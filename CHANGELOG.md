@@ -2,6 +2,32 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [1.1.3] - 2026-09-18
+
+Auditoria recursiva, trilhas independentes de rolagem e hardening do comparador.
+
+### Added
+- **Três trilhas de rolagem independentes:** cada painel do Google, ChatGPT e Claude recebe uma navegação vertical compacta inspirada em linha do tempo, com uma espinha fina, quatro marcas curtas e uma marca longa móvel; clicar ou arrastar afeta apenas aquela IA.
+- Probe interno de lifecycle para o CI medir controladores WebView reais em vez de inferir por processos `msedgewebview2.exe`.
+- PDF.js vendorizado passa a ser componente explícito do SBOM CycloneDX da release.
+
+### Security
+- Ações `neuralia:` injetadas em páginas remotas exigem token aleatório por WebView e eventos de usuário confiáveis; páginas não podem mais navegar diretamente para ações privilegiadas como limpar histórico ou abrir DevTools.
+- Navegação pública do Full Web, comparador e links de PDF bloqueia pivôs sintaticamente locais/privados; navegação local digitada diretamente pelo usuário continua permitida.
+- Reader aplica teto explícito aos bytes pós-decodificação e PDFs exigem `Content-Type: application/pdf` e assinatura `%PDF-`.
+
+### Fixed
+- Downloads de PDF usam um único worker coalescente em vez de criar uma thread do sistema por pedido.
+- O PDF é entregue uma única vez ao protocolo interno, eliminando a cópia Rust persistente de até 64 MiB após o carregamento.
+- O viewer PDF cancela renders obsoletos e libera canvases de páginas distantes.
+- Reader não usa mais `root.text()` como fallback de páginas JS-heavy, evitando expor scripts/JSON de hidratação como conteúdo.
+- Histórico nunca volta a fazer leitura/fsync na thread da UI quando a fila enche.
+- Timeout da pergunta de auto-scroll passa a contar como Não e não contamina avisos posteriores.
+- O aviso de auto-scroll passa a mostrar os mesmos 30 s configurados no runtime.
+- A Home deixa de disparar qualquer consulta automática em produção.
+- `Ctrl+F` + Escape fecha a busca sem voltar a página.
+- O gate de lifecycle agora é bloqueante e mede 3 WebViews no comparador e 0 na Home.
+
 ## [1.1.2] - 2026-09-18
 
 Visualizador embutido de PDF offline com Mozilla PDF.js e acabamento transparente na tela inicial.
