@@ -4112,8 +4112,8 @@ mod tests {
     fn comparator_has_split_palette_and_real_three_way_submit() {
         assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia:split?col="));
         assert!(NEURALIA_PALETTE_SCRIPT.contains("neuralia:palette?col="));
-        assert!(SPLIT_PANEL_SCRIPT.contains("neuralia:split-close"));
-        assert!(SPLIT_PANEL_SCRIPT.contains("neuralia:split-expand"));
+        assert!(SPLIT_PANEL_SCRIPT.contains("'split-close'"));
+        assert!(SPLIT_PANEL_SCRIPT.contains("'split-expand'"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("chatgpt.com"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("claude.ai"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("button.click()"));
