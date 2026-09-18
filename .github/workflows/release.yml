@@ -51,6 +51,38 @@ jobs:
         run: |
           cargo install cargo-cyclonedx --version 0.5.9 --locked
           cargo cyclonedx --manifest-path crates/neural-app/Cargo.toml --format json --target x86_64-pc-windows-msvc --spec-version 1.5
+
+          # cargo-cyclonedx conhece o grafo Rust, mas PDF.js e vendorizado como
+          # asset. Inclui-lo explicitamente evita um buraco silencioso no SBOM.
+          $sbom = Get-ChildItem crates/neural-app -File -Filter "*.json" |
+            Where-Object { $_.Name -match "bom|cdx|cyclonedx" } |
+            Select-Object -First 1
+          if (-not $sbom) {
+            throw "CycloneDX JSON was not generated next to crates/neural-app/Cargo.toml"
+          }
+
+          $bom = Get-Content -Raw $sbom.FullName | ConvertFrom-Json
+          $pdfHash = (Get-FileHash assets/pdfjs/pdf.mjs -Algorithm SHA256).Hash.ToLower()
+          $workerHash = (Get-FileHash assets/pdfjs/pdf.worker.mjs -Algorithm SHA256).Hash.ToLower()
+          $pdfjs = [pscustomobject]@{
+            type = "library"
+            name = "Mozilla PDF.js"
+            version = "6.3.289"
+            purl = "pkg:npm/pdfjs-dist@6.3.289"
+            licenses = @([pscustomobject]@{
+              license = [pscustomobject]@{ id = "Apache-2.0" }
+            })
+            hashes = @([pscustomobject]@{ alg = "SHA-256"; content = $pdfHash })
+            properties = @([pscustomobject]@{
+              name = "neuralia:pdf-worker-sha256"
+              value = $workerHash
+            })
+          }
+          if (-not $bom.components) {
+            $bom | Add-Member -NotePropertyName components -NotePropertyValue @()
+          }
+          $bom.components = @($bom.components) + $pdfjs
+          $bom | ConvertTo-Json -Depth 100 | Set-Content -Encoding utf8 $sbom.FullName
       - name: Prepare release assets
         shell: pwsh
         run: |
