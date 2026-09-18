@@ -662,8 +662,6 @@ impl App {
             self.web_current();
         }
     }
-
-
 }
 
 impl ApplicationHandler<UserEvent> for App {
