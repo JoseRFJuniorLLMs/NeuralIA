@@ -1349,13 +1349,13 @@ impl App {
         let Some(path) = std::env::var_os("NEURALIA_LIFECYCLE_PROBE") else {
             return;
         };
-        let count = usize::from(self.webview.is_some())
+        let count = self.webview.is_some() as usize
             + self
                 .comparator
                 .as_ref()
                 .map(|state| state.views.len())
                 .unwrap_or(0);
-        let _ = std::fs::write(path, count.to_string());
+        let _ = std::fs::write(std::path::PathBuf::from(path), count.to_string());
     }
 
     fn show_home(&mut self) {
@@ -2911,7 +2911,10 @@ static ACTION_FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
 fn action_token() -> String {
     let mut bytes = [0u8; 16];
     if getrandom::fill(&mut bytes).is_ok() {
-        return bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        return bytes.iter().fold(String::with_capacity(32), |mut out, byte| {
+            out.push_str(&format!("{byte:02x}"));
+            out
+        });
     }
 
     // O fallback so existe para uma falha extrema do RNG do SO. Continua
