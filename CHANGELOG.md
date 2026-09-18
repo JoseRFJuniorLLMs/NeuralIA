@@ -19,12 +19,13 @@ Security and reliability hardening release after the second recursive audit.
 ### Fixed
 - Replaced unbounded Reader thread spawning with one coalescing Reader worker.
 - Bounded local history to the configured retention limit.
-- Moved history writes off the UI thread and added a clear-history action.
+- Moved history writes off the UI thread, added a native Ctrl+H viewer, and added a clear-history action.
 - Preserved whitespace in `<pre>` code blocks.
 - Rendered list items as semantic HTML lists.
 - Added explicit handling for `target="_blank"`/new-window requests while retaining the one-WebView invariant.
 - Replaced the painted omnibox editor with a native Windows `EDIT` control.
 - CI now tests exactly the committed `Cargo.lock` with `--locked`.
+- Added a Windows native-Home startup/RSS/thread regression gate with a JSON artifact.
 
 ### Testing
 - Added end-to-end local HTTP tests for redirects, redirect limits, body limits, charset decoding, non-HTML responses and total deadline behavior.
