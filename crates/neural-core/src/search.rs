@@ -1,9 +1,11 @@
-use url::Url;
 use crate::{NeuralError, Result};
+use url::Url;
 
 pub fn google_ai_url(query: &str, language: &str) -> Result<Url> {
     let query = query.trim();
-    if query.is_empty() { return Err(NeuralError::EmptyInput); }
+    if query.is_empty() {
+        return Err(NeuralError::EmptyInput);
+    }
     let mut url = Url::parse("https://www.google.com/search")
         .map_err(|_| NeuralError::InvalidUrl("Google search endpoint".into()))?;
     url.query_pairs_mut()
@@ -17,9 +19,9 @@ pub fn google_ai_url(query: &str, language: &str) -> Result<Url> {
 mod tests {
     use super::*;
     #[test]
-    fn ai_mode_url(){
-        let u=google_ai_url("raft consensus","pt-BR").unwrap();
-        assert_eq!(u.host_str(),Some("www.google.com"));
+    fn ai_mode_url() {
+        let u = google_ai_url("raft consensus", "pt-BR").unwrap();
+        assert_eq!(u.host_str(), Some("www.google.com"));
         assert!(u.as_str().contains("udm=50"));
     }
 }

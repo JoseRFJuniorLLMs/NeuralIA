@@ -3,8 +3,10 @@ on:
   push:
     branches: [main]
   pull_request:
+
 permissions:
   contents: read
+
 jobs:
   core:
     runs-on: ubuntu-latest
@@ -12,16 +14,29 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.1
         with:
-          components: clippy
+          components: clippy,rustfmt
+      - run: cargo fmt --all -- --check
       - run: cargo test -p neural-core
       - run: cargo clippy -p neural-core --all-targets -- -D warnings
+
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.1
         with:
-          components: clippy
+          components: clippy,rustfmt
       - run: cargo check --workspace
       - run: cargo test -p neural-core
       - run: cargo clippy -p neural-app -- -D warnings
+      - run: cargo build -p neural-app --release
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - run: cargo generate-lockfile
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

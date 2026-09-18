@@ -5,7 +5,7 @@
 
 ## What NeuralIA is
 
-NeuralIA is an experimental **AI-first, reader-first, system-WebView browser** written in Rust.
+NeuralIA **v1.0** is an AI-first, reader-first, system-WebView browser written in Rust.
 
 It deliberately refuses the usual browser arms race. It does not ship Chromium, does not implement its own JavaScript engine, does not carry a local LLM, and does not try to become an operating system with tabs.
 
@@ -96,7 +96,17 @@ The desktop app requires the Microsoft Edge WebView2 Runtime only for AI/Reader/
 - [ ] macOS shell
 - [ ] Linux shell
 
-See [the specification index](docs/specs/README.md).
+### v1.0 security baseline
+
+- Reader follows redirects manually and validates every destination before the next request.
+- Public pages cannot redirect Reader into obvious loopback/private/link-local targets.
+- External Web pages do not receive NeuralIA IPC.
+- Web permissions such as camera, microphone, geolocation and notifications are denied by default.
+- Reader output is escaped and protected by a restrictive Content Security Policy.
+- Local paths and non-HTTP(S) schemes are never silently converted into remote AI searches.
+- History writes are locked and flushed to avoid interleaved JSONL records across instances.
+
+See [CHANGELOG.md](CHANGELOG.md) and [the specification index](docs/specs/README.md).
 
 ## Non-goals
 
