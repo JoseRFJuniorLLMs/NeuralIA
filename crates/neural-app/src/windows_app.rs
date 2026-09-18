@@ -155,8 +155,7 @@ impl ReaderWorker {
                 loop {
                     let job = {
                         let (lock, wake) = &*worker_pending;
-                        let mut slot =
-                            lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                         while slot.is_none() {
                             slot = wake
                                 .wait(slot)
@@ -386,14 +385,8 @@ impl App {
             SendMessageW(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
             SendMessageW(edit, EM_SETLIMITTEXT, 2048, 0);
 
-            let proxy_ptr =
-                (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
-            if SetWindowSubclass(
-                edit,
-                Some(omnibox_subclass),
-                OMNIBOX_SUBCLASS_ID,
-                proxy_ptr,
-            ) == 0
+            let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
+            if SetWindowSubclass(edit, Some(omnibox_subclass), OMNIBOX_SUBCLASS_ID, proxy_ptr) == 0
             {
                 return;
             }
@@ -750,7 +743,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Resized(_) if self.surface == Surface::Home => {
                 self.position_omnibox();
                 self.request_redraw();
-            },
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
             }
