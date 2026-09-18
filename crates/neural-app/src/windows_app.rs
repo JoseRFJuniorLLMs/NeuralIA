@@ -4,18 +4,18 @@ use std::thread;
 
 use arboard::Clipboard;
 use neural_core::{
-    google_ai_url, parse_intent, reader_html, CoreConfig, HistoryEntry, HistoryKind, HistoryStore,
-    Intent, ReaderArticle, ReaderClient,
+    CoreConfig, HistoryEntry, HistoryKind, HistoryStore, Intent, ReaderArticle, ReaderClient,
+    google_ai_url, parse_intent, reader_html,
 };
 use serde_json::Value;
 use windows_sys::Win32::{
     Foundation::{HWND, RECT},
     Graphics::Gdi::{
-        CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, FillRect,
-        GetDC, GetStockObject, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor,
-        CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
-        DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, NULL_PEN, OUT_DEFAULT_PRECIS,
-        PS_SOLID, TRANSPARENT,
+        CLEARTYPE_QUALITY, CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET,
+        DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+        DeleteObject, DrawTextW, Ellipse, FW_BOLD, FW_NORMAL, FillRect, GetDC, GetStockObject,
+        NULL_PEN, OUT_DEFAULT_PRECIS, PS_SOLID, ReleaseDC, RoundRect, SelectObject, SetBkMode,
+        SetTextColor, TRANSPARENT,
     },
     UI::WindowsAndMessaging::GetClientRect,
 };
@@ -57,10 +57,7 @@ struct UiRect {
 
 impl UiRect {
     fn contains(self, x: f64, y: f64) -> bool {
-        x >= self.x
-            && x <= self.x + self.width
-            && y >= self.y
-            && y <= self.y + self.height
+        x >= self.x && x <= self.x + self.width && y >= self.y && y <= self.y + self.height
     }
 }
 
@@ -279,9 +276,7 @@ impl App {
     }
 
     fn record(&self, kind: HistoryKind, input: String, target: String) {
-        let _ = self
-            .history
-            .append(&HistoryEntry::now(kind, input, target));
+        let _ = self.history.append(&HistoryEntry::now(kind, input, target));
     }
 
     fn reader_webview_builder(&self) -> WebViewBuilder<'static> {
@@ -304,8 +299,7 @@ impl App {
                     return false;
                 }
 
-                target.starts_with("about:blank")
-                    || neural_core::validate_web_url(&target).is_ok()
+                target.starts_with("about:blank") || neural_core::validate_web_url(&target).is_ok()
             })
             .with_permission_handler(|_| PermissionResponse::Deny)
             .with_focused(true)
@@ -404,11 +398,7 @@ impl App {
             return;
         };
         let size = window.inner_size();
-        let layout = HomeLayout::new(
-            size.width as f64,
-            size.height as f64,
-            window.scale_factor(),
-        );
+        let layout = HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
         let (x, y) = self.cursor;
 
         if layout.go.contains(x, y) {
@@ -500,11 +490,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 match result {
                     Ok(article) => {
-                        self.record(
-                            HistoryKind::Read,
-                            input,
-                            article.source_url.clone(),
-                        );
+                        self.record(HistoryKind::Read, input, article.source_url.clone());
                         self.open_reader(&article);
                     }
                     Err(error) => self.show_native_error(format!("Reader: {error}")),
@@ -613,7 +599,12 @@ fn draw_home(window: &Window, input: &str, status: &str) {
             right: client.right,
             bottom: logo_y + logo_size + (72.0 * scale) as i32,
         };
-        draw_text(hdc, "NeuralIA", &mut title_rect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        draw_text(
+            hdc,
+            "NeuralIA",
+            &mut title_rect,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+        );
 
         SelectObject(hdc, body_font as _);
         SetTextColor(hdc, rgb(114, 118, 125));
@@ -692,12 +683,7 @@ unsafe fn create_font(height: i32, weight: i32) -> *mut core::ffi::c_void {
     )
 }
 
-unsafe fn draw_logo(
-    hdc: *mut core::ffi::c_void,
-    x: i32,
-    y: i32,
-    size: i32,
-) {
+unsafe fn draw_logo(hdc: *mut core::ffi::c_void, x: i32, y: i32, size: i32) {
     let black = CreateSolidBrush(rgb(17, 19, 20));
     let white = CreateSolidBrush(rgb(255, 255, 255));
     let null_pen = GetStockObject(NULL_PEN);
@@ -711,42 +697,12 @@ unsafe fn draw_logo(
     let c = size / 2;
     let arm = size / 5;
     let thick = size / 7;
-    Ellipse(
-        hdc,
-        x + c - thick,
-        y + c - arm * 2,
-        x + c + thick,
-        y + c,
-    );
-    Ellipse(
-        hdc,
-        x + c,
-        y + c - thick,
-        x + c + arm * 2,
-        y + c + thick,
-    );
-    Ellipse(
-        hdc,
-        x + c - thick,
-        y + c,
-        x + c + thick,
-        y + c + arm * 2,
-    );
-    Ellipse(
-        hdc,
-        x + c - arm * 2,
-        y + c - thick,
-        x + c,
-        y + c + thick,
-    );
+    Ellipse(hdc, x + c - thick, y + c - arm * 2, x + c + thick, y + c);
+    Ellipse(hdc, x + c, y + c - thick, x + c + arm * 2, y + c + thick);
+    Ellipse(hdc, x + c - thick, y + c, x + c + thick, y + c + arm * 2);
+    Ellipse(hdc, x + c - arm * 2, y + c - thick, x + c, y + c + thick);
     let dot = size / 9;
-    Ellipse(
-        hdc,
-        x + c - dot,
-        y + c - dot,
-        x + c + dot,
-        y + c + dot,
-    );
+    Ellipse(hdc, x + c - dot, y + c - dot, x + c + dot, y + c + dot);
 
     SelectObject(hdc, old_brush);
     SelectObject(hdc, old_pen);
@@ -822,7 +778,15 @@ unsafe fn draw_button(
     } else {
         rgb(234, 236, 239)
     });
-    let pen = CreatePen(PS_SOLID, 1, if primary { rgb(17, 19, 20) } else { rgb(225, 227, 231) });
+    let pen = CreatePen(
+        PS_SOLID,
+        1,
+        if primary {
+            rgb(17, 19, 20)
+        } else {
+            rgb(225, 227, 231)
+        },
+    );
     let old_brush = SelectObject(hdc, fill as _);
     let old_pen = SelectObject(hdc, pen as _);
 
@@ -864,12 +828,7 @@ unsafe fn draw_button(
     DeleteObject(pen as _);
 }
 
-unsafe fn draw_text(
-    hdc: *mut core::ffi::c_void,
-    text: &str,
-    rect: &mut RECT,
-    format: u32,
-) {
+unsafe fn draw_text(hdc: *mut core::ffi::c_void, text: &str, rect: &mut RECT, format: u32) {
     let wide: Vec<u16> = text.encode_utf16().collect();
     if !wide.is_empty() {
         DrawTextW(hdc, wide.as_ptr(), wide.len() as i32, rect, format);
