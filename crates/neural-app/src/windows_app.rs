@@ -2894,6 +2894,7 @@ fn neural_hash(mut value: u32) -> f64 {
 /// lentas em direcao a marca, ligando-se aos vizinhos proximos. O calculo e
 /// deterministico a partir do tempo, portanto nao precisa de estado ou alocacao
 /// persistente entre frames.
+#[allow(clippy::too_many_arguments)]
 unsafe fn draw_neural_background(
     hdc: *mut core::ffi::c_void,
     width: f64,
