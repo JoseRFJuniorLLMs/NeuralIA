@@ -2087,6 +2087,10 @@ impl App {
         let width = (SPLASH_WIDTH * scale).round() as i32;
         let height = (SPLASH_HEIGHT * scale).round() as i32;
 
+        if !question && self.splash_question_token.take().is_some() {
+            self.auto_scroll_answered = true;
+            self.auto_scroll = false;
+        }
         SPLASH_ASKS.store(question, Ordering::SeqCst);
         if let Ok(mut slot) = SPLASH_TEXT.lock() {
             *slot = text;
