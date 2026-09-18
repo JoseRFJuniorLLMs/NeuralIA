@@ -1930,10 +1930,8 @@ impl App {
                         && let Ok(source_index) = col.parse::<usize>()
                         && remote_web_target(&url, false)
                     {
-                        let _ = navigation_proxy.send_event(UserEvent::OpenSplit {
-                            source_index,
-                            url,
-                        });
+                        let _ =
+                            navigation_proxy.send_event(UserEvent::OpenSplit { source_index, url });
                     }
                     return false;
                 }
@@ -2156,9 +2154,7 @@ impl App {
         {
             drop(split);
         }
-        if was_fullscreen
-            && let Some(window) = &self.window
-        {
+        if was_fullscreen && let Some(window) = &self.window {
             window.set_fullscreen(None);
         }
         self.update_comparator_layout();
