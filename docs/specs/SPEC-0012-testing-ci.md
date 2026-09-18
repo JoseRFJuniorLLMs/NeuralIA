@@ -9,6 +9,7 @@ Required CI:
 2. Windows: locked workspace compile, core tests, desktop clippy and release build.
 3. Dependency audit: RustSec against the committed `Cargo.lock`.
 4. HTTP integration fixtures: redirect success/limit, declared and streamed size limits, charset, content type and navigation-wide deadline.
+5. Windows native-Home regression measurement: startup-to-window, working set, thread count and binary size, with a JSON artifact.
 
 CI and release workflows MUST use SHA-pinned third-party Actions. Normal CI MUST NOT regenerate `Cargo.lock`.
 
