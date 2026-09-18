@@ -2,10 +2,10 @@
 
 use std::{
     borrow::Cow,
+    collections::VecDeque,
     sync::{
         Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{SyncSender, sync_channel},
     },
     thread,
     time::{Duration, Instant},
@@ -15,7 +15,8 @@ use image::RgbaImage;
 
 use neural_core::{
     CoreConfig, HistoryEntry, HistoryKind, HistoryStore, Intent, ReaderArticle, ReaderClient,
-    chatgpt_search_url, claude_search_url, google_ai_url, is_pdf_url, parse_intent, reader_html,
+    chatgpt_search_url, claude_search_url, google_ai_url, is_local_network_target, is_pdf_url,
+    parse_intent, reader_html,
 };
 use url::Url;
 use windows_sys::Win32::{
@@ -377,10 +378,10 @@ const EC_RIGHTMARGIN: usize = 0x0002;
 const WM_SETFONT: u32 = 0x0030;
 const OMNIBOX_SUBCLASS_ID: usize = 0x4E49;
 
-/// Consulta disparada automaticamente quando o app abre. `NEURALIA_STARTUP_INPUT`
-/// substitui-a e `NEURALIA_NO_STARTUP` desliga-a, que e como o teste de
-/// desempenho consegue medir a Home mesmo em repouso.
-const DEFAULT_STARTUP_INPUT: &str = "jose r f junior";
+/// A Home abre em repouso. `NEURALIA_STARTUP_INPUT` existe apenas para testes,
+/// demos e automacao explícita; producao nunca envia uma consulta sem acao do
+/// utilizador.
+const DEFAULT_STARTUP_INPUT: &str = "";
 
 fn startup_input() -> String {
     // Variavel propria em vez de string vazia: no Windows pôr uma variavel a ""
@@ -770,6 +771,76 @@ impl ReaderWorker {
     }
 }
 
+struct DocumentJob {
+    generation: u64,
+    url: String,
+}
+
+#[derive(Clone)]
+struct DocumentWorker {
+    pending: Arc<(Mutex<Option<DocumentJob>>, Condvar)>,
+    alive: bool,
+}
+
+impl DocumentWorker {
+    fn new(
+        client: ReaderClient,
+        proxy: EventLoopProxy<UserEvent>,
+        generation: Arc<AtomicU64>,
+    ) -> Self {
+        let pending = Arc::new((Mutex::new(None::<DocumentJob>), Condvar::new()));
+        let worker_pending = Arc::clone(&pending);
+        let spawned = thread::Builder::new()
+            .name("neural-document".into())
+            .spawn(move || loop {
+                let job = {
+                    let (lock, wake) = &*worker_pending;
+                    let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    while slot.is_none() {
+                        slot = wake
+                            .wait(slot)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    slot.take().expect("document job present")
+                };
+
+                let job_generation = job.generation;
+                let watch = Arc::clone(&generation);
+                let result = client
+                    .fetch_document(&job.url, "application/pdf", PDF_MAX_BYTES, &|| {
+                        watch.load(Ordering::SeqCst) != job_generation
+                    })
+                    .map_err(|error| error.to_string());
+
+                let _ = proxy.send_event(UserEvent::PdfReady {
+                    generation: job_generation,
+                    url: job.url,
+                    result,
+                });
+            });
+
+        Self {
+            pending,
+            alive: spawned.is_ok(),
+        }
+    }
+
+    fn submit(&self, job: DocumentJob) -> Result<(), String> {
+        if !self.alive {
+            return Err("a thread de documentos nao pôde ser criada".to_string());
+        }
+        let (lock, wake) = &*self.pending;
+        let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // So interessa a navegacao mais recente. A ativa e cancelada pelo
+        // generation watch; a pendente anterior e substituida sem criar thread.
+        *slot = Some(job);
+        wake.notify_one();
+        Ok(())
+    }
+}
+
+const HISTORY_QUEUE_LIMIT: usize = 64;
+
 enum HistoryCommand {
     Append(HistoryEntry),
     Clear,
@@ -777,53 +848,85 @@ enum HistoryCommand {
 
 #[derive(Clone)]
 struct HistoryWriter {
-    tx: SyncSender<HistoryCommand>,
-    store: HistoryStore,
+    pending: Arc<(Mutex<VecDeque<HistoryCommand>>, Condvar)>,
+    alive: bool,
 }
 
 impl HistoryWriter {
     fn new(store: HistoryStore, proxy: EventLoopProxy<UserEvent>) -> Self {
-        let (tx, rx) = sync_channel::<HistoryCommand>(64);
-        let worker_store = store.clone();
-        let _ = thread::Builder::new()
+        let pending = Arc::new((
+            Mutex::new(VecDeque::<HistoryCommand>::with_capacity(HISTORY_QUEUE_LIMIT)),
+            Condvar::new(),
+        ));
+        let worker_pending = Arc::clone(&pending);
+        let spawned = thread::Builder::new()
             .name("neural-history".into())
-            .spawn(move || {
-                while let Ok(command) = rx.recv() {
-                    match command {
-                        HistoryCommand::Append(entry) => {
-                            let _ = worker_store.append(&entry);
-                        }
-                        HistoryCommand::Clear => {
-                            // O utilizador so pode ver "apagado" depois de o
-                            // disco confirmar; ate aqui isto era fire-and-forget.
-                            let result = worker_store.clear().map_err(|error| error.to_string());
-                            let _ = proxy.send_event(UserEvent::HistoryCleared(result));
-                        }
+            .spawn(move || loop {
+                let command = {
+                    let (lock, wake) = &*worker_pending;
+                    let mut queue = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    while queue.is_empty() {
+                        queue = wake
+                            .wait(queue)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    queue.pop_front().expect("history command present")
+                };
+
+                match command {
+                    HistoryCommand::Append(entry) => {
+                        let _ = store.append(&entry);
+                    }
+                    HistoryCommand::Clear => {
+                        let result = store.clear().map_err(|error| error.to_string());
+                        let _ = proxy.send_event(UserEvent::HistoryCleared(result));
                     }
                 }
             });
-        Self { tx, store }
+
+        Self {
+            pending,
+            alive: spawned.is_ok(),
+        }
     }
 
-    /// Fila cheia ou worker em falta: escreve aqui mesmo, em vez de perder a
-    /// entrada em silencio.
     fn append(&self, entry: HistoryEntry) {
-        if self
-            .tx
-            .try_send(HistoryCommand::Append(entry.clone()))
-            .is_err()
-        {
-            let _ = self.store.append(&entry);
+        if !self.alive {
+            return;
         }
+        let (lock, wake) = &*self.pending;
+        let mut queue = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if queue.len() >= HISTORY_QUEUE_LIMIT {
+            // Historico e bounded: sob rajada descartamos a entrada Append mais
+            // antiga ainda nao persistida, nunca um Clear, e jamais fazemos
+            // fsync no event loop.
+            if let Some(index) = queue
+                .iter()
+                .position(|command| matches!(command, HistoryCommand::Append(_)))
+            {
+                queue.remove(index);
+            } else {
+                return;
+            }
+        }
+
+        queue.push_back(HistoryCommand::Append(entry));
+        wake.notify_one();
     }
 
-    /// `None` = pedido entregue ao worker, a resposta chega em `HistoryCleared`.
-    /// `Some(..)` = nao houve worker, foi apagado aqui e o resultado e este.
+    /// `None` = pedido entregue ao worker, resposta chega em HistoryCleared.
+    /// `Some` = o worker nao existe e nada e fingido como apagado.
     fn clear(&self) -> Option<Result<(), String>> {
-        if self.tx.try_send(HistoryCommand::Clear).is_ok() {
-            return None;
+        if !self.alive {
+            return Some(Err("worker de historico indisponivel".to_string()));
         }
-        Some(self.store.clear().map_err(|error| error.to_string()))
+        let (lock, wake) = &*self.pending;
+        let mut queue = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        queue.clear();
+        queue.push_back(HistoryCommand::Clear);
+        wake.notify_one();
+        None
     }
 }
 
@@ -893,10 +996,14 @@ struct App {
     auto_scroll_answered: bool,
     auto_scroll_token: u64,
     zoom: f64,
-    /// O visualizador de PDF nao aceita script do host: rola-se por tecla.
     reading_pdf: bool,
     splash: Option<HWND>,
     splash_token: u64,
+    splash_question_token: Option<u64>,
+    /// Um unico timer cooperativo atende todos os avisos, em vez de uma thread
+    /// adormecida por splash.
+    splash_deadline: Arc<AtomicU64>,
+    splash_watch_token: Arc<AtomicU64>,
     /// O Win32 nao apaga o fundo por nos e uma janela filha destruida deixa os
     /// ultimos pixeis onde estava. Sem isto viam-se barras e texto fantasma.
     needs_clear: bool,
@@ -907,11 +1014,10 @@ struct App {
     history_store: HistoryStore,
     history: HistoryWriter,
     reader: ReaderWorker,
-    /// Cliente a parte para documentos: prazo e limite maiores do que os do
-    /// Reader, o mesmo filtro de rede.
-    document_client: Arc<ReaderClient>,
-    /// Os bytes do PDF aberto, servidos ao visualizador pela origem propria.
-    pdf_bytes: Arc<Mutex<Vec<u8>>>,
+    document: DocumentWorker,
+    /// Entrega one-shot ao protocolo interno. Depois que o WebView recebe o
+    /// PDF, a copia Rust e liberada em vez de ficar duplicada em RAM.
+    pdf_bytes: Arc<Mutex<Option<Vec<u8>>>>,
     surface: Surface,
     navigation_generation: Arc<AtomicU64>,
     status: Option<String>,
@@ -931,11 +1037,45 @@ impl App {
             proxy.clone(),
             Arc::clone(&navigation_generation),
         );
+        let document = DocumentWorker::new(
+            ReaderClient::new(PDF_TIMEOUT_SECS, PDF_MAX_BYTES),
+            proxy.clone(),
+            Arc::clone(&navigation_generation),
+        );
         let omnibox_proxy = Box::new(proxy.clone());
-        let document_client = Arc::new(ReaderClient::new(PDF_TIMEOUT_SECS, PDF_MAX_BYTES));
+
+        let splash_deadline = Arc::new(AtomicU64::new(0));
+        let splash_watch_token = Arc::new(AtomicU64::new(0));
+        {
+            let deadline = Arc::clone(&splash_deadline);
+            let watch_token = Arc::clone(&splash_watch_token);
+            let splash_proxy = proxy.clone();
+            let _ = thread::Builder::new()
+                .name("neural-splash-timer".into())
+                .spawn(move || loop {
+                    let target = deadline.load(Ordering::SeqCst);
+                    if target == 0 {
+                        thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
+                    let now = now_ms();
+                    if now >= target {
+                        if deadline
+                            .compare_exchange(target, 0, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            let token = watch_token.load(Ordering::SeqCst);
+                            let _ = splash_proxy.send_event(UserEvent::HideSplash(token));
+                        }
+                        continue;
+                    }
+                    thread::sleep(Duration::from_millis((target - now).min(250)));
+                });
+        }
+
         Self {
-            document_client,
-            pdf_bytes: Arc::new(Mutex::new(Vec::new())),
+            document,
+            pdf_bytes: Arc::new(Mutex::new(None)),
             proxy,
             window: None,
             webview: None,
@@ -955,6 +1095,9 @@ impl App {
             reading_pdf: false,
             splash: None,
             splash_token: 0,
+            splash_question_token: None,
+            splash_deadline,
+            splash_watch_token,
             needs_clear: true,
             omnibox_font: None,
             omnibox_font_height: 0,
