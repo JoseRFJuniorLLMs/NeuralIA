@@ -1339,6 +1339,23 @@ impl App {
             let _ = webview.focus_parent();
             drop(webview);
         }
+        if let Ok(mut bytes) = self.pdf_bytes.lock() {
+            *bytes = None;
+        }
+        self.emit_lifecycle_probe();
+    }
+
+    fn emit_lifecycle_probe(&self) {
+        let Some(path) = std::env::var_os("NEURALIA_LIFECYCLE_PROBE") else {
+            return;
+        };
+        let count = usize::from(self.webview.is_some())
+            + self
+                .comparator
+                .as_ref()
+                .map(|state| state.views.len())
+                .unwrap_or(0);
+        let _ = std::fs::write(path, count.to_string());
     }
 
     fn show_home(&mut self) {
@@ -1496,48 +1513,38 @@ impl App {
         ));
         self.request_redraw();
 
-        let client = Arc::clone(&self.document_client);
-        let proxy = self.proxy.clone();
-        let watch = Arc::clone(&self.navigation_generation);
-        let target = url.to_string();
-        let spawned = thread::Builder::new()
-            .name("neural-pdf".into())
-            .spawn(move || {
-                let result = client
-                    .fetch_document(&target, "application/pdf", PDF_MAX_BYTES, &|| {
-                        watch.load(Ordering::SeqCst) != generation
-                    })
-                    .map_err(|error| error.to_string());
-                let _ = proxy.send_event(UserEvent::PdfReady {
-                    generation,
-                    url: target,
-                    result,
-                });
-            });
-        if spawned.is_err() {
-            self.show_native_error("Não consegui criar a thread para descarregar o PDF.");
+        if let Err(error) = self.document.submit(DocumentJob {
+            generation,
+            url: url.to_string(),
+        }) {
+            self.show_native_error(format!("PDF indisponível: {error}"));
         }
     }
 
     fn pdf_webview_builder(&self) -> WebViewBuilder<'static> {
         let proxy = self.proxy.clone();
         let bytes = Arc::clone(&self.pdf_bytes);
+        let token = action_token();
+        let navigation_token = token.clone();
 
         WebViewBuilder::new()
             .with_custom_protocol("neuralia-pdf".to_string(), move |_id, request| {
                 serve_pdf_asset(&bytes, &request)
             })
-            .with_initialization_script(NEURALIA_KEYMAP_SCRIPT)
+            .with_initialization_script(script_with_token(NEURALIA_KEYMAP_SCRIPT, &token))
             .with_navigation_handler(move |target| {
-                if let Some(event) = neuralia_action(&target) {
+                if let Some(event) = neuralia_action(&target, &navigation_token) {
                     let _ = proxy.send_event(event);
                     return false;
                 }
-                if target.starts_with(PDF_ORIGIN) || target.starts_with("about:blank") {
+                if target == "about:blank" || is_pdf_internal_url(&target) {
                     return true;
                 }
-                // Ligacoes dentro do PDF abrem como qualquer pagina externa.
-                if neural_core::validate_web_url(&target).is_ok() {
+                // PDF e conteudo nao confiavel: um link nele nao ganha direito
+                // de pivotar para localhost/RFC1918.
+                if let Ok(url) = neural_core::validate_web_url(&target)
+                    && !is_local_network_target(&url)
+                {
                     let _ = proxy.send_event(UserEvent::OpenExternal(target));
                 }
                 false
@@ -1551,7 +1558,7 @@ impl App {
         self.show_omnibox(false);
 
         if let Ok(mut slot) = self.pdf_bytes.lock() {
-            *slot = bytes;
+            *slot = Some(bytes);
         }
 
         let result = if let Some(window) = &self.window {
@@ -1569,8 +1576,12 @@ impl App {
                 self.surface = Surface::Pdf;
                 self.record(HistoryKind::Read, url.to_string(), url.to_string());
                 self.begin_reading_session(true);
+                self.emit_lifecycle_probe();
             }
             Err(error) => {
+                if let Ok(mut slot) = self.pdf_bytes.lock() {
+                    *slot = None;
+                }
                 self.show_native_error(format!("WebView2 não pôde abrir o PDF: {error}"));
             }
         }
@@ -1584,7 +1595,7 @@ impl App {
         let proxy = self.proxy.clone();
         WebViewBuilder::new()
             .with_navigation_handler(move |target| {
-                if target.starts_with("about:blank") {
+                if target == "about:blank" {
                     return true;
                 }
 
@@ -1595,11 +1606,6 @@ impl App {
                     return false;
                 }
 
-                if let Some(event) = neuralia_action(&target) {
-                    let _ = proxy.send_event(event);
-                    return false;
-                }
-
                 match action_url.path().trim_matches('/') {
                     "home" => {
                         let _ = proxy.send_event(UserEvent::HomeRequested);
@@ -1607,7 +1613,8 @@ impl App {
                     "web" => {
                         if let Some((_, value)) =
                             action_url.query_pairs().find(|(key, _)| key == "url")
-                            && neural_core::validate_web_url(value.as_ref()).is_ok()
+                            && let Ok(url) = neural_core::validate_web_url(value.as_ref())
+                            && !is_local_network_target(&url)
                         {
                             let _ = proxy.send_event(UserEvent::OpenExternal(value.into_owned()));
                         }
@@ -1621,24 +1628,36 @@ impl App {
             .with_focused(true)
     }
 
-    fn external_webview_builder(&self) -> WebViewBuilder<'static> {
+    fn external_webview_builder(&self, initial_url: &Url) -> WebViewBuilder<'static> {
         let navigation_proxy = self.proxy.clone();
         let new_window_proxy = self.proxy.clone();
+        let allow_local = is_local_network_target(initial_url);
+        let token = action_token();
+        let navigation_token = token.clone();
 
         WebViewBuilder::new()
             .with_initialization_script(format!(
-                "{NEURALIA_KEYMAP_SCRIPT}\n{EXTERNAL_RETURN_BUTTON}"
+                "{}\n{}",
+                script_with_token(NEURALIA_KEYMAP_SCRIPT, &token),
+                script_with_token(EXTERNAL_RETURN_BUTTON, &token)
             ))
             .with_navigation_handler(move |target| {
-                if let Some(event) = neuralia_action(&target) {
+                if let Some(event) = neuralia_action(&target, &navigation_token) {
                     let _ = navigation_proxy.send_event(event);
                     return false;
                 }
-
-                target.starts_with("about:blank") || neural_core::validate_web_url(&target).is_ok()
+                if target == "about:blank" {
+                    return true;
+                }
+                let Ok(url) = neural_core::validate_web_url(&target) else {
+                    return false;
+                };
+                allow_local || !is_local_network_target(&url)
             })
             .with_new_window_req_handler(move |target, _features| {
-                if neural_core::validate_web_url(&target).is_ok() {
+                if let Ok(url) = neural_core::validate_web_url(&target)
+                    && (allow_local || !is_local_network_target(&url))
+                {
                     let _ = new_window_proxy.send_event(UserEvent::OpenExternal(target));
                 }
                 NewWindowResponse::Deny
@@ -1657,8 +1676,15 @@ impl App {
             .to_ascii_lowercase()
             .ends_with(".pdf");
 
+        let Ok(initial_url) = neural_core::validate_web_url(url) else {
+            self.show_native_error("URL externa inválida.");
+            return;
+        };
+
         let result = if let Some(window) = &self.window {
-            self.external_webview_builder().with_url(url).build(window)
+            self.external_webview_builder(&initial_url)
+                .with_url(initial_url.as_str())
+                .build(window)
         } else {
             return;
         };
@@ -1669,6 +1695,7 @@ impl App {
                 self.webview = Some(webview);
                 self.surface = Surface::External;
                 self.begin_reading_session(is_pdf);
+                self.emit_lifecycle_probe();
             }
             Err(error) => {
                 self.show_native_error(format!("WebView2 não pôde abrir a página: {error}"));
@@ -1693,6 +1720,7 @@ impl App {
                 self.webview = Some(webview);
                 self.surface = Surface::Reader;
                 self.begin_reading_session(false);
+                self.emit_lifecycle_probe();
             }
             Err(error) => {
                 self.show_native_error(format!("WebView2 não pôde exibir o Reader: {error}"));
@@ -1780,6 +1808,7 @@ impl App {
         self.bar_hover = None;
         self.surface = Surface::Comparator;
         self.begin_reading_session(false);
+        self.emit_lifecycle_probe();
         self.request_redraw();
     }
 
@@ -1911,40 +1940,46 @@ impl App {
     ) -> WebViewBuilder<'static> {
         let navigation_proxy = self.proxy.clone();
         let new_window_proxy = self.proxy.clone();
+        let token = action_token();
+        let navigation_token = token.clone();
 
         let init_script = format!(
-            "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{COMPARATOR_INJECT_SCRIPT}"
+            "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';\n{}\n{}",
+            script_with_token(NEURALIA_KEYMAP_SCRIPT, &token),
+            script_with_token(COMPARATOR_INJECT_SCRIPT, &token)
         );
 
         WebViewBuilder::new()
             .with_initialization_script(init_script)
             .with_navigation_handler(move |target| {
-                if target.eq_ignore_ascii_case("neuralia:home") {
-                    let _ = navigation_proxy.send_event(UserEvent::HomeRequested);
-                    return false;
-                }
-                if target.eq_ignore_ascii_case("neuralia:restore") {
-                    let _ = navigation_proxy.send_event(UserEvent::RestoreComparator);
-                    return false;
-                }
-                if let Some(event) = neuralia_action(&target) {
-                    let _ = navigation_proxy.send_event(event);
-                    return false;
-                }
-                if target.starts_with("neuralia:expand") {
-                    if let Ok(action_url) = Url::parse(&target)
-                        && let Some((_, val)) = action_url.query_pairs().find(|(k, _)| k == "col")
-                        && let Ok(idx) = val.parse::<usize>()
+                if let Some(action_url) = trusted_action_url(&target, &navigation_token)
+                    && action_url.path().trim_matches('/').eq_ignore_ascii_case("expand")
+                {
+                    if let Some((_, value)) =
+                        action_url.query_pairs().find(|(key, _)| key == "col")
+                        && let Ok(index) = value.parse::<usize>()
+                        && index < COMPARATOR_COLUMNS
                     {
-                        let _ = navigation_proxy.send_event(UserEvent::ExpandComparator(idx));
+                        let _ = navigation_proxy.send_event(UserEvent::ExpandComparator(index));
                     }
                     return false;
                 }
 
-                target.starts_with("about:blank") || neural_core::validate_web_url(&target).is_ok()
+                if let Some(event) = neuralia_action(&target, &navigation_token) {
+                    let _ = navigation_proxy.send_event(event);
+                    return false;
+                }
+
+                if target == "about:blank" {
+                    return true;
+                }
+                neural_core::validate_web_url(&target)
+                    .is_ok_and(|url| !is_local_network_target(&url))
             })
             .with_new_window_req_handler(move |target, _features| {
-                if neural_core::validate_web_url(&target).is_ok() {
+                if let Ok(url) = neural_core::validate_web_url(&target)
+                    && !is_local_network_target(&url)
+                {
                     let _ = new_window_proxy.send_event(UserEvent::OpenInColumn(col_index, target));
                 }
                 NewWindowResponse::Deny
@@ -2810,7 +2845,7 @@ fn pin_webview_profile() {
 /// Responde a origem do visualizador: os tres ficheiros do PDF.js e o
 /// documento que esta aberto. Tudo em memoria; nada toca no disco.
 fn serve_pdf_asset(
-    bytes: &Arc<Mutex<Vec<u8>>>,
+    bytes: &Arc<Mutex<Option<Vec<u8>>>>,
     request: &Request<Vec<u8>>,
 ) -> HttpResponse<Cow<'static, [u8]>> {
     let path = request.uri().path();
@@ -2824,8 +2859,16 @@ fn serve_pdf_asset(
         "/pdf.mjs" => (200, "text/javascript", Cow::Borrowed(PDFJS_CORE)),
         "/pdf.worker.mjs" => (200, "text/javascript", Cow::Borrowed(PDFJS_WORKER)),
         "/document.pdf" => {
-            let data = bytes.lock().map(|slot| slot.clone()).unwrap_or_default();
-            (200, "application/pdf", Cow::Owned(data))
+            let data = bytes
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take())
+                .unwrap_or_default();
+            if data.is_empty() {
+                (410, "text/plain", Cow::Borrowed(b"document already consumed" as &[u8]))
+            } else {
+                (200, "application/pdf", Cow::Owned(data))
+            }
         }
         _ => (404, "text/plain", Cow::Borrowed(b"not found" as &[u8])),
     };
@@ -2838,16 +2881,43 @@ fn serve_pdf_asset(
         .unwrap_or_else(|_| HttpResponse::new(Cow::Borrowed(b"" as &[u8])))
 }
 
-/// Traduz um `neuralia:<accao>` num evento. E o unico sitio onde a lista de
-/// atalhos existe do lado nativo: as paginas so sabem escrever o nome.
-fn neuralia_action(target: &str) -> Option<UserEvent> {
-    let rest = target.strip_prefix("neuralia:").or_else(|| {
-        target
-            .get(..9)
-            .filter(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
-            .map(|_| &target[9..])
-    })?;
-    let name = rest.split(['?', '#']).next().unwrap_or(rest);
+static ACTION_FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn action_token() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_ok() {
+        return bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    }
+
+    // O fallback so existe para uma falha extrema do RNG do SO. Continua
+    // variando por processo/tempo/contador, mas o caminho normal e getrandom.
+    let counter = ACTION_FALLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{:016x}{:016x}",
+        now_ms() ^ ((std::process::id() as u64) << 32),
+        counter.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    )
+}
+
+fn script_with_token(script: &str, token: &str) -> String {
+    script.replace("__TOKEN__", token)
+}
+
+fn trusted_action_url(target: &str, token: &str) -> Option<Url> {
+    let url = Url::parse(target).ok()?;
+    if !url.scheme().eq_ignore_ascii_case("neuralia") {
+        return None;
+    }
+    let supplied = url
+        .query_pairs()
+        .find(|(key, _)| key == "token")
+        .map(|(_, value)| value.into_owned())?;
+    (supplied == token).then_some(url)
+}
+
+fn neuralia_action(target: &str, token: &str) -> Option<UserEvent> {
+    let url = trusted_action_url(target, token)?;
+    let name = url.path().trim_matches('/');
 
     Some(match name.to_ascii_lowercase().as_str() {
         "home" => UserEvent::HomeRequested,
@@ -2867,6 +2937,15 @@ fn neuralia_action(target: &str) -> Option<UserEvent> {
         "viewsource" => UserEvent::ViewSource,
         _ => return None,
     })
+}
+
+fn is_pdf_internal_url(target: &str) -> bool {
+    let Ok(url) = Url::parse(target) else {
+        return false;
+    };
+    url.scheme() == "http"
+        && url.host_str() == Some("neuralia-pdf.localhost")
+        && url.port_or_known_default() == Some(80)
 }
 
 fn wide_null(value: &str) -> Vec<u16> {
