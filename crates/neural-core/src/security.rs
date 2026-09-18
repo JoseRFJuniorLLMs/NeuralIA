@@ -43,9 +43,7 @@ pub fn is_local_network_target(url: &Url) -> bool {
         Some(Host::Ipv6(ip)) => is_forbidden_ip(IpAddr::V6(ip)),
         Some(Host::Domain(domain)) => {
             let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-            domain == "localhost"
-                || domain.ends_with(".localhost")
-                || domain.ends_with(".local")
+            domain == "localhost" || domain.ends_with(".localhost") || domain.ends_with(".local")
         }
         None => false,
     }
