@@ -243,7 +243,10 @@ pub fn extract_article(url: &Url, html: &str) -> Result<ReaderArticle> {
 
         let tag = node.value().name();
         let text = if tag == "pre" {
-            truncate_chars(normalize_code(node.text().collect::<Vec<_>>().join("")), MAX_BLOCK_CHARS)
+            truncate_chars(
+                normalize_code(node.text().collect::<Vec<_>>().join("")),
+                MAX_BLOCK_CHARS,
+            )
         } else {
             truncate_chars(
                 normalize_text(node.text().collect::<Vec<_>>().join(" ")),
