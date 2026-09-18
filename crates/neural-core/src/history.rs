@@ -182,11 +182,7 @@ mod tests {
         let path = temp_history("round-trip");
         let store = HistoryStore::new(&path);
         store
-            .append(&HistoryEntry::now(
-                HistoryKind::Ask,
-                "teste",
-                "google-ai",
-            ))
+            .append(&HistoryEntry::now(HistoryKind::Ask, "teste", "google-ai"))
             .unwrap();
         let got = store.recent(10).unwrap();
         assert_eq!(got.len(), 1);
@@ -220,7 +216,11 @@ mod tests {
         let path = temp_history("clear");
         let store = HistoryStore::new(&path);
         store
-            .append(&HistoryEntry::now(HistoryKind::Web, "x", "https://example.com"))
+            .append(&HistoryEntry::now(
+                HistoryKind::Web,
+                "x",
+                "https://example.com",
+            ))
             .unwrap();
         store.clear().unwrap();
         assert!(store.recent(10).unwrap().is_empty());
