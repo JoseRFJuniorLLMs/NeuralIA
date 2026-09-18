@@ -161,12 +161,25 @@ impl ReaderClient {
 
         let content_type = header(&response, "content-type").to_ascii_lowercase();
         let actual = content_type.split(';').next().unwrap_or("").trim();
-        if !actual.is_empty() && actual != media_type {
-            return Err(NeuralError::UnsupportedContentType(content_type));
+        if actual != media_type {
+            return Err(NeuralError::UnsupportedContentType(if content_type.is_empty() {
+                "cabeçalho Content-Type ausente".to_string()
+            } else {
+                content_type
+            }));
         }
 
         reject_declared_oversize(&response, max_bytes)?;
-        self.read_body(&mut response, started, max_bytes, false, cancelled)
+        let body = self.read_body(&mut response, started, max_bytes, false, cancelled)?;
+        if media_type == "application/pdf" {
+            let head = &body[..body.len().min(1024)];
+            if !head.windows(5).any(|window| window == b"%PDF-") {
+                return Err(NeuralError::UnsupportedContentType(
+                    "application/pdf sem assinatura %PDF-".to_string(),
+                ));
+            }
+        }
+        Ok(body)
     }
 
     /// Segue os redirects ate a resposta final, com o filtro de rede aplicado
@@ -246,11 +259,15 @@ impl ReaderClient {
         let mut reader = response
             .body_mut()
             .with_config()
-            .limit(max_bytes as u64)
+            // O limite interno do ureq não é a nossa fronteira de confiança:
+            // dependendo do Content-Encoding ele pode contar bytes numa fase
+            // diferente da decodificação. Lemos no máximo limite+1 e aplicamos
+            // abaixo um teto explícito sobre os bytes que chegam ao chamador.
+            .limit((max_bytes as u64).saturating_add(1))
             .lossy_utf8(text)
             .reader();
 
-        let mut body = Vec::new();
+        let mut body = Vec::with_capacity(max_bytes.min(64 * 1024));
         let mut chunk = [0u8; 16 * 1024];
         loop {
             if cancelled() {
@@ -262,6 +279,13 @@ impl ReaderClient {
             let read = reader.read(&mut chunk)?;
             if read == 0 {
                 break;
+            }
+            let next_len = body.len().saturating_add(read);
+            if next_len > max_bytes {
+                return Err(NeuralError::ResponseTooLarge {
+                    declared: next_len as u64,
+                    limit: max_bytes as u64,
+                });
             }
             body.extend_from_slice(&chunk[..read]);
         }
@@ -316,14 +340,13 @@ pub fn extract_article(url: &Url, html: &str) -> Result<ReaderArticle> {
     )
     .expect("static selector");
     let link_selector = Selector::parse("a").expect("static selector");
+    let block_selector =
+        Selector::parse("h1,h2,h3,h4,h5,h6,p,blockquote,pre,li").expect("static selector");
     let root = document
         .select(&candidate_selector)
         .filter(|candidate| !inside_ignored_container(candidate))
-        .max_by_key(|candidate| score_candidate(candidate, &link_selector))
+        .max_by_key(|candidate| score_candidate(candidate, &link_selector, &block_selector))
         .unwrap_or_else(|| document.root_element());
-
-    let block_selector =
-        Selector::parse("h1,h2,h3,h4,h5,h6,p,blockquote,pre,li").expect("static selector");
     let mut blocks = Vec::new();
     let mut previous = String::new();
 
@@ -387,15 +410,12 @@ pub fn extract_article(url: &Url, html: &str) -> Result<ReaderArticle> {
         }
     }
 
+    // Não usar root.text() como fallback. Em aplicações JS-heavy isso inclui
+    // <script>, JSON de hidratação e estado interno, que pode ser muito maior
+    // do que o conteúdo visível. Sem blocos semânticos reais, falhamos de forma
+    // limpa e deixamos o utilizador abrir a página completa.
     if blocks.is_empty() {
-        let fallback = truncate_chars(
-            normalize_text(root.text().collect::<Vec<_>>().join(" ")),
-            MAX_BLOCK_CHARS,
-        );
-        if fallback.chars().count() < 40 {
-            return Err(NeuralError::ReaderExtraction);
-        }
-        blocks.push(ReaderBlock::Paragraph(fallback));
+        return Err(NeuralError::ReaderExtraction);
     }
 
     Ok(ReaderArticle {
@@ -413,12 +433,23 @@ pub fn extract_article(url: &Url, html: &str) -> Result<ReaderArticle> {
     })
 }
 
-fn score_candidate(candidate: &ElementRef<'_>, link_selector: &Selector) -> usize {
-    let total = normalize_text(candidate.text().collect::<Vec<_>>().join(" "))
-        .chars()
-        .count();
+fn score_candidate(
+    candidate: &ElementRef<'_>,
+    link_selector: &Selector,
+    block_selector: &Selector,
+) -> usize {
+    let total: usize = candidate
+        .select(block_selector)
+        .filter(|node| !inside_ignored_container(node))
+        .map(|node| {
+            normalize_text(node.text().collect::<Vec<_>>().join(" "))
+                .chars()
+                .count()
+        })
+        .sum();
     let link_text: usize = candidate
         .select(link_selector)
+        .filter(|link| !inside_ignored_container(link))
         .map(|link| {
             normalize_text(link.text().collect::<Vec<_>>().join(" "))
                 .chars()
@@ -558,5 +589,19 @@ mod tests {
         </body></html>"#;
         let url = Url::parse("https://example.jp/").unwrap();
         assert!(extract_article(&url, html).is_ok());
+    }
+
+    #[test]
+    fn script_only_page_is_not_exposed_as_reader_text() {
+        let html = r#"<html><head><title>Aplicação</title></head><body>
+        <script>window.ytInitialData = {"secret":"hydration payload"};</script>
+        <style>.hidden{display:none}</style>
+        <div id="app"></div>
+        </body></html>"#;
+        let url = Url::parse("https://example.com/app").unwrap();
+        assert!(matches!(
+            extract_article(&url, html),
+            Err(NeuralError::ReaderExtraction)
+        ));
     }
 }
