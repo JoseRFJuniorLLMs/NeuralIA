@@ -162,11 +162,13 @@ impl ReaderClient {
         let content_type = header(&response, "content-type").to_ascii_lowercase();
         let actual = content_type.split(';').next().unwrap_or("").trim();
         if actual != media_type {
-            return Err(NeuralError::UnsupportedContentType(if content_type.is_empty() {
-                "cabeçalho Content-Type ausente".to_string()
-            } else {
-                content_type
-            }));
+            return Err(NeuralError::UnsupportedContentType(
+                if content_type.is_empty() {
+                    "cabeçalho Content-Type ausente".to_string()
+                } else {
+                    content_type
+                },
+            ));
         }
 
         reject_declared_oversize(&response, max_bytes)?;
