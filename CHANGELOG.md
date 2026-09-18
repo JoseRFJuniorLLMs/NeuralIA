@@ -31,7 +31,7 @@ Security and reliability hardening release after the second recursive audit.
 - Added additional security and history retention tests.
 
 ### Distribution
-- Release workflow emits SHA-256, Cargo metadata and GitHub build-provenance attestation.
+- Release workflow emits SHA-256, a CycloneDX JSON SBOM, Cargo metadata and GitHub build-provenance attestation.
 - Stable release publication refuses to overwrite an existing release.
 
 ### Remaining
