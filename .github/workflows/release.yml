@@ -1,14 +1,62 @@
 name: Windows release
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
 
 permissions:
   contents: read
 
 jobs:
+  tag:
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      created: ${{ steps.version.outputs.created }}
+      tag: ${{ steps.version.outputs.tag }}
+      sha: ${{ steps.version.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - id: version
+        name: Create tag only for a new workspace version
+        shell: bash
+        env:
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          tag="v$version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$TESTED_SHA" >> "$GITHUB_OUTPUT"
+
+          remote_sha=$(git ls-remote --tags origin "refs/tags/$tag^{}" | awk '{print $1}')
+          if [ -z "$remote_sha" ]; then
+            remote_sha=$(git ls-remote --tags origin "refs/tags/$tag" | awk '{print $1}')
+          fi
+
+          if [ -n "$remote_sha" ]; then
+            echo "Release tag $tag already exists; refusing to mutate or republish it."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" "$TESTED_SHA" -m "NeuralIA $tag"
+          git push origin "refs/tags/$tag"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: tag
+    if: needs.tag.outputs.created == 'true'
     runs-on: windows-latest
     permissions:
       contents: read
@@ -17,24 +65,27 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ needs.tag.outputs.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
         with:
           components: clippy
-      - name: Verify tag matches workspace version
+      - name: Verify tested source matches release tag version
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.tag.outputs.tag }}
         run: |
           $line = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
           $version = $line.Matches[0].Groups[1].Value
-          if ($env:GITHUB_REF_NAME -ne "v$version") {
-            throw "Tag $env:GITHUB_REF_NAME does not match workspace version v$version"
+          if ($env:RELEASE_TAG -ne "v$version") {
+            throw "Tag $env:RELEASE_TAG does not match workspace version v$version"
           }
       - run: cargo test --locked -p neural-core
       - run: cargo clippy --locked -p neural-core --all-targets -- -D warnings
       - run: cargo clippy --locked -p neural-app -- -D warnings
-      - name: Build exact tagged source
+      - name: Build exact CI-tested source
         run: cargo build --locked -p neural-app --release
-      - name: Prepare immutable release assets
+      - name: Prepare release assets
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
@@ -47,28 +98,30 @@ jobs:
           subject-path: dist/NeuralIA.exe
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: NeuralIA-windows-x64-${{ github.ref_name }}
+          name: NeuralIA-windows-x64-${{ needs.tag.outputs.tag }}
           path: dist/
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [tag, build]
+    if: needs.tag.outputs.created == 'true' && needs.build.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          name: NeuralIA-windows-x64-${{ github.ref_name }}
+          name: NeuralIA-windows-x64-${{ needs.tag.outputs.tag }}
           path: dist
-      - name: Create immutable release once
+      - name: Create release once; never overwrite stable assets
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.tag.outputs.tag }}
         run: |
           set -euo pipefail
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $GITHUB_REF_NAME already exists; refusing to overwrite assets." >&2
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refusing to overwrite it." >&2
             exit 1
           fi
-          gh release create "$GITHUB_REF_NAME" dist/*             --repo "$GITHUB_REPOSITORY"             --verify-tag             --title "NeuralIA $GITHUB_REF_NAME"             --generate-notes
+          gh release create "$RELEASE_TAG" dist/*             --repo "$GITHUB_REPOSITORY"             --verify-tag             --title "NeuralIA $RELEASE_TAG"             --generate-notes
