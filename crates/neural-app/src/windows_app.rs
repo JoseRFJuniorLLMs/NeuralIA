@@ -2664,8 +2664,7 @@ impl ApplicationHandler<UserEvent> for App {
                         .ok()
                         .and_then(|value| value.parse::<usize>().ok())
                         .filter(|cycles| *cycles > 0),
-                    std::env::var_os("NEURALIA_LIFECYCLE_PROBE")
-                        .map(std::path::PathBuf::from),
+                    std::env::var_os("NEURALIA_LIFECYCLE_PROBE").map(std::path::PathBuf::from),
                 ) {
                     let proxy = self.proxy.clone();
                     let _ = thread::Builder::new()
@@ -3040,9 +3039,7 @@ fn is_pdf_internal_url(target: &str) -> bool {
 fn wait_for_probe_value(path: &std::path::Path, expected: &str, timeout: Duration) -> bool {
     let started = Instant::now();
     while started.elapsed() < timeout {
-        if std::fs::read_to_string(path)
-            .is_ok_and(|value| value.trim() == expected)
-        {
+        if std::fs::read_to_string(path).is_ok_and(|value| value.trim() == expected) {
             return true;
         }
         thread::sleep(Duration::from_millis(80));
