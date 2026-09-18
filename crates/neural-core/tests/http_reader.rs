@@ -99,11 +99,7 @@ fn rejects_declared_oversized_body_before_reading_it() {
 
 #[test]
 fn pdf_requires_content_type_and_signature() {
-    let missing_type = serve(vec![response(
-        "200 OK",
-        &[],
-        b"%PDF-1.7\nmock",
-    )]);
+    let missing_type = serve(vec![response("200 OK", &[], b"%PDF-1.7\nmock")]);
     assert!(matches!(
         ReaderClient::new(3, 64 * 1024).fetch_document(
             &missing_type,
