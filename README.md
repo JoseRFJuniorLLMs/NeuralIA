@@ -6,7 +6,7 @@
 
 ## What NeuralIA is
 
-NeuralIA **v1.1.4** is an AI-first, reader-first, system-WebView information client written in Rust.
+NeuralIA **v1.2.0** is an AI-first, reader-first, system-WebView information client written in Rust.
 
 It deliberately refuses the usual browser arms race. It does not ship Chromium, does not implement its own JavaScript engine, does not carry a local LLM, and does not try to become an operating system with tabs.
 
@@ -19,9 +19,16 @@ native Rust home
       └── web:<URL> ────────► full page ─────────────────┘
 ```
 
-Uma pergunta normal abre o **comparador de três IAs**. `ask:` ou `?` limita a
-consulta ao Google AI Mode quando o utilizador quer um único fornecedor. A Home
-não dispara nenhuma consulta sozinha.
+Uma pergunta normal abre o **comparador de três IAs** e é enviada de verdade às
+três superfícies: Gemini, ChatGPT e Claude. `ask:` ou `?` limita a consulta ao
+Google AI Mode quando o utilizador quer um único fornecedor. A Home não dispara
+nenhuma consulta sozinha.
+
+No comparador, links externos abrem em **Split View** ao lado da IA que gerou a
+fonte; fechar a gaveta devolve a comparação sem perder o contexto. `Ctrl+K` ou
+`Ctrl+T` abre uma omnibox flutuante: URL abre ao lado, texto é enviado à IA
+ativa. As scrollbars nativas das três colunas ficam escondidas; a timeline
+vertical centralizada passa a ser o controle de rolagem.
 
 On Windows, **no WebView is created while the native home screen is idle**. The Home background is also native: a low-frequency GDI neural network animation flows toward the brand without video, Canvas, WebView or network access. Set `NEURALIA_REDUCE_MOTION=1` to keep the background static. The omnibox is a native Windows edit control; WebView2 is instantiated only after the user asks, reads, or explicitly opens a page, and it is destroyed when the user returns home.
 

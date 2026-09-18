@@ -89,6 +89,18 @@ enum UserEvent {
     OpenExternal(String),
     /// Popup pedido por uma coluna do comparador: carrega nessa coluna.
     OpenInColumn(usize, String),
+    /// Fonte aberta sem abandonar a conversa que a originou.
+    OpenSplit {
+        source_index: usize,
+        url: String,
+    },
+    CloseSplit,
+    ToggleSplitFullscreen,
+    /// Entrada da omnibox flutuante, sempre associada à IA que tinha foco.
+    PaletteSubmit {
+        source_index: usize,
+        input: String,
+    },
     ExpandComparator(usize),
     RestoreComparator,
     ReaderReady {
@@ -339,9 +351,18 @@ struct ComparatorView {
     name: &'static str,
 }
 
+struct SplitView {
+    webview: WebView,
+    source_index: usize,
+    fullscreen: bool,
+}
+
 struct ComparatorState {
     views: Vec<ComparatorView>,
     expanded: Option<usize>,
+    split: Option<SplitView>,
+    /// Histórico leve de fontes por IA. Não cria abas; só preserva contexto.
+    contexts: [Vec<String>; COMPARATOR_COLUMNS],
 }
 
 const EM_SETSEL: u32 = 0x00B1;
@@ -1710,6 +1731,8 @@ impl App {
         self.comparator = Some(ComparatorState {
             views,
             expanded: None,
+            split: None,
+            contexts: std::array::from_fn(|_| Vec::new()),
         });
         self.bar_hover = None;
         self.surface = Surface::Comparator;
@@ -1721,6 +1744,13 @@ impl App {
     /// isso vira "sair da tela cheia" quando a coluna ja esta expandida. Sem a
     /// barra nativa em tela cheia, esse botao e o Esc sao o caminho de volta.
     fn expand_comparator(&mut self, idx: usize) {
+        if self
+            .comparator
+            .as_ref()
+            .is_some_and(|comp| comp.split.is_some())
+        {
+            self.close_split();
+        }
         let mut restored = false;
         if let Some(comp) = &mut self.comparator
             && idx < comp.views.len()
@@ -1794,6 +1824,41 @@ impl App {
         let content_h = (logical_h - TOP_BAR_HEIGHT).max(100.0);
         let content_y = TOP_BAR_HEIGHT;
 
+        // Fonte lateral: a IA que originou o link continua visível, as demais
+        // ficam vivas e preservam estado para reaparecer ao fechar a gaveta.
+        if let Some(split) = &comp.split {
+            if split.fullscreen {
+                for view in &comp.views {
+                    let _ = view.webview.set_visible(false);
+                }
+                let _ = split.webview.set_bounds(wry::Rect {
+                    position: LogicalPosition::new(0.0, 0.0).into(),
+                    size: LogicalSize::new(logical_w, logical_h).into(),
+                });
+                let _ = split.webview.set_visible(true);
+                return;
+            }
+
+            let ai_width = (logical_w * 0.54).clamp(logical_w * 0.38, logical_w * 0.68);
+            for (index, view) in comp.views.iter().enumerate() {
+                if index == split.source_index {
+                    let _ = view.webview.set_bounds(wry::Rect {
+                        position: LogicalPosition::new(0.0, content_y).into(),
+                        size: LogicalSize::new(ai_width, content_h).into(),
+                    });
+                    let _ = view.webview.set_visible(true);
+                } else {
+                    let _ = view.webview.set_visible(false);
+                }
+            }
+            let _ = split.webview.set_bounds(wry::Rect {
+                position: LogicalPosition::new(ai_width, content_y).into(),
+                size: LogicalSize::new((logical_w - ai_width).max(1.0), content_h).into(),
+            });
+            let _ = split.webview.set_visible(true);
+            return;
+        }
+
         match comp.expanded {
             Some(idx) => {
                 // Ecra completo. A coluna ocupa tudo menos uma faixa de 1px no
@@ -1849,13 +1914,44 @@ impl App {
         let navigation_capability = capability.clone();
 
         let init_script = format!(
-            "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{COMPARATOR_INJECT_SCRIPT}"
+            "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{NEURALIA_PALETTE_SCRIPT}\n{AI_AUTO_SUBMIT_SCRIPT}\n{COMPARATOR_INJECT_SCRIPT}"
         )
         .replace("__NEURALIA_CAP__", &capability);
 
         WebViewBuilder::new()
             .with_initialization_script(init_script)
             .with_navigation_handler(move |target| {
+                if target.starts_with("neuralia:split") {
+                    if remote_capability_matches(&target, &navigation_capability)
+                        && let (Some(col), Some(url)) = (
+                            neuralia_query_param(&target, "col"),
+                            neuralia_query_param(&target, "url"),
+                        )
+                        && let Ok(source_index) = col.parse::<usize>()
+                        && remote_web_target(&url, false)
+                    {
+                        let _ = navigation_proxy.send_event(UserEvent::OpenSplit {
+                            source_index,
+                            url,
+                        });
+                    }
+                    return false;
+                }
+                if target.starts_with("neuralia:palette") {
+                    if remote_capability_matches(&target, &navigation_capability)
+                        && let (Some(col), Some(input)) = (
+                            neuralia_query_param(&target, "col"),
+                            neuralia_query_param(&target, "q"),
+                        )
+                        && let Ok(source_index) = col.parse::<usize>()
+                    {
+                        let _ = navigation_proxy.send_event(UserEvent::PaletteSubmit {
+                            source_index,
+                            input,
+                        });
+                    }
+                    return false;
+                }
                 if target.starts_with("neuralia:expand") {
                     if remote_capability_matches(&target, &navigation_capability)
                         && let Ok(action_url) = Url::parse(&target)
@@ -1904,15 +2000,268 @@ impl App {
         }
     }
 
+    fn split_webview_builder(
+        &self,
+        source_index: usize,
+        source_name: &'static str,
+        allow_local: bool,
+    ) -> WebViewBuilder<'static> {
+        let navigation_proxy = self.proxy.clone();
+        let new_window_proxy = self.proxy.clone();
+        let capability = remote_capability();
+        let navigation_capability = capability.clone();
+        let init_script = format!(
+            "window.__neuralia_col_index = {source_index}; window.__neuralia_col_name = '{source_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{NEURALIA_PALETTE_SCRIPT}\n{SPLIT_PANEL_SCRIPT}"
+        )
+        .replace("__NEURALIA_CAP__", &capability);
+
+        WebViewBuilder::new()
+            .with_initialization_script(init_script)
+            .with_navigation_handler(move |target| {
+                if target.starts_with("neuralia:split-close") {
+                    if remote_capability_matches(&target, &navigation_capability) {
+                        let _ = navigation_proxy.send_event(UserEvent::CloseSplit);
+                    }
+                    return false;
+                }
+                if target.starts_with("neuralia:split-expand") {
+                    if remote_capability_matches(&target, &navigation_capability) {
+                        let _ = navigation_proxy.send_event(UserEvent::ToggleSplitFullscreen);
+                    }
+                    return false;
+                }
+                if target.starts_with("neuralia:palette") {
+                    if remote_capability_matches(&target, &navigation_capability)
+                        && let Some(input) = neuralia_query_param(&target, "q")
+                    {
+                        let _ = navigation_proxy.send_event(UserEvent::PaletteSubmit {
+                            source_index,
+                            input,
+                        });
+                    }
+                    return false;
+                }
+                if let Some(event) = remote_neuralia_action(&target, &navigation_capability) {
+                    let _ = navigation_proxy.send_event(event);
+                    return false;
+                }
+                remote_web_target(&target, allow_local)
+            })
+            .with_new_window_req_handler(move |target, _features| {
+                if remote_web_target(&target, false) {
+                    let _ = new_window_proxy.send_event(UserEvent::OpenSplit {
+                        source_index,
+                        url: target,
+                    });
+                }
+                NewWindowResponse::Deny
+            })
+            .with_permission_handler(|_| PermissionResponse::Deny)
+            .with_focused(true)
+    }
+
+    fn open_split(&mut self, source_index: usize, url: String, allow_local: bool) {
+        if self.surface != Surface::Comparator {
+            self.web(url);
+            return;
+        }
+
+        let Ok(valid) = neural_core::validate_web_url(&url) else {
+            self.show_splash("URL da fonte inválida.".to_string(), 3);
+            return;
+        };
+        if !allow_local && neural_core::is_local_network_target(&valid) {
+            self.show_splash(
+                "A página não pode redirecionar a fonte para a rede local.".to_string(),
+                4,
+            );
+            return;
+        }
+
+        let Some(source_name) = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.views.get(source_index))
+            .map(|view| view.name)
+        else {
+            return;
+        };
+
+        self.leave_fullscreen();
+        if let Some(comp) = &mut self.comparator {
+            comp.expanded = None;
+            if let Some(previous) = comp.split.take() {
+                drop(previous);
+            }
+        }
+
+        let Some(window) = &self.window else {
+            return;
+        };
+        let size = window.inner_size();
+        let scale = window.scale_factor().max(1.0);
+        let logical_w = size.width as f64 / scale;
+        let logical_h = size.height as f64 / scale;
+        let ai_width = logical_w * 0.54;
+        let bounds = wry::Rect {
+            position: LogicalPosition::new(ai_width, TOP_BAR_HEIGHT).into(),
+            size: LogicalSize::new(
+                (logical_w - ai_width).max(1.0),
+                (logical_h - TOP_BAR_HEIGHT).max(100.0),
+            )
+            .into(),
+        };
+
+        let result = self
+            .split_webview_builder(source_index, source_name, allow_local)
+            .with_bounds(bounds)
+            .with_url(valid.as_str())
+            .build_as_child(window);
+
+        match result {
+            Ok(webview) => {
+                let _ = webview.zoom(self.zoom);
+                if let Some(comp) = &mut self.comparator {
+                    let links = &mut comp.contexts[source_index];
+                    let value = valid.to_string();
+                    if links.last() != Some(&value) {
+                        links.push(value);
+                        if links.len() > 32 {
+                            links.remove(0);
+                        }
+                    }
+                    comp.split = Some(SplitView {
+                        webview,
+                        source_index,
+                        fullscreen: false,
+                    });
+                }
+                self.update_comparator_layout();
+                self.request_redraw();
+            }
+            Err(error) => {
+                self.show_splash(format!("Não consegui abrir a fonte ao lado: {error}"), 4)
+            }
+        }
+    }
+
+    fn close_split(&mut self) {
+        let was_fullscreen = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.split.as_ref())
+            .is_some_and(|split| split.fullscreen);
+        if let Some(comp) = &mut self.comparator
+            && let Some(split) = comp.split.take()
+        {
+            drop(split);
+        }
+        if was_fullscreen
+            && let Some(window) = &self.window
+        {
+            window.set_fullscreen(None);
+        }
+        self.update_comparator_layout();
+        self.request_redraw();
+    }
+
+    fn toggle_split_fullscreen(&mut self) {
+        let Some(fullscreen) = self
+            .comparator
+            .as_mut()
+            .and_then(|comp| comp.split.as_mut())
+            .map(|split| {
+                split.fullscreen = !split.fullscreen;
+                split.fullscreen
+            })
+        else {
+            return;
+        };
+
+        if let Some(window) = &self.window {
+            window.set_fullscreen(if fullscreen {
+                Some(Fullscreen::Borderless(None))
+            } else {
+                None
+            });
+        }
+        if let Some(comp) = &self.comparator
+            && let Some(split) = &comp.split
+        {
+            let script = if fullscreen {
+                SPLIT_BUTTON_EXPANDED
+            } else {
+                SPLIT_BUTTON_COLLAPSED
+            };
+            let _ = split.webview.evaluate_script(script);
+        }
+        self.update_comparator_layout();
+        self.request_redraw();
+    }
+
+    fn submit_palette(&mut self, source_index: usize, input: String) {
+        let input = input.trim();
+        if input.is_empty() {
+            return;
+        }
+
+        match parse_intent(input) {
+            Ok(Intent::Read(url)) | Ok(Intent::Web(url)) => {
+                self.open_split(source_index, url.to_string(), true);
+            }
+            Ok(Intent::Home) => self.show_home(),
+            Ok(Intent::Ask(query)) | Ok(Intent::Compare(query)) => {
+                let target = match source_index {
+                    0 => google_ai_url(&query, &self.config.language),
+                    1 => chatgpt_search_url(&query),
+                    2 => claude_search_url(&query),
+                    _ => return,
+                };
+                match target {
+                    Ok(url) => {
+                        if let Some(view) = self
+                            .comparator
+                            .as_ref()
+                            .and_then(|comp| comp.views.get(source_index))
+                        {
+                            let _ = view.webview.load_url(url.as_str());
+                            self.record(HistoryKind::Ask, query, url.to_string());
+                        }
+                    }
+                    Err(error) => self.show_splash(error.to_string(), 3),
+                }
+            }
+            Err(error) => self.show_splash(error.to_string(), 3),
+        }
+    }
+
     /// Um nivel para tras. O Escape da janela nativa e o Escape apanhado dentro
     /// das paginas acabam os dois aqui.
     fn go_back(&mut self) {
-        if self.surface == Surface::Comparator
-            && let Some(comp) = &self.comparator
-            && comp.expanded.is_some()
-        {
-            self.restore_comparator();
-            return;
+        if self.surface == Surface::Comparator {
+            if self
+                .comparator
+                .as_ref()
+                .and_then(|comp| comp.split.as_ref())
+                .is_some_and(|split| split.fullscreen)
+            {
+                self.toggle_split_fullscreen();
+                return;
+            }
+            if self
+                .comparator
+                .as_ref()
+                .is_some_and(|comp| comp.split.is_some())
+            {
+                self.close_split();
+                return;
+            }
+            if let Some(comp) = &self.comparator
+                && comp.expanded.is_some()
+            {
+                self.restore_comparator();
+                return;
+            }
         }
         self.show_home();
     }
@@ -2579,6 +2928,15 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::OpenExternal(url) => self.web(url),
             UserEvent::OpenInColumn(index, url) => self.open_in_column(index, url),
+            UserEvent::OpenSplit { source_index, url } => {
+                self.open_split(source_index, url, false);
+            }
+            UserEvent::CloseSplit => self.close_split(),
+            UserEvent::ToggleSplitFullscreen => self.toggle_split_fullscreen(),
+            UserEvent::PaletteSubmit {
+                source_index,
+                input,
+            } => self.submit_palette(source_index, input),
             UserEvent::ExpandComparator(idx) => {
                 if self.surface == Surface::Comparator {
                     self.expand_comparator(idx);
@@ -2844,6 +3202,14 @@ fn remote_neuralia_action(target: &str, capability: &str) -> Option<UserEvent> {
         return None;
     }
     neuralia_action(target)
+}
+
+fn neuralia_query_param(target: &str, key: &str) -> Option<String> {
+    Url::parse(target)
+        .ok()?
+        .query_pairs()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.into_owned())
 }
 
 fn remote_web_target(target: &str, allow_local: bool) -> bool {
@@ -3741,7 +4107,20 @@ mod tests {
         assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia-response-rail"));
         assert!(COMPARATOR_INJECT_SCRIPT.contains("Resposta anterior"));
         assert!(COMPARATOR_INJECT_SCRIPT.contains("Próxima resposta"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("window.scrollBy"));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("scrollToPosition"));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia-scroll-root"));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("top:'50%'"));
+    }
+
+    #[test]
+    fn comparator_has_split_palette_and_real_three_way_submit() {
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia:split?col="));
+        assert!(NEURALIA_PALETTE_SCRIPT.contains("neuralia:palette?col="));
+        assert!(SPLIT_PANEL_SCRIPT.contains("neuralia:split-close"));
+        assert!(SPLIT_PANEL_SCRIPT.contains("neuralia:split-expand"));
+        assert!(AI_AUTO_SUBMIT_SCRIPT.contains("chatgpt.com"));
+        assert!(AI_AUTO_SUBMIT_SCRIPT.contains("claude.ai"));
+        assert!(AI_AUTO_SUBMIT_SCRIPT.contains("button.click()"));
     }
 
     #[test]
@@ -4365,7 +4744,17 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
         case 'r': e.preventDefault(); act('reload'); return;
         case 'l': e.preventDefault(); act('omnibox'); return;
         case 'h': e.preventDefault(); act('history'); return;
-        case 't': e.preventDefault(); act('home'); return;
+        case 'k':
+        case 't':
+          e.preventDefault();
+          if (typeof window.__neuralia_col_index === 'number') {
+            window.dispatchEvent(new CustomEvent('neuralia-open-palette'));
+          } else if (key === 'k') {
+            act('omnibox');
+          } else {
+            act('home');
+          }
+          return;
         case 'w': e.preventDefault(); act('back'); return;
         case 'p': e.preventDefault(); act('print'); return;
         case 'f': e.preventDefault(); findBar(); return;
@@ -4435,6 +4824,199 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 "#;
 
+const NEURALIA_PALETTE_SCRIPT: &str = r#"
+(function () {
+  if (window.__neuralia_palette_ready) return;
+  window.__neuralia_palette_ready = true;
+  const capability = '__NEURALIA_CAP__';
+
+  function closePalette() {
+    const old = document.getElementById('neuralia-palette');
+    if (old) old.remove();
+  }
+
+  function openPalette() {
+    closePalette();
+    const colIndex = window.__neuralia_col_index;
+    if (typeof colIndex !== 'number') return;
+
+    const shade = document.createElement('div');
+    shade.id = 'neuralia-palette';
+    Object.assign(shade.style, {
+      position:'fixed', inset:'0', zIndex:'2147483647',
+      display:'flex', alignItems:'flex-start', justifyContent:'center',
+      paddingTop:'18vh', background:'rgba(0,0,0,.22)',
+      backdropFilter:'blur(2px)', fontFamily:'Segoe UI, system-ui, sans-serif'
+    });
+
+    const box = document.createElement('div');
+    Object.assign(box.style, {
+      width:'min(680px, calc(100vw - 48px))', borderRadius:'18px',
+      padding:'12px 16px', background:'rgba(24,26,28,.97)',
+      border:'1px solid rgba(255,255,255,.12)',
+      boxShadow:'0 24px 80px rgba(0,0,0,.48)'
+    });
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    input.placeholder = 'Pergunte à IA ativa ou digite uma URL';
+    Object.assign(input.style, {
+      width:'100%', boxSizing:'border-box', border:'0', outline:'0',
+      background:'transparent', color:'#fff',
+      font:'500 18px Segoe UI, system-ui, sans-serif', padding:'9px 4px'
+    });
+
+    const hint = document.createElement('div');
+    hint.textContent = 'URL → abre ao lado   ·   texto → envia para '
+      + (window.__neuralia_col_name || 'IA') + '   ·   Esc fecha';
+    Object.assign(hint.style, {
+      color:'rgba(255,255,255,.48)', fontSize:'11px', padding:'2px 4px 4px'
+    });
+
+    input.addEventListener('keydown', (event) => {
+      event.stopPropagation();
+      if (event.key === 'Escape') {
+        event.preventDefault(); closePalette(); return;
+      }
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        const value = input.value.trim();
+        if (!value) return;
+        window.location.href = 'neuralia:palette?col=' + colIndex
+          + '&q=' + encodeURIComponent(value)
+          + '&cap=' + encodeURIComponent(capability);
+      }
+    }, true);
+
+    shade.addEventListener('mousedown', (event) => {
+      if (event.target === shade) closePalette();
+    });
+    box.appendChild(input);
+    box.appendChild(hint);
+    shade.appendChild(box);
+    document.documentElement.appendChild(shade);
+    setTimeout(() => input.focus(), 0);
+  }
+
+  window.addEventListener('neuralia-open-palette', openPalette);
+})();
+"#;
+
+/// ChatGPT e Claude aceitam a consulta por ?q=, mas hoje apenas preenchem o
+/// compositor. O comparador tem semântica de "perguntar às três", portanto o
+/// NeuralIA confirma o envio assim que o botão real do fornecedor fica pronto.
+const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
+(function () {
+  const host = location.hostname.toLowerCase();
+  if (host !== 'chatgpt.com' && host !== 'claude.ai') return;
+  const query = new URL(location.href).searchParams.get('q');
+  if (!query || !query.trim()) return;
+
+  const stampKey = 'neuralia:auto-submit:' + host + ':' + query;
+  const previous = Number(sessionStorage.getItem(stampKey) || '0');
+  if (Date.now() - previous < 10000) return;
+
+  function promptText() {
+    const el = document.querySelector(
+      'textarea, [data-testid="prompt-textarea"], [contenteditable="true"][role="textbox"], div[contenteditable="true"]'
+    );
+    if (!el) return '';
+    return String('value' in el ? el.value : el.innerText || el.textContent || '').trim();
+  }
+
+  function candidates() {
+    if (host === 'chatgpt.com') {
+      return [
+        'button[data-testid="send-button"]',
+        'button[aria-label*="Send prompt"]',
+        'button[aria-label*="Send message"]',
+        'form button[type="submit"]'
+      ];
+    }
+    return [
+      'button[aria-label*="Send"]',
+      'button[data-testid*="send"]',
+      'form button[type="submit"]'
+    ];
+  }
+
+  let attempts = 0;
+  function submitWhenReady() {
+    attempts += 1;
+    const typed = promptText();
+    if (typed) {
+      for (const selector of candidates()) {
+        const button = document.querySelector(selector);
+        if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') continue;
+        const rect = button.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        sessionStorage.setItem(stampKey, String(Date.now()));
+        button.click();
+        return;
+      }
+    }
+    if (attempts < 120) setTimeout(submitWhenReady, 150);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => setTimeout(submitWhenReady, 100), { once:true });
+  } else {
+    setTimeout(submitWhenReady, 100);
+  }
+})();
+"#;
+
+const SPLIT_PANEL_SCRIPT: &str = r#"
+document.addEventListener('DOMContentLoaded', () => {
+  if (document.getElementById('neuralia-split-controls')) return;
+  const capability = '__NEURALIA_CAP__';
+  const controls = document.createElement('div');
+  controls.id = 'neuralia-split-controls';
+  Object.assign(controls.style, {
+    position:'fixed', top:'12px', right:'12px', zIndex:'2147483647',
+    display:'flex', alignItems:'center', gap:'7px',
+    padding:'6px', borderRadius:'999px',
+    background:'rgba(17,19,20,.88)', border:'1px solid rgba(255,255,255,.10)',
+    boxShadow:'0 8px 28px rgba(0,0,0,.30)', backdropFilter:'blur(10px)',
+    fontFamily:'Segoe UI, system-ui, sans-serif'
+  });
+
+  const label = document.createElement('span');
+  label.textContent = 'Fonte · ' + (window.__neuralia_col_name || 'IA');
+  Object.assign(label.style, {
+    color:'rgba(255,255,255,.65)', fontSize:'11px', padding:'0 5px 0 7px'
+  });
+
+  function button(id, text, title, action) {
+    const b = document.createElement('button');
+    b.id = id;
+    b.textContent = text;
+    b.title = title;
+    Object.assign(b.style, {
+      width:'30px', height:'30px', padding:'0', border:'0',
+      borderRadius:'50%', background:'rgba(255,255,255,.10)',
+      color:'#fff', cursor:'pointer', fontSize:'16px'
+    });
+    b.onclick = (event) => {
+      event.preventDefault(); event.stopPropagation();
+      window.location.href = 'neuralia:' + action
+        + '?cap=' + encodeURIComponent(capability);
+    };
+    return b;
+  }
+
+  controls.appendChild(label);
+  controls.appendChild(button('neuralia-split-expand', '⛶', 'Expandir fonte', 'split-expand'));
+  controls.appendChild(button('neuralia-split-close', '×', 'Fechar fonte', 'split-close'));
+  document.documentElement.appendChild(controls);
+});
+"#;
+
+const SPLIT_BUTTON_EXPANDED: &str = "(function(){var b=document.getElementById('neuralia-split-expand');if(b){b.textContent='↙';b.title='Voltar ao split view';}})();";
+const SPLIT_BUTTON_COLLAPSED: &str = "(function(){var b=document.getElementById('neuralia-split-expand');if(b){b.textContent='⛶';b.title='Expandir fonte';}})();";
+
 const COMPARATOR_INJECT_SCRIPT: &str = r#"
 document.addEventListener('DOMContentLoaded', () => {
   const colIndex = window.__neuralia_col_index ?? 0;
@@ -4444,26 +5026,80 @@ document.addEventListener('DOMContentLoaded', () => {
   function mountControls() {
     if (document.getElementById('neuralia-comp-controls')) return;
 
+    const style = document.createElement('style');
+    style.id = 'neuralia-scroll-style';
+    style.textContent = [
+      'html,body,.neuralia-scroll-root{scrollbar-width:none!important;-ms-overflow-style:none!important;}',
+      'html::-webkit-scrollbar,body::-webkit-scrollbar,.neuralia-scroll-root::-webkit-scrollbar{width:0!important;height:0!important;display:none!important;}'
+    ].join('');
+    document.documentElement.appendChild(style);
+
+    let currentRoot = null;
+    function scrollRoot() {
+      const docRoot = document.scrollingElement || document.documentElement || document.body;
+      const candidates = docRoot ? [docRoot] : [];
+      document.querySelectorAll(
+        'main,[role="main"],[class*="scroll"],[class*="overflow"],[style*="overflow"]'
+      ).forEach((el) => candidates.push(el));
+
+      let best = docRoot;
+      let bestRange = best ? Math.max(0, best.scrollHeight - best.clientHeight) : 0;
+      for (const el of candidates) {
+        if (!el || el === document.body) continue;
+        const range = Math.max(0, el.scrollHeight - el.clientHeight);
+        if (range <= bestRange + 24) continue;
+        const css = getComputedStyle(el);
+        if (css.overflowY === 'hidden' || css.display === 'none') continue;
+        best = el;
+        bestRange = range;
+      }
+      if (currentRoot && currentRoot !== best && currentRoot.classList) {
+        currentRoot.classList.remove('neuralia-scroll-root');
+      }
+      currentRoot = best || docRoot;
+      if (currentRoot && currentRoot.classList) currentRoot.classList.add('neuralia-scroll-root');
+      return currentRoot;
+    }
+
+    function metrics() {
+      const root = scrollRoot();
+      if (!root) return { root:null, top:0, max:0, docLike:true };
+      const docLike = root === document.scrollingElement
+        || root === document.documentElement || root === document.body;
+      return {
+        root,
+        docLike,
+        top: docLike ? window.scrollY : root.scrollTop,
+        max: Math.max(0, root.scrollHeight - root.clientHeight)
+      };
+    }
+
+    function scrollToPosition(top) {
+      const state = metrics();
+      const value = Math.max(0, Math.min(state.max, top));
+      if (state.docLike) window.scrollTo({ top:value, behavior:'smooth' });
+      else if (state.root) state.root.scrollTo({ top:value, behavior:'smooth' });
+    }
+
     const controls = document.createElement('div');
     controls.id = 'neuralia-comp-controls';
     Object.assign(controls.style, {
-      position:'fixed', top:'10px', right:'10px', bottom:'18px',
-      zIndex:'2147483647', display:'flex', flexDirection:'column',
-      alignItems:'flex-end', justifyContent:'space-between',
-      pointerEvents:'none', fontFamily:'Segoe UI, sans-serif'
+      position:'fixed', inset:'0', zIndex:'2147483647',
+      pointerEvents:'none', fontFamily:'Segoe UI, system-ui, sans-serif'
     });
 
     const expand = document.createElement('button');
     expand.id = 'neuralia-comp-expand';
     expand.textContent = '⛶ ' + colName;
     Object.assign(expand.style, {
+      position:'absolute', top:'10px', right:'10px',
       pointerEvents:'auto', border:'1px solid rgba(255,255,255,.12)',
       borderRadius:'999px', padding:'6px 11px', background:'rgba(17,19,20,.90)',
       color:'#fff', fontSize:'11px', fontWeight:'600',
       boxShadow:'0 5px 18px rgba(0,0,0,.28)', cursor:'pointer'
     });
-    expand.onclick = (e) => {
-      e.preventDefault(); e.stopPropagation();
+    expand.onclick = (event) => {
+      event.preventDefault(); event.stopPropagation();
       window.location.href = 'neuralia:expand?col=' + colIndex
         + '&cap=' + encodeURIComponent(capability);
     };
@@ -4471,33 +5107,35 @@ document.addEventListener('DOMContentLoaded', () => {
     const rail = document.createElement('div');
     rail.id = 'neuralia-response-rail';
     Object.assign(rail.style, {
-      pointerEvents:'auto', width:'48px', minHeight:'220px', maxHeight:'56vh',
-      padding:'4px 3px', background:'transparent',
+      position:'absolute', top:'50%', right:'7px', transform:'translateY(-50%)',
+      pointerEvents:'auto', width:'44px', minHeight:'240px', maxHeight:'58vh',
       display:'flex', flexDirection:'column', alignItems:'center',
-      justifyContent:'space-between', opacity:'.72', transition:'opacity .18s ease'
+      justifyContent:'space-between', opacity:'.68',
+      transition:'opacity .18s ease'
     });
     rail.onmouseenter = () => { rail.style.opacity = '1'; };
-    rail.onmouseleave = () => { rail.style.opacity = '.72'; };
+    rail.onmouseleave = () => { rail.style.opacity = '.68'; };
 
     function arrow(symbol, title, direction) {
       const button = document.createElement('button');
       button.textContent = symbol;
       button.title = title;
       Object.assign(button.style, {
-        width: direction > 0 ? '42px' : '36px',
-        height: direction > 0 ? '42px' : '32px',
+        width: direction > 0 ? '42px' : '32px',
+        height: direction > 0 ? '42px' : '28px',
         border: direction > 0 ? '1px solid rgba(255,255,255,.08)' : '0',
-        borderRadius:'50%',
+        borderRadius:'50%', padding:'0',
         background: direction > 0 ? 'rgba(38,38,38,.94)' : 'transparent',
-        color: direction > 0 ? '#f4f4f4' : 'rgba(255,255,255,.52)',
+        color: direction > 0 ? '#f4f4f4' : 'rgba(255,255,255,.46)',
         boxShadow: direction > 0 ? '0 6px 20px rgba(0,0,0,.28)' : 'none',
-        fontSize:'22px', lineHeight: direction > 0 ? '38px' : '28px',
-        padding:'0', cursor:'pointer'
+        fontSize:'21px', lineHeight: direction > 0 ? '38px' : '26px',
+        cursor:'pointer'
       });
-      button.onclick = (e) => {
-        e.preventDefault(); e.stopPropagation();
-        const step = Math.max(220, window.innerHeight * 0.82) * direction;
-        window.scrollBy({ top: step, behavior:'smooth' });
+      button.onclick = (event) => {
+        event.preventDefault(); event.stopPropagation();
+        const state = metrics();
+        const view = state.root ? state.root.clientHeight : window.innerHeight;
+        scrollToPosition(state.top + Math.max(220, view * .82) * direction);
       };
       return button;
     }
@@ -4511,24 +5149,25 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     function rebuildTicks() {
-      const scrollable = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+      const state = metrics();
+      const view = state.root ? state.root.clientHeight : window.innerHeight;
       const count = Math.max(5, Math.min(11,
-        Math.ceil((scrollable + window.innerHeight) / Math.max(window.innerHeight, 1))));
+        Math.ceil((state.max + Math.max(view, 1)) / Math.max(view, 1))));
       if (ticks.children.length === count) return;
       ticks.textContent = '';
       for (let i = 0; i < count; i++) {
         const tick = document.createElement('div');
         tick.dataset.tick = String(i);
         Object.assign(tick.style, {
-          height:'2px', width:i === 0 ? '30px' : '15px', borderRadius:'2px',
+          height:'2px', width:i === 0 ? '30px' : '14px', borderRadius:'2px',
           background:'rgba(255,255,255,.30)',
           transition:'width .16s ease, background .16s ease, opacity .16s ease'
         });
-        tick.onclick = (e) => {
-          e.preventDefault(); e.stopPropagation();
-          const max = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+        tick.onclick = (event) => {
+          event.preventDefault(); event.stopPropagation();
+          const state = metrics();
           const fraction = count <= 1 ? 0 : i / (count - 1);
-          window.scrollTo({ top:max * fraction, behavior:'smooth' });
+          scrollToPosition(state.max * fraction);
         };
         ticks.appendChild(tick);
       }
@@ -4536,15 +5175,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function syncTicks() {
       rebuildTicks();
-      const max = Math.max(1, document.documentElement.scrollHeight - window.innerHeight);
-      const progress = Math.max(0, Math.min(1, window.scrollY / max));
+      const state = metrics();
+      const progress = state.max <= 0 ? 0 : Math.max(0, Math.min(1, state.top / state.max));
       const count = ticks.children.length;
       const active = Math.round(progress * Math.max(0, count - 1));
       Array.from(ticks.children).forEach((tick, i) => {
         const selected = i === active;
-        tick.style.width = selected ? '32px' : (Math.abs(i - active) === 1 ? '23px' : '14px');
-        tick.style.background = selected ? '#fff' : 'rgba(255,255,255,.34)';
-        tick.style.opacity = selected ? '1' : (Math.abs(i - active) === 1 ? '.82' : '.62');
+        tick.style.width = selected ? '32px' : (Math.abs(i - active) === 1 ? '22px' : '13px');
+        tick.style.background = selected ? '#fff' : 'rgba(255,255,255,.32)';
+        tick.style.opacity = selected ? '1' : (Math.abs(i - active) === 1 ? '.78' : '.55');
       });
     }
 
@@ -4561,6 +5200,7 @@ document.addEventListener('DOMContentLoaded', () => {
       raf = requestAnimationFrame(() => { raf = 0; syncTicks(); });
     };
     window.addEventListener('scroll', scheduleSync, { passive:true });
+    document.addEventListener('scroll', scheduleSync, { passive:true, capture:true });
     window.addEventListener('resize', scheduleSync, { passive:true });
     new MutationObserver(scheduleSync).observe(document.documentElement, {
       childList:true, subtree:true
@@ -4573,13 +5213,43 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!document.getElementById('neuralia-comp-controls')) mountControls();
   }).observe(document.documentElement, { childList:true, subtree:true });
 
-  document.addEventListener('dblclick', (e) => {
-    if (e.target && e.target.closest && e.target.closest('#neuralia-comp-controls')) return;
-    const tag = e.target && e.target.tagName ? e.target.tagName.toUpperCase() : '';
+  // Uma fonte externa abre ao lado da conversa que a produziu.
+  document.addEventListener('click', (event) => {
+    if (!event.isTrusted || event.defaultPrevented) return;
+    if (event.target && event.target.closest
+        && event.target.closest('#neuralia-comp-controls,#neuralia-palette')) return;
+    const anchor = event.target && event.target.closest
+      ? event.target.closest('a[href]') : null;
+    if (!anchor) return;
+
+    let target;
+    try { target = new URL(anchor.href, location.href); } catch (_) { return; }
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') return;
+
+    if (target.hostname.endsWith('google.com') && target.pathname === '/url') {
+      const actual = target.searchParams.get('q') || target.searchParams.get('url');
+      if (actual) {
+        try { target = new URL(actual); } catch (_) {}
+      }
+    }
+
+    if (target.hostname === location.hostname) return;
+    event.preventDefault();
+    event.stopPropagation();
+    window.location.href = 'neuralia:split?col=' + colIndex
+      + '&url=' + encodeURIComponent(target.href)
+      + '&cap=' + encodeURIComponent(capability);
+  }, true);
+
+  document.addEventListener('dblclick', (event) => {
+    if (event.target && event.target.closest
+        && event.target.closest('#neuralia-comp-controls,#neuralia-palette')) return;
+    const tag = event.target && event.target.tagName
+      ? event.target.tagName.toUpperCase() : '';
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-    if (e.target && e.target.isContentEditable) return;
+    if (event.target && event.target.isContentEditable) return;
     window.location.href = 'neuralia:expand?col=' + colIndex
-        + '&cap=' + encodeURIComponent(capability);
+      + '&cap=' + encodeURIComponent(capability);
   }, true);
 });
 "#;

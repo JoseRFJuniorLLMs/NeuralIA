@@ -2,6 +2,20 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [1.2.0] - 2026-09-18
+
+Split View, omnibox flutuante e envio real da consulta para as tres IAs.
+
+### Added
+- **Split View por IA:** links externos abrem numa gaveta lateral ao lado da conversa que gerou a fonte, com fechar e expandir/restaurar sem criar uma fileira de abas.
+- **Contexto agrupado por IA:** cada coluna preserva um histórico leve das fontes abertas por Gemini, ChatGPT ou Claude.
+- **Omnibox Spotlight:** `Ctrl+K` ou `Ctrl+T` abre uma barra flutuante. URL abre no Split View; texto pesquisa diretamente na IA ativa.
+- **Timeline como scroll:** a scrollbar nativa da coluna e ocultada e a trilha centralizada detecta o container rolavel real, inclusive em SPAs com scroll interno.
+
+### Fixed
+- Enter na barra principal passa a efetivamente enviar a consulta para **Gemini + ChatGPT + Claude**. ChatGPT e Claude antes apenas recebiam o texto preenchido e aguardavam um segundo Enter/clique.
+- A timeline deixa de assumir `window.scrollY` e passa a seguir o maior container rolavel da pagina.
+
 ## [1.1.4] - 2026-09-18
 
 Polimento da timeline independente do comparador e correcao de sincronizacao visual.
