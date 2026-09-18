@@ -2,15 +2,17 @@
 
 use std::{
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, OnceLock,
         mpsc::{SyncSender, sync_channel},
     },
     thread,
 };
 
+use image::RgbaImage;
+
 use neural_core::{
     CoreConfig, HistoryEntry, HistoryKind, HistoryStore, Intent, ReaderArticle, ReaderClient,
-    google_ai_url, parse_intent, reader_html,
+    chatgpt_search_url, claude_search_url, google_ai_url, parse_intent, reader_html,
 };
 use url::Url;
 use windows_sys::Win32::{
@@ -18,9 +20,9 @@ use windows_sys::Win32::{
     Graphics::Gdi::{
         CLEARTYPE_QUALITY, CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET,
         DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-        DeleteObject, DrawTextW, Ellipse, FW_BOLD, FW_NORMAL, FillRect, GetDC, GetStockObject,
-        NULL_PEN, OUT_DEFAULT_PRECIS, PS_SOLID, ReleaseDC, RoundRect, SelectObject, SetBkMode,
-        SetTextColor, TRANSPARENT,
+        DeleteObject, DrawTextW, FW_BOLD, FW_NORMAL, FillRect, GetDC, OUT_DEFAULT_PRECIS,
+        PS_SOLID, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+        BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY, StretchDIBits,
     },
     UI::{
         Input::KeyboardAndMouse::{GetAsyncKeyState, SetFocus, VK_CONTROL, VK_SHIFT},
@@ -34,12 +36,12 @@ use windows_sys::Win32::{
 };
 use winit::{
     application::ApplicationHandler,
-    dpi::LogicalSize,
+    dpi::{LogicalPosition, LogicalSize},
     event::{ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
     keyboard::{Key, NamedKey},
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
-    window::{Window, WindowId},
+    window::{Icon, Window, WindowId},
 };
 use wry::{NewWindowResponse, PermissionResponse, WebView, WebViewBuilder};
 
@@ -49,6 +51,8 @@ enum UserEvent {
     ClearHistory,
     SubmitText(String),
     OpenExternal(String),
+    ExpandComparator(usize),
+    RestoreComparator,
     ReaderReady {
         generation: u64,
         input: String,
@@ -61,6 +65,20 @@ enum Surface {
     Home,
     Reader,
     External,
+    Comparator,
+}
+
+const TOP_BAR_HEIGHT: f64 = 42.0;
+
+struct ComparatorView {
+    webview: WebView,
+    name: &'static str,
+}
+
+struct ComparatorState {
+    views: Vec<ComparatorView>,
+    expanded: Option<usize>,
+    query: String,
 }
 
 const EM_SETSEL: u32 = 0x00B1;
@@ -309,6 +327,7 @@ struct App {
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Window>,
     webview: Option<WebView>,
+    comparator: Option<ComparatorState>,
     omnibox: Option<HWND>,
     omnibox_proxy: Box<EventLoopProxy<UserEvent>>,
     config: CoreConfig,
@@ -334,6 +353,7 @@ impl App {
             proxy,
             window: None,
             webview: None,
+            comparator: None,
             omnibox: None,
             omnibox_proxy,
             config,
@@ -546,14 +566,9 @@ impl App {
     }
 
     fn ask(&mut self, query: String) {
-        match google_ai_url(&query, &self.config.language) {
-            Ok(url) => {
-                self.next_generation();
-                self.record(HistoryKind::Ask, query, "google-ai".to_string());
-                self.open_external(url.as_str());
-            }
-            Err(error) => self.show_native_error(error.to_string()),
-        }
+        self.next_generation();
+        self.record(HistoryKind::Ask, query.clone(), "comparator-3col".to_string());
+        self.open_comparator(&query);
     }
 
     fn read(&mut self, url: String) {
@@ -688,6 +703,261 @@ impl App {
         }
     }
 
+    fn open_comparator(&mut self, query: &str) {
+        self.destroy_webview();
+        self.show_omnibox(false);
+
+        let google_url = match google_ai_url(query, &self.config.language) {
+            Ok(u) => u,
+            Err(e) => {
+                self.show_native_error(e.to_string());
+                return;
+            }
+        };
+        let chatgpt_url = match chatgpt_search_url(query) {
+            Ok(u) => u,
+            Err(e) => {
+                self.show_native_error(e.to_string());
+                return;
+            }
+        };
+        let claude_url = match claude_search_url(query) {
+            Ok(u) => u,
+            Err(e) => {
+                self.show_native_error(e.to_string());
+                return;
+            }
+        };
+
+        let Some(window) = &self.window else {
+            return;
+        };
+
+        let size = window.inner_size();
+        let scale = window.scale_factor().max(1.0);
+        let logical_w = size.width as f64 / scale;
+        let logical_h = size.height as f64 / scale;
+
+        let content_h = (logical_h - TOP_BAR_HEIGHT).max(100.0);
+        let content_y = TOP_BAR_HEIGHT;
+        let n = 3.0;
+        let col_w = logical_w / n;
+
+        let targets = [
+            ("Google Gemini", google_url),
+            ("ChatGPT", chatgpt_url),
+            ("Claude", claude_url),
+        ];
+
+        let mut views = Vec::new();
+        for (i, (name, url)) in targets.into_iter().enumerate() {
+            let col_x = i as f64 * col_w;
+            let actual_w = if i == 2 {
+                logical_w - col_x
+            } else {
+                col_w
+            };
+
+            let bounds = wry::Rect {
+                position: LogicalPosition::new(col_x, content_y).into(),
+                size: LogicalSize::new(actual_w, content_h).into(),
+            };
+
+            let builder = self
+                .comparator_webview_builder(i, name)
+                .with_bounds(bounds)
+                .with_url(url.as_str());
+
+            match builder.build_as_child(window) {
+                Ok(wv) => {
+                    views.push(ComparatorView {
+                        webview: wv,
+                        name,
+                    });
+                }
+                Err(error) => {
+                    self.show_native_error(format!("WebView2 não pôde abrir {name}: {error}"));
+                    return;
+                }
+            }
+        }
+
+        self.comparator = Some(ComparatorState {
+            views,
+            expanded: None,
+            query: query.to_string(),
+        });
+        self.surface = Surface::Comparator;
+        self.request_redraw();
+    }
+
+    fn expand_comparator(&mut self, idx: usize) {
+        if let Some(comp) = &mut self.comparator {
+            if idx < comp.views.len() {
+                comp.expanded = Some(idx);
+            }
+        }
+        self.update_comparator_layout();
+        self.request_redraw();
+    }
+
+    fn restore_comparator(&mut self) {
+        if let Some(comp) = &mut self.comparator {
+            comp.expanded = None;
+        }
+        self.update_comparator_layout();
+        self.request_redraw();
+    }
+
+    fn update_comparator_layout(&self) {
+        let (Some(window), Some(comp)) = (&self.window, &self.comparator) else {
+            return;
+        };
+        let size = window.inner_size();
+        let scale = window.scale_factor().max(1.0);
+        let logical_w = size.width as f64 / scale;
+        let logical_h = size.height as f64 / scale;
+
+        let content_h = (logical_h - TOP_BAR_HEIGHT).max(100.0);
+        let content_y = TOP_BAR_HEIGHT;
+
+        match comp.expanded {
+            Some(idx) => {
+                for (i, v) in comp.views.iter().enumerate() {
+                    if i == idx {
+                        let _ = v.webview.set_bounds(wry::Rect {
+                            position: LogicalPosition::new(0.0, content_y).into(),
+                            size: LogicalSize::new(logical_w, content_h).into(),
+                        });
+                        let _ = v.webview.set_visible(true);
+                    } else {
+                        let _ = v.webview.set_visible(false);
+                    }
+                }
+            }
+            None => {
+                let n = comp.views.len() as f64;
+                let col_w = logical_w / n;
+                for (i, v) in comp.views.iter().enumerate() {
+                    let col_x = i as f64 * col_w;
+                    let actual_w = if i == comp.views.len() - 1 {
+                        logical_w - col_x
+                    } else {
+                        col_w
+                    };
+                    let _ = v.webview.set_bounds(wry::Rect {
+                        position: LogicalPosition::new(col_x, content_y).into(),
+                        size: LogicalSize::new(actual_w, content_h).into(),
+                    });
+                    let _ = v.webview.set_visible(true);
+                }
+            }
+        }
+    }
+
+    fn comparator_webview_builder(
+        &self,
+        col_index: usize,
+        col_name: &'static str,
+    ) -> WebViewBuilder<'static> {
+        let navigation_proxy = self.proxy.clone();
+        let new_window_proxy = self.proxy.clone();
+
+        let init_script = format!(
+            "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';\n{COMPARATOR_INJECT_SCRIPT}"
+        );
+
+        WebViewBuilder::new()
+            .with_initialization_script(init_script)
+            .with_navigation_handler(move |target| {
+                if target.eq_ignore_ascii_case("neuralia:home") {
+                    let _ = navigation_proxy.send_event(UserEvent::HomeRequested);
+                    return false;
+                }
+                if target.eq_ignore_ascii_case("neuralia:restore") {
+                    let _ = navigation_proxy.send_event(UserEvent::RestoreComparator);
+                    return false;
+                }
+                if target.starts_with("neuralia:expand") {
+                    if let Ok(action_url) = Url::parse(&target) {
+                        if let Some((_, val)) = action_url.query_pairs().find(|(k, _)| k == "col") {
+                            if let Ok(idx) = val.parse::<usize>() {
+                                let _ =
+                                    navigation_proxy.send_event(UserEvent::ExpandComparator(idx));
+                            }
+                        }
+                    }
+                    return false;
+                }
+
+                target.starts_with("about:blank") || neural_core::validate_web_url(&target).is_ok()
+            })
+            .with_new_window_req_handler(move |target, _features| {
+                if neural_core::validate_web_url(&target).is_ok() {
+                    let _ = new_window_proxy.send_event(UserEvent::OpenExternal(target));
+                }
+                NewWindowResponse::Deny
+            })
+            .with_permission_handler(|_| PermissionResponse::Deny)
+            .with_focused(true)
+    }
+
+    fn click_comparator(&mut self) {
+        let (Some(window), Some(comp)) = (&self.window, &self.comparator) else {
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
+        let (x, y) = self.cursor;
+
+        if y > TOP_BAR_HEIGHT * scale {
+            return;
+        }
+
+        let home_rect = UiRect {
+            x: 8.0 * scale,
+            y: 7.0 * scale,
+            width: 76.0 * scale,
+            height: 28.0 * scale,
+        };
+        if home_rect.contains(x, y) {
+            self.show_home();
+            return;
+        }
+
+        match comp.expanded {
+            Some(_) => {
+                let restore_rect = UiRect {
+                    x: home_rect.x + home_rect.width + 8.0 * scale,
+                    y: 7.0 * scale,
+                    width: 124.0 * scale,
+                    height: 28.0 * scale,
+                };
+                if restore_rect.contains(x, y) {
+                    self.restore_comparator();
+                }
+            }
+            None => {
+                let size = window.inner_size();
+                let left_offset = home_rect.x + home_rect.width + 12.0 * scale;
+                let avail_w = (size.width as f64 - left_offset - 120.0 * scale).max(100.0);
+                let col_w = avail_w / 3.0;
+
+                for i in 0..3 {
+                    let rect = UiRect {
+                        x: left_offset + i as f64 * col_w,
+                        y: 7.0 * scale,
+                        width: col_w - 8.0 * scale,
+                        height: 28.0 * scale,
+                    };
+                    if rect.contains(x, y) {
+                        self.expand_comparator(i);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     fn click_home(&mut self) {
         let Some(window) = &self.window else {
             return;
@@ -714,10 +984,14 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
 
-        let attributes = Window::default_attributes()
+        let mut attributes = Window::default_attributes()
             .with_title("NeuralIA")
             .with_inner_size(LogicalSize::new(1120.0, 760.0))
             .with_min_inner_size(LogicalSize::new(700.0, 500.0));
+
+        if let Some(icon) = get_app_icon() {
+            attributes = attributes.with_window_icon(Some(icon));
+        }
 
         match event_loop.create_window(attributes) {
             Ok(window) => {
@@ -751,6 +1025,16 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::OpenExternal(url) => self.web(url),
+            UserEvent::ExpandComparator(idx) => {
+                if self.surface == Surface::Comparator {
+                    self.expand_comparator(idx);
+                }
+            }
+            UserEvent::RestoreComparator => {
+                if self.surface == Surface::Comparator {
+                    self.restore_comparator();
+                }
+            }
             UserEvent::ReaderReady {
                 generation,
                 input,
@@ -778,15 +1062,32 @@ impl ApplicationHandler<UserEvent> for App {
     ) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::RedrawRequested if self.surface == Surface::Home => {
-                if let Some(window) = &self.window {
-                    draw_home(window, &self.status);
+            WindowEvent::RedrawRequested => match self.surface {
+                Surface::Home => {
+                    if let Some(window) = &self.window {
+                        draw_home(window, &self.status);
+                    }
                 }
-            }
-            WindowEvent::Resized(_) if self.surface == Surface::Home => {
-                self.position_omnibox();
-                self.request_redraw();
-            }
+                Surface::Comparator => {
+                    if let Some(window) = &self.window {
+                        if let Some(comp) = &self.comparator {
+                            draw_comparator_bar(window, comp);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            WindowEvent::Resized(_) => match self.surface {
+                Surface::Home => {
+                    self.position_omnibox();
+                    self.request_redraw();
+                }
+                Surface::Comparator => {
+                    self.update_comparator_layout();
+                    self.request_redraw();
+                }
+                _ => {}
+            },
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
             }
@@ -794,12 +1095,35 @@ impl ApplicationHandler<UserEvent> for App {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } if self.surface == Surface::Home => self.click_home(),
-            WindowEvent::KeyboardInput { event, .. }
-                if event.state.is_pressed()
-                    && matches!(event.logical_key, Key::Named(NamedKey::Escape)) =>
-            {
-                self.show_home();
+            } => match self.surface {
+                Surface::Home => self.click_home(),
+                Surface::Comparator => self.click_comparator(),
+                _ => {}
+            },
+            WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
+                match event.logical_key {
+                    Key::Named(NamedKey::Escape) => {
+                        if self.surface == Surface::Comparator {
+                            if let Some(comp) = &self.comparator {
+                                if comp.expanded.is_some() {
+                                    self.restore_comparator();
+                                    return;
+                                }
+                            }
+                        }
+                        self.show_home();
+                    }
+                    Key::Character(ref c) if self.surface == Surface::Comparator => {
+                        match c.as_str() {
+                            "1" => self.expand_comparator(0),
+                            "2" => self.expand_comparator(1),
+                            "3" => self.expand_comparator(2),
+                            "0" => self.restore_comparator(),
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
             }
             _ => {}
         }
@@ -940,6 +1264,113 @@ fn draw_home(window: &Window, status: &str) {
     }
 }
 
+fn draw_comparator_bar(window: &Window, comp: &ComparatorState) {
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return;
+    };
+
+    let hwnd = handle.hwnd.get() as HWND;
+    let scale = window.scale_factor().max(1.0);
+
+    unsafe {
+        let hdc = GetDC(hwnd);
+        if hdc.is_null() {
+            return;
+        }
+
+        let mut client = RECT::default();
+        if GetClientRect(hwnd, &mut client) == 0 {
+            let _ = ReleaseDC(hwnd, hdc);
+            return;
+        }
+
+        let bar_h = (TOP_BAR_HEIGHT * scale) as i32;
+        let bar_rect = RECT {
+            left: 0,
+            top: 0,
+            right: client.right,
+            bottom: bar_h,
+        };
+
+        let bg = CreateSolidBrush(rgb(17, 19, 20));
+        FillRect(hdc, &bar_rect, bg);
+        DeleteObject(bg as _);
+
+        let font = create_font((-13.0 * scale) as i32, FW_NORMAL as i32);
+        let bold_font = create_font((-13.0 * scale) as i32, FW_BOLD as i32);
+        let old_font = SelectObject(hdc, font as _);
+
+        SetBkMode(hdc, TRANSPARENT as i32);
+
+        let home_rect = UiRect {
+            x: 8.0 * scale,
+            y: 7.0 * scale,
+            width: 76.0 * scale,
+            height: 28.0 * scale,
+        };
+        draw_button(hdc, home_rect, "⌂ Home", false, scale, font);
+
+        match comp.expanded {
+            Some(idx) => {
+                let restore_rect = UiRect {
+                    x: home_rect.x + home_rect.width + 8.0 * scale,
+                    y: 7.0 * scale,
+                    width: 124.0 * scale,
+                    height: 28.0 * scale,
+                };
+                draw_button(hdc, restore_rect, "⧉ 3 Colunas", true, scale, bold_font);
+
+                let current_name = comp.views.get(idx).map(|v| v.name).unwrap_or("IA");
+                let text = format!("Visualizando {current_name} em tela cheia  —  \"{}\"", comp.query);
+
+                SelectObject(hdc, font as _);
+                SetTextColor(hdc, rgb(200, 205, 210));
+                let mut title_r = RECT {
+                    left: (restore_rect.x + restore_rect.width + 16.0 * scale) as i32,
+                    top: 0,
+                    right: client.right - (120.0 * scale) as i32,
+                    bottom: bar_h,
+                };
+                draw_text(hdc, &text, &mut title_r, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            }
+            None => {
+                let left_offset = home_rect.x + home_rect.width + 12.0 * scale;
+                let avail_w = (client.right as f64 - left_offset - 120.0 * scale).max(100.0);
+                let col_w = avail_w / comp.views.len().max(1) as f64;
+
+                for (i, view) in comp.views.iter().enumerate() {
+                    let label = format!("{}. {} [⛶]", i + 1, view.name);
+                    let rect = UiRect {
+                        x: left_offset + i as f64 * col_w,
+                        y: 7.0 * scale,
+                        width: col_w - 8.0 * scale,
+                        height: 28.0 * scale,
+                    };
+                    draw_button(hdc, rect, &label, false, scale, font);
+                }
+            }
+        }
+
+        SelectObject(hdc, font as _);
+        SetTextColor(hdc, rgb(130, 135, 142));
+        let mut hint_r = RECT {
+            left: client.right - (120.0 * scale) as i32,
+            top: 0,
+            right: client.right - (10.0 * scale) as i32,
+            bottom: bar_h,
+        };
+        draw_text(hdc, "Esc: voltar", &mut hint_r, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+
+        SelectObject(hdc, old_font);
+        DeleteObject(font as _);
+        DeleteObject(bold_font as _);
+        let _ = ReleaseDC(hwnd, hdc);
+    }
+}
+
 unsafe fn create_font(height: i32, weight: i32) -> *mut core::ffi::c_void {
     CreateFontW(
         height,
@@ -959,31 +1390,182 @@ unsafe fn create_font(height: i32, weight: i32) -> *mut core::ffi::c_void {
     )
 }
 
+static LOGO_IMAGE: OnceLock<RgbaImage> = OnceLock::new();
+static SPLASH_CACHE: Mutex<Option<(i32, (u8, u8, u8), Vec<u8>)>> = Mutex::new(None);
+
+fn get_logo_image() -> &'static RgbaImage {
+    LOGO_IMAGE.get_or_init(|| {
+        let raw = include_bytes!("../../../assets/logo.png");
+        image::load_from_memory(raw)
+            .expect("assets/logo.png must be valid PNG")
+            .to_rgba8()
+    })
+}
+
+fn get_app_icon() -> Option<Icon> {
+    let img = get_logo_image();
+    let size = 64u32;
+    let resized = image::imageops::resize(img, size, size, image::imageops::FilterType::Lanczos3);
+    let mut rgba = resized.into_raw();
+    let radius = (size as f32) * 0.20;
+    for y in 0..size {
+        for x in 0..size {
+            let dx = if (x as f32) < radius {
+                radius - (x as f32)
+            } else if (x as f32) > (size as f32) - 1.0 - radius {
+                (x as f32) - ((size as f32) - 1.0 - radius)
+            } else {
+                0.0
+            };
+            let dy = if (y as f32) < radius {
+                radius - (y as f32)
+            } else if (y as f32) > (size as f32) - 1.0 - radius {
+                (y as f32) - ((size as f32) - 1.0 - radius)
+            } else {
+                0.0
+            };
+            if dx > 0.0 && dy > 0.0 {
+                let dist = (dx * dx + dy * dy).sqrt();
+                let idx = ((y * size + x) * 4) as usize;
+                if dist > radius {
+                    rgba[idx + 3] = 0;
+                } else if dist > radius - 1.0 {
+                    let coverage = (radius - dist).clamp(0.0, 1.0);
+                    rgba[idx + 3] = ((rgba[idx + 3] as f32) * coverage) as u8;
+                }
+            }
+        }
+    }
+    Icon::from_rgba(rgba, size, size).ok()
+}
+
+unsafe fn draw_logo_to_dc(
+    hdc: *mut core::ffi::c_void,
+    x: i32,
+    y: i32,
+    size: i32,
+    bg_rgb: (u8, u8, u8),
+) {
+    if size <= 0 {
+        return;
+    }
+
+    let pixels = {
+        let mut cache = SPLASH_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((cached_sz, cached_bg, ref cached_pixels)) = *cache {
+            if cached_sz == size && cached_bg == bg_rgb {
+                cached_pixels.clone()
+            } else {
+                let p = render_logo_pixels(size, bg_rgb);
+                *cache = Some((size, bg_rgb, p.clone()));
+                p
+            }
+        } else {
+            let p = render_logo_pixels(size, bg_rgb);
+            *cache = Some((size, bg_rgb, p.clone()));
+            p
+        }
+    };
+
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: size,
+            biHeight: -size,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            biSizeImage: (size * size * 4) as u32,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        },
+        bmiColors: [windows_sys::Win32::Graphics::Gdi::RGBQUAD {
+            rgbBlue: 0,
+            rgbGreen: 0,
+            rgbRed: 0,
+            rgbReserved: 0,
+        }; 1],
+    };
+
+    StretchDIBits(
+        hdc as _,
+        x,
+        y,
+        size,
+        size,
+        0,
+        0,
+        size,
+        size,
+        pixels.as_ptr() as *const _,
+        &bmi,
+        DIB_RGB_COLORS,
+        SRCCOPY,
+    );
+}
+
+fn render_logo_pixels(size: i32, bg_rgb: (u8, u8, u8)) -> Vec<u8> {
+    let u_size = size as u32;
+    let img = get_logo_image();
+    let resized =
+        image::imageops::resize(img, u_size, u_size, image::imageops::FilterType::Lanczos3);
+
+    let bg_r = bg_rgb.0 as f32;
+    let bg_g = bg_rgb.1 as f32;
+    let bg_b = bg_rgb.2 as f32;
+    let radius = (size as f32) * 0.20;
+
+    let mut bgr_pixels = Vec::with_capacity((size * size * 4) as usize);
+
+    for py in 0..size {
+        for px in 0..size {
+            let dx = if (px as f32) < radius {
+                radius - (px as f32)
+            } else if (px as f32) > (size as f32) - 1.0 - radius {
+                (px as f32) - ((size as f32) - 1.0 - radius)
+            } else {
+                0.0
+            };
+            let dy = if (py as f32) < radius {
+                radius - (py as f32)
+            } else if (py as f32) > (size as f32) - 1.0 - radius {
+                (py as f32) - ((size as f32) - 1.0 - radius)
+            } else {
+                0.0
+            };
+
+            let mask_alpha = if dx > 0.0 && dy > 0.0 {
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist > radius {
+                    0.0
+                } else if dist > radius - 1.0 {
+                    (radius - dist).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                }
+            } else {
+                1.0
+            };
+
+            let pixel = resized.get_pixel(px as u32, py as u32);
+            let src_a = (pixel[3] as f32 / 255.0) * mask_alpha;
+            let final_r = ((pixel[0] as f32) * src_a + bg_r * (1.0 - src_a)).round() as u8;
+            let final_g = ((pixel[1] as f32) * src_a + bg_g * (1.0 - src_a)).round() as u8;
+            let final_b = ((pixel[2] as f32) * src_a + bg_b * (1.0 - src_a)).round() as u8;
+
+            bgr_pixels.push(final_b);
+            bgr_pixels.push(final_g);
+            bgr_pixels.push(final_r);
+            bgr_pixels.push(0);
+        }
+    }
+    bgr_pixels
+}
+
 unsafe fn draw_logo(hdc: *mut core::ffi::c_void, x: i32, y: i32, size: i32) {
-    let black = CreateSolidBrush(rgb(17, 19, 20));
-    let white = CreateSolidBrush(rgb(255, 255, 255));
-    let null_pen = GetStockObject(NULL_PEN);
-
-    let old_pen = SelectObject(hdc, null_pen);
-    let old_brush = SelectObject(hdc, black as _);
-    let radius = (size as f64 * 0.18) as i32;
-    RoundRect(hdc, x, y, x + size, y + size, radius, radius);
-
-    SelectObject(hdc, white as _);
-    let c = size / 2;
-    let arm = size / 5;
-    let thick = size / 7;
-    Ellipse(hdc, x + c - thick, y + c - arm * 2, x + c + thick, y + c);
-    Ellipse(hdc, x + c, y + c - thick, x + c + arm * 2, y + c + thick);
-    Ellipse(hdc, x + c - thick, y + c, x + c + thick, y + c + arm * 2);
-    Ellipse(hdc, x + c - arm * 2, y + c - thick, x + c, y + c + thick);
-    let dot = size / 9;
-    Ellipse(hdc, x + c - dot, y + c - dot, x + c + dot, y + c + dot);
-
-    SelectObject(hdc, old_brush);
-    SelectObject(hdc, old_pen);
-    DeleteObject(black as _);
-    DeleteObject(white as _);
+    draw_logo_to_dc(hdc, x, y, size, (248, 249, 250));
 }
 
 unsafe fn draw_button(
@@ -1076,3 +1658,50 @@ document.addEventListener('DOMContentLoaded', () => {
   document.documentElement.appendChild(b);
 });
 "#;
+
+const COMPARATOR_INJECT_SCRIPT: &str = r#"
+document.addEventListener('DOMContentLoaded', () => {
+  if (document.getElementById('neuralia-comp-btn')) return;
+  const colIndex = window.__neuralia_col_index ?? 0;
+  const colName = window.__neuralia_col_name ?? 'IA';
+
+  const wrap = document.createElement('div');
+  wrap.id = 'neuralia-comp-btn';
+  Object.assign(wrap.style, {
+    position: 'fixed',
+    top: '10px',
+    right: '12px',
+    zIndex: '2147483647',
+    display: 'flex',
+    gap: '6px',
+    fontFamily: 'Segoe UI, -apple-system, BlinkMacSystemFont, sans-serif'
+  });
+
+  const btn = document.createElement('button');
+  btn.textContent = '⛶ Expandir ' + colName;
+  Object.assign(btn.style, {
+    border: '0',
+    borderRadius: '6px',
+    padding: '6px 12px',
+    background: '#111314',
+    color: '#ffffff',
+    fontSize: '11px',
+    fontWeight: '600',
+    boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+    cursor: 'pointer',
+    opacity: '0.9',
+    transition: 'transform 0.15s ease'
+  });
+  btn.onmouseover = () => { btn.style.transform = 'scale(1.05)'; };
+  btn.onmouseout = () => { btn.style.transform = 'scale(1)'; };
+  btn.onclick = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    window.location.href = 'neuralia:expand?col=' + colIndex;
+  };
+  wrap.appendChild(btn);
+
+  document.documentElement.appendChild(wrap);
+});
+"#;
+

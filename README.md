@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/neuralia-brand.jpg" width="600" alt="NeuralIA — A smarter way to browse"></p>
+<p align="center"><img src="assets/logo.png" width="180" alt="NeuralIA — A smarter way to browse" style="border-radius: 36px;"></p>
 
 <h1 align="center">NeuralIA</h1>
 <p align="center"><strong>The browser without the browser.</strong></p>
