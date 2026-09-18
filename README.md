@@ -75,6 +75,7 @@ The native omnibox inherits Windows text editing, selection, clipboard, IME and 
 - Enter: submit
 - Ctrl+L: select the omnibox text
 - Escape: clear/return Home
+- Ctrl+H: show the 20 most recent local history entries
 - Ctrl+Shift+Delete: clear local history
 - Escape while browsing: return to the native Home
 
@@ -105,12 +106,12 @@ The native omnibox inherits Windows text editing, selection, clipboard, IME and 
 - [x] DNS/private-network Reader protection
 - [x] semantic article extraction
 - [x] safe script-free Reader HTML
-- [x] bounded local history + clear
+- [x] bounded local history + native viewer + clear
 - [x] external IPC isolation
 - [x] HTTP integration tests
 - [x] CI Linux + Windows + RustSec
 - [x] immutable release workflow with CycloneDX SBOM + provenance attestation
-- [ ] measured startup/RAM benchmark gate
+- [x] CI startup/RAM/thread regression gate (product targets still measured separately)
 - [ ] Authenticode-signed Windows installer
 - [ ] macOS shell
 - [ ] Linux shell
