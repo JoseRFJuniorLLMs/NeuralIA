@@ -16,6 +16,8 @@ pub enum NeuralError {
     UnsafeRedirect(String),
     #[error("limite de redirecionamentos excedido")]
     RedirectLimit,
+    #[error("tempo total do Reader excedido")]
+    ReaderDeadline,
     #[error("resposta excede o limite do Reader ({declared} > {limit} bytes)")]
     ResponseTooLarge { declared: u64, limit: u64 },
     #[error("resposta não é HTML: {0}")]
@@ -29,4 +31,5 @@ pub enum NeuralError {
     #[error("não foi possível extrair conteúdo legível")]
     ReaderExtraction,
 }
+
 pub type Result<T> = std::result::Result<T, NeuralError>;
