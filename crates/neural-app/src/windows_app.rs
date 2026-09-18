@@ -3609,25 +3609,25 @@ mod tests {
     }
 
     #[test]
-    fn neuralia_actions_are_routed() {
-        // As paginas so escrevem o nome da accao; a traducao vive toda aqui.
-        for (target, expected) in [
-            ("neuralia:back", "BackRequested"),
-            ("NEURALIA:BACK", "BackRequested"),
-            ("neuralia:zoomin", "ZoomIn"),
-            ("neuralia:zoomout", "ZoomOut"),
-            ("neuralia:zoomreset", "ZoomReset"),
-            ("neuralia:reload", "ReloadPage"),
-            ("neuralia:print", "PrintPage"),
-            ("neuralia:omnibox", "FocusOmnibox"),
-            ("neuralia:history", "ShowHistory"),
-            ("neuralia:clearhistory", "ClearHistory"),
-            ("neuralia:fullscreen", "ToggleColumnFullscreen"),
-            ("neuralia:autoscroll", "ToggleAutoScroll"),
-            ("neuralia:restore", "RestoreComparator"),
-            ("neuralia:home", "HomeRequested"),
+    fn neuralia_actions_require_the_per_webview_capability() {
+        let token = "test-capability";
+        for (name, expected) in [
+            ("back", "BackRequested"),
+            ("zoomin", "ZoomIn"),
+            ("zoomout", "ZoomOut"),
+            ("zoomreset", "ZoomReset"),
+            ("reload", "ReloadPage"),
+            ("print", "PrintPage"),
+            ("omnibox", "FocusOmnibox"),
+            ("history", "ShowHistory"),
+            ("clearhistory", "ClearHistory"),
+            ("fullscreen", "ToggleColumnFullscreen"),
+            ("autoscroll", "ToggleAutoScroll"),
+            ("restore", "RestoreComparator"),
+            ("home", "HomeRequested"),
         ] {
-            let action = neuralia_action(target);
+            let target = format!("neuralia:{name}?token={token}");
+            let action = neuralia_action(&target, token);
             assert!(action.is_some(), "{target} devia ser reconhecido");
             assert!(
                 format!("{:?}", action.unwrap()).starts_with(expected),
@@ -3635,14 +3635,18 @@ mod tests {
             );
         }
 
-        // Tudo o resto tem de passar ao lado, incluindo navegacao verdadeira.
         for target in [
+            "neuralia:clearhistory",
+            "neuralia:clearhistory?token=wrong",
             "https://example.com",
-            "neuralia:inventado",
+            "neuralia:inventado?token=test-capability",
             "about:blank",
             "neuralia",
         ] {
-            assert!(neuralia_action(target).is_none(), "{target}");
+            assert!(
+                neuralia_action(target, token).is_none(),
+                "{target} nao devia ganhar uma acao nativa"
+            );
         }
     }
 
