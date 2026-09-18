@@ -1,4 +1,5 @@
-<p align="center"><img src="assets/neuralia-logo.svg" width="150" alt="NeuralIA logo"></p>
+<p align="center"><img src="assets/neuralia-brand.jpg" width="760" alt="NeuralIA — A smarter way to browse"></p>
+
 <h1 align="center">NeuralIA</h1>
 <p align="center"><strong>The browser without the browser.</strong></p>
 <p align="center">Search with AI. Read the Web. Open a full page only when you actually need it.</p>
@@ -36,7 +37,8 @@ On Windows, **no WebView is created while the native home screen is idle**. The 
 NeuralIA/
 ├── crates/neural-core/     # intent, URL policy, Reader, search, history
 ├── crates/neural-app/      # native Windows shell + lazy WebView2
-├── assets/neuralia-logo.svg
+├── assets/neuralia-brand.jpg # official NeuralIA brand artwork
+├── assets/neuralia-logo.svg  # compact in-app legacy mark
 ├── docs/specs/
 └── .github/workflows/
 ```
