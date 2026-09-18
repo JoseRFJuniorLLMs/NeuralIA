@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -8,6 +8,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
+
+const DEFAULT_HISTORY_LIMIT: usize = 250;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HistoryKind {
@@ -42,11 +44,19 @@ impl HistoryEntry {
 #[derive(Debug, Clone)]
 pub struct HistoryStore {
     path: PathBuf,
+    max_entries: usize,
 }
 
 impl HistoryStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self::with_limit(path, DEFAULT_HISTORY_LIMIT)
+    }
+
+    pub fn with_limit(path: impl Into<PathBuf>, max_entries: usize) -> Self {
+        Self {
+            path: path.into(),
+            max_entries: max_entries.max(1),
+        }
     }
 
     pub fn append(&self, entry: &HistoryEntry) -> Result<()> {
@@ -57,20 +67,29 @@ impl HistoryStore {
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
-            .append(true)
+            .write(true)
             .open(&self.path)?;
-
-        // std::fs file locking is process-safe on Windows and advisory on Unix.
-        // Keeping the lock around the whole JSONL record prevents interleaved
-        // lines when two NeuralIA instances write at the same time.
         file.lock()?;
 
         let write_result = (|| -> Result<()> {
-            serde_json::to_writer(&mut file, entry)?;
-            file.write_all(b"\n")?;
+            let mut content = String::new();
+            file.seek(SeekFrom::Start(0))?;
+            file.read_to_string(&mut content)?;
+
+            let mut entries = parse_lines(&content);
+            entries.push(entry.clone());
+            if entries.len() > self.max_entries {
+                let remove = entries.len() - self.max_entries;
+                entries.drain(..remove);
+            }
+
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            for entry in entries {
+                serde_json::to_writer(&mut file, &entry)?;
+                file.write_all(b"\n")?;
+            }
             file.flush()?;
-            // History writes are infrequent; syncing here buys simple
-            // crash-resilience without introducing a database.
             file.sync_data()?;
             Ok(())
         })();
@@ -86,21 +105,15 @@ impl HistoryStore {
             return Ok(Vec::new());
         }
 
-        let file = File::open(&self.path)?;
+        let mut file = File::open(&self.path)?;
         file.lock_shared()?;
 
         let read_result = (|| -> Result<Vec<HistoryEntry>> {
-            let mut entries = Vec::new();
-            for line in BufReader::new(&file).lines() {
-                let line = line?;
-                // A single torn/corrupt historical record must not make all
-                // remaining history unreadable.
-                if let Ok(entry) = serde_json::from_str::<HistoryEntry>(&line) {
-                    entries.push(entry);
-                }
-            }
+            let mut content = String::new();
+            file.read_to_string(&mut content)?;
+            let mut entries = parse_lines(&content);
             entries.reverse();
-            entries.truncate(limit);
+            entries.truncate(limit.min(self.max_entries));
             Ok(entries)
         })();
 
@@ -110,9 +123,41 @@ impl HistoryStore {
         Ok(entries)
     }
 
+    pub fn clear(&self) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&self.path)?;
+        file.lock()?;
+        let clear_result = (|| -> Result<()> {
+            file.set_len(0)?;
+            file.sync_data()?;
+            Ok(())
+        })();
+        let unlock_result = file.unlock();
+        clear_result?;
+        unlock_result?;
+        Ok(())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+}
+
+fn parse_lines(content: &str) -> Vec<HistoryEntry> {
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<HistoryEntry>(line).ok())
+        .collect()
 }
 
 #[cfg(test)]
@@ -140,7 +185,7 @@ mod tests {
             .append(&HistoryEntry::now(
                 HistoryKind::Ask,
                 "teste",
-                "https://example.com",
+                "google-ai",
             ))
             .unwrap();
         let got = store.recent(10).unwrap();
@@ -150,11 +195,44 @@ mod tests {
     }
 
     #[test]
+    fn enforces_retention_limit() {
+        let path = temp_history("bounded");
+        let store = HistoryStore::with_limit(&path, 3);
+        for i in 0..7 {
+            store
+                .append(&HistoryEntry::now(
+                    HistoryKind::Read,
+                    format!("item-{i}"),
+                    "https://example.com",
+                ))
+                .unwrap();
+        }
+
+        let got = store.recent(20).unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].input, "item-6");
+        assert_eq!(got[2].input, "item-4");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn clear_removes_entries() {
+        let path = temp_history("clear");
+        let store = HistoryStore::new(&path);
+        store
+            .append(&HistoryEntry::now(HistoryKind::Web, "x", "https://example.com"))
+            .unwrap();
+        store.clear().unwrap();
+        assert!(store.recent(10).unwrap().is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn corrupt_line_does_not_destroy_other_history() {
         let path = temp_history("corrupt");
         fs::write(
             &path,
-            b"{not-json}\n{\"timestamp_unix\":1,\"kind\":\"Ask\",\"input\":\"ok\",\"target\":\"https://example.com\"}\n",
+            b"{not-json}\n{\"timestamp_unix\":1,\"kind\":\"Ask\",\"input\":\"ok\",\"target\":\"google-ai\"}\n",
         )
         .unwrap();
         let store = HistoryStore::new(&path);
@@ -165,9 +243,9 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_writers_do_not_interleave_jsonl() {
+    fn concurrent_writers_remain_bounded_and_valid() {
         let path = temp_history("concurrent");
-        let store = Arc::new(HistoryStore::new(&path));
+        let store = Arc::new(HistoryStore::with_limit(&path, 50));
         let mut workers = Vec::new();
 
         for worker in 0..4 {
@@ -189,7 +267,7 @@ mod tests {
             worker.join().unwrap();
         }
 
-        assert_eq!(store.recent(1000).unwrap().len(), 80);
+        assert_eq!(store.recent(1000).unwrap().len(), 50);
         let _ = fs::remove_file(path);
     }
 }
