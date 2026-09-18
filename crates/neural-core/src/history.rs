@@ -68,6 +68,7 @@ impl HistoryStore {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(&self.path)?;
         file.lock()?;
 
@@ -131,6 +132,7 @@ impl HistoryStore {
         let file = OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&self.path)?;
         file.lock()?;
         let clear_result = (|| -> Result<()> {
