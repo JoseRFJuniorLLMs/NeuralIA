@@ -725,8 +725,7 @@ unsafe extern "system" fn gmail_toast_subclass(
                 FillRect(hdc, &client, background);
                 DeleteObject(background as _);
 
-                let scale =
-                    ((client.bottom - client.top) as f64 / GMAIL_TOAST_HEIGHT).max(1.0);
+                let scale = ((client.bottom - client.top) as f64 / GMAIL_TOAST_HEIGHT).max(1.0);
                 let title_font = create_font((-13.0 * scale) as i32, FW_BOLD as i32);
                 let body_font = create_font((-12.0 * scale) as i32, FW_NORMAL as i32);
                 let old_font = SelectObject(hdc, title_font as _);
@@ -2715,12 +2714,7 @@ impl App {
                 cookies.iter().any(|cookie| {
                     matches!(
                         cookie.name(),
-                        "SID"
-                            | "HSID"
-                            | "SSID"
-                            | "SAPISID"
-                            | "__Secure-1PSID"
-                            | "__Secure-3PSID"
+                        "SID" | "HSID" | "SSID" | "SAPISID" | "__Secure-1PSID" | "__Secure-3PSID"
                     )
                 })
             })
@@ -2795,13 +2789,7 @@ impl App {
         }
     }
 
-    fn handle_gmail_state(
-        &mut self,
-        unread: u32,
-        sender: String,
-        subject: String,
-        key: String,
-    ) {
+    fn handle_gmail_state(&mut self, unread: u32, sender: String, subject: String, key: String) {
         let notify = gmail_is_new_mail(
             self.gmail_last_unread,
             self.gmail_last_key.as_deref(),
