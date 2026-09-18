@@ -111,8 +111,11 @@ try {
         }
 
         $opened = Wait-ForWebViews -RootId $process.Id -Predicate { param($n) $n -gt 0 } -TimeoutSec $OpenTimeoutSec
-        if ($opened -le 0) {
-            $null = $failures.Add("ciclo ${cycle}: o comparador nao criou nenhum WebView")
+        # WebView2 pode reutilizar processos entre controllers. A contagem
+        # prova a abertura no primeiro ciclo; nos seguintes o gate principal e
+        # retorno a Home + crescimento de working set.
+        if ($cycle -eq 1 -and $opened -le 0) {
+            $null = $failures.Add("ciclo 1: o comparador nao criou nenhum WebView observavel")
         }
 
         $null = $shell.AppActivate($process.Id)

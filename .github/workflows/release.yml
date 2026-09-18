@@ -63,6 +63,26 @@ jobs:
           if (-not $sbom) {
             throw "CycloneDX JSON was not generated next to crates/neural-app/Cargo.toml"
           }
+
+          $document = Get-Content $sbom.FullName -Raw | ConvertFrom-Json
+          $pdfjs = [pscustomobject]@{
+            type = "library"
+            name = "pdf.js"
+            version = "6.3.289"
+            licenses = @([pscustomobject]@{
+              license = [pscustomobject]@{ id = "Apache-2.0" }
+            })
+            properties = @(
+              [pscustomobject]@{ name = "neuralia:vendored"; value = "assets/pdfjs/pdf.mjs" },
+              [pscustomobject]@{ name = "neuralia:worker"; value = "assets/pdfjs/pdf.worker.mjs" }
+            )
+          }
+          if (-not $document.components) {
+            $document | Add-Member -MemberType NoteProperty -Name components -Value @()
+          }
+          $document.components += $pdfjs
+          $document | ConvertTo-Json -Depth 100 | Set-Content -Encoding utf8 $sbom.FullName
+
           Copy-Item $sbom.FullName dist/NeuralIA.cdx.json
           $hash = (Get-FileHash dist/NeuralIA.exe -Algorithm SHA256).Hash.ToLower()
           "$hash  NeuralIA.exe" | Out-File -Encoding ascii dist/NeuralIA.exe.sha256

@@ -6,29 +6,29 @@
 
 ## What NeuralIA is
 
-NeuralIA **v1.0.1** is an AI-first, reader-first, system-WebView information client written in Rust.
+NeuralIA **v1.1.3** is an AI-first, reader-first, system-WebView information client written in Rust.
 
 It deliberately refuses the usual browser arms race. It does not ship Chromium, does not implement its own JavaScript engine, does not carry a local LLM, and does not try to become an operating system with tabs.
 
 ```text
 native Rust home
       │
-      ├── question ─────────► Google AI Mode ─┐
-      ├── URL ──────────────► Reader ─────────┼► lazy system WebView2
-      ├── web:<URL> ────────► full page ──────┘
-      └── compare:<question> ► 3 provedores lado a lado (opt-in explícito)
+      ├── question ─────────► Gemini + ChatGPT + Claude ─┐
+      ├── ask:/? ───────────► Google AI Mode ────────────┤
+      ├── URL ──────────────► Reader ────────────────────┼► lazy system WebView2
+      └── web:<URL> ────────► full page ─────────────────┘
 ```
 
-Uma pergunta normal vai **só** para o Google AI Mode. O comparador envia a mesma
-pergunta ao Google, ChatGPT e Claude ao mesmo tempo, e por isso nunca é
-automático: exige o prefixo `compare:` ou o botão **Comparar**.
+Uma pergunta normal abre o **comparador de três IAs**. `ask:` ou `?` limita a
+consulta ao Google AI Mode quando o utilizador quer um único fornecedor. A Home
+não dispara nenhuma consulta sozinha.
 
-On Windows, **no WebView is created while the native home screen is idle**. The omnibox is a native Windows edit control; WebView2 is instantiated only after the user asks, reads, or explicitly opens a page, and it is destroyed when the user returns home.
+On Windows, **no WebView is created while the native home screen is idle**. The Home background is also native: a low-frequency GDI neural network animation flows toward the brand without video, Canvas, WebView or network access. Set `NEURALIA_REDUCE_MOTION=1` to keep the background static. The omnibox is a native Windows edit control; WebView2 is instantiated only after the user asks, reads, or explicitly opens a page, and it is destroyed when the user returns home.
 
 ## Design rules
 
 1. Native idle shell first; system WebView only on demand.
-2. One system WebView maximum, never a bundled browser engine.
+2. One system WebView outside the comparator; the comparator has a hard ceiling of three.
 3. No local LLM in the default build.
 4. No custom JavaScript engine.
 5. No custom CSS compatibility project.
@@ -52,9 +52,9 @@ NeuralIA/
 
 | Input | Result |
 |---|---|
-| `como funciona Raft?` | Google AI Mode |
+| `como funciona Raft?` | Comparador: Gemini + ChatGPT + Claude |
 | `? MVCC vs OCC` | Google AI Mode |
-| `compare: MVCC vs OCC` | Comparador: envia a mesma pergunta ao Google AI Mode, ChatGPT e Claude |
+| `compare: MVCC vs OCC` | Comparador explícito: Gemini + ChatGPT + Claude |
 | `https://example.com/paper.pdf` | Visualizador de PDF embutido (o Reader só lê HTML) |
 | `https://example.com/article` | Reader |
 | `reader:https://example.com` | Reader |
@@ -106,13 +106,19 @@ before the site sees the key. They work on every surface unless noted.
 
 `Backspace` and the digits are ignored while typing in a field; `Ctrl` combinations are not.
 
+## Comparator timelines
+
+Each AI panel owns its own vertical response timeline. The compact rail on the
+right side of Gemini, ChatGPT and Claude has an up control, progress markers and
+a down control. It tracks the page as answers grow and scrolls only the panel
+where it lives; manual navigation in one provider never moves the other two.
+
 ## Reading
 
 Opening a document asks once per session whether to advance the page automatically
 (**Sim** / **Não**, bottom centre). With **Sim**, the page moves one screen every
-30 seconds and stops at the end. A single document — HTML, plain text or PDF — is
-advanced with a synthesized Page Down, which is the only route that reaches the
-Edge PDF viewer; the three comparator columns are advanced by script. `F8` toggles
+30 seconds and stops at the end. HTML and comparator surfaces advance by script;
+PDFs use NeuralIA's bundled offline PDF.js viewer and advance page-by-page. `F8` toggles
 it at any time. EPUB is not supported: WebView2 does not open it.
 
 ## v1.0.1 hardening baseline
@@ -143,7 +149,7 @@ it at any time. EPUB is not supported: WebView2 does not open it.
 - [x] semantic article extraction
 - [x] safe script-free Reader HTML
 - [x] bounded local history + native viewer + clear
-- [x] AI comparator with system-themed top bar and real fullscreen
+- [x] AI comparator with system-themed top bar, independent response timelines and real fullscreen
 - [x] Chrome-style keyboard, zoom, find bar and DevTools inside every page
 - [x] opt-in auto-scroll for reading (HTML, text and PDF)
 - [x] external IPC isolation

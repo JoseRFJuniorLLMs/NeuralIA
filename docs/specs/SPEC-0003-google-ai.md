@@ -14,10 +14,17 @@ No AI API key is stored by NeuralIA.
 
 ## Query fan-out boundary
 
-A plain natural-language question goes to Google AI Mode and nowhere else. NeuralIA MUST NOT send it to any other provider by default.
+A plain natural-language question opens the bounded comparator and is sent to
+Google AI Mode, ChatGPT and Claude. This is visible in the three-column UI and is
+part of the current input contract.
 
-The comparator is opt-in and explicit: only `compare:<query>` (or the Comparar button) sends the same question to Google AI Mode, ChatGPT and Claude at once. The user chooses that per query; there is no setting that makes it the default, and the input grammar states the fan-out.
+`ask:<query>` and `?<query>` select a single-provider Google AI Mode request.
+The native Home itself MUST NOT send any query at startup; automatic input exists
+only through the explicit `NEURALIA_STARTUP_INPUT` automation variable.
 
-Google authentication, availability, cookies, consent, regional eligibility, and account state belong to Google and the system WebView profile. NeuralIA MUST NOT scrape passwords or promise universal AI Mode availability.
+Google authentication, availability, cookies, consent, regional eligibility,
+and account state belong to Google and the system WebView profile. NeuralIA MUST
+NOT scrape passwords or promise universal AI Mode availability.
 
-If Google changes this route, NeuralIA SHOULD expose an explicit fallback in a future spec. It MUST NOT silently switch to a paid provider.
+If Google changes this route, NeuralIA SHOULD expose an explicit fallback in a
+future spec. It MUST NOT silently switch to a paid provider.

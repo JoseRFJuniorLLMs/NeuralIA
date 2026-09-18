@@ -1,7 +1,7 @@
 # SPEC-0000 — Product Charter
 
 **Status:** Normative  
-**Version:** 1.0.1
+**Version:** 1.1.3
 
 ## Thesis
 
@@ -9,7 +9,7 @@ NeuralIA is an AI-first information client that can temporarily become a browser
 
 ## Primary flow
 
-1. Natural-language input routes to Google AI Mode.
+1. Natural-language input routes to the bounded three-provider comparator; `ask:` / `?` selects one provider.
 2. HTTP(S) URLs route to Reader.
 3. Full web rendering is explicit through `web:` or the Reader escape hatch.
 4. The user can always return to the NeuralIA home surface.
@@ -24,4 +24,4 @@ Any feature that materially increases idle memory, startup latency, resident bac
 
 ## v1 baseline
 
-A Windows user can launch NeuralIA, use a native omnibox, submit an AI query, read a normal article without executing site JavaScript, explicitly open the full page, return home, retain bounded local history, clear that history, and receive stable releases produced only from CI-green source.
+A Windows user can launch NeuralIA into an idle native Home, use a native omnibox, submit an AI query, read a normal article without executing site JavaScript, explicitly open the full page, return home, retain bounded local history, clear that history, and receive stable releases produced only from CI-green source.

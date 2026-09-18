@@ -18,7 +18,7 @@ Malicious sites, malformed HTML, hostile redirects, DNS rebinding/private-networ
 - public DNS resolution rejects local/private/reserved destinations before connection;
 - Reader converts untrusted HTML to escaped text blocks;
 - no site JavaScript in Reader;
-- no IPC exposed to Reader or external web pages;
+- no object IPC exposed to Reader or external web pages; remote `neuralia:` navigation requires a per-WebView capability and synthetic key events are ignored;
 - one-WebView ceiling;
 - bounded local history with local clear operation;
 - locked dependencies;
@@ -31,4 +31,4 @@ Malicious sites, malformed HTML, hostile redirects, DNS rebinding/private-networ
 
 Full Web mode executes arbitrary websites inside the system WebView sandbox. NeuralIA does not claim to make hostile full-web content harmless; it minimizes how often that surface is necessary.
 
-Direct user navigation to an explicitly local HTTP(S) destination is a user-authorized operation and remains distinct from a public page pivoting into the local network.
+Direct user navigation to an explicitly local HTTP(S) destination is a user-authorized operation and remains distinct from a public page pivoting into the local network. A Full Web surface that starts on a public URL and every comparator column reject obvious local/private navigation targets.

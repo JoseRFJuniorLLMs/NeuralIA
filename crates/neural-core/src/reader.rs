@@ -161,8 +161,12 @@ impl ReaderClient {
 
         let content_type = header(&response, "content-type").to_ascii_lowercase();
         let actual = content_type.split(';').next().unwrap_or("").trim();
-        if !actual.is_empty() && actual != media_type {
-            return Err(NeuralError::UnsupportedContentType(content_type));
+        if actual != media_type {
+            return Err(NeuralError::UnsupportedContentType(if content_type.is_empty() {
+                "missing Content-Type".to_string()
+            } else {
+                content_type
+            }));
         }
 
         reject_declared_oversize(&response, max_bytes)?;
@@ -263,6 +267,13 @@ impl ReaderClient {
             if read == 0 {
                 break;
             }
+            let decoded = body.len().saturating_add(read);
+            if decoded > max_bytes {
+                return Err(NeuralError::ResponseTooLarge {
+                    declared: decoded as u64,
+                    limit: max_bytes as u64,
+                });
+            }
             body.extend_from_slice(&chunk[..read]);
         }
         drop(reader);
@@ -316,14 +327,13 @@ pub fn extract_article(url: &Url, html: &str) -> Result<ReaderArticle> {
     )
     .expect("static selector");
     let link_selector = Selector::parse("a").expect("static selector");
+    let block_selector =
+        Selector::parse("h1,h2,h3,h4,h5,h6,p,blockquote,pre,li").expect("static selector");
     let root = document
         .select(&candidate_selector)
         .filter(|candidate| !inside_ignored_container(candidate))
-        .max_by_key(|candidate| score_candidate(candidate, &link_selector))
+        .max_by_key(|candidate| score_candidate(candidate, &link_selector, &block_selector))
         .unwrap_or_else(|| document.root_element());
-
-    let block_selector =
-        Selector::parse("h1,h2,h3,h4,h5,h6,p,blockquote,pre,li").expect("static selector");
     let mut blocks = Vec::new();
     let mut previous = String::new();
 
@@ -388,10 +398,7 @@ pub fn extract_article(url: &Url, html: &str) -> Result<ReaderArticle> {
     }
 
     if blocks.is_empty() {
-        let fallback = truncate_chars(
-            normalize_text(root.text().collect::<Vec<_>>().join(" ")),
-            MAX_BLOCK_CHARS,
-        );
+        let fallback = truncate_chars(fallback_visible_text(&root), MAX_BLOCK_CHARS);
         if fallback.chars().count() < 40 {
             return Err(NeuralError::ReaderExtraction);
         }
@@ -413,12 +420,23 @@ pub fn extract_article(url: &Url, html: &str) -> Result<ReaderArticle> {
     })
 }
 
-fn score_candidate(candidate: &ElementRef<'_>, link_selector: &Selector) -> usize {
-    let total = normalize_text(candidate.text().collect::<Vec<_>>().join(" "))
-        .chars()
-        .count();
+fn score_candidate(
+    candidate: &ElementRef<'_>,
+    link_selector: &Selector,
+    block_selector: &Selector,
+) -> usize {
+    let total: usize = candidate
+        .select(block_selector)
+        .filter(|node| !inside_ignored_container(node))
+        .map(|node| {
+            normalize_text(node.text().collect::<Vec<_>>().join(" "))
+                .chars()
+                .count()
+        })
+        .sum();
     let link_text: usize = candidate
         .select(link_selector)
+        .filter(|link| !inside_ignored_container(link))
         .map(|link| {
             normalize_text(link.text().collect::<Vec<_>>().join(" "))
                 .chars()
@@ -428,27 +446,44 @@ fn score_candidate(candidate: &ElementRef<'_>, link_selector: &Selector) -> usiz
     total.saturating_sub(link_text.saturating_mul(2))
 }
 
+fn ignored_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "nav" | "footer" | "aside" | "script" | "style" | "form" | "template" | "noscript"
+    )
+}
+
 fn inside_ignored_container(node: &ElementRef<'_>) -> bool {
     is_hidden_element(node)
+        || ignored_tag(node.value().name())
         || node
             .ancestors()
             .filter_map(ElementRef::wrap)
-            .any(|ancestor| {
-                matches!(
-                    ancestor.value().name(),
-                    "nav"
-                        | "footer"
-                        | "aside"
-                        | "script"
-                        | "style"
-                        | "form"
-                        | "template"
-                        | "noscript"
-                ) || is_hidden_element(&ancestor)
-            })
+            .any(|ancestor| ignored_tag(ancestor.value().name()) || is_hidden_element(&ancestor))
 }
 
-fn is_hidden_element(element: &ElementRef<'_>) -> bool {
+fn fallback_visible_text(root: &ElementRef<'_>) -> String {
+    let selector = Selector::parse("*").expect("static selector");
+    let mut pieces = Vec::new();
+
+    for node in root.select(&selector) {
+        if inside_ignored_container(&node) {
+            continue;
+        }
+        if node.children().any(|child| ElementRef::wrap(child).is_some()) {
+            continue;
+        }
+        let text = normalize_text(node.text().collect::<Vec<_>>().join(" "));
+        if text.chars().count() < 2 || pieces.last() == Some(&text) {
+            continue;
+        }
+        pieces.push(text);
+    }
+
+    normalize_text(pieces.join(" "))
+}
+
+fn is_hidden_element(element: &ElementRef<'_>) -> bool {fn is_hidden_element(element: &ElementRef<'_>) -> bool {
     let value = element.value();
 
     if value.attr("hidden").is_some()
@@ -549,6 +584,22 @@ mod tests {
         assert!(!rendered.contains("segredo"));
         assert!(!rendered.contains("não deve"));
         assert!(!rendered.contains("também não"));
+    }
+
+    #[test]
+    fn fallback_excludes_script_and_style_payloads() {
+        let html = r#"<html><head><title>Aplicacao</title></head><body>
+        <div>Conteudo visivel suficientemente longo para o Reader usar como fallback sem executar JavaScript.</div>
+        <script>window.ytInitialData = "segredo que nao pode aparecer no Reader";</script>
+        <style>.x{content:"tambem nao"}</style>
+        </body></html>"#;
+        let url = Url::parse("https://example.com/app").unwrap();
+        let article = extract_article(&url, html).unwrap();
+        let rendered = format!("{:?}", article.blocks);
+        assert!(rendered.contains("Conteudo visivel"));
+        assert!(!rendered.contains("ytInitialData"));
+        assert!(!rendered.contains("segredo"));
+        assert!(!rendered.contains("tambem nao"));
     }
 
     #[test]

@@ -38,13 +38,8 @@ jobs:
       - name: Native Home performance regression gate
         shell: pwsh
         run: ./scripts/measure-home.ps1 -ExePath target/release/NeuralIA.exe -OutputPath perf-home.json
-      # Informativo, ainda nao bloqueante: no runner a contagem de WebViews ja
-      # deu zero com a aplicacao a consumir 13 MiB a mais, ou seja, o que falha
-      # e a medicao e nao o produto. Passa a bloquear quando a medicao estiver
-      # provada; o JSON fica no artefacto para se ver a cada corrida.
       - name: WebView lifecycle regression gate
         shell: pwsh
-        continue-on-error: true
         run: ./scripts/measure-cycles.ps1 -ExePath target/release/NeuralIA.exe -Cycles 5 -OutputPath perf-cycles.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

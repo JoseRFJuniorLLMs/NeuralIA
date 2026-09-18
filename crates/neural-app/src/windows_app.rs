@@ -2,6 +2,8 @@
 
 use std::{
     borrow::Cow,
+    collections::hash_map::RandomState,
+    hash::{BuildHasher, Hasher},
     sync::{
         Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -15,7 +17,8 @@ use image::RgbaImage;
 
 use neural_core::{
     CoreConfig, HistoryEntry, HistoryKind, HistoryStore, Intent, ReaderArticle, ReaderClient,
-    chatgpt_search_url, claude_search_url, google_ai_url, is_pdf_url, parse_intent, reader_html,
+    chatgpt_search_url, claude_search_url, google_ai_url, is_local_network_target, is_pdf_url,
+    parse_intent, reader_html,
 };
 use url::Url;
 use windows_sys::Win32::{
@@ -25,9 +28,10 @@ use windows_sys::Win32::{
         ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
         CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
         DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC,
-        DeleteObject, DrawTextW, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC, InvalidateRect,
-        OUT_DEFAULT_PRECIS, PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject, SetBkColor, SetBkMode,
-        SetTextColor, SetWindowRgn, StretchDIBits, TRANSPARENT,
+        DeleteObject, DrawTextW, Ellipse, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC,
+        InvalidateRect, LineTo, MoveToEx, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC,
+        SRCCOPY, SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits,
+        TRANSPARENT, CreatePen,
     },
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     UI::{
@@ -48,7 +52,7 @@ use winit::{
     application::ApplicationHandler,
     dpi::{LogicalPosition, LogicalSize},
     event::{ElementState, MouseButton, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, NamedKey},
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
     window::{Fullscreen, Icon, Window, WindowId},
@@ -197,7 +201,7 @@ const AUTO_SCROLL_TOAST: &str = r#"
     el.id = id;
     document.documentElement.appendChild(el);
   }
-  el.textContent = on ? 'Rolagem automatica ligada — 20s (F8 desliga)' : 'Rolagem automatica desligada';
+  el.textContent = on ? 'Rolagem automatica ligada — __SECONDS__s (F8 desliga)' : 'Rolagem automatica desligada';
   el.setAttribute('style', [
     'position:fixed', 'left:50%', 'bottom:24px', 'transform:translateX(-50%)',
     'z-index:2147483647', 'padding:10px 18px', 'border-radius:999px',
@@ -377,20 +381,14 @@ const EC_RIGHTMARGIN: usize = 0x0002;
 const WM_SETFONT: u32 = 0x0030;
 const OMNIBOX_SUBCLASS_ID: usize = 0x4E49;
 
-/// Consulta disparada automaticamente quando o app abre. `NEURALIA_STARTUP_INPUT`
-/// substitui-a e `NEURALIA_NO_STARTUP` desliga-a, que e como o teste de
-/// desempenho consegue medir a Home mesmo em repouso.
-const DEFAULT_STARTUP_INPUT: &str = "jose r f junior";
-
+/// Consulta opcional para automacao/benchmarks. Em producao a Home abre em
+/// repouso e nao envia texto a nenhum fornecedor sem acao do utilizador.
 fn startup_input() -> String {
-    // Variavel propria em vez de string vazia: no Windows pôr uma variavel a ""
-    // e o mesmo que apaga-la, e o teste de desempenho ficaria sem forma de a
-    // desligar.
     if std::env::var_os("NEURALIA_NO_STARTUP").is_some() {
         return String::new();
     }
     std::env::var("NEURALIA_STARTUP_INPUT")
-        .unwrap_or_else(|_| DEFAULT_STARTUP_INPUT.to_string())
+        .unwrap_or_default()
         .trim()
         .to_string()
 }
@@ -770,6 +768,73 @@ impl ReaderWorker {
     }
 }
 
+struct DocumentJob {
+    generation: u64,
+    url: String,
+}
+
+#[derive(Clone)]
+struct DocumentWorker {
+    pending: Arc<(Mutex<Option<DocumentJob>>, Condvar)>,
+    alive: bool,
+}
+
+impl DocumentWorker {
+    fn new(
+        client: ReaderClient,
+        proxy: EventLoopProxy<UserEvent>,
+        generation: Arc<AtomicU64>,
+    ) -> Self {
+        let pending = Arc::new((Mutex::new(None::<DocumentJob>), Condvar::new()));
+        let worker_pending = Arc::clone(&pending);
+
+        let spawned = thread::Builder::new()
+            .name("neural-pdf".into())
+            .spawn(move || loop {
+                let job = {
+                    let (lock, wake) = &*worker_pending;
+                    let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    while slot.is_none() {
+                        slot = wake
+                            .wait(slot)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    slot.take().expect("document job present")
+                };
+
+                let job_generation = job.generation;
+                let watch = Arc::clone(&generation);
+                let result = client
+                    .fetch_document(&job.url, "application/pdf", PDF_MAX_BYTES, &|| {
+                        watch.load(Ordering::SeqCst) != job_generation
+                    })
+                    .map_err(|error| error.to_string());
+
+                let _ = proxy.send_event(UserEvent::PdfReady {
+                    generation: job_generation,
+                    url: job.url,
+                    result,
+                });
+            });
+
+        Self {
+            pending,
+            alive: spawned.is_ok(),
+        }
+    }
+
+    fn submit(&self, job: DocumentJob) -> Result<(), String> {
+        if !self.alive {
+            return Err("a thread de documentos não pôde ser criada".to_string());
+        }
+        let (lock, wake) = &*self.pending;
+        let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(job);
+        wake.notify_one();
+        Ok(())
+    }
+}
+
 enum HistoryCommand {
     Append(HistoryEntry),
     Clear,
@@ -779,12 +844,14 @@ enum HistoryCommand {
 struct HistoryWriter {
     tx: SyncSender<HistoryCommand>,
     store: HistoryStore,
+    proxy: EventLoopProxy<UserEvent>,
 }
 
 impl HistoryWriter {
     fn new(store: HistoryStore, proxy: EventLoopProxy<UserEvent>) -> Self {
-        let (tx, rx) = sync_channel::<HistoryCommand>(64);
+        let (tx, rx) = sync_channel::<HistoryCommand>(128);
         let worker_store = store.clone();
+        let worker_proxy = proxy.clone();
         let _ = thread::Builder::new()
             .name("neural-history".into())
             .spawn(move || {
@@ -794,36 +861,42 @@ impl HistoryWriter {
                             let _ = worker_store.append(&entry);
                         }
                         HistoryCommand::Clear => {
-                            // O utilizador so pode ver "apagado" depois de o
-                            // disco confirmar; ate aqui isto era fire-and-forget.
                             let result = worker_store.clear().map_err(|error| error.to_string());
-                            let _ = proxy.send_event(UserEvent::HistoryCleared(result));
+                            let _ = worker_proxy.send_event(UserEvent::HistoryCleared(result));
                         }
                     }
                 }
             });
-        Self { tx, store }
+        Self { tx, store, proxy }
     }
 
-    /// Fila cheia ou worker em falta: escreve aqui mesmo, em vez de perder a
-    /// entrada em silencio.
+    /// Nunca faz I/O no event loop. Sob saturacao, perder uma entrada e menos
+    /// grave do que congelar a interface com lock + fsync + rename.
     fn append(&self, entry: HistoryEntry) {
-        if self
-            .tx
-            .try_send(HistoryCommand::Append(entry.clone()))
-            .is_err()
-        {
-            let _ = self.store.append(&entry);
+        if self.tx.try_send(HistoryCommand::Append(entry)).is_err() {
+            eprintln!("history queue saturated; dropping one entry");
         }
     }
 
-    /// `None` = pedido entregue ao worker, a resposta chega em `HistoryCleared`.
-    /// `Some(..)` = nao houve worker, foi apagado aqui e o resultado e este.
+    /// A limpeza nao pode ser perdida. Se o worker estiver saturado, usa uma
+    /// thread excepcional em vez de executar I/O sincrono na UI.
     fn clear(&self) -> Option<Result<(), String>> {
         if self.tx.try_send(HistoryCommand::Clear).is_ok() {
             return None;
         }
-        Some(self.store.clear().map_err(|error| error.to_string()))
+
+        let store = self.store.clone();
+        let proxy = self.proxy.clone();
+        match thread::Builder::new()
+            .name("neural-history-clear".into())
+            .spawn(move || {
+                let result = store.clear().map_err(|error| error.to_string());
+                let _ = proxy.send_event(UserEvent::HistoryCleared(result));
+            })
+        {
+            Ok(_) => None,
+            Err(error) => Some(Err(format!("não consegui criar a thread de limpeza: {error}"))),
+        }
     }
 }
 
@@ -907,15 +980,18 @@ struct App {
     history_store: HistoryStore,
     history: HistoryWriter,
     reader: ReaderWorker,
-    /// Cliente a parte para documentos: prazo e limite maiores do que os do
-    /// Reader, o mesmo filtro de rede.
-    document_client: Arc<ReaderClient>,
+    /// Worker unico para documentos binarios. Um pedido novo substitui o
+    /// pendente, evitando uma thread/socket de 90 s por clique em PDF.
+    document: DocumentWorker,
     /// Os bytes do PDF aberto, servidos ao visualizador pela origem propria.
     pdf_bytes: Arc<Mutex<Vec<u8>>>,
     surface: Surface,
     navigation_generation: Arc<AtomicU64>,
     status: Option<String>,
     cursor: (f64, f64),
+    /// Proximo frame da rede neural nativa da Home. Nao existe WebView nem
+    /// rede por tras do efeito: e apenas GDI, limitado a ~15 FPS.
+    next_home_frame: Instant,
 }
 
 impl App {
@@ -932,9 +1008,13 @@ impl App {
             Arc::clone(&navigation_generation),
         );
         let omnibox_proxy = Box::new(proxy.clone());
-        let document_client = Arc::new(ReaderClient::new(PDF_TIMEOUT_SECS, PDF_MAX_BYTES));
+        let document = DocumentWorker::new(
+            ReaderClient::new(PDF_TIMEOUT_SECS, PDF_MAX_BYTES),
+            proxy.clone(),
+            Arc::clone(&navigation_generation),
+        );
         Self {
-            document_client,
+            document,
             pdf_bytes: Arc::new(Mutex::new(Vec::new())),
             proxy,
             window: None,
@@ -967,6 +1047,7 @@ impl App {
             navigation_generation,
             status: None,
             cursor: (-1.0, -1.0),
+            next_home_frame: Instant::now(),
         }
     }
 
@@ -1196,6 +1277,10 @@ impl App {
             let _ = webview.focus_parent();
             drop(webview);
         }
+        if let Ok(mut bytes) = self.pdf_bytes.lock() {
+            *bytes = Vec::new();
+        }
+        self.reading_pdf = false;
     }
 
     fn show_home(&mut self) {
@@ -1204,6 +1289,7 @@ impl App {
         self.surface = Surface::Home;
         self.bar_hover = None;
         self.status = None;
+        self.next_home_frame = Instant::now();
         self.show_omnibox(true);
         self.position_omnibox();
         self.request_redraw();
@@ -1340,9 +1426,7 @@ impl App {
         }
     }
 
-    /// Descarrega o PDF numa thread, com o filtro de rede do Reader, e abre-o
-    /// no visualizador nosso quando chegar. Cancela-se como o Reader: se a
-    /// navegacao mudar entretanto, o resultado e descartado.
+    /// Descarrega o PDF no worker coalescente de documentos.
     fn read_pdf(&mut self, url: Url) {
         let generation = self.next_generation();
         self.destroy_web_surfaces();
@@ -1353,26 +1437,11 @@ impl App {
         ));
         self.request_redraw();
 
-        let client = Arc::clone(&self.document_client);
-        let proxy = self.proxy.clone();
-        let watch = Arc::clone(&self.navigation_generation);
-        let target = url.to_string();
-        let spawned = thread::Builder::new()
-            .name("neural-pdf".into())
-            .spawn(move || {
-                let result = client
-                    .fetch_document(&target, "application/pdf", PDF_MAX_BYTES, &|| {
-                        watch.load(Ordering::SeqCst) != generation
-                    })
-                    .map_err(|error| error.to_string());
-                let _ = proxy.send_event(UserEvent::PdfReady {
-                    generation,
-                    url: target,
-                    result,
-                });
-            });
-        if spawned.is_err() {
-            self.show_native_error("Não consegui criar a thread para descarregar o PDF.");
+        if let Err(error) = self.document.submit(DocumentJob {
+            generation,
+            url: url.to_string(),
+        }) {
+            self.show_native_error(format!("PDF: {error}"));
         }
     }
 
@@ -1390,11 +1459,10 @@ impl App {
                     let _ = proxy.send_event(event);
                     return false;
                 }
-                if target.starts_with(PDF_ORIGIN) || target.starts_with("about:blank") {
+                if is_pdf_internal_target(&target) {
                     return true;
                 }
-                // Ligacoes dentro do PDF abrem como qualquer pagina externa.
-                if neural_core::validate_web_url(&target).is_ok() {
+                if remote_web_target(&target, false) {
                     let _ = proxy.send_event(UserEvent::OpenExternal(target));
                 }
                 false
@@ -1478,24 +1546,25 @@ impl App {
             .with_focused(true)
     }
 
-    fn external_webview_builder(&self) -> WebViewBuilder<'static> {
+    fn external_webview_builder(&self, allow_local: bool) -> WebViewBuilder<'static> {
         let navigation_proxy = self.proxy.clone();
         let new_window_proxy = self.proxy.clone();
+        let capability = remote_capability();
+        let navigation_capability = capability.clone();
+        let init_script = format!("{NEURALIA_KEYMAP_SCRIPT}\n{EXTERNAL_RETURN_BUTTON}")
+            .replace("__NEURALIA_CAP__", &capability);
 
         WebViewBuilder::new()
-            .with_initialization_script(format!(
-                "{NEURALIA_KEYMAP_SCRIPT}\n{EXTERNAL_RETURN_BUTTON}"
-            ))
+            .with_initialization_script(init_script)
             .with_navigation_handler(move |target| {
-                if let Some(event) = neuralia_action(&target) {
+                if let Some(event) = remote_neuralia_action(&target, &navigation_capability) {
                     let _ = navigation_proxy.send_event(event);
                     return false;
                 }
-
-                target.starts_with("about:blank") || neural_core::validate_web_url(&target).is_ok()
+                remote_web_target(&target, allow_local)
             })
             .with_new_window_req_handler(move |target, _features| {
-                if neural_core::validate_web_url(&target).is_ok() {
+                if remote_web_target(&target, allow_local) {
                     let _ = new_window_proxy.send_event(UserEvent::OpenExternal(target));
                 }
                 NewWindowResponse::Deny
@@ -1514,8 +1583,11 @@ impl App {
             .to_ascii_lowercase()
             .ends_with(".pdf");
 
+        let allow_local = Url::parse(url)
+            .ok()
+            .is_some_and(|target| is_local_network_target(&target));
         let result = if let Some(window) = &self.window {
-            self.external_webview_builder().with_url(url).build(window)
+            self.external_webview_builder(allow_local).with_url(url).build(window)
         } else {
             return;
         };
@@ -1768,28 +1840,20 @@ impl App {
     ) -> WebViewBuilder<'static> {
         let navigation_proxy = self.proxy.clone();
         let new_window_proxy = self.proxy.clone();
+        let capability = remote_capability();
+        let navigation_capability = capability.clone();
 
         let init_script = format!(
             "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{COMPARATOR_INJECT_SCRIPT}"
-        );
+        )
+        .replace("__NEURALIA_CAP__", &capability);
 
         WebViewBuilder::new()
             .with_initialization_script(init_script)
             .with_navigation_handler(move |target| {
-                if target.eq_ignore_ascii_case("neuralia:home") {
-                    let _ = navigation_proxy.send_event(UserEvent::HomeRequested);
-                    return false;
-                }
-                if target.eq_ignore_ascii_case("neuralia:restore") {
-                    let _ = navigation_proxy.send_event(UserEvent::RestoreComparator);
-                    return false;
-                }
-                if let Some(event) = neuralia_action(&target) {
-                    let _ = navigation_proxy.send_event(event);
-                    return false;
-                }
                 if target.starts_with("neuralia:expand") {
-                    if let Ok(action_url) = Url::parse(&target)
+                    if remote_capability_matches(&target, &navigation_capability)
+                        && let Ok(action_url) = Url::parse(&target)
                         && let Some((_, val)) = action_url.query_pairs().find(|(k, _)| k == "col")
                         && let Ok(idx) = val.parse::<usize>()
                     {
@@ -1797,11 +1861,15 @@ impl App {
                     }
                     return false;
                 }
+                if let Some(event) = remote_neuralia_action(&target, &navigation_capability) {
+                    let _ = navigation_proxy.send_event(event);
+                    return false;
+                }
 
-                target.starts_with("about:blank") || neural_core::validate_web_url(&target).is_ok()
+                remote_web_target(&target, false)
             })
             .with_new_window_req_handler(move |target, _features| {
-                if neural_core::validate_web_url(&target).is_ok() {
+                if remote_web_target(&target, false) {
                     let _ = new_window_proxy.send_event(UserEvent::OpenInColumn(col_index, target));
                 }
                 NewWindowResponse::Deny
@@ -1873,8 +1941,9 @@ impl App {
     /// Mostra na propria pagina em que estado esta a rolagem. A barra nativa
     /// tambem o diz, mas em ecra completo ela esconde-se.
     fn announce_auto_scroll(&self) {
-        let toast =
-            AUTO_SCROLL_TOAST.replace("__ON__", if self.auto_scroll { "true" } else { "false" });
+        let toast = AUTO_SCROLL_TOAST
+            .replace("__ON__", if self.auto_scroll { "true" } else { "false" })
+            .replace("__SECONDS__", &AUTO_SCROLL_SECONDS.to_string());
         self.for_each_visible_webview(|webview| {
             let _ = webview.evaluate_script(&toast);
         });
@@ -1970,6 +2039,10 @@ impl App {
     fn hide_splash(&mut self, token: u64) {
         if token != self.splash_token {
             return;
+        }
+        if SPLASH_ASKS.swap(false, Ordering::SeqCst) {
+            self.auto_scroll_answered = true;
+            self.auto_scroll = false;
         }
         if let Some(splash) = self.splash.take() {
             unsafe {
@@ -2450,6 +2523,19 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.surface == Surface::Home && home_animation_enabled() {
+            let now = Instant::now();
+            if now >= self.next_home_frame {
+                self.next_home_frame = now + Duration::from_millis(66);
+                self.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_home_frame));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+    }
+
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::HomeRequested => self.show_home(),
@@ -2726,6 +2812,54 @@ fn neuralia_action(target: &str) -> Option<UserEvent> {
     })
 }
 
+fn remote_capability() -> String {
+    let mut left = RandomState::new().build_hasher();
+    left.write_u64(now_ms());
+    left.write_u8(0x5a);
+
+    let mut right = RandomState::new().build_hasher();
+    right.write_u64(now_ms().rotate_left(17));
+    right.write_u8(0xa5);
+
+    format!("{:016x}{:016x}", left.finish(), right.finish())
+}
+
+fn remote_capability_matches(target: &str, expected: &str) -> bool {
+    let Ok(url) = Url::parse(target) else {
+        return false;
+    };
+    url.scheme().eq_ignore_ascii_case("neuralia")
+        && url
+            .query_pairs()
+            .any(|(key, value)| key == "cap" && value == expected)
+}
+
+fn remote_neuralia_action(target: &str, capability: &str) -> Option<UserEvent> {
+    if !remote_capability_matches(target, capability) {
+        return None;
+    }
+    neuralia_action(target)
+}
+
+fn remote_web_target(target: &str, allow_local: bool) -> bool {
+    if target.eq_ignore_ascii_case("about:blank") {
+        return true;
+    }
+    neural_core::validate_web_url(target)
+        .is_ok_and(|url| allow_local || !is_local_network_target(&url))
+}
+
+fn is_pdf_internal_target(target: &str) -> bool {
+    if target.eq_ignore_ascii_case("about:blank") {
+        return true;
+    }
+    Url::parse(target).is_ok_and(|url| {
+        url.scheme() == "http"
+            && url.host_str() == Some("neuralia-pdf.localhost")
+            && url.port().is_none()
+    })
+}
+
 fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -2736,6 +2870,131 @@ fn window_hwnd(window: &Window) -> Option<HWND> {
         return None;
     };
     Some(handle.hwnd.get() as HWND)
+}
+
+fn home_animation_enabled() -> bool {
+    std::env::var_os("NEURALIA_REDUCE_MOTION").is_none()
+}
+
+fn neural_hash(mut value: u32) -> f64 {
+    value ^= value >> 16;
+    value = value.wrapping_mul(0x7feb_352d);
+    value ^= value >> 15;
+    value = value.wrapping_mul(0x846c_a68b);
+    value ^= value >> 16;
+    value as f64 / u32::MAX as f64
+}
+
+/// Rede neural puramente nativa. Os nodos nascem nas bordas e percorrem curvas
+/// lentas em direcao a marca, ligando-se aos vizinhos proximos. O calculo e
+/// deterministico a partir do tempo, portanto nao precisa de estado ou alocacao
+/// persistente entre frames.
+unsafe fn draw_neural_background(
+    hdc: *mut core::ffi::c_void,
+    width: f64,
+    height: f64,
+    scale: f64,
+    target_x: f64,
+    target_y: f64,
+    brand_width: f64,
+    theme: &Theme,
+) {
+    if width < 1.0 || height < 1.0 {
+        return;
+    }
+
+    let seconds = now_ms() as f64 / 1000.0;
+    let count = ((width / (30.0 * scale.max(1.0))).round() as usize).clamp(34, 58);
+    let mut nodes = Vec::with_capacity(count);
+
+    for i in 0..count {
+        let seed = i as u32 + 1;
+        let side = seed % 4;
+        let along = neural_hash(seed.wrapping_mul(0x9e37_79b9));
+        let (sx, sy) = match side {
+            0 => (along * width, -18.0 * scale),
+            1 => (width + 18.0 * scale, along * height),
+            2 => (along * width, height + 18.0 * scale),
+            _ => (-18.0 * scale, along * height),
+        };
+
+        let phase = neural_hash(seed.wrapping_mul(0x85eb_ca6b));
+        let speed = 0.018 + neural_hash(seed.wrapping_mul(0xc2b2_ae35)) * 0.018;
+        let progress = (seconds * speed + phase).fract();
+        let eased = progress * progress * (3.0 - 2.0 * progress);
+
+        let target_offset_x = (neural_hash(seed.wrapping_mul(0x27d4_eb2d)) - 0.5)
+            * brand_width
+            * 0.44;
+        let target_offset_y = (neural_hash(seed.wrapping_mul(0x1656_67b1)) - 0.5)
+            * brand_width
+            * 0.16;
+        let tx = target_x + target_offset_x;
+        let ty = target_y + target_offset_y;
+
+        let dx = tx - sx;
+        let dy = ty - sy;
+        let length = (dx * dx + dy * dy).sqrt().max(1.0);
+        let px = -dy / length;
+        let py = dx / length;
+        let swirl_phase = neural_hash(seed.wrapping_mul(0xd3a2_646c)) * std::f64::consts::TAU;
+        let swirl = (progress * std::f64::consts::TAU * 1.7 + swirl_phase).sin()
+            * (1.0 - eased)
+            * 38.0
+            * scale;
+
+        let x = sx + dx * eased + px * swirl;
+        let y = sy + dy * eased + py * swirl;
+        let energy = 0.35 + 0.65 * progress;
+        nodes.push((x, y, energy));
+    }
+
+    let line_color = mix(theme.page_bg, theme.accent, if system_dark_mode() { 0.30 } else { 0.18 });
+    let line_pen = CreatePen(PS_SOLID, 1, rgb3(line_color));
+    let old_pen = SelectObject(hdc, line_pen as _);
+    let max_link = 150.0 * scale;
+
+    for i in 0..nodes.len() {
+        for j in (i + 1)..nodes.len() {
+            let dx = nodes[i].0 - nodes[j].0;
+            let dy = nodes[i].1 - nodes[j].1;
+            let distance = (dx * dx + dy * dy).sqrt();
+            if distance > max_link {
+                continue;
+            }
+            MoveToEx(
+                hdc,
+                nodes[i].0.round() as i32,
+                nodes[i].1.round() as i32,
+                std::ptr::null_mut(),
+            );
+            LineTo(hdc, nodes[j].0.round() as i32, nodes[j].1.round() as i32);
+        }
+    }
+    SelectObject(hdc, old_pen);
+    DeleteObject(line_pen as _);
+
+    let node_color = mix(theme.page_bg, theme.accent, if system_dark_mode() { 0.72 } else { 0.50 });
+    let node_brush = CreateSolidBrush(rgb3(node_color));
+    let node_pen = CreatePen(PS_SOLID, 1, rgb3(node_color));
+    let old_brush = SelectObject(hdc, node_brush as _);
+    let old_node_pen = SelectObject(hdc, node_pen as _);
+
+    for (x, y, energy) in nodes {
+        let radius = ((1.4 + energy * 2.1) * scale).clamp(2.0, 6.0);
+        Ellipse(
+            hdc,
+            (x - radius).round() as i32,
+            (y - radius).round() as i32,
+            (x + radius).round() as i32,
+            (y + radius).round() as i32,
+        );
+    }
+
+    SelectObject(hdc, old_node_pen);
+    SelectObject(hdc, old_brush);
+    DeleteObject(node_pen as _);
+    DeleteObject(node_brush as _);
 }
 
 fn draw_home(window: &Window, status: Option<&str>) {
@@ -2764,25 +3023,53 @@ fn draw_home(window: &Window, status: Option<&str>) {
         let width = (client.right - client.left) as f64;
         let height = (client.bottom - client.top) as f64;
         let layout = HomeLayout::new(width, height, scale);
-
         let theme = Theme::system();
 
+        // A Home agora anima continuamente; desenhar direto no ecra faria o
+        // FillRect piscar. Compoe-se o frame inteiro em memoria e faz-se um
+        // unico BitBlt no fim.
+        let mem_dc = CreateCompatibleDC(hdc);
+        let mem_bmp = if mem_dc.is_null() {
+            std::ptr::null_mut()
+        } else {
+            CreateCompatibleBitmap(hdc, client.right.max(1), client.bottom.max(1))
+        };
+        let buffered = !mem_dc.is_null() && !mem_bmp.is_null();
+        let target = if buffered { mem_dc } else { hdc };
+        let old_bmp = if buffered {
+            SelectObject(mem_dc, mem_bmp as _)
+        } else {
+            std::ptr::null_mut()
+        };
+
         let background = CreateSolidBrush(rgb3(theme.page_bg));
-        FillRect(hdc, &client, background);
+        FillRect(target, &client, background);
         DeleteObject(background as _);
+        SetBkMode(target, TRANSPARENT as i32);
 
-        SetBkMode(hdc, TRANSPARENT as i32);
-
-        // Só a marca e a barra, como a página inicial do Google. A arte já
-        // traz o nome lá dentro, por isso não se repete em texto.
         let brand_width = (420.0 * scale).min(width * 0.52);
         let brand_height = brand_width * BRAND_ASPECT;
         let brand_x = ((width - brand_width) / 2.0).round() as i32;
         let brand_y = (layout.input.y - brand_height - 44.0 * scale)
             .max(24.0 * scale)
             .round() as i32;
+
+        if home_animation_enabled() {
+            draw_neural_background(
+                target,
+                width,
+                height,
+                scale,
+                brand_x as f64 + brand_width / 2.0,
+                brand_y as f64 + brand_height * 0.58,
+                brand_width,
+                &theme,
+            );
+        }
+
+        // Marca e omnibox continuam acima da rede neural.
         draw_brand(
-            hdc,
+            target,
             brand_x,
             brand_y,
             brand_width.round() as i32,
@@ -2792,27 +3079,21 @@ fn draw_home(window: &Window, status: Option<&str>) {
 
         let body_font = create_font((-17.0 * scale) as i32, FW_NORMAL as i32);
         let small_font = create_font((-13.0 * scale) as i32, FW_NORMAL as i32);
+        let old_font = SelectObject(target, body_font as _);
 
-        let old_font = SelectObject(hdc, body_font as _);
-
-        // A barra de pesquisa: pilula suavizada por tras do EDIT nativo.
         fill_pill(
-            hdc,
+            target,
             layout.input,
             layout.input.height / 2.0,
             theme.surface,
             Some((theme.surface_line, scale)),
             theme.page_bg,
         );
+        draw_button(target, layout.go, "Ir", true, scale, body_font, &theme);
 
-        draw_button(hdc, layout.go, "Ir", true, scale, body_font, &theme);
-
-        // A Home fica so com a marca e a barra. O estado aparece apenas quando
-        // ha mesmo algo a dizer -- um erro ou uma leitura em curso -- em vez de
-        // ocupar o ecra com um aviso permanente.
         if let Some(message) = status {
-            SelectObject(hdc, small_font as _);
-            SetTextColor(hdc, rgb3(theme.fg_muted));
+            SelectObject(target, small_font as _);
+            SetTextColor(target, rgb3(theme.fg_muted));
             let mut status_rect = RECT {
                 left: (32.0 * scale) as i32,
                 top: client.bottom - (64.0 * scale) as i32,
@@ -2820,16 +3101,36 @@ fn draw_home(window: &Window, status: Option<&str>) {
                 bottom: client.bottom - (24.0 * scale) as i32,
             };
             draw_text(
-                hdc,
+                target,
                 message,
                 &mut status_rect,
                 DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
             );
         }
 
-        SelectObject(hdc, old_font);
+        SelectObject(target, old_font);
         DeleteObject(body_font as _);
         DeleteObject(small_font as _);
+
+        if buffered {
+            BitBlt(
+                hdc,
+                0,
+                0,
+                client.right.max(1),
+                client.bottom.max(1),
+                mem_dc,
+                0,
+                0,
+                SRCCOPY,
+            );
+            SelectObject(mem_dc, old_bmp);
+            DeleteObject(mem_bmp as _);
+            DeleteDC(mem_dc);
+        } else if !mem_dc.is_null() {
+            DeleteDC(mem_dc);
+        }
+
         let _ = ReleaseDC(hwnd, hdc);
     }
 }
@@ -3057,7 +3358,7 @@ const PDFJS_WORKER: &[u8] = include_bytes!("../../../assets/pdfjs/pdf.worker.mjs
 /// `http://neuralia-pdf.<host>`; o wry intercepta tudo o que comece assim.
 const PDF_ORIGIN: &str = "http://neuralia-pdf.localhost";
 /// Limite para um documento; o do Reader (2 MiB) e para HTML.
-const PDF_MAX_BYTES: usize = 64 * 1024 * 1024;
+const PDF_MAX_BYTES: usize = 32 * 1024 * 1024;
 const PDF_TIMEOUT_SECS: u64 = 90;
 
 static LOGO_IMAGE: OnceLock<RgbaImage> = OnceLock::new();
@@ -3374,6 +3675,55 @@ mod tests {
         ] {
             assert!(neuralia_action(target).is_none(), "{target}");
         }
+
+        let capability = "0123456789abcdef0123456789abcdef";
+        for action in [
+            "home",
+            "history",
+            "clearhistory",
+            "devtools",
+            "viewsource",
+            "print",
+            "reload",
+        ] {
+            let unsigned = format!("neuralia:{action}");
+            assert!(
+                remote_neuralia_action(&unsigned, capability).is_none(),
+                "pagina remota nao pode invocar {action} sem capability"
+            );
+            let signed = format!("neuralia:{action}?cap={capability}");
+            assert!(
+                remote_neuralia_action(&signed, capability).is_some(),
+                "script injetado deve poder invocar {action} com capability"
+            );
+        }
+        assert!(!remote_capability_matches(
+            "neuralia:home?cap=errado",
+            capability
+        ));
+    }
+
+    #[test]
+    fn remote_navigation_cannot_pivot_into_private_network() {
+        assert!(remote_web_target("https://example.com/a", false));
+        assert!(!remote_web_target("http://127.0.0.1:8000/", false));
+        assert!(!remote_web_target("http://192.168.1.1/", false));
+        assert!(remote_web_target("http://127.0.0.1:8000/", true));
+    }
+
+    #[test]
+    fn pdf_origin_is_exact_not_prefix_based() {
+        assert!(is_pdf_internal_target("http://neuralia-pdf.localhost/viewer.html"));
+        assert!(!is_pdf_internal_target("http://neuralia-pdf.localhost.evil.test/viewer.html"));
+        assert!(!is_pdf_internal_target("https://neuralia-pdf.localhost/viewer.html"));
+    }
+
+    #[test]
+    fn comparator_script_contains_independent_response_timeline() {
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia-response-rail"));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("Resposta anterior"));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("Próxima resposta"));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("window.scrollBy"));
     }
 
     #[test]
@@ -3920,7 +4270,10 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
   if (window.__neuralia_keymap) { return; }
   window.__neuralia_keymap = true;
 
-  function act(name) { window.location.href = 'neuralia:' + name; }
+  const capability = '__NEURALIA_CAP__';
+  function act(name) {
+    window.location.href = 'neuralia:' + name + '?cap=' + encodeURIComponent(capability);
+  }
 
   function findBar() {
     var id = 'neuralia-find';
@@ -3968,6 +4321,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
   }
 
   document.addEventListener('keydown', function (e) {
+    if (!e.isTrusted) { return; }
     var mod = e.ctrlKey || e.metaKey;
     var key = (e.key || '').toLowerCase();
 
@@ -3995,13 +4349,15 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
 
     if (e.altKey && key === 'arrowleft') { e.preventDefault(); window.history.back(); return; }
     if (e.altKey && key === 'arrowright') { e.preventDefault(); window.history.forward(); return; }
+    var target = e.target || {};
+    if (target.closest && target.closest('#neuralia-find')) { return; }
+
     if (key === 'f5') { e.preventDefault(); act('reload'); return; }
     if (key === 'f12') { e.preventDefault(); act('devtools'); return; }
     if (key === 'f8') { e.preventDefault(); act('autoscroll'); return; }
     if (key === 'f11') { e.preventDefault(); act('fullscreen'); return; }
     if (key === 'escape') { e.preventDefault(); e.stopPropagation(); act('back'); return; }
 
-    var target = e.target || {};
     var tag = (target.tagName || '').toUpperCase();
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable) {
       return;
@@ -4012,7 +4368,8 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     if (key === '1' || key === '2' || key === '3') {
       if (typeof window.__neuralia_col_index === 'number') {
         e.preventDefault();
-        window.location.href = 'neuralia:expand?col=' + (parseInt(key, 10) - 1);
+        window.location.href = 'neuralia:expand?col=' + (parseInt(key, 10) - 1)
+          + '&cap=' + encodeURIComponent(capability);
       }
       return;
     }
@@ -4041,7 +4398,10 @@ document.addEventListener('DOMContentLoaded', () => {
     background:'#111314', color:'#fff', font:'600 13px Segoe UI, sans-serif',
     boxShadow:'0 6px 24px rgba(0,0,0,.25)', cursor:'pointer'
   });
-  b.addEventListener('click', () => { window.location.href = 'neuralia:home'; });
+  const capability = '__NEURALIA_CAP__';
+  b.addEventListener('click', () => {
+    window.location.href = 'neuralia:home?cap=' + encodeURIComponent(capability);
+  });
   document.documentElement.appendChild(b);
 
 });
@@ -4049,63 +4409,143 @@ document.addEventListener('DOMContentLoaded', () => {
 
 const COMPARATOR_INJECT_SCRIPT: &str = r#"
 document.addEventListener('DOMContentLoaded', () => {
-  if (document.getElementById('neuralia-comp-btn')) return;
   const colIndex = window.__neuralia_col_index ?? 0;
   const colName = window.__neuralia_col_name ?? 'IA';
+  const capability = '__NEURALIA_CAP__';
 
-  const wrap = document.createElement('div');
-  wrap.id = 'neuralia-comp-btn';
-  Object.assign(wrap.style, {
-    position: 'fixed',
-    top: '10px',
-    right: '12px',
-    zIndex: '2147483647',
-    display: 'flex',
-    gap: '6px',
-    fontFamily: 'Segoe UI, -apple-system, BlinkMacSystemFont, sans-serif'
-  });
+  function mountControls() {
+    if (document.getElementById('neuralia-comp-controls')) return;
 
-  const btn = document.createElement('button');
-  btn.textContent = '⛶ Expandir ' + colName;
-  Object.assign(btn.style, {
-    border: '0',
-    borderRadius: '6px',
-    padding: '6px 12px',
-    background: '#111314',
-    color: '#ffffff',
-    fontSize: '11px',
-    fontWeight: '600',
-    boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
-    cursor: 'pointer',
-    opacity: '0.9',
-    transition: 'transform 0.15s ease'
-  });
-  btn.onmouseover = () => { btn.style.transform = 'scale(1.05)'; };
-  btn.onmouseout = () => { btn.style.transform = 'scale(1)'; };
-  btn.onclick = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    window.location.href = 'neuralia:expand?col=' + colIndex;
-  };
-  wrap.appendChild(btn);
+    const controls = document.createElement('div');
+    controls.id = 'neuralia-comp-controls';
+    Object.assign(controls.style, {
+      position:'fixed', top:'10px', right:'10px', bottom:'18px',
+      zIndex:'2147483647', display:'flex', flexDirection:'column',
+      alignItems:'flex-end', justifyContent:'space-between',
+      pointerEvents:'none', fontFamily:'Segoe UI, sans-serif'
+    });
 
-  document.documentElement.appendChild(wrap);
+    const expand = document.createElement('button');
+    expand.id = 'neuralia-comp-expand';
+    expand.textContent = '⛶ ' + colName;
+    Object.assign(expand.style, {
+      pointerEvents:'auto', border:'1px solid rgba(255,255,255,.12)',
+      borderRadius:'999px', padding:'6px 11px', background:'rgba(17,19,20,.90)',
+      color:'#fff', fontSize:'11px', fontWeight:'600',
+      boxShadow:'0 5px 18px rgba(0,0,0,.28)', cursor:'pointer'
+    });
+    expand.onclick = (e) => {
+      e.preventDefault(); e.stopPropagation();
+      window.location.href = 'neuralia:expand?col=' + colIndex
+        + '&cap=' + encodeURIComponent(capability);
+    };
 
-  // Duplo clique em qualquer sitio do painel expande essa coluna. Tem de ser
-  // duplo: com clique simples era impossivel usar a pagina -- nem iniciar
-  // sessao, nem escrever uma pergunta.
+    const rail = document.createElement('div');
+    rail.id = 'neuralia-response-rail';
+    Object.assign(rail.style, {
+      pointerEvents:'auto', width:'46px', minHeight:'220px', maxHeight:'54vh',
+      padding:'8px 5px', borderRadius:'24px', background:'rgba(17,19,20,.78)',
+      boxShadow:'0 8px 28px rgba(0,0,0,.28)', backdropFilter:'blur(10px)',
+      display:'flex', flexDirection:'column', alignItems:'center',
+      justifyContent:'space-between', opacity:'.82', transition:'opacity .18s ease'
+    });
+    rail.onmouseenter = () => { rail.style.opacity = '1'; };
+    rail.onmouseleave = () => { rail.style.opacity = '.82'; };
+
+    function arrow(symbol, title, direction) {
+      const button = document.createElement('button');
+      button.textContent = symbol;
+      button.title = title;
+      Object.assign(button.style, {
+        width:'36px', height:'36px', border:'0', borderRadius:'50%',
+        background:'rgba(255,255,255,.10)', color:'#fff',
+        fontSize:'22px', lineHeight:'32px', cursor:'pointer'
+      });
+      button.onclick = (e) => {
+        e.preventDefault(); e.stopPropagation();
+        const step = Math.max(220, window.innerHeight * 0.82) * direction;
+        window.scrollBy({ top: step, behavior:'smooth' });
+      };
+      return button;
+    }
+
+    const ticks = document.createElement('div');
+    ticks.id = 'neuralia-response-ticks';
+    Object.assign(ticks.style, {
+      width:'32px', flex:'1', margin:'7px 0', display:'flex',
+      flexDirection:'column', justifyContent:'space-evenly',
+      alignItems:'flex-end', cursor:'pointer'
+    });
+
+    function rebuildTicks() {
+      const scrollable = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+      const count = Math.max(5, Math.min(11,
+        Math.ceil((scrollable + window.innerHeight) / Math.max(window.innerHeight, 1))));
+      if (ticks.children.length === count) return;
+      ticks.textContent = '';
+      for (let i = 0; i < count; i++) {
+        const tick = document.createElement('div');
+        tick.dataset.tick = String(i);
+        Object.assign(tick.style, {
+          height:'2px', width:i === 0 ? '28px' : '18px', borderRadius:'2px',
+          background:'rgba(255,255,255,.42)',
+          transition:'width .16s ease, background .16s ease'
+        });
+        tick.onclick = (e) => {
+          e.preventDefault(); e.stopPropagation();
+          const max = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+          const fraction = count <= 1 ? 0 : i / (count - 1);
+          window.scrollTo({ top:max * fraction, behavior:'smooth' });
+        };
+        ticks.appendChild(tick);
+      }
+    }
+
+    function syncTicks() {
+      rebuildTicks();
+      const max = Math.max(1, document.documentElement.scrollHeight - window.innerHeight);
+      const progress = Math.max(0, Math.min(1, window.scrollY / max));
+      const count = ticks.children.length;
+      const active = Math.round(progress * Math.max(0, count - 1));
+      Array.from(ticks.children).forEach((tick, i) => {
+        const selected = i === active;
+        tick.style.width = selected ? '30px' : (Math.abs(i - active) === 1 ? '22px' : '16px');
+        tick.style.background = selected ? '#fff' : 'rgba(255,255,255,.38)';
+      });
+    }
+
+    rail.appendChild(arrow('⌃', 'Resposta anterior', -1));
+    rail.appendChild(ticks);
+    rail.appendChild(arrow('⌄', 'Próxima resposta', 1));
+    controls.appendChild(expand);
+    controls.appendChild(rail);
+    document.documentElement.appendChild(controls);
+
+    let raf = 0;
+    const scheduleSync = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => { raf = 0; syncTicks(); });
+    };
+    window.addEventListener('scroll', scheduleSync, { passive:true });
+    window.addEventListener('resize', scheduleSync, { passive:true });
+    new MutationObserver(scheduleSync).observe(document.documentElement, {
+      childList:true, subtree:true
+    });
+    syncTicks();
+  }
+
+  mountControls();
+  new MutationObserver(() => {
+    if (!document.getElementById('neuralia-comp-controls')) mountControls();
+  }).observe(document.documentElement, { childList:true, subtree:true });
+
   document.addEventListener('dblclick', (e) => {
-    if (e.target && e.target.closest && e.target.closest('#neuralia-comp-btn')) {
-      return;
-    }
+    if (e.target && e.target.closest && e.target.closest('#neuralia-comp-controls')) return;
     const tag = e.target && e.target.tagName ? e.target.tagName.toUpperCase() : '';
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
-      return;
-    }
-    if (e.target && e.target.isContentEditable) {
-      return;
-    }
-    window.location.href = 'neuralia:expand?col=' + colIndex;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (e.target && e.target.isContentEditable) return;
+    window.location.href = 'neuralia:expand?col=' + colIndex
+        + '&cap=' + encodeURIComponent(capability);
   }, true);
 });
 "#;

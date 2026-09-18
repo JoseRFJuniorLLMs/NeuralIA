@@ -98,16 +98,13 @@ fn rejects_declared_oversized_body_before_reading_it() {
 }
 
 #[test]
-#[ignore]
-fn test_youtube() {
-    let client = ReaderClient::default();
-    let res = client.fetch("https://www.youtube.com/watch?v=Scymli-lgcU").unwrap();
-    let html = neural_core::reader_html(&res);
-    println!("HTML length: {}", html.len());
-    println!("HTML start:\n{}", &html[..html.len().min(1000)]);
+fn binary_document_requires_explicit_content_type() {
+    let server = serve(vec![response("200 OK", &[], b"%PDF-1.7 fake")]);
+    let error = ReaderClient::new(3, 64 * 1024)
+        .fetch_document(&server, "application/pdf", 64 * 1024, &|| false)
+        .expect_err("binary document without Content-Type must fail");
+    assert!(matches!(error, NeuralError::UnsupportedContentType(_)));
 }
-
-
 
 #[test]
 fn rejects_streamed_body_over_limit() {

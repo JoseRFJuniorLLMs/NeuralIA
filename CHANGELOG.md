@@ -2,6 +2,32 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [1.1.3] - 2026-09-18
+
+Comparador com timelines independentes e hardening de seguranca, memoria e ciclo de vida.
+
+### Added
+- **Home neural nativa:** fundo dinamico desenhado por GDI, com neuronios/conexoes a convergir para a logomarca sem criar WebView, sem video e sem trafego de rede. `NEURALIA_REDUCE_MOTION=1` desliga o movimento.
+- **Timeline por IA:** cada coluna Gemini/ChatGPT/Claude recebe uma trilha vertical independente, com marcadores de progresso, seta para resposta anterior e proxima resposta. Cada controle rola apenas o seu WebView.
+- Testes para impedir comandos privilegiados via `neuralia:`, pivots de pagina publica para rede privada e spoofing da origem interna do PDF.
+- O SBOM CycloneDX passa a declarar o PDF.js 6.3.289 vendorizado e a licenca Apache-2.0.
+
+### Fixed
+- A Home deixa de enviar `jose r f junior` automaticamente ao arrancar. `NEURALIA_STARTUP_INPUT` fica apenas como entrada explicita de automacao/benchmark.
+- Paginas externas nao podem mais disparar historico, limpeza de historico, DevTools, view-source ou impressao atraves do esquema `neuralia:`.
+- Navegacao iniciada em pagina publica nao pode pivotar para loopback/rede privada; navegacao local digitada explicitamente continua permitida.
+- Downloads de PDF usam um worker coalescente, em vez de criar uma thread de 90 s por pedido.
+- O buffer do PDF e libertado ao sair da superficie; o limite de documento baixa para 32 MiB e o viewer remove canvases distantes.
+- O PDF viewer cancela renders antigos em resize e deixa de marcar renderizacao obsoleta como atual.
+- `fetch_document` passa a exigir `Content-Type` explicito e o Reader aplica um limite adicional aos bytes efetivamente decodificados.
+- O fallback do Reader ignora payloads `script/style/template/noscript` em paginas JS-heavy.
+- Historico nunca faz escrita/fsync no event loop quando a fila esta saturada.
+- Timeout da pergunta de auto-scroll agora equivale a "Nao" e limpa corretamente o estado; o toast mostra os 30 s reais.
+- Esc na barra de Ctrl+F fecha a busca em vez de navegar para tras.
+- O gate de lifecycle passa a bloquear o CI e reconhece reutilizacao de processos WebView2 entre controllers.
+- O teste manual do YouTube foi substituido por fixtures deterministicas/offline.
+
+
 ## [1.1.2] - 2026-09-18
 
 Visualizador embutido de PDF offline com Mozilla PDF.js e acabamento transparente na tela inicial.

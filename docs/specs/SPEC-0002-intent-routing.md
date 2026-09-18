@@ -4,8 +4,9 @@
 
 The omnibox is an intent parser.
 
-- ordinary text → `Ask`
+- ordinary text → `Compare`
 - `? query`, `ask:query` → `Ask`
+- `compare:`, `comparar:`, `!compare ` → `Compare`
 - absolute HTTP(S) URL → `Read`
 - domain-like token without whitespace → `Read`
 - `reader:`, `read:`, `!read ` → `Read`
