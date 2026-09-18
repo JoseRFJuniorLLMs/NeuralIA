@@ -80,6 +80,11 @@ fn reject_implicit_local_or_scheme(input: &str) -> Result<()> {
         return Err(NeuralError::LocalPath(redact_local_path(input)));
     }
 
+    let lower = input.to_ascii_lowercase();
+    if lower == "localhost" || lower.starts_with("localhost:") {
+        return Ok(());
+    }
+
     if let Some(scheme) = explicit_scheme(input) {
         if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
             return Ok(());
