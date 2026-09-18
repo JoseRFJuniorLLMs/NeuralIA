@@ -52,9 +52,20 @@ function Get-DescendantIds([int]$RootId) {
     return $found
 }
 
+function Get-TotalWebViewCount {
+    return @(Get-Process -Name msedgewebview2 -ErrorAction SilentlyContinue).Count
+}
+
+# Conta por ascendencia E por diferenca em relacao a linha de base. A ascendencia
+# e mais precisa quando funciona, mas o WebView2 nem sempre mantem os processos
+# como descendentes de quem os criou -- num runner do GitHub a arvore deu zero
+# enquanto a RAM subia 13 MiB. A diferenca e imune a isso; as outras aplicacoes
+# WebView2 da maquina mantem a sua contagem constante.
 function Get-WebViewCount([int]$RootId) {
     $descendants = Get-DescendantIds -RootId $RootId
-    return @($descendants | Where-Object { $_.Name -eq "msedgewebview2.exe" }).Count
+    $owned = @($descendants | Where-Object { $_.Name -eq "msedgewebview2.exe" }).Count
+    $delta = (Get-TotalWebViewCount) - $script:WebViewBaseline
+    return [math]::Max($owned, [math]::Max($delta, 0))
 }
 
 function Wait-ForWebViews([int]$RootId, [scriptblock]$Predicate, [int]$TimeoutSec) {
@@ -66,6 +77,8 @@ function Wait-ForWebViews([int]$RootId, [scriptblock]$Predicate, [int]$TimeoutSe
     }
     return Get-WebViewCount -RootId $RootId
 }
+
+$script:WebViewBaseline = @(Get-Process -Name msedgewebview2 -ErrorAction SilentlyContinue).Count
 
 $env:NEURALIA_STARTUP_INPUT = $StartupInput
 $process = Start-Process -FilePath $resolved -PassThru
@@ -129,6 +142,7 @@ try {
 
     $result = [ordered]@{
         cycles = $Cycles
+        webview_baseline = $script:WebViewBaseline
         baseline_working_set_mib = $baselineMiB
         final_working_set_mib = $finalMiB
         working_set_growth_mib = $growthMiB

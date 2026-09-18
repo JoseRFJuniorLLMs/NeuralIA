@@ -7,6 +7,7 @@ use std::{
         mpsc::{SyncSender, sync_channel},
     },
     thread,
+    time::Duration,
 };
 
 use image::RgbaImage;
@@ -19,20 +20,22 @@ use url::Url;
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
     Graphics::Gdi::{
-        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CLEARTYPE_QUALITY, CreateCompatibleBitmap,
-        CreateCompatibleDC, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH,
-        DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE,
-        DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FW_BOLD, FW_NORMAL, FillRect, GetDC,
-        OUT_DEFAULT_PRECIS, ReleaseDC, SRCCOPY, SelectObject, SetBkColor, SetBkMode, SetTextColor,
-        StretchDIBits, TRANSPARENT,
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CLEARTYPE_QUALITY,
+        ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
+        CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
+        DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC,
+        DeleteObject, DrawTextW, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC, OUT_DEFAULT_PRECIS,
+        PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject, SetBkColor, SetBkMode, SetTextColor,
+        SetWindowRgn, StretchDIBits, TRANSPARENT,
     },
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     UI::{
         Input::KeyboardAndMouse::{GetAsyncKeyState, SetFocus, VK_CONTROL, VK_SHIFT},
         WindowsAndMessaging::{
-            CreateWindowExW, ES_AUTOHSCROLL, GetClientRect, GetWindowTextLengthW, GetWindowTextW,
-            MB_ICONINFORMATION, MB_OK, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
-            SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow, WM_KEYDOWN, WS_CHILD,
+            CreateWindowExW, DestroyWindow, ES_AUTOHSCROLL, GetClientRect, GetWindowTextLengthW,
+            GetWindowTextW, MB_ICONINFORMATION, MB_OK, MessageBoxW, SW_HIDE, SW_SHOW,
+            SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow,
+            WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             WS_TABSTOP, WS_VISIBLE,
         },
     },
@@ -44,7 +47,7 @@ use winit::{
     event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
     keyboard::{Key, NamedKey},
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
-    window::{Icon, Window, WindowId},
+    window::{Fullscreen, Icon, Window, WindowId},
 };
 use wry::{NewWindowResponse, PermissionResponse, WebView, WebViewBuilder};
 
@@ -53,6 +56,8 @@ enum UserEvent {
     ShowHistory,
     ClearHistory,
     HistoryCleared(Result<(), String>),
+    /// Esconde outra vez a barra em ecra completo, se nada a tiver reavivado.
+    HideChrome(u64),
     SubmitText(String),
     OpenExternal(String),
     ExpandComparator(usize),
@@ -95,11 +100,11 @@ struct BarLayout {
 }
 
 impl BarLayout {
-    /// Em tela cheia devolve uma barra escondida: a coluna expandida fica com a
-    /// janela inteira, sem faixa nativa por cima do site.
-    fn new(client_width: f64, scale: f64, expanded: bool, columns: usize) -> Self {
+    /// `visible` falso devolve uma barra escondida: em ecra completo a coluna
+    /// fica com o monitor inteiro, sem faixa nativa por cima do site.
+    fn new(client_width: f64, scale: f64, visible: bool, columns: usize) -> Self {
         let scale = scale.max(1.0);
-        if expanded {
+        if !visible {
             let empty = UiRect {
                 x: 0.0,
                 y: 0.0,
@@ -211,6 +216,11 @@ const EM_SETCUEBANNER: u32 = 0x1501;
 const EM_SETMARGINS: u32 = 0x00D3;
 const WM_CTLCOLOREDIT: u32 = 0x0133;
 const WINDOW_SUBCLASS_ID: usize = 0x4E4A;
+const EXIT_BUTTON_SUBCLASS_ID: usize = 0x4E4B;
+const WM_PAINT: u32 = 0x000F;
+const WM_LBUTTONUP: u32 = 0x0202;
+/// Lado do botao flutuante de saida, em pixeis logicos.
+const EXIT_BUTTON_SIZE: f64 = 42.0;
 const EC_LEFTMARGIN: usize = 0x0001;
 const EC_RIGHTMARGIN: usize = 0x0002;
 const WM_SETFONT: u32 = 0x0030;
@@ -286,6 +296,67 @@ unsafe extern "system" fn window_subclass(
         return omnibox_brush(theme.surface) as LRESULT;
     }
     DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+/// Botao de sair do ecra completo. Tem de ser uma janela de topo propria: o
+/// WebView2 e uma janela filha que cobre o cliente todo, por isso nada pintado
+/// pela janela principal apareceria por cima dele. Tambem nao pode depender de
+/// nada injetado na pagina -- o YouTube reescreve o seu proprio DOM e o botao
+/// injetado desaparece, que foi exatamente o que aconteceu.
+unsafe extern "system" fn exit_button_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    reference_data: usize,
+) -> LRESULT {
+    match message {
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut paint);
+            if !hdc.is_null() {
+                let mut client = RECT::default();
+                if GetClientRect(hwnd, &mut client) != 0 {
+                    let theme = Theme::system();
+                    let width = (client.right - client.left) as f64;
+                    let height = (client.bottom - client.top) as f64;
+
+                    let background = CreateSolidBrush(rgb3(theme.bar_bg));
+                    FillRect(hdc, &client, background);
+                    DeleteObject(background as _);
+
+                    let scale = (height / EXIT_BUTTON_SIZE).max(1.0);
+                    let font = create_font((-17.0 * scale) as i32, FW_NORMAL as i32);
+                    let old_font = SelectObject(hdc, font as _);
+                    SetBkMode(hdc, TRANSPARENT as i32);
+                    SetTextColor(hdc, rgb3(theme.fg));
+                    let mut text_rect = RECT {
+                        left: 0,
+                        top: 0,
+                        right: width as i32,
+                        bottom: height as i32,
+                    };
+                    draw_text(
+                        hdc,
+                        "\u{2715}",
+                        &mut text_rect,
+                        DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                    );
+                    SelectObject(hdc, old_font);
+                    DeleteObject(font as _);
+                }
+                EndPaint(hwnd, &paint);
+            }
+            0
+        }
+        WM_LBUTTONUP => {
+            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+            let _ = proxy.send_event(UserEvent::RestoreComparator);
+            0
+        }
+        _ => DefSubclassProc(hwnd, message, wparam, lparam),
+    }
 }
 
 unsafe extern "system" fn omnibox_subclass(
@@ -529,6 +600,10 @@ struct App {
     comparator: Option<ComparatorState>,
     omnibox: Option<HWND>,
     bar_hover: Option<BarHit>,
+    /// Em ecra completo a barra some; volta enquanto o rato estiver no topo.
+    chrome_revealed: bool,
+    chrome_token: u64,
+    exit_button: Option<HWND>,
     omnibox_font: Option<*mut core::ffi::c_void>,
     omnibox_font_height: i32,
     omnibox_proxy: Box<EventLoopProxy<UserEvent>>,
@@ -563,6 +638,9 @@ impl App {
             comparator: None,
             omnibox: None,
             bar_hover: None,
+            chrome_revealed: false,
+            chrome_token: 0,
+            exit_button: None,
             omnibox_font: None,
             omnibox_font_height: 0,
             omnibox_proxy,
@@ -743,6 +821,11 @@ impl App {
     /// aqui que os tres WebViews sobreviviam ao regresso a Home e o contador
     /// podia chegar a quatro somando o Full Web.
     fn destroy_web_surfaces(&mut self) {
+        if let Some(button) = self.exit_button.take() {
+            unsafe {
+                DestroyWindow(button);
+            }
+        }
         if let Some(comparator) = self.comparator.take() {
             drop(comparator);
         }
@@ -1096,11 +1179,22 @@ impl App {
                 comp.expanded = Some(idx);
             }
         }
-        if restored {
-            self.bar_hover = None;
+        self.bar_hover = None;
+        self.chrome_revealed = false;
+        self.chrome_token = self.chrome_token.wrapping_add(1);
+
+        // Ecra completo a serio: sem barra de titulo, sem minimizar/fechar.
+        if let Some(window) = &self.window {
+            if restored {
+                window.set_fullscreen(None);
+            } else {
+                window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+            }
         }
+
         self.update_comparator_layout();
         self.sync_comparator_buttons();
+        self.sync_exit_button();
         self.request_redraw();
     }
 
@@ -1108,8 +1202,14 @@ impl App {
         if let Some(comp) = &mut self.comparator {
             comp.expanded = None;
         }
+        self.chrome_revealed = false;
+        self.chrome_token = self.chrome_token.wrapping_add(1);
+        if let Some(window) = &self.window {
+            window.set_fullscreen(None);
+        }
         self.update_comparator_layout();
         self.sync_comparator_buttons();
+        self.sync_exit_button();
         self.request_redraw();
     }
 
@@ -1142,14 +1242,21 @@ impl App {
 
         match comp.expanded {
             Some(idx) => {
-                // Tela cheia e tela cheia: a barra sai da frente e o site fica
-                // com a janela inteira. O regresso e o Esc ou o botao que a
-                // propria pagina recebe injetado.
+                // Ecra completo. A coluna ocupa tudo menos uma faixa de 1px no
+                // topo: o WebView e uma janela filha e engole o rato, por isso
+                // sem essa faixa a aplicacao nunca saberia que o rato subiu ao
+                // topo para chamar a barra de volta.
+                let (top, height) = if self.chrome_revealed {
+                    (TOP_BAR_HEIGHT, (logical_h - TOP_BAR_HEIGHT).max(1.0))
+                } else {
+                    (1.0, (logical_h - 1.0).max(1.0))
+                };
+
                 for (i, v) in comp.views.iter().enumerate() {
                     if i == idx {
                         let _ = v.webview.set_bounds(wry::Rect {
-                            position: LogicalPosition::new(0.0, 0.0).into(),
-                            size: LogicalSize::new(logical_w, logical_h).into(),
+                            position: LogicalPosition::new(0.0, top).into(),
+                            size: LogicalSize::new(logical_w, height).into(),
                         });
                         let _ = v.webview.set_visible(true);
                     } else {
@@ -1222,6 +1329,21 @@ impl App {
             .with_focused(true)
     }
 
+    fn is_fullscreen_column(&self) -> bool {
+        self.comparator
+            .as_ref()
+            .is_some_and(|comp| comp.expanded.is_some())
+    }
+
+    /// Em tres colunas a barra esta sempre la; em ecra completo so enquanto o
+    /// rato a chamar.
+    fn bar_visible(&self) -> bool {
+        match &self.comparator {
+            Some(comp) => comp.expanded.is_none() || self.chrome_revealed,
+            None => false,
+        }
+    }
+
     fn bar_layout(&self) -> Option<BarLayout> {
         let (Some(window), Some(comp)) = (&self.window, &self.comparator) else {
             return None;
@@ -1229,9 +1351,129 @@ impl App {
         Some(BarLayout::new(
             window.inner_size().width as f64,
             window.scale_factor(),
-            comp.expanded.is_some(),
+            self.bar_visible(),
             comp.views.len(),
         ))
+    }
+
+    /// Cria/mostra/esconde o botao flutuante de saida. Existe apenas enquanto
+    /// houver uma coluna em ecra completo -- e a unica saida sempre visivel,
+    /// porque a barra de titulo desapareceu e a barra da app auto-esconde-se.
+    fn sync_exit_button(&mut self) {
+        let wanted = self.surface == Surface::Comparator && self.is_fullscreen_column();
+
+        if !wanted {
+            if let Some(button) = self.exit_button.take() {
+                unsafe {
+                    DestroyWindow(button);
+                }
+            }
+            return;
+        }
+
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
+        let size = (EXIT_BUTTON_SIZE * scale).round() as i32;
+        let margin = (16.0 * scale).round() as i32;
+
+        let button = match self.exit_button {
+            Some(button) => button,
+            None => unsafe {
+                // Janela de topo, e nao filha: uma janela filha ficaria por
+                // baixo do WebView2 na ordem Z e nunca se veria.
+                let created = CreateWindowExW(
+                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    windows_sys::w!("STATIC"),
+                    windows_sys::w!(""),
+                    WS_POPUP | WS_VISIBLE,
+                    0,
+                    0,
+                    size,
+                    size,
+                    owner,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                );
+                if created.is_null() {
+                    return;
+                }
+                let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
+                if SetWindowSubclass(
+                    created,
+                    Some(exit_button_subclass),
+                    EXIT_BUTTON_SUBCLASS_ID,
+                    proxy_ptr,
+                ) == 0
+                {
+                    DestroyWindow(created);
+                    return;
+                }
+                let region = CreateRoundRectRgn(0, 0, size + 1, size + 1, size, size);
+                if !region.is_null() {
+                    SetWindowRgn(created, region, 1);
+                }
+                self.exit_button = Some(created);
+                created
+            },
+        };
+
+        // Canto superior direito do monitor, que em ecra completo e a janela.
+        let mut client = RECT::default();
+        unsafe {
+            if GetClientRect(owner, &mut client) == 0 {
+                return;
+            }
+            let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+            ClientToScreen(owner, &mut origin);
+            SetWindowPos(
+                button,
+                std::ptr::null_mut(),
+                origin.x + client.right - size - margin,
+                origin.y + margin,
+                size,
+                size,
+                SWP_NOACTIVATE,
+            );
+            ShowWindow(button, SW_SHOW);
+        }
+    }
+
+    /// Mostra a barra e marca-a para desaparecer sozinha. Cada chamada invalida
+    /// o temporizador anterior, por isso ela fica enquanto o rato la andar.
+    fn reveal_chrome(&mut self) {
+        let was_hidden = !self.chrome_revealed;
+        self.chrome_revealed = true;
+        self.chrome_token = self.chrome_token.wrapping_add(1);
+
+        let proxy = self.proxy.clone();
+        let token = self.chrome_token;
+        let _ = thread::Builder::new()
+            .name("neural-chrome".into())
+            .spawn(move || {
+                thread::sleep(Duration::from_millis(2500));
+                let _ = proxy.send_event(UserEvent::HideChrome(token));
+            });
+
+        if was_hidden {
+            self.update_comparator_layout();
+            self.request_redraw();
+        }
+    }
+
+    fn hide_chrome(&mut self, token: u64) {
+        if token != self.chrome_token || !self.chrome_revealed {
+            return;
+        }
+        self.chrome_revealed = false;
+        self.bar_hover = None;
+        self.update_comparator_layout();
+        self.request_redraw();
     }
 
     fn update_bar_hover(&mut self) {
@@ -1319,6 +1561,7 @@ impl ApplicationHandler<UserEvent> for App {
                 Some(result) => self.report_history_cleared(result),
             },
             UserEvent::HistoryCleared(result) => self.report_history_cleared(result),
+            UserEvent::HideChrome(token) => self.hide_chrome(token),
             UserEvent::SubmitText(input) => {
                 if self.surface == Surface::Home {
                     let input = input.trim().to_string();
@@ -1375,7 +1618,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Some(window) = &self.window
                         && let Some(comp) = &self.comparator
                     {
-                        draw_comparator_bar(window, comp, self.bar_hover);
+                        draw_comparator_bar(window, comp, self.bar_hover, self.bar_visible());
                     }
                 }
                 _ => {}
@@ -1387,6 +1630,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 Surface::Comparator => {
                     self.update_comparator_layout();
+                    self.sync_exit_button();
                     self.request_redraw();
                 }
                 _ => {}
@@ -1394,6 +1638,18 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
                 if self.surface == Surface::Comparator {
+                    if self.is_fullscreen_column() {
+                        let scale = self
+                            .window
+                            .as_ref()
+                            .map(|window| window.scale_factor().max(1.0))
+                            .unwrap_or(1.0);
+                        // Ou o rato encostou ao topo, ou ja esta sobre a barra
+                        // revelada -- em qualquer dos casos ela fica.
+                        if self.chrome_revealed || position.y <= 2.0 * scale {
+                            self.reveal_chrome();
+                        }
+                    }
                     self.update_bar_hover();
                 }
             }
@@ -1575,7 +1831,12 @@ fn draw_home(window: &Window, status: Option<&str>) {
     }
 }
 
-fn draw_comparator_bar(window: &Window, comp: &ComparatorState, hover: Option<BarHit>) {
+fn draw_comparator_bar(
+    window: &Window,
+    comp: &ComparatorState,
+    hover: Option<BarHit>,
+    visible: bool,
+) {
     let Ok(handle) = window.window_handle() else {
         return;
     };
@@ -1623,7 +1884,7 @@ fn draw_comparator_bar(window: &Window, comp: &ComparatorState, hover: Option<Ba
             width,
             scale,
             &names,
-            comp.expanded,
+            visible,
             hover,
             &Theme::system(),
         );
@@ -1649,11 +1910,11 @@ unsafe fn paint_comparator_bar(
     width: i32,
     scale: f64,
     names: &[&str],
-    expanded: Option<usize>,
+    visible: bool,
     hover: Option<BarHit>,
     theme: &Theme,
 ) {
-    let layout = BarLayout::new(width as f64, scale, expanded.is_some(), names.len());
+    let layout = BarLayout::new(width as f64, scale, visible, names.len());
     if !layout.visible {
         return;
     }
@@ -2007,18 +2268,18 @@ mod tests {
             let height = TOP_BAR_HEIGHT as i32;
             let accent = system_accent();
 
-            let cases: [(&str, Theme, Option<usize>, Option<BarHit>); 3] = [
-                ("dark", Theme::dark(accent), None, None),
+            let cases: [(&str, Theme, bool, Option<BarHit>); 3] = [
+                ("dark", Theme::dark(accent), true, None),
                 (
                     "dark-hover",
                     Theme::dark(accent),
-                    None,
+                    true,
                     Some(BarHit::Column(2)),
                 ),
-                ("light-expanded", Theme::light(accent), Some(1), None),
+                ("light", Theme::light(accent), true, None),
             ];
 
-            for (name, theme, expanded, hover) in cases {
+            for (name, theme, visible, hover) in cases {
                 let mem = CreateCompatibleDC(screen);
                 let bitmap = CreateCompatibleBitmap(screen, width, height);
                 assert!(!mem.is_null() && !bitmap.is_null());
@@ -2029,7 +2290,7 @@ mod tests {
                     width,
                     1.0,
                     &["Google Gemini", "ChatGPT", "Claude"],
-                    expanded,
+                    visible,
                     hover,
                     &theme,
                 );
@@ -2098,7 +2359,7 @@ mod tests {
 
     #[test]
     fn bar_layout_hit_matches_drawing() {
-        let layout = BarLayout::new(1600.0, 1.0, false, 3);
+        let layout = BarLayout::new(1600.0, 1.0, true, 3);
 
         // Cada pilula centrada sobre a sua coluna, com 2px de tolerancia.
         for (index, rect) in layout.columns.iter().enumerate().take(3) {
@@ -2123,8 +2384,8 @@ mod tests {
         );
         assert_eq!(layout.hit(800.0, layout.height + 5.0), None);
 
-        // Em tela cheia nao ha barra nenhuma: nem se desenha, nem se clica.
-        let expanded = BarLayout::new(1600.0, 1.0, true, 3);
+        // Em ecra completo nao ha barra nenhuma: nem se desenha, nem se clica.
+        let expanded = BarLayout::new(1600.0, 1.0, false, 3);
         assert!(!expanded.visible);
         assert_eq!(expanded.height, 0.0);
         assert_eq!(expanded.columns_len, 0);

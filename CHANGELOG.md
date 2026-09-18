@@ -2,6 +2,36 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [1.1.0] - 2026-09-18
+
+Comparador de IAs, tema do sistema e correcoes de ciclo de vida apontadas pela terceira auditoria.
+
+### Added
+- Comparador lado a lado: uma pergunta abre o Google AI Mode, o ChatGPT e o Claude em tres colunas. `ask:` ou `?` mantem a pergunta num unico fornecedor.
+- Barra de topo com a cor de destaque do Windows e o tema claro/escuro do sistema, pilulas e icones suavizados, e realce sob o rato.
+- Ecra completo real por coluna: sem barra de titulo, com botao de saida flutuante sempre visivel e barra que reaparece com o rato no topo.
+- Consulta automatica ao arrancar, configuravel por `NEURALIA_STARTUP_INPUT` e desligavel por `NEURALIA_NO_STARTUP`.
+- Gate de ciclo de vida (`scripts/measure-cycles.ps1`) que conta WebViews em ciclos comparador -> Home.
+
+### Fixed
+- **Os WebViews do comparador sobreviviam ao regresso a Home.** Todas as saidas passam agora por `destroy_web_surfaces`, que destroi o comparador e o WebView unico.
+- `Ctrl+Shift+Delete` dizia que tinha apagado o historico sem confirmacao do disco, e a mensagem era escrita antes de `show_home` a apagar. Agora o worker confirma e a mensagem sobrevive.
+- Entradas de historico deixavam de ser gravadas em silencio com a fila cheia; passam a ser escritas na hora.
+- O Reader continuava a puxar bytes da rede depois de o utilizador voltar a Home; passa a desistir entre blocos.
+- O historico e substituido de forma atomica (ficheiro temporario + `rename`) em vez de truncado no lugar.
+- CI e release apontavam para `neural-app.exe` quando o binario passou a chamar-se `NeuralIA.exe`.
+- `cargo clippy` e `cargo fmt --check` falhavam em `main`; o CI passa agora a correr tambem `cargo test -p neural-app`.
+- A omnibox nao tinha tipo de letra definido e herdava a fonte de sistema minuscula.
+
+### Security
+- Filtro de IPv6 desempacota 6to4 e NAT64 antes de decidir, fechando o tunel para 127.0.0.1 e para a rede privada; cobre ainda site-local, discard-only, Teredo e benchmarking.
+- `build.rs` falha a compilacao em release quando o recurso PE nao compila, em vez de continuar com um aviso.
+- O workflow de release exige `push` e repositorio de origem proprio, alem de CI verde em `main`.
+
+### Changed
+- A tela inicial ficou so com a marca, a barra arredondada e o botao Ir; os modos vivem na gramatica da omnibox.
+- SPEC-0003, SPEC-0005 e SPEC-0008 passam a descrever o leque para tres fornecedores e o tecto de WebViews do comparador.
+
 ## [1.0.1] - 2026-09-18
 
 Security and reliability hardening release after the second recursive audit.
