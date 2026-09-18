@@ -1,12 +1,27 @@
-use std::time::Duration;
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use scraper::{ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
+use ureq::{
+    Agent,
+    config::Config,
+    http::Uri,
+    tls::{RootCerts, TlsConfig},
+    unversioned::{
+        resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver},
+        transport::{DefaultConnector, NextTimeout},
+    },
+};
 use url::Url;
 
 use crate::{
     NeuralError, Result,
-    security::{validate_redirect_target, validate_web_url},
+    security::{
+        is_forbidden_ip, is_local_network_target, validate_redirect_target, validate_web_url,
+    },
 };
 
 const MAX_REDIRECTS: usize = 5;
@@ -34,39 +49,98 @@ pub enum ReaderBlock {
     ListItem(String),
 }
 
+#[derive(Debug, Default)]
+struct PublicResolver {
+    inner: DefaultResolver,
+}
+
+impl Resolver for PublicResolver {
+    fn resolve(
+        &self,
+        uri: &Uri,
+        config: &Config,
+        timeout: NextTimeout,
+    ) -> std::result::Result<ResolvedSocketAddrs, ureq::Error> {
+        let resolved = self.inner.resolve(uri, config, timeout)?;
+        let mut safe = self.inner.empty();
+
+        for address in resolved {
+            if !is_forbidden_ip(address.ip()) {
+                safe.push(SocketAddr::new(address.ip(), address.port()));
+            }
+        }
+
+        if safe.is_empty() {
+            Err(ureq::Error::HostNotFound)
+        } else {
+            Ok(safe)
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ReaderClient {
-    agent: ureq::Agent,
+    public_agent: Agent,
+    local_agent: Agent,
     max_bytes: usize,
+    timeout: Duration,
 }
 
 impl ReaderClient {
     pub fn new(timeout_secs: u64, max_bytes: usize) -> Self {
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(timeout_secs)))
-            // Redirects are handled manually so every Location can be validated
-            // before the next network request.
+        let config = Agent::config_builder()
+            .proxy(None)
             .max_redirects(0)
+            .tls_config(
+                TlsConfig::builder()
+                    .root_certs(RootCerts::PlatformVerifier)
+                    .build(),
+            )
             .build();
+
+        let public_agent = Agent::with_parts(
+            config.clone(),
+            DefaultConnector::new(),
+            PublicResolver::default(),
+        );
+        let local_agent = Agent::new_with_config(config);
+
         Self {
-            agent: ureq::Agent::new_with_config(config),
+            public_agent,
+            local_agent,
             max_bytes,
+            timeout: Duration::from_secs(timeout_secs),
         }
     }
 
     pub fn fetch(&self, input: &str) -> Result<ReaderArticle> {
         let mut current = validate_web_url(input)?;
+        let started = Instant::now();
         let user_agent = format!(
             "NeuralIA/{} (+https://github.com/JoseRFJuniorLLMs/NeuralIA)",
             env!("CARGO_PKG_VERSION")
         );
 
         for redirect_count in 0..=MAX_REDIRECTS {
-            let mut response = self
-                .agent
+            let remaining = self
+                .timeout
+                .checked_sub(started.elapsed())
+                .filter(|duration| !duration.is_zero())
+                .ok_or(NeuralError::ReaderDeadline)?;
+
+            let agent = if is_local_network_target(&current) {
+                &self.local_agent
+            } else {
+                &self.public_agent
+            };
+
+            let mut response = agent
                 .get(current.as_str())
                 .header("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1")
                 .header("User-Agent", user_agent.as_str())
+                .config()
+                .timeout_global(Some(remaining))
+                .build()
                 .call()?;
 
             if response.status().is_redirection() {
@@ -90,10 +164,11 @@ impl ReaderClient {
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or("")
                 .to_ascii_lowercase();
+            let media_type = content_type.split(';').next().unwrap_or("").trim();
 
-            if !content_type.is_empty()
-                && !content_type.contains("text/html")
-                && !content_type.contains("application/xhtml+xml")
+            if !media_type.is_empty()
+                && media_type != "text/html"
+                && media_type != "application/xhtml+xml"
             {
                 return Err(NeuralError::UnsupportedContentType(content_type));
             }
@@ -115,9 +190,12 @@ impl ReaderClient {
                 .body_mut()
                 .with_config()
                 .limit(self.max_bytes as u64)
-                // Charset conversion (feature = charset) runs before this.
                 .lossy_utf8(true)
                 .read_to_string()?;
+
+            if started.elapsed() > self.timeout {
+                return Err(NeuralError::ReaderDeadline);
+            }
 
             return extract_article(&current, &html);
         }
@@ -162,15 +240,21 @@ pub fn extract_article(url: &Url, html: &str) -> Result<ReaderArticle> {
         if inside_ignored_container(&node) {
             continue;
         }
-        let text = truncate_chars(
-            normalize_text(node.text().collect::<Vec<_>>().join(" ")),
-            MAX_BLOCK_CHARS,
-        );
+
+        let tag = node.value().name();
+        let text = if tag == "pre" {
+            truncate_chars(normalize_code(node.text().collect::<Vec<_>>().join("")), MAX_BLOCK_CHARS)
+        } else {
+            truncate_chars(
+                normalize_text(node.text().collect::<Vec<_>>().join(" ")),
+                MAX_BLOCK_CHARS,
+            )
+        };
+
         if text.chars().count() < 2 || text == previous {
             continue;
         }
 
-        let tag = node.value().name();
         let block = match tag {
             "h1" => ReaderBlock::Heading {
                 level: 1,
@@ -313,6 +397,18 @@ fn normalize_text(input: String) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn normalize_code(input: String) -> String {
+    input
+        .replace("
+", "
+")
+        .replace('', "
+")
+        .trim_matches('
+')
+        .to_string()
+}
+
 fn truncate_chars(value: String, limit: usize) -> String {
     if value.chars().count() <= limit {
         value
@@ -336,6 +432,17 @@ mod tests {
         assert_eq!(article.title, "Teste");
         assert_eq!(article.byline.as_deref(), Some("Eva"));
         assert!(article.blocks.len() >= 4);
+    }
+
+    #[test]
+    fn preserves_code_whitespace() {
+        let html = "<article><pre>fn main() {\n    println!(\"hi\");\n}</pre></article>";
+        let url = Url::parse("https://example.com/code").unwrap();
+        let article = extract_article(&url, html).unwrap();
+        let ReaderBlock::Code(code) = &article.blocks[0] else {
+            panic!("expected code block");
+        };
+        assert!(code.contains("\n    println!"));
     }
 
     #[test]
