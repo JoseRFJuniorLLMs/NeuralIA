@@ -2656,12 +2656,49 @@ impl ApplicationHandler<UserEvent> for App {
                 self.create_omnibox();
                 self.request_redraw();
 
-                // Abertura: a consulta padrao ja entra na omnibox e vai direto
-                // para a tela de resultados, sem esperar Enter do utilizador.
-                let startup = startup_input();
-                if !startup.is_empty() {
-                    self.set_omnibox_text(&startup);
-                    let _ = self.proxy.send_event(UserEvent::SubmitText(startup));
+                // Em CI o lifecycle e exercitado pelo proprio event loop, sem
+                // SendKeys/foco. O worker apenas pede abrir/fechar e espera o
+                // probe confirmar cada transicao antes de seguir.
+                if let (Some(cycles), Some(probe_path)) = (
+                    std::env::var("NEURALIA_LIFECYCLE_SELFTEST")
+                        .ok()
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .filter(|cycles| *cycles > 0),
+                    std::env::var_os("NEURALIA_LIFECYCLE_PROBE")
+                        .map(std::path::PathBuf::from),
+                ) {
+                    let proxy = self.proxy.clone();
+                    let _ = thread::Builder::new()
+                        .name("neural-lifecycle-selftest".into())
+                        .spawn(move || {
+                            thread::sleep(Duration::from_millis(350));
+                            for cycle in 0..cycles {
+                                let _ = proxy.send_event(UserEvent::SubmitText(format!(
+                                    "neuralia lifecycle probe {}",
+                                    cycle + 1
+                                )));
+                                if !wait_for_probe_value(&probe_path, "3", Duration::from_secs(30))
+                                {
+                                    return;
+                                }
+
+                                thread::sleep(Duration::from_millis(400));
+                                let _ = proxy.send_event(UserEvent::HomeRequested);
+                                if !wait_for_probe_value(&probe_path, "0", Duration::from_secs(30))
+                                {
+                                    return;
+                                }
+                                thread::sleep(Duration::from_millis(400));
+                            }
+                        });
+                } else {
+                    // Abertura normal: producao fica em Home; a variavel de
+                    // startup existe apenas para automacao/demo explicita.
+                    let startup = startup_input();
+                    if !startup.is_empty() {
+                        self.set_omnibox_text(&startup);
+                        let _ = self.proxy.send_event(UserEvent::SubmitText(startup));
+                    }
                 }
             }
             Err(error) => {
@@ -2998,6 +3035,19 @@ fn is_pdf_internal_url(target: &str) -> bool {
     url.scheme() == "http"
         && url.host_str() == Some("neuralia-pdf.localhost")
         && url.port_or_known_default() == Some(80)
+}
+
+fn wait_for_probe_value(path: &std::path::Path, expected: &str, timeout: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if std::fs::read_to_string(path)
+            .is_ok_and(|value| value.trim() == expected)
+        {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(80));
+    }
+    false
 }
 
 fn wide_null(value: &str) -> Vec<u16> {
