@@ -80,10 +80,7 @@ fn enforces_redirect_limit() {
 fn rejects_declared_oversized_body_before_reading_it() {
     let server = serve(vec![response(
         "200 OK",
-        &[
-            ("Content-Type", "text/html"),
-            ("Content-Length", "1048576"),
-        ],
+        &[("Content-Type", "text/html"), ("Content-Length", "1048576")],
         b"",
     )]);
 
@@ -158,9 +155,8 @@ fn deadline_bounds_entire_navigation() {
         if let Ok((mut first, _)) = listener.accept() {
             let mut request = [0u8; 1024];
             let _ = first.read(&mut request);
-            let _ = first.write_all(
-                b"HTTP/1.1 302 Found\r\nLocation: /slow\r\nConnection: close\r\n\r\n",
-            );
+            let _ = first
+                .write_all(b"HTTP/1.1 302 Found\r\nLocation: /slow\r\nConnection: close\r\n\r\n");
         }
         if let Ok((mut second, _)) = listener.accept() {
             let mut request = [0u8; 1024];
