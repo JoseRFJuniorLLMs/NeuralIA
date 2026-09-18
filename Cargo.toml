@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/neural-core","crates/neural-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/JoseRFJuniorLLMs/NeuralIA"
+authors = ["Jose Ribamar Ferreira Junior"]
+
+[workspace.dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0"
+url = { version = "2.5.8", features = ["serde"] }

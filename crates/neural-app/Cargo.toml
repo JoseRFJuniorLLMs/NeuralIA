@@ -1,0 +1,15 @@
+[package]
+name = "neural-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+neural-core = { path = "../neural-core" }
+
+[target.'cfg(windows)'.dependencies]
+serde_json.workspace = true
+winit = "0.30"
+wry = "0.57"
