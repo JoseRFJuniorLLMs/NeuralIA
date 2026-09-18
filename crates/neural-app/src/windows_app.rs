@@ -23,10 +23,10 @@ use windows_sys::Win32::{
         SetTextColor, TRANSPARENT,
     },
     UI::{
-        Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_SHIFT},
+        Input::KeyboardAndMouse::{GetAsyncKeyState, SetFocus, VK_CONTROL, VK_SHIFT},
         WindowsAndMessaging::{
             CreateWindowExW, ES_AUTOHSCROLL, GetClientRect, GetWindowTextLengthW, GetWindowTextW,
-            SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetFocus, SetWindowPos,
+            SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos,
             SetWindowTextW, ShowWindow, WM_KEYDOWN, WS_CHILD, WS_EX_CLIENTEDGE, WS_TABSTOP,
             WS_VISIBLE,
         },
@@ -364,7 +364,7 @@ impl App {
                 WS_EX_CLIENTEDGE,
                 windows_sys::w!("EDIT"),
                 windows_sys::w!(""),
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
                 0,
                 0,
                 100,
