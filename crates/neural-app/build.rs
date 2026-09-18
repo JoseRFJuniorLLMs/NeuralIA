@@ -9,8 +9,15 @@ fn main() {
     res.set("ProductName", "NeuralIA");
     res.set("FileDescription", "NeuralIA Desktop");
     res.set("LegalCopyright", "© 2026 Jose Ribamar Ferreira Junior");
+    // Em release o recurso PE (icone, ProductName, copyright) faz parte do
+    // artefacto: falhar aqui em silencio ja produziu um binario publicado sem
+    // icone. Em debug continua a ser so um aviso, para nao travar o dia a dia.
     if let Err(e) = res.compile() {
-        eprintln!("cargo:warning=Failed to compile Windows resources: {e}");
+        let profile = std::env::var("PROFILE").unwrap_or_default();
+        if profile == "release" {
+            panic!("Windows resources failed to compile in release: {e}");
+        }
+        println!("cargo:warning=Failed to compile Windows resources: {e}");
     }
 }
 

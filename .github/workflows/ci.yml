@@ -32,15 +32,21 @@ jobs:
           components: clippy,rustfmt
       - run: cargo check --locked --workspace
       - run: cargo test --locked -p neural-core
-      - run: cargo clippy --locked -p neural-app -- -D warnings
-      - run: cargo build --locked -p neural-app --release
+      - run: cargo test --locked -p neural-app
+      - run: cargo clippy --locked -p neural-app --all-targets -- -D warnings
+      - run: cargo build --locked -p neural-app --bin NeuralIA --release
       - name: Native Home performance regression gate
         shell: pwsh
-        run: ./scripts/measure-home.ps1 -ExePath target/release/neural-app.exe -OutputPath perf-home.json
+        run: ./scripts/measure-home.ps1 -ExePath target/release/NeuralIA.exe -OutputPath perf-home.json
+      - name: WebView lifecycle regression gate
+        shell: pwsh
+        run: ./scripts/measure-cycles.ps1 -ExePath target/release/NeuralIA.exe -Cycles 5 -OutputPath perf-cycles.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: neuralia-home-performance
-          path: perf-home.json
+          path: |
+            perf-home.json
+            perf-cycles.json
           if-no-files-found: error
 
   dependency-audit:

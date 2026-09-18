@@ -9,6 +9,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 $resolved = (Resolve-Path $ExePath).Path
+
+# Este gate mede a Home nativa EM REPOUSO. A aplicacao abre por omissao com uma
+# consulta automatica, que criaria WebViews e inflacionaria RAM e threads --
+# scripts/measure-cycles.ps1 e que mede esse caminho.
+$env:NEURALIA_NO_STARTUP = "1"
+
 $watch = [System.Diagnostics.Stopwatch]::StartNew()
 $process = Start-Process -FilePath $resolved -PassThru
 

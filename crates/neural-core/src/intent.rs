@@ -5,6 +5,10 @@ use crate::{NeuralError, Result, security::validate_web_url};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intent {
     Ask(String),
+    /// Comparacao lado-a-lado, o destino normal de uma pergunta: a mesma
+    /// pergunta segue para os tres fornecedores. `ask:` ou `?` limitam-na ao
+    /// Google AI Mode quando o utilizador nao quer esse leque.
+    Compare(String),
     Read(Url),
     Web(Url),
     Home,
@@ -28,6 +32,16 @@ pub fn parse_intent(input: &str) -> Result<Intent> {
     for prefix in ["reader:", "read:", "!read "] {
         if let Some(rest) = strip_prefix_ascii(raw, prefix) {
             return Ok(Intent::Read(parse_urlish(rest)?));
+        }
+    }
+
+    for prefix in ["compare:", "comparar:", "!compare "] {
+        if let Some(rest) = strip_prefix_ascii(raw, prefix) {
+            let query = rest.trim();
+            if query.is_empty() {
+                return Err(NeuralError::EmptyInput);
+            }
+            return Ok(Intent::Compare(query.to_string()));
         }
     }
 
@@ -55,7 +69,9 @@ pub fn parse_intent(input: &str) -> Result<Intent> {
         return Ok(Intent::Read(parse_urlish(raw)?));
     }
 
-    Ok(Intent::Ask(raw.to_string()))
+    // Texto normal vai para o comparador. Quem quiser um unico fornecedor usa
+    // `ask:` ou `?`, que ficam no Google AI Mode.
+    Ok(Intent::Compare(raw.to_string()))
 }
 
 fn parse_urlish(input: &str) -> Result<Url> {
@@ -177,10 +193,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compare_prefix_is_explicit_fan_out() {
+        for input in [
+            "compare: mvcc vs occ",
+            "comparar:mvcc vs occ",
+            "!compare mvcc vs occ",
+            "COMPARE: mvcc vs occ",
+        ] {
+            assert_eq!(
+                parse_intent(input).unwrap(),
+                Intent::Compare("mvcc vs occ".to_string()),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_question_goes_to_the_comparator() {
+        for input in ["como funciona raft", "mvcc vs occ", "jose r f junior"] {
+            assert!(
+                matches!(parse_intent(input).unwrap(), Intent::Compare(_)),
+                "{input} devia abrir o comparador"
+            );
+        }
+    }
+
+    #[test]
+    fn ask_prefix_stays_on_a_single_provider() {
+        // A saida para quem nao quer a pergunta em tres sitios ao mesmo tempo.
+        for input in ["? mvcc vs occ", "ask: mvcc vs occ"] {
+            assert_eq!(
+                parse_intent(input).unwrap(),
+                Intent::Ask("mvcc vs occ".to_string()),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_compare_is_rejected() {
+        assert!(parse_intent("compare:").is_err());
+        assert!(parse_intent("compare:   ").is_err());
+    }
+
+    #[test]
     fn text_is_ai() {
         assert_eq!(
             parse_intent("como funciona raft").unwrap(),
-            Intent::Ask("como funciona raft".into())
+            Intent::Compare("como funciona raft".into())
         );
     }
 
@@ -258,9 +318,11 @@ mod tests {
             parse_intent("ask:file format on Windows").unwrap(),
             Intent::Ask(_)
         ));
+        // Texto com dois pontos nao e esquema nem prefixo: segue o caminho
+        // normal, que hoje e o comparador.
         assert!(matches!(
             parse_intent("rust: ownership model").unwrap(),
-            Intent::Ask(_)
+            Intent::Compare(_)
         ));
     }
 

@@ -12,7 +12,9 @@ jobs:
   build:
     if: >
       github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'main'
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: windows-latest
     permissions:
       contents: read
@@ -41,9 +43,9 @@ jobs:
           "sha=$env:TESTED_SHA" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
       - run: cargo test --locked -p neural-core
       - run: cargo clippy --locked -p neural-core --all-targets -- -D warnings
-      - run: cargo clippy --locked -p neural-app -- -D warnings
+      - run: cargo clippy --locked -p neural-app --all-targets -- -D warnings
       - name: Build exact CI-tested source
-        run: cargo build --locked -p neural-app --release
+        run: cargo build --locked -p neural-app --bin NeuralIA --release
       - name: Generate CycloneDX SBOM
         shell: pwsh
         run: |
@@ -53,7 +55,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/release/neural-app.exe dist/NeuralIA.exe
+          Copy-Item target/release/NeuralIA.exe dist/NeuralIA.exe
 
           $sbom = Get-ChildItem crates/neural-app -File -Filter "*.json" |
             Where-Object { $_.Name -match "bom|cdx|cyclonedx" } |

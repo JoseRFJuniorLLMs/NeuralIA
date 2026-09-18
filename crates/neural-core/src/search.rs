@@ -35,8 +35,7 @@ pub fn claude_search_url(query: &str) -> Result<Url> {
     }
     let mut url = Url::parse("https://claude.ai/new")
         .map_err(|_| NeuralError::InvalidUrl("Claude search endpoint".into()))?;
-    url.query_pairs_mut()
-        .append_pair("q", query);
+    url.query_pairs_mut().append_pair("q", query);
     Ok(url)
 }
 
@@ -47,8 +46,7 @@ pub fn perplexity_search_url(query: &str) -> Result<Url> {
     }
     let mut url = Url::parse("https://www.perplexity.ai/search")
         .map_err(|_| NeuralError::InvalidUrl("Perplexity search endpoint".into()))?;
-    url.query_pairs_mut()
-        .append_pair("q", query);
+    url.query_pairs_mut().append_pair("q", query);
     Ok(url)
 }
 
@@ -85,4 +83,3 @@ mod tests {
         assert_eq!(u.path(), "/search");
     }
 }
-

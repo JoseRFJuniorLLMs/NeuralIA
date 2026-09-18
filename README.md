@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/logo.ico" width="180" alt="NeuralIA — A smarter way to browse" style="border-radius: 36px;"></p>
+<p align="center"><img src="assets/logo.png" width="180" alt="NeuralIA — A smarter way to browse" style="border-radius: 36px;"></p>
 
 <h1 align="center">NeuralIA</h1>
 <p align="center"><strong>The browser without the browser.</strong></p>
@@ -13,10 +13,15 @@ It deliberately refuses the usual browser arms race. It does not ship Chromium, 
 ```text
 native Rust home
       │
-      ├── question ─────► Google AI Mode ─┐
-      ├── URL ──────────► Reader ─────────┼► lazy system WebView2
-      └── web:<URL> ─────► full page ─────┘
+      ├── question ─────────► Google AI Mode ─┐
+      ├── URL ──────────────► Reader ─────────┼► lazy system WebView2
+      ├── web:<URL> ────────► full page ──────┘
+      └── compare:<question> ► 3 provedores lado a lado (opt-in explícito)
 ```
+
+Uma pergunta normal vai **só** para o Google AI Mode. O comparador envia a mesma
+pergunta ao Google, ChatGPT e Claude ao mesmo tempo, e por isso nunca é
+automático: exige o prefixo `compare:` ou o botão **Comparar**.
 
 On Windows, **no WebView is created while the native home screen is idle**. The omnibox is a native Windows edit control; WebView2 is instantiated only after the user asks, reads, or explicitly opens a page, and it is destroyed when the user returns home.
 
@@ -49,6 +54,7 @@ NeuralIA/
 |---|---|
 | `como funciona Raft?` | Google AI Mode |
 | `? MVCC vs OCC` | Google AI Mode |
+| `compare: MVCC vs OCC` | Comparador: envia a mesma pergunta ao Google AI Mode, ChatGPT e Claude |
 | `https://example.com/article` | Reader |
 | `reader:https://example.com` | Reader |
 | `web:https://example.com` | Full WebView |

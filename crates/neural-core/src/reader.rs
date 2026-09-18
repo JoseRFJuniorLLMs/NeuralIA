@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use scraper::{ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use ureq::{
     Agent,
     config::Config,
@@ -12,6 +13,7 @@ use ureq::{
         transport::{DefaultConnector, NextTimeout},
     },
 };
+
 use url::Url;
 
 use crate::{
@@ -111,6 +113,18 @@ impl ReaderClient {
     }
 
     pub fn fetch(&self, input: &str) -> Result<ReaderArticle> {
+        self.fetch_cancellable(input, &|| false)
+    }
+
+    /// Como `fetch`, mas desiste assim que `cancelled()` passa a ser verdade.
+    /// O Reader corre numa thread propria e a ligacao nao se pode abortar de
+    /// fora, por isso a desistencia e cooperativa: testada antes de cada pedido
+    /// e entre blocos do corpo.
+    pub fn fetch_cancellable(
+        &self,
+        input: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ReaderArticle> {
         let mut current = validate_web_url(input)?;
         let started = Instant::now();
         let user_agent = format!(
@@ -119,6 +133,10 @@ impl ReaderClient {
         );
 
         for redirect_count in 0..=MAX_REDIRECTS {
+            if cancelled() {
+                return Err(NeuralError::ReaderCancelled);
+            }
+
             let remaining = self
                 .timeout
                 .checked_sub(started.elapsed())
@@ -183,12 +201,37 @@ impl ReaderClient {
                 });
             }
 
-            let html = response
+            // Em blocos, e nao `read_to_string()`, para haver onde desistir:
+            // sem isto uma leitura em curso continua a puxar bytes depois de o
+            // utilizador ja ter voltado a Home.
+            let mut reader = response
                 .body_mut()
                 .with_config()
                 .limit(self.max_bytes as u64)
                 .lossy_utf8(true)
-                .read_to_string()?;
+                .reader();
+
+            let mut body = Vec::new();
+            let mut chunk = [0u8; 16 * 1024];
+            loop {
+                if cancelled() {
+                    return Err(NeuralError::ReaderCancelled);
+                }
+                if started.elapsed() > self.timeout {
+                    return Err(NeuralError::ReaderDeadline);
+                }
+                let read = reader.read(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                body.extend_from_slice(&chunk[..read]);
+            }
+            drop(reader);
+
+            // O BodyReader ja entrega UTF-8 (conversao de charset incluida), por
+            // isso juntamos os blocos e convertemos uma vez so: um caratere
+            // partido entre blocos nao se estraga.
+            let html = String::from_utf8_lossy(&body).into_owned();
 
             if started.elapsed() > self.timeout {
                 return Err(NeuralError::ReaderDeadline);

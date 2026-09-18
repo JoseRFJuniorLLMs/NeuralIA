@@ -18,6 +18,8 @@ pub enum NeuralError {
     RedirectLimit,
     #[error("tempo total do Reader excedido")]
     ReaderDeadline,
+    #[error("leitura cancelada")]
+    ReaderCancelled,
     #[error("resposta excede o limite do Reader ({declared} > {limit} bytes)")]
     ResponseTooLarge { declared: u64, limit: u64 },
     #[error("resposta não é HTML: {0}")]
