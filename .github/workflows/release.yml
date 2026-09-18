@@ -3,19 +3,54 @@ name: Windows release
 on:
   workflow_dispatch:
   push:
+    branches: [main]
     tags: ["v*"]
 
 permissions:
   contents: write
 
 jobs:
+  tag-stable-version:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Lock dependencies and create version tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          tag="v$version"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "$tag already exists; nothing to do."
+            exit 0
+          fi
+
+          cargo generate-lockfile
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add Cargo.lock
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): lock dependencies for $tag"
+          fi
+
+          git tag -a "$tag" -m "NeuralIA $tag"
+          git push --atomic origin HEAD:main "refs/tags/$tag"
+
   build:
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.1
       - name: Build
-        run: cargo build -p neural-app --release
+        run: cargo build -p neural-app --release --locked
       - name: Rename artifact
         shell: pwsh
         run: Copy-Item target/release/neural-app.exe target/release/NeuralIA.exe
@@ -31,7 +66,6 @@ jobs:
             target/release/NeuralIA.exe
             target/release/NeuralIA.exe.sha256
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
