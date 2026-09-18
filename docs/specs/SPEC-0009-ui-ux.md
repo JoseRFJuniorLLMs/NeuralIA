@@ -10,6 +10,15 @@ The Home surface contains the logo, product name/tagline, one native Windows omn
 
 The omnibox MUST be a platform text-edit control rather than a painted text editor. Selection, caret movement, clipboard operations, IME input, Home/End/Delete, and ordinary text-edit shortcuts therefore follow Windows behavior.
 
+## Comparator scroll rails
+
+Each of the three provider panels MUST expose its own compact vertical timeline
+rail near the right edge. It is not a conventional scrollbar: a thin vertical
+spine carries four short reference marks and one longer moving position mark.
+Clicking or dragging the rail scrolls only that panel. The selected scroll
+container hides its conventional visual scrollbar while preserving wheel,
+keyboard and touch scrolling.
+
 ## Reader
 
 Reader prioritizes comfortable line length, typography, semantic headings/lists, quotes, and whitespace-preserving code. It always exposes Home and Open full page.
