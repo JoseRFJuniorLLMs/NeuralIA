@@ -3745,6 +3745,16 @@ mod tests {
     }
 
     #[test]
+    fn comparator_timeline_and_sync_use_current_control_ids() {
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia-response-rail"));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia-comp-expand"));
+        assert!(COMPARATOR_BUTTON_EXPANDED.contains("#neuralia-comp-expand"));
+        assert!(COMPARATOR_BUTTON_COLLAPSED.contains("#neuralia-comp-expand"));
+        assert!(!COMPARATOR_BUTTON_EXPANDED.contains("neuralia-comp-btn"));
+        assert!(!COMPARATOR_BUTTON_COLLAPSED.contains("neuralia-comp-btn"));
+    }
+
+    #[test]
     fn zoom_walks_the_chrome_ladder() {
         assert_eq!(ZOOM_STEPS[0], 0.25);
         assert!(ZOOM_STEPS.contains(&1.0));
@@ -4401,8 +4411,8 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
 
 /// Rotulos do botao injetado no comparador. Em tela cheia a barra nativa some,
 /// por isso este botao tem de anunciar a saida.
-const COMPARATOR_BUTTON_EXPANDED: &str = "(function(){var w=document.querySelector('#neuralia-comp-btn');if(w){w.style.display='none';}})();";
-const COMPARATOR_BUTTON_COLLAPSED: &str = "(function(){var w=document.querySelector('#neuralia-comp-btn');if(w){w.style.display='flex';}var b=document.querySelector('#neuralia-comp-btn button');if(b){b.textContent='\u{26F6} Expandir ' + (window.__neuralia_col_name || 'IA');}})();";
+const COMPARATOR_BUTTON_EXPANDED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='none';}})();";
+const COMPARATOR_BUTTON_COLLAPSED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='block';b.textContent='\u{26F6} ' + (window.__neuralia_col_name || 'IA');}})();";
 
 const EXTERNAL_RETURN_BUTTON: &str = r#"
 document.addEventListener('DOMContentLoaded', () => {
@@ -4461,23 +4471,28 @@ document.addEventListener('DOMContentLoaded', () => {
     const rail = document.createElement('div');
     rail.id = 'neuralia-response-rail';
     Object.assign(rail.style, {
-      pointerEvents:'auto', width:'46px', minHeight:'220px', maxHeight:'54vh',
-      padding:'8px 5px', borderRadius:'24px', background:'rgba(17,19,20,.78)',
-      boxShadow:'0 8px 28px rgba(0,0,0,.28)', backdropFilter:'blur(10px)',
+      pointerEvents:'auto', width:'48px', minHeight:'220px', maxHeight:'56vh',
+      padding:'4px 3px', background:'transparent',
       display:'flex', flexDirection:'column', alignItems:'center',
-      justifyContent:'space-between', opacity:'.82', transition:'opacity .18s ease'
+      justifyContent:'space-between', opacity:'.72', transition:'opacity .18s ease'
     });
     rail.onmouseenter = () => { rail.style.opacity = '1'; };
-    rail.onmouseleave = () => { rail.style.opacity = '.82'; };
+    rail.onmouseleave = () => { rail.style.opacity = '.72'; };
 
     function arrow(symbol, title, direction) {
       const button = document.createElement('button');
       button.textContent = symbol;
       button.title = title;
       Object.assign(button.style, {
-        width:'36px', height:'36px', border:'0', borderRadius:'50%',
-        background:'rgba(255,255,255,.10)', color:'#fff',
-        fontSize:'22px', lineHeight:'32px', cursor:'pointer'
+        width: direction > 0 ? '42px' : '36px',
+        height: direction > 0 ? '42px' : '32px',
+        border: direction > 0 ? '1px solid rgba(255,255,255,.08)' : '0',
+        borderRadius:'50%',
+        background: direction > 0 ? 'rgba(38,38,38,.94)' : 'transparent',
+        color: direction > 0 ? '#f4f4f4' : 'rgba(255,255,255,.52)',
+        boxShadow: direction > 0 ? '0 6px 20px rgba(0,0,0,.28)' : 'none',
+        fontSize:'22px', lineHeight: direction > 0 ? '38px' : '28px',
+        padding:'0', cursor:'pointer'
       });
       button.onclick = (e) => {
         e.preventDefault(); e.stopPropagation();
@@ -4490,7 +4505,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const ticks = document.createElement('div');
     ticks.id = 'neuralia-response-ticks';
     Object.assign(ticks.style, {
-      width:'32px', flex:'1', margin:'7px 0', display:'flex',
+      width:'34px', flex:'1', margin:'8px 0 10px', display:'flex',
       flexDirection:'column', justifyContent:'space-evenly',
       alignItems:'flex-end', cursor:'pointer'
     });
@@ -4505,9 +4520,9 @@ document.addEventListener('DOMContentLoaded', () => {
         const tick = document.createElement('div');
         tick.dataset.tick = String(i);
         Object.assign(tick.style, {
-          height:'2px', width:i === 0 ? '28px' : '18px', borderRadius:'2px',
-          background:'rgba(255,255,255,.42)',
-          transition:'width .16s ease, background .16s ease'
+          height:'2px', width:i === 0 ? '30px' : '15px', borderRadius:'2px',
+          background:'rgba(255,255,255,.30)',
+          transition:'width .16s ease, background .16s ease, opacity .16s ease'
         });
         tick.onclick = (e) => {
           e.preventDefault(); e.stopPropagation();
@@ -4527,8 +4542,9 @@ document.addEventListener('DOMContentLoaded', () => {
       const active = Math.round(progress * Math.max(0, count - 1));
       Array.from(ticks.children).forEach((tick, i) => {
         const selected = i === active;
-        tick.style.width = selected ? '30px' : (Math.abs(i - active) === 1 ? '22px' : '16px');
-        tick.style.background = selected ? '#fff' : 'rgba(255,255,255,.38)';
+        tick.style.width = selected ? '32px' : (Math.abs(i - active) === 1 ? '23px' : '14px');
+        tick.style.background = selected ? '#fff' : 'rgba(255,255,255,.34)';
+        tick.style.opacity = selected ? '1' : (Math.abs(i - active) === 1 ? '.82' : '.62');
       });
     }
 

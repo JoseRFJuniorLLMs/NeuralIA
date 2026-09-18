@@ -2,6 +2,15 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [1.1.4] - 2026-09-18
+
+Polimento da timeline independente do comparador e correcao de sincronizacao visual.
+
+### Fixed
+- O estado expandido/restaurado volta a controlar o ID atual `#neuralia-comp-expand`; a implementacao 1.1.3 ainda procurava o ID antigo `#neuralia-comp-btn`.
+- A timeline de cada IA fica mais proxima do controle temporal do Grok: trilha transparente, marcador ativo mais longo, vizinhos graduais, seta superior discreta e botao inferior circular.
+- Teste de regressao garante que o script injetado e o sincronizador nativo continuem usando os mesmos IDs.
+
 ## [1.1.3] - 2026-09-18
 
 Comparador com timelines independentes e hardening de seguranca, memoria e ciclo de vida.
