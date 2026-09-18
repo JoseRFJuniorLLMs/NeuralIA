@@ -3,6 +3,8 @@ name: Rebuild verified brand asset
 on:
   push:
     branches: ["fix/brand-local-upload"]
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: write
