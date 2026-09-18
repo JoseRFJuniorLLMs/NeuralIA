@@ -1,3 +1,5 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use std::thread;
 
 use arboard::Clipboard;
@@ -402,17 +404,17 @@ impl App {
             return;
         }
 
-        if self.ctrl_pressed {
-            if let Key::Character(value) = &event.logical_key {
-                if value.eq_ignore_ascii_case("v") {
-                    self.paste();
-                    return;
-                }
-                if value.eq_ignore_ascii_case("l") {
-                    self.input.clear();
-                    self.request_redraw();
-                    return;
-                }
+        if self.ctrl_pressed
+            && let Key::Character(value) = &event.logical_key
+        {
+            if value.eq_ignore_ascii_case("v") {
+                self.paste();
+                return;
+            }
+            if value.eq_ignore_ascii_case("l") {
+                self.input.clear();
+                self.request_redraw();
+                return;
             }
         }
 
