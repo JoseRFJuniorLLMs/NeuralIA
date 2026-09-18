@@ -6,7 +6,7 @@
 
 ## What NeuralIA is
 
-NeuralIA **v1.3.0** is an AI-first, reader-first, system-WebView information client written in Rust.
+NeuralIA **v1.4.0** is an AI-first, reader-first, system-WebView information client written in Rust.
 
 It deliberately refuses the usual browser arms race. It does not ship Chromium, does not implement its own JavaScript engine, does not carry a local LLM, and does not try to become an operating system with tabs.
 
@@ -31,7 +31,15 @@ do nome abre a omnibox daquela IA e as fontes abertas aparecem logo abaixo,
 agrupadas automaticamente por origem. Clicar numa aba reabre a fonte no Split
 View. `Ctrl+K` ou `Ctrl+T` abre a mesma omnibox flutuante. As scrollbars
 nativas das três colunas ficam escondidas; a timeline vertical centralizada
-passa a ser o controle de rolagem.
+passa a ser o controle de rolagem. A rolagem automática usa o container real de
+cada painel, portanto **Gemini, ChatGPT e Claude avançam juntos** mesmo quando o
+site usa um scroller interno.
+
+Quando já existe uma sessão Google autenticada no perfil WebView2, o NeuralIA
+pode observar o Gmail em background sem armazenar senha. Uma nova mensagem gera
+um aviso nativo discreto no **canto inferior direito** com remetente e assunto.
+O primeiro estado da caixa de entrada é apenas a linha de base e não dispara
+notificação retroativa.
 
 On Windows, **no WebView is created while the native home screen is idle**. The Home background is also native: a low-frequency GDI neural network animation flows toward the brand without video, Canvas, WebView or network access. Set `NEURALIA_REDUCE_MOTION=1` to keep the background static. The omnibox is a native Windows edit control; WebView2 is instantiated only after the user asks, reads, or explicitly opens a page, and it is destroyed when the user returns home.
 

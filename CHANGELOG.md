@@ -2,6 +2,19 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [1.4.0] - 2026-09-18
+
+Rolagem sincronizada nas tres IAs e notificacao Gmail usando a sessao Google existente.
+
+### Added
+- **Gmail toast:** quando o perfil WebView2 já está autenticado no Google, o NeuralIA acompanha a caixa de entrada e mostra novas mensagens no canto inferior direito, com remetente e assunto, sem guardar senha.
+- O monitor do Gmail cria uma linha de base inicial para não notificar e-mails antigos como se fossem novos.
+
+### Fixed
+- **Auto-scroll das 3 colunas:** Gemini, ChatGPT e Claude agora detectam e rolam seus próprios containers internos; antes apenas páginas que rolavam no `window/document` avançavam corretamente.
+- Ajustado o teste geométrico da barra agrupada: o centro relevante agora é o grupo **IA + botão +**, não apenas a pílula do nome.
+- Aplicado o formato exigido pelo `cargo fmt` à UI de abas agrupadas da 1.3.0.
+
 ## [1.3.0] - 2026-09-18
 
 Abas visiveis agrupadas por IA e botao + em cada grupo.

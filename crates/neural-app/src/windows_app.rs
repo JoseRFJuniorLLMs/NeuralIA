@@ -80,6 +80,14 @@ enum UserEvent {
     ViewSource,
     AutoScrollTick(u64),
     HideSplash(u64),
+    GmailProbe(u64),
+    GmailInboxState {
+        unread: u32,
+        sender: String,
+        subject: String,
+        key: String,
+    },
+    HideGmailToast(u64),
     ShowHistory,
     ClearHistory,
     HistoryCleared(Result<(), String>),
@@ -135,12 +143,16 @@ const AUTO_SCROLL_SECONDS: u64 = 30;
 const AUTO_SCROLL_PROMPT_SECONDS: u64 = 20;
 
 const SPLASH_SUBCLASS_ID: usize = 0x4E4C;
+const GMAIL_TOAST_SUBCLASS_ID: usize = 0x4E4D;
 const SPLASH_WIDTH: f64 = 470.0;
 const SPLASH_HEIGHT: f64 = 46.0;
+const GMAIL_TOAST_WIDTH: f64 = 390.0;
+const GMAIL_TOAST_HEIGHT: f64 = 68.0;
 
 /// Texto do aviso flutuante. Vive fora do App porque quem o pinta e o
 /// procedimento de janela, que nao tem acesso ao estado da aplicacao.
 static SPLASH_TEXT: Mutex<String> = Mutex::new(String::new());
+static GMAIL_TOAST_TEXT: Mutex<String> = Mutex::new(String::new());
 /// Verdadeiro enquanto a janela esta a fazer uma pergunta com Sim/Nao.
 static SPLASH_ASKS: AtomicBool = AtomicBool::new(false);
 
@@ -176,29 +188,62 @@ const AUTO_SCROLL_SCRIPT: &str = r#"
     return;
   }
 
+  function scrollRoot(doc) {
+    var root = doc.scrollingElement || doc.documentElement || doc.body;
+    var best = root;
+    var bestRange = best ? Math.max(0, best.scrollHeight - best.clientHeight) : 0;
+    var candidates = doc.querySelectorAll(
+      'main,[role="main"],[data-radix-scroll-area-viewport],'
+      + '[data-testid*="scroll"],[class*="overflow"],[class*="scroll"]'
+    );
+
+    for (var i = 0; i < candidates.length; i++) {
+      var el = candidates[i];
+      if (!el || el === doc.body || el === doc.documentElement) continue;
+      var range = Math.max(0, el.scrollHeight - el.clientHeight);
+      if (range <= bestRange + 24) continue;
+      var css = doc.defaultView.getComputedStyle(el);
+      if (css.display === 'none' || css.visibility === 'hidden' || css.overflowY === 'hidden') {
+        continue;
+      }
+      best = el;
+      bestRange = range;
+    }
+    return best;
+  }
+
   function step(win) {
     try {
       var doc = win.document;
-      var el = doc.scrollingElement || doc.documentElement || doc.body;
-      if (!el) { return false; }
+      var el = scrollRoot(doc);
+      if (!el) return false;
+
+      var docLike = el === doc.scrollingElement
+        || el === doc.documentElement || el === doc.body;
       var view = el.clientHeight || win.innerHeight || 0;
-      if (view <= 0) { return false; }
-      if (el.scrollHeight - el.clientHeight <= 4) { return false; }
-      if (el.scrollTop + el.clientHeight >= el.scrollHeight - 2) { return false; }
-      win.scrollBy({ top: Math.max(view - 72, 120), left: 0, behavior: 'smooth' });
+      var top = docLike ? win.scrollY : el.scrollTop;
+      var max = Math.max(0, el.scrollHeight - el.clientHeight);
+      if (view <= 0 || max <= 4 || top >= max - 2) return false;
+
+      var amount = Math.max(view - 72, 120);
+      if (docLike) {
+        win.scrollBy({ top: amount, left: 0, behavior: 'smooth' });
+      } else {
+        el.scrollBy({ top: amount, left: 0, behavior: 'smooth' });
+      }
       return true;
     } catch (err) {
       return false;
     }
   }
 
-  if (step(window)) { return; }
+  if (step(window)) return;
 
   // Alguns leitores desenham o conteudo dentro de um frame proprio.
   var frames = document.querySelectorAll('iframe, frame');
   for (var i = 0; i < frames.length; i++) {
     try {
-      if (frames[i].contentWindow && step(frames[i].contentWindow)) { return; }
+      if (frames[i].contentWindow && step(frames[i].contentWindow)) return;
     } catch (err) { /* outra origem: nao ha nada a fazer daqui */ }
   }
 })();
@@ -259,7 +304,13 @@ struct BarLayout {
 
 impl BarLayout {
     fn new(client_width: f64, scale: f64, visible: bool, columns: usize) -> Self {
-        Self::with_contexts(client_width, scale, visible, columns, [0; COMPARATOR_COLUMNS])
+        Self::with_contexts(
+            client_width,
+            scale,
+            visible,
+            columns,
+            [0; COMPARATOR_COLUMNS],
+        )
     }
 
     fn with_contexts(
@@ -317,8 +368,7 @@ impl BarLayout {
 
         if columns_len > 0 {
             let column_width = client_width / columns_len as f64;
-            let group_width = (column_width - 14.0 * scale)
-                .clamp(108.0 * scale, 196.0 * scale);
+            let group_width = (column_width - 14.0 * scale).clamp(108.0 * scale, 196.0 * scale);
             let plus_size = 26.0 * scale;
             let plus_gap = 4.0 * scale;
             let provider_width = (group_width - plus_size - plus_gap).max(72.0 * scale);
@@ -648,6 +698,76 @@ unsafe extern "system" fn splash_subclass(
 
                 SelectObject(hdc, old_font);
                 DeleteObject(font as _);
+            }
+            EndPaint(hwnd, &paint);
+        }
+        return 0;
+    }
+    DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+unsafe extern "system" fn gmail_toast_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    _reference_data: usize,
+) -> LRESULT {
+    if message == WM_PAINT {
+        let mut paint = PAINTSTRUCT::default();
+        let hdc = BeginPaint(hwnd, &mut paint);
+        if !hdc.is_null() {
+            let mut client = RECT::default();
+            if GetClientRect(hwnd, &mut client) != 0 {
+                let theme = Theme::system();
+                let background = CreateSolidBrush(rgb3(theme.surface));
+                FillRect(hdc, &client, background);
+                DeleteObject(background as _);
+
+                let scale =
+                    ((client.bottom - client.top) as f64 / GMAIL_TOAST_HEIGHT).max(1.0);
+                let title_font = create_font((-13.0 * scale) as i32, FW_BOLD as i32);
+                let body_font = create_font((-12.0 * scale) as i32, FW_NORMAL as i32);
+                let old_font = SelectObject(hdc, title_font as _);
+                SetBkMode(hdc, TRANSPARENT as i32);
+
+                SetTextColor(hdc, rgb3(theme.accent));
+                let mut title = RECT {
+                    left: (16.0 * scale) as i32,
+                    top: (7.0 * scale) as i32,
+                    right: client.right - (14.0 * scale) as i32,
+                    bottom: (28.0 * scale) as i32,
+                };
+                draw_text(
+                    hdc,
+                    "Gmail · novo e-mail",
+                    &mut title,
+                    DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                );
+
+                SelectObject(hdc, body_font as _);
+                SetTextColor(hdc, rgb3(theme.fg));
+                let text = GMAIL_TOAST_TEXT
+                    .lock()
+                    .map(|value| value.clone())
+                    .unwrap_or_default();
+                let mut body = RECT {
+                    left: (16.0 * scale) as i32,
+                    top: (28.0 * scale) as i32,
+                    right: client.right - (14.0 * scale) as i32,
+                    bottom: client.bottom - (7.0 * scale) as i32,
+                };
+                draw_text(
+                    hdc,
+                    &text,
+                    &mut body,
+                    DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                );
+
+                SelectObject(hdc, old_font);
+                DeleteObject(title_font as _);
+                DeleteObject(body_font as _);
             }
             EndPaint(hwnd, &paint);
         }
@@ -1053,6 +1173,12 @@ struct App {
     reading_pdf: bool,
     splash: Option<HWND>,
     splash_token: u64,
+    gmail_toast: Option<HWND>,
+    gmail_toast_token: u64,
+    gmail_monitor: Option<WebView>,
+    gmail_probe_token: u64,
+    gmail_last_unread: Option<u32>,
+    gmail_last_key: Option<String>,
     /// O Win32 nao apaga o fundo por nos e uma janela filha destruida deixa os
     /// ultimos pixeis onde estava. Sem isto viam-se barras e texto fantasma.
     needs_clear: bool,
@@ -1118,6 +1244,12 @@ impl App {
             reading_pdf: false,
             splash: None,
             splash_token: 0,
+            gmail_toast: None,
+            gmail_toast_token: 0,
+            gmail_monitor: None,
+            gmail_probe_token: 0,
+            gmail_last_unread: None,
+            gmail_last_key: None,
             needs_clear: true,
             omnibox_font: None,
             omnibox_font_height: 0,
@@ -1682,6 +1814,7 @@ impl App {
                 let _ = webview.zoom(self.zoom);
                 self.webview = Some(webview);
                 self.surface = Surface::External;
+                self.schedule_gmail_probe(4);
                 self.begin_reading_session(is_pdf);
             }
             Err(error) => {
@@ -1795,6 +1928,7 @@ impl App {
         });
         self.bar_hover = None;
         self.surface = Surface::Comparator;
+        self.schedule_gmail_probe(4);
         self.begin_reading_session(false);
         self.request_redraw();
     }
@@ -2461,6 +2595,226 @@ impl App {
         }
     }
 
+    fn show_gmail_toast(&mut self, sender: &str, subject: &str) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
+        let width = (GMAIL_TOAST_WIDTH * scale).round() as i32;
+        let height = (GMAIL_TOAST_HEIGHT * scale).round() as i32;
+
+        let body = match (sender.trim(), subject.trim()) {
+            ("", "") => "Nova mensagem na sua caixa de entrada".to_string(),
+            ("", subject) => subject.to_string(),
+            (sender, "") => sender.to_string(),
+            (sender, subject) => format!("{sender} · {subject}"),
+        };
+        if let Ok(mut slot) = GMAIL_TOAST_TEXT.lock() {
+            *slot = body;
+        }
+
+        let toast = match self.gmail_toast {
+            Some(toast) => toast,
+            None => unsafe {
+                let created = CreateWindowExW(
+                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    windows_sys::w!("STATIC"),
+                    windows_sys::w!(""),
+                    WS_POPUP | WS_VISIBLE,
+                    0,
+                    0,
+                    width,
+                    height,
+                    owner,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                );
+                if created.is_null() {
+                    return;
+                }
+                if SetWindowSubclass(
+                    created,
+                    Some(gmail_toast_subclass),
+                    GMAIL_TOAST_SUBCLASS_ID,
+                    0,
+                ) == 0
+                {
+                    DestroyWindow(created);
+                    return;
+                }
+                let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 18, 18);
+                if !region.is_null() {
+                    SetWindowRgn(created, region, 1);
+                }
+                self.gmail_toast = Some(created);
+                created
+            },
+        };
+
+        let mut client = RECT::default();
+        unsafe {
+            if GetClientRect(owner, &mut client) == 0 {
+                return;
+            }
+            let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+            ClientToScreen(owner, &mut origin);
+            let margin = (18.0 * scale) as i32;
+            SetWindowPos(
+                toast,
+                std::ptr::null_mut(),
+                origin.x + client.right - width - margin,
+                origin.y + client.bottom - height - margin,
+                width,
+                height,
+                SWP_NOACTIVATE,
+            );
+            ShowWindow(toast, SW_SHOW);
+            InvalidateRect(toast, std::ptr::null(), 1);
+        }
+
+        self.gmail_toast_token = self.gmail_toast_token.wrapping_add(1);
+        let token = self.gmail_toast_token;
+        let proxy = self.proxy.clone();
+        let _ = thread::Builder::new()
+            .name("neural-gmail-toast".into())
+            .spawn(move || {
+                thread::sleep(Duration::from_secs(7));
+                let _ = proxy.send_event(UserEvent::HideGmailToast(token));
+            });
+    }
+
+    fn hide_gmail_toast(&mut self, token: u64) {
+        if token != self.gmail_toast_token {
+            return;
+        }
+        if let Some(toast) = self.gmail_toast.take() {
+            unsafe {
+                DestroyWindow(toast);
+            }
+        }
+    }
+
+    fn google_session_available(&self) -> bool {
+        let source = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.views.first().map(|view| &view.webview))
+            .or(self.webview.as_ref());
+        let Some(source) = source else {
+            return false;
+        };
+
+        source
+            .cookies_for_url("https://mail.google.com/")
+            .ok()
+            .is_some_and(|cookies| {
+                cookies.iter().any(|cookie| {
+                    matches!(
+                        cookie.name(),
+                        "SID"
+                            | "HSID"
+                            | "SSID"
+                            | "SAPISID"
+                            | "__Secure-1PSID"
+                            | "__Secure-3PSID"
+                    )
+                })
+            })
+    }
+
+    fn schedule_gmail_probe(&mut self, seconds: u64) {
+        if self.gmail_monitor.is_some() {
+            return;
+        }
+        self.gmail_probe_token = self.gmail_probe_token.wrapping_add(1);
+        let token = self.gmail_probe_token;
+        let proxy = self.proxy.clone();
+        let _ = thread::Builder::new()
+            .name("neural-gmail-probe".into())
+            .spawn(move || {
+                thread::sleep(Duration::from_secs(seconds));
+                let _ = proxy.send_event(UserEvent::GmailProbe(token));
+            });
+    }
+
+    fn maybe_start_gmail_monitor(&mut self) {
+        if self.gmail_monitor.is_some() || !self.google_session_available() {
+            return;
+        }
+        let Some(window) = &self.window else {
+            return;
+        };
+
+        let capability = remote_capability();
+        let navigation_capability = capability.clone();
+        let proxy = self.proxy.clone();
+        let init_script = GMAIL_MONITOR_SCRIPT.replace("__NEURALIA_CAP__", &capability);
+        let bounds = wry::Rect {
+            position: LogicalPosition::new(-10_000.0, -10_000.0).into(),
+            size: LogicalSize::new(1.0, 1.0).into(),
+        };
+
+        let result = WebViewBuilder::new()
+            .with_initialization_script(init_script)
+            .with_navigation_handler(move |target| {
+                if target.starts_with("neuralia:gmail-state") {
+                    if remote_capability_matches(&target, &navigation_capability)
+                        && let Some(count) = neuralia_query_param(&target, "count")
+                        && let Ok(unread) = count.parse::<u32>()
+                    {
+                        let _ = proxy.send_event(UserEvent::GmailInboxState {
+                            unread,
+                            sender: neuralia_query_param(&target, "sender").unwrap_or_default(),
+                            subject: neuralia_query_param(&target, "subject").unwrap_or_default(),
+                            key: neuralia_query_param(&target, "key").unwrap_or_default(),
+                        });
+                    }
+                    return false;
+                }
+                Url::parse(&target).ok().is_some_and(|url| {
+                    url.scheme() == "https"
+                        && matches!(
+                            url.host_str(),
+                            Some("mail.google.com") | Some("accounts.google.com")
+                        )
+                })
+            })
+            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+            .with_permission_handler(|_| PermissionResponse::Deny)
+            .with_focused(false)
+            .with_bounds(bounds)
+            .with_url("https://mail.google.com/mail/u/0/#inbox")
+            .build_as_child(window);
+
+        if let Ok(webview) = result {
+            self.gmail_monitor = Some(webview);
+        }
+    }
+
+    fn handle_gmail_state(
+        &mut self,
+        unread: u32,
+        sender: String,
+        subject: String,
+        key: String,
+    ) {
+        let notify = gmail_is_new_mail(
+            self.gmail_last_unread,
+            self.gmail_last_key.as_deref(),
+            unread,
+            &key,
+        );
+        self.gmail_last_unread = Some(unread);
+        self.gmail_last_key = Some(key);
+        if notify {
+            self.show_gmail_toast(&sender, &subject);
+        }
+    }
+
     /// Abrir um documento: anuncia e da tempo de se comecar a ler em paz antes
     /// do primeiro avanco.
     fn begin_reading_session(&mut self, is_pdf: bool) {
@@ -3010,6 +3364,23 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ViewSource => self.view_source(),
             UserEvent::AutoScrollTick(token) => self.auto_scroll_tick(token),
             UserEvent::HideSplash(token) => self.hide_splash(token),
+            UserEvent::GmailProbe(token) => {
+                if token == self.gmail_probe_token && self.gmail_monitor.is_none() {
+                    self.maybe_start_gmail_monitor();
+                    if self.gmail_monitor.is_none()
+                        && (self.webview.is_some() || self.comparator.is_some())
+                    {
+                        self.schedule_gmail_probe(60);
+                    }
+                }
+            }
+            UserEvent::GmailInboxState {
+                unread,
+                sender,
+                subject,
+                key,
+            } => self.handle_gmail_state(unread, sender, subject, key),
+            UserEvent::HideGmailToast(token) => self.hide_gmail_toast(token),
             UserEvent::ShowHistory => self.show_history(),
             UserEvent::ClearHistory => match self.history.clear() {
                 None => {
@@ -3889,6 +4260,23 @@ fn context_tab_label(value: &str) -> String {
     label
 }
 
+fn gmail_is_new_mail(
+    previous_unread: Option<u32>,
+    previous_key: Option<&str>,
+    unread: u32,
+    key: &str,
+) -> bool {
+    let Some(previous_unread) = previous_unread else {
+        return false;
+    };
+    if unread > previous_unread {
+        return true;
+    }
+    unread > 0
+        && !key.is_empty()
+        && previous_key.is_some_and(|previous| !previous.is_empty() && previous != key)
+}
+
 unsafe fn create_font(height: i32, weight: i32) -> *mut core::ffi::c_void {
     CreateFontW(
         height,
@@ -4330,6 +4718,24 @@ mod tests {
     }
 
     #[test]
+    fn auto_scroll_supports_all_three_internal_scroll_roots() {
+        assert!(AUTO_SCROLL_SCRIPT.contains("[class*=\"overflow\"]"));
+        assert!(AUTO_SCROLL_SCRIPT.contains("[class*=\"scroll\"]"));
+        assert!(AUTO_SCROLL_SCRIPT.contains("el.scrollBy"));
+        assert!(AUTO_SCROLL_SCRIPT.contains("scrollRoot(doc)"));
+    }
+
+    #[test]
+    fn gmail_notifications_do_not_fire_on_initial_baseline() {
+        assert!(!gmail_is_new_mail(None, None, 4, "thread-a"));
+        assert!(gmail_is_new_mail(Some(4), Some("thread-a"), 5, "thread-b"));
+        assert!(gmail_is_new_mail(Some(4), Some("thread-a"), 4, "thread-b"));
+        assert!(!gmail_is_new_mail(Some(4), Some("thread-a"), 4, "thread-a"));
+        assert!(GMAIL_MONITOR_SCRIPT.contains("mail.google.com"));
+        assert!(GMAIL_MONITOR_SCRIPT.contains("neuralia:gmail-state"));
+    }
+
+    #[test]
     fn grouped_tabs_have_plus_and_context_hits() {
         let layout = BarLayout::with_contexts(1600.0, 1.0, true, 3, [2, 1, 4]);
 
@@ -4350,20 +4756,25 @@ mod tests {
                 context_index: 3,
             })
         );
-        assert_eq!(context_tab_label("https://www.example.com/path"), "example.com");
+        assert_eq!(
+            context_tab_label("https://www.example.com/path"),
+            "example.com"
+        );
     }
 
     #[test]
     fn bar_layout_hit_matches_drawing() {
         let layout = BarLayout::new(1600.0, 1.0, true, 3);
 
-        // Cada pilula centrada sobre a sua coluna, com 2px de tolerancia.
-        for (index, rect) in layout.columns.iter().enumerate().take(3) {
+        // O grupo inteiro (nome + botao +) fica centrado sobre a coluna.
+        for index in 0..3 {
+            let provider = layout.columns[index];
+            let plus = layout.add_tabs[index];
             let column_center = 1600.0 / 3.0 * (index as f64 + 0.5);
-            let pill_center = rect.x + rect.width / 2.0;
+            let group_center = (provider.x + plus.x + plus.width) / 2.0;
             assert!(
-                (pill_center - column_center).abs() < 2.0,
-                "pilula {index} centrada em {pill_center}, coluna em {column_center}"
+                (group_center - column_center).abs() < 2.0,
+                "grupo {index} centrado em {group_center}, coluna em {column_center}"
             );
         }
 
@@ -5032,6 +5443,80 @@ document.addEventListener('DOMContentLoaded', () => {
   document.documentElement.appendChild(b);
 
 });
+"#;
+
+const GMAIL_MONITOR_SCRIPT: &str = r#"
+(function () {
+  if (location.hostname !== 'mail.google.com' || window.__neuralia_gmail_monitor) return;
+  window.__neuralia_gmail_monitor = true;
+  const capability = '__NEURALIA_CAP__';
+  let lastState = '';
+  let debounce = 0;
+
+  function clean(value) {
+    return String(value || '').replace(/\s+/g, ' ').trim().slice(0, 180);
+  }
+
+  function unreadCount() {
+    const match = String(document.title || '').match(/\(([\d.,]+)\)/);
+    if (!match) return 0;
+    const digits = match[1].replace(/\D/g, '');
+    return Number(digits || '0');
+  }
+
+  function firstUnread() {
+    const row = document.querySelector(
+      'tr.zE,[role="main"] tr.zE,[role="main"] [data-legacy-thread-id].zE'
+    );
+    if (!row) return { sender:'', subject:'', key:'' };
+
+    const senderNode = row.querySelector('.zF,.yP,[email]');
+    const subjectNode = row.querySelector('.bog,[data-thread-id] .bog');
+    const sender = clean(
+      senderNode && (senderNode.getAttribute('email')
+        || senderNode.getAttribute('name')
+        || senderNode.textContent)
+    );
+    const subject = clean(subjectNode && subjectNode.textContent);
+    const key = clean(
+      row.getAttribute('data-legacy-thread-id')
+        || row.getAttribute('data-thread-id')
+        || (sender + '|' + subject)
+    );
+    return { sender, subject, key };
+  }
+
+  function emit() {
+    if (location.hostname !== 'mail.google.com') return;
+    const first = firstUnread();
+    const count = unreadCount();
+    const state = count + '|' + first.key;
+    if (state === lastState) return;
+    lastState = state;
+
+    window.location.href = 'neuralia:gmail-state?count=' + count
+      + '&sender=' + encodeURIComponent(first.sender)
+      + '&subject=' + encodeURIComponent(first.subject)
+      + '&key=' + encodeURIComponent(first.key)
+      + '&cap=' + encodeURIComponent(capability);
+  }
+
+  function schedule() {
+    clearTimeout(debounce);
+    debounce = setTimeout(emit, 450);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', schedule, { once:true });
+  } else {
+    schedule();
+  }
+
+  new MutationObserver(schedule).observe(document.documentElement, {
+    subtree:true, childList:true, characterData:true, attributes:true
+  });
+  setInterval(emit, 15000);
+})();
 "#;
 
 const NEURALIA_PALETTE_SCRIPT: &str = r#"
