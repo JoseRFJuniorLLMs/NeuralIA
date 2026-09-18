@@ -60,7 +60,8 @@ try {
     if ($process.MainWindowHandle -eq 0) { throw "A janela nativa nao apareceu." }
 
     $process.Refresh()
-    $baselineMiB = [math]::Round($process.WorkingSet64 / 1MB, 2)
+    $coldBaselineMiB = [math]::Round($process.WorkingSet64 / 1MB, 2)
+    $warmBaselineMiB = $null
 
     for ($cycle = 1; $cycle -le $Cycles; $cycle++) {
         $opened = Wait-ForProbe -Expected 3 -TimeoutSec $TransitionTimeoutSec
@@ -76,25 +77,38 @@ try {
         }
 
         $process.Refresh()
+        $currentMiB = [math]::Round($process.WorkingSet64 / 1MB, 2)
+        if ($null -eq $warmBaselineMiB) {
+            # O primeiro ciclo carrega o runtime WebView2 pela primeira vez.
+            # Esse custo frio e permanente no processo, mas nao e crescimento
+            # por ciclo. A fronteira de leak comeca na primeira Home aquecida.
+            $warmBaselineMiB = $currentMiB
+        }
         $null = $samples.Add([ordered]@{
             cycle = $cycle
             webviews_open = $opened
             webviews_after_home = $closed
-            working_set_mib = [math]::Round($process.WorkingSet64 / 1MB, 2)
+            working_set_mib = $currentMiB
         })
     }
 
     $process.Refresh()
     $finalMiB = [math]::Round($process.WorkingSet64 / 1MB, 2)
-    $growthMiB = [math]::Round($finalMiB - $baselineMiB, 2)
+    if ($null -eq $warmBaselineMiB) {
+        $warmBaselineMiB = $coldBaselineMiB
+    }
+    $coldGrowthMiB = [math]::Round($finalMiB - $coldBaselineMiB, 2)
+    $growthMiB = [math]::Round($finalMiB - $warmBaselineMiB, 2)
     if ($growthMiB -gt $MaxWorkingSetGrowthMiB) {
-        $null = $failures.Add("working set cresceu ${growthMiB} MiB em $Cycles ciclos (tecto ${MaxWorkingSetGrowthMiB} MiB)")
+        $null = $failures.Add("working set pós-warm-up cresceu ${growthMiB} MiB em $Cycles ciclos (tecto ${MaxWorkingSetGrowthMiB} MiB)")
     }
 
     $result = [ordered]@{
         cycles = $Cycles
-        baseline_working_set_mib = $baselineMiB
+        cold_start_working_set_mib = $coldBaselineMiB
+        warm_home_working_set_mib = $warmBaselineMiB
         final_working_set_mib = $finalMiB
+        cold_start_growth_mib = $coldGrowthMiB
         working_set_growth_mib = $growthMiB
         samples = $samples
         failures = $failures
