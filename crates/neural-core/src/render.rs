@@ -24,9 +24,7 @@ pub fn reader_html(article: &ReaderArticle) -> String {
                 let level = (*level).clamp(2, 6);
                 body.push_str(&format!("<h{level}>{}</h{level}>", escape_html(text)));
             }
-            ReaderBlock::Paragraph(text) => {
-                body.push_str(&format!("<p>{}</p>", escape_html(text)))
-            }
+            ReaderBlock::Paragraph(text) => body.push_str(&format!("<p>{}</p>", escape_html(text))),
             ReaderBlock::Quote(text) => {
                 body.push_str(&format!("<blockquote>{}</blockquote>", escape_html(text)))
             }
