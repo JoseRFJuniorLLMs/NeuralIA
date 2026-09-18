@@ -71,24 +71,27 @@ impl ReaderWorker {
 
         let _ = thread::Builder::new()
             .name("neural-reader".into())
-            .spawn(move || loop {
-                let job = {
-                    let (lock, wake) = &*worker_pending;
-                    let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    while slot.is_none() {
-                        slot = wake
-                            .wait(slot)
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    }
-                    slot.take().expect("reader job present")
-                };
+            .spawn(move || {
+                loop {
+                    let job = {
+                        let (lock, wake) = &*worker_pending;
+                        let mut slot =
+                            lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        while slot.is_none() {
+                            slot = wake
+                                .wait(slot)
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        }
+                        slot.take().expect("reader job present")
+                    };
 
-                let result = client.fetch(&job.url).map_err(|error| error.to_string());
-                let _ = proxy.send_event(UserEvent::ReaderReady {
-                    generation: job.generation,
-                    input: job.input,
-                    result,
-                });
+                    let result = client.fetch(&job.url).map_err(|error| error.to_string());
+                    let _ = proxy.send_event(UserEvent::ReaderReady {
+                        generation: job.generation,
+                        input: job.input,
+                        result,
+                    });
+                }
             });
 
         Self { pending }
