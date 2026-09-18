@@ -28,12 +28,14 @@ use winit::{
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
     window::{Window, WindowId},
 };
-use wry::{WebView, WebViewBuilder};
+use wry::{PermissionResponse, WebView, WebViewBuilder};
 
 enum UserEvent {
     Ipc(String),
+    HomeRequested,
     ReaderReady {
         generation: u64,
+        input: String,
         result: Result<ReaderArticle, String>,
     },
 }
@@ -131,6 +133,7 @@ struct App {
     webview: Option<WebView>,
     config: CoreConfig,
     history: HistoryStore,
+    reader: ReaderClient,
     surface: Surface,
     navigation_generation: u64,
     input: String,
@@ -143,12 +146,14 @@ impl App {
     fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
         let config = CoreConfig::default();
         let history = HistoryStore::new(config.data_dir.join("history.jsonl"));
+        let reader = ReaderClient::new(config.reader_timeout_secs, config.reader_max_bytes);
         Self {
             proxy,
             window: None,
             webview: None,
             config,
             history,
+            reader,
             surface: Surface::Home,
             navigation_generation: 0,
             input: String::new(),
@@ -247,17 +252,18 @@ impl App {
         self.surface = Surface::Home;
         self.status = format!("Lendo {url} …");
         self.request_redraw();
-        self.record(HistoryKind::Read, url.clone(), url.clone());
 
         let proxy = self.proxy.clone();
-        let timeout = self.config.reader_timeout_secs;
-        let max_bytes = self.config.reader_max_bytes;
+        let reader = self.reader.clone();
+        let input = url.clone();
 
         thread::spawn(move || {
-            let result = ReaderClient::new(timeout, max_bytes)
-                .fetch(&url)
-                .map_err(|error| error.to_string());
-            let _ = proxy.send_event(UserEvent::ReaderReady { generation, result });
+            let result = reader.fetch(&url).map_err(|error| error.to_string());
+            let _ = proxy.send_event(UserEvent::ReaderReady {
+                generation,
+                input,
+                result,
+            });
         });
     }
 
@@ -278,13 +284,30 @@ impl App {
             .append(&HistoryEntry::now(kind, input, target));
     }
 
-    fn base_webview_builder(&self) -> WebViewBuilder<'static> {
+    fn reader_webview_builder(&self) -> WebViewBuilder<'static> {
         let proxy = self.proxy.clone();
         WebViewBuilder::new()
-            .with_initialization_script(EXTERNAL_PAGE_BRIDGE)
             .with_ipc_handler(move |request| {
                 let _ = proxy.send_event(UserEvent::Ipc(request.body().clone()));
             })
+            .with_permission_handler(|_| PermissionResponse::Deny)
+            .with_focused(true)
+    }
+
+    fn external_webview_builder(&self) -> WebViewBuilder<'static> {
+        let proxy = self.proxy.clone();
+        WebViewBuilder::new()
+            .with_initialization_script(EXTERNAL_RETURN_BUTTON)
+            .with_navigation_handler(move |target| {
+                if target.eq_ignore_ascii_case("neuralia:home") {
+                    let _ = proxy.send_event(UserEvent::HomeRequested);
+                    return false;
+                }
+
+                target.starts_with("about:blank")
+                    || neural_core::validate_web_url(&target).is_ok()
+            })
+            .with_permission_handler(|_| PermissionResponse::Deny)
             .with_focused(true)
     }
 
@@ -292,7 +315,7 @@ impl App {
         self.destroy_webview();
 
         let result = if let Some(window) = &self.window {
-            self.base_webview_builder().with_url(url).build(window)
+            self.external_webview_builder().with_url(url).build(window)
         } else {
             return;
         };
@@ -313,7 +336,7 @@ impl App {
         let html = reader_html(article);
 
         let result = if let Some(window) = &self.window {
-            self.base_webview_builder().with_html(html).build(window)
+            self.reader_webview_builder().with_html(html).build(window)
         } else {
             return;
         };
@@ -335,7 +358,7 @@ impl App {
         };
         let action = value.get("action").and_then(Value::as_str).unwrap_or("");
 
-        if self.surface == Surface::External && action != "home" {
+        if self.surface != Surface::Reader {
             return;
         }
 
@@ -466,12 +489,24 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Ipc(raw) => self.handle_ipc(raw),
-            UserEvent::ReaderReady { generation, result } => {
+            UserEvent::HomeRequested => self.show_home(),
+            UserEvent::ReaderReady {
+                generation,
+                input,
+                result,
+            } => {
                 if generation != self.navigation_generation {
                     return;
                 }
                 match result {
-                    Ok(article) => self.open_reader(&article),
+                    Ok(article) => {
+                        self.record(
+                            HistoryKind::Read,
+                            input,
+                            article.source_url.clone(),
+                        );
+                        self.open_reader(&article);
+                    }
                     Err(error) => self.show_native_error(format!("Reader: {error}")),
                 }
             }
@@ -845,7 +880,7 @@ const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
 }
 
-const EXTERNAL_PAGE_BRIDGE: &str = r#"
+const EXTERNAL_RETURN_BUTTON: &str = r#"
 document.addEventListener('DOMContentLoaded', () => {
   if (document.getElementById('neural-shell') || document.getElementById('neuralia-return')) return;
   const b = document.createElement('button');
@@ -857,7 +892,7 @@ document.addEventListener('DOMContentLoaded', () => {
     background:'#111314', color:'#fff', font:'600 13px Segoe UI, sans-serif',
     boxShadow:'0 6px 24px rgba(0,0,0,.25)', cursor:'pointer'
   });
-  b.addEventListener('click', () => window.ipc.postMessage(JSON.stringify({action:'home',value:''})));
+  b.addEventListener('click', () => { window.location.href = 'neuralia:home'; });
   document.documentElement.appendChild(b);
 });
 "#;
