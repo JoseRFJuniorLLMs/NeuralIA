@@ -125,7 +125,8 @@ enum Surface {
     Pdf,
 }
 
-const TOP_BAR_HEIGHT: f64 = 42.0;
+const TOP_BAR_HEIGHT: f64 = 72.0;
+const MAX_VISIBLE_CONTEXT_TABS: usize = 3;
 const COMPARATOR_COLUMNS: usize = 3;
 /// Intervalo da rolagem automatica de leitura, do primeiro avanco ao ultimo.
 const AUTO_SCROLL_SECONDS: u64 = 30;
@@ -234,90 +235,132 @@ const AUTO_SCROLL_TOAST: &str = r#"
 enum BarHit {
     Home,
     Column(usize),
+    AddTab(usize),
+    ContextTab {
+        source_index: usize,
+        context_index: usize,
+    },
 }
 
-/// Geometria da barra de topo — fonte unica para desenho E para o clique.
+/// Geometria da barra de topo: cada IA e um grupo com cabecalho, botao + e
+/// ate tres abas de contexto visiveis. As mais antigas continuam guardadas.
 #[derive(Debug, Clone, Copy)]
 struct BarLayout {
-    /// Falso em tela cheia: nao se desenha nada e nada responde ao rato.
     visible: bool,
     height: f64,
     home: UiRect,
     columns: [UiRect; COMPARATOR_COLUMNS],
+    add_tabs: [UiRect; COMPARATOR_COLUMNS],
+    context_tabs: [[UiRect; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
+    context_indices: [[usize; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
+    context_tab_counts: [usize; COMPARATOR_COLUMNS],
     columns_len: usize,
 }
 
 impl BarLayout {
-    /// `visible` falso devolve uma barra escondida: em ecra completo a coluna
-    /// fica com o monitor inteiro, sem faixa nativa por cima do site.
     fn new(client_width: f64, scale: f64, visible: bool, columns: usize) -> Self {
+        Self::with_contexts(client_width, scale, visible, columns, [0; COMPARATOR_COLUMNS])
+    }
+
+    fn with_contexts(
+        client_width: f64,
+        scale: f64,
+        visible: bool,
+        columns: usize,
+        context_counts: [usize; COMPARATOR_COLUMNS],
+    ) -> Self {
         let scale = scale.max(1.0);
+        let empty = UiRect {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+        };
         if !visible {
-            let empty = UiRect {
-                x: 0.0,
-                y: 0.0,
-                width: 0.0,
-                height: 0.0,
-            };
             return Self {
                 visible: false,
                 height: 0.0,
                 home: empty,
                 columns: [empty; COMPARATOR_COLUMNS],
+                add_tabs: [empty; COMPARATOR_COLUMNS],
+                context_tabs: [[empty; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
+                context_indices: [[0; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
+                context_tab_counts: [0; COMPARATOR_COLUMNS],
                 columns_len: 0,
             };
         }
 
         let height = TOP_BAR_HEIGHT * scale;
         let pad = 10.0 * scale;
-        let gap = 8.0 * scale;
-        let pill_h = 30.0 * scale;
-        let pill_y = ((height - pill_h) / 2.0).round();
+        let gap = 6.0 * scale;
+        let header_h = 28.0 * scale;
+        let header_y = 7.0 * scale;
+        let tab_y = 42.0 * scale;
+        let tab_h = 22.0 * scale;
 
         let home = UiRect {
             x: pad,
-            y: pill_y,
-            width: 104.0 * scale,
-            height: pill_h,
+            y: header_y,
+            width: 92.0 * scale,
+            height: header_h,
         };
-        let hint_w = 104.0 * scale;
-        let hint = UiRect {
-            x: (client_width - hint_w - pad).max(home.x + home.width),
-            y: 0.0,
-            width: hint_w,
-            height,
-        };
+        let hint_w = 84.0 * scale;
+        let content_x = home.x + home.width + 12.0 * scale;
+        let content_right = (client_width - hint_w - pad).max(content_x);
 
-        let content_x = home.x + home.width + gap * 1.5;
-        let content_right = hint.x - gap;
-
-        let empty = UiRect {
-            x: 0.0,
-            y: pill_y,
-            width: 0.0,
-            height: pill_h,
-        };
-        let mut rects = [empty; COMPARATOR_COLUMNS];
+        let mut columns_rect = [empty; COMPARATOR_COLUMNS];
+        let mut plus_rect = [empty; COMPARATOR_COLUMNS];
+        let mut tabs = [[empty; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS];
+        let mut tab_indices = [[0usize; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS];
+        let mut tab_counts = [0usize; COMPARATOR_COLUMNS];
         let columns_len = columns.min(COMPARATOR_COLUMNS);
 
         if columns_len > 0 {
-            // Cada pilula fica centrada sobre a coluna que representa: e o que
-            // liga o botao ao painel por baixo dele. So encolhe/desliza quando
-            // a janela e estreita de mais e ela bateria no Home ou no "Esc".
             let column_width = client_width / columns_len as f64;
-            let width = (column_width - 16.0 * scale).clamp(44.0 * scale, 200.0 * scale);
+            let group_width = (column_width - 14.0 * scale)
+                .clamp(108.0 * scale, 196.0 * scale);
+            let plus_size = 26.0 * scale;
+            let plus_gap = 4.0 * scale;
+            let provider_width = (group_width - plus_size - plus_gap).max(72.0 * scale);
+
             let mut left_bound = content_x;
-            for (i, rect) in rects.iter_mut().enumerate().take(columns_len) {
-                let center = column_width * (i as f64 + 0.5);
-                let highest = (content_right - width).max(left_bound);
-                let x = (center - width / 2.0).clamp(left_bound, highest);
-                *rect = UiRect {
+            for index in 0..columns_len {
+                let center = column_width * (index as f64 + 0.5);
+                let max_x = (content_right - group_width).max(left_bound);
+                let x = (center - group_width / 2.0).clamp(left_bound, max_x);
+
+                columns_rect[index] = UiRect {
                     x,
-                    y: pill_y,
-                    width,
-                    height: pill_h,
+                    y: header_y,
+                    width: provider_width,
+                    height: header_h,
                 };
-                left_bound = x + width + gap;
+                plus_rect[index] = UiRect {
+                    x: x + provider_width + plus_gap,
+                    y: header_y + (header_h - plus_size) / 2.0,
+                    width: plus_size,
+                    height: plus_size,
+                };
+
+                let count = context_counts[index].min(MAX_VISIBLE_CONTEXT_TABS);
+                tab_counts[index] = count;
+                if count > 0 {
+                    let tab_gap = 4.0 * scale;
+                    let tab_width =
+                        (group_width - tab_gap * (count.saturating_sub(1)) as f64) / count as f64;
+                    let first_context = context_counts[index] - count;
+                    for visual in 0..count {
+                        tabs[index][visual] = UiRect {
+                            x: x + visual as f64 * (tab_width + tab_gap),
+                            y: tab_y,
+                            width: tab_width,
+                            height: tab_h,
+                        };
+                        tab_indices[index][visual] = first_context + visual;
+                    }
+                }
+
+                left_bound = x + group_width + gap;
             }
         }
 
@@ -325,7 +368,11 @@ impl BarLayout {
             visible: true,
             height,
             home,
-            columns: rects,
+            columns: columns_rect,
+            add_tabs: plus_rect,
+            context_tabs: tabs,
+            context_indices: tab_indices,
+            context_tab_counts: tab_counts,
             columns_len,
         }
     }
@@ -337,9 +384,20 @@ impl BarLayout {
         if self.home.contains(x, y) {
             return Some(BarHit::Home);
         }
-        for (i, rect) in self.columns.iter().enumerate().take(self.columns_len) {
-            if rect.contains(x, y) {
-                return Some(BarHit::Column(i));
+        for index in 0..self.columns_len {
+            if self.add_tabs[index].contains(x, y) {
+                return Some(BarHit::AddTab(index));
+            }
+            for visual in 0..self.context_tab_counts[index] {
+                if self.context_tabs[index][visual].contains(x, y) {
+                    return Some(BarHit::ContextTab {
+                        source_index: index,
+                        context_index: self.context_indices[index][visual],
+                    });
+                }
+            }
+            if self.columns[index].contains(x, y) {
+                return Some(BarHit::Column(index));
             }
         }
         None
@@ -354,6 +412,7 @@ struct ComparatorView {
 struct SplitView {
     webview: WebView,
     source_index: usize,
+    url: String,
     fullscreen: bool,
 }
 
@@ -361,7 +420,7 @@ struct ComparatorState {
     views: Vec<ComparatorView>,
     expanded: Option<usize>,
     split: Option<SplitView>,
-    /// Histórico leve de fontes por IA. Não cria abas; só preserva contexto.
+    /// Abas/fontes agrupadas automaticamente pela IA que abriu cada link.
     contexts: [Vec<String>; COMPARATOR_COLUMNS],
 }
 
@@ -2131,6 +2190,7 @@ impl App {
                     comp.split = Some(SplitView {
                         webview,
                         source_index,
+                        url: valid.to_string(),
                         fullscreen: false,
                     });
                 }
@@ -2654,11 +2714,12 @@ impl App {
         let (Some(window), Some(comp)) = (&self.window, &self.comparator) else {
             return None;
         };
-        Some(BarLayout::new(
+        Some(BarLayout::with_contexts(
             window.inner_size().width as f64,
             window.scale_factor(),
             self.bar_visible(),
             comp.views.len(),
+            std::array::from_fn(|index| comp.contexts[index].len()),
         ))
     }
 
@@ -2811,6 +2872,47 @@ impl App {
         }
     }
 
+    fn open_ai_palette(&mut self, source_index: usize) {
+        if source_index >= COMPARATOR_COLUMNS {
+            return;
+        }
+        if self
+            .comparator
+            .as_ref()
+            .is_some_and(|comp| comp.split.is_some())
+        {
+            self.close_split();
+        }
+        if self
+            .comparator
+            .as_ref()
+            .is_some_and(|comp| comp.expanded.is_some())
+        {
+            self.restore_comparator();
+        }
+        if let Some(view) = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.views.get(source_index))
+        {
+            let _ = view
+                .webview
+                .evaluate_script("window.dispatchEvent(new CustomEvent('neuralia-open-palette'));");
+        }
+    }
+
+    fn open_context_tab(&mut self, source_index: usize, context_index: usize) {
+        let url = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.contexts.get(source_index))
+            .and_then(|tabs| tabs.get(context_index))
+            .cloned();
+        if let Some(url) = url {
+            self.open_split(source_index, url, false);
+        }
+    }
+
     fn click_comparator(&mut self) {
         let hit = self
             .bar_layout()
@@ -2818,6 +2920,11 @@ impl App {
         match hit {
             Some(BarHit::Home) => self.show_home(),
             Some(BarHit::Column(index)) => self.expand_comparator(index),
+            Some(BarHit::AddTab(index)) => self.open_ai_palette(index),
+            Some(BarHit::ContextTab {
+                source_index,
+                context_index,
+            }) => self.open_context_tab(source_index, context_index),
             None => {}
         }
     }
@@ -3558,11 +3665,15 @@ fn draw_comparator_bar(
             std::ptr::null_mut()
         };
 
-        paint_comparator_bar(
+        paint_comparator_bar_with_contexts(
             target,
             width,
             scale,
             &names,
+            &comp.contexts,
+            comp.split
+                .as_ref()
+                .map(|split| (split.source_index, split.url.as_str())),
             visible,
             hover,
             auto_scroll,
@@ -3595,7 +3706,41 @@ unsafe fn paint_comparator_bar(
     auto_scroll: bool,
     theme: &Theme,
 ) {
-    let layout = BarLayout::new(width as f64, scale, visible, names.len());
+    let empty: [Vec<String>; COMPARATOR_COLUMNS] = std::array::from_fn(|_| Vec::new());
+    paint_comparator_bar_with_contexts(
+        target,
+        width,
+        scale,
+        names,
+        &empty,
+        None,
+        visible,
+        hover,
+        auto_scroll,
+        theme,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn paint_comparator_bar_with_contexts(
+    target: *mut core::ffi::c_void,
+    width: i32,
+    scale: f64,
+    names: &[&str],
+    contexts: &[Vec<String>; COMPARATOR_COLUMNS],
+    active_context: Option<(usize, &str)>,
+    visible: bool,
+    hover: Option<BarHit>,
+    auto_scroll: bool,
+    theme: &Theme,
+) {
+    let layout = BarLayout::with_contexts(
+        width as f64,
+        scale,
+        visible,
+        names.len(),
+        std::array::from_fn(|index| contexts[index].len()),
+    );
     if !layout.visible {
         return;
     }
@@ -3623,6 +3768,7 @@ unsafe fn paint_comparator_bar(
 
     SetBkMode(target, TRANSPARENT as i32);
     let font = create_font((-13.0 * scale) as i32, FW_NORMAL as i32);
+    let tab_font = create_font((-10.0 * scale) as i32, FW_NORMAL as i32);
     let old_font = SelectObject(target, font as _);
 
     let home_fill = if hover == Some(BarHit::Home) {
@@ -3662,31 +3808,61 @@ unsafe fn paint_comparator_bar(
             font,
             theme.bar_bg,
         );
+
+        draw_button(
+            target,
+            layout.add_tabs[index],
+            "+",
+            hover == Some(BarHit::AddTab(index)),
+            scale,
+            font,
+            theme,
+        );
+
+        for visual in 0..layout.context_tab_counts[index] {
+            let context_index = layout.context_indices[index][visual];
+            let Some(url) = contexts[index].get(context_index) else {
+                continue;
+            };
+            let active = active_context
+                .is_some_and(|(source, active_url)| source == index && active_url == url);
+            let hovered = hover
+                == Some(BarHit::ContextTab {
+                    source_index: index,
+                    context_index,
+                });
+            let fill = if active {
+                mix(theme.bar_bg, brand, 0.42)
+            } else if hovered {
+                mix(theme.surface, theme.fg, 0.12)
+            } else {
+                mix(theme.bar_bg, brand, 0.10)
+            };
+            let label = context_tab_label(url);
+            draw_pill(
+                target,
+                layout.context_tabs[index][visual],
+                &label,
+                PillStyle::new(fill, mix(theme.bar_bg, brand, 0.28), theme.fg_muted),
+                scale,
+                tab_font,
+                theme.bar_bg,
+            );
+        }
     }
 
-    // Alinhado a direita a partir do fim da ultima pilula: fica com todo o
-    // espaco livre sem obrigar a estreitar as pilulas, que tem de continuar
-    // centradas sobre as colunas.
-    let pills_right = layout
-        .columns
-        .iter()
-        .take(layout.columns_len)
-        .map(|rect| rect.x + rect.width)
-        .fold(layout.home.x + layout.home.width, f64::max);
-
     let hint = if auto_scroll {
-        format!("F8: rolagem {AUTO_SCROLL_SECONDS}s ligada  ·  Esc: voltar")
+        format!("F8 {AUTO_SCROLL_SECONDS}s · Esc")
     } else {
-        "F8: rolagem automática  ·  Esc: voltar".to_string()
+        "F8 rolar · Esc".to_string()
     };
-
-    SelectObject(target, font as _);
+    SelectObject(target, tab_font as _);
     SetTextColor(target, rgb3(theme.fg_muted));
     let mut hint_rect = RECT {
-        left: (pills_right + 12.0 * scale) as i32,
+        left: (width as f64 - 88.0 * scale) as i32,
         top: 0,
-        right: (width as f64 - 12.0 * scale) as i32,
-        bottom: bar_h,
+        right: (width as f64 - 8.0 * scale) as i32,
+        bottom: (36.0 * scale) as i32,
     };
     draw_text(
         target,
@@ -3697,6 +3873,20 @@ unsafe fn paint_comparator_bar(
 
     SelectObject(target, old_font);
     DeleteObject(font as _);
+    DeleteObject(tab_font as _);
+}
+
+fn context_tab_label(value: &str) -> String {
+    let raw = Url::parse(value)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| "Fonte".to_string());
+    let clean = raw.strip_prefix("www.").unwrap_or(&raw);
+    let mut label = clean.chars().take(16).collect::<String>();
+    if clean.chars().count() > 16 {
+        label.push('…');
+    }
+    label
 }
 
 unsafe fn create_font(height: i32, weight: i32) -> *mut core::ffi::c_void {
@@ -4137,6 +4327,30 @@ mod tests {
             ZOOM_STEPS.windows(2).all(|pair| pair[0] < pair[1]),
             "a escada tem de ser crescente"
         );
+    }
+
+    #[test]
+    fn grouped_tabs_have_plus_and_context_hits() {
+        let layout = BarLayout::with_contexts(1600.0, 1.0, true, 3, [2, 1, 4]);
+
+        for index in 0..3 {
+            let plus = layout.add_tabs[index];
+            assert_eq!(
+                layout.hit(plus.x + plus.width / 2.0, plus.y + plus.height / 2.0),
+                Some(BarHit::AddTab(index))
+            );
+        }
+
+        assert_eq!(layout.context_tab_counts, [2, 1, 3]);
+        let last = layout.context_tabs[2][2];
+        assert_eq!(
+            layout.hit(last.x + 2.0, last.y + 2.0),
+            Some(BarHit::ContextTab {
+                source_index: 2,
+                context_index: 3,
+            })
+        );
+        assert_eq!(context_tab_label("https://www.example.com/path"), "example.com");
     }
 
     #[test]

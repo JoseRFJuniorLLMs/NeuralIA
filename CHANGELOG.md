@@ -2,6 +2,16 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [1.3.0] - 2026-09-18
+
+Abas visiveis agrupadas por IA e botao + em cada grupo.
+
+### Added
+- **Grupos de abas por IA:** Gemini, ChatGPT e Claude passam a ter suas proprias abas de fontes no topo; uma fonte nunca e misturada com a sessao de outra IA.
+- **Botao + por IA:** ao lado do nome de cada modelo, abre a omnibox flutuante já vinculada àquela IA.
+- Ate tres abas recentes ficam visiveis por grupo; contextos mais antigos continuam preservados internamente.
+- Clicar numa aba de fonte reabre diretamente o Split View correspondente; a aba ativa recebe destaque.
+
 ## [1.2.0] - 2026-09-18
 
 Split View, omnibox flutuante e envio real da consulta para as tres IAs.
