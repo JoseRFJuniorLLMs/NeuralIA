@@ -13,6 +13,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(not(target_os = "windows"))]
 fn main() {
-    println!("NeuralIA desktop v0.1 é Windows-first.");
+    println!(
+        "NeuralIA desktop v{} é Windows-first.",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("O núcleo continua portátil: cargo test -p neural-core");
 }
