@@ -1568,6 +1568,64 @@ unsafe fn draw_logo(hdc: *mut core::ffi::c_void, x: i32, y: i32, size: i32) {
     draw_logo_to_dc(hdc, x, y, size, (248, 249, 250));
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stretch_dibits_on_screen_dc() {
+        unsafe {
+            let hdc = GetDC(core::ptr::null_mut());
+            assert!(!hdc.is_null());
+            let img = get_logo_image();
+            assert_eq!(img.width(), 1254);
+            let size = 104;
+            let pixels = render_logo_pixels(size, (248, 249, 250));
+            assert_eq!(pixels.len(), (size * size * 4) as usize);
+
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: size,
+                    biHeight: -size,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    biSizeImage: (size * size * 4) as u32,
+                    biXPelsPerMeter: 0,
+                    biYPelsPerMeter: 0,
+                    biClrUsed: 0,
+                    biClrImportant: 0,
+                },
+                bmiColors: [windows_sys::Win32::Graphics::Gdi::RGBQUAD {
+                    rgbBlue: 0,
+                    rgbGreen: 0,
+                    rgbRed: 0,
+                    rgbReserved: 0,
+                }; 1],
+            };
+
+            let ret = StretchDIBits(
+                hdc as _,
+                0,
+                0,
+                size,
+                size,
+                0,
+                0,
+                size,
+                size,
+                pixels.as_ptr() as *const _,
+                &bmi,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            );
+            ReleaseDC(core::ptr::null_mut(), hdc);
+            assert!(ret > 0, "StretchDIBits failed with ret={ret}");
+        }
+    }
+}
+
 unsafe fn draw_button(
     hdc: *mut core::ffi::c_void,
     rect: UiRect,

@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "NeuralIA"
+path = "src/main.rs"
+
 [dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 neural-core = { path = "../neural-core" }
