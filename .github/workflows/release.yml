@@ -43,13 +43,29 @@ jobs:
           git tag -a "$tag" -m "NeuralIA $tag"
           git push --atomic origin HEAD:main "refs/tags/$tag"
 
-  build:
-    if: startsWith(github.ref, 'refs/tags/')
+  publish:
+    needs: tag-stable-version
+    if: always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.98.1
-      - name: Build
+      - name: Resolve and checkout release tag
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like "refs/tags/*") {
+            $tag = $env:GITHUB_REF_NAME
+          } else {
+            $line = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+            $version = $line.Matches[0].Groups[1].Value
+            $tag = "v$version"
+          }
+          git fetch --tags --force
+          git checkout $tag
+          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build exact tagged source
         run: cargo build -p neural-app --release --locked
       - name: Rename artifact
         shell: pwsh
@@ -69,4 +85,10 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" target/release/NeuralIA.exe target/release/NeuralIA.exe.sha256 --title "NeuralIA ${{ github.ref_name }}" --generate-notes
+        run: |
+          gh release view "$env:RELEASE_TAG" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload "$env:RELEASE_TAG" target/release/NeuralIA.exe target/release/NeuralIA.exe.sha256 --clobber
+          } else {
+            gh release create "$env:RELEASE_TAG" target/release/NeuralIA.exe target/release/NeuralIA.exe.sha256 --verify-tag --title "NeuralIA $env:RELEASE_TAG" --generate-notes
+          }
