@@ -4509,8 +4509,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
   window.addEventListener('resize', updateRail, { passive:true });
   const mutationObserver = new MutationObserver(() => {
-    clearTimeout(window.__neuralia_scroll_recheck);
+    if (window.__neuralia_scroll_recheck) return;
     window.__neuralia_scroll_recheck = setTimeout(() => {
+      window.__neuralia_scroll_recheck = 0;
       useScroller(findScroller());
       updateRail();
     }, 180);
