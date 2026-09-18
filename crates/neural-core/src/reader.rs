@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::{
-    security::{validate_redirect_target, validate_web_url},
     NeuralError, Result,
+    security::{validate_redirect_target, validate_web_url},
 };
 
 const MAX_REDIRECTS: usize = 5;
@@ -65,10 +65,7 @@ impl ReaderClient {
             let mut response = self
                 .agent
                 .get(current.as_str())
-                .header(
-                    "Accept",
-                    "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
-                )
+                .header("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1")
                 .header("User-Agent", user_agent.as_str())
                 .call()?;
 
@@ -256,12 +253,22 @@ fn score_candidate(candidate: &ElementRef<'_>, link_selector: &Selector) -> usiz
 
 fn inside_ignored_container(node: &ElementRef<'_>) -> bool {
     is_hidden_element(node)
-        || node.ancestors().filter_map(ElementRef::wrap).any(|ancestor| {
-            matches!(
-                ancestor.value().name(),
-                "nav" | "footer" | "aside" | "script" | "style" | "form" | "template" | "noscript"
-            ) || is_hidden_element(&ancestor)
-        })
+        || node
+            .ancestors()
+            .filter_map(ElementRef::wrap)
+            .any(|ancestor| {
+                matches!(
+                    ancestor.value().name(),
+                    "nav"
+                        | "footer"
+                        | "aside"
+                        | "script"
+                        | "style"
+                        | "form"
+                        | "template"
+                        | "noscript"
+                ) || is_hidden_element(&ancestor)
+            })
 }
 
 fn is_hidden_element(element: &ElementRef<'_>) -> bool {
