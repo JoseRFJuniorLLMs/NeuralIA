@@ -5,14 +5,17 @@
 Reader turns ordinary HTML documents into a low-noise representation without executing site JavaScript.
 
 Defaults:
-- total request timeout: 12 seconds;
+- total navigation deadline: 12 seconds across all redirects;
 - decoded body limit: 2 MiB;
-- redirect limit: 5.
+- redirect limit: 5;
+- one active Reader worker plus one replaceable pending job.
 
 Candidate containers include `article`, `main`, `[role=main]`, and common article/content classes. Candidates are ranked by text volume penalized by link text.
 
-Output blocks: headings, paragraphs, quotes, code, and list items. Navigation, footer, aside, script, style, and form containers are excluded.
+Output blocks: headings, paragraphs, quotes, code, and list items. Navigation, footer, aside, script, style, form and hidden containers are excluded.
 
-Extracted text is escaped before insertion into Reader HTML. Remote scripts and styles are not copied.
+`<pre>` blocks preserve line structure and indentation. List items render as semantic lists.
 
-Every Reader page MUST expose an explicit full-page escape hatch.
+Extracted text is escaped before insertion into Reader HTML. Remote scripts and styles are not copied. Reader HTML executes no NeuralIA JavaScript and MUST use `script-src 'none'`.
+
+Every Reader page MUST expose Home and an explicit full-page escape hatch through app-controlled navigation actions.
