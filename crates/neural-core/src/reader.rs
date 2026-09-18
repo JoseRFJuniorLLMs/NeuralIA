@@ -162,11 +162,13 @@ impl ReaderClient {
         let content_type = header(&response, "content-type").to_ascii_lowercase();
         let actual = content_type.split(';').next().unwrap_or("").trim();
         if actual != media_type {
-            return Err(NeuralError::UnsupportedContentType(if content_type.is_empty() {
-                "missing Content-Type".to_string()
-            } else {
-                content_type
-            }));
+            return Err(NeuralError::UnsupportedContentType(
+                if content_type.is_empty() {
+                    "missing Content-Type".to_string()
+                } else {
+                    content_type
+                },
+            ));
         }
 
         reject_declared_oversize(&response, max_bytes)?;
@@ -470,7 +472,10 @@ fn fallback_visible_text(root: &ElementRef<'_>) -> String {
         if inside_ignored_container(&node) {
             continue;
         }
-        if node.children().any(|child| ElementRef::wrap(child).is_some()) {
+        if node
+            .children()
+            .any(|child| ElementRef::wrap(child).is_some())
+        {
             continue;
         }
         let text = normalize_text(node.text().collect::<Vec<_>>().join(" "));
