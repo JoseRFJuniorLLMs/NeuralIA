@@ -2,6 +2,43 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [1.0.1] - 2026-09-18
+
+Security and reliability hardening release after the second recursive audit.
+
+### Security
+- Public Reader DNS resolution filters loopback, private, link-local, documentation, benchmark, multicast and reserved IP ranges before connection.
+- Reader uses the operating-system TLS certificate verifier.
+- The full Reader redirect chain shares one hard deadline.
+- Reader-generated pages contain no NeuralIA JavaScript and use `script-src 'none'`.
+- External pages still receive no NeuralIA IPC.
+- Stable release assets cannot be overwritten by later `main` pushes.
+- Release publication only follows a successful `main` CI run.
+- GitHub Actions used by CI/release are pinned to commit SHAs and build jobs do not receive release-write credentials.
+
+### Fixed
+- Replaced unbounded Reader thread spawning with one coalescing Reader worker.
+- Bounded local history to the configured retention limit.
+- Moved history writes off the UI thread and added a clear-history action.
+- Preserved whitespace in `<pre>` code blocks.
+- Rendered list items as semantic HTML lists.
+- Added explicit handling for `target="_blank"`/new-window requests while retaining the one-WebView invariant.
+- Replaced the painted omnibox editor with a native Windows `EDIT` control.
+- CI now tests exactly the committed `Cargo.lock` with `--locked`.
+
+### Testing
+- Added end-to-end local HTTP tests for redirects, redirect limits, body limits, charset decoding, non-HTML responses and total deadline behavior.
+- Added additional security and history retention tests.
+
+### Distribution
+- Release workflow emits SHA-256, Cargo metadata and GitHub build-provenance attestation.
+- Stable release publication refuses to overwrite an existing release.
+
+### Remaining
+- Automated startup/RSS performance gates.
+- Authenticode signing and installer.
+- Optional macOS/Linux shells.
+
 ## [1.0.0] - 2026-09-18
 
 First stable release.
@@ -24,18 +61,3 @@ First stable release.
 - Sensitive WebView permissions are denied by default.
 - Reader HTML is escaped and protected by a restrictive CSP.
 - History writes use file locking and durable flushes to avoid interleaved records.
-
-### Fixed
-- Reader now records the final validated URL after redirects.
-- HTTP connection pooling is preserved across Reader navigations.
-- Early Content-Length rejection avoids unnecessary oversized downloads.
-- Hidden and navigation-only content is filtered more aggressively.
-- Reader scoring and limits are character-aware for Unicode content.
-- History read errors are no longer silently swallowed.
-- Desktop version output now follows the package version.
-
-### Known limitations
-- Windows is the only desktop shell in v1.0.
-- Startup/RAM budgets still need automated benchmark gates.
-- The v1 executable is not Authenticode-signed.
-- Native-home screen-reader semantics need a dedicated accessibility pass.
