@@ -11,6 +11,7 @@ name = "NeuralIA"
 path = "src/main.rs"
 
 [dependencies]
+getrandom = "0.3.4"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 neural-core = { path = "../neural-core" }
 url.workspace = true
