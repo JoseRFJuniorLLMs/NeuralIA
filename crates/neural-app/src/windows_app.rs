@@ -25,13 +25,13 @@ use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
     Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CLEARTYPE_QUALITY,
-        ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
+        ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
         CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
         DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC,
         DeleteObject, DrawTextW, Ellipse, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC,
         InvalidateRect, LineTo, MoveToEx, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC,
         SRCCOPY, SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits,
-        TRANSPARENT, CreatePen,
+        TRANSPARENT,
     },
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     UI::{
@@ -790,31 +790,33 @@ impl DocumentWorker {
 
         let spawned = thread::Builder::new()
             .name("neural-pdf".into())
-            .spawn(move || loop {
-                let job = {
-                    let (lock, wake) = &*worker_pending;
-                    let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    while slot.is_none() {
-                        slot = wake
-                            .wait(slot)
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    }
-                    slot.take().expect("document job present")
-                };
+            .spawn(move || {
+                loop {
+                    let job = {
+                        let (lock, wake) = &*worker_pending;
+                        let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        while slot.is_none() {
+                            slot = wake
+                                .wait(slot)
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        }
+                        slot.take().expect("document job present")
+                    };
 
-                let job_generation = job.generation;
-                let watch = Arc::clone(&generation);
-                let result = client
-                    .fetch_document(&job.url, "application/pdf", PDF_MAX_BYTES, &|| {
-                        watch.load(Ordering::SeqCst) != job_generation
-                    })
-                    .map_err(|error| error.to_string());
+                    let job_generation = job.generation;
+                    let watch = Arc::clone(&generation);
+                    let result = client
+                        .fetch_document(&job.url, "application/pdf", PDF_MAX_BYTES, &|| {
+                            watch.load(Ordering::SeqCst) != job_generation
+                        })
+                        .map_err(|error| error.to_string());
 
-                let _ = proxy.send_event(UserEvent::PdfReady {
-                    generation: job_generation,
-                    url: job.url,
-                    result,
-                });
+                    let _ = proxy.send_event(UserEvent::PdfReady {
+                        generation: job_generation,
+                        url: job.url,
+                        result,
+                    });
+                }
             });
 
         Self {
@@ -892,10 +894,11 @@ impl HistoryWriter {
             .spawn(move || {
                 let result = store.clear().map_err(|error| error.to_string());
                 let _ = proxy.send_event(UserEvent::HistoryCleared(result));
-            })
-        {
+            }) {
             Ok(_) => None,
-            Err(error) => Some(Err(format!("não consegui criar a thread de limpeza: {error}"))),
+            Err(error) => Some(Err(format!(
+                "não consegui criar a thread de limpeza: {error}"
+            ))),
         }
     }
 }
@@ -1587,7 +1590,9 @@ impl App {
             .ok()
             .is_some_and(|target| is_local_network_target(&target));
         let result = if let Some(window) = &self.window {
-            self.external_webview_builder(allow_local).with_url(url).build(window)
+            self.external_webview_builder(allow_local)
+                .with_url(url)
+                .build(window)
         } else {
             return;
         };
@@ -2923,12 +2928,10 @@ unsafe fn draw_neural_background(
         let progress = (seconds * speed + phase).fract();
         let eased = progress * progress * (3.0 - 2.0 * progress);
 
-        let target_offset_x = (neural_hash(seed.wrapping_mul(0x27d4_eb2d)) - 0.5)
-            * brand_width
-            * 0.44;
-        let target_offset_y = (neural_hash(seed.wrapping_mul(0x1656_67b1)) - 0.5)
-            * brand_width
-            * 0.16;
+        let target_offset_x =
+            (neural_hash(seed.wrapping_mul(0x27d4_eb2d)) - 0.5) * brand_width * 0.44;
+        let target_offset_y =
+            (neural_hash(seed.wrapping_mul(0x1656_67b1)) - 0.5) * brand_width * 0.16;
         let tx = target_x + target_offset_x;
         let ty = target_y + target_offset_y;
 
@@ -2949,7 +2952,11 @@ unsafe fn draw_neural_background(
         nodes.push((x, y, energy));
     }
 
-    let line_color = mix(theme.page_bg, theme.accent, if system_dark_mode() { 0.30 } else { 0.18 });
+    let line_color = mix(
+        theme.page_bg,
+        theme.accent,
+        if system_dark_mode() { 0.30 } else { 0.18 },
+    );
     let line_pen = CreatePen(PS_SOLID, 1, rgb3(line_color));
     let old_pen = SelectObject(hdc, line_pen as _);
     let max_link = 150.0 * scale;
@@ -2974,7 +2981,11 @@ unsafe fn draw_neural_background(
     SelectObject(hdc, old_pen);
     DeleteObject(line_pen as _);
 
-    let node_color = mix(theme.page_bg, theme.accent, if system_dark_mode() { 0.72 } else { 0.50 });
+    let node_color = mix(
+        theme.page_bg,
+        theme.accent,
+        if system_dark_mode() { 0.72 } else { 0.50 },
+    );
     let node_brush = CreateSolidBrush(rgb3(node_color));
     let node_pen = CreatePen(PS_SOLID, 1, rgb3(node_color));
     let old_brush = SelectObject(hdc, node_brush as _);
@@ -3713,9 +3724,15 @@ mod tests {
 
     #[test]
     fn pdf_origin_is_exact_not_prefix_based() {
-        assert!(is_pdf_internal_target("http://neuralia-pdf.localhost/viewer.html"));
-        assert!(!is_pdf_internal_target("http://neuralia-pdf.localhost.evil.test/viewer.html"));
-        assert!(!is_pdf_internal_target("https://neuralia-pdf.localhost/viewer.html"));
+        assert!(is_pdf_internal_target(
+            "http://neuralia-pdf.localhost/viewer.html"
+        ));
+        assert!(!is_pdf_internal_target(
+            "http://neuralia-pdf.localhost.evil.test/viewer.html"
+        ));
+        assert!(!is_pdf_internal_target(
+            "https://neuralia-pdf.localhost/viewer.html"
+        ));
     }
 
     #[test]

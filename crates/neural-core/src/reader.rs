@@ -483,7 +483,7 @@ fn fallback_visible_text(root: &ElementRef<'_>) -> String {
     normalize_text(pieces.join(" "))
 }
 
-fn is_hidden_element(element: &ElementRef<'_>) -> bool {fn is_hidden_element(element: &ElementRef<'_>) -> bool {
+fn is_hidden_element(element: &ElementRef<'_>) -> bool {
     let value = element.value();
 
     if value.attr("hidden").is_some()
