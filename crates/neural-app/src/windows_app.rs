@@ -26,9 +26,9 @@ use windows_sys::Win32::{
         Input::KeyboardAndMouse::{GetAsyncKeyState, SetFocus, VK_CONTROL, VK_SHIFT},
         WindowsAndMessaging::{
             CreateWindowExW, ES_AUTOHSCROLL, GetClientRect, GetWindowTextLengthW, GetWindowTextW,
-            MB_ICONINFORMATION, MB_OK, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
-            SWP_NOZORDER, SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow, WM_KEYDOWN,
-            WS_CHILD, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VISIBLE,
+            MB_ICONINFORMATION, MB_OK, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
+            SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow, WM_KEYDOWN, WS_CHILD,
+            WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
