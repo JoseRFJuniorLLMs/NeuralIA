@@ -7,9 +7,10 @@ The stable v1 artifact is a Windows x64 executable from the Rust workspace.
 A stable release MUST originate from a successful `main` CI run for the exact source SHA that is tagged. The release workflow creates a new `v<workspace-version>` tag only when that version tag does not already exist.
 
 Release jobs are separated by authority:
-- tagging may write Git refs but does not build project code;
-- building has read-only repository access plus attestation permissions;
-- publishing receives the completed artifact but does not execute the Rust build.
+- building has read-only repository access plus attestation permissions and operates on the exact CI-tested SHA;
+- publishing receives the completed artifact, then creates the new version tag and GitHub Release; it does not execute the Rust build.
+
+A version tag MUST NOT be created until the locked tests, strict Clippy, release build, SBOM generation, checksum preparation and provenance step have succeeded. This prevents orphan stable tags when artifact preparation fails.
 
 A release build MUST:
 - use the repository's pinned Rust toolchain;
