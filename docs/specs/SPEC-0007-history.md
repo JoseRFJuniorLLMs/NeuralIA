@@ -10,6 +10,6 @@ Default retention is 250 entries. Appending beyond the limit rewrites only the r
 
 History persistence runs on a bounded background writer so `sync_data()` does not block the UI thread. History write failure MUST NOT prevent successful navigation. Corrupt individual lines are skipped during reads.
 
-Ctrl+Shift+Delete clears local history.
+Ctrl+H shows the 20 most recent local history entries in a native Windows dialog. Ctrl+Shift+Delete clears local history.
 
 Cloud synchronization is out of scope.
