@@ -85,11 +85,17 @@ jobs:
       - run: cargo clippy --locked -p neural-app -- -D warnings
       - name: Build exact CI-tested source
         run: cargo build --locked -p neural-app --release
+      - name: Generate CycloneDX SBOM
+        shell: pwsh
+        run: |
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          cargo cyclonedx --manifest-path crates/neural-app/Cargo.toml --format json --target x86_64-pc-windows-msvc --spec-version 1.5 --override-filename NeuralIA.cdx.json
       - name: Prepare release assets
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/neural-app.exe dist/NeuralIA.exe
+          Copy-Item crates/neural-app/NeuralIA.cdx.json dist/NeuralIA.cdx.json
           $hash = (Get-FileHash dist/NeuralIA.exe -Algorithm SHA256).Hash.ToLower()
           "$hash  NeuralIA.exe" | Out-File -Encoding ascii dist/NeuralIA.exe.sha256
           cargo metadata --locked --format-version 1 --no-deps | Out-File -Encoding utf8 dist/cargo-metadata.json
