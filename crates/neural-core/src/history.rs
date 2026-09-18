@@ -25,11 +25,7 @@ pub struct HistoryEntry {
 }
 
 impl HistoryEntry {
-    pub fn now(
-        kind: HistoryKind,
-        input: impl Into<String>,
-        target: impl Into<String>,
-    ) -> Self {
+    pub fn now(kind: HistoryKind, input: impl Into<String>, target: impl Into<String>) -> Self {
         let timestamp_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
