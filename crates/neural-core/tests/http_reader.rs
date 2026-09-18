@@ -98,6 +98,18 @@ fn rejects_declared_oversized_body_before_reading_it() {
 }
 
 #[test]
+#[ignore]
+fn test_youtube() {
+    let client = ReaderClient::default();
+    let res = client.fetch("https://www.youtube.com/watch?v=Scymli-lgcU").unwrap();
+    let html = neural_core::reader_html(&res);
+    println!("HTML length: {}", html.len());
+    println!("HTML start:\n{}", &html[..html.len().min(1000)]);
+}
+
+
+
+#[test]
 fn rejects_streamed_body_over_limit() {
     let body = format!(
         "<html><body><article><p>{}</p></article></body></html>",
