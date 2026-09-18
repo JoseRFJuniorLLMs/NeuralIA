@@ -1,6 +1,6 @@
 use url::Url;
 
-use crate::{security::validate_web_url, NeuralError, Result};
+use crate::{NeuralError, Result, security::validate_web_url};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intent {
@@ -95,9 +95,7 @@ fn reject_implicit_local_or_scheme(input: &str) -> Result<()> {
             .is_some_and(|rest| rest.starts_with("//"));
 
         if compact || dangerous || authority {
-            return Err(NeuralError::DisallowedScheme(
-                scheme.to_ascii_lowercase(),
-            ));
+            return Err(NeuralError::DisallowedScheme(scheme.to_ascii_lowercase()));
         }
     }
     Ok(())
