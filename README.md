@@ -109,7 +109,7 @@ The native omnibox inherits Windows text editing, selection, clipboard, IME and 
 - [x] external IPC isolation
 - [x] HTTP integration tests
 - [x] CI Linux + Windows + RustSec
-- [x] immutable release workflow with provenance attestation
+- [x] immutable release workflow with CycloneDX SBOM + provenance attestation
 - [ ] measured startup/RAM benchmark gate
 - [ ] Authenticode-signed Windows installer
 - [ ] macOS shell
