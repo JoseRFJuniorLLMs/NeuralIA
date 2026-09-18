@@ -1,7 +1,4 @@
-use std::{
-    net::SocketAddr,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use scraper::{ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
