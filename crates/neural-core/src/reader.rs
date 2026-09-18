@@ -103,13 +103,12 @@ impl ReaderClient {
                 .get("content-length")
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok())
+                && declared > self.max_bytes as u64
             {
-                if declared > self.max_bytes as u64 {
-                    return Err(NeuralError::ResponseTooLarge {
-                        declared,
-                        limit: self.max_bytes as u64,
-                    });
-                }
+                return Err(NeuralError::ResponseTooLarge {
+                    declared,
+                    limit: self.max_bytes as u64,
+                });
             }
 
             let html = response
