@@ -24,7 +24,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 winit = "0.30"
-wry = "0.57"
+wry = { version = "0.57", features = ["devtools"] }
 
 [build-dependencies]
 winres = "0.1.12"

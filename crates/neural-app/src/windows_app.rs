@@ -3,11 +3,11 @@
 use std::{
     sync::{
         Arc, Condvar, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{SyncSender, sync_channel},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use image::RgbaImage;
@@ -24,19 +24,22 @@ use windows_sys::Win32::{
         ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
         CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
         DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC,
-        DeleteObject, DrawTextW, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC, OUT_DEFAULT_PRECIS,
-        PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject, SetBkColor, SetBkMode, SetTextColor,
-        SetWindowRgn, StretchDIBits, TRANSPARENT,
+        DeleteObject, DrawTextW, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC, InvalidateRect,
+        OUT_DEFAULT_PRECIS, PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject, SetBkColor, SetBkMode,
+        SetTextColor, SetWindowRgn, StretchDIBits, TRANSPARENT,
     },
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     UI::{
-        Input::KeyboardAndMouse::{GetAsyncKeyState, SetFocus, VK_CONTROL, VK_SHIFT},
+        Input::KeyboardAndMouse::{
+            GetAsyncKeyState, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, SendInput, SetFocus,
+            VK_CONTROL, VK_NEXT, VK_SHIFT,
+        },
         WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, ES_AUTOHSCROLL, GetClientRect, GetWindowTextLengthW,
-            GetWindowTextW, MB_ICONINFORMATION, MB_OK, MessageBoxW, SW_HIDE, SW_SHOW,
-            SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow,
-            WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-            WS_TABSTOP, WS_VISIBLE,
+            CreateWindowExW, DestroyWindow, ES_AUTOHSCROLL, GetClientRect, GetForegroundWindow,
+            GetWindowTextLengthW, GetWindowTextW, MB_ICONINFORMATION, MB_OK, MessageBoxW, SW_HIDE,
+            SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos, SetWindowTextW,
+            ShowWindow, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+            WS_POPUP, WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -51,8 +54,24 @@ use winit::{
 };
 use wry::{NewWindowResponse, PermissionResponse, WebView, WebViewBuilder};
 
+#[derive(Debug)]
 enum UserEvent {
     HomeRequested,
+    /// Voltar um nivel: de ecra completo para tres colunas, de la para a Home.
+    BackRequested,
+    ToggleAutoScroll,
+    AutoScrollAnswer(bool),
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    ReloadPage,
+    PrintPage,
+    FocusOmnibox,
+    ToggleColumnFullscreen,
+    OpenDevTools,
+    ViewSource,
+    AutoScrollTick(u64),
+    HideSplash(u64),
     ShowHistory,
     ClearHistory,
     HistoryCleared(Result<(), String>),
@@ -60,6 +79,8 @@ enum UserEvent {
     HideChrome(u64),
     SubmitText(String),
     OpenExternal(String),
+    /// Popup pedido por uma coluna do comparador: carrega nessa coluna.
+    OpenInColumn(usize, String),
     ExpandComparator(usize),
     RestoreComparator,
     ReaderReady {
@@ -79,6 +100,101 @@ enum Surface {
 
 const TOP_BAR_HEIGHT: f64 = 42.0;
 const COMPARATOR_COLUMNS: usize = 3;
+/// Intervalo da rolagem automatica de leitura, do primeiro avanco ao ultimo.
+const AUTO_SCROLL_SECONDS: u64 = 30;
+/// Quanto tempo a pergunta fica no ecra antes de se dar por respondida com
+/// "nao". Sem resposta nao se mexe em nada: e uma pergunta, nao um aviso.
+const AUTO_SCROLL_PROMPT_SECONDS: u64 = 20;
+
+const SPLASH_SUBCLASS_ID: usize = 0x4E4C;
+const SPLASH_WIDTH: f64 = 470.0;
+const SPLASH_HEIGHT: f64 = 46.0;
+
+/// Texto do aviso flutuante. Vive fora do App porque quem o pinta e o
+/// procedimento de janela, que nao tem acesso ao estado da aplicacao.
+static SPLASH_TEXT: Mutex<String> = Mutex::new(String::new());
+/// Verdadeiro enquanto a janela esta a fazer uma pergunta com Sim/Nao.
+static SPLASH_ASKS: AtomicBool = AtomicBool::new(false);
+
+/// Os dois botoes ocupam o terco direito da janela. Uma so funcao para o
+/// desenho e o clique concordarem sempre.
+fn splash_buttons(client: &RECT) -> (RECT, RECT) {
+    let width = client.right - client.left;
+    let button = width / 5;
+    let margin = width / 40;
+    let no = RECT {
+        left: client.right - margin - button,
+        top: client.top + margin,
+        right: client.right - margin,
+        bottom: client.bottom - margin,
+    };
+    let yes = RECT {
+        left: no.left - margin - button,
+        top: no.top,
+        right: no.left - margin,
+        bottom: no.bottom,
+    };
+    (yes, no)
+}
+
+/// Avanca uma pagina, parando no fim em vez de dar a volta. Usa a altura visivel
+/// menos uma faixa de sobreposicao, para nao se perder a linha que se estava a
+/// ler. Corre no documento e tambem nos frames a que conseguimos chegar.
+const AUTO_SCROLL_SCRIPT: &str = r#"
+(function () {
+  function step(win) {
+    try {
+      var doc = win.document;
+      var el = doc.scrollingElement || doc.documentElement || doc.body;
+      if (!el) { return false; }
+      var view = el.clientHeight || win.innerHeight || 0;
+      if (view <= 0) { return false; }
+      if (el.scrollHeight - el.clientHeight <= 4) { return false; }
+      if (el.scrollTop + el.clientHeight >= el.scrollHeight - 2) { return false; }
+      win.scrollBy({ top: Math.max(view - 72, 120), left: 0, behavior: 'smooth' });
+      return true;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  if (step(window)) { return; }
+
+  // Alguns leitores desenham o conteudo dentro de um frame proprio.
+  var frames = document.querySelectorAll('iframe, frame');
+  for (var i = 0; i < frames.length; i++) {
+    try {
+      if (frames[i].contentWindow && step(frames[i].contentWindow)) { return; }
+    } catch (err) { /* outra origem: nao ha nada a fazer daqui */ }
+  }
+})();
+"#;
+
+/// Aviso curto dentro da propria pagina: a barra nativa nao esta sempre visivel.
+const AUTO_SCROLL_TOAST: &str = r#"
+(function (on) {
+  var id = 'neuralia-autoscroll-toast';
+  var el = document.getElementById(id);
+  if (!el) {
+    el = document.createElement('div');
+    el.id = id;
+    document.documentElement.appendChild(el);
+  }
+  el.textContent = on ? 'Rolagem automatica ligada — 20s (F8 desliga)' : 'Rolagem automatica desligada';
+  el.setAttribute('style', [
+    'position:fixed', 'left:50%', 'bottom:24px', 'transform:translateX(-50%)',
+    'z-index:2147483647', 'padding:10px 18px', 'border-radius:999px',
+    'background:rgba(17,19,20,.92)', 'color:#fff',
+    'font:600 13px Segoe UI, system-ui, sans-serif',
+    'box-shadow:0 8px 28px rgba(0,0,0,.35)', 'pointer-events:none',
+    'opacity:1', 'transition:opacity .4s ease'
+  ].join(';'));
+  clearTimeout(window.__neuralia_toast_timer);
+  window.__neuralia_toast_timer = setTimeout(function () {
+    el.style.opacity = '0';
+  }, 2200);
+})(__ON__);
+"#;
 
 /// O que esta debaixo do rato na barra de topo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,7 +212,6 @@ struct BarLayout {
     home: UiRect,
     columns: [UiRect; COMPARATOR_COLUMNS],
     columns_len: usize,
-    hint: UiRect,
 }
 
 impl BarLayout {
@@ -117,7 +232,6 @@ impl BarLayout {
                 home: empty,
                 columns: [empty; COMPARATOR_COLUMNS],
                 columns_len: 0,
-                hint: empty,
             };
         }
 
@@ -180,7 +294,6 @@ impl BarLayout {
             home,
             columns: rects,
             columns_len,
-            hint,
         }
     }
 
@@ -215,12 +328,33 @@ const EM_SETLIMITTEXT: u32 = 0x00C5;
 const EM_SETCUEBANNER: u32 = 0x1501;
 const EM_SETMARGINS: u32 = 0x00D3;
 const WM_CTLCOLOREDIT: u32 = 0x0133;
+const WM_ERASEBKGND: u32 = 0x0014;
+
+/// Instante de arranque, para termos milissegundos monotonos num AtomicU64.
+static START: OnceLock<Instant> = OnceLock::new();
+
+fn now_ms() -> u64 {
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Construir um WebView faz correr um ciclo de mensagens ANINHADO dentro do
+/// nosso proprio callback (wry chama `wait_with_pump`). Enquanto isso dura, o
+/// winit nao entrega `RedrawRequested` -- so revalida e reinvalida a janela em
+/// ciclo -- por isso o ecra fica com os pixeis das janelas que acabamos de
+/// destruir. Este sinalizador deixa o `WM_ERASEBKGND` apagar o fundo mesmo
+/// nessas voltas, que e o unico ponto de pintura que ainda corre.
+static ERASE_PENDING: AtomicBool = AtomicBool::new(false);
 const WINDOW_SUBCLASS_ID: usize = 0x4E4A;
 const EXIT_BUTTON_SUBCLASS_ID: usize = 0x4E4B;
 const WM_PAINT: u32 = 0x000F;
 const WM_LBUTTONUP: u32 = 0x0202;
-/// Lado do botao flutuante de saida, em pixeis logicos.
-const EXIT_BUTTON_SIZE: f64 = 42.0;
+const WM_NCHITTEST: u32 = 0x0084;
+const HTCLIENT: u32 = 1;
+/// Botao flutuante de saida, em pixeis logicos. Fica centrado no topo: nos
+/// cantos chocava com a propria interface dos sites (o login do Google estava
+/// exatamente por baixo dele).
+const EXIT_BUTTON_WIDTH: f64 = 196.0;
+const EXIT_BUTTON_HEIGHT: f64 = 38.0;
 const EC_LEFTMARGIN: usize = 0x0001;
 const EC_RIGHTMARGIN: usize = 0x0002;
 const WM_SETFONT: u32 = 0x0030;
@@ -288,6 +422,21 @@ unsafe extern "system" fn window_subclass(
     _subclass_id: usize,
     _reference_data: usize,
 ) -> LRESULT {
+    if message == WM_ERASEBKGND {
+        if ERASE_PENDING.swap(false, Ordering::SeqCst) {
+            let hdc = wparam as *mut core::ffi::c_void;
+            let mut client = RECT::default();
+            if GetClientRect(hwnd, &mut client) != 0 {
+                let brush = CreateSolidBrush(rgb3(Theme::system().page_bg));
+                FillRect(hdc, &client, brush);
+                DeleteObject(brush as _);
+            }
+        }
+        // Damos sempre a mensagem por tratada: fora das transicoes nao ha nada
+        // a apagar, e apagar a cada repintura faria a barra piscar.
+        return 1;
+    }
+
     if message == WM_CTLCOLOREDIT {
         let theme = Theme::system();
         let hdc = wparam as *mut core::ffi::c_void;
@@ -303,6 +452,115 @@ unsafe extern "system" fn window_subclass(
 /// pela janela principal apareceria por cima dele. Tambem nao pode depender de
 /// nada injetado na pagina -- o YouTube reescreve o seu proprio DOM e o botao
 /// injetado desaparece, que foi exatamente o que aconteceu.
+/// Aviso flutuante no fundo do ecra. Tem de ser nativo e nao injetado na
+/// pagina: por cima de um PDF nao ha pagina nossa onde escrever -- o
+/// visualizador do Edge e outro documento, noutra origem e noutro processo.
+unsafe extern "system" fn splash_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    reference_data: usize,
+) -> LRESULT {
+    // Quando a janela faz uma pergunta tem de receber cliques; uma janela da
+    // classe STATIC devolve HTTRANSPARENT e o clique atravessava-a.
+    if message == WM_NCHITTEST && SPLASH_ASKS.load(Ordering::SeqCst) {
+        return HTCLIENT as LRESULT;
+    }
+
+    if message == WM_LBUTTONUP && SPLASH_ASKS.load(Ordering::SeqCst) && reference_data != 0 {
+        let mut client = RECT::default();
+        if GetClientRect(hwnd, &mut client) != 0 {
+            let x = (lparam & 0xFFFF) as i16 as i32;
+            let (yes, no) = splash_buttons(&client);
+            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+            if x >= yes.left && x < yes.right {
+                let _ = proxy.send_event(UserEvent::AutoScrollAnswer(true));
+            } else if x >= no.left && x < no.right {
+                let _ = proxy.send_event(UserEvent::AutoScrollAnswer(false));
+            }
+        }
+        return 0;
+    }
+
+    if message == WM_PAINT {
+        let mut paint = PAINTSTRUCT::default();
+        let hdc = BeginPaint(hwnd, &mut paint);
+        if !hdc.is_null() {
+            let mut client = RECT::default();
+            if GetClientRect(hwnd, &mut client) != 0 {
+                let theme = Theme::system();
+                let height = (client.bottom - client.top) as f64;
+
+                let background = CreateSolidBrush(rgb3(theme.surface));
+                FillRect(hdc, &client, background);
+                DeleteObject(background as _);
+
+                let scale = (height / SPLASH_HEIGHT).max(1.0);
+                let font = create_font((-14.0 * scale) as i32, FW_NORMAL as i32);
+                let old_font = SelectObject(hdc, font as _);
+                SetBkMode(hdc, TRANSPARENT as i32);
+                SetTextColor(hdc, rgb3(theme.fg));
+
+                let text = SPLASH_TEXT
+                    .lock()
+                    .map(|value| value.clone())
+                    .unwrap_or_default();
+
+                if SPLASH_ASKS.load(Ordering::SeqCst) {
+                    let (yes, no) = splash_buttons(&client);
+                    let mut question = RECT {
+                        left: client.left + (18.0 * scale) as i32,
+                        top: client.top,
+                        right: yes.left - (10.0 * scale) as i32,
+                        bottom: client.bottom,
+                    };
+                    draw_text(
+                        hdc,
+                        &text,
+                        &mut question,
+                        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                    );
+
+                    for (rect, label, primary) in [(yes, "Sim", true), (no, "Não", false)] {
+                        let pill = UiRect {
+                            x: rect.left as f64,
+                            y: rect.top as f64,
+                            width: (rect.right - rect.left) as f64,
+                            height: (rect.bottom - rect.top) as f64,
+                        };
+                        let style = if primary {
+                            PillStyle::new(theme.accent, theme.accent, on_color(theme.accent))
+                        } else {
+                            PillStyle::new(
+                                mix(theme.surface, theme.fg, 0.10),
+                                theme.surface_line,
+                                theme.fg,
+                            )
+                        };
+                        draw_pill(hdc, pill, label, style, scale, font, theme.surface);
+                    }
+                } else {
+                    let mut rect = client;
+                    draw_text(
+                        hdc,
+                        &text,
+                        &mut rect,
+                        DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                    );
+                }
+
+                SelectObject(hdc, old_font);
+                DeleteObject(font as _);
+            }
+            EndPaint(hwnd, &paint);
+        }
+        return 0;
+    }
+    DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
 unsafe extern "system" fn exit_button_subclass(
     hwnd: HWND,
     message: u32,
@@ -312,6 +570,10 @@ unsafe extern "system" fn exit_button_subclass(
     reference_data: usize,
 ) -> LRESULT {
     match message {
+        // Uma janela da classe STATIC devolve HTTRANSPARENT por omissao: o
+        // clique atravessa-a e vai parar ao WebView por baixo, que era por isso
+        // que este botao nao fazia nada.
+        WM_NCHITTEST => HTCLIENT as LRESULT,
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut paint);
@@ -322,12 +584,12 @@ unsafe extern "system" fn exit_button_subclass(
                     let width = (client.right - client.left) as f64;
                     let height = (client.bottom - client.top) as f64;
 
-                    let background = CreateSolidBrush(rgb3(theme.bar_bg));
+                    let background = CreateSolidBrush(rgb3(theme.surface));
                     FillRect(hdc, &client, background);
                     DeleteObject(background as _);
 
-                    let scale = (height / EXIT_BUTTON_SIZE).max(1.0);
-                    let font = create_font((-17.0 * scale) as i32, FW_NORMAL as i32);
+                    let scale = (height / EXIT_BUTTON_HEIGHT).max(1.0);
+                    let font = create_font((-14.0 * scale) as i32, FW_BOLD as i32);
                     let old_font = SelectObject(hdc, font as _);
                     SetBkMode(hdc, TRANSPARENT as i32);
                     SetTextColor(hdc, rgb3(theme.fg));
@@ -339,7 +601,7 @@ unsafe extern "system" fn exit_button_subclass(
                     };
                     draw_text(
                         hdc,
-                        "\u{2715}",
+                        "\u{2715}  Sair da tela cheia",
                         &mut text_rect,
                         DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
                     );
@@ -603,7 +865,22 @@ struct App {
     /// Em ecra completo a barra some; volta enquanto o rato estiver no topo.
     chrome_revealed: bool,
     chrome_token: u64,
+    /// Prazo de vida da barra, em milissegundos monotonos. Cada movimento do
+    /// rato empurra-o; a thread de vigia le-o. Antes era uma thread do sistema
+    /// operativo POR CADA evento de rato -- centenas vivas ao mesmo tempo.
+    chrome_deadline: Arc<AtomicU64>,
     exit_button: Option<HWND>,
+    auto_scroll: bool,
+    auto_scroll_answered: bool,
+    auto_scroll_token: u64,
+    zoom: f64,
+    /// O visualizador de PDF nao aceita script do host: rola-se por tecla.
+    reading_pdf: bool,
+    splash: Option<HWND>,
+    splash_token: u64,
+    /// O Win32 nao apaga o fundo por nos e uma janela filha destruida deixa os
+    /// ultimos pixeis onde estava. Sem isto viam-se barras e texto fantasma.
+    needs_clear: bool,
     omnibox_font: Option<*mut core::ffi::c_void>,
     omnibox_font_height: i32,
     omnibox_proxy: Box<EventLoopProxy<UserEvent>>,
@@ -640,7 +917,18 @@ impl App {
             bar_hover: None,
             chrome_revealed: false,
             chrome_token: 0,
+            chrome_deadline: Arc::new(AtomicU64::new(0)),
             exit_button: None,
+            // Ligada por omissao: a aplicacao serve para ler.
+            // Nada rola sem o utilizador dizer que sim.
+            auto_scroll: false,
+            auto_scroll_answered: false,
+            auto_scroll_token: 0,
+            zoom: 1.0,
+            reading_pdf: false,
+            splash: None,
+            splash_token: 0,
+            needs_clear: true,
             omnibox_font: None,
             omnibox_font_height: 0,
             omnibox_proxy,
@@ -663,6 +951,39 @@ impl App {
 
     fn current_generation(&self) -> u64 {
         self.navigation_generation.load(Ordering::SeqCst)
+    }
+
+    /// Pinta a area de cliente inteira com o fundo do tema. Corre quando a
+    /// superficie muda ou a janela muda de tamanho, nunca a cada realce do rato.
+    /// Marca o ecra como sujo e limpa-o JA. Nao chega agendar para o proximo
+    /// `RedrawRequested`: a seguir a isto vem quase sempre a construcao de um
+    /// WebView, e durante essa construcao o winit deixa de entregar redraws.
+    fn mark_dirty(&mut self) {
+        self.needs_clear = true;
+        ERASE_PENDING.store(true, Ordering::SeqCst);
+        self.clear_client();
+    }
+
+    fn clear_client(&self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(hwnd) = window_hwnd(window) else {
+            return;
+        };
+        unsafe {
+            let hdc = GetDC(hwnd);
+            if hdc.is_null() {
+                return;
+            }
+            let mut client = RECT::default();
+            if GetClientRect(hwnd, &mut client) != 0 {
+                let brush = CreateSolidBrush(rgb3(Theme::system().page_bg));
+                FillRect(hdc, &client, brush);
+                DeleteObject(brush as _);
+            }
+            let _ = ReleaseDC(hwnd, hdc);
+        }
     }
 
     fn request_redraw(&self) {
@@ -752,6 +1073,9 @@ impl App {
             );
         }
         self.apply_omnibox_font(inner.height);
+        // O EDIT deixa o desenho antigo para tras quando muda de sitio.
+        self.needs_clear = true;
+        self.request_redraw();
     }
 
     /// Fonte proporcional a altura da barra: acompanha o tamanho da caixa e o DPI.
@@ -820,7 +1144,19 @@ impl App {
     /// Unica saida de qualquer superficie web. Leva o comparador junto: era
     /// aqui que os tres WebViews sobreviviam ao regresso a Home e o contador
     /// podia chegar a quatro somando o Full Web.
+    /// Sai do ecra completo. Faltava em quase todas as saidas: bastava um login
+    /// ou um Esc para a janela ficar sem barra de titulo e sem forma de voltar.
+    fn leave_fullscreen(&mut self) {
+        self.chrome_revealed = false;
+        self.chrome_token = self.chrome_token.wrapping_add(1);
+        if let Some(window) = &self.window {
+            window.set_fullscreen(None);
+        }
+    }
+
     fn destroy_web_surfaces(&mut self) {
+        self.mark_dirty();
+        self.leave_fullscreen();
         if let Some(button) = self.exit_button.take() {
             unsafe {
                 DestroyWindow(button);
@@ -995,6 +1331,11 @@ impl App {
                     return false;
                 }
 
+                if let Some(event) = neuralia_action(&target) {
+                    let _ = proxy.send_event(event);
+                    return false;
+                }
+
                 match action_url.path().trim_matches('/') {
                     "home" => {
                         let _ = proxy.send_event(UserEvent::HomeRequested);
@@ -1021,10 +1362,12 @@ impl App {
         let new_window_proxy = self.proxy.clone();
 
         WebViewBuilder::new()
-            .with_initialization_script(EXTERNAL_RETURN_BUTTON)
+            .with_initialization_script(format!(
+                "{NEURALIA_KEYMAP_SCRIPT}\n{EXTERNAL_RETURN_BUTTON}"
+            ))
             .with_navigation_handler(move |target| {
-                if target.eq_ignore_ascii_case("neuralia:home") {
-                    let _ = navigation_proxy.send_event(UserEvent::HomeRequested);
+                if let Some(event) = neuralia_action(&target) {
+                    let _ = navigation_proxy.send_event(event);
                     return false;
                 }
 
@@ -1043,6 +1386,12 @@ impl App {
     fn open_external(&mut self, url: &str) {
         self.destroy_web_surfaces();
         self.show_omnibox(false);
+        let is_pdf = url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(url)
+            .to_ascii_lowercase()
+            .ends_with(".pdf");
 
         let result = if let Some(window) = &self.window {
             self.external_webview_builder().with_url(url).build(window)
@@ -1052,8 +1401,10 @@ impl App {
 
         match result {
             Ok(webview) => {
+                let _ = webview.zoom(self.zoom);
                 self.webview = Some(webview);
                 self.surface = Surface::External;
+                self.begin_reading_session(is_pdf);
             }
             Err(error) => {
                 self.show_native_error(format!("WebView2 não pôde abrir a página: {error}"));
@@ -1074,8 +1425,10 @@ impl App {
 
         match result {
             Ok(webview) => {
+                let _ = webview.zoom(self.zoom);
                 self.webview = Some(webview);
                 self.surface = Surface::Reader;
+                self.begin_reading_session(false);
             }
             Err(error) => {
                 self.show_native_error(format!("WebView2 não pôde exibir o Reader: {error}"));
@@ -1146,6 +1499,7 @@ impl App {
 
             match builder.build_as_child(window) {
                 Ok(wv) => {
+                    let _ = wv.zoom(self.zoom);
                     views.push(ComparatorView { webview: wv, name });
                 }
                 Err(error) => {
@@ -1161,6 +1515,7 @@ impl App {
         });
         self.bar_hover = None;
         self.surface = Surface::Comparator;
+        self.begin_reading_session(false);
         self.request_redraw();
     }
 
@@ -1182,6 +1537,7 @@ impl App {
         self.bar_hover = None;
         self.chrome_revealed = false;
         self.chrome_token = self.chrome_token.wrapping_add(1);
+        self.needs_clear = true;
 
         // Ecra completo a serio: sem barra de titulo, sem minimizar/fechar.
         if let Some(window) = &self.window {
@@ -1293,7 +1649,7 @@ impl App {
         let new_window_proxy = self.proxy.clone();
 
         let init_script = format!(
-            "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';\n{COMPARATOR_INJECT_SCRIPT}"
+            "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{COMPARATOR_INJECT_SCRIPT}"
         );
 
         WebViewBuilder::new()
@@ -1305,6 +1661,10 @@ impl App {
                 }
                 if target.eq_ignore_ascii_case("neuralia:restore") {
                     let _ = navigation_proxy.send_event(UserEvent::RestoreComparator);
+                    return false;
+                }
+                if let Some(event) = neuralia_action(&target) {
+                    let _ = navigation_proxy.send_event(event);
                     return false;
                 }
                 if target.starts_with("neuralia:expand") {
@@ -1321,12 +1681,407 @@ impl App {
             })
             .with_new_window_req_handler(move |target, _features| {
                 if neural_core::validate_web_url(&target).is_ok() {
-                    let _ = new_window_proxy.send_event(UserEvent::OpenExternal(target));
+                    let _ = new_window_proxy.send_event(UserEvent::OpenInColumn(col_index, target));
                 }
                 NewWindowResponse::Deny
             })
             .with_permission_handler(|_| PermissionResponse::Deny)
             .with_focused(true)
+    }
+
+    /// O login abre-se com `window.open`, e ate aqui isso destruia as tres
+    /// colunas para pôr um WebView unico no lugar delas -- perdia-se a
+    /// comparacao e o ecra ficava com os pixeis das janelas mortas. O popup
+    /// pertence a coluna que o pediu e e nela que carrega.
+    fn open_in_column(&mut self, index: usize, url: String) {
+        if self.surface != Surface::Comparator {
+            self.web(url);
+            return;
+        }
+
+        let loaded = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.views.get(index))
+            .is_some_and(|view| view.webview.load_url(&url).is_ok());
+
+        if !loaded {
+            self.web(url);
+        }
+    }
+
+    /// Um nivel para tras. O Escape da janela nativa e o Escape apanhado dentro
+    /// das paginas acabam os dois aqui.
+    fn go_back(&mut self) {
+        if self.surface == Surface::Comparator
+            && let Some(comp) = &self.comparator
+            && comp.expanded.is_some()
+        {
+            self.restore_comparator();
+            return;
+        }
+        self.show_home();
+    }
+
+    /// Liga/desliga a rolagem de leitura. O temporizador e nativo e nao vive na
+    /// pagina: assim sobrevive a navegacao dentro do site.
+    fn toggle_auto_scroll(&mut self) {
+        SPLASH_ASKS.store(false, Ordering::SeqCst);
+        self.auto_scroll_answered = true;
+        self.auto_scroll = !self.auto_scroll;
+        self.auto_scroll_token = self.auto_scroll_token.wrapping_add(1);
+
+        if self.auto_scroll {
+            self.schedule_auto_scroll();
+        }
+
+        self.announce_auto_scroll();
+
+        self.request_redraw();
+
+        if self.surface == Surface::Home {
+            self.status = Some(if self.auto_scroll {
+                format!("Rolagem automática ligada — {AUTO_SCROLL_SECONDS}s. F8 desliga.")
+            } else {
+                "Rolagem automática desligada.".to_string()
+            });
+            self.request_redraw();
+        }
+    }
+
+    /// Mostra na propria pagina em que estado esta a rolagem. A barra nativa
+    /// tambem o diz, mas em ecra completo ela esconde-se.
+    fn announce_auto_scroll(&self) {
+        let toast =
+            AUTO_SCROLL_TOAST.replace("__ON__", if self.auto_scroll { "true" } else { "false" });
+        self.for_each_visible_webview(|webview| {
+            let _ = webview.evaluate_script(&toast);
+        });
+    }
+
+    /// Aviso flutuante, centrado no fundo da janela, que se apaga sozinho.
+    fn show_splash(&mut self, text: String, seconds: u64) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
+        let width = (SPLASH_WIDTH * scale).round() as i32;
+        let height = (SPLASH_HEIGHT * scale).round() as i32;
+
+        if let Ok(mut slot) = SPLASH_TEXT.lock() {
+            *slot = text;
+        }
+
+        let splash = match self.splash {
+            Some(splash) => splash,
+            None => unsafe {
+                let created = CreateWindowExW(
+                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    windows_sys::w!("STATIC"),
+                    windows_sys::w!(""),
+                    WS_POPUP | WS_VISIBLE,
+                    0,
+                    0,
+                    width,
+                    height,
+                    owner,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                );
+                if created.is_null() {
+                    return;
+                }
+                let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
+                if SetWindowSubclass(
+                    created,
+                    Some(splash_subclass),
+                    SPLASH_SUBCLASS_ID,
+                    proxy_ptr,
+                ) == 0
+                {
+                    DestroyWindow(created);
+                    return;
+                }
+                let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, height, height);
+                if !region.is_null() {
+                    SetWindowRgn(created, region, 1);
+                }
+                self.splash = Some(created);
+                created
+            },
+        };
+
+        let mut client = RECT::default();
+        unsafe {
+            if GetClientRect(owner, &mut client) == 0 {
+                return;
+            }
+            let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+            ClientToScreen(owner, &mut origin);
+            SetWindowPos(
+                splash,
+                std::ptr::null_mut(),
+                origin.x + (client.right - width) / 2,
+                origin.y + client.bottom - height - (48.0 * scale) as i32,
+                width,
+                height,
+                SWP_NOACTIVATE,
+            );
+            ShowWindow(splash, SW_SHOW);
+            InvalidateRect(splash, std::ptr::null(), 1);
+        }
+
+        self.splash_token = self.splash_token.wrapping_add(1);
+        let token = self.splash_token;
+        let proxy = self.proxy.clone();
+        let _ = thread::Builder::new()
+            .name("neural-splash".into())
+            .spawn(move || {
+                thread::sleep(Duration::from_secs(seconds));
+                let _ = proxy.send_event(UserEvent::HideSplash(token));
+            });
+    }
+
+    fn hide_splash(&mut self, token: u64) {
+        if token != self.splash_token {
+            return;
+        }
+        if let Some(splash) = self.splash.take() {
+            unsafe {
+                DestroyWindow(splash);
+            }
+        }
+    }
+
+    /// Abrir um documento: anuncia e da tempo de se comecar a ler em paz antes
+    /// do primeiro avanco.
+    fn begin_reading_session(&mut self, is_pdf: bool) {
+        self.reading_pdf = is_pdf;
+
+        // Pergunta-se uma vez por sessao. Depois disso respeita-se a resposta
+        // em silencio -- perguntar a cada pagina seria assedio, nao consentimento.
+        if !self.auto_scroll_answered {
+            self.ask_auto_scroll();
+            return;
+        }
+
+        if self.auto_scroll {
+            self.auto_scroll_token = self.auto_scroll_token.wrapping_add(1);
+            self.schedule_auto_scroll();
+            self.show_splash(
+                format!("Rolagem automática a cada {AUTO_SCROLL_SECONDS}s  ·  F8 desliga"),
+                4,
+            );
+        }
+    }
+
+    fn ask_auto_scroll(&mut self) {
+        SPLASH_ASKS.store(true, Ordering::SeqCst);
+        self.show_splash(
+            format!("Rolar a página sozinho a cada {AUTO_SCROLL_SECONDS}s?"),
+            AUTO_SCROLL_PROMPT_SECONDS,
+        );
+    }
+
+    /// Sem resposta nao se mexe: se a pergunta desaparecer sozinha, fica "nao"
+    /// ate a pessoa carregar em F8.
+    fn answer_auto_scroll(&mut self, yes: bool) {
+        SPLASH_ASKS.store(false, Ordering::SeqCst);
+        self.auto_scroll_answered = true;
+        self.auto_scroll = yes;
+        self.hide_splash(self.splash_token);
+
+        if yes {
+            self.auto_scroll_token = self.auto_scroll_token.wrapping_add(1);
+            self.schedule_auto_scroll();
+            self.show_splash(
+                format!("Rolagem automática ligada — {AUTO_SCROLL_SECONDS}s  ·  F8 desliga"),
+                4,
+            );
+        }
+        self.request_redraw();
+    }
+
+    fn schedule_auto_scroll(&self) {
+        self.schedule_auto_scroll_in(AUTO_SCROLL_SECONDS);
+    }
+
+    /// Sobe ou desce um degrau da escada de zoom, como o Chrome.
+    fn step_zoom(&mut self, direction: i32) {
+        let current = self.zoom;
+        let next = if direction > 0 {
+            ZOOM_STEPS
+                .iter()
+                .find(|step| **step > current + 0.001)
+                .copied()
+                .unwrap_or(current)
+        } else {
+            ZOOM_STEPS
+                .iter()
+                .rev()
+                .find(|step| **step < current - 0.001)
+                .copied()
+                .unwrap_or(current)
+        };
+        self.set_zoom(next);
+    }
+
+    fn set_zoom(&mut self, zoom: f64) {
+        self.zoom = zoom.clamp(ZOOM_STEPS[0], ZOOM_STEPS[ZOOM_STEPS.len() - 1]);
+        let zoom = self.zoom;
+        self.for_each_visible_webview(|webview| {
+            let _ = webview.zoom(zoom);
+        });
+        self.show_splash(format!("Zoom {}%", (zoom * 100.0).round() as i32), 2);
+    }
+
+    fn reload_page(&mut self) {
+        self.for_each_visible_webview(|webview| {
+            let _ = webview.reload();
+        });
+    }
+
+    fn print_page(&mut self) {
+        // Uma folha por pagina visivel seria absurdo: imprime-se a que se esta
+        // mesmo a ver.
+        let printed = match (&self.webview, &self.comparator) {
+            (Some(webview), _) => webview.print().is_ok(),
+            (None, Some(comp)) => comp
+                .views
+                .get(comp.expanded.unwrap_or(0))
+                .is_some_and(|view| view.webview.print().is_ok()),
+            _ => false,
+        };
+        if !printed {
+            self.show_splash("Não há nada para imprimir aqui.".to_string(), 3);
+        }
+    }
+
+    /// O equivalente ao Ctrl+L do Chrome: volta a barra e seleciona o texto.
+    fn focus_omnibox(&mut self) {
+        self.show_home();
+        if let Some(edit) = self.omnibox {
+            unsafe {
+                SetFocus(edit);
+                SendMessageW(edit, EM_SETSEL, 0, -1);
+            }
+        }
+    }
+
+    /// Inspetor do Chromium, o mesmo que o F12 abre num navegador.
+    fn open_devtools(&mut self) {
+        let mut opened = false;
+        self.for_each_visible_webview(|webview| {
+            webview.open_devtools();
+            opened = true;
+        });
+        if !opened {
+            self.show_splash("Não há página aberta para inspecionar.".to_string(), 3);
+        }
+    }
+
+    /// `view-source:` e do proprio Chromium; basta navegar para la.
+    fn view_source(&mut self) {
+        let Some(webview) = &self.webview else {
+            self.show_splash("Ver código-fonte só numa página aberta.".to_string(), 3);
+            return;
+        };
+        let _ = webview
+            .evaluate_script("window.location.href = 'view-source:' + window.location.href;");
+    }
+
+    fn toggle_column_fullscreen(&mut self) {
+        let index = match &self.comparator {
+            Some(comp) => comp.expanded.unwrap_or(0),
+            None => return,
+        };
+        self.expand_comparator(index);
+    }
+
+    fn schedule_auto_scroll_in(&self, seconds: u64) {
+        let proxy = self.proxy.clone();
+        let token = self.auto_scroll_token;
+        let _ = thread::Builder::new()
+            .name("neural-autoscroll".into())
+            .spawn(move || {
+                thread::sleep(Duration::from_secs(seconds));
+                let _ = proxy.send_event(UserEvent::AutoScrollTick(token));
+            });
+    }
+
+    fn auto_scroll_tick(&mut self, token: u64) {
+        if !self.auto_scroll || token != self.auto_scroll_token {
+            return;
+        }
+        // Um documento sozinho no ecra -- HTML, texto simples ou PDF -- avanca
+        // com a tecla, que e a unica via que funciona em todos eles. Nas tres
+        // colunas a tecla so chegaria a uma, por isso ai vai o script.
+        match self.surface {
+            Surface::Comparator => {
+                self.for_each_visible_webview(|webview| {
+                    let _ = webview.evaluate_script(AUTO_SCROLL_SCRIPT);
+                });
+            }
+            _ => self.page_down_synthetic(),
+        }
+        self.schedule_auto_scroll();
+    }
+
+    /// O visualizador de PDF do Edge corre noutro documento, noutra origem e
+    /// noutro processo: nenhum script do host la chega. A unica via que resta e
+    /// a tecla, e so a enviamos com a nossa janela em primeiro plano -- caso
+    /// contrario iria parar a aplicacao de outra pessoa.
+    fn page_down_synthetic(&self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(hwnd) = window_hwnd(window) else {
+            return;
+        };
+
+        unsafe {
+            if GetForegroundWindow() != hwnd {
+                return;
+            }
+
+            let mut inputs: [INPUT; 2] = std::mem::zeroed();
+            for (index, input) in inputs.iter_mut().enumerate() {
+                input.r#type = INPUT_KEYBOARD;
+                input.Anonymous.ki.wVk = VK_NEXT;
+                input.Anonymous.ki.dwFlags = if index == 1 { KEYEVENTF_KEYUP } else { 0 };
+            }
+            SendInput(
+                inputs.len() as u32,
+                inputs.as_ptr(),
+                std::mem::size_of::<INPUT>() as i32,
+            );
+        }
+    }
+
+    /// O WebView unico (Reader ou Full Web), ou as colunas que estao a ser
+    /// vistas: em ecra completo so a expandida, nas tres colunas todas elas.
+    fn for_each_visible_webview(&self, mut action: impl FnMut(&WebView)) {
+        if let Some(webview) = &self.webview {
+            action(webview);
+        }
+        if let Some(comp) = &self.comparator {
+            match comp.expanded {
+                Some(index) => {
+                    if let Some(view) = comp.views.get(index) {
+                        action(&view.webview);
+                    }
+                }
+                None => {
+                    for view in &comp.views {
+                        action(&view.webview);
+                    }
+                }
+            }
+        }
     }
 
     fn is_fullscreen_column(&self) -> bool {
@@ -1360,7 +2115,10 @@ impl App {
     /// houver uma coluna em ecra completo -- e a unica saida sempre visivel,
     /// porque a barra de titulo desapareceu e a barra da app auto-esconde-se.
     fn sync_exit_button(&mut self) {
-        let wanted = self.surface == Surface::Comparator && self.is_fullscreen_column();
+        // Acompanha a barra: aparece quando o rato a chama e desaparece com ela.
+        let wanted = self.surface == Surface::Comparator
+            && self.is_fullscreen_column()
+            && self.chrome_revealed;
 
         if !wanted {
             if let Some(button) = self.exit_button.take() {
@@ -1378,8 +2136,8 @@ impl App {
             return;
         };
         let scale = window.scale_factor().max(1.0);
-        let size = (EXIT_BUTTON_SIZE * scale).round() as i32;
-        let margin = (16.0 * scale).round() as i32;
+        let width = (EXIT_BUTTON_WIDTH * scale).round() as i32;
+        let height = (EXIT_BUTTON_HEIGHT * scale).round() as i32;
 
         let button = match self.exit_button {
             Some(button) => button,
@@ -1393,8 +2151,8 @@ impl App {
                     WS_POPUP | WS_VISIBLE,
                     0,
                     0,
-                    size,
-                    size,
+                    width,
+                    height,
                     owner,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
@@ -1414,7 +2172,7 @@ impl App {
                     DestroyWindow(created);
                     return;
                 }
-                let region = CreateRoundRectRgn(0, 0, size + 1, size + 1, size, size);
+                let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, height, height);
                 if !region.is_null() {
                     SetWindowRgn(created, region, 1);
                 }
@@ -1423,7 +2181,7 @@ impl App {
             },
         };
 
-        // Canto superior direito do monitor, que em ecra completo e a janela.
+        // Centrado no topo, logo abaixo da barra revelada.
         let mut client = RECT::default();
         unsafe {
             if GetClientRect(owner, &mut client) == 0 {
@@ -1431,13 +2189,14 @@ impl App {
             }
             let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
             ClientToScreen(owner, &mut origin);
+            let top = ((TOP_BAR_HEIGHT + 10.0) * scale).round() as i32;
             SetWindowPos(
                 button,
                 std::ptr::null_mut(),
-                origin.x + client.right - size - margin,
-                origin.y + margin,
-                size,
-                size,
+                origin.x + (client.right - width) / 2,
+                origin.y + top,
+                width,
+                height,
                 SWP_NOACTIVATE,
             );
             ShowWindow(button, SW_SHOW);
@@ -1447,23 +2206,37 @@ impl App {
     /// Mostra a barra e marca-a para desaparecer sozinha. Cada chamada invalida
     /// o temporizador anterior, por isso ela fica enquanto o rato la andar.
     fn reveal_chrome(&mut self) {
-        let was_hidden = !self.chrome_revealed;
+        // Adiar e so escrever um numero; nao ha thread nenhuma envolvida.
+        self.chrome_deadline
+            .store(now_ms() + 2500, Ordering::SeqCst);
+
+        if self.chrome_revealed {
+            return;
+        }
+
         self.chrome_revealed = true;
         self.chrome_token = self.chrome_token.wrapping_add(1);
 
         let proxy = self.proxy.clone();
         let token = self.chrome_token;
+        let deadline = Arc::clone(&self.chrome_deadline);
         let _ = thread::Builder::new()
             .name("neural-chrome".into())
             .spawn(move || {
-                thread::sleep(Duration::from_millis(2500));
-                let _ = proxy.send_event(UserEvent::HideChrome(token));
+                loop {
+                    let now = now_ms();
+                    let target = deadline.load(Ordering::SeqCst);
+                    if now >= target {
+                        let _ = proxy.send_event(UserEvent::HideChrome(token));
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis((target - now).min(300)));
+                }
             });
 
-        if was_hidden {
-            self.update_comparator_layout();
-            self.request_redraw();
-        }
+        self.update_comparator_layout();
+        self.sync_exit_button();
+        self.request_redraw();
     }
 
     fn hide_chrome(&mut self, token: u64) {
@@ -1473,6 +2246,7 @@ impl App {
         self.chrome_revealed = false;
         self.bar_hover = None;
         self.update_comparator_layout();
+        self.sync_exit_button();
         self.request_redraw();
     }
 
@@ -1551,6 +2325,20 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::HomeRequested => self.show_home(),
+            UserEvent::BackRequested => self.go_back(),
+            UserEvent::ToggleAutoScroll => self.toggle_auto_scroll(),
+            UserEvent::AutoScrollAnswer(yes) => self.answer_auto_scroll(yes),
+            UserEvent::ZoomIn => self.step_zoom(1),
+            UserEvent::ZoomOut => self.step_zoom(-1),
+            UserEvent::ZoomReset => self.set_zoom(1.0),
+            UserEvent::ReloadPage => self.reload_page(),
+            UserEvent::PrintPage => self.print_page(),
+            UserEvent::FocusOmnibox => self.focus_omnibox(),
+            UserEvent::ToggleColumnFullscreen => self.toggle_column_fullscreen(),
+            UserEvent::OpenDevTools => self.open_devtools(),
+            UserEvent::ViewSource => self.view_source(),
+            UserEvent::AutoScrollTick(token) => self.auto_scroll_tick(token),
+            UserEvent::HideSplash(token) => self.hide_splash(token),
             UserEvent::ShowHistory => self.show_history(),
             UserEvent::ClearHistory => match self.history.clear() {
                 None => {
@@ -1571,6 +2359,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::OpenExternal(url) => self.web(url),
+            UserEvent::OpenInColumn(index, url) => self.open_in_column(index, url),
             UserEvent::ExpandComparator(idx) => {
                 if self.surface == Surface::Comparator {
                     self.expand_comparator(idx);
@@ -1608,27 +2397,41 @@ impl ApplicationHandler<UserEvent> for App {
     ) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::RedrawRequested => match self.surface {
-                Surface::Home => {
-                    if let Some(window) = &self.window {
-                        draw_home(window, self.status.as_deref());
-                    }
+            WindowEvent::RedrawRequested => {
+                if self.needs_clear {
+                    self.clear_client();
+                    self.needs_clear = false;
                 }
-                Surface::Comparator => {
-                    if let Some(window) = &self.window
-                        && let Some(comp) = &self.comparator
-                    {
-                        draw_comparator_bar(window, comp, self.bar_hover, self.bar_visible());
+                match self.surface {
+                    Surface::Home => {
+                        if let Some(window) = &self.window {
+                            draw_home(window, self.status.as_deref());
+                        }
                     }
+                    Surface::Comparator => {
+                        if let Some(window) = &self.window
+                            && let Some(comp) = &self.comparator
+                        {
+                            draw_comparator_bar(
+                                window,
+                                comp,
+                                self.bar_hover,
+                                self.bar_visible(),
+                                self.auto_scroll,
+                            );
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             WindowEvent::Resized(_) => match self.surface {
                 Surface::Home => {
+                    self.needs_clear = true;
                     self.position_omnibox();
                     self.request_redraw();
                 }
                 Surface::Comparator => {
+                    self.needs_clear = true;
                     self.update_comparator_layout();
                     self.sync_exit_button();
                     self.request_redraw();
@@ -1670,16 +2473,8 @@ impl ApplicationHandler<UserEvent> for App {
             },
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
                 match event.logical_key {
-                    Key::Named(NamedKey::Escape) => {
-                        if self.surface == Surface::Comparator
-                            && let Some(comp) = &self.comparator
-                            && comp.expanded.is_some()
-                        {
-                            self.restore_comparator();
-                            return;
-                        }
-                        self.show_home();
-                    }
+                    Key::Named(NamedKey::Escape) => self.go_back(),
+                    Key::Named(NamedKey::F8) => self.toggle_auto_scroll(),
                     Key::Character(ref c) if self.surface == Surface::Comparator => {
                         match c.as_str() {
                             "1" => self.expand_comparator(0),
@@ -1698,11 +2493,65 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    pin_webview_profile();
+
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let mut app = App::new(proxy);
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+/// Fixa o perfil do WebView2 em `%LOCALAPPDATA%\NeuralIA\WebView2`.
+///
+/// Sem isto o WebView2 escolhe sozinho uma pasta ao lado do executavel
+/// (`NeuralIA.exe.WebView2`), e a sessao passa a depender do sitio de onde o
+/// programa foi corrido: mover o ficheiro, descarregar uma versao nova ou
+/// limpar a pasta de build faz perder todos os inicios de sessao. A pasta do
+/// utilizador e a mesma onde ja vive o historico, e sobrevive a tudo isso.
+fn pin_webview_profile() {
+    if std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_some() {
+        return;
+    }
+    let profile = CoreConfig::default().data_dir.join("WebView2");
+    if std::fs::create_dir_all(&profile).is_err() {
+        return;
+    }
+    // SAFETY: corre antes de qualquer thread ser criada.
+    unsafe {
+        std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &profile);
+    }
+}
+
+/// Traduz um `neuralia:<accao>` num evento. E o unico sitio onde a lista de
+/// atalhos existe do lado nativo: as paginas so sabem escrever o nome.
+fn neuralia_action(target: &str) -> Option<UserEvent> {
+    let rest = target.strip_prefix("neuralia:").or_else(|| {
+        target
+            .get(..9)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
+            .map(|_| &target[9..])
+    })?;
+    let name = rest.split(['?', '#']).next().unwrap_or(rest);
+
+    Some(match name.to_ascii_lowercase().as_str() {
+        "home" => UserEvent::HomeRequested,
+        "back" => UserEvent::BackRequested,
+        "restore" => UserEvent::RestoreComparator,
+        "autoscroll" => UserEvent::ToggleAutoScroll,
+        "zoomin" => UserEvent::ZoomIn,
+        "zoomout" => UserEvent::ZoomOut,
+        "zoomreset" => UserEvent::ZoomReset,
+        "reload" => UserEvent::ReloadPage,
+        "print" => UserEvent::PrintPage,
+        "omnibox" => UserEvent::FocusOmnibox,
+        "history" => UserEvent::ShowHistory,
+        "clearhistory" => UserEvent::ClearHistory,
+        "fullscreen" => UserEvent::ToggleColumnFullscreen,
+        "devtools" => UserEvent::OpenDevTools,
+        "viewsource" => UserEvent::ViewSource,
+        _ => return None,
+    })
 }
 
 fn wide_null(value: &str) -> Vec<u16> {
@@ -1752,44 +2601,27 @@ fn draw_home(window: &Window, status: Option<&str>) {
 
         SetBkMode(hdc, TRANSPARENT as i32);
 
-        let logo_size = (104.0 * scale) as i32;
-        let logo_x = ((width - logo_size as f64) / 2.0) as i32;
-        let logo_y = (height * 0.20).clamp(70.0 * scale, 150.0 * scale) as i32;
-        draw_logo_to_dc(hdc, logo_x, logo_y, logo_size, theme.page_bg);
+        // Só a marca e a barra, como a página inicial do Google. A arte já
+        // traz o nome lá dentro, por isso não se repete em texto.
+        let brand_width = (420.0 * scale).min(width * 0.52);
+        let brand_height = brand_width * BRAND_ASPECT;
+        let brand_x = ((width - brand_width) / 2.0).round() as i32;
+        let brand_y = (layout.input.y - brand_height - 44.0 * scale)
+            .max(24.0 * scale)
+            .round() as i32;
+        draw_brand(
+            hdc,
+            brand_x,
+            brand_y,
+            brand_width.round() as i32,
+            brand_height.round() as i32,
+            theme.page_bg,
+        );
 
-        let title_font = create_font((-38.0 * scale) as i32, FW_BOLD as i32);
         let body_font = create_font((-17.0 * scale) as i32, FW_NORMAL as i32);
         let small_font = create_font((-13.0 * scale) as i32, FW_NORMAL as i32);
 
-        let old_font = SelectObject(hdc, title_font as _);
-        SetTextColor(hdc, rgb3(theme.fg));
-        let mut title_rect = RECT {
-            left: 0,
-            top: logo_y + logo_size + (20.0 * scale) as i32,
-            right: client.right,
-            bottom: logo_y + logo_size + (72.0 * scale) as i32,
-        };
-        draw_text(
-            hdc,
-            "NeuralIA",
-            &mut title_rect,
-            DT_CENTER | DT_SINGLELINE | DT_VCENTER,
-        );
-
-        SelectObject(hdc, body_font as _);
-        SetTextColor(hdc, rgb3(theme.fg_muted));
-        let mut tag_rect = RECT {
-            left: 0,
-            top: title_rect.bottom,
-            right: client.right,
-            bottom: title_rect.bottom + (44.0 * scale) as i32,
-        };
-        draw_text(
-            hdc,
-            "Pergunte. Leia. Continue.",
-            &mut tag_rect,
-            DT_CENTER | DT_SINGLELINE | DT_VCENTER,
-        );
+        let old_font = SelectObject(hdc, body_font as _);
 
         // A barra de pesquisa: pilula suavizada por tras do EDIT nativo.
         fill_pill(
@@ -1824,7 +2656,6 @@ fn draw_home(window: &Window, status: Option<&str>) {
         }
 
         SelectObject(hdc, old_font);
-        DeleteObject(title_font as _);
         DeleteObject(body_font as _);
         DeleteObject(small_font as _);
         let _ = ReleaseDC(hwnd, hdc);
@@ -1836,6 +2667,7 @@ fn draw_comparator_bar(
     comp: &ComparatorState,
     hover: Option<BarHit>,
     visible: bool,
+    auto_scroll: bool,
 ) {
     let Ok(handle) = window.window_handle() else {
         return;
@@ -1886,6 +2718,7 @@ fn draw_comparator_bar(
             &names,
             visible,
             hover,
+            auto_scroll,
             &Theme::system(),
         );
 
@@ -1912,6 +2745,7 @@ unsafe fn paint_comparator_bar(
     names: &[&str],
     visible: bool,
     hover: Option<BarHit>,
+    auto_scroll: bool,
     theme: &Theme,
 ) {
     let layout = BarLayout::new(width as f64, scale, visible, names.len());
@@ -1983,17 +2817,33 @@ unsafe fn paint_comparator_bar(
         );
     }
 
+    // Alinhado a direita a partir do fim da ultima pilula: fica com todo o
+    // espaco livre sem obrigar a estreitar as pilulas, que tem de continuar
+    // centradas sobre as colunas.
+    let pills_right = layout
+        .columns
+        .iter()
+        .take(layout.columns_len)
+        .map(|rect| rect.x + rect.width)
+        .fold(layout.home.x + layout.home.width, f64::max);
+
+    let hint = if auto_scroll {
+        format!("F8: rolagem {AUTO_SCROLL_SECONDS}s ligada  ·  Esc: voltar")
+    } else {
+        "F8: rolagem automática  ·  Esc: voltar".to_string()
+    };
+
     SelectObject(target, font as _);
     SetTextColor(target, rgb3(theme.fg_muted));
     let mut hint_rect = RECT {
-        left: layout.hint.x as i32,
+        left: (pills_right + 12.0 * scale) as i32,
         top: 0,
-        right: (layout.hint.x + layout.hint.width - 10.0 * scale) as i32,
+        right: (width as f64 - 12.0 * scale) as i32,
         bottom: bar_h,
     };
     draw_text(
         target,
-        "Esc: voltar",
+        &hint,
         &mut hint_rect,
         DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
     );
@@ -2021,10 +2871,11 @@ unsafe fn create_font(height: i32, weight: i32) -> *mut core::ffi::c_void {
     )
 }
 
-/// (tamanho, cor de fundo, pixeis BGRX ja compostos)
-type SplashCache = Option<(i32, Rgb, Vec<u8>)>;
+/// (largura, altura, cor de fundo, pixeis BGRX ja compostos)
+type SplashCache = Option<(i32, i32, Rgb, Vec<u8>)>;
 
 static LOGO_IMAGE: OnceLock<RgbaImage> = OnceLock::new();
+static BRAND_IMAGE: OnceLock<RgbaImage> = OnceLock::new();
 static SPLASH_CACHE: Mutex<SplashCache> = Mutex::new(None);
 
 fn get_logo_image() -> &'static RgbaImage {
@@ -2032,6 +2883,16 @@ fn get_logo_image() -> &'static RgbaImage {
         let raw = include_bytes!("../../../assets/logo.png");
         image::load_from_memory(raw)
             .expect("assets/logo.png must be valid PNG")
+            .to_rgba8()
+    })
+}
+
+/// Arte da marca mostrada na tela inicial: e a unica coisa la, com a barra.
+fn get_brand_image() -> &'static RgbaImage {
+    BRAND_IMAGE.get_or_init(|| {
+        let raw = include_bytes!("../../../assets/neuralia-home.png");
+        image::load_from_memory(raw)
+            .expect("assets/neuralia-home.png must be valid PNG")
             .to_rgba8()
     })
 }
@@ -2073,129 +2934,71 @@ fn get_app_icon() -> Option<Icon> {
     Icon::from_rgba(rgba, size, size).ok()
 }
 
-unsafe fn draw_logo_to_dc(
+unsafe fn draw_brand(
     hdc: *mut core::ffi::c_void,
     x: i32,
     y: i32,
-    size: i32,
-    bg_rgb: (u8, u8, u8),
+    width: i32,
+    height: i32,
+    bg_rgb: Rgb,
 ) {
-    if size <= 0 {
+    if width <= 0 || height <= 0 {
         return;
     }
 
     let pixels = {
         let mut cache = SPLASH_CACHE.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((cached_sz, cached_bg, ref cached_pixels)) = *cache {
-            if cached_sz == size && cached_bg == bg_rgb {
+        match *cache {
+            Some((cached_w, cached_h, cached_bg, ref cached_pixels))
+                if cached_w == width && cached_h == height && cached_bg == bg_rgb =>
+            {
                 cached_pixels.clone()
-            } else {
-                let p = render_logo_pixels(size, bg_rgb);
-                *cache = Some((size, bg_rgb, p.clone()));
-                p
             }
-        } else {
-            let p = render_logo_pixels(size, bg_rgb);
-            *cache = Some((size, bg_rgb, p.clone()));
-            p
+            _ => {
+                let rendered = render_brand_pixels(width, height, bg_rgb);
+                *cache = Some((width, height, bg_rgb, rendered.clone()));
+                rendered
+            }
         }
     };
 
-    let bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: size,
-            biHeight: -size,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB,
-            biSizeImage: (size * size * 4) as u32,
-            biXPelsPerMeter: 0,
-            biYPelsPerMeter: 0,
-            biClrUsed: 0,
-            biClrImportant: 0,
-        },
-        bmiColors: [windows_sys::Win32::Graphics::Gdi::RGBQUAD {
-            rgbBlue: 0,
-            rgbGreen: 0,
-            rgbRed: 0,
-            rgbReserved: 0,
-        }; 1],
-    };
-
-    StretchDIBits(
-        hdc as _,
-        x,
-        y,
-        size,
-        size,
-        0,
-        0,
-        size,
-        size,
-        pixels.as_ptr() as *const _,
-        &bmi,
-        DIB_RGB_COLORS,
-        SRCCOPY,
-    );
+    blit_bgrx(hdc, &pixels, x, y, width, height);
 }
 
-fn render_logo_pixels(size: i32, bg_rgb: (u8, u8, u8)) -> Vec<u8> {
-    let u_size = size as u32;
-    let img = get_logo_image();
-    let resized =
-        image::imageops::resize(img, u_size, u_size, image::imageops::FilterType::Lanczos3);
+/// A arte tem fundo escuro proprio. Em vez de a cortar num retangulo duro,
+/// esbatemos as bordas contra a cor da pagina: no tema escuro desaparece, no
+/// claro fica uma sombra suave em vez de uma caixa.
+fn render_brand_pixels(width: i32, height: i32, bg_rgb: Rgb) -> Vec<u8> {
+    let image = image::imageops::resize(
+        get_brand_image(),
+        width as u32,
+        height as u32,
+        image::imageops::FilterType::Lanczos3,
+    );
 
-    let bg_r = bg_rgb.0 as f32;
-    let bg_g = bg_rgb.1 as f32;
-    let bg_b = bg_rgb.2 as f32;
-    let radius = (size as f32) * 0.20;
+    let feather = (width.min(height) as f32 * 0.10).max(1.0);
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
 
-    let mut bgr_pixels = Vec::with_capacity((size * size * 4) as usize);
+    for py in 0..height {
+        for px in 0..width {
+            let dx = px.min(width - 1 - px) as f32;
+            let dy = py.min(height - 1 - py) as f32;
+            let edge = (dx.min(dy) / feather).clamp(0.0, 1.0);
+            let alpha = edge * edge * (3.0 - 2.0 * edge);
 
-    for py in 0..size {
-        for px in 0..size {
-            let dx = if (px as f32) < radius {
-                radius - (px as f32)
-            } else if (px as f32) > (size as f32) - 1.0 - radius {
-                (px as f32) - ((size as f32) - 1.0 - radius)
-            } else {
-                0.0
-            };
-            let dy = if (py as f32) < radius {
-                radius - (py as f32)
-            } else if (py as f32) > (size as f32) - 1.0 - radius {
-                (py as f32) - ((size as f32) - 1.0 - radius)
-            } else {
-                0.0
+            let pixel = image.get_pixel(px as u32, py as u32);
+            let source = (pixel[3] as f32 / 255.0) * alpha;
+            let channel = |value: u8, bg: u8| {
+                (value as f32 * source + bg as f32 * (1.0 - source)).round() as u8
             };
 
-            let mask_alpha = if dx > 0.0 && dy > 0.0 {
-                let dist = (dx * dx + dy * dy).sqrt();
-                if dist > radius {
-                    0.0
-                } else if dist > radius - 1.0 {
-                    (radius - dist).clamp(0.0, 1.0)
-                } else {
-                    1.0
-                }
-            } else {
-                1.0
-            };
-
-            let pixel = resized.get_pixel(px as u32, py as u32);
-            let src_a = (pixel[3] as f32 / 255.0) * mask_alpha;
-            let final_r = ((pixel[0] as f32) * src_a + bg_r * (1.0 - src_a)).round() as u8;
-            let final_g = ((pixel[1] as f32) * src_a + bg_g * (1.0 - src_a)).round() as u8;
-            let final_b = ((pixel[2] as f32) * src_a + bg_b * (1.0 - src_a)).round() as u8;
-
-            bgr_pixels.push(final_b);
-            bgr_pixels.push(final_g);
-            bgr_pixels.push(final_r);
-            bgr_pixels.push(0);
+            pixels.push(channel(pixel[2], bg_rgb.2));
+            pixels.push(channel(pixel[1], bg_rgb.1));
+            pixels.push(channel(pixel[0], bg_rgb.0));
+            pixels.push(0);
         }
     }
-    bgr_pixels
+    pixels
 }
 
 #[cfg(test)]
@@ -2208,10 +3011,10 @@ mod tests {
         unsafe {
             let hdc = GetDC(core::ptr::null_mut());
             assert!(!hdc.is_null());
-            let img = get_logo_image();
-            assert_eq!(img.width(), 1254);
+            let img = get_brand_image();
+            assert_eq!(img.width(), 1200);
             let size = 104;
-            let pixels = render_logo_pixels(size, (248, 249, 250));
+            let pixels = render_brand_pixels(size, size, (248, 249, 250));
             assert_eq!(pixels.len(), (size * size * 4) as usize);
 
             let bmi = BITMAPINFO {
@@ -2292,6 +3095,7 @@ mod tests {
                     &["Google Gemini", "ChatGPT", "Claude"],
                     visible,
                     hover,
+                    true,
                     &theme,
                 );
 
@@ -2355,6 +3159,54 @@ mod tests {
 
             ReleaseDC(core::ptr::null_mut(), screen);
         }
+    }
+
+    #[test]
+    fn neuralia_actions_are_routed() {
+        // As paginas so escrevem o nome da accao; a traducao vive toda aqui.
+        for (target, expected) in [
+            ("neuralia:back", "BackRequested"),
+            ("NEURALIA:BACK", "BackRequested"),
+            ("neuralia:zoomin", "ZoomIn"),
+            ("neuralia:zoomout", "ZoomOut"),
+            ("neuralia:zoomreset", "ZoomReset"),
+            ("neuralia:reload", "ReloadPage"),
+            ("neuralia:print", "PrintPage"),
+            ("neuralia:omnibox", "FocusOmnibox"),
+            ("neuralia:history", "ShowHistory"),
+            ("neuralia:clearhistory", "ClearHistory"),
+            ("neuralia:fullscreen", "ToggleColumnFullscreen"),
+            ("neuralia:autoscroll", "ToggleAutoScroll"),
+            ("neuralia:restore", "RestoreComparator"),
+            ("neuralia:home", "HomeRequested"),
+        ] {
+            let action = neuralia_action(target);
+            assert!(action.is_some(), "{target} devia ser reconhecido");
+            assert!(
+                format!("{:?}", action.unwrap()).starts_with(expected),
+                "{target} devia dar {expected}"
+            );
+        }
+
+        // Tudo o resto tem de passar ao lado, incluindo navegacao verdadeira.
+        for target in [
+            "https://example.com",
+            "neuralia:inventado",
+            "about:blank",
+            "neuralia",
+        ] {
+            assert!(neuralia_action(target).is_none(), "{target}");
+        }
+    }
+
+    #[test]
+    fn zoom_walks_the_chrome_ladder() {
+        assert_eq!(ZOOM_STEPS[0], 0.25);
+        assert!(ZOOM_STEPS.contains(&1.0));
+        assert!(
+            ZOOM_STEPS.windows(2).all(|pair| pair[0] < pair[1]),
+            "a escada tem de ser crescente"
+        );
     }
 
     #[test]
@@ -2505,6 +3357,14 @@ fn readable(color: Rgb, background: Rgb, minimum: f32) -> Rgb {
 }
 
 /// Cores de marca das tres IAs comparadas.
+/// Os degraus de zoom do Chrome, para o gesto ser o que a pessoa ja conhece.
+const ZOOM_STEPS: [f64; 16] = [
+    0.25, 0.33, 0.50, 0.67, 0.75, 0.80, 0.90, 1.00, 1.10, 1.25, 1.50, 1.75, 2.00, 2.50, 3.00, 4.00,
+];
+
+/// altura / largura da arte da marca (assets/neuralia-home.png, 1200x868).
+const BRAND_ASPECT: f64 = 868.0 / 1200.0;
+
 const BRAND_COLORS: [Rgb; COMPARATOR_COLUMNS] = [(66, 133, 244), (16, 163, 127), (217, 119, 87)];
 
 #[derive(Debug, Clone, Copy)]
@@ -2875,10 +3735,122 @@ const fn rgb3(color: Rgb) -> u32 {
     rgb(color.0, color.1, color.2)
 }
 
+/// Mapa de teclas injetado em TODAS as paginas. O teclado pertence ao WebView2,
+/// que e uma janela filha: a janela nativa nunca ve a tecla, por isso e aqui,
+/// na fase de captura, que se apanham os atalhos antes de o site os consumir.
+const NEURALIA_KEYMAP_SCRIPT: &str = r#"
+(function () {
+  if (window.__neuralia_keymap) { return; }
+  window.__neuralia_keymap = true;
+
+  function act(name) { window.location.href = 'neuralia:' + name; }
+
+  function findBar() {
+    var id = 'neuralia-find';
+    var box = document.getElementById(id);
+    if (box) { box.querySelector('input').focus(); box.querySelector('input').select(); return; }
+
+    box = document.createElement('div');
+    box.id = id;
+    box.setAttribute('style', [
+      'position:fixed', 'top:12px', 'right:14px', 'z-index:2147483647',
+      'display:flex', 'align-items:center', 'gap:8px',
+      'padding:8px 12px', 'border-radius:999px',
+      'background:rgba(17,19,20,.96)', 'box-shadow:0 8px 28px rgba(0,0,0,.4)',
+      'font:600 13px Segoe UI, system-ui, sans-serif'
+    ].join(';'));
+
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = 'Procurar na pagina';
+    input.setAttribute('style', [
+      'border:0', 'outline:0', 'background:transparent', 'color:#fff',
+      'font:inherit', 'width:190px'
+    ].join(';'));
+
+    var close = document.createElement('span');
+    close.textContent = '\u2715';
+    close.setAttribute('style', 'color:#9aa1a8;cursor:pointer');
+    close.onclick = function () { box.remove(); };
+
+    input.addEventListener('keydown', function (e) {
+      e.stopPropagation();
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        try { window.find(input.value, false, e.shiftKey, true); } catch (err) {}
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        box.remove();
+      }
+    }, true);
+
+    box.appendChild(input);
+    box.appendChild(close);
+    document.documentElement.appendChild(box);
+    input.focus();
+  }
+
+  document.addEventListener('keydown', function (e) {
+    var mod = e.ctrlKey || e.metaKey;
+    var key = (e.key || '').toLowerCase();
+
+    // Combinacoes com Ctrl valem mesmo dentro de um campo de texto.
+    if (mod && !e.altKey) {
+      if (e.shiftKey && key === 'delete') { e.preventDefault(); act('clearhistory'); return; }
+      if (e.shiftKey && key === 'r') { e.preventDefault(); act('reload'); return; }
+      if (e.shiftKey && (key === 'i' || key === 'j' || key === 'c')) {
+        e.preventDefault(); act('devtools'); return;
+      }
+      if (key === 'u') { e.preventDefault(); act('viewsource'); return; }
+      switch (key) {
+        case 'r': e.preventDefault(); act('reload'); return;
+        case 'l': e.preventDefault(); act('omnibox'); return;
+        case 'h': e.preventDefault(); act('history'); return;
+        case 't': e.preventDefault(); act('home'); return;
+        case 'w': e.preventDefault(); act('back'); return;
+        case 'p': e.preventDefault(); act('print'); return;
+        case 'f': e.preventDefault(); findBar(); return;
+        case '+': case '=': e.preventDefault(); act('zoomin'); return;
+        case '-': case '_': e.preventDefault(); act('zoomout'); return;
+        case '0': e.preventDefault(); act('zoomreset'); return;
+      }
+    }
+
+    if (e.altKey && key === 'arrowleft') { e.preventDefault(); window.history.back(); return; }
+    if (e.altKey && key === 'arrowright') { e.preventDefault(); window.history.forward(); return; }
+    if (key === 'f5') { e.preventDefault(); act('reload'); return; }
+    if (key === 'f12') { e.preventDefault(); act('devtools'); return; }
+    if (key === 'f8') { e.preventDefault(); act('autoscroll'); return; }
+    if (key === 'f11') { e.preventDefault(); act('fullscreen'); return; }
+    if (key === 'escape') { e.preventDefault(); e.stopPropagation(); act('back'); return; }
+
+    var target = e.target || {};
+    var tag = (target.tagName || '').toUpperCase();
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable) {
+      return;
+    }
+    if (e.altKey || mod) { return; }
+
+    if (key === 'backspace') { e.preventDefault(); window.history.back(); return; }
+    if (key === '1' || key === '2' || key === '3') {
+      if (typeof window.__neuralia_col_index === 'number') {
+        e.preventDefault();
+        window.location.href = 'neuralia:expand?col=' + (parseInt(key, 10) - 1);
+      }
+      return;
+    }
+    if (key === '0' && typeof window.__neuralia_col_index === 'number') {
+      e.preventDefault();
+      act('restore');
+    }
+  }, true);
+})();
+"#;
+
 /// Rotulos do botao injetado no comparador. Em tela cheia a barra nativa some,
 /// por isso este botao tem de anunciar a saida.
-const COMPARATOR_BUTTON_EXPANDED: &str = "(function(){var b=document.querySelector('#neuralia-comp-btn button');if(b){b.textContent='\u{26F6} Sair da tela cheia';}})();";
-const COMPARATOR_BUTTON_COLLAPSED: &str = "(function(){var b=document.querySelector('#neuralia-comp-btn button');if(b){b.textContent='\u{26F6} Expandir ' + (window.__neuralia_col_name || 'IA');}})();";
+const COMPARATOR_BUTTON_EXPANDED: &str = "(function(){var w=document.querySelector('#neuralia-comp-btn');if(w){w.style.display='none';}})();";
+const COMPARATOR_BUTTON_COLLAPSED: &str = "(function(){var w=document.querySelector('#neuralia-comp-btn');if(w){w.style.display='flex';}var b=document.querySelector('#neuralia-comp-btn button');if(b){b.textContent='\u{26F6} Expandir ' + (window.__neuralia_col_name || 'IA');}})();";
 
 const EXTERNAL_RETURN_BUTTON: &str = r#"
 document.addEventListener('DOMContentLoaded', () => {
@@ -2894,6 +3866,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   b.addEventListener('click', () => { window.location.href = 'neuralia:home'; });
   document.documentElement.appendChild(b);
+
 });
 "#;
 
@@ -2940,5 +3913,22 @@ document.addEventListener('DOMContentLoaded', () => {
   wrap.appendChild(btn);
 
   document.documentElement.appendChild(wrap);
+
+  // Duplo clique em qualquer sitio do painel expande essa coluna. Tem de ser
+  // duplo: com clique simples era impossivel usar a pagina -- nem iniciar
+  // sessao, nem escrever uma pergunta.
+  document.addEventListener('dblclick', (e) => {
+    if (e.target && e.target.closest && e.target.closest('#neuralia-comp-btn')) {
+      return;
+    }
+    const tag = e.target && e.target.tagName ? e.target.tagName.toUpperCase() : '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+      return;
+    }
+    if (e.target && e.target.isContentEditable) {
+      return;
+    }
+    window.location.href = 'neuralia:expand?col=' + colIndex;
+  }, true);
 });
 "#;

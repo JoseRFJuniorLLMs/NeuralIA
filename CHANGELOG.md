@@ -2,6 +2,28 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [1.1.1] - 2026-09-18
+
+Correcoes de congelamento, teclado e tela inicial, mais rolagem de leitura.
+
+### Fixed
+- **A aplicacao congelava ao voltar de um login.** Um popup de uma coluna destruia as tres colunas para abrir um WebView unico; construir WebViews corre um ciclo de mensagens ANINHADO dentro do nosso callback, durante o qual o winit deixa de entregar redraws -- a janela ficava com os pixeis das janelas mortas, a queimar CPU e surda ao teclado. O popup passa a carregar na coluna que o pediu, o fundo e apagado no `WM_ERASEBKGND` (o unico ponto de pintura que ainda corre nesse ciclo) e a limpeza acontece antes de entrar nele.
+- **Esc e Backspace nunca funcionavam fora da tela inicial.** O foco do teclado vive sempre numa janela filha (o WebView2 ou a omnibox), por isso o ramo de teclado do winit era codigo morto. As teclas passam a ser apanhadas na fase de captura dentro das paginas: Esc volta um nivel, Backspace volta uma pagina, 1/2/3 expandem colunas e 0 restaura.
+- **`reveal_chrome` criava uma thread do sistema operativo por cada movimento do rato** -- centenas vivas ao mesmo tempo. Passa a ser um prazo atomico com uma unica thread de vigia.
+- O botao de sair do ecra completo nao respondia: uma janela `STATIC` devolve `HTTRANSPARENT` e o clique atravessava-a ate ao WebView.
+- `set_fullscreen(None)` faltava em quase todas as saidas; bastava um login para ficar sem barra de titulo e sem retorno.
+
+### Added
+- Rolagem automatica de leitura, com consentimento: ao abrir um documento pergunta-se Sim/Nao uma vez por sessao, e sem resposta nada se mexe. Com Sim, avanca uma pagina a cada 30s e para no fim; F8 liga e desliga. Um documento sozinho (HTML, texto ou PDF) avanca por PageDown sintetizado -- a unica via que chega ao visualizador de PDF do Edge -- e as tres colunas por script.
+- Teclado ao estilo do Chrome dentro de todas as paginas: zoom na escada do Chrome (Ctrl +/-/0, herdado pelas paginas novas), barra de procura (Ctrl+F), recarregar (Ctrl+R/F5), historico da pagina (Backspace, Alt+setas), Ctrl+L, Ctrl+P, Ctrl+T/W, F11, DevTools (F12, Ctrl+Shift+I/J/C) e codigo-fonte (Ctrl+U). Ctrl+H e Ctrl+Shift+Delete passam a ser globais a serio, como o README ja prometia.
+- URLs `.pdf` abrem no visualizador embutido em vez de irem para o Reader, que so le HTML e as rejeitava -- o PDF nunca chegava a abrir.
+- Perfil do WebView2 fixado em `%LOCALAPPDATA%\NeuralIA\WebView2`: as sessoes deixam de depender do sitio de onde o executavel foi corrido.
+- Duplo clique em qualquer sitio de um painel expande essa coluna.
+
+### Changed
+- A tela inicial ficou so com a arte da marca e a barra arredondada, sem titulo nem slogan em texto.
+- O botao de sair do ecra completo mudou para o centro do topo e acompanha o aparecer e desaparecer da barra.
+
 ## [1.1.0] - 2026-09-18
 
 Comparador de IAs, tema do sistema e correcoes de ciclo de vida apontadas pela terceira auditoria.

@@ -63,15 +63,33 @@ pub fn parse_intent(input: &str) -> Result<Intent> {
     reject_implicit_local_or_scheme(raw)?;
 
     if raw.starts_with("http://") || raw.starts_with("https://") {
-        return Ok(Intent::Read(validate_web_url(raw)?));
+        let url = validate_web_url(raw)?;
+        // O Reader so sabe ler HTML: mandar-lhe um PDF dava um erro seco e o
+        // ficheiro nunca chegava a abrir. O visualizador embutido trata disso.
+        return Ok(if is_pdf_url(&url) {
+            Intent::Web(url)
+        } else {
+            Intent::Read(url)
+        });
     }
     if looks_like_domain(raw) {
-        return Ok(Intent::Read(parse_urlish(raw)?));
+        let url = parse_urlish(raw)?;
+        return Ok(if is_pdf_url(&url) {
+            Intent::Web(url)
+        } else {
+            Intent::Read(url)
+        });
     }
 
     // Texto normal vai para o comparador. Quem quiser um unico fornecedor usa
     // `ask:` ou `?`, que ficam no Google AI Mode.
     Ok(Intent::Compare(raw.to_string()))
+}
+
+/// Verdadeiro quando o caminho da URL aponta para um PDF. So olha para o
+/// caminho: a query pode trazer qualquer coisa.
+pub fn is_pdf_url(url: &Url) -> bool {
+    url.path().to_ascii_lowercase().ends_with(".pdf")
 }
 
 fn parse_urlish(input: &str) -> Result<Url> {
@@ -242,6 +260,30 @@ mod tests {
             parse_intent("como funciona raft").unwrap(),
             Intent::Compare("como funciona raft".into())
         );
+    }
+
+    #[test]
+    fn pdf_goes_to_the_viewer_not_the_reader() {
+        // O Reader rejeita tudo o que nao seja HTML; um PDF tem de ir inteiro
+        // para o WebView, senao nunca abre.
+        for input in [
+            "https://example.com/artigo.pdf",
+            "https://example.com/a/b/RELATORIO.PDF",
+            "example.com/ficheiro.pdf?download=1",
+        ] {
+            assert!(
+                matches!(parse_intent(input).unwrap(), Intent::Web(_)),
+                "{input} devia abrir no visualizador"
+            );
+        }
+    }
+
+    #[test]
+    fn pdf_in_the_query_is_not_a_pdf() {
+        assert!(matches!(
+            parse_intent("https://example.com/artigo?ref=guia.pdf").unwrap(),
+            Intent::Read(_)
+        ));
     }
 
     #[test]

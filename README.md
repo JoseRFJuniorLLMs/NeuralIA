@@ -55,6 +55,7 @@ NeuralIA/
 | `como funciona Raft?` | Google AI Mode |
 | `? MVCC vs OCC` | Google AI Mode |
 | `compare: MVCC vs OCC` | Comparador: envia a mesma pergunta ao Google AI Mode, ChatGPT e Claude |
+| `https://example.com/paper.pdf` | Visualizador de PDF embutido (o Reader só lê HTML) |
 | `https://example.com/article` | Reader |
 | `reader:https://example.com` | Reader |
 | `web:https://example.com` | Full WebView |
@@ -80,12 +81,39 @@ The desktop app requires the Microsoft Edge WebView2 Runtime only for AI/Reader/
 
 The native omnibox inherits Windows text editing, selection, clipboard, IME and accessibility behavior.
 
-- Enter: submit
-- Ctrl+L: select the omnibox text
-- Escape: clear/return Home
-- Ctrl+H: show the 20 most recent local history entries
-- Ctrl+Shift+Delete: clear local history
-- Escape while browsing: return to the native Home
+Keyboard focus always lives inside a child window (the omnibox or a WebView2),
+so the shortcuts below are captured *inside* every page, in the capture phase,
+before the site sees the key. They work on every surface unless noted.
+
+| Keys | Action |
+|---|---|
+| `Enter` | submit the omnibox |
+| `Esc` | back one level: fullscreen → 3 columns → Home |
+| `Backspace` · `Alt+←` · `Alt+→` | page history back / forward |
+| `Ctrl+L` | return to the omnibox with its text selected |
+| `Ctrl+T` · `Ctrl+W` | Home · back |
+| `Ctrl+R` · `F5` | reload |
+| `Ctrl` `+` / `-` / `0` | zoom, on Chrome's ladder (25%–400%), inherited by new pages |
+| `Ctrl+F` | in-page find bar (Enter / Shift+Enter / Esc) |
+| `Ctrl+P` | print the page you are looking at |
+| `Ctrl+H` | the 20 most recent local history entries |
+| `Ctrl+Shift+Delete` | clear local history (the WebView2 profile is untouched) |
+| `F12` · `Ctrl+Shift+I/J/C` | Chromium DevTools |
+| `Ctrl+U` | view page source |
+| `F11` | fullscreen for the current comparator column |
+| `F8` | auto-scroll on / off |
+| `1` `2` `3` · `0` | expand a comparator column · restore three columns |
+
+`Backspace` and the digits are ignored while typing in a field; `Ctrl` combinations are not.
+
+## Reading
+
+Opening a document asks once per session whether to advance the page automatically
+(**Sim** / **Não**, bottom centre). With **Sim**, the page moves one screen every
+30 seconds and stops at the end. A single document — HTML, plain text or PDF — is
+advanced with a synthesized Page Down, which is the only route that reaches the
+Edge PDF viewer; the three comparator columns are advanced by script. `F8` toggles
+it at any time. EPUB is not supported: WebView2 does not open it.
 
 ## v1.0.1 hardening baseline
 
@@ -115,6 +143,9 @@ The native omnibox inherits Windows text editing, selection, clipboard, IME and 
 - [x] semantic article extraction
 - [x] safe script-free Reader HTML
 - [x] bounded local history + native viewer + clear
+- [x] AI comparator with system-themed top bar and real fullscreen
+- [x] Chrome-style keyboard, zoom, find bar and DevTools inside every page
+- [x] opt-in auto-scroll for reading (HTML, text and PDF)
 - [x] external IPC isolation
 - [x] HTTP integration tests
 - [x] CI Linux + Windows + RustSec

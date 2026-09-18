@@ -10,7 +10,7 @@ pub mod security;
 pub use config::CoreConfig;
 pub use error::{NeuralError, Result};
 pub use history::{HistoryEntry, HistoryKind, HistoryStore};
-pub use intent::{Intent, parse_intent};
+pub use intent::{Intent, is_pdf_url, parse_intent};
 pub use reader::{ReaderArticle, ReaderBlock, ReaderClient};
 pub use render::reader_html;
 pub use search::{chatgpt_search_url, claude_search_url, google_ai_url, perplexity_search_url};
