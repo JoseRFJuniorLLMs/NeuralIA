@@ -14,4 +14,4 @@ pub use intent::{parse_intent, Intent};
 pub use reader::{ReaderArticle, ReaderBlock, ReaderClient};
 pub use render::{home_html, reader_html};
 pub use search::google_ai_url;
-pub use security::validate_web_url;
+pub use security::{is_local_network_target, validate_redirect_target, validate_web_url};
