@@ -26,9 +26,9 @@ use windows_sys::Win32::{
         Input::KeyboardAndMouse::{GetAsyncKeyState, SetFocus, VK_CONTROL, VK_SHIFT},
         WindowsAndMessaging::{
             CreateWindowExW, ES_AUTOHSCROLL, GetClientRect, GetWindowTextLengthW, GetWindowTextW,
-            SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos,
-            SetWindowTextW, ShowWindow, WM_KEYDOWN, WS_CHILD, WS_EX_CLIENTEDGE, WS_TABSTOP,
-            WS_VISIBLE,
+            MB_ICONINFORMATION, MB_OK, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
+            SWP_NOZORDER, SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow, WM_KEYDOWN,
+            WS_CHILD, WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -45,6 +45,7 @@ use wry::{NewWindowResponse, PermissionResponse, WebView, WebViewBuilder};
 
 enum UserEvent {
     HomeRequested,
+    ShowHistory,
     ClearHistory,
     SubmitText(String),
     OpenExternal(String),
@@ -106,6 +107,10 @@ unsafe extern "system" fn omnibox_subclass(
             }
             0x4C if ctrl => {
                 SendMessageW(hwnd, EM_SETSEL, 0, -1);
+                return 0;
+            }
+            0x48 if ctrl => {
+                let _ = proxy.send_event(UserEvent::ShowHistory);
                 return 0;
             }
             0x2E if ctrl && shift => {
@@ -307,6 +312,7 @@ struct App {
     omnibox: Option<HWND>,
     omnibox_proxy: Box<EventLoopProxy<UserEvent>>,
     config: CoreConfig,
+    history_store: HistoryStore,
     history: HistoryWriter,
     reader: ReaderWorker,
     surface: Surface,
@@ -320,7 +326,7 @@ impl App {
         let config = CoreConfig::default();
         let history_store =
             HistoryStore::with_limit(config.data_dir.join("history.jsonl"), config.history_limit);
-        let history = HistoryWriter::new(history_store);
+        let history = HistoryWriter::new(history_store.clone());
         let reader_client = ReaderClient::new(config.reader_timeout_secs, config.reader_max_bytes);
         let reader = ReaderWorker::new(reader_client, proxy.clone());
         let omnibox_proxy = Box::new(proxy.clone());
@@ -331,6 +337,7 @@ impl App {
             omnibox: None,
             omnibox_proxy,
             config,
+            history_store,
             history,
             reader,
             surface: Surface::Home,
@@ -461,6 +468,43 @@ impl App {
         self.show_omnibox(true);
         self.position_omnibox();
         self.request_redraw();
+    }
+
+    fn show_history(&self) {
+        let text = match self.history_store.recent(20) {
+            Ok(entries) if entries.is_empty() => "Histórico local vazio.".to_string(),
+            Ok(entries) => entries
+                .into_iter()
+                .map(|entry| {
+                    let kind = match entry.kind {
+                        HistoryKind::Ask => "IA",
+                        HistoryKind::Read => "Reader",
+                        HistoryKind::Web => "Web",
+                    };
+                    format!("[{kind}] {}", entry.input)
+                })
+                .collect::<Vec<_>>()
+                .join("\r\n"),
+            Err(error) => format!("Não foi possível ler o histórico: {error}"),
+        };
+
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(hwnd) = window_hwnd(window) else {
+            return;
+        };
+
+        let body = wide_null(&text);
+        let title = wide_null("NeuralIA — Histórico local");
+        unsafe {
+            MessageBoxW(
+                hwnd,
+                body.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
     }
 
     fn handle_input(&mut self, input: String) {
@@ -692,6 +736,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::HomeRequested => self.show_home(),
+            UserEvent::ShowHistory => self.show_history(),
             UserEvent::ClearHistory => {
                 self.history.clear();
                 self.status = "Histórico local apagado.".to_string();
@@ -767,6 +812,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(proxy);
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn window_hwnd(window: &Window) -> Option<HWND> {
@@ -864,7 +913,7 @@ fn draw_home(window: &Window, status: &str) {
         };
         draw_text(
             hdc,
-            "Texto → Google AI · URL → Reader · Ctrl+V cola · Ctrl+Shift+Del limpa histórico",
+            "Texto → Google AI · URL → Reader · Ctrl+H histórico · Ctrl+Shift+Del limpa",
             &mut help_rect,
             DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
