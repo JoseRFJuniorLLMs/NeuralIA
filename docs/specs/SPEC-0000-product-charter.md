@@ -1,7 +1,7 @@
 # SPEC-0000 — Product Charter
 
 **Status:** Normative  
-**Version:** 1.0.1
+**Version:** 1.1.3
 
 ## Thesis
 
@@ -9,10 +9,11 @@ NeuralIA is an AI-first information client that can temporarily become a browser
 
 ## Primary flow
 
-1. Natural-language input routes to Google AI Mode.
-2. HTTP(S) URLs route to Reader.
-3. Full web rendering is explicit through `web:` or the Reader escape hatch.
-4. The user can always return to the NeuralIA home surface.
+1. Natural-language input routes to the bounded three-provider comparator (Google AI Mode, ChatGPT and Claude).
+2. `ask:` or `?` routes to Google AI Mode alone when the user wants one provider.
+3. HTTP(S) URLs route to Reader.
+4. Full web rendering is explicit through `web:` or the Reader escape hatch.
+5. The user can always return to the NeuralIA home surface.
 
 ## Non-goals
 
