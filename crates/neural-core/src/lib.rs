@@ -10,7 +10,7 @@ pub mod security;
 pub use config::CoreConfig;
 pub use error::{NeuralError, Result};
 pub use history::{HistoryEntry, HistoryKind, HistoryStore};
-pub use intent::{parse_intent, Intent};
+pub use intent::{Intent, parse_intent};
 pub use reader::{ReaderArticle, ReaderBlock, ReaderClient};
 pub use render::{home_html, reader_html};
 pub use search::google_ai_url;
