@@ -2,6 +2,17 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [1.1.2] - 2026-09-18
+
+Visualizador embutido de PDF offline com Mozilla PDF.js e acabamento transparente na tela inicial.
+
+### Added
+- **Visualizador embutido de PDF offline:** Documentos `.pdf` abrem diretamente num visualizador embutido em memória (`http://neuralia-pdf.localhost`) alimentado pelo PDF.js da Mozilla, com renderização em canvas, zoom, auto-scroll sincronizado e atalhos completos de navegação.
+- **Descarregador seguro de documentos binários (`fetch_document`):** Suporta até 64 MiB com validação estrita de cabeçalho `Content-Type`, controle de redirecionamentos com filtro de rede (SSRF) e verificação de cancelamento/deadline em streaming.
+
+### Changed
+- **Arte da marca na tela inicial com transparência pura:** Composição alfa dos pixels sobre a cor de fundo do tema do Windows, eliminando a caixa escura residual no tema claro.
+
 ## [1.1.1] - 2026-09-18
 
 Correcoes de congelamento, teclado e tela inicial, mais rolagem de leitura.

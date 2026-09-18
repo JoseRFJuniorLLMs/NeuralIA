@@ -4,8 +4,9 @@ use scraper::{ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use ureq::{
-    Agent,
+    Agent, Body,
     config::Config,
+    http::Response,
     http::Uri,
     tls::{RootCerts, TlsConfig},
     unversioned::{
@@ -125,6 +126,56 @@ impl ReaderClient {
         input: &str,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ReaderArticle> {
+        let (current, mut response, started) = self.resolve(input, cancelled)?;
+
+        let content_type = header(&response, "content-type").to_ascii_lowercase();
+        let media_type = content_type.split(';').next().unwrap_or("").trim();
+        if !media_type.is_empty()
+            && media_type != "text/html"
+            && media_type != "application/xhtml+xml"
+        {
+            return Err(NeuralError::UnsupportedContentType(content_type));
+        }
+
+        reject_declared_oversize(&response, self.max_bytes)?;
+        let body = self.read_body(&mut response, started, self.max_bytes, true, cancelled)?;
+
+        // O BodyReader ja entrega UTF-8 (conversao de charset incluida), por
+        // isso juntamos os blocos e convertemos uma vez so: um caratere
+        // partido entre blocos nao se estraga.
+        let html = String::from_utf8_lossy(&body).into_owned();
+        extract_article(&current, &html)
+    }
+
+    /// Descarrega um documento binario -- por exemplo `application/pdf` -- ate
+    /// `max_bytes`, com o mesmo filtro de rede, os mesmos redirects e o mesmo
+    /// prazo do Reader. Devolve os bytes tal como vieram, sem conversao nenhuma.
+    pub fn fetch_document(
+        &self,
+        input: &str,
+        media_type: &str,
+        max_bytes: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>> {
+        let (_, mut response, started) = self.resolve(input, cancelled)?;
+
+        let content_type = header(&response, "content-type").to_ascii_lowercase();
+        let actual = content_type.split(';').next().unwrap_or("").trim();
+        if !actual.is_empty() && actual != media_type {
+            return Err(NeuralError::UnsupportedContentType(content_type));
+        }
+
+        reject_declared_oversize(&response, max_bytes)?;
+        self.read_body(&mut response, started, max_bytes, false, cancelled)
+    }
+
+    /// Segue os redirects ate a resposta final, com o filtro de rede aplicado
+    /// a cada salto e um unico prazo para a cadeia inteira.
+    fn resolve(
+        &self,
+        input: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(Url, Response<Body>, Instant)> {
         let mut current = validate_web_url(input)?;
         let started = Instant::now();
         let user_agent = format!(
@@ -149,9 +200,12 @@ impl ReaderClient {
                 &self.public_agent
             };
 
-            let mut response = agent
+            let response = agent
                 .get(current.as_str())
-                .header("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1")
+                .header(
+                    "Accept",
+                    "text/html,application/xhtml+xml,application/pdf;q=0.9,*/*;q=0.1",
+                )
                 .header("User-Agent", user_agent.as_str())
                 .config()
                 .timeout_global(Some(remaining))
@@ -162,86 +216,83 @@ impl ReaderClient {
                 if redirect_count == MAX_REDIRECTS {
                     return Err(NeuralError::RedirectLimit);
                 }
-                let location = response
-                    .headers()
-                    .get("location")
-                    .and_then(|value| value.to_str().ok())
-                    .ok_or_else(|| {
-                        NeuralError::InvalidRedirect("resposta sem cabeçalho Location".into())
-                    })?;
+                let location = header(&response, "location");
+                if location.is_empty() {
+                    return Err(NeuralError::InvalidRedirect(
+                        "resposta sem cabeçalho Location".into(),
+                    ));
+                }
                 current = validate_redirect_target(&current, location)?;
                 continue;
             }
 
-            let content_type = response
-                .headers()
-                .get("content-type")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            let media_type = content_type.split(';').next().unwrap_or("").trim();
-
-            if !media_type.is_empty()
-                && media_type != "text/html"
-                && media_type != "application/xhtml+xml"
-            {
-                return Err(NeuralError::UnsupportedContentType(content_type));
-            }
-
-            if let Some(declared) = response
-                .headers()
-                .get("content-length")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                && declared > self.max_bytes as u64
-            {
-                return Err(NeuralError::ResponseTooLarge {
-                    declared,
-                    limit: self.max_bytes as u64,
-                });
-            }
-
-            // Em blocos, e nao `read_to_string()`, para haver onde desistir:
-            // sem isto uma leitura em curso continua a puxar bytes depois de o
-            // utilizador ja ter voltado a Home.
-            let mut reader = response
-                .body_mut()
-                .with_config()
-                .limit(self.max_bytes as u64)
-                .lossy_utf8(true)
-                .reader();
-
-            let mut body = Vec::new();
-            let mut chunk = [0u8; 16 * 1024];
-            loop {
-                if cancelled() {
-                    return Err(NeuralError::ReaderCancelled);
-                }
-                if started.elapsed() > self.timeout {
-                    return Err(NeuralError::ReaderDeadline);
-                }
-                let read = reader.read(&mut chunk)?;
-                if read == 0 {
-                    break;
-                }
-                body.extend_from_slice(&chunk[..read]);
-            }
-            drop(reader);
-
-            // O BodyReader ja entrega UTF-8 (conversao de charset incluida), por
-            // isso juntamos os blocos e convertemos uma vez so: um caratere
-            // partido entre blocos nao se estraga.
-            let html = String::from_utf8_lossy(&body).into_owned();
-
-            if started.elapsed() > self.timeout {
-                return Err(NeuralError::ReaderDeadline);
-            }
-
-            return extract_article(&current, &html);
+            return Ok((current, response, started));
         }
 
         Err(NeuralError::RedirectLimit)
     }
+
+    /// Le o corpo em blocos, para haver onde desistir e onde verificar o prazo:
+    /// sem isto uma leitura em curso continua a puxar bytes depois de o
+    /// utilizador ja ter voltado a Home.
+    fn read_body(
+        &self,
+        response: &mut Response<Body>,
+        started: Instant,
+        max_bytes: usize,
+        text: bool,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>> {
+        let mut reader = response
+            .body_mut()
+            .with_config()
+            .limit(max_bytes as u64)
+            .lossy_utf8(text)
+            .reader();
+
+        let mut body = Vec::new();
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            if cancelled() {
+                return Err(NeuralError::ReaderCancelled);
+            }
+            if started.elapsed() > self.timeout {
+                return Err(NeuralError::ReaderDeadline);
+            }
+            let read = reader.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..read]);
+        }
+        drop(reader);
+
+        if started.elapsed() > self.timeout {
+            return Err(NeuralError::ReaderDeadline);
+        }
+        Ok(body)
+    }
+}
+
+fn header<'a>(response: &'a Response<Body>, name: &str) -> &'a str {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+}
+
+/// Um `Content-Length` acima do limite e rejeitado antes de se ler um byte.
+fn reject_declared_oversize(response: &Response<Body>, limit: usize) -> Result<()> {
+    if let Ok(declared) = header(response, "content-length").parse::<u64>()
+        && declared > limit as u64
+    {
+        return Err(NeuralError::ResponseTooLarge {
+            declared,
+            limit: limit as u64,
+        });
+    }
+    Ok(())
 }
 
 impl Default for ReaderClient {

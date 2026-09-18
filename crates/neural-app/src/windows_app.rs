@@ -1,6 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use std::{
+    borrow::Cow,
     sync::{
         Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -14,7 +15,7 @@ use image::RgbaImage;
 
 use neural_core::{
     CoreConfig, HistoryEntry, HistoryKind, HistoryStore, Intent, ReaderArticle, ReaderClient,
-    chatgpt_search_url, claude_search_url, google_ai_url, parse_intent, reader_html,
+    chatgpt_search_url, claude_search_url, google_ai_url, is_pdf_url, parse_intent, reader_html,
 };
 use url::Url;
 use windows_sys::Win32::{
@@ -52,7 +53,10 @@ use winit::{
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
     window::{Fullscreen, Icon, Window, WindowId},
 };
-use wry::{NewWindowResponse, PermissionResponse, WebView, WebViewBuilder};
+use wry::{
+    NewWindowResponse, PermissionResponse, WebView, WebViewBuilder,
+    http::{Request, Response as HttpResponse},
+};
 
 #[derive(Debug)]
 enum UserEvent {
@@ -88,6 +92,11 @@ enum UserEvent {
         input: String,
         result: Result<ReaderArticle, String>,
     },
+    PdfReady {
+        generation: u64,
+        url: String,
+        result: Result<Vec<u8>, String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +105,8 @@ enum Surface {
     Reader,
     External,
     Comparator,
+    /// O nosso visualizador de PDF (PDF.js embutido), numa origem nossa.
+    Pdf,
 }
 
 const TOP_BAR_HEIGHT: f64 = 42.0;
@@ -142,6 +153,12 @@ fn splash_buttons(client: &RECT) -> (RECT, RECT) {
 /// ler. Corre no documento e tambem nos frames a que conseguimos chegar.
 const AUTO_SCROLL_SCRIPT: &str = r#"
 (function () {
+  // O nosso visualizador de PDF sabe avancar uma pagina inteira.
+  if (typeof window.__neuralia_next_page === 'function') {
+    window.__neuralia_next_page();
+    return;
+  }
+
   function step(win) {
     try {
       var doc = win.document;
@@ -645,7 +662,9 @@ unsafe extern "system" fn omnibox_subclass(
                 let _ = proxy.send_event(UserEvent::HomeRequested);
                 return 0;
             }
-            0x4C if ctrl => {
+            // Um EDIT de uma linha nao trata Ctrl+A sozinho -- e uma velha
+            // manha do Win32. Ctrl+L faz o mesmo, por ser o habito do Chrome.
+            0x41 | 0x4C if ctrl => {
                 SendMessageW(hwnd, EM_SETSEL, 0, -1);
                 return 0;
             }
@@ -888,6 +907,11 @@ struct App {
     history_store: HistoryStore,
     history: HistoryWriter,
     reader: ReaderWorker,
+    /// Cliente a parte para documentos: prazo e limite maiores do que os do
+    /// Reader, o mesmo filtro de rede.
+    document_client: Arc<ReaderClient>,
+    /// Os bytes do PDF aberto, servidos ao visualizador pela origem propria.
+    pdf_bytes: Arc<Mutex<Vec<u8>>>,
     surface: Surface,
     navigation_generation: Arc<AtomicU64>,
     status: Option<String>,
@@ -908,7 +932,10 @@ impl App {
             Arc::clone(&navigation_generation),
         );
         let omnibox_proxy = Box::new(proxy.clone());
+        let document_client = Arc::new(ReaderClient::new(PDF_TIMEOUT_SECS, PDF_MAX_BYTES));
         Self {
+            document_client,
+            pdf_bytes: Arc::new(Mutex::new(Vec::new())),
             proxy,
             window: None,
             webview: None,
@@ -1303,12 +1330,106 @@ impl App {
 
     fn web(&mut self, url: String) {
         match neural_core::validate_web_url(&url) {
+            Ok(valid) if is_pdf_url(&valid) => self.read_pdf(valid),
             Ok(valid) => {
                 self.next_generation();
                 self.record(HistoryKind::Web, valid.to_string(), valid.to_string());
                 self.open_external(valid.as_str());
             }
             Err(error) => self.show_native_error(error.to_string()),
+        }
+    }
+
+    /// Descarrega o PDF numa thread, com o filtro de rede do Reader, e abre-o
+    /// no visualizador nosso quando chegar. Cancela-se como o Reader: se a
+    /// navegacao mudar entretanto, o resultado e descartado.
+    fn read_pdf(&mut self, url: Url) {
+        let generation = self.next_generation();
+        self.destroy_web_surfaces();
+        self.surface = Surface::Home;
+        self.status = Some(format!(
+            "A descarregar PDF de {} …",
+            url.host_str().unwrap_or("?")
+        ));
+        self.request_redraw();
+
+        let client = Arc::clone(&self.document_client);
+        let proxy = self.proxy.clone();
+        let watch = Arc::clone(&self.navigation_generation);
+        let target = url.to_string();
+        let spawned = thread::Builder::new()
+            .name("neural-pdf".into())
+            .spawn(move || {
+                let result = client
+                    .fetch_document(&target, "application/pdf", PDF_MAX_BYTES, &|| {
+                        watch.load(Ordering::SeqCst) != generation
+                    })
+                    .map_err(|error| error.to_string());
+                let _ = proxy.send_event(UserEvent::PdfReady {
+                    generation,
+                    url: target,
+                    result,
+                });
+            });
+        if spawned.is_err() {
+            self.show_native_error("Não consegui criar a thread para descarregar o PDF.");
+        }
+    }
+
+    fn pdf_webview_builder(&self) -> WebViewBuilder<'static> {
+        let proxy = self.proxy.clone();
+        let bytes = Arc::clone(&self.pdf_bytes);
+
+        WebViewBuilder::new()
+            .with_custom_protocol("neuralia-pdf".to_string(), move |_id, request| {
+                serve_pdf_asset(&bytes, &request)
+            })
+            .with_initialization_script(NEURALIA_KEYMAP_SCRIPT)
+            .with_navigation_handler(move |target| {
+                if let Some(event) = neuralia_action(&target) {
+                    let _ = proxy.send_event(event);
+                    return false;
+                }
+                if target.starts_with(PDF_ORIGIN) || target.starts_with("about:blank") {
+                    return true;
+                }
+                // Ligacoes dentro do PDF abrem como qualquer pagina externa.
+                if neural_core::validate_web_url(&target).is_ok() {
+                    let _ = proxy.send_event(UserEvent::OpenExternal(target));
+                }
+                false
+            })
+            .with_permission_handler(|_| PermissionResponse::Deny)
+            .with_focused(true)
+    }
+
+    fn open_pdf(&mut self, url: &str, bytes: Vec<u8>) {
+        self.destroy_web_surfaces();
+        self.show_omnibox(false);
+
+        if let Ok(mut slot) = self.pdf_bytes.lock() {
+            *slot = bytes;
+        }
+
+        let result = if let Some(window) = &self.window {
+            self.pdf_webview_builder()
+                .with_url(format!("{PDF_ORIGIN}/viewer.html"))
+                .build(window)
+        } else {
+            return;
+        };
+
+        match result {
+            Ok(webview) => {
+                let _ = webview.zoom(self.zoom);
+                self.webview = Some(webview);
+                self.surface = Surface::Pdf;
+                self.record(HistoryKind::Read, url.to_string(), url.to_string());
+                self.begin_reading_session(true);
+            }
+            Err(error) => {
+                self.show_native_error(format!("WebView2 não pôde abrir o PDF: {error}"));
+            }
         }
     }
 
@@ -2021,7 +2142,7 @@ impl App {
         // com a tecla, que e a unica via que funciona em todos eles. Nas tres
         // colunas a tecla so chegaria a uma, por isso ai vai o script.
         match self.surface {
-            Surface::Comparator => {
+            Surface::Comparator | Surface::Pdf => {
                 self.for_each_visible_webview(|webview| {
                     let _ = webview.evaluate_script(AUTO_SCROLL_SCRIPT);
                 });
@@ -2042,6 +2163,13 @@ impl App {
         let Some(hwnd) = window_hwnd(window) else {
             return;
         };
+
+        // A tecla vai para quem tiver o foco. Depois de carregar um PDF o
+        // visualizador nao o toma sozinho -- sem isto o PageDown caia no vazio
+        // e a pagina nao se mexia.
+        if let Some(webview) = &self.webview {
+            let _ = webview.focus();
+        }
 
         unsafe {
             if GetForegroundWindow() != hwnd {
@@ -2370,6 +2498,19 @@ impl ApplicationHandler<UserEvent> for App {
                     self.restore_comparator();
                 }
             }
+            UserEvent::PdfReady {
+                generation,
+                url,
+                result,
+            } => {
+                if generation != self.current_generation() {
+                    return;
+                }
+                match result {
+                    Ok(bytes) => self.open_pdf(&url, bytes),
+                    Err(error) => self.show_native_error(format!("PDF: {error}")),
+                }
+            }
             UserEvent::ReaderReady {
                 generation,
                 input,
@@ -2521,6 +2662,37 @@ fn pin_webview_profile() {
     unsafe {
         std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &profile);
     }
+}
+
+/// Responde a origem do visualizador: os tres ficheiros do PDF.js e o
+/// documento que esta aberto. Tudo em memoria; nada toca no disco.
+fn serve_pdf_asset(
+    bytes: &Arc<Mutex<Vec<u8>>>,
+    request: &Request<Vec<u8>>,
+) -> HttpResponse<Cow<'static, [u8]>> {
+    let path = request.uri().path();
+    let (status, content_type, body): (u16, &str, Cow<'static, [u8]>) = match path {
+        "/viewer.html" | "/" => (
+            200,
+            "text/html; charset=utf-8",
+            Cow::Borrowed(PDF_VIEWER_HTML),
+        ),
+        "/viewer.mjs" => (200, "text/javascript", Cow::Borrowed(PDF_VIEWER_JS)),
+        "/pdf.mjs" => (200, "text/javascript", Cow::Borrowed(PDFJS_CORE)),
+        "/pdf.worker.mjs" => (200, "text/javascript", Cow::Borrowed(PDFJS_WORKER)),
+        "/document.pdf" => {
+            let data = bytes.lock().map(|slot| slot.clone()).unwrap_or_default();
+            (200, "application/pdf", Cow::Owned(data))
+        }
+        _ => (404, "text/plain", Cow::Borrowed(b"not found" as &[u8])),
+    };
+
+    HttpResponse::builder()
+        .status(status)
+        .header("Content-Type", content_type)
+        .header("Cache-Control", "no-store")
+        .body(body)
+        .unwrap_or_else(|_| HttpResponse::new(Cow::Borrowed(b"" as &[u8])))
 }
 
 /// Traduz um `neuralia:<accao>` num evento. E o unico sitio onde a lista de
@@ -2874,6 +3046,20 @@ unsafe fn create_font(height: i32, weight: i32) -> *mut core::ffi::c_void {
 /// (largura, altura, cor de fundo, pixeis BGRX ja compostos)
 type SplashCache = Option<(i32, i32, Rgb, Vec<u8>)>;
 
+/// Visualizador de PDF proprio: o do Edge corre noutro processo e nao aceita
+/// nem script nem teclado nosso; este e uma pagina nossa, com o PDF.js da
+/// Mozilla (Apache-2.0, assets/pdfjs/LICENSE) a desenhar as paginas em canvas.
+const PDF_VIEWER_HTML: &[u8] = include_bytes!("../../../assets/pdfjs/viewer.html");
+const PDF_VIEWER_JS: &[u8] = include_bytes!("../../../assets/pdfjs/viewer.mjs");
+const PDFJS_CORE: &[u8] = include_bytes!("../../../assets/pdfjs/pdf.mjs");
+const PDFJS_WORKER: &[u8] = include_bytes!("../../../assets/pdfjs/pdf.worker.mjs");
+/// No Windows um esquema personalizado `neuralia-pdf` aparece a pagina como
+/// `http://neuralia-pdf.<host>`; o wry intercepta tudo o que comece assim.
+const PDF_ORIGIN: &str = "http://neuralia-pdf.localhost";
+/// Limite para um documento; o do Reader (2 MiB) e para HTML.
+const PDF_MAX_BYTES: usize = 64 * 1024 * 1024;
+const PDF_TIMEOUT_SECS: u64 = 90;
+
 static LOGO_IMAGE: OnceLock<RgbaImage> = OnceLock::new();
 static BRAND_IMAGE: OnceLock<RgbaImage> = OnceLock::new();
 static SPLASH_CACHE: Mutex<SplashCache> = Mutex::new(None);
@@ -2965,9 +3151,8 @@ unsafe fn draw_brand(
     blit_bgrx(hdc, &pixels, x, y, width, height);
 }
 
-/// A arte tem fundo escuro proprio. Em vez de a cortar num retangulo duro,
-/// esbatemos as bordas contra a cor da pagina: no tema escuro desaparece, no
-/// claro fica uma sombra suave em vez de uma caixa.
+/// A arte vem sem fundo (o azul-escuro foi tirado no PNG): compomos o alfa
+/// dela por cima da cor da pagina e nao ha caixa nenhuma, em nenhum tema.
 fn render_brand_pixels(width: i32, height: i32, bg_rgb: Rgb) -> Vec<u8> {
     let image = image::imageops::resize(
         get_brand_image(),
@@ -2976,22 +3161,14 @@ fn render_brand_pixels(width: i32, height: i32, bg_rgb: Rgb) -> Vec<u8> {
         image::imageops::FilterType::Lanczos3,
     );
 
-    let feather = (width.min(height) as f32 * 0.10).max(1.0);
     let mut pixels = Vec::with_capacity((width * height * 4) as usize);
-
-    for py in 0..height {
-        for px in 0..width {
-            let dx = px.min(width - 1 - px) as f32;
-            let dy = py.min(height - 1 - py) as f32;
-            let edge = (dx.min(dy) / feather).clamp(0.0, 1.0);
-            let alpha = edge * edge * (3.0 - 2.0 * edge);
-
-            let pixel = image.get_pixel(px as u32, py as u32);
-            let source = (pixel[3] as f32 / 255.0) * alpha;
+    for py in 0..height as u32 {
+        for px in 0..width as u32 {
+            let pixel = image.get_pixel(px, py);
+            let alpha = pixel[3] as f32 / 255.0;
             let channel = |value: u8, bg: u8| {
-                (value as f32 * source + bg as f32 * (1.0 - source)).round() as u8
+                (value as f32 * alpha + bg as f32 * (1.0 - alpha)).round() as u8
             };
-
             pixels.push(channel(pixel[2], bg_rgb.2));
             pixels.push(channel(pixel[1], bg_rgb.1));
             pixels.push(channel(pixel[0], bg_rgb.0));

@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "neural-app"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "image",
  "neural-core",
@@ -1592,7 +1592,7 @@ dependencies = [
 
 [[package]]
 name = "neural-core"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "scraper",
  "serde",
