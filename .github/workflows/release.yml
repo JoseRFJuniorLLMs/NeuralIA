@@ -1,94 +1,108 @@
 name: Windows release
 
 on:
-  workflow_dispatch:
-  push:
-    branches: [main]
-    tags: ["v*"]
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  tag-stable-version:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+  build:
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      sha: ${{ steps.version.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+        with:
+          components: clippy
+      - id: version
+        name: Resolve release identity from CI-tested source
+        shell: pwsh
+        env:
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          $line = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          $version = $line.Matches[0].Groups[1].Value
+          "tag=v$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "sha=$env:TESTED_SHA" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - run: cargo test --locked -p neural-core
+      - run: cargo clippy --locked -p neural-core --all-targets -- -D warnings
+      - run: cargo clippy --locked -p neural-app -- -D warnings
+      - name: Build exact CI-tested source
+        run: cargo build --locked -p neural-app --release
+      - name: Generate CycloneDX SBOM
+        shell: pwsh
+        run: |
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          cargo cyclonedx --manifest-path crates/neural-app/Cargo.toml --format json --target x86_64-pc-windows-msvc --spec-version 1.5 --override-filename NeuralIA.cdx.json
+      - name: Prepare release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/neural-app.exe dist/NeuralIA.exe
+          Copy-Item crates/neural-app/NeuralIA.cdx.json dist/NeuralIA.cdx.json
+          $hash = (Get-FileHash dist/NeuralIA.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  NeuralIA.exe" | Out-File -Encoding ascii dist/NeuralIA.exe.sha256
+          cargo metadata --locked --format-version 1 --no-deps | Out-File -Encoding utf8 dist/cargo-metadata.json
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/NeuralIA.exe
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: NeuralIA-windows-x64-${{ steps.version.outputs.tag }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.build.outputs.sha }}
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.98.1
-      - name: Lock dependencies and create version tag
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: NeuralIA-windows-x64-${{ needs.build.outputs.tag }}
+          path: dist
+      - name: Create tag and stable release once
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          TESTED_SHA: ${{ needs.build.outputs.sha }}
         run: |
           set -euo pipefail
-          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
-          tag="v$version"
 
-          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
-            echo "$tag already exists; nothing to do."
-            exit 0
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Tag $RELEASE_TAG already exists; refusing to mutate or republish a stable version." >&2
+            exit 1
           fi
-
-          cargo generate-lockfile
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refusing to overwrite stable assets." >&2
+            exit 1
+          fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$RELEASE_TAG" "$TESTED_SHA" -m "NeuralIA $RELEASE_TAG"
+          git push origin "refs/tags/$RELEASE_TAG"
 
-          git add Cargo.lock
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(release): lock dependencies for $tag"
-          fi
-
-          git tag -a "$tag" -m "NeuralIA $tag"
-          git push --atomic origin HEAD:main "refs/tags/$tag"
-
-  publish:
-    needs: tag-stable-version
-    if: always() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.98.1
-      - name: Resolve and checkout release tag
-        shell: pwsh
-        run: |
-          if ($env:GITHUB_REF -like "refs/tags/*") {
-            $tag = $env:GITHUB_REF_NAME
-          } else {
-            $line = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
-            $version = $line.Matches[0].Groups[1].Value
-            $tag = "v$version"
-          }
-          git fetch --tags --force
-          git checkout $tag
-          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Build exact tagged source
-        run: cargo build -p neural-app --release --locked
-      - name: Rename artifact
-        shell: pwsh
-        run: Copy-Item target/release/neural-app.exe target/release/NeuralIA.exe
-      - name: Generate SHA-256
-        shell: pwsh
-        run: |
-          $hash = (Get-FileHash target/release/NeuralIA.exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  NeuralIA.exe" | Out-File -Encoding ascii target/release/NeuralIA.exe.sha256
-      - uses: actions/upload-artifact@v4
-        with:
-          name: NeuralIA-windows-x64
-          path: |
-            target/release/NeuralIA.exe
-            target/release/NeuralIA.exe.sha256
-      - name: Publish GitHub Release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release view "$env:RELEASE_TAG" *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload "$env:RELEASE_TAG" target/release/NeuralIA.exe target/release/NeuralIA.exe.sha256 --clobber
-          } else {
-            gh release create "$env:RELEASE_TAG" target/release/NeuralIA.exe target/release/NeuralIA.exe.sha256 --verify-tag --title "NeuralIA $env:RELEASE_TAG" --generate-notes
-          }
+          gh release create "$RELEASE_TAG" dist/*             --repo "$GITHUB_REPOSITORY"             --verify-tag             --title "NeuralIA $RELEASE_TAG"             --generate-notes

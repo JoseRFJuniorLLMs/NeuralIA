@@ -2,10 +2,14 @@
 
 **Status:** Normative
 
-History is append-only JSON Lines in the application data directory.
+History is local JSON Lines in the application data directory and is bounded by retention.
 
-Each record contains a Unix timestamp, kind (Ask/Read/Web), original input, and resolved target.
+Each record contains a Unix timestamp, kind (Ask/Read/Web), original input, and resolved target. Ask records MUST NOT duplicate the query inside a Google URL target; the target may use a provider identifier such as `google-ai`.
 
-History write failure MUST NOT prevent successful navigation. Corrupt individual lines are skipped during reads.
+Default retention is 250 entries. Appending beyond the limit rewrites only the retained tail while holding a file lock.
 
-The default UI history limit is 250 entries. Cloud synchronization is out of scope.
+History persistence runs on a bounded background writer so `sync_data()` does not block the UI thread. History write failure MUST NOT prevent successful navigation. Corrupt individual lines are skipped during reads.
+
+Ctrl+H shows the 20 most recent local history entries in a native Windows dialog. Ctrl+Shift+Delete clears local history.
+
+Cloud synchronization is out of scope.

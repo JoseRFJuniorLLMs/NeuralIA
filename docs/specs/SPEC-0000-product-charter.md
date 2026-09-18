@@ -1,7 +1,7 @@
 # SPEC-0000 — Product Charter
 
 **Status:** Normative  
-**Version:** 1.0
+**Version:** 1.0.1
 
 ## Thesis
 
@@ -20,8 +20,8 @@ The default distribution MUST NOT ship Chromium/CEF/Electron, a NeuralIA JavaScr
 
 ## Product invariant
 
-Any feature that materially increases idle memory, startup latency, resident background activity, or web-platform scope MUST justify itself against SPEC-0008 before merge.
+Any feature that materially increases idle memory, startup latency, resident background activity, network authority, or web-platform scope MUST justify itself against SPEC-0008 and SPEC-0015 before merge.
 
-## v0.1 done
+## v1 baseline
 
-A Windows user can launch NeuralIA, submit an AI query, read a normal article without executing site JavaScript, explicitly open the full page, return home, and retain local history. Core behavior is tested and the Windows shell compiles in CI.
+A Windows user can launch NeuralIA, use a native omnibox, submit an AI query, read a normal article without executing site JavaScript, explicitly open the full page, return home, retain bounded local history, clear that history, and receive stable releases produced only from CI-green source.

@@ -1,38 +1,54 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use std::thread;
+use std::{
+    sync::{
+        Arc, Condvar, Mutex,
+        mpsc::{SyncSender, sync_channel},
+    },
+    thread,
+};
 
-use arboard::Clipboard;
 use neural_core::{
     CoreConfig, HistoryEntry, HistoryKind, HistoryStore, Intent, ReaderArticle, ReaderClient,
     google_ai_url, parse_intent, reader_html,
 };
-use serde_json::Value;
+use url::Url;
 use windows_sys::Win32::{
-    Foundation::{HWND, RECT},
+    Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
     Graphics::Gdi::{
         CLEARTYPE_QUALITY, CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET,
-        DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+        DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
         DeleteObject, DrawTextW, Ellipse, FW_BOLD, FW_NORMAL, FillRect, GetDC, GetStockObject,
         NULL_PEN, OUT_DEFAULT_PRECIS, PS_SOLID, ReleaseDC, RoundRect, SelectObject, SetBkMode,
         SetTextColor, TRANSPARENT,
     },
-    UI::WindowsAndMessaging::GetClientRect,
+    UI::{
+        Input::KeyboardAndMouse::{GetAsyncKeyState, SetFocus, VK_CONTROL, VK_SHIFT},
+        WindowsAndMessaging::{
+            CreateWindowExW, ES_AUTOHSCROLL, GetClientRect, GetWindowTextLengthW, GetWindowTextW,
+            MB_ICONINFORMATION, MB_OK, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
+            SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow, WM_KEYDOWN, WS_CHILD,
+            WS_EX_CLIENTEDGE, WS_TABSTOP, WS_VISIBLE,
+        },
+    },
 };
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{ElementState, Ime, MouseButton, WindowEvent},
+    event::{ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
     keyboard::{Key, NamedKey},
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
     window::{Window, WindowId},
 };
-use wry::{PermissionResponse, WebView, WebViewBuilder};
+use wry::{NewWindowResponse, PermissionResponse, WebView, WebViewBuilder};
 
 enum UserEvent {
-    Ipc(String),
     HomeRequested,
+    ShowHistory,
+    ClearHistory,
+    SubmitText(String),
+    OpenExternal(String),
     ReaderReady {
         generation: u64,
         input: String,
@@ -45,6 +61,171 @@ enum Surface {
     Home,
     Reader,
     External,
+}
+
+const EM_SETSEL: u32 = 0x00B1;
+const EM_SETLIMITTEXT: u32 = 0x00C5;
+const EM_SETCUEBANNER: u32 = 0x1501;
+const OMNIBOX_SUBCLASS_ID: usize = 0x4E49;
+
+#[link(name = "comctl32")]
+unsafe extern "system" {
+    fn SetWindowSubclass(
+        hwnd: HWND,
+        callback: Option<
+            unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT,
+        >,
+        subclass_id: usize,
+        reference_data: usize,
+    ) -> i32;
+    fn DefSubclassProc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
+}
+
+unsafe extern "system" fn omnibox_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    reference_data: usize,
+) -> LRESULT {
+    if message == WM_KEYDOWN {
+        let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+        let ctrl = (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;
+        let shift = (GetAsyncKeyState(VK_SHIFT as i32) as u16 & 0x8000) != 0;
+
+        match wparam as u32 {
+            13 => {
+                let text = window_text(hwnd);
+                let _ = proxy.send_event(UserEvent::SubmitText(text));
+                return 0;
+            }
+            27 => {
+                SetWindowTextW(hwnd, windows_sys::w!(""));
+                let _ = proxy.send_event(UserEvent::HomeRequested);
+                return 0;
+            }
+            0x4C if ctrl => {
+                SendMessageW(hwnd, EM_SETSEL, 0, -1);
+                return 0;
+            }
+            0x48 if ctrl => {
+                let _ = proxy.send_event(UserEvent::ShowHistory);
+                return 0;
+            }
+            0x2E if ctrl && shift => {
+                let _ = proxy.send_event(UserEvent::ClearHistory);
+                return 0;
+            }
+            _ => {}
+        }
+    }
+
+    DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+unsafe fn window_text(hwnd: HWND) -> String {
+    let length = GetWindowTextLengthW(hwnd);
+    if length <= 0 {
+        return String::new();
+    }
+    let mut buffer = vec![0u16; length as usize + 1];
+    let copied = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+    if copied <= 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&buffer[..copied as usize])
+    }
+}
+
+struct ReaderJob {
+    generation: u64,
+    input: String,
+    url: String,
+}
+
+#[derive(Clone)]
+struct ReaderWorker {
+    pending: Arc<(Mutex<Option<ReaderJob>>, Condvar)>,
+}
+
+impl ReaderWorker {
+    fn new(client: ReaderClient, proxy: EventLoopProxy<UserEvent>) -> Self {
+        let pending = Arc::new((Mutex::new(None::<ReaderJob>), Condvar::new()));
+        let worker_pending = Arc::clone(&pending);
+
+        let _ = thread::Builder::new()
+            .name("neural-reader".into())
+            .spawn(move || {
+                loop {
+                    let job = {
+                        let (lock, wake) = &*worker_pending;
+                        let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        while slot.is_none() {
+                            slot = wake
+                                .wait(slot)
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        }
+                        slot.take().expect("reader job present")
+                    };
+
+                    let result = client.fetch(&job.url).map_err(|error| error.to_string());
+                    let _ = proxy.send_event(UserEvent::ReaderReady {
+                        generation: job.generation,
+                        input: job.input,
+                        result,
+                    });
+                }
+            });
+
+        Self { pending }
+    }
+
+    fn submit(&self, job: ReaderJob) {
+        let (lock, wake) = &*self.pending;
+        let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(job);
+        wake.notify_one();
+    }
+}
+
+enum HistoryCommand {
+    Append(HistoryEntry),
+    Clear,
+}
+
+#[derive(Clone)]
+struct HistoryWriter {
+    tx: SyncSender<HistoryCommand>,
+}
+
+impl HistoryWriter {
+    fn new(store: HistoryStore) -> Self {
+        let (tx, rx) = sync_channel::<HistoryCommand>(64);
+        let _ = thread::Builder::new()
+            .name("neural-history".into())
+            .spawn(move || {
+                while let Ok(command) = rx.recv() {
+                    match command {
+                        HistoryCommand::Append(entry) => {
+                            let _ = store.append(&entry);
+                        }
+                        HistoryCommand::Clear => {
+                            let _ = store.clear();
+                        }
+                    }
+                }
+            });
+        Self { tx }
+    }
+
+    fn append(&self, entry: HistoryEntry) {
+        let _ = self.tx.try_send(HistoryCommand::Append(entry));
+    }
+
+    fn clear(&self) {
+        let _ = self.tx.try_send(HistoryCommand::Clear);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -128,35 +309,41 @@ struct App {
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Window>,
     webview: Option<WebView>,
+    omnibox: Option<HWND>,
+    omnibox_proxy: Box<EventLoopProxy<UserEvent>>,
     config: CoreConfig,
-    history: HistoryStore,
-    reader: ReaderClient,
+    history_store: HistoryStore,
+    history: HistoryWriter,
+    reader: ReaderWorker,
     surface: Surface,
     navigation_generation: u64,
-    input: String,
     status: String,
     cursor: (f64, f64),
-    ctrl_pressed: bool,
 }
 
 impl App {
     fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
         let config = CoreConfig::default();
-        let history = HistoryStore::new(config.data_dir.join("history.jsonl"));
-        let reader = ReaderClient::new(config.reader_timeout_secs, config.reader_max_bytes);
+        let history_store =
+            HistoryStore::with_limit(config.data_dir.join("history.jsonl"), config.history_limit);
+        let history = HistoryWriter::new(history_store.clone());
+        let reader_client = ReaderClient::new(config.reader_timeout_secs, config.reader_max_bytes);
+        let reader = ReaderWorker::new(reader_client, proxy.clone());
+        let omnibox_proxy = Box::new(proxy.clone());
         Self {
             proxy,
             window: None,
             webview: None,
+            omnibox: None,
+            omnibox_proxy,
             config,
+            history_store,
             history,
             reader,
             surface: Surface::Home,
             navigation_generation: 0,
-            input: String::new(),
             status: "WebView2 desligado enquanto você está aqui.".to_string(),
             cursor: (-1.0, -1.0),
-            ctrl_pressed: false,
         }
     }
 
@@ -171,6 +358,91 @@ impl App {
         }
     }
 
+    fn create_omnibox(&mut self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(parent) = window_hwnd(window) else {
+            return;
+        };
+
+        unsafe {
+            let edit = CreateWindowExW(
+                WS_EX_CLIENTEDGE,
+                windows_sys::w!("EDIT"),
+                windows_sys::w!(""),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
+                0,
+                0,
+                100,
+                32,
+                parent,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            if edit.is_null() {
+                return;
+            }
+
+            let cue: Vec<u16> = "Pergunte algo ou cole uma URL"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            SendMessageW(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
+            SendMessageW(edit, EM_SETLIMITTEXT, 2048, 0);
+
+            let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
+            if SetWindowSubclass(edit, Some(omnibox_subclass), OMNIBOX_SUBCLASS_ID, proxy_ptr) == 0
+            {
+                return;
+            }
+
+            self.omnibox = Some(edit);
+            self.position_omnibox();
+            SetFocus(edit);
+        }
+    }
+
+    fn position_omnibox(&self) {
+        let (Some(window), Some(edit)) = (&self.window, self.omnibox) else {
+            return;
+        };
+        let size = window.inner_size();
+        let layout = HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
+        unsafe {
+            SetWindowPos(
+                edit,
+                std::ptr::null_mut(),
+                layout.input.x as i32,
+                layout.input.y as i32,
+                layout.input.width as i32,
+                layout.input.height as i32,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    fn show_omnibox(&self, visible: bool) {
+        let Some(edit) = self.omnibox else {
+            return;
+        };
+        unsafe {
+            ShowWindow(edit, if visible { SW_SHOW } else { SW_HIDE });
+            if visible {
+                SetFocus(edit);
+            }
+        }
+    }
+
+    fn omnibox_text(&self) -> String {
+        self.omnibox
+            .map(|edit| unsafe { window_text(edit) })
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    }
+
     fn destroy_webview(&mut self) {
         if let Some(webview) = self.webview.take() {
             let _ = webview.focus_parent();
@@ -183,6 +455,8 @@ impl App {
         self.destroy_webview();
         self.surface = Surface::Home;
         self.status = "WebView2 desligado enquanto você está aqui.".to_string();
+        self.show_omnibox(true);
+        self.position_omnibox();
         self.request_redraw();
     }
 
@@ -191,7 +465,46 @@ impl App {
         self.destroy_webview();
         self.surface = Surface::Home;
         self.status = message.into();
+        self.show_omnibox(true);
+        self.position_omnibox();
         self.request_redraw();
+    }
+
+    fn show_history(&self) {
+        let text = match self.history_store.recent(20) {
+            Ok(entries) if entries.is_empty() => "Histórico local vazio.".to_string(),
+            Ok(entries) => entries
+                .into_iter()
+                .map(|entry| {
+                    let kind = match entry.kind {
+                        HistoryKind::Ask => "IA",
+                        HistoryKind::Read => "Reader",
+                        HistoryKind::Web => "Web",
+                    };
+                    format!("[{kind}] {}", entry.input)
+                })
+                .collect::<Vec<_>>()
+                .join("\r\n"),
+            Err(error) => format!("Não foi possível ler o histórico: {error}"),
+        };
+
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(hwnd) = window_hwnd(window) else {
+            return;
+        };
+
+        let body = wide_null(&text);
+        let title = wide_null("NeuralIA — Histórico local");
+        unsafe {
+            MessageBoxW(
+                hwnd,
+                body.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
     }
 
     fn handle_input(&mut self, input: String) {
@@ -205,28 +518,28 @@ impl App {
     }
 
     fn submit_current(&mut self) {
-        let input = self.input.trim().to_string();
+        let input = self.omnibox_text();
         if !input.is_empty() {
             self.handle_input(input);
         }
     }
 
     fn ask_current(&mut self) {
-        let query = self.input.trim().to_string();
+        let query = self.omnibox_text();
         if !query.is_empty() {
             self.ask(query);
         }
     }
 
     fn reader_current(&mut self) {
-        let input = self.input.trim().to_string();
+        let input = self.omnibox_text();
         if !input.is_empty() {
             self.handle_input(format!("reader:{input}"));
         }
     }
 
     fn web_current(&mut self) {
-        let input = self.input.trim().to_string();
+        let input = self.omnibox_text();
         if !input.is_empty() {
             self.handle_input(format!("web:{input}"));
         }
@@ -236,7 +549,7 @@ impl App {
         match google_ai_url(&query, &self.config.language) {
             Ok(url) => {
                 self.next_generation();
-                self.record(HistoryKind::Ask, query, url.to_string());
+                self.record(HistoryKind::Ask, query, "google-ai".to_string());
                 self.open_external(url.as_str());
             }
             Err(error) => self.show_native_error(error.to_string()),
@@ -250,17 +563,10 @@ impl App {
         self.status = format!("Lendo {url} …");
         self.request_redraw();
 
-        let proxy = self.proxy.clone();
-        let reader = self.reader.clone();
-        let input = url.clone();
-
-        thread::spawn(move || {
-            let result = reader.fetch(&url).map_err(|error| error.to_string());
-            let _ = proxy.send_event(UserEvent::ReaderReady {
-                generation,
-                input,
-                result,
-            });
+        self.reader.submit(ReaderJob {
+            generation,
+            input: url.clone(),
+            url,
         });
     }
 
@@ -276,30 +582,64 @@ impl App {
     }
 
     fn record(&self, kind: HistoryKind, input: String, target: String) {
-        let _ = self.history.append(&HistoryEntry::now(kind, input, target));
+        self.history.append(HistoryEntry::now(kind, input, target));
     }
 
     fn reader_webview_builder(&self) -> WebViewBuilder<'static> {
         let proxy = self.proxy.clone();
         WebViewBuilder::new()
-            .with_ipc_handler(move |request| {
-                let _ = proxy.send_event(UserEvent::Ipc(request.body().clone()));
+            .with_navigation_handler(move |target| {
+                if target.starts_with("about:blank") {
+                    return true;
+                }
+
+                let Ok(action_url) = Url::parse(&target) else {
+                    return false;
+                };
+                if action_url.scheme() != "neuralia" {
+                    return false;
+                }
+
+                match action_url.path().trim_matches('/') {
+                    "home" => {
+                        let _ = proxy.send_event(UserEvent::HomeRequested);
+                    }
+                    "web" => {
+                        if let Some((_, value)) =
+                            action_url.query_pairs().find(|(key, _)| key == "url")
+                            && neural_core::validate_web_url(value.as_ref()).is_ok()
+                        {
+                            let _ = proxy.send_event(UserEvent::OpenExternal(value.into_owned()));
+                        }
+                    }
+                    _ => {}
+                }
+
+                false
             })
             .with_permission_handler(|_| PermissionResponse::Deny)
             .with_focused(true)
     }
 
     fn external_webview_builder(&self) -> WebViewBuilder<'static> {
-        let proxy = self.proxy.clone();
+        let navigation_proxy = self.proxy.clone();
+        let new_window_proxy = self.proxy.clone();
+
         WebViewBuilder::new()
             .with_initialization_script(EXTERNAL_RETURN_BUTTON)
             .with_navigation_handler(move |target| {
                 if target.eq_ignore_ascii_case("neuralia:home") {
-                    let _ = proxy.send_event(UserEvent::HomeRequested);
+                    let _ = navigation_proxy.send_event(UserEvent::HomeRequested);
                     return false;
                 }
 
                 target.starts_with("about:blank") || neural_core::validate_web_url(&target).is_ok()
+            })
+            .with_new_window_req_handler(move |target, _features| {
+                if neural_core::validate_web_url(&target).is_ok() {
+                    let _ = new_window_proxy.send_event(UserEvent::OpenExternal(target));
+                }
+                NewWindowResponse::Deny
             })
             .with_permission_handler(|_| PermissionResponse::Deny)
             .with_focused(true)
@@ -307,6 +647,7 @@ impl App {
 
     fn open_external(&mut self, url: &str) {
         self.destroy_webview();
+        self.show_omnibox(false);
 
         let result = if let Some(window) = &self.window {
             self.external_webview_builder().with_url(url).build(window)
@@ -327,6 +668,7 @@ impl App {
 
     fn open_reader(&mut self, article: &ReaderArticle) {
         self.destroy_webview();
+        self.show_omnibox(false);
         let html = reader_html(article);
 
         let result = if let Some(window) = &self.window {
@@ -343,53 +685,6 @@ impl App {
             Err(error) => {
                 self.show_native_error(format!("WebView2 não pôde exibir o Reader: {error}"));
             }
-        }
-    }
-
-    fn handle_ipc(&mut self, raw: String) {
-        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-            return;
-        };
-        let action = value.get("action").and_then(Value::as_str).unwrap_or("");
-
-        if self.surface != Surface::Reader {
-            return;
-        }
-
-        let input = value
-            .get("value")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-
-        match action {
-            "home" => self.show_home(),
-            "web" if self.surface == Surface::Reader && !input.is_empty() => {
-                self.handle_input(format!("web:{input}"));
-            }
-            _ => {}
-        }
-    }
-
-    fn append_text(&mut self, text: &str) {
-        if self.input.chars().count() >= 2048 {
-            return;
-        }
-        for ch in text.chars().filter(|ch| !ch.is_control()) {
-            if self.input.chars().count() >= 2048 {
-                break;
-            }
-            self.input.push(ch);
-        }
-        self.request_redraw();
-    }
-
-    fn paste(&mut self) {
-        if let Ok(mut clipboard) = Clipboard::new()
-            && let Ok(text) = clipboard.get_text()
-        {
-            self.append_text(&text);
         }
     }
 
@@ -411,45 +706,6 @@ impl App {
             self.web_current();
         }
     }
-
-    fn handle_home_key(&mut self, event: &winit::event::KeyEvent) {
-        if event.state != ElementState::Pressed {
-            return;
-        }
-
-        if self.ctrl_pressed
-            && let Key::Character(value) = &event.logical_key
-        {
-            if value.eq_ignore_ascii_case("v") {
-                self.paste();
-                return;
-            }
-            if value.eq_ignore_ascii_case("l") {
-                self.input.clear();
-                self.request_redraw();
-                return;
-            }
-        }
-
-        match &event.logical_key {
-            Key::Named(NamedKey::Enter) => self.submit_current(),
-            Key::Named(NamedKey::Backspace) => {
-                self.input.pop();
-                self.request_redraw();
-            }
-            Key::Named(NamedKey::Escape) => {
-                self.input.clear();
-                self.status = "WebView2 desligado enquanto você está aqui.".to_string();
-                self.request_redraw();
-            }
-            _ if !self.ctrl_pressed => {
-                if let Some(text) = &event.text {
-                    self.append_text(text);
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -467,6 +723,7 @@ impl ApplicationHandler<UserEvent> for App {
             Ok(window) => {
                 window.set_ime_allowed(true);
                 self.window = Some(window);
+                self.create_omnibox();
                 self.request_redraw();
             }
             Err(error) => {
@@ -478,8 +735,22 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Ipc(raw) => self.handle_ipc(raw),
             UserEvent::HomeRequested => self.show_home(),
+            UserEvent::ShowHistory => self.show_history(),
+            UserEvent::ClearHistory => {
+                self.history.clear();
+                self.status = "Histórico local apagado.".to_string();
+                self.show_home();
+            }
+            UserEvent::SubmitText(input) => {
+                if self.surface == Surface::Home {
+                    let input = input.trim().to_string();
+                    if !input.is_empty() {
+                        self.handle_input(input);
+                    }
+                }
+            }
+            UserEvent::OpenExternal(url) => self.web(url),
             UserEvent::ReaderReady {
                 generation,
                 input,
@@ -509,10 +780,13 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested if self.surface == Surface::Home => {
                 if let Some(window) = &self.window {
-                    draw_home(window, &self.input, &self.status);
+                    draw_home(window, &self.status);
                 }
             }
-            WindowEvent::Resized(_) if self.surface == Surface::Home => self.request_redraw(),
+            WindowEvent::Resized(_) if self.surface == Surface::Home => {
+                self.position_omnibox();
+                self.request_redraw();
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
             }
@@ -521,15 +795,6 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } if self.surface == Surface::Home => self.click_home(),
-            WindowEvent::ModifiersChanged(modifiers) => {
-                self.ctrl_pressed = modifiers.state().control_key();
-            }
-            WindowEvent::Ime(Ime::Commit(text)) if self.surface == Surface::Home => {
-                self.append_text(&text);
-            }
-            WindowEvent::KeyboardInput { event, .. } if self.surface == Surface::Home => {
-                self.handle_home_key(&event);
-            }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state.is_pressed()
                     && matches!(event.logical_key, Key::Named(NamedKey::Escape)) =>
@@ -549,7 +814,19 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn draw_home(window: &Window, input: &str, status: &str) {
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn window_hwnd(window: &Window) -> Option<HWND> {
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return None;
+    };
+    Some(handle.hwnd.get() as HWND)
+}
+
+fn draw_home(window: &Window, status: &str) {
     let Ok(handle) = window.window_handle() else {
         return;
     };
@@ -621,7 +898,6 @@ fn draw_home(window: &Window, input: &str, status: &str) {
             DT_CENTER | DT_SINGLELINE | DT_VCENTER,
         );
 
-        draw_input(hdc, layout.input, input, scale, body_font);
         draw_button(hdc, layout.go, "Ir", true, scale, body_font);
         draw_button(hdc, layout.ask, "IA", false, scale, small_font);
         draw_button(hdc, layout.reader, "Reader", false, scale, small_font);
@@ -637,7 +913,7 @@ fn draw_home(window: &Window, input: &str, status: &str) {
         };
         draw_text(
             hdc,
-            "Texto → Google AI   ·   URL → Reader   ·   Ctrl+V cola   ·   web: força página completa",
+            "Texto → Google AI · URL → Reader · Ctrl+H histórico · Ctrl+Shift+Del limpa",
             &mut help_rect,
             DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
@@ -708,61 +984,6 @@ unsafe fn draw_logo(hdc: *mut core::ffi::c_void, x: i32, y: i32, size: i32) {
     SelectObject(hdc, old_pen);
     DeleteObject(black as _);
     DeleteObject(white as _);
-}
-
-unsafe fn draw_input(
-    hdc: *mut core::ffi::c_void,
-    rect: UiRect,
-    input: &str,
-    scale: f64,
-    font: *mut core::ffi::c_void,
-) {
-    let white = CreateSolidBrush(rgb(255, 255, 255));
-    let border = CreatePen(PS_SOLID, (1.0 * scale) as i32, rgb(210, 214, 220));
-    let old_brush = SelectObject(hdc, white as _);
-    let old_pen = SelectObject(hdc, border as _);
-
-    RoundRect(
-        hdc,
-        rect.x as i32,
-        rect.y as i32,
-        (rect.x + rect.width) as i32,
-        (rect.y + rect.height) as i32,
-        (16.0 * scale) as i32,
-        (16.0 * scale) as i32,
-    );
-
-    SelectObject(hdc, font as _);
-    let display = if input.is_empty() {
-        "Pergunte algo ou cole uma URL".to_string()
-    } else {
-        format!("{input}│")
-    };
-    SetTextColor(
-        hdc,
-        if input.is_empty() {
-            rgb(135, 139, 146)
-        } else {
-            rgb(23, 25, 27)
-        },
-    );
-    let mut text_rect = RECT {
-        left: (rect.x + 18.0 * scale) as i32,
-        top: rect.y as i32,
-        right: (rect.x + rect.width - 16.0 * scale) as i32,
-        bottom: (rect.y + rect.height) as i32,
-    };
-    draw_text(
-        hdc,
-        &display,
-        &mut text_rect,
-        DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
-    );
-
-    SelectObject(hdc, old_brush);
-    SelectObject(hdc, old_pen);
-    DeleteObject(white as _);
-    DeleteObject(border as _);
 }
 
 unsafe fn draw_button(

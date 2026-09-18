@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use url::{Host, Url};
 
 use crate::{NeuralError, Result};
@@ -19,12 +21,7 @@ pub fn validate_web_url(input: &str) -> Result<Url> {
     Ok(url)
 }
 
-/// Resolves and validates an HTTP redirect before the next network request.
-///
-/// A page that starts on the public Internet is not allowed to bounce Reader
-/// into obvious loopback/private/link-local targets. Direct user navigation to
-/// a local HTTP(S) service remains possible; the protection is specifically
-/// against hostile public -> local redirects.
+/// Resolve and validate an HTTP redirect before the next network request.
 pub fn validate_redirect_target(previous: &Url, location: &str) -> Result<Url> {
     let joined = previous
         .join(location)
@@ -39,19 +36,11 @@ pub fn validate_redirect_target(previous: &Url, location: &str) -> Result<Url> {
     Ok(next)
 }
 
+/// True for obvious local/special URL targets before DNS resolution.
 pub fn is_local_network_target(url: &Url) -> bool {
     match url.host() {
-        Some(Host::Ipv4(ip)) => is_local_ipv4(ip.octets()),
-        Some(Host::Ipv6(ip)) => {
-            if ip.is_loopback() || ip.is_unspecified() {
-                return true;
-            }
-            if let Some(mapped) = ip.to_ipv4_mapped() {
-                return is_local_ipv4(mapped.octets());
-            }
-            let first = ip.segments()[0];
-            (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
-        }
+        Some(Host::Ipv4(ip)) => is_forbidden_ip(IpAddr::V4(ip)),
+        Some(Host::Ipv6(ip)) => is_forbidden_ip(IpAddr::V6(ip)),
         Some(Host::Domain(domain)) => {
             let domain = domain.trim_end_matches('.').to_ascii_lowercase();
             domain == "localhost" || domain.ends_with(".localhost") || domain.ends_with(".local")
@@ -60,19 +49,50 @@ pub fn is_local_network_target(url: &Url) -> bool {
     }
 }
 
-fn is_local_ipv4([a, b, _, _]: [u8; 4]) -> bool {
-    a == 0
-        || a == 10
-        || a == 127
-        || (a == 100 && (64..=127).contains(&b))
-        || (a == 169 && b == 254)
-        || (a == 172 && (16..=31).contains(&b))
-        || (a == 192 && b == 168)
-        || (a == 198 && (b == 18 || b == 19))
+/// Reject addresses that are not globally routable Internet destinations.
+///
+/// This is deliberately conservative for Reader mode: loopback, private,
+/// link-local, carrier-grade NAT, documentation, benchmarking, multicast and
+/// reserved address space are not valid targets for an untrusted public page.
+pub fn is_forbidden_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            a == 0
+                || a == 10
+                || a == 127
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 169 && b == 254)
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 0 && c == 2)
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 192 && b == 168)
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113)
+                || a >= 224
+        }
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_forbidden_ip(IpAddr::V4(mapped));
+            }
+
+            let segments = ip.segments();
+            ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
     use super::*;
 
     #[test]
@@ -111,6 +131,21 @@ mod tests {
         assert!(!is_local_network_target(
             &Url::parse("https://example.com/").unwrap()
         ));
+    }
+
+    #[test]
+    fn rejects_special_resolved_addresses() {
+        for ip in [
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            "2001:db8::1".parse().unwrap(),
+        ] {
+            assert!(is_forbidden_ip(ip), "{ip}");
+        }
+        assert!(!is_forbidden_ip("8.8.8.8".parse().unwrap()));
+        assert!(!is_forbidden_ip("2606:4700:4700::1111".parse().unwrap()));
     }
 
     #[test]

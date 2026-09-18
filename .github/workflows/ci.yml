@@ -11,32 +11,48 @@ jobs:
   core:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
         with:
           components: clippy,rustfmt
       - run: cargo fmt --all -- --check
-      - run: cargo test -p neural-core
-      - run: cargo clippy -p neural-core --all-targets -- -D warnings
+      - run: cargo test --locked -p neural-core
+      - run: cargo clippy --locked -p neural-core --all-targets -- -D warnings
 
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
         with:
           components: clippy,rustfmt
-      - run: cargo check --workspace
-      - run: cargo test -p neural-core
-      - run: cargo clippy -p neural-app -- -D warnings
-      - run: cargo build -p neural-app --release
+      - run: cargo check --locked --workspace
+      - run: cargo test --locked -p neural-core
+      - run: cargo clippy --locked -p neural-app -- -D warnings
+      - run: cargo build --locked -p neural-app --release
+      - name: Native Home performance regression gate
+        shell: pwsh
+        run: ./scripts/measure-home.ps1 -ExePath target/release/neural-app.exe -OutputPath perf-home.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: neuralia-home-performance
+          path: perf-home.json
+          if-no-files-found: error
 
   dependency-audit:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.1
-      - run: cargo generate-lockfile
-      - uses: rustsec/audit-check@v2.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
