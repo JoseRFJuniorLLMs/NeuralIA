@@ -198,7 +198,7 @@ const AUTO_SCROLL_TOAST: &str = r#"
     el.id = id;
     document.documentElement.appendChild(el);
   }
-  el.textContent = on ? 'Rolagem automatica ligada — 20s (F8 desliga)' : 'Rolagem automatica desligada';
+  el.textContent = on ? 'Rolagem automatica ligada — __SECONDS__s (F8 desliga)' : 'Rolagem automatica desligada';
   el.setAttribute('style', [
     'position:fixed', 'left:50%', 'bottom:24px', 'transform:translateX(-50%)',
     'z-index:2147483647', 'padding:10px 18px', 'border-radius:999px',
@@ -2026,6 +2026,7 @@ impl App {
     /// pagina: assim sobrevive a navegacao dentro do site.
     fn toggle_auto_scroll(&mut self) {
         SPLASH_ASKS.store(false, Ordering::SeqCst);
+        self.splash_question_token = None;
         self.auto_scroll_answered = true;
         self.auto_scroll = !self.auto_scroll;
         self.auto_scroll_token = self.auto_scroll_token.wrapping_add(1);
@@ -2051,8 +2052,9 @@ impl App {
     /// Mostra na propria pagina em que estado esta a rolagem. A barra nativa
     /// tambem o diz, mas em ecra completo ela esconde-se.
     fn announce_auto_scroll(&self) {
-        let toast =
-            AUTO_SCROLL_TOAST.replace("__ON__", if self.auto_scroll { "true" } else { "false" });
+        let toast = AUTO_SCROLL_TOAST
+            .replace("__ON__", if self.auto_scroll { "true" } else { "false" })
+            .replace("__SECONDS__", &AUTO_SCROLL_SECONDS.to_string());
         self.for_each_visible_webview(|webview| {
             let _ = webview.evaluate_script(&toast);
         });
@@ -2060,6 +2062,10 @@ impl App {
 
     /// Aviso flutuante, centrado no fundo da janela, que se apaga sozinho.
     fn show_splash(&mut self, text: String, seconds: u64) {
+        self.show_splash_kind(text, seconds, false);
+    }
+
+    fn show_splash_kind(&mut self, text: String, seconds: u64, question: bool) {
         let Some(window) = &self.window else {
             return;
         };
@@ -2070,6 +2076,7 @@ impl App {
         let width = (SPLASH_WIDTH * scale).round() as i32;
         let height = (SPLASH_HEIGHT * scale).round() as i32;
 
+        SPLASH_ASKS.store(question, Ordering::SeqCst);
         if let Ok(mut slot) = SPLASH_TEXT.lock() {
             *slot = text;
         }
@@ -2136,19 +2143,29 @@ impl App {
 
         self.splash_token = self.splash_token.wrapping_add(1);
         let token = self.splash_token;
-        let proxy = self.proxy.clone();
-        let _ = thread::Builder::new()
-            .name("neural-splash".into())
-            .spawn(move || {
-                thread::sleep(Duration::from_secs(seconds));
-                let _ = proxy.send_event(UserEvent::HideSplash(token));
-            });
+        self.splash_question_token = question.then_some(token);
+        self.splash_watch_token.store(token, Ordering::SeqCst);
+        self.splash_deadline.store(
+            now_ms().saturating_add(seconds.saturating_mul(1000)),
+            Ordering::SeqCst,
+        );
     }
 
     fn hide_splash(&mut self, token: u64) {
         if token != self.splash_token {
             return;
         }
+
+        self.splash_deadline.store(0, Ordering::SeqCst);
+        if self.splash_question_token == Some(token) {
+            // Timeout equivale a "Nao": a pergunta foi respondida e nao volta a
+            // contaminar splashes informativos com botoes Sim/Nao.
+            self.splash_question_token = None;
+            self.auto_scroll_answered = true;
+            self.auto_scroll = false;
+            SPLASH_ASKS.store(false, Ordering::SeqCst);
+        }
+
         if let Some(splash) = self.splash.take() {
             unsafe {
                 DestroyWindow(splash);
@@ -2179,10 +2196,10 @@ impl App {
     }
 
     fn ask_auto_scroll(&mut self) {
-        SPLASH_ASKS.store(true, Ordering::SeqCst);
-        self.show_splash(
+        self.show_splash_kind(
             format!("Rolar a página sozinho a cada {AUTO_SCROLL_SECONDS}s?"),
             AUTO_SCROLL_PROMPT_SECONDS,
+            true,
         );
     }
 
@@ -2190,6 +2207,7 @@ impl App {
     /// ate a pessoa carregar em F8.
     fn answer_auto_scroll(&mut self, yes: bool) {
         SPLASH_ASKS.store(false, Ordering::SeqCst);
+        self.splash_question_token = None;
         self.auto_scroll_answered = true;
         self.auto_scroll = yes;
         self.hide_splash(self.splash_token);
@@ -2239,6 +2257,13 @@ impl App {
     }
 
     fn reload_page(&mut self) {
+        // O PDF e entregue one-shot ao protocolo interno para nao manter uma
+        // segunda copia de ate 64 MiB em Rust. Recarregar a pagina exigiria
+        // duplicar de novo o documento; o viewer ja mantem o PDF carregado.
+        if self.surface == Surface::Pdf {
+            self.show_splash("O PDF já está carregado; a recarga foi ignorada.".to_string(), 3);
+            return;
+        }
         self.for_each_visible_webview(|webview| {
             let _ = webview.reload();
         });
