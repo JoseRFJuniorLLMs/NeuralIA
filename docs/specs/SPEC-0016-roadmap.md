@@ -2,17 +2,19 @@
 
 **Status:** Normative planning document
 
-## Phase 1 — Foundation (v0.1)
+## Phase 1 — Foundation (complete)
 
-Rust workspace, intent engine, Google AI routing, Reader, safe renderer, local history, one system WebView, CI, logo, and specifications.
+Rust workspace, intent engine, Google AI routing, Reader, safe renderer, local history, logo, CI, and specifications.
 
-## Phase 2 — Actually light
+## Phase 2 — Actually light (implemented, measurement pending)
 
-Replace the WebView-rendered home shell with native Windows controls. Create WebView2 lazily. Measure cold start, idle RSS, and first-query latency. Enforce SPEC-0008 with benchmarks.
+Native Windows home/omnibox, zero WebView instances while idle, lazy WebView creation, one-WebView ceiling, IPC isolation, navigation-generation cancellation, and size-oriented release profile.
+
+Remaining work in this phase is empirical: measure cold start, idle RSS, first-query latency, and Reader latency and enforce SPEC-0008 with benchmark gates.
 
 ## Phase 3 — Reader quality
 
-Improve Readability scoring, preserve safe links/images, join article pagination when explicit, improve code blocks, add print/export, and build fixtures from news/docs/blog sites.
+Improve Readability scoring, preserve safe links/images, join article pagination when explicit, improve code blocks, add print/export, and build fixtures from diverse news/docs/blog sites.
 
 ## Phase 4 — Distribution
 

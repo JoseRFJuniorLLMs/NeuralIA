@@ -4,8 +4,21 @@
 
 NeuralIA uses the platform web engine and does not distribute a full browser engine.
 
-On Windows the adapter is WRY backed by Microsoft Edge WebView2. A single WebView instance is the v0.1 ceiling.
+On Windows the adapter is WRY backed by Microsoft Edge WebView2.
 
-v0.1 creates one WebView at startup. v0.2 SHOULD create it lazily after the first operation that needs HTML/web content and MAY suspend or destroy it after an idle threshold only when benchmarks show a material benefit.
+## Lifecycle invariant
 
-External pages receive a small NeuralIA return affordance. Future target=_blank/window.open behavior SHOULD reuse the current view or explicitly hand off to the system browser rather than multiply WebViews.
+The native home screen MUST NOT instantiate WebView2.
+
+A WebView is created only for:
+- Google AI Mode;
+- Reader HTML;
+- explicit Full Web mode.
+
+Only one WebView may exist at a time. Returning to Home drops the WebView and returns focus to the native window.
+
+## IPC
+
+Reader content may request Home or explicit opening of its original source. External web pages receive only a return-to-NeuralIA capability. They MUST NOT be allowed to trigger privileged Reader/native-network actions through IPC.
+
+New-window behavior SHOULD reuse the current view or explicitly hand off to the system browser rather than multiply WebViews.

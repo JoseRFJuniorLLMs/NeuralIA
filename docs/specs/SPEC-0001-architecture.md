@@ -4,8 +4,9 @@
 
 ```text
 neural-app
-   ├── home / omnibox shell
-   ├── system WebView adapter
+   ├── native Windows home/omnibox
+   ├── lazy system WebView adapter
+   ├── lightweight GDI presentation
    └── event routing
           │
           ▼
@@ -20,8 +21,8 @@ neural-core
 
 `neural-core` MUST NOT depend on UI, WRY, WebView2, Win32, or platform GUI libraries. Dependency direction is one-way from app to core.
 
-Windows full-web rendering uses the operating-system WebView2 runtime through WRY. The repository MUST NOT vendor Chromium binaries.
+The Windows home surface is drawn natively and does not create WebView2. AI, Reader, and Full Web create at most one system WebView on demand. Returning Home destroys that WebView.
 
-Blocking Reader work runs away from the UI thread. Results re-enter through the GUI event loop.
+Blocking Reader work runs away from the UI thread. Results re-enter through the GUI event loop and carry a navigation generation; stale results are discarded.
 
-v0.1 uses one system WebView for shell and content. v0.2 SHOULD move the home/omnibox shell to native controls and create the WebView lazily, without changing `neural-core`.
+External pages have an intentionally reduced IPC capability: they may return Home, but may not command Reader or arbitrary native navigation.
