@@ -15,10 +15,14 @@ A WebView is created only for:
 - Reader HTML;
 - explicit Full Web mode.
 
-Only one WebView may exist at a time. Returning to Home drops the WebView and returns focus to the native window.
+Only one WebView may exist at a time. Returning to Home drops that WebView and returns focus to the native window.
 
-## IPC
+## Native bridge boundary
 
-Reader content may request Home or explicit opening of its original source. External web pages receive only a return-to-NeuralIA capability. They MUST NOT be allowed to trigger privileged Reader/native-network actions through IPC.
+Reader and external pages receive no NeuralIA IPC object.
 
-New-window behavior SHOULD reuse the current view or explicitly hand off to the system browser rather than multiply WebViews.
+Reader buttons navigate to the internal `neuralia:` action scheme, which is intercepted before navigation. External pages receive only a controlled return-to-Home navigation button injected by the app.
+
+New-window requests MUST NOT create a second WebView. Valid HTTP(S) targets are routed into the existing Full Web surface; other targets are denied.
+
+New WebView permission requests are denied by default.
