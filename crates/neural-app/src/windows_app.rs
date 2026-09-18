@@ -4061,14 +4061,23 @@ const fn rgb3(color: Rgb) -> u32 {
 const NEURALIA_KEYMAP_SCRIPT: &str = r#"
 (function () {
   if (window.__neuralia_keymap) { return; }
-  window.__neuralia_keymap = true;
+  Object.defineProperty(window, '__neuralia_keymap', { value: true, configurable: false });
+  const token = '__TOKEN__';
 
-  function act(name) { window.location.href = 'neuralia:' + name; }
+  function act(name, extra) {
+    let url = 'neuralia:' + name + '?token=' + encodeURIComponent(token);
+    if (extra) { url += '&' + extra; }
+    window.location.href = url;
+  }
 
   function findBar() {
     var id = 'neuralia-find';
     var box = document.getElementById(id);
-    if (box) { box.querySelector('input').focus(); box.querySelector('input').select(); return; }
+    if (box) {
+      var existing = box.querySelector('input');
+      if (existing) { existing.focus(); existing.select(); }
+      return;
+    }
 
     box = document.createElement('div');
     box.id = id;
@@ -4091,9 +4100,13 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     var close = document.createElement('span');
     close.textContent = '\u2715';
     close.setAttribute('style', 'color:#9aa1a8;cursor:pointer');
-    close.onclick = function () { box.remove(); };
+    close.addEventListener('click', function (e) {
+      if (!e.isTrusted) { return; }
+      box.remove();
+    });
 
     input.addEventListener('keydown', function (e) {
+      if (!e.isTrusted) { return; }
       e.stopPropagation();
       if (e.key === 'Enter') {
         e.preventDefault();
@@ -4111,10 +4124,20 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
   }
 
   document.addEventListener('keydown', function (e) {
+    if (!e.isTrusted) { return; }
+
     var mod = e.ctrlKey || e.metaKey;
     var key = (e.key || '').toLowerCase();
+    var target = e.target || {};
 
-    // Combinacoes com Ctrl valem mesmo dentro de um campo de texto.
+    if (key === 'escape' && target.closest && target.closest('#neuralia-find')) {
+      e.preventDefault();
+      e.stopPropagation();
+      var find = document.getElementById('neuralia-find');
+      if (find) { find.remove(); }
+      return;
+    }
+
     if (mod && !e.altKey) {
       if (e.shiftKey && key === 'delete') { e.preventDefault(); act('clearhistory'); return; }
       if (e.shiftKey && key === 'r') { e.preventDefault(); act('reload'); return; }
@@ -4144,7 +4167,6 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     if (key === 'f11') { e.preventDefault(); act('fullscreen'); return; }
     if (key === 'escape') { e.preventDefault(); e.stopPropagation(); act('back'); return; }
 
-    var target = e.target || {};
     var tag = (target.tagName || '').toUpperCase();
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable) {
       return;
@@ -4155,7 +4177,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     if (key === '1' || key === '2' || key === '3') {
       if (typeof window.__neuralia_col_index === 'number') {
         e.preventDefault();
-        window.location.href = 'neuralia:expand?col=' + (parseInt(key, 10) - 1);
+        act('expand', 'col=' + (parseInt(key, 10) - 1));
       }
       return;
     }
@@ -4175,6 +4197,7 @@ const COMPARATOR_BUTTON_COLLAPSED: &str = "(function(){var w=document.querySelec
 const EXTERNAL_RETURN_BUTTON: &str = r#"
 document.addEventListener('DOMContentLoaded', () => {
   if (document.getElementById('neural-shell') || document.getElementById('neuralia-return')) return;
+  const token = '__TOKEN__';
   const b = document.createElement('button');
   b.id = 'neuralia-return';
   b.textContent = '◀ NeuralIA';
@@ -4184,71 +4207,201 @@ document.addEventListener('DOMContentLoaded', () => {
     background:'#111314', color:'#fff', font:'600 13px Segoe UI, sans-serif',
     boxShadow:'0 6px 24px rgba(0,0,0,.25)', cursor:'pointer'
   });
-  b.addEventListener('click', () => { window.location.href = 'neuralia:home'; });
+  b.addEventListener('click', (e) => {
+    if (!e.isTrusted) return;
+    window.location.href = 'neuralia:home?token=' + encodeURIComponent(token);
+  });
   document.documentElement.appendChild(b);
-
 });
 "#;
 
 const COMPARATOR_INJECT_SCRIPT: &str = r#"
 document.addEventListener('DOMContentLoaded', () => {
   if (document.getElementById('neuralia-comp-btn')) return;
+  const token = '__TOKEN__';
   const colIndex = window.__neuralia_col_index ?? 0;
   const colName = window.__neuralia_col_name ?? 'IA';
+
+  function nativeAction(name, extra) {
+    let url = 'neuralia:' + name + '?token=' + encodeURIComponent(token);
+    if (extra) url += '&' + extra;
+    window.location.href = url;
+  }
 
   const wrap = document.createElement('div');
   wrap.id = 'neuralia-comp-btn';
   Object.assign(wrap.style, {
-    position: 'fixed',
-    top: '10px',
-    right: '12px',
-    zIndex: '2147483647',
-    display: 'flex',
-    gap: '6px',
-    fontFamily: 'Segoe UI, -apple-system, BlinkMacSystemFont, sans-serif'
+    position:'fixed', top:'10px', right:'46px', zIndex:'2147483647',
+    display:'flex', gap:'6px',
+    fontFamily:'Segoe UI, -apple-system, BlinkMacSystemFont, sans-serif'
   });
 
   const btn = document.createElement('button');
   btn.textContent = '⛶ Expandir ' + colName;
   Object.assign(btn.style, {
-    border: '0',
-    borderRadius: '6px',
-    padding: '6px 12px',
-    background: '#111314',
-    color: '#ffffff',
-    fontSize: '11px',
-    fontWeight: '600',
-    boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
-    cursor: 'pointer',
-    opacity: '0.9',
-    transition: 'transform 0.15s ease'
+    border:'0', borderRadius:'6px', padding:'6px 12px',
+    background:'#111314', color:'#ffffff', fontSize:'11px',
+    fontWeight:'600', boxShadow:'0 4px 12px rgba(0,0,0,0.3)',
+    cursor:'pointer', opacity:'0.9', transition:'transform 0.15s ease'
   });
   btn.onmouseover = () => { btn.style.transform = 'scale(1.05)'; };
   btn.onmouseout = () => { btn.style.transform = 'scale(1)'; };
-  btn.onclick = (e) => {
+  btn.addEventListener('click', (e) => {
+    if (!e.isTrusted) return;
     e.preventDefault();
     e.stopPropagation();
-    window.location.href = 'neuralia:expand?col=' + colIndex;
-  };
+    nativeAction('expand', 'col=' + colIndex);
+  });
   wrap.appendChild(btn);
-
   document.documentElement.appendChild(wrap);
 
-  // Duplo clique em qualquer sitio do painel expande essa coluna. Tem de ser
-  // duplo: com clique simples era impossivel usar a pagina -- nem iniciar
-  // sessao, nem escrever uma pergunta.
+  // Trilha vertical discreta, inspirada em uma linha do tempo. Cada WebView
+  // recebe a sua propria instancia e portanto rola sem afetar as outras duas.
+  const style = document.createElement('style');
+  style.id = 'neuralia-scroll-style';
+  style.textContent =
+    '.neuralia-scroll-target{scrollbar-width:none!important;-ms-overflow-style:none!important}' +
+    '.neuralia-scroll-target::-webkit-scrollbar{width:0!important;height:0!important}';
+  document.documentElement.appendChild(style);
+
+  const rail = document.createElement('div');
+  rail.id = 'neuralia-scroll-rail';
+  Object.assign(rail.style, {
+    position:'fixed', right:'6px', top:'50%', transform:'translateY(-50%)',
+    width:'34px', height:'132px', zIndex:'2147483646',
+    cursor:'ns-resize', touchAction:'none', userSelect:'none'
+  });
+
+  const spine = document.createElement('div');
+  Object.assign(spine.style, {
+    position:'absolute', right:'10px', top:'0', width:'2px', height:'100%',
+    background:'rgba(120,120,120,.20)', borderRadius:'2px'
+  });
+  rail.appendChild(spine);
+
+  [0.16, 0.38, 0.62, 0.84].forEach((fraction) => {
+    const tick = document.createElement('div');
+    Object.assign(tick.style, {
+      position:'absolute', right:'10px', top:(fraction * 100) + '%',
+      width:'11px', height:'2px', transform:'translateY(-50%)',
+      background:'rgba(150,150,150,.52)', borderRadius:'2px'
+    });
+    rail.appendChild(tick);
+  });
+
+  const cursor = document.createElement('div');
+  Object.assign(cursor.style, {
+    position:'absolute', right:'10px', top:'0%', width:'24px', height:'2px',
+    transform:'translateY(-50%)', background:'rgba(210,210,210,.88)',
+    borderRadius:'2px', boxShadow:'0 0 8px rgba(0,0,0,.20)',
+    transition:'top 70ms linear'
+  });
+  rail.appendChild(cursor);
+  document.documentElement.appendChild(rail);
+
+  let scroller = null;
+  let dragging = false;
+
+  function canScroll(el) {
+    if (!el || el === rail || (el.closest && el.closest('#neuralia-scroll-rail'))) return false;
+    return (el.scrollHeight - el.clientHeight) > 80 && el.clientHeight > 160;
+  }
+
+  function findScroller() {
+    const root = document.scrollingElement || document.documentElement;
+    if (canScroll(root)) return root;
+
+    let best = null;
+    let bestScore = -1;
+    const nodes = document.querySelectorAll('main,[role="main"],section,div');
+    const limit = Math.min(nodes.length, 700);
+    for (let i = 0; i < limit; i++) {
+      const el = nodes[i];
+      if (!canScroll(el)) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 220 || rect.height < 180 || rect.bottom <= 0 || rect.top >= innerHeight) continue;
+      const css = getComputedStyle(el);
+      const overflow = css.overflowY;
+      if (overflow !== 'auto' && overflow !== 'scroll' && el.scrollHeight < innerHeight * 1.4) continue;
+      const score = (el.scrollHeight - el.clientHeight) + rect.height * 2 + rect.width;
+      if (score > bestScore) { best = el; bestScore = score; }
+    }
+    return best || root;
+  }
+
+  function useScroller(next) {
+    if (!next || next === scroller) return;
+    if (scroller && scroller.classList) scroller.classList.remove('neuralia-scroll-target');
+    scroller = next;
+    if (scroller.classList) scroller.classList.add('neuralia-scroll-target');
+    updateRail();
+  }
+
+  function updateRail() {
+    if (!scroller || !canScroll(scroller)) useScroller(findScroller());
+    if (!scroller) return;
+    const max = Math.max(1, scroller.scrollHeight - scroller.clientHeight);
+    const p = Math.max(0, Math.min(1, scroller.scrollTop / max));
+    cursor.style.top = (p * 100) + '%';
+    rail.style.opacity = max > 1 ? '1' : '.28';
+  }
+
+  function scrollToPointer(e) {
+    if (!e.isTrusted) return;
+    useScroller(scroller || findScroller());
+    if (!scroller) return;
+    const rect = rail.getBoundingClientRect();
+    const p = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+    const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    scroller.scrollTop = p * max;
+    cursor.style.top = (p * 100) + '%';
+  }
+
+  rail.addEventListener('pointerdown', (e) => {
+    if (!e.isTrusted) return;
+    dragging = true;
+    try { rail.setPointerCapture(e.pointerId); } catch (_) {}
+    scrollToPointer(e);
+    e.preventDefault();
+    e.stopPropagation();
+  });
+  rail.addEventListener('pointermove', (e) => {
+    if (dragging) scrollToPointer(e);
+  });
+  rail.addEventListener('pointerup', (e) => {
+    dragging = false;
+    try { rail.releasePointerCapture(e.pointerId); } catch (_) {}
+  });
+  rail.addEventListener('pointercancel', () => { dragging = false; });
+
+  document.addEventListener('scroll', (e) => {
+    const target = e.target === document ? document.scrollingElement : e.target;
+    if (target && canScroll(target)) useScroller(target);
+    updateRail();
+  }, true);
+
+  window.addEventListener('resize', updateRail, { passive:true });
+  const mutationObserver = new MutationObserver(() => {
+    clearTimeout(window.__neuralia_scroll_recheck);
+    window.__neuralia_scroll_recheck = setTimeout(() => {
+      useScroller(findScroller());
+      updateRail();
+    }, 180);
+  });
+  mutationObserver.observe(document.documentElement, { childList:true, subtree:true });
+
+  useScroller(findScroller());
+  updateRail();
+
   document.addEventListener('dblclick', (e) => {
-    if (e.target && e.target.closest && e.target.closest('#neuralia-comp-btn')) {
-      return;
-    }
+    if (!e.isTrusted) return;
+    if (e.target && e.target.closest && (
+      e.target.closest('#neuralia-comp-btn') || e.target.closest('#neuralia-scroll-rail')
+    )) return;
     const tag = e.target && e.target.tagName ? e.target.tagName.toUpperCase() : '';
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
-      return;
-    }
-    if (e.target && e.target.isContentEditable) {
-      return;
-    }
-    window.location.href = 'neuralia:expand?col=' + colIndex;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (e.target && e.target.isContentEditable) return;
+    nativeAction('expand', 'col=' + colIndex);
   }, true);
 });
 "#;
