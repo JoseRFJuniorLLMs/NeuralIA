@@ -1,13 +1,19 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use std::thread;
+use std::{
+    sync::{
+        Arc, Condvar, Mutex,
+        mpsc::{SyncSender, sync_channel},
+    },
+    thread,
+};
 
 use arboard::Clipboard;
 use neural_core::{
     CoreConfig, HistoryEntry, HistoryKind, HistoryStore, Intent, ReaderArticle, ReaderClient,
     google_ai_url, parse_intent, reader_html,
 };
-use serde_json::Value;
+use url::Url;
 use windows_sys::Win32::{
     Foundation::{HWND, RECT},
     Graphics::Gdi::{
@@ -28,11 +34,11 @@ use winit::{
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
     window::{Window, WindowId},
 };
-use wry::{PermissionResponse, WebView, WebViewBuilder};
+use wry::{NewWindowResponse, PermissionResponse, WebView, WebViewBuilder};
 
 enum UserEvent {
-    Ipc(String),
     HomeRequested,
+    OpenExternal(String),
     ReaderReady {
         generation: u64,
         input: String,
@@ -45,6 +51,94 @@ enum Surface {
     Home,
     Reader,
     External,
+}
+
+struct ReaderJob {
+    generation: u64,
+    input: String,
+    url: String,
+}
+
+#[derive(Clone)]
+struct ReaderWorker {
+    pending: Arc<(Mutex<Option<ReaderJob>>, Condvar)>,
+}
+
+impl ReaderWorker {
+    fn new(client: ReaderClient, proxy: EventLoopProxy<UserEvent>) -> Self {
+        let pending = Arc::new((Mutex::new(None::<ReaderJob>), Condvar::new()));
+        let worker_pending = Arc::clone(&pending);
+
+        let _ = thread::Builder::new()
+            .name("neural-reader".into())
+            .spawn(move || loop {
+                let job = {
+                    let (lock, wake) = &*worker_pending;
+                    let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    while slot.is_none() {
+                        slot = wake
+                            .wait(slot)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    slot.take().expect("reader job present")
+                };
+
+                let result = client.fetch(&job.url).map_err(|error| error.to_string());
+                let _ = proxy.send_event(UserEvent::ReaderReady {
+                    generation: job.generation,
+                    input: job.input,
+                    result,
+                });
+            });
+
+        Self { pending }
+    }
+
+    fn submit(&self, job: ReaderJob) {
+        let (lock, wake) = &*self.pending;
+        let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(job);
+        wake.notify_one();
+    }
+}
+
+enum HistoryCommand {
+    Append(HistoryEntry),
+    Clear,
+}
+
+#[derive(Clone)]
+struct HistoryWriter {
+    tx: SyncSender<HistoryCommand>,
+}
+
+impl HistoryWriter {
+    fn new(store: HistoryStore) -> Self {
+        let (tx, rx) = sync_channel::<HistoryCommand>(64);
+        let _ = thread::Builder::new()
+            .name("neural-history".into())
+            .spawn(move || {
+                while let Ok(command) = rx.recv() {
+                    match command {
+                        HistoryCommand::Append(entry) => {
+                            let _ = store.append(&entry);
+                        }
+                        HistoryCommand::Clear => {
+                            let _ = store.clear();
+                        }
+                    }
+                }
+            });
+        Self { tx }
+    }
+
+    fn append(&self, entry: HistoryEntry) {
+        let _ = self.tx.try_send(HistoryCommand::Append(entry));
+    }
+
+    fn clear(&self) {
+        let _ = self.tx.try_send(HistoryCommand::Clear);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -129,21 +223,25 @@ struct App {
     window: Option<Window>,
     webview: Option<WebView>,
     config: CoreConfig,
-    history: HistoryStore,
-    reader: ReaderClient,
+    history: HistoryWriter,
+    reader: ReaderWorker,
     surface: Surface,
     navigation_generation: u64,
     input: String,
     status: String,
     cursor: (f64, f64),
     ctrl_pressed: bool,
+    shift_pressed: bool,
 }
 
 impl App {
     fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
         let config = CoreConfig::default();
-        let history = HistoryStore::new(config.data_dir.join("history.jsonl"));
-        let reader = ReaderClient::new(config.reader_timeout_secs, config.reader_max_bytes);
+        let history_store =
+            HistoryStore::with_limit(config.data_dir.join("history.jsonl"), config.history_limit);
+        let history = HistoryWriter::new(history_store);
+        let reader_client = ReaderClient::new(config.reader_timeout_secs, config.reader_max_bytes);
+        let reader = ReaderWorker::new(reader_client, proxy.clone());
         Self {
             proxy,
             window: None,
@@ -157,6 +255,7 @@ impl App {
             status: "WebView2 desligado enquanto você está aqui.".to_string(),
             cursor: (-1.0, -1.0),
             ctrl_pressed: false,
+            shift_pressed: false,
         }
     }
 
@@ -236,7 +335,7 @@ impl App {
         match google_ai_url(&query, &self.config.language) {
             Ok(url) => {
                 self.next_generation();
-                self.record(HistoryKind::Ask, query, url.to_string());
+                self.record(HistoryKind::Ask, query, "google-ai".to_string());
                 self.open_external(url.as_str());
             }
             Err(error) => self.show_native_error(error.to_string()),
@@ -250,17 +349,10 @@ impl App {
         self.status = format!("Lendo {url} …");
         self.request_redraw();
 
-        let proxy = self.proxy.clone();
-        let reader = self.reader.clone();
-        let input = url.clone();
-
-        thread::spawn(move || {
-            let result = reader.fetch(&url).map_err(|error| error.to_string());
-            let _ = proxy.send_event(UserEvent::ReaderReady {
-                generation,
-                input,
-                result,
-            });
+        self.reader.submit(ReaderJob {
+            generation,
+            input: url.clone(),
+            url,
         });
     }
 
@@ -276,30 +368,64 @@ impl App {
     }
 
     fn record(&self, kind: HistoryKind, input: String, target: String) {
-        let _ = self.history.append(&HistoryEntry::now(kind, input, target));
+        self.history.append(HistoryEntry::now(kind, input, target));
     }
 
     fn reader_webview_builder(&self) -> WebViewBuilder<'static> {
         let proxy = self.proxy.clone();
         WebViewBuilder::new()
-            .with_ipc_handler(move |request| {
-                let _ = proxy.send_event(UserEvent::Ipc(request.body().clone()));
+            .with_navigation_handler(move |target| {
+                if target.starts_with("about:blank") {
+                    return true;
+                }
+
+                let Ok(action_url) = Url::parse(&target) else {
+                    return false;
+                };
+                if action_url.scheme() != "neuralia" {
+                    return false;
+                }
+
+                match action_url.path().trim_matches('/') {
+                    "home" => {
+                        let _ = proxy.send_event(UserEvent::HomeRequested);
+                    }
+                    "web" => {
+                        if let Some((_, value)) =
+                            action_url.query_pairs().find(|(key, _)| key == "url")
+                            && neural_core::validate_web_url(value.as_ref()).is_ok()
+                        {
+                            let _ = proxy.send_event(UserEvent::OpenExternal(value.into_owned()));
+                        }
+                    }
+                    _ => {}
+                }
+
+                false
             })
             .with_permission_handler(|_| PermissionResponse::Deny)
             .with_focused(true)
     }
 
     fn external_webview_builder(&self) -> WebViewBuilder<'static> {
-        let proxy = self.proxy.clone();
+        let navigation_proxy = self.proxy.clone();
+        let new_window_proxy = self.proxy.clone();
+
         WebViewBuilder::new()
             .with_initialization_script(EXTERNAL_RETURN_BUTTON)
             .with_navigation_handler(move |target| {
                 if target.eq_ignore_ascii_case("neuralia:home") {
-                    let _ = proxy.send_event(UserEvent::HomeRequested);
+                    let _ = navigation_proxy.send_event(UserEvent::HomeRequested);
                     return false;
                 }
 
                 target.starts_with("about:blank") || neural_core::validate_web_url(&target).is_ok()
+            })
+            .with_new_window_req_handler(move |target, _features| {
+                if neural_core::validate_web_url(&target).is_ok() {
+                    let _ = new_window_proxy.send_event(UserEvent::OpenExternal(target));
+                }
+                NewWindowResponse::Deny
             })
             .with_permission_handler(|_| PermissionResponse::Deny)
             .with_focused(true)
@@ -346,32 +472,6 @@ impl App {
         }
     }
 
-    fn handle_ipc(&mut self, raw: String) {
-        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-            return;
-        };
-        let action = value.get("action").and_then(Value::as_str).unwrap_or("");
-
-        if self.surface != Surface::Reader {
-            return;
-        }
-
-        let input = value
-            .get("value")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-
-        match action {
-            "home" => self.show_home(),
-            "web" if self.surface == Surface::Reader && !input.is_empty() => {
-                self.handle_input(format!("web:{input}"));
-            }
-            _ => {}
-        }
-    }
-
     fn append_text(&mut self, text: &str) {
         if self.input.chars().count() >= 2048 {
             return;
@@ -414,6 +514,16 @@ impl App {
 
     fn handle_home_key(&mut self, event: &winit::event::KeyEvent) {
         if event.state != ElementState::Pressed {
+            return;
+        }
+
+        if self.ctrl_pressed
+            && self.shift_pressed
+            && matches!(event.logical_key, Key::Named(NamedKey::Delete))
+        {
+            self.history.clear();
+            self.status = "Histórico local apagado.".to_string();
+            self.request_redraw();
             return;
         }
 
@@ -478,8 +588,8 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Ipc(raw) => self.handle_ipc(raw),
             UserEvent::HomeRequested => self.show_home(),
+            UserEvent::OpenExternal(url) => self.web(url),
             UserEvent::ReaderReady {
                 generation,
                 input,
@@ -523,6 +633,7 @@ impl ApplicationHandler<UserEvent> for App {
             } if self.surface == Surface::Home => self.click_home(),
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.ctrl_pressed = modifiers.state().control_key();
+                self.shift_pressed = modifiers.state().shift_key();
             }
             WindowEvent::Ime(Ime::Commit(text)) if self.surface == Surface::Home => {
                 self.append_text(&text);
@@ -637,7 +748,7 @@ fn draw_home(window: &Window, input: &str, status: &str) {
         };
         draw_text(
             hdc,
-            "Texto → Google AI   ·   URL → Reader   ·   Ctrl+V cola   ·   web: força página completa",
+            "Texto → Google AI · URL → Reader · Ctrl+V cola · Ctrl+Shift+Del limpa histórico",
             &mut help_rect,
             DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
