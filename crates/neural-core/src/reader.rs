@@ -64,9 +64,9 @@ impl Resolver for PublicResolver {
         let resolved = self.inner.resolve(uri, config, timeout)?;
         let mut safe = self.inner.empty();
 
-        for address in resolved {
+        for address in &resolved {
             if !is_forbidden_ip(address.ip()) {
-                safe.push(SocketAddr::new(address.ip(), address.port()));
+                safe.push(*address);
             }
         }
 
@@ -398,15 +398,8 @@ fn normalize_text(input: String) -> String {
 }
 
 fn normalize_code(input: String) -> String {
-    input
-        .replace("
-", "
-")
-        .replace('', "
-")
-        .trim_matches('
-')
-        .to_string()
+    let newline = char::from(10).to_string();
+    input.lines().collect::<Vec<_>>().join(&newline)
 }
 
 fn truncate_chars(value: String, limit: usize) -> String {
