@@ -792,31 +792,33 @@ impl DocumentWorker {
         let worker_pending = Arc::clone(&pending);
         let spawned = thread::Builder::new()
             .name("neural-document".into())
-            .spawn(move || loop {
-                let job = {
-                    let (lock, wake) = &*worker_pending;
-                    let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    while slot.is_none() {
-                        slot = wake
-                            .wait(slot)
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    }
-                    slot.take().expect("document job present")
-                };
+            .spawn(move || {
+                loop {
+                    let job = {
+                        let (lock, wake) = &*worker_pending;
+                        let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        while slot.is_none() {
+                            slot = wake
+                                .wait(slot)
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        }
+                        slot.take().expect("document job present")
+                    };
 
-                let job_generation = job.generation;
-                let watch = Arc::clone(&generation);
-                let result = client
-                    .fetch_document(&job.url, "application/pdf", PDF_MAX_BYTES, &|| {
-                        watch.load(Ordering::SeqCst) != job_generation
-                    })
-                    .map_err(|error| error.to_string());
+                    let job_generation = job.generation;
+                    let watch = Arc::clone(&generation);
+                    let result = client
+                        .fetch_document(&job.url, "application/pdf", PDF_MAX_BYTES, &|| {
+                            watch.load(Ordering::SeqCst) != job_generation
+                        })
+                        .map_err(|error| error.to_string());
 
-                let _ = proxy.send_event(UserEvent::PdfReady {
-                    generation: job_generation,
-                    url: job.url,
-                    result,
-                });
+                    let _ = proxy.send_event(UserEvent::PdfReady {
+                        generation: job_generation,
+                        url: job.url,
+                        result,
+                    });
+                }
             });
 
         Self {
@@ -855,31 +857,36 @@ struct HistoryWriter {
 impl HistoryWriter {
     fn new(store: HistoryStore, proxy: EventLoopProxy<UserEvent>) -> Self {
         let pending = Arc::new((
-            Mutex::new(VecDeque::<HistoryCommand>::with_capacity(HISTORY_QUEUE_LIMIT)),
+            Mutex::new(VecDeque::<HistoryCommand>::with_capacity(
+                HISTORY_QUEUE_LIMIT,
+            )),
             Condvar::new(),
         ));
         let worker_pending = Arc::clone(&pending);
         let spawned = thread::Builder::new()
             .name("neural-history".into())
-            .spawn(move || loop {
-                let command = {
-                    let (lock, wake) = &*worker_pending;
-                    let mut queue = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    while queue.is_empty() {
-                        queue = wake
-                            .wait(queue)
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    }
-                    queue.pop_front().expect("history command present")
-                };
+            .spawn(move || {
+                loop {
+                    let command = {
+                        let (lock, wake) = &*worker_pending;
+                        let mut queue =
+                            lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        while queue.is_empty() {
+                            queue = wake
+                                .wait(queue)
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        }
+                        queue.pop_front().expect("history command present")
+                    };
 
-                match command {
-                    HistoryCommand::Append(entry) => {
-                        let _ = store.append(&entry);
-                    }
-                    HistoryCommand::Clear => {
-                        let result = store.clear().map_err(|error| error.to_string());
-                        let _ = proxy.send_event(UserEvent::HistoryCleared(result));
+                    match command {
+                        HistoryCommand::Append(entry) => {
+                            let _ = store.append(&entry);
+                        }
+                        HistoryCommand::Clear => {
+                            let result = store.clear().map_err(|error| error.to_string());
+                            let _ = proxy.send_event(UserEvent::HistoryCleared(result));
+                        }
                     }
                 }
             });
@@ -1052,24 +1059,26 @@ impl App {
             let splash_proxy = proxy.clone();
             let _ = thread::Builder::new()
                 .name("neural-splash-timer".into())
-                .spawn(move || loop {
-                    let target = deadline.load(Ordering::SeqCst);
-                    if target == 0 {
-                        thread::sleep(Duration::from_millis(200));
-                        continue;
-                    }
-                    let now = now_ms();
-                    if now >= target {
-                        if deadline
-                            .compare_exchange(target, 0, Ordering::SeqCst, Ordering::SeqCst)
-                            .is_ok()
-                        {
-                            let token = watch_token.load(Ordering::SeqCst);
-                            let _ = splash_proxy.send_event(UserEvent::HideSplash(token));
+                .spawn(move || {
+                    loop {
+                        let target = deadline.load(Ordering::SeqCst);
+                        if target == 0 {
+                            thread::sleep(Duration::from_millis(200));
+                            continue;
                         }
-                        continue;
+                        let now = now_ms();
+                        if now >= target {
+                            if deadline
+                                .compare_exchange(target, 0, Ordering::SeqCst, Ordering::SeqCst)
+                                .is_ok()
+                            {
+                                let token = watch_token.load(Ordering::SeqCst);
+                                let _ = splash_proxy.send_event(UserEvent::HideSplash(token));
+                            }
+                            continue;
+                        }
+                        thread::sleep(Duration::from_millis((target - now).min(250)));
                     }
-                    thread::sleep(Duration::from_millis((target - now).min(250)));
                 });
         }
 
@@ -1953,10 +1962,12 @@ impl App {
             .with_initialization_script(init_script)
             .with_navigation_handler(move |target| {
                 if let Some(action_url) = trusted_action_url(&target, &navigation_token)
-                    && action_url.path().trim_matches('/').eq_ignore_ascii_case("expand")
+                    && action_url
+                        .path()
+                        .trim_matches('/')
+                        .eq_ignore_ascii_case("expand")
                 {
-                    if let Some((_, value)) =
-                        action_url.query_pairs().find(|(key, _)| key == "col")
+                    if let Some((_, value)) = action_url.query_pairs().find(|(key, _)| key == "col")
                         && let Ok(index) = value.parse::<usize>()
                         && index < COMPARATOR_COLUMNS
                     {
@@ -2261,7 +2272,10 @@ impl App {
         // segunda copia de ate 64 MiB em Rust. Recarregar a pagina exigiria
         // duplicar de novo o documento; o viewer ja mantem o PDF carregado.
         if self.surface == Surface::Pdf {
-            self.show_splash("O PDF já está carregado; a recarga foi ignorada.".to_string(), 3);
+            self.show_splash(
+                "O PDF já está carregado; a recarga foi ignorada.".to_string(),
+                3,
+            );
             return;
         }
         self.for_each_visible_webview(|webview| {
@@ -2890,7 +2904,11 @@ fn serve_pdf_asset(
                 .and_then(|mut slot| slot.take())
                 .unwrap_or_default();
             if data.is_empty() {
-                (410, "text/plain", Cow::Borrowed(b"document already consumed" as &[u8]))
+                (
+                    410,
+                    "text/plain",
+                    Cow::Borrowed(b"document already consumed" as &[u8]),
+                )
             } else {
                 (200, "application/pdf", Cow::Owned(data))
             }
@@ -2911,10 +2929,12 @@ static ACTION_FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
 fn action_token() -> String {
     let mut bytes = [0u8; 16];
     if getrandom::fill(&mut bytes).is_ok() {
-        return bytes.iter().fold(String::with_capacity(32), |mut out, byte| {
-            out.push_str(&format!("{byte:02x}"));
-            out
-        });
+        return bytes
+            .iter()
+            .fold(String::with_capacity(32), |mut out, byte| {
+                out.push_str(&format!("{byte:02x}"));
+                out
+            });
     }
 
     // O fallback so existe para uma falha extrema do RNG do SO. Continua
