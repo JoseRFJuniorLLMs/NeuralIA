@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/logo.png" width="180" alt="NeuralIA — A smarter way to browse" style="border-radius: 36px;"></p>
+<p align="center"><img src="assets/logo.ico" width="112" height="112" alt="NeuralIA"></p>
 
 <h1 align="center">NeuralIA</h1>
 <p align="center"><strong>The browser without the browser.</strong></p>
@@ -6,7 +6,7 @@
 
 ## What NeuralIA is
 
-NeuralIA **v1.1.3** is an AI-first, reader-first, system-WebView information client written in Rust.
+NeuralIA **v1.1.4** is an AI-first, reader-first, system-WebView information client written in Rust.
 
 It deliberately refuses the usual browser arms race. It does not ship Chromium, does not implement its own JavaScript engine, does not carry a local LLM, and does not try to become an operating system with tabs.
 
@@ -42,6 +42,7 @@ On Windows, **no WebView is created while the native home screen is idle**. The 
 NeuralIA/
 ├── crates/neural-core/     # intent, URL policy, Reader, search, history
 ├── crates/neural-app/      # native Windows shell + lazy WebView2
+├── assets/logo.ico          # application/readme icon
 ├── assets/neuralia-brand.jpg # official NeuralIA brand artwork
 ├── assets/neuralia-logo.svg  # compact in-app legacy mark
 ├── docs/specs/
