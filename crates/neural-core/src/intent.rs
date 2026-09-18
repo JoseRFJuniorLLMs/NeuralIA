@@ -66,6 +66,12 @@ fn parse_urlish(input: &str) -> Result<Url> {
     if looks_like_local_path(trimmed) {
         return Err(NeuralError::LocalPath(redact_local_path(trimmed)));
     }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "localhost" || lower.starts_with("localhost:") {
+        return validate_web_url(&format!("http://{trimmed}"));
+    }
+
     if let Some(scheme) = explicit_scheme(trimmed) {
         if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
             return Err(NeuralError::DisallowedScheme(scheme.to_ascii_lowercase()));
