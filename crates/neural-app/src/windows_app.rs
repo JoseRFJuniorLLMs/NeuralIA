@@ -9115,6 +9115,25 @@ mod tests {
     }
 
     #[test]
+    fn spec_0108_capability_scripts_are_top_frame_only() {
+        for (name, script) in [
+            ("keymap", NEURALIA_KEYMAP_SCRIPT),
+            ("return", EXTERNAL_RETURN_BUTTON),
+            ("gmail", GMAIL_MONITOR_SCRIPT),
+            ("agent", AGENT_OBSERVER_SCRIPT),
+            ("comparator", COMPARATOR_INJECT_SCRIPT),
+        ] {
+            let guard = script
+                .find("if (window.top !== window) return;")
+                .expect("top-frame guard");
+            let capability = script
+                .find("const capability = '__NEURALIA_CAP__';")
+                .expect("capability declaration");
+            assert!(guard < capability, "{name}: frame guard must run before capability use");
+        }
+    }
+
+    #[test]
     fn spec_0108_agent_observation_stays_below_ipc_envelope_limit() {
         assert!(
             AGENT_OBSERVER_SCRIPT.contains(".join('\\n').slice(0, 1200)"),
@@ -10113,6 +10132,9 @@ const fn rgb3(color: Rgb) -> u32 {
 /// na fase de captura, que se apanham os atalhos antes de o site os consumir.
 const NEURALIA_KEYMAP_SCRIPT: &str = r#"
 (function () {
+  // WRY/WebView2 injeta initialization scripts em child frames no Windows.
+  // Capability e controles nativos pertencem somente ao documento principal.
+  if (window.top !== window) return;
   if (window.__neuralia_keymap) { return; }
   window.__neuralia_keymap = true;
 
@@ -10261,6 +10283,7 @@ const COMPARATOR_BUTTON_COLLAPSED: &str = "(function(){var b=document.querySelec
 /// DOMContentLoaded e capturado aqui, antes de a pagina correr.
 const EXTERNAL_RETURN_BUTTON: &str = r#"
 (function () {
+  if (window.top !== window) return;
   const capability = '__NEURALIA_CAP__';
   const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
   const stringify = JSON.stringify;
@@ -10294,6 +10317,7 @@ const EXTERNAL_RETURN_BUTTON: &str = r#"
 
 const GMAIL_MONITOR_SCRIPT: &str = r#"
 (function () {
+  if (window.top !== window) return;
   if (location.hostname !== 'mail.google.com' || window.__neuralia_gmail_monitor) return;
   window.__neuralia_gmail_monitor = true;
   const capability = '__NEURALIA_CAP__';
@@ -10447,6 +10471,7 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
 
 const AGENT_OBSERVER_SCRIPT: &str = r#"
 (function () {
+  if (window.top !== window) return;
   const capability = '__NEURALIA_CAP__';
   const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
   const stringify = JSON.stringify;
@@ -10811,6 +10836,7 @@ document.addEventListener('DOMContentLoaded', () => {
 /// para a pagina nao poder ler o handler do elemento e chama-lo a mao.
 const COMPARATOR_INJECT_SCRIPT: &str = r#"
 (function () {
+  if (window.top !== window) return;
   const colIndex = window.__neuralia_col_index ?? 0;
   const colName = window.__neuralia_col_name ?? 'IA';
   const capability = '__NEURALIA_CAP__';
