@@ -1,4 +1,8 @@
-use std::time::{Duration, Instant};
+use std::{
+    fs, io,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -111,7 +115,7 @@ impl Default for AgentRuntimeConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentOutcome {
     Completed {
         summary: String,
@@ -136,6 +140,35 @@ pub enum AgentOutcome {
         error: String,
         trace: Vec<AgentStep>,
     },
+}
+
+pub fn save_agent_outcome(
+    path: impl AsRef<Path>,
+    goal: &str,
+    outcome: &AgentOutcome,
+) -> io::Result<()> {
+    #[derive(Serialize)]
+    struct StoredOutcome<'a> {
+        goal: &'a str,
+        outcome: &'a AgentOutcome,
+    }
+
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(&StoredOutcome { goal, outcome })
+        .map_err(io::Error::other)?;
+    let temp = path.with_extension("tmp");
+    fs::write(&temp, bytes)?;
+    match fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(error) if path.exists() => {
+            fs::remove_file(path)?;
+            fs::rename(temp, path)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub struct AgentRuntime<P, E> {
@@ -472,6 +505,31 @@ mod tests {
             AgentOutcome::Failed { error, .. } => assert!(error.contains("stale")),
             other => panic!("unexpected outcome: {other:?}"),
         }
+    }
+
+    #[test]
+    fn completed_trace_can_be_persisted_locally() {
+        let planner = QueuePlanner {
+            actions: VecDeque::from([AgentAction::Finish {
+                summary: "done".into(),
+            }]),
+        };
+        let executor = MockExecutor { page: page() };
+        let policy = AgentPermissionPolicy::new(Some("https://example.com".into()));
+        let mut runtime =
+            AgentRuntime::new(planner, executor, policy, AgentRuntimeConfig::default());
+        let outcome = runtime.run("research", page());
+
+        let root = std::env::temp_dir().join(format!(
+            "neuralia-agent-trace-{}",
+            std::process::id()
+        ));
+        let path = root.join("trace.json");
+        save_agent_outcome(&path, "research", &outcome).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("research"));
+        assert!(text.contains("Completed"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
