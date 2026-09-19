@@ -40,11 +40,13 @@ use windows_sys::Win32::{
             VK_CONTROL, VK_NEXT, VK_SHIFT,
         },
         WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, ES_AUTOHSCROLL, GetClientRect, GetForegroundWindow,
-            GetWindowTextLengthW, GetWindowTextW, MB_ICONINFORMATION, MB_OK, MessageBoxW, SW_HIDE,
-            SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos, SetWindowTextW,
-            ShowWindow, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-            WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+            AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
+            ES_AUTOHSCROLL, GetClientRect, GetForegroundWindow, GetWindowTextLengthW,
+            GetWindowTextW, MB_ICONINFORMATION, MB_OK, MF_SEPARATOR, MF_STRING, MessageBoxW,
+            SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos,
+            SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_KEYDOWN,
+            WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
+            WS_VISIBLE,
         },
     },
 };
@@ -133,7 +135,7 @@ enum Surface {
     Pdf,
 }
 
-const TOP_BAR_HEIGHT: f64 = 72.0;
+const TOP_BAR_HEIGHT: f64 = 44.0;
 const MAX_VISIBLE_CONTEXT_TABS: usize = 3;
 const COMPARATOR_COLUMNS: usize = 3;
 /// Intervalo da rolagem automatica de leitura, do primeiro avanco ao ultimo.
@@ -343,22 +345,15 @@ impl BarLayout {
         }
 
         let height = TOP_BAR_HEIGHT * scale;
-        let pad = 10.0 * scale;
-        let gap = 6.0 * scale;
-        let header_h = 28.0 * scale;
-        let header_y = 7.0 * scale;
-        let tab_y = 42.0 * scale;
-        let tab_h = 22.0 * scale;
-
+        let pad = 7.0 * scale;
+        let row_y = 7.0 * scale;
+        let row_h = 30.0 * scale;
         let home = UiRect {
             x: pad,
-            y: header_y,
-            width: 92.0 * scale,
-            height: header_h,
+            y: row_y,
+            width: 72.0 * scale,
+            height: row_h,
         };
-        let hint_w = 84.0 * scale;
-        let content_x = home.x + home.width + 12.0 * scale;
-        let content_right = (client_width - hint_w - pad).max(content_x);
 
         let mut columns_rect = [empty; COMPARATOR_COLUMNS];
         let mut plus_rect = [empty; COMPARATOR_COLUMNS];
@@ -369,49 +364,65 @@ impl BarLayout {
 
         if columns_len > 0 {
             let column_width = client_width / columns_len as f64;
-            let group_width = (column_width - 14.0 * scale).clamp(108.0 * scale, 196.0 * scale);
-            let plus_size = 26.0 * scale;
-            let plus_gap = 4.0 * scale;
-            let provider_width = (group_width - plus_size - plus_gap).max(72.0 * scale);
+            let group_pad = 6.0 * scale;
+            let gap = 4.0 * scale;
+            let provider_width = 92.0 * scale;
+            let plus_width = 26.0 * scale;
 
-            let mut left_bound = content_x;
             for index in 0..columns_len {
-                let center = column_width * (index as f64 + 0.5);
-                let max_x = (content_right - group_width).max(left_bound);
-                let x = (center - group_width / 2.0).clamp(left_bound, max_x);
+                let mut left = index as f64 * column_width + group_pad;
+                if index == 0 {
+                    left = left.max(home.x + home.width + 8.0 * scale);
+                }
+                let right =
+                    ((index + 1) as f64 * column_width - group_pad).min(client_width - pad);
+                let available = (right - left).max(provider_width + plus_width + gap);
 
                 columns_rect[index] = UiRect {
-                    x,
-                    y: header_y,
-                    width: provider_width,
-                    height: header_h,
+                    x: left,
+                    y: row_y,
+                    width: provider_width.min(available - plus_width - gap),
+                    height: row_h,
                 };
                 plus_rect[index] = UiRect {
-                    x: x + provider_width + plus_gap,
-                    y: header_y + (header_h - plus_size) / 2.0,
-                    width: plus_size,
-                    height: plus_size,
+                    x: columns_rect[index].x + columns_rect[index].width + gap,
+                    y: row_y + 2.0 * scale,
+                    width: plus_width,
+                    height: row_h - 4.0 * scale,
                 };
 
                 let count = context_counts[index].min(MAX_VISIBLE_CONTEXT_TABS);
                 tab_counts[index] = count;
-                if count > 0 {
-                    let tab_gap = 4.0 * scale;
-                    let tab_width =
-                        (group_width - tab_gap * (count.saturating_sub(1)) as f64) / count as f64;
-                    let first_context = context_counts[index] - count;
-                    for visual in 0..count {
-                        tabs[index][visual] = UiRect {
-                            x: x + visual as f64 * (tab_width + tab_gap),
-                            y: tab_y,
-                            width: tab_width,
-                            height: tab_h,
-                        };
-                        tab_indices[index][visual] = first_context + visual;
-                    }
+                if count == 0 {
+                    continue;
                 }
 
-                left_bound = x + group_width + gap;
+                let tabs_left = plus_rect[index].x + plus_rect[index].width + gap;
+                let tabs_width = (right - tabs_left).max(0.0);
+                if tabs_width < 34.0 * scale {
+                    tab_counts[index] = 0;
+                    continue;
+                }
+                let first_context = context_counts[index] - count;
+                let tab_gap = 3.0 * scale;
+                let tab_width = ((tabs_width - tab_gap * (count.saturating_sub(1)) as f64)
+                    / count as f64)
+                    .max(28.0 * scale);
+
+                for visual in 0..count {
+                    let x = tabs_left + visual as f64 * (tab_width + tab_gap);
+                    if x + 22.0 * scale > right {
+                        tab_counts[index] = visual;
+                        break;
+                    }
+                    tabs[index][visual] = UiRect {
+                        x,
+                        y: row_y + 2.0 * scale,
+                        width: (tab_width.min(right - x)).max(22.0 * scale),
+                        height: row_h - 4.0 * scale,
+                    };
+                    tab_indices[index][visual] = first_context + visual;
+                }
             }
         }
 
@@ -511,6 +522,11 @@ const EC_LEFTMARGIN: usize = 0x0001;
 const EC_RIGHTMARGIN: usize = 0x0002;
 const WM_SETFONT: u32 = 0x0030;
 const OMNIBOX_SUBCLASS_ID: usize = 0x4E49;
+const TAB_MENU_OPEN: usize = 1;
+const TAB_MENU_FULLSCREEN: usize = 2;
+const TAB_MENU_CLOSE: usize = 3;
+const TAB_MENU_CLOSE_OTHERS: usize = 4;
+const TAB_MENU_CLOSE_ALL: usize = 5;
 
 /// Consulta opcional para automacao/benchmarks. Em producao a Home abre em
 /// repouso e nao envia texto a nenhum fornecedor sem acao do utilizador.
@@ -3256,15 +3272,154 @@ impl App {
         }
     }
 
-    fn open_context_tab(&mut self, source_index: usize, context_index: usize) {
-        let url = self
-            .comparator
+    fn context_tab_url(&self, source_index: usize, context_index: usize) -> Option<String> {
+        self.comparator
             .as_ref()
             .and_then(|comp| comp.contexts.get(source_index))
             .and_then(|tabs| tabs.get(context_index))
-            .cloned();
-        if let Some(url) = url {
+            .cloned()
+    }
+
+    fn open_context_tab(&mut self, source_index: usize, context_index: usize) {
+        if let Some(url) = self.context_tab_url(source_index, context_index) {
             self.open_split(source_index, url, false);
+        }
+    }
+
+    fn open_context_tab_fullscreen(&mut self, source_index: usize, context_index: usize) {
+        self.open_context_tab(source_index, context_index);
+        if self
+            .comparator
+            .as_ref()
+            .is_some_and(|comp| comp.split.is_some())
+        {
+            self.toggle_split_fullscreen();
+        }
+    }
+
+    fn close_context_tab(&mut self, source_index: usize, context_index: usize) {
+        let Some(url) = self.context_tab_url(source_index, context_index) else {
+            return;
+        };
+        let closes_active = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.split.as_ref())
+            .is_some_and(|split| split.source_index == source_index && split.url == url);
+        if closes_active {
+            self.close_split();
+        }
+        if let Some(comp) = &mut self.comparator
+            && let Some(tabs) = comp.contexts.get_mut(source_index)
+            && context_index < tabs.len()
+        {
+            tabs.remove(context_index);
+        }
+        self.request_redraw();
+    }
+
+    fn close_other_context_tabs(&mut self, source_index: usize, context_index: usize) {
+        let Some(keep) = self.context_tab_url(source_index, context_index) else {
+            return;
+        };
+        let closes_active = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.split.as_ref())
+            .is_some_and(|split| split.source_index == source_index && split.url != keep);
+        if closes_active {
+            self.close_split();
+        }
+        if let Some(comp) = &mut self.comparator
+            && let Some(tabs) = comp.contexts.get_mut(source_index)
+        {
+            tabs.clear();
+            tabs.push(keep);
+        }
+        self.request_redraw();
+    }
+
+    fn close_all_context_tabs(&mut self, source_index: usize) {
+        let closes_active = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.split.as_ref())
+            .is_some_and(|split| split.source_index == source_index);
+        if closes_active {
+            self.close_split();
+        }
+        if let Some(comp) = &mut self.comparator
+            && let Some(tabs) = comp.contexts.get_mut(source_index)
+        {
+            tabs.clear();
+        }
+        self.request_redraw();
+    }
+
+    fn context_menu_comparator(&mut self) {
+        let hit = self
+            .bar_layout()
+            .and_then(|layout| layout.hit(self.cursor.0, self.cursor.1));
+        let Some(BarHit::ContextTab {
+            source_index,
+            context_index,
+        }) = hit
+        else {
+            return;
+        };
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(hwnd) = window_hwnd(window) else {
+            return;
+        };
+
+        let command = unsafe {
+            let menu = CreatePopupMenu();
+            if menu.is_null() {
+                return;
+            }
+            let open = wide_null("Abrir");
+            let fullscreen = wide_null("Abrir em tela cheia");
+            let close = wide_null("Fechar aba");
+            let close_others = wide_null("Fechar outras abas deste grupo");
+            let close_all = wide_null("Fechar todas deste grupo");
+            AppendMenuW(menu, MF_STRING, TAB_MENU_OPEN, open.as_ptr());
+            AppendMenuW(menu, MF_STRING, TAB_MENU_FULLSCREEN, fullscreen.as_ptr());
+            AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+            AppendMenuW(menu, MF_STRING, TAB_MENU_CLOSE, close.as_ptr());
+            AppendMenuW(menu, MF_STRING, TAB_MENU_CLOSE_OTHERS, close_others.as_ptr());
+            AppendMenuW(menu, MF_STRING, TAB_MENU_CLOSE_ALL, close_all.as_ptr());
+
+            let mut point = windows_sys::Win32::Foundation::POINT {
+                x: self.cursor.0.round() as i32,
+                y: self.cursor.1.round() as i32,
+            };
+            ClientToScreen(hwnd, &mut point);
+            let selected = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                point.x,
+                point.y,
+                0,
+                hwnd,
+                std::ptr::null(),
+            ) as usize;
+            DestroyMenu(menu);
+            selected
+        };
+
+        match command {
+            TAB_MENU_OPEN => self.open_context_tab(source_index, context_index),
+            TAB_MENU_FULLSCREEN => {
+                self.open_context_tab_fullscreen(source_index, context_index)
+            }
+            TAB_MENU_CLOSE => self.close_context_tab(source_index, context_index),
+            TAB_MENU_CLOSE_OTHERS => {
+                self.close_other_context_tabs(source_index, context_index)
+            }
+            TAB_MENU_CLOSE_ALL => self.close_all_context_tabs(source_index),
+            _ => {}
         }
     }
 
@@ -3536,6 +3691,11 @@ impl ApplicationHandler<UserEvent> for App {
                 Surface::Comparator => self.click_comparator(),
                 _ => {}
             },
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } if self.surface == Surface::Comparator => self.context_menu_comparator(),
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
                 match event.logical_key {
                     Key::Named(NamedKey::Escape) => self.go_back(),
@@ -4205,9 +4365,9 @@ unsafe fn paint_comparator_bar_with_contexts(
                     context_index,
                 });
             let fill = if active {
-                mix(theme.bar_bg, brand, 0.42)
+                mix(theme.bar_bg, brand, 0.48)
             } else if hovered {
-                mix(theme.surface, theme.fg, 0.12)
+                mix(theme.bar_bg, brand, 0.30)
             } else {
                 mix(theme.bar_bg, brand, 0.10)
             };
@@ -4224,25 +4384,7 @@ unsafe fn paint_comparator_bar_with_contexts(
         }
     }
 
-    let hint = if auto_scroll {
-        format!("F8 {AUTO_SCROLL_SECONDS}s · Esc")
-    } else {
-        "F8 rolar · Esc".to_string()
-    };
-    SelectObject(target, tab_font as _);
-    SetTextColor(target, rgb3(theme.fg_muted));
-    let mut hint_rect = RECT {
-        left: (width as f64 - 88.0 * scale) as i32,
-        top: 0,
-        right: (width as f64 - 8.0 * scale) as i32,
-        bottom: (36.0 * scale) as i32,
-    };
-    draw_text(
-        target,
-        &hint,
-        &mut hint_rect,
-        DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-    );
+    let _ = auto_scroll;
 
     SelectObject(target, old_font);
     DeleteObject(font as _);
@@ -4746,6 +4888,36 @@ mod tests {
     }
 
     #[test]
+    fn grouped_tabs_live_in_single_title_row() {
+        let layout = BarLayout::with_contexts(1600.0, 1.0, true, 3, [3, 3, 3]);
+        assert_eq!(layout.height, TOP_BAR_HEIGHT);
+        for index in 0..3 {
+            let provider = layout.columns[index];
+            let plus = layout.add_tabs[index];
+            assert!((provider.y - plus.y).abs() <= 2.0);
+            for visual in 0..layout.context_tab_counts[index] {
+                let tab = layout.context_tabs[index][visual];
+                assert!((provider.y - tab.y).abs() <= 2.0);
+                assert!(tab.y + tab.height <= layout.height);
+            }
+        }
+    }
+
+    #[test]
+    fn context_menu_commands_are_unique() {
+        let ids = [
+            TAB_MENU_OPEN,
+            TAB_MENU_FULLSCREEN,
+            TAB_MENU_CLOSE,
+            TAB_MENU_CLOSE_OTHERS,
+            TAB_MENU_CLOSE_ALL,
+        ];
+        for (index, id) in ids.iter().enumerate() {
+            assert!(!ids[..index].contains(id));
+        }
+    }
+
+    #[test]
     fn grouped_tabs_have_plus_and_context_hits() {
         let layout = BarLayout::with_contexts(1600.0, 1.0, true, 3, [2, 1, 4]);
 
@@ -4776,16 +4948,14 @@ mod tests {
     fn bar_layout_hit_matches_drawing() {
         let layout = BarLayout::new(1600.0, 1.0, true, 3);
 
-        // O grupo inteiro (nome + botao +) fica centrado sobre a coluna.
+        // Cada grupo fica dentro da faixa horizontal da sua IA.
         for index in 0..3 {
             let provider = layout.columns[index];
             let plus = layout.add_tabs[index];
-            let column_center = 1600.0 / 3.0 * (index as f64 + 0.5);
-            let group_center = (provider.x + plus.x + plus.width) / 2.0;
-            assert!(
-                (group_center - column_center).abs() < 2.0,
-                "grupo {index} centrado em {group_center}, coluna em {column_center}"
-            );
+            let left = index as f64 * (1600.0 / 3.0);
+            let right = (index + 1) as f64 * (1600.0 / 3.0);
+            assert!(provider.x >= left);
+            assert!(plus.x + plus.width <= right);
         }
 
         for index in 0..3 {
