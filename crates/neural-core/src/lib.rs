@@ -29,8 +29,9 @@ pub use agent_security::{
     redact_sensitive_text,
 };
 pub use local_intelligence::{
-    EMBEDDING_DIM, HashingLocalIntelligence, IntentClass, LocalIntelligence, ModelPackManager,
-    ModelPackManifest, cosine_similarity, hashed_embedding,
+    EMBEDDING_DIM, HashingLocalIntelligence, IntentClass, LocalBenchmark, LocalIntelligence,
+    ModelPackManager, ModelPackManifest, benchmark_local_intelligence, cosine_similarity,
+    hashed_embedding,
 };
 pub use memory::{
     CaptureOutcome, ForgetReport, ForgetScope, MemoryDocument, MemoryHit, MemoryKind, MemoryQuery,
