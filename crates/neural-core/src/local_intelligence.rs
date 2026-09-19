@@ -36,7 +36,13 @@ impl LocalIntelligence for HashingLocalIntelligence {
     fn classify(&self, input: &str) -> Result<IntentClass, String> {
         let lower = input.to_lowercase();
         let memory = [
-            "onde", "lembra", "lembre", "histórico", "historico", "pesquisei", "li ",
+            "onde",
+            "lembra",
+            "lembre",
+            "histórico",
+            "historico",
+            "pesquisei",
+            "li ",
         ];
         let research = [
             "compare",
@@ -47,7 +53,9 @@ impl LocalIntelligence for HashingLocalIntelligence {
             "evidência",
             "evidencia",
         ];
-        let navigate = ["abra ", "abrir ", "vá para", "va para", "http://", "https://"];
+        let navigate = [
+            "abra ", "abrir ", "vá para", "va para", "http://", "https://",
+        ];
         let agent = [
             "faça por mim",
             "faca por mim",
@@ -176,9 +184,8 @@ pub fn extract_entities(input: &str) -> Vec<String> {
             .collect::<Vec<_>>();
         let upper = !letters.is_empty() && letters.iter().all(|ch| ch.is_uppercase());
         let capitalized = word.chars().next().is_some_and(char::is_uppercase);
-        let technical = word.contains('-')
-            || word.contains('_')
-            || word.chars().any(|ch| ch.is_ascii_digit());
+        let technical =
+            word.contains('-') || word.contains('_') || word.chars().any(|ch| ch.is_ascii_digit());
 
         if upper || capitalized || technical {
             entities.insert(word.to_string());
