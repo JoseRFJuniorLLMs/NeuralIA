@@ -234,14 +234,16 @@ impl AgentPermissionPolicy {
                 return confirm(risk, "navigation from web agent to local/private network");
             }
 
+            // Sem origem inicial a lista de aprovadas esta vazia, e e isso
+            // que vale: "nao sei de onde parti" tem de pedir confirmacao,
+            // nunca dispensar o gate de origem.
             let origin = parsed.origin().ascii_serialization();
-            if self.initial_origin.is_some() && !self.approved_origins.contains(&origin) {
+            if !self.approved_origins.contains(&origin) {
                 return confirm(risk, "cross-origin navigation needs approval");
             }
-        } else if self.initial_origin.is_some()
-            && action
-                .origin()
-                .is_some_and(|origin| !self.approved_origins.contains(&origin))
+        } else if action
+            .origin()
+            .is_some_and(|origin| !self.approved_origins.contains(&origin))
         {
             return confirm(risk, "cross-origin action needs approval");
         }
@@ -538,5 +540,29 @@ mod tests {
         });
         assert!(!decision.allowed);
         assert!(!decision.requires_confirmation);
+    }
+
+    #[test]
+    fn policy_without_initial_origin_gates_every_origin() {
+        // Sem origem inicial nao ha nada aprovado: a ausencia de origem nao
+        // pode valer como "qualquer origem serve".
+        let mut policy = AgentPermissionPolicy::new(None);
+        let decision = policy.evaluate(&AgentSecurityAction::Extract {
+            origin: "https://example.com".into(),
+        });
+        assert!(!decision.allowed);
+        assert!(decision.requires_confirmation);
+
+        let decision = policy.evaluate(&AgentSecurityAction::Navigate {
+            url: "https://example.com/pagina".into(),
+        });
+        assert!(!decision.allowed);
+        assert!(decision.requires_confirmation);
+
+        policy.approve_origin("https://example.com");
+        let decision = policy.evaluate(&AgentSecurityAction::Extract {
+            origin: "https://example.com".into(),
+        });
+        assert!(decision.allowed);
     }
 }
