@@ -76,8 +76,19 @@ pub fn semantic_anchors_html(input: &str) -> Vec<SemanticAnchor> {
             SemanticAnchorKind::Answer
         };
 
-        let dedup_key = format!("{kind:?}:{text}");
-        if seen.insert(dedup_key) {
+        let dedup_key = if tag == "article" || element.value().attr("role") == Some("article") {
+            Some(format!("wrapper:{text}"))
+        } else if tag == "a" {
+            let href = element.value().attr("href").unwrap_or_default();
+            Some(format!("source:{href}:{text}"))
+        } else {
+            None
+        };
+
+        if dedup_key
+            .as_ref()
+            .is_none_or(|key| seen.insert(key.clone()))
+        {
             raw.push((kind, text));
         }
         if raw.len() >= 128 {
@@ -192,14 +203,50 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_nested_content_does_not_flood_timeline() {
+    fn duplicate_wrappers_do_not_hide_legitimate_repeated_sections() {
         let anchors = semantic_anchors_html(
             "<article><h1>Título</h1><p>Texto</p></article><article><h1>Título</h1><p>Texto</p></article>",
         );
-        let labels = anchors
+
+        let wrapper_count = anchors
             .iter()
-            .map(|item| item.label.as_str())
-            .collect::<HashSet<_>>();
-        assert_eq!(labels.len(), anchors.len());
+            .filter(|item| item.kind == SemanticAnchorKind::Answer && item.label == "Título Texto")
+            .count();
+        let heading_count = anchors
+            .iter()
+            .filter(|item| item.kind == SemanticAnchorKind::Heading && item.label == "Título")
+            .count();
+
+        assert_eq!(wrapper_count, 1);
+        assert_eq!(heading_count, 2);
+    }
+
+    #[test]
+    fn repeated_conclusion_headings_remain_distinct_anchors() {
+        let anchors = semantic_anchors_html(
+            "<section><h2>Conclusão</h2><p>A</p></section><section><h2>Conclusão</h2><p>B</p></section>",
+        );
+
+        let conclusions = anchors
+            .iter()
+            .filter(|item| item.kind == SemanticAnchorKind::Conclusion)
+            .collect::<Vec<_>>();
+
+        assert_eq!(conclusions.len(), 2);
+        assert_ne!(conclusions[0].ordinal, conclusions[1].ordinal);
+    }
+
+    #[test]
+    fn identical_source_links_are_deduplicated_by_href_and_label() {
+        let anchors = semantic_anchors_html(
+            "<a href=\"https://example.com/a\">Fonte</a><a href=\"https://example.com/a\">Fonte</a><a href=\"https://example.com/b\">Fonte</a>",
+        );
+
+        let sources = anchors
+            .iter()
+            .filter(|item| item.kind == SemanticAnchorKind::Source)
+            .collect::<Vec<_>>();
+
+        assert_eq!(sources.len(), 2);
     }
 }
