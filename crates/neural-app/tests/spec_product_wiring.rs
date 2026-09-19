@@ -119,7 +119,11 @@ fn spec_0104_product_agent_reaches_the_native_permission_policy() {
 
 #[test]
 fn spec_0105_shipped_runtime_is_decide_agent_step_not_the_reference_harness() {
-    let handler = between(APP, "fn handle_agent_observation", "fn extract_agent_observation");
+    let handler = between(
+        APP,
+        "fn handle_agent_observation",
+        "fn extract_agent_observation",
+    );
     assert!(handler.contains("decide_agent_step("));
     assert!(handler.contains("AgentStepDecision::Stop(reason)"));
     assert!(handler.contains("AgentStepDecision::Act(act)"));
