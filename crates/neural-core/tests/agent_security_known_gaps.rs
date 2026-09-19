@@ -203,3 +203,25 @@ fn reversible_session_grant_does_not_cross_origin_boundary() {
     assert!(!decision.allowed);
     assert!(decision.requires_confirmation);
 }
+
+
+#[test]
+#[ignore = "known gap HIGH-08: Navigate policy does not enforce HTTP(S) schemes"]
+fn agent_navigation_policy_rejects_non_web_schemes() {
+    let mut policy = AgentPermissionPolicy::new(None);
+
+    for url in [
+        "file:///C:/Windows/win.ini",
+        "data:text/html,<h1>hostile</h1>",
+        "javascript:alert(1)",
+    ] {
+        let decision = policy.evaluate(&AgentSecurityAction::Navigate {
+            url: url.to_string(),
+        });
+        assert!(!decision.allowed, "{url} must never be an agent navigation capability");
+        assert!(
+            !decision.requires_confirmation,
+            "{url} is invalid authority, not a confirmable web navigation"
+        );
+    }
+}
