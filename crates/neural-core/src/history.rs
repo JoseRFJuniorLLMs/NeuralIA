@@ -2,6 +2,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::Result;
 
 const DEFAULT_HISTORY_LIMIT: usize = 250;
+static HISTORY_TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
 
 /// Tecto de cada campo de texto de uma entrada. A omnibox ja corta o que o
 /// utilizador escreve, mas os alvos vindos das paginas (redireccoes, `data:`
@@ -94,7 +96,9 @@ impl HistoryStore {
     }
 
     fn temp_path(&self) -> PathBuf {
-        sibling(&self.path, "tmp")
+        let nonce = HISTORY_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let suffix = format!("tmp.{}.{}", std::process::id(), nonce);
+        sibling(&self.path, &suffix)
     }
 
     fn acquire_lock(&self, exclusive: bool) -> Result<File> {

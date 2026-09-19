@@ -10,11 +10,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
+mod sqlite_v01;
+
 const MEMORY_SCHEMA_VERSION: u32 = 1;
 
 use crate::{
     agent_security::redact_sensitive_text,
     local_intelligence::{EMBEDDING_DIM, cosine_similarity, extract_entities, hashed_embedding},
+    research::ResearchSession,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,7 +263,8 @@ impl MemoryStore {
         }
         atomic_write(&wiki_path, self.markdown(&document).as_bytes())?;
 
-        sqlite_mirror::upsert(&self.sqlite_path(), &document)?;
+        let session = self.session_for_document(&document);
+        sqlite_v01::upsert(&self.sqlite_path(), &document, session.as_ref())?;
         self.write_index_manifest()?;
         Ok(CaptureOutcome::Stored(document.id))
     }
@@ -480,8 +484,35 @@ impl MemoryStore {
     pub fn rebuild(&self) -> io::Result<()> {
         self.ensure_layout()?;
         let docs = self.documents()?;
-        sqlite_mirror::rebuild(&self.sqlite_path(), &docs)?;
+        let sessions = self.research_sessions()?;
+        sqlite_v01::rebuild(&self.sqlite_path(), &docs, &sessions)?;
         self.write_index_manifest()
+    }
+
+    fn session_for_document(&self, document: &MemoryDocument) -> Option<ResearchSession> {
+        let id = document.session_id.as_deref()?;
+        let path = self.root.join("sessions").join(format!("{id}.json"));
+        ResearchSession::load(path)
+            .ok()
+            .filter(|session| session.id == id)
+    }
+
+    fn research_sessions(&self) -> io::Result<Vec<ResearchSession>> {
+        let mut sessions = Vec::new();
+        let Ok(entries) = fs::read_dir(self.root.join("sessions")) else {
+            return Ok(sessions);
+        };
+
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(session) = ResearchSession::load(entry.path()) {
+                sessions.push(session);
+            }
+        }
+        sessions.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(sessions)
     }
 
     fn ensure_layout(&self) -> io::Result<()> {
@@ -547,11 +578,7 @@ impl MemoryStore {
             schema: MEMORY_SCHEMA_VERSION,
             generated_at: unix_seconds(),
             documents: self.documents()?.len(),
-            sqlite: if cfg!(windows) {
-                "winsqlite3-derived"
-            } else {
-                "file-derived-fallback"
-            },
+            sqlite: "rusqlite-v01-derived",
             retrieval: ["lexical", "entity", "graph", "semantic"],
         };
         atomic_write(
@@ -673,170 +700,6 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
                 Err(error)
             }
         }
-    }
-}
-
-#[cfg(windows)]
-mod sqlite_mirror {
-    use super::*;
-    use std::{
-        ffi::{CStr, CString, c_char, c_int, c_void},
-        ptr,
-    };
-
-    type Sqlite = *mut c_void;
-
-    #[link(name = "winsqlite3")]
-    unsafe extern "C" {
-        fn sqlite3_open(filename: *const c_char, database: *mut Sqlite) -> c_int;
-        fn sqlite3_close(database: Sqlite) -> c_int;
-        fn sqlite3_exec(
-            database: Sqlite,
-            sql: *const c_char,
-            callback: *mut c_void,
-            context: *mut c_void,
-            error: *mut *mut c_char,
-        ) -> c_int;
-        fn sqlite3_errmsg(database: Sqlite) -> *const c_char;
-        fn sqlite3_free(pointer: *mut c_void);
-    }
-
-    struct Database(Sqlite);
-
-    impl Database {
-        fn open(path: &Path) -> io::Result<Self> {
-            let path = CString::new(path.to_string_lossy().as_bytes())
-                .map_err(|_| io::Error::other("sqlite path contains NUL"))?;
-            let mut database: Sqlite = ptr::null_mut();
-            let code = unsafe { sqlite3_open(path.as_ptr(), &mut database) };
-            if code != 0 || database.is_null() {
-                return Err(io::Error::other("winsqlite3 could not open memory index"));
-            }
-
-            let db = Self(database);
-            db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
-            db.exec(
-                "CREATE TABLE IF NOT EXISTS schema_meta(version INTEGER NOT NULL);\
-                 INSERT INTO schema_meta(version) SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM schema_meta);\
-                 UPDATE schema_meta SET version=1;",
-            )?;
-            db.exec(
-                "CREATE TABLE IF NOT EXISTS documents(\
-                 id TEXT PRIMARY KEY,title TEXT NOT NULL,url TEXT,body TEXT NOT NULL,\
-                 provider TEXT,session_id TEXT,entities TEXT,last_seen INTEGER NOT NULL);",
-            )?;
-            let _ = db.exec(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(\
-                 id UNINDEXED,title,body,entities,tokenize='unicode61 remove_diacritics 2');",
-            );
-            Ok(db)
-        }
-
-        fn exec(&self, sql: &str) -> io::Result<()> {
-            let sql = CString::new(sql).map_err(|_| io::Error::other("SQL contains NUL"))?;
-            let mut error: *mut c_char = ptr::null_mut();
-            let code = unsafe {
-                sqlite3_exec(
-                    self.0,
-                    sql.as_ptr(),
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    &mut error,
-                )
-            };
-            if code == 0 {
-                return Ok(());
-            }
-
-            let message = if !error.is_null() {
-                let text = unsafe { CStr::from_ptr(error) }
-                    .to_string_lossy()
-                    .into_owned();
-                unsafe { sqlite3_free(error.cast()) };
-                text
-            } else {
-                unsafe { CStr::from_ptr(sqlite3_errmsg(self.0)) }
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            Err(io::Error::other(message))
-        }
-    }
-
-    impl Drop for Database {
-        fn drop(&mut self) {
-            unsafe {
-                sqlite3_close(self.0);
-            }
-        }
-    }
-
-    pub(super) fn upsert(path: &Path, document: &MemoryDocument) -> io::Result<()> {
-        let db = Database::open(path)?;
-        let entities = document.entities.join(" ");
-        db.exec(&format!(
-            "INSERT OR REPLACE INTO documents(id,title,url,body,provider,session_id,entities,last_seen)\
-             VALUES({},{},{},{},{},{},{},{});",
-            quote(&document.id),
-            quote(&document.title),
-            optional_quote(document.url.as_deref()),
-            quote(&document.body),
-            optional_quote(document.provider.as_deref()),
-            optional_quote(document.session_id.as_deref()),
-            quote(&entities),
-            document.last_seen_at
-        ))?;
-
-        let _ = db.exec(&format!(
-            "DELETE FROM memory_fts WHERE id={};\
-             INSERT INTO memory_fts(id,title,body,entities) VALUES({},{},{},{});",
-            quote(&document.id),
-            quote(&document.id),
-            quote(&document.title),
-            quote(&document.body),
-            quote(&entities)
-        ));
-        Ok(())
-    }
-
-    pub(super) fn rebuild(path: &Path, documents: &[MemoryDocument]) -> io::Result<()> {
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-        let wal = PathBuf::from(format!("{}-wal", path.to_string_lossy()));
-        let shm = PathBuf::from(format!("{}-shm", path.to_string_lossy()));
-        let _ = fs::remove_file(wal);
-        let _ = fs::remove_file(shm);
-
-        if documents.is_empty() {
-            let _ = Database::open(path)?;
-            return Ok(());
-        }
-        for document in documents {
-            upsert(path, document)?;
-        }
-        Ok(())
-    }
-
-    fn quote(value: &str) -> String {
-        format!("'{}'", value.replace('\0', "").replace('\'', "''"))
-    }
-
-    fn optional_quote(value: Option<&str>) -> String {
-        value.map(quote).unwrap_or_else(|| "NULL".into())
-    }
-}
-
-#[cfg(not(windows))]
-mod sqlite_mirror {
-    use super::*;
-
-    pub(super) fn upsert(_path: &Path, _document: &MemoryDocument) -> io::Result<()> {
-        Ok(())
-    }
-
-    pub(super) fn rebuild(_path: &Path, _documents: &[MemoryDocument]) -> io::Result<()> {
-        Ok(())
     }
 }
 
@@ -1003,20 +866,26 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(windows)]
     #[test]
-    fn windows_sqlite_mirror_is_rebuildable() {
-        let root = temp_root("sqlite");
+    fn sqlite_v01_index_is_lazy_and_rebuildable() {
+        let root = temp_root("sqlite-v01");
         let store = MemoryStore::new(&root).unwrap();
+        assert!(
+            !store.sqlite_path().exists(),
+            "constructing MemoryStore must not open/create SQLite"
+        );
+
         store
             .capture(MemoryDocument::new(
                 MemoryKind::Source,
                 MemorySourceKind::Web,
-                "SQLite mirror",
+                "SQLite V01",
                 None,
                 "rebuildable derived index",
             ))
             .unwrap();
+        assert!(store.sqlite_path().exists());
+
         store.rebuild().unwrap();
         assert!(store.sqlite_path().exists());
 
