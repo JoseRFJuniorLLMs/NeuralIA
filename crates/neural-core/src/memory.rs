@@ -441,14 +441,12 @@ impl MemoryStore {
             }
         }
 
-        let newest = docs.iter().map(|doc| doc.last_seen_at).max().unwrap_or(0);
+        let now = unix_seconds();
         let mut ranked = scores
             .into_iter()
             .map(|(index, (mut score, matched))| {
                 let doc = &docs[index];
-                if newest.saturating_sub(doc.last_seen_at) < 7 * 24 * 60 * 60 {
-                    score += 0.002;
-                }
+                score += recency_bonus(doc.last_seen_at, now);
                 (index, score, matched)
             })
             .collect::<Vec<_>>();
@@ -744,6 +742,15 @@ fn lexical_score(document: &MemoryDocument, terms: &[String]) -> f32 {
     score / (1.0 + body.len() as f32 / 500.0)
 }
 
+fn recency_bonus(last_seen_at: u64, now: u64) -> f32 {
+    const RECENT_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+    if last_seen_at > now || now.saturating_sub(last_seen_at) >= RECENT_WINDOW_SECS {
+        0.0
+    } else {
+        0.002
+    }
+}
+
 fn add_rrf(
     scores: &mut HashMap<usize, (f32, BTreeSet<&'static str>)>,
     mut stream: Vec<(usize, f32)>,
@@ -955,6 +962,17 @@ mod tests {
                 .unwrap_or_default()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn recency_bonus_uses_wall_clock_not_newest_document() {
+        let now = 2_000_000u64;
+        let six_days = 6 * 24 * 60 * 60;
+        let eight_days = 8 * 24 * 60 * 60;
+
+        assert_eq!(recency_bonus(now - six_days, now), 0.002);
+        assert_eq!(recency_bonus(now - eight_days, now), 0.0);
+        assert_eq!(recency_bonus(now + 60, now), 0.0);
     }
 
     #[test]
