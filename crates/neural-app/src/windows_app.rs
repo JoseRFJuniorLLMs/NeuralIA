@@ -20,12 +20,12 @@ use image::RgbaImage;
 use crate::ipc::constant_time_eq;
 use crate::ipc::{IpcAction, parse_ipc_message};
 use neural_core::{
-    ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentSecurityAction, CoreConfig,
-    FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent, MemoryDocument, MemoryHit,
-    MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore, ObservedPage, ReaderArticle,
-    ReaderBlock, ReaderClient, ResearchItemKind, ResearchSession, chatgpt_search_url,
-    claude_search_url, google_ai_url, is_local_network_target, is_pdf_url, parse_intent,
-    reader_html, redact_sensitive_text,
+    ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentRuntimeConfig,
+    AgentSecurityAction, CoreConfig, FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent,
+    MemoryDocument, MemoryHit, MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore,
+    ObservedPage, ReaderArticle, ReaderBlock, ReaderClient, ResearchItemKind, ResearchSession,
+    chatgpt_search_url, claude_search_url, google_ai_url, is_local_network_target, is_pdf_url,
+    parse_intent, reader_html, redact_sensitive_text,
 };
 use url::Url;
 use windows_sys::Win32::{
@@ -2179,6 +2179,28 @@ impl AgentTermination {
     }
 }
 
+/// O aviso que o utilizador vê quando o agente pára, e por quantos segundos.
+/// Ficam ao lado da razão para não se dizer uma coisa no trace e outra no ecrã.
+fn agent_stop_message(reason: AgentTermination) -> &'static str {
+    match reason {
+        AgentTermination::Completed => "Agente concluiu a sequência.",
+        AgentTermination::UserStopped => "Agente interrompido.",
+        AgentTermination::Limit => "Agente interrompido pelo limite de execução.",
+        AgentTermination::ElementMissing => "Agente não encontrou o elemento solicitado.",
+        AgentTermination::RestrictedAction => "Ação restrita: controle devolvido ao usuário.",
+        AgentTermination::UserRejected => "Ação do agente cancelada.",
+        AgentTermination::ExecutionError => "Agente parou por erro de execução.",
+    }
+}
+
+fn agent_stop_seconds(reason: AgentTermination) -> u64 {
+    match reason {
+        AgentTermination::Completed | AgentTermination::UserRejected => 3,
+        AgentTermination::RestrictedAction => 5,
+        _ => 4,
+    }
+}
+
 struct BrowserAgentState {
     goal: String,
     commands: Vec<BrowserAgentCommand>,
@@ -3286,128 +3308,101 @@ impl App {
         let Some(agent) = self.active_agent.as_ref() else {
             return;
         };
-        if agent.steps >= 24 || agent.started.elapsed() >= Duration::from_secs(120) {
-            self.show_splash(
-                "Agente interrompido pelo limite de execução.".to_string(),
-                4,
-            );
-            self.finish_agent(AgentTermination::Limit);
-            return;
-        }
+        let (commands, next_command, steps, elapsed) = (
+            agent.commands.clone(),
+            agent.next_command,
+            agent.steps,
+            agent.started.elapsed(),
+        );
 
-        let command = agent.commands.get(agent.next_command).cloned();
-        let Some(command) = command else {
-            self.show_splash("Agente concluiu a sequência.".to_string(), 3);
-            self.finish_agent(AgentTermination::Completed);
-            return;
-        };
-
-        if matches!(command, BrowserAgentCommand::Extract) {
-            let clean = redact_sensitive_text(&page.text_excerpt);
-            let mut document = MemoryDocument::new(
-                MemoryKind::ResearchResult,
-                MemorySourceKind::Web,
-                if page.title.is_empty() {
-                    "Extração do agente".to_string()
-                } else {
-                    page.title.clone()
-                },
-                Some(page.url.clone()),
-                clean.clone(),
-            );
-            if let Some(session) = &self.current_research {
-                document = document.session(session.id.clone());
-            }
-            self.memory.capture(document);
-            if let Some(agent) = &mut self.active_agent {
-                agent.trace.push(format!(
-                    "extract {} chars from {}",
-                    clean.chars().count(),
-                    page.url
-                ));
-                agent.next_command += 1;
-                agent.steps += 1;
-            }
-            self.show_native_text("NeuralIA Agent — Extração", &clean);
-            self.finish_agent(AgentTermination::Completed);
-            return;
-        }
-
-        let action = match command {
-            BrowserAgentCommand::Search(value) => {
-                let target = page.elements.iter().find(|element| {
-                    element.interactable
-                        && matches!(
-                            agent_field_kind(element),
-                            FieldKind::Search | FieldKind::Text
-                        )
-                });
-                target.cloned().map(|target| AgentAction::TypeText {
-                    target,
-                    text: value,
-                    field: FieldKind::Search,
-                })
-            }
-            BrowserAgentCommand::Click(label) => find_agent_element(&page, &label, false)
-                .cloned()
-                .map(|target| AgentAction::Click { target }),
-            BrowserAgentCommand::Select { label, value } => find_agent_element(&page, &label, true)
-                .cloned()
-                .map(|target| AgentAction::Select { target, value }),
-            BrowserAgentCommand::Extract => None,
-        };
-
-        let Some(action) = action else {
-            self.show_splash("Agente não encontrou o elemento solicitado.".to_string(), 4);
-            self.finish_agent(AgentTermination::ElementMissing);
-            return;
-        };
-
-        let security = app_agent_security_action(&action, &page);
         let decision = {
             let Some(agent) = self.active_agent.as_mut() else {
                 return;
             };
-            agent.policy.evaluate(&security)
+            decide_agent_step(
+                &commands,
+                next_command,
+                steps,
+                elapsed,
+                &page,
+                &mut agent.policy,
+            )
         };
 
-        if !decision.allowed {
-            if decision.risk == ActionRisk::Restricted {
+        match decision {
+            AgentStepDecision::Stop(reason) => {
                 self.show_splash(
-                    "Ação restrita: controle devolvido ao usuário.".to_string(),
-                    5,
+                    agent_stop_message(reason).to_string(),
+                    agent_stop_seconds(reason),
                 );
-                self.finish_agent(AgentTermination::RestrictedAction);
-                return;
+                self.finish_agent(reason);
             }
-            if !decision.requires_confirmation
-                || !self.confirm_agent_action(&decision.reason, &action)
-            {
-                if let Some(agent) = self.active_agent.as_mut() {
-                    agent.policy.record_user_confirmation(&security, false);
+            AgentStepDecision::Extract => self.extract_agent_observation(&page),
+            AgentStepDecision::Act(act) => {
+                let AgentAct {
+                    action,
+                    security,
+                    confirmation,
+                } = *act;
+                if let Some(reason) = confirmation {
+                    let approved = self.confirm_agent_action(&reason, &action);
+                    if let Some(agent) = self.active_agent.as_mut() {
+                        agent.policy.record_user_confirmation(&security, approved);
+                    }
+                    if !approved {
+                        self.show_splash("Ação do agente cancelada.".to_string(), 3);
+                        self.finish_agent(AgentTermination::UserRejected);
+                        return;
+                    }
                 }
-                self.show_splash("Ação do agente cancelada.".to_string(), 3);
-                self.finish_agent(AgentTermination::UserRejected);
-                return;
-            }
-            if let Some(agent) = self.active_agent.as_mut() {
-                agent.policy.record_user_confirmation(&security, true);
-            }
-        }
 
-        match self.execute_agent_action(&action) {
-            Ok(()) => {
-                if let Some(agent) = self.active_agent.as_mut() {
-                    agent.trace.push(agent_trace_action(&action));
-                    agent.next_command += 1;
-                    agent.steps += 1;
+                match self.execute_agent_action(&action) {
+                    Ok(()) => {
+                        if let Some(agent) = self.active_agent.as_mut() {
+                            agent.trace.push(agent_trace_action(&action));
+                            agent.next_command += 1;
+                            agent.steps += 1;
+                        }
+                    }
+                    Err(error) => {
+                        self.show_splash(format!("Agent: {error}"), 4);
+                        self.finish_agent(AgentTermination::ExecutionError);
+                    }
                 }
             }
-            Err(error) => {
-                self.show_splash(format!("Agent: {error}"), 4);
-                self.finish_agent(AgentTermination::ExecutionError);
-            }
         }
+    }
+
+    /// O comando `extract`: o texto observado vai para a memória semântica, já
+    /// redigido, e o agente termina.
+    fn extract_agent_observation(&mut self, page: &ObservedPage) {
+        let clean = redact_sensitive_text(&page.text_excerpt);
+        let mut document = MemoryDocument::new(
+            MemoryKind::ResearchResult,
+            MemorySourceKind::Web,
+            if page.title.is_empty() {
+                "Extração do agente".to_string()
+            } else {
+                page.title.clone()
+            },
+            Some(page.url.clone()),
+            clean.clone(),
+        );
+        if let Some(session) = &self.current_research {
+            document = document.session(session.id.clone());
+        }
+        self.memory.capture(document);
+        if let Some(agent) = &mut self.active_agent {
+            agent.trace.push(format!(
+                "extract {} chars from {}",
+                clean.chars().count(),
+                page.url
+            ));
+            agent.next_command += 1;
+            agent.steps += 1;
+        }
+        self.show_native_text("NeuralIA Agent — Extração", &clean);
+        self.finish_agent(AgentTermination::Completed);
     }
 
     fn execute_agent_action(&self, action: &AgentAction) -> Result<(), String> {
@@ -5996,6 +5991,115 @@ fn find_agent_element<'a>(
     })
 }
 
+/// O que fazer com uma observação da página. Decidido sem tocar na UI, no
+/// WebView nem na memória: os limites, a escolha do elemento e o gate da
+/// política vivem aqui, e `handle_agent_observation` fica só com a execução do
+/// que isto decidir.
+///
+/// A separação é o que torna a SPEC-0105 testável no código que embarca. O
+/// `AgentRuntime` do `neural-core` -- sobre o qual corre
+/// `spec_0105_agent_runtime_is_bounded_structured_and_human_gated` -- não é
+/// usado por esta aplicação: o agente do produto é este. Enquanto a decisão
+/// estivesse entalada entre `show_splash` e `evaluate_script`, nenhum teste
+/// conseguia ficar vermelho quando o produto regredisse.
+#[derive(Debug, Clone, PartialEq)]
+enum AgentStepDecision {
+    /// Terminar, com a razão que vai para o trace e para o utilizador.
+    Stop(AgentTermination),
+    /// O comando `extract`: guardar o texto observado e terminar.
+    Extract,
+    /// Executar a ação (em `Box` porque é muitas vezes maior do que as outras
+    /// duas variantes).
+    Act(Box<AgentAct>),
+}
+
+/// A ação aprovada pelo gate, com a razão da confirmação quando a política
+/// exige um sim humano antes de ela acontecer.
+#[derive(Debug, Clone, PartialEq)]
+struct AgentAct {
+    action: AgentAction,
+    security: AgentSecurityAction,
+    confirmation: Option<String>,
+}
+
+/// O orçamento do agente vem do `AgentRuntimeConfig::default()` da SPEC-0105 em
+/// vez de números escritos à mão aqui: dois sítios com os mesmos limites
+/// divergem sem nada os apanhar.
+fn decide_agent_step(
+    commands: &[BrowserAgentCommand],
+    next_command: usize,
+    steps: usize,
+    elapsed: Duration,
+    page: &ObservedPage,
+    policy: &mut AgentPermissionPolicy,
+) -> AgentStepDecision {
+    let budget = AgentRuntimeConfig::default();
+    if steps >= budget.max_steps || elapsed >= budget.max_wall_time {
+        return AgentStepDecision::Stop(AgentTermination::Limit);
+    }
+
+    let Some(command) = commands.get(next_command) else {
+        return AgentStepDecision::Stop(AgentTermination::Completed);
+    };
+
+    let action = match command {
+        BrowserAgentCommand::Extract => return AgentStepDecision::Extract,
+        BrowserAgentCommand::Search(value) => page
+            .elements
+            .iter()
+            .find(|element| {
+                element.interactable
+                    && matches!(
+                        agent_field_kind(element),
+                        FieldKind::Search | FieldKind::Text
+                    )
+            })
+            .cloned()
+            .map(|target| AgentAction::TypeText {
+                target,
+                text: value.clone(),
+                field: FieldKind::Search,
+            }),
+        BrowserAgentCommand::Click(label) => find_agent_element(page, label, false)
+            .cloned()
+            .map(|target| AgentAction::Click { target }),
+        BrowserAgentCommand::Select { label, value } => find_agent_element(page, label, true)
+            .cloned()
+            .map(|target| AgentAction::Select {
+                target,
+                value: value.clone(),
+            }),
+    };
+
+    let Some(action) = action else {
+        return AgentStepDecision::Stop(AgentTermination::ElementMissing);
+    };
+
+    let security = app_agent_security_action(&action, page);
+    let decision = policy.evaluate(&security);
+    if decision.allowed {
+        return AgentStepDecision::Act(Box::new(AgentAct {
+            action,
+            security,
+            confirmation: None,
+        }));
+    }
+    if decision.risk == ActionRisk::Restricted {
+        return AgentStepDecision::Stop(AgentTermination::RestrictedAction);
+    }
+    if !decision.requires_confirmation {
+        // Negada sem caminho de confirmação: fica no log de auditoria como
+        // recusa, tal como a recusa explícita do utilizador.
+        policy.record_user_confirmation(&security, false);
+        return AgentStepDecision::Stop(AgentTermination::UserRejected);
+    }
+    AgentStepDecision::Act(Box::new(AgentAct {
+        action,
+        security,
+        confirmation: Some(decision.reason),
+    }))
+}
+
 fn app_agent_security_action(action: &AgentAction, page: &ObservedPage) -> AgentSecurityAction {
     let origin = Url::parse(&page.url)
         .ok()
@@ -8188,6 +8292,187 @@ mod tests {
                 app_agent_security_action(&AgentAction::Click { target }, &page),
                 AgentSecurityAction::Payment { .. }
             ));
+        }
+    }
+
+    /// A SPEC-0105 sobre o agente que EMBARCA. O teste de aceitação em
+    /// `spec_010x_acceptance.rs` corre sobre o `AgentRuntime` do `neural-core`,
+    /// que esta aplicação não usa: apagar o gate daqui deixava-o verde.
+    /// Estes correm sobre `decide_agent_step`, que é o que decide no produto.
+    mod spec_0105_shipping_agent {
+        use super::*;
+
+        fn element(role: &str, name: &str) -> AgentElement {
+            AgentElement {
+                id: format!("n1-{name}"),
+                generation: 1,
+                role: role.into(),
+                name: name.into(),
+                text: name.into(),
+                origin: "https://example.com".into(),
+                frame: "top".into(),
+                visible: true,
+                interactable: true,
+            }
+        }
+
+        fn page(elements: Vec<AgentElement>) -> ObservedPage {
+            ObservedPage {
+                generation: 1,
+                url: "https://example.com/loja".into(),
+                title: "Loja".into(),
+                text_excerpt: "texto observado".into(),
+                elements,
+            }
+        }
+
+        fn policy() -> AgentPermissionPolicy {
+            let mut policy = AgentPermissionPolicy::new(Some("https://example.com".into()));
+            policy.grant_reversible_session_actions(true);
+            policy
+        }
+
+        fn decide(
+            commands: &[BrowserAgentCommand],
+            page: &ObservedPage,
+            policy: &mut AgentPermissionPolicy,
+        ) -> AgentStepDecision {
+            decide_agent_step(commands, 0, 0, Duration::ZERO, page, policy)
+        }
+
+        #[test]
+        fn payment_click_never_reaches_the_page() {
+            let page = page(vec![element("button", "Comprar agora")]);
+            let mut policy = policy();
+            let decision = decide(
+                &[BrowserAgentCommand::Click("comprar".into())],
+                &page,
+                &mut policy,
+            );
+
+            assert_eq!(
+                decision,
+                AgentStepDecision::Stop(AgentTermination::RestrictedAction)
+            );
+            // A decisão passou mesmo pela política, e ficou registada.
+            assert_eq!(policy.audit().len(), 1);
+            assert!(!policy.audit()[0].allowed);
+        }
+
+        #[test]
+        fn sensitive_submit_waits_for_a_human_yes() {
+            let page = page(vec![element("button", "Enviar formulário")]);
+            let mut policy = policy();
+            let decision = decide(
+                &[BrowserAgentCommand::Click("enviar".into())],
+                &page,
+                &mut policy,
+            );
+
+            let AgentStepDecision::Act(act) = decision else {
+                panic!("esperava Act, veio {decision:?}");
+            };
+            assert!(
+                act.confirmation.is_some(),
+                "ação sensível não pode seguir sem confirmação: {act:?}"
+            );
+            assert!(matches!(act.security, AgentSecurityAction::Submit { .. }));
+        }
+
+        #[test]
+        fn reversible_click_runs_under_the_session_grant() {
+            let page = page(vec![element("button", "Ver detalhes")]);
+            let mut policy = policy();
+            let decision = decide(
+                &[BrowserAgentCommand::Click("ver detalhes".into())],
+                &page,
+                &mut policy,
+            );
+
+            let AgentStepDecision::Act(act) = decision else {
+                panic!("esperava Act, veio {decision:?}");
+            };
+            assert_eq!(act.confirmation, None);
+            assert!(policy.audit()[0].allowed);
+        }
+
+        #[test]
+        fn cross_origin_element_needs_approval() {
+            // O mesmo clique reversível, com a página noutra origem que a
+            // sessão nunca aprovou.
+            let mut other = page(vec![element("button", "Ver detalhes")]);
+            other.url = "https://outra.example/loja".into();
+            let mut policy = policy();
+            let decision = decide(
+                &[BrowserAgentCommand::Click("ver detalhes".into())],
+                &other,
+                &mut policy,
+            );
+
+            let AgentStepDecision::Act(act) = decision else {
+                panic!("esperava Act, veio {decision:?}");
+            };
+            assert!(act.confirmation.is_some(), "{act:?}");
+        }
+
+        #[test]
+        fn budget_comes_from_the_spec_and_stops_the_agent() {
+            let budget = AgentRuntimeConfig::default();
+            let page = page(vec![element("button", "Ver detalhes")]);
+            let commands = [BrowserAgentCommand::Click("ver detalhes".into())];
+
+            for (steps, elapsed) in [
+                (budget.max_steps, Duration::ZERO),
+                (0, budget.max_wall_time),
+            ] {
+                let mut policy = policy();
+                let decision = decide_agent_step(&commands, 0, steps, elapsed, &page, &mut policy);
+                assert_eq!(decision, AgentStepDecision::Stop(AgentTermination::Limit));
+                // Parou antes de sequer consultar a política.
+                assert!(policy.audit().is_empty());
+            }
+        }
+
+        #[test]
+        fn missing_element_and_exhausted_plan_are_distinct_stops() {
+            let empty = page(Vec::new());
+            let mut policy = policy();
+            assert_eq!(
+                decide(
+                    &[BrowserAgentCommand::Click("comprar".into())],
+                    &empty,
+                    &mut policy
+                ),
+                AgentStepDecision::Stop(AgentTermination::ElementMissing)
+            );
+            assert_eq!(
+                decide(&[], &empty, &mut policy),
+                AgentStepDecision::Stop(AgentTermination::Completed)
+            );
+            assert!(policy.audit().is_empty());
+        }
+
+        #[test]
+        fn typed_text_goes_through_the_gate_as_typed_text() {
+            let page = page(vec![element("textbox", "Pesquisar")]);
+            let mut policy = policy();
+            let decision = decide(
+                &[BrowserAgentCommand::Search("rust webview".into())],
+                &page,
+                &mut policy,
+            );
+
+            let AgentStepDecision::Act(act) = decision else {
+                panic!("esperava Act, veio {decision:?}");
+            };
+            assert!(matches!(
+                act.security,
+                AgentSecurityAction::TypeText {
+                    field: FieldKind::Search,
+                    ..
+                }
+            ));
+            assert_eq!(policy.audit().len(), 1);
         }
     }
 
