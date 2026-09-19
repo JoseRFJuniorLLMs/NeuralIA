@@ -55,10 +55,7 @@ fn rebuild_temp_path(path: &Path) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    parent.join(format!(
-        ".{name}.rebuild-{}-{nonce}",
-        std::process::id()
-    ))
+    parent.join(format!(".{name}.rebuild-{}-{nonce}", std::process::id()))
 }
 
 fn recover_interrupted_rebuild(path: &Path) -> io::Result<()> {
@@ -930,10 +927,7 @@ mod tests {
         {
             let connection = Connection::open(&path).unwrap();
             connection
-                .execute(
-                    "UPDATE schema_version SET schema_sha256='corrupt'",
-                    [],
-                )
+                .execute("UPDATE schema_version SET schema_sha256='corrupt'", [])
                 .unwrap();
         }
         assert!(open_ready(&path).is_err());
@@ -941,7 +935,9 @@ mod tests {
         rebuild(&path, std::slice::from_ref(&doc), &[]).unwrap();
         let connection = open_ready(&path).unwrap();
         let hash: String = connection
-            .query_row("SELECT schema_sha256 FROM schema_version", [], |row| row.get(0))
+            .query_row("SELECT schema_sha256 FROM schema_version", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         let count: i64 = connection
             .query_row("SELECT count(*) FROM knowledge_page", [], |row| row.get(0))
