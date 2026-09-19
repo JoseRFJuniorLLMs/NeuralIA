@@ -243,14 +243,11 @@ impl ResearchSession {
         );
 
         for item in &self.items {
-            let provenance = item
-                .provider
-                .as_deref()
-                .or(item.url.as_deref())
-                .unwrap_or("local");
+            let provider = item.provider.as_deref().unwrap_or("local");
+            let url = item.url.as_deref().unwrap_or("");
             output.push_str(&format!(
-                "### {}\n\nOrigem: {}\n\n{}\n\n",
-                item.title, provenance, item.text
+                "### {}\n\nProvedor: {}\n\nURL: {}\n\n{}\n\n",
+                item.title, provider, url, item.text
             ));
         }
 
@@ -299,8 +296,7 @@ fn extract_dates(input: &str) -> Vec<String> {
         .into_iter()
         .filter(|token| {
             let separators = token.matches(['/', '-']).count();
-            separators == 2
-                || (token.len() == 4 && token.chars().all(|ch| ch.is_ascii_digit()))
+            separators == 2 || (token.len() == 4 && token.chars().all(|ch| ch.is_ascii_digit()))
         })
         .collect()
 }
@@ -312,7 +308,10 @@ fn short_title(input: &str, max: usize) -> String {
     } else {
         format!(
             "{}…",
-            clean.chars().take(max.saturating_sub(1)).collect::<String>()
+            clean
+                .chars()
+                .take(max.saturating_sub(1))
+                .collect::<String>()
         )
     }
 }
