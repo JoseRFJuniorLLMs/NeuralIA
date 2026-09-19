@@ -5,7 +5,9 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::Command,
-    ptr, thread,
+    ptr,
+    sync::mpsc,
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -17,11 +19,19 @@ type Statement = *mut c_void;
 
 const SQLITE_OK: c_int = 0;
 const SQLITE_ROW: c_int = 100;
+const REINDEX_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[link(name = "winsqlite3")]
 unsafe extern "C" {
     fn sqlite3_open(filename: *const c_char, database: *mut Sqlite) -> c_int;
     fn sqlite3_close(database: Sqlite) -> c_int;
+    fn sqlite3_exec(
+        database: Sqlite,
+        sql: *const c_char,
+        callback: *mut c_void,
+        context: *mut c_void,
+        error: *mut *mut c_char,
+    ) -> c_int;
     fn sqlite3_prepare_v2(
         database: Sqlite,
         sql: *const c_char,
@@ -33,6 +43,7 @@ unsafe extern "C" {
     fn sqlite3_column_int64(statement: Statement, column: c_int) -> i64;
     fn sqlite3_finalize(statement: Statement) -> c_int;
     fn sqlite3_errmsg(database: Sqlite) -> *const c_char;
+    fn sqlite3_free(pointer: *mut c_void);
 }
 
 struct Database(Sqlite);
@@ -49,6 +60,34 @@ impl Database {
             ));
         }
         Ok(Self(database))
+    }
+
+    fn exec(&self, sql: &str) -> io::Result<()> {
+        let sql = CString::new(sql).map_err(|_| io::Error::other("SQL contains NUL"))?;
+        let mut error: *mut c_char = ptr::null_mut();
+        let code = unsafe {
+            sqlite3_exec(
+                self.0,
+                sql.as_ptr(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut error,
+            )
+        };
+        if code == SQLITE_OK {
+            return Ok(());
+        }
+
+        let message = if !error.is_null() {
+            let text = unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { sqlite3_free(error.cast()) };
+            text
+        } else {
+            self.error_message()
+        };
+        Err(io::Error::other(message))
     }
 
     fn count_fts(&self, query: &str) -> io::Result<i64> {
@@ -112,7 +151,10 @@ struct Baseline {
     documents: usize,
     hybrid_query_median_us: u128,
     fts_query_median_us: u128,
-    reindex_ms: u128,
+    fts_build_ms: u128,
+    reindex_ms: Option<u128>,
+    reindex_timed_out: bool,
+    reindex_lower_bound_ms: u128,
     rss_bytes_idle: u64,
     threads_idle: u64,
     fts_matches: i64,
@@ -146,7 +188,8 @@ fn seed_documents(store: &MemoryStore, count: usize) -> io::Result<String> {
             format!("Baseline document {index}"),
             Some(format!("https://baseline.example/{index}")),
             format!(
-                "NeuralIA memory baseline corpus item {index}.{marker}                 Retrieval, provenance, browser research and local semantic memory."
+                "NeuralIA memory baseline corpus item {index}.{marker}\
+                 Retrieval, provenance, browser research and local semantic memory."
             ),
         );
         if index == count / 2 {
@@ -159,6 +202,58 @@ fn seed_documents(store: &MemoryStore, count: usize) -> io::Result<String> {
     }
 
     sentinel_id.ok_or_else(|| io::Error::other("baseline corpus has no sentinel document"))
+}
+
+fn quote(value: &str) -> String {
+    format!("'{}'", value.replace('\0', "").replace('\'', "''"))
+}
+
+fn build_fts_baseline(path: &Path, count: usize) -> io::Result<u128> {
+    let _ = fs::remove_file(path);
+    let started = Instant::now();
+    let database = Database::open(path)?;
+    database.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+    database.exec(
+        "CREATE VIRTUAL TABLE memory_fts USING fts5(\
+         id UNINDEXED,title,body,entities,tokenize='unicode61 remove_diacritics 2');\
+         BEGIN IMMEDIATE;",
+    )?;
+
+    let mut rows = Vec::with_capacity(500);
+    for index in 0..count {
+        let marker = if index == count / 2 {
+            " baselinequeryneedle "
+        } else {
+            " "
+        };
+        rows.push(format!(
+            "({},{},{},{})",
+            quote(&format!("baseline-{index}")),
+            quote(&format!("Baseline document {index}")),
+            quote(&format!(
+                "NeuralIA memory baseline corpus item {index}.{marker}\
+                 Retrieval, provenance, browser research and local semantic memory."
+            )),
+            quote("NeuralIA memory research")
+        ));
+
+        if rows.len() == 500 {
+            database.exec(&format!(
+                "INSERT INTO memory_fts(id,title,body,entities) VALUES {};",
+                rows.join(",")
+            ))?;
+            rows.clear();
+        }
+    }
+
+    if !rows.is_empty() {
+        database.exec(&format!(
+            "INSERT INTO memory_fts(id,title,body,entities) VALUES {};",
+            rows.join(",")
+        ))?;
+    }
+    database.exec("COMMIT;")?;
+    Ok(started.elapsed().as_millis())
 }
 
 fn median_micros(mut operation: impl FnMut(), repetitions: usize) -> u128 {
@@ -174,7 +269,9 @@ fn median_micros(mut operation: impl FnMut(), repetitions: usize) -> u128 {
 
 fn process_metrics() -> io::Result<ProcessMetrics> {
     let script = format!(
-        "$p=Get-Process -Id {};          [pscustomobject]@{{rss_bytes=[uint64]$p.WorkingSet64;threads=[uint64]$p.Threads.Count}}          | ConvertTo-Json -Compress",
+        "$p=Get-Process -Id {}; \
+         [pscustomobject]@{{rss_bytes=[uint64]$p.WorkingSet64;threads=[uint64]$p.Threads.Count}} \
+         | ConvertTo-Json -Compress",
         std::process::id()
     );
     let output = Command::new("pwsh")
@@ -200,6 +297,29 @@ fn process_metrics() -> io::Result<ProcessMetrics> {
     })
 }
 
+fn measure_reindex_with_timeout(root: &Path) -> (Option<u128>, bool, u128) {
+    let root = root.to_path_buf();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let started = Instant::now();
+        let result = MemoryStore::new(&root).and_then(|store| store.rebuild());
+        let _ = sender.send((started.elapsed().as_millis(), result));
+    });
+
+    match receiver.recv_timeout(REINDEX_TIMEOUT) {
+        Ok((elapsed, Ok(()))) => (Some(elapsed), false, elapsed),
+        Ok((elapsed, Err(error))) => panic!("baseline rebuild failed after {elapsed} ms: {error}"),
+        Err(mpsc::RecvTimeoutError::Timeout) => (
+            None,
+            true,
+            REINDEX_TIMEOUT.as_millis(),
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("baseline rebuild worker disconnected")
+        }
+    }
+}
+
 fn measure(size: usize) -> io::Result<Baseline> {
     let root = temp_root(size);
     let store = MemoryStore::new(&root)?;
@@ -212,6 +332,7 @@ fn measure(size: usize) -> io::Result<Baseline> {
         "sentinel document must be present in hybrid results"
     );
 
+    let repetitions = if size >= 100_000 { 1 } else { 3 };
     let hybrid_query_median_us = median_micros(
         || {
             let hits = store.query(&query).expect("hybrid baseline query");
@@ -220,14 +341,12 @@ fn measure(size: usize) -> io::Result<Baseline> {
                 "sentinel document must remain in hybrid results"
             );
         },
-        3,
+        repetitions,
     );
 
-    let reindex_started = Instant::now();
-    store.rebuild()?;
-    let reindex_ms = reindex_started.elapsed().as_millis();
-
-    let database = Database::open(&root.join("db").join("neural-memory.sqlite"))?;
+    let fts_path = root.join("db").join("fts-query-baseline.sqlite");
+    let fts_build_ms = build_fts_baseline(&fts_path, size)?;
+    let database = Database::open(&fts_path)?;
     let fts_matches = database.count_fts("baselinequeryneedle")?;
     assert_eq!(fts_matches, 1);
 
@@ -245,12 +364,19 @@ fn measure(size: usize) -> io::Result<Baseline> {
 
     thread::sleep(Duration::from_millis(250));
     let metrics = process_metrics()?;
+    drop(database);
+
+    let (reindex_ms, reindex_timed_out, reindex_lower_bound_ms) =
+        measure_reindex_with_timeout(&root);
 
     let result = Baseline {
         documents: size,
         hybrid_query_median_us,
         fts_query_median_us,
+        fts_build_ms,
         reindex_ms,
+        reindex_timed_out,
+        reindex_lower_bound_ms,
         rss_bytes_idle: metrics.rss_bytes,
         threads_idle: metrics.threads,
         fts_matches,
@@ -260,7 +386,10 @@ fn measure(size: usize) -> io::Result<Baseline> {
         "{}",
         serde_json::to_string(&result).map_err(io::Error::other)?
     );
-    let _ = fs::remove_dir_all(root);
+
+    if !reindex_timed_out {
+        let _ = fs::remove_dir_all(root);
+    }
     Ok(result)
 }
 
