@@ -1,17 +1,17 @@
-pub mod semantic_timeline;
 pub mod agent_runtime;
-pub mod research;
-pub mod memory;
-pub mod local_intelligence;
 pub mod agent_security;
 pub mod config;
 pub mod error;
 pub mod history;
 pub mod intent;
+pub mod local_intelligence;
+pub mod memory;
 pub mod reader;
 pub mod render;
+pub mod research;
 pub mod search;
 pub mod security;
+pub mod semantic_timeline;
 
 pub use config::CoreConfig;
 pub use error::{NeuralError, Result};
