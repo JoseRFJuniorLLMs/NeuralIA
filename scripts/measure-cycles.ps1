@@ -29,7 +29,16 @@ $ErrorActionPreference = "Stop"
 $resolved = (Resolve-Path $ExePath).Path
 
 function Get-DescendantIds([int]$RootId) {
-    $all = Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name
+    # Win32_Process via CIM is useful for ownership, but on hosted Windows
+    # runners a WMI/CIM query can occasionally stall for minutes. Bound this
+    # optional precision source; the total-process delta remains the fallback.
+    try {
+        $all = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name -OperationTimeoutSec 2 -ErrorAction Stop)
+    }
+    catch {
+        Write-Warning "Win32_Process snapshot unavailable; using WebView process delta: $($_.Exception.Message)"
+        return @()
+    }
     $byParent = @{}
     foreach ($proc in $all) {
         if (-not $byParent.ContainsKey($proc.ParentProcessId)) {
