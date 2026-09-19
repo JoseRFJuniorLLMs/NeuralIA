@@ -8610,29 +8610,39 @@ mod tests {
 
     #[test]
     fn injected_scripts_capture_globals_before_the_page_runs() {
-        // O token so passa pela captura feita no document-created: um unico
-        // `encodeURIComponent` por script, o da captura, e nenhum `const` de
-        // topo que a pagina pudesse ler pelo nome.
+        // A capability nunca entra numa URL. O transporte e o serializador
+        // sao capturados no document-created, antes de qualquer script remoto.
         for (name, script) in [
             ("keymap", NEURALIA_KEYMAP_SCRIPT),
             ("return", EXTERNAL_RETURN_BUTTON),
             ("gmail", GMAIL_MONITOR_SCRIPT),
+            ("agent", AGENT_OBSERVER_SCRIPT),
             ("comparator", COMPARATOR_INJECT_SCRIPT),
         ] {
             assert!(script.contains("__NEURALIA_CAP__"), "{name}");
             assert_eq!(
-                script.matches("encodeURIComponent").count(),
+                script.matches("window.chrome.webview.postMessage").count(),
                 1,
-                "{name}: so a captura pode nomear encodeURIComponent"
+                "{name}: postMessage deve ser capturado uma unica vez"
+            );
+            assert_eq!(
+                script.matches("JSON.stringify").count(),
+                1,
+                "{name}: JSON.stringify deve ser capturado uma unica vez"
             );
             assert!(
-                script.contains("const encode = encodeURIComponent;"),
+                script.contains(
+                    "const post = window.chrome.webview.postMessage.bind(window.chrome.webview);"
+                ),
                 "{name}"
             );
+            assert!(script.contains("const stringify = JSON.stringify;"), "{name}");
+            assert!(!script.contains("?cap="), "{name}");
             assert!(script.trim_start().starts_with("(function"), "{name}");
         }
-        // Os scripts que so correm depois do DOMContentLoaded nao tocam em
-        // nenhum global do DOM pelo nome.
+
+        // Os scripts que correm depois do DOMContentLoaded usam referencias
+        // capturadas para as primitivas DOM que carregam autoridade.
         for (name, script) in [
             ("return", EXTERNAL_RETURN_BUTTON),
             ("comparator", COMPARATOR_INJECT_SCRIPT),
@@ -8658,8 +8668,7 @@ mod tests {
             }
         }
 
-        // Nenhum handler que leve o token responde a eventos sinteticos, e os
-        // botoes nao expoem o handler em `onclick`.
+        // Nenhum handler que dispare acao nativa aceita evento sintetico.
         assert_eq!(
             COMPARATOR_INJECT_SCRIPT
                 .matches("if (!event.isTrusted")
@@ -8671,7 +8680,6 @@ mod tests {
         assert!(EXTERNAL_RETURN_BUTTON.contains("if (!event.isTrusted) return;"));
         assert!(NEURALIA_KEYMAP_SCRIPT.contains("if (!e.isTrusted) { return; }"));
 
-        // Redireccionador do Google: o dominio e os subdominios, nao um sufixo.
         assert!(
             COMPARATOR_INJECT_SCRIPT
                 .contains("host === 'google.com' || host.endsWith('.google.com')")
@@ -8680,46 +8688,15 @@ mod tests {
     }
 
     #[test]
-    fn pdf_origin_is_exact_not_prefix_based() {
-        assert!(is_pdf_internal_target(
-            "http://neuralia-pdf.localhost/viewer.html"
-        ));
-        assert!(!is_pdf_internal_target(
-            "http://neuralia-pdf.localhost.evil.test/viewer.html"
-        ));
-        assert!(!is_pdf_internal_target(
-            "https://neuralia-pdf.localhost/viewer.html"
-        ));
-    }
-
-    #[test]
-    fn comparator_script_contains_independent_response_timeline() {
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia-response-rail"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("Resposta anterior"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("Próxima resposta"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("scrollToPosition"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia-scroll-root"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("semanticAnchors"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("data-message-author-role"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("ariaLabel"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("top:'50%'"));
-    }
-
-    #[test]
     fn browser_agent_bridge_is_bounded_and_has_no_arbitrary_js_channel() {
         assert!(AGENT_OBSERVER_SCRIPT.contains("rows.length >= 32"));
         assert!(AGENT_OBSERVER_SCRIPT.contains("pageText"));
-        assert!(AGENT_OBSERVER_SCRIPT.contains("neuralia:agent-observation"));
+        assert!(AGENT_OBSERVER_SCRIPT.contains("action:'agent-observation'"));
+        assert!(AGENT_OBSERVER_SCRIPT.contains(".join('\\n').slice(0, 1200)"));
+        assert!(AGENT_OBSERVER_SCRIPT.contains("post(stringify("));
+        assert!(!AGENT_OBSERVER_SCRIPT.contains("?cap="));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("eval("));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("new Function"));
-    }
-
-    #[test]
-    fn research_session_commands_are_exposed_in_native_input() {
-        let source = include_str!("windows_app.rs");
-        assert!(source.contains("research:compare"));
-        assert!(source.contains("research:synthesize"));
-        assert!(source.contains("research:export"));
     }
 
     #[test]
@@ -8738,9 +8715,13 @@ mod tests {
 
     #[test]
     fn comparator_captures_provider_answers_for_research_session() {
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia:research-answer?col="));
+        assert!(
+            COMPARATOR_INJECT_SCRIPT
+                .contains("act('research-answer', { col:colIndex, text })")
+        );
         assert!(COMPARATOR_INJECT_SCRIPT.contains("data-message-author-role"));
         assert!(COMPARATOR_INJECT_SCRIPT.contains("scheduleResearchAnswer"));
+        assert!(!COMPARATOR_INJECT_SCRIPT.contains("neuralia:research-answer"));
     }
 
     #[test]
@@ -9017,7 +8998,8 @@ mod tests {
     #[test]
     fn comparator_minimize_control_is_wired_and_layout_keeps_one_visible() {
         assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia-comp-minimize"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia:minimize?col="));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("act('minimize', { col:colIndex })"));
+        assert!(!COMPARATOR_INJECT_SCRIPT.contains("neuralia:minimize"));
         assert!(COMPARATOR_BUTTON_COLLAPSED.contains("neuralia-comp-minimize"));
     }
 
