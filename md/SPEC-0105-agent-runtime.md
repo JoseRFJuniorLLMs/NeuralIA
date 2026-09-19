@@ -1,6 +1,6 @@
 # SPEC-0105 — Web Agent Runtime
 
-**Status:** Proposed  
+**Status:** Implemented bounded runtime — NeuralIA 2.0  
 **Target:** NeuralIA 2.0  
 **Dependency:** SPEC-0104 must be implemented first
 
