@@ -39,7 +39,11 @@ pub fn semantic_anchors_html(input: &str) -> Vec<SemanticAnchor> {
     for element in document.select(&selector) {
         let tag = element.value().name();
         let role = element.value().attr("data-message-author-role");
-        let class = element.value().attr("class").unwrap_or_default().to_lowercase();
+        let class = element
+            .value()
+            .attr("class")
+            .unwrap_or_default()
+            .to_lowercase();
         let text = normalize_label(&element.text().collect::<Vec<_>>().join(" "), 96);
 
         if text.is_empty() {
@@ -100,7 +104,10 @@ fn normalize_label(input: &str, limit: usize) -> String {
     } else {
         format!(
             "{}…",
-            clean.chars().take(limit.saturating_sub(1)).collect::<String>()
+            clean
+                .chars()
+                .take(limit.saturating_sub(1))
+                .collect::<String>()
         )
     }
 }
@@ -125,24 +132,63 @@ mod tests {
         "#;
         let anchors = semantic_anchors_html(html);
 
-        assert!(anchors.iter().any(|item| item.kind == SemanticAnchorKind::Question));
-        assert!(anchors.iter().any(|item| item.kind == SemanticAnchorKind::Answer));
-        assert!(anchors.iter().any(|item| item.kind == SemanticAnchorKind::Heading));
-        assert!(anchors.iter().any(|item| item.kind == SemanticAnchorKind::Code));
-        assert!(anchors.iter().any(|item| item.kind == SemanticAnchorKind::Table));
-        assert!(anchors.iter().any(|item| item.kind == SemanticAnchorKind::Quote));
-        assert!(anchors.iter().any(|item| item.kind == SemanticAnchorKind::Conclusion));
-        assert!(anchors.iter().any(|item| item.kind == SemanticAnchorKind::Source));
+        assert!(
+            anchors
+                .iter()
+                .any(|item| item.kind == SemanticAnchorKind::Question)
+        );
+        assert!(
+            anchors
+                .iter()
+                .any(|item| item.kind == SemanticAnchorKind::Answer)
+        );
+        assert!(
+            anchors
+                .iter()
+                .any(|item| item.kind == SemanticAnchorKind::Heading)
+        );
+        assert!(
+            anchors
+                .iter()
+                .any(|item| item.kind == SemanticAnchorKind::Code)
+        );
+        assert!(
+            anchors
+                .iter()
+                .any(|item| item.kind == SemanticAnchorKind::Table)
+        );
+        assert!(
+            anchors
+                .iter()
+                .any(|item| item.kind == SemanticAnchorKind::Quote)
+        );
+        assert!(
+            anchors
+                .iter()
+                .any(|item| item.kind == SemanticAnchorKind::Conclusion)
+        );
+        assert!(
+            anchors
+                .iter()
+                .any(|item| item.kind == SemanticAnchorKind::Source)
+        );
     }
 
     #[test]
     fn positions_are_monotonic_and_bounded() {
-        let anchors = semantic_anchors_html(
-            "<h1>A</h1><h2>B</h2><pre>C</pre><blockquote>D</blockquote>",
-        );
+        let anchors =
+            semantic_anchors_html("<h1>A</h1><h2>B</h2><pre>C</pre><blockquote>D</blockquote>");
         assert!(!anchors.is_empty());
-        assert!(anchors.windows(2).all(|pair| pair[0].position <= pair[1].position));
-        assert!(anchors.iter().all(|item| (0.0..=1.0).contains(&item.position)));
+        assert!(
+            anchors
+                .windows(2)
+                .all(|pair| pair[0].position <= pair[1].position)
+        );
+        assert!(
+            anchors
+                .iter()
+                .all(|item| (0.0..=1.0).contains(&item.position))
+        );
     }
 
     #[test]
