@@ -25,8 +25,8 @@ pub use security::{
 };
 
 pub use agent_security::{
-    ActionRisk, AgentPermissionPolicy, AgentSecurityAction, FieldKind, PolicyDecision,
-    redact_sensitive_text,
+    ActionRisk, AgentPermissionPolicy, AgentSecurityAction, FieldKind, PermissionClass,
+    PolicyDecision, redact_sensitive_text,
 };
 pub use local_intelligence::{
     EMBEDDING_DIM, HashingLocalIntelligence, IntentClass, LocalBenchmark, LocalIntelligence,

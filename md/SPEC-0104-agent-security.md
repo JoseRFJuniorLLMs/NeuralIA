@@ -104,6 +104,12 @@ Must always stop for human control:
 
 The agent may prepare a Class D action but MUST NOT complete it autonomously.
 
+The native core represents these levels explicitly as `PermissionClass`.
+`AgentSecurityAction::permission_class()` is the single mapping from actions
+to A/B/C/D. The session grant applies only to Class B; Class C remains an
+immediate per-action confirmation and Class D cannot be unlocked by a session
+grant or by recording an approval.
+
 ## 5. Sensitive data firewall
 
 The observer supplied to models MUST exclude or redact where possible:
@@ -117,6 +123,11 @@ The observer supplied to models MUST exclude or redact where possible:
 - unrelated local files.
 
 An agent never gets a general “read browser profile” tool.
+
+The core text firewall normalizes whitespace/quoting before matching common
+credential keys, so JSON-like fields and spaced assignments do not bypass the
+redactor. This is defense in depth: structured observers must still avoid
+collecting secrets in the first place.
 
 ## 6. Origin policy
 
@@ -177,7 +188,9 @@ Secrets and full sensitive field contents MUST NOT be logged.
 The user can stop an agent immediately.
 
 Stopping prevents new actions, cancels queued actions where possible and
-returns manual control.
+returns manual control. It also revokes the Class B session grant and any
+cross-origin approvals accumulated during the run; resuming starts from the
+initial origin without restoring those grants.
 
 ## 11. Acceptance criteria
 
