@@ -8,9 +8,9 @@ targets = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-deny = [
-  { crate = "serde", reason = "SABOTAGE: prove dependency-policy gate goes red" },
-]
+# Workspace path dependencies intentionally inherit the workspace version.
+# Registry/git wildcards remain forbidden.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
@@ -23,6 +23,7 @@ allow = [
   "Apache-2.0 WITH LLVM-exception",
   "BSD-2-Clause",
   "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
   "ISC",
   "MIT",
   "MPL-2.0",

@@ -21,6 +21,12 @@ All notable changes to NeuralIA are documented here.
   Links internos do Reader continuam sendo a exceção sem token.
 
 ### Validation
+- **PR #56 — dependency policy becomes an enforced CI gate.** A SHA-pinned
+  `cargo-deny` checks licenses, dependency sources and wildcard declarations
+  on Linux + Windows dependency graphs. Unknown registries/git sources and
+  external wildcards fail the build; workspace path dependencies are the
+  explicit exception. The sabotage commit banned `serde` and CI #384 went
+  red before the policy was restored.
 - PR #24 adiciona testes do parser, das 25 ações, bounds, capability incorreta,
   ausência de `?cap=` nos scripts remotos, captura antecipada das primitivas
   IPC e rejeição do esquema `neuralia:` nas superfícies remotas.
