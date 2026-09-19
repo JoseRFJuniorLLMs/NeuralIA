@@ -26,6 +26,7 @@ OutputDir={#OutputDir}
 OutputBaseFilename=NeuralIA-Setup-{#AppVersion}-x64
 SetupIconFile={#IconPath}
 UninstallDisplayIcon={app}\NeuralIA.exe
+UninstallDisplayName=NeuralIA
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
