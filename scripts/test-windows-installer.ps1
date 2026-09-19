@@ -49,6 +49,11 @@ try {
     # Resolve the uninstaller before any assertion that can fail. Negative-path
     # tests deliberately fail below; the finally block still has to remove the
     # uninstall registration rather than merely deleting files.
+    $uninstaller = Join-Path $installDir "unins000.exe"
+    if (-not (Test-Path -LiteralPath $uninstaller)) {
+        throw "Inno Setup uninstaller was not installed."
+    }
+
     $expectedHash = (Get-FileHash -LiteralPath $expectedExe -Algorithm SHA256).Hash
     $installedHash = (Get-FileHash -LiteralPath $installedExe -Algorithm SHA256).Hash
     if ($expectedHash -ne $installedHash) {
@@ -62,11 +67,6 @@ try {
     $entry = Get-ItemProperty -LiteralPath $uninstallKey
     if ($entry.DisplayName -ne "NeuralIA" -or $entry.DisplayVersion -ne $ExpectedVersion) {
         throw "Uninstall registration contains unexpected product metadata: DisplayName='$($entry.DisplayName)', DisplayVersion='$($entry.DisplayVersion)'."
-    }
-
-    $uninstaller = Join-Path $installDir "unins000.exe"
-    if (-not (Test-Path -LiteralPath $uninstaller)) {
-        throw "Inno Setup uninstaller was not installed."
     }
 
     $uninstall = Start-Process -FilePath $uninstaller -ArgumentList @(
