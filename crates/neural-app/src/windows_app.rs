@@ -33,6 +33,7 @@ use windows_sys::Win32::{
         SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits,
         TRANSPARENT,
     },
+    Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom},
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     UI::{
         Input::KeyboardAndMouse::{
@@ -42,11 +43,11 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
             ES_AUTOHSCROLL, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowTextLengthW,
-            GetWindowTextW, MB_ICONINFORMATION, MB_OK, MF_SEPARATOR, MF_STRING, MessageBoxW,
-            SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos,
-            SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_KEYDOWN,
-            WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
-            WS_VISIBLE,
+            GetWindowTextW, GetWindowThreadProcessId, MB_ICONINFORMATION, MB_OK, MF_SEPARATOR,
+            MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
+            SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+            TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -1896,6 +1897,7 @@ impl App {
                     return false;
                 }
                 remote_web_target(&target, allow_local)
+                    || is_view_source_target(&target, allow_local)
             })
             .with_new_window_req_handler(move |target, _features| {
                 if remote_web_target(&target, allow_local) {
@@ -2390,7 +2392,7 @@ impl App {
                     return false;
                 }
 
-                remote_web_target(&target, false)
+                remote_web_target(&target, false) || is_view_source_target(&target, false)
             })
             .with_new_window_req_handler(move |target, _features| {
                 if remote_web_target(&target, false) {
@@ -2471,6 +2473,7 @@ impl App {
                     return false;
                 }
                 remote_web_target(&target, allow_local)
+                    || is_view_source_target(&target, allow_local)
             })
             .with_new_window_req_handler(move |target, _features| {
                 if remote_web_target(&target, false) {
@@ -3217,14 +3220,30 @@ impl App {
         }
     }
 
-    /// `view-source:` e do proprio Chromium; basta navegar para la.
+    /// `view-source:` e do proprio Chromium, mas a pagina nao pode pedi-lo por
+    /// script: o handler de navegacao so deixa passar o alvo que o lado nativo
+    /// constroi a partir do URL actual. So faz sentido com um documento a vista.
     fn view_source(&mut self) {
-        let Some(webview) = &self.webview else {
-            self.show_splash("Ver código-fonte só numa página aberta.".to_string(), 3);
+        let mut visible = 0;
+        self.for_each_visible_webview(|_| visible += 1);
+        if visible != 1 {
+            let reason = if visible == 0 {
+                "Ver código-fonte só numa página aberta."
+            } else {
+                "Ver código-fonte só com uma página em ecrã completo."
+            };
+            self.show_splash(reason.to_string(), 3);
             return;
-        };
-        let _ = webview
-            .evaluate_script("window.location.href = 'view-source:' + window.location.href;");
+        }
+        self.for_each_visible_webview(|webview| {
+            let Ok(current) = webview.url() else {
+                return;
+            };
+            let target = format!("view-source:{current}");
+            if is_view_source_target(&target, true) {
+                let _ = webview.load_url(&target);
+            }
+        });
     }
 
     fn toggle_column_fullscreen(&mut self) {
@@ -3250,23 +3269,38 @@ impl App {
         if !self.auto_scroll || token != self.auto_scroll_token {
             return;
         }
-        // Um documento sozinho no ecra -- HTML, texto simples ou PDF -- avanca
-        // com a tecla, que e a unica via que funciona em todos eles. Nas tres
-        // colunas a tecla so chegaria a uma, por isso ai vai o script.
+        // O script avanca tudo o que e nosso ou HTML: nas tres colunas a tecla
+        // so chegaria a uma, e num documento sozinho a tecla sintetica e uma
+        // arma que pode disparar noutra aplicacao. So o visualizador de PDF do
+        // Edge (URL .pdf), que nao aceita script, fica com a tecla.
         match self.surface {
             Surface::Comparator | Surface::Pdf => {
                 self.for_each_visible_webview(|webview| {
                     let _ = webview.evaluate_script(AUTO_SCROLL_SCRIPT);
                 });
             }
-            _ => self.page_down_synthetic(),
+            Surface::Reader | Surface::External => {
+                let edge_pdf = self
+                    .webview
+                    .as_ref()
+                    .and_then(|webview| webview.url().ok())
+                    .and_then(|url| Url::parse(&url).ok())
+                    .is_some_and(|url| is_pdf_url(&url));
+                if edge_pdf {
+                    self.page_down_synthetic();
+                } else if let Some(webview) = &self.webview {
+                    let _ = webview.evaluate_script(AUTO_SCROLL_SCRIPT);
+                }
+            }
+            Surface::Home => {}
         }
         self.schedule_auto_scroll();
     }
 
     /// O visualizador de PDF do Edge corre noutro documento, noutra origem e
     /// noutro processo: nenhum script do host la chega. A unica via que resta e
-    /// a tecla, e so a enviamos com a nossa janela em primeiro plano -- caso
+    /// a tecla, e so a enviamos com a nossa janela em primeiro plano e a
+    /// pertencer ao nosso processo, verificado mesmo antes do envio -- caso
     /// contrario iria parar a aplicacao de outra pessoa.
     fn page_down_synthetic(&self) {
         let Some(window) = &self.window else {
@@ -3284,15 +3318,21 @@ impl App {
         }
 
         unsafe {
-            if GetForegroundWindow() != hwnd {
-                return;
-            }
-
             let mut inputs: [INPUT; 2] = std::mem::zeroed();
             for (index, input) in inputs.iter_mut().enumerate() {
                 input.r#type = INPUT_KEYBOARD;
                 input.Anonymous.ki.wVk = VK_NEXT;
                 input.Anonymous.ki.dwFlags = if index == 1 { KEYEVENTF_KEYUP } else { 0 };
+            }
+
+            let foreground = GetForegroundWindow();
+            if foreground != hwnd {
+                return;
+            }
+            let mut owner = 0u32;
+            GetWindowThreadProcessId(foreground, &mut owner);
+            if owner != std::process::id() {
+                return;
             }
             SendInput(
                 inputs.len() as u32,
@@ -4312,10 +4352,17 @@ fn serve_pdf_asset(
         _ => (404, "text/plain", Cow::Borrowed(b"not found" as &[u8])),
     };
 
-    HttpResponse::builder()
+    // nosniff em tudo: o tipo declarado e o tipo, nao se adivinha pelo corpo.
+    // A politica do HTML vai tambem em cabecalho, que vale antes do <meta>.
+    let mut response = HttpResponse::builder()
         .status(status)
         .header("Content-Type", content_type)
         .header("Cache-Control", "no-store")
+        .header("X-Content-Type-Options", "nosniff");
+    if content_type.starts_with("text/html") {
+        response = response.header("Content-Security-Policy", PDF_VIEWER_CSP);
+    }
+    response
         .body(body)
         .unwrap_or_else(|_| HttpResponse::new(Cow::Borrowed(b"" as &[u8])))
 }
@@ -4352,16 +4399,57 @@ fn neuralia_action(target: &str) -> Option<UserEvent> {
     })
 }
 
+/// Token que so os scripts injetados conhecem: 128 bits do RNG do sistema.
+/// Se o BCrypt falhar, o SipHash com semente aleatoria de antes entra a
+/// misturar-se com o que houver no buffer, para nunca sair um token vazio.
 fn remote_capability() -> String {
-    let mut left = RandomState::new().build_hasher();
-    left.write_u64(now_ms());
-    left.write_u8(0x5a);
+    use std::fmt::Write as _;
+    let mut bytes = [0u8; 16];
+    // SAFETY: buffer valido com o tamanho declarado; sem handle de algoritmo,
+    // a flag manda usar o RNG preferido do sistema.
+    let status = unsafe {
+        BCryptGenRandom(
+            core::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            bytes.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != 0 {
+        let mut left = RandomState::new().build_hasher();
+        left.write_u64(now_ms());
+        left.write_u8(0x5a);
 
-    let mut right = RandomState::new().build_hasher();
-    right.write_u64(now_ms().rotate_left(17));
-    right.write_u8(0xa5);
+        let mut right = RandomState::new().build_hasher();
+        right.write_u64(now_ms().rotate_left(17));
+        right.write_u8(0xa5);
 
-    format!("{:016x}{:016x}", left.finish(), right.finish())
+        let mix = left
+            .finish()
+            .to_le_bytes()
+            .into_iter()
+            .chain(right.finish().to_le_bytes());
+        for (byte, extra) in bytes.iter_mut().zip(mix) {
+            *byte ^= extra;
+        }
+    }
+    let mut token = String::with_capacity(32);
+    for byte in bytes {
+        let _ = write!(token, "{byte:02x}");
+    }
+    token
+}
+
+/// Igualdade sem atalho: percorre sempre tudo, para o tempo nao denunciar em
+/// que byte o token deixou de bater.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
 }
 
 fn remote_capability_matches(target: &str, expected: &str) -> bool {
@@ -4369,9 +4457,9 @@ fn remote_capability_matches(target: &str, expected: &str) -> bool {
         return false;
     };
     url.scheme().eq_ignore_ascii_case("neuralia")
-        && url
-            .query_pairs()
-            .any(|(key, value)| key == "cap" && value == expected)
+        && url.query_pairs().any(|(key, value)| {
+            key == "cap" && constant_time_eq(value.as_bytes(), expected.as_bytes())
+        })
 }
 
 fn remote_neuralia_action(target: &str, capability: &str) -> Option<UserEvent> {
@@ -4394,6 +4482,17 @@ fn remote_web_target(target: &str, allow_local: bool) -> bool {
         return true;
     }
     neural_core::validate_web_url(target)
+        .is_ok_and(|url| allow_local || !is_local_network_target(&url))
+}
+
+/// `view-source:` so e aceite sobre uma URL web que a propria superficie ja
+/// deixaria abrir: a mesma politica de rede local, sem `about:` nem esquemas
+/// aninhados.
+fn is_view_source_target(target: &str, allow_local: bool) -> bool {
+    let Some(rest) = target.strip_prefix("view-source:") else {
+        return false;
+    };
+    neural_core::validate_web_url(rest)
         .is_ok_and(|url| allow_local || !is_local_network_target(&url))
 }
 
@@ -5094,6 +5193,9 @@ const PDFJS_WORKER: &[u8] = include_bytes!("../../../assets/pdfjs/pdf.worker.mjs
 /// No Windows um esquema personalizado `neuralia-pdf` aparece a pagina como
 /// `http://neuralia-pdf.<host>`; o wry intercepta tudo o que comece assim.
 const PDF_ORIGIN: &str = "http://neuralia-pdf.localhost";
+/// A mesma politica do `<meta>` do viewer.html, servida em cabecalho para
+/// valer antes de o HTML ser lido; um teste garante que as duas nao divergem.
+const PDF_VIEWER_CSP: &str = "default-src 'none'; script-src 'self' blob:; worker-src 'self' blob:; connect-src 'self'; img-src 'self' blob: data:; style-src 'unsafe-inline'; font-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'";
 /// Limite para um documento; o do Reader (2 MiB) e para HTML.
 const PDF_MAX_BYTES: usize = 32 * 1024 * 1024;
 const PDF_TIMEOUT_SECS: u64 = 90;
@@ -5453,6 +5555,231 @@ mod tests {
         assert!(!remote_web_target("http://127.0.0.1:8000/", false));
         assert!(!remote_web_target("http://192.168.1.1/", false));
         assert!(remote_web_target("http://127.0.0.1:8000/", true));
+    }
+
+    #[test]
+    fn view_source_follows_the_surface_network_policy() {
+        assert!(is_view_source_target(
+            "view-source:https://example.com/a?b=c",
+            false
+        ));
+        assert!(is_view_source_target(
+            "view-source:http://example.com/",
+            false
+        ));
+        assert!(!is_view_source_target(
+            "view-source:http://127.0.0.1:8000/",
+            false
+        ));
+        assert!(is_view_source_target(
+            "view-source:http://127.0.0.1:8000/",
+            true
+        ));
+        assert!(!is_view_source_target(
+            "view-source:http://192.168.1.1/",
+            false
+        ));
+        assert!(!is_view_source_target(
+            "view-source:http://neuralia-pdf.localhost/viewer.html",
+            false
+        ));
+
+        // So URL web por baixo: nada de about:, file:, javascript:, credenciais
+        // nem view-source aninhado; e o prefixo tem de estar la.
+        for target in [
+            "view-source:about:blank",
+            "view-source:file:///C:/Windows/win.ini",
+            "view-source:javascript:alert(1)",
+            "view-source:https://user:pw@example.com/",
+            "view-source:view-source:https://example.com/",
+            "view-source:",
+            "view-source:neuralia:home",
+            "https://example.com/",
+            "VIEW-SOURCE:https://example.com/",
+        ] {
+            assert!(!is_view_source_target(target, true), "{target}");
+        }
+        // O pedido por script da pagina continua a nao ser navegacao web.
+        assert!(!remote_web_target("view-source:https://example.com/", true));
+    }
+
+    #[test]
+    fn capability_tokens_are_32_hex_and_never_repeat() {
+        let first = remote_capability();
+        let second = remote_capability();
+        for token in [&first, &second] {
+            assert_eq!(token.len(), 32, "{token}");
+            assert!(
+                token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+                "{token}"
+            );
+        }
+        assert_ne!(first, second);
+        assert_ne!(first, "0".repeat(32));
+    }
+
+    #[test]
+    fn capability_comparison_walks_every_byte() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"xbc"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"", b"a"));
+
+        let token = remote_capability();
+        assert!(remote_capability_matches(
+            &format!("neuralia:home?cap={token}"),
+            &token
+        ));
+        assert!(remote_capability_matches(
+            &format!("neuralia:split?col=1&url=https%3A%2F%2Fa.test%2F&cap={token}"),
+            &token
+        ));
+        let flipped = if token.ends_with('0') { "1" } else { "0" };
+        let wrong = format!("{}{flipped}", &token[..31]);
+        assert!(!remote_capability_matches(
+            &format!("neuralia:home?cap={wrong}"),
+            &token
+        ));
+        assert!(!remote_capability_matches(
+            &format!("neuralia:home?cap={}", &token[..31]),
+            &token
+        ));
+        assert!(!remote_capability_matches(
+            &format!("neuralia:home?cap={token}0"),
+            &token
+        ));
+        assert!(!remote_capability_matches("neuralia:home", &token));
+        assert!(!remote_capability_matches(
+            &format!("https://example.com/?cap={token}"),
+            &token
+        ));
+    }
+
+    #[test]
+    fn pdf_assets_carry_nosniff_and_the_viewer_csp() {
+        let html = std::str::from_utf8(PDF_VIEWER_HTML).expect("viewer.html e UTF-8");
+        assert!(
+            html.contains(PDF_VIEWER_CSP),
+            "o cabecalho tem de ser igual ao <meta> do viewer.html"
+        );
+
+        let bytes = Arc::new(Mutex::new(b"%PDF-1.7".to_vec()));
+        for (path, is_html) in [
+            ("/viewer.html", true),
+            ("/", true),
+            ("/viewer.mjs", false),
+            ("/pdf.mjs", false),
+            ("/pdf.worker.mjs", false),
+            ("/document.pdf", false),
+            ("/nada", false),
+        ] {
+            let request = Request::builder()
+                .uri(format!("{PDF_ORIGIN}{path}"))
+                .body(Vec::new())
+                .expect("pedido de teste");
+            let response = serve_pdf_asset(&bytes, &request);
+            let header = |name: &str| {
+                response
+                    .headers()
+                    .get(name)
+                    .map(|value| value.to_str().unwrap_or("").to_string())
+            };
+            assert_eq!(
+                header("X-Content-Type-Options").as_deref(),
+                Some("nosniff"),
+                "{path}"
+            );
+            assert_eq!(
+                header("Cache-Control").as_deref(),
+                Some("no-store"),
+                "{path}"
+            );
+            let csp = header("Content-Security-Policy");
+            assert_eq!(csp.is_some(), is_html, "{path}");
+            if is_html {
+                assert_eq!(csp.as_deref(), Some(PDF_VIEWER_CSP), "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn injected_scripts_capture_globals_before_the_page_runs() {
+        // O token so passa pela captura feita no document-created: um unico
+        // `encodeURIComponent` por script, o da captura, e nenhum `const` de
+        // topo que a pagina pudesse ler pelo nome.
+        for (name, script) in [
+            ("keymap", NEURALIA_KEYMAP_SCRIPT),
+            ("return", EXTERNAL_RETURN_BUTTON),
+            ("gmail", GMAIL_MONITOR_SCRIPT),
+            ("palette", NEURALIA_PALETTE_SCRIPT),
+            ("comparator", COMPARATOR_INJECT_SCRIPT),
+        ] {
+            assert!(script.contains("__NEURALIA_CAP__"), "{name}");
+            assert_eq!(
+                script.matches("encodeURIComponent").count(),
+                1,
+                "{name}: so a captura pode nomear encodeURIComponent"
+            );
+            assert!(
+                script.contains("const encode = encodeURIComponent;"),
+                "{name}"
+            );
+            assert!(script.trim_start().starts_with("(function"), "{name}");
+        }
+        // Os scripts que so correm depois do DOMContentLoaded nao tocam em
+        // nenhum global do DOM pelo nome.
+        for (name, script) in [
+            ("return", EXTERNAL_RETURN_BUTTON),
+            ("comparator", COMPARATOR_INJECT_SCRIPT),
+        ] {
+            assert!(
+                script.contains(
+                    "Function.prototype.call.bind(EventTarget.prototype.addEventListener)"
+                ),
+                "{name}"
+            );
+            assert!(
+                script.contains("document.createElement.bind(document)"),
+                "{name}"
+            );
+            for forbidden in [
+                "Object.assign(",
+                "document.createElement(",
+                "document.getElementById(",
+                ".appendChild(",
+                ".addEventListener(",
+            ] {
+                assert!(!script.contains(forbidden), "{name}: {forbidden}");
+            }
+        }
+        assert!(NEURALIA_PALETTE_SCRIPT.contains("listen(input, 'keydown'"));
+        assert!(!NEURALIA_PALETTE_SCRIPT.contains("Object.assign("));
+        assert!(!NEURALIA_PALETTE_SCRIPT.contains("document.createElement("));
+
+        // Nenhum handler que leve o token responde a eventos sinteticos, e os
+        // botoes nao expoem o handler em `onclick`.
+        assert_eq!(
+            COMPARATOR_INJECT_SCRIPT
+                .matches("if (!event.isTrusted")
+                .count(),
+            4
+        );
+        assert!(!COMPARATOR_INJECT_SCRIPT.contains("expand.onclick"));
+        assert!(!COMPARATOR_INJECT_SCRIPT.contains("minimize.onclick"));
+        assert!(EXTERNAL_RETURN_BUTTON.contains("if (!event.isTrusted) return;"));
+        assert!(NEURALIA_PALETTE_SCRIPT.contains("if (!event.isTrusted) return;"));
+        assert!(NEURALIA_KEYMAP_SCRIPT.contains("if (!e.isTrusted) { return; }"));
+
+        // Redireccionador do Google: o dominio e os subdominios, nao um sufixo.
+        assert!(
+            COMPARATOR_INJECT_SCRIPT
+                .contains("host === 'google.com' || host.endsWith('.google.com')")
+        );
+        assert!(!COMPARATOR_INJECT_SCRIPT.contains("endsWith('google.com')"));
     }
 
     #[test]
@@ -6145,9 +6472,13 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
   if (window.__neuralia_keymap) { return; }
   window.__neuralia_keymap = true;
 
+  // Capturas no document-created, antes de a pagina correr: o que os atalhos
+  // usam mais tarde com o token nao pode ser um global ja envenenado.
   const capability = '__NEURALIA_CAP__';
+  const encode = encodeURIComponent;
+  const colIndex = window.__neuralia_col_index;
   function act(name) {
-    window.location.href = 'neuralia:' + name + '?cap=' + encodeURIComponent(capability);
+    window.location.href = 'neuralia:' + name + '?cap=' + encode(capability);
   }
 
   function findBar() {
@@ -6214,9 +6545,9 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
         case 'h': e.preventDefault(); act('history'); return;
         case 'n':
           e.preventDefault();
-          if (typeof window.__neuralia_col_index === 'number') {
-            window.location.href = 'neuralia:newtab?col=' + window.__neuralia_col_index
-              + '&cap=' + encodeURIComponent(capability);
+          if (typeof colIndex === 'number') {
+            window.location.href = 'neuralia:newtab?col=' + colIndex
+              + '&cap=' + encode(capability);
           } else {
             act('newtab');
           }
@@ -6224,7 +6555,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
         case 'k':
         case 't':
           e.preventDefault();
-          if (typeof window.__neuralia_col_index === 'number') {
+          if (typeof colIndex === 'number') {
             window.dispatchEvent(new CustomEvent('neuralia-open-palette'));
           } else if (key === 'k') {
             act('omnibox');
@@ -6260,14 +6591,14 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
 
     if (key === 'backspace') { e.preventDefault(); window.history.back(); return; }
     if (key === '1' || key === '2' || key === '3') {
-      if (typeof window.__neuralia_col_index === 'number') {
+      if (typeof colIndex === 'number') {
         e.preventDefault();
         window.location.href = 'neuralia:expand?col=' + (parseInt(key, 10) - 1)
-          + '&cap=' + encodeURIComponent(capability);
+          + '&cap=' + encode(capability);
       }
       return;
     }
-    if (key === '0' && typeof window.__neuralia_col_index === 'number') {
+    if (key === '0' && typeof colIndex === 'number') {
       e.preventDefault();
       act('restore');
     }
@@ -6280,25 +6611,37 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
 const COMPARATOR_BUTTON_EXPANDED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='none';}var m=document.querySelector('#neuralia-comp-minimize');if(m){m.style.display='none';}})();";
 const COMPARATOR_BUTTON_COLLAPSED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='block';b.textContent='\u{26F6} ' + (window.__neuralia_col_name || 'IA');}var m=document.querySelector('#neuralia-comp-minimize');if(m){m.style.display='block';}})();";
 
+/// Fechado num IIFE: um `const` de topo seria um binding lexico global, e a
+/// pagina lia o token pelo nome. Tudo o que o botao usa depois do
+/// DOMContentLoaded e capturado aqui, antes de a pagina correr.
 const EXTERNAL_RETURN_BUTTON: &str = r#"
-document.addEventListener('DOMContentLoaded', () => {
-  if (document.getElementById('neural-shell') || document.getElementById('neuralia-return')) return;
-  const b = document.createElement('button');
-  b.id = 'neuralia-return';
-  b.textContent = '◀ NeuralIA';
-  Object.assign(b.style, {
-    position:'fixed', left:'16px', bottom:'16px', zIndex:'2147483647',
-    border:'0', borderRadius:'999px', padding:'11px 16px',
-    background:'#111314', color:'#fff', font:'600 13px Segoe UI, sans-serif',
-    boxShadow:'0 6px 24px rgba(0,0,0,.25)', cursor:'pointer'
-  });
+(function () {
   const capability = '__NEURALIA_CAP__';
-  b.addEventListener('click', () => {
-    window.location.href = 'neuralia:home?cap=' + encodeURIComponent(capability);
-  });
-  document.documentElement.appendChild(b);
+  const encode = encodeURIComponent;
+  const byId = document.getElementById.bind(document);
+  const createElement = document.createElement.bind(document);
+  const assign = Object.assign;
+  const listen = Function.prototype.call.bind(EventTarget.prototype.addEventListener);
+  const append = Function.prototype.call.bind(Node.prototype.appendChild);
 
-});
+  listen(document, 'DOMContentLoaded', () => {
+    if (byId('neural-shell') || byId('neuralia-return')) return;
+    const b = createElement('button');
+    b.id = 'neuralia-return';
+    b.textContent = '◀ NeuralIA';
+    assign(b.style, {
+      position:'fixed', left:'16px', bottom:'16px', zIndex:'2147483647',
+      border:'0', borderRadius:'999px', padding:'11px 16px',
+      background:'#111314', color:'#fff', font:'600 13px Segoe UI, sans-serif',
+      boxShadow:'0 6px 24px rgba(0,0,0,.25)', cursor:'pointer'
+    });
+    listen(b, 'click', (event) => {
+      if (!event.isTrusted) return;
+      window.location.href = 'neuralia:home?cap=' + encode(capability);
+    });
+    append(document.documentElement, b);
+  });
+})();
 "#;
 
 const GMAIL_MONITOR_SCRIPT: &str = r#"
@@ -6306,6 +6649,8 @@ const GMAIL_MONITOR_SCRIPT: &str = r#"
   if (location.hostname !== 'mail.google.com' || window.__neuralia_gmail_monitor) return;
   window.__neuralia_gmail_monitor = true;
   const capability = '__NEURALIA_CAP__';
+  // emit() corre tarde, a partir do observer: o codificador e capturado agora.
+  const encode = encodeURIComponent;
   let lastState = '';
   let debounce = 0;
 
@@ -6351,10 +6696,10 @@ const GMAIL_MONITOR_SCRIPT: &str = r#"
     lastState = state;
 
     window.location.href = 'neuralia:gmail-state?count=' + count
-      + '&sender=' + encodeURIComponent(first.sender)
-      + '&subject=' + encodeURIComponent(first.subject)
-      + '&key=' + encodeURIComponent(first.key)
-      + '&cap=' + encodeURIComponent(capability);
+      + '&sender=' + encode(first.sender)
+      + '&subject=' + encode(first.subject)
+      + '&key=' + encode(first.key)
+      + '&cap=' + encode(capability);
   }
 
   function schedule() {
@@ -6380,53 +6725,62 @@ const NEURALIA_PALETTE_SCRIPT: &str = r#"
   if (window.__neuralia_palette_ready) return;
   window.__neuralia_palette_ready = true;
   const capability = '__NEURALIA_CAP__';
+  // openPalette() corre tarde (a pagina tambem pode disparar o evento): tudo
+  // o que ele usa vem daqui, capturado antes de a pagina correr.
+  const colIndex = window.__neuralia_col_index;
+  const encode = encodeURIComponent;
+  const byId = document.getElementById.bind(document);
+  const createElement = document.createElement.bind(document);
+  const assign = Object.assign;
+  const listen = Function.prototype.call.bind(EventTarget.prototype.addEventListener);
+  const append = Function.prototype.call.bind(Node.prototype.appendChild);
 
   function closePalette() {
-    const old = document.getElementById('neuralia-palette');
+    const old = byId('neuralia-palette');
     if (old) old.remove();
   }
 
   function openPalette() {
     closePalette();
-    const colIndex = window.__neuralia_col_index;
     if (typeof colIndex !== 'number') return;
 
-    const shade = document.createElement('div');
+    const shade = createElement('div');
     shade.id = 'neuralia-palette';
-    Object.assign(shade.style, {
+    assign(shade.style, {
       position:'fixed', inset:'0', zIndex:'2147483647',
       display:'flex', alignItems:'flex-start', justifyContent:'center',
       paddingTop:'18vh', background:'rgba(0,0,0,.22)',
       backdropFilter:'blur(2px)', fontFamily:'Segoe UI, system-ui, sans-serif'
     });
 
-    const box = document.createElement('div');
-    Object.assign(box.style, {
+    const box = createElement('div');
+    assign(box.style, {
       width:'min(680px, calc(100vw - 48px))', borderRadius:'18px',
       padding:'12px 16px', background:'rgba(24,26,28,.97)',
       border:'1px solid rgba(255,255,255,.12)',
       boxShadow:'0 24px 80px rgba(0,0,0,.48)'
     });
 
-    const input = document.createElement('input');
+    const input = createElement('input');
     input.type = 'text';
     input.autocomplete = 'off';
     input.spellcheck = false;
     input.placeholder = 'Pergunte à IA ativa ou digite uma URL';
-    Object.assign(input.style, {
+    assign(input.style, {
       width:'100%', boxSizing:'border-box', border:'0', outline:'0',
       background:'transparent', color:'#fff',
       font:'500 18px Segoe UI, system-ui, sans-serif', padding:'9px 4px'
     });
 
-    const hint = document.createElement('div');
+    const hint = createElement('div');
     hint.textContent = 'URL → abre ao lado   ·   texto → envia para '
       + (window.__neuralia_col_name || 'IA') + '   ·   Esc fecha';
-    Object.assign(hint.style, {
+    assign(hint.style, {
       color:'rgba(255,255,255,.48)', fontSize:'11px', padding:'2px 4px 4px'
     });
 
-    input.addEventListener('keydown', (event) => {
+    listen(input, 'keydown', (event) => {
+      if (!event.isTrusted) return;
       event.stopPropagation();
       if (event.key === 'Escape') {
         event.preventDefault(); closePalette(); return;
@@ -6436,18 +6790,18 @@ const NEURALIA_PALETTE_SCRIPT: &str = r#"
         const value = input.value.trim();
         if (!value) return;
         window.location.href = 'neuralia:palette?col=' + colIndex
-          + '&q=' + encodeURIComponent(value)
-          + '&cap=' + encodeURIComponent(capability);
+          + '&q=' + encode(value)
+          + '&cap=' + encode(capability);
       }
     }, true);
 
-    shade.addEventListener('mousedown', (event) => {
+    listen(shade, 'mousedown', (event) => {
       if (event.target === shade) closePalette();
     });
-    box.appendChild(input);
-    box.appendChild(hint);
-    shade.appendChild(box);
-    document.documentElement.appendChild(shade);
+    append(box, input);
+    append(box, hint);
+    append(shade, box);
+    append(document.documentElement, shade);
     setTimeout(() => input.focus(), 0);
   }
 
@@ -6680,259 +7034,276 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 "#;
 
+/// Tudo o que corre depois do DOMContentLoaded usa as capturas do topo: a
+/// pagina ja correu nessa altura e pode ter trocado qualquer global. Os
+/// botoes que levam o token ouvem por addEventListener, nao por `onclick`,
+/// para a pagina nao poder ler o handler do elemento e chama-lo a mao.
 const COMPARATOR_INJECT_SCRIPT: &str = r#"
-document.addEventListener('DOMContentLoaded', () => {
+(function () {
   const colIndex = window.__neuralia_col_index ?? 0;
   const colName = window.__neuralia_col_name ?? 'IA';
   const capability = '__NEURALIA_CAP__';
+  const encode = encodeURIComponent;
+  const byId = document.getElementById.bind(document);
+  const createElement = document.createElement.bind(document);
+  const assign = Object.assign;
+  const listen = Function.prototype.call.bind(EventTarget.prototype.addEventListener);
+  const append = Function.prototype.call.bind(Node.prototype.appendChild);
 
-  function mountControls() {
-    if (document.getElementById('neuralia-comp-controls')) return;
+  listen(document, 'DOMContentLoaded', () => {
+    function mountControls() {
+      if (byId('neuralia-comp-controls')) return;
 
-    const style = document.createElement('style');
-    style.id = 'neuralia-scroll-style';
-    style.textContent = [
-      'html,body,.neuralia-scroll-root{scrollbar-width:none!important;-ms-overflow-style:none!important;}',
-      'html::-webkit-scrollbar,body::-webkit-scrollbar,.neuralia-scroll-root::-webkit-scrollbar{width:0!important;height:0!important;display:none!important;}'
-    ].join('');
-    document.documentElement.appendChild(style);
+      const style = createElement('style');
+      style.id = 'neuralia-scroll-style';
+      style.textContent = [
+        'html,body,.neuralia-scroll-root{scrollbar-width:none!important;-ms-overflow-style:none!important;}',
+        'html::-webkit-scrollbar,body::-webkit-scrollbar,.neuralia-scroll-root::-webkit-scrollbar{width:0!important;height:0!important;display:none!important;}'
+      ].join('');
+      append(document.documentElement, style);
 
-    let currentRoot = null;
-    function scrollRoot() {
-      const docRoot = document.scrollingElement || document.documentElement || document.body;
-      const candidates = docRoot ? [docRoot] : [];
-      document.querySelectorAll(
-        'main,[role="main"],[class*="scroll"],[class*="overflow"],[style*="overflow"]'
-      ).forEach((el) => candidates.push(el));
+      let currentRoot = null;
+      function scrollRoot() {
+        const docRoot = document.scrollingElement || document.documentElement || document.body;
+        const candidates = docRoot ? [docRoot] : [];
+        document.querySelectorAll(
+          'main,[role="main"],[class*="scroll"],[class*="overflow"],[style*="overflow"]'
+        ).forEach((el) => candidates.push(el));
 
-      let best = docRoot;
-      let bestRange = best ? Math.max(0, best.scrollHeight - best.clientHeight) : 0;
-      for (const el of candidates) {
-        if (!el || el === document.body) continue;
-        const range = Math.max(0, el.scrollHeight - el.clientHeight);
-        if (range <= bestRange + 24) continue;
-        const css = getComputedStyle(el);
-        if (css.overflowY === 'hidden' || css.display === 'none') continue;
-        best = el;
-        bestRange = range;
+        let best = docRoot;
+        let bestRange = best ? Math.max(0, best.scrollHeight - best.clientHeight) : 0;
+        for (const el of candidates) {
+          if (!el || el === document.body) continue;
+          const range = Math.max(0, el.scrollHeight - el.clientHeight);
+          if (range <= bestRange + 24) continue;
+          const css = getComputedStyle(el);
+          if (css.overflowY === 'hidden' || css.display === 'none') continue;
+          best = el;
+          bestRange = range;
+        }
+        if (currentRoot && currentRoot !== best && currentRoot.classList) {
+          currentRoot.classList.remove('neuralia-scroll-root');
+        }
+        currentRoot = best || docRoot;
+        if (currentRoot && currentRoot.classList) currentRoot.classList.add('neuralia-scroll-root');
+        return currentRoot;
       }
-      if (currentRoot && currentRoot !== best && currentRoot.classList) {
-        currentRoot.classList.remove('neuralia-scroll-root');
+
+      function metrics() {
+        const root = scrollRoot();
+        if (!root) return { root:null, top:0, max:0, docLike:true };
+        const docLike = root === document.scrollingElement
+          || root === document.documentElement || root === document.body;
+        return {
+          root,
+          docLike,
+          top: docLike ? window.scrollY : root.scrollTop,
+          max: Math.max(0, root.scrollHeight - root.clientHeight)
+        };
       }
-      currentRoot = best || docRoot;
-      if (currentRoot && currentRoot.classList) currentRoot.classList.add('neuralia-scroll-root');
-      return currentRoot;
-    }
 
-    function metrics() {
-      const root = scrollRoot();
-      if (!root) return { root:null, top:0, max:0, docLike:true };
-      const docLike = root === document.scrollingElement
-        || root === document.documentElement || root === document.body;
-      return {
-        root,
-        docLike,
-        top: docLike ? window.scrollY : root.scrollTop,
-        max: Math.max(0, root.scrollHeight - root.clientHeight)
-      };
-    }
-
-    function scrollToPosition(top) {
-      const state = metrics();
-      const value = Math.max(0, Math.min(state.max, top));
-      if (state.docLike) window.scrollTo({ top:value, behavior:'smooth' });
-      else if (state.root) state.root.scrollTo({ top:value, behavior:'smooth' });
-    }
-
-    const controls = document.createElement('div');
-    controls.id = 'neuralia-comp-controls';
-    Object.assign(controls.style, {
-      position:'fixed', inset:'0', zIndex:'2147483647',
-      pointerEvents:'none', fontFamily:'Segoe UI, system-ui, sans-serif'
-    });
-
-    const expand = document.createElement('button');
-    expand.id = 'neuralia-comp-expand';
-    expand.textContent = '⛶ ' + colName;
-    Object.assign(expand.style, {
-      position:'absolute', top:'10px', right:'10px',
-      pointerEvents:'auto', border:'1px solid rgba(255,255,255,.12)',
-      borderRadius:'999px', padding:'6px 11px', background:'rgba(17,19,20,.90)',
-      color:'#fff', fontSize:'11px', fontWeight:'600',
-      boxShadow:'0 5px 18px rgba(0,0,0,.28)', cursor:'pointer'
-    });
-    expand.onclick = (event) => {
-      event.preventDefault(); event.stopPropagation();
-      window.location.href = 'neuralia:expand?col=' + colIndex
-        + '&cap=' + encodeURIComponent(capability);
-    };
-
-    const minimize = document.createElement('button');
-    minimize.id = 'neuralia-comp-minimize';
-    minimize.textContent = '−';
-    minimize.title = 'Minimizar ' + colName;
-    Object.assign(minimize.style, {
-      position:'absolute', top:'10px', right:'112px',
-      pointerEvents:'auto', width:'30px', height:'28px',
-      border:'1px solid rgba(255,255,255,.12)',
-      borderRadius:'999px', padding:'0',
-      background:'rgba(17,19,20,.90)', color:'#fff',
-      fontSize:'18px', fontWeight:'600', lineHeight:'24px',
-      boxShadow:'0 5px 18px rgba(0,0,0,.28)', cursor:'pointer'
-    });
-    minimize.onclick = (event) => {
-      event.preventDefault(); event.stopPropagation();
-      window.location.href = 'neuralia:minimize?col=' + colIndex
-        + '&cap=' + encodeURIComponent(capability);
-    };
-
-    const rail = document.createElement('div');
-    rail.id = 'neuralia-response-rail';
-    Object.assign(rail.style, {
-      position:'absolute', top:'50%', right:'7px', transform:'translateY(-50%)',
-      pointerEvents:'auto', width:'44px', minHeight:'240px', maxHeight:'58vh',
-      display:'flex', flexDirection:'column', alignItems:'center',
-      justifyContent:'space-between', opacity:'.68',
-      transition:'opacity .18s ease'
-    });
-    rail.onmouseenter = () => { rail.style.opacity = '1'; };
-    rail.onmouseleave = () => { rail.style.opacity = '.68'; };
-
-    function arrow(symbol, title, direction) {
-      const button = document.createElement('button');
-      button.textContent = symbol;
-      button.title = title;
-      Object.assign(button.style, {
-        width: direction > 0 ? '42px' : '32px',
-        height: direction > 0 ? '42px' : '28px',
-        border: direction > 0 ? '1px solid rgba(255,255,255,.08)' : '0',
-        borderRadius:'50%', padding:'0',
-        background: direction > 0 ? 'rgba(38,38,38,.94)' : 'transparent',
-        color: direction > 0 ? '#f4f4f4' : 'rgba(255,255,255,.46)',
-        boxShadow: direction > 0 ? '0 6px 20px rgba(0,0,0,.28)' : 'none',
-        fontSize:'21px', lineHeight: direction > 0 ? '38px' : '26px',
-        cursor:'pointer'
-      });
-      button.onclick = (event) => {
-        event.preventDefault(); event.stopPropagation();
+      function scrollToPosition(top) {
         const state = metrics();
-        const view = state.root ? state.root.clientHeight : window.innerHeight;
-        scrollToPosition(state.top + Math.max(220, view * .82) * direction);
-      };
-      return button;
-    }
+        const value = Math.max(0, Math.min(state.max, top));
+        if (state.docLike) window.scrollTo({ top:value, behavior:'smooth' });
+        else if (state.root) state.root.scrollTo({ top:value, behavior:'smooth' });
+      }
 
-    const ticks = document.createElement('div');
-    ticks.id = 'neuralia-response-ticks';
-    Object.assign(ticks.style, {
-      width:'34px', flex:'1', margin:'8px 0 10px', display:'flex',
-      flexDirection:'column', justifyContent:'space-evenly',
-      alignItems:'flex-end', cursor:'pointer'
-    });
+      const controls = createElement('div');
+      controls.id = 'neuralia-comp-controls';
+      assign(controls.style, {
+        position:'fixed', inset:'0', zIndex:'2147483647',
+        pointerEvents:'none', fontFamily:'Segoe UI, system-ui, sans-serif'
+      });
 
-    function rebuildTicks() {
-      const state = metrics();
-      const view = state.root ? state.root.clientHeight : window.innerHeight;
-      const count = Math.max(5, Math.min(11,
-        Math.ceil((state.max + Math.max(view, 1)) / Math.max(view, 1))));
-      if (ticks.children.length === count) return;
-      ticks.textContent = '';
-      for (let i = 0; i < count; i++) {
-        const tick = document.createElement('div');
-        tick.dataset.tick = String(i);
-        Object.assign(tick.style, {
-          height:'2px', width:i === 0 ? '30px' : '14px', borderRadius:'2px',
-          background:'rgba(255,255,255,.30)',
-          transition:'width .16s ease, background .16s ease, opacity .16s ease'
+      const expand = createElement('button');
+      expand.id = 'neuralia-comp-expand';
+      expand.textContent = '⛶ ' + colName;
+      assign(expand.style, {
+        position:'absolute', top:'10px', right:'10px',
+        pointerEvents:'auto', border:'1px solid rgba(255,255,255,.12)',
+        borderRadius:'999px', padding:'6px 11px', background:'rgba(17,19,20,.90)',
+        color:'#fff', fontSize:'11px', fontWeight:'600',
+        boxShadow:'0 5px 18px rgba(0,0,0,.28)', cursor:'pointer'
+      });
+      listen(expand, 'click', (event) => {
+        if (!event.isTrusted) return;
+        event.preventDefault(); event.stopPropagation();
+        window.location.href = 'neuralia:expand?col=' + colIndex
+          + '&cap=' + encode(capability);
+      });
+
+      const minimize = createElement('button');
+      minimize.id = 'neuralia-comp-minimize';
+      minimize.textContent = '−';
+      minimize.title = 'Minimizar ' + colName;
+      assign(minimize.style, {
+        position:'absolute', top:'10px', right:'112px',
+        pointerEvents:'auto', width:'30px', height:'28px',
+        border:'1px solid rgba(255,255,255,.12)',
+        borderRadius:'999px', padding:'0',
+        background:'rgba(17,19,20,.90)', color:'#fff',
+        fontSize:'18px', fontWeight:'600', lineHeight:'24px',
+        boxShadow:'0 5px 18px rgba(0,0,0,.28)', cursor:'pointer'
+      });
+      listen(minimize, 'click', (event) => {
+        if (!event.isTrusted) return;
+        event.preventDefault(); event.stopPropagation();
+        window.location.href = 'neuralia:minimize?col=' + colIndex
+          + '&cap=' + encode(capability);
+      });
+
+      const rail = createElement('div');
+      rail.id = 'neuralia-response-rail';
+      assign(rail.style, {
+        position:'absolute', top:'50%', right:'7px', transform:'translateY(-50%)',
+        pointerEvents:'auto', width:'44px', minHeight:'240px', maxHeight:'58vh',
+        display:'flex', flexDirection:'column', alignItems:'center',
+        justifyContent:'space-between', opacity:'.68',
+        transition:'opacity .18s ease'
+      });
+      rail.onmouseenter = () => { rail.style.opacity = '1'; };
+      rail.onmouseleave = () => { rail.style.opacity = '.68'; };
+
+      function arrow(symbol, title, direction) {
+        const button = createElement('button');
+        button.textContent = symbol;
+        button.title = title;
+        assign(button.style, {
+          width: direction > 0 ? '42px' : '32px',
+          height: direction > 0 ? '42px' : '28px',
+          border: direction > 0 ? '1px solid rgba(255,255,255,.08)' : '0',
+          borderRadius:'50%', padding:'0',
+          background: direction > 0 ? 'rgba(38,38,38,.94)' : 'transparent',
+          color: direction > 0 ? '#f4f4f4' : 'rgba(255,255,255,.46)',
+          boxShadow: direction > 0 ? '0 6px 20px rgba(0,0,0,.28)' : 'none',
+          fontSize:'21px', lineHeight: direction > 0 ? '38px' : '26px',
+          cursor:'pointer'
         });
-        tick.onclick = (event) => {
+        button.onclick = (event) => {
           event.preventDefault(); event.stopPropagation();
           const state = metrics();
-          const fraction = count <= 1 ? 0 : i / (count - 1);
-          scrollToPosition(state.max * fraction);
+          const view = state.root ? state.root.clientHeight : window.innerHeight;
+          scrollToPosition(state.top + Math.max(220, view * .82) * direction);
         };
-        ticks.appendChild(tick);
+        return button;
       }
-    }
 
-    function syncTicks() {
-      rebuildTicks();
-      const state = metrics();
-      const progress = state.max <= 0 ? 0 : Math.max(0, Math.min(1, state.top / state.max));
-      const count = ticks.children.length;
-      const active = Math.round(progress * Math.max(0, count - 1));
-      Array.from(ticks.children).forEach((tick, i) => {
-        const selected = i === active;
-        tick.style.width = selected ? '32px' : (Math.abs(i - active) === 1 ? '22px' : '13px');
-        tick.style.background = selected ? '#fff' : 'rgba(255,255,255,.32)';
-        tick.style.opacity = selected ? '1' : (Math.abs(i - active) === 1 ? '.78' : '.55');
+      const ticks = createElement('div');
+      ticks.id = 'neuralia-response-ticks';
+      assign(ticks.style, {
+        width:'34px', flex:'1', margin:'8px 0 10px', display:'flex',
+        flexDirection:'column', justifyContent:'space-evenly',
+        alignItems:'flex-end', cursor:'pointer'
       });
-    }
 
-    rail.appendChild(arrow('⌃', 'Resposta anterior', -1));
-    rail.appendChild(ticks);
-    rail.appendChild(arrow('⌄', 'Próxima resposta', 1));
-    controls.appendChild(minimize);
-    controls.appendChild(expand);
-    controls.appendChild(rail);
-    document.documentElement.appendChild(controls);
-
-    let raf = 0;
-    const scheduleSync = () => {
-      if (raf) return;
-      raf = requestAnimationFrame(() => { raf = 0; syncTicks(); });
-    };
-    window.addEventListener('scroll', scheduleSync, { passive:true });
-    document.addEventListener('scroll', scheduleSync, { passive:true, capture:true });
-    window.addEventListener('resize', scheduleSync, { passive:true });
-    new MutationObserver(scheduleSync).observe(document.documentElement, {
-      childList:true, subtree:true
-    });
-    syncTicks();
-  }
-
-  mountControls();
-  new MutationObserver(() => {
-    if (!document.getElementById('neuralia-comp-controls')) mountControls();
-  }).observe(document.documentElement, { childList:true, subtree:true });
-
-  // Uma fonte externa abre ao lado da conversa que a produziu.
-  document.addEventListener('click', (event) => {
-    if (!event.isTrusted || event.defaultPrevented) return;
-    if (event.target && event.target.closest
-        && event.target.closest('#neuralia-comp-controls,#neuralia-palette')) return;
-    const anchor = event.target && event.target.closest
-      ? event.target.closest('a[href]') : null;
-    if (!anchor) return;
-
-    let target;
-    try { target = new URL(anchor.href, location.href); } catch (_) { return; }
-    if (target.protocol !== 'http:' && target.protocol !== 'https:') return;
-
-    if (target.hostname.endsWith('google.com') && target.pathname === '/url') {
-      const actual = target.searchParams.get('q') || target.searchParams.get('url');
-      if (actual) {
-        try { target = new URL(actual); } catch (_) {}
+      function rebuildTicks() {
+        const state = metrics();
+        const view = state.root ? state.root.clientHeight : window.innerHeight;
+        const count = Math.max(5, Math.min(11,
+          Math.ceil((state.max + Math.max(view, 1)) / Math.max(view, 1))));
+        if (ticks.children.length === count) return;
+        ticks.textContent = '';
+        for (let i = 0; i < count; i++) {
+          const tick = createElement('div');
+          tick.dataset.tick = String(i);
+          assign(tick.style, {
+            height:'2px', width:i === 0 ? '30px' : '14px', borderRadius:'2px',
+            background:'rgba(255,255,255,.30)',
+            transition:'width .16s ease, background .16s ease, opacity .16s ease'
+          });
+          tick.onclick = (event) => {
+            event.preventDefault(); event.stopPropagation();
+            const state = metrics();
+            const fraction = count <= 1 ? 0 : i / (count - 1);
+            scrollToPosition(state.max * fraction);
+          };
+          append(ticks, tick);
+        }
       }
+
+      function syncTicks() {
+        rebuildTicks();
+        const state = metrics();
+        const progress = state.max <= 0 ? 0 : Math.max(0, Math.min(1, state.top / state.max));
+        const count = ticks.children.length;
+        const active = Math.round(progress * Math.max(0, count - 1));
+        Array.from(ticks.children).forEach((tick, i) => {
+          const selected = i === active;
+          tick.style.width = selected ? '32px' : (Math.abs(i - active) === 1 ? '22px' : '13px');
+          tick.style.background = selected ? '#fff' : 'rgba(255,255,255,.32)';
+          tick.style.opacity = selected ? '1' : (Math.abs(i - active) === 1 ? '.78' : '.55');
+        });
+      }
+
+      append(rail, arrow('⌃', 'Resposta anterior', -1));
+      append(rail, ticks);
+      append(rail, arrow('⌄', 'Próxima resposta', 1));
+      append(controls, minimize);
+      append(controls, expand);
+      append(controls, rail);
+      append(document.documentElement, controls);
+
+      let raf = 0;
+      const scheduleSync = () => {
+        if (raf) return;
+        raf = requestAnimationFrame(() => { raf = 0; syncTicks(); });
+      };
+      listen(window, 'scroll', scheduleSync, { passive:true });
+      listen(document, 'scroll', scheduleSync, { passive:true, capture:true });
+      listen(window, 'resize', scheduleSync, { passive:true });
+      new MutationObserver(scheduleSync).observe(document.documentElement, {
+        childList:true, subtree:true
+      });
+      syncTicks();
     }
 
-    if (target.hostname === location.hostname) return;
-    event.preventDefault();
-    event.stopPropagation();
-    window.location.href = 'neuralia:split?col=' + colIndex
-      + '&url=' + encodeURIComponent(target.href)
-      + '&cap=' + encodeURIComponent(capability);
-  }, true);
+    mountControls();
+    new MutationObserver(() => {
+      if (!byId('neuralia-comp-controls')) mountControls();
+    }).observe(document.documentElement, { childList:true, subtree:true });
 
-  document.addEventListener('dblclick', (event) => {
-    if (event.target && event.target.closest
-        && event.target.closest('#neuralia-comp-controls,#neuralia-palette')) return;
-    const tag = event.target && event.target.tagName
-      ? event.target.tagName.toUpperCase() : '';
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-    if (event.target && event.target.isContentEditable) return;
-    window.location.href = 'neuralia:expand?col=' + colIndex
-      + '&cap=' + encodeURIComponent(capability);
-  }, true);
-});
+    // Uma fonte externa abre ao lado da conversa que a produziu.
+    listen(document, 'click', (event) => {
+      if (!event.isTrusted || event.defaultPrevented) return;
+      if (event.target && event.target.closest
+          && event.target.closest('#neuralia-comp-controls,#neuralia-palette')) return;
+      const anchor = event.target && event.target.closest
+        ? event.target.closest('a[href]') : null;
+      if (!anchor) return;
+
+      let target;
+      try { target = new URL(anchor.href, location.href); } catch (_) { return; }
+      if (target.protocol !== 'http:' && target.protocol !== 'https:') return;
+
+      // So o proprio dominio e os seus subdominios: 'evilgoogle.com' nao conta.
+      const host = target.hostname;
+      if ((host === 'google.com' || host.endsWith('.google.com')) && target.pathname === '/url') {
+        const actual = target.searchParams.get('q') || target.searchParams.get('url');
+        if (actual) {
+          try { target = new URL(actual); } catch (_) {}
+        }
+      }
+
+      if (target.hostname === location.hostname) return;
+      event.preventDefault();
+      event.stopPropagation();
+      window.location.href = 'neuralia:split?col=' + colIndex
+        + '&url=' + encode(target.href)
+        + '&cap=' + encode(capability);
+    }, true);
+
+    listen(document, 'dblclick', (event) => {
+      if (!event.isTrusted || event.defaultPrevented) return;
+      if (event.target && event.target.closest
+          && event.target.closest('#neuralia-comp-controls,#neuralia-palette')) return;
+      const tag = event.target && event.target.tagName
+        ? event.target.tagName.toUpperCase() : '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (event.target && event.target.isContentEditable) return;
+      window.location.href = 'neuralia:expand?col=' + colIndex
+        + '&cap=' + encode(capability);
+    }, true);
+  });
+})();
 "#;

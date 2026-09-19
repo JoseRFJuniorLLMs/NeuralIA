@@ -17,7 +17,11 @@ Defaults:
 
 Remote HTML is untrusted input. Reader output is generated from escaped text blocks, not copied raw markup, and is served with a Content Security Policy that forbids scripts, connections, frames and objects.
 
-Full Web mode inherits the patch level and sandbox model of the installed system WebView runtime. External pages MUST NOT receive NeuralIA IPC. New sensitive WebView permission requests are denied by default, and top-level navigation is restricted to HTTP(S) plus the internal controlled return-to-home navigation.
+Full Web mode inherits the patch level and sandbox model of the installed system WebView runtime. New sensitive WebView permission requests are denied by default. Top-level navigation on the web surfaces is restricted to HTTP(S), plus `view-source:` and the internal intercepted `neuralia:` actions.
+
+There is no IPC object exposed to any page, so there is nothing for a page to call. What does exist is a navigation channel: the `neuralia:` scheme, intercepted before navigation and limited to the fixed list of user-interface actions in SPEC-0005, each one requiring a per-WebView capability token taken from the operating-system CSPRNG and compared in constant time. No action reads files, reaches the local network, or hands over credentials; the only destructive action, `clearhistory`, erases the local history and nothing else. The floating omnibox is a native Win32 control, so a page may ask for it to open but can never read or submit what is typed into it.
+
+The optional Gmail monitor is background network activity the user is entitled to know about. When a Google session already exists in the WebView2 profile, a hidden WebView keeps `mail.google.com` loaded so new mail can be announced natively. It consumes the session cookies that are already in the profile to tell whether a session exists; it never asks for a password, never copies those cookies out of the profile, and sends nothing to NeuralIA or to any third party. It only runs while such a session exists, and `NEURALIA_NO_GMAIL=1` disables it.
 
 Local history writes MUST occur off the UI thread and retention MUST be bounded. The user MUST have a local clear-history action.
 

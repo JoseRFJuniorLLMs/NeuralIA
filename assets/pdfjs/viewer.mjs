@@ -1,5 +1,9 @@
-// Visualizador PDF offline do NeuralIA. Mantem uma janela pequena de canvases
-// renderizados para que documentos longos nao consumam memoria sem limite.
+// Visualizador PDF offline do NeuralIA. Documentos longos nao podem consumir
+// memoria sem limite: ha um placeholder por pagina (da a barra de scroll
+// certa), mas o canvas e o PDFPageProxy so vivem perto da pagina actual, e os
+// bytes chegam por ranges em vez de o ficheiro inteiro ser copiado para o
+// worker. A geometria e calculada, nao lida do DOM, para o scroll nao forcar
+// layout a cada evento.
 import * as pdfjsLib from './pdf.mjs';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './pdf.worker.mjs';
@@ -8,14 +12,34 @@ const status = document.getElementById('status');
 const hud = document.getElementById('hud');
 const pagesEl = document.getElementById('pages');
 const MAX_WIDTH = 960;
+// Paginas com canvas vivo a volta da actual; o proxy da pagina sobrevive um
+// pouco mais (EVICT_RADIUS) para o vaivem do scroll nao repetir o getPage.
 const KEEP_RADIUS = 3;
+const EVICT_RADIUS = KEEP_RADIUS + 2;
+// Faixa alem do viewport em que o observer pede render. A evicao respeita a
+// mesma faixa: o que o observer acabou de pedir nao pode ser apagado logo a
+// seguir, porque ele so volta a disparar quando a interseccao mudar.
+const BAND = 1200;
+const PROBE_PAGES = 8;
+const RANGE_CHUNK = 1048576;
 
 const slots = [];
+// tops[i] e o offsetTop do placeholder i e heights[i] a altura que lhe
+// escrevemos; so top0 e gap vem de uma medicao unica (load e resize).
+const tops = [];
+const heights = [];
+let top0 = 0;
+let gap = 0;
+// Indices com canvas e/ou proxy vivos: a evicao percorre so estes.
+const live = new Set();
 let doc = null;
 let scale = 1;
 let current = 1;
+let baseWidth = 1;
+let defaultSize = null;
 let renderGeneration = 0;
 let resizeTimer = 0;
+let hudQueued = false;
 
 function pixelRatio() {
   return Math.max(1, Math.min(window.devicePixelRatio || 1, 3));
@@ -27,15 +51,93 @@ function fail(message) {
   status.hidden = false;
 }
 
+// O PDF.js entrega os erros de rede como ResponseException (estado HTTP) e o
+// "Failed to fetch" embrulhado em UnknownErrorException; o resto e PDF que
+// nao se consegue abrir. Mantem as duas mensagens de sempre.
+function describeLoadError(err) {
+  const name = (err && err.name) || '';
+  const text = (err && err.message) || String(err);
+  if (name === 'ResponseException') return 'Não consegui obter o PDF: HTTP ' + err.status;
+  if (name === 'UnknownErrorException' && /fetch/i.test(text)) return 'Não consegui obter o PDF: ' + text;
+  return 'Este ficheiro não é um PDF que eu consiga abrir: ' + text;
+}
+
 function targetWidth() {
   return Math.min(MAX_WIDTH, Math.max(320, window.innerWidth - 48));
 }
 
-function applyViewport(slot, viewport) {
-  slot.canvas.style.width = Math.floor(viewport.width) + 'px';
-  slot.canvas.style.height = Math.floor(viewport.height) + 'px';
-  slot.el.style.width = slot.canvas.style.width;
-  slot.el.style.height = slot.canvas.style.height;
+// Escreve no placeholder (e no canvas, se existir) o tamanho da pagina a
+// escala actual; devolve true se a altura mudou, porque os tops abaixo dela
+// ficam errados.
+function layoutSlot(index) {
+  const slot = slots[index];
+  const size = slot.size || defaultSize;
+  const w = Math.floor(size.width * scale);
+  const h = Math.floor(size.height * scale);
+  if (slot.cssWidth !== w) {
+    slot.cssWidth = w;
+    slot.el.style.width = w + 'px';
+  }
+  if (slot.canvas) {
+    slot.canvas.style.width = w + 'px';
+    slot.canvas.style.height = h + 'px';
+  }
+  if (heights[index] === h) return false;
+  heights[index] = h;
+  slot.el.style.height = h + 'px';
+  return true;
+}
+
+function rebuildTops(from) {
+  for (let i = from; i < slots.length; i++) {
+    tops[i] = i === 0 ? top0 : tops[i - 1] + heights[i - 1] + gap;
+  }
+}
+
+// Unica leitura de layout: onde comeca o primeiro placeholder e o gap do
+// flex. Tudo o resto e aritmetica sobre alturas que nos proprios escrevemos.
+function measureLayout() {
+  top0 = slots[0].el.getBoundingClientRect().top + window.scrollY;
+  gap = parseFloat(getComputedStyle(pagesEl).rowGap) || 0;
+  rebuildTops(0);
+}
+
+function layoutAll() {
+  for (let i = 0; i < slots.length; i++) layoutSlot(i);
+  measureLayout();
+}
+
+// Tamanho real (escala 1) de uma pagina: corrige o placeholder e os tops a
+// partir dela. Um PDF com orientacoes mistas so salta ate a pagina ser vista.
+function setSize(index, size) {
+  const slot = slots[index];
+  if (slot.size && slot.size.width === size.width && slot.size.height === size.height) return;
+  slot.size = size;
+  if (layoutSlot(index)) rebuildTops(index + 1);
+}
+
+function attachCanvas(slot, index) {
+  const canvas = document.createElement('canvas');
+  canvas.style.width = slot.cssWidth + 'px';
+  canvas.style.height = heights[index] + 'px';
+  slot.el.insertBefore(canvas, slot.el.firstChild);
+  slot.canvas = canvas;
+  return canvas;
+}
+
+// width = 0 liberta o bitmap ja; tirar o no do DOM poupa o resto.
+function releaseCanvas(slot) {
+  const canvas = slot.canvas;
+  if (!canvas) return;
+  canvas.width = 0;
+  canvas.height = 0;
+  canvas.remove();
+  slot.canvas = null;
+  slot.rendered = false;
+}
+
+function cleanupPage(slot) {
+  if (slot.page && typeof slot.page.cleanup === 'function') slot.page.cleanup();
 }
 
 async function render(index) {
@@ -45,17 +147,20 @@ async function render(index) {
   const generation = renderGeneration;
   slot.rendering = true;
   slot.generation = generation;
+  live.add(index);
   try {
     const page = slot.page || (slot.page = await doc.getPage(index + 1));
     if (generation !== renderGeneration) return;
 
+    const base = page.getViewport({ scale: 1 });
+    setSize(index, { width: base.width, height: base.height });
     const viewport = page.getViewport({ scale });
     const dpr = pixelRatio();
-    applyViewport(slot, viewport);
-    slot.canvas.width = Math.max(1, Math.floor(viewport.width * dpr));
-    slot.canvas.height = Math.max(1, Math.floor(viewport.height * dpr));
+    const canvas = slot.canvas || attachCanvas(slot, index);
+    canvas.width = Math.max(1, Math.floor(viewport.width * dpr));
+    canvas.height = Math.max(1, Math.floor(viewport.height * dpr));
 
-    const ctx = slot.canvas.getContext('2d', { alpha: false });
+    const ctx = canvas.getContext('2d', { alpha: false });
     const task = page.render({
       canvasContext: ctx,
       viewport,
@@ -76,15 +181,29 @@ async function render(index) {
   }
 }
 
+// So visita os indices vivos, nunca todas as paginas. O canvas fica enquanto
+// a pagina estiver a KEEP_RADIUS da actual ou dentro da faixa do observer; o
+// proxy dura ate EVICT_RADIUS, excepto o da pagina 1, que e a referencia da
+// escala e a primeira a voltar a mostrar.
 function evictFarPages() {
   const center = current - 1;
-  for (let i = 0; i < slots.length; i++) {
+  const bandTop = window.scrollY - BAND;
+  const bandBottom = window.scrollY + window.innerHeight + BAND;
+  for (const i of live) {
     const slot = slots[i];
-    if (Math.abs(i - center) <= KEEP_RADIUS || slot.rendering || !slot.rendered) continue;
-    slot.canvas.width = 0;
-    slot.canvas.height = 0;
-    slot.rendered = false;
-    if (slot.page && typeof slot.page.cleanup === 'function') slot.page.cleanup();
+    if (slot.rendering) continue;
+    const distance = Math.abs(i - center);
+    if (distance > KEEP_RADIUS && !(tops[i] + heights[i] >= bandTop && tops[i] <= bandBottom)) {
+      if (slot.canvas) {
+        releaseCanvas(slot);
+        cleanupPage(slot);
+      }
+      if (distance > EVICT_RADIUS && i !== 0 && slot.page) {
+        cleanupPage(slot);
+        slot.page = null;
+      }
+    }
+    if (!slot.canvas && !slot.page) live.delete(i);
   }
 }
 
@@ -92,25 +211,55 @@ const observer = new IntersectionObserver((entries) => {
   for (const entry of entries) {
     if (entry.isIntersecting) render(Number(entry.target.dataset.index));
   }
-}, { rootMargin: '1200px 0px' });
+}, { rootMargin: BAND + 'px 0px' });
+
+// Maior indice cujo topo esta acima de y: pesquisa binaria em tops.
+function pageAt(y) {
+  let lo = 0;
+  let hi = tops.length - 1;
+  let best = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (tops[mid] <= y) {
+      best = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return best;
+}
 
 function updateHud() {
-  const top = window.scrollY + window.innerHeight * 0.35;
-  let best = 1;
-  for (let i = 0; i < slots.length; i++) {
-    if (slots[i].el.offsetTop <= top) best = i + 1;
-    else break;
-  }
-  current = best;
+  if (!slots.length) return;
+  const index = pageAt(window.scrollY + window.innerHeight * 0.35);
+  current = index + 1;
   hud.textContent = current + ' / ' + slots.length;
-  for (let i = Math.max(0, current - 2); i <= Math.min(slots.length - 1, current); i++) render(i);
+  for (let i = Math.max(0, index - 1); i <= Math.min(slots.length - 1, index + 1); i++) render(i);
   evictFarPages();
 }
 
+// Um scroll dispara varios eventos por frame; basta um updateHud por frame.
+function scheduleHud() {
+  if (hudQueued) return;
+  hudQueued = true;
+  requestAnimationFrame(() => {
+    hudQueued = false;
+    updateHud();
+  });
+}
+
+// Pede render a tudo o que esta na faixa do observer, pelos tops calculados:
+// o observer nao volta a disparar para o que ja estava a intersectar.
+function renderBand() {
+  const bottom = window.scrollY + window.innerHeight + BAND;
+  for (let i = pageAt(window.scrollY - BAND); i < slots.length && tops[i] <= bottom; i++) render(i);
+}
+
 function scrollToPage(number) {
-  const slot = slots[Math.max(0, Math.min(slots.length, number) - 1)];
-  if (!slot) return;
-  window.scrollTo({ top: Math.max(0, slot.el.offsetTop - 24), behavior: 'smooth' });
+  const index = Math.max(0, Math.min(slots.length, number) - 1);
+  if (!slots[index]) return;
+  window.scrollTo({ top: Math.max(0, tops[index] - 24), behavior: 'smooth' });
 }
 
 window.__neuralia_next_page = function () {
@@ -122,49 +271,83 @@ window.__neuralia_prev_page = function () {
   return false;
 };
 
+// Dimensoes (escala 1) das primeiras paginas; getPage e getViewport nao
+// renderizam nada. Uma falha individual deixa a pagina com o placeholder
+// por omissao.
+async function probeSizes(first) {
+  const count = Math.min(PROBE_PAGES, doc.numPages);
+  const pages = [];
+  for (let i = 0; i < count; i++) {
+    pages.push(i === 0 ? Promise.resolve(first) : doc.getPage(i + 1).catch(() => null));
+  }
+  return (await Promise.all(pages)).map((page) => {
+    if (!page) return null;
+    const v = page.getViewport({ scale: 1 });
+    return { width: v.width, height: v.height };
+  });
+}
+
+function medianSize(sizes) {
+  const found = sizes.filter(Boolean).sort((a, b) => a.height - b.height);
+  return found[found.length >> 1];
+}
+
 async function load() {
-  let data;
   try {
-    const response = await fetch('./document.pdf');
-    if (!response.ok) throw new Error('HTTP ' + response.status);
-    data = await response.arrayBuffer();
+    // url + rangeChunkSize: o PDF.js pede so os bytes de que precisa (Range)
+    // e passa-os ao worker sem copia; se o servidor nao anunciar
+    // Accept-Ranges cai sozinho no download completo. disableStream impede o
+    // pedido inicial de continuar a puxar o ficheiro inteiro depois dos
+    // cabecalhos, e disableAutoFetch impede o worker de ir buscar em fundo os
+    // chunks que ninguem pediu; sem os dois, o PDF acabava todo em memoria.
+    doc = await pdfjsLib.getDocument({
+      url: './document.pdf',
+      rangeChunkSize: RANGE_CHUNK,
+      disableStream: true,
+      disableAutoFetch: true
+    }).promise;
   } catch (err) {
-    fail('Não consegui obter o PDF: ' + err.message);
+    fail(describeLoadError(err));
     return;
   }
 
+  let first;
+  let known;
   try {
-    doc = await pdfjsLib.getDocument({ data }).promise;
+    first = await doc.getPage(1);
+    baseWidth = first.getViewport({ scale: 1 }).width;
+    scale = targetWidth() / baseWidth;
+    // A mediana das primeiras paginas e o placeholder por omissao: menos
+    // saltos que assumir que todas tem o tamanho da pagina 1.
+    known = await probeSizes(first);
+    defaultSize = medianSize(known);
   } catch (err) {
-    fail('Este ficheiro não é um PDF que eu consiga abrir: ' + (err.message || err));
+    fail(describeLoadError(err));
     return;
   }
 
-  const first = await doc.getPage(1);
-  const base = first.getViewport({ scale: 1 });
-  scale = targetWidth() / base.width;
-
+  // Placeholders para todas as paginas (baratos e dao a barra de scroll
+  // certa); o canvas so nasce em render().
+  const fragment = document.createDocumentFragment();
   for (let i = 0; i < doc.numPages; i++) {
     const el = document.createElement('div');
     el.className = 'page';
     el.dataset.index = String(i);
-    el.style.width = Math.floor(base.width * scale) + 'px';
-    el.style.height = Math.floor(base.height * scale) + 'px';
-
-    const canvas = document.createElement('canvas');
     const num = document.createElement('span');
     num.className = 'num';
     num.textContent = String(i + 1);
-    el.appendChild(canvas);
     el.appendChild(num);
-    pagesEl.appendChild(el);
+    fragment.appendChild(el);
 
     slots.push({
-      el, canvas, page: i === 0 ? first : null,
+      el, canvas: null, page: i === 0 ? first : null, size: known[i] || null, cssWidth: 0,
       rendered: false, rendering: false, task: null, generation: renderGeneration
     });
-    observer.observe(el);
   }
+  pagesEl.appendChild(fragment);
+  live.add(0);
+  layoutAll();
+  for (const slot of slots) observer.observe(slot.el);
 
   status.hidden = true;
   hud.hidden = false;
@@ -172,31 +355,32 @@ async function load() {
   document.title = 'NeuralIA · PDF · ' + doc.numPages + ' páginas';
 }
 
-window.addEventListener('scroll', updateHud, { passive: true });
+// Nova escala: cancela o que estava a desenhar, larga todos os canvases (a
+// escala antiga ja nao serve), recalcula a geometria e volta a pedir so o
+// que esta na faixa visivel.
+function relayout() {
+  if (!doc || !slots.length) return;
+
+  renderGeneration++;
+  for (const i of live) {
+    const slot = slots[i];
+    if (slot.task && typeof slot.task.cancel === 'function') slot.task.cancel();
+    slot.rendering = false;
+    slot.task = null;
+    releaseCanvas(slot);
+    if (!slot.page) live.delete(i);
+  }
+
+  scale = targetWidth() / baseWidth;
+  layoutAll();
+  updateHud();
+  renderBand();
+}
+
+window.addEventListener('scroll', scheduleHud, { passive: true });
 window.addEventListener('resize', () => {
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => {
-    if (!doc || !slots[0] || !slots[0].page) return;
-
-    renderGeneration++;
-    for (const slot of slots) {
-      if (slot.task && typeof slot.task.cancel === 'function') slot.task.cancel();
-      slot.rendering = false;
-      slot.rendered = false;
-      slot.task = null;
-    }
-
-    scale = targetWidth() / slots[0].page.getViewport({ scale: 1 }).width;
-    for (const slot of slots) {
-      if (slot.page) applyViewport(slot, slot.page.getViewport({ scale }));
-    }
-    updateHud();
-
-    slots.forEach((slot, index) => {
-      const rect = slot.el.getBoundingClientRect();
-      if (rect.bottom > -1200 && rect.top < window.innerHeight + 1200) render(index);
-    });
-  }, 120);
+  resizeTimer = setTimeout(relayout, 120);
 });
 
 load();

@@ -81,6 +81,14 @@ function Wait-ForWebViews([int]$RootId, [scriptblock]$Predicate, [int]$TimeoutSe
 $script:WebViewBaseline = @(Get-Process -Name msedgewebview2 -ErrorAction SilentlyContinue).Count
 
 $env:NEURALIA_STARTUP_INPUT = $StartupInput
+
+# O monitor do Gmail e uma excepcao INTENCIONAL ao "zero WebViews na Home": ele
+# nasce quando existe sessao Google no perfil WebView2 e fica vivo mesmo depois
+# de voltar a Home, por desenho. Este gate conta processos, nao intencoes, por
+# isso sem esta variavel ele falharia em qualquer maquina com sessao Google --
+# no CI passa por acaso, porque o runner e limpo e nunca tem sessao.
+$env:NEURALIA_NO_GMAIL = "1"
+
 $process = Start-Process -FilePath $resolved -PassThru
 $failures = New-Object System.Collections.ArrayList
 $samples = New-Object System.Collections.ArrayList

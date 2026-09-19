@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use scraper::{ElementRef, Html, Selector};
+use scraper::{CaseSensitivity, ElementRef, Html, Node, Selector, node::Element};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use ureq::{
@@ -30,6 +30,28 @@ const MAX_TITLE_CHARS: usize = 512;
 const MAX_BYLINE_CHARS: usize = 256;
 const MAX_EXCERPT_CHARS: usize = 2_000;
 const MAX_BLOCK_CHARS: usize = 20_000;
+// Tectos independentes do algoritmo: mesmo que um passo volte a ficar caro
+// por elemento, o trabalho fica proporcional a estes numeros e nao ao HTML.
+// Candidatos: os primeiros MAX_CANDIDATES em ordem de documento (o exterior
+// abre primeiro, por isso um <article> com centenas de .post continua a ser
+// pontuado). Profundidade: elementos com mais de MAX_DEPTH antepassados nao
+// sao candidatos, blocos nem texto de fallback (o Chromium corta a 512).
+// Aninhamento: `text()` de um bloco le a subarvore toda, logo cada no seria
+// lido uma vez por bloco antepassado -- blockquote dentro de blockquote sem
+// fim voltava a ser quadratico.
+const MAX_CANDIDATES: usize = 256;
+const MAX_DEPTH: usize = 256;
+const MAX_BLOCK_NESTING: usize = 16;
+const BUDGET_CHECK_INTERVAL: usize = 512;
+const CANDIDATE_CLASSES: [&str; 7] = [
+    "article",
+    "post",
+    "entry-content",
+    "post-content",
+    "article-body",
+    "story-body",
+    "content",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReaderArticle {
@@ -119,8 +141,9 @@ impl ReaderClient {
 
     /// Como `fetch`, mas desiste assim que `cancelled()` passa a ser verdade.
     /// O Reader corre numa thread propria e a ligacao nao se pode abortar de
-    /// fora, por isso a desistencia e cooperativa: testada antes de cada pedido
-    /// e entre blocos do corpo.
+    /// fora, por isso a desistencia e cooperativa: testada antes de cada
+    /// pedido, entre blocos do corpo e, na extraccao, a cada
+    /// `BUDGET_CHECK_INTERVAL` elementos da arvore.
     pub fn fetch_cancellable(
         &self,
         input: &str,
@@ -140,11 +163,22 @@ impl ReaderClient {
         reject_declared_oversize(&response, self.max_bytes)?;
         let body = self.read_body(&mut response, started, self.max_bytes, true, cancelled)?;
 
-        // O BodyReader ja entrega UTF-8 (conversao de charset incluida), por
-        // isso juntamos os blocos e convertemos uma vez so: um caratere
-        // partido entre blocos nao se estraga.
-        let html = String::from_utf8_lossy(&body).into_owned();
-        extract_article(&current, &html)
+        // O BodyReader ja entrega UTF-8 nos `text/*` (conversao de charset e
+        // substituicao lossy incluidas), por isso a conversao e por movimento:
+        // sem copia e sem manter os 2 MiB do Vec vivos durante o parse. O
+        // `application/xhtml+xml` nao passa pelo decoder lossy, dai o recurso
+        // ao `from_utf8_lossy` so quando os bytes nao sao UTF-8.
+        let html = String::from_utf8(body)
+            .unwrap_or_else(|invalid| String::from_utf8_lossy(invalid.as_bytes()).into_owned());
+
+        // O prazo e a desistencia tambem cobrem a extraccao: sem isto um HTML
+        // hostil prendia a thread neural-reader depois de o corpo ter chegado.
+        extract_article_bounded(
+            &current,
+            &html,
+            started.checked_add(self.timeout),
+            cancelled,
+        )
     }
 
     /// Descarrega um documento binario -- por exemplo `application/pdf` -- ate
@@ -249,6 +283,12 @@ impl ReaderClient {
         text: bool,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Vec<u8>> {
+        // O Content-Length declarado ja foi validado contra `max_bytes`; com
+        // Content-Encoding o ureq devolve None e o Vec cresce como antes.
+        let capacity = response
+            .body()
+            .content_length()
+            .map_or(0, |length| length.min(max_bytes as u64) as usize);
         let mut reader = response
             .body_mut()
             .with_config()
@@ -256,7 +296,7 @@ impl ReaderClient {
             .lossy_utf8(text)
             .reader();
 
-        let mut body = Vec::new();
+        let mut body = Vec::with_capacity(capacity);
         let mut chunk = [0u8; 16 * 1024];
         loop {
             if cancelled() {
@@ -269,6 +309,11 @@ impl ReaderClient {
             if read == 0 {
                 break;
             }
+            // O `.limit()` do ureq conta bytes ANTES do gzip/brotli e da
+            // conversao de charset (o LimitReader e a camada mais interna do
+            // BodyReader), por isso esta verificacao nao e redundante: e a
+            // unica que trava o corpo DESCODIFICADO -- uma bomba de
+            // descompressao com 2 MiB comprimidos passava o limite do ureq.
             let decoded = body.len().saturating_add(read);
             if decoded > max_bytes {
                 return Err(NeuralError::ResponseTooLarge {
@@ -314,8 +359,62 @@ impl Default for ReaderClient {
     }
 }
 
+/// Prazo e desistencia cooperativos da extraccao, verificados a cada
+/// `BUDGET_CHECK_INTERVAL` elementos visitados: um HTML hostil nao pode
+/// prender a thread neural-reader depois de o utilizador carregar em Esc.
+struct Budget<'a> {
+    deadline: Option<Instant>,
+    cancelled: &'a dyn Fn() -> bool,
+    visited: usize,
+}
+
+impl Budget<'_> {
+    fn check(&self) -> Result<()> {
+        if (self.cancelled)() {
+            return Err(NeuralError::ReaderCancelled);
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(NeuralError::ReaderDeadline);
+        }
+        Ok(())
+    }
+
+    fn tick(&mut self) -> Result<()> {
+        self.visited += 1;
+        if self.visited.is_multiple_of(BUDGET_CHECK_INTERVAL) {
+            self.check()
+        } else {
+            Ok(())
+        }
+    }
+}
+
 pub fn extract_article(url: &Url, html: &str) -> Result<ReaderArticle> {
+    extract_article_bounded(url, html, None, &|| false)
+}
+
+/// Como `extract_article`, mas com prazo e desistencia: as travessias da
+/// arvore testam `cancelled()` e `deadline` a cada `BUDGET_CHECK_INTERVAL`
+/// elementos. So o `Html::parse_document` fica fora do controlo -- e linear
+/// e o corpo ja chega limitado a `reader_max_bytes`.
+pub fn extract_article_bounded(
+    url: &Url,
+    html: &str,
+    deadline: Option<Instant>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ReaderArticle> {
+    let mut budget = Budget {
+        deadline,
+        cancelled,
+        visited: 0,
+    };
+    budget.check()?;
     let document = Html::parse_document(html);
+    budget.check()?;
+
     let title = meta_content(&document, "meta[property='og:title']")
         .or_else(|| text_of_first(&document, "title"))
         .or_else(|| text_of_first(&document, "h1"))
@@ -324,27 +423,218 @@ pub fn extract_article(url: &Url, html: &str) -> Result<ReaderArticle> {
     let excerpt = meta_content(&document, "meta[name='description']")
         .or_else(|| meta_content(&document, "meta[property='og:description']"));
 
-    let candidate_selector = Selector::parse(
-        "article,main,[role='main'],.article,.post,.entry-content,.post-content,.article-body,.story-body,.content",
+    let root = pick_root(&document, &mut budget)?;
+    let mut blocks = collect_blocks(root, &mut budget)?;
+
+    if blocks.is_empty() {
+        let fallback = truncate_chars(fallback_visible_text(root, &mut budget)?, MAX_BLOCK_CHARS);
+        if fallback.chars().count() < 40 {
+            return Err(NeuralError::ReaderExtraction);
+        }
+        blocks.push(ReaderBlock::Paragraph(fallback));
+    }
+
+    Ok(ReaderArticle {
+        source_url: url.to_string(),
+        title: truncate_chars(normalize_text(title), MAX_TITLE_CHARS),
+        byline: byline
+            .map(normalize_text)
+            .map(|value| truncate_chars(value, MAX_BYLINE_CHARS))
+            .filter(|value| !value.is_empty()),
+        excerpt: excerpt
+            .map(normalize_text)
+            .map(|value| truncate_chars(value, MAX_EXCERPT_CHARS))
+            .filter(|value| !value.is_empty()),
+        blocks,
+    })
+}
+
+/// Um elemento aberto durante a passagem unica. `ignored` vem do proprio
+/// elemento ou de um antepassado -- propaga-se de cima para baixo pela
+/// pilha, nunca subindo a arvore -- e os contadores de texto sobem de baixo
+/// para cima quando o elemento fecha.
+struct Frame<'a> {
+    element: ElementRef<'a>,
+    ignored: bool,
+    candidate: bool,
+    order: usize,
+    text: usize,
+    blocks: usize,
+    links: usize,
+}
+
+/// Escolhe o contentor do artigo numa unica passagem O(n). A pontuacao e a
+/// mesma heuristica de antes -- texto dos blocos menos duas vezes o texto das
+/// ligacoes, blocos aninhados contam duas vezes -- mas acumulada ao fechar
+/// cada elemento em vez de percorrer a subarvore de cada candidato. Em
+/// empate ganha o ultimo em ordem de documento, como o `max_by_key` antigo.
+/// Sem `<html>` como raiz nao ha candidatos e devolve-se a raiz, como antes.
+///
+/// `descendants()` e pre-ordem; o fecho de um elemento acontece quando o
+/// proximo no visitado ja nao esta dentro dele, isto e, quando o pai desse
+/// no nao e o topo da pilha.
+fn pick_root<'a>(document: &'a Html, budget: &mut Budget<'_>) -> Result<ElementRef<'a>> {
+    let html = document.root_element();
+    let mut stack: Vec<Frame<'a>> = Vec::new();
+    let mut best: Option<(usize, usize, ElementRef<'a>)> = None;
+    let mut scored = 0usize;
+    let mut order = 0usize;
+
+    for node in html.descendants() {
+        let parent = node.parent().map(|parent| parent.id());
+        while let Some(frame) = stack.pop_if(|frame| Some(frame.element.id()) != parent) {
+            close_frame(frame, stack.last_mut(), &mut best);
+        }
+
+        match node.value() {
+            Node::Element(element) => {
+                budget.tick()?;
+                let Some(element_ref) = ElementRef::wrap(node) else {
+                    continue;
+                };
+                let ignored = stack.last().is_some_and(|frame| frame.ignored)
+                    || ignored_tag(element.name())
+                    || is_hidden_element(element);
+                let candidate = !ignored
+                    && stack.len() <= MAX_DEPTH
+                    && scored < MAX_CANDIDATES
+                    && is_candidate(element);
+                scored += usize::from(candidate);
+                order += 1;
+                stack.push(Frame {
+                    element: element_ref,
+                    ignored,
+                    candidate,
+                    order,
+                    text: 0,
+                    blocks: 0,
+                    links: 0,
+                });
+            }
+            Node::Text(text) => {
+                if let Some(frame) = stack.last_mut()
+                    && !frame.ignored
+                {
+                    frame.text += visible_chars(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    while let Some(frame) = stack.pop() {
+        close_frame(frame, stack.last_mut(), &mut best);
+    }
+
+    Ok(best.map_or(html, |(_, _, element)| element))
+}
+
+fn close_frame<'a>(
+    frame: Frame<'a>,
+    parent: Option<&mut Frame<'a>>,
+    best: &mut Option<(usize, usize, ElementRef<'a>)>,
+) {
+    if frame.candidate {
+        let score = frame.blocks.saturating_sub(frame.links.saturating_mul(2));
+        if best
+            .as_ref()
+            .is_none_or(|&(top, order, _)| (score, frame.order) > (top, order))
+        {
+            *best = Some((score, frame.order, frame.element));
+        }
+    }
+    if let Some(parent) = parent
+        && !frame.ignored
+    {
+        let name = frame.element.value().name();
+        parent.text += frame.text;
+        parent.blocks += frame.blocks + if block_tag(name) { frame.text } else { 0 };
+        parent.links += frame.links + if name == "a" { frame.text } else { 0 };
+    }
+}
+
+/// Os mesmos contentores do selector antigo (`article,main,[role='main'],
+/// .article,.post,.entry-content,.post-content,.article-body,.story-body,
+/// .content`), testados a mao para nao pagar o motor de selectores em cada
+/// elemento da arvore.
+fn is_candidate(element: &Element) -> bool {
+    matches!(element.name(), "article" | "main")
+        || element.attr("role") == Some("main")
+        || CANDIDATE_CLASSES
+            .iter()
+            .any(|class| element.has_class(class, CaseSensitivity::CaseSensitive))
+}
+
+fn block_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "p" | "blockquote" | "pre" | "li"
     )
-    .expect("static selector");
-    let link_selector = Selector::parse("a").expect("static selector");
-    let block_selector =
-        Selector::parse("h1,h2,h3,h4,h5,h6,p,blockquote,pre,li").expect("static selector");
-    let root = document
-        .select(&candidate_selector)
-        .filter(|candidate| !inside_ignored_container(candidate))
-        .max_by_key(|candidate| score_candidate(candidate, &link_selector, &block_selector))
-        .unwrap_or_else(|| document.root_element());
+}
+
+fn ignored_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "nav" | "footer" | "aside" | "script" | "style" | "form" | "template" | "noscript"
+    )
+}
+
+/// Percorre os descendentes de `root` em pre-ordem e chama `visit` so nos
+/// elementos visiveis ate `MAX_DEPTH` (nem ignorados nem dentro de um
+/// ignorado). A visibilidade propaga-se pela pilha de elementos abertos, por
+/// isso nunca se sobe aos antepassados: O(n). `visit` recebe quantos blocos
+/// visiveis envolvem o elemento e devolve `false` para parar.
+fn walk_visible<'a>(
+    root: ElementRef<'a>,
+    budget: &mut Budget<'_>,
+    mut visit: impl FnMut(ElementRef<'a>, usize) -> bool,
+) -> Result<()> {
+    // (elemento, ignorado, bloco visivel) por elemento aberto abaixo do root
+    let mut open: Vec<(ElementRef<'a>, bool, bool)> = Vec::new();
+    let base_depth = root
+        .ancestors()
+        .filter(|node| node.value().is_element())
+        .count();
+    let mut ignored = 0usize;
+    let mut nesting = 0usize;
+
+    for node in root.descendants().skip(1) {
+        let parent = node.parent().map(|parent| parent.id());
+        while let Some((_, hidden, block)) =
+            open.pop_if(|(element, _, _)| Some(element.id()) != parent)
+        {
+            ignored -= usize::from(hidden);
+            nesting -= usize::from(block);
+        }
+
+        let Some(element) = ElementRef::wrap(node) else {
+            continue;
+        };
+        budget.tick()?;
+        let hidden = ignored > 0
+            || ignored_tag(element.value().name())
+            || is_hidden_element(element.value());
+        let block = !hidden && block_tag(element.value().name());
+        if hidden {
+            ignored += 1;
+        } else if base_depth + open.len() < MAX_DEPTH && !visit(element, nesting) {
+            return Ok(());
+        }
+        nesting += usize::from(block);
+        open.push((element, hidden, block));
+    }
+    Ok(())
+}
+
+fn collect_blocks(root: ElementRef<'_>, budget: &mut Budget<'_>) -> Result<Vec<ReaderBlock>> {
     let mut blocks = Vec::new();
     let mut previous = String::new();
 
-    for node in root.select(&block_selector) {
-        if inside_ignored_container(&node) {
-            continue;
+    walk_visible(root, budget, |node, nesting| {
+        let tag = node.value().name();
+        if !block_tag(tag) || nesting > MAX_BLOCK_NESTING {
+            return true;
         }
 
-        let tag = node.value().name();
         let text = if tag == "pre" {
             truncate_chars(
                 normalize_code(node.text().collect::<Vec<_>>().join("")),
@@ -358,7 +648,7 @@ pub fn extract_article(url: &Url, html: &str) -> Result<ReaderArticle> {
         };
 
         if text.chars().count() < 2 || text == previous {
-            continue;
+            return true;
         }
 
         let block = match tag {
@@ -394,112 +684,39 @@ pub fn extract_article(url: &Url, html: &str) -> Result<ReaderArticle> {
 
         previous = text;
         blocks.push(block);
-        if blocks.len() >= MAX_BLOCKS {
-            break;
-        }
-    }
+        blocks.len() < MAX_BLOCKS
+    })?;
 
-    if blocks.is_empty() {
-        let fallback = truncate_chars(fallback_visible_text(&root), MAX_BLOCK_CHARS);
-        if fallback.chars().count() < 40 {
-            return Err(NeuralError::ReaderExtraction);
-        }
-        blocks.push(ReaderBlock::Paragraph(fallback));
-    }
-
-    Ok(ReaderArticle {
-        source_url: url.to_string(),
-        title: truncate_chars(normalize_text(title), MAX_TITLE_CHARS),
-        byline: byline
-            .map(normalize_text)
-            .map(|value| truncate_chars(value, MAX_BYLINE_CHARS))
-            .filter(|value| !value.is_empty()),
-        excerpt: excerpt
-            .map(normalize_text)
-            .map(|value| truncate_chars(value, MAX_EXCERPT_CHARS))
-            .filter(|value| !value.is_empty()),
-        blocks,
-    })
+    Ok(blocks)
 }
 
-fn score_candidate(
-    candidate: &ElementRef<'_>,
-    link_selector: &Selector,
-    block_selector: &Selector,
-) -> usize {
-    let total: usize = candidate
-        .select(block_selector)
-        .filter(|node| !inside_ignored_container(node))
-        .map(|node| {
-            normalize_text(node.text().collect::<Vec<_>>().join(" "))
-                .chars()
-                .count()
-        })
-        .sum();
-    let link_text: usize = candidate
-        .select(link_selector)
-        .filter(|link| !inside_ignored_container(link))
-        .map(|link| {
-            normalize_text(link.text().collect::<Vec<_>>().join(" "))
-                .chars()
-                .count()
-        })
-        .sum();
-    total.saturating_sub(link_text.saturating_mul(2))
-}
+fn fallback_visible_text(root: ElementRef<'_>, budget: &mut Budget<'_>) -> Result<String> {
+    let mut pieces: Vec<String> = Vec::new();
 
-fn ignored_tag(name: &str) -> bool {
-    matches!(
-        name,
-        "nav" | "footer" | "aside" | "script" | "style" | "form" | "template" | "noscript"
-    )
-}
-
-fn inside_ignored_container(node: &ElementRef<'_>) -> bool {
-    is_hidden_element(node)
-        || ignored_tag(node.value().name())
-        || node
-            .ancestors()
-            .filter_map(ElementRef::wrap)
-            .any(|ancestor| ignored_tag(ancestor.value().name()) || is_hidden_element(&ancestor))
-}
-
-fn fallback_visible_text(root: &ElementRef<'_>) -> String {
-    let selector = Selector::parse("*").expect("static selector");
-    let mut pieces = Vec::new();
-
-    for node in root.select(&selector) {
-        if inside_ignored_container(&node) {
-            continue;
-        }
-        if node
-            .children()
-            .any(|child| ElementRef::wrap(child).is_some())
-        {
-            continue;
+    walk_visible(root, budget, |node, _| {
+        if node.children().any(|child| child.value().is_element()) {
+            return true;
         }
         let text = normalize_text(node.text().collect::<Vec<_>>().join(" "));
-        if text.chars().count() < 2 || pieces.last() == Some(&text) {
-            continue;
+        if text.chars().count() >= 2 && pieces.last() != Some(&text) {
+            pieces.push(text);
         }
-        pieces.push(text);
-    }
+        true
+    })?;
 
-    normalize_text(pieces.join(" "))
+    Ok(normalize_text(pieces.join(" ")))
 }
 
-fn is_hidden_element(element: &ElementRef<'_>) -> bool {
-    let value = element.value();
-
-    if value.attr("hidden").is_some()
-        || value
+fn is_hidden_element(element: &Element) -> bool {
+    if element.attr("hidden").is_some()
+        || element
             .attr("aria-hidden")
             .is_some_and(|v| v.eq_ignore_ascii_case("true"))
     {
         return true;
     }
 
-    value.attr("style").is_some_and(|style| {
+    element.attr("style").is_some_and(|style| {
         let compact: String = style
             .chars()
             .filter(|ch| !ch.is_ascii_whitespace())
@@ -507,6 +724,17 @@ fn is_hidden_element(element: &ElementRef<'_>) -> bool {
             .to_ascii_lowercase();
         compact.contains("display:none") || compact.contains("visibility:hidden")
     })
+}
+
+/// Comprimento que `normalize_text` daria a este texto, sem construir a
+/// string: as palavras mais os espacos entre elas.
+fn visible_chars(text: &str) -> usize {
+    let (words, chars) = text
+        .split_whitespace()
+        .fold((0usize, 0usize), |(words, chars), word| {
+            (words + 1, chars + word.chars().count())
+        });
+    chars + words.saturating_sub(1)
 }
 
 fn meta_content(document: &Html, selector: &str) -> Option<String> {
@@ -614,5 +842,35 @@ mod tests {
         </body></html>"#;
         let url = Url::parse("https://example.jp/").unwrap();
         assert!(extract_article(&url, html).is_ok());
+    }
+
+    #[test]
+    fn prefers_the_container_with_most_block_text() {
+        let html = r#"<html><head><title>Dois</title></head><body>
+        <div class="content"><p>Curto.</p><a href="/x">ligacao ligacao ligacao ligacao</a></div>
+        <article><p>Paragrafo longo o suficiente para ganhar a pontuacao do contentor.</p>
+        <ul><li>Um item de lista com texto.</li></ul></article>
+        <aside><div class="post"><p>Barra lateral ignorada mesmo sendo enorme enorme enorme enorme enorme enorme.</p></div></aside>
+        </body></html>"#;
+        let url = Url::parse("https://example.com/").unwrap();
+        let article = extract_article(&url, html).unwrap();
+        let rendered = format!("{:?}", article.blocks);
+        assert!(rendered.contains("Paragrafo longo"));
+        assert!(rendered.contains("Um item de lista"));
+        assert!(!rendered.contains("Curto"));
+        assert!(!rendered.contains("Barra lateral"));
+    }
+
+    #[test]
+    fn hidden_state_propagates_without_ancestor_walk() {
+        let html = r#"<html><head><title>Oculto</title></head><body><article>
+        <div hidden><div><div><p>fundo escondido escondido escondido escondido escondido</p></div></div></div>
+        <div><div><div><p>fundo visivel e suficientemente longo para o leitor.</p></div></div></div>
+        </article></body></html>"#;
+        let url = Url::parse("https://example.com/").unwrap();
+        let article = extract_article(&url, html).unwrap();
+        let rendered = format!("{:?}", article.blocks);
+        assert!(rendered.contains("fundo visivel"));
+        assert!(!rendered.contains("fundo escondido"));
     }
 }

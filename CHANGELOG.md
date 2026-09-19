@@ -2,6 +2,38 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [Unreleased]
+
+Endurecimento do canal entre página e nativo, omnibox flutuante nativa e uma rodada de correções de ciclo de vida, desempenho e testes.
+
+### Security
+- **Canal `neuralia:` endurecido:** o token de capacidade de cada WebView passa a vir do CSPRNG do sistema operacional (`BCryptGenRandom`), em vez de ser derivado do relógio, e é comparado em **tempo constante** — não dá mais para descobri-lo byte a byte pelo tempo de resposta.
+- O token viaja por funções nativas (`encodeURIComponent` e companhia) capturadas no `document-created`, antes de qualquer script da página rodar: envenenar globais deixa de ser um caminho para roubá-lo ou para adulterar a URL que o carrega. Ele continua existindo apenas dentro do fecho dos scripts injetados, nunca no DOM.
+- **`isTrusted` obrigatório** em todos os handlers injetados, de mouse e de teclado: eventos sintetizados pela página são ignorados. A página pode clicar no controle que o NeuralIA injetou; não pode fingir que o usuário clicou.
+- **Omnibox flutuante nativa:** a palette deixa de ser um `<input>` injetado no DOM da página e passa a ser um controle Win32 nativo. A página só pode **pedir** que ela abra (`neuralia:palette`); não lê nem submete o texto digitado.
+- **O painel privado não sai mais do modo privado:** as páginas abertas a partir dele continuam no perfil incógnito, em vez de cair no perfil normal e deixar rastro em cookies e histórico.
+- **Rede local nunca a partir de uma página:** navegação originada em conteúdo remoto não alcança loopback nem rede privada em nenhuma superfície. Destino local explícito continua sendo permitido quando é o usuário que digita — inclusive na palette nativa, que é entrada do usuário e não da página.
+
+### Fixed
+- **Negação de serviço no Reader:** a extração passa a ser O(n), com prazo e cancelamento cooperativo. HTML hostil com containers aninhados em profundidade deixa de prender a extração; há fixtures para o caso hostil e para um documento de 2 MiB.
+- **Ver código-fonte volta a funcionar:** `view-source:` passa a ser reconhecido como esquema aceito nas superfícies web, em vez de ser barrado pelo próprio filtro de navegação que a ação dispara.
+- A barra superior volta a ficar alinhada com os divisores dos painéis; antes os dois sistemas calculavam a mesma borda de formas diferentes e ela aparecia deslocada.
+- **Janelas auxiliares comportadas:** deixam de ficar por cima de outras aplicações e passam a acompanhar a janela principal ao mover, redimensionar e minimizar.
+
+### Performance
+- **PDF por HTTP Range:** o visualizador passa a carregar o documento por faixas, em vez de exigir o arquivo inteiro em memória antes da primeira página.
+- **Animação da Home para quando a janela é minimizada ou tapada:** enquanto está visível e focada ela roda a ~15 FPS; escondida, não desenha nem um quadro.
+- **Um só serviço de temporizadores:** os temporizadores da interface passam por uma única fila, em vez de cada recurso criar o seu.
+- **Divisores coalescidos:** arrastar um divisor gera uma atualização por quadro, não uma por mensagem do mouse.
+- **Cache de ícones limitado** e **tema em cache:** o cache de ícones passa a ter teto, e as cores do tema deixam de ser consultadas ao sistema a cada desenho.
+- **Histórico fora do event loop:** gravação e retenção do histórico não fazem I/O na thread da interface, e o número de entradas guardadas é limitado.
+
+### Changed
+- **`NEURALIA_NO_GMAIL=1`** desliga por completo o monitor do Gmail. O monitor é uma exceção intencional ao "zero WebViews na tela inicial" — fica vivo na Home porque um notificador que morre ao voltar para casa não notifica — e o gate de ciclo de vida (`scripts/measure-cycles.ps1`) passa a defini-la, já que ele conta processos e não distingue exceção de vazamento.
+- O gate da Home passa a medir também **CPU em repouso** (percentual de um núcleo, janela de 3 s) e a registrá-la no JSON, com teto de CI generoso para runner compartilhado.
+- **Testes reais:** asserts tautológicos — os que passariam com qualquer implementação — deixam de contar como cobertura, e a lógica pura de interface do `neural-app` (layout da barra, pesos do redimensionamento, rota da palette, parsing de `Range`, fila de temporizadores) passa a ter testes no próprio crate.
+- SPEC-0005, SPEC-0006, SPEC-0008, SPEC-0012, SPEC-0015 e `SECURITY.md` passam a descrever o canal `neuralia:` como ele é — sem objeto IPC, lista fechada de ações de interface, capacidade por WebView — e a assumir o monitor do Gmail e seu tráfego em background.
+
 ## [1.6.0] - 2026-09-19
 
 Painéis redimensionáveis, controles nativos de Split View e navegação privada.

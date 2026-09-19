@@ -53,9 +53,13 @@ Quando já existe uma sessão Google autenticada no perfil WebView2, o NeuralIA
 pode observar o Gmail em background sem armazenar senha. Uma nova mensagem gera
 um aviso nativo discreto no **canto inferior direito** com remetente e assunto.
 O primeiro estado da caixa de entrada é apenas a linha de base e não dispara
-notificação retroativa.
+notificação retroativa. O monitor vive numa WebView escondida que continua viva
+mesmo na tela inicial — um notificador que morre ao voltar para casa não
+notifica —, só existe enquanto existir a sessão Google, e `NEURALIA_NO_GMAIL=1`
+o desliga por completo.
 
-On Windows, **no WebView is created while the native home screen is idle**. The Home background is also native: a low-frequency GDI neural network animation flows toward the brand without video, Canvas, WebView or network access. Set `NEURALIA_REDUCE_MOTION=1` to keep the background static. The omnibox is a native Windows edit control; WebView2 is instantiated only after the user asks, reads, or explicitly opens a page, and it is destroyed when the user returns home.
+On Windows, **no WebView is created while the native home screen is idle**
+(the hidden Gmail monitor above is the single intentional exception). The Home background is also native: a low-frequency GDI neural network animation flows toward the brand without video, Canvas, WebView or network access. Set `NEURALIA_REDUCE_MOTION=1` to keep the background static. The omnibox is a native Windows edit control; WebView2 is instantiated only after the user asks, reads, or explicitly opens a page, and it is destroyed when the user returns home.
 
 ## Design rules
 
