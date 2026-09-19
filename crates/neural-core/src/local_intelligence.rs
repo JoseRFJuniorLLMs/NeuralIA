@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -9,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const EMBEDDING_DIM: usize = 384;
+
+static MODEL_PACK_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IntentClass {
@@ -300,7 +303,15 @@ impl ModelPackManager {
         validate_pack_component(id)?;
         let path = self.root.join(id).join("manifest.json");
         let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-        serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+        let manifest: ModelPackManifest =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        if manifest.id != id {
+            return Err(format!(
+                "manifest id {} não corresponde ao diretório {id}",
+                manifest.id
+            ));
+        }
+        Ok(manifest)
     }
 
     pub fn verify(&self, manifest: &ModelPackManifest) -> Result<PathBuf, String> {
@@ -329,6 +340,9 @@ impl ModelPackManager {
             let Some(id) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
+            if id.starts_with('.') {
+                continue;
+            }
             if let Ok(manifest) = self.load_manifest(&id) {
                 packs.push(manifest);
             }
@@ -349,18 +363,59 @@ impl ModelPackManager {
             return Err(format!("hash do model pack {} não confere", manifest.id));
         }
 
+        fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
         let pack = self.root.join(&manifest.id);
-        fs::create_dir_all(&pack).map_err(|error| error.to_string())?;
-        let model = pack.join(&manifest.file);
-        let temp = pack.join(format!(".{}.tmp", manifest.file));
-        fs::write(&temp, model_bytes).map_err(|error| error.to_string())?;
-        fs::rename(&temp, &model).map_err(|error| error.to_string())?;
-        fs::write(
-            pack.join("manifest.json"),
-            serde_json::to_vec_pretty(manifest).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(model)
+        let nonce = MODEL_PACK_NONCE.fetch_add(1, Ordering::Relaxed);
+        let suffix = format!("{}-{nonce}", std::process::id());
+        let staging = self.root.join(format!(".{}.install-{suffix}", manifest.id));
+        let backup = self.root.join(format!(".{}.backup-{suffix}", manifest.id));
+
+        fs::create_dir(&staging).map_err(|error| error.to_string())?;
+        let staged_model = staging.join(&manifest.file);
+        let staged_manifest = staging.join("manifest.json");
+
+        let stage_result = (|| -> Result<(), String> {
+            fs::write(&staged_model, model_bytes).map_err(|error| error.to_string())?;
+            fs::write(
+                &staged_manifest,
+                serde_json::to_vec_pretty(manifest).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+
+            let staged_bytes = fs::read(&staged_model).map_err(|error| error.to_string())?;
+            let staged_hash = format!("{:x}", Sha256::digest(staged_bytes));
+            if !staged_hash.eq_ignore_ascii_case(manifest.sha256.trim()) {
+                return Err("model pack staging hash mismatch".into());
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = stage_result {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+
+        let had_existing = pack.exists();
+        if had_existing {
+            fs::rename(&pack, &backup).map_err(|error| {
+                let _ = fs::remove_dir_all(&staging);
+                error.to_string()
+            })?;
+        }
+
+        if let Err(error) = fs::rename(&staging, &pack) {
+            if had_existing {
+                let _ = fs::rename(&backup, &pack);
+            }
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error.to_string());
+        }
+
+        if had_existing {
+            let _ = fs::remove_dir_all(&backup);
+        }
+
+        Ok(pack.join(&manifest.file))
     }
 
     pub fn uninstall(&self, id: &str) -> Result<bool, String> {
@@ -474,6 +529,102 @@ mod tests {
         let result = benchmark_local_intelligence("hashing-local", &ai, &corpus).unwrap();
         assert_eq!(result.samples, 2);
         assert_eq!(result.embedding_dimension, EMBEDDING_DIM);
+    }
+
+    #[test]
+    fn model_pack_manifest_id_must_match_directory() {
+        let root = temp_root("manifest-id");
+        let pack = root.join("expected");
+        fs::create_dir_all(&pack).unwrap();
+
+        let manifest = ModelPackManifest {
+            id: "other".into(),
+            version: "1".into(),
+            file: "model.bin".into(),
+            sha256: format!("{:x}", Sha256::digest(b"model")),
+            capabilities: vec!["embedding".into()],
+            license: "test".into(),
+        };
+        fs::write(
+            pack.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let manager = ModelPackManager::new(&root);
+        let error = manager.load_manifest("expected").unwrap_err();
+        assert!(error.contains("não corresponde"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_pack_install_is_staged_and_replaces_complete_pack() {
+        let root = temp_root("staged-install");
+        let manager = ModelPackManager::new(&root);
+
+        let first = b"model-v1";
+        let first_manifest = ModelPackManifest {
+            id: "semantic-small".into(),
+            version: "1".into(),
+            file: "model.bin".into(),
+            sha256: format!("{:x}", Sha256::digest(first)),
+            capabilities: vec!["embedding".into()],
+            license: "test".into(),
+        };
+        let model = manager.install(&first_manifest, first).unwrap();
+        assert_eq!(fs::read(&model).unwrap(), first);
+        assert_eq!(
+            manager.load_manifest("semantic-small").unwrap().version,
+            "1"
+        );
+
+        let second = b"model-v2";
+        let second_manifest = ModelPackManifest {
+            version: "2".into(),
+            sha256: format!("{:x}", Sha256::digest(second)),
+            ..first_manifest.clone()
+        };
+        let model = manager.install(&second_manifest, second).unwrap();
+        assert_eq!(fs::read(&model).unwrap(), second);
+        assert_eq!(
+            manager.load_manifest("semantic-small").unwrap().version,
+            "2"
+        );
+
+        let hidden = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+            .filter(|name| name.starts_with(".semantic-small."))
+            .collect::<Vec<_>>();
+        assert!(hidden.is_empty(), "{hidden:?}");
+
+        let installed = manager.installed().unwrap();
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].id, "semantic-small");
+        assert_eq!(installed[0].version, "2");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_model_pack_hash_never_publishes_pack_directory() {
+        let root = temp_root("bad-install");
+        let manager = ModelPackManager::new(&root);
+        let manifest = ModelPackManifest {
+            id: "semantic-small".into(),
+            version: "1".into(),
+            file: "model.bin".into(),
+            sha256: format!("{:x}", Sha256::digest(b"expected")),
+            capabilities: vec!["embedding".into()],
+            license: "test".into(),
+        };
+
+        assert!(manager.install(&manifest, b"tampered").is_err());
+        assert!(!root.join("semantic-small").exists());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
