@@ -632,8 +632,8 @@ pub(super) fn embeddings_for_ids(
             }
 
             let mut values = Vec::with_capacity(dimension as usize);
-            for bytes in bytes.chunks_exact(4) {
-                values.push(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+            for bytes in bytes.as_chunks::<4>().0 {
+                values.push(f32::from_le_bytes(*bytes));
             }
             output.insert(id, values);
         }
