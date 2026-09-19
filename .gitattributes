@@ -1,0 +1,4 @@
+# Vendored PDF.js provenance is byte-level. Do not rewrite line endings on checkout.
+assets/pdfjs/pdf.mjs -text
+assets/pdfjs/pdf.worker.mjs -text
+assets/pdfjs/LICENSE -text
