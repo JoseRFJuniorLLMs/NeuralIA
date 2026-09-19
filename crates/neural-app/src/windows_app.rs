@@ -42,10 +42,10 @@ use windows_sys::Win32::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
             ES_AUTOHSCROLL, GetCapture, GetClientRect, GetCursorPos, GetForegroundWindow,
             GetWindowTextLengthW, GetWindowTextW, MB_ICONINFORMATION, MB_OK, MF_SEPARATOR,
-            MF_STRING, MessageBoxW, ReleaseCapture, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
-            SWP_NOZORDER, ScreenToClient, SendMessageW, SetCapture, SetWindowPos, SetWindowTextW,
-            ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_KEYDOWN, WS_CHILD,
-            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+            MF_STRING, MessageBoxW, ReleaseCapture, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
+            ScreenToClient, SendMessageW, SetCapture, SetWindowPos, SetWindowTextW, ShowWindow,
+            TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -3513,8 +3513,8 @@ impl App {
             };
 
             let width = (SPLITTER_WIDTH * scale).round().max(3.0) as i32;
-            let x = origin.x
-                + (boundaries[slot] * scale - SPLITTER_WIDTH * scale / 2.0).round() as i32;
+            let x =
+                origin.x + (boundaries[slot] * scale - SPLITTER_WIDTH * scale / 2.0).round() as i32;
             let y = origin.y + (TOP_BAR_HEIGHT * scale).round() as i32;
             let height = (content_height * scale).round().max(1.0) as i32;
             unsafe {
@@ -3573,8 +3573,7 @@ impl App {
             .iter()
             .map(|index| comp.weights[*index].max(0.05))
             .sum();
-        let pair_weight =
-            comp.weights[left_index].max(0.05) + comp.weights[right_index].max(0.05);
+        let pair_weight = comp.weights[left_index].max(0.05) + comp.weights[right_index].max(0.05);
         let left_edge = logical_w * before_weight / total_weight;
         let pair_span = logical_w * pair_weight / total_weight;
         if pair_span <= 1.0 {
