@@ -5,8 +5,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::Command,
-    ptr,
-    thread,
+    ptr, thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -45,7 +44,9 @@ impl Database {
         let mut database: Sqlite = ptr::null_mut();
         let code = unsafe { sqlite3_open(path.as_ptr(), &mut database) };
         if code != SQLITE_OK || database.is_null() {
-            return Err(io::Error::other("winsqlite3 could not open baseline database"));
+            return Err(io::Error::other(
+                "winsqlite3 could not open baseline database",
+            ));
         }
         Ok(Self(database))
     }
@@ -59,13 +60,7 @@ impl Database {
 
         let mut statement: Statement = ptr::null_mut();
         let code = unsafe {
-            sqlite3_prepare_v2(
-                self.0,
-                sql.as_ptr(),
-                -1,
-                &mut statement,
-                ptr::null_mut(),
-            )
+            sqlite3_prepare_v2(self.0, sql.as_ptr(), -1, &mut statement, ptr::null_mut())
         };
         if code != SQLITE_OK || statement.is_null() {
             return Err(io::Error::other(self.error_message()));
@@ -208,7 +203,11 @@ fn measure(size: usize) -> io::Result<Baseline> {
 
     let query = MemoryQuery::new("baselinequeryneedle");
     let warm = store.query(&query)?;
-    assert_eq!(warm.len(), 1, "sentinel query must identify exactly one document");
+    assert_eq!(
+        warm.len(),
+        1,
+        "sentinel query must identify exactly one document"
+    );
 
     let hybrid_query_median_us = median_micros(
         || {
@@ -251,7 +250,10 @@ fn measure(size: usize) -> io::Result<Baseline> {
         fts_matches,
     };
 
-    println!("{}", serde_json::to_string(&result).map_err(io::Error::other)?);
+    println!(
+        "{}",
+        serde_json::to_string(&result).map_err(io::Error::other)?
+    );
     let _ = fs::remove_dir_all(root);
     Ok(result)
 }
