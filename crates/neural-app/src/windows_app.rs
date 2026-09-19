@@ -8636,7 +8636,10 @@ mod tests {
                 ),
                 "{name}"
             );
-            assert!(script.contains("const stringify = JSON.stringify;"), "{name}");
+            assert!(
+                script.contains("const stringify = JSON.stringify;"),
+                "{name}"
+            );
             assert!(!script.contains("?cap="), "{name}");
             assert!(script.trim_start().starts_with("(function"), "{name}");
         }
@@ -8716,8 +8719,7 @@ mod tests {
     #[test]
     fn comparator_captures_provider_answers_for_research_session() {
         assert!(
-            COMPARATOR_INJECT_SCRIPT
-                .contains("act('research-answer', { col:colIndex, text })")
+            COMPARATOR_INJECT_SCRIPT.contains("act('research-answer', { col:colIndex, text })")
         );
         assert!(COMPARATOR_INJECT_SCRIPT.contains("data-message-author-role"));
         assert!(COMPARATOR_INJECT_SCRIPT.contains("scheduleResearchAnswer"));
