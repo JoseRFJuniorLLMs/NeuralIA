@@ -16,10 +16,12 @@ use std::{
 use image::RgbaImage;
 
 use neural_core::{
-    CoreConfig, HistoryEntry, HistoryKind, HistoryStore, Intent, MemoryDocument, MemoryHit,
-    MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore, ReaderArticle, ReaderBlock,
-    ReaderClient, ResearchSession, chatgpt_search_url, claude_search_url, google_ai_url,
-    is_local_network_target, is_pdf_url, parse_intent, reader_html,
+    ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentSecurityAction, CoreConfig,
+    FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent, MemoryDocument, MemoryHit,
+    MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore, ObservedPage, ReaderArticle,
+    ReaderBlock, ReaderClient, ResearchSession, chatgpt_search_url, claude_search_url,
+    google_ai_url, is_local_network_target, is_pdf_url, parse_intent, reader_html,
+    redact_sensitive_text,
 };
 use url::Url;
 use windows_sys::Win32::{
@@ -44,8 +46,8 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
             ES_AUTOHSCROLL, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowTextLengthW,
-            GetWindowTextW, GetWindowThreadProcessId, MB_ICONINFORMATION, MB_OK, MF_SEPARATOR,
-            MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
+            GetWindowTextW, GetWindowThreadProcessId, IDYES, MB_ICONINFORMATION, MB_OK, MB_YESNO,
+            MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
             SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
             TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
             WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
@@ -104,6 +106,7 @@ enum UserEvent {
         source_index: usize,
         text: String,
     },
+    AgentObservation(ObservedPage),
     /// Esconde outra vez a barra em ecra completo, se nada a tiver reavivado.
     HideChrome(u64),
     SubmitText(String),
@@ -1457,6 +1460,24 @@ impl HomeLayout {
     }
 }
 
+#[derive(Debug, Clone)]
+enum BrowserAgentCommand {
+    Search(String),
+    Click(String),
+    Select { label: String, value: String },
+    Extract,
+}
+
+struct BrowserAgentState {
+    goal: String,
+    commands: Vec<BrowserAgentCommand>,
+    next_command: usize,
+    steps: usize,
+    started: Instant,
+    policy: AgentPermissionPolicy,
+    trace: Vec<String>,
+}
+
 struct App {
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Window>,
@@ -1498,6 +1519,7 @@ struct App {
     history: HistoryWriter,
     memory: MemoryWorker,
     current_research: Option<ResearchSession>,
+    active_agent: Option<BrowserAgentState>,
     reader: ReaderWorker,
     /// Worker unico para documentos binarios. Um pedido novo substitui o
     /// pendente, evitando uma thread/socket de 90 s por clique em PDF.
@@ -1571,6 +1593,7 @@ impl App {
             history,
             memory,
             current_research: None,
+            active_agent: None,
             reader,
             surface: Surface::Home,
             navigation_generation,
@@ -1793,6 +1816,7 @@ impl App {
 
     fn destroy_web_surfaces(&mut self) {
         self.mark_dirty();
+        self.finish_agent(false);
         self.leave_fullscreen();
         if let Some(window) = &self.window {
             window.set_decorations(true);
@@ -1944,6 +1968,10 @@ impl App {
     }
 
     fn handle_input(&mut self, input: String) {
+        if let Some(spec) = input.strip_prefix("agent:") {
+            self.start_browser_agent(spec.trim());
+            return;
+        }
         if let Some(query) = input
             .strip_prefix("memory:")
             .or_else(|| input.strip_prefix("mem:"))
@@ -2211,17 +2239,37 @@ impl App {
             .with_focused(true)
     }
 
-    fn external_webview_builder(&self, allow_local: bool) -> WebViewBuilder<'static> {
+    fn external_webview_builder(
+        &self,
+        allow_local: bool,
+        agent_enabled: bool,
+    ) -> WebViewBuilder<'static> {
         let navigation_proxy = self.proxy.clone();
         let new_window_proxy = self.proxy.clone();
         let capability = remote_capability();
         let navigation_capability = capability.clone();
-        let init_script = format!("{NEURALIA_KEYMAP_SCRIPT}\n{EXTERNAL_RETURN_BUTTON}")
-            .replace("__NEURALIA_CAP__", &capability);
+        let agent_script = if agent_enabled {
+            AGENT_OBSERVER_SCRIPT
+        } else {
+            ""
+        };
+        let init_script = format!(
+            "{NEURALIA_KEYMAP_SCRIPT}\n{EXTERNAL_RETURN_BUTTON}\n{agent_script}"
+        )
+        .replace("__NEURALIA_CAP__", &capability);
 
         WebViewBuilder::new()
             .with_initialization_script(init_script)
             .with_navigation_handler(move |target| {
+                if target.starts_with("neuralia:agent-observation") {
+                    if remote_capability_matches(&target, &navigation_capability)
+                        && let Some(data) = neuralia_query_param(&target, "data")
+                        && let Some(page) = parse_agent_observation(&data)
+                    {
+                        let _ = navigation_proxy.send_event(UserEvent::AgentObservation(page));
+                    }
+                    return false;
+                }
                 if let Some(event) = remote_neuralia_action(&target, &navigation_capability) {
                     let _ = navigation_proxy.send_event(event);
                     return false;
@@ -2239,6 +2287,246 @@ impl App {
             .with_focused(true)
     }
 
+    fn start_browser_agent(&mut self, spec: &str) {
+        let (url, commands) = match parse_browser_agent_plan(spec) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.show_native_error(error);
+                return;
+            }
+        };
+        let Ok(valid) = neural_core::validate_web_url(&url) else {
+            self.show_native_error("Agent: URL inválida.");
+            return;
+        };
+        if neural_core::is_local_network_target(&valid) {
+            self.show_native_error("Agent: destinos locais/privados não são permitidos.");
+            return;
+        }
+
+        self.destroy_web_surfaces();
+        self.show_omnibox(false);
+        let origin = valid.origin().ascii_serialization();
+        let mut policy = AgentPermissionPolicy::new(Some(origin));
+        policy.grant_reversible_session_actions(true);
+        self.active_agent = Some(BrowserAgentState {
+            goal: spec.to_string(),
+            commands,
+            next_command: 0,
+            steps: 0,
+            started: Instant::now(),
+            policy,
+            trace: vec![format!("navigate {}", valid)],
+        });
+
+        let result = if let Some(window) = &self.window {
+            self.external_webview_builder(false, true)
+                .with_url(valid.as_str())
+                .build(window)
+        } else {
+            self.active_agent = None;
+            return;
+        };
+
+        match result {
+            Ok(webview) => {
+                let _ = webview.zoom(self.zoom);
+                self.webview = Some(webview);
+                self.surface = Surface::External;
+                self.record(
+                    HistoryKind::Web,
+                    format!("agent:{}", spec),
+                    valid.to_string(),
+                );
+                self.show_splash("Agente iniciado. Esc/Home interrompe imediatamente.".to_string(), 4);
+            }
+            Err(error) => {
+                self.active_agent = None;
+                self.show_native_error(format!("Agent WebView: {error}"));
+            }
+        }
+    }
+
+    fn handle_agent_observation(&mut self, page: ObservedPage) {
+        let Some(agent) = self.active_agent.as_ref() else {
+            return;
+        };
+        if agent.steps >= 24 || agent.started.elapsed() >= Duration::from_secs(120) {
+            self.show_splash("Agente interrompido pelo limite de execução.".to_string(), 4);
+            self.finish_agent(true);
+            return;
+        }
+
+        let command = agent.commands.get(agent.next_command).cloned();
+        let Some(command) = command else {
+            self.show_splash("Agente concluiu a sequência.".to_string(), 3);
+            self.finish_agent(true);
+            return;
+        };
+
+        if matches!(command, BrowserAgentCommand::Extract) {
+            let clean = redact_sensitive_text(&page.text_excerpt);
+            let mut document = MemoryDocument::new(
+                MemoryKind::ResearchResult,
+                MemorySourceKind::Web,
+                if page.title.is_empty() {
+                    "Extração do agente".to_string()
+                } else {
+                    page.title.clone()
+                },
+                Some(page.url.clone()),
+                clean.clone(),
+            );
+            if let Some(session) = &self.current_research {
+                document = document.session(session.id.clone());
+            }
+            self.memory.capture(document);
+            if let Some(agent) = &mut self.active_agent {
+                agent.trace.push(format!(
+                    "extract {} chars from {}",
+                    clean.chars().count(),
+                    page.url
+                ));
+                agent.next_command += 1;
+                agent.steps += 1;
+            }
+            self.show_native_text("NeuralIA Agent — Extração", &clean);
+            self.finish_agent(true);
+            return;
+        }
+
+        let action = match command {
+            BrowserAgentCommand::Search(value) => {
+                let target = page.elements.iter().find(|element| {
+                    element.interactable
+                        && matches!(
+                            agent_field_kind(element),
+                            FieldKind::Search | FieldKind::Text
+                        )
+                });
+                target.cloned().map(|target| AgentAction::TypeText {
+                    target,
+                    text: value,
+                    field: FieldKind::Search,
+                })
+            }
+            BrowserAgentCommand::Click(label) => find_agent_element(&page, &label, false)
+                .cloned()
+                .map(|target| AgentAction::Click { target }),
+            BrowserAgentCommand::Select { label, value } => find_agent_element(&page, &label, true)
+                .cloned()
+                .map(|target| AgentAction::Select { target, value }),
+            BrowserAgentCommand::Extract => None,
+        };
+
+        let Some(action) = action else {
+            self.show_splash("Agente não encontrou o elemento solicitado.".to_string(), 4);
+            self.finish_agent(true);
+            return;
+        };
+
+        let security = app_agent_security_action(&action, &page);
+        let decision = {
+            let Some(agent) = self.active_agent.as_mut() else {
+                return;
+            };
+            agent.policy.evaluate(&security)
+        };
+
+        if !decision.allowed {
+            if decision.risk == ActionRisk::Restricted {
+                self.show_splash(
+                    "Ação restrita: controle devolvido ao usuário.".to_string(),
+                    5,
+                );
+                self.finish_agent(true);
+                return;
+            }
+            if !decision.requires_confirmation
+                || !self.confirm_agent_action(&decision.reason, &action)
+            {
+                if let Some(agent) = self.active_agent.as_mut() {
+                    agent.policy.record_user_confirmation(&security, false);
+                }
+                self.show_splash("Ação do agente cancelada.".to_string(), 3);
+                self.finish_agent(true);
+                return;
+            }
+            if let Some(agent) = self.active_agent.as_mut() {
+                agent.policy.record_user_confirmation(&security, true);
+            }
+        }
+
+        match self.execute_agent_action(&action) {
+            Ok(()) => {
+                if let Some(agent) = self.active_agent.as_mut() {
+                    agent.trace.push(format!("{action:?}"));
+                    agent.next_command += 1;
+                    agent.steps += 1;
+                }
+            }
+            Err(error) => {
+                self.show_splash(format!("Agent: {error}"), 4);
+                self.finish_agent(true);
+            }
+        }
+    }
+
+    fn execute_agent_action(&self, action: &AgentAction) -> Result<(), String> {
+        let Some(webview) = &self.webview else {
+            return Err("nenhuma página ativa".into());
+        };
+        let script = agent_action_script(action)?;
+        webview
+            .evaluate_script(&script)
+            .map_err(|error| error.to_string())
+    }
+
+    fn confirm_agent_action(&self, reason: &str, action: &AgentAction) -> bool {
+        let (Some(window), Some(hwnd)) = (&self.window, self.window.as_ref().and_then(window_hwnd))
+        else {
+            return false;
+        };
+        let _ = window;
+        let body = wide_null(&format!(
+            "O agente quer executar uma ação sensível.\n\n{reason}\n\n{action:?}\n\nAutorizar uma única vez?"
+        ));
+        let title = wide_null("NeuralIA — Confirmação do agente");
+        unsafe {
+            MessageBoxW(
+                hwnd,
+                body.as_ptr(),
+                title.as_ptr(),
+                MB_YESNO | MB_ICONINFORMATION,
+            ) == IDYES
+        }
+    }
+
+    fn finish_agent(&mut self, persist: bool) {
+        let Some(agent) = self.active_agent.take() else {
+            return;
+        };
+        if !persist {
+            return;
+        }
+
+        let root = self.config.data_dir.join("agent");
+        let _ = std::fs::create_dir_all(&root);
+        let stamp = now_ms();
+        let _ = std::fs::write(
+            root.join(format!("trace-{stamp}.log")),
+            format!(
+                "goal: {}\nsteps: {}\n{}\n",
+                agent.goal,
+                agent.steps,
+                agent.trace.join("\n")
+            ),
+        );
+        let _ = agent
+            .policy
+            .write_audit_log(root.join(format!("audit-{stamp}.json")));
+    }
+
     fn open_external(&mut self, url: &str) {
         self.destroy_web_surfaces();
         self.show_omnibox(false);
@@ -2253,7 +2541,7 @@ impl App {
             .ok()
             .is_some_and(|target| is_local_network_target(&target));
         let result = if let Some(window) = &self.window {
-            self.external_webview_builder(allow_local)
+            self.external_webview_builder(allow_local, false)
                 .with_url(url)
                 .build(window)
         } else {
@@ -4460,6 +4748,234 @@ impl App {
     }
 }
 
+fn parse_browser_agent_plan(spec: &str) -> Result<(String, Vec<BrowserAgentCommand>), String> {
+    let parts = spec
+        .split('|')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let Some(url) = parts.first() else {
+        return Err(
+            "Use agent:https://site | search=texto | click=botão | select=filtro:valor | extract"
+                .into(),
+        );
+    };
+    neural_core::validate_web_url(url).map_err(|error| error.to_string())?;
+
+    let mut commands = Vec::new();
+    for raw in parts.iter().skip(1) {
+        if let Some(value) = raw
+            .strip_prefix("search=")
+            .or_else(|| raw.strip_prefix("pesquisar="))
+        {
+            if !value.trim().is_empty() {
+                commands.push(BrowserAgentCommand::Search(value.trim().to_string()));
+            }
+        } else if let Some(value) = raw
+            .strip_prefix("click=")
+            .or_else(|| raw.strip_prefix("clique="))
+        {
+            if !value.trim().is_empty() {
+                commands.push(BrowserAgentCommand::Click(value.trim().to_string()));
+            }
+        } else if let Some(value) = raw
+            .strip_prefix("select=")
+            .or_else(|| raw.strip_prefix("selecionar="))
+        {
+            let Some((label, selected)) = value.split_once(':') else {
+                return Err("select usa select=campo:valor".into());
+            };
+            commands.push(BrowserAgentCommand::Select {
+                label: label.trim().to_string(),
+                value: selected.trim().to_string(),
+            });
+        } else if raw.eq_ignore_ascii_case("extract")
+            || raw.eq_ignore_ascii_case("extrair")
+        {
+            commands.push(BrowserAgentCommand::Extract);
+        } else {
+            return Err(format!("comando de agente desconhecido: {raw}"));
+        }
+    }
+    if commands.is_empty() {
+        commands.push(BrowserAgentCommand::Extract);
+    }
+    Ok(((*url).to_string(), commands))
+}
+
+fn parse_agent_observation(data: &str) -> Option<ObservedPage> {
+    let mut lines = data.lines();
+    let generation = lines.next()?.parse::<u64>().ok()?;
+    let url = lines.next()?.trim().to_string();
+    let title = lines.next()?.trim().to_string();
+    let text_excerpt = lines.next().unwrap_or_default().to_string();
+    let origin = Url::parse(&url)
+        .ok()
+        .map(|parsed| parsed.origin().ascii_serialization())
+        .unwrap_or_else(|| url.clone());
+
+    let mut elements = Vec::new();
+    for line in lines.take(40) {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() < 5 {
+            continue;
+        }
+        elements.push(AgentElement {
+            id: fields[0].to_string(),
+            generation,
+            role: fields[1].to_string(),
+            name: fields[2].to_string(),
+            text: fields[2].to_string(),
+            origin: origin.clone(),
+            frame: "top".into(),
+            visible: true,
+            interactable: fields[4] == "1",
+        });
+    }
+
+    Some(ObservedPage {
+        generation,
+        url,
+        title,
+        text_excerpt,
+        elements,
+    })
+}
+
+fn agent_field_kind(element: &AgentElement) -> FieldKind {
+    let role = element.role.to_ascii_lowercase();
+    if role.contains("password") {
+        FieldKind::Password
+    } else if role.contains("otp") {
+        FieldKind::Otp
+    } else if role.contains("card") || role.contains("payment") {
+        FieldKind::PaymentCard
+    } else if role.contains("email") {
+        FieldKind::Email
+    } else if role.contains("search") {
+        FieldKind::Search
+    } else if role.contains("input") || role.contains("textbox") || role.contains("textarea") {
+        FieldKind::Text
+    } else {
+        FieldKind::Unknown
+    }
+}
+
+fn find_agent_element<'a>(
+    page: &'a ObservedPage,
+    label: &str,
+    select_only: bool,
+) -> Option<&'a AgentElement> {
+    let needle = label.to_lowercase();
+    page.elements.iter().find(|element| {
+        element.interactable
+            && (!select_only
+                || element.role.to_ascii_lowercase().contains("select")
+                || element.role.to_ascii_lowercase().contains("combobox"))
+            && (needle.is_empty()
+                || element.name.to_lowercase().contains(&needle)
+                || element.text.to_lowercase().contains(&needle))
+    })
+}
+
+fn app_agent_security_action(action: &AgentAction, page: &ObservedPage) -> AgentSecurityAction {
+    let origin = Url::parse(&page.url)
+        .ok()
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|| page.url.clone());
+
+    match action {
+        AgentAction::Click { target } => {
+            let label = target.name.to_lowercase();
+            if ["delete", "remove", "excluir", "apagar"]
+                .iter()
+                .any(|word| label.contains(word))
+            {
+                AgentSecurityAction::DeleteRemote {
+                    origin,
+                    description: target.name.clone(),
+                }
+            } else if ["buy", "purchase", "pay", "comprar", "pagar"]
+                .iter()
+                .any(|word| label.contains(word))
+            {
+                AgentSecurityAction::Payment {
+                    origin,
+                    description: target.name.clone(),
+                }
+            } else if ["send", "submit", "confirm", "enviar", "confirmar"]
+                .iter()
+                .any(|word| label.contains(word))
+            {
+                AgentSecurityAction::Submit {
+                    origin,
+                    description: target.name.clone(),
+                }
+            } else {
+                AgentSecurityAction::Click {
+                    origin,
+                    label: target.name.clone(),
+                }
+            }
+        }
+        AgentAction::TypeText {
+            field,
+            text,
+            ..
+        } => AgentSecurityAction::TypeText {
+            origin,
+            field: *field,
+            value_summary: format!("{} chars", text.chars().count()),
+        },
+        AgentAction::Select { target, value } => AgentSecurityAction::Click {
+            origin,
+            label: format!("select {} = {}", target.name, value),
+        },
+        AgentAction::Extract { .. } => AgentSecurityAction::Extract { origin },
+        _ => AgentSecurityAction::Read { origin },
+    }
+}
+
+fn js_percent(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+fn agent_action_script(action: &AgentAction) -> Result<String, String> {
+    fn guard(target: &AgentElement) -> String {
+        let id = js_percent(&target.id);
+        let name = js_percent(&target.name);
+        let role = js_percent(&target.role);
+        format!(
+            "const id=decodeURIComponent('{id}');const expectedName=decodeURIComponent('{name}');             const expectedRole=decodeURIComponent('{role}');             const el=document.querySelector('[data-neuralia-agent-id=\"'+id+'\"]');             if(!el)return;             const actualName=((el.getAttribute('aria-label')||el.name||el.innerText||el.textContent||'').replace(/\\s+/g,' ').trim().slice(0,96));             const actualRole=(el.getAttribute('role')||el.type||el.tagName||'').toLowerCase();             if(expectedName && actualName!==expectedName)return;             if(expectedRole && actualRole!==expectedRole)return;"
+        )
+    }
+
+    let body = match action {
+        AgentAction::TypeText { target, text, .. } => {
+            let value = js_percent(text);
+            format!(
+                "{}const value=decodeURIComponent('{}');el.focus();                 const proto=Object.getPrototypeOf(el);const descriptor=Object.getOwnPropertyDescriptor(proto,'value');                 if(descriptor&&descriptor.set)descriptor.set.call(el,value);else el.value=value;                 el.dispatchEvent(new Event('input',{{bubbles:true}}));                 el.dispatchEvent(new Event('change',{{bubbles:true}}));",
+                guard(target),
+                value
+            )
+        }
+        AgentAction::Click { target } => format!("{}el.click();", guard(target)),
+        AgentAction::Select { target, value } => {
+            let value = js_percent(value);
+            format!(
+                "{}el.value=decodeURIComponent('{}');                 el.dispatchEvent(new Event('input',{{bubbles:true}}));                 el.dispatchEvent(new Event('change',{{bubbles:true}}));",
+                guard(target),
+                value
+            )
+        }
+        _ => return Err("ação ainda não executável pela bridge do navegador".into()),
+    };
+
+    Ok(format!(
+        "(function(){{{body}window.dispatchEvent(new Event('neuralia-agent-rescan'));}})();"
+    ))
+}
+
 fn reader_article_memory_text(article: &ReaderArticle) -> String {
     let mut output = String::new();
     if let Some(excerpt) = &article.excerpt {
@@ -4602,6 +5118,9 @@ impl ApplicationHandler<UserEvent> for App {
                     session.upsert_provider_answer(provider, text, None);
                     self.memory.save_session(session.clone());
                 }
+            }
+            UserEvent::AgentObservation(page) => {
+                self.handle_agent_observation(page);
             }
             UserEvent::HideChrome(token) => self.hide_chrome(token),
             UserEvent::SubmitText(input) => {
@@ -6358,6 +6877,29 @@ mod tests {
     }
 
     #[test]
+    fn browser_agent_bridge_is_bounded_and_has_no_arbitrary_js_channel() {
+        assert!(AGENT_OBSERVER_SCRIPT.contains("rows.length >= 32"));
+        assert!(AGENT_OBSERVER_SCRIPT.contains("pageText"));
+        assert!(AGENT_OBSERVER_SCRIPT.contains("neuralia:agent-observation"));
+        assert!(!AGENT_OBSERVER_SCRIPT.contains("eval("));
+        assert!(!AGENT_OBSERVER_SCRIPT.contains("new Function"));
+    }
+
+    #[test]
+    fn browser_agent_plan_parses_search_filter_click_and_extract() {
+        let (url, commands) = parse_browser_agent_plan(
+            "https://example.com | search=rust | select=tipo:artigo | click=Buscar | extract",
+        )
+        .unwrap();
+        assert_eq!(url, "https://example.com");
+        assert_eq!(commands.len(), 4);
+        assert!(matches!(commands[0], BrowserAgentCommand::Search(_)));
+        assert!(matches!(commands[1], BrowserAgentCommand::Select { .. }));
+        assert!(matches!(commands[2], BrowserAgentCommand::Click(_)));
+        assert!(matches!(commands[3], BrowserAgentCommand::Extract));
+    }
+
+    #[test]
     fn comparator_captures_provider_answers_for_research_session() {
         assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia:research-answer?col="));
         assert!(COMPARATOR_INJECT_SCRIPT.contains("data-message-author-role"));
@@ -7480,6 +8022,98 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
   } else {
     setTimeout(submitWhenReady, 100);
   }
+})();
+"#;
+
+const AGENT_OBSERVER_SCRIPT: &str = r#"
+(function () {
+  const capability = '__NEURALIA_CAP__';
+  const encode = encodeURIComponent;
+  const listen = Function.prototype.call.bind(EventTarget.prototype.addEventListener);
+  const defer = setTimeout;
+  let generation = 0;
+  let lastMaterial = '';
+  let timer = 0;
+
+  function clean(value, limit) {
+    return String(value || '').replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
+  }
+
+  function fieldRole(el) {
+    const tag = (el.tagName || '').toLowerCase();
+    const type = (el.type || '').toLowerCase();
+    const autocomplete = (el.autocomplete || '').toLowerCase();
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    const name = (el.name || '').toLowerCase();
+    const combined = [type, autocomplete, role, name].join(' ');
+    if (combined.includes('password')) return 'password';
+    if (combined.includes('one-time') || combined.includes('otp')) return 'otp';
+    if (combined.includes('cc-') || combined.includes('card') || combined.includes('payment')) return 'payment-card';
+    if (combined.includes('email')) return 'email';
+    if (combined.includes('search')) return 'search';
+    if (tag === 'select') return 'select';
+    if (tag === 'input' || tag === 'textarea') return 'textbox';
+    return role || tag || 'element';
+  }
+
+  function observe() {
+    timer = 0;
+    const root = document.querySelector('main,[role="main"]') || document.body || document.documentElement;
+    const pageText = clean(root ? (root.innerText || root.textContent) : '', 1600);
+    const candidates = document.querySelectorAll(
+      'input,textarea,select,button,a[href],[role="button"],[role="textbox"],[role="combobox"]'
+    );
+    const rows = [];
+    let ordinal = 0;
+    for (const el of candidates) {
+      if (rows.length >= 32) break;
+      const rect = el.getBoundingClientRect();
+      const css = getComputedStyle(el);
+      if (rect.width <= 0 || rect.height <= 0 || css.display === 'none' || css.visibility === 'hidden') continue;
+      const id = 'n' + (generation + 1) + '-' + ordinal++;
+      el.setAttribute('data-neuralia-agent-id', id);
+      const name = clean(el.getAttribute('aria-label') || el.name || el.innerText || el.textContent || el.placeholder, 96);
+      rows.push([id, fieldRole(el), name, clean(el.tagName, 20), el.disabled ? '0' : '1'].join('\t'));
+    }
+
+    const material = [location.href, document.title || '', pageText, rows.join('\n')].join('\n');
+    if (material === lastMaterial) return;
+    lastMaterial = material;
+    generation += 1;
+    // IDs carry the generation used by the native stale-element guard.
+    rows.forEach((row, index) => {
+      const oldId = row.split('\t', 1)[0];
+      const newId = 'n' + generation + '-' + index;
+      const el = document.querySelector('[data-neuralia-agent-id="' + oldId + '"]');
+      if (el) el.setAttribute('data-neuralia-agent-id', newId);
+      rows[index] = row.replace(oldId, newId);
+    });
+
+    const payload = [
+      String(generation),
+      clean(location.href, 1200),
+      clean(document.title, 256),
+      pageText,
+      ...rows
+    ].join('\n');
+    window.location.href = 'neuralia:agent-observation?data=' + encode(payload)
+      + '&cap=' + encode(capability);
+  }
+
+  function schedule() {
+    clearTimeout(timer);
+    timer = defer(observe, 700);
+  }
+
+  if (document.readyState === 'loading') {
+    listen(document, 'DOMContentLoaded', schedule, { once:true });
+  } else {
+    schedule();
+  }
+  listen(window, 'neuralia-agent-rescan', schedule);
+  new MutationObserver(schedule).observe(document.documentElement, {
+    childList:true, subtree:true, attributes:true
+  });
 })();
 "#;
 
