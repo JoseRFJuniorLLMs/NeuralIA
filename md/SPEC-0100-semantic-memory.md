@@ -1,6 +1,6 @@
 # SPEC-0100 — Local Semantic Memory
 
-**Status:** Proposed  
+**Status:** Implemented — NeuralIA 2.0  
 **Target:** NeuralIA 1.7
 
 ## 1. Purpose
