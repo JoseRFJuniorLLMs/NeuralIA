@@ -34,8 +34,8 @@ pub use local_intelligence::{
     hashed_embedding,
 };
 pub use memory::{
-    CaptureOutcome, ForgetReport, ForgetScope, MemoryDocument, MemoryHit, MemoryKind, MemoryQuery,
-    MemoryRelation, MemorySourceKind, MemoryStore,
+    CaptureOutcome, ForgetReport, ForgetScope, MemoryDoctorReport, MemoryDocument, MemoryHit,
+    MemoryKind, MemoryQuery, MemoryRelation, MemorySourceKind, MemoryStore,
 };
 pub use research::{
     ComparisonFact, ResearchItem, ResearchItemKind, ResearchSession, SynthesisSnapshot,
