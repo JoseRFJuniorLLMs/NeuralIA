@@ -2,6 +2,15 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [1.7.1] - 2026-09-19
+
+Correção visual do comparador após mudanças de topologia dos painéis.
+
+### Fixed
+- **Divisores duplicados:** minimizar/restaurar uma IA ou abrir o Split View agora ressincroniza imediatamente os splitters nativos.
+- Antes de abrir uma fonte lateral, todos os divisores antigos são ocultados; apenas os divisores correspondentes às fronteiras realmente visíveis voltam a aparecer.
+- Alternar tela cheia do Split View também força a limpeza da topologia de divisores, evitando janelas Win32 antigas sobrepostas ao conteúdo.
+
 ## [1.7.0] - 2026-09-19
 
 Endurecimento do canal entre página e nativo, omnibox flutuante nativa e uma rodada de correções de ciclo de vida, desempenho e testes.
