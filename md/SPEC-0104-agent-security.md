@@ -1,7 +1,8 @@
 # SPEC-0104 — Agent Security and Permission Architecture
 
-**Status:** Implemented security gate — NeuralIA 2.0  
+**Status:** Implemented — independent adversarial audit pending  
 **Target:** NeuralIA 2.0 security gate
+**Audit support:** see `SPEC-0104-0105-support-audit.md`; this support review does not satisfy the independent-review gate.  
 
 ## 1. Principle
 
