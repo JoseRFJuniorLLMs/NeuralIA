@@ -2,6 +2,40 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.0.0] - 2026-09-19
+
+NeuralIA passa de comparador multi-IA para uma base local-first de pesquisa,
+memória semântica e automação Web limitada por política.
+
+### Added
+- SPEC-0100: memória semântica file-first, SQLite/FTS5 derivado no Windows,
+  entidades, relações, busca semântica local, fusão RRF, Memory Doctor e rebuild.
+- SPEC-0101: Research Sessions com proveniência por provedor, comparação,
+  síntese e exportação Markdown.
+- SPEC-0102: inteligência local independente de modelo, embeddings offline,
+  classificação, entidades, resumo, model packs, SHA-256 e benchmark.
+- SPEC-0103: timeline semântica para perguntas, respostas, headings, código,
+  tabelas, citações, fontes, notas e conclusões.
+- SPEC-0104: permission engine do agente, política de origem, redaction,
+  audit log, confirmação humana e kill switch.
+- SPEC-0105: runtime de agente estruturado, limitado por passos/tempo e sem
+  ferramenta de JavaScript arbitrário.
+- SPEC-0107: proveniência MIT do ai-memory vendorizada com SHA upstream,
+  LICENSE, UPSTREAM.md e PATCHES.md.
+- Gate integrado `spec_010x_acceptance.rs` cobrindo SPEC-0100 a SPEC-0107.
+
+### Changed
+- `Ctrl+H` passa a abrir semantic recall local por `memory:`.
+- As abas/fontes ficam na title bar superior; provedores permanecem na segunda faixa.
+- O fallback semântico local normaliza aliases técnicos PT/EN.
+
+### Security
+- Navegação privada não entra na memória persistente.
+- Conteúdo remoto nunca concede capacidades.
+- Ações sensíveis exigem aprovação pontual; senha, cartão, OTP, CAPTCHA e
+  pagamento permanecem human-only.
+- Traces e decisões de política são auditáveis localmente sem valores secretos.
+
 ## [1.7.2] - 2026-09-19
 
 Title bar do comparador redesenhada como uma tab strip de navegador.
