@@ -9,6 +9,7 @@ const README: &str = include_str!("../../../README.md");
 const ARCH: &str = include_str!("../../../docs/specs/SPEC-0001-architecture.md");
 const THREAT: &str = include_str!("../../../docs/specs/SPEC-0015-threat-model.md");
 const ROADMAP: &str = include_str!("../../../docs/specs/SPEC-0016-roadmap.md");
+const TESTING_CI: &str = include_str!("../../../docs/specs/SPEC-0012-testing-ci.md");
 const LOCAL_AI_SPEC: &str = include_str!("../../../md/SPEC-0102-local-intelligence.md");
 
 fn workspace_version() -> &'static str {
@@ -45,6 +46,9 @@ fn normative_architecture_describes_current_bounded_ipc_and_webview_model() {
     assert!(ROADMAP.contains("authenticated"));
     assert!(ROADMAP.contains("closed-schema WebView2 IPC"));
     assert!(!ROADMAP.contains("no external IPC"));
+
+    assert!(TESTING_CI.contains("portable `neural-app` tests"));
+    assert!(TESTING_CI.contains("clippy with `-D warnings` for both crates"));
 }
 
 #[test]
