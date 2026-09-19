@@ -1,7 +1,8 @@
 # SPEC-0105 — Web Agent Runtime
 
-**Status:** Implemented bounded runtime — NeuralIA 2.0  
+**Status:** Implemented — independent adversarial audit pending  
 **Target:** NeuralIA 2.0  
+**Audit support:** see `SPEC-0104-0105-support-audit.md`; this support review does not satisfy the independent-review gate.  
 **Dependency:** SPEC-0104 must be implemented first
 
 ## 1. Purpose
