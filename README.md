@@ -215,7 +215,7 @@ it at any time. EPUB is not supported: WebView2 does not open it.
 - [x] Rust workspace
 - [x] native Windows idle shell
 - [x] native accessible Windows omnibox
-- [x] lazy one-WebView lifecycle
+- [x] bounded lazy WebView lifecycle (one visible surface outside the comparator; three provider surfaces inside)
 - [x] intent parser
 - [x] Google AI Mode routing
 - [x] bounded HTTP Reader
@@ -226,7 +226,7 @@ it at any time. EPUB is not supported: WebView2 does not open it.
 - [x] AI comparator with system-themed top bar, independent response timelines and real fullscreen
 - [x] Chrome-style keyboard, zoom, find bar and DevTools inside every page
 - [x] opt-in auto-scroll for reading (HTML, text and PDF)
-- [x] external IPC isolation
+- [x] bounded authenticated WebView2 IPC with per-WebView capability
 - [x] HTTP integration tests
 - [x] CI Linux + Windows + RustSec
 - [x] immutable release workflow with CycloneDX SBOM + provenance attestation

@@ -51,3 +51,11 @@ fn model_pack_docs_do_not_claim_product_wiring() {
     assert!(LOCAL_AI_SPEC.contains("not a NeuralIA product feature"));
     assert!(README.contains("ainda não está ligada ao produto"));
 }
+
+#[test]
+fn readme_status_does_not_reintroduce_pre_comparator_ipc_claims() {
+    assert!(!README.contains("lazy one-WebView lifecycle"));
+    assert!(!README.contains("external IPC isolation"));
+    assert!(README.contains("bounded lazy WebView lifecycle"));
+    assert!(README.contains("bounded authenticated WebView2 IPC"));
+}
