@@ -21,6 +21,12 @@ All notable changes to NeuralIA are documented here.
   Links internos do Reader continuam sendo a exceção sem token.
 
 ### Validation
+- **PR #65 — Authenticode preserva o artefato medido.** O caminho opt-in de
+  assinatura roda no job Windows antes dos gates de Home/lifecycle, verifica
+  assinatura e timestamp e só então calcula SHA-256/attestation. O smoke gate
+  exige que credenciais ausentes falhem, verifica uma assinatura efêmera e
+  confirma que adulterar o executável invalida a assinatura. A release publica
+  `authenticode.json` ao lado do mesmo binário testado.
 - **PR #58 — release publica exatamente o executável medido pelo CI.** O job
   Windows guarda `NeuralIA.exe`, SHA-256 e os JSONs dos gates no artefato
   nomeado pelo SHA; a attestation é criada sobre esse mesmo binário. O workflow
