@@ -123,6 +123,14 @@ pub fn hashed_embedding(text: &str) -> Vec<f32> {
             continue;
         }
         add_feature(&mut vector, word.as_bytes(), 1.4);
+
+        // Uma camada semântica mínima e determinística melhora o recall offline
+        // entre português/inglês e equivalentes técnicos sem carregar modelo.
+        // Ela é fallback: model packs podem fornecer embeddings reais depois.
+        let canonical = canonical_semantic_token(word);
+        if canonical != word {
+            add_feature(&mut vector, canonical.as_bytes(), 1.8);
+        }
     }
 
     for width in 3..=5 {
@@ -142,6 +150,29 @@ pub fn hashed_embedding(text: &str) -> Vec<f32> {
         }
     }
     vector
+}
+
+fn canonical_semantic_token(word: &str) -> &str {
+    match word {
+        "simd" | "vetor" | "vetores" | "vetorial" | "vector" | "vectors" | "vectorial" => {
+            "simd-vector"
+        }
+        "cpu" | "cpus" | "processador" | "processadores" | "processor" | "processors" => {
+            "cpu-processor"
+        }
+        "otimização" | "otimizacao" | "otimizar" | "optimization" | "optimize" | "optimise" => {
+            "optimization"
+        }
+        "memória" | "memoria" | "memory" => "memory",
+        "navegador" | "navegadores" | "browser" | "browsers" => "browser",
+        "pesquisa" | "pesquisar" | "research" => "research",
+        "agente" | "agentes" | "agent" | "agents" => "agent",
+        "segurança" | "seguranca" | "security" => "security",
+        "fonte" | "fontes" | "source" | "sources" => "source",
+        "resposta" | "respostas" | "answer" | "answers" => "answer",
+        "código" | "codigo" | "code" => "code",
+        _ => word,
+    }
 }
 
 fn add_feature(vector: &mut [f32], bytes: &[u8], weight: f32) {
@@ -400,6 +431,15 @@ mod tests {
 
         let norm = a.iter().map(|value| value * value).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn technical_portuguese_aliases_share_embedding_features() {
+        let query = hashed_embedding("otimização vetorial CPU");
+        let document = hashed_embedding("AVX-512 acelera operações SIMD em CPUs modernas");
+        let unrelated = hashed_embedding("receita de bolo com chocolate");
+
+        assert!(cosine_similarity(&query, &document) > cosine_similarity(&query, &unrelated));
     }
 
     #[test]
