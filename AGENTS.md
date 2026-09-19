@@ -71,6 +71,13 @@ Não é cerimónia. Foi assim que se soube, a 19/09/2026, que o teste de aceita�
 
 Um teste que nunca se viu falhar é uma esperança, não uma garantia.
 
+**E depois restaura-se.** A sabotagem é uma medição, não uma entrega. Antes de `git add`, o passo é
+sempre: desfazer a quebra, correr `cargo test` outra vez e **ver verde** — e só então commitar. Sem
+isto, a disciplina que existe para provar o gate passa a ser a via mais rápida para desligar o gate:
+a 19/09/2026, dois PRs chegaram a revisão com o estado sabotado commitado, um deles com o grant de
+sessão a deixar passar acções sensíveis, o kill switch a não revogar nada e a defesa contra injecção
+de prompt desligada. O código sabotado nunca sai da máquina.
+
 ### 4.3 Testar o que embarca, não uma biblioteca paralela
 
 Um teste que exercita uma biblioteca que o produto não usa não prova nada sobre o produto. `neural-app` é um binário, mas isso **não** é impedimento: o bloco `#[cfg(test)] mod tests` dentro do próprio `windows_app.rs` alcança as funções privadas. É lá que os gates do produto vivem.
@@ -149,6 +156,7 @@ Enquanto não houver um segundo revisor, qualquer alteração aqui só entra com
 - [ ] `git status --short` só mostra ficheiros que eu editei nesta tarefa.
 - [ ] `cargo fmt --all -- --check`, `clippy -D warnings` e `cargo test --workspace` verdes neste SHA.
 - [ ] Se entreguei um gate novo: quebrei o comportamento e vi o teste ficar **vermelho**; está escrito no commit.
+- [ ] **Desfiz a sabotagem** e vi a suite verde outra vez — `grep -rn "SABOTAGE" crates/` não devolve nada.
 - [ ] O gate que entreguei corre sobre o caminho que embarca, não sobre uma biblioteca paralela (§4.3).
 - [ ] Nenhuma frase nova em docs sem código e teste correspondentes.
 - [ ] Não mudei `version` em `Cargo.toml` sem o sim do dono.
