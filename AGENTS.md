@@ -115,6 +115,8 @@ Qualquer alteração aqui só entra em `main` com revisão de quem não a escrev
 
 **Já em `main` (não regredir):** canal `neuralia:` com nativos capturados no document-created, `isTrusted` em todos os handlers, token de `BCryptGenRandom` comparado em tempo constante, `view-source:`, `nosniff`/CSP no servidor PDF; Reader com extração O(n), prazo e cancelamento (`tests/extraction_cost.rs`); `viewer.mjs` por ranges com geometria calculada.
 
+**Override explícito do dono em 19/09/2026, após o PR #14 ficar verde:** o dono instruiu Astra a continuar sem aguardar Claude, integrar o PR #14, concluir a release 2.0.1 e prosseguir com os passos 1–5 da fila corrente. Para esta sequência específica, isso substitui as reservas de autoria/revisão do §2/§4/§7 na medida necessária para executar a ordem do dono. As regras contra mover tags, mentir em docs, usar stash ou commitar trabalho alheio continuam valendo.
+
 **Decisões tomadas pelo dono em 19/09/2026:**
 
 - **Navigation API → canal por mensagem (IPC).** Uma página pode fazer `navigation.addEventListener('navigate', e => e.destination.url)` e ler `neuralia:…?cap=TOKEN` de cada ação do utilizador — o token vaza por desenho do Chromium. Decisão: migrar o transporte para `chrome.webview.postMessage` capturado no document-created, com o mesmo token/closure/tempo constante; `neuralia:` sobrevive só no Reader (HTML nosso, sem script). Formalizado em **SPEC-0108** (`md/SPEC-0108-secure-webview-ipc-channel.md`, na branch `fix/audit-2.0`; entra em `main` com a 2.0.1). Implementação: Claude, branch `fix/audit-ipc`, release 2.1.0. Astra não toca no canal até essa branch integrar.
