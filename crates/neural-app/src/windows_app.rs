@@ -27,7 +27,7 @@ use windows_sys::Win32::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CLEARTYPE_QUALITY,
         ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
         CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
-        DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC,
+        DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC,
         DeleteObject, DrawTextW, Ellipse, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC,
         InvalidateRect, LineTo, MoveToEx, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC,
         SRCCOPY, SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits,
