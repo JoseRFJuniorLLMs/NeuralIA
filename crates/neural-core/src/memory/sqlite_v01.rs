@@ -1,4 +1,9 @@
-use std::{collections::HashMap, fs, io, path::Path, time::Duration};
+use std::{
+    collections::HashMap,
+    fs, io,
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
@@ -23,8 +28,49 @@ fn schema_hash() -> String {
 
 fn remove_sqlite_sidecars(path: &Path) {
     let _ = fs::remove_file(path);
+    remove_wal_shm(path);
+}
+
+fn remove_wal_shm(path: &Path) {
     let _ = fs::remove_file(format!("{}-wal", path.to_string_lossy()));
     let _ = fs::remove_file(format!("{}-shm", path.to_string_lossy()));
+}
+
+fn rebuild_backup_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("memory.sqlite");
+    parent.join(format!(".{name}.rebuild-backup"))
+}
+
+fn rebuild_temp_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("memory.sqlite");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    parent.join(format!(
+        ".{name}.rebuild-{}-{nonce}",
+        std::process::id()
+    ))
+}
+
+fn recover_interrupted_rebuild(path: &Path) -> io::Result<()> {
+    let backup = rebuild_backup_path(path);
+    match (path.exists(), backup.exists()) {
+        (false, true) => fs::rename(&backup, path),
+        (true, true) => {
+            remove_sqlite_sidecars(&backup);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn table_exists(connection: &Connection, name: &str) -> io::Result<bool> {
@@ -157,6 +203,7 @@ fn open_ready(path: &Path) -> io::Result<Connection> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    recover_interrupted_rebuild(path)?;
 
     let mut connection = Connection::open(path).map_err(io_error)?;
     configure_connection(&connection)?;
@@ -471,28 +518,15 @@ pub(super) fn upsert(
     transaction.commit().map_err(io_error)
 }
 
-pub(super) fn rebuild(
+fn build_fresh_index(
     path: &Path,
     documents: &[MemoryDocument],
     sessions: &[ResearchSession],
 ) -> io::Result<()> {
+    remove_sqlite_sidecars(path);
     let mut connection = open_ready(path)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(io_error)?;
-
-    transaction
-        .execute_batch(
-            "DELETE FROM source_relation;
-             DELETE FROM knowledge_page_entity;
-             DELETE FROM memory_embedding;
-             DELETE FROM knowledge_page;
-             DELETE FROM navigation_observation;
-             DELETE FROM research_session;
-             DELETE FROM research_space;
-             DELETE FROM memory_entity;
-             DELETE FROM audit_log;",
-        )
         .map_err(io_error)?;
 
     {
@@ -543,7 +577,72 @@ pub(super) fn rebuild(
         .map_err(io_error)?;
 
     validate_integrity(&transaction)?;
-    transaction.commit().map_err(io_error)
+    transaction.commit().map_err(io_error)?;
+
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(io_error)?;
+    drop(connection);
+    remove_wal_shm(path);
+
+    // Reopen after checkpoint so the exact standalone file that will be
+    // published is validated, not merely the transaction that created it.
+    let validation = open_ready(path)?;
+    let integrity: String = validation
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(io_error)?;
+    if integrity != "ok" {
+        return Err(io::Error::other(format!(
+            "rebuilt SQLite integrity_check failed: {integrity}"
+        )));
+    }
+    drop(validation);
+    remove_wal_shm(path);
+    Ok(())
+}
+
+pub(super) fn rebuild(
+    path: &Path,
+    documents: &[MemoryDocument],
+    sessions: &[ResearchSession],
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    recover_interrupted_rebuild(path)?;
+
+    let temp = rebuild_temp_path(path);
+    let backup = rebuild_backup_path(path);
+    remove_sqlite_sidecars(&temp);
+
+    if let Err(error) = build_fresh_index(&temp, documents, sessions) {
+        remove_sqlite_sidecars(&temp);
+        return Err(error);
+    }
+
+    // The old derived index stays untouched until the replacement is fully
+    // built and validated. A fixed backup name lets open_ready() recover a
+    // crash between these two renames on Windows.
+    remove_sqlite_sidecars(&backup);
+    let had_existing = path.exists();
+    if had_existing {
+        remove_wal_shm(path);
+        fs::rename(path, &backup)?;
+    }
+
+    if let Err(error) = fs::rename(&temp, path) {
+        if had_existing && backup.exists() {
+            let _ = fs::rename(&backup, path);
+        }
+        remove_sqlite_sidecars(&temp);
+        return Err(error);
+    }
+
+    remove_wal_shm(path);
+    if backup.exists() {
+        remove_sqlite_sidecars(&backup);
+    }
+    Ok(())
 }
 
 pub(super) fn sync_tombstones(path: &Path, tombstones: &[MemoryTombstone]) -> io::Result<()> {
@@ -817,6 +916,87 @@ mod tests {
         assert_eq!(fake_count, 0);
         assert_eq!(audit_count, 1);
         drop(connection);
+
+        remove_sqlite_sidecars(&path);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn rebuild_recovers_from_schema_hash_corruption() {
+        let path = temp_path("rebuild-corrupt-schema");
+        let doc = document("healthy source");
+        rebuild(&path, std::slice::from_ref(&doc), &[]).unwrap();
+
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute(
+                    "UPDATE schema_version SET schema_sha256='corrupt'",
+                    [],
+                )
+                .unwrap();
+        }
+        assert!(open_ready(&path).is_err());
+
+        rebuild(&path, std::slice::from_ref(&doc), &[]).unwrap();
+        let connection = open_ready(&path).unwrap();
+        let hash: String = connection
+            .query_row("SELECT schema_sha256 FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM knowledge_page", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(hash, schema_hash());
+        assert_eq!(count, 1);
+        drop(connection);
+
+        remove_sqlite_sidecars(&path);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_rebuild_keeps_previous_index_intact() {
+        let path = temp_path("rebuild-rollback");
+        let original = document("original");
+        rebuild(&path, std::slice::from_ref(&original), &[]).unwrap();
+
+        let invalid = document("private must fail").private(true);
+        assert!(rebuild(&path, &[invalid], &[]).is_err());
+
+        let connection = open_ready(&path).unwrap();
+        let ids = connection
+            .prepare("SELECT id FROM knowledge_page ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(ids, vec![original.id]);
+        drop(connection);
+
+        remove_sqlite_sidecars(&path);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn interrupted_swap_restores_fixed_backup_on_next_open() {
+        let path = temp_path("rebuild-recover-backup");
+        let doc = document("recover me");
+        rebuild(&path, std::slice::from_ref(&doc), &[]).unwrap();
+
+        let backup = rebuild_backup_path(&path);
+        fs::rename(&path, &backup).unwrap();
+        assert!(!path.exists());
+        assert!(backup.exists());
+
+        let connection = open_ready(&path).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM knowledge_page", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        drop(connection);
+        assert!(path.exists());
+        assert!(!backup.exists());
 
         remove_sqlite_sidecars(&path);
         let _ = fs::remove_dir_all(path.parent().unwrap());
