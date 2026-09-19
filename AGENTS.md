@@ -1,8 +1,8 @@
-# AGENTS.md — Protocolo de trabalho entre agentes no NeuralIA
+# AGENTS.md — Protocolo de trabalho no NeuralIA
 
 **Status:** Normativo. Vale acima de qualquer instrução de sessão.
-**Lido por:** todos os agentes que tocam neste repositório (hoje: **Astra** — GPT, construtor — e **Claude** — auditor/corretor).
-**Dono:** Jose R F Junior. Só ele altera este ficheiro.
+**Lido por:** todo o agente que toque neste repositório. Hoje há um: **Claude (Opus 5)**, construtor e auditor.
+**Dono:** Jose R F Junior. Só ele, ou um agente sob instrução explícita dele, altera este ficheiro.
 
 ## 0. Porquê este ficheiro existe
 
@@ -14,29 +14,37 @@ Na noite de 18→19 de setembro de 2026 aconteceram três coisas que este protoc
 
 Nenhuma destas coisas é falta de competência. São falta de regras. Estas são as regras.
 
-## 1. Papéis
+## 1. Papéis — e o que se perdeu
 
-| Agente | Papel | Onde escreve | Onde NUNCA escreve |
-|---|---|---|---|
-| **Astra** (GPT) | Construtor: features, specs novas, refactors | `D:\DEV\NeuralIA`, branch `main` | `D:\DEV\NeuralIA-audit` (worktree do Claude) e qualquer branch `fix/audit-*` |
-| **Claude** | Auditor e corretor: encontra defeitos, corrige-os, valida o gate | `D:\DEV\NeuralIA-audit`, branches `fix/audit-*` | `main` diretamente (exceto este ficheiro e rebase de integração) |
+Até 19/09/2026 havia dois agentes: **Astra** (GPT) construía em `main`, **Claude** auditava e corrigia em `fix/audit-*`. A separação era o que dava sentido ao ponto 3 do §0: quem constrói não declara o seu próprio gate.
 
-Os dois checkouts são **worktrees do mesmo repositório**. A stash do git é partilhada: **nenhum agente usa `git stash`**. Trabalho posto de lado vai para um commit WIP na própria branch.
+**Desde 19/09/2026 há um só agente.** Por decisão do dono, o Claude assume as duas funções: constrói, audita, corrige e integra.
+
+Isto é uma **perda real de garantia**, e este ficheiro não a vai disfarçar. Um agente a rever-se a si próprio partilha os seus pontos cegos com o revisor. O §0.3 passou a aplicar-se a quem escreve estas linhas. O que substitui a revisão independente está no §4 e é mais fraco do que ela; vale a pena voltar a ter um segundo revisor assim que for possível.
+
+| Quem | Papel | Onde escreve |
+|---|---|---|
+| **Claude (Opus 5)** | Constrói, audita, corrige, integra | `D:\DEV\NeuralIA-audit` (worktree), branches `fix/*`, e `main` por merge de PR |
+| **Dono** | Revisor de registo: áreas sensíveis (§7) e releases (§2) | onde quiser |
+
+Os dois checkouts (`D:\DEV\NeuralIA` e `D:\DEV\NeuralIA-audit`) continuam a ser **worktrees do mesmo repositório**, e a stash do git é partilhada entre eles: **não se usa `git stash`**. Trabalho posto de lado vai para um commit WIP na própria branch.
 
 ## 2. Release — quem e quando
 
-- **Astra nunca faz `release:` nem muda a `version` em `Cargo.toml`.** O CI publica uma release em cada push a `main` que altere a versão; o bump é o gatilho. Esse gatilho é do Claude e só dispara depois do gate verde (§4) no SHA exato que vai ser publicado.
-- Uma versão só sobe depois de o `CHANGELOG` ter uma secção `## [Unreleased]` completa e verdadeira (§3). O Claude converte `[Unreleased]` em `[x.y.z]` no commit de release.
-- Tag existente nunca é movida nem republicada (o `release.yml` já recusa; a regra é a mesma para humanos e agentes).
+- O CI publica uma release em cada push a `main` que altere a `version` do `Cargo.toml`; **o bump é o gatilho**. Uma tag publicada não se move nem se republica (o `release.yml` recusa; a regra é a mesma para humanos e agentes).
+- Com um único agente, o bump **exige o sim explícito do dono**. Não é uma formalidade: é o último ponto em que um humano vê o que vai sair para os utilizadores antes de o pacote existir. Um agente não faz `release:` por iniciativa própria, mesmo com o gate verde.
+- Uma versão só sobe depois de o `CHANGELOG` ter uma secção `## [Unreleased]` completa e verdadeira (§3). O commit de release converte `[Unreleased]` em `[x.y.z]`.
 
 ## 3. Docs descrevem código, nunca planos
 
 - Uma frase entra em `SECURITY.md`, `README.md`, `docs/specs/*.md`, `md/*.md` ou `CHANGELOG.md` **só quando o código existe e há um teste que a exercita**. Se o teste não existe, a frase não existe.
-- O status **"Implemented" / "Implementada"** numa spec exige um teste de aceitação a passar no CI que a cite pelo número (`spec_010x_acceptance.rs` é o modelo). Sem teste, o status é "Proposta" ou "Parcial — fase N".
+- O status **"Implemented" / "Implementada"** numa spec exige um teste de aceitação a passar no CI que a cite pelo número, **sobre o caminho que embarca** (§4.3). Sem isso, o status é "Proposta" ou "Parcial — fase N".
 - Cada entrada de `CHANGELOG` aponta para o commit ou PR que a torna verdadeira.
 - Quem encontrar uma afirmação publicada que o código não cumpre **corrige a afirmação no mesmo commit** em que a descobre, ou abre a issue. Não se deixa a docs mentir enquanto se implementa.
 
 ## 4. O gate
+
+### 4.1 Verde
 
 Um SHA só é "verde" quando, nesse SHA exato, tudo isto passa:
 
@@ -48,16 +56,34 @@ cargo test --workspace
 
 mais, para releases:
 
-```bash
-./scripts/measure-home.ps1  -ExePath target/release/NeuralIA.exe
+```powershell
+./scripts/measure-home.ps1   -ExePath target/release/NeuralIA.exe
 ./scripts/measure-cycles.ps1 -ExePath target/release/NeuralIA.exe
 ```
 
-e uma **revisão adversarial independente** (quem não escreveu o código tenta parti-lo: segurança, correção, regressões, verdade das docs). Achados confirmados voltam ao construtor; o gate repete-se no novo SHA.
+### 4.2 A prova de sabotagem — o que substitui o revisor independente
 
-**Testes que passam com qualquer implementação não contam** (SPEC-0012): `assert!(1.0 > 0.0)`, `assert_ne!(EnumA, EnumB)`, "string contém parte de si própria". Um teste tem de conseguir falhar.
+**Sem um segundo agente, o teste é o revisor. Logo o teste tem de ser provado.**
 
-## 5. Nunca commitar trabalho de outro agente
+Ao entregar um gate novo — qualquer teste que exista para impedir uma regressão —, quebra-se de propósito o comportamento que ele guarda e confirma-se que **ele fica vermelho**. O resultado vai no corpo do commit ou do PR, com números.
+
+Não é cerimónia. Foi assim que se soube, a 19/09/2026, que o teste de aceitação da SPEC-0105 não era um gate: com o `policy.evaluate` retirado do código que embarca, ele continuava verde. E foi assim que se soube que as asserções sobre o **texto** do `windows_app.rs` também não o eram: com o gate de permissões do agente inteiramente desligado, passavam as sete.
+
+Um teste que nunca se viu falhar é uma esperança, não uma garantia.
+
+### 4.3 Testar o que embarca, não uma biblioteca paralela
+
+Um teste que exercita uma biblioteca que o produto não usa não prova nada sobre o produto. `neural-app` é um binário, mas isso **não** é impedimento: o bloco `#[cfg(test)] mod tests` dentro do próprio `windows_app.rs` alcança as funções privadas. É lá que os gates do produto vivem.
+
+Quando a decisão está entalada dentro de um método `&mut self` cheio de UI, extrai-se a decisão para uma função que não toca em janelas (`decide_agent_step` é o modelo) e testa-se essa. Asserções sobre o **texto do ficheiro-fonte** não são gates de comportamento: falham com um `rustfmt` e passam com o código desligado. Servem só para proibir a *presença* de algo, nunca para afirmar que algo funciona.
+
+### 4.4 Testes que não contam
+
+Testes que passam com qualquer implementação (SPEC-0012): `assert!(1.0 > 0.0)`, `assert_ne!(EnumA, EnumB)`, "string contém parte de si própria". Um teste tem de conseguir falhar.
+
+Orçamentos em segundos de relógio medem a velocidade da máquina, não o algoritmo: falham com o código certo numa máquina ocupada e passam a verde num runner rápido **mesmo com uma regressão**. Mede-se a relação (o dobro da entrada custa quanto?) e não o absoluto.
+
+## 5. Nunca commitar trabalho que não é desta tarefa
 
 Antes de qualquer `git add`:
 
@@ -65,71 +91,66 @@ Antes de qualquer `git add`:
 git status --short
 ```
 
-Se aparecerem ficheiros que **este** agente não editou nesta tarefa, ele **pára e avisa o dono**. Não os adiciona, não os reverte, não os "arruma". O commit `backup` de 18/09 é o exemplo do que não se faz.
+Se aparecerem ficheiros que **esta tarefa** não editou, pára-se e avisa-se o dono. Não se adicionam, não se revertem, não se "arrumam". O commit `backup` de 18/09 é o exemplo do que não se faz. A regra continua a valer com um só agente: outra sessão pode estar aberta no outro worktree.
 
 ## 6. Fluxo de integração
 
 ```text
-Astra constrói em main
+git fetch — saber o que mudou em main
         │
         ▼
-Claude: git fetch; compara; audita o que é novo (sempre a partir do último SHA de main)
+trabalho em fix/<tema> (worktree D:\DEV\NeuralIA-audit), rebase sobre main
         │
         ▼
-Claude corrige em fix/audit-<tema> (worktree D:\DEV\NeuralIA-audit), rebase sobre main
+gate verde (§4.1) + prova de sabotagem (§4.2) no SHA da branch
         │
         ▼
-Gate verde no SHA da branch  ──►  Astra (ou o dono) integra a branch em main
+PR com o defeito, a medição e a prova  ──►  merge --no-ff em main
         │
         ▼
-Claude faz o bump de versão + CHANGELOG  ──►  CI publica
+bump de versão + CHANGELOG, com o sim do dono  ──►  CI publica
 ```
 
-- **Claude faz rebase sobre `main`; nunca o contrário.** Astra não faz rebase de `main` sobre branches de auditoria nem as edita.
-- Integração é `git merge --no-ff fix/audit-<tema>` (ou PR). Conflito de integração é resolvido por quem integra, com o gate a correr de novo.
-- Antes de começar qualquer tarefa, **os dois** agentes fazem `git fetch` e comparam o que vão fazer com o que já está feito. Trabalho duplicado é desperdício; trabalho contraditório é regressão.
+- **Rebase sobre `main`; nunca o contrário.**
+- Integração é `git merge --no-ff fix/<tema>` (ou PR). Conflito é resolvido por quem integra, com o gate a correr de novo no SHA integrado.
+- O PR não é ritual: é onde fica escrito o que se mediu, para o dono poder discordar sem ler o diff todo.
 
-## 7. Áreas sensíveis — pedem revisão independente antes de entrar em `main`
+## 7. Áreas sensíveis — precisam do sim do dono antes de entrar em `main`
 
-Qualquer alteração aqui só entra em `main` com revisão de quem não a escreveu:
+Enquanto não houver um segundo revisor, qualquer alteração aqui só entra com aprovação explícita do dono, e o PR tem de trazer a prova de sabotagem do §4.2:
 
-- `crates/neural-core/src/agent_runtime.rs`, `agent_security.rs` e a sua ligação em `windows_app.rs` (o agente executa JS gerado nas páginas — é a superfície mais sensível do produto);
-- o canal `neuralia:` e os scripts injetados (`with_initialization_script`);
-- `crates/neural-core/src/security.rs`, `reader.rs` (rede e parsing de conteúdo remoto);
+- `crates/neural-core/src/agent_runtime.rs`, `agent_security.rs` e a ligação do agente em `windows_app.rs` (`decide_agent_step`, `execute_agent_action`, `agent_action_script`) — o agente executa JS nas páginas; é a superfície mais sensível do produto;
+- o canal IPC (`crates/neural-app/src/ipc.rs`) e os scripts injetados (`with_initialization_script`);
+- `crates/neural-core/src/security.rs` e `reader.rs` (rede e parsing de conteúdo remoto);
 - `serve_pdf_asset` e os assets do PDF.js;
-- `memory.rs` no que toca a modo privado, sanitização e apagamento.
+- `memory.rs` e `memory/sqlite_v01.rs` no que toca a modo privado, sanitização e apagamento.
 
-## 8. Estado atual (19/09/2026) — para ninguém refazer o que já está em curso
+## 8. Estado atual (19/09/2026)
 
-**Em curso na branch `fix/audit-2.0` (Claude) — Astra NÃO implementa isto em `main`:**
+**Integrado em `main` — não regredir:**
 
-- palette nativa Win32 (substitui `NEURALIA_PALETTE_SCRIPT` e o canal `neuralia:palette?q=`; corrige a saída do modo privado e o `allow_local` fixo);
-- `NEURALIA_NO_GMAIL` (o monitor do Gmail continua permanente por decisão do dono; a variável só o desliga para o gate `measure-cycles.ps1`);
-- serviço único de temporizadores (`Timers`), em vez de uma thread por `show_splash`/toast/probe/autoscroll;
-- `Range` no servidor `neuralia-pdf` (o `viewer.mjs` já pede por ranges);
-- cache de ícones limitado, tema em cache, animação da Home parada quando minimizada/tapada;
-- barra alinhada aos pesos dos divisores, coalescing do resize, popups sem `WS_EX_TOPMOST` + `Moved`/`Focused`;
-- histórico sem I/O no event loop; entradas de histórico limitadas a 2048 chars; `escape_html` numa passagem;
-- substituição dos três testes tautológicos de 1.6.0 por testes reais;
-- alinhamento das docs com o código (incluindo SPEC-0107 → "Fase 0 feita", não "Implementada").
+- canal IPC da SPEC-0108 (`ipc.rs`): envelope versionado, lista fechada de ações, corpo ≤ 8 KiB, capability de `BCryptGenRandom` comparada em tempo constante, primitivas capturadas no document-created, `window.top !== window` em todos os scripts injetados;
+- Reader com extração linear, prazo e cancelamento; corte na fronteira de char;
+- memória SQLite V01 com FTS5, expansão semântica PT/EN nos candidatos, tombstones de forget, captura de custo constante;
+- gate do agente que embarca isolado em `decide_agent_step`, com testes que ficam vermelhos quando a política é retirada;
+- proveniência do `ai-memory` (SPEC-0107 Fase 0) e do PDF.js presas por teste.
 
-**Já em `main` (não regredir):** canal `neuralia:` com nativos capturados no document-created, `isTrusted` em todos os handlers, token de `BCryptGenRandom` comparado em tempo constante, `view-source:`, `nosniff`/CSP no servidor PDF; Reader com extração O(n), prazo e cancelamento (`tests/extraction_cost.rs`); `viewer.mjs` por ranges com geometria calculada.
+**Aberto, por decidir pelo dono:**
 
-**Override explícito do dono em 19/09/2026, após o PR #14 ficar verde:** o dono instruiu Astra a continuar sem aguardar Claude, integrar o PR #14, concluir a release 2.0.1 e prosseguir com os passos 1–5 da fila corrente. Para esta sequência específica, isso substitui as reservas de autoria/revisão do §2/§4/§7 na medida necessária para executar a ordem do dono. As regras contra mover tags, mentir em docs, usar stash ou commitar trabalho alheio continuam valendo.
+- **Arquitetura do agente.** `AgentRuntime`, `AgentPlanner` e `validate_action_reference` (`neural-core`) **não são usados pelo produto**. Ou a app passa a usá-los, ou a SPEC-0105 descreve o ciclo real e a biblioteca é marcada como não usada — ou removida. Código de segurança que não corre dá conforto falso a quem audita.
+- **A classificação de risco confia na página.** `agent_field_kind` e `app_agent_security_action` decidem Restricted/Sensitive/Reversible a partir do `role`, `type`, `autocomplete` e texto do elemento — tudo servido por quem controla a página. A SPEC-0104 §1 diz que a página é dado não confiável; aqui ela é a autoridade sobre o seu próprio nível de risco. O que limita o estrago é o agente só tocar em elementos que o plano do utilizador nomeou.
+- **`candidate_ids` falha em silêncio.** Índice em falta, bloqueado ou corrompido → varredura completa do corpus, mais lenta e com resultados diferentes, sem sinal nenhum.
 
-**Decisões tomadas pelo dono em 19/09/2026:**
+**Por auditar:** as ~9 000 linhas de UI Win32 fora dos caminhos IPC/agente/PDF foram passadas pelas armadilhas conhecidas (fronteiras de char, `clamp` invertido, buffers do `GetWindowTextW`, pares GDI) e estavam sãs, mas não foram lidas linha a linha.
 
-- **Navigation API → canal por mensagem (IPC).** Uma página pode fazer `navigation.addEventListener('navigate', e => e.destination.url)` e ler `neuralia:…?cap=TOKEN` de cada ação do utilizador — o token vaza por desenho do Chromium. Decisão: migrar o transporte para `chrome.webview.postMessage` capturado no document-created, com o mesmo token/closure/tempo constante; `neuralia:` sobrevive só no Reader (HTML nosso, sem script). Formalizado em **SPEC-0108** (`md/SPEC-0108-secure-webview-ipc-channel.md`, na branch `fix/audit-2.0`; entra em `main` com a 2.0.1). Implementação: Claude, branch `fix/audit-ipc`, release 2.1.0. Astra não toca no canal até essa branch integrar.
-- **Auditoria independente do agent runtime** contra SPEC-0104 §11 (classes de capacidade, aprovação por classe, firewall de dados sensíveis, pivot para rede local, fixtures de injeção, audit log, kill switch) e da SPEC-0105 (sem JS arbitrário do modelo, limites de passos/tempo, interrupção, trace) — em curso pelo Claude, só leitura. Até o relatório sair, as SPEC-0104/0105 ficam com status "Implementada — auditoria independente pendente".
-
-**Ordem acordada depois da 2.0.1:** auditoria 0104/0105 → SPEC-0108 e migração do canal (2.1.0) → SPEC-0107 Fase 1 (SQLite/FTS5) **com a restrição**: `rusqlite` síncrono, sem `tokio`, carregado lazy, nunca na Home — o `ai-memory-store` upstream traz `tokio` full e rebentaria o gate de ≤16 threads da SPEC-0008.
-
-## 9. Checklist antes de cada push (os dois agentes)
+## 9. Checklist antes de cada push
 
 - [ ] `git fetch` feito; sei o que mudou em `origin/main` desde a última vez.
 - [ ] `git status --short` só mostra ficheiros que eu editei nesta tarefa.
 - [ ] `cargo fmt --all -- --check`, `clippy -D warnings` e `cargo test --workspace` verdes neste SHA.
+- [ ] Se entreguei um gate novo: quebrei o comportamento e vi o teste ficar **vermelho**; está escrito no commit.
+- [ ] O gate que entreguei corre sobre o caminho que embarca, não sobre uma biblioteca paralela (§4.3).
 - [ ] Nenhuma frase nova em docs sem código e teste correspondentes.
-- [ ] Não mudei `version` em `Cargo.toml` (só o Claude, depois do gate).
+- [ ] Não mudei `version` em `Cargo.toml` sem o sim do dono.
 - [ ] Não usei `git stash`.
-- [ ] Se toquei numa área do §7, pedi revisão independente.
+- [ ] Se toquei numa área do §7, o PR traz a prova de sabotagem e espera o dono.
