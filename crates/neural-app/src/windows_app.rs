@@ -6080,7 +6080,11 @@ fn agent_trace_action(action: &AgentAction) -> String {
             text.chars().count()
         ),
         AgentAction::Select { target, value } => {
-            format!("select target={} chars={}", target.id, value.chars().count())
+            format!(
+                "select target={} chars={}",
+                target.id,
+                value.chars().count()
+            )
         }
         AgentAction::Click { target } => format!(
             "click target={} label={}",
@@ -8184,10 +8188,7 @@ mod tests {
             ));
         }
 
-        for target in [
-            make("button", "Checkout"),
-            make("button", "Transfer"),
-        ] {
+        for target in [make("button", "Checkout"), make("button", "Transfer")] {
             assert!(matches!(
                 app_agent_security_action(&AgentAction::Click { target }, &page),
                 AgentSecurityAction::Payment { .. }
@@ -8199,7 +8200,10 @@ mod tests {
     fn agent_termination_reason_is_explicit() {
         assert_eq!(AgentTermination::Completed.as_str(), "completed");
         assert_eq!(AgentTermination::UserStopped.as_str(), "user-stopped");
-        assert_eq!(AgentTermination::RestrictedAction.as_str(), "restricted-action");
+        assert_eq!(
+            AgentTermination::RestrictedAction.as_str(),
+            "restricted-action"
+        );
         assert_eq!(AgentTermination::ExecutionError.as_str(), "execution-error");
     }
 
