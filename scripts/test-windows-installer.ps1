@@ -19,6 +19,8 @@ $installer = (Resolve-Path -LiteralPath $InstallerPath).Path
 $expectedExe = (Resolve-Path -LiteralPath $ExpectedExePath).Path
 $root = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
 $installDir = Join-Path $root ("neuralia-installer-smoke-" + [Guid]::NewGuid().ToString("N"))
+$uninstaller = $null
+$didUninstall = $false
 
 if ($RequireValidSignature) {
     $signature = Get-AuthenticodeSignature -FilePath $installer
@@ -79,6 +81,7 @@ try {
     if ($uninstall.ExitCode -ne 0) {
         throw "Uninstaller exited with code $($uninstall.ExitCode)."
     }
+    $didUninstall = $true
 
     Start-Sleep -Milliseconds 500
     if (Test-Path -LiteralPath $installedExe) {
