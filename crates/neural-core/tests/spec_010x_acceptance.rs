@@ -10,8 +10,7 @@ use neural_core::{
     AgentRuntime, AgentRuntimeConfig, AgentSecurityAction, AgentToolExecutor, CaptureOutcome,
     FieldKind, ForgetScope, HashingLocalIntelligence, IntentClass, LocalIntelligence,
     MemoryDocument, MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore, ObservedPage,
-    ResearchItemKind,
-    ResearchSession, SemanticAnchorKind, ToolResult, semantic_anchors_html,
+    ResearchItemKind, ResearchSession, SemanticAnchorKind, ToolResult, semantic_anchors_html,
 };
 
 fn temp_root(name: &str) -> PathBuf {
