@@ -6,7 +6,7 @@
 
 ## What NeuralIA is
 
-NeuralIA **v1.7.2** is an AI-first, reader-first, system-WebView information client written in Rust.
+NeuralIA **v2.0.0** is an AI-first, reader-first, system-WebView information client written in Rust.
 
 It deliberately refuses the usual browser arms race. It does not ship Chromium, does not implement its own JavaScript engine, does not carry a local LLM, and does not recreate a full browser tab strip just to prove that rectangles can multiply.
 
@@ -25,11 +25,43 @@ Google AI Mode quando o utilizador quer um único fornecedor. A Home não dispar
 nenhuma consulta sozinha.
 
 No comparador, links externos abrem em **Split View** ao lado da IA que gerou a
-fonte; fechar a gaveta devolve a comparação sem perder o contexto. Cada
-**Gemini / ChatGPT / Claude** é também um grupo de abas na **mesma barra de
-título**: `IA + [aba] [aba]`. O botão **+** abre a omnibox daquela IA, hover
-deixa claro o componente atingido e o clique direito numa aba abre um menu
-nativo com abrir, tela cheia, fechar, fechar outras e fechar todas do grupo.
+fonte; fechar a gaveta devolve a comparação sem perder o contexto. O chrome
+nativo tem duas faixas: no topo, como Chrome/Edge, ficam as **abas/fontes e os
+controles minimizar/maximizar/fechar**; abaixo ficam Home, Gemini, ChatGPT,
+Claude, os botões **+**, Privado e controles de Split View. O clique direito
+numa aba abre um menu nativo com abrir, tela cheia, fechar, fechar outras e
+fechar todas do grupo.
+
+## NeuralIA 2.0: memória, pesquisa e agente controlado
+
+A linha 2.0 acrescenta uma camada local de conhecimento sem transformar a Home
+num processo de inferência permanente.
+
+- **Memória semântica local:** conhecimento durável em arquivos, espelho
+  SQLite/FTS5 no Windows, entidades, relações, embeddings determinísticos
+  offline e fusão de ranking. Conteúdo privado/incógnito é descartado antes da
+  persistência e segredos conhecidos são redigidos.
+- **Research Sessions:** perguntas, respostas de Gemini/ChatGPT/Claude e fontes
+  mantêm proveniência. `research:compare`, `research:synthesize` e
+  `research:export` comparam, sintetizam e exportam a sessão em Markdown.
+- **Inteligência local opcional:** embeddings/classificação/entidades/resumos
+  possuem fallback determinístico sem modelo; model packs têm manifesto,
+  checksum, instalação/remoção e benchmark, sem serem necessários para abrir a
+  Home.
+- **Timeline semântica:** perguntas, respostas, títulos, código, tabelas,
+  citações, fontes e conclusões viram âncoras navegáveis.
+- **Agente Web limitado:** `agent:https://site | search=texto | click=botão |
+  select=campo:valor | extract` executa uma sequência estruturada com limite de
+  passos/tempo. Não existe ferramenta de JavaScript arbitrário.
+- **Human-in-the-loop:** mudanças sensíveis de estado exigem confirmação e
+  senha, cartão, OTP, CAPTCHA e pagamento permanecem sob controle humano.
+- **ai-memory:** ideias e trechos selecionados do projeto MIT são vendorizados
+  com licença, SHA upstream e histórico de patches; NeuralIA não depende de um
+  servidor ai-memory em runtime.
+
+`Ctrl+H` abre a busca de memória via `memory:`. O índice pode ser reconstruído
+a partir do conhecimento durável, e o **Memory Doctor** verifica schema,
+documentos e estado do índice.
 
 O Split View usa a mesma timeline vertical do NeuralIA: a scrollbar nativa da
 página lateral é escondida e a trilha tracejada centralizada assume a navegação.
@@ -96,6 +128,11 @@ NeuralIA/
 | `https://example.com/article` | Reader |
 | `reader:https://example.com` | Reader |
 | `web:https://example.com` | Full WebView |
+| `memory: WebView2 prompt injection` | Busca semântica na memória local |
+| `research:compare` | Compara fontes/respostas da sessão ativa |
+| `research:synthesize` | Cria síntese local com proveniência |
+| `research:export` | Exporta a sessão ativa em Markdown |
+| `agent:https://example.com | search=rust | extract` | Agente Web limitado por política |
 | `home:` | Native NeuralIA home |
 
 ## Build
@@ -133,7 +170,7 @@ before the site sees the key. They work on every surface unless noted.
 | `Ctrl` `+` / `-` / `0` | zoom, on Chrome's ladder (25%–400%), inherited by new pages |
 | `Ctrl+F` | in-page find bar (Enter / Shift+Enter / Esc) |
 | `Ctrl+P` | print the page you are looking at |
-| `Ctrl+H` | the 20 most recent local history entries |
+| `Ctrl+H` | semantic local memory search (`memory:`) |
 | `Ctrl+Shift+Delete` | clear local history (the WebView2 profile is untouched) |
 | `F12` · `Ctrl+Shift+I/J/C` | Chromium DevTools |
 | `Ctrl+U` | view page source |
