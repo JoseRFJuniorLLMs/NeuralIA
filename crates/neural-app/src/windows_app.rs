@@ -20,9 +20,8 @@ use neural_core::{
     FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent, MemoryDocument, MemoryHit,
     MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore, ObservedPage, ReaderArticle,
     ReaderBlock, ReaderClient, ResearchItemKind, ResearchSession, chatgpt_search_url,
-    claude_search_url,
-    google_ai_url, is_local_network_target, is_pdf_url, parse_intent, reader_html,
-    redact_sensitive_text,
+    claude_search_url, google_ai_url, is_local_network_target, is_pdf_url, parse_intent,
+    reader_html, redact_sensitive_text,
 };
 use url::Url;
 use windows_sys::Win32::{
@@ -2056,12 +2055,11 @@ impl App {
                 .into_iter()
                 .map(|fact| {
                     format!(
-                        "{}\nEntidades: {}\nNúmeros: {}\nDatas: {}\n{}",
-                        fact.title,
+                        "{}\nEntidades: {}\nNúmeros: {}\nDatas: {}",
+                        fact.source,
                         fact.entities.join(", "),
                         fact.numbers.join(", "),
-                        fact.dates.join(", "),
-                        fact.excerpt
+                        fact.dates.join(", ")
                     )
                 })
                 .collect::<Vec<_>>()
@@ -2088,7 +2086,7 @@ impl App {
         }
         let snapshot = session.synthesize(&ids).clone();
         self.memory.save_session(session.clone());
-        self.show_native_text("NeuralIA — Síntese com proveniência", &snapshot.body);
+        self.show_native_text("NeuralIA — Síntese com proveniência", &snapshot.output);
     }
 
     fn export_current_research(&mut self) {
