@@ -1,7 +1,7 @@
 # AGENTS.md — Protocolo de trabalho no NeuralIA
 
 **Status:** Normativo. Vale acima de qualquer instrução de sessão.
-**Lido por:** todo o agente que toque neste repositório. Hoje há um: **Claude (Opus 5)**, construtor e auditor.
+**Lido por:** todo o agente que toque neste repositório. Hoje há dois: **Claude (Opus 5)** e **GPT**, trabalhando em áreas disjuntas e revendo o trabalho sensível um do outro.
 **Dono:** Jose R F Junior. Só ele, ou um agente sob instrução explícita dele, altera este ficheiro.
 
 ## 0. Porquê este ficheiro existe
@@ -16,16 +16,15 @@ Nenhuma destas coisas é falta de competência. São falta de regras. Estas são
 
 ## 1. Papéis — e o que se perdeu
 
-Até 19/09/2026 havia dois agentes: **Astra** (GPT) construía em `main`, **Claude** auditava e corrigia em `fix/audit-*`. A separação era o que dava sentido ao ponto 3 do §0: quem constrói não declara o seu próprio gate.
+Até 19/09/2026 havia dois agentes: **Astra/GPT** construía e **Claude** auditava/corrigia. Durante parte do dia 19/09 o repositório ficou temporariamente com um único agente ativo, e o protocolo foi endurecido para exigir prova de sabotagem.
 
-**Desde 19/09/2026 há um só agente.** Por decisão do dono, o Claude assume as duas funções: constrói, audita, corrige e integra.
-
-Isto é uma **perda real de garantia**, e este ficheiro não a vai disfarçar. Um agente a rever-se a si próprio partilha os seus pontos cegos com o revisor. O §0.3 passou a aplicar-se a quem escreve estas linhas. O que substitui a revisão independente está no §4 e é mais fraco do que ela; vale a pena voltar a ter um segundo revisor assim que for possível.
+**Estado atual: voltaram a existir dois agentes ativos.** A revisão independente volta a ser a regra sempre que possível, sem abandonar a prova de sabotagem do §4.2. Os dois agentes trabalham em tarefas disjuntas; quando um ocupa um ficheiro ou área, o outro não entra ali sem coordenação explícita.
 
 | Quem | Papel | Onde escreve |
 |---|---|---|
-| **Claude (Opus 5)** | Constrói, audita, corrige, integra | `D:\DEV\NeuralIA-audit` (worktree), branches `fix/*`, e `main` por merge de PR |
-| **Dono** | Revisor de registo: áreas sensíveis (§7) e releases (§2) | onde quiser |
+| **Claude (Opus 5)** | Constrói e audita, com foco atual em `windows_app.rs`, auditorias amplas e portabilidade | `D:\DEV\NeuralIA-audit`, branches `fix/*`, e `main` por merge de PR |
+| **GPT** | Constrói e audita trabalho disjunto; não toca em ficheiro/área ocupada pelo Claude sem coordenação | branches próprias `fix/*`, `docs/*`, `test/*`; integração por PR |
+| **Dono** | Decide conflitos de escopo, aprova áreas sensíveis (§7) e releases (§2) | onde quiser |
 
 Os dois checkouts (`D:\DEV\NeuralIA` e `D:\DEV\NeuralIA-audit`) continuam a ser **worktrees do mesmo repositório**, e a stash do git é partilhada entre eles: **não se usa `git stash`**. Trabalho posto de lado vai para um commit WIP na própria branch.
 
@@ -61,9 +60,9 @@ mais, para releases:
 ./scripts/measure-cycles.ps1 -ExePath target/release/NeuralIA.exe
 ```
 
-### 4.2 A prova de sabotagem — o que substitui o revisor independente
+### 4.2 A prova de sabotagem — obrigatória mesmo com revisor independente
 
-**Sem um segundo agente, o teste é o revisor. Logo o teste tem de ser provado.**
+**O teste é um revisor executável e tem de ser provado.**
 
 Ao entregar um gate novo — qualquer teste que exista para impedir uma regressão —, quebra-se de propósito o comportamento que ele guarda e confirma-se que **ele fica vermelho**. O resultado vai no corpo do commit ou do PR, com números.
 
@@ -89,6 +88,14 @@ Quando a decisão está entalada dentro de um método `&mut self` cheio de UI, e
 Testes que passam com qualquer implementação (SPEC-0012): `assert!(1.0 > 0.0)`, `assert_ne!(EnumA, EnumB)`, "string contém parte de si própria". Um teste tem de conseguir falhar.
 
 Orçamentos em segundos de relógio medem a velocidade da máquina, não o algoritmo: falham com o código certo numa máquina ocupada e passam a verde num runner rápido **mesmo com uma regressão**. Mede-se a relação (o dobro da entrada custa quanto?) e não o absoluto.
+
+## 4.5 Coordenação entre agentes
+
+- Antes de começar, cada agente confirma `main`, PRs abertos e a área ocupada pelo outro.
+- Trabalho paralelo só acontece em ficheiros/subsistemas disjuntos.
+- Se o Claude estiver em `windows_app.rs`, o GPT não toca nele sem aviso/coordenação explícita; a mesma regra vale no sentido inverso.
+- Durante uma auditoria ampla declarada sobre `neural-core`, novo trabalho nesse subsistema espera os resultados, salvo instrução explícita do dono para uma correção concreta.
+- PRs de um agente podem ser revistos pelo outro; aprovação independente não substitui CI nem prova de sabotagem.
 
 ## 5. Nunca commitar trabalho que não é desta tarefa
 
@@ -146,7 +153,7 @@ Enquanto não houver um segundo revisor, qualquer alteração aqui só entra com
 
 - **Arquitetura do agente.** `AgentRuntime`, `AgentPlanner` e `validate_action_reference` (`neural-core`) **não são usados pelo produto**. Ou a app passa a usá-los, ou a SPEC-0105 descreve o ciclo real e a biblioteca é marcada como não usada — ou removida. Código de segurança que não corre dá conforto falso a quem audita.
 - **A classificação de risco confia na página.** `agent_field_kind` e `app_agent_security_action` decidem Restricted/Sensitive/Reversible a partir do `role`, `type`, `autocomplete` e texto do elemento — tudo servido por quem controla a página. A SPEC-0104 §1 diz que a página é dado não confiável; aqui ela é a autoridade sobre o seu próprio nível de risco. O que limita o estrago é o agente só tocar em elementos que o plano do utilizador nomeou.
-- **`candidate_ids` falha em silêncio.** Índice em falta, bloqueado ou corrompido → varredura completa do corpus, mais lenta e com resultados diferentes, sem sinal nenhum.
+- **Resolvido no PR #54:** falha do índice de candidatos deixou de cair silenciosamente para full scan quando já existe corpus. Índice ausente/corrompido/impossível de abrir agora torna a degradação visível e orienta `memory:rebuild`; perfil vazio sem documentos continua válido.
 
 **Por auditar:** as ~9 000 linhas de UI Win32 fora dos caminhos IPC/agente/PDF foram passadas pelas armadilhas conhecidas (fronteiras de char, `clamp` invertido, buffers do `GetWindowTextW`, pares GDI) e estavam sãs, mas não foram lidas linha a linha.
 
@@ -162,3 +169,4 @@ Enquanto não houver um segundo revisor, qualquer alteração aqui só entra com
 - [ ] Não mudei `version` em `Cargo.toml` sem o sim do dono.
 - [ ] Não usei `git stash`.
 - [ ] Se toquei numa área do §7, o PR traz a prova de sabotagem e espera o dono.
+- [ ] Confirmei que não entrei em ficheiro/área declarada como ocupada pelo outro agente sem coordenação.
