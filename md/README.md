@@ -1,7 +1,8 @@
 # NeuralIA — Future Architecture Specifications
 
-This directory contains the architecture specifications implemented by the
-NeuralIA 2.0 baseline. They extend the Rust + WRY + system-WebView design
+This directory contains the NeuralIA future-architecture specifications and
+their current implementation state. Some are implemented baselines; others are
+roadmaps or phased work. They extend the Rust + WRY + system-WebView design
 without turning the project into a Chromium/Electron rewrite.
 
 ## Product thesis
@@ -41,11 +42,16 @@ The browser remains infrastructure. The product is the research workflow.
 
 ## Implementation status
 
-SPEC-0100 through SPEC-0107 are implemented in the NeuralIA 2.0 baseline and
-are guarded together by `crates/neural-core/tests/spec_010x_acceptance.rs`.
-The acceptance gate covers semantic recall/private-memory exclusion, research
-provenance and synthesis, local intelligence, semantic timeline anchors, agent
-permissions, bounded agent execution and ai-memory provenance.
+- **SPEC-0100–0103:** implemented baseline with real acceptance coverage.
+- **SPEC-0104–0105:** implementation exists; independent adversarial audit is pending.
+- **SPEC-0106:** execution roadmap, not a runtime feature.
+- **SPEC-0107:** only **Phase 0** is complete: the ai-memory provenance snapshot,
+  license and upstream lineage are vendored. Phase 1 (native SQLite/FTS5
+  integration) remains pending.
+
+`crates/neural-core/tests/spec_010x_acceptance.rs` has cases numbered through
+SPEC-0107, but the SPEC-0107 case proves only Phase 0 provenance. It must not be
+used as evidence that the later storage/retrieval phases are implemented.
 
 Future changes MUST NOT silently violate the existing product charter,
 performance budget, privacy guarantees or threat model.
