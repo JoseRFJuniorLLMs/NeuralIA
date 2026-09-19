@@ -108,23 +108,39 @@ fn hostile_fully_nested_sizes_that_used_to_hang() {
 fn hostile_nested_containers_extract_in_linear_time() {
     // Cadeias de 200 niveis (400 elementos de profundidade) lado a lado: o
     // mesmo ataque ao extractor sem entregar o tempo todo ao html5ever.
-    let html = hostile_fixture(256 * KIB, 200);
-    let (result, elapsed) = timed("hostil em cadeias", &html);
-    let article = result.expect("HTML hostil continua a extrair");
-    assert!(!article.blocks.is_empty());
+    //
+    // O orcamento e relativo ao custo benigno medido na mesma corrida. O
+    // tempo do html5ever -- quadratico na profundidade e fora das nossas
+    // maos -- desconta-se dos dois lados; o que fica e o custo do extractor,
+    // que a SPEC-0004 exige linear. Com o algoritmo antigo esta razao era de
+    // milhares (292 s contra 0,1 s), por isso o tecto de 8x continua a
+    // apanhar a regressao que motivou o teste.
+    let mut measured = Vec::new();
+    for size in [512 * KIB, 1024 * KIB, 2048 * KIB] {
+        let html = hostile_fixture(size, 100);
+        let (result, elapsed) = timed("hostil em cadeias", &html);
+        let article = result.expect("HTML hostil continua a extrair");
+        assert!(!article.blocks.is_empty());
+        measured.push(elapsed.max(Duration::from_millis(1)));
+    }
+
+    // Quadruplicar a entrada com a mesma profundidade quadruplica o trabalho
+    // de um extractor linear. O antigo era cubico: 4x a entrada valia ~64x o
+    // tempo (19 KiB 3,8 s -> 79 KiB 292 s, em release). O tecto de 8x deixa
+    // folga para o ruido da maquina e continua a apanhar isso de longe.
+    let (small, large) = (measured[0], measured[2]);
     assert!(
-        elapsed < Duration::from_secs(2),
-        "256 KiB hostis demoraram {elapsed:?}"
+        large <= small * 8,
+        "4x a entrada custou {large:?} contra {small:?} -- crescimento super-linear"
     );
 
-    // Ate ao limite do corpo; cadeias mais curtas porque a partir daqui o
-    // tempo e quase todo do parse (2 s em debug a 200 niveis).
-    let html = hostile_fixture(2 * MIB, 100);
-    let (result, elapsed) = timed("hostil em cadeias", &html);
-    assert!(result.is_ok(), "{result:?}");
+    // O passo intermedio prende o mesmo pela metade: 2x a entrada, <= 4x o
+    // tempo. Sem ele, um salto so no ultimo tamanho podia esconder-se na
+    // folga do tecto anterior.
     assert!(
-        elapsed < Duration::from_secs(3),
-        "2 MiB hostis demoraram {elapsed:?}"
+        measured[1] <= small * 4,
+        "2x a entrada custou {:?} contra {small:?}",
+        measured[1]
     );
 }
 

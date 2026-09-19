@@ -681,6 +681,19 @@ impl MemoryStore {
         )
     }
 
+    /// Quantos documentos estao guardados, sem abrir nenhum.
+    fn document_file_count(&self) -> io::Result<usize> {
+        let Ok(entries) = fs::read_dir(self.documents_dir()) else {
+            return Ok(0);
+        };
+        Ok(entries
+            .flatten()
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+            })
+            .count())
+    }
+
     fn write_index_manifest(&self) -> io::Result<()> {
         #[derive(Serialize)]
         struct Manifest {
@@ -694,7 +707,11 @@ impl MemoryStore {
         let manifest = Manifest {
             schema: MEMORY_SCHEMA_VERSION,
             generated_at: unix_seconds(),
-            documents: self.documents()?.len(),
+            // Contar ficheiros, nao desserializar o corpus todo: este
+            // manifesto escreve-se a cada captura e o numero e o unico campo
+            // que dependia do conteudo. Documentos privados nunca chegam a
+            // ser escritos (ver `capture`), por isso a contagem e a mesma.
+            documents: self.document_file_count()?,
             sqlite: "rusqlite-v01-derived",
             retrieval: ["lexical", "entity", "graph", "semantic"],
         };

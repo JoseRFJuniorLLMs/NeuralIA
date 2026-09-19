@@ -511,7 +511,14 @@ pub(super) fn upsert(
     }
     upsert_page_base(&transaction, document)?;
     replace_relations(&transaction, document)?;
-    validate_integrity(&transaction)?;
+    // Sem `validate_integrity` aqui: o `PRAGMA integrity_check` percorre a
+    // base inteira e as contagens varrem as duas tabelas, por isso guardar um
+    // documento custava O(corpus) -- 10 ms com a base vazia, 217 ms com 1500
+    // paginas, e a subir. A captura acontece a cada navegacao numa fila de
+    // 128: com o corpus a crescer, a fila satura e as capturas passam a ser
+    // deitadas fora. A prova de que ESTA escrita ficou no sitio e o
+    // `knowledge_page` relido dentro da transaccao (`upsert_page_base`); a
+    // verificacao da base toda pertence ao `rebuild`, que ja a faz.
     transaction.commit().map_err(io_error)
 }
 

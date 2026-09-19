@@ -6125,8 +6125,16 @@ fn agent_trace_action(action: &AgentAction) -> String {
     }
 }
 
+/// Percent-encoding para dentro de um literal JS que a pagina le com
+/// `decodeURIComponent`. O serializador de formularios escreve o espaco como
+/// `+` e `decodeURIComponent` nao o desfaz: um `+` aqui era um `+` escrito no
+/// campo, e um nome com espacos nunca batia com o do DOM -- o guard do script
+/// desistia em silencio e a accao do agente nao acontecia. Um `+` literal ja
+/// chega como `%2B`, por isso os que sobram sao todos espacos.
 fn js_percent(value: &str) -> String {
-    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+    url::form_urlencoded::byte_serialize(value.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20")
 }
 
 fn agent_action_script(action: &AgentAction) -> Result<String, String> {
@@ -6165,6 +6173,9 @@ fn agent_action_script(action: &AgentAction) -> Result<String, String> {
     ))
 }
 
+/// Tecto do texto de um artigo que entra na memoria semantica.
+const READER_MEMORY_MAX_BYTES: usize = 512 * 1024;
+
 fn reader_article_memory_text(article: &ReaderArticle) -> String {
     let mut output = String::new();
     if let Some(excerpt) = &article.excerpt {
@@ -6184,7 +6195,16 @@ fn reader_article_memory_text(article: &ReaderArticle) -> String {
             output.push_str("\n\n");
         }
     }
-    output.truncate(output.len().min(512 * 1024));
+    // `String::truncate` num indice que cai a meio de um UTF-8 entra em
+    // panico -- e um artigo longo com acentos e o caso normal, nao o raro.
+    // Recua-se ate a fronteira de char anterior antes de cortar.
+    if output.len() > READER_MEMORY_MAX_BYTES {
+        let mut cut = READER_MEMORY_MAX_BYTES;
+        while cut > 0 && !output.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        output.truncate(cut);
+    }
     output
 }
 
@@ -8149,6 +8169,59 @@ mod tests {
         assert!(!typed.contains("synthetic-secret-value"));
         assert!(!selected.contains("synthetic-secret-option"));
         assert!(typed.contains("chars=22"));
+    }
+
+    #[test]
+    fn agent_script_encodes_spaces_as_percent_twenty() {
+        // `decodeURIComponent` nao converte '+' em espaco. Um '+' aqui e um
+        // '+' escrito no campo, e um nome que nunca bate com o do DOM: o
+        // guard do script desiste em silencio e a accao nao acontece.
+        let target = AgentElement {
+            id: "agent-7".into(),
+            generation: 1,
+            role: "textbox".into(),
+            name: "Search the site".into(),
+            text: String::new(),
+            origin: "https://example.com".into(),
+            frame: "top".into(),
+            visible: true,
+            interactable: true,
+        };
+        let script = agent_action_script(&AgentAction::TypeText {
+            target,
+            text: "duas palavras".into(),
+            field: FieldKind::Text,
+        })
+        .expect("TypeText e executavel pela bridge");
+
+        assert!(
+            script.contains("decodeURIComponent('Search%20the%20site')"),
+            "{script}"
+        );
+        assert!(
+            script.contains("decodeURIComponent('duas%20palavras')"),
+            "{script}"
+        );
+        assert!(!script.contains("Search+the+site"), "{script}");
+        assert!(!script.contains("duas+palavras"), "{script}");
+    }
+
+    #[test]
+    fn reader_memory_text_cuts_on_char_boundary() {
+        // 512 KiB caem a meio de um caractere de dois bytes quando o corpo
+        // comeca num offset impar: `String::truncate` nesse indice entra em
+        // panico e leva a aplicacao inteira.
+        let article = ReaderArticle {
+            source_url: "https://example.com/artigo".into(),
+            title: "Artigo".into(),
+            byline: None,
+            excerpt: Some("a".into()),
+            blocks: vec![ReaderBlock::Paragraph("ç".repeat(400_000))],
+        };
+
+        let text = reader_article_memory_text(&article);
+        assert!(text.len() <= 512 * 1024, "{}", text.len());
+        assert!(text.starts_with("a\n\n"));
     }
 
     #[test]
