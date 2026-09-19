@@ -1302,7 +1302,7 @@ impl MemoryWorker {
                                 }
                                 MemoryCommand::Clear => {
                                     let _ = proxy.send_event(UserEvent::MemoryCleared(Err(
-                                        error.to_string(),
+                                        error.to_string()
                                     )));
                                 }
                                 _ => {}
@@ -4548,12 +4548,12 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ClearHistory => {
                 self.memory.clear();
                 match self.history.clear() {
-                None => {
-                    self.show_home();
-                    self.status = Some("A apagar o histórico local…".to_string());
-                    self.request_redraw();
-                }
-                Some(result) => self.report_history_cleared(result),
+                    None => {
+                        self.show_home();
+                        self.status = Some("A apagar o histórico local…".to_string());
+                        self.request_redraw();
+                    }
+                    Some(result) => self.report_history_cleared(result),
                 }
             }
             UserEvent::HistoryCleared(result) => self.report_history_cleared(result),
