@@ -695,8 +695,17 @@ pub(super) fn candidate_ids(
     limit: usize,
 ) -> io::Result<Vec<String>> {
     let terms = super::tokenize(query_text);
-    if terms.is_empty() || !path.exists() {
+    if terms.is_empty() {
         return Ok(Vec::new());
+    }
+    if !path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "semantic candidate index is missing at {}; rebuild the memory index",
+                path.display()
+            ),
+        ));
     }
 
     // Cada termo entra com os seus equivalentes conhecidos. Sem isto, a ponte

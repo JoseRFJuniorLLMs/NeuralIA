@@ -179,6 +179,28 @@ The user can stop an agent immediately.
 Stopping prevents new actions, cancels queued actions where possible and
 returns manual control.
 
+## 10.1. Native policy boundary implemented
+
+The native policy exposes the four permission classes explicitly as
+`CapabilityClass::{AReadOnly,BReversible,CSensitive,DRestricted}`. Every
+`AgentSecurityAction` maps to one class before a policy decision is recorded.
+
+Class B authority is a session grant and is revoked by the kill switch. Class C
+may proceed only after a positive one-action user confirmation. Class D remains
+human-only even after a positive confirmation record; the confirmation is
+audited but never becomes autonomous authority.
+
+`redact_sensitive_text` is the shared model/storage firewall for textual
+context. It removes authorization/cookie material, password/OTP/token forms,
+API/client secrets and payment-card/CVV/CVC forms before those strings are
+persisted or handed to reference planner context. The browser still must avoid
+creating general profile/credential tools; redaction is defense in depth, not
+permission to expose those sources.
+
+The kill switch is fail-closed: `stop()` blocks all subsequent policy
+decisions and revokes reversible-session and extra-origin grants. A later
+`resume()` does not silently restore those grants.
+
 ## 11. Acceptance criteria
 
 Agent execution is forbidden from release until:

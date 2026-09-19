@@ -336,14 +336,28 @@ impl MemoryStore {
         }
 
         let candidate_limit = query.limit.clamp(1, 100).saturating_mul(16).min(512);
-        let candidate_ids = sqlite_v01::candidate_ids(
+        let candidate_ids = match sqlite_v01::candidate_ids(
             &self.sqlite_path(),
             query_text,
             query.provider.as_deref(),
             query.session_id.as_deref(),
             candidate_limit,
-        )
-        .unwrap_or_default();
+        ) {
+            Ok(ids) => ids,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && self.document_file_count()? == 0 =>
+            {
+                Vec::new()
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "semantic candidate index unavailable; run memory:rebuild before retrying: {error}"
+                    ),
+                ));
+            }
+        };
 
         let used_sqlite_candidates = !candidate_ids.is_empty();
         let docs = if candidate_ids.is_empty() {
@@ -1012,6 +1026,56 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].provider.as_deref(), Some("Claude"));
         assert!(hits[0].matched_by.iter().any(|source| source == "lexical"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_reports_missing_sqlite_index_instead_of_silent_full_scan() {
+        let root = temp_root("missing-candidate-index");
+        let store = MemoryStore::new(&root).unwrap();
+        store
+            .capture(MemoryDocument::new(
+                MemoryKind::Source,
+                MemorySourceKind::Reader,
+                "Index visibility",
+                None,
+                "semantic candidate fallback must never be silent",
+            ))
+            .unwrap();
+
+        fs::remove_file(store.sqlite_path()).unwrap();
+        let error = store
+            .query(&MemoryQuery::new("semantic candidate"))
+            .expect_err("missing derived index must be visible to the caller");
+        let message = error.to_string();
+        assert!(message.contains("candidate index"), "{message}");
+        assert!(message.contains("rebuild"), "{message}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_reports_corrupt_sqlite_index_instead_of_silent_full_scan() {
+        let root = temp_root("corrupt-candidate-index");
+        let store = MemoryStore::new(&root).unwrap();
+        store
+            .capture(MemoryDocument::new(
+                MemoryKind::Source,
+                MemorySourceKind::Reader,
+                "Corrupt index visibility",
+                None,
+                "corrupt sqlite must not silently change retrieval semantics",
+            ))
+            .unwrap();
+
+        fs::write(store.sqlite_path(), b"not a sqlite database").unwrap();
+        let error = store
+            .query(&MemoryQuery::new("corrupt sqlite"))
+            .expect_err("corrupt derived index must be visible to the caller");
+        let message = error.to_string();
+        assert!(message.contains("candidate index"), "{message}");
+        assert!(message.contains("rebuild"), "{message}");
 
         let _ = fs::remove_dir_all(root);
     }
