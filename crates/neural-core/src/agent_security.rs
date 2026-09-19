@@ -1,8 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    fs, io,
-    path::Path,
-};
+use std::{collections::BTreeSet, fs, io, path::Path};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -252,11 +248,7 @@ impl AgentPermissionPolicy {
         }
     }
 
-    pub fn record_user_confirmation(
-        &mut self,
-        action: &AgentSecurityAction,
-        approved: bool,
-    ) {
+    pub fn record_user_confirmation(&mut self, action: &AgentSecurityAction, approved: bool) {
         let risk = action.risk();
         self.sequence = self.sequence.saturating_add(1);
         self.audit.push(AuditEntry {
@@ -472,10 +464,8 @@ mod tests {
 
     #[test]
     fn audit_log_can_be_persisted_without_secret_values() {
-        let root = std::env::temp_dir().join(format!(
-            "neuralia-agent-audit-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("neuralia-agent-audit-{}", std::process::id()));
         let path = root.join("audit.json");
         let mut policy = AgentPermissionPolicy::new(Some("https://example.com".into()));
         let _ = policy.evaluate(&AgentSecurityAction::TypeText {
