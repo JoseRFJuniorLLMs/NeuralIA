@@ -998,10 +998,7 @@ mod tests {
         assert!(report.rebuilt);
 
         let manifest = fs::read_to_string(root.join("db").join("index-manifest.json")).unwrap();
-        assert!(manifest.contains(&format!(
-            "\"schema\": {}",
-            MEMORY_SCHEMA_VERSION
-        )));
+        assert!(manifest.contains(&format!("\"schema\": {}", MEMORY_SCHEMA_VERSION)));
 
         let _ = fs::remove_dir_all(root);
     }
