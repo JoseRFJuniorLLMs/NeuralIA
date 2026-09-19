@@ -45,6 +45,10 @@ The browser remains infrastructure. The product is the research workflow.
 | [SPEC-0106](SPEC-0106-execution-roadmap.md) | Implementation order and release gates | 1.7 → 2.0 |
 | [SPEC-0107](SPEC-0107-ai-memory-native-integration.md) | Native import/adaptation of ai-memory into NeuralIA memory crates | 1.7–1.9 |
 
+A matriz que responde explicitamente “este teste exercita o caminho que
+embarca?” está em
+[AUDIT-SPEC-0100-0108](AUDIT-SPEC-0100-0108.md).
+
 ## Implementation status
 
 - **SPEC-0100–0101:** implemented baselines; core behavior and the shipped
