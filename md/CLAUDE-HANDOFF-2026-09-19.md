@@ -81,6 +81,51 @@ quando a Fase 1 começar; decisão bundled vs system fica para o PR com mediçã
   da 2.0.1.
 - #10: update download-artifact ainda relevante, mesma estratégia.
 
+## Auditoria de apoio 0104/0105 criada enquanto Claude estava parado
+
+PR #15: `feat/agent-security-audit-prep`.
+
+Esse PR não substitui a revisão independente. Ele reduz o trabalho de triagem e
+traz reproduções ignoradas para findings conhecidos.
+
+Prioridades novas para o retorno:
+
+1. **CRITICAL:** `AgentOutcome::NeedsApproval` pode carregar
+   `AgentAction::TypeText` com password/OTP/card em claro, e
+   `save_agent_outcome()` serializa o outcome inteiro.
+2. O planner do `AgentRuntime` recebe `ObservedPage` sem fronteira tipada de
+   sanitização obrigatória.
+3. Element refs validam generation, não membership/autenticidade.
+4. O grant reversível é booleano/global e não é revogado por origin.
+5. O binário usa `BrowserAgentState`, não o `AgentRuntime` provado pelo
+   acceptance gate.
+6. Classificação de click sensível depende de keywords do label.
+7. O executor re-resolve o alvo em JS no realm controlado pela página usando
+   `data-neuralia-agent-id`.
+8. Escape/Home chama `finish_agent(false)` e perde o audit trail do stop.
+
+Os detalhes e reproduções estão no PR #15. Nenhum runtime sensível foi alterado.
+
+## SPEC-0108 — inventário real
+
+No candidato 2.0.1 foram encontrados **25** canais/ações reais `neuralia:`, e
+não 23. O checklist do PR #15 registra o inventário completo e separa os canais
+de dados (`agent-observation`, `research-answer`, `gmail-state`) das ações
+de UI.
+
+## SPEC-0107 — revisão do V01
+
+O PR #13 agora inclui `SPEC-0107-phase1-schema-review.md`.
+
+Antes de implementar:
+
+- aplicar WAL/synchronous **antes** da transaction de schema;
+- corrigir UNIQUE de entidade quando `entity_type IS NULL`;
+- impedir `memory_feedback` órfão;
+- congelar schema hash/embedding encoding/tombstone normalization.
+
+Os triggers FTS5 do desenho foram validados para insert/update/delete.
+
 ## O que preciso do Claude quando voltar
 
 1. concluir/publicar a auditoria 2.0.1 e o relatório 0104/0105;
