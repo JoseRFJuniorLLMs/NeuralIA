@@ -5,6 +5,12 @@ All notable changes to NeuralIA are documented here.
 ## [Unreleased]
 
 ### Security
+- **PR #54 — SPEC-0104 passa a aplicar classes A/B/C/D em código nativo.**
+  `CapabilityClass` deixa explícito o nível de autoridade; confirmação positiva
+  pode autorizar Classe C, mas nunca transforma Classe D em ação autônoma.
+  `stop()` revoga o grant reversível e origens extras antes de qualquer
+  `resume()`, e o firewall textual cobre formas adicionais de senha, API/client
+  secret e dados de cartão.
 - **SPEC-0108 / PR #24:** superfícies WebView remotas deixam de transportar a
   capability em URLs `neuralia:?cap=...` e passam a usar mensagens WebView2
   autenticadas por capability por WebView. O parser aceita somente o envelope
@@ -21,6 +27,11 @@ All notable changes to NeuralIA are documented here.
 - Revisão adversarial independente e release 2.1.0 permanecem pendentes.
 
 ### Fixed
+- **PR #54 — falhas do shortlist SQLite deixam de virar full scan silencioso.**
+  Com corpus existente, índice ausente, corrompido ou impossível de abrir chega
+  ao chamador como erro com instrução para `memory:rebuild`; só um perfil
+  realmente vazio aceita ainda não ter índice. O gate inclui falha portátil de
+  abertura, sem depender de locking específico de Windows.
 - **Reader derrubava a janela** em artigos longos com acentos: o texto que vai
   para a memória era cortado com `String::truncate` num índice de byte, e 512
   KiB caem a meio de um UTF-8 quando o corpo começa em offset ímpar. O corte
