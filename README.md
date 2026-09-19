@@ -229,7 +229,7 @@ it at any time. EPUB is not supported: WebView2 does not open it.
 - [x] bounded authenticated WebView2 IPC with per-WebView capability
 - [x] HTTP integration tests
 - [x] CI Linux + Windows + RustSec
-- [x] immutable release workflow with CycloneDX SBOM + provenance attestation
+- [x] immutable release pipeline with CycloneDX SBOM + provenance attestation of the CI-tested binary
 - [x] CI startup/RAM/thread regression gate (product targets still measured separately)
 - [ ] Authenticode-signed Windows installer
 - [ ] macOS shell

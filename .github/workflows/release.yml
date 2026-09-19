@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  package:
     if: >
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_branch == 'main' &&
@@ -17,9 +17,8 @@ jobs:
       github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: windows-latest
     permissions:
+      actions: read
       contents: read
-      id-token: write
-      attestations: write
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       sha: ${{ steps.version.outputs.sha }}
@@ -41,11 +40,22 @@ jobs:
           $version = $line.Matches[0].Groups[1].Value
           "tag=v$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "sha=$env:TESTED_SHA" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-      - run: cargo test --locked -p neural-core
-      - run: cargo clippy --locked -p neural-core --all-targets -- -D warnings
-      - run: cargo clippy --locked -p neural-app --all-targets -- -D warnings
-      - name: Build exact CI-tested source
-        run: cargo build --locked -p neural-app --bin NeuralIA --release
+      - name: Download the exact binary measured by the triggering CI run
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: neuralia-windows-tested-${{ github.event.workflow_run.head_sha }}
+          path: ci-tested
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+      - name: Verify the CI-tested binary checksum
+        shell: pwsh
+        run: |
+          $line = (Get-Content ci-tested/NeuralIA.exe.sha256 -Raw).Trim()
+          $expected = ($line -split '\s+')[0].ToLower()
+          $actual = (Get-FileHash ci-tested/NeuralIA.exe -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) {
+            throw "CI-tested NeuralIA.exe checksum mismatch: expected $expected, got $actual"
+          }
       - name: Generate CycloneDX SBOM
         shell: pwsh
         run: |
@@ -55,7 +65,9 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/release/NeuralIA.exe dist/NeuralIA.exe
+          Copy-Item ci-tested/NeuralIA.exe dist/NeuralIA.exe
+          Copy-Item ci-tested/perf-home.json dist/perf-home.json
+          Copy-Item ci-tested/perf-cycles.json dist/perf-cycles.json
 
           $sbom = Get-ChildItem crates/neural-app -File -Filter "*.json" |
             Where-Object { $_.Name -match "bom|cdx|cyclonedx" } |
@@ -87,9 +99,6 @@ jobs:
           $hash = (Get-FileHash dist/NeuralIA.exe -Algorithm SHA256).Hash.ToLower()
           "$hash  NeuralIA.exe" | Out-File -Encoding ascii dist/NeuralIA.exe.sha256
           cargo metadata --locked --format-version 1 --no-deps | Out-File -Encoding utf8 dist/cargo-metadata.json
-      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
-        with:
-          subject-path: dist/NeuralIA.exe
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: NeuralIA-windows-x64-${{ steps.version.outputs.tag }}
@@ -97,26 +106,26 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
-    if: needs.build.result == 'success'
+    needs: package
+    if: needs.package.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ needs.build.outputs.sha }}
+          ref: ${{ needs.package.outputs.sha }}
           fetch-depth: 0
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          name: NeuralIA-windows-x64-${{ needs.build.outputs.tag }}
+          name: NeuralIA-windows-x64-${{ needs.package.outputs.tag }}
           path: dist
       - name: Create tag and stable release once
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.build.outputs.tag }}
-          TESTED_SHA: ${{ needs.build.outputs.sha }}
+          RELEASE_TAG: ${{ needs.package.outputs.tag }}
+          TESTED_SHA: ${{ needs.package.outputs.sha }}
         run: |
           set -euo pipefail
 

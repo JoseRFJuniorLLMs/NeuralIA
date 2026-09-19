@@ -4,6 +4,10 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -48,13 +52,38 @@ jobs:
       - name: WebView lifecycle regression gate
         shell: pwsh
         run: ./scripts/measure-cycles.ps1 -ExePath target/release/NeuralIA.exe -Cycles 5 -OutputPath perf-cycles.json
+      - name: Stage the exact tested release candidate
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ci-tested | Out-Null
+          Copy-Item target/release/NeuralIA.exe ci-tested/NeuralIA.exe
+          Copy-Item perf-home.json ci-tested/perf-home.json
+          Copy-Item perf-cycles.json ci-tested/perf-cycles.json
+          $hash = (Get-FileHash ci-tested/NeuralIA.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  NeuralIA.exe" | Out-File -Encoding ascii ci-tested/NeuralIA.exe.sha256
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: neuralia-home-performance
-          path: |
-            perf-home.json
-            perf-cycles.json
+          name: neuralia-windows-tested-${{ github.sha }}
+          path: ci-tested/
           if-no-files-found: error
+          retention-days: 7
+
+  attest-tested-binary:
+    needs: windows
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: neuralia-windows-tested-${{ github.sha }}
+          path: ci-tested
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: ci-tested/NeuralIA.exe
 
   dependency-audit:
     runs-on: ubuntu-latest
