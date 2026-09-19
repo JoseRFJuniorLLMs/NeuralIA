@@ -1056,9 +1056,11 @@ mod tests {
         let store = MemoryStore::new(&root).unwrap();
         let mut session = ResearchSession::new("forget me");
         session.id = "session-forget".into();
-        session
-            .save(root.join("sessions").join("session-forget.json"))
-            .unwrap();
+        let session_path = session.save(&root).unwrap();
+        assert_eq!(
+            session_path,
+            root.join("sessions").join("session-forget.json")
+        );
 
         store
             .capture(
