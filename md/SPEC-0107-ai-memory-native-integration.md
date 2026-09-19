@@ -1,7 +1,7 @@
 # SPEC-0107 — Integração Nativa do ai-memory no NeuralIA
 
-**Status:** Implementada — NeuralIA 2.0  
-**Alvo:** NeuralIA 1.7–1.9  
+**Status:** Fase 0 concluída — proveniência vendorizada; Fase 1 (SQLite/FTS5 nativo) pendente  
+**Alvo:** NeuralIA pós-2.1  
 **Upstream:** akitaonrails/ai-memory  
 **Licença upstream:** MIT  
 **Estratégia:** importar e adaptar código selecionado; não criar dependência obrigatória do produto ai-memory

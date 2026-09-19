@@ -11,6 +11,32 @@ use crate::Result;
 
 const DEFAULT_HISTORY_LIMIT: usize = 250;
 
+/// Tecto de cada campo de texto de uma entrada. A omnibox ja corta o que o
+/// utilizador escreve, mas os alvos vindos das paginas (redireccoes, `data:`
+/// enormes, titulos gerados) nunca passam por la: sem este tecto uma unica
+/// entrada de megabytes fica no ficheiro e e relida para memoria a cada
+/// `append`, que reescreve o historico inteiro.
+pub const MAX_FIELD_CHARS: usize = 2048;
+
+/// Corta na fronteira de CHAR e nunca na de byte: `String::truncate` num
+/// offset a meio de um UTF-8 entra em panico, e cortar por bytes partiria
+/// acentos e emojis ao meio.
+fn truncate_field(mut value: String) -> String {
+    // Caminho rapido: cada char ocupa pelo menos um byte, por isso um
+    // comprimento em bytes dentro do tecto garante que tambem esta em chars,
+    // sem percorrer a string.
+    if value.len() <= MAX_FIELD_CHARS {
+        return value;
+    }
+
+    // `nth(MAX)` da o offset do char seguinte ao ultimo que se mantem, ou seja
+    // o comprimento exacto dos primeiros MAX chars. `None` = ja cabia.
+    if let Some((offset, _)) = value.char_indices().nth(MAX_FIELD_CHARS) {
+        value.truncate(offset);
+    }
+    value
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HistoryKind {
     Ask,
@@ -35,8 +61,9 @@ impl HistoryEntry {
         Self {
             timestamp_unix,
             kind,
-            input: input.into(),
-            target: target.into(),
+            // Cortar na origem: o que nao entra aqui nunca chega ao ficheiro.
+            input: truncate_field(input.into()),
+            target: truncate_field(target.into()),
         }
     }
 }
@@ -142,11 +169,11 @@ impl HistoryStore {
         Ok(())
     }
 
+    /// Sem `path.exists()` antes do lock: entre o teste e a leitura o ficheiro
+    /// pode nascer ou ser substituido pelo `rename` do `append` (TOCTOU), e o
+    /// teste ficava de fora do lock que devia protege-lo. `read_entries` ja
+    /// trata o `NotFound` como historico vazio, por isso basta ler sempre.
     pub fn recent(&self, limit: usize) -> Result<Vec<HistoryEntry>> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
-
         let lock = self.acquire_lock(false)?;
         let read_result = (|| -> Result<Vec<HistoryEntry>> {
             let mut entries = self.read_entries()?;
@@ -179,10 +206,18 @@ impl HistoryStore {
     }
 }
 
+/// Corta tambem na leitura: um ficheiro escrito por uma versao anterior (ou
+/// a mao) traz campos sem tecto, e o `append` reescreve o que leu. Sem este
+/// corte o gigante sobrevivia a todas as gravacoes seguintes.
 fn parse_lines(content: &str) -> Vec<HistoryEntry> {
     content
         .lines()
         .filter_map(|line| serde_json::from_str::<HistoryEntry>(line).ok())
+        .map(|mut entry| {
+            entry.input = truncate_field(entry.input);
+            entry.target = truncate_field(entry.target);
+            entry
+        })
         .collect()
 }
 
@@ -307,6 +342,63 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].input, "ok");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn oversized_fields_are_truncated_on_creation() {
+        let entry = HistoryEntry::now(HistoryKind::Read, "a".repeat(10_000), "b".repeat(10_000));
+        assert_eq!(entry.input.chars().count(), MAX_FIELD_CHARS);
+        assert_eq!(entry.target.chars().count(), MAX_FIELD_CHARS);
+
+        // O que ja cabia nao pode ser tocado.
+        let small = HistoryEntry::now(HistoryKind::Ask, "curto", "google-ai");
+        assert_eq!(small.input, "curto");
+        assert_eq!(small.target, "google-ai");
+    }
+
+    #[test]
+    fn truncation_cuts_on_char_boundary() {
+        // Cada 'ç' sao dois bytes: cortar aos 2048 BYTES cairia a meio de um
+        // char e o `String::truncate` entraria em panico.
+        let entry = HistoryEntry::now(HistoryKind::Web, "ç".repeat(10_000), "https://example.com");
+        assert_eq!(entry.input.chars().count(), MAX_FIELD_CHARS);
+        assert!(entry.input.chars().all(|c| c == 'ç'));
+        assert_eq!(entry.input.len(), MAX_FIELD_CHARS * 2);
+    }
+
+    #[test]
+    fn oversized_fields_from_disk_are_truncated_on_read() {
+        let path = temp_history("oversized");
+        let line = format!(
+            "{{\"timestamp_unix\":1,\"kind\":\"Read\",\"input\":\"{}\",\"target\":\"{}\"}}\n",
+            "a".repeat(10_000),
+            "https://example.com/".to_string() + &"b".repeat(10_000)
+        );
+        fs::write(&path, line.as_bytes()).unwrap();
+
+        let store = HistoryStore::new(&path);
+        let got = store.recent(10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].input.chars().count(), MAX_FIELD_CHARS);
+        assert_eq!(got[0].target.chars().count(), MAX_FIELD_CHARS);
+
+        // E o corte tem de sobreviver ao ciclo ler-escrever do `append`.
+        store
+            .append(&HistoryEntry::now(HistoryKind::Ask, "depois", "alvo"))
+            .unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.lines().all(|line| line.len() < 6_000));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(sibling(&path, "lock"));
+    }
+
+    #[test]
+    fn recent_on_missing_file_is_empty() {
+        let path = temp_history("missing");
+        let store = HistoryStore::new(&path);
+        assert!(store.recent(10).unwrap().is_empty());
+        let _ = fs::remove_file(sibling(&path, "lock"));
     }
 
     #[test]

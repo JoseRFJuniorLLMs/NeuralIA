@@ -1,0 +1,178 @@
+# SPEC-0108 — Canal seguro página→nativo (IPC do WebView2)
+
+**Status:** Proposta — decisão arquitetural tomada pelo dono em 2026-09-19; implementação pendente  
+**Alvo:** NeuralIA 2.1  
+**Substitui:** o transporte por navegação `neuralia:` descrito em SPEC-0005 §"Native bridge boundary" (o modelo de confiança mantém-se; muda o transporte)  
+**Depende de:** SPEC-0005, SPEC-0006, SPEC-0015
+
+## 1. Problema
+
+Hoje uma página pede uma ação de interface navegando para
+`neuralia:<ação>?cap=<token>`; o handler de navegação nativo intercepta, valida o
+token por WebView e traduz num `UserEvent`. O token vive no closure dos scripts
+injetados, é gerado por `BCryptGenRandom`, comparado em tempo constante e
+transportado por funções nativas capturadas no *document-created*.
+
+Nada disso chega. O Chromium expõe a **Navigation API**: qualquer script da
+página pode registar
+
+```js
+navigation.addEventListener('navigate', e => exfiltrate(e.destination.url));
+```
+
+e ler a URL completa — token incluído — de **cada** ação que o utilizador
+dispara. O vazamento é por desenho do browser, não por erro nosso: um canal
+que passa pela barra de navegação é observável pela página. Com o token na mão,
+a página forja `neuralia:clearhistory`, `neuralia:devtools`, `neuralia:split`
+com qualquer URL, etc.
+
+Alternativa rejeitada: `delete window.navigation` no *document-created*. Parte
+SPAs que usem a API e é contornável (um `iframe` `about:blank` criado antes de o
+nosso script correr nele, `Object.getOwnPropertyDescriptor` no protótipo,
+`document.open()`). Um remendo que se contorna não é uma fronteira.
+
+## 2. Decisão
+
+O transporte passa a ser a **mensagem do WebView2**
+(`window.chrome.webview.postMessage`, recebida no nativo pelo
+`WebViewBuilder::with_ipc_handler` do wry 0.57, que entrega
+`Request<String>` com o corpo e a URL do frame emissor).
+
+Propriedades que motivam a escolha:
+
+- **Não observável pela página.** Não existe evento que exponha mensagens
+  enviadas por outro script do mesmo mundo; a Navigation API não se aplica.
+- **Não cria superfície nova.** `chrome.webview` existe em todo o WebView2, com
+  ou sem handler; sem handler as mensagens são descartadas. A página já podia
+  chamar `postMessage`; continua a poder — e continua sem token.
+- **O modelo de confiança é o mesmo.** Token por WebView, no closure, gerado
+  pelo CSPRNG do SO, comparado em tempo constante, transportado por uma
+  referência capturada no *document-created*. Só muda o meio.
+
+A frase de SPEC-0005 "there is no IPC object" passa a
+"there is no IPC with ambient authority": existe um canal de mensagens,
+limitado a ações de interface, e cada mensagem tem de provar posse do token.
+
+## 3. Protocolo
+
+### 3.1 Mensagem
+
+Uma string JSON, sempre com estes campos e nenhum outro obrigatório:
+
+```json
+{ "v": 1, "cap": "<32 hex>", "action": "<nome>", "args": { } }
+```
+
+- `v` — versão do protocolo; mensagens com outra versão são ignoradas.
+- `cap` — o token do WebView (32 hex). Comparação em tempo constante.
+- `action` — um nome da lista fechada de SPEC-0005 (`home`, `back`, `restore`,
+  `autoscroll`, `zoomin`, `zoomout`, `zoomreset`, `reload`, `print`, `omnibox`,
+  `history`, `clearhistory`, `fullscreen`, `devtools`, `viewsource`, `newtab`,
+  `expand`, `minimize`, `split`, `split-close`, `split-expand`, `palette`,
+  `gmail-state`). Nome fora da lista → ignorado.
+- `args` — objeto com os parâmetros da ação (`col`, `url`, `count`, `sender`,
+  `subject`, `key`), com os mesmos limites de hoje (índices validados contra
+  `COMPARATOR_COLUMNS`; `url` passa por `validate_web_url` e pela política de
+  rede local da superfície; strings truncadas a 180/2048 chars).
+
+Tamanho máximo da mensagem: 8 KiB. Acima disso é descartada sem parse.
+
+### 3.2 Lado da página
+
+Cada script injetado captura, no *document-created*, antes de qualquer script
+da página:
+
+```js
+const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
+const capability = '__NEURALIA_CAP__';
+function act(action, args) {
+  post(JSON.stringify({ v: 1, cap: capability, action, args: args || {} }));
+}
+```
+
+`JSON.stringify` também é capturado (`const stringify = JSON.stringify`).
+Nenhum script usa `window.ipc` (global do wry, envenenável pela página antes
+de ser lido tarde) nem `location.href` para ações.
+
+Todos os handlers que chamam `act` continuam a exigir `event.isTrusted`.
+
+### 3.3 Lado nativo
+
+- Um `with_ipc_handler` por WebView (external, comparador ×3, split, Gmail),
+  cada um com o seu token no closure, exatamente como hoje os handlers de
+  navegação.
+- O handler: rejeita corpo > 8 KiB; faz parse; rejeita `v != 1`; compara `cap`
+  em tempo constante; mapeia `action`/`args` para o `UserEvent` correspondente
+  com as mesmas validações de hoje; qualquer falha é silenciosa (sem log de
+  conteúdo da página).
+- A URL do frame emissor (`request.uri()`) é registada no diagnóstico mas **não
+  é autoridade**: o token é o que conta.
+- Os handlers de navegação deixam de aceitar `neuralia:` nas superfícies web
+  (external, comparador, split, Gmail). Um `neuralia:` vindo dessas superfícies
+  passa a ser negado e registado como tentativa.
+
+### 3.4 Exceção: Reader e visualizador de PDF
+
+O Reader é HTML nosso, servido com `script-src 'none'`: não há script que possa
+chamar `postMessage`, e não há script de terceiros que possa observar a
+navegação. Os seus botões continuam a ser `href="neuralia:home"` e
+`href="neuralia:web?url=…"` **sem token**, aceites apenas pelo handler de
+navegação do Reader (que já rejeita tudo o resto). O visualizador de PDF
+(`neuralia-pdf.localhost`, PDF.js nosso) usa o canal de mensagens como as
+outras superfícies, porque tem script próprio.
+
+## 4. Impacto nas specs existentes
+
+| Spec | Frase de hoje | Passa a |
+|---|---|---|
+| SPEC-0005 §Native bridge boundary | "There is no IPC object. … The only page-to-native channel is the internal `neuralia:` scheme" | "There is no IPC with ambient authority. The page-to-native channel is a WebView2 message carrying a per-WebView capability; the `neuralia:` scheme survives only inside the script-free Reader" |
+| SPEC-0005 (token) | "carried using native functions … so poisoning globals neither steals the token nor corrupts the URL" | "carried by `chrome.webview.postMessage` captured at document-created; the Navigation API cannot observe it" |
+| SPEC-0006 §Full Web | "Top-level navigation … plus the internal intercepted `neuralia:` actions" | "`neuralia:` is accepted only from the Reader; web surfaces use the message channel" |
+| SPEC-0015 §Controls | linha do capability | acrescentar "message transport not observable by page script (Navigation API leak closed)" |
+| SECURITY.md | parágrafo do canal | reescrever conforme acima |
+
+Nenhuma destas frases muda antes de o código e os testes existirem (AGENTS.md §3).
+
+## 5. Critérios de aceitação
+
+A SPEC-0108 só passa a "Implementada" quando, no CI:
+
+1. Teste unitário do parser de mensagens: rejeita corpo > 8 KiB, `v != 1`,
+   `cap` ausente/errado/com comprimento diferente, `action` fora da lista,
+   `args` com tipos errados; aceita cada uma das 23 ações com `args` válidos.
+2. Teste: nenhuma constante de script injetado contém `location.href = 'neuralia:`
+   nem `neuralia:` + `?cap=` — exceto no HTML do Reader (`render.rs`), que não
+   pode conter `cap` de todo.
+3. Teste: todos os scripts que enviam ações capturam `chrome.webview.postMessage`
+   e `JSON.stringify` no topo (padrão já verificado por
+   `injected_scripts_capture_globals_before_the_page_runs`; estender).
+4. Teste: os handlers de navegação das superfícies web recusam `neuralia:`.
+5. Teste de comparação em tempo constante (já existe; manter).
+6. Revisão adversarial independente (AGENTS.md §4 e §7): tentar, com script de
+   página, (a) ler o token, (b) forjar uma ação sem token, (c) disparar uma ação
+   com evento sintético, (d) usar um `iframe` para contornar a captura. As
+   quatro têm de falhar.
+
+## 6. Plano de implementação
+
+1. `fn parse_ipc_message(body: &str, expected_cap: &str) -> Option<IpcAction>`
+   pura, em `windows_app.rs` (ou módulo novo `ipc.rs` no `neural-app`), com os
+   testes do §5.1.
+2. Trocar `act()` e todos os `location.href = 'neuralia:…'` dos scripts
+   injetados pelo `post(...)` do §3.2, um script de cada vez, mantendo
+   `isTrusted`.
+3. Acrescentar `with_ipc_handler` aos builders external/comparator/split/Gmail/
+   PDF, reutilizando o token e o `proxy` que hoje vão para o handler de
+   navegação.
+4. Fechar `neuralia:` nos handlers de navegação dessas superfícies.
+5. Atualizar as specs conforme §4, no mesmo commit em que os testes passam.
+6. Revisão adversarial; gate; release **2.1.0** (mudança de canal interno —
+   *minor*, não *patch*).
+
+## 7. O que não muda
+
+- Lista de ações e as suas validações.
+- Palette nativa (SPEC-0005): a página só pede a abertura.
+- `isTrusted` obrigatório.
+- Token por WebView, CSPRNG, tempo constante, closure.
+- Reader sem script e sem token.
