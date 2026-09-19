@@ -560,10 +560,7 @@ pub(super) fn candidate_ids(
 
     let match_query = terms
         .into_iter()
-        .map(|term| {
-            let escaped = term.replace('"', """");
-            format!("\"{escaped}\"*")
-        })
+        .map(|term| format!("\"{term}\"*"))
         .collect::<Vec<_>>()
         .join(" OR ");
     let candidate_limit = limit.clamp(1, 512) as i64;
