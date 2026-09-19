@@ -70,6 +70,13 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
 
     let value: Value = serde_json::from_str(body).ok()?;
     let object = value.as_object()?;
+    if object.len() != 4
+        || !["v", "cap", "action", "args"]
+            .iter()
+            .all(|key| object.contains_key(*key))
+    {
+        return None;
+    }
     if object.get("v")?.as_u64()? != 1 {
         return None;
     }
@@ -254,6 +261,14 @@ mod tests {
             .is_none()
         );
         assert!(parse_ipc_message(&"x".repeat(IPC_MAX_BYTES + 1), CAP, 3).is_none());
+        assert!(
+            parse_ipc_message(
+                &json!({"v":1,"cap":CAP,"action":"home","args":{},"extra":true}).to_string(),
+                CAP,
+                3
+            )
+            .is_none()
+        );
     }
 
     #[test]
