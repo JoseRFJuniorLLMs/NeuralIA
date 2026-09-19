@@ -303,6 +303,7 @@ struct BarLayout {
 }
 
 impl BarLayout {
+    #[cfg(test)]
     fn new(client_width: f64, scale: f64, visible: bool, columns: usize) -> Self {
         Self::with_contexts(
             client_width,
@@ -4055,6 +4056,7 @@ fn draw_comparator_bar(
 /// Todo o desenho da barra de topo, num DC qualquer — o ecra em producao, um
 /// bitmap em memoria nos testes, que e como este visual se inspeciona sem ecra.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 unsafe fn paint_comparator_bar(
     target: *mut core::ffi::c_void,
     width: i32,
