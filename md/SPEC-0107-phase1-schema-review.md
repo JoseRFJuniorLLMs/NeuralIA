@@ -295,6 +295,115 @@ Não guardar bytes cuja interpretação depende de conhecimento tribal de 2026.
 
 ---
 
+## S-09 — session_id órfão pode quebrar a migração por FK
+
+**Severidade:** alta para migration/rebuild.
+
+O tipo atual permite:
+
+```rust
+MemoryDocument::new(...).session("qualquer-id")
+```
+
+Não existe constraint no JSON que garanta que
+`memory/sessions/<id>.json` exista.
+
+No V01:
+
+```sql
+knowledge_page.research_session_id
+  REFERENCES research_session(id)
+  ON DELETE SET NULL
+```
+
+A própria estratégia de migração diz para criar `research_session` somente
+para sessões reais existentes. Logo um documento legado com `session_id`
+órfão causaria foreign-key failure se o ID for copiado cegamente.
+
+### Regra necessária
+
+Na importação de cada documento:
+
+```text
+session_id exists in imported research_session
+    -> preserve FK
+otherwise
+    -> insert knowledge_page.research_session_id = NULL
+    -> audit orphan_session_reference {page_id, legacy_session_id}
+```
+
+Nunca fabricar uma sessão falsa apenas para satisfazer a FK.
+
+O JSON legado continua preservando a referência original durante a Fase 1.
+
+### Teste obrigatório
+
+```text
+migration_with_orphan_session_id_succeeds_and_audits_reference
+```
+
+---
+
+## S-10 — V01 não representa ResearchItem/SynthesisSnapshot completos
+
+**Severidade:** design constraint, não blocker da Fase 1 derivada.
+
+O estado durável atual de uma `ResearchSession` contém:
+
+- `items: Vec<ResearchItem>`;
+- `syntheses: Vec<SynthesisSnapshot>`.
+
+Cada item preserva:
+
+- kind;
+- provider;
+- URL;
+- memory_id;
+- texto;
+- created_at.
+
+Cada synthesis preserva:
+
+- item_ids;
+- generator;
+- output;
+- created_at.
+
+O V01 possui `research_session` e `navigation_observation`, mas não uma
+representação lossless desses arrays.
+
+Isso é aceitável **somente enquanto os arquivos
+`memory/sessions/*.json` continuarem fonte durável** e SQLite for índice
+derivado.
+
+### Consequência
+
+A frase "inverter source of truth depois da Fase 1" não pode significar tornar
+esse V01 sozinho suficiente para reconstruir Research Sessions.
+
+Antes de qualquer inversão, escolher uma das duas arquiteturas:
+
+1. arquivos de ResearchSession permanecem fonte autoritativa permanentemente; ou
+2. uma migration futura adiciona tabelas lossless para research items e
+   synthesis snapshots.
+
+Não mapear `ResearchItem` para `navigation_observation` só porque os campos
+parecem parecidos. Uma resposta capturada/nota/síntese não é automaticamente
+telemetria de navegação.
+
+### Teste de arquitetura
+
+Enquanto V01 for derivado:
+
+```text
+delete_sqlite_then_rebuild_preserves_research_session_items_and_syntheses
+```
+
+A prova pode reconstruir o índice a partir dos arquivos, sem exigir que SQLite
+contenha todos os bytes.
+
+---
+
 # FTS5: resultado da validação
 
 O desenho atual usa external-content FTS:
@@ -394,6 +503,8 @@ Antes de implementar, corrigir:
 1. ordem dos PRAGMAs;
 2. identidade de `memory_entity` quando type é desconhecido;
 3. ownership constraint de `memory_feedback`;
-4. fluxo explícito de schema version/hash.
+4. tratamento de `session_id` órfão;
+5. fluxo explícito de schema version/hash;
+6. manter explícito que V01 não é fonte lossless de ResearchSession.
 
 O restante pode entrar incrementalmente com testes.
