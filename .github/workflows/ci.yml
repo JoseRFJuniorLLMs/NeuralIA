@@ -19,7 +19,13 @@ jobs:
           components: clippy,rustfmt
       - run: cargo fmt --all -- --check
       - run: cargo test --locked -p neural-core
+      # O parser do canal IPC (SPEC-0108) é portátil: compila e é testado aqui
+      # também, não só no runner Windows. É a superfície mais sensível do
+      # produto e não deve depender de um único sistema operativo para ter
+      # cobertura.
+      - run: cargo test --locked -p neural-app
       - run: cargo clippy --locked -p neural-core --all-targets -- -D warnings
+      - run: cargo clippy --locked -p neural-app --all-targets -- -D warnings
 
   windows:
     runs-on: windows-latest
