@@ -2049,9 +2049,7 @@ impl App {
             return;
         }
 
-        if was_expanded
-            && let Some(window) = &self.window
-        {
+        if was_expanded && let Some(window) = &self.window {
             window.set_fullscreen(None);
         }
 
