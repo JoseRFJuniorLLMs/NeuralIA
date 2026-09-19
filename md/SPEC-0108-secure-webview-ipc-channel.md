@@ -1,13 +1,13 @@
 # SPEC-0108 — Canal seguro página→nativo (IPC do WebView2)
 
-**Status:** Proposta — decisão arquitetural tomada pelo dono em 2026-09-19; implementação pendente  
+**Status:** Parcial — transporte IPC implementado e coberto por testes no PR #24; revisão adversarial independente e release 2.1 pendentes  
 **Alvo:** NeuralIA 2.1  
 **Substitui:** o transporte por navegação `neuralia:` descrito em SPEC-0005 §"Native bridge boundary" (o modelo de confiança mantém-se; muda o transporte)  
 **Depende de:** SPEC-0005, SPEC-0006, SPEC-0015
 
 ## 1. Problema
 
-Hoje uma página pede uma ação de interface navegando para
+Na baseline 2.0.1 uma página pedia uma ação de interface navegando para
 `neuralia:<ação>?cap=<token>`; o handler de navegação nativo intercepta, valida o
 token por WebView e traduz num `UserEvent`. O token vive no closure dos scripts
 injetados, é gerado por `BCryptGenRandom`, comparado em tempo constante e
@@ -40,8 +40,9 @@ O transporte passa a ser a **mensagem do WebView2**
 
 Propriedades que motivam a escolha:
 
-- **Não observável pela página.** Não existe evento que exponha mensagens
-  enviadas por outro script do mesmo mundo; a Navigation API não se aplica.
+- **Fora da Navigation API.** A mensagem não é navegação e, portanto, não
+  aparece em `navigation.navigate`/`destination.url`; o transporte capturado
+  no *document-created* não põe a capability numa URL observável.
 - **Não cria superfície nova.** `chrome.webview` existe em todo o WebView2, com
   ou sem handler; sem handler as mensagens são descartadas. A página já podia
   chamar `postMessage`; continua a poder — e continua sem token.
@@ -57,7 +58,7 @@ limitado a ações de interface, e cada mensagem tem de provar posse do token.
 
 ### 3.1 Mensagem
 
-Uma string JSON, sempre com estes campos e nenhum outro obrigatório:
+Uma string JSON, sempre com estes quatro campos e nenhum outro:
 
 ```json
 { "v": 1, "cap": "<32 hex>", "action": "<nome>", "args": { } }
@@ -69,11 +70,14 @@ Uma string JSON, sempre com estes campos e nenhum outro obrigatório:
   `autoscroll`, `zoomin`, `zoomout`, `zoomreset`, `reload`, `print`, `omnibox`,
   `history`, `clearhistory`, `fullscreen`, `devtools`, `viewsource`, `newtab`,
   `expand`, `minimize`, `split`, `split-close`, `split-expand`, `palette`,
-  `gmail-state`). Nome fora da lista → ignorado.
-- `args` — objeto com os parâmetros da ação (`col`, `url`, `count`, `sender`,
-  `subject`, `key`), com os mesmos limites de hoje (índices validados contra
-  `COMPARATOR_COLUMNS`; `url` passa por `validate_web_url` e pela política de
-  rede local da superfície; strings truncadas a 180/2048 chars).
+  `gmail-state`, `research-answer`, `agent-observation`). Nome fora da lista →
+  ignorado.
+- `args` — objeto com os parâmetros exatos da ação (`col`, `url`, `count`,
+  `sender`, `subject`, `key`, `text`, `data`). Campos extras ou tipos errados
+  são rejeitados; índices são validados contra `COMPARATOR_COLUMNS`; `url`
+  passa por `validate_web_url` e não pode pivotar para rede local; strings são
+  recusadas acima dos limites definidos (180/2048 chars e payload do observer
+  limitado antes da serialização).
 
 Tamanho máximo da mensagem: 8 KiB. Acima disso é descartada sem parse.
 
@@ -105,21 +109,22 @@ Todos os handlers que chamam `act` continuam a exigir `event.isTrusted`.
   em tempo constante; mapeia `action`/`args` para o `UserEvent` correspondente
   com as mesmas validações de hoje; qualquer falha é silenciosa (sem log de
   conteúdo da página).
-- A URL do frame emissor (`request.uri()`) é registada no diagnóstico mas **não
-  é autoridade**: o token é o que conta.
+- A URL associada ao `Request<String>` não é autoridade e não participa da
+  decisão: o token no closure do WebView é o que conta.
 - Os handlers de navegação deixam de aceitar `neuralia:` nas superfícies web
-  (external, comparador, split, Gmail). Um `neuralia:` vindo dessas superfícies
-  passa a ser negado e registado como tentativa.
+  (external, comparador, split, Gmail e PDF). Um `neuralia:` vindo dessas
+  superfícies é negado silenciosamente, sem logar conteúdo da página.
 
 ### 3.4 Exceção: Reader e visualizador de PDF
 
-O Reader é HTML nosso, servido com `script-src 'none'`: não há script que possa
-chamar `postMessage`, e não há script de terceiros que possa observar a
-navegação. Os seus botões continuam a ser `href="neuralia:home"` e
+O Reader é HTML nosso, servido com `script-src 'none'` para conteúdo da
+página: não executa JavaScript do site. Os seus botões continuam a ser
+`href="neuralia:home"` e
 `href="neuralia:web?url=…"` **sem token**, aceites apenas pelo handler de
-navegação do Reader (que já rejeita tudo o resto). O visualizador de PDF
-(`neuralia-pdf.localhost`, PDF.js nosso) usa o canal de mensagens como as
-outras superfícies, porque tem script próprio.
+navegação do Reader (que já rejeita tudo o resto). Os atalhos injetados pelo
+host no Reader usam IPC, sem mudar a exceção dos links internos. O visualizador
+de PDF (`neuralia-pdf.localhost`, PDF.js nosso) usa o canal de mensagens como
+as outras superfícies, porque tem script próprio.
 
 ## 4. Impacto nas specs existentes
 
@@ -139,7 +144,7 @@ A SPEC-0108 só passa a "Implementada" quando, no CI:
 
 1. Teste unitário do parser de mensagens: rejeita corpo > 8 KiB, `v != 1`,
    `cap` ausente/errado/com comprimento diferente, `action` fora da lista,
-   `args` com tipos errados; aceita cada uma das 23 ações com `args` válidos.
+   `args` com tipos errados; aceita cada uma das 25 ações com `args` válidos.
 2. Teste: nenhuma constante de script injetado contém `location.href = 'neuralia:`
    nem `neuralia:` + `?cap=` — exceto no HTML do Reader (`render.rs`), que não
    pode conter `cap` de todo.
@@ -165,9 +170,14 @@ A SPEC-0108 só passa a "Implementada" quando, no CI:
    PDF, reutilizando o token e o `proxy` que hoje vão para o handler de
    navegação.
 4. Fechar `neuralia:` nos handlers de navegação dessas superfícies.
-5. Atualizar as specs conforme §4, no mesmo commit em que os testes passam.
+5. Atualizar as specs conforme §4, no mesmo PR em que os testes passam.
 6. Revisão adversarial; gate; release **2.1.0** (mudança de canal interno —
    *minor*, não *patch*).
+
+### Estado do PR #24
+
+Os passos 1–5 estão implementados no PR #24. O passo 6 permanece pendente;
+por isso esta spec não usa o status **Implementada**.
 
 ## 7. O que não muda
 
