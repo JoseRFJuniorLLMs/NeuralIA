@@ -4739,16 +4739,14 @@ fn draw_comparator_bar(
             scale,
             &names,
             &comp.contexts,
-            comp.split
-                .as_ref()
-                .map(|split| {
-                    (
-                        split.source_index,
-                        split.url.as_str(),
-                        split.fullscreen,
-                        split.private,
-                    )
-                }),
+            comp.split.as_ref().map(|split| {
+                (
+                    split.source_index,
+                    split.url.as_str(),
+                    split.fullscreen,
+                    split.private,
+                )
+            }),
             visible,
             hover,
             auto_scroll,
@@ -4933,8 +4931,14 @@ unsafe fn paint_comparator_bar_with_contexts(
         let row_h = 30.0 * scale;
         let button_w = 78.0 * scale;
         let right = if active_context.is_some() {
-            width as f64 - margin - 30.0 * scale - 5.0 * scale - 30.0 * scale
-                - 5.0 * scale - 150.0 * scale - 6.0 * scale
+            width as f64
+                - margin
+                - 30.0 * scale
+                - 5.0 * scale
+                - 30.0 * scale
+                - 5.0 * scale
+                - 150.0 * scale
+                - 6.0 * scale
         } else {
             width as f64 - margin
         };
