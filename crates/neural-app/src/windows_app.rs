@@ -111,6 +111,7 @@ enum UserEvent {
         input: String,
     },
     ExpandComparator(usize),
+    MinimizeComparator(usize),
     RestoreComparator,
     ReaderReady {
         generation: u64,
@@ -479,6 +480,7 @@ struct SplitView {
 struct ComparatorState {
     views: Vec<ComparatorView>,
     expanded: Option<usize>,
+    minimized: [bool; COMPARATOR_COLUMNS],
     split: Option<SplitView>,
     /// Abas/fontes agrupadas automaticamente pela IA que abriu cada link.
     contexts: [Vec<String>; COMPARATOR_COLUMNS],
@@ -1937,6 +1939,7 @@ impl App {
         self.comparator = Some(ComparatorState {
             views,
             expanded: None,
+            minimized: [false; COMPARATOR_COLUMNS],
             split: None,
             contexts: std::array::from_fn(|_| Vec::new()),
         });
@@ -1958,6 +1961,21 @@ impl App {
         {
             self.close_split();
         }
+
+        if let Some(comp) = &mut self.comparator
+            && idx < comp.views.len()
+            && comp.minimized[idx]
+        {
+            comp.minimized[idx] = false;
+            comp.expanded = None;
+            self.bar_hover = None;
+            self.needs_clear = true;
+            self.update_comparator_layout();
+            self.sync_comparator_buttons();
+            self.request_redraw();
+            return;
+        }
+
         let mut restored = false;
         if let Some(comp) = &mut self.comparator
             && idx < comp.views.len()
@@ -1983,6 +2001,64 @@ impl App {
             }
         }
 
+        self.update_comparator_layout();
+        self.sync_comparator_buttons();
+        self.sync_exit_button();
+        self.request_redraw();
+    }
+
+    fn minimize_comparator(&mut self, idx: usize) {
+        if self.surface != Surface::Comparator {
+            return;
+        }
+
+        if self
+            .comparator
+            .as_ref()
+            .is_some_and(|comp| comp.split.is_some())
+        {
+            self.close_split();
+        }
+
+        let mut was_expanded = false;
+        let mut changed = false;
+        if let Some(comp) = &mut self.comparator
+            && idx < comp.views.len()
+        {
+            let visible = comp
+                .views
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !comp.minimized[*index])
+                .count();
+
+            // Mantemos sempre pelo menos uma IA visível.
+            if !comp.minimized[idx] && visible > 1 {
+                was_expanded = comp.expanded == Some(idx);
+                comp.expanded = None;
+                comp.minimized[idx] = true;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            self.show_splash(
+                "Pelo menos um painel precisa continuar visível.".to_string(),
+                2,
+            );
+            return;
+        }
+
+        if was_expanded
+            && let Some(window) = &self.window
+        {
+            window.set_fullscreen(None);
+        }
+
+        self.bar_hover = None;
+        self.chrome_revealed = false;
+        self.chrome_token = self.chrome_token.wrapping_add(1);
+        self.needs_clear = true;
         self.update_comparator_layout();
         self.sync_comparator_buttons();
         self.sync_exit_button();
@@ -2091,11 +2167,22 @@ impl App {
                 }
             }
             None => {
-                let n = comp.views.len() as f64;
+                let visible: Vec<usize> = comp
+                    .views
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, _)| (!comp.minimized[index]).then_some(index))
+                    .collect();
+                let n = visible.len().max(1) as f64;
                 let col_w = logical_w / n;
+
                 for (i, v) in comp.views.iter().enumerate() {
-                    let col_x = i as f64 * col_w;
-                    let actual_w = if i == comp.views.len() - 1 {
+                    let Some(slot) = visible.iter().position(|index| *index == i) else {
+                        let _ = v.webview.set_visible(false);
+                        continue;
+                    };
+                    let col_x = slot as f64 * col_w;
+                    let actual_w = if slot == visible.len() - 1 {
                         logical_w - col_x
                     } else {
                         col_w
@@ -2164,6 +2251,16 @@ impl App {
                         && let Ok(idx) = val.parse::<usize>()
                     {
                         let _ = navigation_proxy.send_event(UserEvent::ExpandComparator(idx));
+                    }
+                    return false;
+                }
+                if target.starts_with("neuralia:minimize") {
+                    if remote_capability_matches(&target, &navigation_capability)
+                        && let Ok(action_url) = Url::parse(&target)
+                        && let Some((_, val)) = action_url.query_pairs().find(|(k, _)| k == "col")
+                        && let Ok(idx) = val.parse::<usize>()
+                    {
+                        let _ = navigation_proxy.send_event(UserEvent::MinimizeComparator(idx));
                     }
                     return false;
                 }
@@ -3571,6 +3668,11 @@ impl ApplicationHandler<UserEvent> for App {
                     self.expand_comparator(idx);
                 }
             }
+            UserEvent::MinimizeComparator(idx) => {
+                if self.surface == Surface::Comparator {
+                    self.minimize_comparator(idx);
+                }
+            }
             UserEvent::RestoreComparator => {
                 if self.surface == Surface::Comparator {
                     self.restore_comparator();
@@ -4841,6 +4943,13 @@ mod tests {
     }
 
     #[test]
+    fn comparator_minimize_control_is_wired_and_layout_keeps_one_visible() {
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia-comp-minimize"));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia:minimize?col="));
+        assert!(COMPARATOR_BUTTON_COLLAPSED.contains("neuralia-comp-minimize"));
+    }
+
+    #[test]
     fn comparator_timeline_and_sync_use_current_control_ids() {
         assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia-response-rail"));
         assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia-comp-expand"));
@@ -5600,8 +5709,8 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
 
 /// Rotulos do botao injetado no comparador. Em tela cheia a barra nativa some,
 /// por isso este botao tem de anunciar a saida.
-const COMPARATOR_BUTTON_EXPANDED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='none';}})();";
-const COMPARATOR_BUTTON_COLLAPSED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='block';b.textContent='\u{26F6} ' + (window.__neuralia_col_name || 'IA');}})();";
+const COMPARATOR_BUTTON_EXPANDED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='none';}var m=document.querySelector('#neuralia-comp-minimize');if(m){m.style.display='none';}})();";
+const COMPARATOR_BUTTON_COLLAPSED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='block';b.textContent='\u{26F6} ' + (window.__neuralia_col_name || 'IA');}var m=document.querySelector('#neuralia-comp-minimize');if(m){m.style.display='block';}})();";
 
 const EXTERNAL_RETURN_BUTTON: &str = r#"
 document.addEventListener('DOMContentLoaded', () => {
@@ -6139,6 +6248,25 @@ document.addEventListener('DOMContentLoaded', () => {
         + '&cap=' + encodeURIComponent(capability);
     };
 
+    const minimize = document.createElement('button');
+    minimize.id = 'neuralia-comp-minimize';
+    minimize.textContent = '−';
+    minimize.title = 'Minimizar ' + colName;
+    Object.assign(minimize.style, {
+      position:'absolute', top:'10px', right:'112px',
+      pointerEvents:'auto', width:'30px', height:'28px',
+      border:'1px solid rgba(255,255,255,.12)',
+      borderRadius:'999px', padding:'0',
+      background:'rgba(17,19,20,.90)', color:'#fff',
+      fontSize:'18px', fontWeight:'600', lineHeight:'24px',
+      boxShadow:'0 5px 18px rgba(0,0,0,.28)', cursor:'pointer'
+    });
+    minimize.onclick = (event) => {
+      event.preventDefault(); event.stopPropagation();
+      window.location.href = 'neuralia:minimize?col=' + colIndex
+        + '&cap=' + encodeURIComponent(capability);
+    };
+
     const rail = document.createElement('div');
     rail.id = 'neuralia-response-rail';
     Object.assign(rail.style, {
@@ -6225,6 +6353,7 @@ document.addEventListener('DOMContentLoaded', () => {
     rail.appendChild(arrow('⌃', 'Resposta anterior', -1));
     rail.appendChild(ticks);
     rail.appendChild(arrow('⌄', 'Próxima resposta', 1));
+    controls.appendChild(minimize);
     controls.appendChild(expand);
     controls.appendChild(rail);
     document.documentElement.appendChild(controls);
