@@ -795,7 +795,7 @@ mod tests {
         let doc = document("C++ rust foo-bar quoted content");
         upsert(&path, &doc, None).unwrap();
 
-        let hits = candidate_ids(&path, "rust " OR 1=1 --", None, None, 10).unwrap();
+        let hits = candidate_ids(&path, r#"rust " OR 1=1 --"#, None, None, 10).unwrap();
         assert_eq!(hits, vec![doc.id.clone()]);
 
         remove_sqlite_sidecars(&path);
