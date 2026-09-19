@@ -299,6 +299,22 @@ fn upsert_page_base(transaction: &Transaction<'_>, document: &MemoryDocument) ->
         )
         .map_err(io_error)?;
 
+    let page_exists = transaction
+        .query_row(
+            "SELECT 1 FROM knowledge_page WHERE id=?1 LIMIT 1",
+            [&document.id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(io_error)?
+        .is_some();
+    if !page_exists {
+        return Err(io::Error::other(format!(
+            "knowledge_page upsert did not persist {} inside transaction",
+            document.id
+        )));
+    }
+
     transaction
         .execute(
             "DELETE FROM knowledge_page_entity WHERE page_id=?1",
@@ -634,13 +650,16 @@ mod tests {
         upsert(&path, &doc, None).unwrap();
 
         let connection = open_ready(&path).unwrap();
-        let stored: Option<String> = connection
-            .query_row(
-                "SELECT research_session_id FROM knowledge_page WHERE id=?1",
-                [&doc.id],
-                |row| row.get(0),
-            )
+        let rows = connection
+            .prepare("SELECT id, research_session_id FROM knowledge_page ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
             .unwrap();
+        assert_eq!(rows, vec![(doc.id.clone(), None)]);
         let fake_count: i64 = connection
             .query_row(
                 "SELECT count(*) FROM research_session WHERE id='missing-session'",
@@ -657,7 +676,6 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(stored, None);
         assert_eq!(fake_count, 0);
         assert_eq!(audit_count, 1);
 
