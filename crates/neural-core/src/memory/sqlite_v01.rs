@@ -52,14 +52,12 @@ fn has_only_legacy_mirror_schema(connection: &Connection) -> io::Result<bool> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(io_error)?;
 
-    !names
-        .is_empty()
-        .then_some(
-            names
-                .iter()
-                .all(|name| matches!(name.as_str(), "schema_meta" | "documents" | "memory_fts")),
-        )
-        .ok_or_else(|| io::Error::other("empty schema is not legacy"))
+    if names.is_empty() {
+        return Err(io::Error::other("empty schema is not legacy"));
+    }
+    Ok(names
+        .iter()
+        .all(|name| matches!(name.as_str(), "schema_meta" | "documents" | "memory_fts")))
 }
 
 fn configure_connection(connection: &Connection) -> io::Result<()> {
