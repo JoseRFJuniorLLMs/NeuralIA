@@ -20,21 +20,37 @@ pub enum IpcAction {
     Fullscreen,
     DevTools,
     ViewSource,
-    NewTab { col: Option<usize> },
-    Expand { col: usize },
-    Minimize { col: usize },
-    Split { col: usize, url: String },
+    NewTab {
+        col: Option<usize>,
+    },
+    Expand {
+        col: usize,
+    },
+    Minimize {
+        col: usize,
+    },
+    Split {
+        col: usize,
+        url: String,
+    },
     SplitClose,
     SplitExpand,
-    Palette { col: usize },
+    Palette {
+        col: usize,
+    },
     GmailState {
         unread: u32,
         sender: String,
         subject: String,
         key: String,
     },
-    ResearchAnswer { col: usize, text: String },
-    AgentObservation { data: String },
+    ResearchAnswer {
+        col: usize,
+        text: String,
+    },
+    AgentObservation {
+        data: String,
+    },
 }
 
 pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -47,11 +63,7 @@ pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-pub fn parse_ipc_message(
-    body: &str,
-    expected_cap: &str,
-    max_columns: usize,
-) -> Option<IpcAction> {
+pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> Option<IpcAction> {
     if body.len() > IPC_MAX_BYTES || expected_cap.len() != 32 {
         return None;
     }
@@ -201,36 +213,46 @@ mod tests {
     fn rejects_invalid_envelope_and_oversized_body() {
         assert!(parse_ipc_message("", CAP, 3).is_none());
         assert!(parse_ipc_message("{}", CAP, 3).is_none());
-        assert!(parse_ipc_message(
-            &json!({"v":2,"cap":CAP,"action":"home","args":{}}).to_string(),
-            CAP,
-            3
-        )
-        .is_none());
-        assert!(parse_ipc_message(
-            &json!({"v":1,"action":"home","args":{}}).to_string(),
-            CAP,
-            3
-        )
-        .is_none());
-        assert!(parse_ipc_message(
-            &json!({"v":1,"cap":"bad","action":"home","args":{}}).to_string(),
-            CAP,
-            3
-        )
-        .is_none());
-        assert!(parse_ipc_message(
-            &json!({"v":1,"cap":CAP,"action":"inventado","args":{}}).to_string(),
-            CAP,
-            3
-        )
-        .is_none());
-        assert!(parse_ipc_message(
-            &json!({"v":1,"cap":CAP,"action":"home","args":[]}).to_string(),
-            CAP,
-            3
-        )
-        .is_none());
+        assert!(
+            parse_ipc_message(
+                &json!({"v":2,"cap":CAP,"action":"home","args":{}}).to_string(),
+                CAP,
+                3
+            )
+            .is_none()
+        );
+        assert!(
+            parse_ipc_message(
+                &json!({"v":1,"action":"home","args":{}}).to_string(),
+                CAP,
+                3
+            )
+            .is_none()
+        );
+        assert!(
+            parse_ipc_message(
+                &json!({"v":1,"cap":"bad","action":"home","args":{}}).to_string(),
+                CAP,
+                3
+            )
+            .is_none()
+        );
+        assert!(
+            parse_ipc_message(
+                &json!({"v":1,"cap":CAP,"action":"inventado","args":{}}).to_string(),
+                CAP,
+                3
+            )
+            .is_none()
+        );
+        assert!(
+            parse_ipc_message(
+                &json!({"v":1,"cap":CAP,"action":"home","args":[]}).to_string(),
+                CAP,
+                3
+            )
+            .is_none()
+        );
         assert!(parse_ipc_message(&"x".repeat(IPC_MAX_BYTES + 1), CAP, 3).is_none());
     }
 
@@ -311,7 +333,12 @@ mod tests {
             ),
             Some(IpcAction::Split { col: 1, .. })
         ));
-        for url in ["http://127.0.0.1/", "http://localhost/", "file:///tmp/a", "javascript:1"] {
+        for url in [
+            "http://127.0.0.1/",
+            "http://localhost/",
+            "file:///tmp/a",
+            "javascript:1",
+        ] {
             assert!(
                 parse_ipc_message(&message("split", json!({"col":1,"url":url})), CAP, 3).is_none(),
                 "{url}"
@@ -350,7 +377,10 @@ mod tests {
         );
         assert_eq!(
             parse_ipc_message(
-                &message("agent-observation", json!({"data":"1\nhttps://example.com"})),
+                &message(
+                    "agent-observation",
+                    json!({"data":"1\nhttps://example.com"})
+                ),
                 CAP,
                 3
             ),
@@ -359,18 +389,25 @@ mod tests {
             })
         );
 
-        assert!(parse_ipc_message(
-            &message("gmail-state", json!({"count":"4","sender":"A","subject":"B","key":"K"})),
-            CAP,
-            3
-        )
-        .is_none());
-        assert!(parse_ipc_message(
-            &message("research-answer", json!({"col":1,"text":"x".repeat(2_049)})),
-            CAP,
-            3
-        )
-        .is_none());
+        assert!(
+            parse_ipc_message(
+                &message(
+                    "gmail-state",
+                    json!({"count":"4","sender":"A","subject":"B","key":"K"})
+                ),
+                CAP,
+                3
+            )
+            .is_none()
+        );
+        assert!(
+            parse_ipc_message(
+                &message("research-answer", json!({"col":1,"text":"x".repeat(2_049)})),
+                CAP,
+                3
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -398,13 +435,24 @@ mod tests {
             message("split-close", json!({})),
             message("split-expand", json!({})),
             message("palette", json!({"col":0})),
-            message("gmail-state", json!({"count":0,"sender":"","subject":"","key":""})),
-            message("research-answer", json!({"col":0,"text":"texto suficiente"})),
-            message("agent-observation", json!({"data":"1\nhttps://example.com"})),
+            message(
+                "gmail-state",
+                json!({"count":0,"sender":"","subject":"","key":""}),
+            ),
+            message(
+                "research-answer",
+                json!({"col":0,"text":"texto suficiente"}),
+            ),
+            message(
+                "agent-observation",
+                json!({"data":"1\nhttps://example.com"}),
+            ),
         ];
         assert_eq!(messages.len(), 25);
-        assert!(messages
-            .iter()
-            .all(|body| parse_ipc_message(body, CAP, 3).is_some()));
+        assert!(
+            messages
+                .iter()
+                .all(|body| parse_ipc_message(body, CAP, 3).is_some())
+        );
     }
 }
