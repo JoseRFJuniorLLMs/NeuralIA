@@ -9,8 +9,7 @@
 const APP: &str = include_str!("../src/windows_app.rs");
 const IPC: &str = include_str!("../src/ipc.rs");
 const CORE_MEMORY: &str = include_str!("../../neural-core/src/memory.rs");
-const LOCAL_INTELLIGENCE: &str =
-    include_str!("../../neural-core/src/local_intelligence.rs");
+const LOCAL_INTELLIGENCE: &str = include_str!("../../neural-core/src/local_intelligence.rs");
 
 fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     source
@@ -82,10 +81,17 @@ fn spec_0103_product_gate_targets_the_shipped_javascript_timeline() {
         "const fallbackCount =",
         "requestAnimationFrame(() =>",
     ] {
-        assert!(APP.contains(required), "missing shipped timeline behavior: {required}");
+        assert!(
+            APP.contains(required),
+            "missing shipped timeline behavior: {required}"
+        );
     }
 
-    let reader = between(APP, "fn reader_webview_builder", "fn external_webview_builder");
+    let reader = between(
+        APP,
+        "fn reader_webview_builder",
+        "fn external_webview_builder",
+    );
     assert!(reader.contains("SPLIT_SCROLL_RAIL_SCRIPT"));
     assert!(APP.contains("rail.id = 'neuralia-response-rail';"));
     assert!(APP.contains("rail.id = 'neuralia-split-scroll-rail';"));
@@ -102,7 +108,11 @@ fn spec_0104_product_agent_reaches_the_native_permission_policy() {
     assert!(decision.contains("decision.risk == ActionRisk::Restricted"));
     assert!(decision.contains("policy.record_user_confirmation(&security, false)"));
 
-    let handler = between(APP, "fn handle_agent_observation", "fn extract_agent_observation");
+    let handler = between(
+        APP,
+        "fn handle_agent_observation",
+        "fn extract_agent_observation",
+    );
     assert!(handler.contains("agent.policy.record_user_confirmation(&security, approved)"));
     assert!(handler.contains("self.execute_agent_action(&action)"));
 }
