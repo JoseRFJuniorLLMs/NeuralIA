@@ -2992,24 +2992,35 @@ impl App {
     }
 
     fn pdf_webview_builder(&self) -> WebViewBuilder<'static> {
-        let proxy = self.proxy.clone();
+        let ipc_proxy = self.proxy.clone();
+        let navigation_proxy = self.proxy.clone();
         let bytes = Arc::clone(&self.pdf_bytes);
+        let capability = remote_capability();
+        let ipc_capability = capability.clone();
+        let init_script = NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", &capability);
 
         WebViewBuilder::new()
             .with_custom_protocol("neuralia-pdf".to_string(), move |_id, request| {
                 serve_pdf_asset(&bytes, &request)
             })
-            .with_initialization_script(NEURALIA_KEYMAP_SCRIPT)
+            .with_initialization_script(init_script)
+            .with_ipc_handler(move |request| {
+                if let Some(action) =
+                    parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
+                    && let Some(event) = common_ipc_event(action)
+                {
+                    let _ = ipc_proxy.send_event(event);
+                }
+            })
             .with_navigation_handler(move |target| {
-                if let Some(event) = neuralia_action(&target) {
-                    let _ = proxy.send_event(event);
+                if target.get(..9).is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:")) {
                     return false;
                 }
                 if is_pdf_internal_target(&target) {
                     return true;
                 }
                 if remote_web_target(&target, false) {
-                    let _ = proxy.send_event(UserEvent::OpenExternal(target));
+                    let _ = navigation_proxy.send_event(UserEvent::OpenExternal(target));
                 }
                 false
             })
@@ -3092,11 +3103,25 @@ impl App {
     }
 
     fn reader_webview_builder(&self) -> WebViewBuilder<'static> {
-        let proxy = self.proxy.clone();
+        let navigation_proxy = self.proxy.clone();
+        let ipc_proxy = self.proxy.clone();
+        let capability = remote_capability();
+        let ipc_capability = capability.clone();
+        let init_script = format!(
+            "{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}"
+        )
+        .replace("__NEURALIA_CAP__", &capability);
+
         WebViewBuilder::new()
-            .with_initialization_script(format!(
-                "{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}"
-            ))
+            .with_initialization_script(init_script)
+            .with_ipc_handler(move |request| {
+                if let Some(action) =
+                    parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
+                    && let Some(event) = common_ipc_event(action)
+                {
+                    let _ = ipc_proxy.send_event(event);
+                }
+            })
             .with_navigation_handler(move |target| {
                 if target.starts_with("about:blank") {
                     return true;
@@ -3110,20 +3135,21 @@ impl App {
                 }
 
                 if let Some(event) = neuralia_action(&target) {
-                    let _ = proxy.send_event(event);
+                    let _ = navigation_proxy.send_event(event);
                     return false;
                 }
 
                 match action_url.path().trim_matches('/') {
                     "home" => {
-                        let _ = proxy.send_event(UserEvent::HomeRequested);
+                        let _ = navigation_proxy.send_event(UserEvent::HomeRequested);
                     }
                     "web" => {
                         if let Some((_, value)) =
                             action_url.query_pairs().find(|(key, _)| key == "url")
                             && neural_core::validate_web_url(value.as_ref()).is_ok()
                         {
-                            let _ = proxy.send_event(UserEvent::OpenExternal(value.into_owned()));
+                            let _ =
+                                navigation_proxy.send_event(UserEvent::OpenExternal(value.into_owned()));
                         }
                     }
                     _ => {}
@@ -3140,10 +3166,10 @@ impl App {
         allow_local: bool,
         agent_enabled: bool,
     ) -> WebViewBuilder<'static> {
-        let navigation_proxy = self.proxy.clone();
+        let ipc_proxy = self.proxy.clone();
         let new_window_proxy = self.proxy.clone();
         let capability = remote_capability();
-        let navigation_capability = capability.clone();
+        let ipc_capability = capability.clone();
         let agent_script = if agent_enabled {
             AGENT_OBSERVER_SCRIPT
         } else {
@@ -3155,18 +3181,24 @@ impl App {
 
         WebViewBuilder::new()
             .with_initialization_script(init_script)
-            .with_navigation_handler(move |target| {
-                if target.starts_with("neuralia:agent-observation") {
-                    if remote_capability_matches(&target, &navigation_capability)
-                        && let Some(data) = neuralia_query_param(&target, "data")
-                        && let Some(page) = parse_agent_observation(&data)
-                    {
-                        let _ = navigation_proxy.send_event(UserEvent::AgentObservation(page));
+            .with_ipc_handler(move |request| {
+                let Some(action) =
+                    parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
+                else {
+                    return;
+                };
+                let event = match action {
+                    IpcAction::AgentObservation { data } if agent_enabled => {
+                        parse_agent_observation(&data).map(UserEvent::AgentObservation)
                     }
-                    return false;
+                    other => common_ipc_event(other),
+                };
+                if let Some(event) = event {
+                    let _ = ipc_proxy.send_event(event);
                 }
-                if let Some(event) = remote_neuralia_action(&target, &navigation_capability) {
-                    let _ = navigation_proxy.send_event(event);
+            })
+            .with_navigation_handler(move |target| {
+                if target.get(..9).is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:")) {
                     return false;
                 }
                 remote_web_target(&target, allow_local)
@@ -3845,10 +3877,10 @@ impl App {
         col_index: usize,
         col_name: &'static str,
     ) -> WebViewBuilder<'static> {
-        let navigation_proxy = self.proxy.clone();
+        let ipc_proxy = self.proxy.clone();
         let new_window_proxy = self.proxy.clone();
         let capability = remote_capability();
-        let navigation_capability = capability.clone();
+        let ipc_capability = capability.clone();
 
         let init_script = format!(
             "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{AI_AUTO_SUBMIT_SCRIPT}\n{COMPARATOR_INJECT_SCRIPT}"
@@ -3857,80 +3889,45 @@ impl App {
 
         WebViewBuilder::new()
             .with_initialization_script(init_script)
+            .with_ipc_handler(move |request| {
+                let Some(action) =
+                    parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
+                else {
+                    return;
+                };
+                let event = match action {
+                    IpcAction::ResearchAnswer { col, text } if col == col_index => {
+                        Some(UserEvent::ResearchAnswer {
+                            source_index: col_index,
+                            text,
+                        })
+                    }
+                    IpcAction::Split { col, url } if col == col_index => {
+                        Some(UserEvent::OpenSplit {
+                            source_index: col_index,
+                            url,
+                        })
+                    }
+                    IpcAction::Palette { col } if col == col_index => {
+                        Some(UserEvent::OpenPalette(col_index))
+                    }
+                    IpcAction::Minimize { col } if col == col_index => {
+                        Some(UserEvent::MinimizeComparator(col_index))
+                    }
+                    IpcAction::NewTab { col: Some(col) } if col == col_index => {
+                        Some(UserEvent::NewTab(col_index))
+                    }
+                    IpcAction::Expand { col } => Some(UserEvent::ExpandComparator(col)),
+                    other => common_ipc_event(other),
+                };
+                if let Some(event) = event {
+                    let _ = ipc_proxy.send_event(event);
+                }
+            })
             .with_navigation_handler(move |target| {
-                if target.starts_with("neuralia:research-answer") {
-                    if remote_capability_matches(&target, &navigation_capability)
-                        && let (Some(col), Some(text)) = (
-                            neuralia_query_param(&target, "col"),
-                            neuralia_query_param(&target, "text"),
-                        )
-                        && let Ok(source_index) = col.parse::<usize>()
-                        && source_index < COMPARATOR_COLUMNS
-                        && !text.trim().is_empty()
-                    {
-                        let _ = navigation_proxy
-                            .send_event(UserEvent::ResearchAnswer { source_index, text });
-                    }
+                if target.get(..9).is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:")) {
                     return false;
                 }
-                if target.starts_with("neuralia:split") {
-                    if remote_capability_matches(&target, &navigation_capability)
-                        && let (Some(col), Some(url)) = (
-                            neuralia_query_param(&target, "col"),
-                            neuralia_query_param(&target, "url"),
-                        )
-                        && let Ok(source_index) = col.parse::<usize>()
-                        && remote_web_target(&url, false)
-                    {
-                        let _ =
-                            navigation_proxy.send_event(UserEvent::OpenSplit { source_index, url });
-                    }
-                    return false;
-                }
-                if target.starts_with("neuralia:palette") {
-                    // A pagina so pede a abertura. A coluna e a deste WebView,
-                    // nao a que o pedido diz; o texto vai ser escrito num
-                    // controlo nativo que a pagina nem ve.
-                    if remote_capability_matches(&target, &navigation_capability) {
-                        let _ = navigation_proxy.send_event(UserEvent::OpenPalette(col_index));
-                    }
-                    return false;
-                }
-                if target.starts_with("neuralia:newtab") {
-                    if remote_capability_matches(&target, &navigation_capability)
-                        && let Ok(action_url) = Url::parse(&target)
-                        && let Some((_, val)) = action_url.query_pairs().find(|(k, _)| k == "col")
-                        && let Ok(idx) = val.parse::<usize>()
-                    {
-                        let _ = navigation_proxy.send_event(UserEvent::NewTab(idx));
-                    }
-                    return false;
-                }
-                if target.starts_with("neuralia:expand") {
-                    if remote_capability_matches(&target, &navigation_capability)
-                        && let Ok(action_url) = Url::parse(&target)
-                        && let Some((_, val)) = action_url.query_pairs().find(|(k, _)| k == "col")
-                        && let Ok(idx) = val.parse::<usize>()
-                    {
-                        let _ = navigation_proxy.send_event(UserEvent::ExpandComparator(idx));
-                    }
-                    return false;
-                }
-                if target.starts_with("neuralia:minimize") {
-                    if remote_capability_matches(&target, &navigation_capability)
-                        && let Ok(action_url) = Url::parse(&target)
-                        && let Some((_, val)) = action_url.query_pairs().find(|(k, _)| k == "col")
-                        && let Ok(idx) = val.parse::<usize>()
-                    {
-                        let _ = navigation_proxy.send_event(UserEvent::MinimizeComparator(idx));
-                    }
-                    return false;
-                }
-                if let Some(event) = remote_neuralia_action(&target, &navigation_capability) {
-                    let _ = navigation_proxy.send_event(event);
-                    return false;
-                }
-
                 remote_web_target(&target, false) || is_view_source_target(&target, false)
             })
             .with_new_window_req_handler(move |target, _features| {
@@ -3942,6 +3939,7 @@ impl App {
             .with_permission_handler(|_| PermissionResponse::Deny)
             .with_focused(true)
     }
+
 
     /// O login abre-se com `window.open`, e ate aqui isso destruia as tres
     /// colunas para pôr um WebView unico no lugar delas -- perdia-se a
@@ -3971,10 +3969,10 @@ impl App {
         allow_local: bool,
         private: bool,
     ) -> WebViewBuilder<'static> {
-        let navigation_proxy = self.proxy.clone();
+        let ipc_proxy = self.proxy.clone();
         let new_window_proxy = self.proxy.clone();
         let capability = remote_capability();
-        let navigation_capability = capability.clone();
+        let ipc_capability = capability.clone();
         let init_script = format!(
             "window.__neuralia_col_index = {source_index}; window.__neuralia_col_name = '{source_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}"
         )
@@ -3983,29 +3981,29 @@ impl App {
         WebViewBuilder::new()
             .with_incognito(private)
             .with_initialization_script(init_script)
+            .with_ipc_handler(move |request| {
+                let Some(action) =
+                    parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
+                else {
+                    return;
+                };
+                let event = match action {
+                    IpcAction::SplitClose => Some(UserEvent::CloseSplit),
+                    IpcAction::SplitExpand => Some(UserEvent::ToggleSplitFullscreen),
+                    IpcAction::Palette { col } if col == source_index => {
+                        Some(UserEvent::OpenPalette(source_index))
+                    }
+                    IpcAction::NewTab { col: Some(col) } if col == source_index => {
+                        Some(UserEvent::NewTab(source_index))
+                    }
+                    other => common_ipc_event(other),
+                };
+                if let Some(event) = event {
+                    let _ = ipc_proxy.send_event(event);
+                }
+            })
             .with_navigation_handler(move |target| {
-                if target.starts_with("neuralia:split-close") {
-                    if remote_capability_matches(&target, &navigation_capability) {
-                        let _ = navigation_proxy.send_event(UserEvent::CloseSplit);
-                    }
-                    return false;
-                }
-                if target.starts_with("neuralia:split-expand") {
-                    if remote_capability_matches(&target, &navigation_capability) {
-                        let _ = navigation_proxy.send_event(UserEvent::ToggleSplitFullscreen);
-                    }
-                    return false;
-                }
-                if target.starts_with("neuralia:palette") {
-                    // Pedido de abertura vindo da fonte ao lado: abre sobre a
-                    // coluna que a originou; a privacidade e decidida no App.
-                    if remote_capability_matches(&target, &navigation_capability) {
-                        let _ = navigation_proxy.send_event(UserEvent::OpenPalette(source_index));
-                    }
-                    return false;
-                }
-                if let Some(event) = remote_neuralia_action(&target, &navigation_capability) {
-                    let _ = navigation_proxy.send_event(event);
+                if target.get(..9).is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:")) {
                     return false;
                 }
                 remote_web_target(&target, allow_local)
