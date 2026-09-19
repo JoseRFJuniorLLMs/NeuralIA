@@ -37,6 +37,7 @@ The browser remains infrastructure. The product is the research workflow.
 | [SPEC-0104](SPEC-0104-agent-security.md) | Agent security, permissions and prompt-injection defense | 2.0 gate |
 | [SPEC-0105](SPEC-0105-agent-runtime.md) | DOM/accessibility-first web agent runtime | 2.0 |
 | [SPEC-0106](SPEC-0106-execution-roadmap.md) | Implementation order and release gates | 1.7 → 2.0 |
+| [SPEC-0107](SPEC-0107-ai-memory-native-integration.md) | Native import/adaptation of ai-memory into NeuralIA memory crates | 1.7–1.9 |
 
 ## Adoption rule
 
