@@ -25,6 +25,7 @@ SolidCompression=yes
 WizardStyle=modern
 SetupIconFile=..\assets\logo.ico
 UninstallDisplayIcon={app}\NeuralIA.exe
+UninstallDisplayName=NeuralIA
 Uninstallable=yes
 CreateUninstallRegKey=yes
 DisableProgramGroupPage=yes
