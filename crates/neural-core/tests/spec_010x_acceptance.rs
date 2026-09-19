@@ -8,8 +8,9 @@ use std::{
 use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentOutcome, AgentPermissionPolicy, AgentPlanner,
     AgentRuntime, AgentRuntimeConfig, AgentSecurityAction, AgentToolExecutor, CaptureOutcome,
-    FieldKind, HashingLocalIntelligence, IntentClass, LocalIntelligence, MemoryDocument,
-    MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore, ObservedPage, ResearchItemKind,
+    FieldKind, ForgetScope, HashingLocalIntelligence, IntentClass, LocalIntelligence,
+    MemoryDocument, MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore, ObservedPage,
+    ResearchItemKind,
     ResearchSession, SemanticAnchorKind, ToolResult, semantic_anchors_html,
 };
 
@@ -319,6 +320,88 @@ fn spec_0106_roadmap_gate_has_all_core_subsystems_available_together() {
     let _policy = AgentPermissionPolicy::new(None);
     let anchors = semantic_anchors_html("<h1>NeuralIA</h1>");
     assert!(!anchors.is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn spec_0107_phase1_sqlite_retrieval_forget_and_rebuild_are_operational() {
+    let root = temp_root("spec-0107-phase1");
+    let store = MemoryStore::new(&root).unwrap();
+
+    let target = MemoryDocument::new(
+        MemoryKind::Concept,
+        MemorySourceKind::Web,
+        "Rust ownership",
+        Some("https://docs.example.com/rust".into()),
+        "Rust ownership borrowing lifetimes compiler memory safety",
+    )
+    .provider("Reader");
+    let target_id = target.id.clone();
+
+    let noise = MemoryDocument::new(
+        MemoryKind::Concept,
+        MemorySourceKind::Web,
+        "Cooking",
+        Some("https://food.invalid/pasta".into()),
+        "tomato basil pasta recipe kitchen",
+    );
+
+    assert!(matches!(
+        store.capture(target).unwrap(),
+        CaptureOutcome::Stored(_)
+    ));
+    assert!(matches!(
+        store.capture(noise).unwrap(),
+        CaptureOutcome::Stored(_)
+    ));
+
+    let sqlite = root.join("db").join("neural-memory.sqlite");
+    assert!(sqlite.exists());
+    let doctor = store.doctor(false).unwrap();
+    assert!(doctor.sqlite_present);
+
+    let hits = store
+        .query(&MemoryQuery::new("rust ownership compiler"))
+        .unwrap();
+    assert!(!hits.is_empty());
+    assert_eq!(hits[0].id, target_id);
+    assert!(
+        hits[0]
+            .matched_by
+            .iter()
+            .any(|source| source == "lexical" || source == "semantic")
+    );
+
+    let forgotten = store
+        .forget(ForgetScope::Domain("EXAMPLE.com".into()))
+        .unwrap();
+    assert_eq!(forgotten.documents, 1);
+    assert!(root.join("tombstones.json").exists());
+
+    let recapture = MemoryDocument::new(
+        MemoryKind::Source,
+        MemorySourceKind::Web,
+        "Forgotten source",
+        Some("https://deep.docs.example.com/again".into()),
+        "must never come back",
+    );
+    assert_eq!(
+        store.capture(recapture).unwrap(),
+        CaptureOutcome::SkippedForgotten
+    );
+
+    let _ = fs::remove_file(&sqlite);
+    let _ = fs::remove_file(format!("{}-wal", sqlite.to_string_lossy()));
+    let _ = fs::remove_file(format!("{}-shm", sqlite.to_string_lossy()));
+
+    store.rebuild().unwrap();
+    assert!(sqlite.exists());
+
+    let after_rebuild = store
+        .query(&MemoryQuery::new("ownership compiler"))
+        .unwrap();
+    assert!(after_rebuild.iter().all(|hit| hit.id != target_id));
+
     let _ = fs::remove_dir_all(root);
 }
 
