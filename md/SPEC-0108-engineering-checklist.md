@@ -177,6 +177,56 @@ Não usar depois:
 - `window.location.href = 'neuralia:...'`;
 - `location.assign('neuralia:...')`.
 
+## Inventário real de ações no candidato 2.0.1
+
+Varredura de `feat/astra-finish-audit-2.0@3ec01dd` encontrou **25 ações/canais reais** combinando:
+
+- chamadas `act('...')`;
+- handlers `starts_with("neuralia:...")`;
+- match nativo `name => UserEvent`.
+
+Lista:
+
+```text
+agent-observation
+autoscroll
+back
+clearhistory
+devtools
+expand
+fullscreen
+gmail-state
+history
+home
+minimize
+newtab
+omnibox
+palette
+print
+reload
+research-answer
+restore
+split
+split-close
+split-expand
+viewsource
+zoomin
+zoomout
+zoomreset
+```
+
+`auto-submit` apareceu apenas como chave de `sessionStorage`, não como canal.
+`inventado` apareceu apenas em teste negativo.
+
+**Consequência:** a SPEC-0108 atual fala em "23 ações". Esse número não deve ser
+copiado para código. O inventário real do SHA de implementação deve ser a fonte,
+e a spec deve ser corrigida no mesmo commit em que o transporte novo ficar
+completo.
+
+Os canais `agent-observation`, `research-answer` e `gmail-state` carregam
+dados, não apenas comandos de UI, e precisam de schemas próprios em vez de
+`args: Value` sem validação.
+
 ## Inventário de builders a migrar
 
 Revisar no SHA de implementação:
