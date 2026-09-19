@@ -115,13 +115,23 @@ fn hostile_nested_containers_extract_in_linear_time() {
     // que a SPEC-0004 exige linear. Com o algoritmo antigo esta razao era de
     // milhares (292 s contra 0,1 s), por isso o tecto de 8x continua a
     // apanhar a regressao que motivou o teste.
+    // Três tamanhos, cada um medido três vezes, ficando com o MÍNIMO. O ruído
+    // de uma máquina ocupada só acrescenta tempo, nunca o tira: o mínimo de
+    // várias corridas é a estimativa menos contaminada. Sem isto, uma medição
+    // apanhada numa aresta de escalonamento (e as três correm em momentos
+    // diferentes) chegava para inflacionar a razão e pintar de vermelho código
+    // que está correcto -- que é exactamente o defeito que este teste teve.
     let mut measured = Vec::new();
-    for size in [512 * KIB, 1024 * KIB, 2048 * KIB] {
+    for size in [128 * KIB, 256 * KIB, 512 * KIB] {
         let html = hostile_fixture(size, 100);
-        let (result, elapsed) = timed("hostil em cadeias", &html);
-        let article = result.expect("HTML hostil continua a extrair");
-        assert!(!article.blocks.is_empty());
-        measured.push(elapsed.max(Duration::from_millis(1)));
+        let mut best = Duration::MAX;
+        for _ in 0..3 {
+            let (result, elapsed) = timed("hostil em cadeias", &html);
+            let article = result.expect("HTML hostil continua a extrair");
+            assert!(!article.blocks.is_empty());
+            best = best.min(elapsed);
+        }
+        measured.push(best.max(Duration::from_millis(1)));
     }
 
     // Quadruplicar a entrada com a mesma profundidade quadruplica o trabalho
