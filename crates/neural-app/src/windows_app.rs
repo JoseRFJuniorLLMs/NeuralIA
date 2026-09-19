@@ -124,6 +124,7 @@ enum UserEvent {
         screen_x: i32,
     },
     RestoreComparator,
+    ExitRequested,
     ReaderReady {
         generation: u64,
         input: String,
@@ -146,7 +147,11 @@ enum Surface {
     Pdf,
 }
 
+/// Linha superior sem moldura: abas + minimizar/maximizar/fechar, como num browser.
+const TITLE_TAB_HEIGHT: f64 = 32.0;
+/// Segunda linha: Home, provedores, +, Privado e controles de Split View.
 const TOP_BAR_HEIGHT: f64 = 44.0;
+const COMPARATOR_CHROME_HEIGHT: f64 = TITLE_TAB_HEIGHT + TOP_BAR_HEIGHT;
 const MAX_VISIBLE_CONTEXT_TABS: usize = 3;
 const COMPARATOR_COLUMNS: usize = 3;
 /// Intervalo da rolagem automatica de leitura, do primeiro avanco ao ultimo.
@@ -288,7 +293,7 @@ const AUTO_SCROLL_TOAST: &str = r#"
 })(__ON__);
 "#;
 
-/// O que esta debaixo do rato na barra de topo.
+/// O que esta debaixo do rato no chrome nativo do comparador.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BarHit {
     Home,
@@ -301,10 +306,13 @@ enum BarHit {
     SplitExpand,
     SplitClose,
     Private,
+    WindowMinimize,
+    WindowMaximize,
+    WindowClose,
 }
 
-/// Geometria da barra de topo: cada IA e um grupo com cabecalho, botao + e
-/// ate tres abas de contexto visiveis. As mais antigas continuam guardadas.
+/// Geometria em duas linhas. As fontes ficam na title bar; os provedores ficam
+/// numa segunda linha, sem disputar espaco com as abas.
 #[derive(Debug, Clone, Copy)]
 struct BarLayout {
     visible: bool,
@@ -316,6 +324,9 @@ struct BarLayout {
     context_indices: [[usize; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
     context_tab_counts: [usize; COMPARATOR_COLUMNS],
     columns_len: usize,
+    window_minimize: UiRect,
+    window_maximize: UiRect,
+    window_close: UiRect,
 }
 
 impl BarLayout {
@@ -355,12 +366,36 @@ impl BarLayout {
                 context_indices: [[0; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
                 context_tab_counts: [0; COMPARATOR_COLUMNS],
                 columns_len: 0,
+                window_minimize: empty,
+                window_maximize: empty,
+                window_close: empty,
             };
         }
 
-        let height = TOP_BAR_HEIGHT * scale;
+        let height = COMPARATOR_CHROME_HEIGHT * scale;
+        let title_h = TITLE_TAB_HEIGHT * scale;
+        let caption_w = 46.0 * scale;
+        let window_close = UiRect {
+            x: (client_width - caption_w).max(0.0),
+            y: 0.0,
+            width: caption_w,
+            height: title_h,
+        };
+        let window_maximize = UiRect {
+            x: (window_close.x - caption_w).max(0.0),
+            y: 0.0,
+            width: caption_w,
+            height: title_h,
+        };
+        let window_minimize = UiRect {
+            x: (window_maximize.x - caption_w).max(0.0),
+            y: 0.0,
+            width: caption_w,
+            height: title_h,
+        };
+
         let pad = 7.0 * scale;
-        let row_y = 7.0 * scale;
+        let row_y = title_h + 7.0 * scale;
         let row_h = 30.0 * scale;
         let home = UiRect {
             x: pad,
@@ -376,11 +411,12 @@ impl BarLayout {
         let mut tab_counts = [0usize; COMPARATOR_COLUMNS];
         let columns_len = columns.min(COMPARATOR_COLUMNS);
 
+        // Linha dos provedores, agora livre das abas.
         if columns_len > 0 {
             let column_width = client_width / columns_len as f64;
             let group_pad = 6.0 * scale;
             let gap = 4.0 * scale;
-            let provider_width = 92.0 * scale;
+            let provider_width = 116.0 * scale;
             let plus_width = 26.0 * scale;
 
             for index in 0..columns_len {
@@ -388,9 +424,9 @@ impl BarLayout {
                 if index == 0 {
                     left = left.max(home.x + home.width + 8.0 * scale);
                 }
-                let right = ((index + 1) as f64 * column_width - group_pad).min(client_width - pad);
+                let right = ((index + 1) as f64 * column_width - group_pad)
+                    .min(client_width - pad);
                 let available = (right - left).max(provider_width + plus_width + gap);
-
                 columns_rect[index] = UiRect {
                     x: left,
                     y: row_y,
@@ -403,38 +439,39 @@ impl BarLayout {
                     width: plus_width,
                     height: row_h - 4.0 * scale,
                 };
+            }
+        }
 
-                let count = context_counts[index].min(MAX_VISIBLE_CONTEXT_TABS);
-                tab_counts[index] = count;
-                if count == 0 {
-                    continue;
-                }
+        // Linha superior: todas as fontes/abas, antes dos controles da janela.
+        let tabs_left = 90.0 * scale;
+        let tabs_right = (window_minimize.x - 8.0 * scale).max(tabs_left);
+        let desired: [usize; COMPARATOR_COLUMNS] =
+            std::array::from_fn(|index| context_counts[index].min(MAX_VISIBLE_CONTEXT_TABS));
+        let total_tabs: usize = desired.iter().sum();
+        if total_tabs > 0 && tabs_right > tabs_left {
+            let gap = 3.0 * scale;
+            let usable = tabs_right - tabs_left - gap * total_tabs.saturating_sub(1) as f64;
+            let tab_width = (usable / total_tabs as f64)
+                .clamp(56.0 * scale, 156.0 * scale);
+            let mut x = tabs_left;
 
-                let tabs_left = plus_rect[index].x + plus_rect[index].width + gap;
-                let tabs_width = (right - tabs_left).max(0.0);
-                if tabs_width < 34.0 * scale {
-                    tab_counts[index] = 0;
-                    continue;
-                }
-                let first_context = context_counts[index] - count;
-                let tab_gap = 3.0 * scale;
-                let tab_width = ((tabs_width - tab_gap * (count.saturating_sub(1)) as f64)
-                    / count as f64)
-                    .max(28.0 * scale);
-
+            for index in 0..columns_len {
+                let count = desired[index];
+                let first_context = context_counts[index].saturating_sub(count);
                 for visual in 0..count {
-                    let x = tabs_left + visual as f64 * (tab_width + tab_gap);
-                    if x + 22.0 * scale > right {
-                        tab_counts[index] = visual;
+                    if x + 28.0 * scale > tabs_right {
                         break;
                     }
+                    let width = tab_width.min(tabs_right - x).max(28.0 * scale);
                     tabs[index][visual] = UiRect {
                         x,
-                        y: row_y + 2.0 * scale,
-                        width: (tab_width.min(right - x)).max(22.0 * scale),
-                        height: row_h - 4.0 * scale,
+                        y: 3.0 * scale,
+                        width,
+                        height: (title_h - 6.0 * scale).max(20.0 * scale),
                     };
                     tab_indices[index][visual] = first_context + visual;
+                    tab_counts[index] += 1;
+                    x += width + gap;
                 }
             }
         }
@@ -449,6 +486,9 @@ impl BarLayout {
             context_indices: tab_indices,
             context_tab_counts: tab_counts,
             columns_len,
+            window_minimize,
+            window_maximize,
+            window_close,
         }
     }
 
@@ -456,13 +496,16 @@ impl BarLayout {
         if !self.visible || y > self.height {
             return None;
         }
-        if self.home.contains(x, y) {
-            return Some(BarHit::Home);
+        if self.window_close.contains(x, y) {
+            return Some(BarHit::WindowClose);
+        }
+        if self.window_maximize.contains(x, y) {
+            return Some(BarHit::WindowMaximize);
+        }
+        if self.window_minimize.contains(x, y) {
+            return Some(BarHit::WindowMinimize);
         }
         for index in 0..self.columns_len {
-            if self.add_tabs[index].contains(x, y) {
-                return Some(BarHit::AddTab(index));
-            }
             for visual in 0..self.context_tab_counts[index] {
                 if self.context_tabs[index][visual].contains(x, y) {
                     return Some(BarHit::ContextTab {
@@ -470,6 +513,14 @@ impl BarLayout {
                         context_index: self.context_indices[index][visual],
                     });
                 }
+            }
+        }
+        if self.home.contains(x, y) {
+            return Some(BarHit::Home);
+        }
+        for index in 0..self.columns_len {
+            if self.add_tabs[index].contains(x, y) {
+                return Some(BarHit::AddTab(index));
             }
             if self.columns[index].contains(x, y) {
                 return Some(BarHit::Column(index));
@@ -1593,6 +1644,9 @@ impl App {
     fn destroy_web_surfaces(&mut self) {
         self.mark_dirty();
         self.leave_fullscreen();
+        if let Some(window) = &self.window {
+            window.set_decorations(true);
+        }
         if let Some(button) = self.exit_button.take() {
             unsafe {
                 DestroyWindow(button);
@@ -1997,14 +2051,17 @@ impl App {
         let Some(window) = &self.window else {
             return;
         };
+        // No comparador o chrome e nosso: a primeira linha recebe as abas e os
+        // controles de janela; a segunda fica reservada aos provedores.
+        window.set_decorations(false);
 
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
         let logical_w = size.width as f64 / scale;
         let logical_h = size.height as f64 / scale;
 
-        let content_h = (logical_h - TOP_BAR_HEIGHT).max(100.0);
-        let content_y = TOP_BAR_HEIGHT;
+        let content_h = (logical_h - COMPARATOR_CHROME_HEIGHT).max(100.0);
+        let content_y = COMPARATOR_CHROME_HEIGHT;
         let n = 3.0;
         let col_w = logical_w / n;
 
@@ -2213,8 +2270,8 @@ impl App {
         let logical_w = size.width as f64 / scale;
         let logical_h = size.height as f64 / scale;
 
-        let content_h = (logical_h - TOP_BAR_HEIGHT).max(100.0);
-        let content_y = TOP_BAR_HEIGHT;
+        let content_h = (logical_h - COMPARATOR_CHROME_HEIGHT).max(100.0);
+        let content_y = COMPARATOR_CHROME_HEIGHT;
 
         // Fonte lateral: a IA que originou o link continua visível, as demais
         // ficam vivas e preservam estado para reaparecer ao fechar a gaveta.
@@ -2258,7 +2315,7 @@ impl App {
                 // sem essa faixa a aplicacao nunca saberia que o rato subiu ao
                 // topo para chamar a barra de volta.
                 let (top, height) = if self.chrome_revealed {
-                    (TOP_BAR_HEIGHT, (logical_h - TOP_BAR_HEIGHT).max(1.0))
+                    (COMPARATOR_CHROME_HEIGHT, (logical_h - COMPARATOR_CHROME_HEIGHT).max(1.0))
                 } else {
                     (1.0, (logical_h - 1.0).max(1.0))
                 };
@@ -2557,10 +2614,10 @@ impl App {
         let logical_h = size.height as f64 / scale;
         let ai_width = logical_w * 0.54;
         let bounds = wry::Rect {
-            position: LogicalPosition::new(ai_width, TOP_BAR_HEIGHT).into(),
+            position: LogicalPosition::new(ai_width, COMPARATOR_CHROME_HEIGHT).into(),
             size: LogicalSize::new(
                 (logical_w - ai_width).max(1.0),
-                (logical_h - TOP_BAR_HEIGHT).max(100.0),
+                (logical_h - COMPARATOR_CHROME_HEIGHT).max(100.0),
             )
             .into(),
         };
@@ -3492,7 +3549,7 @@ impl App {
             }
             let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
             ClientToScreen(owner, &mut origin);
-            let top = ((TOP_BAR_HEIGHT + 10.0) * scale).round() as i32;
+            let top = ((COMPARATOR_CHROME_HEIGHT + 10.0) * scale).round() as i32;
             SetWindowPos(
                 button,
                 std::ptr::null_mut(),
@@ -3605,7 +3662,7 @@ impl App {
             (
                 show,
                 boundaries,
-                (logical_h - TOP_BAR_HEIGHT).max(1.0),
+                (logical_h - COMPARATOR_CHROME_HEIGHT).max(1.0),
                 scale,
             )
         } else {
@@ -3664,7 +3721,7 @@ impl App {
             let width = (SPLITTER_WIDTH * scale).round().max(3.0) as i32;
             let x =
                 origin.x + (boundaries[slot] * scale - SPLITTER_WIDTH * scale / 2.0).round() as i32;
-            let y = origin.y + (TOP_BAR_HEIGHT * scale).round() as i32;
+            let y = origin.y + (COMPARATOR_CHROME_HEIGHT * scale).round() as i32;
             let height = (content_height * scale).round().max(1.0) as i32;
             unsafe {
                 SetWindowPos(
@@ -3746,7 +3803,7 @@ impl App {
         }
         let scale = window.scale_factor().max(1.0);
         let width = window.inner_size().width as f64;
-        let row_y = 7.0 * scale;
+        let row_y = (TITLE_TAB_HEIGHT + 7.0) * scale;
         let row_h = 30.0 * scale;
         let button_w = 78.0 * scale;
         let margin = 8.0 * scale;
@@ -3773,7 +3830,7 @@ impl App {
         let scale = window.scale_factor().max(1.0);
         let width = window.inner_size().width as f64;
         let margin = 8.0 * scale;
-        let row_y = 7.0 * scale;
+        let row_y = (TITLE_TAB_HEIGHT + 7.0) * scale;
         let row_h = 30.0 * scale;
         let close_w = 30.0 * scale;
         let expand_w = 30.0 * scale;
@@ -4008,6 +4065,19 @@ impl App {
     fn click_comparator(&mut self) {
         let hit = self.comparator_bar_hit();
         match hit {
+            Some(BarHit::WindowMinimize) => {
+                if let Some(window) = &self.window {
+                    window.set_minimized(true);
+                }
+            }
+            Some(BarHit::WindowMaximize) => {
+                if let Some(window) = &self.window {
+                    window.set_maximized(!window.is_maximized());
+                }
+            }
+            Some(BarHit::WindowClose) => {
+                let _ = self.proxy.send_event(UserEvent::ExitRequested);
+            }
             Some(BarHit::Private) => self.open_private_panel(),
             Some(BarHit::SplitClose) => self.close_split(),
             Some(BarHit::SplitExpand) => self.toggle_split_fullscreen(),
@@ -4018,7 +4088,19 @@ impl App {
                 source_index,
                 context_index,
             }) => self.open_context_tab(source_index, context_index),
-            None => {}
+            None => {
+                let scale = self
+                    .window
+                    .as_ref()
+                    .map(|window| window.scale_factor().max(1.0))
+                    .unwrap_or(1.0);
+                if self.cursor.1 >= 0.0
+                    && self.cursor.1 <= TITLE_TAB_HEIGHT * scale
+                    && let Some(window) = &self.window
+                {
+                    let _ = window.drag_window();
+                }
+            }
         }
     }
 
@@ -4086,8 +4168,9 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
+            UserEvent::ExitRequested => event_loop.exit(),
             UserEvent::HomeRequested => self.show_home(),
             UserEvent::BackRequested => self.go_back(),
             UserEvent::ToggleAutoScroll => self.toggle_auto_scroll(),
@@ -4837,7 +4920,7 @@ fn draw_comparator_bar(
         }
 
         let width = client.right.max(1);
-        let bar_h = (TOP_BAR_HEIGHT * scale).round() as i32;
+        let bar_h = (COMPARATOR_CHROME_HEIGHT * scale).round() as i32;
 
         // Desenhar fora do ecra e fazer um BitBlt so no fim: sem isto a barra
         // pisca a cada movimento do rato, porque o hover obriga a redesenhar.
@@ -4941,6 +5024,7 @@ unsafe fn paint_comparator_bar_with_contexts(
         return;
     }
     let bar_h = layout.height.round() as i32;
+    let title_h = (TITLE_TAB_HEIGHT * scale).round() as i32;
 
     let bar_rect = RECT {
         left: 0,
@@ -4952,21 +5036,110 @@ unsafe fn paint_comparator_bar_with_contexts(
     FillRect(target, &bar_rect, background);
     DeleteObject(background as _);
 
-    let hairline = RECT {
+    // Separa discretamente title bar e barra dos provedores.
+    let title_line = RECT {
+        left: 0,
+        top: title_h - scale.round().max(1.0) as i32,
+        right: width,
+        bottom: title_h,
+    };
+    let separator = CreateSolidBrush(rgb3(theme.bar_line));
+    FillRect(target, &title_line, separator);
+    let bottom_line = RECT {
         left: 0,
         top: bar_h - scale.round().max(1.0) as i32,
         right: width,
         bottom: bar_h,
     };
-    let line = CreateSolidBrush(rgb3(theme.bar_line));
-    FillRect(target, &hairline, line);
-    DeleteObject(line as _);
+    FillRect(target, &bottom_line, separator);
+    DeleteObject(separator as _);
 
     SetBkMode(target, TRANSPARENT as i32);
     let font = create_font((-13.0 * scale) as i32, FW_NORMAL as i32);
     let tab_font = create_font((-10.0 * scale) as i32, FW_NORMAL as i32);
     let old_font = SelectObject(target, font as _);
 
+    // Identidade do app ocupa o canto esquerdo; o restante da faixa e
+    // arrastavel quando nao houver uma aba sob o rato.
+    draw_pill(
+        target,
+        UiRect {
+            x: 7.0 * scale,
+            y: 3.0 * scale,
+            width: 76.0 * scale,
+            height: (TITLE_TAB_HEIGHT - 6.0) * scale,
+        },
+        "NeuralIA",
+        PillStyle::new(theme.bar_bg, theme.bar_bg, theme.fg_muted),
+        scale,
+        tab_font,
+        theme.bar_bg,
+    );
+
+    // Abas/fontes na mesma faixa dos botoes de janela.
+    for index in 0..layout.columns_len {
+        let brand = theme.brand(index);
+        for visual in 0..layout.context_tab_counts[index] {
+            let context_index = layout.context_indices[index][visual];
+            let Some(url) = contexts[index].get(context_index) else {
+                continue;
+            };
+            let active = active_context
+                .is_some_and(|(source, active_url, _, _)| source == index && active_url == url);
+            let hovered = hover
+                == Some(BarHit::ContextTab {
+                    source_index: index,
+                    context_index,
+                });
+            let fill = if active {
+                mix(theme.bar_bg, brand, 0.48)
+            } else if hovered {
+                mix(theme.bar_bg, brand, 0.30)
+            } else {
+                mix(theme.bar_bg, brand, 0.12)
+            };
+            draw_pill(
+                target,
+                layout.context_tabs[index][visual],
+                &context_tab_label(url),
+                PillStyle::new(fill, mix(theme.bar_bg, brand, 0.30), theme.fg_muted),
+                scale,
+                tab_font,
+                theme.bar_bg,
+            );
+        }
+    }
+
+    // Caption controls fazem parte da nossa title bar frameless.
+    draw_button(
+        target,
+        layout.window_minimize,
+        "—",
+        hover == Some(BarHit::WindowMinimize),
+        scale,
+        font,
+        theme,
+    );
+    draw_button(
+        target,
+        layout.window_maximize,
+        "□",
+        hover == Some(BarHit::WindowMaximize),
+        scale,
+        font,
+        theme,
+    );
+    draw_button(
+        target,
+        layout.window_close,
+        "×",
+        hover == Some(BarHit::WindowClose),
+        scale,
+        font,
+        theme,
+    );
+
+    // Segunda linha: apenas controles do NeuralIA/provedores.
     let home_fill = if hover == Some(BarHit::Home) {
         mix(theme.surface, theme.fg, 0.10)
     } else {
@@ -5004,7 +5177,6 @@ unsafe fn paint_comparator_bar_with_contexts(
             font,
             theme.bar_bg,
         );
-
         draw_button(
             target,
             layout.add_tabs[index],
@@ -5014,42 +5186,11 @@ unsafe fn paint_comparator_bar_with_contexts(
             font,
             theme,
         );
-
-        for visual in 0..layout.context_tab_counts[index] {
-            let context_index = layout.context_indices[index][visual];
-            let Some(url) = contexts[index].get(context_index) else {
-                continue;
-            };
-            let active = active_context
-                .is_some_and(|(source, active_url, _, _)| source == index && active_url == url);
-            let hovered = hover
-                == Some(BarHit::ContextTab {
-                    source_index: index,
-                    context_index,
-                });
-            let fill = if active {
-                mix(theme.bar_bg, brand, 0.48)
-            } else if hovered {
-                mix(theme.bar_bg, brand, 0.30)
-            } else {
-                mix(theme.bar_bg, brand, 0.10)
-            };
-            let label = context_tab_label(url);
-            draw_pill(
-                target,
-                layout.context_tabs[index][visual],
-                &label,
-                PillStyle::new(fill, mix(theme.bar_bg, brand, 0.28), theme.fg_muted),
-                scale,
-                tab_font,
-                theme.bar_bg,
-            );
-        }
     }
 
     {
         let margin = 8.0 * scale;
-        let row_y = 7.0 * scale;
+        let row_y = (TITLE_TAB_HEIGHT + 7.0) * scale;
         let row_h = 30.0 * scale;
         let button_w = 78.0 * scale;
         let right = if active_context.is_some() {
@@ -5083,7 +5224,7 @@ unsafe fn paint_comparator_bar_with_contexts(
 
     if let Some((source_index, _url, fullscreen, private_split)) = active_context {
         let margin = 8.0 * scale;
-        let row_y = 7.0 * scale;
+        let row_y = (TITLE_TAB_HEIGHT + 7.0) * scale;
         let row_h = 30.0 * scale;
         let close_w = 30.0 * scale;
         let expand_w = 30.0 * scale;
@@ -5402,7 +5543,7 @@ mod tests {
             assert!(!screen.is_null());
 
             let width = 1600i32;
-            let height = TOP_BAR_HEIGHT as i32;
+            let height = COMPARATOR_CHROME_HEIGHT as i32;
             let accent = system_accent();
 
             let cases: [(&str, Theme, bool, Option<BarHit>); 3] = [
@@ -5918,19 +6059,35 @@ mod tests {
     }
 
     #[test]
-    fn grouped_tabs_live_in_single_title_row() {
+    fn context_tabs_live_in_browser_title_bar() {
         let layout = BarLayout::with_contexts(1600.0, 1.0, true, 3, [3, 3, 3]);
-        assert_eq!(layout.height, TOP_BAR_HEIGHT);
+        assert_eq!(layout.height, COMPARATOR_CHROME_HEIGHT);
         for index in 0..3 {
             let provider = layout.columns[index];
             let plus = layout.add_tabs[index];
+            assert!(provider.y >= TITLE_TAB_HEIGHT);
             assert!((provider.y - plus.y).abs() <= 2.0);
             for visual in 0..layout.context_tab_counts[index] {
                 let tab = layout.context_tabs[index][visual];
-                assert!((provider.y - tab.y).abs() <= 2.0);
-                assert!(tab.y + tab.height <= layout.height);
+                assert!(tab.y < TITLE_TAB_HEIGHT);
+                assert!(tab.y + tab.height <= TITLE_TAB_HEIGHT);
             }
         }
+        assert!(layout.window_minimize.y < TITLE_TAB_HEIGHT);
+        assert!(layout.window_maximize.y < TITLE_TAB_HEIGHT);
+        assert!(layout.window_close.y < TITLE_TAB_HEIGHT);
+    }
+
+    #[test]
+    fn title_bar_window_controls_are_hit_tested() {
+        let layout = BarLayout::with_contexts(1400.0, 1.0, true, 3, [1, 1, 1]);
+        let center = |r: UiRect| (r.x + r.width / 2.0, r.y + r.height / 2.0);
+        let (x, y) = center(layout.window_minimize);
+        assert_eq!(layout.hit(x, y), Some(BarHit::WindowMinimize));
+        let (x, y) = center(layout.window_maximize);
+        assert_eq!(layout.hit(x, y), Some(BarHit::WindowMaximize));
+        let (x, y) = center(layout.window_close);
+        assert_eq!(layout.hit(x, y), Some(BarHit::WindowClose));
     }
 
     #[test]
