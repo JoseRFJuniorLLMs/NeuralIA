@@ -8,6 +8,9 @@ Correção da baseline 2.0 após auditoria do código real e alinhamento das
 afirmações publicadas com o binário.
 
 ### Fixed
+- Workflow de release trata tag + GitHub Release já existentes como no-op seguro
+  quando a versão não mudou; estado parcial continua falhando para nunca mover,
+  reparar silenciosamente ou republicar uma versão estável.
 - Palette do comparador passa a ser controle Win32 nativo, sem campo de texto
   injetado na página e preservando o perfil privado.
 - `NEURALIA_NO_GMAIL=1` desliga o monitor do Gmail para gates de lifecycle.
