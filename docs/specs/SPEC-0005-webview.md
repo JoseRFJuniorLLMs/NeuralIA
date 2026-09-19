@@ -57,8 +57,10 @@ Every accepted message MUST carry the per-WebView capability token. The token:
   attributes or `window.name`;
 - is compared in constant time;
 - is sent through a reference to `window.chrome.webview.postMessage` captured
-  at document-created time, with `JSON.stringify` captured at the same point.
-  It is never carried in a navigation URL.
+  at document-created time, with `JSON.stringify` captured at the same point;
+- is unavailable to child frames: capability-bearing initialization scripts
+  return when `window.top !== window` before the token declaration;
+- is never carried in a navigation URL.
 
 The native parser rejects messages above 8 KiB before JSON parsing. Column
 indices are bounded, split URLs must be valid public HTTP(S) targets, and
