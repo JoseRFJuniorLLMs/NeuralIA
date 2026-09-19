@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
+const MEMORY_SCHEMA_VERSION: u32 = 1;
+
 use crate::{
     agent_security::redact_sensitive_text,
     local_intelligence::{EMBEDDING_DIM, cosine_similarity, extract_entities, hashed_embedding},
@@ -201,6 +203,16 @@ pub enum ForgetScope {
 pub struct ForgetReport {
     pub documents: usize,
     pub files: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryDoctorReport {
+    pub schema: u32,
+    pub documents: usize,
+    pub corrupt_documents: usize,
+    pub manifest_present: bool,
+    pub sqlite_present: bool,
+    pub rebuilt: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -407,6 +419,41 @@ impl MemoryStore {
             .collect())
     }
 
+    pub fn doctor(&self, rebuild: bool) -> io::Result<MemoryDoctorReport> {
+        self.ensure_layout()?;
+        let mut documents = 0usize;
+        let mut corrupt_documents = 0usize;
+
+        if let Ok(entries) = fs::read_dir(self.documents_dir()) {
+            for entry in entries.flatten() {
+                if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+                    continue;
+                }
+                match fs::read(entry.path())
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<MemoryDocument>(&bytes).ok())
+                {
+                    Some(document) if !document.private => documents += 1,
+                    Some(_) => {}
+                    None => corrupt_documents += 1,
+                }
+            }
+        }
+
+        if rebuild {
+            self.rebuild()?;
+        }
+
+        Ok(MemoryDoctorReport {
+            schema: MEMORY_SCHEMA_VERSION,
+            documents,
+            corrupt_documents,
+            manifest_present: self.root.join("db").join("index-manifest.json").exists(),
+            sqlite_present: self.sqlite_path().exists(),
+            rebuilt: rebuild,
+        })
+    }
+
     pub fn forget(&self, scope: ForgetScope) -> io::Result<ForgetReport> {
         let documents = self.documents()?;
         let mut report = ForgetReport::default();
@@ -497,7 +544,7 @@ impl MemoryStore {
         }
 
         let manifest = Manifest {
-            schema: 1,
+            schema: MEMORY_SCHEMA_VERSION,
             generated_at: unix_seconds(),
             documents: self.documents()?.len(),
             sqlite: if cfg!(windows) {
@@ -668,6 +715,11 @@ mod sqlite_mirror {
 
             let db = Self(database);
             db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+            db.exec(
+                "CREATE TABLE IF NOT EXISTS schema_meta(version INTEGER NOT NULL);\
+                 INSERT INTO schema_meta(version) SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM schema_meta);\
+                 UPDATE schema_meta SET version=1;",
+            )?;
             db.exec(
                 "CREATE TABLE IF NOT EXISTS documents(\
                  id TEXT PRIMARY KEY,title TEXT NOT NULL,url TEXT,body TEXT NOT NULL,\
@@ -891,6 +943,65 @@ mod tests {
             .unwrap();
         assert_eq!(report.documents, 2);
         assert!(store.documents().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn duplicate_capture_is_idempotent_and_no_vector_fallback_still_finds_text() {
+        let root = temp_root("dedup");
+        let store = MemoryStore::new(&root).unwrap();
+        let mut doc = MemoryDocument::new(
+            MemoryKind::Source,
+            MemorySourceKind::Reader,
+            "Raft e consenso",
+            Some("https://example.com/raft".into()),
+            "Leader election replica o log distribuído.",
+        );
+        doc.embedding.clear();
+
+        let first = doc.id.clone();
+        store.capture(doc.clone()).unwrap();
+        store.capture(doc).unwrap();
+
+        let documents = store.documents().unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].id, first);
+
+        let hits = store.query(&MemoryQuery::new("Leader election")).unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits[0].matched_by.iter().any(|source| source == "lexical"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn memory_doctor_reports_corruption_and_rebuilds_healthy_index() {
+        let root = temp_root("doctor");
+        let store = MemoryStore::new(&root).unwrap();
+        store
+            .capture(MemoryDocument::new(
+                MemoryKind::Source,
+                MemorySourceKind::Reader,
+                "Documento saudável",
+                None,
+                "conteúdo indexável",
+            ))
+            .unwrap();
+
+        fs::write(store.documents_dir().join("corrupt.json"), b"{not-json").unwrap();
+        let report = store.doctor(true).unwrap();
+        assert_eq!(report.schema, MEMORY_SCHEMA_VERSION);
+        assert_eq!(report.documents, 1);
+        assert_eq!(report.corrupt_documents, 1);
+        assert!(report.manifest_present);
+        assert!(report.rebuilt);
+
+        let manifest = fs::read_to_string(root.join("db").join("index-manifest.json")).unwrap();
+        assert!(manifest.contains(&format!(
+            "\"schema\": {}",
+            MEMORY_SCHEMA_VERSION
+        )));
 
         let _ = fs::remove_dir_all(root);
     }
