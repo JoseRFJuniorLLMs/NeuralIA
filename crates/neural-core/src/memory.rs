@@ -335,7 +335,7 @@ impl MemoryStore {
         } else {
             candidate_ids
                 .into_iter()
-                .filter_map(|id| self.get(&id).transpose())
+                .map(|id| self.get(&id))
                 .collect::<io::Result<Vec<_>>>()?
                 .into_iter()
                 .flatten()
