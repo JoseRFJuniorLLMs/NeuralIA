@@ -21,6 +21,13 @@ All notable changes to NeuralIA are documented here.
   Links internos do Reader continuam sendo a exceção sem token.
 
 ### Validation
+- **PR #64 — instalador per-user com caminho de Authenticode preparado.** O CI
+  compila um setup Inno a partir do mesmo `NeuralIA.exe` medido, instala em
+  diretório temporário, confere SHA-256 do payload, registro de uninstall em
+  HKCU e desinstalação. Uma segunda montagem adultera o payload em 1 byte e o
+  gate precisa rejeitá-la. O release só publica setup quando o par de segredos
+  Authenticode está completo; configuração parcial falha fechado. O executável
+  medido não é assinado depois do CI, porque isso mudaria os seus bytes.
 - **PR #58 — release publica exatamente o executável medido pelo CI.** O job
   Windows guarda `NeuralIA.exe`, SHA-256 e os JSONs dos gates no artefato
   nomeado pelo SHA; a attestation é criada sobre esse mesmo binário. O workflow
@@ -72,7 +79,7 @@ All notable changes to NeuralIA are documented here.
   inicial, toda ação de qualquer origem passava sem confirmação. Sem origem
   inicial nada está aprovado
   (`policy_without_initial_origin_gates_every_origin`).
-- **PR #44 — a memória deixou de atravessar idiomas.** A shortlist FTS
+- **PR #44 — o recall PT/EN voltou a atravessar idiomas.** A shortlist FTS
   introduzida no PR #36 escolhia candidatos por palavra exacta antes de
   pontuar: uma pergunta em português já não encontrava o documento em inglês,
   excepto quando *nenhum* documento batia lexicalmente. Medido com dois
