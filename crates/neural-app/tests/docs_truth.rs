@@ -11,7 +11,7 @@ const THREAT: &str = include_str!("../../../docs/specs/SPEC-0015-threat-model.md
 const ROADMAP: &str = include_str!("../../../docs/specs/SPEC-0016-roadmap.md");
 const LOCAL_AI_SPEC: &str = include_str!("../../../md/SPEC-0102-local-intelligence.md");
 
-fn workspace_version() -> &str {
+fn workspace_version() -> &'static str {
     CARGO_ROOT
         .lines()
         .find_map(|line| {
