@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::agent_security::{
-    AgentPermissionPolicy, AgentSecurityAction, FieldKind, PolicyDecision,
+    AgentPermissionPolicy, AgentSecurityAction, FieldKind, PolicyDecision, redact_sensitive_text,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,17 +148,20 @@ pub fn save_agent_outcome(
     outcome: &AgentOutcome,
 ) -> io::Result<()> {
     #[derive(Serialize)]
-    struct StoredOutcome<'a> {
-        goal: &'a str,
-        outcome: &'a AgentOutcome,
+    struct StoredOutcome {
+        goal: String,
+        outcome: AgentOutcome,
     }
 
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let bytes =
-        serde_json::to_vec_pretty(&StoredOutcome { goal, outcome }).map_err(io::Error::other)?;
+    let stored = StoredOutcome {
+        goal: redact_sensitive_text(goal),
+        outcome: redacted_outcome(outcome),
+    };
+    let bytes = serde_json::to_vec_pretty(&stored).map_err(io::Error::other)?;
     let temp = path.with_extension("tmp");
     fs::write(&temp, bytes)?;
     match fs::rename(&temp, path) {
@@ -169,6 +172,105 @@ pub fn save_agent_outcome(
         }
         Err(error) => Err(error),
     }
+}
+
+fn redacted_outcome(outcome: &AgentOutcome) -> AgentOutcome {
+    match outcome {
+        AgentOutcome::Completed { summary, trace } => AgentOutcome::Completed {
+            summary: redact_sensitive_text(summary),
+            trace: redacted_trace(trace),
+        },
+        AgentOutcome::NeedsApproval {
+            action,
+            decision,
+            trace,
+        } => AgentOutcome::NeedsApproval {
+            action: redacted_action(action),
+            decision: decision.clone(),
+            trace: redacted_trace(trace),
+        },
+        AgentOutcome::NeedsUser { reason, trace } => AgentOutcome::NeedsUser {
+            reason: redact_sensitive_text(reason),
+            trace: redacted_trace(trace),
+        },
+        AgentOutcome::Stopped { trace } => AgentOutcome::Stopped {
+            trace: redacted_trace(trace),
+        },
+        AgentOutcome::StepLimit { trace } => AgentOutcome::StepLimit {
+            trace: redacted_trace(trace),
+        },
+        AgentOutcome::Failed { error, trace } => AgentOutcome::Failed {
+            error: redact_sensitive_text(error),
+            trace: redacted_trace(trace),
+        },
+    }
+}
+
+fn redacted_trace(trace: &[AgentStep]) -> Vec<AgentStep> {
+    trace
+        .iter()
+        .map(|step| AgentStep {
+            number: step.number,
+            action: redacted_action(&step.action),
+            result_summary: redact_sensitive_text(&step.result_summary),
+        })
+        .collect()
+}
+
+fn redacted_action(action: &AgentAction) -> AgentAction {
+    let mut redacted = action.clone();
+    match &mut redacted {
+        AgentAction::TypeText { text, field, .. }
+            if matches!(
+                *field,
+                FieldKind::Email
+                    | FieldKind::Password
+                    | FieldKind::PaymentCard
+                    | FieldKind::Otp
+                    | FieldKind::Unknown
+            ) =>
+        {
+            let chars = text.chars().count();
+            *text = format!("[REDACTED {chars} chars]");
+        }
+        AgentAction::Select { value, .. } => {
+            *value = redact_sensitive_text(value);
+        }
+        AgentAction::Submit { description, .. } => {
+            *description = redact_sensitive_text(description);
+        }
+        AgentAction::AskUser { reason } => {
+            *reason = redact_sensitive_text(reason);
+        }
+        AgentAction::Finish { summary } => {
+            *summary = redact_sensitive_text(summary);
+        }
+        _ => {}
+    }
+    redacted
+}
+
+fn sanitize_observed_page(page: &ObservedPage) -> ObservedPage {
+    let mut sanitized = page.clone();
+    sanitized.title = redact_sensitive_text(&sanitized.title);
+    sanitized.text_excerpt = redact_sensitive_text(&sanitized.text_excerpt);
+    for element in &mut sanitized.elements {
+        element.text = if element_looks_sensitive(element) {
+            "[REDACTED]".into()
+        } else {
+            redact_sensitive_text(&element.text)
+        };
+    }
+    sanitized
+}
+
+fn element_looks_sensitive(element: &AgentElement) -> bool {
+    let material = format!("{} {}", element.role, element.name).to_ascii_lowercase();
+    [
+        "password", "senha", "otp", "one-time", "card", "cartão", "cartao", "cvv", "cvc",
+    ]
+    .iter()
+    .any(|needle| material.contains(needle))
 }
 
 pub struct AgentRuntime<P, E> {
@@ -223,7 +325,8 @@ where
                 };
             }
 
-            let action = match self.planner.plan(goal, &page, &self.trace) {
+            let planner_page = sanitize_observed_page(&page);
+            let action = match self.planner.plan(goal, &planner_page, &self.trace) {
                 Ok(action) => action,
                 Err(error) => {
                     return AgentOutcome::Failed {
@@ -246,7 +349,7 @@ where
                 };
             }
 
-            if let Err(error) = validate_action_generation(&action, page.generation) {
+            if let Err(error) = validate_action_reference(&action, &page) {
                 return AgentOutcome::Failed {
                     error,
                     trace: self.trace.clone(),
@@ -307,7 +410,7 @@ where
     }
 }
 
-fn validate_action_generation(action: &AgentAction, current: u64) -> Result<(), String> {
+fn validate_action_reference(action: &AgentAction, page: &ObservedPage) -> Result<(), String> {
     let target = match action {
         AgentAction::Click { target }
         | AgentAction::TypeText { target, .. }
@@ -320,11 +423,43 @@ fn validate_action_generation(action: &AgentAction, current: u64) -> Result<(), 
         _ => None,
     };
 
-    if target.is_some_and(|target| target.generation != current) {
-        Err("stale element reference after navigation".into())
-    } else {
-        Ok(())
+    let Some(target) = target else {
+        return Ok(());
+    };
+    if target.generation != page.generation {
+        return Err("stale element reference after navigation".into());
     }
+
+    let Some(observed) = page
+        .elements
+        .iter()
+        .find(|element| element.id == target.id && element.generation == target.generation)
+    else {
+        return Err("element reference was not issued by current observation".into());
+    };
+
+    if observed.origin != target.origin
+        || observed.frame != target.frame
+        || observed.role != target.role
+        || observed.name != target.name
+        || observed.visible != target.visible
+        || observed.interactable != target.interactable
+    {
+        return Err("element reference metadata does not match current observation".into());
+    }
+
+    if matches!(
+        action,
+        AgentAction::Click { .. }
+            | AgentAction::TypeText { .. }
+            | AgentAction::Select { .. }
+            | AgentAction::Submit { .. }
+    ) && (!observed.visible || !observed.interactable)
+    {
+        return Err("element is not currently visible and interactable".into());
+    }
+
+    Ok(())
 }
 
 fn security_action(action: &AgentAction, page: &ObservedPage) -> Option<AgentSecurityAction> {
@@ -374,7 +509,10 @@ fn page_origin(page: &ObservedPage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
 
     struct QueuePlanner {
         actions: VecDeque<AgentAction>,
@@ -415,7 +553,12 @@ mod tests {
             url: "https://example.com/search".into(),
             title: "Search".into(),
             text_excerpt: "results".into(),
-            elements: Vec::new(),
+            elements: vec![
+                element("textbox", "query"),
+                element("article", "result"),
+                element("button", "Send"),
+                element("button", "Old"),
+            ],
         }
     }
 
@@ -528,6 +671,95 @@ mod tests {
         assert!(text.contains("research"));
         assert!(text.contains("Completed"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    struct CapturePlanner {
+        seen: Arc<Mutex<ObservedPage>>,
+    }
+
+    impl AgentPlanner for CapturePlanner {
+        fn plan(
+            &mut self,
+            _goal: &str,
+            page: &ObservedPage,
+            _trace: &[AgentStep],
+        ) -> Result<AgentAction, String> {
+            *self.seen.lock().unwrap() = page.clone();
+            Ok(AgentAction::Finish {
+                summary: "done".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn persisted_outcome_redacts_restricted_text_values() {
+        let target = element("password", "Password");
+        let planner = QueuePlanner {
+            actions: VecDeque::from([AgentAction::TypeText {
+                target: target.clone(),
+                text: "synthetic-sensitive-value".into(),
+                field: FieldKind::Password,
+            }]),
+        };
+        let executor = MockExecutor { page: page() };
+        let policy = AgentPermissionPolicy::new(Some("https://example.com".into()));
+        let mut runtime =
+            AgentRuntime::new(planner, executor, policy, AgentRuntimeConfig::default());
+
+        let mut observed = page();
+        observed.elements.push(target);
+        let outcome = runtime.run("credential field", observed);
+        assert!(matches!(outcome, AgentOutcome::NeedsApproval { .. }));
+
+        let root =
+            std::env::temp_dir().join(format!("neuralia-agent-redaction-{}", std::process::id()));
+        let path = root.join("trace.json");
+        save_agent_outcome(&path, "token=synthetic-sensitive-value", &outcome).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("synthetic-sensitive-value"));
+        assert!(text.contains("REDACTED"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn planner_receives_sanitized_observation() {
+        let seen = Arc::new(Mutex::new(page()));
+        let planner = CapturePlanner {
+            seen: Arc::clone(&seen),
+        };
+        let executor = MockExecutor { page: page() };
+        let policy = AgentPermissionPolicy::new(Some("https://example.com".into()));
+        let mut runtime =
+            AgentRuntime::new(planner, executor, policy, AgentRuntimeConfig::default());
+
+        let mut observed = page();
+        observed.text_excerpt = "token=synthetic-sensitive-value\nbody: visible".into();
+        let _ = runtime.run("inspect", observed);
+
+        let seen = seen.lock().unwrap();
+        assert!(!seen.text_excerpt.contains("synthetic-sensitive-value"));
+        assert!(seen.text_excerpt.contains("body: visible"));
+    }
+
+    #[test]
+    fn fabricated_element_reference_is_rejected() {
+        let forged = AgentElement {
+            id: "not-issued".into(),
+            ..element("button", "Send")
+        };
+        let planner = QueuePlanner {
+            actions: VecDeque::from([AgentAction::Click { target: forged }]),
+        };
+        let executor = MockExecutor { page: page() };
+        let mut policy = AgentPermissionPolicy::new(Some("https://example.com".into()));
+        policy.grant_reversible_session_actions(true);
+        let mut runtime =
+            AgentRuntime::new(planner, executor, policy, AgentRuntimeConfig::default());
+
+        match runtime.run("click", page()) {
+            AgentOutcome::Failed { error, .. } => assert!(error.contains("not issued")),
+            other => panic!("unexpected outcome: {other:?}"),
+        }
     }
 
     #[test]

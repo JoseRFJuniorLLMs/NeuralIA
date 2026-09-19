@@ -226,6 +226,9 @@ impl AgentPermissionPolicy {
             let Ok(parsed) = Url::parse(url) else {
                 return deny(risk, "invalid navigation URL");
             };
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return deny(risk, "agent navigation only allows HTTP(S)");
+            }
 
             if is_local_network_target(&parsed) {
                 return confirm(risk, "navigation from web agent to local/private network");
@@ -235,6 +238,12 @@ impl AgentPermissionPolicy {
             if self.initial_origin.is_some() && !self.approved_origins.contains(&origin) {
                 return confirm(risk, "cross-origin navigation needs approval");
             }
+        } else if self.initial_origin.is_some()
+            && action
+                .origin()
+                .is_some_and(|origin| !self.approved_origins.contains(&origin))
+        {
+            return confirm(risk, "cross-origin action needs approval");
         }
 
         match risk {
@@ -381,6 +390,46 @@ mod tests {
         assert!(clean.contains("body: visible"));
         assert!(!clean.contains("Bearer abc"));
         assert!(!clean.contains("hunter2"));
+    }
+
+    #[test]
+    fn non_web_navigation_schemes_are_denied() {
+        let mut policy = AgentPermissionPolicy::new(None);
+        for url in [
+            "file:///C:/Windows/win.ini",
+            "data:text/html,<h1>hostile</h1>",
+            "javascript:alert(1)",
+        ] {
+            let decision = policy.evaluate(&AgentSecurityAction::Navigate {
+                url: url.to_string(),
+            });
+            assert!(!decision.allowed);
+            assert!(!decision.requires_confirmation);
+            assert_eq!(decision.risk, ActionRisk::ReadOnly);
+        }
+    }
+
+    #[test]
+    fn reversible_grant_does_not_cross_unapproved_origin() {
+        let mut policy = AgentPermissionPolicy::new(Some("https://a.example".into()));
+        policy.grant_reversible_session_actions(true);
+
+        let decision = policy.evaluate(&AgentSecurityAction::Click {
+            origin: "https://b.example".into(),
+            label: "Continue".into(),
+        });
+
+        assert_eq!(decision.risk, ActionRisk::Reversible);
+        assert!(!decision.allowed);
+        assert!(decision.requires_confirmation);
+
+        policy.approve_origin("https://b.example");
+        let approved = policy.evaluate(&AgentSecurityAction::Click {
+            origin: "https://b.example".into(),
+            label: "Continue".into(),
+        });
+        assert!(approved.allowed);
+        assert!(!approved.requires_confirmation);
     }
 
     #[test]
