@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dev-dependencies]
+# O teste de proveniência confere o SHA-256 dos ficheiros vendorizados.
+sha2 = "0.10.9"
+
 [dependencies]
 scraper = "0.27"
 serde.workspace = true
