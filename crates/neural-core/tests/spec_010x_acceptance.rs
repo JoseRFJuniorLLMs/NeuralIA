@@ -8,9 +8,9 @@ use std::{
 use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentOutcome, AgentPermissionPolicy, AgentPlanner,
     AgentRuntime, AgentRuntimeConfig, AgentSecurityAction, AgentToolExecutor, CaptureOutcome,
-    FieldKind, HashingLocalIntelligence, IntentClass, LocalIntelligence, MemoryDocument, MemoryKind,
-    MemoryQuery, MemorySourceKind, MemoryStore, ObservedPage, ResearchItemKind, ResearchSession,
-    SemanticAnchorKind, ToolResult, semantic_anchors_html,
+    FieldKind, HashingLocalIntelligence, IntentClass, LocalIntelligence, MemoryDocument,
+    MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore, ObservedPage, ResearchItemKind,
+    ResearchSession, SemanticAnchorKind, ToolResult, semantic_anchors_html,
 };
 
 fn temp_root(name: &str) -> PathBuf {
@@ -82,7 +82,11 @@ fn spec_0101_research_sessions_compare_synthesize_and_export_with_provenance() {
     let mut ids = Vec::new();
 
     for (provider, title, body) in [
-        ("Gemini", "DOM", "DOM fornece estrutura e seletores estáveis."),
+        (
+            "Gemini",
+            "DOM",
+            "DOM fornece estrutura e seletores estáveis.",
+        ),
         (
             "ChatGPT",
             "Accessibility",
