@@ -357,6 +357,43 @@ cargo test -p neural-core --test memory_phase1_baseline -- --ignored --nocapture
 Os resultados impressos em JSON são o baseline. A Fase 1 só pode declarar
 melhoria de performance comparando a mesma máquina, build mode e corpus.
 
+### 8.1 Baseline medida em 19/09/2026
+
+Medição executada em GitHub Actions `windows-latest`, build `--release`,
+Rust 1.98.1, no harness desta branch. O corpus usa o formato durável atual do
+`memory.rs`. A query híbrida passa por `MemoryStore::query`; FTS-only usa o
+mesmo schema/tokenizer FTS5 atual, construído numa única conexão para isolar o
+custo da consulta do defeito conhecido do rebuild. RSS/threads são do processo
+de teste com o `MemoryStore` ativo e idle depois das queries.
+
+| Documentos | Query híbrida | FTS-only | Build FTS de referência | Reindex atual | RSS idle | Threads |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1.000 | 74.048 µs (74,048 ms) | 18 µs | 51 ms | 47.302 ms (47,302 s) | 7.413.760 B | 5 |
+| 10.000 | 524.554 µs (524,554 ms) | 15 µs | 99 ms | **> 180.000 ms** | 8.314.880 B | 5 |
+| 100.000 | 8.514.011 µs (8,514 s) | 32 µs | 1.694 ms | **> 180.000 ms** | 9.682.944 B | 3 |
+
+Nos tamanhos 10k e 100k o rebuild foi interrompido pelo limite explícito de
+180 s; portanto a baseline correta é um **lower bound**, não uma estimativa
+disfarçada de medição.
+
+A leitura mais importante é estrutural:
+
+- FTS-only permanece na ordem de dezenas de microssegundos neste corpus;
+- o custo da busca híbrida cresce porque o caminho atual lê/parsa os arquivos e
+  faz scoring em memória;
+- o rebuild atual degrada dramaticamente porque `sqlite_mirror::rebuild`
+  chama `upsert` por documento e cada `upsert` reabre/configura SQLite;
+- construir o mesmo volume FTS numa única conexão/transação levou 51 ms, 99 ms
+  e 1.694 ms respectivamente, mostrando que a maior dívida não é FTS5, é o
+  lifecycle da conexão do mirror atual;
+- RSS e contagem de threads não cresceram proporcionalmente ao corpus porque o
+  store não mantém o corpus residente em idle. Isso é uma propriedade a
+  preservar na Fase 1.
+
+GitHub-hosted runners têm ruído entre execuções. Estes valores são uma baseline
+reprodutível de engenharia, não um SLA. Comparações futuras devem usar o mesmo
+harness, build mode e classe de runner.
+
 ## 9. Gates para substituir o índice atual
 
 A implementação V01 não substitui o caminho atual até provar:
