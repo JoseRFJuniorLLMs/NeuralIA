@@ -580,9 +580,10 @@ pub(super) fn candidate_ids(
         .map_err(io_error)?;
 
     statement
-        .query_map(params![match_query, provider, session_id, candidate_limit], |row| {
-            row.get::<_, String>(0)
-        })
+        .query_map(
+            params![match_query, provider, session_id, candidate_limit],
+            |row| row.get::<_, String>(0),
+        )
         .map_err(io_error)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(io_error)
@@ -850,9 +851,11 @@ mod tests {
         upsert(&path, &first, None).unwrap();
         upsert(&path, &second, None).unwrap();
 
-        let embeddings =
-            embeddings_for_ids(&path, &[first.id.clone(), second.id.clone(), "missing".into()])
-                .unwrap();
+        let embeddings = embeddings_for_ids(
+            &path,
+            &[first.id.clone(), second.id.clone(), "missing".into()],
+        )
+        .unwrap();
 
         assert_eq!(embeddings.len(), 2);
         assert_eq!(embeddings[&first.id], first.embedding);
