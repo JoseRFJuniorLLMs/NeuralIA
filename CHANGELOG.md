@@ -20,9 +20,11 @@ memória semântica e automação Web limitada por política.
   audit log, confirmação humana e kill switch.
 - SPEC-0105: runtime de agente estruturado, limitado por passos/tempo e sem
   ferramenta de JavaScript arbitrário.
-- SPEC-0107: proveniência MIT do ai-memory vendorizada com SHA upstream,
-  LICENSE, UPSTREAM.md e PATCHES.md.
-- Gate integrado `spec_010x_acceptance.rs` cobrindo SPEC-0100 a SPEC-0107.
+- SPEC-0107 **Fase 0**: proveniência MIT do ai-memory vendorizada com SHA upstream,
+  LICENSE, UPSTREAM.md e PATCHES.md. As fases de storage/retrieval não fazem parte
+  da baseline 2.0.
+- Gate integrado `spec_010x_acceptance.rs` com casos numerados SPEC-0100 a
+  SPEC-0107; o caso 0107 valida somente a proveniência da Fase 0.
 
 ### Changed
 - `Ctrl+H` passa a abrir semantic recall local por `memory:`.
