@@ -20,6 +20,38 @@ All notable changes to NeuralIA are documented here.
   IPC e rejeição do esquema `neuralia:` nas superfícies remotas.
 - Revisão adversarial independente e release 2.1.0 permanecem pendentes.
 
+### Fixed
+- **Reader derrubava a janela** em artigos longos com acentos: o texto que vai
+  para a memória era cortado com `String::truncate` num índice de byte, e 512
+  KiB caem a meio de um UTF-8 quando o corpo começa em offset ímpar. O corte
+  recua até à fronteira de char anterior
+  (`reader_memory_text_cuts_on_char_boundary`).
+- **Bridge do agente não agia em elementos com espaço no nome**: `js_percent`
+  usava o serializador de formulários, que escreve o espaço como `+`, e
+  `decodeURIComponent` não o desfaz. O nome esperado nunca batia com o do DOM
+  — o guard do script desistia em silêncio — e `TypeText`/`Select` escreviam
+  `+` no lugar dos espaços (`agent_script_encodes_spaces_as_percent_twenty`).
+- **Captura de memória custava O(corpus)**: cada escrita corria um `PRAGMA
+  integrity_check` sobre a base inteira e relia todos os documentos em JSON só
+  para contar. Com 1500 páginas, 217 ms por captura contra 10 ms com a base
+  vazia; a fila de 128 saturava e as capturas passavam a ser descartadas em
+  silêncio. Agora é constante — 9 ms às 1500 páginas
+  (`tests/memory_capture_cost.rs`). A verificação da base inteira fica no
+  `rebuild`, que já a fazia.
+- **`AgentPermissionPolicy::new(None)` desligava o gate de origem**: sem origem
+  inicial, toda ação de qualquer origem passava sem confirmação. Sem origem
+  inicial nada está aprovado
+  (`policy_without_initial_origin_gates_every_origin`).
+
+### Changed
+- O orçamento do caso hostil em `tests/extraction_cost.rs` deixa de ser um teto
+  em segundos de relógio — que media a velocidade da máquina: falhava a 4,7 s
+  com o código certo numa máquina ocupada e passaria a verde num runner rápido
+  mesmo com regressão — e passa a medir o que a SPEC-0004 exige: 4x a entrada,
+  no máximo 8x o tempo.
+- SPEC-0104 e SPEC-0105 declaram "auditoria independente pendente", como o
+  AGENTS.md §8 e o `md/README.md` já diziam.
+
 ## [2.0.1] - 2026-09-19
 
 Correção da baseline 2.0 após auditoria do código real e alinhamento das
