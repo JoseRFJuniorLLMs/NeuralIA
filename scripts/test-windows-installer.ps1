@@ -46,6 +46,9 @@ try {
         throw "Installer completed without producing $installedExe."
     }
 
+    # Resolve the uninstaller before any assertion that can fail. Negative-path
+    # tests deliberately fail below; the finally block still has to remove the
+    # uninstall registration rather than merely deleting files.
     $expectedHash = (Get-FileHash -LiteralPath $expectedExe -Algorithm SHA256).Hash
     $installedHash = (Get-FileHash -LiteralPath $installedExe -Algorithm SHA256).Hash
     if ($expectedHash -ne $installedHash) {
