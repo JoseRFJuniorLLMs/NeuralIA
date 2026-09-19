@@ -374,8 +374,7 @@ impl BarLayout {
                 if index == 0 {
                     left = left.max(home.x + home.width + 8.0 * scale);
                 }
-                let right =
-                    ((index + 1) as f64 * column_width - group_pad).min(client_width - pad);
+                let right = ((index + 1) as f64 * column_width - group_pad).min(client_width - pad);
                 let available = (right - left).max(provider_width + plus_width + gap);
 
                 columns_rect[index] = UiRect {
@@ -3388,7 +3387,12 @@ impl App {
             AppendMenuW(menu, MF_STRING, TAB_MENU_FULLSCREEN, fullscreen.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
             AppendMenuW(menu, MF_STRING, TAB_MENU_CLOSE, close.as_ptr());
-            AppendMenuW(menu, MF_STRING, TAB_MENU_CLOSE_OTHERS, close_others.as_ptr());
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                TAB_MENU_CLOSE_OTHERS,
+                close_others.as_ptr(),
+            );
             AppendMenuW(menu, MF_STRING, TAB_MENU_CLOSE_ALL, close_all.as_ptr());
 
             let mut point = windows_sys::Win32::Foundation::POINT {
@@ -3411,13 +3415,9 @@ impl App {
 
         match command {
             TAB_MENU_OPEN => self.open_context_tab(source_index, context_index),
-            TAB_MENU_FULLSCREEN => {
-                self.open_context_tab_fullscreen(source_index, context_index)
-            }
+            TAB_MENU_FULLSCREEN => self.open_context_tab_fullscreen(source_index, context_index),
             TAB_MENU_CLOSE => self.close_context_tab(source_index, context_index),
-            TAB_MENU_CLOSE_OTHERS => {
-                self.close_other_context_tabs(source_index, context_index)
-            }
+            TAB_MENU_CLOSE_OTHERS => self.close_other_context_tabs(source_index, context_index),
             TAB_MENU_CLOSE_ALL => self.close_all_context_tabs(source_index),
             _ => {}
         }
