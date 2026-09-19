@@ -308,23 +308,51 @@ impl MemoryStore {
             return Ok(Vec::new());
         }
 
-        let docs = self
-            .documents()?
-            .into_iter()
-            .filter(|doc| {
-                query
-                    .provider
-                    .as_ref()
-                    .is_none_or(|provider| doc.provider.as_ref() == Some(provider))
-                    && query
-                        .session_id
+        let candidate_limit = query.limit.clamp(1, 100).saturating_mul(16).min(512);
+        let candidate_ids = sqlite_v01::candidate_ids(
+            &self.sqlite_path(),
+            query_text,
+            query.provider.as_deref(),
+            query.session_id.as_deref(),
+            candidate_limit,
+        )
+        .unwrap_or_default();
+
+        let used_sqlite_candidates = !candidate_ids.is_empty();
+        let docs = if candidate_ids.is_empty() {
+            self.documents()?
+                .into_iter()
+                .filter(|doc| {
+                    query
+                        .provider
                         .as_ref()
-                        .is_none_or(|session| doc.session_id.as_ref() == Some(session))
-            })
-            .collect::<Vec<_>>();
+                        .is_none_or(|provider| doc.provider.as_ref() == Some(provider))
+                        && query
+                            .session_id
+                            .as_ref()
+                            .is_none_or(|session| doc.session_id.as_ref() == Some(session))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            candidate_ids
+                .into_iter()
+                .map(|id| self.get(&id))
+                .collect::<io::Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .filter(|doc| !doc.private)
+                .collect::<Vec<_>>()
+        };
         if docs.is_empty() {
             return Ok(Vec::new());
         }
+
+        let persisted_embeddings = if used_sqlite_candidates {
+            let ids = docs.iter().map(|doc| doc.id.clone()).collect::<Vec<_>>();
+            sqlite_v01::embeddings_for_ids(&self.sqlite_path(), &ids).unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
 
         let terms = tokenize(query_text);
         let query_entities = extract_entities(query_text)
@@ -343,9 +371,10 @@ impl MemoryStore {
             .iter()
             .enumerate()
             .map(|(index, doc)| {
+                let embedding = persisted_embeddings.get(&doc.id).unwrap_or(&doc.embedding);
                 (
                     index,
-                    cosine_similarity(&query_embedding, &doc.embedding).max(0.0),
+                    cosine_similarity(&query_embedding, embedding).max(0.0),
                 )
             })
             .filter(|(_, score)| *score > 0.05)
@@ -716,6 +745,81 @@ mod tests {
                 .unwrap_or_default()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn query_uses_fts_candidates_without_losing_provider_filter() {
+        let root = temp_root("fts-query-filter");
+        let store = MemoryStore::new(&root).unwrap();
+
+        store
+            .capture(
+                MemoryDocument::new(
+                    MemoryKind::Source,
+                    MemorySourceKind::ProviderAnswer,
+                    "Rust A",
+                    None,
+                    "ownership borrowing lifetimes rust",
+                )
+                .provider("Claude"),
+            )
+            .unwrap();
+        store
+            .capture(
+                MemoryDocument::new(
+                    MemoryKind::Source,
+                    MemorySourceKind::ProviderAnswer,
+                    "Rust B",
+                    None,
+                    "ownership borrowing lifetimes rust",
+                )
+                .provider("Gemini"),
+            )
+            .unwrap();
+
+        let mut query = MemoryQuery::new("ownership rust");
+        query.provider = Some("Claude".into());
+        let hits = store.query(&query).unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].provider.as_deref(), Some("Claude"));
+        assert!(hits[0].matched_by.iter().any(|source| source == "lexical"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sqlite_embedding_rerank_matches_document_embedding_results() {
+        let root = temp_root("sqlite-rerank");
+        let store = MemoryStore::new(&root).unwrap();
+        let target = MemoryDocument::new(
+            MemoryKind::Concept,
+            MemorySourceKind::Note,
+            "Borrow checker",
+            None,
+            "Rust ownership borrowing lifetimes compiler",
+        );
+        let target_id = target.id.clone();
+        store.capture(target).unwrap();
+        store
+            .capture(MemoryDocument::new(
+                MemoryKind::Concept,
+                MemorySourceKind::Note,
+                "Cooking",
+                None,
+                "recipe tomato basil pasta kitchen",
+            ))
+            .unwrap();
+
+        let hits = store
+            .query(&MemoryQuery::new("rust ownership compiler"))
+            .unwrap();
+
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].id, target_id);
+        assert!(hits[0].matched_by.iter().any(|source| source == "semantic"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
