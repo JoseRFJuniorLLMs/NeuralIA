@@ -120,12 +120,21 @@ jobs:
         run: |
           set -euo pipefail
 
+          tag_exists=0
+          release_exists=0
           if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "Tag $RELEASE_TAG already exists; refusing to mutate or republish a stable version." >&2
-            exit 1
+            tag_exists=1
           fi
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $RELEASE_TAG already exists; refusing to overwrite stable assets." >&2
+            release_exists=1
+          fi
+
+          if [ "$tag_exists" -eq 1 ] && [ "$release_exists" -eq 1 ]; then
+            echo "Stable release $RELEASE_TAG already exists; version is unchanged, nothing to publish."
+            exit 0
+          fi
+          if [ "$tag_exists" -ne "$release_exists" ]; then
+            echo "Inconsistent stable release state for $RELEASE_TAG (tag=$tag_exists release=$release_exists); refusing repair or overwrite." >&2
             exit 1
           fi
 

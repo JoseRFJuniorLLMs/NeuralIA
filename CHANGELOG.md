@@ -2,6 +2,39 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.0.1] - 2026-09-19
+
+Correção da baseline 2.0 após auditoria do código real e alinhamento das
+afirmações publicadas com o binário.
+
+### Fixed
+- Workflow de release trata tag + GitHub Release já existentes como no-op seguro
+  quando a versão não mudou; estado parcial continua falhando para nunca mover,
+  reparar silenciosamente ou republicar uma versão estável.
+- Palette do comparador passa a ser controle Win32 nativo, sem campo de texto
+  injetado na página e preservando o perfil privado.
+- `NEURALIA_NO_GMAIL=1` desliga o monitor do Gmail para gates de lifecycle.
+- Timers de splash, toast, probe e autoscroll passam por um serviço único.
+- Servidor interno do PDF responde a HTTP Range para o PDF.js vendorizado.
+- Histórico sai do event loop e limita entradas; escaping HTML é feito em uma
+  única passagem.
+- Layout/splitters, resize coalescido, caches de ícone/tema e janelas auxiliares
+  foram alinhados com o comportamento testado.
+- Testes tautológicos da baseline anterior foram substituídos por testes reais
+  de palette, Range, timers e layout.
+
+### Changed
+- SPEC-0107 passa a declarar apenas **Fase 0 concluída**; SQLite/FTS5 continua
+  pendente e não é apresentado como parte implementada da baseline.
+- SPEC-0108 documenta a migração futura do transporte observável
+  `neuralia:?cap=...` para WebView2 IPC; esta release não declara essa migração
+  como implementada.
+
+### Validation
+- CI completo verde no candidato integrado pelo PR #14, incluindo core,
+  Windows, dependency audit, build release, Home performance e cinco ciclos
+  de lifecycle WebView.
+
 ## [2.0.0] - 2026-09-19
 
 NeuralIA passa de comparador multi-IA para uma base local-first de pesquisa,
