@@ -155,27 +155,71 @@ pub fn hashed_embedding(text: &str) -> Vec<f32> {
     vector
 }
 
+/// A camada semântica mínima, numa tabela só: a forma canónica e as palavras
+/// que lhe chegam. Duas funções leem daqui -- a que gera a feature do
+/// embedding e a que alarga a pesquisa lexical -- porque duas tabelas com os
+/// mesmos sinónimos divergem sem nada as apanhar.
+const SEMANTIC_GROUPS: &[&[&str]] = &[
+    &[
+        "simd-vector",
+        "simd",
+        "vetor",
+        "vetores",
+        "vetorial",
+        "vector",
+        "vectors",
+        "vectorial",
+    ],
+    &[
+        "cpu-processor",
+        "cpu",
+        "cpus",
+        "processador",
+        "processadores",
+        "processor",
+        "processors",
+    ],
+    &[
+        "optimization",
+        "otimização",
+        "otimizacao",
+        "otimizar",
+        "optimize",
+        "optimise",
+    ],
+    &["memory", "memória", "memoria"],
+    &["browser", "navegador", "navegadores", "browsers"],
+    &["research", "pesquisa", "pesquisar"],
+    &["agent", "agente", "agentes", "agents"],
+    &["security", "segurança", "seguranca"],
+    &["source", "fonte", "fontes", "sources"],
+    &["answer", "resposta", "respostas", "answers"],
+    &["code", "código", "codigo"],
+];
+
+fn semantic_group(word: &str) -> Option<&'static [&'static str]> {
+    SEMANTIC_GROUPS
+        .iter()
+        .find(|group| group.contains(&word))
+        .copied()
+}
+
 fn canonical_semantic_token(word: &str) -> &str {
-    match word {
-        "simd" | "vetor" | "vetores" | "vetorial" | "vector" | "vectors" | "vectorial" => {
-            "simd-vector"
-        }
-        "cpu" | "cpus" | "processador" | "processadores" | "processor" | "processors" => {
-            "cpu-processor"
-        }
-        "otimização" | "otimizacao" | "otimizar" | "optimization" | "optimize" | "optimise" => {
-            "optimization"
-        }
-        "memória" | "memoria" | "memory" => "memory",
-        "navegador" | "navegadores" | "browser" | "browsers" => "browser",
-        "pesquisa" | "pesquisar" | "research" => "research",
-        "agente" | "agentes" | "agent" | "agents" => "agent",
-        "segurança" | "seguranca" | "security" => "security",
-        "fonte" | "fontes" | "source" | "sources" => "source",
-        "resposta" | "respostas" | "answer" | "answers" => "answer",
-        "código" | "codigo" | "code" => "code",
-        _ => word,
+    match semantic_group(word) {
+        Some(group) => group[0],
+        None => word,
     }
+}
+
+/// As palavras que partilham o sentido de `word`, ela incluída, ou nada quando
+/// a palavra não está na tabela.
+///
+/// Serve o candidato lexical: sem isto, a ponte português/inglês que o
+/// `hashed_embedding` constrói só chega ao reranking se o documento já tiver
+/// entrado na lista de candidatos por partilhar palavras -- e um documento em
+/// inglês nunca partilha a palavra portuguesa que se procurou.
+pub fn semantic_expansion(word: &str) -> &'static [&'static str] {
+    semantic_group(word).unwrap_or(&[])
 }
 
 fn add_feature(vector: &mut [f32], bytes: &[u8], weight: f32) {

@@ -12,6 +12,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::{MemoryDocument, MemoryRelation, MemoryTombstone};
+use crate::local_intelligence::semantic_expansion;
 use crate::research::ResearchSession;
 
 const SCHEMA_VERSION: i64 = 1;
@@ -698,11 +699,22 @@ pub(super) fn candidate_ids(
         return Ok(Vec::new());
     }
 
-    let match_query = terms
-        .into_iter()
-        .map(|term| format!("\"{term}\"*"))
-        .collect::<Vec<_>>()
-        .join(" OR ");
+    // Cada termo entra com os seus equivalentes conhecidos. Sem isto, a ponte
+    // português/inglês que o `hashed_embedding` constrói nunca chega ao
+    // reranking: um documento em inglês não partilha a palavra portuguesa que
+    // se procurou, logo não entra na lista de candidatos e a fase semântica
+    // nem o vê.
+    let mut wanted = Vec::new();
+    for term in terms {
+        for word in std::iter::once(term.as_str()).chain(semantic_expansion(&term).iter().copied())
+        {
+            let quoted = format!("\"{word}\"*");
+            if !wanted.contains(&quoted) {
+                wanted.push(quoted);
+            }
+        }
+    }
+    let match_query = wanted.join(" OR ");
     let candidate_limit = limit.clamp(1, 512) as i64;
 
     let connection = open_ready(path)?;
