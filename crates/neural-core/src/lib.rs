@@ -1,3 +1,5 @@
+pub mod semantic_timeline;
+pub mod agent_runtime;
 pub mod research;
 pub mod memory;
 pub mod local_intelligence;
@@ -37,3 +39,9 @@ pub use memory::{
 pub use research::{
     ComparisonFact, ResearchItem, ResearchItemKind, ResearchSession, SynthesisSnapshot,
 };
+
+pub use agent_runtime::{
+    AgentAction, AgentElement, AgentOutcome, AgentPlanner, AgentRuntime, AgentRuntimeConfig,
+    AgentToolExecutor, ObservedPage, ToolResult,
+};
+pub use semantic_timeline::{SemanticAnchor, SemanticAnchorKind, semantic_anchors_html};
