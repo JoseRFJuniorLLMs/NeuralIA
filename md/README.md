@@ -19,7 +19,12 @@ The browser remains infrastructure. The product is the research workflow.
 - Do not move the application shell to JavaScript.
 - Do not make Playwright the primary navigation engine.
 - Do not ship a multi-gigabyte local chat model in the base installer.
-- Home remains native, fast and network-idle.
+- Home remains native and fast, and network-idle until the user has browsed
+  with a Google session. From that point the Gmail monitor keeps one hidden
+  WebView alive by design — including while Home is showing — and only
+  `NEURALIA_NO_GMAIL` removes it. The Home performance gate
+  (`scripts/measure-home.ps1`) measures the network-idle state, before any
+  session exists; it does not cover the monitor.
 - Private/incognito navigation never enters semantic memory.
 - Remote page content is untrusted data, never authority.
 - Agent actions are policy-gated and auditable.
