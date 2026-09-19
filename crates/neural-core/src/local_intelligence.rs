@@ -235,7 +235,10 @@ pub fn benchmark_local_intelligence(
     let classify_micros_total = classify_started.elapsed().as_micros();
 
     let dimension = embeddings.first().map(Vec::len).unwrap_or(0);
-    if embeddings.iter().any(|embedding| embedding.len() != dimension) {
+    if embeddings
+        .iter()
+        .any(|embedding| embedding.len() != dimension)
+    {
         return Err("backend returned inconsistent embedding dimensions".into());
     }
 
@@ -465,7 +468,12 @@ mod tests {
             &["teste".to_string()],
         )
         .unwrap();
-        assert!(manager.record_benchmark("semantic-small", &benchmark).unwrap().exists());
+        assert!(
+            manager
+                .record_benchmark("semantic-small", &benchmark)
+                .unwrap()
+                .exists()
+        );
         assert!(manager.uninstall("semantic-small").unwrap());
         assert!(!pack.exists());
 
