@@ -2202,7 +2202,7 @@ impl App {
         let capability = remote_capability();
         let navigation_capability = capability.clone();
         let init_script = format!(
-            "window.__neuralia_col_index = {source_index}; window.__neuralia_col_name = '{source_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{NEURALIA_PALETTE_SCRIPT}\n{SPLIT_PANEL_SCRIPT}"
+            "window.__neuralia_col_index = {source_index}; window.__neuralia_col_name = '{source_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{NEURALIA_PALETTE_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}\n{SPLIT_PANEL_SCRIPT}"
         )
         .replace("__NEURALIA_CAP__", &capability);
 
@@ -3023,6 +3023,18 @@ impl App {
             action(webview);
         }
         if let Some(comp) = &self.comparator {
+            if let Some(split) = &comp.split {
+                if split.fullscreen {
+                    action(&split.webview);
+                    return;
+                }
+                if let Some(view) = comp.views.get(split.source_index) {
+                    action(&view.webview);
+                }
+                action(&split.webview);
+                return;
+            }
+
             match comp.expanded {
                 Some(index) => {
                     if let Some(view) = comp.views.get(index) {
@@ -4708,6 +4720,14 @@ mod tests {
     }
 
     #[test]
+    fn split_view_uses_neuralia_scroll_rail_and_auto_scroll() {
+        assert!(SPLIT_SCROLL_RAIL_SCRIPT.contains("neuralia-split-scroll-rail"));
+        assert!(SPLIT_SCROLL_RAIL_SCRIPT.contains("scrollbar-width:none"));
+        assert!(SPLIT_SCROLL_RAIL_SCRIPT.contains("scrollToPosition"));
+        assert!(SPLIT_SCROLL_RAIL_SCRIPT.contains("top:'50%'"));
+    }
+
+    #[test]
     fn auto_scroll_supports_all_three_internal_scroll_roots() {
         assert!(AUTO_SCROLL_SCRIPT.contains("[class*=\"overflow\"]"));
         assert!(AUTO_SCROLL_SCRIPT.contains("[class*=\"scroll\"]"));
@@ -5651,6 +5671,167 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
     setTimeout(submitWhenReady, 100);
   }
 })();
+"#;
+
+const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
+document.addEventListener('DOMContentLoaded', () => {
+  if (document.getElementById('neuralia-split-scroll-rail')) return;
+
+  const style = document.createElement('style');
+  style.id = 'neuralia-split-scroll-style';
+  style.textContent = [
+    '*{scrollbar-width:none!important;-ms-overflow-style:none!important;}',
+    '*::-webkit-scrollbar{width:0!important;height:0!important;display:none!important;background:transparent!important;}'
+  ].join('');
+  document.documentElement.appendChild(style);
+
+  let currentRoot = null;
+  function scrollRoot() {
+    const docRoot = document.scrollingElement || document.documentElement || document.body;
+    const candidates = docRoot ? [docRoot] : [];
+    document.querySelectorAll(
+      'main,[role="main"],[data-radix-scroll-area-viewport],'
+      + '[data-testid*="scroll"],[class*="scroll"],[class*="overflow"],[style*="overflow"]'
+    ).forEach((el) => candidates.push(el));
+
+    let best = docRoot;
+    let bestRange = best ? Math.max(0, best.scrollHeight - best.clientHeight) : 0;
+    for (const el of candidates) {
+      if (!el || el === document.body) continue;
+      const range = Math.max(0, el.scrollHeight - el.clientHeight);
+      if (range <= bestRange + 24) continue;
+      const css = getComputedStyle(el);
+      if (css.display === 'none' || css.visibility === 'hidden' || css.overflowY === 'hidden') continue;
+      best = el;
+      bestRange = range;
+    }
+    currentRoot = best || docRoot;
+    return currentRoot;
+  }
+
+  function metrics() {
+    const root = scrollRoot();
+    if (!root) return { root:null, top:0, max:0, docLike:true };
+    const docLike = root === document.scrollingElement
+      || root === document.documentElement || root === document.body;
+    return {
+      root,
+      docLike,
+      top: docLike ? window.scrollY : root.scrollTop,
+      max: Math.max(0, root.scrollHeight - root.clientHeight)
+    };
+  }
+
+  function scrollToPosition(top) {
+    const state = metrics();
+    const value = Math.max(0, Math.min(state.max, top));
+    if (state.docLike) window.scrollTo({ top:value, behavior:'smooth' });
+    else if (state.root) state.root.scrollTo({ top:value, behavior:'smooth' });
+  }
+
+  const rail = document.createElement('div');
+  rail.id = 'neuralia-split-scroll-rail';
+  Object.assign(rail.style, {
+    position:'fixed', top:'50%', right:'7px', transform:'translateY(-50%)',
+    zIndex:'2147483646', pointerEvents:'auto', width:'44px',
+    minHeight:'240px', maxHeight:'58vh',
+    display:'flex', flexDirection:'column', alignItems:'center',
+    justifyContent:'space-between', opacity:'.68',
+    transition:'opacity .18s ease', fontFamily:'Segoe UI, system-ui, sans-serif'
+  });
+  rail.onmouseenter = () => { rail.style.opacity = '1'; };
+  rail.onmouseleave = () => { rail.style.opacity = '.68'; };
+
+  function arrow(symbol, title, direction) {
+    const button = document.createElement('button');
+    button.textContent = symbol;
+    button.title = title;
+    Object.assign(button.style, {
+      width: direction > 0 ? '42px' : '32px',
+      height: direction > 0 ? '42px' : '28px',
+      border: direction > 0 ? '1px solid rgba(255,255,255,.08)' : '0',
+      borderRadius:'50%', padding:'0',
+      background: direction > 0 ? 'rgba(38,38,38,.94)' : 'transparent',
+      color: direction > 0 ? '#f4f4f4' : 'rgba(255,255,255,.46)',
+      boxShadow: direction > 0 ? '0 6px 20px rgba(0,0,0,.28)' : 'none',
+      fontSize:'21px', lineHeight: direction > 0 ? '38px' : '26px',
+      cursor:'pointer'
+    });
+    button.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const state = metrics();
+      const view = state.root ? state.root.clientHeight : window.innerHeight;
+      scrollToPosition(state.top + Math.max(220, view * .82) * direction);
+    };
+    return button;
+  }
+
+  const ticks = document.createElement('div');
+  Object.assign(ticks.style, {
+    width:'34px', flex:'1', margin:'8px 0 10px',
+    display:'flex', flexDirection:'column',
+    justifyContent:'space-evenly', alignItems:'flex-end',
+    cursor:'pointer'
+  });
+
+  function rebuildTicks() {
+    const state = metrics();
+    const view = state.root ? state.root.clientHeight : window.innerHeight;
+    const count = Math.max(5, Math.min(11,
+      Math.ceil((state.max + Math.max(view, 1)) / Math.max(view, 1))));
+    if (ticks.children.length === count) return;
+    ticks.textContent = '';
+    for (let i = 0; i < count; i++) {
+      const tick = document.createElement('div');
+      Object.assign(tick.style, {
+        height:'2px', width:i === 0 ? '30px' : '14px', borderRadius:'2px',
+        background:'rgba(255,255,255,.30)',
+        transition:'width .16s ease, background .16s ease, opacity .16s ease'
+      });
+      tick.onclick = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const state = metrics();
+        const fraction = count <= 1 ? 0 : i / (count - 1);
+        scrollToPosition(state.max * fraction);
+      };
+      ticks.appendChild(tick);
+    }
+  }
+
+  function syncTicks() {
+    rebuildTicks();
+    const state = metrics();
+    const progress = state.max <= 0 ? 0 : Math.max(0, Math.min(1, state.top / state.max));
+    const count = ticks.children.length;
+    const active = Math.round(progress * Math.max(0, count - 1));
+    Array.from(ticks.children).forEach((tick, i) => {
+      const selected = i === active;
+      tick.style.width = selected ? '32px' : (Math.abs(i - active) === 1 ? '22px' : '13px');
+      tick.style.background = selected ? '#fff' : 'rgba(255,255,255,.32)';
+      tick.style.opacity = selected ? '1' : (Math.abs(i - active) === 1 ? '.78' : '.55');
+    });
+  }
+
+  rail.appendChild(arrow('⌃', 'Página anterior', -1));
+  rail.appendChild(ticks);
+  rail.appendChild(arrow('⌄', 'Próxima página', 1));
+  document.documentElement.appendChild(rail);
+
+  let raf = 0;
+  const scheduleSync = () => {
+    if (raf) return;
+    raf = requestAnimationFrame(() => { raf = 0; syncTicks(); });
+  };
+  window.addEventListener('scroll', scheduleSync, { passive:true });
+  document.addEventListener('scroll', scheduleSync, { passive:true, capture:true });
+  window.addEventListener('resize', scheduleSync, { passive:true });
+  new MutationObserver(scheduleSync).observe(document.documentElement, {
+    childList:true, subtree:true
+  });
+  syncTicks();
+});
 "#;
 
 const SPLIT_PANEL_SCRIPT: &str = r#"
