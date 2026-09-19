@@ -75,7 +75,8 @@ Uma string JSON, sempre com estes quatro campos e nenhum outro:
 - `args` — objeto com os parâmetros exatos da ação (`col`, `url`, `count`,
   `sender`, `subject`, `key`, `text`, `data`). Campos extras ou tipos errados
   são rejeitados; índices são validados contra `COMPARATOR_COLUMNS`; `url`
-  passa por `validate_web_url` e não pode pivotar para rede local; strings são
+  passa por `validate_web_url` e rejeita alvos locais/privados/special óbvios
+  antes de DNS; a camada IPC não afirma filtragem DNS pré-conexão do WebView2; strings são
   recusadas acima dos limites definidos (180/2048 chars e payload do observer
   limitado antes da serialização).
 

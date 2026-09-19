@@ -3,9 +3,8 @@
 use std::{
     borrow::Cow,
     cell::Cell,
-    collections::{BinaryHeap, hash_map::RandomState},
+    collections::BinaryHeap,
     ffi::OsString,
-    hash::{BuildHasher, Hasher},
     sync::{
         Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
@@ -6909,8 +6908,20 @@ fn route_palette(input: &str, source_index: usize, private: bool) -> PaletteRout
 /// Token que so os scripts injetados conhecem: 128 bits do RNG do sistema.
 /// Se o BCrypt falhar, o SipHash com semente aleatoria de antes entra a
 /// misturar-se com o que houver no buffer, para nunca sair um token vazio.
-fn remote_capability() -> String {
+fn capability_from_rng(status: i32, bytes: [u8; 16]) -> Option<String> {
+    if status != 0 {
+        return None;
+    }
+
     use std::fmt::Write as _;
+    let mut token = String::with_capacity(32);
+    for byte in bytes {
+        let _ = write!(token, "{byte:02x}");
+    }
+    Some(token)
+}
+
+fn remote_capability() -> String {
     let mut bytes = [0u8; 16];
     // SAFETY: buffer valido com o tamanho declarado; sem handle de algoritmo,
     // a flag manda usar o RNG preferido do sistema.
@@ -6922,29 +6933,9 @@ fn remote_capability() -> String {
             BCRYPT_USE_SYSTEM_PREFERRED_RNG,
         )
     };
-    if status != 0 {
-        let mut left = RandomState::new().build_hasher();
-        left.write_u64(now_ms());
-        left.write_u8(0x5a);
 
-        let mut right = RandomState::new().build_hasher();
-        right.write_u64(now_ms().rotate_left(17));
-        right.write_u8(0xa5);
-
-        let mix = left
-            .finish()
-            .to_le_bytes()
-            .into_iter()
-            .chain(right.finish().to_le_bytes());
-        for (byte, extra) in bytes.iter_mut().zip(mix) {
-            *byte ^= extra;
-        }
-    }
-    let mut token = String::with_capacity(32);
-    for byte in bytes {
-        let _ = write!(token, "{byte:02x}");
-    }
-    token
+    capability_from_rng(status, bytes)
+        .expect("BCryptGenRandom failed; refusing to create an unauthenticated WebView capability")
 }
 
 fn remote_web_target(target: &str, allow_local: bool) -> bool {
@@ -9157,6 +9148,16 @@ mod tests {
         assert!(top.contains("JSON.stringify"));
         assert!(top.contains("const defer = setTimeout;"));
         assert!(top.contains("const cancelDefer = clearTimeout;"));
+    }
+
+    #[test]
+    fn capability_generation_fails_closed_when_system_rng_fails() {
+        let bytes = [0xabu8; 16];
+        assert_eq!(
+            capability_from_rng(0, bytes),
+            Some("abababababababababababababababab".to_string())
+        );
+        assert_eq!(capability_from_rng(-1, bytes), None);
     }
 
     #[test]
