@@ -16,7 +16,7 @@ A implementação tem uma boa base de política nativa, mas hoje existem **dois 
 
 Essa duplicação cria divergências entre aquilo que os testes de core provam e aquilo que o produto realmente executa.
 
-A auditoria encontrou um achado crítico, sete altos e vários médios.
+A auditoria encontrou um achado crítico, nove altos e vários médios.
 
 ---
 
@@ -413,6 +413,91 @@ O stop deve **persistir um log redigido**, não simplesmente apagar o run.
 
 ---
 
+## HIGH-08 — policy core não restringe Navigate a HTTP(S)
+
+### Evidência
+
+`AgentPermissionPolicy::evaluate_live` para `Navigate` faz:
+
+1. `Url::parse`;
+2. teste de rede local/private;
+3. teste de approved origin somente quando `initial_origin.is_some()`;
+4. cai em `ActionRisk::ReadOnly => allow`.
+
+Não há validação de scheme.
+
+Com `AgentPermissionPolicy::new(None)`, URLs como:
+
+```text
+file:///C:/Windows/win.ini
+data:text/html,...
+javascript:alert(1)
+```
+
+podem chegar à decisão read-only permitida no core.
+
+O app Windows filtra a URL inicial por `validate_web_url` e a bridge atual nem
+executa `AgentAction::Navigate`, mas a policy é a fronteira reutilizável e não
+deve depender de cada executor repetir o filtro.
+
+### Correção recomendada
+
+`AgentSecurityAction::Navigate` deve aceitar apenas `http` e `https` no
+próprio policy engine, antes de origin/local-network checks.
+
+Schemes internos precisam de ações tipadas separadas, nunca de Navigate genérico.
+
+### Reprodução
+
+Adicionada como `#[ignore]` em
+`agent_security_known_gaps.rs`.
+
+---
+
+## HIGH-09 — leak do canal SPEC-0108 também permite forjar observações do agente
+
+### Evidência
+
+O `AGENT_OBSERVER_SCRIPT` envia:
+
+```text
+neuralia:agent-observation?data=...&cap=TOKEN
+```
+
+A própria SPEC-0108 já demonstra que a Navigation API da página consegue
+observar URLs `neuralia:` e portanto ler o token.
+
+Depois de observar um token válido, uma página hostil pode tentar emitir uma
+nova URL `agent-observation` com:
+
+- generation escolhida;
+- URL/origin escolhidos;
+- nomes/roles de elementos escolhidos;
+- IDs que ela mesma colocou no DOM.
+
+Isso se combina com HIGH-02/HIGH-05/HIGH-06. O token leak não é apenas um
+problema de atalhos UI; ele contamina a cadeia de autoridade do agente.
+
+### Consequência de release
+
+Enquanto SPEC-0108 não estiver implementada, a revisão independente deve decidir
+explicitamente se o comando `agent:` pode permanecer exposto ou se precisa ser
+desabilitado/feature-gated até 2.1.0.
+
+Não esconder essa decisão atrás do fato de a feature exigir comando manual.
+
+### Correção definitiva
+
+SPEC-0108:
+
+```text
+agent-observation -> WebView2 postMessage -> typed native parser
+```
+
+sem capability em URL observável.
+
+---
+
 ## MEDIUM-01 — wall-time não é hard deadline
 
 O relógio é checado antes de cada iteração.
@@ -540,7 +625,9 @@ como pede SPEC-0105 §12.
 # Ordem de correção sugerida
 
 1. CRITICAL-01: persistência de segredo;
-2. HIGH-03: grant cross-origin;
+2. HIGH-09: canal de observação do agente dependente da correção SPEC-0108;
+3. HIGH-08: scheme gate na policy;
+4. HIGH-03: grant cross-origin;
 3. HIGH-05: classificação de ação sensível;
 4. HIGH-02: referência opaca/autenticada;
 5. HIGH-01: sanitização tipada antes do planner;
