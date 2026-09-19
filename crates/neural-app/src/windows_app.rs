@@ -30,7 +30,8 @@ use windows_sys::Win32::{
         DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject,
         DrawTextW, Ellipse, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC, InvalidateRect, LineTo,
         MoveToEx, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC, SRCCOPY, SelectObject,
-        SetBkColor, SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits, TRANSPARENT,
+        ScreenToClient, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits,
+        TRANSPARENT,
     },
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     UI::{
@@ -40,10 +41,10 @@ use windows_sys::Win32::{
         },
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
-            ES_AUTOHSCROLL, GetCapture, GetClientRect, GetCursorPos, GetForegroundWindow,
-            GetWindowTextLengthW, GetWindowTextW, MB_ICONINFORMATION, MB_OK, MF_SEPARATOR,
-            MF_STRING, MessageBoxW, ReleaseCapture, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
-            ScreenToClient, SendMessageW, SetCapture, SetWindowPos, SetWindowTextW, ShowWindow,
+            ES_AUTOHSCROLL, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowTextLengthW,
+            GetWindowTextW, MB_ICONINFORMATION, MB_OK, MF_SEPARATOR, MF_STRING, MessageBoxW,
+            SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos,
+            SetWindowTextW, ShowWindow,
             TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE,
             WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
         },
@@ -571,6 +572,13 @@ unsafe extern "system" {
         reference_data: usize,
     ) -> i32;
     fn DefSubclassProc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetCapture() -> HWND;
+    fn SetCapture(hwnd: HWND) -> HWND;
+    fn ReleaseCapture() -> i32;
 }
 
 /// Pincel de fundo da omnibox, um por cor. Criar um a cada WM_CTLCOLOREDIT
@@ -1882,7 +1890,6 @@ impl App {
             .replace("__NEURALIA_CAP__", &capability);
 
         WebViewBuilder::new()
-            .with_incognito(private)
             .with_initialization_script(init_script)
             .with_navigation_handler(move |target| {
                 if let Some(event) = remote_neuralia_action(&target, &navigation_capability) {
@@ -2434,6 +2441,7 @@ impl App {
         .replace("__NEURALIA_CAP__", &capability);
 
         WebViewBuilder::new()
+            .with_incognito(private)
             .with_initialization_script(init_script)
             .with_navigation_handler(move |target| {
                 if target.starts_with("neuralia:split-close") {
