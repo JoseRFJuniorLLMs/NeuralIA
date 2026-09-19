@@ -16,9 +16,10 @@ use std::{
 use image::RgbaImage;
 
 use neural_core::{
-    CoreConfig, HistoryEntry, HistoryKind, HistoryStore, Intent, ReaderArticle, ReaderClient,
-    chatgpt_search_url, claude_search_url, google_ai_url, is_local_network_target, is_pdf_url,
-    parse_intent, reader_html,
+    CoreConfig, HistoryEntry, HistoryKind, HistoryStore, Intent, MemoryDocument, MemoryHit,
+    MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore, ReaderArticle, ReaderBlock,
+    ReaderClient, ResearchSession, chatgpt_search_url, claude_search_url, google_ai_url,
+    is_local_network_target, is_pdf_url, parse_intent, reader_html,
 };
 use url::Url;
 use windows_sys::Win32::{
@@ -94,6 +95,11 @@ enum UserEvent {
     ShowHistory,
     ClearHistory,
     HistoryCleared(Result<(), String>),
+    MemoryQueryReady {
+        query: String,
+        result: Result<Vec<MemoryHit>, String>,
+    },
+    MemoryCleared(Result<(), String>),
     /// Esconde outra vez a barra em ecra completo, se nada a tiver reavivado.
     HideChrome(u64),
     SubmitText(String),
@@ -1263,6 +1269,143 @@ impl HistoryWriter {
     }
 }
 
+enum MemoryCommand {
+    Capture(MemoryDocument),
+    Query(String),
+    Clear,
+    SaveSession(ResearchSession),
+    Rebuild,
+}
+
+#[derive(Clone)]
+struct MemoryWorker {
+    tx: SyncSender<MemoryCommand>,
+}
+
+impl MemoryWorker {
+    fn new(root: std::path::PathBuf, proxy: EventLoopProxy<UserEvent>) -> Self {
+        let (tx, rx) = sync_channel::<MemoryCommand>(128);
+        let _ = thread::Builder::new()
+            .name("neural-memory".into())
+            .spawn(move || {
+                let store = match MemoryStore::new(&root) {
+                    Ok(store) => store,
+                    Err(error) => {
+                        eprintln!("memory store unavailable: {error}");
+                        while let Ok(command) = rx.recv() {
+                            match command {
+                                MemoryCommand::Query(query) => {
+                                    let _ = proxy.send_event(UserEvent::MemoryQueryReady {
+                                        query,
+                                        result: Err(error.to_string()),
+                                    });
+                                }
+                                MemoryCommand::Clear => {
+                                    let _ = proxy.send_event(UserEvent::MemoryCleared(Err(
+                                        error.to_string(),
+                                    )));
+                                }
+                                _ => {}
+                            }
+                        }
+                        return;
+                    }
+                };
+
+                while let Ok(command) = rx.recv() {
+                    match command {
+                        MemoryCommand::Capture(document) => {
+                            if let Err(error) = store.capture(document) {
+                                eprintln!("memory capture failed: {error}");
+                            }
+                        }
+                        MemoryCommand::Query(query) => {
+                            let result = if query.trim().is_empty() {
+                                store.documents().map(|documents| {
+                                    documents
+                                        .into_iter()
+                                        .take(20)
+                                        .map(|document| MemoryHit {
+                                            id: document.id,
+                                            title: document.title,
+                                            url: document.url,
+                                            provider: document.provider,
+                                            session_id: document.session_id,
+                                            excerpt: document
+                                                .body
+                                                .split_whitespace()
+                                                .take(36)
+                                                .collect::<Vec<_>>()
+                                                .join(" "),
+                                            score: 0.0,
+                                            matched_by: vec!["recent".into()],
+                                        })
+                                        .collect()
+                                })
+                            } else {
+                                store.query(&MemoryQuery::new(query.clone()))
+                            }
+                            .map_err(|error| error.to_string());
+                            let _ = proxy.send_event(UserEvent::MemoryQueryReady { query, result });
+                        }
+                        MemoryCommand::Clear => {
+                            let result = store
+                                .forget(neural_core::ForgetScope::All)
+                                .map(|_| ())
+                                .map_err(|error| error.to_string());
+                            let _ = proxy.send_event(UserEvent::MemoryCleared(result));
+                        }
+                        MemoryCommand::SaveSession(session) => {
+                            if let Err(error) = session.save(store.root()) {
+                                eprintln!("research session save failed: {error}");
+                            }
+                        }
+                        MemoryCommand::Rebuild => {
+                            if let Err(error) = store.rebuild() {
+                                eprintln!("memory rebuild failed: {error}");
+                            }
+                        }
+                    }
+                }
+            });
+        Self { tx }
+    }
+
+    fn capture(&self, document: MemoryDocument) {
+        if self.tx.try_send(MemoryCommand::Capture(document)).is_err() {
+            eprintln!("memory queue saturated; dropping one capture");
+        }
+    }
+
+    fn query(&self, query: String) {
+        if self.tx.try_send(MemoryCommand::Query(query)).is_err() {
+            eprintln!("memory queue saturated; query not scheduled");
+        }
+    }
+
+    fn clear(&self) {
+        if self.tx.try_send(MemoryCommand::Clear).is_err() {
+            eprintln!("memory queue saturated; clear not scheduled");
+        }
+    }
+
+    fn save_session(&self, session: ResearchSession) {
+        if self
+            .tx
+            .try_send(MemoryCommand::SaveSession(session))
+            .is_err()
+        {
+            eprintln!("memory queue saturated; session save not scheduled");
+        }
+    }
+
+    fn rebuild(&self) {
+        if self.tx.try_send(MemoryCommand::Rebuild).is_err() {
+            eprintln!("memory queue saturated; rebuild not scheduled");
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct UiRect {
     x: f64,
@@ -1349,6 +1492,8 @@ struct App {
     config: CoreConfig,
     history_store: HistoryStore,
     history: HistoryWriter,
+    memory: MemoryWorker,
+    current_research: Option<ResearchSession>,
     reader: ReaderWorker,
     /// Worker unico para documentos binarios. Um pedido novo substitui o
     /// pendente, evitando uma thread/socket de 90 s por clique em PDF.
@@ -1370,6 +1515,7 @@ impl App {
         let history_store =
             HistoryStore::with_limit(config.data_dir.join("history.jsonl"), config.history_limit);
         let history = HistoryWriter::new(history_store.clone(), proxy.clone());
+        let memory = MemoryWorker::new(config.data_dir.join("memory"), proxy.clone());
         let reader_client = ReaderClient::new(config.reader_timeout_secs, config.reader_max_bytes);
         let navigation_generation = Arc::new(AtomicU64::new(0));
         let reader = ReaderWorker::new(
@@ -1419,6 +1565,8 @@ impl App {
             config,
             history_store,
             history,
+            memory,
+            current_research: None,
             reader,
             surface: Surface::Home,
             navigation_generation,
@@ -1703,7 +1851,17 @@ impl App {
         self.request_redraw();
     }
 
-    fn show_history(&self) {
+    fn show_history(&mut self) {
+        self.set_omnibox_text("memory:");
+        self.focus_omnibox();
+        self.show_splash(
+            "Memória semântica: descreva o que você quer reencontrar e pressione Enter."
+                .to_string(),
+            4,
+        );
+    }
+
+    fn show_recent_history(&self) {
         let text = match self.history_store.recent(20) {
             Ok(entries) if entries.is_empty() => "Histórico local vazio.".to_string(),
             Ok(entries) => entries
@@ -1720,16 +1878,18 @@ impl App {
                 .join("\r\n"),
             Err(error) => format!("Não foi possível ler o histórico: {error}"),
         };
+        self.show_native_text("NeuralIA — Histórico cronológico", &text);
+    }
 
+    fn show_native_text(&self, title: &str, text: &str) {
         let Some(window) = &self.window else {
             return;
         };
         let Some(hwnd) = window_hwnd(window) else {
             return;
         };
-
-        let body = wide_null(&text);
-        let title = wide_null("NeuralIA — Histórico local");
+        let body = wide_null(text);
+        let title = wide_null(title);
         unsafe {
             MessageBoxW(
                 hwnd,
@@ -1740,7 +1900,64 @@ impl App {
         }
     }
 
+    fn show_memory_results(&self, query: &str, result: Result<Vec<MemoryHit>, String>) {
+        let text = match result {
+            Err(error) => format!("Não foi possível consultar a memória: {error}"),
+            Ok(hits) if hits.is_empty() => {
+                if query.trim().is_empty() {
+                    "Memória semântica vazia.".to_string()
+                } else {
+                    format!("Nenhum resultado para \"{query}\".")
+                }
+            }
+            Ok(hits) => hits
+                .into_iter()
+                .enumerate()
+                .map(|(index, hit)| {
+                    let source = hit
+                        .provider
+                        .as_deref()
+                        .or(hit.url.as_deref())
+                        .unwrap_or("local");
+                    let via = hit.matched_by.join("+");
+                    format!(
+                        "{}. {}\r\n   {} · {}\r\n   {}{}",
+                        index + 1,
+                        hit.title,
+                        source,
+                        via,
+                        hit.excerpt,
+                        hit.url
+                            .as_deref()
+                            .map(|url| format!("\r\n   {url}"))
+                            .unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\r\n\r\n"),
+        };
+        self.show_native_text("NeuralIA — Memória semântica", &text);
+    }
+
     fn handle_input(&mut self, input: String) {
+        if let Some(query) = input
+            .strip_prefix("memory:")
+            .or_else(|| input.strip_prefix("mem:"))
+        {
+            self.memory.query(query.trim().to_string());
+            self.show_splash("Buscando na memória local…".to_string(), 2);
+            return;
+        }
+        if input.trim().eq_ignore_ascii_case("history:") {
+            self.show_recent_history();
+            return;
+        }
+        if input.trim().eq_ignore_ascii_case("memory:rebuild") {
+            self.memory.rebuild();
+            self.show_splash("Reconstrução da memória agendada.".to_string(), 3);
+            return;
+        }
+
         match parse_intent(&input) {
             Ok(Intent::Home) => self.show_home(),
             Ok(Intent::Ask(query)) => self.ask(query),
@@ -1777,6 +1994,20 @@ impl App {
     /// para o Google AI Mode, o ChatGPT e o Claude, lado a lado.
     fn compare(&mut self, query: String) {
         self.next_generation();
+
+        let session = ResearchSession::new(query.clone());
+        let question_memory = MemoryDocument::new(
+            MemoryKind::ResearchResult,
+            MemorySourceKind::Note,
+            format!("Pesquisa · {}", session.title),
+            None,
+            query.clone(),
+        )
+        .session(session.id.clone());
+        self.memory.capture(question_memory);
+        self.memory.save_session(session.clone());
+        self.current_research = Some(session);
+
         self.record(
             HistoryKind::Ask,
             format!("compare:{query}"),
@@ -1880,6 +2111,21 @@ impl App {
                 self.webview = Some(webview);
                 self.surface = Surface::Pdf;
                 self.record(HistoryKind::Read, url.to_string(), url.to_string());
+                let mut document = MemoryDocument::new(
+                    MemoryKind::Source,
+                    MemorySourceKind::Pdf,
+                    Url::parse(url)
+                        .ok()
+                        .and_then(|parsed| parsed.path_segments()?.next_back().map(str::to_string))
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| "Documento PDF".to_string()),
+                    Some(url.to_string()),
+                    format!("Documento PDF aberto no NeuralIA: {url}"),
+                );
+                if let Some(session) = &self.current_research {
+                    document = document.session(session.id.clone());
+                }
+                self.memory.capture(document);
                 self.begin_reading_session(true);
             }
             Err(error) => {
@@ -1890,6 +2136,31 @@ impl App {
 
     fn record(&self, kind: HistoryKind, input: String, target: String) {
         self.history.append(HistoryEntry::now(kind, input, target));
+    }
+
+    fn capture_reader_memory(&mut self, article: &ReaderArticle) {
+        let body = reader_article_memory_text(article);
+        let mut document = MemoryDocument::new(
+            MemoryKind::Source,
+            MemorySourceKind::Reader,
+            article.title.clone(),
+            Some(article.source_url.clone()),
+            body.clone(),
+        );
+
+        if let Some(session) = &mut self.current_research {
+            document = document.session(session.id.clone());
+            let memory_id = document.id.clone();
+            session.add_source(
+                None,
+                article.title.clone(),
+                article.source_url.clone(),
+                Some(memory_id),
+                body,
+            );
+            self.memory.save_session(session.clone());
+        }
+        self.memory.capture(document);
     }
 
     fn reader_webview_builder(&self) -> WebViewBuilder<'static> {
@@ -1987,6 +2258,23 @@ impl App {
                 let _ = webview.zoom(self.zoom);
                 self.webview = Some(webview);
                 self.surface = Surface::External;
+                if !allow_local {
+                    let title = Url::parse(url)
+                        .ok()
+                        .and_then(|parsed| parsed.host_str().map(str::to_string))
+                        .unwrap_or_else(|| "Página Web".to_string());
+                    let mut document = MemoryDocument::new(
+                        MemoryKind::Source,
+                        MemorySourceKind::Web,
+                        title,
+                        Some(url.to_string()),
+                        url.to_string(),
+                    );
+                    if let Some(session) = &self.current_research {
+                        document = document.session(session.id.clone());
+                    }
+                    self.memory.capture(document);
+                }
                 self.schedule_gmail_probe(4);
                 self.begin_reading_session(is_pdf);
             }
@@ -2593,6 +2881,35 @@ impl App {
         else {
             return;
         };
+
+        if !private {
+            let value = valid.to_string();
+            let title = valid
+                .host_str()
+                .map(|host| format!("Fonte · {host}"))
+                .unwrap_or_else(|| "Fonte Web".to_string());
+            let mut document = MemoryDocument::new(
+                MemoryKind::Source,
+                MemorySourceKind::Web,
+                title.clone(),
+                Some(value.clone()),
+                value.clone(),
+            )
+            .provider(source_name);
+            if let Some(session) = &mut self.current_research {
+                document = document.session(session.id.clone());
+                let memory_id = document.id.clone();
+                session.add_source(
+                    Some(source_name.to_string()),
+                    title,
+                    value.clone(),
+                    Some(memory_id),
+                    value,
+                );
+                self.memory.save_session(session.clone());
+            }
+            self.memory.capture(document);
+        }
 
         self.leave_fullscreen();
         if let Some(comp) = &mut self.comparator {
@@ -4119,6 +4436,29 @@ impl App {
     }
 }
 
+fn reader_article_memory_text(article: &ReaderArticle) -> String {
+    let mut output = String::new();
+    if let Some(excerpt) = &article.excerpt {
+        output.push_str(excerpt);
+        output.push_str("\n\n");
+    }
+    for block in &article.blocks {
+        let text = match block {
+            ReaderBlock::Heading { text, .. }
+            | ReaderBlock::Paragraph(text)
+            | ReaderBlock::Quote(text)
+            | ReaderBlock::Code(text)
+            | ReaderBlock::ListItem(text) => text,
+        };
+        if !text.trim().is_empty() {
+            output.push_str(text.trim());
+            output.push_str("\n\n");
+        }
+    }
+    output.truncate(output.len().min(512 * 1024));
+    output
+}
+
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -4205,15 +4545,29 @@ impl ApplicationHandler<UserEvent> for App {
             } => self.handle_gmail_state(unread, sender, subject, key),
             UserEvent::HideGmailToast(token) => self.hide_gmail_toast(token),
             UserEvent::ShowHistory => self.show_history(),
-            UserEvent::ClearHistory => match self.history.clear() {
+            UserEvent::ClearHistory => {
+                self.memory.clear();
+                match self.history.clear() {
                 None => {
                     self.show_home();
                     self.status = Some("A apagar o histórico local…".to_string());
                     self.request_redraw();
                 }
                 Some(result) => self.report_history_cleared(result),
-            },
+                }
+            }
             UserEvent::HistoryCleared(result) => self.report_history_cleared(result),
+            UserEvent::MemoryQueryReady { query, result } => {
+                self.show_memory_results(&query, result);
+            }
+            UserEvent::MemoryCleared(result) => {
+                if let Err(error) = result {
+                    self.show_splash(format!("Memória: {error}"), 4);
+                } else {
+                    self.status = Some("Histórico e memória semântica apagados.".to_string());
+                    self.request_redraw();
+                }
+            }
             UserEvent::HideChrome(token) => self.hide_chrome(token),
             UserEvent::SubmitText(input) => {
                 if self.surface == Surface::Home {
@@ -4282,6 +4636,7 @@ impl ApplicationHandler<UserEvent> for App {
                 match result {
                     Ok(article) => {
                         self.record(HistoryKind::Read, input, article.source_url.clone());
+                        self.capture_reader_memory(&article);
                         self.open_reader(&article);
                     }
                     Err(error) => self.show_native_error(format!("Reader: {error}")),
