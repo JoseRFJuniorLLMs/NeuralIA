@@ -733,6 +733,21 @@ mod tests {
     }
 
     #[test]
+    fn candidate_lookup_does_not_create_missing_sqlite_index() {
+        let path = temp_path("candidate-lazy");
+        assert!(!path.exists());
+
+        let ids = candidate_ids(&path, "rust memory", None, None, 20).unwrap();
+
+        assert!(ids.is_empty());
+        assert!(
+            !path.exists(),
+            "candidate lookup must stay lazy when the derived index is absent"
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn fts_candidate_ids_respect_provider_and_session_filters() {
         let path = temp_path("candidate-filters");
 
