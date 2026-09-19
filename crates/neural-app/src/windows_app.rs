@@ -9129,7 +9129,10 @@ mod tests {
             let capability = script
                 .find("const capability = '__NEURALIA_CAP__';")
                 .expect("capability declaration");
-            assert!(guard < capability, "{name}: frame guard must run before capability use");
+            assert!(
+                guard < capability,
+                "{name}: frame guard must run before capability use"
+            );
         }
     }
 
