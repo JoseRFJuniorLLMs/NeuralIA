@@ -68,6 +68,7 @@ jobs:
           Copy-Item ci-tested/NeuralIA.exe dist/NeuralIA.exe
           Copy-Item ci-tested/perf-home.json dist/perf-home.json
           Copy-Item ci-tested/perf-cycles.json dist/perf-cycles.json
+          Copy-Item ci-tested/authenticode.json dist/authenticode.json
 
           $sbom = Get-ChildItem crates/neural-app -File -Filter "*.json" |
             Where-Object { $_.Name -match "bom|cdx|cyclonedx" } |
