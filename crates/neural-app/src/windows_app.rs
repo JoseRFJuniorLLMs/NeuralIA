@@ -4643,7 +4643,7 @@ impl App {
         };
 
         let capability = remote_capability();
-        let navigation_capability = capability.clone();
+        let ipc_capability = capability.clone();
         let proxy = self.proxy.clone();
         let init_script = GMAIL_MONITOR_SCRIPT.replace("__NEURALIA_CAP__", &capability);
         let bounds = wry::Rect {
@@ -4653,19 +4653,25 @@ impl App {
 
         let result = WebViewBuilder::new()
             .with_initialization_script(init_script)
+            .with_ipc_handler(move |request| {
+                let Some(IpcAction::GmailState {
+                    unread,
+                    sender,
+                    subject,
+                    key,
+                }) = parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
+                else {
+                    return;
+                };
+                let _ = proxy.send_event(UserEvent::GmailInboxState {
+                    unread,
+                    sender,
+                    subject,
+                    key,
+                });
+            })
             .with_navigation_handler(move |target| {
-                if target.starts_with("neuralia:gmail-state") {
-                    if remote_capability_matches(&target, &navigation_capability)
-                        && let Some(count) = neuralia_query_param(&target, "count")
-                        && let Ok(unread) = count.parse::<u32>()
-                    {
-                        let _ = proxy.send_event(UserEvent::GmailInboxState {
-                            unread,
-                            sender: neuralia_query_param(&target, "sender").unwrap_or_default(),
-                            subject: neuralia_query_param(&target, "subject").unwrap_or_default(),
-                            key: neuralia_query_param(&target, "key").unwrap_or_default(),
-                        });
-                    }
+                if target.get(..9).is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:")) {
                     return false;
                 }
                 Url::parse(&target).ok().is_some_and(|url| {
