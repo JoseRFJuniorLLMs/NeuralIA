@@ -371,9 +371,7 @@ impl MemoryStore {
             .iter()
             .enumerate()
             .map(|(index, doc)| {
-                let embedding = persisted_embeddings
-                    .get(&doc.id)
-                    .unwrap_or(&doc.embedding);
+                let embedding = persisted_embeddings.get(&doc.id).unwrap_or(&doc.embedding);
                 (
                     index,
                     cosine_similarity(&query_embedding, embedding).max(0.0),
