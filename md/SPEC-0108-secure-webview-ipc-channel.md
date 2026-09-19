@@ -84,7 +84,9 @@ Tamanho máximo da mensagem: 8 KiB. Acima disso é descartada sem parse.
 ### 3.2 Lado da página
 
 Cada script injetado captura, no *document-created*, antes de qualquer script
-da página:
+da página. No Windows, onde initialization scripts também alcançam child
+frames, o script aborta primeiro com `if (window.top !== window) return;`; a
+capability só é declarada/ usada no documento principal:
 
 ```js
 const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
@@ -148,9 +150,11 @@ A SPEC-0108 só passa a "Implementada" quando, no CI:
 2. Teste: nenhuma constante de script injetado contém `location.href = 'neuralia:`
    nem `neuralia:` + `?cap=` — exceto no HTML do Reader (`render.rs`), que não
    pode conter `cap` de todo.
-3. Teste: todos os scripts que enviam ações capturam `chrome.webview.postMessage`
-   e `JSON.stringify` no topo (padrão já verificado por
-   `injected_scripts_capture_globals_before_the_page_runs`; estender).
+3. Teste: todos os scripts que enviam ações abortam em child frames **antes**
+   de usar a capability e capturam `chrome.webview.postMessage` e
+   `JSON.stringify` no topo do documento principal (padrão verificado por
+   `injected_scripts_capture_globals_before_the_page_runs` e testes
+   `spec_0108_*`).
 4. Teste: os handlers de navegação das superfícies web recusam `neuralia:`.
 5. Teste de comparação em tempo constante (já existe; manter).
 6. Revisão adversarial independente (AGENTS.md §4 e §7): tentar, com script de
