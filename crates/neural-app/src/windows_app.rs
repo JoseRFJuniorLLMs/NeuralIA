@@ -17,6 +17,7 @@ use std::{
 
 use image::RgbaImage;
 
+use crate::ipc::{IpcAction, constant_time_eq, parse_ipc_message};
 use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentSecurityAction, CoreConfig,
     FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent, MemoryDocument, MemoryHit,
@@ -6822,6 +6823,58 @@ fn neuralia_action(target: &str) -> Option<UserEvent> {
     })
 }
 
+fn simple_ipc_event(action: IpcAction) -> Option<UserEvent> {
+    Some(match action {
+        IpcAction::Home => UserEvent::HomeRequested,
+        IpcAction::Back => UserEvent::BackRequested,
+        IpcAction::Restore => UserEvent::RestoreComparator,
+        IpcAction::AutoScroll => UserEvent::ToggleAutoScroll,
+        IpcAction::ZoomIn => UserEvent::ZoomIn,
+        IpcAction::ZoomOut => UserEvent::ZoomOut,
+        IpcAction::ZoomReset => UserEvent::ZoomReset,
+        IpcAction::Reload => UserEvent::ReloadPage,
+        IpcAction::Print => UserEvent::PrintPage,
+        IpcAction::Omnibox => UserEvent::FocusOmnibox,
+        IpcAction::History => UserEvent::ShowHistory,
+        IpcAction::ClearHistory => UserEvent::ClearHistory,
+        IpcAction::Fullscreen => UserEvent::ToggleColumnFullscreen,
+        IpcAction::DevTools => UserEvent::OpenDevTools,
+        IpcAction::ViewSource => UserEvent::ViewSource,
+        IpcAction::NewTab { col } => UserEvent::NewTab(col.unwrap_or(0)),
+        IpcAction::Expand { col } => UserEvent::ExpandComparator(col),
+        IpcAction::Minimize { col } => UserEvent::MinimizeComparator(col),
+        IpcAction::Split { col, url } => UserEvent::OpenSplit {
+            source_index: col,
+            url,
+        },
+        IpcAction::SplitClose => UserEvent::CloseSplit,
+        IpcAction::SplitExpand => UserEvent::ToggleSplitFullscreen,
+        IpcAction::Palette { col } => UserEvent::OpenPalette(col),
+        IpcAction::GmailState {
+            unread,
+            sender,
+            subject,
+            key,
+        } => UserEvent::GmailInboxState {
+            unread,
+            sender,
+            subject,
+            key,
+        },
+        IpcAction::ResearchAnswer { col, text } => UserEvent::ResearchAnswer {
+            source_index: col,
+            text,
+        },
+        IpcAction::AgentObservation { data } => {
+            UserEvent::AgentObservation(parse_agent_observation(&data)?)
+        }
+    })
+}
+
+fn remote_ipc_event(body: &str, capability: &str) -> Option<UserEvent> {
+    simple_ipc_event(parse_ipc_message(body, capability, COMPARATOR_COLUMNS)?)
+}
+
 /// Para onde vai o que o utilizador escreveu na palette. Puro, para se poder
 /// testar sem janela: e aqui que se decide que um painel privado nunca
 /// carrega nada na coluna normal nem passa pelo historico.
@@ -6905,43 +6958,6 @@ fn remote_capability() -> String {
         let _ = write!(token, "{byte:02x}");
     }
     token
-}
-
-/// Igualdade sem atalho: percorre sempre tudo, para o tempo nao denunciar em
-/// que byte o token deixou de bater.
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-        == 0
-}
-
-fn remote_capability_matches(target: &str, expected: &str) -> bool {
-    let Ok(url) = Url::parse(target) else {
-        return false;
-    };
-    url.scheme().eq_ignore_ascii_case("neuralia")
-        && url.query_pairs().any(|(key, value)| {
-            key == "cap" && constant_time_eq(value.as_bytes(), expected.as_bytes())
-        })
-}
-
-fn remote_neuralia_action(target: &str, capability: &str) -> Option<UserEvent> {
-    if !remote_capability_matches(target, capability) {
-        return None;
-    }
-    neuralia_action(target)
-}
-
-fn neuralia_query_param(target: &str, key: &str) -> Option<String> {
-    Url::parse(target)
-        .ok()?
-        .query_pairs()
-        .find(|(name, _)| name == key)
-        .map(|(_, value)| value.into_owned())
 }
 
 fn remote_web_target(target: &str, allow_local: bool) -> bool {
