@@ -42,6 +42,27 @@ All notable changes to NeuralIA are documented here.
   inicial, toda ação de qualquer origem passava sem confirmação. Sem origem
   inicial nada está aprovado
   (`policy_without_initial_origin_gates_every_origin`).
+- **PR #44 — a memória deixou de atravessar idiomas.** A shortlist FTS
+  introduzida no PR #36 escolhia candidatos por palavra exacta antes de
+  pontuar: uma pergunta em português já não encontrava o documento em inglês,
+  excepto quando *nenhum* documento batia lexicalmente. Medido com dois
+  documentos: `["Navegadores leves"]` com índice contra
+  `["Navegadores leves", "Browser engines"]` sem ele. Cada termo passa a entrar
+  no `MATCH` com os seus equivalentes, e os sinónimos vivem numa tabela única
+  lida pelo embedding e pela pesquisa (`tests/semantic_recall.rs`).
+- **PR #46 — um `click=` mal escrito guardava a página na memória.** Comandos de
+  agente com valor vazio eram descartados em silêncio; quando eram os únicos, o
+  parser punha um `extract` no lugar. E `select=` com rótulo vazio escrevia no
+  primeiro `select`/`combobox` da página, escolhido por ordem do DOM. Passam a
+  ser erros com a forma correcta.
+- **PR #47 — `memory:rebuild` nunca reconstruiu nada.** O prefixo `memory:` era
+  testado antes do comando exacto e apanhava-o primeiro: o comando procurava a
+  palavra *"rebuild"* na memória e anunciava *"Buscando na memória local…"*. O
+  encaminhamento sai para `route_input`, comandos exactos antes de prefixos
+  (`route_input_sends_each_command_where_it_belongs`,
+  `memory_rebuild_is_not_swallowed_by_the_memory_prefix`).
+- **PR #41 — a bonificação de recência media o documento mais novo do corpus**,
+  não o relógio. `recency_bonus(last_seen_at, now)` passa a usar a hora real.
 
 ### Changed
 - O orçamento do caso hostil em `tests/extraction_cost.rs` deixa de ser um teto
@@ -51,6 +72,50 @@ All notable changes to NeuralIA are documented here.
   no máximo 8x o tempo.
 - SPEC-0104 e SPEC-0105 declaram "auditoria independente pendente", como o
   AGENTS.md §8 e o `md/README.md` já diziam.
+- **PR #43 — o gate do agente passa a ser testável no código que embarca.** O
+  `AgentRuntime` do `neural-core` não é usado pela aplicação: o agente do
+  produto é `handle_agent_observation`. A decisão — limites, escolha do
+  elemento, gate da política — sai para `decide_agent_step`, sem UI nem
+  WebView. Medido: com o `policy.evaluate` retirado do caminho que embarca, o
+  teste de aceitação da SPEC-0105 continuava **verde**; os sete testes novos
+  ficam vermelhos, 5 de 7. Os limites passam a vir do
+  `AgentRuntimeConfig::default()`, num sítio só.
+- **PR #47 — a regra "navegação privada nunca entra na memória semântica"
+  passa a ser testada por comportamento.** Era guardada por contagens de
+  ocorrências de `if !private` no texto do ficheiro, que passam com a condição
+  invertida. A decisão vive em `split_source_memory`
+  (`private_split_source_never_becomes_a_memory_document`).
+- **PR #47 — o orçamento do teste hostil deixa de ser instável.** Media os três
+  tamanhos uma vez cada, em momentos diferentes; sob carga paralela a razão
+  inflacionava e o teste ficava vermelho com o código correcto. Cada tamanho
+  passa a ser medido três vezes, ficando com o mínimo.
+- **PR #50 — model packs são biblioteca, não feature.** O `ModelPackManager`
+  declara no próprio código o que não faz (sem download, sem escolha de
+  backend, sem activação automática, sem gancho no arranque) e a SPEC-0102
+  mantém-se **Parcial** com a razão escrita.
+- O CI do Windows ganha `timeout-minutes: 20` e o `measure-cycles.ps1` limita a
+  consulta CIM a 2 s com aviso; a detecção de fugas continua pelo delta de
+  processos `msedgewebview2` contra a baseline.
+
+### Added
+- **PR #51 — o parser do canal IPC passa a ser compilado e testado fora do
+  Windows.** `src/ipc.rs` não tem uma chamada Win32, mas estava atrás de
+  `cfg(target_os = "windows")` por arrastamento: a superfície por onde uma
+  página remota fala com o nativo não era sequer compilada noutro sistema. Em
+  Linux, `cargo test -p neural-app` passa de zero para 14 testes, e o job
+  `core` do CI (ubuntu) passa a testá-lo e a lintá-lo.
+- **PR #42 — `tests/forget_leaves_no_trace.rs`**: "esquecer" apaga os bytes, não
+  só a vista da API. Os testes leem a árvore inteira do store à procura do
+  texto capturado, nos âmbitos `All` e `Domain`.
+- **PR #45 — proveniência do PDF.js presa ao SBOM.** O `release.yml` escrevia a
+  versão à mão, sem nada a ligá-la ao ficheiro que embarca. `UPSTREAM.md`
+  regista origem, versão, licença e SHA-256, e
+  `tests/vendored_provenance.rs` obriga três sítios a dizer o mesmo número.
+  `.gitattributes` mantém os bytes vendorizados intactos entre plataformas.
+- Gates de produto para as SPEC-0100..0107 (`tests/spec_product_wiring.rs`),
+  aceitação da Fase 1 da SPEC-0107, fixtures adversariais da SPEC-0104 e o
+  documento `md/AUDIT-SPEC-0100-0108.md`, que classifica cada gate por aquilo
+  que ele consegue mesmo provar.
 
 ## [2.0.1] - 2026-09-19
 
