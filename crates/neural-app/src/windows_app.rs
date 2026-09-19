@@ -6092,6 +6092,7 @@ fn agent_trace_action(action: &AgentAction) -> String {
             redact_sensitive_text(&target.name)
         ),
         AgentAction::Extract { .. } => "extract".to_string(),
+        AgentAction::Scroll { amount } => format!("scroll {amount}"),
         AgentAction::Submit { description, .. } => {
             format!("submit {}", redact_sensitive_text(description))
         }
