@@ -8199,14 +8199,13 @@ mod tests {
 
     #[test]
     fn private_panel_and_new_tab_are_wired() {
-        assert!(NEURALIA_KEYMAP_SCRIPT.contains("neuralia:newtab?col="));
+        assert!(NEURALIA_KEYMAP_SCRIPT.contains("act('newtab', { col:colIndex })"));
         assert!(format!("{:?}", neuralia_action("neuralia:newtab")).starts_with("Some(NewTab"));
         assert_ne!(BarHit::Private, BarHit::SplitClose);
     }
 
     #[test]
-    fn neuralia_actions_are_routed() {
-        // As paginas so escrevem o nome da accao; a traducao vive toda aqui.
+    fn reader_neuralia_actions_are_routed() {
         for (target, expected) in [
             ("neuralia:back", "BackRequested"),
             ("NEURALIA:BACK", "BackRequested"),
@@ -8231,7 +8230,6 @@ mod tests {
             );
         }
 
-        // Tudo o resto tem de passar ao lado, incluindo navegacao verdadeira.
         for target in [
             "https://example.com",
             "neuralia:inventado",
@@ -8240,32 +8238,6 @@ mod tests {
         ] {
             assert!(neuralia_action(target).is_none(), "{target}");
         }
-
-        let capability = "0123456789abcdef0123456789abcdef";
-        for action in [
-            "home",
-            "history",
-            "clearhistory",
-            "devtools",
-            "viewsource",
-            "print",
-            "reload",
-        ] {
-            let unsigned = format!("neuralia:{action}");
-            assert!(
-                remote_neuralia_action(&unsigned, capability).is_none(),
-                "pagina remota nao pode invocar {action} sem capability"
-            );
-            let signed = format!("neuralia:{action}?cap={capability}");
-            assert!(
-                remote_neuralia_action(&signed, capability).is_some(),
-                "script injetado deve poder invocar {action} com capability"
-            );
-        }
-        assert!(!remote_capability_matches(
-            "neuralia:home?cap=errado",
-            capability
-        ));
     }
 
     #[test]
@@ -8349,33 +8321,11 @@ mod tests {
         assert!(!constant_time_eq(b"", b"a"));
 
         let token = remote_capability();
-        assert!(remote_capability_matches(
-            &format!("neuralia:home?cap={token}"),
-            &token
-        ));
-        assert!(remote_capability_matches(
-            &format!("neuralia:split?col=1&url=https%3A%2F%2Fa.test%2F&cap={token}"),
-            &token
-        ));
         let flipped = if token.ends_with('0') { "1" } else { "0" };
         let wrong = format!("{}{flipped}", &token[..31]);
-        assert!(!remote_capability_matches(
-            &format!("neuralia:home?cap={wrong}"),
-            &token
-        ));
-        assert!(!remote_capability_matches(
-            &format!("neuralia:home?cap={}", &token[..31]),
-            &token
-        ));
-        assert!(!remote_capability_matches(
-            &format!("neuralia:home?cap={token}0"),
-            &token
-        ));
-        assert!(!remote_capability_matches("neuralia:home", &token));
-        assert!(!remote_capability_matches(
-            &format!("https://example.com/?cap={token}"),
-            &token
-        ));
+        assert!(constant_time_eq(token.as_bytes(), token.as_bytes()));
+        assert!(!constant_time_eq(token.as_bytes(), wrong.as_bytes()));
+        assert!(!constant_time_eq(token.as_bytes(), &token.as_bytes()[..31]));
     }
 
     #[test]
@@ -8783,16 +8733,9 @@ mod tests {
 
     #[test]
     fn comparator_has_split_palette_and_real_three_way_submit() {
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia:split?col="));
-        // A pagina so pede a palette: o pedido leva a coluna e o token, e
-        // nunca um `q` -- o texto e escrito no controlo nativo.
-        let palette_request = NEURALIA_KEYMAP_SCRIPT
-            .split("'neuralia:palette?col=' + colIndex")
-            .nth(1)
-            .and_then(|rest| rest.split(';').next())
-            .expect("keymap palette request");
-        assert!(palette_request.contains("'&cap=' + encode(capability)"));
-        assert!(!palette_request.contains("q="));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("act('split', { col:colIndex, url:target.href })"));
+        assert!(NEURALIA_KEYMAP_SCRIPT.contains("act('palette', { col:colIndex })"));
+        assert!(!NEURALIA_KEYMAP_SCRIPT.contains("q="));
         assert!(SPLIT_SCROLL_RAIL_SCRIPT.contains("neuralia-split-scroll-rail"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("chatgpt.com"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("claude.ai"));
@@ -8802,26 +8745,24 @@ mod tests {
     #[test]
     fn palette_is_native_and_the_page_can_only_ask_for_it() {
         let source = include_str!("windows_app.rs");
-        // Nenhum script injetado cria a palette no DOM nem a abre por evento.
         assert!(!source.contains(concat!("NEURALIA_PALETTE", "_SCRIPT")));
         assert!(!source.contains(concat!("neuralia-open-", "palette")));
         assert!(!NEURALIA_KEYMAP_SCRIPT.contains("CustomEvent"));
+        assert!(NEURALIA_KEYMAP_SCRIPT.contains("act('palette', { col:colIndex })"));
 
-        // Os handlers de navegacao so traduzem o pedido em OpenPalette com a
-        // coluna do proprio WebView: nem `q` nem `col` do pedido sao lidos.
         for builder in ["fn comparator_webview_builder", "fn split_webview_builder"] {
-            let handler = source
+            let body = source
                 .split(builder)
                 .nth(1)
-                .and_then(|part| part.split("\"neuralia:palette\"").nth(1))
-                .and_then(|part| part.split("return false;").next())
+                .and_then(|part| part.split(".with_new_window_req_handler").next())
                 .expect(builder);
-            assert!(!handler.contains("neuralia_query_param"), "{builder}");
-            assert!(!handler.contains("PaletteSubmit"), "{builder}");
-            assert!(handler.contains("UserEvent::OpenPalette("), "{builder}");
+            assert!(body.contains("with_ipc_handler"), "{builder}");
+            assert!(body.contains("IpcAction::Palette"), "{builder}");
+            assert!(body.contains("UserEvent::OpenPalette("), "{builder}");
+            assert!(!body.contains("neuralia_query_param"), "{builder}");
+            assert!(!body.contains("PaletteSubmit"), "{builder}");
         }
 
-        // Quem submete e a subclasse do EDIT nativo, a partir do PaletteHost.
         let edit = source
             .split("fn palette_edit_subclass")
             .nth(1)
@@ -8833,8 +8774,6 @@ mod tests {
         assert!(edit.contains("VK_ESCAPE"));
         assert!(edit.contains("WM_KILLFOCUS"));
 
-        // O popup precisa de foco (sem NOACTIVATE) e nao e um aviso (sem
-        // TOPMOST); o EDIT tem o mesmo limite e a mesma pista que a omnibox.
         let show = source
             .split("fn show_palette")
             .nth(1)
@@ -9125,7 +9064,60 @@ mod tests {
         assert!(gmail_is_new_mail(Some(4), Some("thread-a"), 4, "thread-b"));
         assert!(!gmail_is_new_mail(Some(4), Some("thread-a"), 4, "thread-a"));
         assert!(GMAIL_MONITOR_SCRIPT.contains("mail.google.com"));
-        assert!(GMAIL_MONITOR_SCRIPT.contains("neuralia:gmail-state"));
+        assert!(GMAIL_MONITOR_SCRIPT.contains("action:'gmail-state'"));
+        assert!(GMAIL_MONITOR_SCRIPT.contains("post(stringify("));
+    }
+
+    #[test]
+    fn spec_0108_remote_scripts_use_message_transport_without_capability_urls() {
+        for (name, script) in [
+            ("keymap", NEURALIA_KEYMAP_SCRIPT),
+            ("return", EXTERNAL_RETURN_BUTTON),
+            ("gmail", GMAIL_MONITOR_SCRIPT),
+            ("agent", AGENT_OBSERVER_SCRIPT),
+            ("comparator", COMPARATOR_INJECT_SCRIPT),
+        ] {
+            assert!(script.contains("window.chrome.webview.postMessage"), "{name}");
+            assert!(script.contains("JSON.stringify"), "{name}");
+            assert!(!script.contains("?cap="), "{name}");
+            assert!(!script.contains("window.location.href = 'neuralia:"), "{name}");
+        }
+    }
+
+    #[test]
+    fn spec_0108_remote_navigation_handlers_reject_neuralia_scheme() {
+        let source = include_str!("windows_app.rs");
+        for builder in [
+            "fn pdf_webview_builder",
+            "fn external_webview_builder",
+            "fn comparator_webview_builder",
+            "fn split_webview_builder",
+            "fn maybe_start_gmail_monitor",
+        ] {
+            let body = source
+                .split(builder)
+                .nth(1)
+                .and_then(|part| part.split(".with_permission_handler").next())
+                .expect(builder);
+            assert!(body.contains("with_ipc_handler"), "{builder}");
+            assert!(
+                body.contains("eq_ignore_ascii_case(\"neuralia:\")"),
+                "{builder}"
+            );
+            assert!(!body.contains("remote_neuralia_action"), "{builder}");
+        }
+    }
+
+    #[test]
+    fn spec_0108_comparator_captures_timers_with_ipc_primitives() {
+        let top = COMPARATOR_INJECT_SCRIPT
+            .split("listen(document, 'DOMContentLoaded'")
+            .next()
+            .expect("comparator prelude");
+        assert!(top.contains("window.chrome.webview.postMessage"));
+        assert!(top.contains("JSON.stringify"));
+        assert!(top.contains("const defer = setTimeout;"));
+        assert!(top.contains("const cancelDefer = clearTimeout;"));
     }
 
     #[test]
