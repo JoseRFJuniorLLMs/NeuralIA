@@ -16,9 +16,9 @@ upstream.
 
 | Ficheiro | SHA-256 |
 |---|---|
-| `pdf.mjs` | `d90d57eceac606b8d0f70872aeb632571bb6d2322540a1551a70d516cd0b29cb` |
-| `pdf.worker.mjs` | `2c36ad19110a73873fbdcc30124a445e1e681a5bbe6463546d56696f1124ced5` |
-| `LICENSE` | `eb3d7b5485466acbd81f2b496f595ab637d2792e268206b27d99e793bdb67549` |
+| `pdf.mjs` | `df4a14ea8a67f687265d7d51d89cc4fce429739f6e8076dea163b164024fe6e2` |
+| `pdf.worker.mjs` | `f2870db902eaff8397442c912b69459980ac91f6f4b5ed827167b12cf7057930` |
+| `LICENSE` | `0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594` |
 
 ## Porque é que isto está preso por um teste
 
