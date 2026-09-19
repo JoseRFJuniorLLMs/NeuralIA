@@ -21,6 +21,12 @@ All notable changes to NeuralIA are documented here.
   Links internos do Reader continuam sendo a exceção sem token.
 
 ### Validation
+- **PR #58 — release publica exatamente o executável medido pelo CI.** O job
+  Windows guarda `NeuralIA.exe`, SHA-256 e os JSONs dos gates no artefato
+  nomeado pelo SHA; a attestation é criada sobre esse mesmo binário. O workflow
+  de release baixa o artefato do run que o disparou, verifica o checksum e
+  empacota sem recompilar. PRs também passam a cancelar runs antigos do próprio
+  PR, enquanto pushes em `main` permanecem não-canceláveis.
 - **PR #56 — dependency policy becomes an enforced CI gate.** A SHA-pinned
   `cargo-deny` checks licenses, dependency sources and wildcard declarations
   on Linux + Windows dependency graphs. Unknown registries/git sources and
@@ -35,6 +41,11 @@ All notable changes to NeuralIA are documented here.
 - Revisão adversarial independente e release 2.1.0 permanecem pendentes.
 
 ### Fixed
+- **PR #57 — o divisor nativo do comparador volta a receber o rato.** A janela
+  `STATIC` do splitter devolvia `HTTRANSPARENT` no `WM_NCHITTEST`, portanto
+  `WM_LBUTTONDOWN`/`WM_MOUSEMOVE` nunca chegavam à subclasse e toda a lógica de
+  `SetCapture`/resize ficava morta. O gate novo cria a janela real e prova o
+  hit-test, em vez de apenas procurar handlers escritos no fonte.
 - **PR #54 — falhas do shortlist SQLite deixam de virar full scan silencioso.**
   Com corpus existente, índice ausente, corrompido ou impossível de abrir chega
   ao chamador como erro com instrução para `memory:rebuild`; só um perfil
