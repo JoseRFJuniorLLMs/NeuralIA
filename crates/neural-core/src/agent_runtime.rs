@@ -163,7 +163,7 @@ pub fn save_agent_outcome(
     fs::write(&temp, bytes)?;
     match fs::rename(&temp, path) {
         Ok(()) => Ok(()),
-        Err(error) if path.exists() => {
+        Err(_error) if path.exists() => {
             fs::remove_file(path)?;
             fs::rename(temp, path)
         }
