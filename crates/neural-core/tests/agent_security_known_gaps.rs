@@ -204,7 +204,6 @@ fn reversible_session_grant_does_not_cross_origin_boundary() {
     assert!(decision.requires_confirmation);
 }
 
-
 #[test]
 #[ignore = "known gap HIGH-08: Navigate policy does not enforce HTTP(S) schemes"]
 fn agent_navigation_policy_rejects_non_web_schemes() {
@@ -218,7 +217,10 @@ fn agent_navigation_policy_rejects_non_web_schemes() {
         let decision = policy.evaluate(&AgentSecurityAction::Navigate {
             url: url.to_string(),
         });
-        assert!(!decision.allowed, "{url} must never be an agent navigation capability");
+        assert!(
+            !decision.allowed,
+            "{url} must never be an agent navigation capability"
+        );
         assert!(
             !decision.requires_confirmation,
             "{url} is invalid authority, not a confirmable web navigation"
