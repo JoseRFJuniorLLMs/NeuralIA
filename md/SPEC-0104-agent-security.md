@@ -1,6 +1,6 @@
 # SPEC-0104 — Agent Security and Permission Architecture
 
-**Status:** Proposed, blocking for agent execution  
+**Status:** Implemented security gate — NeuralIA 2.0  
 **Target:** NeuralIA 2.0 security gate
 
 ## 1. Principle
