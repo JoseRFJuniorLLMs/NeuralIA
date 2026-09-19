@@ -1,12 +1,6 @@
-use std::{
-    fs, io,
-    path::Path,
-    time::Duration,
-};
+use std::{fs, io, path::Path, time::Duration};
 
-use rusqlite::{
-    Connection, OptionalExtension, Transaction, TransactionBehavior, params,
-};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -58,7 +52,8 @@ fn has_only_legacy_mirror_schema(connection: &Connection) -> io::Result<bool> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(io_error)?;
 
-    !names.is_empty()
+    !names
+        .is_empty()
         .then_some(
             names
                 .iter()
@@ -262,10 +257,7 @@ fn entity_id(normalized: &str, entity_type: &str) -> String {
     format!("{:x}", Sha256::digest(material.as_bytes()))[..24].to_string()
 }
 
-fn upsert_page_base(
-    transaction: &Transaction<'_>,
-    document: &MemoryDocument,
-) -> io::Result<()> {
+fn upsert_page_base(transaction: &Transaction<'_>, document: &MemoryDocument) -> io::Result<()> {
     if document.private {
         return Err(io::Error::other(
             "private document reached SQLite storage boundary",
@@ -374,10 +366,7 @@ fn upsert_page_base(
     Ok(())
 }
 
-fn replace_relations(
-    transaction: &Transaction<'_>,
-    document: &MemoryDocument,
-) -> io::Result<()> {
+fn replace_relations(transaction: &Transaction<'_>, document: &MemoryDocument) -> io::Result<()> {
     transaction
         .execute(
             "DELETE FROM source_relation WHERE from_page_id=?1",
@@ -415,12 +404,7 @@ fn replace_relations(
                 "INSERT OR IGNORE INTO source_relation(
                     from_page_id, to_page_id, kind, evidence_observation_id, created_at
                  ) VALUES (?1, ?2, ?3, NULL, ?4)",
-                params![
-                    document.id,
-                    target_id,
-                    kind,
-                    document.last_seen_at as i64
-                ],
+                params![document.id, target_id, kind, document.last_seen_at as i64],
             )
             .map_err(io_error)?;
     }
@@ -441,7 +425,9 @@ fn validate_integrity(transaction: &Transaction<'_>) -> io::Result<()> {
         .query_row("SELECT count(*) FROM knowledge_page", [], |row| row.get(0))
         .map_err(io_error)?;
     let fts_count: i64 = transaction
-        .query_row("SELECT count(*) FROM knowledge_page_fts", [], |row| row.get(0))
+        .query_row("SELECT count(*) FROM knowledge_page_fts", [], |row| {
+            row.get(0)
+        })
         .map_err(io_error)?;
     if page_count != fts_count {
         return Err(io::Error::other(format!(
