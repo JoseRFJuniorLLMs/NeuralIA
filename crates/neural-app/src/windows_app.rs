@@ -47,8 +47,8 @@ use windows_sys::Win32::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
             ES_AUTOHSCROLL, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowTextLengthW,
             GetWindowTextW, GetWindowThreadProcessId, IDYES, MB_ICONINFORMATION, MB_OK, MB_YESNO,
-            MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
-            SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+            MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
+            SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
             TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
             WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
         },
@@ -2253,10 +2253,9 @@ impl App {
         } else {
             ""
         };
-        let init_script = format!(
-            "{NEURALIA_KEYMAP_SCRIPT}\n{EXTERNAL_RETURN_BUTTON}\n{agent_script}"
-        )
-        .replace("__NEURALIA_CAP__", &capability);
+        let init_script =
+            format!("{NEURALIA_KEYMAP_SCRIPT}\n{EXTERNAL_RETURN_BUTTON}\n{agent_script}")
+                .replace("__NEURALIA_CAP__", &capability);
 
         WebViewBuilder::new()
             .with_initialization_script(init_script)
@@ -2338,7 +2337,10 @@ impl App {
                     format!("agent:{}", spec),
                     valid.to_string(),
                 );
-                self.show_splash("Agente iniciado. Esc/Home interrompe imediatamente.".to_string(), 4);
+                self.show_splash(
+                    "Agente iniciado. Esc/Home interrompe imediatamente.".to_string(),
+                    4,
+                );
             }
             Err(error) => {
                 self.active_agent = None;
@@ -2352,7 +2354,10 @@ impl App {
             return;
         };
         if agent.steps >= 24 || agent.started.elapsed() >= Duration::from_secs(120) {
-            self.show_splash("Agente interrompido pelo limite de execução.".to_string(), 4);
+            self.show_splash(
+                "Agente interrompido pelo limite de execução.".to_string(),
+                4,
+            );
             self.finish_agent(true);
             return;
         }
@@ -2982,10 +2987,8 @@ impl App {
                         && source_index < COMPARATOR_COLUMNS
                         && !text.trim().is_empty()
                     {
-                        let _ = navigation_proxy.send_event(UserEvent::ResearchAnswer {
-                            source_index,
-                            text,
-                        });
+                        let _ = navigation_proxy
+                            .send_event(UserEvent::ResearchAnswer { source_index, text });
                     }
                     return false;
                 }
@@ -4789,9 +4792,7 @@ fn parse_browser_agent_plan(spec: &str) -> Result<(String, Vec<BrowserAgentComma
                 label: label.trim().to_string(),
                 value: selected.trim().to_string(),
             });
-        } else if raw.eq_ignore_ascii_case("extract")
-            || raw.eq_ignore_ascii_case("extrair")
-        {
+        } else if raw.eq_ignore_ascii_case("extract") || raw.eq_ignore_ascii_case("extrair") {
             commands.push(BrowserAgentCommand::Extract);
         } else {
             return Err(format!("comando de agente desconhecido: {raw}"));
@@ -4918,11 +4919,7 @@ fn app_agent_security_action(action: &AgentAction, page: &ObservedPage) -> Agent
                 }
             }
         }
-        AgentAction::TypeText {
-            field,
-            text,
-            ..
-        } => AgentSecurityAction::TypeText {
+        AgentAction::TypeText { field, text, .. } => AgentSecurityAction::TypeText {
             origin,
             field: *field,
             value_summary: format!("{} chars", text.chars().count()),
