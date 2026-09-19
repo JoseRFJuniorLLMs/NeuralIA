@@ -115,10 +115,12 @@ Qualquer alteração aqui só entra em `main` com revisão de quem não a escrev
 
 **Já em `main` (não regredir):** canal `neuralia:` com nativos capturados no document-created, `isTrusted` em todos os handlers, token de `BCryptGenRandom` comparado em tempo constante, `view-source:`, `nosniff`/CSP no servidor PDF; Reader com extração O(n), prazo e cancelamento (`tests/extraction_cost.rs`); `viewer.mjs` por ranges com geometria calculada.
 
-**Decisões pendentes do dono (ninguém implementa sem ele decidir):**
+**Decisões tomadas pelo dono em 19/09/2026:**
 
-- **Navigation API.** Uma página pode fazer `navigation.addEventListener('navigate', e => e.destination.url)` e ler `neuralia:…?cap=TOKEN` de cada ação do utilizador — o token vaza por desenho do Chromium. Opções: migrar o canal para `chrome.webview.postMessage` capturado no document-created (contradiz a letra de SPEC-0005 "no IPC object", cumpre a intenção) ou `delete window.navigation` em todos os frames (pode partir SPAs que a usem).
-- **Auditoria do agent runtime** contra SPEC-0104 §11 (classes de capacidade, aprovação por classe, firewall de dados sensíveis, pivot para rede local, fixtures de injeção, audit log, kill switch) por quem não o escreveu.
+- **Navigation API → canal por mensagem (IPC).** Uma página pode fazer `navigation.addEventListener('navigate', e => e.destination.url)` e ler `neuralia:…?cap=TOKEN` de cada ação do utilizador — o token vaza por desenho do Chromium. Decisão: migrar o transporte para `chrome.webview.postMessage` capturado no document-created, com o mesmo token/closure/tempo constante; `neuralia:` sobrevive só no Reader (HTML nosso, sem script). Formalizado em **SPEC-0108** (`md/SPEC-0108-secure-webview-ipc-channel.md`, na branch `fix/audit-2.0`; entra em `main` com a 2.0.1). Implementação: Claude, branch `fix/audit-ipc`, release 2.1.0. Astra não toca no canal até essa branch integrar.
+- **Auditoria independente do agent runtime** contra SPEC-0104 §11 (classes de capacidade, aprovação por classe, firewall de dados sensíveis, pivot para rede local, fixtures de injeção, audit log, kill switch) e da SPEC-0105 (sem JS arbitrário do modelo, limites de passos/tempo, interrupção, trace) — em curso pelo Claude, só leitura. Até o relatório sair, as SPEC-0104/0105 ficam com status "Implementada — auditoria independente pendente".
+
+**Ordem acordada depois da 2.0.1:** auditoria 0104/0105 → SPEC-0108 e migração do canal (2.1.0) → SPEC-0107 Fase 1 (SQLite/FTS5) **com a restrição**: `rusqlite` síncrono, sem `tokio`, carregado lazy, nunca na Home — o `ai-memory-store` upstream traz `tokio` full e rebentaria o gate de ≤16 threads da SPEC-0008.
 
 ## 9. Checklist antes de cada push (os dois agentes)
 
