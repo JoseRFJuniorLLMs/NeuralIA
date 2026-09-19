@@ -2078,6 +2078,7 @@ impl App {
             self.bar_hover = None;
             self.needs_clear = true;
             self.update_comparator_layout();
+            self.sync_comparator_splitters();
             self.sync_comparator_buttons();
             self.request_redraw();
             return;
@@ -2166,6 +2167,7 @@ impl App {
         self.chrome_token = self.chrome_token.wrapping_add(1);
         self.needs_clear = true;
         self.update_comparator_layout();
+        self.sync_comparator_splitters();
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.request_redraw();
@@ -2181,6 +2183,7 @@ impl App {
             window.set_fullscreen(None);
         }
         self.update_comparator_layout();
+        self.sync_comparator_splitters();
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.request_redraw();
@@ -2540,6 +2543,10 @@ impl App {
                 drop(previous);
             }
         }
+        // O Split View substitui a topologia de colunas. Os divisores sao
+        // janelas Win32 independentes; esconda-os antes de criar a nova WebView
+        // para que nenhum divisor antigo fique por cima do painel lateral.
+        self.hide_comparator_splitters();
 
         let Some(window) = &self.window else {
             return;
@@ -2587,6 +2594,7 @@ impl App {
                     });
                 }
                 self.update_comparator_layout();
+                self.sync_comparator_splitters();
                 self.request_redraw();
             }
             Err(error) => {
@@ -2675,6 +2683,7 @@ impl App {
             });
         }
         self.update_comparator_layout();
+        self.sync_comparator_splitters();
         self.request_redraw();
     }
 
@@ -3544,7 +3553,20 @@ impl App {
         self.request_redraw();
     }
 
+    fn hide_comparator_splitters(&self) {
+        for hwnd in self.splitters.iter().flatten() {
+            unsafe {
+                ShowWindow(*hwnd, SW_HIDE);
+            }
+        }
+    }
+
     fn sync_comparator_splitters(&mut self) {
+        // Comece sempre escondendo todas as janelas de divisor. Assim uma
+        // transicao 3 -> 2 -> 1 colunas, ou Comparator -> Split View, nunca
+        // deixa um splitter da geometria anterior visivel.
+        self.hide_comparator_splitters();
+
         let Some(window) = &self.window else {
             return;
         };
@@ -3597,11 +3619,6 @@ impl App {
 
         for slot in 0..self.splitters.len() {
             if !show || slot >= boundaries.len() {
-                if let Some(hwnd) = self.splitters[slot] {
-                    unsafe {
-                        ShowWindow(hwnd, SW_HIDE);
-                    }
-                }
                 continue;
             }
 
@@ -5820,6 +5837,25 @@ mod tests {
         assert_ne!(BarHit::SplitExpand, BarHit::SplitClose);
         assert!(!SPLIT_SCROLL_RAIL_SCRIPT.contains("neuralia-split-controls"));
         assert!(!SPLIT_SCROLL_RAIL_SCRIPT.contains("Fonte ·"));
+    }
+
+    #[test]
+    fn splitter_topology_is_resynced_after_layout_transitions() {
+        let source = include_str!("windows_app.rs");
+        let minimize = source
+            .split("fn minimize_comparator")
+            .nth(1)
+            .and_then(|part| part.split("fn restore_comparator").next())
+            .expect("minimize body");
+        assert!(minimize.contains("sync_comparator_splitters()"));
+
+        let split = source
+            .split("fn open_split_mode")
+            .nth(1)
+            .and_then(|part| part.split("fn open_private_panel").next())
+            .expect("split body");
+        assert!(split.contains("hide_comparator_splitters()"));
+        assert!(split.contains("sync_comparator_splitters()"));
     }
 
     #[test]
