@@ -63,8 +63,10 @@ Every accepted message MUST carry the per-WebView capability token. The token:
 - is never carried in a navigation URL.
 
 The native parser rejects messages above 8 KiB before JSON parsing. Column
-indices are bounded, split URLs must be valid public HTTP(S) targets, and
-surface-specific handlers accept only the actions meaningful for that WebView.
+indices are bounded; split URLs must be valid HTTP(S) targets and obvious
+local/private/special targets are rejected before DNS. This WebView boundary
+does not claim the Reader's pre-connect DNS-resolution filtering. Surface-specific
+handlers accept only the actions meaningful for that WebView.
 Actions tied to a comparator column must match the emitting column.
 
 Remote navigation handlers reject the `neuralia:` scheme. The sole navigation
