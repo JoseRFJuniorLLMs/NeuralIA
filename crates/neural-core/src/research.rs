@@ -1,6 +1,8 @@
 use std::{
+    collections::HashSet,
     fs, io,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -8,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::local_intelligence::{HashingLocalIntelligence, LocalIntelligence};
+
+static RESEARCH_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -67,8 +71,7 @@ impl ResearchSession {
     pub fn new(question: impl Into<String>) -> Self {
         let question = question.into();
         let now = unix_seconds();
-        let digest = Sha256::digest(format!("{question}\n{now}").as_bytes());
-        let id = format!("{:x}", digest)[..24].to_string();
+        let id = unique_id(&[&question], 24);
         let title = short_title(&question, 72);
 
         let mut session = Self {
@@ -120,10 +123,10 @@ impl ResearchSession {
             item.kind == ResearchItemKind::ProviderAnswer
                 && item.provider.as_deref() == Some(provider.as_str())
         }) {
+            let updated_at = unix_seconds();
             item.text = text;
             item.memory_id = memory_id;
-            item.created_at = unix_seconds();
-            self.updated_at = item.created_at;
+            self.updated_at = updated_at;
             return item.id.clone();
         }
         self.add_provider_answer(provider, text, memory_id)
@@ -169,15 +172,16 @@ impl ResearchSession {
     ) -> String {
         let title = title.into();
         let created_at = unix_seconds();
-        let material = format!(
-            "{}\n{:?}\n{}\n{}\n{}",
-            self.id,
-            kind,
-            title,
-            provider.as_deref().unwrap_or_default(),
-            created_at
+        let kind_name = format!("{kind:?}");
+        let id = unique_id(
+            &[
+                &self.id,
+                &kind_name,
+                &title,
+                provider.as_deref().unwrap_or_default(),
+            ],
+            20,
         );
-        let id = format!("{:x}", Sha256::digest(material.as_bytes()))[..20].to_string();
 
         self.items.push(ResearchItem {
             id: id.clone(),
@@ -194,10 +198,15 @@ impl ResearchSession {
     }
 
     pub fn comparison(&self, item_ids: &[String]) -> Vec<ComparisonFact> {
+        let selected_ids = selected_id_set(item_ids);
         let ai = HashingLocalIntelligence;
         self.items
             .iter()
-            .filter(|item| item_ids.is_empty() || item_ids.contains(&item.id))
+            .filter(|item| {
+                selected_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(item.id.as_str()))
+            })
             .map(|item| ComparisonFact {
                 item_id: item.id.clone(),
                 source: item
@@ -213,10 +222,15 @@ impl ResearchSession {
     }
 
     pub fn synthesize(&mut self, item_ids: &[String]) -> SynthesisSnapshot {
+        let selected_ids = selected_id_set(item_ids);
         let selected = self
             .items
             .iter()
-            .filter(|item| item_ids.is_empty() || item_ids.contains(&item.id))
+            .filter(|item| {
+                selected_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(item.id.as_str()))
+            })
             .collect::<Vec<_>>();
 
         let mut output = format!("# {}\n\n", self.title);
@@ -240,11 +254,12 @@ impl ResearchSession {
         }
 
         let now = unix_seconds();
-        let id = format!(
-            "{:x}",
-            Sha256::digest(format!("{}\n{}\n{now}", self.id, item_ids.join(",")).as_bytes())
-        )[..20]
-            .to_string();
+        let selected_material = selected
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let id = unique_id(&[&self.id, &selected_material], 20);
         let snapshot = SynthesisSnapshot {
             id,
             created_at: now,
@@ -298,6 +313,31 @@ impl ResearchSession {
     }
 }
 
+fn selected_id_set(item_ids: &[String]) -> Option<HashSet<&str>> {
+    (!item_ids.is_empty()).then(|| item_ids.iter().map(String::as_str).collect())
+}
+
+fn unique_id(parts: &[&str], hex_len: usize) -> String {
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = RESEARCH_NONCE.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update((part.len() as u64).to_le_bytes());
+        digest.update(part.as_bytes());
+    }
+    digest.update(now_nanos.to_le_bytes());
+    digest.update(pid.to_le_bytes());
+    digest.update(nonce.to_le_bytes());
+
+    let hex = format!("{:x}", digest.finalize());
+    hex[..hex_len.min(hex.len())].to_string()
+}
+
 fn extract_numberish(input: &str) -> Vec<String> {
     input
         .split_whitespace()
@@ -349,12 +389,14 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .parent()
         .ok_or_else(|| io::Error::other("missing parent"))?;
     fs::create_dir_all(parent)?;
+    let temp_nonce = RESEARCH_NONCE.fetch_add(1, Ordering::Relaxed);
     let temp = parent.join(format!(
-        ".{}.{}.tmp",
+        ".{}.{}.{}.tmp",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("session"),
-        std::process::id()
+        std::process::id(),
+        temp_nonce
     ));
     fs::write(&temp, bytes)?;
 
@@ -367,6 +409,29 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_sessions_with_same_question_have_unique_ids() {
+        let ids = (0..2_048)
+            .map(|_| ResearchSession::new("mesma pergunta").id)
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), 2_048);
+    }
+
+    #[test]
+    fn repeated_items_and_syntheses_have_unique_ids() {
+        let mut session = ResearchSession::new("unicidade");
+        let item_ids = (0..1_024)
+            .map(|_| session.add_note("Mesmo título", "Mesmo texto"))
+            .collect::<HashSet<_>>();
+        assert_eq!(item_ids.len(), 1_024);
+
+        let selected = session.items[1].id.clone();
+        let synthesis_ids = (0..512)
+            .map(|_| session.synthesize(std::slice::from_ref(&selected)).id)
+            .collect::<HashSet<_>>();
+        assert_eq!(synthesis_ids.len(), 512);
+    }
 
     #[test]
     fn session_preserves_provider_source_provenance() {
@@ -382,6 +447,32 @@ mod tests {
         let fact = session.comparison(&[source]).remove(0);
         assert_eq!(fact.source, "Claude");
         assert!(fact.entities.iter().any(|entity| entity == "Accessibility"));
+    }
+
+    #[test]
+    fn provider_upsert_preserves_original_created_at() {
+        let mut session = ResearchSession::new("preservar criação");
+        session.upsert_provider_answer("Claude", "primeira", None);
+
+        let answer = session
+            .items
+            .iter_mut()
+            .find(|item| item.kind == ResearchItemKind::ProviderAnswer)
+            .expect("provider answer");
+        answer.created_at = 42;
+
+        let id_before = answer.id.clone();
+        session.upsert_provider_answer("Claude", "segunda", Some("memory-2".into()));
+
+        let answer = session
+            .items
+            .iter()
+            .find(|item| item.kind == ResearchItemKind::ProviderAnswer)
+            .expect("provider answer");
+        assert_eq!(answer.id, id_before);
+        assert_eq!(answer.created_at, 42);
+        assert_eq!(answer.text, "segunda");
+        assert_eq!(answer.memory_id.as_deref(), Some("memory-2"));
     }
 
     #[test]
