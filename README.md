@@ -6,9 +6,9 @@
 
 ## What NeuralIA is
 
-NeuralIA **v1.4.0** is an AI-first, reader-first, system-WebView information client written in Rust.
+NeuralIA **v1.5.0** is an AI-first, reader-first, system-WebView information client written in Rust.
 
-It deliberately refuses the usual browser arms race. It does not ship Chromium, does not implement its own JavaScript engine, does not carry a local LLM, and does not try to become an operating system with tabs.
+It deliberately refuses the usual browser arms race. It does not ship Chromium, does not implement its own JavaScript engine, does not carry a local LLM, and does not recreate a full browser tab strip just to prove that rectangles can multiply.
 
 ```text
 native Rust home
@@ -26,14 +26,16 @@ nenhuma consulta sozinha.
 
 No comparador, links externos abrem em **Split View** ao lado da IA que gerou a
 fonte; fechar a gaveta devolve a comparação sem perder o contexto. Cada
-**Gemini / ChatGPT / Claude** é também um grupo de abas: o botão **+** ao lado
-do nome abre a omnibox daquela IA e as fontes abertas aparecem logo abaixo,
-agrupadas automaticamente por origem. Clicar numa aba reabre a fonte no Split
-View. `Ctrl+K` ou `Ctrl+T` abre a mesma omnibox flutuante. As scrollbars
-nativas das três colunas ficam escondidas; a timeline vertical centralizada
-passa a ser o controle de rolagem. A rolagem automática usa o container real de
-cada painel, portanto **Gemini, ChatGPT e Claude avançam juntos** mesmo quando o
-site usa um scroller interno.
+**Gemini / ChatGPT / Claude** é também um grupo de abas na **mesma barra de
+título**: `IA + [aba] [aba]`. O botão **+** abre a omnibox daquela IA, hover
+deixa claro o componente atingido e o clique direito numa aba abre um menu
+nativo com abrir, tela cheia, fechar, fechar outras e fechar todas do grupo.
+
+O Split View usa a mesma timeline vertical do NeuralIA: a scrollbar nativa da
+página lateral é escondida e a trilha tracejada centralizada assume a navegação.
+A rolagem automática percorre tanto a IA visível quanto a página lateral,
+detectando containers internos de scroll. `Ctrl+K` ou `Ctrl+T` abre a
+omnibox flutuante da IA ativa.
 
 Quando já existe uma sessão Google autenticada no perfil WebView2, o NeuralIA
 pode observar o Gmail em background sem armazenar senha. Uma nova mensagem gera

@@ -2,6 +2,23 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [1.5.0] - 2026-09-18
+
+Barra de titulo compacta com abas inline, menu de contexto e Split View alinhado ao scroll do NeuralIA.
+
+### Added
+- **Hit/hover visual** em Home, nome da IA, botão + e abas de contexto.
+- **Menu nativo no clique direito da aba:** Abrir, Abrir em tela cheia, Fechar aba, Fechar outras abas do grupo e Fechar todas do grupo.
+
+### Changed
+- As abas deixam a segunda linha e passam para a mesma barra de titulo: `Gemini + [abas]`, `ChatGPT + [abas]`, `Claude + [abas]`.
+- A barra superior volta a 44 px logicos para devolver altura util aos painéis.
+- O Split View passa a usar a mesma timeline tracejada vertical do NeuralIA e oculta a scrollbar tradicional.
+
+### Fixed
+- **Auto-scroll do Split View:** quando uma fonte lateral está aberta, o ciclo automático avança a IA de origem e a página lateral; em tela cheia, avança a própria fonte.
+- A timeline da fonte lateral detecta também containers internos com overflow, não apenas o documento principal.
+
 ## [1.4.0] - 2026-09-18
 
 Rolagem sincronizada nas tres IAs e notificacao Gmail usando a sessao Google existente.
