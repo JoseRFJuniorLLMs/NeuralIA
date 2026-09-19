@@ -191,6 +191,7 @@ pub struct MemoryHit {
 pub enum CaptureOutcome {
     Stored(String),
     SkippedPrivate,
+    SkippedForgotten,
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +207,15 @@ pub enum ForgetScope {
 pub struct ForgetReport {
     pub documents: usize,
     pub files: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct MemoryTombstone {
+    object_type: String,
+    object_id: String,
+    scope: Option<String>,
+    reason: Option<String>,
+    created_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -239,6 +249,11 @@ impl MemoryStore {
             return Ok(CaptureOutcome::SkippedPrivate);
         }
         self.ensure_layout()?;
+        let tombstones = self.load_tombstones()?;
+        if tombstone_blocks_document(&document, &tombstones) {
+            return Ok(CaptureOutcome::SkippedForgotten);
+        }
+        let sqlite_existed = self.sqlite_path().exists();
 
         document.body = redact_sensitive_text(&document.body);
         document.content_hash = sha256_hex(document.body.as_bytes());
@@ -265,6 +280,9 @@ impl MemoryStore {
 
         let session = self.session_for_document(&document);
         sqlite_v01::upsert(&self.sqlite_path(), &document, session.as_ref())?;
+        if !sqlite_existed && !tombstones.is_empty() {
+            sqlite_v01::sync_tombstones(&self.sqlite_path(), &tombstones)?;
+        }
         self.write_index_manifest()?;
         Ok(CaptureOutcome::Stored(document.id))
     }
@@ -272,15 +290,23 @@ impl MemoryStore {
     pub fn get(&self, id: &str) -> io::Result<Option<MemoryDocument>> {
         let path = self.document_path(id);
         match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(io::Error::other),
+            Ok(bytes) => {
+                let document =
+                    serde_json::from_slice::<MemoryDocument>(&bytes).map_err(io::Error::other)?;
+                let tombstones = self.load_tombstones()?;
+                if tombstone_blocks_document(&document, &tombstones) {
+                    Ok(None)
+                } else {
+                    Ok(Some(document))
+                }
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
     }
 
     pub fn documents(&self) -> io::Result<Vec<MemoryDocument>> {
+        let tombstones = self.load_tombstones()?;
         let mut documents = Vec::new();
         let Ok(entries) = fs::read_dir(self.documents_dir()) else {
             return Ok(documents);
@@ -293,6 +319,7 @@ impl MemoryStore {
             if let Ok(bytes) = fs::read(entry.path())
                 && let Ok(document) = serde_json::from_slice::<MemoryDocument>(&bytes)
                 && !document.private
+                && !tombstone_blocks_document(&document, &tombstones)
             {
                 documents.push(document);
             }
@@ -488,8 +515,16 @@ impl MemoryStore {
     }
 
     pub fn forget(&self, scope: ForgetScope) -> io::Result<ForgetReport> {
+        self.ensure_layout()?;
         let documents = self.documents()?;
+        let sessions = self.research_sessions_unfiltered()?;
         let mut report = ForgetReport::default();
+
+        // Persist the deny policy before deleting source files. If the process
+        // dies halfway through forget(), stale source cannot be re-imported.
+        let mut tombstones = self.load_tombstones()?;
+        extend_tombstones_for_scope(&mut tombstones, &scope, &sessions);
+        self.save_tombstones(&tombstones)?;
 
         for document in documents {
             if !matches_scope(&document, &scope) {
@@ -503,18 +538,39 @@ impl MemoryStore {
             report.documents += 1;
         }
 
-        if matches!(scope, ForgetScope::All) {
-            let _ = fs::remove_file(self.sqlite_path());
+        match &scope {
+            ForgetScope::Session(id) => {
+                let path = self.root.join("sessions").join(format!("{id}.json"));
+                if fs::remove_file(path).is_ok() {
+                    report.files += 1;
+                }
+            }
+            ForgetScope::All => {
+                if let Ok(entries) = fs::read_dir(self.root.join("sessions")) {
+                    for entry in entries.flatten() {
+                        if entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+                            && fs::remove_file(entry.path()).is_ok()
+                        {
+                            report.files += 1;
+                        }
+                    }
+                }
+                let _ = fs::remove_file(self.sqlite_path());
+            }
+            _ => {}
         }
+
         self.rebuild()?;
         Ok(report)
     }
 
     pub fn rebuild(&self) -> io::Result<()> {
         self.ensure_layout()?;
+        let tombstones = self.load_tombstones()?;
         let docs = self.documents()?;
         let sessions = self.research_sessions()?;
         sqlite_v01::rebuild(&self.sqlite_path(), &docs, &sessions)?;
+        sqlite_v01::sync_tombstones(&self.sqlite_path(), &tombstones)?;
         self.write_index_manifest()
     }
 
@@ -527,6 +583,15 @@ impl MemoryStore {
     }
 
     fn research_sessions(&self) -> io::Result<Vec<ResearchSession>> {
+        let tombstones = self.load_tombstones()?;
+        Ok(self
+            .research_sessions_unfiltered()?
+            .into_iter()
+            .filter(|session| !tombstone_blocks_session(session, &tombstones))
+            .collect())
+    }
+
+    fn research_sessions_unfiltered(&self) -> io::Result<Vec<ResearchSession>> {
         let mut sessions = Vec::new();
         let Ok(entries) = fs::read_dir(self.root.join("sessions")) else {
             return Ok(sessions);
@@ -576,6 +641,29 @@ impl MemoryStore {
 
     fn sqlite_path(&self) -> PathBuf {
         self.root.join("db").join("neural-memory.sqlite")
+    }
+
+    fn tombstones_path(&self) -> PathBuf {
+        self.root.join("tombstones.json")
+    }
+
+    fn load_tombstones(&self) -> io::Result<Vec<MemoryTombstone>> {
+        match fs::read(self.tombstones_path()) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+                io::Error::other(format!(
+                    "memory tombstone registry is corrupt; refusing to bypass forget policy: {error}"
+                ))
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn save_tombstones(&self, tombstones: &[MemoryTombstone]) -> io::Result<()> {
+        atomic_write(
+            &self.tombstones_path(),
+            &serde_json::to_vec_pretty(tombstones).map_err(io::Error::other)?,
+        )
     }
 
     fn markdown(&self, document: &MemoryDocument) -> String {
@@ -676,20 +764,128 @@ fn excerpt(body: &str, max_chars: usize) -> String {
     }
 }
 
+fn normalize_domain(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed = Url::parse(trimmed)
+        .or_else(|_| Url::parse(&format!("https://{}", trimmed.trim_start_matches('.'))))
+        .ok()?;
+    let host = parsed.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+fn document_domain(document: &MemoryDocument) -> Option<String> {
+    document
+        .url
+        .as_deref()
+        .and_then(normalize_domain)
+}
+
+fn domain_matches(host: &str, domain: &str) -> bool {
+    host.eq_ignore_ascii_case(domain)
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn tombstone_blocks_document(
+    document: &MemoryDocument,
+    tombstones: &[MemoryTombstone],
+) -> bool {
+    tombstones.iter().any(|tombstone| match tombstone.object_type.as_str() {
+        "document" => tombstone.object_id == document.id,
+        "session" => document.session_id.as_deref() == Some(tombstone.object_id.as_str()),
+        "domain" => document_domain(document)
+            .is_some_and(|host| domain_matches(&host, &tombstone.object_id)),
+        "before" => tombstone
+            .object_id
+            .parse::<u64>()
+            .ok()
+            .is_some_and(|timestamp| document.last_seen_at < timestamp),
+        _ => false,
+    })
+}
+
+fn tombstone_blocks_session(
+    session: &ResearchSession,
+    tombstones: &[MemoryTombstone],
+) -> bool {
+    tombstones.iter().any(|tombstone| {
+        tombstone.object_type == "session" && tombstone.object_id == session.id
+    })
+}
+
+fn push_tombstone(
+    tombstones: &mut Vec<MemoryTombstone>,
+    object_type: &str,
+    object_id: String,
+    scope: &str,
+) {
+    if tombstones
+        .iter()
+        .any(|item| item.object_type == object_type && item.object_id == object_id)
+    {
+        return;
+    }
+    tombstones.push(MemoryTombstone {
+        object_type: object_type.to_string(),
+        object_id,
+        scope: Some(scope.to_string()),
+        reason: Some("user-forget".to_string()),
+        created_at: unix_seconds(),
+    });
+    tombstones.sort_by(|left, right| {
+        left.object_type
+            .cmp(&right.object_type)
+            .then_with(|| left.object_id.cmp(&right.object_id))
+    });
+}
+
+fn extend_tombstones_for_scope(
+    tombstones: &mut Vec<MemoryTombstone>,
+    scope: &ForgetScope,
+    sessions: &[ResearchSession],
+) {
+    match scope {
+        ForgetScope::Document(id) => {
+            push_tombstone(tombstones, "document", id.clone(), "document");
+        }
+        ForgetScope::Session(id) => {
+            push_tombstone(tombstones, "session", id.clone(), "session");
+        }
+        ForgetScope::Domain(domain) => {
+            if let Some(domain) = normalize_domain(domain) {
+                push_tombstone(tombstones, "domain", domain, "domain");
+            }
+        }
+        ForgetScope::Before(timestamp) => {
+            push_tombstone(tombstones, "before", timestamp.to_string(), "before");
+        }
+        ForgetScope::All => {
+            push_tombstone(
+                tombstones,
+                "before",
+                unix_seconds().saturating_add(1).to_string(),
+                "all",
+            );
+            for session in sessions {
+                push_tombstone(tombstones, "session", session.id.clone(), "all");
+            }
+        }
+    }
+}
+
 fn matches_scope(document: &MemoryDocument, scope: &ForgetScope) -> bool {
     match scope {
         ForgetScope::All => true,
         ForgetScope::Document(id) => &document.id == id,
         ForgetScope::Session(id) => document.session_id.as_ref() == Some(id),
         ForgetScope::Before(timestamp) => document.last_seen_at < *timestamp,
-        ForgetScope::Domain(domain) => document
-            .url
-            .as_deref()
-            .and_then(|value| Url::parse(value).ok())
-            .and_then(|url| url.host_str().map(str::to_string))
-            .is_some_and(|host| {
-                host.eq_ignore_ascii_case(domain) || host.ends_with(&format!(".{domain}"))
-            }),
+        ForgetScope::Domain(domain) => normalize_domain(domain)
+            .and_then(|domain| document_domain(document).map(|host| (host, domain)))
+            .is_some_and(|(host, domain)| domain_matches(&host, &domain)),
     }
 }
 
@@ -823,6 +1019,133 @@ mod tests {
     }
 
     #[test]
+    fn forgotten_domain_blocks_subdomain_recapture_and_survives_sqlite_loss() {
+        let root = temp_root("domain-tombstone");
+        let store = MemoryStore::new(&root).unwrap();
+        let original = MemoryDocument::new(
+            MemoryKind::Source,
+            MemorySourceKind::Web,
+            "Example",
+            Some("https://news.Example.COM./article".into()),
+            "first capture",
+        );
+        store.capture(original).unwrap();
+
+        let report = store
+            .forget(ForgetScope::Domain("EXAMPLE.com.".into()))
+            .unwrap();
+        assert_eq!(report.documents, 1);
+        assert!(store.documents().unwrap().is_empty());
+
+        let _ = fs::remove_file(store.sqlite_path());
+        let recapture = MemoryDocument::new(
+            MemoryKind::Source,
+            MemorySourceKind::Web,
+            "Example again",
+            Some("https://deep.sub.example.com/other".into()),
+            "future capture",
+        );
+        assert_eq!(
+            store.capture(recapture).unwrap(),
+            CaptureOutcome::SkippedForgotten
+        );
+        assert!(root.join("tombstones.json").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn forgotten_session_removes_session_file_and_blocks_recapture() {
+        let root = temp_root("session-tombstone");
+        let store = MemoryStore::new(&root).unwrap();
+        let mut session = ResearchSession::new("forget me");
+        session.id = "session-forget".into();
+        session.save(root.join("sessions").join("session-forget.json")).unwrap();
+
+        store
+            .capture(
+                MemoryDocument::new(
+                    MemoryKind::Source,
+                    MemorySourceKind::Reader,
+                    "Session doc",
+                    None,
+                    "session body",
+                )
+                .session("session-forget"),
+            )
+            .unwrap();
+
+        store
+            .forget(ForgetScope::Session("session-forget".into()))
+            .unwrap();
+        assert!(!root.join("sessions").join("session-forget.json").exists());
+
+        let recapture = MemoryDocument::new(
+            MemoryKind::Source,
+            MemorySourceKind::Reader,
+            "Session doc 2",
+            None,
+            "new body",
+        )
+        .session("session-forget");
+        assert_eq!(
+            store.capture(recapture).unwrap(),
+            CaptureOutcome::SkippedForgotten
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rebuild_does_not_resurrect_stale_tombstoned_source() {
+        let root = temp_root("tombstone-rebuild");
+        let store = MemoryStore::new(&root).unwrap();
+        let doc = MemoryDocument::new(
+            MemoryKind::Source,
+            MemorySourceKind::Web,
+            "Stale",
+            Some("https://forgot.example/page".into()),
+            "must stay forgotten",
+        );
+        let stale = serde_json::to_vec_pretty(&doc).unwrap();
+        let stale_path = store.document_path(&doc.id);
+        store.capture(doc).unwrap();
+        store
+            .forget(ForgetScope::Domain("forgot.example".into()))
+            .unwrap();
+
+        fs::write(&stale_path, stale).unwrap();
+        store.rebuild().unwrap();
+
+        assert!(store.documents().unwrap().is_empty());
+        assert!(store
+            .query(&MemoryQuery::new("must stay forgotten"))
+            .unwrap()
+            .is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn corrupt_tombstone_registry_fails_closed() {
+        let root = temp_root("tombstone-corrupt");
+        let store = MemoryStore::new(&root).unwrap();
+        fs::write(root.join("tombstones.json"), b"{not-json").unwrap();
+
+        let result = store.capture(MemoryDocument::new(
+            MemoryKind::Note,
+            MemorySourceKind::Note,
+            "Should fail",
+            None,
+            "body",
+        ));
+        assert!(result.is_err());
+        assert!(store.documents().is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn conceptual_query_finds_document_without_exact_title() {
         let root = temp_root("semantic");
         let store = MemoryStore::new(&root).unwrap();
@@ -876,7 +1199,9 @@ mod tests {
         );
         let id = match store.capture(doc).unwrap() {
             CaptureOutcome::Stored(id) => id,
-            CaptureOutcome::SkippedPrivate => panic!("not private"),
+            CaptureOutcome::SkippedPrivate | CaptureOutcome::SkippedForgotten => {
+                panic!("document should be stored")
+            }
         };
 
         let loaded = store.get(&id).unwrap().unwrap();
