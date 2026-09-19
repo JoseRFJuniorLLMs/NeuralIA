@@ -108,6 +108,27 @@ impl ResearchSession {
         )
     }
 
+    pub fn upsert_provider_answer(
+        &mut self,
+        provider: impl Into<String>,
+        text: impl Into<String>,
+        memory_id: Option<String>,
+    ) -> String {
+        let provider = provider.into();
+        let text = text.into();
+        if let Some(item) = self.items.iter_mut().rev().find(|item| {
+            item.kind == ResearchItemKind::ProviderAnswer
+                && item.provider.as_deref() == Some(provider.as_str())
+        }) {
+            item.text = text;
+            item.memory_id = memory_id;
+            item.created_at = unix_seconds();
+            self.updated_at = item.created_at;
+            return item.id.clone();
+        }
+        self.add_provider_answer(provider, text, memory_id)
+    }
+
     pub fn add_source(
         &mut self,
         provider: Option<String>,
@@ -361,6 +382,55 @@ mod tests {
         let fact = session.comparison(&[source]).remove(0);
         assert_eq!(fact.source, "Claude");
         assert!(fact.entities.iter().any(|entity| entity == "Accessibility"));
+    }
+
+    #[test]
+    fn comparison_accepts_five_sources_and_provider_answer_is_upserted() {
+        let mut session = ResearchSession::new("comparar cinco fontes");
+        for index in 0..5 {
+            session.add_source(
+                Some("Claude".into()),
+                format!("Fonte {index}"),
+                format!("https://example.com/{index}"),
+                None,
+                format!("Entidade{index} valor {}", index + 10),
+            );
+        }
+        let ids = session
+            .items
+            .iter()
+            .filter(|item| item.kind == ResearchItemKind::Source)
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 5);
+        assert_eq!(session.comparison(&ids).len(), 5);
+
+        session.upsert_provider_answer("Claude", "primeira versão", None);
+        session.upsert_provider_answer("Claude", "versão final", None);
+        let answers = session
+            .items
+            .iter()
+            .filter(|item| item.kind == ResearchItemKind::ProviderAnswer)
+            .collect::<Vec<_>>();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].text, "versão final");
+    }
+
+    #[test]
+    fn markdown_export_contains_sources_and_synthesis() {
+        let mut session = ResearchSession::new("exportar");
+        let source = session.add_source(
+            Some("Gemini".into()),
+            "Fonte",
+            "https://example.com",
+            None,
+            "conteúdo",
+        );
+        session.synthesize(&[source]);
+        let markdown = session.export_markdown();
+        assert!(markdown.contains("https://example.com"));
+        assert!(markdown.contains("Gemini"));
+        assert!(markdown.contains("## Sínteses"));
     }
 
     #[test]
