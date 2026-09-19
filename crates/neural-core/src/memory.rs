@@ -492,7 +492,9 @@ impl MemoryStore {
     fn session_for_document(&self, document: &MemoryDocument) -> Option<ResearchSession> {
         let id = document.session_id.as_deref()?;
         let path = self.root.join("sessions").join(format!("{id}.json"));
-        ResearchSession::load(path).ok().filter(|session| session.id == id)
+        ResearchSession::load(path)
+            .ok()
+            .filter(|session| session.id == id)
     }
 
     fn research_sessions(&self) -> io::Result<Vec<ResearchSession>> {
