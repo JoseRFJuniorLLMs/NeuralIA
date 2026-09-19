@@ -1,6 +1,8 @@
-use std::{fs, io, path::Path, time::Duration};
+use std::{collections::HashMap, fs, io, path::Path, time::Duration};
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -544,6 +546,102 @@ pub(super) fn rebuild(
     transaction.commit().map_err(io_error)
 }
 
+pub(super) fn candidate_ids(
+    path: &Path,
+    query_text: &str,
+    provider: Option<&str>,
+    session_id: Option<&str>,
+    limit: usize,
+) -> io::Result<Vec<String>> {
+    let terms = super::tokenize(query_text);
+    if terms.is_empty() || !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let match_query = terms
+        .into_iter()
+        .map(|term| format!("\"{term}\"*"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let candidate_limit = limit.clamp(1, 512) as i64;
+
+    let connection = open_ready(path)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT kp.id
+             FROM knowledge_page_fts AS fts
+             JOIN knowledge_page AS kp ON kp.page_pk = fts.rowid
+             WHERE knowledge_page_fts MATCH ?1
+               AND (?2 IS NULL OR kp.provider = ?2)
+               AND (?3 IS NULL OR kp.research_session_id = ?3)
+             ORDER BY bm25(knowledge_page_fts), kp.last_seen_at DESC
+             LIMIT ?4",
+        )
+        .map_err(io_error)?;
+
+    statement
+        .query_map(
+            params![match_query, provider, session_id, candidate_limit],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(io_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(io_error)
+}
+
+pub(super) fn embeddings_for_ids(
+    path: &Path,
+    ids: &[String],
+) -> io::Result<HashMap<String, Vec<f32>>> {
+    if ids.is_empty() || !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let connection = open_ready(path)?;
+    let mut output = HashMap::with_capacity(ids.len());
+
+    for chunk in ids.chunks(400) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT page_id, dimension, vector
+             FROM memory_embedding
+             WHERE model_id='hashing-v1-384'
+               AND page_id IN ({placeholders})"
+        );
+        let mut statement = connection.prepare(&sql).map_err(io_error)?;
+        let rows = statement
+            .query_map(params_from_iter(chunk.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(io_error)?;
+
+        for row in rows {
+            let (id, dimension, bytes) = row.map_err(io_error)?;
+            if dimension <= 0 || dimension as usize > 4096 {
+                continue;
+            }
+            let expected = dimension as usize * std::mem::size_of::<f32>();
+            if bytes.len() != expected {
+                continue;
+            }
+
+            let mut values = Vec::with_capacity(dimension as usize);
+            for bytes in bytes.as_chunks::<4>().0 {
+                values.push(f32::from_le_bytes(*bytes));
+            }
+            output.insert(id, values);
+        }
+    }
+
+    Ok(output)
+}
+
 #[cfg(test)]
 fn inspect_pragmas(path: &Path) -> io::Result<(i64, String, i64)> {
     let connection = open_ready(path)?;
@@ -682,6 +780,87 @@ mod tests {
         assert_eq!(fake_count, 0);
         assert_eq!(audit_count, 1);
         drop(connection);
+
+        remove_sqlite_sidecars(&path);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn fts_candidate_ids_respect_provider_and_session_filters() {
+        let path = temp_path("candidate-filters");
+
+        let mut alpha = document("rust consensus raft");
+        alpha.provider = Some("Claude".into());
+        alpha.session_id = Some("s1".into());
+        let session = ResearchSession {
+            id: "s1".into(),
+            title: "S1".into(),
+            question: "Q".into(),
+            created_at: alpha.created_at,
+            updated_at: alpha.last_seen_at,
+            items: Vec::new(),
+            syntheses: Vec::new(),
+        };
+        upsert(&path, &alpha, Some(&session)).unwrap();
+
+        let mut beta = document("rust consensus paxos");
+        beta.provider = Some("Gemini".into());
+        beta.session_id = Some("s2".into());
+        let session2 = ResearchSession {
+            id: "s2".into(),
+            title: "S2".into(),
+            question: "Q".into(),
+            created_at: beta.created_at,
+            updated_at: beta.last_seen_at,
+            items: Vec::new(),
+            syntheses: Vec::new(),
+        };
+        upsert(&path, &beta, Some(&session2)).unwrap();
+
+        let all = candidate_ids(&path, "rust consensus", None, None, 10).unwrap();
+        assert_eq!(all.len(), 2);
+
+        let claude = candidate_ids(&path, "rust", Some("Claude"), None, 10).unwrap();
+        assert_eq!(claude, vec![alpha.id.clone()]);
+
+        let s2 = candidate_ids(&path, "consensus", None, Some("s2"), 10).unwrap();
+        assert_eq!(s2, vec![beta.id.clone()]);
+
+        remove_sqlite_sidecars(&path);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn fts_candidate_query_is_parameterized_and_handles_punctuation() {
+        let path = temp_path("candidate-punctuation");
+        let doc = document("C++ rust foo-bar quoted content");
+        upsert(&path, &doc, None).unwrap();
+
+        let hits = candidate_ids(&path, r#"rust " OR 1=1 --"#, None, None, 10).unwrap();
+        assert_eq!(hits, vec![doc.id.clone()]);
+
+        remove_sqlite_sidecars(&path);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn persisted_embeddings_round_trip_for_candidate_ids() {
+        let path = temp_path("embedding-roundtrip");
+        let first = document("semantic one");
+        let second = document("semantic two");
+        upsert(&path, &first, None).unwrap();
+        upsert(&path, &second, None).unwrap();
+
+        let embeddings = embeddings_for_ids(
+            &path,
+            &[first.id.clone(), second.id.clone(), "missing".into()],
+        )
+        .unwrap();
+
+        assert_eq!(embeddings.len(), 2);
+        assert_eq!(embeddings[&first.id], first.embedding);
+        assert_eq!(embeddings[&second.id], second.embedding);
+        assert!(!embeddings.contains_key("missing"));
 
         remove_sqlite_sidecars(&path);
         let _ = fs::remove_dir_all(path.parent().unwrap());
