@@ -52,19 +52,13 @@ try {
         throw "Installed NeuralIA.exe differs from the CI-tested payload."
     }
 
-    $uninstallRoot = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall"
-    $entry = Get-ChildItem -Path $uninstallRoot -ErrorAction Stop |
-        ForEach-Object { Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue } |
-        Where-Object {
-            $_.DisplayName -eq "NeuralIA" -and
-            $_.DisplayVersion -eq $ExpectedVersion -and
-            $_.InstallLocation -and
-            ([IO.Path]::GetFullPath($_.InstallLocation.TrimEnd("\\")) -eq [IO.Path]::GetFullPath($installDir))
-        } |
-        Select-Object -First 1
-
-    if (-not $entry) {
+    $uninstallKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{8B2A98F4-7D55-4C43-ABF0-0D7D1A02C4B9}_is1"
+    if (-not (Test-Path -LiteralPath $uninstallKey)) {
         throw "Per-user uninstall registration was not found in HKCU."
+    }
+    $entry = Get-ItemProperty -LiteralPath $uninstallKey
+    if ($entry.DisplayName -ne "NeuralIA" -or $entry.DisplayVersion -ne $ExpectedVersion) {
+        throw "Uninstall registration contains unexpected product metadata."
     }
 
     $uninstaller = Join-Path $installDir "unins000.exe"
