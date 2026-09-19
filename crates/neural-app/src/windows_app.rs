@@ -287,6 +287,8 @@ enum BarHit {
         source_index: usize,
         context_index: usize,
     },
+    SplitExpand,
+    SplitClose,
 }
 
 /// Geometria da barra de topo: cada IA e um grupo com cabecalho, botao + e
@@ -2113,8 +2115,8 @@ impl App {
                     let _ = view.webview.set_visible(false);
                 }
                 let _ = split.webview.set_bounds(wry::Rect {
-                    position: LogicalPosition::new(0.0, 0.0).into(),
-                    size: LogicalSize::new(logical_w, logical_h).into(),
+                    position: LogicalPosition::new(0.0, content_y).into(),
+                    size: LogicalSize::new(logical_w, content_h).into(),
                 });
                 let _ = split.webview.set_visible(true);
                 return;
@@ -2311,7 +2313,7 @@ impl App {
         let capability = remote_capability();
         let navigation_capability = capability.clone();
         let init_script = format!(
-            "window.__neuralia_col_index = {source_index}; window.__neuralia_col_name = '{source_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{NEURALIA_PALETTE_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}\n{SPLIT_PANEL_SCRIPT}"
+            "window.__neuralia_col_index = {source_index}; window.__neuralia_col_name = '{source_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{NEURALIA_PALETTE_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}"
         )
         .replace("__NEURALIA_CAP__", &capability);
 
@@ -2483,16 +2485,6 @@ impl App {
             } else {
                 None
             });
-        }
-        if let Some(comp) = &self.comparator
-            && let Some(split) = &comp.split
-        {
-            let script = if fullscreen {
-                SPLIT_BUTTON_EXPANDED
-            } else {
-                SPLIT_BUTTON_COLLAPSED
-            };
-            let _ = split.webview.evaluate_script(script);
         }
         self.update_comparator_layout();
         self.request_redraw();
@@ -3169,6 +3161,7 @@ impl App {
     /// rato a chamar.
     fn bar_visible(&self) -> bool {
         match &self.comparator {
+            Some(comp) if comp.split.is_some() => true,
             Some(comp) => comp.expanded.is_none() || self.chrome_revealed,
             None => false,
         }
@@ -3326,10 +3319,58 @@ impl App {
         self.request_redraw();
     }
 
+    fn split_bar_rects(&self) -> Option<(UiRect, UiRect, UiRect)> {
+        let (Some(window), Some(comp)) = (&self.window, &self.comparator) else {
+            return None;
+        };
+        if comp.split.is_none() || !self.bar_visible() {
+            return None;
+        }
+        let scale = window.scale_factor().max(1.0);
+        let width = window.inner_size().width as f64;
+        let margin = 8.0 * scale;
+        let row_y = 7.0 * scale;
+        let row_h = 30.0 * scale;
+        let close_w = 30.0 * scale;
+        let expand_w = 30.0 * scale;
+        let label_w = 150.0 * scale;
+        let gap = 5.0 * scale;
+        let close = UiRect {
+            x: width - margin - close_w,
+            y: row_y,
+            width: close_w,
+            height: row_h,
+        };
+        let expand = UiRect {
+            x: close.x - gap - expand_w,
+            y: row_y,
+            width: expand_w,
+            height: row_h,
+        };
+        let label = UiRect {
+            x: expand.x - gap - label_w,
+            y: row_y,
+            width: label_w,
+            height: row_h,
+        };
+        Some((label, expand, close))
+    }
+
+    fn comparator_bar_hit(&self) -> Option<BarHit> {
+        if let Some((_label, expand, close)) = self.split_bar_rects() {
+            if close.contains(self.cursor.0, self.cursor.1) {
+                return Some(BarHit::SplitClose);
+            }
+            if expand.contains(self.cursor.0, self.cursor.1) {
+                return Some(BarHit::SplitExpand);
+            }
+        }
+        self.bar_layout()
+            .and_then(|layout| layout.hit(self.cursor.0, self.cursor.1))
+    }
+
     fn update_bar_hover(&mut self) {
-        let next = self
-            .bar_layout()
-            .and_then(|layout| layout.hit(self.cursor.0, self.cursor.1));
+        let next = self.comparator_bar_hit();
         if next != self.bar_hover {
             self.bar_hover = next;
             self.request_redraw();
@@ -3450,9 +3491,7 @@ impl App {
     }
 
     fn context_menu_comparator(&mut self) {
-        let hit = self
-            .bar_layout()
-            .and_then(|layout| layout.hit(self.cursor.0, self.cursor.1));
+        let hit = self.comparator_bar_hit();
         let Some(BarHit::ContextTab {
             source_index,
             context_index,
@@ -3518,10 +3557,10 @@ impl App {
     }
 
     fn click_comparator(&mut self) {
-        let hit = self
-            .bar_layout()
-            .and_then(|layout| layout.hit(self.cursor.0, self.cursor.1));
+        let hit = self.comparator_bar_hit();
         match hit {
+            Some(BarHit::SplitClose) => self.close_split(),
+            Some(BarHit::SplitExpand) => self.toggle_split_fullscreen(),
             Some(BarHit::Home) => self.show_home(),
             Some(BarHit::Column(index)) => self.expand_comparator(index),
             Some(BarHit::AddTab(index)) => self.open_ai_palette(index),
@@ -4304,7 +4343,7 @@ fn draw_comparator_bar(
             &comp.contexts,
             comp.split
                 .as_ref()
-                .map(|split| (split.source_index, split.url.as_str())),
+                .map(|split| (split.source_index, split.url.as_str(), split.fullscreen)),
             visible,
             hover,
             auto_scroll,
@@ -4360,7 +4399,7 @@ unsafe fn paint_comparator_bar_with_contexts(
     scale: f64,
     names: &[&str],
     contexts: &[Vec<String>; COMPARATOR_COLUMNS],
-    active_context: Option<(usize, &str)>,
+    active_context: Option<(usize, &str, bool)>,
     visible: bool,
     hover: Option<BarHit>,
     auto_scroll: bool,
@@ -4457,7 +4496,7 @@ unsafe fn paint_comparator_bar_with_contexts(
                 continue;
             };
             let active = active_context
-                .is_some_and(|(source, active_url)| source == index && active_url == url);
+                .is_some_and(|(source, active_url, _)| source == index && active_url == url);
             let hovered = hover
                 == Some(BarHit::ContextTab {
                     source_index: index,
@@ -4481,6 +4520,62 @@ unsafe fn paint_comparator_bar_with_contexts(
                 theme.bar_bg,
             );
         }
+    }
+
+    if let Some((source_index, _url, fullscreen)) = active_context {
+        let margin = 8.0 * scale;
+        let row_y = 7.0 * scale;
+        let row_h = 30.0 * scale;
+        let close_w = 30.0 * scale;
+        let expand_w = 30.0 * scale;
+        let label_w = 150.0 * scale;
+        let gap = 5.0 * scale;
+        let close = UiRect {
+            x: width as f64 - margin - close_w,
+            y: row_y,
+            width: close_w,
+            height: row_h,
+        };
+        let expand = UiRect {
+            x: close.x - gap - expand_w,
+            y: row_y,
+            width: expand_w,
+            height: row_h,
+        };
+        let label = UiRect {
+            x: expand.x - gap - label_w,
+            y: row_y,
+            width: label_w,
+            height: row_h,
+        };
+        let source = names.get(source_index).copied().unwrap_or("IA");
+        draw_pill(
+            target,
+            label,
+            &format!("Fonte · {source}"),
+            PillStyle::new(theme.surface, theme.surface_line, theme.fg_muted),
+            scale,
+            tab_font,
+            theme.bar_bg,
+        );
+        draw_button(
+            target,
+            expand,
+            if fullscreen { "↙" } else { "⛶" },
+            hover == Some(BarHit::SplitExpand),
+            scale,
+            font,
+            theme,
+        );
+        draw_button(
+            target,
+            close,
+            "×",
+            hover == Some(BarHit::SplitClose),
+            scale,
+            font,
+            theme,
+        );
     }
 
     let _ = auto_scroll;
@@ -4933,11 +5028,17 @@ mod tests {
     fn comparator_has_split_palette_and_real_three_way_submit() {
         assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia:split?col="));
         assert!(NEURALIA_PALETTE_SCRIPT.contains("neuralia:palette?col="));
-        assert!(SPLIT_PANEL_SCRIPT.contains("'split-close'"));
-        assert!(SPLIT_PANEL_SCRIPT.contains("'split-expand'"));
+        assert!(SPLIT_SCROLL_RAIL_SCRIPT.contains("neuralia-split-scroll-rail"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("chatgpt.com"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("claude.ai"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("button.click()"));
+    }
+
+    #[test]
+    fn split_controls_are_native_bar_hits() {
+        assert_ne!(BarHit::SplitExpand, BarHit::SplitClose);
+        assert!(!SPLIT_SCROLL_RAIL_SCRIPT.contains("neuralia-split-controls"));
+        assert!(!SPLIT_SCROLL_RAIL_SCRIPT.contains("Fonte ·"));
     }
 
     #[test]
@@ -6109,55 +6210,6 @@ document.addEventListener('DOMContentLoaded', () => {
   syncTicks();
 });
 "#;
-
-const SPLIT_PANEL_SCRIPT: &str = r#"
-document.addEventListener('DOMContentLoaded', () => {
-  if (document.getElementById('neuralia-split-controls')) return;
-  const capability = '__NEURALIA_CAP__';
-  const controls = document.createElement('div');
-  controls.id = 'neuralia-split-controls';
-  Object.assign(controls.style, {
-    position:'fixed', top:'12px', right:'12px', zIndex:'2147483647',
-    display:'flex', alignItems:'center', gap:'7px',
-    padding:'6px', borderRadius:'999px',
-    background:'rgba(17,19,20,.88)', border:'1px solid rgba(255,255,255,.10)',
-    boxShadow:'0 8px 28px rgba(0,0,0,.30)', backdropFilter:'blur(10px)',
-    fontFamily:'Segoe UI, system-ui, sans-serif'
-  });
-
-  const label = document.createElement('span');
-  label.textContent = 'Fonte · ' + (window.__neuralia_col_name || 'IA');
-  Object.assign(label.style, {
-    color:'rgba(255,255,255,.65)', fontSize:'11px', padding:'0 5px 0 7px'
-  });
-
-  function button(id, text, title, action) {
-    const b = document.createElement('button');
-    b.id = id;
-    b.textContent = text;
-    b.title = title;
-    Object.assign(b.style, {
-      width:'30px', height:'30px', padding:'0', border:'0',
-      borderRadius:'50%', background:'rgba(255,255,255,.10)',
-      color:'#fff', cursor:'pointer', fontSize:'16px'
-    });
-    b.onclick = (event) => {
-      event.preventDefault(); event.stopPropagation();
-      window.location.href = 'neuralia:' + action
-        + '?cap=' + encodeURIComponent(capability);
-    };
-    return b;
-  }
-
-  controls.appendChild(label);
-  controls.appendChild(button('neuralia-split-expand', '⛶', 'Expandir fonte', 'split-expand'));
-  controls.appendChild(button('neuralia-split-close', '×', 'Fechar fonte', 'split-close'));
-  document.documentElement.appendChild(controls);
-});
-"#;
-
-const SPLIT_BUTTON_EXPANDED: &str = "(function(){var b=document.getElementById('neuralia-split-expand');if(b){b.textContent='↙';b.title='Voltar ao split view';}})();";
-const SPLIT_BUTTON_COLLAPSED: &str = "(function(){var b=document.getElementById('neuralia-split-expand');if(b){b.textContent='⛶';b.title='Expandir fonte';}})();";
 
 const COMPARATOR_INJECT_SCRIPT: &str = r#"
 document.addEventListener('DOMContentLoaded', () => {
