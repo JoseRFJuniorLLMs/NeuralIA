@@ -22,7 +22,7 @@ use neural_core::{
 };
 use url::Url;
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CLEARTYPE_QUALITY,
         ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
@@ -40,12 +40,12 @@ use windows_sys::Win32::{
         },
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
-            ES_AUTOHSCROLL, GetClientRect, GetForegroundWindow, GetWindowTextLengthW,
-            GetWindowTextW, MB_ICONINFORMATION, MB_OK, MF_SEPARATOR, MF_STRING, MessageBoxW,
-            SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos,
-            SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_KEYDOWN,
-            WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
-            WS_VISIBLE,
+            ES_AUTOHSCROLL, GetCapture, GetClientRect, GetCursorPos, GetForegroundWindow,
+            GetWindowTextLengthW, GetWindowTextW, MB_ICONINFORMATION, MB_OK, MF_SEPARATOR,
+            MF_STRING, MessageBoxW, ReleaseCapture, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
+            SWP_NOZORDER, ScreenToClient, SendMessageW, SetCapture, SetWindowPos, SetWindowTextW,
+            ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_KEYDOWN, WS_CHILD,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -112,6 +112,10 @@ enum UserEvent {
     },
     ExpandComparator(usize),
     MinimizeComparator(usize),
+    ResizeComparator {
+        divider: usize,
+        screen_x: i32,
+    },
     RestoreComparator,
     ReaderReady {
         generation: u64,
@@ -483,6 +487,7 @@ struct ComparatorState {
     views: Vec<ComparatorView>,
     expanded: Option<usize>,
     minimized: [bool; COMPARATOR_COLUMNS],
+    weights: [f64; COMPARATOR_COLUMNS],
     split: Option<SplitView>,
     /// Abas/fontes agrupadas automaticamente pela IA que abriu cada link.
     contexts: [Vec<String>; COMPARATOR_COLUMNS],
@@ -529,6 +534,11 @@ const TAB_MENU_FULLSCREEN: usize = 2;
 const TAB_MENU_CLOSE: usize = 3;
 const TAB_MENU_CLOSE_OTHERS: usize = 4;
 const TAB_MENU_CLOSE_ALL: usize = 5;
+const SPLITTER_SUBCLASS_BASE: usize = 0x4E60;
+const SPLITTER_WIDTH: f64 = 7.0;
+const MIN_PANEL_WIDTH: f64 = 180.0;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_MOUSEMOVE: u32 = 0x0200;
 
 /// Consulta opcional para automacao/benchmarks. Em producao a Home abre em
 /// repouso e nao envia texto a nenhum fornecedor sem acao do utilizador.
@@ -790,6 +800,69 @@ unsafe extern "system" fn gmail_toast_subclass(
             EndPaint(hwnd, &paint);
         }
         return 0;
+    }
+    DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+unsafe extern "system" fn comparator_splitter_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    subclass_id: usize,
+    reference_data: usize,
+) -> LRESULT {
+    match message {
+        WM_LBUTTONDOWN => {
+            SetCapture(hwnd);
+            return 0;
+        }
+        WM_MOUSEMOVE => {
+            if GetCapture() == hwnd {
+                let mut point = POINT { x: 0, y: 0 };
+                if GetCursorPos(&mut point) != 0 {
+                    let divider = subclass_id.saturating_sub(SPLITTER_SUBCLASS_BASE);
+                    let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+                    let _ = proxy.send_event(UserEvent::ResizeComparator {
+                        divider,
+                        screen_x: point.x,
+                    });
+                }
+            }
+            return 0;
+        }
+        WM_LBUTTONUP => {
+            if GetCapture() == hwnd {
+                ReleaseCapture();
+            }
+            return 0;
+        }
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut paint);
+            if !hdc.is_null() {
+                let mut client = RECT::default();
+                if GetClientRect(hwnd, &mut client) != 0 {
+                    let theme = Theme::system();
+                    let bg = CreateSolidBrush(rgb3(theme.bar_bg));
+                    FillRect(hdc, &client, bg);
+                    DeleteObject(bg as _);
+                    let center = (client.right - client.left) / 2;
+                    let line = RECT {
+                        left: center,
+                        top: 0,
+                        right: center + 1,
+                        bottom: client.bottom,
+                    };
+                    let brush = CreateSolidBrush(rgb3(theme.surface_line));
+                    FillRect(hdc, &line, brush);
+                    DeleteObject(brush as _);
+                }
+                EndPaint(hwnd, &paint);
+            }
+            return 0;
+        }
+        _ => {}
     }
     DefSubclassProc(hwnd, message, wparam, lparam)
 }
@@ -1183,6 +1256,7 @@ struct App {
     /// operativo POR CADA evento de rato -- centenas vivas ao mesmo tempo.
     chrome_deadline: Arc<AtomicU64>,
     exit_button: Option<HWND>,
+    splitters: [Option<HWND>; COMPARATOR_COLUMNS - 1],
     auto_scroll: bool,
     auto_scroll_answered: bool,
     auto_scroll_token: u64,
@@ -1253,6 +1327,7 @@ impl App {
             chrome_token: 0,
             chrome_deadline: Arc::new(AtomicU64::new(0)),
             exit_button: None,
+            splitters: [None; COMPARATOR_COLUMNS - 1],
             // Ligada por omissao: a aplicacao serve para ler.
             // Nada rola sem o utilizador dizer que sim.
             auto_scroll: false,
@@ -1501,6 +1576,13 @@ impl App {
         if let Some(button) = self.exit_button.take() {
             unsafe {
                 DestroyWindow(button);
+            }
+        }
+        for splitter in &mut self.splitters {
+            if let Some(hwnd) = splitter.take() {
+                unsafe {
+                    DestroyWindow(hwnd);
+                }
             }
         }
         if let Some(comparator) = self.comparator.take() {
@@ -1942,6 +2024,7 @@ impl App {
             views,
             expanded: None,
             minimized: [false; COMPARATOR_COLUMNS],
+            weights: [1.0; COMPARATOR_COLUMNS],
             split: None,
             contexts: std::array::from_fn(|_| Vec::new()),
         });
@@ -1949,6 +2032,7 @@ impl App {
         self.surface = Surface::Comparator;
         self.schedule_gmail_probe(4);
         self.begin_reading_session(false);
+        self.sync_comparator_splitters();
         self.request_redraw();
     }
 
@@ -2004,6 +2088,7 @@ impl App {
         }
 
         self.update_comparator_layout();
+        self.sync_comparator_splitters();
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.request_redraw();
@@ -2173,25 +2258,32 @@ impl App {
                     .enumerate()
                     .filter_map(|(index, _)| (!comp.minimized[index]).then_some(index))
                     .collect();
-                let n = visible.len().max(1) as f64;
-                let col_w = logical_w / n;
+                let total_weight: f64 = visible
+                    .iter()
+                    .map(|index| comp.weights[*index].max(0.05))
+                    .sum::<f64>()
+                    .max(0.05);
+                let mut col_x = 0.0;
 
-                for (i, v) in comp.views.iter().enumerate() {
-                    let Some(slot) = visible.iter().position(|index| *index == i) else {
-                        let _ = v.webview.set_visible(false);
-                        continue;
-                    };
-                    let col_x = slot as f64 * col_w;
+                for (slot, index) in visible.iter().enumerate() {
+                    let v = &comp.views[*index];
                     let actual_w = if slot == visible.len() - 1 {
                         logical_w - col_x
                     } else {
-                        col_w
+                        logical_w * comp.weights[*index].max(0.05) / total_weight
                     };
                     let _ = v.webview.set_bounds(wry::Rect {
                         position: LogicalPosition::new(col_x, content_y).into(),
-                        size: LogicalSize::new(actual_w, content_h).into(),
+                        size: LogicalSize::new(actual_w.max(1.0), content_h).into(),
                     });
                     let _ = v.webview.set_visible(true);
+                    col_x += actual_w;
+                }
+
+                for (index, v) in comp.views.iter().enumerate() {
+                    if comp.minimized[index] {
+                        let _ = v.webview.set_visible(false);
+                    }
                 }
             }
         }
@@ -2463,6 +2555,7 @@ impl App {
             window.set_fullscreen(None);
         }
         self.update_comparator_layout();
+        self.sync_comparator_splitters();
         self.request_redraw();
     }
 
@@ -3319,6 +3412,185 @@ impl App {
         self.request_redraw();
     }
 
+    fn sync_comparator_splitters(&mut self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+
+        let (show, boundaries, content_height, scale) = if let Some(comp) = &self.comparator {
+            let scale = window.scale_factor().max(1.0);
+            let size = window.inner_size();
+            let logical_w = size.width as f64 / scale;
+            let logical_h = size.height as f64 / scale;
+            let show = self.surface == Surface::Comparator
+                && comp.split.is_none()
+                && comp.expanded.is_none();
+            let visible: Vec<usize> = comp
+                .views
+                .iter()
+                .enumerate()
+                .filter_map(|(index, _)| (!comp.minimized[index]).then_some(index))
+                .collect();
+            let total_weight: f64 = visible
+                .iter()
+                .map(|index| comp.weights[*index].max(0.05))
+                .sum::<f64>()
+                .max(0.05);
+            let mut boundaries = Vec::new();
+            let mut x = 0.0;
+            for (slot, index) in visible.iter().enumerate() {
+                if slot + 1 == visible.len() {
+                    break;
+                }
+                x += logical_w * comp.weights[*index].max(0.05) / total_weight;
+                boundaries.push(x);
+            }
+            (
+                show,
+                boundaries,
+                (logical_h - TOP_BAR_HEIGHT).max(1.0),
+                scale,
+            )
+        } else {
+            (false, Vec::new(), 1.0, window.scale_factor().max(1.0))
+        };
+
+        let mut origin = POINT { x: 0, y: 0 };
+        unsafe {
+            ClientToScreen(owner, &mut origin);
+        }
+
+        for slot in 0..self.splitters.len() {
+            if !show || slot >= boundaries.len() {
+                if let Some(hwnd) = self.splitters[slot] {
+                    unsafe {
+                        ShowWindow(hwnd, SW_HIDE);
+                    }
+                }
+                continue;
+            }
+
+            let hwnd = match self.splitters[slot] {
+                Some(hwnd) => hwnd,
+                None => unsafe {
+                    let width = (SPLITTER_WIDTH * scale).round().max(3.0) as i32;
+                    let height = (content_height * scale).round().max(1.0) as i32;
+                    let created = CreateWindowExW(
+                        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                        windows_sys::w!("STATIC"),
+                        windows_sys::w!(""),
+                        WS_POPUP | WS_VISIBLE,
+                        0,
+                        0,
+                        width,
+                        height,
+                        owner,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                    );
+                    if created.is_null() {
+                        continue;
+                    }
+                    let proxy_ptr =
+                        (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
+                    if SetWindowSubclass(
+                        created,
+                        Some(comparator_splitter_subclass),
+                        SPLITTER_SUBCLASS_BASE + slot,
+                        proxy_ptr,
+                    ) == 0
+                    {
+                        DestroyWindow(created);
+                        continue;
+                    }
+                    self.splitters[slot] = Some(created);
+                    created
+                },
+            };
+
+            let width = (SPLITTER_WIDTH * scale).round().max(3.0) as i32;
+            let x = origin.x
+                + (boundaries[slot] * scale - SPLITTER_WIDTH * scale / 2.0).round() as i32;
+            let y = origin.y + (TOP_BAR_HEIGHT * scale).round() as i32;
+            let height = (content_height * scale).round().max(1.0) as i32;
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    x,
+                    y,
+                    width,
+                    height,
+                    SWP_NOACTIVATE,
+                );
+                ShowWindow(hwnd, SW_SHOW);
+                InvalidateRect(hwnd, std::ptr::null(), 1);
+            }
+        }
+    }
+
+    fn resize_comparator(&mut self, divider: usize, screen_x: i32) {
+        let (Some(window), Some(comp)) = (&self.window, &mut self.comparator) else {
+            return;
+        };
+        if comp.split.is_some() || comp.expanded.is_some() {
+            return;
+        }
+
+        let visible: Vec<usize> = comp
+            .views
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| (!comp.minimized[index]).then_some(index))
+            .collect();
+        if divider + 1 >= visible.len() {
+            return;
+        }
+
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let mut point = POINT { x: screen_x, y: 0 };
+        unsafe {
+            ScreenToClient(owner, &mut point);
+        }
+        let scale = window.scale_factor().max(1.0);
+        let logical_w = window.inner_size().width as f64 / scale;
+        let mouse_x = (point.x as f64 / scale).clamp(0.0, logical_w);
+
+        let total_weight: f64 = visible
+            .iter()
+            .map(|index| comp.weights[*index].max(0.05))
+            .sum::<f64>()
+            .max(0.05);
+        let left_index = visible[divider];
+        let right_index = visible[divider + 1];
+        let before_weight: f64 = visible[..divider]
+            .iter()
+            .map(|index| comp.weights[*index].max(0.05))
+            .sum();
+        let pair_weight =
+            comp.weights[left_index].max(0.05) + comp.weights[right_index].max(0.05);
+        let left_edge = logical_w * before_weight / total_weight;
+        let pair_span = logical_w * pair_weight / total_weight;
+        if pair_span <= 1.0 {
+            return;
+        }
+        let min_width = MIN_PANEL_WIDTH.min(pair_span * 0.45);
+        let left_width = (mouse_x - left_edge).clamp(min_width, pair_span - min_width);
+        let left_weight = pair_weight * left_width / pair_span;
+        comp.weights[left_index] = left_weight.max(0.05);
+        comp.weights[right_index] = (pair_weight - left_weight).max(0.05);
+
+        self.update_comparator_layout();
+        self.sync_comparator_splitters();
+        self.request_redraw();
+    }
+
     fn split_bar_rects(&self) -> Option<(UiRect, UiRect, UiRect)> {
         let (Some(window), Some(comp)) = (&self.window, &self.comparator) else {
             return None;
@@ -3710,6 +3982,11 @@ impl ApplicationHandler<UserEvent> for App {
                     self.minimize_comparator(idx);
                 }
             }
+            UserEvent::ResizeComparator { divider, screen_x } => {
+                if self.surface == Surface::Comparator {
+                    self.resize_comparator(divider, screen_x);
+                }
+            }
             UserEvent::RestoreComparator => {
                 if self.surface == Surface::Comparator {
                     self.restore_comparator();
@@ -3791,6 +4068,7 @@ impl ApplicationHandler<UserEvent> for App {
                 Surface::Comparator => {
                     self.needs_clear = true;
                     self.update_comparator_layout();
+                    self.sync_comparator_splitters();
                     self.sync_exit_button();
                     self.request_redraw();
                 }
@@ -5039,6 +5317,14 @@ mod tests {
         assert_ne!(BarHit::SplitExpand, BarHit::SplitClose);
         assert!(!SPLIT_SCROLL_RAIL_SCRIPT.contains("neuralia-split-controls"));
         assert!(!SPLIT_SCROLL_RAIL_SCRIPT.contains("Fonte ·"));
+    }
+
+    #[test]
+    fn comparator_resize_uses_persistent_weights_and_native_splitters() {
+        let weights = [1.0_f64; COMPARATOR_COLUMNS];
+        assert!(weights.iter().all(|weight| *weight > 0.0));
+        assert!(MIN_PANEL_WIDTH >= 120.0);
+        assert!(SPLITTER_WIDTH >= 3.0);
     }
 
     #[test]
