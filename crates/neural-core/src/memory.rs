@@ -308,20 +308,40 @@ impl MemoryStore {
             return Ok(Vec::new());
         }
 
-        let docs = self
-            .documents()?
-            .into_iter()
-            .filter(|doc| {
-                query
-                    .provider
-                    .as_ref()
-                    .is_none_or(|provider| doc.provider.as_ref() == Some(provider))
-                    && query
-                        .session_id
+        let candidate_limit = query.limit.clamp(1, 100).saturating_mul(16).min(512);
+        let candidate_ids = sqlite_v01::candidate_ids(
+            &self.sqlite_path(),
+            query_text,
+            query.provider.as_deref(),
+            query.session_id.as_deref(),
+            candidate_limit,
+        )
+        .unwrap_or_default();
+
+        let docs = if candidate_ids.is_empty() {
+            self.documents()?
+                .into_iter()
+                .filter(|doc| {
+                    query
+                        .provider
                         .as_ref()
-                        .is_none_or(|session| doc.session_id.as_ref() == Some(session))
-            })
-            .collect::<Vec<_>>();
+                        .is_none_or(|provider| doc.provider.as_ref() == Some(provider))
+                        && query
+                            .session_id
+                            .as_ref()
+                            .is_none_or(|session| doc.session_id.as_ref() == Some(session))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            candidate_ids
+                .into_iter()
+                .filter_map(|id| self.get(&id).transpose())
+                .collect::<io::Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .filter(|doc| !doc.private)
+                .collect::<Vec<_>>()
+        };
         if docs.is_empty() {
             return Ok(Vec::new());
         }
@@ -716,6 +736,47 @@ mod tests {
                 .unwrap_or_default()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn query_uses_fts_candidates_without_losing_provider_filter() {
+        let root = temp_root("fts-query-filter");
+        let store = MemoryStore::new(&root).unwrap();
+
+        store
+            .capture(
+                MemoryDocument::new(
+                    MemoryKind::Source,
+                    MemorySourceKind::ProviderAnswer,
+                    "Rust A",
+                    None,
+                    "ownership borrowing lifetimes rust",
+                )
+                .provider("Claude"),
+            )
+            .unwrap();
+        store
+            .capture(
+                MemoryDocument::new(
+                    MemoryKind::Source,
+                    MemorySourceKind::ProviderAnswer,
+                    "Rust B",
+                    None,
+                    "ownership borrowing lifetimes rust",
+                )
+                .provider("Gemini"),
+            )
+            .unwrap();
+
+        let mut query = MemoryQuery::new("ownership rust");
+        query.provider = Some("Claude".into());
+        let hits = store.query(&query).unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].provider.as_deref(), Some("Claude"));
+        assert!(hits[0].matched_by.iter().any(|source| source == "lexical"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
