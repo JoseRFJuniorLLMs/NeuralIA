@@ -26,7 +26,7 @@ Improve Readability scoring, preserve selected safe links/images, join article p
 
 ## Phase 4 — Distribution
 
-Windows icon resources, SHA-256 checksums, CycloneDX SBOM, Cargo metadata and provenance are implemented. The remaining distribution work is an Authenticode-signed installer and explicit update metadata/policy. Dependency policy is enforced in CI with a SHA-pinned `cargo-deny` action: unknown registries/git sources and registry/git wildcard dependencies are denied, licenses are allowlisted explicitly, and duplicate crate versions are surfaced as warnings for cleanup. The release pipeline is CI-gated, SHA-pinned and immutable; build provenance is attested in CI against the exact Windows binary that passed the product gates.
+Windows icon resources, SHA-256 checksums, CycloneDX SBOM, Cargo metadata and provenance are implemented. The CI now also has an opt-in Authenticode path that signs the release candidate before product measurement and fails closed when enabled without valid certificate material; the owner still has to provision the real certificate. The remaining distribution work is the actual per-user installer and explicit update metadata/policy. Dependency policy is enforced in CI with a SHA-pinned `cargo-deny` action: unknown registries/git sources and registry/git wildcard dependencies are denied, licenses are allowlisted explicitly, and duplicate crate versions are surfaced as warnings for cleanup. The release pipeline is CI-gated, SHA-pinned and immutable; build provenance is attested in CI against the exact Windows binary that passed the product gates.
 
 ## Phase 5 — Optional platforms
 
