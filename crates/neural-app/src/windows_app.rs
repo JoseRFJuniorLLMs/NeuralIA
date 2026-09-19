@@ -2152,6 +2152,31 @@ enum BrowserAgentCommand {
     Extract,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentTermination {
+    Completed,
+    UserStopped,
+    Limit,
+    ElementMissing,
+    RestrictedAction,
+    UserRejected,
+    ExecutionError,
+}
+
+impl AgentTermination {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::UserStopped => "user-stopped",
+            Self::Limit => "limit",
+            Self::ElementMissing => "element-missing",
+            Self::RestrictedAction => "restricted-action",
+            Self::UserRejected => "user-rejected",
+            Self::ExecutionError => "execution-error",
+        }
+    }
+}
+
 struct BrowserAgentState {
     goal: String,
     commands: Vec<BrowserAgentCommand>,
@@ -2573,7 +2598,7 @@ impl App {
     fn destroy_web_surfaces(&mut self) {
         self.mark_dirty();
         self.close_palette();
-        self.finish_agent(false);
+        self.finish_agent(AgentTermination::UserStopped);
         self.leave_fullscreen();
         if let Some(window) = &self.window {
             window.set_decorations(true);
@@ -3228,14 +3253,14 @@ impl App {
                 "Agente interrompido pelo limite de execução.".to_string(),
                 4,
             );
-            self.finish_agent(true);
+            self.finish_agent(AgentTermination::Limit);
             return;
         }
 
         let command = agent.commands.get(agent.next_command).cloned();
         let Some(command) = command else {
             self.show_splash("Agente concluiu a sequência.".to_string(), 3);
-            self.finish_agent(true);
+            self.finish_agent(AgentTermination::Completed);
             return;
         };
 
@@ -3266,7 +3291,7 @@ impl App {
                 agent.steps += 1;
             }
             self.show_native_text("NeuralIA Agent — Extração", &clean);
-            self.finish_agent(true);
+            self.finish_agent(AgentTermination::Completed);
             return;
         }
 
@@ -3296,7 +3321,7 @@ impl App {
 
         let Some(action) = action else {
             self.show_splash("Agente não encontrou o elemento solicitado.".to_string(), 4);
-            self.finish_agent(true);
+            self.finish_agent(AgentTermination::ElementMissing);
             return;
         };
 
@@ -3314,7 +3339,7 @@ impl App {
                     "Ação restrita: controle devolvido ao usuário.".to_string(),
                     5,
                 );
-                self.finish_agent(true);
+                self.finish_agent(AgentTermination::RestrictedAction);
                 return;
             }
             if !decision.requires_confirmation
@@ -3324,7 +3349,7 @@ impl App {
                     agent.policy.record_user_confirmation(&security, false);
                 }
                 self.show_splash("Ação do agente cancelada.".to_string(), 3);
-                self.finish_agent(true);
+                self.finish_agent(AgentTermination::UserRejected);
                 return;
             }
             if let Some(agent) = self.active_agent.as_mut() {
@@ -3335,14 +3360,14 @@ impl App {
         match self.execute_agent_action(&action) {
             Ok(()) => {
                 if let Some(agent) = self.active_agent.as_mut() {
-                    agent.trace.push(format!("{action:?}"));
+                    agent.trace.push(agent_trace_action(&action));
                     agent.next_command += 1;
                     agent.steps += 1;
                 }
             }
             Err(error) => {
                 self.show_splash(format!("Agent: {error}"), 4);
-                self.finish_agent(true);
+                self.finish_agent(AgentTermination::ExecutionError);
             }
         }
     }
@@ -3377,13 +3402,10 @@ impl App {
         }
     }
 
-    fn finish_agent(&mut self, persist: bool) {
+    fn finish_agent(&mut self, reason: AgentTermination) {
         let Some(agent) = self.active_agent.take() else {
             return;
         };
-        if !persist {
-            return;
-        }
 
         let root = self.config.data_dir.join("agent");
         let _ = std::fs::create_dir_all(&root);
@@ -3391,8 +3413,9 @@ impl App {
         let _ = std::fs::write(
             root.join(format!("trace-{stamp}.log")),
             format!(
-                "goal: {}\nsteps: {}\n{}\n",
-                agent.goal,
+                "termination: {}\ngoal: {}\nsteps: {}\n{}\n",
+                reason.as_str(),
+                redact_sensitive_text(&agent.goal),
                 agent.steps,
                 agent.trace.join("\n")
             ),
@@ -5964,25 +5987,61 @@ fn app_agent_security_action(action: &AgentAction, page: &ObservedPage) -> Agent
     match action {
         AgentAction::Click { target } => {
             let label = target.name.to_lowercase();
-            if ["delete", "remove", "excluir", "apagar"]
+            let role = target.role.to_lowercase();
+            let material = format!("{role} {label}");
+            if ["delete", "remove", "excluir", "apagar", "cancel account"]
                 .iter()
-                .any(|word| label.contains(word))
+                .any(|word| material.contains(word))
             {
                 AgentSecurityAction::DeleteRemote {
                     origin,
                     description: target.name.clone(),
                 }
-            } else if ["buy", "purchase", "pay", "comprar", "pagar"]
-                .iter()
-                .any(|word| label.contains(word))
+            } else if [
+                "buy",
+                "purchase",
+                "pay",
+                "comprar",
+                "pagar",
+                "checkout",
+                "transfer",
+                "transferir",
+                "subscribe",
+                "assinar plano",
+            ]
+            .iter()
+            .any(|word| material.contains(word))
             {
                 AgentSecurityAction::Payment {
                     origin,
                     description: target.name.clone(),
                 }
-            } else if ["send", "submit", "confirm", "enviar", "confirmar"]
+            } else if role.contains("submit")
+                || [
+                    "send",
+                    "submit",
+                    "confirm",
+                    "enviar",
+                    "confirmar",
+                    "post",
+                    "publish",
+                    "publicar",
+                    "save changes",
+                    "salvar alterações",
+                    "salvar alteracoes",
+                    "create account",
+                    "criar conta",
+                    "authorize",
+                    "autorizar",
+                    "accept terms",
+                    "aceitar termos",
+                    "sign agreement",
+                    "assinar acordo",
+                    "finalize",
+                    "finalizar",
+                ]
                 .iter()
-                .any(|word| label.contains(word))
+                .any(|word| material.contains(word))
             {
                 AgentSecurityAction::Submit {
                     origin,
@@ -6006,6 +6065,40 @@ fn app_agent_security_action(action: &AgentAction, page: &ObservedPage) -> Agent
         },
         AgentAction::Extract { .. } => AgentSecurityAction::Extract { origin },
         _ => AgentSecurityAction::Read { origin },
+    }
+}
+
+fn agent_trace_action(action: &AgentAction) -> String {
+    match action {
+        AgentAction::TypeText {
+            target,
+            text,
+            field,
+        } => format!(
+            "type target={} field={field:?} chars={}",
+            target.id,
+            text.chars().count()
+        ),
+        AgentAction::Select { target, value } => {
+            format!("select target={} chars={}", target.id, value.chars().count())
+        }
+        AgentAction::Click { target } => format!(
+            "click target={} label={}",
+            target.id,
+            redact_sensitive_text(&target.name)
+        ),
+        AgentAction::Extract { .. } => "extract".to_string(),
+        AgentAction::Submit { description, .. } => {
+            format!("submit {}", redact_sensitive_text(description))
+        }
+        AgentAction::Navigate { url } => format!("navigate {}", redact_sensitive_text(url)),
+        AgentAction::Wait { millis } => format!("wait {millis}ms"),
+        AgentAction::AskUser { reason } => {
+            format!("ask-user {}", redact_sensitive_text(reason))
+        }
+        AgentAction::Finish { summary } => {
+            format!("finish {}", redact_sensitive_text(summary))
+        }
     }
 }
 
@@ -8029,6 +8122,85 @@ mod tests {
                 .unwrap_or_else(|p| p.into_inner())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn agent_trace_never_records_typed_or_selected_values() {
+        let target = AgentElement {
+            id: "field-1".into(),
+            generation: 1,
+            role: "textbox".into(),
+            name: "Search".into(),
+            text: String::new(),
+            origin: "https://example.com".into(),
+            frame: "top".into(),
+            visible: true,
+            interactable: true,
+        };
+        let typed = agent_trace_action(&AgentAction::TypeText {
+            target: target.clone(),
+            text: "synthetic-secret-value".into(),
+            field: FieldKind::Text,
+        });
+        let selected = agent_trace_action(&AgentAction::Select {
+            target,
+            value: "synthetic-secret-option".into(),
+        });
+
+        assert!(!typed.contains("synthetic-secret-value"));
+        assert!(!selected.contains("synthetic-secret-option"));
+        assert!(typed.contains("chars=22"));
+    }
+
+    #[test]
+    fn submit_role_and_sensitive_labels_are_not_plain_reversible_clicks() {
+        let page = ObservedPage {
+            generation: 1,
+            url: "https://example.com/form".into(),
+            title: String::new(),
+            text_excerpt: String::new(),
+            elements: Vec::new(),
+        };
+        let make = |role: &str, name: &str| AgentElement {
+            id: name.into(),
+            generation: 1,
+            role: role.into(),
+            name: name.into(),
+            text: name.into(),
+            origin: "https://example.com".into(),
+            frame: "top".into(),
+            visible: true,
+            interactable: true,
+        };
+
+        for target in [
+            make("submit", "Continue"),
+            make("button", "Save changes"),
+            make("button", "Authorize"),
+        ] {
+            assert!(matches!(
+                app_agent_security_action(&AgentAction::Click { target }, &page),
+                AgentSecurityAction::Submit { .. }
+            ));
+        }
+
+        for target in [
+            make("button", "Checkout"),
+            make("button", "Transfer"),
+        ] {
+            assert!(matches!(
+                app_agent_security_action(&AgentAction::Click { target }, &page),
+                AgentSecurityAction::Payment { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn agent_termination_reason_is_explicit() {
+        assert_eq!(AgentTermination::Completed.as_str(), "completed");
+        assert_eq!(AgentTermination::UserStopped.as_str(), "user-stopped");
+        assert_eq!(AgentTermination::RestrictedAction.as_str(), "restricted-action");
+        assert_eq!(AgentTermination::ExecutionError.as_str(), "execution-error");
     }
 
     #[test]
