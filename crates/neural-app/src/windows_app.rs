@@ -2782,47 +2782,28 @@ impl App {
     }
 
     fn handle_input(&mut self, input: String) {
-        if let Some(spec) = input.strip_prefix("agent:") {
-            self.start_browser_agent(spec.trim());
-            return;
-        }
-        if let Some(query) = input
-            .strip_prefix("memory:")
-            .or_else(|| input.strip_prefix("mem:"))
-        {
-            self.memory.query(query.trim().to_string());
-            self.show_splash("Buscando na memória local…".to_string(), 2);
-            return;
-        }
-        if input.trim().eq_ignore_ascii_case("history:") {
-            self.show_recent_history();
-            return;
-        }
-        if input.trim().eq_ignore_ascii_case("research:compare") {
-            self.compare_current_research();
-            return;
-        }
-        if input.trim().eq_ignore_ascii_case("research:synthesize") {
-            self.synthesize_current_research();
-            return;
-        }
-        if input.trim().eq_ignore_ascii_case("research:export") {
-            self.export_current_research();
-            return;
-        }
-        if input.trim().eq_ignore_ascii_case("memory:rebuild") {
-            self.memory.rebuild();
-            self.show_splash("Reconstrução da memória agendada.".to_string(), 3);
-            return;
-        }
-
-        match parse_intent(&input) {
-            Ok(Intent::Home) => self.show_home(),
-            Ok(Intent::Ask(query)) => self.ask(query),
-            Ok(Intent::Compare(query)) => self.compare(query),
-            Ok(Intent::Read(url)) => self.read(url.to_string()),
-            Ok(Intent::Web(url)) => self.web(url.to_string()),
-            Err(error) => self.show_native_error(error.to_string()),
+        match route_input(&input) {
+            InputRoute::Agent(spec) => self.start_browser_agent(&spec),
+            InputRoute::MemoryQuery(query) => {
+                self.memory.query(query);
+                self.show_splash("Buscando na memória local…".to_string(), 2);
+            }
+            InputRoute::MemoryRebuild => {
+                self.memory.rebuild();
+                self.show_splash("Reconstrução da memória agendada.".to_string(), 3);
+            }
+            InputRoute::History => self.show_recent_history(),
+            InputRoute::ResearchCompare => self.compare_current_research(),
+            InputRoute::ResearchSynthesize => self.synthesize_current_research(),
+            InputRoute::ResearchExport => self.export_current_research(),
+            InputRoute::Intent => match parse_intent(&input) {
+                Ok(Intent::Home) => self.show_home(),
+                Ok(Intent::Ask(query)) => self.ask(query),
+                Ok(Intent::Compare(query)) => self.compare(query),
+                Ok(Intent::Read(url)) => self.read(url.to_string()),
+                Ok(Intent::Web(url)) => self.web(url.to_string()),
+                Err(error) => self.show_native_error(error.to_string()),
+            },
         }
     }
 
@@ -6100,6 +6081,53 @@ fn decide_agent_step(
     }))
 }
 
+/// Para onde vai o texto que o utilizador submeteu, decidido sem tocar na
+/// janela, na memória, na rede nem no agente. É a SPEC-0106 -- a composição do
+/// produto -- num sítio onde um teste lhe consegue chegar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InputRoute {
+    Agent(String),
+    MemoryQuery(String),
+    MemoryRebuild,
+    History,
+    ResearchCompare,
+    ResearchSynthesize,
+    ResearchExport,
+    /// Sem comando próprio: segue para o `parse_intent`.
+    Intent,
+}
+
+fn route_input(input: &str) -> InputRoute {
+    // Os comandos exactos vêm ANTES dos prefixos. `memory:rebuild` começa por
+    // `memory:`, por isso enquanto o prefixo foi testado primeiro o rebuild
+    // nunca aconteceu: procurava-se a palavra "rebuild" na memória e
+    // anunciava-se "Buscando na memória local…".
+    let trimmed = input.trim();
+    for (command, route) in [
+        ("history:", InputRoute::History),
+        ("research:compare", InputRoute::ResearchCompare),
+        ("research:synthesize", InputRoute::ResearchSynthesize),
+        ("research:export", InputRoute::ResearchExport),
+        ("memory:rebuild", InputRoute::MemoryRebuild),
+        ("mem:rebuild", InputRoute::MemoryRebuild),
+    ] {
+        if trimmed.eq_ignore_ascii_case(command) {
+            return route;
+        }
+    }
+
+    if let Some(spec) = input.strip_prefix("agent:") {
+        return InputRoute::Agent(spec.trim().to_string());
+    }
+    if let Some(query) = input
+        .strip_prefix("memory:")
+        .or_else(|| input.strip_prefix("mem:"))
+    {
+        return InputRoute::MemoryQuery(query.trim().to_string());
+    }
+    InputRoute::Intent
+}
+
 fn app_agent_security_action(action: &AgentAction, page: &ObservedPage) -> AgentSecurityAction {
     let origin = Url::parse(&page.url)
         .ok()
@@ -9065,6 +9093,54 @@ mod tests {
         assert!(matches!(commands[1], BrowserAgentCommand::Select { .. }));
         assert!(matches!(commands[2], BrowserAgentCommand::Click(_)));
         assert!(matches!(commands[3], BrowserAgentCommand::Extract));
+    }
+
+    /// SPEC-0106 sobre o caminho que embarca: o que o utilizador escreve na
+    /// omnibox vai para onde deve ir. `handle_input` só executa o que esta
+    /// função decidir.
+    #[test]
+    fn route_input_sends_each_command_where_it_belongs() {
+        assert_eq!(
+            route_input("agent:https://example.com | extract"),
+            InputRoute::Agent("https://example.com | extract".into())
+        );
+        assert_eq!(
+            route_input("memory:rust ownership"),
+            InputRoute::MemoryQuery("rust ownership".into())
+        );
+        assert_eq!(
+            route_input("mem: borrow checker "),
+            InputRoute::MemoryQuery("borrow checker".into())
+        );
+        assert_eq!(route_input("history:"), InputRoute::History);
+        assert_eq!(
+            route_input(" research:compare "),
+            InputRoute::ResearchCompare
+        );
+        assert_eq!(
+            route_input("RESEARCH:SYNTHESIZE"),
+            InputRoute::ResearchSynthesize
+        );
+        assert_eq!(route_input("research:export"), InputRoute::ResearchExport);
+        assert_eq!(route_input("o que é ownership"), InputRoute::Intent);
+        assert_eq!(route_input("https://example.com"), InputRoute::Intent);
+    }
+
+    #[test]
+    fn memory_rebuild_is_not_swallowed_by_the_memory_prefix() {
+        // `memory:rebuild` começa por `memory:`. Enquanto o prefixo foi
+        // testado primeiro, o ramo do rebuild era inalcançável: o comando
+        // procurava a palavra "rebuild" na memória e dizia "Buscando na
+        // memória local…". A ordem aqui é o próprio comportamento.
+        assert_eq!(route_input("memory:rebuild"), InputRoute::MemoryRebuild);
+        assert_eq!(route_input(" Memory:Rebuild "), InputRoute::MemoryRebuild);
+        assert_eq!(route_input("mem:rebuild"), InputRoute::MemoryRebuild);
+
+        // E o prefixo continua a funcionar para tudo o resto.
+        assert_eq!(
+            route_input("memory:rebuilding a parser"),
+            InputRoute::MemoryQuery("rebuilding a parser".into())
+        );
     }
 
     #[test]

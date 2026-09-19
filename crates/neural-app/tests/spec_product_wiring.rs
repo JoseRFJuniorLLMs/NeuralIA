@@ -1,10 +1,27 @@
-//! Acceptance gates for SPEC-0100..0106 on the code that actually ships.
+//! Ligações entre subsistemas no binário que embarca — NÃO são gates de
+//! comportamento.
 //!
-//! These tests are intentionally source-wiring tests. `neural-app` is a binary
-//! with Windows-only UI internals, so an integration test cannot import private
-//! `windows_app` functions directly. Reading the compiled source path still
-//! gives the property we need here: removing/bypassing the product wiring makes
-//! this gate red instead of leaving a parallel library test green.
+//! Estes testes leem o **texto** de `windows_app.rs`. Isso prova uma coisa só:
+//! que certas peças estão ligadas umas às outras no produto, e não apenas
+//! construíveis numa biblioteca à parte. É útil, e é o limite.
+//!
+//! O que isto NÃO prova, medido a 19/09/2026: com o `policy.evaluate` retirado
+//! do `decide_agent_step` — o agente a executar tudo sem política, sem
+//! confirmação e sem parar em ações restritas — **os sete testes deste ficheiro
+//! passavam**. A string continuava lá; o código já não corria. Ao mesmo tempo,
+//! os testes de comportamento em `windows_app::tests::spec_0105_shipping_agent`
+//! ficavam vermelhos, 5 de 7.
+//!
+//! E falham ao contrário também: quando o encaminhamento da omnibox saiu de
+//! `handle_input` para `route_input`, sem uma única mudança de comportamento,
+//! este ficheiro ficou vermelho.
+//!
+//! Regra (AGENTS.md §4.3): uma afirmação sobre o que o produto **faz** tem de
+//! ser testada onde ela acontece — no bloco `#[cfg(test)] mod tests` dentro do
+//! próprio `windows_app.rs`, que alcança as funções privadas, extraindo a
+//! decisão para uma função sem UI quando ela estiver entalada num método
+//! (`decide_agent_step` e `route_input` são os modelos). Aqui fica só o que o
+//! texto consegue provar: presença e, sobretudo, **ausência**.
 
 const APP: &str = include_str!("../src/windows_app.rs");
 const IPC: &str = include_str!("../src/ipc.rs");
@@ -144,12 +161,15 @@ fn spec_0105_shipped_runtime_is_decide_agent_step_not_the_reference_harness() {
 
 #[test]
 fn spec_0106_roadmap_product_composition_is_wired_not_just_constructible() {
-    let input = between(APP, "fn handle_input", "fn submit_current");
-    assert!(input.contains("input.strip_prefix(\"agent:\")"));
-    assert!(input.contains(".strip_prefix(\"memory:\")"));
-    assert!(input.contains("research:compare"));
-    assert!(input.contains("research:synthesize"));
-    assert!(input.contains("research:export"));
+    // O encaminhamento da omnibox saiu daqui: a decisão vive em `route_input`
+    // e é testada pelo comportamento, em
+    // `windows_app::tests::route_input_sends_each_command_where_it_belongs` e
+    // `::memory_rebuild_is_not_swallowed_by_the_memory_prefix`. Foi essa
+    // passagem que mostrou que `memory:rebuild` nunca chegava a reconstruir
+    // nada -- o prefixo `memory:` apanhava-o primeiro -- com estas asserções
+    // de texto todas verdes.
+    assert!(APP.contains("fn route_input("));
+    assert!(APP.contains("match route_input(&input)"));
 
     assert!(APP.contains("ResearchSession::new(query.clone())"));
     assert!(APP.contains("self.memory.capture(question_memory);"));
