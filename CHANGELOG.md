@@ -2,6 +2,24 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [Unreleased]
+
+### Security
+- **SPEC-0108 / PR #24:** superfícies WebView remotas deixam de transportar a
+  capability em URLs `neuralia:?cap=...` e passam a usar mensagens WebView2
+  autenticadas por capability por WebView. O parser aceita somente o envelope
+  versionado e a lista fechada de 25 ações, limita o corpo a 8 KiB, valida
+  argumentos e bloqueia pivô de Split View para rede local.
+- Scripts capturam `chrome.webview.postMessage` e `JSON.stringify` no
+  document-created; handlers de navegação remotos recusam `neuralia:`.
+  Links internos do Reader continuam sendo a exceção sem token.
+
+### Validation
+- PR #24 adiciona testes do parser, das 25 ações, bounds, capability incorreta,
+  ausência de `?cap=` nos scripts remotos, captura antecipada das primitivas
+  IPC e rejeição do esquema `neuralia:` nas superfícies remotas.
+- Revisão adversarial independente e release 2.1.0 permanecem pendentes.
+
 ## [2.0.1] - 2026-09-19
 
 Correção da baseline 2.0 após auditoria do código real e alinhamento das

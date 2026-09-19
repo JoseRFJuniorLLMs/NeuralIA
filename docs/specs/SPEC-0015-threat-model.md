@@ -18,7 +18,7 @@ Malicious sites, malformed HTML, hostile redirects, DNS rebinding/private-networ
 - public DNS resolution rejects local/private/reserved destinations before connection;
 - Reader converts untrusted HTML to escaped text blocks;
 - no site JavaScript in Reader;
-- no object IPC exposed to Reader or external web pages; remote `neuralia:` navigation is limited to a fixed list of user-interface actions, each requiring a per-WebView capability token drawn from the operating-system CSPRNG (`BCryptGenRandom`), held only inside the closure of the injected scripts, carried by native functions captured at document-created time so poisoned globals cannot steal it, and compared in constant time; every injected handler requires a trusted event, for pointer and keyboard alike, so synthetic clicks and key presses are ignored; the floating palette is a native Win32 control rather than an input injected into the page, so a page can request that it open but can never read or submit its text;
+- remote page-to-native control uses a bounded WebView2 message channel with no ambient authority: a closed 25-action schema, 8 KiB envelope ceiling, exact argument validation and a per-WebView capability drawn from `BCryptGenRandom` and compared in constant time; `postMessage` and `JSON.stringify` are captured at document-created time, and the capability never enters a navigation URL, closing the Navigation API token leak; remote handlers reject `neuralia:` navigation, while the script-free Reader keeps only its internal links; injected user-event handlers require `isTrusted`; the floating palette remains a native Win32 control whose text is never exposed to the page;
 - one-WebView ceiling;
 - bounded local history with local clear operation;
 - locked dependencies;

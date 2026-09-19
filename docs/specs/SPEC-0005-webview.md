@@ -35,21 +35,52 @@ The monitor is therefore counted apart from the surface budget: Home has zero su
 
 ## Native bridge boundary
 
-There is no IPC object. Reader, comparator and Full Web pages receive no bridge object, no filesystem access and no native API. The only page-to-native channel is the internal `neuralia:` scheme, which is intercepted before navigation and translated into a fixed list of UI events.
+There is no page-to-native IPC with ambient authority. Remote WebView surfaces
+(external web, comparator, split, Gmail monitor and the PDF surface) receive a
+message transport through WebView2, but every accepted message is a bounded JSON
+envelope authenticated with a per-WebView capability. The native side exposes
+no filesystem API, credential API or arbitrary native-call object.
 
-The accepted actions are exactly: `home`, `back`, `restore`, `autoscroll`, `zoomin`, `zoomout`, `zoomreset`, `reload`, `print`, `omnibox`, `history`, `clearhistory`, `fullscreen`, `devtools`, `viewsource`, `newtab`, `expand`, `minimize`, `split`, `split-close`, `split-expand`, `palette` and `gmail-state`. Any other name is rejected. Every one of them drives the application's own user interface: none reads files, reaches the local network, or touches credentials, and the only destructive one (`clearhistory`) erases local history and nothing else.
+The closed action set has 25 names: `home`, `back`, `restore`,
+`autoscroll`, `zoomin`, `zoomout`, `zoomreset`, `reload`, `print`,
+`omnibox`, `history`, `clearhistory`, `fullscreen`, `devtools`,
+`viewsource`, `newtab`, `expand`, `minimize`, `split`,
+`split-close`, `split-expand`, `palette`, `gmail-state`,
+`research-answer` and `agent-observation`. Unknown actions, extra fields,
+wrong types, oversized messages and invalid per-action arguments are rejected.
 
-Every action MUST carry a per-WebView capability token, and the native side MUST reject an action whose token is absent or wrong. The token:
+Every accepted message MUST carry the per-WebView capability token. The token:
 
-- comes from the operating-system CSPRNG (`BCryptGenRandom`), never from a clock, a hash of a clock, or a process-local PRNG;
-- is generated per WebView, so a token leaked from one surface is useless in another;
-- exists only inside the closure of the injected scripts, and is never written to the DOM, to a global, to an attribute or to `window.name`;
-- is compared in constant time, so a page cannot recover it byte by byte through timing;
-- is carried using native functions (`encodeURIComponent` and the rest) captured at document-created time, before page script runs, so poisoning globals neither steals the token nor corrupts the URL that carries it.
+- comes from the operating-system CSPRNG (`BCryptGenRandom`);
+- is generated per WebView;
+- remains inside the closure of injected scripts and is never written to DOM,
+  attributes or `window.name`;
+- is compared in constant time;
+- is sent through a reference to `window.chrome.webview.postMessage` captured
+  at document-created time, with `JSON.stringify` captured at the same point;
+- is unavailable to child frames: capability-bearing initialization scripts
+  return when `window.top !== window` before the token declaration;
+- is never carried in a navigation URL.
 
-Handlers on injected controls MUST require `event.isTrusted`, for pointer and keyboard events alike; synthesized events are ignored. A page may therefore *ask* for a UI action only by clicking the control NeuralIA injected, never by dispatching one.
+The native parser rejects messages above 8 KiB before JSON parsing. Column
+indices are bounded, split URLs must be valid public HTTP(S) targets, and
+surface-specific handlers accept only the actions meaningful for that WebView.
+Actions tied to a comparator column must match the emitting column.
 
-The floating omnibox (palette) is a native Win32 control, not an `<input>` injected into the page's DOM. Through `neuralia:palette` a page may only request that the palette open; the text is typed into the native control and read from it natively, so a page can neither read nor submit what the user types.
+Remote navigation handlers reject the `neuralia:` scheme. The sole navigation
+exception is the script-free Reader content: its own internal links may use
+`neuralia:home` and `neuralia:web?...` without a capability. Host-injected
+keyboard shortcuts in the Reader use the authenticated message channel.
+
+Handlers on injected user controls MUST require `event.isTrusted`; synthesized
+pointer and keyboard events are ignored. Automatic observers such as Gmail,
+research-answer capture and the bounded agent observer are not user-event
+handlers, but their messages still require the private per-WebView capability.
+
+The floating omnibox (palette) is a native Win32 control, not an `<input>`
+inside page DOM. A remote page can only request that it open through the
+authenticated `palette` message; the text itself is typed and read natively.
+
 
 New-window requests MUST NOT create a second WebView. Valid HTTP(S) targets are routed into the existing Full Web surface; other targets are denied.
 

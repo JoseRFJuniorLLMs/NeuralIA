@@ -16,6 +16,7 @@ neural-core = { path = "../neural-core" }
 url.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+serde_json.workspace = true
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

@@ -17,6 +17,9 @@ use std::{
 
 use image::RgbaImage;
 
+#[cfg(test)]
+use crate::ipc::constant_time_eq;
+use crate::ipc::{IpcAction, parse_ipc_message};
 use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentSecurityAction, CoreConfig,
     FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent, MemoryDocument, MemoryHit,
@@ -2991,24 +2994,38 @@ impl App {
     }
 
     fn pdf_webview_builder(&self) -> WebViewBuilder<'static> {
-        let proxy = self.proxy.clone();
+        let ipc_proxy = self.proxy.clone();
+        let navigation_proxy = self.proxy.clone();
         let bytes = Arc::clone(&self.pdf_bytes);
+        let capability = remote_capability();
+        let ipc_capability = capability.clone();
+        let init_script = NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", &capability);
 
         WebViewBuilder::new()
             .with_custom_protocol("neuralia-pdf".to_string(), move |_id, request| {
                 serve_pdf_asset(&bytes, &request)
             })
-            .with_initialization_script(NEURALIA_KEYMAP_SCRIPT)
+            .with_initialization_script(init_script)
+            .with_ipc_handler(move |request| {
+                if let Some(action) =
+                    parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
+                    && let Some(event) = common_ipc_event(action)
+                {
+                    let _ = ipc_proxy.send_event(event);
+                }
+            })
             .with_navigation_handler(move |target| {
-                if let Some(event) = neuralia_action(&target) {
-                    let _ = proxy.send_event(event);
+                if target
+                    .get(..9)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
+                {
                     return false;
                 }
                 if is_pdf_internal_target(&target) {
                     return true;
                 }
                 if remote_web_target(&target, false) {
-                    let _ = proxy.send_event(UserEvent::OpenExternal(target));
+                    let _ = navigation_proxy.send_event(UserEvent::OpenExternal(target));
                 }
                 false
             })
@@ -3091,11 +3108,23 @@ impl App {
     }
 
     fn reader_webview_builder(&self) -> WebViewBuilder<'static> {
-        let proxy = self.proxy.clone();
+        let navigation_proxy = self.proxy.clone();
+        let ipc_proxy = self.proxy.clone();
+        let capability = remote_capability();
+        let ipc_capability = capability.clone();
+        let init_script = format!("{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}")
+            .replace("__NEURALIA_CAP__", &capability);
+
         WebViewBuilder::new()
-            .with_initialization_script(format!(
-                "{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}"
-            ))
+            .with_initialization_script(init_script)
+            .with_ipc_handler(move |request| {
+                if let Some(action) =
+                    parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
+                    && let Some(event) = common_ipc_event(action)
+                {
+                    let _ = ipc_proxy.send_event(event);
+                }
+            })
             .with_navigation_handler(move |target| {
                 if target.starts_with("about:blank") {
                     return true;
@@ -3109,20 +3138,21 @@ impl App {
                 }
 
                 if let Some(event) = neuralia_action(&target) {
-                    let _ = proxy.send_event(event);
+                    let _ = navigation_proxy.send_event(event);
                     return false;
                 }
 
                 match action_url.path().trim_matches('/') {
                     "home" => {
-                        let _ = proxy.send_event(UserEvent::HomeRequested);
+                        let _ = navigation_proxy.send_event(UserEvent::HomeRequested);
                     }
                     "web" => {
                         if let Some((_, value)) =
                             action_url.query_pairs().find(|(key, _)| key == "url")
                             && neural_core::validate_web_url(value.as_ref()).is_ok()
                         {
-                            let _ = proxy.send_event(UserEvent::OpenExternal(value.into_owned()));
+                            let _ = navigation_proxy
+                                .send_event(UserEvent::OpenExternal(value.into_owned()));
                         }
                     }
                     _ => {}
@@ -3139,10 +3169,10 @@ impl App {
         allow_local: bool,
         agent_enabled: bool,
     ) -> WebViewBuilder<'static> {
-        let navigation_proxy = self.proxy.clone();
+        let ipc_proxy = self.proxy.clone();
         let new_window_proxy = self.proxy.clone();
         let capability = remote_capability();
-        let navigation_capability = capability.clone();
+        let ipc_capability = capability.clone();
         let agent_script = if agent_enabled {
             AGENT_OBSERVER_SCRIPT
         } else {
@@ -3154,18 +3184,27 @@ impl App {
 
         WebViewBuilder::new()
             .with_initialization_script(init_script)
-            .with_navigation_handler(move |target| {
-                if target.starts_with("neuralia:agent-observation") {
-                    if remote_capability_matches(&target, &navigation_capability)
-                        && let Some(data) = neuralia_query_param(&target, "data")
-                        && let Some(page) = parse_agent_observation(&data)
-                    {
-                        let _ = navigation_proxy.send_event(UserEvent::AgentObservation(page));
+            .with_ipc_handler(move |request| {
+                let Some(action) =
+                    parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
+                else {
+                    return;
+                };
+                let event = match action {
+                    IpcAction::AgentObservation { data } if agent_enabled => {
+                        parse_agent_observation(&data).map(UserEvent::AgentObservation)
                     }
-                    return false;
+                    other => common_ipc_event(other),
+                };
+                if let Some(event) = event {
+                    let _ = ipc_proxy.send_event(event);
                 }
-                if let Some(event) = remote_neuralia_action(&target, &navigation_capability) {
-                    let _ = navigation_proxy.send_event(event);
+            })
+            .with_navigation_handler(move |target| {
+                if target
+                    .get(..9)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
+                {
                     return false;
                 }
                 remote_web_target(&target, allow_local)
@@ -3844,10 +3883,10 @@ impl App {
         col_index: usize,
         col_name: &'static str,
     ) -> WebViewBuilder<'static> {
-        let navigation_proxy = self.proxy.clone();
+        let ipc_proxy = self.proxy.clone();
         let new_window_proxy = self.proxy.clone();
         let capability = remote_capability();
-        let navigation_capability = capability.clone();
+        let ipc_capability = capability.clone();
 
         let init_script = format!(
             "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{AI_AUTO_SUBMIT_SCRIPT}\n{COMPARATOR_INJECT_SCRIPT}"
@@ -3856,80 +3895,48 @@ impl App {
 
         WebViewBuilder::new()
             .with_initialization_script(init_script)
+            .with_ipc_handler(move |request| {
+                let Some(action) =
+                    parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
+                else {
+                    return;
+                };
+                let event = match action {
+                    IpcAction::ResearchAnswer { col, text } if col == col_index => {
+                        Some(UserEvent::ResearchAnswer {
+                            source_index: col_index,
+                            text,
+                        })
+                    }
+                    IpcAction::Split { col, url } if col == col_index => {
+                        Some(UserEvent::OpenSplit {
+                            source_index: col_index,
+                            url,
+                        })
+                    }
+                    IpcAction::Palette { col } if col == col_index => {
+                        Some(UserEvent::OpenPalette(col_index))
+                    }
+                    IpcAction::Minimize { col } if col == col_index => {
+                        Some(UserEvent::MinimizeComparator(col_index))
+                    }
+                    IpcAction::NewTab { col: Some(col) } if col == col_index => {
+                        Some(UserEvent::NewTab(col_index))
+                    }
+                    IpcAction::Expand { col } => Some(UserEvent::ExpandComparator(col)),
+                    other => common_ipc_event(other),
+                };
+                if let Some(event) = event {
+                    let _ = ipc_proxy.send_event(event);
+                }
+            })
             .with_navigation_handler(move |target| {
-                if target.starts_with("neuralia:research-answer") {
-                    if remote_capability_matches(&target, &navigation_capability)
-                        && let (Some(col), Some(text)) = (
-                            neuralia_query_param(&target, "col"),
-                            neuralia_query_param(&target, "text"),
-                        )
-                        && let Ok(source_index) = col.parse::<usize>()
-                        && source_index < COMPARATOR_COLUMNS
-                        && !text.trim().is_empty()
-                    {
-                        let _ = navigation_proxy
-                            .send_event(UserEvent::ResearchAnswer { source_index, text });
-                    }
+                if target
+                    .get(..9)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
+                {
                     return false;
                 }
-                if target.starts_with("neuralia:split") {
-                    if remote_capability_matches(&target, &navigation_capability)
-                        && let (Some(col), Some(url)) = (
-                            neuralia_query_param(&target, "col"),
-                            neuralia_query_param(&target, "url"),
-                        )
-                        && let Ok(source_index) = col.parse::<usize>()
-                        && remote_web_target(&url, false)
-                    {
-                        let _ =
-                            navigation_proxy.send_event(UserEvent::OpenSplit { source_index, url });
-                    }
-                    return false;
-                }
-                if target.starts_with("neuralia:palette") {
-                    // A pagina so pede a abertura. A coluna e a deste WebView,
-                    // nao a que o pedido diz; o texto vai ser escrito num
-                    // controlo nativo que a pagina nem ve.
-                    if remote_capability_matches(&target, &navigation_capability) {
-                        let _ = navigation_proxy.send_event(UserEvent::OpenPalette(col_index));
-                    }
-                    return false;
-                }
-                if target.starts_with("neuralia:newtab") {
-                    if remote_capability_matches(&target, &navigation_capability)
-                        && let Ok(action_url) = Url::parse(&target)
-                        && let Some((_, val)) = action_url.query_pairs().find(|(k, _)| k == "col")
-                        && let Ok(idx) = val.parse::<usize>()
-                    {
-                        let _ = navigation_proxy.send_event(UserEvent::NewTab(idx));
-                    }
-                    return false;
-                }
-                if target.starts_with("neuralia:expand") {
-                    if remote_capability_matches(&target, &navigation_capability)
-                        && let Ok(action_url) = Url::parse(&target)
-                        && let Some((_, val)) = action_url.query_pairs().find(|(k, _)| k == "col")
-                        && let Ok(idx) = val.parse::<usize>()
-                    {
-                        let _ = navigation_proxy.send_event(UserEvent::ExpandComparator(idx));
-                    }
-                    return false;
-                }
-                if target.starts_with("neuralia:minimize") {
-                    if remote_capability_matches(&target, &navigation_capability)
-                        && let Ok(action_url) = Url::parse(&target)
-                        && let Some((_, val)) = action_url.query_pairs().find(|(k, _)| k == "col")
-                        && let Ok(idx) = val.parse::<usize>()
-                    {
-                        let _ = navigation_proxy.send_event(UserEvent::MinimizeComparator(idx));
-                    }
-                    return false;
-                }
-                if let Some(event) = remote_neuralia_action(&target, &navigation_capability) {
-                    let _ = navigation_proxy.send_event(event);
-                    return false;
-                }
-
                 remote_web_target(&target, false) || is_view_source_target(&target, false)
             })
             .with_new_window_req_handler(move |target, _features| {
@@ -3970,10 +3977,10 @@ impl App {
         allow_local: bool,
         private: bool,
     ) -> WebViewBuilder<'static> {
-        let navigation_proxy = self.proxy.clone();
+        let ipc_proxy = self.proxy.clone();
         let new_window_proxy = self.proxy.clone();
         let capability = remote_capability();
-        let navigation_capability = capability.clone();
+        let ipc_capability = capability.clone();
         let init_script = format!(
             "window.__neuralia_col_index = {source_index}; window.__neuralia_col_name = '{source_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}"
         )
@@ -3982,29 +3989,32 @@ impl App {
         WebViewBuilder::new()
             .with_incognito(private)
             .with_initialization_script(init_script)
+            .with_ipc_handler(move |request| {
+                let Some(action) =
+                    parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
+                else {
+                    return;
+                };
+                let event = match action {
+                    IpcAction::SplitClose => Some(UserEvent::CloseSplit),
+                    IpcAction::SplitExpand => Some(UserEvent::ToggleSplitFullscreen),
+                    IpcAction::Palette { col } if col == source_index => {
+                        Some(UserEvent::OpenPalette(source_index))
+                    }
+                    IpcAction::NewTab { col: Some(col) } if col == source_index => {
+                        Some(UserEvent::NewTab(source_index))
+                    }
+                    other => common_ipc_event(other),
+                };
+                if let Some(event) = event {
+                    let _ = ipc_proxy.send_event(event);
+                }
+            })
             .with_navigation_handler(move |target| {
-                if target.starts_with("neuralia:split-close") {
-                    if remote_capability_matches(&target, &navigation_capability) {
-                        let _ = navigation_proxy.send_event(UserEvent::CloseSplit);
-                    }
-                    return false;
-                }
-                if target.starts_with("neuralia:split-expand") {
-                    if remote_capability_matches(&target, &navigation_capability) {
-                        let _ = navigation_proxy.send_event(UserEvent::ToggleSplitFullscreen);
-                    }
-                    return false;
-                }
-                if target.starts_with("neuralia:palette") {
-                    // Pedido de abertura vindo da fonte ao lado: abre sobre a
-                    // coluna que a originou; a privacidade e decidida no App.
-                    if remote_capability_matches(&target, &navigation_capability) {
-                        let _ = navigation_proxy.send_event(UserEvent::OpenPalette(source_index));
-                    }
-                    return false;
-                }
-                if let Some(event) = remote_neuralia_action(&target, &navigation_capability) {
-                    let _ = navigation_proxy.send_event(event);
+                if target
+                    .get(..9)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
+                {
                     return false;
                 }
                 remote_web_target(&target, allow_local)
@@ -4644,7 +4654,7 @@ impl App {
         };
 
         let capability = remote_capability();
-        let navigation_capability = capability.clone();
+        let ipc_capability = capability.clone();
         let proxy = self.proxy.clone();
         let init_script = GMAIL_MONITOR_SCRIPT.replace("__NEURALIA_CAP__", &capability);
         let bounds = wry::Rect {
@@ -4654,19 +4664,28 @@ impl App {
 
         let result = WebViewBuilder::new()
             .with_initialization_script(init_script)
+            .with_ipc_handler(move |request| {
+                let Some(IpcAction::GmailState {
+                    unread,
+                    sender,
+                    subject,
+                    key,
+                }) = parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
+                else {
+                    return;
+                };
+                let _ = proxy.send_event(UserEvent::GmailInboxState {
+                    unread,
+                    sender,
+                    subject,
+                    key,
+                });
+            })
             .with_navigation_handler(move |target| {
-                if target.starts_with("neuralia:gmail-state") {
-                    if remote_capability_matches(&target, &navigation_capability)
-                        && let Some(count) = neuralia_query_param(&target, "count")
-                        && let Ok(unread) = count.parse::<u32>()
-                    {
-                        let _ = proxy.send_event(UserEvent::GmailInboxState {
-                            unread,
-                            sender: neuralia_query_param(&target, "sender").unwrap_or_default(),
-                            subject: neuralia_query_param(&target, "subject").unwrap_or_default(),
-                            key: neuralia_query_param(&target, "key").unwrap_or_default(),
-                        });
-                    }
+                if target
+                    .get(..9)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
+                {
                     return false;
                 }
                 Url::parse(&target).ok().is_some_and(|url| {
@@ -6822,6 +6841,27 @@ fn neuralia_action(target: &str) -> Option<UserEvent> {
     })
 }
 
+fn common_ipc_event(action: IpcAction) -> Option<UserEvent> {
+    Some(match action {
+        IpcAction::Home => UserEvent::HomeRequested,
+        IpcAction::Back => UserEvent::BackRequested,
+        IpcAction::Restore => UserEvent::RestoreComparator,
+        IpcAction::AutoScroll => UserEvent::ToggleAutoScroll,
+        IpcAction::ZoomIn => UserEvent::ZoomIn,
+        IpcAction::ZoomOut => UserEvent::ZoomOut,
+        IpcAction::ZoomReset => UserEvent::ZoomReset,
+        IpcAction::Reload => UserEvent::ReloadPage,
+        IpcAction::Print => UserEvent::PrintPage,
+        IpcAction::Omnibox => UserEvent::FocusOmnibox,
+        IpcAction::History => UserEvent::ShowHistory,
+        IpcAction::ClearHistory => UserEvent::ClearHistory,
+        IpcAction::Fullscreen => UserEvent::ToggleColumnFullscreen,
+        IpcAction::DevTools => UserEvent::OpenDevTools,
+        IpcAction::ViewSource => UserEvent::ViewSource,
+        IpcAction::NewTab { col } => UserEvent::NewTab(col.unwrap_or(0)),
+        _ => return None,
+    })
+}
 /// Para onde vai o que o utilizador escreveu na palette. Puro, para se poder
 /// testar sem janela: e aqui que se decide que um painel privado nunca
 /// carrega nada na coluna normal nem passa pelo historico.
@@ -6905,43 +6945,6 @@ fn remote_capability() -> String {
         let _ = write!(token, "{byte:02x}");
     }
     token
-}
-
-/// Igualdade sem atalho: percorre sempre tudo, para o tempo nao denunciar em
-/// que byte o token deixou de bater.
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-        == 0
-}
-
-fn remote_capability_matches(target: &str, expected: &str) -> bool {
-    let Ok(url) = Url::parse(target) else {
-        return false;
-    };
-    url.scheme().eq_ignore_ascii_case("neuralia")
-        && url.query_pairs().any(|(key, value)| {
-            key == "cap" && constant_time_eq(value.as_bytes(), expected.as_bytes())
-        })
-}
-
-fn remote_neuralia_action(target: &str, capability: &str) -> Option<UserEvent> {
-    if !remote_capability_matches(target, capability) {
-        return None;
-    }
-    neuralia_action(target)
-}
-
-fn neuralia_query_param(target: &str, key: &str) -> Option<String> {
-    Url::parse(target)
-        .ok()?
-        .query_pairs()
-        .find(|(name, _)| name == key)
-        .map(|(_, value)| value.into_owned())
 }
 
 fn remote_web_target(target: &str, allow_local: bool) -> bool {
@@ -8210,14 +8213,13 @@ mod tests {
 
     #[test]
     fn private_panel_and_new_tab_are_wired() {
-        assert!(NEURALIA_KEYMAP_SCRIPT.contains("neuralia:newtab?col="));
+        assert!(NEURALIA_KEYMAP_SCRIPT.contains("act('newtab', { col:colIndex })"));
         assert!(format!("{:?}", neuralia_action("neuralia:newtab")).starts_with("Some(NewTab"));
         assert_ne!(BarHit::Private, BarHit::SplitClose);
     }
 
     #[test]
-    fn neuralia_actions_are_routed() {
-        // As paginas so escrevem o nome da accao; a traducao vive toda aqui.
+    fn reader_neuralia_actions_are_routed() {
         for (target, expected) in [
             ("neuralia:back", "BackRequested"),
             ("NEURALIA:BACK", "BackRequested"),
@@ -8242,7 +8244,6 @@ mod tests {
             );
         }
 
-        // Tudo o resto tem de passar ao lado, incluindo navegacao verdadeira.
         for target in [
             "https://example.com",
             "neuralia:inventado",
@@ -8251,32 +8252,6 @@ mod tests {
         ] {
             assert!(neuralia_action(target).is_none(), "{target}");
         }
-
-        let capability = "0123456789abcdef0123456789abcdef";
-        for action in [
-            "home",
-            "history",
-            "clearhistory",
-            "devtools",
-            "viewsource",
-            "print",
-            "reload",
-        ] {
-            let unsigned = format!("neuralia:{action}");
-            assert!(
-                remote_neuralia_action(&unsigned, capability).is_none(),
-                "pagina remota nao pode invocar {action} sem capability"
-            );
-            let signed = format!("neuralia:{action}?cap={capability}");
-            assert!(
-                remote_neuralia_action(&signed, capability).is_some(),
-                "script injetado deve poder invocar {action} com capability"
-            );
-        }
-        assert!(!remote_capability_matches(
-            "neuralia:home?cap=errado",
-            capability
-        ));
     }
 
     #[test]
@@ -8360,33 +8335,11 @@ mod tests {
         assert!(!constant_time_eq(b"", b"a"));
 
         let token = remote_capability();
-        assert!(remote_capability_matches(
-            &format!("neuralia:home?cap={token}"),
-            &token
-        ));
-        assert!(remote_capability_matches(
-            &format!("neuralia:split?col=1&url=https%3A%2F%2Fa.test%2F&cap={token}"),
-            &token
-        ));
         let flipped = if token.ends_with('0') { "1" } else { "0" };
         let wrong = format!("{}{flipped}", &token[..31]);
-        assert!(!remote_capability_matches(
-            &format!("neuralia:home?cap={wrong}"),
-            &token
-        ));
-        assert!(!remote_capability_matches(
-            &format!("neuralia:home?cap={}", &token[..31]),
-            &token
-        ));
-        assert!(!remote_capability_matches(
-            &format!("neuralia:home?cap={token}0"),
-            &token
-        ));
-        assert!(!remote_capability_matches("neuralia:home", &token));
-        assert!(!remote_capability_matches(
-            &format!("https://example.com/?cap={token}"),
-            &token
-        ));
+        assert!(constant_time_eq(token.as_bytes(), token.as_bytes()));
+        assert!(!constant_time_eq(token.as_bytes(), wrong.as_bytes()));
+        assert!(!constant_time_eq(token.as_bytes(), &token.as_bytes()[..31]));
     }
 
     #[test]
@@ -8659,29 +8612,42 @@ mod tests {
 
     #[test]
     fn injected_scripts_capture_globals_before_the_page_runs() {
-        // O token so passa pela captura feita no document-created: um unico
-        // `encodeURIComponent` por script, o da captura, e nenhum `const` de
-        // topo que a pagina pudesse ler pelo nome.
+        // A capability nunca entra numa URL. O transporte e o serializador
+        // sao capturados no document-created, antes de qualquer script remoto.
         for (name, script) in [
             ("keymap", NEURALIA_KEYMAP_SCRIPT),
             ("return", EXTERNAL_RETURN_BUTTON),
             ("gmail", GMAIL_MONITOR_SCRIPT),
+            ("agent", AGENT_OBSERVER_SCRIPT),
             ("comparator", COMPARATOR_INJECT_SCRIPT),
         ] {
             assert!(script.contains("__NEURALIA_CAP__"), "{name}");
             assert_eq!(
-                script.matches("encodeURIComponent").count(),
+                script.matches("window.chrome.webview.postMessage").count(),
                 1,
-                "{name}: so a captura pode nomear encodeURIComponent"
+                "{name}: postMessage deve ser capturado uma unica vez"
+            );
+            assert_eq!(
+                script.matches("JSON.stringify").count(),
+                1,
+                "{name}: JSON.stringify deve ser capturado uma unica vez"
             );
             assert!(
-                script.contains("const encode = encodeURIComponent;"),
+                script.contains(
+                    "const post = window.chrome.webview.postMessage.bind(window.chrome.webview);"
+                ),
                 "{name}"
             );
+            assert!(
+                script.contains("const stringify = JSON.stringify;"),
+                "{name}"
+            );
+            assert!(!script.contains("?cap="), "{name}");
             assert!(script.trim_start().starts_with("(function"), "{name}");
         }
-        // Os scripts que so correm depois do DOMContentLoaded nao tocam em
-        // nenhum global do DOM pelo nome.
+
+        // Os scripts que correm depois do DOMContentLoaded usam referencias
+        // capturadas para as primitivas DOM que carregam autoridade.
         for (name, script) in [
             ("return", EXTERNAL_RETURN_BUTTON),
             ("comparator", COMPARATOR_INJECT_SCRIPT),
@@ -8707,8 +8673,7 @@ mod tests {
             }
         }
 
-        // Nenhum handler que leve o token responde a eventos sinteticos, e os
-        // botoes nao expoem o handler em `onclick`.
+        // Nenhum handler que dispare acao nativa aceita evento sintetico.
         assert_eq!(
             COMPARATOR_INJECT_SCRIPT
                 .matches("if (!event.isTrusted")
@@ -8720,7 +8685,6 @@ mod tests {
         assert!(EXTERNAL_RETURN_BUTTON.contains("if (!event.isTrusted) return;"));
         assert!(NEURALIA_KEYMAP_SCRIPT.contains("if (!e.isTrusted) { return; }"));
 
-        // Redireccionador do Google: o dominio e os subdominios, nao um sufixo.
         assert!(
             COMPARATOR_INJECT_SCRIPT
                 .contains("host === 'google.com' || host.endsWith('.google.com')")
@@ -8729,46 +8693,15 @@ mod tests {
     }
 
     #[test]
-    fn pdf_origin_is_exact_not_prefix_based() {
-        assert!(is_pdf_internal_target(
-            "http://neuralia-pdf.localhost/viewer.html"
-        ));
-        assert!(!is_pdf_internal_target(
-            "http://neuralia-pdf.localhost.evil.test/viewer.html"
-        ));
-        assert!(!is_pdf_internal_target(
-            "https://neuralia-pdf.localhost/viewer.html"
-        ));
-    }
-
-    #[test]
-    fn comparator_script_contains_independent_response_timeline() {
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia-response-rail"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("Resposta anterior"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("Próxima resposta"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("scrollToPosition"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia-scroll-root"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("semanticAnchors"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("data-message-author-role"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("ariaLabel"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("top:'50%'"));
-    }
-
-    #[test]
     fn browser_agent_bridge_is_bounded_and_has_no_arbitrary_js_channel() {
         assert!(AGENT_OBSERVER_SCRIPT.contains("rows.length >= 32"));
         assert!(AGENT_OBSERVER_SCRIPT.contains("pageText"));
-        assert!(AGENT_OBSERVER_SCRIPT.contains("neuralia:agent-observation"));
+        assert!(AGENT_OBSERVER_SCRIPT.contains("action:'agent-observation'"));
+        assert!(AGENT_OBSERVER_SCRIPT.contains(".join('\\n').slice(0, 1200)"));
+        assert!(AGENT_OBSERVER_SCRIPT.contains("post(stringify("));
+        assert!(!AGENT_OBSERVER_SCRIPT.contains("?cap="));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("eval("));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("new Function"));
-    }
-
-    #[test]
-    fn research_session_commands_are_exposed_in_native_input() {
-        let source = include_str!("windows_app.rs");
-        assert!(source.contains("research:compare"));
-        assert!(source.contains("research:synthesize"));
-        assert!(source.contains("research:export"));
     }
 
     #[test]
@@ -8787,23 +8720,21 @@ mod tests {
 
     #[test]
     fn comparator_captures_provider_answers_for_research_session() {
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia:research-answer?col="));
+        assert!(
+            COMPARATOR_INJECT_SCRIPT.contains("act('research-answer', { col:colIndex, text })")
+        );
         assert!(COMPARATOR_INJECT_SCRIPT.contains("data-message-author-role"));
         assert!(COMPARATOR_INJECT_SCRIPT.contains("scheduleResearchAnswer"));
+        assert!(!COMPARATOR_INJECT_SCRIPT.contains("neuralia:research-answer"));
     }
 
     #[test]
     fn comparator_has_split_palette_and_real_three_way_submit() {
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia:split?col="));
-        // A pagina so pede a palette: o pedido leva a coluna e o token, e
-        // nunca um `q` -- o texto e escrito no controlo nativo.
-        let palette_request = NEURALIA_KEYMAP_SCRIPT
-            .split("'neuralia:palette?col=' + colIndex")
-            .nth(1)
-            .and_then(|rest| rest.split(';').next())
-            .expect("keymap palette request");
-        assert!(palette_request.contains("'&cap=' + encode(capability)"));
-        assert!(!palette_request.contains("q="));
+        assert!(
+            COMPARATOR_INJECT_SCRIPT.contains("act('split', { col:colIndex, url:target.href })")
+        );
+        assert!(NEURALIA_KEYMAP_SCRIPT.contains("act('palette', { col:colIndex })"));
+        assert!(!NEURALIA_KEYMAP_SCRIPT.contains("q="));
         assert!(SPLIT_SCROLL_RAIL_SCRIPT.contains("neuralia-split-scroll-rail"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("chatgpt.com"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("claude.ai"));
@@ -8813,26 +8744,24 @@ mod tests {
     #[test]
     fn palette_is_native_and_the_page_can_only_ask_for_it() {
         let source = include_str!("windows_app.rs");
-        // Nenhum script injetado cria a palette no DOM nem a abre por evento.
         assert!(!source.contains(concat!("NEURALIA_PALETTE", "_SCRIPT")));
         assert!(!source.contains(concat!("neuralia-open-", "palette")));
         assert!(!NEURALIA_KEYMAP_SCRIPT.contains("CustomEvent"));
+        assert!(NEURALIA_KEYMAP_SCRIPT.contains("act('palette', { col:colIndex })"));
 
-        // Os handlers de navegacao so traduzem o pedido em OpenPalette com a
-        // coluna do proprio WebView: nem `q` nem `col` do pedido sao lidos.
         for builder in ["fn comparator_webview_builder", "fn split_webview_builder"] {
-            let handler = source
+            let body = source
                 .split(builder)
                 .nth(1)
-                .and_then(|part| part.split("\"neuralia:palette\"").nth(1))
-                .and_then(|part| part.split("return false;").next())
+                .and_then(|part| part.split(".with_new_window_req_handler").next())
                 .expect(builder);
-            assert!(!handler.contains("neuralia_query_param"), "{builder}");
-            assert!(!handler.contains("PaletteSubmit"), "{builder}");
-            assert!(handler.contains("UserEvent::OpenPalette("), "{builder}");
+            assert!(body.contains("with_ipc_handler"), "{builder}");
+            assert!(body.contains("IpcAction::Palette"), "{builder}");
+            assert!(body.contains("UserEvent::OpenPalette("), "{builder}");
+            assert!(!body.contains("neuralia_query_param"), "{builder}");
+            assert!(!body.contains("PaletteSubmit"), "{builder}");
         }
 
-        // Quem submete e a subclasse do EDIT nativo, a partir do PaletteHost.
         let edit = source
             .split("fn palette_edit_subclass")
             .nth(1)
@@ -8844,8 +8773,6 @@ mod tests {
         assert!(edit.contains("VK_ESCAPE"));
         assert!(edit.contains("WM_KILLFOCUS"));
 
-        // O popup precisa de foco (sem NOACTIVATE) e nao e um aviso (sem
-        // TOPMOST); o EDIT tem o mesmo limite e a mesma pista que a omnibox.
         let show = source
             .split("fn show_palette")
             .nth(1)
@@ -9075,7 +9002,8 @@ mod tests {
     #[test]
     fn comparator_minimize_control_is_wired_and_layout_keeps_one_visible() {
         assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia-comp-minimize"));
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia:minimize?col="));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("act('minimize', { col:colIndex })"));
+        assert!(!COMPARATOR_INJECT_SCRIPT.contains("neuralia:minimize"));
         assert!(COMPARATOR_BUTTON_COLLAPSED.contains("neuralia-comp-minimize"));
     }
 
@@ -9136,7 +9064,99 @@ mod tests {
         assert!(gmail_is_new_mail(Some(4), Some("thread-a"), 4, "thread-b"));
         assert!(!gmail_is_new_mail(Some(4), Some("thread-a"), 4, "thread-a"));
         assert!(GMAIL_MONITOR_SCRIPT.contains("mail.google.com"));
-        assert!(GMAIL_MONITOR_SCRIPT.contains("neuralia:gmail-state"));
+        assert!(GMAIL_MONITOR_SCRIPT.contains("action:'gmail-state'"));
+        assert!(GMAIL_MONITOR_SCRIPT.contains("post(stringify("));
+    }
+
+    #[test]
+    fn spec_0108_remote_scripts_use_message_transport_without_capability_urls() {
+        for (name, script) in [
+            ("keymap", NEURALIA_KEYMAP_SCRIPT),
+            ("return", EXTERNAL_RETURN_BUTTON),
+            ("gmail", GMAIL_MONITOR_SCRIPT),
+            ("agent", AGENT_OBSERVER_SCRIPT),
+            ("comparator", COMPARATOR_INJECT_SCRIPT),
+        ] {
+            assert!(
+                script.contains("window.chrome.webview.postMessage"),
+                "{name}"
+            );
+            assert!(script.contains("JSON.stringify"), "{name}");
+            assert!(!script.contains("?cap="), "{name}");
+            assert!(
+                !script.contains("window.location.href = 'neuralia:"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_0108_remote_navigation_handlers_reject_neuralia_scheme() {
+        let source = include_str!("windows_app.rs");
+        for builder in [
+            "fn pdf_webview_builder",
+            "fn external_webview_builder",
+            "fn comparator_webview_builder",
+            "fn split_webview_builder",
+            "fn maybe_start_gmail_monitor",
+        ] {
+            let body = source
+                .split(builder)
+                .nth(1)
+                .and_then(|part| part.split(".with_permission_handler").next())
+                .expect(builder);
+            assert!(body.contains("with_ipc_handler"), "{builder}");
+            assert!(
+                body.contains("eq_ignore_ascii_case(\"neuralia:\")"),
+                "{builder}"
+            );
+            assert!(!body.contains("remote_neuralia_action"), "{builder}");
+        }
+    }
+
+    #[test]
+    fn spec_0108_capability_scripts_are_top_frame_only() {
+        for (name, script) in [
+            ("keymap", NEURALIA_KEYMAP_SCRIPT),
+            ("return", EXTERNAL_RETURN_BUTTON),
+            ("gmail", GMAIL_MONITOR_SCRIPT),
+            ("agent", AGENT_OBSERVER_SCRIPT),
+            ("comparator", COMPARATOR_INJECT_SCRIPT),
+        ] {
+            let guard = script
+                .find("if (window.top !== window) return;")
+                .expect("top-frame guard");
+            let capability = script
+                .find("const capability = '__NEURALIA_CAP__';")
+                .expect("capability declaration");
+            assert!(
+                guard < capability,
+                "{name}: frame guard must run before capability use"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_0108_agent_observation_stays_below_ipc_envelope_limit() {
+        assert!(
+            AGENT_OBSERVER_SCRIPT.contains(".join('\\n').slice(0, 1200)"),
+            "agent payload must be bounded before JSON serialization"
+        );
+        // JSON escaping may expand one UTF-16 code unit to six ASCII bytes.
+        // 1200 * 6 leaves >900 bytes for the protocol envelope under 8 KiB.
+        const { assert!(1200 * 6 + 900 < crate::ipc::IPC_MAX_BYTES) };
+    }
+
+    #[test]
+    fn spec_0108_comparator_captures_timers_with_ipc_primitives() {
+        let top = COMPARATOR_INJECT_SCRIPT
+            .split("listen(document, 'DOMContentLoaded'")
+            .next()
+            .expect("comparator prelude");
+        assert!(top.contains("window.chrome.webview.postMessage"));
+        assert!(top.contains("JSON.stringify"));
+        assert!(top.contains("const defer = setTimeout;"));
+        assert!(top.contains("const cancelDefer = clearTimeout;"));
     }
 
     #[test]
@@ -10115,16 +10135,20 @@ const fn rgb3(color: Rgb) -> u32 {
 /// na fase de captura, que se apanham os atalhos antes de o site os consumir.
 const NEURALIA_KEYMAP_SCRIPT: &str = r#"
 (function () {
+  // WRY/WebView2 injeta initialization scripts em child frames no Windows.
+  // Capability e controles nativos pertencem somente ao documento principal.
+  if (window.top !== window) return;
   if (window.__neuralia_keymap) { return; }
   window.__neuralia_keymap = true;
 
   // Capturas no document-created, antes de a pagina correr: o que os atalhos
   // usam mais tarde com o token nao pode ser um global ja envenenado.
   const capability = '__NEURALIA_CAP__';
-  const encode = encodeURIComponent;
+  const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
+  const stringify = JSON.stringify;
   const colIndex = window.__neuralia_col_index;
-  function act(name) {
-    window.location.href = 'neuralia:' + name + '?cap=' + encode(capability);
+  function act(action, args) {
+    post(stringify({ v:1, cap:capability, action, args:args || {} }));
   }
 
   function findBar() {
@@ -10192,8 +10216,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
         case 'n':
           e.preventDefault();
           if (typeof colIndex === 'number') {
-            window.location.href = 'neuralia:newtab?col=' + colIndex
-              + '&cap=' + encode(capability);
+            act('newtab', { col:colIndex });
           } else {
             act('newtab');
           }
@@ -10204,8 +10227,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
           if (typeof colIndex === 'number') {
             // So o pedido de abertura: o texto vai ser escrito num controlo
             // nativo, fora do alcance da pagina.
-            window.location.href = 'neuralia:palette?col=' + colIndex
-              + '&cap=' + encode(capability);
+            act('palette', { col:colIndex });
           } else if (key === 'k') {
             act('omnibox');
           } else {
@@ -10242,8 +10264,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     if (key === '1' || key === '2' || key === '3') {
       if (typeof colIndex === 'number') {
         e.preventDefault();
-        window.location.href = 'neuralia:expand?col=' + (parseInt(key, 10) - 1)
-          + '&cap=' + encode(capability);
+        act('expand', { col:(parseInt(key, 10) - 1) });
       }
       return;
     }
@@ -10265,8 +10286,10 @@ const COMPARATOR_BUTTON_COLLAPSED: &str = "(function(){var b=document.querySelec
 /// DOMContentLoaded e capturado aqui, antes de a pagina correr.
 const EXTERNAL_RETURN_BUTTON: &str = r#"
 (function () {
+  if (window.top !== window) return;
   const capability = '__NEURALIA_CAP__';
-  const encode = encodeURIComponent;
+  const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
+  const stringify = JSON.stringify;
   const defer = setTimeout;
   const cancelDefer = clearTimeout;
   const byId = document.getElementById.bind(document);
@@ -10288,7 +10311,7 @@ const EXTERNAL_RETURN_BUTTON: &str = r#"
     });
     listen(b, 'click', (event) => {
       if (!event.isTrusted) return;
-      window.location.href = 'neuralia:home?cap=' + encode(capability);
+      post(stringify({ v:1, cap:capability, action:'home', args:{} }));
     });
     append(document.documentElement, b);
   });
@@ -10297,11 +10320,12 @@ const EXTERNAL_RETURN_BUTTON: &str = r#"
 
 const GMAIL_MONITOR_SCRIPT: &str = r#"
 (function () {
+  if (window.top !== window) return;
   if (location.hostname !== 'mail.google.com' || window.__neuralia_gmail_monitor) return;
   window.__neuralia_gmail_monitor = true;
   const capability = '__NEURALIA_CAP__';
-  // emit() corre tarde, a partir do observer: o codificador e capturado agora.
-  const encode = encodeURIComponent;
+  const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
+  const stringify = JSON.stringify;
   let lastState = '';
   let debounce = 0;
 
@@ -10346,11 +10370,12 @@ const GMAIL_MONITOR_SCRIPT: &str = r#"
     if (state === lastState) return;
     lastState = state;
 
-    window.location.href = 'neuralia:gmail-state?count=' + count
-      + '&sender=' + encode(first.sender)
-      + '&subject=' + encode(first.subject)
-      + '&key=' + encode(first.key)
-      + '&cap=' + encode(capability);
+    post(stringify({
+      v:1,
+      cap:capability,
+      action:'gmail-state',
+      args:{ count, sender:first.sender, subject:first.subject, key:first.key }
+    }));
   }
 
   function schedule() {
@@ -10449,8 +10474,10 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
 
 const AGENT_OBSERVER_SCRIPT: &str = r#"
 (function () {
+  if (window.top !== window) return;
   const capability = '__NEURALIA_CAP__';
-  const encode = encodeURIComponent;
+  const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
+  const stringify = JSON.stringify;
   const listen = Function.prototype.call.bind(EventTarget.prototype.addEventListener);
   const defer = setTimeout;
   let generation = 0;
@@ -10511,15 +10538,22 @@ const AGENT_OBSERVER_SCRIPT: &str = r#"
       rows[index] = row.replace(oldId, newId);
     });
 
+    // O envelope nativo aceita no maximo 8 KiB. 1200 unidades UTF-16
+    // continuam abaixo desse teto mesmo no pior caso JSON (surrogates
+    // escapados como \\uXXXX), deixando margem para cap/action/args.
     const payload = [
       String(generation),
       clean(location.href, 1200),
       clean(document.title, 256),
       pageText,
       ...rows
-    ].join('\n');
-    window.location.href = 'neuralia:agent-observation?data=' + encode(payload)
-      + '&cap=' + encode(capability);
+    ].join('\n').slice(0, 1200);
+    post(stringify({
+      v:1,
+      cap:capability,
+      action:'agent-observation',
+      args:{ data:payload }
+    }));
   }
 
   function schedule() {
@@ -10805,10 +10839,17 @@ document.addEventListener('DOMContentLoaded', () => {
 /// para a pagina nao poder ler o handler do elemento e chama-lo a mao.
 const COMPARATOR_INJECT_SCRIPT: &str = r#"
 (function () {
+  if (window.top !== window) return;
   const colIndex = window.__neuralia_col_index ?? 0;
   const colName = window.__neuralia_col_name ?? 'IA';
   const capability = '__NEURALIA_CAP__';
-  const encode = encodeURIComponent;
+  const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
+  const stringify = JSON.stringify;
+  const defer = setTimeout;
+  const cancelDefer = clearTimeout;
+  function act(action, args) {
+    post(stringify({ v:1, cap:capability, action, args:args || {} }));
+  }
   const byId = document.getElementById.bind(document);
   const createElement = document.createElement.bind(document);
   const assign = Object.assign;
@@ -10847,9 +10888,7 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
         const text = researchAnswerText();
         if (text.length < 24 || text === lastResearchAnswer) return;
         lastResearchAnswer = text;
-        window.location.href = 'neuralia:research-answer?col=' + colIndex
-          + '&text=' + encode(text)
-          + '&cap=' + encode(capability);
+        act('research-answer', { col:colIndex, text });
       }, 1800);
     }
 
@@ -10931,8 +10970,7 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
       listen(expand, 'click', (event) => {
         if (!event.isTrusted) return;
         event.preventDefault(); event.stopPropagation();
-        window.location.href = 'neuralia:expand?col=' + colIndex
-          + '&cap=' + encode(capability);
+        act('expand', { col:colIndex });
       });
 
       const minimize = createElement('button');
@@ -10951,8 +10989,7 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
       listen(minimize, 'click', (event) => {
         if (!event.isTrusted) return;
         event.preventDefault(); event.stopPropagation();
-        window.location.href = 'neuralia:minimize?col=' + colIndex
-          + '&cap=' + encode(capability);
+        act('minimize', { col:colIndex });
       });
 
       const rail = createElement('div');
@@ -11193,9 +11230,7 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
       if (target.hostname === location.hostname) return;
       event.preventDefault();
       event.stopPropagation();
-      window.location.href = 'neuralia:split?col=' + colIndex
-        + '&url=' + encode(target.href)
-        + '&cap=' + encode(capability);
+      act('split', { col:colIndex, url:target.href });
     }, true);
 
     listen(document, 'dblclick', (event) => {
@@ -11206,8 +11241,7 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
         ? event.target.tagName.toUpperCase() : '';
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
       if (event.target && event.target.isContentEditable) return;
-      window.location.href = 'neuralia:expand?col=' + colIndex
-        + '&cap=' + encode(capability);
+      act('expand', { col:colIndex });
     }, true);
   });
 })();

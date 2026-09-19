@@ -4,6 +4,8 @@
 )]
 
 #[cfg(target_os = "windows")]
+mod ipc;
+#[cfg(target_os = "windows")]
 mod windows_app;
 
 #[cfg(target_os = "windows")]
