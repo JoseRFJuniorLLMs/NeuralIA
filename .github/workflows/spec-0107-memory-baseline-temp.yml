@@ -1,0 +1,33 @@
+name: Temporary SPEC-0107 Memory Baseline
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  memory-baseline:
+    if: github.head_ref == 'feat/spec-0107-phase1-design'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: 1k
+            test_name: spec_0107_phase1_baseline_1k
+          - label: 10k
+            test_name: spec_0107_phase1_baseline_10k
+          - label: 100k
+            test_name: spec_0107_phase1_baseline_100k
+    name: memory-baseline-${{ matrix.label }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e
+      - name: Run ignored baseline
+        shell: pwsh
+        run: cargo test --release --locked -p neural-core --test memory_phase1_baseline ${{ matrix.test_name }} -- --ignored --nocapture
