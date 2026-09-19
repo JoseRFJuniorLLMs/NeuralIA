@@ -14,6 +14,25 @@ pub enum ActionRisk {
     Restricted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
+pub enum PermissionClass {
+    AReadOnly,
+    BReversible,
+    CSensitive,
+    DRestricted,
+}
+
+impl From<ActionRisk> for PermissionClass {
+    fn from(risk: ActionRisk) -> Self {
+        match risk {
+            ActionRisk::ReadOnly => Self::AReadOnly,
+            ActionRisk::Reversible => Self::BReversible,
+            ActionRisk::Sensitive => Self::CSensitive,
+            ActionRisk::Restricted => Self::DRestricted,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FieldKind {
     Search,
@@ -119,6 +138,10 @@ impl AgentSecurityAction {
             | Self::Captcha { origin } => Some(origin.clone()),
         }
     }
+
+    pub fn permission_class(&self) -> PermissionClass {
+        self.risk().into()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,6 +199,11 @@ impl AgentPermissionPolicy {
 
     pub fn stop(&mut self) {
         self.stopped = true;
+        self.session_reversible_grant = false;
+        self.approved_origins.clear();
+        if let Some(origin) = self.initial_origin.as_ref() {
+            self.approved_origins.insert(origin.clone());
+        }
     }
 
     pub fn resume(&mut self) {
@@ -354,10 +382,17 @@ pub fn redact_sensitive_text(input: &str) -> String {
     let mut output = Vec::new();
     for raw in input.lines() {
         let lower = raw.to_ascii_lowercase();
+        let compact = lower
+            .chars()
+            .filter(|ch| !ch.is_ascii_whitespace() && !matches!(*ch, '"' | '\''))
+            .collect::<String>();
         let sensitive = [
             "authorization:",
+            "authorization=",
             "cookie:",
+            "cookie=",
             "set-cookie:",
+            "set-cookie=",
             "password=",
             "password:",
             "passwd=",
@@ -365,11 +400,15 @@ pub fn redact_sensitive_text(input: &str) -> String {
             "token=",
             "access_token",
             "refresh_token",
+            "client_secret",
+            "api_key",
+            "sessionid",
             "card_number",
             "cvv=",
+            "private_key",
         ]
         .iter()
-        .any(|needle| lower.contains(needle));
+        .any(|needle| compact.contains(needle));
 
         if sensitive {
             let key = raw.split([':', '=']).next().unwrap_or("sensitive").trim();
@@ -392,6 +431,83 @@ mod tests {
         assert!(clean.contains("body: visible"));
         assert!(!clean.contains("Bearer abc"));
         assert!(!clean.contains("hunter2"));
+    }
+
+    #[test]
+    fn permission_classes_are_native_and_match_the_four_spec_levels() {
+        let origin = "https://example.com".to_string();
+        let cases = [
+            (
+                AgentSecurityAction::Read {
+                    origin: origin.clone(),
+                },
+                PermissionClass::AReadOnly,
+            ),
+            (
+                AgentSecurityAction::Click {
+                    origin: origin.clone(),
+                    label: "Next".into(),
+                },
+                PermissionClass::BReversible,
+            ),
+            (
+                AgentSecurityAction::Submit {
+                    origin: origin.clone(),
+                    description: "Send".into(),
+                },
+                PermissionClass::CSensitive,
+            ),
+            (
+                AgentSecurityAction::Password {
+                    origin: origin.clone(),
+                },
+                PermissionClass::DRestricted,
+            ),
+        ];
+        for (action, expected) in cases {
+            assert_eq!(action.permission_class(), expected);
+        }
+    }
+
+    #[test]
+    fn session_grant_only_authorizes_class_b() {
+        let origin = "https://example.com";
+        let mut policy = AgentPermissionPolicy::new(Some(origin.into()));
+        policy.grant_reversible_session_actions(true);
+
+        let reversible = policy.evaluate(&AgentSecurityAction::Click {
+            origin: origin.into(),
+            label: "Next".into(),
+        });
+        assert!(reversible.allowed);
+
+        let sensitive = policy.evaluate(&AgentSecurityAction::Submit {
+            origin: origin.into(),
+            description: "Send form".into(),
+        });
+        assert!(!sensitive.allowed);
+        assert!(sensitive.requires_confirmation);
+
+        let restricted = policy.evaluate(&AgentSecurityAction::Payment {
+            origin: origin.into(),
+            description: "Pay".into(),
+        });
+        assert!(!restricted.allowed);
+        assert!(restricted.requires_confirmation);
+    }
+
+    #[test]
+    fn sensitive_firewall_handles_json_and_spaced_assignments() {
+        let input = r#"{"password":"hunter2"}
+Authorization = Bearer abc
+Cookie = session-secret
+client_secret = xyz
+body: visible"#;
+        let clean = redact_sensitive_text(input);
+        for secret in ["hunter2", "Bearer abc", "session-secret", "xyz"] {
+            assert!(!clean.contains(secret), "{clean}");
+        }
+        assert!(clean.contains("body: visible"));
     }
 
     #[test]
@@ -540,6 +656,28 @@ mod tests {
         });
         assert!(!decision.allowed);
         assert!(!decision.requires_confirmation);
+    }
+
+    #[test]
+    fn kill_switch_revokes_session_and_cross_origin_grants_before_resume() {
+        let mut policy = AgentPermissionPolicy::new(Some("https://a.example".into()));
+        policy.grant_reversible_session_actions(true);
+        policy.approve_origin("https://b.example");
+        policy.stop();
+        policy.resume();
+
+        let reversible = policy.evaluate(&AgentSecurityAction::Click {
+            origin: "https://a.example".into(),
+            label: "Continue".into(),
+        });
+        assert!(!reversible.allowed);
+        assert!(reversible.requires_confirmation);
+
+        let cross_origin = policy.evaluate(&AgentSecurityAction::Read {
+            origin: "https://b.example".into(),
+        });
+        assert!(!cross_origin.allowed);
+        assert!(cross_origin.requires_confirmation);
     }
 
     #[test]
