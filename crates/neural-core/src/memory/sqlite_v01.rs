@@ -1,6 +1,8 @@
-use std::{fs, io, path::Path, time::Duration};
+use std::{collections::HashMap, fs, io, path::Path, time::Duration};
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -589,6 +591,59 @@ pub(super) fn candidate_ids(
         .map_err(io_error)
 }
 
+pub(super) fn embeddings_for_ids(
+    path: &Path,
+    ids: &[String],
+) -> io::Result<HashMap<String, Vec<f32>>> {
+    if ids.is_empty() || !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let connection = open_ready(path)?;
+    let mut output = HashMap::with_capacity(ids.len());
+
+    for chunk in ids.chunks(400) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT page_id, dimension, vector
+             FROM memory_embedding
+             WHERE model_id='hashing-v1-384'
+               AND page_id IN ({placeholders})"
+        );
+        let mut statement = connection.prepare(&sql).map_err(io_error)?;
+        let rows = statement
+            .query_map(params_from_iter(chunk.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(io_error)?;
+
+        for row in rows {
+            let (id, dimension, bytes) = row.map_err(io_error)?;
+            if dimension <= 0 || dimension as usize > 4096 {
+                continue;
+            }
+            let expected = dimension as usize * std::mem::size_of::<f32>();
+            if bytes.len() != expected {
+                continue;
+            }
+
+            let mut values = Vec::with_capacity(dimension as usize);
+            for bytes in bytes.chunks_exact(4) {
+                values.push(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+            }
+            output.insert(id, values);
+        }
+    }
+
+    Ok(output)
+}
+
 #[cfg(test)]
 fn inspect_pragmas(path: &Path) -> io::Result<(i64, String, i64)> {
     let connection = open_ready(path)?;
@@ -785,6 +840,27 @@ mod tests {
 
         let hits = candidate_ids(&path, "rust " OR 1=1 --", None, None, 10).unwrap();
         assert_eq!(hits, vec![doc.id.clone()]);
+
+        remove_sqlite_sidecars(&path);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn persisted_embeddings_round_trip_for_candidate_ids() {
+        let path = temp_path("embedding-roundtrip");
+        let first = document("semantic one");
+        let second = document("semantic two");
+        upsert(&path, &first, None).unwrap();
+        upsert(&path, &second, None).unwrap();
+
+        let embeddings =
+            embeddings_for_ids(&path, &[first.id.clone(), second.id.clone(), "missing".into()])
+                .unwrap();
+
+        assert_eq!(embeddings.len(), 2);
+        assert_eq!(embeddings[&first.id], first.embedding);
+        assert_eq!(embeddings[&second.id], second.embedding);
+        assert!(!embeddings.contains_key("missing"));
 
         remove_sqlite_sidecars(&path);
         let _ = fs::remove_dir_all(path.parent().unwrap());
