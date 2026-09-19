@@ -196,7 +196,10 @@ mod tests {
         let anchors = semantic_anchors_html(
             "<article><h1>Título</h1><p>Texto</p></article><article><h1>Título</h1><p>Texto</p></article>",
         );
-        let labels = anchors.iter().map(|item| item.label.as_str()).collect::<HashSet<_>>();
+        let labels = anchors
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<HashSet<_>>();
         assert_eq!(labels.len(), anchors.len());
     }
 }
