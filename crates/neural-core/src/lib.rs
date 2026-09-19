@@ -43,6 +43,6 @@ pub use research::{
 
 pub use agent_runtime::{
     AgentAction, AgentElement, AgentOutcome, AgentPlanner, AgentRuntime, AgentRuntimeConfig,
-    AgentToolExecutor, ObservedPage, ToolResult,
+    AgentToolExecutor, ObservedPage, ToolResult, save_agent_outcome,
 };
 pub use semantic_timeline::{SemanticAnchor, SemanticAnchorKind, semantic_anchors_html};
