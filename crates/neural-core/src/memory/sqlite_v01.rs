@@ -619,6 +619,7 @@ mod tests {
             .unwrap();
         assert_eq!(version, 1);
         assert_eq!(hash, schema_hash());
+        drop(connection);
 
         let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
@@ -640,6 +641,8 @@ mod tests {
         rebuild(&path, &[], &[]).unwrap();
         assert_eq!(fts_count(&path, "python").unwrap(), 0);
 
+        // SQLite WAL/SHM handles must be gone before Windows can remove the tree.
+        remove_sqlite_sidecars(&path);
         let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
@@ -678,7 +681,9 @@ mod tests {
 
         assert_eq!(fake_count, 0);
         assert_eq!(audit_count, 1);
+        drop(connection);
 
+        remove_sqlite_sidecars(&path);
         let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
