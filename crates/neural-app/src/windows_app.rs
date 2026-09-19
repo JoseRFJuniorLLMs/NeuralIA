@@ -5879,20 +5879,29 @@ fn parse_browser_agent_plan(spec: &str) -> Result<(String, Vec<BrowserAgentComma
 
     let mut commands = Vec::new();
     for raw in parts.iter().skip(1) {
+        // Um valor vazio era descartado em silêncio. O plano seguia sem o
+        // comando que o utilizador escreveu e, se fosse o único, o
+        // `commands.is_empty()` lá em baixo punha um `extract` no lugar: um
+        // `click=` mal escrito acabava a guardar a página na memória em vez de
+        // clicar. Um comando que não dá para cumprir é um erro, não um salto.
         if let Some(value) = raw
             .strip_prefix("search=")
             .or_else(|| raw.strip_prefix("pesquisar="))
         {
-            if !value.trim().is_empty() {
-                commands.push(BrowserAgentCommand::Search(value.trim().to_string()));
+            let value = value.trim();
+            if value.is_empty() {
+                return Err("search precisa do texto a procurar: search=termo".into());
             }
+            commands.push(BrowserAgentCommand::Search(value.to_string()));
         } else if let Some(value) = raw
             .strip_prefix("click=")
             .or_else(|| raw.strip_prefix("clique="))
         {
-            if !value.trim().is_empty() {
-                commands.push(BrowserAgentCommand::Click(value.trim().to_string()));
+            let value = value.trim();
+            if value.is_empty() {
+                return Err("click precisa do rótulo do elemento: click=Buscar".into());
             }
+            commands.push(BrowserAgentCommand::Click(value.to_string()));
         } else if let Some(value) = raw
             .strip_prefix("select=")
             .or_else(|| raw.strip_prefix("selecionar="))
@@ -5900,9 +5909,15 @@ fn parse_browser_agent_plan(spec: &str) -> Result<(String, Vec<BrowserAgentComma
             let Some((label, selected)) = value.split_once(':') else {
                 return Err("select usa select=campo:valor".into());
             };
+            let (label, selected) = (label.trim(), selected.trim());
+            // Um rótulo vazio não é "qualquer campo": era o primeiro
+            // `select`/`combobox` da página, escolhido por ordem do DOM.
+            if label.is_empty() || selected.is_empty() {
+                return Err("select usa select=campo:valor, com os dois preenchidos".into());
+            }
             commands.push(BrowserAgentCommand::Select {
-                label: label.trim().to_string(),
-                value: selected.trim().to_string(),
+                label: label.to_string(),
+                value: selected.to_string(),
             });
         } else if raw.eq_ignore_ascii_case("extract") || raw.eq_ignore_ascii_case("extrair") {
             commands.push(BrowserAgentCommand::Extract);
@@ -9065,6 +9080,41 @@ mod tests {
         assert!(matches!(commands[1], BrowserAgentCommand::Select { .. }));
         assert!(matches!(commands[2], BrowserAgentCommand::Click(_)));
         assert!(matches!(commands[3], BrowserAgentCommand::Extract));
+    }
+
+    #[test]
+    fn browser_agent_plan_refuses_empty_commands_instead_of_dropping_them() {
+        // Antes, estes eram descartados em silêncio. Como eram os únicos
+        // comandos do plano, o agente acabava a correr um `extract` -- a
+        // guardar a página na memória semântica em vez de fazer o que lhe foi
+        // pedido, sem uma palavra ao utilizador.
+        for spec in [
+            "https://example.com | click=",
+            "https://example.com | click=   ",
+            "https://example.com | clique=",
+            "https://example.com | search=",
+            "https://example.com | pesquisar=  ",
+        ] {
+            let result = parse_browser_agent_plan(spec);
+            assert!(result.is_err(), "{spec} devia ser recusado: {result:?}");
+        }
+    }
+
+    #[test]
+    fn browser_agent_plan_refuses_half_written_select() {
+        // Um rótulo vazio não é "qualquer campo": o `find_agent_element`
+        // devolvia o primeiro select/combobox da página, por ordem do DOM.
+        for spec in [
+            "https://example.com | select=:artigo",
+            "https://example.com | select=  :artigo",
+            "https://example.com | select=tipo:",
+            "https://example.com | select=tipo",
+        ] {
+            let result = parse_browser_agent_plan(spec);
+            assert!(result.is_err(), "{spec} devia ser recusado: {result:?}");
+        }
+
+        assert!(parse_browser_agent_plan("https://example.com | select=tipo:artigo").is_ok());
     }
 
     #[test]
