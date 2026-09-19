@@ -58,9 +58,13 @@ from the measured payload:
   `NEURALIA_AUTHENTICODE_PFX_PASSWORD` are configured. If neither exists,
   the installer asset is omitted and the existing executable release remains
   valid. If exactly one exists, packaging fails closed;
-- after signing, `signtool verify /pa`, PowerShell Authenticode verification,
-  and the same install/hash/uninstall smoke gate must all pass before the setup
-  executable enters `dist/`.
+- PR CI exercises the Authenticode sign/verify path with an ephemeral trusted
+  code-signing certificate but skips the external timestamp authority, so a
+  third-party outage cannot turn the product gate red;
+- stable release signing does **not** skip timestamping: it uses an RFC3161
+  SHA-256 timestamp before `signtool verify /pa`, PowerShell Authenticode
+  verification, and the same install/hash/uninstall smoke gate; all must pass
+  before the setup executable enters `dist/`.
 
 The certificate itself is an owner-controlled release credential, not repository
 content. The README signed-installer milestone remains incomplete until a real
