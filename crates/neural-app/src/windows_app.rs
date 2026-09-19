@@ -19,7 +19,8 @@ use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentSecurityAction, CoreConfig,
     FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent, MemoryDocument, MemoryHit,
     MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore, ObservedPage, ReaderArticle,
-    ReaderBlock, ReaderClient, ResearchSession, chatgpt_search_url, claude_search_url,
+    ReaderBlock, ReaderClient, ResearchItemKind, ResearchSession, chatgpt_search_url,
+    claude_search_url,
     google_ai_url, is_local_network_target, is_pdf_url, parse_intent, reader_html,
     redact_sensitive_text,
 };
@@ -1984,6 +1985,18 @@ impl App {
             self.show_recent_history();
             return;
         }
+        if input.trim().eq_ignore_ascii_case("research:compare") {
+            self.compare_current_research();
+            return;
+        }
+        if input.trim().eq_ignore_ascii_case("research:synthesize") {
+            self.synthesize_current_research();
+            return;
+        }
+        if input.trim().eq_ignore_ascii_case("research:export") {
+            self.export_current_research();
+            return;
+        }
         if input.trim().eq_ignore_ascii_case("memory:rebuild") {
             self.memory.rebuild();
             self.show_splash("Reconstrução da memória agendada.".to_string(), 3);
@@ -2004,6 +2017,100 @@ impl App {
         let input = self.omnibox_text();
         if !input.is_empty() {
             self.handle_input(input);
+        }
+    }
+
+    fn current_research_item_ids(&self) -> Vec<String> {
+        self.current_research
+            .as_ref()
+            .map(|session| {
+                session
+                    .items
+                    .iter()
+                    .filter(|item| {
+                        matches!(
+                            item.kind,
+                            ResearchItemKind::Source | ResearchItemKind::ProviderAnswer
+                        )
+                    })
+                    .map(|item| item.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn compare_current_research(&self) {
+        let Some(session) = &self.current_research else {
+            self.show_native_text(
+                "NeuralIA — Research Session",
+                "Nenhuma sessão de pesquisa está ativa.",
+            );
+            return;
+        };
+        let ids = self.current_research_item_ids();
+        let facts = session.comparison(&ids);
+        let text = if facts.is_empty() {
+            "Ainda não há fontes/respostas suficientes para comparar.".to_string()
+        } else {
+            facts
+                .into_iter()
+                .map(|fact| {
+                    format!(
+                        "{}\nEntidades: {}\nNúmeros: {}\nDatas: {}\n{}",
+                        fact.title,
+                        fact.entities.join(", "),
+                        fact.numbers.join(", "),
+                        fact.dates.join(", "),
+                        fact.excerpt
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\r\n\r\n")
+        };
+        self.show_native_text("NeuralIA — Comparação da pesquisa", &text);
+    }
+
+    fn synthesize_current_research(&mut self) {
+        let ids = self.current_research_item_ids();
+        let Some(session) = &mut self.current_research else {
+            self.show_native_text(
+                "NeuralIA — Research Session",
+                "Nenhuma sessão de pesquisa está ativa.",
+            );
+            return;
+        };
+        if ids.is_empty() {
+            self.show_native_text(
+                "NeuralIA — Síntese",
+                "Ainda não há fontes/respostas para sintetizar.",
+            );
+            return;
+        }
+        let snapshot = session.synthesize(&ids).clone();
+        self.memory.save_session(session.clone());
+        self.show_native_text("NeuralIA — Síntese com proveniência", &snapshot.body);
+    }
+
+    fn export_current_research(&mut self) {
+        let Some(session) = &self.current_research else {
+            self.show_native_text(
+                "NeuralIA — Research Session",
+                "Nenhuma sessão de pesquisa está ativa.",
+            );
+            return;
+        };
+        let dir = self.config.data_dir.join("research-exports");
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            self.show_splash(format!("Export: {error}"), 4);
+            return;
+        }
+        let path = dir.join(format!("{}.md", session.id));
+        match std::fs::write(&path, session.export_markdown()) {
+            Ok(()) => self.show_native_text(
+                "NeuralIA — Pesquisa exportada",
+                &format!("Markdown salvo em:\r\n{}", path.display()),
+            ),
+            Err(error) => self.show_splash(format!("Export: {error}"), 4),
         }
     }
 
@@ -6880,6 +6987,14 @@ mod tests {
         assert!(AGENT_OBSERVER_SCRIPT.contains("neuralia:agent-observation"));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("eval("));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("new Function"));
+    }
+
+    #[test]
+    fn research_session_commands_are_exposed_in_native_input() {
+        let source = include_str!("windows_app.rs");
+        assert!(source.contains("research:compare"));
+        assert!(source.contains("research:synthesize"));
+        assert!(source.contains("research:export"));
     }
 
     #[test]
