@@ -129,9 +129,10 @@ fn temp_root(size: usize) -> PathBuf {
     ))
 }
 
-fn seed_documents(store: &MemoryStore, count: usize) -> io::Result<()> {
+fn seed_documents(store: &MemoryStore, count: usize) -> io::Result<String> {
     let documents = store.root().join("documents");
     fs::create_dir_all(&documents)?;
+    let mut sentinel_id = None;
 
     for index in 0..count {
         let marker = if index == count / 2 {
@@ -148,13 +149,16 @@ fn seed_documents(store: &MemoryStore, count: usize) -> io::Result<()> {
                 "NeuralIA memory baseline corpus item {index}.{marker}                 Retrieval, provenance, browser research and local semantic memory."
             ),
         );
+        if index == count / 2 {
+            sentinel_id = Some(document.id.clone());
+        }
         fs::write(
             documents.join(format!("{}.json", document.id)),
             serde_json::to_vec(&document).map_err(io::Error::other)?,
         )?;
     }
 
-    Ok(())
+    sentinel_id.ok_or_else(|| io::Error::other("baseline corpus has no sentinel document"))
 }
 
 fn median_micros(mut operation: impl FnMut(), repetitions: usize) -> u128 {
@@ -199,20 +203,22 @@ fn process_metrics() -> io::Result<ProcessMetrics> {
 fn measure(size: usize) -> io::Result<Baseline> {
     let root = temp_root(size);
     let store = MemoryStore::new(&root)?;
-    seed_documents(&store, size)?;
+    let sentinel_id = seed_documents(&store, size)?;
 
     let query = MemoryQuery::new("baselinequeryneedle");
     let warm = store.query(&query)?;
-    assert_eq!(
-        warm.len(),
-        1,
-        "sentinel query must identify exactly one document"
+    assert!(
+        warm.iter().any(|hit| hit.id == sentinel_id),
+        "sentinel document must be present in hybrid results"
     );
 
     let hybrid_query_median_us = median_micros(
         || {
             let hits = store.query(&query).expect("hybrid baseline query");
-            assert_eq!(hits.len(), 1);
+            assert!(
+                hits.iter().any(|hit| hit.id == sentinel_id),
+                "sentinel document must remain in hybrid results"
+            );
         },
         3,
     );
