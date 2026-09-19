@@ -16,7 +16,7 @@ A implementação tem uma boa base de política nativa, mas hoje existem **dois 
 
 Essa duplicação cria divergências entre aquilo que os testes de core provam e aquilo que o produto realmente executa.
 
-A auditoria encontrou um achado crítico, quatro altos e vários médios.
+A auditoria encontrou um achado crítico, sete altos e vários médios.
 
 ---
 
@@ -292,6 +292,127 @@ Na dúvida, cair para classe mais restritiva, nunca mais permissiva.
 
 ---
 
+## HIGH-06 — executor re-resolve alvo em um mundo JavaScript controlado pela página
+
+### Evidência
+
+O observer grava um atributo visível:
+
+```text
+data-neuralia-agent-id="n<generation>-<ordinal>"
+```
+
+Depois, `agent_action_script` executa na página:
+
+```js
+document.querySelector('[data-neuralia-agent-id="' + id + '"]')
+```
+
+e usa, em runtime:
+
+- `document.querySelector`;
+- `Object.getPrototypeOf`;
+- `Object.getOwnPropertyDescriptor`;
+- `el.getAttribute`;
+- `el.innerText`;
+- `el.click()`;
+- `Event`.
+
+Essas referências não são capturadas em um isolated world. A página controla o
+mesmo realm JavaScript e pode:
+
+- copiar/mover o `data-neuralia-agent-id`;
+- alterar nome/role entre observação e ação;
+- monkeypatch métodos usados pelo guard;
+- reagir ao atributo com MutationObserver.
+
+O guard de name/role reduz acidentes comuns, mas não é fronteira adversarial:
+os próprios valores comparados continuam sob controle da página.
+
+### Risco
+
+Uma ação classificada como reversível a partir da observação pode ser redirecionada
+para outro elemento antes da execução.
+
+Isso se combina perigosamente com HIGH-05, porque o grant reversível já está
+ativo por sessão.
+
+### Correção recomendada
+
+O reviewer deve avaliar uma referência de elemento que a página não consiga
+reapontar.
+
+Candidatos:
+
+- DevTools/DOM backend node identity;
+- adapter nativo com verificação de frame/origin;
+- isolated execution world, se WebView2/WRY expuser caminho apropriado;
+- no mínimo, re-observation nativa imediatamente antes de qualquer ação que
+  muda estado.
+
+Não tratar um atributo DOM controlável pela página como capability.
+
+### Teste adversarial
+
+Depois da observação e antes da execução:
+
+1. página copia o ID para outro botão;
+2. troca role/name;
+3. monkeypatch `document.querySelector`;
+4. tenta fazer o host clicar o alvo alternativo.
+
+A execução deve falhar fechada.
+
+---
+
+## HIGH-07 — interrupção pelo usuário perde o audit trail e não registra termination reason
+
+### Evidência
+
+`destroy_web_surfaces()` chama:
+
+```rust
+self.finish_agent(false);
+```
+
+`show_home()`/Escape passam por esse caminho.
+
+`finish_agent(false)` simplesmente remove `active_agent` e retorna sem
+persistir trace ou policy audit log.
+
+Mesmo quando `finish_agent(true)` é usado, o arquivo grava goal, steps e ações,
+mas não há campo explícito para a causa de término. O mesmo helper é chamado em:
+
+- sucesso;
+- limite;
+- elemento não encontrado;
+- ação restrita;
+- cancelamento;
+- erro de execução.
+
+A SPEC-0104 §9 exige termination reason; SPEC-0105 exige full traces.
+
+### Correção recomendada
+
+`finish_agent` deve receber um enum de razão:
+
+```rust
+enum AgentTermination {
+    Completed,
+    UserStopped,
+    StepLimit,
+    WallTime,
+    RestrictedAction,
+    UserRejected,
+    ElementMissing,
+    ExecutionError,
+}
+```
+
+O stop deve **persistir um log redigido**, não simplesmente apagar o run.
+
+---
+
 ## MEDIUM-01 — wall-time não é hard deadline
 
 O relógio é checado antes de cada iteração.
@@ -389,6 +510,32 @@ Mesmo assim, a regra de audit trail deve ser única: qualquer persistência de t
 - [ ] stale element valida ID/membership, não apenas generation;
 - [ ] trace persistido é redigido;
 - [ ] nenhum executor aceita JavaScript arbitrário oriundo do planner.
+
+## MEDIUM-06 — parte da acceptance coverage é estrutural, não comportamental
+
+O teste `runtime_has_no_arbitrary_javascript_action` formata apenas
+`AgentAction::Finish` e verifica que a string não contém "JavaScript".
+
+Adicionar amanhã uma variante `AgentAction::JavaScript { code }` não faria esse
+teste falhar, porque ele continuaria formatando somente `Finish`.
+
+Além disso, o acceptance 0105 exercita principalmente `TypeText(Search) -> Finish`.
+Não há workflow de produção que prove, no mesmo caminho:
+
+```text
+navigate -> search -> select/filter -> extract -> trace
+```
+
+como pede SPEC-0105 §12.
+
+### Correção recomendada
+
+- substituir o teste tautológico por source/enum-contract test capaz de falhar
+  quando uma ferramenta arbitrária aparece;
+- criar acceptance do wiring real, não só do runtime core;
+- provar filtro/select e extração com mudança de geração/DOM.
+
+---
 
 # Ordem de correção sugerida
 
