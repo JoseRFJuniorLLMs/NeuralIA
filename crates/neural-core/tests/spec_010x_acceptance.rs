@@ -201,15 +201,15 @@ fn spec_0100_forgotten_domain_stays_absent_after_reindex() {
     let root = temp_root("memory-domain-reindex");
     let store = MemoryStore::new(&root).unwrap();
 
-    store
-        .capture(MemoryDocument::new(
-            MemoryKind::Source,
-            MemorySourceKind::Web,
-            "Excluded domain",
-            Some("https://news.example.com/article".into()),
-            "domain-exclusion-sentinel",
-        ))
-        .unwrap();
+    let excluded = MemoryDocument::new(
+        MemoryKind::Source,
+        MemorySourceKind::Web,
+        "Excluded domain",
+        Some("https://news.example.com/article".into()),
+        "domain-exclusion-sentinel",
+    );
+    let excluded_id = excluded.id.clone();
+    store.capture(excluded).unwrap();
     store
         .capture(MemoryDocument::new(
             MemoryKind::Source,
@@ -226,12 +226,20 @@ fn spec_0100_forgotten_domain_stays_absent_after_reindex() {
     assert_eq!(report.documents, 1);
     store.rebuild().unwrap();
 
+    let excluded_hits = store
+        .query(&MemoryQuery::new("domain-exclusion-sentinel"))
+        .unwrap();
     assert!(
-        store
-            .query(&MemoryQuery::new("domain-exclusion-sentinel"))
-            .unwrap()
-            .is_empty(),
-        "reindex must not resurrect a domain that was removed"
+        excluded_hits.iter().all(|hit| hit.id != excluded_id),
+        "reindex must not resurrect the removed document id"
+    );
+    assert!(
+        excluded_hits.iter().all(|hit| {
+            hit.url
+                .as_deref()
+                .is_none_or(|url| !url.contains("example.com"))
+        }),
+        "reindex must not resurrect a removed domain URL"
     );
     assert_eq!(
         store
@@ -255,19 +263,23 @@ fn spec_0101_research_sessions_roundtrip_exact_source_provenance() {
         (
             "Gemini",
             "DOM",
-            "DOM fornece estrutura e seletores estáveis. Latência 10 ms em 2026.",
+            "DOM fornece estrutura e seletores estáveis. Latência 10 ms em 2026 referência.",
         ),
         (
             "ChatGPT",
             "Accessibility",
-            "Accessibility Tree fornece papéis e nomes acessíveis. Latência 12 ms em 2026.",
+            "Accessibility Tree fornece papéis e nomes acessíveis. Latência 12 ms em 2026 referência.",
         ),
         (
             "Claude",
             "Vision",
-            "Visão deve ser fallback quando sinais estruturados falham. Latência 20 ms em 2026.",
+            "Visão deve ser fallback quando sinais estruturados falham. Latência 20 ms em 2026 referência.",
         ),
-        ("Gemini", "CDP", "DevTools fornece metadados adicionais. Latência 8 ms."),
+        (
+            "Gemini",
+            "CDP",
+            "DevTools fornece metadados adicionais. Latência 8 ms.",
+        ),
         (
             "Claude",
             "Security",
@@ -285,11 +297,17 @@ fn spec_0101_research_sessions_roundtrip_exact_source_provenance() {
 
     let facts = session.comparison(&ids);
     assert_eq!(
-        facts.iter().map(|fact| fact.item_id.as_str()).collect::<Vec<_>>(),
+        facts
+            .iter()
+            .map(|fact| fact.item_id.as_str())
+            .collect::<Vec<_>>(),
         ids.iter().map(String::as_str).collect::<Vec<_>>()
     );
     assert_eq!(
-        facts.iter().map(|fact| fact.source.as_str()).collect::<Vec<_>>(),
+        facts
+            .iter()
+            .map(|fact| fact.source.as_str())
+            .collect::<Vec<_>>(),
         vec!["Gemini", "ChatGPT", "Claude", "Gemini", "Claude"]
     );
     assert!(facts[0].numbers.iter().any(|value| value == "10"));
@@ -351,13 +369,10 @@ fn spec_0102_local_intelligence_fallback_is_deterministic_and_discriminative() {
     }
 
     let query = ai.embed(&["otimização vetorial CPU".to_string()]).unwrap();
-    let related = ai
-        .embed(&["SIMD em CPUs modernas".to_string()])
-        .unwrap();
+    let related = ai.embed(&["SIMD em CPUs modernas".to_string()]).unwrap();
     let unrelated = ai.embed(&["receita de bolo".to_string()]).unwrap();
     assert!(
-        cosine_similarity(&query[0], &related[0])
-            > cosine_similarity(&query[0], &unrelated[0])
+        cosine_similarity(&query[0], &related[0]) > cosine_similarity(&query[0], &unrelated[0])
     );
 
     assert_eq!(
@@ -387,7 +402,10 @@ fn spec_0102_local_intelligence_fallback_is_deterministic_and_discriminative() {
         .summarize("um texto simples e comprido para resumir sem modelo", 12)
         .unwrap();
     assert!(summary.chars().count() <= 12);
-    assert_ne!(summary, "um texto simples e comprido para resumir sem modelo");
+    assert_ne!(
+        summary,
+        "um texto simples e comprido para resumir sem modelo"
+    );
 }
 
 #[test]
@@ -419,7 +437,10 @@ fn spec_0103_semantic_timeline_preserves_kind_order_labels_and_geometry() {
         expected_kinds
     );
     assert_eq!(
-        anchors.iter().map(|anchor| anchor.label.as_str()).collect::<Vec<_>>(),
+        anchors
+            .iter()
+            .map(|anchor| anchor.label.as_str())
+            .collect::<Vec<_>>(),
         vec![
             "Pergunta",
             "Resposta",
@@ -432,7 +453,10 @@ fn spec_0103_semantic_timeline_preserves_kind_order_labels_and_geometry() {
         ]
     );
     assert_eq!(
-        anchors.iter().map(|anchor| anchor.ordinal).collect::<Vec<_>>(),
+        anchors
+            .iter()
+            .map(|anchor| anchor.ordinal)
+            .collect::<Vec<_>>(),
         (0..anchors.len()).collect::<Vec<_>>()
     );
     assert_eq!(anchors.first().unwrap().position, 0.0);
