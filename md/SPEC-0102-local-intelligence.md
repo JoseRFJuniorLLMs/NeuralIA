@@ -1,6 +1,6 @@
 # SPEC-0102 — Optional Local Intelligence
 
-**Status:** Proposed  
+**Status:** Implemented baseline — NeuralIA 2.0  
 **Target:** NeuralIA 1.9
 
 ## 1. Purpose
