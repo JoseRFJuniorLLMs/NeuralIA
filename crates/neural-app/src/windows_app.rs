@@ -3013,7 +3013,10 @@ impl App {
                 }
             })
             .with_navigation_handler(move |target| {
-                if target.get(..9).is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:")) {
+                if target
+                    .get(..9)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
+                {
                     return false;
                 }
                 if is_pdf_internal_target(&target) {
@@ -3107,10 +3110,8 @@ impl App {
         let ipc_proxy = self.proxy.clone();
         let capability = remote_capability();
         let ipc_capability = capability.clone();
-        let init_script = format!(
-            "{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}"
-        )
-        .replace("__NEURALIA_CAP__", &capability);
+        let init_script = format!("{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}")
+            .replace("__NEURALIA_CAP__", &capability);
 
         WebViewBuilder::new()
             .with_initialization_script(init_script)
@@ -3148,8 +3149,8 @@ impl App {
                             action_url.query_pairs().find(|(key, _)| key == "url")
                             && neural_core::validate_web_url(value.as_ref()).is_ok()
                         {
-                            let _ =
-                                navigation_proxy.send_event(UserEvent::OpenExternal(value.into_owned()));
+                            let _ = navigation_proxy
+                                .send_event(UserEvent::OpenExternal(value.into_owned()));
                         }
                     }
                     _ => {}
@@ -3198,7 +3199,10 @@ impl App {
                 }
             })
             .with_navigation_handler(move |target| {
-                if target.get(..9).is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:")) {
+                if target
+                    .get(..9)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
+                {
                     return false;
                 }
                 remote_web_target(&target, allow_local)
@@ -3925,7 +3929,10 @@ impl App {
                 }
             })
             .with_navigation_handler(move |target| {
-                if target.get(..9).is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:")) {
+                if target
+                    .get(..9)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
+                {
                     return false;
                 }
                 remote_web_target(&target, false) || is_view_source_target(&target, false)
@@ -3939,7 +3946,6 @@ impl App {
             .with_permission_handler(|_| PermissionResponse::Deny)
             .with_focused(true)
     }
-
 
     /// O login abre-se com `window.open`, e ate aqui isso destruia as tres
     /// colunas para pôr um WebView unico no lugar delas -- perdia-se a
@@ -4003,7 +4009,10 @@ impl App {
                 }
             })
             .with_navigation_handler(move |target| {
-                if target.get(..9).is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:")) {
+                if target
+                    .get(..9)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
+                {
                     return false;
                 }
                 remote_web_target(&target, allow_local)
@@ -4671,7 +4680,10 @@ impl App {
                 });
             })
             .with_navigation_handler(move |target| {
-                if target.get(..9).is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:")) {
+                if target
+                    .get(..9)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
+                {
                     return false;
                 }
                 Url::parse(&target).ok().is_some_and(|url| {
@@ -8733,7 +8745,9 @@ mod tests {
 
     #[test]
     fn comparator_has_split_palette_and_real_three_way_submit() {
-        assert!(COMPARATOR_INJECT_SCRIPT.contains("act('split', { col:colIndex, url:target.href })"));
+        assert!(
+            COMPARATOR_INJECT_SCRIPT.contains("act('split', { col:colIndex, url:target.href })")
+        );
         assert!(NEURALIA_KEYMAP_SCRIPT.contains("act('palette', { col:colIndex })"));
         assert!(!NEURALIA_KEYMAP_SCRIPT.contains("q="));
         assert!(SPLIT_SCROLL_RAIL_SCRIPT.contains("neuralia-split-scroll-rail"));
@@ -9077,10 +9091,16 @@ mod tests {
             ("agent", AGENT_OBSERVER_SCRIPT),
             ("comparator", COMPARATOR_INJECT_SCRIPT),
         ] {
-            assert!(script.contains("window.chrome.webview.postMessage"), "{name}");
+            assert!(
+                script.contains("window.chrome.webview.postMessage"),
+                "{name}"
+            );
             assert!(script.contains("JSON.stringify"), "{name}");
             assert!(!script.contains("?cap="), "{name}");
-            assert!(!script.contains("window.location.href = 'neuralia:"), "{name}");
+            assert!(
+                !script.contains("window.location.href = 'neuralia:"),
+                "{name}"
+            );
         }
     }
 
