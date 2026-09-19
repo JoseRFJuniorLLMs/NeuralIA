@@ -56,6 +56,7 @@ fn model_pack_docs_do_not_claim_product_wiring() {
 fn readme_status_does_not_reintroduce_pre_comparator_ipc_claims() {
     assert!(!README.contains("lazy one-WebView lifecycle"));
     assert!(!README.contains("external IPC isolation"));
+    assert!(!README.contains("External Web pages receive no NeuralIA IPC."));
     assert!(README.contains("bounded lazy WebView lifecycle"));
     assert!(README.contains("bounded authenticated WebView2 IPC"));
 }

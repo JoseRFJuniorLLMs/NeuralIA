@@ -202,7 +202,7 @@ it at any time. EPUB is not supported: WebView2 does not open it.
 - Reader uses the operating-system TLS verifier.
 - Reader runs on one bounded worker; newer pending reads replace older pending reads.
 - Reader HTML executes no NeuralIA JavaScript and has `script-src 'none'`.
-- External Web pages receive no NeuralIA IPC.
+- In the v1.0.1 baseline, external Web pages received no NeuralIA IPC; current releases use only the bounded authenticated WebView2 channel described above.
 - New-window requests are reused in the single WebView instead of multiplying WebViews.
 - Local history is bounded, written off the UI thread, and can be cleared.
 - Release dependencies are locked and CI uses `--locked`.
