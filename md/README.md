@@ -1,8 +1,8 @@
 # NeuralIA — Future Architecture Specifications
 
-This directory contains **proposed** specifications for the next architectural
-steps of NeuralIA. They extend the current Rust + WRY + system-WebView design;
-they do not authorize a rewrite.
+This directory contains the architecture specifications implemented by the
+NeuralIA 2.0 baseline. They extend the Rust + WRY + system-WebView design
+without turning the project into a Chromium/Electron rewrite.
 
 ## Product thesis
 
@@ -39,11 +39,16 @@ The browser remains infrastructure. The product is the research workflow.
 | [SPEC-0106](SPEC-0106-execution-roadmap.md) | Implementation order and release gates | 1.7 → 2.0 |
 | [SPEC-0107](SPEC-0107-ai-memory-native-integration.md) | Native import/adaptation of ai-memory into NeuralIA memory crates | 1.7–1.9 |
 
-## Adoption rule
+## Implementation status
 
-These files are design proposals until an implementation milestone explicitly
-promotes them to normative status. A future feature MUST NOT silently violate
-the existing product charter, performance budget or threat model.
+SPEC-0100 through SPEC-0107 are implemented in the NeuralIA 2.0 baseline and
+are guarded together by `crates/neural-core/tests/spec_010x_acceptance.rs`.
+The acceptance gate covers semantic recall/private-memory exclusion, research
+provenance and synthesis, local intelligence, semantic timeline anchors, agent
+permissions, bounded agent execution and ai-memory provenance.
+
+Future changes MUST NOT silently violate the existing product charter,
+performance budget, privacy guarantees or threat model.
 
 The boring rule is intentional: architecture should be allowed to evolve;
 scope creep should not be allowed to wear an architecture badge.
