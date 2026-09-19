@@ -5078,11 +5078,15 @@ unsafe fn paint_comparator_bar_with_contexts(
     );
 
     // Abas/fontes na mesma faixa dos botoes de janela.
-    for index in 0..layout.columns_len {
+    for (index, source_contexts) in contexts
+        .iter()
+        .enumerate()
+        .take(layout.columns_len)
+    {
         let brand = theme.brand(index);
         for visual in 0..layout.context_tab_counts[index] {
             let context_index = layout.context_indices[index][visual];
-            let Some(url) = contexts[index].get(context_index) else {
+            let Some(url) = source_contexts.get(context_index) else {
                 continue;
             };
             let active = active_context
