@@ -46,6 +46,38 @@ jobs:
       - run: cargo test --locked -p neural-app
       - run: cargo clippy --locked -p neural-app --all-targets -- -D warnings
       - run: cargo build --locked -p neural-app --bin NeuralIA --release
+      - name: Authenticode signer regression gate
+        shell: pwsh
+        run: ./scripts/test-authenticode.ps1 -ExePath target/release/NeuralIA.exe
+      - name: Sign the release candidate when Authenticode is enabled
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.NEURALIA_AUTHENTICODE_ENABLED == 'true'
+        shell: pwsh
+        env:
+          NEURALIA_AUTHENTICODE_PFX_B64: ${{ secrets.NEURALIA_AUTHENTICODE_PFX_B64 }}
+          NEURALIA_AUTHENTICODE_PFX_PASSWORD: ${{ secrets.NEURALIA_AUTHENTICODE_PFX_PASSWORD }}
+          NEURALIA_AUTHENTICODE_TIMESTAMP_URL: ${{ vars.NEURALIA_AUTHENTICODE_TIMESTAMP_URL }}
+          NEURALIA_AUTHENTICODE_EXPECTED_SUBJECT: ${{ vars.NEURALIA_AUTHENTICODE_EXPECTED_SUBJECT }}
+        run: |
+          $timestamp = $env:NEURALIA_AUTHENTICODE_TIMESTAMP_URL
+          if ([string]::IsNullOrWhiteSpace($timestamp)) {
+            $timestamp = "http://timestamp.digicert.com"
+          }
+          ./scripts/sign-authenticode.ps1 `
+            -ExePath target/release/NeuralIA.exe `
+            -PfxBase64 $env:NEURALIA_AUTHENTICODE_PFX_B64 `
+            -PfxPassword $env:NEURALIA_AUTHENTICODE_PFX_PASSWORD `
+            -TimestampUrl $timestamp `
+            -ExpectedSubject $env:NEURALIA_AUTHENTICODE_EXPECTED_SUBJECT
+      - name: Verify the signed release candidate
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.NEURALIA_AUTHENTICODE_ENABLED == 'true'
+        shell: pwsh
+        env:
+          NEURALIA_AUTHENTICODE_EXPECTED_SUBJECT: ${{ vars.NEURALIA_AUTHENTICODE_EXPECTED_SUBJECT }}
+        run: |
+          ./scripts/verify-authenticode.ps1 `
+            -ExePath target/release/NeuralIA.exe `
+            -ExpectedSubject $env:NEURALIA_AUTHENTICODE_EXPECTED_SUBJECT `
+            -RequireTimestamp
       - name: Native Home performance regression gate
         shell: pwsh
         run: ./scripts/measure-home.ps1 -ExePath target/release/NeuralIA.exe -OutputPath perf-home.json
