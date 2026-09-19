@@ -4053,20 +4053,8 @@ impl App {
             return;
         };
 
-        if !private {
+        if let Some((title, mut document)) = split_source_memory(&valid, source_name, private) {
             let value = valid.to_string();
-            let title = valid
-                .host_str()
-                .map(|host| format!("Fonte · {host}"))
-                .unwrap_or_else(|| "Fonte Web".to_string());
-            let mut document = MemoryDocument::new(
-                MemoryKind::Source,
-                MemorySourceKind::Web,
-                title.clone(),
-                Some(value.clone()),
-                value.clone(),
-            )
-            .provider(source_name);
             if let Some(session) = &mut self.current_research {
                 document = document.session(session.id.clone());
                 let memory_id = document.id.clone();
@@ -6079,6 +6067,37 @@ fn decide_agent_step(
         security,
         confirmation: Some(decision.reason),
     }))
+}
+
+/// O que uma fonte aberta em Split View deixa na memória semântica: o título e
+/// o documento, ou **nada** quando o painel é privado.
+///
+/// "Private/incognito navigation never enters semantic memory" está na lista de
+/// restrições inegociáveis do `md/README.md`. É aqui que isso se decide para
+/// este caminho, fora de qualquer janela, para um teste poder ficar vermelho se
+/// alguém inverter a condição.
+fn split_source_memory(
+    url: &Url,
+    source_name: &str,
+    private: bool,
+) -> Option<(String, MemoryDocument)> {
+    if private {
+        return None;
+    }
+    let value = url.to_string();
+    let title = url
+        .host_str()
+        .map(|host| format!("Fonte · {host}"))
+        .unwrap_or_else(|| "Fonte Web".to_string());
+    let document = MemoryDocument::new(
+        MemoryKind::Source,
+        MemorySourceKind::Web,
+        title.clone(),
+        Some(value.clone()),
+        value,
+    )
+    .provider(source_name);
+    Some((title, document))
 }
 
 /// Para onde vai o texto que o utilizador submeteu, decidido sem tocar na
@@ -9126,6 +9145,26 @@ mod tests {
         assert_eq!(route_input("https://example.com"), InputRoute::Intent);
     }
 
+    /// SPEC-0100 / SPEC-0006 no caminho que embarca: "Private/incognito
+    /// navigation never enters semantic memory" é uma restrição inegociável do
+    /// `md/README.md`. O gate que existia para isto contava ocorrências de
+    /// `if !private` no texto do ficheiro — passava com a condição invertida.
+    #[test]
+    fn private_split_source_never_becomes_a_memory_document() {
+        let url = Url::parse("https://exemplo.pt/artigo").unwrap();
+
+        assert!(split_source_memory(&url, "ChatGPT", true).is_none());
+
+        let (title, document) = split_source_memory(&url, "ChatGPT", false)
+            .expect("uma fonte não privada entra na memória");
+        assert_eq!(title, "Fonte · exemplo.pt");
+        assert!(!document.private);
+        assert_eq!(document.provider.as_deref(), Some("ChatGPT"));
+        assert_eq!(document.url.as_deref(), Some("https://exemplo.pt/artigo"));
+        assert!(matches!(document.kind, MemoryKind::Source));
+        assert!(matches!(document.source_kind, MemorySourceKind::Web));
+    }
+
     #[test]
     fn memory_rebuild_is_not_swallowed_by_the_memory_prefix() {
         // `memory:rebuild` começa por `memory:`. Enquanto o prefixo foi
@@ -9279,14 +9318,18 @@ mod tests {
         assert!(before.contains("PaletteRoute::OpenPrivateProvider"));
         assert!(before.contains("open_split_mode(source_index, url.to_string(), false, true)"));
 
-        // open_split_mode so escreve memoria e abas quando nao e privado; e
-        // OpenPrivateSplit entra sempre com private = true.
+        // A parte da memória passou a ser testada pelo comportamento, em
+        // `private_split_source_never_becomes_a_memory_document`: contar
+        // ocorrências de `if !private` passava com a condição invertida. Aqui
+        // fica o que só o texto prova -- que este caminho não escreve
+        // histórico -- e a ligação à função que decide.
         let split = source
             .split("fn open_split_mode")
             .nth(1)
             .and_then(|part| part.split("fn open_private_panel").next())
             .expect("split body");
-        assert_eq!(split.matches("if !private").count(), 2);
+        assert!(split.contains("split_source_memory(&valid, source_name, private)"));
+        assert_eq!(split.matches("if !private").count(), 1);
         assert!(!split.contains("self.record("));
         let private_split = source
             .split("UserEvent::OpenPrivateSplit { source_index, url } =>")

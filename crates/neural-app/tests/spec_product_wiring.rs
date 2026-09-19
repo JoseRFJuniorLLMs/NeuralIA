@@ -53,10 +53,16 @@ fn spec_0100_product_memory_is_worker_backed_reader_wired_and_private_safe() {
     assert!(reader.contains("MemorySourceKind::Reader"));
     assert!(reader.contains("self.memory.capture(document)"));
 
+    // A regra "navegação privada nunca entra na memória semântica" deixou de
+    // ser contada por ocorrências de `if !private` no texto: contar strings
+    // passava com a condição invertida e falhava com um refactor inocente.
+    // A decisão vive em `split_source_memory` e é testada pelo comportamento em
+    // `windows_app::tests::private_split_source_never_becomes_a_memory_document`.
     let split = between(APP, "fn open_split_mode", "fn open_private_panel");
+    assert!(split.contains("split_source_memory(&valid, source_name, private)"));
     assert!(
-        split.matches("if !private").count() >= 2,
-        "private split must stay outside persistent history/memory paths"
+        split.matches("if !private").count() >= 1,
+        "o histórico do Split View continua fora do caminho privado"
     );
 }
 
