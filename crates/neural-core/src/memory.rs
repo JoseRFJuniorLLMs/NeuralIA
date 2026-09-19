@@ -1081,6 +1081,33 @@ mod tests {
     }
 
     #[test]
+    fn query_reports_unopenable_sqlite_index_instead_of_silent_full_scan() {
+        let root = temp_root("unopenable-candidate-index");
+        let store = MemoryStore::new(&root).unwrap();
+        store
+            .capture(MemoryDocument::new(
+                MemoryKind::Source,
+                MemorySourceKind::Reader,
+                "Unopenable index visibility",
+                None,
+                "any candidate-index failure must be visible to the caller",
+            ))
+            .unwrap();
+
+        fs::remove_file(store.sqlite_path()).unwrap();
+        fs::create_dir(store.sqlite_path()).unwrap();
+
+        let error = store
+            .query(&MemoryQuery::new("candidate index failure"))
+            .expect_err("unopenable derived index must be visible to the caller");
+        let message = error.to_string();
+        assert!(message.contains("candidate index"), "{message}");
+        assert!(message.contains("rebuild"), "{message}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn sqlite_embedding_rerank_matches_document_embedding_results() {
         let root = temp_root("sqlite-rerank");
         let store = MemoryStore::new(&root).unwrap();
