@@ -13,10 +13,12 @@ path = "src/main.rs"
 [dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 neural-core = { path = "../neural-core" }
+# O parser do canal IPC (src/ipc.rs) é portátil e é compilado em todas as
+# plataformas; por isso o serde_json não pode ficar só no lado Windows.
+serde_json.workspace = true
 url.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-serde_json.workspace = true
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
