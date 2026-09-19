@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -207,6 +208,50 @@ pub struct ModelPackManifest {
     pub license: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LocalBenchmark {
+    pub backend: String,
+    pub samples: usize,
+    pub embedding_dimension: usize,
+    pub embed_micros_total: u128,
+    pub classify_micros_total: u128,
+    pub measured_at: u64,
+}
+
+pub fn benchmark_local_intelligence(
+    backend: &str,
+    ai: &dyn LocalIntelligence,
+    corpus: &[String],
+) -> Result<LocalBenchmark, String> {
+    let samples = corpus.len();
+    let embed_started = Instant::now();
+    let embeddings = ai.embed(corpus)?;
+    let embed_micros_total = embed_started.elapsed().as_micros();
+
+    let classify_started = Instant::now();
+    for sample in corpus {
+        let _ = ai.classify(sample)?;
+    }
+    let classify_micros_total = classify_started.elapsed().as_micros();
+
+    let dimension = embeddings.first().map(Vec::len).unwrap_or(0);
+    if embeddings.iter().any(|embedding| embedding.len() != dimension) {
+        return Err("backend returned inconsistent embedding dimensions".into());
+    }
+
+    Ok(LocalBenchmark {
+        backend: backend.to_string(),
+        samples,
+        embedding_dimension: dimension,
+        embed_micros_total,
+        classify_micros_total,
+        measured_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelPackManager {
     root: PathBuf,
@@ -256,6 +301,61 @@ impl ModelPackManager {
         }
         packs.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(packs)
+    }
+
+    pub fn install(
+        &self,
+        manifest: &ModelPackManifest,
+        model_bytes: &[u8],
+    ) -> Result<PathBuf, String> {
+        validate_pack_component(&manifest.id)?;
+        validate_pack_component(&manifest.file)?;
+        let actual = format!("{:x}", Sha256::digest(model_bytes));
+        if !actual.eq_ignore_ascii_case(manifest.sha256.trim()) {
+            return Err(format!("hash do model pack {} não confere", manifest.id));
+        }
+
+        let pack = self.root.join(&manifest.id);
+        fs::create_dir_all(&pack).map_err(|error| error.to_string())?;
+        let model = pack.join(&manifest.file);
+        let temp = pack.join(format!(".{}.tmp", manifest.file));
+        fs::write(&temp, model_bytes).map_err(|error| error.to_string())?;
+        fs::rename(&temp, &model).map_err(|error| error.to_string())?;
+        fs::write(
+            pack.join("manifest.json"),
+            serde_json::to_vec_pretty(manifest).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(model)
+    }
+
+    pub fn uninstall(&self, id: &str) -> Result<bool, String> {
+        validate_pack_component(id)?;
+        let path = self.root.join(id);
+        if !path.exists() {
+            return Ok(false);
+        }
+        fs::remove_dir_all(path).map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    pub fn record_benchmark(
+        &self,
+        id: &str,
+        benchmark: &LocalBenchmark,
+    ) -> Result<PathBuf, String> {
+        validate_pack_component(id)?;
+        let dir = self.root.join(id);
+        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let path = dir.join("benchmark.json");
+        let temp = dir.join(".benchmark.json.tmp");
+        fs::write(
+            &temp,
+            serde_json::to_vec_pretty(benchmark).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::rename(temp, &path).map_err(|error| error.to_string())?;
+        Ok(path)
     }
 }
 
@@ -322,6 +422,18 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_is_local_and_records_dimension() {
+        let ai = HashingLocalIntelligence;
+        let corpus = vec![
+            "NeuralIA memória semântica".to_string(),
+            "WebView2 accessibility tree".to_string(),
+        ];
+        let result = benchmark_local_intelligence("hashing-local", &ai, &corpus).unwrap();
+        assert_eq!(result.samples, 2);
+        assert_eq!(result.embedding_dimension, EMBEDDING_DIM);
+    }
+
+    #[test]
     fn model_pack_hash_is_verified_before_use() {
         let root = temp_root("pack");
         let pack = root.join("semantic-small");
@@ -346,6 +458,16 @@ mod tests {
         let manager = ModelPackManager::new(&root);
         let loaded = manager.load_manifest("semantic-small").unwrap();
         assert_eq!(manager.verify(&loaded).unwrap(), pack.join("model.bin"));
+
+        let benchmark = benchmark_local_intelligence(
+            "hashing-local",
+            &HashingLocalIntelligence,
+            &["teste".to_string()],
+        )
+        .unwrap();
+        assert!(manager.record_benchmark("semantic-small", &benchmark).unwrap().exists());
+        assert!(manager.uninstall("semantic-small").unwrap());
+        assert!(!pack.exists());
 
         let _ = fs::remove_dir_all(root);
     }
