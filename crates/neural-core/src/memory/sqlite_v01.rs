@@ -6,7 +6,7 @@ use rusqlite::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::{MemoryDocument, MemoryRelation};
+use super::{MemoryDocument, MemoryRelation, MemoryTombstone};
 use crate::research::ResearchSession;
 
 const SCHEMA_VERSION: i64 = 1;
@@ -546,6 +546,43 @@ pub(super) fn rebuild(
     transaction.commit().map_err(io_error)
 }
 
+pub(super) fn sync_tombstones(path: &Path, tombstones: &[MemoryTombstone]) -> io::Result<()> {
+    if !path.exists() && tombstones.is_empty() {
+        return Ok(());
+    }
+
+    let mut connection = open_ready(path)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(io_error)?;
+    transaction
+        .execute("DELETE FROM tombstones", [])
+        .map_err(io_error)?;
+
+    {
+        let mut statement = transaction
+            .prepare(
+                "INSERT INTO tombstones(
+                    object_type, object_id, scope, reason, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .map_err(io_error)?;
+        for tombstone in tombstones {
+            statement
+                .execute(params![
+                    tombstone.object_type,
+                    tombstone.object_id,
+                    tombstone.scope,
+                    tombstone.reason,
+                    tombstone.created_at as i64
+                ])
+                .map_err(io_error)?;
+        }
+    }
+
+    transaction.commit().map_err(io_error)
+}
+
 pub(super) fn candidate_ids(
     path: &Path,
     query_text: &str,
@@ -779,6 +816,68 @@ mod tests {
 
         assert_eq!(fake_count, 0);
         assert_eq!(audit_count, 1);
+        drop(connection);
+
+        remove_sqlite_sidecars(&path);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn durable_tombstones_are_mirrored_exactly() {
+        let path = temp_path("tombstone-mirror");
+        rebuild(&path, &[], &[]).unwrap();
+        let tombstones = vec![
+            MemoryTombstone {
+                object_type: "domain".into(),
+                object_id: "example.com".into(),
+                scope: Some("domain".into()),
+                reason: Some("user-forget".into()),
+                created_at: 10,
+            },
+            MemoryTombstone {
+                object_type: "session".into(),
+                object_id: "session-x".into(),
+                scope: Some("session".into()),
+                reason: Some("user-forget".into()),
+                created_at: 11,
+            },
+        ];
+
+        sync_tombstones(&path, &tombstones).unwrap();
+
+        let connection = open_ready(&path).unwrap();
+        let rows = connection
+            .prepare(
+                "SELECT object_type, object_id, scope, reason, created_at
+                 FROM tombstones
+                 ORDER BY object_type, object_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "domain");
+        assert_eq!(rows[0].1, "example.com");
+        assert_eq!(rows[1].0, "session");
+        assert_eq!(rows[1].1, "session-x");
+        drop(connection);
+
+        sync_tombstones(&path, &tombstones[1..]).unwrap();
+        let connection = open_ready(&path).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM tombstones", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
         drop(connection);
 
         remove_sqlite_sidecars(&path);
