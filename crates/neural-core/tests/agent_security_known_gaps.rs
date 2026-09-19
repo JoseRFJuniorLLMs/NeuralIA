@@ -10,12 +10,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use neural_core::agent_runtime::AgentStep;
 use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentOutcome, AgentPermissionPolicy, AgentPlanner,
     AgentRuntime, AgentRuntimeConfig, AgentSecurityAction, AgentToolExecutor, FieldKind,
     ObservedPage, ToolResult, save_agent_outcome,
 };
-use neural_core::agent_runtime::AgentStep;
 
 fn page(text: &str) -> ObservedPage {
     ObservedPage {
@@ -87,10 +87,8 @@ fn restricted_type_text_never_persists_plaintext_secret() {
     let outcome = runtime.run("login", page("Login form"));
     assert!(matches!(outcome, AgentOutcome::NeedsApproval { .. }));
 
-    let root = std::env::temp_dir().join(format!(
-        "neuralia-known-gap-secret-{}",
-        std::process::id()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("neuralia-known-gap-secret-{}", std::process::id()));
     let path = root.join("outcome.json");
     save_agent_outcome(&path, "login", &outcome).unwrap();
     let stored = fs::read_to_string(&path).unwrap();
@@ -160,7 +158,12 @@ impl AgentToolExecutor for FlagExecutor {
 #[test]
 #[ignore = "known gap HIGH-02: element ref authenticity checks generation only"]
 fn fabricated_element_reference_is_rejected_before_executor() {
-    let forged = element("not-issued-by-observer", "button", "Continue", "https://example.com");
+    let forged = element(
+        "not-issued-by-observer",
+        "button",
+        "Continue",
+        "https://example.com",
+    );
     let planner = QueuePlanner {
         actions: VecDeque::from([
             AgentAction::Click { target: forged },
@@ -175,8 +178,7 @@ fn fabricated_element_reference_is_rejected_before_executor() {
     };
     let mut policy = AgentPermissionPolicy::new(Some("https://example.com".into()));
     policy.grant_reversible_session_actions(true);
-    let mut runtime =
-        AgentRuntime::new(planner, executor, policy, AgentRuntimeConfig::default());
+    let mut runtime = AgentRuntime::new(planner, executor, policy, AgentRuntimeConfig::default());
 
     let _ = runtime.run("click", page("benign"));
 
