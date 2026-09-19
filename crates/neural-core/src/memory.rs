@@ -1,8 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeSet, HashMap, HashSet},
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -13,7 +12,7 @@ use url::Url;
 
 use crate::{
     agent_security::redact_sensitive_text,
-    local_intelligence::{cosine_similarity, extract_entities, hashed_embedding, EMBEDDING_DIM},
+    local_intelligence::{EMBEDDING_DIM, cosine_similarity, extract_entities, hashed_embedding},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,8 +233,7 @@ impl MemoryStore {
                 hashed_embedding(&format!("{}\n{}", document.title, document.body));
         }
         if document.entities.is_empty() {
-            document.entities =
-                extract_entities(&format!("{}\n{}", document.title, document.body));
+            document.entities = extract_entities(&format!("{}\n{}", document.title, document.body));
         }
 
         let json_path = self.document_path(&document.id);
@@ -567,7 +565,10 @@ fn excerpt(body: &str, max_chars: usize) -> String {
     } else {
         format!(
             "{}…",
-            clean.chars().take(max_chars.saturating_sub(1)).collect::<String>()
+            clean
+                .chars()
+                .take(max_chars.saturating_sub(1))
+                .collect::<String>()
         )
     }
 }
@@ -662,9 +663,7 @@ mod sqlite_mirror {
             let mut database: Sqlite = ptr::null_mut();
             let code = unsafe { sqlite3_open(path.as_ptr(), &mut database) };
             if code != 0 || database.is_null() {
-                return Err(io::Error::other(
-                    "winsqlite3 could not open memory index",
-                ));
+                return Err(io::Error::other("winsqlite3 could not open memory index"));
             }
 
             let db = Self(database);
@@ -818,9 +817,7 @@ mod tests {
         store.capture(doc).unwrap();
 
         let hits = store
-            .query(&MemoryQuery::new(
-                "accessibility tree automação navegador",
-            ))
+            .query(&MemoryQuery::new("accessibility tree automação navegador"))
             .unwrap();
         assert!(!hits.is_empty());
         assert!(hits[0].title.contains("WebView2"));
@@ -841,10 +838,7 @@ mod tests {
         )
         .private(true);
 
-        assert_eq!(
-            store.capture(doc).unwrap(),
-            CaptureOutcome::SkippedPrivate
-        );
+        assert_eq!(store.capture(doc).unwrap(), CaptureOutcome::SkippedPrivate);
         assert!(store.documents().unwrap().is_empty());
 
         let _ = fs::remove_dir_all(root);
