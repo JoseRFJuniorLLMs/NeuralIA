@@ -26,7 +26,7 @@ Improve Readability scoring, preserve selected safe links/images, join article p
 
 ## Phase 4 — Distribution
 
-Windows icon resources, Authenticode-signed installer, update metadata, checksums, SBOM, and stronger dependency-policy tooling. The release workflow is already CI-gated, SHA-pinned, immutable and provenance-attested.
+Windows icon resources, Authenticode-signed installer, update metadata, checksums and SBOM remain distribution work. Dependency policy is now enforced in CI with a SHA-pinned `cargo-deny` action: unknown registries/git sources and registry/git wildcard dependencies are denied, licenses are allowlisted explicitly, and duplicate crate versions are surfaced as warnings for cleanup. The release workflow is already CI-gated, SHA-pinned, immutable and provenance-attested.
 
 ## Phase 5 — Optional platforms
 
