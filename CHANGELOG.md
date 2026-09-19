@@ -2,7 +2,7 @@
 
 All notable changes to NeuralIA are documented here.
 
-## [Unreleased]
+## [1.7.0] - 2026-09-19
 
 Endurecimento do canal entre página e nativo, omnibox flutuante nativa e uma rodada de correções de ciclo de vida, desempenho e testes.
 
