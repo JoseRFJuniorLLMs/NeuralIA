@@ -1,6 +1,6 @@
 # SPEC-0103 — Semantic Timeline
 
-**Status:** Proposed  
+**Status:** Implemented — NeuralIA 2.0  
 **Target:** NeuralIA 1.9
 
 ## 1. Purpose
