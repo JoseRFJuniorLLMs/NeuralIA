@@ -31,7 +31,7 @@ Os dois checkouts (`D:\DEV\NeuralIA` e `D:\DEV\NeuralIA-audit`) continuam a ser 
 ## 2. Release — quem e quando
 
 - O CI publica uma release em cada push a `main` que altere a `version` do `Cargo.toml`; **o bump é o gatilho**. Uma tag publicada não se move nem se republica (o `release.yml` recusa; a regra é a mesma para humanos e agentes).
-- Com um único agente, o bump **exige o sim explícito do dono**. Não é uma formalidade: é o último ponto em que um humano vê o que vai sair para os utilizadores antes de o pacote existir. Um agente não faz `release:` por iniciativa própria, mesmo com o gate verde.
+- O bump **exige o sim explícito do dono** mesmo com dois agentes ativos. Não é uma formalidade: é o último ponto em que um humano vê o que vai sair para os utilizadores antes de o pacote existir. Nenhum agente faz `release:` por iniciativa própria, mesmo com o gate verde.
 - Uma versão só sobe depois de o `CHANGELOG` ter uma secção `## [Unreleased]` completa e verdadeira (§3). O commit de release converte `[Unreleased]` em `[x.y.z]`.
 
 ## 3. Docs descrevem código, nunca planos
@@ -105,7 +105,7 @@ Antes de qualquer `git add`:
 git status --short
 ```
 
-Se aparecerem ficheiros que **esta tarefa** não editou, pára-se e avisa-se o dono. Não se adicionam, não se revertem, não se "arrumam". O commit `backup` de 18/09 é o exemplo do que não se faz. A regra continua a valer com um só agente: outra sessão pode estar aberta no outro worktree.
+Se aparecerem ficheiros que **esta tarefa** não editou, pára-se e avisa-se o dono. Não se adicionam, não se revertem, não se "arrumam". O commit `backup` de 18/09 é o exemplo do que não se faz. A regra continua a valer com múltiplos agentes e múltiplas sessões: outro worktree pode conter trabalho legítimo em curso.
 
 ## 6. Fluxo de integração
 
