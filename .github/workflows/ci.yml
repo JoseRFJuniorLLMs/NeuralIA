@@ -94,6 +94,44 @@ jobs:
           $installer = Get-ChildItem ci-installer -Filter "NeuralIA-Setup-*-x64.exe" -File | Select-Object -First 1
           if (-not $installer) { throw "Installer candidate was not produced." }
           ./scripts/test-windows-installer.ps1 -InstallerPath $installer.FullName -ExpectedExePath ci-tested/NeuralIA.exe -ExpectedVersion $version
+      - name: Exercise Authenticode path with an ephemeral CI certificate
+        shell: pwsh
+        run: |
+          $line = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          $version = $line.Matches[0].Groups[1].Value
+          $plainPassword = "NeuralIA-CI-$env:GITHUB_RUN_ID"
+          $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
+          $pfxPath = Join-Path $env:RUNNER_TEMP "neuralia-ci-authenticode.pfx"
+          $cerPath = Join-Path $env:RUNNER_TEMP "neuralia-ci-authenticode.cer"
+          $cert = $null
+
+          try {
+            $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=NeuralIA CI Authenticode Test" -CertStoreLocation "Cert:\CurrentUser\My" -KeyExportPolicy Exportable -HashAlgorithm SHA256 -NotAfter (Get-Date).AddDays(1)
+            Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $securePassword | Out-Null
+            Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
+            Import-Certificate -FilePath $cerPath -CertStoreLocation "Cert:\CurrentUser\Root" | Out-Null
+            Import-Certificate -FilePath $cerPath -CertStoreLocation "Cert:\CurrentUser\TrustedPublisher" | Out-Null
+
+            $env:NEURALIA_AUTHENTICODE_PFX_B64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($pfxPath))
+            $env:NEURALIA_AUTHENTICODE_PFX_PASSWORD = $plainPassword
+
+            ./scripts/build-windows-installer.ps1 -ExePath ci-tested/NeuralIA.exe -Version $version -OutputDir signed-ci-installer -Sign
+            $installer = Get-ChildItem signed-ci-installer -Filter "NeuralIA-Setup-*-x64.exe" -File | Select-Object -First 1
+            if (-not $installer) { throw "Signed CI installer was not produced." }
+            ./scripts/test-windows-installer.ps1 -InstallerPath $installer.FullName -ExpectedExePath ci-tested/NeuralIA.exe -ExpectedVersion $version -RequireValidSignature
+          }
+          finally {
+            $env:NEURALIA_AUTHENTICODE_PFX_B64 = $null
+            $env:NEURALIA_AUTHENTICODE_PFX_PASSWORD = $null
+            if ($cert) {
+              foreach ($store in @("My", "Root", "TrustedPublisher")) {
+                Remove-Item -LiteralPath ("Cert:\CurrentUser\$store\" + $cert.Thumbprint) -Force -ErrorAction SilentlyContinue
+              }
+            }
+            Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $cerPath -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Prove installer gate rejects a substituted payload
         shell: pwsh
         run: |
