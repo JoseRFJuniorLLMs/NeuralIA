@@ -1,6 +1,6 @@
 # SPEC-0102 — Optional Local Intelligence
 
-**Status:** Parcial — inteligência local determinística integrada; lifecycle de model packs ainda não ligado ao `neural-app`  
+**Status:** Parcial — inteligência local determinística integrada; `ModelPackManager` é biblioteca, não feature de produto  
 **Target:** NeuralIA 1.9
 
 ## 1. Purpose
@@ -121,12 +121,24 @@ model-independent local intelligence primitives. This path is exercised by the
 core tests and by the product-wiring gate in
 `crates/neural-app/tests/spec_product_wiring.rs`.
 
-The optional model-pack lifecycle is **not** wired into `neural-app` yet.
-`ModelPackManager` exists in `neural-core`, but the application does not
-instantiate it at startup or navigation time. Therefore this specification must
-remain **Parcial** until install/uninstall, failure fallback and measurement
-gates exercise the product path. A library-only model-pack test is not evidence
-that the browser ships the feature.
+### Decision: model packs are library-only for now
+
+`ModelPackManager` is **not a NeuralIA product feature** in the current
+baseline. It is a `neural-core` filesystem utility that can validate manifests,
+verify hashes, stage/replace pack files, list them, record benchmarks and
+uninstall them. It performs no download, no backend selection, no automatic
+activation and no startup hook.
+
+This is intentional. Wiring model packs into the product would require touching
+the browser lifecycle and proving lazy load, zero Home residency, failure
+fallback and measured resource budgets. Until that work is explicitly scheduled,
+the existence of `ModelPackManager` must not be presented as “model packs
+supported by NeuralIA”.
+
+Therefore this specification remains **Parcial**. The deterministic local
+intelligence is shipped; optional pack lifecycle is library infrastructure only.
+The acceptance criteria below that mention enabling/uninstalling a pack remain
+open product criteria, not claims about the current browser.
 
 ## 9. Acceptance criteria
 

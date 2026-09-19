@@ -333,6 +333,13 @@ pub fn benchmark_local_intelligence(
     })
 }
 
+/// Library-only filesystem utility for optional model-pack artifacts.
+///
+/// This type verifies, stages, lists and removes pack files. It deliberately
+/// does not download packs, select an inference backend, activate a global
+/// model or hook itself into browser startup. As of SPEC-0102's current
+/// partial state, `neural-app` does not instantiate it; product lifecycle
+/// wiring requires a separate measured integration.
 #[derive(Debug, Clone)]
 pub struct ModelPackManager {
     root: PathBuf,
