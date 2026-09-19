@@ -9,7 +9,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$OutputDir,
 
-    [switch]$Sign
+    [switch]$Sign,
+
+    [switch]$SkipTimestamp
 )
 
 $ErrorActionPreference = "Stop"
@@ -105,9 +107,13 @@ if ($Sign) {
     try {
         $certificate = Import-SigningCertificate -PfxBase64 $pfxBase64 -Password $pfxPassword
         $signTool = Resolve-SignTool
-        $timestampUrl = "https://timestamp.digicert.com"
-
-        & $signTool sign /sha1 $certificate.Thumbprint /s My /fd SHA256 /tr $timestampUrl /td SHA256 $installer
+        if ($SkipTimestamp) {
+            & $signTool sign /sha1 $certificate.Thumbprint /s My /fd SHA256 $installer
+        }
+        else {
+            $timestampUrl = "https://timestamp.digicert.com"
+            & $signTool sign /sha1 $certificate.Thumbprint /s My /fd SHA256 /tr $timestampUrl /td SHA256 $installer
+        }
         if ($LASTEXITCODE -ne 0) {
             throw "signtool failed to sign the installer."
         }
