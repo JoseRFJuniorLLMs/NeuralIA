@@ -770,8 +770,9 @@ fn normalize_domain(value: &str) -> Option<String> {
         return None;
     }
     let parsed = Url::parse(trimmed)
-        .or_else(|_| Url::parse(&format!("https://{}", trimmed.trim_start_matches('.'))))
-        .ok()?;
+        .ok()
+        .filter(|url| url.host_str().is_some())
+        .or_else(|| Url::parse(&format!("https://{}", trimmed.trim_start_matches('.'))).ok())?;
     let host = parsed
         .host_str()?
         .trim_end_matches('.')
@@ -1012,6 +1013,18 @@ mod tests {
         assert!(hits[0].matched_by.iter().any(|source| source == "semantic"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn domain_normalization_accepts_host_port_and_full_url() {
+        assert_eq!(
+            normalize_domain("Example.COM.:443").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            normalize_domain("https://Sub.Example.COM/path?q=1").as_deref(),
+            Some("sub.example.com")
+        );
     }
 
     #[test]
