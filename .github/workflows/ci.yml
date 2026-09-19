@@ -68,6 +68,39 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  installer-smoke:
+    needs: windows
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: neuralia-windows-tested-${{ github.sha }}
+          path: ci-tested
+      - name: Build unsigned installer candidate
+        shell: pwsh
+        run: |
+          $line = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          $version = $line.Matches[0].Groups[1].Value
+          ./scripts/build-windows-installer.ps1 -ExePath ci-tested/NeuralIA.exe -Version $version -OutputDir ci-installer
+      - name: Smoke install exact CI-tested payload
+        shell: pwsh
+        run: |
+          $line = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          $version = $line.Matches[0].Groups[1].Value
+          $installer = Get-ChildItem ci-installer -Filter "NeuralIA-Setup-*-x64.exe" -File | Select-Object -First 1
+          if (-not $installer) { throw "Installer candidate was not produced." }
+          ./scripts/test-windows-installer.ps1 -InstallerPath $installer.FullName -ExpectedExePath ci-tested/NeuralIA.exe -ExpectedVersion $version
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: neuralia-installer-unsigned-${{ github.sha }}
+          path: ci-installer/*.exe
+          if-no-files-found: error
+          retention-days: 3
+
   attest-tested-binary:
     needs: windows
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
