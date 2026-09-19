@@ -2166,6 +2166,9 @@ impl App {
     fn reader_webview_builder(&self) -> WebViewBuilder<'static> {
         let proxy = self.proxy.clone();
         WebViewBuilder::new()
+            .with_initialization_script(format!(
+                "{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}"
+            ))
             .with_navigation_handler(move |target| {
                 if target.starts_with("about:blank") {
                     return true;
@@ -6316,6 +6319,9 @@ mod tests {
         assert!(COMPARATOR_INJECT_SCRIPT.contains("Próxima resposta"));
         assert!(COMPARATOR_INJECT_SCRIPT.contains("scrollToPosition"));
         assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia-scroll-root"));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("semanticAnchors"));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("data-message-author-role"));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("ariaLabel"));
         assert!(COMPARATOR_INJECT_SCRIPT.contains("top:'50%'"));
     }
 
@@ -6393,7 +6399,21 @@ mod tests {
         assert!(SPLIT_SCROLL_RAIL_SCRIPT.contains("neuralia-split-scroll-rail"));
         assert!(SPLIT_SCROLL_RAIL_SCRIPT.contains("scrollbar-width:none"));
         assert!(SPLIT_SCROLL_RAIL_SCRIPT.contains("scrollToPosition"));
+        assert!(SPLIT_SCROLL_RAIL_SCRIPT.contains("semanticAnchors"));
+        assert!(SPLIT_SCROLL_RAIL_SCRIPT.contains("data-message-author-role"));
+        assert!(SPLIT_SCROLL_RAIL_SCRIPT.contains("aria-label"));
         assert!(SPLIT_SCROLL_RAIL_SCRIPT.contains("top:'50%'"));
+    }
+
+    #[test]
+    fn reader_uses_semantic_timeline_script() {
+        let source = include_str!("windows_app.rs");
+        let reader = source
+            .split("fn reader_webview_builder")
+            .nth(1)
+            .and_then(|part| part.split("fn external_webview_builder").next())
+            .expect("reader builder");
+        assert!(reader.contains("SPLIT_SCROLL_RAIL_SCRIPT"));
     }
 
     #[test]
@@ -7435,6 +7455,8 @@ document.addEventListener('DOMContentLoaded', () => {
   document.documentElement.appendChild(style);
 
   let currentRoot = null;
+  let semantic = [];
+
   function scrollRoot() {
     const docRoot = document.scrollingElement || document.documentElement || document.body;
     const candidates = docRoot ? [docRoot] : [];
@@ -7460,14 +7482,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function metrics() {
     const root = scrollRoot();
-    if (!root) return { root:null, top:0, max:0, docLike:true };
+    if (!root) return { root:null, top:0, max:0, view:window.innerHeight, docLike:true };
     const docLike = root === document.scrollingElement
       || root === document.documentElement || root === document.body;
     return {
       root,
       docLike,
       top: docLike ? window.scrollY : root.scrollTop,
-      max: Math.max(0, root.scrollHeight - root.clientHeight)
+      max: Math.max(0, root.scrollHeight - root.clientHeight),
+      view: root.clientHeight || window.innerHeight
     };
   }
 
@@ -7476,6 +7499,77 @@ document.addEventListener('DOMContentLoaded', () => {
     const value = Math.max(0, Math.min(state.max, top));
     if (state.docLike) window.scrollTo({ top:value, behavior:'smooth' });
     else if (state.root) state.root.scrollTo({ top:value, behavior:'smooth' });
+  }
+
+  function anchorTop(el, state) {
+    const rect = el.getBoundingClientRect();
+    if (state.docLike) return state.top + rect.top;
+    const rootRect = state.root.getBoundingClientRect();
+    return state.top + rect.top - rootRect.top;
+  }
+
+  function kindOf(el) {
+    const role = el.getAttribute('data-message-author-role');
+    const tag = el.tagName ? el.tagName.toLowerCase() : '';
+    const text = (el.textContent || '').trim().toLowerCase();
+    if (role === 'user') return 'pergunta';
+    if (role === 'assistant') return 'resposta';
+    if (/^h[1-6]$/.test(tag)) return text.includes('conclus') ? 'conclusão' : 'seção';
+    if (tag === 'pre' || tag === 'code') return 'código';
+    if (tag === 'table') return 'tabela';
+    if (tag === 'blockquote') return 'citação';
+    if (tag === 'aside') return 'nota';
+    if (tag === 'a') return 'fonte';
+    return 'resposta';
+  }
+
+  function semanticAnchors() {
+    const state = metrics();
+    const raw = [];
+    const seen = new Set();
+    const nodes = document.querySelectorAll(
+      '[data-message-author-role="user"],[data-message-author-role="assistant"],'
+      + 'h1,h2,h3,h4,h5,h6,pre,table,blockquote,aside,article,[role="article"],a[href]'
+    );
+
+    for (const el of nodes) {
+      if (raw.length >= 128) break;
+      if (!el || el.closest('#neuralia-split-scroll-rail,#neuralia-comp-controls')) continue;
+      const css = getComputedStyle(el);
+      if (css.display === 'none' || css.visibility === 'hidden') continue;
+      const label = (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 96);
+      if (!label) continue;
+      const kind = kindOf(el);
+      const key = kind + ':' + label;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      raw.push({ el, kind, label, top:anchorTop(el, state) });
+    }
+
+    raw.sort((a, b) => a.top - b.top);
+    if (raw.length <= 28) return raw;
+    const sampled = [];
+    for (let i = 0; i < 28; i++) {
+      sampled.push(raw[Math.round(i * (raw.length - 1) / 27)]);
+    }
+    return sampled;
+  }
+
+  function semanticStep(direction) {
+    semantic = semanticAnchors();
+    if (!semantic.length) return false;
+    const state = metrics();
+    const pivot = state.top + Math.max(24, state.view * .24);
+    let current = 0;
+    for (let i = 0; i < semantic.length; i++) {
+      if (semantic[i].top <= pivot) current = i;
+      else break;
+    }
+    const target = Math.max(0, Math.min(semantic.length - 1, current + direction));
+    if (target === current && ((direction < 0 && current === 0)
+        || (direction > 0 && current === semantic.length - 1))) return false;
+    scrollToPosition(semantic[target].top);
+    return true;
   }
 
   const rail = document.createElement('div');
@@ -7495,6 +7589,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const button = document.createElement('button');
     button.textContent = symbol;
     button.title = title;
+    button.setAttribute('aria-label', title);
     Object.assign(button.style, {
       width: direction > 0 ? '42px' : '32px',
       height: direction > 0 ? '42px' : '28px',
@@ -7509,9 +7604,9 @@ document.addEventListener('DOMContentLoaded', () => {
     button.onclick = (event) => {
       event.preventDefault();
       event.stopPropagation();
+      if (semanticStep(direction)) return;
       const state = metrics();
-      const view = state.root ? state.root.clientHeight : window.innerHeight;
-      scrollToPosition(state.top + Math.max(220, view * .82) * direction);
+      scrollToPosition(state.top + Math.max(220, state.view * .82) * direction);
     };
     return button;
   }
@@ -7520,30 +7615,43 @@ document.addEventListener('DOMContentLoaded', () => {
   Object.assign(ticks.style, {
     width:'34px', flex:'1', margin:'8px 0 10px',
     display:'flex', flexDirection:'column',
-    justifyContent:'space-evenly', alignItems:'flex-end',
-    cursor:'pointer'
+    justifyContent:'space-evenly', alignItems:'flex-end'
   });
 
   function rebuildTicks() {
     const state = metrics();
-    const view = state.root ? state.root.clientHeight : window.innerHeight;
-    const count = Math.max(5, Math.min(11,
-      Math.ceil((state.max + Math.max(view, 1)) / Math.max(view, 1))));
-    if (ticks.children.length === count) return;
+    semantic = semanticAnchors();
+    const fallbackCount = Math.max(5, Math.min(11,
+      Math.ceil((state.max + Math.max(state.view, 1)) / Math.max(state.view, 1))));
+    const count = semantic.length || fallbackCount;
+    const signature = semantic.length
+      ? semantic.map((item) => item.kind + ':' + Math.round(item.top)).join('|')
+      : 'fallback:' + count;
+    if (ticks.dataset.signature === signature) return;
+    ticks.dataset.signature = signature;
     ticks.textContent = '';
+
     for (let i = 0; i < count; i++) {
-      const tick = document.createElement('div');
+      const tick = document.createElement('button');
+      tick.type = 'button';
+      const item = semantic[i] || null;
+      const label = item ? item.kind + ': ' + item.label : 'posição ' + (i + 1);
+      tick.title = label;
+      tick.setAttribute('aria-label', label);
+      tick.dataset.top = item ? String(item.top) : '';
+      tick.dataset.fraction = item ? '' : String(count <= 1 ? 0 : i / (count - 1));
       Object.assign(tick.style, {
-        height:'2px', width:i === 0 ? '30px' : '14px', borderRadius:'2px',
-        background:'rgba(255,255,255,.30)',
+        display:'block', height:'3px', width:i === 0 ? '30px' : '14px',
+        minHeight:'3px', border:'0', borderRadius:'2px', padding:'0',
+        background:'rgba(255,255,255,.30)', cursor:'pointer',
         transition:'width .16s ease, background .16s ease, opacity .16s ease'
       });
       tick.onclick = (event) => {
         event.preventDefault();
         event.stopPropagation();
-        const state = metrics();
-        const fraction = count <= 1 ? 0 : i / (count - 1);
-        scrollToPosition(state.max * fraction);
+        const top = Number(tick.dataset.top);
+        if (tick.dataset.top) scrollToPosition(top);
+        else scrollToPosition(metrics().max * Number(tick.dataset.fraction || 0));
       };
       ticks.appendChild(tick);
     }
@@ -7552,10 +7660,21 @@ document.addEventListener('DOMContentLoaded', () => {
   function syncTicks() {
     rebuildTicks();
     const state = metrics();
-    const progress = state.max <= 0 ? 0 : Math.max(0, Math.min(1, state.top / state.max));
-    const count = ticks.children.length;
-    const active = Math.round(progress * Math.max(0, count - 1));
-    Array.from(ticks.children).forEach((tick, i) => {
+    const children = Array.from(ticks.children);
+    let active = 0;
+    if (semantic.length) {
+      const pivot = state.top + Math.max(24, state.view * .24);
+      for (let i = 0; i < children.length; i++) {
+        const top = Number(children[i].dataset.top || 0);
+        if (top <= pivot) active = i;
+        else break;
+      }
+    } else {
+      const progress = state.max <= 0 ? 0 : Math.max(0, Math.min(1, state.top / state.max));
+      active = Math.round(progress * Math.max(0, children.length - 1));
+    }
+
+    children.forEach((tick, i) => {
       const selected = i === active;
       tick.style.width = selected ? '32px' : (Math.abs(i - active) === 1 ? '22px' : '13px');
       tick.style.background = selected ? '#fff' : 'rgba(255,255,255,.32)';
@@ -7563,9 +7682,9 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  rail.appendChild(arrow('⌃', 'Página anterior', -1));
+  rail.appendChild(arrow('⌃', 'Seção semântica anterior', -1));
   rail.appendChild(ticks);
-  rail.appendChild(arrow('⌄', 'Próxima página', 1));
+  rail.appendChild(arrow('⌄', 'Próxima seção semântica', 1));
   document.documentElement.appendChild(rail);
 
   let raf = 0;
@@ -7731,6 +7850,7 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
         });
         button.onclick = (event) => {
           event.preventDefault(); event.stopPropagation();
+          if (semanticStep(direction)) return;
           const state = metrics();
           const view = state.root ? state.root.clientHeight : window.innerHeight;
           scrollToPosition(state.top + Math.max(220, view * .82) * direction);
@@ -7746,26 +7866,111 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
         alignItems:'flex-end', cursor:'pointer'
       });
 
+      let semantic = [];
+
+      function anchorTop(el, state) {
+        const rect = el.getBoundingClientRect();
+        if (state.docLike) return state.top + rect.top;
+        const rootRect = state.root.getBoundingClientRect();
+        return state.top + rect.top - rootRect.top;
+      }
+
+      function semanticKind(el) {
+        const role = el.getAttribute('data-message-author-role');
+        const tag = el.tagName ? el.tagName.toLowerCase() : '';
+        const text = (el.textContent || '').trim().toLowerCase();
+        if (role === 'user') return 'pergunta';
+        if (role === 'assistant') return 'resposta';
+        if (/^h[1-6]$/.test(tag)) return text.includes('conclus') ? 'conclusão' : 'seção';
+        if (tag === 'pre' || tag === 'code') return 'código';
+        if (tag === 'table') return 'tabela';
+        if (tag === 'blockquote') return 'citação';
+        if (tag === 'aside') return 'nota';
+        if (tag === 'a') return 'fonte';
+        return 'resposta';
+      }
+
+      function semanticAnchors() {
+        const state = metrics();
+        const raw = [];
+        const seen = new Set();
+        const nodes = document.querySelectorAll(
+          '[data-message-author-role="user"],[data-message-author-role="assistant"],'
+          + 'h1,h2,h3,h4,h5,h6,pre,table,blockquote,aside,article,[role="article"],a[href]'
+        );
+        for (const el of nodes) {
+          if (raw.length >= 128) break;
+          if (!el || (el.closest && el.closest('#neuralia-comp-controls,#neuralia-palette'))) continue;
+          const css = getComputedStyle(el);
+          if (css.display === 'none' || css.visibility === 'hidden') continue;
+          const label = (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 96);
+          if (!label) continue;
+          const kind = semanticKind(el);
+          const key = kind + ':' + label;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          raw.push({ el, kind, label, top:anchorTop(el, state) });
+        }
+        raw.sort((a, b) => a.top - b.top);
+        if (raw.length <= 28) return raw;
+        const sampled = [];
+        for (let i = 0; i < 28; i++) {
+          sampled.push(raw[Math.round(i * (raw.length - 1) / 27)]);
+        }
+        return sampled;
+      }
+
+      function semanticStep(direction) {
+        semantic = semanticAnchors();
+        if (!semantic.length) return false;
+        const state = metrics();
+        const view = state.root ? state.root.clientHeight : window.innerHeight;
+        const pivot = state.top + Math.max(24, view * .24);
+        let current = 0;
+        for (let i = 0; i < semantic.length; i++) {
+          if (semantic[i].top <= pivot) current = i;
+          else break;
+        }
+        const target = Math.max(0, Math.min(semantic.length - 1, current + direction));
+        if (target === current && ((direction < 0 && current === 0)
+            || (direction > 0 && current === semantic.length - 1))) return false;
+        scrollToPosition(semantic[target].top);
+        return true;
+      }
+
       function rebuildTicks() {
         const state = metrics();
         const view = state.root ? state.root.clientHeight : window.innerHeight;
-        const count = Math.max(5, Math.min(11,
+        semantic = semanticAnchors();
+        const fallbackCount = Math.max(5, Math.min(11,
           Math.ceil((state.max + Math.max(view, 1)) / Math.max(view, 1))));
-        if (ticks.children.length === count) return;
+        const count = semantic.length || fallbackCount;
+        const signature = semantic.length
+          ? semantic.map((item) => item.kind + ':' + Math.round(item.top)).join('|')
+          : 'fallback:' + count;
+        if (ticks.dataset.signature === signature) return;
+        ticks.dataset.signature = signature;
         ticks.textContent = '';
+
         for (let i = 0; i < count; i++) {
-          const tick = createElement('div');
-          tick.dataset.tick = String(i);
+          const tick = createElement('button');
+          const item = semantic[i] || null;
+          const label = item ? item.kind + ': ' + item.label : 'posição ' + (i + 1);
+          tick.type = 'button';
+          tick.title = label;
+          tick.ariaLabel = label;
+          tick.dataset.top = item ? String(item.top) : '';
+          tick.dataset.fraction = item ? '' : String(count <= 1 ? 0 : i / (count - 1));
           assign(tick.style, {
-            height:'2px', width:i === 0 ? '30px' : '14px', borderRadius:'2px',
-            background:'rgba(255,255,255,.30)',
+            display:'block', height:'3px', minHeight:'3px',
+            width:i === 0 ? '30px' : '14px', border:'0', borderRadius:'2px',
+            padding:'0', background:'rgba(255,255,255,.30)', cursor:'pointer',
             transition:'width .16s ease, background .16s ease, opacity .16s ease'
           });
           tick.onclick = (event) => {
             event.preventDefault(); event.stopPropagation();
-            const state = metrics();
-            const fraction = count <= 1 ? 0 : i / (count - 1);
-            scrollToPosition(state.max * fraction);
+            if (tick.dataset.top) scrollToPosition(Number(tick.dataset.top));
+            else scrollToPosition(metrics().max * Number(tick.dataset.fraction || 0));
           };
           append(ticks, tick);
         }
@@ -7774,10 +7979,23 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
       function syncTicks() {
         rebuildTicks();
         const state = metrics();
-        const progress = state.max <= 0 ? 0 : Math.max(0, Math.min(1, state.top / state.max));
-        const count = ticks.children.length;
-        const active = Math.round(progress * Math.max(0, count - 1));
-        Array.from(ticks.children).forEach((tick, i) => {
+        const view = state.root ? state.root.clientHeight : window.innerHeight;
+        const children = Array.from(ticks.children);
+        let active = 0;
+
+        if (semantic.length) {
+          const pivot = state.top + Math.max(24, view * .24);
+          for (let i = 0; i < children.length; i++) {
+            const top = Number(children[i].dataset.top || 0);
+            if (top <= pivot) active = i;
+            else break;
+          }
+        } else {
+          const progress = state.max <= 0 ? 0 : Math.max(0, Math.min(1, state.top / state.max));
+          active = Math.round(progress * Math.max(0, children.length - 1));
+        }
+
+        children.forEach((tick, i) => {
           const selected = i === active;
           tick.style.width = selected ? '32px' : (Math.abs(i - active) === 1 ? '22px' : '13px');
           tick.style.background = selected ? '#fff' : 'rgba(255,255,255,.32)';
