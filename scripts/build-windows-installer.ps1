@@ -66,6 +66,7 @@ function Import-SigningCertificate {
     )
 
     $pfxPath = Join-Path ([IO.Path]::GetTempPath()) ("neuralia-authenticode-" + [Guid]::NewGuid().ToString("N") + ".pfx")
+    $bytes = $null
     try {
         $bytes = [Convert]::FromBase64String($PfxBase64.Trim())
         [IO.File]::WriteAllBytes($pfxPath, $bytes)
