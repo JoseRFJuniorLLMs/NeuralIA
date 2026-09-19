@@ -89,6 +89,13 @@ try {
     }
 }
 finally {
+    if (-not $didUninstall -and $uninstaller -and (Test-Path -LiteralPath $uninstaller)) {
+        Start-Process -FilePath $uninstaller -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART"
+        ) -Wait -ErrorAction SilentlyContinue | Out-Null
+    }
     if (Test-Path -LiteralPath $installDir) {
         Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
     }
