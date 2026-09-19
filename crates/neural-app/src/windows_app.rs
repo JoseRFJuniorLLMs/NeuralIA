@@ -17,7 +17,9 @@ use std::{
 
 use image::RgbaImage;
 
-use crate::ipc::{IpcAction, constant_time_eq, parse_ipc_message};
+#[cfg(test)]
+use crate::ipc::constant_time_eq;
+use crate::ipc::{IpcAction, parse_ipc_message};
 use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentSecurityAction, CoreConfig,
     FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent, MemoryDocument, MemoryHit,
@@ -9120,7 +9122,7 @@ mod tests {
         );
         // JSON escaping may expand one UTF-16 code unit to six ASCII bytes.
         // 1200 * 6 leaves >900 bytes for the protocol envelope under 8 KiB.
-        assert!(1200 * 6 + 900 < crate::ipc::IPC_MAX_BYTES);
+        const { assert!(1200 * 6 + 900 < crate::ipc::IPC_MAX_BYTES) };
     }
 
     #[test]
