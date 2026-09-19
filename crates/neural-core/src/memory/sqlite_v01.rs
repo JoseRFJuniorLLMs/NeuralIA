@@ -666,7 +666,7 @@ mod tests {
         assert_eq!(hash, schema_hash());
         drop(connection);
 
-        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -688,7 +688,7 @@ mod tests {
 
         // SQLite WAL/SHM handles must be gone before Windows can remove the tree.
         remove_sqlite_sidecars(&path);
-        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -729,7 +729,7 @@ mod tests {
         drop(connection);
 
         remove_sqlite_sidecars(&path);
-        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -774,7 +774,7 @@ mod tests {
         assert_eq!(s2, vec![beta.id.clone()]);
 
         remove_sqlite_sidecars(&path);
-        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -787,7 +787,7 @@ mod tests {
         assert_eq!(hits, vec![doc.id.clone()]);
 
         remove_sqlite_sidecars(&path);
-        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -796,6 +796,6 @@ mod tests {
         let doc = document("secret").private(true);
         assert!(upsert(&path, &doc, None).is_err());
 
-        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }
