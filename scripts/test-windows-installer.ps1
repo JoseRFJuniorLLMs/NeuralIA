@@ -58,7 +58,7 @@ try {
     }
     $entry = Get-ItemProperty -LiteralPath $uninstallKey
     if ($entry.DisplayName -ne "NeuralIA" -or $entry.DisplayVersion -ne $ExpectedVersion) {
-        throw "Uninstall registration contains unexpected product metadata."
+        throw "Uninstall registration contains unexpected product metadata: DisplayName='$($entry.DisplayName)', DisplayVersion='$($entry.DisplayVersion)'."
     }
 
     $uninstaller = Join-Path $installDir "unins000.exe"
