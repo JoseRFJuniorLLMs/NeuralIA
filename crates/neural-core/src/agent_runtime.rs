@@ -157,8 +157,8 @@ pub fn save_agent_outcome(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let bytes = serde_json::to_vec_pretty(&StoredOutcome { goal, outcome })
-        .map_err(io::Error::other)?;
+    let bytes =
+        serde_json::to_vec_pretty(&StoredOutcome { goal, outcome }).map_err(io::Error::other)?;
     let temp = path.with_extension("tmp");
     fs::write(&temp, bytes)?;
     match fs::rename(&temp, path) {
@@ -520,10 +520,8 @@ mod tests {
             AgentRuntime::new(planner, executor, policy, AgentRuntimeConfig::default());
         let outcome = runtime.run("research", page());
 
-        let root = std::env::temp_dir().join(format!(
-            "neuralia-agent-trace-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("neuralia-agent-trace-{}", std::process::id()));
         let path = root.join("trace.json");
         save_agent_outcome(&path, "research", &outcome).unwrap();
         let text = fs::read_to_string(&path).unwrap();
