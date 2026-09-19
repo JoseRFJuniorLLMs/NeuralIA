@@ -546,10 +546,7 @@ pub(super) fn rebuild(
     transaction.commit().map_err(io_error)
 }
 
-pub(super) fn sync_tombstones(
-    path: &Path,
-    tombstones: &[MemoryTombstone],
-) -> io::Result<()> {
+pub(super) fn sync_tombstones(path: &Path, tombstones: &[MemoryTombstone]) -> io::Result<()> {
     if !path.exists() && tombstones.is_empty() {
         return Ok(());
     }
