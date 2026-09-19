@@ -9129,6 +9129,17 @@ mod tests {
     }
 
     #[test]
+    fn spec_0108_agent_observation_stays_below_ipc_envelope_limit() {
+        assert!(
+            AGENT_OBSERVER_SCRIPT.contains(".join('\\n').slice(0, 1200)"),
+            "agent payload must be bounded before JSON serialization"
+        );
+        // JSON escaping may expand one UTF-16 code unit to six ASCII bytes.
+        // 1200 * 6 leaves >900 bytes for the protocol envelope under 8 KiB.
+        assert!(1200 * 6 + 900 < crate::ipc::IPC_MAX_BYTES);
+    }
+
+    #[test]
     fn spec_0108_comparator_captures_timers_with_ipc_primitives() {
         let top = COMPARATOR_INJECT_SCRIPT
             .split("listen(document, 'DOMContentLoaded'")
@@ -10513,13 +10524,16 @@ const AGENT_OBSERVER_SCRIPT: &str = r#"
       rows[index] = row.replace(oldId, newId);
     });
 
+    // O envelope nativo aceita no maximo 8 KiB. 1200 unidades UTF-16
+    // continuam abaixo desse teto mesmo no pior caso JSON (surrogates
+    // escapados como \\uXXXX), deixando margem para cap/action/args.
     const payload = [
       String(generation),
       clean(location.href, 1200),
       clean(document.title, 256),
       pageText,
       ...rows
-    ].join('\n');
+    ].join('\n').slice(0, 1200);
     post(stringify({
       v:1,
       cap:capability,
