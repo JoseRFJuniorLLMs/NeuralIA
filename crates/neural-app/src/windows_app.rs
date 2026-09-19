@@ -100,6 +100,10 @@ enum UserEvent {
         result: Result<Vec<MemoryHit>, String>,
     },
     MemoryCleared(Result<(), String>),
+    ResearchAnswer {
+        source_index: usize,
+        text: String,
+    },
     /// Esconde outra vez a barra em ecra completo, se nada a tiver reavivado.
     HideChrome(u64),
     SubmitText(String),
@@ -2680,6 +2684,23 @@ impl App {
         WebViewBuilder::new()
             .with_initialization_script(init_script)
             .with_navigation_handler(move |target| {
+                if target.starts_with("neuralia:research-answer") {
+                    if remote_capability_matches(&target, &navigation_capability)
+                        && let (Some(col), Some(text)) = (
+                            neuralia_query_param(&target, "col"),
+                            neuralia_query_param(&target, "text"),
+                        )
+                        && let Ok(source_index) = col.parse::<usize>()
+                        && source_index < COMPARATOR_COLUMNS
+                        && !text.trim().is_empty()
+                    {
+                        let _ = navigation_proxy.send_event(UserEvent::ResearchAnswer {
+                            source_index,
+                            text,
+                        });
+                    }
+                    return false;
+                }
                 if target.starts_with("neuralia:split") {
                     if remote_capability_matches(&target, &navigation_capability)
                         && let (Some(col), Some(url)) = (
@@ -4571,6 +4592,17 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                 }
             }
+            UserEvent::ResearchAnswer { source_index, text } => {
+                let provider = self
+                    .comparator
+                    .as_ref()
+                    .and_then(|comp| comp.views.get(source_index))
+                    .map(|view| view.name.to_string());
+                if let (Some(provider), Some(session)) = (provider, &mut self.current_research) {
+                    session.upsert_provider_answer(provider, text, None);
+                    self.memory.save_session(session.clone());
+                }
+            }
             UserEvent::HideChrome(token) => self.hide_chrome(token),
             UserEvent::SubmitText(input) => {
                 if self.surface == Surface::Home {
@@ -6326,6 +6358,13 @@ mod tests {
     }
 
     #[test]
+    fn comparator_captures_provider_answers_for_research_session() {
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia:research-answer?col="));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("data-message-author-role"));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("scheduleResearchAnswer"));
+    }
+
+    #[test]
     fn comparator_has_split_palette_and_real_three_way_submit() {
         assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia:split?col="));
         assert!(NEURALIA_PALETTE_SCRIPT.contains("neuralia:palette?col="));
@@ -7187,6 +7226,8 @@ const EXTERNAL_RETURN_BUTTON: &str = r#"
 (function () {
   const capability = '__NEURALIA_CAP__';
   const encode = encodeURIComponent;
+  const defer = setTimeout;
+  const cancelDefer = clearTimeout;
   const byId = document.getElementById.bind(document);
   const createElement = document.createElement.bind(document);
   const assign = Object.assign;
@@ -7719,6 +7760,43 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
   const append = Function.prototype.call.bind(Node.prototype.appendChild);
 
   listen(document, 'DOMContentLoaded', () => {
+    let researchAnswerTimer = 0;
+    let lastResearchAnswer = '';
+
+    function researchAnswerText() {
+      const preferred = Array.from(document.querySelectorAll(
+        '[data-message-author-role="assistant"],'
+        + '[data-testid*="assistant"],[class*="assistant"],article,[role="article"]'
+      ));
+      let best = '';
+      for (const element of preferred) {
+        if (!element || (element.closest && element.closest('#neuralia-comp-controls,#neuralia-palette'))) {
+          continue;
+        }
+        const text = (element.innerText || element.textContent || '')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (text.length > best.length) best = text;
+      }
+      if (!best) {
+        const main = document.querySelector('main,[role="main"]');
+        best = main ? (main.innerText || main.textContent || '').replace(/\s+/g, ' ').trim() : '';
+      }
+      return best.slice(0, 1800);
+    }
+
+    function scheduleResearchAnswer() {
+      cancelDefer(researchAnswerTimer);
+      researchAnswerTimer = defer(() => {
+        const text = researchAnswerText();
+        if (text.length < 24 || text === lastResearchAnswer) return;
+        lastResearchAnswer = text;
+        window.location.href = 'neuralia:research-answer?col=' + colIndex
+          + '&text=' + encode(text)
+          + '&cap=' + encode(capability);
+      }, 1800);
+    }
+
     function mountControls() {
       if (byId('neuralia-comp-controls')) return;
 
@@ -8019,10 +8097,14 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
       listen(window, 'scroll', scheduleSync, { passive:true });
       listen(document, 'scroll', scheduleSync, { passive:true, capture:true });
       listen(window, 'resize', scheduleSync, { passive:true });
-      new MutationObserver(scheduleSync).observe(document.documentElement, {
+      new MutationObserver(() => {
+        scheduleSync();
+        scheduleResearchAnswer();
+      }).observe(document.documentElement, {
         childList:true, subtree:true
       });
       syncTicks();
+      scheduleResearchAnswer();
     }
 
     mountControls();
