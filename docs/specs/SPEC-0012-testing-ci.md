@@ -7,8 +7,8 @@ Every intent grammar rule, URL policy rule, search URL transformation, Reader ex
 UI logic in `neural-app` that can be expressed as a pure function — top-bar layout, resize weights, the palette's routing decision, `Range` header parsing, the timer queue — requires unit tests in `neural-app` itself, next to the logic. Those tests MUST be able to fail: a tautological assertion, one that would pass against any implementation (a constant asserted to contain part of itself, a builder asserted to return something, a value asserted to equal the expression that produced it), does not count as coverage and MUST NOT be presented as such.
 
 Required CI:
-1. Linux: `cargo fmt --check`, locked core tests, locked core clippy.
-2. Windows: locked workspace compile, core tests, desktop clippy and release build.
+1. Linux: `cargo fmt --all -- --check`; locked `neural-core` tests; locked portable `neural-app` tests (including the SPEC-0108 IPC parser and documentation-truth sentinels); clippy with `-D warnings` for both crates/all targets.
+2. Windows: locked workspace compile; locked `neural-core` and `neural-app` tests; desktop clippy with `-D warnings`; release build.
 3. Dependency audit: RustSec against the committed `Cargo.lock`.
 4. HTTP integration fixtures: redirect success/limit, declared and streamed size limits, charset, content type and navigation-wide deadline.
 5. Windows native-Home regression measurement: startup-to-window, working set, thread count, binary size and idle CPU sampled over a fixed window with Home visible, with a JSON artifact.

@@ -6,11 +6,19 @@
 
 Rust workspace, intent engine, Google AI routing, Reader, safe renderer, bounded local history, logo, CI, and specifications.
 
-## Phase 2 — Actually light (implemented, measurement pending)
+## Phase 2 — Actually light (implemented, core gates active)
 
-Native Windows home, native Windows omnibox, zero WebView instances while idle, lazy WebView creation, one-WebView ceiling, no external IPC, coalescing Reader worker, background history writer, and size-oriented release profile.
+Native Windows Home, native Windows omnibox, zero **surface** WebViews while
+idle, lazy WebView creation, bounded comparator lifecycle, authenticated
+closed-schema WebView2 IPC, coalescing Reader worker, background history writer,
+and a size-oriented release profile are implemented. A previously authenticated
+Google session may keep one hidden Gmail monitor alive by design; lifecycle CI
+sets `NEURALIA_NO_GMAIL=1` so that exception cannot masquerade as a leak.
 
-Remaining work in this phase is empirical: measure cold start, idle RSS, first-query latency, and Reader latency and enforce SPEC-0008 with benchmark gates.
+CI now enforces the native-Home startup/RSS/thread/idle-CPU budget and repeated
+comparator → Home WebView lifecycle. Broader first-query and Reader-latency
+measurement remain performance follow-up under SPEC-0008 rather than an
+unmeasured claim about this phase.
 
 ## Phase 3 — Reader quality
 

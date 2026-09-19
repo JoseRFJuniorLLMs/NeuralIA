@@ -6,7 +6,7 @@
 
 ## What NeuralIA is
 
-NeuralIA **v2.0.0** is an AI-first, reader-first, system-WebView information client written in Rust.
+NeuralIA **v2.0.1** is an AI-first, reader-first, system-WebView information client written in Rust.
 
 It deliberately refuses the usual browser arms race. It does not ship Chromium, does not implement its own JavaScript engine, does not carry a local LLM, and does not recreate a full browser tab strip just to prove that rectangles can multiply.
 
@@ -38,16 +38,16 @@ A linha 2.0 acrescenta uma camada local de conhecimento sem transformar a Home
 num processo de inferência permanente.
 
 - **Memória semântica local:** conhecimento durável em arquivos, espelho
-  SQLite/FTS5 no Windows, entidades, relações, embeddings determinísticos
-  offline e fusão de ranking. Conteúdo privado/incógnito é descartado antes da
+  SQLite/FTS5 derivado, entidades, relações, embeddings determinísticos offline
+  e fusão de ranking. Conteúdo privado/incógnito é descartado antes da
   persistência e segredos conhecidos são redigidos.
 - **Research Sessions:** perguntas, respostas de Gemini/ChatGPT/Claude e fontes
   mantêm proveniência. `research:compare`, `research:synthesize` e
   `research:export` comparam, sintetizam e exportam a sessão em Markdown.
 - **Inteligência local opcional:** embeddings/classificação/entidades/resumos
-  possuem fallback determinístico sem modelo; model packs têm manifesto,
-  checksum, instalação/remoção e benchmark, sem serem necessários para abrir a
-  Home.
+  possuem fallback determinístico sem modelo. A infraestrutura de biblioteca de
+  model packs valida manifesto, checksum, instalação/remoção e benchmark, mas
+  ainda não está ligada ao produto nem carrega modelos automaticamente.
 - **Timeline semântica:** perguntas, respostas, títulos, código, tabelas,
   citações, fontes e conclusões viram âncoras navegáveis.
 - **Agente Web limitado:** `agent:https://site | search=texto | click=botão |
@@ -202,7 +202,7 @@ it at any time. EPUB is not supported: WebView2 does not open it.
 - Reader uses the operating-system TLS verifier.
 - Reader runs on one bounded worker; newer pending reads replace older pending reads.
 - Reader HTML executes no NeuralIA JavaScript and has `script-src 'none'`.
-- External Web pages receive no NeuralIA IPC.
+- In the v1.0.1 baseline, external Web pages received no NeuralIA IPC; current releases use only the bounded authenticated WebView2 channel described above.
 - New-window requests are reused in the single WebView instead of multiplying WebViews.
 - Local history is bounded, written off the UI thread, and can be cleared.
 - Release dependencies are locked and CI uses `--locked`.
@@ -215,7 +215,7 @@ it at any time. EPUB is not supported: WebView2 does not open it.
 - [x] Rust workspace
 - [x] native Windows idle shell
 - [x] native accessible Windows omnibox
-- [x] lazy one-WebView lifecycle
+- [x] bounded lazy WebView lifecycle (one visible surface outside the comparator; three provider surfaces inside)
 - [x] intent parser
 - [x] Google AI Mode routing
 - [x] bounded HTTP Reader
@@ -226,7 +226,7 @@ it at any time. EPUB is not supported: WebView2 does not open it.
 - [x] AI comparator with system-themed top bar, independent response timelines and real fullscreen
 - [x] Chrome-style keyboard, zoom, find bar and DevTools inside every page
 - [x] opt-in auto-scroll for reading (HTML, text and PDF)
-- [x] external IPC isolation
+- [x] bounded authenticated WebView2 IPC with per-WebView capability
 - [x] HTTP integration tests
 - [x] CI Linux + Windows + RustSec
 - [x] immutable release workflow with CycloneDX SBOM + provenance attestation

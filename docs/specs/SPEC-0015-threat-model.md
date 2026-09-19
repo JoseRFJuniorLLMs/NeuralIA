@@ -19,7 +19,7 @@ Malicious sites, malformed HTML, hostile redirects, DNS rebinding/private-networ
 - Reader converts untrusted HTML to escaped text blocks;
 - no site JavaScript in Reader;
 - remote page-to-native control uses a bounded WebView2 message channel with no ambient authority: a closed 25-action schema, 8 KiB envelope ceiling, exact argument validation and a per-WebView capability drawn from `BCryptGenRandom` and compared in constant time; `postMessage` and `JSON.stringify` are captured at document-created time, and the capability never enters a navigation URL, closing the Navigation API token leak; remote handlers reject `neuralia:` navigation, while the script-free Reader keeps only its internal links; injected user-event handlers require `isTrusted`; the floating palette remains a native Win32 control whose text is never exposed to the page;
-- one-WebView ceiling;
+- bounded WebView lifecycle: one visible surface outside the comparator, a hard ceiling of three provider surfaces inside it, and the optional hidden Gmail monitor accounted for separately; lifecycle return-to-Home is regression-tested;
 - bounded local history with local clear operation;
 - locked dependencies;
 - SHA-pinned GitHub Actions;
