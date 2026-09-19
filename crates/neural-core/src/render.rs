@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use url::Url;
 
 use crate::reader::{ReaderArticle, ReaderBlock};
@@ -17,7 +19,11 @@ pub fn reader_html(article: &ReaderArticle) -> String {
                     body.push_str("<ul>");
                     list_open = true;
                 }
-                body.push_str(&format!("<li>{}</li>", escape_html(text)));
+                // `push_str` directo: o `format!` por bloco era mais uma
+                // String alocada e copiada so para ser logo concatenada.
+                body.push_str("<li>");
+                body.push_str(&escape_html(text));
+                body.push_str("</li>");
             }
             other => {
                 if list_open {
@@ -28,16 +34,31 @@ pub fn reader_html(article: &ReaderArticle) -> String {
                 match other {
                     ReaderBlock::Heading { level, text } => {
                         let level = (*level).clamp(2, 6);
-                        body.push_str(&format!("<h{level}>{}</h{level}>", escape_html(text)));
+                        // Preso a 2..=6, logo o nivel e sempre um unico digito
+                        // e dispensa o `format!`.
+                        let digit = char::from(b'0' + level);
+                        body.push_str("<h");
+                        body.push(digit);
+                        body.push('>');
+                        body.push_str(&escape_html(text));
+                        body.push_str("</h");
+                        body.push(digit);
+                        body.push('>');
                     }
                     ReaderBlock::Paragraph(text) => {
-                        body.push_str(&format!("<p>{}</p>", escape_html(text)));
+                        body.push_str("<p>");
+                        body.push_str(&escape_html(text));
+                        body.push_str("</p>");
                     }
                     ReaderBlock::Quote(text) => {
-                        body.push_str(&format!("<blockquote>{}</blockquote>", escape_html(text)));
+                        body.push_str("<blockquote>");
+                        body.push_str(&escape_html(text));
+                        body.push_str("</blockquote>");
                     }
                     ReaderBlock::Code(text) => {
-                        body.push_str(&format!("<pre><code>{}</code></pre>", escape_html(text)));
+                        body.push_str("<pre><code>");
+                        body.push_str(&escape_html(text));
+                        body.push_str("</code></pre>");
                     }
                     ReaderBlock::ListItem(_) => unreachable!(),
                 }
@@ -82,22 +103,112 @@ fn reader_action_url(action: &str, value: Option<&str>) -> String {
     url.to_string()
 }
 
-pub fn escape_html(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
+/// Uma passagem unica em vez de cinco `replace` encadeados. Cada `replace`
+/// alocava e copiava a string inteira: cinco copias por bloco, e o reader
+/// chega a centenas de blocos de dezenas de milhares de chars. O caso comum e
+/// nao haver nada a escapar: ai devolve-se o proprio input emprestado, sem
+/// alocar nada.
+///
+/// O resultado e identico ao dos cinco `replace`: como o `&` era substituido
+/// primeiro, os `&` que as proprias entidades introduzem nunca eram reescritos
+/// pelas passagens seguintes, que e o que esta passagem unica faz por
+/// construcao.
+pub fn escape_html(input: &str) -> Cow<'_, str> {
+    let Some(first) = input.find(['&', '<', '>', '"', '\'']) else {
+        return Cow::Borrowed(input);
+    };
+
+    // O prefixo limpo copia-se de uma vez; a folga cobre as primeiras
+    // entidades sem obrigar a realocar logo na primeira.
+    let mut escaped = String::with_capacity(input.len() + 16);
+    escaped.push_str(&input[..first]);
+    for ch in input[first..].chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            other => escaped.push(other),
+        }
+    }
+    Cow::Owned(escaped)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A versao anterior, palavra por palavra, para servir de referencia: a
+    /// passagem unica so vale se der exactamente o mesmo resultado.
+    fn escape_html_five_replaces(input: &str) -> String {
+        input
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#39;")
+    }
+
     #[test]
     fn escapes() {
         assert_eq!(escape_html("<script>"), "&lt;script&gt;");
+    }
+
+    #[test]
+    fn escape_html_matches_the_five_replace_version() {
+        let cases = [
+            "",
+            "texto simples",
+            "<script>",
+            "a & b",
+            "\"aspas\"",
+            "'apostrofo'",
+            "&amp;",
+            "&lt;ja escapado&gt;",
+            "&<>\"'",
+            "'\"><&",
+            "acentuacao e emojis: ação,日本語, 🙂",
+            "<a href=\"x\" onclick='alert(1)'>ação & cia</a>",
+            "&&&&&",
+            "fim com &",
+            "& no inicio",
+        ];
+
+        for case in cases {
+            assert_eq!(
+                escape_html(case).as_ref(),
+                escape_html_five_replaces(case),
+                "divergiu em {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_html_matches_on_large_mixed_input() {
+        let big = "ação & <b>negrito</b> 'x' \"y\" > z\n".repeat(2_000);
+        assert_eq!(escape_html(&big).as_ref(), escape_html_five_replaces(&big));
+    }
+
+    #[test]
+    fn escape_html_borrows_when_there_is_nothing_to_escape() {
+        assert!(matches!(
+            escape_html("texto sem nada a escapar, com acentuação"),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(escape_html(""), Cow::Borrowed(_)));
+        assert!(matches!(escape_html("um < aqui"), Cow::Owned(_)));
+    }
+
+    #[test]
+    fn escape_html_keeps_the_clean_prefix_intact() {
+        // O prefixo antes do primeiro char perigoso e copiado em bloco: se o
+        // offset estivesse errado, aqui perdia-se ou duplicava-se texto.
+        let input = "prefixo longo e sem nada de especial <fim>";
+        assert_eq!(
+            escape_html(input).as_ref(),
+            "prefixo longo e sem nada de especial &lt;fim&gt;"
+        );
     }
 
     #[test]

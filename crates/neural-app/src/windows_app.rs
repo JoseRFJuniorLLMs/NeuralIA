@@ -2,11 +2,13 @@
 
 use std::{
     borrow::Cow,
-    collections::hash_map::RandomState,
+    cell::Cell,
+    collections::{BinaryHeap, hash_map::RandomState},
+    ffi::OsString,
     hash::{BuildHasher, Hasher},
     sync::{
         Arc, Condvar, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
         mpsc::{SyncSender, sync_channel},
     },
     thread,
@@ -40,8 +42,8 @@ use windows_sys::Win32::{
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, SendInput, SetFocus,
-            VK_CONTROL, VK_NEXT, VK_SHIFT,
+            GetAsyncKeyState, GetFocus, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, SendInput,
+            SetFocus, VK_CONTROL, VK_ESCAPE, VK_NEXT, VK_RETURN, VK_SHIFT,
         },
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
@@ -49,8 +51,8 @@ use windows_sys::Win32::{
             GetWindowTextW, GetWindowThreadProcessId, IDYES, MB_ICONINFORMATION, MB_OK, MB_YESNO,
             MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
             SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-            TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-            WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+            TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+            WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -97,6 +99,9 @@ enum UserEvent {
     ShowHistory,
     ClearHistory,
     HistoryCleared(Result<(), String>),
+    /// O historico recente lido pelo worker; a caixa nativa e mostrada aqui,
+    /// no event loop, e nunca a leitura do ficheiro.
+    HistoryLoaded(Result<Vec<HistoryEntry>, String>),
     MemoryQueryReady {
         query: String,
         result: Result<Vec<MemoryHit>, String>,
@@ -125,17 +130,24 @@ enum UserEvent {
     NewTab(usize),
     CloseSplit,
     ToggleSplitFullscreen,
-    /// Entrada da omnibox flutuante, sempre associada à IA que tinha foco.
+    /// A pagina so pode PEDIR a palette (Ctrl+K/T ou o botao +): a coluna e
+    /// a do proprio WebView; texto e destino nunca viajam por este canal.
+    OpenPalette(usize),
+    /// Enter no EDIT nativo da palette. `source_index` e `private` vem do
+    /// estado nativo escrito ao abrir; `input` e lido do controlo Win32.
     PaletteSubmit {
         source_index: usize,
         input: String,
+        private: bool,
     },
+    /// Escape ou perda de foco no EDIT da palette; traz a geracao que viu.
+    ClosePalette(u64),
     ExpandComparator(usize),
     MinimizeComparator(usize),
-    ResizeComparator {
-        divider: usize,
-        screen_x: i32,
-    },
+    /// Ha um arrasto de divisor por atender. O divisor e o x vem dos statics
+    /// `RESIZE_*`, nao do evento: assim os movimentos que chegam enquanto
+    /// este esta na fila substituem-se uns aos outros em vez de se somarem.
+    ResizeComparator,
     RestoreComparator,
     ExitRequested,
     ReaderReady {
@@ -172,9 +184,34 @@ const AUTO_SCROLL_SECONDS: u64 = 30;
 /// Quanto tempo a pergunta fica no ecra antes de se dar por respondida com
 /// "nao". Sem resposta nao se mexe em nada: e uma pergunta, nao um aviso.
 const AUTO_SCROLL_PROMPT_SECONDS: u64 = 20;
+/// Quanto tempo a barra fica visivel em ecra completo depois do ultimo
+/// movimento do rato no topo.
+const CHROME_HIDE_DELAY_MS: u64 = 2500;
+/// Quanto tempo o aviso de correio novo fica no canto.
+const GMAIL_TOAST_SECONDS: u64 = 7;
+/// Quantas entradas do historico a caixa "history:" mostra.
+const HISTORY_RECENT_LIMIT: usize = 20;
+/// Tecto, em chars, de cada campo que o monitor do Gmail nos envia. O script
+/// ja corta a 180, mas o script corre numa pagina remota: o lado nativo nao
+/// pode confiar nesse corte e repete-o antes de guardar ou pintar.
+const GMAIL_FIELD_MAX_CHARS: usize = 180;
 
 const SPLASH_SUBCLASS_ID: usize = 0x4E4C;
 const GMAIL_TOAST_SUBCLASS_ID: usize = 0x4E4D;
+const PALETTE_SUBCLASS_ID: usize = 0x4E4E;
+const PALETTE_EDIT_SUBCLASS_ID: usize = 0x4E4F;
+/// Palette nativa, em pixeis logicos: nunca mais larga que isto nem que a
+/// coluna a que pertence menos as margens; a altura e fixa.
+const PALETTE_MAX_WIDTH: f64 = 680.0;
+const PALETTE_MIN_WIDTH: f64 = 240.0;
+const PALETTE_HEIGHT: f64 = 78.0;
+const PALETTE_CORNER: f64 = 18.0;
+const PALETTE_PAD_X: f64 = 16.0;
+const PALETTE_EDIT_TOP: f64 = 14.0;
+const PALETTE_EDIT_HEIGHT: f64 = 30.0;
+const PALETTE_HINT_TOP: f64 = 48.0;
+/// Fraccao da altura util (abaixo da barra) a que a palette pousa.
+const PALETTE_TOP_RATIO: f64 = 0.18;
 const SPLASH_WIDTH: f64 = 470.0;
 const SPLASH_HEIGHT: f64 = 46.0;
 const GMAIL_TOAST_WIDTH: f64 = 390.0;
@@ -184,6 +221,9 @@ const GMAIL_TOAST_HEIGHT: f64 = 68.0;
 /// procedimento de janela, que nao tem acesso ao estado da aplicacao.
 static SPLASH_TEXT: Mutex<String> = Mutex::new(String::new());
 static GMAIL_TOAST_TEXT: Mutex<String> = Mutex::new(String::new());
+/// Legenda da palette nativa (para onde vao URL e texto). Fora do App pela
+/// mesma razao que SPLASH_TEXT: quem a pinta e o procedimento de janela.
+static PALETTE_HINT: Mutex<String> = Mutex::new(String::new());
 /// Verdadeiro enquanto a janela esta a fazer uma pergunta com Sim/Nao.
 static SPLASH_ASKS: AtomicBool = AtomicBool::new(false);
 
@@ -324,6 +364,33 @@ enum BarHit {
     WindowClose,
 }
 
+/// O estado do comparador de que a barra precisa. Anda sempre junto -- quem
+/// arrasta um divisor muda os pesos, quem minimiza muda as duas coisas -- e
+/// agrupa-lo evita que a barra receba uma parte e esqueca a outra, que era
+/// exactamente como os rotulos deixavam de estar sobre as colunas.
+#[derive(Debug, Clone, Copy)]
+struct BarColumns {
+    count: usize,
+    weights: [f64; COMPARATOR_COLUMNS],
+    minimized: [bool; COMPARATOR_COLUMNS],
+    /// Ha uma gaveta aberta: os botoes do Split ocupam o canto direito e os
+    /// chips tem de parar antes deles.
+    split_active: bool,
+}
+
+impl BarColumns {
+    /// Colunas iguais, nenhuma minimizada -- o estado de partida, e o que os
+    /// testes de geometria usam quando os pesos nao sao o assunto.
+    fn even(count: usize) -> Self {
+        Self {
+            count,
+            weights: [1.0; COMPARATOR_COLUMNS],
+            minimized: [false; COMPARATOR_COLUMNS],
+            split_active: false,
+        }
+    }
+}
+
 /// Geometria em duas linhas. As fontes ficam na title bar; os provedores ficam
 /// numa segunda linha, sem disputar espaco com as abas.
 #[derive(Debug, Clone, Copy)]
@@ -331,7 +398,12 @@ struct BarLayout {
     visible: bool,
     height: f64,
     home: UiRect,
+    /// Por coluna: a pilula do provedor sobre a sua faixa, ou -- se estiver
+    /// minimizada -- o chip compacto encostado aos controlos da direita.
     columns: [UiRect; COMPARATOR_COLUMNS],
+    /// Quais das `columns` sao chips. O desenho precisa de saber porque o
+    /// chip e apagado e nao leva o botao "+".
+    minimized: [bool; COMPARATOR_COLUMNS],
     add_tabs: [UiRect; COMPARATOR_COLUMNS],
     context_tabs: [[UiRect; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
     context_indices: [[usize; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
@@ -349,7 +421,7 @@ impl BarLayout {
             client_width,
             scale,
             visible,
-            columns,
+            BarColumns::even(columns),
             [0; COMPARATOR_COLUMNS],
         )
     }
@@ -358,7 +430,7 @@ impl BarLayout {
         client_width: f64,
         scale: f64,
         visible: bool,
-        columns: usize,
+        columns: BarColumns,
         context_counts: [usize; COMPARATOR_COLUMNS],
     ) -> Self {
         let scale = scale.max(1.0);
@@ -374,6 +446,7 @@ impl BarLayout {
                 height: 0.0,
                 home: empty,
                 columns: [empty; COMPARATOR_COLUMNS],
+                minimized: [false; COMPARATOR_COLUMNS],
                 add_tabs: [empty; COMPARATOR_COLUMNS],
                 context_tabs: [[empty; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
                 context_indices: [[0; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
@@ -422,35 +495,67 @@ impl BarLayout {
         let mut tabs = [[empty; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS];
         let mut tab_indices = [[0usize; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS];
         let mut tab_counts = [0usize; COMPARATOR_COLUMNS];
-        let columns_len = columns.min(COMPARATOR_COLUMNS);
+        let columns_len = columns.count.min(COMPARATOR_COLUMNS);
 
-        // Linha dos provedores, agora livre das abas.
-        if columns_len > 0 {
-            let column_width = client_width / columns_len as f64;
-            let group_pad = 6.0 * scale;
-            let gap = 4.0 * scale;
-            let provider_width = 116.0 * scale;
-            let plus_width = 26.0 * scale;
+        // Linha dos provedores, agora livre das abas. As faixas vem da MESMA
+        // funcao que posiciona os WebViews: depois de arrastar um divisor o
+        // rotulo continua sobre a sua coluna, e o hit-testing com ele.
+        let spans = visible_column_spans(
+            client_width / scale,
+            columns.count,
+            &columns.weights,
+            &columns.minimized,
+        );
+        let group_pad = 6.0 * scale;
+        let gap = 4.0 * scale;
+        let provider_width = 116.0 * scale;
+        let plus_width = 26.0 * scale;
 
-            for index in 0..columns_len {
-                let mut left = index as f64 * column_width + group_pad;
-                if index == 0 {
-                    left = left.max(home.x + home.width + 8.0 * scale);
-                }
-                let right = ((index + 1) as f64 * column_width - group_pad).min(client_width - pad);
-                let available = (right - left).max(provider_width + plus_width + gap);
+        for (slot, span) in spans.iter().enumerate() {
+            let mut left = span.x * scale + group_pad;
+            if slot == 0 {
+                left = left.max(home.x + home.width + 8.0 * scale);
+            }
+            let right = ((span.x + span.width) * scale - group_pad).min(client_width - pad);
+            let available = (right - left).max(provider_width + plus_width + gap);
+            columns_rect[span.index] = UiRect {
+                x: left,
+                y: row_y,
+                width: provider_width.min(available - plus_width - gap),
+                height: row_h,
+            };
+            plus_rect[span.index] = UiRect {
+                x: columns_rect[span.index].x + columns_rect[span.index].width + gap,
+                y: row_y + 2.0 * scale,
+                width: plus_width,
+                height: row_h - 4.0 * scale,
+            };
+        }
+
+        // Colunas minimizadas: nao tem faixa, mas nao podem desaparecer da
+        // barra -- e o chip que as traz de volta com um clique. Encostam-se a
+        // direita, logo antes de Privado/Split, para nao roubarem espaco as
+        // colunas que estao mesmo a ser vistas.
+        let hidden: Vec<usize> = (0..columns_len)
+            .filter(|index| columns.minimized[*index])
+            .collect();
+        if !hidden.is_empty() {
+            let chip_w = 62.0 * scale;
+            let chip_gap = 5.0 * scale;
+            let controls_left = right_controls(client_width, scale, columns.split_active)
+                .private
+                .x;
+            let strip =
+                hidden.len() as f64 * chip_w + chip_gap * hidden.len().saturating_sub(1) as f64;
+            let mut x = (controls_left - 8.0 * scale - strip).max(pad);
+            for index in hidden {
                 columns_rect[index] = UiRect {
-                    x: left,
+                    x,
                     y: row_y,
-                    width: provider_width.min(available - plus_width - gap),
+                    width: chip_w,
                     height: row_h,
                 };
-                plus_rect[index] = UiRect {
-                    x: columns_rect[index].x + columns_rect[index].width + gap,
-                    y: row_y + 2.0 * scale,
-                    width: plus_width,
-                    height: row_h - 4.0 * scale,
-                };
+                x += chip_w + chip_gap;
             }
         }
 
@@ -492,6 +597,7 @@ impl BarLayout {
             height,
             home,
             columns: columns_rect,
+            minimized: columns.minimized,
             add_tabs: plus_rect,
             context_tabs: tabs,
             context_indices: tab_indices,
@@ -541,6 +647,59 @@ impl BarLayout {
     }
 }
 
+/// Os controlos do canto direito da segunda linha.
+#[derive(Debug, Clone, Copy)]
+struct RightControls {
+    private: UiRect,
+    /// Rotulo, expandir e fechar da gaveta; `None` quando nao ha gaveta.
+    split: Option<(UiRect, UiRect, UiRect)>,
+}
+
+/// Geometria dos controlos encostados a direita. A mesma conta estava escrita
+/// tres vezes -- no desenho, no hit-testing e agora nos chips -- e as copias
+/// ja tinham comecado a divergir; aqui ela e uma so.
+fn right_controls(client_width: f64, scale: f64, split_active: bool) -> RightControls {
+    let margin = 8.0 * scale;
+    let row_y = (TITLE_TAB_HEIGHT + 7.0) * scale;
+    let row_h = 30.0 * scale;
+    let gap = 5.0 * scale;
+
+    let split = split_active.then(|| {
+        let close = UiRect {
+            x: client_width - margin - 30.0 * scale,
+            y: row_y,
+            width: 30.0 * scale,
+            height: row_h,
+        };
+        let expand = UiRect {
+            x: close.x - gap - 30.0 * scale,
+            y: row_y,
+            width: 30.0 * scale,
+            height: row_h,
+        };
+        let label = UiRect {
+            x: expand.x - gap - 150.0 * scale,
+            y: row_y,
+            width: 150.0 * scale,
+            height: row_h,
+        };
+        (label, expand, close)
+    });
+
+    let right = match split {
+        Some((label, _, _)) => label.x - 6.0 * scale,
+        None => client_width - margin,
+    };
+    let private = UiRect {
+        x: right - 78.0 * scale,
+        y: row_y,
+        width: 78.0 * scale,
+        height: row_h,
+    };
+
+    RightControls { private, split }
+}
+
 struct ComparatorView {
     webview: WebView,
     name: &'static str,
@@ -564,12 +723,172 @@ struct ComparatorState {
     contexts: [Vec<String>; COMPARATOR_COLUMNS],
 }
 
+/// Janelas da palette nativa: o popup que desenha a caixa e o EDIT onde o
+/// utilizador escreve. A fonte e nossa e morre com o popup.
+struct PaletteWindow {
+    popup: HWND,
+    edit: HWND,
+    font: *mut core::ffi::c_void,
+}
+
+/// O que o procedimento do EDIT da palette precisa e nao pode ir buscar ao
+/// App. O App escreve aqui, ao abrir a palette, a coluna a que ela pertence
+/// e se essa coluna esta em privado; e daqui, e so daqui, que a submissao
+/// os le. A pagina remota nunca toca neste bloco -- e por isso que nao pode
+/// forjar nem o destino nem o texto. Numa Box para o endereco ficar estavel
+/// enquanto a subclasse o guardar.
+struct PaletteHost {
+    proxy: EventLoopProxy<UserEvent>,
+    /// (coluna, privado) da palette aberta; `None` quando nao ha nenhuma.
+    source: Cell<Option<(usize, bool)>>,
+    /// Sobe a cada abertura. O pedido de fecho traz o valor que viu: se a
+    /// palette entretanto ja e outra, o pedido vem de uma janela morta.
+    generation: Cell<u64>,
+}
+
+/// O que a barra precisa de saber sobre o comparador, tirado do proprio
+/// estado. Desenho e hit-testing chamam isto -- nunca montam o seu proprio.
+fn bar_columns(comp: &ComparatorState) -> BarColumns {
+    // Em ecra completo ou com a gaveta aberta o conteudo ja nao esta em
+    // faixas por peso, por isso a barra tambem nao finge que esta: reparte-se
+    // em partes iguais e nenhuma coluna vira chip.
+    if comp.expanded.is_some() || comp.split.is_some() {
+        return BarColumns {
+            split_active: comp.split.is_some(),
+            ..BarColumns::even(comp.views.len())
+        };
+    }
+    BarColumns {
+        count: comp.views.len(),
+        weights: comp.weights,
+        minimized: comp.minimized,
+        split_active: false,
+    }
+}
+
+/// Faixa horizontal de uma coluna visivel do comparador, em pixeis logicos.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ColumnSpan {
+    index: usize,
+    x: f64,
+    width: f64,
+}
+
+/// Reparte a largura pelas colunas nao minimizadas na proporcao dos pesos; a
+/// ultima fica com o resto para a soma fechar exatamente na largura. E a
+/// unica fonte desta geometria: as WebViews, os divisores e a palette leem
+/// todos daqui, por isso nunca discordam entre si.
+fn visible_column_spans(
+    logical_w: f64,
+    columns: usize,
+    weights: &[f64; COMPARATOR_COLUMNS],
+    minimized: &[bool; COMPARATOR_COLUMNS],
+) -> Vec<ColumnSpan> {
+    let visible: Vec<usize> = (0..columns.min(COMPARATOR_COLUMNS))
+        .filter(|index| !minimized[*index])
+        .collect();
+    let total_weight: f64 = visible
+        .iter()
+        .map(|index| weights[*index].max(0.05))
+        .sum::<f64>()
+        .max(0.05);
+    let mut x = 0.0;
+    visible
+        .iter()
+        .enumerate()
+        .map(|(slot, index)| {
+            let width = if slot + 1 == visible.len() {
+                logical_w - x
+            } else {
+                logical_w * weights[*index].max(0.05) / total_weight
+            };
+            let span = ColumnSpan {
+                index: *index,
+                x,
+                width,
+            };
+            x += width;
+            span
+        })
+        .collect()
+}
+
+/// Pesos novos depois de o divisor `divider` (entre as colunas visiveis
+/// `visible[divider]` e `visible[divider + 1]`) ser largado em `mouse_x`.
+/// So o par vizinho se mexe: a soma dos pesos nao muda, e por isso as outras
+/// colunas ficam exactamente onde estavam. O par nunca fecha abaixo de
+/// `MIN_PANEL_WIDTH` -- ou de 45% da faixa do par, se ela for mais estreita
+/// que dois minimos e um minimo fixo nao coubesse la dentro.
+fn resized_weights(
+    weights: &[f64; COMPARATOR_COLUMNS],
+    visible: &[usize],
+    divider: usize,
+    mouse_x: f64,
+    logical_w: f64,
+) -> [f64; COMPARATOR_COLUMNS] {
+    let mut next = *weights;
+    if divider + 1 >= visible.len() {
+        return next;
+    }
+    let total_weight: f64 = visible
+        .iter()
+        .map(|index| weights[*index].max(0.05))
+        .sum::<f64>()
+        .max(0.05);
+    let left_index = visible[divider];
+    let right_index = visible[divider + 1];
+    let before_weight: f64 = visible[..divider]
+        .iter()
+        .map(|index| weights[*index].max(0.05))
+        .sum();
+    let pair_weight = weights[left_index].max(0.05) + weights[right_index].max(0.05);
+    let left_edge = logical_w * before_weight / total_weight;
+    let pair_span = logical_w * pair_weight / total_weight;
+    if pair_span <= 1.0 {
+        return next;
+    }
+    let min_width = MIN_PANEL_WIDTH.min(pair_span * 0.45);
+    let left_width = (mouse_x - left_edge).clamp(min_width, pair_span - min_width);
+    let left_weight = pair_weight * left_width / pair_span;
+    next[left_index] = left_weight.max(0.05);
+    next[right_index] = (pair_weight - left_weight).max(0.05);
+    next
+}
+
+/// Geometria da palette (logicos) para a faixa da sua coluna: centrada nela,
+/// a uma fraccao fixa da altura util abaixo da barra, nunca mais larga que a
+/// coluna menos as margens.
+fn palette_geometry(span: ColumnSpan, logical_h: f64) -> UiRect {
+    let width = PALETTE_MAX_WIDTH
+        .min(span.width - 48.0)
+        .max(PALETTE_MIN_WIDTH);
+    let content_h = (logical_h - COMPARATOR_CHROME_HEIGHT).max(100.0);
+    UiRect {
+        x: span.x + (span.width - width) / 2.0,
+        y: COMPARATOR_CHROME_HEIGHT + content_h * PALETTE_TOP_RATIO,
+        width,
+        height: PALETTE_HEIGHT,
+    }
+}
+
+/// Legenda por baixo do campo: diz para onde vai cada tipo de entrada.
+fn palette_hint(source_name: &str, private: bool) -> String {
+    if private {
+        "URL → abre ao lado, em privado   ·   texto → pergunta em privado   ·   Esc fecha"
+            .to_string()
+    } else {
+        format!("URL → abre ao lado   ·   texto → envia para {source_name}   ·   Esc fecha")
+    }
+}
+
 const EM_SETSEL: u32 = 0x00B1;
 const EM_SETLIMITTEXT: u32 = 0x00C5;
 const EM_SETCUEBANNER: u32 = 0x1501;
 const EM_SETMARGINS: u32 = 0x00D3;
 const WM_CTLCOLOREDIT: u32 = 0x0133;
 const WM_ERASEBKGND: u32 = 0x0014;
+const WM_KILLFOCUS: u32 = 0x0008;
+const WM_CHAR: u32 = 0x0102;
 
 /// Instante de arranque, para termos milissegundos monotonos num AtomicU64.
 static START: OnceLock<Instant> = OnceLock::new();
@@ -608,6 +927,17 @@ const TAB_MENU_CLOSE_ALL: usize = 5;
 const SPLITTER_SUBCLASS_BASE: usize = 0x4E60;
 const SPLITTER_WIDTH: f64 = 7.0;
 const MIN_PANEL_WIDTH: f64 = 180.0;
+
+/// Ultima posicao pedida pelo arrasto de um divisor, e se ja ha um pedido por
+/// atender. O rato manda WM_MOUSEMOVE a mais de 100 Hz e cada um reposiciona
+/// tres WebView2: enfileirar um evento por movimento enche a fila de pedidos
+/// que nascem velhos e o divisor fica a arrastar-se atras do cursor. Em vez
+/// disso a subclasse escreve SEMPRE aqui a posicao mais recente e so acorda o
+/// event loop quando nao ha nenhum pedido pendente -- o que chega ao handler
+/// e o estado de agora, nao o de ha dez eventos.
+static RESIZE_DIVIDER: AtomicUsize = AtomicUsize::new(0);
+static RESIZE_X: AtomicI32 = AtomicI32::new(0);
+static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_MOUSEMOVE: u32 = 0x0200;
 
@@ -900,11 +1230,18 @@ unsafe extern "system" fn comparator_splitter_subclass(
                 let mut point = POINT { x: 0, y: 0 };
                 if GetCursorPos(&mut point) != 0 {
                     let divider = subclass_id.saturating_sub(SPLITTER_SUBCLASS_BASE);
-                    let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
-                    let _ = proxy.send_event(UserEvent::ResizeComparator {
-                        divider,
-                        screen_x: point.x,
-                    });
+                    // Publicar antes de marcar o pedido: quem for atende-lo ja
+                    // encontra a posicao nova.
+                    RESIZE_DIVIDER.store(divider, Ordering::Release);
+                    RESIZE_X.store(point.x, Ordering::Release);
+                    if !RESIZE_PENDING.swap(true, Ordering::AcqRel) {
+                        let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+                        if proxy.send_event(UserEvent::ResizeComparator).is_err() {
+                            // Ninguem vai limpar a marca; sem isto o arrasto
+                            // ficava mudo para sempre depois de um erro.
+                            RESIZE_PENDING.store(false, Ordering::Release);
+                        }
+                    }
                 }
             }
             return 0;
@@ -1051,6 +1388,143 @@ unsafe extern "system" fn omnibox_subclass(
         }
     }
 
+    DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+/// Popup da palette. Pinta a caixa e a legenda e da ao EDIT filho as cores
+/// da omnibox. E uma janela de topo propria pela mesma razao que o botao
+/// de sair: nada pintado pela janela principal aparece por cima do WebView2.
+unsafe extern "system" fn palette_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    _reference_data: usize,
+) -> LRESULT {
+    match message {
+        // STATIC devolve HTTRANSPARENT: o clique atravessava o popup e ia
+        // parar ao WebView por baixo, roubando o foco ao EDIT.
+        WM_NCHITTEST => HTCLIENT as LRESULT,
+        WM_CTLCOLOREDIT => {
+            let theme = Theme::system();
+            let hdc = wparam as *mut core::ffi::c_void;
+            SetTextColor(hdc, rgb3(theme.fg));
+            SetBkColor(hdc, rgb3(theme.surface));
+            omnibox_brush(theme.surface) as LRESULT
+        }
+        // O WM_PAINT cobre o cliente todo; apagar antes so faria piscar.
+        WM_ERASEBKGND => 1,
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut paint);
+            if !hdc.is_null() {
+                let mut client = RECT::default();
+                if GetClientRect(hwnd, &mut client) != 0 {
+                    let theme = Theme::system();
+                    let scale = ((client.bottom - client.top) as f64 / PALETTE_HEIGHT).max(1.0);
+
+                    // Rebordo de 1px: enche-se com a cor da linha e volta a
+                    // encher-se por dentro; a regiao arredondada trata dos cantos.
+                    let line = CreateSolidBrush(rgb3(theme.surface_line));
+                    FillRect(hdc, &client, line);
+                    DeleteObject(line as _);
+                    let border = scale.round().max(1.0) as i32;
+                    let inner = RECT {
+                        left: client.left + border,
+                        top: client.top + border,
+                        right: client.right - border,
+                        bottom: client.bottom - border,
+                    };
+                    let background = CreateSolidBrush(rgb3(theme.surface));
+                    FillRect(hdc, &inner, background);
+                    DeleteObject(background as _);
+
+                    let font = create_font((-11.0 * scale) as i32, FW_NORMAL as i32);
+                    let old_font = SelectObject(hdc, font as _);
+                    SetBkMode(hdc, TRANSPARENT as i32);
+                    SetTextColor(hdc, rgb3(theme.fg_muted));
+                    let text = PALETTE_HINT
+                        .lock()
+                        .map(|value| value.clone())
+                        .unwrap_or_default();
+                    let mut hint = RECT {
+                        left: (PALETTE_PAD_X * scale) as i32,
+                        top: (PALETTE_HINT_TOP * scale) as i32,
+                        right: client.right - (PALETTE_PAD_X * scale) as i32,
+                        bottom: client.bottom - (8.0 * scale) as i32,
+                    };
+                    draw_text(
+                        hdc,
+                        &text,
+                        &mut hint,
+                        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                    );
+                    SelectObject(hdc, old_font);
+                    DeleteObject(font as _);
+                }
+                EndPaint(hwnd, &paint);
+            }
+            0
+        }
+        _ => DefSubclassProc(hwnd, message, wparam, lparam),
+    }
+}
+
+/// EDIT da palette. So aqui se le o que o utilizador escreveu: o texto sai
+/// do controlo nativo com `window_text`, e a coluna e a privacidade vem do
+/// `PaletteHost` que o App preencheu ao abrir. Nenhum dos tres passa pela
+/// pagina, que nem sequer sabe que a palette existe.
+unsafe extern "system" fn palette_edit_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    reference_data: usize,
+) -> LRESULT {
+    let host = &*(reference_data as *const PaletteHost);
+    match message {
+        WM_KEYDOWN => {
+            let ctrl = (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;
+            match wparam as u16 {
+                VK_RETURN => {
+                    let input = window_text(hwnd);
+                    if let Some((source_index, private)) = host.source.get() {
+                        let _ = host.proxy.send_event(UserEvent::PaletteSubmit {
+                            source_index,
+                            input,
+                            private,
+                        });
+                    }
+                    return 0;
+                }
+                VK_ESCAPE => {
+                    let _ = host
+                        .proxy
+                        .send_event(UserEvent::ClosePalette(host.generation.get()));
+                    return 0;
+                }
+                // Um EDIT de uma linha nao trata Ctrl+A sozinho (ver omnibox).
+                0x41 if ctrl => {
+                    SendMessageW(hwnd, EM_SETSEL, 0, -1);
+                    return 0;
+                }
+                _ => {}
+            }
+        }
+        // O caracter de Enter/Escape ja foi tratado acima; deixa-lo chegar
+        // ao EDIT fazia o sistema apitar a cada submissao.
+        WM_CHAR if wparam == 13 || wparam == 27 => return 0,
+        // Clicar fora (no WebView, na barra, noutra janela) fecha a palette:
+        // nao fica uma caixa fantasma sobre uma coluna que entretanto mudou.
+        WM_KILLFOCUS => {
+            let _ = host
+                .proxy
+                .send_event(UserEvent::ClosePalette(host.generation.get()));
+        }
+        _ => {}
+    }
     DefSubclassProc(hwnd, message, wparam, lparam)
 }
 
@@ -1210,9 +1684,180 @@ impl DocumentWorker {
     }
 }
 
+/// Um prazo na fila de temporizadores. A ordem e a do prazo; a igualdade de
+/// prazos desempata pela ordem de chegada, para dois pedidos feitos no mesmo
+/// instante sairem na ordem em que foram feitos.
+struct TimerEntry<E> {
+    deadline: Instant,
+    seq: u64,
+    event: E,
+}
+
+impl<E> PartialEq for TimerEntry<E> {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.seq == other.seq
+    }
+}
+
+impl<E> Eq for TimerEntry<E> {}
+
+impl<E> PartialOrd for TimerEntry<E> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<E> Ord for TimerEntry<E> {
+    /// Invertida de proposito: o `BinaryHeap` e um max-heap e queremos que o
+    /// prazo MAIS PROXIMO fique no topo.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .deadline
+            .cmp(&self.deadline)
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+
+/// Fila de prazos, generica no evento para se poder testar sem `UserEvent`
+/// (que nao e `Ord` nem precisa de ser). Nao sabe nada de threads: quem a
+/// usa decide quando chamar `pop_due` e quanto dormir ate `next_deadline`.
+struct TimerQueue<E> {
+    heap: BinaryHeap<TimerEntry<E>>,
+    next_seq: u64,
+}
+
+impl<E> TimerQueue<E> {
+    fn new() -> Self {
+        Self {
+            heap: BinaryHeap::new(),
+            next_seq: 0,
+        }
+    }
+
+    fn push(&mut self, deadline: Instant, event: E) {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        self.heap.push(TimerEntry {
+            deadline,
+            seq,
+            event,
+        });
+    }
+
+    /// O prazo mais proximo, ou `None` com a fila vazia.
+    fn next_deadline(&self) -> Option<Instant> {
+        self.heap.peek().map(|entry| entry.deadline)
+    }
+
+    /// Retira o evento mais proximo se o seu prazo ja venceu em `now`. Um de
+    /// cada vez, para quem chama poder despachar entre chamadas.
+    fn pop_due(&mut self, now: Instant) -> Option<E> {
+        if self.heap.peek().is_some_and(|entry| entry.deadline <= now) {
+            self.heap.pop().map(|entry| entry.event)
+        } else {
+            None
+        }
+    }
+}
+
+/// Servico unico de temporizadores da interface. Antes, cada aviso, cada
+/// passo de zoom (`set_zoom` -> `show_splash`), cada sonda do Gmail e cada
+/// avanco da rolagem criava uma thread do sistema operativo so para dormir e
+/// devolver um evento; a barra em ecra completo tinha ainda uma thread a
+/// sondar de 300 em 300 ms. Agora ha UMA thread, `neural-timers`, que dorme
+/// exactamente ate ao prazo mais proximo e entrega o evento ao event loop. Os
+/// tokens de invalidacao continuam do lado de quem agenda: um evento que chega
+/// tarde e ignorado por quem o recebe, como sempre foi.
+struct Timers {
+    shared: Arc<(Mutex<TimerQueue<UserEvent>>, Condvar)>,
+    /// So para o fallback: a thread de servico tem a sua propria copia.
+    proxy: EventLoopProxy<UserEvent>,
+    alive: bool,
+}
+
+impl Timers {
+    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+        let shared = Arc::new((Mutex::new(TimerQueue::new()), Condvar::new()));
+        let worker = Arc::clone(&shared);
+        let worker_proxy = proxy.clone();
+
+        let spawned = thread::Builder::new()
+            .name("neural-timers".into())
+            .spawn(move || {
+                let (lock, wake) = &*worker;
+                loop {
+                    let due = {
+                        let mut queue =
+                            lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let now = Instant::now();
+                        let mut due = Vec::new();
+                        while let Some(event) = queue.pop_due(now) {
+                            due.push(event);
+                        }
+                        if due.is_empty() {
+                            // Dorme ate ao proximo prazo, ou ate alguem
+                            // agendar um; `after` acorda-nos para reavaliar,
+                            // porque o novo prazo pode ser mais proximo.
+                            match queue.next_deadline() {
+                                Some(deadline) => {
+                                    let _guard = wake
+                                        .wait_timeout(
+                                            queue,
+                                            deadline.saturating_duration_since(now),
+                                        )
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                }
+                                None => {
+                                    let _guard = wake
+                                        .wait(queue)
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                }
+                            }
+                        }
+                        due
+                    };
+                    // Fora do lock: `after` nunca fica a espera de uma entrega.
+                    for event in due {
+                        let _ = worker_proxy.send_event(event);
+                    }
+                }
+            });
+
+        Self {
+            shared,
+            proxy,
+            alive: spawned.is_ok(),
+        }
+    }
+
+    /// Entrega `event` ao event loop passado `delay`. Se a thread de servico
+    /// nao pode ser criada no arranque, recorre a uma thread excepcional por
+    /// pedido -- o comportamento antigo -- para nao deixar um aviso preso no
+    /// ecra; e o mesmo compromisso de `HistoryWriter::clear`.
+    fn after(&self, delay: Duration, event: UserEvent) {
+        if self.alive {
+            let (lock, wake) = &*self.shared;
+            let mut queue = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue.push(Instant::now() + delay, event);
+            wake.notify_one();
+            return;
+        }
+
+        let proxy = self.proxy.clone();
+        let _ = thread::Builder::new()
+            .name("neural-timer-fallback".into())
+            .spawn(move || {
+                thread::sleep(delay);
+                let _ = proxy.send_event(event);
+            });
+    }
+}
+
 enum HistoryCommand {
     Append(HistoryEntry),
     Clear,
+    /// Le as `n` entradas mais recentes e devolve-as por `HistoryLoaded`.
+    Recent(usize),
 }
 
 #[derive(Clone)]
@@ -1239,10 +1884,41 @@ impl HistoryWriter {
                             let result = worker_store.clear().map_err(|error| error.to_string());
                             let _ = worker_proxy.send_event(UserEvent::HistoryCleared(result));
                         }
+                        HistoryCommand::Recent(limit) => {
+                            let result = worker_store
+                                .recent(limit)
+                                .map_err(|error| error.to_string());
+                            let _ = worker_proxy.send_event(UserEvent::HistoryLoaded(result));
+                        }
                     }
                 }
             });
         Self { tx, store, proxy }
+    }
+
+    /// Ler o historico e lock + leitura do ficheiro inteiro: nao se faz no
+    /// event loop. Como em `clear`, o pedido nao pode ser perdido -- o
+    /// utilizador esta a espera da caixa -- por isso, com o worker saturado,
+    /// recorre-se a uma thread excepcional; so se essa tambem falhar e que o
+    /// erro volta ja, para ser mostrado no lugar da lista.
+    fn recent(&self, limit: usize) -> Option<Result<Vec<HistoryEntry>, String>> {
+        if self.tx.try_send(HistoryCommand::Recent(limit)).is_ok() {
+            return None;
+        }
+
+        let store = self.store.clone();
+        let proxy = self.proxy.clone();
+        match thread::Builder::new()
+            .name("neural-history-recent".into())
+            .spawn(move || {
+                let result = store.recent(limit).map_err(|error| error.to_string());
+                let _ = proxy.send_event(UserEvent::HistoryLoaded(result));
+            }) {
+            Ok(_) => None,
+            Err(error) => Some(Err(format!(
+                "não consegui criar a thread de leitura: {error}"
+            ))),
+        }
     }
 
     /// Nunca faz I/O no event loop. Sob saturacao, perder uma entrada e menos
@@ -1423,7 +2099,15 @@ struct UiRect {
 
 impl UiRect {
     fn contains(self, x: f64, y: f64) -> bool {
-        x >= self.x && x <= self.x + self.width && y >= self.y && y <= self.y + self.height
+        // Um rectangulo sem area nao contem nada. As caixas por preencher da
+        // barra ficam em (0,0) com lado zero e, sem esta guarda, o canto
+        // superior esquerdo da janela acertava em todas elas ao mesmo tempo.
+        self.width > 0.0
+            && self.height > 0.0
+            && x >= self.x
+            && x <= self.x + self.width
+            && y >= self.y
+            && y <= self.y + self.height
     }
 }
 
@@ -1489,9 +2173,11 @@ struct App {
     chrome_revealed: bool,
     chrome_token: u64,
     /// Prazo de vida da barra, em milissegundos monotonos. Cada movimento do
-    /// rato empurra-o; a thread de vigia le-o. Antes era uma thread do sistema
-    /// operativo POR CADA evento de rato -- centenas vivas ao mesmo tempo.
-    chrome_deadline: Arc<AtomicU64>,
+    /// rato empurra-o sem agendar nada; quando o `HideChrome` agendado chega,
+    /// `hide_chrome` compara com isto e reagenda so o que falta. Antes era uma
+    /// thread do sistema operativo POR CADA evento de rato, depois uma thread
+    /// de vigia a sondar de 300 em 300 ms; agora e so um numero.
+    chrome_deadline: u64,
     exit_button: Option<HWND>,
     splitters: [Option<HWND>; COMPARATOR_COLUMNS - 1],
     auto_scroll: bool,
@@ -1514,10 +2200,16 @@ struct App {
     omnibox_font: Option<*mut core::ffi::c_void>,
     omnibox_font_height: i32,
     omnibox_proxy: Box<EventLoopProxy<UserEvent>>,
+    /// Popup nativo da palette (Ctrl+K/T ou +), so enquanto esta aberta.
+    palette: Option<PaletteWindow>,
+    /// Estado nativo lido pela subclasse do EDIT da palette.
+    palette_host: Box<PaletteHost>,
     config: CoreConfig,
-    history_store: HistoryStore,
     history: HistoryWriter,
     memory: MemoryWorker,
+    /// Todos os prazos da interface (avisos, sondas, rolagem, barra) passam
+    /// por aqui: uma thread para a aplicacao inteira.
+    timers: Timers,
     current_research: Option<ResearchSession>,
     active_agent: Option<BrowserAgentState>,
     reader: ReaderWorker,
@@ -1533,6 +2225,13 @@ struct App {
     /// Proximo frame da rede neural nativa da Home. Nao existe WebView nem
     /// rede por tras do efeito: e apenas GDI, limitado a ~15 FPS.
     next_home_frame: Instant,
+    /// Janela inteiramente tapada por outra (ou minimizada), segundo o
+    /// `WindowEvent::Occluded`. Animar nesse estado e gastar bateria a pintar
+    /// pixeis que ninguem chega a ver.
+    home_occluded: bool,
+    /// Janela com o foco do teclado (`WindowEvent::Focused`). Em segundo plano
+    /// a animacao continua, mas devagar.
+    home_focused: bool,
 }
 
 impl App {
@@ -1540,8 +2239,9 @@ impl App {
         let config = CoreConfig::default();
         let history_store =
             HistoryStore::with_limit(config.data_dir.join("history.jsonl"), config.history_limit);
-        let history = HistoryWriter::new(history_store.clone(), proxy.clone());
+        let history = HistoryWriter::new(history_store, proxy.clone());
         let memory = MemoryWorker::new(config.data_dir.join("memory"), proxy.clone());
+        let timers = Timers::new(proxy.clone());
         let reader_client = ReaderClient::new(config.reader_timeout_secs, config.reader_max_bytes);
         let navigation_generation = Arc::new(AtomicU64::new(0));
         let reader = ReaderWorker::new(
@@ -1550,6 +2250,11 @@ impl App {
             Arc::clone(&navigation_generation),
         );
         let omnibox_proxy = Box::new(proxy.clone());
+        let palette_host = Box::new(PaletteHost {
+            proxy: proxy.clone(),
+            source: Cell::new(None),
+            generation: Cell::new(0),
+        });
         let document = DocumentWorker::new(
             ReaderClient::new(PDF_TIMEOUT_SECS, PDF_MAX_BYTES),
             proxy.clone(),
@@ -1566,7 +2271,7 @@ impl App {
             bar_hover: None,
             chrome_revealed: false,
             chrome_token: 0,
-            chrome_deadline: Arc::new(AtomicU64::new(0)),
+            chrome_deadline: 0,
             exit_button: None,
             splitters: [None; COMPARATOR_COLUMNS - 1],
             // Ligada por omissao: a aplicacao serve para ler.
@@ -1588,10 +2293,12 @@ impl App {
             omnibox_font: None,
             omnibox_font_height: 0,
             omnibox_proxy,
+            palette: None,
+            palette_host,
             config,
-            history_store,
             history,
             memory,
+            timers,
             current_research: None,
             active_agent: None,
             reader,
@@ -1600,6 +2307,9 @@ impl App {
             status: None,
             cursor: (-1.0, -1.0),
             next_home_frame: Instant::now(),
+            // A janela nasce visivel e com foco; os eventos corrigem se nao for.
+            home_occluded: false,
+            home_focused: true,
         }
     }
 
@@ -1650,6 +2360,52 @@ impl App {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    /// A janela ganhou ou perdeu o foco do teclado: muda o ritmo da animacao
+    /// da Home (66 ms com foco, 250 ms sem) e arruma as janelas auxiliares,
+    /// que so fazem sentido enquanto a app esta a frente.
+    fn on_focus_changed(&mut self, focused: bool) {
+        if self.home_focused == focused {
+            return;
+        }
+        self.home_focused = focused;
+        if focused {
+            self.resume_home_animation();
+            // Os popups owned reaparecem com o dono, mas a geometria pode ter
+            // mudado enquanto estivemos fora (outro ecra, outro DPI, outra
+            // maximizacao), por isso recalcula-se em vez de se confiar nela.
+            self.sync_comparator_splitters();
+            self.sync_exit_button();
+            return;
+        }
+        // Sem foco nao ha o que arrastar nem de onde sair: as auxiliares que
+        // so servem o rato saem da frente ate a janela voltar.
+        self.hide_comparator_splitters();
+        self.hide_exit_button();
+    }
+
+    /// A janela ficou inteiramente tapada (ou deixou de estar). Enquanto esta
+    /// tapada nao se pinta nada.
+    fn on_occluded_changed(&mut self, occluded: bool) {
+        if self.home_occluded == occluded {
+            return;
+        }
+        self.home_occluded = occluded;
+        if !occluded {
+            self.resume_home_animation();
+        }
+    }
+
+    /// Ao voltar a ser vista, a Home repinta ja: o prazo do frame seguinte
+    /// pode ter ficado a 250 ms de distancia, e esperar por ele daria a
+    /// sensacao de uma janela congelada.
+    fn resume_home_animation(&mut self) {
+        if self.surface != Surface::Home {
+            return;
+        }
+        self.next_home_frame = Instant::now();
+        self.request_redraw();
     }
 
     fn create_omnibox(&mut self) {
@@ -1816,6 +2572,7 @@ impl App {
 
     fn destroy_web_surfaces(&mut self) {
         self.mark_dirty();
+        self.close_palette();
         self.finish_agent(false);
         self.leave_fullscreen();
         if let Some(window) = &self.window {
@@ -1889,8 +2646,16 @@ impl App {
         );
     }
 
+    /// Pede a lista ao worker; a caixa aparece quando `HistoryLoaded` voltar.
+    /// A leitura (lock + ficheiro inteiro) nunca corre no event loop.
     fn show_recent_history(&self) {
-        let text = match self.history_store.recent(20) {
+        if let Some(result) = self.history.recent(HISTORY_RECENT_LIMIT) {
+            self.show_history_entries(result);
+        }
+    }
+
+    fn show_history_entries(&self, result: Result<Vec<HistoryEntry>, String>) {
+        let text = match result {
             Ok(entries) if entries.is_empty() => "Histórico local vazio.".to_string(),
             Ok(entries) => entries
                 .into_iter()
@@ -3027,32 +3792,19 @@ impl App {
                 }
             }
             None => {
-                let visible: Vec<usize> = comp
-                    .views
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, _)| (!comp.minimized[index]).then_some(index))
-                    .collect();
-                let total_weight: f64 = visible
-                    .iter()
-                    .map(|index| comp.weights[*index].max(0.05))
-                    .sum::<f64>()
-                    .max(0.05);
-                let mut col_x = 0.0;
-
-                for (slot, index) in visible.iter().enumerate() {
-                    let v = &comp.views[*index];
-                    let actual_w = if slot == visible.len() - 1 {
-                        logical_w - col_x
-                    } else {
-                        logical_w * comp.weights[*index].max(0.05) / total_weight
-                    };
+                let spans = visible_column_spans(
+                    logical_w,
+                    comp.views.len(),
+                    &comp.weights,
+                    &comp.minimized,
+                );
+                for span in &spans {
+                    let v = &comp.views[span.index];
                     let _ = v.webview.set_bounds(wry::Rect {
-                        position: LogicalPosition::new(col_x, content_y).into(),
-                        size: LogicalSize::new(actual_w.max(1.0), content_h).into(),
+                        position: LogicalPosition::new(span.x, content_y).into(),
+                        size: LogicalSize::new(span.width.max(1.0), content_h).into(),
                     });
                     let _ = v.webview.set_visible(true);
-                    col_x += actual_w;
                 }
 
                 for (index, v) in comp.views.iter().enumerate() {
@@ -3075,7 +3827,7 @@ impl App {
         let navigation_capability = capability.clone();
 
         let init_script = format!(
-            "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{NEURALIA_PALETTE_SCRIPT}\n{AI_AUTO_SUBMIT_SCRIPT}\n{COMPARATOR_INJECT_SCRIPT}"
+            "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{AI_AUTO_SUBMIT_SCRIPT}\n{COMPARATOR_INJECT_SCRIPT}"
         )
         .replace("__NEURALIA_CAP__", &capability);
 
@@ -3112,17 +3864,11 @@ impl App {
                     return false;
                 }
                 if target.starts_with("neuralia:palette") {
-                    if remote_capability_matches(&target, &navigation_capability)
-                        && let (Some(col), Some(input)) = (
-                            neuralia_query_param(&target, "col"),
-                            neuralia_query_param(&target, "q"),
-                        )
-                        && let Ok(source_index) = col.parse::<usize>()
-                    {
-                        let _ = navigation_proxy.send_event(UserEvent::PaletteSubmit {
-                            source_index,
-                            input,
-                        });
+                    // A pagina so pede a abertura. A coluna e a deste WebView,
+                    // nao a que o pedido diz; o texto vai ser escrito num
+                    // controlo nativo que a pagina nem ve.
+                    if remote_capability_matches(&target, &navigation_capability) {
+                        let _ = navigation_proxy.send_event(UserEvent::OpenPalette(col_index));
                     }
                     return false;
                 }
@@ -3206,7 +3952,7 @@ impl App {
         let capability = remote_capability();
         let navigation_capability = capability.clone();
         let init_script = format!(
-            "window.__neuralia_col_index = {source_index}; window.__neuralia_col_name = '{source_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{NEURALIA_PALETTE_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}"
+            "window.__neuralia_col_index = {source_index}; window.__neuralia_col_name = '{source_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}"
         )
         .replace("__NEURALIA_CAP__", &capability);
 
@@ -3227,13 +3973,10 @@ impl App {
                     return false;
                 }
                 if target.starts_with("neuralia:palette") {
-                    if remote_capability_matches(&target, &navigation_capability)
-                        && let Some(input) = neuralia_query_param(&target, "q")
-                    {
-                        let _ = navigation_proxy.send_event(UserEvent::PaletteSubmit {
-                            source_index,
-                            input,
-                        });
+                    // Pedido de abertura vindo da fonte ao lado: abre sobre a
+                    // coluna que a originou; a privacidade e decidida no App.
+                    if remote_capability_matches(&target, &navigation_capability) {
+                        let _ = navigation_proxy.send_event(UserEvent::OpenPalette(source_index));
                     }
                     return false;
                 }
@@ -3424,15 +4167,7 @@ impl App {
 
     fn new_tab(&mut self, source_index: usize) {
         if self.surface == Surface::Comparator {
-            let index = source_index.min(COMPARATOR_COLUMNS - 1);
-            if let Some(comp) = &mut self.comparator
-                && comp.minimized[index]
-            {
-                comp.minimized[index] = false;
-            }
-            self.update_comparator_layout();
-            self.sync_comparator_splitters();
-            self.open_ai_palette(index);
+            self.open_ai_palette(source_index.min(COMPARATOR_COLUMNS - 1));
         } else {
             self.focus_omnibox();
         }
@@ -3482,25 +4217,43 @@ impl App {
         self.request_redraw();
     }
 
-    fn submit_palette(&mut self, source_index: usize, input: String) {
-        let input = input.trim();
-        if input.is_empty() {
-            return;
+    /// URL de pergunta do fornecedor da coluna.
+    fn provider_query_url(&self, source_index: usize, query: &str) -> neural_core::Result<Url> {
+        match source_index {
+            0 => google_ai_url(query, &self.config.language),
+            1 => chatgpt_search_url(query),
+            _ => claude_search_url(query),
         }
+    }
 
-        match parse_intent(input) {
-            Ok(Intent::Read(url)) | Ok(Intent::Web(url)) => {
-                self.open_split(source_index, url.to_string(), true);
+    /// Entrada da palette nativa. `source_index` e `private` vem do estado
+    /// nativo escrito ao abrir a palette, nunca da pagina; a decisao de rota
+    /// e pura (`route_palette`) e testada sem janela.
+    fn submit_palette(&mut self, source_index: usize, input: String, private: bool) {
+        match route_palette(&input, source_index, private) {
+            PaletteRoute::Invalid(message) => {
+                if let Some(message) = message {
+                    self.show_splash(message, 3);
+                }
             }
-            Ok(Intent::Home) => self.show_home(),
-            Ok(Intent::Ask(query)) | Ok(Intent::Compare(query)) => {
-                let target = match source_index {
-                    0 => google_ai_url(&query, &self.config.language),
-                    1 => chatgpt_search_url(&query),
-                    2 => claude_search_url(&query),
-                    _ => return,
-                };
-                match target {
+            PaletteRoute::Home => self.show_home(),
+            // allow_local: a URL foi digitada num controlo nativo, e entrada
+            // do utilizador e nao da pagina (SPEC-0015). Em privado a fonte
+            // abre privada: open_split_mode(private) nao grava memoria nem
+            // abas.
+            PaletteRoute::OpenSplit { url, private } => {
+                self.open_split_mode(source_index, url.to_string(), true, private);
+            }
+            // Painel privado: a pergunta abre como fonte privada, nunca na
+            // coluna normal (cookies normais) e nunca no historico.
+            PaletteRoute::OpenPrivateProvider { query } => {
+                match self.provider_query_url(source_index, &query) {
+                    Ok(url) => self.open_split_mode(source_index, url.to_string(), false, true),
+                    Err(error) => self.show_splash(error.to_string(), 3),
+                }
+            }
+            PaletteRoute::LoadProvider { query } => {
+                match self.provider_query_url(source_index, &query) {
                     Ok(url) => {
                         if let Some(view) = self
                             .comparator
@@ -3514,7 +4267,6 @@ impl App {
                     Err(error) => self.show_splash(error.to_string(), 3),
                 }
             }
-            Err(error) => self.show_splash(error.to_string(), 3),
         }
     }
 
@@ -3602,11 +4354,16 @@ impl App {
             *slot = text;
         }
 
-        let splash = match self.splash {
-            Some(splash) => splash,
-            None => unsafe {
+        if self.splash.is_none() {
+            unsafe {
+                // Popup OWNED pela janela principal (`owner` em hWndParent), e
+                // nao filha nem TOPMOST. Uma janela owned fica sempre acima do
+                // dono e das filhas dele -- o WebView2 incluido -- e some com
+                // ele quando a app vai para tras; o TOPMOST que aqui estava
+                // punha este aviso por cima de TODAS as aplicacoes depois de
+                // um Alt+Tab, que nunca foi o que se queria.
                 let created = CreateWindowExW(
-                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                     windows_sys::w!("STATIC"),
                     windows_sys::w!(""),
                     WS_POPUP | WS_VISIBLE,
@@ -3638,16 +4395,37 @@ impl App {
                     SetWindowRgn(created, region, 1);
                 }
                 self.splash = Some(created);
-                created
-            },
+            }
+        }
+
+        self.position_splash();
+
+        self.splash_token = self.splash_token.wrapping_add(1);
+        self.timers.after(
+            Duration::from_secs(seconds),
+            UserEvent::HideSplash(self.splash_token),
+        );
+    }
+
+    /// Centra o aviso no fundo da janela. Vive em coordenadas de ECRA: se
+    /// so se calculasse ao nascer, arrastar a janela deixava-o para tras.
+    fn position_splash(&self) {
+        let (Some(window), Some(splash)) = (&self.window, self.splash) else {
+            return;
         };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
+        let width = (SPLASH_WIDTH * scale).round() as i32;
+        let height = (SPLASH_HEIGHT * scale).round() as i32;
 
         let mut client = RECT::default();
         unsafe {
             if GetClientRect(owner, &mut client) == 0 {
                 return;
             }
-            let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+            let mut origin = POINT { x: 0, y: 0 };
             ClientToScreen(owner, &mut origin);
             SetWindowPos(
                 splash,
@@ -3661,16 +4439,6 @@ impl App {
             ShowWindow(splash, SW_SHOW);
             InvalidateRect(splash, std::ptr::null(), 1);
         }
-
-        self.splash_token = self.splash_token.wrapping_add(1);
-        let token = self.splash_token;
-        let proxy = self.proxy.clone();
-        let _ = thread::Builder::new()
-            .name("neural-splash".into())
-            .spawn(move || {
-                thread::sleep(Duration::from_secs(seconds));
-                let _ = proxy.send_event(UserEvent::HideSplash(token));
-            });
     }
 
     fn hide_splash(&mut self, token: u64) {
@@ -3709,11 +4477,14 @@ impl App {
             *slot = body;
         }
 
-        let toast = match self.gmail_toast {
-            Some(toast) => toast,
-            None => unsafe {
+        if self.gmail_toast.is_none() {
+            unsafe {
+                // Owned pela janela principal, como o splash: sobe acima do
+                // WebView2 por ser owned, e nao acima do resto do ambiente de
+                // trabalho -- um aviso de email nosso nao tem nada que tapar a
+                // aplicacao de outra pessoa.
                 let created = CreateWindowExW(
-                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                     windows_sys::w!("STATIC"),
                     windows_sys::w!(""),
                     WS_POPUP | WS_VISIBLE,
@@ -3744,16 +4515,37 @@ impl App {
                     SetWindowRgn(created, region, 1);
                 }
                 self.gmail_toast = Some(created);
-                created
-            },
+            }
+        }
+
+        self.position_gmail_toast();
+
+        self.gmail_toast_token = self.gmail_toast_token.wrapping_add(1);
+        self.timers.after(
+            Duration::from_secs(GMAIL_TOAST_SECONDS),
+            UserEvent::HideGmailToast(self.gmail_toast_token),
+        );
+    }
+
+    /// Encosta o aviso ao canto inferior direito da janela. Como o splash,
+    /// tem de ser refeito sempre que a janela se mexe.
+    fn position_gmail_toast(&self) {
+        let (Some(window), Some(toast)) = (&self.window, self.gmail_toast) else {
+            return;
         };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
+        let width = (GMAIL_TOAST_WIDTH * scale).round() as i32;
+        let height = (GMAIL_TOAST_HEIGHT * scale).round() as i32;
 
         let mut client = RECT::default();
         unsafe {
             if GetClientRect(owner, &mut client) == 0 {
                 return;
             }
-            let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+            let mut origin = POINT { x: 0, y: 0 };
             ClientToScreen(owner, &mut origin);
             let margin = (18.0 * scale) as i32;
             SetWindowPos(
@@ -3768,16 +4560,6 @@ impl App {
             ShowWindow(toast, SW_SHOW);
             InvalidateRect(toast, std::ptr::null(), 1);
         }
-
-        self.gmail_toast_token = self.gmail_toast_token.wrapping_add(1);
-        let token = self.gmail_toast_token;
-        let proxy = self.proxy.clone();
-        let _ = thread::Builder::new()
-            .name("neural-gmail-toast".into())
-            .spawn(move || {
-                thread::sleep(Duration::from_secs(7));
-                let _ = proxy.send_event(UserEvent::HideGmailToast(token));
-            });
     }
 
     fn hide_gmail_toast(&mut self, token: u64) {
@@ -3815,22 +4597,23 @@ impl App {
     }
 
     fn schedule_gmail_probe(&mut self, seconds: u64) {
-        if self.gmail_monitor.is_some() {
+        // Desligado por NEURALIA_NO_GMAIL nem se sonda: a sonda le cookies e
+        // acabaria por criar o WebView que a variavel promete nao existir.
+        if self.gmail_monitor.is_some() || !gmail_monitor_enabled() {
             return;
         }
         self.gmail_probe_token = self.gmail_probe_token.wrapping_add(1);
-        let token = self.gmail_probe_token;
-        let proxy = self.proxy.clone();
-        let _ = thread::Builder::new()
-            .name("neural-gmail-probe".into())
-            .spawn(move || {
-                thread::sleep(Duration::from_secs(seconds));
-                let _ = proxy.send_event(UserEvent::GmailProbe(token));
-            });
+        self.timers.after(
+            Duration::from_secs(seconds),
+            UserEvent::GmailProbe(self.gmail_probe_token),
+        );
     }
 
     fn maybe_start_gmail_monitor(&mut self) {
-        if self.gmail_monitor.is_some() || !self.google_session_available() {
+        if self.gmail_monitor.is_some()
+            || !gmail_monitor_enabled()
+            || !self.google_session_available()
+        {
             return;
         }
         let Some(window) = &self.window else {
@@ -3884,6 +4667,10 @@ impl App {
     }
 
     fn handle_gmail_state(&mut self, unread: u32, sender: String, subject: String, key: String) {
+        // O corte do script nao conta: ele corre em mail.google.com.
+        let sender = gmail_field(sender);
+        let subject = gmail_field(subject);
+        let key = gmail_field(key);
         let notify = gmail_is_new_mail(
             self.gmail_last_unread,
             self.gmail_last_key.as_deref(),
@@ -4059,14 +4846,10 @@ impl App {
     }
 
     fn schedule_auto_scroll_in(&self, seconds: u64) {
-        let proxy = self.proxy.clone();
-        let token = self.auto_scroll_token;
-        let _ = thread::Builder::new()
-            .name("neural-autoscroll".into())
-            .spawn(move || {
-                thread::sleep(Duration::from_secs(seconds));
-                let _ = proxy.send_event(UserEvent::AutoScrollTick(token));
-            });
+        self.timers.after(
+            Duration::from_secs(seconds),
+            UserEvent::AutoScrollTick(self.auto_scroll_token),
+        );
     }
 
     fn auto_scroll_tick(&mut self, token: u64) {
@@ -4204,7 +4987,7 @@ impl App {
             window.inner_size().width as f64,
             window.scale_factor(),
             self.bar_visible(),
-            comp.views.len(),
+            bar_columns(comp),
             std::array::from_fn(|index| comp.contexts[index].len()),
         ))
     }
@@ -4237,13 +5020,15 @@ impl App {
         let width = (EXIT_BUTTON_WIDTH * scale).round() as i32;
         let height = (EXIT_BUTTON_HEIGHT * scale).round() as i32;
 
-        let button = match self.exit_button {
-            Some(button) => button,
-            None => unsafe {
-                // Janela de topo, e nao filha: uma janela filha ficaria por
-                // baixo do WebView2 na ordem Z e nunca se veria.
+        if self.exit_button.is_none() {
+            unsafe {
+                // Popup owned pela janela principal, e nao filha: uma filha
+                // ficaria por baixo do WebView2 na ordem Z e nunca se veria.
+                // Ser owned ja garante o lugar acima do dono e das filhas
+                // dele; o TOPMOST so acrescentava ficar por cima das outras
+                // aplicacoes depois de um Alt+Tab.
                 let created = CreateWindowExW(
-                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                     windows_sys::w!("STATIC"),
                     windows_sys::w!(""),
                     WS_POPUP | WS_VISIBLE,
@@ -4275,17 +5060,31 @@ impl App {
                     SetWindowRgn(created, region, 1);
                 }
                 self.exit_button = Some(created);
-                created
-            },
-        };
+            }
+        }
 
-        // Centrado no topo, logo abaixo da barra revelada.
+        self.position_exit_button();
+    }
+
+    /// Centrado no topo, logo abaixo da barra revelada. Em coordenadas de
+    /// ecra, como as outras auxiliares: tem de seguir a janela que se arrasta.
+    fn position_exit_button(&self) {
+        let (Some(window), Some(button)) = (&self.window, self.exit_button) else {
+            return;
+        };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
+        let width = (EXIT_BUTTON_WIDTH * scale).round() as i32;
+        let height = (EXIT_BUTTON_HEIGHT * scale).round() as i32;
+
         let mut client = RECT::default();
         unsafe {
             if GetClientRect(owner, &mut client) == 0 {
                 return;
             }
-            let mut origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+            let mut origin = POINT { x: 0, y: 0 };
             ClientToScreen(owner, &mut origin);
             let top = ((COMPARATOR_CHROME_HEIGHT + 10.0) * scale).round() as i32;
             SetWindowPos(
@@ -4301,12 +5100,22 @@ impl App {
         }
     }
 
+    /// Esconde o botao sem o destruir. Serve a perda de foco: a janela volta
+    /// e o `sync_exit_button` decide de novo, sem recriar nada entretanto.
+    fn hide_exit_button(&self) {
+        if let Some(button) = self.exit_button {
+            unsafe {
+                ShowWindow(button, SW_HIDE);
+            }
+        }
+    }
+
     /// Mostra a barra e marca-a para desaparecer sozinha. Cada chamada invalida
     /// o temporizador anterior, por isso ela fica enquanto o rato la andar.
     fn reveal_chrome(&mut self) {
-        // Adiar e so escrever um numero; nao ha thread nenhuma envolvida.
-        self.chrome_deadline
-            .store(now_ms() + 2500, Ordering::SeqCst);
+        // Adiar e so escrever um numero; o rato mexe-se centenas de vezes por
+        // segundo e nao se agenda nada por movimento.
+        self.chrome_deadline = now_ms() + CHROME_HIDE_DELAY_MS;
 
         if self.chrome_revealed {
             return;
@@ -4314,23 +5123,10 @@ impl App {
 
         self.chrome_revealed = true;
         self.chrome_token = self.chrome_token.wrapping_add(1);
-
-        let proxy = self.proxy.clone();
-        let token = self.chrome_token;
-        let deadline = Arc::clone(&self.chrome_deadline);
-        let _ = thread::Builder::new()
-            .name("neural-chrome".into())
-            .spawn(move || {
-                loop {
-                    let now = now_ms();
-                    let target = deadline.load(Ordering::SeqCst);
-                    if now >= target {
-                        let _ = proxy.send_event(UserEvent::HideChrome(token));
-                        return;
-                    }
-                    thread::sleep(Duration::from_millis((target - now).min(300)));
-                }
-            });
+        self.timers.after(
+            Duration::from_millis(CHROME_HIDE_DELAY_MS),
+            UserEvent::HideChrome(self.chrome_token),
+        );
 
         self.update_comparator_layout();
         self.sync_exit_button();
@@ -4339,6 +5135,16 @@ impl App {
 
     fn hide_chrome(&mut self, token: u64) {
         if token != self.chrome_token || !self.chrome_revealed {
+            return;
+        }
+        // O rato empurrou o prazo desde que este pedido foi agendado: em vez
+        // de sondar, reagenda-se exactamente o que falta, com o mesmo token.
+        let remaining = self.chrome_deadline.saturating_sub(now_ms());
+        if remaining > 0 {
+            self.timers.after(
+                Duration::from_millis(remaining),
+                UserEvent::HideChrome(token),
+            );
             return;
         }
         self.chrome_revealed = false;
@@ -4357,15 +5163,18 @@ impl App {
     }
 
     fn sync_comparator_splitters(&mut self) {
-        // Comece sempre escondendo todas as janelas de divisor. Assim uma
-        // transicao 3 -> 2 -> 1 colunas, ou Comparator -> Split View, nunca
-        // deixa um splitter da geometria anterior visivel.
-        self.hide_comparator_splitters();
-
+        // Todo o divisor que nao couber na geometria de agora e escondido
+        // abaixo, um a um: uma transicao 3 -> 2 -> 1 colunas, ou Comparator
+        // -> Split View, nunca deixa um splitter da geometria anterior a
+        // vista. Antes escondiam-se todos aqui em cima e mostravam-se logo a
+        // seguir -- o que piscava a cada WM_MOVE agora que esta funcao
+        // tambem corre quando a janela e arrastada.
         let Some(window) = &self.window else {
+            self.hide_comparator_splitters();
             return;
         };
         let Some(owner) = window_hwnd(window) else {
+            self.hide_comparator_splitters();
             return;
         };
 
@@ -4377,26 +5186,15 @@ impl App {
             let show = self.surface == Surface::Comparator
                 && comp.split.is_none()
                 && comp.expanded.is_none();
-            let visible: Vec<usize> = comp
-                .views
+            // Um divisor por fronteira entre colunas visiveis: o fim de cada
+            // faixa menos a ultima, na mesma geometria que as WebViews usam.
+            let spans =
+                visible_column_spans(logical_w, comp.views.len(), &comp.weights, &comp.minimized);
+            let boundaries: Vec<f64> = spans
                 .iter()
-                .enumerate()
-                .filter_map(|(index, _)| (!comp.minimized[index]).then_some(index))
+                .take(spans.len().saturating_sub(1))
+                .map(|span| span.x + span.width)
                 .collect();
-            let total_weight: f64 = visible
-                .iter()
-                .map(|index| comp.weights[*index].max(0.05))
-                .sum::<f64>()
-                .max(0.05);
-            let mut boundaries = Vec::new();
-            let mut x = 0.0;
-            for (slot, index) in visible.iter().enumerate() {
-                if slot + 1 == visible.len() {
-                    break;
-                }
-                x += logical_w * comp.weights[*index].max(0.05) / total_weight;
-                boundaries.push(x);
-            }
             (
                 show,
                 boundaries,
@@ -4414,6 +5212,11 @@ impl App {
 
         for slot in 0..self.splitters.len() {
             if !show || slot >= boundaries.len() {
+                if let Some(hwnd) = self.splitters[slot] {
+                    unsafe {
+                        ShowWindow(hwnd, SW_HIDE);
+                    }
+                }
                 continue;
             }
 
@@ -4422,8 +5225,12 @@ impl App {
                 None => unsafe {
                     let width = (SPLITTER_WIDTH * scale).round().max(3.0) as i32;
                     let height = (content_height * scale).round().max(1.0) as i32;
+                    // Owned pela janela principal: e o que o poe acima dos
+                    // WebView2 (filhas do dono) sem o pousar sobre o ambiente
+                    // de trabalho inteiro. Um divisor a flutuar por cima de
+                    // outra aplicacao era o que o TOPMOST daqui fazia.
                     let created = CreateWindowExW(
-                        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                         windows_sys::w!("STATIC"),
                         windows_sys::w!(""),
                         WS_POPUP | WS_VISIBLE,
@@ -4506,93 +5313,38 @@ impl App {
         let logical_w = window.inner_size().width as f64 / scale;
         let mouse_x = (point.x as f64 / scale).clamp(0.0, logical_w);
 
-        let total_weight: f64 = visible
-            .iter()
-            .map(|index| comp.weights[*index].max(0.05))
-            .sum::<f64>()
-            .max(0.05);
-        let left_index = visible[divider];
-        let right_index = visible[divider + 1];
-        let before_weight: f64 = visible[..divider]
-            .iter()
-            .map(|index| comp.weights[*index].max(0.05))
-            .sum();
-        let pair_weight = comp.weights[left_index].max(0.05) + comp.weights[right_index].max(0.05);
-        let left_edge = logical_w * before_weight / total_weight;
-        let pair_span = logical_w * pair_weight / total_weight;
-        if pair_span <= 1.0 {
-            return;
-        }
-        let min_width = MIN_PANEL_WIDTH.min(pair_span * 0.45);
-        let left_width = (mouse_x - left_edge).clamp(min_width, pair_span - min_width);
-        let left_weight = pair_weight * left_width / pair_span;
-        comp.weights[left_index] = left_weight.max(0.05);
-        comp.weights[right_index] = (pair_weight - left_weight).max(0.05);
+        comp.weights = resized_weights(&comp.weights, &visible, divider, mouse_x, logical_w);
 
         self.update_comparator_layout();
         self.sync_comparator_splitters();
         self.request_redraw();
     }
 
-    fn private_bar_rect(&self) -> Option<UiRect> {
+    /// Controlos da direita tal como estao desenhados AGORA, ou `None` se a
+    /// barra nao estiver a ser mostrada. A geometria vem toda de
+    /// `right_controls`: nao ha uma segunda copia da conta por aqui.
+    fn right_controls(&self) -> Option<RightControls> {
         let window = self.window.as_ref()?;
         if self.surface != Surface::Comparator || !self.bar_visible() {
             return None;
         }
-        let scale = window.scale_factor().max(1.0);
-        let width = window.inner_size().width as f64;
-        let row_y = (TITLE_TAB_HEIGHT + 7.0) * scale;
-        let row_h = 30.0 * scale;
-        let button_w = 78.0 * scale;
-        let margin = 8.0 * scale;
-        let right = if let Some((label, _, _)) = self.split_bar_rects() {
-            label.x - 6.0 * scale
-        } else {
-            width - margin
-        };
-        Some(UiRect {
-            x: right - button_w,
-            y: row_y,
-            width: button_w,
-            height: row_h,
-        })
+        let split_active = self
+            .comparator
+            .as_ref()
+            .is_some_and(|comp| comp.split.is_some());
+        Some(right_controls(
+            window.inner_size().width as f64,
+            window.scale_factor().max(1.0),
+            split_active,
+        ))
+    }
+
+    fn private_bar_rect(&self) -> Option<UiRect> {
+        Some(self.right_controls()?.private)
     }
 
     fn split_bar_rects(&self) -> Option<(UiRect, UiRect, UiRect)> {
-        let (Some(window), Some(comp)) = (&self.window, &self.comparator) else {
-            return None;
-        };
-        if comp.split.is_none() || !self.bar_visible() {
-            return None;
-        }
-        let scale = window.scale_factor().max(1.0);
-        let width = window.inner_size().width as f64;
-        let margin = 8.0 * scale;
-        let row_y = (TITLE_TAB_HEIGHT + 7.0) * scale;
-        let row_h = 30.0 * scale;
-        let close_w = 30.0 * scale;
-        let expand_w = 30.0 * scale;
-        let label_w = 150.0 * scale;
-        let gap = 5.0 * scale;
-        let close = UiRect {
-            x: width - margin - close_w,
-            y: row_y,
-            width: close_w,
-            height: row_h,
-        };
-        let expand = UiRect {
-            x: close.x - gap - expand_w,
-            y: row_y,
-            width: expand_w,
-            height: row_h,
-        };
-        let label = UiRect {
-            x: expand.x - gap - label_w,
-            y: row_y,
-            width: label_w,
-            height: row_h,
-        };
-        Some((label, expand, close))
+        self.right_controls()?.split
     }
 
     fn comparator_bar_hit(&self) -> Option<BarHit> {
@@ -4621,10 +5373,20 @@ impl App {
         }
     }
 
+    /// Abre a palette nativa sobre a coluna `source_index`. E um popup Win32,
+    /// nao um <input> no DOM: a pagina remota nem ve o que se escreve nem
+    /// consegue submeter nada por ela.
     fn open_ai_palette(&mut self, source_index: usize) {
-        if source_index >= COMPARATOR_COLUMNS {
+        if source_index >= COMPARATOR_COLUMNS || self.comparator.is_none() {
             return;
         }
+        // A privacidade e a da fonte aberta ao lado desta coluna -- lida ANTES
+        // de a fechar, porque e ela que decide para onde vai a submissao.
+        let private = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.split.as_ref())
+            .is_some_and(|split| split.source_index == source_index && split.private);
         if self
             .comparator
             .as_ref()
@@ -4639,14 +5401,223 @@ impl App {
         {
             self.restore_comparator();
         }
-        if let Some(view) = self
+        // Uma coluna minimizada nao tem faixa onde a palette possa pousar.
+        if let Some(comp) = &mut self.comparator
+            && comp.minimized[source_index]
+        {
+            comp.minimized[source_index] = false;
+            self.update_comparator_layout();
+            self.sync_comparator_splitters();
+            self.sync_comparator_buttons();
+        }
+        self.show_palette(source_index, private);
+    }
+
+    /// Coluna e privacidade a que a palette aberta esta ligada: estado
+    /// nativo, escrito por nos ao abrir, nunca pela pagina.
+    fn palette_source(&self) -> Option<(usize, bool)> {
+        self.palette_host.source.get()
+    }
+
+    /// Cria o popup da palette (owned pela janela principal, sem
+    /// NOACTIVATE porque precisa de foco, sem TOPMOST porque nao e um aviso)
+    /// com o EDIT dentro, e poe-lhe o foco.
+    fn show_palette(&mut self, source_index: usize, private: bool) {
+        // Uma palette de cada vez: a anterior (talvez noutra coluna) morre e
+        // esta nasce ja com a geometria e a fonte do DPI atual.
+        self.close_palette();
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let Some(source_name) = self
             .comparator
             .as_ref()
             .and_then(|comp| comp.views.get(source_index))
+            .map(|view| view.name)
+        else {
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
+
+        if let Ok(mut slot) = PALETTE_HINT.lock() {
+            *slot = palette_hint(source_name, private);
+        }
+
+        let created = unsafe {
+            let popup = CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!(""),
+                WS_POPUP,
+                0,
+                0,
+                10,
+                10,
+                owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            if popup.is_null() {
+                return;
+            }
+            if SetWindowSubclass(popup, Some(palette_subclass), PALETTE_SUBCLASS_ID, 0) == 0 {
+                DestroyWindow(popup);
+                return;
+            }
+            // Sem WS_EX_CLIENTEDGE, como a omnibox: a caixa e a do popup.
+            let edit = CreateWindowExW(
+                0,
+                windows_sys::w!("EDIT"),
+                windows_sys::w!(""),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
+                0,
+                0,
+                10,
+                10,
+                popup,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            if edit.is_null() {
+                DestroyWindow(popup);
+                return;
+            }
+            let cue = wide_null("Pergunte à IA ativa ou digite uma URL");
+            SendMessageW(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
+            SendMessageW(edit, EM_SETLIMITTEXT, 2048, 0);
+            let host_ptr = (&*self.palette_host as *const PaletteHost) as usize;
+            if SetWindowSubclass(
+                edit,
+                Some(palette_edit_subclass),
+                PALETTE_EDIT_SUBCLASS_ID,
+                host_ptr,
+            ) == 0
+            {
+                DestroyWindow(popup);
+                return;
+            }
+            let font = create_font(-((18.0 * scale).round() as i32), FW_NORMAL as i32);
+            if !font.is_null() {
+                SendMessageW(edit, WM_SETFONT, font as usize, 1);
+            }
+            let margin = (6.0 * scale) as usize;
+            SendMessageW(
+                edit,
+                EM_SETMARGINS,
+                EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                ((margin << 16) | margin) as isize,
+            );
+            PaletteWindow { popup, edit, font }
+        };
+
+        let (popup, edit) = (created.popup, created.edit);
+        self.palette = Some(created);
+        self.palette_host.source.set(Some((source_index, private)));
+        self.palette_host
+            .generation
+            .set(self.palette_host.generation.get().wrapping_add(1));
+        self.position_palette();
+        unsafe {
+            ShowWindow(popup, SW_SHOW);
+            InvalidateRect(popup, std::ptr::null(), 1);
+            SetFocus(edit);
+        }
+    }
+
+    /// Centra a palette sobre a faixa da sua coluna. Tudo em logicos e so
+    /// depois escalado: a mesma geometria em qualquer DPI.
+    fn position_palette(&self) {
+        let (Some(window), Some(palette), Some((source_index, _))) =
+            (&self.window, &self.palette, self.palette_source())
+        else {
+            return;
+        };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let size = window.inner_size();
+        let scale = window.scale_factor().max(1.0);
+        let logical_w = size.width as f64 / scale;
+        let logical_h = size.height as f64 / scale;
+        // Coluna sem faixa (minimizada, ou o layout mudou por baixo da
+        // palette): usa-se a largura toda em vez de a esconder.
+        let span = self
+            .comparator
+            .as_ref()
+            .filter(|comp| comp.split.is_none() && comp.expanded.is_none())
+            .and_then(|comp| {
+                visible_column_spans(logical_w, comp.views.len(), &comp.weights, &comp.minimized)
+                    .into_iter()
+                    .find(|span| span.index == source_index)
+            })
+            .unwrap_or(ColumnSpan {
+                index: source_index,
+                x: 0.0,
+                width: logical_w,
+            });
+        let geometry = palette_geometry(span, logical_h);
+        let width = (geometry.width * scale).round() as i32;
+        let height = (geometry.height * scale).round() as i32;
+
+        let mut origin = POINT { x: 0, y: 0 };
+        unsafe {
+            ClientToScreen(owner, &mut origin);
+            SetWindowPos(
+                palette.popup,
+                std::ptr::null_mut(),
+                origin.x + (geometry.x * scale).round() as i32,
+                origin.y + (geometry.y * scale).round() as i32,
+                width,
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            let corner = (PALETTE_CORNER * scale).round() as i32;
+            let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, corner, corner);
+            if !region.is_null() {
+                SetWindowRgn(palette.popup, region, 1);
+            }
+            let pad_x = (PALETTE_PAD_X * scale).round() as i32;
+            SetWindowPos(
+                palette.edit,
+                std::ptr::null_mut(),
+                pad_x,
+                (PALETTE_EDIT_TOP * scale).round() as i32,
+                (width - pad_x * 2).max(1),
+                (PALETTE_EDIT_HEIGHT * scale).round() as i32,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// Fecha a palette. Limpa primeiro o host: o WM_KILLFOCUS que a
+    /// destruicao provoca ja nao encontra coluna nenhuma para submeter.
+    fn close_palette(&mut self) {
+        let source = self.palette_host.source.replace(None);
+        let Some(palette) = self.palette.take() else {
+            return;
+        };
+        // Escape/Enter: o foco ainda esta no EDIT e volta para a coluna. Se o
+        // utilizador clicou noutro sitio, o foco ja e desse sitio e fica la.
+        let had_focus = unsafe { GetFocus() } == palette.edit;
+        unsafe {
+            DestroyWindow(palette.popup);
+            if !palette.font.is_null() {
+                DeleteObject(palette.font as _);
+            }
+        }
+        if had_focus
+            && let Some((source_index, _)) = source
+            && let Some(view) = self
+                .comparator
+                .as_ref()
+                .and_then(|comp| comp.views.get(source_index))
         {
-            let _ = view
-                .webview
-                .evaluate_script("window.dispatchEvent(new CustomEvent('neuralia-open-palette'));");
+            let _ = view.webview.focus();
         }
     }
 
@@ -5139,15 +6110,30 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.surface == Surface::Home && home_animation_enabled() {
-            let now = Instant::now();
-            if now >= self.next_home_frame {
-                self.next_home_frame = now + Duration::from_millis(66);
-                self.request_redraw();
-            }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_home_frame));
+        let interval = if self.surface == Surface::Home && home_animation_enabled() {
+            // O `Occluded` do Windows nao cobre a minimizacao em todos os
+            // casos, por isso pergunta-se tambem a janela.
+            let minimized = self
+                .window
+                .as_ref()
+                .and_then(|window| window.is_minimized())
+                .unwrap_or(false);
+            home_frame_interval(minimized, self.home_occluded, self.home_focused)
         } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            None
+        };
+
+        match interval {
+            Some(interval) => {
+                let now = Instant::now();
+                if now >= self.next_home_frame {
+                    self.next_home_frame = now + interval;
+                    self.request_redraw();
+                }
+                event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_home_frame));
+            }
+            // Sem prazo nenhum: o laco dorme ate chegar um evento de verdade.
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 
@@ -5199,6 +6185,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::HistoryCleared(result) => self.report_history_cleared(result),
+            UserEvent::HistoryLoaded(result) => self.show_history_entries(result),
             UserEvent::MemoryQueryReady { query, result } => {
                 self.show_memory_results(&query, result);
             }
@@ -5244,10 +6231,28 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::NewTab(index) => self.new_tab(index),
             UserEvent::CloseSplit => self.close_split(),
             UserEvent::ToggleSplitFullscreen => self.toggle_split_fullscreen(),
+            UserEvent::OpenPalette(index) => {
+                if self.surface == Surface::Comparator {
+                    self.open_ai_palette(index);
+                }
+            }
             UserEvent::PaletteSubmit {
                 source_index,
                 input,
-            } => self.submit_palette(source_index, input),
+                private,
+            } => {
+                // So vale o que a palette aberta prometeu: se entretanto foi
+                // fechada (a coluna pode ja nem existir), a entrada cai.
+                if self.palette_source() == Some((source_index, private)) {
+                    self.close_palette();
+                    self.submit_palette(source_index, input, private);
+                }
+            }
+            UserEvent::ClosePalette(generation) => {
+                if generation == self.palette_host.generation.get() {
+                    self.close_palette();
+                }
+            }
             UserEvent::ExpandComparator(idx) => {
                 if self.surface == Surface::Comparator {
                     self.expand_comparator(idx);
@@ -5258,9 +6263,17 @@ impl ApplicationHandler<UserEvent> for App {
                     self.minimize_comparator(idx);
                 }
             }
-            UserEvent::ResizeComparator { divider, screen_x } => {
+            UserEvent::ResizeComparator => {
+                // Limpar a marca ANTES de ler: um movimento que chegue durante
+                // o reposicionamento volta a enfileirar e nao se perde. Ao
+                // contrario, um movimento entre a leitura e a limpeza seria
+                // engolido e o divisor parava onde nao devia.
+                RESIZE_PENDING.store(false, Ordering::Release);
                 if self.surface == Surface::Comparator {
-                    self.resize_comparator(divider, screen_x);
+                    self.resize_comparator(
+                        RESIZE_DIVIDER.load(Ordering::Acquire),
+                        RESIZE_X.load(Ordering::Acquire),
+                    );
                 }
             }
             UserEvent::RestoreComparator => {
@@ -5347,10 +6360,22 @@ impl ApplicationHandler<UserEvent> for App {
                     self.update_comparator_layout();
                     self.sync_comparator_splitters();
                     self.sync_exit_button();
+                    self.position_palette();
                     self.request_redraw();
                 }
                 _ => {}
             },
+            // Splash, toast, botao de saida, divisores e palette sao popups em
+            // coordenadas de ECRA: mover a janela nao lhes toca. Ate aqui so o
+            // Resized os sincronizava, por isso arrastar a janela deixava-os
+            // para tras, no sitio onde ela estava antes.
+            WindowEvent::Moved(_) => {
+                self.position_splash();
+                self.position_gmail_toast();
+                self.position_exit_button();
+                self.position_palette();
+                self.sync_comparator_splitters();
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
                 if self.surface == Surface::Comparator {
@@ -5374,6 +6399,15 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.surface == Surface::Comparator {
                     self.update_bar_hover();
                 }
+            }
+            WindowEvent::Focused(focused) => self.on_focus_changed(focused),
+            WindowEvent::Occluded(occluded) => self.on_occluded_changed(occluded),
+            // O tema do sistema mudou: o cache de 1 s tem de cair agora, e o
+            // fundo inteiro e repintado porque ate a cor da pagina mudou.
+            WindowEvent::ThemeChanged(_) => {
+                Theme::invalidate();
+                self.needs_clear = true;
+                self.request_redraw();
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -5443,11 +6477,26 @@ fn pin_webview_profile() {
 
 /// Responde a origem do visualizador: os tres ficheiros do PDF.js e o
 /// documento que esta aberto. Tudo em memoria; nada toca no disco.
+///
+/// O documento e servido por faixas (RFC 9110, `Range`): o visualizador pede
+/// `getDocument({url, rangeChunkSize})` e, mal ve `Accept-Ranges: bytes` e o
+/// `Content-Length`, aborta o pedido inicial e passa a pedir so os bytes de
+/// que precisa. Cada pedido copia apenas a sua fatia -- antes, cada GET
+/// clonava o documento inteiro (ate 32 MiB) por baixo do Mutex.
 fn serve_pdf_asset(
     bytes: &Arc<Mutex<Vec<u8>>>,
     request: &Request<Vec<u8>>,
 ) -> HttpResponse<Cow<'static, [u8]>> {
     let path = request.uri().path();
+    // HEAD e um GET sem corpo. O WebView2 entrega o metodo tal como a pagina
+    // o pediu (wry 0.57, webview2/mod.rs, `prepare_request`), e os cabecalhos
+    // -- em especial o Content-Length do documento -- tem de ser os do GET,
+    // sem se copiar um unico byte.
+    let head = request.method() == wry::http::Method::HEAD;
+    // Cabecalhos que so o documento leva: o Content-Length do corpo que um GET
+    // traria e, num 206/416, o Content-Range. Os ficheiros do visualizador
+    // sao estaticos e nao precisam de nenhum dos dois.
+    let mut document: Option<(usize, Option<String>)> = None;
     let (status, content_type, body): (u16, &str, Cow<'static, [u8]>) = match path {
         "/viewer.html" | "/" => (
             200,
@@ -5458,8 +6507,44 @@ fn serve_pdf_asset(
         "/pdf.mjs" => (200, "text/javascript", Cow::Borrowed(PDFJS_CORE)),
         "/pdf.worker.mjs" => (200, "text/javascript", Cow::Borrowed(PDFJS_WORKER)),
         "/document.pdf" => {
-            let data = bytes.lock().map(|slot| slot.clone()).unwrap_or_default();
-            (200, "application/pdf", Cow::Owned(data))
+            // O lock fica seguro ate a fatia estar copiada, para `open_pdf`
+            // nao trocar o documento a meio; um Mutex envenenado vale como
+            // documento vazio, exactamente como antes.
+            let guard = bytes.lock().ok();
+            let data: &[u8] = match guard.as_deref() {
+                Some(slot) => slot,
+                None => &[],
+            };
+            let total = data.len() as u64;
+            let range = request
+                .headers()
+                .get("range")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("");
+            let (status, slice, content_range) = match parse_range(range, total) {
+                // `end` e inclusivo e ja esta cortado a `total - 1`; os `as
+                // usize` nao truncam porque `total` veio de um `len()`.
+                RangeParse::Satisfiable { start, end } => (
+                    206,
+                    &data[start as usize..=end as usize],
+                    Some(format!("bytes {start}-{end}/{total}")),
+                ),
+                RangeParse::Unsatisfiable => (416, &data[..0], Some(format!("bytes */{total}"))),
+                RangeParse::None | RangeParse::Ignored => (200, data, None),
+            };
+            document = Some((slice.len(), content_range));
+            // Copiar e inevitavel: a resposta do wry e `Cow<'static, [u8]>` e
+            // os bytes vivem atras de um Mutex que nao se pode emprestar para
+            // fora do handler. Mas copia-se SO a fatia pedida: com o
+            // visualizador a pedir por Range, o documento inteiro passa uma
+            // unica vez (o pedido inicial, que o PDF.js aborta assim que le o
+            // Accept-Ranges) em vez de uma vez por cada pedido.
+            let body = if head {
+                Cow::Borrowed(b"" as &[u8])
+            } else {
+                Cow::Owned(slice.to_vec())
+            };
+            (status, "application/pdf", body)
         }
         _ => (404, "text/plain", Cow::Borrowed(b"not found" as &[u8])),
     };
@@ -5474,9 +6559,137 @@ fn serve_pdf_asset(
     if content_type.starts_with("text/html") {
         response = response.header("Content-Security-Policy", PDF_VIEWER_CSP);
     }
+    if let Some((length, content_range)) = document {
+        // Accept-Ranges vai em todas as respostas do documento, tambem no 416:
+        // e ele que diz ao PDF.js que pode pedir por faixas.
+        response = response
+            .header("Accept-Ranges", "bytes")
+            .header("Content-Length", length);
+        if let Some(content_range) = content_range {
+            response = response.header("Content-Range", content_range);
+        }
+    }
+    // Os ficheiros estaticos num HEAD: sao `Borrowed`, por isso descartar o
+    // corpo aqui nao custa nada (o documento ja chegou vazio de cima, antes
+    // de qualquer copia).
+    let body = if head {
+        Cow::Borrowed(b"" as &[u8])
+    } else {
+        body
+    };
     response
         .body(body)
         .unwrap_or_else(|_| HttpResponse::new(Cow::Borrowed(b"" as &[u8])))
+}
+
+/// O que o cabecalho `Range` de um pedido pede a um documento de `total`
+/// bytes. Puro, para os casos limite se testarem sem WebView.
+#[derive(Debug, PartialEq, Eq)]
+enum RangeParse {
+    /// Nao veio cabecalho: resposta completa, 200.
+    None,
+    /// Uma unica faixa que cabe no documento. `end` e inclusivo e ja esta
+    /// cortado ao ultimo byte, por isso `start..=end` indexa sem verificar.
+    Satisfiable { start: u64, end: u64 },
+    /// Faixa bem formada mas sem um unico byte a devolver (inicio para la do
+    /// fim, sufixo de zero bytes, documento vazio): 416 com `bytes */total`.
+    Unsatisfiable,
+    /// Outra unidade, sintaxe estranha, inicio maior que o fim ou varias
+    /// faixas: a RFC 9110 permite ignorar o cabecalho e responder 200 com o
+    /// documento inteiro, e e o que o PDF.js tambem aceita. Servir
+    /// `multipart/byteranges` nao vale o codigo que custaria.
+    Ignored,
+}
+
+/// Le o cabecalho `Range` (RFC 9110, 14.2) para um documento com `total`
+/// bytes. `header` vazio significa que o pedido nao trouxe cabecalho.
+///
+/// Aceita `bytes=A-B`, `bytes=A-` e `bytes=-N`; a unidade nao distingue
+/// maiusculas e ha tolerancia a espacos, porque nada se ganha em recusar
+/// `bytes= 0-9`. Um fim para la do documento corta-se ao ultimo byte; um
+/// sufixo maior do que o documento e o documento inteiro. O que decide entre
+/// `Unsatisfiable` e `Ignored` e a RFC: uma faixa valida que nao apanha
+/// nenhum byte merece 416, porque um 200 mascararia o erro do cliente; uma
+/// faixa invalida nao e um pedido de faixa e serve-se tudo.
+fn parse_range(header: &str, total: u64) -> RangeParse {
+    let header = header.trim();
+    if header.is_empty() {
+        return RangeParse::None;
+    }
+    let Some((unit, set)) = header.split_once('=') else {
+        return RangeParse::Ignored;
+    };
+    if !unit.trim().eq_ignore_ascii_case("bytes") {
+        return RangeParse::Ignored;
+    }
+    // A lista pode trazer elementos vazios (`bytes=0-9,`), que a gramatica de
+    // listas do HTTP manda ignorar; contam-se so os que existem, e mais do
+    // que um seria multipart.
+    let mut specs = set
+        .split(',')
+        .map(str::trim)
+        .filter(|spec| !spec.is_empty());
+    let (Some(spec), None) = (specs.next(), specs.next()) else {
+        return RangeParse::Ignored;
+    };
+    let Some((first, last)) = spec.split_once('-') else {
+        return RangeParse::Ignored;
+    };
+    let (first, last) = (first.trim(), last.trim());
+
+    if first.is_empty() {
+        // `bytes=-N`: os ultimos N bytes. N = 0 e insatisfazivel por definicao
+        // (nao apanha byte nenhum), e um documento vazio nao tem ultimos bytes.
+        let Some(suffix) = parse_range_pos(last) else {
+            return RangeParse::Ignored;
+        };
+        if suffix == 0 || total == 0 {
+            return RangeParse::Unsatisfiable;
+        }
+        return RangeParse::Satisfiable {
+            start: total.saturating_sub(suffix),
+            end: total - 1,
+        };
+    }
+
+    let Some(start) = parse_range_pos(first) else {
+        return RangeParse::Ignored;
+    };
+    let end = if last.is_empty() {
+        u64::MAX
+    } else {
+        match parse_range_pos(last) {
+            Some(end) => end,
+            None => return RangeParse::Ignored,
+        }
+    };
+    // Fim antes do inicio e sintaxe invalida pela RFC, nao uma faixa vazia.
+    if end < start {
+        return RangeParse::Ignored;
+    }
+    if start >= total {
+        return RangeParse::Unsatisfiable;
+    }
+    RangeParse::Satisfiable {
+        start,
+        end: end.min(total - 1),
+    }
+}
+
+/// Um inteiro decimal do cabecalho `Range`: so digitos ASCII, pelo menos um.
+/// Um valor que nao cabe em u64 satura em vez de falhar, porque para este fim
+/// "enorme" e "infinito" sao o mesmo: um inicio assim e insatisfazivel e um
+/// fim assim corta-se ao documento -- e um cliente que escreve 30 digitos nao
+/// merece um 200 com o ficheiro inteiro por causa disso.
+fn parse_range_pos(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(text.bytes().fold(0u64, |value, byte| {
+        value
+            .saturating_mul(10)
+            .saturating_add(u64::from(byte - b'0'))
+    }))
 }
 
 /// Traduz um `neuralia:<accao>` num evento. E o unico sitio onde a lista de
@@ -5509,6 +6722,50 @@ fn neuralia_action(target: &str) -> Option<UserEvent> {
         "viewsource" => UserEvent::ViewSource,
         _ => return None,
     })
+}
+
+/// Para onde vai o que o utilizador escreveu na palette. Puro, para se poder
+/// testar sem janela: e aqui que se decide que um painel privado nunca
+/// carrega nada na coluna normal nem passa pelo historico.
+#[derive(Debug, PartialEq)]
+enum PaletteRoute {
+    /// Nada a fazer; a mensagem, quando ha, e para mostrar ao utilizador.
+    Invalid(Option<String>),
+    Home,
+    /// URL: abre ao lado da coluna, privada se a palette veio de um painel
+    /// privado. A rede local e permitida porque a URL foi digitada.
+    OpenSplit {
+        url: Url,
+        private: bool,
+    },
+    /// Texto numa coluna normal: a pergunta vai para o fornecedor da coluna
+    /// e fica no historico.
+    LoadProvider {
+        query: String,
+    },
+    /// Texto num painel privado: a pergunta abre como fonte privada.
+    OpenPrivateProvider {
+        query: String,
+    },
+}
+
+fn route_palette(input: &str, source_index: usize, private: bool) -> PaletteRoute {
+    let input = input.trim();
+    if input.is_empty() || source_index >= COMPARATOR_COLUMNS {
+        return PaletteRoute::Invalid(None);
+    }
+    match parse_intent(input) {
+        Ok(Intent::Read(url)) | Ok(Intent::Web(url)) => PaletteRoute::OpenSplit { url, private },
+        Ok(Intent::Home) => PaletteRoute::Home,
+        Ok(Intent::Ask(query)) | Ok(Intent::Compare(query)) => {
+            if private {
+                PaletteRoute::OpenPrivateProvider { query }
+            } else {
+                PaletteRoute::LoadProvider { query }
+            }
+        }
+        Err(error) => PaletteRoute::Invalid(Some(error.to_string())),
+    }
 }
 
 /// Token que so os scripts injetados conhecem: 128 bits do RNG do sistema.
@@ -5635,6 +6892,36 @@ fn home_animation_enabled() -> bool {
     std::env::var_os("NEURALIA_REDUCE_MOTION").is_none()
 }
 
+/// Ritmo da animacao da Home, ou `None` para nao animar de todo.
+///
+/// O laco pedia um frame a cada 66 ms enquanto a Home estivesse aberta, mesmo
+/// com a janela minimizada, tapada por outra ou em segundo plano: 15 repinturas
+/// GDI por segundo a gastar bateria sem ninguem a ver. A decisao esta aqui,
+/// fora do `about_to_wait`, porque e a unica parte testavel sem event loop.
+fn home_frame_interval(minimized: bool, occluded: bool, focused: bool) -> Option<Duration> {
+    if minimized || occluded {
+        return None;
+    }
+    // Em segundo plano a animacao nao para (a janela continua a ser vista),
+    // mas 4 FPS chegam para nao parecer congelada.
+    Some(Duration::from_millis(if focused { 66 } else { 250 }))
+}
+
+/// `NEURALIA_NO_GMAIL` desliga o monitor do Gmail por completo (SPEC-0005,
+/// SECURITY.md): sem sonda, sem leitura de cookies, sem WebView escondido. O
+/// gate de ciclo de vida define-a porque conta processos e nao distingue a
+/// excepcao intencional de um vazamento.
+fn gmail_monitor_enabled() -> bool {
+    gmail_monitor_enabled_for(std::env::var_os("NEURALIA_NO_GMAIL"))
+}
+
+/// Basta a variavel EXISTIR, como em NEURALIA_REDUCE_MOTION: `=0` ou vazia
+/// tambem desligam. Um interruptor de privacidade que dependesse do valor
+/// deixava passar quem o definiu mal.
+fn gmail_monitor_enabled_for(no_gmail: Option<OsString>) -> bool {
+    no_gmail.is_none()
+}
+
 fn neural_hash(mut value: u32) -> f64 {
     value ^= value >> 16;
     value = value.wrapping_mul(0x7feb_352d);
@@ -5707,10 +6994,12 @@ unsafe fn draw_neural_background(
         nodes.push((x, y, energy));
     }
 
+    // O tema recebido ja sabe se esta escuro: ler o registo aqui era faze-lo
+    // duas vezes por frame, 15 vezes por segundo.
     let line_color = mix(
         theme.page_bg,
         theme.accent,
-        if system_dark_mode() { 0.30 } else { 0.18 },
+        if theme.dark { 0.30 } else { 0.18 },
     );
     let line_pen = CreatePen(PS_SOLID, 1, rgb3(line_color));
     let old_pen = SelectObject(hdc, line_pen as _);
@@ -5739,7 +7028,7 @@ unsafe fn draw_neural_background(
     let node_color = mix(
         theme.page_bg,
         theme.accent,
-        if system_dark_mode() { 0.72 } else { 0.50 },
+        if theme.dark { 0.72 } else { 0.50 },
     );
     let node_brush = CreateSolidBrush(rgb3(node_color));
     let node_pen = CreatePen(PS_SOLID, 1, rgb3(node_color));
@@ -5955,6 +7244,7 @@ fn draw_comparator_bar(
             width,
             scale,
             &names,
+            bar_columns(comp),
             &comp.contexts,
             comp.split.as_ref().map(|split| {
                 (
@@ -6003,6 +7293,7 @@ unsafe fn paint_comparator_bar(
         width,
         scale,
         names,
+        BarColumns::even(names.len()),
         &empty,
         None,
         visible,
@@ -6018,6 +7309,7 @@ unsafe fn paint_comparator_bar_with_contexts(
     width: i32,
     scale: f64,
     names: &[&str],
+    columns: BarColumns,
     contexts: &[Vec<String>; COMPARATOR_COLUMNS],
     active_context: Option<(usize, &str, bool, bool)>,
     visible: bool,
@@ -6029,7 +7321,7 @@ unsafe fn paint_comparator_bar_with_contexts(
         width as f64,
         scale,
         visible,
-        names.len(),
+        columns,
         std::array::from_fn(|index| contexts[index].len()),
     );
     if !layout.visible {
@@ -6170,11 +7462,29 @@ unsafe fn paint_comparator_bar_with_contexts(
 
     for (index, name) in names.iter().enumerate().take(layout.columns_len) {
         let brand = theme.brand(index);
-        let tint = if hover == Some(BarHit::Column(index)) {
-            0.30
-        } else {
-            0.16
-        };
+        let hovered = hover == Some(BarHit::Column(index));
+
+        // Coluna minimizada: um chip apagado, so com o nome. Fica na barra
+        // de proposito -- e o unico sitio onde o clique a traz de volta --
+        // mas sem "+", porque nao ha faixa onde abrir uma aba.
+        if layout.minimized[index] {
+            draw_pill(
+                target,
+                layout.columns[index],
+                name,
+                PillStyle::new(
+                    mix(theme.bar_bg, brand, if hovered { 0.24 } else { 0.10 }),
+                    mix(theme.bar_bg, brand, 0.30),
+                    theme.fg_muted,
+                ),
+                scale,
+                tab_font,
+                theme.bar_bg,
+            );
+            continue;
+        }
+
+        let tint = if hovered { 0.30 } else { 0.16 };
         draw_pill(
             target,
             layout.columns[index],
@@ -6200,66 +7510,21 @@ unsafe fn paint_comparator_bar_with_contexts(
         );
     }
 
-    {
-        let margin = 8.0 * scale;
-        let row_y = (TITLE_TAB_HEIGHT + 7.0) * scale;
-        let row_h = 30.0 * scale;
-        let button_w = 78.0 * scale;
-        let right = if active_context.is_some() {
-            width as f64
-                - margin
-                - 30.0 * scale
-                - 5.0 * scale
-                - 30.0 * scale
-                - 5.0 * scale
-                - 150.0 * scale
-                - 6.0 * scale
-        } else {
-            width as f64 - margin
-        };
-        let rect = UiRect {
-            x: right - button_w,
-            y: row_y,
-            width: button_w,
-            height: row_h,
-        };
-        draw_button(
-            target,
-            rect,
-            "Privado",
-            hover == Some(BarHit::Private),
-            scale,
-            tab_font,
-            theme,
-        );
-    }
+    // Os mesmos rectangulos que o hit-testing usa; ver `right_controls`.
+    let controls = right_controls(width as f64, scale, active_context.is_some());
+    draw_button(
+        target,
+        controls.private,
+        "Privado",
+        hover == Some(BarHit::Private),
+        scale,
+        tab_font,
+        theme,
+    );
 
-    if let Some((source_index, _url, fullscreen, private_split)) = active_context {
-        let margin = 8.0 * scale;
-        let row_y = (TITLE_TAB_HEIGHT + 7.0) * scale;
-        let row_h = 30.0 * scale;
-        let close_w = 30.0 * scale;
-        let expand_w = 30.0 * scale;
-        let label_w = 150.0 * scale;
-        let gap = 5.0 * scale;
-        let close = UiRect {
-            x: width as f64 - margin - close_w,
-            y: row_y,
-            width: close_w,
-            height: row_h,
-        };
-        let expand = UiRect {
-            x: close.x - gap - expand_w,
-            y: row_y,
-            width: expand_w,
-            height: row_h,
-        };
-        let label = UiRect {
-            x: expand.x - gap - label_w,
-            y: row_y,
-            width: label_w,
-            height: row_h,
-        };
+    if let (Some((source_index, _url, fullscreen, private_split)), Some((label, expand, close))) =
+        (active_context, controls.split)
+    {
         let source = names.get(source_index).copied().unwrap_or("IA");
         draw_pill(
             target,
@@ -6314,6 +7579,20 @@ fn context_tab_label(value: &str) -> String {
     label
 }
 
+/// Corta um campo vindo do monitor a `GMAIL_FIELD_MAX_CHARS` chars, na
+/// fronteira de char e nao de byte: `String::truncate` a meio de um UTF-8
+/// entra em panico, e um remetente com acentos e o caso normal. O que ja
+/// cabe volta intacto, sem alocar.
+fn gmail_field(mut value: String) -> String {
+    if value.len() <= GMAIL_FIELD_MAX_CHARS {
+        return value;
+    }
+    if let Some((offset, _)) = value.char_indices().nth(GMAIL_FIELD_MAX_CHARS) {
+        value.truncate(offset);
+    }
+    value
+}
+
 fn gmail_is_new_mail(
     previous_unread: Option<u32>,
     previous_key: Option<&str>,
@@ -6350,8 +7629,10 @@ unsafe fn create_font(height: i32, weight: i32) -> *mut core::ffi::c_void {
     )
 }
 
-/// (largura, altura, cor de fundo, pixeis BGRX ja compostos)
-type SplashCache = Option<(i32, i32, Rgb, Vec<u8>)>;
+/// (largura, altura, cor de fundo, pixeis BGRX ja compostos). Os pixeis estao
+/// num `Arc` porque a tela inicial repinta-se a cada frame e um `Vec` clonado
+/// ali custa uma copia de largura*altura*4 bytes por frame, so para o blit ler.
+type SplashCache = Option<(i32, i32, Rgb, Arc<Vec<u8>>)>;
 
 /// Visualizador de PDF proprio: o do Edge corre noutro processo e nao aceita
 /// nem script nem teclado nosso; este e uma pagina nossa, com o PDF.js da
@@ -6448,11 +7729,13 @@ unsafe fn draw_brand(
             Some((cached_w, cached_h, cached_bg, ref cached_pixels))
                 if cached_w == width && cached_h == height && cached_bg == bg_rgb =>
             {
-                cached_pixels.clone()
+                // Clonar o Arc e copiar um ponteiro; clonar o Vec seria copiar
+                // a imagem inteira a cada repintura.
+                Arc::clone(cached_pixels)
             }
             _ => {
-                let rendered = render_brand_pixels(width, height, bg_rgb);
-                *cache = Some((width, height, bg_rgb, rendered.clone()));
+                let rendered = Arc::new(render_brand_pixels(width, height, bg_rgb));
+                *cache = Some((width, height, bg_rgb, Arc::clone(&rendered)));
                 rendered
             }
         }
@@ -6646,6 +7929,106 @@ mod tests {
 
             ReleaseDC(core::ptr::null_mut(), screen);
         }
+    }
+
+    #[test]
+    fn lru_evicts_the_oldest_and_keeps_the_used_alive() {
+        // Simula o que a barra faz: enche o cache e depois continua a pedir
+        // tamanhos novos, como durante um arrasto da borda da janela.
+        let mut entries: Vec<((usize, u32), u32)> = Vec::new();
+        for size in 0..ICON_CACHE_CAPACITY as u32 {
+            lru_insert(&mut entries, (0, size), size, ICON_CACHE_CAPACITY);
+        }
+        assert_eq!(entries.len(), ICON_CACHE_CAPACITY);
+
+        // Usar a mais antiga promove-a: deixa de ser a proxima a sair.
+        assert_eq!(lru_promote(&mut entries, &(0, 0)), Some(0));
+        lru_insert(&mut entries, (0, 100), 100, ICON_CACHE_CAPACITY);
+        assert_eq!(entries.len(), ICON_CACHE_CAPACITY);
+        assert_eq!(lru_promote(&mut entries, &(0, 0)), Some(0));
+        // A vitima foi a que estava sem uso ha mais tempo, nao a recem-usada.
+        assert_eq!(lru_promote(&mut entries, &(0, 1)), None);
+    }
+
+    #[test]
+    fn lru_insert_replaces_instead_of_duplicating() {
+        let mut entries: Vec<((usize, u32), u32)> = Vec::new();
+        lru_insert(&mut entries, (1, 16), 1, 4);
+        lru_insert(&mut entries, (1, 16), 2, 4);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(lru_promote(&mut entries, &(1, 16)), Some(2));
+        assert_eq!(lru_promote(&mut entries, &(2, 16)), None);
+    }
+
+    #[test]
+    fn icon_cache_stays_bounded_across_many_sizes() {
+        // Pelo cache verdadeiro: cada tamanho e uma entrada, e mesmo pedindo
+        // muito mais do que o tecto a lista nao cresce.
+        for size in 8..64u32 {
+            let _ = icon_scaled(ICON_SLOT_HOME, size);
+        }
+        let entries = ICON_SCALE_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(entries.len() <= ICON_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn home_animation_sleeps_when_nobody_is_looking() {
+        // Minimizada ou tapada nao ha frame nenhum — o laco fica em Wait.
+        assert_eq!(home_frame_interval(true, false, true), None);
+        assert_eq!(home_frame_interval(false, true, true), None);
+        assert_eq!(home_frame_interval(true, true, false), None);
+        // Visivel e com foco: os ~15 FPS de sempre.
+        assert_eq!(
+            home_frame_interval(false, false, true),
+            Some(Duration::from_millis(66))
+        );
+        // Visivel sem foco: continua a animar, mas quatro vezes mais devagar.
+        assert_eq!(
+            home_frame_interval(false, false, false),
+            Some(Duration::from_millis(250))
+        );
+    }
+
+    #[test]
+    fn theme_carries_its_own_dark_flag() {
+        // draw_neural_background le isto em vez de voltar ao registo.
+        assert!(Theme::dark((0, 120, 212)).dark);
+        assert!(!Theme::light((0, 120, 212)).dark);
+    }
+
+    #[test]
+    fn theme_cache_is_reused_and_invalidated() {
+        Theme::invalidate();
+        assert!(
+            THEME_CACHE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none()
+        );
+        let first = Theme::system();
+        // A segunda chamada dentro da validade nao volta ao registo: o valor
+        // guardado e o mesmo objecto que saiu da primeira.
+        let stamp = THEME_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .map(|(stamp, _)| stamp)
+            .expect("system() deve deixar o tema em cache");
+        let second = Theme::system();
+        let same_stamp = THEME_CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .map(|(stamp, _)| stamp);
+        assert_eq!(same_stamp, Some(stamp));
+        assert_eq!(first.page_bg, second.page_bg);
+        assert_eq!(first.dark, second.dark);
+
+        Theme::invalidate();
+        assert!(
+            THEME_CACHE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none()
+        );
     }
 
     #[test]
@@ -6873,7 +8256,228 @@ mod tests {
             if is_html {
                 assert_eq!(csp.as_deref(), Some(PDF_VIEWER_CSP), "{path}");
             }
+            // So o documento anuncia faixas: os ficheiros do visualizador sao
+            // servidos inteiros e nunca por Range.
+            assert_eq!(
+                header("Accept-Ranges").is_some(),
+                path == "/document.pdf",
+                "{path}"
+            );
         }
+    }
+
+    #[test]
+    fn parse_range_reads_single_byte_ranges() {
+        use RangeParse::*;
+        assert_eq!(parse_range("", 10), None);
+        assert_eq!(parse_range("   ", 10), None);
+        assert_eq!(
+            parse_range("bytes=0-0", 10),
+            Satisfiable { start: 0, end: 0 }
+        );
+        assert_eq!(
+            parse_range("bytes=0-0", 1),
+            Satisfiable { start: 0, end: 0 }
+        );
+        assert_eq!(
+            parse_range("bytes=2-4", 10),
+            Satisfiable { start: 2, end: 4 }
+        );
+        assert_eq!(
+            parse_range("bytes=9-9", 10),
+            Satisfiable { start: 9, end: 9 }
+        );
+        // Sem fim: ate ao ultimo byte. Fim para la do documento: cortado.
+        assert_eq!(
+            parse_range("bytes=5-", 10),
+            Satisfiable { start: 5, end: 9 }
+        );
+        assert_eq!(
+            parse_range("bytes=5-99", 10),
+            Satisfiable { start: 5, end: 9 }
+        );
+        assert_eq!(
+            parse_range("bytes=0-99999999999999999999999999", 10),
+            Satisfiable { start: 0, end: 9 }
+        );
+        // Sufixo: os ultimos N bytes; maior do que o documento e tudo.
+        assert_eq!(
+            parse_range("bytes=-3", 10),
+            Satisfiable { start: 7, end: 9 }
+        );
+        assert_eq!(
+            parse_range("bytes=-10", 10),
+            Satisfiable { start: 0, end: 9 }
+        );
+        assert_eq!(
+            parse_range("bytes=-100", 10),
+            Satisfiable { start: 0, end: 9 }
+        );
+        // Tolerancia: unidade sem distinguir maiusculas, espacos, elemento
+        // vazio no fim da lista.
+        assert_eq!(
+            parse_range("BYTES=0-1", 10),
+            Satisfiable { start: 0, end: 1 }
+        );
+        assert_eq!(
+            parse_range(" bytes = 0 - 1 ", 10),
+            Satisfiable { start: 0, end: 1 }
+        );
+        assert_eq!(
+            parse_range("bytes=0-1,", 10),
+            Satisfiable { start: 0, end: 1 }
+        );
+    }
+
+    #[test]
+    fn parse_range_separates_unsatisfiable_from_ignored() {
+        use RangeParse::*;
+        // Validas mas sem byte nenhum: 416.
+        assert_eq!(parse_range("bytes=-0", 10), Unsatisfiable);
+        assert_eq!(parse_range("bytes=10-", 10), Unsatisfiable);
+        assert_eq!(parse_range("bytes=10-20", 10), Unsatisfiable);
+        assert_eq!(
+            parse_range("bytes=99999999999999999999999999-", 10),
+            Unsatisfiable
+        );
+        // Documento vazio nao tem nenhum byte para dar, venha o que vier.
+        assert_eq!(parse_range("bytes=0-", 0), Unsatisfiable);
+        assert_eq!(parse_range("bytes=0-0", 0), Unsatisfiable);
+        assert_eq!(parse_range("bytes=-1", 0), Unsatisfiable);
+        assert_eq!(parse_range("", 0), None);
+        // Invalidas: nao sao pedidos de faixa, serve-se tudo.
+        assert_eq!(parse_range("bytes=3-2", 10), Ignored);
+        assert_eq!(parse_range("items=0-1", 10), Ignored);
+        assert_eq!(parse_range("bytes", 10), Ignored);
+        assert_eq!(parse_range("bytes=", 10), Ignored);
+        assert_eq!(parse_range("bytes=-", 10), Ignored);
+        assert_eq!(parse_range("bytes=,", 10), Ignored);
+        assert_eq!(parse_range("bytes=a-b", 10), Ignored);
+        assert_eq!(parse_range("bytes=0-1x", 10), Ignored);
+        assert_eq!(parse_range("bytes=+0-1", 10), Ignored);
+        assert_eq!(parse_range("bytes=0", 10), Ignored);
+        // Varias faixas seriam multipart/byteranges: 200 completo.
+        assert_eq!(parse_range("bytes=0-1,3-4", 10), Ignored);
+        assert_eq!(parse_range("bytes=0-1, 3-4", 10), Ignored);
+    }
+
+    #[test]
+    fn pdf_document_is_served_by_range() {
+        let document = b"%PDF-1.7 0123456789".to_vec();
+        let total = document.len();
+        let bytes = Arc::new(Mutex::new(document.clone()));
+        let serve = |method: &str, range: Option<&str>| {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(format!("{PDF_ORIGIN}/document.pdf"));
+            if let Some(range) = range {
+                request = request.header("Range", range);
+            }
+            serve_pdf_asset(&bytes, &request.body(Vec::new()).expect("pedido de teste"))
+        };
+        let header = |response: &HttpResponse<Cow<'static, [u8]>>, name: &str| {
+            response
+                .headers()
+                .get(name)
+                .map(|value| value.to_str().unwrap_or("").to_string())
+        };
+        let common = |response: &HttpResponse<Cow<'static, [u8]>>| {
+            assert_eq!(
+                header(response, "Content-Type").as_deref(),
+                Some("application/pdf")
+            );
+            assert_eq!(header(response, "Accept-Ranges").as_deref(), Some("bytes"));
+            assert_eq!(
+                header(response, "Cache-Control").as_deref(),
+                Some("no-store")
+            );
+            assert_eq!(
+                header(response, "X-Content-Type-Options").as_deref(),
+                Some("nosniff")
+            );
+        };
+
+        // Sem Range: o documento inteiro, com o tamanho anunciado.
+        let full = serve("GET", None);
+        common(&full);
+        assert_eq!(full.status(), 200);
+        assert_eq!(header(&full, "Content-Length"), Some(total.to_string()));
+        assert_eq!(header(&full, "Content-Range"), None);
+        assert_eq!(full.body().as_ref(), document.as_slice());
+
+        // Faixa: so a fatia, com o Content-Range certo.
+        let slice = serve("GET", Some("bytes=9-12"));
+        common(&slice);
+        assert_eq!(slice.status(), 206);
+        assert_eq!(header(&slice, "Content-Length").as_deref(), Some("4"));
+        assert_eq!(
+            header(&slice, "Content-Range"),
+            Some(format!("bytes 9-12/{total}"))
+        );
+        assert_eq!(slice.body().as_ref(), b"0123");
+
+        let tail = serve("GET", Some("bytes=15-"));
+        assert_eq!(tail.status(), 206);
+        assert_eq!(
+            header(&tail, "Content-Range"),
+            Some(format!("bytes 15-{}/{total}", total - 1))
+        );
+        assert_eq!(tail.body().as_ref(), b"6789");
+
+        let suffix = serve("GET", Some("bytes=-2"));
+        assert_eq!(suffix.status(), 206);
+        assert_eq!(
+            header(&suffix, "Content-Range"),
+            Some(format!("bytes {}-{}/{total}", total - 2, total - 1))
+        );
+        assert_eq!(suffix.body().as_ref(), b"89");
+
+        // Varias faixas: 200 com tudo, e sem Content-Range.
+        let multi = serve("GET", Some("bytes=0-1,3-4"));
+        common(&multi);
+        assert_eq!(multi.status(), 200);
+        assert_eq!(header(&multi, "Content-Range"), None);
+        assert_eq!(multi.body().as_ref(), document.as_slice());
+
+        // Insatisfazivel: 416, corpo vazio, o total no Content-Range.
+        let beyond = serve("GET", Some("bytes=100-200"));
+        common(&beyond);
+        assert_eq!(beyond.status(), 416);
+        assert_eq!(header(&beyond, "Content-Length").as_deref(), Some("0"));
+        assert_eq!(
+            header(&beyond, "Content-Range"),
+            Some(format!("bytes */{total}"))
+        );
+        assert!(beyond.body().is_empty());
+
+        // HEAD: os cabecalhos do GET correspondente, sem corpo.
+        let head = serve("HEAD", None);
+        common(&head);
+        assert_eq!(head.status(), 200);
+        assert_eq!(header(&head, "Content-Length"), Some(total.to_string()));
+        assert!(head.body().is_empty());
+        let head_range = serve("HEAD", Some("bytes=9-12"));
+        assert_eq!(head_range.status(), 206);
+        assert_eq!(header(&head_range, "Content-Length").as_deref(), Some("4"));
+        assert_eq!(
+            header(&head_range, "Content-Range"),
+            Some(format!("bytes 9-12/{total}"))
+        );
+        assert!(head_range.body().is_empty());
+
+        // Sem documento aberto: 200 vazio sem Range, 416 com Range.
+        bytes.lock().expect("slot de teste").clear();
+        let empty = serve("GET", None);
+        assert_eq!(empty.status(), 200);
+        assert_eq!(header(&empty, "Content-Length").as_deref(), Some("0"));
+        assert!(empty.body().is_empty());
+        let empty_range = serve("GET", Some("bytes=0-"));
+        assert_eq!(empty_range.status(), 416);
+        assert_eq!(
+            header(&empty_range, "Content-Range").as_deref(),
+            Some("bytes */0")
+        );
+        assert!(empty_range.body().is_empty());
     }
 
     #[test]
@@ -6885,7 +8489,6 @@ mod tests {
             ("keymap", NEURALIA_KEYMAP_SCRIPT),
             ("return", EXTERNAL_RETURN_BUTTON),
             ("gmail", GMAIL_MONITOR_SCRIPT),
-            ("palette", NEURALIA_PALETTE_SCRIPT),
             ("comparator", COMPARATOR_INJECT_SCRIPT),
         ] {
             assert!(script.contains("__NEURALIA_CAP__"), "{name}");
@@ -6926,9 +8529,6 @@ mod tests {
                 assert!(!script.contains(forbidden), "{name}: {forbidden}");
             }
         }
-        assert!(NEURALIA_PALETTE_SCRIPT.contains("listen(input, 'keydown'"));
-        assert!(!NEURALIA_PALETTE_SCRIPT.contains("Object.assign("));
-        assert!(!NEURALIA_PALETTE_SCRIPT.contains("document.createElement("));
 
         // Nenhum handler que leve o token responde a eventos sinteticos, e os
         // botoes nao expoem o handler em `onclick`.
@@ -6941,7 +8541,6 @@ mod tests {
         assert!(!COMPARATOR_INJECT_SCRIPT.contains("expand.onclick"));
         assert!(!COMPARATOR_INJECT_SCRIPT.contains("minimize.onclick"));
         assert!(EXTERNAL_RETURN_BUTTON.contains("if (!event.isTrusted) return;"));
-        assert!(NEURALIA_PALETTE_SCRIPT.contains("if (!event.isTrusted) return;"));
         assert!(NEURALIA_KEYMAP_SCRIPT.contains("if (!e.isTrusted) { return; }"));
 
         // Redireccionador do Google: o dominio e os subdominios, nao um sufixo.
@@ -7019,11 +8618,223 @@ mod tests {
     #[test]
     fn comparator_has_split_palette_and_real_three_way_submit() {
         assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia:split?col="));
-        assert!(NEURALIA_PALETTE_SCRIPT.contains("neuralia:palette?col="));
+        // A pagina so pede a palette: o pedido leva a coluna e o token, e
+        // nunca um `q` -- o texto e escrito no controlo nativo.
+        let palette_request = NEURALIA_KEYMAP_SCRIPT
+            .split("'neuralia:palette?col=' + colIndex")
+            .nth(1)
+            .and_then(|rest| rest.split(';').next())
+            .expect("keymap palette request");
+        assert!(palette_request.contains("'&cap=' + encode(capability)"));
+        assert!(!palette_request.contains("q="));
         assert!(SPLIT_SCROLL_RAIL_SCRIPT.contains("neuralia-split-scroll-rail"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("chatgpt.com"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("claude.ai"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("button.click()"));
+    }
+
+    #[test]
+    fn palette_is_native_and_the_page_can_only_ask_for_it() {
+        let source = include_str!("windows_app.rs");
+        // Nenhum script injetado cria a palette no DOM nem a abre por evento.
+        assert!(!source.contains(concat!("NEURALIA_PALETTE", "_SCRIPT")));
+        assert!(!source.contains(concat!("neuralia-open-", "palette")));
+        assert!(!NEURALIA_KEYMAP_SCRIPT.contains("CustomEvent"));
+
+        // Os handlers de navegacao so traduzem o pedido em OpenPalette com a
+        // coluna do proprio WebView: nem `q` nem `col` do pedido sao lidos.
+        for builder in ["fn comparator_webview_builder", "fn split_webview_builder"] {
+            let handler = source
+                .split(builder)
+                .nth(1)
+                .and_then(|part| part.split("\"neuralia:palette\"").nth(1))
+                .and_then(|part| part.split("return false;").next())
+                .expect(builder);
+            assert!(!handler.contains("neuralia_query_param"), "{builder}");
+            assert!(!handler.contains("PaletteSubmit"), "{builder}");
+            assert!(handler.contains("UserEvent::OpenPalette("), "{builder}");
+        }
+
+        // Quem submete e a subclasse do EDIT nativo, a partir do PaletteHost.
+        let edit = source
+            .split("fn palette_edit_subclass")
+            .nth(1)
+            .and_then(|part| part.split("unsafe fn window_text").next())
+            .expect("edit subclass");
+        assert!(edit.contains("window_text(hwnd)"));
+        assert!(edit.contains("host.source.get()"));
+        assert!(edit.contains("UserEvent::PaletteSubmit {"));
+        assert!(edit.contains("VK_ESCAPE"));
+        assert!(edit.contains("WM_KILLFOCUS"));
+
+        // O popup precisa de foco (sem NOACTIVATE) e nao e um aviso (sem
+        // TOPMOST); o EDIT tem o mesmo limite e a mesma pista que a omnibox.
+        let show = source
+            .split("fn show_palette")
+            .nth(1)
+            .and_then(|part| part.split("fn position_palette").next())
+            .expect("show_palette body");
+        assert!(!show.contains("WS_EX_NOACTIVATE"));
+        assert!(!show.contains("WS_EX_TOPMOST"));
+        assert!(show.contains("WS_POPUP"));
+        assert!(show.contains("ES_AUTOHSCROLL"));
+        assert!(show.contains("EM_SETLIMITTEXT, 2048"));
+        assert!(show.contains("EM_SETCUEBANNER"));
+        assert!(show.contains("SetFocus(edit)"));
+    }
+
+    #[test]
+    fn palette_routes_private_input_away_from_the_normal_column() {
+        let split = |route: PaletteRoute| match route {
+            PaletteRoute::OpenSplit { url, private } => (url.to_string(), private),
+            other => panic!("esperava OpenSplit, veio {other:?}"),
+        };
+        assert_eq!(
+            split(route_palette("https://example.org/a", 0, true)),
+            ("https://example.org/a".to_string(), true)
+        );
+        assert_eq!(
+            split(route_palette("https://example.org/a", 1, false)),
+            ("https://example.org/a".to_string(), false)
+        );
+        // Rede local digitada pelo utilizador: a palette e entrada nativa, nao
+        // da pagina, por isso a rota nao a barra (SPEC-0015).
+        assert_eq!(
+            split(route_palette("http://localhost:8080/", 0, false)),
+            ("http://localhost:8080/".to_string(), false)
+        );
+        assert_eq!(
+            split(route_palette("http://192.168.1.1/", 2, true)),
+            ("http://192.168.1.1/".to_string(), true)
+        );
+
+        assert_eq!(
+            route_palette("qual a capital de Angola", 2, true),
+            PaletteRoute::OpenPrivateProvider {
+                query: "qual a capital de Angola".to_string()
+            }
+        );
+        assert_eq!(
+            route_palette("  qual a capital de Angola  ", 2, false),
+            PaletteRoute::LoadProvider {
+                query: "qual a capital de Angola".to_string()
+            }
+        );
+        assert_eq!(route_palette("home:", 0, true), PaletteRoute::Home);
+        assert_eq!(route_palette("   ", 0, false), PaletteRoute::Invalid(None));
+        assert_eq!(
+            route_palette("texto", COMPARATOR_COLUMNS, false),
+            PaletteRoute::Invalid(None)
+        );
+        assert!(matches!(
+            route_palette("javascript:alert(1)", 0, false),
+            PaletteRoute::Invalid(Some(_))
+        ));
+    }
+
+    #[test]
+    fn private_palette_paths_never_touch_history_or_context_tabs() {
+        let source = include_str!("windows_app.rs");
+        let submit = source
+            .split("fn submit_palette")
+            .nth(1)
+            .and_then(|part| part.split("fn go_back").next())
+            .expect("submit body");
+        // So o caminho normal (LoadProvider) grava historico, e e o ultimo
+        // braco: tudo o que vem antes (URL, privado) nunca chama record().
+        let (before, load_provider) = submit
+            .split_once("PaletteRoute::LoadProvider")
+            .expect("LoadProvider arm");
+        assert!(!before.contains("record("));
+        assert_eq!(load_provider.matches("self.record(").count(), 1);
+        assert!(before.contains("PaletteRoute::OpenPrivateProvider"));
+        assert!(before.contains("open_split_mode(source_index, url.to_string(), false, true)"));
+
+        // open_split_mode so escreve memoria e abas quando nao e privado; e
+        // OpenPrivateSplit entra sempre com private = true.
+        let split = source
+            .split("fn open_split_mode")
+            .nth(1)
+            .and_then(|part| part.split("fn open_private_panel").next())
+            .expect("split body");
+        assert_eq!(split.matches("if !private").count(), 2);
+        assert!(!split.contains("self.record("));
+        let private_split = source
+            .split("UserEvent::OpenPrivateSplit { source_index, url } =>")
+            .nth(1)
+            .and_then(|part| part.split("UserEvent::NewTab").next())
+            .expect("OpenPrivateSplit arm");
+        assert!(private_split.contains("open_split_mode(source_index, url, false, true)"));
+    }
+
+    #[test]
+    fn column_spans_share_the_width_and_the_palette_sits_on_its_column() {
+        let spans = visible_column_spans(1200.0, 3, &[1.0; 3], &[false; 3]);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(
+            spans[1],
+            ColumnSpan {
+                index: 1,
+                x: 400.0,
+                width: 400.0
+            }
+        );
+        assert_eq!(spans[2].x + spans[2].width, 1200.0);
+
+        // Coluna minimizada nao ocupa faixa; a ultima absorve o resto.
+        let spans = visible_column_spans(1000.0, 3, &[2.0, 1.0, 1.0], &[false, true, false]);
+        assert_eq!(
+            spans.iter().map(|span| span.index).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert!((spans[0].width - 2000.0 / 3.0).abs() < 1e-9);
+        assert!((spans[1].x + spans[1].width - 1000.0).abs() < 1e-9);
+
+        // Pesos nulos nao dividem por zero; menos colunas que o maximo tambem.
+        let spans = visible_column_spans(900.0, 3, &[0.0; 3], &[false; 3]);
+        assert!((spans[0].width - 300.0).abs() < 1e-9);
+        assert_eq!(
+            visible_column_spans(900.0, 2, &[1.0; 3], &[false; 3]).len(),
+            2
+        );
+        assert!(visible_column_spans(900.0, 3, &[1.0; 3], &[true; 3]).is_empty());
+
+        // Palette: centrada na coluna, nunca mais larga que ela menos as
+        // margens, e nunca acima da barra.
+        let geometry = palette_geometry(
+            ColumnSpan {
+                index: 1,
+                x: 400.0,
+                width: 400.0,
+            },
+            800.0,
+        );
+        assert_eq!(geometry.width, 352.0);
+        assert_eq!(geometry.x, 424.0);
+        assert_eq!(geometry.height, PALETTE_HEIGHT);
+        assert!(geometry.y > COMPARATOR_CHROME_HEIGHT);
+        let wide = palette_geometry(
+            ColumnSpan {
+                index: 0,
+                x: 0.0,
+                width: 1600.0,
+            },
+            800.0,
+        );
+        assert_eq!(wide.width, PALETTE_MAX_WIDTH);
+        assert_eq!(wide.x, 460.0);
+        let narrow = palette_geometry(
+            ColumnSpan {
+                index: 2,
+                x: 700.0,
+                width: 100.0,
+            },
+            800.0,
+        );
+        assert_eq!(narrow.width, PALETTE_MIN_WIDTH);
+
+        assert!(palette_hint("ChatGPT", false).contains("ChatGPT"));
+        assert!(palette_hint("ChatGPT", true).contains("privado"));
     }
 
     #[test]
@@ -7056,6 +8867,32 @@ mod tests {
     fn comparator_resize_uses_persistent_weights_and_native_splitters() {
         let weights = [1.0_f64; COMPARATOR_COLUMNS];
         assert!(weights.iter().all(|weight| *weight > 0.0));
+
+        // O arrasto e coalescido: a subclasse publica a ultima posicao e so
+        // acorda o event loop quando nao ha pedido pendente. Sem isto cada
+        // WM_MOUSEMOVE reposicionava tres WebView2 a mais de 100 Hz.
+        let source = include_str!("windows_app.rs");
+        let subclass = source
+            .split("fn comparator_splitter_subclass")
+            .nth(1)
+            .and_then(|part| part.split("fn exit_button_subclass").next())
+            .expect("subclass body");
+        assert!(subclass.contains("RESIZE_X.store("));
+        assert!(subclass.contains("RESIZE_PENDING.swap(true"));
+        assert!(!subclass.contains("ResizeComparator {"));
+
+        // E o handler liberta a marca ANTES de ler, para nao engolir o
+        // movimento que chegar a meio do reposicionamento.
+        let handler = source
+            .split("UserEvent::ResizeComparator =>")
+            .nth(1)
+            .and_then(|part| part.split("UserEvent::RestoreComparator").next())
+            .expect("handler body");
+        let cleared = handler
+            .find("RESIZE_PENDING.store(false")
+            .expect("limpa a marca");
+        let read = handler.find("RESIZE_X.load(").expect("le a posicao");
+        assert!(cleared < read);
     }
 
     #[test]
@@ -7126,8 +8963,126 @@ mod tests {
     }
 
     #[test]
+    fn gmail_monitor_observer_is_coalesced_like_the_others() {
+        // O observer so ve a arvore (childList+subtree), passa por um quadro
+        // e so depois pelo debounce; o emit periodico continua como rede.
+        assert!(GMAIL_MONITOR_SCRIPT.contains("requestAnimationFrame"));
+        assert!(GMAIL_MONITOR_SCRIPT.contains("childList:true, subtree:true"));
+        // Pela sintaxe das opcoes, nao pela palavra: o comentario do script
+        // explica porque se tiraram e usa os mesmos nomes.
+        assert!(!GMAIL_MONITOR_SCRIPT.contains("characterData:true"));
+        assert!(!GMAIL_MONITOR_SCRIPT.contains("attributes:true"));
+        assert!(GMAIL_MONITOR_SCRIPT.contains("setTimeout(emit, 450)"));
+        assert!(GMAIL_MONITOR_SCRIPT.contains("setInterval(emit, 15000)"));
+    }
+
+    #[test]
+    fn gmail_fields_are_capped_natively_on_char_boundary() {
+        let long = "a".repeat(1000);
+        assert_eq!(gmail_field(long).chars().count(), GMAIL_FIELD_MAX_CHARS);
+
+        // Dois bytes por char: cortar por bytes cairia a meio de um 'ç'.
+        let accented = "ç".repeat(1000);
+        let cut = gmail_field(accented);
+        assert_eq!(cut.chars().count(), GMAIL_FIELD_MAX_CHARS);
+        assert!(cut.chars().all(|c| c == 'ç'));
+
+        // O que cabe nao e tocado.
+        assert_eq!(
+            gmail_field("Ana <ana@example.com>".to_string()),
+            "Ana <ana@example.com>"
+        );
+        assert_eq!(gmail_field(String::new()), "");
+        let exact = "x".repeat(GMAIL_FIELD_MAX_CHARS);
+        assert_eq!(gmail_field(exact.clone()), exact);
+    }
+
+    #[test]
+    fn gmail_monitor_switch_depends_on_presence_not_value() {
+        assert!(gmail_monitor_enabled_for(None));
+        assert!(!gmail_monitor_enabled_for(Some(OsString::from("1"))));
+        // Interruptor de privacidade: definir mal ainda desliga.
+        assert!(!gmail_monitor_enabled_for(Some(OsString::from("0"))));
+        assert!(!gmail_monitor_enabled_for(Some(OsString::new())));
+    }
+
+    #[test]
+    fn timer_queue_pops_in_deadline_order_with_arrival_tiebreak() {
+        let base = Instant::now();
+        let mut queue = TimerQueue::new();
+        queue.push(base + Duration::from_millis(300), "c");
+        queue.push(base + Duration::from_millis(100), "a1");
+        queue.push(base + Duration::from_millis(200), "b");
+        queue.push(base + Duration::from_millis(100), "a2");
+
+        assert_eq!(
+            queue.next_deadline(),
+            Some(base + Duration::from_millis(100))
+        );
+
+        let far = base + Duration::from_secs(10);
+        let mut order = Vec::new();
+        while let Some(event) = queue.pop_due(far) {
+            order.push(event);
+        }
+        // Prazos iguais saem na ordem em que foram pedidos.
+        assert_eq!(order, vec!["a1", "a2", "b", "c"]);
+        assert_eq!(queue.next_deadline(), None);
+    }
+
+    #[test]
+    fn timer_queue_only_pops_what_is_due() {
+        let base = Instant::now();
+        let mut queue = TimerQueue::new();
+        queue.push(base + Duration::from_millis(50), "soon");
+        queue.push(base + Duration::from_millis(500), "later");
+
+        // Antes do primeiro prazo nada sai, mas a fila diz quanto dormir.
+        assert_eq!(queue.pop_due(base), None);
+        assert_eq!(
+            queue.next_deadline(),
+            Some(base + Duration::from_millis(50))
+        );
+
+        // No prazo exacto ja conta como vencido.
+        assert_eq!(
+            queue.pop_due(base + Duration::from_millis(50)),
+            Some("soon")
+        );
+        assert_eq!(queue.pop_due(base + Duration::from_millis(51)), None);
+        assert_eq!(
+            queue.next_deadline(),
+            Some(base + Duration::from_millis(500))
+        );
+
+        assert_eq!(
+            queue.pop_due(base + Duration::from_millis(500)),
+            Some("later")
+        );
+        assert_eq!(queue.next_deadline(), None);
+    }
+
+    #[test]
+    fn timer_queue_empty_has_no_deadline_and_pops_nothing() {
+        let mut queue: TimerQueue<u8> = TimerQueue::new();
+        assert_eq!(queue.next_deadline(), None);
+        assert_eq!(queue.pop_due(Instant::now()), None);
+        assert_eq!(
+            queue.pop_due(Instant::now() + Duration::from_secs(3600)),
+            None
+        );
+
+        // Esvaziar e voltar a encher nao deixa nada para tras.
+        let now = Instant::now();
+        queue.push(now, 7);
+        assert_eq!(queue.pop_due(now), Some(7));
+        assert_eq!(queue.next_deadline(), None);
+        assert_eq!(queue.pop_due(now), None);
+    }
+
+    #[test]
     fn context_tabs_live_in_browser_title_bar() {
-        let layout = BarLayout::with_contexts(1600.0, 1.0, true, 3, [3, 3, 3]);
+        let layout = BarLayout::with_contexts(1600.0, 1.0, true, BarColumns::even(3), [3, 3, 3]);
         assert_eq!(layout.height, COMPARATOR_CHROME_HEIGHT);
         for index in 0..3 {
             let provider = layout.columns[index];
@@ -7147,7 +9102,7 @@ mod tests {
 
     #[test]
     fn title_bar_window_controls_are_hit_tested() {
-        let layout = BarLayout::with_contexts(1400.0, 1.0, true, 3, [1, 1, 1]);
+        let layout = BarLayout::with_contexts(1400.0, 1.0, true, BarColumns::even(3), [1, 1, 1]);
         let center = |r: UiRect| (r.x + r.width / 2.0, r.y + r.height / 2.0);
         let (x, y) = center(layout.window_minimize);
         assert_eq!(layout.hit(x, y), Some(BarHit::WindowMinimize));
@@ -7173,7 +9128,7 @@ mod tests {
 
     #[test]
     fn grouped_tabs_have_plus_and_context_hits() {
-        let layout = BarLayout::with_contexts(1600.0, 1.0, true, 3, [2, 1, 4]);
+        let layout = BarLayout::with_contexts(1600.0, 1.0, true, BarColumns::even(3), [2, 1, 4]);
 
         for index in 0..3 {
             let plus = layout.add_tabs[index];
@@ -7198,9 +9153,187 @@ mod tests {
         );
     }
 
+    /// A barra tem de usar a MESMA reparticao que os WebViews. Antes recebia
+    /// so o numero de colunas e desenhava tres partes iguais: depois de
+    /// arrastar um divisor o rotulo da IA ficava sobre a coluna do lado, e o
+    /// hit-testing -- que le as mesmas caixas -- ia atras dele.
+    #[test]
+    fn bar_columns_follow_the_dragged_weights() {
+        let dragged = BarColumns {
+            count: 3,
+            weights: [2.0, 1.0, 1.0],
+            minimized: [false; COMPARATOR_COLUMNS],
+            split_active: false,
+        };
+        let layout = BarLayout::with_contexts(1600.0, 1.0, true, dragged, [0; 3]);
+        let spans = visible_column_spans(1600.0, 3, &dragged.weights, &dragged.minimized);
+
+        for span in &spans {
+            let provider = layout.columns[span.index];
+            let plus = layout.add_tabs[span.index];
+            assert!(
+                provider.x >= span.x,
+                "coluna {} comeca antes da sua faixa",
+                span.index
+            );
+            assert!(
+                plus.x + plus.width <= span.x + span.width,
+                "o + da coluna {} passa para a faixa seguinte",
+                span.index
+            );
+            let center = (
+                provider.x + provider.width / 2.0,
+                provider.y + provider.height / 2.0,
+            );
+            assert_eq!(
+                layout.hit(center.0, center.1),
+                Some(BarHit::Column(span.index))
+            );
+        }
+
+        // A primeira coluna e a mais larga: o rotulo do meio tem de ter
+        // andado para a direita face as colunas iguais.
+        let even = BarLayout::new(1600.0, 1.0, true, 3);
+        assert!(layout.columns[1].x > even.columns[1].x);
+    }
+
+    /// Coluna minimizada continua na barra, como chip encostado a direita:
+    /// e o unico sitio por onde ela volta.
+    #[test]
+    fn minimized_columns_become_chips_next_to_the_right_controls() {
+        let state = BarColumns {
+            count: 3,
+            weights: [1.0; COMPARATOR_COLUMNS],
+            minimized: [false, true, false],
+            split_active: false,
+        };
+        let layout = BarLayout::with_contexts(1600.0, 1.0, true, state, [0; 3]);
+        assert_eq!(layout.minimized, [false, true, false]);
+
+        let chip = layout.columns[1];
+        let controls = right_controls(1600.0, 1.0, false);
+        assert!(chip.width > 0.0);
+        assert!(
+            chip.x + chip.width <= controls.private.x,
+            "o chip nao pode tapar o botao Privado"
+        );
+        assert!(
+            chip.x > layout.columns[2].x + layout.columns[2].width,
+            "o chip fica a direita das colunas que ainda se veem"
+        );
+        assert_eq!(
+            layout.hit(chip.x + chip.width / 2.0, chip.y + chip.height / 2.0),
+            Some(BarHit::Column(1)),
+            "clicar no chip tem de restaurar a coluna"
+        );
+        // Sem faixa nao ha onde abrir uma aba: o "+" desaparece e nao rouba
+        // o clique ao canto superior esquerdo da janela.
+        assert_eq!(layout.add_tabs[1].width, 0.0);
+        assert_eq!(layout.hit(0.0, 0.0), None);
+
+        // As duas que ficam repartem a largura toda, tal como as WebViews.
+        let spans = visible_column_spans(1600.0, 3, &state.weights, &state.minimized);
+        assert_eq!(spans.len(), 2);
+        for span in &spans {
+            assert!(layout.columns[span.index].x >= span.x);
+        }
+    }
+
+    /// Com a gaveta aberta os controlos do Split ocupam o canto; o Privado
+    /// recua e tudo o que se encosta a direita recua com ele.
+    #[test]
+    fn right_controls_make_room_for_the_split_drawer() {
+        let plain = right_controls(1600.0, 1.0, false);
+        assert!(plain.split.is_none());
+        assert_eq!(plain.private.x + plain.private.width, 1600.0 - 8.0);
+
+        let drawer = right_controls(1600.0, 1.0, true);
+        let (label, expand, close) = drawer.split.expect("ha gaveta");
+        assert_eq!(close.x + close.width, 1600.0 - 8.0);
+        assert!(expand.x + expand.width < close.x);
+        assert!(label.x + label.width < expand.x);
+        assert!(drawer.private.x + drawer.private.width <= label.x);
+    }
+
+    /// Arrastar um divisor so mexe no par vizinho, nunca fecha um painel
+    /// abaixo do minimo e nao inventa nem perde largura pelo caminho.
+    #[test]
+    fn resized_weights_keep_the_total_and_the_minimum() {
+        let weights = [1.0, 1.0, 1.0];
+        let visible = [0usize, 1, 2];
+        let total = |w: &[f64; COMPARATOR_COLUMNS]| w.iter().sum::<f64>();
+
+        // Divisor 0 largado a 600 de 1200: a esquerda fica com 600 dos 800
+        // do par, a direita com o resto, e a terceira coluna nao se mexe.
+        let next = resized_weights(&weights, &visible, 0, 600.0, 1200.0);
+        assert!((next[0] - 1.5).abs() < 1e-9);
+        assert!((next[1] - 0.5).abs() < 1e-9);
+        assert_eq!(next[2], weights[2]);
+        assert!((total(&next) - total(&weights)).abs() < 1e-9);
+
+        // Puxar para fora do ecra nao colapsa o painel: para no minimo.
+        let crushed = resized_weights(&weights, &visible, 0, -5000.0, 1200.0);
+        assert!((total(&crushed) - total(&weights)).abs() < 1e-9);
+        let span = 1200.0 * (crushed[0] + crushed[1]) / total(&crushed);
+        assert!((1200.0 * crushed[0] / total(&crushed) - MIN_PANEL_WIDTH).abs() < 1e-9);
+        let stretched = resized_weights(&weights, &visible, 0, 9000.0, 1200.0);
+        assert!(
+            (1200.0 * stretched[1] / total(&stretched) - MIN_PANEL_WIDTH).abs() < 1e-9,
+            "o painel da direita tambem tem minimo"
+        );
+        assert!(span > 2.0 * MIN_PANEL_WIDTH);
+
+        // O segundo divisor conta a partir do fim da primeira coluna.
+        let second = resized_weights(&weights, &visible, 1, 1000.0, 1200.0);
+        assert_eq!(second[0], weights[0]);
+        assert!(second[1] > weights[1] && second[2] < weights[2]);
+        assert!((total(&second) - total(&weights)).abs() < 1e-9);
+
+        // Uma coluna minimizada tira um divisor da conta: o que sobra nao
+        // existe e os pesos voltam intactos.
+        assert_eq!(
+            resized_weights(&weights, &[0, 2], 1, 600.0, 1200.0),
+            weights
+        );
+        assert_eq!(resized_weights(&weights, &[0], 0, 600.0, 1200.0), weights);
+    }
+
+    /// Splash, toast, botao de saida e divisores sao popups OWNED: ficam
+    /// acima do WebView2 por serem owned, nao por serem TOPMOST. Com TOPMOST
+    /// flutuavam sobre outras aplicacoes depois de um Alt+Tab.
+    #[test]
+    fn owned_popups_are_not_topmost() {
+        let source = include_str!("windows_app.rs");
+        let body = |from: &str, to: &str| {
+            source
+                .split(from)
+                .nth(1)
+                .and_then(|part| part.split(to).next())
+                .unwrap_or_else(|| panic!("corpo de {from}"))
+                .to_string()
+        };
+        for (from, to) in [
+            ("fn show_splash", "fn position_splash"),
+            ("fn show_gmail_toast", "fn position_gmail_toast"),
+            ("fn sync_exit_button", "fn position_exit_button"),
+            ("fn sync_comparator_splitters", "fn resize_comparator"),
+        ] {
+            let text = body(from, to);
+            assert!(
+                text.contains("CreateWindowExW"),
+                "{from} devia criar a janela"
+            );
+            assert!(
+                !text.contains("WS_EX_TOPMOST"),
+                "{from} nao pode pousar sobre as outras aplicacoes"
+            );
+        }
+    }
+
     #[test]
     fn bar_layout_hit_matches_drawing() {
         let layout = BarLayout::new(1600.0, 1.0, true, 3);
+        assert_eq!(layout.minimized, [false; COMPARATOR_COLUMNS]);
 
         // Cada grupo fica dentro da faixa horizontal da sua IA.
         for index in 0..3 {
@@ -7356,6 +9489,14 @@ const BRAND_ASPECT: f64 = 868.0 / 1200.0;
 
 const BRAND_COLORS: [Rgb; COMPARATOR_COLUMNS] = [(66, 133, 244), (16, 163, 127), (217, 119, 87)];
 
+/// Quanto tempo um tema lido do registo continua a valer. `Theme::system()` e
+/// chamada em WM_CTLCOLOREDIT, WM_ERASEBKGND, em cada divisor pintado e a cada
+/// frame da Home (15 FPS) — e cada chamada fazia DUAS leituras de registo. Com
+/// 1 s de validade o registo passa a ser lido uma vez por segundo, e a mudanca
+/// de tema nao fica por notar porque `ThemeChanged` invalida isto de imediato.
+const THEME_CACHE_TTL: Duration = Duration::from_secs(1);
+static THEME_CACHE: Mutex<Option<(Instant, Theme)>> = Mutex::new(None);
+
 #[derive(Debug, Clone, Copy)]
 struct Theme {
     accent: Rgb,
@@ -7366,16 +9507,39 @@ struct Theme {
     surface_line: Rgb,
     fg: Rgb,
     fg_muted: Rgb,
+    /// Guardado com o resto do tema para quem desenha nao voltar ao registo so
+    /// para saber se esta escuro (o fundo neural fazia-o duas vezes por frame).
+    dark: bool,
 }
 
 impl Theme {
     fn system() -> Self {
+        let mut cache = THEME_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((stamp, theme)) = *cache
+            && stamp.elapsed() < THEME_CACHE_TTL
+        {
+            return theme;
+        }
+        let theme = Self::read_system();
+        *cache = Some((Instant::now(), theme));
+        theme
+    }
+
+    /// A leitura verdadeira do registo; quem decide quando ela acontece e o
+    /// cache acima.
+    fn read_system() -> Self {
         let accent = system_accent();
         if system_dark_mode() {
             Self::dark(accent)
         } else {
             Self::light(accent)
         }
+    }
+
+    /// Obriga a proxima `system()` a reler o registo. Chamada quando o Windows
+    /// avisa que o tema mudou: esperar ate 1 s daria um piscar de cores velhas.
+    fn invalidate() {
+        *THEME_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
     fn dark(accent: Rgb) -> Self {
@@ -7389,6 +9553,7 @@ impl Theme {
             surface_line: (54, 59, 64),
             fg: (233, 236, 239),
             fg_muted: (152, 159, 166),
+            dark: true,
         }
     }
 
@@ -7403,6 +9568,7 @@ impl Theme {
             surface_line: (219, 223, 228),
             fg: (26, 29, 32),
             fg_muted: (106, 112, 119),
+            dark: false,
         }
     }
 
@@ -7535,7 +9701,44 @@ const ICON_SLOT_HOME: usize = COMPARATOR_COLUMNS;
 static AI_ICON_IMAGES: [OnceLock<RgbaImage>; COMPARATOR_COLUMNS] =
     [OnceLock::new(), OnceLock::new(), OnceLock::new()];
 static HOME_ICON_IMAGE: OnceLock<RgbaImage> = OnceLock::new();
-static ICON_SCALE_CACHE: Mutex<Vec<(usize, u32, RgbaImage)>> = Mutex::new(Vec::new());
+/// Tecto do cache de icones redimensionados. Ha 4 slots, mas o tamanho vem da
+/// escala da janela: arrastar a borda gera um tamanho novo por pixel percorrido
+/// e o cache antigo, sem limite, guardava um bitmap por cada um deles para
+/// sempre. 24 entradas chegam para os tamanhos que a barra usa de facto.
+const ICON_CACHE_CAPACITY: usize = 24;
+/// (slot, lado em pixeis) -> bitmap ja redimensionado, partilhado por `Arc`
+/// para o desenho nao copiar a imagem a cada WM_PAINT.
+type IconCacheEntry = ((usize, u32), Arc<RgbaImage>);
+static ICON_SCALE_CACHE: Mutex<Vec<IconCacheEntry>> = Mutex::new(Vec::new());
+
+/// LRU minimo sobre um vector: o fim e o mais recentemente usado, o inicio e o
+/// candidato a sair. Estao separadas do cache de icones de proposito — assim a
+/// politica de eviccao testa-se sem GDI, sem PNGs e sem estado global.
+///
+/// Devolve o valor se a chave existir, promovendo a entrada a mais recente.
+fn lru_promote<K: PartialEq, V: Clone>(entries: &mut Vec<(K, V)>, key: &K) -> Option<V> {
+    let index = entries.iter().position(|(cached, _)| cached == key)?;
+    let entry = entries.remove(index);
+    let value = entry.1.clone();
+    entries.push(entry);
+    Some(value)
+}
+
+/// Insere como mais recente, deitando fora as mais antigas ate caber em
+/// `capacity`. Uma chave repetida substitui a entrada antiga em vez de crescer.
+fn lru_insert<K: PartialEq, V>(entries: &mut Vec<(K, V)>, key: K, value: V, capacity: usize) {
+    if capacity == 0 {
+        entries.clear();
+        return;
+    }
+    if let Some(index) = entries.iter().position(|(cached, _)| *cached == key) {
+        entries.remove(index);
+    }
+    while entries.len() >= capacity {
+        entries.remove(0);
+    }
+    entries.push((key, value));
+}
 
 fn ai_icon(index: usize) -> &'static RgbaImage {
     AI_ICON_IMAGES[index.min(COMPARATOR_COLUMNS - 1)].get_or_init(|| {
@@ -7560,13 +9763,12 @@ fn home_icon() -> &'static RgbaImage {
     })
 }
 
-fn icon_scaled(slot: usize, size: u32) -> RgbaImage {
-    let mut cache = ICON_SCALE_CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((_, _, image)) = cache
-        .iter()
-        .find(|(cached_slot, cached_size, _)| *cached_slot == slot && *cached_size == size)
-    {
-        return image.clone();
+fn icon_scaled(slot: usize, size: u32) -> Arc<RgbaImage> {
+    let key = (slot, size);
+    let mut guard = ICON_SCALE_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    let entries = &mut *guard;
+    if let Some(image) = lru_promote(entries, &key) {
+        return image;
     }
 
     let source = if slot == ICON_SLOT_HOME {
@@ -7574,8 +9776,13 @@ fn icon_scaled(slot: usize, size: u32) -> RgbaImage {
     } else {
         ai_icon(slot)
     };
-    let scaled = image::imageops::resize(source, size, size, image::imageops::FilterType::Lanczos3);
-    cache.push((slot, size, scaled.clone()));
+    let scaled = Arc::new(image::imageops::resize(
+        source,
+        size,
+        size,
+        image::imageops::FilterType::Lanczos3,
+    ));
+    lru_insert(entries, key, Arc::clone(&scaled), ICON_CACHE_CAPACITY);
     scaled
 }
 
@@ -7594,7 +9801,9 @@ unsafe fn draw_icon(
         return;
     }
 
-    let image = icon_scaled(slot, size as u32);
+    // O cache entrega o `Arc`; aqui so se le, por isso basta emprestar.
+    let scaled = icon_scaled(slot, size as u32);
+    let image: &RgbaImage = &scaled;
     let mut pixels = Vec::with_capacity((size * size * 4) as usize);
     for py in 0..size as u32 {
         for px in 0..size as u32 {
@@ -7816,7 +10025,10 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
         case 't':
           e.preventDefault();
           if (typeof colIndex === 'number') {
-            window.dispatchEvent(new CustomEvent('neuralia-open-palette'));
+            // So o pedido de abertura: o texto vai ser escrito num controlo
+            // nativo, fora do alcance da pagina.
+            window.location.href = 'neuralia:palette?col=' + colIndex
+              + '&cap=' + encode(capability);
           } else if (key === 'k') {
             act('omnibox');
           } else {
@@ -7969,105 +10181,28 @@ const GMAIL_MONITOR_SCRIPT: &str = r#"
     debounce = setTimeout(emit, 450);
   }
 
+  // Como os outros observers deste ficheiro: uma chamada por quadro, nao uma
+  // por mutacao. A caixa de entrada muda o DOM em rajadas de centenas de
+  // registos e cada um fazia clearTimeout/setTimeout.
+  let raf = 0;
+  const coalesce = () => {
+    if (raf) return;
+    raf = requestAnimationFrame(() => { raf = 0; schedule(); });
+  };
+
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', schedule, { once:true });
   } else {
     schedule();
   }
 
-  new MutationObserver(schedule).observe(document.documentElement, {
-    subtree:true, childList:true, characterData:true, attributes:true
+  // So childList+subtree: attributes e characterData disparavam a cada
+  // realce de linha e a cada relogio que o Gmail redesenha. O que escapar
+  // apanha-se no emit() periodico.
+  new MutationObserver(coalesce).observe(document.documentElement, {
+    childList:true, subtree:true
   });
   setInterval(emit, 15000);
-})();
-"#;
-
-const NEURALIA_PALETTE_SCRIPT: &str = r#"
-(function () {
-  if (window.__neuralia_palette_ready) return;
-  window.__neuralia_palette_ready = true;
-  const capability = '__NEURALIA_CAP__';
-  // openPalette() corre tarde (a pagina tambem pode disparar o evento): tudo
-  // o que ele usa vem daqui, capturado antes de a pagina correr.
-  const colIndex = window.__neuralia_col_index;
-  const encode = encodeURIComponent;
-  const byId = document.getElementById.bind(document);
-  const createElement = document.createElement.bind(document);
-  const assign = Object.assign;
-  const listen = Function.prototype.call.bind(EventTarget.prototype.addEventListener);
-  const append = Function.prototype.call.bind(Node.prototype.appendChild);
-
-  function closePalette() {
-    const old = byId('neuralia-palette');
-    if (old) old.remove();
-  }
-
-  function openPalette() {
-    closePalette();
-    if (typeof colIndex !== 'number') return;
-
-    const shade = createElement('div');
-    shade.id = 'neuralia-palette';
-    assign(shade.style, {
-      position:'fixed', inset:'0', zIndex:'2147483647',
-      display:'flex', alignItems:'flex-start', justifyContent:'center',
-      paddingTop:'18vh', background:'rgba(0,0,0,.22)',
-      backdropFilter:'blur(2px)', fontFamily:'Segoe UI, system-ui, sans-serif'
-    });
-
-    const box = createElement('div');
-    assign(box.style, {
-      width:'min(680px, calc(100vw - 48px))', borderRadius:'18px',
-      padding:'12px 16px', background:'rgba(24,26,28,.97)',
-      border:'1px solid rgba(255,255,255,.12)',
-      boxShadow:'0 24px 80px rgba(0,0,0,.48)'
-    });
-
-    const input = createElement('input');
-    input.type = 'text';
-    input.autocomplete = 'off';
-    input.spellcheck = false;
-    input.placeholder = 'Pergunte à IA ativa ou digite uma URL';
-    assign(input.style, {
-      width:'100%', boxSizing:'border-box', border:'0', outline:'0',
-      background:'transparent', color:'#fff',
-      font:'500 18px Segoe UI, system-ui, sans-serif', padding:'9px 4px'
-    });
-
-    const hint = createElement('div');
-    hint.textContent = 'URL → abre ao lado   ·   texto → envia para '
-      + (window.__neuralia_col_name || 'IA') + '   ·   Esc fecha';
-    assign(hint.style, {
-      color:'rgba(255,255,255,.48)', fontSize:'11px', padding:'2px 4px 4px'
-    });
-
-    listen(input, 'keydown', (event) => {
-      if (!event.isTrusted) return;
-      event.stopPropagation();
-      if (event.key === 'Escape') {
-        event.preventDefault(); closePalette(); return;
-      }
-      if (event.key === 'Enter') {
-        event.preventDefault();
-        const value = input.value.trim();
-        if (!value) return;
-        window.location.href = 'neuralia:palette?col=' + colIndex
-          + '&q=' + encode(value)
-          + '&cap=' + encode(capability);
-      }
-    }, true);
-
-    listen(shade, 'mousedown', (event) => {
-      if (event.target === shade) closePalette();
-    });
-    append(box, input);
-    append(box, hint);
-    append(shade, box);
-    append(document.documentElement, shade);
-    setTimeout(() => input.focus(), 0);
-  }
-
-  window.addEventListener('neuralia-open-palette', openPalette);
 })();
 "#;
 
