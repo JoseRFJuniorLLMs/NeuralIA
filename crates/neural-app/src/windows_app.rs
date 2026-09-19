@@ -10137,10 +10137,11 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
   // Capturas no document-created, antes de a pagina correr: o que os atalhos
   // usam mais tarde com o token nao pode ser um global ja envenenado.
   const capability = '__NEURALIA_CAP__';
-  const encode = encodeURIComponent;
+  const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
+  const stringify = JSON.stringify;
   const colIndex = window.__neuralia_col_index;
-  function act(name) {
-    window.location.href = 'neuralia:' + name + '?cap=' + encode(capability);
+  function act(action, args) {
+    post(stringify({ v:1, cap:capability, action, args:args || {} }));
   }
 
   function findBar() {
@@ -10208,8 +10209,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
         case 'n':
           e.preventDefault();
           if (typeof colIndex === 'number') {
-            window.location.href = 'neuralia:newtab?col=' + colIndex
-              + '&cap=' + encode(capability);
+            act('newtab', { col:colIndex });
           } else {
             act('newtab');
           }
@@ -10220,8 +10220,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
           if (typeof colIndex === 'number') {
             // So o pedido de abertura: o texto vai ser escrito num controlo
             // nativo, fora do alcance da pagina.
-            window.location.href = 'neuralia:palette?col=' + colIndex
-              + '&cap=' + encode(capability);
+            act('palette', { col:colIndex });
           } else if (key === 'k') {
             act('omnibox');
           } else {
@@ -10258,8 +10257,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     if (key === '1' || key === '2' || key === '3') {
       if (typeof colIndex === 'number') {
         e.preventDefault();
-        window.location.href = 'neuralia:expand?col=' + (parseInt(key, 10) - 1)
-          + '&cap=' + encode(capability);
+        act('expand', { col:(parseInt(key, 10) - 1) });
       }
       return;
     }
@@ -10282,7 +10280,8 @@ const COMPARATOR_BUTTON_COLLAPSED: &str = "(function(){var b=document.querySelec
 const EXTERNAL_RETURN_BUTTON: &str = r#"
 (function () {
   const capability = '__NEURALIA_CAP__';
-  const encode = encodeURIComponent;
+  const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
+  const stringify = JSON.stringify;
   const defer = setTimeout;
   const cancelDefer = clearTimeout;
   const byId = document.getElementById.bind(document);
@@ -10304,7 +10303,7 @@ const EXTERNAL_RETURN_BUTTON: &str = r#"
     });
     listen(b, 'click', (event) => {
       if (!event.isTrusted) return;
-      window.location.href = 'neuralia:home?cap=' + encode(capability);
+      post(stringify({ v:1, cap:capability, action:'home', args:{} }));
     });
     append(document.documentElement, b);
   });
@@ -10316,8 +10315,8 @@ const GMAIL_MONITOR_SCRIPT: &str = r#"
   if (location.hostname !== 'mail.google.com' || window.__neuralia_gmail_monitor) return;
   window.__neuralia_gmail_monitor = true;
   const capability = '__NEURALIA_CAP__';
-  // emit() corre tarde, a partir do observer: o codificador e capturado agora.
-  const encode = encodeURIComponent;
+  const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
+  const stringify = JSON.stringify;
   let lastState = '';
   let debounce = 0;
 
@@ -10362,11 +10361,12 @@ const GMAIL_MONITOR_SCRIPT: &str = r#"
     if (state === lastState) return;
     lastState = state;
 
-    window.location.href = 'neuralia:gmail-state?count=' + count
-      + '&sender=' + encode(first.sender)
-      + '&subject=' + encode(first.subject)
-      + '&key=' + encode(first.key)
-      + '&cap=' + encode(capability);
+    post(stringify({
+      v:1,
+      cap:capability,
+      action:'gmail-state',
+      args:{ count, sender:first.sender, subject:first.subject, key:first.key }
+    }));
   }
 
   function schedule() {
@@ -10466,7 +10466,8 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
 const AGENT_OBSERVER_SCRIPT: &str = r#"
 (function () {
   const capability = '__NEURALIA_CAP__';
-  const encode = encodeURIComponent;
+  const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
+  const stringify = JSON.stringify;
   const listen = Function.prototype.call.bind(EventTarget.prototype.addEventListener);
   const defer = setTimeout;
   let generation = 0;
@@ -10534,8 +10535,12 @@ const AGENT_OBSERVER_SCRIPT: &str = r#"
       pageText,
       ...rows
     ].join('\n');
-    window.location.href = 'neuralia:agent-observation?data=' + encode(payload)
-      + '&cap=' + encode(capability);
+    post(stringify({
+      v:1,
+      cap:capability,
+      action:'agent-observation',
+      args:{ data:payload }
+    }));
   }
 
   function schedule() {
@@ -10824,7 +10829,13 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
   const colIndex = window.__neuralia_col_index ?? 0;
   const colName = window.__neuralia_col_name ?? 'IA';
   const capability = '__NEURALIA_CAP__';
-  const encode = encodeURIComponent;
+  const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
+  const stringify = JSON.stringify;
+  const defer = setTimeout;
+  const cancelDefer = clearTimeout;
+  function act(action, args) {
+    post(stringify({ v:1, cap:capability, action, args:args || {} }));
+  }
   const byId = document.getElementById.bind(document);
   const createElement = document.createElement.bind(document);
   const assign = Object.assign;
@@ -10863,9 +10874,7 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
         const text = researchAnswerText();
         if (text.length < 24 || text === lastResearchAnswer) return;
         lastResearchAnswer = text;
-        window.location.href = 'neuralia:research-answer?col=' + colIndex
-          + '&text=' + encode(text)
-          + '&cap=' + encode(capability);
+        act('research-answer', { col:colIndex, text });
       }, 1800);
     }
 
@@ -10947,8 +10956,7 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
       listen(expand, 'click', (event) => {
         if (!event.isTrusted) return;
         event.preventDefault(); event.stopPropagation();
-        window.location.href = 'neuralia:expand?col=' + colIndex
-          + '&cap=' + encode(capability);
+        act('expand', { col:colIndex });
       });
 
       const minimize = createElement('button');
@@ -10967,8 +10975,7 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
       listen(minimize, 'click', (event) => {
         if (!event.isTrusted) return;
         event.preventDefault(); event.stopPropagation();
-        window.location.href = 'neuralia:minimize?col=' + colIndex
-          + '&cap=' + encode(capability);
+        act('minimize', { col:colIndex });
       });
 
       const rail = createElement('div');
@@ -11209,9 +11216,7 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
       if (target.hostname === location.hostname) return;
       event.preventDefault();
       event.stopPropagation();
-      window.location.href = 'neuralia:split?col=' + colIndex
-        + '&url=' + encode(target.href)
-        + '&cap=' + encode(capability);
+      act('split', { col:colIndex, url:target.href });
     }, true);
 
     listen(document, 'dblclick', (event) => {
@@ -11222,8 +11227,7 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
         ? event.target.tagName.toUpperCase() : '';
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
       if (event.target && event.target.isContentEditable) return;
-      window.location.href = 'neuralia:expand?col=' + colIndex
-        + '&cap=' + encode(capability);
+      act('expand', { col:colIndex });
     }, true);
   });
 })();
