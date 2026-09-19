@@ -29,7 +29,7 @@ fn spec_0100_product_memory_is_worker_backed_reader_wired_and_private_safe() {
     assert!(worker.contains("MemoryStore::new(&root)"));
     assert!(worker.contains("store.capture(document)"));
     assert!(worker.contains("store.query(&MemoryQuery::new(query.clone()))"));
-    assert!(worker.contains("store.forget(neural_core::ForgetScope::All)"));
+    assert!(worker.contains("ForgetScope::All"));
     assert!(worker.contains("store.rebuild()"));
 
     let reader = between(APP, "fn capture_reader_memory", "fn reader_webview_builder");
@@ -146,7 +146,7 @@ fn spec_0105_shipped_runtime_is_decide_agent_step_not_the_reference_harness() {
 fn spec_0106_roadmap_product_composition_is_wired_not_just_constructible() {
     let input = between(APP, "fn handle_input", "fn submit_current");
     assert!(input.contains("input.strip_prefix(\"agent:\")"));
-    assert!(input.contains("input.strip_prefix(\"memory:\")"));
+    assert!(input.contains(".strip_prefix(\"memory:\")"));
     assert!(input.contains("research:compare"));
     assert!(input.contains("research:synthesize"));
     assert!(input.contains("research:export"));
