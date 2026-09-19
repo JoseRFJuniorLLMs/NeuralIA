@@ -1223,6 +1223,12 @@ unsafe extern "system" fn comparator_splitter_subclass(
     reference_data: usize,
 ) -> LRESULT {
     match message {
+        // A classe STATIC responde HTTRANSPARENT quando nao tem SS_NOTIFY: o
+        // sistema entrega entao o rato a janela de baixo -- aqui, o WebView2.
+        // Sem esta linha nenhum WM_LBUTTONDOWN chega, o SetCapture nunca corre
+        // e o arrasto do divisor e codigo morto. O botao de saida (1299) e a
+        // palette (1410) ja carregavam este mesmo override.
+        WM_NCHITTEST => return HTCLIENT as LRESULT,
         WM_LBUTTONDOWN => {
             SetCapture(hwnd);
             return 0;
@@ -8053,6 +8059,50 @@ fn render_brand_pixels(width: i32, height: i32, bg_rgb: Rgb) -> Vec<u8> {
 mod tests {
     use super::*;
     use windows_sys::Win32::Graphics::Gdi::GetDIBits;
+
+    /// O divisor do comparador tem de aceitar o rato.
+    ///
+    /// A classe STATIC responde `HTTRANSPARENT` ao `WM_NCHITTEST` quando nao
+    /// tem `SS_NOTIFY`, e o sistema entrega o rato a janela de baixo -- aqui, o
+    /// WebView2. Sem a interceccao, nenhum `WM_LBUTTONDOWN` chega ao divisor:
+    /// o `SetCapture` nunca corre, o `RESIZE_X` nunca e escrito, o
+    /// `UserEvent::ResizeComparator` nunca e enviado, e arrastar o divisor
+    /// seleciona texto na pagina em vez de mudar a largura das colunas.
+    #[test]
+    fn comparator_splitter_accepts_the_mouse() {
+        unsafe {
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!(""),
+                WS_POPUP,
+                0,
+                0,
+                8,
+                100,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!hwnd.is_null(), "a janela do divisor tem de nascer");
+
+            let subclassed = SetWindowSubclass(
+                hwnd,
+                Some(comparator_splitter_subclass),
+                SPLITTER_SUBCLASS_BASE,
+                0,
+            );
+            let hit = SendMessageW(hwnd, WM_NCHITTEST, 0, 0);
+            DestroyWindow(hwnd);
+
+            assert_ne!(subclassed, 0, "a subclasse tem de instalar");
+            assert_eq!(
+                hit, HTCLIENT as LRESULT,
+                "o divisor devolveu {hit} (HTTRANSPARENT e -1): o rato atravessa-o"
+            );
+        }
+    }
 
     #[test]
     fn test_stretch_dibits_on_screen_dc() {
