@@ -544,6 +544,48 @@ pub(super) fn rebuild(
     transaction.commit().map_err(io_error)
 }
 
+pub(super) fn candidate_ids(
+    path: &Path,
+    query_text: &str,
+    provider: Option<&str>,
+    session_id: Option<&str>,
+    limit: usize,
+) -> io::Result<Vec<String>> {
+    let terms = super::tokenize(query_text);
+    if terms.is_empty() || !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let match_query = terms
+        .into_iter()
+        .map(|term| format!("\"{}\"*", term.replace('"', """")))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let candidate_limit = limit.clamp(1, 512) as i64;
+
+    let connection = open_ready(path)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT kp.id
+             FROM knowledge_page_fts AS fts
+             JOIN knowledge_page AS kp ON kp.page_pk = fts.rowid
+             WHERE knowledge_page_fts MATCH ?1
+               AND (?2 IS NULL OR kp.provider = ?2)
+               AND (?3 IS NULL OR kp.research_session_id = ?3)
+             ORDER BY bm25(knowledge_page_fts), kp.last_seen_at DESC
+             LIMIT ?4",
+        )
+        .map_err(io_error)?;
+
+    statement
+        .query_map(params![match_query, provider, session_id, candidate_limit], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(io_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(io_error)
+}
+
 #[cfg(test)]
 fn inspect_pragmas(path: &Path) -> io::Result<(i64, String, i64)> {
     let connection = open_ready(path)?;
@@ -682,6 +724,64 @@ mod tests {
         assert_eq!(fake_count, 0);
         assert_eq!(audit_count, 1);
         drop(connection);
+
+        remove_sqlite_sidecars(&path);
+        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn fts_candidate_ids_respect_provider_and_session_filters() {
+        let path = temp_path("candidate-filters");
+
+        let mut alpha = document("rust consensus raft");
+        alpha.provider = Some("Claude".into());
+        alpha.session_id = Some("s1".into());
+        let session = ResearchSession {
+            id: "s1".into(),
+            title: "S1".into(),
+            question: "Q".into(),
+            created_at: alpha.created_at,
+            updated_at: alpha.last_seen_at,
+            items: Vec::new(),
+            syntheses: Vec::new(),
+        };
+        upsert(&path, &alpha, Some(&session)).unwrap();
+
+        let mut beta = document("rust consensus paxos");
+        beta.provider = Some("Gemini".into());
+        beta.session_id = Some("s2".into());
+        let session2 = ResearchSession {
+            id: "s2".into(),
+            title: "S2".into(),
+            question: "Q".into(),
+            created_at: beta.created_at,
+            updated_at: beta.last_seen_at,
+            items: Vec::new(),
+            syntheses: Vec::new(),
+        };
+        upsert(&path, &beta, Some(&session2)).unwrap();
+
+        let all = candidate_ids(&path, "rust consensus", None, None, 10).unwrap();
+        assert_eq!(all.len(), 2);
+
+        let claude = candidate_ids(&path, "rust", Some("Claude"), None, 10).unwrap();
+        assert_eq!(claude, vec![alpha.id.clone()]);
+
+        let s2 = candidate_ids(&path, "consensus", None, Some("s2"), 10).unwrap();
+        assert_eq!(s2, vec![beta.id.clone()]);
+
+        remove_sqlite_sidecars(&path);
+        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn fts_candidate_query_is_parameterized_and_handles_punctuation() {
+        let path = temp_path("candidate-punctuation");
+        let doc = document("C++ rust foo-bar quoted content");
+        upsert(&path, &doc, None).unwrap();
+
+        let hits = candidate_ids(&path, "rust " OR 1=1 --", None, None, 10).unwrap();
+        assert_eq!(hits, vec![doc.id.clone()]);
 
         remove_sqlite_sidecars(&path);
         let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
