@@ -2,6 +2,16 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [1.7.2] - 2026-09-19
+
+Title bar do comparador redesenhada como uma tab strip de navegador.
+
+### Changed
+- As abas/fontes abertas pelas IAs ficam agora na mesma faixa visual dos controles de janela, em vez de ao lado dos botões Gemini/ChatGPT/Claude.
+- O comparador usa chrome próprio em duas linhas: title bar com abas + minimizar/maximizar/fechar; segunda linha com Home, provedores, +, Privado e controles de Split View.
+- Áreas vazias da title bar arrastam a janela; controles de janela e abas mantêm hit-testing próprio.
+- O conteúdo, Split View e divisores foram reposicionados para começar abaixo do novo chrome de duas linhas.
+
 ## [1.7.1] - 2026-09-19
 
 Correção visual do comparador após mudanças de topologia dos painéis.
