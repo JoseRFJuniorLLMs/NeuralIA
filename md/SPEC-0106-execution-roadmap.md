@@ -1,6 +1,6 @@
 # SPEC-0106 — NeuralIA Execution Roadmap
 
-**Status:** Proposed planning document
+**Status:** Completed baseline — NeuralIA 2.0
 
 ## Objective
 
