@@ -103,6 +103,12 @@ enum UserEvent {
         source_index: usize,
         url: String,
     },
+    OpenPrivateSplit {
+        source_index: usize,
+        url: String,
+    },
+    OpenPrivatePanel,
+    NewTab(usize),
     CloseSplit,
     ToggleSplitFullscreen,
     /// Entrada da omnibox flutuante, sempre associada à IA que tinha foco.
@@ -293,6 +299,7 @@ enum BarHit {
     },
     SplitExpand,
     SplitClose,
+    Private,
 }
 
 /// Geometria da barra de topo: cada IA e um grupo com cabecalho, botao + e
@@ -481,6 +488,7 @@ struct SplitView {
     source_index: usize,
     url: String,
     fullscreen: bool,
+    private: bool,
 }
 
 struct ComparatorState {
@@ -959,6 +967,10 @@ unsafe extern "system" fn omnibox_subclass(
             }
             0x48 if ctrl => {
                 let _ = proxy.send_event(UserEvent::ShowHistory);
+                return 0;
+            }
+            0x4E if ctrl => {
+                let _ = proxy.send_event(UserEvent::NewTab(0));
                 return 0;
             }
             0x2E if ctrl && shift => {
@@ -1870,6 +1882,7 @@ impl App {
             .replace("__NEURALIA_CAP__", &capability);
 
         WebViewBuilder::new()
+            .with_incognito(private)
             .with_initialization_script(init_script)
             .with_navigation_handler(move |target| {
                 if let Some(event) = remote_neuralia_action(&target, &navigation_capability) {
@@ -2336,6 +2349,16 @@ impl App {
                     }
                     return false;
                 }
+                if target.starts_with("neuralia:newtab") {
+                    if remote_capability_matches(&target, &navigation_capability)
+                        && let Ok(action_url) = Url::parse(&target)
+                        && let Some((_, val)) = action_url.query_pairs().find(|(k, _)| k == "col")
+                        && let Ok(idx) = val.parse::<usize>()
+                    {
+                        let _ = navigation_proxy.send_event(UserEvent::NewTab(idx));
+                    }
+                    return false;
+                }
                 if target.starts_with("neuralia:expand") {
                     if remote_capability_matches(&target, &navigation_capability)
                         && let Ok(action_url) = Url::parse(&target)
@@ -2399,6 +2422,7 @@ impl App {
         source_index: usize,
         source_name: &'static str,
         allow_local: bool,
+        private: bool,
     ) -> WebViewBuilder<'static> {
         let navigation_proxy = self.proxy.clone();
         let new_window_proxy = self.proxy.clone();
@@ -2443,10 +2467,18 @@ impl App {
             })
             .with_new_window_req_handler(move |target, _features| {
                 if remote_web_target(&target, false) {
-                    let _ = new_window_proxy.send_event(UserEvent::OpenSplit {
-                        source_index,
-                        url: target,
-                    });
+                    let event = if private {
+                        UserEvent::OpenPrivateSplit {
+                            source_index,
+                            url: target,
+                        }
+                    } else {
+                        UserEvent::OpenSplit {
+                            source_index,
+                            url: target,
+                        }
+                    };
+                    let _ = new_window_proxy.send_event(event);
                 }
                 NewWindowResponse::Deny
             })
@@ -2455,6 +2487,16 @@ impl App {
     }
 
     fn open_split(&mut self, source_index: usize, url: String, allow_local: bool) {
+        self.open_split_mode(source_index, url, allow_local, false);
+    }
+
+    fn open_split_mode(
+        &mut self,
+        source_index: usize,
+        url: String,
+        allow_local: bool,
+        private: bool,
+    ) {
         if self.surface != Surface::Comparator {
             self.web(url);
             return;
@@ -2507,7 +2549,7 @@ impl App {
         };
 
         let result = self
-            .split_webview_builder(source_index, source_name, allow_local)
+            .split_webview_builder(source_index, source_name, allow_local, private)
             .with_bounds(bounds)
             .with_url(valid.as_str())
             .build_as_child(window);
@@ -2516,12 +2558,14 @@ impl App {
             Ok(webview) => {
                 let _ = webview.zoom(self.zoom);
                 if let Some(comp) = &mut self.comparator {
-                    let links = &mut comp.contexts[source_index];
-                    let value = valid.to_string();
-                    if links.last() != Some(&value) {
-                        links.push(value);
-                        if links.len() > 32 {
-                            links.remove(0);
+                    if !private {
+                        let links = &mut comp.contexts[source_index];
+                        let value = valid.to_string();
+                        if links.last() != Some(&value) {
+                            links.push(value);
+                            if links.len() > 32 {
+                                links.remove(0);
+                            }
                         }
                     }
                     comp.split = Some(SplitView {
@@ -2529,6 +2573,7 @@ impl App {
                         source_index,
                         url: valid.to_string(),
                         fullscreen: false,
+                        private,
                     });
                 }
                 self.update_comparator_layout();
@@ -2537,6 +2582,46 @@ impl App {
             Err(error) => {
                 self.show_splash(format!("Não consegui abrir a fonte ao lado: {error}"), 4)
             }
+        }
+    }
+
+    fn open_private_panel(&mut self) {
+        if self.surface != Surface::Comparator {
+            return;
+        }
+        let source_index = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| {
+                comp.expanded.or_else(|| {
+                    comp.views
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, _)| (!comp.minimized[index]).then_some(index))
+                })
+            })
+            .unwrap_or(0);
+        self.open_split_mode(
+            source_index,
+            "https://www.google.com/".to_string(),
+            false,
+            true,
+        );
+    }
+
+    fn new_tab(&mut self, source_index: usize) {
+        if self.surface == Surface::Comparator {
+            let index = source_index.min(COMPARATOR_COLUMNS - 1);
+            if let Some(comp) = &mut self.comparator
+                && comp.minimized[index]
+            {
+                comp.minimized[index] = false;
+            }
+            self.update_comparator_layout();
+            self.sync_comparator_splitters();
+            self.open_ai_palette(index);
+        } else {
+            self.focus_omnibox();
         }
     }
 
@@ -3590,6 +3675,30 @@ impl App {
         self.request_redraw();
     }
 
+    fn private_bar_rect(&self) -> Option<UiRect> {
+        let window = self.window.as_ref()?;
+        if self.surface != Surface::Comparator || !self.bar_visible() {
+            return None;
+        }
+        let scale = window.scale_factor().max(1.0);
+        let width = window.inner_size().width as f64;
+        let row_y = 7.0 * scale;
+        let row_h = 30.0 * scale;
+        let button_w = 78.0 * scale;
+        let margin = 8.0 * scale;
+        let right = if let Some((label, _, _)) = self.split_bar_rects() {
+            label.x - 6.0 * scale
+        } else {
+            width - margin
+        };
+        Some(UiRect {
+            x: right - button_w,
+            y: row_y,
+            width: button_w,
+            height: row_h,
+        })
+    }
+
     fn split_bar_rects(&self) -> Option<(UiRect, UiRect, UiRect)> {
         let (Some(window), Some(comp)) = (&self.window, &self.comparator) else {
             return None;
@@ -3628,6 +3737,11 @@ impl App {
     }
 
     fn comparator_bar_hit(&self) -> Option<BarHit> {
+        if let Some(private) = self.private_bar_rect()
+            && private.contains(self.cursor.0, self.cursor.1)
+        {
+            return Some(BarHit::Private);
+        }
         if let Some((_label, expand, close)) = self.split_bar_rects() {
             if close.contains(self.cursor.0, self.cursor.1) {
                 return Some(BarHit::SplitClose);
@@ -3830,6 +3944,7 @@ impl App {
     fn click_comparator(&mut self) {
         let hit = self.comparator_bar_hit();
         match hit {
+            Some(BarHit::Private) => self.open_private_panel(),
             Some(BarHit::SplitClose) => self.close_split(),
             Some(BarHit::SplitExpand) => self.toggle_split_fullscreen(),
             Some(BarHit::Home) => self.show_home(),
@@ -3965,6 +4080,11 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::OpenSplit { source_index, url } => {
                 self.open_split(source_index, url, false);
             }
+            UserEvent::OpenPrivateSplit { source_index, url } => {
+                self.open_split_mode(source_index, url, false, true);
+            }
+            UserEvent::OpenPrivatePanel => self.open_private_panel(),
+            UserEvent::NewTab(index) => self.new_tab(index),
             UserEvent::CloseSplit => self.close_split(),
             UserEvent::ToggleSplitFullscreen => self.toggle_split_fullscreen(),
             UserEvent::PaletteSubmit {
@@ -4217,6 +4337,7 @@ fn neuralia_action(target: &str) -> Option<UserEvent> {
         "print" => UserEvent::PrintPage,
         "omnibox" => UserEvent::FocusOmnibox,
         "history" => UserEvent::ShowHistory,
+        "newtab" => UserEvent::NewTab(0),
         "clearhistory" => UserEvent::ClearHistory,
         "fullscreen" => UserEvent::ToggleColumnFullscreen,
         "devtools" => UserEvent::OpenDevTools,
@@ -4620,7 +4741,14 @@ fn draw_comparator_bar(
             &comp.contexts,
             comp.split
                 .as_ref()
-                .map(|split| (split.source_index, split.url.as_str(), split.fullscreen)),
+                .map(|split| {
+                    (
+                        split.source_index,
+                        split.url.as_str(),
+                        split.fullscreen,
+                        split.private,
+                    )
+                }),
             visible,
             hover,
             auto_scroll,
@@ -4676,7 +4804,7 @@ unsafe fn paint_comparator_bar_with_contexts(
     scale: f64,
     names: &[&str],
     contexts: &[Vec<String>; COMPARATOR_COLUMNS],
-    active_context: Option<(usize, &str, bool)>,
+    active_context: Option<(usize, &str, bool, bool)>,
     visible: bool,
     hover: Option<BarHit>,
     auto_scroll: bool,
@@ -4773,7 +4901,7 @@ unsafe fn paint_comparator_bar_with_contexts(
                 continue;
             };
             let active = active_context
-                .is_some_and(|(source, active_url, _)| source == index && active_url == url);
+                .is_some_and(|(source, active_url, _, _)| source == index && active_url == url);
             let hovered = hover
                 == Some(BarHit::ContextTab {
                     source_index: index,
@@ -4799,7 +4927,35 @@ unsafe fn paint_comparator_bar_with_contexts(
         }
     }
 
-    if let Some((source_index, _url, fullscreen)) = active_context {
+    {
+        let margin = 8.0 * scale;
+        let row_y = 7.0 * scale;
+        let row_h = 30.0 * scale;
+        let button_w = 78.0 * scale;
+        let right = if active_context.is_some() {
+            width as f64 - margin - 30.0 * scale - 5.0 * scale - 30.0 * scale
+                - 5.0 * scale - 150.0 * scale - 6.0 * scale
+        } else {
+            width as f64 - margin
+        };
+        let rect = UiRect {
+            x: right - button_w,
+            y: row_y,
+            width: button_w,
+            height: row_h,
+        };
+        draw_button(
+            target,
+            rect,
+            "Privado",
+            hover == Some(BarHit::Private),
+            scale,
+            tab_font,
+            theme,
+        );
+    }
+
+    if let Some((source_index, _url, fullscreen, private_split)) = active_context {
         let margin = 8.0 * scale;
         let row_y = 7.0 * scale;
         let row_h = 30.0 * scale;
@@ -4829,7 +4985,11 @@ unsafe fn paint_comparator_bar_with_contexts(
         draw_pill(
             target,
             label,
-            &format!("Fonte · {source}"),
+            &if private_split {
+                format!("Privado · {source}")
+            } else {
+                format!("Fonte · {source}")
+            },
             PillStyle::new(theme.surface, theme.surface_line, theme.fg_muted),
             scale,
             tab_font,
@@ -5204,6 +5364,13 @@ mod tests {
 
             ReleaseDC(core::ptr::null_mut(), screen);
         }
+    }
+
+    #[test]
+    fn private_panel_and_new_tab_are_wired() {
+        assert!(NEURALIA_KEYMAP_SCRIPT.contains("neuralia:newtab?col="));
+        assert!(format!("{:?}", neuralia_action("neuralia:newtab")).starts_with("Some(NewTab"));
+        assert_ne!(BarHit::Private, BarHit::SplitClose);
     }
 
     #[test]
@@ -6037,6 +6204,15 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
         case 'r': e.preventDefault(); act('reload'); return;
         case 'l': e.preventDefault(); act('omnibox'); return;
         case 'h': e.preventDefault(); act('history'); return;
+        case 'n':
+          e.preventDefault();
+          if (typeof window.__neuralia_col_index === 'number') {
+            window.location.href = 'neuralia:newtab?col=' + window.__neuralia_col_index
+              + '&cap=' + encodeURIComponent(capability);
+          } else {
+            act('newtab');
+          }
+          return;
         case 'k':
         case 't':
           e.preventDefault();
