@@ -336,14 +336,19 @@ impl MemoryStore {
         }
 
         let candidate_limit = query.limit.clamp(1, 100).saturating_mul(16).min(512);
-        let candidate_ids = sqlite_v01::candidate_ids(
+        let (candidate_ids, candidate_degraded) = match sqlite_v01::candidate_ids(
             &self.sqlite_path(),
             query_text,
             query.provider.as_deref(),
             query.session_id.as_deref(),
             candidate_limit,
-        )
-        .unwrap_or_default();
+        ) {
+            Ok(ids) => (ids, None),
+            Err(error) => {
+                eprintln!("memory candidate lookup degraded to full scan: {error}");
+                (Vec::new(), Some(error.kind()))
+            }
+        };
 
         let used_sqlite_candidates = !candidate_ids.is_empty();
         let docs = if candidate_ids.is_empty() {
@@ -463,6 +468,10 @@ impl MemoryStore {
             .take(query.limit.clamp(1, 100))
             .map(|(index, score, matched)| {
                 let doc = &docs[index];
+                let mut matched_by = matched.into_iter().map(str::to_string).collect::<Vec<_>>();
+                if let Some(kind) = candidate_degraded {
+                    matched_by.push(format!("fallback-scan:{kind:?}"));
+                }
                 MemoryHit {
                     id: doc.id.clone(),
                     title: doc.title.clone(),
@@ -471,7 +480,7 @@ impl MemoryStore {
                     session_id: doc.session_id.clone(),
                     excerpt: excerpt(&doc.body, 240),
                     score,
-                    matched_by: matched.into_iter().map(str::to_string).collect(),
+                    matched_by,
                 }
             })
             .collect())
@@ -1012,6 +1021,36 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].provider.as_deref(), Some("Claude"));
         assert!(hits[0].matched_by.iter().any(|source| source == "lexical"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_marks_full_scan_when_sqlite_candidates_are_unavailable() {
+        let root = temp_root("candidate-fallback-visible");
+        let store = MemoryStore::new(&root).unwrap();
+        store
+            .capture(MemoryDocument::new(
+                MemoryKind::Concept,
+                MemorySourceKind::Note,
+                "Browser engines",
+                None,
+                "browser engine architecture rendering",
+            ))
+            .unwrap();
+
+        fs::remove_file(store.sqlite_path()).unwrap();
+
+        let hits = store.query(&MemoryQuery::new("browser engine")).unwrap();
+        assert!(!hits.is_empty());
+        assert!(
+            hits.iter().all(|hit| {
+                hit.matched_by
+                    .iter()
+                    .any(|source| source == "fallback-scan:NotFound")
+            }),
+            "{hits:?}"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
