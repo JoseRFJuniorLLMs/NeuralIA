@@ -2,6 +2,25 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [1.6.0] - 2026-09-19
+
+Painéis redimensionáveis, controles nativos de Split View e navegação privada.
+
+### Added
+- **Redimensionamento por mouse:** divisores nativos entre os painéis permitem ajustar Gemini, ChatGPT e Claude arrastando horizontalmente.
+- **Painéis persistentes:** as IAs podem ser minimizadas e maximizadas, mas nunca fechadas; as demais expandem automaticamente e a proporção manual é preservada.
+- **Privado:** botão no canto superior direito abre um painel lateral usando `WebViewBuilder::with_incognito(true)`, sem reutilizar cookies da sessão normal nem criar aba de fonte persistente.
+- **Ctrl+N:** inicia uma nova aba no grupo da IA atual.
+- **Ctrl+H:** histórico local permanece acessível tanto pela omnibox nativa quanto pelas páginas WebView.
+
+### Changed
+- Os controles **Fonte · IA / expandir / fechar** do Split View deixam de ser injetados dentro do site e passam para a barra nativa superior.
+- Mesmo em tela cheia do Split View, a barra nativa continua acessível e o conteúdo começa abaixo dela.
+
+### Fixed
+- O Split View não sobrepõe mais seus botões ao conteúdo de LinkedIn, GitHub ou qualquer outro site.
+- Divisores são ocultados automaticamente quando um painel é minimizado, quando há Split View ou quando uma IA está maximizada.
+
 ## [1.5.0] - 2026-09-18
 
 Barra de titulo compacta com abas inline, menu de contexto e Split View alinhado ao scroll do NeuralIA.

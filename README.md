@@ -6,7 +6,7 @@
 
 ## What NeuralIA is
 
-NeuralIA **v1.5.0** is an AI-first, reader-first, system-WebView information client written in Rust.
+NeuralIA **v1.6.0** is an AI-first, reader-first, system-WebView information client written in Rust.
 
 It deliberately refuses the usual browser arms race. It does not ship Chromium, does not implement its own JavaScript engine, does not carry a local LLM, and does not recreate a full browser tab strip just to prove that rectangles can multiply.
 
@@ -34,8 +34,20 @@ nativo com abrir, tela cheia, fechar, fechar outras e fechar todas do grupo.
 O Split View usa a mesma timeline vertical do NeuralIA: a scrollbar nativa da
 página lateral é escondida e a trilha tracejada centralizada assume a navegação.
 A rolagem automática percorre tanto a IA visível quanto a página lateral,
-detectando containers internos de scroll. `Ctrl+K` ou `Ctrl+T` abre a
-omnibox flutuante da IA ativa.
+detectando containers internos de scroll. Os controles **Fonte / tela cheia /
+fechar** vivem na barra nativa do NeuralIA, fora do conteúdo do site.
+
+Os três painéis de IA podem ser **redimensionados arrastando os divisores
+verticais com o mouse**, maximizados ou minimizados. Eles nunca são fechados:
+minimizar só oculta a WebView e as demais ocupam o espaço liberado. As proporções
+ajustadas pelo usuário ficam preservadas enquanto a sessão do comparador estiver
+aberta.
+
+`Ctrl+K` ou `Ctrl+T` abre a omnibox da IA ativa, `Ctrl+H` mostra o
+histórico local e `Ctrl+N` inicia uma nova aba no grupo da IA atual. O botão
+**Privado** no canto superior direito abre um Split View em modo incognito do
+WebView2; ele não reutiliza cookies e não adiciona a navegação à lista normal de
+fontes.
 
 Quando já existe uma sessão Google autenticada no perfil WebView2, o NeuralIA
 pode observar o Gmail em background sem armazenar senha. Uma nova mensagem gera
