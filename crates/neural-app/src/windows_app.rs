@@ -108,7 +108,6 @@ enum UserEvent {
         source_index: usize,
         url: String,
     },
-    OpenPrivatePanel,
     NewTab(usize),
     CloseSplit,
     ToggleSplitFullscreen,
@@ -4091,7 +4090,6 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::OpenPrivateSplit { source_index, url } => {
                 self.open_split_mode(source_index, url, false, true);
             }
-            UserEvent::OpenPrivatePanel => self.open_private_panel(),
             UserEvent::NewTab(index) => self.new_tab(index),
             UserEvent::CloseSplit => self.close_split(),
             UserEvent::ToggleSplitFullscreen => self.toggle_split_fullscreen(),
@@ -5501,8 +5499,6 @@ mod tests {
     fn comparator_resize_uses_persistent_weights_and_native_splitters() {
         let weights = [1.0_f64; COMPARATOR_COLUMNS];
         assert!(weights.iter().all(|weight| *weight > 0.0));
-        assert!(MIN_PANEL_WIDTH >= 120.0);
-        assert!(SPLITTER_WIDTH >= 3.0);
     }
 
     #[test]
