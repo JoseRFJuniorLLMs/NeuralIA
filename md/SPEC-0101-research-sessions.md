@@ -1,6 +1,6 @@
 # SPEC-0101 — Research Sessions and Cross-Source Synthesis
 
-**Status:** Proposed  
+**Status:** Implemented — NeuralIA 2.0  
 **Target:** NeuralIA 1.8
 
 ## 1. Purpose
