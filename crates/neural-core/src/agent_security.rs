@@ -252,6 +252,28 @@ impl AgentPermissionPolicy {
         }
     }
 
+    pub fn record_user_confirmation(
+        &mut self,
+        action: &AgentSecurityAction,
+        approved: bool,
+    ) {
+        let risk = action.risk();
+        self.sequence = self.sequence.saturating_add(1);
+        self.audit.push(AuditEntry {
+            sequence: self.sequence,
+            risk,
+            action: format!("confirm:{}", audit_action_name(action)),
+            origin: action.origin(),
+            allowed: approved && risk != ActionRisk::Restricted,
+            confirmation_required: true,
+            reason: if approved {
+                "user explicitly approved this sensitive action".into()
+            } else {
+                "user rejected this sensitive action".into()
+            },
+        });
+    }
+
     pub fn write_audit_log(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -429,6 +451,23 @@ mod tests {
         });
         assert!(!pivot.allowed);
         assert!(pivot.requires_confirmation);
+    }
+
+    #[test]
+    fn explicit_confirmation_is_audited_but_never_unlocks_restricted_actions() {
+        let mut policy = AgentPermissionPolicy::new(Some("https://example.com".into()));
+        let sensitive = AgentSecurityAction::Submit {
+            origin: "https://example.com".into(),
+            description: "send form".into(),
+        };
+        policy.record_user_confirmation(&sensitive, true);
+        assert!(policy.audit().last().unwrap().allowed);
+
+        let restricted = AgentSecurityAction::Password {
+            origin: "https://example.com".into(),
+        };
+        policy.record_user_confirmation(&restricted, true);
+        assert!(!policy.audit().last().unwrap().allowed);
     }
 
     #[test]
