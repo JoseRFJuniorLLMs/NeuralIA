@@ -309,11 +309,7 @@ fn measure_reindex_with_timeout(root: &Path) -> (Option<u128>, bool, u128) {
     match receiver.recv_timeout(REINDEX_TIMEOUT) {
         Ok((elapsed, Ok(()))) => (Some(elapsed), false, elapsed),
         Ok((elapsed, Err(error))) => panic!("baseline rebuild failed after {elapsed} ms: {error}"),
-        Err(mpsc::RecvTimeoutError::Timeout) => (
-            None,
-            true,
-            REINDEX_TIMEOUT.as_millis(),
-        ),
+        Err(mpsc::RecvTimeoutError::Timeout) => (None, true, REINDEX_TIMEOUT.as_millis()),
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             panic!("baseline rebuild worker disconnected")
         }
