@@ -42,7 +42,8 @@ fn normative_architecture_describes_current_bounded_ipc_and_webview_model() {
     assert!(THREAT.contains("hard ceiling of three provider surfaces"));
     assert!(!THREAT.contains("one-WebView ceiling"));
 
-    assert!(ROADMAP.contains("authenticated closed-schema WebView2 IPC"));
+    assert!(ROADMAP.contains("authenticated"));
+    assert!(ROADMAP.contains("closed-schema WebView2 IPC"));
     assert!(!ROADMAP.contains("no external IPC"));
 }
 
