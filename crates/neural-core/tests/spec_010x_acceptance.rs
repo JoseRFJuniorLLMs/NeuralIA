@@ -165,7 +165,7 @@ fn spec_0102_local_intelligence_has_offline_fallback_capabilities() {
 }
 
 #[test]
-fn spec_0103_semantic_timeline_maps_meaningful_page_units() {
+fn semantic_timeline_core_parser_maps_meaningful_page_units() {
     let html = r#"
         <div data-message-author-role="user">Pergunta</div>
         <div data-message-author-role="assistant">Resposta</div>
@@ -275,7 +275,7 @@ fn observed_page() -> ObservedPage {
 }
 
 #[test]
-fn spec_0105_agent_runtime_is_bounded_structured_and_human_gated() {
+fn agent_runtime_reference_harness_is_bounded_structured_and_human_gated() {
     let page = observed_page();
     let input = page.elements[0].clone();
 
@@ -312,7 +312,7 @@ fn spec_0105_agent_runtime_is_bounded_structured_and_human_gated() {
 }
 
 #[test]
-fn spec_0106_roadmap_gate_has_all_core_subsystems_available_together() {
+fn roadmap_core_subsystems_are_available_together() {
     let root = temp_root("roadmap");
     let _memory = MemoryStore::new(&root).unwrap();
     let _ai = HashingLocalIntelligence;

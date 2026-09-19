@@ -1,177 +1,166 @@
 # SPEC-0105 — Web Agent Runtime
 
-**Status:** Implementada — auditoria independente pendente (NeuralIA 2.0)  
+**Status:** Implementada no caminho embarcado — gate em `decide_agent_step`; auditoria adversarial independente pendente  
 **Target:** NeuralIA 2.0  
-**Dependency:** SPEC-0104 must be implemented first
+**Dependency:** SPEC-0104
 
 ## 1. Purpose
 
-NeuralIA should eventually be able to carry out bounded web tasks such as:
+NeuralIA provides bounded assisted Web navigation for deliberately narrow
+workflows: search, select/filter, click, extract and stop for the user when risk
+increases. It is not an unrestricted desktop robot and it does not expose a
+generic model-provided JavaScript tool.
 
-- research several pages;
-- apply filters;
-- fill non-sensitive search forms;
-- collect structured results;
-- compare options;
-- prepare a workflow for user confirmation.
+## 2. The runtime that actually ships
 
-The goal is **assisted autonomous navigation**, not an unrestricted desktop
-robot.
-
-## 2. Observation hierarchy
-
-The runtime uses the cheapest structured signal first:
-
-1. DOM;
-2. accessibility tree;
-3. browser/DevTools metadata;
-4. rendered screenshot/vision fallback.
-
-Computer vision is a fallback, not the default click engine.
-
-If the DOM says a visible element is a button with a stable role and label,
-guessing pixel coordinates with a multimodal model is unnecessary.
-
-## 3. Core loop
+As of 2026-09-19 the application runtime is the path below:
 
 ```text
-Observe
-  │
-  ▼
-Plan
-  │
-  ▼
-Validate against policy
-  │
-  ▼
-Execute one bounded action
-  │
-  ▼
-Observe result
-  └─────────────► repeat
+AGENT_OBSERVER_SCRIPT
+        │  bounded WebView2 IPC observation
+        ▼
+handle_agent_observation
+        │
+        ▼
+decide_agent_step
+  ├─ step/wall-clock budget
+  ├─ semantic element selection
+  └─ AgentPermissionPolicy
+        │
+        ├─ Stop
+        ├─ Extract
+        └─ Act ──► native confirmation when required
+                     │
+                     ▼
+               execute_agent_action
+                     │
+                     ▼
+                next observation
 ```
 
-Every iteration is finite and auditable.
+`decide_agent_step` is intentionally free of UI, WebView and memory side
+effects so the security/limit decision can be tested on the same code that the
+product calls.
 
-## 4. Action vocabulary
+`neural_core::AgentRuntime`, `AgentPlanner` and `AgentToolExecutor` remain
+a reference/library harness. They are **not** the execution loop used by
+`neural-app`. Tests of that harness are useful unit coverage but are not, by
+themselves, acceptance evidence for this specification.
 
-The first runtime SHOULD use a small explicit action enum.
+## 3. Observation and action vocabulary
 
-```rust
-enum AgentAction {
-    Navigate { url: String },
-    Click { target: ElementRef },
-    TypeText { target: ElementRef, text: String },
-    Select { target: ElementRef, value: String },
-    Scroll { target: ScrollTarget, amount: ScrollAmount },
-    Extract { target: ElementRef, schema: ExtractSchema },
-    Wait { condition: WaitCondition },
-    AskUser { reason: String },
-    Finish { summary: String },
-}
-```
+The injected observer emits a bounded structured page observation. The
+application resolves explicit commands into the existing `AgentAction` types,
+currently including:
 
-There is no generic “execute arbitrary JavaScript from the model” action.
+- search/type text;
+- click;
+- select/filter;
+- extraction;
+- initial navigation to a validated HTTP(S) target.
 
-## 5. Element references
+The page observation is data, not authority. The model/user plan never supplies
+raw JavaScript for execution. `agent_action_script` is application-owned code
+generated from a validated structured action.
 
-The observer produces stable, short-lived element references with:
+## 4. Decision gate
 
-- role;
-- accessible name;
-- relevant text;
-- bounding rectangle;
-- DOM selector/path metadata;
-- origin/frame identity;
-- visibility/interactability state.
+Every actionable observation passes through `decide_agent_step`.
 
-The planner refers to IDs, not raw injected JavaScript.
+The function:
 
-References expire after meaningful navigation/DOM replacement.
+1. reads limits from `AgentRuntimeConfig::default()`, avoiding a second set of
+   hard-coded budgets in the application;
+2. resolves the next structured action against the fresh observation;
+3. maps it to `AgentSecurityAction`;
+4. calls the same `AgentPermissionPolicy` used by the product;
+5. stops restricted actions;
+6. returns a native-confirmation reason for confirmable sensitive actions;
+7. returns an executable action only after the policy gate allows it.
 
-## 6. Planner interface
+The tests introduced with PR #43 deliberately fail when
+`policy.evaluate(...)` is removed from this shipped decision function.
 
-The planner receives:
+## 5. Element references and DOM movement
 
-- user goal;
-- sanitized current observation;
-- prior action/result summaries;
-- remaining step/time budget;
-- allowed capabilities.
+Each observation rebuilds short-lived element records with generation, role,
+accessible name/text, origin/frame and interactability information. Commands
+are resolved again from the latest observation before execution. The
+application-owned execution script also guards the expected element properties
+before acting.
 
-The planner returns structured candidate actions.
+References are therefore ephemeral. A stale page must produce a new
+observation rather than granting authority to an old target.
 
-Malformed output is rejected.
+## 6. Runtime limits
 
-## 7. Runtime limits
-
-Every run has:
+The shipped decision path uses the same default budget source as the reference
+runtime:
 
 - maximum steps;
 - maximum wall time;
-- per-navigation timeout;
-- maximum open temporary pages;
+- bounded observation payload;
 - origin policy;
-- action retry limit;
-- extraction size budget.
+- policy-controlled sensitive actions.
 
-Loops terminate rather than “thinking harder forever”.
+The product stops before consulting/executing the next action when the step or
+wall-clock budget is exhausted.
 
-## 8. Human-in-the-loop
+## 7. Human in the loop
 
-When SPEC-0104 classifies an action as sensitive, the runtime emits a native
-approval request that explains:
+Sensitive confirmable actions are returned as `AgentStepDecision::Act` with a
+confirmation reason. `handle_agent_observation` displays the native approval
+dialog and records the answer in `AgentPermissionPolicy` before execution.
 
-- what will happen;
-- which site/origin;
-- what data will be sent;
-- whether the action is reversible.
+Restricted actions, including password/payment-class authority, do not become
+allowed merely because a user confirmation was requested.
 
-After the user completes CAPTCHA, 2FA or payment manually, the agent MAY resume
-from a fresh observation.
+CAPTCHA, 2FA and payment completion remain manual user work.
 
-## 9. Browser integration strategy
+## 8. Trace and interruption
 
-Primary implementation should reuse the existing system WebView architecture.
+Executed actions append application-owned summaries to the local agent trace.
+Extraction is redacted before being shown or captured into semantic memory.
 
-Preferred exploration order:
+The UI advertises Esc/Home as immediate manual interruption. A stopped run does
+not continue acting on later observations.
 
-1. WebView2 DOM/script bridge with narrow app-owned adapters;
-2. DevTools protocol for observation/debug metadata;
-3. accessibility tree;
-4. screenshot capture for vision fallback.
+## 9. Planner independence
 
-CEF/Electron are not justified merely to implement the agent.
+The current shipped planner is intentionally boring: the `agent:` command is
+parsed into a bounded queue of structured browser commands. A future local or
+cloud planner may replace that command source, but it must feed the same
+structured decision/policy boundary.
 
-Playwright MAY exist later as an optional external worker for specialized
-automation, but it is not the primary browser engine.
+Changing planner technology must not create a second execution path around
+`decide_agent_step`.
 
-## 10. Model independence
+## 10. Browser integration
 
-The runtime is not coupled to LangGraph, AutoGen or a particular model vendor.
-
-A simple native state machine is preferred first.
-
-Cloud or local planners can implement the same structured interface.
+The implementation reuses the existing system WebView2 architecture. Remote
+page-to-native traffic uses the bounded IPC channel from SPEC-0108. The agent
+does not require CEF, Electron or Playwright as the primary browser engine.
 
 ## 11. Failure handling
 
-On unexpected page change, stale element, challenge page or policy failure:
-
-- stop the current action;
-- re-observe;
-- retry only within budget;
-- ask the user when uncertainty affects a sensitive operation.
-
-The agent never bypasses CAPTCHA or authentication challenges.
+On budget exhaustion, missing element, restricted authority, user rejection or
+execution error, the application terminates the run with an explicit
+`AgentTermination` reason. Unexpected page changes are handled by observing
+again; the agent does not bypass authentication challenges.
 
 ## 12. Acceptance criteria
 
-1. a test workflow can navigate, search, filter and extract structured results;
-2. the same workflow survives ordinary DOM movement through semantic element
-   references;
-3. no arbitrary model-provided JavaScript is executed;
-4. Class C/D actions stop for approval;
-5. step/time budgets terminate loops;
-6. interruption returns manual control immediately;
-7. full action/result traces are available locally.
+The shipped SPEC-0105 gate is green only when:
+
+1. the product path calls `decide_agent_step` before execution;
+2. search/click/select actions are resolved from a fresh structured observation;
+3. restricted actions stop before reaching the page;
+4. confirmable sensitive actions require the native human gate;
+5. step and wall-clock budgets terminate the product path;
+6. no arbitrary model-provided JavaScript execution channel exists;
+7. action/extraction results produce local trace material;
+8. the product-wiring acceptance test cites SPEC-0105 and fails if the shipped
+   decision path is bypassed.
+
+The independent adversarial review required by `AGENTS.md` §4/§7 remains a
+separate release gate.

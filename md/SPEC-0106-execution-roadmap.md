@@ -1,6 +1,6 @@
 # SPEC-0106 — NeuralIA Execution Roadmap
 
-**Status:** Completed baseline — NeuralIA 2.0
+**Status:** Roadmap ativo — não é uma feature nem um gate único de runtime
 
 ## Objective
 
@@ -111,6 +111,20 @@ Those workflows combine every hard problem at once and are poor first tests.
 - unrestricted filesystem access;
 - unrestricted arbitrary JavaScript tools;
 - general 3B+ local chat model in the base installer.
+
+## Verification rule
+
+This document describes ordering and composition. Merely constructing one
+`MemoryStore`, one local-intelligence value and one permission policy does not
+prove this roadmap in the product. The old core smoke test was therefore
+renamed so it cannot masquerade as a SPEC-0106 acceptance gate.
+
+Product composition is instead pinned by
+`crates/neural-app/tests/spec_product_wiring.rs`, which checks that the
+shipping application wires the memory worker, research sessions, semantic
+timeline, bounded IPC and the policy-gated agent decision path together.
+Individual behavioral guarantees still belong to their own specifications and
+tests.
 
 ## Success criterion
 

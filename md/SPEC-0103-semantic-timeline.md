@@ -1,6 +1,6 @@
 # SPEC-0103 — Semantic Timeline
 
-**Status:** Implemented — NeuralIA 2.0  
+**Status:** Parcial — timeline JS embarcada e coberta por gate de produto; aceitação completa por fornecedor/performance pendente  
 **Target:** NeuralIA 1.9
 
 ## 1. Purpose
@@ -82,6 +82,24 @@ markers.
 The timeline controls need accessible labels and keyboard equivalents.
 
 A user must be able to navigate previous/next semantic section without a mouse.
+
+## 7.1. Shipped implementation boundary
+
+The product path is the JavaScript timeline injected by `neural-app`:
+`SPLIT_SCROLL_RAIL_SCRIPT` and `COMPARATOR_INJECT_SCRIPT`, each with its own
+`semanticAnchors()` implementation. The Rust helper
+`neural_core::semantic_anchors_html` is useful as a parser/reference, but it is
+**not** the implementation that draws the shipped rail.
+
+For that reason, a test that only calls `semantic_anchors_html` is not an
+acceptance gate for this specification. The product gate lives in
+`crates/neural-app/tests/spec_product_wiring.rs` and checks the scripts that
+actually ship: question/answer roles, headings, code/table/quote/source
+selectors, deterministic proportional fallback, Reader/Split wiring and
+coalesced animation-frame updates.
+
+The remaining end-to-end provider and visible-jank criteria below keep this
+specification in **Parcial** state.
 
 ## 8. Acceptance criteria
 

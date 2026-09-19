@@ -1,6 +1,6 @@
 # SPEC-0102 — Optional Local Intelligence
 
-**Status:** Implemented baseline — NeuralIA 2.0  
+**Status:** Parcial — inteligência local determinística integrada; lifecycle de model packs ainda não ligado ao `neural-app`  
 **Target:** NeuralIA 1.9
 
 ## 1. Purpose
@@ -112,6 +112,21 @@ practical:
 
 The UI must not become unusable because a model pack is absent or failed to
 load.
+
+## 8.1. Current implementation boundary
+
+The shipped product already uses deterministic local semantics: memory documents
+receive local hashed embeddings and research comparison uses the same
+model-independent local intelligence primitives. This path is exercised by the
+core tests and by the product-wiring gate in
+`crates/neural-app/tests/spec_product_wiring.rs`.
+
+The optional model-pack lifecycle is **not** wired into `neural-app` yet.
+`ModelPackManager` exists in `neural-core`, but the application does not
+instantiate it at startup or navigation time. Therefore this specification must
+remain **Parcial** until install/uninstall, failure fallback and measurement
+gates exercise the product path. A library-only model-pack test is not evidence
+that the browser ships the feature.
 
 ## 9. Acceptance criteria
 

@@ -1,7 +1,7 @@
 # SPEC-0107 — Integração Nativa do ai-memory no NeuralIA
 
-**Status:** Fase 0 concluída — proveniência vendorizada; Fase 1 (SQLite/FTS5 nativo) pendente  
-**Alvo:** NeuralIA pós-2.1  
+**Status:** Fase 1 parcial — proveniência, SQLite/FTS5, retrieval, tombstones e rebuild operacionais; integração/UX/performance completas pendentes  
+**Alvo:** integração incremental pós-2.0; conclusão após os gates de produto/performance  
 **Upstream:** akitaonrails/ai-memory  
 **Licença upstream:** MIT  
 **Estratégia:** importar e adaptar código selecionado; não criar dependência obrigatória do produto ai-memory
@@ -30,6 +30,23 @@ de navegação e pesquisa:
 
 O NeuralIA continua sendo uma aplicação Rust nativa usando WRY e WebView do
 sistema.
+
+## 1.1. Estado verificado em 19/09/2026
+
+O repositório já passou da Fase 0. Estão em `main` um índice SQLite derivado,
+FTS5 para shortlist, rerank semântico local, tombstones duráveis, rebuild
+atômico/validado e integração assíncrona pelo `MemoryWorker` do produto.
+
+O teste `spec_0107_phase1_sqlite_retrieval_forget_and_rebuild_are_operational`
+prende num mesmo fluxo captura, consulta híbrida, forget por domínio,
+tombstone, bloqueio de recaptura e reconstrução do SQLite sem ressuscitar dados
+esquecidos. Testes adicionais cobrem custo de captura, ausência de vestígios
+após forget e recall PT/EN através do atalho FTS.
+
+Isso **não** torna esta especificação inteira concluída. Permanecem, entre
+outros, os gates de lifecycle de model packs, UX completa, benchmarks de
+escala/idle e a decomposição arquitetural futura descrita abaixo. O status é
+portanto Fase 1 parcial, não "Implementada".
 
 ## 2. Não objetivos
 

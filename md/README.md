@@ -42,16 +42,31 @@ The browser remains infrastructure. The product is the research workflow.
 
 ## Implementation status
 
-- **SPEC-0100–0103:** implemented baseline with real acceptance coverage.
-- **SPEC-0104–0105:** implementation exists; independent adversarial audit is pending.
-- **SPEC-0106:** execution roadmap, not a runtime feature.
-- **SPEC-0107:** only **Phase 0** is complete: the ai-memory provenance snapshot,
-  license and upstream lineage are vendored. Phase 1 (native SQLite/FTS5
-  integration) remains pending.
+- **SPEC-0100–0101:** implemented baselines; core behavior and the shipped
+  `neural-app` wiring are both gated.
+- **SPEC-0102:** partial. Deterministic local semantics/embeddings are integrated;
+  optional model-pack install/uninstall/runtime wiring is not yet a product feature.
+- **SPEC-0103:** partial. The shipped JavaScript semantic rails are product-gated;
+  full provider/end-to-end performance acceptance remains pending.
+- **SPEC-0104:** security policy is used by the shipped agent path; independent
+  adversarial review remains a release gate.
+- **SPEC-0105:** the shipped runtime is `handle_agent_observation → decide_agent_step`;
+  its gate is now tested on the product path. `neural-core::AgentRuntime` is a
+  reference harness, not the browser execution loop.
+- **SPEC-0106:** execution roadmap, not a runtime feature or a standalone "green"
+  object-construction test.
+- **SPEC-0107:** Phase 0 is complete and Phase 1 is partial: SQLite/FTS5,
+  retrieval/rerank, tombstones and rebuild are operational and acceptance-tested;
+  the full integration/UX/performance criteria remain open.
+- **SPEC-0108:** bounded WebView2 IPC is implemented and product-tested; the
+  independent adversarial/release gate remains pending.
 
-`crates/neural-core/tests/spec_010x_acceptance.rs` has cases numbered through
-SPEC-0107, but the SPEC-0107 case proves only Phase 0 provenance. It must not be
-used as evidence that the later storage/retrieval phases are implemented.
+`crates/neural-core/tests/spec_010x_acceptance.rs` now keeps SPEC numbers only
+where the tested core is the same core used by the product. Reference-only
+checks for the Rust semantic-timeline parser, `AgentRuntime` harness and roadmap
+object coexistence no longer present themselves as product acceptance gates.
+Shipped wiring is pinned in `crates/neural-app/tests/spec_product_wiring.rs`,
+and SPEC-0107 Phase 1 has its own operational acceptance test.
 
 Future changes MUST NOT silently violate the existing product charter,
 performance budget, privacy guarantees or threat model.
