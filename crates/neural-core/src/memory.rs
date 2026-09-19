@@ -282,7 +282,7 @@ impl MemoryStore {
             }
         }
 
-        documents.sort_by(|left, right| right.last_seen_at.cmp(&left.last_seen_at));
+        documents.sort_by_key(|document| std::cmp::Reverse(document.last_seen_at));
         Ok(documents)
     }
 
