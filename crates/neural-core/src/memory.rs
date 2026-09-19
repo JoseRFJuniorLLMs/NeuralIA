@@ -772,15 +772,15 @@ fn normalize_domain(value: &str) -> Option<String> {
     let parsed = Url::parse(trimmed)
         .or_else(|_| Url::parse(&format!("https://{}", trimmed.trim_start_matches('.'))))
         .ok()?;
-    let host = parsed.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    let host = parsed
+        .host_str()?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     (!host.is_empty()).then_some(host)
 }
 
 fn document_domain(document: &MemoryDocument) -> Option<String> {
-    document
-        .url
-        .as_deref()
-        .and_then(normalize_domain)
+    document.url.as_deref().and_then(normalize_domain)
 }
 
 fn domain_matches(host: &str, domain: &str) -> bool {
@@ -790,31 +790,27 @@ fn domain_matches(host: &str, domain: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
-fn tombstone_blocks_document(
-    document: &MemoryDocument,
-    tombstones: &[MemoryTombstone],
-) -> bool {
-    tombstones.iter().any(|tombstone| match tombstone.object_type.as_str() {
-        "document" => tombstone.object_id == document.id,
-        "session" => document.session_id.as_deref() == Some(tombstone.object_id.as_str()),
-        "domain" => document_domain(document)
-            .is_some_and(|host| domain_matches(&host, &tombstone.object_id)),
-        "before" => tombstone
-            .object_id
-            .parse::<u64>()
-            .ok()
-            .is_some_and(|timestamp| document.last_seen_at < timestamp),
-        _ => false,
-    })
+fn tombstone_blocks_document(document: &MemoryDocument, tombstones: &[MemoryTombstone]) -> bool {
+    tombstones
+        .iter()
+        .any(|tombstone| match tombstone.object_type.as_str() {
+            "document" => tombstone.object_id == document.id,
+            "session" => document.session_id.as_deref() == Some(tombstone.object_id.as_str()),
+            "domain" => document_domain(document)
+                .is_some_and(|host| domain_matches(&host, &tombstone.object_id)),
+            "before" => tombstone
+                .object_id
+                .parse::<u64>()
+                .ok()
+                .is_some_and(|timestamp| document.last_seen_at < timestamp),
+            _ => false,
+        })
 }
 
-fn tombstone_blocks_session(
-    session: &ResearchSession,
-    tombstones: &[MemoryTombstone],
-) -> bool {
-    tombstones.iter().any(|tombstone| {
-        tombstone.object_type == "session" && tombstone.object_id == session.id
-    })
+fn tombstone_blocks_session(session: &ResearchSession, tombstones: &[MemoryTombstone]) -> bool {
+    tombstones
+        .iter()
+        .any(|tombstone| tombstone.object_type == "session" && tombstone.object_id == session.id)
 }
 
 fn push_tombstone(
@@ -1060,7 +1056,9 @@ mod tests {
         let store = MemoryStore::new(&root).unwrap();
         let mut session = ResearchSession::new("forget me");
         session.id = "session-forget".into();
-        session.save(root.join("sessions").join("session-forget.json")).unwrap();
+        session
+            .save(root.join("sessions").join("session-forget.json"))
+            .unwrap();
 
         store
             .capture(
@@ -1118,10 +1116,12 @@ mod tests {
         store.rebuild().unwrap();
 
         assert!(store.documents().unwrap().is_empty());
-        assert!(store
-            .query(&MemoryQuery::new("must stay forgotten"))
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .query(&MemoryQuery::new("must stay forgotten"))
+                .unwrap()
+                .is_empty()
+        );
 
         let _ = fs::remove_dir_all(root);
     }
