@@ -51,7 +51,7 @@ impl Database {
     }
 
     fn count_fts(&self, query: &str) -> io::Result<i64> {
-        let escaped = query.replace(''', "''");
+        let escaped = query.replace(char::from(39), "''");
         let sql = CString::new(format!(
             "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH '{escaped}';"
         ))
