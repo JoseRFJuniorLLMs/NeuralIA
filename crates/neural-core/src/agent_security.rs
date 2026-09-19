@@ -325,11 +325,7 @@ pub fn redact_sensitive_text(input: &str) -> String {
         .any(|needle| lower.contains(needle));
 
         if sensitive {
-            let key = raw
-                .split([':', '='])
-                .next()
-                .unwrap_or("sensitive")
-                .trim();
+            let key = raw.split([':', '=']).next().unwrap_or("sensitive").trim();
             output.push(format!("{key}: [REDACTED]"));
         } else {
             output.push(raw.to_string());
@@ -344,8 +340,7 @@ mod tests {
 
     #[test]
     fn sensitive_values_are_redacted_before_storage_or_model_context() {
-        let input =
-            "title: ok\nAuthorization: Bearer abc\npassword=hunter2\nbody: visible";
+        let input = "title: ok\nAuthorization: Bearer abc\npassword=hunter2\nbody: visible";
         let clean = redact_sensitive_text(input);
         assert!(clean.contains("body: visible"));
         assert!(!clean.contains("Bearer abc"));
