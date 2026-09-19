@@ -6823,7 +6823,7 @@ fn neuralia_action(target: &str) -> Option<UserEvent> {
     })
 }
 
-fn simple_ipc_event(action: IpcAction) -> Option<UserEvent> {
+fn common_ipc_event(action: IpcAction) -> Option<UserEvent> {
     Some(match action {
         IpcAction::Home => UserEvent::HomeRequested,
         IpcAction::Back => UserEvent::BackRequested,
@@ -6841,40 +6841,9 @@ fn simple_ipc_event(action: IpcAction) -> Option<UserEvent> {
         IpcAction::DevTools => UserEvent::OpenDevTools,
         IpcAction::ViewSource => UserEvent::ViewSource,
         IpcAction::NewTab { col } => UserEvent::NewTab(col.unwrap_or(0)),
-        IpcAction::Expand { col } => UserEvent::ExpandComparator(col),
-        IpcAction::Minimize { col } => UserEvent::MinimizeComparator(col),
-        IpcAction::Split { col, url } => UserEvent::OpenSplit {
-            source_index: col,
-            url,
-        },
-        IpcAction::SplitClose => UserEvent::CloseSplit,
-        IpcAction::SplitExpand => UserEvent::ToggleSplitFullscreen,
-        IpcAction::Palette { col } => UserEvent::OpenPalette(col),
-        IpcAction::GmailState {
-            unread,
-            sender,
-            subject,
-            key,
-        } => UserEvent::GmailInboxState {
-            unread,
-            sender,
-            subject,
-            key,
-        },
-        IpcAction::ResearchAnswer { col, text } => UserEvent::ResearchAnswer {
-            source_index: col,
-            text,
-        },
-        IpcAction::AgentObservation { data } => {
-            UserEvent::AgentObservation(parse_agent_observation(&data)?)
-        }
+        _ => return None,
     })
 }
-
-fn remote_ipc_event(body: &str, capability: &str) -> Option<UserEvent> {
-    simple_ipc_event(parse_ipc_message(body, capability, COMPARATOR_COLUMNS)?)
-}
-
 /// Para onde vai o que o utilizador escreveu na palette. Puro, para se poder
 /// testar sem janela: e aqui que se decide que um painel privado nunca
 /// carrega nada na coluna normal nem passa pelo historico.
