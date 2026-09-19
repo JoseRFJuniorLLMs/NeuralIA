@@ -424,8 +424,7 @@ impl BarLayout {
                 if index == 0 {
                     left = left.max(home.x + home.width + 8.0 * scale);
                 }
-                let right = ((index + 1) as f64 * column_width - group_pad)
-                    .min(client_width - pad);
+                let right = ((index + 1) as f64 * column_width - group_pad).min(client_width - pad);
                 let available = (right - left).max(provider_width + plus_width + gap);
                 columns_rect[index] = UiRect {
                     x: left,
@@ -451,8 +450,7 @@ impl BarLayout {
         if total_tabs > 0 && tabs_right > tabs_left {
             let gap = 3.0 * scale;
             let usable = tabs_right - tabs_left - gap * total_tabs.saturating_sub(1) as f64;
-            let tab_width = (usable / total_tabs as f64)
-                .clamp(56.0 * scale, 156.0 * scale);
+            let tab_width = (usable / total_tabs as f64).clamp(56.0 * scale, 156.0 * scale);
             let mut x = tabs_left;
 
             for index in 0..columns_len {
@@ -2315,7 +2313,10 @@ impl App {
                 // sem essa faixa a aplicacao nunca saberia que o rato subiu ao
                 // topo para chamar a barra de volta.
                 let (top, height) = if self.chrome_revealed {
-                    (COMPARATOR_CHROME_HEIGHT, (logical_h - COMPARATOR_CHROME_HEIGHT).max(1.0))
+                    (
+                        COMPARATOR_CHROME_HEIGHT,
+                        (logical_h - COMPARATOR_CHROME_HEIGHT).max(1.0),
+                    )
                 } else {
                     (1.0, (logical_h - 1.0).max(1.0))
                 };
