@@ -1,6 +1,6 @@
 # SPEC-0107 — Integração Nativa do ai-memory no NeuralIA
 
-**Status:** Proposta  
+**Status:** Implementada — NeuralIA 2.0  
 **Alvo:** NeuralIA 1.7–1.9  
 **Upstream:** akitaonrails/ai-memory  
 **Licença upstream:** MIT  
