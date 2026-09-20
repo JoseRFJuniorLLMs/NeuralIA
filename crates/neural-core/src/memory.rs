@@ -15,7 +15,7 @@ mod sqlite_v01;
 const MEMORY_SCHEMA_VERSION: u32 = 1;
 
 use crate::{
-    agent_security::redact_sensitive_text,
+    agent_security::{redact_sensitive_text, redact_url},
     local_intelligence::{EMBEDDING_DIM, cosine_similarity, extract_entities, hashed_embedding},
     research::ResearchSession,
 };
@@ -98,7 +98,12 @@ impl MemoryDocument {
         url: Option<String>,
         body: impl Into<String>,
     ) -> Self {
-        let title = title.into();
+        // O titulo e texto livre vindo da pagina e a URL costuma carregar
+        // credenciais na query: os dois passam pelo mesmo cuidado que o corpo
+        // sempre teve. A redaccao acontece ANTES do id, para o mesmo documento
+        // dar sempre o mesmo id, com ou sem segredo na URL de origem.
+        let title = redact_sensitive_text(&title.into());
+        let url = url.map(|value| redact_url(&value));
         let body = redact_sensitive_text(&body.into());
         let now = unix_seconds();
         let content_hash = sha256_hex(body.as_bytes());
@@ -255,6 +260,8 @@ impl MemoryStore {
         }
         let sqlite_existed = self.sqlite_path().exists();
 
+        document.title = redact_sensitive_text(&document.title);
+        document.url = document.url.take().map(|value| redact_url(&value));
         document.body = redact_sensitive_text(&document.body);
         document.content_hash = sha256_hex(document.body.as_bytes());
         document.last_seen_at = unix_seconds();
@@ -267,6 +274,9 @@ impl MemoryStore {
         }
 
         let json_path = self.document_path(&document.id);
+        // Um `stat` constante em vez de listar o directorio inteiro para saber
+        // se este documento e novo.
+        let is_new = !json_path.exists();
         atomic_write(
             &json_path,
             &serde_json::to_vec_pretty(&document).map_err(io::Error::other)?,
@@ -283,7 +293,7 @@ impl MemoryStore {
         if !sqlite_existed && !tombstones.is_empty() {
             sqlite_v01::sync_tombstones(&self.sqlite_path(), &tombstones)?;
         }
-        self.write_index_manifest()?;
+        self.write_index_manifest(Some(usize::from(is_new)))?;
         Ok(CaptureOutcome::Stored(document.id))
     }
 
@@ -583,7 +593,7 @@ impl MemoryStore {
         let sessions = self.research_sessions()?;
         sqlite_v01::rebuild(&self.sqlite_path(), &docs, &sessions)?;
         sqlite_v01::sync_tombstones(&self.sqlite_path(), &tombstones)?;
-        self.write_index_manifest()
+        self.write_index_manifest(None)
     }
 
     fn session_for_document(&self, document: &MemoryDocument) -> Option<ResearchSession> {
@@ -706,7 +716,27 @@ impl MemoryStore {
             .count())
     }
 
-    fn write_index_manifest(&self) -> io::Result<()> {
+    fn manifest_path(&self) -> PathBuf {
+        self.root.join("db").join("index-manifest.json")
+    }
+
+    /// Quantos documentos o manifesto anterior declarava, ou `None` quando nao
+    /// ha manifesto legivel.
+    fn manifest_documents(&self) -> Option<usize> {
+        #[derive(Deserialize)]
+        struct Counted {
+            documents: usize,
+        }
+        let bytes = fs::read(self.manifest_path()).ok()?;
+        serde_json::from_slice::<Counted>(&bytes)
+            .ok()
+            .map(|counted| counted.documents)
+    }
+
+    /// `delta` e quantos documentos NOVOS esta escrita acrescenta: `Some(0)`
+    /// quando se reescreveu um que ja existia, `Some(1)` quando nasceu um, e
+    /// `None` quando se quer recontar do zero (rebuild, forget).
+    fn write_index_manifest(&self, delta: Option<usize>) -> io::Result<()> {
         #[derive(Serialize)]
         struct Manifest {
             schema: u32,
@@ -716,19 +746,31 @@ impl MemoryStore {
             retrieval: [&'static str; 4],
         }
 
+        // Contar ficheiros custa uma leitura do directorio, e este manifesto
+        // escreve-se A CADA CAPTURA: com 600 paginas no corpus, o CI do Windows
+        // media 115 ms na primeira captura contra 559 ms na ultima, e o gate de
+        // `memory_capture_cost` apanhou-o. Foi a minha propria correccao
+        // anterior que deixou isto para tras: troquei "desserializar o corpus
+        // todo" por "listar o directorio", que e muito mais barato mas continua
+        // a ser linear.
+        //
+        // O numero nao e lido por codigo nenhum (o `doctor` so verifica que o
+        // ficheiro existe), por isso a captura soma ao que ja estava escrito e
+        // so o `rebuild`/`forget` reconta.
+        let documents = match delta {
+            Some(delta) => self.manifest_documents().unwrap_or(0).saturating_add(delta),
+            None => self.document_file_count()?,
+        };
+
         let manifest = Manifest {
             schema: MEMORY_SCHEMA_VERSION,
             generated_at: unix_seconds(),
-            // Contar ficheiros, nao desserializar o corpus todo: este
-            // manifesto escreve-se a cada captura e o numero e o unico campo
-            // que dependia do conteudo. Documentos privados nunca chegam a
-            // ser escritos (ver `capture`), por isso a contagem e a mesma.
-            documents: self.document_file_count()?,
+            documents,
             sqlite: "rusqlite-v01-derived",
             retrieval: ["lexical", "entity", "graph", "semantic"],
         };
         atomic_write(
-            &self.root.join("db").join("index-manifest.json"),
+            &self.manifest_path(),
             &serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?,
         )
     }
@@ -966,6 +1008,58 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_url_removes_credentials_and_keeps_the_rest() {
+        // O caso que motivou isto: um callback OAuth capturado pela memoria.
+        let out =
+            redact_url("https://app.exemplo.com/callback?access_token=ya29.SEGREDO&state=abc");
+        assert!(!out.contains("ya29.SEGREDO"), "{out}");
+        assert!(out.contains("state=abc"), "a query util sobrevive: {out}");
+
+        // Fluxo implicito: o token vem depois do `#`.
+        let out =
+            redact_url("https://app.exemplo.com/#access_token=ya29.SEGREDO&token_type=bearer");
+        assert!(!out.contains("ya29.SEGREDO"), "{out}");
+
+        // Sufixos: `x_api_key`, `user_password`.
+        let out = redact_url("https://api.exemplo.com/v1?user_password=hunter2&page=3");
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(out.contains("page=3"), "{out}");
+
+        // Credenciais embutidas.
+        let out = redact_url("https://ana:hunter2@exemplo.com/privado");
+        assert!(!out.contains("hunter2"), "{out}");
+
+        // Uma URL normal nao se mexe.
+        assert_eq!(
+            redact_url("https://exemplo.pt/artigo?q=rust+ownership&page=2"),
+            "https://exemplo.pt/artigo?q=rust+ownership&page=2"
+        );
+
+        // Nao sendo URL, cai no redactor de texto.
+        assert!(!redact_url("password=hunter2").contains("hunter2"));
+    }
+
+    #[test]
+    fn captured_document_never_stores_a_secret_in_its_url_or_title() {
+        let document = MemoryDocument::new(
+            MemoryKind::Source,
+            MemorySourceKind::Web,
+            "Sessao aberta com token=ya29.SEGREDO",
+            Some("https://app.exemplo.com/cb?access_token=ya29.SEGREDO&state=ok".into()),
+            "corpo qualquer",
+        );
+
+        let url = document.url.clone().unwrap_or_default();
+        assert!(!url.contains("ya29.SEGREDO"), "url: {url}");
+        assert!(url.contains("state=ok"), "url: {url}");
+        assert!(
+            !document.title.contains("ya29.SEGREDO"),
+            "title: {}",
+            document.title
+        );
+    }
 
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

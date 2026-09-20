@@ -1,0 +1,86 @@
+name: Local intelligence gates
+
+on:
+  pull_request:
+    paths:
+      - 'crates/neural-core/src/local_intelligence.rs'
+      - '.github/workflows/local-intelligence.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/neural-core/src/local_intelligence.rs'
+      - '.github/workflows/local-intelligence.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  local-intelligence:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+
+      - name: Exercise shipped local-intelligence regressions
+        run: |
+          cargo test --locked -p neural-core local_intelligence::tests::summary_never_exceeds_character_budget
+          cargo test --locked -p neural-core local_intelligence::tests::model_pack_components_reject_windows_drive_and_stream_syntax
+
+      - name: Prove summary-budget gate catches overflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("crates/neural-core/src/local_intelligence.rs")
+          text = path.read_text(encoding="utf-8")
+          old = "let content_budget = budget.saturating_sub(1);"
+          new = "let content_budget = budget;"
+          if text.count(old) != 1:
+              raise SystemExit("summary sabotage target not found exactly once")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
+
+          set +e
+          cargo test --locked -p neural-core local_intelligence::tests::summary_never_exceeds_character_budget
+          result=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+
+          if [ "$result" -eq 0 ]; then
+            echo "Summary budget sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: summary budget overflow was rejected with exit code $result."
+
+      - name: Prove Windows component gate catches drive-relative paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("crates/neural-core/src/local_intelligence.rs")
+          text = path.read_text(encoding="utf-8")
+          old = "        || value.contains(':')"
+          if text.count(old) != 1:
+              raise SystemExit("Windows path sabotage target not found exactly once")
+          path.write_text(text.replace(old, ""), encoding="utf-8")
+          PY
+
+          set +e
+          cargo test --locked -p neural-core local_intelligence::tests::model_pack_components_reject_windows_drive_and_stream_syntax
+          result=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+
+          if [ "$result" -eq 0 ]; then
+            echo "Windows component sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: Windows drive-relative component was rejected with exit code $result."
+
+      - name: Confirm restored local-intelligence source is green
+        run: |
+          cargo test --locked -p neural-core local_intelligence::tests::

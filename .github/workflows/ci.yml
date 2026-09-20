@@ -68,6 +68,142 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  installer-smoke:
+    needs: windows
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: neuralia-windows-tested-${{ github.sha }}
+          path: ci-tested
+      - name: Build unsigned installer candidate
+        shell: pwsh
+        run: |
+          $line = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          $version = $line.Matches[0].Groups[1].Value
+          ./scripts/build-windows-installer.ps1 -ExePath ci-tested/NeuralIA.exe -Version $version -OutputDir ci-installer
+      - name: Smoke install exact CI-tested payload
+        shell: pwsh
+        run: |
+          $line = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          $version = $line.Matches[0].Groups[1].Value
+          $installer = Get-ChildItem ci-installer -Filter "NeuralIA-Setup-*-x64.exe" -File | Select-Object -First 1
+          if (-not $installer) { throw "Installer candidate was not produced." }
+          ./scripts/test-windows-installer.ps1 -InstallerPath $installer.FullName -ExpectedExePath ci-tested/NeuralIA.exe -ExpectedVersion $version
+      - name: Exercise Authenticode path with an ephemeral CI certificate
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $line = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          $version = $line.Matches[0].Groups[1].Value
+          $ephemeralSecret = [Guid]::NewGuid().ToString("N") + [Guid]::NewGuid().ToString("N")
+          $ephemeralSecureSecret = ConvertTo-SecureString $ephemeralSecret -AsPlainText -Force
+          $pfxPath = Join-Path $env:RUNNER_TEMP "neuralia-ci-authenticode.pfx"
+          $cert = $null
+
+          try {
+            Write-Host "[authenticode-ci] generating ephemeral code-signing certificate"
+            $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=NeuralIA CI Authenticode Test" -CertStoreLocation "Cert:\CurrentUser\My" -KeyExportPolicy Exportable -HashAlgorithm SHA256 -NotAfter (Get-Date).AddDays(1)
+
+            Write-Host "[authenticode-ci] exporting ephemeral certificate"
+            Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $ephemeralSecureSecret | Out-Null
+
+            $env:NEURALIA_AUTHENTICODE_PFX_B64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($pfxPath))
+            $env:NEURALIA_AUTHENTICODE_PFX_PASSWORD = $ephemeralSecret
+
+            # A self-signed CI leaf deliberately has no public trust chain.
+            # We verify its cryptographic signature and expected thumbprint,
+            # while stable release still requires /pa trust + RFC3161 timestamp.
+            Write-Host "[authenticode-ci] building and signing installer"
+            ./scripts/build-windows-installer.ps1 -ExePath ci-tested/NeuralIA.exe -Version $version -OutputDir signed-ci-installer -Sign -SkipTimestamp -AllowUntrustedTestCertificate
+
+            # The certificate existed before build-windows-installer imported
+            # the PFX. The helper must not delete pre-existing store entries
+            # during cleanup.
+            if (-not (Test-Path -LiteralPath ("Cert:\\CurrentUser\\My\\" + $cert.Thumbprint))) {
+              throw "Signing helper removed a pre-existing certificate from CurrentUser\\My."
+            }
+
+            $installer = Get-ChildItem signed-ci-installer -Filter "NeuralIA-Setup-*-x64.exe" -File | Select-Object -First 1
+            if (-not $installer) { throw "Signed CI installer was not produced." }
+
+            # The signed setup must still install the exact CI-tested payload.
+            ./scripts/test-windows-installer.ps1 -InstallerPath $installer.FullName -ExpectedExePath ci-tested/NeuralIA.exe -ExpectedVersion $version
+
+            # Signature sabotage proof: flip one byte in the signed PE body.
+            # The verifier must reject HashMismatch/invalid signature even when
+            # untrusted test certificates are otherwise allowed.
+            $tampered = Join-Path $env:RUNNER_TEMP "NeuralIA-Setup-tampered.exe"
+            Copy-Item $installer.FullName $tampered
+            $bytes = [IO.File]::ReadAllBytes($tampered)
+            if ($bytes.Length -le 1024) { throw "Installer unexpectedly too small for signature sabotage." }
+            $bytes[1024] = $bytes[1024] -bxor 0x01
+            [IO.File]::WriteAllBytes($tampered, $bytes)
+
+            $signatureRejected = $false
+            try {
+              ./scripts/verify-windows-installer-signature.ps1 -InstallerPath $tampered -ExpectedThumbprint $cert.Thumbprint -AllowUntrustedTestCertificate
+            }
+            catch {
+              $signatureRejected = $true
+              Write-Host "Signature sabotage proof: tampered signed installer was rejected: $($_.Exception.Message)"
+            }
+            if (-not $signatureRejected) {
+              throw "Authenticode gate stayed green after the signed installer was tampered."
+            }
+            Remove-Item -LiteralPath $tampered -Force -ErrorAction SilentlyContinue
+          }
+          finally {
+            $env:NEURALIA_AUTHENTICODE_PFX_B64 = $null
+            $env:NEURALIA_AUTHENTICODE_PFX_PASSWORD = $null
+            if ($cert) {
+              Remove-Item -LiteralPath ("Cert:\CurrentUser\My\" + $cert.Thumbprint) -Force -ErrorAction SilentlyContinue
+            }
+            Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Prove installer gate rejects a substituted payload
+        shell: pwsh
+        run: |
+          $line = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          $version = $line.Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force sabotage | Out-Null
+          Copy-Item ci-tested/NeuralIA.exe sabotage/NeuralIA.exe
+          $stream = [IO.File]::Open((Resolve-Path sabotage/NeuralIA.exe).Path, [IO.FileMode]::Append, [IO.FileAccess]::Write)
+          try { $stream.WriteByte(0) } finally { $stream.Dispose() }
+
+          ./scripts/build-windows-installer.ps1 -ExePath sabotage/NeuralIA.exe -Version $version -OutputDir sabotage-installer
+          $installer = Get-ChildItem sabotage-installer -Filter "NeuralIA-Setup-*-x64.exe" -File | Select-Object -First 1
+
+          $caughtExpectedFailure = $false
+          try {
+            ./scripts/test-windows-installer.ps1 -InstallerPath $installer.FullName -ExpectedExePath ci-tested/NeuralIA.exe -ExpectedVersion $version
+          }
+          catch {
+            if ($_.Exception.Message -match "differs from the CI-tested payload") {
+              $caughtExpectedFailure = $true
+              Write-Host "Sabotage proof: substituted payload was rejected."
+            }
+            else {
+              throw
+            }
+          }
+
+          if (-not $caughtExpectedFailure) {
+            throw "Installer gate stayed green after payload substitution."
+          }
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: neuralia-installer-unsigned-${{ github.sha }}
+          path: ci-installer/*.exe
+          if-no-files-found: error
+          retention-days: 3
+
   attest-tested-binary:
     needs: windows
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

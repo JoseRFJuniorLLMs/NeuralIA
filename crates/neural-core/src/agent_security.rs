@@ -398,6 +398,94 @@ fn audit_action_name(action: &AgentSecurityAction) -> &'static str {
     }
 }
 
+/// Parametros de query/fragmento que carregam credenciais. A lista e
+/// deliberadamente generosa: um parametro perdido custa muito mais do que um
+/// parametro redigido a mais.
+const CREDENTIAL_PARAMS: &[&str] = &[
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "token",
+    "auth",
+    "authorization",
+    "api_key",
+    "apikey",
+    "client_secret",
+    "secret",
+    "password",
+    "passwd",
+    "pwd",
+    "session",
+    "sessionid",
+    "sid",
+    "signature",
+    "sig",
+    "code",
+    "otp",
+    "key",
+];
+
+fn looks_like_credential_param(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    CREDENTIAL_PARAMS
+        .iter()
+        .any(|needle| name == *needle || name.ends_with(&format!("_{needle}")))
+}
+
+/// Uma URL sem as credenciais que costumam viajar nela, mantendo tudo o resto.
+///
+/// O corpo de um documento passa pelo `redact_sensitive_text`; a URL nao
+/// passava por nada. Um `?access_token=...` de um callback OAuth ficava
+/// verbatim no JSON do documento, no `.md` do wiki, na coluna indexada do
+/// SQLite e no `MemoryHit` que vai para a interface -- ao lado do corpo que o
+/// sistema se deu ao trabalho de limpar.
+///
+/// Nao se apaga a query inteira: ela e muitas vezes o que torna a URL util
+/// (o termo pesquisado, o id do artigo). Apaga-se o valor dos parametros que
+/// parecem credenciais, e o fragmento inteiro quando ele carrega um -- o fluxo
+/// implicito do OAuth entrega o token depois do `#`.
+pub fn redact_url(raw: &str) -> String {
+    let Ok(mut url) = Url::parse(raw) else {
+        return redact_sensitive_text(raw);
+    };
+
+    let redacted: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(name, value)| {
+            if looks_like_credential_param(&name) {
+                (name.into_owned(), "[REDACTED]".to_string())
+            } else {
+                (name.into_owned(), value.into_owned())
+            }
+        })
+        .collect();
+    if redacted.is_empty() {
+        url.set_query(None);
+    } else {
+        let mut serializer = url.query_pairs_mut();
+        serializer.clear();
+        for (name, value) in &redacted {
+            serializer.append_pair(name, value);
+        }
+        drop(serializer);
+    }
+
+    if let Some(fragment) = url.fragment()
+        && fragment
+            .split(['&', ';'])
+            .filter_map(|pair| pair.split('=').next())
+            .any(looks_like_credential_param)
+    {
+        url.set_fragment(Some("[REDACTED]"));
+    }
+
+    if !url.username().is_empty() || url.password().is_some() {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+    }
+
+    url.to_string()
+}
 pub fn redact_sensitive_text(input: &str) -> String {
     let mut output = Vec::new();
     for raw in input.lines() {
@@ -426,10 +514,24 @@ pub fn redact_sensitive_text(input: &str) -> String {
             "cvc=",
         ]
         .iter()
-        .any(|needle| lower.contains(needle));
+        .find(|needle| lower.contains(*needle))
+        .copied();
 
-        if sensitive {
-            let key = raw.split([':', '=']).next().unwrap_or("sensitive").trim();
+        if let Some(needle) = sensitive {
+            // O nome do campo so se escreve quando foi ELE o reconhecido.
+            //
+            // Com `split(...).next()`, uma linha sem separador devolvia a
+            // LINHA INTEIRA como chave: o segredo saia verbatim, com um
+            // "[REDACTED]" colado atras a fingir que tinha sido apagado --
+            // pior do que nao redigir, porque parece redigido. E numa linha
+            // como `<segredo>: api_key` a agulha esta DEPOIS do separador,
+            // portanto a chave era o segredo.
+            let field = needle.trim_end_matches([':', '=']);
+            let key = raw
+                .split_once([':', '='])
+                .map(|(key, _)| key.trim())
+                .filter(|key| !key.is_empty() && key.to_ascii_lowercase().contains(field))
+                .unwrap_or("sensitive");
             output.push(format!("{key}: [REDACTED]"));
         } else {
             output.push(raw.to_string());
@@ -442,6 +544,36 @@ pub fn redact_sensitive_text(input: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_sensitive_line_without_a_separator_does_not_echo_the_secret() {
+        // `raw.split([':','=']).next()` devolve a LINHA INTEIRA quando nao ha
+        // separador nenhum. O segredo saia verbatim como "chave", com um
+        // "[REDACTED]" colado atras a fingir que tinha sido apagado -- pior do
+        // que nao redigir, porque parece redigido.
+        for (line, secret) in [
+            ("access_token ya29.SEGREDO", "ya29.SEGREDO"),
+            ("api_key sk-SEGREDO", "sk-SEGREDO"),
+            ("refresh_token   abc123", "abc123"),
+        ] {
+            let clean = redact_sensitive_text(line);
+            assert!(!clean.contains(secret), "{line} -> {clean}");
+            assert!(clean.contains("[REDACTED]"), "{line} -> {clean}");
+        }
+
+        // NOTA, e nao e o assunto deste teste: `Authorization Bearer abc` --
+        // cabecalho escrito com espaco em vez de `:` -- nao e sequer detectado,
+        // porque as agulhas da lista sao "authorization:" e "authorization=".
+        // E uma lacuna separada, do detector e nao do formatador.
+
+        // Com separador, o nome do campo continua a sobreviver -- e o que diz
+        // ao utilizador o que foi apagado.
+        let clean = redact_sensitive_text("Authorization: Bearer abc123");
+        assert_eq!(clean, "Authorization: [REDACTED]");
+
+        // Uma chave que seja ela propria suspeita nao passa por nome de campo.
+        let clean = redact_sensitive_text("ya29.SEGREDO-MUITO-LONGO-E-ESTRANHO: api_key");
+        assert!(!clean.contains("ya29.SEGREDO"), "{clean}");
+    }
     #[test]
     fn sensitive_values_are_redacted_before_storage_or_model_context() {
         let input = "title: ok\nAuthorization: Bearer abc\npassword=hunter2\nbody: visible";

@@ -1,0 +1,143 @@
+name: Reader gates
+
+on:
+  pull_request:
+    paths:
+      - 'crates/neural-core/src/reader.rs'
+      - '.github/workflows/reader.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/neural-core/src/reader.rs'
+      - '.github/workflows/reader.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  reader:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+
+      - name: Exercise shipped Reader regressions
+        run: |
+          cargo test --locked -p neural-core reader::tests::nested_list_item_text_is_not_repeated_by_its_parent
+          cargo test --locked -p neural-core reader::tests::empty_meta_content_does_not_block_title_or_excerpt_fallbacks
+          cargo test --locked -p neural-core reader::tests::fallback_body_never_contains_document_title
+          cargo test --locked -p neural-core reader::tests::semantic_wrapper_keeps_its_type_without_duplicate_inner_paragraph
+
+      - name: Prove nested-block gate catches duplication
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("crates/neural-core/src/reader.rs")
+          text = path.read_text(encoding="utf-8")
+          old = 'active_blocks.last().copied()'
+          new = 'active_blocks.first().copied()'
+          if text.count(old) != 1:
+              raise SystemExit("nested-block sabotage target not found exactly once")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
+
+          set +e
+          cargo test --locked -p neural-core reader::tests::nested_list_item_text_is_not_repeated_by_its_parent
+          result=$?
+          set -e
+          git checkout -- crates/neural-core/src/reader.rs
+
+          if [ "$result" -eq 0 ]; then
+            echo "Reader nested-block sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: subtree-wide block text was rejected with exit code $result."
+
+      - name: Prove empty-meta gate preserves fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("crates/neural-core/src/reader.rs")
+          text = path.read_text(encoding="utf-8")
+          old = '        .map(ToString::to_string)\n        .filter(|value| !value.trim().is_empty())'
+          new = '        .map(ToString::to_string)'
+          if text.count(old) != 1:
+              raise SystemExit("empty-meta sabotage target not found exactly once")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
+
+          set +e
+          cargo test --locked -p neural-core reader::tests::empty_meta_content_does_not_block_title_or_excerpt_fallbacks
+          result=$?
+          set -e
+          git checkout -- crates/neural-core/src/reader.rs
+
+          if [ "$result" -eq 0 ]; then
+            echo "Reader empty-meta sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: empty metadata blocking fallback was rejected with exit code $result."
+
+      - name: Prove fallback body gate excludes head metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("crates/neural-core/src/reader.rs")
+          text = path.read_text(encoding="utf-8")
+          old = '        "head" | "nav"'
+          new = '        "nav"'
+          if text.count(old) != 1:
+              raise SystemExit("head sabotage target not found exactly once")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
+
+          set +e
+          cargo test --locked -p neural-core reader::tests::fallback_body_never_contains_document_title
+          result=$?
+          set -e
+          git checkout -- crates/neural-core/src/reader.rs
+
+          if [ "$result" -eq 0 ]; then
+            echo "Reader head/title sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: title leaking into fallback body was rejected with exit code $result."
+
+      - name: Prove semantic-wrapper gate preserves outer block type
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("crates/neural-core/src/reader.rs")
+          text = path.read_text(encoding="utf-8")
+          old = "let raw = if self.has_own_visible {"
+          new = "let raw = if !self.has_own_visible {"
+          if text.count(old) != 1:
+              raise SystemExit("semantic-wrapper sabotage target not found exactly once")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
+
+          set +e
+          cargo test --locked -p neural-core reader::tests::semantic_wrapper_keeps_its_type_without_duplicate_inner_paragraph
+          result=$?
+          set -e
+          git checkout -- crates/neural-core/src/reader.rs
+
+          if [ "$result" -eq 0 ]; then
+            echo "Reader semantic-wrapper sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: losing semantic wrapper fallback was rejected with exit code $result."
+
+      - name: Confirm restored Reader source is green
+        run: |
+          cargo test --locked -p neural-core reader::tests::

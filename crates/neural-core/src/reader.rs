@@ -36,9 +36,10 @@ const MAX_BLOCK_CHARS: usize = 20_000;
 // abre primeiro, por isso um <article> com centenas de .post continua a ser
 // pontuado). Profundidade: elementos com mais de MAX_DEPTH antepassados nao
 // sao candidatos, blocos nem texto de fallback (o Chromium corta a 512).
-// Aninhamento: `text()` de um bloco le a subarvore toda, logo cada no seria
-// lido uma vez por bloco antepassado -- blockquote dentro de blockquote sem
-// fim voltava a ser quadratico.
+// Aninhamento: a recolha de blocos e hoje uma passagem unica; o tecto continua
+// a limitar quantos blocos semanticos podem ficar simultaneamente activos e
+// quantos PendingBlock podem nascer numa cadeia adversarial profundamente
+// aninhada. Texto abaixo do tecto de emissao permanece no ultimo bloco elegivel.
 const MAX_CANDIDATES: usize = 256;
 const MAX_DEPTH: usize = 256;
 const MAX_BLOCK_NESTING: usize = 16;
@@ -574,7 +575,7 @@ fn block_tag(name: &str) -> bool {
 fn ignored_tag(name: &str) -> bool {
     matches!(
         name,
-        "nav" | "footer" | "aside" | "script" | "style" | "form" | "template" | "noscript"
+        "head" | "nav" | "footer" | "aside" | "script" | "style" | "form" | "template" | "noscript"
     )
 }
 
@@ -625,68 +626,186 @@ fn walk_visible<'a>(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum BlockKind {
+    Heading(u8),
+    Paragraph,
+    Quote,
+    Code,
+    ListItem,
+}
+
+impl BlockKind {
+    fn from_tag(tag: &str) -> Option<Self> {
+        Some(match tag {
+            "h1" => Self::Heading(1),
+            "h2" => Self::Heading(2),
+            "h3" => Self::Heading(3),
+            "h4" => Self::Heading(4),
+            "h5" => Self::Heading(5),
+            "h6" => Self::Heading(6),
+            "blockquote" => Self::Quote,
+            "pre" => Self::Code,
+            "li" => Self::ListItem,
+            "p" => Self::Paragraph,
+            _ => return None,
+        })
+    }
+
+    fn into_reader_block(self, text: String) -> ReaderBlock {
+        match self {
+            Self::Heading(level) => ReaderBlock::Heading { level, text },
+            Self::Paragraph => ReaderBlock::Paragraph(text),
+            Self::Quote => ReaderBlock::Quote(text),
+            Self::Code => ReaderBlock::Code(text),
+            Self::ListItem => ReaderBlock::ListItem(text),
+        }
+    }
+}
+
+struct PendingBlock {
+    kind: BlockKind,
+    own_raw: String,
+    fallback_raw: String,
+    has_own_visible: bool,
+}
+
+impl PendingBlock {
+    fn append_raw(kind: BlockKind, raw: &mut String, text: &str) {
+        if matches!(kind, BlockKind::Code) {
+            raw.push_str(text);
+        } else {
+            if !raw.is_empty() {
+                raw.push(' ');
+            }
+            raw.push_str(text);
+        }
+    }
+
+    fn push_fallback(&mut self, text: &str) {
+        if !self.has_own_visible {
+            Self::append_raw(self.kind, &mut self.fallback_raw, text);
+        }
+    }
+
+    fn push_own(&mut self, text: &str) {
+        if !self.has_own_visible && text.split_whitespace().next().is_some() {
+            self.has_own_visible = true;
+            self.fallback_raw = String::new();
+        }
+        Self::append_raw(self.kind, &mut self.own_raw, text);
+    }
+
+    fn normalized(self) -> String {
+        let raw = if self.has_own_visible {
+            self.own_raw
+        } else {
+            self.fallback_raw
+        };
+        if matches!(self.kind, BlockKind::Code) {
+            normalize_code(raw)
+        } else {
+            normalize_text(raw)
+        }
+    }
+}
+
+/// Recolhe blocos numa única passagem. Texto próprio pertence ao bloco emitível
+/// mais interno; os ancestrais guardam o mesmo texto apenas como fallback
+/// enquanto ainda não tiverem texto próprio. Assim um <li> pai com texto não
+/// absorve o <li> filho, mas um wrapper sem texto próprio como
+/// <blockquote><p>...</p></blockquote> conserva a semântica Quote.
+///
+/// Quando a árvore passa de MAX_BLOCK_NESTING, blocos mais fundos deixam de ser
+/// emitidos e o texto continua no fallback do último bloco elegível, portanto
+/// conteúdo profundo não desaparece. PendingBlock nasce em pré-ordem e é
+/// materializado no fim sem revarrer subárvores.
 fn collect_blocks(root: ElementRef<'_>, budget: &mut Budget<'_>) -> Result<Vec<ReaderBlock>> {
+    // (elemento, ignorado, é bloco visível, índice emitível) por elemento aberto
+    let mut open: Vec<(ElementRef<'_>, bool, bool, Option<usize>)> = Vec::new();
+    let mut active_blocks: Vec<usize> = Vec::new();
+    let mut pending: Vec<PendingBlock> = Vec::new();
+    let base_depth = root
+        .ancestors()
+        .filter(|node| node.value().is_element())
+        .count();
+    let mut ignored = 0usize;
+    let mut nesting = 0usize;
+
+    for node in root.descendants().skip(1) {
+        let parent = node.parent().map(|parent| parent.id());
+        while let Some((_, hidden, block, pending_index)) =
+            open.pop_if(|(element, _, _, _)| Some(element.id()) != parent)
+        {
+            ignored -= usize::from(hidden);
+            nesting -= usize::from(block);
+            if let Some(index) = pending_index {
+                debug_assert_eq!(active_blocks.pop(), Some(index));
+            }
+        }
+
+        match node.value() {
+            Node::Element(element) => {
+                budget.tick()?;
+                let Some(element_ref) = ElementRef::wrap(node) else {
+                    continue;
+                };
+                let hidden =
+                    ignored > 0 || ignored_tag(element.name()) || is_hidden_element(element);
+                let block = !hidden && block_tag(element.name());
+                let pending_index =
+                    if block && nesting <= MAX_BLOCK_NESTING && base_depth + open.len() < MAX_DEPTH
+                    {
+                        let Some(kind) = BlockKind::from_tag(element.name()) else {
+                            open.push((element_ref, hidden, block, None));
+                            nesting += usize::from(block);
+                            continue;
+                        };
+                        let index = pending.len();
+                        pending.push(PendingBlock {
+                            kind,
+                            own_raw: String::new(),
+                            fallback_raw: String::new(),
+                            has_own_visible: false,
+                        });
+                        active_blocks.push(index);
+                        Some(index)
+                    } else {
+                        None
+                    };
+
+                if hidden {
+                    ignored += 1;
+                }
+                nesting += usize::from(block);
+                open.push((element_ref, hidden, block, pending_index));
+            }
+            Node::Text(text) if ignored == 0 => {
+                for &index in &active_blocks {
+                    pending[index].push_fallback(text);
+                }
+                if let Some(index) = active_blocks.last().copied() {
+                    pending[index].push_own(text);
+                }
+            }
+            _ => {}
+        }
+    }
+
     let mut blocks = Vec::new();
     let mut previous = String::new();
-
-    walk_visible(root, budget, |node, nesting| {
-        let tag = node.value().name();
-        if !block_tag(tag) || nesting > MAX_BLOCK_NESTING {
-            return true;
-        }
-
-        let text = if tag == "pre" {
-            truncate_chars(
-                normalize_code(node.text().collect::<Vec<_>>().join("")),
-                MAX_BLOCK_CHARS,
-            )
-        } else {
-            truncate_chars(
-                normalize_text(node.text().collect::<Vec<_>>().join(" ")),
-                MAX_BLOCK_CHARS,
-            )
-        };
-
+    for block in pending {
+        let kind = block.kind;
+        let text = truncate_chars(block.normalized(), MAX_BLOCK_CHARS);
         if text.chars().count() < 2 || text == previous {
-            return true;
+            continue;
         }
-
-        let block = match tag {
-            "h1" => ReaderBlock::Heading {
-                level: 1,
-                text: text.clone(),
-            },
-            "h2" => ReaderBlock::Heading {
-                level: 2,
-                text: text.clone(),
-            },
-            "h3" => ReaderBlock::Heading {
-                level: 3,
-                text: text.clone(),
-            },
-            "h4" => ReaderBlock::Heading {
-                level: 4,
-                text: text.clone(),
-            },
-            "h5" => ReaderBlock::Heading {
-                level: 5,
-                text: text.clone(),
-            },
-            "h6" => ReaderBlock::Heading {
-                level: 6,
-                text: text.clone(),
-            },
-            "blockquote" => ReaderBlock::Quote(text.clone()),
-            "pre" => ReaderBlock::Code(text.clone()),
-            "li" => ReaderBlock::ListItem(text.clone()),
-            _ => ReaderBlock::Paragraph(text.clone()),
-        };
-
-        previous = text;
-        blocks.push(block);
-        blocks.len() < MAX_BLOCKS
-    })?;
-
+        previous = text.clone();
+        blocks.push(kind.into_reader_block(text));
+        if blocks.len() >= MAX_BLOCKS {
+            break;
+        }
+    }
     Ok(blocks)
 }
 
@@ -744,6 +863,7 @@ fn meta_content(document: &Html, selector: &str) -> Option<String> {
         .next()
         .and_then(|element| element.value().attr("content"))
         .map(ToString::to_string)
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn text_of_first(document: &Html, selector: &str) -> Option<String> {
@@ -872,5 +992,90 @@ mod tests {
         let rendered = format!("{:?}", article.blocks);
         assert!(rendered.contains("fundo visivel"));
         assert!(!rendered.contains("fundo escondido"));
+    }
+
+    #[test]
+    fn nested_list_item_text_is_not_repeated_by_its_parent() {
+        let html = r#"<html><head><title>Lista</title></head><body><article>
+        <ul>
+          <li>Item pai com contexto suficiente
+            <ul><li>Item filho aparece uma vez apenas</li></ul>
+          </li>
+        </ul>
+        </article></body></html>"#;
+        let url = Url::parse("https://example.com/lista").unwrap();
+        let article = extract_article(&url, html).unwrap();
+
+        let items: Vec<&str> = article
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ReaderBlock::ListItem(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], "Item pai com contexto suficiente");
+        assert_eq!(items[1], "Item filho aparece uma vez apenas");
+        assert_eq!(
+            items
+                .iter()
+                .filter(|text| text.contains("Item filho aparece uma vez apenas"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn semantic_wrapper_keeps_its_type_without_duplicate_inner_paragraph() {
+        let html = r#"<html><head><title>Semântica</title></head><body><article>
+        <ul><li><p>Item de lista embrulhado em parágrafo</p></li></ul>
+        <blockquote><p>Citação embrulhada em parágrafo</p></blockquote>
+        </article></body></html>"#;
+        let url = Url::parse("https://example.com/semantica").unwrap();
+        let article = extract_article(&url, html).unwrap();
+
+        assert!(article.blocks.iter().any(|block| {
+            matches!(block, ReaderBlock::ListItem(text) if text == "Item de lista embrulhado em parágrafo")
+        }));
+        assert!(article.blocks.iter().any(|block| {
+            matches!(block, ReaderBlock::Quote(text) if text == "Citação embrulhada em parágrafo")
+        }));
+        assert!(!article.blocks.iter().any(|block| {
+            matches!(block, ReaderBlock::Paragraph(text)
+                if text == "Item de lista embrulhado em parágrafo"
+                    || text == "Citação embrulhada em parágrafo")
+        }));
+    }
+
+    #[test]
+    fn empty_meta_content_does_not_block_title_or_excerpt_fallbacks() {
+        let html = r#"<html><head>
+        <meta property="og:title" content="   ">
+        <title>Título real da página</title>
+        <meta name="description" content="">
+        <meta property="og:description" content="Resumo real da página">
+        </head><body><article>
+        <p>Conteúdo suficientemente longo para a extração do Reader.</p>
+        </article></body></html>"#;
+        let url = Url::parse("https://example.com/meta").unwrap();
+        let article = extract_article(&url, html).unwrap();
+
+        assert_eq!(article.title, "Título real da página");
+        assert_eq!(article.excerpt.as_deref(), Some("Resumo real da página"));
+    }
+
+    #[test]
+    fn fallback_body_never_contains_document_title() {
+        let html = r#"<html><head><title>TÍTULO NÃO É CORPO</title></head><body>
+        <div><span>Este é o conteúdo visível suficientemente longo para o Reader usar como texto de fallback do artigo.</span></div>
+        </body></html>"#;
+        let url = Url::parse("https://example.com/fallback").unwrap();
+        let article = extract_article(&url, html).unwrap();
+        let rendered = format!("{:?}", article.blocks);
+
+        assert!(rendered.contains("Este é o conteúdo visível"));
+        assert!(!rendered.contains("TÍTULO NÃO É CORPO"));
     }
 }

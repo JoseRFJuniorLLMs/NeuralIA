@@ -56,6 +56,31 @@ jobs:
           if ($actual -ne $expected) {
             throw "CI-tested NeuralIA.exe checksum mismatch: expected $expected, got $actual"
           }
+      - name: Build signed installer when Authenticode credentials are configured
+        shell: pwsh
+        env:
+          NEURALIA_AUTHENTICODE_PFX_B64: ${{ secrets.NEURALIA_AUTHENTICODE_PFX_B64 }}
+          NEURALIA_AUTHENTICODE_PFX_PASSWORD: ${{ secrets.NEURALIA_AUTHENTICODE_PFX_PASSWORD }}
+        run: |
+          $hasPfx = -not [string]::IsNullOrWhiteSpace($env:NEURALIA_AUTHENTICODE_PFX_B64)
+          $hasPfxSecret = -not [string]::IsNullOrWhiteSpace($env:NEURALIA_AUTHENTICODE_PFX_PASSWORD)
+
+          if ($hasPfx -xor $hasPfxSecret) {
+            throw "Authenticode configuration is incomplete: both PFX and password secrets are required."
+          }
+          if (-not $hasPfx) {
+            Write-Host "Authenticode certificate is not configured; signed installer asset will be omitted."
+            exit 0
+          }
+
+          $line = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          $version = $line.Matches[0].Groups[1].Value
+          ./scripts/build-windows-installer.ps1 -ExePath ci-tested/NeuralIA.exe -Version $version -OutputDir signed-installer -Sign
+
+          $installer = Get-ChildItem signed-installer -Filter "NeuralIA-Setup-*-x64.exe" -File | Select-Object -First 1
+          if (-not $installer) { throw "Signed installer was not produced." }
+          ./scripts/test-windows-installer.ps1 -InstallerPath $installer.FullName -ExpectedExePath ci-tested/NeuralIA.exe -ExpectedVersion $version -RequireValidSignature
+
       - name: Generate CycloneDX SBOM
         shell: pwsh
         run: |
@@ -68,6 +93,15 @@ jobs:
           Copy-Item ci-tested/NeuralIA.exe dist/NeuralIA.exe
           Copy-Item ci-tested/perf-home.json dist/perf-home.json
           Copy-Item ci-tested/perf-cycles.json dist/perf-cycles.json
+
+          if (Test-Path signed-installer) {
+            $installer = Get-ChildItem signed-installer -Filter "NeuralIA-Setup-*-x64.exe" -File | Select-Object -First 1
+            if ($installer) {
+              Copy-Item $installer.FullName dist/$($installer.Name)
+              $installerHash = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLower()
+              "$installerHash  $($installer.Name)" | Out-File -Encoding ascii "dist/$($installer.Name).sha256"
+            }
+          }
 
           $sbom = Get-ChildItem crates/neural-app -File -Filter "*.json" |
             Where-Object { $_.Name -match "bom|cdx|cyclonedx" } |
