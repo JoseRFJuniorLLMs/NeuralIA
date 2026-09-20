@@ -1,0 +1,30 @@
+name: SABOTAGE memory capture gate #86
+
+on:
+  push:
+    branches: [test/sabotage-memory-86-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  prove-red:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+      - name: Apply O(n) sabotage only inside runner
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("crates/neural-core/src/memory.rs")
+          source = path.read_text(encoding="utf-8")
+          needle = "        let sqlite_existed = self.sqlite_path().exists();\n"
+          sabotage = needle + "        let _ = self.document_file_count()?; // SABOTAGE runner-only\n"
+          if source.count(needle) != 1:
+              raise SystemExit("capture anchor not unique")
+          path.write_text(source.replace(needle, sabotage, 1), encoding="utf-8")
+      - name: Gate must turn red under corpus scan sabotage
+        run: cargo test --locked -p neural-core capture_never_scans_the_existing_corpus_or_validates_the_whole_index
