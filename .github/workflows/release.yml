@@ -122,13 +122,51 @@ jobs:
             })
             properties = @(
               [pscustomobject]@{ name = "neuralia:vendored"; value = "assets/pdfjs/pdf.mjs" },
-              [pscustomobject]@{ name = "neuralia:worker"; value = "assets/pdfjs/pdf.worker.mjs" }
+              [pscustomobject]@{ name = "neuralia:worker"; value = "assets/pdfjs/pdf.worker.mjs" },
+              [pscustomobject]@{ name = "neuralia:auxiliary-manifest"; value = "assets/pdfjs/AUXILIARY_BLOBS.md" }
             )
           }
+          $pdfjsAuxiliary = @(
+            [pscustomobject]@{
+              type = "library"; name = "pdf.js OpenJPEG decoder"; version = "6.3.289"
+              licenses = @([pscustomobject]@{ license = [pscustomobject]@{ id = "BSD-2-Clause" } })
+              properties = @([pscustomobject]@{ name = "neuralia:vendored"; value = "assets/pdfjs/wasm/openjpeg.wasm" })
+            },
+            [pscustomobject]@{
+              type = "library"; name = "pdf.js JBIG2 decoder"; version = "6.3.289"
+              licenses = @([pscustomobject]@{ license = [pscustomobject]@{ id = "Apache-2.0" } })
+              properties = @([pscustomobject]@{ name = "neuralia:vendored"; value = "assets/pdfjs/wasm/jbig2.wasm" })
+            },
+            [pscustomobject]@{
+              type = "library"; name = "pdf.js QCMS decoder"; version = "6.3.289"
+              licenses = @([pscustomobject]@{ license = [pscustomobject]@{ id = "MIT" } })
+              properties = @([pscustomobject]@{ name = "neuralia:vendored"; value = "assets/pdfjs/wasm/qcms_bg.wasm" })
+            },
+            [pscustomobject]@{
+              type = "data"; name = "Adobe binary CMaps"; version = "pdf.js-6.3.289"
+              licenses = @([pscustomobject]@{ license = [pscustomobject]@{ name = "Adobe BSD-style CMap license" } })
+              properties = @([pscustomobject]@{ name = "neuralia:vendored"; value = "assets/pdfjs/cmaps/" })
+            },
+            [pscustomobject]@{
+              type = "library"; name = "Foxit standard fonts"; version = "pdf.js-6.3.289"
+              licenses = @([pscustomobject]@{ license = [pscustomobject]@{ name = "PDFium/Foxit BSD-style license" } })
+              properties = @([pscustomobject]@{ name = "neuralia:vendored"; value = "assets/pdfjs/standard_fonts/" })
+            },
+            [pscustomobject]@{
+              type = "library"; name = "Liberation Sans"; version = "1.07.4"
+              licenses = @([pscustomobject]@{ license = [pscustomobject]@{ name = "GPLv2 with Liberation font exception" } })
+              properties = @([pscustomobject]@{ name = "neuralia:vendored"; value = "assets/pdfjs/standard_fonts/LiberationSans-Regular.ttf" })
+            },
+            [pscustomobject]@{
+              type = "data"; name = "CGATS001Compat-v2-micro ICC profile"; version = "bdd84663061bc4ae95ca70decff54f581e27f702"
+              licenses = @([pscustomobject]@{ license = [pscustomobject]@{ id = "CC0-1.0" } })
+              properties = @([pscustomobject]@{ name = "neuralia:vendored"; value = "assets/pdfjs/icc/CGATS001Compat-v2-micro.icc" })
+            }
+          )
           if (-not $document.components) {
             $document | Add-Member -MemberType NoteProperty -Name components -Value @()
           }
-          $document.components += $pdfjs
+          $document.components += @($pdfjs) + $pdfjsAuxiliary
           $document | ConvertTo-Json -Depth 100 | Set-Content -Encoding utf8 $sbom.FullName
 
           Copy-Item $sbom.FullName dist/NeuralIA.cdx.json
