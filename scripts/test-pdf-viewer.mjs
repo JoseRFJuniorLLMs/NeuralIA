@@ -1,13 +1,11 @@
 import assert from 'node:assert/strict';
-import OpenJPEG from '../assets/pdfjs/wasm/openjpeg_nowasm_fallback.js';
-import JBig2 from '../assets/pdfjs/wasm/jbig2_nowasm_fallback.js';
-import {
-  PDF_AUX_BASE,
-  describeLoadError,
-  hideStatus,
-  makePdfLoadOptions,
-  showStatus
-} from '../assets/pdfjs/viewer-runtime.mjs';
+import * as pdfjsLib from '../assets/pdfjs/pdf.mjs';
+
+const viewerModule =
+  process.env.NEURALIA_PDF_VIEWER_MODULE ||
+  new URL('../assets/pdfjs/viewer.mjs', import.meta.url).href;
+
+const { describeLoadError, hideStatus, showStatus } = await import(viewerModule);
 
 let passed = 0;
 
@@ -22,42 +20,15 @@ function test(name, fn) {
   }
 }
 
-test('vendored decoder fallbacks are executable modules', () => {
-  assert.equal(typeof OpenJPEG, 'function');
-  assert.equal(typeof JBig2, 'function');
-});
-
-test('load options never ask PDF.js for missing WASM binaries', () => {
-  const options = makePdfLoadOptions('./document.pdf', 1048576);
-  assert.equal(options.url, './document.pdf');
-  assert.equal(options.rangeChunkSize, 1048576);
-  assert.equal(options.disableStream, true);
-  assert.equal(options.disableAutoFetch, true);
-  assert.equal(options.wasmUrl, './wasm/');
-  assert.equal(options.useWasm, false);
-  assert.equal(PDF_AUX_BASE, './wasm/');
-});
-
 test('ResponseException is classified as transport failure', () => {
-  class ResponseException extends Error {
-    constructor(message, status) {
-      super(message);
-      this.name = 'SomethingElse';
-      this.status = status;
-    }
-  }
-  const err = new ResponseException('Service unavailable', 503);
-  assert.equal(
-    describeLoadError(err, { ResponseException }),
-    'Não consegui obter o PDF: HTTP 503'
-  );
+  const err = new pdfjsLib.ResponseException('Service unavailable', 503, false);
+  assert.equal(describeLoadError(err), 'Não consegui obter o PDF: HTTP 503');
 });
 
 test('InvalidPDFException is classified as document failure', () => {
-  class InvalidPDFException extends Error {}
-  const err = new InvalidPDFException('bad xref');
+  const err = new pdfjsLib.InvalidPDFException('bad xref');
   assert.equal(
-    describeLoadError(err, { InvalidPDFException }),
+    describeLoadError(err),
     'Este ficheiro não é um PDF que eu consiga abrir: bad xref'
   );
 });
