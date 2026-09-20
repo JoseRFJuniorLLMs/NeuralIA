@@ -5,6 +5,7 @@
 // worker. A geometria e calculada, nao lida do DOM, para o scroll nao forcar
 // layout a cada evento.
 import * as pdfjsLib from './pdf.mjs';
+import { describeLoadError, hideStatus, makePdfLoadOptions, showStatus } from './viewer-runtime.mjs';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './pdf.worker.mjs';
 
@@ -46,20 +47,7 @@ function pixelRatio() {
 }
 
 function fail(message) {
-  status.textContent = message;
-  status.classList.add('error');
-  status.hidden = false;
-}
-
-// O PDF.js entrega os erros de rede como ResponseException (estado HTTP) e o
-// "Failed to fetch" embrulhado em UnknownErrorException; o resto e PDF que
-// nao se consegue abrir. Mantem as duas mensagens de sempre.
-function describeLoadError(err) {
-  const name = (err && err.name) || '';
-  const text = (err && err.message) || String(err);
-  if (name === 'ResponseException') return 'Não consegui obter o PDF: HTTP ' + err.status;
-  if (name === 'UnknownErrorException' && /fetch/i.test(text)) return 'Não consegui obter o PDF: ' + text;
-  return 'Este ficheiro não é um PDF que eu consiga abrir: ' + text;
+  showStatus(status, message, true);
 }
 
 function targetWidth() {
@@ -300,14 +288,11 @@ async function load() {
     // pedido inicial de continuar a puxar o ficheiro inteiro depois dos
     // cabecalhos, e disableAutoFetch impede o worker de ir buscar em fundo os
     // chunks que ninguem pediu; sem os dois, o PDF acabava todo em memoria.
-    doc = await pdfjsLib.getDocument({
-      url: './document.pdf',
-      rangeChunkSize: RANGE_CHUNK,
-      disableStream: true,
-      disableAutoFetch: true
-    }).promise;
+    doc = await pdfjsLib.getDocument(
+      makePdfLoadOptions('./document.pdf', RANGE_CHUNK)
+    ).promise;
   } catch (err) {
-    fail(describeLoadError(err));
+    fail(describeLoadError(err, pdfjsLib));
     return;
   }
 
@@ -322,7 +307,7 @@ async function load() {
     known = await probeSizes(first);
     defaultSize = medianSize(known);
   } catch (err) {
-    fail(describeLoadError(err));
+    fail(describeLoadError(err, pdfjsLib));
     return;
   }
 
@@ -349,7 +334,7 @@ async function load() {
   layoutAll();
   for (const slot of slots) observer.observe(slot.el);
 
-  status.hidden = true;
+  hideStatus(status);
   hud.hidden = false;
   updateHud();
   document.title = 'NeuralIA · PDF · ' + doc.numPages + ' páginas';
