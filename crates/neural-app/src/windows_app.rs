@@ -7713,11 +7713,11 @@ fn web_media_permission(kind: PermissionKind, user_visible: bool) -> PermissionR
         return PermissionResponse::Deny;
     }
     match kind {
-        PermissionKind::Microphone | PermissionKind::Camera | PermissionKind::DisplayCapture => {
-            // No WRY 0.57, Default continua o fluxo nativo do WebView2 no Windows:
-            // o utilizador decide no prompt do runtime. NeuralIA nunca da Allow silencioso.
+        PermissionKind::Microphone | PermissionKind::DisplayCapture => {
+            // SABOTAGE: camera foi retirada do fluxo nativo.
             PermissionResponse::Default
         }
+        PermissionKind::Camera => PermissionResponse::Deny,
         _ => PermissionResponse::Deny,
     }
 }
