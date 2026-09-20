@@ -31,7 +31,8 @@ A release candidate MUST:
 - publish a CycloneDX JSON SBOM for the Windows application;
 - publish Cargo metadata;
 - publish the Home and WebView lifecycle measurement JSON produced against the released executable;
-- generate GitHub build-provenance attestation in CI for the same tested executable, before release packaging.
+- generate GitHub build-provenance attestation in CI for the same tested executable, before release packaging;
+- generate a second provenance attestation in the release workflow for `dist/NeuralIA.exe`, after checksum verification and immediately before publication. Because `dist/NeuralIA.exe` is copied from the verified CI artifact rather than rebuilt, both attestations bind the same executable bytes.
 
 Stable release assets MUST be immutable by policy. When both the version tag
 and its GitHub Release already exist, a later main push with the same workspace
