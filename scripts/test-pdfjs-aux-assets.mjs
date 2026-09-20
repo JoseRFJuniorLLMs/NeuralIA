@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import * as pdfjsLib from '../assets/pdfjs/pdf.mjs';
+if (typeof Promise.try !== 'function') {
+  Promise.try = (fn, ...args) => Promise.resolve().then(() => fn(...args));
+}
+const pdfjsLib = await import('../assets/pdfjs/pdf.mjs');
 
 const pdfjsRoot = fileURLToPath(new URL('../assets/pdfjs/', import.meta.url));
 const missing = path.join(pdfjsRoot, '__missing_aux__') + path.sep;
