@@ -69,7 +69,6 @@ fn vendored_pdfjs_files_match_the_recorded_hashes() {
     }
 }
 
-
 fn listed_files(relative_dir: &str) -> Vec<String> {
     let root = repo_root();
     let dir = root.join(relative_dir);
