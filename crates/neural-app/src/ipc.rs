@@ -259,7 +259,10 @@ mod tests {
     #[test]
     fn pdf_page_text_is_capability_authenticated_and_bounded() {
         let parsed = parse_ipc_message(
-            &message("pdf-page-text", json!({"page": 3, "text": "conteudo pesquisavel"})),
+            &message(
+                "pdf-page-text",
+                json!({"page": 3, "text": "conteudo pesquisavel"}),
+            ),
             CAP,
             3,
         );

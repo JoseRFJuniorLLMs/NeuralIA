@@ -18,9 +18,7 @@ use image::RgbaImage;
 
 #[cfg(test)]
 use crate::ipc::constant_time_eq;
-use crate::ipc::{
-    IpcAction, PDF_TEXT_MAX_CHARS_PER_PAGE, PDF_TEXT_MAX_PAGES, parse_ipc_message,
-};
+use crate::ipc::{IpcAction, PDF_TEXT_MAX_CHARS_PER_PAGE, PDF_TEXT_MAX_PAGES, parse_ipc_message};
 use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentRuntimeConfig,
     AgentSecurityAction, CoreConfig, FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent,
@@ -8702,7 +8700,6 @@ const PDF_TEXT_BRIDGE_SCRIPT: &str = r#"
   };
 })();
 "#;
-
 
 static LOGO_IMAGE: OnceLock<RgbaImage> = OnceLock::new();
 static BRAND_IMAGE: OnceLock<RgbaImage> = OnceLock::new();
