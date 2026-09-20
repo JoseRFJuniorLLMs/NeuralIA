@@ -114,18 +114,14 @@ jobs:
             Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $securePassword | Out-Null
             Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
 
-            # Import-Certificate into Root can enter an interactive trust path
-            # on a headless runner. certutil -f is explicitly non-interactive.
-            Write-Host "[authenticode-ci] trusting ephemeral root"
-            & certutil.exe -user -f -addstore Root $cerPath | Out-Host
-            if ($LASTEXITCODE -ne 0) {
-              throw "certutil failed to trust the ephemeral Root certificate."
-            }
+            # Trust the ephemeral leaf directly. Importing a synthetic CI
+            # certificate into Root can enter an interactive trust path on a
+            # headless runner; TrustedPeople gives this exact leaf trust without
+            # mutating the runner's root trust set.
+            Write-Host "[authenticode-ci] trusting ephemeral signer leaf"
+            Import-Certificate -FilePath $cerPath -CertStoreLocation "Cert:\CurrentUser\TrustedPeople" | Out-Null
             Write-Host "[authenticode-ci] trusting ephemeral publisher"
-            & certutil.exe -user -f -addstore TrustedPublisher $cerPath | Out-Host
-            if ($LASTEXITCODE -ne 0) {
-              throw "certutil failed to trust the ephemeral publisher certificate."
-            }
+            Import-Certificate -FilePath $cerPath -CertStoreLocation "Cert:\CurrentUser\TrustedPublisher" | Out-Null
 
             $env:NEURALIA_AUTHENTICODE_PFX_B64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($pfxPath))
             $env:NEURALIA_AUTHENTICODE_PFX_PASSWORD = $plainPassword
@@ -143,7 +139,7 @@ jobs:
             $env:NEURALIA_AUTHENTICODE_PFX_B64 = $null
             $env:NEURALIA_AUTHENTICODE_PFX_PASSWORD = $null
             if ($cert) {
-              foreach ($store in @("My", "Root", "TrustedPublisher")) {
+              foreach ($store in @("My", "TrustedPeople", "TrustedPublisher")) {
                 Remove-Item -LiteralPath ("Cert:\CurrentUser\$store\" + $cert.Thumbprint) -Force -ErrorAction SilentlyContinue
               }
             }
