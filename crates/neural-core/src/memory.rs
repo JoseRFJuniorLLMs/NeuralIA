@@ -14,6 +14,21 @@ mod sqlite_v01;
 
 const MEMORY_SCHEMA_VERSION: u32 = 1;
 
+#[cfg(test)]
+thread_local! {
+    static DOCUMENT_FILE_COUNT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_document_file_count_calls() {
+    DOCUMENT_FILE_COUNT_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn document_file_count_calls() -> usize {
+    DOCUMENT_FILE_COUNT_CALLS.with(std::cell::Cell::get)
+}
+
 use crate::{
     agent_security::{redact_sensitive_text, redact_url},
     local_intelligence::{EMBEDDING_DIM, cosine_similarity, extract_entities, hashed_embedding},
@@ -705,6 +720,9 @@ impl MemoryStore {
 
     /// Quantos documentos estao guardados, sem abrir nenhum.
     fn document_file_count(&self) -> io::Result<usize> {
+        #[cfg(test)]
+        DOCUMENT_FILE_COUNT_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+
         let Ok(entries) = fs::read_dir(self.documents_dir()) else {
             return Ok(0);
         };
@@ -1526,6 +1544,64 @@ mod tests {
 
         let manifest = fs::read_to_string(root.join("db").join("index-manifest.json")).unwrap();
         assert!(manifest.contains(&format!("\"schema\": {}", MEMORY_SCHEMA_VERSION)));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn capture_never_scans_the_existing_corpus_or_validates_the_whole_index() {
+        let root = temp_root("capture-constant-work");
+        let store = MemoryStore::new(&root).unwrap();
+
+        const CORPUS: usize = 32;
+        for index in 0..CORPUS {
+            store
+                .capture(MemoryDocument::new(
+                    MemoryKind::Source,
+                    MemorySourceKind::Web,
+                    format!("Documento {index}"),
+                    Some(format!("https://example.com/pagina/{index}")),
+                    format!("corpo indexavel do documento {index}"),
+                ))
+                .unwrap();
+        }
+        assert_eq!(store.manifest_documents(), Some(CORPUS));
+
+        reset_document_file_count_calls();
+        sqlite_v01::reset_validate_integrity_calls();
+
+        let fresh = MemoryDocument::new(
+            MemoryKind::Source,
+            MemorySourceKind::Web,
+            "Documento novo",
+            Some("https://example.com/pagina/nova".into()),
+            "captura incremental nao pode percorrer o corpus existente",
+        );
+        store.capture(fresh.clone()).unwrap();
+
+        assert_eq!(
+            document_file_count_calls(),
+            0,
+            "capture must update the manifest incrementally, never enumerate documents/"
+        );
+        assert_eq!(
+            sqlite_v01::validate_integrity_calls(),
+            0,
+            "capture must not run whole-index SQLite integrity validation"
+        );
+        assert_eq!(store.manifest_documents(), Some(CORPUS + 1));
+
+        reset_document_file_count_calls();
+        sqlite_v01::reset_validate_integrity_calls();
+        store.capture(fresh).unwrap();
+
+        assert_eq!(document_file_count_calls(), 0);
+        assert_eq!(sqlite_v01::validate_integrity_calls(), 0);
+        assert_eq!(
+            store.manifest_documents(),
+            Some(CORPUS + 1),
+            "rewriting an existing document must not inflate the manifest"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
