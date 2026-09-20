@@ -19,6 +19,21 @@ const SCHEMA_VERSION: i64 = 1;
 const SCHEMA_V01: &str = include_str!("schema_v01.sql");
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(test)]
+thread_local! {
+    static VALIDATE_INTEGRITY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_validate_integrity_calls() {
+    VALIDATE_INTEGRITY_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn validate_integrity_calls() -> usize {
+    VALIDATE_INTEGRITY_CALLS.with(std::cell::Cell::get)
+}
+
 fn io_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
@@ -473,6 +488,9 @@ fn replace_relations(transaction: &Transaction<'_>, document: &MemoryDocument) -
 }
 
 fn validate_integrity(transaction: &Transaction<'_>) -> io::Result<()> {
+    #[cfg(test)]
+    VALIDATE_INTEGRITY_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+
     let integrity: String = transaction
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .map_err(io_error)?;
