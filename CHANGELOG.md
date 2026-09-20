@@ -21,6 +21,12 @@ All notable changes to NeuralIA are documented here.
   Links internos do Reader continuam sendo a exceção sem token.
 
 ### Validation
+- **Pipeline de release consolidado.** O executável publicado continua sendo o
+  mesmo `NeuralIA.exe` medido pelo CI, com checksum verificado antes do
+  empacotamento; o release gera SBOM, instalador Authenticode quando as
+  credenciais existem e agora também uma attestation sobre o
+  `dist/NeuralIA.exe` efetivamente publicado.
+
 - **PR #64 — instalador per-user com caminho de Authenticode preparado.** O CI
   compila um setup Inno a partir do mesmo `NeuralIA.exe` medido, instala em
   diretório temporário, confere SHA-256 do payload, registro de uninstall em
