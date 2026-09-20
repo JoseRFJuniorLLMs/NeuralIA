@@ -6435,6 +6435,10 @@ impl ApplicationHandler<UserEvent> for App {
 
         let mut attributes = Window::default_attributes()
             .with_title("NeuralIA")
+            // Maximizada a abrir: e um browser, e o comparador de tres colunas
+            // nao cabe com folga em 1120 px. O `inner_size` fica como o tamanho
+            // de restauro, para quem carregar no botao do meio.
+            .with_maximized(true)
             .with_inner_size(LogicalSize::new(1120.0, 760.0))
             .with_min_inner_size(LogicalSize::new(700.0, 500.0));
 
@@ -7282,6 +7286,16 @@ fn neural_hash(mut value: u32) -> f64 {
 /// deterministico a partir do tempo, portanto nao precisa de estado ou alocacao
 /// persistente entre frames.
 #[allow(clippy::too_many_arguments)]
+/// Uma rede neuronal em repouso: neuronios espalhados pela tela, ligados aos
+/// vizinhos, com impulsos a percorrer as ligacoes.
+///
+/// A versao anterior lancava particulas das margens e fazia-as convergir TODAS
+/// para o logo. O efeito era o contrario do pretendido: um amontoado a mexer
+/// atras da marca, sem ligacoes estaveis e sem nada que se parecesse com
+/// transmissao. Aqui os neuronios ficam onde estao -- so respiram --, as
+/// ligacoes persistem entre vizinhos, e o que se move sao os IMPULSOS que
+/// viajam ao longo delas. E a marca tem uma zona limpa a volta: o fundo
+/// acompanha o logo, nao disputa com ele.
 unsafe fn draw_neural_background(
     hdc: *mut core::ffi::c_void,
     width: f64,
@@ -7296,80 +7310,146 @@ unsafe fn draw_neural_background(
         return;
     }
 
+    let nodes = neural_nodes(
+        width,
+        height,
+        scale,
+        target_x,
+        target_y,
+        brand_width,
+        now_ms() as f64 / 1000.0,
+    );
     let seconds = now_ms() as f64 / 1000.0;
-    let count = ((width / (30.0 * scale.max(1.0))).round() as usize).clamp(34, 58);
-    let mut nodes = Vec::with_capacity(count);
+    draw_neural_tissue(hdc, &nodes, scale, seconds, theme);
+}
 
+/// Onde estao os neuronios neste instante. Puro, para a zona limpa a volta da
+/// marca e a distribuicao poderem ser testadas sem uma janela.
+fn neural_nodes(
+    width: f64,
+    height: f64,
+    scale: f64,
+    target_x: f64,
+    target_y: f64,
+    brand_width: f64,
+    seconds: f64,
+) -> Vec<(f64, f64, f64)> {
+    let count = ((width / (34.0 * scale.max(1.0))).round() as usize).clamp(28, 52);
+
+    // Grelha com ruido: uma distribuicao puramente aleatoria faz grumos e
+    // buracos, e nenhum dos dois se parece com tecido neuronal.
+    let columns = (count as f64).sqrt().ceil().max(1.0) as usize;
+    let rows = count.div_ceil(columns).max(1);
+    let cell_w = width / columns as f64;
+    let cell_h = height / rows as f64;
+
+    // Elipse de respeito a volta da marca. O fundo nunca entra aqui.
+    let quiet_x = (brand_width * 0.60).max(120.0 * scale);
+    let quiet_y = (brand_width * 0.26).max(70.0 * scale);
+
+    let mut nodes: Vec<(f64, f64, f64)> = Vec::with_capacity(count);
     for i in 0..count {
         let seed = i as u32 + 1;
-        let side = seed % 4;
-        let along = neural_hash(seed.wrapping_mul(0x9e37_79b9));
-        let (sx, sy) = match side {
-            0 => (along * width, -18.0 * scale),
-            1 => (width + 18.0 * scale, along * height),
-            2 => (along * width, height + 18.0 * scale),
-            _ => (-18.0 * scale, along * height),
-        };
+        let (col, row) = (i % columns, i / columns);
+        let jitter_x = neural_hash(seed.wrapping_mul(0x9e37_79b9)) - 0.5;
+        let jitter_y = neural_hash(seed.wrapping_mul(0x85eb_ca6b)) - 0.5;
 
-        let phase = neural_hash(seed.wrapping_mul(0x85eb_ca6b));
-        let speed = 0.018 + neural_hash(seed.wrapping_mul(0xc2b2_ae35)) * 0.018;
-        let progress = (seconds * speed + phase).fract();
-        let eased = progress * progress * (3.0 - 2.0 * progress);
+        let mut x = (col as f64 + 0.5) * cell_w + jitter_x * cell_w * 0.7;
+        let mut y = (row as f64 + 0.5) * cell_h + jitter_y * cell_h * 0.7;
 
-        let target_offset_x =
-            (neural_hash(seed.wrapping_mul(0x27d4_eb2d)) - 0.5) * brand_width * 0.44;
-        let target_offset_y =
-            (neural_hash(seed.wrapping_mul(0x1656_67b1)) - 0.5) * brand_width * 0.16;
-        let tx = target_x + target_offset_x;
-        let ty = target_y + target_offset_y;
+        // Deriva lenta: o tecido respira, nao viaja.
+        let phase = neural_hash(seed.wrapping_mul(0xc2b2_ae35)) * std::f64::consts::TAU;
+        let drift = 0.05 + neural_hash(seed.wrapping_mul(0x27d4_eb2d)) * 0.06;
+        x += (seconds * drift + phase).sin() * 9.0 * scale;
+        y += (seconds * drift * 0.7 + phase * 1.3).cos() * 7.0 * scale;
 
-        let dx = tx - sx;
-        let dy = ty - sy;
-        let length = (dx * dx + dy * dy).sqrt().max(1.0);
-        let px = -dy / length;
-        let py = dx / length;
-        let swirl_phase = neural_hash(seed.wrapping_mul(0xd3a2_646c)) * std::f64::consts::TAU;
-        let swirl = (progress * std::f64::consts::TAU * 1.7 + swirl_phase).sin()
-            * (1.0 - eased)
-            * 38.0
-            * scale;
+        // Empurrar para fora da elipse da marca, pela normal.
+        let nx = (x - target_x) / quiet_x;
+        let ny = (y - target_y) / quiet_y;
+        let radial = (nx * nx + ny * ny).sqrt();
+        if radial < 1.0 && radial > f64::EPSILON {
+            let push = 1.0 / radial;
+            x = target_x + (x - target_x) * push;
+            y = target_y + (y - target_y) * push;
+        } else if radial <= f64::EPSILON {
+            x = target_x + quiet_x;
+        }
 
-        let x = sx + dx * eased + px * swirl;
-        let y = sy + dy * eased + py * swirl;
-        let energy = 0.35 + 0.65 * progress;
+        // Cada neuronio pulsa no seu proprio ritmo.
+        let beat = neural_hash(seed.wrapping_mul(0x1656_67b1)) * std::f64::consts::TAU;
+        let energy = 0.45 + 0.55 * (seconds * 0.9 + beat).sin().abs();
         nodes.push((x, y, energy));
     }
+    nodes
+}
 
-    // O tema recebido ja sabe se esta escuro: ler o registo aqui era faze-lo
-    // duas vezes por frame, 15 vezes por segundo.
-    let line_color = mix(
+/// Desenha as ligacoes, os impulsos e os neuronios.
+unsafe fn draw_neural_tissue(
+    hdc: *mut core::ffi::c_void,
+    nodes: &[(f64, f64, f64)],
+    scale: f64,
+    seconds: f64,
+    theme: &Theme,
+) {
+    // Ligacoes em tres intensidades, para as mais proximas se lerem mais
+    // fortes. Tres canetas no total: uma por ligacao seria caro a 15 FPS.
+    let max_link = 132.0 * scale;
+    let pens: [*mut core::ffi::c_void; 3] = std::array::from_fn(|step| {
+        let weight = if theme.dark { 0.14 } else { 0.10 } + (2 - step) as f32 * 0.09;
+        CreatePen(PS_SOLID, 1, rgb3(mix(theme.page_bg, theme.accent, weight)))
+    });
+    let old_pen = SelectObject(hdc, pens[2] as _);
+
+    let pulse_color = mix(
         theme.page_bg,
         theme.accent,
-        if theme.dark { 0.30 } else { 0.18 },
+        if theme.dark { 0.95 } else { 0.78 },
     );
-    let line_pen = CreatePen(PS_SOLID, 1, rgb3(line_color));
-    let old_pen = SelectObject(hdc, line_pen as _);
-    let max_link = 150.0 * scale;
+    let pulse_brush = CreateSolidBrush(rgb3(pulse_color));
+    let pulse_pen = CreatePen(PS_SOLID, 1, rgb3(pulse_color));
+    let mut pulses: Vec<(f64, f64, f64)> = Vec::new();
 
     for i in 0..nodes.len() {
         for j in (i + 1)..nodes.len() {
-            let dx = nodes[i].0 - nodes[j].0;
-            let dy = nodes[i].1 - nodes[j].1;
-            let distance = (dx * dx + dy * dy).sqrt();
+            let (ax, ay, _) = nodes[i];
+            let (bx, by, _) = nodes[j];
+            let distance = ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt();
             if distance > max_link {
                 continue;
             }
+
+            let closeness = 1.0 - distance / max_link;
+            let bucket = ((closeness * 3.0) as usize).min(2);
+            SelectObject(hdc, pens[bucket] as _);
             MoveToEx(
                 hdc,
-                nodes[i].0.round() as i32,
-                nodes[i].1.round() as i32,
+                ax.round() as i32,
+                ay.round() as i32,
                 std::ptr::null_mut(),
             );
-            LineTo(hdc, nodes[j].0.round() as i32, nodes[j].1.round() as i32);
+            LineTo(hdc, bx.round() as i32, by.round() as i32);
+
+            // So as ligacoes curtas transmitem, e so algumas: uma sinapse a
+            // disparar em cada ligacao ao mesmo tempo seria ruido outra vez.
+            let link_seed = (i as u32 + 1).wrapping_mul(0x85eb_ca6b) ^ (j as u32 + 1);
+            if closeness < 0.45 || neural_hash(link_seed) > 0.38 {
+                continue;
+            }
+            let speed = 0.18 + neural_hash(link_seed.wrapping_mul(0xc2b2_ae35)) * 0.22;
+            let offset = neural_hash(link_seed.wrapping_mul(0xd3a2_646c));
+            let travel = (seconds * speed + offset).fract();
+            pulses.push((
+                ax + (bx - ax) * travel,
+                ay + (by - ay) * travel,
+                // Acende ao sair e apaga ao chegar.
+                (travel * std::f64::consts::PI).sin(),
+            ));
         }
     }
     SelectObject(hdc, old_pen);
-    DeleteObject(line_pen as _);
+    for pen in pens {
+        DeleteObject(pen as _);
+    }
 
     let node_color = mix(
         theme.page_bg,
@@ -7382,7 +7462,20 @@ unsafe fn draw_neural_background(
     let old_node_pen = SelectObject(hdc, node_pen as _);
 
     for (x, y, energy) in nodes {
-        let radius = ((1.4 + energy * 2.1) * scale).clamp(2.0, 6.0);
+        let radius = ((1.5 + energy * 1.9) * scale).clamp(2.0, 6.0);
+        Ellipse(
+            hdc,
+            (x - radius).round() as i32,
+            (y - radius).round() as i32,
+            (x + radius).round() as i32,
+            (y + radius).round() as i32,
+        );
+    }
+
+    SelectObject(hdc, pulse_brush as _);
+    SelectObject(hdc, pulse_pen as _);
+    for (x, y, brightness) in &pulses {
+        let radius = ((1.0 + brightness * 2.2) * scale).clamp(1.5, 4.5);
         Ellipse(
             hdc,
             (x - radius).round() as i32,
@@ -7394,6 +7487,8 @@ unsafe fn draw_neural_background(
 
     SelectObject(hdc, old_node_pen);
     SelectObject(hdc, old_brush);
+    DeleteObject(pulse_pen as _);
+    DeleteObject(pulse_brush as _);
     DeleteObject(node_pen as _);
     DeleteObject(node_brush as _);
 }
@@ -8121,6 +8216,68 @@ fn render_brand_pixels(width: i32, height: i32, bg_rgb: Rgb) -> Vec<u8> {
 mod tests {
     use super::*;
     use windows_sys::Win32::Graphics::Gdi::GetDIBits;
+
+    /// O fundo da Home acompanha a marca, nao disputa com ela.
+    ///
+    /// A versao anterior lancava particulas das margens e fazia-as convergir
+    /// TODAS para o logo: o que se via era um amontoado a mexer por tras da
+    /// marca. Estes testes prendem as duas propriedades que fazem a diferenca
+    /// -- a zona limpa e a distribuicao pela tela -- porque nenhuma delas se
+    /// nota a faltar ate alguem olhar para o ecra.
+    #[test]
+    fn home_background_never_crowds_the_brand() {
+        let (width, height, scale) = (1920.0, 1080.0, 1.0);
+        let (target_x, target_y) = (width / 2.0, height * 0.32);
+        let brand_width: f64 = 520.0;
+        let quiet_x = (brand_width * 0.60).max(120.0 * scale);
+        let quiet_y = (brand_width * 0.26).max(70.0 * scale);
+
+        // Varios instantes: a deriva nao pode empurrar ninguem para dentro.
+        for step in 0..40 {
+            let seconds = step as f64 * 0.37;
+            let nodes = neural_nodes(
+                width,
+                height,
+                scale,
+                target_x,
+                target_y,
+                brand_width,
+                seconds,
+            );
+            assert!(!nodes.is_empty());
+            for (x, y, _) in &nodes {
+                let nx = (x - target_x) / quiet_x;
+                let ny = (y - target_y) / quiet_y;
+                assert!(
+                    nx * nx + ny * ny >= 0.999,
+                    "neuronio dentro da zona da marca em t={seconds}: ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn home_background_spreads_across_the_canvas() {
+        let nodes = neural_nodes(1920.0, 1080.0, 1.0, 960.0, 345.0, 520.0, 3.0);
+
+        // Uma convergencia para um ponto passaria a zona limpa mas continuaria
+        // a ser um amontoado: exige-se ocupacao dos quatro quadrantes.
+        let mut quadrants = [0usize; 4];
+        for (x, y, _) in &nodes {
+            let index = usize::from(*x > 960.0) + 2 * usize::from(*y > 540.0);
+            quadrants[index] += 1;
+        }
+        assert!(
+            quadrants.iter().all(|count| *count >= 3),
+            "distribuicao amontoada: {quadrants:?}"
+        );
+
+        // E as energias tem de variar, senao nao ha pulsacao nenhuma.
+        let energies: Vec<f64> = nodes.iter().map(|(_, _, energy)| *energy).collect();
+        let min = energies.iter().copied().fold(f64::MAX, f64::min);
+        let max = energies.iter().copied().fold(f64::MIN, f64::max);
+        assert!(max - min > 0.1, "energias iguais: {min}..{max}");
+    }
 
     /// A autorizacao de rede local vale para a ORIGEM que o utilizador
     /// escreveu, nao para a rede local inteira.
@@ -11247,6 +11404,17 @@ const GMAIL_MONITOR_SCRIPT: &str = r#"
 /// ChatGPT e Claude aceitam a consulta por ?q=, mas hoje apenas preenchem o
 /// compositor. O comparador tem semântica de "perguntar às três", portanto o
 /// NeuralIA confirma o envio assim que o botão real do fornecedor fica pronto.
+/// Envia a pergunta no fornecedor em vez de a deixar na caixa.
+///
+/// O Gemini abre directamente numa pagina de resultados; o ChatGPT e o Claude
+/// recebem `?q=` que so PREENCHE a caixa. A versao anterior esperava que
+/// `promptText()` devolvesse texto antes de carregar em enviar -- mas lia o
+/// PRIMEIRO `textarea` da pagina, que nestes sitios e um campo escondido e
+/// vazio. Ficava a tentar 120 vezes e desistia, e a pergunta ficava na barra a
+/// espera de um Enter manual: exactamente o que o utilizador via.
+///
+/// Agora procura o editor que TEM texto, e se nenhum tiver escreve a pergunta
+/// ele proprio antes de enviar.
 const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
 (function () {
   const host = location.hostname.toLowerCase();
@@ -11255,46 +11423,86 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
   if (!query || !query.trim()) return;
 
   const stampKey = 'neuralia:auto-submit:' + host + ':' + query;
-  const previous = Number(sessionStorage.getItem(stampKey) || '0');
-  if (Date.now() - previous < 10000) return;
+  if (Date.now() - Number(sessionStorage.getItem(stampKey) || '0') < 10000) return;
 
-  function promptText() {
-    const el = document.querySelector(
-      'textarea, [data-testid="prompt-textarea"], [contenteditable="true"][role="textbox"], div[contenteditable="true"]'
-    );
+  const EDITORS = 'div[contenteditable="true"][role="textbox"], div[contenteditable="true"], [data-testid="prompt-textarea"], textarea';
+
+  function textOf(el) {
     if (!el) return '';
-    return String('value' in el ? el.value : el.innerText || el.textContent || '').trim();
+    return String('value' in el && typeof el.value === 'string' ? el.value : el.innerText || el.textContent || '').trim();
   }
 
-  function candidates() {
-    if (host === 'chatgpt.com') {
-      return [
-        'button[data-testid="send-button"]',
-        'button[aria-label*="Send prompt"]',
-        'button[aria-label*="Send message"]',
-        'form button[type="submit"]'
-      ];
+  function visible(el) {
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  // O editor certo e o que ESTA VISIVEL e, de preferencia, o que ja tem texto.
+  // Ler so o primeiro `textarea` apanhava um campo escondido e vazio.
+  function editor() {
+    const all = Array.from(document.querySelectorAll(EDITORS)).filter(visible);
+    return all.find((el) => textOf(el)) || all[0] || null;
+  }
+
+  function fill(el) {
+    el.focus();
+    if (el.isContentEditable) {
+      // `execCommand` e o que os editores com React por tras aceitam sem
+      // reescrever o estado deles por baixo.
+      if (!document.execCommand('insertText', false, query)) {
+        el.textContent = query;
+        el.dispatchEvent(new InputEvent('input', { bubbles:true, data:query, inputType:'insertText' }));
+      }
+      return;
     }
-    return [
-      'button[aria-label*="Send"]',
-      'button[data-testid*="send"]',
-      'form button[type="submit"]'
-    ];
+    const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
+    if (descriptor && descriptor.set) descriptor.set.call(el, query);
+    else el.value = query;
+    el.dispatchEvent(new Event('input', { bubbles:true }));
+  }
+
+  function sendButton() {
+    const selectors = host === 'chatgpt.com'
+      ? ['button[data-testid="send-button"]', 'button[aria-label*="Send prompt"]', 'button[aria-label*="Send message"]', 'button[aria-label*="Enviar"]', 'form button[type="submit"]']
+      : ['button[aria-label*="Send"]', 'button[aria-label*="Enviar"]', 'button[data-testid*="send"]', 'form button[type="submit"]'];
+    for (const selector of selectors) {
+      const button = document.querySelector(selector);
+      if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') continue;
+      if (!visible(button)) continue;
+      return button;
+    }
+    return null;
   }
 
   let attempts = 0;
+  let filled = false;
   function submitWhenReady() {
     attempts += 1;
-    const typed = promptText();
-    if (typed) {
-      for (const selector of candidates()) {
-        const button = document.querySelector(selector);
-        if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') continue;
-        const rect = button.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) continue;
-        sessionStorage.setItem(stampKey, String(Date.now()));
-        button.click();
-        return;
+    const el = editor();
+    if (el) {
+      // Dez tentativas (~1,5 s) a dar hipotese ao proprio site de preencher;
+      // passadas essas, escrevemos nos.
+      if (!textOf(el) && !filled && attempts > 10) {
+        fill(el);
+        filled = true;
+      }
+      if (textOf(el)) {
+        const button = sendButton();
+        if (button) {
+          sessionStorage.setItem(stampKey, String(Date.now()));
+          button.click();
+          return;
+        }
+        // Sem botao utilizavel, Enter no editor e o caminho que estes sitios
+        // tambem aceitam.
+        if (attempts > 20) {
+          sessionStorage.setItem(stampKey, String(Date.now()));
+          el.focus();
+          for (const type of ['keydown', 'keypress', 'keyup']) {
+            el.dispatchEvent(new KeyboardEvent(type, { key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true, cancelable:true }));
+          }
+          return;
+        }
       }
     }
     if (attempts < 120) setTimeout(submitWhenReady, 150);
@@ -12041,9 +12249,13 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
       if (!byId('neuralia-comp-controls')) mountControls();
     }).observe(document.documentElement, { childList:true, subtree:true });
 
-    // Uma fonte externa abre ao lado da conversa que a produziu.
+    // Ctrl+clique (ou clique do meio) abre a fonte AO LADO, no painel lateral,
+    // e cria a aba na barra de titulo. Clique normal segue o link na propria
+    // coluna, como em qualquer browser -- antes QUALQUER clique era desviado
+    // para o Split View e nao havia maneira de simplesmente seguir uma ligacao.
     listen(document, 'click', (event) => {
       if (!event.isTrusted || event.defaultPrevented) return;
+      if (!(event.ctrlKey || event.metaKey || event.button === 1)) return;
       if (event.target && event.target.closest
           && event.target.closest('#neuralia-comp-controls,#neuralia-palette')) return;
       const anchor = event.target && event.target.closest
