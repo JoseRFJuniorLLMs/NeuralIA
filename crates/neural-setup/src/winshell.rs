@@ -11,13 +11,18 @@
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
-use windows_sys::Win32::Foundation::{HANDLE, S_OK};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, S_OK};
 use windows_sys::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
 };
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
     RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW,
+};
+#[cfg(test)]
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
 };
 use windows_sys::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Programs, SHGetKnownFolderPath};
 use windows_sys::core::GUID;
@@ -331,6 +336,62 @@ pub fn unregister_uninstall() {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    volume_serial: u32,
+    file_index: u64,
+}
+
+#[cfg(test)]
+fn file_identity(path: &Path) -> Result<FileIdentity, String> {
+    let path = wide_path(path);
+    unsafe {
+        let handle = CreateFileW(
+            path.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(format!(
+                "abrir caminho para identidade falhou: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+        let ok = GetFileInformationByHandle(handle, info.as_mut_ptr());
+        let close = CloseHandle(handle);
+        if ok == 0 {
+            return Err(format!(
+                "GetFileInformationByHandle falhou: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if close == 0 {
+            return Err(format!(
+                "CloseHandle falhou: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let info = info.assume_init();
+        Ok(FileIdentity {
+            volume_serial: info.dwVolumeSerialNumber,
+            file_index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+        })
+    }
+}
+
+#[cfg(test)]
+fn same_filesystem_object(left: &Path, right: &Path) -> Result<bool, String> {
+    Ok(file_identity(left)? == file_identity(right)?)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -350,20 +411,53 @@ mod tests {
         assert!(link.is_file(), "o .lnk nao foi gravado");
 
         let read = shortcut_details(&link).expect("ler atalho");
-        assert_eq!(
-            read.target.to_string_lossy().to_lowercase(),
-            target.to_string_lossy().to_lowercase(),
-            "o atalho aponta para outro sitio"
+        assert!(
+            same_filesystem_object(&read.target, &target).expect("identidade do alvo"),
+            "o atalho aponta para outro sitio: {} != {}",
+            read.target.display(),
+            target.display()
         );
         assert_eq!(
             read.description, "Navegador NeuralIA",
             "a descricao saiu por outro slot"
         );
-        assert_eq!(
-            read.working_dir.to_string_lossy().to_lowercase(),
-            dir.to_string_lossy().to_lowercase(),
-            "a pasta de trabalho saiu por outro slot"
+        assert!(
+            same_filesystem_object(&read.working_dir, &dir).expect("identidade da pasta"),
+            "a pasta de trabalho saiu por outro slot: {} != {}",
+            read.working_dir.display(),
+            dir.display()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shortcut_to_another_executable_is_not_the_same_destination() {
+        init_com();
+        let dir = std::env::temp_dir().join(format!(
+            "neuralia-lnk-negative-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("pasta");
+
+        let expected = dir.join("NeuralIA.exe");
+        let other = dir.join("Outro.exe");
+        std::fs::write(&expected, b"MZ expected").expect("alvo esperado");
+        std::fs::write(&other, b"MZ other").expect("outro alvo");
+
+        let link = dir.join("Outro.lnk");
+        create_shortcut(&link, &other, &dir, "Outro executavel", &other)
+            .expect("criar atalho para outro executavel");
+
+        let read = shortcut_details(&link).expect("ler atalho");
+        assert!(
+            same_filesystem_object(&read.target, &other).expect("identidade do outro alvo"),
+            "o atalho de controle deve apontar para Outro.exe"
+        );
+        assert!(
+            !same_filesystem_object(&read.target, &expected).expect("comparar alvos distintos"),
+            "um atalho para Outro.exe nunca pode ser aceito como NeuralIA.exe"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
