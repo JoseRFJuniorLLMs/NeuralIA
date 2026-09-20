@@ -4,7 +4,24 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-09-20
+
+Auditoria completa do produto e do núcleo, com regressões presas a gates
+determinísticos. Esta versão entrega a memória semântica SQLite/FTS5, reforça o
+isolamento do agente e da WebView, renova a experiência nativa e publica
+exatamente o binário aprovado pelo CI.
+
 ### Security
+- **PR #69 — uma URL local escrita autoriza somente a sua origem.** A permissão
+  deixa de abrir toda a rede local para a página carregada no Split View;
+  redireções dentro do mesmo servidor continuam válidas, mas pivôs para
+  loopback, router ou outro host voltam a exigir autorização.
+- **PR #74 — o redactor deixa de devolver o segredo em linhas sem separador.**
+  Entradas como `access_token ya29.SEGREDO` já não reaparecem intactas ao lado
+  de um rótulo `[REDACTED]` enganoso.
+- **PR #70 — URL e título passam pelo mesmo redactor do corpo.** Tokens em query
+  ou fragmento deixam de chegar ao JSON, wiki, SQLite e interface; parâmetros
+  não sensíveis continuam preservados.
 - **PR #54 — SPEC-0104 passa a aplicar classes A/B/C/D em código nativo.**
   `CapabilityClass` deixa explícito o nível de autoridade; confirmação positiva
   pode autorizar Classe C, mas nunca transforma Classe D em ação autônoma.
@@ -21,13 +38,23 @@ All notable changes to NeuralIA are documented here.
   Links internos do Reader continuam sendo a exceção sem token.
 
 ### Validation
-- **SPEC-0103 fecha a aceitação da timeline sem cronómetro absoluto.** O CI
+- **PR #88 — o custo da captura de memória passa a ter gate determinístico.**
+  O caminho real de `MemoryStore::capture` precisa executar zero varreduras do
+  corpus e zero validações integrais do SQLite, mantendo o manifesto incremental
+  correto inclusive ao regravar o mesmo documento.
+- **PR #90 — atalhos Windows são validados pela identidade do arquivo.** O gate
+  compara volume e file index, aceitando alias 8.3 do mesmo objeto e rejeitando
+  outro executável mesmo quando a grafia do caminho parece equivalente.
+- **PR #91 — os 204 blobs auxiliares do PDF.js têm proveniência verificável.**
+  O gate confere tamanho e Git blob SHA-1, a allowlist do host, os bytes servidos
+  e o MIME de cada recurso; sabotagens de WASM, CMap e fontes ficam vermelhas.
+- **PR #82 — SPEC-0103 fecha a aceitação da timeline sem cronómetro absoluto.** O CI
   executa as duas funções `semanticAnchors()` que realmente embarcam contra
   fixtures ChatGPT/Gemini/Claude e mede 16→64 nós por rácio. O parser Rust de
   referência recebe o mesmo gate por fornecedor e 256→1024 secções. Mutações
   deliberadas de papel e trabalho O(n²) precisam deixar ambos vermelhos.
 
-- **Pipeline de release consolidado.** O executável publicado continua sendo o
+- **PR #83 — pipeline de release consolidado.** O executável publicado continua sendo o
   mesmo `NeuralIA.exe` medido pelo CI, com checksum verificado antes do
   empacotamento; o release gera SBOM, instalador Authenticode quando as
   credenciais existem e agora também uma attestation sobre o
@@ -54,12 +81,27 @@ All notable changes to NeuralIA are documented here.
   without pretending the Windows application is a crates.io library. The
   sabotage commit banned `serde` and CI #384 went red before the policy was
   restored.
+- **PR #79 — `neural-core` ganha gate portátil no Linux.** Check, testes e
+  clippy passam a rodar fora do Windows; o parser IPC compartilhável também é
+  compilado no job principal.
+- **PRs #9 e #87 — actions de attestation e download de artefatos atualizadas.**
+  O pipeline permanece preso a SHAs e compatível com os formatos atuais dos
+  artefatos usados na publicação.
 - PR #24 adiciona testes do parser, das 25 ações, bounds, capability incorreta,
   ausência de `?cap=` nos scripts remotos, captura antecipada das primitivas
   IPC e rejeição do esquema `neuralia:` nas superfícies remotas.
-- Revisão adversarial independente e release 2.1.0 permanecem pendentes.
+- Revisão adversarial independente concluída antes da publicação da 2.1.0.
 
 ### Fixed
+- **PR #67 — minimizar a janela na Home deixa de derrubar a aplicação.** O
+  layout trata dimensões transitórias iguais a zero sem chamar `f64::clamp`
+  com limites invertidos.
+- **PR #61 — o cromado de cada coluna permanece dentro da sua coluna.** Pílulas,
+  chips e controlos da direita reservam espaço antes da distribuição, evitando
+  hit-tests na coluna vizinha.
+- **PR #75 — capturar um documento deixa de listar todo o diretório.** O
+  manifesto é atualizado incrementalmente, eliminando a última operação
+  O(corpus) que permanecia em cada gravação.
 - **PR #71 — o Reader deixa de duplicar blocos aninhados e de misturar metadata com o corpo.**
   Itens de lista/blocos filhos são emitidos uma vez, metadados vazios deixam a
   cadeia de fallback continuar e o conteúdo de `<head>/<title>` não entra no
@@ -127,7 +169,15 @@ All notable changes to NeuralIA are documented here.
   não o relógio. `recency_bonus(last_seen_at, now)` passa a usar a hora real.
 
 ### Changed
-- **Agent runtime morto removido.** O antigo `neural_core::AgentRuntime`,
+- **PR #62 — a razão de linearidade é medida dentro da mesma ronda.** O gate
+  deixa de comparar janelas de carga distintas sem afrouxar os limites de
+  crescimento aceitos.
+- **PR #76 — variáveis efémeras de Authenticode deixam de parecer segredos
+  persistentes ao scanner.** A mudança de nomes elimina falsos positivos sem
+  expor nem reduzir a proteção das credenciais reais.
+- **PR #63 — a SPEC-0105 distingue constantes de observações.** `frame="top"`
+  e `visible=true` são documentados como garantias por construção do observador.
+- **PR #80 — agent runtime morto removido.** O antigo `neural_core::AgentRuntime`,
   `AgentPlanner` e `AgentToolExecutor` não eram chamados pelo binário e
   duplicavam uma superfície de segurança que não protegia o produto. O
   vocabulário/configuração realmente compartilhado passa para
@@ -167,6 +217,15 @@ All notable changes to NeuralIA are documented here.
   processos `msedgewebview2` contra a baseline.
 
 ### Added
+- **PR #85 — experiência nativa renovada.** A Home ganha tecido neuronal denso
+  e ramificado com custo limitado por contagens, animação mais legível e marca
+  com alfa real; grupos de abas, arranque maximizado, auto-submit nos três
+  provedores e Ctrl+clique para o painel lateral chegam no mesmo conjunto. O
+  instalador nativo per-user passa a reutilizar o tecido compartilhado.
+- **PR #91 — visualizador PDF realmente offline para documentos complexos.**
+  O pacote passa a incluir 168 CMaps, 14 fontes padrão, OpenJPEG, JBIG2, QCMS,
+  perfil ICC, licenças e fixtures. O host serve apenas rotas exatas, com CSP
+  same-origin, `nosniff` e MIME explícito; não há fallback para CDN.
 - **PR #51 — o parser do canal IPC passa a ser compilado e testado fora do
   Windows.** `src/ipc.rs` não tem uma chamada Win32, mas estava atrás de
   `cfg(target_os = "windows")` por arrastamento: a superfície por onde uma
