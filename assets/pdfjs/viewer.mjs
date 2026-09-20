@@ -61,6 +61,63 @@ export function hideStatus(element) {
   element.classList.remove('error');
 }
 
+export function normalizePdfTextItems(items) {
+  return items
+    .map((item) => (item && typeof item.str === 'string' ? item.str.trim() : ''))
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function chunkPdfText(text, maxChars = 1000) {
+  if (!Number.isInteger(maxChars) || maxChars <= 0) throw new RangeError('maxChars');
+  const chars = Array.from(text);
+  const chunks = [];
+  for (let i = 0; i < chars.length; i += maxChars) {
+    chunks.push(chars.slice(i, i + maxChars).join(''));
+  }
+  return chunks;
+}
+
+export async function extractPdfText(
+  pdf,
+  emit,
+  { maxPages = 256, maxChars = 512 * 1024, chunkChars = 1000 } = {}
+) {
+  const pageLimit = Math.min(pdf.numPages, maxPages);
+  let remaining = maxChars;
+  let lastPage = 1;
+  let truncated = pdf.numPages > pageLimit;
+
+  for (let pageNumber = 1; pageNumber <= pageLimit && remaining > 0; pageNumber++) {
+    lastPage = pageNumber;
+    let text = '';
+    try {
+      const page = await pdf.getPage(pageNumber);
+      const content = await page.getTextContent();
+      text = normalizePdfTextItems(content.items || []);
+    } catch (err) {
+      truncated = true;
+      console.error('texto da pagina', pageNumber, err);
+      continue;
+    }
+
+    const chars = Array.from(text);
+    if (chars.length > remaining) truncated = true;
+    const accepted = chars.slice(0, remaining).join('');
+    remaining -= Math.min(chars.length, remaining);
+    for (const chunk of chunkPdfText(accepted, chunkChars)) {
+      emit({ page: pageNumber, text: chunk, done: false, truncated: false });
+    }
+    if (chars.length > accepted.length && remaining === 0) break;
+  }
+
+  if (remaining === 0 && (lastPage < pdf.numPages || pdf.numPages > 0)) truncated = true;
+  emit({ page: lastPage, text: '', done: true, truncated });
+  return { pages: lastPage, truncated, remaining };
+}
+
 if (typeof document !== 'undefined') {
 const status = document.getElementById('status');
 const hud = document.getElementById('hud');
@@ -77,6 +134,9 @@ const EVICT_RADIUS = KEEP_RADIUS + 2;
 const BAND = 1200;
 const PROBE_PAGES = 8;
 const RANGE_CHUNK = 1048576;
+const TEXT_CAPTURE_MAX_PAGES = 256;
+const TEXT_CAPTURE_MAX_CHARS = 512 * 1024;
+const TEXT_CAPTURE_CHUNK_CHARS = 1000;
 
 const slots = [];
 // tops[i] e o offsetTop do placeholder i e heights[i] a altura que lhe
@@ -167,8 +227,44 @@ function attachCanvas(slot, index) {
   return canvas;
 }
 
+async function renderTextLayer(slot, page, viewport) {
+  if (slot.textTask) slot.textTask.cancel();
+  if (slot.textLayer) slot.textLayer.remove();
+
+  const layer = document.createElement('div');
+  layer.className = 'textLayer';
+  layer.style.setProperty('--total-scale-factor', String(viewport.scale));
+  const number = slot.el.querySelector('.num');
+  slot.el.insertBefore(layer, number || null);
+
+  const task = new pdfjsLib.TextLayer({
+    textContentSource: page.streamTextContent({ includeMarkedContent: true }),
+    container: layer,
+    viewport
+  });
+  slot.textLayer = layer;
+  slot.textTask = task;
+  try {
+    await task.render();
+  } finally {
+    if (slot.textTask === task) slot.textTask = null;
+  }
+}
+
+function releaseTextLayer(slot) {
+  if (slot.textTask) {
+    slot.textTask.cancel();
+    slot.textTask = null;
+  }
+  if (slot.textLayer) {
+    slot.textLayer.remove();
+    slot.textLayer = null;
+  }
+}
+
 // width = 0 liberta o bitmap ja; tirar o no do DOM poupa o resto.
 function releaseCanvas(slot) {
+  releaseTextLayer(slot);
   const canvas = slot.canvas;
   if (!canvas) return;
   canvas.width = 0;
@@ -210,7 +306,14 @@ async function render(index) {
     });
     slot.task = task;
     await task.promise;
-    if (generation === renderGeneration) slot.rendered = true;
+    if (generation === renderGeneration) {
+      try {
+        await renderTextLayer(slot, page, viewport);
+      } catch (err) {
+        if (!err || err.name !== 'AbortException') console.error('texto visual', index + 1, err);
+      }
+      slot.rendered = true;
+    }
   } catch (err) {
     if (!err || err.name !== 'RenderingCancelledException') {
       console.error('pagina', index + 1, err);
@@ -391,8 +494,9 @@ async function load() {
     fragment.appendChild(el);
 
     slots.push({
-      el, canvas: null, page: i === 0 ? first : null, size: known[i] || null, cssWidth: 0,
-      rendered: false, rendering: false, task: null, generation: renderGeneration
+      el, canvas: null, textLayer: null, textTask: null, page: i === 0 ? first : null,
+      size: known[i] || null, cssWidth: 0, rendered: false, rendering: false,
+      task: null, generation: renderGeneration
     });
   }
   pagesEl.appendChild(fragment);
@@ -404,6 +508,14 @@ async function load() {
   hud.hidden = false;
   updateHud();
   document.title = 'NeuralIA · PDF · ' + doc.numPages + ' páginas';
+
+  if (typeof window.__neuralia_pdf_text === 'function') {
+    void extractPdfText(doc, window.__neuralia_pdf_text, {
+      maxPages: TEXT_CAPTURE_MAX_PAGES,
+      maxChars: TEXT_CAPTURE_MAX_CHARS,
+      chunkChars: TEXT_CAPTURE_CHUNK_CHARS
+    }).catch((err) => console.error('extracao textual do PDF', err));
+  }
 }
 
 // Nova escala: cancela o que estava a desenhar, larga todos os canvases (a

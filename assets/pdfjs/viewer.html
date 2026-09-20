@@ -20,10 +20,23 @@
     box-shadow: 0 10px 40px rgba(0, 0, 0, .55);
   }
   .page canvas { display: block; border-radius: 4px; }
+  .textLayer {
+    position: absolute; inset: 0; overflow: hidden; line-height: 1;
+    text-size-adjust: none; forced-color-adjust: none; transform-origin: 0 0;
+    z-index: 1; cursor: text; --total-scale-factor: 1;
+  }
+  .textLayer span, .textLayer br {
+    position: absolute; white-space: pre; color: transparent; transform-origin: 0 0;
+  }
+  .textLayer span {
+    font-size: calc(var(--font-height) * var(--total-scale-factor));
+    transform: rotate(var(--rotate, 0deg)) scaleX(var(--scale-x, 1));
+  }
+  .textLayer ::selection { background: rgba(48, 126, 255, .38); }
   .page .num {
     position: absolute; right: 10px; bottom: 8px; padding: 2px 8px;
     border-radius: 999px; background: rgba(17, 19, 20, .75); color: #e9ecef;
-    font-size: 11px; font-weight: 600; pointer-events: none;
+    font-size: 11px; font-weight: 600; pointer-events: none; z-index: 2;
   }
   #hud {
     position: fixed; top: 12px; left: 50%; transform: translateX(-50%);

@@ -168,6 +168,13 @@ enum UserEvent {
         url: String,
         result: Result<Vec<u8>, String>,
     },
+    PdfTextChunk {
+        generation: u64,
+        page: u32,
+        text: String,
+        done: bool,
+        truncated: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2582,6 +2589,64 @@ struct BrowserAgentState {
     trace: Vec<String>,
 }
 
+#[derive(Debug)]
+struct PdfTextCapture {
+    generation: u64,
+    url: String,
+    title: String,
+    body: String,
+    last_page: u32,
+    truncated: bool,
+}
+
+impl PdfTextCapture {
+    fn new(generation: u64, url: String, title: String) -> Self {
+        Self {
+            generation,
+            url,
+            title,
+            body: String::new(),
+            last_page: 0,
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, page: u32, text: &str, done: bool, truncated: bool) -> bool {
+        self.truncated |= truncated;
+        if page > PDF_TEXT_MAX_PAGES {
+            self.truncated = true;
+            return done;
+        }
+        if page < self.last_page {
+            return done;
+        }
+        if page > self.last_page && !self.body.is_empty() && !text.is_empty() {
+            self.body.push('\n');
+        }
+        self.last_page = self.last_page.max(page);
+
+        let remaining = PDF_TEXT_MAX_CHARS.saturating_sub(self.body.chars().count());
+        if remaining == 0 {
+            self.truncated = true;
+            return done;
+        }
+        let mut chars = text.chars();
+        self.body.extend(chars.by_ref().take(remaining));
+        if chars.next().is_some() {
+            self.truncated = true;
+        }
+        done
+    }
+}
+
+fn pdf_document_title(url: &str) -> String {
+    Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.path_segments()?.next_back().map(str::to_string))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Documento PDF".to_string())
+}
+
 struct App {
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Window>,
@@ -2638,6 +2703,9 @@ struct App {
     document: DocumentWorker,
     /// Os bytes do PDF aberto, servidos ao visualizador pela origem propria.
     pdf_bytes: Arc<Mutex<Vec<u8>>>,
+    /// Texto extraido pelo viewer PDF em chunks autenticados. So e publicado
+    /// na memoria quando a extracao termina, evitando documentos duplicados.
+    pdf_text_capture: Option<PdfTextCapture>,
     surface: Surface,
     navigation_generation: Arc<AtomicU64>,
     status: Option<String>,
@@ -2683,6 +2751,7 @@ impl App {
         Self {
             document,
             pdf_bytes: Arc::new(Mutex::new(Vec::new())),
+            pdf_text_capture: None,
             proxy,
             window: None,
             webview: None,
@@ -3020,6 +3089,7 @@ impl App {
         if let Ok(mut bytes) = self.pdf_bytes.lock() {
             *bytes = Vec::new();
         }
+        self.pdf_text_capture = None;
         self.reading_pdf = false;
     }
 
@@ -3370,19 +3440,22 @@ impl App {
         let ipc_proxy = self.proxy.clone();
         let navigation_proxy = self.proxy.clone();
         let bytes = Arc::clone(&self.pdf_bytes);
+        let generation = self.current_generation();
         let capability = remote_capability();
         let ipc_capability = capability.clone();
         let init_script = NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", &capability);
+        let pdf_text_script = PDF_TEXT_BRIDGE_SCRIPT.replace("__NEURALIA_CAP__", &capability);
 
         WebViewBuilder::new()
             .with_custom_protocol("neuralia-pdf".to_string(), move |_id, request| {
                 serve_pdf_asset(&bytes, &request)
             })
             .with_initialization_script(init_script)
+            .with_initialization_script(pdf_text_script)
             .with_ipc_handler(move |request| {
                 if let Some(action) =
                     parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
-                    && let Some(event) = common_ipc_event(action)
+                    && let Some(event) = pdf_ipc_event(generation, action)
                 {
                     let _ = ipc_proxy.send_event(event);
                 }
@@ -3413,12 +3486,18 @@ impl App {
         if let Ok(mut slot) = self.pdf_bytes.lock() {
             *slot = bytes;
         }
+        self.pdf_text_capture = Some(PdfTextCapture::new(
+            self.current_generation(),
+            url.to_string(),
+            pdf_document_title(url),
+        ));
 
         let result = if let Some(window) = &self.window {
             self.pdf_webview_builder()
                 .with_url(format!("{PDF_ORIGIN}/viewer.html"))
                 .build(window)
         } else {
+            self.pdf_text_capture = None;
             return;
         };
 
@@ -3428,26 +3507,64 @@ impl App {
                 self.webview = Some(webview);
                 self.surface = Surface::Pdf;
                 self.record(HistoryKind::Read, url.to_string(), url.to_string());
-                let mut document = MemoryDocument::new(
-                    MemoryKind::Source,
-                    MemorySourceKind::Pdf,
-                    Url::parse(url)
-                        .ok()
-                        .and_then(|parsed| parsed.path_segments()?.next_back().map(str::to_string))
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or_else(|| "Documento PDF".to_string()),
-                    Some(url.to_string()),
-                    format!("Documento PDF aberto no NeuralIA: {url}"),
-                );
-                if let Some(session) = &self.current_research {
-                    document = document.session(session.id.clone());
-                }
-                self.memory.capture(document);
                 self.begin_reading_session(true);
             }
             Err(error) => {
+                self.pdf_text_capture = None;
                 self.show_native_error(format!("WebView2 não pôde abrir o PDF: {error}"));
             }
+        }
+    }
+
+    fn capture_pdf_memory(&mut self, capture: PdfTextCapture) {
+        let mut body = capture.body.trim().to_string();
+        if body.is_empty() {
+            body = format!("PDF sem texto extraível aberto no NeuralIA: {}", capture.url);
+        }
+        if capture.truncated {
+            body.push_str("\n\n[Extração textual limitada pelo NeuralIA.]");
+        }
+
+        let mut document = MemoryDocument::new(
+            MemoryKind::Source,
+            MemorySourceKind::Pdf,
+            capture.title.clone(),
+            Some(capture.url.clone()),
+            body.clone(),
+        );
+        if let Some(session) = &mut self.current_research {
+            document = document.session(session.id.clone());
+            let memory_id = document.id.clone();
+            session.add_source(
+                None,
+                capture.title,
+                capture.url,
+                Some(memory_id),
+                body,
+            );
+            self.memory.save_session(session.clone());
+        }
+        self.memory.capture(document);
+    }
+
+    fn handle_pdf_text_chunk(
+        &mut self,
+        generation: u64,
+        page: u32,
+        text: String,
+        done: bool,
+        truncated: bool,
+    ) {
+        if generation != self.current_generation() {
+            return;
+        }
+        let complete = self
+            .pdf_text_capture
+            .as_mut()
+            .filter(|capture| capture.generation == generation)
+            .is_some_and(|capture| capture.push(page, &text, done, truncated));
+        if complete && let Some(capture) = self.pdf_text_capture.take() {
+            self.capture_pdf_memory(capture);
         }
     }
 
@@ -7166,6 +7283,13 @@ impl ApplicationHandler<UserEvent> for App {
                     Err(error) => self.show_native_error(format!("PDF: {error}")),
                 }
             }
+            UserEvent::PdfTextChunk {
+                generation,
+                page,
+                text,
+                done,
+                truncated,
+            } => self.handle_pdf_text_chunk(generation, page, text, done, truncated),
             UserEvent::ReaderReady {
                 generation,
                 input,
@@ -7597,6 +7721,24 @@ fn neuralia_action(target: &str) -> Option<UserEvent> {
         "viewsource" => UserEvent::ViewSource,
         _ => return None,
     })
+}
+
+fn pdf_ipc_event(generation: u64, action: IpcAction) -> Option<UserEvent> {
+    match action {
+        IpcAction::PdfText {
+            page,
+            text,
+            done,
+            truncated,
+        } => Some(UserEvent::PdfTextChunk {
+            generation,
+            page,
+            text,
+            done,
+            truncated,
+        }),
+        other => common_ipc_event(other),
+    }
 }
 
 fn common_ipc_event(action: IpcAction) -> Option<UserEvent> {
@@ -8625,6 +8767,10 @@ const PDF_VIEWER_CSP: &str = "default-src 'none'; script-src 'self' blob: 'wasm-
 /// Limite para um documento; o do Reader (2 MiB) e para HTML.
 const PDF_MAX_BYTES: usize = 32 * 1024 * 1024;
 const PDF_TIMEOUT_SECS: u64 = 90;
+/// Extracao textual para memoria/pesquisa. Renderizar continua independente:
+/// estes limites existem para um PDF gigante nao virar um documento de memoria gigante.
+const PDF_TEXT_MAX_PAGES: u32 = 256;
+const PDF_TEXT_MAX_CHARS: usize = 512 * 1024;
 
 static LOGO_IMAGE: OnceLock<RgbaImage> = OnceLock::new();
 static BRAND_IMAGE: OnceLock<RgbaImage> = OnceLock::new();
@@ -8765,6 +8911,51 @@ mod tests {
 
     fn home_field() -> tissue::Field {
         home_tissue_field(1920.0, 1080.0, 1.0)
+    }
+
+    #[test]
+    fn spec_0110_pdf_ipc_maps_authenticated_text_to_the_current_generation() {
+        let event = pdf_ipc_event(77, IpcAction::PdfText {
+            page: 3,
+            text: "conteudo".to_string(),
+            done: true,
+            truncated: false,
+        });
+        assert!(matches!(
+            event,
+            Some(UserEvent::PdfTextChunk {
+                generation: 77,
+                page: 3,
+                ref text,
+                done: true,
+                truncated: false,
+            }) if text == "conteudo"
+        ));
+    }
+
+    #[test]
+    fn spec_0110_pdf_text_capture_is_bounded_and_published_only_on_done() {
+        let mut capture = PdfTextCapture::new(9, "https://example.com/a.pdf".into(), "a.pdf".into());
+        assert!(!capture.push(1, "primeira", false, false));
+        assert!(!capture.push(2, "segunda", false, false));
+        assert_eq!(capture.body, "primeira\nsegunda");
+
+        let oversized = "x".repeat(PDF_TEXT_MAX_CHARS + 32);
+        assert!(!capture.push(2, &oversized, false, false));
+        assert_eq!(capture.body.chars().count(), PDF_TEXT_MAX_CHARS);
+        assert!(capture.truncated);
+        assert!(capture.push(2, "", true, true));
+    }
+
+    #[test]
+    fn spec_0110_pdf_text_capture_drops_backward_or_out_of_budget_pages() {
+        let mut capture = PdfTextCapture::new(11, "https://example.com/b.pdf".into(), "b.pdf".into());
+        assert!(!capture.push(2, "dois", false, false));
+        assert!(!capture.push(1, "um atrasado", false, false));
+        assert_eq!(capture.body, "dois");
+        assert!(!capture.push(PDF_TEXT_MAX_PAGES + 1, "fora", false, false));
+        assert_eq!(capture.body, "dois");
+        assert!(capture.truncated);
     }
 
     #[test]
@@ -12218,6 +12409,20 @@ const fn rgb3(color: Rgb) -> u32 {
 /// Mapa de teclas injetado em TODAS as paginas. O teclado pertence ao WebView2,
 /// que e uma janela filha: a janela nativa nunca ve a tecla, por isso e aqui,
 /// na fase de captura, que se apanham os atalhos antes de o site os consumir.
+const PDF_TEXT_BRIDGE_SCRIPT: &str = r#"
+(() => {
+  if (window.top !== window) return;
+  const cap = '__NEURALIA_CAP__';
+  const webview = window.chrome && window.chrome.webview;
+  if (!webview || typeof webview.postMessage !== 'function') return;
+  const post = webview.postMessage.bind(webview);
+  const send = (args) => post(JSON.stringify({v:1, cap, action:'pdf-text', args}));
+  Object.defineProperty(window, '__neuralia_pdf_text', {
+    value: send, writable: false, configurable: false, enumerable: false
+  });
+})();
+"#;
+
 const NEURALIA_KEYMAP_SCRIPT: &str = r#"
 (function () {
   // WRY/WebView2 injeta initialization scripts em child frames no Windows.

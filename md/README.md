@@ -44,6 +44,8 @@ The browser remains infrastructure. The product is the research workflow.
 | [SPEC-0105](SPEC-0105-agent-runtime.md) | DOM/accessibility-first web agent runtime | 2.0 |
 | [SPEC-0106](SPEC-0106-execution-roadmap.md) | Implementation order and release gates | 1.7 → 2.0 |
 | [SPEC-0107](SPEC-0107-ai-memory-native-integration.md) | Native import/adaptation of ai-memory into NeuralIA memory crates | 1.7–1.9 |
+| [SPEC-0108](SPEC-0108-secure-webview-ipc-channel.md) | Capability-authenticated WebView IPC | 2.0 gate |
+| [SPEC-0110](SPEC-0110-pdf-reader-text.md) | Selectable PDF text and bounded extraction into memory/research | post-2.1 |
 
 A matriz que responde explicitamente “este teste exercita o caminho que
 embarca?” está em

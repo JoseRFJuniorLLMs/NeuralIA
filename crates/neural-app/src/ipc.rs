@@ -59,6 +59,12 @@ pub enum IpcAction {
     AgentObservation {
         data: String,
     },
+    PdfText {
+        page: u32,
+        text: String,
+        done: bool,
+        truncated: bool,
+    },
 }
 
 pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -195,6 +201,22 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
             exact_keys(args, &["data"])?;
             let data = bounded_string(args, "data", 7_500, false)?;
             Some(IpcAction::AgentObservation { data })
+        }
+        "pdf-text" => {
+            exact_keys(args, &["page", "text", "done", "truncated"])?;
+            let page = u32::try_from(args.get("page")?.as_u64()?).ok()?;
+            if page == 0 || page > 10_000 {
+                return None;
+            }
+            let text = bounded_string(args, "text", 4_096, true)?;
+            let done = args.get("done")?.as_bool()?;
+            let truncated = args.get("truncated")?.as_bool()?;
+            Some(IpcAction::PdfText {
+                page,
+                text,
+                done,
+                truncated,
+            })
         }
         _ => None,
     }
@@ -553,7 +575,51 @@ mod tests {
     }
 
     #[test]
-    fn protocol_covers_twenty_five_real_actions() {
+    fn accepts_bounded_pdf_text_chunks_and_rejects_abuse() {
+        let action = parse_ipc_message(
+            &message(
+                "pdf-text",
+                json!({"page":2,"text":"trecho do PDF","done":false,"truncated":false}),
+            ),
+            CAP,
+            3,
+        );
+        assert_eq!(
+            action,
+            Some(IpcAction::PdfText {
+                page: 2,
+                text: "trecho do PDF".into(),
+                done: false,
+                truncated: false,
+            })
+        );
+
+        for args in [
+            json!({"page":0,"text":"x","done":false,"truncated":false}),
+            json!({"page":10001,"text":"x","done":false,"truncated":false}),
+            json!({"page":1,"text":"x","done":false}),
+            json!({"page":1,"text":"x","done":"nao","truncated":false}),
+            json!({"page":1,"text":"x","done":false,"truncated":false,"extra":1}),
+        ] {
+            assert!(parse_ipc_message(&message("pdf-text", args), CAP, 3).is_none());
+        }
+
+        let too_long = "x".repeat(4_097);
+        assert!(
+            parse_ipc_message(
+                &message(
+                    "pdf-text",
+                    json!({"page":1,"text":too_long,"done":false,"truncated":false}),
+                ),
+                CAP,
+                3,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn protocol_covers_twenty_six_real_actions() {
         let messages = [
             message("home", json!({})),
             message("back", json!({})),
@@ -589,8 +655,12 @@ mod tests {
                 "agent-observation",
                 json!({"data":"1\nhttps://example.com"}),
             ),
+            message(
+                "pdf-text",
+                json!({"page":1,"text":"pagina","done":true,"truncated":false}),
+            ),
         ];
-        assert_eq!(messages.len(), 25);
+        assert_eq!(messages.len(), 26);
         assert!(
             messages
                 .iter()

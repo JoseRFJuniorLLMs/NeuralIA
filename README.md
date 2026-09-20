@@ -124,7 +124,7 @@ NeuralIA/
 | `como funciona Raft?` | Comparador: Gemini + ChatGPT + Claude |
 | `? MVCC vs OCC` | Google AI Mode |
 | `compare: MVCC vs OCC` | Comparador explícito: Gemini + ChatGPT + Claude |
-| `https://example.com/paper.pdf` | Visualizador de PDF embutido (o Reader só lê HTML) |
+| `https://example.com/paper.pdf` | Visualizador PDF.js embutido, com texto selecionável e extração limitada para memória/pesquisa |
 | `https://example.com/article` | Reader |
 | `reader:https://example.com` | Reader |
 | `web:https://example.com` | Full WebView |
