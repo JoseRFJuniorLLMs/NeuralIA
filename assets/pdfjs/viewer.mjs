@@ -354,7 +354,8 @@ async function load() {
       standardFontDataUrl: './standard_fonts/',
       wasmUrl: './wasm/',
       iccUrl: './icc/',
-      useWasm: true
+      useWasm: true,
+      useWorkerFetch: true
     }).promise;
   } catch (err) {
     fail(describeLoadError(err));
