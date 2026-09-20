@@ -41,6 +41,10 @@ All notable changes to NeuralIA are documented here.
 - Revisão adversarial independente e release 2.1.0 permanecem pendentes.
 
 ### Fixed
+- **PR #73 — a inteligência local respeita budgets e mantém model packs dentro da raiz.**
+  Resumos truncados passam a incluir a elipse dentro do próprio limite de
+  caracteres, e componentes de model pack rejeitam sintaxe Windows com `:`
+  (incluindo caminhos drive-relative e alternate data streams).
 - **PR #66 — o visualizador PDF fecha o overlay de carregamento de forma determinística.**
   `hidden` deixa de depender da precedência de `#status { display:grid }`: o
   viewer controla também `display` diretamente. Erros HTTP/PDF passam a usar
