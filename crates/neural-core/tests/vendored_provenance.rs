@@ -106,7 +106,7 @@ fn pdfjs_auxiliary_assets_match_the_recorded_manifest() {
         ("assets/pdfjs/wasm", 5usize),
         ("assets/pdfjs/icc", 1usize),
         ("assets/pdfjs/licenses", 10usize),
-        ("assets/pdfjs/fixtures", 5usize),
+        ("assets/pdfjs/fixtures", 6usize),
     ];
 
     for (directory, expected_count) in families {
