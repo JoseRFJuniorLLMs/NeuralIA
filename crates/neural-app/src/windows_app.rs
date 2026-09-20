@@ -2133,7 +2133,16 @@ impl HomeLayout {
         let go_width = 84.0 * scale;
         let gap = 10.0 * scale;
         let row_x = (width - row_width) / 2.0;
-        let row_y = (height * 0.54).clamp(310.0 * scale, height - 180.0 * scale);
+        // `f64::clamp` entra em panico se o minimo for maior que o maximo, e
+        // isso acontece sempre que a altura e inferior a 490*scale -- em
+        // particular com altura ZERO, que e o que o winit reporta quando a
+        // janela e minimizada (`WM_SIZE` sem filtro de `SIZE_MINIMIZED`). O
+        // `with_min_inner_size` nao protege este caso: a minimizacao nao passa
+        // pelo `WM_GETMINMAXINFO`. Numa janela dessas nao se desenha nada, mas
+        // tambem nao se pode morrer a calcular onde.
+        let row_top = 310.0 * scale;
+        let row_bottom = (height - 180.0 * scale).max(row_top);
+        let row_y = (height * 0.54).clamp(row_top, row_bottom);
 
         let input = UiRect {
             x: row_x,
@@ -8059,6 +8068,31 @@ fn render_brand_pixels(width: i32, height: i32, bg_rgb: Rgb) -> Vec<u8> {
 mod tests {
     use super::*;
     use windows_sys::Win32::Graphics::Gdi::GetDIBits;
+
+    /// Minimizar a janela na Home matava a aplicacao.
+    ///
+    /// O winit trata o `WM_SIZE` sem filtrar `SIZE_MINIMIZED`, por isso emite
+    /// `Resized(0, 0)`; o ramo `Surface::Home` chama `position_omnibox`, que
+    /// passa a altura 0 ao `HomeLayout::new`. La dentro,
+    /// `(0.0).clamp(310.0, -180.0)` faz `assert!(min <= max)` -- activo tambem
+    /// em release -- e entra em panico dentro do callback do event loop.
+    ///
+    /// O `with_min_inner_size(700x500)` nao protege: a minimizacao nao passa
+    /// pelo `WM_GETMINMAXINFO`.
+    #[test]
+    fn home_layout_survives_a_minimized_window() {
+        for height in [0.0, 1.0, 100.0, 300.0, 489.0, 490.0, 760.0, 2000.0] {
+            for width in [0.0, 320.0, 1120.0] {
+                for scale in [1.0, 1.5, 2.0] {
+                    let layout = HomeLayout::new(width, height, scale);
+                    assert!(
+                        layout.input.y.is_finite() && layout.go.y.is_finite(),
+                        "{width}x{height} @{scale}"
+                    );
+                }
+            }
+        }
+    }
 
     /// O divisor do comparador tem de aceitar o rato.
     ///
