@@ -67,23 +67,60 @@ function Import-SigningCertificate {
         [string]$Password
     )
 
+    $storePath = "Cert:\CurrentUser\My"
     $pfxPath = Join-Path ([IO.Path]::GetTempPath()) ("neuralia-authenticode-" + [Guid]::NewGuid().ToString("N") + ".pfx")
     $bytes = $null
+    $newThumbprints = @()
+    $completed = $false
     try {
+        $beforeThumbprints = @(
+            Get-ChildItem -Path $storePath -ErrorAction Stop |
+                Where-Object { $_.Thumbprint } |
+                ForEach-Object { $_.Thumbprint.ToUpperInvariant() }
+        )
+
         $bytes = [Convert]::FromBase64String($PfxBase64.Trim())
         [IO.File]::WriteAllBytes($pfxPath, $bytes)
         $securePassword = ConvertTo-SecureString $Password -AsPlainText -Force
-        $certificate = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation "Cert:\CurrentUser\My" -Password $securePassword -Exportable:$false
+        $imported = @(
+            Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation $storePath -Password $securePassword -Exportable:$false
+        )
 
-        if (-not $certificate) {
+        if ($imported.Count -eq 0) {
             throw "The Authenticode certificate could not be imported."
         }
-        if (-not $certificate.HasPrivateKey) {
-            throw "The Authenticode certificate does not contain a private key."
+
+        $signers = @($imported | Where-Object { $_.HasPrivateKey })
+        if ($signers.Count -ne 1) {
+            throw "The Authenticode PFX must contain exactly one certificate with a private key; found $($signers.Count)."
         }
-        return $certificate
+
+        # Compare the store before/after instead of assuming Import-PfxCertificate
+        # returns only the leaf. A PFX may carry intermediates, and cleanup must
+        # remove only entries created by this invocation.
+        $newThumbprints = @(
+            Get-ChildItem -Path $storePath -ErrorAction Stop |
+                Where-Object {
+                    $_.Thumbprint -and
+                    ($beforeThumbprints -notcontains $_.Thumbprint.ToUpperInvariant())
+                } |
+                ForEach-Object { $_.Thumbprint.ToUpperInvariant() } |
+                Sort-Object -Unique
+        )
+
+        $completed = $true
+        return [pscustomobject]@{
+            Signer = $signers[0]
+            NewThumbprints = @($newThumbprints)
+        }
     }
     finally {
+        # If import/validation fails, do not leak newly imported certificates.
+        if (-not $completed) {
+            foreach ($thumbprint in @($newThumbprints)) {
+                Remove-Item -LiteralPath ("$storePath\" + $thumbprint) -Force -ErrorAction SilentlyContinue
+            }
+        }
         Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
         if ($bytes) {
             [Array]::Clear($bytes, 0, $bytes.Length)
@@ -142,9 +179,11 @@ if ($Sign) {
         throw "Signing was requested but NEURALIA_AUTHENTICODE_PFX_B64 and NEURALIA_AUTHENTICODE_PFX_PASSWORD are not both configured."
     }
 
+    $certificateImport = $null
     $certificate = $null
     try {
-        $certificate = Import-SigningCertificate -PfxBase64 $pfxBase64 -Password $pfxPassword
+        $certificateImport = Import-SigningCertificate -PfxBase64 $pfxBase64 -Password $pfxPassword
+        $certificate = $certificateImport.Signer
         $signTool = Resolve-SignTool
 
         if ($SkipTimestamp) {
@@ -178,9 +217,13 @@ if ($Sign) {
         & "$PSScriptRoot/verify-windows-installer-signature.ps1" @verifyParams
     }
     finally {
-        if ($certificate) {
-            Remove-Item -LiteralPath ("Cert:\CurrentUser\My\" + $certificate.Thumbprint) -Force -ErrorAction SilentlyContinue
+        if ($certificateImport) {
+            foreach ($thumbprint in @($certificateImport.NewThumbprints)) {
+                Remove-Item -LiteralPath ("Cert:\CurrentUser\My\" + $thumbprint) -Force -ErrorAction SilentlyContinue
+            }
         }
+        $certificate = $null
+        $certificateImport = $null
         $pfxBase64 = $null
         $pfxPassword = $null
     }
