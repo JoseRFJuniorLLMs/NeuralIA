@@ -514,10 +514,24 @@ pub fn redact_sensitive_text(input: &str) -> String {
             "cvc=",
         ]
         .iter()
-        .any(|needle| lower.contains(needle));
+        .find(|needle| lower.contains(*needle))
+        .copied();
 
-        if sensitive {
-            let key = raw.split([':', '=']).next().unwrap_or("sensitive").trim();
+        if let Some(needle) = sensitive {
+            // O nome do campo so se escreve quando foi ELE o reconhecido.
+            //
+            // Com `split(...).next()`, uma linha sem separador devolvia a
+            // LINHA INTEIRA como chave: o segredo saia verbatim, com um
+            // "[REDACTED]" colado atras a fingir que tinha sido apagado --
+            // pior do que nao redigir, porque parece redigido. E numa linha
+            // como `<segredo>: api_key` a agulha esta DEPOIS do separador,
+            // portanto a chave era o segredo.
+            let field = needle.trim_end_matches([':', '=']);
+            let key = raw
+                .split_once([':', '='])
+                .map(|(key, _)| key.trim())
+                .filter(|key| !key.is_empty() && key.to_ascii_lowercase().contains(field))
+                .unwrap_or("sensitive");
             output.push(format!("{key}: [REDACTED]"));
         } else {
             output.push(raw.to_string());
@@ -530,6 +544,36 @@ pub fn redact_sensitive_text(input: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_sensitive_line_without_a_separator_does_not_echo_the_secret() {
+        // `raw.split([':','=']).next()` devolve a LINHA INTEIRA quando nao ha
+        // separador nenhum. O segredo saia verbatim como "chave", com um
+        // "[REDACTED]" colado atras a fingir que tinha sido apagado -- pior do
+        // que nao redigir, porque parece redigido.
+        for (line, secret) in [
+            ("access_token ya29.SEGREDO", "ya29.SEGREDO"),
+            ("api_key sk-SEGREDO", "sk-SEGREDO"),
+            ("refresh_token   abc123", "abc123"),
+        ] {
+            let clean = redact_sensitive_text(line);
+            assert!(!clean.contains(secret), "{line} -> {clean}");
+            assert!(clean.contains("[REDACTED]"), "{line} -> {clean}");
+        }
+
+        // NOTA, e nao e o assunto deste teste: `Authorization Bearer abc` --
+        // cabecalho escrito com espaco em vez de `:` -- nao e sequer detectado,
+        // porque as agulhas da lista sao "authorization:" e "authorization=".
+        // E uma lacuna separada, do detector e nao do formatador.
+
+        // Com separador, o nome do campo continua a sobreviver -- e o que diz
+        // ao utilizador o que foi apagado.
+        let clean = redact_sensitive_text("Authorization: Bearer abc123");
+        assert_eq!(clean, "Authorization: [REDACTED]");
+
+        // Uma chave que seja ela propria suspeita nao passa por nome de campo.
+        let clean = redact_sensitive_text("ya29.SEGREDO-MUITO-LONGO-E-ESTRANHO: api_key");
+        assert!(!clean.contains("ya29.SEGREDO"), "{clean}");
+    }
     #[test]
     fn sensitive_values_are_redacted_before_storage_or_model_context() {
         let input = "title: ok\nAuthorization: Bearer abc\npassword=hunter2\nbody: visible";
