@@ -72,7 +72,7 @@ export function plainTextFromTextContent(content, maxChars = 1500) {
     if (out.length >= maxChars) break;
   }
   return out
-    .slice(0, maxChars)
+    .slice(0)
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
