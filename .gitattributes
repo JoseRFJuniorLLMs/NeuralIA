@@ -2,3 +2,13 @@
 assets/pdfjs/pdf.mjs -text
 assets/pdfjs/pdf.worker.mjs -text
 assets/pdfjs/LICENSE -text
+
+# Auxiliary PDF.js assets are pinned by upstream Git blob id. Keep every byte
+# stable on Windows too; some fixtures and generated fallbacks look textual to
+# Git but are provenance-controlled payloads rather than project source files.
+assets/pdfjs/cmaps/** -text
+assets/pdfjs/fixtures/** -text
+assets/pdfjs/icc/** -text
+assets/pdfjs/licenses/** -text
+assets/pdfjs/standard_fonts/** -text
+assets/pdfjs/wasm/** -text

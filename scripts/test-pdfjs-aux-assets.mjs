@@ -37,12 +37,15 @@ console.warn = (...args) => {
 };
 
 const pdfjsRoot = fileURLToPath(new URL('../assets/pdfjs/', import.meta.url));
-const missing = path.join(pdfjsRoot, '__missing_aux__') + path.sep;
+function factoryPath(...parts) {
+  return path.join(...parts).replaceAll(path.sep, '/') + '/';
+}
+const missing = factoryPath(pdfjsRoot, '__missing_aux__');
 const breakKind = process.env.NEURALIA_PDF_AUX_BREAK || '';
 const only = process.env.NEURALIA_PDF_AUX_CASE || '';
 
 function base(name) {
-  const dir = path.join(pdfjsRoot, name) + path.sep;
+  const dir = factoryPath(pdfjsRoot, name);
   if (
     (breakKind === 'wasm' && name === 'wasm') ||
     (breakKind === 'cmap' && name === 'cmaps') ||

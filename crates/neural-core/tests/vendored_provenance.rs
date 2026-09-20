@@ -9,7 +9,13 @@
 //! `pdf.mjs`, o que está em `assets/pdfjs/UPSTREAM.md`, e o que o `release.yml`
 //! põe no SBOM.
 
-use std::{fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Write,
+    path::PathBuf,
+    process::{Command, Stdio},
+};
 
 use sha2::{Digest, Sha256};
 
@@ -91,6 +97,69 @@ fn listed_files(relative_dir: &str) -> Vec<String> {
     files
 }
 
+fn auxiliary_manifest_rows(manifest: &str) -> BTreeMap<String, (String, u64)> {
+    manifest
+        .lines()
+        .filter_map(|line| {
+            let cells = line
+                .split('|')
+                .map(str::trim)
+                .filter(|cell| !cell.is_empty())
+                .collect::<Vec<_>>();
+            if cells.len() != 4 {
+                return None;
+            }
+            let path = cells[0].strip_prefix('`')?.strip_suffix('`')?;
+            let hash = cells[2].strip_prefix('`')?.strip_suffix('`')?;
+            if !path.starts_with("assets/pdfjs/")
+                || hash.len() != 40
+                || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return None;
+            }
+            let size = cells[3].parse::<u64>().ok()?;
+            Some((path.to_string(), (hash.to_ascii_lowercase(), size)))
+        })
+        .collect()
+}
+
+fn git_blob_hashes(paths: impl Iterator<Item = String>) -> Vec<String> {
+    let root = repo_root();
+    let paths = paths.collect::<Vec<_>>();
+    let mut child = Command::new("git")
+        .args(["hash-object", "--no-filters", "--stdin-paths"])
+        .current_dir(&root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("git hash-object disponível para conferir blobs vendorizados");
+    {
+        let stdin = child.stdin.as_mut().expect("stdin de git hash-object");
+        for path in &paths {
+            writeln!(stdin, "{path}").expect("enviar caminho a git hash-object");
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .expect("aguardar git hash-object dos blobs vendorizados");
+    assert!(
+        output.status.success(),
+        "git hash-object falhou: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let hashes = String::from_utf8(output.stdout)
+        .expect("hashes Git em ASCII")
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        hashes.len(),
+        paths.len(),
+        "git hash-object deve devolver um hash por asset"
+    );
+    hashes
+}
+
 #[test]
 fn pdfjs_auxiliary_assets_match_the_recorded_manifest() {
     let upstream = read("assets/pdfjs/UPSTREAM.md");
@@ -99,6 +168,7 @@ fn pdfjs_auxiliary_assets_match_the_recorded_manifest() {
 
     assert!(upstream.contains(source_commit));
     assert!(manifest.contains(source_commit));
+    let rows = auxiliary_manifest_rows(&manifest);
 
     let families = [
         ("assets/pdfjs/cmaps", 168usize),
@@ -118,10 +188,31 @@ fn pdfjs_auxiliary_assets_match_the_recorded_manifest() {
         );
         for file in files {
             assert!(
-                manifest.contains(&format!("`{file}`")),
+                rows.contains_key(&file),
                 "{file} existe no pacote mas não está no manifesto upstream"
             );
         }
+    }
+
+    assert_eq!(
+        rows.len(),
+        204,
+        "o manifesto deve conter exatamente todos os 204 blobs auxiliares"
+    );
+    let hashes = git_blob_hashes(rows.keys().cloned());
+    for ((path, (expected_hash, expected_size)), actual_hash) in rows.iter().zip(hashes) {
+        let full_path = repo_root().join(path);
+        let actual_size = fs::metadata(&full_path)
+            .unwrap_or_else(|error| panic!("{}: {error}", full_path.display()))
+            .len();
+        assert_eq!(
+            actual_size, *expected_size,
+            "{path} não tem o tamanho upstream registrado"
+        );
+        assert_eq!(
+            actual_hash, *expected_hash,
+            "{path} não tem os bytes do Git blob upstream registrado"
+        );
     }
 
     for critical in [
@@ -133,7 +224,7 @@ fn pdfjs_auxiliary_assets_match_the_recorded_manifest() {
         "assets/pdfjs/icc/CGATS001Compat-v2-micro.icc",
     ] {
         assert!(
-            manifest.contains(&format!("`{critical}`")),
+            rows.contains_key(critical),
             "asset crítico sem proveniência: {critical}"
         );
     }

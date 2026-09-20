@@ -765,6 +765,8 @@ pub(crate) fn lookup(path: &str) -> Option<(&'static str, &'static [u8])> {
 mod tests {
     use super::lookup;
 
+    use std::{fs, path::PathBuf};
+
     #[test]
     fn auxiliary_asset_lookup_is_fail_closed() {
         assert!(lookup("/wasm/openjpeg.wasm").is_some());
@@ -781,5 +783,51 @@ mod tests {
         ] {
             assert!(lookup(path).is_none(), "{path} não pode ser servido");
         }
+    }
+
+    #[test]
+    fn every_vendored_runtime_asset_has_an_exact_route_and_mime() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/pdfjs");
+        let mut checked = 0usize;
+        for family in ["cmaps", "standard_fonts", "wasm", "icc"] {
+            let directory = root.join(family);
+            for entry in fs::read_dir(&directory)
+                .unwrap_or_else(|error| panic!("{}: {error}", directory.display()))
+            {
+                let path = entry
+                    .unwrap_or_else(|error| panic!("{}: {error}", directory.display()))
+                    .path();
+                if !path.is_file() {
+                    continue;
+                }
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("nome de asset PDF.js em UTF-8");
+                let route = format!("/{family}/{name}");
+                let (content_type, bytes) = lookup(&route)
+                    .unwrap_or_else(|| panic!("asset vendorizado sem rota exata: {route}"));
+                assert_eq!(
+                    bytes.len() as u64,
+                    fs::metadata(&path)
+                        .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+                        .len(),
+                    "a rota deve servir todos os bytes de {route}"
+                );
+                let expected_type = match path.extension().and_then(|ext| ext.to_str()) {
+                    Some("wasm") => "application/wasm",
+                    Some("js") => "text/javascript",
+                    Some("ttf") => "font/ttf",
+                    Some("icc") => "application/vnd.iccprofile",
+                    _ => "application/octet-stream",
+                };
+                assert_eq!(content_type, expected_type, "MIME incorreto para {route}");
+                checked += 1;
+            }
+        }
+        assert_eq!(
+            checked, 188,
+            "a allowlist deve cobrir todos os 188 assets auxiliares de runtime"
+        );
     }
 }

@@ -35,7 +35,7 @@ ficheiro — é esse o objetivo.
 
 ## Assets auxiliares do viewer
 
-A política do NeuralIA para o PDF.js 6.3.289 é **suporte integral e offline**. Todos os assets abaixo vêm do mesmo commit upstream `1c8020a7d4e43668ac287a3ecf9a8dbea17e4c56` da tag `v6.3.289` e são servidos somente pela origem privada `neuralia-pdf://` através de uma allowlist fechada.
+A política do NeuralIA para o PDF.js 6.3.289 é **suporte integral e offline**. Todos os assets abaixo vêm do mesmo commit upstream `1c8020a7d4e43668ac287a3ecf9a8dbea17e4c56` da tag `v6.3.289` e são servidos somente pela origem privada `http://neuralia-pdf.localhost`, que o protocolo personalizado `neuralia-pdf` do Wry intercepta, através de uma allowlist fechada.
 
 - `cmaps/`: 168 Adobe binary CMaps (`.bcmap`), licença BSD-style Adobe.
 - `standard_fonts/`: 10 fontes Foxit/PDFium em PFB + 4 Liberation Sans 1.07.4 em TTF. Foxit: BSD-style. Liberation Sans 1.07.4: GPLv2 + Liberation font exception.
