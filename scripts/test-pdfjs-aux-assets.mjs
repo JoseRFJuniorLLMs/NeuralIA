@@ -81,7 +81,7 @@ for (const [name, file] of cases) {
     await page.getTextContent();
     page.cleanup();
   }
-  await doc.destroy();
+  await task.destroy();
   passed++;
   console.log('ok - aux ' + name);
 }
