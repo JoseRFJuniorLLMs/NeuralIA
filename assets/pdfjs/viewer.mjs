@@ -1,9 +1,11 @@
-// Visualizador PDF offline do NeuralIA. Documentos longos nao podem consumir
-// memoria sem limite: ha um placeholder por pagina (da a barra de scroll
-// certa), mas o canvas e o PDFPageProxy so vivem perto da pagina actual, e os
-// bytes chegam por ranges em vez de o ficheiro inteiro ser copiado para o
-// worker. A geometria e calculada, nao lida do DOM, para o scroll nao forcar
-// layout a cada evento.
+// Visualizador PDF offline do NeuralIA. Documentos longos usam um placeholder
+// barato por pagina (da a barra de scroll certa), enquanto canvas/bitmap e
+// estado de render sao libertados longe da pagina actual. O PDF.js conserva
+// internamente os PDFPageProxy ja pedidos ate destruir o documento, portanto a
+// garantia de memoria limitada aqui aplica-se aos recursos pesados de render,
+// nao ao numero de proxies. Os bytes chegam por ranges em vez de o ficheiro
+// inteiro ser copiado para o worker. A geometria e calculada, nao lida do DOM,
+// para o scroll nao forcar layout a cada evento.
 import * as pdfjsLib from './pdf.mjs';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './pdf.worker.mjs';
@@ -214,9 +216,11 @@ async function render(index) {
 }
 
 // So visita os indices vivos, nunca todas as paginas. O canvas fica enquanto
-// a pagina estiver a KEEP_RADIUS da actual ou dentro da faixa do observer; o
-// proxy dura ate EVICT_RADIUS, excepto o da pagina 1, que e a referencia da
-// escala e a primeira a voltar a mostrar.
+// a pagina estiver a KEEP_RADIUS da actual ou dentro da faixa do observer.
+// Fora de EVICT_RADIUS largamos a referencia local e chamamos cleanup() para
+// libertar estado pesado de render; o WorkerTransport do PDF.js pode continuar
+// a reter o PDFPageProxy no cache interno. A pagina 1 fica referenciada porque
+// e a base da escala e a primeira a voltar a mostrar.
 function evictFarPages() {
   const center = current - 1;
   const bandTop = window.scrollY - BAND;
