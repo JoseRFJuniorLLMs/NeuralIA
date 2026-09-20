@@ -7418,7 +7418,10 @@ fn serve_pdf_asset(
             };
             (status, "application/pdf", body)
         }
-        _ => (404, "text/plain", Cow::Borrowed(b"not found" as &[u8])),
+        _ => match crate::pdf_assets::lookup(path) {
+            Some((content_type, asset)) => (200, content_type, Cow::Borrowed(asset)),
+            None => (404, "text/plain", Cow::Borrowed(b"not found" as &[u8])),
+        },
     };
 
     // nosniff em tudo: o tipo declarado e o tipo, nao se adivinha pelo corpo.
@@ -8618,7 +8621,7 @@ const PDFJS_WORKER: &[u8] = include_bytes!("../../../assets/pdfjs/pdf.worker.mjs
 const PDF_ORIGIN: &str = "http://neuralia-pdf.localhost";
 /// A mesma politica do `<meta>` do viewer.html, servida em cabecalho para
 /// valer antes de o HTML ser lido; um teste garante que as duas nao divergem.
-const PDF_VIEWER_CSP: &str = "default-src 'none'; script-src 'self' blob:; worker-src 'self' blob:; connect-src 'self'; img-src 'self' blob: data:; style-src 'unsafe-inline'; font-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'";
+const PDF_VIEWER_CSP: &str = "default-src 'none'; script-src 'self' blob: 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self'; img-src 'self' blob: data:; style-src 'unsafe-inline'; font-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'";
 /// Limite para um documento; o do Reader (2 MiB) e para HTML.
 const PDF_MAX_BYTES: usize = 32 * 1024 * 1024;
 const PDF_TIMEOUT_SECS: u64 = 90;
