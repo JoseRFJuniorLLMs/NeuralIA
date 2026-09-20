@@ -3032,7 +3032,7 @@ impl App {
                 if is_pdf_internal_target(&target) {
                     return true;
                 }
-                if remote_web_target(&target, false) {
+                if remote_web_target(&target, None) {
                     let _ = navigation_proxy.send_event(UserEvent::OpenExternal(target));
                 }
                 false
@@ -3174,11 +3174,12 @@ impl App {
 
     fn external_webview_builder(
         &self,
-        allow_local: bool,
+        local_origin: Option<String>,
         agent_enabled: bool,
     ) -> WebViewBuilder<'static> {
         let ipc_proxy = self.proxy.clone();
         let new_window_proxy = self.proxy.clone();
+        let nav_origin = local_origin.clone();
         let capability = remote_capability();
         let ipc_capability = capability.clone();
         let agent_script = if agent_enabled {
@@ -3215,11 +3216,11 @@ impl App {
                 {
                     return false;
                 }
-                remote_web_target(&target, allow_local)
-                    || is_view_source_target(&target, allow_local)
+                remote_web_target(&target, nav_origin.as_deref())
+                    || is_view_source_target(&target, nav_origin.as_deref())
             })
             .with_new_window_req_handler(move |target, _features| {
-                if remote_web_target(&target, allow_local) {
+                if remote_web_target(&target, local_origin.as_deref()) {
                     let _ = new_window_proxy.send_event(UserEvent::OpenExternal(target));
                 }
                 NewWindowResponse::Deny
@@ -3261,7 +3262,7 @@ impl App {
         });
 
         let result = if let Some(window) = &self.window {
-            self.external_webview_builder(false, true)
+            self.external_webview_builder(None, true)
                 .with_url(valid.as_str())
                 .build(window)
         } else {
@@ -3455,11 +3456,11 @@ impl App {
             .to_ascii_lowercase()
             .ends_with(".pdf");
 
-        let allow_local = Url::parse(url)
-            .ok()
-            .is_some_and(|target| is_local_network_target(&target));
+        // A autorizacao vale para a origem escrita, nao para a rede local.
+        let local_origin = Url::parse(url).ok().as_ref().and_then(local_origin_of);
+        let allow_local = local_origin.is_some();
         let result = if let Some(window) = &self.window {
-            self.external_webview_builder(allow_local, false)
+            self.external_webview_builder(local_origin, false)
                 .with_url(url)
                 .build(window)
         } else {
@@ -3918,10 +3919,10 @@ impl App {
                 {
                     return false;
                 }
-                remote_web_target(&target, false) || is_view_source_target(&target, false)
+                remote_web_target(&target, None) || is_view_source_target(&target, None)
             })
             .with_new_window_req_handler(move |target, _features| {
-                if remote_web_target(&target, false) {
+                if remote_web_target(&target, None) {
                     let _ = new_window_proxy.send_event(UserEvent::OpenInColumn(col_index, target));
                 }
                 NewWindowResponse::Deny
@@ -3955,7 +3956,7 @@ impl App {
         &self,
         source_index: usize,
         source_name: &'static str,
-        allow_local: bool,
+        local_origin: Option<String>,
         private: bool,
     ) -> WebViewBuilder<'static> {
         let ipc_proxy = self.proxy.clone();
@@ -3998,11 +3999,11 @@ impl App {
                 {
                     return false;
                 }
-                remote_web_target(&target, allow_local)
-                    || is_view_source_target(&target, allow_local)
+                remote_web_target(&target, local_origin.as_deref())
+                    || is_view_source_target(&target, local_origin.as_deref())
             })
             .with_new_window_req_handler(move |target, _features| {
-                if remote_web_target(&target, false) {
+                if remote_web_target(&target, None) {
                     let event = if private {
                         UserEvent::OpenPrivateSplit {
                             source_index,
@@ -4106,7 +4107,12 @@ impl App {
         };
 
         let result = self
-            .split_webview_builder(source_index, source_name, allow_local, private)
+            .split_webview_builder(
+                source_index,
+                source_name,
+                allow_local.then(|| valid.origin().ascii_serialization()),
+                private,
+            )
             .with_bounds(bounds)
             .with_url(valid.as_str())
             .build_as_child(window);
@@ -4841,8 +4847,10 @@ impl App {
             let Ok(current) = webview.url() else {
                 return;
             };
+            // A pagina ja esta carregada: ver a fonte dela nao alarga nada.
+            let current_origin = Url::parse(&current).ok().as_ref().and_then(local_origin_of);
             let target = format!("view-source:{current}");
-            if is_view_source_target(&target, true) {
+            if is_view_source_target(&target, current_origin.as_deref()) {
                 let _ = webview.load_url(&target);
             }
         });
@@ -7130,23 +7138,38 @@ fn remote_capability() -> String {
         .expect("BCryptGenRandom failed; refusing to create an unauthenticated WebView capability")
 }
 
-fn remote_web_target(target: &str, allow_local: bool) -> bool {
+/// A origem local que o utilizador autorizou ao escrever uma URL num controlo
+/// nativo, ou `None` quando nao autorizou nenhuma.
+///
+/// Era um `bool`, e o handler de navegacao capturava-o para toda a vida da
+/// WebView: autorizar `http://192.168.1.50:3000` abria a rede local INTEIRA a
+/// essa pagina, que a partir daí podia navegar para o router ou para qualquer
+/// outro host. O utilizador autorizou uma origem, nao uma rede.
+fn local_origin_of(url: &Url) -> Option<String> {
+    is_local_network_target(url).then(|| url.origin().ascii_serialization())
+}
+
+fn remote_web_target(target: &str, local_origin: Option<&str>) -> bool {
     if target.eq_ignore_ascii_case("about:blank") {
         return true;
     }
-    neural_core::validate_web_url(target)
-        .is_ok_and(|url| allow_local || !is_local_network_target(&url))
+    neural_core::validate_web_url(target).is_ok_and(|url| {
+        !is_local_network_target(&url)
+            || local_origin.is_some_and(|allowed| url.origin().ascii_serialization() == allowed)
+    })
 }
 
 /// `view-source:` so e aceite sobre uma URL web que a propria superficie ja
 /// deixaria abrir: a mesma politica de rede local, sem `about:` nem esquemas
 /// aninhados.
-fn is_view_source_target(target: &str, allow_local: bool) -> bool {
+fn is_view_source_target(target: &str, local_origin: Option<&str>) -> bool {
     let Some(rest) = target.strip_prefix("view-source:") else {
         return false;
     };
-    neural_core::validate_web_url(rest)
-        .is_ok_and(|url| allow_local || !is_local_network_target(&url))
+    neural_core::validate_web_url(rest).is_ok_and(|url| {
+        !is_local_network_target(&url)
+            || local_origin.is_some_and(|allowed| url.origin().ascii_serialization() == allowed)
+    })
 }
 
 fn is_pdf_internal_target(target: &str) -> bool {
@@ -8060,6 +8083,54 @@ mod tests {
     use super::*;
     use windows_sys::Win32::Graphics::Gdi::GetDIBits;
 
+    /// A autorizacao de rede local vale para a ORIGEM que o utilizador
+    /// escreveu, nao para a rede local inteira.
+    ///
+    /// O `allow_local` era um booleano capturado pelo handler de navegacao
+    /// para toda a vida da WebView: depois de o utilizador abrir
+    /// `http://192.168.1.50:3000` na palette nativa, essa pagina -- remota do
+    /// ponto de vista do produto -- podia navegar para `http://192.168.1.1/`
+    /// ou para qualquer outro host da rede, e o handler deixava passar.
+    #[test]
+    fn typed_local_url_authorizes_only_its_own_origin() {
+        let typed = "http://192.168.1.50:3000";
+
+        assert!(remote_web_target(
+            "http://192.168.1.50:3000/painel",
+            Some(typed)
+        ));
+        assert!(!remote_web_target(
+            "view-source:http://192.168.1.50:3000/painel",
+            None
+        ));
+        assert!(is_view_source_target(
+            "view-source:http://192.168.1.50:3000/painel",
+            Some(typed)
+        ));
+
+        // O pivot: outro host da mesma rede local.
+        assert!(
+            !remote_web_target("http://192.168.1.1/admin", Some(typed)),
+            "outro host local nao esta autorizado"
+        );
+        assert!(
+            !remote_web_target("http://127.0.0.1:8080/", Some(typed)),
+            "loopback nao esta autorizado"
+        );
+        assert!(
+            !is_view_source_target("view-source:http://192.168.1.1/admin", Some(typed)),
+            "view-source nao contorna a mesma regra"
+        );
+
+        // Outra porta e outra origem.
+        assert!(!remote_web_target("http://192.168.1.50:9000/", Some(typed)));
+
+        // Sem autorizacao nenhuma, nada local passa; a web publica passa sempre.
+        assert!(!remote_web_target("http://192.168.1.50:3000/", None));
+        assert!(remote_web_target("https://example.com/x", None));
+        assert!(remote_web_target("https://example.com/x", Some(typed)));
+    }
+
     /// O divisor do comparador tem de aceitar o rato.
     ///
     /// A classe STATIC responde `HTTRANSPARENT` ao `WM_NCHITTEST` quando nao
@@ -8717,37 +8788,40 @@ mod tests {
 
     #[test]
     fn remote_navigation_cannot_pivot_into_private_network() {
-        assert!(remote_web_target("https://example.com/a", false));
-        assert!(!remote_web_target("http://127.0.0.1:8000/", false));
-        assert!(!remote_web_target("http://192.168.1.1/", false));
-        assert!(remote_web_target("http://127.0.0.1:8000/", true));
+        assert!(remote_web_target("https://example.com/a", None));
+        assert!(!remote_web_target("http://127.0.0.1:8000/", None));
+        assert!(!remote_web_target("http://192.168.1.1/", None));
+        assert!(remote_web_target(
+            "http://127.0.0.1:8000/",
+            Some("http://127.0.0.1:8000")
+        ));
     }
 
     #[test]
     fn view_source_follows_the_surface_network_policy() {
         assert!(is_view_source_target(
             "view-source:https://example.com/a?b=c",
-            false
+            None
         ));
         assert!(is_view_source_target(
             "view-source:http://example.com/",
-            false
+            None
         ));
         assert!(!is_view_source_target(
             "view-source:http://127.0.0.1:8000/",
-            false
+            None
         ));
         assert!(is_view_source_target(
             "view-source:http://127.0.0.1:8000/",
-            true
+            Some("http://127.0.0.1:8000")
         ));
         assert!(!is_view_source_target(
             "view-source:http://192.168.1.1/",
-            false
+            None
         ));
         assert!(!is_view_source_target(
             "view-source:http://neuralia-pdf.localhost/viewer.html",
-            false
+            None
         ));
 
         // So URL web por baixo: nada de about:, file:, javascript:, credenciais
@@ -8763,10 +8837,16 @@ mod tests {
             "https://example.com/",
             "VIEW-SOURCE:https://example.com/",
         ] {
-            assert!(!is_view_source_target(target, true), "{target}");
+            assert!(
+                !is_view_source_target(target, Some("http://127.0.0.1:8000")),
+                "{target}"
+            );
         }
         // O pedido por script da pagina continua a nao ser navegacao web.
-        assert!(!remote_web_target("view-source:https://example.com/", true));
+        assert!(!remote_web_target(
+            "view-source:https://example.com/",
+            Some("http://127.0.0.1:8000")
+        ));
     }
 
     #[test]
