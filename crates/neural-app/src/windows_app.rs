@@ -9885,6 +9885,8 @@ mod tests {
             ("/pdf.worker.mjs", false, "text/javascript", 200),
             ("/document.pdf", false, "application/pdf", 200),
             ("/wasm/openjpeg.wasm", false, "application/wasm", 200),
+            ("/wasm/jbig2.wasm", false, "application/wasm", 200),
+            ("/wasm/qcms_bg.wasm", false, "application/wasm", 200),
             (
                 "/wasm/openjpeg_nowasm_fallback.js",
                 false,
@@ -9968,6 +9970,7 @@ mod tests {
             "wasmUrl: './wasm/'",
             "iccUrl: './icc/'",
             "useWasm: true",
+            "useWorkerFetch: true",
         ] {
             assert!(viewer.contains(setting), "configuração ausente: {setting}");
         }
