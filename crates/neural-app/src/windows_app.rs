@@ -18,7 +18,9 @@ use image::RgbaImage;
 
 #[cfg(test)]
 use crate::ipc::constant_time_eq;
-use crate::ipc::{IpcAction, parse_ipc_message};
+use crate::ipc::{
+    IpcAction, PDF_TEXT_MAX_CHARS_PER_PAGE, PDF_TEXT_MAX_PAGES, parse_ipc_message,
+};
 use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentRuntimeConfig,
     AgentSecurityAction, CoreConfig, FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent,
@@ -112,6 +114,10 @@ enum UserEvent {
     MemoryCleared(Result<(), String>),
     ResearchAnswer {
         source_index: usize,
+        text: String,
+    },
+    PdfPageText {
+        page: u32,
         text: String,
     },
     AgentObservation(ObservedPage),
@@ -2638,6 +2644,9 @@ struct App {
     document: DocumentWorker,
     /// Os bytes do PDF aberto, servidos ao visualizador pela origem propria.
     pdf_bytes: Arc<Mutex<Vec<u8>>>,
+    /// URL original do PDF atualmente visivel; eventos tardios de outro viewer
+    /// sao ignorados quando esta origem deixa de estar ativa.
+    active_pdf_url: Option<String>,
     surface: Surface,
     navigation_generation: Arc<AtomicU64>,
     status: Option<String>,
@@ -2683,6 +2692,7 @@ impl App {
         Self {
             document,
             pdf_bytes: Arc::new(Mutex::new(Vec::new())),
+            active_pdf_url: None,
             proxy,
             window: None,
             webview: None,
@@ -3020,6 +3030,7 @@ impl App {
         if let Ok(mut bytes) = self.pdf_bytes.lock() {
             *bytes = Vec::new();
         }
+        self.active_pdf_url = None;
         self.reading_pdf = false;
     }
 
@@ -3373,17 +3384,27 @@ impl App {
         let capability = remote_capability();
         let ipc_capability = capability.clone();
         let init_script = NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", &capability);
+        let text_bridge = PDF_TEXT_BRIDGE_SCRIPT.replace("__NEURALIA_CAP__", &capability);
 
         WebViewBuilder::new()
             .with_custom_protocol("neuralia-pdf".to_string(), move |_id, request| {
                 serve_pdf_asset(&bytes, &request)
             })
             .with_initialization_script(init_script)
+            .with_initialization_script(text_bridge)
             .with_ipc_handler(move |request| {
-                if let Some(action) =
+                let Some(action) =
                     parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
-                    && let Some(event) = common_ipc_event(action)
-                {
+                else {
+                    return;
+                };
+                let event = match action {
+                    IpcAction::PdfPageText { page, text } => {
+                        Some(UserEvent::PdfPageText { page, text })
+                    }
+                    other => common_ipc_event(other),
+                };
+                if let Some(event) = event {
                     let _ = ipc_proxy.send_event(event);
                 }
             })
@@ -3427,6 +3448,7 @@ impl App {
                 let _ = webview.zoom(self.zoom);
                 self.webview = Some(webview);
                 self.surface = Surface::Pdf;
+                self.active_pdf_url = Some(url.to_string());
                 self.record(HistoryKind::Read, url.to_string(), url.to_string());
                 let mut document = MemoryDocument::new(
                     MemoryKind::Source,
@@ -3449,6 +3471,39 @@ impl App {
                 self.show_native_error(format!("WebView2 não pôde abrir o PDF: {error}"));
             }
         }
+    }
+
+    fn capture_pdf_page_text(&mut self, page: u32, text: String) {
+        if self.surface != Surface::Pdf || !(1..=PDF_TEXT_MAX_PAGES).contains(&page) {
+            return;
+        }
+        let Some(url) = self.active_pdf_url.clone() else {
+            return;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let text = text
+            .chars()
+            .take(PDF_TEXT_MAX_CHARS_PER_PAGE)
+            .collect::<String>();
+        let base_title = Url::parse(&url)
+            .ok()
+            .and_then(|parsed| parsed.path_segments()?.next_back().map(str::to_string))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "Documento PDF".to_string());
+        let mut document = MemoryDocument::new(
+            MemoryKind::Source,
+            MemorySourceKind::Pdf,
+            format!("{base_title} · página {page}"),
+            Some(url),
+            format!("Página {page}\n\n{text}"),
+        );
+        if let Some(session) = &self.current_research {
+            document = document.session(session.id.clone());
+        }
+        self.memory.capture(document);
     }
 
     fn record(&self, kind: HistoryKind, input: String, target: String) {
@@ -7079,6 +7134,9 @@ impl ApplicationHandler<UserEvent> for App {
                     self.memory.save_session(session.clone());
                 }
             }
+            UserEvent::PdfPageText { page, text } => {
+                self.capture_pdf_page_text(page, text);
+            }
             UserEvent::AgentObservation(page) => {
                 self.handle_agent_observation(page);
             }
@@ -8626,6 +8684,26 @@ const PDF_VIEWER_CSP: &str = "default-src 'none'; script-src 'self' blob: 'wasm-
 const PDF_MAX_BYTES: usize = 32 * 1024 * 1024;
 const PDF_TIMEOUT_SECS: u64 = 90;
 
+/// Ponte minima do viewer interno para a memoria. Ela so reporta texto de uma
+/// pagina; nao expoe o dispatcher generico de acoes do navegador.
+const PDF_TEXT_BRIDGE_SCRIPT: &str = r#"
+(function () {
+  if (window.top !== window) return;
+  const capability = '__NEURALIA_CAP__';
+  const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
+  const stringify = JSON.stringify;
+  window.__neuralia_pdf_page_text = function (page, text) {
+    if (!Number.isInteger(page) || page < 1 || page > 24) return;
+    if (typeof text !== 'string') return;
+    text = text.trim();
+    if (!text) return;
+    if (text.length > 1500) text = text.slice(0, 1500);
+    post(stringify({ v:1, cap:capability, action:'pdf-page-text', args:{ page, text } }));
+  };
+})();
+"#;
+
+
 static LOGO_IMAGE: OnceLock<RgbaImage> = OnceLock::new();
 static BRAND_IMAGE: OnceLock<RgbaImage> = OnceLock::new();
 static SPLASH_CACHE: Mutex<SplashCache> = Mutex::new(None);
@@ -9958,6 +10036,14 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn spec_0110_pdf_text_bridge_is_specific_and_bounded() {
+        assert!(PDF_TEXT_BRIDGE_SCRIPT.contains("action:'pdf-page-text'"));
+        assert!(PDF_TEXT_BRIDGE_SCRIPT.contains("page > 24"));
+        assert!(PDF_TEXT_BRIDGE_SCRIPT.contains("text.length > 1500"));
+        assert!(!PDF_TEXT_BRIDGE_SCRIPT.contains("__neuralia_act"));
     }
 
     #[test]

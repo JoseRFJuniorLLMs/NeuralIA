@@ -5,7 +5,7 @@ const viewerModule =
   process.env.NEURALIA_PDF_VIEWER_MODULE ||
   new URL('../assets/pdfjs/viewer.mjs', import.meta.url).href;
 
-const { describeLoadError, hideStatus, showStatus } = await import(viewerModule);
+const { describeLoadError, hideStatus, plainTextFromTextContent, showStatus } = await import(viewerModule);
 
 let passed = 0;
 
@@ -55,6 +55,23 @@ test('unknown parser failure is not mislabeled as network', () => {
     describeLoadError(err),
     'Este ficheiro não é um PDF que eu consiga abrir: bad object stream'
   );
+});
+
+test('PDF text extraction preserves reading order and hard bounds', () => {
+  const content = {
+    items: [
+      { str: 'Primeira linha', hasEOL: true },
+      { str: 'Segunda', hasEOL: false },
+      { str: 'linha', hasEOL: true },
+      { str: 'Fim', hasEOL: false }
+    ]
+  };
+  assert.equal(
+    plainTextFromTextContent(content, 200),
+    'Primeira linha\nSegunda linha\nFim'
+  );
+  assert.equal(plainTextFromTextContent(content, 12).length, 12);
+  assert.equal(plainTextFromTextContent({ items: [] }, 200), '');
 });
 
 test('hideStatus defeats author CSS display:grid', () => {
