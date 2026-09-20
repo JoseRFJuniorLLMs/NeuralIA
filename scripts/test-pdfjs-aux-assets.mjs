@@ -84,7 +84,7 @@ async function requireDecodedImages(page, operators, caseName) {
 const cases = [
   ['jpx', 'bug_jpx.pdf'],
   ['jbig2', 'jbig2_file_header.pdf'],
-  ['cid-cmap', 'arial_unicode_ab_cidfont.pdf'],
+  ['cid-cmap', 'issue16176.pdf'],
   ['standard-fonts', 'standard_fonts.pdf'],
   ['cmyk', 'cmykjpeg.pdf'],
 ];
