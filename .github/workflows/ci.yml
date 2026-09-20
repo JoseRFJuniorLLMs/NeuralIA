@@ -106,11 +106,25 @@ jobs:
           $cert = $null
 
           try {
+            Write-Host "[authenticode-ci] generating ephemeral code-signing certificate"
             $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=NeuralIA CI Authenticode Test" -CertStoreLocation "Cert:\CurrentUser\My" -KeyExportPolicy Exportable -HashAlgorithm SHA256 -NotAfter (Get-Date).AddDays(1)
+
+            Write-Host "[authenticode-ci] exporting ephemeral certificate"
             Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $securePassword | Out-Null
             Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
-            Import-Certificate -FilePath $cerPath -CertStoreLocation "Cert:\CurrentUser\Root" | Out-Null
-            Import-Certificate -FilePath $cerPath -CertStoreLocation "Cert:\CurrentUser\TrustedPublisher" | Out-Null
+
+            # Import-Certificate into Root can enter an interactive trust path
+            # on a headless runner. certutil -f is explicitly non-interactive.
+            Write-Host "[authenticode-ci] trusting ephemeral root"
+            & certutil.exe -user -f -addstore Root $cerPath | Out-Host
+            if ($LASTEXITCODE -ne 0) {
+              throw "certutil failed to trust the ephemeral Root certificate."
+            }
+            Write-Host "[authenticode-ci] trusting ephemeral publisher"
+            & certutil.exe -user -f -addstore TrustedPublisher $cerPath | Out-Host
+            if ($LASTEXITCODE -ne 0) {
+              throw "certutil failed to trust the ephemeral publisher certificate."
+            }
 
             $env:NEURALIA_AUTHENTICODE_PFX_B64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($pfxPath))
             $env:NEURALIA_AUTHENTICODE_PFX_PASSWORD = $plainPassword
@@ -118,6 +132,7 @@ jobs:
             # CI proves our signing/verification path without depending on an
             # external timestamp authority. Stable release omits -SkipTimestamp
             # and therefore still requires an RFC3161 timestamp.
+            Write-Host "[authenticode-ci] building and signing installer"
             ./scripts/build-windows-installer.ps1 -ExePath ci-tested/NeuralIA.exe -Version $version -OutputDir signed-ci-installer -Sign -SkipTimestamp
             $installer = Get-ChildItem signed-ci-installer -Filter "NeuralIA-Setup-*-x64.exe" -File | Select-Object -First 1
             if (-not $installer) { throw "Signed CI installer was not produced." }
