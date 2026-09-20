@@ -180,6 +180,9 @@ const TITLE_TAB_HEIGHT: f64 = 32.0;
 const TOP_BAR_HEIGHT: f64 = 44.0;
 const COMPARATOR_CHROME_HEIGHT: f64 = TITLE_TAB_HEIGHT + TOP_BAR_HEIGHT;
 const MAX_VISIBLE_CONTEXT_TABS: usize = 3;
+/// Cada aba visivel pode arrastar consigo a pilula do seu grupo, e um grupo
+/// fechado ocupa um lugar sem mostrar abas nenhumas -- dai o dobro.
+const MAX_VISIBLE_TAB_SLOTS: usize = MAX_VISIBLE_CONTEXT_TABS * 2;
 const COMPARATOR_COLUMNS: usize = 3;
 /// Intervalo da rolagem automatica de leitura, do primeiro avanco ao ultimo.
 const AUTO_SCROLL_SECONDS: u64 = 30;
@@ -358,6 +361,11 @@ enum BarHit {
         source_index: usize,
         context_index: usize,
     },
+    /// A pilula de um grupo. O indice e o do grupo dentro da coluna.
+    ContextGroup {
+        source_index: usize,
+        group_index: usize,
+    },
     SplitExpand,
     SplitClose,
     Private,
@@ -410,6 +418,10 @@ struct BarLayout {
     context_tabs: [[UiRect; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
     context_indices: [[usize; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
     context_tab_counts: [usize; COMPARATOR_COLUMNS],
+    /// Pilulas dos grupos, intercaladas com as abas na mesma fila.
+    group_pills: [[UiRect; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS],
+    group_pill_indices: [[usize; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS],
+    group_pill_counts: [usize; COMPARATOR_COLUMNS],
     columns_len: usize,
     window_minimize: UiRect,
     window_maximize: UiRect,
@@ -428,12 +440,31 @@ impl BarLayout {
         )
     }
 
+    /// Atalho para quem so sabe quantas abas tem cada coluna: nenhuma delas
+    /// esta agrupada.
+    #[cfg(test)]
     fn with_contexts(
         client_width: f64,
         scale: f64,
         visible: bool,
         columns: BarColumns,
         context_counts: [usize; COMPARATOR_COLUMNS],
+    ) -> Self {
+        Self::with_rows(
+            client_width,
+            scale,
+            visible,
+            columns,
+            std::array::from_fn(|index| TabRow::plain(context_counts[index])),
+        )
+    }
+
+    fn with_rows(
+        client_width: f64,
+        scale: f64,
+        visible: bool,
+        columns: BarColumns,
+        rows: [TabRow; COMPARATOR_COLUMNS],
     ) -> Self {
         let scale = scale.max(1.0);
         let empty = UiRect {
@@ -453,6 +484,9 @@ impl BarLayout {
                 context_tabs: [[empty; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
                 context_indices: [[0; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
                 context_tab_counts: [0; COMPARATOR_COLUMNS],
+                group_pills: [[empty; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS],
+                group_pill_indices: [[0; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS],
+                group_pill_counts: [0; COMPARATOR_COLUMNS],
                 columns_len: 0,
                 window_minimize: empty,
                 window_maximize: empty,
@@ -497,6 +531,9 @@ impl BarLayout {
         let mut tabs = [[empty; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS];
         let mut tab_indices = [[0usize; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS];
         let mut tab_counts = [0usize; COMPARATOR_COLUMNS];
+        let mut pills = [[empty; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS];
+        let mut pill_indices = [[0usize; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS];
+        let mut pill_counts = [0usize; COMPARATOR_COLUMNS];
         let columns_len = columns.count.min(COMPARATOR_COLUMNS);
 
         // Linha dos provedores, agora livre das abas. As faixas vem da MESMA
@@ -594,31 +631,68 @@ impl BarLayout {
         // Linha superior: todas as fontes/abas, antes dos controles da janela.
         let tabs_left = 90.0 * scale;
         let tabs_right = (window_minimize.x - 8.0 * scale).max(tabs_left);
-        let desired: [usize; COMPARATOR_COLUMNS] =
-            std::array::from_fn(|index| context_counts[index].min(MAX_VISIBLE_CONTEXT_TABS));
-        let total_tabs: usize = desired.iter().sum();
-        if total_tabs > 0 && tabs_right > tabs_left {
+        let visible_rows = &rows[..columns_len];
+        let total_slots: usize = visible_rows.iter().map(|row| row.len).sum();
+        let total_pills: usize = visible_rows
+            .iter()
+            .map(|row| {
+                row.visible()
+                    .iter()
+                    .filter(|slot| matches!(slot, TabSlot::Group(_)))
+                    .count()
+            })
+            .sum();
+        let total_tabs = total_slots - total_pills;
+        if total_slots > 0 && tabs_right > tabs_left {
             let gap = 3.0 * scale;
-            let usable = tabs_right - tabs_left - gap * total_tabs.saturating_sub(1) as f64;
-            let tab_width = (usable / total_tabs as f64).clamp(56.0 * scale, 156.0 * scale);
+            // A pilula do grupo leva largura fixa: e um rotulo, nao um titulo
+            // de pagina. O que sobra e das abas.
+            let pill_width = 74.0 * scale;
+            let spent =
+                gap * total_slots.saturating_sub(1) as f64 + pill_width * total_pills as f64;
+            let usable = tabs_right - tabs_left - spent;
+            let tab_width = if total_tabs == 0 {
+                0.0
+            } else {
+                (usable / total_tabs as f64).clamp(56.0 * scale, 156.0 * scale)
+            };
             let mut x = tabs_left;
+            let tab_y = 3.0 * scale;
+            let tab_h = (title_h - 6.0 * scale).max(20.0 * scale);
 
             for index in 0..columns_len {
-                let count = desired[index];
-                let first_context = context_counts[index].saturating_sub(count);
-                for visual in 0..count {
+                for slot in rows[index].visible().iter().copied() {
                     if x + 28.0 * scale > tabs_right {
                         break;
                     }
-                    let width = tab_width.min(tabs_right - x).max(28.0 * scale);
-                    tabs[index][visual] = UiRect {
-                        x,
-                        y: 3.0 * scale,
-                        width,
-                        height: (title_h - 6.0 * scale).max(20.0 * scale),
+                    let desired = match slot {
+                        TabSlot::Group(_) => pill_width,
+                        TabSlot::Tab(_) => tab_width,
                     };
-                    tab_indices[index][visual] = first_context + visual;
-                    tab_counts[index] += 1;
+                    let width = desired.min(tabs_right - x).max(28.0 * scale);
+                    let rect = UiRect {
+                        x,
+                        y: tab_y,
+                        width,
+                        height: tab_h,
+                    };
+                    match slot {
+                        TabSlot::Group(group) => {
+                            let visual = pill_counts[index];
+                            pills[index][visual] = rect;
+                            pill_indices[index][visual] = group;
+                            pill_counts[index] += 1;
+                        }
+                        TabSlot::Tab(context) => {
+                            let visual = tab_counts[index];
+                            if visual >= MAX_VISIBLE_CONTEXT_TABS {
+                                continue;
+                            }
+                            tabs[index][visual] = rect;
+                            tab_indices[index][visual] = context;
+                            tab_counts[index] += 1;
+                        }
+                    }
                     x += width + gap;
                 }
             }
@@ -634,6 +708,9 @@ impl BarLayout {
             context_tabs: tabs,
             context_indices: tab_indices,
             context_tab_counts: tab_counts,
+            group_pills: pills,
+            group_pill_indices: pill_indices,
+            group_pill_counts: pill_counts,
             columns_len,
             window_minimize,
             window_maximize,
@@ -655,6 +732,14 @@ impl BarLayout {
             return Some(BarHit::WindowMinimize);
         }
         for index in 0..self.columns_len {
+            for visual in 0..self.group_pill_counts[index] {
+                if self.group_pills[index][visual].contains(x, y) {
+                    return Some(BarHit::ContextGroup {
+                        source_index: index,
+                        group_index: self.group_pill_indices[index][visual],
+                    });
+                }
+            }
             for visual in 0..self.context_tab_counts[index] {
                 if self.context_tabs[index][visual].contains(x, y) {
                     return Some(BarHit::ContextTab {
@@ -745,6 +830,233 @@ struct SplitView {
     private: bool,
 }
 
+/// As cores que um grupo de abas pode ter. Poucas e nomeadas: uma paleta
+/// aberta obrigaria a um seletor, e o que se quer e distinguir grupos de
+/// relance, nao escolher tons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupColor {
+    Blue,
+    Green,
+    Amber,
+    Pink,
+    Purple,
+    Slate,
+}
+
+impl GroupColor {
+    const ALL: [Self; 6] = [
+        Self::Blue,
+        Self::Green,
+        Self::Amber,
+        Self::Pink,
+        Self::Purple,
+        Self::Slate,
+    ];
+
+    fn rgb(self) -> Rgb {
+        match self {
+            Self::Blue => (66, 133, 244),
+            Self::Green => (52, 168, 83),
+            Self::Amber => (244, 180, 0),
+            Self::Pink => (233, 30, 99),
+            Self::Purple => (156, 39, 176),
+            Self::Slate => (96, 125, 139),
+        }
+    }
+
+    /// A proxima cor por usar numa coluna, para dois grupos seguidos nao
+    /// nascerem iguais.
+    fn next(used: &[Self]) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|color| !used.contains(color))
+            .unwrap_or(Self::Blue)
+    }
+}
+
+/// Um grupo de abas na barra de titulo: nome, cor e se esta fechado.
+#[derive(Debug, Clone)]
+struct ContextGroup {
+    id: u64,
+    name: String,
+    color: GroupColor,
+    collapsed: bool,
+}
+
+/// Uma aba de contexto. O `group` e o id do grupo, nao um indice: fechar um
+/// grupo no meio nao pode renumerar as abas dos outros.
+#[derive(Debug, Clone)]
+struct ContextTab {
+    url: String,
+    group: Option<u64>,
+}
+
+/// Um lugar na fila de abas de uma coluna: ou a pilula de um grupo, ou uma aba.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabSlot {
+    /// Indice do grupo dentro de `groups` daquela coluna.
+    Group(usize),
+    /// Indice da aba dentro de `contexts` daquela coluna.
+    Tab(usize),
+}
+
+/// A fila visivel de uma coluna, ja cortada ao que cabe na barra.
+#[derive(Debug, Clone, Copy)]
+struct TabRow {
+    slots: [TabSlot; MAX_VISIBLE_TAB_SLOTS],
+    len: usize,
+}
+
+impl TabRow {
+    fn empty() -> Self {
+        Self {
+            slots: [TabSlot::Tab(0); MAX_VISIBLE_TAB_SLOTS],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, slot: TabSlot) {
+        if self.len < MAX_VISIBLE_TAB_SLOTS {
+            self.slots[self.len] = slot;
+            self.len += 1;
+        }
+    }
+
+    fn visible(&self) -> &[TabSlot] {
+        &self.slots[..self.len]
+    }
+
+    /// Uma coluna sem grupo nenhum: as ultimas abas, como era antes de existirem
+    /// grupos. Serve os chamadores que so sabem contar abas.
+    #[cfg(test)]
+    fn plain(count: usize) -> Self {
+        let mut row = Self::empty();
+        let shown = count.min(MAX_VISIBLE_CONTEXT_TABS);
+        for offset in 0..shown {
+            row.push(TabSlot::Tab(count - shown + offset));
+        }
+        row
+    }
+}
+
+/// Decide o que aparece na barra de uma coluna: a pilula de cada grupo antes da
+/// sua primeira aba, as abas de um grupo fechado escondidas, e o resto cortado
+/// pelo fim -- as abas recentes ficam, as antigas saem.
+///
+/// Duas invariantes que os testes prendem: uma aba cujo grupo ja nao existe
+/// volta a ser solta em vez de desaparecer, e nunca sobra uma aba agrupada sem
+/// a pilula do seu grupo a acompanha-la.
+fn plan_tab_row(tabs: &[ContextTab], groups: &[ContextGroup]) -> TabRow {
+    let group_of = |index: usize| -> Option<usize> {
+        tabs.get(index)
+            .and_then(|tab| tab.group)
+            .and_then(|id| groups.iter().position(|group| group.id == id))
+    };
+
+    let mut full: Vec<TabSlot> = Vec::new();
+    let mut billed: Vec<usize> = Vec::new();
+    for index in 0..tabs.len() {
+        if let Some(group) = group_of(index) {
+            if !billed.contains(&group) {
+                billed.push(group);
+                full.push(TabSlot::Group(group));
+            }
+            if groups[group].collapsed {
+                continue;
+            }
+        }
+        full.push(TabSlot::Tab(index));
+    }
+
+    // Janela deslizante a contar do fim: para quando estoirar o numero de
+    // lugares ou o numero de abas.
+    let mut start = full.len();
+    let mut tabs_kept = 0usize;
+    while start > 0 {
+        let candidate = start - 1;
+        let is_tab = matches!(full[candidate], TabSlot::Tab(_));
+        if is_tab && tabs_kept == MAX_VISIBLE_CONTEXT_TABS {
+            break;
+        }
+        if full.len() - candidate > MAX_VISIBLE_TAB_SLOTS {
+            break;
+        }
+        if is_tab {
+            tabs_kept += 1;
+        }
+        start = candidate;
+    }
+
+    // A pilula vem sempre antes das suas abas. Se o corte caiu no meio de um
+    // grupo, a pilula ficou de fora -- desce-se ate a proxima pilula ou ate
+    // uma aba solta, em vez de mostrar orfas.
+    while start < full.len() {
+        match full[start] {
+            TabSlot::Group(_) => break,
+            TabSlot::Tab(index) if group_of(index).is_none() => break,
+            TabSlot::Tab(_) => start += 1,
+        }
+    }
+
+    let mut row = TabRow::empty();
+    for slot in full[start..].iter().copied() {
+        row.push(slot);
+    }
+    row
+}
+
+/// Cria um grupo com a aba indicada e devolve o indice do grupo novo. O nome
+/// sai do host da aba -- um grupo sem nome nao diz nada a ninguem.
+fn create_context_group(
+    tabs: &mut [ContextTab],
+    groups: &mut Vec<ContextGroup>,
+    next_id: &mut u64,
+    tab_index: usize,
+) -> Option<usize> {
+    let name = context_tab_label(&tabs.get(tab_index)?.url);
+    let used: Vec<GroupColor> = groups.iter().map(|group| group.color).collect();
+    let id = *next_id;
+    *next_id += 1;
+    groups.push(ContextGroup {
+        id,
+        name,
+        color: GroupColor::next(&used),
+        collapsed: false,
+    });
+    tabs[tab_index].group = Some(id);
+    Some(groups.len() - 1)
+}
+
+/// Poe a aba no grupo e encosta-a ao ultimo membro: os membros de um grupo tem
+/// de ficar juntos na barra, senao a pilula fica a rotular abas que nao sao
+/// dela.
+fn join_context_group(tabs: &mut Vec<ContextTab>, group_id: u64, tab_index: usize) {
+    if tab_index >= tabs.len() {
+        return;
+    }
+    let mut tab = tabs.remove(tab_index);
+    tab.group = Some(group_id);
+    let target = tabs
+        .iter()
+        .rposition(|other| other.group == Some(group_id))
+        .map(|last| last + 1)
+        .unwrap_or(tabs.len());
+    tabs.insert(target, tab);
+}
+
+/// Tira a aba do grupo. Um grupo que fique sem abas desaparece -- uma pilula
+/// vazia so ocupava espaco e enganava.
+fn leave_context_group(tabs: &mut [ContextTab], groups: &mut Vec<ContextGroup>, tab_index: usize) {
+    if let Some(tab) = tabs.get_mut(tab_index) {
+        tab.group = None;
+    }
+    prune_empty_groups(tabs, groups);
+}
+
+fn prune_empty_groups(tabs: &[ContextTab], groups: &mut Vec<ContextGroup>) {
+    groups.retain(|group| tabs.iter().any(|tab| tab.group == Some(group.id)));
+}
+
 struct ComparatorState {
     views: Vec<ComparatorView>,
     expanded: Option<usize>,
@@ -752,7 +1064,11 @@ struct ComparatorState {
     weights: [f64; COMPARATOR_COLUMNS],
     split: Option<SplitView>,
     /// Abas/fontes agrupadas automaticamente pela IA que abriu cada link.
-    contexts: [Vec<String>; COMPARATOR_COLUMNS],
+    contexts: [Vec<ContextTab>; COMPARATOR_COLUMNS],
+    /// Grupos por coluna, na ordem em que aparecem na barra.
+    groups: [Vec<ContextGroup>; COMPARATOR_COLUMNS],
+    /// Contador dos ids de grupo. Nunca reutiliza.
+    next_group_id: u64,
 }
 
 /// Janelas da palette nativa: o popup que desenha a caixa e o EDIT onde o
@@ -956,6 +1272,10 @@ const TAB_MENU_FULLSCREEN: usize = 2;
 const TAB_MENU_CLOSE: usize = 3;
 const TAB_MENU_CLOSE_OTHERS: usize = 4;
 const TAB_MENU_CLOSE_ALL: usize = 5;
+const TAB_MENU_NEW_GROUP: usize = 6;
+const TAB_MENU_UNGROUP: usize = 7;
+/// Os grupos ja existentes ocupam ids a partir daqui, um por grupo da coluna.
+const TAB_MENU_GROUP_BASE: usize = 100;
 const SPLITTER_SUBCLASS_BASE: usize = 0x4E60;
 const SPLITTER_WIDTH: f64 = 7.0;
 const MIN_PANEL_WIDTH: f64 = 180.0;
@@ -3644,6 +3964,8 @@ impl App {
             weights: [1.0; COMPARATOR_COLUMNS],
             split: None,
             contexts: std::array::from_fn(|_| Vec::new()),
+            groups: std::array::from_fn(|_| Vec::new()),
+            next_group_id: 1,
         });
         self.bar_hover = None;
         self.surface = Surface::Comparator;
@@ -4163,8 +4485,11 @@ impl App {
                     if !private {
                         let links = &mut comp.contexts[source_index];
                         let value = valid.to_string();
-                        if links.last() != Some(&value) {
-                            links.push(value);
+                        if links.last().map(|tab| tab.url.as_str()) != Some(value.as_str()) {
+                            links.push(ContextTab {
+                                url: value,
+                                group: None,
+                            });
                             if links.len() > 32 {
                                 links.remove(0);
                             }
@@ -5041,12 +5366,14 @@ impl App {
         let (Some(window), Some(comp)) = (&self.window, &self.comparator) else {
             return None;
         };
-        Some(BarLayout::with_contexts(
+        // O mesmo plano que o desenho usa. Se aqui se contassem so as abas, o
+        // rato acertaria noutro sitio que nao o que esta no ecra.
+        Some(BarLayout::with_rows(
             window.inner_size().width as f64,
             window.scale_factor(),
             self.bar_visible(),
             bar_columns(comp),
-            std::array::from_fn(|index| comp.contexts[index].len()),
+            std::array::from_fn(|index| plan_tab_row(&comp.contexts[index], &comp.groups[index])),
         ))
     }
 
@@ -5684,7 +6011,7 @@ impl App {
             .as_ref()
             .and_then(|comp| comp.contexts.get(source_index))
             .and_then(|tabs| tabs.get(context_index))
-            .cloned()
+            .map(|tab| tab.url.clone())
     }
 
     fn open_context_tab(&mut self, source_index: usize, context_index: usize) {
@@ -5717,10 +6044,65 @@ impl App {
             self.close_split();
         }
         if let Some(comp) = &mut self.comparator
-            && let Some(tabs) = comp.contexts.get_mut(source_index)
-            && context_index < tabs.len()
+            && context_index < comp.contexts[source_index].len()
         {
-            tabs.remove(context_index);
+            comp.contexts[source_index].remove(context_index);
+            prune_empty_groups(&comp.contexts[source_index], &mut comp.groups[source_index]);
+        }
+        self.request_redraw();
+    }
+
+    /// Um clique na pilula abre ou fecha o grupo. Fechado, as abas continuam
+    /// abertas -- so deixam de ocupar a barra.
+    fn toggle_context_group(&mut self, source_index: usize, group_index: usize) {
+        if let Some(comp) = &mut self.comparator
+            && let Some(group) = comp
+                .groups
+                .get_mut(source_index)
+                .and_then(|groups| groups.get_mut(group_index))
+        {
+            group.collapsed = !group.collapsed;
+        }
+        self.request_redraw();
+    }
+
+    fn group_context_tab(&mut self, source_index: usize, context_index: usize) {
+        if let Some(comp) = &mut self.comparator {
+            let next_id = &mut comp.next_group_id;
+            create_context_group(
+                &mut comp.contexts[source_index],
+                &mut comp.groups[source_index],
+                next_id,
+                context_index,
+            );
+        }
+        self.request_redraw();
+    }
+
+    fn join_context_tab_group(
+        &mut self,
+        source_index: usize,
+        context_index: usize,
+        group_index: usize,
+    ) {
+        if let Some(comp) = &mut self.comparator
+            && let Some(id) = comp.groups[source_index]
+                .get(group_index)
+                .map(|group| group.id)
+        {
+            join_context_group(&mut comp.contexts[source_index], id, context_index);
+            prune_empty_groups(&comp.contexts[source_index], &mut comp.groups[source_index]);
+        }
+        self.request_redraw();
+    }
+
+    fn ungroup_context_tab(&mut self, source_index: usize, context_index: usize) {
+        if let Some(comp) = &mut self.comparator {
+            leave_context_group(
+                &mut comp.contexts[source_index],
+                &mut comp.groups[source_index],
+                context_index,
+            );
         }
         self.request_redraw();
     }
@@ -5740,8 +6122,13 @@ impl App {
         if let Some(comp) = &mut self.comparator
             && let Some(tabs) = comp.contexts.get_mut(source_index)
         {
+            // A aba que fica mantem o grupo a que pertencia.
+            let group = tabs
+                .iter()
+                .find(|tab| tab.url == keep)
+                .and_then(|tab| tab.group);
             tabs.clear();
-            tabs.push(keep);
+            tabs.push(ContextTab { url: keep, group });
         }
         self.request_redraw();
     }
@@ -5779,6 +6166,23 @@ impl App {
             return;
         };
 
+        // Lidos antes de abrir o menu: dentro do bloco `unsafe` ja nao ha
+        // emprestimo do estado que sobreviva ao `TrackPopupMenu`.
+        let (existing_groups, in_group) = self
+            .comparator
+            .as_ref()
+            .map(|comp| {
+                let names: Vec<String> = comp.groups[source_index]
+                    .iter()
+                    .map(|group| group.name.clone())
+                    .collect();
+                let member = comp.contexts[source_index]
+                    .get(context_index)
+                    .is_some_and(|tab| tab.group.is_some());
+                (names, member)
+            })
+            .unwrap_or_default();
+
         let command = unsafe {
             let menu = CreatePopupMenu();
             if menu.is_null() {
@@ -5800,6 +6204,27 @@ impl App {
                 close_others.as_ptr(),
             );
             AppendMenuW(menu, MF_STRING, TAB_MENU_CLOSE_ALL, close_all.as_ptr());
+            AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+            let new_group = wide_null("Novo grupo com esta aba");
+            AppendMenuW(menu, MF_STRING, TAB_MENU_NEW_GROUP, new_group.as_ptr());
+            // As entradas "juntar a" tem de sobreviver ao fim do bloco, senao
+            // o Win32 le ponteiros ja libertados enquanto desenha o menu.
+            let join_labels: Vec<Vec<u16>> = existing_groups
+                .iter()
+                .map(|name| wide_null(&format!("Juntar ao grupo \u{201C}{name}\u{201D}")))
+                .collect();
+            for (offset, label) in join_labels.iter().enumerate() {
+                AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    TAB_MENU_GROUP_BASE + offset,
+                    label.as_ptr(),
+                );
+            }
+            if in_group {
+                let ungroup = wide_null("Remover do grupo");
+                AppendMenuW(menu, MF_STRING, TAB_MENU_UNGROUP, ungroup.as_ptr());
+            }
 
             let mut point = windows_sys::Win32::Foundation::POINT {
                 x: self.cursor.0.round() as i32,
@@ -5825,6 +6250,14 @@ impl App {
             TAB_MENU_CLOSE => self.close_context_tab(source_index, context_index),
             TAB_MENU_CLOSE_OTHERS => self.close_other_context_tabs(source_index, context_index),
             TAB_MENU_CLOSE_ALL => self.close_all_context_tabs(source_index),
+            TAB_MENU_NEW_GROUP => self.group_context_tab(source_index, context_index),
+            TAB_MENU_UNGROUP => self.ungroup_context_tab(source_index, context_index),
+            other if other >= TAB_MENU_GROUP_BASE => {
+                let group_index = other - TAB_MENU_GROUP_BASE;
+                if group_index < existing_groups.len() {
+                    self.join_context_tab_group(source_index, context_index, group_index);
+                }
+            }
             _ => {}
         }
     }
@@ -5855,6 +6288,10 @@ impl App {
                 source_index,
                 context_index,
             }) => self.open_context_tab(source_index, context_index),
+            Some(BarHit::ContextGroup {
+                source_index,
+                group_index,
+            }) => self.toggle_context_group(source_index, group_index),
             None => {
                 let scale = self
                     .window
@@ -7687,6 +8124,7 @@ fn draw_comparator_bar(
             &names,
             bar_columns(comp),
             &comp.contexts,
+            &comp.groups,
             comp.split.as_ref().map(|split| {
                 (
                     split.source_index,
@@ -7728,7 +8166,8 @@ unsafe fn paint_comparator_bar(
     auto_scroll: bool,
     theme: &Theme,
 ) {
-    let empty: [Vec<String>; COMPARATOR_COLUMNS] = std::array::from_fn(|_| Vec::new());
+    let empty: [Vec<ContextTab>; COMPARATOR_COLUMNS] = std::array::from_fn(|_| Vec::new());
+    let no_groups: [Vec<ContextGroup>; COMPARATOR_COLUMNS] = std::array::from_fn(|_| Vec::new());
     paint_comparator_bar_with_contexts(
         target,
         width,
@@ -7736,6 +8175,7 @@ unsafe fn paint_comparator_bar(
         names,
         BarColumns::even(names.len()),
         &empty,
+        &no_groups,
         None,
         visible,
         hover,
@@ -7751,19 +8191,20 @@ unsafe fn paint_comparator_bar_with_contexts(
     scale: f64,
     names: &[&str],
     columns: BarColumns,
-    contexts: &[Vec<String>; COMPARATOR_COLUMNS],
+    contexts: &[Vec<ContextTab>; COMPARATOR_COLUMNS],
+    groups: &[Vec<ContextGroup>; COMPARATOR_COLUMNS],
     active_context: Option<(usize, &str, bool, bool)>,
     visible: bool,
     hover: Option<BarHit>,
     auto_scroll: bool,
     theme: &Theme,
 ) {
-    let layout = BarLayout::with_contexts(
+    let layout = BarLayout::with_rows(
         width as f64,
         scale,
         visible,
         columns,
-        std::array::from_fn(|index| contexts[index].len()),
+        std::array::from_fn(|index| plan_tab_row(&contexts[index], &groups[index])),
     );
     if !layout.visible {
         return;
@@ -7824,11 +8265,48 @@ unsafe fn paint_comparator_bar_with_contexts(
     // Abas/fontes na mesma faixa dos botoes de janela.
     for (index, source_contexts) in contexts.iter().enumerate().take(layout.columns_len) {
         let brand = theme.brand(index);
-        for visual in 0..layout.context_tab_counts[index] {
-            let context_index = layout.context_indices[index][visual];
-            let Some(url) = source_contexts.get(context_index) else {
+        // A pilula do grupo vem primeiro: a cor e do grupo, nao do provedor, e
+        // o triangulo diz se esta aberto ou fechado.
+        for visual in 0..layout.group_pill_counts[index] {
+            let group_index = layout.group_pill_indices[index][visual];
+            let Some(group) = groups[index].get(group_index) else {
                 continue;
             };
+            let color = group.color.rgb();
+            let hovered = hover
+                == Some(BarHit::ContextGroup {
+                    source_index: index,
+                    group_index,
+                });
+            let fill = mix(theme.bar_bg, color, if hovered { 0.62 } else { 0.42 });
+            let arrow = if group.collapsed {
+                "\u{25B8}"
+            } else {
+                "\u{25BE}"
+            };
+            draw_pill(
+                target,
+                layout.group_pills[index][visual],
+                &format!("{arrow} {}", group.name),
+                PillStyle::new(fill, color, theme.fg_muted),
+                scale,
+                tab_font,
+                theme.bar_bg,
+            );
+        }
+        for visual in 0..layout.context_tab_counts[index] {
+            let context_index = layout.context_indices[index][visual];
+            let Some(tab) = source_contexts.get(context_index) else {
+                continue;
+            };
+            let url = tab.url.as_str();
+            // Uma aba agrupada veste a cor do grupo, nao a do provedor: e assim
+            // que se ve de relance onde acaba um grupo e comeca o outro.
+            let brand = tab
+                .group
+                .and_then(|id| groups[index].iter().find(|group| group.id == id))
+                .map(|group| group.color.rgb())
+                .unwrap_or(brand);
             let active = active_context
                 .is_some_and(|(source, active_url, _, _)| source == index && active_url == url);
             let hovered = hover
@@ -10562,6 +11040,219 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---------- grupos de abas ----------
+
+    fn tab(url: &str, group: Option<u64>) -> ContextTab {
+        ContextTab {
+            url: url.to_string(),
+            group,
+        }
+    }
+
+    fn group(id: u64, collapsed: bool) -> ContextGroup {
+        ContextGroup {
+            id,
+            name: format!("G{id}"),
+            color: GroupColor::Blue,
+            collapsed,
+        }
+    }
+
+    #[test]
+    fn a_collapsed_group_hides_its_tabs_and_keeps_its_pill() {
+        let tabs = vec![
+            tab("https://a.example/1", Some(7)),
+            tab("https://b.example/2", Some(7)),
+            tab("https://c.example/3", None),
+        ];
+        let open = plan_tab_row(&tabs, &[group(7, false)]);
+        assert_eq!(
+            open.visible(),
+            &[
+                TabSlot::Group(0),
+                TabSlot::Tab(0),
+                TabSlot::Tab(1),
+                TabSlot::Tab(2)
+            ]
+        );
+
+        let shut = plan_tab_row(&tabs, &[group(7, true)]);
+        // A pilula fica -- e o unico sitio onde o grupo se reabre. As abas
+        // saem da barra sem deixarem de estar abertas.
+        assert_eq!(shut.visible(), &[TabSlot::Group(0), TabSlot::Tab(2)]);
+    }
+
+    #[test]
+    fn a_tab_whose_group_vanished_stays_on_the_bar_as_a_loose_tab() {
+        // O grupo 7 ja nao existe: a aba tem de voltar a ser solta, nao
+        // desaparecer com ele.
+        let tabs = vec![tab("https://a.example/1", Some(7))];
+        let row = plan_tab_row(&tabs, &[]);
+        assert_eq!(row.visible(), &[TabSlot::Tab(0)]);
+    }
+
+    /// Confirma a invariante em qualquer fila: nenhuma aba agrupada aparece
+    /// sem a pilula do seu grupo antes dela, e o tecto de abas e respeitado.
+    fn assert_no_orphans(row: &TabRow, tabs: &[ContextTab], groups: &[ContextGroup]) {
+        let mut seen: Vec<usize> = Vec::new();
+        for slot in row.visible() {
+            match slot {
+                TabSlot::Group(index) => seen.push(*index),
+                TabSlot::Tab(index) => {
+                    if let Some(id) = tabs[*index].group
+                        && let Some(owner) = groups.iter().position(|group| group.id == id)
+                    {
+                        assert!(
+                            seen.contains(&owner),
+                            "aba {index} aparece sem a pilula do grupo {owner}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            row.visible()
+                .iter()
+                .filter(|slot| matches!(slot, TabSlot::Tab(_)))
+                .count()
+                <= MAX_VISIBLE_CONTEXT_TABS
+        );
+    }
+
+    #[test]
+    fn a_group_that_fits_is_shown_whole() {
+        let tabs = vec![
+            tab("https://a.example/1", Some(1)),
+            tab("https://b.example/2", Some(1)),
+            tab("https://c.example/3", None),
+        ];
+        let groups = vec![group(1, false)];
+        let row = plan_tab_row(&tabs, &groups);
+        assert_eq!(
+            row.visible(),
+            &[
+                TabSlot::Group(0),
+                TabSlot::Tab(0),
+                TabSlot::Tab(1),
+                TabSlot::Tab(2)
+            ]
+        );
+        assert_no_orphans(&row, &tabs, &groups);
+    }
+
+    #[test]
+    fn the_overflow_cut_never_leaves_a_tab_without_its_pill() {
+        // O corte cai a meio do grupo: sem a correcao sobravam as duas ultimas
+        // abas do grupo sem pilula nenhuma a dizer de quem sao.
+        let tabs = vec![
+            tab("https://a.example/1", Some(1)),
+            tab("https://b.example/2", Some(1)),
+            tab("https://c.example/3", Some(1)),
+            tab("https://d.example/4", None),
+        ];
+        let groups = vec![group(1, false)];
+        let row = plan_tab_row(&tabs, &groups);
+        assert_no_orphans(&row, &tabs, &groups);
+        assert_eq!(row.visible(), &[TabSlot::Tab(3)]);
+
+        // E com dois grupos seguidos, o mesmo: o que entra entra inteiro.
+        let many = vec![
+            tab("https://a.example/1", None),
+            tab("https://b.example/2", Some(1)),
+            tab("https://c.example/3", Some(1)),
+            tab("https://d.example/4", Some(2)),
+            tab("https://e.example/5", Some(2)),
+            tab("https://f.example/6", None),
+        ];
+        let pair = vec![group(1, false), group(2, false)];
+        assert_no_orphans(&plan_tab_row(&many, &pair), &many, &pair);
+    }
+
+    #[test]
+    fn joining_a_group_parks_the_tab_next_to_the_other_members() {
+        // Sem isto a pilula ficava a rotular a aba errada: os membros tem de
+        // ser contiguos na barra.
+        let mut tabs = vec![
+            tab("https://a.example/1", Some(1)),
+            tab("https://b.example/2", None),
+            tab("https://c.example/3", None),
+        ];
+        join_context_group(&mut tabs, 1, 2);
+        assert_eq!(tabs[0].url, "https://a.example/1");
+        assert_eq!(tabs[1].url, "https://c.example/3");
+        assert_eq!(tabs[1].group, Some(1));
+        assert_eq!(tabs[2].url, "https://b.example/2");
+        assert_eq!(tabs[2].group, None);
+    }
+
+    #[test]
+    fn a_group_that_loses_its_last_tab_disappears() {
+        let mut tabs = vec![tab("https://a.example/1", Some(3))];
+        let mut groups = vec![group(3, false)];
+        leave_context_group(&mut tabs, &mut groups, 0);
+        assert_eq!(tabs[0].group, None);
+        assert!(groups.is_empty(), "pilula vazia nao pode ficar na barra");
+    }
+
+    #[test]
+    fn a_new_group_takes_the_host_for_a_name_and_a_colour_nobody_is_using() {
+        let mut tabs = vec![
+            tab("https://www.arxiv.org/abs/1", None),
+            tab("https://b.example/2", None),
+        ];
+        let mut groups = Vec::new();
+        let mut next_id = 1;
+        let first =
+            create_context_group(&mut tabs, &mut groups, &mut next_id, 0).expect("aba existe");
+        let second =
+            create_context_group(&mut tabs, &mut groups, &mut next_id, 1).expect("aba existe");
+        assert_eq!(groups[first].name, "arxiv.org");
+        assert_eq!(tabs[0].group, Some(groups[first].id));
+        assert_ne!(
+            groups[first].color, groups[second].color,
+            "dois grupos seguidos nao podem nascer da mesma cor"
+        );
+        assert_ne!(groups[first].id, groups[second].id);
+    }
+
+    #[test]
+    fn the_group_pill_is_hit_tested_where_it_is_drawn() {
+        let tabs = vec![
+            tab("https://a.example/1", Some(1)),
+            tab("https://b.example/2", None),
+        ];
+        let groups = vec![group(1, false)];
+        let mut rows = [TabRow::empty(); COMPARATOR_COLUMNS];
+        rows[0] = plan_tab_row(&tabs, &groups);
+        let layout = BarLayout::with_rows(1600.0, 1.0, true, BarColumns::even(3), rows);
+
+        assert_eq!(layout.group_pill_counts[0], 1);
+        let pill = layout.group_pills[0][0];
+        assert!(pill.width > 0.0);
+        assert_eq!(
+            layout.hit(pill.x + pill.width / 2.0, pill.y + pill.height / 2.0),
+            Some(BarHit::ContextGroup {
+                source_index: 0,
+                group_index: 0
+            })
+        );
+
+        // E as abas continuam a acertar nelas proprias, nao na pilula.
+        assert_eq!(layout.context_tab_counts[0], 2);
+        let first = layout.context_tabs[0][0];
+        assert!(
+            first.x >= pill.x + pill.width,
+            "a pilula vem antes da sua primeira aba"
+        );
+        assert_eq!(
+            layout.hit(first.x + first.width / 2.0, first.y + first.height / 2.0),
+            Some(BarHit::ContextTab {
+                source_index: 0,
+                context_index: 0
+            })
+        );
     }
 }
 
