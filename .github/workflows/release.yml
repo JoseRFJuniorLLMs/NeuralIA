@@ -63,9 +63,9 @@ jobs:
           NEURALIA_AUTHENTICODE_PFX_PASSWORD: ${{ secrets.NEURALIA_AUTHENTICODE_PFX_PASSWORD }}
         run: |
           $hasPfx = -not [string]::IsNullOrWhiteSpace($env:NEURALIA_AUTHENTICODE_PFX_B64)
-          $hasPassword = -not [string]::IsNullOrWhiteSpace($env:NEURALIA_AUTHENTICODE_PFX_PASSWORD)
+          $hasPfxSecret = -not [string]::IsNullOrWhiteSpace($env:NEURALIA_AUTHENTICODE_PFX_PASSWORD)
 
-          if ($hasPfx -xor $hasPassword) {
+          if ($hasPfx -xor $hasPfxSecret) {
             throw "Authenticode configuration is incomplete: both PFX and password secrets are required."
           }
           if (-not $hasPfx) {

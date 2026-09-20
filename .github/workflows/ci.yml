@@ -100,8 +100,8 @@ jobs:
         run: |
           $line = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
           $version = $line.Matches[0].Groups[1].Value
-          $plainPassword = [Guid]::NewGuid().ToString("N") + [Guid]::NewGuid().ToString("N")
-          $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
+          $ephemeralSecret = [Guid]::NewGuid().ToString("N") + [Guid]::NewGuid().ToString("N")
+          $ephemeralSecureSecret = ConvertTo-SecureString $ephemeralSecret -AsPlainText -Force
           $pfxPath = Join-Path $env:RUNNER_TEMP "neuralia-ci-authenticode.pfx"
           $cert = $null
 
@@ -110,10 +110,10 @@ jobs:
             $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=NeuralIA CI Authenticode Test" -CertStoreLocation "Cert:\CurrentUser\My" -KeyExportPolicy Exportable -HashAlgorithm SHA256 -NotAfter (Get-Date).AddDays(1)
 
             Write-Host "[authenticode-ci] exporting ephemeral certificate"
-            Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $securePassword | Out-Null
+            Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $ephemeralSecureSecret | Out-Null
 
             $env:NEURALIA_AUTHENTICODE_PFX_B64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($pfxPath))
-            $env:NEURALIA_AUTHENTICODE_PFX_PASSWORD = $plainPassword
+            $env:NEURALIA_AUTHENTICODE_PFX_PASSWORD = $ephemeralSecret
 
             # A self-signed CI leaf deliberately has no public trust chain.
             # We verify its cryptographic signature and expected thumbprint,
