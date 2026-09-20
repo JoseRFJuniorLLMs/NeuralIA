@@ -66,8 +66,9 @@ const status = document.getElementById('status');
 const hud = document.getElementById('hud');
 const pagesEl = document.getElementById('pages');
 const MAX_WIDTH = 960;
-// Paginas com canvas vivo a volta da actual; o proxy da pagina sobrevive um
-// pouco mais (EVICT_RADIUS) para o vaivem do scroll nao repetir o getPage.
+// Paginas com canvas vivo a volta da actual; a referencia local ao proxy da
+// pagina sobrevive um pouco mais (EVICT_RADIUS) para o vaivem do scroll nao
+// repetir o getPage. O PDF.js pode manter o mesmo proxy no cache interno.
 const KEEP_RADIUS = 3;
 const EVICT_RADIUS = KEEP_RADIUS + 2;
 // Faixa alem do viewport em que o observer pede render. A evicao respeita a
