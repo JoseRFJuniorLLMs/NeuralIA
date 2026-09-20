@@ -1,0 +1,22 @@
+name: Full AGENTS gates #89 v2
+
+on:
+  push:
+    branches: [test/full-gates-winshell-89-v2]
+
+permissions:
+  contents: read
+
+jobs:
+  full-gates:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
