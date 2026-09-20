@@ -68,3 +68,74 @@ fn vendored_pdfjs_files_match_the_recorded_hashes() {
         );
     }
 }
+
+
+fn listed_files(relative_dir: &str) -> Vec<String> {
+    let root = repo_root();
+    let dir = root.join(relative_dir);
+    let mut files = fs::read_dir(&dir)
+        .unwrap_or_else(|error| panic!("{}: {error}", dir.display()))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|error| panic!("{}: {error}", dir.display()))
+                .path()
+        })
+        .filter(|path| path.is_file())
+        .map(|path| {
+            path.strip_prefix(&root)
+                .expect("ficheiro dentro do repositório")
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+#[test]
+fn pdfjs_auxiliary_assets_match_the_recorded_manifest() {
+    let upstream = read("assets/pdfjs/UPSTREAM.md");
+    let manifest = read("assets/pdfjs/AUXILIARY_BLOBS.md");
+    let source_commit = "1c8020a7d4e43668ac287a3ecf9a8dbea17e4c56";
+
+    assert!(upstream.contains(source_commit));
+    assert!(manifest.contains(source_commit));
+
+    let families = [
+        ("assets/pdfjs/cmaps", 168usize),
+        ("assets/pdfjs/standard_fonts", 14usize),
+        ("assets/pdfjs/wasm", 5usize),
+        ("assets/pdfjs/icc", 1usize),
+        ("assets/pdfjs/licenses", 10usize),
+        ("assets/pdfjs/fixtures", 5usize),
+    ];
+
+    for (directory, expected_count) in families {
+        let files = listed_files(directory);
+        assert_eq!(
+            files.len(),
+            expected_count,
+            "{directory} devia conter exatamente {expected_count} ficheiros"
+        );
+        for file in files {
+            assert!(
+                manifest.contains(&format!("\`{file}\`")),
+                "{file} existe no pacote mas não está no manifesto upstream"
+            );
+        }
+    }
+
+    for critical in [
+        "assets/pdfjs/wasm/openjpeg.wasm",
+        "assets/pdfjs/wasm/jbig2.wasm",
+        "assets/pdfjs/wasm/qcms_bg.wasm",
+        "assets/pdfjs/cmaps/Adobe-Japan1-UCS2.bcmap",
+        "assets/pdfjs/standard_fonts/LiberationSans-Regular.ttf",
+        "assets/pdfjs/icc/CGATS001Compat-v2-micro.icc",
+    ] {
+        assert!(
+            manifest.contains(&format!("\`{critical}\`")),
+            "asset crítico sem proveniência: {critical}"
+        );
+    }
+}
