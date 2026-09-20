@@ -103,54 +103,58 @@ fn hostile_fully_nested_sizes_that_used_to_hang() {
         );
     }
 }
-
 #[test]
 fn hostile_nested_containers_extract_in_linear_time() {
-    // Cadeias de 200 niveis (400 elementos de profundidade) lado a lado: o
-    // mesmo ataque ao extractor sem entregar o tempo todo ao html5ever.
+    // Cadeias de 200 niveis lado a lado: o ataque ao extractor sem entregar o
+    // tempo todo ao html5ever. O que a SPEC-0004 exige e linearidade, e e isso
+    // -- e so isso -- que aqui se mede.
     //
-    // O orcamento e relativo ao custo benigno medido na mesma corrida. O
-    // tempo do html5ever -- quadratico na profundidade e fora das nossas
-    // maos -- desconta-se dos dois lados; o que fica e o custo do extractor,
-    // que a SPEC-0004 exige linear. Com o algoritmo antigo esta razao era de
-    // milhares (292 s contra 0,1 s), por isso o tecto de 8x continua a
-    // apanhar a regressao que motivou o teste.
-    // Três tamanhos, cada um medido três vezes, ficando com o MÍNIMO. O ruído
-    // de uma máquina ocupada só acrescenta tempo, nunca o tira: o mínimo de
-    // várias corridas é a estimativa menos contaminada. Sem isto, uma medição
-    // apanhada numa aresta de escalonamento (e as três correm em momentos
-    // diferentes) chegava para inflacionar a razão e pintar de vermelho código
-    // que está correcto -- que é exactamente o defeito que este teste teve.
-    let mut measured = Vec::new();
-    for size in [128 * KIB, 256 * KIB, 512 * KIB] {
-        let html = hostile_fixture(size, 100);
-        let mut best = Duration::MAX;
-        for _ in 0..3 {
-            let (result, elapsed) = timed("hostil em cadeias", &html);
+    // Terceira versao deste orcamento, e vale a pena dizer porque:
+    //   1. teto absoluto em segundos -> media a velocidade da maquina; falhava
+    //      a 4,7 s com o codigo certo e passaria a verde num runner rapido
+    //      mesmo com regressao;
+    //   2. minimo de tres medicoes POR TAMANHO -> melhor, mas ainda comparava
+    //      instantes diferentes: os tres "pequenos" corriam numa janela de
+    //      tempo e os tres "grandes" noutra, que e o pior arranjo possivel se a
+    //      carga da maquina mudar pelo meio. Falhou na mesma.
+    //   3. esta: cada RONDA mede os tres tamanhos seguidos e calcula a razao
+    //      DENTRO da ronda. A carga afecta os tres numeradores e denominadores
+    //      da mesma maneira, por isso a razao sobrevive ao ruido que as
+    //      medicoes absolutas nao sobrevivem. Fica a menor razao das rondas.
+    let fixtures: Vec<String> = [128 * KIB, 256 * KIB, 512 * KIB]
+        .iter()
+        .map(|size| hostile_fixture(*size, 100))
+        .collect();
+
+    let mut best_quadruple = f64::MAX;
+    let mut best_double = f64::MAX;
+    for round in 0..3 {
+        let mut seconds = Vec::new();
+        for html in &fixtures {
+            let (result, elapsed) = timed(&format!("hostil em cadeias r{round}"), html);
             let article = result.expect("HTML hostil continua a extrair");
             assert!(!article.blocks.is_empty());
-            best = best.min(elapsed);
+            seconds.push(elapsed.as_secs_f64().max(1e-6));
         }
-        measured.push(best.max(Duration::from_millis(1)));
+        best_quadruple = best_quadruple.min(seconds[2] / seconds[0]);
+        best_double = best_double.min(seconds[1] / seconds[0]);
     }
 
-    // Quadruplicar a entrada com a mesma profundidade quadruplica o trabalho
-    // de um extractor linear. O antigo era cubico: 4x a entrada valia ~64x o
-    // tempo (19 KiB 3,8 s -> 79 KiB 292 s, em release). O tecto de 8x deixa
-    // folga para o ruido da maquina e continua a apanhar isso de longe.
-    let (small, large) = (measured[0], measured[2]);
+    // Quadruplicar a entrada com a mesma profundidade quadruplica o trabalho de
+    // um extractor linear. O antigo era cubico -- 4x a entrada valia ~64x o
+    // tempo (19 KiB 3,8 s -> 79 KiB 292 s, em release) -- por isso o tecto de
+    // 8x deixa folga para o ruido e continua a apanhar isso de longe.
     assert!(
-        large <= small * 8,
-        "4x a entrada custou {large:?} contra {small:?} -- crescimento super-linear"
+        best_quadruple <= 8.0,
+        "4x a entrada custou {best_quadruple:.1}x o tempo -- crescimento super-linear"
     );
 
     // O passo intermedio prende o mesmo pela metade: 2x a entrada, <= 4x o
-    // tempo. Sem ele, um salto so no ultimo tamanho podia esconder-se na
-    // folga do tecto anterior.
+    // tempo. Sem ele, um salto so no ultimo tamanho escondia-se na folga do
+    // tecto anterior.
     assert!(
-        measured[1] <= small * 4,
-        "2x a entrada custou {:?} contra {small:?}",
-        measured[1]
+        best_double <= 4.0,
+        "2x a entrada custou {best_double:.1}x o tempo"
     );
 }
 
