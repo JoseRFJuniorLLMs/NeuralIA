@@ -398,6 +398,94 @@ fn audit_action_name(action: &AgentSecurityAction) -> &'static str {
     }
 }
 
+/// Parametros de query/fragmento que carregam credenciais. A lista e
+/// deliberadamente generosa: um parametro perdido custa muito mais do que um
+/// parametro redigido a mais.
+const CREDENTIAL_PARAMS: &[&str] = &[
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "token",
+    "auth",
+    "authorization",
+    "api_key",
+    "apikey",
+    "client_secret",
+    "secret",
+    "password",
+    "passwd",
+    "pwd",
+    "session",
+    "sessionid",
+    "sid",
+    "signature",
+    "sig",
+    "code",
+    "otp",
+    "key",
+];
+
+fn looks_like_credential_param(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    CREDENTIAL_PARAMS
+        .iter()
+        .any(|needle| name == *needle || name.ends_with(&format!("_{needle}")))
+}
+
+/// Uma URL sem as credenciais que costumam viajar nela, mantendo tudo o resto.
+///
+/// O corpo de um documento passa pelo `redact_sensitive_text`; a URL nao
+/// passava por nada. Um `?access_token=...` de um callback OAuth ficava
+/// verbatim no JSON do documento, no `.md` do wiki, na coluna indexada do
+/// SQLite e no `MemoryHit` que vai para a interface -- ao lado do corpo que o
+/// sistema se deu ao trabalho de limpar.
+///
+/// Nao se apaga a query inteira: ela e muitas vezes o que torna a URL util
+/// (o termo pesquisado, o id do artigo). Apaga-se o valor dos parametros que
+/// parecem credenciais, e o fragmento inteiro quando ele carrega um -- o fluxo
+/// implicito do OAuth entrega o token depois do `#`.
+pub fn redact_url(raw: &str) -> String {
+    let Ok(mut url) = Url::parse(raw) else {
+        return redact_sensitive_text(raw);
+    };
+
+    let redacted: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(name, value)| {
+            if looks_like_credential_param(&name) {
+                (name.into_owned(), "[REDACTED]".to_string())
+            } else {
+                (name.into_owned(), value.into_owned())
+            }
+        })
+        .collect();
+    if redacted.is_empty() {
+        url.set_query(None);
+    } else {
+        let mut serializer = url.query_pairs_mut();
+        serializer.clear();
+        for (name, value) in &redacted {
+            serializer.append_pair(name, value);
+        }
+        drop(serializer);
+    }
+
+    if let Some(fragment) = url.fragment()
+        && fragment
+            .split(['&', ';'])
+            .filter_map(|pair| pair.split('=').next())
+            .any(looks_like_credential_param)
+    {
+        url.set_fragment(Some("[REDACTED]"));
+    }
+
+    if !url.username().is_empty() || url.password().is_some() {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+    }
+
+    url.to_string()
+}
 pub fn redact_sensitive_text(input: &str) -> String {
     let mut output = Vec::new();
     for raw in input.lines() {

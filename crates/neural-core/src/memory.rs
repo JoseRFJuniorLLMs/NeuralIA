@@ -15,7 +15,7 @@ mod sqlite_v01;
 const MEMORY_SCHEMA_VERSION: u32 = 1;
 
 use crate::{
-    agent_security::redact_sensitive_text,
+    agent_security::{redact_sensitive_text, redact_url},
     local_intelligence::{EMBEDDING_DIM, cosine_similarity, extract_entities, hashed_embedding},
     research::ResearchSession,
 };
@@ -98,7 +98,12 @@ impl MemoryDocument {
         url: Option<String>,
         body: impl Into<String>,
     ) -> Self {
-        let title = title.into();
+        // O titulo e texto livre vindo da pagina e a URL costuma carregar
+        // credenciais na query: os dois passam pelo mesmo cuidado que o corpo
+        // sempre teve. A redaccao acontece ANTES do id, para o mesmo documento
+        // dar sempre o mesmo id, com ou sem segredo na URL de origem.
+        let title = redact_sensitive_text(&title.into());
+        let url = url.map(|value| redact_url(&value));
         let body = redact_sensitive_text(&body.into());
         let now = unix_seconds();
         let content_hash = sha256_hex(body.as_bytes());
@@ -255,6 +260,8 @@ impl MemoryStore {
         }
         let sqlite_existed = self.sqlite_path().exists();
 
+        document.title = redact_sensitive_text(&document.title);
+        document.url = document.url.take().map(|value| redact_url(&value));
         document.body = redact_sensitive_text(&document.body);
         document.content_hash = sha256_hex(document.body.as_bytes());
         document.last_seen_at = unix_seconds();
@@ -966,6 +973,58 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_url_removes_credentials_and_keeps_the_rest() {
+        // O caso que motivou isto: um callback OAuth capturado pela memoria.
+        let out =
+            redact_url("https://app.exemplo.com/callback?access_token=ya29.SEGREDO&state=abc");
+        assert!(!out.contains("ya29.SEGREDO"), "{out}");
+        assert!(out.contains("state=abc"), "a query util sobrevive: {out}");
+
+        // Fluxo implicito: o token vem depois do `#`.
+        let out =
+            redact_url("https://app.exemplo.com/#access_token=ya29.SEGREDO&token_type=bearer");
+        assert!(!out.contains("ya29.SEGREDO"), "{out}");
+
+        // Sufixos: `x_api_key`, `user_password`.
+        let out = redact_url("https://api.exemplo.com/v1?user_password=hunter2&page=3");
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(out.contains("page=3"), "{out}");
+
+        // Credenciais embutidas.
+        let out = redact_url("https://ana:hunter2@exemplo.com/privado");
+        assert!(!out.contains("hunter2"), "{out}");
+
+        // Uma URL normal nao se mexe.
+        assert_eq!(
+            redact_url("https://exemplo.pt/artigo?q=rust+ownership&page=2"),
+            "https://exemplo.pt/artigo?q=rust+ownership&page=2"
+        );
+
+        // Nao sendo URL, cai no redactor de texto.
+        assert!(!redact_url("password=hunter2").contains("hunter2"));
+    }
+
+    #[test]
+    fn captured_document_never_stores_a_secret_in_its_url_or_title() {
+        let document = MemoryDocument::new(
+            MemoryKind::Source,
+            MemorySourceKind::Web,
+            "Sessao aberta com token=ya29.SEGREDO",
+            Some("https://app.exemplo.com/cb?access_token=ya29.SEGREDO&state=ok".into()),
+            "corpo qualquer",
+        );
+
+        let url = document.url.clone().unwrap_or_default();
+        assert!(!url.contains("ya29.SEGREDO"), "url: {url}");
+        assert!(url.contains("state=ok"), "url: {url}");
+        assert!(
+            !document.title.contains("ya29.SEGREDO"),
+            "title: {}",
+            document.title
+        );
+    }
 
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
