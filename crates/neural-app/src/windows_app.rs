@@ -3519,7 +3519,10 @@ impl App {
     fn capture_pdf_memory(&mut self, capture: PdfTextCapture) {
         let mut body = capture.body.trim().to_string();
         if body.is_empty() {
-            body = format!("PDF sem texto extraível aberto no NeuralIA: {}", capture.url);
+            body = format!(
+                "PDF sem texto extraível aberto no NeuralIA: {}",
+                capture.url
+            );
         }
         if capture.truncated {
             body.push_str("\n\n[Extração textual limitada pelo NeuralIA.]");
@@ -3535,13 +3538,7 @@ impl App {
         if let Some(session) = &mut self.current_research {
             document = document.session(session.id.clone());
             let memory_id = document.id.clone();
-            session.add_source(
-                None,
-                capture.title,
-                capture.url,
-                Some(memory_id),
-                body,
-            );
+            session.add_source(None, capture.title, capture.url, Some(memory_id), body);
             self.memory.save_session(session.clone());
         }
         self.memory.capture(document);
@@ -8915,12 +8912,15 @@ mod tests {
 
     #[test]
     fn spec_0110_pdf_ipc_maps_authenticated_text_to_the_current_generation() {
-        let event = pdf_ipc_event(77, IpcAction::PdfText {
-            page: 3,
-            text: "conteudo".to_string(),
-            done: true,
-            truncated: false,
-        });
+        let event = pdf_ipc_event(
+            77,
+            IpcAction::PdfText {
+                page: 3,
+                text: "conteudo".to_string(),
+                done: true,
+                truncated: false,
+            },
+        );
         assert!(matches!(
             event,
             Some(UserEvent::PdfTextChunk {
@@ -8935,7 +8935,8 @@ mod tests {
 
     #[test]
     fn spec_0110_pdf_text_capture_is_bounded_and_published_only_on_done() {
-        let mut capture = PdfTextCapture::new(9, "https://example.com/a.pdf".into(), "a.pdf".into());
+        let mut capture =
+            PdfTextCapture::new(9, "https://example.com/a.pdf".into(), "a.pdf".into());
         assert!(!capture.push(1, "primeira", false, false));
         assert!(!capture.push(2, "segunda", false, false));
         assert_eq!(capture.body, "primeira\nsegunda");
@@ -8949,7 +8950,8 @@ mod tests {
 
     #[test]
     fn spec_0110_pdf_text_capture_drops_backward_or_out_of_budget_pages() {
-        let mut capture = PdfTextCapture::new(11, "https://example.com/b.pdf".into(), "b.pdf".into());
+        let mut capture =
+            PdfTextCapture::new(11, "https://example.com/b.pdf".into(), "b.pdf".into());
         assert!(!capture.push(2, "dois", false, false));
         assert!(!capture.push(1, "um atrasado", false, false));
         assert_eq!(capture.body, "dois");
