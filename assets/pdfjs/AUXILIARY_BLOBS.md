@@ -207,3 +207,4 @@ Todos os ficheiros abaixo foram copiados da árvore upstream no commit `1c8020a7
 | `assets/pdfjs/wasm/openjpeg_nowasm_fallback.js` | `external/openjpeg/openjpeg_nowasm_fallback.js` | `0df96aed34f98a6c88a2a11656673b547f41e4c1` | 451590 |
 | `assets/pdfjs/wasm/openjpeg.wasm` | `external/openjpeg/openjpeg.wasm` | `5acce73fd95c1baa3aa68cfe9d29aa3f97b7ce18` | 252032 |
 | `assets/pdfjs/wasm/qcms_bg.wasm` | `external/qcms/qcms_bg.wasm` | `ea1d07bc4439d034d5a188bb78ef317c33f56787` | 96589 |
+| `assets/pdfjs/fixtures/issue16176.pdf` | `test/pdfs/issue16176.pdf` | `0558900e9380e9a5faefa12e9f703ded8f2cb12f` | 65589 |
