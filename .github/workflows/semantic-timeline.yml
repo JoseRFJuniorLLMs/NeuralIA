@@ -1,0 +1,288 @@
+name: Semantic timeline gates
+
+on:
+  pull_request:
+    paths:
+      - 'crates/neural-core/src/semantic_timeline.rs'
+      - 'crates/neural-core/tests/timeline_acceptance.rs'
+      - 'crates/neural-app/src/windows_app.rs'
+      - '.github/workflows/semantic-timeline.yml'
+      - 'md/SPEC-0103-semantic-timeline.md'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/neural-core/src/semantic_timeline.rs'
+      - 'crates/neural-core/tests/timeline_acceptance.rs'
+      - 'crates/neural-app/src/windows_app.rs'
+      - '.github/workflows/semantic-timeline.yml'
+      - 'md/SPEC-0103-semantic-timeline.md'
+
+permissions:
+  contents: read
+
+jobs:
+  timeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+
+      - name: Provider acceptance and ratio gate
+        run: cargo test --locked -p neural-core --test timeline_acceptance
+
+      - name: Build shipped-JS behavior harness
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/timeline-shipped-gate.mjs" <<'NODE'
+          import fs from 'node:fs';
+
+          let source = fs.readFileSync('crates/neural-app/src/windows_app.rs', 'utf8');
+          if (process.env.TIMELINE_SABOTAGE === '1') {
+            source = source.replaceAll(
+              "if (role === 'user') return 'pergunta';",
+              "if (role === 'user') return 'resposta';"
+            );
+          }
+          if (process.env.TIMELINE_PERF_SABOTAGE === '1') {
+            source = source.replaceAll(
+              "const state = metrics();",
+              "const state = metrics(); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(1, Math.floor(document.querySelectorAll('*').length ** 2 / 64)));"
+            );
+          }
+
+          function functionAt(start) {
+            const open = source.indexOf('{', start);
+            if (open < 0) throw new Error('function body not found');
+            let depth = 0;
+            let quote = '';
+            let escaped = false;
+            for (let i = open; i < source.length; i++) {
+              const ch = source[i];
+              if (quote) {
+                if (escaped) escaped = false;
+                else if (ch === '\\') escaped = true;
+                else if (ch === quote) quote = '';
+                continue;
+              }
+              if (ch === "'" || ch === '"' || ch === '`') {
+                quote = ch;
+                continue;
+              }
+              if (ch === '{') depth++;
+              else if (ch === '}' && --depth === 0) return source.slice(start, i + 1);
+            }
+            throw new Error('unterminated function');
+          }
+
+          const positions = [];
+          let cursor = 0;
+          const needle = 'function semanticAnchors()';
+          while ((cursor = source.indexOf(needle, cursor)) >= 0) {
+            positions.push(cursor);
+            cursor += needle.length;
+          }
+          if (positions.length !== 2) {
+            throw new Error(`expected 2 shipped semanticAnchors functions, got ${positions.length}`);
+          }
+
+          function node(tag, text, attrs = {}, top = 0) {
+            return {
+              tagName: tag.toUpperCase(),
+              textContent: text,
+              top,
+              getAttribute(name) { return attrs[name] ?? null; },
+              closest() { return null; },
+              getBoundingClientRect() { return { top: this.top }; },
+            };
+          }
+
+          const fixtures = [
+            {
+              name: 'ChatGPT',
+              nodes: [
+                node('div', 'Pergunta', {'data-message-author-role':'user'}, 10),
+                node('div', 'Resposta', {'data-message-author-role':'assistant'}, 20),
+                node('h2', 'Detalhes', {}, 30),
+                node('pre', 'codigo()', {}, 40),
+              ],
+              required: ['pergunta', 'resposta', 'seção', 'código'],
+            },
+            {
+              name: 'Gemini',
+              nodes: [
+                node('article', 'Resposta Gemini', {}, 10),
+                node('h2', 'Comparação', {}, 20),
+                node('table', 'A B', {}, 30),
+                node('a', 'Fonte', {href:'https://example.com'}, 40),
+              ],
+              required: ['resposta', 'seção', 'tabela', 'fonte'],
+            },
+            {
+              name: 'Claude',
+              nodes: [
+                node('article', 'Resposta Claude', {role:'article'}, 10),
+                node('blockquote', 'Citação', {}, 20),
+                node('h2', 'Conclusão', {}, 30),
+              ],
+              required: ['resposta', 'citação', 'conclusão'],
+            },
+          ];
+
+          for (const anchorPos of positions) {
+            const prefix = source.slice(0, anchorPos);
+            const kindOfPos = prefix.lastIndexOf('function kindOf(');
+            const semanticKindPos = prefix.lastIndexOf('function semanticKind(');
+            const kindPos = Math.max(kindOfPos, semanticKindPos);
+            if (kindPos < 0) throw new Error('shipped kind function not found');
+
+            const kindFn = functionAt(kindPos);
+            const anchorFn = functionAt(anchorPos);
+            for (const fixture of fixtures) {
+              const document = { querySelectorAll() { return fixture.nodes; } };
+              const getComputedStyle = () => ({ display:'block', visibility:'visible' });
+              const metrics = () => ({ top:0, view:800, max:2000, docLike:true, root:null });
+              const anchorTop = (el) => el.top;
+              const semanticAnchors = new Function(
+                'document', 'getComputedStyle', 'metrics', 'anchorTop',
+                `${kindFn}\n${anchorFn}\nreturn semanticAnchors;`
+              )(document, getComputedStyle, metrics, anchorTop);
+
+              const kinds = semanticAnchors().map(item => item.kind);
+              for (const expected of fixture.required) {
+                if (!kinds.includes(expected)) {
+                  throw new Error(`${fixture.name}: missing ${expected}; got ${kinds.join(',')}`);
+                }
+              }
+            }
+
+            function buildSemantic(nodes) {
+              const document = { querySelectorAll() { return nodes; } };
+              const getComputedStyle = () => ({ display:'block', visibility:'visible' });
+              const metrics = () => ({ top:0, view:800, max:2000, docLike:true, root:null });
+              const anchorTop = (el) => el.top;
+              return new Function(
+                'document', 'getComputedStyle', 'metrics', 'anchorTop',
+                `${kindFn}\n${anchorFn}\nreturn semanticAnchors;`
+              )(document, getComputedStyle, metrics, anchorTop);
+            }
+
+            function perfNodes(count) {
+              return Array.from({ length:count }, (_, i) =>
+                node(i % 4 === 0 ? 'h2' : 'article', 'Item ' + i, {}, i)
+              );
+            }
+
+            function elapsed(count, iterations) {
+              const semanticAnchors = buildSemantic(perfNodes(count));
+              const start = process.hrtime.bigint();
+              for (let i = 0; i < iterations; i++) semanticAnchors();
+              return Number(process.hrtime.bigint() - start) || 1;
+            }
+
+            let bestRatio = Number.POSITIVE_INFINITY;
+            for (let round = 0; round < 5; round++) {
+              const iterations = process.env.TIMELINE_PERF_SABOTAGE === '1' ? 4 : 80;
+              let small;
+              let large;
+              if (round % 2 === 0) {
+                small = elapsed(16, iterations);
+                large = elapsed(64, iterations);
+              } else {
+                large = elapsed(64, iterations);
+                small = elapsed(16, iterations);
+              }
+              bestRatio = Math.min(bestRatio, large / small);
+            }
+            if (!(bestRatio < 8.0)) {
+              throw new Error(`shipped semantic timeline scaling regressed: 4x nodes cost ${bestRatio.toFixed(2)}x`);
+            }
+          }
+          console.log('shipped semantic timeline: provider fixtures and ratio gate passed for both rails');
+          NODE
+
+      - name: Exercise the exact shipped semanticAnchors implementations
+        run: node "$RUNNER_TEMP/timeline-shipped-gate.mjs"
+
+      - name: Prove shipped provider gate catches role regression
+        shell: bash
+        run: |
+          set +e
+          TIMELINE_SABOTAGE=1 node "$RUNNER_TEMP/timeline-shipped-gate.mjs"
+          result=$?
+          set -e
+          if [ "$result" -eq 0 ]; then
+            echo "Shipped timeline sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: shipped role regression was rejected with exit code $result."
+
+      - name: Prove shipped ratio gate catches superlinear work
+        shell: bash
+        run: |
+          set +e
+          TIMELINE_PERF_SABOTAGE=1 node "$RUNNER_TEMP/timeline-shipped-gate.mjs"
+          result=$?
+          set -e
+          if [ "$result" -eq 0 ]; then
+            echo "Shipped timeline ratio sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: shipped superlinear work was rejected with exit code $result."
+
+      - name: Prove Rust provider gate catches role regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("crates/neural-core/src/semantic_timeline.rs")
+          text = path.read_text(encoding="utf-8")
+          old = 'if role == Some("user") {'
+          new = 'if role == Some("assistant") {'
+          if text.count(old) != 1:
+              raise SystemExit("provider sabotage target not found exactly once")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core --test timeline_acceptance chatgpt_fixture_exposes_question_answer_heading_and_code
+          result=$?
+          set -e
+          git checkout -- crates/neural-core/src/semantic_timeline.rs
+          if [ "$result" -eq 0 ]; then
+            echo "Timeline provider sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: provider role regression was rejected with exit code $result."
+
+      - name: Prove ratio gate catches superlinear work
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("crates/neural-core/src/semantic_timeline.rs")
+          text = path.read_text(encoding="utf-8")
+          old = '    let document = Html::parse_document(input);'
+          new = '''    std::thread::sleep(std::time::Duration::from_millis(
+              ((input.len() / 10_000).max(1).pow(2)) as u64,
+          ));
+              let document = Html::parse_document(input);'''
+          if text.count(old) != 1:
+              raise SystemExit("ratio sabotage target not found exactly once")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core --test timeline_acceptance timeline_cost_scales_by_ratio_not_wall_clock_budget
+          result=$?
+          set -e
+          git checkout -- crates/neural-core/src/semantic_timeline.rs
+          if [ "$result" -eq 0 ]; then
+            echo "Timeline ratio sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: superlinear timeline work was rejected with exit code $result."
+
+      - name: Confirm restored timeline is green
+        run: cargo test --locked -p neural-core --test timeline_acceptance
