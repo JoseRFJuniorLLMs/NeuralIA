@@ -19,6 +19,8 @@ jobs:
     permissions:
       actions: read
       contents: read
+      id-token: write
+      attestations: write
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       sha: ${{ steps.version.outputs.sha }}
@@ -133,6 +135,11 @@ jobs:
           $hash = (Get-FileHash dist/NeuralIA.exe -Algorithm SHA256).Hash.ToLower()
           "$hash  NeuralIA.exe" | Out-File -Encoding ascii dist/NeuralIA.exe.sha256
           cargo metadata --locked --format-version 1 --no-deps | Out-File -Encoding utf8 dist/cargo-metadata.json
+      - name: Attest the exact release executable
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/NeuralIA.exe
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: NeuralIA-windows-x64-${{ steps.version.outputs.tag }}
