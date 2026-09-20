@@ -4,7 +4,34 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-09-20
+
+Auditoria completa do produto e do núcleo, com cada defeito corrigido a trazer o
+teste que o apanha. O pipeline de release passa a publicar exatamente o binário
+que os gates mediram, e o instalador per-user fica pronto para assinatura.
+
 ### Security
+- **PR #69 — uma URL local escrita autoriza aquela origem, não a rede local
+  inteira.** O `allow_local` era um booleano capturado pelo handler de navegação
+  para toda a vida da WebView: depois de o utilizador escrever
+  `http://192.168.1.50:3000` na palette nativa, essa página — conteúdo remoto —
+  podia navegar para o router, para o loopback ou para qualquer outro host da
+  rede. A autorização passa a ser a origem exacta; redirecções e navegação
+  dentro do mesmo servidor continuam a funcionar, o pivot não.
+  (`typed_local_url_authorizes_only_its_own_origin`)
+- **PR #74 — o redactor devolvia o segredo quando a linha não tinha separador.**
+  `raw.split([':','=']).next()` devolve a linha inteira quando não há separador:
+  `access_token ya29.SEGREDO` saía como `access_token ya29.SEGREDO: [REDACTED]`,
+  com o segredo intacto e um rótulo a fingir que tinha sido apagado. O nome do
+  campo passa a escrever-se só quando foi ele o reconhecido. Vale por todos os
+  caminhos que passam pelo redactor: documentos, trace do agente, audit log.
+- **PR #70 — a URL e o título passam a ser redigidos, não só o corpo.** Um
+  callback OAuth com `?access_token=` ficava verbatim no JSON do documento, no
+  `.md` do wiki, na coluna indexada do SQLite e na interface — ao lado do corpo,
+  que é a mesma string e que era limpo. O `redact_url` apaga o valor dos
+  parâmetros que parecem credenciais e o fragmento inteiro quando ele carrega um
+  (o fluxo implícito do OAuth entrega o token depois do `#`), mantendo a query
+  útil intacta.
 - **PR #54 — SPEC-0104 passa a aplicar classes A/B/C/D em código nativo.**
   `CapabilityClass` deixa explícito o nível de autoridade; confirmação positiva
   pode autorizar Classe C, mas nunca transforma Classe D em ação autônoma.
@@ -48,6 +75,26 @@ All notable changes to NeuralIA are documented here.
 - Revisão adversarial independente e release 2.1.0 permanecem pendentes.
 
 ### Fixed
+- **PR #67 — minimizar a janela na Home matava a aplicação.** `f64::clamp` entra
+  em pânico quando o mínimo é maior que o máximo, e a asserção está activa em
+  release. O `HomeLayout::new` invertia os limites sempre que a altura era
+  inferior a `490*scale` — em particular zero, que é o que o winit reporta ao
+  minimizar. O `with_min_inner_size` não protegia: a minimização não passa pelo
+  `WM_GETMINMAXINFO`.
+- **PR #61 — o cromado de cada coluna deixa de aterrar na coluna vizinha.** Três
+  defeitos na mesma função, todos com o mesmo efeito: o utilizador clicava numa
+  coisa e acontecia outra. A pílula do provedor nunca encolhia (um `.max()`
+  tornava o `.min()` seguinte matematicamente morto) e transbordava; o "+" da
+  última coluna caía dentro do botão "Privado", que ganha o hit-test; e o chip
+  de uma coluna minimizada aterrava por cima de uma coluna estreita. Os chips e
+  os controlos da direita passam a ser reservados antes de distribuir as
+  pílulas.
+- **PR #75 — guardar um documento deixa de listar o diretório inteiro.** A
+  correcção do O(corpus) do PR #42 trocou "desserializar o corpus" por "listar o
+  diretório" — mais barato, e ainda linear, com o manifesto a ser escrito a cada
+  captura. No runner Windows isso media 115 ms na primeira captura contra 559 ms
+  na última com 600 páginas. O gate `memory_capture_cost` apanhou-o num PR que
+  não tocava em memória nenhuma.
 - **PR #71 — o Reader deixa de duplicar blocos aninhados e de misturar metadata com o corpo.**
   Itens de lista/blocos filhos são emitidos uma vez, metadados vazios deixam a
   cadeia de fallback continuar e o conteúdo de `<head>/<title>` não entra no
@@ -115,6 +162,19 @@ All notable changes to NeuralIA are documented here.
   não o relógio. `recency_bonus(last_seen_at, now)` passa a usar a hora real.
 
 ### Changed
+- **PR #62 — a razão de linearidade passa a ser medida dentro da ronda.** O
+  orçamento do caso hostil media os três tamanhos em janelas de tempo
+  diferentes, o que o punha vermelho com o código correcto numa máquina
+  ocupada. Cada ronda mede os três seguidos e calcula a razão dentro da ronda;
+  fica a menor das três. Os limites não mudaram.
+- **PR #76 — variáveis dos workflows renomeadas para o scanner de segredos parar
+  de as ler como credenciais.** `$hasPassword` era um booleano e
+  `$plainPassword` era a senha de um certificado efémero gerado e destruído na
+  mesma corrida; ambos bloqueavam o check em todos os PRs.
+- **PR #63 — a SPEC-0105 diz quais campos da observação são constantes.** O
+  `frame` é sempre `"top"` (o observador desiste em child frames) e o `visible`
+  é sempre `true` (o script filtra antes de emitir): verdadeiros por construção,
+  não por medição.
 - O orçamento do caso hostil em `tests/extraction_cost.rs` deixa de ser um teto
   em segundos de relógio — que media a velocidade da máquina: falhava a 4,7 s
   com o código certo numa máquina ocupada e passaria a verde num runner rápido
