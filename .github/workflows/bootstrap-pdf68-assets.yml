@@ -68,6 +68,5 @@ jobs:
           git config user.name "NeuralIA web agent"
           git config user.email "web-agent@users.noreply.github.com"
           git add assets/pdfjs/cmaps assets/pdfjs/standard_fonts assets/pdfjs/icc assets/pdfjs/wasm
-          git diff --cached --check
           git commit -m "vendor: add PDF.js 6.3.289 auxiliary assets"
           git push origin HEAD:feat/pdfjs-aux-assets-68
