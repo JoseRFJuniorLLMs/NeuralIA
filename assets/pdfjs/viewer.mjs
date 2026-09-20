@@ -348,7 +348,13 @@ async function load() {
       url: './document.pdf',
       rangeChunkSize: RANGE_CHUNK,
       disableStream: true,
-      disableAutoFetch: true
+      disableAutoFetch: true,
+      cMapUrl: './cmaps/',
+      cMapPacked: true,
+      standardFontDataUrl: './standard_fonts/',
+      wasmUrl: './wasm/',
+      iccUrl: './icc/',
+      useWasm: true
     }).promise;
   } catch (err) {
     fail(describeLoadError(err));
