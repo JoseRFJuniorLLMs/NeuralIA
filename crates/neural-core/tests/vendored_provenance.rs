@@ -139,7 +139,6 @@ fn pdfjs_auxiliary_assets_match_the_recorded_manifest() {
     }
 }
 
-
 #[test]
 fn release_sbom_names_every_pdfjs_auxiliary_family() {
     let release = read(".github/workflows/release.yml");
