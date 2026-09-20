@@ -36,9 +36,10 @@ const MAX_BLOCK_CHARS: usize = 20_000;
 // abre primeiro, por isso um <article> com centenas de .post continua a ser
 // pontuado). Profundidade: elementos com mais de MAX_DEPTH antepassados nao
 // sao candidatos, blocos nem texto de fallback (o Chromium corta a 512).
-// Aninhamento: `text()` de um bloco le a subarvore toda, logo cada no seria
-// lido uma vez por bloco antepassado -- blockquote dentro de blockquote sem
-// fim voltava a ser quadratico.
+// Aninhamento: a recolha de blocos e hoje uma passagem unica; o tecto continua
+// a limitar quantos blocos semanticos podem ficar simultaneamente activos e
+// quantos PendingBlock podem nascer numa cadeia adversarial profundamente
+// aninhada. Texto abaixo do tecto de emissao permanece no ultimo bloco elegivel.
 const MAX_CANDIDATES: usize = 256;
 const MAX_DEPTH: usize = 256;
 const MAX_BLOCK_NESTING: usize = 16;
