@@ -81,11 +81,12 @@ jobs:
           from pathlib import Path
           path = Path("crates/neural-app/src/pdf_assets.rs")
           text = path.read_text(encoding="utf-8")
-          arm = '''        "/icc/CGATS001Compat-v2-micro.icc" => (
-            "application/vnd.iccprofile",
-            include_bytes!("../../../assets/pdfjs/icc/CGATS001Compat-v2-micro.icc"),
-        ),
-'''
+          arm = (
+              '        "/icc/CGATS001Compat-v2-micro.icc" => (\n'
+              '            "application/vnd.iccprofile",\n'
+              '            include_bytes!("../../../assets/pdfjs/icc/CGATS001Compat-v2-micro.icc"),\n'
+              '        ),\n'
+          )
           if text.count(arm) != 1:
               raise SystemExit("ICC sabotage arm not found exactly once")
           path.write_text(text.replace(arm, "", 1), encoding="utf-8")
