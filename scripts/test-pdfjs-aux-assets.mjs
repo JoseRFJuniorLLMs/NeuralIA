@@ -5,6 +5,17 @@ import { fileURLToPath } from 'node:url';
 if (typeof Promise.try !== 'function') {
   Promise.try = (fn, ...args) => Promise.resolve().then(() => fn(...args));
 }
+if (typeof Uint8Array.prototype.toHex !== 'function') {
+  Uint8Array.prototype.toHex = function () {
+    return Array.from(this, byte => byte.toString(16).padStart(2, '0')).join('');
+  };
+}
+if (typeof Uint8Array.fromHex !== 'function') {
+  Uint8Array.fromHex = function (hex) {
+    if (hex.length % 2 !== 0) throw new SyntaxError('hex string must have even length');
+    return Uint8Array.from(hex.match(/../g) || [], pair => Number.parseInt(pair, 16));
+  };
+}
 const pdfjsLib = await import('../assets/pdfjs/pdf.mjs');
 
 const pdfjsRoot = fileURLToPath(new URL('../assets/pdfjs/', import.meta.url));
