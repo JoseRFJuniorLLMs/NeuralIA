@@ -1,0 +1,31 @@
+name: Exact AGENTS gates 0109 0110
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/exact-gates-0109-0110.yml'
+permissions:
+  contents: read
+jobs:
+  exact:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: webrtc-spec-0109
+            ref: d6b418a4cfe3eb462f846770f620a852b7ad51dd
+          - name: pdf-spec-0110
+            ref: ebb7ee54cc94486cd268e88e21e74abbe5edc1b4
+    name: ${{ matrix.name }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+        with:
+          components: clippy,rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
