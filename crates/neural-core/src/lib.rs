@@ -1,4 +1,4 @@
-pub mod agent_runtime;
+pub mod agent_protocol;
 pub mod agent_security;
 pub mod config;
 pub mod error;
@@ -41,8 +41,5 @@ pub use research::{
     ComparisonFact, ResearchItem, ResearchItemKind, ResearchSession, SynthesisSnapshot,
 };
 
-pub use agent_runtime::{
-    AgentAction, AgentElement, AgentOutcome, AgentPlanner, AgentRuntime, AgentRuntimeConfig,
-    AgentToolExecutor, ObservedPage, ToolResult, save_agent_outcome,
-};
+pub use agent_protocol::{AgentAction, AgentElement, AgentRuntimeConfig, ObservedPage};
 pub use semantic_timeline::{SemanticAnchor, SemanticAnchorKind, semantic_anchors_html};

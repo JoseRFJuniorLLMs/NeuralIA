@@ -42,10 +42,17 @@ decide_agent_step
 effects so the security/limit decision can be tested on the same code that the
 product calls.
 
-`neural_core::AgentRuntime`, `AgentPlanner` and `AgentToolExecutor` remain
-a reference/library harness. They are **not** the execution loop used by
-`neural-app`. Tests of that harness are useful unit coverage but are not, by
-themselves, acceptance evidence for this specification.
+The old `neural_core::AgentRuntime` / `AgentPlanner` / `AgentToolExecutor`
+reference loop was removed. It was not called by the binary and duplicated
+security-sensitive control flow, which made audits look stronger than the
+product actually was.
+
+The shared structured vocabulary and budgets used by the shipped path now live
+in `neural_core::agent_protocol` (`AgentAction`, `AgentElement`,
+`ObservedPage`, `AgentRuntimeConfig`). That module is a data/config contract,
+not an execution loop. There is exactly one agent execution path in the product:
+the native `decide_agent_step` -> confirmation -> `execute_agent_action`
+path described above.
 
 ## 3. Observation and action vocabulary
 
@@ -69,8 +76,8 @@ Every actionable observation passes through `decide_agent_step`.
 
 The function:
 
-1. reads limits from `AgentRuntimeConfig::default()`, avoiding a second set of
-   hard-coded budgets in the application;
+1. reads limits from `agent_protocol::AgentRuntimeConfig::default()`, avoiding
+   a second set of hard-coded budgets in the application;
 2. resolves the next structured action against the fresh observation;
 3. maps it to `AgentSecurityAction`;
 4. calls the same `AgentPermissionPolicy` used by the product;

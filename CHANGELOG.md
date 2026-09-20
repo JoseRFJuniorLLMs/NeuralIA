@@ -121,6 +121,13 @@ All notable changes to NeuralIA are documented here.
   não o relógio. `recency_bonus(last_seen_at, now)` passa a usar a hora real.
 
 ### Changed
+- **Agent runtime morto removido.** O antigo `neural_core::AgentRuntime`,
+  `AgentPlanner` e `AgentToolExecutor` não eram chamados pelo binário e
+  duplicavam uma superfície de segurança que não protegia o produto. O
+  vocabulário/configuração realmente compartilhado passa para
+  `agent_protocol`; o único loop que envia ações continua em
+  `windows_app.rs` conforme a SPEC-0105.
+
 - O orçamento do caso hostil em `tests/extraction_cost.rs` deixa de ser um teto
   em segundos de relógio — que media a velocidade da máquina: falhava a 4,7 s
   com o código certo numa máquina ocupada e passaria a verde num runner rápido
