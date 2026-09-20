@@ -119,7 +119,7 @@ fn pdfjs_auxiliary_assets_match_the_recorded_manifest() {
         );
         for file in files {
             assert!(
-                manifest.contains(&format!("\`{file}\`")),
+                manifest.contains(&format!("`{file}`")),
                 "{file} existe no pacote mas não está no manifesto upstream"
             );
         }
@@ -134,7 +134,7 @@ fn pdfjs_auxiliary_assets_match_the_recorded_manifest() {
         "assets/pdfjs/icc/CGATS001Compat-v2-micro.icc",
     ] {
         assert!(
-            manifest.contains(&format!("\`{critical}\`")),
+            manifest.contains(&format!("`{critical}`")),
             "asset crítico sem proveniência: {critical}"
         );
     }
