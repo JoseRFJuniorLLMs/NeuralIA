@@ -7717,26 +7717,12 @@ fn gmail_monitor_enabled_for(no_gmail: Option<OsString>) -> bool {
 /// afinada. O que fica deste lado e so o que e proprio da Home -- onde esta a
 /// marca e quanto espaco ela reserva.
 ///
-/// A elipse e estreita de proposito: so tira o tecido de cima da esfera e das
-/// letras. O resto do retangulo da arte nao precisa de ser esvaziado, porque a
-/// marca e misturada com o que esta por tras dela em vez de o apagar -- uma
-/// elipse suficientemente grande para conter o retangulo deixava um buraco
-/// oval a meio da tela, que e tao visivel como a caixa que vinha corrigir.
-fn home_tissue_field(
-    width: f64,
-    height: f64,
-    scale: f64,
-    brand_x: f64,
-    brand_y: f64,
-    brand_width: f64,
-    brand_height: f64,
-) -> tissue::Field {
-    tissue::Field::new(width, height, scale).with_quiet_ellipse(
-        brand_x + brand_width / 2.0,
-        brand_y + brand_height * 0.58,
-        (brand_width * 0.60).max(120.0 * scale),
-        (brand_width * 0.26).max(70.0 * scale),
-    )
+/// **Sem zona de silencio.** A marca vai para o ecra com o alfa dela, por
+/// `AlphaBlend`, portanto os neuronios passam mesmo por tras dela -- que e o
+/// efeito pedido. Qualquer zona limpa, por mais estreita, desenha uma mancha
+/// escura a volta do logo; foi rejeitada duas vezes, como caixa e como oval.
+fn home_tissue_field(width: f64, height: f64, scale: f64) -> tissue::Field {
+    tissue::Field::new(width, height, scale)
 }
 
 /// Uma rede neuronal viva: neuronios a percorrer a tela, ligados aos vizinhos,
@@ -7755,25 +7741,13 @@ unsafe fn draw_neural_background(
     width: f64,
     height: f64,
     scale: f64,
-    brand_x: f64,
-    brand_y: f64,
-    brand_width: f64,
-    brand_height: f64,
     theme: &Theme,
 ) {
     if width < 1.0 || height < 1.0 {
         return;
     }
 
-    let field = home_tissue_field(
-        width,
-        height,
-        scale,
-        brand_x,
-        brand_y,
-        brand_width,
-        brand_height,
-    );
+    let field = home_tissue_field(width, height, scale);
     let seconds = now_ms() as f64 / 1000.0;
     draw_neural_tissue(hdc, &field, scale, seconds, theme);
 }
@@ -8002,17 +7976,7 @@ fn draw_home(window: &Window, status: Option<&str>) {
             .round() as i32;
 
         if home_animation_enabled() {
-            draw_neural_background(
-                target,
-                width,
-                height,
-                scale,
-                brand_x as f64,
-                brand_y as f64,
-                brand_width,
-                brand_height,
-                &theme,
-            );
+            draw_neural_background(target, width, height, scale, &theme);
         }
 
         // Marca e omnibox continuam acima da rede neural.
@@ -8722,76 +8686,54 @@ mod tests {
     const BRAND: (f64, f64, f64, f64) = (700.0, 180.0, 520.0, 374.0);
 
     fn home_field() -> tissue::Field {
-        home_tissue_field(1920.0, 1080.0, 1.0, BRAND.0, BRAND.1, BRAND.2, BRAND.3)
-    }
-
-    /// Dentro da elipse de silencio -- a zona onde vivem a esfera e as letras.
-    fn on_the_logo(x: f64, y: f64) -> bool {
-        let (bx, by, bw, bh) = BRAND;
-        let nx = (x - (bx + bw / 2.0)) / (bw * 0.60);
-        let ny = (y - (by + bh * 0.58)) / (bw * 0.26);
-        // O empurrao poe o neuronio exatamente no bordo; a folga e para o
-        // arredondamento, nao para o desenho.
-        nx * nx + ny * ny < 0.999
+        home_tissue_field(1920.0, 1080.0, 1.0)
     }
 
     #[test]
-    fn home_background_never_runs_over_the_logo_itself() {
-        // O tecido passa por TRAS da arte -- ela vai para o ecra com o alfa
-        // dela --, mas nao pode passar por cima da esfera nem das letras, que
-        // sao o unico sitio onde a marca tem de se ler sem concorrencia.
+    fn the_tissue_runs_right_through_where_the_brand_sits() {
+        // Foi rejeitado tres vezes no ecra: primeiro um retangulo opaco a
+        // apagar o tecido (caixa), depois uma zona limpa a conter esse
+        // retangulo (buraco oval), depois uma zona limpa estreita (mancha
+        // escura a volta do logo). O que o dono quer e simples de dizer e
+        // simples de verificar: **nao ha buraco nenhum**. O tecido atravessa
+        // o sitio onde a marca esta, e a marca pousa em cima dele com o alfa
+        // que traz.
+        let (bx, by, bw, bh) = BRAND;
         let field = home_field();
-        for step in 0..60 {
-            let seconds = step as f64 * 0.37;
-            let frame = tissue::tissue_at(&field, seconds);
-            assert!(!frame.nodes.is_empty());
-            for node in &frame.nodes {
-                assert!(
-                    !on_the_logo(node.x, node.y),
-                    "soma por cima do logo em t={seconds}: ({}, {})",
-                    node.x,
-                    node.y
-                );
-            }
+        // Uma grelha sobre o retangulo da marca. Contar o total nao chega:
+        // uma zona limpa deixa o total alto e abre o buraco na mesma. O que
+        // tem de valer e que NENHUMA celula fica vazia.
+        const COLUMNS: usize = 4;
+        const ROWS: usize = 3;
+        for step in 0..40 {
+            let frame = tissue::tissue_at(&field, step as f64 * 0.31);
+            let mut cells = [[0usize; COLUMNS]; ROWS];
+            let mut count = |x: f64, y: f64| {
+                if x < bx || x > bx + bw || y < by || y > by + bh {
+                    return;
+                }
+                let col = (((x - bx) / bw * COLUMNS as f64) as usize).min(COLUMNS - 1);
+                let row = (((y - by) / bh * ROWS as f64) as usize).min(ROWS - 1);
+                cells[row][col] += 1;
+            };
             for branch in &frame.branches {
-                for (x, y) in [(branch.ax, branch.ay), (branch.bx, branch.by)] {
+                count(branch.ax, branch.ay);
+                count(branch.bx, branch.by);
+            }
+            for node in &frame.nodes {
+                count(node.x, node.y);
+            }
+            for (row, line) in cells.iter().enumerate() {
+                for (col, found) in line.iter().enumerate() {
                     assert!(
-                        !on_the_logo(x, y),
-                        "ramo por cima do logo em t={seconds}: ({x}, {y})"
+                        *found > 0,
+                        "nada na celula ({row}, {col}) do retangulo da marca \
+                         em t={:.2}: e um buraco, so que mais pequeno",
+                        step as f64 * 0.31
                     );
                 }
             }
-            for burst in &frame.bursts {
-                assert!(
-                    !on_the_logo(burst.x, burst.y),
-                    "descarga por cima do logo em t={seconds}: ({}, {})",
-                    burst.x,
-                    burst.y
-                );
-            }
         }
-    }
-
-    #[test]
-    fn the_tissue_runs_behind_the_brand_instead_of_leaving_a_hole() {
-        // O contrario tambem tem de valer: uma zona limpa grande o suficiente
-        // para conter o retangulo da arte trocava a caixa por um buraco oval a
-        // meio da tela. O tecido tem de chegar ao retangulo -- e a arte, com
-        // alfa, pousa em cima.
-        let (bx, by, bw, bh) = BRAND;
-        let field = home_field();
-        let frame = tissue::tissue_at(&field, 6.0);
-        let inside_rect = |x: f64, y: f64| x >= bx && x <= bx + bw && y >= by && y <= by + bh;
-        let touching = frame
-            .branches
-            .iter()
-            .filter(|b| inside_rect(b.ax, b.ay) || inside_rect(b.bx, b.by))
-            .count();
-        assert!(
-            touching > 8,
-            "so {touching} ramos entram no retangulo da arte: ficou um buraco \
-             oval onde devia haver tecido"
-        );
     }
 
     #[test]
