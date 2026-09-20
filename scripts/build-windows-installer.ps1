@@ -11,7 +11,9 @@ param(
 
     [switch]$Sign,
 
-    [switch]$SkipTimestamp
+    [switch]$SkipTimestamp,
+
+    [switch]$AllowUntrustedTestCertificate
 )
 
 $ErrorActionPreference = "Stop"
@@ -89,6 +91,13 @@ function Import-SigningCertificate {
     }
 }
 
+if ($AllowUntrustedTestCertificate -and -not $Sign) {
+    throw "-AllowUntrustedTestCertificate is valid only together with -Sign."
+}
+if ($AllowUntrustedTestCertificate -and -not $SkipTimestamp) {
+    throw "-AllowUntrustedTestCertificate is test-only and requires -SkipTimestamp."
+}
+
 $sourceExe = (Resolve-Path -LiteralPath $ExePath).Path
 if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
     throw "Version '$Version' is not a supported semantic version."
@@ -149,18 +158,24 @@ if ($Sign) {
             throw "signtool failed to sign the installer."
         }
 
-        & $signTool verify /pa /all /v $installer
-        if ($LASTEXITCODE -ne 0) {
-            throw "signtool could not verify the signed installer."
+        if (-not $AllowUntrustedTestCertificate) {
+            & $signTool verify /pa /all /v $installer
+            if ($LASTEXITCODE -ne 0) {
+                throw "signtool could not verify the signed installer."
+            }
         }
 
-        $signature = Get-AuthenticodeSignature -FilePath $installer
-        if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
-            throw "Authenticode verification returned status '$($signature.Status)'."
+        $verifyParams = @{
+            InstallerPath = $installer
+            ExpectedThumbprint = $certificate.Thumbprint
         }
-        if (-not $SkipTimestamp -and -not $signature.TimeStamperCertificate) {
-            throw "Stable installer signing completed without a timestamp certificate."
+        if (-not $SkipTimestamp) {
+            $verifyParams.RequireTimestamp = $true
         }
+        if ($AllowUntrustedTestCertificate) {
+            $verifyParams.AllowUntrustedTestCertificate = $true
+        }
+        & "$PSScriptRoot/verify-windows-installer-signature.ps1" @verifyParams
     }
     finally {
         if ($certificate) {
