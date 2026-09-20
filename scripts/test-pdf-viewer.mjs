@@ -33,6 +33,14 @@ test('InvalidPDFException is classified as document failure', () => {
   );
 });
 
+test('PasswordException is classified as unsupported password protection', () => {
+  const err = new pdfjsLib.PasswordException('Password required', pdfjsLib.PasswordResponses.NEED_PASSWORD);
+  assert.equal(
+    describeLoadError(err),
+    'Este PDF está protegido por senha e o NeuralIA ainda não consegue abri-lo.'
+  );
+});
+
 test('wrapped fetch failure remains a transport failure', () => {
   const err = { name: 'UnknownErrorException', message: 'Failed to fetch document' };
   assert.equal(
