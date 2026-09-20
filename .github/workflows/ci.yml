@@ -12,6 +12,19 @@ permissions:
   contents: read
 
 jobs:
+  core-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+        with:
+          components: clippy
+      - run: cargo check -p neural-core
+      - run: cargo test -p neural-core
+      - run: cargo clippy -p neural-core -- -D warnings
+
   core:
     runs-on: ubuntu-latest
     steps:
