@@ -100,7 +100,7 @@ jobs:
         run: |
           $line = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
           $version = $line.Matches[0].Groups[1].Value
-          $plainPassword = "NeuralIA-CI-$env:GITHUB_RUN_ID"
+          $plainPassword = [Guid]::NewGuid().ToString("N") + [Guid]::NewGuid().ToString("N")
           $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
           $pfxPath = Join-Path $env:RUNNER_TEMP "neuralia-ci-authenticode.pfx"
           $cert = $null
