@@ -274,6 +274,9 @@ impl MemoryStore {
         }
 
         let json_path = self.document_path(&document.id);
+        // Um `stat` constante em vez de listar o directorio inteiro para saber
+        // se este documento e novo.
+        let is_new = !json_path.exists();
         atomic_write(
             &json_path,
             &serde_json::to_vec_pretty(&document).map_err(io::Error::other)?,
@@ -290,7 +293,7 @@ impl MemoryStore {
         if !sqlite_existed && !tombstones.is_empty() {
             sqlite_v01::sync_tombstones(&self.sqlite_path(), &tombstones)?;
         }
-        self.write_index_manifest()?;
+        self.write_index_manifest(Some(usize::from(is_new)))?;
         Ok(CaptureOutcome::Stored(document.id))
     }
 
@@ -590,7 +593,7 @@ impl MemoryStore {
         let sessions = self.research_sessions()?;
         sqlite_v01::rebuild(&self.sqlite_path(), &docs, &sessions)?;
         sqlite_v01::sync_tombstones(&self.sqlite_path(), &tombstones)?;
-        self.write_index_manifest()
+        self.write_index_manifest(None)
     }
 
     fn session_for_document(&self, document: &MemoryDocument) -> Option<ResearchSession> {
@@ -713,7 +716,27 @@ impl MemoryStore {
             .count())
     }
 
-    fn write_index_manifest(&self) -> io::Result<()> {
+    fn manifest_path(&self) -> PathBuf {
+        self.root.join("db").join("index-manifest.json")
+    }
+
+    /// Quantos documentos o manifesto anterior declarava, ou `None` quando nao
+    /// ha manifesto legivel.
+    fn manifest_documents(&self) -> Option<usize> {
+        #[derive(Deserialize)]
+        struct Counted {
+            documents: usize,
+        }
+        let bytes = fs::read(self.manifest_path()).ok()?;
+        serde_json::from_slice::<Counted>(&bytes)
+            .ok()
+            .map(|counted| counted.documents)
+    }
+
+    /// `delta` e quantos documentos NOVOS esta escrita acrescenta: `Some(0)`
+    /// quando se reescreveu um que ja existia, `Some(1)` quando nasceu um, e
+    /// `None` quando se quer recontar do zero (rebuild, forget).
+    fn write_index_manifest(&self, delta: Option<usize>) -> io::Result<()> {
         #[derive(Serialize)]
         struct Manifest {
             schema: u32,
@@ -723,19 +746,31 @@ impl MemoryStore {
             retrieval: [&'static str; 4],
         }
 
+        // Contar ficheiros custa uma leitura do directorio, e este manifesto
+        // escreve-se A CADA CAPTURA: com 600 paginas no corpus, o CI do Windows
+        // media 115 ms na primeira captura contra 559 ms na ultima, e o gate de
+        // `memory_capture_cost` apanhou-o. Foi a minha propria correccao
+        // anterior que deixou isto para tras: troquei "desserializar o corpus
+        // todo" por "listar o directorio", que e muito mais barato mas continua
+        // a ser linear.
+        //
+        // O numero nao e lido por codigo nenhum (o `doctor` so verifica que o
+        // ficheiro existe), por isso a captura soma ao que ja estava escrito e
+        // so o `rebuild`/`forget` reconta.
+        let documents = match delta {
+            Some(delta) => self.manifest_documents().unwrap_or(0).saturating_add(delta),
+            None => self.document_file_count()?,
+        };
+
         let manifest = Manifest {
             schema: MEMORY_SCHEMA_VERSION,
             generated_at: unix_seconds(),
-            // Contar ficheiros, nao desserializar o corpus todo: este
-            // manifesto escreve-se a cada captura e o numero e o unico campo
-            // que dependia do conteudo. Documentos privados nunca chegam a
-            // ser escritos (ver `capture`), por isso a contagem e a mesma.
-            documents: self.document_file_count()?,
+            documents,
             sqlite: "rusqlite-v01-derived",
             retrieval: ["lexical", "entity", "graph", "semantic"],
         };
         atomic_write(
-            &self.root.join("db").join("index-manifest.json"),
+            &self.manifest_path(),
             &serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?,
         )
     }
