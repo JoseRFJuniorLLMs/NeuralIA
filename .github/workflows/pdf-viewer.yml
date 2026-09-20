@@ -1,0 +1,27 @@
+name: PDF viewer
+
+on:
+  pull_request:
+    paths:
+      - 'assets/pdfjs/**'
+      - 'scripts/test-pdf-viewer.mjs'
+      - '.github/workflows/pdf-viewer.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'assets/pdfjs/**'
+      - 'scripts/test-pdf-viewer.mjs'
+      - '.github/workflows/pdf-viewer.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Exercise PDF viewer runtime invariants
+        run: node scripts/test-pdf-viewer.mjs
