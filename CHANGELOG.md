@@ -41,7 +41,7 @@ All notable changes to NeuralIA are documented here.
 - Revisão adversarial independente e release 2.1.0 permanecem pendentes.
 
 ### Fixed
-- **O visualizador PDF fecha o overlay de carregamento de forma determinística.**
+- **PR #66 — o visualizador PDF fecha o overlay de carregamento de forma determinística.**
   `hidden` deixa de depender da precedência de `#status { display:grid }`: o
   viewer controla também `display` diretamente. Erros HTTP/PDF passam a usar
   as classes exportadas pelo PDF.js antes do fallback textual.
