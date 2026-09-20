@@ -134,7 +134,10 @@ jobs:
             },
             [pscustomobject]@{
               type = "library"; name = "pdf.js JBIG2 decoder"; version = "6.3.289"
-              licenses = @([pscustomobject]@{ license = [pscustomobject]@{ id = "Apache-2.0" } })
+              licenses = @(
+                [pscustomobject]@{ license = [pscustomobject]@{ id = "BSD-3-Clause" } },
+                [pscustomobject]@{ license = [pscustomobject]@{ id = "Apache-2.0" } }
+              )
               properties = @([pscustomobject]@{ name = "neuralia:vendored"; value = "assets/pdfjs/wasm/jbig2.wasm" })
             },
             [pscustomobject]@{
