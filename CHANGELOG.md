@@ -21,6 +21,12 @@ All notable changes to NeuralIA are documented here.
   Links internos do Reader continuam sendo a exceção sem token.
 
 ### Validation
+- **SPEC-0103 fecha a aceitação da timeline sem cronómetro absoluto.** O CI
+  executa as duas funções `semanticAnchors()` que realmente embarcam contra
+  fixtures ChatGPT/Gemini/Claude e mede 16→64 nós por rácio. O parser Rust de
+  referência recebe o mesmo gate por fornecedor e 256→1024 secções. Mutações
+  deliberadas de papel e trabalho O(n²) precisam deixar ambos vermelhos.
+
 - **Pipeline de release consolidado.** O executável publicado continua sendo o
   mesmo `NeuralIA.exe` medido pelo CI, com checksum verificado antes do
   empacotamento; o release gera SBOM, instalador Authenticode quando as
