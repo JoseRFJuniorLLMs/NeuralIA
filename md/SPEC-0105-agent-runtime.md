@@ -84,10 +84,19 @@ The tests introduced with PR #43 deliberately fail when
 ## 5. Element references and DOM movement
 
 Each observation rebuilds short-lived element records with generation, role,
-accessible name/text, origin/frame and interactability information. Commands
+accessible name/text, origin, frame and interactability information. Commands
 are resolved again from the latest observation before execution. The
 application-owned execution script also guards the expected element properties
 before acting.
+
+Two of those fields are constants today, and the specification says so rather
+than implying an observation that does not happen. `frame` is always `"top"`
+because the injected observer returns early in child frames
+(`if (window.top !== window) return;`), so no element from a subframe is ever
+reported; and `visible` is always `true` because the observer filters on
+`getBoundingClientRect` plus `display`/`visibility` before emitting a row. They
+are true by construction, not by measurement. A future observer that reports
+subframes must make `frame` real before any gate relies on it.
 
 References are therefore ephemeral. A stale page must produce a new
 observation rather than granting authority to an old target.
