@@ -1,0 +1,30 @@
+name: SABOTAGE winshell identity #89 v2
+
+on:
+  push:
+    branches: [test/sabotage-winshell-89-v2]
+
+permissions:
+  contents: read
+
+jobs:
+  prove-red:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e
+      - name: Accept every destination only inside runner
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("crates/neural-setup/src/winshell.rs")
+          source = path.read_text(encoding="utf-8")
+          needle = "    Ok(file_identity(left)? == file_identity(right)?)\n"
+          sabotage = "    Ok(true) // SABOTAGE runner-only\n"
+          if source.count(needle) != 1:
+              raise SystemExit("identity comparison anchor not unique")
+          path.write_text(source.replace(needle, sabotage, 1), encoding="utf-8")
+      - name: Negative gate must turn red
+        run: cargo test --locked -p neural-setup winshell::tests::a_shortcut_to_another_executable_is_not_the_same_destination -- --exact
