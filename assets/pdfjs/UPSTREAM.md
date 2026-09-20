@@ -32,3 +32,18 @@ sítio onde ela custa mais.
 dizer o mesmo número: a `const version` dentro do `pdf.mjs`, a tabela acima, e a
 versão escrita no `release.yml`. Atualizar o PDF.js implica atualizar este
 ficheiro — é esse o objetivo.
+
+
+## Runtime auxiliar do viewer
+
+O viewer do NeuralIA usa `useWasm: false` de forma deliberada e aponta
+`wasmUrl` para `./wasm/`. Nessa pasta ficam os fallbacks JavaScript oficiais
+de OpenJPEG e JBIG2 da **mesma release v6.3.289**, copiados sem alterações de:
+
+- `external/openjpeg/openjpeg_nowasm_fallback.js`;
+- `external/jbig2/jbig2_nowasm_fallback.js`.
+
+Isto evita pedidos inválidos `null*.wasm` quando os binários WASM não são
+distribuídos e mantém a descodificação JPEG2000/JBIG2 disponível. QCMS/ICC por
+WASM continua deliberadamente desativado até os binários correspondentes serem
+vendorizados com proveniência equivalente.
