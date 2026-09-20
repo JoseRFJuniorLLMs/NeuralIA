@@ -81,12 +81,14 @@ jobs:
           from pathlib import Path
           path = Path("crates/neural-app/src/pdf_assets.rs")
           text = path.read_text(encoding="utf-8")
-          needle = '        "/icc/CGATS001Compat-v2-micro.icc" => '
-          lines = text.splitlines()
-          changed = [line for line in lines if needle not in line]
-          if len(changed) == len(lines):
-              raise SystemExit("ICC sabotage target not found")
-          path.write_text("\n".join(changed) + "\n", encoding="utf-8")
+          arm = '''        "/icc/CGATS001Compat-v2-micro.icc" => (
+            "application/vnd.iccprofile",
+            include_bytes!("../../../assets/pdfjs/icc/CGATS001Compat-v2-micro.icc"),
+        ),
+'''
+          if text.count(arm) != 1:
+              raise SystemExit("ICC sabotage arm not found exactly once")
+          path.write_text(text.replace(arm, "", 1), encoding="utf-8")
           PY
           set +e
           cargo test --locked -p neural-app pdf_assets::tests::auxiliary_asset_lookup_is_fail_closed
