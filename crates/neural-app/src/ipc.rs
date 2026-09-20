@@ -33,6 +33,14 @@ pub enum IpcAction {
         col: usize,
         url: String,
     },
+    /// Um clique num link dentro de uma coluna. `aside` distingue as duas
+    /// intencoes do Chrome: clique simples abre onde se esta, Ctrl+clique (ou
+    /// clique do meio) abre "noutro separador" -- aqui, o painel lateral.
+    Link {
+        col: usize,
+        url: String,
+        aside: bool,
+    },
     SplitClose,
     SplitExpand,
     Palette {
@@ -143,6 +151,23 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
             Some(IpcAction::Split {
                 col,
                 url: url.to_string(),
+            })
+        }
+        "link" => {
+            let col = bounded_col(args, max_columns)?;
+            let raw = bounded_string(args, "url", 2_048, false)?;
+            let aside = args.get("aside")?.as_bool()?;
+            exact_keys(args, &["col", "url", "aside"])?;
+            let url = validate_web_url(&raw).ok()?;
+            // A mesma politica do `split`: uma pagina nao usa um clique para
+            // mandar o navegador a rede local de quem a esta a ler.
+            if is_local_network_target(&url) {
+                return None;
+            }
+            Some(IpcAction::Link {
+                col,
+                url: url.to_string(),
+                aside,
             })
         }
         "split-close" => no_args(args, IpcAction::SplitClose),
@@ -336,6 +361,108 @@ mod tests {
         assert!(parse_ipc_message(&message("expand", json!({"col":3})), CAP, 3).is_none());
         assert!(parse_ipc_message(&message("expand", json!({"col":"1"})), CAP, 3).is_none());
         assert!(parse_ipc_message(&message("home", json!({"col":0})), CAP, 3).is_none());
+    }
+
+    #[test]
+    fn a_link_click_carries_which_panel_it_opens_in() {
+        // O `aside` e a diferenca entre "abre aqui" e "abre ao lado". Se
+        // chegasse por omissao, um clique simples abria sempre no mesmo sitio.
+        assert_eq!(
+            parse_ipc_message(
+                &message(
+                    "link",
+                    json!({"col":1,"url":"https://example.com/a","aside":false})
+                ),
+                CAP,
+                3
+            ),
+            Some(IpcAction::Link {
+                col: 1,
+                url: "https://example.com/a".into(),
+                aside: false
+            })
+        );
+        assert_eq!(
+            parse_ipc_message(
+                &message(
+                    "link",
+                    json!({"col":2,"url":"https://example.com/b","aside":true})
+                ),
+                CAP,
+                3
+            ),
+            Some(IpcAction::Link {
+                col: 2,
+                url: "https://example.com/b".into(),
+                aside: true
+            })
+        );
+    }
+
+    #[test]
+    fn a_link_click_obeys_the_same_policy_as_the_split() {
+        // Uma pagina nao usa um clique para mandar o navegador de quem a le a
+        // um endereco da rede local dele.
+        for url in [
+            "http://127.0.0.1:8080/",
+            "http://192.168.1.10/",
+            "http://localhost/",
+            "file:///C:/Windows/System32/drivers/etc/hosts",
+            "javascript:alert(1)",
+            "neuralia:home",
+        ] {
+            assert!(
+                parse_ipc_message(
+                    &message("link", json!({"col":0,"url":url,"aside":true})),
+                    CAP,
+                    3
+                )
+                .is_none(),
+                "{url} devia ser recusado"
+            );
+        }
+        // Coluna fora do alcance, tipo errado e chaves a mais ou a menos.
+        assert!(
+            parse_ipc_message(
+                &message(
+                    "link",
+                    json!({"col":9,"url":"https://example.com/","aside":true})
+                ),
+                CAP,
+                3
+            )
+            .is_none()
+        );
+        assert!(
+            parse_ipc_message(
+                &message(
+                    "link",
+                    json!({"col":0,"url":"https://example.com/","aside":"sim"})
+                ),
+                CAP,
+                3
+            )
+            .is_none()
+        );
+        assert!(
+            parse_ipc_message(
+                &message("link", json!({"col":0,"url":"https://example.com/"})),
+                CAP,
+                3
+            )
+            .is_none()
+        );
+        assert!(
+            parse_ipc_message(
+                &message(
+                    "link",
+                    json!({"col":0,"url":"https://example.com/","aside":true,"extra":1})
+                ),
+                CAP,
+                3
+            )
+            .is_none()
+        );
     }
 
     #[test]

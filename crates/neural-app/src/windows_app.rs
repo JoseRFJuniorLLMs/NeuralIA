@@ -121,6 +121,11 @@ enum UserEvent {
     OpenExternal(String),
     /// Popup pedido por uma coluna do comparador: carrega nessa coluna.
     OpenInColumn(usize, String),
+    /// Clique simples num link: a mesma pagina nas TRES colunas, para se
+    /// poder comparar o que cada IA diz dela. E o gesto que distingue este
+    /// navegador de um normal, onde o clique so afeta o separador de onde
+    /// partiu.
+    OpenEverywhere(String),
     /// Fonte aberta sem abandonar a conversa que a originou.
     OpenSplit {
         source_index: usize,
@@ -4222,6 +4227,50 @@ impl App {
         }
     }
 
+    /// Que evento nasce de uma mensagem vinda da coluna `col_index`.
+    ///
+    /// Vive fora do closure do IPC de proposito. A decisao que aqui se toma --
+    /// em especial a de um clique num link ir para a propria coluna ou para o
+    /// painel lateral -- e a que o utilizador ve, e dentro de um closure de
+    /// `WebViewBuilder` nao havia forma de a exercitar sem abrir uma janela.
+    #[allow(clippy::needless_pass_by_value)]
+    fn column_ipc_event_impl(col_index: usize, action: IpcAction) -> Option<UserEvent> {
+        match action {
+            IpcAction::ResearchAnswer { col, text } if col == col_index => {
+                Some(UserEvent::ResearchAnswer {
+                    source_index: col_index,
+                    text,
+                })
+            }
+            // Clique simples: a pagina abre nas TRES colunas, para se ver o
+            // que cada IA diz dela. Ctrl+clique: abre no painel lateral e a
+            // barra de titulo guarda a aba -- o "novo separador" do Chrome.
+            IpcAction::Link { col, url, aside } if col == col_index => Some(if aside {
+                UserEvent::OpenSplit {
+                    source_index: col_index,
+                    url,
+                }
+            } else {
+                UserEvent::OpenEverywhere(url)
+            }),
+            IpcAction::Split { col, url } if col == col_index => Some(UserEvent::OpenSplit {
+                source_index: col_index,
+                url,
+            }),
+            IpcAction::Palette { col } if col == col_index => {
+                Some(UserEvent::OpenPalette(col_index))
+            }
+            IpcAction::Minimize { col } if col == col_index => {
+                Some(UserEvent::MinimizeComparator(col_index))
+            }
+            IpcAction::NewTab { col: Some(col) } if col == col_index => {
+                Some(UserEvent::NewTab(col_index))
+            }
+            IpcAction::Expand { col } => Some(UserEvent::ExpandComparator(col)),
+            other => common_ipc_event(other),
+        }
+    }
+
     fn comparator_webview_builder(
         &self,
         col_index: usize,
@@ -4232,44 +4281,31 @@ impl App {
         let capability = remote_capability();
         let ipc_capability = capability.clone();
 
-        let init_script = format!(
-            "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{AI_AUTO_SUBMIT_SCRIPT}\n{COMPARATOR_INJECT_SCRIPT}"
-        )
-        .replace("__NEURALIA_CAP__", &capability);
+        // Um script por chamada, e nao os tres concatenados num so. O
+        // WebView2 executa cada script de inicializacao isoladamente: assim
+        // uma excecao ao nivel de topo de um deles -- o `sessionStorage` do
+        // auto-submit, por exemplo, que lanca com armazenamento particionado --
+        // deixa de levar atras o COMPARATOR_INJECT_SCRIPT, e com ele os
+        // cliques nos links e os controlos da coluna.
+        let prelude = format!(
+            "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';"
+        );
+        let keymap = NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", &capability);
+        let auto_submit = AI_AUTO_SUBMIT_SCRIPT.replace("__NEURALIA_CAP__", &capability);
+        let inject = COMPARATOR_INJECT_SCRIPT.replace("__NEURALIA_CAP__", &capability);
 
         WebViewBuilder::new()
-            .with_initialization_script(init_script)
+            .with_initialization_script(prelude)
+            .with_initialization_script(keymap)
+            .with_initialization_script(auto_submit)
+            .with_initialization_script(inject)
             .with_ipc_handler(move |request| {
                 let Some(action) =
                     parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
                 else {
                     return;
                 };
-                let event = match action {
-                    IpcAction::ResearchAnswer { col, text } if col == col_index => {
-                        Some(UserEvent::ResearchAnswer {
-                            source_index: col_index,
-                            text,
-                        })
-                    }
-                    IpcAction::Split { col, url } if col == col_index => {
-                        Some(UserEvent::OpenSplit {
-                            source_index: col_index,
-                            url,
-                        })
-                    }
-                    IpcAction::Palette { col } if col == col_index => {
-                        Some(UserEvent::OpenPalette(col_index))
-                    }
-                    IpcAction::Minimize { col } if col == col_index => {
-                        Some(UserEvent::MinimizeComparator(col_index))
-                    }
-                    IpcAction::NewTab { col: Some(col) } if col == col_index => {
-                        Some(UserEvent::NewTab(col_index))
-                    }
-                    IpcAction::Expand { col } => Some(UserEvent::ExpandComparator(col)),
-                    other => common_ipc_event(other),
-                };
+                let event = Self::column_ipc_event_impl(col_index, action);
                 if let Some(event) = event {
                     let _ = ipc_proxy.send_event(event);
                 }
@@ -4284,7 +4320,12 @@ impl App {
                 remote_web_target(&target, None) || is_view_source_target(&target, None)
             })
             .with_new_window_req_handler(move |target, _features| {
-                if remote_web_target(&target, None) {
+                // `about:blank` NAO. Muitos sites abrem uma ligacao com
+                // `window.open('', '_blank')` e so depois atribuem o endereco
+                // ao popup: o WebView2 levanta o pedido com `about:blank`, e
+                // carregar isso na coluna apagava a conversa da IA e nao
+                // abria link nenhum. Ficar quieto deixa a pagina como estava.
+                if !target.eq_ignore_ascii_case("about:blank") && remote_web_target(&target, None) {
                     let _ = new_window_proxy.send_event(UserEvent::OpenInColumn(col_index, target));
                 }
                 NewWindowResponse::Deny
@@ -4312,6 +4353,39 @@ impl App {
         if !loaded {
             self.web(url);
         }
+    }
+
+    /// A mesma pagina nas tres colunas.
+    ///
+    /// Nao mexe no comparador nem no painel lateral: so troca o endereco de
+    /// cada coluna. Se alguma recusar -- uma coluna minimizada nao tem
+    /// WebView --, as outras seguem na mesma; um clique num link nao pode
+    /// desmontar a comparacao por causa de uma delas.
+    fn open_everywhere(&mut self, url: String) {
+        if self.surface != Surface::Comparator {
+            self.web(url);
+            return;
+        }
+        let Ok(valid) = neural_core::validate_web_url(&url) else {
+            self.show_splash("URL da fonte inválida.".to_string(), 3);
+            return;
+        };
+        if neural_core::is_local_network_target(&valid) {
+            self.show_splash(
+                "A página não pode redirecionar a fonte para a rede local.".to_string(),
+                4,
+            );
+            return;
+        }
+
+        let target = valid.to_string();
+        let Some(comp) = &self.comparator else {
+            return;
+        };
+        for view in &comp.views {
+            let _ = view.webview.load_url(&target);
+        }
+        self.request_redraw();
     }
 
     fn split_webview_builder(
@@ -7019,6 +7093,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::OpenExternal(url) => self.web(url),
             UserEvent::OpenInColumn(index, url) => self.open_in_column(index, url),
+            UserEvent::OpenEverywhere(url) => self.open_everywhere(url),
             UserEvent::OpenSplit { source_index, url } => {
                 self.open_split(source_index, url, false);
             }
@@ -10279,11 +10354,76 @@ mod tests {
         assert!(!COMPARATOR_INJECT_SCRIPT.contains("neuralia:research-answer"));
     }
 
+    /// O comportamento que o dono descreveu em duas frases: "clicou abre,
+    /// segurou control abre em outra aba".
+    ///
+    /// O guard que b8f6fc2 acrescentou tirou o desvio do clique simples e nao
+    /// pos nada no lugar: o clique deixou de ter tratamento nenhum. E o
+    /// caminho do Ctrl era testado apenas por uma assercao sobre o TEXTO do
+    /// script, que continuava verde com a funcionalidade partida.
+    #[test]
+    fn a_plain_click_opens_in_all_three_panels_and_ctrl_click_opens_beside() {
+        let url = "https://example.com/fonte".to_string();
+
+        match App::column_ipc_event_impl(
+            1,
+            IpcAction::Link {
+                col: 1,
+                url: url.clone(),
+                aside: false,
+            },
+        ) {
+            Some(UserEvent::OpenEverywhere(opened)) => assert_eq!(opened, url),
+            other => panic!("clique simples devia abrir nas tres colunas, veio {other:?}"),
+        }
+
+        match App::column_ipc_event_impl(
+            1,
+            IpcAction::Link {
+                col: 1,
+                url: url.clone(),
+                aside: true,
+            },
+        ) {
+            Some(UserEvent::OpenSplit {
+                source_index,
+                url: opened,
+            }) => {
+                assert_eq!(source_index, 1);
+                assert_eq!(opened, url);
+            }
+            other => panic!("Ctrl+clique devia abrir ao lado, veio {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_click_reported_by_another_column_is_ignored() {
+        // Cada coluna tem o seu handler de IPC. Sem esta verificacao, uma
+        // pagina numa coluna mandava a outra abrir o que lhe apetecesse.
+        assert!(
+            App::column_ipc_event_impl(
+                0,
+                IpcAction::Link {
+                    col: 2,
+                    url: "https://example.com/".into(),
+                    aside: true,
+                },
+            )
+            .is_none()
+        );
+    }
+
     #[test]
     fn comparator_has_split_palette_and_real_three_way_submit() {
         assert!(
-            COMPARATOR_INJECT_SCRIPT.contains("act('split', { col:colIndex, url:target.href })")
+            COMPARATOR_INJECT_SCRIPT
+                .contains("act('link', { col:colIndex, url:target.href, aside:aside })")
         );
+        // O botao do meio chega como `auxclick`; dentro de `click` o
+        // `event.button` e sempre 0. Ter isto aqui e presenca, nao
+        // comportamento -- o que decide para onde vai o clique esta em
+        // `column_ipc_event_impl`, e esse tem teste a serio.
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("'auxclick'"));
         assert!(NEURALIA_KEYMAP_SCRIPT.contains("act('palette', { col:colIndex })"));
         assert!(!NEURALIA_KEYMAP_SCRIPT.contains("q="));
         assert!(SPLIT_SCROLL_RAIL_SCRIPT.contains("neuralia-split-scroll-rail"));
@@ -10307,11 +10447,25 @@ mod tests {
                 .and_then(|part| part.split(".with_new_window_req_handler").next())
                 .expect(builder);
             assert!(body.contains("with_ipc_handler"), "{builder}");
-            assert!(body.contains("IpcAction::Palette"), "{builder}");
-            assert!(body.contains("UserEvent::OpenPalette("), "{builder}");
             assert!(!body.contains("neuralia_query_param"), "{builder}");
             assert!(!body.contains("PaletteSubmit"), "{builder}");
         }
+
+        // A palette da COLUNA ja nao se verifica por texto: o despacho saiu do
+        // closure para uma funcao, e agora chama-se.
+        assert!(matches!(
+            App::column_ipc_event_impl(1, IpcAction::Palette { col: 1 }),
+            Some(UserEvent::OpenPalette(1))
+        ));
+        // O painel lateral mantem o despacho dentro do closure, e por isso
+        // continua a ser so presenca.
+        let split_body = source
+            .split("fn split_webview_builder")
+            .nth(1)
+            .and_then(|part| part.split(".with_new_window_req_handler").next())
+            .expect("split builder");
+        assert!(split_body.contains("IpcAction::Palette"));
+        assert!(split_body.contains("UserEvent::OpenPalette("));
 
         let edit = source
             .split("fn palette_edit_subclass")
@@ -12293,13 +12447,27 @@ const GMAIL_MONITOR_SCRIPT: &str = r#"
 /// ele proprio antes de enviar.
 const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
 (function () {
+  // So no frame de topo. Este script ESCREVE numa caixa de texto, e o WebView2
+  // injeta os scripts de inicializacao tambem nos frames filhos: sem esta
+  // guarda, um iframe da mesma origem levava com a pergunta escrita dentro.
+  if (window.top !== window) return;
   const host = location.hostname.toLowerCase();
   if (host !== 'chatgpt.com' && host !== 'claude.ai') return;
   const query = new URL(location.href).searchParams.get('q');
   if (!query || !query.trim()) return;
 
+  // O acesso ao sessionStorage pode LANCAR -- armazenamento particionado,
+  // cookies de terceiros bloqueados, modo restrito. Sem rede, um throw aqui
+  // ao nivel de topo abortava o script todo.
+  function stampRead(key) {
+    try { return Number(sessionStorage.getItem(key) || '0'); } catch (_) { return 0; }
+  }
+  function stampWrite(key, value) {
+    try { sessionStorage.setItem(key, String(value)); } catch (_) {}
+  }
+
   const stampKey = 'neuralia:auto-submit:' + host + ':' + query;
-  if (Date.now() - Number(sessionStorage.getItem(stampKey) || '0') < 10000) return;
+  if (Date.now() - stampRead(stampKey) < 10000) return;
 
   const EDITORS = 'div[contenteditable="true"][role="textbox"], div[contenteditable="true"], [data-testid="prompt-textarea"], textarea';
 
@@ -12337,6 +12505,29 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
     el.dispatchEvent(new Event('input', { bubbles:true }));
   }
 
+  // Apagar o que NOS escrevemos. So se usa quando desistimos: texto que o
+  // utilizador nao escreveu nao pode ficar na caixa de outra pessoa.
+  function clear(el) {
+    if (!el) return;
+    el.focus();
+    if (el.isContentEditable) {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      if (!document.execCommand('insertText', false, '')) {
+        el.textContent = '';
+        el.dispatchEvent(new InputEvent('input', { bubbles:true, inputType:'deleteContentBackward' }));
+      }
+      return;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
+    if (descriptor && descriptor.set) descriptor.set.call(el, '');
+    else el.value = '';
+    el.dispatchEvent(new Event('input', { bubbles:true }));
+  }
+
   function sendButton() {
     const selectors = host === 'chatgpt.com'
       ? ['button[data-testid="send-button"]', 'button[aria-label*="Send prompt"]', 'button[aria-label*="Send message"]', 'button[aria-label*="Enviar"]', 'form button[type="submit"]']
@@ -12350,10 +12541,31 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
     return null;
   }
 
+  // O sitio ja tratou da pergunta sozinho?
+  //
+  // O ChatGPT, com `?q=...&hints=search`, NAO se limita a preencher a caixa:
+  // envia a pergunta e troca a URL para `/uc/<id>` sem recarregar a pagina.
+  // A caixa fica entao vazia -- e o script, que guardou a pergunta no
+  // arranque, via-a vazia e escrevia-a de volta. Era isso que ficava escrito
+  // no ChatGPT depois de a resposta ja estar na tela.
+  //
+  // O sinal e a propria URL e nao o DOM: o `?q=` desaparece quando o site o
+  // consome, em qualquer provedor e em qualquer versao do HTML deles. Ler o
+  // DOM obrigava a conhecer os seletores de cada um -- e o ChatGPT tem pelo
+  // menos duas variantes (ligado e desligado) com marcadores diferentes.
+  function consumed() {
+    try {
+      return new URL(location.href).searchParams.get('q') !== query;
+    } catch (_) {
+      return true;
+    }
+  }
+
   let attempts = 0;
   let filled = false;
   function submitWhenReady() {
     attempts += 1;
+    if (consumed()) return;
     const el = editor();
     if (el) {
       // Dez tentativas (~1,5 s) a dar hipotese ao proprio site de preencher;
@@ -12365,14 +12577,14 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
       if (textOf(el)) {
         const button = sendButton();
         if (button) {
-          sessionStorage.setItem(stampKey, String(Date.now()));
+          stampWrite(stampKey, Date.now());
           button.click();
           return;
         }
         // Sem botao utilizavel, Enter no editor e o caminho que estes sitios
         // tambem aceitam.
         if (attempts > 20) {
-          sessionStorage.setItem(stampKey, String(Date.now()));
+          stampWrite(stampKey, Date.now());
           el.focus();
           for (const type of ['keydown', 'keypress', 'keyup']) {
             el.dispatchEvent(new KeyboardEvent(type, { key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true, cancelable:true }));
@@ -12381,7 +12593,14 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
         }
       }
     }
-    if (attempts < 120) setTimeout(submitWhenReady, 150);
+    if (attempts < 120) {
+      setTimeout(submitWhenReady, 150);
+      return;
+    }
+    // Desistimos ao fim de ~18 s. Se fomos NOS a escrever e nunca chegou a ser
+    // enviado, a pergunta nao pode ficar la a fingir que o utilizador a
+    // escreveu.
+    if (filled) clear(el || editor());
   }
 
   if (document.readyState === 'loading') {
@@ -12776,6 +12995,99 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
   const listen = Function.prototype.call.bind(EventTarget.prototype.addEventListener);
   const append = Function.prototype.call.bind(Node.prototype.appendChild);
 
+  // Semantica do Chrome: clique abre onde se esta, Ctrl+clique (ou clique do
+  // meio) abre "noutro separador" -- aqui, o painel lateral, com a aba na
+  // barra de titulo.
+  //
+  // Os listeners ficam registados JA, fora do DOMContentLoaded. Os scripts da
+  // propria pagina correm durante o parse, ou seja antes desse evento, e
+  // registam os deles em captura primeiro; quem chega depois recebe os
+  // eventos ja com `defaultPrevented` posto e desiste sem fazer nada.
+  const GOOGLE_REDIRECT_PARAMS = ['q', 'url', 'imgurl', 'adurl'];
+
+  function linkUrl(node) {
+    // Nem toda a fonte e uma <a href>: o AI Mode do Google e as citacoes do
+    // ChatGPT usam chips que trazem o endereco num atributo. Ler apenas
+    // `a[href]` deixava de fora justamente as ligacoes destas paginas -- que
+    // sao as unicas paginas onde isto corre.
+    const anchor = node.closest('a[href], [role="link"], [data-href], [data-url]');
+    if (!anchor) return null;
+    const raw = anchor.getAttribute('href')
+      || anchor.getAttribute('data-href')
+      || anchor.getAttribute('data-url');
+    if (!raw) return null;
+
+    let target;
+    try { target = new URL(raw, location.href); } catch (_) { return null; }
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') return null;
+
+    // O Google embrulha as fontes num redirecionamento seu. Desembrulhar pelo
+    // PARAMETRO e nao pelo caminho: /url, /imgres e /aclk sao caminhos
+    // diferentes para a mesma coisa, e so o primeiro estava coberto.
+    const host = target.hostname;
+    if (host === 'google.com' || host.endsWith('.google.com')) {
+      for (const name of GOOGLE_REDIRECT_PARAMS) {
+        const actual = target.searchParams.get(name);
+        if (!actual) continue;
+        try {
+          const unwrapped = new URL(actual, location.href);
+          if (unwrapped.protocol === 'http:' || unwrapped.protocol === 'https:') {
+            target = unwrapped;
+            break;
+          }
+        } catch (_) {}
+      }
+    }
+    return target;
+  }
+
+  function routeLink(event, aside) {
+    if (!event.isTrusted || event.defaultPrevented) return;
+    // Alt e Shift sao gestos do proprio navegador (descarregar, nova janela);
+    // nao os roubamos.
+    if (event.altKey || event.shiftKey) return;
+    const node = event.target;
+    if (!node || !node.closest) return;
+    if (node.closest('#neuralia-comp-controls,#neuralia-palette')) return;
+
+    const target = linkUrl(node);
+    if (!target) return;
+
+    // Clique simples numa ligacao do proprio sitio e navegacao interna da
+    // aplicacao: a SPA trata disso melhor do que um load_url, que recarregava
+    // a pagina toda e perdia a conversa. Com Ctrl a intencao e explicita e
+    // vale para qualquer endereco, incluindo o do proprio sitio.
+    if (!aside && target.origin === location.origin) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    act('link', { col:colIndex, url:target.href, aside:aside });
+  }
+
+  listen(document, 'click', (event) => {
+    if (event.button !== 0) return;
+    routeLink(event, !!(event.ctrlKey || event.metaKey));
+  }, true);
+
+  // O botao do meio NAO dispara 'click' desde o Chrome 55 -- dispara
+  // 'auxclick'. O `event.button === 1` que aqui estava dentro do 'click' era
+  // codigo morto: naquele evento o botao e sempre 0.
+  listen(document, 'auxclick', (event) => {
+    if (event.button !== 1) return;
+    routeLink(event, true);
+  }, true);
+
+  listen(document, 'dblclick', (event) => {
+    if (!event.isTrusted || event.defaultPrevented) return;
+    if (event.target && event.target.closest
+        && event.target.closest('#neuralia-comp-controls,#neuralia-palette')) return;
+    const tag = event.target && event.target.tagName
+      ? event.target.tagName.toUpperCase() : '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (event.target && event.target.isContentEditable) return;
+    act('expand', { col:colIndex });
+  }, true);
+
   listen(document, 'DOMContentLoaded', () => {
     let researchAnswerTimer = 0;
     let lastResearchAnswer = '';
@@ -13125,48 +13437,6 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
       if (!byId('neuralia-comp-controls')) mountControls();
     }).observe(document.documentElement, { childList:true, subtree:true });
 
-    // Ctrl+clique (ou clique do meio) abre a fonte AO LADO, no painel lateral,
-    // e cria a aba na barra de titulo. Clique normal segue o link na propria
-    // coluna, como em qualquer browser -- antes QUALQUER clique era desviado
-    // para o Split View e nao havia maneira de simplesmente seguir uma ligacao.
-    listen(document, 'click', (event) => {
-      if (!event.isTrusted || event.defaultPrevented) return;
-      if (!(event.ctrlKey || event.metaKey || event.button === 1)) return;
-      if (event.target && event.target.closest
-          && event.target.closest('#neuralia-comp-controls,#neuralia-palette')) return;
-      const anchor = event.target && event.target.closest
-        ? event.target.closest('a[href]') : null;
-      if (!anchor) return;
-
-      let target;
-      try { target = new URL(anchor.href, location.href); } catch (_) { return; }
-      if (target.protocol !== 'http:' && target.protocol !== 'https:') return;
-
-      // So o proprio dominio e os seus subdominios: 'evilgoogle.com' nao conta.
-      const host = target.hostname;
-      if ((host === 'google.com' || host.endsWith('.google.com')) && target.pathname === '/url') {
-        const actual = target.searchParams.get('q') || target.searchParams.get('url');
-        if (actual) {
-          try { target = new URL(actual); } catch (_) {}
-        }
-      }
-
-      if (target.hostname === location.hostname) return;
-      event.preventDefault();
-      event.stopPropagation();
-      act('split', { col:colIndex, url:target.href });
-    }, true);
-
-    listen(document, 'dblclick', (event) => {
-      if (!event.isTrusted || event.defaultPrevented) return;
-      if (event.target && event.target.closest
-          && event.target.closest('#neuralia-comp-controls,#neuralia-palette')) return;
-      const tag = event.target && event.target.tagName
-        ? event.target.tagName.toUpperCase() : '';
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-      if (event.target && event.target.isContentEditable) return;
-      act('expand', { col:colIndex });
-    }, true);
   });
 })();
 "#;
