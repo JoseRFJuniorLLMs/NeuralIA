@@ -103,3 +103,42 @@ jobs:
             exit 1
           fi
           echo "Sabotage proof: mutated ResponseException classification was rejected with exit code $result."
+      - name: Prove the password-error gate catches a regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          sabotage="$RUNNER_TEMP/neuralia-pdf-password-sabotage"
+          mkdir -p "$sabotage"
+          cp assets/pdfjs/viewer.mjs "$sabotage/viewer.mjs"
+          cp assets/pdfjs/pdf.mjs "$sabotage/pdf.mjs"
+
+          python - "$sabotage/viewer.mjs" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text(encoding="utf-8")
+          old = "return 'Este PDF está protegido por senha e o NeuralIA ainda não consegue abri-lo.';"
+          new = "return 'Este ficheiro não é um PDF que eu consiga abrir: ' + text;"
+          if text.count(old) != 1:
+              raise SystemExit("password sabotage target not found exactly once")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
+
+          module_uri="$(python - "$sabotage/viewer.mjs" <<'PY'
+          from pathlib import Path
+          import sys
+          print(Path(sys.argv[1]).resolve().as_uri())
+          PY
+          )"
+
+          set +e
+          NEURALIA_PDF_VIEWER_MODULE="$module_uri" node scripts/test-pdf-viewer.mjs
+          result=$?
+          set -e
+
+          if [ "$result" -eq 0 ]; then
+            echo "PDF password classifier sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: mutated PasswordException classification was rejected with exit code $result."
