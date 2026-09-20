@@ -95,6 +95,7 @@ jobs:
           if (-not $installer) { throw "Installer candidate was not produced." }
           ./scripts/test-windows-installer.ps1 -InstallerPath $installer.FullName -ExpectedExePath ci-tested/NeuralIA.exe -ExpectedVersion $version
       - name: Exercise Authenticode path with an ephemeral CI certificate
+        timeout-minutes: 3
         shell: pwsh
         run: |
           $line = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
