@@ -10,6 +10,8 @@
 // Fora do Windows ninguém o chama ainda; daí o `allow(dead_code)`.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod ipc;
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod pdf_assets;
 #[cfg(target_os = "windows")]
 mod windows_app;
 

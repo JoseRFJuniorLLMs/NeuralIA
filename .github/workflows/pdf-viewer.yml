@@ -5,12 +5,18 @@ on:
     paths:
       - 'assets/pdfjs/**'
       - 'scripts/test-pdf-viewer.mjs'
+      - 'scripts/test-pdfjs-aux-assets.mjs'
+      - 'crates/neural-app/src/pdf_assets.rs'
+      - 'crates/neural-app/src/windows_app.rs'
       - '.github/workflows/pdf-viewer.yml'
   push:
     branches: [main]
     paths:
       - 'assets/pdfjs/**'
       - 'scripts/test-pdf-viewer.mjs'
+      - 'scripts/test-pdfjs-aux-assets.mjs'
+      - 'crates/neural-app/src/pdf_assets.rs'
+      - 'crates/neural-app/src/windows_app.rs'
       - '.github/workflows/pdf-viewer.yml'
 
 permissions:
@@ -25,6 +31,76 @@ jobs:
           persist-credentials: false
       - name: Exercise shipped PDF viewer behavior
         run: node scripts/test-pdf-viewer.mjs
+      - name: Exercise real auxiliary PDF.js paths
+        run: node scripts/test-pdfjs-aux-assets.mjs
+      - name: Prove JPX gate needs local WASM/fallback assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          NEURALIA_PDF_AUX_CASE=jpx NEURALIA_PDF_AUX_BREAK=wasm node scripts/test-pdfjs-aux-assets.mjs
+          result=$?
+          set -e
+          if [ "$result" -eq 0 ]; then
+            echo "JPX sabotage unexpectedly stayed green without the WASM asset base" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: JPX failed without its auxiliary WASM/fallback base."
+      - name: Prove CID gate needs local packed CMaps
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          NEURALIA_PDF_AUX_CASE=cid-cmap NEURALIA_PDF_AUX_BREAK=cmap node scripts/test-pdfjs-aux-assets.mjs
+          result=$?
+          set -e
+          if [ "$result" -eq 0 ]; then
+            echo "CID/CMap sabotage unexpectedly stayed green without the CMap base" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: CID/CMap fixture failed without packed CMaps."
+      - name: Prove standard-font gate needs vendored font data
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          NEURALIA_PDF_AUX_CASE=standard-fonts NEURALIA_PDF_AUX_BREAK=font node scripts/test-pdfjs-aux-assets.mjs
+          result=$?
+          set -e
+          if [ "$result" -eq 0 ]; then
+            echo "Standard-font sabotage unexpectedly stayed green without font data" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: standard-font fixture failed without vendored font data."
+      - name: Prove ICC allowlist gate catches a removed profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp crates/neural-app/src/pdf_assets.rs "$RUNNER_TEMP/pdf_assets.rs.clean"
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("crates/neural-app/src/pdf_assets.rs")
+          text = path.read_text(encoding="utf-8")
+          arm = (
+              '        "/icc/CGATS001Compat-v2-micro.icc" => (\n'
+              '            "application/vnd.iccprofile",\n'
+              '            include_bytes!("../../../assets/pdfjs/icc/CGATS001Compat-v2-micro.icc"),\n'
+              '        ),\n'
+          )
+          if text.count(arm) != 1:
+              raise SystemExit("ICC sabotage arm not found exactly once")
+          path.write_text(text.replace(arm, "", 1), encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-app pdf_assets::tests::auxiliary_asset_lookup_is_fail_closed
+          result=$?
+          set -e
+          cp "$RUNNER_TEMP/pdf_assets.rs.clean" crates/neural-app/src/pdf_assets.rs
+          if [ "$result" -eq 0 ]; then
+            echo "ICC allowlist sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: removing the ICC profile route turns the gate red."
       - name: Prove the status gate catches a regression
         shell: bash
         run: |

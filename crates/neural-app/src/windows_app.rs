@@ -7418,7 +7418,10 @@ fn serve_pdf_asset(
             };
             (status, "application/pdf", body)
         }
-        _ => (404, "text/plain", Cow::Borrowed(b"not found" as &[u8])),
+        _ => match crate::pdf_assets::lookup(path) {
+            Some((content_type, asset)) => (200, content_type, Cow::Borrowed(asset)),
+            None => (404, "text/plain", Cow::Borrowed(b"not found" as &[u8])),
+        },
     };
 
     // nosniff em tudo: o tipo declarado e o tipo, nao se adivinha pelo corpo.
@@ -8618,7 +8621,7 @@ const PDFJS_WORKER: &[u8] = include_bytes!("../../../assets/pdfjs/pdf.worker.mjs
 const PDF_ORIGIN: &str = "http://neuralia-pdf.localhost";
 /// A mesma politica do `<meta>` do viewer.html, servida em cabecalho para
 /// valer antes de o HTML ser lido; um teste garante que as duas nao divergem.
-const PDF_VIEWER_CSP: &str = "default-src 'none'; script-src 'self' blob:; worker-src 'self' blob:; connect-src 'self'; img-src 'self' blob: data:; style-src 'unsafe-inline'; font-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'";
+const PDF_VIEWER_CSP: &str = "default-src 'none'; script-src 'self' blob: 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self'; img-src 'self' blob: data:; style-src 'unsafe-inline'; font-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'";
 /// Limite para um documento; o do Reader (2 MiB) e para HTML.
 const PDF_MAX_BYTES: usize = 32 * 1024 * 1024;
 const PDF_TIMEOUT_SECS: u64 = 90;
@@ -9874,20 +9877,58 @@ mod tests {
         );
 
         let bytes = Arc::new(Mutex::new(b"%PDF-1.7".to_vec()));
-        for (path, is_html) in [
-            ("/viewer.html", true),
-            ("/", true),
-            ("/viewer.mjs", false),
-            ("/pdf.mjs", false),
-            ("/pdf.worker.mjs", false),
-            ("/document.pdf", false),
-            ("/nada", false),
+        for (path, is_html, expected_type, expected_status) in [
+            ("/viewer.html", true, "text/html; charset=utf-8", 200),
+            ("/", true, "text/html; charset=utf-8", 200),
+            ("/viewer.mjs", false, "text/javascript", 200),
+            ("/pdf.mjs", false, "text/javascript", 200),
+            ("/pdf.worker.mjs", false, "text/javascript", 200),
+            ("/document.pdf", false, "application/pdf", 200),
+            ("/wasm/openjpeg.wasm", false, "application/wasm", 200),
+            ("/wasm/jbig2.wasm", false, "application/wasm", 200),
+            ("/wasm/qcms_bg.wasm", false, "application/wasm", 200),
+            (
+                "/wasm/openjpeg_nowasm_fallback.js",
+                false,
+                "text/javascript",
+                200,
+            ),
+            (
+                "/cmaps/Adobe-Japan1-UCS2.bcmap",
+                false,
+                "application/octet-stream",
+                200,
+            ),
+            (
+                "/standard_fonts/LiberationSans-Regular.ttf",
+                false,
+                "font/ttf",
+                200,
+            ),
+            (
+                "/icc/CGATS001Compat-v2-micro.icc",
+                false,
+                "application/vnd.iccprofile",
+                200,
+            ),
+            ("/wasm/../pdf.mjs", false, "text/plain", 404),
+            ("/fixtures/bug_jpx.pdf", false, "text/plain", 404),
+            ("/nada", false, "text/plain", 404),
         ] {
             let request = Request::builder()
                 .uri(format!("{PDF_ORIGIN}{path}"))
                 .body(Vec::new())
                 .expect("pedido de teste");
             let response = serve_pdf_asset(&bytes, &request);
+            assert_eq!(response.status().as_u16(), expected_status, "{path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("Content-Type")
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected_type),
+                "{path}"
+            );
             let header = |name: &str| {
                 response
                     .headers()
@@ -9917,6 +9958,27 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn pdf_viewer_configures_complete_local_pdfjs_assets() {
+        let viewer = std::str::from_utf8(PDF_VIEWER_JS).expect("viewer.mjs e UTF-8");
+        for setting in [
+            "cMapUrl: './cmaps/'",
+            "cMapPacked: true",
+            "standardFontDataUrl: './standard_fonts/'",
+            "wasmUrl: './wasm/'",
+            "iccUrl: './icc/'",
+            "useWasm: true",
+            "useWorkerFetch: true",
+        ] {
+            assert!(viewer.contains(setting), "configuração ausente: {setting}");
+        }
+        assert!(PDF_VIEWER_CSP.contains("'wasm-unsafe-eval'"));
+        assert!(!PDF_VIEWER_CSP.contains("'unsafe-eval'"));
+        assert!(PDF_VIEWER_CSP.contains("connect-src 'self'"));
+        assert!(!PDF_VIEWER_CSP.contains("https:"));
+        assert!(!PDF_VIEWER_CSP.contains("http:"));
     }
 
     #[test]
