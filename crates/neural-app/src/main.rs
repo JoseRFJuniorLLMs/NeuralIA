@@ -11,6 +11,8 @@
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod ipc;
 #[cfg(target_os = "windows")]
+mod pdf_assets;
+#[cfg(target_os = "windows")]
 mod windows_app;
 
 #[cfg(target_os = "windows")]
