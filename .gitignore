@@ -8,3 +8,6 @@ target/
 NeuralIA-data/
 *.WebView2/
 release/
+
+# Artefactos do instalador (packaging/build-installer.ps1).
+dist/
