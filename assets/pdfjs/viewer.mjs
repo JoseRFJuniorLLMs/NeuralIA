@@ -5,10 +5,54 @@
 // worker. A geometria e calculada, nao lida do DOM, para o scroll nao forcar
 // layout a cada evento.
 import * as pdfjsLib from './pdf.mjs';
-import { describeLoadError, hideStatus, makePdfLoadOptions, showStatus } from './viewer-runtime.mjs';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './pdf.worker.mjs';
 
+export function describeLoadError(err) {
+  const name = (err && err.name) || '';
+  const text = (err && err.message) || String(err);
+
+  if (
+    (typeof pdfjsLib.ResponseException === 'function' && err instanceof pdfjsLib.ResponseException) ||
+    name === 'ResponseException'
+  ) {
+    const status = Number.isFinite(err && err.status) ? ' HTTP ' + err.status : '';
+    return 'Não consegui obter o PDF:' + status + (status ? '' : ' ' + text);
+  }
+
+  if (
+    (typeof pdfjsLib.InvalidPDFException === 'function' && err instanceof pdfjsLib.InvalidPDFException) ||
+    name === 'InvalidPDFException'
+  ) {
+    return 'Este ficheiro não é um PDF que eu consiga abrir: ' + text;
+  }
+
+  if (
+    name === 'UnknownErrorException' &&
+    /(?:failed to fetch|network(?:error)?|load failed|fetch)/i.test(text)
+  ) {
+    return 'Não consegui obter o PDF: ' + text;
+  }
+
+  return 'Este ficheiro não é um PDF que eu consiga abrir: ' + text;
+}
+
+export function showStatus(element, message, error = false) {
+  if (message !== undefined && message !== null) element.textContent = message;
+  element.hidden = false;
+  element.style.display = 'grid';
+  element.classList.toggle('error', error);
+}
+
+export function hideStatus(element) {
+  element.hidden = true;
+  // #status tem display:grid em CSS autoral; portanto hidden sozinho pode ser
+  // sobreposto. O estilo inline fecha o overlay de forma inequívoca.
+  element.style.display = 'none';
+  element.classList.remove('error');
+}
+
+if (typeof document !== 'undefined') {
 const status = document.getElementById('status');
 const hud = document.getElementById('hud');
 const pagesEl = document.getElementById('pages');
@@ -288,11 +332,14 @@ async function load() {
     // pedido inicial de continuar a puxar o ficheiro inteiro depois dos
     // cabecalhos, e disableAutoFetch impede o worker de ir buscar em fundo os
     // chunks que ninguem pediu; sem os dois, o PDF acabava todo em memoria.
-    doc = await pdfjsLib.getDocument(
-      makePdfLoadOptions('./document.pdf', RANGE_CHUNK)
-    ).promise;
+    doc = await pdfjsLib.getDocument({
+      url: './document.pdf',
+      rangeChunkSize: RANGE_CHUNK,
+      disableStream: true,
+      disableAutoFetch: true
+    }).promise;
   } catch (err) {
-    fail(describeLoadError(err, pdfjsLib));
+    fail(describeLoadError(err));
     return;
   }
 
@@ -307,7 +354,7 @@ async function load() {
     known = await probeSizes(first);
     defaultSize = medianSize(known);
   } catch (err) {
-    fail(describeLoadError(err, pdfjsLib));
+    fail(describeLoadError(err));
     return;
   }
 
@@ -369,3 +416,4 @@ window.addEventListener('resize', () => {
 });
 
 load();
+}
