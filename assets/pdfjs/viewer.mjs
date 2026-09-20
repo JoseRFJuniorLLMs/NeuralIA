@@ -23,6 +23,13 @@ export function describeLoadError(err) {
   }
 
   if (
+    (typeof pdfjsLib.PasswordException === 'function' && err instanceof pdfjsLib.PasswordException) ||
+    name === 'PasswordException'
+  ) {
+    return 'Este PDF está protegido por senha e o NeuralIA ainda não consegue abri-lo.';
+  }
+
+  if (
     (typeof pdfjsLib.InvalidPDFException === 'function' && err instanceof pdfjsLib.InvalidPDFException) ||
     name === 'InvalidPDFException'
   ) {
