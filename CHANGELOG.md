@@ -48,6 +48,10 @@ All notable changes to NeuralIA are documented here.
 - Revisão adversarial independente e release 2.1.0 permanecem pendentes.
 
 ### Fixed
+- **PR #71 — o Reader deixa de duplicar blocos aninhados e de misturar metadata com o corpo.**
+  Itens de lista/blocos filhos são emitidos uma vez, metadados vazios deixam a
+  cadeia de fallback continuar e o conteúdo de `<head>/<title>` não entra no
+  texto de fallback do artigo.
 - **PR #73 — a inteligência local respeita budgets e mantém model packs dentro da raiz.**
   Resumos truncados passam a incluir a elipse dentro do próprio limite de
   caracteres, e componentes de model pack rejeitam sintaxe Windows com `:`
