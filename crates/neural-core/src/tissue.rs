@@ -6,12 +6,26 @@
 //! instalador precisa exatamente do mesmo fundo do navegador, e assim a unica
 //! parte que se pode enganar sozinha -- as contas -- e testavel sem ecra.
 
-/// Um neuronio. `energy` anda entre 0 e 1 e diz o quanto esta aceso agora.
+/// O corpo de um neuronio. `energy` anda entre 0 e 1 e diz o quanto esta aceso
+/// agora; `depth` entre 0 e 1 diz o quao a frente esta -- e o que da camadas ao
+/// tecido em vez de uma folha plana de pontos iguais.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Node {
     pub x: f64,
     pub y: f64,
     pub energy: f64,
+    pub depth: f64,
+}
+
+/// Um segmento de ramagem. `weight` entre 0 e 1 diz o quao grosso e aceso:
+/// 1 no tronco que sai do corpo, cada vez menos a medida que bifurca.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Branch {
+    pub ax: f64,
+    pub ay: f64,
+    pub bx: f64,
+    pub by: f64,
+    pub weight: f64,
 }
 
 /// Uma ligacao entre dois neuronios proximos. `closeness` anda entre 0 e 1:
@@ -48,6 +62,9 @@ pub struct Burst {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Tissue {
     pub nodes: Vec<Node>,
+    /// A ramagem, do tronco aos fios mais finos. Desenha-se primeiro: e o que
+    /// esta por tras de tudo.
+    pub branches: Vec<Branch>,
     pub links: Vec<Link>,
     pub pulses: Vec<Pulse>,
     pub bursts: Vec<Burst>,
@@ -94,15 +111,27 @@ fn hash(mut value: u32) -> f64 {
     value as f64 / u32::MAX as f64
 }
 
-/// Quantos neuronios cabem nesta largura. Poucos parecem pobres, muitos viram
-/// um borrao cinzento.
+/// Quantos somas cabem nesta tela.
+///
+/// Sai da **area**, nao da largura: uma janela larga e baixa tinha a mesma
+/// contagem de uma alta, e ficava rala. E divide-se pelo DPI, senao o mesmo
+/// ecra a 200% levava quatro vezes mais neuronios do que a 100% e virava uma
+/// mancha.
 fn node_count(field: &Field) -> usize {
-    ((field.width / (34.0 * field.scale.max(1.0))).round() as usize).clamp(28, 52)
+    let scale = field.scale.max(1.0);
+    let area = field.width.max(1.0) * field.height.max(1.0) / (scale * scale);
+    ((area / 7200.0).round() as usize).clamp(70, 150)
 }
 
-/// Os neuronios no instante `seconds`.
+/// O espacamento medio entre somas. E a unidade de tudo o resto: o alcance das
+/// sinapses, o comprimento dos dendritos e o raio de contacto saem daqui, para
+/// o tecido ter o mesmo aspeto em qualquer tamanho de janela.
+pub fn spacing(field: &Field) -> f64 {
+    (field.width.max(1.0) * field.height.max(1.0) / node_count(field) as f64).sqrt()
+}
+
+/// Os somas no instante `seconds`.
 pub fn nodes_at(field: &Field, seconds: f64) -> Vec<Node> {
-    let scale = field.scale.max(1.0);
     let count = node_count(field);
 
     // Grelha com ruido: uma distribuicao puramente aleatoria faz grumos e
@@ -128,11 +157,8 @@ pub fn nodes_at(field: &Field, seconds: f64) -> Vec<Node> {
         // que produz as descargas.
         let phase = hash(seed.wrapping_mul(0xc2b2_ae35)) * std::f64::consts::TAU;
         let speed = 0.55 + hash(seed.wrapping_mul(0x27d4_eb2d)) * 0.75;
-        let swing_x = cell_w * 0.40;
-        let swing_y = cell_h * 0.40;
-        x += (seconds * speed + phase).sin() * swing_x;
-        y += (seconds * speed * 0.83 + phase * 1.7).cos() * swing_y;
-        let _ = scale;
+        x += (seconds * speed + phase).sin() * cell_w * 0.40;
+        y += (seconds * speed * 0.83 + phase * 1.7).cos() * cell_h * 0.40;
 
         if let Some((cx, cy, rx, ry)) = field.quiet {
             // Empurrar para fora da elipse pela normal, mantendo a direcao.
@@ -148,10 +174,19 @@ pub fn nodes_at(field: &Field, seconds: f64) -> Vec<Node> {
             }
         }
 
+        // Profundidade: uns estao a frente, outros ao fundo. Sem isto o tecido
+        // e uma folha plana de pontos todos iguais; com isto ganha camadas,
+        // que e o que faz parecer volume.
+        let depth = 0.25 + hash(seed.wrapping_mul(0x2545_f491)) * 0.75;
         // Cada neuronio pulsa no seu proprio ritmo.
         let beat = hash(seed.wrapping_mul(0x1656_67b1)) * std::f64::consts::TAU;
         let energy = 0.45 + 0.55 * (seconds * 0.9 + beat).sin().abs();
-        nodes.push(Node { x, y, energy });
+        nodes.push(Node {
+            x,
+            y,
+            energy,
+            depth,
+        });
     }
     nodes
 }
@@ -163,13 +198,9 @@ pub fn nodes_at(field: &Field, seconds: f64) -> Vec<Node> {
 /// verticais de contas soltas -- exatamente o que nao e uma rede. Amarrado ao
 /// espacamento, a vizinhanca de cada neuronio e a mesma em qualquer tamanho.
 pub fn max_link(field: &Field) -> f64 {
-    let spacing = (field.width.max(1.0) * field.height.max(1.0) / node_count(field) as f64).sqrt();
-    (spacing * 1.35).max(90.0 * field.scale.max(1.0))
+    (spacing(field) * 1.55).max(90.0 * field.scale.max(1.0))
 }
 
-/// O tecido inteiro num instante: neuronios, ligacoes e impulsos.
-/// A que distancia dois neuronios se consideram em contacto. Mais do que isto
-/// e so vizinhanca; menos do que isto e descarga.
 /// Se um ponto cai dentro da elipse de silencio. Sem elipse, nada cai dentro.
 fn inside_quiet(field: &Field, x: f64, y: f64) -> bool {
     let Some((cx, cy, rx, ry)) = field.quiet else {
@@ -180,17 +211,92 @@ fn inside_quiet(field: &Field, x: f64, y: f64) -> bool {
     nx * nx + ny * ny < 1.0
 }
 
+/// A que distancia dois neuronios se consideram em contacto. Mais do que isto
+/// e so vizinhanca; menos do que isto e descarga.
 pub fn contact_distance(field: &Field) -> f64 {
     max_link(field) * 0.13
 }
 
+/// Os dendritos de um soma: arvores curtas que saem dele em todas as direcoes.
+///
+/// E o que distingue tecido neuronal de um grafo de pontos e linhas. Cada
+/// braco sai do corpo, bifurca uma vez e bifurca outra, afinando e apagando a
+/// cada nivel -- como nas fotografias de microscopia, onde o que se ve nao sao
+/// ligacoes mas ramagem.
+fn dendrites_of(field: &Field, node: &Node, seed: u32, seconds: f64, out: &mut Vec<Branch>) {
+    let reach = spacing(field) * 0.78 * (0.55 + node.depth * 0.65);
+    let arms = 4 + (hash(seed.wrapping_mul(0x7feb_352d)) * 3.0) as usize;
+    let base = hash(seed.wrapping_mul(0x165e_1b7f)) * std::f64::consts::TAU;
+    // Rotacao lenta, e em sentidos diferentes: a ramagem mexe-se sem que se
+    // perceba um padrao a repetir.
+    let spin = (hash(seed.wrapping_mul(0x9e37_79b1)) - 0.5) * 0.18;
+
+    let mut push = |ax: f64, ay: f64, bx: f64, by: f64, weight: f64| {
+        // A ramagem respeita a zona da marca como tudo o resto.
+        if inside_quiet(field, ax, ay) || inside_quiet(field, bx, by) {
+            return;
+        }
+        out.push(Branch {
+            ax,
+            ay,
+            bx,
+            by,
+            weight,
+        });
+    };
+
+    for arm in 0..arms {
+        let arm_seed = seed.wrapping_mul(0x27d4_eb2d) ^ (arm as u32 + 1);
+        let wobble = (seconds * 0.7 + hash(arm_seed) * std::f64::consts::TAU).sin() * 0.14;
+        let angle =
+            base + seconds * spin + arm as f64 * std::f64::consts::TAU / arms as f64 + wobble;
+        let length = reach * (0.7 + hash(arm_seed.wrapping_mul(0x85eb_ca6b)) * 0.6);
+
+        let tip_x = node.x + angle.cos() * length;
+        let tip_y = node.y + angle.sin() * length;
+        push(node.x, node.y, tip_x, tip_y, 1.0);
+
+        // Primeira bifurcacao.
+        for (fork, side) in [(0u32, -1.0f64), (1, 1.0)] {
+            let fork_seed = arm_seed.wrapping_mul(0x846c_a68b) ^ (fork + 1);
+            let spread = 0.36 + hash(fork_seed) * 0.34;
+            let branch_angle = angle + side * spread;
+            let branch_len = length * (0.48 + hash(fork_seed.wrapping_mul(0xc2b2_ae35)) * 0.26);
+            let bx = tip_x + branch_angle.cos() * branch_len;
+            let by = tip_y + branch_angle.sin() * branch_len;
+            push(tip_x, tip_y, bx, by, 0.6);
+
+            // Segunda bifurcacao: os fios mais finos, quase apagados.
+            for (twig, twig_side) in [(0u32, -1.0f64), (1, 1.0)] {
+                let twig_seed = fork_seed.wrapping_mul(0xd3a2_646c) ^ (twig + 1);
+                let twig_angle = branch_angle + twig_side * (0.30 + hash(twig_seed) * 0.30);
+                let twig_len = branch_len * 0.55;
+                push(
+                    bx,
+                    by,
+                    bx + twig_angle.cos() * twig_len,
+                    by + twig_angle.sin() * twig_len,
+                    0.32,
+                );
+            }
+        }
+    }
+}
+
+/// O tecido inteiro num instante: somas, ramagem, sinapses, impulsos e
+/// descargas.
 pub fn tissue_at(field: &Field, seconds: f64) -> Tissue {
     let nodes = nodes_at(field, seconds);
     let reach = max_link(field);
     let contact = contact_distance(field);
+    let mut branches = Vec::with_capacity(nodes.len() * 28);
     let mut links = Vec::new();
     let mut pulses = Vec::new();
     let mut bursts = Vec::new();
+
+    for (index, node) in nodes.iter().enumerate() {
+        dendrites_of(field, node, index as u32 + 1, seconds, &mut branches);
+    }
 
     for i in 0..nodes.len() {
         for j in (i + 1)..nodes.len() {
@@ -205,7 +311,7 @@ pub fn tissue_at(field: &Field, seconds: f64) -> Tissue {
             if distance < contact {
                 let (mx, my) = ((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
                 // Os neuronios ficam fora da zona de silencio, mas o ponto
-                // medio de dois que a ladeiam cai la dentro -- e uma faisca em
+                // medio de dois que a ladeiam cai la dentro, e uma faisca em
                 // cima da marca chama a atencao exatamente para o sitio que
                 // tem de ficar limpo.
                 if !inside_quiet(field, mx, my) {
@@ -227,13 +333,14 @@ pub fn tissue_at(field: &Field, seconds: f64) -> Tissue {
                 closeness,
             });
 
-            // So as ligacoes curtas transmitem, e so algumas: uma sinapse a
-            // disparar em cada ligacao ao mesmo tempo seria ruido outra vez.
+            // Nem todas as ligacoes transmitem ao mesmo tempo -- isso seria
+            // ruido -- mas transmitem muitas, e depressa: e o transito que faz
+            // o tecido parecer vivo em vez de desenhado.
             let seed = (i as u32 + 1).wrapping_mul(0x85eb_ca6b) ^ (j as u32 + 1);
-            if closeness < 0.45 || hash(seed) > 0.38 {
+            if closeness < 0.25 || hash(seed) > 0.55 {
                 continue;
             }
-            let speed = 0.55 + hash(seed.wrapping_mul(0xc2b2_ae35)) * 0.70;
+            let speed = 1.10 + hash(seed.wrapping_mul(0xc2b2_ae35)) * 1.30;
             let offset = hash(seed.wrapping_mul(0xd3a2_646c));
             let travel = (seconds * speed + offset).fract();
             pulses.push(Pulse {
@@ -246,12 +353,12 @@ pub fn tissue_at(field: &Field, seconds: f64) -> Tissue {
 
     Tissue {
         nodes,
+        branches,
         links,
         pulses,
         bursts,
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,7 +381,7 @@ mod tests {
     fn the_tissue_is_dense_enough_to_read_as_a_network() {
         let tissue = tissue_at(&field(), 3.0);
         assert!(
-            (28..=52).contains(&tissue.nodes.len()),
+            (70..=150).contains(&tissue.nodes.len()),
             "neuronios: {}",
             tissue.nodes.len()
         );
@@ -361,15 +468,15 @@ mod tests {
             let tissue = tissue_at(&field, 5.0);
             let per_node = tissue.links.len() as f64 / tissue.nodes.len() as f64;
             assert!(
-                per_node >= 1.5,
+                per_node >= 2.5,
                 "{width}x{height}: {:.2} ligacoes por neuronio -- isto sao \
-                 contas num fio, nao uma rede",
+                 contas num fio, nao tecido",
                 per_node
             );
             assert!(
-                per_node <= 6.0,
-                "{width}x{height}: {:.2} ligacoes por neuronio -- isto e uma \
-                 mancha, nao uma rede",
+                per_node <= 12.0,
+                "{width}x{height}: {:.2} ligacoes por neuronio -- a esta \
+                 densidade deixa de haver buracos e fica uma mancha",
                 per_node
             );
         }
@@ -505,12 +612,124 @@ mod tests {
     }
 
     #[test]
+    fn every_soma_grows_a_branching_tree_and_not_a_star() {
+        // O que distingue tecido de um grafo de pontos e linhas e a ramagem:
+        // cada braco tem de bifurcar, e os fios finos tem de ser mais finos.
+        let field = field();
+        let tissue = tissue_at(&field, 4.0);
+        assert!(
+            tissue.branches.len() > tissue.nodes.len() * 12,
+            "{} ramos para {} somas: isto e uma estrela, nao uma arvore",
+            tissue.branches.len(),
+            tissue.nodes.len()
+        );
+
+        let trunks = tissue.branches.iter().filter(|b| b.weight > 0.9).count();
+        let twigs = tissue.branches.iter().filter(|b| b.weight < 0.4).count();
+        assert!(
+            twigs > trunks * 2,
+            "{twigs} fios finos para {trunks} troncos: a ramagem nao esta a \
+             bifurcar duas vezes"
+        );
+        for branch in &tissue.branches {
+            assert!((0.0..=1.0).contains(&branch.weight));
+        }
+    }
+
+    #[test]
+    fn the_branches_stay_local_instead_of_crossing_the_screen() {
+        // Um dendrito que atravessa a tela deixa de se ler como ramagem e
+        // passa a parecer uma ligacao errada.
+        let field = field();
+        let limit = spacing(&field) * 1.6;
+        for step in 0..30 {
+            for branch in tissue_at(&field, step as f64 * 0.4).branches {
+                let length =
+                    ((branch.ax - branch.bx).powi(2) + (branch.ay - branch.by).powi(2)).sqrt();
+                assert!(
+                    length <= limit,
+                    "ramo de {length:.0} px para um espacamento de {:.0} px",
+                    spacing(&field)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_branch_reaches_into_the_quiet_ellipse() {
+        // A ramagem e muito mais densa do que os somas: se nao respeitasse a
+        // zona limpa, tapava a marca sozinha.
+        let field = field().with_quiet_ellipse(480.0, 270.0, 220.0, 90.0);
+        for step in 0..30 {
+            for branch in tissue_at(&field, step as f64 * 0.4).branches {
+                for (x, y) in [(branch.ax, branch.ay), (branch.bx, branch.by)] {
+                    let nx = (x - 480.0) / 220.0;
+                    let ny = (y - 270.0) / 90.0;
+                    assert!(
+                        nx * nx + ny * ny >= 1.0,
+                        "ramo dentro da zona de silencio em ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_frame_stays_within_what_gdi_can_draw_thirty_times_a_second() {
+        // Contagens, nao segundos: um limite em milissegundos falha sozinho
+        // num CI lento. O que importa e nao pedir ao GDI mais linhas do que
+        // ele desenha entre dois quadros.
+        for (w, h, scale) in [
+            (1920.0, 1080.0, 1.0),
+            (2906.0, 1826.0, 2.0),
+            (1520.0, 1000.0, 2.0),
+        ] {
+            let tissue = tissue_at(&Field::new(w, h, scale), 5.0);
+            assert!(
+                tissue.branches.len() <= 6000,
+                "{w}x{h}@{scale}: {} ramos",
+                tissue.branches.len()
+            );
+            assert!(
+                tissue.links.len() <= 1400,
+                "{w}x{h}@{scale}: {} ligacoes",
+                tissue.links.len()
+            );
+        }
+    }
+
+    #[test]
+    fn pulses_travel_fast_enough_to_read_as_traffic() {
+        // "Esta lento" foi a queixa. Um impulso tem de atravessar a sua
+        // ligacao em menos de um segundo, senao parece um ponto parado.
+        let field = field();
+        let mut moved = 0usize;
+        let first = tissue_at(&field, 10.0);
+        let second = tissue_at(&field, 10.25);
+        for a in &first.pulses {
+            if second
+                .pulses
+                .iter()
+                .all(|b| ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt() > 4.0)
+            {
+                moved += 1;
+            }
+        }
+        assert!(
+            moved * 2 > first.pulses.len(),
+            "so {moved} de {} impulsos se mexeram em um quarto de segundo",
+            first.pulses.len()
+        );
+    }
+
+    #[test]
     fn a_narrow_window_still_grows_tissue() {
         // A janela do instalador e estreita. Sem o minimo, ficava um punhado
         // de pontos soltos.
         let narrow = Field::new(360.0, 220.0, 1.0);
         let tissue = tissue_at(&narrow, 1.0);
-        assert_eq!(tissue.nodes.len(), 28);
+        assert_eq!(tissue.nodes.len(), 70);
         assert!(!tissue.links.is_empty());
+        assert!(!tissue.branches.is_empty());
     }
 }

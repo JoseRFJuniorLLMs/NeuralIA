@@ -24,6 +24,9 @@ pub const ACCENT_FAR: Rgb = (167, 139, 250);
 pub const FG: Rgb = (232, 238, 250);
 pub const MUTED: Rgb = (138, 154, 184);
 pub const OK: Rgb = (52, 211, 153);
+/// A cor de uma sinapse a disparar. Quente de proposito: num tecido todo azul,
+/// e o unico sitio onde algo acontece, e tem de se ver a primeira vista.
+pub const SPARK: Rgb = (255, 138, 76);
 pub const BAD: Rgb = (248, 113, 113);
 
 pub fn mix(a: Rgb, b: Rgb, t: f64) -> Rgb {
@@ -128,15 +131,43 @@ pub unsafe fn tissue_background(hdc: HDC, layout: &Layout, seconds: f64) {
         );
     let Tissue {
         nodes,
+        branches,
         links,
         pulses,
         bursts,
     } = tissue::tissue_at(&field, seconds);
 
-    // Tres canetas, escolhidas pela proximidade: uma por ligacao seria caro a
-    // 30 quadros por segundo e nao se notaria.
+    // A ramagem primeiro: e o que esta por tras de tudo. Tres canetas pela
+    // espessura do ramo -- uma por segmento seria caro a 30 quadros por
+    // segundo e nao se notaria.
+    let twigs: [HPEN; 3] = std::array::from_fn(|step| {
+        let weight = 0.07 + step as f64 * 0.11;
+        CreatePen(
+            PS_SOLID,
+            1 + step as i32,
+            colorref(mix(PAGE, ACCENT, weight)),
+        )
+    });
+    let old_pen = SelectObject(hdc, twigs[0] as _);
+    for branch in &branches {
+        let bucket = ((branch.weight * 3.0) as usize).min(2);
+        SelectObject(hdc, twigs[bucket] as _);
+        MoveToEx(
+            hdc,
+            branch.ax.round() as i32,
+            branch.ay.round() as i32,
+            std::ptr::null_mut(),
+        );
+        LineTo(hdc, branch.bx.round() as i32, branch.by.round() as i32);
+    }
+    SelectObject(hdc, old_pen);
+    for pen in twigs {
+        DeleteObject(pen as _);
+    }
+
+    // As sinapses por cima da ramagem, mais acesas: sao ligacao, nao tecido.
     let pens: [HPEN; 3] = std::array::from_fn(|step| {
-        let weight = 0.10 + (2 - step) as f64 * 0.10;
+        let weight = 0.14 + (2 - step) as f64 * 0.11;
         CreatePen(PS_SOLID, 1, colorref(mix(PAGE, ACCENT, weight)))
     });
     let old_pen = SelectObject(hdc, pens[2] as _);
@@ -172,8 +203,10 @@ pub unsafe fn tissue_background(hdc: HDC, layout: &Layout, seconds: f64) {
     }
 
     for node in &nodes {
-        let radius = (1.6 + 2.2 * node.energy) * layout.scale;
-        let color = mix(PAGE, ACCENT, 0.30 + 0.45 * node.energy);
+        // O tamanho e o brilho seguem a profundidade: os da frente sao corpos,
+        // os do fundo sao pontos. E o que da volume a folha.
+        let radius = (1.4 + 4.6 * node.depth) * (0.75 + 0.25 * node.energy) * layout.scale;
+        let color = mix(PAGE, ACCENT, 0.18 + 0.30 * node.depth + 0.30 * node.energy);
         round(
             hdc,
             Rect {
@@ -198,11 +231,7 @@ pub unsafe fn tissue_background(hdc: HDC, layout: &Layout, seconds: f64) {
             let pen = CreatePen(
                 PS_SOLID,
                 (1.0 + burst.glow).round() as i32,
-                colorref(mix(
-                    PAGE,
-                    mix(ACCENT_FAR, (255, 255, 255), 0.45),
-                    weight * burst.glow,
-                )),
+                colorref(mix(PAGE, SPARK, weight * burst.glow)),
             );
             let old_pen = SelectObject(hdc, pen as _);
             let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH) as _);
@@ -232,7 +261,7 @@ pub unsafe fn tissue_background(hdc: HDC, layout: &Layout, seconds: f64) {
                 height: core * 2.0,
             },
             core,
-            mix(ACCENT, (255, 255, 255), 0.20 + 0.45 * burst.glow),
+            mix(SPARK, (255, 245, 235), 0.20 + 0.55 * burst.glow),
             None,
         );
     }

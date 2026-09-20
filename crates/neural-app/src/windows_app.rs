@@ -31,14 +31,15 @@ use url::Url;
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::Gdi::{
-        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CLEARTYPE_QUALITY,
-        ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
-        CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
-        DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject,
-        DrawTextW, Ellipse, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC, GetStockObject,
-        InvalidateRect, LineTo, MoveToEx, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID,
-        ReleaseDC, SRCCOPY, ScreenToClient, SelectObject, SetBkColor, SetBkMode, SetTextColor,
-        SetWindowRgn, StretchDIBits, TRANSPARENT,
+        AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+        BeginPaint, BitBlt, CLEARTYPE_QUALITY, ClientToScreen, CreateCompatibleBitmap,
+        CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateRoundRectRgn,
+        CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER,
+        DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW,
+        Ellipse, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC, GetStockObject, InvalidateRect,
+        LineTo, MoveToEx, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC,
+        SRCCOPY, ScreenToClient, SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn,
+        StretchDIBits, TRANSPARENT,
     },
     Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom},
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
@@ -7715,17 +7716,24 @@ fn gmail_monitor_enabled_for(no_gmail: Option<OsString>) -> bool {
 /// instalador desenha, e duas copias divergiam a primeira vez que uma fosse
 /// afinada. O que fica deste lado e so o que e proprio da Home -- onde esta a
 /// marca e quanto espaco ela reserva.
+///
+/// A elipse e estreita de proposito: so tira o tecido de cima da esfera e das
+/// letras. O resto do retangulo da arte nao precisa de ser esvaziado, porque a
+/// marca e misturada com o que esta por tras dela em vez de o apagar -- uma
+/// elipse suficientemente grande para conter o retangulo deixava um buraco
+/// oval a meio da tela, que e tao visivel como a caixa que vinha corrigir.
 fn home_tissue_field(
     width: f64,
     height: f64,
     scale: f64,
-    target_x: f64,
-    target_y: f64,
+    brand_x: f64,
+    brand_y: f64,
     brand_width: f64,
+    brand_height: f64,
 ) -> tissue::Field {
     tissue::Field::new(width, height, scale).with_quiet_ellipse(
-        target_x,
-        target_y,
+        brand_x + brand_width / 2.0,
+        brand_y + brand_height * 0.58,
         (brand_width * 0.60).max(120.0 * scale),
         (brand_width * 0.26).max(70.0 * scale),
     )
@@ -7747,16 +7755,25 @@ unsafe fn draw_neural_background(
     width: f64,
     height: f64,
     scale: f64,
-    target_x: f64,
-    target_y: f64,
+    brand_x: f64,
+    brand_y: f64,
     brand_width: f64,
+    brand_height: f64,
     theme: &Theme,
 ) {
     if width < 1.0 || height < 1.0 {
         return;
     }
 
-    let field = home_tissue_field(width, height, scale, target_x, target_y, brand_width);
+    let field = home_tissue_field(
+        width,
+        height,
+        scale,
+        brand_x,
+        brand_y,
+        brand_width,
+        brand_height,
+    );
     let seconds = now_ms() as f64 / 1000.0;
     draw_neural_tissue(hdc, &field, scale, seconds, theme);
 }
@@ -7771,15 +7788,42 @@ unsafe fn draw_neural_tissue(
 ) {
     let tissue::Tissue {
         nodes,
+        branches,
         links,
         pulses,
         bursts,
     } = tissue::tissue_at(field, seconds);
 
-    // Ligacoes em tres intensidades, para as mais proximas se lerem mais
-    // fortes. Tres canetas no total: uma por ligacao seria caro a 15 FPS.
+    // A ramagem primeiro: e o que esta por tras de tudo. Tres canetas pela
+    // espessura do ramo -- uma por segmento seria caro a 15 FPS.
+    let twigs: [*mut core::ffi::c_void; 3] = std::array::from_fn(|step| {
+        let weight = if theme.dark { 0.07 } else { 0.05 } + step as f32 * 0.10;
+        CreatePen(
+            PS_SOLID,
+            1 + step as i32,
+            rgb3(mix(theme.page_bg, theme.accent, weight)),
+        )
+    });
+    let old_twig = SelectObject(hdc, twigs[0] as _);
+    for branch in &branches {
+        let bucket = ((branch.weight * 3.0) as usize).min(2);
+        SelectObject(hdc, twigs[bucket] as _);
+        MoveToEx(
+            hdc,
+            branch.ax.round() as i32,
+            branch.ay.round() as i32,
+            std::ptr::null_mut(),
+        );
+        LineTo(hdc, branch.bx.round() as i32, branch.by.round() as i32);
+    }
+    SelectObject(hdc, old_twig);
+    for pen in twigs {
+        DeleteObject(pen as _);
+    }
+
+    // As sinapses por cima da ramagem, mais acesas: sao ligacao, nao tecido.
     let pens: [*mut core::ffi::c_void; 3] = std::array::from_fn(|step| {
-        let weight = if theme.dark { 0.14 } else { 0.10 } + (2 - step) as f32 * 0.09;
+        let weight = if theme.dark { 0.18 } else { 0.13 } + (2 - step) as f32 * 0.10;
         CreatePen(PS_SOLID, 1, rgb3(mix(theme.page_bg, theme.accent, weight)))
     });
     let old_pen = SelectObject(hdc, pens[2] as _);
@@ -7810,7 +7854,10 @@ unsafe fn draw_neural_tissue(
     let old_node_pen = SelectObject(hdc, node_pen as _);
 
     for node in &nodes {
-        let radius = ((1.5 + node.energy * 1.9) * scale).clamp(2.0, 6.0);
+        // O tamanho segue a profundidade: os da frente sao corpos, os do fundo
+        // sao pontos. E o que da volume a folha.
+        let radius =
+            ((1.4 + 4.6 * node.depth) * (0.75 + 0.25 * node.energy) * scale).clamp(1.5, 9.0);
         Ellipse(
             hdc,
             (node.x - radius).round() as i32,
@@ -7850,15 +7897,9 @@ unsafe fn draw_neural_tissue(
     // As descargas por cima de tudo: sao o que acontece agora. Dois aneis --
     // o de fora largo e fraco, o de dentro apertado e forte -- e um nucleo
     // aceso. E assim que uma faisca se le sem haver alpha a disposicao.
-    let spark = mix(
-        theme.accent,
-        if theme.dark {
-            (255, 255, 255)
-        } else {
-            theme.fg
-        },
-        0.45,
-    );
+    // Quente de proposito: num tecido todo azul, a descarga e o unico sitio
+    // onde algo acontece, e tem de se ver a primeira vista.
+    let spark: Rgb = (255, 138, 76);
     let hollow = GetStockObject(NULL_BRUSH);
     for burst in &bursts {
         for (factor, weight) in [(1.0, 0.22), (0.55, 0.55)] {
@@ -7884,7 +7925,7 @@ unsafe fn draw_neural_tissue(
 
         // Nucleo pequeno: uma faisca, nao um holofote.
         let core = (burst.radius * 0.11 * (0.4 + burst.glow)).max(1.0);
-        let color = mix(theme.accent, spark, (0.20 + 0.45 * burst.glow) as f32);
+        let color = mix(spark, (255, 245, 235), (0.20 + 0.55 * burst.glow) as f32);
         let brush = CreateSolidBrush(rgb3(color));
         let pen = CreatePen(PS_SOLID, 1, rgb3(color));
         let old_brush = SelectObject(hdc, brush as _);
@@ -7966,9 +8007,10 @@ fn draw_home(window: &Window, status: Option<&str>) {
                 width,
                 height,
                 scale,
-                brand_x as f64 + brand_width / 2.0,
-                brand_y as f64 + brand_height * 0.58,
+                brand_x as f64,
+                brand_y as f64,
                 brand_width,
+                brand_height,
                 &theme,
             );
         }
@@ -7980,7 +8022,6 @@ fn draw_home(window: &Window, status: Option<&str>) {
             brand_y,
             brand_width.round() as i32,
             brand_height.round() as i32,
-            theme.page_bg,
         );
 
         let body_font = create_font((-17.0 * scale) as i32, FW_NORMAL as i32);
@@ -8524,7 +8565,7 @@ unsafe fn create_font(height: i32, weight: i32) -> *mut core::ffi::c_void {
 /// (largura, altura, cor de fundo, pixeis BGRX ja compostos). Os pixeis estao
 /// num `Arc` porque a tela inicial repinta-se a cada frame e um `Vec` clonado
 /// ali custa uma copia de largura*altura*4 bytes por frame, so para o blit ler.
-type SplashCache = Option<(i32, i32, Rgb, Arc<Vec<u8>>)>;
+type SplashCache = Option<(i32, i32, Arc<Vec<u8>>)>;
 
 /// Visualizador de PDF proprio: o do Edge corre noutro processo e nao aceita
 /// nem script nem teclado nosso; este e uma pagina nossa, com o PDF.js da
@@ -8603,14 +8644,18 @@ fn get_app_icon() -> Option<Icon> {
     Icon::from_rgba(rgba, size, size).ok()
 }
 
-unsafe fn draw_brand(
-    hdc: *mut core::ffi::c_void,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    bg_rgb: Rgb,
-) {
+/// A marca, misturada com o que estiver por tras dela.
+///
+/// Antes compunha-se o alfa da arte contra a cor da pagina e blitava-se um
+/// retangulo opaco. Numa tela vazia isso era invisivel; com o tecido neuronal
+/// por tras passou a ser uma caixa -- o retangulo apagava as linhas que
+/// cruzavam a arte. Abrir uma zona limpa grande o suficiente para o conter
+/// trocava a caixa por um buraco oval, igualmente visivel.
+///
+/// Agora a arte vai para o ecra com o alfa dela, por `AlphaBlend`: o tecido
+/// continua a passar por tras e a marca pousa em cima. Nao ha retangulo
+/// nenhum, em tema nenhum.
+unsafe fn draw_brand(hdc: *mut core::ffi::c_void, x: i32, y: i32, width: i32, height: i32) {
     if width <= 0 || height <= 0 {
         return;
     }
@@ -8618,27 +8663,28 @@ unsafe fn draw_brand(
     let pixels = {
         let mut cache = SPLASH_CACHE.lock().unwrap_or_else(|p| p.into_inner());
         match *cache {
-            Some((cached_w, cached_h, cached_bg, ref cached_pixels))
-                if cached_w == width && cached_h == height && cached_bg == bg_rgb =>
+            Some((cached_w, cached_h, ref cached_pixels))
+                if cached_w == width && cached_h == height =>
             {
                 // Clonar o Arc e copiar um ponteiro; clonar o Vec seria copiar
                 // a imagem inteira a cada repintura.
                 Arc::clone(cached_pixels)
             }
             _ => {
-                let rendered = Arc::new(render_brand_pixels(width, height, bg_rgb));
-                *cache = Some((width, height, bg_rgb, Arc::clone(&rendered)));
+                let rendered = Arc::new(render_brand_pixels(width, height));
+                *cache = Some((width, height, Arc::clone(&rendered)));
                 rendered
             }
         }
     };
 
-    blit_bgrx(hdc, &pixels, x, y, width, height);
+    alpha_blit(hdc, &pixels, x, y, width, height);
 }
 
-/// A arte vem sem fundo (o azul-escuro foi tirado no PNG): compomos o alfa
-/// dela por cima da cor da pagina e nao ha caixa nenhuma, em nenhum tema.
-fn render_brand_pixels(width: i32, height: i32, bg_rgb: Rgb) -> Vec<u8> {
+/// A arte vem com alfa e sai **pre-multiplicada**, que e o que o `AlphaBlend`
+/// exige: com canais por multiplicar, o que aparece a volta das letras e uma
+/// auréola clara.
+fn render_brand_pixels(width: i32, height: i32) -> Vec<u8> {
     let image = image::imageops::resize(
         get_brand_image(),
         width as u32,
@@ -8650,14 +8696,13 @@ fn render_brand_pixels(width: i32, height: i32, bg_rgb: Rgb) -> Vec<u8> {
     for py in 0..height as u32 {
         for px in 0..width as u32 {
             let pixel = image.get_pixel(px, py);
-            let alpha = pixel[3] as f32 / 255.0;
-            let channel = |value: u8, bg: u8| {
-                (value as f32 * alpha + bg as f32 * (1.0 - alpha)).round() as u8
-            };
-            pixels.push(channel(pixel[2], bg_rgb.2));
-            pixels.push(channel(pixel[1], bg_rgb.1));
-            pixels.push(channel(pixel[0], bg_rgb.0));
-            pixels.push(0);
+            let alpha = pixel[3];
+            let premultiply =
+                |value: u8| ((value as u32 * alpha as u32 + 127) / 255).min(255) as u8;
+            pixels.push(premultiply(pixel[2]));
+            pixels.push(premultiply(pixel[1]));
+            pixels.push(premultiply(pixel[0]));
+            pixels.push(alpha);
         }
     }
     pixels
@@ -8667,7 +8712,6 @@ fn render_brand_pixels(width: i32, height: i32, bg_rgb: Rgb) -> Vec<u8> {
 mod tests {
     use super::*;
     use windows_sys::Win32::Graphics::Gdi::GetDIBits;
-
     /// O fundo da Home acompanha a marca, nao disputa com ela.
     ///
     /// A versao anterior lancava particulas das margens e fazia-as convergir
@@ -8675,34 +8719,79 @@ mod tests {
     /// marca. Estes testes prendem as propriedades que fazem a diferenca --
     /// a zona limpa, a distribuicao pela tela, o movimento e as descargas --
     /// porque nenhuma delas se nota a faltar ate alguem olhar para o ecra.
+    const BRAND: (f64, f64, f64, f64) = (700.0, 180.0, 520.0, 374.0);
+
     fn home_field() -> tissue::Field {
-        home_tissue_field(1920.0, 1080.0, 1.0, 960.0, 345.6, 520.0)
+        home_tissue_field(1920.0, 1080.0, 1.0, BRAND.0, BRAND.1, BRAND.2, BRAND.3)
+    }
+
+    /// Dentro da elipse de silencio -- a zona onde vivem a esfera e as letras.
+    fn on_the_logo(x: f64, y: f64) -> bool {
+        let (bx, by, bw, bh) = BRAND;
+        let nx = (x - (bx + bw / 2.0)) / (bw * 0.60);
+        let ny = (y - (by + bh * 0.58)) / (bw * 0.26);
+        // O empurrao poe o neuronio exatamente no bordo; a folga e para o
+        // arredondamento, nao para o desenho.
+        nx * nx + ny * ny < 0.999
     }
 
     #[test]
-    fn home_background_never_crowds_the_brand() {
-        let (target_x, target_y) = (960.0, 345.6);
-        let brand_width: f64 = 520.0;
-        let quiet_x = (brand_width * 0.60).max(120.0);
-        let quiet_y = (brand_width * 0.26).max(70.0);
+    fn home_background_never_runs_over_the_logo_itself() {
+        // O tecido passa por TRAS da arte -- ela vai para o ecra com o alfa
+        // dela --, mas nao pode passar por cima da esfera nem das letras, que
+        // sao o unico sitio onde a marca tem de se ler sem concorrencia.
         let field = home_field();
-
-        // Varios instantes: o movimento nao pode empurrar ninguem para dentro.
-        for step in 0..40 {
+        for step in 0..60 {
             let seconds = step as f64 * 0.37;
-            let nodes = tissue::nodes_at(&field, seconds);
-            assert!(!nodes.is_empty());
-            for node in &nodes {
-                let nx = (node.x - target_x) / quiet_x;
-                let ny = (node.y - target_y) / quiet_y;
+            let frame = tissue::tissue_at(&field, seconds);
+            assert!(!frame.nodes.is_empty());
+            for node in &frame.nodes {
                 assert!(
-                    nx * nx + ny * ny >= 0.999,
-                    "neuronio dentro da zona da marca em t={seconds}: ({}, {})",
+                    !on_the_logo(node.x, node.y),
+                    "soma por cima do logo em t={seconds}: ({}, {})",
                     node.x,
                     node.y
                 );
             }
+            for branch in &frame.branches {
+                for (x, y) in [(branch.ax, branch.ay), (branch.bx, branch.by)] {
+                    assert!(
+                        !on_the_logo(x, y),
+                        "ramo por cima do logo em t={seconds}: ({x}, {y})"
+                    );
+                }
+            }
+            for burst in &frame.bursts {
+                assert!(
+                    !on_the_logo(burst.x, burst.y),
+                    "descarga por cima do logo em t={seconds}: ({}, {})",
+                    burst.x,
+                    burst.y
+                );
+            }
         }
+    }
+
+    #[test]
+    fn the_tissue_runs_behind_the_brand_instead_of_leaving_a_hole() {
+        // O contrario tambem tem de valer: uma zona limpa grande o suficiente
+        // para conter o retangulo da arte trocava a caixa por um buraco oval a
+        // meio da tela. O tecido tem de chegar ao retangulo -- e a arte, com
+        // alfa, pousa em cima.
+        let (bx, by, bw, bh) = BRAND;
+        let field = home_field();
+        let frame = tissue::tissue_at(&field, 6.0);
+        let inside_rect = |x: f64, y: f64| x >= bx && x <= bx + bw && y >= by && y <= by + bh;
+        let touching = frame
+            .branches
+            .iter()
+            .filter(|b| inside_rect(b.ax, b.ay) || inside_rect(b.bx, b.by))
+            .count();
+        assert!(
+            touching > 8,
+            "so {touching} ramos entram no retangulo da arte: ficou um buraco \
+             oval onde devia haver tecido"
+        );
     }
 
     #[test]
@@ -8758,24 +8847,21 @@ mod tests {
     }
 
     #[test]
-    fn home_discharges_never_light_up_over_the_brand() {
-        // Uma faisca em cima do logo e pior do que uma linha: chama a atencao
-        // exatamente para o sitio que tem de ficar limpo.
-        let field = home_field();
-        let quiet_x = (520.0f64 * 0.60).max(120.0);
-        let quiet_y = (520.0f64 * 0.26).max(70.0);
-        for step in 0..240 {
-            for burst in tissue::tissue_at(&field, step as f64 * 0.05).bursts {
-                let nx = (burst.x - 960.0) / quiet_x;
-                let ny = (burst.y - 345.6) / quiet_y;
-                assert!(
-                    nx * nx + ny * ny >= 0.999,
-                    "descarga por cima da marca em ({}, {})",
-                    burst.x,
-                    burst.y
-                );
-            }
-        }
+    fn home_tissue_is_dense_enough_to_read_as_tissue() {
+        // "Quero algo mais real, com muito mais conexoes." Uma rede rala le-se
+        // como um grafo; o que se quer e tecido, com ramagem por tras.
+        let frame = tissue::tissue_at(&home_field(), 6.0);
+        let per_node = frame.links.len() as f64 / frame.nodes.len() as f64;
+        assert!(
+            per_node >= 2.5,
+            "{per_node:.1} ligacoes por soma: ainda e um grafo, nao tecido"
+        );
+        assert!(
+            frame.branches.len() > frame.nodes.len() * 12,
+            "{} ramos para {} somas: falta a ramagem",
+            frame.branches.len(),
+            frame.nodes.len()
+        );
     }
 
     /// A autorizacao de rede local vale para a ORIGEM que o utilizador
@@ -9010,6 +9096,51 @@ mod tests {
     }
 
     #[test]
+    fn the_brand_keeps_its_transparency_instead_of_becoming_a_rectangle() {
+        // Isto foi rejeitado duas vezes no ecra: a arte compunha-se contra a
+        // cor da pagina e ia para o ecra opaca, o que apagava o tecido num
+        // retangulo. Os cantos da arte sao transparentes e tem de continuar a
+        // ser depois de redimensionados.
+        let size = 96;
+        let pixels = render_brand_pixels(size, size);
+        assert_eq!(pixels.len(), (size * size * 4) as usize);
+
+        let at = |x: i32, y: i32| {
+            let index = ((y * size + x) * 4) as usize;
+            (
+                pixels[index],
+                pixels[index + 1],
+                pixels[index + 2],
+                pixels[index + 3],
+            )
+        };
+        for (x, y) in [(0, 0), (size - 1, 0), (0, size - 1), (size - 1, size - 1)] {
+            let (b, g, r, a) = at(x, y);
+            assert_eq!(
+                (b, g, r, a),
+                (0, 0, 0, 0),
+                "o canto ({x}, {y}) e opaco: vai aparecer um retangulo"
+            );
+        }
+
+        // E alguma coisa tem de ser visivel, senao o que se corrigiu foi
+        // apagar a marca.
+        assert!(
+            pixels.chunks(4).any(|px| px[3] > 200),
+            "a marca ficou toda transparente"
+        );
+
+        // Pre-multiplicado: nenhum canal pode exceder o alfa. Sem isto o
+        // AlphaBlend desenha uma aureola clara a volta das letras.
+        for px in pixels.chunks(4) {
+            assert!(
+                px[0] <= px[3] && px[1] <= px[3] && px[2] <= px[3],
+                "pixel por pre-multiplicar: {px:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_stretch_dibits_on_screen_dc() {
         unsafe {
             let hdc = GetDC(core::ptr::null_mut());
@@ -9017,7 +9148,7 @@ mod tests {
             let img = get_brand_image();
             assert_eq!(img.width(), 1200);
             let size = 104;
-            let pixels = render_brand_pixels(size, size, (248, 249, 250));
+            let pixels = render_brand_pixels(size, size);
             assert_eq!(pixels.len(), (size * size * 4) as usize);
 
             let bmi = BITMAPINFO {
@@ -11488,6 +11619,97 @@ fn round_rect_sdf(px: f32, py: f32, width: f32, height: f32, radius: f32) -> f32
     let ax = qx.max(0.0);
     let ay = qy.max(0.0);
     (ax * ax + ay * ay).sqrt() + qx.max(qy).min(0.0) - radius
+}
+
+/// Poe uma imagem BGRA **pre-multiplicada** por cima do que ja esta no DC,
+/// respeitando o alfa. E o unico sitio onde a NeuralIA usa a `msimg32`, e usa-a
+/// porque a alternativa -- ler o fundo de volta com `GetDIBits`, compor a mao e
+/// voltar a escrever -- e tres vezes o trabalho para o mesmo resultado.
+unsafe fn alpha_blit(
+    hdc: *mut core::ffi::c_void,
+    pixels: &[u8],
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) {
+    if width <= 0 || height <= 0 || pixels.len() < (width * height * 4) as usize {
+        return;
+    }
+
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            // Negativo: a imagem vem de cima para baixo, como a `image` a da.
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            biSizeImage: (width * height * 4) as u32,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        },
+        bmiColors: [windows_sys::Win32::Graphics::Gdi::RGBQUAD {
+            rgbBlue: 0,
+            rgbGreen: 0,
+            rgbRed: 0,
+            rgbReserved: 0,
+        }; 1],
+    };
+
+    // O `AlphaBlend` precisa de um bitmap com alfa de verdade, e um
+    // `CreateCompatibleBitmap` nao o tem: dai a seccao DIB.
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let dib = CreateDIBSection(
+        hdc as _,
+        &bmi,
+        DIB_RGB_COLORS,
+        &mut bits,
+        std::ptr::null_mut(),
+        0,
+    );
+    if dib.is_null() || bits.is_null() {
+        if !dib.is_null() {
+            DeleteObject(dib as _);
+        }
+        return;
+    }
+    std::ptr::copy_nonoverlapping(
+        pixels.as_ptr(),
+        bits as *mut u8,
+        (width * height * 4) as usize,
+    );
+
+    let mem = CreateCompatibleDC(hdc as _);
+    if mem.is_null() {
+        DeleteObject(dib as _);
+        return;
+    }
+    let old = SelectObject(mem, dib as _);
+    AlphaBlend(
+        hdc as _,
+        x,
+        y,
+        width,
+        height,
+        mem,
+        0,
+        0,
+        width,
+        height,
+        BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        },
+    );
+    SelectObject(mem, old);
+    DeleteDC(mem);
+    DeleteObject(dib as _);
 }
 
 unsafe fn blit_bgrx(
