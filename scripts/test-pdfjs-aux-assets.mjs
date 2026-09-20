@@ -29,6 +29,13 @@ if (typeof Math.sumPrecise !== 'function') {
 }
 const pdfjsLib = await import('../assets/pdfjs/pdf.mjs');
 
+const warnings = [];
+const originalWarn = console.warn;
+console.warn = (...args) => {
+  warnings.push(args.map(String).join(' '));
+  originalWarn(...args);
+};
+
 const pdfjsRoot = fileURLToPath(new URL('../assets/pdfjs/', import.meta.url));
 const missing = path.join(pdfjsRoot, '__missing_aux__') + path.sep;
 const breakKind = process.env.NEURALIA_PDF_AUX_BREAK || '';
@@ -93,6 +100,7 @@ let passed = 0;
 for (const [name, file] of cases) {
   if (only && only !== name) continue;
 
+  const warningStart = warnings.length;
   const data = new Uint8Array(
     await readFile(path.join(pdfjsRoot, 'fixtures', file))
   );
@@ -122,6 +130,18 @@ for (const [name, file] of cases) {
     page.cleanup();
   }
   await task.destroy();
+
+  const caseWarnings = warnings.slice(warningStart).join('\n');
+  if (name === 'cid-cmap' && /Unable to load CMap data/i.test(caseWarnings)) {
+    throw new Error(name + ': CMap externo necessário não foi carregado');
+  }
+  if (
+    name === 'standard-fonts' &&
+    /Unable to load (?:standard )?font data|fetchStandardFontData/i.test(caseWarnings)
+  ) {
+    throw new Error(name + ': dados de fonte standard necessários não foram carregados');
+  }
+
   passed++;
   console.log('ok - aux ' + name);
 }
