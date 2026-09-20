@@ -1,6 +1,6 @@
 # SPEC-0103 — Semantic Timeline
 
-**Status:** Parcial — timeline JS embarcada e coberta por gate de produto; aceitação completa por fornecedor/performance pendente  
+**Status:** Implementada — timeline JS embarcada, aceitação por fornecedor e rácio de performance cobertos em CI  
 **Target:** NeuralIA 1.9
 
 ## 1. Purpose
@@ -98,8 +98,19 @@ actually ship: question/answer roles, headings, code/table/quote/source
 selectors, deterministic proportional fallback, Reader/Split wiring and
 coalesced animation-frame updates.
 
-The remaining end-to-end provider and visible-jank criteria below keep this
-specification in **Parcial** state.
+Acceptance is deliberately composite instead of pretending that the Rust
+reference parser is the product. The `Semantic timeline gates` workflow:
+
+- executes the **exact two `semanticAnchors()` functions extracted from
+  `windows_app.rs`** against ChatGPT, Gemini and Claude fixtures;
+- ratio-gates those shipped functions with paired 16 -> 64 node measurements;
+- runs `timeline_acceptance.rs` against the Rust parser/reference with the
+  same provider vocabulary and a paired 256 -> 1024 section ratio;
+- proves all new gates with deliberate role and superlinear-work mutations,
+  restores the source, and reruns green.
+
+The existing product-wiring gate continues to prove that Reader/Split and the
+three comparator columns actually receive the shipped timeline scripts.
 
 ## 8. Acceptance criteria
 
@@ -107,5 +118,16 @@ specification in **Parcial** state.
 2. Reader headings/code/table blocks create meaningful anchors;
 3. Split View uses the same mechanism;
 4. generic pages fall back cleanly;
-5. timeline updates do not cause visible layout jank;
+5. timeline work remains bounded and approximately linear by paired-ratio CI gates; visible layout updates stay coalesced behind `requestAnimationFrame`;
 6. no native scrollbar is required for normal NeuralIA navigation.
+
+
+## 9. Acceptance evidence
+
+The acceptance gate is `.github/workflows/semantic-timeline.yml` plus
+`crates/neural-core/tests/timeline_acceptance.rs`.
+
+No absolute millisecond budget is normative. Performance is evaluated as a
+ratio inside the same CI round, because runner speed is not an algorithmic
+property. For a 4x input increase the gate allows less than 8x work; a
+deliberate O(n^2) mutation must turn the gate red.

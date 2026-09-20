@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+const MAX_SEMANTIC_ANCHORS: usize = 128;
+
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 
@@ -91,7 +93,7 @@ pub fn semantic_anchors_html(input: &str) -> Vec<SemanticAnchor> {
         {
             raw.push((kind, text));
         }
-        if raw.len() >= 128 {
+        if raw.len() >= MAX_SEMANTIC_ANCHORS {
             break;
         }
     }
