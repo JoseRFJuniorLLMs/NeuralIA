@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/logo.ico" width="112" height="112" alt="NeuralIA"></p>
+<p align="center"><img src="assets/logo.ico" width="400" height="400" alt="NeuralIA"></p>
 
 <h1 align="center">NeuralIA</h1>
 <p align="center"><strong>The browser without the browser.</strong></p>
