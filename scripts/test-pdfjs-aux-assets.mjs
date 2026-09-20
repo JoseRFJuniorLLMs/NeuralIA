@@ -16,6 +16,14 @@ if (typeof Uint8Array.fromHex !== 'function') {
     return Uint8Array.from(hex.match(/../g) || [], pair => Number.parseInt(pair, 16));
   };
 }
+if (typeof Map.prototype.getOrInsertComputed !== 'function') {
+  Map.prototype.getOrInsertComputed = function (key, callback) {
+    if (this.has(key)) return this.get(key);
+    const value = callback(key);
+    this.set(key, value);
+    return value;
+  };
+}
 const pdfjsLib = await import('../assets/pdfjs/pdf.mjs');
 
 const pdfjsRoot = fileURLToPath(new URL('../assets/pdfjs/', import.meta.url));
