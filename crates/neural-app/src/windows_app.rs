@@ -512,24 +512,61 @@ impl BarLayout {
         let gap = 4.0 * scale;
         let provider_width = 116.0 * scale;
         let plus_width = 26.0 * scale;
+        let chip_w = 62.0 * scale;
+        let chip_gap = 5.0 * scale;
+
+        // Os chips das colunas minimizadas e os controlos da direita sao
+        // reservados ANTES de distribuir as pilulas. Ao contrario, a pilula
+        // estendia-se ate a borda da janela e aterrava por cima do botao
+        // "Privado" ou de um chip -- e como o hit-testing resolve por ordem de
+        // indice, o clique ia parar a coluna errada.
+        let hidden: Vec<usize> = (0..columns_len)
+            .filter(|index| columns.minimized[*index])
+            .collect();
+        let chips_w = if hidden.is_empty() {
+            0.0
+        } else {
+            hidden.len() as f64 * chip_w + chip_gap * hidden.len().saturating_sub(1) as f64
+        };
+        let controls_left = right_controls(client_width, scale, columns.split_active)
+            .private
+            .x;
+        let reserved = if hidden.is_empty() {
+            0.0
+        } else {
+            chips_w + 8.0 * scale
+        };
+        let bar_right = (controls_left - 8.0 * scale - reserved).max(pad);
 
         for (slot, span) in spans.iter().enumerate() {
             let mut left = span.x * scale + group_pad;
             if slot == 0 {
                 left = left.max(home.x + home.width + 8.0 * scale);
             }
-            let right = ((span.x + span.width) * scale - group_pad).min(client_width - pad);
-            let available = (right - left).max(provider_width + plus_width + gap);
+            let right = ((span.x + span.width) * scale - group_pad).min(bar_right);
+            // O `.max()` que aqui estava punha o chao ACIMA do tecto: garantia
+            // `available >= provider_width + plus_width + gap`, o que tornava o
+            // `.min()` de baixo matematicamente morto e a pilula nunca encolhia.
+            let available = (right - left).max(0.0);
+            let pill = provider_width.min((available - plus_width - gap).max(0.0));
             columns_rect[span.index] = UiRect {
                 x: left,
                 y: row_y,
-                width: provider_width.min(available - plus_width - gap),
+                width: pill,
                 height: row_h,
             };
+            // O "+" fica sempre dentro da faixa da sua coluna. Se nao couber,
+            // desaparece -- em vez de ficar invisivel mas clicavel por cima do
+            // vizinho, que e o pior dos dois mundos.
+            let plus_x = left + pill + gap;
             plus_rect[span.index] = UiRect {
-                x: columns_rect[span.index].x + columns_rect[span.index].width + gap,
+                x: plus_x,
                 y: row_y + 2.0 * scale,
-                width: plus_width,
+                width: if plus_x + plus_width <= right {
+                    plus_width
+                } else {
+                    0.0
+                },
                 height: row_h - 4.0 * scale,
             };
         }
@@ -538,18 +575,11 @@ impl BarLayout {
         // barra -- e o chip que as traz de volta com um clique. Encostam-se a
         // direita, logo antes de Privado/Split, para nao roubarem espaco as
         // colunas que estao mesmo a ser vistas.
-        let hidden: Vec<usize> = (0..columns_len)
-            .filter(|index| columns.minimized[*index])
-            .collect();
         if !hidden.is_empty() {
-            let chip_w = 62.0 * scale;
-            let chip_gap = 5.0 * scale;
-            let controls_left = right_controls(client_width, scale, columns.split_active)
-                .private
-                .x;
-            let strip =
-                hidden.len() as f64 * chip_w + chip_gap * hidden.len().saturating_sub(1) as f64;
-            let mut x = (controls_left - 8.0 * scale - strip).max(pad);
+            // O espaco ja foi reservado acima; o `.max(bar_right)` garante que
+            // os chips nunca recuam para dentro da faixa das pilulas, mesmo com
+            // a janela absurdamente estreita.
+            let mut x = (controls_left - 8.0 * scale - chips_w).max(bar_right);
             for index in hidden {
                 columns_rect[index] = UiRect {
                     x,
@@ -8129,6 +8159,120 @@ mod tests {
         assert!(!remote_web_target("http://192.168.1.50:3000/", None));
         assert!(remote_web_target("https://example.com/x", None));
         assert!(remote_web_target("https://example.com/x", Some(typed)));
+    }
+
+    /// Geometria da barra: nada do que e desenhado numa coluna pode aterrar
+    /// noutra, nem por cima dos controlos da direita. Os tres casos vieram da
+    /// auditoria de 2026-09-19 e cada um tinha um clique concreto a ir para o
+    /// sitio errado.
+    mod bar_geometry {
+        use super::*;
+
+        /// Pesos que sobram depois de arrastar o divisor `divider` ate ao
+        /// batente da esquerda ou da direita.
+        fn dragged(weights: [f64; COMPARATOR_COLUMNS], divider: usize, mouse_x: f64) -> BarColumns {
+            let visible: Vec<usize> = (0..COMPARATOR_COLUMNS).collect();
+            BarColumns {
+                count: COMPARATOR_COLUMNS,
+                weights: resized_weights(&weights, &visible, divider, mouse_x, 1120.0),
+                minimized: [false; COMPARATOR_COLUMNS],
+                split_active: false,
+            }
+        }
+
+        fn overlaps(left: UiRect, right: UiRect) -> bool {
+            left.width > 0.0
+                && right.width > 0.0
+                && left.x < right.x + right.width
+                && right.x < left.x + left.width
+        }
+
+        #[test]
+        fn nothing_a_column_draws_leaves_that_column() {
+            // Divisor 0 todo para a esquerda: a coluna 0 fecha no minimo e a
+            // pilula de 116 px deixa de caber la dentro.
+            let columns = dragged([1.0; COMPARATOR_COLUMNS], 0, 0.0);
+            let layout =
+                BarLayout::with_contexts(1120.0, 1.0, true, columns, [0; COMPARATOR_COLUMNS]);
+            let spans = visible_column_spans(
+                1120.0,
+                COMPARATOR_COLUMNS,
+                &columns.weights,
+                &columns.minimized,
+            );
+
+            for span in &spans {
+                let pill = layout.columns[span.index];
+                let plus = layout.add_tabs[span.index];
+                let right = span.x + span.width;
+                assert!(
+                    pill.x + pill.width <= right + 0.5,
+                    "pilula da coluna {} sai da faixa: {:?} contra {right}",
+                    span.index,
+                    pill
+                );
+                assert!(
+                    plus.x + plus.width <= right + 0.5,
+                    "'+' da coluna {} sai da faixa: {:?} contra {right}",
+                    span.index,
+                    plus
+                );
+            }
+        }
+
+        #[test]
+        fn the_plus_never_hides_under_the_private_button() {
+            // Divisor 1 todo para a direita: a coluna 2 fica no minimo e o
+            // "+" dela ia parar dentro de "Privado", que ganha o hit-test.
+            let columns = dragged([1.0; COMPARATOR_COLUMNS], 1, 1120.0);
+            let layout =
+                BarLayout::with_contexts(1120.0, 1.0, true, columns, [0; COMPARATOR_COLUMNS]);
+            let private = right_controls(1120.0, 1.0, false).private;
+
+            for index in 0..COMPARATOR_COLUMNS {
+                let plus = layout.add_tabs[index];
+                assert!(
+                    !overlaps(plus, private),
+                    "'+' da coluna {index} debaixo de Privado: {plus:?} contra {private:?}"
+                );
+                let pill = layout.columns[index];
+                assert!(
+                    !overlaps(pill, private),
+                    "pilula da coluna {index} debaixo de Privado: {pill:?} contra {private:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_minimized_chip_never_lands_on_a_visible_column() {
+            // Coluna 1 minimizada e o unico divisor todo para a direita: a
+            // coluna 2 fica estreita e o chip caia-lhe em cima.
+            let visible = vec![0usize, 2];
+            let weights = resized_weights(&[1.0; COMPARATOR_COLUMNS], &visible, 0, 1120.0, 1120.0);
+            let columns = BarColumns {
+                count: COMPARATOR_COLUMNS,
+                weights,
+                minimized: [false, true, false],
+                split_active: false,
+            };
+            let layout =
+                BarLayout::with_contexts(1120.0, 1.0, true, columns, [0; COMPARATOR_COLUMNS]);
+
+            let chip = layout.columns[1];
+            assert!(chip.width > 0.0, "a coluna minimizada tem de ter chip");
+            for index in [0usize, 2] {
+                assert!(
+                    !overlaps(chip, layout.columns[index]),
+                    "chip em cima da pilula da coluna {index}: {chip:?} contra {:?}",
+                    layout.columns[index]
+                );
+                assert!(
+                    !overlaps(chip, layout.add_tabs[index]),
+                    "chip em cima do '+' da coluna {index}: {chip:?} contra {:?}",
+                    layout.add_tabs[index]
+                );
+            }
+        }
     }
 
     /// O divisor do comparador tem de aceitar o rato.

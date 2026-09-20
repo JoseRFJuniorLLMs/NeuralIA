@@ -1,19 +1,74 @@
-// Visualizador PDF offline do NeuralIA. Documentos longos nao podem consumir
-// memoria sem limite: ha um placeholder por pagina (da a barra de scroll
-// certa), mas o canvas e o PDFPageProxy so vivem perto da pagina actual, e os
-// bytes chegam por ranges em vez de o ficheiro inteiro ser copiado para o
-// worker. A geometria e calculada, nao lida do DOM, para o scroll nao forcar
-// layout a cada evento.
+// Visualizador PDF offline do NeuralIA. Documentos longos usam um placeholder
+// barato por pagina (da a barra de scroll certa), enquanto canvas/bitmap e
+// estado de render sao libertados longe da pagina actual. O PDF.js conserva
+// internamente os PDFPageProxy ja pedidos ate destruir o documento, portanto a
+// garantia de memoria limitada aqui aplica-se aos recursos pesados de render,
+// nao ao numero de proxies. Os bytes chegam por ranges em vez de o ficheiro
+// inteiro ser copiado para o worker. A geometria e calculada, nao lida do DOM,
+// para o scroll nao forcar layout a cada evento.
 import * as pdfjsLib from './pdf.mjs';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './pdf.worker.mjs';
 
+export function describeLoadError(err) {
+  const name = (err && err.name) || '';
+  const text = (err && err.message) || String(err);
+
+  if (
+    (typeof pdfjsLib.ResponseException === 'function' && err instanceof pdfjsLib.ResponseException) ||
+    name === 'ResponseException'
+  ) {
+    const status = Number.isFinite(err && err.status) ? ' HTTP ' + err.status : '';
+    return 'Não consegui obter o PDF:' + status + (status ? '' : ' ' + text);
+  }
+
+  if (
+    (typeof pdfjsLib.PasswordException === 'function' && err instanceof pdfjsLib.PasswordException) ||
+    name === 'PasswordException'
+  ) {
+    return 'Este PDF está protegido por senha e o NeuralIA ainda não consegue abri-lo.';
+  }
+
+  if (
+    (typeof pdfjsLib.InvalidPDFException === 'function' && err instanceof pdfjsLib.InvalidPDFException) ||
+    name === 'InvalidPDFException'
+  ) {
+    return 'Este ficheiro não é um PDF que eu consiga abrir: ' + text;
+  }
+
+  if (
+    name === 'UnknownErrorException' &&
+    /(?:failed to fetch|network(?:error)?|load failed|fetch)/i.test(text)
+  ) {
+    return 'Não consegui obter o PDF: ' + text;
+  }
+
+  return 'Este ficheiro não é um PDF que eu consiga abrir: ' + text;
+}
+
+export function showStatus(element, message, error = false) {
+  if (message !== undefined && message !== null) element.textContent = message;
+  element.hidden = false;
+  element.style.display = 'grid';
+  element.classList.toggle('error', error);
+}
+
+export function hideStatus(element) {
+  element.hidden = true;
+  // #status tem display:grid em CSS autoral; portanto hidden sozinho pode ser
+  // sobreposto. O estilo inline fecha o overlay de forma inequívoca.
+  element.style.display = 'none';
+  element.classList.remove('error');
+}
+
+if (typeof document !== 'undefined') {
 const status = document.getElementById('status');
 const hud = document.getElementById('hud');
 const pagesEl = document.getElementById('pages');
 const MAX_WIDTH = 960;
-// Paginas com canvas vivo a volta da actual; o proxy da pagina sobrevive um
-// pouco mais (EVICT_RADIUS) para o vaivem do scroll nao repetir o getPage.
+// Paginas com canvas vivo a volta da actual; a referencia local ao proxy da
+// pagina sobrevive um pouco mais (EVICT_RADIUS) para o vaivem do scroll nao
+// repetir o getPage. O PDF.js pode manter o mesmo proxy no cache interno.
 const KEEP_RADIUS = 3;
 const EVICT_RADIUS = KEEP_RADIUS + 2;
 // Faixa alem do viewport em que o observer pede render. A evicao respeita a
@@ -46,20 +101,7 @@ function pixelRatio() {
 }
 
 function fail(message) {
-  status.textContent = message;
-  status.classList.add('error');
-  status.hidden = false;
-}
-
-// O PDF.js entrega os erros de rede como ResponseException (estado HTTP) e o
-// "Failed to fetch" embrulhado em UnknownErrorException; o resto e PDF que
-// nao se consegue abrir. Mantem as duas mensagens de sempre.
-function describeLoadError(err) {
-  const name = (err && err.name) || '';
-  const text = (err && err.message) || String(err);
-  if (name === 'ResponseException') return 'Não consegui obter o PDF: HTTP ' + err.status;
-  if (name === 'UnknownErrorException' && /fetch/i.test(text)) return 'Não consegui obter o PDF: ' + text;
-  return 'Este ficheiro não é um PDF que eu consiga abrir: ' + text;
+  showStatus(status, message, true);
 }
 
 function targetWidth() {
@@ -182,9 +224,11 @@ async function render(index) {
 }
 
 // So visita os indices vivos, nunca todas as paginas. O canvas fica enquanto
-// a pagina estiver a KEEP_RADIUS da actual ou dentro da faixa do observer; o
-// proxy dura ate EVICT_RADIUS, excepto o da pagina 1, que e a referencia da
-// escala e a primeira a voltar a mostrar.
+// a pagina estiver a KEEP_RADIUS da actual ou dentro da faixa do observer.
+// Fora de EVICT_RADIUS largamos a referencia local e chamamos cleanup() para
+// libertar estado pesado de render; o WorkerTransport do PDF.js pode continuar
+// a reter o PDFPageProxy no cache interno. A pagina 1 fica referenciada porque
+// e a base da escala e a primeira a voltar a mostrar.
 function evictFarPages() {
   const center = current - 1;
   const bandTop = window.scrollY - BAND;
@@ -349,7 +393,7 @@ async function load() {
   layoutAll();
   for (const slot of slots) observer.observe(slot.el);
 
-  status.hidden = true;
+  hideStatus(status);
   hud.hidden = false;
   updateHud();
   document.title = 'NeuralIA · PDF · ' + doc.numPages + ' páginas';
@@ -384,3 +428,4 @@ window.addEventListener('resize', () => {
 });
 
 load();
+}
