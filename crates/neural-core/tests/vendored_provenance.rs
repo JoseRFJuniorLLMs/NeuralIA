@@ -138,3 +138,27 @@ fn pdfjs_auxiliary_assets_match_the_recorded_manifest() {
         );
     }
 }
+
+
+#[test]
+fn release_sbom_names_every_pdfjs_auxiliary_family() {
+    let release = read(".github/workflows/release.yml");
+    for marker in [
+        "pdf.js OpenJPEG decoder",
+        "BSD-2-Clause",
+        "pdf.js JBIG2 decoder",
+        "pdf.js QCMS decoder",
+        "Adobe binary CMaps",
+        "Foxit standard fonts",
+        "Liberation Sans",
+        "1.07.4",
+        "CGATS001Compat-v2-micro ICC profile",
+        "CC0-1.0",
+        "assets/pdfjs/AUXILIARY_BLOBS.md",
+    ] {
+        assert!(
+            release.contains(marker),
+            "SBOM de release não declara o componente/proveniência: {marker}"
+        );
+    }
+}
