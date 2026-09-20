@@ -41,6 +41,11 @@ All notable changes to NeuralIA are documented here.
 - Revisão adversarial independente e release 2.1.0 permanecem pendentes.
 
 ### Fixed
+- **PDF.js deixa de pedir WASM inexistente e o overlay de carregamento fecha de verdade.**
+  O viewer usa os fallbacks JS oficiais OpenJPEG/JBIG2 da release 6.3.289,
+  passa `wasmUrl` explicitamente e desliga WASM enquanto os binários não forem
+  vendorizados. O estado visual passa a controlar `display` diretamente, e
+  erros HTTP/PDF usam as classes exportadas pelo PDF.js antes do fallback textual.
 - **PR #57 — o divisor nativo do comparador volta a receber o rato.** A janela
   `STATIC` do splitter devolvia `HTTRANSPARENT` no `WM_NCHITTEST`, portanto
   `WM_LBUTTONDOWN`/`WM_MOUSEMOVE` nunca chegavam à subclasse e toda a lógica de
