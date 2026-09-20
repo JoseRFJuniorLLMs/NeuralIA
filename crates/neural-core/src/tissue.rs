@@ -170,6 +170,16 @@ pub fn max_link(field: &Field) -> f64 {
 /// O tecido inteiro num instante: neuronios, ligacoes e impulsos.
 /// A que distancia dois neuronios se consideram em contacto. Mais do que isto
 /// e so vizinhanca; menos do que isto e descarga.
+/// Se um ponto cai dentro da elipse de silencio. Sem elipse, nada cai dentro.
+fn inside_quiet(field: &Field, x: f64, y: f64) -> bool {
+    let Some((cx, cy, rx, ry)) = field.quiet else {
+        return false;
+    };
+    let nx = (x - cx) / rx;
+    let ny = (y - cy) / ry;
+    nx * nx + ny * ny < 1.0
+}
+
 pub fn contact_distance(field: &Field) -> f64 {
     max_link(field) * 0.13
 }
@@ -193,13 +203,20 @@ pub fn tissue_at(field: &Field, seconds: f64) -> Tissue {
             // medida que se aproximam, portanto o clarao acende e apaga
             // sozinho com o movimento -- nao ha estado nenhum a guardar.
             if distance < contact {
-                let force = 1.0 - distance / contact;
-                bursts.push(Burst {
-                    x: (a.x + b.x) / 2.0,
-                    y: (a.y + b.y) / 2.0,
-                    radius: contact * (0.45 + 1.25 * force),
-                    glow: force,
-                });
+                let (mx, my) = ((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
+                // Os neuronios ficam fora da zona de silencio, mas o ponto
+                // medio de dois que a ladeiam cai la dentro -- e uma faisca em
+                // cima da marca chama a atencao exatamente para o sitio que
+                // tem de ficar limpo.
+                if !inside_quiet(field, mx, my) {
+                    let force = 1.0 - distance / contact;
+                    bursts.push(Burst {
+                        x: mx,
+                        y: my,
+                        radius: contact * (0.45 + 1.25 * force),
+                        glow: force,
+                    });
+                }
             }
             let closeness = 1.0 - distance / reach;
             links.push(Link {
@@ -462,6 +479,29 @@ mod tests {
             "o clarao mais forte em 30 segundos foi {brightest:.2}: eles \
              aproximam-se mas nunca se encontram a serio"
         );
+    }
+
+    #[test]
+    fn no_discharge_lights_up_inside_the_quiet_ellipse() {
+        // Os neuronios ja ficam de fora, mas o ponto medio de dois que ladeiam
+        // a zona cai la dentro. Uma faisca ali chama a atencao exatamente para
+        // o sitio que tinha de ficar limpo.
+        let field = field().with_quiet_ellipse(480.0, 270.0, 220.0, 90.0);
+        let mut seen = 0usize;
+        for step in 0..600 {
+            for burst in tissue_at(&field, step as f64 * 0.05).bursts {
+                let nx = (burst.x - 480.0) / 220.0;
+                let ny = (burst.y - 270.0) / 90.0;
+                assert!(
+                    nx * nx + ny * ny >= 1.0,
+                    "descarga dentro da zona de silencio em ({}, {})",
+                    burst.x,
+                    burst.y
+                );
+                seen += 1;
+            }
+        }
+        assert!(seen > 20, "so {seen} descargas: nada para verificar");
     }
 
     #[test]

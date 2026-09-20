@@ -25,7 +25,7 @@ use neural_core::{
     MemoryDocument, MemoryHit, MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore,
     ObservedPage, ReaderArticle, ReaderBlock, ReaderClient, ResearchItemKind, ResearchSession,
     chatgpt_search_url, claude_search_url, google_ai_url, is_local_network_target, is_pdf_url,
-    parse_intent, reader_html, redact_sensitive_text,
+    parse_intent, reader_html, redact_sensitive_text, tissue,
 };
 use url::Url;
 use windows_sys::Win32::{
@@ -35,10 +35,10 @@ use windows_sys::Win32::{
         ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
         CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
         DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject,
-        DrawTextW, Ellipse, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC, InvalidateRect, LineTo,
-        MoveToEx, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC, SRCCOPY, ScreenToClient,
-        SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits,
-        TRANSPARENT,
+        DrawTextW, Ellipse, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC, GetStockObject,
+        InvalidateRect, LineTo, MoveToEx, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID,
+        ReleaseDC, SRCCOPY, ScreenToClient, SelectObject, SetBkColor, SetBkMode, SetTextColor,
+        SetWindowRgn, StretchDIBits, TRANSPARENT,
     },
     Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom},
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
@@ -7709,30 +7709,39 @@ fn gmail_monitor_enabled_for(no_gmail: Option<OsString>) -> bool {
     no_gmail.is_none()
 }
 
-fn neural_hash(mut value: u32) -> f64 {
-    value ^= value >> 16;
-    value = value.wrapping_mul(0x7feb_352d);
-    value ^= value >> 15;
-    value = value.wrapping_mul(0x846c_a68b);
-    value ^= value >> 16;
-    value as f64 / u32::MAX as f64
+/// A tela do fundo da Home, com a zona limpa a volta da marca.
+///
+/// As contas vivem no `neural-core` e nao aqui: e o mesmo tecido que o
+/// instalador desenha, e duas copias divergiam a primeira vez que uma fosse
+/// afinada. O que fica deste lado e so o que e proprio da Home -- onde esta a
+/// marca e quanto espaco ela reserva.
+fn home_tissue_field(
+    width: f64,
+    height: f64,
+    scale: f64,
+    target_x: f64,
+    target_y: f64,
+    brand_width: f64,
+) -> tissue::Field {
+    tissue::Field::new(width, height, scale).with_quiet_ellipse(
+        target_x,
+        target_y,
+        (brand_width * 0.60).max(120.0 * scale),
+        (brand_width * 0.26).max(70.0 * scale),
+    )
 }
 
-/// Rede neural puramente nativa. Os nodos nascem nas bordas e percorrem curvas
-/// lentas em direcao a marca, ligando-se aos vizinhos proximos. O calculo e
-/// deterministico a partir do tempo, portanto nao precisa de estado ou alocacao
-/// persistente entre frames.
-#[allow(clippy::too_many_arguments)]
-/// Uma rede neuronal em repouso: neuronios espalhados pela tela, ligados aos
-/// vizinhos, com impulsos a percorrer as ligacoes.
+/// Uma rede neuronal viva: neuronios a percorrer a tela, ligados aos vizinhos,
+/// com impulsos a viajar pelas ligacoes e descargas onde dois se encontram.
 ///
 /// A versao anterior lancava particulas das margens e fazia-as convergir TODAS
 /// para o logo. O efeito era o contrario do pretendido: um amontoado a mexer
 /// atras da marca, sem ligacoes estaveis e sem nada que se parecesse com
-/// transmissao. Aqui os neuronios ficam onde estao -- so respiram --, as
-/// ligacoes persistem entre vizinhos, e o que se move sao os IMPULSOS que
-/// viajam ao longo delas. E a marca tem uma zona limpa a volta: o fundo
-/// acompanha o logo, nao disputa com ele.
+/// transmissao. E a versao a seguir a essa corrigiu o amontoado mas deixou-os
+/// a oscilar nove pixeis, sem nunca chegarem ao vizinho -- um mobile, nao um
+/// cerebro. Agora percorrem a sua celula, encontram-se, e o encontro e uma
+/// descarga.
+#[allow(clippy::too_many_arguments)]
 unsafe fn draw_neural_background(
     hdc: *mut core::ffi::c_void,
     width: f64,
@@ -7747,141 +7756,43 @@ unsafe fn draw_neural_background(
         return;
     }
 
-    let nodes = neural_nodes(
-        width,
-        height,
-        scale,
-        target_x,
-        target_y,
-        brand_width,
-        now_ms() as f64 / 1000.0,
-    );
+    let field = home_tissue_field(width, height, scale, target_x, target_y, brand_width);
     let seconds = now_ms() as f64 / 1000.0;
-    draw_neural_tissue(hdc, &nodes, scale, seconds, theme);
+    draw_neural_tissue(hdc, &field, scale, seconds, theme);
 }
 
-/// Onde estao os neuronios neste instante. Puro, para a zona limpa a volta da
-/// marca e a distribuicao poderem ser testadas sem uma janela.
-fn neural_nodes(
-    width: f64,
-    height: f64,
-    scale: f64,
-    target_x: f64,
-    target_y: f64,
-    brand_width: f64,
-    seconds: f64,
-) -> Vec<(f64, f64, f64)> {
-    let count = ((width / (34.0 * scale.max(1.0))).round() as usize).clamp(28, 52);
-
-    // Grelha com ruido: uma distribuicao puramente aleatoria faz grumos e
-    // buracos, e nenhum dos dois se parece com tecido neuronal.
-    let columns = (count as f64).sqrt().ceil().max(1.0) as usize;
-    let rows = count.div_ceil(columns).max(1);
-    let cell_w = width / columns as f64;
-    let cell_h = height / rows as f64;
-
-    // Elipse de respeito a volta da marca. O fundo nunca entra aqui.
-    let quiet_x = (brand_width * 0.60).max(120.0 * scale);
-    let quiet_y = (brand_width * 0.26).max(70.0 * scale);
-
-    let mut nodes: Vec<(f64, f64, f64)> = Vec::with_capacity(count);
-    for i in 0..count {
-        let seed = i as u32 + 1;
-        let (col, row) = (i % columns, i / columns);
-        let jitter_x = neural_hash(seed.wrapping_mul(0x9e37_79b9)) - 0.5;
-        let jitter_y = neural_hash(seed.wrapping_mul(0x85eb_ca6b)) - 0.5;
-
-        let mut x = (col as f64 + 0.5) * cell_w + jitter_x * cell_w * 0.7;
-        let mut y = (row as f64 + 0.5) * cell_h + jitter_y * cell_h * 0.7;
-
-        // Deriva lenta: o tecido respira, nao viaja.
-        let phase = neural_hash(seed.wrapping_mul(0xc2b2_ae35)) * std::f64::consts::TAU;
-        let drift = 0.05 + neural_hash(seed.wrapping_mul(0x27d4_eb2d)) * 0.06;
-        x += (seconds * drift + phase).sin() * 9.0 * scale;
-        y += (seconds * drift * 0.7 + phase * 1.3).cos() * 7.0 * scale;
-
-        // Empurrar para fora da elipse da marca, pela normal.
-        let nx = (x - target_x) / quiet_x;
-        let ny = (y - target_y) / quiet_y;
-        let radial = (nx * nx + ny * ny).sqrt();
-        if radial < 1.0 && radial > f64::EPSILON {
-            let push = 1.0 / radial;
-            x = target_x + (x - target_x) * push;
-            y = target_y + (y - target_y) * push;
-        } else if radial <= f64::EPSILON {
-            x = target_x + quiet_x;
-        }
-
-        // Cada neuronio pulsa no seu proprio ritmo.
-        let beat = neural_hash(seed.wrapping_mul(0x1656_67b1)) * std::f64::consts::TAU;
-        let energy = 0.45 + 0.55 * (seconds * 0.9 + beat).sin().abs();
-        nodes.push((x, y, energy));
-    }
-    nodes
-}
-
-/// Desenha as ligacoes, os impulsos e os neuronios.
+/// Desenha as ligacoes, os impulsos, os neuronios e as descargas.
 unsafe fn draw_neural_tissue(
     hdc: *mut core::ffi::c_void,
-    nodes: &[(f64, f64, f64)],
+    field: &tissue::Field,
     scale: f64,
     seconds: f64,
     theme: &Theme,
 ) {
+    let tissue::Tissue {
+        nodes,
+        links,
+        pulses,
+        bursts,
+    } = tissue::tissue_at(field, seconds);
+
     // Ligacoes em tres intensidades, para as mais proximas se lerem mais
     // fortes. Tres canetas no total: uma por ligacao seria caro a 15 FPS.
-    let max_link = 132.0 * scale;
     let pens: [*mut core::ffi::c_void; 3] = std::array::from_fn(|step| {
         let weight = if theme.dark { 0.14 } else { 0.10 } + (2 - step) as f32 * 0.09;
         CreatePen(PS_SOLID, 1, rgb3(mix(theme.page_bg, theme.accent, weight)))
     });
     let old_pen = SelectObject(hdc, pens[2] as _);
-
-    let pulse_color = mix(
-        theme.page_bg,
-        theme.accent,
-        if theme.dark { 0.95 } else { 0.78 },
-    );
-    let pulse_brush = CreateSolidBrush(rgb3(pulse_color));
-    let pulse_pen = CreatePen(PS_SOLID, 1, rgb3(pulse_color));
-    let mut pulses: Vec<(f64, f64, f64)> = Vec::new();
-
-    for i in 0..nodes.len() {
-        for j in (i + 1)..nodes.len() {
-            let (ax, ay, _) = nodes[i];
-            let (bx, by, _) = nodes[j];
-            let distance = ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt();
-            if distance > max_link {
-                continue;
-            }
-
-            let closeness = 1.0 - distance / max_link;
-            let bucket = ((closeness * 3.0) as usize).min(2);
-            SelectObject(hdc, pens[bucket] as _);
-            MoveToEx(
-                hdc,
-                ax.round() as i32,
-                ay.round() as i32,
-                std::ptr::null_mut(),
-            );
-            LineTo(hdc, bx.round() as i32, by.round() as i32);
-
-            // So as ligacoes curtas transmitem, e so algumas: uma sinapse a
-            // disparar em cada ligacao ao mesmo tempo seria ruido outra vez.
-            let link_seed = (i as u32 + 1).wrapping_mul(0x85eb_ca6b) ^ (j as u32 + 1);
-            if closeness < 0.45 || neural_hash(link_seed) > 0.38 {
-                continue;
-            }
-            let speed = 0.18 + neural_hash(link_seed.wrapping_mul(0xc2b2_ae35)) * 0.22;
-            let offset = neural_hash(link_seed.wrapping_mul(0xd3a2_646c));
-            let travel = (seconds * speed + offset).fract();
-            pulses.push((
-                ax + (bx - ax) * travel,
-                ay + (by - ay) * travel,
-                // Acende ao sair e apaga ao chegar.
-                (travel * std::f64::consts::PI).sin(),
-            ));
-        }
+    for link in &links {
+        let bucket = ((link.closeness * 3.0) as usize).min(2);
+        SelectObject(hdc, pens[bucket] as _);
+        MoveToEx(
+            hdc,
+            link.ax.round() as i32,
+            link.ay.round() as i32,
+            std::ptr::null_mut(),
+        );
+        LineTo(hdc, link.bx.round() as i32, link.by.round() as i32);
     }
     SelectObject(hdc, old_pen);
     for pen in pens {
@@ -7898,27 +7809,34 @@ unsafe fn draw_neural_tissue(
     let old_brush = SelectObject(hdc, node_brush as _);
     let old_node_pen = SelectObject(hdc, node_pen as _);
 
-    for (x, y, energy) in nodes {
-        let radius = ((1.5 + energy * 1.9) * scale).clamp(2.0, 6.0);
+    for node in &nodes {
+        let radius = ((1.5 + node.energy * 1.9) * scale).clamp(2.0, 6.0);
         Ellipse(
             hdc,
-            (x - radius).round() as i32,
-            (y - radius).round() as i32,
-            (x + radius).round() as i32,
-            (y + radius).round() as i32,
+            (node.x - radius).round() as i32,
+            (node.y - radius).round() as i32,
+            (node.x + radius).round() as i32,
+            (node.y + radius).round() as i32,
         );
     }
 
+    let pulse_color = mix(
+        theme.page_bg,
+        theme.accent,
+        if theme.dark { 0.95 } else { 0.78 },
+    );
+    let pulse_brush = CreateSolidBrush(rgb3(pulse_color));
+    let pulse_pen = CreatePen(PS_SOLID, 1, rgb3(pulse_color));
     SelectObject(hdc, pulse_brush as _);
     SelectObject(hdc, pulse_pen as _);
-    for (x, y, brightness) in &pulses {
-        let radius = ((1.0 + brightness * 2.2) * scale).clamp(1.5, 4.5);
+    for pulse in &pulses {
+        let radius = ((1.0 + pulse.glow * 2.2) * scale).clamp(1.5, 4.5);
         Ellipse(
             hdc,
-            (x - radius).round() as i32,
-            (y - radius).round() as i32,
-            (x + radius).round() as i32,
-            (y + radius).round() as i32,
+            (pulse.x - radius).round() as i32,
+            (pulse.y - radius).round() as i32,
+            (pulse.x + radius).round() as i32,
+            (pulse.y + radius).round() as i32,
         );
     }
 
@@ -7928,6 +7846,61 @@ unsafe fn draw_neural_tissue(
     DeleteObject(pulse_brush as _);
     DeleteObject(node_pen as _);
     DeleteObject(node_brush as _);
+
+    // As descargas por cima de tudo: sao o que acontece agora. Dois aneis --
+    // o de fora largo e fraco, o de dentro apertado e forte -- e um nucleo
+    // aceso. E assim que uma faisca se le sem haver alpha a disposicao.
+    let spark = mix(
+        theme.accent,
+        if theme.dark {
+            (255, 255, 255)
+        } else {
+            theme.fg
+        },
+        0.45,
+    );
+    let hollow = GetStockObject(NULL_BRUSH);
+    for burst in &bursts {
+        for (factor, weight) in [(1.0, 0.22), (0.55, 0.55)] {
+            let r = burst.radius * factor;
+            let pen = CreatePen(
+                PS_SOLID,
+                (1.0_f64 + burst.glow).round().max(1.0) as i32,
+                rgb3(mix(theme.page_bg, spark, (weight * burst.glow) as f32)),
+            );
+            let old_pen = SelectObject(hdc, pen as _);
+            let old_brush = SelectObject(hdc, hollow as _);
+            Ellipse(
+                hdc,
+                (burst.x - r).round() as i32,
+                (burst.y - r).round() as i32,
+                (burst.x + r).round() as i32,
+                (burst.y + r).round() as i32,
+            );
+            SelectObject(hdc, old_pen);
+            SelectObject(hdc, old_brush);
+            DeleteObject(pen as _);
+        }
+
+        // Nucleo pequeno: uma faisca, nao um holofote.
+        let core = (burst.radius * 0.11 * (0.4 + burst.glow)).max(1.0);
+        let color = mix(theme.accent, spark, (0.20 + 0.45 * burst.glow) as f32);
+        let brush = CreateSolidBrush(rgb3(color));
+        let pen = CreatePen(PS_SOLID, 1, rgb3(color));
+        let old_brush = SelectObject(hdc, brush as _);
+        let old_pen = SelectObject(hdc, pen as _);
+        Ellipse(
+            hdc,
+            (burst.x - core).round() as i32,
+            (burst.y - core).round() as i32,
+            (burst.x + core).round() as i32,
+            (burst.y + core).round() as i32,
+        );
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        DeleteObject(brush as _);
+        DeleteObject(pen as _);
+    }
 }
 
 fn draw_home(window: &Window, status: Option<&str>) {
@@ -8699,36 +8672,34 @@ mod tests {
     ///
     /// A versao anterior lancava particulas das margens e fazia-as convergir
     /// TODAS para o logo: o que se via era um amontoado a mexer por tras da
-    /// marca. Estes testes prendem as duas propriedades que fazem a diferenca
-    /// -- a zona limpa e a distribuicao pela tela -- porque nenhuma delas se
-    /// nota a faltar ate alguem olhar para o ecra.
+    /// marca. Estes testes prendem as propriedades que fazem a diferenca --
+    /// a zona limpa, a distribuicao pela tela, o movimento e as descargas --
+    /// porque nenhuma delas se nota a faltar ate alguem olhar para o ecra.
+    fn home_field() -> tissue::Field {
+        home_tissue_field(1920.0, 1080.0, 1.0, 960.0, 345.6, 520.0)
+    }
+
     #[test]
     fn home_background_never_crowds_the_brand() {
-        let (width, height, scale) = (1920.0, 1080.0, 1.0);
-        let (target_x, target_y) = (width / 2.0, height * 0.32);
+        let (target_x, target_y) = (960.0, 345.6);
         let brand_width: f64 = 520.0;
-        let quiet_x = (brand_width * 0.60).max(120.0 * scale);
-        let quiet_y = (brand_width * 0.26).max(70.0 * scale);
+        let quiet_x = (brand_width * 0.60).max(120.0);
+        let quiet_y = (brand_width * 0.26).max(70.0);
+        let field = home_field();
 
-        // Varios instantes: a deriva nao pode empurrar ninguem para dentro.
+        // Varios instantes: o movimento nao pode empurrar ninguem para dentro.
         for step in 0..40 {
             let seconds = step as f64 * 0.37;
-            let nodes = neural_nodes(
-                width,
-                height,
-                scale,
-                target_x,
-                target_y,
-                brand_width,
-                seconds,
-            );
+            let nodes = tissue::nodes_at(&field, seconds);
             assert!(!nodes.is_empty());
-            for (x, y, _) in &nodes {
-                let nx = (x - target_x) / quiet_x;
-                let ny = (y - target_y) / quiet_y;
+            for node in &nodes {
+                let nx = (node.x - target_x) / quiet_x;
+                let ny = (node.y - target_y) / quiet_y;
                 assert!(
                     nx * nx + ny * ny >= 0.999,
-                    "neuronio dentro da zona da marca em t={seconds}: ({x}, {y})"
+                    "neuronio dentro da zona da marca em t={seconds}: ({}, {})",
+                    node.x,
+                    node.y
                 );
             }
         }
@@ -8736,13 +8707,13 @@ mod tests {
 
     #[test]
     fn home_background_spreads_across_the_canvas() {
-        let nodes = neural_nodes(1920.0, 1080.0, 1.0, 960.0, 345.0, 520.0, 3.0);
+        let nodes = tissue::nodes_at(&home_field(), 3.0);
 
         // Uma convergencia para um ponto passaria a zona limpa mas continuaria
         // a ser um amontoado: exige-se ocupacao dos quatro quadrantes.
         let mut quadrants = [0usize; 4];
-        for (x, y, _) in &nodes {
-            let index = usize::from(*x > 960.0) + 2 * usize::from(*y > 540.0);
+        for node in &nodes {
+            let index = usize::from(node.x > 960.0) + 2 * usize::from(node.y > 540.0);
             quadrants[index] += 1;
         }
         assert!(
@@ -8751,10 +8722,60 @@ mod tests {
         );
 
         // E as energias tem de variar, senao nao ha pulsacao nenhuma.
-        let energies: Vec<f64> = nodes.iter().map(|(_, _, energy)| *energy).collect();
+        let energies: Vec<f64> = nodes.iter().map(|node| node.energy).collect();
         let min = energies.iter().copied().fold(f64::MAX, f64::min);
         let max = energies.iter().copied().fold(f64::MIN, f64::max);
         assert!(max - min > 0.1, "energias iguais: {min}..{max}");
+    }
+
+    #[test]
+    fn home_neurons_travel_and_discharge_when_they_meet() {
+        // O fundo da Home e o mesmo tecido do instalador: tem de ter o mesmo
+        // comportamento, nao so o mesmo aspeto parado. Sem deslocacao nao ha
+        // encontro, e sem encontro nao ha descarga -- fica um mobile.
+        let field = home_field();
+        let start = tissue::nodes_at(&field, 0.0);
+        let mut furthest = 0.0f64;
+        let mut discharges = 0usize;
+        for step in 0..240 {
+            let seconds = step as f64 * 0.05;
+            let frame = tissue::tissue_at(&field, seconds);
+            discharges += frame.bursts.len();
+            for (a, b) in start.iter().zip(frame.nodes.iter()) {
+                furthest = furthest.max(((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt());
+            }
+        }
+        let spacing = (1920.0 * 1080.0 / start.len() as f64).sqrt();
+        assert!(
+            furthest > spacing * 0.5,
+            "em 12 segundos o neuronio que mais andou fez {furthest:.0} px \
+             para um espacamento de {spacing:.0} px"
+        );
+        assert!(
+            discharges > 20,
+            "em 12 segundos houve {discharges} descargas no fundo da Home"
+        );
+    }
+
+    #[test]
+    fn home_discharges_never_light_up_over_the_brand() {
+        // Uma faisca em cima do logo e pior do que uma linha: chama a atencao
+        // exatamente para o sitio que tem de ficar limpo.
+        let field = home_field();
+        let quiet_x = (520.0f64 * 0.60).max(120.0);
+        let quiet_y = (520.0f64 * 0.26).max(70.0);
+        for step in 0..240 {
+            for burst in tissue::tissue_at(&field, step as f64 * 0.05).bursts {
+                let nx = (burst.x - 960.0) / quiet_x;
+                let ny = (burst.y - 345.6) / quiet_y;
+                assert!(
+                    nx * nx + ny * ny >= 0.999,
+                    "descarga por cima da marca em ({}, {})",
+                    burst.x,
+                    burst.y
+                );
+            }
+        }
     }
 
     /// A autorizacao de rede local vale para a ORIGEM que o utilizador
