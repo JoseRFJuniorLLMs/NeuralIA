@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import OpenJPEG from '../assets/pdfjs/wasm/openjpeg_nowasm_fallback.js';
+import JBig2 from '../assets/pdfjs/wasm/jbig2_nowasm_fallback.js';
 import {
   PDF_AUX_BASE,
   describeLoadError,
@@ -19,6 +21,11 @@ function test(name, fn) {
     throw err;
   }
 }
+
+test('vendored decoder fallbacks are executable modules', () => {
+  assert.equal(typeof OpenJPEG, 'function');
+  assert.equal(typeof JBig2, 'function');
+});
 
 test('load options never ask PDF.js for missing WASM binaries', () => {
   const options = makePdfLoadOptions('./document.pdf', 1048576);
