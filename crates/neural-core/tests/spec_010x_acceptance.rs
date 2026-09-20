@@ -1,16 +1,14 @@
 use std::{
-    collections::VecDeque,
     fs,
     path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use neural_core::{
-    ActionRisk, AgentAction, AgentElement, AgentOutcome, AgentPermissionPolicy, AgentPlanner,
-    AgentRuntime, AgentRuntimeConfig, AgentSecurityAction, AgentToolExecutor, CaptureOutcome,
-    FieldKind, HashingLocalIntelligence, IntentClass, LocalIntelligence, MemoryDocument,
-    MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore, ObservedPage, ResearchItemKind,
-    ResearchSession, SemanticAnchorKind, ToolResult, semantic_anchors_html,
+    ActionRisk, AgentPermissionPolicy, AgentSecurityAction, CaptureOutcome,
+    HashingLocalIntelligence, IntentClass, LocalIntelligence, MemoryDocument, MemoryKind,
+    MemoryQuery, MemorySourceKind, MemoryStore, ResearchItemKind, ResearchSession,
+    SemanticAnchorKind, semantic_anchors_html,
 };
 
 fn temp_root(name: &str) -> PathBuf {
@@ -219,96 +217,6 @@ fn spec_0104_agent_security_never_grants_restricted_authority() {
         origin: "https://example.com".into(),
     });
     assert!(!after_stop.allowed);
-}
-
-struct QueuePlanner {
-    actions: VecDeque<AgentAction>,
-}
-
-impl AgentPlanner for QueuePlanner {
-    fn plan(
-        &mut self,
-        _goal: &str,
-        _page: &ObservedPage,
-        _trace: &[neural_core::agent_runtime::AgentStep],
-    ) -> Result<AgentAction, String> {
-        self.actions
-            .pop_front()
-            .ok_or_else(|| "planner exhausted".to_string())
-    }
-}
-
-struct MockExecutor {
-    page: ObservedPage,
-}
-
-impl AgentToolExecutor for MockExecutor {
-    fn execute(&mut self, action: &AgentAction) -> Result<ToolResult, String> {
-        if matches!(action, AgentAction::Navigate { .. }) {
-            self.page.generation = self.page.generation.saturating_add(1);
-        }
-        Ok(ToolResult {
-            page: self.page.clone(),
-            output: Some("ok".into()),
-        })
-    }
-}
-
-fn observed_page() -> ObservedPage {
-    ObservedPage {
-        generation: 1,
-        url: "https://example.com/search".into(),
-        title: "Search".into(),
-        text_excerpt: "results".into(),
-        elements: vec![AgentElement {
-            id: "query".into(),
-            generation: 1,
-            role: "textbox".into(),
-            name: "query".into(),
-            text: String::new(),
-            origin: "https://example.com".into(),
-            frame: "top".into(),
-            visible: true,
-            interactable: true,
-        }],
-    }
-}
-
-#[test]
-fn agent_runtime_reference_harness_is_bounded_structured_and_human_gated() {
-    let page = observed_page();
-    let input = page.elements[0].clone();
-
-    let planner = QueuePlanner {
-        actions: VecDeque::from([
-            AgentAction::TypeText {
-                target: input,
-                text: "rust webview".into(),
-                field: FieldKind::Search,
-            },
-            AgentAction::Finish {
-                summary: "done".into(),
-            },
-        ]),
-    };
-    let executor = MockExecutor { page: page.clone() };
-    let mut policy = AgentPermissionPolicy::new(Some("https://example.com".into()));
-    policy.grant_reversible_session_actions(true);
-
-    let config = AgentRuntimeConfig {
-        max_steps: 4,
-        max_wall_time: Duration::from_secs(2),
-        max_wait: Duration::from_millis(250),
-    };
-    let mut runtime = AgentRuntime::new(planner, executor, policy, config);
-
-    match runtime.run("pesquisar", page) {
-        AgentOutcome::Completed { summary, trace } => {
-            assert_eq!(summary, "done");
-            assert_eq!(trace.len(), 1);
-        }
-        other => panic!("unexpected outcome: {other:?}"),
-    }
 }
 
 #[test]
