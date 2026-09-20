@@ -25,7 +25,7 @@ assert.doesNotMatch(
 );
 assert.match(
   workflow,
-  /subject-path:\s*dist\/NeuralIA-\*-x64\.exe/,
+  /subject-path:\s*dist\/NeuralIA-\$\{\{ steps\.version\.outputs\.version \}\}-x64\.exe/,
   'attestation must follow the versioned public executable name'
 );
 
