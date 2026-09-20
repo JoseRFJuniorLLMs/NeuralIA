@@ -114,12 +114,12 @@ jobs:
             Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $securePassword | Out-Null
             Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
 
-            # Trust the ephemeral leaf directly. Importing a synthetic CI
-            # certificate into Root can enter an interactive trust path on a
-            # headless runner; TrustedPeople gives this exact leaf trust without
-            # mutating the runner's root trust set.
-            Write-Host "[authenticode-ci] trusting ephemeral signer leaf"
-            Import-Certificate -FilePath $cerPath -CertStoreLocation "Cert:\CurrentUser\TrustedPeople" | Out-Null
+            # Authenticode /pa requires a trusted chain. Use the PowerShell
+            # certificate provider rather than certutil: certutil's Root import
+            # can block on a headless runner, while Import-Certificate is
+            # non-interactive for the ephemeral CurrentUser stores used here.
+            Write-Host "[authenticode-ci] trusting ephemeral root"
+            Import-Certificate -FilePath $cerPath -CertStoreLocation "Cert:\CurrentUser\Root" | Out-Null
             Write-Host "[authenticode-ci] trusting ephemeral publisher"
             Import-Certificate -FilePath $cerPath -CertStoreLocation "Cert:\CurrentUser\TrustedPublisher" | Out-Null
 
@@ -139,7 +139,7 @@ jobs:
             $env:NEURALIA_AUTHENTICODE_PFX_B64 = $null
             $env:NEURALIA_AUTHENTICODE_PFX_PASSWORD = $null
             if ($cert) {
-              foreach ($store in @("My", "TrustedPeople", "TrustedPublisher")) {
+              foreach ($store in @("My", "Root", "TrustedPublisher")) {
                 Remove-Item -LiteralPath ("Cert:\CurrentUser\$store\" + $cert.Thumbprint) -Force -ErrorAction SilentlyContinue
               }
             }
