@@ -12,17 +12,18 @@ use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, S_OK};
+#[cfg(test)]
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+    OPEN_EXISTING,
+};
 use windows_sys::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
 };
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
     RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW,
-};
-#[cfg(test)]
-use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
 };
 use windows_sys::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Programs, SHGetKnownFolderPath};
 use windows_sys::core::GUID;
@@ -433,10 +434,8 @@ mod tests {
     #[test]
     fn a_shortcut_to_another_executable_is_not_the_same_destination() {
         init_com();
-        let dir = std::env::temp_dir().join(format!(
-            "neuralia-lnk-negative-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("neuralia-lnk-negative-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("pasta");
 
         let expected = dir.join("NeuralIA.exe");
