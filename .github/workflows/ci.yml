@@ -120,6 +120,14 @@ jobs:
             # while stable release still requires /pa trust + RFC3161 timestamp.
             Write-Host "[authenticode-ci] building and signing installer"
             ./scripts/build-windows-installer.ps1 -ExePath ci-tested/NeuralIA.exe -Version $version -OutputDir signed-ci-installer -Sign -SkipTimestamp -AllowUntrustedTestCertificate
+
+            # The certificate existed before build-windows-installer imported
+            # the PFX. The helper must not delete pre-existing store entries
+            # during cleanup.
+            if (-not (Test-Path -LiteralPath ("Cert:\\CurrentUser\\My\\" + $cert.Thumbprint))) {
+              throw "Signing helper removed a pre-existing certificate from CurrentUser\\My."
+            }
+
             $installer = Get-ChildItem signed-ci-installer -Filter "NeuralIA-Setup-*-x64.exe" -File | Select-Object -First 1
             if (-not $installer) { throw "Signed CI installer was not produced." }
 
