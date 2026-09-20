@@ -12,6 +12,7 @@ pub mod research;
 pub mod search;
 pub mod security;
 pub mod semantic_timeline;
+pub mod tissue;
 
 pub use config::CoreConfig;
 pub use error::{NeuralError, Result};

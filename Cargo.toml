@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/neural-core","crates/neural-app"]
+members = ["crates/neural-core","crates/neural-app","crates/neural-setup"]
 
 [workspace.package]
 version = "2.0.1"

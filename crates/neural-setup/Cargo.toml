@@ -1,0 +1,38 @@
+[package]
+name = "neural-setup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "NeuralIA-Setup"
+path = "src/main.rs"
+
+[dependencies]
+# O fundo do instalador e o mesmo do navegador: a matematica vem do core.
+neural-core = { path = "../neural-core" }
+# Confere o resumo da carga util antes de escrever o que quer que seja.
+sha2 = "0.10.9"
+
+[target.'cfg(windows)'.dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+# O `build.rs` inclui o `src/archive.rs` a letra para empacotar com o MESMO
+# codigo que o instalador usa para desempacotar.
+sha2 = "0.10.9"
+winres = "0.1.12"

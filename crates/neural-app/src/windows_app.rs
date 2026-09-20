@@ -25,20 +25,21 @@ use neural_core::{
     MemoryDocument, MemoryHit, MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore,
     ObservedPage, ReaderArticle, ReaderBlock, ReaderClient, ResearchItemKind, ResearchSession,
     chatgpt_search_url, claude_search_url, google_ai_url, is_local_network_target, is_pdf_url,
-    parse_intent, reader_html, redact_sensitive_text,
+    parse_intent, reader_html, redact_sensitive_text, tissue,
 };
 use url::Url;
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::Gdi::{
-        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CLEARTYPE_QUALITY,
-        ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
-        CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS,
-        DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject,
-        DrawTextW, Ellipse, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC, InvalidateRect, LineTo,
-        MoveToEx, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC, SRCCOPY, ScreenToClient,
-        SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits,
-        TRANSPARENT,
+        AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+        BeginPaint, BitBlt, CLEARTYPE_QUALITY, ClientToScreen, CreateCompatibleBitmap,
+        CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateRoundRectRgn,
+        CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER,
+        DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW,
+        Ellipse, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC, GetStockObject, InvalidateRect,
+        LineTo, MoveToEx, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC,
+        SRCCOPY, ScreenToClient, SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn,
+        StretchDIBits, TRANSPARENT,
     },
     Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom},
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
@@ -120,6 +121,11 @@ enum UserEvent {
     OpenExternal(String),
     /// Popup pedido por uma coluna do comparador: carrega nessa coluna.
     OpenInColumn(usize, String),
+    /// Clique simples num link: a mesma pagina nas TRES colunas, para se
+    /// poder comparar o que cada IA diz dela. E o gesto que distingue este
+    /// navegador de um normal, onde o clique so afeta o separador de onde
+    /// partiu.
+    OpenEverywhere(String),
     /// Fonte aberta sem abandonar a conversa que a originou.
     OpenSplit {
         source_index: usize,
@@ -180,6 +186,9 @@ const TITLE_TAB_HEIGHT: f64 = 32.0;
 const TOP_BAR_HEIGHT: f64 = 44.0;
 const COMPARATOR_CHROME_HEIGHT: f64 = TITLE_TAB_HEIGHT + TOP_BAR_HEIGHT;
 const MAX_VISIBLE_CONTEXT_TABS: usize = 3;
+/// Cada aba visivel pode arrastar consigo a pilula do seu grupo, e um grupo
+/// fechado ocupa um lugar sem mostrar abas nenhumas -- dai o dobro.
+const MAX_VISIBLE_TAB_SLOTS: usize = MAX_VISIBLE_CONTEXT_TABS * 2;
 const COMPARATOR_COLUMNS: usize = 3;
 /// Intervalo da rolagem automatica de leitura, do primeiro avanco ao ultimo.
 const AUTO_SCROLL_SECONDS: u64 = 30;
@@ -358,6 +367,11 @@ enum BarHit {
         source_index: usize,
         context_index: usize,
     },
+    /// A pilula de um grupo. O indice e o do grupo dentro da coluna.
+    ContextGroup {
+        source_index: usize,
+        group_index: usize,
+    },
     SplitExpand,
     SplitClose,
     Private,
@@ -410,6 +424,10 @@ struct BarLayout {
     context_tabs: [[UiRect; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
     context_indices: [[usize; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
     context_tab_counts: [usize; COMPARATOR_COLUMNS],
+    /// Pilulas dos grupos, intercaladas com as abas na mesma fila.
+    group_pills: [[UiRect; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS],
+    group_pill_indices: [[usize; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS],
+    group_pill_counts: [usize; COMPARATOR_COLUMNS],
     columns_len: usize,
     window_minimize: UiRect,
     window_maximize: UiRect,
@@ -428,12 +446,31 @@ impl BarLayout {
         )
     }
 
+    /// Atalho para quem so sabe quantas abas tem cada coluna: nenhuma delas
+    /// esta agrupada.
+    #[cfg(test)]
     fn with_contexts(
         client_width: f64,
         scale: f64,
         visible: bool,
         columns: BarColumns,
         context_counts: [usize; COMPARATOR_COLUMNS],
+    ) -> Self {
+        Self::with_rows(
+            client_width,
+            scale,
+            visible,
+            columns,
+            std::array::from_fn(|index| TabRow::plain(context_counts[index])),
+        )
+    }
+
+    fn with_rows(
+        client_width: f64,
+        scale: f64,
+        visible: bool,
+        columns: BarColumns,
+        rows: [TabRow; COMPARATOR_COLUMNS],
     ) -> Self {
         let scale = scale.max(1.0);
         let empty = UiRect {
@@ -453,6 +490,9 @@ impl BarLayout {
                 context_tabs: [[empty; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
                 context_indices: [[0; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
                 context_tab_counts: [0; COMPARATOR_COLUMNS],
+                group_pills: [[empty; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS],
+                group_pill_indices: [[0; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS],
+                group_pill_counts: [0; COMPARATOR_COLUMNS],
                 columns_len: 0,
                 window_minimize: empty,
                 window_maximize: empty,
@@ -497,6 +537,9 @@ impl BarLayout {
         let mut tabs = [[empty; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS];
         let mut tab_indices = [[0usize; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS];
         let mut tab_counts = [0usize; COMPARATOR_COLUMNS];
+        let mut pills = [[empty; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS];
+        let mut pill_indices = [[0usize; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS];
+        let mut pill_counts = [0usize; COMPARATOR_COLUMNS];
         let columns_len = columns.count.min(COMPARATOR_COLUMNS);
 
         // Linha dos provedores, agora livre das abas. As faixas vem da MESMA
@@ -594,31 +637,68 @@ impl BarLayout {
         // Linha superior: todas as fontes/abas, antes dos controles da janela.
         let tabs_left = 90.0 * scale;
         let tabs_right = (window_minimize.x - 8.0 * scale).max(tabs_left);
-        let desired: [usize; COMPARATOR_COLUMNS] =
-            std::array::from_fn(|index| context_counts[index].min(MAX_VISIBLE_CONTEXT_TABS));
-        let total_tabs: usize = desired.iter().sum();
-        if total_tabs > 0 && tabs_right > tabs_left {
+        let visible_rows = &rows[..columns_len];
+        let total_slots: usize = visible_rows.iter().map(|row| row.len).sum();
+        let total_pills: usize = visible_rows
+            .iter()
+            .map(|row| {
+                row.visible()
+                    .iter()
+                    .filter(|slot| matches!(slot, TabSlot::Group(_)))
+                    .count()
+            })
+            .sum();
+        let total_tabs = total_slots - total_pills;
+        if total_slots > 0 && tabs_right > tabs_left {
             let gap = 3.0 * scale;
-            let usable = tabs_right - tabs_left - gap * total_tabs.saturating_sub(1) as f64;
-            let tab_width = (usable / total_tabs as f64).clamp(56.0 * scale, 156.0 * scale);
+            // A pilula do grupo leva largura fixa: e um rotulo, nao um titulo
+            // de pagina. O que sobra e das abas.
+            let pill_width = 74.0 * scale;
+            let spent =
+                gap * total_slots.saturating_sub(1) as f64 + pill_width * total_pills as f64;
+            let usable = tabs_right - tabs_left - spent;
+            let tab_width = if total_tabs == 0 {
+                0.0
+            } else {
+                (usable / total_tabs as f64).clamp(56.0 * scale, 156.0 * scale)
+            };
             let mut x = tabs_left;
+            let tab_y = 3.0 * scale;
+            let tab_h = (title_h - 6.0 * scale).max(20.0 * scale);
 
             for index in 0..columns_len {
-                let count = desired[index];
-                let first_context = context_counts[index].saturating_sub(count);
-                for visual in 0..count {
+                for slot in rows[index].visible().iter().copied() {
                     if x + 28.0 * scale > tabs_right {
                         break;
                     }
-                    let width = tab_width.min(tabs_right - x).max(28.0 * scale);
-                    tabs[index][visual] = UiRect {
-                        x,
-                        y: 3.0 * scale,
-                        width,
-                        height: (title_h - 6.0 * scale).max(20.0 * scale),
+                    let desired = match slot {
+                        TabSlot::Group(_) => pill_width,
+                        TabSlot::Tab(_) => tab_width,
                     };
-                    tab_indices[index][visual] = first_context + visual;
-                    tab_counts[index] += 1;
+                    let width = desired.min(tabs_right - x).max(28.0 * scale);
+                    let rect = UiRect {
+                        x,
+                        y: tab_y,
+                        width,
+                        height: tab_h,
+                    };
+                    match slot {
+                        TabSlot::Group(group) => {
+                            let visual = pill_counts[index];
+                            pills[index][visual] = rect;
+                            pill_indices[index][visual] = group;
+                            pill_counts[index] += 1;
+                        }
+                        TabSlot::Tab(context) => {
+                            let visual = tab_counts[index];
+                            if visual >= MAX_VISIBLE_CONTEXT_TABS {
+                                continue;
+                            }
+                            tabs[index][visual] = rect;
+                            tab_indices[index][visual] = context;
+                            tab_counts[index] += 1;
+                        }
+                    }
                     x += width + gap;
                 }
             }
@@ -634,6 +714,9 @@ impl BarLayout {
             context_tabs: tabs,
             context_indices: tab_indices,
             context_tab_counts: tab_counts,
+            group_pills: pills,
+            group_pill_indices: pill_indices,
+            group_pill_counts: pill_counts,
             columns_len,
             window_minimize,
             window_maximize,
@@ -655,6 +738,14 @@ impl BarLayout {
             return Some(BarHit::WindowMinimize);
         }
         for index in 0..self.columns_len {
+            for visual in 0..self.group_pill_counts[index] {
+                if self.group_pills[index][visual].contains(x, y) {
+                    return Some(BarHit::ContextGroup {
+                        source_index: index,
+                        group_index: self.group_pill_indices[index][visual],
+                    });
+                }
+            }
             for visual in 0..self.context_tab_counts[index] {
                 if self.context_tabs[index][visual].contains(x, y) {
                     return Some(BarHit::ContextTab {
@@ -745,6 +836,233 @@ struct SplitView {
     private: bool,
 }
 
+/// As cores que um grupo de abas pode ter. Poucas e nomeadas: uma paleta
+/// aberta obrigaria a um seletor, e o que se quer e distinguir grupos de
+/// relance, nao escolher tons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupColor {
+    Blue,
+    Green,
+    Amber,
+    Pink,
+    Purple,
+    Slate,
+}
+
+impl GroupColor {
+    const ALL: [Self; 6] = [
+        Self::Blue,
+        Self::Green,
+        Self::Amber,
+        Self::Pink,
+        Self::Purple,
+        Self::Slate,
+    ];
+
+    fn rgb(self) -> Rgb {
+        match self {
+            Self::Blue => (66, 133, 244),
+            Self::Green => (52, 168, 83),
+            Self::Amber => (244, 180, 0),
+            Self::Pink => (233, 30, 99),
+            Self::Purple => (156, 39, 176),
+            Self::Slate => (96, 125, 139),
+        }
+    }
+
+    /// A proxima cor por usar numa coluna, para dois grupos seguidos nao
+    /// nascerem iguais.
+    fn next(used: &[Self]) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|color| !used.contains(color))
+            .unwrap_or(Self::Blue)
+    }
+}
+
+/// Um grupo de abas na barra de titulo: nome, cor e se esta fechado.
+#[derive(Debug, Clone)]
+struct ContextGroup {
+    id: u64,
+    name: String,
+    color: GroupColor,
+    collapsed: bool,
+}
+
+/// Uma aba de contexto. O `group` e o id do grupo, nao um indice: fechar um
+/// grupo no meio nao pode renumerar as abas dos outros.
+#[derive(Debug, Clone)]
+struct ContextTab {
+    url: String,
+    group: Option<u64>,
+}
+
+/// Um lugar na fila de abas de uma coluna: ou a pilula de um grupo, ou uma aba.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabSlot {
+    /// Indice do grupo dentro de `groups` daquela coluna.
+    Group(usize),
+    /// Indice da aba dentro de `contexts` daquela coluna.
+    Tab(usize),
+}
+
+/// A fila visivel de uma coluna, ja cortada ao que cabe na barra.
+#[derive(Debug, Clone, Copy)]
+struct TabRow {
+    slots: [TabSlot; MAX_VISIBLE_TAB_SLOTS],
+    len: usize,
+}
+
+impl TabRow {
+    fn empty() -> Self {
+        Self {
+            slots: [TabSlot::Tab(0); MAX_VISIBLE_TAB_SLOTS],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, slot: TabSlot) {
+        if self.len < MAX_VISIBLE_TAB_SLOTS {
+            self.slots[self.len] = slot;
+            self.len += 1;
+        }
+    }
+
+    fn visible(&self) -> &[TabSlot] {
+        &self.slots[..self.len]
+    }
+
+    /// Uma coluna sem grupo nenhum: as ultimas abas, como era antes de existirem
+    /// grupos. Serve os chamadores que so sabem contar abas.
+    #[cfg(test)]
+    fn plain(count: usize) -> Self {
+        let mut row = Self::empty();
+        let shown = count.min(MAX_VISIBLE_CONTEXT_TABS);
+        for offset in 0..shown {
+            row.push(TabSlot::Tab(count - shown + offset));
+        }
+        row
+    }
+}
+
+/// Decide o que aparece na barra de uma coluna: a pilula de cada grupo antes da
+/// sua primeira aba, as abas de um grupo fechado escondidas, e o resto cortado
+/// pelo fim -- as abas recentes ficam, as antigas saem.
+///
+/// Duas invariantes que os testes prendem: uma aba cujo grupo ja nao existe
+/// volta a ser solta em vez de desaparecer, e nunca sobra uma aba agrupada sem
+/// a pilula do seu grupo a acompanha-la.
+fn plan_tab_row(tabs: &[ContextTab], groups: &[ContextGroup]) -> TabRow {
+    let group_of = |index: usize| -> Option<usize> {
+        tabs.get(index)
+            .and_then(|tab| tab.group)
+            .and_then(|id| groups.iter().position(|group| group.id == id))
+    };
+
+    let mut full: Vec<TabSlot> = Vec::new();
+    let mut billed: Vec<usize> = Vec::new();
+    for index in 0..tabs.len() {
+        if let Some(group) = group_of(index) {
+            if !billed.contains(&group) {
+                billed.push(group);
+                full.push(TabSlot::Group(group));
+            }
+            if groups[group].collapsed {
+                continue;
+            }
+        }
+        full.push(TabSlot::Tab(index));
+    }
+
+    // Janela deslizante a contar do fim: para quando estoirar o numero de
+    // lugares ou o numero de abas.
+    let mut start = full.len();
+    let mut tabs_kept = 0usize;
+    while start > 0 {
+        let candidate = start - 1;
+        let is_tab = matches!(full[candidate], TabSlot::Tab(_));
+        if is_tab && tabs_kept == MAX_VISIBLE_CONTEXT_TABS {
+            break;
+        }
+        if full.len() - candidate > MAX_VISIBLE_TAB_SLOTS {
+            break;
+        }
+        if is_tab {
+            tabs_kept += 1;
+        }
+        start = candidate;
+    }
+
+    // A pilula vem sempre antes das suas abas. Se o corte caiu no meio de um
+    // grupo, a pilula ficou de fora -- desce-se ate a proxima pilula ou ate
+    // uma aba solta, em vez de mostrar orfas.
+    while start < full.len() {
+        match full[start] {
+            TabSlot::Group(_) => break,
+            TabSlot::Tab(index) if group_of(index).is_none() => break,
+            TabSlot::Tab(_) => start += 1,
+        }
+    }
+
+    let mut row = TabRow::empty();
+    for slot in full[start..].iter().copied() {
+        row.push(slot);
+    }
+    row
+}
+
+/// Cria um grupo com a aba indicada e devolve o indice do grupo novo. O nome
+/// sai do host da aba -- um grupo sem nome nao diz nada a ninguem.
+fn create_context_group(
+    tabs: &mut [ContextTab],
+    groups: &mut Vec<ContextGroup>,
+    next_id: &mut u64,
+    tab_index: usize,
+) -> Option<usize> {
+    let name = context_tab_label(&tabs.get(tab_index)?.url);
+    let used: Vec<GroupColor> = groups.iter().map(|group| group.color).collect();
+    let id = *next_id;
+    *next_id += 1;
+    groups.push(ContextGroup {
+        id,
+        name,
+        color: GroupColor::next(&used),
+        collapsed: false,
+    });
+    tabs[tab_index].group = Some(id);
+    Some(groups.len() - 1)
+}
+
+/// Poe a aba no grupo e encosta-a ao ultimo membro: os membros de um grupo tem
+/// de ficar juntos na barra, senao a pilula fica a rotular abas que nao sao
+/// dela.
+fn join_context_group(tabs: &mut Vec<ContextTab>, group_id: u64, tab_index: usize) {
+    if tab_index >= tabs.len() {
+        return;
+    }
+    let mut tab = tabs.remove(tab_index);
+    tab.group = Some(group_id);
+    let target = tabs
+        .iter()
+        .rposition(|other| other.group == Some(group_id))
+        .map(|last| last + 1)
+        .unwrap_or(tabs.len());
+    tabs.insert(target, tab);
+}
+
+/// Tira a aba do grupo. Um grupo que fique sem abas desaparece -- uma pilula
+/// vazia so ocupava espaco e enganava.
+fn leave_context_group(tabs: &mut [ContextTab], groups: &mut Vec<ContextGroup>, tab_index: usize) {
+    if let Some(tab) = tabs.get_mut(tab_index) {
+        tab.group = None;
+    }
+    prune_empty_groups(tabs, groups);
+}
+
+fn prune_empty_groups(tabs: &[ContextTab], groups: &mut Vec<ContextGroup>) {
+    groups.retain(|group| tabs.iter().any(|tab| tab.group == Some(group.id)));
+}
+
 struct ComparatorState {
     views: Vec<ComparatorView>,
     expanded: Option<usize>,
@@ -752,7 +1070,11 @@ struct ComparatorState {
     weights: [f64; COMPARATOR_COLUMNS],
     split: Option<SplitView>,
     /// Abas/fontes agrupadas automaticamente pela IA que abriu cada link.
-    contexts: [Vec<String>; COMPARATOR_COLUMNS],
+    contexts: [Vec<ContextTab>; COMPARATOR_COLUMNS],
+    /// Grupos por coluna, na ordem em que aparecem na barra.
+    groups: [Vec<ContextGroup>; COMPARATOR_COLUMNS],
+    /// Contador dos ids de grupo. Nunca reutiliza.
+    next_group_id: u64,
 }
 
 /// Janelas da palette nativa: o popup que desenha a caixa e o EDIT onde o
@@ -956,6 +1278,10 @@ const TAB_MENU_FULLSCREEN: usize = 2;
 const TAB_MENU_CLOSE: usize = 3;
 const TAB_MENU_CLOSE_OTHERS: usize = 4;
 const TAB_MENU_CLOSE_ALL: usize = 5;
+const TAB_MENU_NEW_GROUP: usize = 6;
+const TAB_MENU_UNGROUP: usize = 7;
+/// Os grupos ja existentes ocupam ids a partir daqui, um por grupo da coluna.
+const TAB_MENU_GROUP_BASE: usize = 100;
 const SPLITTER_SUBCLASS_BASE: usize = 0x4E60;
 const SPLITTER_WIDTH: f64 = 7.0;
 const MIN_PANEL_WIDTH: f64 = 180.0;
@@ -3644,6 +3970,8 @@ impl App {
             weights: [1.0; COMPARATOR_COLUMNS],
             split: None,
             contexts: std::array::from_fn(|_| Vec::new()),
+            groups: std::array::from_fn(|_| Vec::new()),
+            next_group_id: 1,
         });
         self.bar_hover = None;
         self.surface = Surface::Comparator;
@@ -3899,6 +4227,50 @@ impl App {
         }
     }
 
+    /// Que evento nasce de uma mensagem vinda da coluna `col_index`.
+    ///
+    /// Vive fora do closure do IPC de proposito. A decisao que aqui se toma --
+    /// em especial a de um clique num link ir para a propria coluna ou para o
+    /// painel lateral -- e a que o utilizador ve, e dentro de um closure de
+    /// `WebViewBuilder` nao havia forma de a exercitar sem abrir uma janela.
+    #[allow(clippy::needless_pass_by_value)]
+    fn column_ipc_event_impl(col_index: usize, action: IpcAction) -> Option<UserEvent> {
+        match action {
+            IpcAction::ResearchAnswer { col, text } if col == col_index => {
+                Some(UserEvent::ResearchAnswer {
+                    source_index: col_index,
+                    text,
+                })
+            }
+            // Clique simples: a pagina abre nas TRES colunas, para se ver o
+            // que cada IA diz dela. Ctrl+clique: abre no painel lateral e a
+            // barra de titulo guarda a aba -- o "novo separador" do Chrome.
+            IpcAction::Link { col, url, aside } if col == col_index => Some(if aside {
+                UserEvent::OpenSplit {
+                    source_index: col_index,
+                    url,
+                }
+            } else {
+                UserEvent::OpenEverywhere(url)
+            }),
+            IpcAction::Split { col, url } if col == col_index => Some(UserEvent::OpenSplit {
+                source_index: col_index,
+                url,
+            }),
+            IpcAction::Palette { col } if col == col_index => {
+                Some(UserEvent::OpenPalette(col_index))
+            }
+            IpcAction::Minimize { col } if col == col_index => {
+                Some(UserEvent::MinimizeComparator(col_index))
+            }
+            IpcAction::NewTab { col: Some(col) } if col == col_index => {
+                Some(UserEvent::NewTab(col_index))
+            }
+            IpcAction::Expand { col } => Some(UserEvent::ExpandComparator(col)),
+            other => common_ipc_event(other),
+        }
+    }
+
     fn comparator_webview_builder(
         &self,
         col_index: usize,
@@ -3909,44 +4281,31 @@ impl App {
         let capability = remote_capability();
         let ipc_capability = capability.clone();
 
-        let init_script = format!(
-            "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{AI_AUTO_SUBMIT_SCRIPT}\n{COMPARATOR_INJECT_SCRIPT}"
-        )
-        .replace("__NEURALIA_CAP__", &capability);
+        // Um script por chamada, e nao os tres concatenados num so. O
+        // WebView2 executa cada script de inicializacao isoladamente: assim
+        // uma excecao ao nivel de topo de um deles -- o `sessionStorage` do
+        // auto-submit, por exemplo, que lanca com armazenamento particionado --
+        // deixa de levar atras o COMPARATOR_INJECT_SCRIPT, e com ele os
+        // cliques nos links e os controlos da coluna.
+        let prelude = format!(
+            "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';"
+        );
+        let keymap = NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", &capability);
+        let auto_submit = AI_AUTO_SUBMIT_SCRIPT.replace("__NEURALIA_CAP__", &capability);
+        let inject = COMPARATOR_INJECT_SCRIPT.replace("__NEURALIA_CAP__", &capability);
 
         WebViewBuilder::new()
-            .with_initialization_script(init_script)
+            .with_initialization_script(prelude)
+            .with_initialization_script(keymap)
+            .with_initialization_script(auto_submit)
+            .with_initialization_script(inject)
             .with_ipc_handler(move |request| {
                 let Some(action) =
                     parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
                 else {
                     return;
                 };
-                let event = match action {
-                    IpcAction::ResearchAnswer { col, text } if col == col_index => {
-                        Some(UserEvent::ResearchAnswer {
-                            source_index: col_index,
-                            text,
-                        })
-                    }
-                    IpcAction::Split { col, url } if col == col_index => {
-                        Some(UserEvent::OpenSplit {
-                            source_index: col_index,
-                            url,
-                        })
-                    }
-                    IpcAction::Palette { col } if col == col_index => {
-                        Some(UserEvent::OpenPalette(col_index))
-                    }
-                    IpcAction::Minimize { col } if col == col_index => {
-                        Some(UserEvent::MinimizeComparator(col_index))
-                    }
-                    IpcAction::NewTab { col: Some(col) } if col == col_index => {
-                        Some(UserEvent::NewTab(col_index))
-                    }
-                    IpcAction::Expand { col } => Some(UserEvent::ExpandComparator(col)),
-                    other => common_ipc_event(other),
-                };
+                let event = Self::column_ipc_event_impl(col_index, action);
                 if let Some(event) = event {
                     let _ = ipc_proxy.send_event(event);
                 }
@@ -3961,7 +4320,12 @@ impl App {
                 remote_web_target(&target, None) || is_view_source_target(&target, None)
             })
             .with_new_window_req_handler(move |target, _features| {
-                if remote_web_target(&target, None) {
+                // `about:blank` NAO. Muitos sites abrem uma ligacao com
+                // `window.open('', '_blank')` e so depois atribuem o endereco
+                // ao popup: o WebView2 levanta o pedido com `about:blank`, e
+                // carregar isso na coluna apagava a conversa da IA e nao
+                // abria link nenhum. Ficar quieto deixa a pagina como estava.
+                if !target.eq_ignore_ascii_case("about:blank") && remote_web_target(&target, None) {
                     let _ = new_window_proxy.send_event(UserEvent::OpenInColumn(col_index, target));
                 }
                 NewWindowResponse::Deny
@@ -3989,6 +4353,39 @@ impl App {
         if !loaded {
             self.web(url);
         }
+    }
+
+    /// A mesma pagina nas tres colunas.
+    ///
+    /// Nao mexe no comparador nem no painel lateral: so troca o endereco de
+    /// cada coluna. Se alguma recusar -- uma coluna minimizada nao tem
+    /// WebView --, as outras seguem na mesma; um clique num link nao pode
+    /// desmontar a comparacao por causa de uma delas.
+    fn open_everywhere(&mut self, url: String) {
+        if self.surface != Surface::Comparator {
+            self.web(url);
+            return;
+        }
+        let Ok(valid) = neural_core::validate_web_url(&url) else {
+            self.show_splash("URL da fonte inválida.".to_string(), 3);
+            return;
+        };
+        if neural_core::is_local_network_target(&valid) {
+            self.show_splash(
+                "A página não pode redirecionar a fonte para a rede local.".to_string(),
+                4,
+            );
+            return;
+        }
+
+        let target = valid.to_string();
+        let Some(comp) = &self.comparator else {
+            return;
+        };
+        for view in &comp.views {
+            let _ = view.webview.load_url(&target);
+        }
+        self.request_redraw();
     }
 
     fn split_webview_builder(
@@ -4163,8 +4560,11 @@ impl App {
                     if !private {
                         let links = &mut comp.contexts[source_index];
                         let value = valid.to_string();
-                        if links.last() != Some(&value) {
-                            links.push(value);
+                        if links.last().map(|tab| tab.url.as_str()) != Some(value.as_str()) {
+                            links.push(ContextTab {
+                                url: value,
+                                group: None,
+                            });
                             if links.len() > 32 {
                                 links.remove(0);
                             }
@@ -5041,12 +5441,14 @@ impl App {
         let (Some(window), Some(comp)) = (&self.window, &self.comparator) else {
             return None;
         };
-        Some(BarLayout::with_contexts(
+        // O mesmo plano que o desenho usa. Se aqui se contassem so as abas, o
+        // rato acertaria noutro sitio que nao o que esta no ecra.
+        Some(BarLayout::with_rows(
             window.inner_size().width as f64,
             window.scale_factor(),
             self.bar_visible(),
             bar_columns(comp),
-            std::array::from_fn(|index| comp.contexts[index].len()),
+            std::array::from_fn(|index| plan_tab_row(&comp.contexts[index], &comp.groups[index])),
         ))
     }
 
@@ -5684,7 +6086,7 @@ impl App {
             .as_ref()
             .and_then(|comp| comp.contexts.get(source_index))
             .and_then(|tabs| tabs.get(context_index))
-            .cloned()
+            .map(|tab| tab.url.clone())
     }
 
     fn open_context_tab(&mut self, source_index: usize, context_index: usize) {
@@ -5717,10 +6119,65 @@ impl App {
             self.close_split();
         }
         if let Some(comp) = &mut self.comparator
-            && let Some(tabs) = comp.contexts.get_mut(source_index)
-            && context_index < tabs.len()
+            && context_index < comp.contexts[source_index].len()
         {
-            tabs.remove(context_index);
+            comp.contexts[source_index].remove(context_index);
+            prune_empty_groups(&comp.contexts[source_index], &mut comp.groups[source_index]);
+        }
+        self.request_redraw();
+    }
+
+    /// Um clique na pilula abre ou fecha o grupo. Fechado, as abas continuam
+    /// abertas -- so deixam de ocupar a barra.
+    fn toggle_context_group(&mut self, source_index: usize, group_index: usize) {
+        if let Some(comp) = &mut self.comparator
+            && let Some(group) = comp
+                .groups
+                .get_mut(source_index)
+                .and_then(|groups| groups.get_mut(group_index))
+        {
+            group.collapsed = !group.collapsed;
+        }
+        self.request_redraw();
+    }
+
+    fn group_context_tab(&mut self, source_index: usize, context_index: usize) {
+        if let Some(comp) = &mut self.comparator {
+            let next_id = &mut comp.next_group_id;
+            create_context_group(
+                &mut comp.contexts[source_index],
+                &mut comp.groups[source_index],
+                next_id,
+                context_index,
+            );
+        }
+        self.request_redraw();
+    }
+
+    fn join_context_tab_group(
+        &mut self,
+        source_index: usize,
+        context_index: usize,
+        group_index: usize,
+    ) {
+        if let Some(comp) = &mut self.comparator
+            && let Some(id) = comp.groups[source_index]
+                .get(group_index)
+                .map(|group| group.id)
+        {
+            join_context_group(&mut comp.contexts[source_index], id, context_index);
+            prune_empty_groups(&comp.contexts[source_index], &mut comp.groups[source_index]);
+        }
+        self.request_redraw();
+    }
+
+    fn ungroup_context_tab(&mut self, source_index: usize, context_index: usize) {
+        if let Some(comp) = &mut self.comparator {
+            leave_context_group(
+                &mut comp.contexts[source_index],
+                &mut comp.groups[source_index],
+                context_index,
+            );
         }
         self.request_redraw();
     }
@@ -5740,8 +6197,13 @@ impl App {
         if let Some(comp) = &mut self.comparator
             && let Some(tabs) = comp.contexts.get_mut(source_index)
         {
+            // A aba que fica mantem o grupo a que pertencia.
+            let group = tabs
+                .iter()
+                .find(|tab| tab.url == keep)
+                .and_then(|tab| tab.group);
             tabs.clear();
-            tabs.push(keep);
+            tabs.push(ContextTab { url: keep, group });
         }
         self.request_redraw();
     }
@@ -5779,6 +6241,23 @@ impl App {
             return;
         };
 
+        // Lidos antes de abrir o menu: dentro do bloco `unsafe` ja nao ha
+        // emprestimo do estado que sobreviva ao `TrackPopupMenu`.
+        let (existing_groups, in_group) = self
+            .comparator
+            .as_ref()
+            .map(|comp| {
+                let names: Vec<String> = comp.groups[source_index]
+                    .iter()
+                    .map(|group| group.name.clone())
+                    .collect();
+                let member = comp.contexts[source_index]
+                    .get(context_index)
+                    .is_some_and(|tab| tab.group.is_some());
+                (names, member)
+            })
+            .unwrap_or_default();
+
         let command = unsafe {
             let menu = CreatePopupMenu();
             if menu.is_null() {
@@ -5800,6 +6279,27 @@ impl App {
                 close_others.as_ptr(),
             );
             AppendMenuW(menu, MF_STRING, TAB_MENU_CLOSE_ALL, close_all.as_ptr());
+            AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+            let new_group = wide_null("Novo grupo com esta aba");
+            AppendMenuW(menu, MF_STRING, TAB_MENU_NEW_GROUP, new_group.as_ptr());
+            // As entradas "juntar a" tem de sobreviver ao fim do bloco, senao
+            // o Win32 le ponteiros ja libertados enquanto desenha o menu.
+            let join_labels: Vec<Vec<u16>> = existing_groups
+                .iter()
+                .map(|name| wide_null(&format!("Juntar ao grupo \u{201C}{name}\u{201D}")))
+                .collect();
+            for (offset, label) in join_labels.iter().enumerate() {
+                AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    TAB_MENU_GROUP_BASE + offset,
+                    label.as_ptr(),
+                );
+            }
+            if in_group {
+                let ungroup = wide_null("Remover do grupo");
+                AppendMenuW(menu, MF_STRING, TAB_MENU_UNGROUP, ungroup.as_ptr());
+            }
 
             let mut point = windows_sys::Win32::Foundation::POINT {
                 x: self.cursor.0.round() as i32,
@@ -5825,6 +6325,14 @@ impl App {
             TAB_MENU_CLOSE => self.close_context_tab(source_index, context_index),
             TAB_MENU_CLOSE_OTHERS => self.close_other_context_tabs(source_index, context_index),
             TAB_MENU_CLOSE_ALL => self.close_all_context_tabs(source_index),
+            TAB_MENU_NEW_GROUP => self.group_context_tab(source_index, context_index),
+            TAB_MENU_UNGROUP => self.ungroup_context_tab(source_index, context_index),
+            other if other >= TAB_MENU_GROUP_BASE => {
+                let group_index = other - TAB_MENU_GROUP_BASE;
+                if group_index < existing_groups.len() {
+                    self.join_context_tab_group(source_index, context_index, group_index);
+                }
+            }
             _ => {}
         }
     }
@@ -5855,6 +6363,10 @@ impl App {
                 source_index,
                 context_index,
             }) => self.open_context_tab(source_index, context_index),
+            Some(BarHit::ContextGroup {
+                source_index,
+                group_index,
+            }) => self.toggle_context_group(source_index, group_index),
             None => {
                 let scale = self
                     .window
@@ -6435,6 +6947,10 @@ impl ApplicationHandler<UserEvent> for App {
 
         let mut attributes = Window::default_attributes()
             .with_title("NeuralIA")
+            // Maximizada a abrir: e um browser, e o comparador de tres colunas
+            // nao cabe com folga em 1120 px. O `inner_size` fica como o tamanho
+            // de restauro, para quem carregar no botao do meio.
+            .with_maximized(true)
             .with_inner_size(LogicalSize::new(1120.0, 760.0))
             .with_min_inner_size(LogicalSize::new(700.0, 500.0));
 
@@ -6577,6 +7093,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::OpenExternal(url) => self.web(url),
             UserEvent::OpenInColumn(index, url) => self.open_in_column(index, url),
+            UserEvent::OpenEverywhere(url) => self.open_everywhere(url),
             UserEvent::OpenSplit { source_index, url } => {
                 self.open_split(source_index, url, false);
             }
@@ -7268,108 +7785,112 @@ fn gmail_monitor_enabled_for(no_gmail: Option<OsString>) -> bool {
     no_gmail.is_none()
 }
 
-fn neural_hash(mut value: u32) -> f64 {
-    value ^= value >> 16;
-    value = value.wrapping_mul(0x7feb_352d);
-    value ^= value >> 15;
-    value = value.wrapping_mul(0x846c_a68b);
-    value ^= value >> 16;
-    value as f64 / u32::MAX as f64
+/// A tela do fundo da Home, com a zona limpa a volta da marca.
+///
+/// As contas vivem no `neural-core` e nao aqui: e o mesmo tecido que o
+/// instalador desenha, e duas copias divergiam a primeira vez que uma fosse
+/// afinada. O que fica deste lado e so o que e proprio da Home -- onde esta a
+/// marca e quanto espaco ela reserva.
+///
+/// **Sem zona de silencio.** A marca vai para o ecra com o alfa dela, por
+/// `AlphaBlend`, portanto os neuronios passam mesmo por tras dela -- que e o
+/// efeito pedido. Qualquer zona limpa, por mais estreita, desenha uma mancha
+/// escura a volta do logo; foi rejeitada duas vezes, como caixa e como oval.
+fn home_tissue_field(width: f64, height: f64, scale: f64) -> tissue::Field {
+    tissue::Field::new(width, height, scale)
 }
 
-/// Rede neural puramente nativa. Os nodos nascem nas bordas e percorrem curvas
-/// lentas em direcao a marca, ligando-se aos vizinhos proximos. O calculo e
-/// deterministico a partir do tempo, portanto nao precisa de estado ou alocacao
-/// persistente entre frames.
+/// Uma rede neuronal viva: neuronios a percorrer a tela, ligados aos vizinhos,
+/// com impulsos a viajar pelas ligacoes e descargas onde dois se encontram.
+///
+/// A versao anterior lancava particulas das margens e fazia-as convergir TODAS
+/// para o logo. O efeito era o contrario do pretendido: um amontoado a mexer
+/// atras da marca, sem ligacoes estaveis e sem nada que se parecesse com
+/// transmissao. E a versao a seguir a essa corrigiu o amontoado mas deixou-os
+/// a oscilar nove pixeis, sem nunca chegarem ao vizinho -- um mobile, nao um
+/// cerebro. Agora percorrem a sua celula, encontram-se, e o encontro e uma
+/// descarga.
 #[allow(clippy::too_many_arguments)]
 unsafe fn draw_neural_background(
     hdc: *mut core::ffi::c_void,
     width: f64,
     height: f64,
     scale: f64,
-    target_x: f64,
-    target_y: f64,
-    brand_width: f64,
     theme: &Theme,
 ) {
     if width < 1.0 || height < 1.0 {
         return;
     }
 
+    let field = home_tissue_field(width, height, scale);
     let seconds = now_ms() as f64 / 1000.0;
-    let count = ((width / (30.0 * scale.max(1.0))).round() as usize).clamp(34, 58);
-    let mut nodes = Vec::with_capacity(count);
+    draw_neural_tissue(hdc, &field, scale, seconds, theme);
+}
 
-    for i in 0..count {
-        let seed = i as u32 + 1;
-        let side = seed % 4;
-        let along = neural_hash(seed.wrapping_mul(0x9e37_79b9));
-        let (sx, sy) = match side {
-            0 => (along * width, -18.0 * scale),
-            1 => (width + 18.0 * scale, along * height),
-            2 => (along * width, height + 18.0 * scale),
-            _ => (-18.0 * scale, along * height),
-        };
+/// Desenha as ligacoes, os impulsos, os neuronios e as descargas.
+unsafe fn draw_neural_tissue(
+    hdc: *mut core::ffi::c_void,
+    field: &tissue::Field,
+    scale: f64,
+    seconds: f64,
+    theme: &Theme,
+) {
+    let tissue::Tissue {
+        nodes,
+        branches,
+        links,
+        pulses,
+        bursts,
+    } = tissue::tissue_at(field, seconds);
 
-        let phase = neural_hash(seed.wrapping_mul(0x85eb_ca6b));
-        let speed = 0.018 + neural_hash(seed.wrapping_mul(0xc2b2_ae35)) * 0.018;
-        let progress = (seconds * speed + phase).fract();
-        let eased = progress * progress * (3.0 - 2.0 * progress);
-
-        let target_offset_x =
-            (neural_hash(seed.wrapping_mul(0x27d4_eb2d)) - 0.5) * brand_width * 0.44;
-        let target_offset_y =
-            (neural_hash(seed.wrapping_mul(0x1656_67b1)) - 0.5) * brand_width * 0.16;
-        let tx = target_x + target_offset_x;
-        let ty = target_y + target_offset_y;
-
-        let dx = tx - sx;
-        let dy = ty - sy;
-        let length = (dx * dx + dy * dy).sqrt().max(1.0);
-        let px = -dy / length;
-        let py = dx / length;
-        let swirl_phase = neural_hash(seed.wrapping_mul(0xd3a2_646c)) * std::f64::consts::TAU;
-        let swirl = (progress * std::f64::consts::TAU * 1.7 + swirl_phase).sin()
-            * (1.0 - eased)
-            * 38.0
-            * scale;
-
-        let x = sx + dx * eased + px * swirl;
-        let y = sy + dy * eased + py * swirl;
-        let energy = 0.35 + 0.65 * progress;
-        nodes.push((x, y, energy));
+    // A ramagem primeiro: e o que esta por tras de tudo. Tres canetas pela
+    // espessura do ramo -- uma por segmento seria caro a 15 FPS.
+    let twigs: [*mut core::ffi::c_void; 3] = std::array::from_fn(|step| {
+        let weight = if theme.dark { 0.07 } else { 0.05 } + step as f32 * 0.10;
+        CreatePen(
+            PS_SOLID,
+            1 + step as i32,
+            rgb3(mix(theme.page_bg, theme.accent, weight)),
+        )
+    });
+    let old_twig = SelectObject(hdc, twigs[0] as _);
+    for branch in &branches {
+        let bucket = ((branch.weight * 3.0) as usize).min(2);
+        SelectObject(hdc, twigs[bucket] as _);
+        MoveToEx(
+            hdc,
+            branch.ax.round() as i32,
+            branch.ay.round() as i32,
+            std::ptr::null_mut(),
+        );
+        LineTo(hdc, branch.bx.round() as i32, branch.by.round() as i32);
+    }
+    SelectObject(hdc, old_twig);
+    for pen in twigs {
+        DeleteObject(pen as _);
     }
 
-    // O tema recebido ja sabe se esta escuro: ler o registo aqui era faze-lo
-    // duas vezes por frame, 15 vezes por segundo.
-    let line_color = mix(
-        theme.page_bg,
-        theme.accent,
-        if theme.dark { 0.30 } else { 0.18 },
-    );
-    let line_pen = CreatePen(PS_SOLID, 1, rgb3(line_color));
-    let old_pen = SelectObject(hdc, line_pen as _);
-    let max_link = 150.0 * scale;
-
-    for i in 0..nodes.len() {
-        for j in (i + 1)..nodes.len() {
-            let dx = nodes[i].0 - nodes[j].0;
-            let dy = nodes[i].1 - nodes[j].1;
-            let distance = (dx * dx + dy * dy).sqrt();
-            if distance > max_link {
-                continue;
-            }
-            MoveToEx(
-                hdc,
-                nodes[i].0.round() as i32,
-                nodes[i].1.round() as i32,
-                std::ptr::null_mut(),
-            );
-            LineTo(hdc, nodes[j].0.round() as i32, nodes[j].1.round() as i32);
-        }
+    // As sinapses por cima da ramagem, mais acesas: sao ligacao, nao tecido.
+    let pens: [*mut core::ffi::c_void; 3] = std::array::from_fn(|step| {
+        let weight = if theme.dark { 0.18 } else { 0.13 } + (2 - step) as f32 * 0.10;
+        CreatePen(PS_SOLID, 1, rgb3(mix(theme.page_bg, theme.accent, weight)))
+    });
+    let old_pen = SelectObject(hdc, pens[2] as _);
+    for link in &links {
+        let bucket = ((link.closeness * 3.0) as usize).min(2);
+        SelectObject(hdc, pens[bucket] as _);
+        MoveToEx(
+            hdc,
+            link.ax.round() as i32,
+            link.ay.round() as i32,
+            std::ptr::null_mut(),
+        );
+        LineTo(hdc, link.bx.round() as i32, link.by.round() as i32);
     }
     SelectObject(hdc, old_pen);
-    DeleteObject(line_pen as _);
+    for pen in pens {
+        DeleteObject(pen as _);
+    }
 
     let node_color = mix(
         theme.page_bg,
@@ -7381,21 +7902,95 @@ unsafe fn draw_neural_background(
     let old_brush = SelectObject(hdc, node_brush as _);
     let old_node_pen = SelectObject(hdc, node_pen as _);
 
-    for (x, y, energy) in nodes {
-        let radius = ((1.4 + energy * 2.1) * scale).clamp(2.0, 6.0);
+    for node in &nodes {
+        // O tamanho segue a profundidade: os da frente sao corpos, os do fundo
+        // sao pontos. E o que da volume a folha.
+        let radius =
+            ((1.4 + 4.6 * node.depth) * (0.75 + 0.25 * node.energy) * scale).clamp(1.5, 9.0);
         Ellipse(
             hdc,
-            (x - radius).round() as i32,
-            (y - radius).round() as i32,
-            (x + radius).round() as i32,
-            (y + radius).round() as i32,
+            (node.x - radius).round() as i32,
+            (node.y - radius).round() as i32,
+            (node.x + radius).round() as i32,
+            (node.y + radius).round() as i32,
+        );
+    }
+
+    let pulse_color = mix(
+        theme.page_bg,
+        theme.accent,
+        if theme.dark { 0.95 } else { 0.78 },
+    );
+    let pulse_brush = CreateSolidBrush(rgb3(pulse_color));
+    let pulse_pen = CreatePen(PS_SOLID, 1, rgb3(pulse_color));
+    SelectObject(hdc, pulse_brush as _);
+    SelectObject(hdc, pulse_pen as _);
+    for pulse in &pulses {
+        let radius = ((1.0 + pulse.glow * 2.2) * scale).clamp(1.5, 4.5);
+        Ellipse(
+            hdc,
+            (pulse.x - radius).round() as i32,
+            (pulse.y - radius).round() as i32,
+            (pulse.x + radius).round() as i32,
+            (pulse.y + radius).round() as i32,
         );
     }
 
     SelectObject(hdc, old_node_pen);
     SelectObject(hdc, old_brush);
+    DeleteObject(pulse_pen as _);
+    DeleteObject(pulse_brush as _);
     DeleteObject(node_pen as _);
     DeleteObject(node_brush as _);
+
+    // As descargas por cima de tudo: sao o que acontece agora. Dois aneis --
+    // o de fora largo e fraco, o de dentro apertado e forte -- e um nucleo
+    // aceso. E assim que uma faisca se le sem haver alpha a disposicao.
+    // Quente de proposito: num tecido todo azul, a descarga e o unico sitio
+    // onde algo acontece, e tem de se ver a primeira vista.
+    let spark: Rgb = (255, 138, 76);
+    let hollow = GetStockObject(NULL_BRUSH);
+    for burst in &bursts {
+        for (factor, weight) in [(1.0, 0.22), (0.55, 0.55)] {
+            let r = burst.radius * factor;
+            let pen = CreatePen(
+                PS_SOLID,
+                (1.0_f64 + burst.glow).round().max(1.0) as i32,
+                rgb3(mix(theme.page_bg, spark, (weight * burst.glow) as f32)),
+            );
+            let old_pen = SelectObject(hdc, pen as _);
+            let old_brush = SelectObject(hdc, hollow as _);
+            Ellipse(
+                hdc,
+                (burst.x - r).round() as i32,
+                (burst.y - r).round() as i32,
+                (burst.x + r).round() as i32,
+                (burst.y + r).round() as i32,
+            );
+            SelectObject(hdc, old_pen);
+            SelectObject(hdc, old_brush);
+            DeleteObject(pen as _);
+        }
+
+        // Nucleo pequeno: uma faisca, nao um holofote.
+        let core = (burst.radius * 0.11 * (0.4 + burst.glow)).max(1.0);
+        let color = mix(spark, (255, 245, 235), (0.20 + 0.55 * burst.glow) as f32);
+        let brush = CreateSolidBrush(rgb3(color));
+        let pen = CreatePen(PS_SOLID, 1, rgb3(color));
+        let old_brush = SelectObject(hdc, brush as _);
+        let old_pen = SelectObject(hdc, pen as _);
+        Ellipse(
+            hdc,
+            (burst.x - core).round() as i32,
+            (burst.y - core).round() as i32,
+            (burst.x + core).round() as i32,
+            (burst.y + core).round() as i32,
+        );
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        DeleteObject(brush as _);
+        DeleteObject(pen as _);
+    }
 }
 
 fn draw_home(window: &Window, status: Option<&str>) {
@@ -7456,16 +8051,7 @@ fn draw_home(window: &Window, status: Option<&str>) {
             .round() as i32;
 
         if home_animation_enabled() {
-            draw_neural_background(
-                target,
-                width,
-                height,
-                scale,
-                brand_x as f64 + brand_width / 2.0,
-                brand_y as f64 + brand_height * 0.58,
-                brand_width,
-                &theme,
-            );
+            draw_neural_background(target, width, height, scale, &theme);
         }
 
         // Marca e omnibox continuam acima da rede neural.
@@ -7475,7 +8061,6 @@ fn draw_home(window: &Window, status: Option<&str>) {
             brand_y,
             brand_width.round() as i32,
             brand_height.round() as i32,
-            theme.page_bg,
         );
 
         let body_font = create_font((-17.0 * scale) as i32, FW_NORMAL as i32);
@@ -7592,6 +8177,7 @@ fn draw_comparator_bar(
             &names,
             bar_columns(comp),
             &comp.contexts,
+            &comp.groups,
             comp.split.as_ref().map(|split| {
                 (
                     split.source_index,
@@ -7633,7 +8219,8 @@ unsafe fn paint_comparator_bar(
     auto_scroll: bool,
     theme: &Theme,
 ) {
-    let empty: [Vec<String>; COMPARATOR_COLUMNS] = std::array::from_fn(|_| Vec::new());
+    let empty: [Vec<ContextTab>; COMPARATOR_COLUMNS] = std::array::from_fn(|_| Vec::new());
+    let no_groups: [Vec<ContextGroup>; COMPARATOR_COLUMNS] = std::array::from_fn(|_| Vec::new());
     paint_comparator_bar_with_contexts(
         target,
         width,
@@ -7641,6 +8228,7 @@ unsafe fn paint_comparator_bar(
         names,
         BarColumns::even(names.len()),
         &empty,
+        &no_groups,
         None,
         visible,
         hover,
@@ -7656,19 +8244,20 @@ unsafe fn paint_comparator_bar_with_contexts(
     scale: f64,
     names: &[&str],
     columns: BarColumns,
-    contexts: &[Vec<String>; COMPARATOR_COLUMNS],
+    contexts: &[Vec<ContextTab>; COMPARATOR_COLUMNS],
+    groups: &[Vec<ContextGroup>; COMPARATOR_COLUMNS],
     active_context: Option<(usize, &str, bool, bool)>,
     visible: bool,
     hover: Option<BarHit>,
     auto_scroll: bool,
     theme: &Theme,
 ) {
-    let layout = BarLayout::with_contexts(
+    let layout = BarLayout::with_rows(
         width as f64,
         scale,
         visible,
         columns,
-        std::array::from_fn(|index| contexts[index].len()),
+        std::array::from_fn(|index| plan_tab_row(&contexts[index], &groups[index])),
     );
     if !layout.visible {
         return;
@@ -7729,11 +8318,48 @@ unsafe fn paint_comparator_bar_with_contexts(
     // Abas/fontes na mesma faixa dos botoes de janela.
     for (index, source_contexts) in contexts.iter().enumerate().take(layout.columns_len) {
         let brand = theme.brand(index);
-        for visual in 0..layout.context_tab_counts[index] {
-            let context_index = layout.context_indices[index][visual];
-            let Some(url) = source_contexts.get(context_index) else {
+        // A pilula do grupo vem primeiro: a cor e do grupo, nao do provedor, e
+        // o triangulo diz se esta aberto ou fechado.
+        for visual in 0..layout.group_pill_counts[index] {
+            let group_index = layout.group_pill_indices[index][visual];
+            let Some(group) = groups[index].get(group_index) else {
                 continue;
             };
+            let color = group.color.rgb();
+            let hovered = hover
+                == Some(BarHit::ContextGroup {
+                    source_index: index,
+                    group_index,
+                });
+            let fill = mix(theme.bar_bg, color, if hovered { 0.62 } else { 0.42 });
+            let arrow = if group.collapsed {
+                "\u{25B8}"
+            } else {
+                "\u{25BE}"
+            };
+            draw_pill(
+                target,
+                layout.group_pills[index][visual],
+                &format!("{arrow} {}", group.name),
+                PillStyle::new(fill, color, theme.fg_muted),
+                scale,
+                tab_font,
+                theme.bar_bg,
+            );
+        }
+        for visual in 0..layout.context_tab_counts[index] {
+            let context_index = layout.context_indices[index][visual];
+            let Some(tab) = source_contexts.get(context_index) else {
+                continue;
+            };
+            let url = tab.url.as_str();
+            // Uma aba agrupada veste a cor do grupo, nao a do provedor: e assim
+            // que se ve de relance onde acaba um grupo e comeca o outro.
+            let brand = tab
+                .group
+                .and_then(|id| groups[index].iter().find(|group| group.id == id))
+                .map(|group| group.color.rgb())
+                .unwrap_or(brand);
             let active = active_context
                 .is_some_and(|(source, active_url, _, _)| source == index && active_url == url);
             let hovered = hover
@@ -7978,7 +8604,7 @@ unsafe fn create_font(height: i32, weight: i32) -> *mut core::ffi::c_void {
 /// (largura, altura, cor de fundo, pixeis BGRX ja compostos). Os pixeis estao
 /// num `Arc` porque a tela inicial repinta-se a cada frame e um `Vec` clonado
 /// ali custa uma copia de largura*altura*4 bytes por frame, so para o blit ler.
-type SplashCache = Option<(i32, i32, Rgb, Arc<Vec<u8>>)>;
+type SplashCache = Option<(i32, i32, Arc<Vec<u8>>)>;
 
 /// Visualizador de PDF proprio: o do Edge corre noutro processo e nao aceita
 /// nem script nem teclado nosso; este e uma pagina nossa, com o PDF.js da
@@ -8057,14 +8683,18 @@ fn get_app_icon() -> Option<Icon> {
     Icon::from_rgba(rgba, size, size).ok()
 }
 
-unsafe fn draw_brand(
-    hdc: *mut core::ffi::c_void,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    bg_rgb: Rgb,
-) {
+/// A marca, misturada com o que estiver por tras dela.
+///
+/// Antes compunha-se o alfa da arte contra a cor da pagina e blitava-se um
+/// retangulo opaco. Numa tela vazia isso era invisivel; com o tecido neuronal
+/// por tras passou a ser uma caixa -- o retangulo apagava as linhas que
+/// cruzavam a arte. Abrir uma zona limpa grande o suficiente para o conter
+/// trocava a caixa por um buraco oval, igualmente visivel.
+///
+/// Agora a arte vai para o ecra com o alfa dela, por `AlphaBlend`: o tecido
+/// continua a passar por tras e a marca pousa em cima. Nao ha retangulo
+/// nenhum, em tema nenhum.
+unsafe fn draw_brand(hdc: *mut core::ffi::c_void, x: i32, y: i32, width: i32, height: i32) {
     if width <= 0 || height <= 0 {
         return;
     }
@@ -8072,27 +8702,28 @@ unsafe fn draw_brand(
     let pixels = {
         let mut cache = SPLASH_CACHE.lock().unwrap_or_else(|p| p.into_inner());
         match *cache {
-            Some((cached_w, cached_h, cached_bg, ref cached_pixels))
-                if cached_w == width && cached_h == height && cached_bg == bg_rgb =>
+            Some((cached_w, cached_h, ref cached_pixels))
+                if cached_w == width && cached_h == height =>
             {
                 // Clonar o Arc e copiar um ponteiro; clonar o Vec seria copiar
                 // a imagem inteira a cada repintura.
                 Arc::clone(cached_pixels)
             }
             _ => {
-                let rendered = Arc::new(render_brand_pixels(width, height, bg_rgb));
-                *cache = Some((width, height, bg_rgb, Arc::clone(&rendered)));
+                let rendered = Arc::new(render_brand_pixels(width, height));
+                *cache = Some((width, height, Arc::clone(&rendered)));
                 rendered
             }
         }
     };
 
-    blit_bgrx(hdc, &pixels, x, y, width, height);
+    alpha_blit(hdc, &pixels, x, y, width, height);
 }
 
-/// A arte vem sem fundo (o azul-escuro foi tirado no PNG): compomos o alfa
-/// dela por cima da cor da pagina e nao ha caixa nenhuma, em nenhum tema.
-fn render_brand_pixels(width: i32, height: i32, bg_rgb: Rgb) -> Vec<u8> {
+/// A arte vem com alfa e sai **pre-multiplicada**, que e o que o `AlphaBlend`
+/// exige: com canais por multiplicar, o que aparece a volta das letras e uma
+/// auréola clara.
+fn render_brand_pixels(width: i32, height: i32) -> Vec<u8> {
     let image = image::imageops::resize(
         get_brand_image(),
         width as u32,
@@ -8104,14 +8735,13 @@ fn render_brand_pixels(width: i32, height: i32, bg_rgb: Rgb) -> Vec<u8> {
     for py in 0..height as u32 {
         for px in 0..width as u32 {
             let pixel = image.get_pixel(px, py);
-            let alpha = pixel[3] as f32 / 255.0;
-            let channel = |value: u8, bg: u8| {
-                (value as f32 * alpha + bg as f32 * (1.0 - alpha)).round() as u8
-            };
-            pixels.push(channel(pixel[2], bg_rgb.2));
-            pixels.push(channel(pixel[1], bg_rgb.1));
-            pixels.push(channel(pixel[0], bg_rgb.0));
-            pixels.push(0);
+            let alpha = pixel[3];
+            let premultiply =
+                |value: u8| ((value as u32 * alpha as u32 + 127) / 255).min(255) as u8;
+            pixels.push(premultiply(pixel[2]));
+            pixels.push(premultiply(pixel[1]));
+            pixels.push(premultiply(pixel[0]));
+            pixels.push(alpha);
         }
     }
     pixels
@@ -8121,6 +8751,135 @@ fn render_brand_pixels(width: i32, height: i32, bg_rgb: Rgb) -> Vec<u8> {
 mod tests {
     use super::*;
     use windows_sys::Win32::Graphics::Gdi::GetDIBits;
+    /// O fundo da Home acompanha a marca, nao disputa com ela.
+    ///
+    /// A versao anterior lancava particulas das margens e fazia-as convergir
+    /// TODAS para o logo: o que se via era um amontoado a mexer por tras da
+    /// marca. Estes testes prendem as propriedades que fazem a diferenca --
+    /// a zona limpa, a distribuicao pela tela, o movimento e as descargas --
+    /// porque nenhuma delas se nota a faltar ate alguem olhar para o ecra.
+    const BRAND: (f64, f64, f64, f64) = (700.0, 180.0, 520.0, 374.0);
+
+    fn home_field() -> tissue::Field {
+        home_tissue_field(1920.0, 1080.0, 1.0)
+    }
+
+    #[test]
+    fn the_tissue_runs_right_through_where_the_brand_sits() {
+        // Foi rejeitado tres vezes no ecra: primeiro um retangulo opaco a
+        // apagar o tecido (caixa), depois uma zona limpa a conter esse
+        // retangulo (buraco oval), depois uma zona limpa estreita (mancha
+        // escura a volta do logo). O que o dono quer e simples de dizer e
+        // simples de verificar: **nao ha buraco nenhum**. O tecido atravessa
+        // o sitio onde a marca esta, e a marca pousa em cima dele com o alfa
+        // que traz.
+        let (bx, by, bw, bh) = BRAND;
+        let field = home_field();
+        // Uma grelha sobre o retangulo da marca. Contar o total nao chega:
+        // uma zona limpa deixa o total alto e abre o buraco na mesma. O que
+        // tem de valer e que NENHUMA celula fica vazia.
+        const COLUMNS: usize = 4;
+        const ROWS: usize = 3;
+        for step in 0..40 {
+            let frame = tissue::tissue_at(&field, step as f64 * 0.31);
+            let mut cells = [[0usize; COLUMNS]; ROWS];
+            let mut count = |x: f64, y: f64| {
+                if x < bx || x > bx + bw || y < by || y > by + bh {
+                    return;
+                }
+                let col = (((x - bx) / bw * COLUMNS as f64) as usize).min(COLUMNS - 1);
+                let row = (((y - by) / bh * ROWS as f64) as usize).min(ROWS - 1);
+                cells[row][col] += 1;
+            };
+            for branch in &frame.branches {
+                count(branch.ax, branch.ay);
+                count(branch.bx, branch.by);
+            }
+            for node in &frame.nodes {
+                count(node.x, node.y);
+            }
+            for (row, line) in cells.iter().enumerate() {
+                for (col, found) in line.iter().enumerate() {
+                    assert!(
+                        *found > 0,
+                        "nada na celula ({row}, {col}) do retangulo da marca \
+                         em t={:.2}: e um buraco, so que mais pequeno",
+                        step as f64 * 0.31
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn home_background_spreads_across_the_canvas() {
+        let nodes = tissue::nodes_at(&home_field(), 3.0);
+
+        // Uma convergencia para um ponto passaria a zona limpa mas continuaria
+        // a ser um amontoado: exige-se ocupacao dos quatro quadrantes.
+        let mut quadrants = [0usize; 4];
+        for node in &nodes {
+            let index = usize::from(node.x > 960.0) + 2 * usize::from(node.y > 540.0);
+            quadrants[index] += 1;
+        }
+        assert!(
+            quadrants.iter().all(|count| *count >= 3),
+            "distribuicao amontoada: {quadrants:?}"
+        );
+
+        // E as energias tem de variar, senao nao ha pulsacao nenhuma.
+        let energies: Vec<f64> = nodes.iter().map(|node| node.energy).collect();
+        let min = energies.iter().copied().fold(f64::MAX, f64::min);
+        let max = energies.iter().copied().fold(f64::MIN, f64::max);
+        assert!(max - min > 0.1, "energias iguais: {min}..{max}");
+    }
+
+    #[test]
+    fn home_neurons_travel_and_discharge_when_they_meet() {
+        // O fundo da Home e o mesmo tecido do instalador: tem de ter o mesmo
+        // comportamento, nao so o mesmo aspeto parado. Sem deslocacao nao ha
+        // encontro, e sem encontro nao ha descarga -- fica um mobile.
+        let field = home_field();
+        let start = tissue::nodes_at(&field, 0.0);
+        let mut furthest = 0.0f64;
+        let mut discharges = 0usize;
+        for step in 0..240 {
+            let seconds = step as f64 * 0.05;
+            let frame = tissue::tissue_at(&field, seconds);
+            discharges += frame.bursts.len();
+            for (a, b) in start.iter().zip(frame.nodes.iter()) {
+                furthest = furthest.max(((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt());
+            }
+        }
+        let spacing = (1920.0 * 1080.0 / start.len() as f64).sqrt();
+        assert!(
+            furthest > spacing * 0.5,
+            "em 12 segundos o neuronio que mais andou fez {furthest:.0} px \
+             para um espacamento de {spacing:.0} px"
+        );
+        assert!(
+            discharges > 20,
+            "em 12 segundos houve {discharges} descargas no fundo da Home"
+        );
+    }
+
+    #[test]
+    fn home_tissue_is_dense_enough_to_read_as_tissue() {
+        // "Quero algo mais real, com muito mais conexoes." Uma rede rala le-se
+        // como um grafo; o que se quer e tecido, com ramagem por tras.
+        let frame = tissue::tissue_at(&home_field(), 6.0);
+        let per_node = frame.links.len() as f64 / frame.nodes.len() as f64;
+        assert!(
+            per_node >= 2.5,
+            "{per_node:.1} ligacoes por soma: ainda e um grafo, nao tecido"
+        );
+        assert!(
+            frame.branches.len() > frame.nodes.len() * 12,
+            "{} ramos para {} somas: falta a ramagem",
+            frame.branches.len(),
+            frame.nodes.len()
+        );
+    }
 
     /// A autorizacao de rede local vale para a ORIGEM que o utilizador
     /// escreveu, nao para a rede local inteira.
@@ -8354,6 +9113,51 @@ mod tests {
     }
 
     #[test]
+    fn the_brand_keeps_its_transparency_instead_of_becoming_a_rectangle() {
+        // Isto foi rejeitado duas vezes no ecra: a arte compunha-se contra a
+        // cor da pagina e ia para o ecra opaca, o que apagava o tecido num
+        // retangulo. Os cantos da arte sao transparentes e tem de continuar a
+        // ser depois de redimensionados.
+        let size = 96;
+        let pixels = render_brand_pixels(size, size);
+        assert_eq!(pixels.len(), (size * size * 4) as usize);
+
+        let at = |x: i32, y: i32| {
+            let index = ((y * size + x) * 4) as usize;
+            (
+                pixels[index],
+                pixels[index + 1],
+                pixels[index + 2],
+                pixels[index + 3],
+            )
+        };
+        for (x, y) in [(0, 0), (size - 1, 0), (0, size - 1), (size - 1, size - 1)] {
+            let (b, g, r, a) = at(x, y);
+            assert_eq!(
+                (b, g, r, a),
+                (0, 0, 0, 0),
+                "o canto ({x}, {y}) e opaco: vai aparecer um retangulo"
+            );
+        }
+
+        // E alguma coisa tem de ser visivel, senao o que se corrigiu foi
+        // apagar a marca.
+        assert!(
+            pixels.chunks(4).any(|px| px[3] > 200),
+            "a marca ficou toda transparente"
+        );
+
+        // Pre-multiplicado: nenhum canal pode exceder o alfa. Sem isto o
+        // AlphaBlend desenha uma aureola clara a volta das letras.
+        for px in pixels.chunks(4) {
+            assert!(
+                px[0] <= px[3] && px[1] <= px[3] && px[2] <= px[3],
+                "pixel por pre-multiplicar: {px:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_stretch_dibits_on_screen_dc() {
         unsafe {
             let hdc = GetDC(core::ptr::null_mut());
@@ -8361,7 +9165,7 @@ mod tests {
             let img = get_brand_image();
             assert_eq!(img.width(), 1200);
             let size = 104;
-            let pixels = render_brand_pixels(size, size, (248, 249, 250));
+            let pixels = render_brand_pixels(size, size);
             assert_eq!(pixels.len(), (size * size * 4) as usize);
 
             let bmi = BITMAPINFO {
@@ -9550,11 +10354,76 @@ mod tests {
         assert!(!COMPARATOR_INJECT_SCRIPT.contains("neuralia:research-answer"));
     }
 
+    /// O comportamento que o dono descreveu em duas frases: "clicou abre,
+    /// segurou control abre em outra aba".
+    ///
+    /// O guard que b8f6fc2 acrescentou tirou o desvio do clique simples e nao
+    /// pos nada no lugar: o clique deixou de ter tratamento nenhum. E o
+    /// caminho do Ctrl era testado apenas por uma assercao sobre o TEXTO do
+    /// script, que continuava verde com a funcionalidade partida.
+    #[test]
+    fn a_plain_click_opens_in_all_three_panels_and_ctrl_click_opens_beside() {
+        let url = "https://example.com/fonte".to_string();
+
+        match App::column_ipc_event_impl(
+            1,
+            IpcAction::Link {
+                col: 1,
+                url: url.clone(),
+                aside: false,
+            },
+        ) {
+            Some(UserEvent::OpenEverywhere(opened)) => assert_eq!(opened, url),
+            other => panic!("clique simples devia abrir nas tres colunas, veio {other:?}"),
+        }
+
+        match App::column_ipc_event_impl(
+            1,
+            IpcAction::Link {
+                col: 1,
+                url: url.clone(),
+                aside: true,
+            },
+        ) {
+            Some(UserEvent::OpenSplit {
+                source_index,
+                url: opened,
+            }) => {
+                assert_eq!(source_index, 1);
+                assert_eq!(opened, url);
+            }
+            other => panic!("Ctrl+clique devia abrir ao lado, veio {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_click_reported_by_another_column_is_ignored() {
+        // Cada coluna tem o seu handler de IPC. Sem esta verificacao, uma
+        // pagina numa coluna mandava a outra abrir o que lhe apetecesse.
+        assert!(
+            App::column_ipc_event_impl(
+                0,
+                IpcAction::Link {
+                    col: 2,
+                    url: "https://example.com/".into(),
+                    aside: true,
+                },
+            )
+            .is_none()
+        );
+    }
+
     #[test]
     fn comparator_has_split_palette_and_real_three_way_submit() {
         assert!(
-            COMPARATOR_INJECT_SCRIPT.contains("act('split', { col:colIndex, url:target.href })")
+            COMPARATOR_INJECT_SCRIPT
+                .contains("act('link', { col:colIndex, url:target.href, aside:aside })")
         );
+        // O botao do meio chega como `auxclick`; dentro de `click` o
+        // `event.button` e sempre 0. Ter isto aqui e presenca, nao
+        // comportamento -- o que decide para onde vai o clique esta em
+        // `column_ipc_event_impl`, e esse tem teste a serio.
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("'auxclick'"));
         assert!(NEURALIA_KEYMAP_SCRIPT.contains("act('palette', { col:colIndex })"));
         assert!(!NEURALIA_KEYMAP_SCRIPT.contains("q="));
         assert!(SPLIT_SCROLL_RAIL_SCRIPT.contains("neuralia-split-scroll-rail"));
@@ -9578,11 +10447,25 @@ mod tests {
                 .and_then(|part| part.split(".with_new_window_req_handler").next())
                 .expect(builder);
             assert!(body.contains("with_ipc_handler"), "{builder}");
-            assert!(body.contains("IpcAction::Palette"), "{builder}");
-            assert!(body.contains("UserEvent::OpenPalette("), "{builder}");
             assert!(!body.contains("neuralia_query_param"), "{builder}");
             assert!(!body.contains("PaletteSubmit"), "{builder}");
         }
+
+        // A palette da COLUNA ja nao se verifica por texto: o despacho saiu do
+        // closure para uma funcao, e agora chama-se.
+        assert!(matches!(
+            App::column_ipc_event_impl(1, IpcAction::Palette { col: 1 }),
+            Some(UserEvent::OpenPalette(1))
+        ));
+        // O painel lateral mantem o despacho dentro do closure, e por isso
+        // continua a ser so presenca.
+        let split_body = source
+            .split("fn split_webview_builder")
+            .nth(1)
+            .and_then(|part| part.split(".with_new_window_req_handler").next())
+            .expect("split builder");
+        assert!(split_body.contains("IpcAction::Palette"));
+        assert!(split_body.contains("UserEvent::OpenPalette("));
 
         let edit = source
             .split("fn palette_edit_subclass")
@@ -10406,6 +11289,219 @@ mod tests {
             }
         }
     }
+
+    // ---------- grupos de abas ----------
+
+    fn tab(url: &str, group: Option<u64>) -> ContextTab {
+        ContextTab {
+            url: url.to_string(),
+            group,
+        }
+    }
+
+    fn group(id: u64, collapsed: bool) -> ContextGroup {
+        ContextGroup {
+            id,
+            name: format!("G{id}"),
+            color: GroupColor::Blue,
+            collapsed,
+        }
+    }
+
+    #[test]
+    fn a_collapsed_group_hides_its_tabs_and_keeps_its_pill() {
+        let tabs = vec![
+            tab("https://a.example/1", Some(7)),
+            tab("https://b.example/2", Some(7)),
+            tab("https://c.example/3", None),
+        ];
+        let open = plan_tab_row(&tabs, &[group(7, false)]);
+        assert_eq!(
+            open.visible(),
+            &[
+                TabSlot::Group(0),
+                TabSlot::Tab(0),
+                TabSlot::Tab(1),
+                TabSlot::Tab(2)
+            ]
+        );
+
+        let shut = plan_tab_row(&tabs, &[group(7, true)]);
+        // A pilula fica -- e o unico sitio onde o grupo se reabre. As abas
+        // saem da barra sem deixarem de estar abertas.
+        assert_eq!(shut.visible(), &[TabSlot::Group(0), TabSlot::Tab(2)]);
+    }
+
+    #[test]
+    fn a_tab_whose_group_vanished_stays_on_the_bar_as_a_loose_tab() {
+        // O grupo 7 ja nao existe: a aba tem de voltar a ser solta, nao
+        // desaparecer com ele.
+        let tabs = vec![tab("https://a.example/1", Some(7))];
+        let row = plan_tab_row(&tabs, &[]);
+        assert_eq!(row.visible(), &[TabSlot::Tab(0)]);
+    }
+
+    /// Confirma a invariante em qualquer fila: nenhuma aba agrupada aparece
+    /// sem a pilula do seu grupo antes dela, e o tecto de abas e respeitado.
+    fn assert_no_orphans(row: &TabRow, tabs: &[ContextTab], groups: &[ContextGroup]) {
+        let mut seen: Vec<usize> = Vec::new();
+        for slot in row.visible() {
+            match slot {
+                TabSlot::Group(index) => seen.push(*index),
+                TabSlot::Tab(index) => {
+                    if let Some(id) = tabs[*index].group
+                        && let Some(owner) = groups.iter().position(|group| group.id == id)
+                    {
+                        assert!(
+                            seen.contains(&owner),
+                            "aba {index} aparece sem a pilula do grupo {owner}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            row.visible()
+                .iter()
+                .filter(|slot| matches!(slot, TabSlot::Tab(_)))
+                .count()
+                <= MAX_VISIBLE_CONTEXT_TABS
+        );
+    }
+
+    #[test]
+    fn a_group_that_fits_is_shown_whole() {
+        let tabs = vec![
+            tab("https://a.example/1", Some(1)),
+            tab("https://b.example/2", Some(1)),
+            tab("https://c.example/3", None),
+        ];
+        let groups = vec![group(1, false)];
+        let row = plan_tab_row(&tabs, &groups);
+        assert_eq!(
+            row.visible(),
+            &[
+                TabSlot::Group(0),
+                TabSlot::Tab(0),
+                TabSlot::Tab(1),
+                TabSlot::Tab(2)
+            ]
+        );
+        assert_no_orphans(&row, &tabs, &groups);
+    }
+
+    #[test]
+    fn the_overflow_cut_never_leaves_a_tab_without_its_pill() {
+        // O corte cai a meio do grupo: sem a correcao sobravam as duas ultimas
+        // abas do grupo sem pilula nenhuma a dizer de quem sao.
+        let tabs = vec![
+            tab("https://a.example/1", Some(1)),
+            tab("https://b.example/2", Some(1)),
+            tab("https://c.example/3", Some(1)),
+            tab("https://d.example/4", None),
+        ];
+        let groups = vec![group(1, false)];
+        let row = plan_tab_row(&tabs, &groups);
+        assert_no_orphans(&row, &tabs, &groups);
+        assert_eq!(row.visible(), &[TabSlot::Tab(3)]);
+
+        // E com dois grupos seguidos, o mesmo: o que entra entra inteiro.
+        let many = vec![
+            tab("https://a.example/1", None),
+            tab("https://b.example/2", Some(1)),
+            tab("https://c.example/3", Some(1)),
+            tab("https://d.example/4", Some(2)),
+            tab("https://e.example/5", Some(2)),
+            tab("https://f.example/6", None),
+        ];
+        let pair = vec![group(1, false), group(2, false)];
+        assert_no_orphans(&plan_tab_row(&many, &pair), &many, &pair);
+    }
+
+    #[test]
+    fn joining_a_group_parks_the_tab_next_to_the_other_members() {
+        // Sem isto a pilula ficava a rotular a aba errada: os membros tem de
+        // ser contiguos na barra.
+        let mut tabs = vec![
+            tab("https://a.example/1", Some(1)),
+            tab("https://b.example/2", None),
+            tab("https://c.example/3", None),
+        ];
+        join_context_group(&mut tabs, 1, 2);
+        assert_eq!(tabs[0].url, "https://a.example/1");
+        assert_eq!(tabs[1].url, "https://c.example/3");
+        assert_eq!(tabs[1].group, Some(1));
+        assert_eq!(tabs[2].url, "https://b.example/2");
+        assert_eq!(tabs[2].group, None);
+    }
+
+    #[test]
+    fn a_group_that_loses_its_last_tab_disappears() {
+        let mut tabs = vec![tab("https://a.example/1", Some(3))];
+        let mut groups = vec![group(3, false)];
+        leave_context_group(&mut tabs, &mut groups, 0);
+        assert_eq!(tabs[0].group, None);
+        assert!(groups.is_empty(), "pilula vazia nao pode ficar na barra");
+    }
+
+    #[test]
+    fn a_new_group_takes_the_host_for_a_name_and_a_colour_nobody_is_using() {
+        let mut tabs = vec![
+            tab("https://www.arxiv.org/abs/1", None),
+            tab("https://b.example/2", None),
+        ];
+        let mut groups = Vec::new();
+        let mut next_id = 1;
+        let first =
+            create_context_group(&mut tabs, &mut groups, &mut next_id, 0).expect("aba existe");
+        let second =
+            create_context_group(&mut tabs, &mut groups, &mut next_id, 1).expect("aba existe");
+        assert_eq!(groups[first].name, "arxiv.org");
+        assert_eq!(tabs[0].group, Some(groups[first].id));
+        assert_ne!(
+            groups[first].color, groups[second].color,
+            "dois grupos seguidos nao podem nascer da mesma cor"
+        );
+        assert_ne!(groups[first].id, groups[second].id);
+    }
+
+    #[test]
+    fn the_group_pill_is_hit_tested_where_it_is_drawn() {
+        let tabs = vec![
+            tab("https://a.example/1", Some(1)),
+            tab("https://b.example/2", None),
+        ];
+        let groups = vec![group(1, false)];
+        let mut rows = [TabRow::empty(); COMPARATOR_COLUMNS];
+        rows[0] = plan_tab_row(&tabs, &groups);
+        let layout = BarLayout::with_rows(1600.0, 1.0, true, BarColumns::even(3), rows);
+
+        assert_eq!(layout.group_pill_counts[0], 1);
+        let pill = layout.group_pills[0][0];
+        assert!(pill.width > 0.0);
+        assert_eq!(
+            layout.hit(pill.x + pill.width / 2.0, pill.y + pill.height / 2.0),
+            Some(BarHit::ContextGroup {
+                source_index: 0,
+                group_index: 0
+            })
+        );
+
+        // E as abas continuam a acertar nelas proprias, nao na pilula.
+        assert_eq!(layout.context_tab_counts[0], 2);
+        let first = layout.context_tabs[0][0];
+        assert!(
+            first.x >= pill.x + pill.width,
+            "a pilula vem antes da sua primeira aba"
+        );
+        assert_eq!(
+            layout.hit(first.x + first.width / 2.0, first.y + first.height / 2.0),
+            Some(BarHit::ContextTab {
+                source_index: 0,
+                context_index: 0
+            })
+        );
+    }
 }
 
 // ===================== tema do sistema (cor de destaque + claro/escuro) =====================
@@ -10619,6 +11715,97 @@ fn round_rect_sdf(px: f32, py: f32, width: f32, height: f32, radius: f32) -> f32
     let ax = qx.max(0.0);
     let ay = qy.max(0.0);
     (ax * ax + ay * ay).sqrt() + qx.max(qy).min(0.0) - radius
+}
+
+/// Poe uma imagem BGRA **pre-multiplicada** por cima do que ja esta no DC,
+/// respeitando o alfa. E o unico sitio onde a NeuralIA usa a `msimg32`, e usa-a
+/// porque a alternativa -- ler o fundo de volta com `GetDIBits`, compor a mao e
+/// voltar a escrever -- e tres vezes o trabalho para o mesmo resultado.
+unsafe fn alpha_blit(
+    hdc: *mut core::ffi::c_void,
+    pixels: &[u8],
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) {
+    if width <= 0 || height <= 0 || pixels.len() < (width * height * 4) as usize {
+        return;
+    }
+
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            // Negativo: a imagem vem de cima para baixo, como a `image` a da.
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            biSizeImage: (width * height * 4) as u32,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        },
+        bmiColors: [windows_sys::Win32::Graphics::Gdi::RGBQUAD {
+            rgbBlue: 0,
+            rgbGreen: 0,
+            rgbRed: 0,
+            rgbReserved: 0,
+        }; 1],
+    };
+
+    // O `AlphaBlend` precisa de um bitmap com alfa de verdade, e um
+    // `CreateCompatibleBitmap` nao o tem: dai a seccao DIB.
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let dib = CreateDIBSection(
+        hdc as _,
+        &bmi,
+        DIB_RGB_COLORS,
+        &mut bits,
+        std::ptr::null_mut(),
+        0,
+    );
+    if dib.is_null() || bits.is_null() {
+        if !dib.is_null() {
+            DeleteObject(dib as _);
+        }
+        return;
+    }
+    std::ptr::copy_nonoverlapping(
+        pixels.as_ptr(),
+        bits as *mut u8,
+        (width * height * 4) as usize,
+    );
+
+    let mem = CreateCompatibleDC(hdc as _);
+    if mem.is_null() {
+        DeleteObject(dib as _);
+        return;
+    }
+    let old = SelectObject(mem, dib as _);
+    AlphaBlend(
+        hdc as _,
+        x,
+        y,
+        width,
+        height,
+        mem,
+        0,
+        0,
+        width,
+        height,
+        BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        },
+    );
+    SelectObject(mem, old);
+    DeleteDC(mem);
+    DeleteObject(dib as _);
 }
 
 unsafe fn blit_bgrx(
@@ -11247,57 +12434,173 @@ const GMAIL_MONITOR_SCRIPT: &str = r#"
 /// ChatGPT e Claude aceitam a consulta por ?q=, mas hoje apenas preenchem o
 /// compositor. O comparador tem semântica de "perguntar às três", portanto o
 /// NeuralIA confirma o envio assim que o botão real do fornecedor fica pronto.
+/// Envia a pergunta no fornecedor em vez de a deixar na caixa.
+///
+/// O Gemini abre directamente numa pagina de resultados; o ChatGPT e o Claude
+/// recebem `?q=` que so PREENCHE a caixa. A versao anterior esperava que
+/// `promptText()` devolvesse texto antes de carregar em enviar -- mas lia o
+/// PRIMEIRO `textarea` da pagina, que nestes sitios e um campo escondido e
+/// vazio. Ficava a tentar 120 vezes e desistia, e a pergunta ficava na barra a
+/// espera de um Enter manual: exactamente o que o utilizador via.
+///
+/// Agora procura o editor que TEM texto, e se nenhum tiver escreve a pergunta
+/// ele proprio antes de enviar.
 const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
 (function () {
+  // So no frame de topo. Este script ESCREVE numa caixa de texto, e o WebView2
+  // injeta os scripts de inicializacao tambem nos frames filhos: sem esta
+  // guarda, um iframe da mesma origem levava com a pergunta escrita dentro.
+  if (window.top !== window) return;
   const host = location.hostname.toLowerCase();
   if (host !== 'chatgpt.com' && host !== 'claude.ai') return;
   const query = new URL(location.href).searchParams.get('q');
   if (!query || !query.trim()) return;
 
-  const stampKey = 'neuralia:auto-submit:' + host + ':' + query;
-  const previous = Number(sessionStorage.getItem(stampKey) || '0');
-  if (Date.now() - previous < 10000) return;
-
-  function promptText() {
-    const el = document.querySelector(
-      'textarea, [data-testid="prompt-textarea"], [contenteditable="true"][role="textbox"], div[contenteditable="true"]'
-    );
-    if (!el) return '';
-    return String('value' in el ? el.value : el.innerText || el.textContent || '').trim();
+  // O acesso ao sessionStorage pode LANCAR -- armazenamento particionado,
+  // cookies de terceiros bloqueados, modo restrito. Sem rede, um throw aqui
+  // ao nivel de topo abortava o script todo.
+  function stampRead(key) {
+    try { return Number(sessionStorage.getItem(key) || '0'); } catch (_) { return 0; }
+  }
+  function stampWrite(key, value) {
+    try { sessionStorage.setItem(key, String(value)); } catch (_) {}
   }
 
-  function candidates() {
-    if (host === 'chatgpt.com') {
-      return [
-        'button[data-testid="send-button"]',
-        'button[aria-label*="Send prompt"]',
-        'button[aria-label*="Send message"]',
-        'form button[type="submit"]'
-      ];
+  const stampKey = 'neuralia:auto-submit:' + host + ':' + query;
+  if (Date.now() - stampRead(stampKey) < 10000) return;
+
+  const EDITORS = 'div[contenteditable="true"][role="textbox"], div[contenteditable="true"], [data-testid="prompt-textarea"], textarea';
+
+  function textOf(el) {
+    if (!el) return '';
+    return String('value' in el && typeof el.value === 'string' ? el.value : el.innerText || el.textContent || '').trim();
+  }
+
+  function visible(el) {
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  // O editor certo e o que ESTA VISIVEL e, de preferencia, o que ja tem texto.
+  // Ler so o primeiro `textarea` apanhava um campo escondido e vazio.
+  function editor() {
+    const all = Array.from(document.querySelectorAll(EDITORS)).filter(visible);
+    return all.find((el) => textOf(el)) || all[0] || null;
+  }
+
+  function fill(el) {
+    el.focus();
+    if (el.isContentEditable) {
+      // `execCommand` e o que os editores com React por tras aceitam sem
+      // reescrever o estado deles por baixo.
+      if (!document.execCommand('insertText', false, query)) {
+        el.textContent = query;
+        el.dispatchEvent(new InputEvent('input', { bubbles:true, data:query, inputType:'insertText' }));
+      }
+      return;
     }
-    return [
-      'button[aria-label*="Send"]',
-      'button[data-testid*="send"]',
-      'form button[type="submit"]'
-    ];
+    const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
+    if (descriptor && descriptor.set) descriptor.set.call(el, query);
+    else el.value = query;
+    el.dispatchEvent(new Event('input', { bubbles:true }));
+  }
+
+  // Apagar o que NOS escrevemos. So se usa quando desistimos: texto que o
+  // utilizador nao escreveu nao pode ficar na caixa de outra pessoa.
+  function clear(el) {
+    if (!el) return;
+    el.focus();
+    if (el.isContentEditable) {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      if (!document.execCommand('insertText', false, '')) {
+        el.textContent = '';
+        el.dispatchEvent(new InputEvent('input', { bubbles:true, inputType:'deleteContentBackward' }));
+      }
+      return;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
+    if (descriptor && descriptor.set) descriptor.set.call(el, '');
+    else el.value = '';
+    el.dispatchEvent(new Event('input', { bubbles:true }));
+  }
+
+  function sendButton() {
+    const selectors = host === 'chatgpt.com'
+      ? ['button[data-testid="send-button"]', 'button[aria-label*="Send prompt"]', 'button[aria-label*="Send message"]', 'button[aria-label*="Enviar"]', 'form button[type="submit"]']
+      : ['button[aria-label*="Send"]', 'button[aria-label*="Enviar"]', 'button[data-testid*="send"]', 'form button[type="submit"]'];
+    for (const selector of selectors) {
+      const button = document.querySelector(selector);
+      if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') continue;
+      if (!visible(button)) continue;
+      return button;
+    }
+    return null;
+  }
+
+  // O sitio ja tratou da pergunta sozinho?
+  //
+  // O ChatGPT, com `?q=...&hints=search`, NAO se limita a preencher a caixa:
+  // envia a pergunta e troca a URL para `/uc/<id>` sem recarregar a pagina.
+  // A caixa fica entao vazia -- e o script, que guardou a pergunta no
+  // arranque, via-a vazia e escrevia-a de volta. Era isso que ficava escrito
+  // no ChatGPT depois de a resposta ja estar na tela.
+  //
+  // O sinal e a propria URL e nao o DOM: o `?q=` desaparece quando o site o
+  // consome, em qualquer provedor e em qualquer versao do HTML deles. Ler o
+  // DOM obrigava a conhecer os seletores de cada um -- e o ChatGPT tem pelo
+  // menos duas variantes (ligado e desligado) com marcadores diferentes.
+  function consumed() {
+    try {
+      return new URL(location.href).searchParams.get('q') !== query;
+    } catch (_) {
+      return true;
+    }
   }
 
   let attempts = 0;
+  let filled = false;
   function submitWhenReady() {
     attempts += 1;
-    const typed = promptText();
-    if (typed) {
-      for (const selector of candidates()) {
-        const button = document.querySelector(selector);
-        if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') continue;
-        const rect = button.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) continue;
-        sessionStorage.setItem(stampKey, String(Date.now()));
-        button.click();
-        return;
+    if (consumed()) return;
+    const el = editor();
+    if (el) {
+      // Dez tentativas (~1,5 s) a dar hipotese ao proprio site de preencher;
+      // passadas essas, escrevemos nos.
+      if (!textOf(el) && !filled && attempts > 10) {
+        fill(el);
+        filled = true;
+      }
+      if (textOf(el)) {
+        const button = sendButton();
+        if (button) {
+          stampWrite(stampKey, Date.now());
+          button.click();
+          return;
+        }
+        // Sem botao utilizavel, Enter no editor e o caminho que estes sitios
+        // tambem aceitam.
+        if (attempts > 20) {
+          stampWrite(stampKey, Date.now());
+          el.focus();
+          for (const type of ['keydown', 'keypress', 'keyup']) {
+            el.dispatchEvent(new KeyboardEvent(type, { key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true, cancelable:true }));
+          }
+          return;
+        }
       }
     }
-    if (attempts < 120) setTimeout(submitWhenReady, 150);
+    if (attempts < 120) {
+      setTimeout(submitWhenReady, 150);
+      return;
+    }
+    // Desistimos ao fim de ~18 s. Se fomos NOS a escrever e nunca chegou a ser
+    // enviado, a pergunta nao pode ficar la a fingir que o utilizador a
+    // escreveu.
+    if (filled) clear(el || editor());
   }
 
   if (document.readyState === 'loading') {
@@ -11692,6 +12995,99 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
   const listen = Function.prototype.call.bind(EventTarget.prototype.addEventListener);
   const append = Function.prototype.call.bind(Node.prototype.appendChild);
 
+  // Semantica do Chrome: clique abre onde se esta, Ctrl+clique (ou clique do
+  // meio) abre "noutro separador" -- aqui, o painel lateral, com a aba na
+  // barra de titulo.
+  //
+  // Os listeners ficam registados JA, fora do DOMContentLoaded. Os scripts da
+  // propria pagina correm durante o parse, ou seja antes desse evento, e
+  // registam os deles em captura primeiro; quem chega depois recebe os
+  // eventos ja com `defaultPrevented` posto e desiste sem fazer nada.
+  const GOOGLE_REDIRECT_PARAMS = ['q', 'url', 'imgurl', 'adurl'];
+
+  function linkUrl(node) {
+    // Nem toda a fonte e uma <a href>: o AI Mode do Google e as citacoes do
+    // ChatGPT usam chips que trazem o endereco num atributo. Ler apenas
+    // `a[href]` deixava de fora justamente as ligacoes destas paginas -- que
+    // sao as unicas paginas onde isto corre.
+    const anchor = node.closest('a[href], [role="link"], [data-href], [data-url]');
+    if (!anchor) return null;
+    const raw = anchor.getAttribute('href')
+      || anchor.getAttribute('data-href')
+      || anchor.getAttribute('data-url');
+    if (!raw) return null;
+
+    let target;
+    try { target = new URL(raw, location.href); } catch (_) { return null; }
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') return null;
+
+    // O Google embrulha as fontes num redirecionamento seu. Desembrulhar pelo
+    // PARAMETRO e nao pelo caminho: /url, /imgres e /aclk sao caminhos
+    // diferentes para a mesma coisa, e so o primeiro estava coberto.
+    const host = target.hostname;
+    if (host === 'google.com' || host.endsWith('.google.com')) {
+      for (const name of GOOGLE_REDIRECT_PARAMS) {
+        const actual = target.searchParams.get(name);
+        if (!actual) continue;
+        try {
+          const unwrapped = new URL(actual, location.href);
+          if (unwrapped.protocol === 'http:' || unwrapped.protocol === 'https:') {
+            target = unwrapped;
+            break;
+          }
+        } catch (_) {}
+      }
+    }
+    return target;
+  }
+
+  function routeLink(event, aside) {
+    if (!event.isTrusted || event.defaultPrevented) return;
+    // Alt e Shift sao gestos do proprio navegador (descarregar, nova janela);
+    // nao os roubamos.
+    if (event.altKey || event.shiftKey) return;
+    const node = event.target;
+    if (!node || !node.closest) return;
+    if (node.closest('#neuralia-comp-controls,#neuralia-palette')) return;
+
+    const target = linkUrl(node);
+    if (!target) return;
+
+    // Clique simples numa ligacao do proprio sitio e navegacao interna da
+    // aplicacao: a SPA trata disso melhor do que um load_url, que recarregava
+    // a pagina toda e perdia a conversa. Com Ctrl a intencao e explicita e
+    // vale para qualquer endereco, incluindo o do proprio sitio.
+    if (!aside && target.origin === location.origin) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    act('link', { col:colIndex, url:target.href, aside:aside });
+  }
+
+  listen(document, 'click', (event) => {
+    if (event.button !== 0) return;
+    routeLink(event, !!(event.ctrlKey || event.metaKey));
+  }, true);
+
+  // O botao do meio NAO dispara 'click' desde o Chrome 55 -- dispara
+  // 'auxclick'. O `event.button === 1` que aqui estava dentro do 'click' era
+  // codigo morto: naquele evento o botao e sempre 0.
+  listen(document, 'auxclick', (event) => {
+    if (event.button !== 1) return;
+    routeLink(event, true);
+  }, true);
+
+  listen(document, 'dblclick', (event) => {
+    if (!event.isTrusted || event.defaultPrevented) return;
+    if (event.target && event.target.closest
+        && event.target.closest('#neuralia-comp-controls,#neuralia-palette')) return;
+    const tag = event.target && event.target.tagName
+      ? event.target.tagName.toUpperCase() : '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (event.target && event.target.isContentEditable) return;
+    act('expand', { col:colIndex });
+  }, true);
+
   listen(document, 'DOMContentLoaded', () => {
     let researchAnswerTimer = 0;
     let lastResearchAnswer = '';
@@ -12041,44 +13437,6 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
       if (!byId('neuralia-comp-controls')) mountControls();
     }).observe(document.documentElement, { childList:true, subtree:true });
 
-    // Uma fonte externa abre ao lado da conversa que a produziu.
-    listen(document, 'click', (event) => {
-      if (!event.isTrusted || event.defaultPrevented) return;
-      if (event.target && event.target.closest
-          && event.target.closest('#neuralia-comp-controls,#neuralia-palette')) return;
-      const anchor = event.target && event.target.closest
-        ? event.target.closest('a[href]') : null;
-      if (!anchor) return;
-
-      let target;
-      try { target = new URL(anchor.href, location.href); } catch (_) { return; }
-      if (target.protocol !== 'http:' && target.protocol !== 'https:') return;
-
-      // So o proprio dominio e os seus subdominios: 'evilgoogle.com' nao conta.
-      const host = target.hostname;
-      if ((host === 'google.com' || host.endsWith('.google.com')) && target.pathname === '/url') {
-        const actual = target.searchParams.get('q') || target.searchParams.get('url');
-        if (actual) {
-          try { target = new URL(actual); } catch (_) {}
-        }
-      }
-
-      if (target.hostname === location.hostname) return;
-      event.preventDefault();
-      event.stopPropagation();
-      act('split', { col:colIndex, url:target.href });
-    }, true);
-
-    listen(document, 'dblclick', (event) => {
-      if (!event.isTrusted || event.defaultPrevented) return;
-      if (event.target && event.target.closest
-          && event.target.closest('#neuralia-comp-controls,#neuralia-palette')) return;
-      const tag = event.target && event.target.tagName
-        ? event.target.tagName.toUpperCase() : '';
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-      if (event.target && event.target.isContentEditable) return;
-      act('expand', { col:colIndex });
-    }, true);
   });
 })();
 "#;
