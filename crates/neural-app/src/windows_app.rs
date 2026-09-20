@@ -3975,9 +3975,20 @@ impl App {
         });
         self.bar_hover = None;
         self.surface = Surface::Comparator;
+
+        // build_as_child nasce antes de self.comparator existir, portanto o
+        // primeiro layout feito durante a construcao nao pode passar pela
+        // rotina que tambem torna cada controller visivel. Reaplicar aqui e
+        // essencial: sem isto o WebView2 podia ficar branco ate um evento de
+        // rato provocar nova composicao.
+        self.needs_clear = true;
+        self.update_comparator_layout();
+        self.sync_comparator_splitters();
+        self.sync_comparator_buttons();
+        self.sync_exit_button();
+
         self.schedule_gmail_probe(4);
         self.begin_reading_session(false);
-        self.sync_comparator_splitters();
         self.request_redraw();
     }
 
@@ -10492,6 +10503,9 @@ mod tests {
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("chatgpt.com"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("claude.ai"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("button.click()"));
+        assert!(AI_AUTO_SUBMIT_SCRIPT.contains("form.requestSubmit"));
+        assert!(AI_AUTO_SUBMIT_SCRIPT.contains("lastSubmitAt"));
+        assert!(AI_AUTO_SUBMIT_SCRIPT.contains("setTimeout(submitWhenReady, 150)"));
     }
 
     #[test]
@@ -12623,43 +12637,106 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
     }
   }
 
+  // Reaviva o estado do framework quando o proprio ?q= desenhou texto no
+  // editor mas ainda nao habilitou o botao de envio.
+  function nudge(el) {
+    if (!el) return;
+    try {
+      el.dispatchEvent(new InputEvent('input', { bubbles:true, inputType:'insertText' }));
+    } catch (_) {
+      el.dispatchEvent(new Event('input', { bubbles:true }));
+    }
+    el.dispatchEvent(new Event('change', { bubbles:true }));
+  }
+
+  // Primeiro tenta o botao real. Se o fornecedor escondeu o botao mas o
+  // editor pertence a um form, requestSubmit() percorre o caminho nativo do
+  // formulario. O KeyboardEvent sintetico fica apenas como ultimo recurso:
+  // Chromium marca-o isTrusted=false e os fornecedores podem ignora-lo.
+  function submitEditor(el) {
+    const button = sendButton();
+    if (button) {
+      button.click();
+      return 'button';
+    }
+
+    const form = el && typeof el.closest === 'function' ? el.closest('form') : null;
+    if (form && typeof form.requestSubmit === 'function') {
+      try {
+        const submitter = form.querySelector(
+          'button[type="submit"]:not([disabled]), input[type="submit"]:not([disabled])'
+        );
+        if (submitter) form.requestSubmit(submitter);
+        else form.requestSubmit();
+        return 'form';
+      } catch (_) {}
+    }
+
+    el.focus();
+    for (const type of ['keydown', 'keypress', 'keyup']) {
+      el.dispatchEvent(new KeyboardEvent(type, {
+        key:'Enter', code:'Enter', keyCode:13, which:13,
+        bubbles:true, cancelable:true
+      }));
+    }
+    return 'keyboard';
+  }
+
   let attempts = 0;
   let filled = false;
+  let nudged = false;
+  let lastSubmitAt = 0;
+
   function submitWhenReady() {
     attempts += 1;
-    if (consumed()) return;
+
+    if (consumed()) {
+      stampWrite(stampKey, Date.now());
+      return;
+    }
+
     const el = editor();
+
+    // Depois de uma tentativa, o compositor vazio e o melhor reconhecimento
+    // transversal de que o site aceitou a pergunta. Nao ha novo clique.
+    if (lastSubmitAt && el && !textOf(el)) {
+      stampWrite(stampKey, Date.now());
+      return;
+    }
+
     if (el) {
-      // Dez tentativas (~1,5 s) a dar hipotese ao proprio site de preencher;
-      // passadas essas, escrevemos nos.
+      // Dez tentativas (~1,5 s) para o proprio site preencher o compositor.
+      // Depois disso escrevemos nos, caso ele ainda esteja vazio.
       if (!textOf(el) && !filled && attempts > 10) {
         fill(el);
         filled = true;
       }
+
       if (textOf(el)) {
-        const button = sendButton();
-        if (button) {
-          stampWrite(stampKey, Date.now());
-          button.click();
-          return;
+        // Um ?q= pode pintar a string sem acordar o estado React. Reemitir
+        // input/change uma vez deixa o botao real nascer/habilitar.
+        if (!nudged && attempts > 8) {
+          nudge(el);
+          nudged = true;
         }
-        // Sem botao utilizavel, Enter no editor e o caminho que estes sitios
-        // tambem aceitam.
-        if (attempts > 20) {
-          stampWrite(stampKey, Date.now());
-          el.focus();
-          for (const type of ['keydown', 'keypress', 'keyup']) {
-            el.dispatchEvent(new KeyboardEvent(type, { key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true, cancelable:true }));
-          }
-          return;
+
+        const now = Date.now();
+        // Nao martelar o endpoint enquanto uma submissao anterior ainda pode
+        // estar em voo. Se um Enter sintetico for ignorado, continuamos a
+        // observar e tentamos o botao/formulario assim que aparecer.
+        if (attempts > 10 && now - lastSubmitAt >= 2500) {
+          lastSubmitAt = now;
+          submitEditor(el);
         }
       }
     }
-    if (attempts < 120) {
+
+    if (attempts < 160) {
       setTimeout(submitWhenReady, 150);
       return;
     }
-    // Desistimos ao fim de ~18 s. Se fomos NOS a escrever e nunca chegou a ser
+
+    // Desistimos ao fim de ~24 s. Se fomos NOS a escrever e nunca chegou a ser
     // enviado, a pergunta nao pode ficar la a fingir que o utilizador a
     // escreveu.
     if (filled) clear(el || editor());

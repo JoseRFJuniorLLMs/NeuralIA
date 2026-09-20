@@ -41,6 +41,8 @@ jobs:
       # produto e não deve depender de um único sistema operativo para ter
       # cobertura.
       - run: cargo test --locked -p neural-app
+      - name: Exercise ChatGPT/Claude auto-submit runtime
+        run: node scripts/test-ai-auto-submit.mjs
       - run: cargo clippy --locked -p neural-core --all-targets -- -D warnings
       - run: cargo clippy --locked -p neural-app --all-targets -- -D warnings
 
@@ -57,6 +59,8 @@ jobs:
       - run: cargo check --locked --workspace
       - run: cargo test --locked -p neural-core
       - run: cargo test --locked -p neural-app
+      - name: Exercise ChatGPT/Claude auto-submit runtime
+        run: node scripts/test-ai-auto-submit.mjs
       - run: cargo clippy --locked -p neural-app --all-targets -- -D warnings
       - run: cargo build --locked -p neural-app --bin NeuralIA --release
       - name: Native Home performance regression gate
