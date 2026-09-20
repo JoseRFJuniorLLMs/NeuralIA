@@ -103,7 +103,6 @@ jobs:
           $plainPassword = "NeuralIA-CI-$env:GITHUB_RUN_ID"
           $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
           $pfxPath = Join-Path $env:RUNNER_TEMP "neuralia-ci-authenticode.pfx"
-          $cerPath = Join-Path $env:RUNNER_TEMP "neuralia-ci-authenticode.cer"
           $cert = $null
 
           try {
@@ -112,39 +111,51 @@ jobs:
 
             Write-Host "[authenticode-ci] exporting ephemeral certificate"
             Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $securePassword | Out-Null
-            Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
-
-            # Authenticode /pa requires a trusted chain. Use the PowerShell
-            # certificate provider rather than certutil: certutil's Root import
-            # can block on a headless runner, while Import-Certificate is
-            # non-interactive for the ephemeral CurrentUser stores used here.
-            Write-Host "[authenticode-ci] trusting ephemeral root"
-            Import-Certificate -FilePath $cerPath -CertStoreLocation "Cert:\CurrentUser\Root" | Out-Null
-            Write-Host "[authenticode-ci] trusting ephemeral publisher"
-            Import-Certificate -FilePath $cerPath -CertStoreLocation "Cert:\CurrentUser\TrustedPublisher" | Out-Null
 
             $env:NEURALIA_AUTHENTICODE_PFX_B64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($pfxPath))
             $env:NEURALIA_AUTHENTICODE_PFX_PASSWORD = $plainPassword
 
-            # CI proves our signing/verification path without depending on an
-            # external timestamp authority. Stable release omits -SkipTimestamp
-            # and therefore still requires an RFC3161 timestamp.
+            # A self-signed CI leaf deliberately has no public trust chain.
+            # We verify its cryptographic signature and expected thumbprint,
+            # while stable release still requires /pa trust + RFC3161 timestamp.
             Write-Host "[authenticode-ci] building and signing installer"
-            ./scripts/build-windows-installer.ps1 -ExePath ci-tested/NeuralIA.exe -Version $version -OutputDir signed-ci-installer -Sign -SkipTimestamp
+            ./scripts/build-windows-installer.ps1 -ExePath ci-tested/NeuralIA.exe -Version $version -OutputDir signed-ci-installer -Sign -SkipTimestamp -AllowUntrustedTestCertificate
             $installer = Get-ChildItem signed-ci-installer -Filter "NeuralIA-Setup-*-x64.exe" -File | Select-Object -First 1
             if (-not $installer) { throw "Signed CI installer was not produced." }
-            ./scripts/test-windows-installer.ps1 -InstallerPath $installer.FullName -ExpectedExePath ci-tested/NeuralIA.exe -ExpectedVersion $version -RequireValidSignature
+
+            # The signed setup must still install the exact CI-tested payload.
+            ./scripts/test-windows-installer.ps1 -InstallerPath $installer.FullName -ExpectedExePath ci-tested/NeuralIA.exe -ExpectedVersion $version
+
+            # Signature sabotage proof: flip one byte in the signed PE body.
+            # The verifier must reject HashMismatch/invalid signature even when
+            # untrusted test certificates are otherwise allowed.
+            $tampered = Join-Path $env:RUNNER_TEMP "NeuralIA-Setup-tampered.exe"
+            Copy-Item $installer.FullName $tampered
+            $bytes = [IO.File]::ReadAllBytes($tampered)
+            if ($bytes.Length -le 1024) { throw "Installer unexpectedly too small for signature sabotage." }
+            $bytes[1024] = $bytes[1024] -bxor 0x01
+            [IO.File]::WriteAllBytes($tampered, $bytes)
+
+            $signatureRejected = $false
+            try {
+              ./scripts/verify-windows-installer-signature.ps1 -InstallerPath $tampered -ExpectedThumbprint $cert.Thumbprint -AllowUntrustedTestCertificate
+            }
+            catch {
+              $signatureRejected = $true
+              Write-Host "Signature sabotage proof: tampered signed installer was rejected: $($_.Exception.Message)"
+            }
+            if (-not $signatureRejected) {
+              throw "Authenticode gate stayed green after the signed installer was tampered."
+            }
+            Remove-Item -LiteralPath $tampered -Force -ErrorAction SilentlyContinue
           }
           finally {
             $env:NEURALIA_AUTHENTICODE_PFX_B64 = $null
             $env:NEURALIA_AUTHENTICODE_PFX_PASSWORD = $null
             if ($cert) {
-              foreach ($store in @("My", "Root", "TrustedPublisher")) {
-                Remove-Item -LiteralPath ("Cert:\CurrentUser\$store\" + $cert.Thumbprint) -Force -ErrorAction SilentlyContinue
-              }
+              Remove-Item -LiteralPath ("Cert:\CurrentUser\My\" + $cert.Thumbprint) -Force -ErrorAction SilentlyContinue
             }
             Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $cerPath -Force -ErrorAction SilentlyContinue
           }
 
       - name: Prove installer gate rejects a substituted payload
