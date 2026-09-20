@@ -24,6 +24,9 @@ if (typeof Map.prototype.getOrInsertComputed !== 'function') {
     return value;
   };
 }
+if (typeof Math.sumPrecise !== 'function') {
+  Math.sumPrecise = values => Array.from(values).reduce((sum, value) => sum + value, 0);
+}
 const pdfjsLib = await import('../assets/pdfjs/pdf.mjs');
 
 const pdfjsRoot = fileURLToPath(new URL('../assets/pdfjs/', import.meta.url));
@@ -42,6 +45,40 @@ function base(name) {
     return missing;
   }
   return dir;
+}
+
+function resolvedObject(objects, id, timeoutMs = 3000) {
+  if (objects.has(id)) return Promise.resolve(objects.get(id));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error('objeto de imagem não resolvido: ' + id)),
+      timeoutMs
+    );
+    objects.get(id, value => {
+      clearTimeout(timer);
+      resolve(value);
+    });
+  });
+}
+
+async function requireDecodedImages(page, operators, caseName) {
+  const ids = [];
+  for (let i = 0; i < operators.fnArray.length; i++) {
+    if (operators.fnArray[i] === pdfjsLib.OPS.paintImageXObject) {
+      const id = operators.argsArray[i]?.[0];
+      if (typeof id === 'string') ids.push(id);
+    }
+  }
+  assert.ok(ids.length > 0, caseName + ': fixture não possui paintImageXObject');
+  for (const id of ids) {
+    const image = await resolvedObject(page.objs, id);
+    assert.ok(image, caseName + ': imagem decodificada ausente: ' + id);
+    assert.ok(
+      Number.isFinite(image.width) && image.width > 0 &&
+      Number.isFinite(image.height) && image.height > 0,
+      caseName + ': imagem decodificada sem dimensões válidas: ' + id
+    );
+  }
 }
 
 const cases = [
@@ -78,6 +115,9 @@ for (const [name, file] of cases) {
     const page = await doc.getPage(pageNumber);
     const operators = await page.getOperatorList();
     assert.ok(operators.fnArray.length > 0, name + ': operator list vazia');
+    if (name === 'jpx' || name === 'jbig2') {
+      await requireDecodedImages(page, operators, name);
+    }
     await page.getTextContent();
     page.cleanup();
   }
