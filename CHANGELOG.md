@@ -44,7 +44,8 @@ All notable changes to NeuralIA are documented here.
 - **PR #66 — o visualizador PDF fecha o overlay de carregamento de forma determinística.**
   `hidden` deixa de depender da precedência de `#status { display:grid }`: o
   viewer controla também `display` diretamente. Erros HTTP/PDF passam a usar
-  as classes exportadas pelo PDF.js antes do fallback textual.
+  as classes exportadas pelo PDF.js antes do fallback textual, e documentos
+  protegidos por senha deixam de ser rotulados incorretamente como PDF inválido.
 - **PR #57 — o divisor nativo do comparador volta a receber o rato.** A janela
   `STATIC` do splitter devolvia `HTTRANSPARENT` no `WM_NCHITTEST`, portanto
   `WM_LBUTTONDOWN`/`WM_MOUSEMOVE` nunca chegavam à subclasse e toda a lógica de
