@@ -13,7 +13,7 @@ function scenario(host, { formAfter = 0, buttonAfter = Number.POSITIVE_INFINITY 
     ? 'https://chatgpt.com/?q=pergunta+de+regressao&hints=search'
     : 'https://claude.ai/new?q=pergunta+de+regressao';
   let tick = 0;
-  let now = 0;
+  let now = 20000;
   let clicks = 0;
   let formSubmits = 0;
   let syntheticEnter = 0;

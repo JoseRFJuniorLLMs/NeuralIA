@@ -156,6 +156,9 @@ enum UserEvent {
     /// `RESIZE_*`, nao do evento: assim os movimentos que chegam enquanto
     /// este esta na fila substituem-se uns aos outros em vez de se somarem.
     ResizeComparator,
+    /// Reaplica a geometria depois de o Windows terminar a transicao
+    /// assíncrona para a janela sem decoracao. Nao depende de rato/teclado.
+    RelayoutComparator,
     RestoreComparator,
     ExitRequested,
     ReaderReady {
@@ -198,6 +201,10 @@ const AUTO_SCROLL_PROMPT_SECONDS: u64 = 20;
 /// Quanto tempo a barra fica visivel em ecra completo depois do ultimo
 /// movimento do rato no topo.
 const CHROME_HIDE_DELAY_MS: u64 = 2500;
+/// A moldura Win32 pode mudar o client rect um ciclo depois de
+/// set_decorations(false). Fazemos dois relayouts baratos para nao deixar
+/// WebViews presos na geometria anterior ate o primeiro movimento do rato.
+const COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS: [u64; 2] = [40, 220];
 /// Quanto tempo o aviso de correio novo fica no canto.
 const GMAIL_TOAST_SECONDS: u64 = 7;
 /// Quantas entradas do historico a caixa "history:" mostra.
@@ -3987,6 +3994,13 @@ impl App {
         self.sync_comparator_buttons();
         self.sync_exit_button();
 
+        for delay_ms in COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS {
+            self.timers.after(
+                Duration::from_millis(delay_ms),
+                UserEvent::RelayoutComparator,
+            );
+        }
+
         self.schedule_gmail_probe(4);
         self.begin_reading_session(false);
         self.request_redraw();
@@ -7157,6 +7171,16 @@ impl ApplicationHandler<UserEvent> for App {
                         RESIZE_DIVIDER.load(Ordering::Acquire),
                         RESIZE_X.load(Ordering::Acquire),
                     );
+                }
+            }
+            UserEvent::RelayoutComparator => {
+                if self.surface == Surface::Comparator {
+                    self.needs_clear = true;
+                    self.update_comparator_layout();
+                    self.sync_comparator_splitters();
+                    self.sync_comparator_buttons();
+                    self.sync_exit_button();
+                    self.request_redraw();
                 }
             }
             UserEvent::RestoreComparator => {
@@ -10782,6 +10806,16 @@ mod tests {
             .expect("limpa a marca");
         let read = handler.find("RESIZE_X.load(").expect("le a posicao");
         assert!(cleared < read);
+    }
+
+    #[test]
+    fn first_comparator_layout_retries_without_waiting_for_mouse_input() {
+        assert_eq!(COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS.len(), 2);
+        assert!(COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS[0] > 0);
+        assert!(
+            COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS[1]
+                > COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS[0]
+        );
     }
 
     #[test]
