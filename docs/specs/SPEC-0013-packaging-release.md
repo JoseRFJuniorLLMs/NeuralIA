@@ -58,8 +58,10 @@ from the measured payload:
   `NEURALIA_AUTHENTICODE_PFX_PASSWORD` are configured. If neither exists,
   the installer asset is omitted and the existing executable release remains
   valid. If exactly one exists, packaging fails closed;
-- PR CI exercises the Authenticode sign/verify path with an ephemeral trusted
-  code-signing certificate but skips the external timestamp authority, so a
+- PR CI exercises the Authenticode sign/verify path with an ephemeral
+  self-signed code-signing certificate. It verifies the cryptographic
+  signature and expected signer thumbprint while allowing only the expected
+  trust-chain failure, and skips the external timestamp authority so a
   third-party outage cannot turn the product gate red;
 - stable release signing does **not** skip timestamping: it uses an RFC3161
   SHA-256 timestamp before `signtool verify /pa`, PowerShell Authenticode
