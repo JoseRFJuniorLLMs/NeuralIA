@@ -96,22 +96,33 @@ impl LocalIntelligence for HashingLocalIntelligence {
             return Ok(clean);
         }
 
+        // A elipse também consome budget. Reservá-la antes de escolher frases
+        // evita que um resumo que caiba exactamente no limite cresça um
+        // carácter ao indicar truncamento.
+        let content_budget = budget.saturating_sub(1);
         let mut output = String::new();
+        let mut used = 0usize;
         for sentence in clean.split_inclusive(['.', '!', '?']) {
-            if !output.is_empty() {
-                output.push(' ');
+            let sentence = sentence.trim();
+            if sentence.is_empty() {
+                continue;
             }
-            if output.chars().count() + sentence.chars().count() > budget {
+            let sentence_chars = sentence.chars().count();
+            let separator = usize::from(!output.is_empty());
+            if used + separator + sentence_chars > content_budget {
                 break;
             }
-            output.push_str(sentence.trim());
+            if separator != 0 {
+                output.push(' ');
+                used += 1;
+            }
+            output.push_str(sentence);
+            used += sentence_chars;
         }
         if output.is_empty() {
-            output = clean.chars().take(budget.saturating_sub(1)).collect();
+            output = clean.chars().take(content_budget).collect();
         }
-        if output.chars().count() < clean.chars().count() {
-            output.push('…');
-        }
+        output.push('…');
         Ok(output)
     }
 }
@@ -506,6 +517,10 @@ fn validate_pack_component(value: &str) -> Result<(), String> {
         || value.contains("..")
         || value.contains('/')
         || value.contains('\\')
+        // Um componente de model pack é também um nome de ficheiro Windows.
+        // ':' fecha tanto caminhos drive-relative (C:foo), que Path::is_absolute
+        // não apanha, como alternate data streams (model.bin:stream).
+        || value.contains(':')
     {
         return Err("caminho inválido no model pack".to_string());
     }
@@ -568,6 +583,36 @@ mod tests {
         let entities = ai.entities("NeuralIA usa WebView2 e AVX-512").unwrap();
         assert!(entities.iter().any(|item| item == "NeuralIA"));
         assert!(entities.iter().any(|item| item == "WebView2"));
+    }
+
+    #[test]
+    fn summary_never_exceeds_character_budget() {
+        let ai = HashingLocalIntelligence;
+        let input = "Um. Dois. Três. Quatro com mais texto.";
+
+        for budget in 0..=input.chars().count() {
+            let summary = ai.summarize(input, budget).unwrap();
+            assert!(
+                summary.chars().count() <= budget,
+                "budget={budget}, summary={summary:?}, chars={}",
+                summary.chars().count()
+            );
+        }
+
+        assert_eq!(ai.summarize(input, 1).unwrap(), "…");
+        assert_eq!(ai.summarize(input, 3).unwrap(), "Um…");
+    }
+
+    #[test]
+    fn model_pack_components_reject_windows_drive_and_stream_syntax() {
+        for value in ["C:foo", "c:model.bin", "model.bin:stream"] {
+            assert!(
+                validate_pack_component(value).is_err(),
+                "{value:?} must not escape Windows model-pack roots"
+            );
+        }
+        assert!(validate_pack_component("model.bin").is_ok());
+        assert!(validate_pack_component("semantic-small").is_ok());
     }
 
     #[test]
