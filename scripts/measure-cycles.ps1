@@ -146,14 +146,51 @@ public static class NeuraliaCycleWindowProbe {
         var message = RegisterWindowMessage("NeuralIA.LifecycleProbe.Home");
         if (message == 0) return false;
 
-        // A janela externa pode trocar de HWND quando o comparador alterna a
-        // decoração. O EDIT da omnibox mantém a sua subclass/proxy e é o
-        // transporte estável para o comando Home do probe.
-        var edit = FindWindowEx(parent, IntPtr.Zero, "Edit", null);
-        if (edit != IntPtr.Zero && PostMessage(edit, message, IntPtr.Zero, IntPtr.Zero)) {
+        uint processId;
+        GetWindowThreadProcessId(parent, out processId);
+        if (processId == 0) return false;
+
+        // Alternar a decoração do comparador pode substituir/reparentar o HWND
+        // externo. Não confie no "main window" escolhido pelo runner: procure o
+        // EDIT da omnibox em TODAS as janelas top-level do processo, inclusive
+        // as temporariamente ocultas, e entregue a mensagem à sua subclass.
+        // Isso só melhora o transporte do probe; o sucesso do gate continua
+        // exigindo externamente zero hosts WRY_WEBVIEW depois de HomeRequested.
+        bool postedToEdit = false;
+        var editClass = new StringBuilder(128);
+        EnumWindows(delegate(IntPtr top, IntPtr data) {
+            uint ownerPid;
+            GetWindowThreadProcessId(top, out ownerPid);
+            if (ownerPid != processId) return true;
+
+            EnumChildWindows(top, delegate(IntPtr child, IntPtr childData) {
+                editClass.Clear();
+                GetClassName(child, editClass, editClass.Capacity);
+                if (string.Equals(editClass.ToString(), "Edit", StringComparison.Ordinal)) {
+                    if (PostMessage(child, message, IntPtr.Zero, IntPtr.Zero)) {
+                        postedToEdit = true;
+                    }
+                }
+                return true;
+            }, IntPtr.Zero);
             return true;
-        }
-        return PostMessage(parent, message, IntPtr.Zero, IntPtr.Zero);
+        }, IntPtr.Zero);
+
+        if (postedToEdit) return true;
+
+        // Fallback para a subclass da janela externa quando a omnibox ainda não
+        // foi criada/reparentada. Poste para todas as top-level do processo, não
+        // apenas para o HWND que por acaso tinha a maior área naquele instante.
+        bool postedToWindow = false;
+        EnumWindows(delegate(IntPtr top, IntPtr data) {
+            uint ownerPid;
+            GetWindowThreadProcessId(top, out ownerPid);
+            if (ownerPid == processId && PostMessage(top, message, IntPtr.Zero, IntPtr.Zero)) {
+                postedToWindow = true;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return postedToWindow;
     }
 
     public static bool ReturnHomeViaNativeEscape(IntPtr parent) {
@@ -415,9 +452,9 @@ try {
             break
         }
 
-        # Envia Escape diretamente ao EDIT nativo da omnibox. O controlo pode
-        # estar oculto sob o comparador, mas a sua subclass é o caminho real do
-        # produto: WM_KEYDOWN(ESC) -> HomeRequested -> show_home().
+        # Entrega a mensagem registada ao EDIT nativo da omnibox em qualquer
+        # top-level pertencente ao processo. A subclass da omnibox converte-a
+        # em HomeRequested; a validação abaixo continua exigindo teardown real.
         Return-LifecycleProbeHome -Process $process
 
         # build_as_child torna o HWND WRY_WEBVIEW visivel antes de o pump
