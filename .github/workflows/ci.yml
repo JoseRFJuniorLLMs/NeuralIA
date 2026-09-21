@@ -34,15 +34,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
         with:
           components: clippy,rustfmt
-      # Gate normativo do AGENTS.md. Manter estes três comandos literais:
-      # mudar para equivalentes por pacote volta a esconder divergências do workspace.
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo test --locked -p neural-core
+      # O parser do canal IPC (SPEC-0108) é portátil: compila e é testado aqui
+      # também, não só no runner Windows. É a superfície mais sensível do
+      # produto e não deve depender de um único sistema operativo para ter
+      # cobertura.
+      - run: cargo test --locked -p neural-app
       - name: Exercise ChatGPT/Claude auto-submit runtime
         run: node scripts/test-ai-auto-submit.mjs
       - name: Verify release asset contract
         run: node scripts/test-release-contract.mjs
+      - run: cargo clippy --locked -p neural-core --all-targets -- -D warnings
+      - run: cargo clippy --locked -p neural-app --all-targets -- -D warnings
 
   windows:
     runs-on: windows-latest
@@ -54,6 +58,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
         with:
           components: clippy,rustfmt
+      # Gate normativo do AGENTS.md precisa do runner Windows porque
+      # neural-setup e a aplicação Win32 fazem parte do workspace.
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
       - run: cargo check --locked --workspace
       - run: cargo test --locked -p neural-core
       - run: cargo test --locked -p neural-app
