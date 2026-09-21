@@ -209,7 +209,7 @@ const COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS: [u64; 2] = [40, 220];
 /// WebView2 pode tornar o HWND filho visível outra vez enquanto conclui uma
 /// navegação iniciada imediatamente antes de regressarmos à Home. Reafirmamos
 /// o estado estacionado durante a curta janela em que isso pode acontecer.
-const HOME_PARK_REHIDE_DELAYS_MS: [u64; 4] = [40, 220, 750, 1500];
+const HOME_PARK_REHIDE_DELAYS_MS: [u64; 8] = [40, 220, 750, 1500, 3000, 6000, 12000, 18000];
 /// Quanto tempo o aviso de correio novo fica no canto.
 const GMAIL_TOAST_SECONDS: u64 = 7;
 /// Quantas entradas do historico a caixa "history:" mostra.
