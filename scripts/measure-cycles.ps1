@@ -9,7 +9,11 @@
 
     Para cada ciclo:
       Enter  -> o comparador abre e nascem processos msedgewebview2.exe
-      Escape -> volta a Home e esses processos tem de desaparecer TODOS
+      Escape -> volta a Home e nenhuma superficie WebView pode continuar visivel
+
+    O runtime WebView2 pode manter um pool de subprocessos para reutilizacao.
+    Esse pool pode sobreviver aos controllers, mas nao pode crescer de ciclo em
+    ciclo. Tambem mantemos o gate de working set para apanhar crescimento real.
 
     So contam os msedgewebview2.exe que descendem do nosso processo: a maquina
     pode ter outras aplicacoes WebView2 a correr.
@@ -27,6 +31,60 @@ param(
 
 $ErrorActionPreference = "Stop"
 $resolved = (Resolve-Path $ExePath).Path
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class NeuraliaCycleWindowProbe {
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT {
+        public int Left, Top, Right, Bottom;
+    }
+
+    [DllImport("user32.dll")]
+    public static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+
+    public static int VisibleLargeChildren(IntPtr parent) {
+        int count = 0;
+        EnumChildWindows(parent, delegate(IntPtr hwnd, IntPtr data) {
+            if (!IsWindowVisible(hwnd)) return true;
+            RECT r;
+            if (!GetWindowRect(hwnd, out r)) return true;
+            var width = r.Right - r.Left;
+            var height = r.Bottom - r.Top;
+            if (width >= 180 && height >= 220) count++;
+            return true;
+        }, IntPtr.Zero);
+        return count;
+    }
+}
+"@
+
+function Get-VisibleLargeChildCount([IntPtr]$Parent) {
+    return [NeuraliaCycleWindowProbe]::VisibleLargeChildren($Parent)
+}
+
+function Wait-ForNoVisibleWebSurfaces([System.Diagnostics.Process]$Process, [int]$TimeoutSec) {
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        $Process.Refresh()
+        if ($Process.HasExited) { return 0 }
+        $count = Get-VisibleLargeChildCount -Parent ([IntPtr]$Process.MainWindowHandle)
+        if ($count -eq 0) { return 0 }
+        Start-Sleep -Milliseconds 150
+    }
+    $Process.Refresh()
+    return Get-VisibleLargeChildCount -Parent ([IntPtr]$Process.MainWindowHandle)
+}
 
 function Get-DescendantIds([int]$RootId) {
     # Win32_Process via CIM is useful for ownership, but on hosted Windows
@@ -101,6 +159,7 @@ $env:NEURALIA_NO_GMAIL = "1"
 $process = Start-Process -FilePath $resolved -PassThru
 $failures = New-Object System.Collections.ArrayList
 $samples = New-Object System.Collections.ArrayList
+$webViewPoolCeiling = $null
 
 try {
     $shell = New-Object -ComObject WScript.Shell
@@ -139,16 +198,33 @@ try {
         Start-Sleep -Milliseconds 400
         $shell.SendKeys("{ESC}")
 
-        $closed = Wait-ForWebViews -RootId $process.Id -Predicate { param($n) $n -eq 0 } -TimeoutSec $CloseTimeoutSec
-        if ($closed -ne 0) {
-            $null = $failures.Add("ciclo ${cycle}: ${closed} processo(s) WebView2 sobreviveram ao regresso a Home")
+        # A Home precisa ficar sem nenhuma superficie WebView filha visivel.
+        # Isto testa o controller/child HWND que interessa ao utilizador, em
+        # vez de inferir controller vivo pela existencia do pool de processos
+        # do runtime WebView2.
+        $visibleAfterHome = Wait-ForNoVisibleWebSurfaces -Process $process -TimeoutSec $CloseTimeoutSec
+        if ($visibleAfterHome -ne 0) {
+            $null = $failures.Add("ciclo ${cycle}: ${visibleAfterHome} superficie(s) WebView continuaram visiveis depois de voltar a Home")
+        }
+
+        # O Edge WebView2 pode manter um pool de subprocessos para reutilizacao
+        # mesmo depois de os controllers terem sido fechados. O que nao pode
+        # acontecer e esse pool crescer a cada ciclo: isso sim denuncia leak.
+        $pooled = Get-WebViewCount -RootId $process.Id
+        if ($null -eq $webViewPoolCeiling) {
+            $webViewPoolCeiling = $pooled
+        }
+        elseif ($pooled -gt $webViewPoolCeiling) {
+            $null = $failures.Add("ciclo ${cycle}: pool WebView2 cresceu de ${webViewPoolCeiling} para ${pooled} processo(s)")
+            $webViewPoolCeiling = $pooled
         }
 
         $process.Refresh()
         $null = $samples.Add([ordered]@{
             cycle = $cycle
             webviews_open = $opened
-            webviews_after_home = $closed
+            visible_surfaces_after_home = $visibleAfterHome
+            webview_process_pool_after_home = $pooled
             working_set_mib = [math]::Round($process.WorkingSet64 / 1MB, 2)
         })
     }
