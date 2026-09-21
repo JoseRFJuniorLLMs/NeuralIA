@@ -240,9 +240,17 @@ function Return-LifecycleProbeHome([System.Diagnostics.Process]$Process) {
     }
     $parent = Get-CurrentMainWindow -Process $Process
     if ($parent -eq [IntPtr]::Zero) { throw "Janela principal atual do NeuralIA não foi encontrada." }
-    $ok = [NeuraliaCycleWindowProbe]::RequestLifecycleProbeHome($parent)
+
+    # Exercita primeiro o caminho real do produto: ESC no EDIT nativo da
+    # omnibox -> omnibox_subclass -> HomeRequested -> show_home(). A mensagem
+    # privada fica apenas como fallback para runners onde o HWND do EDIT ainda
+    # está sendo reparentado durante a transição de decoração.
+    $ok = [NeuraliaCycleWindowProbe]::ReturnHomeViaNativeEscape($parent)
     if (-not $ok) {
-        throw "Falhou ao enfileirar o comando Win32 de retorno à Home."
+        $ok = [NeuraliaCycleWindowProbe]::RequestLifecycleProbeHome($parent)
+    }
+    if (-not $ok) {
+        throw "Falhou ao enfileirar o retorno nativo à Home."
     }
 }
 
