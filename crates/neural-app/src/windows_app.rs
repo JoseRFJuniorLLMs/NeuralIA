@@ -3126,17 +3126,70 @@ impl App {
         self.reading_pdf = false;
     }
 
+    fn park_comparator_for_home(&mut self) -> bool {
+        if self.comparator.is_none() {
+            return false;
+        }
+        if lifecycle_probe_enabled() {
+            LIFECYCLE_COMPARATOR_READY.store(false, Ordering::Release);
+        }
+
+        self.mark_dirty();
+        self.close_palette();
+        self.finish_agent(AgentTermination::UserStopped);
+
+        // Home não precisa destruir os três controllers do comparador. Mantê-los
+        // vivos e invisíveis evita reconstruir três WebViews em sequência na
+        // pesquisa seguinte, operação que pode manter o WebView2 num pump Win32
+        // aninhado. O caminho de reuso de open_comparator() navega e reapresenta
+        // exatamente estes controllers.
+        if let Some(comparator) = &mut self.comparator {
+            for view in &comparator.views {
+                let _ = view.webview.set_visible(false);
+                let _ = view.webview.focus_parent();
+            }
+            if let Some(split) = comparator.split.take() {
+                let _ = split.webview.set_visible(false);
+                let _ = split.webview.focus_parent();
+                drop(split);
+            }
+            comparator.expanded = None;
+            comparator.minimized = [false; COMPARATOR_COLUMNS];
+            comparator.weights = [1.0; COMPARATOR_COLUMNS];
+        }
+
+        if let Some(button) = self.exit_button.take() {
+            unsafe {
+                DestroyWindow(button);
+            }
+        }
+        for splitter in &mut self.splitters {
+            if let Some(hwnd) = splitter.take() {
+                unsafe {
+                    DestroyWindow(hwnd);
+                }
+            }
+        }
+
+        self.leave_fullscreen();
+        if let Some(window) = &self.window {
+            window.set_decorations(true);
+        }
+        self.ensure_window_subclass();
+        true
+    }
+
     fn show_home(&mut self) {
         self.next_generation();
-
-        // Home é um estado sem superfícies web. Destruir os controllers aqui é
-        // deliberadamente mais forte do que apenas estacioná-los: navegações
-        // tardias do WebView2 podem voltar a tornar os hosts WRY_WEBVIEW
-        // visíveis depois de set_visible(false), deixando a Home coberta pelos
-        // painéis até outra mensagem de janela. O próximo Compare cria um trio
-        // novo e o gate de lifecycle exercita essa recriação repetidamente.
         self.surface = Surface::Home;
-        self.destroy_web_surfaces();
+
+        // O comparador é estacionado para que a próxima pesquisa reutilize os
+        // mesmos controllers. Outras superfícies continuam sendo destruídas,
+        // porque não possuem um caminho de reuso equivalente.
+        if !self.park_comparator_for_home() {
+            self.destroy_web_surfaces();
+        }
+
         self.bar_hover = None;
         self.status = None;
         self.next_home_frame = Instant::now();
