@@ -10879,7 +10879,12 @@ mod tests {
         assert!(COMPARATOR_INJECT_SCRIPT.contains("listen(window, 'auxclick'"));
         assert!(COMPARATOR_INJECT_SCRIPT.contains("event.composedPath"));
         assert!(COMPARATOR_INJECT_SCRIPT.contains("event.stopImmediatePropagation()"));
-        assert!(!COMPARATOR_INJECT_SCRIPT.contains("event.defaultPrevented) return"));
+        let route_link = COMPARATOR_INJECT_SCRIPT
+            .split("function routeLink")
+            .nth(1)
+            .and_then(|part| part.split("listen(window, 'click'").next())
+            .expect("routeLink body");
+        assert!(!route_link.contains("event.defaultPrevented"));
         // O botao do meio chega como `auxclick`; dentro de `click` o
         // `event.button` e sempre 0. Ter isto aqui e presenca, nao
         // comportamento -- o que decide para onde vai o clique esta em
