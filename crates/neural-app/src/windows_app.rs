@@ -159,8 +159,6 @@ enum UserEvent {
     /// Reaplica a geometria depois de o Windows terminar a transicao
     /// assíncrona para a janela sem decoracao. Nao depende de rato/teclado.
     RelayoutComparator,
-    /// Confirma que o winit voltou ao pump normal depois de construir o comparador.
-    LifecycleProbeReady,
     RestoreComparator,
     ExitRequested,
     ReaderReady {
@@ -7372,11 +7370,6 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_comparator_buttons();
                     self.sync_exit_button();
                     self.request_redraw();
-                }
-            }
-            UserEvent::LifecycleProbeReady => {
-                if lifecycle_probe_enabled() && self.surface == Surface::Comparator {
-                    LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
                 }
             }
             UserEvent::RestoreComparator => {
