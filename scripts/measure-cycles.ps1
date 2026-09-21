@@ -36,6 +36,9 @@ param(
 $ErrorActionPreference = "Stop"
 $resolved = (Resolve-Path $ExePath).Path
 
+# Os comandos Home/Reopen usam RegisterWindowMessage no processo do gate e
+# no NeuralIA. Isso evita colisões com IDs privados de WM_APP usados por
+# winit/WRY/WebView2 e mantém o transporte independente de foco/teclado.
 Add-Type @"
 using System;
 using System.Collections.Generic;
