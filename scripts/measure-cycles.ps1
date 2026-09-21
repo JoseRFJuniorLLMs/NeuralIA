@@ -224,6 +224,22 @@ public static class NeuraliaCycleWindowProbe {
         );
         return sent != IntPtr.Zero && result != IntPtr.Zero;
     }
+
+    public static bool LifecycleProbeHomeReady(IntPtr parent) {
+        var message = RegisterWindowMessage("NeuralIA.LifecycleProbe.HomeReady");
+        if (message == 0) return false;
+        IntPtr result;
+        var sent = SendMessageTimeout(
+            parent,
+            message,
+            IntPtr.Zero,
+            IntPtr.Zero,
+            0x0002,
+            500,
+            out result
+        );
+        return sent != IntPtr.Zero && result != IntPtr.Zero;
+    }
 }
 "@
 
@@ -336,6 +352,23 @@ function Wait-ForLifecycleProbeReady([System.Diagnostics.Process]$Process, [int]
             $stableSince = $null
         }
 
+        Start-Sleep -Milliseconds 100
+    }
+    return $false
+}
+
+function Wait-ForLifecycleProbeHomeReady([System.Diagnostics.Process]$Process, [int]$TimeoutSec) {
+    # Zero hosts WRY prova o teardown. Este segundo handshake prova que a
+    # transição de decorations/HWND da Home também terminou antes do próximo
+    # reopen. Sem ele o ciclo 2 podia começar dentro do teardown do ciclo 1.
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        $Process.Refresh()
+        if ($Process.HasExited) { return $false }
+        $main = Get-NeuraliaMainWindow -Process $Process
+        if ($main -ne [IntPtr]::Zero -and [NeuraliaCycleWindowProbe]::LifecycleProbeHomeReady($main)) {
+            return $true
+        }
         Start-Sleep -Milliseconds 100
     }
     return $false
@@ -474,6 +507,10 @@ try {
         # controller/host esta oculto, portanto nao servem como autoridade.
         if ($visibleAfterHome -ne 0) {
             $null = $failures.Add("ciclo ${cycle}: ${visibleAfterHome} superficie(s) WebView continuaram visiveis depois de voltar a Home")
+        }
+        elseif (-not (Wait-ForLifecycleProbeHomeReady -Process $process -TimeoutSec $CloseTimeoutSec)) {
+            $null = $failures.Add("ciclo ${cycle}: Home ficou sem WebViews, mas nao concluiu a restauracao do HWND/decorations")
+            break
         }
 
         # Mede memoria no estado Home, nao no meio da abertura seguinte.
