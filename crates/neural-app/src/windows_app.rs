@@ -1404,9 +1404,7 @@ unsafe extern "system" fn window_subclass(
     let lifecycle_reopen = lifecycle_probe_reopen_message();
     let lifecycle_ready = lifecycle_probe_ready_message();
     if message == lifecycle_ready {
-        return if lifecycle_probe_enabled()
-            && LIFECYCLE_COMPARATOR_READY.load(Ordering::Acquire)
-        {
+        return if lifecycle_probe_enabled() && LIFECYCLE_COMPARATOR_READY.load(Ordering::Acquire) {
             1
         } else {
             0
