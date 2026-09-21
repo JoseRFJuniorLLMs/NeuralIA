@@ -159,7 +159,6 @@ enum UserEvent {
     /// Reaplica a geometria depois de o Windows terminar a transicao
     /// assíncrona para a janela sem decoracao. Nao depende de rato/teclado.
     RelayoutComparator,
-    RehideParkedComparator(u64),
     RestoreComparator,
     ExitRequested,
     ReaderReady {
@@ -206,10 +205,6 @@ const CHROME_HIDE_DELAY_MS: u64 = 2500;
 /// set_decorations(false). Fazemos dois relayouts baratos para nao deixar
 /// WebViews presos na geometria anterior ate o primeiro movimento do rato.
 const COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS: [u64; 2] = [40, 220];
-/// WebView2 pode tornar o HWND filho visível outra vez enquanto conclui uma
-/// navegação iniciada imediatamente antes de regressarmos à Home. Reafirmamos
-/// o estado estacionado durante a curta janela em que isso pode acontecer.
-const HOME_PARK_REHIDE_DELAYS_MS: [u64; 8] = [40, 220, 750, 1500, 3000, 6000, 12000, 18000];
 /// Quanto tempo o aviso de correio novo fica no canto.
 const GMAIL_TOAST_SECONDS: u64 = 7;
 /// Quantas entradas do historico a caixa "history:" mostra.
@@ -3124,104 +3119,23 @@ impl App {
         self.reading_pdf = false;
     }
 
-    /// Volta à Home sem destruir o trio do comparador. WebView2 pode bloquear
-    /// o event loop ao criar repetidamente novos controllers no mesmo processo;
-    /// esconder e reutilizar os três existentes evita essa recriação, preserva
-    /// o perfil/sessão e deixa a Home sem nenhuma superfície web visível.
-    fn park_comparator_for_home(&mut self) {
-        if lifecycle_probe_enabled() {
-            LIFECYCLE_COMPARATOR_READY.store(false, Ordering::Release);
-        }
-        self.mark_dirty();
-        self.close_palette();
-        self.finish_agent(AgentTermination::UserStopped);
-        self.leave_fullscreen();
-        if let Some(window) = &self.window {
-            window.set_decorations(true);
-        }
-        self.ensure_window_subclass();
-        if let Some(button) = self.exit_button.take() {
-            unsafe {
-                DestroyWindow(button);
-            }
-        }
-        for splitter in &mut self.splitters {
-            if let Some(hwnd) = splitter.take() {
-                unsafe {
-                    DestroyWindow(hwnd);
-                }
-            }
-        }
-        if let Some(comparator) = &mut self.comparator {
-            if let Some(split) = comparator.split.take() {
-                let _ = split.webview.set_visible(false);
-                let _ = split.webview.focus_parent();
-                drop(split);
-            }
-            comparator.expanded = None;
-            comparator.minimized = [false; COMPARATOR_COLUMNS];
-            comparator.weights = [1.0; COMPARATOR_COLUMNS];
-            for view in &comparator.views {
-                let _ = view.webview.set_visible(false);
-                let _ = view.webview.focus_parent();
-            }
-        }
-        // WebView2 pode reexibir o HWND hospedeiro enquanto conclui uma
-        // navegação iniciada pouco antes da Home. O controller já foi marcado
-        // invisível acima; reafirmar SW_HIDE no host Win32 fecha essa corrida
-        // sem destruir o pool/sessão que queremos reutilizar.
-        if let Some(window) = &self.window {
-            hide_native_wry_webview_hosts(window);
-        }
-    }
-
     fn show_home(&mut self) {
-        let generation = self.next_generation();
-        let park_comparator = self.surface == Surface::Comparator && self.comparator.is_some();
+        self.next_generation();
 
-        // Muda o estado ANTES de restaurar a decoração da janela ou esconder
-        // os WebViews. set_decorations(true) pode bombear mensagens e entregar
-        // Resized de forma reentrante; se ainda parecermos estar no Comparator,
-        // esse handler reaplica o layout e torna os três controllers visíveis
-        // outra vez logo depois de os escondermos.
+        // Home é um estado sem superfícies web. Destruir os controllers aqui é
+        // deliberadamente mais forte do que apenas estacioná-los: navegações
+        // tardias do WebView2 podem voltar a tornar os hosts WRY_WEBVIEW
+        // visíveis depois de set_visible(false), deixando a Home coberta pelos
+        // painéis até outra mensagem de janela. O próximo Compare cria um trio
+        // novo e o gate de lifecycle exercita essa recriação repetidamente.
         self.surface = Surface::Home;
-        if park_comparator {
-            self.park_comparator_for_home();
-            for delay_ms in HOME_PARK_REHIDE_DELAYS_MS {
-                self.timers.after(
-                    Duration::from_millis(delay_ms),
-                    UserEvent::RehideParkedComparator(generation),
-                );
-            }
-        } else {
-            self.destroy_web_surfaces();
-        }
+        self.destroy_web_surfaces();
         self.bar_hover = None;
         self.status = None;
         self.next_home_frame = Instant::now();
         self.show_omnibox(true);
         self.position_omnibox();
         self.request_redraw();
-    }
-
-    fn rehide_parked_comparator(&self, generation: u64) {
-        if generation != self.current_generation() || self.surface != Surface::Home {
-            return;
-        }
-        let Some(comparator) = &self.comparator else {
-            return;
-        };
-        for view in &comparator.views {
-            let _ = view.webview.set_visible(false);
-        }
-        if let Some(split) = &comparator.split {
-            let _ = split.webview.set_visible(false);
-        }
-        if let Some(window) = &self.window {
-            hide_native_wry_webview_hosts(window);
-        }
-        self.hide_comparator_splitters();
-        self.hide_exit_button();
     }
 
     fn show_native_error(&mut self, message: impl Into<String>) {
@@ -7429,9 +7343,6 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_exit_button();
                     self.request_redraw();
                 }
-            }
-            UserEvent::RehideParkedComparator(generation) => {
-                self.rehide_parked_comparator(generation);
             }
             UserEvent::RestoreComparator => {
                 if self.surface == Surface::Comparator {
