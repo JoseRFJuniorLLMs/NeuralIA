@@ -13531,15 +13531,41 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
   // registam os deles em captura primeiro; quem chega depois recebe os
   // eventos ja com `defaultPrevented` posto e desiste sem fazer nada.
   const GOOGLE_REDIRECT_PARAMS = ['q', 'url', 'imgurl', 'adurl'];
+  const LINK_SELECTOR = 'a[href],area[href],[role="link"],[data-href],[data-url]';
 
-  function linkUrl(node) {
-    // Nem toda a fonte e uma <a href>: o AI Mode do Google e as citacoes do
-    // ChatGPT usam chips que trazem o endereco num atributo. Ler apenas
-    // `a[href]` deixava de fora justamente as ligacoes destas paginas -- que
-    // sao as unicas paginas onde isto corre.
-    const anchor = node.closest('a[href], [role="link"], [data-href], [data-url]');
+  function linkNodeFromEvent(event) {
+    // React/Shadow DOM pode retargetear event.target para um host que nao e o
+    // <a> real. composedPath devolve o caminho original atraves das sombras.
+    const path = typeof event.composedPath === 'function'
+      ? event.composedPath()
+      : [event.target];
+
+    for (const candidate of path) {
+      if (!candidate || candidate === window || candidate === document) continue;
+      if (candidate.matches && candidate.matches(LINK_SELECTOR)) return candidate;
+      if (candidate.closest) {
+        const found = candidate.closest(LINK_SELECTOR);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  function neuraliaControlFromEvent(event) {
+    const path = typeof event.composedPath === 'function'
+      ? event.composedPath()
+      : [event.target];
+    return path.some((candidate) => candidate && candidate.closest
+      && candidate.closest('#neuralia-comp-controls,#neuralia-palette'));
+  }
+
+  function linkUrl(anchor) {
     if (!anchor) return null;
-    const raw = anchor.getAttribute('href')
+
+    // href absoluto do DOM ganha de getAttribute: sites React podem montar a
+    // URL relativa e trocar <base>. data-* cobre chips de fonte sem <a>.
+    const raw = (typeof anchor.href === 'string' && anchor.href)
+      || anchor.getAttribute('href')
       || anchor.getAttribute('data-href')
       || anchor.getAttribute('data-url');
     if (!raw) return null;
@@ -13548,10 +13574,9 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
     try { target = new URL(raw, location.href); } catch (_) { return null; }
     if (target.protocol !== 'http:' && target.protocol !== 'https:') return null;
 
-    // O Google embrulha as fontes num redirecionamento seu. Desembrulhar pelo
-    // PARAMETRO e nao pelo caminho: /url, /imgres e /aclk sao caminhos
-    // diferentes para a mesma coisa, e so o primeiro estava coberto.
-    const host = target.hostname;
+    // O Google embrulha as fontes em /url, /imgres, /aclk etc. O parametro
+    // revela o destino real sem depender de um path especifico.
+    const host = target.hostname.toLowerCase();
     if (host === 'google.com' || host.endsWith('.google.com')) {
       for (const name of GOOGLE_REDIRECT_PARAMS) {
         const actual = target.searchParams.get(name);
@@ -13569,37 +13594,36 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
   }
 
   function routeLink(event, aside) {
-    if (!event.isTrusted || event.defaultPrevented) return;
-    // Alt e Shift sao gestos do proprio navegador (descarregar, nova janela);
-    // nao os roubamos.
-    if (event.altKey || event.shiftKey) return;
-    const node = event.target;
-    if (!node || !node.closest) return;
-    if (node.closest('#neuralia-comp-controls,#neuralia-palette')) return;
+    if (!event.isTrusted) return false;
+    // Alt e Shift continuam reservados ao comportamento nativo do navegador.
+    if (event.altKey || event.shiftKey) return false;
+    if (neuraliaControlFromEvent(event)) return false;
 
-    const target = linkUrl(node);
-    if (!target) return;
+    const anchor = linkNodeFromEvent(event);
+    const target = linkUrl(anchor);
+    if (!target) return false;
 
-    // Clique simples numa ligacao do proprio sitio e navegacao interna da
-    // aplicacao: a SPA trata disso melhor do que um load_url, que recarregava
-    // a pagina toda e perdia a conversa. Com Ctrl a intencao e explicita e
-    // vale para qualquer endereco, incluindo o do proprio sitio.
-    if (!aside && target.origin === location.origin) return;
+    // Navegacao interna da propria IA continua com a SPA para nao perder a
+    // conversa. Ctrl/meta/meio e links externos sao assumidos pelo NeuralIA.
+    if (!aside && target.origin === location.origin) return false;
 
+    // Capturamos no WINDOW, antes de handlers de document/React. Depois que o
+    // NeuralIA assume o clique, nenhum listener concorrente pode navegar a
+    // coluna ao mesmo tempo e criar click duplo/race com o IPC.
     event.preventDefault();
-    event.stopPropagation();
+    event.stopImmediatePropagation();
     act('link', { col:colIndex, url:target.href, aside:aside });
+    return true;
   }
 
-  listen(document, 'click', (event) => {
+  listen(window, 'click', (event) => {
     if (event.button !== 0) return;
     routeLink(event, !!(event.ctrlKey || event.metaKey));
   }, true);
 
-  // O botao do meio NAO dispara 'click' desde o Chrome 55 -- dispara
-  // 'auxclick'. O `event.button === 1` que aqui estava dentro do 'click' era
-  // codigo morto: naquele evento o botao e sempre 0.
-  listen(document, 'auxclick', (event) => {
+  // O botao do meio usa auxclick. Captura no window pela mesma razao: sites de
+  // IA costumam instalar handlers de document que chamam window.open primeiro.
+  listen(window, 'auxclick', (event) => {
     if (event.button !== 1) return;
     routeLink(event, true);
   }, true);
