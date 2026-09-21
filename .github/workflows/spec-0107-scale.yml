@@ -13,6 +13,7 @@ on:
     branches: [main]
     paths:
       - 'crates/neural-core/tests/spec_0107_scale.rs'
+      - 'crates/neural-core/tests/spec_0107_doctor.rs'
       - 'crates/neural-core/examples/memory_scale.rs'
       - 'crates/neural-core/src/memory.rs'
       - 'md/SPEC-0107-ai-memory-native-integration.md'
@@ -73,16 +74,17 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
+          import re
           from pathlib import Path
           p = Path("crates/neural-core/src/memory.rs")
           s = p.read_text(encoding="utf-8")
-          old = '''        if rebuild {
-              self.rebuild()?;
-          }
-          '''
-          if s.count(old) != 1:
+          pattern = re.compile(
+              r'\n\s*if rebuild \{\s*self\.rebuild\(\)\?;\s*\}\s*'
+          )
+          updated, count = pattern.subn('\n', s, count=1)
+          if count != 1:
               raise SystemExit("doctor sabotage target not found exactly once")
-          p.write_text(s.replace(old, ""), encoding="utf-8")
+          p.write_text(updated, encoding="utf-8")
           PY
           set +e
           cargo test --locked -p neural-core --test spec_0107_doctor -- --nocapture
