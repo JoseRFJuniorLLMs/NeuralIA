@@ -159,6 +159,7 @@ enum UserEvent {
     /// Reaplica a geometria depois de o Windows terminar a transicao
     /// assíncrona para a janela sem decoracao. Nao depende de rato/teclado.
     RelayoutComparator,
+    RehideParkedComparator(u64),
     RestoreComparator,
     ExitRequested,
     ReaderReady {
@@ -205,6 +206,10 @@ const CHROME_HIDE_DELAY_MS: u64 = 2500;
 /// set_decorations(false). Fazemos dois relayouts baratos para nao deixar
 /// WebViews presos na geometria anterior ate o primeiro movimento do rato.
 const COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS: [u64; 2] = [40, 220];
+/// WebView2 pode tornar o HWND filho visível outra vez enquanto conclui uma
+/// navegação iniciada imediatamente antes de regressarmos à Home. Reafirmamos
+/// o estado estacionado durante a curta janela em que isso pode acontecer.
+const HOME_PARK_REHIDE_DELAYS_MS: [u64; 4] = [40, 220, 750, 1500];
 /// Quanto tempo o aviso de correio novo fica no canto.
 const GMAIL_TOAST_SECONDS: u64 = 7;
 /// Quantas entradas do historico a caixa "history:" mostra.
@@ -3164,7 +3169,7 @@ impl App {
     }
 
     fn show_home(&mut self) {
-        self.next_generation();
+        let generation = self.next_generation();
         let park_comparator = self.surface == Surface::Comparator && self.comparator.is_some();
 
         // Muda o estado ANTES de restaurar a decoração da janela ou esconder
@@ -3175,6 +3180,12 @@ impl App {
         self.surface = Surface::Home;
         if park_comparator {
             self.park_comparator_for_home();
+            for delay_ms in HOME_PARK_REHIDE_DELAYS_MS {
+                self.timers.after(
+                    Duration::from_millis(delay_ms),
+                    UserEvent::RehideParkedComparator(generation),
+                );
+            }
         } else {
             self.destroy_web_surfaces();
         }
@@ -3184,6 +3195,23 @@ impl App {
         self.show_omnibox(true);
         self.position_omnibox();
         self.request_redraw();
+    }
+
+    fn rehide_parked_comparator(&self, generation: u64) {
+        if generation != self.current_generation() || self.surface != Surface::Home {
+            return;
+        }
+        let Some(comparator) = &self.comparator else {
+            return;
+        };
+        for view in &comparator.views {
+            let _ = view.webview.set_visible(false);
+        }
+        if let Some(split) = &comparator.split {
+            let _ = split.webview.set_visible(false);
+        }
+        self.hide_comparator_splitters();
+        self.hide_exit_button();
     }
 
     fn show_native_error(&mut self, message: impl Into<String>) {
@@ -7391,6 +7419,9 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_exit_button();
                     self.request_redraw();
                 }
+            }
+            UserEvent::RehideParkedComparator(generation) => {
+                self.rehide_parked_comparator(generation);
             }
             UserEvent::RestoreComparator => {
                 if self.surface == Surface::Comparator {
