@@ -240,9 +240,9 @@ function Return-LifecycleProbeHome([System.Diagnostics.Process]$Process) {
     }
     $parent = Get-CurrentMainWindow -Process $Process
     if ($parent -eq [IntPtr]::Zero) { throw "Janela principal atual do NeuralIA não foi encontrada." }
-    $ok = [NeuraliaCycleWindowProbe]::ReturnHomeViaNativeEscape($parent)
+    $ok = [NeuraliaCycleWindowProbe]::RequestLifecycleProbeHome($parent)
     if (-not $ok) {
-        throw "Omnibox nativa não encontrada para enviar Escape e regressar a Home."
+        throw "Falhou ao enfileirar o comando Win32 de retorno à Home."
     }
 }
 
