@@ -3154,20 +3154,30 @@ impl App {
         // antes de trocar o chrome nativo.
         self.leave_fullscreen();
 
-        // set_visible(false) atua no controller, mas o HWND hospedeiro do WRY
-        // pode sobreviver até o próximo pump quando houve troca de decorations.
-        // Escondê-lo aqui evita o flash/ghost imediato; RestoreHomeDecorations
-        // repete a limpeza depois que o pump teve tempo de concluir o drop.
+        // Teardown e transicao para Home sao coisas diferentes. Antes esta
+        // funcao sempre agendava RestoreHomeDecorations; quando um novo
+        // comparador era aberto a partir da propria Home, esse timer podia
+        // disparar dentro do pump aninhado de build_as_child e recolocar a
+        // moldura da Home no meio da criacao dos tres WRY_WEBVIEW. O resultado
+        // era exatamente a regressao dos ciclos 2+: hosts visiveis presos ao
+        // HWND errado. Aqui so destruimos. Quem realmente entra na Home agenda
+        // a restauracao depois.
         if let Some(window) = &self.window {
             hide_orphaned_wry_hosts(window);
         }
 
-        self.timers
-            .after(Duration::from_millis(40), UserEvent::RestoreHomeDecorations);
         if let Ok(mut bytes) = self.pdf_bytes.lock() {
             *bytes = Vec::new();
         }
         self.reading_pdf = false;
+    }
+
+    fn schedule_home_restoration(&self) {
+        if lifecycle_probe_enabled() {
+            LIFECYCLE_HOME_READY.store(false, Ordering::Release);
+        }
+        self.timers
+            .after(Duration::from_millis(40), UserEvent::RestoreHomeDecorations);
     }
 
     fn show_home(&mut self) {
@@ -3179,6 +3189,7 @@ impl App {
         // entre pesquisas. Reuso dentro do próprio comparador continua possível,
         // mas sair para Home sempre encerra as superfícies web.
         self.destroy_web_surfaces();
+        self.schedule_home_restoration();
 
         self.bar_hover = None;
         self.status = None;
@@ -3192,6 +3203,7 @@ impl App {
         self.next_generation();
         self.destroy_web_surfaces();
         self.surface = Surface::Home;
+        self.schedule_home_restoration();
         self.status = Some(message.into());
         self.show_omnibox(true);
         self.position_omnibox();
@@ -3476,6 +3488,7 @@ impl App {
         let generation = self.next_generation();
         self.destroy_web_surfaces();
         self.surface = Surface::Home;
+        self.schedule_home_restoration();
         self.status = Some(format!("Lendo {url} …"));
         self.request_redraw();
 
@@ -3505,6 +3518,7 @@ impl App {
         let generation = self.next_generation();
         self.destroy_web_surfaces();
         self.surface = Surface::Home;
+        self.schedule_home_restoration();
         self.status = Some(format!(
             "A descarregar PDF de {} …",
             url.host_str().unwrap_or("?")
@@ -4577,14 +4591,32 @@ impl App {
             return;
         }
 
+        let Ok(valid) = neural_core::validate_web_url(&url) else {
+            self.show_splash("URL do link inválida.".to_string(), 3);
+            return;
+        };
+        if neural_core::is_local_network_target(&valid) {
+            self.show_splash(
+                "O link não pode redirecionar a coluna para a rede local.".to_string(),
+                4,
+            );
+            return;
+        }
+
         let loaded = self
             .comparator
             .as_ref()
             .and_then(|comp| comp.views.get(index))
-            .is_some_and(|view| view.webview.load_url(&url).is_ok());
+            .is_some_and(|view| view.webview.load_url(valid.as_str()).is_ok());
 
+        // Um popup/link que falha pertence à coluna que o originou. Nunca
+        // derrube as três colunas para abrir um WebView solitário como fallback:
+        // além de destruir a comparação, isso reabria a corrida de lifecycle.
         if !loaded {
-            self.web(url);
+            self.show_splash(
+                "Não consegui abrir esse link na coluna sem perder a comparação.".to_string(),
+                4,
+            );
         }
     }
 
@@ -4750,6 +4782,8 @@ impl App {
         if let Some(comp) = &mut self.comparator {
             comp.expanded = None;
             if let Some(previous) = comp.split.take() {
+                let _ = previous.webview.set_visible(false);
+                let _ = previous.webview.focus_parent();
                 drop(previous);
             }
         }
@@ -7393,17 +7427,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_comparator_splitters();
                     self.sync_comparator_buttons();
                     self.sync_exit_button();
-                    if lifecycle_probe_enabled()
-                        && !LIFECYCLE_COMPARATOR_READY.swap(true, Ordering::AcqRel)
-                    {
-                        // O benchmark mede teardown, não transporte de teclado ou
-                        // de mensagens para um HWND que o Windows pode substituir.
-                        // Agenda a mesma transição HomeRequested dentro do event
-                        // loop, depois de o comparador ter estabilizado.
-                        self.timers.after(
-                            Duration::from_millis(800),
-                            UserEvent::LifecycleProbeAutoHome,
-                        );
+                    if lifecycle_probe_enabled() {
+                        LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
                     }
                     self.request_redraw();
                 }
@@ -7427,16 +7452,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.needs_clear = true;
                     self.position_omnibox();
                     self.request_redraw();
-                    if lifecycle_probe_enabled()
-                        && !LIFECYCLE_HOME_READY.swap(true, Ordering::AcqRel)
-                    {
-                        // A reabertura automática ocorre bem depois da medição da
-                        // Home. Assim cada ciclo começa somente após a restauração
-                        // de decorations/HWND do ciclo anterior.
-                        self.timers.after(
-                            Duration::from_millis(4000),
-                            UserEvent::LifecycleProbeAutoReopen,
-                        );
+                    if lifecycle_probe_enabled() {
+                        LIFECYCLE_HOME_READY.store(true, Ordering::Release);
                     }
                 }
             }
