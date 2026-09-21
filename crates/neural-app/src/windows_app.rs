@@ -10810,6 +10810,49 @@ mod tests {
     }
 
     #[test]
+    fn comparator_popup_failure_never_falls_back_to_destroying_all_panels() {
+        let source = include_str!("windows_app.rs");
+        let body = source
+            .split("fn open_in_column")
+            .nth(1)
+            .and_then(|part| part.split("fn open_everywhere").next())
+            .expect("open_in_column body");
+
+        // Fora do comparador, um popup ainda pode abrir como Web normal.
+        // Dentro dele, porém, uma falha de load_url deve ficar isolada à
+        // coluna. Um segundo self.web(url) reintroduziria o teardown das três
+        // colunas por causa de um único clique.
+        assert_eq!(body.matches("self.web(url)").count(), 1);
+        assert!(body.contains("load_url(valid.as_str())"));
+        assert!(body.contains("sem perder a comparação"));
+    }
+
+    #[test]
+    fn webview_teardown_does_not_schedule_home_chrome_while_opening_comparator() {
+        let source = include_str!("windows_app.rs");
+        let destroy = source
+            .split("fn destroy_web_surfaces")
+            .nth(1)
+            .and_then(|part| part.split("fn schedule_home_restoration").next())
+            .expect("destroy_web_surfaces body");
+        assert!(!destroy.contains("UserEvent::RestoreHomeDecorations"));
+
+        let home = source
+            .split("fn show_home")
+            .nth(1)
+            .and_then(|part| part.split("fn show_native_error").next())
+            .expect("show_home body");
+        assert!(home.contains("self.schedule_home_restoration()"));
+
+        let comparator = source
+            .split("fn open_comparator")
+            .nth(1)
+            .and_then(|part| part.split("fn activate_comparator").next())
+            .expect("open_comparator body");
+        assert!(!comparator.contains("schedule_home_restoration"));
+    }
+
+    #[test]
     fn a_click_reported_by_another_column_is_ignored() {
         // Cada coluna tem o seu handler de IPC. Sem esta verificacao, uma
         // pagina numa coluna mandava a outra abrir o que lhe apetecesse.
