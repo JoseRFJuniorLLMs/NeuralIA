@@ -4021,12 +4021,17 @@ impl App {
 
         // Gate de lifecycle: usa exactamente o mesmo evento nativo de Home do
         // produto, mas sem depender de WScript.SendKeys chegar atraves de uma
-        // child window do WebView2 no runner do GitHub.
+        // child window do WebView2 no runner do GitHub. O probe usa uma thread
+        // curta dedicada em vez do scheduler geral da UI: cada nova abertura
+        // precisa de UM Home garantido, inclusive depois de ciclos repetidos.
         if lifecycle_probe_enabled() {
-            self.timers.after(
-                Duration::from_millis(LIFECYCLE_PROBE_HOME_DELAY_MS),
-                UserEvent::HomeRequested,
-            );
+            let proxy = self.proxy.clone();
+            let _ = thread::Builder::new()
+                .name("neural-lifecycle-probe".into())
+                .spawn(move || {
+                    thread::sleep(Duration::from_millis(LIFECYCLE_PROBE_HOME_DELAY_MS));
+                    let _ = proxy.send_event(UserEvent::HomeRequested);
+                });
         }
 
         self.schedule_gmail_probe(4);
@@ -10836,6 +10841,16 @@ mod tests {
             .expect("limpa a marca");
         let read = handler.find("RESIZE_X.load(").expect("le a posicao");
         assert!(cleared < read);
+    }
+
+    #[test]
+    fn lifecycle_probe_uses_a_dedicated_event_loop_delivery_path() {
+        let source = include_str!("windows_app.rs");
+        assert!(source.contains("neural-lifecycle-probe"));
+        assert!(source.contains("proxy.send_event(UserEvent::HomeRequested)"));
+        assert!(!source.contains(
+            "self.timers.after(\n                Duration::from_millis(LIFECYCLE_PROBE_HOME_DELAY_MS)"
+        ));
     }
 
     #[test]
