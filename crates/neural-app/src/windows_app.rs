@@ -156,6 +156,9 @@ enum UserEvent {
     /// `RESIZE_*`, nao do evento: assim os movimentos que chegam enquanto
     /// este esta na fila substituem-se uns aos outros em vez de se somarem.
     ResizeComparator,
+    /// Reaplica a geometria depois de o Windows terminar a transicao
+    /// assíncrona para a janela sem decoracao. Nao depende de rato/teclado.
+    RelayoutComparator,
     RestoreComparator,
     ExitRequested,
     ReaderReady {
@@ -198,6 +201,10 @@ const AUTO_SCROLL_PROMPT_SECONDS: u64 = 20;
 /// Quanto tempo a barra fica visivel em ecra completo depois do ultimo
 /// movimento do rato no topo.
 const CHROME_HIDE_DELAY_MS: u64 = 2500;
+/// A moldura Win32 pode mudar o client rect um ciclo depois de
+/// set_decorations(false). Fazemos dois relayouts baratos para nao deixar
+/// WebViews presos na geometria anterior ate o primeiro movimento do rato.
+const COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS: [u64; 2] = [40, 220];
 /// Quanto tempo o aviso de correio novo fica no canto.
 const GMAIL_TOAST_SECONDS: u64 = 7;
 /// Quantas entradas do historico a caixa "history:" mostra.
@@ -1259,6 +1266,12 @@ fn now_ms() -> u64 {
 /// nessas voltas, que e o unico ponto de pintura que ainda corre.
 static ERASE_PENDING: AtomicBool = AtomicBool::new(false);
 const WINDOW_SUBCLASS_ID: usize = 0x4E4A;
+/// Mensagens privadas usadas somente pelo gate de lifecycle. O handler só
+/// aceita os comandos quando NEURALIA_LIFECYCLE_PROBE está presente no processo.
+/// São deliberadamente separadas da omnibox: este gate mede criar/destruir
+/// WebViews, não a entrega de teclado sintético entre processos.
+const WM_LIFECYCLE_PROBE_HOME: u32 = 0x8000 + 0x4D;
+const WM_LIFECYCLE_PROBE_REOPEN: u32 = 0x8000 + 0x4E;
 const EXIT_BUTTON_SUBCLASS_ID: usize = 0x4E4B;
 const WM_PAINT: u32 = 0x000F;
 const WM_LBUTTONUP: u32 = 0x0202;
@@ -1311,6 +1324,10 @@ fn startup_input() -> String {
         .to_string()
 }
 
+fn lifecycle_probe_enabled() -> bool {
+    std::env::var_os("NEURALIA_LIFECYCLE_PROBE").is_some()
+}
+
 #[link(name = "comctl32")]
 unsafe extern "system" {
     fn SetWindowSubclass(
@@ -1360,8 +1377,23 @@ unsafe extern "system" fn window_subclass(
     wparam: WPARAM,
     lparam: LPARAM,
     _subclass_id: usize,
-    _reference_data: usize,
+    reference_data: usize,
 ) -> LRESULT {
+    if matches!(message, WM_LIFECYCLE_PROBE_HOME | WM_LIFECYCLE_PROBE_REOPEN) {
+        if lifecycle_probe_enabled() && reference_data != 0 {
+            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+            if message == WM_LIFECYCLE_PROBE_HOME {
+                let _ = proxy.send_event(UserEvent::HomeRequested);
+            } else {
+                let input = startup_input();
+                if !input.is_empty() {
+                    let _ = proxy.send_event(UserEvent::SubmitText(input));
+                }
+            }
+        }
+        return 0;
+    }
+
     if message == WM_ERASEBKGND {
         if ERASE_PENDING.swap(false, Ordering::SeqCst) {
             let hdc = wparam as *mut core::ffi::c_void;
@@ -2870,7 +2902,7 @@ impl App {
                 return;
             }
 
-            SetWindowSubclass(parent, Some(window_subclass), WINDOW_SUBCLASS_ID, 0);
+            SetWindowSubclass(parent, Some(window_subclass), WINDOW_SUBCLASS_ID, proxy_ptr);
 
             self.omnibox = Some(edit);
             self.position_omnibox();
@@ -3011,9 +3043,21 @@ impl App {
             }
         }
         if let Some(comparator) = self.comparator.take() {
+            // WebView2 pode manter a HWND filha visível por alguns ciclos de
+            // mensagens mesmo depois do drop do controller. Esconde primeiro,
+            // depois devolve o foco ao pai e só então destrói o estado.
+            for view in &comparator.views {
+                let _ = view.webview.set_visible(false);
+                let _ = view.webview.focus_parent();
+            }
+            if let Some(split) = &comparator.split {
+                let _ = split.webview.set_visible(false);
+                let _ = split.webview.focus_parent();
+            }
             drop(comparator);
         }
         if let Some(webview) = self.webview.take() {
+            let _ = webview.set_visible(false);
             let _ = webview.focus_parent();
             drop(webview);
         }
@@ -3975,9 +4019,27 @@ impl App {
         });
         self.bar_hover = None;
         self.surface = Surface::Comparator;
+
+        // build_as_child nasce antes de self.comparator existir, portanto o
+        // primeiro layout feito durante a construcao nao pode passar pela
+        // rotina que tambem torna cada controller visivel. Reaplicar aqui e
+        // essencial: sem isto o WebView2 podia ficar branco ate um evento de
+        // rato provocar nova composicao.
+        self.needs_clear = true;
+        self.update_comparator_layout();
+        self.sync_comparator_splitters();
+        self.sync_comparator_buttons();
+        self.sync_exit_button();
+
+        for delay_ms in COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS {
+            self.timers.after(
+                Duration::from_millis(delay_ms),
+                UserEvent::RelayoutComparator,
+            );
+        }
+
         self.schedule_gmail_probe(4);
         self.begin_reading_session(false);
-        self.sync_comparator_splitters();
         self.request_redraw();
     }
 
@@ -7148,6 +7210,16 @@ impl ApplicationHandler<UserEvent> for App {
                     );
                 }
             }
+            UserEvent::RelayoutComparator => {
+                if self.surface == Surface::Comparator {
+                    self.needs_clear = true;
+                    self.update_comparator_layout();
+                    self.sync_comparator_splitters();
+                    self.sync_comparator_buttons();
+                    self.sync_exit_button();
+                    self.request_redraw();
+                }
+            }
             UserEvent::RestoreComparator => {
                 if self.surface == Surface::Comparator {
                     self.restore_comparator();
@@ -9731,6 +9803,8 @@ mod tests {
     #[test]
     fn private_panel_and_new_tab_are_wired() {
         assert!(NEURALIA_KEYMAP_SCRIPT.contains("act('newtab', { col:colIndex })"));
+        assert!(NEURALIA_KEYMAP_SCRIPT.contains("key === 'escape'"));
+        assert!(NEURALIA_KEYMAP_SCRIPT.contains("act('back')"));
         assert!(format!("{:?}", neuralia_action("neuralia:newtab")).starts_with("Some(NewTab"));
         assert_ne!(BarHit::Private, BarHit::SplitClose);
     }
@@ -10492,6 +10566,9 @@ mod tests {
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("chatgpt.com"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("claude.ai"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("button.click()"));
+        assert!(AI_AUTO_SUBMIT_SCRIPT.contains("form.requestSubmit"));
+        assert!(AI_AUTO_SUBMIT_SCRIPT.contains("lastSubmitAt"));
+        assert!(AI_AUTO_SUBMIT_SCRIPT.contains("setTimeout(submitWhenReady, 150)"));
     }
 
     #[test]
@@ -10768,6 +10845,15 @@ mod tests {
             .expect("limpa a marca");
         let read = handler.find("RESIZE_X.load(").expect("le a posicao");
         assert!(cleared < read);
+    }
+
+    #[test]
+    fn first_comparator_layout_retries_without_waiting_for_mouse_input() {
+        assert_eq!(COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS.len(), 2);
+        assert!(COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS[0] > 0);
+        assert!(
+            COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS[1] > COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS[0]
+        );
     }
 
     #[test]
@@ -12623,43 +12709,106 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
     }
   }
 
+  // Reaviva o estado do framework quando o proprio ?q= desenhou texto no
+  // editor mas ainda nao habilitou o botao de envio.
+  function nudge(el) {
+    if (!el) return;
+    try {
+      el.dispatchEvent(new InputEvent('input', { bubbles:true, inputType:'insertText' }));
+    } catch (_) {
+      el.dispatchEvent(new Event('input', { bubbles:true }));
+    }
+    el.dispatchEvent(new Event('change', { bubbles:true }));
+  }
+
+  // Primeiro tenta o botao real. Se o fornecedor escondeu o botao mas o
+  // editor pertence a um form, requestSubmit() percorre o caminho nativo do
+  // formulario. O KeyboardEvent sintetico fica apenas como ultimo recurso:
+  // Chromium marca-o isTrusted=false e os fornecedores podem ignora-lo.
+  function submitEditor(el) {
+    const button = sendButton();
+    if (button) {
+      button.click();
+      return 'button';
+    }
+
+    const form = el && typeof el.closest === 'function' ? el.closest('form') : null;
+    if (form && typeof form.requestSubmit === 'function') {
+      try {
+        const submitter = form.querySelector(
+          'button[type="submit"]:not([disabled]), input[type="submit"]:not([disabled])'
+        );
+        if (submitter) form.requestSubmit(submitter);
+        else form.requestSubmit();
+        return 'form';
+      } catch (_) {}
+    }
+
+    el.focus();
+    for (const type of ['keydown', 'keypress', 'keyup']) {
+      el.dispatchEvent(new KeyboardEvent(type, {
+        key:'Enter', code:'Enter', keyCode:13, which:13,
+        bubbles:true, cancelable:true
+      }));
+    }
+    return 'keyboard';
+  }
+
   let attempts = 0;
   let filled = false;
+  let nudged = false;
+  let lastSubmitAt = 0;
+
   function submitWhenReady() {
     attempts += 1;
-    if (consumed()) return;
+
+    if (consumed()) {
+      stampWrite(stampKey, Date.now());
+      return;
+    }
+
     const el = editor();
+
+    // Depois de uma tentativa, o compositor vazio e o melhor reconhecimento
+    // transversal de que o site aceitou a pergunta. Nao ha novo clique.
+    if (lastSubmitAt && el && !textOf(el)) {
+      stampWrite(stampKey, Date.now());
+      return;
+    }
+
     if (el) {
-      // Dez tentativas (~1,5 s) a dar hipotese ao proprio site de preencher;
-      // passadas essas, escrevemos nos.
+      // Dez tentativas (~1,5 s) para o proprio site preencher o compositor.
+      // Depois disso escrevemos nos, caso ele ainda esteja vazio.
       if (!textOf(el) && !filled && attempts > 10) {
         fill(el);
         filled = true;
       }
+
       if (textOf(el)) {
-        const button = sendButton();
-        if (button) {
-          stampWrite(stampKey, Date.now());
-          button.click();
-          return;
+        // Um ?q= pode pintar a string sem acordar o estado React. Reemitir
+        // input/change uma vez deixa o botao real nascer/habilitar.
+        if (!nudged && attempts > 8) {
+          nudge(el);
+          nudged = true;
         }
-        // Sem botao utilizavel, Enter no editor e o caminho que estes sitios
-        // tambem aceitam.
-        if (attempts > 20) {
-          stampWrite(stampKey, Date.now());
-          el.focus();
-          for (const type of ['keydown', 'keypress', 'keyup']) {
-            el.dispatchEvent(new KeyboardEvent(type, { key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true, cancelable:true }));
-          }
-          return;
+
+        const now = Date.now();
+        // Nao martelar o endpoint enquanto uma submissao anterior ainda pode
+        // estar em voo. Se um Enter sintetico for ignorado, continuamos a
+        // observar e tentamos o botao/formulario assim que aparecer.
+        if (attempts > 10 && now - lastSubmitAt >= 2500) {
+          lastSubmitAt = now;
+          submitEditor(el);
         }
       }
     }
-    if (attempts < 120) {
+
+    if (attempts < 160) {
       setTimeout(submitWhenReady, 150);
       return;
     }
-    // Desistimos ao fim de ~18 s. Se fomos NOS a escrever e nunca chegou a ser
+
+    // Desistimos ao fim de ~24 s. Se fomos NOS a escrever e nunca chegou a ser
     // enviado, a pergunta nao pode ficar la a fingir que o utilizador a
     // escreveu.
     if (filled) clear(el || editor());
