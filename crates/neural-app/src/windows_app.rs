@@ -159,6 +159,10 @@ enum UserEvent {
     /// Reaplica a geometria depois de o Windows terminar a transicao
     /// assíncrona para a janela sem decoracao. Nao depende de rato/teclado.
     RelayoutComparator,
+    /// Restaura a moldura nativa da Home num ciclo posterior ao drop dos
+    /// WebViews. Isto evita reparentear hosts WRY enquanto WebView2 ainda
+    /// conclui a destruição dos controllers no pump de mensagens.
+    RestoreHomeDecorations,
     RestoreComparator,
     ExitRequested,
     ReaderReady {
@@ -3121,13 +3125,16 @@ impl App {
             }
         }
 
-        // Só depois de não haver controllers WebView vivos é seguro trocar o
-        // chrome nativo e reinstalar a subclasse no HWND que ficou ativo.
+        // O drop dos controllers pode concluir a destruição dos HWNDs WRY no
+        // pump de mensagens seguinte. Restaurar a decoração aqui, no mesmo
+        // stack, pode reparentear esses hosts para o novo HWND da Home e deixá-los
+        // visíveis a partir da segunda abertura. Deixe o event loop respirar
+        // antes de trocar o chrome nativo.
         self.leave_fullscreen();
-        if let Some(window) = &self.window {
-            window.set_decorations(true);
-        }
-        self.ensure_window_subclass();
+        self.timers.after(
+            Duration::from_millis(40),
+            UserEvent::RestoreHomeDecorations,
+        );
         if let Ok(mut bytes) = self.pdf_bytes.lock() {
             *bytes = Vec::new();
         }
@@ -7363,6 +7370,17 @@ impl ApplicationHandler<UserEvent> for App {
                         // nunca é disparado contra um HWND ainda em substituição.
                         LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
                     }
+                    self.request_redraw();
+                }
+            }
+            UserEvent::RestoreHomeDecorations => {
+                if self.surface == Surface::Home {
+                    if let Some(window) = &self.window {
+                        window.set_decorations(true);
+                    }
+                    self.ensure_window_subclass();
+                    self.needs_clear = true;
+                    self.position_omnibox();
                     self.request_redraw();
                 }
             }
