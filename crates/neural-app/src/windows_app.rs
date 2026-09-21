@@ -2891,6 +2891,23 @@ impl App {
         self.request_redraw();
     }
 
+    /// Reinstala a subclasse da janela principal depois de transições de
+    /// decoração. No Windows, alternar a moldura pode substituir o HWND nativo;
+    /// SetWindowSubclass é idempotente para o mesmo callback/id e atualiza o
+    /// reference_data quando a janela continua a mesma.
+    fn ensure_window_subclass(&self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(parent) = window_hwnd(window) else {
+            return;
+        };
+        let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
+        unsafe {
+            SetWindowSubclass(parent, Some(window_subclass), WINDOW_SUBCLASS_ID, proxy_ptr);
+        }
+    }
+
     fn create_omnibox(&mut self) {
         let Some(window) = &self.window else {
             return;
@@ -3064,6 +3081,7 @@ impl App {
         if let Some(window) = &self.window {
             window.set_decorations(true);
         }
+        self.ensure_window_subclass();
         if let Some(button) = self.exit_button.take() {
             unsafe {
                 DestroyWindow(button);
@@ -3116,6 +3134,7 @@ impl App {
         if let Some(window) = &self.window {
             window.set_decorations(true);
         }
+        self.ensure_window_subclass();
         if let Some(button) = self.exit_button.take() {
             unsafe {
                 DestroyWindow(button);
@@ -4057,6 +4076,7 @@ impl App {
         // No comparador o chrome e nosso: a primeira linha recebe as abas e os
         // controles de janela; a segunda fica reservada aos provedores.
         window.set_decorations(false);
+        self.ensure_window_subclass();
 
         if reuse_comparator {
             let urls = [
