@@ -163,6 +163,11 @@ enum UserEvent {
     /// WebViews. Isto evita reparentear hosts WRY enquanto WebView2 ainda
     /// conclui a destruição dos controllers no pump de mensagens.
     RestoreHomeDecorations,
+    /// Probe de CI: pede Home pelo próprio event loop, sem depender de HWND
+    /// externo que pode ser substituído ao alternar decorations.
+    LifecycleProbeAutoHome,
+    /// Probe de CI: reabre o comparador somente depois de a Home estabilizar.
+    LifecycleProbeAutoReopen,
     RestoreComparator,
     ExitRequested,
     ReaderReady {
@@ -7379,11 +7384,17 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_comparator_splitters();
                     self.sync_comparator_buttons();
                     self.sync_exit_button();
-                    if lifecycle_probe_enabled() {
-                        // O probe só considera o comparador pronto depois de pelo
-                        // menos um relayout pós-transição de decoração. Assim Home
-                        // nunca é disparado contra um HWND ainda em substituição.
-                        LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
+                    if lifecycle_probe_enabled()
+                        && !LIFECYCLE_COMPARATOR_READY.swap(true, Ordering::AcqRel)
+                    {
+                        // O benchmark mede teardown, não transporte de teclado ou
+                        // de mensagens para um HWND que o Windows pode substituir.
+                        // Agenda a mesma transição HomeRequested dentro do event
+                        // loop, depois de o comparador ter estabilizado.
+                        self.timers.after(
+                            Duration::from_millis(800),
+                            UserEvent::LifecycleProbeAutoHome,
+                        );
                     }
                     self.request_redraw();
                 }
@@ -7397,13 +7408,29 @@ impl ApplicationHandler<UserEvent> for App {
                     self.needs_clear = true;
                     self.position_omnibox();
                     self.request_redraw();
-                    if lifecycle_probe_enabled() {
-                        // O gate só pode reabrir o comparador depois de a Home
-                        // terminar a restauração do HWND/decorations. Reabrir
-                        // apenas porque os hosts WRY sumiram recriava WebViews
-                        // dentro do teardown anterior e produzia falsos leaks
-                        // a partir do segundo ciclo.
-                        LIFECYCLE_HOME_READY.store(true, Ordering::Release);
+                    if lifecycle_probe_enabled()
+                        && !LIFECYCLE_HOME_READY.swap(true, Ordering::AcqRel)
+                    {
+                        // A reabertura automática ocorre bem depois da medição da
+                        // Home. Assim cada ciclo começa somente após a restauração
+                        // de decorations/HWND do ciclo anterior.
+                        self.timers.after(
+                            Duration::from_millis(4000),
+                            UserEvent::LifecycleProbeAutoReopen,
+                        );
+                    }
+                }
+            }
+            UserEvent::LifecycleProbeAutoHome => {
+                if lifecycle_probe_enabled() && self.surface == Surface::Comparator {
+                    self.show_home();
+                }
+            }
+            UserEvent::LifecycleProbeAutoReopen => {
+                if lifecycle_probe_enabled() && self.surface == Surface::Home {
+                    let input = startup_input();
+                    if !input.is_empty() {
+                        self.handle_input(input);
                     }
                 }
             }
