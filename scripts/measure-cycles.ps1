@@ -82,8 +82,9 @@ public static class NeuraliaCycleWindowProbe {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern bool SetWindowText(IntPtr hWnd, string text);
 
-    [DllImport("user32.dll")]
-    public static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [return: MarshalAs(UnmanagedType.Bool)]
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
     public static List<string> VisibleWryWebViewRects(IntPtr parent) {
         var rows = new List<string>();
@@ -113,7 +114,12 @@ public static class NeuraliaCycleWindowProbe {
         if (!SetWindowText(edit, text)) return false;
         SetFocus(edit);
         const uint WM_KEYDOWN = 0x0100;
-        SendMessage(edit, WM_KEYDOWN, new IntPtr(13), IntPtr.Zero);
+        const uint WM_KEYUP = 0x0101;
+        // Posta a tecla na fila da thread da UI. SendMessage executava o
+        // subclass reentrantemente a partir do processo do gate e podia
+        // enfileirar SubmitText enquanto a transicao Home ainda terminava.
+        if (!PostMessage(edit, WM_KEYDOWN, new IntPtr(13), IntPtr.Zero)) return false;
+        PostMessage(edit, WM_KEYUP, new IntPtr(13), IntPtr.Zero);
         return true;
     }
 
@@ -121,7 +127,9 @@ public static class NeuraliaCycleWindowProbe {
         var edit = FindOmniboxEdit(parent);
         if (edit == IntPtr.Zero) return false;
         const uint WM_KEYDOWN = 0x0100;
-        SendMessage(edit, WM_KEYDOWN, new IntPtr(27), IntPtr.Zero);
+        const uint WM_KEYUP = 0x0101;
+        if (!PostMessage(edit, WM_KEYDOWN, new IntPtr(27), IntPtr.Zero)) return false;
+        PostMessage(edit, WM_KEYUP, new IntPtr(27), IntPtr.Zero);
         return true;
     }
 }
