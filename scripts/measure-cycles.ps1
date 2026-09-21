@@ -268,11 +268,22 @@ try {
         # exactamente HomeRequested no mesmo event loop do produto.
         Return-LifecycleProbeHome -Process $process
 
+        # build_as_child torna o HWND WRY_WEBVIEW visivel antes de o pump
+        # aninhado do WebView2 necessariamente devolver o controlo ao event loop.
+        # Se HOME foi postado nesse intervalo, reenfileiramos UMA vez depois de
+        # observar que os hosts continuam presentes. Isto nao mascara teardown:
+        # uma implementacao que nao esconda/destrua os WebViews continua vermelha.
+        $firstCloseWindow = [math]::Min(2, $CloseTimeoutSec)
+        $visibleAfterHome = Wait-ForNoVisibleWebSurfaces -Process $process -TimeoutSec $firstCloseWindow
+        if ($visibleAfterHome -ne 0 -and $CloseTimeoutSec -gt $firstCloseWindow) {
+            Return-LifecycleProbeHome -Process $process
+            $visibleAfterHome = Wait-ForNoVisibleWebSurfaces -Process $process -TimeoutSec ($CloseTimeoutSec - $firstCloseWindow)
+        }
+
         # A Home precisa ficar sem nenhum container WRY_WEBVIEW visivel.
         # Este e o HWND hospedeiro criado e controlado pelo WRY; as HWNDs
         # internas do Chromium podem continuar com WS_VISIBLE mesmo quando o
         # controller/host esta oculto, portanto nao servem como autoridade.
-        $visibleAfterHome = Wait-ForNoVisibleWebSurfaces -Process $process -TimeoutSec $CloseTimeoutSec
         if ($visibleAfterHome -ne 0) {
             $null = $failures.Add("ciclo ${cycle}: ${visibleAfterHome} superficie(s) WebView continuaram visiveis depois de voltar a Home")
         }
