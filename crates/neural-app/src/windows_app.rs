@@ -4201,10 +4201,8 @@ impl App {
             // enfileirar outro UserEvent apenas para virar este bit. Isso evita
             // que o handshake fique preso atrás do pump aninhado do WebView2
             // numa reabertura, sem afrouxar o gate de teardown.
-            self.timers.after(
-                Duration::from_millis(1),
-                UserEvent::LifecycleProbeReady,
-            );
+            self.timers
+                .after(Duration::from_millis(1), UserEvent::LifecycleProbeReady);
         }
     }
 
