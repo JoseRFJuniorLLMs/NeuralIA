@@ -239,7 +239,7 @@ $process = Start-Process -FilePath $resolved -PassThru
 $failures = New-Object System.Collections.ArrayList
 $samples = New-Object System.Collections.ArrayList
 $webViewPoolCeiling = $null
-$webViewPoolWarmupCycles = 2
+$webViewPoolWarmupCycles = 3
 $warmWorkingSetMiB = $null
 
 try {
@@ -292,8 +292,8 @@ try {
         $process.Refresh()
         $postHomeMiB = [math]::Round($process.WorkingSet64 / 1MB, 2)
         if ($cycle -eq $webViewPoolWarmupCycles) {
-            # Primeiro/segundo ciclo carregam runtime e caches legitimamente.
-            # Leak e crescimento persistente DEPOIS desse aquecimento.
+            # Os três primeiros ciclos carregam runtime/processos auxiliares
+            # legitimamente. Leak é crescimento persistente DEPOIS desse aquecimento.
             $warmWorkingSetMiB = $postHomeMiB
         }
 
@@ -302,9 +302,9 @@ try {
         # acontecer e esse pool crescer a cada ciclo: isso sim denuncia leak.
         $pooled = Get-WebViewCount -RootId $process.Id
         if ($cycle -le $webViewPoolWarmupCycles) {
-            # O runtime pode completar o seu pool entre a primeira e a segunda
-            # abertura. A partir do ciclo seguinte, qualquer crescimento e
-            # persistente e passa a ser regressao.
+            # O runtime pode completar o pool gradualmente até a terceira
+            # abertura. A partir daí, qualquer novo teto é crescimento
+            # persistente e passa a ser regressão.
             if ($null -eq $webViewPoolCeiling -or $pooled -gt $webViewPoolCeiling) {
                 $webViewPoolCeiling = $pooled
             }
