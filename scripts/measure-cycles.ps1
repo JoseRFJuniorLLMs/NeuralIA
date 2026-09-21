@@ -57,6 +57,12 @@ public static class NeuraliaCycleWindowProbe {
     public static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
     [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hWnd);
 
     [DllImport("user32.dll")]
@@ -88,6 +94,27 @@ public static class NeuraliaCycleWindowProbe {
         uint timeout,
         out IntPtr result
     );
+
+    public static IntPtr MainWindowForProcess(int processId) {
+        IntPtr best = IntPtr.Zero;
+        long bestArea = -1;
+        EnumWindows(delegate(IntPtr hwnd, IntPtr data) {
+            uint ownerPid;
+            GetWindowThreadProcessId(hwnd, out ownerPid);
+            if (ownerPid != (uint)processId || !IsWindowVisible(hwnd)) return true;
+            RECT r;
+            if (!GetWindowRect(hwnd, out r)) return true;
+            long width = Math.Max(0, r.Right - r.Left);
+            long height = Math.Max(0, r.Bottom - r.Top);
+            long area = width * height;
+            if (area > bestArea) {
+                bestArea = area;
+                best = hwnd;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return best;
+    }
 
     public static List<string> VisibleWryWebViewRects(IntPtr parent) {
         var rows = new List<string>();
@@ -132,6 +159,16 @@ public static class NeuraliaCycleWindowProbe {
 }
 "@
 
+function Get-NeuraliaMainWindow([System.Diagnostics.Process]$Process) {
+    $Process.Refresh()
+    if ($Process.HasExited) { return [IntPtr]::Zero }
+    $hwnd = [NeuraliaCycleWindowProbe]::MainWindowForProcess($Process.Id)
+    if ($hwnd -eq [IntPtr]::Zero) {
+        $hwnd = [IntPtr]$Process.MainWindowHandle
+    }
+    return $hwnd
+}
+
 function Get-VisibleWebViewSurfaceRects([IntPtr]$Parent) {
     return @(
         [NeuraliaCycleWindowProbe]::VisibleWryWebViewRects($Parent) |
@@ -144,12 +181,12 @@ function Wait-ForNoVisibleWebSurfaces([System.Diagnostics.Process]$Process, [int
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
         $Process.Refresh()
         if ($Process.HasExited) { return 0 }
-        $count = @(Get-VisibleWebViewSurfaceRects -Parent ([IntPtr]$Process.MainWindowHandle)).Count
+        $count = @(Get-VisibleWebViewSurfaceRects -Parent (Get-NeuraliaMainWindow -Process $Process)).Count
         if ($count -eq 0) { return 0 }
         Start-Sleep -Milliseconds 150
     }
     $Process.Refresh()
-    return @(Get-VisibleWebViewSurfaceRects -Parent ([IntPtr]$Process.MainWindowHandle)).Count
+    return @(Get-VisibleWebViewSurfaceRects -Parent (Get-NeuraliaMainWindow -Process $Process)).Count
 }
 
 function Submit-LifecycleProbeQuery([System.Diagnostics.Process]$Process) {
@@ -183,12 +220,12 @@ function Wait-ForVisibleWebSurfaces([System.Diagnostics.Process]$Process, [int]$
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
         $Process.Refresh()
         if ($Process.HasExited) { return 0 }
-        $count = @(Get-VisibleWebViewSurfaceRects -Parent ([IntPtr]$Process.MainWindowHandle)).Count
+        $count = @(Get-VisibleWebViewSurfaceRects -Parent (Get-NeuraliaMainWindow -Process $Process)).Count
         if ($count -ge $Expected) { return $count }
         Start-Sleep -Milliseconds 150
     }
     $Process.Refresh()
-    return @(Get-VisibleWebViewSurfaceRects -Parent ([IntPtr]$Process.MainWindowHandle)).Count
+    return @(Get-VisibleWebViewSurfaceRects -Parent (Get-NeuraliaMainWindow -Process $Process)).Count
 }
 
 function Wait-ForLifecycleProbeReady([System.Diagnostics.Process]$Process, [int]$TimeoutSec) {
@@ -196,7 +233,7 @@ function Wait-ForLifecycleProbeReady([System.Diagnostics.Process]$Process, [int]
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
         $Process.Refresh()
         if ($Process.HasExited) { return $false }
-        if ([NeuraliaCycleWindowProbe]::LifecycleProbeReady([IntPtr]$Process.MainWindowHandle)) {
+        if ([NeuraliaCycleWindowProbe]::LifecycleProbeReady(Get-NeuraliaMainWindow -Process $Process)) {
             return $true
         }
         Start-Sleep -Milliseconds 100
@@ -284,12 +321,14 @@ $warmWorkingSetMiB = $null
 
 try {
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($watch.Elapsed.TotalSeconds -lt 10 -and $process.MainWindowHandle -eq 0) {
+    $mainWindow = [IntPtr]::Zero
+    while ($watch.Elapsed.TotalSeconds -lt 10 -and $mainWindow -eq [IntPtr]::Zero) {
         Start-Sleep -Milliseconds 50
         $process.Refresh()
         if ($process.HasExited) { throw "NeuralIA saiu antes de criar a janela." }
+        $mainWindow = Get-NeuraliaMainWindow -Process $process
     }
-    if ($process.MainWindowHandle -eq 0) { throw "A janela nativa nao apareceu." }
+    if ($mainWindow -eq [IntPtr]::Zero) { throw "A janela nativa nao apareceu." }
 
     $process.Refresh()
     $baselineMiB = [math]::Round($process.WorkingSet64 / 1MB, 2)
