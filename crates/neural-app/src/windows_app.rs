@@ -1272,6 +1272,8 @@ const WINDOW_SUBCLASS_ID: usize = 0x4E4A;
 /// então Windows resolve os dois processos para os mesmos IDs de mensagem.
 static LIFECYCLE_PROBE_HOME_MESSAGE: OnceLock<u32> = OnceLock::new();
 static LIFECYCLE_PROBE_REOPEN_MESSAGE: OnceLock<u32> = OnceLock::new();
+static LIFECYCLE_PROBE_READY_MESSAGE: OnceLock<u32> = OnceLock::new();
+static LIFECYCLE_COMPARATOR_READY: AtomicBool = AtomicBool::new(false);
 
 fn lifecycle_probe_home_message() -> u32 {
     *LIFECYCLE_PROBE_HOME_MESSAGE.get_or_init(|| unsafe {
@@ -1282,6 +1284,12 @@ fn lifecycle_probe_home_message() -> u32 {
 fn lifecycle_probe_reopen_message() -> u32 {
     *LIFECYCLE_PROBE_REOPEN_MESSAGE.get_or_init(|| unsafe {
         RegisterWindowMessageW(windows_sys::w!("NeuralIA.LifecycleProbe.Reopen"))
+    })
+}
+
+fn lifecycle_probe_ready_message() -> u32 {
+    *LIFECYCLE_PROBE_READY_MESSAGE.get_or_init(|| unsafe {
+        RegisterWindowMessageW(windows_sys::w!("NeuralIA.LifecycleProbe.Ready"))
     })
 }
 const EXIT_BUTTON_SUBCLASS_ID: usize = 0x4E4B;
@@ -1394,6 +1402,16 @@ unsafe extern "system" fn window_subclass(
 ) -> LRESULT {
     let lifecycle_home = lifecycle_probe_home_message();
     let lifecycle_reopen = lifecycle_probe_reopen_message();
+    let lifecycle_ready = lifecycle_probe_ready_message();
+    if message == lifecycle_ready {
+        return if lifecycle_probe_enabled()
+            && LIFECYCLE_COMPARATOR_READY.load(Ordering::Acquire)
+        {
+            1
+        } else {
+            0
+        };
+    }
     if message == lifecycle_home || message == lifecycle_reopen {
         if lifecycle_probe_enabled() && reference_data != 0 {
             let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
@@ -3038,6 +3056,9 @@ impl App {
     }
 
     fn destroy_web_surfaces(&mut self) {
+        if lifecycle_probe_enabled() {
+            LIFECYCLE_COMPARATOR_READY.store(false, Ordering::Release);
+        }
         self.mark_dirty();
         self.close_palette();
         self.finish_agent(AgentTermination::UserStopped);
@@ -4056,6 +4077,9 @@ impl App {
         self.schedule_gmail_probe(4);
         self.begin_reading_session(false);
         self.request_redraw();
+        if lifecycle_probe_enabled() {
+            LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
+        }
     }
 
     /// Alterna: o botao injetado na pagina pede sempre "expandir", e e aqui que
