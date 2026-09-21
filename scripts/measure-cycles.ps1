@@ -327,29 +327,21 @@ function Wait-ForVisibleWebSurfaces([System.Diagnostics.Process]$Process, [int]$
 }
 
 function Wait-ForLifecycleProbeReady([System.Diagnostics.Process]$Process, [int]$TimeoutSec) {
-    # A condição autoritativa do gate é externa: os três hosts WRY precisam
-    # estar visíveis e permanecer assim por uma janela curta. O sinal Ready
-    # continua útil quando chega, mas não pode transformar um comparador já
-    # aberto em falso negativo só porque um timer interno ficou atrás do pump
-    # aninhado do WebView2.
+    # Tres hosts visiveis provam a geometria, mas NAO provam que a janela
+    # nativa terminou a troca de HWND/decorations. O ciclo 2 mostrou exatamente
+    # isso: aceitar 750 ms de estabilidade deixava o gate enviar Home para um
+    # HWND sem a subclass do NeuralIA. Agora Ready é obrigatório.
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $stableSince = $null
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
         $Process.Refresh()
         if ($Process.HasExited) { return $false }
 
         $visible = @(Get-VisibleWebViewSurfaceRects -Process $Process).Count
         if ($visible -ge 3) {
-            if ($null -eq $stableSince) {
-                $stableSince = [System.Diagnostics.Stopwatch]::StartNew()
-            }
             $main = Get-NeuraliaMainWindow -Process $Process
-            if ([NeuraliaCycleWindowProbe]::LifecycleProbeReady($main) -or $stableSince.Elapsed.TotalMilliseconds -ge 750) {
+            if ($main -ne [IntPtr]::Zero -and [NeuraliaCycleWindowProbe]::LifecycleProbeReady($main)) {
                 return $true
             }
-        }
-        else {
-            $stableSince = $null
         }
 
         Start-Sleep -Milliseconds 100
