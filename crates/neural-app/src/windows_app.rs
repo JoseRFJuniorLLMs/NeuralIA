@@ -163,11 +163,6 @@ enum UserEvent {
     /// WebViews. Isto evita reparentear hosts WRY enquanto WebView2 ainda
     /// conclui a destruição dos controllers no pump de mensagens.
     RestoreHomeDecorations,
-    /// Probe de CI: pede Home pelo próprio event loop, sem depender de HWND
-    /// externo que pode ser substituído ao alternar decorations.
-    LifecycleProbeAutoHome,
-    /// Probe de CI: reabre o comparador somente depois de a Home estabilizar.
-    LifecycleProbeAutoReopen,
     RestoreComparator,
     ExitRequested,
     ReaderReady {
@@ -7454,19 +7449,6 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                     if lifecycle_probe_enabled() {
                         LIFECYCLE_HOME_READY.store(true, Ordering::Release);
-                    }
-                }
-            }
-            UserEvent::LifecycleProbeAutoHome => {
-                if lifecycle_probe_enabled() && self.surface == Surface::Comparator {
-                    self.show_home();
-                }
-            }
-            UserEvent::LifecycleProbeAutoReopen => {
-                if lifecycle_probe_enabled() && self.surface == Surface::Home {
-                    let input = startup_input();
-                    if !input.is_empty() {
-                        self.handle_input(input);
                     }
                 }
             }
