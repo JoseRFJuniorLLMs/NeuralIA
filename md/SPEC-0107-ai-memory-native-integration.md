@@ -524,6 +524,23 @@ Criar um Memory Doctor:
 Corrupção do SQLite não pode significar perda irreversível do conhecimento
 mantido.
 
+### 19.1 Estado operacional do Doctor
+
+`MemoryStore::doctor(rebuild)` já é API pública do core. O gate
+`crates/neural-core/tests/spec_0107_doctor.rs` cria fontes duráveis reais,
+injeta um documento JSON corrompido, remove o SQLite derivado e exige que
+`doctor(true)`:
+
+- conte separadamente fontes válidas e corrompidas;
+- não promova o JSON corrompido a conhecimento;
+- recrie o SQLite a partir das fontes válidas;
+- devolva busca semântica/lexical funcional depois do rebuild.
+
+O workflow sabota deliberadamente a chamada a `rebuild()` dentro do Doctor e
+confirma vermelho antes de restaurar. Compatibilidade de modelo/embedding e
+rebuild seletivo de entidades/grafo continuam critérios futuros; o Doctor atual
+é de storage/index, não deve ser descrito como mais do que isso.
+
 ## 20. Atualização futura do upstream
 
 NeuralIA não faz merge contínuo do ai-memory.

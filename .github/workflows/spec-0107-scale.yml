@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'crates/neural-core/tests/spec_0107_scale.rs'
+      - 'crates/neural-core/tests/spec_0107_doctor.rs'
       - 'crates/neural-core/examples/memory_scale.rs'
       - 'crates/neural-core/src/memory.rs'
       - 'md/SPEC-0107-ai-memory-native-integration.md'
@@ -32,6 +33,9 @@ jobs:
 
       - name: Baseline ratio gate
         run: cargo test --locked -p neural-core --test spec_0107_scale -- --nocapture
+
+      - name: Baseline Memory Doctor recovery gate
+        run: cargo test --locked -p neural-core --test spec_0107_doctor -- --nocapture
 
       - name: Prove ratio gate catches quadratic rebuild work
         shell: bash
@@ -67,8 +71,37 @@ jobs:
           fi
           echo "Sabotage proof: quadratic rebuild work was rejected."
 
-      - name: Restored ratio gate
-        run: cargo test --locked -p neural-core --test spec_0107_scale -- --nocapture
+      - name: Prove Memory Doctor gate catches missing rebuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/neural-core/src/memory.rs")
+          s = p.read_text(encoding="utf-8")
+          old = '''        if rebuild {
+              self.rebuild()?;
+          }
+          '''
+          if s.count(old) != 1:
+              raise SystemExit("doctor sabotage target not found exactly once")
+          p.write_text(s.replace(old, ""), encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core --test spec_0107_doctor -- --nocapture
+          rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/memory.rs
+          if [ "$rc" -eq 0 ]; then
+            echo "Memory Doctor sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: Doctor without rebuild was rejected."
+
+      - name: Restored ratio and Doctor gates
+        run: |
+          cargo test --locked -p neural-core --test spec_0107_scale -- --nocapture
+          cargo test --locked -p neural-core --test spec_0107_doctor -- --nocapture
 
   exact-agents-gates:
     runs-on: windows-latest
