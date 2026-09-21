@@ -65,6 +65,14 @@ public static class NeuraliaCycleWindowProbe {
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hWnd);
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr FindWindowEx(
+        IntPtr hWndParent,
+        IntPtr hWndChildAfter,
+        string lpszClass,
+        string lpszWindow
+    );
+
     [DllImport("user32.dll")]
     public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
 
@@ -137,6 +145,18 @@ public static class NeuraliaCycleWindowProbe {
     public static bool RequestLifecycleProbeHome(IntPtr parent) {
         var message = RegisterWindowMessage("NeuralIA.LifecycleProbe.Home");
         return message != 0 && PostMessage(parent, message, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    public static bool ReturnHomeViaNativeEscape(IntPtr parent) {
+        // A omnibox principal é o único EDIT filho direto da janela principal.
+        // A palette tem outro EDIT, mas vive dentro de um popup nativo.
+        var edit = FindWindowEx(parent, IntPtr.Zero, "Edit", null);
+        if (edit == IntPtr.Zero) return false;
+        const uint WM_KEYDOWN = 0x0100;
+        const uint WM_KEYUP = 0x0101;
+        if (!PostMessage(edit, WM_KEYDOWN, new IntPtr(27), IntPtr.Zero)) return false;
+        PostMessage(edit, WM_KEYUP, new IntPtr(27), IntPtr.Zero);
+        return true;
     }
 
     public static bool RequestLifecycleProbeReopen(IntPtr parent) {
@@ -220,9 +240,9 @@ function Return-LifecycleProbeHome([System.Diagnostics.Process]$Process) {
     }
     $parent = Get-CurrentMainWindow -Process $Process
     if ($parent -eq [IntPtr]::Zero) { throw "Janela principal atual do NeuralIA não foi encontrada." }
-    $ok = [NeuraliaCycleWindowProbe]::RequestLifecycleProbeHome($parent)
+    $ok = [NeuraliaCycleWindowProbe]::ReturnHomeViaNativeEscape($parent)
     if (-not $ok) {
-        throw "Falhou ao enfileirar o comando Win32 de Home do lifecycle."
+        throw "Omnibox nativa não encontrada para enviar Escape e regressar a Home."
     }
 }
 
@@ -362,9 +382,9 @@ try {
             break
         }
 
-        # Lifecycle mede os controllers e o teardown, não transporte de teclado.
-        # O comando privado só existe sob NEURALIA_LIFECYCLE_PROBE e enfileira
-        # exactamente HomeRequested no mesmo event loop do produto.
+        # Envia Escape diretamente ao EDIT nativo da omnibox. O controlo pode
+        # estar oculto sob o comparador, mas a sua subclass é o caminho real do
+        # produto: WM_KEYDOWN(ESC) -> HomeRequested -> show_home().
         Return-LifecycleProbeHome -Process $process
 
         # build_as_child torna o HWND WRY_WEBVIEW visivel antes de o pump
