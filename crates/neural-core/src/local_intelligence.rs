@@ -648,10 +648,9 @@ impl ModelPackManager {
     fn write_activation(&self, activation: &ModelPackActivation) -> Result<(), String> {
         fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
         let nonce = MODEL_PACK_NONCE.fetch_add(1, Ordering::Relaxed);
-        let temp = self.root.join(format!(
-            ".active.json.tmp-{}-{nonce}",
-            std::process::id()
-        ));
+        let temp = self
+            .root
+            .join(format!(".active.json.tmp-{}-{nonce}", std::process::id()));
         let final_path = self.root.join(MODEL_PACK_ACTIVE_FILE);
         let backup = self.root.join(format!(
             ".active.json.backup-{}-{nonce}",
@@ -756,7 +755,8 @@ fn validate_pack_version(version: &str) -> Result<(), String> {
 
 fn validate_sha256(value: &str) -> Result<(), String> {
     let value = value.trim();
-    if value.len() != MODEL_PACK_HASH_HEX_LEN || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if value.len() != MODEL_PACK_HASH_HEX_LEN || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         return Err("sha256 inválido no model pack".to_string());
     }
     Ok(())
@@ -776,8 +776,8 @@ fn validate_benchmark(benchmark: &LocalBenchmark) -> Result<(), String> {
 }
 
 fn reject_symlink(path: &Path, label: &str) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
     if metadata.file_type().is_symlink() {
         return Err(format!("{label} não pode ser symlink: {}", path.display()));
     }
@@ -1059,11 +1059,19 @@ mod tests {
         assert!(validate_manifest(&manifest).is_ok());
 
         manifest.license.clear();
-        assert!(validate_manifest(&manifest).unwrap_err().contains("licença"));
+        assert!(
+            validate_manifest(&manifest)
+                .unwrap_err()
+                .contains("licença")
+        );
 
         manifest = valid_manifest("semantic-small", "1.0.0", bytes);
         manifest.capabilities.clear();
-        assert!(validate_manifest(&manifest).unwrap_err().contains("capabilities"));
+        assert!(
+            validate_manifest(&manifest)
+                .unwrap_err()
+                .contains("capabilities")
+        );
 
         manifest = valid_manifest("semantic-small", "", bytes);
         assert!(validate_manifest(&manifest).unwrap_err().contains("versão"));
@@ -1082,7 +1090,10 @@ mod tests {
 
         manager.install(&manifest, bytes).unwrap();
         assert!(
-            manager.activate("semantic-small").unwrap_err().contains("benchmark"),
+            manager
+                .activate("semantic-small")
+                .unwrap_err()
+                .contains("benchmark"),
             "activation must fail before benchmark evidence exists"
         );
 
@@ -1100,7 +1111,9 @@ mod tests {
         assert_eq!(activation.id, "semantic-small");
         let selection = manager.selection();
         assert!(selection.warning.is_none());
-        let active = selection.active.expect("pack must be active after validation");
+        let active = selection
+            .active
+            .expect("pack must be active after validation");
         assert_eq!(active.manifest.version, "1.0.0");
         assert_eq!(active.benchmark.samples, 1);
         assert_eq!(fs::read(active.model_path).unwrap(), bytes);
@@ -1176,5 +1189,4 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
     }
-
 }
