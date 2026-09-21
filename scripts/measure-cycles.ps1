@@ -34,6 +34,8 @@ $resolved = (Resolve-Path $ExePath).Path
 
 Add-Type @"
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 public static class NeuraliaCycleWindowProbe {
@@ -53,24 +55,44 @@ public static class NeuraliaCycleWindowProbe {
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
 
-    public static int VisibleLargeChildren(IntPtr parent) {
-        int count = 0;
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    private static bool IsWebViewWindow(IntPtr hwnd) {
+        uint processId;
+        GetWindowThreadProcessId(hwnd, out processId);
+        if (processId == 0) return false;
+        try {
+            var process = Process.GetProcessById((int)processId);
+            return string.Equals(process.ProcessName, "msedgewebview2", StringComparison.OrdinalIgnoreCase);
+        }
+        catch {
+            return false;
+        }
+    }
+
+    public static List<string> VisibleLargeWebViewRects(IntPtr parent) {
+        var rows = new List<string>();
         EnumChildWindows(parent, delegate(IntPtr hwnd, IntPtr data) {
-            if (!IsWindowVisible(hwnd)) return true;
+            if (!IsWindowVisible(hwnd) || !IsWebViewWindow(hwnd)) return true;
             RECT r;
             if (!GetWindowRect(hwnd, out r)) return true;
             var width = r.Right - r.Left;
             var height = r.Bottom - r.Top;
-            if (width >= 180 && height >= 220) count++;
+            if (width < 180 || height < 220) return true;
+            rows.Add(r.Left + "," + r.Top + "," + r.Right + "," + r.Bottom);
             return true;
         }, IntPtr.Zero);
-        return count;
+        return rows;
     }
 }
 "@
 
-function Get-VisibleLargeChildCount([IntPtr]$Parent) {
-    return [NeuraliaCycleWindowProbe]::VisibleLargeChildren($Parent)
+function Get-VisibleWebViewSurfaceRects([IntPtr]$Parent) {
+    return @(
+        [NeuraliaCycleWindowProbe]::VisibleLargeWebViewRects($Parent) |
+        Sort-Object -Unique
+    )
 }
 
 function Wait-ForNoVisibleWebSurfaces([System.Diagnostics.Process]$Process, [int]$TimeoutSec) {
@@ -78,14 +100,13 @@ function Wait-ForNoVisibleWebSurfaces([System.Diagnostics.Process]$Process, [int
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
         $Process.Refresh()
         if ($Process.HasExited) { return 0 }
-        $count = Get-VisibleLargeChildCount -Parent ([IntPtr]$Process.MainWindowHandle)
+        $count = @(Get-VisibleWebViewSurfaceRects -Parent ([IntPtr]$Process.MainWindowHandle)).Count
         if ($count -eq 0) { return 0 }
         Start-Sleep -Milliseconds 150
     }
     $Process.Refresh()
-    return Get-VisibleLargeChildCount -Parent ([IntPtr]$Process.MainWindowHandle)
+    return @(Get-VisibleWebViewSurfaceRects -Parent ([IntPtr]$Process.MainWindowHandle)).Count
 }
-
 function Get-DescendantIds([int]$RootId) {
     # Win32_Process via CIM is useful for ownership, but on hosted Windows
     # runners a WMI/CIM query can occasionally stall for minutes. Bound this

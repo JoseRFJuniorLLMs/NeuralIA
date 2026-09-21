@@ -10,8 +10,8 @@ $resolved = (Resolve-Path $ExePath).Path
 Add-Type @"
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
-using System.Text;
 
 public static class NeuraliaWindowProbe {
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -31,20 +31,31 @@ public static class NeuraliaWindowProbe {
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
 
     [DllImport("user32.dll")]
-    public static extern int GetClassName(IntPtr hWnd, StringBuilder className, int maxCount);
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 
-    public static List<string> VisibleLargeRects(IntPtr parent) {
+    private static bool IsWebViewWindow(IntPtr hwnd) {
+        uint processId;
+        GetWindowThreadProcessId(hwnd, out processId);
+        if (processId == 0) return false;
+        try {
+            var process = Process.GetProcessById((int)processId);
+            return string.Equals(process.ProcessName, "msedgewebview2", StringComparison.OrdinalIgnoreCase);
+        }
+        catch {
+            return false;
+        }
+    }
+
+    public static List<string> VisibleLargeWebViewRects(IntPtr parent) {
         var rows = new List<string>();
         EnumChildWindows(parent, delegate(IntPtr hwnd, IntPtr data) {
-            if (!IsWindowVisible(hwnd)) return true;
+            if (!IsWindowVisible(hwnd) || !IsWebViewWindow(hwnd)) return true;
             RECT r;
             if (!GetWindowRect(hwnd, out r)) return true;
             var width = r.Right - r.Left;
             var height = r.Bottom - r.Top;
             if (width < 180 || height < 220) return true;
-            var name = new StringBuilder(256);
-            GetClassName(hwnd, name, name.Capacity);
-            rows.Add(r.Left + "," + r.Top + "," + r.Right + "," + r.Bottom + "|" + name.ToString());
+            rows.Add(r.Left + "," + r.Top + "," + r.Right + "," + r.Bottom);
             return true;
         }, IntPtr.Zero);
         return rows;
@@ -71,13 +82,11 @@ try {
     $watch.Restart()
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
         $process.Refresh()
-        $rows = [NeuraliaWindowProbe]::VisibleLargeRects([IntPtr]$process.MainWindowHandle)
-
-        # Dedupe pela geometria: cada WebView2 pode ter mais de um HWND interno
-        # com o mesmo rectangulo, mas as tres colunas têm rectangulos distintos.
+        # Conta somente HWNDs visiveis cujo processo dono e msedgewebview2.
+        # Dedupe pela geometria porque uma mesma superficie pode ter mais de
+        # um HWND interno no runtime.
         $rects = @(
-            $rows |
-            ForEach-Object { ($_ -split '\|')[0] } |
+            [NeuraliaWindowProbe]::VisibleLargeWebViewRects([IntPtr]$process.MainWindowHandle) |
             Sort-Object -Unique
         )
 
@@ -86,7 +95,7 @@ try {
     }
 
     $result = [ordered]@{
-        distinct_visible_large_child_rects = $rects.Count
+        distinct_visible_webview_rects = $rects.Count
         rects = $rects
         mouse_or_keyboard_injected = $false
     }
