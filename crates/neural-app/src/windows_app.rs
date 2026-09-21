@@ -4073,7 +4073,18 @@ impl App {
                 comparator.groups = std::array::from_fn(|_| Vec::new());
                 comparator.next_group_id = 1;
                 for (view, url) in comparator.views.iter().zip(urls) {
-                    if let Err(error) = view.webview.load_url(url) {
+                    let encoded = match serde_json::to_string(url) {
+                        Ok(encoded) => encoded,
+                        Err(error) => {
+                            reload_error = Some(format!(
+                                "URL inválida ao reutilizar {}: {error}",
+                                view.name
+                            ));
+                            break;
+                        }
+                    };
+                    let script = format!("window.location.replace({encoded});");
+                    if let Err(error) = view.webview.evaluate_script(&script) {
                         reload_error = Some(format!(
                             "WebView2 não pôde reutilizar {}: {error}",
                             view.name
