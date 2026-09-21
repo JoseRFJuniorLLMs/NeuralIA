@@ -8,9 +8,10 @@
     sobreviverem ao regresso a Home. Este script fecha esse buraco.
 
     Para cada ciclo:
-      Enter -> o comparador abre e aparecem containers WRY_WEBVIEW
+      startup/reopen interno -> o comparador abre e aparecem containers WRY_WEBVIEW
       o event loop agenda HomeRequested em modo de probe
       Home -> nenhum container WRY_WEBVIEW pode continuar visivel
+      o event loop agenda SubmitText -> proximo ciclo abre sem input sintetico
 
     O runtime WebView2 pode manter um pool de subprocessos para reutilizacao.
     Esse pool pode sobreviver aos controllers, mas nao pode crescer de ciclo em
@@ -194,8 +195,6 @@ $webViewPoolCeiling = $null
 $webViewPoolWarmupCycles = 2
 
 try {
-    $shell = New-Object -ComObject WScript.Shell
-
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     while ($watch.Elapsed.TotalSeconds -lt 10 -and $process.MainWindowHandle -eq 0) {
         Start-Sleep -Milliseconds 50
@@ -208,16 +207,9 @@ try {
     $baselineMiB = [math]::Round($process.WorkingSet64 / 1MB, 2)
 
     for ($cycle = 1; $cycle -le $Cycles; $cycle++) {
-        if ($cycle -gt 1) {
-            # A omnibox mantem texto e foco ao voltar a Home, mas reescrevemos
-            # a consulta para o ciclo nao depender do estado anterior.
-            $null = $shell.AppActivate($process.Id)
-            Start-Sleep -Milliseconds 400
-            $shell.SendKeys("^a")
-            $shell.SendKeys($StartupInput)
-            $shell.SendKeys("{ENTER}")
-        }
-
+        # O primeiro comparador abre por NEURALIA_STARTUP_INPUT. Nos ciclos
+        # seguintes, o proprio event loop agenda SubmitText depois de voltar a
+        # Home. O gate nao depende de foco, AppActivate ou SendKeys.
         $opened = Wait-ForVisibleWebSurfaces -Process $process -Expected 3 -TimeoutSec $OpenTimeoutSec
         if ($opened -lt 3) {
             $null = $failures.Add("ciclo ${cycle}: comparador abriu apenas ${opened} container(s) WRY_WEBVIEW visivel(is)")

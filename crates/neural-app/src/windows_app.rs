@@ -1323,6 +1323,7 @@ fn lifecycle_probe_enabled() -> bool {
 }
 
 const LIFECYCLE_PROBE_HOME_DELAY_MS: u64 = 1_200;
+const LIFECYCLE_PROBE_REOPEN_DELAY_MS: u64 = 450;
 
 #[link(name = "comctl32")]
 unsafe extern "system" {
@@ -7064,7 +7065,18 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::ExitRequested => event_loop.exit(),
-            UserEvent::HomeRequested => self.show_home(),
+            UserEvent::HomeRequested => {
+                self.show_home();
+                if lifecycle_probe_enabled() {
+                    let input = startup_input();
+                    if !input.is_empty() {
+                        self.timers.after(
+                            Duration::from_millis(LIFECYCLE_PROBE_REOPEN_DELAY_MS),
+                            UserEvent::SubmitText(input),
+                        );
+                    }
+                }
+            }
             UserEvent::BackRequested => self.go_back(),
             UserEvent::ToggleAutoScroll => self.toggle_auto_scroll(),
             UserEvent::AutoScrollAnswer(yes) => self.answer_auto_scroll(yes),
@@ -10836,6 +10848,12 @@ mod tests {
             .expect("limpa a marca");
         let read = handler.find("RESIZE_X.load(").expect("le a posicao");
         assert!(cleared < read);
+    }
+
+    #[test]
+    fn lifecycle_probe_has_separate_home_and_reopen_delays() {
+        assert!(LIFECYCLE_PROBE_HOME_DELAY_MS > LIFECYCLE_PROBE_REOPEN_DELAY_MS);
+        assert!(LIFECYCLE_PROBE_REOPEN_DELAY_MS > 0);
     }
 
     #[test]
