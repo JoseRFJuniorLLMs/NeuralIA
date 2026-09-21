@@ -66,6 +66,24 @@ public static class NeuraliaCycleWindowProbe {
     public static extern bool IsWindowVisible(IntPtr hWnd);
 
     [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    public static IntPtr MainWindowForProcess(int processId) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows(delegate(IntPtr hwnd, IntPtr data) {
+            uint owner;
+            GetWindowThreadProcessId(hwnd, out owner);
+            if (owner != (uint)processId || !IsWindowVisible(hwnd)) return true;
+            found = hwnd;
+            return false;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -169,9 +187,17 @@ function Get-NeuraliaMainWindow([System.Diagnostics.Process]$Process) {
     return $hwnd
 }
 
-function Get-VisibleWebViewSurfaceRects([IntPtr]$Parent) {
+function Get-CurrentMainWindow([System.Diagnostics.Process]$Process) {
+    $Process.Refresh()
+    if ($Process.HasExited) { return [IntPtr]::Zero }
+    return [NeuraliaCycleWindowProbe]::MainWindowForProcess($Process.Id)
+}
+
+function Get-VisibleWebViewSurfaceRects([System.Diagnostics.Process]$Process) {
+    $parent = Get-CurrentMainWindow -Process $Process
+    if ($parent -eq [IntPtr]::Zero) { return @() }
     return @(
-        [NeuraliaCycleWindowProbe]::VisibleWryWebViewRects($Parent) |
+        [NeuraliaCycleWindowProbe]::VisibleWryWebViewRects($parent) |
         Sort-Object -Unique
     )
 }
@@ -194,9 +220,9 @@ function Submit-LifecycleProbeQuery([System.Diagnostics.Process]$Process) {
     if ($Process.HasExited) {
         throw "NeuralIA saiu antes de reabrir o comparador."
     }
-    $ok = [NeuraliaCycleWindowProbe]::RequestLifecycleProbeReopen(
-        [IntPtr]$Process.MainWindowHandle
-    )
+    $parent = Get-CurrentMainWindow -Process $Process
+    if ($parent -eq [IntPtr]::Zero) { throw "Janela principal atual do NeuralIA não foi encontrada." }
+    $ok = [NeuraliaCycleWindowProbe]::RequestLifecycleProbeReopen($parent)
     if (-not $ok) {
         throw "Falhou ao enfileirar o comando Win32 de reabertura do lifecycle."
     }
@@ -207,9 +233,9 @@ function Return-LifecycleProbeHome([System.Diagnostics.Process]$Process) {
     if ($Process.HasExited) {
         throw "NeuralIA saiu antes de regressar a Home."
     }
-    $ok = [NeuraliaCycleWindowProbe]::RequestLifecycleProbeHome(
-        [IntPtr]$Process.MainWindowHandle
-    )
+    $parent = Get-CurrentMainWindow -Process $Process
+    if ($parent -eq [IntPtr]::Zero) { throw "Janela principal atual do NeuralIA não foi encontrada." }
+    $ok = [NeuraliaCycleWindowProbe]::RequestLifecycleProbeHome($parent)
     if (-not $ok) {
         throw "Falhou ao enfileirar o comando Win32 de Home do lifecycle."
     }
