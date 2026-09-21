@@ -4,6 +4,12 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-09-21
+
+### Fixed
+- **PR #101 — Correção de instalação e primeira pesquisa v2.1.** Corrigidas regressões no ciclo de vida da WebView e primeira instalação.
+- Nome dos artefatos de release ajustado para `NeuralIA-v2.1.1-windows-x64.exe`.
+
 ## [2.1.0] - 2026-09-20
 
 Auditoria completa do produto e do núcleo, com regressões presas a gates

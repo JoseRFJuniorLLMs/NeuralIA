@@ -156,6 +156,18 @@ enum UserEvent {
     /// `RESIZE_*`, nao do evento: assim os movimentos que chegam enquanto
     /// este esta na fila substituem-se uns aos outros em vez de se somarem.
     ResizeComparator,
+    /// Reaplica a geometria depois de o Windows terminar a transicao
+    /// assíncrona para a janela sem decoracao. Nao depende de rato/teclado.
+    RelayoutComparator,
+    /// Restaura a moldura nativa da Home num ciclo posterior ao drop dos
+    /// WebViews. Isto evita reparentear hosts WRY enquanto WebView2 ainda
+    /// conclui a destruição dos controllers no pump de mensagens.
+    RestoreHomeDecorations,
+    /// Probe de CI: pede Home pelo próprio event loop, sem depender de HWND
+    /// externo que pode ser substituído ao alternar decorations.
+    LifecycleProbeAutoHome,
+    /// Probe de CI: reabre o comparador somente depois de a Home estabilizar.
+    LifecycleProbeAutoReopen,
     RestoreComparator,
     ExitRequested,
     ReaderReady {
@@ -198,6 +210,10 @@ const AUTO_SCROLL_PROMPT_SECONDS: u64 = 20;
 /// Quanto tempo a barra fica visivel em ecra completo depois do ultimo
 /// movimento do rato no topo.
 const CHROME_HIDE_DELAY_MS: u64 = 2500;
+/// A moldura Win32 pode mudar o client rect um ciclo depois de
+/// set_decorations(false). Fazemos dois relayouts baratos para nao deixar
+/// WebViews presos na geometria anterior ate o primeiro movimento do rato.
+const COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS: [u64; 2] = [40, 220];
 /// Quanto tempo o aviso de correio novo fica no canto.
 const GMAIL_TOAST_SECONDS: u64 = 7;
 /// Quantas entradas do historico a caixa "history:" mostra.
@@ -1259,6 +1275,40 @@ fn now_ms() -> u64 {
 /// nessas voltas, que e o unico ponto de pintura que ainda corre.
 static ERASE_PENDING: AtomicBool = AtomicBool::new(false);
 const WINDOW_SUBCLASS_ID: usize = 0x4E4A;
+/// Mensagens privadas usadas somente pelo gate de lifecycle. Usamos
+/// RegisterWindowMessageW em vez de IDs fixos em WM_APP para não colidir com
+/// mensagens privadas do winit/WRY/WebView2. O script registra os mesmos nomes,
+/// então Windows resolve os dois processos para os mesmos IDs de mensagem.
+static LIFECYCLE_PROBE_HOME_MESSAGE: OnceLock<u32> = OnceLock::new();
+static LIFECYCLE_PROBE_REOPEN_MESSAGE: OnceLock<u32> = OnceLock::new();
+static LIFECYCLE_PROBE_READY_MESSAGE: OnceLock<u32> = OnceLock::new();
+static LIFECYCLE_PROBE_HOME_READY_MESSAGE: OnceLock<u32> = OnceLock::new();
+static LIFECYCLE_COMPARATOR_READY: AtomicBool = AtomicBool::new(false);
+static LIFECYCLE_HOME_READY: AtomicBool = AtomicBool::new(false);
+
+fn lifecycle_probe_home_message() -> u32 {
+    *LIFECYCLE_PROBE_HOME_MESSAGE.get_or_init(|| unsafe {
+        RegisterWindowMessageW(windows_sys::w!("NeuralIA.LifecycleProbe.Home"))
+    })
+}
+
+fn lifecycle_probe_reopen_message() -> u32 {
+    *LIFECYCLE_PROBE_REOPEN_MESSAGE.get_or_init(|| unsafe {
+        RegisterWindowMessageW(windows_sys::w!("NeuralIA.LifecycleProbe.Reopen"))
+    })
+}
+
+fn lifecycle_probe_ready_message() -> u32 {
+    *LIFECYCLE_PROBE_READY_MESSAGE.get_or_init(|| unsafe {
+        RegisterWindowMessageW(windows_sys::w!("NeuralIA.LifecycleProbe.Ready"))
+    })
+}
+
+fn lifecycle_probe_home_ready_message() -> u32 {
+    *LIFECYCLE_PROBE_HOME_READY_MESSAGE.get_or_init(|| unsafe {
+        RegisterWindowMessageW(windows_sys::w!("NeuralIA.LifecycleProbe.HomeReady"))
+    })
+}
 const EXIT_BUTTON_SUBCLASS_ID: usize = 0x4E4B;
 const WM_PAINT: u32 = 0x000F;
 const WM_LBUTTONUP: u32 = 0x0202;
@@ -1311,6 +1361,10 @@ fn startup_input() -> String {
         .to_string()
 }
 
+fn lifecycle_probe_enabled() -> bool {
+    std::env::var_os("NEURALIA_LIFECYCLE_PROBE").is_some()
+}
+
 #[link(name = "comctl32")]
 unsafe extern "system" {
     fn SetWindowSubclass(
@@ -1329,6 +1383,7 @@ unsafe extern "system" {
     fn GetCapture() -> HWND;
     fn SetCapture(hwnd: HWND) -> HWND;
     fn ReleaseCapture() -> i32;
+    fn RegisterWindowMessageW(lp_string: *const u16) -> u32;
 }
 
 /// Pincel de fundo da omnibox, um por cor. Criar um a cada WM_CTLCOLOREDIT
@@ -1360,8 +1415,41 @@ unsafe extern "system" fn window_subclass(
     wparam: WPARAM,
     lparam: LPARAM,
     _subclass_id: usize,
-    _reference_data: usize,
+    reference_data: usize,
 ) -> LRESULT {
+    let lifecycle_home = lifecycle_probe_home_message();
+    let lifecycle_reopen = lifecycle_probe_reopen_message();
+    let lifecycle_ready = lifecycle_probe_ready_message();
+    let lifecycle_home_ready = lifecycle_probe_home_ready_message();
+    if message == lifecycle_home_ready {
+        return if lifecycle_probe_enabled() && LIFECYCLE_HOME_READY.load(Ordering::Acquire) {
+            1
+        } else {
+            0
+        };
+    }
+    if message == lifecycle_ready {
+        return if lifecycle_probe_enabled() && LIFECYCLE_COMPARATOR_READY.load(Ordering::Acquire) {
+            1
+        } else {
+            0
+        };
+    }
+    if message == lifecycle_home || message == lifecycle_reopen {
+        if lifecycle_probe_enabled() && reference_data != 0 {
+            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+            if message == lifecycle_home {
+                let _ = proxy.send_event(UserEvent::HomeRequested);
+            } else {
+                let input = startup_input();
+                if !input.is_empty() {
+                    let _ = proxy.send_event(UserEvent::SubmitText(input));
+                }
+            }
+        }
+        return 0;
+    }
+
     if message == WM_ERASEBKGND {
         if ERASE_PENDING.swap(false, Ordering::SeqCst) {
             let hdc = wparam as *mut core::ffi::c_void;
@@ -1714,6 +1802,14 @@ unsafe extern "system" fn omnibox_subclass(
     _subclass_id: usize,
     reference_data: usize,
 ) -> LRESULT {
+    if message == lifecycle_probe_home_message() && lifecycle_probe_enabled() && reference_data != 0
+    {
+        let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+        SetWindowTextW(hwnd, windows_sys::w!(""));
+        let _ = proxy.send_event(UserEvent::HomeRequested);
+        return 0;
+    }
+
     if message == WM_KEYDOWN {
         let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
         let ctrl = (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;
@@ -2828,6 +2924,23 @@ impl App {
         self.request_redraw();
     }
 
+    /// Reinstala a subclasse da janela principal depois de transições de
+    /// decoração. No Windows, alternar a moldura pode substituir o HWND nativo;
+    /// SetWindowSubclass é idempotente para o mesmo callback/id e atualiza o
+    /// reference_data quando a janela continua a mesma.
+    fn ensure_window_subclass(&self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(parent) = window_hwnd(window) else {
+            return;
+        };
+        let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
+        unsafe {
+            SetWindowSubclass(parent, Some(window_subclass), WINDOW_SUBCLASS_ID, proxy_ptr);
+        }
+    }
+
     fn create_omnibox(&mut self) {
         let Some(window) = &self.window else {
             return;
@@ -2870,7 +2983,7 @@ impl App {
                 return;
             }
 
-            SetWindowSubclass(parent, Some(window_subclass), WINDOW_SUBCLASS_ID, 0);
+            SetWindowSubclass(parent, Some(window_subclass), WINDOW_SUBCLASS_ID, proxy_ptr);
 
             self.omnibox = Some(edit);
             self.position_omnibox();
@@ -2991,13 +3104,36 @@ impl App {
     }
 
     fn destroy_web_surfaces(&mut self) {
+        if lifecycle_probe_enabled() {
+            LIFECYCLE_COMPARATOR_READY.store(false, Ordering::Release);
+            LIFECYCLE_HOME_READY.store(false, Ordering::Release);
+        }
         self.mark_dirty();
         self.close_palette();
         self.finish_agent(AgentTermination::UserStopped);
-        self.leave_fullscreen();
-        if let Some(window) = &self.window {
-            window.set_decorations(true);
+
+        // Derruba as superfícies WebView ANTES de alterar fullscreen/decoração.
+        // No Windows, essas transições podem substituir ou reparentear o HWND
+        // principal. Fazer a troca de chrome com controllers ainda vivos deixa
+        // hosts WRY_WEBVIEW da segunda abertura presos ao HWND anterior e eles
+        // reaparecem sobre a Home mesmo depois do drop.
+        if let Some(comparator) = self.comparator.take() {
+            for view in &comparator.views {
+                let _ = view.webview.set_visible(false);
+                let _ = view.webview.focus_parent();
+            }
+            if let Some(split) = &comparator.split {
+                let _ = split.webview.set_visible(false);
+                let _ = split.webview.focus_parent();
+            }
+            drop(comparator);
         }
+        if let Some(webview) = self.webview.take() {
+            let _ = webview.set_visible(false);
+            let _ = webview.focus_parent();
+            drop(webview);
+        }
+
         if let Some(button) = self.exit_button.take() {
             unsafe {
                 DestroyWindow(button);
@@ -3010,13 +3146,15 @@ impl App {
                 }
             }
         }
-        if let Some(comparator) = self.comparator.take() {
-            drop(comparator);
-        }
-        if let Some(webview) = self.webview.take() {
-            let _ = webview.focus_parent();
-            drop(webview);
-        }
+
+        // O drop dos controllers pode concluir a destruição dos HWNDs WRY no
+        // pump de mensagens seguinte. Restaurar a decoração aqui, no mesmo
+        // stack, pode reparentear esses hosts para o novo HWND da Home e deixá-los
+        // visíveis a partir da segunda abertura. Deixe o event loop respirar
+        // antes de trocar o chrome nativo.
+        self.leave_fullscreen();
+        self.timers
+            .after(Duration::from_millis(40), UserEvent::RestoreHomeDecorations);
         if let Ok(mut bytes) = self.pdf_bytes.lock() {
             *bytes = Vec::new();
         }
@@ -3025,8 +3163,14 @@ impl App {
 
     fn show_home(&mut self) {
         self.next_generation();
-        self.destroy_web_surfaces();
         self.surface = Surface::Home;
+
+        // Home é uma fronteira de ciclo de vida real. Destruir os controllers
+        // aqui garante que nenhum host WRY_WEBVIEW sobreviva oculto/reparentado
+        // entre pesquisas. Reuso dentro do próprio comparador continua possível,
+        // mas sair para Home sempre encerra as superfícies web.
+        self.destroy_web_surfaces();
+
         self.bar_hover = None;
         self.status = None;
         self.next_home_frame = Instant::now();
@@ -3888,7 +4032,13 @@ impl App {
     }
 
     fn open_comparator(&mut self, query: &str) {
-        self.destroy_web_surfaces();
+        let reuse_comparator = self
+            .comparator
+            .as_ref()
+            .is_some_and(|comp| comp.views.len() == COMPARATOR_COLUMNS);
+        if !reuse_comparator {
+            self.destroy_web_surfaces();
+        }
         self.show_omnibox(false);
 
         let google_url = match google_ai_url(query, &self.config.language) {
@@ -3919,6 +4069,53 @@ impl App {
         // No comparador o chrome e nosso: a primeira linha recebe as abas e os
         // controles de janela; a segunda fica reservada aos provedores.
         window.set_decorations(false);
+        self.ensure_window_subclass();
+
+        if reuse_comparator {
+            let urls = [
+                google_url.as_str(),
+                chatgpt_url.as_str(),
+                claude_url.as_str(),
+            ];
+            let mut reload_error = None;
+            if let Some(comparator) = &mut self.comparator {
+                comparator.expanded = None;
+                comparator.minimized = [false; COMPARATOR_COLUMNS];
+                comparator.weights = [1.0; COMPARATOR_COLUMNS];
+                if let Some(split) = comparator.split.take() {
+                    let _ = split.webview.set_visible(false);
+                    let _ = split.webview.focus_parent();
+                    drop(split);
+                }
+                comparator.contexts = std::array::from_fn(|_| Vec::new());
+                comparator.groups = std::array::from_fn(|_| Vec::new());
+                comparator.next_group_id = 1;
+                for (view, url) in comparator.views.iter().zip(urls) {
+                    let encoded = match serde_json::to_string(url) {
+                        Ok(encoded) => encoded,
+                        Err(error) => {
+                            reload_error =
+                                Some(format!("URL inválida ao reutilizar {}: {error}", view.name));
+                            break;
+                        }
+                    };
+                    let script = format!("window.location.replace({encoded});");
+                    if let Err(error) = view.webview.evaluate_script(&script) {
+                        reload_error = Some(format!(
+                            "WebView2 não pôde reutilizar {}: {error}",
+                            view.name
+                        ));
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = reload_error {
+                self.show_native_error(error);
+                return;
+            }
+            self.activate_comparator(false);
+            return;
+        }
 
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
@@ -3973,11 +4170,38 @@ impl App {
             groups: std::array::from_fn(|_| Vec::new()),
             next_group_id: 1,
         });
+        self.activate_comparator(true);
+    }
+
+    fn activate_comparator(&mut self, sync_remote_buttons: bool) {
         self.bar_hover = None;
         self.surface = Surface::Comparator;
+
+        // build_as_child nasce antes de self.comparator existir, portanto o
+        // primeiro layout feito durante a construcao nao pode passar pela
+        // rotina que tambem torna cada controller visivel. Reaplicar aqui e
+        // essencial também ao reutilizar controllers estacionados na Home.
+        self.needs_clear = true;
+        self.update_comparator_layout();
+        self.sync_comparator_splitters();
+        // Na reutilização acabámos de iniciar três navegações. Executar outro
+        // script remoto aqui pode manter WebView2 dentro do pump aninhado e
+        // impedir o callback de devolver o controlo ao winit. O relayout de
+        // 40 ms sincroniza os botões depois que o event loop já respirou.
+        if sync_remote_buttons {
+            self.sync_comparator_buttons();
+        }
+        self.sync_exit_button();
+
+        for delay_ms in COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS {
+            self.timers.after(
+                Duration::from_millis(delay_ms),
+                UserEvent::RelayoutComparator,
+            );
+        }
+
         self.schedule_gmail_probe(4);
         self.begin_reading_session(false);
-        self.sync_comparator_splitters();
         self.request_redraw();
     }
 
@@ -7148,6 +7372,68 @@ impl ApplicationHandler<UserEvent> for App {
                     );
                 }
             }
+            UserEvent::RelayoutComparator => {
+                if self.surface == Surface::Comparator {
+                    // set_decorations(false) pode substituir/reconfigurar o HWND
+                    // depois de open_comparator() regressar. Reinstalar a subclass
+                    // aqui prende os comandos nativos ao HWND que ficou realmente
+                    // ativo, em vez de ao handle anterior da Home.
+                    self.ensure_window_subclass();
+                    self.needs_clear = true;
+                    self.update_comparator_layout();
+                    self.sync_comparator_splitters();
+                    self.sync_comparator_buttons();
+                    self.sync_exit_button();
+                    if lifecycle_probe_enabled()
+                        && !LIFECYCLE_COMPARATOR_READY.swap(true, Ordering::AcqRel)
+                    {
+                        // O benchmark mede teardown, não transporte de teclado ou
+                        // de mensagens para um HWND que o Windows pode substituir.
+                        // Agenda a mesma transição HomeRequested dentro do event
+                        // loop, depois de o comparador ter estabilizado.
+                        self.timers.after(
+                            Duration::from_millis(800),
+                            UserEvent::LifecycleProbeAutoHome,
+                        );
+                    }
+                    self.request_redraw();
+                }
+            }
+            UserEvent::RestoreHomeDecorations => {
+                if self.surface == Surface::Home {
+                    if let Some(window) = &self.window {
+                        window.set_decorations(true);
+                    }
+                    self.ensure_window_subclass();
+                    self.needs_clear = true;
+                    self.position_omnibox();
+                    self.request_redraw();
+                    if lifecycle_probe_enabled()
+                        && !LIFECYCLE_HOME_READY.swap(true, Ordering::AcqRel)
+                    {
+                        // A reabertura automática ocorre bem depois da medição da
+                        // Home. Assim cada ciclo começa somente após a restauração
+                        // de decorations/HWND do ciclo anterior.
+                        self.timers.after(
+                            Duration::from_millis(4000),
+                            UserEvent::LifecycleProbeAutoReopen,
+                        );
+                    }
+                }
+            }
+            UserEvent::LifecycleProbeAutoHome => {
+                if lifecycle_probe_enabled() && self.surface == Surface::Comparator {
+                    self.show_home();
+                }
+            }
+            UserEvent::LifecycleProbeAutoReopen => {
+                if lifecycle_probe_enabled() && self.surface == Surface::Home {
+                    let input = startup_input();
+                    if !input.is_empty() {
+                        self.handle_input(input);
+                    }
+                }
+            }
             UserEvent::RestoreComparator => {
                 if self.surface == Surface::Comparator {
                     self.restore_comparator();
@@ -9731,6 +10017,8 @@ mod tests {
     #[test]
     fn private_panel_and_new_tab_are_wired() {
         assert!(NEURALIA_KEYMAP_SCRIPT.contains("act('newtab', { col:colIndex })"));
+        assert!(NEURALIA_KEYMAP_SCRIPT.contains("key === 'escape'"));
+        assert!(NEURALIA_KEYMAP_SCRIPT.contains("act('back')"));
         assert!(format!("{:?}", neuralia_action("neuralia:newtab")).starts_with("Some(NewTab"));
         assert_ne!(BarHit::Private, BarHit::SplitClose);
     }
@@ -10492,6 +10780,9 @@ mod tests {
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("chatgpt.com"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("claude.ai"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("button.click()"));
+        assert!(AI_AUTO_SUBMIT_SCRIPT.contains("form.requestSubmit"));
+        assert!(AI_AUTO_SUBMIT_SCRIPT.contains("lastSubmitAt"));
+        assert!(AI_AUTO_SUBMIT_SCRIPT.contains("setTimeout(submitWhenReady, 150)"));
     }
 
     #[test]
@@ -10768,6 +11059,15 @@ mod tests {
             .expect("limpa a marca");
         let read = handler.find("RESIZE_X.load(").expect("le a posicao");
         assert!(cleared < read);
+    }
+
+    #[test]
+    fn first_comparator_layout_retries_without_waiting_for_mouse_input() {
+        assert_eq!(COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS.len(), 2);
+        assert!(COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS[0] > 0);
+        assert!(
+            COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS[1] > COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS[0]
+        );
     }
 
     #[test]
@@ -12623,43 +12923,106 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
     }
   }
 
+  // Reaviva o estado do framework quando o proprio ?q= desenhou texto no
+  // editor mas ainda nao habilitou o botao de envio.
+  function nudge(el) {
+    if (!el) return;
+    try {
+      el.dispatchEvent(new InputEvent('input', { bubbles:true, inputType:'insertText' }));
+    } catch (_) {
+      el.dispatchEvent(new Event('input', { bubbles:true }));
+    }
+    el.dispatchEvent(new Event('change', { bubbles:true }));
+  }
+
+  // Primeiro tenta o botao real. Se o fornecedor escondeu o botao mas o
+  // editor pertence a um form, requestSubmit() percorre o caminho nativo do
+  // formulario. O KeyboardEvent sintetico fica apenas como ultimo recurso:
+  // Chromium marca-o isTrusted=false e os fornecedores podem ignora-lo.
+  function submitEditor(el) {
+    const button = sendButton();
+    if (button) {
+      button.click();
+      return 'button';
+    }
+
+    const form = el && typeof el.closest === 'function' ? el.closest('form') : null;
+    if (form && typeof form.requestSubmit === 'function') {
+      try {
+        const submitter = form.querySelector(
+          'button[type="submit"]:not([disabled]), input[type="submit"]:not([disabled])'
+        );
+        if (submitter) form.requestSubmit(submitter);
+        else form.requestSubmit();
+        return 'form';
+      } catch (_) {}
+    }
+
+    el.focus();
+    for (const type of ['keydown', 'keypress', 'keyup']) {
+      el.dispatchEvent(new KeyboardEvent(type, {
+        key:'Enter', code:'Enter', keyCode:13, which:13,
+        bubbles:true, cancelable:true
+      }));
+    }
+    return 'keyboard';
+  }
+
   let attempts = 0;
   let filled = false;
+  let nudged = false;
+  let lastSubmitAt = 0;
+
   function submitWhenReady() {
     attempts += 1;
-    if (consumed()) return;
+
+    if (consumed()) {
+      stampWrite(stampKey, Date.now());
+      return;
+    }
+
     const el = editor();
+
+    // Depois de uma tentativa, o compositor vazio e o melhor reconhecimento
+    // transversal de que o site aceitou a pergunta. Nao ha novo clique.
+    if (lastSubmitAt && el && !textOf(el)) {
+      stampWrite(stampKey, Date.now());
+      return;
+    }
+
     if (el) {
-      // Dez tentativas (~1,5 s) a dar hipotese ao proprio site de preencher;
-      // passadas essas, escrevemos nos.
+      // Dez tentativas (~1,5 s) para o proprio site preencher o compositor.
+      // Depois disso escrevemos nos, caso ele ainda esteja vazio.
       if (!textOf(el) && !filled && attempts > 10) {
         fill(el);
         filled = true;
       }
+
       if (textOf(el)) {
-        const button = sendButton();
-        if (button) {
-          stampWrite(stampKey, Date.now());
-          button.click();
-          return;
+        // Um ?q= pode pintar a string sem acordar o estado React. Reemitir
+        // input/change uma vez deixa o botao real nascer/habilitar.
+        if (!nudged && attempts > 8) {
+          nudge(el);
+          nudged = true;
         }
-        // Sem botao utilizavel, Enter no editor e o caminho que estes sitios
-        // tambem aceitam.
-        if (attempts > 20) {
-          stampWrite(stampKey, Date.now());
-          el.focus();
-          for (const type of ['keydown', 'keypress', 'keyup']) {
-            el.dispatchEvent(new KeyboardEvent(type, { key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true, cancelable:true }));
-          }
-          return;
+
+        const now = Date.now();
+        // Nao martelar o endpoint enquanto uma submissao anterior ainda pode
+        // estar em voo. Se um Enter sintetico for ignorado, continuamos a
+        // observar e tentamos o botao/formulario assim que aparecer.
+        if (attempts > 10 && now - lastSubmitAt >= 2500) {
+          lastSubmitAt = now;
+          submitEditor(el);
         }
       }
     }
-    if (attempts < 120) {
+
+    if (attempts < 160) {
       setTimeout(submitWhenReady, 150);
       return;
     }
-    // Desistimos ao fim de ~18 s. Se fomos NOS a escrever e nunca chegou a ser
+
+    // Desistimos ao fim de ~24 s. Se fomos NOS a escrever e nunca chegou a ser
     // enviado, a pergunta nao pode ficar la a fingir que o utilizador a
     // escreveu.
     if (filled) clear(el || editor());
