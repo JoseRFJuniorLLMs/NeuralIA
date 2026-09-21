@@ -3077,27 +3077,13 @@ impl App {
         self.mark_dirty();
         self.close_palette();
         self.finish_agent(AgentTermination::UserStopped);
-        self.leave_fullscreen();
-        if let Some(window) = &self.window {
-            window.set_decorations(true);
-        }
-        self.ensure_window_subclass();
-        if let Some(button) = self.exit_button.take() {
-            unsafe {
-                DestroyWindow(button);
-            }
-        }
-        for splitter in &mut self.splitters {
-            if let Some(hwnd) = splitter.take() {
-                unsafe {
-                    DestroyWindow(hwnd);
-                }
-            }
-        }
+
+        // Derruba as superfícies WebView ANTES de alterar fullscreen/decoração.
+        // No Windows, essas transições podem substituir ou reparentear o HWND
+        // principal. Fazer a troca de chrome com controllers ainda vivos deixa
+        // hosts WRY_WEBVIEW da segunda abertura presos ao HWND anterior e eles
+        // reaparecem sobre a Home mesmo depois do drop.
         if let Some(comparator) = self.comparator.take() {
-            // WebView2 pode manter a HWND filha visível por alguns ciclos de
-            // mensagens mesmo depois do drop do controller. Esconde primeiro,
-            // depois devolve o foco ao pai e só então destrói o estado.
             for view in &comparator.views {
                 let _ = view.webview.set_visible(false);
                 let _ = view.webview.focus_parent();
@@ -3113,6 +3099,27 @@ impl App {
             let _ = webview.focus_parent();
             drop(webview);
         }
+
+        if let Some(button) = self.exit_button.take() {
+            unsafe {
+                DestroyWindow(button);
+            }
+        }
+        for splitter in &mut self.splitters {
+            if let Some(hwnd) = splitter.take() {
+                unsafe {
+                    DestroyWindow(hwnd);
+                }
+            }
+        }
+
+        // Só depois de não haver controllers WebView vivos é seguro trocar o
+        // chrome nativo e reinstalar a subclasse no HWND que ficou ativo.
+        self.leave_fullscreen();
+        if let Some(window) = &self.window {
+            window.set_decorations(true);
+        }
+        self.ensure_window_subclass();
         if let Ok(mut bytes) = self.pdf_bytes.lock() {
             *bytes = Vec::new();
         }
