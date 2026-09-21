@@ -3146,8 +3146,7 @@ impl App {
 
     fn show_home(&mut self) {
         self.next_generation();
-        let park_comparator =
-            self.surface == Surface::Comparator && self.comparator.is_some();
+        let park_comparator = self.surface == Surface::Comparator && self.comparator.is_some();
 
         // Muda o estado ANTES de restaurar a decoração da janela ou esconder
         // os WebViews. set_decorations(true) pode bombear mensagens e entregar
