@@ -28,6 +28,30 @@ public static class NeuraliaWindowProbe {
     public static extern bool IsWindowVisible(IntPtr hWnd);
 
     [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+
+    private const uint GW_OWNER = 4;
+
+    public static IntPtr MainWindowForProcess(int processId) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows(delegate(IntPtr hwnd, IntPtr data) {
+            uint owner;
+            GetWindowThreadProcessId(hwnd, out owner);
+            if (owner != (uint)processId || !IsWindowVisible(hwnd)) return true;
+            if (GetWindow(hwnd, GW_OWNER) != IntPtr.Zero) return true;
+            found = hwnd;
+            return false;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -78,10 +102,15 @@ try {
         # Conta os containers WRY_WEBVIEW reais do produto. Eles sao os
         # HWNDs que o WRY posiciona, esconde e destroi; nao as janelas internas
         # do processo msedgewebview2.
-        $rects = @(
-            [NeuraliaWindowProbe]::VisibleWryWebViewRects([IntPtr]$process.MainWindowHandle) |
-            Sort-Object -Unique
-        )
+        $parent = [NeuraliaWindowProbe]::MainWindowForProcess($process.Id)
+        $rects = if ($parent -eq [IntPtr]::Zero) {
+            @()
+        } else {
+            @(
+                [NeuraliaWindowProbe]::VisibleWryWebViewRects($parent) |
+                Sort-Object -Unique
+            )
+        }
 
         if ($rects.Count -ge 3) { break }
         Start-Sleep -Milliseconds 150
