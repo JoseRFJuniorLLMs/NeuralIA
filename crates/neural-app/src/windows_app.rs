@@ -10871,6 +10871,15 @@ mod tests {
             COMPARATOR_INJECT_SCRIPT
                 .contains("act('link', { col:colIndex, url:target.href, aside:aside })")
         );
+        // Os provedores usam React, popovers e Shadow DOM. O interceptador tem
+        // de chegar antes dos handlers de document e descobrir o link real no
+        // composed path; depois que assume um link externo, nenhum listener do
+        // site pode disparar uma segunda navegacao concorrente.
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("listen(window, 'click'"));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("listen(window, 'auxclick'"));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("event.composedPath"));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("event.stopImmediatePropagation()"));
+        assert!(!COMPARATOR_INJECT_SCRIPT.contains("event.defaultPrevented) return"));
         // O botao do meio chega como `auxclick`; dentro de `click` o
         // `event.button` e sempre 0. Ter isto aqui e presenca, nao
         // comportamento -- o que decide para onde vai o clique esta em
