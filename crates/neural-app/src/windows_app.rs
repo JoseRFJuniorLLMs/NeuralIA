@@ -50,13 +50,12 @@ use windows_sys::Win32::{
         },
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
-            EnumChildWindows, ES_AUTOHSCROLL, GetClassNameW, GetClientRect, GetCursorPos,
+            ES_AUTOHSCROLL, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
             GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-            IDYES, MB_ICONINFORMATION, MB_OK, MB_YESNO,
-            MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
-            SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-            TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
-            WS_TABSTOP, WS_VISIBLE,
+            IDYES, MB_ICONINFORMATION, MB_OK, MB_YESNO, MF_SEPARATOR, MF_STRING, MessageBoxW,
+            SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos,
+            SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_KEYDOWN,
+            WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -8071,8 +8070,7 @@ unsafe extern "system" fn hide_wry_webview_host(hwnd: HWND, _lparam: LPARAM) -> 
     let mut class_name = [0u16; 64];
     let len = GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32);
     if len > 0
-        && String::from_utf16_lossy(&class_name[..len as usize])
-            .eq_ignore_ascii_case("WRY_WEBVIEW")
+        && String::from_utf16_lossy(&class_name[..len as usize]).eq_ignore_ascii_case("WRY_WEBVIEW")
     {
         ShowWindow(hwnd, SW_HIDE);
     }
