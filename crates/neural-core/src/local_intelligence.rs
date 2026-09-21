@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeSet,
     fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -12,6 +13,9 @@ use sha2::{Digest, Sha256};
 pub const EMBEDDING_DIM: usize = 384;
 
 static MODEL_PACK_NONCE: AtomicU64 = AtomicU64::new(1);
+const MODEL_PACK_ACTIVE_FILE: &str = "active.json";
+const MODEL_PACK_BENCHMARK_FILE: &str = "benchmark.json";
+const MODEL_PACK_HASH_HEX_LEN: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IntentClass {
@@ -307,6 +311,43 @@ pub struct LocalBenchmark {
     pub measured_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelPackActivation {
+    pub id: String,
+    pub version: String,
+    pub sha256: String,
+    pub activated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveModelPack {
+    pub manifest: ModelPackManifest,
+    pub model_path: PathBuf,
+    pub benchmark: LocalBenchmark,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelPackSelection {
+    pub active: Option<ActiveModelPack>,
+    pub warning: Option<String>,
+}
+
+impl ModelPackSelection {
+    pub fn deterministic_fallback() -> Self {
+        Self {
+            active: None,
+            warning: None,
+        }
+    }
+
+    fn fallback_with_warning(warning: impl Into<String>) -> Self {
+        Self {
+            active: None,
+            warning: Some(warning.into()),
+        }
+    }
+}
+
 pub fn benchmark_local_intelligence(
     backend: &str,
     ai: &dyn LocalIntelligence,
@@ -373,14 +414,20 @@ impl ModelPackManager {
                 manifest.id
             ));
         }
+        validate_manifest(&manifest)?;
         Ok(manifest)
     }
 
     pub fn verify(&self, manifest: &ModelPackManifest) -> Result<PathBuf, String> {
-        validate_pack_component(&manifest.id)?;
-        validate_pack_component(&manifest.file)?;
+        validate_manifest(manifest)?;
 
-        let path = self.root.join(&manifest.id).join(&manifest.file);
+        let pack = self.root.join(&manifest.id);
+        reject_symlink(&pack, "diretório do model pack")?;
+        let manifest_path = pack.join("manifest.json");
+        reject_symlink(&manifest_path, "manifest do model pack")?;
+
+        let path = pack.join(&manifest.file);
+        reject_symlink(&path, "ficheiro do model pack")?;
         let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
         let actual = format!("{:x}", Sha256::digest(bytes));
         if !actual.eq_ignore_ascii_case(manifest.sha256.trim()) {
@@ -418,8 +465,7 @@ impl ModelPackManager {
         manifest: &ModelPackManifest,
         model_bytes: &[u8],
     ) -> Result<PathBuf, String> {
-        validate_pack_component(&manifest.id)?;
-        validate_pack_component(&manifest.file)?;
+        validate_manifest(manifest)?;
         let actual = format!("{:x}", Sha256::digest(model_bytes));
         if !actual.eq_ignore_ascii_case(manifest.sha256.trim()) {
             return Err(format!("hash do model pack {} não confere", manifest.id));
@@ -486,8 +532,158 @@ impl ModelPackManager {
         if !path.exists() {
             return Ok(false);
         }
+
+        if self
+            .read_activation()?
+            .as_ref()
+            .is_some_and(|activation| activation.id == id)
+        {
+            self.deactivate()?;
+        }
+
         fs::remove_dir_all(path).map_err(|error| error.to_string())?;
         Ok(true)
+    }
+
+    /// Ativação explícita do artefacto, ainda no nível de biblioteca.
+    ///
+    /// A ativação só grava estado depois de manifest, licença, hash e benchmark
+    /// terem sido verificados. Ela NÃO carrega um backend nem toca no browser.
+    pub fn activate(&self, id: &str) -> Result<ModelPackActivation, String> {
+        let manifest = self.load_manifest(id)?;
+        self.verify(&manifest)?;
+        let benchmark = self.load_benchmark(id)?;
+        validate_benchmark(&benchmark)?;
+
+        let activation = ModelPackActivation {
+            id: manifest.id.clone(),
+            version: manifest.version.clone(),
+            sha256: manifest.sha256.to_ascii_lowercase(),
+            activated_at: now_unix_seconds(),
+        };
+        self.write_activation(&activation)?;
+        Ok(activation)
+    }
+
+    pub fn deactivate(&self) -> Result<bool, String> {
+        let path = self.root.join(MODEL_PACK_ACTIVE_FILE);
+        match fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Resolve o pack ativo sem sacrificar o fallback determinístico.
+    ///
+    /// Estado ausente => fallback limpo. Estado corrompido, pack apagado,
+    /// hash alterado ou benchmark inválido => fallback + warning diagnóstico.
+    pub fn selection(&self) -> ModelPackSelection {
+        let activation = match self.read_activation() {
+            Ok(Some(activation)) => activation,
+            Ok(None) => return ModelPackSelection::deterministic_fallback(),
+            Err(error) => return ModelPackSelection::fallback_with_warning(error),
+        };
+
+        let manifest = match self.load_manifest(&activation.id) {
+            Ok(manifest) => manifest,
+            Err(error) => return ModelPackSelection::fallback_with_warning(error),
+        };
+        if manifest.version != activation.version
+            || !manifest
+                .sha256
+                .eq_ignore_ascii_case(activation.sha256.trim())
+        {
+            return ModelPackSelection::fallback_with_warning(format!(
+                "estado ativo do model pack {} não corresponde ao manifest instalado",
+                activation.id
+            ));
+        }
+
+        let model_path = match self.verify(&manifest) {
+            Ok(path) => path,
+            Err(error) => return ModelPackSelection::fallback_with_warning(error),
+        };
+        let benchmark = match self.load_benchmark(&manifest.id) {
+            Ok(benchmark) => benchmark,
+            Err(error) => return ModelPackSelection::fallback_with_warning(error),
+        };
+        if let Err(error) = validate_benchmark(&benchmark) {
+            return ModelPackSelection::fallback_with_warning(error);
+        }
+
+        ModelPackSelection {
+            active: Some(ActiveModelPack {
+                manifest,
+                model_path,
+                benchmark,
+            }),
+            warning: None,
+        }
+    }
+
+    fn load_benchmark(&self, id: &str) -> Result<LocalBenchmark, String> {
+        validate_pack_component(id)?;
+        let path = self.root.join(id).join(MODEL_PACK_BENCHMARK_FILE);
+        reject_symlink(&path, "benchmark do model pack")?;
+        let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+    }
+
+    fn read_activation(&self) -> Result<Option<ModelPackActivation>, String> {
+        let path = self.root.join(MODEL_PACK_ACTIVE_FILE);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        };
+        let activation: ModelPackActivation =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        validate_pack_component(&activation.id)?;
+        validate_pack_version(&activation.version)?;
+        validate_sha256(&activation.sha256)?;
+        Ok(Some(activation))
+    }
+
+    fn write_activation(&self, activation: &ModelPackActivation) -> Result<(), String> {
+        fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
+        let nonce = MODEL_PACK_NONCE.fetch_add(1, Ordering::Relaxed);
+        let temp = self.root.join(format!(
+            ".active.json.tmp-{}-{nonce}",
+            std::process::id()
+        ));
+        let final_path = self.root.join(MODEL_PACK_ACTIVE_FILE);
+        let backup = self.root.join(format!(
+            ".active.json.backup-{}-{nonce}",
+            std::process::id()
+        ));
+
+        fs::write(
+            &temp,
+            serde_json::to_vec_pretty(activation).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+
+        let had_existing = final_path.exists();
+        if had_existing {
+            fs::rename(&final_path, &backup).map_err(|error| {
+                let _ = fs::remove_file(&temp);
+                error.to_string()
+            })?;
+        }
+
+        if let Err(error) = fs::rename(&temp, &final_path) {
+            if had_existing {
+                let _ = fs::rename(&backup, &final_path);
+            }
+            let _ = fs::remove_file(&temp);
+            return Err(error.to_string());
+        }
+
+        if had_existing {
+            let _ = fs::remove_file(&backup);
+        }
+        Ok(())
     }
 
     pub fn record_benchmark(
@@ -496,9 +692,12 @@ impl ModelPackManager {
         benchmark: &LocalBenchmark,
     ) -> Result<PathBuf, String> {
         validate_pack_component(id)?;
+        let manifest = self.load_manifest(id)?;
+        self.verify(&manifest)?;
+        validate_benchmark(benchmark)?;
+
         let dir = self.root.join(id);
-        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-        let path = dir.join("benchmark.json");
+        let path = dir.join(MODEL_PACK_BENCHMARK_FILE);
         let temp = dir.join(".benchmark.json.tmp");
         fs::write(
             &temp,
@@ -508,6 +707,81 @@ impl ModelPackManager {
         fs::rename(temp, &path).map_err(|error| error.to_string())?;
         Ok(path)
     }
+}
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn validate_manifest(manifest: &ModelPackManifest) -> Result<(), String> {
+    validate_pack_component(&manifest.id)?;
+    validate_pack_component(&manifest.file)?;
+    validate_pack_version(&manifest.version)?;
+    validate_sha256(&manifest.sha256)?;
+
+    if manifest.license.trim().is_empty() {
+        return Err("model pack sem metadados de licença".to_string());
+    }
+    if manifest.capabilities.is_empty() {
+        return Err("model pack sem capabilities declaradas".to_string());
+    }
+    for capability in &manifest.capabilities {
+        let capability = capability.trim();
+        if capability.is_empty()
+            || !capability
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        {
+            return Err(format!("capability inválida no model pack: {capability:?}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_pack_version(version: &str) -> Result<(), String> {
+    let version = version.trim();
+    if version.is_empty()
+        || version.len() > 64
+        || !version
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+    {
+        return Err("versão inválida no model pack".to_string());
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.len() != MODEL_PACK_HASH_HEX_LEN || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("sha256 inválido no model pack".to_string());
+    }
+    Ok(())
+}
+
+fn validate_benchmark(benchmark: &LocalBenchmark) -> Result<(), String> {
+    if benchmark.backend.trim().is_empty() {
+        return Err("benchmark sem backend".to_string());
+    }
+    if benchmark.samples == 0 {
+        return Err("benchmark sem amostras".to_string());
+    }
+    if benchmark.embedding_dimension == 0 {
+        return Err("benchmark sem dimensão de embedding".to_string());
+    }
+    Ok(())
+}
+
+fn reject_symlink(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{label} não pode ser symlink: {}", path.display()));
+    }
+    Ok(())
 }
 
 fn validate_pack_component(value: &str) -> Result<(), String> {
@@ -766,4 +1040,141 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
     }
+
+    fn valid_manifest(id: &str, version: &str, bytes: &[u8]) -> ModelPackManifest {
+        ModelPackManifest {
+            id: id.into(),
+            version: version.into(),
+            file: "model.bin".into(),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            capabilities: vec!["embedding".into()],
+            license: "MIT".into(),
+        }
+    }
+
+    #[test]
+    fn model_pack_manifest_requires_license_capability_version_and_full_sha256() {
+        let bytes = b"model";
+        let mut manifest = valid_manifest("semantic-small", "1.0.0", bytes);
+        assert!(validate_manifest(&manifest).is_ok());
+
+        manifest.license.clear();
+        assert!(validate_manifest(&manifest).unwrap_err().contains("licença"));
+
+        manifest = valid_manifest("semantic-small", "1.0.0", bytes);
+        manifest.capabilities.clear();
+        assert!(validate_manifest(&manifest).unwrap_err().contains("capabilities"));
+
+        manifest = valid_manifest("semantic-small", "", bytes);
+        assert!(validate_manifest(&manifest).unwrap_err().contains("versão"));
+
+        manifest = valid_manifest("semantic-small", "1.0.0", bytes);
+        manifest.sha256 = "abcd".into();
+        assert!(validate_manifest(&manifest).unwrap_err().contains("sha256"));
+    }
+
+    #[test]
+    fn model_pack_activation_requires_verified_pack_and_recorded_benchmark() {
+        let root = temp_root("activation-requires-benchmark");
+        let manager = ModelPackManager::new(&root);
+        let bytes = b"model-v1";
+        let manifest = valid_manifest("semantic-small", "1.0.0", bytes);
+
+        manager.install(&manifest, bytes).unwrap();
+        assert!(
+            manager.activate("semantic-small").unwrap_err().contains("benchmark"),
+            "activation must fail before benchmark evidence exists"
+        );
+
+        let benchmark = benchmark_local_intelligence(
+            "semantic-small",
+            &HashingLocalIntelligence,
+            &["NeuralIA".to_string()],
+        )
+        .unwrap();
+        manager
+            .record_benchmark("semantic-small", &benchmark)
+            .unwrap();
+
+        let activation = manager.activate("semantic-small").unwrap();
+        assert_eq!(activation.id, "semantic-small");
+        let selection = manager.selection();
+        assert!(selection.warning.is_none());
+        let active = selection.active.expect("pack must be active after validation");
+        assert_eq!(active.manifest.version, "1.0.0");
+        assert_eq!(active.benchmark.samples, 1);
+        assert_eq!(fs::read(active.model_path).unwrap(), bytes);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn corrupt_active_pack_degrades_to_deterministic_fallback_with_warning() {
+        let root = temp_root("activation-corrupt-fallback");
+        let manager = ModelPackManager::new(&root);
+        let bytes = b"model-v1";
+        let manifest = valid_manifest("semantic-small", "1.0.0", bytes);
+        let model = manager.install(&manifest, bytes).unwrap();
+
+        let benchmark = benchmark_local_intelligence(
+            "semantic-small",
+            &HashingLocalIntelligence,
+            &["NeuralIA".to_string()],
+        )
+        .unwrap();
+        manager
+            .record_benchmark("semantic-small", &benchmark)
+            .unwrap();
+        manager.activate("semantic-small").unwrap();
+
+        fs::write(model, b"tampered").unwrap();
+        let selection = manager.selection();
+        assert!(selection.active.is_none());
+        assert!(
+            selection
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("hash"))
+        );
+
+        // O fallback continua funcional sem qualquer pack.
+        let fallback = HashingLocalIntelligence;
+        assert_eq!(
+            fallback.classify("onde eu li isso?").unwrap(),
+            IntentClass::MemoryRecall
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uninstalling_active_pack_deactivates_before_removing_files() {
+        let root = temp_root("active-uninstall");
+        let manager = ModelPackManager::new(&root);
+        let bytes = b"model-v1";
+        let manifest = valid_manifest("semantic-small", "1.0.0", bytes);
+        manager.install(&manifest, bytes).unwrap();
+
+        let benchmark = benchmark_local_intelligence(
+            "semantic-small",
+            &HashingLocalIntelligence,
+            &["NeuralIA".to_string()],
+        )
+        .unwrap();
+        manager
+            .record_benchmark("semantic-small", &benchmark)
+            .unwrap();
+        manager.activate("semantic-small").unwrap();
+
+        assert!(manager.uninstall("semantic-small").unwrap());
+        assert!(!root.join("semantic-small").exists());
+        assert!(!root.join(MODEL_PACK_ACTIVE_FILE).exists());
+        assert_eq!(
+            manager.selection(),
+            ModelPackSelection::deterministic_fallback()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
 }

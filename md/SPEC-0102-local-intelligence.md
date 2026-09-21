@@ -1,6 +1,6 @@
 # SPEC-0102 — Optional Local Intelligence
 
-**Status:** Parcial — inteligência local determinística integrada; `ModelPackManager` é biblioteca, não feature de produto  
+**Status:** Parcial — inteligência local determinística integrada; lifecycle de model packs validado no core, ainda não ligado ao produto  
 **Target:** NeuralIA 1.9
 
 ## 1. Purpose
@@ -124,10 +124,19 @@ core tests and by the product-wiring gate in
 ### Decision: model packs are library-only for now
 
 `ModelPackManager` is **not a NeuralIA product feature** in the current
-baseline. It is a `neural-core` filesystem utility that can validate manifests,
-verify hashes, stage/replace pack files, list them, record benchmarks and
-uninstall them. It performs no download, no backend selection, no automatic
-activation and no startup hook.
+baseline. It is a `neural-core` lifecycle utility that validates manifests,
+license metadata and hashes, stages/replaces pack files atomically, records
+benchmarks, supports explicit activation/deactivation and removes packs.
+
+Activation in the core is deliberately stricter than installation: a pack is
+only marked active after the installed artifact verifies and a non-empty
+benchmark record exists. The active-state record pins id/version/hash. If that
+state becomes stale, the model file is altered or benchmark metadata is
+unusable, resolution returns the deterministic fallback plus a diagnostic
+warning instead of making ordinary local intelligence unavailable.
+
+It still performs **no download, no inference-backend construction, no
+automatic activation and no browser-startup hook**.
 
 This is intentional. Wiring model packs into the product would require touching
 the browser lifecycle and proving lazy load, zero Home residency, failure
