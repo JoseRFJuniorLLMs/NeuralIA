@@ -3131,10 +3131,8 @@ impl App {
         // visíveis a partir da segunda abertura. Deixe o event loop respirar
         // antes de trocar o chrome nativo.
         self.leave_fullscreen();
-        self.timers.after(
-            Duration::from_millis(40),
-            UserEvent::RestoreHomeDecorations,
-        );
+        self.timers
+            .after(Duration::from_millis(40), UserEvent::RestoreHomeDecorations);
         if let Ok(mut bytes) = self.pdf_bytes.lock() {
             *bytes = Vec::new();
         }
