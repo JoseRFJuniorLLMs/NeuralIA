@@ -1379,10 +1379,7 @@ unsafe extern "system" fn window_subclass(
     _subclass_id: usize,
     reference_data: usize,
 ) -> LRESULT {
-    if matches!(
-        message,
-        WM_LIFECYCLE_PROBE_HOME | WM_LIFECYCLE_PROBE_REOPEN
-    ) {
+    if matches!(message, WM_LIFECYCLE_PROBE_HOME | WM_LIFECYCLE_PROBE_REOPEN) {
         if lifecycle_probe_enabled() && reference_data != 0 {
             let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
             if message == WM_LIFECYCLE_PROBE_HOME {
