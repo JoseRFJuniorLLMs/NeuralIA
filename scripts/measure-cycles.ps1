@@ -89,7 +89,7 @@ public static class NeuraliaCycleWindowProbe {
         return rows;
     }
 
-    public static IntPtr FindOmniboxEdit(IntPtr parent) {
+    public static IntPtr FindAnyEdit(IntPtr parent) {
         IntPtr found = IntPtr.Zero;
         EnumChildWindows(parent, delegate(IntPtr hwnd, IntPtr data) {
             var name = new StringBuilder(128);
@@ -103,8 +103,23 @@ public static class NeuraliaCycleWindowProbe {
         return found;
     }
 
+    public static IntPtr FindVisibleEdit(IntPtr parent) {
+        IntPtr found = IntPtr.Zero;
+        EnumChildWindows(parent, delegate(IntPtr hwnd, IntPtr data) {
+            if (!IsWindowVisible(hwnd)) return true;
+            var name = new StringBuilder(128);
+            GetClassName(hwnd, name, name.Capacity);
+            if (string.Equals(name.ToString(), "Edit", StringComparison.OrdinalIgnoreCase)) {
+                found = hwnd;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
     public static bool SubmitNativeOmnibox(IntPtr parent, string text) {
-        var edit = FindOmniboxEdit(parent);
+        var edit = FindVisibleEdit(parent);
         if (edit == IntPtr.Zero) return false;
         if (!SetWindowText(edit, text)) return false;
         const uint WM_KEYDOWN = 0x0100;
@@ -113,7 +128,7 @@ public static class NeuraliaCycleWindowProbe {
     }
 
     public static bool ReturnHomeViaNativeEscape(IntPtr parent) {
-        var edit = FindOmniboxEdit(parent);
+        var edit = FindAnyEdit(parent);
         if (edit == IntPtr.Zero) return false;
         const uint WM_KEYDOWN = 0x0100;
         SendMessage(edit, WM_KEYDOWN, new IntPtr(27), IntPtr.Zero);
@@ -152,7 +167,7 @@ function Submit-LifecycleProbeQuery([System.Diagnostics.Process]$Process, [strin
         $Text
     )
     if (-not $ok) {
-        throw "Omnibox nativa visivel nao encontrada para reabrir o comparador."
+        throw "Omnibox nativa VISIVEL da Home nao encontrada para reabrir o comparador."
     }
 }
 
