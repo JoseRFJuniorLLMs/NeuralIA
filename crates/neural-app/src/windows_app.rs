@@ -159,6 +159,9 @@ enum UserEvent {
     /// Reaplica a geometria depois de o Windows terminar a transicao
     /// assíncrona para a janela sem decoracao. Nao depende de rato/teclado.
     RelayoutComparator,
+    /// Handshake exclusivo do gate de lifecycle. Só fica pronto quando o
+    /// event loop já voltou a processar UserEvent depois da abertura/reabertura.
+    LifecycleProbeReady,
     RestoreComparator,
     ExitRequested,
     ReaderReady {
@@ -4198,7 +4201,10 @@ impl App {
             // enfileirar outro UserEvent apenas para virar este bit. Isso evita
             // que o handshake fique preso atrás do pump aninhado do WebView2
             // numa reabertura, sem afrouxar o gate de teardown.
-            LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
+            self.timers.after(
+                Duration::from_millis(1),
+                UserEvent::LifecycleProbeReady,
+            );
         }
     }
 
@@ -7377,6 +7383,11 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_comparator_buttons();
                     self.sync_exit_button();
                     self.request_redraw();
+                }
+            }
+            UserEvent::LifecycleProbeReady => {
+                if self.surface == Surface::Comparator && lifecycle_probe_enabled() {
+                    LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
                 }
             }
             UserEvent::RestoreComparator => {
