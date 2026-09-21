@@ -484,11 +484,13 @@ try {
             break
         }
 
-        # No modo de probe, o próprio event loop agenda HomeRequested depois
-        # de o comparador estabilizar. Isso remove da medição o transporte por
-        # teclado/registered-message para HWNDs que mudam com decorations.
-        # A condição continua externa e rigorosa: os três hosts WRY precisam
-        # desaparecer de verdade.
+        # O gate comanda explicitamente a transição depois do handshake Ready.
+        # Antes a própria app agendava Home/Reopen por timers internos. Isso
+        # misturava duas coisas: teardown real e atraso do pump aninhado do
+        # WebView2. A mensagem privada passa pelo mesmo EventLoopProxy e chama
+        # exatamente HomeRequested, mas deixa o teste decidir quando medir.
+        Return-LifecycleProbeHome -Process $process
+
         $visibleAfterHome = Wait-ForNoVisibleWebSurfaces -Process $process -TimeoutSec $CloseTimeoutSec
 
         # A Home precisa ficar sem nenhum container WRY_WEBVIEW visivel.
@@ -499,9 +501,13 @@ try {
             $null = $failures.Add("ciclo ${cycle}: ${visibleAfterHome} superficie(s) WebView continuaram visiveis depois de voltar a Home")
         }
 
-        # A app só agenda o próximo reopen depois de RestoreHomeDecorations.
-        # Pequena folga aqui garante que a amostra pertence à Home restaurada,
-        # sem depender de consultar a subclass de um HWND potencialmente novo.
+        # Zero WRY prova teardown; HomeReady prova que a transição de
+        # decorations/HWND terminou antes de qualquer reabertura.
+        if (-not (Wait-ForLifecycleProbeHomeReady -Process $process -TimeoutSec $CloseTimeoutSec)) {
+            $null = $failures.Add("ciclo ${cycle}: Home ficou sem WebView mas não concluiu RestoreHomeDecorations")
+            break
+        }
+
         Start-Sleep -Milliseconds 250
 
         # Mede memoria no estado Home, nao no meio da abertura seguinte.
@@ -539,8 +545,12 @@ try {
             working_set_mib = $postHomeMiB
         })
 
-        # O próximo comparador é reaberto pelo próprio event loop, somente
-        # depois de a Home terminar a restauração de decorations/HWND.
+        # O próximo comparador só nasce depois de o script ter observado
+        # teardown=0 e HomeReady. Isso impede que a medição do ciclo N conte
+        # superfícies já pertencentes ao ciclo N+1.
+        if ($cycle -lt $Cycles) {
+            Submit-LifecycleProbeQuery -Process $process
+        }
     }
 
     $process.Refresh()
