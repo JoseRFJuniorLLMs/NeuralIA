@@ -3017,8 +3017,8 @@ impl App {
                 }
             }
         }
-        if let Some(comparator) = self.comparator.take() {
-            drop(comparator);
+        if self.comparator.is_some() {
+            // SABOTAGE: mantem os WebViews do comparador vivos ao voltar a Home.
         }
         if let Some(webview) = self.webview.take() {
             let _ = webview.focus_parent();

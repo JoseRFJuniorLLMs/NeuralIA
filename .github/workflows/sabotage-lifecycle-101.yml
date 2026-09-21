@@ -1,0 +1,28 @@
+name: Sabotage lifecycle 101
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/sabotage-lifecycle-101.yml'
+      - 'crates/neural-app/src/windows_app.rs'
+      - 'scripts/measure-cycles.ps1'
+permissions:
+  contents: read
+jobs:
+  sabotage:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+      - run: cargo build --locked -p neural-app --bin NeuralIA --release
+      - name: Lifecycle gate must turn red under sabotage
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          ./scripts/measure-cycles.ps1 -ExePath target/release/NeuralIA.exe -Cycles 2 -OutputPath sabotage-cycles.json
+          if ($LASTEXITCODE -eq 0 -and $?) {
+            throw "SABOTAGE unexpectedly stayed green: lifecycle gate did not detect live WebViews."
+          }
+          Write-Host "Sabotage proof: lifecycle gate rejected live WebViews."
