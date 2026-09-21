@@ -2895,12 +2895,7 @@ impl App {
                 return;
             }
 
-            SetWindowSubclass(
-                parent,
-                Some(window_subclass),
-                WINDOW_SUBCLASS_ID,
-                proxy_ptr,
-            );
+            SetWindowSubclass(parent, Some(window_subclass), WINDOW_SUBCLASS_ID, proxy_ptr);
 
             self.omnibox = Some(edit);
             self.position_omnibox();
