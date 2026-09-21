@@ -3042,19 +3042,15 @@ impl App {
                 }
             }
         }
-        if let Some(comparator) = self.comparator.take() {
-            // WebView2 pode manter a HWND filha visível por alguns ciclos de
-            // mensagens mesmo depois do drop do controller. Esconde primeiro,
-            // depois devolve o foco ao pai e só então destrói o estado.
+        if let Some(comparator) = self.comparator.as_ref() {
+            // SABOTAGE: deixa os controllers e hosts WRY_WEBVIEW vivos/visíveis.
+            // O gate de lifecycle precisa ficar vermelho com esta mutação.
             for view in &comparator.views {
-                let _ = view.webview.set_visible(false);
                 let _ = view.webview.focus_parent();
             }
             if let Some(split) = &comparator.split {
-                let _ = split.webview.set_visible(false);
                 let _ = split.webview.focus_parent();
             }
-            drop(comparator);
         }
         if let Some(webview) = self.webview.take() {
             let _ = webview.set_visible(false);
