@@ -4186,7 +4186,14 @@ impl App {
         self.begin_reading_session(false);
         self.request_redraw();
         if lifecycle_probe_enabled() {
-            let _ = self.proxy.send_event(UserEvent::LifecycleProbeReady);
+            // Este ponto só é alcançado depois de construir/reutilizar os três
+            // WebViews e aplicar o primeiro layout. A consulta Ready chega por
+            // uma mensagem Win32 registrada e só pode ser atendida quando o
+            // pump voltar a processar mensagens, portanto não precisamos
+            // enfileirar outro UserEvent apenas para virar este bit. Isso evita
+            // que o handshake fique preso atrás do pump aninhado do WebView2
+            // numa reabertura, sem afrouxar o gate de teardown.
+            LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
         }
     }
 
