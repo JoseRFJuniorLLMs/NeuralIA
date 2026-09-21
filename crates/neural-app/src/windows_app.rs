@@ -1777,6 +1777,13 @@ unsafe extern "system" fn omnibox_subclass(
     _subclass_id: usize,
     reference_data: usize,
 ) -> LRESULT {
+    if message == lifecycle_probe_home_message() && lifecycle_probe_enabled() && reference_data != 0 {
+        let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+        SetWindowTextW(hwnd, windows_sys::w!(""));
+        let _ = proxy.send_event(UserEvent::HomeRequested);
+        return 0;
+    }
+
     if message == WM_KEYDOWN {
         let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
         let ctrl = (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;
