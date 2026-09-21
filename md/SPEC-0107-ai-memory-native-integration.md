@@ -610,6 +610,28 @@ Benchmarks:
 - embedding throughput;
 - startup com memória ativada porém idle.
 
+### 22.1 Harness e gate de escala
+
+O harness `crates/neural-core/examples/memory_scale.rs` mede, pela API pública
+real de `MemoryStore`, captura, 100 queries híbridas e rebuild. Sem argumentos,
+ele executa exatamente os corpora de 1k, 10k e 100k documentos previstos acima:
+
+`cargo run -p neural-core --example memory_scale --release -- 1000 10000 100000`
+
+O CI não usa 100k em cada PR. Ele mantém um gate de regressão em
+`crates/neural-core/tests/spec_0107_scale.rs`: dois stores independentes com
+128 e 512 documentos, mesmas queries e rebuilds, medidos por melhor de múltiplas
+rodadas. Para 4x entrada, query e rebuild devem custar menos de 8x.
+
+O limite é uma **razão**, não um orçamento absoluto em milissegundos. Uma
+sabotagem no workflow injeta trabalho O(n²) no rebuild e precisa deixar o gate
+vermelho antes de restaurar o código. Assim o teste rejeita regressão
+algorítmica sem confundir uma VM ocupada com código ruim.
+
+Este gate fecha a infraestrutura de benchmark de escala, mas não conclui a
+SPEC-0107: UX, entidades/grafo completos, embeddings opcionais de produto e
+startup idle com backend real continuam pendentes.
+
 ## 23. Segurança
 
 Código importado não vira confiável apenas por ser Rust.

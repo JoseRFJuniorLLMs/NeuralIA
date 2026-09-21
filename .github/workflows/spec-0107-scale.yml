@@ -1,0 +1,85 @@
+name: SPEC-0107 memory scale
+
+on:
+  pull_request:
+    paths:
+      - 'crates/neural-core/tests/spec_0107_scale.rs'
+      - 'crates/neural-core/examples/memory_scale.rs'
+      - 'crates/neural-core/src/memory.rs'
+      - 'md/SPEC-0107-ai-memory-native-integration.md'
+      - '.github/workflows/spec-0107-scale.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/neural-core/tests/spec_0107_scale.rs'
+      - 'crates/neural-core/examples/memory_scale.rs'
+      - 'crates/neural-core/src/memory.rs'
+      - 'md/SPEC-0107-ai-memory-native-integration.md'
+      - '.github/workflows/spec-0107-scale.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  ratio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+
+      - name: Baseline ratio gate
+        run: cargo test --locked -p neural-core --test spec_0107_scale -- --nocapture
+
+      - name: Prove ratio gate catches quadratic rebuild work
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/neural-core/src/memory.rs")
+          s = p.read_text(encoding="utf-8")
+          old = '''        let docs = self.documents()?;
+                  let sessions = self.research_sessions()?;
+          '''
+          new = '''        let docs = self.documents()?;
+                  for left in &docs {
+                      for right in &docs {
+                          std::hint::black_box((left.id.as_str(), right.id.as_str()));
+                      }
+                  }
+                  let sessions = self.research_sessions()?;
+          '''
+          if s.count(old) != 1:
+              raise SystemExit("rebuild sabotage target not found exactly once")
+          p.write_text(s.replace(old, new), encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core --test spec_0107_scale -- --nocapture
+          rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/memory.rs
+          if [ "$rc" -eq 0 ]; then
+            echo "Quadratic rebuild sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: quadratic rebuild work was rejected."
+
+      - name: Restored ratio gate
+        run: cargo test --locked -p neural-core --test spec_0107_scale -- --nocapture
+
+  exact-agents-gates:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+        with:
+          components: clippy,rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
