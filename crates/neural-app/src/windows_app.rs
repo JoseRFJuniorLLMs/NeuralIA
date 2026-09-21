@@ -1274,7 +1274,6 @@ static LIFECYCLE_PROBE_HOME_MESSAGE: OnceLock<u32> = OnceLock::new();
 static LIFECYCLE_PROBE_REOPEN_MESSAGE: OnceLock<u32> = OnceLock::new();
 static LIFECYCLE_PROBE_READY_MESSAGE: OnceLock<u32> = OnceLock::new();
 static LIFECYCLE_COMPARATOR_READY: AtomicBool = AtomicBool::new(false);
-static LIFECYCLE_HOME_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn lifecycle_probe_home_message() -> u32 {
     *LIFECYCLE_PROBE_HOME_MESSAGE.get_or_init(|| unsafe {
@@ -1411,21 +1410,16 @@ unsafe extern "system" fn window_subclass(
             0
         };
     }
-    if message == lifecycle_home {
-        if lifecycle_probe_enabled() {
-            // Não dependa de EventLoopProxy dentro da subclasse Win32: depois
-            // da troca de decoração o HWND pode estar num pump nativo aninhado.
-            // O próprio event loop consome este pedido em about_to_wait.
-            LIFECYCLE_HOME_REQUESTED.store(true, Ordering::Release);
-        }
-        return 0;
-    }
-    if message == lifecycle_reopen {
+    if message == lifecycle_home || message == lifecycle_reopen {
         if lifecycle_probe_enabled() && reference_data != 0 {
             let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
-            let input = startup_input();
-            if !input.is_empty() {
-                let _ = proxy.send_event(UserEvent::SubmitText(input));
+            if message == lifecycle_home {
+                let _ = proxy.send_event(UserEvent::HomeRequested);
+            } else {
+                let input = startup_input();
+                if !input.is_empty() {
+                    let _ = proxy.send_event(UserEvent::SubmitText(input));
+                }
             }
         }
         return 0;
@@ -7170,10 +7164,6 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if lifecycle_probe_enabled() && LIFECYCLE_HOME_REQUESTED.swap(false, Ordering::AcqRel) {
-            self.show_home();
-        }
-
         let interval = if self.surface == Surface::Home && home_animation_enabled() {
             // O `Occluded` do Windows nao cobre a minimizacao em todos os
             // casos, por isso pergunta-se tambem a janela.
