@@ -159,9 +159,6 @@ enum UserEvent {
     /// Reaplica a geometria depois de o Windows terminar a transicao
     /// assíncrona para a janela sem decoracao. Nao depende de rato/teclado.
     RelayoutComparator,
-    /// Handshake exclusivo do gate de lifecycle. Só fica pronto quando o
-    /// event loop já voltou a processar UserEvent depois da abertura/reabertura.
-    LifecycleProbeReady,
     RestoreComparator,
     ExitRequested,
     ReaderReady {
@@ -1277,6 +1274,7 @@ static LIFECYCLE_PROBE_HOME_MESSAGE: OnceLock<u32> = OnceLock::new();
 static LIFECYCLE_PROBE_REOPEN_MESSAGE: OnceLock<u32> = OnceLock::new();
 static LIFECYCLE_PROBE_READY_MESSAGE: OnceLock<u32> = OnceLock::new();
 static LIFECYCLE_COMPARATOR_READY: AtomicBool = AtomicBool::new(false);
+static LIFECYCLE_COMPARATOR_READY_PENDING: AtomicBool = AtomicBool::new(false);
 
 fn lifecycle_probe_home_message() -> u32 {
     *LIFECYCLE_PROBE_HOME_MESSAGE.get_or_init(|| unsafe {
@@ -3059,6 +3057,7 @@ impl App {
     fn destroy_web_surfaces(&mut self) {
         if lifecycle_probe_enabled() {
             LIFECYCLE_COMPARATOR_READY.store(false, Ordering::Release);
+            LIFECYCLE_COMPARATOR_READY_PENDING.store(false, Ordering::Release);
         }
         self.mark_dirty();
         self.close_palette();
@@ -3111,6 +3110,7 @@ impl App {
     fn park_comparator_for_home(&mut self) {
         if lifecycle_probe_enabled() {
             LIFECYCLE_COMPARATOR_READY.store(false, Ordering::Release);
+            LIFECYCLE_COMPARATOR_READY_PENDING.store(false, Ordering::Release);
         }
         self.mark_dirty();
         self.close_palette();
@@ -4201,7 +4201,7 @@ impl App {
             // enfileirar outro UserEvent apenas para virar este bit. Isso evita
             // que o handshake fique preso atrás do pump aninhado do WebView2
             // numa reabertura, sem afrouxar o gate de teardown.
-            let _ = self.proxy.send_event(UserEvent::LifecycleProbeReady);
+            LIFECYCLE_COMPARATOR_READY_PENDING.store(true, Ordering::Release);
         }
     }
 
@@ -7205,6 +7205,13 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if lifecycle_probe_enabled()
+            && self.surface == Surface::Comparator
+            && LIFECYCLE_COMPARATOR_READY_PENDING.swap(false, Ordering::AcqRel)
+        {
+            LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
+        }
+
         let interval = if self.surface == Surface::Home && home_animation_enabled() {
             // O `Occluded` do Windows nao cobre a minimizacao em todos os
             // casos, por isso pergunta-se tambem a janela.
@@ -7380,11 +7387,6 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_comparator_buttons();
                     self.sync_exit_button();
                     self.request_redraw();
-                }
-            }
-            UserEvent::LifecycleProbeReady => {
-                if self.surface == Surface::Comparator && lifecycle_probe_enabled() {
-                    LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
                 }
             }
             UserEvent::RestoreComparator => {
