@@ -4095,7 +4095,7 @@ impl App {
                 self.show_native_error(error);
                 return;
             }
-            self.activate_comparator();
+            self.activate_comparator(false);
             return;
         }
 
@@ -4152,10 +4152,10 @@ impl App {
             groups: std::array::from_fn(|_| Vec::new()),
             next_group_id: 1,
         });
-        self.activate_comparator();
+        self.activate_comparator(true);
     }
 
-    fn activate_comparator(&mut self) {
+    fn activate_comparator(&mut self, sync_remote_buttons: bool) {
         self.bar_hover = None;
         self.surface = Surface::Comparator;
 
@@ -4166,7 +4166,13 @@ impl App {
         self.needs_clear = true;
         self.update_comparator_layout();
         self.sync_comparator_splitters();
-        self.sync_comparator_buttons();
+        // Na reutilização acabámos de iniciar três navegações. Executar outro
+        // script remoto aqui pode manter WebView2 dentro do pump aninhado e
+        // impedir o callback de devolver o controlo ao winit. O relayout de
+        // 40 ms sincroniza os botões depois que o event loop já respirou.
+        if sync_remote_buttons {
+            self.sync_comparator_buttons();
+        }
         self.sync_exit_button();
 
         for delay_ms in COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS {
