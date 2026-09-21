@@ -1268,7 +1268,8 @@ static ERASE_PENDING: AtomicBool = AtomicBool::new(false);
 const WINDOW_SUBCLASS_ID: usize = 0x4E4A;
 /// Mensagens privadas usadas somente pelo gate de lifecycle. Usamos
 /// RegisterWindowMessageW em vez de IDs fixos em WM_APP para não colidir com
-/// mensagens privadas do winit/WRY/WebView2.
+/// mensagens privadas do winit/WRY/WebView2. O script registra os mesmos nomes,
+/// então Windows resolve os dois processos para os mesmos IDs de mensagem.
 static LIFECYCLE_PROBE_HOME_MESSAGE: OnceLock<u32> = OnceLock::new();
 static LIFECYCLE_PROBE_REOPEN_MESSAGE: OnceLock<u32> = OnceLock::new();
 
