@@ -1266,8 +1266,11 @@ fn now_ms() -> u64 {
 /// nessas voltas, que e o unico ponto de pintura que ainda corre.
 static ERASE_PENDING: AtomicBool = AtomicBool::new(false);
 const WINDOW_SUBCLASS_ID: usize = 0x4E4A;
-/// Mensagem privada usada somente pelo gate de lifecycle. O handler só aceita
-/// o comando quando NEURALIA_LIFECYCLE_PROBE está presente no processo.
+/// Mensagens privadas usadas somente pelo gate de lifecycle. O handler só
+/// aceita os comandos quando NEURALIA_LIFECYCLE_PROBE está presente no processo.
+/// São deliberadamente separadas da omnibox: este gate mede criar/destruir
+/// WebViews, não a entrega de teclado sintético entre processos.
+const WM_LIFECYCLE_PROBE_HOME: u32 = 0x8000 + 0x4D;
 const WM_LIFECYCLE_PROBE_REOPEN: u32 = 0x8000 + 0x4E;
 const EXIT_BUTTON_SUBCLASS_ID: usize = 0x4E4B;
 const WM_PAINT: u32 = 0x000F;
@@ -1376,12 +1379,19 @@ unsafe extern "system" fn window_subclass(
     _subclass_id: usize,
     reference_data: usize,
 ) -> LRESULT {
-    if message == WM_LIFECYCLE_PROBE_REOPEN {
+    if matches!(
+        message,
+        WM_LIFECYCLE_PROBE_HOME | WM_LIFECYCLE_PROBE_REOPEN
+    ) {
         if lifecycle_probe_enabled() && reference_data != 0 {
-            let input = startup_input();
-            if !input.is_empty() {
-                let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
-                let _ = proxy.send_event(UserEvent::SubmitText(input));
+            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+            if message == WM_LIFECYCLE_PROBE_HOME {
+                let _ = proxy.send_event(UserEvent::HomeRequested);
+            } else {
+                let input = startup_input();
+                if !input.is_empty() {
+                    let _ = proxy.send_event(UserEvent::SubmitText(input));
+                }
             }
         }
         return 0;
