@@ -45,32 +45,67 @@ fn populate(root: &PathBuf, count: usize) -> MemoryStore {
     store
 }
 
-fn best_elapsed(rounds: usize, mut run: impl FnMut()) -> Duration {
-    let mut best = Duration::MAX;
-    for _ in 0..rounds {
-        let started = Instant::now();
-        run();
-        best = best.min(started.elapsed());
-    }
-    best
+fn elapsed_once(mut run: impl FnMut()) -> Duration {
+    let started = Instant::now();
+    run();
+    started.elapsed()
 }
 
-fn query_cost(store: &MemoryStore) -> Duration {
-    best_elapsed(5, || {
-        for _ in 0..16 {
-            let hits = store
-                .query(&MemoryQuery::new("WebView2 security semantic memory"))
-                .unwrap();
-            black_box(hits);
+fn paired_costs(
+    rounds: usize,
+    mut small: impl FnMut(),
+    mut large: impl FnMut(),
+) -> (Duration, Duration) {
+    let mut small_total = Duration::ZERO;
+    let mut large_total = Duration::ZERO;
+    for round in 0..rounds {
+        if round % 2 == 0 {
+            small_total += elapsed_once(&mut small);
+            large_total += elapsed_once(&mut large);
+        } else {
+            large_total += elapsed_once(&mut large);
+            small_total += elapsed_once(&mut small);
         }
-    })
+    }
+    (small_total, large_total)
 }
 
-fn rebuild_cost(store: &MemoryStore) -> Duration {
-    best_elapsed(3, || {
-        store.rebuild().unwrap();
-        black_box(());
-    })
+fn query_costs(small: &MemoryStore, large: &MemoryStore) -> (Duration, Duration) {
+    paired_costs(
+        3,
+        || {
+            for _ in 0..16 {
+                black_box(
+                    small
+                        .query(&MemoryQuery::new("WebView2 security semantic memory"))
+                        .unwrap(),
+                );
+            }
+        },
+        || {
+            for _ in 0..16 {
+                black_box(
+                    large
+                        .query(&MemoryQuery::new("WebView2 security semantic memory"))
+                        .unwrap(),
+                );
+            }
+        },
+    )
+}
+
+fn rebuild_costs(small: &MemoryStore, large: &MemoryStore) -> (Duration, Duration) {
+    paired_costs(
+        3,
+        || {
+            small.rebuild().unwrap();
+            black_box(());
+        },
+        || {
+            large.rebuild().unwrap();
+            black_box(());
+        },
+    )
 }
 
 fn ratio(large: Duration, small: Duration) -> f64 {
@@ -88,11 +123,11 @@ fn spec_0107_query_and_rebuild_scale_by_ratio_not_absolute_clock() {
     let small = populate(&small_root, 128);
     let large = populate(&large_root, 512);
 
-    // Alternar a ordem reduz o viés de cache/aquecimento.
-    let query_large = query_cost(&large);
-    let query_small = query_cost(&small);
-    let rebuild_small = rebuild_cost(&small);
-    let rebuild_large = rebuild_cost(&large);
+    // Mede os dois corpora em rodadas pareadas e alterna quem corre primeiro.
+    // Isso evita dividir o melhor caso do corpus pequeno por uma janela de carga
+    // diferente do corpus grande, sem transformar o gate em orçamento absoluto.
+    let (query_small, query_large) = query_costs(&small, &large);
+    let (rebuild_small, rebuild_large) = rebuild_costs(&small, &large);
 
     let query_ratio = ratio(query_large, query_small);
     let rebuild_ratio = ratio(rebuild_large, rebuild_small);
