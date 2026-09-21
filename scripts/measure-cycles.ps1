@@ -204,41 +204,67 @@ public static class NeuraliaCycleWindowProbe {
         return true;
     }
 
+    private static uint ProcessIdOf(IntPtr anyWindow) {
+        uint processId;
+        GetWindowThreadProcessId(anyWindow, out processId);
+        return processId;
+    }
+
     public static bool RequestLifecycleProbeReopen(IntPtr parent) {
         var message = RegisterWindowMessage("NeuralIA.LifecycleProbe.Reopen");
-        return message != 0 && PostMessage(parent, message, IntPtr.Zero, IntPtr.Zero);
+        if (message == 0) return false;
+        var processId = ProcessIdOf(parent);
+        if (processId == 0) return false;
+
+        bool posted = false;
+        EnumWindows(delegate(IntPtr top, IntPtr data) {
+            uint ownerPid;
+            GetWindowThreadProcessId(top, out ownerPid);
+            if (ownerPid == processId && PostMessage(top, message, IntPtr.Zero, IntPtr.Zero)) {
+                posted = true;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return posted;
+    }
+
+    private static bool ProbeFlagForProcess(IntPtr anyWindow, string name) {
+        var message = RegisterWindowMessage(name);
+        if (message == 0) return false;
+        var processId = ProcessIdOf(anyWindow);
+        if (processId == 0) return false;
+
+        bool ready = false;
+        EnumWindows(delegate(IntPtr top, IntPtr data) {
+            uint ownerPid;
+            GetWindowThreadProcessId(top, out ownerPid);
+            if (ownerPid != processId) return true;
+
+            IntPtr result;
+            var sent = SendMessageTimeout(
+                top,
+                message,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                0x0002,
+                250,
+                out result
+            );
+            if (sent != IntPtr.Zero && result != IntPtr.Zero) {
+                ready = true;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return ready;
     }
 
     public static bool LifecycleProbeReady(IntPtr parent) {
-        var message = RegisterWindowMessage("NeuralIA.LifecycleProbe.Ready");
-        if (message == 0) return false;
-        IntPtr result;
-        var sent = SendMessageTimeout(
-            parent,
-            message,
-            IntPtr.Zero,
-            IntPtr.Zero,
-            0x0002,
-            500,
-            out result
-        );
-        return sent != IntPtr.Zero && result != IntPtr.Zero;
+        return ProbeFlagForProcess(parent, "NeuralIA.LifecycleProbe.Ready");
     }
 
     public static bool LifecycleProbeHomeReady(IntPtr parent) {
-        var message = RegisterWindowMessage("NeuralIA.LifecycleProbe.HomeReady");
-        if (message == 0) return false;
-        IntPtr result;
-        var sent = SendMessageTimeout(
-            parent,
-            message,
-            IntPtr.Zero,
-            IntPtr.Zero,
-            0x0002,
-            500,
-            out result
-        );
-        return sent != IntPtr.Zero && result != IntPtr.Zero;
+        return ProbeFlagForProcess(parent, "NeuralIA.LifecycleProbe.HomeReady");
     }
 }
 "@
