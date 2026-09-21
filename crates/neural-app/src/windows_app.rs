@@ -50,8 +50,9 @@ use windows_sys::Win32::{
         },
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
-            ES_AUTOHSCROLL, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowTextLengthW,
-            GetWindowTextW, GetWindowThreadProcessId, IDYES, MB_ICONINFORMATION, MB_OK, MB_YESNO,
+            ES_AUTOHSCROLL, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
+            GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+            IDYES, MB_ICONINFORMATION, MB_OK, MB_YESNO,
             MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
             SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
             TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
@@ -3166,6 +3167,13 @@ impl App {
                 let _ = view.webview.focus_parent();
             }
         }
+        // WebView2 pode reexibir o HWND hospedeiro enquanto conclui uma
+        // navegação iniciada pouco antes da Home. O controller já foi marcado
+        // invisível acima; reafirmar SW_HIDE no host Win32 fecha essa corrida
+        // sem destruir o pool/sessão que queremos reutilizar.
+        if let Some(window) = &self.window {
+            hide_native_wry_webview_hosts(window);
+        }
     }
 
     fn show_home(&mut self) {
@@ -3209,6 +3217,9 @@ impl App {
         }
         if let Some(split) = &comparator.split {
             let _ = split.webview.set_visible(false);
+        }
+        if let Some(window) = &self.window {
+            hide_native_wry_webview_hosts(window);
         }
         self.hide_comparator_splitters();
         self.hide_exit_button();
@@ -8027,6 +8038,40 @@ fn window_hwnd(window: &Window) -> Option<HWND> {
         return None;
     };
     Some(handle.hwnd.get() as HWND)
+}
+
+const WRY_WEBVIEW_CLASS: [u16; 11] = [
+    b'W' as u16,
+    b'R' as u16,
+    b'Y' as u16,
+    b'_' as u16,
+    b'W' as u16,
+    b'E' as u16,
+    b'B' as u16,
+    b'V' as u16,
+    b'I' as u16,
+    b'E' as u16,
+    b'W' as u16,
+];
+
+unsafe extern "system" fn hide_wry_webview_host(hwnd: HWND, _lparam: LPARAM) -> i32 {
+    let mut class_name = [0u16; 32];
+    let length = GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32);
+    if length == WRY_WEBVIEW_CLASS.len() as i32
+        && class_name[..length as usize] == WRY_WEBVIEW_CLASS
+    {
+        ShowWindow(hwnd, SW_HIDE);
+    }
+    1
+}
+
+fn hide_native_wry_webview_hosts(window: &Window) {
+    let Some(parent) = window_hwnd(window) else {
+        return;
+    };
+    unsafe {
+        EnumChildWindows(parent, Some(hide_wry_webview_host), 0);
+    }
 }
 
 fn home_animation_enabled() -> bool {
