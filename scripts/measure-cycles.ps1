@@ -9,7 +9,7 @@
 
     Para cada ciclo:
       startup/omnibox nativa -> o comparador abre e aparecem containers WRY_WEBVIEW
-      Escape enviado ao EDIT nativo -> HomeRequested pelo caminho real do produto
+      o comparador só conta como aberto quando o app sinaliza fim da construção
       Home -> nenhum container WRY_WEBVIEW pode continuar visivel
       o script pede HOME e REOPEN por mensagens Win32 privadas habilitadas
       somente em NEURALIA_LIFECYCLE_PROBE; cada reopen só ocorre após Home limpa
@@ -78,6 +78,17 @@ public static class NeuraliaCycleWindowProbe {
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern uint RegisterWindowMessage(string lpString);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr SendMessageTimeout(
+        IntPtr hWnd,
+        uint msg,
+        IntPtr wParam,
+        IntPtr lParam,
+        uint flags,
+        uint timeout,
+        out IntPtr result
+    );
+
     public static List<string> VisibleWryWebViewRects(IntPtr parent) {
         var rows = new List<string>();
         EnumChildWindows(parent, delegate(IntPtr hwnd, IntPtr data) {
@@ -101,6 +112,22 @@ public static class NeuraliaCycleWindowProbe {
     public static bool RequestLifecycleProbeReopen(IntPtr parent) {
         var message = RegisterWindowMessage("NeuralIA.LifecycleProbe.Reopen");
         return message != 0 && PostMessage(parent, message, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    public static bool LifecycleProbeReady(IntPtr parent) {
+        var message = RegisterWindowMessage("NeuralIA.LifecycleProbe.Ready");
+        if (message == 0) return false;
+        IntPtr result;
+        var sent = SendMessageTimeout(
+            parent,
+            message,
+            IntPtr.Zero,
+            IntPtr.Zero,
+            0x0002,
+            500,
+            out result
+        );
+        return sent != IntPtr.Zero && result != IntPtr.Zero;
     }
 }
 "@
@@ -162,6 +189,19 @@ function Wait-ForVisibleWebSurfaces([System.Diagnostics.Process]$Process, [int]$
     }
     $Process.Refresh()
     return @(Get-VisibleWebViewSurfaceRects -Parent ([IntPtr]$Process.MainWindowHandle)).Count
+}
+
+function Wait-ForLifecycleProbeReady([System.Diagnostics.Process]$Process, [int]$TimeoutSec) {
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        $Process.Refresh()
+        if ($Process.HasExited) { return $false }
+        if ([NeuraliaCycleWindowProbe]::LifecycleProbeReady([IntPtr]$Process.MainWindowHandle)) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    return $false
 }
 
 function Get-DescendantIds([int]$RootId) {
@@ -261,6 +301,15 @@ try {
         $opened = Wait-ForVisibleWebSurfaces -Process $process -Expected 3 -TimeoutSec $OpenTimeoutSec
         if ($opened -lt 3) {
             $null = $failures.Add("ciclo ${cycle}: comparador abriu apenas ${opened} container(s) WRY_WEBVIEW visivel(is)")
+        }
+
+        # WRY/WebView2 pode criar os HWNDs enquanto build_as_child ainda está
+        # dentro de um pump aninhado. Mandar Home nesse instante só enfileira o
+        # evento para depois e transforma um gate de teardown num teste de race.
+        # O handshake fica true somente no fim de open_comparator.
+        if (-not (Wait-ForLifecycleProbeReady -Process $process -TimeoutSec $OpenTimeoutSec)) {
+            $null = $failures.Add("ciclo ${cycle}: comparador ficou visível mas não concluiu a abertura")
+            break
         }
 
         # Lifecycle mede os controllers e o teardown, não transporte de teclado.
