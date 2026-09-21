@@ -265,7 +265,7 @@ function Wait-ForLifecycleProbeReady([System.Diagnostics.Process]$Process, [int]
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
         $Process.Refresh()
         if ($Process.HasExited) { return $false }
-        if ([NeuraliaCycleWindowProbe]::LifecycleProbeReady(Get-NeuraliaMainWindow -Process $Process)) {
+        if ([NeuraliaCycleWindowProbe]::LifecycleProbeReady((Get-NeuraliaMainWindow -Process $Process))) {
             return $true
         }
         Start-Sleep -Milliseconds 100
