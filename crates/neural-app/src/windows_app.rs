@@ -7243,6 +7243,13 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // set_decorations pode trocar/reparentear o HWND depois do callback que
+        // pediu a mudança. Este é o primeiro ponto garantido depois de cada lote
+        // de eventos, já fora do pump aninhado do WebView2. Reinstalar a
+        // subclass aqui é idempotente e garante que Home, atalhos e o probe
+        // continuem chegando à janela REAL também na segunda abertura.
+        self.ensure_window_subclass();
+
         let interval = if self.surface == Surface::Home && home_animation_enabled() {
             // O `Occluded` do Windows nao cobre a minimizacao em todos os
             // casos, por isso pergunta-se tambem a janela.
