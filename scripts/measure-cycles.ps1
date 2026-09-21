@@ -8,8 +8,8 @@
     sobreviverem ao regresso a Home. Este script fecha esse buraco.
 
     Para cada ciclo:
-      startup/probe nativo -> o comparador abre e aparecem containers WRY_WEBVIEW
-      o event loop agenda HomeRequested em modo de probe
+      startup/omnibox nativa -> o comparador abre e aparecem containers WRY_WEBVIEW
+      Escape enviado ao EDIT nativo -> HomeRequested pelo caminho real do produto
       Home -> nenhum container WRY_WEBVIEW pode continuar visivel
       o script escreve na omnibox EDIT nativa e envia WM_KEYDOWN Enter ao controlo
       exacto, sem depender de foco global ou SendKeys
@@ -89,10 +89,9 @@ public static class NeuraliaCycleWindowProbe {
         return rows;
     }
 
-    public static IntPtr FindVisibleEdit(IntPtr parent) {
+    public static IntPtr FindOmniboxEdit(IntPtr parent) {
         IntPtr found = IntPtr.Zero;
         EnumChildWindows(parent, delegate(IntPtr hwnd, IntPtr data) {
-            if (!IsWindowVisible(hwnd)) return true;
             var name = new StringBuilder(128);
             GetClassName(hwnd, name, name.Capacity);
             if (string.Equals(name.ToString(), "Edit", StringComparison.OrdinalIgnoreCase)) {
@@ -105,11 +104,19 @@ public static class NeuraliaCycleWindowProbe {
     }
 
     public static bool SubmitNativeOmnibox(IntPtr parent, string text) {
-        var edit = FindVisibleEdit(parent);
+        var edit = FindOmniboxEdit(parent);
         if (edit == IntPtr.Zero) return false;
         if (!SetWindowText(edit, text)) return false;
         const uint WM_KEYDOWN = 0x0100;
         SendMessage(edit, WM_KEYDOWN, new IntPtr(13), IntPtr.Zero);
+        return true;
+    }
+
+    public static bool ReturnHomeViaNativeEscape(IntPtr parent) {
+        var edit = FindOmniboxEdit(parent);
+        if (edit == IntPtr.Zero) return false;
+        const uint WM_KEYDOWN = 0x0100;
+        SendMessage(edit, WM_KEYDOWN, new IntPtr(27), IntPtr.Zero);
         return true;
     }
 }
@@ -146,6 +153,19 @@ function Submit-LifecycleProbeQuery([System.Diagnostics.Process]$Process, [strin
     )
     if (-not $ok) {
         throw "Omnibox nativa visivel nao encontrada para reabrir o comparador."
+    }
+}
+
+function Return-LifecycleProbeHome([System.Diagnostics.Process]$Process) {
+    $Process.Refresh()
+    if ($Process.HasExited) {
+        throw "NeuralIA saiu antes de regressar a Home."
+    }
+    $ok = [NeuraliaCycleWindowProbe]::ReturnHomeViaNativeEscape(
+        [IntPtr]$Process.MainWindowHandle
+    )
+    if (-not $ok) {
+        throw "Omnibox nativa nao encontrada para enviar Escape e regressar a Home."
     }
 }
 
@@ -224,7 +244,6 @@ function Wait-ForWebViews([int]$RootId, [scriptblock]$Predicate, [int]$TimeoutSe
 $script:WebViewBaseline = @(Get-Process -Name msedgewebview2 -ErrorAction SilentlyContinue).Count
 
 $env:NEURALIA_STARTUP_INPUT = $StartupInput
-$env:NEURALIA_LIFECYCLE_PROBE = "1"
 
 # O monitor do Gmail e uma excepcao INTENCIONAL ao "zero WebViews na Home": ele
 # nasce quando existe sessao Google no perfil WebView2 e fica vivo mesmo depois
@@ -261,9 +280,11 @@ try {
             $null = $failures.Add("ciclo ${cycle}: comparador abriu apenas ${opened} container(s) WRY_WEBVIEW visivel(is)")
         }
 
-        # NEURALIA_LIFECYCLE_PROBE agenda HomeRequested no event loop depois da
-        # abertura. Isto testa o teardown real sem depender da entrega de uma
-        # tecla sintetica atraves do child HWND do WebView2.
+        # Envia Escape ao EDIT nativo da omnibox. O controlo pode estar oculto
+        # por baixo dos WebViews, mas a sua subclass continua a ser o caminho
+        # real do produto: WM_KEYDOWN(ESC) -> HomeRequested -> show_home().
+        Return-LifecycleProbeHome -Process $process
+
         # A Home precisa ficar sem nenhum container WRY_WEBVIEW visivel.
         # Este e o HWND hospedeiro criado e controlado pelo WRY; as HWNDs
         # internas do Chromium podem continuar com WS_VISIBLE mesmo quando o
@@ -344,7 +365,6 @@ try {
 }
 finally {
     $env:NEURALIA_STARTUP_INPUT = $null
-    $env:NEURALIA_LIFECYCLE_PROBE = $null
     $env:NEURALIA_NO_GMAIL = $null
     if (-not $process.HasExited) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
