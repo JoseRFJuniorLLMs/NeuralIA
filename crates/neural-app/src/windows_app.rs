@@ -4055,6 +4055,7 @@ impl App {
 
         if reuse_comparator {
             let urls = [google_url.as_str(), chatgpt_url.as_str(), claude_url.as_str()];
+            let mut reload_error = None;
             if let Some(comparator) = &mut self.comparator {
                 comparator.expanded = None;
                 comparator.minimized = [false; COMPARATOR_COLUMNS];
@@ -4069,13 +4070,17 @@ impl App {
                 comparator.next_group_id = 1;
                 for (view, url) in comparator.views.iter().zip(urls) {
                     if let Err(error) = view.webview.load_url(url) {
-                        self.show_native_error(format!(
+                        reload_error = Some(format!(
                             "WebView2 não pôde reutilizar {}: {error}",
                             view.name
                         ));
-                        return;
+                        break;
                     }
                 }
+            }
+            if let Some(error) = reload_error {
+                self.show_native_error(error);
+                return;
             }
             self.activate_comparator();
             return;
