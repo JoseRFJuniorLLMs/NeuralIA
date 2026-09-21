@@ -1323,7 +1323,6 @@ fn lifecycle_probe_enabled() -> bool {
 }
 
 const LIFECYCLE_PROBE_HOME_DELAY_MS: u64 = 1_200;
-const LIFECYCLE_PROBE_REOPEN_DELAY_MS: u64 = 2_500;
 
 #[link(name = "comctl32")]
 unsafe extern "system" {
@@ -7065,18 +7064,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::ExitRequested => event_loop.exit(),
-            UserEvent::HomeRequested => {
-                self.show_home();
-                if lifecycle_probe_enabled() {
-                    let input = startup_input();
-                    if !input.is_empty() {
-                        self.timers.after(
-                            Duration::from_millis(LIFECYCLE_PROBE_REOPEN_DELAY_MS),
-                            UserEvent::SubmitText(input),
-                        );
-                    }
-                }
-            }
+            UserEvent::HomeRequested => self.show_home(),
             UserEvent::BackRequested => self.go_back(),
             UserEvent::ToggleAutoScroll => self.toggle_auto_scroll(),
             UserEvent::AutoScrollAnswer(yes) => self.answer_auto_scroll(yes),

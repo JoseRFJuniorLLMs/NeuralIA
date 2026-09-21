@@ -8,10 +8,11 @@
     sobreviverem ao regresso a Home. Este script fecha esse buraco.
 
     Para cada ciclo:
-      startup/reopen interno -> o comparador abre e aparecem containers WRY_WEBVIEW
+      startup/probe nativo -> o comparador abre e aparecem containers WRY_WEBVIEW
       o event loop agenda HomeRequested em modo de probe
       Home -> nenhum container WRY_WEBVIEW pode continuar visivel
-      o event loop agenda SubmitText -> proximo ciclo abre sem input sintetico
+      o script escreve na omnibox EDIT nativa e envia WM_KEYDOWN Enter ao controlo
+      exacto, sem depender de foco global ou SendKeys
 
     O runtime WebView2 pode manter um pool de subprocessos para reutilizacao.
     Esse pool pode sobreviver aos controllers, mas nao pode crescer de ciclo em
@@ -67,6 +68,12 @@ public static class NeuraliaCycleWindowProbe {
         return string.Equals(name.ToString(), "WRY_WEBVIEW", StringComparison.Ordinal);
     }
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern bool SetWindowText(IntPtr hWnd, string text);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
     public static List<string> VisibleWryWebViewRects(IntPtr parent) {
         var rows = new List<string>();
         EnumChildWindows(parent, delegate(IntPtr hwnd, IntPtr data) {
@@ -80,6 +87,30 @@ public static class NeuraliaCycleWindowProbe {
             return true;
         }, IntPtr.Zero);
         return rows;
+    }
+
+    public static IntPtr FindVisibleEdit(IntPtr parent) {
+        IntPtr found = IntPtr.Zero;
+        EnumChildWindows(parent, delegate(IntPtr hwnd, IntPtr data) {
+            if (!IsWindowVisible(hwnd)) return true;
+            var name = new StringBuilder(128);
+            GetClassName(hwnd, name, name.Capacity);
+            if (string.Equals(name.ToString(), "Edit", StringComparison.OrdinalIgnoreCase)) {
+                found = hwnd;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    public static bool SubmitNativeOmnibox(IntPtr parent, string text) {
+        var edit = FindVisibleEdit(parent);
+        if (edit == IntPtr.Zero) return false;
+        if (!SetWindowText(edit, text)) return false;
+        const uint WM_KEYDOWN = 0x0100;
+        SendMessage(edit, WM_KEYDOWN, new IntPtr(13), IntPtr.Zero);
+        return true;
     }
 }
 "@
@@ -102,6 +133,20 @@ function Wait-ForNoVisibleWebSurfaces([System.Diagnostics.Process]$Process, [int
     }
     $Process.Refresh()
     return @(Get-VisibleWebViewSurfaceRects -Parent ([IntPtr]$Process.MainWindowHandle)).Count
+}
+
+function Submit-LifecycleProbeQuery([System.Diagnostics.Process]$Process, [string]$Text) {
+    $Process.Refresh()
+    if ($Process.HasExited) {
+        throw "NeuralIA saiu antes de reabrir o comparador."
+    }
+    $ok = [NeuraliaCycleWindowProbe]::SubmitNativeOmnibox(
+        [IntPtr]$Process.MainWindowHandle,
+        $Text
+    )
+    if (-not $ok) {
+        throw "Omnibox nativa visivel nao encontrada para reabrir o comparador."
+    }
 }
 
 function Wait-ForVisibleWebSurfaces([System.Diagnostics.Process]$Process, [int]$Expected, [int]$TimeoutSec) {
@@ -193,6 +238,7 @@ $failures = New-Object System.Collections.ArrayList
 $samples = New-Object System.Collections.ArrayList
 $webViewPoolCeiling = $null
 $webViewPoolWarmupCycles = 2
+$warmWorkingSetMiB = $null
 
 try {
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -207,9 +253,9 @@ try {
     $baselineMiB = [math]::Round($process.WorkingSet64 / 1MB, 2)
 
     for ($cycle = 1; $cycle -le $Cycles; $cycle++) {
-        # O primeiro comparador abre por NEURALIA_STARTUP_INPUT. Nos ciclos
-        # seguintes, o proprio event loop agenda SubmitText depois de voltar a
-        # Home. O gate nao depende de foco, AppActivate ou SendKeys.
+        # O primeiro comparador abre por NEURALIA_STARTUP_INPUT. Os seguintes
+        # so reabrem DEPOIS de este script observar Home sem WRY_WEBVIEW.
+        # Nao dependemos de foco global, AppActivate ou SendKeys.
         $opened = Wait-ForVisibleWebSurfaces -Process $process -Expected 3 -TimeoutSec $OpenTimeoutSec
         if ($opened -lt 3) {
             $null = $failures.Add("ciclo ${cycle}: comparador abriu apenas ${opened} container(s) WRY_WEBVIEW visivel(is)")
@@ -225,6 +271,15 @@ try {
         $visibleAfterHome = Wait-ForNoVisibleWebSurfaces -Process $process -TimeoutSec $CloseTimeoutSec
         if ($visibleAfterHome -ne 0) {
             $null = $failures.Add("ciclo ${cycle}: ${visibleAfterHome} superficie(s) WebView continuaram visiveis depois de voltar a Home")
+        }
+
+        # Mede memoria no estado Home, nao no meio da abertura seguinte.
+        $process.Refresh()
+        $postHomeMiB = [math]::Round($process.WorkingSet64 / 1MB, 2)
+        if ($cycle -eq $webViewPoolWarmupCycles) {
+            # Primeiro/segundo ciclo carregam runtime e caches legitimamente.
+            # Leak e crescimento persistente DEPOIS desse aquecimento.
+            $warmWorkingSetMiB = $postHomeMiB
         }
 
         # O Edge WebView2 pode manter um pool de subprocessos para reutilizacao
@@ -250,22 +305,32 @@ try {
             webviews_open = $opened
             visible_surfaces_after_home = $visibleAfterHome
             webview_process_pool_after_home = $pooled
-            working_set_mib = [math]::Round($process.WorkingSet64 / 1MB, 2)
+            working_set_mib = $postHomeMiB
         })
+
+        if ($cycle -lt $Cycles -and $visibleAfterHome -eq 0) {
+            Submit-LifecycleProbeQuery -Process $process -Text $StartupInput
+        }
     }
 
     $process.Refresh()
     $finalMiB = [math]::Round($process.WorkingSet64 / 1MB, 2)
-    $growthMiB = [math]::Round($finalMiB - $baselineMiB, 2)
+    $coldGrowthMiB = [math]::Round($finalMiB - $baselineMiB, 2)
+    if ($null -eq $warmWorkingSetMiB) {
+        $warmWorkingSetMiB = $baselineMiB
+    }
+    $growthMiB = [math]::Round($finalMiB - $warmWorkingSetMiB, 2)
     if ($growthMiB -gt $MaxWorkingSetGrowthMiB) {
-        $null = $failures.Add("working set cresceu ${growthMiB} MiB em $Cycles ciclos (tecto ${MaxWorkingSetGrowthMiB} MiB)")
+        $null = $failures.Add("working set cresceu ${growthMiB} MiB depois do aquecimento (tecto ${MaxWorkingSetGrowthMiB} MiB)")
     }
 
     $result = [ordered]@{
         cycles = $Cycles
         webview_baseline = $script:WebViewBaseline
         baseline_working_set_mib = $baselineMiB
+        warm_working_set_mib = $warmWorkingSetMiB
         final_working_set_mib = $finalMiB
+        cold_working_set_growth_mib = $coldGrowthMiB
         working_set_growth_mib = $growthMiB
         samples = $samples
         failures = $failures
