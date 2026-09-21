@@ -1323,7 +1323,7 @@ fn lifecycle_probe_enabled() -> bool {
 }
 
 const LIFECYCLE_PROBE_HOME_DELAY_MS: u64 = 1_200;
-const LIFECYCLE_PROBE_REOPEN_DELAY_MS: u64 = 450;
+const LIFECYCLE_PROBE_REOPEN_DELAY_MS: u64 = 2_500;
 
 #[link(name = "comctl32")]
 unsafe extern "system" {
