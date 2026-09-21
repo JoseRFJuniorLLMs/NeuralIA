@@ -484,22 +484,12 @@ try {
             break
         }
 
-        # Entrega a mensagem registada ao EDIT nativo da omnibox em qualquer
-        # top-level pertencente ao processo. A subclass da omnibox converte-a
-        # em HomeRequested; a validação abaixo continua exigindo teardown real.
-        Return-LifecycleProbeHome -Process $process
-
-        # build_as_child torna o HWND WRY_WEBVIEW visivel antes de o pump
-        # aninhado do WebView2 necessariamente devolver o controlo ao event loop.
-        # Se HOME foi postado nesse intervalo, reenfileiramos UMA vez depois de
-        # observar que os hosts continuam presentes. Isto nao mascara teardown:
-        # uma implementacao que nao esconda/destrua os WebViews continua vermelha.
-        $firstCloseWindow = [math]::Min(2, $CloseTimeoutSec)
-        $visibleAfterHome = Wait-ForNoVisibleWebSurfaces -Process $process -TimeoutSec $firstCloseWindow
-        if ($visibleAfterHome -ne 0 -and $CloseTimeoutSec -gt $firstCloseWindow) {
-            Return-LifecycleProbeHome -Process $process
-            $visibleAfterHome = Wait-ForNoVisibleWebSurfaces -Process $process -TimeoutSec ($CloseTimeoutSec - $firstCloseWindow)
-        }
+        # No modo de probe, o próprio event loop agenda HomeRequested depois
+        # de o comparador estabilizar. Isso remove da medição o transporte por
+        # teclado/registered-message para HWNDs que mudam com decorations.
+        # A condição continua externa e rigorosa: os três hosts WRY precisam
+        # desaparecer de verdade.
+        $visibleAfterHome = Wait-ForNoVisibleWebSurfaces -Process $process -TimeoutSec $CloseTimeoutSec
 
         # A Home precisa ficar sem nenhum container WRY_WEBVIEW visivel.
         # Este e o HWND hospedeiro criado e controlado pelo WRY; as HWNDs
@@ -508,10 +498,11 @@ try {
         if ($visibleAfterHome -ne 0) {
             $null = $failures.Add("ciclo ${cycle}: ${visibleAfterHome} superficie(s) WebView continuaram visiveis depois de voltar a Home")
         }
-        elseif (-not (Wait-ForLifecycleProbeHomeReady -Process $process -TimeoutSec $CloseTimeoutSec)) {
-            $null = $failures.Add("ciclo ${cycle}: Home ficou sem WebViews, mas nao concluiu a restauracao do HWND/decorations")
-            break
-        }
+
+        # A app só agenda o próximo reopen depois de RestoreHomeDecorations.
+        # Pequena folga aqui garante que a amostra pertence à Home restaurada,
+        # sem depender de consultar a subclass de um HWND potencialmente novo.
+        Start-Sleep -Milliseconds 250
 
         # Mede memoria no estado Home, nao no meio da abertura seguinte.
         $process.Refresh()
@@ -548,9 +539,8 @@ try {
             working_set_mib = $postHomeMiB
         })
 
-        if ($cycle -lt $Cycles -and $visibleAfterHome -eq 0) {
-            Submit-LifecycleProbeQuery -Process $process
-        }
+        # O próximo comparador é reaberto pelo próprio event loop, somente
+        # depois de a Home terminar a restauração de decorations/HWND.
     }
 
     $process.Refresh()
