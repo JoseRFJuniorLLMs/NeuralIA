@@ -56,6 +56,17 @@ public static class NeuraliaCycleWindowProbe {
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hWnd);
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr FindWindowEx(
+        IntPtr hWndParent,
+        IntPtr hWndChildAfter,
+        string lpszClass,
+        string lpszWindow
+    );
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetFocus(IntPtr hWnd);
+
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
 
@@ -89,46 +100,25 @@ public static class NeuraliaCycleWindowProbe {
         return rows;
     }
 
-    public static IntPtr FindAnyEdit(IntPtr parent) {
-        IntPtr found = IntPtr.Zero;
-        EnumChildWindows(parent, delegate(IntPtr hwnd, IntPtr data) {
-            var name = new StringBuilder(128);
-            GetClassName(hwnd, name, name.Capacity);
-            if (string.Equals(name.ToString(), "Edit", StringComparison.OrdinalIgnoreCase)) {
-                found = hwnd;
-                return false;
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    public static IntPtr FindVisibleEdit(IntPtr parent) {
-        IntPtr found = IntPtr.Zero;
-        EnumChildWindows(parent, delegate(IntPtr hwnd, IntPtr data) {
-            if (!IsWindowVisible(hwnd)) return true;
-            var name = new StringBuilder(128);
-            GetClassName(hwnd, name, name.Capacity);
-            if (string.Equals(name.ToString(), "Edit", StringComparison.OrdinalIgnoreCase)) {
-                found = hwnd;
-                return false;
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
+    public static IntPtr FindOmniboxEdit(IntPtr parent) {
+        // A omnibox principal e o unico EDIT filho DIRETO da janela principal.
+        // A palette tambem tem EDIT, mas vive dentro de um popup STATIC; usar
+        // EnumChildWindows recursivo pode apanhar o controlo errado.
+        return FindWindowEx(parent, IntPtr.Zero, "Edit", null);
     }
 
     public static bool SubmitNativeOmnibox(IntPtr parent, string text) {
-        var edit = FindVisibleEdit(parent);
-        if (edit == IntPtr.Zero) return false;
+        var edit = FindOmniboxEdit(parent);
+        if (edit == IntPtr.Zero || !IsWindowVisible(edit)) return false;
         if (!SetWindowText(edit, text)) return false;
+        SetFocus(edit);
         const uint WM_KEYDOWN = 0x0100;
         SendMessage(edit, WM_KEYDOWN, new IntPtr(13), IntPtr.Zero);
         return true;
     }
 
     public static bool ReturnHomeViaNativeEscape(IntPtr parent) {
-        var edit = FindAnyEdit(parent);
+        var edit = FindOmniboxEdit(parent);
         if (edit == IntPtr.Zero) return false;
         const uint WM_KEYDOWN = 0x0100;
         SendMessage(edit, WM_KEYDOWN, new IntPtr(27), IntPtr.Zero);
