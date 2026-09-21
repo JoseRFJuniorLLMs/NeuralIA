@@ -10839,6 +10839,13 @@ mod tests {
             .and_then(|part| part.split("fn activate_comparator").next())
             .expect("open_comparator body");
         assert!(!comparator.contains("schedule_home_restoration"));
+
+        let idle = source
+            .split("fn about_to_wait")
+            .nth(1)
+            .and_then(|part| part.split("fn user_event").next())
+            .expect("about_to_wait body");
+        assert!(idle.contains("self.ensure_window_subclass()"));
     }
 
     #[test]
