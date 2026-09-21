@@ -144,7 +144,16 @@ public static class NeuraliaCycleWindowProbe {
 
     public static bool RequestLifecycleProbeHome(IntPtr parent) {
         var message = RegisterWindowMessage("NeuralIA.LifecycleProbe.Home");
-        return message != 0 && PostMessage(parent, message, IntPtr.Zero, IntPtr.Zero);
+        if (message == 0) return false;
+
+        // A janela externa pode trocar de HWND quando o comparador alterna a
+        // decoração. O EDIT da omnibox mantém a sua subclass/proxy e é o
+        // transporte estável para o comando Home do probe.
+        var edit = FindWindowEx(parent, IntPtr.Zero, "Edit", null);
+        if (edit != IntPtr.Zero && PostMessage(edit, message, IntPtr.Zero, IntPtr.Zero)) {
+            return true;
+        }
+        return PostMessage(parent, message, IntPtr.Zero, IntPtr.Zero);
     }
 
     public static bool ReturnHomeViaNativeEscape(IntPtr parent) {
