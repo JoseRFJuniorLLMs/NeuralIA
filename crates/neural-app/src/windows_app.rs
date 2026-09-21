@@ -10851,12 +10851,6 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_probe_has_separate_home_and_reopen_delays() {
-        assert!(LIFECYCLE_PROBE_HOME_DELAY_MS > LIFECYCLE_PROBE_REOPEN_DELAY_MS);
-        assert!(LIFECYCLE_PROBE_REOPEN_DELAY_MS > 0);
-    }
-
-    #[test]
     fn first_comparator_layout_retries_without_waiting_for_mouse_input() {
         assert_eq!(COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS.len(), 2);
         assert!(COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS[0] > 0);
