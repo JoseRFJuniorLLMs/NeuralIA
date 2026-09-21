@@ -4076,10 +4076,8 @@ impl App {
                     let encoded = match serde_json::to_string(url) {
                         Ok(encoded) => encoded,
                         Err(error) => {
-                            reload_error = Some(format!(
-                                "URL inválida ao reutilizar {}: {error}",
-                                view.name
-                            ));
+                            reload_error =
+                                Some(format!("URL inválida ao reutilizar {}: {error}", view.name));
                             break;
                         }
                     };
