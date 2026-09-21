@@ -7278,9 +7278,6 @@ impl ApplicationHandler<UserEvent> for App {
                     let input = input.trim().to_string();
                     if !input.is_empty() {
                         self.handle_input(input);
-                        if lifecycle_probe_enabled() && self.surface == Surface::Comparator {
-                            LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
-                        }
                     }
                 }
             }
@@ -7343,11 +7340,22 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::RelayoutComparator => {
                 if self.surface == Surface::Comparator {
+                    // set_decorations(false) pode substituir/reconfigurar o HWND
+                    // depois de open_comparator() regressar. Reinstalar a subclass
+                    // aqui prende os comandos nativos ao HWND que ficou realmente
+                    // ativo, em vez de ao handle anterior da Home.
+                    self.ensure_window_subclass();
                     self.needs_clear = true;
                     self.update_comparator_layout();
                     self.sync_comparator_splitters();
                     self.sync_comparator_buttons();
                     self.sync_exit_button();
+                    if lifecycle_probe_enabled() {
+                        // O probe só considera o comparador pronto depois de pelo
+                        // menos um relayout pós-transição de decoração. Assim Home
+                        // nunca é disparado contra um HWND ainda em substituição.
+                        LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
+                    }
                     self.request_redraw();
                 }
             }
