@@ -524,6 +524,23 @@ Criar um Memory Doctor:
 Corrupção do SQLite não pode significar perda irreversível do conhecimento
 mantido.
 
+### 19.1 Estado operacional do Doctor
+
+`MemoryStore::doctor(rebuild)` já é API pública do core. O gate
+`crates/neural-core/tests/spec_0107_doctor.rs` cria fontes duráveis reais,
+injeta um documento JSON corrompido, remove o SQLite derivado e exige que
+`doctor(true)`:
+
+- conte separadamente fontes válidas e corrompidas;
+- não promova o JSON corrompido a conhecimento;
+- recrie o SQLite a partir das fontes válidas;
+- devolva busca semântica/lexical funcional depois do rebuild.
+
+O workflow sabota deliberadamente a chamada a `rebuild()` dentro do Doctor e
+confirma vermelho antes de restaurar. Compatibilidade de modelo/embedding e
+rebuild seletivo de entidades/grafo continuam critérios futuros; o Doctor atual
+é de storage/index, não deve ser descrito como mais do que isso.
+
 ## 20. Atualização futura do upstream
 
 NeuralIA não faz merge contínuo do ai-memory.
@@ -609,6 +626,28 @@ Benchmarks:
 - reindex;
 - embedding throughput;
 - startup com memória ativada porém idle.
+
+### 22.1 Harness e gate de escala
+
+O harness `crates/neural-core/examples/memory_scale.rs` mede, pela API pública
+real de `MemoryStore`, captura, 100 queries híbridas e rebuild. Sem argumentos,
+ele executa exatamente os corpora de 1k, 10k e 100k documentos previstos acima:
+
+`cargo run -p neural-core --example memory_scale --release -- 1000 10000 100000`
+
+O CI não usa 100k em cada PR. Ele mantém um gate de regressão em
+`crates/neural-core/tests/spec_0107_scale.rs`: dois stores independentes com
+128 e 512 documentos, mesmas queries e rebuilds, medidos por melhor de múltiplas
+rodadas. Para 4x entrada, query e rebuild devem custar menos de 8x.
+
+O limite é uma **razão**, não um orçamento absoluto em milissegundos. Uma
+sabotagem no workflow injeta atraso O(n²) proporcional ao número de documentos
+no rebuild e precisa deixar o gate vermelho antes de restaurar o código. Assim o teste rejeita regressão
+algorítmica sem confundir uma VM ocupada com código ruim.
+
+Este gate fecha a infraestrutura de benchmark de escala, mas não conclui a
+SPEC-0107: UX, entidades/grafo completos, embeddings opcionais de produto e
+startup idle com backend real continuam pendentes.
 
 ## 23. Segurança
 
