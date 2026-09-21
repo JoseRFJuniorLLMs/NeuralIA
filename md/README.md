@@ -54,9 +54,11 @@ embarca?” está em
 - **SPEC-0100–0101:** implemented baselines; core behavior and the shipped
   `neural-app` wiring are both gated.
 - **SPEC-0102:** partial. Deterministic local semantics/embeddings are integrated;
-  optional model-pack install/uninstall/runtime wiring is not yet a product feature.
-- **SPEC-0103:** partial. The shipped JavaScript semantic rails are product-gated;
-  full provider/end-to-end performance acceptance remains pending.
+  model-pack install/verify/benchmark/explicit-activation/fallback lifecycle is
+  covered in `neural-core`, but no model backend or product UI/startup wiring ships.
+- **SPEC-0103:** implemented. The shipped JavaScript rails have provider fixtures,
+  paired-ratio performance gates and deliberate sabotage proofs in CI; the Rust
+  parser remains a reference path, not a substitute for the shipped JS gate.
 - **SPEC-0104:** security policy is used by the shipped agent path; independent
   adversarial review remains a release gate.
 - **SPEC-0105:** the shipped runtime is `handle_agent_observation → decide_agent_step`;

@@ -30,9 +30,9 @@ pub use agent_security::{
     PolicyDecision, redact_sensitive_text,
 };
 pub use local_intelligence::{
-    EMBEDDING_DIM, HashingLocalIntelligence, IntentClass, LocalBenchmark, LocalIntelligence,
-    ModelPackManager, ModelPackManifest, benchmark_local_intelligence, cosine_similarity,
-    hashed_embedding,
+    ActiveModelPack, EMBEDDING_DIM, HashingLocalIntelligence, IntentClass, LocalBenchmark,
+    LocalIntelligence, ModelPackActivation, ModelPackManager, ModelPackManifest,
+    ModelPackSelection, benchmark_local_intelligence, cosine_similarity, hashed_embedding,
 };
 pub use memory::{
     CaptureOutcome, ForgetReport, ForgetScope, MemoryDoctorReport, MemoryDocument, MemoryHit,

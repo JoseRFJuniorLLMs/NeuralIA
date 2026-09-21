@@ -1,0 +1,180 @@
+name: SPEC-0102 model-pack lifecycle
+
+on:
+  pull_request:
+    paths:
+      - 'crates/neural-core/src/local_intelligence.rs'
+      - 'crates/neural-core/src/lib.rs'
+      - 'md/SPEC-0102-local-intelligence.md'
+      - 'md/README.md'
+      - '.github/workflows/spec-0102.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/neural-core/src/local_intelligence.rs'
+      - 'crates/neural-core/src/lib.rs'
+      - 'md/SPEC-0102-local-intelligence.md'
+      - 'md/README.md'
+      - '.github/workflows/spec-0102.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  exact-agents-gates:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+        with:
+          components: clippy,rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  sabotage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+
+      - name: Baseline SPEC-0102 lifecycle tests are green
+        run: |
+          cargo test --locked -p neural-core model_pack_manifest_requires_license_capability_version_and_full_sha256
+          cargo test --locked -p neural-core model_pack_activation_requires_verified_pack_and_recorded_benchmark
+          cargo test --locked -p neural-core corrupt_active_pack_degrades_to_deterministic_fallback_with_warning
+          cargo test --locked -p neural-core uninstalling_active_pack_deactivates_before_removing_files
+
+      - name: Sabotage manifest-license validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import re
+          from pathlib import Path
+          p = Path("crates/neural-core/src/local_intelligence.rs")
+          s = p.read_text(encoding="utf-8")
+          pattern = re.compile(
+              r'\n\s*if manifest\.license\.trim\(\)\.is_empty\(\) \{\s*'
+              r'return Err\("model pack sem metadados de licença"\.to_string\(\)\);\s*'
+              r'\}\s*'
+          )
+          updated, count = pattern.subn('\n', s, count=1)
+          if count != 1:
+              raise SystemExit("license sabotage target not found exactly once")
+          p.write_text(updated, encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core model_pack_manifest_requires_license_capability_version_and_full_sha256
+          rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+          if [ "$rc" -eq 0 ]; then
+            echo "License-validation sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: missing-license acceptance was rejected."
+
+      - name: Sabotage benchmark-before-activation rule
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import re
+          from pathlib import Path
+          p = Path("crates/neural-core/src/local_intelligence.rs")
+          s = p.read_text(encoding="utf-8")
+          pattern = re.compile(
+              r'\s*let benchmark = self\.load_benchmark\(id\)\?;\s*'
+              r'validate_benchmark\(&benchmark\)\?;\s*'
+          )
+          updated, count = pattern.subn('\n', s, count=1)
+          if count != 1:
+              raise SystemExit("benchmark sabotage target not found exactly once")
+          p.write_text(updated, encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core model_pack_activation_requires_verified_pack_and_recorded_benchmark
+          rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+          if [ "$rc" -eq 0 ]; then
+            echo "Benchmark-before-activation sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: activation without benchmark was rejected."
+
+      - name: Sabotage active-pack hash revalidation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/neural-core/src/local_intelligence.rs")
+          s = p.read_text(encoding="utf-8")
+          old = '''        let model_path = match self.verify(&manifest) {
+                      Ok(path) => path,
+                      Err(error) => return ModelPackSelection::fallback_with_warning(error),
+                  };
+          '''
+          new = '''        let model_path = self.root.join(&manifest.id).join(&manifest.file);
+          '''
+          if s.count(old) != 1:
+              raise SystemExit("hash sabotage target not found exactly once")
+          p.write_text(s.replace(old, new), encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core corrupt_active_pack_degrades_to_deterministic_fallback_with_warning
+          rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+          if [ "$rc" -eq 0 ]; then
+            echo "Active-pack hash sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: tampered active pack was rejected."
+
+      - name: Sabotage active-pack deactivation on uninstall
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/neural-core/src/local_intelligence.rs")
+          s = p.read_text(encoding="utf-8")
+          old = '''        if self
+                      .read_activation()?
+                      .as_ref()
+                      .is_some_and(|activation| activation.id == id)
+                  {
+                      self.deactivate()?;
+                  }
+
+          '''
+          if s.count(old) != 1:
+              raise SystemExit("uninstall sabotage target not found exactly once")
+          p.write_text(s.replace(old, ""), encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core uninstalling_active_pack_deactivates_before_removing_files
+          rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+          if [ "$rc" -eq 0 ]; then
+            echo "Active-uninstall sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: uninstall without deactivation was rejected."
+
+      - name: Restored SPEC-0102 lifecycle tests are green
+        run: |
+          cargo test --locked -p neural-core model_pack_manifest_requires_license_capability_version_and_full_sha256
+          cargo test --locked -p neural-core model_pack_activation_requires_verified_pack_and_recorded_benchmark
+          cargo test --locked -p neural-core corrupt_active_pack_degrades_to_deterministic_fallback_with_warning
+          cargo test --locked -p neural-core uninstalling_active_pack_deactivates_before_removing_files
