@@ -71,12 +71,18 @@ public static class NeuraliaCycleWindowProbe {
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+
+    private const uint GW_OWNER = 4;
+
     public static IntPtr MainWindowForProcess(int processId) {
         IntPtr found = IntPtr.Zero;
         EnumWindows(delegate(IntPtr hwnd, IntPtr data) {
             uint owner;
             GetWindowThreadProcessId(hwnd, out owner);
             if (owner != (uint)processId || !IsWindowVisible(hwnd)) return true;
+            if (GetWindow(hwnd, GW_OWNER) != IntPtr.Zero) return true;
             found = hwnd;
             return false;
         }, IntPtr.Zero);
