@@ -64,9 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let query_started = Instant::now();
         for _ in 0..100 {
-            black_box(store.query(&MemoryQuery::new(
-                "WebView2 security semantic memory",
-            ))?);
+            black_box(store.query(&MemoryQuery::new("WebView2 security semantic memory"))?);
         }
         let query = query_started.elapsed();
 
