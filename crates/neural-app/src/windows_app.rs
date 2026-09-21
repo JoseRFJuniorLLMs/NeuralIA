@@ -50,8 +50,9 @@ use windows_sys::Win32::{
         },
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
-            ES_AUTOHSCROLL, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowTextLengthW,
-            GetWindowTextW, GetWindowThreadProcessId, IDYES, MB_ICONINFORMATION, MB_OK, MB_YESNO,
+            EnumChildWindows, ES_AUTOHSCROLL, GetClassNameW, GetClientRect, GetCursorPos,
+            GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+            IDYES, MB_ICONINFORMATION, MB_OK, MB_YESNO,
             MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
             SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
             TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
@@ -3153,6 +3154,15 @@ impl App {
         // visíveis a partir da segunda abertura. Deixe o event loop respirar
         // antes de trocar o chrome nativo.
         self.leave_fullscreen();
+
+        // set_visible(false) atua no controller, mas o HWND hospedeiro do WRY
+        // pode sobreviver até o próximo pump quando houve troca de decorations.
+        // Escondê-lo aqui evita o flash/ghost imediato; RestoreHomeDecorations
+        // repete a limpeza depois que o pump teve tempo de concluir o drop.
+        if let Some(window) = &self.window {
+            hide_orphaned_wry_hosts(window);
+        }
+
         self.timers
             .after(Duration::from_millis(40), UserEvent::RestoreHomeDecorations);
         if let Ok(mut bytes) = self.pdf_bytes.lock() {
@@ -7401,10 +7411,20 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::RestoreHomeDecorations => {
                 if self.surface == Surface::Home {
+                    // O controller já foi descartado. Primeiro escondemos
+                    // qualquer host WRY que ainda esteja preso ao HWND antigo,
+                    // depois restauramos a moldura e repetimos a limpeza no
+                    // HWND efetivo. Isto fecha a regressão em que, do segundo
+                    // ciclo em diante, três WRY_WEBVIEW ficavam visíveis sobre
+                    // a Home apesar de os WebView Rust já terem sido dropados.
                     if let Some(window) = &self.window {
+                        hide_orphaned_wry_hosts(window);
                         window.set_decorations(true);
                     }
                     self.ensure_window_subclass();
+                    if let Some(window) = &self.window {
+                        hide_orphaned_wry_hosts(window);
+                    }
                     self.needs_clear = true;
                     self.position_omnibox();
                     self.request_redraw();
@@ -8038,6 +8058,34 @@ fn window_hwnd(window: &Window) -> Option<HWND> {
         return None;
     };
     Some(handle.hwnd.get() as HWND)
+}
+
+/// Esconde containers WRY que ficaram órfãos depois do drop dos controllers.
+///
+/// WebView2 pode concluir a destruição de forma assíncrona quando a janela pai
+/// troca de decorations. Nessa janela curta, um host `WRY_WEBVIEW` já sem
+/// controller pode continuar com WS_VISIBLE e ficar pintado por cima da Home.
+/// A Home nunca deve mostrar esses hosts. O pool de processos pode continuar
+/// quente para reutilização, mas a superfície nativa precisa desaparecer.
+unsafe extern "system" fn hide_wry_webview_host(hwnd: HWND, _lparam: LPARAM) -> i32 {
+    let mut class_name = [0u16; 64];
+    let len = GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32);
+    if len > 0
+        && String::from_utf16_lossy(&class_name[..len as usize])
+            .eq_ignore_ascii_case("WRY_WEBVIEW")
+    {
+        ShowWindow(hwnd, SW_HIDE);
+    }
+    1
+}
+
+fn hide_orphaned_wry_hosts(window: &Window) {
+    let Some(parent) = window_hwnd(window) else {
+        return;
+    };
+    unsafe {
+        EnumChildWindows(parent, Some(hide_wry_webview_host), 0);
+    }
 }
 
 fn home_animation_enabled() -> bool {
