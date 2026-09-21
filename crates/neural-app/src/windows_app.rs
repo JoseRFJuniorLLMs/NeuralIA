@@ -3103,9 +3103,56 @@ impl App {
         self.reading_pdf = false;
     }
 
+    /// Volta à Home sem destruir o trio do comparador. WebView2 pode bloquear
+    /// o event loop ao criar repetidamente novos controllers no mesmo processo;
+    /// esconder e reutilizar os três existentes evita essa recriação, preserva
+    /// o perfil/sessão e deixa a Home sem nenhuma superfície web visível.
+    fn park_comparator_for_home(&mut self) {
+        if lifecycle_probe_enabled() {
+            LIFECYCLE_COMPARATOR_READY.store(false, Ordering::Release);
+        }
+        self.mark_dirty();
+        self.close_palette();
+        self.finish_agent(AgentTermination::UserStopped);
+        self.leave_fullscreen();
+        if let Some(window) = &self.window {
+            window.set_decorations(true);
+        }
+        if let Some(button) = self.exit_button.take() {
+            unsafe {
+                DestroyWindow(button);
+            }
+        }
+        for splitter in &mut self.splitters {
+            if let Some(hwnd) = splitter.take() {
+                unsafe {
+                    DestroyWindow(hwnd);
+                }
+            }
+        }
+        if let Some(comparator) = &mut self.comparator {
+            if let Some(split) = comparator.split.take() {
+                let _ = split.webview.set_visible(false);
+                let _ = split.webview.focus_parent();
+                drop(split);
+            }
+            comparator.expanded = None;
+            comparator.minimized = [false; COMPARATOR_COLUMNS];
+            comparator.weights = [1.0; COMPARATOR_COLUMNS];
+            for view in &comparator.views {
+                let _ = view.webview.set_visible(false);
+                let _ = view.webview.focus_parent();
+            }
+        }
+    }
+
     fn show_home(&mut self) {
         self.next_generation();
-        self.destroy_web_surfaces();
+        if self.surface == Surface::Comparator && self.comparator.is_some() {
+            self.park_comparator_for_home();
+        } else {
+            self.destroy_web_surfaces();
+        }
         self.surface = Surface::Home;
         self.bar_hover = None;
         self.status = None;
@@ -3968,7 +4015,13 @@ impl App {
     }
 
     fn open_comparator(&mut self, query: &str) {
-        self.destroy_web_surfaces();
+        let reuse_comparator = self
+            .comparator
+            .as_ref()
+            .is_some_and(|comp| comp.views.len() == COMPARATOR_COLUMNS);
+        if !reuse_comparator {
+            self.destroy_web_surfaces();
+        }
         self.show_omnibox(false);
 
         let google_url = match google_ai_url(query, &self.config.language) {
@@ -3999,6 +4052,34 @@ impl App {
         // No comparador o chrome e nosso: a primeira linha recebe as abas e os
         // controles de janela; a segunda fica reservada aos provedores.
         window.set_decorations(false);
+
+        if reuse_comparator {
+            let urls = [google_url.as_str(), chatgpt_url.as_str(), claude_url.as_str()];
+            if let Some(comparator) = &mut self.comparator {
+                comparator.expanded = None;
+                comparator.minimized = [false; COMPARATOR_COLUMNS];
+                comparator.weights = [1.0; COMPARATOR_COLUMNS];
+                if let Some(split) = comparator.split.take() {
+                    let _ = split.webview.set_visible(false);
+                    let _ = split.webview.focus_parent();
+                    drop(split);
+                }
+                comparator.contexts = std::array::from_fn(|_| Vec::new());
+                comparator.groups = std::array::from_fn(|_| Vec::new());
+                comparator.next_group_id = 1;
+                for (view, url) in comparator.views.iter().zip(urls) {
+                    if let Err(error) = view.webview.load_url(url) {
+                        self.show_native_error(format!(
+                            "WebView2 não pôde reutilizar {}: {error}",
+                            view.name
+                        ));
+                        return;
+                    }
+                }
+            }
+            self.activate_comparator();
+            return;
+        }
 
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
@@ -4053,14 +4134,17 @@ impl App {
             groups: std::array::from_fn(|_| Vec::new()),
             next_group_id: 1,
         });
+        self.activate_comparator();
+    }
+
+    fn activate_comparator(&mut self) {
         self.bar_hover = None;
         self.surface = Surface::Comparator;
 
         // build_as_child nasce antes de self.comparator existir, portanto o
         // primeiro layout feito durante a construcao nao pode passar pela
         // rotina que tambem torna cada controller visivel. Reaplicar aqui e
-        // essencial: sem isto o WebView2 podia ficar branco ate um evento de
-        // rato provocar nova composicao.
+        // essencial também ao reutilizar controllers estacionados na Home.
         self.needs_clear = true;
         self.update_comparator_layout();
         self.sync_comparator_splitters();
