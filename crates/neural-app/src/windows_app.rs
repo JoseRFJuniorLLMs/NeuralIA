@@ -4054,7 +4054,11 @@ impl App {
         window.set_decorations(false);
 
         if reuse_comparator {
-            let urls = [google_url.as_str(), chatgpt_url.as_str(), claude_url.as_str()];
+            let urls = [
+                google_url.as_str(),
+                chatgpt_url.as_str(),
+                claude_url.as_str(),
+            ];
             let mut reload_error = None;
             if let Some(comparator) = &mut self.comparator {
                 comparator.expanded = None;
