@@ -10,8 +10,8 @@ $resolved = (Resolve-Path $ExePath).Path
 Add-Type @"
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 
 public static class NeuraliaWindowProbe {
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -30,31 +30,24 @@ public static class NeuraliaWindowProbe {
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
 
-    [DllImport("user32.dll")]
-    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetClassName(IntPtr hWnd, StringBuilder className, int maxCount);
 
-    private static bool IsWebViewWindow(IntPtr hwnd) {
-        uint processId;
-        GetWindowThreadProcessId(hwnd, out processId);
-        if (processId == 0) return false;
-        try {
-            var process = Process.GetProcessById((int)processId);
-            return string.Equals(process.ProcessName, "msedgewebview2", StringComparison.OrdinalIgnoreCase);
-        }
-        catch {
-            return false;
-        }
+    private static bool IsWryWebViewHost(IntPtr hwnd) {
+        var name = new StringBuilder(128);
+        GetClassName(hwnd, name, name.Capacity);
+        return string.Equals(name.ToString(), "WRY_WEBVIEW", StringComparison.Ordinal);
     }
 
-    public static List<string> VisibleLargeWebViewRects(IntPtr parent) {
+    public static List<string> VisibleWryWebViewRects(IntPtr parent) {
         var rows = new List<string>();
         EnumChildWindows(parent, delegate(IntPtr hwnd, IntPtr data) {
-            if (!IsWindowVisible(hwnd) || !IsWebViewWindow(hwnd)) return true;
+            if (!IsWindowVisible(hwnd) || !IsWryWebViewHost(hwnd)) return true;
             RECT r;
             if (!GetWindowRect(hwnd, out r)) return true;
             var width = r.Right - r.Left;
             var height = r.Bottom - r.Top;
-            if (width < 180 || height < 220) return true;
+            if (width < 1 || height < 1) return true;
             rows.Add(r.Left + "," + r.Top + "," + r.Right + "," + r.Bottom);
             return true;
         }, IntPtr.Zero);
@@ -82,11 +75,11 @@ try {
     $watch.Restart()
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
         $process.Refresh()
-        # Conta somente HWNDs visiveis cujo processo dono e msedgewebview2.
-        # Dedupe pela geometria porque uma mesma superficie pode ter mais de
-        # um HWND interno no runtime.
+        # Conta os containers WRY_WEBVIEW reais do produto. Eles sao os
+        # HWNDs que o WRY posiciona, esconde e destroi; nao as janelas internas
+        # do processo msedgewebview2.
         $rects = @(
-            [NeuraliaWindowProbe]::VisibleLargeWebViewRects([IntPtr]$process.MainWindowHandle) |
+            [NeuraliaWindowProbe]::VisibleWryWebViewRects([IntPtr]$process.MainWindowHandle) |
             Sort-Object -Unique
         )
 
@@ -95,7 +88,7 @@ try {
     }
 
     $result = [ordered]@{
-        distinct_visible_webview_rects = $rects.Count
+        distinct_visible_wry_webview_rects = $rects.Count
         rects = $rects
         mouse_or_keyboard_injected = $false
     }

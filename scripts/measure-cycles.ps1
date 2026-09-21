@@ -8,15 +8,16 @@
     sobreviverem ao regresso a Home. Este script fecha esse buraco.
 
     Para cada ciclo:
-      Enter  -> o comparador abre e nascem processos msedgewebview2.exe
-      Escape -> volta a Home e nenhuma superficie WebView pode continuar visivel
+      Enter  -> o comparador abre e aparecem containers WRY_WEBVIEW
+      Escape -> volta a Home e nenhum container WRY_WEBVIEW pode continuar visivel
 
     O runtime WebView2 pode manter um pool de subprocessos para reutilizacao.
     Esse pool pode sobreviver aos controllers, mas nao pode crescer de ciclo em
     ciclo. Tambem mantemos o gate de working set para apanhar crescimento real.
 
-    So contam os msedgewebview2.exe que descendem do nosso processo: a maquina
-    pode ter outras aplicacoes WebView2 a correr.
+    A visibilidade e medida no container Win32 WRY_WEBVIEW criado pelo WRY,
+    que e a superficie controlada pelo NeuralIA. Os processos msedgewebview2
+    sao medidos separadamente apenas para detectar crescimento persistente do pool.
 #>
 param(
     [Parameter(Mandatory = $true)]
@@ -35,8 +36,8 @@ $resolved = (Resolve-Path $ExePath).Path
 Add-Type @"
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 
 public static class NeuraliaCycleWindowProbe {
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -55,31 +56,24 @@ public static class NeuraliaCycleWindowProbe {
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
 
-    [DllImport("user32.dll")]
-    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetClassName(IntPtr hWnd, StringBuilder className, int maxCount);
 
-    private static bool IsWebViewWindow(IntPtr hwnd) {
-        uint processId;
-        GetWindowThreadProcessId(hwnd, out processId);
-        if (processId == 0) return false;
-        try {
-            var process = Process.GetProcessById((int)processId);
-            return string.Equals(process.ProcessName, "msedgewebview2", StringComparison.OrdinalIgnoreCase);
-        }
-        catch {
-            return false;
-        }
+    private static bool IsWryWebViewHost(IntPtr hwnd) {
+        var name = new StringBuilder(128);
+        GetClassName(hwnd, name, name.Capacity);
+        return string.Equals(name.ToString(), "WRY_WEBVIEW", StringComparison.Ordinal);
     }
 
-    public static List<string> VisibleLargeWebViewRects(IntPtr parent) {
+    public static List<string> VisibleWryWebViewRects(IntPtr parent) {
         var rows = new List<string>();
         EnumChildWindows(parent, delegate(IntPtr hwnd, IntPtr data) {
-            if (!IsWindowVisible(hwnd) || !IsWebViewWindow(hwnd)) return true;
+            if (!IsWindowVisible(hwnd) || !IsWryWebViewHost(hwnd)) return true;
             RECT r;
             if (!GetWindowRect(hwnd, out r)) return true;
             var width = r.Right - r.Left;
             var height = r.Bottom - r.Top;
-            if (width < 180 || height < 220) return true;
+            if (width < 1 || height < 1) return true;
             rows.Add(r.Left + "," + r.Top + "," + r.Right + "," + r.Bottom);
             return true;
         }, IntPtr.Zero);
@@ -90,7 +84,7 @@ public static class NeuraliaCycleWindowProbe {
 
 function Get-VisibleWebViewSurfaceRects([IntPtr]$Parent) {
     return @(
-        [NeuraliaCycleWindowProbe]::VisibleLargeWebViewRects($Parent) |
+        [NeuraliaCycleWindowProbe]::VisibleWryWebViewRects($Parent) |
         Sort-Object -Unique
     )
 }
@@ -107,6 +101,7 @@ function Wait-ForNoVisibleWebSurfaces([System.Diagnostics.Process]$Process, [int
     $Process.Refresh()
     return @(Get-VisibleWebViewSurfaceRects -Parent ([IntPtr]$Process.MainWindowHandle)).Count
 }
+
 function Get-DescendantIds([int]$RootId) {
     # Win32_Process via CIM is useful for ownership, but on hosted Windows
     # runners a WMI/CIM query can occasionally stall for minutes. Bound this
@@ -181,6 +176,7 @@ $process = Start-Process -FilePath $resolved -PassThru
 $failures = New-Object System.Collections.ArrayList
 $samples = New-Object System.Collections.ArrayList
 $webViewPoolCeiling = $null
+$webViewPoolWarmupCycles = 2
 
 try {
     $shell = New-Object -ComObject WScript.Shell
@@ -219,10 +215,10 @@ try {
         Start-Sleep -Milliseconds 400
         $shell.SendKeys("{ESC}")
 
-        # A Home precisa ficar sem nenhuma superficie WebView filha visivel.
-        # Isto testa o controller/child HWND que interessa ao utilizador, em
-        # vez de inferir controller vivo pela existencia do pool de processos
-        # do runtime WebView2.
+        # A Home precisa ficar sem nenhum container WRY_WEBVIEW visivel.
+        # Este e o HWND hospedeiro criado e controlado pelo WRY; as HWNDs
+        # internas do Chromium podem continuar com WS_VISIBLE mesmo quando o
+        # controller/host esta oculto, portanto nao servem como autoridade.
         $visibleAfterHome = Wait-ForNoVisibleWebSurfaces -Process $process -TimeoutSec $CloseTimeoutSec
         if ($visibleAfterHome -ne 0) {
             $null = $failures.Add("ciclo ${cycle}: ${visibleAfterHome} superficie(s) WebView continuaram visiveis depois de voltar a Home")
@@ -232,11 +228,16 @@ try {
         # mesmo depois de os controllers terem sido fechados. O que nao pode
         # acontecer e esse pool crescer a cada ciclo: isso sim denuncia leak.
         $pooled = Get-WebViewCount -RootId $process.Id
-        if ($null -eq $webViewPoolCeiling) {
-            $webViewPoolCeiling = $pooled
+        if ($cycle -le $webViewPoolWarmupCycles) {
+            # O runtime pode completar o seu pool entre a primeira e a segunda
+            # abertura. A partir do ciclo seguinte, qualquer crescimento e
+            # persistente e passa a ser regressao.
+            if ($null -eq $webViewPoolCeiling -or $pooled -gt $webViewPoolCeiling) {
+                $webViewPoolCeiling = $pooled
+            }
         }
         elseif ($pooled -gt $webViewPoolCeiling) {
-            $null = $failures.Add("ciclo ${cycle}: pool WebView2 cresceu de ${webViewPoolCeiling} para ${pooled} processo(s)")
+            $null = $failures.Add("ciclo ${cycle}: pool WebView2 cresceu de ${webViewPoolCeiling} para ${pooled} processo(s) depois do aquecimento")
             $webViewPoolCeiling = $pooled
         }
 
