@@ -3146,12 +3146,20 @@ impl App {
 
     fn show_home(&mut self) {
         self.next_generation();
-        if self.surface == Surface::Comparator && self.comparator.is_some() {
+        let park_comparator =
+            self.surface == Surface::Comparator && self.comparator.is_some();
+
+        // Muda o estado ANTES de restaurar a decoração da janela ou esconder
+        // os WebViews. set_decorations(true) pode bombear mensagens e entregar
+        // Resized de forma reentrante; se ainda parecermos estar no Comparator,
+        // esse handler reaplica o layout e torna os três controllers visíveis
+        // outra vez logo depois de os escondermos.
+        self.surface = Surface::Home;
+        if park_comparator {
             self.park_comparator_for_home();
         } else {
             self.destroy_web_surfaces();
         }
-        self.surface = Surface::Home;
         self.bar_hover = None;
         self.status = None;
         self.next_home_frame = Instant::now();
