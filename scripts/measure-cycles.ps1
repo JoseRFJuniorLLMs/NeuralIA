@@ -11,8 +11,8 @@
       startup/omnibox nativa -> o comparador abre e aparecem containers WRY_WEBVIEW
       Escape enviado ao EDIT nativo -> HomeRequested pelo caminho real do produto
       Home -> nenhum container WRY_WEBVIEW pode continuar visivel
-      o script pede a reabertura por uma mensagem Win32 privada habilitada
-      somente em NEURALIA_LIFECYCLE_PROBE, depois de observar Home limpa
+      o script pede HOME e REOPEN por mensagens Win32 privadas habilitadas
+      somente em NEURALIA_LIFECYCLE_PROBE; cada reopen só ocorre após Home limpa
 
     O runtime WebView2 pode manter um pool de subprocessos para reutilizacao.
     Esse pool pode sobreviver aos controllers, mas nao pode crescer de ciclo em
@@ -56,14 +56,6 @@ public static class NeuraliaCycleWindowProbe {
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hWnd);
 
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr FindWindowEx(
-        IntPtr hWndParent,
-        IntPtr hWndChildAfter,
-        string lpszClass,
-        string lpszWindow
-    );
-
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
 
@@ -75,9 +67,6 @@ public static class NeuraliaCycleWindowProbe {
         GetClassName(hwnd, name, name.Capacity);
         return string.Equals(name.ToString(), "WRY_WEBVIEW", StringComparison.Ordinal);
     }
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern bool SetWindowText(IntPtr hWnd, string text);
 
     [return: MarshalAs(UnmanagedType.Bool)]
     [DllImport("user32.dll", SetLastError = true)]
@@ -98,27 +87,16 @@ public static class NeuraliaCycleWindowProbe {
         return rows;
     }
 
-    public static IntPtr FindOmniboxEdit(IntPtr parent) {
-        // A omnibox principal e o unico EDIT filho DIRETO da janela principal.
-        // A palette tambem tem EDIT, mas vive dentro de um popup STATIC; usar
-        // EnumChildWindows recursivo pode apanhar o controlo errado.
-        return FindWindowEx(parent, IntPtr.Zero, "Edit", null);
+    public static bool RequestLifecycleProbeHome(IntPtr parent) {
+        // WM_APP + 0x4D. Ignorado pelo NeuralIA fora do modo de probe.
+        const uint WM_LIFECYCLE_PROBE_HOME = 0x8000 + 0x4D;
+        return PostMessage(parent, WM_LIFECYCLE_PROBE_HOME, IntPtr.Zero, IntPtr.Zero);
     }
 
     public static bool RequestLifecycleProbeReopen(IntPtr parent) {
-        // WM_APP + 0x4E. O NeuralIA ignora este comando fora do modo de probe.
+        // WM_APP + 0x4E. Ignorado pelo NeuralIA fora do modo de probe.
         const uint WM_LIFECYCLE_PROBE_REOPEN = 0x8000 + 0x4E;
         return PostMessage(parent, WM_LIFECYCLE_PROBE_REOPEN, IntPtr.Zero, IntPtr.Zero);
-    }
-
-    public static bool ReturnHomeViaNativeEscape(IntPtr parent) {
-        var edit = FindOmniboxEdit(parent);
-        if (edit == IntPtr.Zero) return false;
-        const uint WM_KEYDOWN = 0x0100;
-        const uint WM_KEYUP = 0x0101;
-        if (!PostMessage(edit, WM_KEYDOWN, new IntPtr(27), IntPtr.Zero)) return false;
-        PostMessage(edit, WM_KEYUP, new IntPtr(27), IntPtr.Zero);
-        return true;
     }
 }
 "@
@@ -161,11 +139,11 @@ function Return-LifecycleProbeHome([System.Diagnostics.Process]$Process) {
     if ($Process.HasExited) {
         throw "NeuralIA saiu antes de regressar a Home."
     }
-    $ok = [NeuraliaCycleWindowProbe]::ReturnHomeViaNativeEscape(
+    $ok = [NeuraliaCycleWindowProbe]::RequestLifecycleProbeHome(
         [IntPtr]$Process.MainWindowHandle
     )
     if (-not $ok) {
-        throw "Omnibox nativa nao encontrada para enviar Escape e regressar a Home."
+        throw "Falhou ao enfileirar o comando Win32 de Home do lifecycle."
     }
 }
 
@@ -281,9 +259,9 @@ try {
             $null = $failures.Add("ciclo ${cycle}: comparador abriu apenas ${opened} container(s) WRY_WEBVIEW visivel(is)")
         }
 
-        # Envia Escape ao EDIT nativo da omnibox. O controlo pode estar oculto
-        # por baixo dos WebViews, mas a sua subclass continua a ser o caminho
-        # real do produto: WM_KEYDOWN(ESC) -> HomeRequested -> show_home().
+        # Lifecycle mede os controllers e o teardown, não transporte de teclado.
+        # O comando privado só existe sob NEURALIA_LIFECYCLE_PROBE e enfileira
+        # exactamente HomeRequested no mesmo event loop do produto.
         Return-LifecycleProbeHome -Process $process
 
         # A Home precisa ficar sem nenhum container WRY_WEBVIEW visivel.
