@@ -1266,6 +1266,9 @@ fn now_ms() -> u64 {
 /// nessas voltas, que e o unico ponto de pintura que ainda corre.
 static ERASE_PENDING: AtomicBool = AtomicBool::new(false);
 const WINDOW_SUBCLASS_ID: usize = 0x4E4A;
+/// Mensagem privada usada somente pelo gate de lifecycle. O handler só aceita
+/// o comando quando NEURALIA_LIFECYCLE_PROBE está presente no processo.
+const WM_LIFECYCLE_PROBE_REOPEN: u32 = 0x8000 + 0x4E;
 const EXIT_BUTTON_SUBCLASS_ID: usize = 0x4E4B;
 const WM_PAINT: u32 = 0x000F;
 const WM_LBUTTONUP: u32 = 0x0202;
@@ -1318,6 +1321,10 @@ fn startup_input() -> String {
         .to_string()
 }
 
+fn lifecycle_probe_enabled() -> bool {
+    std::env::var_os("NEURALIA_LIFECYCLE_PROBE").is_some()
+}
+
 #[link(name = "comctl32")]
 unsafe extern "system" {
     fn SetWindowSubclass(
@@ -1367,8 +1374,19 @@ unsafe extern "system" fn window_subclass(
     wparam: WPARAM,
     lparam: LPARAM,
     _subclass_id: usize,
-    _reference_data: usize,
+    reference_data: usize,
 ) -> LRESULT {
+    if message == WM_LIFECYCLE_PROBE_REOPEN {
+        if lifecycle_probe_enabled() && reference_data != 0 {
+            let input = startup_input();
+            if !input.is_empty() {
+                let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+                let _ = proxy.send_event(UserEvent::SubmitText(input));
+            }
+        }
+        return 0;
+    }
+
     if message == WM_ERASEBKGND {
         if ERASE_PENDING.swap(false, Ordering::SeqCst) {
             let hdc = wparam as *mut core::ffi::c_void;
@@ -2877,7 +2895,12 @@ impl App {
                 return;
             }
 
-            SetWindowSubclass(parent, Some(window_subclass), WINDOW_SUBCLASS_ID, 0);
+            SetWindowSubclass(
+                parent,
+                Some(window_subclass),
+                WINDOW_SUBCLASS_ID,
+                proxy_ptr,
+            );
 
             self.omnibox = Some(edit);
             self.position_omnibox();
