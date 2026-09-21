@@ -4190,17 +4190,6 @@ impl App {
         self.schedule_gmail_probe(4);
         self.begin_reading_session(false);
         self.request_redraw();
-        if lifecycle_probe_enabled() {
-            // Este ponto só é alcançado depois de construir/reutilizar os três
-            // WebViews e aplicar o primeiro layout. A consulta Ready chega por
-            // uma mensagem Win32 registrada e só pode ser atendida quando o
-            // pump voltar a processar mensagens, portanto não precisamos
-            // enfileirar outro UserEvent apenas para virar este bit. Isso evita
-            // que o handshake fique preso atrás do pump aninhado do WebView2
-            // numa reabertura, sem afrouxar o gate de teardown.
-            // O bit Ready só é publicado no fim de UserEvent::SubmitText,
-            // depois que handle_input/open_comparator devolveram o controlo.
-        }
     }
 
     /// Alterna: o botao injetado na pagina pede sempre "expandir", e e aqui que
