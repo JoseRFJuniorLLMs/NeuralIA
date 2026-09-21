@@ -68,21 +68,6 @@ public static class NeuraliaCycleWindowProbe {
     [DllImport("user32.dll")]
     public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
 
-    private const uint GW_OWNER = 4;
-
-    public static IntPtr MainWindowForProcess(int processId) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows(delegate(IntPtr hwnd, IntPtr data) {
-            uint owner;
-            GetWindowThreadProcessId(hwnd, out owner);
-            if (owner != (uint)processId || !IsWindowVisible(hwnd)) return true;
-            if (GetWindow(hwnd, GW_OWNER) != IntPtr.Zero) return true;
-            found = hwnd;
-            return false;
-        }, IntPtr.Zero);
-        return found;
-    }
-
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
 
@@ -207,12 +192,12 @@ function Wait-ForNoVisibleWebSurfaces([System.Diagnostics.Process]$Process, [int
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
         $Process.Refresh()
         if ($Process.HasExited) { return 0 }
-        $count = @(Get-VisibleWebViewSurfaceRects -Parent (Get-NeuraliaMainWindow -Process $Process)).Count
+        $count = @(Get-VisibleWebViewSurfaceRects -Process $Process).Count
         if ($count -eq 0) { return 0 }
         Start-Sleep -Milliseconds 150
     }
     $Process.Refresh()
-    return @(Get-VisibleWebViewSurfaceRects -Parent (Get-NeuraliaMainWindow -Process $Process)).Count
+    return @(Get-VisibleWebViewSurfaceRects -Process $Process).Count
 }
 
 function Submit-LifecycleProbeQuery([System.Diagnostics.Process]$Process) {
@@ -246,12 +231,12 @@ function Wait-ForVisibleWebSurfaces([System.Diagnostics.Process]$Process, [int]$
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
         $Process.Refresh()
         if ($Process.HasExited) { return 0 }
-        $count = @(Get-VisibleWebViewSurfaceRects -Parent (Get-NeuraliaMainWindow -Process $Process)).Count
+        $count = @(Get-VisibleWebViewSurfaceRects -Process $Process).Count
         if ($count -ge $Expected) { return $count }
         Start-Sleep -Milliseconds 150
     }
     $Process.Refresh()
-    return @(Get-VisibleWebViewSurfaceRects -Parent (Get-NeuraliaMainWindow -Process $Process)).Count
+    return @(Get-VisibleWebViewSurfaceRects -Process $Process).Count
 }
 
 function Wait-ForLifecycleProbeReady([System.Diagnostics.Process]$Process, [int]$TimeoutSec) {
