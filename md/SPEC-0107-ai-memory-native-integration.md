@@ -641,8 +641,8 @@ O CI não usa 100k em cada PR. Ele mantém um gate de regressão em
 rodadas. Para 4x entrada, query e rebuild devem custar menos de 8x.
 
 O limite é uma **razão**, não um orçamento absoluto em milissegundos. Uma
-sabotagem no workflow injeta trabalho O(n²) no rebuild e precisa deixar o gate
-vermelho antes de restaurar o código. Assim o teste rejeita regressão
+sabotagem no workflow injeta atraso O(n²) proporcional ao número de documentos
+no rebuild e precisa deixar o gate vermelho antes de restaurar o código. Assim o teste rejeita regressão
 algorítmica sem confundir uma VM ocupada com código ruim.
 
 Este gate fecha a infraestrutura de benchmark de escala, mas não conclui a

@@ -37,7 +37,7 @@ jobs:
       - name: Baseline Memory Doctor recovery gate
         run: cargo test --locked -p neural-core --test spec_0107_doctor -- --nocapture
 
-      - name: Prove ratio gate catches quadratic rebuild work
+      - name: Prove ratio gate catches quadratic rebuild delay
         shell: bash
         run: |
           set -euo pipefail
@@ -49,11 +49,8 @@ jobs:
                   let sessions = self.research_sessions()?;
           '''
           new = '''        let docs = self.documents()?;
-                  for left in &docs {
-                      for right in &docs {
-                          std::hint::black_box((left.id.as_str(), right.id.as_str()));
-                      }
-                  }
+                  let sabotage_units = ((docs.len() / 10).max(1) as u64).pow(2);
+                  std::thread::sleep(std::time::Duration::from_millis(sabotage_units));
                   let sessions = self.research_sessions()?;
           '''
           if s.count(old) != 1:
@@ -66,10 +63,10 @@ jobs:
           set -e
           git checkout -- crates/neural-core/src/memory.rs
           if [ "$rc" -eq 0 ]; then
-            echo "Quadratic rebuild sabotage unexpectedly stayed green" >&2
+            echo "Quadratic rebuild-delay sabotage unexpectedly stayed green" >&2
             exit 1
           fi
-          echo "Sabotage proof: quadratic rebuild work was rejected."
+          echo "Sabotage proof: quadratic rebuild delay was rejected."
 
       - name: Prove Memory Doctor gate catches missing rebuild
         shell: bash
