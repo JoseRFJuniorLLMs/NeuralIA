@@ -1318,6 +1318,12 @@ fn startup_input() -> String {
         .to_string()
 }
 
+fn lifecycle_probe_enabled() -> bool {
+    std::env::var_os("NEURALIA_LIFECYCLE_PROBE").is_some()
+}
+
+const LIFECYCLE_PROBE_HOME_DELAY_MS: u64 = 1_200;
+
 #[link(name = "comctl32")]
 unsafe extern "system" {
     fn SetWindowSubclass(
@@ -4010,6 +4016,16 @@ impl App {
             self.timers.after(
                 Duration::from_millis(delay_ms),
                 UserEvent::RelayoutComparator,
+            );
+        }
+
+        // Gate de lifecycle: usa exactamente o mesmo evento nativo de Home do
+        // produto, mas sem depender de WScript.SendKeys chegar atraves de uma
+        // child window do WebView2 no runner do GitHub.
+        if lifecycle_probe_enabled() {
+            self.timers.after(
+                Duration::from_millis(LIFECYCLE_PROBE_HOME_DELAY_MS),
+                UserEvent::HomeRequested,
             );
         }
 
@@ -9778,6 +9794,8 @@ mod tests {
     #[test]
     fn private_panel_and_new_tab_are_wired() {
         assert!(NEURALIA_KEYMAP_SCRIPT.contains("act('newtab', { col:colIndex })"));
+        assert!(NEURALIA_KEYMAP_SCRIPT.contains("key === 'escape'"));
+        assert!(NEURALIA_KEYMAP_SCRIPT.contains("act('back')"));
         assert!(format!("{:?}", neuralia_action("neuralia:newtab")).starts_with("Some(NewTab"));
         assert_ne!(BarHit::Private, BarHit::SplitClose);
     }

@@ -8,8 +8,9 @@
     sobreviverem ao regresso a Home. Este script fecha esse buraco.
 
     Para cada ciclo:
-      Enter  -> o comparador abre e aparecem containers WRY_WEBVIEW
-      Escape -> volta a Home e nenhum container WRY_WEBVIEW pode continuar visivel
+      Enter -> o comparador abre e aparecem containers WRY_WEBVIEW
+      o event loop agenda HomeRequested em modo de probe
+      Home -> nenhum container WRY_WEBVIEW pode continuar visivel
 
     O runtime WebView2 pode manter um pool de subprocessos para reutilizacao.
     Esse pool pode sobreviver aos controllers, mas nao pode crescer de ciclo em
@@ -102,6 +103,19 @@ function Wait-ForNoVisibleWebSurfaces([System.Diagnostics.Process]$Process, [int
     return @(Get-VisibleWebViewSurfaceRects -Parent ([IntPtr]$Process.MainWindowHandle)).Count
 }
 
+function Wait-ForVisibleWebSurfaces([System.Diagnostics.Process]$Process, [int]$Expected, [int]$TimeoutSec) {
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        $Process.Refresh()
+        if ($Process.HasExited) { return 0 }
+        $count = @(Get-VisibleWebViewSurfaceRects -Parent ([IntPtr]$Process.MainWindowHandle)).Count
+        if ($count -ge $Expected) { return $count }
+        Start-Sleep -Milliseconds 150
+    }
+    $Process.Refresh()
+    return @(Get-VisibleWebViewSurfaceRects -Parent ([IntPtr]$Process.MainWindowHandle)).Count
+}
+
 function Get-DescendantIds([int]$RootId) {
     # Win32_Process via CIM is useful for ownership, but on hosted Windows
     # runners a WMI/CIM query can occasionally stall for minutes. Bound this
@@ -164,6 +178,7 @@ function Wait-ForWebViews([int]$RootId, [scriptblock]$Predicate, [int]$TimeoutSe
 $script:WebViewBaseline = @(Get-Process -Name msedgewebview2 -ErrorAction SilentlyContinue).Count
 
 $env:NEURALIA_STARTUP_INPUT = $StartupInput
+$env:NEURALIA_LIFECYCLE_PROBE = "1"
 
 # O monitor do Gmail e uma excepcao INTENCIONAL ao "zero WebViews na Home": ele
 # nasce quando existe sessao Google no perfil WebView2 e fica vivo mesmo depois
@@ -203,18 +218,14 @@ try {
             $shell.SendKeys("{ENTER}")
         }
 
-        $opened = Wait-ForWebViews -RootId $process.Id -Predicate { param($n) $n -gt 0 } -TimeoutSec $OpenTimeoutSec
-        # WebView2 pode reutilizar processos entre controllers. A contagem
-        # prova a abertura no primeiro ciclo; nos seguintes o gate principal e
-        # retorno a Home + crescimento de working set.
-        if ($cycle -eq 1 -and $opened -le 0) {
-            $null = $failures.Add("ciclo 1: o comparador nao criou nenhum WebView observavel")
+        $opened = Wait-ForVisibleWebSurfaces -Process $process -Expected 3 -TimeoutSec $OpenTimeoutSec
+        if ($opened -lt 3) {
+            $null = $failures.Add("ciclo ${cycle}: comparador abriu apenas ${opened} container(s) WRY_WEBVIEW visivel(is)")
         }
 
-        $null = $shell.AppActivate($process.Id)
-        Start-Sleep -Milliseconds 400
-        $shell.SendKeys("{ESC}")
-
+        # NEURALIA_LIFECYCLE_PROBE agenda HomeRequested no event loop depois da
+        # abertura. Isto testa o teardown real sem depender da entrega de uma
+        # tecla sintetica atraves do child HWND do WebView2.
         # A Home precisa ficar sem nenhum container WRY_WEBVIEW visivel.
         # Este e o HWND hospedeiro criado e controlado pelo WRY; as HWNDs
         # internas do Chromium podem continuar com WS_VISIBLE mesmo quando o
@@ -275,6 +286,9 @@ try {
     }
 }
 finally {
+    $env:NEURALIA_STARTUP_INPUT = $null
+    $env:NEURALIA_LIFECYCLE_PROBE = $null
+    $env:NEURALIA_NO_GMAIL = $null
     if (-not $process.HasExited) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
     }
