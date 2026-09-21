@@ -176,11 +176,10 @@ public static class NeuraliaCycleWindowProbe {
             return true;
         }, IntPtr.Zero);
 
-        if (postedToEdit) return true;
-
-        // Fallback para a subclass da janela externa quando a omnibox ainda não
-        // foi criada/reparentada. Poste para todas as top-level do processo, não
-        // apenas para o HWND que por acaso tinha a maior área naquele instante.
+        // Mesmo quando algum EDIT foi encontrado, envie também para as
+        // top-level do processo. WebView2/Chromium também cria controles EDIT;
+        // considerar qualquer um deles como prova de entrega pode deixar o
+        // verdadeiro omnibox de fora a partir do segundo ciclo.
         bool postedToWindow = false;
         EnumWindows(delegate(IntPtr top, IntPtr data) {
             uint ownerPid;
@@ -190,7 +189,7 @@ public static class NeuraliaCycleWindowProbe {
             }
             return true;
         }, IntPtr.Zero);
-        return postedToWindow;
+        return postedToEdit || postedToWindow;
     }
 
     public static bool ReturnHomeViaNativeEscape(IntPtr parent) {
