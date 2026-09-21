@@ -11,8 +11,8 @@
       startup/omnibox nativa -> o comparador abre e aparecem containers WRY_WEBVIEW
       Escape enviado ao EDIT nativo -> HomeRequested pelo caminho real do produto
       Home -> nenhum container WRY_WEBVIEW pode continuar visivel
-      o script escreve na omnibox EDIT nativa e envia WM_KEYDOWN Enter ao controlo
-      exacto, sem depender de foco global ou SendKeys
+      o script pede a reabertura por uma mensagem Win32 privada habilitada
+      somente em NEURALIA_LIFECYCLE_PROBE, depois de observar Home limpa
 
     O runtime WebView2 pode manter um pool de subprocessos para reutilizacao.
     Esse pool pode sobreviver aos controllers, mas nao pode crescer de ciclo em
@@ -65,9 +65,6 @@ public static class NeuraliaCycleWindowProbe {
     );
 
     [DllImport("user32.dll")]
-    public static extern IntPtr SetFocus(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -108,19 +105,10 @@ public static class NeuraliaCycleWindowProbe {
         return FindWindowEx(parent, IntPtr.Zero, "Edit", null);
     }
 
-    public static bool SubmitNativeOmnibox(IntPtr parent, string text) {
-        var edit = FindOmniboxEdit(parent);
-        if (edit == IntPtr.Zero || !IsWindowVisible(edit)) return false;
-        if (!SetWindowText(edit, text)) return false;
-        SetFocus(edit);
-        const uint WM_KEYDOWN = 0x0100;
-        const uint WM_KEYUP = 0x0101;
-        // Posta a tecla na fila da thread da UI. SendMessage executava o
-        // subclass reentrantemente a partir do processo do gate e podia
-        // enfileirar SubmitText enquanto a transicao Home ainda terminava.
-        if (!PostMessage(edit, WM_KEYDOWN, new IntPtr(13), IntPtr.Zero)) return false;
-        PostMessage(edit, WM_KEYUP, new IntPtr(13), IntPtr.Zero);
-        return true;
+    public static bool RequestLifecycleProbeReopen(IntPtr parent) {
+        // WM_APP + 0x4E. O NeuralIA ignora este comando fora do modo de probe.
+        const uint WM_LIFECYCLE_PROBE_REOPEN = 0x8000 + 0x4E;
+        return PostMessage(parent, WM_LIFECYCLE_PROBE_REOPEN, IntPtr.Zero, IntPtr.Zero);
     }
 
     public static bool ReturnHomeViaNativeEscape(IntPtr parent) {
@@ -155,17 +143,16 @@ function Wait-ForNoVisibleWebSurfaces([System.Diagnostics.Process]$Process, [int
     return @(Get-VisibleWebViewSurfaceRects -Parent ([IntPtr]$Process.MainWindowHandle)).Count
 }
 
-function Submit-LifecycleProbeQuery([System.Diagnostics.Process]$Process, [string]$Text) {
+function Submit-LifecycleProbeQuery([System.Diagnostics.Process]$Process) {
     $Process.Refresh()
     if ($Process.HasExited) {
         throw "NeuralIA saiu antes de reabrir o comparador."
     }
-    $ok = [NeuraliaCycleWindowProbe]::SubmitNativeOmnibox(
-        [IntPtr]$Process.MainWindowHandle,
-        $Text
+    $ok = [NeuraliaCycleWindowProbe]::RequestLifecycleProbeReopen(
+        [IntPtr]$Process.MainWindowHandle
     )
     if (-not $ok) {
-        throw "Omnibox nativa VISIVEL da Home nao encontrada para reabrir o comparador."
+        throw "Falhou ao enfileirar o comando Win32 de reabertura do lifecycle."
     }
 }
 
@@ -257,6 +244,7 @@ function Wait-ForWebViews([int]$RootId, [scriptblock]$Predicate, [int]$TimeoutSe
 $script:WebViewBaseline = @(Get-Process -Name msedgewebview2 -ErrorAction SilentlyContinue).Count
 
 $env:NEURALIA_STARTUP_INPUT = $StartupInput
+$env:NEURALIA_LIFECYCLE_PROBE = "1"
 
 # O monitor do Gmail e uma excepcao INTENCIONAL ao "zero WebViews na Home": ele
 # nasce quando existe sessao Google no perfil WebView2 e fica vivo mesmo depois
@@ -343,7 +331,7 @@ try {
         })
 
         if ($cycle -lt $Cycles -and $visibleAfterHome -eq 0) {
-            Submit-LifecycleProbeQuery -Process $process -Text $StartupInput
+            Submit-LifecycleProbeQuery -Process $process
         }
     }
 
@@ -378,6 +366,7 @@ try {
 }
 finally {
     $env:NEURALIA_STARTUP_INPUT = $null
+    $env:NEURALIA_LIFECYCLE_PROBE = $null
     $env:NEURALIA_NO_GMAIL = $null
     if (-not $process.HasExited) {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
