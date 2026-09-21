@@ -50,7 +50,7 @@ use windows_sys::Win32::{
         },
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
-            ES_AUTOHSCROLL, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
+            ES_AUTOHSCROLL, GetClientRect, GetCursorPos,
             GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
             IDYES, MB_ICONINFORMATION, MB_OK, MB_YESNO, MF_SEPARATOR, MF_STRING, MessageBoxW,
             SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos,
@@ -7948,40 +7948,6 @@ fn window_hwnd(window: &Window) -> Option<HWND> {
         return None;
     };
     Some(handle.hwnd.get() as HWND)
-}
-
-const WRY_WEBVIEW_CLASS: [u16; 11] = [
-    b'W' as u16,
-    b'R' as u16,
-    b'Y' as u16,
-    b'_' as u16,
-    b'W' as u16,
-    b'E' as u16,
-    b'B' as u16,
-    b'V' as u16,
-    b'I' as u16,
-    b'E' as u16,
-    b'W' as u16,
-];
-
-unsafe extern "system" fn hide_wry_webview_host(hwnd: HWND, _lparam: LPARAM) -> i32 {
-    let mut class_name = [0u16; 32];
-    let length = GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32);
-    if length == WRY_WEBVIEW_CLASS.len() as i32
-        && class_name[..length as usize] == WRY_WEBVIEW_CLASS
-    {
-        ShowWindow(hwnd, SW_HIDE);
-    }
-    1
-}
-
-fn hide_native_wry_webview_hosts(window: &Window) {
-    let Some(parent) = window_hwnd(window) else {
-        return;
-    };
-    unsafe {
-        EnumChildWindows(parent, Some(hide_wry_webview_host), 0);
-    }
 }
 
 fn home_animation_enabled() -> bool {
