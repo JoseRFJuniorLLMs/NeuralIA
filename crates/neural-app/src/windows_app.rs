@@ -3150,36 +3150,50 @@ impl App {
     }
 
     fn position_omnibox(&mut self) {
-        if self.surface != Surface::Home {
-            return;
-        }
         let (Some(window), Some(edit)) = (&self.window, self.omnibox) else {
             return;
         };
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
-        let layout = HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
-        let pad_x = 22.0 * scale;
-        let pad_y = 5.0 * scale;
-        let inner = UiRect {
-            x: layout.input.x + pad_x,
-            y: layout.input.y + pad_y,
-            width: (layout.input.width - pad_x * 2.0).max(1.0),
-            height: (layout.input.height - pad_y * 2.0).max(1.0),
+
+        // O EDIT nativo continua vivo e WS_VISIBLE durante o comparador porque
+        // a troca de decorations/HWND já depende dessa identidade estável no
+        // lifecycle provado. Fora da Home ele fica estacionado fora do cliente:
+        // não aparece na titlebar e Ctrl+L abre a palette nativa.
+        let inner = if self.surface == Surface::Home {
+            let layout =
+                HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
+            let pad_x = 22.0 * scale;
+            let pad_y = 5.0 * scale;
+            UiRect {
+                x: layout.input.x + pad_x,
+                y: layout.input.y + pad_y,
+                width: (layout.input.width - pad_x * 2.0).max(1.0),
+                height: (layout.input.height - pad_y * 2.0).max(1.0),
+            }
+        } else {
+            UiRect {
+                x: -4096.0 * scale,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            }
         };
 
         unsafe {
             SetWindowPos(
                 edit,
                 std::ptr::null_mut(),
-                inner.x as i32,
-                inner.y as i32,
-                inner.width as i32,
-                inner.height as i32,
+                inner.x.round() as i32,
+                inner.y.round() as i32,
+                inner.width.round() as i32,
+                inner.height.round() as i32,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
-        self.apply_omnibox_font(inner.height);
+        if self.surface == Surface::Home {
+            self.apply_omnibox_font(inner.height);
+        }
         self.needs_clear = true;
         self.request_redraw();
     }
@@ -3241,6 +3255,10 @@ impl App {
 
     fn show_omnibox(&self, visible: bool) {
         self.set_omnibox_visibility(visible, visible);
+    }
+
+    fn show_omnibox_passive(&self, visible: bool) {
+        self.set_omnibox_visibility(visible, false);
     }
 
     fn omnibox_text(&self) -> String {
@@ -3744,7 +3762,8 @@ impl App {
 
     fn open_pdf(&mut self, url: &str, bytes: Vec<u8>) {
         self.destroy_web_surfaces();
-        self.show_omnibox(false);
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
 
         if let Ok(mut slot) = self.pdf_bytes.lock() {
             *slot = bytes;
@@ -3948,7 +3967,8 @@ impl App {
         }
 
         self.destroy_web_surfaces();
-        self.show_omnibox(false);
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
         let origin = valid.origin().ascii_serialization();
         let mut policy = AgentPermissionPolicy::new(Some(origin));
         policy.grant_reversible_session_actions(true);
@@ -4149,7 +4169,8 @@ impl App {
 
     fn open_external(&mut self, url: &str) {
         self.destroy_web_surfaces();
-        self.show_omnibox(false);
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
         let is_pdf = url
             .split(['?', '#'])
             .next()
@@ -4231,7 +4252,8 @@ impl App {
         if !reuse_comparator {
             self.destroy_web_surfaces();
         }
-        self.show_omnibox(false);
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
 
         let google_url = match google_ai_url(query, &self.config.language) {
             Ok(u) => u,
@@ -4386,7 +4408,8 @@ impl App {
         self.sync_exit_button();
         self.sync_home_button();
         self.sync_caption_buttons();
-        self.show_omnibox(false);
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
 
         for delay_ms in COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS {
             self.timers.after(
@@ -4466,7 +4489,8 @@ impl App {
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.sync_home_button();
-        self.show_omnibox(false);
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
         self.request_redraw();
     }
 
@@ -4524,7 +4548,8 @@ impl App {
         self.sync_exit_button();
         self.sync_home_button();
         self.sync_caption_buttons();
-        self.show_omnibox(false);
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
         self.request_redraw();
     }
 
@@ -4541,7 +4566,8 @@ impl App {
         self.sync_exit_button();
         self.sync_home_button();
         self.sync_caption_buttons();
-        self.show_omnibox(false);
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
         self.request_redraw();
     }
 
@@ -7748,7 +7774,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_exit_button();
                     self.sync_home_button();
                     self.sync_caption_buttons();
-                    self.show_omnibox(false);
+                    self.show_omnibox_passive(true);
+        self.position_omnibox();
                     if lifecycle_probe_enabled() {
                         LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
                     }
@@ -7865,6 +7892,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_exit_button();
                     self.sync_home_button();
                     self.sync_caption_buttons();
+                    self.position_omnibox();
                     self.position_palette();
                     self.request_redraw();
                 }
