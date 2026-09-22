@@ -3073,8 +3073,7 @@ impl App {
 
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
-        let layout =
-            HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
+        let layout = HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
         let pad_x = 22.0 * scale;
         let pad_y = 5.0 * scale;
         let inner = UiRect {
