@@ -3762,8 +3762,7 @@ impl App {
 
     fn open_pdf(&mut self, url: &str, bytes: Vec<u8>) {
         self.destroy_web_surfaces();
-        self.show_omnibox_passive(true);
-        self.position_omnibox();
+        self.show_omnibox(false);
 
         if let Ok(mut slot) = self.pdf_bytes.lock() {
             *slot = bytes;
@@ -3967,8 +3966,7 @@ impl App {
         }
 
         self.destroy_web_surfaces();
-        self.show_omnibox_passive(true);
-        self.position_omnibox();
+        self.show_omnibox(false);
         let origin = valid.origin().ascii_serialization();
         let mut policy = AgentPermissionPolicy::new(Some(origin));
         policy.grant_reversible_session_actions(true);
@@ -4169,8 +4167,7 @@ impl App {
 
     fn open_external(&mut self, url: &str) {
         self.destroy_web_surfaces();
-        self.show_omnibox_passive(true);
-        self.position_omnibox();
+        self.show_omnibox(false);
         let is_pdf = url
             .split(['?', '#'])
             .next()
@@ -4489,6 +4486,7 @@ impl App {
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.sync_home_button();
+        self.sync_caption_buttons();
         self.show_omnibox_passive(true);
         self.position_omnibox();
         self.request_redraw();
@@ -7775,7 +7773,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_home_button();
                     self.sync_caption_buttons();
                     self.show_omnibox_passive(true);
-        self.position_omnibox();
+                    self.position_omnibox();
                     if lifecycle_probe_enabled() {
                         LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
                     }
