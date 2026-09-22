@@ -106,6 +106,9 @@ enum UserEvent {
     /// O historico recente lido pelo worker; a caixa nativa e mostrada aqui,
     /// no event loop, e nunca a leitura do ficheiro.
     HistoryLoaded(Result<Vec<HistoryEntry>, String>),
+    /// Falha de persistência do histórico. Nunca fica só no stderr: a UI
+    /// precisa avisar que uma entrada não foi gravada.
+    HistoryWriteFailed(String),
     MemoryQueryReady {
         query: String,
         result: Result<Vec<MemoryHit>, String>,
@@ -2494,7 +2497,11 @@ impl HistoryWriter {
                 while let Ok(command) = rx.recv() {
                     match command {
                         HistoryCommand::Append(entry) => {
-                            let _ = worker_store.append(&entry);
+                            if let Err(error) = worker_store.append(&entry) {
+                                let _ = worker_proxy.send_event(UserEvent::HistoryWriteFailed(
+                                    format!("Histórico não foi gravado: {error}"),
+                                ));
+                            }
                         }
                         HistoryCommand::Clear => {
                             let result = worker_store.clear().map_err(|error| error.to_string());
@@ -2541,7 +2548,9 @@ impl HistoryWriter {
     /// grave do que congelar a interface com lock + fsync + rename.
     fn append(&self, entry: HistoryEntry) {
         if self.tx.try_send(HistoryCommand::Append(entry)).is_err() {
-            eprintln!("history queue saturated; dropping one entry");
+            let _ = self.proxy.send_event(UserEvent::HistoryWriteFailed(
+                "Histórico ocupado: uma entrada não pôde ser enfileirada.".to_string(),
+            ));
         }
     }
 
@@ -4249,8 +4258,10 @@ impl App {
         if !reuse_comparator {
             self.destroy_web_surfaces();
         }
-        self.show_omnibox_passive(true);
-        self.position_omnibox();
+        // A omnibox pertence à Home. Mantê-la WS_VISIBLE/WS_TABSTOP fora do
+        // cliente deixava um controlo de teclado invisível concorrendo com os
+        // WebViews e podia roubar foco depois de reparenting do HWND.
+        self.show_omnibox_passive(false);
 
         let google_url = match google_ai_url(query, &self.config.language) {
             Ok(u) => u,
@@ -4405,8 +4416,7 @@ impl App {
         self.sync_exit_button();
         self.sync_home_button();
         self.sync_caption_buttons();
-        self.show_omnibox_passive(true);
-        self.position_omnibox();
+        self.show_omnibox_passive(false);
 
         for delay_ms in COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS {
             self.timers.after(
@@ -4422,10 +4432,9 @@ impl App {
         // o gate pode enviar Home imediatamente depois de observar o flag.
         self.ensure_window_subclass();
 
-        if lifecycle_probe_enabled() {
-            LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
-        }
-
+        // Não publique Ready aqui. build_as_child/navigation ainda pode estar
+        // num pump aninhado do WebView2. O handshake só nasce em about_to_wait,
+        // quando o winit recuperou realmente o event loop.
         self.schedule_gmail_probe(4);
         self.begin_reading_session(false);
         self.request_redraw();
@@ -4458,37 +4467,27 @@ impl App {
             return;
         }
 
-        let mut restored = false;
         if let Some(comp) = &mut self.comparator
             && idx < comp.views.len()
         {
-            if comp.expanded == Some(idx) {
-                comp.expanded = None;
-                restored = true;
+            comp.expanded = if comp.expanded == Some(idx) {
+                None
             } else {
-                comp.expanded = Some(idx);
-            }
+                Some(idx)
+            };
         }
         self.bar_hover = None;
         self.needs_clear = true;
 
-        // Ecra completo a serio: sem barra de titulo, sem minimizar/fechar.
-        if let Some(window) = &self.window {
-            if restored {
-                window.set_fullscreen(None);
-            } else {
-                window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-            }
-        }
-
+        // Expandir ocupa só a área de conteúdo. A janela continua uma janela:
+        // titlebar NeuralIA e minimizar/maximizar/fechar permanecem acessíveis.
         self.update_comparator_layout();
         self.sync_comparator_splitters();
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.sync_home_button();
         self.sync_caption_buttons();
-        self.show_omnibox_passive(true);
-        self.position_omnibox();
+        self.show_omnibox_passive(false);
         self.request_redraw();
     }
 
@@ -4505,7 +4504,6 @@ impl App {
             self.close_split();
         }
 
-        let mut was_expanded = false;
         let mut changed = false;
         if let Some(comp) = &mut self.comparator
             && idx < comp.views.len()
@@ -4519,7 +4517,6 @@ impl App {
 
             // Mantemos sempre pelo menos uma IA visível.
             if !comp.minimized[idx] && visible > 1 {
-                was_expanded = comp.expanded == Some(idx);
                 comp.expanded = None;
                 comp.minimized[idx] = true;
                 changed = true;
@@ -4534,10 +4531,6 @@ impl App {
             return;
         }
 
-        if was_expanded && let Some(window) = &self.window {
-            window.set_fullscreen(None);
-        }
-
         self.bar_hover = None;
         self.needs_clear = true;
         self.update_comparator_layout();
@@ -4546,8 +4539,7 @@ impl App {
         self.sync_exit_button();
         self.sync_home_button();
         self.sync_caption_buttons();
-        self.show_omnibox_passive(true);
-        self.position_omnibox();
+        self.show_omnibox_passive(false);
         self.request_redraw();
     }
 
@@ -4555,17 +4547,13 @@ impl App {
         if let Some(comp) = &mut self.comparator {
             comp.expanded = None;
         }
-        if let Some(window) = &self.window {
-            window.set_fullscreen(None);
-        }
         self.update_comparator_layout();
         self.sync_comparator_splitters();
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.sync_home_button();
         self.sync_caption_buttons();
-        self.show_omnibox_passive(true);
-        self.position_omnibox();
+        self.show_omnibox_passive(false);
         self.request_redraw();
     }
 
@@ -4640,8 +4628,8 @@ impl App {
                 for (i, v) in comp.views.iter().enumerate() {
                     if i == idx {
                         let _ = v.webview.set_bounds(wry::Rect {
-                            position: LogicalPosition::new(0.0, 0.0).into(),
-                            size: LogicalSize::new(logical_w, logical_h.max(1.0)).into(),
+                            position: LogicalPosition::new(0.0, content_y).into(),
+                            size: LogicalSize::new(logical_w, content_h).into(),
                         });
                         let _ = v.webview.set_visible(true);
                     } else {
@@ -4714,7 +4702,9 @@ impl App {
             IpcAction::NewTab { col: Some(col) } if col == col_index => {
                 Some(UserEvent::NewTab(col_index))
             }
-            IpcAction::Expand { col } => Some(UserEvent::ExpandComparator(col)),
+            IpcAction::Expand { col } if col == col_index => {
+                Some(UserEvent::ExpandComparator(col_index))
+            }
             other => common_ipc_event(other),
         }
     }
@@ -5904,19 +5894,13 @@ impl App {
     }
 
     fn is_fullscreen_column(&self) -> bool {
-        self.comparator
-            .as_ref()
-            .is_some_and(|comp| comp.expanded.is_some())
+        false
     }
 
-    /// Em tres colunas a barra fica estavel. Em fullscreen ela desaparece e
-    /// a saida fica por conta do botao nativo flutuante.
+    /// A barra do NeuralIA permanece visível também quando uma IA é expandida.
+    /// "Expandir" muda o layout do conteúdo, não o modo de janela do Windows.
     fn bar_visible(&self) -> bool {
-        match &self.comparator {
-            Some(comp) if comp.split.is_some() => true,
-            Some(comp) => comp.expanded.is_none(),
-            None => false,
-        }
+        self.comparator.is_some()
     }
 
     fn bar_layout(&self) -> Option<BarLayout> {
@@ -7592,6 +7576,26 @@ impl ApplicationHandler<UserEvent> for App {
         // continuem chegando à janela REAL também na segunda abertura.
         self.ensure_window_subclass();
 
+        // Primeiro ponto garantidamente posterior ao retorno do handler que
+        // abriu/reutilizou os WebViews. Só aqui o probe pode afirmar que o
+        // comparador devolveu o controlo ao event loop.
+        if lifecycle_probe_enabled()
+            && self.surface == Surface::Comparator
+            && self.comparator.is_some()
+            && !LIFECYCLE_COMPARATOR_READY.load(Ordering::Acquire)
+        {
+            self.needs_clear = true;
+            self.update_comparator_layout();
+            self.sync_comparator_splitters();
+            self.sync_comparator_buttons();
+            self.sync_exit_button();
+            self.sync_home_button();
+            self.sync_caption_buttons();
+            self.show_omnibox_passive(false);
+            LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
+            self.request_redraw();
+        }
+
         let interval = if self.surface == Surface::Home && home_animation_enabled() {
             // O `Occluded` do Windows nao cobre a minimizacao em todos os
             // casos, por isso pergunta-se tambem a janela.
@@ -7668,6 +7672,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::HistoryCleared(result) => self.report_history_cleared(result),
             UserEvent::HistoryLoaded(result) => self.show_history_entries(result),
+            UserEvent::HistoryWriteFailed(message) => self.show_splash(message, 5),
             UserEvent::MemoryQueryReady { query, result } => {
                 self.show_memory_results(&query, result);
             }
@@ -7772,11 +7777,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_exit_button();
                     self.sync_home_button();
                     self.sync_caption_buttons();
-                    self.show_omnibox_passive(true);
-                    self.position_omnibox();
-                    if lifecycle_probe_enabled() {
-                        LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
-                    }
+                    self.show_omnibox_passive(false);
                     self.request_redraw();
                 }
             }
@@ -11626,6 +11627,72 @@ mod tests {
             .expect("split body");
         assert!(split.contains("hide_comparator_splitters()"));
         assert!(split.contains("sync_comparator_splitters()"));
+    }
+
+    #[test]
+    fn expanded_column_never_enters_borderless_fullscreen_or_hides_chrome() {
+        let source = include_str!("windows_app.rs");
+        let expand = source
+            .split("fn expand_comparator")
+            .nth(1)
+            .and_then(|part| part.split("fn minimize_comparator").next())
+            .expect("expand_comparator body");
+        assert!(!expand.contains("set_fullscreen(Some"));
+        assert!(expand.contains("área de conteúdo"));
+
+        let bar = source
+            .split("fn bar_visible")
+            .nth(1)
+            .and_then(|part| part.split("fn bar_layout").next())
+            .expect("bar_visible body");
+        assert!(!bar.contains("expanded.is_none"));
+    }
+
+    #[test]
+    fn comparator_expand_ipc_cannot_control_another_column() {
+        assert!(matches!(
+            App::column_ipc_event_impl(1, IpcAction::Expand { col: 1 }),
+            Some(UserEvent::ExpandComparator(1))
+        ));
+        assert!(App::column_ipc_event_impl(1, IpcAction::Expand { col: 0 }).is_none());
+        assert!(App::column_ipc_event_impl(1, IpcAction::Expand { col: 2 }).is_none());
+    }
+
+    #[test]
+    fn lifecycle_ready_is_never_published_from_activation_or_relayout() {
+        let source = include_str!("windows_app.rs");
+        let activate = source
+            .split("fn activate_comparator")
+            .nth(1)
+            .and_then(|part| part.split("fn expand_comparator").next())
+            .expect("activate_comparator body");
+        assert!(!activate.contains("LIFECYCLE_COMPARATOR_READY.store(true"));
+
+        let relayout = source
+            .split("UserEvent::RelayoutComparator =>")
+            .nth(1)
+            .and_then(|part| part.split("UserEvent::RestoreHomeDecorations =>").next())
+            .expect("RelayoutComparator handler");
+        assert!(!relayout.contains("LIFECYCLE_COMPARATOR_READY.store(true"));
+
+        let idle = source
+            .split("fn about_to_wait")
+            .nth(1)
+            .and_then(|part| part.split("fn user_event").next())
+            .expect("about_to_wait body");
+        assert!(idle.contains("LIFECYCLE_COMPARATOR_READY.store(true"));
+    }
+
+    #[test]
+    fn history_worker_does_not_silently_discard_append_failures() {
+        let source = include_str!("windows_app.rs");
+        let worker = source
+            .split("HistoryCommand::Append(entry) =>")
+            .nth(1)
+            .and_then(|part| part.split("HistoryCommand::Clear =>").next())
+            .expect("history append worker");
+        assert!(!worker.contains("let _ = worker_store.append"));
+        assert!(worker.contains("HistoryWriteFailed"));
     }
 
     #[test]
