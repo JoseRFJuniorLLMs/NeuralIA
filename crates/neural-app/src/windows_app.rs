@@ -45,14 +45,15 @@ use windows_sys::Win32::{
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, GetFocus, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, SendInput,
-            SetFocus, VK_CONTROL, VK_ESCAPE, VK_NEXT, VK_RETURN, VK_SHIFT,
+            EnableWindow, GetAsyncKeyState, GetFocus, INPUT, INPUT_KEYBOARD, IsWindowEnabled,
+            KEYEVENTF_KEYUP, SendInput, SetFocus, VK_CONTROL, VK_ESCAPE, VK_NEXT, VK_RETURN,
+            VK_SHIFT,
         },
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
-            ES_AUTOHSCROLL, EnableWindow, EnumChildWindows, GetClassNameW, GetClientRect,
-            GetCursorPos, GetForegroundWindow, GetParent, GetWindowTextLengthW, GetWindowTextW,
-            GetWindowThreadProcessId, IDYES, IsWindowEnabled, IsZoomed, MB_ICONINFORMATION, MB_OK,
+            ES_AUTOHSCROLL, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
+            GetForegroundWindow, GetParent, GetWindowTextLengthW, GetWindowTextW,
+            GetWindowThreadProcessId, IDYES, IsZoomed, MB_ICONINFORMATION, MB_OK,
             MB_YESNO, MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
             SWP_NOZORDER, SendMessageW, SetParent, SetWindowPos, SetWindowTextW, ShowWindow,
             TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE,
@@ -3167,7 +3168,9 @@ impl App {
         };
         let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
         unsafe {
-            SetWindowSubclass(parent, Some(window_subclass), WINDOW_SUBCLASS_ID, proxy_ptr);
+            if SetWindowSubclass(parent, Some(window_subclass), WINDOW_SUBCLASS_ID, proxy_ptr) == 0 {
+                eprintln!("failed to subclass effective NeuralIA HWND");
+            }
 
             // A troca de decorations pode substituir/reparentar o HWND nativo.
             // A omnibox e o Home sao filhos Win32 reais: se continuarem ligados
@@ -3226,7 +3229,9 @@ impl App {
                 return;
             }
 
-            SetWindowSubclass(parent, Some(window_subclass), WINDOW_SUBCLASS_ID, proxy_ptr);
+            if SetWindowSubclass(parent, Some(window_subclass), WINDOW_SUBCLASS_ID, proxy_ptr) == 0 {
+                eprintln!("failed to subclass NeuralIA parent HWND while creating omnibox");
+            }
 
             self.omnibox = Some(edit);
             self.position_omnibox();
