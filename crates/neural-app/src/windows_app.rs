@@ -70,7 +70,7 @@ use winit::{
     window::{Fullscreen, Icon, Window, WindowId},
 };
 use wry::{
-    NewWindowResponse, PermissionResponse, WebView, WebViewBuilder,
+    NewWindowResponse, PermissionKind, PermissionResponse, WebView, WebViewBuilder,
     http::{Request, Response as HttpResponse},
 };
 
@@ -3955,7 +3955,7 @@ impl App {
                 }
                 NewWindowResponse::Deny
             })
-            .with_permission_handler(|_| PermissionResponse::Deny)
+            .with_permission_handler(move |kind| web_media_permission(kind, !agent_enabled))
             .with_focused(true)
     }
 
@@ -4777,7 +4777,7 @@ impl App {
                 }
                 NewWindowResponse::Deny
             })
-            .with_permission_handler(|_| PermissionResponse::Deny)
+            .with_permission_handler(|kind| web_media_permission(kind, true))
             .with_focused(true)
     }
 
@@ -4920,7 +4920,7 @@ impl App {
                 }
                 NewWindowResponse::Deny
             })
-            .with_permission_handler(|_| PermissionResponse::Deny)
+            .with_permission_handler(|kind| web_media_permission(kind, true))
             .with_focused(true)
     }
 
@@ -8365,6 +8365,20 @@ fn local_origin_of(url: &Url) -> Option<String> {
     is_local_network_target(url).then(|| url.origin().ascii_serialization())
 }
 
+fn web_media_permission(kind: PermissionKind, user_visible: bool) -> PermissionResponse {
+    if !user_visible {
+        return PermissionResponse::Deny;
+    }
+    match kind {
+        PermissionKind::Microphone | PermissionKind::Camera | PermissionKind::DisplayCapture => {
+            // No WRY 0.57, Default continua o fluxo nativo do WebView2 no Windows:
+            // o utilizador decide no prompt do runtime. NeuralIA nunca da Allow silencioso.
+            PermissionResponse::Default
+        }
+        _ => PermissionResponse::Deny,
+    }
+}
+
 fn remote_web_target(target: &str, local_origin: Option<&str>) -> bool {
     if target.eq_ignore_ascii_case("about:blank") {
         return true;
@@ -9565,6 +9579,51 @@ mod tests {
             frame.branches.len(),
             frame.nodes.len()
         );
+    }
+
+    #[test]
+    fn spec_0109_webrtc_media_requires_native_user_consent() {
+        for kind in [
+            PermissionKind::Microphone,
+            PermissionKind::Camera,
+            PermissionKind::DisplayCapture,
+        ] {
+            assert_eq!(
+                web_media_permission(kind, true),
+                PermissionResponse::Default,
+                "{kind:?} deve continuar pelo prompt nativo do WebView2"
+            );
+            assert_ne!(
+                web_media_permission(kind, true),
+                PermissionResponse::Allow,
+                "NeuralIA nunca deve conceder captura silenciosamente"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_0109_webrtc_media_stays_fail_closed_outside_visible_capture() {
+        for kind in [
+            PermissionKind::Geolocation,
+            PermissionKind::Notifications,
+            PermissionKind::ClipboardRead,
+            PermissionKind::Sensors,
+            PermissionKind::LocalFonts,
+            PermissionKind::FileSystemAccess,
+        ] {
+            assert_eq!(web_media_permission(kind, true), PermissionResponse::Deny);
+        }
+        for kind in [
+            PermissionKind::Microphone,
+            PermissionKind::Camera,
+            PermissionKind::DisplayCapture,
+        ] {
+            assert_eq!(
+                web_media_permission(kind, false),
+                PermissionResponse::Deny,
+                "agente/superficie nao visivel nao pode pedir captura"
+            );
+        }
     }
 
     /// A autorizacao de rede local vale para a ORIGEM que o utilizador
