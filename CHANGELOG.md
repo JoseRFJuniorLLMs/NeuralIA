@@ -4,6 +4,13 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- Removido o ícone não solicitado do botão Home no comparador.
+- A titlebar volta a ser reservada para abas e controles da janela; a omnibox permanece somente na Home e a pesquisa do comparador continua disponível pela palette.
+- Expandir uma IA deixa de entrar em fullscreen borderless: o painel ocupa a área de conteúdo e mantém minimizar/maximizar/fechar visíveis.
+- O gate de ciclo de vida passa a medir também crescimento de handles, threads e objetos GDI após o aquecimento, além de RAM, hosts WRY e processos WebView2.
+
+
 ## [2.1.2] - 2026-09-21
 
 ### Fixed
