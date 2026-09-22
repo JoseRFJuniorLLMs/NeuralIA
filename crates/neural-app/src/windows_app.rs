@@ -55,8 +55,8 @@ use windows_sys::Win32::{
             GetWindowThreadProcessId, IDYES, MB_ICONINFORMATION, MB_OK, MB_YESNO, MF_SEPARATOR,
             MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
             SetParent, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-            TrackPopupMenu, WM_KEYDOWN,
-            WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+            TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+            WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -784,8 +784,7 @@ fn comparator_omnibox_rect(client_width: f64, scale: f64) -> UiRect {
     let scale = scale.max(1.0);
     let x = 92.0 * scale;
     let caption_left = (client_width - 3.0 * 46.0 * scale - 10.0 * scale).max(x);
-    let width = (360.0 * scale)
-        .min((caption_left - x - 10.0 * scale).max(0.0));
+    let width = (360.0 * scale).min((caption_left - x - 10.0 * scale).max(0.0));
     UiRect {
         x,
         y: 5.0 * scale,
@@ -5894,8 +5893,7 @@ impl App {
                 if created.is_null() {
                     return;
                 }
-                let proxy_ptr =
-                    (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
+                let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
                 if SetWindowSubclass(
                     created,
                     Some(home_button_subclass),
@@ -5908,8 +5906,7 @@ impl App {
                 }
                 let width = rect.width.round() as i32;
                 let height = rect.height.round() as i32;
-                let region =
-                    CreateRoundRectRgn(0, 0, width + 1, height + 1, height, height);
+                let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, height, height);
                 if !region.is_null() {
                     SetWindowRgn(created, region, 1);
                 }
@@ -9609,12 +9606,8 @@ mod tests {
                 std::ptr::null(),
             );
             assert!(!hwnd.is_null(), "o Home nativo tem de nascer");
-            let subclassed = SetWindowSubclass(
-                hwnd,
-                Some(home_button_subclass),
-                HOME_BUTTON_SUBCLASS_ID,
-                0,
-            );
+            let subclassed =
+                SetWindowSubclass(hwnd, Some(home_button_subclass), HOME_BUTTON_SUBCLASS_ID, 0);
             let hit = SendMessageW(hwnd, WM_NCHITTEST, 0, 0);
             DestroyWindow(hwnd);
             assert_ne!(subclassed, 0);
