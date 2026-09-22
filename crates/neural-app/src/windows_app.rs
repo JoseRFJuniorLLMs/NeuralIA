@@ -4421,8 +4421,9 @@ impl App {
         // o gate pode enviar Home imediatamente depois de observar o flag.
         self.ensure_window_subclass();
 
-        // Ready só é publicado em about_to_wait(), depois de devolver o
-        // controlo ao event loop fora do pump aninhado do WebView2.
+        if lifecycle_probe_enabled() {
+            LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
+        }
         self.schedule_gmail_probe(4);
         self.begin_reading_session(false);
         self.request_redraw();
@@ -4467,8 +4468,9 @@ impl App {
         self.bar_hover = None;
         self.needs_clear = true;
 
-        // Expandir ocupa apenas a área de conteúdo. A titlebar do NeuralIA e
-        // minimizar/maximizar/fechar permanecem acessíveis.
+        if let Some(window) = &self.window {
+            window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+        }
         self.update_comparator_layout();
         self.sync_comparator_splitters();
         self.sync_comparator_buttons();
@@ -4696,9 +4698,7 @@ impl App {
             IpcAction::NewTab { col: Some(col) } if col == col_index => {
                 Some(UserEvent::NewTab(col_index))
             }
-            IpcAction::Expand { col } if col == col_index => {
-                Some(UserEvent::ExpandComparator(col_index))
-            }
+            IpcAction::Expand { col } => Some(UserEvent::ExpandComparator(col)),
             other => common_ipc_event(other),
         }
     }
