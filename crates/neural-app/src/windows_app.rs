@@ -646,7 +646,8 @@ impl BarLayout {
         }
 
         // Linha superior: todas as fontes/abas, antes dos controles da janela.
-        let tabs_left = 90.0 * scale;
+        let omnibox = comparator_omnibox_rect(client_width, scale);
+        let tabs_left = (omnibox.x + omnibox.width + 8.0 * scale).max(90.0 * scale);
         let tabs_right = (window_minimize.x - 8.0 * scale).max(tabs_left);
         let visible_rows = &rows[..columns_len];
         let total_slots: usize = visible_rows.iter().map(|row| row.len).sum();
@@ -779,6 +780,26 @@ impl BarLayout {
         }
         None
     }
+}
+
+/// Omnibox persistente do comparador, na mesma faixa da title bar.
+/// Usa coordenadas fisicas, como BarLayout e os eventos do rato.
+fn comparator_omnibox_rect(client_width: f64, scale: f64) -> UiRect {
+    let scale = scale.max(1.0);
+    let x = 92.0 * scale;
+    let caption_left = (client_width - 3.0 * 46.0 * scale - 10.0 * scale).max(x);
+    let width = (360.0 * scale)
+        .min((caption_left - x - 10.0 * scale).max(0.0));
+    UiRect {
+        x,
+        y: 5.0 * scale,
+        width,
+        height: (TITLE_TAB_HEIGHT - 10.0) * scale,
+    }
+}
+
+fn surface_accepts_omnibox_submit(surface: Surface) -> bool {
+    matches!(surface, Surface::Home | Surface::Comparator)
 }
 
 /// Os controlos do canto direito da segunda linha.
@@ -3014,18 +3035,32 @@ impl App {
             return;
         };
         let size = window.inner_size();
-        let layout = HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
         let scale = window.scale_factor().max(1.0);
 
-        // O controlo vive encaixado dentro da pilula desenhada: os cantos retos
-        // ficam por baixo da curva e nunca se veem.
-        let pad_x = 22.0 * scale;
-        let pad_y = 5.0 * scale;
-        let inner = UiRect {
-            x: layout.input.x + pad_x,
-            y: layout.input.y + pad_y,
-            width: (layout.input.width - pad_x * 2.0).max(1.0),
-            height: (layout.input.height - pad_y * 2.0).max(1.0),
+        // A mesma caixa nativa serve a Home e o comparador. Na segunda tela ela
+        // vive na title bar, portanto o utilizador pode fazer outra pesquisa
+        // sem voltar à Home nem depender de atalhos escondidos.
+        let inner = if self.surface == Surface::Comparator {
+            let outer = comparator_omnibox_rect(size.width as f64, scale);
+            let pad_x = 10.0 * scale;
+            let pad_y = 3.0 * scale;
+            UiRect {
+                x: outer.x + pad_x,
+                y: outer.y + pad_y,
+                width: (outer.width - pad_x * 2.0).max(1.0),
+                height: (outer.height - pad_y * 2.0).max(1.0),
+            }
+        } else {
+            let layout =
+                HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
+            let pad_x = 22.0 * scale;
+            let pad_y = 5.0 * scale;
+            UiRect {
+                x: layout.input.x + pad_x,
+                y: layout.input.y + pad_y,
+                width: (layout.input.width - pad_x * 2.0).max(1.0),
+                height: (layout.input.height - pad_y * 2.0).max(1.0),
+            }
         };
 
         unsafe {
@@ -3088,16 +3123,24 @@ impl App {
         }
     }
 
-    fn show_omnibox(&self, visible: bool) {
+    fn set_omnibox_visibility(&self, visible: bool, focus: bool) {
         let Some(edit) = self.omnibox else {
             return;
         };
         unsafe {
             ShowWindow(edit, if visible { SW_SHOW } else { SW_HIDE });
-            if visible {
+            if visible && focus {
                 SetFocus(edit);
             }
         }
+    }
+
+    fn show_omnibox(&self, visible: bool) {
+        self.set_omnibox_visibility(visible, visible);
+    }
+
+    fn show_omnibox_passive(&self, visible: bool) {
+        self.set_omnibox_visibility(visible, false);
     }
 
     fn omnibox_text(&self) -> String {
@@ -4080,7 +4123,8 @@ impl App {
         if !reuse_comparator {
             self.destroy_web_surfaces();
         }
-        self.show_omnibox(false);
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
 
         let google_url = match google_ai_url(query, &self.config.language) {
             Ok(u) => u,
@@ -4233,6 +4277,8 @@ impl App {
             self.sync_comparator_buttons();
         }
         self.sync_exit_button();
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
 
         for delay_ms in COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS {
             self.timers.after(
@@ -5542,7 +5588,12 @@ impl App {
 
     /// O equivalente ao Ctrl+L do Chrome: volta a barra e seleciona o texto.
     fn focus_omnibox(&mut self) {
-        self.show_home();
+        if self.surface != Surface::Comparator {
+            self.show_home();
+        } else {
+            self.show_omnibox_passive(true);
+            self.position_omnibox();
+        }
         if let Some(edit) = self.omnibox {
             unsafe {
                 SetFocus(edit);
@@ -7387,7 +7438,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::HideChrome(token) => self.hide_chrome(token),
             UserEvent::SubmitText(input) => {
-                if self.surface == Surface::Home {
+                if surface_accepts_omnibox_submit(self.surface) {
                     let input = input.trim().to_string();
                     if !input.is_empty() {
                         self.handle_input(input);
@@ -7577,6 +7628,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.update_comparator_layout();
                     self.sync_comparator_splitters();
                     self.sync_exit_button();
+                    self.position_omnibox();
                     self.position_palette();
                     self.request_redraw();
                 }
@@ -8685,6 +8737,17 @@ unsafe fn paint_comparator_bar_with_contexts(
         },
         "NeuralIA",
         PillStyle::new(theme.bar_bg, theme.bar_bg, theme.fg_muted),
+        scale,
+        tab_font,
+        theme.bar_bg,
+    );
+
+    let search = comparator_omnibox_rect(width as f64, scale);
+    draw_pill(
+        target,
+        search,
+        "",
+        PillStyle::new(theme.surface, theme.surface_line, theme.fg),
         scale,
         tab_font,
         theme.bar_bg,
@@ -11799,6 +11862,19 @@ mod tests {
                 "{from} nao pode pousar sobre as outras aplicacoes"
             );
         }
+    }
+
+    #[test]
+    fn comparator_keeps_a_real_omnibox_without_covering_window_controls() {
+        let rect = comparator_omnibox_rect(1600.0, 1.0);
+        assert!(rect.width >= 300.0);
+        assert!(rect.x >= 90.0);
+        assert!(rect.x + rect.width < 1600.0 - 3.0 * 46.0);
+        assert!(surface_accepts_omnibox_submit(Surface::Home));
+        assert!(surface_accepts_omnibox_submit(Surface::Comparator));
+        assert!(!surface_accepts_omnibox_submit(Surface::External));
+        assert!(!surface_accepts_omnibox_submit(Surface::Reader));
+        assert!(!surface_accepts_omnibox_submit(Surface::Pdf));
     }
 
     #[test]
