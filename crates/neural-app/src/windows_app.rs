@@ -861,6 +861,21 @@ fn right_controls(client_width: f64, scale: f64, split_active: bool) -> RightCon
     RightControls { private, split }
 }
 
+fn right_controls_hit(controls: RightControls, x: f64, y: f64) -> Option<BarHit> {
+    if controls.private.contains(x, y) {
+        return Some(BarHit::Private);
+    }
+    if let Some((_label, expand, close)) = controls.split {
+        if close.contains(x, y) {
+            return Some(BarHit::SplitClose);
+        }
+        if expand.contains(x, y) {
+            return Some(BarHit::SplitExpand);
+        }
+    }
+    None
+}
+
 struct ComparatorView {
     webview: WebView,
     name: &'static str,
@@ -1219,6 +1234,20 @@ fn regroup_context_tab(
     let created_id = groups.get(created)?.id;
     prune_empty_groups(tabs, groups);
     groups.iter().position(|group| group.id == created_id)
+}
+
+fn commit_split_build<T, E, P>(
+    result: Result<T, E>,
+    current_split: &mut Option<P>,
+    expanded: &mut Option<usize>,
+) -> Result<(T, Option<P>), E> {
+    match result {
+        Ok(value) => {
+            *expanded = None;
+            Ok((value, current_split.take()))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 struct ComparatorState {
@@ -5108,8 +5137,8 @@ impl App {
             .with_focused(true)
     }
 
-    fn open_split(&mut self, source_index: usize, url: String, allow_local: bool) {
-        self.open_split_mode(source_index, url, allow_local, false, None);
+    fn open_split(&mut self, source_index: usize, url: String, allow_local: bool) -> bool {
+        self.open_split_mode(source_index, url, allow_local, false, None)
     }
 
     fn open_split_mode(
@@ -5119,22 +5148,22 @@ impl App {
         allow_local: bool,
         private: bool,
         existing_context_id: Option<u64>,
-    ) {
+    ) -> bool {
         if self.surface != Surface::Comparator {
             self.web(url);
-            return;
+            return true;
         }
 
         let Ok(valid) = neural_core::validate_web_url(&url) else {
             self.show_splash("URL da fonte inválida.".to_string(), 3);
-            return;
+            return false;
         };
         if !allow_local && neural_core::is_local_network_target(&valid) {
             self.show_splash(
                 "A página não pode redirecionar a fonte para a rede local.".to_string(),
                 4,
             );
-            return;
+            return false;
         }
 
         let Some(source_name) = self
@@ -5143,42 +5172,11 @@ impl App {
             .and_then(|comp| comp.views.get(source_index))
             .map(|view| view.name)
         else {
-            return;
+            return false;
         };
 
-        if let Some((title, mut document)) = split_source_memory(&valid, source_name, private) {
-            let value = valid.to_string();
-            if let Some(session) = &mut self.current_research {
-                document = document.session(session.id.clone());
-                let memory_id = document.id.clone();
-                session.add_source(
-                    Some(source_name.to_string()),
-                    title,
-                    value.clone(),
-                    Some(memory_id),
-                    value,
-                );
-                self.memory.save_session(session.clone());
-            }
-            self.memory.capture(document);
-        }
-
-        self.leave_fullscreen();
-        if let Some(comp) = &mut self.comparator {
-            comp.expanded = None;
-            if let Some(previous) = comp.split.take() {
-                let _ = previous.webview.set_visible(false);
-                let _ = previous.webview.focus_parent();
-                drop(previous);
-            }
-        }
-        // O Split View substitui a topologia de colunas. Os divisores sao
-        // janelas Win32 independentes; esconda-os antes de criar a nova WebView
-        // para que nenhum divisor antigo fique por cima do painel lateral.
-        self.hide_comparator_splitters();
-
         let Some(window) = &self.window else {
-            return;
+            return false;
         };
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
@@ -5194,7 +5192,10 @@ impl App {
             .into(),
         };
 
-        let result = self
+        // Construir primeiro, com o estado antigo intacto. WebView2 pode falhar
+        // ou entrar num pump aninhado; uma tentativa falhada nao pode destruir
+        // o Split que o utilizador ainda esta a ver nem sair da expansao atual.
+        let built = self
             .split_webview_builder(
                 source_index,
                 source_name,
@@ -5205,8 +5206,48 @@ impl App {
             .with_url(valid.as_str())
             .build_as_child(window);
 
-        match result {
-            Ok(webview) => {
+        let committed = match &mut self.comparator {
+            Some(comp) => commit_split_build(built, &mut comp.split, &mut comp.expanded),
+            None => {
+                if let Ok(webview) = built {
+                    drop(webview);
+                }
+                return false;
+            }
+        };
+
+        match committed {
+            Ok((webview, previous)) => {
+                if let Some(previous) = previous {
+                    let _ = previous.webview.set_visible(false);
+                    let _ = previous.webview.focus_parent();
+                    drop(previous);
+                }
+
+                self.leave_fullscreen();
+                self.hide_comparator_splitters();
+
+                // So uma fonte que abriu de verdade entra na memoria/sessao.
+                // Antes, uma falha de build deixava uma fonte fantasma gravada.
+                if let Some((title, mut document)) =
+                    split_source_memory(&valid, source_name, private)
+                {
+                    let value = valid.to_string();
+                    if let Some(session) = &mut self.current_research {
+                        document = document.session(session.id.clone());
+                        let memory_id = document.id.clone();
+                        session.add_source(
+                            Some(source_name.to_string()),
+                            title,
+                            value.clone(),
+                            Some(memory_id),
+                            value,
+                        );
+                        self.memory.save_session(session.clone());
+                    }
+                    self.memory.capture(document);
+                }
+
                 let _ = webview.zoom(self.zoom);
                 if let Some(comp) = &mut self.comparator {
                     let context_id = if private {
@@ -5238,9 +5279,17 @@ impl App {
                 self.update_comparator_layout();
                 self.sync_comparator_splitters();
                 self.request_redraw();
+                true
             }
             Err(error) => {
-                self.show_splash(format!("Não consegui abrir a fonte ao lado: {error}"), 4)
+                // O estado anterior continua vivo. Reaplica a geometria para
+                // garantir que nem um resize ocorrido durante o pump do build
+                // deixe uma metade vazia.
+                self.update_comparator_layout();
+                self.sync_comparator_splitters();
+                self.request_redraw();
+                self.show_splash(format!("Não consegui abrir a fonte ao lado: {error}"), 4);
+                false
             }
         }
     }
@@ -5261,7 +5310,7 @@ impl App {
                 })
             })
             .unwrap_or(0);
-        self.open_split_mode(
+        let _ = self.open_split_mode(
             source_index,
             "https://www.google.com/".to_string(),
             false,
@@ -5347,13 +5396,15 @@ impl App {
             // abre privada: open_split_mode(private) nao grava memoria nem
             // abas.
             PaletteRoute::OpenSplit { url, private } => {
-                self.open_split_mode(source_index, url.to_string(), true, private, None);
+                let _ = self.open_split_mode(source_index, url.to_string(), true, private, None);
             }
             // Painel privado: a pergunta abre como fonte privada, nunca na
             // coluna normal (cookies normais) e nunca no historico.
             PaletteRoute::OpenPrivateProvider { query } => {
                 match self.provider_query_url(source_index, &query) {
-                    Ok(url) => self.open_split_mode(source_index, url.to_string(), false, true, None),
+                    Ok(url) => {
+                        let _ = self.open_split_mode(source_index, url.to_string(), false, true, None);
+                    }
                     Err(error) => self.show_splash(error.to_string(), 3),
                 }
             }
@@ -6653,18 +6704,10 @@ impl App {
     }
 
     fn comparator_bar_hit(&self) -> Option<BarHit> {
-        if let Some(private) = self.private_bar_rect()
-            && private.contains(self.cursor.0, self.cursor.1)
+        if let Some(controls) = self.right_controls()
+            && let Some(hit) = right_controls_hit(controls, self.cursor.0, self.cursor.1)
         {
-            return Some(BarHit::Private);
-        }
-        if let Some((_label, expand, close)) = self.split_bar_rects() {
-            if close.contains(self.cursor.0, self.cursor.1) {
-                return Some(BarHit::SplitClose);
-            }
-            if expand.contains(self.cursor.0, self.cursor.1) {
-                return Some(BarHit::SplitExpand);
-            }
+            return Some(hit);
         }
         self.bar_layout()
             .and_then(|layout| layout.hit(self.cursor.0, self.cursor.1))
@@ -6938,19 +6981,15 @@ impl App {
             .map(|tab| (tab.id, tab.url.clone()))
     }
 
-    fn open_context_tab(&mut self, source_index: usize, context_index: usize) {
-        if let Some((context_id, url)) = self.context_tab_identity(source_index, context_index) {
-            self.open_split_mode(source_index, url, false, false, Some(context_id));
-        }
+    fn open_context_tab(&mut self, source_index: usize, context_index: usize) -> bool {
+        self.context_tab_identity(source_index, context_index)
+            .is_some_and(|(context_id, url)| {
+                self.open_split_mode(source_index, url, false, false, Some(context_id))
+            })
     }
 
     fn open_context_tab_fullscreen(&mut self, source_index: usize, context_index: usize) {
-        self.open_context_tab(source_index, context_index);
-        if self
-            .comparator
-            .as_ref()
-            .is_some_and(|comp| comp.split.is_some())
-        {
+        if self.open_context_tab(source_index, context_index) {
             self.toggle_split_fullscreen();
         }
     }
@@ -8016,10 +8055,10 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::OpenInColumn(index, url) => self.open_in_column(index, url),
             UserEvent::OpenEverywhere(url) => self.open_everywhere(url),
             UserEvent::OpenSplit { source_index, url } => {
-                self.open_split(source_index, url, false);
+                let _ = self.open_split(source_index, url, false);
             }
             UserEvent::OpenPrivateSplit { source_index, url } => {
-                self.open_split_mode(source_index, url, false, true, None);
+                let _ = self.open_split_mode(source_index, url, false, true, None);
             }
             UserEvent::NewTab(index) => self.new_tab(index),
             UserEvent::CloseSplit => self.close_split(),
