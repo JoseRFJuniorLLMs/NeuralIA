@@ -1331,6 +1331,7 @@ fn lifecycle_probe_home_ready_message() -> u32 {
     })
 }
 const EXIT_BUTTON_SUBCLASS_ID: usize = 0x4E4B;
+const HOME_BUTTON_SUBCLASS_ID: usize = 0x4E4C;
 const WM_PAINT: u32 = 0x000F;
 const WM_LBUTTONUP: u32 = 0x0202;
 const WM_NCHITTEST: u32 = 0x0084;
@@ -1768,6 +1769,58 @@ unsafe extern "system" fn comparator_splitter_subclass(
         _ => {}
     }
     DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+unsafe extern "system" fn home_button_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    reference_data: usize,
+) -> LRESULT {
+    match message {
+        WM_NCHITTEST => HTCLIENT as LRESULT,
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut paint);
+            if !hdc.is_null() {
+                let mut client = RECT::default();
+                if GetClientRect(hwnd, &mut client) != 0 {
+                    let theme = Theme::system();
+                    let width = (client.right - client.left).max(1) as f64;
+                    let height = (client.bottom - client.top).max(1) as f64;
+                    let scale = (height / 30.0).max(1.0);
+                    let font = create_font((-13.0 * scale) as i32, FW_NORMAL as i32);
+                    let rect = UiRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width,
+                        height,
+                    };
+                    draw_pill(
+                        hdc,
+                        rect,
+                        "Home",
+                        PillStyle::new(theme.surface, theme.surface_line, theme.fg)
+                            .with_icon(ICON_SLOT_HOME, Some(theme.fg)),
+                        scale,
+                        font,
+                        theme.bar_bg,
+                    );
+                    DeleteObject(font as _);
+                }
+                EndPaint(hwnd, &paint);
+            }
+            0
+        }
+        WM_LBUTTONUP if reference_data != 0 => {
+            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+            let _ = proxy.send_event(UserEvent::HomeRequested);
+            0
+        }
+        _ => DefSubclassProc(hwnd, message, wparam, lparam),
+    }
 }
 
 unsafe extern "system" fn exit_button_subclass(
@@ -2734,6 +2787,7 @@ struct App {
     /// de vigia a sondar de 300 em 300 ms; agora e so um numero.
     chrome_deadline: u64,
     exit_button: Option<HWND>,
+    home_button: Option<HWND>,
     splitters: [Option<HWND>; COMPARATOR_COLUMNS - 1],
     auto_scroll: bool,
     auto_scroll_answered: bool,
@@ -2828,6 +2882,7 @@ impl App {
             chrome_token: 0,
             chrome_deadline: 0,
             exit_button: None,
+            home_button: None,
             splitters: [None; COMPARATOR_COLUMNS - 1],
             // Ligada por omissao: a aplicacao serve para ler.
             // Nada rola sem o utilizador dizer que sim.
@@ -3196,6 +3251,11 @@ impl App {
         }
 
         if let Some(button) = self.exit_button.take() {
+            unsafe {
+                DestroyWindow(button);
+            }
+        }
+        if let Some(button) = self.home_button.take() {
             unsafe {
                 DestroyWindow(button);
             }
@@ -4277,6 +4337,7 @@ impl App {
             self.sync_comparator_buttons();
         }
         self.sync_exit_button();
+        self.sync_home_button();
         self.show_omnibox_passive(true);
         self.position_omnibox();
 
@@ -4359,6 +4420,7 @@ impl App {
         self.sync_comparator_splitters();
         self.sync_comparator_buttons();
         self.sync_exit_button();
+        self.sync_home_button();
         self.request_redraw();
     }
 
@@ -4416,6 +4478,7 @@ impl App {
         self.sync_comparator_splitters();
         self.sync_comparator_buttons();
         self.sync_exit_button();
+        self.sync_home_button();
         self.request_redraw();
     }
 
@@ -4432,6 +4495,7 @@ impl App {
         self.sync_comparator_splitters();
         self.sync_comparator_buttons();
         self.sync_exit_button();
+        self.sync_home_button();
         self.request_redraw();
     }
 
@@ -5797,6 +5861,91 @@ impl App {
             bar_columns(comp),
             std::array::from_fn(|index| plan_tab_row(&comp.contexts[index], &comp.groups[index])),
         ))
+    }
+
+    /// Home nativo da barra. O desenho da barra continua existindo por baixo,
+    /// mas o clique pertence a uma janela Win32 real, acima de qualquer filho
+    /// WebView2. Assim o controlo nao depende do foco nem da entrega de eventos
+    /// do winit para voltar à Home.
+    fn sync_home_button(&mut self) {
+        let wanted = self.surface == Surface::Comparator && !self.is_fullscreen_column();
+        if !wanted {
+            if let Some(button) = self.home_button.take() {
+                unsafe {
+                    DestroyWindow(button);
+                }
+            }
+            return;
+        }
+
+        let (Some(window), Some(layout)) = (&self.window, self.bar_layout()) else {
+            return;
+        };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let rect = layout.home;
+        if rect.width <= 0.0 || rect.height <= 0.0 {
+            return;
+        }
+
+        if self.home_button.is_none() {
+            unsafe {
+                let created = CreateWindowExW(
+                    0,
+                    windows_sys::w!("STATIC"),
+                    windows_sys::w!(""),
+                    WS_CHILD | WS_VISIBLE,
+                    rect.x.round() as i32,
+                    rect.y.round() as i32,
+                    rect.width.round() as i32,
+                    rect.height.round() as i32,
+                    owner,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                );
+                if created.is_null() {
+                    return;
+                }
+                let proxy_ptr =
+                    (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
+                if SetWindowSubclass(
+                    created,
+                    Some(home_button_subclass),
+                    HOME_BUTTON_SUBCLASS_ID,
+                    proxy_ptr,
+                ) == 0
+                {
+                    DestroyWindow(created);
+                    return;
+                }
+                let width = rect.width.round() as i32;
+                let height = rect.height.round() as i32;
+                let region =
+                    CreateRoundRectRgn(0, 0, width + 1, height + 1, height, height);
+                if !region.is_null() {
+                    SetWindowRgn(created, region, 1);
+                }
+                self.home_button = Some(created);
+            }
+        }
+
+        if let Some(button) = self.home_button {
+            unsafe {
+                SetWindowPos(
+                    button,
+                    std::ptr::null_mut(),
+                    rect.x.round() as i32,
+                    rect.y.round() as i32,
+                    rect.width.round() as i32,
+                    rect.height.round() as i32,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                ShowWindow(button, SW_SHOW);
+                InvalidateRect(button, std::ptr::null(), 1);
+            }
+        }
     }
 
     /// Cria/mostra/esconde o botao flutuante de saida. Existe apenas enquanto
@@ -7628,6 +7777,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.update_comparator_layout();
                     self.sync_comparator_splitters();
                     self.sync_exit_button();
+                    self.sync_home_button();
                     self.position_omnibox();
                     self.position_palette();
                     self.request_redraw();
@@ -9503,6 +9653,37 @@ mod tests {
                     layout.add_tabs[index]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn native_home_button_accepts_the_mouse() {
+        unsafe {
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!(""),
+                WS_POPUP,
+                0,
+                0,
+                80,
+                30,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!hwnd.is_null(), "o Home nativo tem de nascer");
+            let subclassed = SetWindowSubclass(
+                hwnd,
+                Some(home_button_subclass),
+                HOME_BUTTON_SUBCLASS_ID,
+                0,
+            );
+            let hit = SendMessageW(hwnd, WM_NCHITTEST, 0, 0);
+            DestroyWindow(hwnd);
+            assert_ne!(subclassed, 0);
+            assert_eq!(hit, HTCLIENT as LRESULT);
         }
     }
 
