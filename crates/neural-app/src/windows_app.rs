@@ -13400,14 +13400,14 @@ mod tests {
 
     #[test]
     fn native_buttons_only_activate_when_press_and_release_match() {
-        assert_eq!(native_button_index( ninety_for_test(), 0), Some(0));
-        assert_eq!(native_button_index( ninety_for_test(), 29), Some(0));
-        assert_eq!(native_button_index( ninety_for_test(), 30), Some(1));
-        assert_eq!(native_button_index( ninety_for_test(), 59), Some(1));
-        assert_eq!(native_button_index( ninety_for_test(), 60), Some(2));
-        assert_eq!(native_button_index( ninety_for_test(), 89), Some(2));
-        assert_eq!(native_button_index( ninety_for_test(), -1), None);
-        assert_eq!(native_button_index( ninety_for_test(), 90), None);
+        assert_eq!(native_button_index(ninety_for_test(), 0), Some(0));
+        assert_eq!(native_button_index(ninety_for_test(), 29), Some(0));
+        assert_eq!(native_button_index(ninety_for_test(), 30), Some(1));
+        assert_eq!(native_button_index(ninety_for_test(), 59), Some(1));
+        assert_eq!(native_button_index(ninety_for_test(), 60), Some(2));
+        assert_eq!(native_button_index(ninety_for_test(), 89), Some(2));
+        assert_eq!(native_button_index(ninety_for_test(), -1), None);
+        assert_eq!(native_button_index(ninety_for_test(), 90), None);
 
         assert_eq!(native_release_matches(Some(0), Some(0)), Some(0));
         assert_eq!(native_release_matches(Some(0), Some(2)), None);
@@ -13425,10 +13425,7 @@ mod tests {
     fn current_group_is_not_offered_as_a_join_target() {
         let groups = vec![group(1, false), group(2, false), group(3, false)];
         let joinable = App::joinable_context_groups(&groups, Some(2));
-        assert_eq!(
-            joinable,
-            vec![(0, "G1".to_string()), (2, "G3".to_string())]
-        );
+        assert_eq!(joinable, vec![(0, "G1".to_string()), (2, "G3".to_string())]);
         assert_eq!(
             App::joinable_context_groups(&groups, None),
             vec![
