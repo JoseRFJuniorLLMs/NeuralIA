@@ -8453,10 +8453,12 @@ fn capability_from_sources<F>(
 where
     F: FnMut(&mut [u8; 16]) -> bool,
 {
+    if primary_status != 0 {
+        return None;
+    }
     if let Some(token) = capability_from_rng(primary_status, primary_bytes) {
         return Some(token);
     }
-    return None;
 
     let mut secondary = [0u8; 16];
     if !fallback(&mut secondary) {
