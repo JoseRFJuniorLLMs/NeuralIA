@@ -1124,7 +1124,9 @@ fn close_context_tab_scope(
         return false;
     };
     let before = tabs.len();
-    tabs.clear();
+    if tabs.iter().any(|tab| tab.group == scope) {
+        tabs.clear();
+    }
     prune_empty_groups(tabs, groups);
     tabs.len() != before
 }
