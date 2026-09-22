@@ -29,7 +29,7 @@ param(
     [int]$OpenTimeoutSec = 25,
     [int]$CloseTimeoutSec = 20,
     [double]$MaxWorkingSetGrowthMiB = 24,
-    [int]$MaxHandleGrowth = 128,
+    [int]$MaxHandleGrowth = -1,
     [int]$MaxThreadGrowth = 8,
     [int]$MaxGdiGrowth = 64,
     [string]$StartupInput = "jose r f junior",
