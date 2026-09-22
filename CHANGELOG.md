@@ -4,6 +4,12 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+## [2.1.3] - 2026-09-22
+
+### Fixed
+- **PR #113 — remove regressões visuais e de foco da v2.1.2.** O botão Home volta a ser somente texto, sem ícone inventado; a omnibox deixa de ocupar a titlebar do comparador; os controles nativos de minimizar, maximizar/restaurar e fechar permanecem acessíveis acima das WebViews; e o foco/teclado deixa de depender de reparenting instável do EDIT da Home.
+- **PR #113 — Ctrl+L no comparador volta ao fluxo correto.** Em vez de reutilizar a caixa da Home na barra de título, a ação abre a palette da coluna ativa, mantendo a busca fora do chrome da janela.
+
 ## [2.1.2] - 2026-09-21
 
 ### Fixed
