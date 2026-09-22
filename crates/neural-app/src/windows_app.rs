@@ -11259,32 +11259,38 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_ready_is_published_at_the_real_end_of_comparator_activation() {
+    fn lifecycle_ready_is_published_only_after_returning_to_the_event_loop() {
         let source = include_str!("windows_app.rs");
-        let body = source
+        let activate = source
             .split("fn activate_comparator")
             .nth(1)
             .and_then(|part| part.split("fn expand_comparator").next())
             .expect("activate_comparator body");
+        assert!(
+            !activate.contains("LIFECYCLE_COMPARATOR_READY.store(true"),
+            "activate_comparator ainda pode estar dentro do pump aninhado do WebView2"
+        );
 
-        assert!(body.contains("LIFECYCLE_COMPARATOR_READY.store(true"));
-        let ready = body
+        let relayout = source
+            .split("UserEvent::RelayoutComparator =>")
+            .nth(1)
+            .and_then(|part| part.split("UserEvent::RestoreHomeDecorations =>").next())
+            .expect("RelayoutComparator handler");
+        assert!(
+            !relayout.contains("LIFECYCLE_COMPARATOR_READY.store(true"),
+            "timer de relayout nao prova que o pump do WebView2 devolveu o controlo"
+        );
+
+        let idle = source
+            .split("fn about_to_wait")
+            .nth(1)
+            .and_then(|part| part.split("fn user_event").next())
+            .expect("about_to_wait body");
+        let rebind = idle.find("self.ensure_window_subclass()").expect("rebind");
+        let ready = idle
             .find("LIFECYCLE_COMPARATOR_READY.store(true")
             .expect("Ready publish");
-        let layout = body
-            .find("self.update_comparator_layout()")
-            .expect("initial layout");
-        let rebind = body
-            .find("self.ensure_window_subclass()")
-            .expect("subclass rebind");
-        assert!(
-            ready > layout,
-            "Ready so pode ser publicado depois de o comparador existir e ter layout"
-        );
-        assert!(
-            ready > rebind,
-            "Ready so pode ser publicado depois de rebindar a subclass no HWND efetivo"
-        );
+        assert!(ready > rebind);
     }
 
     #[test]
@@ -12213,23 +12219,30 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_column_has_stable_chrome_policy() {
+    fn expanded_column_keeps_window_chrome_and_content_offset() {
         let source = include_str!("windows_app.rs");
+        let expand = source
+            .split("fn expand_comparator")
+            .nth(1)
+            .and_then(|part| part.split("fn minimize_comparator").next())
+            .expect("expand_comparator body");
+        assert!(
+            !expand.contains("set_fullscreen(Some"),
+            "expandir uma IA nao pode esconder os controles da janela"
+        );
+
         let layout = source
             .split("fn update_comparator_layout")
             .nth(1)
             .and_then(|part| part.split("fn column_ipc_event_impl").next())
             .expect("layout body");
-        assert!(!layout.contains("chrome_revealed"));
-        assert!(layout.contains("LogicalPosition::new(0.0, 0.0)"));
+        assert!(layout.contains("LogicalPosition::new(0.0, content_y)"));
+        assert!(layout.contains("LogicalSize::new(logical_w, content_h)"));
 
-        let exit = source
-            .split("fn sync_exit_button")
-            .nth(1)
-            .and_then(|part| part.split("fn position_exit_button").next())
-            .expect("exit button body");
-        assert!(exit.contains("self.is_fullscreen_column()"));
-        assert!(!exit.contains("chrome_revealed"));
+        let bar = BarLayout::new(1600.0, 1.0, true, 3);
+        assert!(bar.window_minimize.width > 0.0);
+        assert!(bar.window_maximize.width > 0.0);
+        assert!(bar.window_close.width > 0.0);
     }
 
     #[test]
@@ -12244,6 +12257,15 @@ mod tests {
             App::column_ipc_event_impl(2, IpcAction::Omnibox),
             Some(UserEvent::OpenPalette(2))
         ));
+
+        assert!(matches!(
+            App::column_ipc_event_impl(1, IpcAction::Expand { col: 1 }),
+            Some(UserEvent::ExpandComparator(1))
+        ));
+        assert!(
+            App::column_ipc_event_impl(0, IpcAction::Expand { col: 1 }).is_none(),
+            "uma coluna nao pode comandar a expansao de outra"
+        );
     }
 
     #[test]
