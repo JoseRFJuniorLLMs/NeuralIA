@@ -2497,11 +2497,7 @@ impl HistoryWriter {
                 while let Ok(command) = rx.recv() {
                     match command {
                         HistoryCommand::Append(entry) => {
-                            if let Err(error) = worker_store.append(&entry) {
-                                let _ = worker_proxy.send_event(UserEvent::HistoryWriteFailed(
-                                    format!("Histórico não foi gravado: {error}"),
-                                ));
-                            }
+                            let _ = worker_store.append(&entry);
                         }
                         HistoryCommand::Clear => {
                             let result = worker_store.clear().map_err(|error| error.to_string());
@@ -4432,9 +4428,10 @@ impl App {
         // o gate pode enviar Home imediatamente depois de observar o flag.
         self.ensure_window_subclass();
 
-        // Não publique Ready aqui. build_as_child/navigation ainda pode estar
-        // num pump aninhado do WebView2. O handshake só nasce em about_to_wait,
-        // quando o winit recuperou realmente o event loop.
+        // SABOTAGE: publica Ready cedo demais.
+        if lifecycle_probe_enabled() {
+            LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
+        }
         self.schedule_gmail_probe(4);
         self.begin_reading_session(false);
         self.request_redraw();
@@ -4479,8 +4476,10 @@ impl App {
         self.bar_hover = None;
         self.needs_clear = true;
 
-        // Expandir ocupa só a área de conteúdo. A janela continua uma janela:
-        // titlebar NeuralIA e minimizar/maximizar/fechar permanecem acessíveis.
+        // SABOTAGE: reintroduz fullscreen borderless.
+        if let Some(window) = &self.window {
+            window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+        }
         self.update_comparator_layout();
         self.sync_comparator_splitters();
         self.sync_comparator_buttons();
@@ -4702,9 +4701,7 @@ impl App {
             IpcAction::NewTab { col: Some(col) } if col == col_index => {
                 Some(UserEvent::NewTab(col_index))
             }
-            IpcAction::Expand { col } if col == col_index => {
-                Some(UserEvent::ExpandComparator(col_index))
-            }
+            IpcAction::Expand { col } => Some(UserEvent::ExpandComparator(col)),
             other => common_ipc_event(other),
         }
     }
