@@ -74,6 +74,12 @@ use wry::{
     http::{Request, Response as HttpResponse},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageTarget {
+    Column(usize),
+    Split,
+}
+
 #[derive(Debug)]
 enum UserEvent {
     HomeRequested,
@@ -85,11 +91,15 @@ enum UserEvent {
     ZoomOut,
     ZoomReset,
     ReloadPage,
+    ReloadTarget(PageTarget),
     PrintPage,
+    PrintTarget(PageTarget),
     FocusOmnibox,
     ToggleColumnFullscreen,
     OpenDevTools,
+    OpenDevToolsTarget(PageTarget),
     ViewSource,
+    ViewSourceTarget(PageTarget),
     AutoScrollTick(u64),
     HideSplash(u64),
     GmailProbe(u64),
@@ -2876,9 +2886,9 @@ impl UiRect {
         self.width > 0.0
             && self.height > 0.0
             && x >= self.x
-            && x <= self.x + self.width
+            && x < self.x + self.width
             && y >= self.y
-            && y <= self.y + self.height
+            && y < self.y + self.height
     }
 }
 
@@ -4857,6 +4867,16 @@ impl App {
                 Some(UserEvent::OpenPalette(col_index))
             }
             IpcAction::Omnibox => Some(UserEvent::OpenPalette(col_index)),
+            IpcAction::Reload => Some(UserEvent::ReloadTarget(PageTarget::Column(col_index))),
+            IpcAction::Print => Some(UserEvent::PrintTarget(PageTarget::Column(col_index))),
+            IpcAction::DevTools => {
+                Some(UserEvent::OpenDevToolsTarget(PageTarget::Column(col_index)))
+            }
+            IpcAction::ViewSource => {
+                Some(UserEvent::ViewSourceTarget(PageTarget::Column(col_index)))
+            }
+            IpcAction::Fullscreen => Some(UserEvent::ExpandComparator(col_index)),
+            IpcAction::ShortcutExpand { col } => Some(UserEvent::ExpandComparator(col)),
             IpcAction::Minimize { col } if col == col_index => {
                 Some(UserEvent::MinimizeComparator(col_index))
             }
@@ -5005,6 +5025,28 @@ impl App {
         self.request_redraw();
     }
 
+    fn split_ipc_event_impl(source_index: usize, action: IpcAction) -> Option<UserEvent> {
+        match action {
+            IpcAction::SplitClose => Some(UserEvent::CloseSplit),
+            IpcAction::SplitExpand | IpcAction::Fullscreen => {
+                Some(UserEvent::ToggleSplitFullscreen)
+            }
+            IpcAction::Palette { col } if col == source_index => {
+                Some(UserEvent::OpenPalette(source_index))
+            }
+            IpcAction::Omnibox => Some(UserEvent::OpenPalette(source_index)),
+            IpcAction::NewTab { col: Some(col) } if col == source_index => {
+                Some(UserEvent::NewTab(source_index))
+            }
+            IpcAction::ShortcutExpand { col } => Some(UserEvent::ExpandComparator(col)),
+            IpcAction::Reload => Some(UserEvent::ReloadTarget(PageTarget::Split)),
+            IpcAction::Print => Some(UserEvent::PrintTarget(PageTarget::Split)),
+            IpcAction::DevTools => Some(UserEvent::OpenDevToolsTarget(PageTarget::Split)),
+            IpcAction::ViewSource => Some(UserEvent::ViewSourceTarget(PageTarget::Split)),
+            other => common_ipc_event(other),
+        }
+    }
+
     fn split_webview_builder(
         &self,
         source_index: usize,
@@ -5030,17 +5072,7 @@ impl App {
                 else {
                     return;
                 };
-                let event = match action {
-                    IpcAction::SplitClose => Some(UserEvent::CloseSplit),
-                    IpcAction::SplitExpand => Some(UserEvent::ToggleSplitFullscreen),
-                    IpcAction::Palette { col } if col == source_index => {
-                        Some(UserEvent::OpenPalette(source_index))
-                    }
-                    IpcAction::NewTab { col: Some(col) } if col == source_index => {
-                        Some(UserEvent::NewTab(source_index))
-                    }
-                    other => common_ipc_event(other),
-                };
+                let event = Self::split_ipc_event_impl(source_index, action);
                 if let Some(event) = event {
                     let _ = ipc_proxy.send_event(event);
                 }
@@ -5846,6 +5878,63 @@ impl App {
             let _ = webview.zoom(zoom);
         });
         self.show_splash(format!("Zoom {}%", (zoom * 100.0).round() as i32), 2);
+    }
+
+    fn page_target_webview(&self, target: PageTarget) -> Option<&WebView> {
+        let comp = self.comparator.as_ref()?;
+        match target {
+            PageTarget::Column(index) => comp.views.get(index).map(|view| &view.webview),
+            PageTarget::Split => comp.split.as_ref().map(|split| &split.webview),
+        }
+    }
+
+    fn reload_target(&mut self, target: PageTarget) {
+        let reloaded = self
+            .page_target_webview(target)
+            .is_some_and(|webview| webview.reload().is_ok());
+        if !reloaded {
+            self.show_splash("Não há página ativa para recarregar.".to_string(), 3);
+        }
+    }
+
+    fn print_target(&mut self, target: PageTarget) {
+        let printed = self
+            .page_target_webview(target)
+            .is_some_and(|webview| webview.print().is_ok());
+        if !printed {
+            self.show_splash("Não há página ativa para imprimir.".to_string(), 3);
+        }
+    }
+
+    fn open_devtools_target(&mut self, target: PageTarget) {
+        let opened = if let Some(webview) = self.page_target_webview(target) {
+            webview.open_devtools();
+            true
+        } else {
+            false
+        };
+        if !opened {
+            self.show_splash("Não há página ativa para inspecionar.".to_string(), 3);
+        }
+    }
+
+    fn view_source_target(&mut self, target: PageTarget) {
+        let current = self
+            .page_target_webview(target)
+            .and_then(|webview| webview.url().ok());
+        let Some(current) = current else {
+            self.show_splash("Não há página ativa para ver o código-fonte.".to_string(), 3);
+            return;
+        };
+        let current_origin = Url::parse(&current).ok().as_ref().and_then(local_origin_of);
+        let source = format!("view-source:{current}");
+        let loaded = is_view_source_target(&source, current_origin.as_deref())
+            && self
+                .page_target_webview(target)
+                .is_some_and(|webview| webview.load_url(&source).is_ok());
+        if !loaded {
+            self.show_splash("Não foi possível abrir o código-fonte desta página.".to_string(), 3);
+        }
     }
 
     fn reload_page(&mut self) {
@@ -7060,8 +7149,16 @@ impl App {
             let open = wide_null("Abrir");
             let fullscreen = wide_null("Abrir em tela cheia");
             let close = wide_null("Fechar aba");
-            let close_others = wide_null("Fechar outras abas deste grupo");
-            let close_all = wide_null("Fechar todas deste grupo");
+            let close_others = wide_null(if in_group {
+                "Fechar outras abas deste grupo"
+            } else {
+                "Fechar outras abas sem grupo"
+            });
+            let close_all = wide_null(if in_group {
+                "Fechar todas deste grupo"
+            } else {
+                "Fechar todas as abas sem grupo"
+            });
             AppendMenuW(menu, MF_STRING, TAB_MENU_OPEN, open.as_ptr());
             AppendMenuW(menu, MF_STRING, TAB_MENU_FULLSCREEN, fullscreen.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
@@ -7837,11 +7934,15 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ZoomOut => self.step_zoom(-1),
             UserEvent::ZoomReset => self.set_zoom(1.0),
             UserEvent::ReloadPage => self.reload_page(),
+            UserEvent::ReloadTarget(target) => self.reload_target(target),
             UserEvent::PrintPage => self.print_page(),
+            UserEvent::PrintTarget(target) => self.print_target(target),
             UserEvent::FocusOmnibox => self.focus_omnibox(),
             UserEvent::ToggleColumnFullscreen => self.toggle_column_fullscreen(),
             UserEvent::OpenDevTools => self.open_devtools(),
+            UserEvent::OpenDevToolsTarget(target) => self.open_devtools_target(target),
             UserEvent::ViewSource => self.view_source(),
+            UserEvent::ViewSourceTarget(target) => self.view_source_target(target),
             UserEvent::AutoScrollTick(token) => self.auto_scroll_tick(token),
             UserEvent::HideSplash(token) => self.hide_splash(token),
             UserEvent::GmailProbe(token) => {
@@ -13816,7 +13917,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     if (key === '1' || key === '2' || key === '3') {
       if (typeof colIndex === 'number') {
         e.preventDefault();
-        act('expand', { col:(parseInt(key, 10) - 1) });
+        act('shortcut-expand', { col:(parseInt(key, 10) - 1) });
       }
       return;
     }
@@ -14724,7 +14825,9 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
   listen(document, 'dblclick', (event) => {
     if (!event.isTrusted || event.defaultPrevented) return;
     if (event.target && event.target.closest
-        && event.target.closest('#neuralia-comp-controls,#neuralia-palette')) return;
+        && event.target.closest(
+          '#neuralia-comp-controls,#neuralia-palette,a[href],button,input,textarea,select,option,label,summary,[role="button"],[role="link"],[contenteditable="true"]'
+        )) return;
     const tag = event.target && event.target.tagName
       ? event.target.tagName.toUpperCase() : '';
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
