@@ -11269,31 +11269,29 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_ready_is_published_at_the_real_end_of_comparator_activation() {
+    fn lifecycle_ready_is_published_after_the_event_loop_boundary() {
         let source = include_str!("windows_app.rs");
-        let body = source
+        let activate = source
             .split("fn activate_comparator")
             .nth(1)
             .and_then(|part| part.split("fn expand_comparator").next())
             .expect("activate_comparator body");
+        assert!(!activate.contains("LIFECYCLE_COMPARATOR_READY.store(true"));
 
-        assert!(body.contains("LIFECYCLE_COMPARATOR_READY.store(true"));
-        let ready = body
-            .find("LIFECYCLE_COMPARATOR_READY.store(true")
-            .expect("Ready publish");
-        let layout = body
-            .find("self.update_comparator_layout()")
-            .expect("initial layout");
-        let rebind = body
+        let idle = source
+            .split("fn about_to_wait")
+            .nth(1)
+            .and_then(|part| part.split("fn user_event").next())
+            .expect("about_to_wait body");
+        let rebind = idle
             .find("self.ensure_window_subclass()")
             .expect("subclass rebind");
-        assert!(
-            ready > layout,
-            "Ready so pode ser publicado depois de o comparador existir e ter layout"
-        );
+        let ready = idle
+            .find("LIFECYCLE_COMPARATOR_READY.store(true")
+            .expect("Ready publish");
         assert!(
             ready > rebind,
-            "Ready so pode ser publicado depois de rebindar a subclass no HWND efetivo"
+            "Ready só pode ser publicado depois de voltar ao event loop e rebindar o HWND"
         );
     }
 
@@ -12289,23 +12287,23 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_column_has_stable_chrome_policy() {
+    fn expanded_column_keeps_the_neuralia_chrome_visible() {
         let source = include_str!("windows_app.rs");
         let layout = source
             .split("fn update_comparator_layout")
             .nth(1)
             .and_then(|part| part.split("fn column_ipc_event_impl").next())
             .expect("layout body");
-        assert!(!layout.contains("chrome_revealed"));
-        assert!(layout.contains("LogicalPosition::new(0.0, 0.0)"));
+        assert!(layout.contains("LogicalPosition::new(0.0, content_y)"));
+        assert!(layout.contains("LogicalSize::new(logical_w, content_h)"));
+        assert!(!layout.contains("LogicalPosition::new(0.0, 0.0)"));
 
-        let exit = source
-            .split("fn sync_exit_button")
+        let policy = source
+            .split("fn is_fullscreen_column")
             .nth(1)
-            .and_then(|part| part.split("fn position_exit_button").next())
-            .expect("exit button body");
-        assert!(exit.contains("self.is_fullscreen_column()"));
-        assert!(!exit.contains("chrome_revealed"));
+            .and_then(|part| part.split("fn bar_visible").next())
+            .expect("fullscreen policy");
+        assert!(policy.contains("false"));
     }
 
     #[test]
