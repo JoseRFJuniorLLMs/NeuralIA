@@ -50,8 +50,9 @@ use windows_sys::Win32::{
         },
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
-            ES_AUTOHSCROLL, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
-            GetForegroundWindow, GetParent, GetWindowTextLengthW, GetWindowTextW,
+            ES_AUTOHSCROLL, EnableWindow, EnumChildWindows, GetClassNameW, GetClientRect,
+            GetCursorPos, GetForegroundWindow, GetParent, GetWindowTextLengthW, GetWindowTextW,
+            IsWindowEnabled,
             GetWindowThreadProcessId, IDYES, IsZoomed, MB_ICONINFORMATION, MB_OK, MB_YESNO,
             MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
             SendMessageW, SetParent, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD,
@@ -70,7 +71,7 @@ use winit::{
     window::{Fullscreen, Icon, Window, WindowId},
 };
 use wry::{
-    NewWindowResponse, PermissionResponse, WebView, WebViewBuilder,
+    NewWindowResponse, PermissionKind, PermissionResponse, WebView, WebViewBuilder,
     http::{Request, Response as HttpResponse},
 };
 
@@ -1075,6 +1076,56 @@ fn leave_context_group(tabs: &mut [ContextTab], groups: &mut Vec<ContextGroup>, 
 
 fn prune_empty_groups(tabs: &[ContextTab], groups: &mut Vec<ContextGroup>) {
     groups.retain(|group| tabs.iter().any(|tab| tab.group == Some(group.id)));
+}
+
+/// Fecha as outras abas do MESMO escopo da aba selecionada. Um grupo real
+/// usa o seu id; abas soltas partilham o escopo `None`. Abas de outros grupos
+/// nunca sao tocadas.
+fn close_other_context_tabs_in_scope(
+    tabs: &mut Vec<ContextTab>,
+    groups: &mut Vec<ContextGroup>,
+    context_index: usize,
+) -> bool {
+    let Some(scope) = tabs.get(context_index).map(|tab| tab.group) else {
+        return false;
+    };
+    let mut index = 0usize;
+    tabs.retain(|tab| {
+        let keep = index == context_index || tab.group != scope;
+        index += 1;
+        keep
+    });
+    prune_empty_groups(tabs, groups);
+    true
+}
+
+/// Fecha todas as abas do escopo selecionado e preserva integralmente os
+/// demais grupos da coluna.
+fn close_context_tab_scope(
+    tabs: &mut Vec<ContextTab>,
+    groups: &mut Vec<ContextGroup>,
+    context_index: usize,
+) -> bool {
+    let Some(scope) = tabs.get(context_index).map(|tab| tab.group) else {
+        return false;
+    };
+    let before = tabs.len();
+    tabs.retain(|tab| tab.group != scope);
+    prune_empty_groups(tabs, groups);
+    tabs.len() != before
+}
+
+/// Reagrupar uma aba pode esvaziar o grupo anterior. A criacao e a poda
+/// pertencem a uma unica operacao para nunca deixar pilulas fantasmas.
+fn regroup_context_tab(
+    tabs: &mut Vec<ContextTab>,
+    groups: &mut Vec<ContextGroup>,
+    next_id: &mut u64,
+    context_index: usize,
+) -> Option<usize> {
+    let created = create_context_group(tabs, groups, next_id, context_index)?;
+    prune_empty_groups(tabs, groups);
+    Some(created)
 }
 
 struct ComparatorState {
@@ -3148,6 +3199,7 @@ impl App {
             let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
             if SetWindowSubclass(edit, Some(omnibox_subclass), OMNIBOX_SUBCLASS_ID, proxy_ptr) == 0
             {
+                DestroyWindow(edit);
                 return;
             }
 
@@ -3200,6 +3252,14 @@ impl App {
                 inner.height.round() as i32,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
+            let interactive = surface_accepts_omnibox_submit(self.surface);
+            EnableWindow(edit, i32::from(interactive));
+            if !interactive && GetFocus() == edit {
+                let parent = GetParent(edit);
+                if !parent.is_null() {
+                    SetFocus(parent);
+                }
+            }
             ShowWindow(edit, SW_SHOW);
         }
         if self.surface == Surface::Home {
@@ -3955,7 +4015,7 @@ impl App {
                 }
                 NewWindowResponse::Deny
             })
-            .with_permission_handler(|_| PermissionResponse::Deny)
+            .with_permission_handler(move |kind| web_media_permission(kind, !agent_enabled))
             .with_focused(true)
     }
 
@@ -4777,7 +4837,7 @@ impl App {
                 }
                 NewWindowResponse::Deny
             })
-            .with_permission_handler(|_| PermissionResponse::Deny)
+            .with_permission_handler(|kind| web_media_permission(kind, true))
             .with_focused(true)
     }
 
@@ -4920,7 +4980,7 @@ impl App {
                 }
                 NewWindowResponse::Deny
             })
-            .with_permission_handler(|_| PermissionResponse::Deny)
+            .with_permission_handler(|kind| web_media_permission(kind, true))
             .with_focused(true)
     }
 
@@ -6740,11 +6800,16 @@ impl App {
 
     fn group_context_tab(&mut self, source_index: usize, context_index: usize) {
         if let Some(comp) = &mut self.comparator {
-            let next_id = &mut comp.next_group_id;
-            create_context_group(
-                &mut comp.contexts[source_index],
-                &mut comp.groups[source_index],
-                next_id,
+            let ComparatorState {
+                contexts,
+                groups,
+                next_group_id,
+                ..
+            } = comp;
+            let _ = regroup_context_tab(
+                &mut contexts[source_index],
+                &mut groups[source_index],
+                next_group_id,
                 context_index,
             );
         }
@@ -6780,44 +6845,67 @@ impl App {
     }
 
     fn close_other_context_tabs(&mut self, source_index: usize, context_index: usize) {
-        let Some(keep) = self.context_tab_url(source_index, context_index) else {
+        let Some((scope, keep)) = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.contexts.get(source_index))
+            .and_then(|tabs| tabs.get(context_index).map(|tab| (tab.group, tab.url.clone())))
+        else {
             return;
         };
         let closes_active = self
             .comparator
             .as_ref()
-            .and_then(|comp| comp.split.as_ref())
-            .is_some_and(|split| split.source_index == source_index && split.url != keep);
+            .and_then(|comp| comp.split.as_ref().map(|split| (comp, split)))
+            .is_some_and(|(comp, split)| {
+                split.source_index == source_index
+                    && split.url != keep
+                    && comp.contexts[source_index]
+                        .iter()
+                        .any(|tab| tab.group == scope && tab.url == split.url)
+            });
         if closes_active {
             self.close_split();
         }
-        if let Some(comp) = &mut self.comparator
-            && let Some(tabs) = comp.contexts.get_mut(source_index)
-        {
-            // A aba que fica mantem o grupo a que pertencia.
-            let group = tabs
-                .iter()
-                .find(|tab| tab.url == keep)
-                .and_then(|tab| tab.group);
-            tabs.clear();
-            tabs.push(ContextTab { url: keep, group });
+        if let Some(comp) = &mut self.comparator {
+            let _ = close_other_context_tabs_in_scope(
+                &mut comp.contexts[source_index],
+                &mut comp.groups[source_index],
+                context_index,
+            );
         }
         self.request_redraw();
     }
 
-    fn close_all_context_tabs(&mut self, source_index: usize) {
+    fn close_all_context_tabs(&mut self, source_index: usize, context_index: usize) {
+        let Some(scope) = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.contexts.get(source_index))
+            .and_then(|tabs| tabs.get(context_index))
+            .map(|tab| tab.group)
+        else {
+            return;
+        };
         let closes_active = self
             .comparator
             .as_ref()
-            .and_then(|comp| comp.split.as_ref())
-            .is_some_and(|split| split.source_index == source_index);
+            .and_then(|comp| comp.split.as_ref().map(|split| (comp, split)))
+            .is_some_and(|(comp, split)| {
+                split.source_index == source_index
+                    && comp.contexts[source_index]
+                        .iter()
+                        .any(|tab| tab.group == scope && tab.url == split.url)
+            });
         if closes_active {
             self.close_split();
         }
-        if let Some(comp) = &mut self.comparator
-            && let Some(tabs) = comp.contexts.get_mut(source_index)
-        {
-            tabs.clear();
+        if let Some(comp) = &mut self.comparator {
+            let _ = close_context_tab_scope(
+                &mut comp.contexts[source_index],
+                &mut comp.groups[source_index],
+                context_index,
+            );
         }
         self.request_redraw();
     }
@@ -6921,7 +7009,7 @@ impl App {
             TAB_MENU_FULLSCREEN => self.open_context_tab_fullscreen(source_index, context_index),
             TAB_MENU_CLOSE => self.close_context_tab(source_index, context_index),
             TAB_MENU_CLOSE_OTHERS => self.close_other_context_tabs(source_index, context_index),
-            TAB_MENU_CLOSE_ALL => self.close_all_context_tabs(source_index),
+            TAB_MENU_CLOSE_ALL => self.close_all_context_tabs(source_index, context_index),
             TAB_MENU_NEW_GROUP => self.group_context_tab(source_index, context_index),
             TAB_MENU_UNGROUP => self.ungroup_context_tab(source_index, context_index),
             other if other >= TAB_MENU_GROUP_BASE => {
@@ -8365,6 +8453,20 @@ fn local_origin_of(url: &Url) -> Option<String> {
     is_local_network_target(url).then(|| url.origin().ascii_serialization())
 }
 
+fn web_media_permission(kind: PermissionKind, user_visible: bool) -> PermissionResponse {
+    if !user_visible {
+        return PermissionResponse::Deny;
+    }
+    match kind {
+        PermissionKind::Microphone | PermissionKind::Camera | PermissionKind::DisplayCapture => {
+            // Default continua o fluxo nativo do WebView2: o utilizador decide
+            // no prompt do runtime. NeuralIA nunca concede Allow silenciosamente.
+            PermissionResponse::Default
+        }
+        _ => PermissionResponse::Deny,
+    }
+}
+
 fn remote_web_target(target: &str, local_origin: Option<&str>) -> bool {
     if target.eq_ignore_ascii_case("about:blank") {
         return true;
@@ -9565,6 +9667,51 @@ mod tests {
             frame.branches.len(),
             frame.nodes.len()
         );
+    }
+
+    #[test]
+    fn spec_0109_webrtc_media_requires_native_user_consent() {
+        for kind in [
+            PermissionKind::Microphone,
+            PermissionKind::Camera,
+            PermissionKind::DisplayCapture,
+        ] {
+            assert_eq!(
+                web_media_permission(kind, true),
+                PermissionResponse::Default,
+                "{kind:?} deve continuar pelo prompt nativo do WebView2"
+            );
+            assert_ne!(
+                web_media_permission(kind, true),
+                PermissionResponse::Allow,
+                "NeuralIA nunca deve conceder captura silenciosamente"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_0109_webrtc_media_stays_fail_closed_outside_visible_capture() {
+        for kind in [
+            PermissionKind::Geolocation,
+            PermissionKind::Notifications,
+            PermissionKind::ClipboardRead,
+            PermissionKind::Sensors,
+            PermissionKind::LocalFonts,
+            PermissionKind::FileSystemAccess,
+        ] {
+            assert_eq!(web_media_permission(kind, true), PermissionResponse::Deny);
+        }
+        for kind in [
+            PermissionKind::Microphone,
+            PermissionKind::Camera,
+            PermissionKind::DisplayCapture,
+        ] {
+            assert_eq!(
+                web_media_permission(kind, false),
+                PermissionResponse::Deny,
+                "agente/superficie nao visivel nao pode pedir captura"
+            );
+        }
     }
 
     /// A autorizacao de rede local vale para a ORIGEM que o utilizador
@@ -12288,6 +12435,51 @@ mod tests {
     }
 
     #[test]
+    fn comparator_disables_the_offscreen_home_omnibox() {
+        unsafe {
+            let parent = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!(""),
+                WS_POPUP,
+                0,
+                0,
+                200,
+                80,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!parent.is_null());
+
+            let edit = CreateWindowExW(
+                0,
+                windows_sys::w!("EDIT"),
+                windows_sys::w!(""),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
+                0,
+                0,
+                100,
+                30,
+                parent,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!edit.is_null());
+
+            EnableWindow(edit, i32::from(surface_accepts_omnibox_submit(Surface::Comparator)));
+            assert_eq!(IsWindowEnabled(edit), 0, "omnibox invisivel nao pode receber foco");
+
+            EnableWindow(edit, i32::from(surface_accepts_omnibox_submit(Surface::Home)));
+            assert_ne!(IsWindowEnabled(edit), 0, "Home precisa reativar a omnibox");
+
+            DestroyWindow(parent);
+        }
+    }
+
+    #[test]
     fn comparator_titlebar_does_not_reserve_an_omnibox_slot() {
         let layout = BarLayout::with_contexts(
             1600.0,
@@ -12500,6 +12692,63 @@ mod tests {
         leave_context_group(&mut tabs, &mut groups, 0);
         assert_eq!(tabs[0].group, None);
         assert!(groups.is_empty(), "pilula vazia nao pode ficar na barra");
+    }
+
+    #[test]
+    fn closing_other_tabs_only_touches_the_selected_group() {
+        let mut tabs = vec![
+            tab("https://g1.example/keep", Some(1)),
+            tab("https://g1.example/drop", Some(1)),
+            tab("https://g2.example/a", Some(2)),
+            tab("https://loose.example/a", None),
+        ];
+        let mut groups = vec![group(1, false), group(2, false)];
+        assert!(close_other_context_tabs_in_scope(&mut tabs, &mut groups, 0));
+        assert_eq!(
+            tabs.iter().map(|tab| tab.url.as_str()).collect::<Vec<_>>(),
+            vec![
+                "https://g1.example/keep",
+                "https://g2.example/a",
+                "https://loose.example/a"
+            ]
+        );
+        assert_eq!(groups.len(), 2, "outro grupo deve permanecer intacto");
+    }
+
+    #[test]
+    fn closing_all_tabs_only_removes_the_selected_group_and_prunes_its_pill() {
+        let mut tabs = vec![
+            tab("https://g1.example/a", Some(1)),
+            tab("https://g1.example/b", Some(1)),
+            tab("https://g2.example/a", Some(2)),
+            tab("https://loose.example/a", None),
+        ];
+        let mut groups = vec![group(1, false), group(2, false)];
+        assert!(close_context_tab_scope(&mut tabs, &mut groups, 1));
+        assert_eq!(
+            tabs.iter().map(|tab| tab.url.as_str()).collect::<Vec<_>>(),
+            vec!["https://g2.example/a", "https://loose.example/a"]
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, 2);
+    }
+
+    #[test]
+    fn regrouping_the_last_tab_prunes_the_previous_empty_group() {
+        let mut tabs = vec![
+            tab("https://old.example/a", Some(7)),
+            tab("https://other.example/a", Some(9)),
+        ];
+        let mut groups = vec![group(7, false), group(9, false)];
+        let mut next_id = 10;
+        let created =
+            regroup_context_tab(&mut tabs, &mut groups, &mut next_id, 0).expect("aba existe");
+        assert_eq!(tabs[0].group, Some(groups[created].id));
+        assert!(
+            groups.iter().all(|group| group.id != 7),
+            "grupo anterior vazio nao pode continuar na barra"
+        );
+        assert!(groups.iter().any(|group| group.id == 9));
     }
 
     #[test]
