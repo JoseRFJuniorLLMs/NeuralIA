@@ -2831,7 +2831,6 @@ struct BrowserAgentState {
 }
 
 struct App {
-struct App {
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Window>,
     webview: Option<WebView>,
