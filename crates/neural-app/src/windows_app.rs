@@ -53,11 +53,10 @@ use windows_sys::Win32::{
             ES_AUTOHSCROLL, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
             GetForegroundWindow, GetParent, GetWindowTextLengthW, GetWindowTextW,
             GetWindowThreadProcessId, IDYES, IsZoomed, MB_ICONINFORMATION, MB_OK, MB_YESNO,
-            MF_SEPARATOR,
-            MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
-            SetParent, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-            TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
-            WS_TABSTOP, WS_VISIBLE,
+            MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
+            SendMessageW, SetParent, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD,
+            TPM_RIGHTBUTTON, TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -3170,8 +3169,7 @@ impl App {
         };
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
-        let layout =
-            HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
+        let layout = HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
         let pad_x = 22.0 * scale;
         let pad_y = 5.0 * scale;
         let inner = UiRect {
@@ -5710,9 +5708,8 @@ impl App {
                 .comparator
                 .as_ref()
                 .and_then(|comp| {
-                    comp.expanded.or_else(|| {
-                        (0..comp.views.len()).find(|index| !comp.minimized[*index])
-                    })
+                    comp.expanded
+                        .or_else(|| (0..comp.views.len()).find(|index| !comp.minimized[*index]))
                 })
                 .unwrap_or(0);
             self.open_ai_palette(index);
@@ -12141,9 +12138,9 @@ mod tests {
         assert!(body.contains("GetParent(child) != parent"));
         assert!(body.contains("SetParent(child, parent)"));
         assert!(body.contains("Surface::Home => [self.omnibox"));
-        assert!(body.contains(
-            "Surface::Comparator => [None, self.home_button, self.caption_buttons]"
-        ));
+        assert!(
+            body.contains("Surface::Comparator => [None, self.home_button, self.caption_buttons]")
+        );
         assert!(body.contains("self.home_button"));
         assert!(body.contains("self.caption_buttons"));
     }
