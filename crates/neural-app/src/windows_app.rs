@@ -2498,9 +2498,8 @@ impl HistoryWriter {
                     match command {
                         HistoryCommand::Append(entry) => {
                             if let Err(error) = worker_store.append(&entry) {
-                                let _ = worker_proxy.send_event(UserEvent::HistoryWriteFailed(
-                                    error.to_string(),
-                                ));
+                                let _ = worker_proxy
+                                    .send_event(UserEvent::HistoryWriteFailed(error.to_string()));
                             }
                         }
                         HistoryCommand::Clear => {
@@ -2550,7 +2549,9 @@ impl HistoryWriter {
         if self.tx.try_send(HistoryCommand::Append(entry)).is_err() {
             let message = "fila do histórico saturada; uma entrada não foi gravada".to_string();
             eprintln!("{message}");
-            let _ = self.proxy.send_event(UserEvent::HistoryWriteFailed(message));
+            let _ = self
+                .proxy
+                .send_event(UserEvent::HistoryWriteFailed(message));
         }
     }
 
@@ -3171,8 +3172,7 @@ impl App {
 
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
-        let layout =
-            HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
+        let layout = HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
         let pad_x = 22.0 * scale;
         let pad_y = 5.0 * scale;
         let inner = UiRect {
