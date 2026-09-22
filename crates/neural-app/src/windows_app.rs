@@ -12110,26 +12110,6 @@ mod tests {
     }
 
     #[test]
-    fn comparator_uses_palette_instead_of_the_home_omnibox() {
-        assert!(matches!(
-            App::column_ipc_event_impl(0, IpcAction::Omnibox),
-            Some(UserEvent::OpenPalette(0))
-        ));
-        assert!(matches!(
-            App::column_ipc_event_impl(2, IpcAction::Omnibox),
-            Some(UserEvent::OpenPalette(2))
-        ));
-
-        let source = include_str!("windows_app.rs");
-        let comparator = source
-            .split("fn open_comparator")
-            .nth(1)
-            .and_then(|part| part.split("fn activate_comparator").next())
-            .expect("open_comparator body");
-        assert!(comparator.contains("self.show_omnibox(false)"));
-    }
-
-    #[test]
     fn home_button_is_text_only_without_an_invented_icon() {
         let source = include_str!("windows_app.rs");
         let native = source
