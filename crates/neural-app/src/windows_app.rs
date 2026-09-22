@@ -2830,33 +2830,7 @@ struct BrowserAgentState {
     trace: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NativeControlPlan {
-    omnibox: bool,
-    home_button: bool,
-    caption_buttons: bool,
-}
-
-fn native_control_plan(surface: Surface) -> NativeControlPlan {
-    match surface {
-        Surface::Home => NativeControlPlan {
-            omnibox: true,
-            home_button: false,
-            caption_buttons: false,
-        },
-        Surface::Comparator => NativeControlPlan {
-            omnibox: false,
-            home_button: true,
-            caption_buttons: true,
-        },
-        Surface::Reader | Surface::External | Surface::Pdf => NativeControlPlan {
-            omnibox: false,
-            home_button: false,
-            caption_buttons: false,
-        },
-    }
-}
-
+struct App {
 struct App {
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Window>,
@@ -3096,10 +3070,10 @@ impl App {
         self.request_redraw();
     }
 
-    /// Reinstala a subclasse da janela principal depois de transições de
-    /// decoração. No Windows, alternar a moldura pode substituir o HWND nativo;
-    /// SetWindowSubclass é idempotente para o mesmo callback/id e atualiza o
-    /// reference_data quando a janela continua a mesma.
+    /// Reinstala a subclasse e mantém os controles nativos ligados ao HWND
+    /// efetivo depois de mudanças de decoração. A omnibox da Home permanece
+    /// escondida no comparador, mas continua a acompanhar o HWND como antes da
+    /// regressão: o lifecycle depende dessa identidade sobreviver aos ciclos.
     fn ensure_window_subclass(&self) {
         let Some(window) = &self.window else {
             return;
@@ -3110,35 +3084,10 @@ impl App {
         let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
         unsafe {
             SetWindowSubclass(parent, Some(window_subclass), WINDOW_SUBCLASS_ID, proxy_ptr);
-        }
-    }
-
-    /// Reparenta somente os controles nativos que pertencem à superfície
-    /// visível. A omnibox da Home fica quieta e escondida enquanto um WebView2
-    /// possui o foco do teclado.
-    fn reparent_native_controls(&self) {
-        let Some(window) = &self.window else {
-            return;
-        };
-        let Some(parent) = window_hwnd(window) else {
-            return;
-        };
-        let plan = native_control_plan(self.surface);
-        let children = [
-            if plan.omnibox { self.omnibox } else { None },
-            if plan.home_button {
-                self.home_button
-            } else {
-                None
-            },
-            if plan.caption_buttons {
-                self.caption_buttons
-            } else {
-                None
-            },
-        ];
-        unsafe {
-            for child in children.into_iter().flatten() {
+            for child in [self.omnibox, self.home_button, self.caption_buttons]
+                .into_iter()
+                .flatten()
+            {
                 if GetParent(child) != parent {
                     SetParent(child, parent);
                 }
@@ -7606,7 +7555,6 @@ impl ApplicationHandler<UserEvent> for App {
         // subclass aqui é idempotente e garante que Home, atalhos e o probe
         // continuem chegando à janela REAL também na segunda abertura.
         self.ensure_window_subclass();
-        self.reparent_native_controls();
 
         let interval = if self.surface == Surface::Home && home_animation_enabled() {
             // O `Occluded` do Windows nao cobre a minimizacao em todos os
@@ -7781,8 +7729,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // aqui prende os comandos nativos ao HWND que ficou realmente
                     // ativo, em vez de ao handle anterior da Home.
                     self.ensure_window_subclass();
-                    self.reparent_native_controls();
-                    self.needs_clear = true;
+                                self.needs_clear = true;
                     self.update_comparator_layout();
                     self.sync_comparator_splitters();
                     self.sync_comparator_buttons();
@@ -7809,8 +7756,7 @@ impl ApplicationHandler<UserEvent> for App {
                         window.set_decorations(true);
                     }
                     self.ensure_window_subclass();
-                    self.reparent_native_controls();
-                    if let Some(window) = &self.window {
+                                if let Some(window) = &self.window {
                         hide_orphaned_wry_hosts(window);
                     }
                     self.needs_clear = true;
@@ -12164,33 +12110,23 @@ mod tests {
     }
 
     #[test]
-    fn native_control_reparent_policy_never_moves_hidden_home_edit_into_comparator() {
-        assert_eq!(
-            native_control_plan(Surface::Home),
-            NativeControlPlan {
-                omnibox: true,
-                home_button: false,
-                caption_buttons: false,
-            }
-        );
-        assert_eq!(
-            native_control_plan(Surface::Comparator),
-            NativeControlPlan {
-                omnibox: false,
-                home_button: true,
-                caption_buttons: true,
-            }
-        );
-        for surface in [Surface::Reader, Surface::External, Surface::Pdf] {
-            assert_eq!(
-                native_control_plan(surface),
-                NativeControlPlan {
-                    omnibox: false,
-                    home_button: false,
-                    caption_buttons: false,
-                }
-            );
-        }
+    fn comparator_uses_palette_instead_of_the_home_omnibox() {
+        assert!(matches!(
+            App::column_ipc_event_impl(0, IpcAction::Omnibox),
+            Some(UserEvent::OpenPalette(0))
+        ));
+        assert!(matches!(
+            App::column_ipc_event_impl(2, IpcAction::Omnibox),
+            Some(UserEvent::OpenPalette(2))
+        ));
+
+        let source = include_str!("windows_app.rs");
+        let comparator = source
+            .split("fn open_comparator")
+            .nth(1)
+            .and_then(|part| part.split("fn activate_comparator").next())
+            .expect("open_comparator body");
+        assert!(comparator.contains("self.show_omnibox(false)"));
     }
 
     #[test]
