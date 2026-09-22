@@ -41,14 +41,44 @@ jobs:
       # produto e não deve depender de um único sistema operativo para ter
       # cobertura.
       - run: cargo test --locked -p neural-app
+      - name: Exercise ChatGPT/Claude auto-submit runtime
+        run: node scripts/test-ai-auto-submit.mjs
+      - name: Exercise shipped provider link routing
+        run: node scripts/test-link-routing.mjs
+      - name: Verify release asset contract
+        run: node scripts/test-release-contract.mjs
+      - run: cargo clippy --locked -p neural-core --all-targets -- -D warnings
+      - run: cargo clippy --locked -p neural-app --all-targets -- -D warnings
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+        with:
+          components: clippy,rustfmt
+      # Gate normativo do AGENTS.md precisa do runner Windows porque
+      # neural-setup e a aplicação Win32 fazem parte do workspace.
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo check --locked --workspace
+      - run: cargo test --locked -p neural-core
+      - run: cargo test --locked -p neural-app
       - name: Prove 100-interaction UI gates reject sabotage
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $sourcePath = "crates/neural-app/src/windows_app.rs"
-          $linkTestPath = "scripts/test-link-routing.mjs"
           $originalSource = Get-Content -Raw -LiteralPath $sourcePath
-          $originalLinkTest = Get-Content -Raw -LiteralPath $linkTestPath
+          $utf8 = [Text.UTF8Encoding]::new($false)
+
+          function Write-Exact([string]$path, [string]$text) {
+            [IO.File]::WriteAllText($path, $text, $utf8)
+          }
 
           function Replace-Exact([string]$text, [string]$old, [string]$new, [string]$label) {
             $count = ([regex]::Matches($text, [regex]::Escape($old))).Count
@@ -109,7 +139,7 @@ jobs:
                   },
           '@ "split-transaction"
 
-            Set-Content -LiteralPath $sourcePath -Value $broken -Encoding utf8
+            Write-Exact $sourcePath $broken
 
             $output = Join-Path $env:RUNNER_TEMP "ui-sabotage-tests.txt"
             cargo test --locked -p neural-app 2>&1 | Tee-Object -FilePath $output
@@ -134,14 +164,14 @@ jobs:
             }
             Write-Host "Sabotage proof: six Rust UI regressions turned the shipped-path gates red."
 
-            Set-Content -LiteralPath $sourcePath -Value $originalSource -Encoding utf8
+            Write-Exact $sourcePath $originalSource
 
-            $brokenLinkTest = Replace-Exact $originalLinkTest @'
+            $brokenJs = Replace-Exact $originalSource @'
           '#neuralia-comp-controls,#neuralia-palette,a[href],button,input,textarea,select,option,label,summary,[role="button"],[role="link"],[contenteditable="true"]'
           '@ @'
           '#neuralia-comp-controls,#neuralia-palette,button,input,textarea,select,option,label,summary,[role="button"],[role="link"],[contenteditable="true"]'
           '@ "double-click-link-guard"
-            Set-Content -LiteralPath $linkTestPath -Value $brokenLinkTest -Encoding utf8
+            Write-Exact $sourcePath $brokenJs
 
             node scripts/test-link-routing.mjs
             $jsResult = $LASTEXITCODE
@@ -151,41 +181,13 @@ jobs:
             Write-Host "Sabotage proof: removing the link guard turns the runtime routing gate red."
           }
           finally {
-            Set-Content -LiteralPath $sourcePath -Value $originalSource -Encoding utf8
-            Set-Content -LiteralPath $linkTestPath -Value $originalLinkTest -Encoding utf8
+            Write-Exact $sourcePath $originalSource
           }
 
           cargo fmt --all -- --check
           cargo test --locked -p neural-app
           node scripts/test-link-routing.mjs
-          git diff --exit-code -- $sourcePath $linkTestPath
-      - name: Exercise ChatGPT/Claude auto-submit runtime
-        run: node scripts/test-ai-auto-submit.mjs
-      - name: Exercise shipped provider link routing
-        run: node scripts/test-link-routing.mjs
-      - name: Verify release asset contract
-        run: node scripts/test-release-contract.mjs
-      - run: cargo clippy --locked -p neural-core --all-targets -- -D warnings
-      - run: cargo clippy --locked -p neural-app --all-targets -- -D warnings
-
-  windows:
-    runs-on: windows-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
-        with:
-          components: clippy,rustfmt
-      # Gate normativo do AGENTS.md precisa do runner Windows porque
-      # neural-setup e a aplicação Win32 fazem parte do workspace.
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo check --locked --workspace
-      - run: cargo test --locked -p neural-core
-      - run: cargo test --locked -p neural-app
+          git diff --exit-code -- $sourcePath
       - name: Exercise ChatGPT/Claude auto-submit runtime
         run: node scripts/test-ai-auto-submit.mjs
       - name: Exercise shipped provider link routing
