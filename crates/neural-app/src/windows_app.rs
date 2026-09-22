@@ -4350,9 +4350,9 @@ impl App {
         let col_w = logical_w / n;
 
         let targets = [
-            ("Google Gemini", google_url),
-            ("ChatGPT", chatgpt_url),
-            ("Claude", claude_url),
+            ("Google Gemini", google_url.as_str()),
+            ("ChatGPT", chatgpt_url.as_str()),
+            ("Claude", claude_url.as_str()),
         ];
 
         let mut views = Vec::new();
