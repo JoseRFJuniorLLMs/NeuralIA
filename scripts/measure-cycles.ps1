@@ -29,6 +29,9 @@ param(
     [int]$OpenTimeoutSec = 25,
     [int]$CloseTimeoutSec = 20,
     [double]$MaxWorkingSetGrowthMiB = 24,
+    [int]$MaxHandleGrowth = 128,
+    [int]$MaxThreadGrowth = 8,
+    [int]$MaxGdiGrowth = 64,
     [string]$StartupInput = "jose r f junior",
     [string]$OutputPath = "perf-cycles.json"
 )
@@ -61,6 +64,9 @@ public static class NeuraliaCycleWindowProbe {
 
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetGuiResources(IntPtr hProcess, uint uiFlags);
 
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hWnd);
@@ -517,6 +523,9 @@ $samples = New-Object System.Collections.ArrayList
 $webViewPoolCeiling = $null
 $webViewPoolWarmupCycles = 3
 $warmWorkingSetMiB = $null
+$warmHandleCount = $null
+$warmThreadCount = $null
+$warmGdiCount = $null
 
 try {
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -531,6 +540,9 @@ try {
 
     $process.Refresh()
     $baselineMiB = [math]::Round($process.WorkingSet64 / 1MB, 2)
+    $baselineHandleCount = $process.HandleCount
+    $baselineThreadCount = $process.Threads.Count
+    $baselineGdiCount = [NeuraliaCycleWindowProbe]::GetGuiResources($process.Handle, 0)
 
     for ($cycle = 1; $cycle -le $Cycles; $cycle++) {
         # O primeiro comparador abre por NEURALIA_STARTUP_INPUT. Os seguintes
@@ -579,10 +591,16 @@ try {
         # Mede memoria no estado Home, nao no meio da abertura seguinte.
         $process.Refresh()
         $postHomeMiB = [math]::Round($process.WorkingSet64 / 1MB, 2)
+        $postHomeHandles = $process.HandleCount
+        $postHomeThreads = $process.Threads.Count
+        $postHomeGdi = [NeuraliaCycleWindowProbe]::GetGuiResources($process.Handle, 0)
         if ($cycle -eq $webViewPoolWarmupCycles) {
             # Os três primeiros ciclos carregam runtime/processos auxiliares
             # legitimamente. Leak é crescimento persistente DEPOIS desse aquecimento.
             $warmWorkingSetMiB = $postHomeMiB
+            $warmHandleCount = $postHomeHandles
+            $warmThreadCount = $postHomeThreads
+            $warmGdiCount = $postHomeGdi
         }
 
         # O Edge WebView2 pode manter um pool de subprocessos para reutilizacao
@@ -609,6 +627,9 @@ try {
             visible_surfaces_after_home = $visibleAfterHome
             webview_process_pool_after_home = $pooled
             working_set_mib = $postHomeMiB
+            handles = $postHomeHandles
+            threads = $postHomeThreads
+            gdi_objects = $postHomeGdi
         })
 
         # O próximo comparador só nasce depois de o script ter observado
@@ -630,6 +651,28 @@ try {
         $null = $failures.Add("working set cresceu ${growthMiB} MiB depois do aquecimento (tecto ${MaxWorkingSetGrowthMiB} MiB)")
     }
 
+    $process.Refresh()
+    $finalHandleCount = $process.HandleCount
+    $finalThreadCount = $process.Threads.Count
+    $finalGdiCount = [NeuraliaCycleWindowProbe]::GetGuiResources($process.Handle, 0)
+    if ($null -eq $warmHandleCount) { $warmHandleCount = $baselineHandleCount }
+    if ($null -eq $warmThreadCount) { $warmThreadCount = $baselineThreadCount }
+    if ($null -eq $warmGdiCount) { $warmGdiCount = $baselineGdiCount }
+
+    $handleGrowth = $finalHandleCount - $warmHandleCount
+    $threadGrowth = $finalThreadCount - $warmThreadCount
+    $gdiGrowth = [int]$finalGdiCount - [int]$warmGdiCount
+
+    if ($handleGrowth -gt $MaxHandleGrowth) {
+        $null = $failures.Add("handles cresceram ${handleGrowth} depois do aquecimento (tecto ${MaxHandleGrowth})")
+    }
+    if ($threadGrowth -gt $MaxThreadGrowth) {
+        $null = $failures.Add("threads cresceram ${threadGrowth} depois do aquecimento (tecto ${MaxThreadGrowth})")
+    }
+    if ($gdiGrowth -gt $MaxGdiGrowth) {
+        $null = $failures.Add("objetos GDI cresceram ${gdiGrowth} depois do aquecimento (tecto ${MaxGdiGrowth})")
+    }
+
     $result = [ordered]@{
         cycles = $Cycles
         webview_baseline = $script:WebViewBaseline
@@ -638,6 +681,18 @@ try {
         final_working_set_mib = $finalMiB
         cold_working_set_growth_mib = $coldGrowthMiB
         working_set_growth_mib = $growthMiB
+        baseline_handles = $baselineHandleCount
+        warm_handles = $warmHandleCount
+        final_handles = $finalHandleCount
+        handle_growth = $handleGrowth
+        baseline_threads = $baselineThreadCount
+        warm_threads = $warmThreadCount
+        final_threads = $finalThreadCount
+        thread_growth = $threadGrowth
+        baseline_gdi_objects = $baselineGdiCount
+        warm_gdi_objects = $warmGdiCount
+        final_gdi_objects = $finalGdiCount
+        gdi_growth = $gdiGrowth
         samples = $samples
         failures = $failures
     }

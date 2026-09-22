@@ -72,6 +72,8 @@ jobs:
         run: node scripts/test-ai-auto-submit.mjs
       - name: Exercise shipped provider link routing
         run: node scripts/test-link-routing.mjs
+      - name: Lock native resource lifecycle coverage
+        run: node scripts/test-native-resource-gate.mjs
       - run: cargo clippy --locked -p neural-app --all-targets -- -D warnings
       - run: cargo build --locked -p neural-app --bin NeuralIA --release
       - name: First comparator paint without mouse or keyboard
