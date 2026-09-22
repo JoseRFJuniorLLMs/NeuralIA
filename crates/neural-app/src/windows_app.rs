@@ -642,8 +642,7 @@ impl BarLayout {
         }
 
         // Linha superior: todas as fontes/abas, antes dos controles da janela.
-        let omnibox = comparator_omnibox_rect(client_width, scale);
-        let tabs_left = (omnibox.x + omnibox.width + 8.0 * scale).max(90.0 * scale);
+        let tabs_left = 90.0 * scale;
         let tabs_right = (window_minimize.x - 8.0 * scale).max(tabs_left);
         let visible_rows = &rows[..columns_len];
         let total_slots: usize = visible_rows.iter().map(|row| row.len).sum();
@@ -778,23 +777,8 @@ impl BarLayout {
     }
 }
 
-/// Omnibox persistente do comparador, na mesma faixa da title bar.
-/// Usa coordenadas fisicas, como BarLayout e os eventos do rato.
-fn comparator_omnibox_rect(client_width: f64, scale: f64) -> UiRect {
-    let scale = scale.max(1.0);
-    let x = 92.0 * scale;
-    let caption_left = (client_width - 3.0 * 46.0 * scale - 10.0 * scale).max(x);
-    let width = (360.0 * scale).min((caption_left - x - 10.0 * scale).max(0.0));
-    UiRect {
-        x,
-        y: 5.0 * scale,
-        width,
-        height: (TITLE_TAB_HEIGHT - 10.0) * scale,
-    }
-}
-
-fn surface_accepts_omnibox_submit(surface: Surface) -> bool {
-    matches!(surface, Surface::Home | Surface::Comparator)
+fn surface_accepts_omnibox_submit(surface: Surface) -> bool {fn surface_accepts_omnibox_submit(surface: Surface) -> bool {
+    matches!(surface, Surface::Home)
 }
 
 /// Os controlos do canto direito da segunda linha.
@@ -1797,8 +1781,7 @@ unsafe extern "system" fn home_button_subclass(
                         hdc,
                         rect,
                         "Home",
-                        PillStyle::new(theme.surface, theme.surface_line, theme.fg)
-                            .with_icon(ICON_SLOT_HOME, Some(theme.fg)),
+                        PillStyle::new(theme.surface, theme.surface_line, theme.fg),
                         scale,
                         font,
                         theme.bar_bg,
@@ -3081,33 +3064,24 @@ impl App {
         let (Some(window), Some(edit)) = (&self.window, self.omnibox) else {
             return;
         };
+        if self.surface != Surface::Home {
+            unsafe {
+                ShowWindow(edit, SW_HIDE);
+            }
+            return;
+        }
+
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
-
-        // A mesma caixa nativa serve a Home e o comparador. Na segunda tela ela
-        // vive na title bar, portanto o utilizador pode fazer outra pesquisa
-        // sem voltar à Home nem depender de atalhos escondidos.
-        let inner = if self.surface == Surface::Comparator {
-            let outer = comparator_omnibox_rect(size.width as f64, scale);
-            let pad_x = 10.0 * scale;
-            let pad_y = 3.0 * scale;
-            UiRect {
-                x: outer.x + pad_x,
-                y: outer.y + pad_y,
-                width: (outer.width - pad_x * 2.0).max(1.0),
-                height: (outer.height - pad_y * 2.0).max(1.0),
-            }
-        } else {
-            let layout =
-                HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
-            let pad_x = 22.0 * scale;
-            let pad_y = 5.0 * scale;
-            UiRect {
-                x: layout.input.x + pad_x,
-                y: layout.input.y + pad_y,
-                width: (layout.input.width - pad_x * 2.0).max(1.0),
-                height: (layout.input.height - pad_y * 2.0).max(1.0),
-            }
+        let layout =
+            HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
+        let pad_x = 22.0 * scale;
+        let pad_y = 5.0 * scale;
+        let inner = UiRect {
+            x: layout.input.x + pad_x,
+            y: layout.input.y + pad_y,
+            width: (layout.input.width - pad_x * 2.0).max(1.0),
+            height: (layout.input.height - pad_y * 2.0).max(1.0),
         };
 
         unsafe {
@@ -3122,7 +3096,6 @@ impl App {
             );
         }
         self.apply_omnibox_font(inner.height);
-        // O EDIT deixa o desenho antigo para tras quando muda de sitio.
         self.needs_clear = true;
         self.request_redraw();
     }
@@ -4173,8 +4146,7 @@ impl App {
         if !reuse_comparator {
             self.destroy_web_surfaces();
         }
-        self.show_omnibox_passive(true);
-        self.position_omnibox();
+        self.show_omnibox_passive(false);
 
         let google_url = match google_ai_url(query, &self.config.language) {
             Ok(u) => u,
@@ -4328,8 +4300,7 @@ impl App {
         }
         self.sync_exit_button();
         self.sync_home_button();
-        self.show_omnibox_passive(true);
-        self.position_omnibox();
+        self.show_omnibox_passive(false);
 
         for delay_ms in COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS {
             self.timers.after(
@@ -4381,28 +4352,20 @@ impl App {
             return;
         }
 
-        let mut restored = false;
         if let Some(comp) = &mut self.comparator
             && idx < comp.views.len()
         {
-            if comp.expanded == Some(idx) {
-                comp.expanded = None;
-                restored = true;
+            comp.expanded = if comp.expanded == Some(idx) {
+                None
             } else {
-                comp.expanded = Some(idx);
-            }
+                Some(idx)
+            };
         }
         self.bar_hover = None;
         self.needs_clear = true;
 
-        // Ecra completo a serio: sem barra de titulo, sem minimizar/fechar.
-        if let Some(window) = &self.window {
-            if restored {
-                window.set_fullscreen(None);
-            } else {
-                window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-            }
-        }
+        // Expandir uma IA ocupa a area de conteudo, nao o monitor inteiro.
+        // A titlebar e os controles da janela continuam sempre acessiveis.
 
         self.update_comparator_layout();
         self.sync_comparator_splitters();
@@ -4471,8 +4434,7 @@ impl App {
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.sync_home_button();
-        self.show_omnibox_passive(true);
-        self.position_omnibox();
+        self.show_omnibox_passive(false);
         self.request_redraw();
     }
 
@@ -4488,8 +4450,7 @@ impl App {
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.sync_home_button();
-        self.show_omnibox_passive(true);
-        self.position_omnibox();
+        self.show_omnibox_passive(false);
         self.request_redraw();
     }
 
@@ -4564,8 +4525,8 @@ impl App {
                 for (i, v) in comp.views.iter().enumerate() {
                     if i == idx {
                         let _ = v.webview.set_bounds(wry::Rect {
-                            position: LogicalPosition::new(0.0, 0.0).into(),
-                            size: LogicalSize::new(logical_w, logical_h.max(1.0)).into(),
+                            position: LogicalPosition::new(0.0, content_y).into(),
+                            size: LogicalSize::new(logical_w, content_h).into(),
                         });
                         let _ = v.webview.set_visible(true);
                     } else {
@@ -5818,19 +5779,12 @@ impl App {
     }
 
     fn is_fullscreen_column(&self) -> bool {
-        self.comparator
-            .as_ref()
-            .is_some_and(|comp| comp.expanded.is_some())
+        false
     }
 
-    /// Em tres colunas a barra fica estavel. Em fullscreen ela desaparece e
-    /// a saida fica por conta do botao nativo flutuante.
+    /// O chrome do NeuralIA permanece visivel também com uma IA expandida.
     fn bar_visible(&self) -> bool {
-        match &self.comparator {
-            Some(comp) if comp.split.is_some() => true,
-            Some(comp) => comp.expanded.is_none(),
-            None => false,
-        }
+        self.comparator.is_some()
     }
 
     fn bar_layout(&self) -> Option<BarLayout> {
@@ -7604,8 +7558,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if self.is_fullscreen_column() {
                         self.show_omnibox_passive(false);
                     } else {
-                        self.show_omnibox_passive(true);
-                        self.position_omnibox();
+                        self.show_omnibox_passive(false);
                     }
                     if lifecycle_probe_enabled() {
                         LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
@@ -8824,17 +8777,6 @@ unsafe fn paint_comparator_bar_with_contexts(
         theme.bar_bg,
     );
 
-    let search = comparator_omnibox_rect(width as f64, scale);
-    draw_pill(
-        target,
-        search,
-        "",
-        PillStyle::new(theme.surface, theme.surface_line, theme.fg),
-        scale,
-        tab_font,
-        theme.bar_bg,
-    );
-
     // Abas/fontes na mesma faixa dos botoes de janela.
     for (index, source_contexts) in contexts.iter().enumerate().take(layout.columns_len) {
         let brand = theme.brand(index);
@@ -8945,8 +8887,7 @@ unsafe fn paint_comparator_bar_with_contexts(
         target,
         layout.home,
         "Home",
-        PillStyle::new(home_fill, theme.surface_line, theme.fg)
-            .with_icon(ICON_SLOT_HOME, Some(theme.fg)),
+        PillStyle::new(home_fill, theme.surface_line, theme.fg),
         scale,
         font,
         theme.bar_bg,
@@ -12002,36 +11943,32 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_column_has_stable_chrome_policy() {
+    fn expanded_column_keeps_window_controls_visible() {
         let source = include_str!("windows_app.rs");
-        let layout = source
-            .split("fn update_comparator_layout")
+        let expand = source
+            .split("fn expand_comparator")
             .nth(1)
-            .and_then(|part| part.split("fn column_ipc_event_impl").next())
-            .expect("layout body");
-        assert!(!layout.contains("chrome_revealed"));
-        assert!(layout.contains("LogicalPosition::new(0.0, 0.0)"));
+            .and_then(|part| part.split("fn minimize_comparator").next())
+            .expect("expand_comparator body");
+        assert!(!expand.contains("set_fullscreen(Some"));
+        assert!(expand.contains("titlebar"));
 
-        let exit = source
-            .split("fn sync_exit_button")
-            .nth(1)
-            .and_then(|part| part.split("fn position_exit_button").next())
-            .expect("exit button body");
-        assert!(exit.contains("self.is_fullscreen_column()"));
-        assert!(!exit.contains("chrome_revealed"));
+        let layout = BarLayout::new(1600.0, 1.0, true, 3);
+        assert!(layout.window_minimize.width > 0.0);
+        assert!(layout.window_maximize.width > 0.0);
+        assert!(layout.window_close.width > 0.0);
     }
 
     #[test]
-    fn comparator_keeps_a_real_omnibox_without_covering_window_controls() {
-        let rect = comparator_omnibox_rect(1600.0, 1.0);
-        assert!(rect.width >= 300.0);
-        assert!(rect.x >= 90.0);
-        assert!(rect.x + rect.width < 1600.0 - 3.0 * 46.0);
+    fn comparator_does_not_put_search_in_the_titlebar() {
         assert!(surface_accepts_omnibox_submit(Surface::Home));
-        assert!(surface_accepts_omnibox_submit(Surface::Comparator));
+        assert!(!surface_accepts_omnibox_submit(Surface::Comparator));
         assert!(!surface_accepts_omnibox_submit(Surface::External));
         assert!(!surface_accepts_omnibox_submit(Surface::Reader));
         assert!(!surface_accepts_omnibox_submit(Surface::Pdf));
+
+        let source = include_str!("windows_app.rs");
+        assert!(!source.contains("fn comparator_omnibox_rect"));
     }
 
     #[test]
