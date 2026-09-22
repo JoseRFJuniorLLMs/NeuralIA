@@ -11733,6 +11733,18 @@ mod tests {
     }
 
     #[test]
+    fn history_worker_does_not_silently_discard_append_failures() {
+        let source = include_str!("windows_app.rs");
+        let worker = source
+            .split("HistoryCommand::Append(entry) =>")
+            .nth(1)
+            .and_then(|part| part.split("HistoryCommand::Clear =>").next())
+            .expect("history append worker");
+        assert!(!worker.contains("let _ = worker_store.append"));
+        assert!(worker.contains("HistoryWriteFailed"));
+    }
+
+    #[test]
     fn comparator_minimize_control_is_wired_and_layout_keeps_one_visible() {
         assert!(COMPARATOR_INJECT_SCRIPT.contains("neuralia-comp-minimize"));
         assert!(COMPARATOR_INJECT_SCRIPT.contains("act('minimize', { col:colIndex })"));
