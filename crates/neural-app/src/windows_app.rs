@@ -1144,6 +1144,25 @@ fn can_minimize_column(
 /// Fecha as outras abas do MESMO escopo da aba selecionada. Um grupo real
 /// usa o seu id; abas soltas partilham o escopo `None`. Abas de outros grupos
 /// nunca sao tocadas.
+fn active_context_removed_by_scope(
+    tabs: &[ContextTab],
+    context_index: usize,
+    active_id: Option<u64>,
+    keep_selected: bool,
+) -> bool {
+    let Some(selected) = tabs.get(context_index) else {
+        return false;
+    };
+    let Some(active_id) = active_id else {
+        return false;
+    };
+    tabs.iter().any(|tab| {
+        tab.id == active_id
+            && tab.group == selected.group
+            && (!keep_selected || tab.id != selected.id)
+    })
+}
+
 fn close_other_context_tabs_in_scope(
     tabs: &mut Vec<ContextTab>,
     groups: &mut Vec<ContextGroup>,
@@ -6931,26 +6950,26 @@ impl App {
     }
 
     fn close_other_context_tabs(&mut self, source_index: usize, context_index: usize) {
-        let Some((scope, keep_id)) = self
+        let valid_context = self
             .comparator
             .as_ref()
             .and_then(|comp| comp.contexts.get(source_index))
-            .and_then(|tabs| tabs.get(context_index).map(|tab| (tab.group, tab.id)))
-        else {
+            .is_some_and(|tabs| context_index < tabs.len());
+        if !valid_context {
             return;
-        };
+        }
         let closes_active = self
             .comparator
             .as_ref()
             .and_then(|comp| comp.split.as_ref().map(|split| (comp, split)))
             .is_some_and(|(comp, split)| {
                 split.source_index == source_index
-                    && split.context_id.is_some_and(|active_id| {
-                        active_id != keep_id
-                            && comp.contexts[source_index]
-                                .iter()
-                                .any(|tab| tab.id == active_id && tab.group == scope)
-                    })
+                    && active_context_removed_by_scope(
+                        &comp.contexts[source_index],
+                        context_index,
+                        split.context_id,
+                        true,
+                    )
             });
         if closes_active {
             self.close_split();
@@ -6966,26 +6985,26 @@ impl App {
     }
 
     fn close_all_context_tabs(&mut self, source_index: usize, context_index: usize) {
-        let Some(scope) = self
+        let valid_context = self
             .comparator
             .as_ref()
             .and_then(|comp| comp.contexts.get(source_index))
-            .and_then(|tabs| tabs.get(context_index))
-            .map(|tab| tab.group)
-        else {
+            .is_some_and(|tabs| context_index < tabs.len());
+        if !valid_context {
             return;
-        };
+        }
         let closes_active = self
             .comparator
             .as_ref()
             .and_then(|comp| comp.split.as_ref().map(|split| (comp, split)))
             .is_some_and(|(comp, split)| {
                 split.source_index == source_index
-                    && split.context_id.is_some_and(|active_id| {
-                        comp.contexts[source_index]
-                            .iter()
-                            .any(|tab| tab.id == active_id && tab.group == scope)
-                    })
+                    && active_context_removed_by_scope(
+                        &comp.contexts[source_index],
+                        context_index,
+                        split.context_id,
+                        false,
+                    )
             });
         if closes_active {
             self.close_split();
@@ -11909,6 +11928,19 @@ mod tests {
         let first = tabs[0].id;
         let second = tabs[1].id;
         assert_ne!(first, second, "URL repetida nao pode colapsar identidades");
+
+        assert!(
+            !active_context_removed_by_scope(&tabs, 0, Some(second), false),
+            "mesma URL noutro grupo nao pode ser confundida com a aba ativa do grupo fechado"
+        );
+        assert!(
+            active_context_removed_by_scope(&tabs, 0, Some(first), false),
+            "a aba ativa do proprio grupo precisa ser fechada"
+        );
+        assert!(
+            !active_context_removed_by_scope(&tabs, 0, Some(first), true),
+            "Fechar outras deve preservar a aba selecionada"
+        );
 
         let mut groups = vec![group(10, false), group(20, false)];
         assert!(close_context_tab_scope(&mut tabs, &mut groups, 0));
