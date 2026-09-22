@@ -2548,7 +2548,9 @@ impl HistoryWriter {
     /// grave do que congelar a interface com lock + fsync + rename.
     fn append(&self, entry: HistoryEntry) {
         if self.tx.try_send(HistoryCommand::Append(entry)).is_err() {
-            eprintln!("history queue saturated; dropping one entry");
+            let message = "fila do histórico saturada; uma entrada não foi gravada".to_string();
+            eprintln!("{message}");
+            let _ = self.proxy.send_event(UserEvent::HistoryWriteFailed(message));
         }
     }
 
