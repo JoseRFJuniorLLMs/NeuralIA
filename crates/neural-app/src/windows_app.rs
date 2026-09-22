@@ -3163,23 +3163,31 @@ impl App {
         let (Some(window), Some(edit)) = (&self.window, self.omnibox) else {
             return;
         };
-        if self.surface != Surface::Home {
-            unsafe {
-                ShowWindow(edit, SW_HIDE);
-            }
-            return;
-        }
-
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
-        let layout = HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
-        let pad_x = 22.0 * scale;
-        let pad_y = 5.0 * scale;
-        let inner = UiRect {
-            x: layout.input.x + pad_x,
-            y: layout.input.y + pad_y,
-            width: (layout.input.width - pad_x * 2.0).max(1.0),
-            height: (layout.input.height - pad_y * 2.0).max(1.0),
+
+        // O EDIT precisa manter a mesma identidade Win32 durante as trocas de
+        // decorations/HWND. Fora da Home ele continua WS_VISIBLE, mas fica
+        // estacionado muito fora do cliente e com 1x1 px: não aparece na
+        // titlebar nem disputa espaço com as abas.
+        let inner = if self.surface == Surface::Home {
+            let layout =
+                HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
+            let pad_x = 22.0 * scale;
+            let pad_y = 5.0 * scale;
+            UiRect {
+                x: layout.input.x + pad_x,
+                y: layout.input.y + pad_y,
+                width: (layout.input.width - pad_x * 2.0).max(1.0),
+                height: (layout.input.height - pad_y * 2.0).max(1.0),
+            }
+        } else {
+            UiRect {
+                x: -4096.0 * scale,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            }
         };
 
         unsafe {
@@ -3194,7 +3202,9 @@ impl App {
             );
             ShowWindow(edit, SW_SHOW);
         }
-        self.apply_omnibox_font(inner.height);
+        if self.surface == Surface::Home {
+            self.apply_omnibox_font(inner.height);
+        }
         self.needs_clear = true;
         self.request_redraw();
     }
@@ -4250,7 +4260,8 @@ impl App {
         if !reuse_comparator {
             self.destroy_web_surfaces();
         }
-        self.show_omnibox_passive(false);
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
 
         let google_url = match google_ai_url(query, &self.config.language) {
             Ok(u) => u,
@@ -4405,7 +4416,8 @@ impl App {
         self.sync_exit_button();
         self.sync_home_button();
         self.sync_caption_buttons();
-        self.show_omnibox_passive(false);
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
 
         for delay_ms in COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS {
             self.timers.after(
@@ -4475,7 +4487,8 @@ impl App {
         self.sync_exit_button();
         self.sync_home_button();
         self.sync_caption_buttons();
-        self.show_omnibox_passive(false);
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
         self.request_redraw();
     }
 
@@ -4533,7 +4546,8 @@ impl App {
         self.sync_exit_button();
         self.sync_home_button();
         self.sync_caption_buttons();
-        self.show_omnibox_passive(false);
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
         self.request_redraw();
     }
 
@@ -4547,7 +4561,8 @@ impl App {
         self.sync_exit_button();
         self.sync_home_button();
         self.sync_caption_buttons();
-        self.show_omnibox_passive(false);
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
         self.request_redraw();
     }
 
@@ -7581,7 +7596,8 @@ impl ApplicationHandler<UserEvent> for App {
             self.sync_exit_button();
             self.sync_home_button();
             self.sync_caption_buttons();
-            self.show_omnibox_passive(false);
+            self.show_omnibox_passive(true);
+        self.position_omnibox();
             LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
             self.request_redraw();
         }
@@ -7769,7 +7785,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_exit_button();
                     self.sync_home_button();
                     self.sync_caption_buttons();
-                    self.show_omnibox_passive(false);
+                    self.show_omnibox_passive(true);
+        self.position_omnibox();
                     self.request_redraw();
                 }
             }
