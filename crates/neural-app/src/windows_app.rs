@@ -3289,6 +3289,67 @@ impl App {
         }
     }
 
+    /// Volta à Home sem destruir os três controllers do comparador.
+    ///
+    /// Destruir/recriar os child WebViews a cada pesquisa fazia o segundo
+    /// build_as_child entrar no pump aninhado do WebView2 e acumulava handles.
+    /// Na Home os hosts ficam invisíveis e sem foco; a próxima pesquisa reutiliza
+    /// os mesmos controllers. Superfícies avulsas e Split continuam a ser
+    /// descartados, porque não fazem parte do comparador reutilizável.
+    fn park_comparator_for_home(&mut self) {
+        if lifecycle_probe_enabled() {
+            LIFECYCLE_COMPARATOR_READY.store(false, Ordering::Release);
+            LIFECYCLE_HOME_READY.store(false, Ordering::Release);
+        }
+        self.mark_dirty();
+        self.close_palette();
+        self.finish_agent(AgentTermination::UserStopped);
+
+        if let Some(comparator) = &mut self.comparator {
+            comparator.expanded = None;
+            comparator.minimized = [false; COMPARATOR_COLUMNS];
+            for view in &comparator.views {
+                let _ = view.webview.set_visible(false);
+                let _ = view.webview.focus_parent();
+            }
+            if let Some(split) = comparator.split.take() {
+                let _ = split.webview.set_visible(false);
+                let _ = split.webview.focus_parent();
+                drop(split);
+            }
+        }
+
+        if let Some(webview) = self.webview.take() {
+            let _ = webview.set_visible(false);
+            let _ = webview.focus_parent();
+            drop(webview);
+        }
+
+        if let Some(button) = self.exit_button.take() {
+            unsafe { DestroyWindow(button); }
+        }
+        if let Some(button) = self.home_button.take() {
+            unsafe { DestroyWindow(button); }
+        }
+        if let Some(buttons) = self.caption_buttons.take() {
+            unsafe { DestroyWindow(buttons); }
+        }
+        for splitter in &mut self.splitters {
+            if let Some(hwnd) = splitter.take() {
+                unsafe { DestroyWindow(hwnd); }
+            }
+        }
+
+        self.leave_fullscreen();
+        if let Some(window) = &self.window {
+            hide_orphaned_wry_hosts(window);
+        }
+        if let Ok(mut bytes) = self.pdf_bytes.lock() {
+            *bytes = Vec::new();
+        }
+        self.reading_pdf = false;
+    }
+
     fn destroy_web_surfaces(&mut self) {
         if lifecycle_probe_enabled() {
             LIFECYCLE_COMPARATOR_READY.store(false, Ordering::Release);
@@ -3377,14 +3438,19 @@ impl App {
     }
 
     fn show_home(&mut self) {
+        let reuse_comparator =
+            self.surface == Surface::Comparator && self.comparator.is_some();
         self.next_generation();
-        self.surface = Surface::Home;
 
-        // Home é uma fronteira de ciclo de vida real. Destruir os controllers
-        // aqui garante que nenhum host WRY_WEBVIEW sobreviva oculto/reparentado
-        // entre pesquisas. Reuso dentro do próprio comparador continua possível,
-        // mas sair para Home sempre encerra as superfícies web.
-        self.destroy_web_surfaces();
+        // O comparador é caro e, pior, recriá-lo repetidamente abre uma janela
+        // de pump aninhado no WebView2. Na Home ele fica estacionado e invisível;
+        // qualquer outra superfície continua a ser destruída de verdade.
+        if reuse_comparator {
+            self.park_comparator_for_home();
+        } else {
+            self.destroy_web_surfaces();
+        }
+        self.surface = Surface::Home;
         self.schedule_home_restoration();
 
         self.bar_hover = None;
@@ -11293,6 +11359,26 @@ mod tests {
             ready > rebind,
             "Ready só pode ser publicado depois de voltar ao event loop e rebindar o HWND"
         );
+    }
+
+    #[test]
+    fn home_parks_comparator_controllers_for_reuse_instead_of_rebuilding_them() {
+        let source = include_str!("windows_app.rs");
+        let home = source
+            .split("fn show_home")
+            .nth(1)
+            .and_then(|part| part.split("fn show_native_error").next())
+            .expect("show_home body");
+        assert!(home.contains("self.park_comparator_for_home()"));
+
+        let park = source
+            .split("fn park_comparator_for_home")
+            .nth(1)
+            .and_then(|part| part.split("fn destroy_web_surfaces").next())
+            .expect("park comparator body");
+        assert!(park.contains("view.webview.set_visible(false)"));
+        assert!(!park.contains("self.comparator.take()"));
+        assert!(!park.contains("drop(comparator)"));
     }
 
     #[test]
