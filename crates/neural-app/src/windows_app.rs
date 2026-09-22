@@ -51,11 +51,12 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
             ES_AUTOHSCROLL, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
-            GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-            IDYES, MB_ICONINFORMATION, MB_OK, MB_YESNO, MF_SEPARATOR, MF_STRING, MessageBoxW,
-            SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos,
-            SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_KEYDOWN,
-            WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+            GetForegroundWindow, GetParent, GetWindowTextLengthW, GetWindowTextW,
+            GetWindowThreadProcessId, IDYES, MB_ICONINFORMATION, MB_OK, MB_YESNO, MF_SEPARATOR,
+            MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
+            SetParent, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+            TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+            WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -115,8 +116,6 @@ enum UserEvent {
         text: String,
     },
     AgentObservation(ObservedPage),
-    /// Esconde outra vez a barra em ecra completo, se nada a tiver reavivado.
-    HideChrome(u64),
     SubmitText(String),
     OpenExternal(String),
     /// Popup pedido por uma coluna do comparador: carrega nessa coluna.
@@ -202,9 +201,6 @@ const AUTO_SCROLL_SECONDS: u64 = 30;
 /// Quanto tempo a pergunta fica no ecra antes de se dar por respondida com
 /// "nao". Sem resposta nao se mexe em nada: e uma pergunta, nao um aviso.
 const AUTO_SCROLL_PROMPT_SECONDS: u64 = 20;
-/// Quanto tempo a barra fica visivel em ecra completo depois do ultimo
-/// movimento do rato no topo.
-const CHROME_HIDE_DELAY_MS: u64 = 2500;
 /// A moldura Win32 pode mudar o client rect um ciclo depois de
 /// set_decorations(false). Fazemos dois relayouts baratos para nao deixar
 /// WebViews presos na geometria anterior ate o primeiro movimento do rato.
@@ -646,7 +642,8 @@ impl BarLayout {
         }
 
         // Linha superior: todas as fontes/abas, antes dos controles da janela.
-        let tabs_left = 90.0 * scale;
+        let omnibox = comparator_omnibox_rect(client_width, scale);
+        let tabs_left = (omnibox.x + omnibox.width + 8.0 * scale).max(90.0 * scale);
         let tabs_right = (window_minimize.x - 8.0 * scale).max(tabs_left);
         let visible_rows = &rows[..columns_len];
         let total_slots: usize = visible_rows.iter().map(|row| row.len).sum();
@@ -779,6 +776,25 @@ impl BarLayout {
         }
         None
     }
+}
+
+/// Omnibox persistente do comparador, na mesma faixa da title bar.
+/// Usa coordenadas fisicas, como BarLayout e os eventos do rato.
+fn comparator_omnibox_rect(client_width: f64, scale: f64) -> UiRect {
+    let scale = scale.max(1.0);
+    let x = 92.0 * scale;
+    let caption_left = (client_width - 3.0 * 46.0 * scale - 10.0 * scale).max(x);
+    let width = (360.0 * scale).min((caption_left - x - 10.0 * scale).max(0.0));
+    UiRect {
+        x,
+        y: 5.0 * scale,
+        width,
+        height: (TITLE_TAB_HEIGHT - 10.0) * scale,
+    }
+}
+
+fn surface_accepts_omnibox_submit(surface: Surface) -> bool {
+    matches!(surface, Surface::Home | Surface::Comparator)
 }
 
 /// Os controlos do canto direito da segunda linha.
@@ -1310,6 +1326,7 @@ fn lifecycle_probe_home_ready_message() -> u32 {
     })
 }
 const EXIT_BUTTON_SUBCLASS_ID: usize = 0x4E4B;
+const HOME_BUTTON_SUBCLASS_ID: usize = 0x4E4C;
 const WM_PAINT: u32 = 0x000F;
 const WM_LBUTTONUP: u32 = 0x0202;
 const WM_NCHITTEST: u32 = 0x0084;
@@ -1747,6 +1764,58 @@ unsafe extern "system" fn comparator_splitter_subclass(
         _ => {}
     }
     DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+unsafe extern "system" fn home_button_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    reference_data: usize,
+) -> LRESULT {
+    match message {
+        WM_NCHITTEST => HTCLIENT as LRESULT,
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut paint);
+            if !hdc.is_null() {
+                let mut client = RECT::default();
+                if GetClientRect(hwnd, &mut client) != 0 {
+                    let theme = Theme::system();
+                    let width = (client.right - client.left).max(1) as f64;
+                    let height = (client.bottom - client.top).max(1) as f64;
+                    let scale = (height / 30.0).max(1.0);
+                    let font = create_font((-13.0 * scale) as i32, FW_NORMAL as i32);
+                    let rect = UiRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width,
+                        height,
+                    };
+                    draw_pill(
+                        hdc,
+                        rect,
+                        "Home",
+                        PillStyle::new(theme.surface, theme.surface_line, theme.fg)
+                            .with_icon(ICON_SLOT_HOME, Some(theme.fg)),
+                        scale,
+                        font,
+                        theme.bar_bg,
+                    );
+                    DeleteObject(font as _);
+                }
+                EndPaint(hwnd, &paint);
+            }
+            0
+        }
+        WM_LBUTTONUP if reference_data != 0 => {
+            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+            let _ = proxy.send_event(UserEvent::HomeRequested);
+            0
+        }
+        _ => DefSubclassProc(hwnd, message, wparam, lparam),
+    }
 }
 
 unsafe extern "system" fn exit_button_subclass(
@@ -2703,16 +2772,8 @@ struct App {
     comparator: Option<ComparatorState>,
     omnibox: Option<HWND>,
     bar_hover: Option<BarHit>,
-    /// Em ecra completo a barra some; volta enquanto o rato estiver no topo.
-    chrome_revealed: bool,
-    chrome_token: u64,
-    /// Prazo de vida da barra, em milissegundos monotonos. Cada movimento do
-    /// rato empurra-o sem agendar nada; quando o `HideChrome` agendado chega,
-    /// `hide_chrome` compara com isto e reagenda so o que falta. Antes era uma
-    /// thread do sistema operativo POR CADA evento de rato, depois uma thread
-    /// de vigia a sondar de 300 em 300 ms; agora e so um numero.
-    chrome_deadline: u64,
     exit_button: Option<HWND>,
+    home_button: Option<HWND>,
     splitters: [Option<HWND>; COMPARATOR_COLUMNS - 1],
     auto_scroll: bool,
     auto_scroll_answered: bool,
@@ -2803,10 +2864,8 @@ impl App {
             comparator: None,
             omnibox: None,
             bar_hover: None,
-            chrome_revealed: false,
-            chrome_token: 0,
-            chrome_deadline: 0,
             exit_button: None,
+            home_button: None,
             splitters: [None; COMPARATOR_COLUMNS - 1],
             // Ligada por omissao: a aplicacao serve para ler.
             // Nada rola sem o utilizador dizer que sim.
@@ -2956,6 +3015,15 @@ impl App {
         let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
         unsafe {
             SetWindowSubclass(parent, Some(window_subclass), WINDOW_SUBCLASS_ID, proxy_ptr);
+
+            // A troca de decorations pode substituir/reparentar o HWND nativo.
+            // A omnibox e o Home sao filhos Win32 reais: se continuarem ligados
+            // ao HWND antigo, ficam invisiveis ou deixam de receber teclado/rato.
+            for child in [self.omnibox, self.home_button].into_iter().flatten() {
+                if GetParent(child) != parent {
+                    SetParent(child, parent);
+                }
+            }
         }
     }
 
@@ -3014,18 +3082,32 @@ impl App {
             return;
         };
         let size = window.inner_size();
-        let layout = HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
         let scale = window.scale_factor().max(1.0);
 
-        // O controlo vive encaixado dentro da pilula desenhada: os cantos retos
-        // ficam por baixo da curva e nunca se veem.
-        let pad_x = 22.0 * scale;
-        let pad_y = 5.0 * scale;
-        let inner = UiRect {
-            x: layout.input.x + pad_x,
-            y: layout.input.y + pad_y,
-            width: (layout.input.width - pad_x * 2.0).max(1.0),
-            height: (layout.input.height - pad_y * 2.0).max(1.0),
+        // A mesma caixa nativa serve a Home e o comparador. Na segunda tela ela
+        // vive na title bar, portanto o utilizador pode fazer outra pesquisa
+        // sem voltar à Home nem depender de atalhos escondidos.
+        let inner = if self.surface == Surface::Comparator {
+            let outer = comparator_omnibox_rect(size.width as f64, scale);
+            let pad_x = 10.0 * scale;
+            let pad_y = 3.0 * scale;
+            UiRect {
+                x: outer.x + pad_x,
+                y: outer.y + pad_y,
+                width: (outer.width - pad_x * 2.0).max(1.0),
+                height: (outer.height - pad_y * 2.0).max(1.0),
+            }
+        } else {
+            let layout =
+                HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
+            let pad_x = 22.0 * scale;
+            let pad_y = 5.0 * scale;
+            UiRect {
+                x: layout.input.x + pad_x,
+                y: layout.input.y + pad_y,
+                width: (layout.input.width - pad_x * 2.0).max(1.0),
+                height: (layout.input.height - pad_y * 2.0).max(1.0),
+            }
         };
 
         unsafe {
@@ -3088,16 +3170,24 @@ impl App {
         }
     }
 
-    fn show_omnibox(&self, visible: bool) {
+    fn set_omnibox_visibility(&self, visible: bool, focus: bool) {
         let Some(edit) = self.omnibox else {
             return;
         };
         unsafe {
             ShowWindow(edit, if visible { SW_SHOW } else { SW_HIDE });
-            if visible {
+            if visible && focus {
                 SetFocus(edit);
             }
         }
+    }
+
+    fn show_omnibox(&self, visible: bool) {
+        self.set_omnibox_visibility(visible, visible);
+    }
+
+    fn show_omnibox_passive(&self, visible: bool) {
+        self.set_omnibox_visibility(visible, false);
     }
 
     fn omnibox_text(&self) -> String {
@@ -3114,8 +3204,6 @@ impl App {
     /// Sai do ecra completo. Faltava em quase todas as saidas: bastava um login
     /// ou um Esc para a janela ficar sem barra de titulo e sem forma de voltar.
     fn leave_fullscreen(&mut self) {
-        self.chrome_revealed = false;
-        self.chrome_token = self.chrome_token.wrapping_add(1);
         if let Some(window) = &self.window {
             window.set_fullscreen(None);
         }
@@ -3153,6 +3241,11 @@ impl App {
         }
 
         if let Some(button) = self.exit_button.take() {
+            unsafe {
+                DestroyWindow(button);
+            }
+        }
+        if let Some(button) = self.home_button.take() {
             unsafe {
                 DestroyWindow(button);
             }
@@ -4080,7 +4173,8 @@ impl App {
         if !reuse_comparator {
             self.destroy_web_surfaces();
         }
-        self.show_omnibox(false);
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
 
         let google_url = match google_ai_url(query, &self.config.language) {
             Ok(u) => u,
@@ -4233,6 +4327,9 @@ impl App {
             self.sync_comparator_buttons();
         }
         self.sync_exit_button();
+        self.sync_home_button();
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
 
         for delay_ms in COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS {
             self.timers.after(
@@ -4296,8 +4393,6 @@ impl App {
             }
         }
         self.bar_hover = None;
-        self.chrome_revealed = false;
-        self.chrome_token = self.chrome_token.wrapping_add(1);
         self.needs_clear = true;
 
         // Ecra completo a serio: sem barra de titulo, sem minimizar/fechar.
@@ -4313,6 +4408,13 @@ impl App {
         self.sync_comparator_splitters();
         self.sync_comparator_buttons();
         self.sync_exit_button();
+        self.sync_home_button();
+        if self.is_fullscreen_column() {
+            self.show_omnibox_passive(false);
+        } else {
+            self.show_omnibox_passive(true);
+            self.position_omnibox();
+        }
         self.request_redraw();
     }
 
@@ -4363,13 +4465,14 @@ impl App {
         }
 
         self.bar_hover = None;
-        self.chrome_revealed = false;
-        self.chrome_token = self.chrome_token.wrapping_add(1);
         self.needs_clear = true;
         self.update_comparator_layout();
         self.sync_comparator_splitters();
         self.sync_comparator_buttons();
         self.sync_exit_button();
+        self.sync_home_button();
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
         self.request_redraw();
     }
 
@@ -4377,8 +4480,6 @@ impl App {
         if let Some(comp) = &mut self.comparator {
             comp.expanded = None;
         }
-        self.chrome_revealed = false;
-        self.chrome_token = self.chrome_token.wrapping_add(1);
         if let Some(window) = &self.window {
             window.set_fullscreen(None);
         }
@@ -4386,6 +4487,9 @@ impl App {
         self.sync_comparator_splitters();
         self.sync_comparator_buttons();
         self.sync_exit_button();
+        self.sync_home_button();
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
         self.request_redraw();
     }
 
@@ -4453,24 +4557,15 @@ impl App {
 
         match comp.expanded {
             Some(idx) => {
-                // Ecra completo. A coluna ocupa tudo menos uma faixa de 1px no
-                // topo: o WebView e uma janela filha e engole o rato, por isso
-                // sem essa faixa a aplicacao nunca saberia que o rato subiu ao
-                // topo para chamar a barra de volta.
-                let (top, height) = if self.chrome_revealed {
-                    (
-                        COMPARATOR_CHROME_HEIGHT,
-                        (logical_h - COMPARATOR_CHROME_HEIGHT).max(1.0),
-                    )
-                } else {
-                    (1.0, (logical_h - 1.0).max(1.0))
-                };
-
+                // Fullscreen fica geometricamente estavel. A versao anterior
+                // mudava o bounds do WebView toda vez que o cursor tocava o
+                // topo para mostrar/esconder chrome, causando flicker e pump
+                // de layout em cascata no WebView2.
                 for (i, v) in comp.views.iter().enumerate() {
                     if i == idx {
                         let _ = v.webview.set_bounds(wry::Rect {
-                            position: LogicalPosition::new(0.0, top).into(),
-                            size: LogicalSize::new(logical_w, height).into(),
+                            position: LogicalPosition::new(0.0, 0.0).into(),
+                            size: LogicalSize::new(logical_w, logical_h.max(1.0)).into(),
                         });
                         let _ = v.webview.set_visible(true);
                     } else {
@@ -5542,7 +5637,12 @@ impl App {
 
     /// O equivalente ao Ctrl+L do Chrome: volta a barra e seleciona o texto.
     fn focus_omnibox(&mut self) {
-        self.show_home();
+        if self.surface != Surface::Comparator {
+            self.show_home();
+        } else {
+            self.show_omnibox_passive(true);
+            self.position_omnibox();
+        }
         if let Some(edit) = self.omnibox {
             unsafe {
                 SetFocus(edit);
@@ -5723,12 +5823,12 @@ impl App {
             .is_some_and(|comp| comp.expanded.is_some())
     }
 
-    /// Em tres colunas a barra esta sempre la; em ecra completo so enquanto o
-    /// rato a chamar.
+    /// Em tres colunas a barra fica estavel. Em fullscreen ela desaparece e
+    /// a saida fica por conta do botao nativo flutuante.
     fn bar_visible(&self) -> bool {
         match &self.comparator {
             Some(comp) if comp.split.is_some() => true,
-            Some(comp) => comp.expanded.is_none() || self.chrome_revealed,
+            Some(comp) => comp.expanded.is_none(),
             None => false,
         }
     }
@@ -5748,14 +5848,96 @@ impl App {
         ))
     }
 
+    /// Home nativo da barra. O desenho da barra continua existindo por baixo,
+    /// mas o clique pertence a uma janela Win32 real, acima de qualquer filho
+    /// WebView2. Assim o controlo nao depende do foco nem da entrega de eventos
+    /// do winit para voltar à Home.
+    fn sync_home_button(&mut self) {
+        let wanted = self.surface == Surface::Comparator && !self.is_fullscreen_column();
+        if !wanted {
+            if let Some(button) = self.home_button.take() {
+                unsafe {
+                    DestroyWindow(button);
+                }
+            }
+            return;
+        }
+
+        let (Some(window), Some(layout)) = (&self.window, self.bar_layout()) else {
+            return;
+        };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let rect = layout.home;
+        if rect.width <= 0.0 || rect.height <= 0.0 {
+            return;
+        }
+
+        if self.home_button.is_none() {
+            unsafe {
+                let created = CreateWindowExW(
+                    0,
+                    windows_sys::w!("STATIC"),
+                    windows_sys::w!(""),
+                    WS_CHILD | WS_VISIBLE,
+                    rect.x.round() as i32,
+                    rect.y.round() as i32,
+                    rect.width.round() as i32,
+                    rect.height.round() as i32,
+                    owner,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                );
+                if created.is_null() {
+                    return;
+                }
+                let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
+                if SetWindowSubclass(
+                    created,
+                    Some(home_button_subclass),
+                    HOME_BUTTON_SUBCLASS_ID,
+                    proxy_ptr,
+                ) == 0
+                {
+                    DestroyWindow(created);
+                    return;
+                }
+                let width = rect.width.round() as i32;
+                let height = rect.height.round() as i32;
+                let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, height, height);
+                if !region.is_null() {
+                    SetWindowRgn(created, region, 1);
+                }
+                self.home_button = Some(created);
+            }
+        }
+
+        if let Some(button) = self.home_button {
+            unsafe {
+                SetWindowPos(
+                    button,
+                    std::ptr::null_mut(),
+                    rect.x.round() as i32,
+                    rect.y.round() as i32,
+                    rect.width.round() as i32,
+                    rect.height.round() as i32,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                ShowWindow(button, SW_SHOW);
+                InvalidateRect(button, std::ptr::null(), 1);
+            }
+        }
+    }
+
     /// Cria/mostra/esconde o botao flutuante de saida. Existe apenas enquanto
     /// houver uma coluna em ecra completo -- e a unica saida sempre visivel,
     /// porque a barra de titulo desapareceu e a barra da app auto-esconde-se.
     fn sync_exit_button(&mut self) {
-        // Acompanha a barra: aparece quando o rato a chama e desaparece com ela.
-        let wanted = self.surface == Surface::Comparator
-            && self.is_fullscreen_column()
-            && self.chrome_revealed;
+        // Em fullscreen e o controlo nativo permanente de saida. Nao depende
+        // de hover nem de redimensionar o WebView.
+        let wanted = self.surface == Surface::Comparator && self.is_fullscreen_column();
 
         if !wanted {
             if let Some(button) = self.exit_button.take() {
@@ -5864,50 +6046,6 @@ impl App {
                 ShowWindow(button, SW_HIDE);
             }
         }
-    }
-
-    /// Mostra a barra e marca-a para desaparecer sozinha. Cada chamada invalida
-    /// o temporizador anterior, por isso ela fica enquanto o rato la andar.
-    fn reveal_chrome(&mut self) {
-        // Adiar e so escrever um numero; o rato mexe-se centenas de vezes por
-        // segundo e nao se agenda nada por movimento.
-        self.chrome_deadline = now_ms() + CHROME_HIDE_DELAY_MS;
-
-        if self.chrome_revealed {
-            return;
-        }
-
-        self.chrome_revealed = true;
-        self.chrome_token = self.chrome_token.wrapping_add(1);
-        self.timers.after(
-            Duration::from_millis(CHROME_HIDE_DELAY_MS),
-            UserEvent::HideChrome(self.chrome_token),
-        );
-
-        self.update_comparator_layout();
-        self.sync_exit_button();
-        self.request_redraw();
-    }
-
-    fn hide_chrome(&mut self, token: u64) {
-        if token != self.chrome_token || !self.chrome_revealed {
-            return;
-        }
-        // O rato empurrou o prazo desde que este pedido foi agendado: em vez
-        // de sondar, reagenda-se exactamente o que falta, com o mesmo token.
-        let remaining = self.chrome_deadline.saturating_sub(now_ms());
-        if remaining > 0 {
-            self.timers.after(
-                Duration::from_millis(remaining),
-                UserEvent::HideChrome(token),
-            );
-            return;
-        }
-        self.chrome_revealed = false;
-        self.bar_hover = None;
-        self.update_comparator_layout();
-        self.sync_exit_button();
-        self.request_redraw();
     }
 
     fn hide_comparator_splitters(&self) {
@@ -7385,9 +7523,8 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::AgentObservation(page) => {
                 self.handle_agent_observation(page);
             }
-            UserEvent::HideChrome(token) => self.hide_chrome(token),
             UserEvent::SubmitText(input) => {
-                if self.surface == Surface::Home {
+                if surface_accepts_omnibox_submit(self.surface) {
                     let input = input.trim().to_string();
                     if !input.is_empty() {
                         self.handle_input(input);
@@ -7463,6 +7600,13 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_comparator_splitters();
                     self.sync_comparator_buttons();
                     self.sync_exit_button();
+                    self.sync_home_button();
+                    if self.is_fullscreen_column() {
+                        self.show_omnibox_passive(false);
+                    } else {
+                        self.show_omnibox_passive(true);
+                        self.position_omnibox();
+                    }
                     if lifecycle_probe_enabled() {
                         LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
                     }
@@ -7577,6 +7721,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.update_comparator_layout();
                     self.sync_comparator_splitters();
                     self.sync_exit_button();
+                    self.sync_home_button();
+                    self.position_omnibox();
                     self.position_palette();
                     self.request_redraw();
                 }
@@ -7595,19 +7741,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
-                if self.surface == Surface::Comparator {
-                    if self.is_fullscreen_column() {
-                        let scale = self
-                            .window
-                            .as_ref()
-                            .map(|window| window.scale_factor().max(1.0))
-                            .unwrap_or(1.0);
-                        // Ou o rato encostou ao topo, ou ja esta sobre a barra
-                        // revelada -- em qualquer dos casos ela fica.
-                        if self.chrome_revealed || position.y <= 2.0 * scale {
-                            self.reveal_chrome();
-                        }
-                    }
+                if self.surface == Surface::Comparator && self.bar_visible() {
                     self.update_bar_hover();
                 }
             }
@@ -8690,6 +8824,17 @@ unsafe fn paint_comparator_bar_with_contexts(
         theme.bar_bg,
     );
 
+    let search = comparator_omnibox_rect(width as f64, scale);
+    draw_pill(
+        target,
+        search,
+        "",
+        PillStyle::new(theme.surface, theme.surface_line, theme.fg),
+        scale,
+        tab_font,
+        theme.bar_bg,
+    );
+
     // Abas/fontes na mesma faixa dos botoes de janela.
     for (index, source_contexts) in contexts.iter().enumerate().take(layout.columns_len) {
         let brand = theme.brand(index);
@@ -9440,6 +9585,33 @@ mod tests {
                     layout.add_tabs[index]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn native_home_button_accepts_the_mouse() {
+        unsafe {
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!(""),
+                WS_POPUP,
+                0,
+                0,
+                80,
+                30,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!hwnd.is_null(), "o Home nativo tem de nascer");
+            let subclassed =
+                SetWindowSubclass(hwnd, Some(home_button_subclass), HOME_BUTTON_SUBCLASS_ID, 0);
+            let hit = SendMessageW(hwnd, WM_NCHITTEST, 0, 0);
+            DestroyWindow(hwnd);
+            assert_ne!(subclassed, 0);
+            assert_eq!(hit, HTCLIENT as LRESULT);
         }
     }
 
@@ -10975,6 +11147,9 @@ mod tests {
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("button.click()"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("form.requestSubmit"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("lastSubmitAt"));
+        assert!(AI_AUTO_SUBMIT_SCRIPT.contains("neuralia:pending-query:"));
+        assert!(AI_AUTO_SUBMIT_SCRIPT.contains("if (host === 'claude.ai') return false"));
+        assert!(AI_AUTO_SUBMIT_SCRIPT.contains("storageRemove(pendingKey)"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("setTimeout(submitWhenReady, 150)"));
     }
 
@@ -11799,6 +11974,53 @@ mod tests {
                 "{from} nao pode pousar sobre as outras aplicacoes"
             );
         }
+    }
+
+    #[test]
+    fn native_controls_follow_the_effective_hwnd_after_decoration_changes() {
+        let source = include_str!("windows_app.rs");
+        let body = source
+            .split("fn ensure_window_subclass")
+            .nth(1)
+            .and_then(|part| part.split("fn create_omnibox").next())
+            .expect("ensure_window_subclass body");
+        assert!(body.contains("GetParent(child) != parent"));
+        assert!(body.contains("SetParent(child, parent)"));
+        assert!(body.contains("self.omnibox"));
+        assert!(body.contains("self.home_button"));
+    }
+
+    #[test]
+    fn fullscreen_column_has_stable_chrome_policy() {
+        let source = include_str!("windows_app.rs");
+        let layout = source
+            .split("fn update_comparator_layout")
+            .nth(1)
+            .and_then(|part| part.split("fn column_ipc_event_impl").next())
+            .expect("layout body");
+        assert!(!layout.contains("chrome_revealed"));
+        assert!(layout.contains("LogicalPosition::new(0.0, 0.0)"));
+
+        let exit = source
+            .split("fn sync_exit_button")
+            .nth(1)
+            .and_then(|part| part.split("fn position_exit_button").next())
+            .expect("exit button body");
+        assert!(exit.contains("self.is_fullscreen_column()"));
+        assert!(!exit.contains("chrome_revealed"));
+    }
+
+    #[test]
+    fn comparator_keeps_a_real_omnibox_without_covering_window_controls() {
+        let rect = comparator_omnibox_rect(1600.0, 1.0);
+        assert!(rect.width >= 300.0);
+        assert!(rect.x >= 90.0);
+        assert!(rect.x + rect.width < 1600.0 - 3.0 * 46.0);
+        assert!(surface_accepts_omnibox_submit(Surface::Home));
+        assert!(surface_accepts_omnibox_submit(Surface::Comparator));
+        assert!(!surface_accepts_omnibox_submit(Surface::External));
+        assert!(!surface_accepts_omnibox_submit(Surface::Reader));
+        assert!(!surface_accepts_omnibox_submit(Surface::Pdf));
     }
 
     #[test]
@@ -13008,21 +13230,44 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
   if (window.top !== window) return;
   const host = location.hostname.toLowerCase();
   if (host !== 'chatgpt.com' && host !== 'claude.ai') return;
-  const query = new URL(location.href).searchParams.get('q');
-  if (!query || !query.trim()) return;
 
-  // O acesso ao sessionStorage pode LANCAR -- armazenamento particionado,
-  // cookies de terceiros bloqueados, modo restrito. Sem rede, um throw aqui
-  // ao nivel de topo abortava o script todo.
-  function stampRead(key) {
-    try { return Number(sessionStorage.getItem(key) || '0'); } catch (_) { return 0; }
+  // Claude pode redireccionar /new?q=... antes de o compositor ficar pronto.
+  // Guardamos a consulta no sessionStorage no primeiro documento e retomamos
+  // no seguinte. Assim o auto-submit nao depende de o fornecedor preservar o
+  // parametro q durante toda a montagem da SPA.
+  function storageRead(key) {
+    try { return String(sessionStorage.getItem(key) || ''); } catch (_) { return ''; }
   }
-  function stampWrite(key, value) {
+  function storageWrite(key, value) {
     try { sessionStorage.setItem(key, String(value)); } catch (_) {}
   }
+  function storageRemove(key) {
+    try { sessionStorage.removeItem(key); } catch (_) {}
+  }
+  function stampRead(key) {
+    return Number(storageRead(key) || '0');
+  }
+  function stampWrite(key, value) {
+    storageWrite(key, value);
+  }
+
+  let urlQuery = '';
+  try { urlQuery = String(new URL(location.href).searchParams.get('q') || '').trim(); } catch (_) {}
+  const pendingKey = 'neuralia:pending-query:' + host;
+  if (urlQuery) storageWrite(pendingKey, urlQuery);
+  const query = (urlQuery || storageRead(pendingKey)).trim();
+  if (!query) return;
 
   const stampKey = 'neuralia:auto-submit:' + host + ':' + query;
-  if (Date.now() - stampRead(stampKey) < 10000) return;
+  if (Date.now() - stampRead(stampKey) < 10000) {
+    storageRemove(pendingKey);
+    return;
+  }
+
+  function finish() {
+    stampWrite(stampKey, Date.now());
+    storageRemove(pendingKey);
+  }
 
   const EDITORS = 'div[contenteditable="true"][role="textbox"], div[contenteditable="true"], [data-testid="prompt-textarea"], textarea';
 
@@ -13086,7 +13331,7 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
   function sendButton() {
     const selectors = host === 'chatgpt.com'
       ? ['button[data-testid="send-button"]', 'button[aria-label*="Send prompt"]', 'button[aria-label*="Send message"]', 'button[aria-label*="Enviar"]', 'form button[type="submit"]']
-      : ['button[aria-label*="Send"]', 'button[aria-label*="Enviar"]', 'button[data-testid*="send"]', 'form button[type="submit"]'];
+      : ['button[data-testid="send-button"]', 'button[aria-label*="Send"]', 'button[aria-label*="Enviar"]', 'button[data-testid*="send"]', 'form button[type="submit"]'];
     for (const selector of selectors) {
       const button = document.querySelector(selector);
       if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') continue;
@@ -13109,6 +13354,10 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
   // DOM obrigava a conhecer os seletores de cada um -- e o ChatGPT tem pelo
   // menos duas variantes (ligado e desligado) com marcadores diferentes.
   function consumed() {
+    // No ChatGPT o desaparecimento de q e um sinal real de submissao. No
+    // Claude e apenas parte do redirect de /new para a SPA, portanto nao pode
+    // encerrar o auto-submit antes de o compositor sequer existir.
+    if (host === 'claude.ai') return false;
     try {
       return new URL(location.href).searchParams.get('q') !== query;
     } catch (_) {
@@ -13170,7 +13419,7 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
     attempts += 1;
 
     if (consumed()) {
-      stampWrite(stampKey, Date.now());
+      finish();
       return;
     }
 
@@ -13179,7 +13428,7 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
     // Depois de uma tentativa, o compositor vazio e o melhor reconhecimento
     // transversal de que o site aceitou a pergunta. Nao ha novo clique.
     if (lastSubmitAt && el && !textOf(el)) {
-      stampWrite(stampKey, Date.now());
+      finish();
       return;
     }
 
@@ -13219,6 +13468,7 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
     // enviado, a pergunta nao pode ficar la a fingir que o utilizador a
     // escreveu.
     if (filled) clear(el || editor());
+    storageRemove(pendingKey);
   }
 
   if (document.readyState === 'loading') {
