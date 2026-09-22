@@ -220,7 +220,7 @@ public static class NeuraliaCycleWindowProbe {
         EnumWindows(delegate(IntPtr top, IntPtr data) {
             uint ownerPid;
             GetWindowThreadProcessId(top, out ownerPid);
-            if (ownerPid == processId && PostMessage(top, message, IntPtr.Zero, IntPtr.Zero)) {
+            if (ownerPid == processId && PostMessage(top, message, new IntPtr(nonce), IntPtr.Zero)) {
                 posted = true;
             }
             return true;
