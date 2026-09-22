@@ -7554,11 +7554,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_comparator_buttons();
                     self.sync_exit_button();
                     self.sync_home_button();
-                    if self.is_fullscreen_column() {
-                        self.show_omnibox_passive(false);
-                    } else {
-                        self.show_omnibox_passive(false);
-                    }
+                    self.show_omnibox_passive(false);
                     if lifecycle_probe_enabled() {
                         LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
                     }
