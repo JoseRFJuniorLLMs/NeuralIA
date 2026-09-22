@@ -2830,6 +2830,33 @@ struct BrowserAgentState {
     trace: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeControlPlan {
+    omnibox: bool,
+    home_button: bool,
+    caption_buttons: bool,
+}
+
+fn native_control_plan(surface: Surface) -> NativeControlPlan {
+    match surface {
+        Surface::Home => NativeControlPlan {
+            omnibox: true,
+            home_button: false,
+            caption_buttons: false,
+        },
+        Surface::Comparator => NativeControlPlan {
+            omnibox: false,
+            home_button: true,
+            caption_buttons: true,
+        },
+        Surface::Reader | Surface::External | Surface::Pdf => NativeControlPlan {
+            omnibox: false,
+            home_button: false,
+            caption_buttons: false,
+        },
+    }
+}
+
 struct App {
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Window>,
@@ -3096,11 +3123,20 @@ impl App {
         let Some(parent) = window_hwnd(window) else {
             return;
         };
-        let children = match self.surface {
-            Surface::Home => [self.omnibox, None, None],
-            Surface::Comparator => [None, self.home_button, self.caption_buttons],
-            _ => [None, None, None],
-        };
+        let plan = native_control_plan(self.surface);
+        let children = [
+            if plan.omnibox { self.omnibox } else { None },
+            if plan.home_button {
+                self.home_button
+            } else {
+                None
+            },
+            if plan.caption_buttons {
+                self.caption_buttons
+            } else {
+                None
+            },
+        ];
         unsafe {
             for child in children.into_iter().flatten() {
                 if GetParent(child) != parent {
@@ -12128,21 +12164,33 @@ mod tests {
     }
 
     #[test]
-    fn native_controls_follow_the_effective_hwnd_after_decoration_changes() {
-        let source = include_str!("windows_app.rs");
-        let body = source
-            .split("fn reparent_native_controls")
-            .nth(1)
-            .and_then(|part| part.split("fn create_omnibox").next())
-            .expect("reparent_native_controls body");
-        assert!(body.contains("GetParent(child) != parent"));
-        assert!(body.contains("SetParent(child, parent)"));
-        assert!(body.contains("Surface::Home => [self.omnibox"));
-        assert!(
-            body.contains("Surface::Comparator => [None, self.home_button, self.caption_buttons]")
+    fn native_control_reparent_policy_never_moves_hidden_home_edit_into_comparator() {
+        assert_eq!(
+            native_control_plan(Surface::Home),
+            NativeControlPlan {
+                omnibox: true,
+                home_button: false,
+                caption_buttons: false,
+            }
         );
-        assert!(body.contains("self.home_button"));
-        assert!(body.contains("self.caption_buttons"));
+        assert_eq!(
+            native_control_plan(Surface::Comparator),
+            NativeControlPlan {
+                omnibox: false,
+                home_button: true,
+                caption_buttons: true,
+            }
+        );
+        for surface in [Surface::Reader, Surface::External, Surface::Pdf] {
+            assert_eq!(
+                native_control_plan(surface),
+                NativeControlPlan {
+                    omnibox: false,
+                    home_button: false,
+                    caption_buttons: false,
+                }
+            );
+        }
     }
 
     #[test]
