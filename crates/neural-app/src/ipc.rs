@@ -571,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_covers_twenty_five_real_actions() {
+    fn protocol_covers_twenty_six_real_actions() {
         let messages = [
             message("home", json!({})),
             message("back", json!({})),
