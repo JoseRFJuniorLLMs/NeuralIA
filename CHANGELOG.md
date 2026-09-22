@@ -14,6 +14,8 @@ All notable changes to NeuralIA are documented here.
 - **PR #133 — identidade e grupos:** abas recebem identidade estável independente da URL; URLs iguais em grupos diferentes não fecham nem realçam o Split errado; a poda de 32 abas remove grupos que fiquem órfãos.
 - **PR #133 — atalhos por foco:** Ctrl+R, Ctrl+P, F12 e Ctrl+U atuam na WebView que recebeu o gesto; F11 respeita a coluna atual; 1/2/3 continuam globais através de `shortcut-expand` sem ampliar a autoridade do `expand` vindo do DOM; Ctrl+L no Split volta à IA de origem.
 - **PR #133 — cliques e Split:** duplo clique em links/controles não expande a coluna junto com a ação do elemento; uma troca de Split só substitui o painel anterior depois de o novo WebView existir, preserva o estado em falha e descarta builds que terminem depois de outra navegação.
+- **PR #133 — controles nativos:** minimizar/maximizar/fechar e Home só executam quando press e release pertencem ao mesmo controle; perda/cancelamento de captura limpa o estado pendente.
+- **PR #133 — menu de grupos:** “Juntar ao grupo” deixa de oferecer o próprio grupo atual da aba, evitando reordenação sem efeito.
 
 ### Security
 - **PR #128 / SPEC-0109:** câmera, microfone e captura de tela passam pelo consentimento nativo do WebView2 apenas em superfícies visíveis; agente e demais permissões continuam `Deny`.
@@ -21,7 +23,8 @@ All notable changes to NeuralIA are documented here.
 
 ### Testing
 - **PR #128:** gates de comportamento cobrem escopo de grupos, poda de grupos vazios, omnibox desabilitada fora da Home, fallback CSPRNG e política WebRTC.
-- **PR #133:** matriz determinística de 100 cenários cobre 5 larguras × 4 escalas de DPI × 5 topologias, além de gates de bordas de clique, alvo por foco, troca transacional de Split e duplo clique em elementos interativos.
+- **PR #133:** matriz determinística de 100 cenários cobre 5 larguras × 4 escalas de DPI × 5 topologias, além de gates de bordas de clique, alvo por foco, troca transacional de Split, press→release nativo, menu de grupos e duplo clique em elementos interativos.
+- **PR #133 — sabotagem automática:** o job Windows reintroduz temporariamente seis regressões Rust e uma regressão JS no checkout do runner, exige os gates vermelhos, restaura os bytes originais e repete os gates verdes antes de prosseguir.
 
 ## [2.1.4] - 2026-09-22
 
