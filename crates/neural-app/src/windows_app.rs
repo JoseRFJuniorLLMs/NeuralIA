@@ -7597,7 +7597,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.sync_home_button();
             self.sync_caption_buttons();
             self.show_omnibox_passive(true);
-        self.position_omnibox();
+            self.position_omnibox();
             LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
             self.request_redraw();
         }
@@ -7786,7 +7786,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_home_button();
                     self.sync_caption_buttons();
                     self.show_omnibox_passive(true);
-        self.position_omnibox();
+                    self.position_omnibox();
                     self.request_redraw();
                 }
             }
