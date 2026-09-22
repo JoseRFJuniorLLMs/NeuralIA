@@ -860,6 +860,9 @@ struct SplitView {
     webview: WebView,
     source_index: usize,
     url: String,
+    /// Identidade da aba que originou este Split. URL nao e identidade:
+    /// a mesma fonte pode existir em dois grupos diferentes.
+    context_id: Option<u64>,
     fullscreen: bool,
     private: bool,
 }
@@ -921,6 +924,9 @@ struct ContextGroup {
 /// grupo no meio nao pode renumerar as abas dos outros.
 #[derive(Debug, Clone)]
 struct ContextTab {
+    /// Identidade estavel. A URL pode repetir em grupos diferentes e por isso
+    /// nunca serve para decidir qual aba esta aberta ou deve ser fechada.
+    id: u64,
     url: String,
     group: Option<u64>,
 }
@@ -1091,6 +1097,51 @@ fn prune_empty_groups(tabs: &[ContextTab], groups: &mut Vec<ContextGroup>) {
     groups.retain(|group| tabs.iter().any(|tab| tab.group == Some(group.id)));
 }
 
+/// Guarda uma nova aba de contexto e devolve a sua identidade estavel. Se a
+/// ultima aba ja e a mesma URL, reutiliza-a; ao aplicar o limite, poda tambem
+/// o grupo que eventualmente ficou sem o seu ultimo membro.
+fn remember_context_tab(
+    tabs: &mut Vec<ContextTab>,
+    groups: &mut Vec<ContextGroup>,
+    next_id: &mut u64,
+    url: String,
+) -> u64 {
+    if let Some(last) = tabs.last()
+        && last.url == url
+    {
+        return last.id;
+    }
+
+    let id = *next_id;
+    *next_id = next_id.wrapping_add(1).max(1);
+    tabs.push(ContextTab {
+        id,
+        url,
+        group: None,
+    });
+    if tabs.len() > 32 {
+        tabs.remove(0);
+        prune_empty_groups(tabs, groups);
+    }
+    id
+}
+
+/// Decide se uma coluna ainda pode ser minimizada sem esconder todas as IAs.
+/// Esta decisao acontece ANTES de fechar um Split ativo: um clique rejeitado
+/// nao pode destruir estado que o utilizador tinha aberto.
+fn can_minimize_column(
+    minimized: &[bool; COMPARATOR_COLUMNS],
+    columns: usize,
+    index: usize,
+) -> bool {
+    index < columns
+        && !minimized[index]
+        && (0..columns.min(COMPARATOR_COLUMNS))
+            .filter(|slot| !minimized[*slot])
+            .count()
+            > 1
+}
+
 /// Fecha as outras abas do MESMO escopo da aba selecionada. Um grupo real
 /// usa o seu id; abas soltas partilham o escopo `None`. Abas de outros grupos
 /// nunca sao tocadas.
@@ -1154,6 +1205,8 @@ struct ComparatorState {
     groups: [Vec<ContextGroup>; COMPARATOR_COLUMNS],
     /// Contador dos ids de grupo. Nunca reutiliza.
     next_group_id: u64,
+    /// Contador das identidades de abas. Nunca reutiliza durante a sessao.
+    next_context_id: u64,
 }
 
 /// Janelas da palette nativa: o popup que desenha a caixa e o EDIT onde o
@@ -1292,9 +1345,12 @@ fn resized_weights(
 /// a uma fraccao fixa da altura util abaixo da barra, nunca mais larga que a
 /// coluna menos as margens.
 fn palette_geometry(span: ColumnSpan, logical_h: f64) -> UiRect {
-    let width = PALETTE_MAX_WIDTH
-        .min(span.width - 48.0)
-        .max(PALETTE_MIN_WIDTH);
+    let available = (span.width - 48.0).max(1.0);
+    let width = if available < PALETTE_MIN_WIDTH {
+        available
+    } else {
+        available.min(PALETTE_MAX_WIDTH)
+    };
     let content_h = (logical_h - COMPARATOR_CHROME_HEIGHT).max(100.0);
     UiRect {
         x: span.x + (span.width - width) / 2.0,
@@ -4474,6 +4530,7 @@ impl App {
             contexts: std::array::from_fn(|_| Vec::new()),
             groups: std::array::from_fn(|_| Vec::new()),
             next_group_id: 1,
+            next_context_id: 1,
         });
         self.activate_comparator(true);
     }
@@ -4580,6 +4637,20 @@ impl App {
             return;
         }
 
+        let can_minimize = self.comparator.as_ref().is_some_and(|comp| {
+            can_minimize_column(&comp.minimized, comp.views.len(), idx)
+        });
+        if !can_minimize {
+            self.show_splash(
+                "Pelo menos um painel precisa continuar visível.".to_string(),
+                2,
+            );
+            return;
+        }
+
+        // So agora a operacao foi validada. Antes, um pedido impossivel para a
+        // ultima coluna visivel fechava a fonte lateral e depois dizia que nao
+        // podia minimizar: o clique rejeitado destruia estado.
         if self
             .comparator
             .as_ref()
@@ -4589,32 +4660,12 @@ impl App {
         }
 
         let mut was_expanded = false;
-        let mut changed = false;
         if let Some(comp) = &mut self.comparator
             && idx < comp.views.len()
         {
-            let visible = comp
-                .views
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| !comp.minimized[*index])
-                .count();
-
-            // Mantemos sempre pelo menos uma IA visível.
-            if !comp.minimized[idx] && visible > 1 {
-                was_expanded = comp.expanded == Some(idx);
-                comp.expanded = None;
-                comp.minimized[idx] = true;
-                changed = true;
-            }
-        }
-
-        if !changed {
-            self.show_splash(
-                "Pelo menos um painel precisa continuar visível.".to_string(),
-                2,
-            );
-            return;
+            was_expanded = comp.expanded == Some(idx);
+            comp.expanded = None;
+            comp.minimized[idx] = true;
         }
 
         if was_expanded && let Some(window) = &self.window {
@@ -5008,7 +5059,7 @@ impl App {
     }
 
     fn open_split(&mut self, source_index: usize, url: String, allow_local: bool) {
-        self.open_split_mode(source_index, url, allow_local, false);
+        self.open_split_mode(source_index, url, allow_local, false, None);
     }
 
     fn open_split_mode(
@@ -5017,6 +5068,7 @@ impl App {
         url: String,
         allow_local: bool,
         private: bool,
+        existing_context_id: Option<u64>,
     ) {
         if self.surface != Surface::Comparator {
             self.web(url);
@@ -5107,23 +5159,29 @@ impl App {
             Ok(webview) => {
                 let _ = webview.zoom(self.zoom);
                 if let Some(comp) = &mut self.comparator {
-                    if !private {
-                        let links = &mut comp.contexts[source_index];
-                        let value = valid.to_string();
-                        if links.last().map(|tab| tab.url.as_str()) != Some(value.as_str()) {
-                            links.push(ContextTab {
-                                url: value,
-                                group: None,
-                            });
-                            if links.len() > 32 {
-                                links.remove(0);
-                            }
-                        }
-                    }
+                    let context_id = if private {
+                        None
+                    } else if let Some(id) = existing_context_id {
+                        Some(id)
+                    } else {
+                        let ComparatorState {
+                            contexts,
+                            groups,
+                            next_context_id,
+                            ..
+                        } = comp;
+                        Some(remember_context_tab(
+                            &mut contexts[source_index],
+                            &mut groups[source_index],
+                            next_context_id,
+                            valid.to_string(),
+                        ))
+                    };
                     comp.split = Some(SplitView {
                         webview,
                         source_index,
                         url: valid.to_string(),
+                        context_id,
                         fullscreen: false,
                         private,
                     });
@@ -5159,6 +5217,7 @@ impl App {
             "https://www.google.com/".to_string(),
             false,
             true,
+            None,
         );
     }
 
@@ -5239,13 +5298,13 @@ impl App {
             // abre privada: open_split_mode(private) nao grava memoria nem
             // abas.
             PaletteRoute::OpenSplit { url, private } => {
-                self.open_split_mode(source_index, url.to_string(), true, private);
+                self.open_split_mode(source_index, url.to_string(), true, private, None);
             }
             // Painel privado: a pergunta abre como fonte privada, nunca na
             // coluna normal (cookies normais) e nunca no historico.
             PaletteRoute::OpenPrivateProvider { query } => {
                 match self.provider_query_url(source_index, &query) {
-                    Ok(url) => self.open_split_mode(source_index, url.to_string(), false, true),
+                    Ok(url) => self.open_split_mode(source_index, url.to_string(), false, true, None),
                     Err(error) => self.show_splash(error.to_string(), 3),
                 }
             }
@@ -6761,17 +6820,21 @@ impl App {
         }
     }
 
-    fn context_tab_url(&self, source_index: usize, context_index: usize) -> Option<String> {
+    fn context_tab_identity(
+        &self,
+        source_index: usize,
+        context_index: usize,
+    ) -> Option<(u64, String)> {
         self.comparator
             .as_ref()
             .and_then(|comp| comp.contexts.get(source_index))
             .and_then(|tabs| tabs.get(context_index))
-            .map(|tab| tab.url.clone())
+            .map(|tab| (tab.id, tab.url.clone()))
     }
 
     fn open_context_tab(&mut self, source_index: usize, context_index: usize) {
-        if let Some(url) = self.context_tab_url(source_index, context_index) {
-            self.open_split(source_index, url, false);
+        if let Some((context_id, url)) = self.context_tab_identity(source_index, context_index) {
+            self.open_split_mode(source_index, url, false, false, Some(context_id));
         }
     }
 
@@ -6787,14 +6850,16 @@ impl App {
     }
 
     fn close_context_tab(&mut self, source_index: usize, context_index: usize) {
-        let Some(url) = self.context_tab_url(source_index, context_index) else {
+        let Some((context_id, _url)) = self.context_tab_identity(source_index, context_index) else {
             return;
         };
         let closes_active = self
             .comparator
             .as_ref()
             .and_then(|comp| comp.split.as_ref())
-            .is_some_and(|split| split.source_index == source_index && split.url == url);
+            .is_some_and(|split| {
+                split.source_index == source_index && split.context_id == Some(context_id)
+            });
         if closes_active {
             self.close_split();
         }
@@ -6868,14 +6933,11 @@ impl App {
     }
 
     fn close_other_context_tabs(&mut self, source_index: usize, context_index: usize) {
-        let Some((scope, keep)) = self
+        let Some((scope, keep_id)) = self
             .comparator
             .as_ref()
             .and_then(|comp| comp.contexts.get(source_index))
-            .and_then(|tabs| {
-                tabs.get(context_index)
-                    .map(|tab| (tab.group, tab.url.clone()))
-            })
+            .and_then(|tabs| tabs.get(context_index).map(|tab| (tab.group, tab.id)))
         else {
             return;
         };
@@ -6885,10 +6947,12 @@ impl App {
             .and_then(|comp| comp.split.as_ref().map(|split| (comp, split)))
             .is_some_and(|(comp, split)| {
                 split.source_index == source_index
-                    && split.url != keep
-                    && comp.contexts[source_index]
-                        .iter()
-                        .any(|tab| tab.group == scope && tab.url == split.url)
+                    && split.context_id.is_some_and(|active_id| {
+                        active_id != keep_id
+                            && comp.contexts[source_index]
+                                .iter()
+                                .any(|tab| tab.id == active_id && tab.group == scope)
+                    })
             });
         if closes_active {
             self.close_split();
@@ -6919,9 +6983,11 @@ impl App {
             .and_then(|comp| comp.split.as_ref().map(|split| (comp, split)))
             .is_some_and(|(comp, split)| {
                 split.source_index == source_index
-                    && comp.contexts[source_index]
-                        .iter()
-                        .any(|tab| tab.group == scope && tab.url == split.url)
+                    && split.context_id.is_some_and(|active_id| {
+                        comp.contexts[source_index]
+                            .iter()
+                            .any(|tab| tab.id == active_id && tab.group == scope)
+                    })
             });
         if closes_active {
             self.close_split();
@@ -7835,7 +7901,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.open_split(source_index, url, false);
             }
             UserEvent::OpenPrivateSplit { source_index, url } => {
-                self.open_split_mode(source_index, url, false, true);
+                self.open_split_mode(source_index, url, false, true, None);
             }
             UserEvent::NewTab(index) => self.new_tab(index),
             UserEvent::CloseSplit => self.close_split(),
@@ -9021,7 +9087,7 @@ fn draw_comparator_bar(
             comp.split.as_ref().map(|split| {
                 (
                     split.source_index,
-                    split.url.as_str(),
+                    split.context_id,
                     split.fullscreen,
                     split.private,
                 )
@@ -9086,7 +9152,7 @@ unsafe fn paint_comparator_bar_with_contexts(
     columns: BarColumns,
     contexts: &[Vec<ContextTab>; COMPARATOR_COLUMNS],
     groups: &[Vec<ContextGroup>; COMPARATOR_COLUMNS],
-    active_context: Option<(usize, &str, bool, bool)>,
+    active_context: Option<(usize, Option<u64>, bool, bool)>,
     visible: bool,
     hover: Option<BarHit>,
     auto_scroll: bool,
@@ -9200,8 +9266,9 @@ unsafe fn paint_comparator_bar_with_contexts(
                 .and_then(|id| groups[index].iter().find(|group| group.id == id))
                 .map(|group| group.color.rgb())
                 .unwrap_or(brand);
-            let active = active_context
-                .is_some_and(|(source, active_url, _, _)| source == index && active_url == url);
+            let active = active_context.is_some_and(|(source, active_id, _, _)| {
+                source == index && active_id == Some(tab.id)
+            });
             let hovered = hover
                 == Some(BarHit::ContextTab {
                     source_index: index,
@@ -11826,10 +11893,57 @@ mod tests {
             },
             800.0,
         );
-        assert_eq!(narrow.width, PALETTE_MIN_WIDTH);
+        assert_eq!(narrow.width, 52.0);
+        assert_eq!(narrow.x, 724.0);
+        assert!(narrow.width <= 100.0);
 
         assert!(palette_hint("ChatGPT", false).contains("ChatGPT"));
         assert!(palette_hint("ChatGPT", true).contains("privado"));
+    }
+
+    #[test]
+    fn duplicate_urls_keep_distinct_tab_identity_across_groups() {
+        let mut tabs = vec![
+            tab("https://example.com/same", Some(10)),
+            tab("https://example.com/same", Some(20)),
+        ];
+        let first = tabs[0].id;
+        let second = tabs[1].id;
+        assert_ne!(first, second, "URL repetida nao pode colapsar identidades");
+
+        let mut groups = vec![group(10, false), group(20, false)];
+        assert!(close_context_tab_scope(&mut tabs, &mut groups, 0));
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].id, second);
+        assert_eq!(tabs[0].url, "https://example.com/same");
+        assert_eq!(tabs[0].group, Some(20));
+    }
+
+    #[test]
+    fn context_limit_prunes_group_orphaned_by_eviction() {
+        let mut tabs = vec![tab("https://old.example/", Some(77))];
+        let mut groups = vec![group(77, false)];
+        let mut next_id = 10_000;
+        for index in 0..32 {
+            let _ = remember_context_tab(
+                &mut tabs,
+                &mut groups,
+                &mut next_id,
+                format!("https://example.com/{index}"),
+            );
+        }
+        assert_eq!(tabs.len(), 32);
+        assert!(
+            groups.iter().all(|item| item.id != 77),
+            "o limite de abas deixou grupo sem membro"
+        );
+    }
+
+    #[test]
+    fn rejected_minimize_keeps_last_visible_panel_state_intact() {
+        assert!(!can_minimize_column(&[true, false, true], 3, 1));
+        assert!(can_minimize_column(&[false, false, true], 3, 1));
+        assert!(!can_minimize_column(&[false, false, true], 3, 9));
     }
 
     #[test]
@@ -12618,7 +12732,9 @@ mod tests {
     // ---------- grupos de abas ----------
 
     fn tab(url: &str, group: Option<u64>) -> ContextTab {
+        static NEXT_TEST_TAB_ID: AtomicU64 = AtomicU64::new(1);
         ContextTab {
+            id: NEXT_TEST_TAB_ID.fetch_add(1, Ordering::Relaxed),
             url: url.to_string(),
             group,
         }
