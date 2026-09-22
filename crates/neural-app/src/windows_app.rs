@@ -4711,9 +4711,7 @@ impl App {
             IpcAction::NewTab { col: Some(col) } if col == col_index => {
                 Some(UserEvent::NewTab(col_index))
             }
-            IpcAction::Expand { col } if col == col_index => {
-                Some(UserEvent::ExpandComparator(col_index))
-            }
+            IpcAction::Expand { col } => Some(UserEvent::ExpandComparator(col)),
             other => common_ipc_event(other),
         }
     }
