@@ -1124,8 +1124,9 @@ fn regroup_context_tab(
     context_index: usize,
 ) -> Option<usize> {
     let created = create_context_group(tabs, groups, next_id, context_index)?;
+    let created_id = groups.get(created)?.id;
     prune_empty_groups(tabs, groups);
-    Some(created)
+    groups.iter().position(|group| group.id == created_id)
 }
 
 struct ComparatorState {
@@ -1440,6 +1441,12 @@ unsafe extern "system" {
     fn SetCapture(hwnd: HWND) -> HWND;
     fn ReleaseCapture() -> i32;
     fn RegisterWindowMessageW(lp_string: *const u16) -> u32;
+}
+
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    #[link_name = "SystemFunction036"]
+    fn rtl_gen_random(buffer: *mut core::ffi::c_void, length: u32) -> u8;
 }
 
 /// Pincel de fundo da omnibox, um por cor. Criar um a cada WM_CTLCOLOREDIT
@@ -3155,6 +3162,9 @@ impl App {
             for child in [self.omnibox, self.home_button].into_iter().flatten() {
                 if GetParent(child) != parent {
                     SetParent(child, parent);
+                    if GetParent(child) != parent {
+                        eprintln!("failed to reparent native NeuralIA control to effective HWND");
+                    }
                 }
             }
         }
@@ -3253,7 +3263,7 @@ impl App {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
             let interactive = surface_accepts_omnibox_submit(self.surface);
-            EnableWindow(edit, i32::from(interactive));
+            EnableWindow(edit, if interactive { 1 } else { 0 });
             if !interactive && GetFocus() == edit {
                 let parent = GetParent(edit);
                 if !parent.is_null() {
@@ -3319,6 +3329,7 @@ impl App {
         unsafe {
             ShowWindow(edit, if visible { SW_SHOW } else { SW_HIDE });
             if visible && focus {
+                EnableWindow(edit, 1);
                 SetFocus(edit);
             }
         }
@@ -8409,9 +8420,10 @@ fn route_palette(input: &str, source_index: usize, private: bool) -> PaletteRout
     }
 }
 
-/// Token que so os scripts injetados conhecem: 128 bits do RNG do sistema.
-/// Se o BCrypt falhar, o SipHash com semente aleatoria de antes entra a
-/// misturar-se com o que houver no buffer, para nunca sair um token vazio.
+/// Token que so os scripts injetados conhecem: 128 bits de CSPRNG do Windows.
+/// O caminho principal usa BCryptGenRandom. Se essa API falhar, tentamos a
+/// segunda interface criptografica do proprio Windows (RtlGenRandom) antes de
+/// falhar fechado; nunca degradamos para tempo, PID ou outro pseudo-segredo.
 fn capability_from_rng(status: i32, bytes: [u8; 16]) -> Option<String> {
     if status != 0 {
         return None;
@@ -8423,6 +8435,25 @@ fn capability_from_rng(status: i32, bytes: [u8; 16]) -> Option<String> {
         let _ = write!(token, "{byte:02x}");
     }
     Some(token)
+}
+
+fn capability_from_sources<F>(
+    primary_status: i32,
+    primary_bytes: [u8; 16],
+    mut fallback: F,
+) -> Option<String>
+where
+    F: FnMut(&mut [u8; 16]) -> bool,
+{
+    if let Some(token) = capability_from_rng(primary_status, primary_bytes) {
+        return Some(token);
+    }
+
+    let mut secondary = [0u8; 16];
+    if !fallback(&mut secondary) {
+        return None;
+    }
+    capability_from_rng(0, secondary)
 }
 
 fn remote_capability() -> String {
@@ -8438,8 +8469,13 @@ fn remote_capability() -> String {
         )
     };
 
-    capability_from_rng(status, bytes)
-        .expect("BCryptGenRandom failed; refusing to create an unauthenticated WebView capability")
+    capability_from_sources(status, bytes, |secondary| unsafe {
+        rtl_gen_random(
+            secondary.as_mut_ptr().cast::<core::ffi::c_void>(),
+            secondary.len() as u32,
+        ) != 0
+    })
+    .expect("both Windows CSPRNG providers failed; refusing unauthenticated IPC capability")
 }
 
 /// A origem local que o utilizador autorizou ao escrever uma URL num controlo
@@ -10786,6 +10822,22 @@ mod tests {
     }
 
     #[test]
+    fn capability_falls_back_to_the_secondary_windows_csprng() {
+        let expected = [0xabu8; 16];
+        let token = capability_from_sources(-1, [0u8; 16], |output| {
+            *output = expected;
+            true
+        })
+        .expect("fallback valido");
+        assert_eq!(token, "ab".repeat(16));
+
+        assert!(
+            capability_from_sources(-1, [0u8; 16], |_| false).is_none(),
+            "se os dois CSPRNG falham, o canal deve falhar fechado"
+        );
+    }
+
+    #[test]
     fn capability_comparison_walks_every_byte() {
         assert!(constant_time_eq(b"", b""));
         assert!(constant_time_eq(b"abc", b"abc"));
@@ -12469,10 +12521,24 @@ mod tests {
             );
             assert!(!edit.is_null());
 
-            EnableWindow(edit, i32::from(surface_accepts_omnibox_submit(Surface::Comparator)));
+            EnableWindow(
+                edit,
+                if surface_accepts_omnibox_submit(Surface::Comparator) {
+                    1
+                } else {
+                    0
+                },
+            );
             assert_eq!(IsWindowEnabled(edit), 0, "omnibox invisivel nao pode receber foco");
 
-            EnableWindow(edit, i32::from(surface_accepts_omnibox_submit(Surface::Home)));
+            EnableWindow(
+                edit,
+                if surface_accepts_omnibox_submit(Surface::Home) {
+                    1
+                } else {
+                    0
+                },
+            );
             assert_ne!(IsWindowEnabled(edit), 0, "Home precisa reativar a omnibox");
 
             DestroyWindow(parent);
