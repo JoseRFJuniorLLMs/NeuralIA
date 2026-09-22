@@ -115,8 +115,6 @@ enum UserEvent {
         text: String,
     },
     AgentObservation(ObservedPage),
-    /// Esconde outra vez a barra em ecra completo, se nada a tiver reavivado.
-    HideChrome(u64),
     SubmitText(String),
     OpenExternal(String),
     /// Popup pedido por uma coluna do comparador: carrega nessa coluna.
@@ -202,9 +200,6 @@ const AUTO_SCROLL_SECONDS: u64 = 30;
 /// Quanto tempo a pergunta fica no ecra antes de se dar por respondida com
 /// "nao". Sem resposta nao se mexe em nada: e uma pergunta, nao um aviso.
 const AUTO_SCROLL_PROMPT_SECONDS: u64 = 20;
-/// Quanto tempo a barra fica visivel em ecra completo depois do ultimo
-/// movimento do rato no topo.
-const CHROME_HIDE_DELAY_MS: u64 = 2500;
 /// A moldura Win32 pode mudar o client rect um ciclo depois de
 /// set_decorations(false). Fazemos dois relayouts baratos para nao deixar
 /// WebViews presos na geometria anterior ate o primeiro movimento do rato.
@@ -2777,15 +2772,6 @@ struct App {
     comparator: Option<ComparatorState>,
     omnibox: Option<HWND>,
     bar_hover: Option<BarHit>,
-    /// Em ecra completo a barra some; volta enquanto o rato estiver no topo.
-    chrome_revealed: bool,
-    chrome_token: u64,
-    /// Prazo de vida da barra, em milissegundos monotonos. Cada movimento do
-    /// rato empurra-o sem agendar nada; quando o `HideChrome` agendado chega,
-    /// `hide_chrome` compara com isto e reagenda so o que falta. Antes era uma
-    /// thread do sistema operativo POR CADA evento de rato, depois uma thread
-    /// de vigia a sondar de 300 em 300 ms; agora e so um numero.
-    chrome_deadline: u64,
     exit_button: Option<HWND>,
     home_button: Option<HWND>,
     splitters: [Option<HWND>; COMPARATOR_COLUMNS - 1],
@@ -2878,9 +2864,6 @@ impl App {
             comparator: None,
             omnibox: None,
             bar_hover: None,
-            chrome_revealed: false,
-            chrome_token: 0,
-            chrome_deadline: 0,
             exit_button: None,
             home_button: None,
             splitters: [None; COMPARATOR_COLUMNS - 1],
@@ -3212,8 +3195,6 @@ impl App {
     /// Sai do ecra completo. Faltava em quase todas as saidas: bastava um login
     /// ou um Esc para a janela ficar sem barra de titulo e sem forma de voltar.
     fn leave_fullscreen(&mut self) {
-        self.chrome_revealed = false;
-        self.chrome_token = self.chrome_token.wrapping_add(1);
         if let Some(window) = &self.window {
             window.set_fullscreen(None);
         }
@@ -4403,8 +4384,6 @@ impl App {
             }
         }
         self.bar_hover = None;
-        self.chrome_revealed = false;
-        self.chrome_token = self.chrome_token.wrapping_add(1);
         self.needs_clear = true;
 
         // Ecra completo a serio: sem barra de titulo, sem minimizar/fechar.
@@ -4421,6 +4400,12 @@ impl App {
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.sync_home_button();
+        if self.is_fullscreen_column() {
+            self.show_omnibox_passive(false);
+        } else {
+            self.show_omnibox_passive(true);
+            self.position_omnibox();
+        }
         self.request_redraw();
     }
 
@@ -4471,14 +4456,14 @@ impl App {
         }
 
         self.bar_hover = None;
-        self.chrome_revealed = false;
-        self.chrome_token = self.chrome_token.wrapping_add(1);
         self.needs_clear = true;
         self.update_comparator_layout();
         self.sync_comparator_splitters();
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.sync_home_button();
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
         self.request_redraw();
     }
 
@@ -4486,8 +4471,6 @@ impl App {
         if let Some(comp) = &mut self.comparator {
             comp.expanded = None;
         }
-        self.chrome_revealed = false;
-        self.chrome_token = self.chrome_token.wrapping_add(1);
         if let Some(window) = &self.window {
             window.set_fullscreen(None);
         }
@@ -4496,6 +4479,8 @@ impl App {
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.sync_home_button();
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
         self.request_redraw();
     }
 
@@ -4563,24 +4548,15 @@ impl App {
 
         match comp.expanded {
             Some(idx) => {
-                // Ecra completo. A coluna ocupa tudo menos uma faixa de 1px no
-                // topo: o WebView e uma janela filha e engole o rato, por isso
-                // sem essa faixa a aplicacao nunca saberia que o rato subiu ao
-                // topo para chamar a barra de volta.
-                let (top, height) = if self.chrome_revealed {
-                    (
-                        COMPARATOR_CHROME_HEIGHT,
-                        (logical_h - COMPARATOR_CHROME_HEIGHT).max(1.0),
-                    )
-                } else {
-                    (1.0, (logical_h - 1.0).max(1.0))
-                };
-
+                // Fullscreen fica geometricamente estavel. A versao anterior
+                // mudava o bounds do WebView toda vez que o cursor tocava o
+                // topo para mostrar/esconder chrome, causando flicker e pump
+                // de layout em cascata no WebView2.
                 for (i, v) in comp.views.iter().enumerate() {
                     if i == idx {
                         let _ = v.webview.set_bounds(wry::Rect {
-                            position: LogicalPosition::new(0.0, top).into(),
-                            size: LogicalSize::new(logical_w, height).into(),
+                            position: LogicalPosition::new(0.0, 0.0).into(),
+                            size: LogicalSize::new(logical_w, logical_h.max(1.0)).into(),
                         });
                         let _ = v.webview.set_visible(true);
                     } else {
@@ -5838,12 +5814,12 @@ impl App {
             .is_some_and(|comp| comp.expanded.is_some())
     }
 
-    /// Em tres colunas a barra esta sempre la; em ecra completo so enquanto o
-    /// rato a chamar.
+    /// Em tres colunas a barra fica estavel. Em fullscreen ela desaparece e
+    /// a saida fica por conta do botao nativo flutuante.
     fn bar_visible(&self) -> bool {
         match &self.comparator {
             Some(comp) if comp.split.is_some() => true,
-            Some(comp) => comp.expanded.is_none() || self.chrome_revealed,
+            Some(comp) => comp.expanded.is_none(),
             None => false,
         }
     }
@@ -5952,10 +5928,9 @@ impl App {
     /// houver uma coluna em ecra completo -- e a unica saida sempre visivel,
     /// porque a barra de titulo desapareceu e a barra da app auto-esconde-se.
     fn sync_exit_button(&mut self) {
-        // Acompanha a barra: aparece quando o rato a chama e desaparece com ela.
-        let wanted = self.surface == Surface::Comparator
-            && self.is_fullscreen_column()
-            && self.chrome_revealed;
+        // Em fullscreen e o controlo nativo permanente de saida. Nao depende
+        // de hover nem de redimensionar o WebView.
+        let wanted = self.surface == Surface::Comparator && self.is_fullscreen_column();
 
         if !wanted {
             if let Some(button) = self.exit_button.take() {
@@ -6064,50 +6039,6 @@ impl App {
                 ShowWindow(button, SW_HIDE);
             }
         }
-    }
-
-    /// Mostra a barra e marca-a para desaparecer sozinha. Cada chamada invalida
-    /// o temporizador anterior, por isso ela fica enquanto o rato la andar.
-    fn reveal_chrome(&mut self) {
-        // Adiar e so escrever um numero; o rato mexe-se centenas de vezes por
-        // segundo e nao se agenda nada por movimento.
-        self.chrome_deadline = now_ms() + CHROME_HIDE_DELAY_MS;
-
-        if self.chrome_revealed {
-            return;
-        }
-
-        self.chrome_revealed = true;
-        self.chrome_token = self.chrome_token.wrapping_add(1);
-        self.timers.after(
-            Duration::from_millis(CHROME_HIDE_DELAY_MS),
-            UserEvent::HideChrome(self.chrome_token),
-        );
-
-        self.update_comparator_layout();
-        self.sync_exit_button();
-        self.request_redraw();
-    }
-
-    fn hide_chrome(&mut self, token: u64) {
-        if token != self.chrome_token || !self.chrome_revealed {
-            return;
-        }
-        // O rato empurrou o prazo desde que este pedido foi agendado: em vez
-        // de sondar, reagenda-se exactamente o que falta, com o mesmo token.
-        let remaining = self.chrome_deadline.saturating_sub(now_ms());
-        if remaining > 0 {
-            self.timers.after(
-                Duration::from_millis(remaining),
-                UserEvent::HideChrome(token),
-            );
-            return;
-        }
-        self.chrome_revealed = false;
-        self.bar_hover = None;
-        self.update_comparator_layout();
-        self.sync_exit_button();
-        self.request_redraw();
     }
 
     fn hide_comparator_splitters(&self) {
@@ -7585,7 +7516,6 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::AgentObservation(page) => {
                 self.handle_agent_observation(page);
             }
-            UserEvent::HideChrome(token) => self.hide_chrome(token),
             UserEvent::SubmitText(input) => {
                 if surface_accepts_omnibox_submit(self.surface) {
                     let input = input.trim().to_string();
@@ -7663,6 +7593,13 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_comparator_splitters();
                     self.sync_comparator_buttons();
                     self.sync_exit_button();
+                    self.sync_home_button();
+                    if self.is_fullscreen_column() {
+                        self.show_omnibox_passive(false);
+                    } else {
+                        self.show_omnibox_passive(true);
+                        self.position_omnibox();
+                    }
                     if lifecycle_probe_enabled() {
                         LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
                     }
@@ -7797,19 +7734,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
-                if self.surface == Surface::Comparator {
-                    if self.is_fullscreen_column() {
-                        let scale = self
-                            .window
-                            .as_ref()
-                            .map(|window| window.scale_factor().max(1.0))
-                            .unwrap_or(1.0);
-                        // Ou o rato encostou ao topo, ou ja esta sobre a barra
-                        // revelada -- em qualquer dos casos ela fica.
-                        if self.chrome_revealed || position.y <= 2.0 * scale {
-                            self.reveal_chrome();
-                        }
-                    }
+                if self.surface == Surface::Comparator && self.bar_visible() {
                     self.update_bar_hover();
                 }
             }
@@ -12043,6 +11968,26 @@ mod tests {
                 "{from} nao pode pousar sobre as outras aplicacoes"
             );
         }
+    }
+
+    #[test]
+    fn fullscreen_column_has_stable_chrome_policy() {
+        let source = include_str!("windows_app.rs");
+        let layout = source
+            .split("fn update_comparator_layout")
+            .nth(1)
+            .and_then(|part| part.split("fn column_ipc_event_impl").next())
+            .expect("layout body");
+        assert!(!layout.contains("chrome_revealed"));
+        assert!(layout.contains("LogicalPosition::new(0.0, 0.0)"));
+
+        let exit = source
+            .split("fn sync_exit_button")
+            .nth(1)
+            .and_then(|part| part.split("fn position_exit_button").next())
+            .expect("exit button body");
+        assert!(exit.contains("self.is_fullscreen_column()"));
+        assert!(!exit.contains("chrome_revealed"));
     }
 
     #[test]
