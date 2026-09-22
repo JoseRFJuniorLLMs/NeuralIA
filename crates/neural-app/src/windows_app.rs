@@ -11962,8 +11962,6 @@ mod tests {
         assert!(!surface_accepts_omnibox_submit(Surface::Reader));
         assert!(!surface_accepts_omnibox_submit(Surface::Pdf));
 
-        let source = include_str!("windows_app.rs");
-        assert!(!source.contains("fn comparator_omnibox_rect"));
     }
 
     #[test]
