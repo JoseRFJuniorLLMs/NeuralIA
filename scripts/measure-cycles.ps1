@@ -31,7 +31,6 @@ param(
     [double]$MaxWorkingSetGrowthMiB = 24,
     [int]$MaxHandleGrowth = 128,
     [int]$MaxThreadGrowth = 8,
-    [int]$MaxGdiGrowth = 64,
     [string]$StartupInput = "jose r f junior",
     [string]$OutputPath = "perf-cycles.json"
 )
