@@ -859,7 +859,6 @@ struct ComparatorView {
 struct SplitView {
     webview: WebView,
     source_index: usize,
-    url: String,
     /// Identidade da aba que originou este Split. URL nao e identidade:
     /// a mesma fonte pode existir em dois grupos diferentes.
     context_id: Option<u64>,
@@ -1113,7 +1112,7 @@ fn remember_context_tab(
     }
 
     let id = *next_id;
-    *next_id = next_id.wrapping_add(1).max(1);
+    *next_id = (*next_id).wrapping_add(1).max(1);
     tabs.push(ContextTab {
         id,
         url,
@@ -5180,7 +5179,6 @@ impl App {
                     comp.split = Some(SplitView {
                         webview,
                         source_index,
-                        url: valid.to_string(),
                         context_id,
                         fullscreen: false,
                         private,
@@ -11806,7 +11804,7 @@ mod tests {
         assert!(!before.contains("record("));
         assert_eq!(load_provider.matches("self.record(").count(), 1);
         assert!(before.contains("PaletteRoute::OpenPrivateProvider"));
-        assert!(before.contains("open_split_mode(source_index, url.to_string(), false, true)"));
+        assert!(before.contains("open_split_mode(source_index, url.to_string(), false, true, None)"));
 
         // A parte da memória passou a ser testada pelo comportamento, em
         // `private_split_source_never_becomes_a_memory_document`: contar
@@ -11819,14 +11817,15 @@ mod tests {
             .and_then(|part| part.split("fn open_private_panel").next())
             .expect("split body");
         assert!(split.contains("split_source_memory(&valid, source_name, private)"));
-        assert_eq!(split.matches("if !private").count(), 1);
+        assert!(split.contains("let context_id = if private"));
+        assert!(split.contains("remember_context_tab("));
         assert!(!split.contains("self.record("));
         let private_split = source
             .split("UserEvent::OpenPrivateSplit { source_index, url } =>")
             .nth(1)
             .and_then(|part| part.split("UserEvent::NewTab").next())
             .expect("OpenPrivateSplit arm");
-        assert!(private_split.contains("open_split_mode(source_index, url, false, true)"));
+        assert!(private_split.contains("open_split_mode(source_index, url, false, true, None)"));
     }
 
     #[test]
