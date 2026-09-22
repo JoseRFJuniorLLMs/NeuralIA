@@ -52,11 +52,11 @@ use windows_sys::Win32::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
             ES_AUTOHSCROLL, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
             GetForegroundWindow, GetParent, GetWindowTextLengthW, GetWindowTextW,
-            GetWindowThreadProcessId, IDYES, MB_ICONINFORMATION, MB_OK, MB_YESNO, MF_SEPARATOR,
-            MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
-            SetParent, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-            TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
-            WS_TABSTOP, WS_VISIBLE,
+            GetWindowThreadProcessId, IDYES, IsZoomed, MB_ICONINFORMATION, MB_OK, MB_YESNO,
+            MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
+            SendMessageW, SetParent, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD,
+            TPM_RIGHTBUTTON, TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -642,8 +642,7 @@ impl BarLayout {
         }
 
         // Linha superior: todas as fontes/abas, antes dos controles da janela.
-        let omnibox = comparator_omnibox_rect(client_width, scale);
-        let tabs_left = (omnibox.x + omnibox.width + 8.0 * scale).max(90.0 * scale);
+        let tabs_left = 90.0 * scale;
         let tabs_right = (window_minimize.x - 8.0 * scale).max(tabs_left);
         let visible_rows = &rows[..columns_len];
         let total_slots: usize = visible_rows.iter().map(|row| row.len).sum();
@@ -778,23 +777,8 @@ impl BarLayout {
     }
 }
 
-/// Omnibox persistente do comparador, na mesma faixa da title bar.
-/// Usa coordenadas fisicas, como BarLayout e os eventos do rato.
-fn comparator_omnibox_rect(client_width: f64, scale: f64) -> UiRect {
-    let scale = scale.max(1.0);
-    let x = 92.0 * scale;
-    let caption_left = (client_width - 3.0 * 46.0 * scale - 10.0 * scale).max(x);
-    let width = (360.0 * scale).min((caption_left - x - 10.0 * scale).max(0.0));
-    UiRect {
-        x,
-        y: 5.0 * scale,
-        width,
-        height: (TITLE_TAB_HEIGHT - 10.0) * scale,
-    }
-}
-
 fn surface_accepts_omnibox_submit(surface: Surface) -> bool {
-    matches!(surface, Surface::Home | Surface::Comparator)
+    matches!(surface, Surface::Home)
 }
 
 /// Os controlos do canto direito da segunda linha.
@@ -1327,6 +1311,7 @@ fn lifecycle_probe_home_ready_message() -> u32 {
 }
 const EXIT_BUTTON_SUBCLASS_ID: usize = 0x4E4B;
 const HOME_BUTTON_SUBCLASS_ID: usize = 0x4E4C;
+const CAPTION_BUTTONS_SUBCLASS_ID: usize = 0x4E70;
 const WM_PAINT: u32 = 0x000F;
 const WM_LBUTTONUP: u32 = 0x0202;
 const WM_NCHITTEST: u32 = 0x0084;
@@ -1766,6 +1751,91 @@ unsafe extern "system" fn comparator_splitter_subclass(
     DefSubclassProc(hwnd, message, wparam, lparam)
 }
 
+unsafe extern "system" fn caption_buttons_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    _reference_data: usize,
+) -> LRESULT {
+    const WM_SYSCOMMAND_NATIVE: u32 = 0x0112;
+    const SC_MINIMIZE_NATIVE: usize = 0xF020;
+    const SC_MAXIMIZE_NATIVE: usize = 0xF030;
+    const SC_CLOSE_NATIVE: usize = 0xF060;
+    const SC_RESTORE_NATIVE: usize = 0xF120;
+
+    match message {
+        WM_NCHITTEST => HTCLIENT as LRESULT,
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut paint);
+            if !hdc.is_null() {
+                let mut client = RECT::default();
+                if GetClientRect(hwnd, &mut client) != 0 {
+                    let theme = Theme::system();
+                    let width = (client.right - client.left).max(1) as f64;
+                    let height = (client.bottom - client.top).max(1) as f64;
+                    let scale = (height / TITLE_TAB_HEIGHT).max(1.0);
+                    let third = width / 3.0;
+                    let font = create_font((-13.0 * scale) as i32, FW_NORMAL as i32);
+                    let maximized = IsZoomed(GetParent(hwnd)) != 0;
+                    let labels = ["—", if maximized { "❐" } else { "□" }, "×"];
+                    for (index, label) in labels.into_iter().enumerate() {
+                        draw_button(
+                            hdc,
+                            UiRect {
+                                x: index as f64 * third,
+                                y: 0.0,
+                                width: if index == 2 {
+                                    width - third * 2.0
+                                } else {
+                                    third
+                                },
+                                height,
+                            },
+                            label,
+                            false,
+                            scale,
+                            font,
+                            &theme,
+                        );
+                    }
+                    DeleteObject(font as _);
+                }
+                EndPaint(hwnd, &paint);
+            }
+            0
+        }
+        WM_LBUTTONUP => {
+            let parent = GetParent(hwnd);
+            if parent.is_null() {
+                return 0;
+            }
+            let mut client = RECT::default();
+            if GetClientRect(hwnd, &mut client) == 0 {
+                return 0;
+            }
+            let width = (client.right - client.left).max(1);
+            let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
+            let command = if x < width / 3 {
+                SC_MINIMIZE_NATIVE
+            } else if x < (width * 2) / 3 {
+                if IsZoomed(parent) != 0 {
+                    SC_RESTORE_NATIVE
+                } else {
+                    SC_MAXIMIZE_NATIVE
+                }
+            } else {
+                SC_CLOSE_NATIVE
+            };
+            SendMessageW(parent, WM_SYSCOMMAND_NATIVE, command, 0);
+            0
+        }
+        _ => DefSubclassProc(hwnd, message, wparam, lparam),
+    }
+}
+
 unsafe extern "system" fn home_button_subclass(
     hwnd: HWND,
     message: u32,
@@ -1797,8 +1867,7 @@ unsafe extern "system" fn home_button_subclass(
                         hdc,
                         rect,
                         "Home",
-                        PillStyle::new(theme.surface, theme.surface_line, theme.fg)
-                            .with_icon(ICON_SLOT_HOME, Some(theme.fg)),
+                        PillStyle::new(theme.surface, theme.surface_line, theme.fg),
                         scale,
                         font,
                         theme.bar_bg,
@@ -2774,6 +2843,7 @@ struct App {
     bar_hover: Option<BarHit>,
     exit_button: Option<HWND>,
     home_button: Option<HWND>,
+    caption_buttons: Option<HWND>,
     splitters: [Option<HWND>; COMPARATOR_COLUMNS - 1],
     auto_scroll: bool,
     auto_scroll_answered: bool,
@@ -2866,6 +2936,7 @@ impl App {
             bar_hover: None,
             exit_button: None,
             home_button: None,
+            caption_buttons: None,
             splitters: [None; COMPARATOR_COLUMNS - 1],
             // Ligada por omissao: a aplicacao serve para ler.
             // Nada rola sem o utilizador dizer que sim.
@@ -2970,6 +3041,7 @@ impl App {
             // maximizacao), por isso recalcula-se em vez de se confiar nela.
             self.sync_comparator_splitters();
             self.sync_exit_button();
+            self.sync_caption_buttons();
             return;
         }
         // Sem foco nao ha o que arrastar nem de onde sair: as auxiliares que
@@ -3084,20 +3156,11 @@ impl App {
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
 
-        // A mesma caixa nativa serve a Home e o comparador. Na segunda tela ela
-        // vive na title bar, portanto o utilizador pode fazer outra pesquisa
-        // sem voltar à Home nem depender de atalhos escondidos.
-        let inner = if self.surface == Surface::Comparator {
-            let outer = comparator_omnibox_rect(size.width as f64, scale);
-            let pad_x = 10.0 * scale;
-            let pad_y = 3.0 * scale;
-            UiRect {
-                x: outer.x + pad_x,
-                y: outer.y + pad_y,
-                width: (outer.width - pad_x * 2.0).max(1.0),
-                height: (outer.height - pad_y * 2.0).max(1.0),
-            }
-        } else {
+        // O EDIT nativo continua vivo e WS_VISIBLE durante o comparador porque
+        // a troca de decorations/HWND já depende dessa identidade estável no
+        // lifecycle provado. Fora da Home ele fica estacionado fora do cliente:
+        // não aparece na titlebar e Ctrl+L abre a palette nativa.
+        let inner = if self.surface == Surface::Home {
             let layout =
                 HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
             let pad_x = 22.0 * scale;
@@ -3108,21 +3171,29 @@ impl App {
                 width: (layout.input.width - pad_x * 2.0).max(1.0),
                 height: (layout.input.height - pad_y * 2.0).max(1.0),
             }
+        } else {
+            UiRect {
+                x: -4096.0 * scale,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            }
         };
 
         unsafe {
             SetWindowPos(
                 edit,
                 std::ptr::null_mut(),
-                inner.x as i32,
-                inner.y as i32,
-                inner.width as i32,
-                inner.height as i32,
+                inner.x.round() as i32,
+                inner.y.round() as i32,
+                inner.width.round() as i32,
+                inner.height.round() as i32,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
-        self.apply_omnibox_font(inner.height);
-        // O EDIT deixa o desenho antigo para tras quando muda de sitio.
+        if self.surface == Surface::Home {
+            self.apply_omnibox_font(inner.height);
+        }
         self.needs_clear = true;
         self.request_redraw();
     }
@@ -3248,6 +3319,11 @@ impl App {
         if let Some(button) = self.home_button.take() {
             unsafe {
                 DestroyWindow(button);
+            }
+        }
+        if let Some(buttons) = self.caption_buttons.take() {
+            unsafe {
+                DestroyWindow(buttons);
             }
         }
         for splitter in &mut self.splitters {
@@ -4328,6 +4404,7 @@ impl App {
         }
         self.sync_exit_button();
         self.sync_home_button();
+        self.sync_caption_buttons();
         self.show_omnibox_passive(true);
         self.position_omnibox();
 
@@ -4409,12 +4486,9 @@ impl App {
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.sync_home_button();
-        if self.is_fullscreen_column() {
-            self.show_omnibox_passive(false);
-        } else {
-            self.show_omnibox_passive(true);
-            self.position_omnibox();
-        }
+        self.sync_caption_buttons();
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
         self.request_redraw();
     }
 
@@ -4471,6 +4545,7 @@ impl App {
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.sync_home_button();
+        self.sync_caption_buttons();
         self.show_omnibox_passive(true);
         self.position_omnibox();
         self.request_redraw();
@@ -4488,6 +4563,7 @@ impl App {
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.sync_home_button();
+        self.sync_caption_buttons();
         self.show_omnibox_passive(true);
         self.position_omnibox();
         self.request_redraw();
@@ -4631,6 +4707,7 @@ impl App {
             IpcAction::Palette { col } if col == col_index => {
                 Some(UserEvent::OpenPalette(col_index))
             }
+            IpcAction::Omnibox => Some(UserEvent::OpenPalette(col_index)),
             IpcAction::Minimize { col } if col == col_index => {
                 Some(UserEvent::MinimizeComparator(col_index))
             }
@@ -5635,14 +5712,23 @@ impl App {
         }
     }
 
-    /// O equivalente ao Ctrl+L do Chrome: volta a barra e seleciona o texto.
+    /// O equivalente ao Ctrl+L do Chrome. Na Home foca a caixa principal;
+    /// no comparador abre a palette flutuante da coluna ativa.
     fn focus_omnibox(&mut self) {
-        if self.surface != Surface::Comparator {
-            self.show_home();
-        } else {
-            self.show_omnibox_passive(true);
-            self.position_omnibox();
+        if self.surface == Surface::Comparator {
+            let index = self
+                .comparator
+                .as_ref()
+                .and_then(|comp| {
+                    comp.expanded
+                        .or_else(|| (0..comp.views.len()).find(|index| !comp.minimized[*index]))
+                })
+                .unwrap_or(0);
+            self.open_ai_palette(index);
+            return;
         }
+
+        self.show_home();
         if let Some(edit) = self.omnibox {
             unsafe {
                 SetFocus(edit);
@@ -5927,6 +6013,90 @@ impl App {
                 );
                 ShowWindow(button, SW_SHOW);
                 InvalidateRect(button, std::ptr::null(), 1);
+            }
+        }
+    }
+
+    /// Controles de janela reais acima dos filhos WebView2. Se a troca de
+    /// decoracao produzir outro HWND, o controlo e destruido e recriado no
+    /// novo pai; nao se usa SetParent neste overlay.
+    fn sync_caption_buttons(&mut self) {
+        let wanted = self.surface == Surface::Comparator && self.bar_visible();
+        if !wanted {
+            if let Some(buttons) = self.caption_buttons.take() {
+                unsafe {
+                    DestroyWindow(buttons);
+                }
+            }
+            return;
+        }
+
+        let (Some(window), Some(layout)) = (&self.window, self.bar_layout()) else {
+            return;
+        };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let left = layout.window_minimize.x;
+        let right = layout.window_close.x + layout.window_close.width;
+        let width = (right - left).max(1.0);
+        let height = layout.window_close.height.max(1.0);
+
+        if let Some(buttons) = self.caption_buttons
+            && unsafe { GetParent(buttons) } != owner
+        {
+            unsafe {
+                DestroyWindow(buttons);
+            }
+            self.caption_buttons = None;
+        }
+
+        if self.caption_buttons.is_none() {
+            unsafe {
+                let created = CreateWindowExW(
+                    0,
+                    windows_sys::w!("STATIC"),
+                    windows_sys::w!("NeuralIA.CaptionControls"),
+                    WS_CHILD | WS_VISIBLE,
+                    left.round() as i32,
+                    0,
+                    width.round() as i32,
+                    height.round() as i32,
+                    owner,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                );
+                if created.is_null() {
+                    return;
+                }
+                if SetWindowSubclass(
+                    created,
+                    Some(caption_buttons_subclass),
+                    CAPTION_BUTTONS_SUBCLASS_ID,
+                    0,
+                ) == 0
+                {
+                    DestroyWindow(created);
+                    return;
+                }
+                self.caption_buttons = Some(created);
+            }
+        }
+
+        if let Some(buttons) = self.caption_buttons {
+            unsafe {
+                SetWindowPos(
+                    buttons,
+                    std::ptr::null_mut(),
+                    left.round() as i32,
+                    0,
+                    width.round() as i32,
+                    height.round() as i32,
+                    SWP_NOACTIVATE,
+                );
+                ShowWindow(buttons, SW_SHOW);
+                InvalidateRect(buttons, std::ptr::null(), 1);
             }
         }
     }
@@ -7601,12 +7771,9 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_comparator_buttons();
                     self.sync_exit_button();
                     self.sync_home_button();
-                    if self.is_fullscreen_column() {
-                        self.show_omnibox_passive(false);
-                    } else {
-                        self.show_omnibox_passive(true);
-                        self.position_omnibox();
-                    }
+                    self.sync_caption_buttons();
+                    self.show_omnibox_passive(true);
+                    self.position_omnibox();
                     if lifecycle_probe_enabled() {
                         LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
                     }
@@ -7722,6 +7889,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_comparator_splitters();
                     self.sync_exit_button();
                     self.sync_home_button();
+                    self.sync_caption_buttons();
                     self.position_omnibox();
                     self.position_palette();
                     self.request_redraw();
@@ -8824,17 +8992,6 @@ unsafe fn paint_comparator_bar_with_contexts(
         theme.bar_bg,
     );
 
-    let search = comparator_omnibox_rect(width as f64, scale);
-    draw_pill(
-        target,
-        search,
-        "",
-        PillStyle::new(theme.surface, theme.surface_line, theme.fg),
-        scale,
-        tab_font,
-        theme.bar_bg,
-    );
-
     // Abas/fontes na mesma faixa dos botoes de janela.
     for (index, source_contexts) in contexts.iter().enumerate().take(layout.columns_len) {
         let brand = theme.brand(index);
@@ -8945,8 +9102,7 @@ unsafe fn paint_comparator_bar_with_contexts(
         target,
         layout.home,
         "Home",
-        PillStyle::new(home_fill, theme.surface_line, theme.fg)
-            .with_icon(ICON_SLOT_HOME, Some(theme.fg)),
+        PillStyle::new(home_fill, theme.surface_line, theme.fg),
         scale,
         font,
         theme.bar_bg,
@@ -9585,6 +9741,70 @@ mod tests {
                     layout.add_tabs[index]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn home_button_is_text_only_without_an_invented_icon() {
+        let source = include_str!("windows_app.rs");
+        let native = source
+            .split("fn home_button_subclass")
+            .nth(1)
+            .and_then(|part| part.split("fn exit_button_subclass").next())
+            .expect("home_button_subclass body");
+        assert!(!native.contains("with_icon("));
+
+        let bar = source
+            .split("let home_fill =")
+            .nth(1)
+            .and_then(|part| part.split("for (index, name)").next())
+            .expect("painted Home body");
+        assert!(!bar.contains("with_icon("));
+    }
+
+    #[test]
+    fn native_caption_buttons_accept_the_mouse() {
+        unsafe {
+            let parent = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!(""),
+                WS_POPUP,
+                0,
+                0,
+                200,
+                80,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!parent.is_null(), "parent do caption tem de nascer");
+            let hwnd = CreateWindowExW(
+                0,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!(""),
+                WS_CHILD | WS_VISIBLE,
+                0,
+                0,
+                138,
+                32,
+                parent,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!hwnd.is_null(), "caption child tem de nascer");
+            let subclassed = SetWindowSubclass(
+                hwnd,
+                Some(caption_buttons_subclass),
+                CAPTION_BUTTONS_SUBCLASS_ID,
+                0,
+            );
+            let hit = SendMessageW(hwnd, WM_NCHITTEST, 0, 0);
+            DestroyWindow(parent);
+            assert_ne!(subclassed, 0);
+            assert_eq!(hit, HTCLIENT as LRESULT);
         }
     }
 
@@ -12022,16 +12242,34 @@ mod tests {
     }
 
     #[test]
-    fn comparator_keeps_a_real_omnibox_without_covering_window_controls() {
-        let rect = comparator_omnibox_rect(1600.0, 1.0);
-        assert!(rect.width >= 300.0);
-        assert!(rect.x >= 90.0);
-        assert!(rect.x + rect.width < 1600.0 - 3.0 * 46.0);
+    fn comparator_uses_palette_instead_of_the_home_omnibox() {
         assert!(surface_accepts_omnibox_submit(Surface::Home));
-        assert!(surface_accepts_omnibox_submit(Surface::Comparator));
-        assert!(!surface_accepts_omnibox_submit(Surface::External));
-        assert!(!surface_accepts_omnibox_submit(Surface::Reader));
-        assert!(!surface_accepts_omnibox_submit(Surface::Pdf));
+        assert!(!surface_accepts_omnibox_submit(Surface::Comparator));
+        assert!(matches!(
+            App::column_ipc_event_impl(0, IpcAction::Omnibox),
+            Some(UserEvent::OpenPalette(0))
+        ));
+        assert!(matches!(
+            App::column_ipc_event_impl(2, IpcAction::Omnibox),
+            Some(UserEvent::OpenPalette(2))
+        ));
+    }
+
+    #[test]
+    fn comparator_titlebar_does_not_reserve_an_omnibox_slot() {
+        let layout = BarLayout::with_contexts(
+            1600.0,
+            1.0,
+            true,
+            BarColumns::even(COMPARATOR_COLUMNS),
+            [1, 0, 0],
+        );
+        assert_eq!(layout.context_tab_counts[0], 1);
+        assert!(
+            layout.context_tabs[0][0].x <= 100.0,
+            "a primeira aba foi empurrada por controle extra: {:?}",
+            layout.context_tabs[0][0]
+        );
     }
 
     #[test]
