@@ -3244,10 +3244,6 @@ impl App {
         self.set_omnibox_visibility(visible, visible);
     }
 
-    fn show_omnibox_passive(&self, visible: bool) {
-        self.set_omnibox_visibility(visible, false);
-    }
-
     fn omnibox_text(&self) -> String {
         self.omnibox
             .map(|edit| unsafe { window_text(edit) })
@@ -4471,12 +4467,7 @@ impl App {
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.sync_home_button();
-        if self.is_fullscreen_column() {
-            self.show_omnibox_passive(false);
-        } else {
-            self.show_omnibox_passive(true);
-            self.position_omnibox();
-        }
+        self.show_omnibox(false);
         self.request_redraw();
     }
 
