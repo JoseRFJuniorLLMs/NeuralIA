@@ -1280,6 +1280,11 @@ static LIFECYCLE_PROBE_READY_MESSAGE: OnceLock<u32> = OnceLock::new();
 static LIFECYCLE_PROBE_HOME_READY_MESSAGE: OnceLock<u32> = OnceLock::new();
 static LIFECYCLE_COMPARATOR_READY: AtomicBool = AtomicBool::new(false);
 static LIFECYCLE_HOME_READY: AtomicBool = AtomicBool::new(false);
+/// O probe transmite comandos a todas as janelas do processo porque o HWND
+/// principal pode mudar com decorations. O nonce impede que o mesmo comando,
+/// recebido por um HWND antigo e pelo atual, gere eventos duplicados.
+static LIFECYCLE_LAST_HOME_NONCE: AtomicUsize = AtomicUsize::new(0);
+static LIFECYCLE_LAST_REOPEN_NONCE: AtomicUsize = AtomicUsize::new(0);
 
 fn lifecycle_probe_home_message() -> u32 {
     *LIFECYCLE_PROBE_HOME_MESSAGE.get_or_init(|| unsafe {
@@ -1432,13 +1437,28 @@ unsafe extern "system" fn window_subclass(
     }
     if message == lifecycle_home || message == lifecycle_reopen {
         if lifecycle_probe_enabled() && reference_data != 0 {
-            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
-            if message == lifecycle_home {
-                let _ = proxy.send_event(UserEvent::HomeRequested);
+            let nonce = wparam;
+            let seen = if message == lifecycle_home {
+                &LIFECYCLE_LAST_HOME_NONCE
             } else {
-                let input = startup_input();
-                if !input.is_empty() {
-                    let _ = proxy.send_event(UserEvent::SubmitText(input));
+                &LIFECYCLE_LAST_REOPEN_NONCE
+            };
+
+            // O script faz broadcast process-wide por desenho: decorations pode
+            // deixar mais de um HWND transitório vivo. Um único comando lógico
+            // não pode virar dois HomeRequested/SubmitText. Sem este filtro,
+            // um Reopen atrasado podia chegar depois da Home do ciclo seguinte
+            // e recriar exactamente as três superfícies que o gate acabara de
+            // derrubar.
+            if nonce == 0 || seen.swap(nonce, Ordering::AcqRel) != nonce {
+                let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+                if message == lifecycle_home {
+                    let _ = proxy.send_event(UserEvent::HomeRequested);
+                } else {
+                    let input = startup_input();
+                    if !input.is_empty() {
+                        let _ = proxy.send_event(UserEvent::SubmitText(input));
+                    }
                 }
             }
         }
@@ -1799,9 +1819,12 @@ unsafe extern "system" fn omnibox_subclass(
 ) -> LRESULT {
     if message == lifecycle_probe_home_message() && lifecycle_probe_enabled() && reference_data != 0
     {
-        let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
-        SetWindowTextW(hwnd, windows_sys::w!(""));
-        let _ = proxy.send_event(UserEvent::HomeRequested);
+        let nonce = wparam;
+        if nonce == 0 || LIFECYCLE_LAST_HOME_NONCE.swap(nonce, Ordering::AcqRel) != nonce {
+            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+            SetWindowTextW(hwnd, windows_sys::w!(""));
+            let _ = proxy.send_event(UserEvent::HomeRequested);
+        }
         return 0;
     }
 
@@ -10825,6 +10848,20 @@ mod tests {
         assert_eq!(body.matches("self.web(url)").count(), 1);
         assert!(body.contains("load_url(valid.as_str())"));
         assert!(body.contains("sem perder a comparação"));
+    }
+
+    #[test]
+    fn lifecycle_probe_commands_are_deduplicated_by_nonce() {
+        LIFECYCLE_LAST_HOME_NONCE.store(0, Ordering::Release);
+        LIFECYCLE_LAST_REOPEN_NONCE.store(0, Ordering::Release);
+
+        assert_ne!(LIFECYCLE_LAST_HOME_NONCE.swap(7, Ordering::AcqRel), 7);
+        assert_eq!(LIFECYCLE_LAST_HOME_NONCE.swap(7, Ordering::AcqRel), 7);
+        assert_ne!(LIFECYCLE_LAST_HOME_NONCE.swap(8, Ordering::AcqRel), 8);
+
+        assert_ne!(LIFECYCLE_LAST_REOPEN_NONCE.swap(9, Ordering::AcqRel), 9);
+        assert_eq!(LIFECYCLE_LAST_REOPEN_NONCE.swap(9, Ordering::AcqRel), 9);
+        assert_ne!(LIFECYCLE_LAST_REOPEN_NONCE.swap(10, Ordering::AcqRel), 10);
     }
 
     #[test]
