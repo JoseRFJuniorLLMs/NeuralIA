@@ -1236,7 +1236,11 @@ fn regroup_context_tab(
     groups.iter().position(|group| group.id == created_id)
 }
 
-fn split_build_is_current(start_generation: u64, current_generation: u64, surface: Surface) -> bool {
+fn split_build_is_current(
+    start_generation: u64,
+    current_generation: u64,
+    surface: Surface,
+) -> bool {
     start_generation == current_generation && surface == Surface::Comparator
 }
 
@@ -4698,9 +4702,10 @@ impl App {
             return;
         }
 
-        let can_minimize = self.comparator.as_ref().is_some_and(|comp| {
-            can_minimize_column(&comp.minimized, comp.views.len(), idx)
-        });
+        let can_minimize = self
+            .comparator
+            .as_ref()
+            .is_some_and(|comp| can_minimize_column(&comp.minimized, comp.views.len(), idx));
         if !can_minimize {
             self.show_splash(
                 "Pelo menos um painel precisa continuar visível.".to_string(),
@@ -5415,7 +5420,8 @@ impl App {
             PaletteRoute::OpenPrivateProvider { query } => {
                 match self.provider_query_url(source_index, &query) {
                     Ok(url) => {
-                        let _ = self.open_split_mode(source_index, url.to_string(), false, true, None);
+                        let _ =
+                            self.open_split_mode(source_index, url.to_string(), false, true, None);
                     }
                     Err(error) => self.show_splash(error.to_string(), 3),
                 }
@@ -5986,7 +5992,10 @@ impl App {
             .page_target_webview(target)
             .and_then(|webview| webview.url().ok());
         let Some(current) = current else {
-            self.show_splash("Não há página ativa para ver o código-fonte.".to_string(), 3);
+            self.show_splash(
+                "Não há página ativa para ver o código-fonte.".to_string(),
+                3,
+            );
             return;
         };
         let current_origin = Url::parse(&current).ok().as_ref().and_then(local_origin_of);
@@ -5996,7 +6005,10 @@ impl App {
                 .page_target_webview(target)
                 .is_some_and(|webview| webview.load_url(&source).is_ok());
         if !loaded {
-            self.show_splash("Não foi possível abrir o código-fonte desta página.".to_string(), 3);
+            self.show_splash(
+                "Não foi possível abrir o código-fonte desta página.".to_string(),
+                3,
+            );
         }
     }
 
@@ -7007,7 +7019,8 @@ impl App {
     }
 
     fn close_context_tab(&mut self, source_index: usize, context_index: usize) {
-        let Some((context_id, _url)) = self.context_tab_identity(source_index, context_index) else {
+        let Some((context_id, _url)) = self.context_tab_identity(source_index, context_index)
+        else {
             return;
         };
         let closes_active = self
@@ -11975,7 +11988,9 @@ mod tests {
         assert!(!before.contains("record("));
         assert_eq!(load_provider.matches("self.record(").count(), 1);
         assert!(before.contains("PaletteRoute::OpenPrivateProvider"));
-        assert!(before.contains("open_split_mode(source_index, url.to_string(), false, true, None)"));
+        assert!(
+            before.contains("open_split_mode(source_index, url.to_string(), false, true, None)")
+        );
 
         // A parte da memória passou a ser testada pelo comportamento, em
         // `private_split_source_never_becomes_a_memory_document`: contar
@@ -13211,10 +13226,7 @@ mod tests {
             "a borda do fechar nao pode pertencer tambem ao maximizar"
         );
         assert_eq!(bar.hit(boundary, y), Some(BarHit::WindowClose));
-        assert_eq!(
-            bar.hit(boundary - 0.001, y),
-            Some(BarHit::WindowMaximize)
-        );
+        assert_eq!(bar.hit(boundary - 0.001, y), Some(BarHit::WindowMaximize));
     }
 
     #[test]
@@ -13354,10 +13366,7 @@ mod tests {
 
                     let controls = right_controls(client_width, scale, split_active);
                     let (px, py) = center(controls.private);
-                    assert_eq!(
-                        right_controls_hit(controls, px, py),
-                        Some(BarHit::Private)
-                    );
+                    assert_eq!(right_controls_hit(controls, px, py), Some(BarHit::Private));
                     assert_eq!(
                         layout.hit(px, py),
                         None,
@@ -13365,10 +13374,9 @@ mod tests {
                     );
 
                     if let Some((_label, expand, close)) = controls.split {
-                        for (rect, expected) in [
-                            (expand, BarHit::SplitExpand),
-                            (close, BarHit::SplitClose),
-                        ] {
+                        for (rect, expected) in
+                            [(expand, BarHit::SplitExpand), (close, BarHit::SplitClose)]
+                        {
                             let (x, y) = center(rect);
                             assert_eq!(right_controls_hit(controls, x, y), Some(expected));
                             assert_eq!(
@@ -13422,7 +13430,6 @@ mod tests {
             "o gate precisa exercitar exatamente cem combinacoes de tela/estado"
         );
     }
-
 }
 
 // ===================== tema do sistema (cor de destaque + claro/escuro) =====================
