@@ -778,7 +778,7 @@ impl BarLayout {
     }
 }
 
-fn surface_accepts_omnibox_submit(surface: Surface) -> bool {fn surface_accepts_omnibox_submit(surface: Surface) -> bool {
+fn surface_accepts_omnibox_submit(surface: Surface) -> bool {
     matches!(surface, Surface::Home)
 }
 
@@ -12248,7 +12248,6 @@ mod tests {
     }
 
     #[test]
-    fn bar_layout_hit_matches_drawing() {    #[test]
     fn bar_layout_hit_matches_drawing() {
         let layout = BarLayout::new(1600.0, 1.0, true, 3);
         assert_eq!(layout.minimized, [false; COMPARATOR_COLUMNS]);
