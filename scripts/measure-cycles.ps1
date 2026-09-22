@@ -142,7 +142,7 @@ public static class NeuraliaCycleWindowProbe {
         return rows;
     }
 
-    public static bool RequestLifecycleProbeHome(IntPtr parent) {
+    public static bool RequestLifecycleProbeHome(IntPtr parent, int nonce) {
         var message = RegisterWindowMessage("NeuralIA.LifecycleProbe.Home");
         if (message == 0) return false;
 
@@ -167,7 +167,7 @@ public static class NeuraliaCycleWindowProbe {
                 editClass.Clear();
                 GetClassName(child, editClass, editClass.Capacity);
                 if (string.Equals(editClass.ToString(), "Edit", StringComparison.Ordinal)) {
-                    if (PostMessage(child, message, IntPtr.Zero, IntPtr.Zero)) {
+                    if (PostMessage(child, message, new IntPtr(nonce), IntPtr.Zero)) {
                         postedToEdit = true;
                     }
                 }
@@ -184,7 +184,7 @@ public static class NeuraliaCycleWindowProbe {
         EnumWindows(delegate(IntPtr top, IntPtr data) {
             uint ownerPid;
             GetWindowThreadProcessId(top, out ownerPid);
-            if (ownerPid == processId && PostMessage(top, message, IntPtr.Zero, IntPtr.Zero)) {
+            if (ownerPid == processId && PostMessage(top, message, new IntPtr(nonce), IntPtr.Zero)) {
                 postedToWindow = true;
             }
             return true;
@@ -193,52 +193,100 @@ public static class NeuraliaCycleWindowProbe {
     }
 
     public static bool ReturnHomeViaNativeEscape(IntPtr parent) {
-        // A omnibox principal é o único EDIT filho direto da janela principal.
-        // A palette tem outro EDIT, mas vive dentro de um popup nativo.
-        var edit = FindWindowEx(parent, IntPtr.Zero, "Edit", null);
-        if (edit == IntPtr.Zero) return false;
+        // Exercita o caminho nativo embarcado, sem depender de foco global nem
+        // da mensagem privada do probe: WM_KEYDOWN chega ao WndProc do winit,
+        // vira WindowEvent::KeyboardInput(Escape), depois go_back() -> show_home().
+        // O scan code 0x01 é o Esc físico no set 1; key-up leva os bits 30/31.
         const uint WM_KEYDOWN = 0x0100;
         const uint WM_KEYUP = 0x0101;
-        if (!PostMessage(edit, WM_KEYDOWN, new IntPtr(27), IntPtr.Zero)) return false;
-        PostMessage(edit, WM_KEYUP, new IntPtr(27), IntPtr.Zero);
-        return true;
+        const uint SMTO_ABORTIFHUNG = 0x0002;
+        const int VK_ESCAPE = 27;
+
+        IntPtr result;
+        var down = SendMessageTimeout(
+            parent,
+            WM_KEYDOWN,
+            new IntPtr(VK_ESCAPE),
+            new IntPtr(0x00010001),
+            SMTO_ABORTIFHUNG,
+            1000,
+            out result
+        );
+        if (down == IntPtr.Zero) return false;
+
+        var up = SendMessageTimeout(
+            parent,
+            WM_KEYUP,
+            new IntPtr(VK_ESCAPE),
+            new IntPtr(unchecked((long)0xC0010001)),
+            SMTO_ABORTIFHUNG,
+            1000,
+            out result
+        );
+        return up != IntPtr.Zero;
     }
 
-    public static bool RequestLifecycleProbeReopen(IntPtr parent) {
+    private static uint ProcessIdOf(IntPtr anyWindow) {
+        uint processId;
+        GetWindowThreadProcessId(anyWindow, out processId);
+        return processId;
+    }
+
+    public static bool RequestLifecycleProbeReopen(IntPtr parent, int nonce) {
         var message = RegisterWindowMessage("NeuralIA.LifecycleProbe.Reopen");
-        return message != 0 && PostMessage(parent, message, IntPtr.Zero, IntPtr.Zero);
+        if (message == 0) return false;
+        var processId = ProcessIdOf(parent);
+        if (processId == 0) return false;
+
+        bool posted = false;
+        EnumWindows(delegate(IntPtr top, IntPtr data) {
+            uint ownerPid;
+            GetWindowThreadProcessId(top, out ownerPid);
+            if (ownerPid == processId && PostMessage(top, message, new IntPtr(nonce), IntPtr.Zero)) {
+                posted = true;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return posted;
+    }
+
+    private static bool ProbeFlagForProcess(IntPtr anyWindow, string name) {
+        var message = RegisterWindowMessage(name);
+        if (message == 0) return false;
+        var processId = ProcessIdOf(anyWindow);
+        if (processId == 0) return false;
+
+        bool ready = false;
+        EnumWindows(delegate(IntPtr top, IntPtr data) {
+            uint ownerPid;
+            GetWindowThreadProcessId(top, out ownerPid);
+            if (ownerPid != processId) return true;
+
+            IntPtr result;
+            var sent = SendMessageTimeout(
+                top,
+                message,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                0x0002,
+                250,
+                out result
+            );
+            if (sent != IntPtr.Zero && result != IntPtr.Zero) {
+                ready = true;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return ready;
     }
 
     public static bool LifecycleProbeReady(IntPtr parent) {
-        var message = RegisterWindowMessage("NeuralIA.LifecycleProbe.Ready");
-        if (message == 0) return false;
-        IntPtr result;
-        var sent = SendMessageTimeout(
-            parent,
-            message,
-            IntPtr.Zero,
-            IntPtr.Zero,
-            0x0002,
-            500,
-            out result
-        );
-        return sent != IntPtr.Zero && result != IntPtr.Zero;
+        return ProbeFlagForProcess(parent, "NeuralIA.LifecycleProbe.Ready");
     }
 
     public static bool LifecycleProbeHomeReady(IntPtr parent) {
-        var message = RegisterWindowMessage("NeuralIA.LifecycleProbe.HomeReady");
-        if (message == 0) return false;
-        IntPtr result;
-        var sent = SendMessageTimeout(
-            parent,
-            message,
-            IntPtr.Zero,
-            IntPtr.Zero,
-            0x0002,
-            500,
-            out result
-        );
-        return sent != IntPtr.Zero && result != IntPtr.Zero;
+        return ProbeFlagForProcess(parent, "NeuralIA.LifecycleProbe.HomeReady");
     }
 }
 "@
@@ -281,20 +329,20 @@ function Wait-ForNoVisibleWebSurfaces([System.Diagnostics.Process]$Process, [int
     return @(Get-VisibleWebViewSurfaceRects -Process $Process).Count
 }
 
-function Submit-LifecycleProbeQuery([System.Diagnostics.Process]$Process) {
+function Submit-LifecycleProbeQuery([System.Diagnostics.Process]$Process, [int]$Nonce) {
     $Process.Refresh()
     if ($Process.HasExited) {
         throw "NeuralIA saiu antes de reabrir o comparador."
     }
     $parent = Get-CurrentMainWindow -Process $Process
     if ($parent -eq [IntPtr]::Zero) { throw "Janela principal atual do NeuralIA não foi encontrada." }
-    $ok = [NeuraliaCycleWindowProbe]::RequestLifecycleProbeReopen($parent)
+    $ok = [NeuraliaCycleWindowProbe]::RequestLifecycleProbeReopen($parent, $Nonce)
     if (-not $ok) {
         throw "Falhou ao enfileirar o comando Win32 de reabertura do lifecycle."
     }
 }
 
-function Return-LifecycleProbeHome([System.Diagnostics.Process]$Process) {
+function Return-LifecycleProbeHome([System.Diagnostics.Process]$Process, [int]$Nonce) {
     $Process.Refresh()
     if ($Process.HasExited) {
         throw "NeuralIA saiu antes de regressar a Home."
@@ -302,14 +350,14 @@ function Return-LifecycleProbeHome([System.Diagnostics.Process]$Process) {
     $parent = Get-CurrentMainWindow -Process $Process
     if ($parent -eq [IntPtr]::Zero) { throw "Janela principal atual do NeuralIA não foi encontrada." }
 
-    # O gate mede teardown, não entrega de teclado. Use a mensagem Win32
-    # privada do modo NEURALIA_LIFECYCLE_PROBE em todos os ciclos para disparar
-    # exatamente HomeRequested no event loop do produto. O caminho real de ESC
-    # já é coberto separadamente; misturá-lo aqui tornou o ciclo 2+ dependente
-    # do estado/foco do EDIT oculto e produziu falso negativo no runner.
-    $ok = [NeuraliaCycleWindowProbe]::RequestLifecycleProbeHome($parent)
+    # Exercita o caminho que o utilizador realmente usa: Escape no HWND nativo
+    # da janela principal. SendMessageTimeout é síncrono e independe de foco,
+    # portanto não sofre com AppActivate/SendKeys nem com a troca de HWND após
+    # decorations. O gate continua rigoroso logo abaixo: só passa com zero
+    # WRY_WEBVIEW visível e HomeReady concluído.
+    $ok = [NeuraliaCycleWindowProbe]::ReturnHomeViaNativeEscape($parent)
     if (-not $ok) {
-        throw "Falhou ao enfileirar o retorno determinístico à Home."
+        throw "Falhou ao entregar Escape nativo à janela principal do NeuralIA."
     }
 }
 
@@ -327,29 +375,21 @@ function Wait-ForVisibleWebSurfaces([System.Diagnostics.Process]$Process, [int]$
 }
 
 function Wait-ForLifecycleProbeReady([System.Diagnostics.Process]$Process, [int]$TimeoutSec) {
-    # A condição autoritativa do gate é externa: os três hosts WRY precisam
-    # estar visíveis e permanecer assim por uma janela curta. O sinal Ready
-    # continua útil quando chega, mas não pode transformar um comparador já
-    # aberto em falso negativo só porque um timer interno ficou atrás do pump
-    # aninhado do WebView2.
+    # Tres hosts visiveis provam a geometria, mas NAO provam que a janela
+    # nativa terminou a troca de HWND/decorations. O ciclo 2 mostrou exatamente
+    # isso: aceitar 750 ms de estabilidade deixava o gate enviar Home para um
+    # HWND sem a subclass do NeuralIA. Agora Ready é obrigatório.
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $stableSince = $null
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
         $Process.Refresh()
         if ($Process.HasExited) { return $false }
 
         $visible = @(Get-VisibleWebViewSurfaceRects -Process $Process).Count
         if ($visible -ge 3) {
-            if ($null -eq $stableSince) {
-                $stableSince = [System.Diagnostics.Stopwatch]::StartNew()
-            }
             $main = Get-NeuraliaMainWindow -Process $Process
-            if ([NeuraliaCycleWindowProbe]::LifecycleProbeReady($main) -or $stableSince.Elapsed.TotalMilliseconds -ge 750) {
+            if ($main -ne [IntPtr]::Zero -and [NeuraliaCycleWindowProbe]::LifecycleProbeReady($main)) {
                 return $true
             }
-        }
-        else {
-            $stableSince = $null
         }
 
         Start-Sleep -Milliseconds 100
@@ -484,11 +524,13 @@ try {
             break
         }
 
-        # No modo de probe, o próprio event loop agenda HomeRequested depois
-        # de o comparador estabilizar. Isso remove da medição o transporte por
-        # teclado/registered-message para HWNDs que mudam com decorations.
-        # A condição continua externa e rigorosa: os três hosts WRY precisam
-        # desaparecer de verdade.
+        # O gate comanda explicitamente a transição depois do handshake Ready.
+        # Antes a própria app agendava Home/Reopen por timers internos. Isso
+        # misturava duas coisas: teardown real e atraso do pump aninhado do
+        # WebView2. A mensagem privada passa pelo mesmo EventLoopProxy e chama
+        # exatamente HomeRequested, mas deixa o teste decidir quando medir.
+        Return-LifecycleProbeHome -Process $process -Nonce $cycle
+
         $visibleAfterHome = Wait-ForNoVisibleWebSurfaces -Process $process -TimeoutSec $CloseTimeoutSec
 
         # A Home precisa ficar sem nenhum container WRY_WEBVIEW visivel.
@@ -499,9 +541,13 @@ try {
             $null = $failures.Add("ciclo ${cycle}: ${visibleAfterHome} superficie(s) WebView continuaram visiveis depois de voltar a Home")
         }
 
-        # A app só agenda o próximo reopen depois de RestoreHomeDecorations.
-        # Pequena folga aqui garante que a amostra pertence à Home restaurada,
-        # sem depender de consultar a subclass de um HWND potencialmente novo.
+        # Zero WRY prova teardown; HomeReady prova que a transição de
+        # decorations/HWND terminou antes de qualquer reabertura.
+        if (-not (Wait-ForLifecycleProbeHomeReady -Process $process -TimeoutSec $CloseTimeoutSec)) {
+            $null = $failures.Add("ciclo ${cycle}: Home ficou sem WebView mas não concluiu RestoreHomeDecorations")
+            break
+        }
+
         Start-Sleep -Milliseconds 250
 
         # Mede memoria no estado Home, nao no meio da abertura seguinte.
@@ -539,8 +585,12 @@ try {
             working_set_mib = $postHomeMiB
         })
 
-        # O próximo comparador é reaberto pelo próprio event loop, somente
-        # depois de a Home terminar a restauração de decorations/HWND.
+        # O próximo comparador só nasce depois de o script ter observado
+        # teardown=0 e HomeReady. Isso impede que a medição do ciclo N conte
+        # superfícies já pertencentes ao ciclo N+1.
+        if ($cycle -lt $Cycles) {
+            Submit-LifecycleProbeQuery -Process $process -Nonce ($cycle + 1)
+        }
     }
 
     $process.Refresh()

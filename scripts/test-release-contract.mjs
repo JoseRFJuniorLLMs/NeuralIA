@@ -5,7 +5,7 @@ const workflow = fs.readFileSync('.github/workflows/release.yml', 'utf8');
 
 assert.match(
   workflow,
-  /\$portableName\s*=\s*"NeuralIA-\$version-x64\.exe"/,
+  /\$portableName\s*=\s*"NeuralIA-v\$version-windows-x64\.exe"/,
   'portable release executable must include the version in its public filename'
 );
 assert.match(
@@ -25,7 +25,7 @@ assert.doesNotMatch(
 );
 assert.match(
   workflow,
-  /subject-path:\s*dist\/NeuralIA-\$\{\{ steps\.version\.outputs\.version \}\}-x64\.exe/,
+  /subject-path:\s*dist\/NeuralIA-v\$\{\{ steps\.version\.outputs\.version \}\}-windows-x64\.exe/,
   'attestation must follow the versioned public executable name'
 );
 

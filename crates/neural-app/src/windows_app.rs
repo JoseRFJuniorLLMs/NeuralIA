@@ -50,12 +50,12 @@ use windows_sys::Win32::{
         },
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
-            ES_AUTOHSCROLL, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowTextLengthW,
-            GetWindowTextW, GetWindowThreadProcessId, IDYES, MB_ICONINFORMATION, MB_OK, MB_YESNO,
-            MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
-            SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-            TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
-            WS_TABSTOP, WS_VISIBLE,
+            ES_AUTOHSCROLL, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
+            GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+            IDYES, MB_ICONINFORMATION, MB_OK, MB_YESNO, MF_SEPARATOR, MF_STRING, MessageBoxW,
+            SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos,
+            SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_KEYDOWN,
+            WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -163,11 +163,6 @@ enum UserEvent {
     /// WebViews. Isto evita reparentear hosts WRY enquanto WebView2 ainda
     /// conclui a destruição dos controllers no pump de mensagens.
     RestoreHomeDecorations,
-    /// Probe de CI: pede Home pelo próprio event loop, sem depender de HWND
-    /// externo que pode ser substituído ao alternar decorations.
-    LifecycleProbeAutoHome,
-    /// Probe de CI: reabre o comparador somente depois de a Home estabilizar.
-    LifecycleProbeAutoReopen,
     RestoreComparator,
     ExitRequested,
     ReaderReady {
@@ -1285,6 +1280,11 @@ static LIFECYCLE_PROBE_READY_MESSAGE: OnceLock<u32> = OnceLock::new();
 static LIFECYCLE_PROBE_HOME_READY_MESSAGE: OnceLock<u32> = OnceLock::new();
 static LIFECYCLE_COMPARATOR_READY: AtomicBool = AtomicBool::new(false);
 static LIFECYCLE_HOME_READY: AtomicBool = AtomicBool::new(false);
+/// O probe transmite comandos a todas as janelas do processo porque o HWND
+/// principal pode mudar com decorations. O nonce impede que o mesmo comando,
+/// recebido por um HWND antigo e pelo atual, gere eventos duplicados.
+static LIFECYCLE_LAST_HOME_NONCE: AtomicUsize = AtomicUsize::new(0);
+static LIFECYCLE_LAST_REOPEN_NONCE: AtomicUsize = AtomicUsize::new(0);
 
 fn lifecycle_probe_home_message() -> u32 {
     *LIFECYCLE_PROBE_HOME_MESSAGE.get_or_init(|| unsafe {
@@ -1437,13 +1437,28 @@ unsafe extern "system" fn window_subclass(
     }
     if message == lifecycle_home || message == lifecycle_reopen {
         if lifecycle_probe_enabled() && reference_data != 0 {
-            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
-            if message == lifecycle_home {
-                let _ = proxy.send_event(UserEvent::HomeRequested);
+            let nonce = wparam;
+            let seen = if message == lifecycle_home {
+                &LIFECYCLE_LAST_HOME_NONCE
             } else {
-                let input = startup_input();
-                if !input.is_empty() {
-                    let _ = proxy.send_event(UserEvent::SubmitText(input));
+                &LIFECYCLE_LAST_REOPEN_NONCE
+            };
+
+            // O script faz broadcast process-wide por desenho: decorations pode
+            // deixar mais de um HWND transitório vivo. Um único comando lógico
+            // não pode virar dois HomeRequested/SubmitText. Sem este filtro,
+            // um Reopen atrasado podia chegar depois da Home do ciclo seguinte
+            // e recriar exactamente as três superfícies que o gate acabara de
+            // derrubar.
+            if nonce == 0 || seen.swap(nonce, Ordering::AcqRel) != nonce {
+                let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+                if message == lifecycle_home {
+                    let _ = proxy.send_event(UserEvent::HomeRequested);
+                } else {
+                    let input = startup_input();
+                    if !input.is_empty() {
+                        let _ = proxy.send_event(UserEvent::SubmitText(input));
+                    }
                 }
             }
         }
@@ -1804,9 +1819,12 @@ unsafe extern "system" fn omnibox_subclass(
 ) -> LRESULT {
     if message == lifecycle_probe_home_message() && lifecycle_probe_enabled() && reference_data != 0
     {
-        let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
-        SetWindowTextW(hwnd, windows_sys::w!(""));
-        let _ = proxy.send_event(UserEvent::HomeRequested);
+        let nonce = wparam;
+        if nonce == 0 || LIFECYCLE_LAST_HOME_NONCE.swap(nonce, Ordering::AcqRel) != nonce {
+            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+            SetWindowTextW(hwnd, windows_sys::w!(""));
+            let _ = proxy.send_event(UserEvent::HomeRequested);
+        }
         return 0;
     }
 
@@ -3153,12 +3171,31 @@ impl App {
         // visíveis a partir da segunda abertura. Deixe o event loop respirar
         // antes de trocar o chrome nativo.
         self.leave_fullscreen();
-        self.timers
-            .after(Duration::from_millis(40), UserEvent::RestoreHomeDecorations);
+
+        // Teardown e transicao para Home sao coisas diferentes. Antes esta
+        // funcao sempre agendava RestoreHomeDecorations; quando um novo
+        // comparador era aberto a partir da propria Home, esse timer podia
+        // disparar dentro do pump aninhado de build_as_child e recolocar a
+        // moldura da Home no meio da criacao dos tres WRY_WEBVIEW. O resultado
+        // era exatamente a regressao dos ciclos 2+: hosts visiveis presos ao
+        // HWND errado. Aqui so destruimos. Quem realmente entra na Home agenda
+        // a restauracao depois.
+        if let Some(window) = &self.window {
+            hide_orphaned_wry_hosts(window);
+        }
+
         if let Ok(mut bytes) = self.pdf_bytes.lock() {
             *bytes = Vec::new();
         }
         self.reading_pdf = false;
+    }
+
+    fn schedule_home_restoration(&self) {
+        if lifecycle_probe_enabled() {
+            LIFECYCLE_HOME_READY.store(false, Ordering::Release);
+        }
+        self.timers
+            .after(Duration::from_millis(40), UserEvent::RestoreHomeDecorations);
     }
 
     fn show_home(&mut self) {
@@ -3170,6 +3207,7 @@ impl App {
         // entre pesquisas. Reuso dentro do próprio comparador continua possível,
         // mas sair para Home sempre encerra as superfícies web.
         self.destroy_web_surfaces();
+        self.schedule_home_restoration();
 
         self.bar_hover = None;
         self.status = None;
@@ -3183,6 +3221,7 @@ impl App {
         self.next_generation();
         self.destroy_web_surfaces();
         self.surface = Surface::Home;
+        self.schedule_home_restoration();
         self.status = Some(message.into());
         self.show_omnibox(true);
         self.position_omnibox();
@@ -3467,6 +3506,7 @@ impl App {
         let generation = self.next_generation();
         self.destroy_web_surfaces();
         self.surface = Surface::Home;
+        self.schedule_home_restoration();
         self.status = Some(format!("Lendo {url} …"));
         self.request_redraw();
 
@@ -3496,6 +3536,7 @@ impl App {
         let generation = self.next_generation();
         self.destroy_web_surfaces();
         self.surface = Surface::Home;
+        self.schedule_home_restoration();
         self.status = Some(format!(
             "A descarregar PDF de {} …",
             url.host_str().unwrap_or("?")
@@ -4200,6 +4241,17 @@ impl App {
             );
         }
 
+        // Chegar aqui significa que os tres build_as_child ja retornaram,
+        // self.comparator ja existe e o layout inicial foi aplicado. Nesta
+        // altura set_decorations(false) pode ja ter trocado/reparentado o HWND
+        // nativo. Reinstale a subclass NO HWND efetivo antes de publicar Ready:
+        // o gate pode enviar Home imediatamente depois de observar o flag.
+        self.ensure_window_subclass();
+
+        if lifecycle_probe_enabled() {
+            LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
+        }
+
         self.schedule_gmail_probe(4);
         self.begin_reading_session(false);
         self.request_redraw();
@@ -4568,14 +4620,32 @@ impl App {
             return;
         }
 
+        let Ok(valid) = neural_core::validate_web_url(&url) else {
+            self.show_splash("URL do link inválida.".to_string(), 3);
+            return;
+        };
+        if neural_core::is_local_network_target(&valid) {
+            self.show_splash(
+                "O link não pode redirecionar a coluna para a rede local.".to_string(),
+                4,
+            );
+            return;
+        }
+
         let loaded = self
             .comparator
             .as_ref()
             .and_then(|comp| comp.views.get(index))
-            .is_some_and(|view| view.webview.load_url(&url).is_ok());
+            .is_some_and(|view| view.webview.load_url(valid.as_str()).is_ok());
 
+        // Um popup/link que falha pertence à coluna que o originou. Nunca
+        // derrube as três colunas para abrir um WebView solitário como fallback:
+        // além de destruir a comparação, isso reabria a corrida de lifecycle.
         if !loaded {
-            self.web(url);
+            self.show_splash(
+                "Não consegui abrir esse link na coluna sem perder a comparação.".to_string(),
+                4,
+            );
         }
     }
 
@@ -4741,6 +4811,8 @@ impl App {
         if let Some(comp) = &mut self.comparator {
             comp.expanded = None;
             if let Some(previous) = comp.split.take() {
+                let _ = previous.webview.set_visible(false);
+                let _ = previous.webview.focus_parent();
                 drop(previous);
             }
         }
@@ -7205,6 +7277,13 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // set_decorations pode trocar/reparentear o HWND depois do callback que
+        // pediu a mudança. Este é o primeiro ponto garantido depois de cada lote
+        // de eventos, já fora do pump aninhado do WebView2. Reinstalar a
+        // subclass aqui é idempotente e garante que Home, atalhos e o probe
+        // continuem chegando à janela REAL também na segunda abertura.
+        self.ensure_window_subclass();
+
         let interval = if self.surface == Surface::Home && home_animation_enabled() {
             // O `Occluded` do Windows nao cobre a minimizacao em todos os
             // casos, por isso pergunta-se tambem a janela.
@@ -7384,53 +7463,33 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_comparator_splitters();
                     self.sync_comparator_buttons();
                     self.sync_exit_button();
-                    if lifecycle_probe_enabled()
-                        && !LIFECYCLE_COMPARATOR_READY.swap(true, Ordering::AcqRel)
-                    {
-                        // O benchmark mede teardown, não transporte de teclado ou
-                        // de mensagens para um HWND que o Windows pode substituir.
-                        // Agenda a mesma transição HomeRequested dentro do event
-                        // loop, depois de o comparador ter estabilizado.
-                        self.timers.after(
-                            Duration::from_millis(800),
-                            UserEvent::LifecycleProbeAutoHome,
-                        );
+                    if lifecycle_probe_enabled() {
+                        LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
                     }
                     self.request_redraw();
                 }
             }
             UserEvent::RestoreHomeDecorations => {
                 if self.surface == Surface::Home {
+                    // O controller já foi descartado. Primeiro escondemos
+                    // qualquer host WRY que ainda esteja preso ao HWND antigo,
+                    // depois restauramos a moldura e repetimos a limpeza no
+                    // HWND efetivo. Isto fecha a regressão em que, do segundo
+                    // ciclo em diante, três WRY_WEBVIEW ficavam visíveis sobre
+                    // a Home apesar de os WebView Rust já terem sido dropados.
                     if let Some(window) = &self.window {
+                        hide_orphaned_wry_hosts(window);
                         window.set_decorations(true);
                     }
                     self.ensure_window_subclass();
+                    if let Some(window) = &self.window {
+                        hide_orphaned_wry_hosts(window);
+                    }
                     self.needs_clear = true;
                     self.position_omnibox();
                     self.request_redraw();
-                    if lifecycle_probe_enabled()
-                        && !LIFECYCLE_HOME_READY.swap(true, Ordering::AcqRel)
-                    {
-                        // A reabertura automática ocorre bem depois da medição da
-                        // Home. Assim cada ciclo começa somente após a restauração
-                        // de decorations/HWND do ciclo anterior.
-                        self.timers.after(
-                            Duration::from_millis(4000),
-                            UserEvent::LifecycleProbeAutoReopen,
-                        );
-                    }
-                }
-            }
-            UserEvent::LifecycleProbeAutoHome => {
-                if lifecycle_probe_enabled() && self.surface == Surface::Comparator {
-                    self.show_home();
-                }
-            }
-            UserEvent::LifecycleProbeAutoReopen => {
-                if lifecycle_probe_enabled() && self.surface == Surface::Home {
-                    let input = startup_input();
-                    if !input.is_empty() {
-                        self.handle_input(input);
+                    if lifecycle_probe_enabled() {
+                        LIFECYCLE_HOME_READY.store(true, Ordering::Release);
                     }
                 }
             }
@@ -8038,6 +8097,33 @@ fn window_hwnd(window: &Window) -> Option<HWND> {
         return None;
     };
     Some(handle.hwnd.get() as HWND)
+}
+
+/// Esconde containers WRY que ficaram órfãos depois do drop dos controllers.
+///
+/// WebView2 pode concluir a destruição de forma assíncrona quando a janela pai
+/// troca de decorations. Nessa janela curta, um host `WRY_WEBVIEW` já sem
+/// controller pode continuar com WS_VISIBLE e ficar pintado por cima da Home.
+/// A Home nunca deve mostrar esses hosts. O pool de processos pode continuar
+/// quente para reutilização, mas a superfície nativa precisa desaparecer.
+unsafe extern "system" fn hide_wry_webview_host(hwnd: HWND, _lparam: LPARAM) -> i32 {
+    let mut class_name = [0u16; 64];
+    let len = GetClassNameW(hwnd, class_name.as_mut_ptr(), class_name.len() as i32);
+    if len > 0
+        && String::from_utf16_lossy(&class_name[..len as usize]).eq_ignore_ascii_case("WRY_WEBVIEW")
+    {
+        ShowWindow(hwnd, SW_HIDE);
+    }
+    1
+}
+
+fn hide_orphaned_wry_hosts(window: &Window) {
+    let Some(parent) = window_hwnd(window) else {
+        return;
+    };
+    unsafe {
+        EnumChildWindows(parent, Some(hide_wry_webview_host), 0);
+    }
 }
 
 fn home_animation_enabled() -> bool {
@@ -10747,6 +10833,99 @@ mod tests {
     }
 
     #[test]
+    fn comparator_popup_failure_never_falls_back_to_destroying_all_panels() {
+        let source = include_str!("windows_app.rs");
+        let body = source
+            .split("fn open_in_column")
+            .nth(1)
+            .and_then(|part| part.split("fn open_everywhere").next())
+            .expect("open_in_column body");
+
+        // Fora do comparador, um popup ainda pode abrir como Web normal.
+        // Dentro dele, porém, uma falha de load_url deve ficar isolada à
+        // coluna. Um segundo self.web(url) reintroduziria o teardown das três
+        // colunas por causa de um único clique.
+        assert_eq!(body.matches("self.web(url)").count(), 1);
+        assert!(body.contains("load_url(valid.as_str())"));
+        assert!(body.contains("sem perder a comparação"));
+    }
+
+    #[test]
+    fn lifecycle_probe_commands_are_deduplicated_by_nonce() {
+        LIFECYCLE_LAST_HOME_NONCE.store(0, Ordering::Release);
+        LIFECYCLE_LAST_REOPEN_NONCE.store(0, Ordering::Release);
+
+        assert_ne!(LIFECYCLE_LAST_HOME_NONCE.swap(7, Ordering::AcqRel), 7);
+        assert_eq!(LIFECYCLE_LAST_HOME_NONCE.swap(7, Ordering::AcqRel), 7);
+        assert_ne!(LIFECYCLE_LAST_HOME_NONCE.swap(8, Ordering::AcqRel), 8);
+
+        assert_ne!(LIFECYCLE_LAST_REOPEN_NONCE.swap(9, Ordering::AcqRel), 9);
+        assert_eq!(LIFECYCLE_LAST_REOPEN_NONCE.swap(9, Ordering::AcqRel), 9);
+        assert_ne!(LIFECYCLE_LAST_REOPEN_NONCE.swap(10, Ordering::AcqRel), 10);
+    }
+
+    #[test]
+    fn lifecycle_ready_is_published_at_the_real_end_of_comparator_activation() {
+        let source = include_str!("windows_app.rs");
+        let body = source
+            .split("fn activate_comparator")
+            .nth(1)
+            .and_then(|part| part.split("fn expand_comparator").next())
+            .expect("activate_comparator body");
+
+        assert!(body.contains("LIFECYCLE_COMPARATOR_READY.store(true"));
+        let ready = body
+            .find("LIFECYCLE_COMPARATOR_READY.store(true")
+            .expect("Ready publish");
+        let layout = body
+            .find("self.update_comparator_layout()")
+            .expect("initial layout");
+        let rebind = body
+            .find("self.ensure_window_subclass()")
+            .expect("subclass rebind");
+        assert!(
+            ready > layout,
+            "Ready so pode ser publicado depois de o comparador existir e ter layout"
+        );
+        assert!(
+            ready > rebind,
+            "Ready so pode ser publicado depois de rebindar a subclass no HWND efetivo"
+        );
+    }
+
+    #[test]
+    fn webview_teardown_does_not_schedule_home_chrome_while_opening_comparator() {
+        let source = include_str!("windows_app.rs");
+        let destroy = source
+            .split("fn destroy_web_surfaces")
+            .nth(1)
+            .and_then(|part| part.split("fn schedule_home_restoration").next())
+            .expect("destroy_web_surfaces body");
+        assert!(!destroy.contains("UserEvent::RestoreHomeDecorations"));
+
+        let home = source
+            .split("fn show_home")
+            .nth(1)
+            .and_then(|part| part.split("fn show_native_error").next())
+            .expect("show_home body");
+        assert!(home.contains("self.schedule_home_restoration()"));
+
+        let comparator = source
+            .split("fn open_comparator")
+            .nth(1)
+            .and_then(|part| part.split("fn activate_comparator").next())
+            .expect("open_comparator body");
+        assert!(!comparator.contains("schedule_home_restoration"));
+
+        let idle = source
+            .split("fn about_to_wait")
+            .nth(1)
+            .and_then(|part| part.split("fn user_event").next())
+            .expect("about_to_wait body");
+        assert!(idle.contains("self.ensure_window_subclass()"));
+    }
+
+    #[test]
     fn a_click_reported_by_another_column_is_ignored() {
         // Cada coluna tem o seu handler de IPC. Sem esta verificacao, uma
         // pagina numa coluna mandava a outra abrir o que lhe apetecesse.
@@ -10769,6 +10948,20 @@ mod tests {
             COMPARATOR_INJECT_SCRIPT
                 .contains("act('link', { col:colIndex, url:target.href, aside:aside })")
         );
+        // Os provedores usam React, popovers e Shadow DOM. O interceptador tem
+        // de chegar antes dos handlers de document e descobrir o link real no
+        // composed path; depois que assume um link externo, nenhum listener do
+        // site pode disparar uma segunda navegacao concorrente.
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("listen(window, 'click'"));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("listen(window, 'auxclick'"));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("event.composedPath"));
+        assert!(COMPARATOR_INJECT_SCRIPT.contains("event.stopImmediatePropagation()"));
+        let route_link = COMPARATOR_INJECT_SCRIPT
+            .split("function routeLink")
+            .nth(1)
+            .and_then(|part| part.split("listen(window, 'click'").next())
+            .expect("routeLink body");
+        assert!(!route_link.contains("event.defaultPrevented"));
         // O botao do meio chega como `auxclick`; dentro de `click` o
         // `event.button` e sempre 0. Ter isto aqui e presenca, nao
         // comportamento -- o que decide para onde vai o clique esta em
@@ -13429,15 +13622,41 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
   // registam os deles em captura primeiro; quem chega depois recebe os
   // eventos ja com `defaultPrevented` posto e desiste sem fazer nada.
   const GOOGLE_REDIRECT_PARAMS = ['q', 'url', 'imgurl', 'adurl'];
+  const LINK_SELECTOR = 'a[href],area[href],[role="link"],[data-href],[data-url]';
 
-  function linkUrl(node) {
-    // Nem toda a fonte e uma <a href>: o AI Mode do Google e as citacoes do
-    // ChatGPT usam chips que trazem o endereco num atributo. Ler apenas
-    // `a[href]` deixava de fora justamente as ligacoes destas paginas -- que
-    // sao as unicas paginas onde isto corre.
-    const anchor = node.closest('a[href], [role="link"], [data-href], [data-url]');
+  function linkNodeFromEvent(event) {
+    // React/Shadow DOM pode retargetear event.target para um host que nao e o
+    // <a> real. composedPath devolve o caminho original atraves das sombras.
+    const path = typeof event.composedPath === 'function'
+      ? event.composedPath()
+      : [event.target];
+
+    for (const candidate of path) {
+      if (!candidate || candidate === window || candidate === document) continue;
+      if (candidate.matches && candidate.matches(LINK_SELECTOR)) return candidate;
+      if (candidate.closest) {
+        const found = candidate.closest(LINK_SELECTOR);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  function neuraliaControlFromEvent(event) {
+    const path = typeof event.composedPath === 'function'
+      ? event.composedPath()
+      : [event.target];
+    return path.some((candidate) => candidate && candidate.closest
+      && candidate.closest('#neuralia-comp-controls,#neuralia-palette'));
+  }
+
+  function linkUrl(anchor) {
     if (!anchor) return null;
-    const raw = anchor.getAttribute('href')
+
+    // href absoluto do DOM ganha de getAttribute: sites React podem montar a
+    // URL relativa e trocar <base>. data-* cobre chips de fonte sem <a>.
+    const raw = (typeof anchor.href === 'string' && anchor.href)
+      || anchor.getAttribute('href')
       || anchor.getAttribute('data-href')
       || anchor.getAttribute('data-url');
     if (!raw) return null;
@@ -13446,10 +13665,9 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
     try { target = new URL(raw, location.href); } catch (_) { return null; }
     if (target.protocol !== 'http:' && target.protocol !== 'https:') return null;
 
-    // O Google embrulha as fontes num redirecionamento seu. Desembrulhar pelo
-    // PARAMETRO e nao pelo caminho: /url, /imgres e /aclk sao caminhos
-    // diferentes para a mesma coisa, e so o primeiro estava coberto.
-    const host = target.hostname;
+    // O Google embrulha as fontes em /url, /imgres, /aclk etc. O parametro
+    // revela o destino real sem depender de um path especifico.
+    const host = target.hostname.toLowerCase();
     if (host === 'google.com' || host.endsWith('.google.com')) {
       for (const name of GOOGLE_REDIRECT_PARAMS) {
         const actual = target.searchParams.get(name);
@@ -13467,37 +13685,36 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
   }
 
   function routeLink(event, aside) {
-    if (!event.isTrusted || event.defaultPrevented) return;
-    // Alt e Shift sao gestos do proprio navegador (descarregar, nova janela);
-    // nao os roubamos.
-    if (event.altKey || event.shiftKey) return;
-    const node = event.target;
-    if (!node || !node.closest) return;
-    if (node.closest('#neuralia-comp-controls,#neuralia-palette')) return;
+    if (!event.isTrusted) return false;
+    // Alt e Shift continuam reservados ao comportamento nativo do navegador.
+    if (event.altKey || event.shiftKey) return false;
+    if (neuraliaControlFromEvent(event)) return false;
 
-    const target = linkUrl(node);
-    if (!target) return;
+    const anchor = linkNodeFromEvent(event);
+    const target = linkUrl(anchor);
+    if (!target) return false;
 
-    // Clique simples numa ligacao do proprio sitio e navegacao interna da
-    // aplicacao: a SPA trata disso melhor do que um load_url, que recarregava
-    // a pagina toda e perdia a conversa. Com Ctrl a intencao e explicita e
-    // vale para qualquer endereco, incluindo o do proprio sitio.
-    if (!aside && target.origin === location.origin) return;
+    // Navegacao interna da propria IA continua com a SPA para nao perder a
+    // conversa. Ctrl/meta/meio e links externos sao assumidos pelo NeuralIA.
+    if (!aside && target.origin === location.origin) return false;
 
+    // Capturamos no WINDOW, antes de handlers de document/React. Depois que o
+    // NeuralIA assume o clique, nenhum listener concorrente pode navegar a
+    // coluna ao mesmo tempo e criar click duplo/race com o IPC.
     event.preventDefault();
-    event.stopPropagation();
+    event.stopImmediatePropagation();
     act('link', { col:colIndex, url:target.href, aside:aside });
+    return true;
   }
 
-  listen(document, 'click', (event) => {
+  listen(window, 'click', (event) => {
     if (event.button !== 0) return;
     routeLink(event, !!(event.ctrlKey || event.metaKey));
   }, true);
 
-  // O botao do meio NAO dispara 'click' desde o Chrome 55 -- dispara
-  // 'auxclick'. O `event.button === 1` que aqui estava dentro do 'click' era
-  // codigo morto: naquele evento o botao e sempre 0.
-  listen(document, 'auxclick', (event) => {
+  // O botao do meio usa auxclick. Captura no window pela mesma razao: sites de
+  // IA costumam instalar handlers de document que chamam window.open primeiro.
+  listen(window, 'auxclick', (event) => {
     if (event.button !== 1) return;
     routeLink(event, true);
   }, true);
