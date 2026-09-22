@@ -192,6 +192,31 @@ public static class NeuraliaCycleWindowProbe {
         return postedToEdit || postedToWindow;
     }
 
+    public static bool ReturnHomeViaNativeButton(IntPtr anyWindow) {
+        const uint WM_LBUTTONUP = 0x0202;
+        var processId = ProcessIdOf(anyWindow);
+        if (processId == 0) return false;
+
+        bool delivered = false;
+        EnumWindows(delegate(IntPtr top, IntPtr data) {
+            uint ownerPid;
+            GetWindowThreadProcessId(top, out ownerPid);
+            if (ownerPid != processId) return true;
+
+            // Home é um controlo Win32 filho real. O nome não é texto visual:
+            // a subclass pinta o botão; serve apenas para identificar sem
+            // adivinhar geometria/DPI nem confundir splitters/popups.
+            var home = FindWindowEx(top, IntPtr.Zero, "STATIC", "NeuralIA.Home");
+            if (home != IntPtr.Zero && IsWindowVisible(home)) {
+                if (PostMessage(home, WM_LBUTTONUP, IntPtr.Zero, IntPtr.Zero)) {
+                    delivered = true;
+                }
+            }
+            return true;
+        }, IntPtr.Zero);
+        return delivered;
+    }
+
     public static bool ReturnHomeViaNativeEscape(IntPtr parent) {
         // Exercita o caminho nativo embarcado, sem depender de foco global nem
         // da mensagem privada do probe: WM_KEYDOWN chega ao WndProc do winit,
@@ -350,14 +375,13 @@ function Return-LifecycleProbeHome([System.Diagnostics.Process]$Process, [int]$N
     $parent = Get-CurrentMainWindow -Process $Process
     if ($parent -eq [IntPtr]::Zero) { throw "Janela principal atual do NeuralIA não foi encontrada." }
 
-    # Exercita o caminho que o utilizador realmente usa: Escape no HWND nativo
-    # da janela principal. SendMessageTimeout é síncrono e independe de foco,
-    # portanto não sofre com AppActivate/SendKeys nem com a troca de HWND após
-    # decorations. O gate continua rigoroso logo abaixo: só passa com zero
-    # WRY_WEBVIEW visível e HomeReady concluído.
-    $ok = [NeuraliaCycleWindowProbe]::ReturnHomeViaNativeEscape($parent)
+    # Exercita o caminho embarcado que o utilizador realmente clica: o botão
+    # Home Win32 nativo. Ele é procurado em todas as top-level do processo
+    # porque set_decorations pode trocar o HWND externo. O gate continua
+    # rigoroso: depois do clique exige zero WRY_WEBVIEW e HomeReady concluído.
+    $ok = [NeuraliaCycleWindowProbe]::ReturnHomeViaNativeButton($parent)
     if (-not $ok) {
-        throw "Falhou ao entregar Escape nativo à janela principal do NeuralIA."
+        throw "Botão Home nativo do NeuralIA não foi encontrado/clicado."
     }
 }
 
