@@ -4,11 +4,25 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **Auditoria recursiva de 20 passagens:** a omnibox Win32 da Home mantém o HWND estável fora da área cliente, mas fica desabilitada no comparador e deixa de poder roubar foco/teclado.
+- **Grupos de abas:** “Fechar outras abas deste grupo” e “Fechar todas deste grupo” passam a atuar somente no grupo selecionado; grupos vazios são podados e outras coleções permanecem intactas.
+- **Reagrupamento:** mover a última aba de um grupo para um novo grupo deixa de criar pílulas vazias/fantasmas.
+- **Win32:** falha ao instalar a subclass da omnibox destrói o HWND recém-criado em vez de vazá-lo; reparenting passa a verificar o pai efetivo.
+- **IPC:** se o `BCryptGenRandom` principal falhar, a capability tenta `RtlGenRandom` antes de falhar fechado, sem degradar para fonte pseudoaleatória.
+
+### Security
+- **SPEC-0109:** câmera, microfone e captura de tela passam pelo consentimento nativo do WebView2 apenas em superfícies visíveis; agente e demais permissões continuam `Deny`.
+
+### Testing
+- Gates de comportamento cobrem escopo de grupos, poda de grupos vazios, omnibox desabilitada fora da Home, fallback CSPRNG e política WebRTC.
+
+
 ## [2.1.4] - 2026-09-22
 
 ### Fixed
 - **Chrome do comparador corrigido após auditoria recursiva.** Expandir uma IA passa a ocupar somente a área de conteúdo; a titlebar do NeuralIA e os controles minimizar, maximizar/restaurar e fechar permanecem visíveis.
-- **Omnibox da Home deixa de sobreviver escondida no comparador.** O controle Win32 é realmente ocultado fora da Home, reduzindo interferência de foco/teclado e eliminando a regressão da barra de pesquisa na segunda tela.
+- **Omnibox da Home deixa de ocupar visualmente o comparador.** O controle Win32 permanece vivo para estabilidade do HWND, mas é estacionado fora da área cliente; a desativação explícita de foco/teclado fica registrada em `[Unreleased]`.
 - **Lifecycle WebView2 endurecido.** O gate só publica o comparador como pronto depois de devolver o controle ao event loop, fora do pump aninhado do WebView2.
 - **Isolamento IPC entre painéis.** Uma coluna não pode mais enviar `Expand { col }` para comandar outra coluna.
 - **Erros do histórico deixam de ser silenciosos.** Falhas de persistência e saturação da fila passam a ser reportadas pela interface.
