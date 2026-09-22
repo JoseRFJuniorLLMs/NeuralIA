@@ -4,6 +4,21 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+## [2.1.4] - 2026-09-22
+
+### Fixed
+- **Chrome do comparador corrigido após auditoria recursiva.** Expandir uma IA passa a ocupar somente a área de conteúdo; a titlebar do NeuralIA e os controles minimizar, maximizar/restaurar e fechar permanecem visíveis.
+- **Omnibox da Home deixa de sobreviver escondida no comparador.** O controle Win32 é realmente ocultado fora da Home, reduzindo interferência de foco/teclado e eliminando a regressão da barra de pesquisa na segunda tela.
+- **Lifecycle WebView2 endurecido.** O gate só publica o comparador como pronto depois de devolver o controle ao event loop, fora do pump aninhado do WebView2.
+- **Isolamento IPC entre painéis.** Uma coluna não pode mais enviar `Expand { col }` para comandar outra coluna.
+- **Erros do histórico deixam de ser silenciosos.** Falhas de persistência e saturação da fila passam a ser reportadas pela interface.
+
+### Testing
+- O loop de lifecycle passa a medir, além de Working Set e processos WebView2, crescimento de **handles Win32, threads e objetos GDI**.
+- Prova de sabotagem do PR #126 reintroduziu fullscreen borderless, readiness precoce e expansão cruzada; os novos gates ficaram vermelhos exatamente nesses pontos.
+- O PR #124 passou os gates Windows, core, core-linux, runtime, timeline, dependency policy/audit e installer smoke antes do merge.
+
+
 ## [2.1.3] - 2026-09-22
 
 ### Fixed
