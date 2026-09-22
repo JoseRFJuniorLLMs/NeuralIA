@@ -4,6 +4,12 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- Auditoria de 10 passagens: expandir uma IA permanece dentro da janela e mantém a barra do NeuralIA e os controles minimizar/maximizar/fechar; a omnibox da Home fica realmente escondida fora da Home.
+- O handshake de lifecycle só declara o comparador pronto depois de o winit recuperar o event loop, evitando falso-verde durante pump aninhado do WebView2.
+- O gate de ciclos passa a medir crescimento de handles Win32, threads e objetos GDI, além de working set, superfícies WRY e pool WebView2.
+- O IPC de uma coluna não pode mais expandir outra coluna, e falhas/saturação de gravação do histórico deixam de ser silenciosas.
+
 ## [2.1.3] - 2026-09-22
 
 ### Fixed
