@@ -41,6 +41,124 @@ jobs:
       # produto e não deve depender de um único sistema operativo para ter
       # cobertura.
       - run: cargo test --locked -p neural-app
+      - name: Prove 100-interaction UI gates reject sabotage
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sourcePath = "crates/neural-app/src/windows_app.rs"
+          $linkTestPath = "scripts/test-link-routing.mjs"
+          $originalSource = Get-Content -Raw -LiteralPath $sourcePath
+          $originalLinkTest = Get-Content -Raw -LiteralPath $linkTestPath
+
+          function Replace-Exact([string]$text, [string]$old, [string]$new, [string]$label) {
+            $count = ([regex]::Matches($text, [regex]::Escape($old))).Count
+            if ($count -ne 1) {
+              throw "Sabotage target '$label' expected once, found $count."
+            }
+            return $text.Replace($old, $new)
+          }
+
+          try {
+            $broken = $originalSource
+
+            $broken = Replace-Exact $broken @'
+            && x < self.x + self.width
+            && y >= self.y
+            && y < self.y + self.height
+          '@ @'
+            && x <= self.x + self.width
+            && y >= self.y
+            && y <= self.y + self.height
+          '@ "half-open-hit-test"
+
+            $broken = Replace-Exact $broken @'
+              start_generation == current_generation && surface == Surface::Comparator
+          '@ @'
+              true
+          '@ "stale-split-generation"
+
+            $broken = Replace-Exact $broken @'
+              pressed.filter(|index| Some(*index) == released)
+          '@ @'
+              released
+          '@ "native-press-release"
+
+            $broken = Replace-Exact $broken @'
+                  .filter(|(_, group)| Some(group.id) != current_group)
+          '@ @'
+                  .filter(|_| true)
+          '@ "join-current-group"
+
+            $broken = Replace-Exact $broken @'
+                  IpcAction::Fullscreen => Some(UserEvent::ExpandComparator(col_index)),
+                  IpcAction::ShortcutExpand { col } => Some(UserEvent::ExpandComparator(col)),
+          '@ @'
+                  IpcAction::Fullscreen => Some(UserEvent::ExpandComparator(col_index)),
+                  IpcAction::ShortcutExpand { col } if col == col_index => {
+                      Some(UserEvent::ExpandComparator(col))
+                  }
+          '@ "global-digit-shortcut"
+
+            $broken = Replace-Exact $broken @'
+                  Err(error) => Err(error),
+          '@ @'
+                  Err(error) => {
+                      let _ = current_split.take();
+                      *expanded = None;
+                      Err(error)
+                  },
+          '@ "split-transaction"
+
+            Set-Content -LiteralPath $sourcePath -Value $broken -Encoding utf8
+
+            $output = Join-Path $env:RUNNER_TEMP "ui-sabotage-tests.txt"
+            cargo test --locked -p neural-app 2>&1 | Tee-Object -FilePath $output
+            $result = $LASTEXITCODE
+            if ($result -eq 0) {
+              throw "UI sabotage unexpectedly stayed green."
+            }
+
+            $log = Get-Content -Raw -LiteralPath $output
+            $expectedFailures = @(
+              "ui_rect_edges_are_half_open_so_adjacent_controls_never_share_a_click",
+              "keyboard_shortcuts_keep_page_identity_and_global_digit_targets",
+              "stale_split_builds_are_discarded_after_navigation_changes",
+              "failed_split_build_preserves_the_previous_split_and_expansion",
+              "native_buttons_only_activate_when_press_and_release_match",
+              "current_group_is_not_offered_as_a_join_target"
+            )
+            foreach ($name in $expectedFailures) {
+              if ($log -notmatch [regex]::Escape($name)) {
+                throw "Sabotage did not exercise expected gate: $name"
+              }
+            }
+            Write-Host "Sabotage proof: six Rust UI regressions turned the shipped-path gates red."
+
+            Set-Content -LiteralPath $sourcePath -Value $originalSource -Encoding utf8
+
+            $brokenLinkTest = Replace-Exact $originalLinkTest @'
+          '#neuralia-comp-controls,#neuralia-palette,a[href],button,input,textarea,select,option,label,summary,[role="button"],[role="link"],[contenteditable="true"]'
+          '@ @'
+          '#neuralia-comp-controls,#neuralia-palette,button,input,textarea,select,option,label,summary,[role="button"],[role="link"],[contenteditable="true"]'
+          '@ "double-click-link-guard"
+            Set-Content -LiteralPath $linkTestPath -Value $brokenLinkTest -Encoding utf8
+
+            node scripts/test-link-routing.mjs
+            $jsResult = $LASTEXITCODE
+            if ($jsResult -eq 0) {
+              throw "Double-click routing sabotage unexpectedly stayed green."
+            }
+            Write-Host "Sabotage proof: removing the link guard turns the runtime routing gate red."
+          }
+          finally {
+            Set-Content -LiteralPath $sourcePath -Value $originalSource -Encoding utf8
+            Set-Content -LiteralPath $linkTestPath -Value $originalLinkTest -Encoding utf8
+          }
+
+          cargo fmt --all -- --check
+          cargo test --locked -p neural-app
+          node scripts/test-link-routing.mjs
+          git diff --exit-code -- $sourcePath $linkTestPath
       - name: Exercise ChatGPT/Claude auto-submit runtime
         run: node scripts/test-ai-auto-submit.mjs
       - name: Exercise shipped provider link routing
