@@ -46,8 +46,7 @@ use windows_sys::Win32::{
     UI::{
         Input::KeyboardAndMouse::{
             EnableWindow, GetAsyncKeyState, GetFocus, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP,
-            SendInput, SetFocus, VK_CONTROL, VK_ESCAPE, VK_NEXT, VK_RETURN,
-            VK_SHIFT,
+            SendInput, SetFocus, VK_CONTROL, VK_ESCAPE, VK_NEXT, VK_RETURN, VK_SHIFT,
         },
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
@@ -12545,7 +12544,11 @@ mod tests {
             );
 
             apply_omnibox_interactivity(edit, Surface::Home);
-            assert_ne!(windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(edit), 0, "Home precisa reativar a omnibox");
+            assert_ne!(
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(edit),
+                0,
+                "Home precisa reativar a omnibox"
+            );
 
             DestroyWindow(parent);
         }
