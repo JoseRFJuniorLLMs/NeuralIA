@@ -777,7 +777,7 @@ impl BarLayout {
     }
 }
 
-fn surface_accepts_omnibox_submit(surface: Surface) -> bool {fn surface_accepts_omnibox_submit(surface: Surface) -> bool {
+fn surface_accepts_omnibox_submit(surface: Surface) -> bool {
     matches!(surface, Surface::Home)
 }
 
