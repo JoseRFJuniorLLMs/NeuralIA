@@ -1946,6 +1946,30 @@ unsafe extern "system" fn comparator_splitter_subclass(
     DefSubclassProc(hwnd, message, wparam, lparam)
 }
 
+const NATIVE_BUTTON_NONE: usize = usize::MAX;
+static CAPTION_PRESSED_BUTTON: AtomicUsize = AtomicUsize::new(NATIVE_BUTTON_NONE);
+
+fn native_button_index(width: i32, x: i32) -> Option<usize> {
+    if width <= 0 || x < 0 || x >= width {
+        return None;
+    }
+    if x < width / 3 {
+        Some(0)
+    } else if x < (width * 2) / 3 {
+        Some(1)
+    } else {
+        Some(2)
+    }
+}
+
+fn native_release_matches(pressed: Option<usize>, released: Option<usize>) -> Option<usize> {
+    pressed.filter(|index| Some(*index) == released)
+}
+
+fn point_inside_client(width: i32, height: i32, x: i32, y: i32) -> bool {
+    width > 0 && height > 0 && x >= 0 && x < width && y >= 0 && y < height
+}
+
 unsafe extern "system" fn caption_buttons_subclass(
     hwnd: HWND,
     message: u32,
@@ -2002,7 +2026,28 @@ unsafe extern "system" fn caption_buttons_subclass(
             }
             0
         }
+        WM_LBUTTONDOWN => {
+            let mut client = RECT::default();
+            if GetClientRect(hwnd, &mut client) != 0 {
+                let width = client.right - client.left;
+                let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
+                if let Some(index) = native_button_index(width, x) {
+                    CAPTION_PRESSED_BUTTON.store(index, Ordering::Release);
+                    SetCapture(hwnd);
+                }
+            }
+            0
+        }
         WM_LBUTTONUP => {
+            let captured = GetCapture() == hwnd;
+            if captured {
+                ReleaseCapture();
+            }
+            let pressed_raw = CAPTION_PRESSED_BUTTON.swap(NATIVE_BUTTON_NONE, Ordering::AcqRel);
+            if !captured || pressed_raw == NATIVE_BUTTON_NONE {
+                return 0;
+            }
+
             let parent = GetParent(hwnd);
             if parent.is_null() {
                 return 0;
@@ -2011,20 +2056,24 @@ unsafe extern "system" fn caption_buttons_subclass(
             if GetClientRect(hwnd, &mut client) == 0 {
                 return 0;
             }
-            let width = (client.right - client.left).max(1);
+            let width = client.right - client.left;
             let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
-            let command = if x < width / 3 {
-                SC_MINIMIZE_NATIVE
-            } else if x < (width * 2) / 3 {
-                if IsZoomed(parent) != 0 {
-                    SC_RESTORE_NATIVE
-                } else {
-                    SC_MAXIMIZE_NATIVE
-                }
-            } else {
-                SC_CLOSE_NATIVE
+            let Some(index) =
+                native_release_matches(Some(pressed_raw), native_button_index(width, x))
+            else {
+                return 0;
+            };
+            let command = match index {
+                0 => SC_MINIMIZE_NATIVE,
+                1 if IsZoomed(parent) != 0 => SC_RESTORE_NATIVE,
+                1 => SC_MAXIMIZE_NATIVE,
+                _ => SC_CLOSE_NATIVE,
             };
             SendMessageW(parent, WM_SYSCOMMAND_NATIVE, command, 0);
+            0
+        }
+        WM_CAPTURECHANGED | WM_CANCELMODE => {
+            CAPTION_PRESSED_BUTTON.store(NATIVE_BUTTON_NONE, Ordering::Release);
             0
         }
         _ => DefSubclassProc(hwnd, message, wparam, lparam),
@@ -2073,9 +2122,25 @@ unsafe extern "system" fn home_button_subclass(
             }
             0
         }
-        WM_LBUTTONUP if reference_data != 0 => {
-            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
-            let _ = proxy.send_event(UserEvent::HomeRequested);
+        WM_LBUTTONDOWN => {
+            SetCapture(hwnd);
+            0
+        }
+        WM_LBUTTONUP => {
+            let captured = GetCapture() == hwnd;
+            if captured {
+                ReleaseCapture();
+            }
+            let mut client = RECT::default();
+            let inside = GetClientRect(hwnd, &mut client) != 0 && {
+                let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
+                let y = ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32;
+                point_inside_client(client.right - client.left, client.bottom - client.top, x, y)
+            };
+            if captured && inside && reference_data != 0 {
+                let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+                let _ = proxy.send_event(UserEvent::HomeRequested);
+            }
             0
         }
         _ => DefSubclassProc(hwnd, message, wparam, lparam),
@@ -7172,6 +7237,18 @@ impl App {
         self.request_redraw();
     }
 
+    fn joinable_context_groups(
+        groups: &[ContextGroup],
+        current_group: Option<u64>,
+    ) -> Vec<(usize, String)> {
+        groups
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| Some(group.id) != current_group)
+            .map(|(index, group)| (index, group.name.clone()))
+            .collect()
+    }
+
     fn context_menu_comparator(&mut self) {
         let hit = self.comparator_bar_hit();
         let Some(BarHit::ContextTab {
@@ -7194,14 +7271,13 @@ impl App {
             .comparator
             .as_ref()
             .map(|comp| {
-                let names: Vec<String> = comp.groups[source_index]
-                    .iter()
-                    .map(|group| group.name.clone())
-                    .collect();
-                let member = comp.contexts[source_index]
+                let current_group = comp.contexts[source_index]
                     .get(context_index)
-                    .is_some_and(|tab| tab.group.is_some());
-                (names, member)
+                    .and_then(|tab| tab.group);
+                (
+                    Self::joinable_context_groups(&comp.groups[source_index], current_group),
+                    current_group.is_some(),
+                )
             })
             .unwrap_or_default();
 
@@ -7241,7 +7317,7 @@ impl App {
             // o Win32 le ponteiros ja libertados enquanto desenha o menu.
             let join_labels: Vec<Vec<u16>> = existing_groups
                 .iter()
-                .map(|name| wide_null(&format!("Juntar ao grupo \u{201C}{name}\u{201D}")))
+                .map(|(_, name)| wide_null(&format!("Juntar ao grupo \u{201C}{name}\u{201D}")))
                 .collect();
             for (offset, label) in join_labels.iter().enumerate() {
                 AppendMenuW(
@@ -7283,9 +7359,9 @@ impl App {
             TAB_MENU_NEW_GROUP => self.group_context_tab(source_index, context_index),
             TAB_MENU_UNGROUP => self.ungroup_context_tab(source_index, context_index),
             other if other >= TAB_MENU_GROUP_BASE => {
-                let group_index = other - TAB_MENU_GROUP_BASE;
-                if group_index < existing_groups.len() {
-                    self.join_context_tab_group(source_index, context_index, group_index);
+                let menu_index = other - TAB_MENU_GROUP_BASE;
+                if let Some((group_index, _)) = existing_groups.get(menu_index) {
+                    self.join_context_tab_group(source_index, context_index, *group_index);
                 }
             }
             _ => {}
@@ -13320,6 +13396,47 @@ mod tests {
         assert_eq!(committed, (99, Some(41)));
         assert_eq!(split, None);
         assert_eq!(expanded, None);
+    }
+
+    #[test]
+    fn native_buttons_only_activate_when_press_and_release_match() {
+        assert_eq!(native_button_index( ninety_for_test(), 0), Some(0));
+        assert_eq!(native_button_index( ninety_for_test(), 29), Some(0));
+        assert_eq!(native_button_index( ninety_for_test(), 30), Some(1));
+        assert_eq!(native_button_index( ninety_for_test(), 59), Some(1));
+        assert_eq!(native_button_index( ninety_for_test(), 60), Some(2));
+        assert_eq!(native_button_index( ninety_for_test(), 89), Some(2));
+        assert_eq!(native_button_index( ninety_for_test(), -1), None);
+        assert_eq!(native_button_index( ninety_for_test(), 90), None);
+
+        assert_eq!(native_release_matches(Some(0), Some(0)), Some(0));
+        assert_eq!(native_release_matches(Some(0), Some(2)), None);
+        assert_eq!(native_release_matches(None, Some(2)), None);
+        assert!(point_inside_client(100, 30, 99, 29));
+        assert!(!point_inside_client(100, 30, 100, 29));
+        assert!(!point_inside_client(100, 30, 99, 30));
+    }
+
+    fn ninety_for_test() -> i32 {
+        90
+    }
+
+    #[test]
+    fn current_group_is_not_offered_as_a_join_target() {
+        let groups = vec![group(1, false), group(2, false), group(3, false)];
+        let joinable = App::joinable_context_groups(&groups, Some(2));
+        assert_eq!(
+            joinable,
+            vec![(0, "G1".to_string()), (2, "G3".to_string())]
+        );
+        assert_eq!(
+            App::joinable_context_groups(&groups, None),
+            vec![
+                (0, "G1".to_string()),
+                (1, "G2".to_string()),
+                (2, "G3".to_string())
+            ]
+        );
     }
 
     #[test]
