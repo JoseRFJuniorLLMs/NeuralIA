@@ -142,7 +142,7 @@ public static class NeuraliaCycleWindowProbe {
         return rows;
     }
 
-    public static bool RequestLifecycleProbeHome(IntPtr parent) {
+    public static bool RequestLifecycleProbeHome(IntPtr parent, int nonce) {
         var message = RegisterWindowMessage("NeuralIA.LifecycleProbe.Home");
         if (message == 0) return false;
 
@@ -167,7 +167,7 @@ public static class NeuraliaCycleWindowProbe {
                 editClass.Clear();
                 GetClassName(child, editClass, editClass.Capacity);
                 if (string.Equals(editClass.ToString(), "Edit", StringComparison.Ordinal)) {
-                    if (PostMessage(child, message, IntPtr.Zero, IntPtr.Zero)) {
+                    if (PostMessage(child, message, new IntPtr(nonce), IntPtr.Zero)) {
                         postedToEdit = true;
                     }
                 }
@@ -184,7 +184,7 @@ public static class NeuraliaCycleWindowProbe {
         EnumWindows(delegate(IntPtr top, IntPtr data) {
             uint ownerPid;
             GetWindowThreadProcessId(top, out ownerPid);
-            if (ownerPid == processId && PostMessage(top, message, IntPtr.Zero, IntPtr.Zero)) {
+            if (ownerPid == processId && PostMessage(top, message, new IntPtr(nonce), IntPtr.Zero)) {
                 postedToWindow = true;
             }
             return true;
@@ -210,7 +210,7 @@ public static class NeuraliaCycleWindowProbe {
         return processId;
     }
 
-    public static bool RequestLifecycleProbeReopen(IntPtr parent) {
+    public static bool RequestLifecycleProbeReopen(IntPtr parent, int nonce) {
         var message = RegisterWindowMessage("NeuralIA.LifecycleProbe.Reopen");
         if (message == 0) return false;
         var processId = ProcessIdOf(parent);
@@ -307,20 +307,20 @@ function Wait-ForNoVisibleWebSurfaces([System.Diagnostics.Process]$Process, [int
     return @(Get-VisibleWebViewSurfaceRects -Process $Process).Count
 }
 
-function Submit-LifecycleProbeQuery([System.Diagnostics.Process]$Process) {
+function Submit-LifecycleProbeQuery([System.Diagnostics.Process]$Process, [int]$Nonce) {
     $Process.Refresh()
     if ($Process.HasExited) {
         throw "NeuralIA saiu antes de reabrir o comparador."
     }
     $parent = Get-CurrentMainWindow -Process $Process
     if ($parent -eq [IntPtr]::Zero) { throw "Janela principal atual do NeuralIA não foi encontrada." }
-    $ok = [NeuraliaCycleWindowProbe]::RequestLifecycleProbeReopen($parent)
+    $ok = [NeuraliaCycleWindowProbe]::RequestLifecycleProbeReopen($parent, $Nonce)
     if (-not $ok) {
         throw "Falhou ao enfileirar o comando Win32 de reabertura do lifecycle."
     }
 }
 
-function Return-LifecycleProbeHome([System.Diagnostics.Process]$Process) {
+function Return-LifecycleProbeHome([System.Diagnostics.Process]$Process, [int]$Nonce) {
     $Process.Refresh()
     if ($Process.HasExited) {
         throw "NeuralIA saiu antes de regressar a Home."
@@ -333,7 +333,7 @@ function Return-LifecycleProbeHome([System.Diagnostics.Process]$Process) {
     # exatamente HomeRequested no event loop do produto. O caminho real de ESC
     # já é coberto separadamente; misturá-lo aqui tornou o ciclo 2+ dependente
     # do estado/foco do EDIT oculto e produziu falso negativo no runner.
-    $ok = [NeuraliaCycleWindowProbe]::RequestLifecycleProbeHome($parent)
+    $ok = [NeuraliaCycleWindowProbe]::RequestLifecycleProbeHome($parent, $Nonce)
     if (-not $ok) {
         throw "Falhou ao enfileirar o retorno determinístico à Home."
     }
@@ -507,7 +507,7 @@ try {
         # misturava duas coisas: teardown real e atraso do pump aninhado do
         # WebView2. A mensagem privada passa pelo mesmo EventLoopProxy e chama
         # exatamente HomeRequested, mas deixa o teste decidir quando medir.
-        Return-LifecycleProbeHome -Process $process
+        Return-LifecycleProbeHome -Process $process -Nonce $cycle
 
         $visibleAfterHome = Wait-ForNoVisibleWebSurfaces -Process $process -TimeoutSec $CloseTimeoutSec
 
@@ -567,7 +567,7 @@ try {
         # teardown=0 e HomeReady. Isso impede que a medição do ciclo N conte
         # superfícies já pertencentes ao ciclo N+1.
         if ($cycle -lt $Cycles) {
-            Submit-LifecycleProbeQuery -Process $process
+            Submit-LifecycleProbeQuery -Process $process -Nonce ($cycle + 1)
         }
     }
 
