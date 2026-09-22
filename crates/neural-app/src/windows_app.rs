@@ -10838,7 +10838,9 @@ mod tests {
         let ready = body
             .find("LIFECYCLE_COMPARATOR_READY.store(true")
             .expect("Ready publish");
-        let layout = body.find("self.update_comparator_layout()").expect("initial layout");
+        let layout = body
+            .find("self.update_comparator_layout()")
+            .expect("initial layout");
         assert!(
             ready > layout,
             "Ready so pode ser publicado depois de o comparador existir e ter layout"
