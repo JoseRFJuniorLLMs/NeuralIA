@@ -51,10 +51,11 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
             ES_AUTOHSCROLL, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
-            GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-            IDYES, MB_ICONINFORMATION, MB_OK, MB_YESNO, MF_SEPARATOR, MF_STRING, MessageBoxW,
-            SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowPos,
-            SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_KEYDOWN,
+            GetForegroundWindow, GetParent, GetWindowTextLengthW, GetWindowTextW,
+            GetWindowThreadProcessId, IDYES, MB_ICONINFORMATION, MB_OK, MB_YESNO, MF_SEPARATOR,
+            MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
+            SetParent, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+            TrackPopupMenu, WM_KEYDOWN,
             WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
         },
     },
@@ -3015,6 +3016,15 @@ impl App {
         let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
         unsafe {
             SetWindowSubclass(parent, Some(window_subclass), WINDOW_SUBCLASS_ID, proxy_ptr);
+
+            // A troca de decorations pode substituir/reparentar o HWND nativo.
+            // A omnibox e o Home sao filhos Win32 reais: se continuarem ligados
+            // ao HWND antigo, ficam invisiveis ou deixam de receber teclado/rato.
+            for child in [self.omnibox, self.home_button].into_iter().flatten() {
+                if GetParent(child) != parent {
+                    SetParent(child, parent);
+                }
+            }
         }
     }
 
@@ -11971,6 +11981,20 @@ mod tests {
                 "{from} nao pode pousar sobre as outras aplicacoes"
             );
         }
+    }
+
+    #[test]
+    fn native_controls_follow_the_effective_hwnd_after_decoration_changes() {
+        let source = include_str!("windows_app.rs");
+        let body = source
+            .split("fn ensure_window_subclass")
+            .nth(1)
+            .and_then(|part| part.split("fn create_omnibox").next())
+            .expect("ensure_window_subclass body");
+        assert!(body.contains("GetParent(child) != parent"));
+        assert!(body.contains("SetParent(child, parent)"));
+        assert!(body.contains("self.omnibox"));
+        assert!(body.contains("self.home_button"));
     }
 
     #[test]
