@@ -4315,10 +4315,10 @@ impl App {
         // o gate pode enviar Home imediatamente depois de observar o flag.
         self.ensure_window_subclass();
 
-        if lifecycle_probe_enabled() {
-            LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
-        }
-
+        // Não publique Ready aqui. WebView2 ainda pode estar dentro do pump
+        // aninhado de build/navigation enquanto open_comparator não devolveu.
+        // O primeiro RelayoutComparator só é processado numa volta posterior
+        // do event loop e publica o handshake depois dessa fronteira real.
         self.schedule_gmail_probe(4);
         self.begin_reading_session(false);
         self.request_redraw();
@@ -4371,12 +4371,7 @@ impl App {
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.sync_home_button();
-        if self.is_fullscreen_column() {
-            self.show_omnibox_passive(false);
-        } else {
-            self.show_omnibox_passive(true);
-            self.position_omnibox();
-        }
+        self.show_omnibox_passive(false);
         self.request_redraw();
     }
 
@@ -10984,31 +10979,34 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_ready_is_published_at_the_real_end_of_comparator_activation() {
+    fn lifecycle_ready_waits_for_a_later_event_loop_turn() {
         let source = include_str!("windows_app.rs");
-        let body = source
+
+        let activate = source
             .split("fn activate_comparator")
             .nth(1)
             .and_then(|part| part.split("fn expand_comparator").next())
             .expect("activate_comparator body");
+        assert!(
+            !activate.contains("LIFECYCLE_COMPARATOR_READY.store(true"),
+            "activate_comparator ainda corre no stack que abriu WebView2"
+        );
+        assert!(activate.contains("UserEvent::RelayoutComparator"));
 
-        assert!(body.contains("LIFECYCLE_COMPARATOR_READY.store(true"));
-        let ready = body
+        let relayout = source
+            .split("UserEvent::RelayoutComparator =>")
+            .nth(1)
+            .and_then(|part| part.split("UserEvent::RestoreHomeDecorations =>").next())
+            .expect("RelayoutComparator handler");
+        let rebind = relayout
+            .find("self.ensure_window_subclass()")
+            .expect("rebind");
+        let ready = relayout
             .find("LIFECYCLE_COMPARATOR_READY.store(true")
             .expect("Ready publish");
-        let layout = body
-            .find("self.update_comparator_layout()")
-            .expect("initial layout");
-        let rebind = body
-            .find("self.ensure_window_subclass()")
-            .expect("subclass rebind");
-        assert!(
-            ready > layout,
-            "Ready so pode ser publicado depois de o comparador existir e ter layout"
-        );
         assert!(
             ready > rebind,
-            "Ready so pode ser publicado depois de rebindar a subclass no HWND efetivo"
+            "Ready só pode nascer depois de rebindar o HWND numa volta posterior"
         );
     }
 
