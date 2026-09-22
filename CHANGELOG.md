@@ -4,6 +4,8 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+## [2.1.5] - 2026-09-22
+
 ### Fixed
 - **PR #128 — auditoria recursiva de 20 passagens:** a omnibox Win32 da Home mantém o HWND estável fora da área cliente, mas fica desabilitada no comparador e deixa de poder roubar foco/teclado.
 - **PR #128 — grupos de abas:** “Fechar outras abas deste grupo” e “Fechar todas deste grupo” passam a atuar somente no grupo selecionado; grupos vazios são podados e outras coleções permanecem intactas.
