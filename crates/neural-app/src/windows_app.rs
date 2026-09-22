@@ -52,11 +52,10 @@ use windows_sys::Win32::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
             ES_AUTOHSCROLL, EnableWindow, EnumChildWindows, GetClassNameW, GetClientRect,
             GetCursorPos, GetForegroundWindow, GetParent, GetWindowTextLengthW, GetWindowTextW,
-            IsWindowEnabled,
-            GetWindowThreadProcessId, IDYES, IsZoomed, MB_ICONINFORMATION, MB_OK, MB_YESNO,
-            MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
-            SendMessageW, SetParent, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD,
-            TPM_RIGHTBUTTON, TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE,
+            GetWindowThreadProcessId, IDYES, IsWindowEnabled, IsZoomed, MB_ICONINFORMATION, MB_OK,
+            MB_YESNO, MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
+            SWP_NOZORDER, SendMessageW, SetParent, SetWindowPos, SetWindowTextW, ShowWindow,
+            TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE,
             WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
         },
     },
@@ -6867,7 +6866,10 @@ impl App {
             .comparator
             .as_ref()
             .and_then(|comp| comp.contexts.get(source_index))
-            .and_then(|tabs| tabs.get(context_index).map(|tab| (tab.group, tab.url.clone())))
+            .and_then(|tabs| {
+                tabs.get(context_index)
+                    .map(|tab| (tab.group, tab.url.clone()))
+            })
         else {
             return;
         };
@@ -12529,7 +12531,11 @@ mod tests {
             assert!(!edit.is_null());
 
             apply_omnibox_interactivity(edit, Surface::Comparator);
-            assert_eq!(IsWindowEnabled(edit), 0, "omnibox invisivel nao pode receber foco");
+            assert_eq!(
+                IsWindowEnabled(edit),
+                0,
+                "omnibox invisivel nao pode receber foco"
+            );
 
             apply_omnibox_interactivity(edit, Surface::Home);
             assert_ne!(IsWindowEnabled(edit), 0, "Home precisa reativar a omnibox");
