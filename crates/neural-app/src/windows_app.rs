@@ -45,8 +45,8 @@ use windows_sys::Win32::{
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
     UI::{
         Input::KeyboardAndMouse::{
-            EnableWindow, GetAsyncKeyState, GetFocus, INPUT, INPUT_KEYBOARD, IsWindowEnabled,
-            KEYEVENTF_KEYUP, SendInput, SetFocus, VK_CONTROL, VK_ESCAPE, VK_NEXT, VK_RETURN,
+            EnableWindow, GetAsyncKeyState, GetFocus, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP,
+            SendInput, SetFocus, VK_CONTROL, VK_ESCAPE, VK_NEXT, VK_RETURN,
             VK_SHIFT,
         },
         WindowsAndMessaging::{
@@ -1132,7 +1132,7 @@ fn close_context_tab_scope(
 /// Reagrupar uma aba pode esvaziar o grupo anterior. A criacao e a poda
 /// pertencem a uma unica operacao para nunca deixar pilulas fantasmas.
 fn regroup_context_tab(
-    tabs: &mut Vec<ContextTab>,
+    tabs: &mut [ContextTab],
     groups: &mut Vec<ContextGroup>,
     next_id: &mut u64,
     context_index: usize,
@@ -12539,13 +12539,13 @@ mod tests {
 
             apply_omnibox_interactivity(edit, Surface::Comparator);
             assert_eq!(
-                IsWindowEnabled(edit),
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(edit),
                 0,
                 "omnibox invisivel nao pode receber foco"
             );
 
             apply_omnibox_interactivity(edit, Surface::Home);
-            assert_ne!(IsWindowEnabled(edit), 0, "Home precisa reativar a omnibox");
+            assert_ne!(windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(edit), 0, "Home precisa reativar a omnibox");
 
             DestroyWindow(parent);
         }
