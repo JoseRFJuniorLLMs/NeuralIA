@@ -2496,9 +2496,8 @@ impl HistoryWriter {
                     match command {
                         HistoryCommand::Append(entry) => {
                             if let Err(error) = worker_store.append(&entry) {
-                                let _ = worker_proxy.send_event(UserEvent::HistoryWriteFailed(
-                                    error.to_string(),
-                                ));
+                                let _ = worker_proxy
+                                    .send_event(UserEvent::HistoryWriteFailed(error.to_string()));
                             }
                         }
                         HistoryCommand::Clear => {
