@@ -193,15 +193,37 @@ public static class NeuraliaCycleWindowProbe {
     }
 
     public static bool ReturnHomeViaNativeEscape(IntPtr parent) {
-        // A omnibox principal é o único EDIT filho direto da janela principal.
-        // A palette tem outro EDIT, mas vive dentro de um popup nativo.
-        var edit = FindWindowEx(parent, IntPtr.Zero, "Edit", null);
-        if (edit == IntPtr.Zero) return false;
+        // Exercita o caminho nativo embarcado, sem depender de foco global nem
+        // da mensagem privada do probe: WM_KEYDOWN chega ao WndProc do winit,
+        // vira WindowEvent::KeyboardInput(Escape), depois go_back() -> show_home().
+        // O scan code 0x01 é o Esc físico no set 1; key-up leva os bits 30/31.
         const uint WM_KEYDOWN = 0x0100;
         const uint WM_KEYUP = 0x0101;
-        if (!PostMessage(edit, WM_KEYDOWN, new IntPtr(27), IntPtr.Zero)) return false;
-        PostMessage(edit, WM_KEYUP, new IntPtr(27), IntPtr.Zero);
-        return true;
+        const uint SMTO_ABORTIFHUNG = 0x0002;
+        const int VK_ESCAPE = 27;
+
+        IntPtr result;
+        var down = SendMessageTimeout(
+            parent,
+            WM_KEYDOWN,
+            new IntPtr(VK_ESCAPE),
+            new IntPtr(0x00010001),
+            SMTO_ABORTIFHUNG,
+            1000,
+            out result
+        );
+        if (down == IntPtr.Zero) return false;
+
+        var up = SendMessageTimeout(
+            parent,
+            WM_KEYUP,
+            new IntPtr(VK_ESCAPE),
+            new IntPtr(unchecked((long)0xC0010001)),
+            SMTO_ABORTIFHUNG,
+            1000,
+            out result
+        );
+        return up != IntPtr.Zero;
     }
 
     private static uint ProcessIdOf(IntPtr anyWindow) {
@@ -328,14 +350,14 @@ function Return-LifecycleProbeHome([System.Diagnostics.Process]$Process, [int]$N
     $parent = Get-CurrentMainWindow -Process $Process
     if ($parent -eq [IntPtr]::Zero) { throw "Janela principal atual do NeuralIA não foi encontrada." }
 
-    # O gate mede teardown, não entrega de teclado. Use a mensagem Win32
-    # privada do modo NEURALIA_LIFECYCLE_PROBE em todos os ciclos para disparar
-    # exatamente HomeRequested no event loop do produto. O caminho real de ESC
-    # já é coberto separadamente; misturá-lo aqui tornou o ciclo 2+ dependente
-    # do estado/foco do EDIT oculto e produziu falso negativo no runner.
-    $ok = [NeuraliaCycleWindowProbe]::RequestLifecycleProbeHome($parent, $Nonce)
+    # Exercita o caminho que o utilizador realmente usa: Escape no HWND nativo
+    # da janela principal. SendMessageTimeout é síncrono e independe de foco,
+    # portanto não sofre com AppActivate/SendKeys nem com a troca de HWND após
+    # decorations. O gate continua rigoroso logo abaixo: só passa com zero
+    # WRY_WEBVIEW visível e HomeReady concluído.
+    $ok = [NeuraliaCycleWindowProbe]::ReturnHomeViaNativeEscape($parent)
     if (-not $ok) {
-        throw "Falhou ao enfileirar o retorno determinístico à Home."
+        throw "Falhou ao entregar Escape nativo à janela principal do NeuralIA."
     }
 }
 
