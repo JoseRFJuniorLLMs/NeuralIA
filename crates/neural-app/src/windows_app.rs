@@ -7734,7 +7734,18 @@ impl ApplicationHandler<UserEvent> for App {
                     let mut failure = None;
                     if let Some(comp) = &self.comparator {
                         for (view, url) in comp.views.iter().zip(urls.iter()) {
-                            if let Err(error) = view.webview.load_url(url) {
+                            let encoded = match serde_json::to_string(url) {
+                                Ok(encoded) => encoded,
+                                Err(error) => {
+                                    failure = Some(format!(
+                                        "URL invalida ao iniciar {}: {error}",
+                                        view.name
+                                    ));
+                                    break;
+                                }
+                            };
+                            let script = format!("window.location.replace({encoded});");
+                            if let Err(error) = view.webview.evaluate_script(&script) {
                                 failure = Some(format!(
                                     "WebView2 nao pode iniciar {}: {error}",
                                     view.name
