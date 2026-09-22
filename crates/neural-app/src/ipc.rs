@@ -365,9 +365,7 @@ mod tests {
             parse_ipc_message(&message("shortcut-expand", json!({"col":2})), CAP, 3),
             Some(IpcAction::ShortcutExpand { col: 2 })
         );
-        assert!(
-            parse_ipc_message(&message("shortcut-expand", json!({"col":3})), CAP, 3).is_none()
-        );
+        assert!(parse_ipc_message(&message("shortcut-expand", json!({"col":3})), CAP, 3).is_none());
         assert_eq!(
             parse_ipc_message(&message("minimize", json!({"col":0})), CAP, 3),
             Some(IpcAction::Minimize { col: 0 })
