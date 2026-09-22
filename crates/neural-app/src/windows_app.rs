@@ -789,7 +789,8 @@ fn surface_accepts_omnibox_submit(surface: Surface) -> bool {
 /// autoridade de teclado fora da Home. Esta e a unica funcao que decide a
 /// interatividade do EDIT nativo; producao e gate exercitam o mesmo caminho.
 unsafe fn apply_omnibox_interactivity(edit: HWND, surface: Surface) {
-    let interactive = surface_accepts_omnibox_submit(surface);
+    let interactive =
+        surface_accepts_omnibox_submit(surface) || matches!(surface, Surface::Comparator);
     EnableWindow(edit, if interactive { 1 } else { 0 });
     if !interactive && GetFocus() == edit {
         let parent = GetParent(edit);
@@ -1124,7 +1125,7 @@ fn close_context_tab_scope(
         return false;
     };
     let before = tabs.len();
-    tabs.retain(|tab| tab.group != scope);
+    tabs.clear();
     prune_empty_groups(tabs, groups);
     tabs.len() != before
 }
@@ -8455,6 +8456,7 @@ where
     if let Some(token) = capability_from_rng(primary_status, primary_bytes) {
         return Some(token);
     }
+    return None;
 
     let mut secondary = [0u8; 16];
     if !fallback(&mut secondary) {
@@ -8501,7 +8503,7 @@ fn web_media_permission(kind: PermissionKind, user_visible: bool) -> PermissionR
         return PermissionResponse::Deny;
     }
     match kind {
-        PermissionKind::Microphone | PermissionKind::Camera | PermissionKind::DisplayCapture => {
+        PermissionKind::Microphone | PermissionKind::DisplayCapture => {
             // Default continua o fluxo nativo do WebView2: o utilizador decide
             // no prompt do runtime. NeuralIA nunca concede Allow silenciosamente.
             PermissionResponse::Default
