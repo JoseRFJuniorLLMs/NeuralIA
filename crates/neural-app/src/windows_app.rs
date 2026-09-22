@@ -785,6 +785,20 @@ fn surface_accepts_omnibox_submit(surface: Surface) -> bool {
     matches!(surface, Surface::Home)
 }
 
+/// Mantem o HWND da omnibox vivo entre trocas de decoracao, mas remove a sua
+/// autoridade de teclado fora da Home. Esta e a unica funcao que decide a
+/// interatividade do EDIT nativo; producao e gate exercitam o mesmo caminho.
+unsafe fn apply_omnibox_interactivity(edit: HWND, surface: Surface) {
+    let interactive = surface_accepts_omnibox_submit(surface);
+    EnableWindow(edit, if interactive { 1 } else { 0 });
+    if !interactive && GetFocus() == edit {
+        let parent = GetParent(edit);
+        if !parent.is_null() {
+            SetFocus(parent);
+        }
+    }
+}
+
 /// Os controlos do canto direito da segunda linha.
 #[derive(Debug, Clone, Copy)]
 struct RightControls {
@@ -3262,14 +3276,7 @@ impl App {
                 inner.height.round() as i32,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
-            let interactive = surface_accepts_omnibox_submit(self.surface);
-            EnableWindow(edit, if interactive { 1 } else { 0 });
-            if !interactive && GetFocus() == edit {
-                let parent = GetParent(edit);
-                if !parent.is_null() {
-                    SetFocus(parent);
-                }
-            }
+            apply_omnibox_interactivity(edit, self.surface);
             ShowWindow(edit, SW_SHOW);
         }
         if self.surface == Surface::Home {
@@ -12521,24 +12528,10 @@ mod tests {
             );
             assert!(!edit.is_null());
 
-            EnableWindow(
-                edit,
-                if surface_accepts_omnibox_submit(Surface::Comparator) {
-                    1
-                } else {
-                    0
-                },
-            );
+            apply_omnibox_interactivity(edit, Surface::Comparator);
             assert_eq!(IsWindowEnabled(edit), 0, "omnibox invisivel nao pode receber foco");
 
-            EnableWindow(
-                edit,
-                if surface_accepts_omnibox_submit(Surface::Home) {
-                    1
-                } else {
-                    0
-                },
-            );
+            apply_omnibox_interactivity(edit, Surface::Home);
             assert_ne!(IsWindowEnabled(edit), 0, "Home precisa reativar a omnibox");
 
             DestroyWindow(parent);
