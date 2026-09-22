@@ -12141,6 +12141,9 @@ mod tests {
         assert!(body.contains("GetParent(child) != parent"));
         assert!(body.contains("SetParent(child, parent)"));
         assert!(body.contains("Surface::Home => [self.omnibox"));
+        assert!(body.contains(
+            "Surface::Comparator => [None, self.home_button, self.caption_buttons]"
+        ));
         assert!(body.contains("self.home_button"));
         assert!(body.contains("self.caption_buttons"));
     }
@@ -12166,21 +12169,36 @@ mod tests {
     #[test]
     fn native_caption_buttons_accept_the_mouse() {
         unsafe {
-            let hwnd = CreateWindowExW(
+            let parent = CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 windows_sys::w!("STATIC"),
                 windows_sys::w!(""),
                 WS_POPUP,
                 0,
                 0,
-                138,
-                32,
+                200,
+                80,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 std::ptr::null(),
             );
-            assert!(!hwnd.is_null(), "caption control tem de nascer");
+            assert!(!parent.is_null(), "parent do caption tem de nascer");
+            let hwnd = CreateWindowExW(
+                0,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!(""),
+                WS_CHILD | WS_VISIBLE,
+                0,
+                0,
+                138,
+                32,
+                parent,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!hwnd.is_null(), "caption child tem de nascer");
             let subclassed = SetWindowSubclass(
                 hwnd,
                 Some(caption_buttons_subclass),
@@ -12188,7 +12206,7 @@ mod tests {
                 0,
             );
             let hit = SendMessageW(hwnd, WM_NCHITTEST, 0, 0);
-            DestroyWindow(hwnd);
+            DestroyWindow(parent);
             assert_ne!(subclassed, 0);
             assert_eq!(hit, HTCLIENT as LRESULT);
         }
