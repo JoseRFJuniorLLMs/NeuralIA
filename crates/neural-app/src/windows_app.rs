@@ -54,9 +54,10 @@ use windows_sys::Win32::{
             GetForegroundWindow, GetParent, GetWindowTextLengthW, GetWindowTextW,
             GetWindowThreadProcessId, IDYES, IsZoomed, MB_ICONINFORMATION, MB_OK, MB_YESNO,
             MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
-            SendMessageW, SetParent, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD,
-            TPM_RIGHTBUTTON, TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE,
-            WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+            SendMessageW,
+            SetParent, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+            TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+            WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -775,6 +776,10 @@ impl BarLayout {
         }
         None
     }
+}
+
+fn surface_accepts_omnibox_submit(surface: Surface) -> bool {fn surface_accepts_omnibox_submit(surface: Surface) -> bool {
+    matches!(surface, Surface::Home)
 }
 
 /// Os controlos do canto direito da segunda linha.
@@ -3069,10 +3074,10 @@ impl App {
         self.request_redraw();
     }
 
-    /// Reinstala a subclasse e mantém os controles nativos ligados ao HWND
-    /// efetivo depois de mudanças de decoração. A omnibox da Home permanece
-    /// escondida no comparador, mas continua a acompanhar o HWND como antes da
-    /// regressão: o lifecycle depende dessa identidade sobreviver aos ciclos.
+    /// Reinstala a subclasse da janela principal depois de transições de
+    /// decoração. No Windows, alternar a moldura pode substituir o HWND nativo;
+    /// SetWindowSubclass é idempotente para o mesmo callback/id e atualiza o
+    /// reference_data quando a janela continua a mesma.
     fn ensure_window_subclass(&self) {
         let Some(window) = &self.window else {
             return;
@@ -3083,10 +3088,11 @@ impl App {
         let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
         unsafe {
             SetWindowSubclass(parent, Some(window_subclass), WINDOW_SUBCLASS_ID, proxy_ptr);
-            for child in [self.omnibox, self.home_button, self.caption_buttons]
-                .into_iter()
-                .flatten()
-            {
+
+            // A troca de decorations pode substituir/reparentar o HWND nativo.
+            // A omnibox e o Home sao filhos Win32 reais: se continuarem ligados
+            // ao HWND antigo, ficam invisiveis ou deixam de receber teclado/rato.
+            for child in [self.omnibox, self.home_button].into_iter().flatten() {
                 if GetParent(child) != parent {
                     SetParent(child, parent);
                 }
@@ -3236,6 +3242,10 @@ impl App {
 
     fn show_omnibox(&self, visible: bool) {
         self.set_omnibox_visibility(visible, visible);
+    }
+
+    fn show_omnibox_passive(&self, visible: bool) {
+        self.set_omnibox_visibility(visible, false);
     }
 
     fn omnibox_text(&self) -> String {
@@ -4461,8 +4471,12 @@ impl App {
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.sync_home_button();
-        self.sync_caption_buttons();
-        self.show_omnibox(false);
+        if self.is_fullscreen_column() {
+            self.show_omnibox_passive(false);
+        } else {
+            self.show_omnibox_passive(true);
+            self.position_omnibox();
+        }
         self.request_redraw();
     }
 
@@ -5989,9 +6003,9 @@ impl App {
         }
     }
 
-    /// Controles de janela reais acima dos filhos WebView2. O desenho da barra
-    /// continua como fallback, mas este HWND recebe e pinta minimizar,
-    /// maximizar/restaurar e fechar depois de resize/maximize.
+    /// Controles de janela reais acima dos filhos WebView2. Se a troca de
+    /// decoracao produzir outro HWND, o controlo e destruido e recriado no
+    /// novo pai; nao se usa SetParent neste overlay.
     fn sync_caption_buttons(&mut self) {
         let wanted = self.surface == Surface::Comparator && self.bar_visible();
         if !wanted {
@@ -6013,6 +6027,15 @@ impl App {
         let right = layout.window_close.x + layout.window_close.width;
         let width = (right - left).max(1.0);
         let height = layout.window_close.height.max(1.0);
+
+        if let Some(buttons) = self.caption_buttons
+            && unsafe { GetParent(buttons) } != owner
+        {
+            unsafe {
+                DestroyWindow(buttons);
+            }
+            self.caption_buttons = None;
+        }
 
         if self.caption_buttons.is_none() {
             unsafe {
@@ -7657,7 +7680,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.handle_agent_observation(page);
             }
             UserEvent::SubmitText(input) => {
-                if self.surface == Surface::Home {
+                if surface_accepts_omnibox_submit(self.surface) {
                     let input = input.trim().to_string();
                     if !input.is_empty() {
                         self.handle_input(input);
@@ -9706,6 +9729,70 @@ mod tests {
     }
 
     #[test]
+    fn home_button_is_text_only_without_an_invented_icon() {
+        let source = include_str!("windows_app.rs");
+        let native = source
+            .split("fn home_button_subclass")
+            .nth(1)
+            .and_then(|part| part.split("fn exit_button_subclass").next())
+            .expect("home_button_subclass body");
+        assert!(!native.contains("with_icon("));
+
+        let bar = source
+            .split("let home_fill =")
+            .nth(1)
+            .and_then(|part| part.split("for (index, name)").next())
+            .expect("painted Home body");
+        assert!(!bar.contains("with_icon("));
+    }
+
+    #[test]
+    fn native_caption_buttons_accept_the_mouse() {
+        unsafe {
+            let parent = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!(""),
+                WS_POPUP,
+                0,
+                0,
+                200,
+                80,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!parent.is_null(), "parent do caption tem de nascer");
+            let hwnd = CreateWindowExW(
+                0,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!(""),
+                WS_CHILD | WS_VISIBLE,
+                0,
+                0,
+                138,
+                32,
+                parent,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!hwnd.is_null(), "caption child tem de nascer");
+            let subclassed = SetWindowSubclass(
+                hwnd,
+                Some(caption_buttons_subclass),
+                CAPTION_BUTTONS_SUBCLASS_ID,
+                0,
+            );
+            let hit = SendMessageW(hwnd, WM_NCHITTEST, 0, 0);
+            DestroyWindow(parent);
+            assert_ne!(subclassed, 0);
+            assert_eq!(hit, HTCLIENT as LRESULT);
+        }
+    }
+
+    #[test]
     fn native_home_button_has_a_stable_window_identity_for_the_shipping_gate() {
         let source = include_str!("windows_app.rs");
         let body = source
@@ -11306,10 +11393,6 @@ mod tests {
             App::column_ipc_event_impl(1, IpcAction::Palette { col: 1 }),
             Some(UserEvent::OpenPalette(1))
         ));
-        assert!(matches!(
-            App::column_ipc_event_impl(2, IpcAction::Omnibox),
-            Some(UserEvent::OpenPalette(2))
-        ));
         // O painel lateral mantem o despacho dentro do closure, e por isso
         // continua a ser so presenca.
         let split_body = source
@@ -12109,67 +12192,17 @@ mod tests {
     }
 
     #[test]
-    fn home_button_is_text_only_without_an_invented_icon() {
+    fn native_controls_follow_the_effective_hwnd_after_decoration_changes() {
         let source = include_str!("windows_app.rs");
-        let native = source
-            .split("fn home_button_subclass")
+        let body = source
+            .split("fn ensure_window_subclass")
             .nth(1)
-            .and_then(|part| part.split("fn exit_button_subclass").next())
-            .expect("home_button_subclass body");
-        assert!(!native.contains("with_icon("));
-
-        let bar = source
-            .split("let home_fill =")
-            .nth(1)
-            .and_then(|part| part.split("for (index, name)").next())
-            .expect("painted Home body");
-        assert!(!bar.contains("with_icon("));
-    }
-
-    #[test]
-    fn native_caption_buttons_accept_the_mouse() {
-        unsafe {
-            let parent = CreateWindowExW(
-                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                windows_sys::w!("STATIC"),
-                windows_sys::w!(""),
-                WS_POPUP,
-                0,
-                0,
-                200,
-                80,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            );
-            assert!(!parent.is_null(), "parent do caption tem de nascer");
-            let hwnd = CreateWindowExW(
-                0,
-                windows_sys::w!("STATIC"),
-                windows_sys::w!(""),
-                WS_CHILD | WS_VISIBLE,
-                0,
-                0,
-                138,
-                32,
-                parent,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            );
-            assert!(!hwnd.is_null(), "caption child tem de nascer");
-            let subclassed = SetWindowSubclass(
-                hwnd,
-                Some(caption_buttons_subclass),
-                CAPTION_BUTTONS_SUBCLASS_ID,
-                0,
-            );
-            let hit = SendMessageW(hwnd, WM_NCHITTEST, 0, 0);
-            DestroyWindow(parent);
-            assert_ne!(subclassed, 0);
-            assert_eq!(hit, HTCLIENT as LRESULT);
-        }
+            .and_then(|part| part.split("fn create_omnibox").next())
+            .expect("ensure_window_subclass body");
+        assert!(body.contains("GetParent(child) != parent"));
+        assert!(body.contains("SetParent(child, parent)"));
+        assert!(body.contains("self.omnibox"));
+        assert!(body.contains("self.home_button"));
     }
 
     #[test]
@@ -12193,6 +12226,20 @@ mod tests {
     }
 
     #[test]
+    fn comparator_uses_palette_instead_of_the_home_omnibox() {
+        assert!(surface_accepts_omnibox_submit(Surface::Home));
+        assert!(!surface_accepts_omnibox_submit(Surface::Comparator));
+        assert!(matches!(
+            App::column_ipc_event_impl(0, IpcAction::Omnibox),
+            Some(UserEvent::OpenPalette(0))
+        ));
+        assert!(matches!(
+            App::column_ipc_event_impl(2, IpcAction::Omnibox),
+            Some(UserEvent::OpenPalette(2))
+        ));
+    }
+
+    #[test]
     fn comparator_titlebar_does_not_reserve_an_omnibox_slot() {
         let layout = BarLayout::with_contexts(
             1600.0,
@@ -12210,6 +12257,7 @@ mod tests {
     }
 
     #[test]
+    fn bar_layout_hit_matches_drawing() {    #[test]
     fn bar_layout_hit_matches_drawing() {
         let layout = BarLayout::new(1600.0, 1.0, true, 3);
         assert_eq!(layout.minimized, [false; COMPARATOR_COLUMNS]);
