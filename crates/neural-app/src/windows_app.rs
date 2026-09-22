@@ -103,6 +103,9 @@ enum UserEvent {
     ShowHistory,
     ClearHistory,
     HistoryCleared(Result<(), String>),
+    /// Falha de persistencia do historico. Append e assíncrono, mas erro de
+    /// disco/permissão não pode desaparecer só no stderr.
+    HistoryWriteFailed(String),
     /// O historico recente lido pelo worker; a caixa nativa e mostrada aqui,
     /// no event loop, e nunca a leitura do ficheiro.
     HistoryLoaded(Result<Vec<HistoryEntry>, String>),
@@ -2494,7 +2497,11 @@ impl HistoryWriter {
                 while let Ok(command) = rx.recv() {
                     match command {
                         HistoryCommand::Append(entry) => {
-                            let _ = worker_store.append(&entry);
+                            if let Err(error) = worker_store.append(&entry) {
+                                let _ = worker_proxy.send_event(UserEvent::HistoryWriteFailed(
+                                    error.to_string(),
+                                ));
+                            }
                         }
                         HistoryCommand::Clear => {
                             let result = worker_store.clear().map_err(|error| error.to_string());
@@ -3153,31 +3160,24 @@ impl App {
         let (Some(window), Some(edit)) = (&self.window, self.omnibox) else {
             return;
         };
+        if self.surface != Surface::Home {
+            unsafe {
+                ShowWindow(edit, SW_HIDE);
+            }
+            return;
+        }
+
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
-
-        // O EDIT nativo continua vivo e WS_VISIBLE durante o comparador porque
-        // a troca de decorations/HWND já depende dessa identidade estável no
-        // lifecycle provado. Fora da Home ele fica estacionado fora do cliente:
-        // não aparece na titlebar e Ctrl+L abre a palette nativa.
-        let inner = if self.surface == Surface::Home {
-            let layout =
-                HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
-            let pad_x = 22.0 * scale;
-            let pad_y = 5.0 * scale;
-            UiRect {
-                x: layout.input.x + pad_x,
-                y: layout.input.y + pad_y,
-                width: (layout.input.width - pad_x * 2.0).max(1.0),
-                height: (layout.input.height - pad_y * 2.0).max(1.0),
-            }
-        } else {
-            UiRect {
-                x: -4096.0 * scale,
-                y: 0.0,
-                width: 1.0,
-                height: 1.0,
-            }
+        let layout =
+            HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
+        let pad_x = 22.0 * scale;
+        let pad_y = 5.0 * scale;
+        let inner = UiRect {
+            x: layout.input.x + pad_x,
+            y: layout.input.y + pad_y,
+            width: (layout.input.width - pad_x * 2.0).max(1.0),
+            height: (layout.input.height - pad_y * 2.0).max(1.0),
         };
 
         unsafe {
@@ -3190,10 +3190,9 @@ impl App {
                 inner.height.round() as i32,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
+            ShowWindow(edit, SW_SHOW);
         }
-        if self.surface == Surface::Home {
-            self.apply_omnibox_font(inner.height);
-        }
+        self.apply_omnibox_font(inner.height);
         self.needs_clear = true;
         self.request_redraw();
     }
@@ -4249,8 +4248,7 @@ impl App {
         if !reuse_comparator {
             self.destroy_web_surfaces();
         }
-        self.show_omnibox_passive(true);
-        self.position_omnibox();
+        self.show_omnibox_passive(false);
 
         let google_url = match google_ai_url(query, &self.config.language) {
             Ok(u) => u,
@@ -4405,8 +4403,7 @@ impl App {
         self.sync_exit_button();
         self.sync_home_button();
         self.sync_caption_buttons();
-        self.show_omnibox_passive(true);
-        self.position_omnibox();
+        self.show_omnibox_passive(false);
 
         for delay_ms in COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS {
             self.timers.after(
@@ -4422,10 +4419,8 @@ impl App {
         // o gate pode enviar Home imediatamente depois de observar o flag.
         self.ensure_window_subclass();
 
-        if lifecycle_probe_enabled() {
-            LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
-        }
-
+        // Ready só é publicado em about_to_wait(), depois de devolver o
+        // controlo ao event loop fora do pump aninhado do WebView2.
         self.schedule_gmail_probe(4);
         self.begin_reading_session(false);
         self.request_redraw();
@@ -4458,37 +4453,27 @@ impl App {
             return;
         }
 
-        let mut restored = false;
         if let Some(comp) = &mut self.comparator
             && idx < comp.views.len()
         {
-            if comp.expanded == Some(idx) {
-                comp.expanded = None;
-                restored = true;
+            comp.expanded = if comp.expanded == Some(idx) {
+                None
             } else {
-                comp.expanded = Some(idx);
-            }
+                Some(idx)
+            };
         }
         self.bar_hover = None;
         self.needs_clear = true;
 
-        // Ecra completo a serio: sem barra de titulo, sem minimizar/fechar.
-        if let Some(window) = &self.window {
-            if restored {
-                window.set_fullscreen(None);
-            } else {
-                window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-            }
-        }
-
+        // Expandir ocupa apenas a área de conteúdo. A titlebar do NeuralIA e
+        // minimizar/maximizar/fechar permanecem acessíveis.
         self.update_comparator_layout();
         self.sync_comparator_splitters();
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.sync_home_button();
         self.sync_caption_buttons();
-        self.show_omnibox_passive(true);
-        self.position_omnibox();
+        self.show_omnibox_passive(false);
         self.request_redraw();
     }
 
@@ -4546,8 +4531,7 @@ impl App {
         self.sync_exit_button();
         self.sync_home_button();
         self.sync_caption_buttons();
-        self.show_omnibox_passive(true);
-        self.position_omnibox();
+        self.show_omnibox_passive(false);
         self.request_redraw();
     }
 
@@ -4555,17 +4539,13 @@ impl App {
         if let Some(comp) = &mut self.comparator {
             comp.expanded = None;
         }
-        if let Some(window) = &self.window {
-            window.set_fullscreen(None);
-        }
         self.update_comparator_layout();
         self.sync_comparator_splitters();
         self.sync_comparator_buttons();
         self.sync_exit_button();
         self.sync_home_button();
         self.sync_caption_buttons();
-        self.show_omnibox_passive(true);
-        self.position_omnibox();
+        self.show_omnibox_passive(false);
         self.request_redraw();
     }
 
@@ -4640,8 +4620,8 @@ impl App {
                 for (i, v) in comp.views.iter().enumerate() {
                     if i == idx {
                         let _ = v.webview.set_bounds(wry::Rect {
-                            position: LogicalPosition::new(0.0, 0.0).into(),
-                            size: LogicalSize::new(logical_w, logical_h.max(1.0)).into(),
+                            position: LogicalPosition::new(0.0, content_y).into(),
+                            size: LogicalSize::new(logical_w, content_h).into(),
                         });
                         let _ = v.webview.set_visible(true);
                     } else {
@@ -4714,7 +4694,9 @@ impl App {
             IpcAction::NewTab { col: Some(col) } if col == col_index => {
                 Some(UserEvent::NewTab(col_index))
             }
-            IpcAction::Expand { col } => Some(UserEvent::ExpandComparator(col)),
+            IpcAction::Expand { col } if col == col_index => {
+                Some(UserEvent::ExpandComparator(col_index))
+            }
             other => common_ipc_event(other),
         }
     }
@@ -5904,19 +5886,13 @@ impl App {
     }
 
     fn is_fullscreen_column(&self) -> bool {
-        self.comparator
-            .as_ref()
-            .is_some_and(|comp| comp.expanded.is_some())
+        false
     }
 
-    /// Em tres colunas a barra fica estavel. Em fullscreen ela desaparece e
-    /// a saida fica por conta do botao nativo flutuante.
+    /// O chrome permanece visível também quando uma IA ocupa toda a área de
+    /// conteúdo. "Expandir" não significa tomar o monitor inteiro.
     fn bar_visible(&self) -> bool {
-        match &self.comparator {
-            Some(comp) if comp.split.is_some() => true,
-            Some(comp) => comp.expanded.is_none(),
-            None => false,
-        }
+        self.comparator.is_some()
     }
 
     fn bar_layout(&self) -> Option<BarLayout> {
@@ -7592,6 +7568,22 @@ impl ApplicationHandler<UserEvent> for App {
         // continuem chegando à janela REAL também na segunda abertura.
         self.ensure_window_subclass();
 
+        if lifecycle_probe_enabled()
+            && self.surface == Surface::Comparator
+            && self.comparator.is_some()
+            && !LIFECYCLE_COMPARATOR_READY.load(Ordering::Acquire)
+        {
+            self.needs_clear = true;
+            self.update_comparator_layout();
+            self.sync_comparator_splitters();
+            self.sync_exit_button();
+            self.sync_home_button();
+            self.sync_caption_buttons();
+            self.show_omnibox_passive(false);
+            LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
+            self.request_redraw();
+        }
+
         let interval = if self.surface == Surface::Home && home_animation_enabled() {
             // O `Occluded` do Windows nao cobre a minimizacao em todos os
             // casos, por isso pergunta-se tambem a janela.
@@ -7668,6 +7660,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::HistoryCleared(result) => self.report_history_cleared(result),
             UserEvent::HistoryLoaded(result) => self.show_history_entries(result),
+            UserEvent::HistoryWriteFailed(error) => {
+                self.show_splash(format!("Histórico não foi gravado: {error}"), 4);
+            }
             UserEvent::MemoryQueryReady { query, result } => {
                 self.show_memory_results(&query, result);
             }
@@ -7772,11 +7767,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_exit_button();
                     self.sync_home_button();
                     self.sync_caption_buttons();
-                    self.show_omnibox_passive(true);
-                    self.position_omnibox();
-                    if lifecycle_probe_enabled() {
-                        LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
-                    }
+                    self.show_omnibox_passive(false);
                     self.request_redraw();
                 }
             }
