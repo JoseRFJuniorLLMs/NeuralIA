@@ -13171,6 +13171,238 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn ui_rect_edges_are_half_open_so_adjacent_controls_never_share_a_click() {
+        let left = UiRect {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+        };
+        let right = UiRect {
+            x: 10.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+        };
+        assert!(left.contains(9.999, 5.0));
+        assert!(!left.contains(10.0, 5.0));
+        assert!(right.contains(10.0, 5.0));
+        assert!(!right.contains(20.0, 5.0));
+
+        let bar = BarLayout::new(1120.0, 1.0, true, 3);
+        let boundary = bar.window_close.x;
+        let y = bar.window_close.y + bar.window_close.height / 2.0;
+        assert!(
+            !bar.window_maximize.contains(boundary, y),
+            "a borda do fechar nao pode pertencer tambem ao maximizar"
+        );
+        assert_eq!(bar.hit(boundary, y), Some(BarHit::WindowClose));
+        assert_eq!(
+            bar.hit(boundary - 0.001, y),
+            Some(BarHit::WindowMaximize)
+        );
+    }
+
+    #[test]
+    fn keyboard_shortcuts_keep_page_identity_and_global_digit_targets() {
+        for source in 0..COMPARATOR_COLUMNS {
+            assert!(matches!(
+                App::column_ipc_event_impl(source, IpcAction::Fullscreen),
+                Some(UserEvent::ExpandComparator(index)) if index == source
+            ));
+            assert!(matches!(
+                App::column_ipc_event_impl(source, IpcAction::Reload),
+                Some(UserEvent::ReloadTarget(PageTarget::Column(index))) if index == source
+            ));
+            assert!(matches!(
+                App::column_ipc_event_impl(source, IpcAction::Print),
+                Some(UserEvent::PrintTarget(PageTarget::Column(index))) if index == source
+            ));
+            assert!(matches!(
+                App::column_ipc_event_impl(source, IpcAction::DevTools),
+                Some(UserEvent::OpenDevToolsTarget(PageTarget::Column(index))) if index == source
+            ));
+            assert!(matches!(
+                App::column_ipc_event_impl(source, IpcAction::ViewSource),
+                Some(UserEvent::ViewSourceTarget(PageTarget::Column(index))) if index == source
+            ));
+
+            // 1/2/3 sao atalhos globais: a coluna com foco nao limita o alvo.
+            for target in 0..COMPARATOR_COLUMNS {
+                assert!(matches!(
+                    App::column_ipc_event_impl(
+                        source,
+                        IpcAction::ShortcutExpand { col: target }
+                    ),
+                    Some(UserEvent::ExpandComparator(index)) if index == target
+                ));
+            }
+        }
+
+        // O botao/DOM normal continua preso a propria coluna.
+        assert!(matches!(
+            App::column_ipc_event_impl(1, IpcAction::Expand { col: 1 }),
+            Some(UserEvent::ExpandComparator(1))
+        ));
+        assert!(App::column_ipc_event_impl(0, IpcAction::Expand { col: 1 }).is_none());
+
+        assert!(matches!(
+            App::split_ipc_event_impl(2, IpcAction::Fullscreen),
+            Some(UserEvent::ToggleSplitFullscreen)
+        ));
+        assert!(matches!(
+            App::split_ipc_event_impl(2, IpcAction::Omnibox),
+            Some(UserEvent::OpenPalette(2))
+        ));
+        assert!(matches!(
+            App::split_ipc_event_impl(2, IpcAction::Print),
+            Some(UserEvent::PrintTarget(PageTarget::Split))
+        ));
+        assert!(matches!(
+            App::split_ipc_event_impl(2, IpcAction::ShortcutExpand { col: 0 }),
+            Some(UserEvent::ExpandComparator(0))
+        ));
+    }
+
+    #[test]
+    fn failed_split_build_preserves_the_previous_split_and_expansion() {
+        let mut split = Some(41u32);
+        let mut expanded = Some(2usize);
+
+        let failed: Result<u32, &str> = Err("webview failed");
+        assert_eq!(
+            commit_split_build(failed, &mut split, &mut expanded),
+            Err("webview failed")
+        );
+        assert_eq!(split, Some(41), "falha nao pode destruir o Split anterior");
+        assert_eq!(
+            expanded,
+            Some(2),
+            "falha nao pode sair da expansao que ja estava visivel"
+        );
+
+        let committed = commit_split_build(Ok::<u32, &str>(99), &mut split, &mut expanded)
+            .expect("build valido");
+        assert_eq!(committed, (99, Some(41)));
+        assert_eq!(split, None);
+        assert_eq!(expanded, None);
+    }
+
+    #[test]
+    fn ui_100_interaction_matrix_keeps_click_targets_unambiguous() {
+        let logical_widths = [700.0, 760.0, 900.0, 1120.0, 1600.0];
+        let scales = [1.0, 1.25, 1.5, 2.0];
+        let topologies = [
+            ([false, false, false], false),
+            ([true, false, false], false),
+            ([false, true, false], false),
+            ([false, false, true], false),
+            ([false, false, false], true),
+        ];
+        let center = |rect: UiRect| (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+        let mut scenarios = 0usize;
+
+        for logical_width in logical_widths {
+            for scale in scales {
+                let client_width = logical_width * scale;
+                for (minimized, split_active) in topologies {
+                    scenarios += 1;
+                    let columns = BarColumns {
+                        count: COMPARATOR_COLUMNS,
+                        weights: [1.0; COMPARATOR_COLUMNS],
+                        minimized,
+                        split_active,
+                    };
+                    let layout =
+                        BarLayout::with_contexts(client_width, scale, true, columns, [3, 3, 3]);
+
+                    for (rect, expected) in [
+                        (layout.window_minimize, BarHit::WindowMinimize),
+                        (layout.window_maximize, BarHit::WindowMaximize),
+                        (layout.window_close, BarHit::WindowClose),
+                        (layout.home, BarHit::Home),
+                    ] {
+                        let (x, y) = center(rect);
+                        assert_eq!(
+                            layout.hit(x, y),
+                            Some(expected),
+                            "alvo errado em {logical_width}px @{scale}x"
+                        );
+                    }
+
+                    let controls = right_controls(client_width, scale, split_active);
+                    let (px, py) = center(controls.private);
+                    assert_eq!(
+                        right_controls_hit(controls, px, py),
+                        Some(BarHit::Private)
+                    );
+                    assert_eq!(
+                        layout.hit(px, py),
+                        None,
+                        "controle Privado sobrepoe alvo da barra em {logical_width}px @{scale}x"
+                    );
+
+                    if let Some((_label, expand, close)) = controls.split {
+                        for (rect, expected) in [
+                            (expand, BarHit::SplitExpand),
+                            (close, BarHit::SplitClose),
+                        ] {
+                            let (x, y) = center(rect);
+                            assert_eq!(right_controls_hit(controls, x, y), Some(expected));
+                            assert_eq!(
+                                layout.hit(x, y),
+                                None,
+                                "controle do Split sobrepoe alvo da barra em {logical_width}px @{scale}x"
+                            );
+                        }
+                    }
+
+                    for index in 0..COMPARATOR_COLUMNS {
+                        let provider = layout.columns[index];
+                        if provider.width > 0.0 {
+                            let (x, y) = center(provider);
+                            assert_eq!(
+                                layout.hit(x, y),
+                                Some(BarHit::Column(index)),
+                                "provedor {index} perdeu o clique em {logical_width}px @{scale}x"
+                            );
+                        }
+
+                        let add = layout.add_tabs[index];
+                        if add.width > 0.0 {
+                            let (x, y) = center(add);
+                            assert_eq!(
+                                layout.hit(x, y),
+                                Some(BarHit::AddTab(index)),
+                                "+ da coluna {index} perdeu o clique em {logical_width}px @{scale}x"
+                            );
+                        }
+
+                        for visual in 0..layout.context_tab_counts[index] {
+                            let tab_rect = layout.context_tabs[index][visual];
+                            let (x, y) = center(tab_rect);
+                            assert_eq!(
+                                layout.hit(x, y),
+                                Some(BarHit::ContextTab {
+                                    source_index: index,
+                                    context_index: layout.context_indices[index][visual],
+                                }),
+                                "aba da coluna {index} perdeu o clique em {logical_width}px @{scale}x"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            scenarios, 100,
+            "o gate precisa exercitar exatamente cem combinacoes de tela/estado"
+        );
+    }
+
 }
 
 // ===================== tema do sistema (cor de destaque + claro/escuro) =====================
