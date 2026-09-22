@@ -4356,7 +4356,7 @@ impl App {
         ];
 
         let mut views = Vec::new();
-        for (i, (name, url)) in targets.into_iter().enumerate() {
+        for (i, (name, _url)) in targets.into_iter().enumerate() {
             let col_x = i as f64 * col_w;
             let actual_w = if i == 2 { logical_w - col_x } else { col_w };
 
