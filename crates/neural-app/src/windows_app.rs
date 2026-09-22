@@ -11961,7 +11961,6 @@ mod tests {
         assert!(!surface_accepts_omnibox_submit(Surface::External));
         assert!(!surface_accepts_omnibox_submit(Surface::Reader));
         assert!(!surface_accepts_omnibox_submit(Surface::Pdf));
-
     }
 
     #[test]
