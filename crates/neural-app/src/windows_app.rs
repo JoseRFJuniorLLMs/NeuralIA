@@ -1236,6 +1236,10 @@ fn regroup_context_tab(
     groups.iter().position(|group| group.id == created_id)
 }
 
+fn split_build_is_current(start_generation: u64, current_generation: u64, surface: Surface) -> bool {
+    start_generation == current_generation && surface == Surface::Comparator
+}
+
 fn commit_split_build<T, E, P>(
     result: Result<T, E>,
     current_split: &mut Option<P>,
@@ -5175,6 +5179,7 @@ impl App {
             return false;
         };
 
+        let generation = self.current_generation();
         let Some(window) = &self.window else {
             return false;
         };
@@ -5205,6 +5210,13 @@ impl App {
             .with_bounds(bounds)
             .with_url(valid.as_str())
             .build_as_child(window);
+
+        if !split_build_is_current(generation, self.current_generation(), self.surface) {
+            if let Ok(webview) = built {
+                drop(webview);
+            }
+            return false;
+        }
 
         let committed = match &mut self.comparator {
             Some(comp) => commit_split_build(built, &mut comp.split, &mut comp.expanded),
@@ -13264,6 +13276,14 @@ mod tests {
             App::split_ipc_event_impl(2, IpcAction::ShortcutExpand { col: 0 }),
             Some(UserEvent::ExpandComparator(0))
         ));
+    }
+
+    #[test]
+    fn stale_split_builds_are_discarded_after_navigation_changes() {
+        assert!(split_build_is_current(7, 7, Surface::Comparator));
+        assert!(!split_build_is_current(7, 8, Surface::Comparator));
+        assert!(!split_build_is_current(7, 7, Surface::Home));
+        assert!(!split_build_is_current(7, 7, Surface::External));
     }
 
     #[test]
