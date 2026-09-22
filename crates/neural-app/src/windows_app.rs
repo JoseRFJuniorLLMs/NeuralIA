@@ -7370,6 +7370,26 @@ impl ApplicationHandler<UserEvent> for App {
         // continuem chegando à janela REAL também na segunda abertura.
         self.ensure_window_subclass();
 
+        // Este é o primeiro callback do winit garantidamente posterior ao
+        // retorno do handler que abriu os WebView2. Não publique o handshake
+        // dentro de open_comparator nem num timer: ambos podem ficar presos no
+        // pump aninhado do WebView2. Na primeira passagem pós-abertura,
+        // reaplique só a geometria/controles nativos e então marque Ready.
+        if lifecycle_probe_enabled()
+            && self.surface == Surface::Comparator
+            && self.comparator.is_some()
+            && !LIFECYCLE_COMPARATOR_READY.load(Ordering::Acquire)
+        {
+            self.needs_clear = true;
+            self.update_comparator_layout();
+            self.sync_comparator_splitters();
+            self.sync_exit_button();
+            self.sync_home_button();
+            self.show_omnibox_passive(false);
+            LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
+            self.request_redraw();
+        }
+
         let interval = if self.surface == Surface::Home && home_animation_enabled() {
             // O `Occluded` do Windows nao cobre a minimizacao em todos os
             // casos, por isso pergunta-se tambem a janela.
@@ -7550,9 +7570,6 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sync_exit_button();
                     self.sync_home_button();
                     self.show_omnibox_passive(false);
-                    if lifecycle_probe_enabled() {
-                        LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
-                    }
                     self.request_redraw();
                 }
             }
@@ -10979,7 +10996,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_ready_waits_for_a_later_event_loop_turn() {
+    fn lifecycle_ready_is_published_only_from_about_to_wait() {
         let source = include_str!("windows_app.rs");
 
         let activate = source
@@ -10987,26 +11004,29 @@ mod tests {
             .nth(1)
             .and_then(|part| part.split("fn expand_comparator").next())
             .expect("activate_comparator body");
-        assert!(
-            !activate.contains("LIFECYCLE_COMPARATOR_READY.store(true"),
-            "activate_comparator ainda corre no stack que abriu WebView2"
-        );
-        assert!(activate.contains("UserEvent::RelayoutComparator"));
+        assert!(!activate.contains("LIFECYCLE_COMPARATOR_READY.store(true"));
 
         let relayout = source
             .split("UserEvent::RelayoutComparator =>")
             .nth(1)
             .and_then(|part| part.split("UserEvent::RestoreHomeDecorations =>").next())
             .expect("RelayoutComparator handler");
-        let rebind = relayout
+        assert!(!relayout.contains("LIFECYCLE_COMPARATOR_READY.store(true"));
+
+        let idle = source
+            .split("fn about_to_wait")
+            .nth(1)
+            .and_then(|part| part.split("fn user_event").next())
+            .expect("about_to_wait body");
+        let rebind = idle
             .find("self.ensure_window_subclass()")
             .expect("rebind");
-        let ready = relayout
+        let ready = idle
             .find("LIFECYCLE_COMPARATOR_READY.store(true")
             .expect("Ready publish");
         assert!(
             ready > rebind,
-            "Ready só pode nascer depois de rebindar o HWND numa volta posterior"
+            "Ready só pode nascer depois de voltar ao event loop e rebindar o HWND"
         );
     }
 
