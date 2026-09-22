@@ -7755,7 +7755,7 @@ impl ApplicationHandler<UserEvent> for App {
                         window.set_decorations(true);
                     }
                     self.ensure_window_subclass();
-                                if let Some(window) = &self.window {
+                    if let Some(window) = &self.window {
                         hide_orphaned_wry_hosts(window);
                     }
                     self.needs_clear = true;
