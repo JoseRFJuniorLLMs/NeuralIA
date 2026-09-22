@@ -7728,7 +7728,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // aqui prende os comandos nativos ao HWND que ficou realmente
                     // ativo, em vez de ao handle anterior da Home.
                     self.ensure_window_subclass();
-                                self.needs_clear = true;
+                    self.needs_clear = true;
                     self.update_comparator_layout();
                     self.sync_comparator_splitters();
                     self.sync_comparator_buttons();
