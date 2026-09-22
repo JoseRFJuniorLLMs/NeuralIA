@@ -11018,9 +11018,7 @@ mod tests {
             .nth(1)
             .and_then(|part| part.split("fn user_event").next())
             .expect("about_to_wait body");
-        let rebind = idle
-            .find("self.ensure_window_subclass()")
-            .expect("rebind");
+        let rebind = idle.find("self.ensure_window_subclass()").expect("rebind");
         let ready = idle
             .find("LIFECYCLE_COMPARATOR_READY.store(true")
             .expect("Ready publish");
