@@ -4219,10 +4219,12 @@ impl App {
         }
 
         // Chegar aqui significa que os tres build_as_child ja retornaram,
-        // self.comparator ja existe e o layout inicial foi aplicado. Isso e a
-        // fronteira real de "abertura concluida". O probe nao deve depender do
-        // RelayoutComparator de 40/220 ms, porque na segunda abertura o Windows
-        // pode trocar/reparentar o HWND e o evento tardio ficar atras do pump.
+        // self.comparator ja existe e o layout inicial foi aplicado. Nesta
+        // altura set_decorations(false) pode ja ter trocado/reparentado o HWND
+        // nativo. Reinstale a subclass NO HWND efetivo antes de publicar Ready:
+        // o gate pode enviar Home imediatamente depois de observar o flag.
+        self.ensure_window_subclass();
+
         if lifecycle_probe_enabled() {
             LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
         }
@@ -10841,9 +10843,16 @@ mod tests {
         let layout = body
             .find("self.update_comparator_layout()")
             .expect("initial layout");
+        let rebind = body
+            .find("self.ensure_window_subclass()")
+            .expect("subclass rebind");
         assert!(
             ready > layout,
             "Ready so pode ser publicado depois de o comparador existir e ter layout"
+        );
+        assert!(
+            ready > rebind,
+            "Ready so pode ser publicado depois de rebindar a subclass no HWND efetivo"
         );
     }
 
