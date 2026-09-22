@@ -3326,17 +3326,25 @@ impl App {
         }
 
         if let Some(button) = self.exit_button.take() {
-            unsafe { DestroyWindow(button); }
+            unsafe {
+                DestroyWindow(button);
+            }
         }
         if let Some(button) = self.home_button.take() {
-            unsafe { DestroyWindow(button); }
+            unsafe {
+                DestroyWindow(button);
+            }
         }
         if let Some(buttons) = self.caption_buttons.take() {
-            unsafe { DestroyWindow(buttons); }
+            unsafe {
+                DestroyWindow(buttons);
+            }
         }
         for splitter in &mut self.splitters {
             if let Some(hwnd) = splitter.take() {
-                unsafe { DestroyWindow(hwnd); }
+                unsafe {
+                    DestroyWindow(hwnd);
+                }
             }
         }
 
@@ -3438,8 +3446,7 @@ impl App {
     }
 
     fn show_home(&mut self) {
-        let reuse_comparator =
-            self.surface == Surface::Comparator && self.comparator.is_some();
+        let reuse_comparator = self.surface == Surface::Comparator && self.comparator.is_some();
         self.next_generation();
 
         // O comparador é caro e, pior, recriá-lo repetidamente abre uma janela
