@@ -4,6 +4,16 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+## [2.1.2] - 2026-09-21
+
+### Fixed
+- Auditoria visual pós-2.1.1: a omnibox permanece utilizável no comparador, permitindo novas pesquisas sem regressar à Home.
+- Home passou a ter controlo Win32 nativo clicável e os controlos nativos são reparentados quando o Windows troca o HWND após mudanças de decoração.
+- Fullscreen usa geometria estável e botão nativo permanente de saída, eliminando o redimensionamento por hover que causava flicker e travamentos.
+- Claude preserva a consulta através de redirects e não considera a pesquisa enviada apenas porque o parâmetro `?q=` desapareceu.
+- A release pública passa a publicar somente o instalador `NeuralIA-Setup-<versão>-x64.exe`.
+
+
 ## [2.1.1] - 2026-09-21
 
 ### Fixed

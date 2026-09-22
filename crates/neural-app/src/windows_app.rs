@@ -5879,7 +5879,7 @@ impl App {
                 let created = CreateWindowExW(
                     0,
                     windows_sys::w!("STATIC"),
-                    windows_sys::w!(""),
+                    windows_sys::w!("NeuralIA.Home"),
                     WS_CHILD | WS_VISIBLE,
                     rect.x.round() as i32,
                     rect.y.round() as i32,
@@ -9586,6 +9586,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn native_home_button_has_a_stable_window_identity_for_the_shipping_gate() {
+        let source = include_str!("windows_app.rs");
+        let body = source
+            .split("fn sync_home_button")
+            .nth(1)
+            .and_then(|part| part.split("fn sync_exit_button").next())
+            .expect("sync_home_button body");
+        assert!(body.contains(r#"windows_sys::w!("NeuralIA.Home")"#));
     }
 
     #[test]
