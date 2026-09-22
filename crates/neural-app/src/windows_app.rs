@@ -4218,6 +4218,15 @@ impl App {
             );
         }
 
+        // Chegar aqui significa que os tres build_as_child ja retornaram,
+        // self.comparator ja existe e o layout inicial foi aplicado. Isso e a
+        // fronteira real de "abertura concluida". O probe nao deve depender do
+        // RelayoutComparator de 40/220 ms, porque na segunda abertura o Windows
+        // pode trocar/reparentar o HWND e o evento tardio ficar atras do pump.
+        if lifecycle_probe_enabled() {
+            LIFECYCLE_COMPARATOR_READY.store(true, Ordering::Release);
+        }
+
         self.schedule_gmail_probe(4);
         self.begin_reading_session(false);
         self.request_redraw();
@@ -10814,6 +10823,26 @@ mod tests {
         assert_eq!(body.matches("self.web(url)").count(), 1);
         assert!(body.contains("load_url(valid.as_str())"));
         assert!(body.contains("sem perder a comparação"));
+    }
+
+    #[test]
+    fn lifecycle_ready_is_published_at_the_real_end_of_comparator_activation() {
+        let source = include_str!("windows_app.rs");
+        let body = source
+            .split("fn activate_comparator")
+            .nth(1)
+            .and_then(|part| part.split("fn expand_comparator").next())
+            .expect("activate_comparator body");
+
+        assert!(body.contains("LIFECYCLE_COMPARATOR_READY.store(true"));
+        let ready = body
+            .find("LIFECYCLE_COMPARATOR_READY.store(true")
+            .expect("Ready publish");
+        let layout = body.find("self.update_comparator_layout()").expect("initial layout");
+        assert!(
+            ready > layout,
+            "Ready so pode ser publicado depois de o comparador existir e ter layout"
+        );
     }
 
     #[test]
