@@ -11144,6 +11144,9 @@ mod tests {
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("button.click()"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("form.requestSubmit"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("lastSubmitAt"));
+        assert!(AI_AUTO_SUBMIT_SCRIPT.contains("neuralia:pending-query:"));
+        assert!(AI_AUTO_SUBMIT_SCRIPT.contains("if (host === 'claude.ai') return false"));
+        assert!(AI_AUTO_SUBMIT_SCRIPT.contains("storageRemove(pendingKey)"));
         assert!(AI_AUTO_SUBMIT_SCRIPT.contains("setTimeout(submitWhenReady, 150)"));
     }
 
@@ -13210,21 +13213,44 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
   if (window.top !== window) return;
   const host = location.hostname.toLowerCase();
   if (host !== 'chatgpt.com' && host !== 'claude.ai') return;
-  const query = new URL(location.href).searchParams.get('q');
-  if (!query || !query.trim()) return;
 
-  // O acesso ao sessionStorage pode LANCAR -- armazenamento particionado,
-  // cookies de terceiros bloqueados, modo restrito. Sem rede, um throw aqui
-  // ao nivel de topo abortava o script todo.
-  function stampRead(key) {
-    try { return Number(sessionStorage.getItem(key) || '0'); } catch (_) { return 0; }
+  // Claude pode redireccionar /new?q=... antes de o compositor ficar pronto.
+  // Guardamos a consulta no sessionStorage no primeiro documento e retomamos
+  // no seguinte. Assim o auto-submit nao depende de o fornecedor preservar o
+  // parametro q durante toda a montagem da SPA.
+  function storageRead(key) {
+    try { return String(sessionStorage.getItem(key) || ''); } catch (_) { return ''; }
   }
-  function stampWrite(key, value) {
+  function storageWrite(key, value) {
     try { sessionStorage.setItem(key, String(value)); } catch (_) {}
   }
+  function storageRemove(key) {
+    try { sessionStorage.removeItem(key); } catch (_) {}
+  }
+  function stampRead(key) {
+    return Number(storageRead(key) || '0');
+  }
+  function stampWrite(key, value) {
+    storageWrite(key, value);
+  }
+
+  let urlQuery = '';
+  try { urlQuery = String(new URL(location.href).searchParams.get('q') || '').trim(); } catch (_) {}
+  const pendingKey = 'neuralia:pending-query:' + host;
+  if (urlQuery) storageWrite(pendingKey, urlQuery);
+  const query = (urlQuery || storageRead(pendingKey)).trim();
+  if (!query) return;
 
   const stampKey = 'neuralia:auto-submit:' + host + ':' + query;
-  if (Date.now() - stampRead(stampKey) < 10000) return;
+  if (Date.now() - stampRead(stampKey) < 10000) {
+    storageRemove(pendingKey);
+    return;
+  }
+
+  function finish() {
+    stampWrite(stampKey, Date.now());
+    storageRemove(pendingKey);
+  }
 
   const EDITORS = 'div[contenteditable="true"][role="textbox"], div[contenteditable="true"], [data-testid="prompt-textarea"], textarea';
 
@@ -13288,7 +13314,7 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
   function sendButton() {
     const selectors = host === 'chatgpt.com'
       ? ['button[data-testid="send-button"]', 'button[aria-label*="Send prompt"]', 'button[aria-label*="Send message"]', 'button[aria-label*="Enviar"]', 'form button[type="submit"]']
-      : ['button[aria-label*="Send"]', 'button[aria-label*="Enviar"]', 'button[data-testid*="send"]', 'form button[type="submit"]'];
+      : ['button[data-testid="send-button"]', 'button[aria-label*="Send"]', 'button[aria-label*="Enviar"]', 'button[data-testid*="send"]', 'form button[type="submit"]'];
     for (const selector of selectors) {
       const button = document.querySelector(selector);
       if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') continue;
@@ -13311,6 +13337,10 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
   // DOM obrigava a conhecer os seletores de cada um -- e o ChatGPT tem pelo
   // menos duas variantes (ligado e desligado) com marcadores diferentes.
   function consumed() {
+    // No ChatGPT o desaparecimento de q e um sinal real de submissao. No
+    // Claude e apenas parte do redirect de /new para a SPA, portanto nao pode
+    // encerrar o auto-submit antes de o compositor sequer existir.
+    if (host === 'claude.ai') return false;
     try {
       return new URL(location.href).searchParams.get('q') !== query;
     } catch (_) {
@@ -13372,7 +13402,7 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
     attempts += 1;
 
     if (consumed()) {
-      stampWrite(stampKey, Date.now());
+      finish();
       return;
     }
 
@@ -13381,7 +13411,7 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
     // Depois de uma tentativa, o compositor vazio e o melhor reconhecimento
     // transversal de que o site aceitou a pergunta. Nao ha novo clique.
     if (lastSubmitAt && el && !textOf(el)) {
-      stampWrite(stampKey, Date.now());
+      finish();
       return;
     }
 
@@ -13421,6 +13451,7 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
     // enviado, a pergunta nao pode ficar la a fingir que o utilizador a
     // escreveu.
     if (filled) clear(el || editor());
+    storageRemove(pendingKey);
   }
 
   if (document.readyState === 'loading') {
