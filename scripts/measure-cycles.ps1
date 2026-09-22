@@ -438,53 +438,54 @@ function Wait-ForLifecycleProbeHomeReady([System.Diagnostics.Process]$Process, [
     return $false
 }
 
-function Get-DescendantIds([int]$RootId) {
-    # Win32_Process via CIM is useful for ownership, but on hosted Windows
-    # runners a WMI/CIM query can occasionally stall for minutes. Bound this
-    # optional precision source; the total-process delta remains the fallback.
+function Get-WebViewCount([int]$RootId) {
+    # Não use a contagem GLOBAL de msedgewebview2 como proxy de ownership.
+    # Runners Windows e aplicações do próprio SO podem criar/encerrar WebView2
+    # durante o gate. O runtime identifica o app hospedeiro na command line com
+    # --webview-exe-name=<exe>; usamos essa identidade e seguimos os descendentes
+    # desses processos mesmo quando o browser process deixa de ser filho direto.
     try {
-        $all = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name -OperationTimeoutSec 2 -ErrorAction Stop)
+        $all = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, CommandLine -OperationTimeoutSec 2 -ErrorAction Stop)
     }
     catch {
-        Write-Warning "Win32_Process snapshot unavailable; using WebView process delta: $($_.Exception.Message)"
-        return @()
-    }
-    $byParent = @{}
-    foreach ($proc in $all) {
-        if (-not $byParent.ContainsKey($proc.ParentProcessId)) {
-            $byParent[$proc.ParentProcessId] = New-Object System.Collections.ArrayList
-        }
-        $null = $byParent[$proc.ParentProcessId].Add($proc)
+        throw "Não foi possível obter snapshot Win32_Process para atribuir processos WebView2 ao NeuralIA: $($_.Exception.Message)"
     }
 
-    $found = New-Object System.Collections.ArrayList
-    $queue = New-Object System.Collections.Queue
-    $queue.Enqueue($RootId)
+    $needle = "--webview-exe-name=$script:WebViewExeName"
+    $byParent = @{}
+    foreach ($proc in $all) {
+        if (-not $byParent.ContainsKey([int]$proc.ParentProcessId)) {
+            $byParent[[int]$proc.ParentProcessId] = New-Object System.Collections.ArrayList
+        }
+        $null = $byParent[[int]$proc.ParentProcessId].Add($proc)
+    }
+
+    $owned = [System.Collections.Generic.HashSet[int]]::new()
+    $queue = [System.Collections.Generic.Queue[int]]::new()
+
+    foreach ($proc in $all) {
+        if ([string]$proc.Name -ine "msedgewebview2.exe") { continue }
+        $commandLine = [string]$proc.CommandLine
+        $tagged = $commandLine.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+        $directChild = [int]$proc.ParentProcessId -eq $RootId
+        if (($tagged -or $directChild) -and $owned.Add([int]$proc.ProcessId)) {
+            $queue.Enqueue([int]$proc.ProcessId)
+        }
+    }
+
     while ($queue.Count -gt 0) {
         $current = $queue.Dequeue()
         if (-not $byParent.ContainsKey($current)) { continue }
         foreach ($child in $byParent[$current]) {
-            $null = $found.Add($child)
-            $queue.Enqueue($child.ProcessId)
+            if ([string]$child.Name -ine "msedgewebview2.exe") { continue }
+            $childId = [int]$child.ProcessId
+            if ($owned.Add($childId)) {
+                $queue.Enqueue($childId)
+            }
         }
     }
-    return $found
-}
 
-function Get-TotalWebViewCount {
-    return @(Get-Process -Name msedgewebview2 -ErrorAction SilentlyContinue).Count
-}
-
-# Conta por ascendencia E por diferenca em relacao a linha de base. A ascendencia
-# e mais precisa quando funciona, mas o WebView2 nem sempre mantem os processos
-# como descendentes de quem os criou -- num runner do GitHub a arvore deu zero
-# enquanto a RAM subia 13 MiB. A diferenca e imune a isso; as outras aplicacoes
-# WebView2 da maquina mantem a sua contagem constante.
-function Get-WebViewCount([int]$RootId) {
-    $descendants = Get-DescendantIds -RootId $RootId
-    $owned = @($descendants | Where-Object { $_.Name -eq "msedgewebview2.exe" }).Count
-    $delta = (Get-TotalWebViewCount) - $script:WebViewBaseline
-    return [math]::Max($owned, [math]::Max($delta, 0))
+    return $owned.Count
 }
 
 function Wait-ForWebViews([int]$RootId, [scriptblock]$Predicate, [int]$TimeoutSec) {
@@ -497,7 +498,8 @@ function Wait-ForWebViews([int]$RootId, [scriptblock]$Predicate, [int]$TimeoutSe
     return Get-WebViewCount -RootId $RootId
 }
 
-$script:WebViewBaseline = @(Get-Process -Name msedgewebview2 -ErrorAction SilentlyContinue).Count
+$script:WebViewExeName = [System.IO.Path]::GetFileName($resolved)
+$script:WebViewBaseline = 0 # ownership agora é por identidade do app, não por delta global
 
 $env:NEURALIA_STARTUP_INPUT = $StartupInput
 $env:NEURALIA_LIFECYCLE_PROBE = "1"
