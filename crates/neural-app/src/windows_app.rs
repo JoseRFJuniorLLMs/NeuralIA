@@ -126,6 +126,8 @@ enum UserEvent {
     /// navegador de um normal, onde o clique so afeta o separador de onde
     /// partiu.
     OpenEverywhere(String),
+    /// Navegacao inicial das tres colunas, separada da criacao dos HWNDs.
+    LoadComparatorUrls([String; COMPARATOR_COLUMNS]),
     /// Fonte aberta sem abandonar a conversa que a originou.
     OpenSplit {
         source_index: usize,
@@ -2845,6 +2847,7 @@ struct App {
     window: Option<Window>,
     webview: Option<WebView>,
     comparator: Option<ComparatorState>,
+    comparator_navigation_started: bool,
     omnibox: Option<HWND>,
     bar_hover: Option<BarHit>,
     exit_button: Option<HWND>,
@@ -2938,6 +2941,7 @@ impl App {
             window: None,
             webview: None,
             comparator: None,
+            comparator_navigation_started: false,
             omnibox: None,
             bar_hover: None,
             exit_button: None,
@@ -3291,6 +3295,7 @@ impl App {
             LIFECYCLE_COMPARATOR_READY.store(false, Ordering::Release);
             LIFECYCLE_HOME_READY.store(false, Ordering::Release);
         }
+        self.comparator_navigation_started = false;
         self.mark_dirty();
         self.close_palette();
         self.finish_agent(AgentTermination::UserStopped);
@@ -4360,10 +4365,7 @@ impl App {
                 size: LogicalSize::new(actual_w, content_h).into(),
             };
 
-            let builder = self
-                .comparator_webview_builder(i, name)
-                .with_bounds(bounds)
-                .with_url(url.as_str());
+            let builder = self.comparator_webview_builder(i, name).with_bounds(bounds);
 
             match builder.build_as_child(window) {
                 Ok(wv) => {
@@ -4387,7 +4389,16 @@ impl App {
             groups: std::array::from_fn(|_| Vec::new()),
             next_group_id: 1,
         });
-        self.activate_comparator(true);
+        self.comparator_navigation_started = false;
+        self.activate_comparator(false);
+        self.timers.after(
+            Duration::from_millis(25),
+            UserEvent::LoadComparatorUrls([
+                google_url.to_string(),
+                chatgpt_url.to_string(),
+                claude_url.to_string(),
+            ]),
+        );
     }
 
     fn activate_comparator(&mut self, sync_remote_buttons: bool) {
@@ -7589,6 +7600,7 @@ impl ApplicationHandler<UserEvent> for App {
         if lifecycle_probe_enabled()
             && self.surface == Surface::Comparator
             && self.comparator.is_some()
+            && self.comparator_navigation_started
             && !LIFECYCLE_COMPARATOR_READY.load(Ordering::Acquire)
         {
             self.needs_clear = true;
@@ -7717,6 +7729,29 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::OpenExternal(url) => self.web(url),
             UserEvent::OpenInColumn(index, url) => self.open_in_column(index, url),
             UserEvent::OpenEverywhere(url) => self.open_everywhere(url),
+            UserEvent::LoadComparatorUrls(urls) => {
+                if self.surface == Surface::Comparator {
+                    let mut failure = None;
+                    if let Some(comp) = &self.comparator {
+                        for (view, url) in comp.views.iter().zip(urls.iter()) {
+                            if let Err(error) = view.webview.load_url(url) {
+                                failure = Some(format!(
+                                    "WebView2 nao pode iniciar {}: {error}",
+                                    view.name
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(error) = failure {
+                        self.show_native_error(error);
+                    } else {
+                        self.comparator_navigation_started = true;
+                        self.sync_comparator_buttons();
+                        self.request_redraw();
+                    }
+                }
+            }
             UserEvent::OpenSplit { source_index, url } => {
                 self.open_split(source_index, url, false);
             }
@@ -11673,6 +11708,18 @@ mod tests {
         assert!(
             COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS[1] > COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS[0]
         );
+    }
+
+    #[test]
+    fn fresh_comparator_defers_remote_navigation_until_after_child_creation() {
+        let source = include_str!("windows_app.rs");
+        let open = source
+            .split("fn open_comparator")
+            .nth(1)
+            .and_then(|part| part.split("fn activate_comparator").next())
+            .expect("open_comparator body");
+        assert!(!open.contains(".with_url(url.as_str())"));
+        assert!(open.contains("UserEvent::LoadComparatorUrls"));
     }
 
     #[test]
