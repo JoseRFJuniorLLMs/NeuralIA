@@ -2607,6 +2607,10 @@ struct NoteEdit {
     title: String,
     body: String,
     tags: Vec<String>,
+    /// A revisao da nota que o editor abriu (`note_rev`): se o ficheiro ja
+    /// nao e esse -- outra janela do NeuralIA ou o Obsidian gravaram por
+    /// cima --, o salvar vai para uma copia em vez de esmagar o outro.
+    rev: Option<String>,
 }
 
 const PANEL_MESSAGE_MAX_BYTES: usize = 4 * 1024;
@@ -2693,10 +2697,17 @@ fn note_line(text: &str) -> String {
         .to_string()
 }
 
-/// `{"id": null | "<id>", "title", "body", "tags": [..]}`, exatamente.
+/// `{"id": null | "<id>", "title", "body", "tags": [..]}` e, opcional,
+/// `"rev": null | "<16 hex>"` -- e mais nada.
 fn parse_note_edit(args: &serde_json::Value) -> Option<NoteEdit> {
     let args = args.as_object()?;
-    if args.len() != 4 {
+    let rev = match args.get("rev") {
+        None => None,
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(rev)) if is_note_rev(rev) => Some(rev.clone()),
+        Some(_) => return None,
+    };
+    if args.len() != 4 + usize::from(args.contains_key("rev")) {
         return None;
     }
     let id = match args.get("id")? {
@@ -2731,7 +2742,24 @@ fn parse_note_edit(args: &serde_json::Value) -> Option<NoteEdit> {
         title,
         body: body.to_string(),
         tags,
+        rev,
     })
+}
+
+/// A revisao de uma nota: FNV-1a de 64 bits do Markdown que ela e no disco.
+/// Muda com qualquer mudanca de titulo, corpo, tags, fonte, datas ou das
+/// propriedades que o Obsidian la escreveu.
+fn note_rev(note: &Note) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in note.to_markdown().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn is_note_rev(text: &str) -> bool {
+    text.len() == 16 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// O lado nativo segue o que o editor tem por salvar: o `note-draft` mais
@@ -3031,6 +3059,13 @@ enum NotesReply {
     Missing {
         id: String,
     },
+    /// A nota `original` mudou fora deste editor desde que ele a abriu; o
+    /// que o editor tinha ficou na copia `note`, e a original ficou como o
+    /// outro a deixou.
+    Conflict {
+        original: String,
+        note: Note,
+    },
     Failed(String),
 }
 
@@ -3069,9 +3104,28 @@ fn notes_command_for(message: PanelMessage) -> Option<NotesCommand> {
 /// A resposta a um note-save que o parser recusou.
 const NOTE_SAVE_REFUSED: &str = "A nota não foi salva: o título, as tags ou o tamanho passam dos limites.";
 
+/// O que o worker das notas lembra entre pedidos: a revisao que ELE
+/// escreveu em cada nota. Um salvar com a revisao de antes de um salvar
+/// nosso (o segundo Ctrl+S antes da resposta ao primeiro) nao e conflito.
+#[derive(Debug, Default)]
+struct NotesSession {
+    written: std::collections::HashMap<String, String>,
+}
+
+/// Um pedido fora de uma sessao (os gates que nao sao sobre conflitos).
+#[cfg(test)]
+fn run_notes_command(store: &ZettelStore, command: NotesCommand, now_unix: u64) -> NotesReply {
+    run_notes_command_in(&mut NotesSession::default(), store, command, now_unix)
+}
+
 /// O trabalho do worker das notas, sem thread nem janela: e isto que os
 /// gates correm, sobre uma pasta temporaria.
-fn run_notes_command(store: &ZettelStore, command: NotesCommand, now_unix: u64) -> NotesReply {
+fn run_notes_command_in(
+    session: &mut NotesSession,
+    store: &ZettelStore,
+    command: NotesCommand,
+    now_unix: u64,
+) -> NotesReply {
     match command {
         NotesCommand::List => notes_listed(store.list(), None),
         NotesCommand::Search(query) => notes_listed(store.search(&query), Some(query)),
@@ -3082,11 +3136,26 @@ fn run_notes_command(store: &ZettelStore, command: NotesCommand, now_unix: u64) 
         },
         NotesCommand::Save(edit) => {
             let saved = match edit.id {
-                None => store.create(&edit.title, &edit.body, edit.tags, None, now_unix),
+                None => store
+                    .create(&edit.title, &edit.body, edit.tags, None, now_unix)
+                    .map(|note| (None, note)),
                 // A fonte, as datas e as propriedades que o Obsidian escreveu
                 // ficam as do ficheiro. Se a nota foi apagada por fora enquanto
                 // estava aberta, grava-se o que o editor tem.
                 Some(id) => store.get(&id).and_then(|existing| {
+                    // Mudou fora deste editor desde que ele a abriu (outra
+                    // janela do NeuralIA, o Obsidian) e nao por um salvar
+                    // nosso: o texto do editor vai para uma copia e a nota
+                    // fica como o outro a deixou. Antes o salvar esmagava-a.
+                    if let (Some(current), Some(opened)) = (&existing, &edit.rev) {
+                        let now = note_rev(current);
+                        if &now != opened && session.written.get(&id) != Some(&now) {
+                            let title = format!("{} (conflito)", edit.title).trim().to_string();
+                            return store
+                                .create(&title, &edit.body, edit.tags, current.source.clone(), now_unix)
+                                .map(|copy| (Some(id), copy));
+                        }
+                    }
                     let mut note = existing.unwrap_or_else(|| Note {
                         id,
                         ..Note::default()
@@ -3094,11 +3163,17 @@ fn run_notes_command(store: &ZettelStore, command: NotesCommand, now_unix: u64) 
                     note.title = edit.title;
                     note.body = edit.body;
                     note.tags = edit.tags;
-                    store.save(&note, now_unix)
+                    store.save(&note, now_unix).map(|note| (None, note))
                 }),
             };
             match saved {
-                Ok(note) => notes_opened(store, NoteOpened::Saved, note),
+                Ok((conflict, note)) => {
+                    session.written.insert(note.id.clone(), note_rev(&note));
+                    match conflict {
+                        Some(original) => NotesReply::Conflict { original, note },
+                        None => notes_opened(store, NoteOpened::Saved, note),
+                    }
+                }
                 Err(error) => {
                     NotesReply::Failed(format!("Não foi possível salvar a nota: {error}"))
                 }
@@ -3155,6 +3230,18 @@ fn notes_opened(store: &ZettelStore, cause: NoteOpened, note: Note) -> NotesRepl
 /// (`serde_json::to_string`: um literal JS valido, com aspas, barras e
 /// `</script>` escapados) e a pagina so os usa como texto.
 fn notes_reply_script(reply: &NotesReply) -> String {
+    let note_json = |note: &Note| {
+        serde_json::json!({
+            "id": note.id,
+            "title": note.title,
+            "body": note.body,
+            "tags": note.tags,
+            "source": note.source,
+            "created": note.created_unix,
+            "updated": note.updated_unix,
+            "rev": note_rev(note),
+        })
+    };
     let summary = |note: &NoteSummary| {
         serde_json::json!({
             "id": note.id,
@@ -3181,16 +3268,13 @@ fn notes_reply_script(reply: &NotesReply) -> String {
         } => serde_json::json!({
             "kind": "opened",
             "cause": cause.as_str(),
-            "note": {
-                "id": note.id,
-                "title": note.title,
-                "body": note.body,
-                "tags": note.tags,
-                "source": note.source,
-                "created": note.created_unix,
-                "updated": note.updated_unix,
-            },
+            "note": note_json(note),
             "backlinks": backlinks.iter().map(summary).collect::<Vec<_>>(),
+        }),
+        NotesReply::Conflict { original, note } => serde_json::json!({
+            "kind": "conflict",
+            "original": original,
+            "note": note_json(note),
         }),
         NotesReply::Deleted { id } => serde_json::json!({ "kind": "deleted", "id": id }),
         NotesReply::Missing { id } => serde_json::json!({ "kind": "missing", "id": id }),
@@ -3228,11 +3312,14 @@ impl ZettelWorker {
         let _ = thread::Builder::new()
             .name("neural-zettel".into())
             .spawn(move || {
+                let mut session = NotesSession::default();
                 while let Ok(job) = rx.recv() {
                     // `open` so cria a pasta se faltar; abrir a cada pedido
                     // aguenta a pasta ter sido apagada com o app aberto.
                     let reply = match ZettelStore::open(&dir) {
-                        Ok(store) => run_notes_command(&store, job.command, unix_now()),
+                        Ok(store) => {
+                            run_notes_command_in(&mut session, &store, job.command, unix_now())
+                        }
                         Err(error) => NotesReply::Failed(format!(
                             "Não foi possível abrir a pasta das notas: {error}"
                         )),
@@ -3580,6 +3667,10 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
     const confirmBox = byId('note-confirm');
     // Nota no editor: o id dela, ou null para uma nota nova ainda por salvar.
     let openId = null;
+    // A revisao da nota que o editor mostra (do disco, ou do nosso ultimo
+    // salvar): o salvar leva-a, e o worker nao esmaga uma nota que mudou fora
+    // daqui desde entao.
+    let openRev = null;
     let openSource = '';
     let dirty = false;
     let savingNew = false;
@@ -3612,6 +3703,7 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
     const line = (text) => whole(String(text)).replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').trim();
     const edited = () => ({
       id: openId,
+      rev: openId === null ? null : openRev,
       title: line(title.value),
       body: whole(body.value),
       tags: tags.value.split(',').map(line).filter(Boolean),
@@ -3694,6 +3786,7 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
 
     function fill(note, links) {
       openId = note ? note.id : null;
+      openRev = note && note.rev ? note.rev : null;
       // Outra nota no editor: a resposta ao salvar de uma nota nova que
       // ainda venha a caminho ja nao e desta.
       savingNew = false;
@@ -3767,6 +3860,7 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
             if (same) {
               saving = undefined;
               openId = note.id;
+              openRev = note.rev || null;
               if (!title.value.trim()) title.value = note.title;
               describe(note, data.backlinks);
               // O que se escreveu enquanto a nota nova esperava pelo id: a
@@ -3800,6 +3894,21 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
           say('Essa nota já não existe.');
           refresh();
           break;
+        case 'conflict': {
+          // A nota mudou fora deste editor (outra janela, o Obsidian): o
+          // texto dele ficou numa copia, e o editor passa a mostra-la.
+          const note = data.note;
+          if (openId === data.original) {
+            saving = undefined;
+            openId = note.id;
+            openRev = note.rev || null;
+            title.value = note.title;
+            describe(note, []);
+          }
+          say('Esta nota mudou fora deste editor (outra janela ou o Obsidian). O seu texto ficou numa cópia: ' + note.title);
+          refresh();
+          break;
+        }
         case 'failed':
           savingNew = false;
           // Um salvar que falhou (pasta ocupada, disco cheio, ficheiro preso
@@ -3944,6 +4053,24 @@ impl Service {
         match self {
             Self::Breath => true,
             Self::Meet | Self::WhatsApp | Self::YouTube | Self::Gmail => false,
+        }
+    }
+}
+
+/// Para onde vai o teclado quando um painel ao lado fecha.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelCloseFocus {
+    /// Na Home: a omnibox, para continuar a escrever.
+    Omnibox,
+    /// No resto: a janela (os atalhos da barra continuam a funcionar).
+    Window,
+}
+
+fn focus_after_panel_close(surface: Surface) -> PanelCloseFocus {
+    match surface {
+        Surface::Home => PanelCloseFocus::Omnibox,
+        Surface::Reader | Surface::External | Surface::Comparator | Surface::Pdf => {
+            PanelCloseFocus::Window
         }
     }
 }
@@ -10485,10 +10612,28 @@ impl App {
     }
 
     fn close_service_panel(&mut self) {
-        if self.service_panel.take().is_some() {
-            debug_log(format_args!("service panel: fechado"));
-            self.fit_comparator_to_panel();
+        let Some((_, panel)) = self.service_panel.take() else {
+            return;
+        };
+        // O painel tinha o teclado (`panel.focus()` ao abrir) e largar a
+        // WebView nao o devolve a ninguem: fechar o video da respiracao na
+        // Home deixava a omnibox sem teclado ate um clique.
+        let focus = focus_after_panel_close(self.surface);
+        if focus == PanelCloseFocus::Window {
+            let _ = panel.focus_parent();
         }
+        drop(panel);
+        if focus == PanelCloseFocus::Omnibox
+            && let Some(edit) = self.omnibox
+        {
+            // Direto no EDIT, sem `focus_omnibox` (que passa pelo
+            // `show_home`).
+            unsafe {
+                SetFocus(edit);
+            }
+        }
+        debug_log(format_args!("service panel: fechado"));
+        self.fit_comparator_to_panel();
     }
 
     fn position_service_panel(&self) {
@@ -10849,11 +10994,18 @@ impl App {
                 NotesReply::Failed(error) => self.show_splash(error.clone(), 4),
                 NotesReply::Listed { .. }
                 | NotesReply::Deleted { .. }
-                | NotesReply::Missing { .. } => {}
+                | NotesReply::Missing { .. }
+                | NotesReply::Conflict { .. } => {}
             },
             NotesOrigin::Closed => match &reply {
                 NotesReply::Opened { note, .. } => {
                     self.show_splash(format!("Nota salva: {}", note.title), 3);
+                }
+                NotesReply::Conflict { note, .. } => {
+                    self.show_splash(
+                        format!("A nota mudou fora do NeuralIA; o texto ficou em: {}", note.title),
+                        6,
+                    );
                 }
                 NotesReply::Failed(error) => self.show_splash(error.clone(), 6),
                 NotesReply::Listed { .. }
@@ -22651,6 +22803,29 @@ Clique: pausar · botão direito: opções";
         }
     }
 
+    /// Gate: fechar o video da respiracao (ou outro servico) na Home devolve
+    /// o teclado a omnibox -- o painel tinha-o, e largar a WebView nao o
+    /// devolvia a ninguem --; fora da Home, a janela.
+    #[test]
+    fn closing_a_service_panel_gives_the_keyboard_back() {
+        assert_eq!(
+            focus_after_panel_close(Surface::Home),
+            PanelCloseFocus::Omnibox
+        );
+        for surface in [
+            Surface::Comparator,
+            Surface::Reader,
+            Surface::Pdf,
+            Surface::External,
+        ] {
+            assert_eq!(
+                focus_after_panel_close(surface),
+                PanelCloseFocus::Window,
+                "{surface:?}"
+            );
+        }
+    }
+
     /// Gate: aberto no comparador, o painel da respiracao tira-lhe a largura
     /// como os outros -- e o do Gemini Live tambem --, e as colunas acabam
     /// antes dele; na Home nao ha colunas a empurrar.
@@ -23174,6 +23349,7 @@ process.stdout.write(JSON.stringify({
                     title: "Título".to_string(),
                     body: "corpo\n".to_string(),
                     tags: vec!["a".to_string(), "b".to_string()],
+                    rev: None,
                 }))
             );
             assert!(matches!(
@@ -23218,6 +23394,7 @@ process.stdout.write(JSON.stringify({
                     title: "Capítulo 1 Introdução".to_string(),
                     body: "corpo com\ttab".to_string(),
                     tags: vec!["a b".to_string(), "linha quebrada".to_string()],
+                    rev: None,
                 }))
             );
             // O rascunho: o mesmo formato do salvar, ou {} para "nada".
@@ -23235,6 +23412,7 @@ process.stdout.write(JSON.stringify({
                     title: "t".to_string(),
                     body: "b".to_string(),
                     tags: Vec::new(),
+                    rev: None,
                 })))
             );
             let big_draft = save_message(None, "t", &"b".repeat(NOTE_BODY_MAX_BYTES), &[])
@@ -23506,6 +23684,7 @@ process.stdout.write(JSON.stringify({
                     title: "Segunda".to_string(),
                     body: String::new(),
                     tags: Vec::new(),
+                    rev: None,
                 }))
             );
             // E, gravada, e uma segunda nota: a Primeira fica como estava.
@@ -23673,6 +23852,135 @@ process.stdout.write(JSON.stringify({
             );
         }
 
+        /// Gate: o salvar do painel nunca esmaga uma nota que mudou fora
+        /// deste editor desde que ele a abriu -- outra janela do NeuralIA (o
+        /// NeuralIA nao e instancia unica e cada processo tem o seu worker) ou
+        /// o Obsidian. O texto do editor vai para uma copia "(conflito)", a
+        /// nota fica como o outro a deixou, e o editor passa a mostrar a copia.
+        /// Dois salvar seguidos do MESMO editor (o segundo antes da resposta
+        /// ao primeiro) nao sao conflito.
+        #[test]
+        fn a_panel_save_never_overwrites_a_note_changed_elsewhere() {
+            let dir = NotesDir::new("conflict");
+            let store = dir.store();
+            let note = store
+                .create("Ideia", "linha A", Vec::new(), None, T0)
+                .expect("nota");
+            let opened = run_notes_command(&store, NotesCommand::Open(note.id.clone()), T0);
+            let opened_rev = match &opened {
+                NotesReply::Opened { note, .. } => note_rev(note),
+                other => panic!("{other:?}"),
+            };
+
+            // Esta janela abre a nota e escreve.
+            let steps: Vec<String> = vec![
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                notes_reply_script(&opened),
+                "__type($('note-body'), 'linha A\\nlinha C');".into(),
+                "__click($('note-save'));".into(),
+            ];
+            let sent = posted(&run_panel(&steps));
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            let mine = parse_panel_message(&sent[0]).expect("note-save");
+
+            // Entretanto outra janela (outro processo, outro worker) grava.
+            let mut elsewhere = NotesSession::default();
+            let other = run_notes_command_in(
+                &mut elsewhere,
+                &store,
+                NotesCommand::Save(NoteEdit {
+                    id: Some(note.id.clone()),
+                    title: "Ideia".to_string(),
+                    body: "linha A\nlinha B escrita noutra janela".to_string(),
+                    tags: Vec::new(),
+                    rev: Some(opened_rev.clone()),
+                }),
+                T0 + 30,
+            );
+            assert!(matches!(other, NotesReply::Opened { .. }), "{other:?}");
+
+            // O salvar desta janela chega ao worker dela.
+            let mut session = NotesSession::default();
+            let reply = run_notes_command_in(
+                &mut session,
+                &store,
+                notes_command_for(mine).expect("comando"),
+                T0 + 60,
+            );
+            let NotesReply::Conflict {
+                original,
+                note: copy,
+            } = &reply
+            else {
+                panic!("o salvar esmagou a nota da outra janela: {reply:?}");
+            };
+            assert_eq!(original, &note.id);
+            assert_eq!(
+                store.get(&note.id).expect("ler").expect("existe").body,
+                "linha A\nlinha B escrita noutra janela",
+                "a linha B perdeu-se"
+            );
+            assert_eq!(copy.body, "linha A\nlinha C");
+            assert_eq!(copy.title, "Ideia (conflito)");
+            assert_ne!(copy.id, note.id);
+
+            // O painel passa a mostrar a copia: o salvar seguinte vai para ela.
+            let mut follow = steps.clone();
+            follow.push(notes_reply_script(&reply));
+            follow.push("__out.msg = $('notes-msg').textContent; __posted.length = 0;".into());
+            follow.push("__type($('note-body'), 'linha A\\nlinha C\\nlinha D');".into());
+            follow.push("__click($('note-save'));".into());
+            let result = run_panel(&follow);
+            assert!(
+                result["out"]["msg"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("cópia"),
+                "{result}"
+            );
+            let sent = posted(&result);
+            let next: Vec<&String> = sent
+                .iter()
+                .filter(|m| action_of(m) == "note-save")
+                .collect();
+            assert_eq!(next.len(), 1, "{sent:?}");
+            assert!(matches!(
+                parse_panel_message(next[0]),
+                Some(PanelMessage::NoteSave(NoteEdit { id: Some(ref id), .. })) if *id == copy.id
+            ));
+
+            // Dois salvar seguidos do mesmo editor, com a revisao da abertura:
+            // o segundo nao e conflito (o ficheiro mudou pelo primeiro).
+            let own = store
+                .create("Propria", "v1", Vec::new(), None, T0)
+                .expect("nota");
+            let rev = note_rev(&store.get(&own.id).expect("ler").expect("existe"));
+            let mut session = NotesSession::default();
+            for (body, at) in [("v2", T0 + 100), ("v3", T0 + 101)] {
+                let reply = run_notes_command_in(
+                    &mut session,
+                    &store,
+                    NotesCommand::Save(NoteEdit {
+                        id: Some(own.id.clone()),
+                        title: "Propria".to_string(),
+                        body: body.to_string(),
+                        tags: Vec::new(),
+                        rev: Some(rev.clone()),
+                    }),
+                    at,
+                );
+                assert!(
+                    matches!(reply, NotesReply::Opened { cause: NoteOpened::Saved, .. }),
+                    "{body}: {reply:?}"
+                );
+            }
+            assert_eq!(
+                store.get(&own.id).expect("ler").expect("existe").body,
+                "v3"
+            );
+            assert_eq!(store.list().expect("lista").len(), 3, "nenhuma copia a mais");
+        }
+
         fn opened_id(reply: &NotesReply) -> String {
             match reply {
                 NotesReply::Opened { note, .. } => note.id.clone(),
@@ -23722,6 +24030,10 @@ process.stdout.write(JSON.stringify({
                     title: "Tabela Resumo".to_string(),
                     body: "v2 importante".to_string(),
                     tags: Vec::new(),
+                    rev: Some(match &opened {
+                        NotesReply::Opened { note, .. } => note_rev(note),
+                        other => panic!("{other:?}"),
+                    }),
                 })
             );
             // Enquanto falhado, o fecho nativo grava a copia.
