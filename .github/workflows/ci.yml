@@ -92,13 +92,13 @@ jobs:
             $broken = $originalSource
 
             $broken = Replace-Exact $broken @'
-            && x < self.x + self.width
-            && y >= self.y
-            && y < self.y + self.height
+                      && x < self.x + self.width
+                      && y >= self.y
+                      && y < self.y + self.height
           '@ @'
-            && x <= self.x + self.width
-            && y >= self.y
-            && y <= self.y + self.height
+                      && x <= self.x + self.width
+                      && y >= self.y
+                      && y <= self.y + self.height
           '@ "half-open-hit-test"
 
             $broken = Replace-Exact $broken @'
@@ -120,13 +120,13 @@ jobs:
           '@ "join-current-group"
 
             $broken = Replace-Exact $broken @'
-                  IpcAction::Fullscreen => Some(UserEvent::ExpandComparator(col_index)),
-                  IpcAction::ShortcutExpand { col } => Some(UserEvent::ExpandComparator(col)),
+                      IpcAction::Fullscreen => Some(UserEvent::ExpandComparator(col_index)),
+                      IpcAction::ShortcutExpand { col } => Some(UserEvent::ExpandComparator(col)),
           '@ @'
-                  IpcAction::Fullscreen => Some(UserEvent::ExpandComparator(col_index)),
-                  IpcAction::ShortcutExpand { col } if col == col_index => {
-                      Some(UserEvent::ExpandComparator(col))
-                  }
+                      IpcAction::Fullscreen => Some(UserEvent::ExpandComparator(col_index)),
+                      IpcAction::ShortcutExpand { col } if col == col_index => {
+                          Some(UserEvent::ExpandComparator(col))
+                      }
           '@ "global-digit-shortcut"
 
             $broken = Replace-Exact $broken @'
