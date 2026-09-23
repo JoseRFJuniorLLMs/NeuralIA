@@ -5,18 +5,27 @@ All notable changes to NeuralIA are documented here.
 ## [Unreleased]
 
 ### Fixed
-- **Auditoria recursiva de 20 passagens:** a omnibox Win32 da Home mantém o HWND estável fora da área cliente, mas fica desabilitada no comparador e deixa de poder roubar foco/teclado.
-- **Grupos de abas:** “Fechar outras abas deste grupo” e “Fechar todas deste grupo” passam a atuar somente no grupo selecionado; grupos vazios são podados e outras coleções permanecem intactas.
-- **Reagrupamento:** mover a última aba de um grupo para um novo grupo deixa de criar pílulas vazias/fantasmas.
-- **Win32:** falha ao instalar a subclass da omnibox destrói o HWND recém-criado em vez de vazá-lo; reparenting passa a verificar o pai efetivo.
-- **IPC:** se o `BCryptGenRandom` principal falhar, a capability tenta `RtlGenRandom` antes de falhar fechado, sem degradar para fonte pseudoaleatória.
+- **PR #128 — auditoria recursiva de 20 passagens:** a omnibox Win32 da Home mantém o HWND estável fora da área cliente, mas fica desabilitada no comparador e deixa de poder roubar foco/teclado.
+- **PR #128 — grupos de abas:** “Fechar outras abas deste grupo” e “Fechar todas deste grupo” passam a atuar somente no grupo selecionado; grupos vazios são podados e outras coleções permanecem intactas.
+- **PR #128 — reagrupamento:** mover a última aba de um grupo para um novo grupo deixa de criar pílulas vazias/fantasmas.
+- **PR #128 — Win32:** falha ao instalar a subclass da omnibox destrói o HWND recém-criado em vez de vazá-lo; reparenting passa a verificar o pai efetivo.
+- **PR #128 — IPC:** se o `BCryptGenRandom` principal falhar, a capability tenta `RtlGenRandom` antes de falhar fechado, sem degradar para fonte pseudoaleatória.
+- **PR #133 — auditoria recursiva de 100 interações:** hit-testing de tela usa bordas half-open, a palette respeita colunas estreitas e minimizar a última IA visível não destrói um Split antes de rejeitar a ação.
+- **PR #133 — identidade e grupos:** abas recebem identidade estável independente da URL; URLs iguais em grupos diferentes não fecham nem realçam o Split errado; a poda de 32 abas remove grupos que fiquem órfãos.
+- **PR #133 — atalhos por foco:** Ctrl+R, Ctrl+P, F12 e Ctrl+U atuam na WebView que recebeu o gesto; F11 respeita a coluna atual; 1/2/3 continuam globais através de `shortcut-expand` sem ampliar a autoridade do `expand` vindo do DOM; Ctrl+L no Split volta à IA de origem.
+- **PR #133 — cliques e Split:** duplo clique em links/controles não expande a coluna junto com a ação do elemento; uma troca de Split só substitui o painel anterior depois de o novo WebView existir, preserva o estado em falha e descarta builds que terminem depois de outra navegação.
+- **PR #133 — controles nativos:** minimizar/maximizar/fechar e Home só executam quando press e release pertencem ao mesmo controle; perda/cancelamento de captura limpa o estado pendente. Soltar após `ReleaseCapture` mantém o clique legítimo e arrastar para fora da altura do botão cancela a ação.
+- **PR #133 — menu de grupos:** “Juntar ao grupo” deixa de oferecer o próprio grupo atual da aba, evitando reordenação sem efeito.
 
 ### Security
-- **SPEC-0109:** câmera, microfone e captura de tela passam pelo consentimento nativo do WebView2 apenas em superfícies visíveis; agente e demais permissões continuam `Deny`.
+- **PR #128 / SPEC-0109:** câmera, microfone e captura de tela passam pelo consentimento nativo do WebView2 apenas em superfícies visíveis; agente e demais permissões continuam `Deny`.
+- **PR #133 / SPEC-0108:** o conjunto fechado passa a 26 ações com `shortcut-expand`, autenticada pela capability e separada do `expand` de autoridade local à coluna.
 
 ### Testing
-- Gates de comportamento cobrem escopo de grupos, poda de grupos vazios, omnibox desabilitada fora da Home, fallback CSPRNG e política WebRTC.
-
+- **PR #128:** gates de comportamento cobrem escopo de grupos, poda de grupos vazios, omnibox desabilitada fora da Home, fallback CSPRNG e política WebRTC.
+- **PR #133:** matriz determinística de 100 cenários cobre 5 larguras × 4 escalas de DPI × 5 topologias, além de gates de bordas de clique, alvo por foco, troca transacional de Split, press→release nativo, menu de grupos e duplo clique em elementos interativos.
+- **PR #133 — sabotagem automática:** o job Windows reintroduz temporariamente seis regressões Rust, as falhas de ordem de captura e limite vertical e uma regressão JS no checkout do runner, exige os gates vermelhos, restaura os bytes originais e repete os gates verdes antes de prosseguir.
+- **PR #133 — ciclo de vida:** a medição de cinco ciclos envia press→release ao botão Home nativo, como o produto exige, e verifica zero WebViews visíveis após cada retorno.
 
 ## [2.1.4] - 2026-09-22
 

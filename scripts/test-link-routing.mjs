@@ -98,6 +98,15 @@ function listener(type) {
 const click = listener("click");
 const auxclick = listener("auxclick");
 
+function documentListener(type) {
+  const rows = document.listeners.get(type) ?? [];
+  assert.equal(rows.length, 1, `expected one document ${type} listener`);
+  assert.equal(rows[0].capture, true, `${type} must capture at document`);
+  return rows[0].handler;
+}
+
+const dblclick = documentListener("dblclick");
+
 function eventFor({ anchor, target = null, button = 0, ctrlKey = false, metaKey = false, altKey = false, shiftKey = false }) {
   let prevented = false;
   let stopped = false;
@@ -189,6 +198,24 @@ function popMessage() {
   click(ev);
   const msg = popMessage();
   assert.equal(msg.args.url, "https://example.org/google-source");
+}
+
+// 7. Double-clicking a real link must not also expand the comparator column.
+{
+  const anchor = new MockElement({ href: "https://example.org/double", matchesLink: true });
+  const ev = eventFor({ anchor, target: anchor });
+  dblclick(ev);
+  assert.equal(posted.length, 0, "double-click on link must not emit expand");
+}
+
+// 8. Double-clicking ordinary panel content still expands the focused column.
+{
+  const leaf = new MockElement();
+  const ev = eventFor({ anchor: null, target: leaf });
+  dblclick(ev);
+  const msg = popMessage();
+  assert.equal(msg.action, "expand");
+  assert.deepEqual(msg.args, { col: 1 });
 }
 
 console.log("link routing runtime gate: ok");

@@ -55,8 +55,8 @@ use windows_sys::Win32::{
             GetWindowThreadProcessId, IDYES, IsZoomed, MB_ICONINFORMATION, MB_OK, MB_YESNO,
             MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
             SendMessageW, SetParent, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD,
-            TPM_RIGHTBUTTON, TrackPopupMenu, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE,
-            WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+            TPM_RIGHTBUTTON, TrackPopupMenu, WM_CANCELMODE, WM_CAPTURECHANGED, WM_KEYDOWN,
+            WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -74,6 +74,12 @@ use wry::{
     http::{Request, Response as HttpResponse},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageTarget {
+    Column(usize),
+    Split,
+}
+
 #[derive(Debug)]
 enum UserEvent {
     HomeRequested,
@@ -85,11 +91,15 @@ enum UserEvent {
     ZoomOut,
     ZoomReset,
     ReloadPage,
+    ReloadTarget(PageTarget),
     PrintPage,
+    PrintTarget(PageTarget),
     FocusOmnibox,
     ToggleColumnFullscreen,
     OpenDevTools,
+    OpenDevToolsTarget(PageTarget),
     ViewSource,
+    ViewSourceTarget(PageTarget),
     AutoScrollTick(u64),
     HideSplash(u64),
     GmailProbe(u64),
@@ -851,6 +861,21 @@ fn right_controls(client_width: f64, scale: f64, split_active: bool) -> RightCon
     RightControls { private, split }
 }
 
+fn right_controls_hit(controls: RightControls, x: f64, y: f64) -> Option<BarHit> {
+    if controls.private.contains(x, y) {
+        return Some(BarHit::Private);
+    }
+    if let Some((_label, expand, close)) = controls.split {
+        if close.contains(x, y) {
+            return Some(BarHit::SplitClose);
+        }
+        if expand.contains(x, y) {
+            return Some(BarHit::SplitExpand);
+        }
+    }
+    None
+}
+
 struct ComparatorView {
     webview: WebView,
     name: &'static str,
@@ -859,7 +884,9 @@ struct ComparatorView {
 struct SplitView {
     webview: WebView,
     source_index: usize,
-    url: String,
+    /// Identidade da aba que originou este Split. URL nao e identidade:
+    /// a mesma fonte pode existir em dois grupos diferentes.
+    context_id: Option<u64>,
     fullscreen: bool,
     private: bool,
 }
@@ -921,6 +948,9 @@ struct ContextGroup {
 /// grupo no meio nao pode renumerar as abas dos outros.
 #[derive(Debug, Clone)]
 struct ContextTab {
+    /// Identidade estavel. A URL pode repetir em grupos diferentes e por isso
+    /// nunca serve para decidir qual aba esta aberta ou deve ser fechada.
+    id: u64,
     url: String,
     group: Option<u64>,
 }
@@ -1091,9 +1121,73 @@ fn prune_empty_groups(tabs: &[ContextTab], groups: &mut Vec<ContextGroup>) {
     groups.retain(|group| tabs.iter().any(|tab| tab.group == Some(group.id)));
 }
 
+/// Guarda uma nova aba de contexto e devolve a sua identidade estavel. Se a
+/// ultima aba ja e a mesma URL, reutiliza-a; ao aplicar o limite, poda tambem
+/// o grupo que eventualmente ficou sem o seu ultimo membro.
+fn remember_context_tab(
+    tabs: &mut Vec<ContextTab>,
+    groups: &mut Vec<ContextGroup>,
+    next_id: &mut u64,
+    url: String,
+) -> u64 {
+    if let Some(last) = tabs.last()
+        && last.url == url
+    {
+        return last.id;
+    }
+
+    let id = *next_id;
+    *next_id = (*next_id).wrapping_add(1).max(1);
+    tabs.push(ContextTab {
+        id,
+        url,
+        group: None,
+    });
+    if tabs.len() > 32 {
+        tabs.remove(0);
+        prune_empty_groups(tabs, groups);
+    }
+    id
+}
+
+/// Decide se uma coluna ainda pode ser minimizada sem esconder todas as IAs.
+/// Esta decisao acontece ANTES de fechar um Split ativo: um clique rejeitado
+/// nao pode destruir estado que o utilizador tinha aberto.
+fn can_minimize_column(
+    minimized: &[bool; COMPARATOR_COLUMNS],
+    columns: usize,
+    index: usize,
+) -> bool {
+    index < columns
+        && !minimized[index]
+        && (0..columns.min(COMPARATOR_COLUMNS))
+            .filter(|slot| !minimized[*slot])
+            .count()
+            > 1
+}
+
 /// Fecha as outras abas do MESMO escopo da aba selecionada. Um grupo real
 /// usa o seu id; abas soltas partilham o escopo `None`. Abas de outros grupos
 /// nunca sao tocadas.
+fn active_context_removed_by_scope(
+    tabs: &[ContextTab],
+    context_index: usize,
+    active_id: Option<u64>,
+    keep_selected: bool,
+) -> bool {
+    let Some(selected) = tabs.get(context_index) else {
+        return false;
+    };
+    let Some(active_id) = active_id else {
+        return false;
+    };
+    tabs.iter().any(|tab| {
+        tab.id == active_id
+            && tab.group == selected.group
+            && (!keep_selected || tab.id != selected.id)
+    })
+}
+
 fn close_other_context_tabs_in_scope(
     tabs: &mut Vec<ContextTab>,
     groups: &mut Vec<ContextGroup>,
@@ -1142,6 +1236,28 @@ fn regroup_context_tab(
     groups.iter().position(|group| group.id == created_id)
 }
 
+fn split_build_is_current(
+    start_generation: u64,
+    current_generation: u64,
+    surface: Surface,
+) -> bool {
+    start_generation == current_generation && surface == Surface::Comparator
+}
+
+fn commit_split_build<T, E, P>(
+    result: Result<T, E>,
+    current_split: &mut Option<P>,
+    expanded: &mut Option<usize>,
+) -> Result<(T, Option<P>), E> {
+    match result {
+        Ok(value) => {
+            *expanded = None;
+            Ok((value, current_split.take()))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 struct ComparatorState {
     views: Vec<ComparatorView>,
     expanded: Option<usize>,
@@ -1154,6 +1270,8 @@ struct ComparatorState {
     groups: [Vec<ContextGroup>; COMPARATOR_COLUMNS],
     /// Contador dos ids de grupo. Nunca reutiliza.
     next_group_id: u64,
+    /// Contador das identidades de abas. Nunca reutiliza durante a sessao.
+    next_context_id: u64,
 }
 
 /// Janelas da palette nativa: o popup que desenha a caixa e o EDIT onde o
@@ -1292,9 +1410,12 @@ fn resized_weights(
 /// a uma fraccao fixa da altura util abaixo da barra, nunca mais larga que a
 /// coluna menos as margens.
 fn palette_geometry(span: ColumnSpan, logical_h: f64) -> UiRect {
-    let width = PALETTE_MAX_WIDTH
-        .min(span.width - 48.0)
-        .max(PALETTE_MIN_WIDTH);
+    let available = (span.width - 48.0).max(1.0);
+    let width = if available < PALETTE_MIN_WIDTH {
+        available
+    } else {
+        available.min(PALETTE_MAX_WIDTH)
+    };
     let content_h = (logical_h - COMPARATOR_CHROME_HEIGHT).max(100.0);
     UiRect {
         x: span.x + (span.width - width) / 2.0,
@@ -1825,6 +1946,54 @@ unsafe extern "system" fn comparator_splitter_subclass(
     DefSubclassProc(hwnd, message, wparam, lparam)
 }
 
+const NATIVE_BUTTON_NONE: usize = usize::MAX;
+static CAPTION_PRESSED_BUTTON: AtomicUsize = AtomicUsize::new(NATIVE_BUTTON_NONE);
+
+fn native_button_index(width: i32, x: i32) -> Option<usize> {
+    if width <= 0 || x < 0 || x >= width {
+        return None;
+    }
+    if x < width / 3 {
+        Some(0)
+    } else if x < (width * 2) / 3 {
+        Some(1)
+    } else {
+        Some(2)
+    }
+}
+
+fn native_release_matches(pressed: Option<usize>, released: Option<usize>) -> Option<usize> {
+    pressed.filter(|index| Some(*index) == released)
+}
+
+// ReleaseCapture envia WM_CAPTURECHANGED antes de voltar. Retirar o estado
+// antes da chamada preserva o clique legitimo sem deixar um press pendurado.
+fn take_native_pressed_button(
+    pressed: &AtomicUsize,
+    release_capture: impl FnOnce(),
+) -> Option<usize> {
+    let index = pressed.swap(NATIVE_BUTTON_NONE, Ordering::AcqRel);
+    release_capture();
+    (index != NATIVE_BUTTON_NONE).then_some(index)
+}
+
+fn point_inside_client(width: i32, height: i32, x: i32, y: i32) -> bool {
+    width > 0 && height > 0 && x >= 0 && x < width && y >= 0 && y < height
+}
+
+fn native_caption_release(
+    pressed: Option<usize>,
+    captured: bool,
+    width: i32,
+    height: i32,
+    x: i32,
+    y: i32,
+) -> Option<usize> {
+    (captured && point_inside_client(width, height, x, y))
+        .then(|| native_release_matches(pressed, native_button_index(width, x)))
+        .flatten()
+}
+
 unsafe extern "system" fn caption_buttons_subclass(
     hwnd: HWND,
     message: u32,
@@ -1881,7 +2050,25 @@ unsafe extern "system" fn caption_buttons_subclass(
             }
             0
         }
+        WM_LBUTTONDOWN => {
+            let mut client = RECT::default();
+            if GetClientRect(hwnd, &mut client) != 0 {
+                let width = client.right - client.left;
+                let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
+                if let Some(index) = native_button_index(width, x) {
+                    CAPTION_PRESSED_BUTTON.store(index, Ordering::Release);
+                    SetCapture(hwnd);
+                }
+            }
+            0
+        }
         WM_LBUTTONUP => {
+            let captured = GetCapture() == hwnd;
+            let pressed = take_native_pressed_button(&CAPTION_PRESSED_BUTTON, || {
+                if captured {
+                    ReleaseCapture();
+                }
+            });
             let parent = GetParent(hwnd);
             if parent.is_null() {
                 return 0;
@@ -1890,20 +2077,24 @@ unsafe extern "system" fn caption_buttons_subclass(
             if GetClientRect(hwnd, &mut client) == 0 {
                 return 0;
             }
-            let width = (client.right - client.left).max(1);
+            let width = client.right - client.left;
+            let height = client.bottom - client.top;
             let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
-            let command = if x < width / 3 {
-                SC_MINIMIZE_NATIVE
-            } else if x < (width * 2) / 3 {
-                if IsZoomed(parent) != 0 {
-                    SC_RESTORE_NATIVE
-                } else {
-                    SC_MAXIMIZE_NATIVE
-                }
-            } else {
-                SC_CLOSE_NATIVE
+            let y = ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32;
+            let Some(index) = native_caption_release(pressed, captured, width, height, x, y) else {
+                return 0;
+            };
+            let command = match index {
+                0 => SC_MINIMIZE_NATIVE,
+                1 if IsZoomed(parent) != 0 => SC_RESTORE_NATIVE,
+                1 => SC_MAXIMIZE_NATIVE,
+                _ => SC_CLOSE_NATIVE,
             };
             SendMessageW(parent, WM_SYSCOMMAND_NATIVE, command, 0);
+            0
+        }
+        WM_CAPTURECHANGED | WM_CANCELMODE => {
+            CAPTION_PRESSED_BUTTON.store(NATIVE_BUTTON_NONE, Ordering::Release);
             0
         }
         _ => DefSubclassProc(hwnd, message, wparam, lparam),
@@ -1952,9 +2143,25 @@ unsafe extern "system" fn home_button_subclass(
             }
             0
         }
-        WM_LBUTTONUP if reference_data != 0 => {
-            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
-            let _ = proxy.send_event(UserEvent::HomeRequested);
+        WM_LBUTTONDOWN => {
+            SetCapture(hwnd);
+            0
+        }
+        WM_LBUTTONUP => {
+            let captured = GetCapture() == hwnd;
+            if captured {
+                ReleaseCapture();
+            }
+            let mut client = RECT::default();
+            let inside = GetClientRect(hwnd, &mut client) != 0 && {
+                let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
+                let y = ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32;
+                point_inside_client(client.right - client.left, client.bottom - client.top, x, y)
+            };
+            if captured && inside && reference_data != 0 {
+                let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+                let _ = proxy.send_event(UserEvent::HomeRequested);
+            }
             0
         }
         _ => DefSubclassProc(hwnd, message, wparam, lparam),
@@ -2802,9 +3009,9 @@ impl UiRect {
         self.width > 0.0
             && self.height > 0.0
             && x >= self.x
-            && x <= self.x + self.width
+            && x < self.x + self.width
             && y >= self.y
-            && y <= self.y + self.height
+            && y < self.y + self.height
     }
 }
 
@@ -4474,6 +4681,7 @@ impl App {
             contexts: std::array::from_fn(|_| Vec::new()),
             groups: std::array::from_fn(|_| Vec::new()),
             next_group_id: 1,
+            next_context_id: 1,
         });
         self.activate_comparator(true);
     }
@@ -4580,6 +4788,21 @@ impl App {
             return;
         }
 
+        let can_minimize = self
+            .comparator
+            .as_ref()
+            .is_some_and(|comp| can_minimize_column(&comp.minimized, comp.views.len(), idx));
+        if !can_minimize {
+            self.show_splash(
+                "Pelo menos um painel precisa continuar visível.".to_string(),
+                2,
+            );
+            return;
+        }
+
+        // So agora a operacao foi validada. Antes, um pedido impossivel para a
+        // ultima coluna visivel fechava a fonte lateral e depois dizia que nao
+        // podia minimizar: o clique rejeitado destruia estado.
         if self
             .comparator
             .as_ref()
@@ -4589,32 +4812,12 @@ impl App {
         }
 
         let mut was_expanded = false;
-        let mut changed = false;
         if let Some(comp) = &mut self.comparator
             && idx < comp.views.len()
         {
-            let visible = comp
-                .views
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| !comp.minimized[*index])
-                .count();
-
-            // Mantemos sempre pelo menos uma IA visível.
-            if !comp.minimized[idx] && visible > 1 {
-                was_expanded = comp.expanded == Some(idx);
-                comp.expanded = None;
-                comp.minimized[idx] = true;
-                changed = true;
-            }
-        }
-
-        if !changed {
-            self.show_splash(
-                "Pelo menos um painel precisa continuar visível.".to_string(),
-                2,
-            );
-            return;
+            was_expanded = comp.expanded == Some(idx);
+            comp.expanded = None;
+            comp.minimized[idx] = true;
         }
 
         if was_expanded && let Some(window) = &self.window {
@@ -4788,6 +4991,16 @@ impl App {
                 Some(UserEvent::OpenPalette(col_index))
             }
             IpcAction::Omnibox => Some(UserEvent::OpenPalette(col_index)),
+            IpcAction::Reload => Some(UserEvent::ReloadTarget(PageTarget::Column(col_index))),
+            IpcAction::Print => Some(UserEvent::PrintTarget(PageTarget::Column(col_index))),
+            IpcAction::DevTools => {
+                Some(UserEvent::OpenDevToolsTarget(PageTarget::Column(col_index)))
+            }
+            IpcAction::ViewSource => {
+                Some(UserEvent::ViewSourceTarget(PageTarget::Column(col_index)))
+            }
+            IpcAction::Fullscreen => Some(UserEvent::ExpandComparator(col_index)),
+            IpcAction::ShortcutExpand { col } => Some(UserEvent::ExpandComparator(col)),
             IpcAction::Minimize { col } if col == col_index => {
                 Some(UserEvent::MinimizeComparator(col_index))
             }
@@ -4936,6 +5149,28 @@ impl App {
         self.request_redraw();
     }
 
+    fn split_ipc_event_impl(source_index: usize, action: IpcAction) -> Option<UserEvent> {
+        match action {
+            IpcAction::SplitClose => Some(UserEvent::CloseSplit),
+            IpcAction::SplitExpand | IpcAction::Fullscreen => {
+                Some(UserEvent::ToggleSplitFullscreen)
+            }
+            IpcAction::Palette { col } if col == source_index => {
+                Some(UserEvent::OpenPalette(source_index))
+            }
+            IpcAction::Omnibox => Some(UserEvent::OpenPalette(source_index)),
+            IpcAction::NewTab { col: Some(col) } if col == source_index => {
+                Some(UserEvent::NewTab(source_index))
+            }
+            IpcAction::ShortcutExpand { col } => Some(UserEvent::ExpandComparator(col)),
+            IpcAction::Reload => Some(UserEvent::ReloadTarget(PageTarget::Split)),
+            IpcAction::Print => Some(UserEvent::PrintTarget(PageTarget::Split)),
+            IpcAction::DevTools => Some(UserEvent::OpenDevToolsTarget(PageTarget::Split)),
+            IpcAction::ViewSource => Some(UserEvent::ViewSourceTarget(PageTarget::Split)),
+            other => common_ipc_event(other),
+        }
+    }
+
     fn split_webview_builder(
         &self,
         source_index: usize,
@@ -4961,17 +5196,7 @@ impl App {
                 else {
                     return;
                 };
-                let event = match action {
-                    IpcAction::SplitClose => Some(UserEvent::CloseSplit),
-                    IpcAction::SplitExpand => Some(UserEvent::ToggleSplitFullscreen),
-                    IpcAction::Palette { col } if col == source_index => {
-                        Some(UserEvent::OpenPalette(source_index))
-                    }
-                    IpcAction::NewTab { col: Some(col) } if col == source_index => {
-                        Some(UserEvent::NewTab(source_index))
-                    }
-                    other => common_ipc_event(other),
-                };
+                let event = Self::split_ipc_event_impl(source_index, action);
                 if let Some(event) = event {
                     let _ = ipc_proxy.send_event(event);
                 }
@@ -5007,8 +5232,8 @@ impl App {
             .with_focused(true)
     }
 
-    fn open_split(&mut self, source_index: usize, url: String, allow_local: bool) {
-        self.open_split_mode(source_index, url, allow_local, false);
+    fn open_split(&mut self, source_index: usize, url: String, allow_local: bool) -> bool {
+        self.open_split_mode(source_index, url, allow_local, false, None)
     }
 
     fn open_split_mode(
@@ -5017,22 +5242,23 @@ impl App {
         url: String,
         allow_local: bool,
         private: bool,
-    ) {
+        existing_context_id: Option<u64>,
+    ) -> bool {
         if self.surface != Surface::Comparator {
             self.web(url);
-            return;
+            return true;
         }
 
         let Ok(valid) = neural_core::validate_web_url(&url) else {
             self.show_splash("URL da fonte inválida.".to_string(), 3);
-            return;
+            return false;
         };
         if !allow_local && neural_core::is_local_network_target(&valid) {
             self.show_splash(
                 "A página não pode redirecionar a fonte para a rede local.".to_string(),
                 4,
             );
-            return;
+            return false;
         }
 
         let Some(source_name) = self
@@ -5041,42 +5267,12 @@ impl App {
             .and_then(|comp| comp.views.get(source_index))
             .map(|view| view.name)
         else {
-            return;
+            return false;
         };
 
-        if let Some((title, mut document)) = split_source_memory(&valid, source_name, private) {
-            let value = valid.to_string();
-            if let Some(session) = &mut self.current_research {
-                document = document.session(session.id.clone());
-                let memory_id = document.id.clone();
-                session.add_source(
-                    Some(source_name.to_string()),
-                    title,
-                    value.clone(),
-                    Some(memory_id),
-                    value,
-                );
-                self.memory.save_session(session.clone());
-            }
-            self.memory.capture(document);
-        }
-
-        self.leave_fullscreen();
-        if let Some(comp) = &mut self.comparator {
-            comp.expanded = None;
-            if let Some(previous) = comp.split.take() {
-                let _ = previous.webview.set_visible(false);
-                let _ = previous.webview.focus_parent();
-                drop(previous);
-            }
-        }
-        // O Split View substitui a topologia de colunas. Os divisores sao
-        // janelas Win32 independentes; esconda-os antes de criar a nova WebView
-        // para que nenhum divisor antigo fique por cima do painel lateral.
-        self.hide_comparator_splitters();
-
+        let generation = self.current_generation();
         let Some(window) = &self.window else {
-            return;
+            return false;
         };
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
@@ -5092,7 +5288,10 @@ impl App {
             .into(),
         };
 
-        let result = self
+        // Construir primeiro, com o estado antigo intacto. WebView2 pode falhar
+        // ou entrar num pump aninhado; uma tentativa falhada nao pode destruir
+        // o Split que o utilizador ainda esta a ver nem sair da expansao atual.
+        let built = self
             .split_webview_builder(
                 source_index,
                 source_name,
@@ -5103,27 +5302,79 @@ impl App {
             .with_url(valid.as_str())
             .build_as_child(window);
 
-        match result {
-            Ok(webview) => {
+        if !split_build_is_current(generation, self.current_generation(), self.surface) {
+            if let Ok(webview) = built {
+                drop(webview);
+            }
+            return false;
+        }
+
+        let committed = match &mut self.comparator {
+            Some(comp) => commit_split_build(built, &mut comp.split, &mut comp.expanded),
+            None => {
+                if let Ok(webview) = built {
+                    drop(webview);
+                }
+                return false;
+            }
+        };
+
+        match committed {
+            Ok((webview, previous)) => {
+                if let Some(previous) = previous {
+                    let _ = previous.webview.set_visible(false);
+                    let _ = previous.webview.focus_parent();
+                    drop(previous);
+                }
+
+                self.leave_fullscreen();
+                self.hide_comparator_splitters();
+
+                // So uma fonte que abriu de verdade entra na memoria/sessao.
+                // Antes, uma falha de build deixava uma fonte fantasma gravada.
+                if let Some((title, mut document)) =
+                    split_source_memory(&valid, source_name, private)
+                {
+                    let value = valid.to_string();
+                    if let Some(session) = &mut self.current_research {
+                        document = document.session(session.id.clone());
+                        let memory_id = document.id.clone();
+                        session.add_source(
+                            Some(source_name.to_string()),
+                            title,
+                            value.clone(),
+                            Some(memory_id),
+                            value,
+                        );
+                        self.memory.save_session(session.clone());
+                    }
+                    self.memory.capture(document);
+                }
+
                 let _ = webview.zoom(self.zoom);
                 if let Some(comp) = &mut self.comparator {
-                    if !private {
-                        let links = &mut comp.contexts[source_index];
-                        let value = valid.to_string();
-                        if links.last().map(|tab| tab.url.as_str()) != Some(value.as_str()) {
-                            links.push(ContextTab {
-                                url: value,
-                                group: None,
-                            });
-                            if links.len() > 32 {
-                                links.remove(0);
-                            }
-                        }
-                    }
+                    let context_id = if private {
+                        None
+                    } else if let Some(id) = existing_context_id {
+                        Some(id)
+                    } else {
+                        let ComparatorState {
+                            contexts,
+                            groups,
+                            next_context_id,
+                            ..
+                        } = comp;
+                        Some(remember_context_tab(
+                            &mut contexts[source_index],
+                            &mut groups[source_index],
+                            next_context_id,
+                            valid.to_string(),
+                        ))
+                    };
                     comp.split = Some(SplitView {
                         webview,
                         source_index,
-                        url: valid.to_string(),
+                        context_id,
                         fullscreen: false,
                         private,
                     });
@@ -5131,9 +5382,17 @@ impl App {
                 self.update_comparator_layout();
                 self.sync_comparator_splitters();
                 self.request_redraw();
+                true
             }
             Err(error) => {
-                self.show_splash(format!("Não consegui abrir a fonte ao lado: {error}"), 4)
+                // O estado anterior continua vivo. Reaplica a geometria para
+                // garantir que nem um resize ocorrido durante o pump do build
+                // deixe uma metade vazia.
+                self.update_comparator_layout();
+                self.sync_comparator_splitters();
+                self.request_redraw();
+                self.show_splash(format!("Não consegui abrir a fonte ao lado: {error}"), 4);
+                false
             }
         }
     }
@@ -5154,11 +5413,12 @@ impl App {
                 })
             })
             .unwrap_or(0);
-        self.open_split_mode(
+        let _ = self.open_split_mode(
             source_index,
             "https://www.google.com/".to_string(),
             false,
             true,
+            None,
         );
     }
 
@@ -5239,13 +5499,16 @@ impl App {
             // abre privada: open_split_mode(private) nao grava memoria nem
             // abas.
             PaletteRoute::OpenSplit { url, private } => {
-                self.open_split_mode(source_index, url.to_string(), true, private);
+                let _ = self.open_split_mode(source_index, url.to_string(), true, private, None);
             }
             // Painel privado: a pergunta abre como fonte privada, nunca na
             // coluna normal (cookies normais) e nunca no historico.
             PaletteRoute::OpenPrivateProvider { query } => {
                 match self.provider_query_url(source_index, &query) {
-                    Ok(url) => self.open_split_mode(source_index, url.to_string(), false, true),
+                    Ok(url) => {
+                        let _ =
+                            self.open_split_mode(source_index, url.to_string(), false, true, None);
+                    }
                     Err(error) => self.show_splash(error.to_string(), 3),
                 }
             }
@@ -5770,6 +6033,69 @@ impl App {
             let _ = webview.zoom(zoom);
         });
         self.show_splash(format!("Zoom {}%", (zoom * 100.0).round() as i32), 2);
+    }
+
+    fn page_target_webview(&self, target: PageTarget) -> Option<&WebView> {
+        let comp = self.comparator.as_ref()?;
+        match target {
+            PageTarget::Column(index) => comp.views.get(index).map(|view| &view.webview),
+            PageTarget::Split => comp.split.as_ref().map(|split| &split.webview),
+        }
+    }
+
+    fn reload_target(&mut self, target: PageTarget) {
+        let reloaded = self
+            .page_target_webview(target)
+            .is_some_and(|webview| webview.reload().is_ok());
+        if !reloaded {
+            self.show_splash("Não há página ativa para recarregar.".to_string(), 3);
+        }
+    }
+
+    fn print_target(&mut self, target: PageTarget) {
+        let printed = self
+            .page_target_webview(target)
+            .is_some_and(|webview| webview.print().is_ok());
+        if !printed {
+            self.show_splash("Não há página ativa para imprimir.".to_string(), 3);
+        }
+    }
+
+    fn open_devtools_target(&mut self, target: PageTarget) {
+        let opened = if let Some(webview) = self.page_target_webview(target) {
+            webview.open_devtools();
+            true
+        } else {
+            false
+        };
+        if !opened {
+            self.show_splash("Não há página ativa para inspecionar.".to_string(), 3);
+        }
+    }
+
+    fn view_source_target(&mut self, target: PageTarget) {
+        let current = self
+            .page_target_webview(target)
+            .and_then(|webview| webview.url().ok());
+        let Some(current) = current else {
+            self.show_splash(
+                "Não há página ativa para ver o código-fonte.".to_string(),
+                3,
+            );
+            return;
+        };
+        let current_origin = Url::parse(&current).ok().as_ref().and_then(local_origin_of);
+        let source = format!("view-source:{current}");
+        let loaded = is_view_source_target(&source, current_origin.as_deref())
+            && self
+                .page_target_webview(target)
+                .is_some_and(|webview| webview.load_url(&source).is_ok());
+        if !loaded {
+            self.show_splash(
+                "Não foi possível abrir o código-fonte desta página.".to_string(),
+                3,
+            );
+        }
     }
 
     fn reload_page(&mut self) {
@@ -6479,27 +6805,11 @@ impl App {
         ))
     }
 
-    fn private_bar_rect(&self) -> Option<UiRect> {
-        Some(self.right_controls()?.private)
-    }
-
-    fn split_bar_rects(&self) -> Option<(UiRect, UiRect, UiRect)> {
-        self.right_controls()?.split
-    }
-
     fn comparator_bar_hit(&self) -> Option<BarHit> {
-        if let Some(private) = self.private_bar_rect()
-            && private.contains(self.cursor.0, self.cursor.1)
+        if let Some(controls) = self.right_controls()
+            && let Some(hit) = right_controls_hit(controls, self.cursor.0, self.cursor.1)
         {
-            return Some(BarHit::Private);
-        }
-        if let Some((_label, expand, close)) = self.split_bar_rects() {
-            if close.contains(self.cursor.0, self.cursor.1) {
-                return Some(BarHit::SplitClose);
-            }
-            if expand.contains(self.cursor.0, self.cursor.1) {
-                return Some(BarHit::SplitExpand);
-            }
+            return Some(hit);
         }
         self.bar_layout()
             .and_then(|layout| layout.hit(self.cursor.0, self.cursor.1))
@@ -6761,40 +7071,43 @@ impl App {
         }
     }
 
-    fn context_tab_url(&self, source_index: usize, context_index: usize) -> Option<String> {
+    fn context_tab_identity(
+        &self,
+        source_index: usize,
+        context_index: usize,
+    ) -> Option<(u64, String)> {
         self.comparator
             .as_ref()
             .and_then(|comp| comp.contexts.get(source_index))
             .and_then(|tabs| tabs.get(context_index))
-            .map(|tab| tab.url.clone())
+            .map(|tab| (tab.id, tab.url.clone()))
     }
 
-    fn open_context_tab(&mut self, source_index: usize, context_index: usize) {
-        if let Some(url) = self.context_tab_url(source_index, context_index) {
-            self.open_split(source_index, url, false);
-        }
+    fn open_context_tab(&mut self, source_index: usize, context_index: usize) -> bool {
+        self.context_tab_identity(source_index, context_index)
+            .is_some_and(|(context_id, url)| {
+                self.open_split_mode(source_index, url, false, false, Some(context_id))
+            })
     }
 
     fn open_context_tab_fullscreen(&mut self, source_index: usize, context_index: usize) {
-        self.open_context_tab(source_index, context_index);
-        if self
-            .comparator
-            .as_ref()
-            .is_some_and(|comp| comp.split.is_some())
-        {
+        if self.open_context_tab(source_index, context_index) {
             self.toggle_split_fullscreen();
         }
     }
 
     fn close_context_tab(&mut self, source_index: usize, context_index: usize) {
-        let Some(url) = self.context_tab_url(source_index, context_index) else {
+        let Some((context_id, _url)) = self.context_tab_identity(source_index, context_index)
+        else {
             return;
         };
         let closes_active = self
             .comparator
             .as_ref()
             .and_then(|comp| comp.split.as_ref())
-            .is_some_and(|split| split.source_index == source_index && split.url == url);
+            .is_some_and(|split| {
+                split.source_index == source_index && split.context_id == Some(context_id)
+            });
         if closes_active {
             self.close_split();
         }
@@ -6868,27 +7181,26 @@ impl App {
     }
 
     fn close_other_context_tabs(&mut self, source_index: usize, context_index: usize) {
-        let Some((scope, keep)) = self
+        let valid_context = self
             .comparator
             .as_ref()
             .and_then(|comp| comp.contexts.get(source_index))
-            .and_then(|tabs| {
-                tabs.get(context_index)
-                    .map(|tab| (tab.group, tab.url.clone()))
-            })
-        else {
+            .is_some_and(|tabs| context_index < tabs.len());
+        if !valid_context {
             return;
-        };
+        }
         let closes_active = self
             .comparator
             .as_ref()
             .and_then(|comp| comp.split.as_ref().map(|split| (comp, split)))
             .is_some_and(|(comp, split)| {
                 split.source_index == source_index
-                    && split.url != keep
-                    && comp.contexts[source_index]
-                        .iter()
-                        .any(|tab| tab.group == scope && tab.url == split.url)
+                    && active_context_removed_by_scope(
+                        &comp.contexts[source_index],
+                        context_index,
+                        split.context_id,
+                        true,
+                    )
             });
         if closes_active {
             self.close_split();
@@ -6904,24 +7216,26 @@ impl App {
     }
 
     fn close_all_context_tabs(&mut self, source_index: usize, context_index: usize) {
-        let Some(scope) = self
+        let valid_context = self
             .comparator
             .as_ref()
             .and_then(|comp| comp.contexts.get(source_index))
-            .and_then(|tabs| tabs.get(context_index))
-            .map(|tab| tab.group)
-        else {
+            .is_some_and(|tabs| context_index < tabs.len());
+        if !valid_context {
             return;
-        };
+        }
         let closes_active = self
             .comparator
             .as_ref()
             .and_then(|comp| comp.split.as_ref().map(|split| (comp, split)))
             .is_some_and(|(comp, split)| {
                 split.source_index == source_index
-                    && comp.contexts[source_index]
-                        .iter()
-                        .any(|tab| tab.group == scope && tab.url == split.url)
+                    && active_context_removed_by_scope(
+                        &comp.contexts[source_index],
+                        context_index,
+                        split.context_id,
+                        false,
+                    )
             });
         if closes_active {
             self.close_split();
@@ -6934,6 +7248,18 @@ impl App {
             );
         }
         self.request_redraw();
+    }
+
+    fn joinable_context_groups(
+        groups: &[ContextGroup],
+        current_group: Option<u64>,
+    ) -> Vec<(usize, String)> {
+        groups
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| Some(group.id) != current_group)
+            .map(|(index, group)| (index, group.name.clone()))
+            .collect()
     }
 
     fn context_menu_comparator(&mut self) {
@@ -6958,14 +7284,13 @@ impl App {
             .comparator
             .as_ref()
             .map(|comp| {
-                let names: Vec<String> = comp.groups[source_index]
-                    .iter()
-                    .map(|group| group.name.clone())
-                    .collect();
-                let member = comp.contexts[source_index]
+                let current_group = comp.contexts[source_index]
                     .get(context_index)
-                    .is_some_and(|tab| tab.group.is_some());
-                (names, member)
+                    .and_then(|tab| tab.group);
+                (
+                    Self::joinable_context_groups(&comp.groups[source_index], current_group),
+                    current_group.is_some(),
+                )
             })
             .unwrap_or_default();
 
@@ -6977,8 +7302,16 @@ impl App {
             let open = wide_null("Abrir");
             let fullscreen = wide_null("Abrir em tela cheia");
             let close = wide_null("Fechar aba");
-            let close_others = wide_null("Fechar outras abas deste grupo");
-            let close_all = wide_null("Fechar todas deste grupo");
+            let close_others = wide_null(if in_group {
+                "Fechar outras abas deste grupo"
+            } else {
+                "Fechar outras abas sem grupo"
+            });
+            let close_all = wide_null(if in_group {
+                "Fechar todas deste grupo"
+            } else {
+                "Fechar todas as abas sem grupo"
+            });
             AppendMenuW(menu, MF_STRING, TAB_MENU_OPEN, open.as_ptr());
             AppendMenuW(menu, MF_STRING, TAB_MENU_FULLSCREEN, fullscreen.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
@@ -6997,7 +7330,7 @@ impl App {
             // o Win32 le ponteiros ja libertados enquanto desenha o menu.
             let join_labels: Vec<Vec<u16>> = existing_groups
                 .iter()
-                .map(|name| wide_null(&format!("Juntar ao grupo \u{201C}{name}\u{201D}")))
+                .map(|(_, name)| wide_null(&format!("Juntar ao grupo \u{201C}{name}\u{201D}")))
                 .collect();
             for (offset, label) in join_labels.iter().enumerate() {
                 AppendMenuW(
@@ -7031,7 +7364,9 @@ impl App {
         };
 
         match command {
-            TAB_MENU_OPEN => self.open_context_tab(source_index, context_index),
+            TAB_MENU_OPEN => {
+                self.open_context_tab(source_index, context_index);
+            }
             TAB_MENU_FULLSCREEN => self.open_context_tab_fullscreen(source_index, context_index),
             TAB_MENU_CLOSE => self.close_context_tab(source_index, context_index),
             TAB_MENU_CLOSE_OTHERS => self.close_other_context_tabs(source_index, context_index),
@@ -7039,9 +7374,9 @@ impl App {
             TAB_MENU_NEW_GROUP => self.group_context_tab(source_index, context_index),
             TAB_MENU_UNGROUP => self.ungroup_context_tab(source_index, context_index),
             other if other >= TAB_MENU_GROUP_BASE => {
-                let group_index = other - TAB_MENU_GROUP_BASE;
-                if group_index < existing_groups.len() {
-                    self.join_context_tab_group(source_index, context_index, group_index);
+                let menu_index = other - TAB_MENU_GROUP_BASE;
+                if let Some((group_index, _)) = existing_groups.get(menu_index) {
+                    self.join_context_tab_group(source_index, context_index, *group_index);
                 }
             }
             _ => {}
@@ -7073,7 +7408,9 @@ impl App {
             Some(BarHit::ContextTab {
                 source_index,
                 context_index,
-            }) => self.open_context_tab(source_index, context_index),
+            }) => {
+                self.open_context_tab(source_index, context_index);
+            }
             Some(BarHit::ContextGroup {
                 source_index,
                 group_index,
@@ -7754,11 +8091,15 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ZoomOut => self.step_zoom(-1),
             UserEvent::ZoomReset => self.set_zoom(1.0),
             UserEvent::ReloadPage => self.reload_page(),
+            UserEvent::ReloadTarget(target) => self.reload_target(target),
             UserEvent::PrintPage => self.print_page(),
+            UserEvent::PrintTarget(target) => self.print_target(target),
             UserEvent::FocusOmnibox => self.focus_omnibox(),
             UserEvent::ToggleColumnFullscreen => self.toggle_column_fullscreen(),
             UserEvent::OpenDevTools => self.open_devtools(),
+            UserEvent::OpenDevToolsTarget(target) => self.open_devtools_target(target),
             UserEvent::ViewSource => self.view_source(),
+            UserEvent::ViewSourceTarget(target) => self.view_source_target(target),
             UserEvent::AutoScrollTick(token) => self.auto_scroll_tick(token),
             UserEvent::HideSplash(token) => self.hide_splash(token),
             UserEvent::GmailProbe(token) => {
@@ -7832,10 +8173,10 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::OpenInColumn(index, url) => self.open_in_column(index, url),
             UserEvent::OpenEverywhere(url) => self.open_everywhere(url),
             UserEvent::OpenSplit { source_index, url } => {
-                self.open_split(source_index, url, false);
+                let _ = self.open_split(source_index, url, false);
             }
             UserEvent::OpenPrivateSplit { source_index, url } => {
-                self.open_split_mode(source_index, url, false, true);
+                let _ = self.open_split_mode(source_index, url, false, true, None);
             }
             UserEvent::NewTab(index) => self.new_tab(index),
             UserEvent::CloseSplit => self.close_split(),
@@ -9021,7 +9362,7 @@ fn draw_comparator_bar(
             comp.split.as_ref().map(|split| {
                 (
                     split.source_index,
-                    split.url.as_str(),
+                    split.context_id,
                     split.fullscreen,
                     split.private,
                 )
@@ -9086,7 +9427,7 @@ unsafe fn paint_comparator_bar_with_contexts(
     columns: BarColumns,
     contexts: &[Vec<ContextTab>; COMPARATOR_COLUMNS],
     groups: &[Vec<ContextGroup>; COMPARATOR_COLUMNS],
-    active_context: Option<(usize, &str, bool, bool)>,
+    active_context: Option<(usize, Option<u64>, bool, bool)>,
     visible: bool,
     hover: Option<BarHit>,
     auto_scroll: bool,
@@ -9200,8 +9541,9 @@ unsafe fn paint_comparator_bar_with_contexts(
                 .and_then(|id| groups[index].iter().find(|group| group.id == id))
                 .map(|group| group.color.rgb())
                 .unwrap_or(brand);
-            let active = active_context
-                .is_some_and(|(source, active_url, _, _)| source == index && active_url == url);
+            let active = active_context.is_some_and(|(source, active_id, _, _)| {
+                source == index && active_id == Some(tab.id)
+            });
             let hovered = hover
                 == Some(BarHit::ContextTab {
                     source_index: index,
@@ -11639,15 +11981,11 @@ mod tests {
             App::column_ipc_event_impl(1, IpcAction::Palette { col: 1 }),
             Some(UserEvent::OpenPalette(1))
         ));
-        // O painel lateral mantem o despacho dentro do closure, e por isso
-        // continua a ser so presenca.
-        let split_body = source
-            .split("fn split_webview_builder")
-            .nth(1)
-            .and_then(|part| part.split(".with_new_window_req_handler").next())
-            .expect("split builder");
-        assert!(split_body.contains("IpcAction::Palette"));
-        assert!(split_body.contains("UserEvent::OpenPalette("));
+        assert!(matches!(
+            App::split_ipc_event_impl(1, IpcAction::Palette { col: 1 }),
+            Some(UserEvent::OpenPalette(1))
+        ));
+        assert!(App::split_ipc_event_impl(1, IpcAction::Palette { col: 0 }).is_none());
 
         let edit = source
             .split("fn palette_edit_subclass")
@@ -11739,7 +12077,9 @@ mod tests {
         assert!(!before.contains("record("));
         assert_eq!(load_provider.matches("self.record(").count(), 1);
         assert!(before.contains("PaletteRoute::OpenPrivateProvider"));
-        assert!(before.contains("open_split_mode(source_index, url.to_string(), false, true)"));
+        assert!(
+            before.contains("open_split_mode(source_index, url.to_string(), false, true, None)")
+        );
 
         // A parte da memória passou a ser testada pelo comportamento, em
         // `private_split_source_never_becomes_a_memory_document`: contar
@@ -11752,14 +12092,15 @@ mod tests {
             .and_then(|part| part.split("fn open_private_panel").next())
             .expect("split body");
         assert!(split.contains("split_source_memory(&valid, source_name, private)"));
-        assert_eq!(split.matches("if !private").count(), 1);
+        assert!(split.contains("let context_id = if private"));
+        assert!(split.contains("remember_context_tab("));
         assert!(!split.contains("self.record("));
         let private_split = source
             .split("UserEvent::OpenPrivateSplit { source_index, url } =>")
             .nth(1)
             .and_then(|part| part.split("UserEvent::NewTab").next())
             .expect("OpenPrivateSplit arm");
-        assert!(private_split.contains("open_split_mode(source_index, url, false, true)"));
+        assert!(private_split.contains("open_split_mode(source_index, url, false, true, None)"));
     }
 
     #[test]
@@ -11826,10 +12167,70 @@ mod tests {
             },
             800.0,
         );
-        assert_eq!(narrow.width, PALETTE_MIN_WIDTH);
+        assert_eq!(narrow.width, 52.0);
+        assert_eq!(narrow.x, 724.0);
+        assert!(narrow.width <= 100.0);
 
         assert!(palette_hint("ChatGPT", false).contains("ChatGPT"));
         assert!(palette_hint("ChatGPT", true).contains("privado"));
+    }
+
+    #[test]
+    fn duplicate_urls_keep_distinct_tab_identity_across_groups() {
+        let mut tabs = vec![
+            tab("https://example.com/same", Some(10)),
+            tab("https://example.com/same", Some(20)),
+        ];
+        let first = tabs[0].id;
+        let second = tabs[1].id;
+        assert_ne!(first, second, "URL repetida nao pode colapsar identidades");
+
+        assert!(
+            !active_context_removed_by_scope(&tabs, 0, Some(second), false),
+            "mesma URL noutro grupo nao pode ser confundida com a aba ativa do grupo fechado"
+        );
+        assert!(
+            active_context_removed_by_scope(&tabs, 0, Some(first), false),
+            "a aba ativa do proprio grupo precisa ser fechada"
+        );
+        assert!(
+            !active_context_removed_by_scope(&tabs, 0, Some(first), true),
+            "Fechar outras deve preservar a aba selecionada"
+        );
+
+        let mut groups = vec![group(10, false), group(20, false)];
+        assert!(close_context_tab_scope(&mut tabs, &mut groups, 0));
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].id, second);
+        assert_eq!(tabs[0].url, "https://example.com/same");
+        assert_eq!(tabs[0].group, Some(20));
+    }
+
+    #[test]
+    fn context_limit_prunes_group_orphaned_by_eviction() {
+        let mut tabs = vec![tab("https://old.example/", Some(77))];
+        let mut groups = vec![group(77, false)];
+        let mut next_id = 10_000;
+        for index in 0..32 {
+            let _ = remember_context_tab(
+                &mut tabs,
+                &mut groups,
+                &mut next_id,
+                format!("https://example.com/{index}"),
+            );
+        }
+        assert_eq!(tabs.len(), 32);
+        assert!(
+            groups.iter().all(|item| item.id != 77),
+            "o limite de abas deixou grupo sem membro"
+        );
+    }
+
+    #[test]
+    fn rejected_minimize_keeps_last_visible_panel_state_intact() {
+        assert!(!can_minimize_column(&[true, false, true], 3, 1));
+        assert!(can_minimize_column(&[false, false, true], 3, 1));
+        assert!(!can_minimize_column(&[false, false, true], 3, 9));
     }
 
     #[test]
@@ -12618,7 +13019,9 @@ mod tests {
     // ---------- grupos de abas ----------
 
     fn tab(url: &str, group: Option<u64>) -> ContextTab {
+        static NEXT_TEST_TAB_ID: AtomicU64 = AtomicU64::new(1);
         ContextTab {
+            id: NEXT_TEST_TAB_ID.fetch_add(1, Ordering::Relaxed),
             url: url.to_string(),
             group,
         }
@@ -12882,6 +13285,294 @@ mod tests {
                 source_index: 0,
                 context_index: 0
             })
+        );
+    }
+
+    #[test]
+    fn ui_rect_edges_are_half_open_so_adjacent_controls_never_share_a_click() {
+        let left = UiRect {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+        };
+        let right = UiRect {
+            x: 10.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+        };
+        assert!(left.contains(9.999, 5.0));
+        assert!(!left.contains(10.0, 5.0));
+        assert!(right.contains(10.0, 5.0));
+        assert!(!right.contains(20.0, 5.0));
+
+        let bar = BarLayout::new(1120.0, 1.0, true, 3);
+        let boundary = bar.window_close.x;
+        let y = bar.window_close.y + bar.window_close.height / 2.0;
+        assert!(
+            !bar.window_maximize.contains(boundary, y),
+            "a borda do fechar nao pode pertencer tambem ao maximizar"
+        );
+        assert_eq!(bar.hit(boundary, y), Some(BarHit::WindowClose));
+        assert_eq!(bar.hit(boundary - 0.001, y), Some(BarHit::WindowMaximize));
+    }
+
+    #[test]
+    fn keyboard_shortcuts_keep_page_identity_and_global_digit_targets() {
+        for source in 0..COMPARATOR_COLUMNS {
+            assert!(matches!(
+                App::column_ipc_event_impl(source, IpcAction::Fullscreen),
+                Some(UserEvent::ExpandComparator(index)) if index == source
+            ));
+            assert!(matches!(
+                App::column_ipc_event_impl(source, IpcAction::Reload),
+                Some(UserEvent::ReloadTarget(PageTarget::Column(index))) if index == source
+            ));
+            assert!(matches!(
+                App::column_ipc_event_impl(source, IpcAction::Print),
+                Some(UserEvent::PrintTarget(PageTarget::Column(index))) if index == source
+            ));
+            assert!(matches!(
+                App::column_ipc_event_impl(source, IpcAction::DevTools),
+                Some(UserEvent::OpenDevToolsTarget(PageTarget::Column(index))) if index == source
+            ));
+            assert!(matches!(
+                App::column_ipc_event_impl(source, IpcAction::ViewSource),
+                Some(UserEvent::ViewSourceTarget(PageTarget::Column(index))) if index == source
+            ));
+
+            // 1/2/3 sao atalhos globais: a coluna com foco nao limita o alvo.
+            for target in 0..COMPARATOR_COLUMNS {
+                assert!(matches!(
+                    App::column_ipc_event_impl(
+                        source,
+                        IpcAction::ShortcutExpand { col: target }
+                    ),
+                    Some(UserEvent::ExpandComparator(index)) if index == target
+                ));
+            }
+        }
+
+        // O botao/DOM normal continua preso a propria coluna.
+        assert!(matches!(
+            App::column_ipc_event_impl(1, IpcAction::Expand { col: 1 }),
+            Some(UserEvent::ExpandComparator(1))
+        ));
+        assert!(App::column_ipc_event_impl(0, IpcAction::Expand { col: 1 }).is_none());
+
+        assert!(matches!(
+            App::split_ipc_event_impl(2, IpcAction::Fullscreen),
+            Some(UserEvent::ToggleSplitFullscreen)
+        ));
+        assert!(matches!(
+            App::split_ipc_event_impl(2, IpcAction::Omnibox),
+            Some(UserEvent::OpenPalette(2))
+        ));
+        assert!(matches!(
+            App::split_ipc_event_impl(2, IpcAction::Print),
+            Some(UserEvent::PrintTarget(PageTarget::Split))
+        ));
+        assert!(matches!(
+            App::split_ipc_event_impl(2, IpcAction::ShortcutExpand { col: 0 }),
+            Some(UserEvent::ExpandComparator(0))
+        ));
+    }
+
+    #[test]
+    fn stale_split_builds_are_discarded_after_navigation_changes() {
+        assert!(split_build_is_current(7, 7, Surface::Comparator));
+        assert!(!split_build_is_current(7, 8, Surface::Comparator));
+        assert!(!split_build_is_current(7, 7, Surface::Home));
+        assert!(!split_build_is_current(7, 7, Surface::External));
+    }
+
+    #[test]
+    fn failed_split_build_preserves_the_previous_split_and_expansion() {
+        let mut split = Some(41u32);
+        let mut expanded = Some(2usize);
+
+        let failed: Result<u32, &str> = Err("webview failed");
+        assert_eq!(
+            commit_split_build(failed, &mut split, &mut expanded),
+            Err("webview failed")
+        );
+        assert_eq!(split, Some(41), "falha nao pode destruir o Split anterior");
+        assert_eq!(
+            expanded,
+            Some(2),
+            "falha nao pode sair da expansao que ja estava visivel"
+        );
+
+        let committed = commit_split_build(Ok::<u32, &str>(99), &mut split, &mut expanded)
+            .expect("build valido");
+        assert_eq!(committed, (99, Some(41)));
+        assert_eq!(split, None);
+        assert_eq!(expanded, None);
+    }
+
+    #[test]
+    fn native_buttons_only_activate_when_press_and_release_match() {
+        assert_eq!(native_button_index(ninety_for_test(), 0), Some(0));
+        assert_eq!(native_button_index(ninety_for_test(), 29), Some(0));
+        assert_eq!(native_button_index(ninety_for_test(), 30), Some(1));
+        assert_eq!(native_button_index(ninety_for_test(), 59), Some(1));
+        assert_eq!(native_button_index(ninety_for_test(), 60), Some(2));
+        assert_eq!(native_button_index(ninety_for_test(), 89), Some(2));
+        assert_eq!(native_button_index(ninety_for_test(), -1), None);
+        assert_eq!(native_button_index(ninety_for_test(), 90), None);
+
+        assert_eq!(native_release_matches(Some(0), Some(0)), Some(0));
+        assert_eq!(native_release_matches(Some(0), Some(2)), None);
+        assert_eq!(native_release_matches(None, Some(2)), None);
+        assert_eq!(
+            native_caption_release(Some(1), true, 90, 30, 45, 15),
+            Some(1)
+        );
+        assert_eq!(native_caption_release(Some(1), true, 90, 30, 45, 30), None);
+        assert_eq!(native_caption_release(Some(1), true, 90, 30, 45, -1), None);
+        assert_eq!(native_caption_release(Some(1), false, 90, 30, 45, 15), None);
+        assert!(point_inside_client(100, 30, 99, 29));
+        assert!(!point_inside_client(100, 30, 100, 29));
+        assert!(!point_inside_client(100, 30, 99, 30));
+
+        let pressed = AtomicUsize::new(1);
+        assert_eq!(
+            take_native_pressed_button(&pressed, || {
+                // WM_CAPTURECHANGED chega sincronamente durante ReleaseCapture.
+                pressed.store(NATIVE_BUTTON_NONE, Ordering::Release);
+            }),
+            Some(1)
+        );
+        assert_eq!(pressed.load(Ordering::Acquire), NATIVE_BUTTON_NONE);
+        assert_eq!(take_native_pressed_button(&pressed, || {}), None);
+    }
+
+    fn ninety_for_test() -> i32 {
+        90
+    }
+
+    #[test]
+    fn current_group_is_not_offered_as_a_join_target() {
+        let groups = vec![group(1, false), group(2, false), group(3, false)];
+        let joinable = App::joinable_context_groups(&groups, Some(2));
+        assert_eq!(joinable, vec![(0, "G1".to_string()), (2, "G3".to_string())]);
+        assert_eq!(
+            App::joinable_context_groups(&groups, None),
+            vec![
+                (0, "G1".to_string()),
+                (1, "G2".to_string()),
+                (2, "G3".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn ui_100_interaction_matrix_keeps_click_targets_unambiguous() {
+        let logical_widths = [700.0, 760.0, 900.0, 1120.0, 1600.0];
+        let scales = [1.0, 1.25, 1.5, 2.0];
+        let topologies = [
+            ([false, false, false], false),
+            ([true, false, false], false),
+            ([false, true, false], false),
+            ([false, false, true], false),
+            ([false, false, false], true),
+        ];
+        let center = |rect: UiRect| (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+        let mut scenarios = 0usize;
+
+        for logical_width in logical_widths {
+            for scale in scales {
+                let client_width = logical_width * scale;
+                for (minimized, split_active) in topologies {
+                    scenarios += 1;
+                    let columns = BarColumns {
+                        count: COMPARATOR_COLUMNS,
+                        weights: [1.0; COMPARATOR_COLUMNS],
+                        minimized,
+                        split_active,
+                    };
+                    let layout =
+                        BarLayout::with_contexts(client_width, scale, true, columns, [3, 3, 3]);
+
+                    for (rect, expected) in [
+                        (layout.window_minimize, BarHit::WindowMinimize),
+                        (layout.window_maximize, BarHit::WindowMaximize),
+                        (layout.window_close, BarHit::WindowClose),
+                        (layout.home, BarHit::Home),
+                    ] {
+                        let (x, y) = center(rect);
+                        assert_eq!(
+                            layout.hit(x, y),
+                            Some(expected),
+                            "alvo errado em {logical_width}px @{scale}x"
+                        );
+                    }
+
+                    let controls = right_controls(client_width, scale, split_active);
+                    let (px, py) = center(controls.private);
+                    assert_eq!(right_controls_hit(controls, px, py), Some(BarHit::Private));
+                    assert_eq!(
+                        layout.hit(px, py),
+                        None,
+                        "controle Privado sobrepoe alvo da barra em {logical_width}px @{scale}x"
+                    );
+
+                    if let Some((_label, expand, close)) = controls.split {
+                        for (rect, expected) in
+                            [(expand, BarHit::SplitExpand), (close, BarHit::SplitClose)]
+                        {
+                            let (x, y) = center(rect);
+                            assert_eq!(right_controls_hit(controls, x, y), Some(expected));
+                            assert_eq!(
+                                layout.hit(x, y),
+                                None,
+                                "controle do Split sobrepoe alvo da barra em {logical_width}px @{scale}x"
+                            );
+                        }
+                    }
+
+                    for index in 0..COMPARATOR_COLUMNS {
+                        let provider = layout.columns[index];
+                        if provider.width > 0.0 {
+                            let (x, y) = center(provider);
+                            assert_eq!(
+                                layout.hit(x, y),
+                                Some(BarHit::Column(index)),
+                                "provedor {index} perdeu o clique em {logical_width}px @{scale}x"
+                            );
+                        }
+
+                        let add = layout.add_tabs[index];
+                        if add.width > 0.0 {
+                            let (x, y) = center(add);
+                            assert_eq!(
+                                layout.hit(x, y),
+                                Some(BarHit::AddTab(index)),
+                                "+ da coluna {index} perdeu o clique em {logical_width}px @{scale}x"
+                            );
+                        }
+
+                        for visual in 0..layout.context_tab_counts[index] {
+                            let tab_rect = layout.context_tabs[index][visual];
+                            let (x, y) = center(tab_rect);
+                            assert_eq!(
+                                layout.hit(x, y),
+                                Some(BarHit::ContextTab {
+                                    source_index: index,
+                                    context_index: layout.context_indices[index][visual],
+                                }),
+                                "aba da coluna {index} perdeu o clique em {logical_width}px @{scale}x"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            scenarios, 100,
+            "o gate precisa exercitar exatamente cem combinacoes de tela/estado"
         );
     }
 }
@@ -13669,7 +14360,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     if (key === '1' || key === '2' || key === '3') {
       if (typeof colIndex === 'number') {
         e.preventDefault();
-        act('expand', { col:(parseInt(key, 10) - 1) });
+        act('shortcut-expand', { col:(parseInt(key, 10) - 1) });
       }
       return;
     }
@@ -14577,7 +15268,9 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
   listen(document, 'dblclick', (event) => {
     if (!event.isTrusted || event.defaultPrevented) return;
     if (event.target && event.target.closest
-        && event.target.closest('#neuralia-comp-controls,#neuralia-palette')) return;
+        && event.target.closest(
+          '#neuralia-comp-controls,#neuralia-palette,a[href],button,input,textarea,select,option,label,summary,[role="button"],[role="link"],[contenteditable="true"]'
+        )) return;
     const tag = event.target && event.target.tagName
       ? event.target.tagName.toUpperCase() : '';
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;

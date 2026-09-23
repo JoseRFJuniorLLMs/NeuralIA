@@ -26,6 +26,12 @@ pub enum IpcAction {
     Expand {
         col: usize,
     },
+    /// Atalho 1/2/3: ao contrario do botao de uma pagina, e global ao
+    /// comparador e pode escolher outra coluna. Continua autenticado pela
+    /// capability e separado de Expand para nao alargar a autoridade do DOM.
+    ShortcutExpand {
+        col: usize,
+    },
     Minimize {
         col: usize,
     },
@@ -129,6 +135,11 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
             let col = bounded_col(args, max_columns)?;
             exact_keys(args, &["col"])?;
             Some(IpcAction::Expand { col })
+        }
+        "shortcut-expand" => {
+            let col = bounded_col(args, max_columns)?;
+            exact_keys(args, &["col"])?;
+            Some(IpcAction::ShortcutExpand { col })
         }
         "minimize" => {
             let col = bounded_col(args, max_columns)?;
@@ -351,6 +362,11 @@ mod tests {
             Some(IpcAction::Expand { col: 1 })
         );
         assert_eq!(
+            parse_ipc_message(&message("shortcut-expand", json!({"col":2})), CAP, 3),
+            Some(IpcAction::ShortcutExpand { col: 2 })
+        );
+        assert!(parse_ipc_message(&message("shortcut-expand", json!({"col":3})), CAP, 3).is_none());
+        assert_eq!(
             parse_ipc_message(&message("minimize", json!({"col":0})), CAP, 3),
             Some(IpcAction::Minimize { col: 0 })
         );
@@ -553,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_covers_twenty_five_real_actions() {
+    fn protocol_covers_twenty_six_real_actions() {
         let messages = [
             message("home", json!({})),
             message("back", json!({})),
@@ -574,6 +590,7 @@ mod tests {
             message("expand", json!({"col":0})),
             message("minimize", json!({"col":0})),
             message("split", json!({"col":0,"url":"https://example.com"})),
+            message("shortcut-expand", json!({"col":1})),
             message("split-close", json!({})),
             message("split-expand", json!({})),
             message("palette", json!({"col":0})),
@@ -590,7 +607,7 @@ mod tests {
                 json!({"data":"1\nhttps://example.com"}),
             ),
         ];
-        assert_eq!(messages.len(), 25);
+        assert_eq!(messages.len(), 26);
         assert!(
             messages
                 .iter()

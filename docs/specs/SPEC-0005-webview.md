@@ -41,10 +41,10 @@ message transport through WebView2, but every accepted message is a bounded JSON
 envelope authenticated with a per-WebView capability. The native side exposes
 no filesystem API, credential API or arbitrary native-call object.
 
-The closed action set has 25 names: `home`, `back`, `restore`,
+The closed action set has 26 names: `home`, `back`, `restore`,
 `autoscroll`, `zoomin`, `zoomout`, `zoomreset`, `reload`, `print`,
 `omnibox`, `history`, `clearhistory`, `fullscreen`, `devtools`,
-`viewsource`, `newtab`, `expand`, `minimize`, `split`,
+`viewsource`, `newtab`, `expand`, `shortcut-expand`, `minimize`, `split`,
 `split-close`, `split-expand`, `palette`, `gmail-state`,
 `research-answer` and `agent-observation`. Unknown actions, extra fields,
 wrong types, oversized messages and invalid per-action arguments are rejected.
