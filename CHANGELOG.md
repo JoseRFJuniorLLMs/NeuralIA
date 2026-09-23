@@ -6,7 +6,14 @@ All notable changes to NeuralIA are documented here.
 
 ## [2.1.7] - 2026-09-23
 
+### Added
+- **Grupos de abas como no Chrome:** cada aba tem o seu **×** (vermelho sob o mouse); o grupo mostra a etiqueta na cor dele e uma linha da mesma cor por baixo das abas que lhe pertencem; botão direito no grupo (ou numa aba do grupo) abre as **9 cores**, Recolher/Expandir, Desagrupar e Fechar grupo; o menu da aba ganha "Adicionar a um novo grupo", "Mover para o grupo" e "Remover do grupo".
+- **Arrastar abas e grupos com o mouse:** soltar entre membros junta ao grupo, arrastar para fora sai dele, um grupo arrasta-se inteiro e nunca cai dentro de outro; Esc cancela.
+- **Abas e grupos guardados:** uma nova pesquisa já não apaga as abas nem os grupos, e eles voltam quando reabres a NeuralIA (`tabs.json`, escrita atómica, um só escritor por pasta de dados); o modo privado nunca é guardado e "Apagar histórico" também apaga as abas guardadas.
+- **Botão direito dentro de uma IA:** o menu do WebView2 ganha "Desativar/Ativar rolagem automática (Ctrl+R)", nas colunas e no painel ao lado.
+
 ### Fixed
+- **Grupos de abas:** uma aba aberta a partir de uma aba agrupada nasce dentro do grupo; tirar ou reagrupar uma aba do meio já não parte o grupo em dois; o limite de 32 abas já não apaga os grupos guardados.
 - **Instalador — sem elipse escura:** o `neural-setup` abria uma zona de silêncio em forma de elipse à volta da marca e do texto, e via-se como um buraco escuro no meio do tecido. Saiu: os neurónios passam por trás da logo, como na Home do navegador. O título, a versão, o caminho de instalação, a etapa e a legenda leem-se por cima do tecido graças a uma orla fina na cor da página (`paint::text_on_tissue`); os botões mantêm o fundo próprio.
 
 ### Testing
