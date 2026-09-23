@@ -11262,6 +11262,287 @@ mod tests {
         }
     }
 
+    /// Os gates do agente sobre o JavaScript que EMBARCA.
+    ///
+    /// O `AGENT_OBSERVER_SCRIPT` e o `agent_action_script` correm aqui dentro
+    /// de um DOM mínimo em Node (`node:vm`), e o que eles publicam passa pelo
+    /// mesmo caminho nativo do produto: `parse_ipc_message` →
+    /// `parse_agent_observation` → `decide_agent_step`. Asserções sobre o texto
+    /// do script não apanhavam nenhum destes defeitos (AGENTS.md §4.3): o
+    /// observador e o guard falavam vocabulários diferentes e os testes de
+    /// texto ficavam verdes.
+    mod agent_dom_gates {
+        use super::*;
+        use serde_json::{Value, json};
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+
+        /// Um DOM de brinquedo, com o que o observador e o guard usam: tipos
+        /// por omissão como no HTML (`<button>` é `submit`, `<select>` é
+        /// `select-one`), `setAttribute` a disparar o `MutationObserver`,
+        /// relógio falso para os `setTimeout` e o `postMessage` capturado.
+        const HARNESS: &str = r#"
+const vm = require('node:vm');
+const input = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+const page = input.page;
+const posts = [];
+const timers = new Map();
+const observers = [];
+let now = 0, seq = 0, mutated = false;
+function listeners(target, type) {
+  if (!target.__l) target.__l = {};
+  return target.__l[type] || (target.__l[type] = []);
+}
+class FakeEventTarget {}
+FakeEventTarget.prototype.addEventListener = function (type, fn) { listeners(this, type).push(fn); };
+FakeEventTarget.prototype.dispatchEvent = function (event) {
+  if (this.events) this.events.push(event.type);
+  for (const fn of listeners(this, event.type).slice()) fn.call(this, event);
+  return true;
+};
+class FakeEvent { constructor(type, init) { this.type = type; this.bubbles = !!(init && init.bubbles); this.isTrusted = false; } }
+const form = { submits: 0 };
+const NAMED = ['input', 'select', 'textarea', 'button', 'a'];
+class FakeElement extends FakeEventTarget {
+  constructor(spec) {
+    super();
+    this.spec = spec; this.tag = spec.tag; this.tagName = spec.tag.toUpperCase();
+    this.attrs = new Map(Object.entries(spec.attrs || {}));
+    this.clicks = 0; this.events = []; this.form = spec.form ? form : null;
+  }
+  getAttribute(name) { return this.attrs.has(name) ? String(this.attrs.get(name)) : null; }
+  setAttribute(name, value) { this.attrs.set(name, String(value)); mutated = true; }
+  get disabled() { return this.attrs.has('disabled'); }
+  get type() {
+    const t = (this.getAttribute('type') || '').toLowerCase();
+    if (this.tag === 'input') return t || 'text';
+    if (this.tag === 'button') return t === 'button' || t === 'reset' ? t : 'submit';
+    if (this.tag === 'select') return 'select-one';
+    if (this.tag === 'textarea') return 'textarea';
+    if (this.tag === 'a') return this.getAttribute('type') || '';
+    return undefined;
+  }
+  get name() { return NAMED.includes(this.tag) ? (this.getAttribute('name') || '') : undefined; }
+  get autocomplete() { return ['input', 'select', 'textarea'].includes(this.tag) ? (this.getAttribute('autocomplete') || '') : undefined; }
+  get placeholder() { return ['input', 'textarea'].includes(this.tag) ? (this.getAttribute('placeholder') || '') : undefined; }
+  get innerText() {
+    if (this.tag === 'select') return (this.spec.options || []).join('\n');
+    if (this.tag === 'input' || this.tag === 'textarea') return '';
+    return this.spec.text || '';
+  }
+  get textContent() {
+    if (this.tag === 'select') return (this.spec.options || []).join('');
+    if (this.tag === 'input') return '';
+    return this.spec.text || '';
+  }
+  getBoundingClientRect() { return this.spec.hidden ? { width: 0, height: 0 } : { width: 120, height: 24 }; }
+  focus() {}
+  click() { this.clicks += 1; if (this.form && this.type === 'submit') form.submits += 1; }
+}
+class FakeField extends FakeElement {
+  get value() { return this._value !== undefined ? this._value : (this.getAttribute('value') || ''); }
+  set value(v) { this._value = String(v); }
+}
+class FakeSelect extends FakeElement {
+  get value() { return this._value !== undefined ? this._value : ((this.spec.options || [])[0] || ''); }
+  set value(v) { v = String(v); this._value = (this.spec.options || []).includes(v) ? v : ''; }
+}
+const elements = (page.elements || []).map((spec) =>
+  spec.tag === 'select' ? new FakeSelect(spec)
+    : (spec.tag === 'input' || spec.tag === 'textarea') ? new FakeField(spec)
+    : new FakeElement(spec));
+function matchesPart(el, part) {
+  const m = /^([a-z]*)(?:\[([a-z-]+)(?:="([^"]*)")?\])?$/.exec(part.trim());
+  if (!m) throw new Error('unsupported selector: ' + part);
+  const [, tag, attr, value] = m;
+  if (tag && el.tag !== tag) return false;
+  if (attr) {
+    if (!el.attrs.has(attr)) return false;
+    if (value !== undefined && el.getAttribute(attr) !== value) return false;
+  }
+  return true;
+}
+function matches(el, selector) { return selector.split(',').some((part) => matchesPart(el, part)); }
+const textRoot = (t) => ({ innerText: t, textContent: t });
+const main = page.main !== undefined ? textRoot(page.main) : null;
+const document = Object.assign(new FakeEventTarget(), {
+  readyState: 'complete',
+  title: page.title || '',
+  documentElement: {},
+  body: textRoot(page.body || ''),
+  querySelectorAll(selector) { return elements.filter((el) => matches(el, selector)); },
+  querySelector(selector) {
+    if (selector === 'main,[role="main"]') return main;
+    return elements.find((el) => matches(el, selector)) || null;
+  }
+});
+function advance(ms) {
+  const target = now + ms;
+  for (let guard = 0; guard < 100000; guard++) {
+    if (mutated) { mutated = false; for (const o of observers) o.cb([], o); continue; }
+    let next = null;
+    for (const t of timers.values()) {
+      if (t.due <= target && (!next || t.due < next.due || (t.due === next.due && t.id < next.id))) next = t;
+    }
+    if (!next) break;
+    timers.delete(next.id);
+    now = next.due;
+    next.fn();
+  }
+  now = target;
+}
+const sandbox = {
+  document,
+  location: { href: page.url },
+  getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
+  MutationObserver: class { constructor(cb) { this.cb = cb; observers.push(this); } observe() {} disconnect() {} },
+  setTimeout: (fn, ms) => { const id = ++seq; timers.set(id, { id, due: now + (ms || 0), fn }); return id; },
+  clearTimeout: (id) => { timers.delete(id); },
+  Event: FakeEvent,
+  EventTarget: FakeEventTarget,
+  chrome: { webview: { postMessage: (message) => posts.push(String(message)) } }
+};
+sandbox.window = sandbox;
+sandbox.top = sandbox;
+sandbox.addEventListener = FakeEventTarget.prototype.addEventListener;
+sandbox.dispatchEvent = FakeEventTarget.prototype.dispatchEvent;
+vm.createContext(sandbox);
+vm.runInContext(input.observer, sandbox);
+for (const step of input.steps) {
+  if ('advance' in step) advance(step.advance);
+  else vm.runInContext(step.eval, sandbox);
+}
+const state = {};
+for (const el of elements) {
+  if (el.spec.key) state[el.spec.key] = { value: 'value' in el ? String(el.value) : null, clicks: el.clicks, events: el.events };
+}
+process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
+"#;
+
+        struct DomRun {
+            posts: Vec<String>,
+            state: Value,
+        }
+
+        /// Corre o observador que embarca num DOM descrito por `page` e depois
+        /// os `steps` (`{"advance": ms}` ou `{"eval": script}`), por ordem.
+        /// O DOM é determinístico: a mesma página e os mesmos passos dão os
+        /// mesmos ids, e é isso que deixa um teste observar numa corrida e
+        /// executar noutra.
+        fn run_page(page: &Value, steps: &[Value]) -> DomRun {
+            let input = json!({
+                "observer": AGENT_OBSERVER_SCRIPT.replace("__NEURALIA_CAP__", CAP),
+                "page": page,
+                "steps": steps,
+            });
+            let mut child = Command::new("node")
+                .arg("-e")
+                .arg(HARNESS)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("os gates do agente precisam do `node` no PATH (o CI já o usa)");
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(input.to_string().as_bytes())
+                .expect("escrever o cenário");
+            let output = child.wait_with_output().expect("node terminou");
+            assert!(
+                output.status.success(),
+                "harness falhou: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: Value = serde_json::from_slice(&output.stdout).expect("JSON do harness");
+            DomRun {
+                posts: result["posts"]
+                    .as_array()
+                    .expect("posts")
+                    .iter()
+                    .map(|post| post.as_str().expect("post").to_string())
+                    .collect(),
+                state: result["state"].clone(),
+            }
+        }
+
+        /// O caminho nativo de uma mensagem publicada, igual ao do
+        /// `external_webview_builder`: `None` é uma observação que o produto
+        /// deita fora.
+        fn observed(post: &str) -> Option<ObservedPage> {
+            match parse_ipc_message(post, CAP, COMPARATOR_COLUMNS)? {
+                IpcAction::AgentObservation { data } => parse_agent_observation(&data),
+                _ => None,
+            }
+        }
+
+        fn first_observation(page: &Value) -> ObservedPage {
+            let run = run_page(page, &[json!({ "advance": 800 })]);
+            let post = run.posts.first().expect("o observador publicou");
+            observed(post).expect("a observação chegou ao nativo")
+        }
+
+        fn policy_for(origin: &str) -> AgentPermissionPolicy {
+            let mut policy = AgentPermissionPolicy::new(Some(origin.into()));
+            policy.grant_reversible_session_actions(true);
+            policy
+        }
+
+        fn act(
+            commands: &[BrowserAgentCommand],
+            next: usize,
+            page: &ObservedPage,
+            policy: &mut AgentPermissionPolicy,
+        ) -> AgentAct {
+            match decide_agent_step(commands, next, 0, Duration::ZERO, page, policy) {
+                AgentStepDecision::Act(act) => *act,
+                other => panic!("esperava Act para {:?}, veio {other:?}", commands[next]),
+            }
+        }
+
+        #[test]
+        fn approved_action_still_finds_its_element_after_the_dialog() {
+            // O MessageBox de confirmação é modal: o utilizador lê-o durante
+            // segundos. O script aprovado tem de encontrar o mesmo elemento
+            // depois disso, numa página que não mudou.
+            let page = json!({
+                "url": "https://site.example/",
+                "title": "Contacto",
+                "main": "Formulário de contacto",
+                "elements": [
+                    {"key": "send", "tag": "a", "attrs": {"role": "button", "href": "#"}, "text": "Enviar"}
+                ]
+            });
+            let first = first_observation(&page);
+            let mut policy = policy_for("https://site.example");
+            let commands = [BrowserAgentCommand::Click("Enviar".into())];
+            let act = act(&commands, 0, &first, &mut policy);
+            assert!(act.confirmation.is_some(), "Enviar pede um sim: {act:?}");
+            let script = agent_action_script(&act.action).expect("click executável");
+
+            let run = run_page(
+                &page,
+                &[
+                    json!({ "advance": 800 }),
+                    json!({ "advance": 2000 }),
+                    json!({ "eval": script }),
+                ],
+            );
+            assert_eq!(
+                run.posts.len(),
+                1,
+                "página parada não pode ser re-observada com ids novos"
+            );
+            assert_eq!(
+                run.state["send"]["clicks"], 1,
+                "o clique aprovado não chegou ao elemento"
+            );
+        }
+    }
+
     #[test]
     fn agent_termination_reason_is_explicit() {
         assert_eq!(AgentTermination::Completed.as_str(), "completed");
@@ -15018,6 +15299,15 @@ const AGENT_OBSERVER_SCRIPT: &str = r#"
   let generation = 0;
   let lastMaterial = '';
   let timer = 0;
+  // Um id por ELEMENTO, dado uma vez e nunca renomeado. Os ids por geracao
+  // mudavam a cada observacao: o proprio setAttribute disparava o
+  // MutationObserver, a observacao seguinte trazia ids novos e o material
+  // nunca repetia, por isso os ids mudavam a cada ~700 ms. Um clique aprovado
+  // depois de o utilizador ler o dialogo procurava um id que ja nao existia e
+  // nao fazia nada. Um clone copia o atributo mas nao a entrada do mapa, e
+  // recebe um id seu.
+  const agentIds = new WeakMap();
+  let nextAgentId = 0;
 
   function clean(value, limit) {
     return String(value || '').replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
@@ -15048,14 +15338,18 @@ const AGENT_OBSERVER_SCRIPT: &str = r#"
       'input,textarea,select,button,a[href],[role="button"],[role="textbox"],[role="combobox"]'
     );
     const rows = [];
-    let ordinal = 0;
     for (const el of candidates) {
       if (rows.length >= 32) break;
       const rect = el.getBoundingClientRect();
       const css = getComputedStyle(el);
       if (rect.width <= 0 || rect.height <= 0 || css.display === 'none' || css.visibility === 'hidden') continue;
-      const id = 'n' + (generation + 1) + '-' + ordinal++;
-      el.setAttribute('data-neuralia-agent-id', id);
+      let id = agentIds.get(el);
+      if (!id) {
+        nextAgentId += 1;
+        id = 'n' + nextAgentId;
+        agentIds.set(el, id);
+      }
+      if (el.getAttribute('data-neuralia-agent-id') !== id) el.setAttribute('data-neuralia-agent-id', id);
       const name = clean(el.getAttribute('aria-label') || el.name || el.innerText || el.textContent || el.placeholder, 96);
       rows.push([id, fieldRole(el), name, clean(el.tagName, 20), el.disabled ? '0' : '1'].join('\t'));
     }
@@ -15064,14 +15358,6 @@ const AGENT_OBSERVER_SCRIPT: &str = r#"
     if (material === lastMaterial) return;
     lastMaterial = material;
     generation += 1;
-    // IDs carry the generation used by the native stale-element guard.
-    rows.forEach((row, index) => {
-      const oldId = row.split('\t', 1)[0];
-      const newId = 'n' + generation + '-' + index;
-      const el = document.querySelector('[data-neuralia-agent-id="' + oldId + '"]');
-      if (el) el.setAttribute('data-neuralia-agent-id', newId);
-      rows[index] = row.replace(oldId, newId);
-    });
 
     // O envelope nativo aceita no maximo 8 KiB. 1200 unidades UTF-16
     // continuam abaixo desse teto mesmo no pior caso JSON (surrogates
