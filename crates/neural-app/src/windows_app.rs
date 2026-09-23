@@ -5249,11 +5249,11 @@ impl App {
         self.open_external(url.as_str());
     }
 
-    /// "Pesquisar" da barra de selecao. Vai direto ao `compare`: o texto
-    /// selecionado numa pagina e uma pergunta, nunca um comando da omnibox
-    /// (ver `selection_search_question`).
+    /// "Pesquisar" da barra de selecao. A decisao e a de `selection_search`
+    /// (pura, testada); aqui so se executa: o texto selecionado numa pagina
+    /// e uma pergunta para as tres IAs, nunca um comando da omnibox.
     fn search_selection(&mut self, text: &str) {
-        if let Some(question) = selection_search_question(text) {
+        if let Some(SelectionSearch::Compare(question)) = selection_search(text) {
             self.compare(question);
         }
     }
@@ -5452,11 +5452,7 @@ impl App {
         let ipc_proxy = self.proxy.clone();
         let capability = remote_capability();
         let ipc_capability = capability.clone();
-        let init_script = bind_page_script(
-            &format!("{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}"),
-            &capability,
-            false,
-        );
+        let init_script = Self::reader_init_script(&capability);
 
         themed_webview_builder()
             .with_initialization_script(init_script)
@@ -5507,6 +5503,16 @@ impl App {
             .with_focused(true)
     }
 
+    /// O script do Reader, tal como `reader_webview_builder` o injeta: o mapa
+    /// de teclas (com a barra de selecao) e o rail de rolagem semantico.
+    fn reader_init_script(capability: &str) -> String {
+        bind_page_script(
+            &format!("{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}"),
+            capability,
+            false,
+        )
+    }
+
     fn external_webview_builder(
         &self,
         local_origin: Option<String>,
@@ -5517,16 +5523,7 @@ impl App {
         let nav_origin = local_origin.clone();
         let capability = remote_capability();
         let ipc_capability = capability.clone();
-        let agent_script = if agent_enabled {
-            AGENT_OBSERVER_SCRIPT
-        } else {
-            ""
-        };
-        let init_script = bind_page_script(
-            &format!("{NEURALIA_KEYMAP_SCRIPT}\n{EXTERNAL_RETURN_BUTTON}\n{agent_script}"),
-            &capability,
-            false,
-        );
+        let init_script = external_init_script(&capability, agent_enabled);
 
         themed_webview_builder()
             .with_initialization_script(init_script)
@@ -6372,12 +6369,8 @@ impl App {
         // auto-submit, por exemplo, que lanca com armazenamento particionado --
         // deixa de levar atras o COMPARATOR_INJECT_SCRIPT, e com ele os
         // cliques nos links e os controlos da coluna.
-        let prelude = format!(
-            "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';"
-        );
-        let keymap = bind_page_script(NEURALIA_KEYMAP_SCRIPT, &capability, false);
-        let auto_submit = AI_AUTO_SUBMIT_SCRIPT.replace("__NEURALIA_CAP__", &capability);
-        let inject = COMPARATOR_INJECT_SCRIPT.replace("__NEURALIA_CAP__", &capability);
+        let [prelude, keymap, auto_submit, inject] =
+            comparator_init_scripts(col_index, col_name, &capability);
 
         themed_webview_builder()
             .with_initialization_script(prelude)
@@ -6532,10 +6525,11 @@ impl App {
         let new_window_proxy = self.proxy.clone();
         let capability = remote_capability();
         let ipc_capability = capability.clone();
-        let init_script = split_init_script(source_index, source_name, &capability, private);
+        let SplitPage { init_script, ipc } =
+            split_page(source_index, source_name, &capability, private);
 
         themed_webview_builder()
-            .with_incognito(private)
+            .with_incognito(ipc.private)
             .with_initialization_script(init_script)
             .with_ipc_handler(move |request| {
                 let Some(action) =
@@ -6543,8 +6537,7 @@ impl App {
                 else {
                     return;
                 };
-                let event = Self::split_ipc_event_impl(source_index, private, action);
-                if let Some(event) = event {
+                if let Some(event) = ipc.event(action) {
                     let _ = ipc_proxy.send_event(event);
                 }
             })
@@ -6560,7 +6553,7 @@ impl App {
             })
             .with_new_window_req_handler(move |target, _features| {
                 if remote_web_target(&target, None) {
-                    let event = if private {
+                    let event = if ipc.private {
                         UserEvent::OpenPrivateSplit {
                             source_index,
                             url: target,
@@ -10863,17 +10856,23 @@ fn external_ipc_event(action: IpcAction, agent_enabled: bool) -> Option<UserEven
     }
 }
 
-/// A pergunta que o "Pesquisar" da barra de selecao leva ao comparador.
-///
-/// E o texto selecionado, aparado, e mais nada: nao passa pelo
-/// `route_input` nem pelo `parse_intent`. Quem seleciona "agent:https://x"
-/// ou "tema:escuro" numa pagina quer saber o que aquilo e, nao correr um
-/// agente nem mudar o tema -- e a pagina, que escolhe o texto, nunca pode
-/// dar ordens ao navegador por esta via.
-fn selection_search_question(text: &str) -> Option<String> {
+/// O que o "Pesquisar" da barra de selecao faz com o texto. Ha uma so
+/// saida: a comparacao normal das tres IAs com o texto como pergunta.
+#[derive(Debug, PartialEq)]
+enum SelectionSearch {
+    Compare(String),
+}
+
+/// A decisao do "Pesquisar": o texto selecionado, aparado, e mais nada. Nao
+/// passa pelo `route_input`, pelo `parse_intent` nem pela palette. Quem
+/// seleciona "agent:https://x", "tema:escuro" ou um endereco numa pagina
+/// quer saber o que aquilo e, nao correr um agente, mudar o tema ou navegar
+/// -- e a pagina, que escolhe o texto, nunca pode dar ordens ao navegador
+/// por esta via.
+fn selection_search(text: &str) -> Option<SelectionSearch> {
     let question = text.trim();
     (!question.is_empty() && question.chars().count() <= SEARCH_MAX_CHARS)
-        .then(|| question.to_string())
+        .then(|| SelectionSearch::Compare(question.to_string()))
 }
 
 /// O mapa de teclas (e a barra de selecao que vive nele) com a capability e
@@ -10886,20 +10885,72 @@ fn bind_page_script(script: &str, capability: &str, private: bool) -> String {
     )
 }
 
-/// Scripts de inicializacao do painel Split, tal como o builder os injeta.
-fn split_init_script(
+/// Os scripts de uma coluna do comparador, pela ordem em que
+/// `comparator_webview_builder` os injeta (um por chamada).
+fn comparator_init_scripts(col_index: usize, col_name: &str, capability: &str) -> [String; 4] {
+    [
+        format!(
+            "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';"
+        ),
+        bind_page_script(NEURALIA_KEYMAP_SCRIPT, capability, false),
+        AI_AUTO_SUBMIT_SCRIPT.replace("__NEURALIA_CAP__", capability),
+        COMPARATOR_INJECT_SCRIPT.replace("__NEURALIA_CAP__", capability),
+    ]
+}
+
+/// O script da Web externa, tal como `external_webview_builder` o injeta.
+fn external_init_script(capability: &str, agent_enabled: bool) -> String {
+    let agent_script = if agent_enabled {
+        AGENT_OBSERVER_SCRIPT
+    } else {
+        ""
+    };
+    bind_page_script(
+        &format!("{NEURALIA_KEYMAP_SCRIPT}\n{EXTERNAL_RETURN_BUTTON}\n{agent_script}"),
+        capability,
+        false,
+    )
+}
+
+/// O painel Split como o builder o monta. O script injetado, o mapa IPC e o
+/// perfil anonimo saem TODOS do mesmo `private`: o builder recebe-o uma vez
+/// e nao o volta a decidir em cada sitio.
+struct SplitPage {
+    init_script: String,
+    ipc: SplitIpc,
+}
+
+#[derive(Clone, Copy)]
+struct SplitIpc {
+    source_index: usize,
+    private: bool,
+}
+
+impl SplitIpc {
+    fn event(self, action: IpcAction) -> Option<UserEvent> {
+        App::split_ipc_event_impl(self.source_index, self.private, action)
+    }
+}
+
+fn split_page(
     source_index: usize,
     source_name: &str,
     capability: &str,
     private: bool,
-) -> String {
-    bind_page_script(
-        &format!(
-            "window.__neuralia_col_index = {source_index}; window.__neuralia_col_name = '{source_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}"
+) -> SplitPage {
+    SplitPage {
+        init_script: bind_page_script(
+            &format!(
+                "window.__neuralia_col_index = {source_index}; window.__neuralia_col_name = '{source_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}"
+            ),
+            capability,
+            private,
         ),
-        capability,
-        private,
-    )
+        ipc: SplitIpc {
+            source_index,
+            private,
+        },
+    }
 }
 /// Para onde vai o que o utilizador escreveu na palette. Puro, para se poder
 /// testar sem janela: e aqui que se decide que um painel privado nunca
@@ -16267,8 +16318,12 @@ __fire('submit', at(login));
 const vm = require('node:vm');
 const MOCK = `
 var __stolen = [], __posted = [], __errors = [], __listeners = [], __timers = [], __observers = [], __created = [];
+// O mock usa as suas copias: uma "pagina" que troca String ou
+// String.prototype nao lhe muda o que regista.
+const __String = String;
+const __upperCase = Function.prototype.call.bind(String.prototype.toUpperCase);
 class EventTarget {
-  addEventListener(type, handler) { __listeners.push({ target: this, type: String(type), handler }); }
+  addEventListener(type, handler) { __listeners.push({ target: this, type: __String(type), handler }); }
   removeEventListener() {}
   dispatchEvent() { return true; }
 }
@@ -16280,7 +16335,7 @@ class Node extends EventTarget {
 class Element extends Node {
   constructor(tag) {
     super();
-    this.tagName = String(tag || 'div').toUpperCase();
+    this.tagName = __upperCase(__String(tag || 'div'));
     this.style = {}; this.dataset = {}; this.attrs = {}; this.children = [];
     this.classList = { add() {}, remove() {}, toggle() {}, contains() { return false; } };
     this.textContent = ''; this.innerText = 'x'.repeat(40); this.value = '';
@@ -16303,8 +16358,8 @@ class Document extends Node {
     this.documentElement = new Element('html'); this.body = new Element('body'); this.head = new Element('head');
   }
   getElementById() { return null; }
-  createElement(tag) { __created.push(String(tag)); return new Element(tag); }
-  createTextNode(text) { return { textContent: String(text) }; }
+  createElement(tag) { __created.push(__String(tag)); return new Element(tag); }
+  createTextNode(text) { return { textContent: __String(text) }; }
   querySelector() { return null; }
   querySelectorAll() { return []; }
 }
@@ -16313,7 +16368,7 @@ var window = new EventTarget();
 window.top = window;
 window.location = location;
 window.history = { back() {}, forward() {} };
-window.chrome = { webview: { postMessage(message) { __posted.push(String(message)); } } };
+window.chrome = { webview: { postMessage(message) { __posted.push(__String(message)); } } };
 window.__neuralia_col_index = 0;
 window.__neuralia_col_name = 'IA';
 function __timer(fn) { const t = { fn, done: false }; __timers.push(t); return __timers.length; }
@@ -16388,7 +16443,11 @@ for (const c of INPUT.cases) {
   // `pre`: o resto do "navegador" que um caso precisa, antes do script.
   if (c.pre) vm.runInContext(c.pre, context);
   if (c.child) vm.runInContext('window.top = {};', context);
-  vm.runInContext(c.script, context, { filename: c.name });
+  // `scripts`: varios scripts de inicializacao, cada um na sua avaliacao,
+  // como o WebView2 os corre quando o builder os injeta um a um.
+  for (const script of c.scripts || [c.script]) {
+    vm.runInContext(script, context, { filename: c.name });
+  }
   vm.runInContext(PAGE, context);
   vm.runInContext(HELPERS, context);
   if (c.steps) {
@@ -16526,25 +16585,97 @@ __fire('keydown', { key: 'F8' });
 
     /// O resto do "navegador" que a barra de selecao usa, sobre o DOM minimo
     /// do harness: arvore com pais, `closest`, shadow root, Selection/Range,
-    /// clipboard, `execCommand` e `speechSynthesis`. Corre antes do script,
-    /// como o navegador que ele encontra no document-created; os `__` sao
-    /// os gestos do utilizador e as leituras do teste.
+    /// eventos com acessores no prototipo, estilo calculado, relogio,
+    /// IntersectionObserver v2, clipboard, `execCommand` e `speechSynthesis`.
+    /// Corre antes do script, como o navegador que ele encontra no
+    /// document-created; os `__` sao os gestos do utilizador e as leituras
+    /// do teste.
     const SELECTION_DOM: &str = r##"
-var __log = [], __clipboard = [], __exec = [], __spoken = [], __shadows = [], __prevented = [];
-var __cancels = 0, __clipboardFails = false, __voices = [];
+var __log = [], __clipboard = [], __exec = [], __spoken = [], __shadows = [], __prevented = [], __leaks = [];
+var __cancels = 0, __clipboardFails = false, __voices = [], __covered = false;
+// As copias do teste: a "pagina" pode trocar JSON, String e String.prototype.
 const __json = JSON.stringify;
+const __S = String;
+const __trim = Function.prototype.call.bind(String.prototype.trim);
+const __split = Function.prototype.call.bind(String.prototype.split);
+const __upper = Function.prototype.call.bind(String.prototype.toUpperCase);
+// O relogio da pagina so anda quando o teste manda.
+var __now = 1000000;
+Date.now = function () { return __now; };
+function __wait(ms) { __now += ms; }
 class CSSStyleDeclaration {
   setProperty(name, value, priority) {
-    this[String(name)] = String(value);
-    this['!' + String(name)] = String(priority || '');
+    this[__S(name)] = __S(value);
+    this['!' + __S(name)] = __S(priority || '');
+  }
+  getPropertyValue(name) {
+    const value = this[__S(name)];
+    return typeof value === 'string' ? value : '';
   }
 }
-class CSSStyleSheet { replaceSync(css) { this.css = String(css); } }
+// Estilo calculado: o inline do elemento por cima da folha da "pagina".
+var __pageCss = new Map();
+const __computedDefaults = {
+  opacity: '1', visibility: 'visible', display: 'block', transform: 'none',
+  filter: 'none', 'clip-path': 'none', 'mix-blend-mode': 'normal'
+};
+var getComputedStyle = function (el) {
+  const out = new CSSStyleDeclaration();
+  const sheet = __pageCss.get(el) || {};
+  for (const name of Object.keys(__computedDefaults)) {
+    const inline = el && el.style ? el.style[name] : undefined;
+    out[name] = typeof inline === 'string' ? inline
+      : typeof sheet[name] === 'string' ? sheet[name] : __computedDefaults[name];
+  }
+  return out;
+};
+class CSSStyleSheet { replaceSync(css) { this.css = __S(css); } }
 class ShadowRoot extends Node {
-  constructor(host, mode) { super(); this.host = host; this.mode = mode; this.adoptedStyleSheets = []; }
+  constructor(host, mode) { super(); this.host = host; this.mode = mode; this.__sheets = []; }
+  get adoptedStyleSheets() { return this.__sheets; }
+  set adoptedStyleSheets(value) { this.__sheets = value; }
 }
 class Text extends Node {
-  constructor(data) { super(); this.data = String(data); }
+  constructor(data) { super(); this.data = __S(data); }
+}
+// Eventos com os acessores no prototipo, como no navegador. `where` marca
+// quem cancelou um mousedown.
+class Event {
+  constructor(type, fields) { this.__f = fields; this.isTrusted = fields.isTrusted !== false; this.__canceled = false; }
+  get type() { return this.__f.type; }
+  get target() { return this.__f.target; }
+  get defaultPrevented() { return this.__canceled; }
+  preventDefault() { this.__canceled = true; if (this.__f.where) __prevented.push(this.__f.where); }
+  stopPropagation() {}
+  stopImmediatePropagation() {}
+  composedPath() { return [this.__f.target]; }
+}
+class UIEvent extends Event { get detail() { return this.__f.detail; } }
+class MouseEvent extends UIEvent {
+  get button() { return this.__f.button; }
+  get clientX() { return this.__f.clientX; }
+  get clientY() { return this.__f.clientY; }
+  get shiftKey() { return this.__f.shiftKey; }
+  get ctrlKey() { return this.__f.ctrlKey; }
+  get metaKey() { return this.__f.metaKey; }
+  get altKey() { return this.__f.altKey; }
+}
+class KeyboardEvent extends UIEvent {
+  get key() { return this.__f.key; }
+  get shiftKey() { return this.__f.shiftKey; }
+  get ctrlKey() { return this.__f.ctrlKey; }
+  get metaKey() { return this.__f.metaKey; }
+  get altKey() { return this.__f.altKey; }
+  get isComposing() { return false; }
+}
+function __selEvent(type, extra) {
+  const fields = Object.assign({
+    type: type, isTrusted: true, button: 0, detail: 1, clientX: 0, clientY: 0, key: '',
+    ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, target: document.body
+  }, extra || {});
+  const Kind = /^(mouse|click|dblclick|auxclick)/.test(type) ? MouseEvent
+    : /^key/.test(type) ? KeyboardEvent : Event;
+  return new Kind(type, fields);
 }
 Object.defineProperty(Node.prototype, 'nodeType', {
   configurable: true,
@@ -16553,7 +16684,7 @@ Object.defineProperty(Node.prototype, 'nodeType', {
 Object.defineProperty(Node.prototype, 'textContent', {
   configurable: true,
   get() { return this instanceof Text ? this.data : (this.__text || ''); },
-  set(value) { this.__text = String(value); }
+  set(value) { this.__text = __S(value); }
 });
 const __textOf = Object.getOwnPropertyDescriptor(Node.prototype, 'textContent').get;
 Node.prototype.appendChild = function (child) {
@@ -16583,16 +16714,18 @@ Object.defineProperty(Node.prototype, 'isConnected', {
   }
 });
 function __matchOne(el, selector) {
-  const s = String(selector).trim();
+  const s = __trim(__S(selector));
   let m = /^\[([\w-]+)="([^"]*)"\]$/.exec(s);
   if (m) return el.getAttribute(m[1]) === m[2];
+  m = /^([a-z]+)\[([\w-]+)\]$/i.exec(s);
+  if (m) return el.tagName === __upper(m[1]) && el.hasAttribute(m[2]);
   m = /^#([\w-]+)$/.exec(s);
   if (m) return el.id === m[1] || el.getAttribute('id') === m[1];
-  if (/^[a-z]+$/i.test(s)) return el.tagName === s.toUpperCase();
+  if (/^[a-z]+$/i.test(s)) return el.tagName === __upper(s);
   throw new Error('seletor fora do mock: ' + s);
 }
 Element.prototype.matches = function (selector) {
-  return String(selector).split(',').some((part) => __matchOne(this, part));
+  return __split(__S(selector), ',').some((part) => __matchOne(this, part));
 };
 Element.prototype.closest = function (selector) {
   for (let node = this; node instanceof Element; node = node.parentNode) {
@@ -16618,13 +16751,15 @@ Element.prototype.attachShadow = function (init) {
   if (init && init.mode === 'open') this.shadowRoot = root;
   return root;
 };
-// A barra mede 300x42 quando esta a vista; escondida nao tem caixa.
+// A barra mede 300x42 quando esta a vista, onde o estilo inline a pos;
+// escondida nao tem caixa.
 const __box = Element.prototype.getBoundingClientRect;
 Element.prototype.getBoundingClientRect = function () {
   if (!this.__shadow) return __box.call(this);
   const on = this.style.display !== 'none';
   const w = on ? 300 : 0, h = on ? 42 : 0;
-  return { x: 0, y: 0, top: 0, left: 0, right: w, bottom: h, width: w, height: h };
+  const top = parseFloat(this.style.top) || 0, left = parseFloat(this.style.left) || 0;
+  return { x: left, y: top, top: top, left: left, right: left + w, bottom: top + h, width: w, height: h };
 };
 const __makeElement = Document.prototype.createElement;
 Document.prototype.createElement = function (tag) {
@@ -16673,14 +16808,14 @@ window.getSelection = function () { return __selection; };
 
 class Clipboard {
   writeText(text) {
-    __clipboard.push(String(text));
+    __clipboard.push(__S(text));
     return __clipboardFails ? Promise.reject(new Error('negado')) : Promise.resolve();
   }
 }
 var navigator = { language: 'en-US', clipboard: new Clipboard() };
-Document.prototype.execCommand = function (command) { __exec.push(String(command)); return true; };
+Document.prototype.execCommand = function (command) { __exec.push(__S(command)); return true; };
 class SpeechSynthesisUtterance extends EventTarget {
-  constructor(text) { super(); this.text = String(text); this.voice = null; this.lang = ''; }
+  constructor(text) { super(); this.text = __S(text); this.voice = null; this.lang = ''; }
 }
 class SpeechSynthesis extends EventTarget {
   speak(utterance) { __spoken.push(utterance); }
@@ -16694,6 +16829,38 @@ var __MARIA = { name: 'Maria', lang: 'pt-BR', localService: true, default: false
 var __ZIRA = { name: 'Zira', lang: 'en-US', localService: true, default: true };
 var __HELENA = { name: 'Helena', lang: 'es-ES', localService: true, default: false };
 
+// IntersectionObserver v2: `isVisible` so e verdade com a barra na arvore,
+// a mostra e sem nada da pagina por cima (`__covered`).
+var __watchers = [];
+class IntersectionObserverEntry {
+  constructor(target, visible) { this.__target = target; this.__visible = visible; }
+  get isVisible() { return this.__visible; }
+  get target() { return this.__target; }
+}
+class IntersectionObserver {
+  constructor(callback, options) {
+    if (!options || options.trackVisibility !== true || !(options.delay >= 100)) {
+      throw new Error('v2 pede trackVisibility e delay >= 100');
+    }
+    this.callback = callback;
+    this.targets = [];
+    __watchers.push(this);
+  }
+  observe(target) { this.targets.push(target); }
+  unobserve() {}
+  disconnect() {}
+}
+function __seen() {
+  for (const w of __watchers) {
+    for (const t of w.targets) {
+      const on = !!t.isConnected && t.style.display === 'block' && !__covered;
+      w.callback([new IntersectionObserverEntry(t, on)], w);
+    }
+  }
+}
+// O observador entrega o que ve e o utilizador leva o rato ate a barra.
+function __settle(ms) { __seen(); __wait(ms === undefined ? 600 : ms); }
+
 function __el(tag, attrs, parent) {
   const el = document.createElement(tag);
   for (const key of Object.keys(attrs || {})) el.setAttribute(key, attrs[key]);
@@ -16706,8 +16873,8 @@ var __line = { top: 300, bottom: 320, left: 100, right: 400, width: 300, height:
 function __select(text, node, extra) {
   const at = node || __para;
   Object.assign(__sel, {
-    text: String(text), anchor: at, focus: at, common: at,
-    collapsed: String(text) === '', rects: [__line]
+    text: __S(text), anchor: at, focus: at, common: at,
+    collapsed: __S(text) === '', rects: [__line]
   }, extra || {});
 }
 function __unselect() { Object.assign(__sel, { text: '', collapsed: true, rects: [] }); }
@@ -16717,16 +16884,35 @@ function __on(target, type, extra) {
     if (l.target !== target || l.type !== type) continue;
     try {
       const h = l.handler;
-      (typeof h === 'function' ? h : h.handleEvent).call(target, __event(type, extra));
+      (typeof h === 'function' ? h : h.handleEvent).call(target, __selEvent(type, extra));
     } catch (e) { __errors.push(type + ': ' + e.message); }
   }
 }
-function __up(extra) { __on(window, 'mouseup', Object.assign({ target: document.body }, extra)); }
-function __show(text, node, extra) { __select(text, node, extra); __up(); __drain(); }
+// Um arrasto do rato sobre o texto.
+function __up(extra) {
+  __on(window, 'mousedown', Object.assign({ target: document.body, clientX: 100, clientY: 300 }, extra));
+  __on(window, 'mouseup', Object.assign({ target: document.body, clientX: 160, clientY: 300 }, extra));
+}
+// Um clique sem arrasto (`detail` 2 e o segundo de um duplo clique).
+function __click(extra) {
+  __on(window, 'mousedown', Object.assign({ target: document.body, clientX: 100, clientY: 300 }, extra));
+  __on(window, 'mouseup', Object.assign({ target: document.body, clientX: 100, clientY: 300 }, extra));
+}
+// Uma tecla premida e solta, como o navegador a entrega.
+function __tecla(key, extra) {
+  const fields = Object.assign({ key: key }, extra);
+  __on(window, 'keydown', fields);
+  __on(document, 'keydown', fields);
+  __on(window, 'keyup', fields);
+}
+function __show(text, node, extra) { __select(text, node, extra); __up(); __wait(200); __drain(); __settle(); }
 function __root() { return __shadows[__shadows.length - 1] || null; }
-function __kids() {
+function __bar() {
   const root = __root();
-  const bar = root && (root.childNodes || []).find((n) => n.getAttribute && n.getAttribute('class') === 'bar');
+  return root && (root.childNodes || []).find((n) => n.getAttribute && n.getAttribute('role') === 'toolbar') || null;
+}
+function __kids() {
+  const bar = __bar();
   return bar ? bar.childNodes || [] : [];
 }
 function __button(action) {
@@ -16737,9 +16923,8 @@ function __press(action, extra) {
   const host = __root().host;
   const b = __button(action);
   if (!b) throw new Error('sem o botao ' + action);
-  const mark = (where) => ({ preventDefault() { __prevented.push(where); } });
-  __on(window, 'mousedown', Object.assign({ target: host }, mark('window'), extra));
-  __on(b, 'mousedown', Object.assign({ target: b }, mark('botao'), extra));
+  __on(window, 'mousedown', Object.assign({ target: host, where: 'window' }, extra));
+  __on(b, 'mousedown', Object.assign({ target: b, where: 'botao' }, extra));
   __on(window, 'mouseup', Object.assign({ target: host }, extra));
   __on(b, 'click', Object.assign({ target: b }, extra));
 }
@@ -16748,14 +16933,16 @@ function __voicesChanged() { __on(window.speechSynthesis, 'voiceschanged'); }
 function __state(tag) {
   const root = __root();
   const host = root ? root.host : null;
+  const bar = __bar();
   const kids = __kids();
   const buttons = kids.filter((n) => n.tagName === 'BUTTON');
   const note = kids.find((n) => n.getAttribute && n.getAttribute('role') === 'status');
   __log.push(__json({
     tag: tag,
     shown: !!host && host.style.display === 'block' && host.isConnected,
+    solo: !!bar && bar.getAttribute('class') === 'bar solo',
     mode: root ? root.mode : null,
-    sheets: root ? root.adoptedStyleSheets.length : 0,
+    sheets: root ? root.__sheets.length : 0,
     position: host ? host.style.position || '' : '',
     zIndex: host ? host.style['z-index'] || '' : '',
     top: host ? parseFloat(host.style.top) : null,
@@ -16769,6 +16956,7 @@ function __state(tag) {
     spoken: __spoken.map((u) => ({ text: u.text, voice: u.voice ? u.voice.name : null, lang: u.lang })),
     cancels: __cancels,
     prevented: __prevented.slice(),
+    leaks: __leaks.slice(),
     posted: __posted.length
   }));
 }
@@ -16843,6 +17031,16 @@ function __state(tag) {
             .collect()
     }
 
+    fn selection_searches(result: &serde_json::Value) -> Vec<String> {
+        selection_posted(result)
+            .into_iter()
+            .filter_map(|action| match action {
+                IpcAction::Search { text } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn the_selection_toolbar_offers_three_actions_for_a_trusted_selection() {
         // O mapa de teclas QUE EMBARCA, com a capability e o sinal privado
@@ -16864,16 +17062,18 @@ __on(document, 'keydown', { key: 'Escape' });
 "#;
         let keyboard = r#"
 __select('Por teclado.');
-__on(window, 'keyup', { key: 'x' });
+__tecla('x');
 __state('tecla-x');
+__on(window, 'keydown', { key: 'ArrowRight', shiftKey: true, isTrusted: false });
 __on(window, 'keyup', { key: 'ArrowRight', shiftKey: true, isTrusted: false });
 __state('tecla-sintetica');
-__on(window, 'keyup', { key: 'ArrowRight', shiftKey: true });
+__tecla('ArrowRight', { shiftKey: true });
 __drain();
 __state('shift-seta');
 __on(window, 'mousedown', { target: document.body });
 __state('clique-fora');
-__on(window, 'keyup', { key: 'a', ctrlKey: true });
+__on(window, 'keydown', { key: 'Control', ctrlKey: true });
+__tecla('a', { ctrlKey: true });
 __drain();
 __state('ctrl-a');
 "#;
@@ -16920,6 +17120,40 @@ __prevented.length = 0;
 __press('copy');
 __state('depois-de-premir');
 "#;
+        // Depois do Esc (ou de rolar), so um gesto que muda a selecao a traz
+        // de volta: setas, PgDn, End ou soltar o Ctrl de um Ctrl+C nao.
+        let sticks = r#"
+__show('Texto.');
+__tecla('Escape');
+__state('esc');
+__tecla('ArrowDown');
+__drain();
+__state('seta-depois-do-esc');
+__on(window, 'keydown', { key: 'Control', ctrlKey: true });
+__tecla('c', { ctrlKey: true });
+__on(window, 'keyup', { key: 'Control' });
+__drain();
+__state('ctrl-depois-do-esc');
+__tecla('End');
+__drain();
+__state('end-depois-do-esc');
+__show('Texto.');
+__on(window, 'scroll');
+__state('rolou');
+__tecla('PageDown');
+__drain();
+__state('pagedown-depois-de-rolar');
+__on(window, 'keydown', { key: 'Shift', shiftKey: true });
+__on(window, 'keydown', { key: 'ArrowDown', shiftKey: true });
+__on(window, 'keyup', { key: 'Shift' });
+__on(window, 'keyup', { key: 'ArrowDown' });
+__drain();
+__state('shift-solto-antes-da-seta');
+__select('Texto.', __para, { rects: [{ top: -390, bottom: -370, left: 100, right: 400, width: 300, height: 20 }] });
+__tecla('PageDown', { shiftKey: true });
+__drain();
+__state('fora-de-vista');
+"#;
         let positions = r#"
 function __at(tag, rects) {
   __on(window, 'mousedown', { target: document.body });
@@ -16935,6 +17169,11 @@ __at('duas-linhas', [
   { top: 130, bottom: 150, left: 0, right: 200, width: 200, height: 20 },
   { top: 150, bottom: 150, left: 200, right: 200, width: 0, height: 0 }
 ]);
+__at('tres-linhas', [
+  { top: 300, bottom: 320, left: 100, right: 900, width: 800, height: 20 },
+  { top: 324, bottom: 344, left: 0, right: 900, width: 900, height: 20 },
+  { top: 348, bottom: 368, left: 0, right: 400, width: 400, height: 20 }
+]);
 "#;
         let framed = r#"
 __show('Texto num iframe.');
@@ -16946,6 +17185,7 @@ __state('quadro');
             selection_case("aparece", &script, "", &[appears, keyboard, hides, refuses]),
             selection_case("posicao", &script, "", &[positions]),
             child,
+            selection_case("esc-fica", &script, "", &[sticks]),
         ]);
 
         let states = selection_states(&results[0]);
@@ -17026,14 +17266,15 @@ __state('quadro');
         assert_eq!(pressed["prevented"], serde_json::json!(["window", "botao"]));
 
         // Perto do fim da selecao, dentro da area visivel (990x700 sem a
-        // barra de rolagem), por cima quando cabe.
+        // barra de rolagem), por cima da selecao inteira quando cabe.
         let positions = selection_states(&results[1]);
         for (tag, top, left) in [
             ("meio", 250.0, 250.0),
             ("canto-sup-dir", 48.0, 682.0),
             ("canto-inf-esq", 620.0, 8.0),
             ("alta", 650.0, 350.0),
-            ("duas-linhas", 80.0, 50.0),
+            ("duas-linhas", 50.0, 50.0),
+            ("tres-linhas", 250.0, 250.0),
         ] {
             let placed = &positions[tag];
             assert_eq!(placed["shown"], true, "{tag}");
@@ -17047,11 +17288,45 @@ __state('quadro');
             );
             assert_eq!((y, x), (top, left), "{tag}");
         }
+        // Numa selecao de varias linhas a barra nao tapa nenhuma delas.
+        for (tag, lines) in [
+            ("duas-linhas", &[(100.0, 120.0), (130.0, 150.0)][..]),
+            ("tres-linhas", &[(300.0, 320.0), (324.0, 344.0), (348.0, 368.0)][..]),
+        ] {
+            let y = positions[tag]["top"].as_f64().expect("top");
+            for (top, bottom) in lines {
+                assert!(
+                    y + 42.0 <= *top || y >= *bottom,
+                    "{tag}: a barra ({y}..{}) tapa a linha {top}..{bottom}",
+                    y + 42.0
+                );
+            }
+        }
 
         // Num iframe a barra nao existe.
         let framed = selection_states(&results[2]);
         assert_eq!(framed["quadro"]["mode"], serde_json::Value::Null);
         assert_eq!(framed["quadro"]["pending"], 0);
+
+        // Fechada com Esc ou por rolar, fica fechada ate um gesto que escolhe
+        // texto; e nunca aponta para uma selecao fora da area visivel.
+        let sticks = selection_states(&results[3]);
+        for tag in [
+            "esc",
+            "seta-depois-do-esc",
+            "ctrl-depois-do-esc",
+            "end-depois-do-esc",
+            "rolou",
+            "pagedown-depois-de-rolar",
+            "fora-de-vista",
+        ] {
+            assert_eq!(sticks[tag]["shown"], false, "{tag}: a barra voltou");
+            assert_eq!(sticks[tag]["pending"], 0, "{tag}: ficou um relogio");
+        }
+        assert_eq!(
+            sticks["shift-solto-antes-da-seta"]["shown"], true,
+            "Shift+seta (com o Shift solto primeiro) escolhe texto"
+        );
     }
 
     #[test]
@@ -17070,7 +17345,8 @@ __show('forjado');
 __press('search', { isTrusted: false });
 __state('sintetico');
 "#;
-        // A pagina, depois de carregar, troca tudo o que a barra usa.
+        // A pagina, depois de carregar, troca tudo o que a barra usa: DOM,
+        // Selection/Range, eventos, Promise, JSON, String e String.prototype.
         let hostile_page = r#"
 Document.prototype.getSelection = function () { return null; };
 window.getSelection = function () { return null; };
@@ -17093,6 +17369,17 @@ Object.defineProperty(Node.prototype, 'textContent', { configurable: true, get()
 Clipboard.prototype.writeText = function () { throw new Error('bloqueado'); };
 Promise.prototype.then = function () { throw new Error('bloqueado'); };
 JSON.stringify = function () { return '"forjado"'; };
+(function () {
+  const S = String;
+  for (const name of ['trim', 'replace', 'split', 'slice', 'charCodeAt', 'toLowerCase',
+                      'toUpperCase', 'indexOf', 'lastIndexOf']) {
+    S.prototype[name] = function () { return 'agent:forjado'; };
+  }
+  S.fromCharCode = function () { return 'agent:forjado'; };
+  String = function () { return 'agent:forjado'; };
+})();
+Math.round = function () { return -5000; };
+Math.abs = function () { return 0; };
 "#;
         let hostile_use = r#"
 __show('  Texto que o utilizador escolheu  ');
@@ -17102,6 +17389,45 @@ __press('copy');
         let hostile_after = r#"
 __state('copiada');
 __press('search');
+"#;
+        // A pagina espia: acessores de Event e o setter da folha adotada que
+        // recebiam um `this` de dentro da shadow root fechada; um `target` e
+        // um `detail` falsos para fazer de um clique um gesto de selecao.
+        let spying_page = r#"
+(function () {
+  const realTarget = Object.getOwnPropertyDescriptor(Event.prototype, 'target').get;
+  function inside(node) {
+    for (let n = node; n; n = n.parentNode) { if (n instanceof ShadowRoot) return true; }
+    return false;
+  }
+  for (const name of ['preventDefault', 'stopPropagation', 'stopImmediatePropagation']) {
+    const original = Event.prototype[name];
+    Event.prototype[name] = function () {
+      if (inside(realTarget.call(this))) __leaks.push(name);
+      return original.call(this);
+    };
+  }
+  Object.defineProperty(ShadowRoot.prototype, 'adoptedStyleSheets', {
+    configurable: true,
+    get() { __leaks.push('adoptedStyleSheets'); return []; },
+    set(value) { __leaks.push('adoptedStyleSheets'); }
+  });
+  Object.defineProperty(Event.prototype, 'target', { configurable: true, get() { return document.body; } });
+  Object.defineProperty(UIEvent.prototype, 'detail', { configurable: true, get() { return 2; } });
+})();
+"#;
+        let spied = r#"
+__select('agent:https://example.com | click=Comprar');
+__click();
+__drain();
+__state('detail-falso');
+__show('Texto espiado');
+__state('espiada');
+__press('copy');
+"#;
+        let spied_after = r#"
+__press('search');
+__state('pesquisada');
 "#;
         let offered = r#"
 __show('Texto do painel.');
@@ -17115,16 +17441,17 @@ __state('barra');
                 "",
                 &[hostile_page, hostile_use, hostile_after],
             ),
-            // O Split tal como `split_webview_builder` o injeta.
+            selection_case("pagina-espia", &page, "", &[spying_page, spied, spied_after]),
+            // O Split tal como `split_webview_builder` o monta.
             selection_case(
                 "split-privado",
-                &split_init_script(1, "ChatGPT", SELECTION_CAP, true),
+                &split_page(1, "ChatGPT", SELECTION_CAP, true).init_script,
                 "",
                 &[offered],
             ),
             selection_case(
                 "split",
-                &split_init_script(1, "ChatGPT", SELECTION_CAP, false),
+                &split_page(1, "ChatGPT", SELECTION_CAP, false).init_script,
                 "",
                 &[offered],
             ),
@@ -17160,8 +17487,9 @@ __state('barra');
         // Um clique sintetico nao pesquisa.
         assert_eq!(states["sintetico"]["posted"], 2);
 
-        // Com as primitivas trocadas pela pagina, a barra continua a ler a
-        // selecao verdadeira e a mandar o texto certo.
+        // Com as primitivas trocadas pela pagina -- String e String.prototype
+        // incluidos --, a barra continua a ler a selecao verdadeira e a mandar
+        // e copiar o texto certo.
         let hostile = selection_states(&results[1]);
         assert_eq!(hostile["robusta"]["shown"], true);
         assert_eq!(
@@ -17180,19 +17508,152 @@ __state('barra');
             }]
         );
 
+        // A pagina que espia nunca recebe um no de dentro da barra, e um
+        // `detail` falso nao faz de um clique um gesto.
+        let spied = selection_states(&results[2]);
+        assert_eq!(spied["detail-falso"]["shown"], false);
+        assert_eq!(spied["espiada"]["shown"], true);
+        assert_eq!(spied["espiada"]["sheets"], 1);
+        assert_eq!(spied["pesquisada"]["leaks"], serde_json::json!([]));
+        assert_eq!(
+            spied["pesquisada"]["prevented"],
+            serde_json::json!(["window", "botao", "window", "botao"])
+        );
+        assert_eq!(selection_searches(&results[2]), vec!["Texto espiado"]);
+
         // Painel privado: sem Pesquisar. Painel normal: os tres.
-        let private = selection_states(&results[2]);
+        let private = selection_states(&results[3]);
         assert_eq!(private["barra"]["shown"], true);
         assert_eq!(
             private["barra"]["buttons"],
             serde_json::json!(["📋 Copiar", "🔊 Falar"])
         );
-        assert!(selection_posted(&results[2]).is_empty());
-        let normal = selection_states(&results[3]);
+        assert!(selection_posted(&results[3]).is_empty());
+        let normal = selection_states(&results[4]);
         assert_eq!(
             normal["barra"]["buttons"],
             serde_json::json!(["🔎 Pesquisar", "📋 Copiar", "🔊 Falar"])
         );
+    }
+
+    #[test]
+    fn pesquisar_only_counts_a_click_on_a_bar_the_user_really_saw() {
+        // Pesquisar leva texto da pagina as tres IAs, a memoria e ao
+        // historico. So conta um clique numa barra que o utilizador viu: a
+        // vista ha 500 ms, onde foi posta, sem a pagina por cima nem a mexer
+        // no estilo dela; e so para uma selecao feita pelo gesto dele.
+        let page = bind_page_script(NEURALIA_KEYMAP_SCRIPT, SELECTION_CAP, false);
+        let early = r#"
+__select('Pergunta do utilizador.');
+__up();
+__wait(200);
+__drain();
+__seen();
+__wait(100);
+__press('search');
+__state('cedo');
+__wait(600);
+__press('search');
+__state('depois');
+"#;
+        // Uma camada da pagina por cima (pointer-events:none) -- e a pagina a
+        // mentir no isVisible.
+        let covered = r#"
+Object.defineProperty(IntersectionObserverEntry.prototype, 'isVisible', {
+  configurable: true, get() { return true; }
+});
+__covered = true;
+__show('Pergunta coberta.');
+__wait(600);
+__press('search');
+__state('coberta');
+__covered = false;
+__settle();
+__press('search');
+__state('descoberta');
+"#;
+        // A pagina chega ao host (esta na arvore dela) e reescreve-lhe o
+        // estilo inline, ou filtra o documento inteiro.
+        let transparent = r#"
+__show('Pergunta.');
+__root().host.style.setProperty('opacity', '0', 'important');
+__press('search');
+__state('alterada');
+"#;
+        let moved = r#"
+__show('Pergunta.');
+__root().host.style.setProperty('top', '400px', 'important');
+__press('search');
+__state('alterada');
+"#;
+        let filtered = r#"
+__show('Pergunta.');
+__pageCss.set(document.documentElement, { filter: 'url(#troca)' });
+__press('search');
+__state('alterada');
+"#;
+        // A selecao tem de ser a que o gesto do utilizador deixou.
+        let gestures = r#"
+__select('agent:https://example.com | click=Comprar');
+__click();
+__drain();
+__state('clique-simples');
+__select('Texto do utilizador.');
+__up();
+__select('agent:https://example.com | click=Comprar');
+__drain();
+__state('trocada-no-intervalo');
+__click();
+__select('Palavra');
+__click({ detail: 2 });
+__drain();
+__state('duplo-clique');
+__select('Palavra e mais');
+__click({ shiftKey: true });
+__drain();
+__state('shift-clique');
+"#;
+        let results = run_selection_cases(vec![
+            selection_case("cedo", &page, "", &[early]),
+            selection_case("coberta", &page, "", &[covered]),
+            selection_case("gestos", &page, "", &[gestures]),
+            selection_case("transparente", &page, "", &[transparent]),
+            selection_case("movida", &page, "", &[moved]),
+            selection_case("filtro-na-pagina", &page, "", &[filtered]),
+        ]);
+        const TOO_SOON: &str = "Clique de novo em Pesquisar";
+        const TAMPERED: &str = "A página cobriu ou alterou esta barra: a pesquisa não foi enviada";
+
+        let early = selection_states(&results[0]);
+        assert_eq!(early["cedo"]["posted"], 0, "clique 100 ms depois de aparecer");
+        assert_eq!(early["cedo"]["note"], TOO_SOON);
+        assert_eq!(early["depois"]["posted"], 1);
+        assert_eq!(
+            selection_searches(&results[0]),
+            vec!["Pergunta do utilizador."]
+        );
+
+        let covered = selection_states(&results[1]);
+        assert_eq!(covered["coberta"]["posted"], 0, "barra coberta pela pagina");
+        assert_eq!(covered["coberta"]["note"], TAMPERED);
+        assert_eq!(covered["descoberta"]["posted"], 1);
+
+        for result in &results[3..] {
+            let name = result["name"].as_str().expect("name");
+            let state = &selection_states(result)["alterada"];
+            assert_eq!(state["shown"], true, "{name}");
+            assert_eq!(state["note"], TAMPERED, "{name}");
+            assert!(selection_posted(result).is_empty(), "{name}: pesquisou");
+        }
+
+        let gestures = selection_states(&results[2]);
+        for tag in ["clique-simples", "trocada-no-intervalo"] {
+            assert_eq!(gestures[tag]["shown"], false, "{tag}: a barra apareceu");
+            assert_eq!(gestures[tag]["pending"], 0, "{tag}: ficou um relogio");
+        }
+        for tag in ["duplo-clique", "shift-clique"] {
+            assert_eq!(gestures[tag]["shown"], true, "{tag}: gesto do utilizador");
+        }
     }
 
     #[test]
@@ -17388,6 +17849,237 @@ __state('sem-vozes');
     }
 
     #[test]
+    fn while_reading_a_new_selection_is_what_copy_and_search_take() {
+        // A ler o paragrafo A, o utilizador seleciona a frase B: a barra vai
+        // para B e Copiar/Pesquisar levam B. Sem nova selecao, so fica o
+        // Parar -- nunca um Copiar ou Pesquisar com o texto antigo.
+        let page = bind_page_script(NEURALIA_KEYMAP_SCRIPT, SELECTION_CAP, false);
+        let reselect = r#"
+__voices = [__MARIA];
+__show('Paragrafo A inteiro.');
+__press('speak');
+__state('lendo-A');
+__on(window, 'mousedown', { target: document.body, clientX: 100, clientY: 510 });
+__select('Frase B.', __para, { rects: [{ top: 500, bottom: 520, left: 100, right: 400, width: 300, height: 20 }] });
+__on(document, 'selectionchange');
+__on(window, 'mouseup', { target: document.body, clientX: 200, clientY: 510 });
+__wait(200);
+__drain();
+__settle();
+__state('selecionou-B');
+__press('copy');
+"#;
+        let reselected = r#"
+__state('copiou-B');
+__press('search');
+__state('pesquisou-B');
+"#;
+        let clicked_away = r#"
+__voices = [__MARIA];
+__show('Paragrafo A inteiro.');
+__press('speak');
+__on(window, 'mousedown', { target: document.body, clientX: 100, clientY: 510 });
+__unselect();
+__on(document, 'selectionchange');
+__on(window, 'mouseup', { target: document.body, clientX: 100, clientY: 510 });
+__drain();
+__state('clicou-fora-a-ler');
+__press('copy');
+__press('search');
+__state('sem-texto-antigo');
+__press('speak');
+__state('parou');
+"#;
+        let results = run_selection_cases(vec![
+            selection_case("nova-selecao", &page, "", &[reselect, reselected]),
+            selection_case("clique-fora", &page, "", &[clicked_away]),
+        ]);
+
+        let states = selection_states(&results[0]);
+        assert_eq!(states["lendo-A"]["buttons"][2], "⏹ Parar");
+        let b = &states["selecionou-B"];
+        assert_eq!(b["shown"], true);
+        assert_eq!(b["solo"], false);
+        assert_eq!(b["top"], 450.0, "a barra ficou na posicao de A");
+        assert_eq!(b["buttons"][2], "⏹ Parar", "a leitura de A continua");
+        assert_eq!(
+            states["copiou-B"]["clipboard"],
+            serde_json::json!(["Frase B."])
+        );
+        assert_eq!(selection_searches(&results[0]), vec!["Frase B."]);
+
+        let away = selection_states(&results[1]);
+        let solo = &away["clicou-fora-a-ler"];
+        assert_eq!(solo["shown"], true, "o Parar tem de ficar a mao");
+        assert_eq!(solo["solo"], true, "Copiar/Pesquisar ficaram com o texto antigo");
+        assert_eq!(solo["buttons"][2], "⏹ Parar");
+        assert_eq!(
+            away["sem-texto-antigo"]["clipboard"],
+            serde_json::json!([])
+        );
+        assert!(selection_posted(&results[1]).is_empty());
+        assert_eq!(away["parou"]["shown"], false);
+        assert_eq!(away["parou"]["pending"], 0);
+    }
+
+    #[test]
+    fn every_page_surface_gets_the_toolbar_its_privacy_allows() {
+        // Os scripts que cada builder injeta, gerados pelas MESMAS funcoes
+        // que o builder chama: colunas, Web externa (com e sem agente),
+        // Reader, Split normal e privado.
+        let offered = r#"
+__show('Texto da pagina.');
+__state('barra');
+"#;
+        let mut column = selection_case("coluna", "", "", &[offered]);
+        column["scripts"] = serde_json::json!(comparator_init_scripts(
+            0,
+            "Google IA",
+            SELECTION_CAP
+        ));
+        let surfaces = vec![
+            column,
+            selection_case(
+                "web",
+                &external_init_script(SELECTION_CAP, false),
+                "",
+                &[offered],
+            ),
+            selection_case(
+                "web-agente",
+                &external_init_script(SELECTION_CAP, true),
+                "",
+                &[offered],
+            ),
+            selection_case(
+                "reader",
+                &App::reader_init_script(SELECTION_CAP),
+                "",
+                &[offered],
+            ),
+            selection_case(
+                "split",
+                &split_page(1, "ChatGPT", SELECTION_CAP, false).init_script,
+                "",
+                &[offered],
+            ),
+            selection_case(
+                "split-privado",
+                &split_page(1, "ChatGPT", SELECTION_CAP, true).init_script,
+                "",
+                &[offered],
+            ),
+        ];
+        let results = run_selection_cases(surfaces);
+        let all = serde_json::json!(["🔎 Pesquisar", "📋 Copiar", "🔊 Falar"]);
+        for result in &results {
+            let name = result["name"].as_str().expect("name");
+            let bar = &selection_states(result)["barra"];
+            assert_eq!(bar["shown"], true, "{name}: a barra nao apareceu");
+            let expected = if name == "split-privado" {
+                serde_json::json!(["📋 Copiar", "🔊 Falar"])
+            } else {
+                all.clone()
+            };
+            assert_eq!(bar["buttons"], expected, "{name}");
+        }
+
+        // O mesmo `private` decide o script e o IPC do Split.
+        let search = || IpcAction::Search {
+            text: "texto".to_string(),
+        };
+        let private = split_page(1, "ChatGPT", SELECTION_CAP, true).ipc;
+        assert!(private.private, "o painel privado perdeu o perfil anonimo");
+        assert!(private.event(search()).is_none());
+        assert!(matches!(
+            private.event(IpcAction::SplitClose),
+            Some(UserEvent::CloseSplit)
+        ));
+        let normal = split_page(1, "ChatGPT", SELECTION_CAP, false).ipc;
+        assert!(!normal.private);
+        assert!(matches!(
+            normal.event(search()),
+            Some(UserEvent::SearchSelection(ref text)) if text == "texto"
+        ));
+
+        // Os builders nao montam o script nem decidem a privacidade por conta
+        // propria: usam as funcoes acima (asserção de ausencia, AGENTS.md
+        // §4.3).
+        let source = include_str!("windows_app.rs");
+        let body = |builder: &str| {
+            source
+                .split(builder)
+                .nth(1)
+                .and_then(|part| part.split(".with_permission_handler").next())
+                .unwrap_or_else(|| panic!("{builder}"))
+                .to_string()
+        };
+        for builder in [
+            "fn comparator_webview_builder",
+            "fn external_webview_builder",
+            "fn reader_webview_builder",
+            "fn split_webview_builder",
+        ] {
+            let body = body(builder);
+            for forbidden in ["NEURALIA_KEYMAP_SCRIPT", "bind_page_script("] {
+                assert!(!body.contains(forbidden), "{builder}: {forbidden}");
+            }
+        }
+        let split = body("fn split_webview_builder");
+        for forbidden in [
+            "split_ipc_event_impl(",
+            "with_incognito(private)",
+            "if private",
+        ] {
+            assert!(!split.contains(forbidden), "split_webview_builder: {forbidden}");
+        }
+    }
+
+    #[test]
+    fn double_clicking_a_word_in_a_column_selects_it_instead_of_expanding() {
+        // A coluna do comparador com TODOS os seus scripts, como o builder
+        // os injeta. Um duplo clique numa palavra seleciona-a: a barra tem de
+        // aparecer e a coluna nao expande (expandir redimensionava o WebView
+        // e o 'resize' levava a barra).
+        let word = r#"
+__click();
+__select('palavra');
+__click({ detail: 2 });
+const __dbl = { target: __para.parentNode, detail: 2 };
+__on(window, 'dblclick', __dbl);
+__on(document, 'dblclick', __dbl);
+// O nativo expande a coluna ao receber 'expand': o WebView muda de tamanho.
+if (__posted.some((m) => m.indexOf('"expand"') >= 0)) __on(window, 'resize');
+__wait(200);
+__drain();
+__settle();
+__state('duplo-clique-na-palavra');
+__on(window, 'mousedown', { target: document.body });
+__unselect();
+__on(document, 'dblclick', { target: __para.parentNode, detail: 2 });
+__state('duplo-clique-no-vazio');
+"#;
+        let mut column = selection_case("coluna", "", "", &[word]);
+        column["scripts"] = serde_json::json!(comparator_init_scripts(
+            0,
+            "Google IA",
+            SELECTION_CAP
+        ));
+        let results = run_selection_cases(vec![column]);
+        let states = selection_states(&results[0]);
+        assert_eq!(
+            states["duplo-clique-na-palavra"]["shown"], true,
+            "duplo clique numa palavra da coluna: a barra nao aparece"
+        );
+        assert_eq!(states["duplo-clique-na-palavra"]["posted"], 0);
+        // Sem texto selecionado, o duplo clique continua a expandir.
+        assert_eq!(
+            selection_posted(&results[0]),
+            vec![IpcAction::Expand { col: 0 }]
+        );
+    }
+
+    #[test]
     fn a_selected_search_reaches_the_comparator_from_every_surface_but_the_private_split() {
         let text = "agent:https://example.com | click=Comprar".to_string();
         let search = || IpcAction::Search { text: text.clone() };
@@ -17400,16 +18092,17 @@ __state('sem-vozes');
             );
         }
         // Split normal; o privado recusa, mas continua a fechar-se.
-        assert!(carries(App::split_ipc_event_impl(1, false, search())));
-        assert!(App::split_ipc_event_impl(1, true, search()).is_none());
+        let split = |private: bool| split_page(1, "ChatGPT", SELECTION_CAP, private).ipc;
+        assert!(carries(split(false).event(search())));
+        assert!(split(true).event(search()).is_none());
         assert!(matches!(
-            App::split_ipc_event_impl(1, true, IpcAction::SplitClose),
+            split(true).event(IpcAction::SplitClose),
             Some(UserEvent::CloseSplit)
         ));
         // Web externa, com e sem agente.
         assert!(carries(external_ipc_event(search(), false)));
         assert!(carries(external_ipc_event(search(), true)));
-        // Reader e PDF usam o mapa comum.
+        // O Reader usa o mapa comum.
         assert!(carries(common_ipc_event(search())));
     }
 
@@ -17432,31 +18125,57 @@ __state('sem-vozes');
                 "{command} deixou de ser um comando da omnibox; o teste perdeu o sentido"
             );
             assert_eq!(
-                selection_search_question(&format!("  {command}\n")),
-                Some(command.to_string()),
+                selection_search(&format!("  {command}\n")),
+                Some(SelectionSearch::Compare(command.to_string())),
                 "{command}"
             );
         }
-        // Um endereco selecionado tambem e pergunta, nao navegacao.
+        // Um endereco selecionado tambem e pergunta, nao navegacao (na
+        // palette abria-se no Split).
+        assert!(matches!(
+            route_palette("https://example.com/", 0, false),
+            PaletteRoute::OpenSplit { .. }
+        ));
         assert_eq!(
-            selection_search_question("https://example.com/"),
-            Some("https://example.com/".to_string())
+            selection_search("https://example.com/"),
+            Some(SelectionSearch::Compare("https://example.com/".to_string()))
         );
-        assert_eq!(selection_search_question(" \n "), None);
+        assert_eq!(selection_search(" \n "), None);
         assert_eq!(
-            selection_search_question(&"a".repeat(crate::ipc::SEARCH_MAX_CHARS + 1)),
+            selection_search(&"a".repeat(crate::ipc::SEARCH_MAX_CHARS + 1)),
             None
         );
 
-        // O handler nativo nao pode sequer tocar no interpretador de
-        // comandos (asserção de ausencia, AGENTS.md §4.3).
+        // O handler nativo so executa a decisao acima: a unica chamada que
+        // faz e `self.compare` -- nada de omnibox, palette, Split ou Web
+        // (asserção sobre o texto; ver AGENTS.md §4.3).
         let source = include_str!("windows_app.rs");
         let handler = source
             .split("fn search_selection(&mut self")
             .nth(1)
             .and_then(|part| part.split("\n    fn ").next())
             .expect("search_selection");
-        for forbidden in ["handle_input", "route_input", "parse_intent", "SubmitText"] {
+        let calls: Vec<&str> = handler
+            .match_indices("self.")
+            .map(|(at, _)| {
+                let rest = &handler[at + 5..];
+                let end = rest
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect();
+        assert_eq!(calls, vec!["compare"], "o Pesquisar faz outra coisa");
+        for forbidden in [
+            "handle_input",
+            "route_input",
+            "parse_intent",
+            "SubmitText",
+            "submit_palette",
+            "route_palette",
+            "open_split",
+            "web(",
+        ] {
             assert!(
                 !handler.contains(forbidden),
                 "o Pesquisar passa por {forbidden}"
@@ -20235,11 +20954,17 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     // Montada ja no document-created (fora da arvore ate a primeira vez):
     // a folha adotada e atribuida antes de a pagina poder trocar o setter
     // de ShadowRoot.prototype.adoptedStyleSheets.
-    function build() {
-      host = makeElement(document, 'div');
+    // O estilo que protege o host; reposto sempre que a barra aparece, por
+    // cima do que a pagina lhe tenha escrito entretanto.
+    function pin() {
       important(host, 'all', 'initial');
       important(host, 'position', 'fixed');
       important(host, 'z-index', '2147483647');
+    }
+
+    function build() {
+      host = makeElement(document, 'div');
+      pin();
       important(host, 'display', 'none');
       important(host, 'top', '0px');
       important(host, 'left', '0px');
@@ -20318,6 +21043,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       clearFeedback();
       setAttr(bar, 'class', 'bar');
       say('');
+      pin();
       important(host, 'visibility', 'hidden');
       important(host, 'display', 'block');
       place(snap);
