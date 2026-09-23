@@ -17170,7 +17170,7 @@ class Element extends Node {
     this.classList = { add() {}, remove() {}, toggle() {}, contains() { return false; } };
     this.textContent = ''; this.innerText = 'x'.repeat(40); this.value = '';
   }
-  setAttribute(k, v) { this.attrs[k] = String(v); }
+  setAttribute(k, v) { this.attrs[k] = __String(v); }
   getAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k) ? this.attrs[k] : null; }
   removeAttribute(k) { delete this.attrs[k]; }
   hasAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k); }
