@@ -41,14 +41,14 @@ message transport through WebView2, but every accepted message is a bounded JSON
 envelope authenticated with a per-WebView capability. The native side exposes
 no filesystem API, credential API or arbitrary native-call object.
 
-The closed action set has 27 names: `home`, `back`, `restore`,
+The closed action set has 28 names: `home`, `back`, `restore`,
 `autoscroll`, `zoomin`, `zoomout`, `zoomreset`, `reload`, `print`,
 `omnibox`, `history`, `clearhistory`, `fullscreen`, `devtools`,
 `viewsource`, `newtab`, `expand`, `shortcut-expand`, `minimize`, `split`,
-`link`, `split-close`, `split-expand`, `palette`, `gmail-state`,
+`link`, `ask`, `split-close`, `split-expand`, `palette`, `gmail-state`,
 `research-answer` and `agent-observation`. Unknown actions, extra fields,
 wrong types, oversized messages and invalid per-action arguments are rejected.
-The parser gate `protocol_accepts_exactly_the_twenty_seven_published_actions`
+The parser gate `protocol_accepts_exactly_the_twenty_eight_published_actions`
 (`crates/neural-app/src/ipc.rs`) reads this list and fails when it differs from
 the set the shipped parser accepts.
 
@@ -61,6 +61,14 @@ effect reaches columns other than the one that emitted it (gate:
 `a_plain_click_opens_in_all_three_panels_and_ctrl_click_opens_beside` in
 `crates/neural-app/src/windows_app.rs`; argument policy:
 `a_link_click_obeys_the_same_policy_as_the_split` in `ipc.rs`).
+
+`ask` reports a question the user typed and sent in a comparator column (Enter
+or the send button, trusted events only, on the column's own AI page). Its
+arguments are exactly `col` and `text` (1..=2000 characters after trimming,
+no control characters except newline and tab). The OTHER columns load the same
+question in their own provider; the emitting column is not touched. Gates:
+`ask_carries_the_typed_question_within_bounds` (`ipc.rs`) and
+`a_question_typed_in_one_column_goes_to_the_others` (`windows_app.rs`).
 
 Every accepted message MUST carry the per-WebView capability token. The token:
 

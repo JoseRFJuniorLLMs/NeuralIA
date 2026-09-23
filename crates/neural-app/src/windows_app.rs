@@ -57,12 +57,12 @@ use windows_sys::Win32::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
             ES_AUTOHSCROLL, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
             GetForegroundWindow, GetParent, GetWindowTextLengthW, GetWindowTextW,
-            GetWindowThreadProcessId, IDYES, IsZoomed, MB_ICONINFORMATION, MB_OK, MB_YESNO,
-            MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
-            SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetParent, SetWindowPos, SetWindowTextW,
-            ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_CANCELMODE,
-            WM_CAPTURECHANGED, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
-            WS_TABSTOP, WS_VISIBLE,
+            GetWindowThreadProcessId, IDYES, IsZoomed, MB_DEFBUTTON2, MB_ICONINFORMATION,
+            MB_ICONWARNING, MB_OK, MB_YESNO, MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE,
+            SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetParent,
+            SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+            TrackPopupMenu, WM_CANCELMODE, WM_CAPTURECHANGED, WM_KEYDOWN, WS_CHILD,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -73,7 +73,7 @@ use winit::{
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, NamedKey},
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
-    window::{Fullscreen, Icon, Window, WindowId},
+    window::{CursorIcon, Fullscreen, Icon, Window, WindowId},
 };
 use wry::{
     NewWindowResponse, PermissionKind, PermissionResponse, WebView, WebViewBuilder,
@@ -140,6 +140,11 @@ enum UserEvent {
     },
     MemoryCleared(Result<(), String>),
     ResearchAnswer {
+        source_index: usize,
+        text: String,
+    },
+    /// Pergunta enviada na caixa de uma coluna: vai tambem as outras.
+    AskEverywhere {
         source_index: usize,
         text: String,
     },
@@ -373,32 +378,6 @@ const AUTO_SCROLL_SCRIPT: &str = r#"
     } catch (err) { /* outra origem: nao ha nada a fazer daqui */ }
   }
 })();
-"#;
-
-/// Aviso curto dentro da propria pagina: a barra nativa nao esta sempre visivel.
-const AUTO_SCROLL_TOAST: &str = r#"
-(function (on) {
-  var id = 'neuralia-autoscroll-toast';
-  var el = document.getElementById(id);
-  if (!el) {
-    el = document.createElement('div');
-    el.id = id;
-    document.documentElement.appendChild(el);
-  }
-  el.textContent = on ? 'Rolagem automatica ligada — __SECONDS__s (F8 desliga)' : 'Rolagem automatica desligada';
-  el.setAttribute('style', [
-    'position:fixed', 'left:50%', 'bottom:24px', 'transform:translateX(-50%)',
-    'z-index:2147483647', 'padding:10px 18px', 'border-radius:999px',
-    'background:rgba(17,19,20,.92)', 'color:#fff',
-    'font:600 13px Segoe UI, system-ui, sans-serif',
-    'box-shadow:0 8px 28px rgba(0,0,0,.35)', 'pointer-events:none',
-    'opacity:1', 'transition:opacity .4s ease'
-  ].join(';'));
-  clearTimeout(window.__neuralia_toast_timer);
-  window.__neuralia_toast_timer = setTimeout(function () {
-    el.style.opacity = '0';
-  }, 2200);
-})(__ON__);
 "#;
 
 /// O que esta debaixo do rato no chrome nativo do comparador.
@@ -3615,6 +3594,10 @@ unsafe extern "system" fn omnibox_subclass(
                 let _ = proxy.send_event(UserEvent::NewTab(0));
                 return 0;
             }
+            0x52 if ctrl && !shift => {
+                let _ = proxy.send_event(UserEvent::ToggleAutoScroll);
+                return 0;
+            }
             0x2E if ctrl && shift => {
                 let _ = proxy.send_event(UserEvent::ClearHistory);
                 return 0;
@@ -4473,6 +4456,10 @@ struct App {
     comparator: Option<ComparatorState>,
     omnibox: Option<HWND>,
     bar_hover: Option<BarHit>,
+    /// Ctrl/Shift/Alt no teclado da janela principal (a barra com o foco).
+    modifiers: winit::keyboard::ModifiersState,
+    /// O rato esta em cima do "Ir" da Home: pinta-se em degradê.
+    home_go_hover: bool,
     exit_button: Option<HWND>,
     home_button: Option<HWND>,
     caption_buttons: Option<HWND>,
@@ -4580,6 +4567,8 @@ impl App {
             comparator: None,
             omnibox: None,
             bar_hover: None,
+            modifiers: winit::keyboard::ModifiersState::empty(),
+            home_go_hover: false,
             exit_button: None,
             home_button: None,
             caption_buttons: None,
@@ -5105,6 +5094,27 @@ impl App {
             Err(error) => format!("Não foi possível ler o histórico: {error}"),
         };
         self.show_native_text("NeuralIA — Histórico cronológico", &text);
+    }
+
+    /// Ctrl+Shift+Delete apagava historico e memoria local de uma vez, sem
+    /// perguntar e sem volta. Agora pergunta, com o "Nao" por omissao.
+    fn confirm_clear_history(&self) -> bool {
+        let Some(hwnd) = self.window.as_ref().and_then(window_hwnd) else {
+            return false;
+        };
+        let body = wide_null(
+            "Apagar TODO o histórico e a memória local da NeuralIA?\n\nIsto não pode ser desfeito.",
+        );
+        let title = wide_null("NeuralIA — Apagar histórico");
+        let answer = unsafe {
+            MessageBoxW(
+                hwnd,
+                body.as_ptr(),
+                title.as_ptr(),
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+            )
+        };
+        clear_history_confirmed(answer)
     }
 
     fn show_native_text(&self, title: &str, text: &str) {
@@ -6369,6 +6379,11 @@ impl App {
                     text,
                 })
             }
+            // Uma coluna so fala por si: o `col` tem de ser o dela.
+            IpcAction::Ask { col, text } if col == col_index => Some(UserEvent::AskEverywhere {
+                source_index: col_index,
+                text,
+            }),
             // Clique simples: a pagina abre nas TRES colunas, para se ver o
             // que cada IA diz dela. Ctrl+clique: abre no painel lateral e a
             // barra de titulo guarda a aba -- o "novo separador" do Chrome.
@@ -6891,6 +6906,44 @@ impl App {
     }
 
     /// URL de pergunta do fornecedor da coluna.
+    /// Pergunta escrita e enviada numa coluna: segue tambem para as outras,
+    /// cada uma no seu fornecedor -- como o clique num link, que abre em
+    /// todas. A coluna de origem nao e tocada: ja esta a enviar e mantem o
+    /// contexto da conversa dela.
+    fn ask_other_columns(&mut self, source_index: usize, text: String) {
+        if self.surface != Surface::Comparator {
+            return;
+        }
+        let Some(count) = self.comparator.as_ref().map(|comp| comp.views.len()) else {
+            return;
+        };
+        let mut urls = Vec::new();
+        for index in ask_targets(source_index, count) {
+            match self.provider_query_url(index, &text) {
+                Ok(url) => urls.push((index, url)),
+                Err(error) => {
+                    self.show_splash(error.to_string(), 3);
+                    return;
+                }
+            }
+        }
+        debug_log(format_args!(
+            "ask: coluna {source_index} -> {} coluna(s), {} chars",
+            urls.len(),
+            text.chars().count()
+        ));
+        if let Some(comp) = &self.comparator {
+            for (index, url) in &urls {
+                if let Some(view) = comp.views.get(*index) {
+                    let _ = view.webview.load_url(url.as_str());
+                }
+            }
+        }
+        if let Some((_, url)) = urls.first() {
+            self.record(HistoryKind::Ask, text, url.to_string());
+        }
+    }
+
     fn provider_query_url(&self, source_index: usize, query: &str) -> neural_core::Result<Url> {
         match source_index {
             0 => google_ai_url(query, &self.config.language),
@@ -7043,29 +7096,10 @@ impl App {
             self.schedule_auto_scroll();
         }
 
-        self.announce_auto_scroll();
-
+        // A mensagem e a do meio da janela, como as outras dicas: o aviso
+        // dentro da pagina ficava no fundo e so aparecia nas colunas.
+        self.show_splash(auto_scroll_message(self.auto_scroll), 3);
         self.request_redraw();
-
-        if self.surface == Surface::Home {
-            self.status = Some(if self.auto_scroll {
-                format!("Rolagem automática ligada — {AUTO_SCROLL_SECONDS}s. F8 desliga.")
-            } else {
-                "Rolagem automática desligada.".to_string()
-            });
-            self.request_redraw();
-        }
-    }
-
-    /// Mostra na propria pagina em que estado esta a rolagem. A barra nativa
-    /// tambem o diz, mas em ecra completo ela esconde-se.
-    fn announce_auto_scroll(&self) {
-        let toast = AUTO_SCROLL_TOAST
-            .replace("__ON__", if self.auto_scroll { "true" } else { "false" })
-            .replace("__SECONDS__", &AUTO_SCROLL_SECONDS.to_string());
-        self.for_each_visible_webview(|webview| {
-            let _ = webview.evaluate_script(&toast);
-        });
     }
 
     /// Aviso flutuante, centrado no fundo da janela, que se apaga sozinho.
@@ -7439,10 +7473,7 @@ impl App {
         if self.auto_scroll {
             self.auto_scroll_token = self.auto_scroll_token.wrapping_add(1);
             self.schedule_auto_scroll();
-            self.show_splash(
-                format!("Rolagem automática a cada {AUTO_SCROLL_SECONDS}s  ·  F8 desliga"),
-                4,
-            );
+            self.show_splash(auto_scroll_message(true), 4);
         }
     }
 
@@ -7465,10 +7496,7 @@ impl App {
         if yes {
             self.auto_scroll_token = self.auto_scroll_token.wrapping_add(1);
             self.schedule_auto_scroll();
-            self.show_splash(
-                format!("Rolagem automática ligada — {AUTO_SCROLL_SECONDS}s  ·  F8 desliga"),
-                4,
-            );
+            self.show_splash(auto_scroll_message(true), 4);
         }
         self.request_redraw();
     }
@@ -8301,6 +8329,31 @@ impl App {
         }
         self.bar_layout()
             .and_then(|layout| layout.hit(self.cursor.0, self.cursor.1))
+    }
+
+    /// "Ir" da Home sob o rato: degradê e mao, para se ver que esta vivo e
+    /// responde ao clique. Fora da Home volta tudo ao normal.
+    fn update_home_go_hover(&mut self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let size = window.inner_size();
+        let hovered = home_go_hovered(
+            self.surface,
+            (size.width as f64, size.height as f64),
+            window.scale_factor(),
+            self.cursor,
+        );
+        if hovered == self.home_go_hover {
+            return;
+        }
+        self.home_go_hover = hovered;
+        window.set_cursor(if hovered {
+            CursorIcon::Pointer
+        } else {
+            CursorIcon::Default
+        });
+        self.request_redraw();
     }
 
     fn update_bar_hover(&mut self) {
@@ -9493,6 +9546,35 @@ impl App {
     }
 }
 
+/// Atalhos com Ctrl quando o teclado esta na propria janela (depois de um
+/// clique na barra): os mesmos que o mapa de teclas das paginas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainShortcut {
+    AutoScroll,
+    Reload,
+    History,
+    NewTab,
+}
+
+fn main_window_shortcut(
+    key: &Key,
+    modifiers: winit::keyboard::ModifiersState,
+) -> Option<MainShortcut> {
+    if !modifiers.control_key() || modifiers.alt_key() {
+        return None;
+    }
+    let Key::Character(text) = key else {
+        return None;
+    };
+    match (text.to_lowercase().as_str(), modifiers.shift_key()) {
+        ("r", false) => Some(MainShortcut::AutoScroll),
+        ("r", true) => Some(MainShortcut::Reload),
+        ("h", false) => Some(MainShortcut::History),
+        ("n", false) => Some(MainShortcut::NewTab),
+        _ => None,
+    }
+}
+
 fn parse_browser_agent_plan(spec: &str) -> Result<(String, Vec<BrowserAgentCommand>), String> {
     let parts = spec
         .split('|')
@@ -10290,6 +10372,9 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Live(message) => self.handle_live_message(message),
             UserEvent::GmailAnswer(open) => self.answer_gmail(open),
             UserEvent::ClearHistory => {
+                if !self.confirm_clear_history() {
+                    return;
+                }
                 self.memory.clear(&mut self.current_research);
                 match self.history.clear() {
                     None => {
@@ -10325,6 +10410,9 @@ impl ApplicationHandler<UserEvent> for App {
                     self.status = Some("Histórico e memória semântica apagados.".to_string());
                     self.request_redraw();
                 }
+            }
+            UserEvent::AskEverywhere { source_index, text } => {
+                self.ask_other_columns(source_index, text)
             }
             UserEvent::ResearchAnswer { source_index, text } => {
                 let provider = self
@@ -10504,7 +10592,7 @@ impl ApplicationHandler<UserEvent> for App {
                 match self.surface {
                     Surface::Home => {
                         if let Some(window) = &self.window {
-                            draw_home(window, self.status.as_deref());
+                            draw_home(window, self.status.as_deref(), self.home_go_hover);
                         }
                     }
                     Surface::Comparator => {
@@ -10571,13 +10659,16 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.surface == Surface::Comparator && self.bar_visible() {
                     self.update_bar_hover();
                 }
+                self.update_home_go_hover();
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor = (-1.0, -1.0);
                 if self.surface == Surface::Comparator {
                     self.update_bar_hover();
                 }
+                self.update_home_go_hover();
             }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Focused(focused) => self.on_focus_changed(focused),
             WindowEvent::Occluded(occluded) => self.on_occluded_changed(occluded),
             // O tema do sistema mudou: o cache de 1 s tem de cair agora, e o
@@ -10598,6 +10689,15 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } if self.surface == Surface::Comparator => self.context_menu_comparator(),
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
+                if let Some(shortcut) = main_window_shortcut(&event.logical_key, self.modifiers) {
+                    match shortcut {
+                        MainShortcut::AutoScroll => self.toggle_auto_scroll(),
+                        MainShortcut::Reload => self.reload_page(),
+                        MainShortcut::History => self.toggle_side_panel(),
+                        MainShortcut::NewTab => self.new_tab(0),
+                    }
+                    return;
+                }
                 match event.logical_key {
                     Key::Named(NamedKey::Escape) => self.go_back(),
                     Key::Named(NamedKey::F8) => self.toggle_auto_scroll(),
@@ -10899,6 +10999,11 @@ fn neuralia_action(target: &str) -> Option<UserEvent> {
         "viewsource" => UserEvent::ViewSource,
         _ => return None,
     })
+}
+
+/// Colunas que recebem a pergunta enviada em `source`: todas as outras.
+fn ask_targets(source: usize, count: usize) -> Vec<usize> {
+    (0..count).filter(|index| *index != source).collect()
 }
 
 fn common_ipc_event(action: IpcAction) -> Option<UserEvent> {
@@ -11374,7 +11479,7 @@ unsafe fn draw_neural_tissue(
     }
 }
 
-fn draw_home(window: &Window, status: Option<&str>) {
+fn draw_home(window: &Window, status: Option<&str>, go_hover: bool) {
     let Ok(handle) = window.window_handle() else {
         return;
     };
@@ -11456,7 +11561,18 @@ fn draw_home(window: &Window, status: Option<&str>) {
             Some((theme.surface_line, scale)),
             theme.page_bg,
         );
-        draw_button(target, layout.go, "Ir", true, scale, body_font, &theme);
+        if go_hover {
+            // Parado com NEURALIA_REDUCE_MOTION; senao o degradê desliza ao
+            // ritmo dos frames da Home.
+            let phase = if home_animation_enabled() {
+                (now_ms() % GO_GRADIENT_PERIOD_MS) as f32 / GO_GRADIENT_PERIOD_MS as f32
+            } else {
+                0.0
+            };
+            draw_go_gradient(target, layout.go, phase, body_font, &theme);
+        } else {
+            draw_button(target, layout.go, "Ir", true, scale, body_font, &theme);
+        }
 
         if let Some(message) = status {
             SelectObject(target, small_font as _);
@@ -13696,6 +13812,60 @@ mod tests {
     }
 
     #[test]
+    fn the_go_button_lights_up_only_under_the_mouse_on_home() {
+        let (size, scale) = ((1600.0, 900.0), 1.0);
+        let go = HomeLayout::new(size.0, size.1, scale).go;
+        let center = (go.x + go.width / 2.0, go.y + go.height / 2.0);
+        assert!(home_go_hovered(Surface::Home, size, scale, center));
+        assert!(!home_go_hovered(
+            Surface::Home,
+            size,
+            scale,
+            (go.x - 2.0, center.1)
+        ));
+        assert!(!home_go_hovered(Surface::Home, size, scale, (-1.0, -1.0)));
+        assert!(
+            !home_go_hovered(Surface::Comparator, size, scale, center),
+            "o Ir nao existe fora da Home"
+        );
+    }
+
+    #[test]
+    fn the_go_button_turns_into_a_sliding_gradient() {
+        let (from, to) = ((26, 115, 232), GO_GRADIENT_END);
+        // Fase 0: da cor de destaque (esquerda) ao violeta (direita).
+        assert_eq!(go_gradient_color(from, to, 0.0, 0.0), from);
+        assert_eq!(go_gradient_color(from, to, 1.0, 0.0), to);
+        // A fase desliza a onda: a ponta esquerda muda de cor com o tempo.
+        assert_ne!(go_gradient_color(from, to, 0.0, 0.25), from);
+        // Nos pixels da pilula: o corpo a esquerda e a direita difere mesmo.
+        let (width, height) = (84, 54);
+        let pixels = pill_pixels(
+            width,
+            height,
+            27.0,
+            &|t| go_gradient_color(from, to, t, 0.0),
+            None,
+            (255, 255, 255),
+        );
+        let at = |x: i32| {
+            let index = ((height / 2 * width + x) * 4) as usize;
+            (pixels[index + 2], pixels[index + 1], pixels[index])
+        };
+        let near = |a: Rgb, b: Rgb| {
+            (a.0 as i32 - b.0 as i32).abs() <= 24
+                && (a.1 as i32 - b.1 as i32).abs() <= 24
+                && (a.2 as i32 - b.2 as i32).abs() <= 24
+        };
+        assert!(near(at(2), from), "esquerda {:?}", at(2));
+        assert!(near(at(width - 3), to), "direita {:?}", at(width - 3));
+        // Solido continua solido: o refactor nao mexeu nos outros botoes.
+        let solid = pill_pixels(width, height, 27.0, &|_| from, None, (255, 255, 255));
+        let index = ((height / 2 * width + width / 2) * 4) as usize;
+        assert_eq!((solid[index + 2], solid[index + 1], solid[index]), from);
+    }
+
+    #[test]
     fn the_splash_question_opens_in_the_center_of_the_window() {
         // Janela 1440x900, splash 400x120: centro exacto, nao o rodape.
         assert_eq!(splash_origin(1440, 900, 400, 120), (520, 390));
@@ -15414,12 +15584,14 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
             }
         }
 
-        // Nenhum handler que dispare acao nativa aceita evento sintetico.
+        // Nenhum handler que dispare acao nativa aceita evento sintetico:
+        // os 4 de sempre + os 4 da pergunta replicada (focusin, Enter,
+        // botao de enviar, submit).
         assert_eq!(
             COMPARATOR_INJECT_SCRIPT
                 .matches("if (!event.isTrusted")
                 .count(),
-            4
+            8
         );
         assert!(!COMPARATOR_INJECT_SCRIPT.contains("expand.onclick"));
         assert!(!COMPARATOR_INJECT_SCRIPT.contains("minimize.onclick"));
@@ -15577,6 +15749,144 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
     /// pos nada no lugar: o clique deixou de ter tratamento nenhum. E o
     /// caminho do Ctrl era testado apenas por uma assercao sobre o TEXTO do
     /// script, que continuava verde com a funcionalidade partida.
+    #[test]
+    fn a_question_typed_in_one_column_goes_to_the_others() {
+        match App::column_ipc_event_impl(
+            1,
+            IpcAction::Ask {
+                col: 1,
+                text: "capital da França".to_string(),
+            },
+        ) {
+            Some(UserEvent::AskEverywhere { source_index, text }) => {
+                assert_eq!(source_index, 1);
+                assert_eq!(text, "capital da França");
+            }
+            other => panic!("a pergunta devia ir as outras colunas, veio {other:?}"),
+        }
+        // Uma pagina nao fala por outra coluna.
+        assert!(
+            App::column_ipc_event_impl(
+                1,
+                IpcAction::Ask {
+                    col: 0,
+                    text: "x".to_string()
+                }
+            )
+            .is_none()
+        );
+        // A origem nao e tocada; as outras sim.
+        assert_eq!(ask_targets(1, 3), vec![0, 2]);
+        assert_eq!(ask_targets(0, 3), vec![1, 2]);
+        assert_eq!(ask_targets(2, 3), vec![0, 1]);
+    }
+
+    #[test]
+    fn typing_and_sending_in_a_column_searches_in_all_of_them() {
+        // Corre o script das colunas QUE EMBARCA e le o que ele publica pelo
+        // parser nativo do produto.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let provider = r#"
+const box = document.createElement('textarea');
+box.value = '  capital da França  ';
+const at = (node) => ({ target: node, composedPath() { return [node]; } });
+__fire('keydown', Object.assign({ key: 'Enter' }, at(box)));
+// o submit/Enter repetido da mesma pergunta nao duplica
+__fire('keydown', Object.assign({ key: 'Enter' }, at(box)));
+// Shift+Enter e uma quebra de linha
+box.value = 'outra coisa';
+__fire('keydown', Object.assign({ key: 'Enter', shiftKey: true }, at(box)));
+// senha nunca
+const pw = document.createElement('input'); pw.type = 'password'; pw.value = 'segredo';
+__fire('keydown', Object.assign({ key: 'Enter' }, at(pw)));
+// botao de enviar com o texto da ultima caixa focada
+const composer = document.createElement('textarea'); composer.value = 'segunda pergunta';
+__fire('focusin', at(composer));
+const toggle = document.createElement('button'); toggle.setAttribute('aria-label', 'Pesquisar na web');
+__fire('click', at(toggle));
+const send = document.createElement('button'); send.setAttribute('aria-label', 'Enviar mensagem');
+__fire('click', at(send));
+// evento sintetico da propria pagina: ignorado
+__fire('keydown', Object.assign({ key: 'Enter', isTrusted: false }, at(composer)));
+"#;
+        let ai_mode_form = r#"
+const q = document.createElement('textarea'); q.name = 'q'; q.value = 'nova pergunta';
+const form = document.createElement('form'); form.elements = [q];
+__fire('submit', { target: form, composedPath() { return [form]; } });
+"#;
+        let site = r#"
+const at = (node) => ({ target: node, composedPath() { return [node]; } });
+const q = document.createElement('input'); q.type = 'search'; q.name = 'q'; q.value = 'rust async';
+// Enter num site qualquer nao e pergunta a IA
+__fire('keydown', Object.assign({ key: 'Enter' }, at(q)));
+const lang = document.createElement('input'); lang.type = 'hidden'; lang.name = 'lang'; lang.value = 'pt';
+const form = document.createElement('form'); form.setAttribute('action', '/search'); form.elements = [q, lang];
+__fire('submit', at(form));
+const post = document.createElement('form'); post.setAttribute('method', 'post'); post.elements = [q];
+__fire('submit', at(post));
+const pw = document.createElement('input'); pw.type = 'password'; pw.name = 'p'; pw.value = 's';
+const login = document.createElement('form'); login.elements = [q, pw];
+__fire('submit', at(login));
+"#;
+        let script = COMPARATOR_INJECT_SCRIPT.replace("__NEURALIA_CAP__", CAP);
+        let cases: Vec<serde_json::Value> = [
+            ("chatgpt", "https://chatgpt.com/c/abc", provider),
+            (
+                "ai-mode",
+                "https://www.google.com/search?q=x&udm=50",
+                ai_mode_form,
+            ),
+            ("site", "https://example.com/artigo", site),
+        ]
+        .into_iter()
+        .map(|(name, href, drive)| {
+            serde_json::json!({ "name": name, "href": href, "script": script, "drive": drive })
+        })
+        .collect();
+        let program = format!(
+            "const INPUT = {};\n{}",
+            serde_json::json!({ "cases": cases }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        let actions = |index: usize| -> Vec<IpcAction> {
+            results[index]["posted"]
+                .as_array()
+                .expect("posted")
+                .iter()
+                .filter_map(|message| parse_ipc_message(message.as_str()?, CAP, 3))
+                .filter(|action| matches!(action, IpcAction::Ask { .. } | IpcAction::Link { .. }))
+                .collect()
+        };
+        let ask = |text: &str| IpcAction::Ask {
+            col: 0,
+            text: text.to_string(),
+        };
+        assert_eq!(
+            actions(0),
+            vec![ask("capital da França"), ask("segunda pergunta")],
+            "erros: {}",
+            results[0]["errors"]
+        );
+        assert_eq!(
+            actions(1),
+            vec![ask("nova pergunta")],
+            "erros: {}",
+            results[1]["errors"]
+        );
+        assert_eq!(
+            actions(2),
+            vec![IpcAction::Link {
+                col: 0,
+                url: "https://example.com/search?q=rust+async&lang=pt".to_string(),
+                aside: false,
+            }],
+            "erros: {}",
+            results[2]["errors"]
+        );
+    }
+
     #[test]
     fn a_plain_click_opens_in_all_three_panels_and_ctrl_click_opens_beside() {
         let url = "https://example.com/fonte".to_string();
@@ -16474,6 +16784,99 @@ process.stdout.write(JSON.stringify(results));
                 stolen.len()
             );
         }
+    }
+
+    #[test]
+    fn ctrl_r_toggles_auto_scroll_and_reload_stays_on_f5_and_ctrl_shift_r() {
+        // Corre o mapa de teclas QUE EMBARCA e le o que ele publica pelo
+        // mesmo parser nativo do produto.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let drive = r#"
+document.readyState = 'interactive';
+__fire('DOMContentLoaded');
+__drain();
+__fire('keydown', { key: 'r', ctrlKey: true });
+__fire('keydown', { key: 'R', ctrlKey: true, shiftKey: true });
+__fire('keydown', { key: 'F5' });
+__fire('keydown', { key: 'F8' });
+"#;
+        let cases = [serde_json::json!({
+            "name": "keymap",
+            "href": "https://example.com/",
+            "script": NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", CAP),
+            "drive": drive,
+        })];
+        let program = format!(
+            "const INPUT = {};\n{}",
+            serde_json::json!({ "cases": cases }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        let actions: Vec<IpcAction> = results[0]["posted"]
+            .as_array()
+            .expect("posted")
+            .iter()
+            .filter_map(|message| parse_ipc_message(message.as_str()?, CAP, 3))
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                IpcAction::AutoScroll,
+                IpcAction::Reload,
+                IpcAction::Reload,
+                IpcAction::AutoScroll,
+            ],
+            "erros: {}",
+            results[0]["errors"]
+        );
+    }
+
+    #[test]
+    fn the_main_window_answers_the_same_ctrl_shortcuts() {
+        use winit::keyboard::ModifiersState;
+        let key = |text: &str| Key::Character(text.into());
+        let ctrl = ModifiersState::CONTROL;
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert_eq!(
+            main_window_shortcut(&key("r"), ctrl),
+            Some(MainShortcut::AutoScroll)
+        );
+        assert_eq!(
+            main_window_shortcut(&key("R"), ctrl_shift),
+            Some(MainShortcut::Reload)
+        );
+        assert_eq!(
+            main_window_shortcut(&key("h"), ctrl),
+            Some(MainShortcut::History)
+        );
+        assert_eq!(
+            main_window_shortcut(&key("n"), ctrl),
+            Some(MainShortcut::NewTab)
+        );
+        // Sem Ctrl, ou com Alt (AltGr no teclado portugues), a tecla e texto.
+        assert_eq!(
+            main_window_shortcut(&key("r"), ModifiersState::empty()),
+            None
+        );
+        assert_eq!(
+            main_window_shortcut(&key("r"), ctrl | ModifiersState::ALT),
+            None
+        );
+    }
+
+    #[test]
+    fn clearing_all_history_needs_an_explicit_yes() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IDCANCEL, IDNO};
+        assert!(clear_history_confirmed(IDYES));
+        for answer in [IDNO, IDCANCEL, 0] {
+            assert!(
+                !clear_history_confirmed(answer),
+                "resposta {answer} apagou tudo"
+            );
+        }
+        assert!(auto_scroll_message(false).contains("desligada"));
+        assert!(auto_scroll_message(true).contains("Ctrl+R desliga"));
     }
 
     #[test]
@@ -18351,14 +18754,37 @@ unsafe fn fill_pill(
     if width <= 0 || height <= 0 {
         return;
     }
+    let pixels = pill_pixels(width, height, radius, &|_| fill, border, background);
+    blit_bgrx(
+        hdc,
+        &pixels,
+        rect.x.round() as i32,
+        rect.y.round() as i32,
+        width,
+        height,
+    );
+}
 
-    let (border_color, border_width) = border.unwrap_or((fill, 0.0));
-    let border_width = border_width as f32;
-    let radius = radius.min(rect.width.min(rect.height) / 2.0).max(0.0) as f32;
+/// Pixels BGRX de uma pilula com contorno suave. `fill_at(t)` da a cor do
+/// corpo na fraccao `t` da largura (0 a esquerda, 1 a direita): cor unica nos
+/// botoes normais, degradê no "Ir" sob o rato. Sem borda, o fio tem a cor do
+/// proprio corpo.
+fn pill_pixels(
+    width: i32,
+    height: i32,
+    radius: f64,
+    fill_at: &dyn Fn(f32) -> Rgb,
+    border: Option<(Rgb, f64)>,
+    background: Rgb,
+) -> Vec<u8> {
+    let border_width = border.map_or(0.0, |(_, width)| width) as f32;
+    let radius = radius.min(width.min(height) as f64 / 2.0).max(0.0) as f32;
 
-    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    let mut pixels = Vec::with_capacity((width.max(0) * height.max(0) * 4) as usize);
     for py in 0..height {
         for px in 0..width {
+            let fill = fill_at((px as f32 + 0.5) / width as f32);
+            let border_color = border.map_or(fill, |(color, _)| color);
             let distance = round_rect_sdf(
                 px as f32 + 0.5,
                 py as f32 + 0.5,
@@ -18381,7 +18807,67 @@ unsafe fn fill_pill(
             pixels.push(0);
         }
     }
+    pixels
+}
 
+/// Fim do degradê do "Ir" sob o rato; o inicio e a cor de destaque do tema.
+const GO_GRADIENT_END: Rgb = (124, 58, 237);
+/// O que o aviso do meio da janela diz quando a rolagem muda.
+fn auto_scroll_message(on: bool) -> String {
+    if on {
+        format!("Rolagem automática ligada — {AUTO_SCROLL_SECONDS}s  ·  Ctrl+R desliga")
+    } else {
+        "Rolagem automática desligada  ·  Ctrl+R liga".to_string()
+    }
+}
+
+/// Apagar TUDO so com um "Sim" explicito. Fechar a caixa, "Nao" ou uma caixa
+/// que nem abriu (0) deixam o historico como estava.
+fn clear_history_confirmed(answer: i32) -> bool {
+    answer == IDYES
+}
+
+/// Uma volta completa do degradê a deslizar.
+const GO_GRADIENT_PERIOD_MS: u64 = 2400;
+
+/// Cor do degradê do "Ir" na fraccao `t` da largura. A `phase` (0..1) faz a
+/// onda deslizar com o tempo: o botao "respira" enquanto o rato esta nele.
+fn go_gradient_color(from: Rgb, to: Rgb, t: f32, phase: f32) -> Rgb {
+    let wave = 0.5 - 0.5 * (std::f32::consts::TAU * (t * 0.5 + phase)).cos();
+    mix(from, to, wave)
+}
+
+/// O rato esta sobre o "Ir"? So na Home; noutras superficies o rect da Home
+/// nao existe e o botao nao se acende por baixo das colunas.
+fn home_go_hovered(surface: Surface, size: (f64, f64), scale: f64, cursor: (f64, f64)) -> bool {
+    surface == Surface::Home
+        && HomeLayout::new(size.0, size.1, scale)
+            .go
+            .contains(cursor.0, cursor.1)
+}
+
+/// O "Ir" em degradê, texto legivel sobre o meio do degradê.
+unsafe fn draw_go_gradient(
+    hdc: *mut core::ffi::c_void,
+    rect: UiRect,
+    phase: f32,
+    font: *mut core::ffi::c_void,
+    theme: &Theme,
+) {
+    let width = rect.width.round() as i32;
+    let height = rect.height.round() as i32;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let (from, to) = (theme.accent, GO_GRADIENT_END);
+    let pixels = pill_pixels(
+        width,
+        height,
+        rect.height / 2.0,
+        &|t| go_gradient_color(from, to, t, phase),
+        None,
+        theme.page_bg,
+    );
     blit_bgrx(
         hdc,
         &pixels,
@@ -18389,6 +18875,21 @@ unsafe fn fill_pill(
         rect.y.round() as i32,
         width,
         height,
+    );
+    SelectObject(hdc, font as _);
+    SetTextColor(hdc, rgb3(on_color(mix(from, to, 0.5))));
+    SetBkMode(hdc, TRANSPARENT as i32);
+    let mut text_rect = RECT {
+        left: rect.x.round() as i32,
+        top: rect.y as i32,
+        right: (rect.x + rect.width) as i32,
+        bottom: (rect.y + rect.height) as i32,
+    };
+    draw_text(
+        hdc,
+        "Ir",
+        &mut text_rect,
+        DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
     );
 }
 
@@ -18760,7 +19261,9 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       }
       if (key === 'u') { e.preventDefault(); act('viewsource'); return; }
       switch (key) {
-        case 'r': e.preventDefault(); act('reload'); return;
+        // Ctrl+R liga/desliga a rolagem automatica (pedido do dono);
+        // recarregar fica no F5 e no Ctrl+Shift+R.
+        case 'r': e.preventDefault(); act('autoscroll'); return;
         case 'l': e.preventDefault(); act('omnibox'); return;
         case 'h': e.preventDefault(); act('history'); return;
         case 'n':
@@ -19764,9 +20267,12 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
     return true;
   }
 
+  // UM so listener de clique no window (o gate scripts/test-link-routing.mjs
+  // exige-o): primeiro o link; se nao era link, o botao de enviar da IA.
   listen(window, 'click', (event) => {
     if (event.button !== 0) return;
-    routeLink(event, !!(event.ctrlKey || event.metaKey));
+    if (routeLink(event, !!(event.ctrlKey || event.metaKey))) return;
+    askFromSendButton(event);
   }, true);
 
   // O botao do meio usa auxclick. Captura no window pela mesma razao: sites de
@@ -19774,6 +20280,147 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
   listen(window, 'auxclick', (event) => {
     if (event.button !== 1) return;
     routeLink(event, true);
+  }, true);
+
+  // Pergunta escrita numa coluna tambem pesquisa nas outras (pedido do
+  // dono: "escrever pesquisar, tem que pesquisar em todos tambem").
+  //  - Na pagina da propria IA (Google IA, ChatGPT, Claude, Gemini): o texto
+  //    enviado com Enter ou com o botao de enviar vai as OUTRAS colunas
+  //    ('ask'); esta segue a conversa dela.
+  //  - Num site aberto por um link (as colunas no mesmo site): a pesquisa GET
+  //    desse site abre o resultado em todas ('link'), tal como o clique.
+  //  POST, senhas, e-mails e eventos sinteticos nunca sao replicados.
+  const ASK_MAX = 2000;
+  const ASK_REPEAT_MS = 2000;
+  const SEND_LABEL = /\bsend\b|enviar|submit/i;
+  const clock = Date.now;
+  const toArray = Array.from;
+  let lastAsk = { text: '', at: 0 };
+  let lastComposer = null;
+
+  function onProviderPage() {
+    let here;
+    try { here = new URL(location.href); } catch (_) { return false; }
+    const host = here.hostname.toLowerCase();
+    if (host === 'chatgpt.com' || host.endsWith('.chatgpt.com') || host === 'chat.openai.com') return true;
+    if (host === 'claude.ai' || host.endsWith('.claude.ai')) return true;
+    if (host === 'gemini.google.com') return true;
+    return (host === 'google.com' || host.endsWith('.google.com'))
+      && here.searchParams.get('udm') === '50';
+  }
+
+  // Texto de uma caixa onde se escreve uma pergunta; null para tudo o resto
+  // (senhas, e-mails, codigos, botoes...).
+  function composerText(node) {
+    if (!node || !node.tagName) return null;
+    const tag = String(node.tagName).toUpperCase();
+    if (tag === 'TEXTAREA') return String(node.value || '');
+    if (tag === 'INPUT') {
+      const type = String(node.type || 'text').toLowerCase();
+      if (type !== 'text' && type !== 'search') return null;
+      const auto = String((node.getAttribute && node.getAttribute('autocomplete')) || '').toLowerCase();
+      if (/user|mail|pass|code|tel|cc-/.test(auto)) return null;
+      return String(node.value || '');
+    }
+    if (node.isContentEditable) return String(node.innerText || node.textContent || '');
+    return null;
+  }
+
+  function pathOf(event) {
+    return typeof event.composedPath === 'function' ? event.composedPath() : [event.target];
+  }
+
+  function composerFromEvent(event) {
+    for (const candidate of pathOf(event)) {
+      if (composerText(candidate) !== null) return candidate;
+    }
+    return null;
+  }
+
+  function sendAsk(text) {
+    const clean = String(text || '').trim();
+    if (!clean || clean.length > ASK_MAX) return;
+    const at = clock();
+    // Enter e o submit do mesmo formulario chegam os dois: uma pergunta so.
+    if (clean === lastAsk.text && at - lastAsk.at < ASK_REPEAT_MS) return;
+    lastAsk = { text: clean, at: at };
+    act('ask', { col:colIndex, text:clean });
+  }
+
+  // Um GET de um formulario com texto escrito -> a URL que ele abriria.
+  function formSearchUrl(form, submitter) {
+    const method = String((form.getAttribute && form.getAttribute('method')) || 'get').toLowerCase();
+    if (method !== 'get') return null;
+    let target;
+    try {
+      target = new URL((form.getAttribute && form.getAttribute('action')) || location.href, location.href);
+    } catch (_) { return null; }
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') return null;
+    target.search = '';
+    let typed = false;
+    for (const field of toArray(form.elements || [])) {
+      if (!field || !field.name || field.disabled) continue;
+      const type = String(field.type || '').toLowerCase();
+      if (type === 'password' || type === 'file' || type === 'email') return null;
+      if ((type === 'checkbox' || type === 'radio') && !field.checked) continue;
+      if ((type === 'submit' || type === 'button' || type === 'image' || type === 'reset')
+          && field !== submitter) continue;
+      const value = String(field.value == null ? '' : field.value);
+      if ((type === 'search' || type === 'text' || type === 'textarea') && value.trim()) typed = true;
+      target.searchParams.append(String(field.name), value);
+    }
+    return typed ? target : null;
+  }
+
+  listen(window, 'focusin', (event) => {
+    if (!event.isTrusted) return;
+    const node = composerFromEvent(event);
+    if (node) lastComposer = node;
+  }, true);
+
+  listen(window, 'keydown', (event) => {
+    if (!event.isTrusted || event.key !== 'Enter') return;
+    // Shift+Enter e quebra de linha; durante a composicao (acentos, IME) o
+    // Enter ainda nao e envio.
+    if (event.shiftKey || event.ctrlKey || event.altKey || event.metaKey || event.isComposing) return;
+    if (!onProviderPage() || neuraliaControlFromEvent(event)) return;
+    const node = composerFromEvent(event);
+    if (node) sendAsk(composerText(node));
+  }, true);
+
+  // Chamado pelo listener de clique do window, depois do encaminhamento de
+  // links.
+  function askFromSendButton(event) {
+    if (!event.isTrusted || event.button !== 0 || !onProviderPage()) return;
+    if (neuraliaControlFromEvent(event) || !lastComposer) return;
+    const button = pathOf(event).find((node) => node && node.tagName
+      && (String(node.tagName).toUpperCase() === 'BUTTON'
+        || (node.getAttribute && node.getAttribute('role') === 'button')));
+    if (!button || !button.getAttribute) return;
+    const label = [
+      button.getAttribute('aria-label'),
+      button.getAttribute('data-testid'),
+      button.getAttribute('title')
+    ].join(' ');
+    if (SEND_LABEL.test(label)) sendAsk(composerText(lastComposer));
+  }
+
+  listen(window, 'submit', (event) => {
+    if (!event.isTrusted) return;
+    const form = event.target;
+    if (!form || !form.tagName || String(form.tagName).toUpperCase() !== 'FORM') return;
+    if (onProviderPage()) {
+      for (const field of toArray(form.elements || [])) {
+        const text = composerText(field);
+        if (text && text.trim()) { sendAsk(text); return; }
+      }
+      return;
+    }
+    const target = formSearchUrl(form, event.submitter || null);
+    if (!target) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    act('link', { col:colIndex, url:target.href, aside:false });
   }, true);
 
   listen(document, 'dblclick', (event) => {
