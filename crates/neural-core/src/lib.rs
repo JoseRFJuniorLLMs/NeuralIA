@@ -5,9 +5,11 @@
 pub mod agent_protocol;
 pub mod agent_security;
 pub mod config;
+pub mod epub;
 pub mod error;
 pub mod history;
 pub mod intent;
+pub mod library;
 pub mod local_intelligence;
 pub mod memory;
 pub mod pomodoro;
@@ -21,9 +23,14 @@ pub mod tissue;
 pub mod zettel;
 
 pub use config::CoreConfig;
+pub use epub::{
+    Creator, EpubArchive, EpubBook, EpubError, EpubMetadata, LimitKind, ManifestItem,
+    PageProgression, SpineItem, TocEntry,
+};
 pub use error::{NeuralError, Result};
 pub use history::{HistoryEntry, HistoryKind, HistoryStore};
 pub use intent::{Intent, is_pdf_url, parse_intent};
+pub use library::{BookEntry, Bookmark, Library, LibraryError, Position};
 pub use reader::{ReaderArticle, ReaderBlock, ReaderClient};
 pub use render::reader_html;
 pub use search::{chatgpt_search_url, claude_search_url, google_ai_url, perplexity_search_url};
