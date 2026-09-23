@@ -16584,11 +16584,13 @@ __fire('keydown', { key: 'F8' });
         }
     }
 
-    /// Um `[[package]]` do Cargo.lock: nome, versao e as dependencias tal como
-    /// o lock as escreve ("nome" ou "nome versao" quando ha varias).
+    /// Um `[[package]]` do Cargo.lock: nome, versao, origem (ausente nos
+    /// membros do workspace) e as dependencias tal como o lock as escreve --
+    /// "nome", ou "nome versao" quando ha varias versoes da mesma crate.
     struct LockPackage {
         name: String,
         version: String,
+        source: Option<String>,
         dependencies: Vec<String>,
     }
 
@@ -16606,6 +16608,7 @@ __fire('keydown', { key: 'F8' });
                 packages.push(LockPackage {
                     name: String::new(),
                     version: String::new(),
+                    source: None,
                     dependencies: Vec::new(),
                 });
                 in_dependencies = false;
@@ -16630,69 +16633,109 @@ __fire('keydown', { key: 'F8' });
                 package.name = name;
             } else if let Some(version) = quoted(line, "version") {
                 package.version = version;
+            } else if let Some(source) = quoted(line, "source") {
+                package.source = Some(source);
             }
         }
         packages
     }
 
-    /// FNV-1a 64 sobre as linhas "nome versao" ordenadas: muda com qualquer
-    /// crate que entre, saia ou mude de versao.
-    fn lock_package_fingerprint(packages: &[LockPackage]) -> u64 {
-        let mut lines: Vec<String> = packages
+    /// A entrada do lock a que uma dependencia ("nome" ou "nome versao ...")
+    /// se refere. Uma referencia que nao resolve e um lock que este parser
+    /// nao entende, e isso tem de falhar alto, nao encolher o conjunto.
+    fn lock_entry(packages: &[LockPackage], dependency: &str) -> usize {
+        let mut parts = dependency.split(' ');
+        let name = parts.next().unwrap_or_default();
+        let version = parts.next();
+        let found: Vec<usize> = packages
             .iter()
-            .map(|package| format!("{} {}\n", package.name, package.version))
+            .enumerate()
+            .filter(|(_, package)| {
+                package.name == name && version.is_none_or(|version| package.version == version)
+            })
+            .map(|(index, _)| index)
             .collect();
-        lines.sort();
-        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        for byte in lines.iter().flat_map(|line| line.bytes()) {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        assert_eq!(found.len(), 1, "dependencia {dependency:?} no Cargo.lock");
+        found[0]
+    }
+
+    /// Os pacotes ("nome versao") que a arvore compila a partir dos membros do
+    /// workspace, seguindo as arestas que `keep(de, para)` deixa passar.
+    fn lock_closure(
+        packages: &[LockPackage],
+        keep: impl Fn(&LockPackage, &LockPackage) -> bool,
+    ) -> std::collections::BTreeSet<String> {
+        let mut seen = vec![false; packages.len()];
+        let mut pending: Vec<usize> = packages
+            .iter()
+            .enumerate()
+            .filter(|(_, package)| package.source.is_none())
+            .map(|(index, _)| index)
+            .collect();
+        while let Some(index) = pending.pop() {
+            if std::mem::replace(&mut seen[index], true) {
+                continue;
+            }
+            let from = &packages[index];
+            for dependency in &from.dependencies {
+                let to = lock_entry(packages, dependency);
+                if keep(from, &packages[to]) {
+                    pending.push(to);
+                }
+            }
         }
-        hash
+        packages
+            .iter()
+            .zip(seen)
+            .filter(|(_, seen)| *seen)
+            .map(|(package, _)| format!("{} {}", package.name, package.version))
+            .collect()
     }
 
     #[test]
     fn webview2_bindings_add_no_crate_to_the_lock() {
-        // O conjunto de pacotes do Cargo.lock de fix/popup-focus-theft
-        // (6b91d6b), antes do menu de rolagem. Uma crate nova na arvore muda
-        // estes dois numeros e so entra com o sim do dono: atualizar aqui e
-        // escrever no commit qual entrou e porque.
-        const LOCKED_PACKAGE_COUNT: usize = 419;
-        const LOCKED_PACKAGE_FINGERPRINT: u64 = 0x450c_2a56_a5a7_0730;
+        // Os dois nomes que o neural-app passou a declarar para chegar ao
+        // ContextMenuRequested (ICoreWebView2_11).
+        const BINDINGS: [&str; 2] = ["webview2-com", "windows-core"];
 
         let packages = parse_cargo_lock(include_str!("../../../Cargo.lock"));
-        let fingerprint = lock_package_fingerprint(&packages);
-        assert_eq!(
-            (packages.len(), fingerprint),
-            (LOCKED_PACKAGE_COUNT, LOCKED_PACKAGE_FINGERPRINT),
-            "o Cargo.lock ganhou, perdeu ou mudou crates: {} pacotes, impressao {fingerprint:#018x}",
-            packages.len()
-        );
+        let app = &packages[lock_entry(&packages, "neural-app")];
+        let wry = &packages[lock_entry(&packages, "wry")];
 
-        // Os bindings COM que a app nomeia sao os MESMOS pacotes que o wry ja
-        // puxa: a mesma entrada do lock, nao uma segunda versao ao lado.
-        let dependencies_of = |name: &str| {
-            let matches: Vec<&LockPackage> = packages
+        // Nao e vacuo: o neural-app nomeia mesmo cada binding, uma vez so, e
+        // a entrada e a MESMA que o wry ja usa -- nao uma segunda versao.
+        for binding in BINDINGS {
+            let named: Vec<usize> = app
+                .dependencies
                 .iter()
-                .filter(|package| package.name == name)
+                .map(|dependency| lock_entry(&packages, dependency))
+                .filter(|&entry| packages[entry].name == binding)
                 .collect();
-            assert_eq!(matches.len(), 1, "{name} no lock");
-            matches[0].dependencies.clone()
-        };
-        let app = dependencies_of("neural-app");
-        let wry = dependencies_of("wry");
-        for binding in ["webview2-com", "windows-core"] {
-            let from_app: Vec<&String> = app
+            assert_eq!(named.len(), 1, "neural-app -> {binding}");
+            let via_wry = wry
+                .dependencies
                 .iter()
-                .filter(|dependency| dependency.split(' ').next() == Some(binding))
-                .collect();
-            assert_eq!(from_app.len(), 1, "neural-app -> {binding}");
+                .map(|dependency| lock_entry(&packages, dependency))
+                .any(|entry| entry == named[0]);
             assert!(
-                wry.contains(from_app[0]),
-                "neural-app usa {} e o wry nao",
-                from_app[0]
+                via_wry,
+                "neural-app usa {binding} {} e o wry nao",
+                packages[named[0]].version
             );
         }
+
+        // O conjunto de pacotes compilados com as arestas novas e o mesmo que
+        // sem elas: nomear os bindings nao pos crate nenhuma na arvore.
+        let with_bindings = lock_closure(&packages, |_, _| true);
+        let without_bindings = lock_closure(&packages, |from, to| {
+            !(from.name == "neural-app" && BINDINGS.contains(&to.name.as_str()))
+        });
+        let added: Vec<&String> = with_bindings.difference(&without_bindings).collect();
+        assert!(
+            added.is_empty(),
+            "os bindings do WebView2 puseram crates novas no Cargo.lock: {added:?}"
+        );
+        assert!(with_bindings.contains(&format!("wry {}", wry.version)));
     }
 
     #[test]
