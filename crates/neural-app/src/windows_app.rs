@@ -2251,7 +2251,7 @@ body{display:flex;flex-direction:column;border-left:1px solid var(--line)}
 header{display:flex;align-items:center;justify-content:space-between;padding:14px 12px 8px 18px}
 h1{font-size:17px;font-weight:600;margin:0}
 #close{background:none;border:0;color:var(--muted);font-size:18px;cursor:pointer;border-radius:8px;width:32px;height:32px}
-#close:hover{background:var(--surface);color:var(--fg)}
+#close:hover{background:#e81123;color:#fff}
 .search{padding:4px 16px 10px}
 #q{width:100%;padding:10px 14px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--fg);font:inherit;outline:none}
 #q:focus{border-color:var(--accent)}
@@ -11502,14 +11502,15 @@ unsafe fn paint_comparator_bar_with_contexts(
             font,
             theme,
         );
-        draw_button(
+        // Fechar a fonte: vermelho debaixo do rato, como o fechar da janela.
+        draw_pill(
             target,
             close,
             "×",
-            hover == Some(BarHit::SplitClose),
+            caption_button_style(2, hover == Some(BarHit::SplitClose), theme),
             scale,
             font,
-            theme,
+            theme.bar_bg,
         );
     }
 
@@ -12870,6 +12871,8 @@ mod tests {
         );
         assert_eq!(close.text, (255, 255, 255), "com a cruz branca");
         assert_ne!(caption_button_style(2, false, &theme).fill, CLOSE_HOVER_RED);
+        // O ✕ do painel lateral segue a mesma regra (CSS da pagina local).
+        assert!(PANEL_HTML.contains("#close:hover{background:#e81123;color:#fff}"));
         for index in [0, 1] {
             let style = caption_button_style(index, true, &theme);
             assert_ne!(style.fill, CLOSE_HOVER_RED, "so o fechar fica vermelho");
