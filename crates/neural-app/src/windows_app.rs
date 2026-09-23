@@ -18920,7 +18920,15 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       const found = Object.getOwnPropertyDescriptor(proto, name);
       return uncurry(found && found.get);
     }
+    function setterOf(proto, name) {
+      const found = Object.getOwnPropertyDescriptor(proto, name);
+      return uncurry(found && found.set);
+    }
     const listen = uncurry(EventTarget.prototype.addEventListener);
+    const setAttr = uncurry(Element.prototype.setAttribute);
+    const setText = setterOf(Node.prototype, 'textContent');
+    const setStyle = uncurry(CSSStyleDeclaration.prototype.setProperty);
+    const connected = getterOf(Node.prototype, 'isConnected');
     const later = setTimeout;
     const cancelLater = clearTimeout;
     const thenOf = uncurry(Promise.prototype.then);
@@ -18994,9 +19002,10 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     let host = null;
     let bar = null;
     let note = null;
-    const buttons = {};
+    const buttons = Object.create(null);
     let visible = false;
     let text = '';
+    let shownAt = null;
     let showTimer = 0;
     let feedbackTimer = 0;
     let voiceTimer = 0;
@@ -19004,6 +19013,9 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     let voicesHooked = false;
     let speaking = false;
     let speechRun = 0;
+    // A fala em curso fica referenciada: o Chromium recolhe uma
+    // SpeechSynthesisUtterance sem dono e o 'end' dela nunca chega.
+    let speechHold = null;
 
     function guard(fn) {
       return function (event) {
@@ -19012,7 +19024,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     }
 
     function important(node, name, value) {
-      node.style.setProperty(name, value, 'important');
+      setStyle(node.style, name, value, 'important');
     }
 
     function elementOf(node) {
@@ -19103,13 +19115,15 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     }
 
     function setLabel(name, label) {
-      if (buttons[name]) buttons[name].textContent = label;
+      if (buttons[name]) setText(buttons[name], label);
     }
 
+    // Mensagem dentro da barra; a barra cresce e volta a caber no ecra.
     function say(message) {
       if (!note) return;
-      note.textContent = message;
-      note.className = message ? 'msg on' : 'msg';
+      setText(note, message);
+      setAttr(note, 'class', message ? 'msg on' : 'msg');
+      if (visible && shownAt) place(shownAt);
     }
 
     function clearFeedback() {
@@ -19124,10 +19138,11 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
 
     function button(name, label, run) {
       const b = makeElement(document, 'button');
-      b.setAttribute('type', 'button');
-      b.setAttribute('tabindex', '-1');
-      b.setAttribute('data-action', name);
-      b.textContent = label;
+      setAttr(b, 'type', 'button');
+      // Fora da ordem do Tab e sem foco ao clicar: o foco fica na pagina.
+      setAttr(b, 'tabindex', '-1');
+      setAttr(b, 'data-action', name);
+      setText(b, label);
       // mousedown sem efeito por omissao: o foco e a selecao ficam na pagina.
       listen(b, 'mousedown', guard(function (e) { e.preventDefault(); }));
       listen(b, 'click', guard(function (e) {
@@ -19142,7 +19157,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
 
     function build() {
       if (host) {
-        if (!host.isConnected) appendTo(document.documentElement, host);
+        if (!connected(host)) appendTo(document.documentElement, host);
         return;
       }
       host = makeElement(document, 'div');
@@ -19167,27 +19182,32 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       }
       if (!styled) {
         const style = makeElement(document, 'style');
-        style.textContent = CSS;
+        setText(style, CSS);
         appendTo(root, style);
       }
       bar = makeElement(document, 'div');
-      bar.className = 'bar';
-      bar.setAttribute('role', 'toolbar');
-      bar.setAttribute('aria-label', 'Texto selecionado');
+      setAttr(bar, 'class', 'bar');
+      setAttr(bar, 'role', 'toolbar');
+      setAttr(bar, 'aria-label', 'Texto selecionado');
       appendTo(root, bar);
       if (searchAllowed) button('search', LABELS.search, search);
       button('copy', LABELS.copy, copy);
       if (speakNow) button('speak', LABELS.speak, toggleSpeech);
       note = makeElement(document, 'div');
-      note.className = 'msg';
-      note.setAttribute('role', 'status');
+      setAttr(note, 'class', 'msg');
+      setAttr(note, 'role', 'status');
       appendTo(bar, note);
       appendTo(document.documentElement, host);
     }
 
+    // Perto do fim da selecao: por cima se couber, senao por baixo; sempre
+    // dentro da area visivel (sem a barra de rolagem).
     function place(rect) {
-      const vw = window.innerWidth || 0;
-      const vh = window.innerHeight || 0;
+      const root = document.documentElement;
+      let vw = window.innerWidth || 0;
+      let vh = window.innerHeight || 0;
+      if (root && root.clientWidth > 0 && root.clientWidth < vw) vw = root.clientWidth;
+      if (root && root.clientHeight > 0 && root.clientHeight < vh) vh = root.clientHeight;
       const box = boxOf(host);
       const w = box && box.width > 0 ? box.width : 320;
       const h = box && box.height > 0 ? box.height : 44;
@@ -19205,21 +19225,24 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     function show(snap) {
       build();
       text = snap.text;
+      shownAt = snap.rect;
       clearFeedback();
       say('');
       important(host, 'visibility', 'hidden');
       important(host, 'display', 'block');
-      place(snap.rect);
+      place(shownAt);
       important(host, 'visibility', 'visible');
       visible = true;
     }
 
-    function hide(keepPending) {
-      if (!keepPending && showTimer) { cancelLater(showTimer); showTimer = 0; }
+    // Escondida, a barra nao deixa relogio nenhum a correr.
+    function hide() {
+      if (showTimer) { cancelLater(showTimer); showTimer = 0; }
       clearFeedback();
       if (host) important(host, 'display', 'none');
       visible = false;
       text = '';
+      shownAt = null;
     }
 
     function check() {
@@ -19246,10 +19269,13 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       return busy;
     }
 
+    // A pergunta vai inteira ou nao vai: acima do tecto nada sai da pagina
+    // e a barra diz porque.
     function search() {
       const question = searchable(text);
       if (!question) { hide(); return; }
       if (codePoints(question) > SEARCH_MAX) { say(TOO_LONG); return; }
+      stopSpeech();
       // Envelope montado so com strings: o serializador nunca ve um objeto
       // em que a pagina possa pendurar um toJSON.
       post('{"v":1,"cap":"' + capability + '","action":"search","args":{"text":'
@@ -19326,7 +19352,12 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
         let piece = String(pieces[i] || '').replace(/\s+/g, ' ').trim();
         while (piece.length > SPEECH_CHUNK) {
           let cut = piece.lastIndexOf(' ', SPEECH_CHUNK);
-          if (cut < SPEECH_CHUNK / 2) cut = SPEECH_CHUNK;
+          if (cut < SPEECH_CHUNK / 2) {
+            // Sem espaco: corte seco, mas nunca a meio de um par UTF-16.
+            cut = SPEECH_CHUNK;
+            const high = piece.charCodeAt(cut - 1);
+            if (high >= 0xD800 && high <= 0xDBFF) cut--;
+          }
           if (current) { out.push(current); current = ''; }
           out.push(piece.slice(0, cut).trim());
           piece = piece.slice(cut).trim();
@@ -19367,6 +19398,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     function stopSpeech() {
       speechRun++;
       clearVoiceWait();
+      speechHold = null;
       if (speaking) {
         speaking = false;
         try { cancelSpeech(synth); } catch (err) {}
@@ -19377,6 +19409,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     function spoken(run) {
       if (run !== speechRun) return;
       speaking = false;
+      speechHold = null;
       setLabel('speak', LABELS.speak);
       if (!stillSelected()) hide();
     }
@@ -19407,6 +19440,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
           utterance.lang = voice.lang;
           listen(utterance, 'end', guard(sayNext));
           listen(utterance, 'error', guard(function () { spoken(run); }));
+          speechHold = utterance;
           speakNow(synth, utterance);
         }
         sayNext();
@@ -19444,7 +19478,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       if (visible && !speaking && !stillSelected()) hide();
     }));
 
-    const quietHide = guard(function () { if (!speaking) hide(true); });
+    const quietHide = guard(function () { if (!speaking) hide(); });
     listen(window, 'scroll', quietHide, true);
     listen(window, 'resize', quietHide);
     listen(window, 'popstate', quietHide);
