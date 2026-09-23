@@ -6418,18 +6418,16 @@ impl App {
     /// das IAs ganham o item de rolagem. Um runtime WebView2 sem o evento
     /// ContextMenuRequested deixa a coluna com o menu nativo e fica no log.
     fn install_context_menu(&self, webview: &WebView, host: WebViewHost) {
-        let Some(col_index) = context_menu_column(host) else {
-            return;
-        };
-        if let Err(error) = register_column_context_menu(
-            webview,
-            col_index,
-            self.auto_scroll.clone(),
-            self.proxy.clone(),
-        ) {
-            debug_log(format_args!(
-                "context menu: coluna {col_index} sem o item de rolagem ({error})"
-            ));
+        let missing = install_column_menu(host, |col_index| {
+            register_column_context_menu(
+                webview,
+                col_index,
+                self.auto_scroll.clone(),
+                self.proxy.clone(),
+            )
+        });
+        if let Some(line) = missing {
+            debug_log(format_args!("{line}"));
         }
     }
 
@@ -16582,6 +16580,45 @@ __fire('keydown', { key: 'F8' });
         ] {
             assert_eq!(context_menu_column(host), None, "{host:?}");
         }
+
+        // O que `install_context_menu` corre a cada WebView construida: o
+        // registo acontece para as colunas, com o indice certo, e para mais
+        // nenhuma.
+        for col in 0..COMPARATOR_COLUMNS {
+            let mut registered = Vec::new();
+            let missing = install_column_menu(WebViewHost::Column(col), |index| {
+                registered.push(index);
+                Ok(())
+            });
+            assert_eq!(registered, [col]);
+            assert_eq!(missing, None, "coluna {col}");
+        }
+        for host in [
+            WebViewHost::Split,
+            WebViewHost::SidePanel,
+            WebViewHost::Service,
+            WebViewHost::Column(COMPARATOR_COLUMNS),
+        ] {
+            let mut registered = Vec::new();
+            let missing = install_column_menu(host, |index| {
+                registered.push(index);
+                Ok(())
+            });
+            assert!(
+                registered.is_empty(),
+                "{host:?} ganhou o item: {registered:?}"
+            );
+            assert_eq!(missing, None, "{host:?}");
+        }
+
+        // Um runtime sem ContextMenuRequested: nada sobe nem para, a falha
+        // vira uma linha de log que diz a coluna e porque.
+        let missing = install_column_menu(WebViewHost::Column(2), |_| {
+            Err("ICoreWebView2_11 indisponível: E_NOINTERFACE".to_string())
+        })
+        .expect("a falha do registo fica no log");
+        assert!(missing.contains("coluna 2"), "{missing}");
+        assert!(missing.contains("E_NOINTERFACE"), "{missing}");
     }
 
     #[test]
@@ -18805,6 +18842,21 @@ fn context_menu_column(host: WebViewHost) -> Option<usize> {
         | WebViewHost::SidePanel
         | WebViewHost::Service => None,
     }
+}
+
+/// O que `install_context_menu` faz com uma WebView acabada de construir:
+/// chama `register` so para uma coluna, com o indice dela, e devolve a linha
+/// de log quando o registo falha -- um runtime WebView2 sem o
+/// ContextMenuRequested. Essa falha nao sobe: a coluna abre, com o menu
+/// nativo inteiro, e so o item de rolagem fica de fora.
+fn install_column_menu(
+    host: WebViewHost,
+    register: impl FnOnce(usize) -> Result<(), String>,
+) -> Option<String> {
+    let col_index = context_menu_column(host)?;
+    register(col_index)
+        .err()
+        .map(|error| format!("context menu: coluna {col_index} sem o item de rolagem ({error})"))
 }
 
 /// Onde o item de rolagem entra num menu nativo com `native` itens: DEPOIS de
