@@ -21,6 +21,8 @@
   const CONTEXT_CHARS = 48;
   const MAX_SPOKEN_CHARS = 280;
   const MAX_LABEL_CHARS = 200;
+  // Precisão com que a posição e os marcadores vão para o disco.
+  const FRACTION_STEP = 0.0001;
 
   const MARGINS = { narrow: 16, normal: 40, wide: 80 };
   const FONT_STEPS = [60, 70, 80, 90, 100, 110, 120, 135, 150, 170, 200, 240];
@@ -84,9 +86,14 @@
     return E.clamp(page / pages, 0, 1);
   }
 
+  // A fração gravada vem arredondada a 4 casas (`roundFraction`): 1/3 da
+  // página 1 de 3 volta como 0.3333, e 0.3333 * 3 = 0.9999 cairia na página 0.
+  // Meio passo do arredondamento por página devolve a página onde a posição
+  // foi gravada (até ~10 000 páginas por capítulo).
   function pageForFraction(fraction, pages) {
     if (!(pages > 1)) return 0;
-    return Math.min(pages - 1, Math.max(0, Math.floor(E.clamp(fraction, 0, 1) * pages + 1e-6)));
+    const slack = FRACTION_STEP / 2 * pages + 1e-6;
+    return Math.min(pages - 1, Math.max(0, Math.floor(E.clamp(fraction, 0, 1) * pages + slack)));
   }
 
   function scrollFraction(scrollTop, scrollHeight) {
@@ -408,6 +415,22 @@
     return range;
   }
 
+  // Um capítulo XHTML que o parser XML recusou (Chromium mostra um
+  // <parsererror>) é pedido outra vez como HTML: `?as=html` faz o servidor
+  // mandá-lo como text/html, que tolera `&nbsp;` sem DTD e tags por fechar.
+  // `null` quando já é a segunda tentativa (nunca em ciclo).
+  function htmlFallbackHref(href) {
+    const text = String(href || '');
+    const bare = text.split('#')[0];
+    if (!bare || bare.indexOf('?') >= 0) return null;
+    return bare + '?as=html';
+  }
+
+  function hasParseError(doc) {
+    return Boolean(doc && typeof doc.getElementsByTagName === 'function' &&
+      doc.getElementsByTagName('parsererror').length);
+  }
+
   function parseChapter(win, source, contentType) {
     const Parser = win.DOMParser;
     if (typeof Parser !== 'function') return null;
@@ -425,7 +448,8 @@
   // ----------------------------------------------------- posição, marcas
 
   function roundFraction(value) {
-    return Math.round(E.clamp(value, 0, 1) * 10000) / 10000;
+    const scale = Math.round(1 / FRACTION_STEP);
+    return Math.round(E.clamp(value, 0, 1) * scale) / scale;
   }
 
   // Guarda a posição sem inundar o disco: a primeira mudança arma um
@@ -1131,10 +1155,20 @@
     onFrameLoad() {
       const doc = this.frameDoc();
       if (!doc || !this.book) return;
-      let here = { kind: 'ignore' };
+      let location = '';
       try {
-        here = classifyLink(String(this.frameWin().location.href), this.id, this.spinePaths);
+        location = String(this.frameWin().location.href);
       } catch (_) { /* sem location: fica o spine pedido */ }
+      if (hasParseError(doc)) {
+        const retry = htmlFallbackHref(location || this.book.spine[this.spine].href);
+        if (retry) {
+          // O alvo pendente fica para quando o capítulo abrir como HTML.
+          if (!this.pendingTarget) this.pendingTarget = { page: 0 };
+          this.frame.src = retry;
+          return;
+        }
+      }
+      const here = location ? classifyLink(location, this.id, this.spinePaths) : { kind: 'ignore' };
       if (here.kind === 'internal' && here.spine !== this.spine) {
         // O iframe navegou sozinho (um link seguido sem passar por aqui).
         this.spine = here.spine;
@@ -1852,6 +1886,7 @@
     pageCount,
     fractionForPage,
     pageForFraction,
+    roundFraction,
     scrollFraction,
     stepPaged,
     clickZone,
@@ -1862,6 +1897,8 @@
     currentTocIndex,
     classifyLink,
     routeLink,
+    htmlFallbackHref,
+    hasParseError,
     findAnchor,
     anchorHref,
     searchText,

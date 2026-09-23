@@ -67,6 +67,12 @@ pub(crate) const PAGE_CSP: &str = "default-src 'none'; script-src 'self'; style-
 /// uma URL `http(s)` remota nunca carrega.
 pub(crate) const BOOK_CSP: &str = "default-src 'none'; img-src http://neuralia-epub.localhost data:; style-src http://neuralia-epub.localhost data: 'unsafe-inline'; font-src http://neuralia-epub.localhost data:; media-src http://neuralia-epub.localhost data:; script-src 'none'; form-action 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors http://neuralia-epub.localhost";
 
+/// Um capítulo XHTML que o parser XML do WebView recusa (uma entidade HTML
+/// como `&nbsp;` sem DTD, uma tag por fechar) volta a ser pedido com esta
+/// query e é servido como `text/html`, que o parser de HTML tolera. A CSP
+/// dos livros continua a mesma.
+pub(crate) const HTML_FALLBACK_QUERY: &str = "as=html";
+
 /// JSON e capas: não são documentos, mas nada neles deve correr.
 const DATA_CSP: &str = "default-src 'none'; frame-ancestors 'none'";
 
@@ -897,8 +903,10 @@ impl EpubServer {
         }
     }
 
-    /// Responde a um pedido (`path` sem a query, tal como vem no URI).
-    pub(crate) fn respond(&mut self, method: &str, path: &str) -> EpubResponse {
+    /// Responde a um pedido. `target` é o caminho e a query tal como vêm no
+    /// URI; só os capítulos olham para a query (`?as=html`, ver
+    /// [`HTML_FALLBACK_QUERY`]).
+    pub(crate) fn respond(&mut self, method: &str, target: &str) -> EpubResponse {
         let head = method.eq_ignore_ascii_case("HEAD");
         if !head && !method.eq_ignore_ascii_case("GET") {
             return EpubResponse::new(
@@ -908,14 +916,18 @@ impl EpubServer {
                 b"method not allowed".as_slice(),
             );
         }
-        let mut response = self.route(path);
+        let (path, query) = match target.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (target, None),
+        };
+        let mut response = self.route(path, query);
         if head {
             response.body = Cow::Borrowed(&[]);
         }
         response
     }
 
-    fn route(&mut self, path: &str) -> EpubResponse {
+    fn route(&mut self, path: &str, query: Option<&str>) -> EpubResponse {
         if let Some((content_type, bytes)) = epub_asset(path) {
             return EpubResponse::new(200, content_type, PAGE_CSP, bytes);
         }
@@ -934,7 +946,7 @@ impl EpubServer {
             let Some((id, entry)) = rest.split_once('/') else {
                 return EpubResponse::not_found();
             };
-            return self.book_resource(&snapshot, id, entry);
+            return self.book_resource(&snapshot, id, entry, query == Some(HTML_FALLBACK_QUERY));
         }
         EpubResponse::not_found()
     }
@@ -1082,7 +1094,13 @@ impl EpubServer {
         EpubResponse::json(200, &value)
     }
 
-    fn book_resource(&mut self, snapshot: &LibrarySnapshot, id: &str, raw: &str) -> EpubResponse {
+    fn book_resource(
+        &mut self,
+        snapshot: &LibrarySnapshot,
+        id: &str,
+        raw: &str,
+        as_html: bool,
+    ) -> EpubResponse {
         // O caminho tem de chegar já normalizado: `..`, `.`, segmentos
         // vazios, `\`, NUL, letra de unidade ou um `%` mal formado são 404.
         let Some(name) = percent_decode_strict(raw) else {
@@ -1110,7 +1128,10 @@ impl EpubServer {
             .book
             .item_for_path(&entry_name)
             .map(|item| item.media_type.as_str());
-        let content_type = served_content_type(declared, &entry_name);
+        let mut content_type = served_content_type(declared, &entry_name);
+        if as_html && content_type == "application/xhtml+xml" {
+            content_type = "text/html";
+        }
         match open.archive.read_capped(&entry_name, MAX_SERVED_BYTES) {
             Ok(bytes) => EpubResponse::new(200, content_type, BOOK_CSP, bytes),
             Err(_) => EpubResponse::new(
@@ -1293,10 +1314,11 @@ fn known_media_type(declared: &str) -> Option<&'static str> {
     })
 }
 
-/// Um pedido para o servidor: método, caminho e a quem responder.
+/// Um pedido para o servidor: método, caminho (com a query) e a quem
+/// responder.
 pub(crate) struct ServeJob {
     pub method: String,
-    pub path: String,
+    pub target: String,
     pub reply: Box<dyn FnOnce(EpubResponse) + Send>,
 }
 
@@ -1309,7 +1331,7 @@ pub(crate) fn spawn_epub_server(shared: SharedLibrary) -> std::io::Result<SyncSe
         .spawn(move || {
             let mut server = EpubServer::new(shared);
             for job in receiver {
-                let response = server.respond(&job.method, &job.path);
+                let response = server.respond(&job.method, &job.target);
                 (job.reply)(response);
             }
         })?;

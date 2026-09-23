@@ -328,10 +328,7 @@ fn epub_origin_serves_only_its_own_assets_with_the_page_csp() {
             Some(PAGE_CSP),
             "{path}"
         );
-        assert_eq!(
-            header(&headers, "X-Content-Type-Options"),
-            Some("nosniff")
-        );
+        assert_eq!(header(&headers, "X-Content-Type-Options"), Some("nosniff"));
         assert_eq!(response.body.as_ref(), epub_asset(path).unwrap().1);
     }
     // A política das páginas: só script nosso, nada inline, rede só para a
@@ -346,6 +343,17 @@ fn epub_origin_serves_only_its_own_assets_with_the_page_csp() {
         assert!(PAGE_CSP.contains(directive), "{directive}");
     }
     assert!(!PAGE_CSP.contains("unsafe-inline") && !PAGE_CSP.contains("unsafe-eval"));
+    // As duas páginas repetem a política num <meta> (vale mesmo que um dia
+    // sejam servidas sem o cabeçalho); o <meta> não aceita frame-ancestors,
+    // o resto tem de ser igual ao cabeçalho.
+    let meta = PAGE_CSP
+        .strip_suffix("; frame-ancestors 'none'")
+        .expect("frame-ancestors fecha a política das páginas");
+    for page in [LIBRARY_PATH, READER_PATH] {
+        let html = std::str::from_utf8(epub_asset(page).unwrap().1).unwrap();
+        let tag = format!(r#"<meta http-equiv="Content-Security-Policy" content="{meta}">"#);
+        assert_eq!(html.matches(&tag).count(), 1, "{page}");
+    }
     for path in [
         "/",
         "/library.htm",
@@ -393,7 +401,11 @@ fn book_resources_are_served_by_exact_path_with_their_type_and_the_book_csp() {
             "OEBPS/Text/ch 2.xhtml",
         ),
         ("OEBPS/Styles/book.css", "text/css", "OEBPS/Styles/book.css"),
-        ("OEBPS/Images/cover.png", "image/png", "OEBPS/Images/cover.png"),
+        (
+            "OEBPS/Images/cover.png",
+            "image/png",
+            "OEBPS/Images/cover.png",
+        ),
         (
             "OEBPS/Images/caf%C3%A9.jpg",
             "image/jpeg",
@@ -406,7 +418,11 @@ fn book_resources_are_served_by_exact_path_with_their_type_and_the_book_csp() {
         ),
         // Tipo do manifest fora da lista: vale a extensão.
         ("OEBPS/Fonts/f.woff2", "font/woff2", "OEBPS/Fonts/f.woff2"),
-        ("OEBPS/nav.xhtml", "application/xhtml+xml", "OEBPS/nav.xhtml"),
+        (
+            "OEBPS/nav.xhtml",
+            "application/xhtml+xml",
+            "OEBPS/nav.xhtml",
+        ),
     ] {
         let response = get(&mut server, &format!("{base}{path}"));
         assert_eq!(response.status, 200, "{path}");
@@ -454,6 +470,56 @@ fn book_resources_are_served_by_exact_path_with_their_type_and_the_book_csp() {
         header(&head.headers(), "Content-Security-Policy"),
         Some(BOOK_CSP)
     );
+}
+
+#[test]
+fn a_chapter_asked_again_as_html_changes_only_its_type() {
+    let fx = fixture();
+    let mut server = fx.server();
+    let base = format!("/book/{}/", fx.id);
+    let chapter = get(&mut server, &format!("{base}OEBPS/Text/ch1.xhtml?as=html"));
+    assert_eq!(chapter.status, 200);
+    assert_eq!(chapter.content_type, "text/html");
+    assert_eq!(chapter.body.as_ref(), CHAPTER_1.as_bytes());
+    assert_eq!(
+        header(&chapter.headers(), "Content-Security-Policy"),
+        Some(BOOK_CSP)
+    );
+    // Só um capítulo (X)HTML muda de tipo; o resto, e outras queries, vão
+    // como sempre.
+    for (path, kind) in [
+        ("OEBPS/Styles/book.css?as=html", "text/css"),
+        ("OEBPS/Scripts/evil.js?as=html", "application/octet-stream"),
+        ("OEBPS/Images/cover.png?as=html", "image/png"),
+        ("OEBPS/Text/ch1.xhtml?as=xhtml", "application/xhtml+xml"),
+        ("OEBPS/Text/ch1.xhtml?x=1&as=html", "application/xhtml+xml"),
+        ("OEBPS/Text/ch1.xhtml?", "application/xhtml+xml"),
+    ] {
+        let response = get(&mut server, &format!("{base}{path}"));
+        assert_eq!(response.status, 200, "{path}");
+        assert_eq!(response.content_type, kind, "{path}");
+        assert_eq!(
+            header(&response.headers(), "Content-Security-Policy"),
+            Some(BOOK_CSP),
+            "{path}"
+        );
+    }
+    // A query nunca muda QUE arquivo é servido.
+    for path in [
+        "OEBPS/Text/nao-existe.xhtml?as=html",
+        "OEBPS/Text/../Text/ch1.xhtml?as=html",
+        "?as=html",
+    ] {
+        assert_eq!(
+            get(&mut server, &format!("{base}{path}")).status,
+            404,
+            "{path}"
+        );
+    }
+    // As páginas ignoram a query (o leitor abre com ?book=).
+    let reader = get(&mut server, "/reader.html?book=0123456789abcdef");
+    assert_eq!(reader.status, 200);
+    assert_eq!(reader.csp, PAGE_CSP);
 }
 
 #[test]
@@ -569,7 +635,10 @@ fn library_and_book_api_expose_metadata_spine_toc_positions_and_bookmarks() {
     let expected = (CHAPTER_1.len() as f64 + CHAPTER_2.len() as f64 * 0.5)
         / (CHAPTER_1.len() + CHAPTER_2.len()) as f64;
     let progress = library["books"][0]["progress"].as_f64().expect("progresso");
-    assert!((progress - expected).abs() < 1e-9, "{progress} != {expected}");
+    assert!(
+        (progress - expected).abs() < 1e-9,
+        "{progress} != {expected}"
+    );
 }
 
 #[test]
@@ -585,7 +654,11 @@ fn a_stored_book_that_became_unreadable_answers_with_a_pt_br_error() {
         "Este livro tem DRM e não pode ser aberto."
     );
     assert_eq!(
-        get(&mut server, &format!("/book/{}/OEBPS/Text/ch1.xhtml", fx.id)).status,
+        get(
+            &mut server,
+            &format!("/book/{}/OEBPS/Text/ch1.xhtml", fx.id)
+        )
+        .status,
         404
     );
 
@@ -640,9 +713,16 @@ fn rejected_books_are_reported_in_pt_br_and_never_enter_the_library() {
             },
         ]
     );
-    assert!(failures[2].message.starts_with("Não foi possível ler o arquivo"));
+    assert!(
+        failures[2]
+            .message
+            .starts_with("Não foi possível ler o arquivo")
+    );
     let mut server = EpubServer::new(worker.shared());
-    assert_eq!(json_body(&get(&mut server, "/api/library"))["books"], json!([]));
+    assert_eq!(
+        json_body(&get(&mut server, "/api/library"))["books"],
+        json!([])
+    );
     let status = EpubNotice::Added {
         books,
         failures,
@@ -881,7 +961,10 @@ fn library_operations_run_through_the_same_ipc_handler() {
         None
     );
     assert_eq!(
-        send(&reader_source, format!(r#"{{"t":"removeBook","id":"{id}"}}"#)),
+        send(
+            &reader_source,
+            format!(r#"{{"t":"removeBook","id":"{id}"}}"#)
+        ),
         None
     );
     flush(&fx.worker);
@@ -932,13 +1015,21 @@ fn library_operations_run_through_the_same_ipc_handler() {
 
     // Remover pela biblioteca: livro e capa vão para a lixeira.
     assert_eq!(
-        send(LIBRARY_SOURCE, format!(r#"{{"t":"removeBook","id":"{id}"}}"#)),
+        send(
+            LIBRARY_SOURCE,
+            format!(r#"{{"t":"removeBook","id":"{id}"}}"#)
+        ),
         None
     );
     flush(&fx.worker);
     let library = Library::open(&fx.library).unwrap();
     assert!(library.get(id).is_none());
-    assert!(fx.library.join(".trash").join(format!("{id}.epub")).exists());
+    assert!(
+        fx.library
+            .join(".trash")
+            .join(format!("{id}.epub"))
+            .exists()
+    );
     let mut notices = Vec::new();
     while let Ok(notice) = fx.notices.try_recv() {
         notices.push(notice);
@@ -966,7 +1057,7 @@ fn the_server_thread_answers_every_request_even_when_it_cannot_serve() {
             &server,
             ServeJob {
                 method: "GET".into(),
-                path,
+                target: path,
                 reply: Box::new(move |response| {
                     let _ = sender.send(response.status);
                 }),
@@ -984,7 +1075,7 @@ fn the_server_thread_answers_every_request_even_when_it_cannot_serve() {
         &dead,
         ServeJob {
             method: "GET".into(),
-            path: "/reader.html".into(),
+            target: "/reader.html".into(),
             reply: Box::new(move |response| {
                 let _ = sender.send(response.status);
             }),

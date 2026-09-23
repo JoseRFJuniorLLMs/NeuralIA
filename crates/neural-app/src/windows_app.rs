@@ -3559,6 +3559,15 @@ unsafe extern "system" fn exit_button_subclass(
     }
 }
 
+/// Ctrl+O na omnibox da Home: o diálogo "Adicionar livros EPUB". Só nativo
+/// (a janela principal responde o mesmo em `main_window_shortcut`); o mapa de
+/// teclas das páginas (`NEURALIA_KEYMAP_SCRIPT`) não o conhece, para não
+/// nascer uma ação IPC nova no canal das páginas remotas. Nas páginas de
+/// livros quem o trata é a própria página, pelo IPC fechado delas.
+fn omnibox_opens_epub_dialog(virtual_key: u32, ctrl: bool, shift: bool) -> bool {
+    virtual_key == u32::from(b'O') && ctrl && !shift
+}
+
 unsafe extern "system" fn omnibox_subclass(
     hwnd: HWND,
     message: u32,
@@ -3613,7 +3622,7 @@ unsafe extern "system" fn omnibox_subclass(
                 return 0;
             }
             // Ctrl+O: adicionar e abrir livros EPUB.
-            0x4F if ctrl && !shift => {
+            key if omnibox_opens_epub_dialog(key, ctrl, shift) => {
                 let _ = proxy.send_event(UserEvent::OpenEpubDialog);
                 return 0;
             }
@@ -5588,9 +5597,9 @@ impl App {
             .is_some_and(|epub| epub.worker.submit(job));
         if submitted && adding > 0 && self.surface == Surface::Home {
             self.status = Some(if adding == 1 {
-                "A adicionar o livro à biblioteca…".to_string()
+                "Adicionando o livro à biblioteca…".to_string()
             } else {
-                format!("A adicionar {adding} livros à biblioteca…")
+                format!("Adicionando {adding} livros à biblioteca…")
             });
             self.request_redraw();
         }
@@ -5672,7 +5681,10 @@ impl App {
                 move |_id, request, responder| {
                     let job = ServeJob {
                         method: request.method().as_str().to_string(),
-                        path: request.uri().path().to_string(),
+                        target: request
+                            .uri()
+                            .path_and_query()
+                            .map_or_else(|| "/".to_string(), |target| target.as_str().to_string()),
                         reply: Box::new(move |response| {
                             responder.respond(epub_http_response(response));
                         }),
@@ -5700,42 +5712,31 @@ impl App {
     }
 
     fn handle_epub_notice(&mut self, notice: EpubNotice) {
-        let on_epub = self.surface == Surface::Epub;
-        if on_epub && let Some(webview) = &self.webview {
+        // A página de livros aberta recebe sempre o aviso (lista, marcadores,
+        // erros); o resto decide-o `plan_epub_notice`.
+        if self.surface == Surface::Epub
+            && let Some(webview) = &self.webview
+        {
             let _ = webview.evaluate_script(&notice_script(&notice));
         }
-        if let EpubNotice::Added {
-            books,
-            failures,
-            open: true,
-        } = &notice
-        {
-            if let ([book], true) = (books.as_slice(), failures.is_empty()) {
-                let id = book.id.clone();
-                self.open_epub_reader(&id);
-                return;
-            }
-            if !books.is_empty() && !on_epub {
+        match plan_epub_notice(&notice, self.surface) {
+            EpubNoticePlan::OpenReader(id) => self.open_epub_reader(&id),
+            EpubNoticePlan::OpenLibrary(line) => {
                 self.open_library();
-                if let Some(line) = notice.status_line() {
+                if let Some(line) = line {
                     self.show_splash(line, 8);
                 }
-                return;
             }
-        }
-        if on_epub {
-            return;
-        }
-        if let Some(line) = notice.status_line() {
-            if self.surface == Surface::Home {
+            EpubNoticePlan::HomeStatus(line) => {
                 self.status = Some(line);
                 self.request_redraw();
-            } else {
-                self.show_splash(line, 8);
             }
-        } else if matches!(notice, EpubNotice::Added { .. }) && self.surface == Surface::Home {
-            self.status = None;
-            self.request_redraw();
+            EpubNoticePlan::Splash(line) => self.show_splash(line, 8),
+            EpubNoticePlan::ClearHomeStatus => {
+                self.status = None;
+                self.request_redraw();
+            }
+            EpubNoticePlan::PageOnly | EpubNoticePlan::Nothing => {}
         }
     }
 
@@ -10223,17 +10224,28 @@ fn route_input(input: &str) -> InputRoute {
         ("biblioteca:", InputRoute::Library),
         ("books:", InputRoute::Library),
         ("library:", InputRoute::Library),
+        ("!livros", InputRoute::Library),
+        ("!books", InputRoute::Library),
     ] {
         if trimmed.eq_ignore_ascii_case(command) {
             return route;
         }
     }
 
-    if trimmed
-        .get(..5)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("epub:"))
-    {
-        let path = trimmed[5..].trim().trim_matches('"').trim();
+    // `epub:` (ou `!epub`) sozinho abre o diálogo; com um caminho à frente
+    // (aspas do "Copiar como caminho" do Explorer aceites) abre esse arquivo.
+    for prefix in ["epub:", "!epub"] {
+        let Some(rest) = trimmed
+            .get(..prefix.len())
+            .filter(|head| head.eq_ignore_ascii_case(prefix))
+            .map(|_| &trimmed[prefix.len()..])
+        else {
+            continue;
+        };
+        if prefix.starts_with('!') && !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let path = rest.trim().trim_matches('"').trim();
         return InputRoute::OpenEpub((!path.is_empty()).then(|| PathBuf::from(path)));
     }
 
@@ -11056,6 +11068,54 @@ fn pin_webview_profile() {
     // SAFETY: corre antes de qualquer thread ser criada.
     unsafe {
         std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &profile);
+    }
+}
+
+/// O que a interface faz com um aviso do worker de livros, conforme a
+/// superfície em que a pessoa está quando ele chega.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EpubNoticePlan {
+    /// Um livro pedido para ler entrou (ou já lá estava): abre no leitor.
+    OpenReader(String),
+    /// Vários entraram fora da biblioteca: abre-a, com a linha dos que
+    /// falharam (se algum falhou).
+    OpenLibrary(Option<String>),
+    /// A página de livros aberta já recebeu o aviso; nada mais a fazer.
+    PageOnly,
+    /// Erro para ler na Home.
+    HomeStatus(String),
+    /// Erro sobre outra superfície.
+    Splash(String),
+    /// Tudo entrou sem nada para abrir: sai o "Adicionando…" da Home.
+    ClearHomeStatus,
+    Nothing,
+}
+
+fn plan_epub_notice(notice: &EpubNotice, surface: Surface) -> EpubNoticePlan {
+    let on_epub = surface == Surface::Epub;
+    if let EpubNotice::Added {
+        books,
+        failures,
+        open: true,
+    } = notice
+    {
+        if let ([book], true) = (books.as_slice(), failures.is_empty()) {
+            return EpubNoticePlan::OpenReader(book.id.clone());
+        }
+        if !books.is_empty() && !on_epub {
+            return EpubNoticePlan::OpenLibrary(notice.status_line());
+        }
+    }
+    if on_epub {
+        return EpubNoticePlan::PageOnly;
+    }
+    match notice.status_line() {
+        Some(line) if surface == Surface::Home => EpubNoticePlan::HomeStatus(line),
+        Some(line) => EpubNoticePlan::Splash(line),
+        None if matches!(notice, EpubNotice::Added { .. }) && surface == Surface::Home => {
+            EpubNoticePlan::ClearHomeStatus
+        }
+        None => EpubNoticePlan::Nothing,
     }
 }
 
@@ -17616,6 +17676,176 @@ __fire('keydown', { key: 'F8' });
             "erros: {}",
             results[0]["errors"]
         );
+    }
+
+    #[test]
+    fn a_book_asked_for_opens_in_the_reader_and_failures_reach_the_person() {
+        use crate::epub_app::{AddFailure, AddedBook};
+        let book = |id: &str| AddedBook {
+            id: id.to_string(),
+            title: "Livro".to_string(),
+        };
+        let drm = AddFailure {
+            file: "protegido.epub".to_string(),
+            message: "Este livro tem DRM e não pode ser aberto.".to_string(),
+        };
+        let line = "“protegido.epub”: Este livro tem DRM e não pode ser aberto.".to_string();
+        let added =
+            |books: Vec<AddedBook>, failures: Vec<AddFailure>, open: bool| EpubNotice::Added {
+                books,
+                failures,
+                open,
+            };
+        // Um livro largado, escolhido no diálogo ou em `epub:`: abre no
+        // leitor, esteja a pessoa onde estiver.
+        for surface in [Surface::Home, Surface::External, Surface::Epub] {
+            assert_eq!(
+                plan_epub_notice(&added(vec![book("aaaa")], vec![], true), surface),
+                EpubNoticePlan::OpenReader("aaaa".to_string()),
+                "{surface:?}"
+            );
+        }
+        // Vários, ou algum que falhou: a biblioteca, com o erro à vista.
+        assert_eq!(
+            plan_epub_notice(
+                &added(vec![book("aaaa"), book("bbbb")], vec![], true),
+                Surface::Home
+            ),
+            EpubNoticePlan::OpenLibrary(None)
+        );
+        assert_eq!(
+            plan_epub_notice(
+                &added(vec![book("aaaa")], vec![drm.clone()], true),
+                Surface::Home
+            ),
+            EpubNoticePlan::OpenLibrary(Some(line.clone()))
+        );
+        // Nada entrou: o erro, na Home ou num splash; a página já o mostra.
+        let failed = added(vec![], vec![drm.clone()], true);
+        assert_eq!(
+            plan_epub_notice(&failed, Surface::Home),
+            EpubNoticePlan::HomeStatus(line.clone())
+        );
+        assert_eq!(
+            plan_epub_notice(&failed, Surface::Comparator),
+            EpubNoticePlan::Splash(line.clone())
+        );
+        assert_eq!(
+            plan_epub_notice(&failed, Surface::Epub),
+            EpubNoticePlan::PageOnly
+        );
+        assert_eq!(
+            plan_epub_notice(
+                &added(vec![book("aaaa"), book("bbbb")], vec![drm], true),
+                Surface::Epub
+            ),
+            EpubNoticePlan::PageOnly
+        );
+        // Adicionados da própria biblioteca (sem abrir), e o resto.
+        assert_eq!(
+            plan_epub_notice(&added(vec![book("aaaa")], vec![], false), Surface::Home),
+            EpubNoticePlan::ClearHomeStatus
+        );
+        let failure = EpubNotice::Failed {
+            message: "A biblioteca de livros está indisponível.".to_string(),
+        };
+        assert_eq!(
+            plan_epub_notice(&failure, Surface::Home),
+            EpubNoticePlan::HomeStatus("A biblioteca de livros está indisponível.".to_string())
+        );
+        assert_eq!(
+            plan_epub_notice(&failure, Surface::Epub),
+            EpubNoticePlan::PageOnly
+        );
+        let bookmarks = EpubNotice::Bookmarks {
+            id: "aaaa".to_string(),
+        };
+        assert_eq!(
+            plan_epub_notice(&bookmarks, Surface::Home),
+            EpubNoticePlan::Nothing
+        );
+        assert_eq!(
+            plan_epub_notice(&bookmarks, Surface::Epub),
+            EpubNoticePlan::PageOnly
+        );
+    }
+
+    #[test]
+    fn ctrl_o_opens_the_book_dialog_on_home_and_in_the_main_window() {
+        use winit::keyboard::ModifiersState;
+        // A omnibox da Home (o subclass do EDIT decide por esta função).
+        assert!(omnibox_opens_epub_dialog(0x4F, true, false));
+        assert!(!omnibox_opens_epub_dialog(0x4F, false, false));
+        assert!(!omnibox_opens_epub_dialog(0x4F, true, true));
+        assert!(!omnibox_opens_epub_dialog(0x50, true, false));
+        assert!(!omnibox_opens_epub_dialog(0x4E, true, false));
+        // A janela principal (winit).
+        let key = |text: &str| Key::Character(text.into());
+        let ctrl = ModifiersState::CONTROL;
+        assert_eq!(
+            main_window_shortcut(&key("o"), ctrl),
+            Some(MainShortcut::OpenEpub)
+        );
+        assert_eq!(
+            main_window_shortcut(&key("O"), ctrl),
+            Some(MainShortcut::OpenEpub)
+        );
+        assert_eq!(
+            main_window_shortcut(&key("o"), ctrl | ModifiersState::SHIFT),
+            None
+        );
+        assert_eq!(
+            main_window_shortcut(&key("o"), ctrl | ModifiersState::ALT),
+            None
+        );
+        assert_eq!(
+            main_window_shortcut(&key("o"), ModifiersState::empty()),
+            None
+        );
+    }
+
+    #[test]
+    fn livros_and_epub_commands_route_to_the_book_library() {
+        for command in [
+            "livros:",
+            " LIVROS: ",
+            "biblioteca:",
+            "Books:",
+            "library:",
+            "!livros",
+            "!BOOKS",
+        ] {
+            assert_eq!(route_input(command), InputRoute::Library, "{command}");
+        }
+        for command in ["epub:", " EPUB: ", "!epub", "!Epub   "] {
+            assert_eq!(
+                route_input(command),
+                InputRoute::OpenEpub(None),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            route_input(r#"epub:"C:\Livros\Meu livro.epub""#),
+            InputRoute::OpenEpub(Some(PathBuf::from(r"C:\Livros\Meu livro.epub")))
+        );
+        assert_eq!(
+            route_input("!epub D:/livros/a.epub"),
+            InputRoute::OpenEpub(Some(PathBuf::from("D:/livros/a.epub")))
+        );
+        assert_eq!(
+            route_input("Epub: livro.epub"),
+            InputRoute::OpenEpub(Some(PathBuf::from("livro.epub")))
+        );
+        for text in [
+            "livros",
+            "livros: dom casmurro",
+            "!epubx",
+            "epubs:",
+            "o que é epub",
+            "https://example.com/livros:",
+        ] {
+            assert_eq!(route_input(text), InputRoute::Intent, "{text}");
+        }
     }
 
     #[test]

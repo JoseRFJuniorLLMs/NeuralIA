@@ -5,7 +5,7 @@
 (function (root) {
   const ORIGIN = 'http://neuralia-epub.localhost';
   const ID_RE = /^[0-9a-f]{16,64}$/;
-  const COMBINING = /[̀-ͯ]/g;
+  const COMBINING = /[\u0300-\u036f]/g;
 
   function isBookId(id) {
     return typeof id === 'string' && ID_RE.test(id);
