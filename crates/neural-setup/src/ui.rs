@@ -52,6 +52,60 @@ pub const WINDOW_H: f64 = 500.0;
 /// sai daqui: esticar a marca para caber num quadrado descaracteriza-a.
 pub const BRAND_ASPECT: f64 = 1254.0 / 874.0;
 
+/// De quanto em quanto tempo o temporizador acorda a janela, em milissegundos:
+/// ~30 quadros por segundo, o mesmo ritmo do tecido na Home da NeuralIA.
+pub const FRAME_MS: u32 = 33;
+/// O maior passo que o tecido da de uma vez. Uma janela que esteve parada (o
+/// disco a meio de uma escrita grande, um depurador) retoma de onde estava em
+/// vez de dar um salto que parece um defeito.
+pub const MAX_FRAME_STEP: f64 = 0.1;
+
+/// O relogio do tecido de fundo: os neuronios mexem-se com o tempo real, mas
+/// so enquanto a janela se ve. Minimizada, o relogio para -- e ao voltar o
+/// tecido continua de onde estava, sem saltar o tempo em que ninguem o viu.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TissueClock {
+    /// O instante do tecido que se desenha agora, em segundos.
+    pub seconds: f64,
+    /// O relogio de parede no ultimo passo.
+    last: Option<f64>,
+}
+
+impl TissueClock {
+    /// Um passo do temporizador: `now` e o relogio de parede em segundos.
+    pub fn advance(self, now: f64, visible: bool) -> Self {
+        let step = self
+            .last
+            .map_or(0.0, |last| (now - last).clamp(0.0, MAX_FRAME_STEP));
+        Self {
+            seconds: if visible {
+                self.seconds + step
+            } else {
+                self.seconds
+            },
+            last: Some(now),
+        }
+    }
+}
+
+/// A tela do tecido para esta janela.
+///
+/// A zona de silencio cobre a coluna inteira do texto, nao so a marca: uma
+/// sinapse a passar por cima do caminho de instalacao torna-o ilegivel, e o
+/// caminho e a unica coisa nesta janela que o utilizador precisa mesmo de
+/// conseguir ler.
+pub fn tissue_field(layout: &Layout) -> neural_core::tissue::Field {
+    let top = layout.logo.y;
+    let bottom = layout.note.bottom();
+    neural_core::tissue::Field::new(layout.client.width, layout.client.height, layout.scale)
+        .with_quiet_ellipse(
+            layout.client.center_x(),
+            (top + bottom) / 2.0,
+            layout.client.width * 0.42,
+            (bottom - top) / 2.0 + 10.0 * layout.scale,
+        )
+}
+
 /// O que esta debaixo do rato.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
@@ -418,6 +472,71 @@ mod tests {
         // Fora da escala nao transborda da calha.
         assert_eq!(layout.filled(4.0).width, layout.track.width);
         assert_eq!(layout.filled(-1.0).width, 0.0);
+    }
+
+    /// O tecido tal como o instalador o desenha, no instante do relogio.
+    fn frame(clock: TissueClock) -> neural_core::tissue::Tissue {
+        neural_core::tissue::tissue_at(&tissue_field(&layout()), clock.seconds)
+    }
+
+    #[test]
+    fn the_neurons_move_from_one_timer_tick_to_the_next() {
+        // O dono quer o instalador "com os neuronios se movimentando". Cada
+        // passo do temporizador tem de dar um tecido diferente do anterior --
+        // um relogio parado desenha sempre o mesmo quadro, e o fundo fica uma
+        // fotografia.
+        let tick = f64::from(FRAME_MS) / 1000.0;
+        let mut clock = TissueClock::default().advance(0.0, true);
+        let mut previous = frame(clock);
+        for step in 1..=30 {
+            clock = clock.advance(step as f64 * tick, true);
+            let current = frame(clock);
+            assert_ne!(
+                current.nodes, previous.nodes,
+                "o tecido ficou parado no passo {step} (t={:.3}s)",
+                clock.seconds
+            );
+            previous = current;
+        }
+        assert!(
+            (clock.seconds - 30.0 * tick).abs() < 1e-9,
+            "o relogio do tecido devia andar com o tempo: {}",
+            clock.seconds
+        );
+    }
+
+    #[test]
+    fn a_minimised_installer_stops_animating_and_resumes_where_it_was() {
+        let tick = f64::from(FRAME_MS) / 1000.0;
+        let shown = TissueClock::default()
+            .advance(0.0, true)
+            .advance(tick, true);
+        let mut hidden = shown;
+        for step in 2..200 {
+            hidden = hidden.advance(step as f64 * tick, false);
+        }
+        assert_eq!(
+            hidden.seconds, shown.seconds,
+            "minimizado, o tecido continuou a andar"
+        );
+        assert_eq!(frame(hidden).nodes, frame(shown).nodes);
+        // Ao voltar, um passo normal -- nao os seis segundos em que esteve
+        // escondido de uma vez.
+        let back = hidden.advance(200.0 * tick, true);
+        assert!(
+            back.seconds - hidden.seconds <= MAX_FRAME_STEP + 1e-12,
+            "voltou com um salto de {}s",
+            back.seconds - hidden.seconds
+        );
+        assert!(back.seconds > hidden.seconds);
+    }
+
+    #[test]
+    fn a_clock_that_goes_backwards_or_stalls_does_not_jerk_the_tissue() {
+        let clock = TissueClock::default().advance(10.0, true);
+        assert_eq!(clock.advance(9.0, true).seconds, clock.seconds);
+        let stalled = clock.advance(40.0, true);
+        assert!((stalled.seconds - clock.seconds - MAX_FRAME_STEP).abs() < 1e-12);
     }
 
     #[test]

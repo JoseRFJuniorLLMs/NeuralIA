@@ -116,19 +116,7 @@ pub unsafe fn text(hdc: HDC, value: &str, rect: Rect, color: Rgb, hfont: HFONT, 
 /// O fundo: neuronios, sinapses e impulsos. E o mesmo tecido do navegador,
 /// vindo do `neural-core`.
 pub unsafe fn tissue_background(hdc: HDC, layout: &Layout, seconds: f64) {
-    // A zona de silencio cobre a coluna inteira do texto, nao so a marca:
-    // uma sinapse a passar por cima do caminho de instalacao torna-o ilegivel,
-    // e o caminho e a unica coisa nesta janela que o utilizador precisa mesmo
-    // de conseguir ler.
-    let top = layout.logo.y;
-    let bottom = layout.note.bottom();
-    let field = tissue::Field::new(layout.client.width, layout.client.height, layout.scale)
-        .with_quiet_ellipse(
-            layout.client.center_x(),
-            (top + bottom) / 2.0,
-            layout.client.width * 0.42,
-            (bottom - top) / 2.0 + 10.0 * layout.scale,
-        );
+    let field = crate::ui::tissue_field(layout);
     let Tissue {
         nodes,
         branches,
