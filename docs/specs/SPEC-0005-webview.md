@@ -63,7 +63,9 @@ http(s) address becomes the note's source, and on the Reader and PDF surfaces
 the source is the address the native side opened. The note is written under
 `<data_dir>/zettel` by a worker thread. A request from the private split is
 refused ("Modo privado: notas não são criadas") without reading the page, and
-the split's privacy is checked again when the read would happen. Gates:
+the split's privacy is checked again when the read would happen; both the
+choice of WebView and that check live in `note_read_view`, which the shipped
+`request_note_from_page` calls. Gates:
 `note_is_a_bare_request_and_carries_no_page_data` (`ipc.rs`),
 `ctrl_shift_z_on_a_page_posts_a_bare_note_request`,
 `a_note_request_reads_its_own_webview_and_never_the_private_split` and

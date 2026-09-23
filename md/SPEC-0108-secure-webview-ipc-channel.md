@@ -69,8 +69,8 @@ Uma string JSON, sempre com estes quatro campos e nenhum outro:
 - `action` — um nome da lista fechada de SPEC-0005 (`home`, `back`, `restore`,
   `autoscroll`, `zoomin`, `zoomout`, `zoomreset`, `reload`, `print`, `omnibox`,
   `history`, `clearhistory`, `fullscreen`, `devtools`, `viewsource`, `newtab`,
-  `expand`, `shortcut-expand`, `minimize`, `split`, `link`, `split-close`, `split-expand`, `palette`,
-  `gmail-state`, `research-answer`, `agent-observation`). Nome fora da lista →
+  `expand`, `shortcut-expand`, `minimize`, `split`, `link`, `ask`, `split-close`, `split-expand`, `palette`,
+  `gmail-state`, `research-answer`, `agent-observation`, `note`). Nome fora da lista →
   ignorado.
 - `args` — objeto com os parâmetros exatos da ação (`col`, `url`, `aside`, `count`,
   `sender`, `subject`, `key`, `text`, `data`). Campos extras ou tipos errados
