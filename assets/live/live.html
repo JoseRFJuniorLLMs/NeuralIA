@@ -15,11 +15,11 @@
 
 <section id="key-screen" hidden>
   <h2>Chave da API do Gemini</h2>
-  <p>Crie a chave em aistudio.google.com/apikey e cole-a aqui.</p>
+  <p>Crie a chave em aistudio.google.com/apikey e cole aqui.</p>
   <input id="key" type="password" autocomplete="off" spellcheck="false" placeholder="Chave da API">
-  <button id="save" class="primary">Guardar e ligar</button>
+  <button id="save" class="primary">Salvar e conectar</button>
   <p id="key-error" class="error" hidden></p>
-  <p class="muted">A chave fica neste computador, cifrada para o seu usuário do Windows, e só é usada para falar com a API do Gemini.</p>
+  <p class="muted">A chave fica neste computador, criptografada para o seu usuário do Windows, e só é usada para falar com a API do Gemini.</p>
 </section>
 
 <section id="live-screen" hidden>
@@ -29,16 +29,20 @@
     <button id="t-camera" class="toggle" aria-pressed="false">Câmera</button>
     <button id="t-mic" class="toggle" aria-pressed="false">Microfone</button>
   </div>
-  <p id="status" class="status">A ligar…</p>
-  <p id="notice" class="notice" hidden></p>
+  <p id="status" class="status">Conectando…</p>
+  <div id="notices" class="notices" hidden></div>
   <div id="error-box" class="error-box" hidden>
     <p id="error"></p>
-    <button id="error-key">Trocar chave</button>
+    <p id="error-detail" class="muted" hidden></p>
+    <div class="error-actions">
+      <button id="restart">Conectar de novo</button>
+      <button id="error-key">Trocar chave</button>
+    </div>
   </div>
   <video id="cam" class="cam" muted playsinline hidden></video>
   <div id="log" class="log" aria-live="polite"></div>
   <footer>
-    <button id="change-key" class="link">Trocar chave</button>
+    <button id="change-key" class="link" title="Apaga a chave salva neste computador e pede outra">Trocar chave</button>
     <span class="muted">Use fones de ouvido para evitar eco.</span>
   </footer>
 </section>

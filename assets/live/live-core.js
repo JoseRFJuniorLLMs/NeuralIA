@@ -7,8 +7,8 @@
 // Tudo o que toca no navegador (WebSocket, AudioContext, getUserMedia,
 // getDisplayMedia, o worklet do microfone, o canvas dos frames e os
 // temporizadores) chega por `env`; a interface chega por `ui`. Assim o ciclo
-// de vida inteiro -- ligar, enviar, tocar, interromper, desligar -- corre em
-// Node com dublês e fica provado sem um ecra.
+// de vida inteiro -- ligar, enviar, tocar, interromper, retomar, desligar --
+// corre em Node com dublês e fica provado sem um ecra.
 (function (root) {
   'use strict';
 
@@ -23,6 +23,14 @@
   const FRAME_INTERVAL_MS = 1000;
   /// 100 ms de voz a 16 kHz por mensagem.
   const MIC_CHUNK_SAMPLES = 1600;
+  /// O mesmo tecto do nativo (LIVE_KEY_MAX_CHARS em gemini_live.rs). Uma
+  /// colagem maior nem cabe no canal do painel: a pagina recusa-a sozinha.
+  const KEY_MAX_CHARS = 256;
+  /// O mesmo texto que o nativo manda para uma chave com forma errada.
+  const INVALID_KEY_NOTICE =
+    'Isso não parece uma chave da API do Gemini. Copie de novo da AI Studio.';
+  /// Religacoes seguidas sem um setupComplete pelo meio antes de desistir.
+  const MAX_RESUMES = 3;
   const SYSTEM_INSTRUCTION =
     'Você é a assistente de voz do NeuralIA, um navegador para Windows. ' +
     'Você vê a tela do usuário (e a câmera, quando ligada) e ouve o microfone. ' +
@@ -55,14 +63,22 @@
     return ENDPOINT + '?key=' + encodeURIComponent(String(key));
   }
 
-  function setupMessage() {
+  /// `handle` retoma uma sessao anterior (o ultimo sessionResumptionUpdate);
+  /// sem ele a sessao e nova.
+  function setupMessage(handle) {
     return {
       setup: {
         model: MODEL,
         generationConfig: { responseModalities: ['AUDIO'] },
         systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
         inputAudioTranscription: {},
-        outputAudioTranscription: {}
+        outputAudioTranscription: {},
+        // Sem compressao do contexto, o Google corta uma sessao com video aos
+        // ~2 minutos (so audio, aos 15). A janela deslizante tira o tecto.
+        contextWindowCompression: { slidingWindow: {} },
+        // Cada ligacao dura ~10 minutos: com isto o servidor manda handles
+        // para a sessao continuar numa ligacao nova.
+        sessionResumption: handle ? { handle: String(handle) } : {}
       }
     };
   }
@@ -146,6 +162,11 @@
     };
   }
 
+  /// O microfone desligou: o servidor deixa de esperar pelo resto da frase.
+  function audioStreamEndMessage() {
+    return { realtimeInput: { audioStreamEnd: true } };
+  }
+
   function videoMessage(jpegBase64) {
     return { realtimeInput: { video: { data: jpegBase64, mimeType: 'image/jpeg' } } };
   }
@@ -204,6 +225,7 @@
     const out = {
       setupComplete: !!message.setupComplete,
       goAway: !!message.goAway,
+      resumeHandle: '',
       error: '',
       audio: [],
       inputText: '',
@@ -211,6 +233,16 @@
       interrupted: false,
       turnComplete: false
     };
+    // So um handle "resumable" serve para retomar; os outros nao se guardam.
+    const update = message.sessionResumptionUpdate;
+    if (
+      update &&
+      update.resumable === true &&
+      typeof update.newHandle === 'string' &&
+      update.newHandle
+    ) {
+      out.resumeHandle = update.newHandle;
+    }
     if (message.error) {
       out.error = String(message.error.message || message.error.status || 'erro do servidor');
     }
@@ -236,21 +268,29 @@
     return out;
   }
 
-  /// Porque a sessao fechou, em portugues, e se a culpa e da chave.
+  /// Porque a sessao fechou, em portugues do Brasil, se a culpa e da chave, e
+  /// o motivo cru do servidor (em ingles) como detalhe a parte.
   function describeClose(code, reason) {
-    const text = String(reason || '');
+    const text = String(reason || '').trim();
+    const detail = text.replace(/[\s.]+$/, '');
     const keyProblem = /api[ _-]?key|permission|unauthori[sz]ed|forbidden|unregistered/i.test(text);
     let message;
     if (keyProblem) {
       message = 'O Google recusou a chave. Use «Trocar chave» e tente de novo.';
+    } else if (/quota|resource[ _-]?exhausted|billing|rate[ _-]?limit/i.test(text)) {
+      message =
+        'A cota da API do Gemini acabou ou falta configurar o faturamento. ' +
+        'Confira o plano em aistudio.google.com.';
+    } else if (/model/i.test(text) && /not (found|supported)|unsupported/i.test(text)) {
+      message = 'O modelo do Gemini Live não está disponível para esta chave.';
     } else if (code === 1000) {
-      message = 'Sessão terminada pelo servidor.';
+      message = 'Sessão encerrada pelo servidor.';
     } else if (code === 1006) {
-      message = 'A ligação caiu (rede ou servidor indisponível).';
+      message = 'A conexão caiu (rede ou servidor indisponível).';
     } else {
-      message = 'O servidor fechou a sessão (código ' + code + ')' + (text ? ': ' + text : '') + '.';
+      message = 'O servidor encerrou a sessão (código ' + code + ').';
     }
-    return { message, keyProblem };
+    return { message, keyProblem, detail };
   }
 
   function stopStream(stream) {
@@ -268,14 +308,14 @@
     const name = (error && error.name) || '';
     if (name === 'NotAllowedError' || name === 'SecurityError' || name === 'InvalidStateError') {
       return what === 'screen'
-        ? 'Tela não partilhada. Clique em «Tela» para escolher uma janela ou ecrã.'
+        ? 'Tela não compartilhada. Clique em «Tela» para escolher uma janela ou a tela inteira.'
         : 'Sem permissão para ' + (what === 'camera' ? 'a câmera' : 'o microfone') + '.';
     }
     if (name === 'NotFoundError' || name === 'OverconstrainedError') {
       return what === 'camera' ? 'Nenhuma câmera encontrada.' : 'Nenhum microfone encontrado.';
     }
     const label = what === 'screen' ? 'a tela' : what === 'camera' ? 'a câmera' : 'o microfone';
-    return 'Não foi possível ligar ' + label + '.';
+    return 'Não foi possível ativar ' + label + '.';
   }
 
   const MIC_CONSTRAINTS = {
@@ -283,9 +323,14 @@
   };
   const CAMERA_CONSTRAINTS = { video: { width: { ideal: 640 }, height: { ideal: 480 } } };
   const SCREEN_CONSTRAINTS = { video: true, audio: false };
+  const SOURCES = ['screen', 'camera', 'mic'];
 
   /// Uma sessao ao vivo. `options.env` traz o navegador (ou os dublês dos
   /// testes), `options.ui` recebe o que mostrar, `options.key` e a chave.
+  ///
+  /// `ui.notice(fonte, texto)` guarda um aviso por fonte ('screen', 'camera',
+  /// 'mic'); texto vazio apaga so o dessa fonte. `ui.ended()` diz que a sessao
+  /// acabou sem o utilizador a desligar.
   function createSession(options) {
     const env = options.env;
     const ui = options.ui || {};
@@ -299,6 +344,8 @@
       closed: false,
       ready: false,
       socket: null,
+      resumeHandle: null,
+      resumes: 0,
       context: null,
       frameTimer: null,
       grabbing: false,
@@ -327,13 +374,7 @@
       return true;
     }
 
-    function onMicChunk(chunk) {
-      if (state.closed || !state.ready || !state.downsample || !state.streams.mic) return;
-      const samples = state.downsample(chunk);
-      if (!samples.length) return;
-      state.micQueue.push(samples);
-      state.micQueued += samples.length;
-      if (state.micQueued < MIC_CHUNK_SAMPLES) return;
+    function takeMicQueue() {
       const joined = new Int16Array(state.micQueued);
       let at = 0;
       for (const part of state.micQueue) {
@@ -342,7 +383,25 @@
       }
       state.micQueue = [];
       state.micQueued = 0;
-      send(audioMessage(joined));
+      return joined;
+    }
+
+    function onMicChunk(chunk) {
+      if (state.closed || !state.ready || !state.downsample || !state.streams.mic) return;
+      const samples = state.downsample(chunk);
+      if (!samples.length) return;
+      state.micQueue.push(samples);
+      state.micQueued += samples.length;
+      if (state.micQueued < MIC_CHUNK_SAMPLES) return;
+      send(audioMessage(takeMicQueue()));
+    }
+
+    /// O microfone desligado a meio de uma frase: o que estava na fila sai, e
+    /// o servidor fica a saber que o audio acabou. Sem isto a deteccao de voz
+    /// dele fica a espera do resto e a IA nao responde.
+    function endAudioStream() {
+      if (state.micQueued > 0) send(audioMessage(takeMicQueue()));
+      send(audioStreamEndMessage());
     }
 
     function flushPlayback() {
@@ -384,8 +443,10 @@
       if (state.closed) return;
       const message = parseServerMessage(text);
       if (!message) return;
+      if (message.resumeHandle) state.resumeHandle = message.resumeHandle;
       if (message.setupComplete) {
         state.ready = true;
+        state.resumes = 0;
         notify('status', 'Ao vivo: a IA vê e ouve o que está ligado.', 'live');
       }
       if (message.interrupted) flushPlayback();
@@ -393,8 +454,12 @@
       if (message.inputText) notify('transcript', 'user', message.inputText);
       if (message.outputText) notify('transcript', 'model', message.outputText);
       if (message.turnComplete) notify('turnComplete');
-      if (message.goAway) notify('status', 'O servidor vai fechar a sessão em breve…', 'warn');
-      if (message.error) notify('error', 'Erro do servidor: ' + message.error, false);
+      if (message.error) notify('error', 'Erro do servidor: ' + message.error, false, '');
+      // Por ultimo: retomar troca o socket, e o resto desta mensagem ainda
+      // era da ligacao velha.
+      if (message.goAway && !resume()) {
+        notify('status', 'O servidor vai encerrar a sessão em breve…', 'warn');
+      }
     }
 
     function sendFrame() {
@@ -439,6 +504,7 @@
       const ticket = ++state.tickets[which];
       const current = () => !state.closed && state.tickets[which] === ticket;
       if (!on || state.closed) {
+        if (which === 'mic' && state.streams.mic && !state.closed) endAudioStream();
         release(which);
         notify('sources', sources());
         return false;
@@ -449,7 +515,7 @@
         if (which === 'screen') stream = await env.getDisplayMedia(SCREEN_CONSTRAINTS);
         else stream = await env.getUserMedia(which === 'mic' ? MIC_CONSTRAINTS : CAMERA_CONSTRAINTS);
       } catch (error) {
-        if (current()) notify('notice', mediaError(which, error));
+        if (current()) notify('notice', which, mediaError(which, error));
         notify('sources', sources());
         return false;
       }
@@ -463,7 +529,7 @@
           mic = await env.createMic(state.context, stream, onMicChunk);
         } catch (_) {
           stopStream(stream);
-          if (current()) notify('notice', mediaError('mic', null));
+          if (current()) notify('notice', 'mic', mediaError('mic', null));
           notify('sources', sources());
           return false;
         }
@@ -480,10 +546,12 @@
         state.downsample = createDownsampler(mic.rate || state.context.sampleRate, INPUT_RATE);
       }
       state.streams[which] = stream;
+      // A fonte ligou: o aviso dela (se havia) ja nao e verdade.
+      notify('notice', which, '');
       if (which === 'camera') notify('camera', stream);
       if (which === 'screen') {
         notify('screen', stream);
-        // "Parar partilha" na barra do Windows termina a faixa por fora.
+        // "Parar compartilhamento" na barra do Windows termina a faixa por fora.
         const [track] = typeof stream.getVideoTracks === 'function' ? stream.getVideoTracks() : [];
         if (track) {
           track.onended = () => {
@@ -495,27 +563,73 @@
       return true;
     }
 
+    /// Larga um socket sem o tratar como o fim da sessao.
+    function detach(socket) {
+      socket.onopen = socket.onmessage = socket.onclose = socket.onerror = null;
+      if (socket.readyState === 0 || socket.readyState === 1) {
+        try {
+          socket.close(1000);
+        } catch (_) {
+          // Ja estava a fechar.
+        }
+      }
+    }
+
+    /// Abre uma ligacao. So a ligacao atual (`state.socket`) conta: as
+    /// mensagens e o fecho de uma que ja foi substituida sao ignorados.
+    function connect(handle) {
+      const socket = new env.WebSocket(socketUrl(key));
+      state.socket = socket;
+      state.ready = false;
+      socket.onopen = () => {
+        if (state.closed || state.socket !== socket) return;
+        socket.send(JSON.stringify(setupMessage(handle)));
+        notify('status', 'Preparando a sessão…', 'connecting');
+      };
+      socket.onmessage = (event) => {
+        frameText(event.data).then((text) => {
+          if (state.socket === socket) handleText(text);
+        }, () => {});
+      };
+      socket.onclose = (event) => {
+        if (state.closed || state.socket !== socket) return;
+        lost(event && event.code, event && event.reason);
+      };
+    }
+
+    /// Continua a mesma sessao numa ligacao nova, com o ultimo handle. A tela,
+    /// a camera e o microfone ficam como estao: so o socket muda.
+    function resume() {
+      if (state.closed || !state.resumeHandle || state.resumes >= MAX_RESUMES) return false;
+      state.resumes += 1;
+      const old = state.socket;
+      state.socket = null;
+      state.ready = false;
+      if (old) detach(old);
+      // O audio a meio da fila era da ligacao velha.
+      state.micQueue = [];
+      state.micQueued = 0;
+      notify('status', 'Reconectando ao Gemini…', 'connecting');
+      connect(state.resumeHandle);
+      return true;
+    }
+
+    /// A ligacao fechou sem o utilizador pedir. Retoma se puder; senao para
+    /// tudo e diz porque.
+    function lost(code, reason) {
+      const closed = describeClose(code, reason);
+      if (!closed.keyProblem && resume()) return;
+      stop();
+      notify('error', closed.message, closed.keyProblem, closed.detail);
+      notify('ended');
+    }
+
     async function start() {
       if (state.started) return;
       state.started = true;
-      notify('status', 'A ligar ao Gemini…', 'connecting');
+      notify('status', 'Conectando ao Gemini…', 'connecting');
       state.context = new env.AudioContext();
-      const socket = new env.WebSocket(socketUrl(key));
-      state.socket = socket;
-      socket.onopen = () => {
-        if (state.closed) return;
-        socket.send(JSON.stringify(setupMessage()));
-        notify('status', 'A preparar a sessão…', 'connecting');
-      };
-      socket.onmessage = (event) => {
-        frameText(event.data).then(handleText, () => {});
-      };
-      socket.onclose = (event) => {
-        if (state.closed) return;
-        const closed = describeClose(event && event.code, event && event.reason);
-        stop();
-        notify('error', closed.message, closed.keyProblem);
-      };
+      connect(null);
       state.frameTimer = env.setInterval(sendFrame, FRAME_INTERVAL_MS);
       await Promise.all([toggle('mic', true), toggle('camera', true), toggle('screen', true)]);
     }
@@ -535,16 +649,7 @@
       flushPlayback();
       const socket = state.socket;
       state.socket = null;
-      if (socket) {
-        socket.onopen = socket.onmessage = socket.onclose = socket.onerror = null;
-        if (socket.readyState === 0 || socket.readyState === 1) {
-          try {
-            socket.close(1000);
-          } catch (_) {
-            // Ja estava a fechar.
-          }
-        }
-      }
+      if (socket) detach(socket);
       const context = state.context;
       state.context = null;
       if (context && context.state !== 'closed') {
@@ -555,6 +660,8 @@
           // Contexto ja fechado.
         }
       }
+      // Com tudo desligado, os avisos das fontes ja nao dizem nada.
+      for (const which of SOURCES) notify('notice', which, '');
       notify('sources', sources());
       notify('status', 'Desligado.', 'idle');
     }
@@ -592,6 +699,9 @@
     FRAME_MAX_SIDE,
     FRAME_INTERVAL_MS,
     MIC_CHUNK_SAMPLES,
+    KEY_MAX_CHARS,
+    INVALID_KEY_NOTICE,
+    MAX_RESUMES,
     SYSTEM_INSTRUCTION,
     WORKLET_NAME,
     WORKLET_SOURCE,
@@ -603,6 +713,7 @@
     base64ToPcm16,
     pcm16ToFloat32,
     audioMessage,
+    audioStreamEndMessage,
     videoMessage,
     frameSize,
     pictureInPicture,

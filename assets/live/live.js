@@ -17,9 +17,10 @@
   const saveButton = $('save');
   const keyError = $('key-error');
   const statusLine = $('status');
-  const notice = $('notice');
+  const notices = $('notices');
   const errorBox = $('error-box');
   const errorText = $('error');
+  const errorDetail = $('error-detail');
   const errorKey = $('error-key');
   const cam = $('cam');
   const log = $('log');
@@ -36,6 +37,13 @@
   let session = null;
   let lastRole = null;
   let lastLine = null;
+
+  // Um aviso por motivo, cada um apagado so quando o seu motivo acaba: o da
+  // chave que nao foi salva, o de cada fonte que nao ligou e o do som que
+  // espera um clique. Uma linha so para todos deixava o ultimo apagar os
+  // outros -- e o "clique em Tela" sumia debaixo do aviso do som.
+  const NOTICE_KINDS = ['save', 'screen', 'camera', 'mic', 'audio'];
+  const noticeText = {};
 
   function theme(vars) {
     if (!vars || typeof vars !== 'object') return;
@@ -54,13 +62,33 @@
     document.body.dataset.state = tone || 'idle';
   }
 
-  function setNotice(text) {
-    notice.textContent = text || '';
-    notice.hidden = !text;
+  function setNotice(kind, text) {
+    if (!NOTICE_KINDS.includes(kind)) return;
+    noticeText[kind] = text || '';
+    while (notices.firstElementChild) notices.removeChild(notices.firstElementChild);
+    let shown = 0;
+    for (const name of NOTICE_KINDS) {
+      if (!noticeText[name]) continue;
+      const line = document.createElement('p');
+      line.className = 'notice';
+      line.dataset.kind = name;
+      line.textContent = noticeText[name];
+      notices.appendChild(line);
+      shown += 1;
+    }
+    notices.hidden = shown === 0;
   }
 
-  function showError(message, keyProblem) {
+  function clearNotices() {
+    for (const name of NOTICE_KINDS) noticeText[name] = '';
+    setNotice('save', '');
+  }
+
+  function showError(message, keyProblem, detail) {
     errorText.textContent = message;
+    const extra = detail && detail !== message ? String(detail) : '';
+    errorDetail.textContent = extra;
+    errorDetail.hidden = !extra;
     errorKey.hidden = !keyProblem;
     errorBox.hidden = false;
     document.body.dataset.state = 'error';
@@ -164,6 +192,11 @@
     sources: renderSources,
     transcript,
     turnComplete,
+    // A sessao acabou sem o utilizador a desligar: o nativo tira o vermelho
+    // do olho, porque ja nada sai.
+    ended() {
+      post('stopped');
+    },
     camera(stream) {
       attach(cam, stream);
       cam.hidden = !stream;
@@ -185,14 +218,15 @@
     stopSession();
     show('live');
     errorBox.hidden = true;
-    setNotice((config && config.notice) || '');
+    clearNotices();
+    setNotice('save', (config && config.notice) || '');
     log.textContent = '';
     turnComplete();
     const current = core.createSession({ env, ui, key: config.key });
     session = current;
     current.start().then(() => {
       if (session === current && current.audioSuspended) {
-        setNotice('Clique no painel para ativar o som e o microfone.');
+        setNotice('audio', 'Clique no painel para ativar o som e o microfone.');
       }
     });
   }
@@ -218,6 +252,13 @@
       keyError.hidden = false;
       return;
     }
+    // Maior do que qualquer chave nem cabe no canal: o nativo largava-a sem
+    // resposta e o botao ficava desativado para sempre.
+    if (value.length > core.KEY_MAX_CHARS) {
+      keyError.textContent = core.INVALID_KEY_NOTICE;
+      keyError.hidden = false;
+      return;
+    }
     keyError.hidden = true;
     saveButton.disabled = true;
     post('save_key', { key: value });
@@ -233,6 +274,14 @@
   $('off').addEventListener('click', () => {
     stopSession();
     post('close');
+  });
+  // Depois de a sessao cair: pede ao nativo para arrancar de novo com a
+  // chave salva (ou pedir uma), sem apagar nada.
+  $('restart').addEventListener('click', () => {
+    stopSession();
+    errorBox.hidden = true;
+    setStatus('Conectando…', 'connecting');
+    post('ready');
   });
   for (const button of [$('change-key'), errorKey]) {
     button.addEventListener('click', () => {
@@ -255,7 +304,7 @@
     () => {
       if (session && session.audioSuspended) {
         session.resumeAudio().then(() => {
-          if (session && !session.audioSuspended) setNotice('');
+          if (session && !session.audioSuspended) setNotice('audio', '');
         });
       }
     },

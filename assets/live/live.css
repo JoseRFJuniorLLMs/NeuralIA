@@ -1,11 +1,25 @@
+/* As cores de partida sao as do tema do NeuralIA (Theme::light e
+   Theme::dark em windows_app.rs, com o acento padrao do Windows): o painel
+   pinta ja com elas, antes de o nativo mandar as do tema em vigor. Sem o
+   bloco escuro, quem usa o tema escuro via um painel branco a piscar. */
 :root {
-  --bg: #ffffff;
-  --surface: #f1f3f4;
-  --fg: #1f1f1f;
-  --muted: #5f6368;
-  --line: #dadce0;
-  --accent: #0b57d0;
+  --bg: #f8f9fa;
+  --surface: #f2f4f6;
+  --fg: #1a1d20;
+  --muted: #6a7077;
+  --line: #dbdfe4;
+  --accent: #0078d4;
   --live: #d93025;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181a;
+    --surface: #25292c;
+    --fg: #e9ecef;
+    --muted: #989fa6;
+    --line: #363b40;
+    --accent: #0078d4;
+  }
 }
 * { box-sizing: border-box; }
 html, body {
@@ -58,9 +72,12 @@ p { margin: 0; }
 }
 .toggle[aria-pressed="true"] { background: var(--live); border-color: var(--live); color: #fff; }
 .status { font-size: 13px; color: var(--muted); }
+.notices { display: flex; flex-direction: column; gap: 6px; }
 .notice { font-size: 13px; color: var(--fg); background: var(--surface); padding: 8px 10px; border-radius: 6px; }
 .error-box { display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--live); border-radius: 8px; padding: 10px; }
 .error-box p { color: var(--live); font-size: 13px; }
+.error-box p.muted { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.error-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .error-box button, .link {
   align-self: flex-start; border: 1px solid var(--line); background: var(--surface);
   border-radius: 999px; padding: 5px 12px; font-size: 13px;

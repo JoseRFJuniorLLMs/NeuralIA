@@ -13,6 +13,7 @@
 //!   `<data_dir>/gemini-live.key`, escrita de forma atomica;
 //! - os scripts que o nativo corre na pagina. A chave so entra na pagina
 //!   quando a sessao arranca, como literal JSON, nunca no URL;
+//! - o estado do painel e do olho da barra numa peca so (`LivePanel`);
 //! - a redacao do log de depuracao: a chave nunca chega ao disco em claro.
 //!
 //! A ligacao a janela (botao, painel, eventos) esta em `windows_app.rs`.
@@ -127,6 +128,21 @@ pub(crate) fn live_ipc_source_ok(source: &str) -> bool {
     live_panel_allows_navigation(source)
 }
 
+/// O porteiro inteiro do canal do painel: a origem E a lista fechada. E isto
+/// que o handler de IPC do painel chama, e o que os gates exercitam.
+pub(crate) fn live_ipc_message(source: &str, body: &str) -> Option<LiveMessage> {
+    if !live_ipc_source_ok(source) {
+        return None;
+    }
+    parse_live_message(body)
+}
+
+/// A regra de navegacao com a assinatura que o wry pede. O painel passa esta
+/// funcao ao `with_navigation_handler`, sem closure pelo meio.
+pub(crate) fn live_panel_navigation(target: String) -> bool {
+    live_panel_allows_navigation(&target)
+}
+
 /// A chave da API. Nunca se imprime: o `Debug` diz so que existe, para um
 /// `{:?}` de um evento (o `UserEvent` deriva Debug) nao a deixar num log.
 pub(crate) struct LiveKey(String);
@@ -158,8 +174,15 @@ impl Drop for LiveKey {
     }
 }
 
-/// Zeros em vez da copia que o alocador deixaria para tras. Zeros sao UTF-8
-/// valido, por isso servem tambem para o `String` da `LiveKey`.
+/// Zera um buffer do proprio NeuralIA antes de o devolver ao alocador. Zeros
+/// sao UTF-8 valido, por isso servem tambem para o `String` da `LiveKey`.
+///
+/// E so higiene, nao uma garantia: a chave passa por copias que ninguem zera
+/// -- o corpo da mensagem que o wry entrega ao handler, o `serde_json::Value`
+/// de `parse_live_message`, o script de arranque e o HSTRING em que o wry o
+/// converte, e a propria pagina no processo do WebView2. Um despejo de memoria
+/// do processo pode ter a chave. O que a protege de verdade e a DPAPI no disco
+/// e ela nunca ir para o log (`redact_debug_secrets`).
 fn wipe(bytes: &mut [u8]) {
     for byte in bytes.iter_mut() {
         unsafe { std::ptr::write_volatile(byte, 0) };
@@ -184,12 +207,17 @@ pub(crate) fn validate_live_key(raw: &str) -> Option<LiveKey> {
 /// O que a pagina do painel pode pedir. Lista fechada.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LiveMessage {
+    /// A pagina carregou, ou o utilizador pediu "Conectar de novo": arranca
+    /// com a chave guardada ou pede uma.
     Ready,
     SaveKey(LiveKey),
     /// Pediu para guardar algo que nao tem forma de chave: volta ao ecra da
     /// chave com o aviso, em vez de a pagina ficar a espera para sempre.
     InvalidKey,
     ForgetKey,
+    /// A sessao acabou sem o utilizador a desligar (a ligacao caiu, o Google
+    /// recusou): ja nada e capturado nem enviado, e o olho deixa o vermelho.
+    Stopped,
     Close,
 }
 
@@ -212,6 +240,7 @@ pub(crate) fn parse_live_message(body: &str) -> Option<LiveMessage> {
         "ready" => Some(LiveMessage::Ready),
         "close" => Some(LiveMessage::Close),
         "forget_key" => Some(LiveMessage::ForgetKey),
+        "stopped" => Some(LiveMessage::Stopped),
         "save_key" => {
             let raw = envelope.get("args")?.get("key")?.as_str()?;
             Some(validate_live_key(raw).map_or(LiveMessage::InvalidKey, LiveMessage::SaveKey))
@@ -396,9 +425,14 @@ pub(crate) fn live_theme_script(theme: &serde_json::Value) -> String {
 /// O que fazer com uma mensagem do painel. Separado da janela para se testar:
 /// o `App` so corre o script devolvido ou fecha o painel.
 pub(crate) enum LiveStep {
-    /// Correr este script na pagina do painel. Pode levar a chave: nao tem
+    /// Correr na pagina o script que arranca a sessao: a partir daqui a tela,
+    /// a camera e o microfone podem estar a sair. Leva a chave: nao tem
     /// `Debug` de proposito.
-    Run(String),
+    Start(String),
+    /// Correr na pagina o script do ecra da chave: nada e capturado.
+    AskKey(String),
+    /// A pagina diz que a sessao acabou: nada a correr, so o olho muda.
+    Stopped,
     Close,
 }
 
@@ -408,34 +442,137 @@ pub(crate) fn live_step(
     theme: &serde_json::Value,
 ) -> LiveStep {
     match message {
-        LiveMessage::Ready => LiveStep::Run(match store.load() {
-            Some(key) => live_start_script(&key, theme, None),
-            None => live_ask_key_script(theme, None),
-        }),
+        LiveMessage::Ready => match store.load() {
+            Some(key) => LiveStep::Start(live_start_script(&key, theme, None)),
+            None => LiveStep::AskKey(live_ask_key_script(theme, None)),
+        },
         // Mesmo sem conseguir guardar, a sessao arranca com a chave que o
         // utilizador acabou de dar -- e o aviso diz que vale so desta vez.
-        LiveMessage::SaveKey(key) => LiveStep::Run(match store.save(&key) {
+        LiveMessage::SaveKey(key) => LiveStep::Start(match store.save(&key) {
             Ok(()) => live_start_script(&key, theme, None),
             Err(error) => live_start_script(
                 &key,
                 theme,
                 Some(&format!(
-                    "Não foi possível guardar a chave ({error}); vale só para esta sessão."
+                    "Não foi possível salvar a chave ({error}); ela vale só para esta sessão."
                 )),
             ),
         }),
-        LiveMessage::InvalidKey => LiveStep::Run(live_ask_key_script(
-            theme,
-            Some("Isso não parece uma chave da API do Gemini. Copie-a de novo da AI Studio."),
-        )),
-        LiveMessage::ForgetKey => LiveStep::Run(match store.forget() {
+        LiveMessage::InvalidKey => {
+            LiveStep::AskKey(live_ask_key_script(theme, Some(LIVE_INVALID_KEY_NOTICE)))
+        }
+        LiveMessage::ForgetKey => LiveStep::AskKey(match store.forget() {
             Ok(()) => live_ask_key_script(theme, None),
             Err(error) => live_ask_key_script(
                 theme,
                 Some(&format!("Não foi possível apagar a chave antiga: {error}")),
             ),
         }),
+        LiveMessage::Stopped => LiveStep::Stopped,
         LiveMessage::Close => LiveStep::Close,
+    }
+}
+
+/// O aviso de uma chave com forma errada. A pagina mostra o mesmo texto
+/// quando recusa sozinha uma colagem grande demais para o canal.
+pub(crate) const LIVE_INVALID_KEY_NOTICE: &str =
+    "Isso não parece uma chave da API do Gemini. Copie de novo da AI Studio.";
+
+/// O que o `App` faz depois de `LivePanel::follow`. `Run` leva o script (e,
+/// no arranque, a chave): sem `Debug` de proposito.
+pub(crate) enum LiveAction {
+    Run(String),
+    Close,
+    Nothing,
+}
+
+/// O que o olho da barra mostra.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LiveIndicator {
+    /// Painel fechado: nada e capturado.
+    Off,
+    /// Painel aberto sem sessao (a pedir a chave, ou a sessao acabou): nada
+    /// e capturado nem enviado, mas o painel continua la.
+    Standby,
+    /// O nativo mandou a pagina arrancar: a tela, a camera e o microfone podem
+    /// estar a sair para o Google.
+    Live,
+}
+
+/// O painel do Gemini Live e o estado do olho numa peca so: o olho e lido
+/// daqui, nunca de uma bandeira a parte que alguem se esqueca de repor.
+/// Generico na vista para os gates correrem sem janela; no app e `WebView`.
+///
+/// A pagina so comeca a capturar quando o nativo corre o `start()` dela
+/// (`LiveStep::Start`), por isso o vermelho comeca ai -- antes de o script
+/// correr -- e so acaba quando a pagina diz que parou ou o painel fecha.
+pub(crate) struct LivePanel<W> {
+    view: Option<W>,
+    started: bool,
+}
+
+impl<W> LivePanel<W> {
+    pub(crate) const fn off() -> Self {
+        Self {
+            view: None,
+            started: false,
+        }
+    }
+
+    /// Abre com a vista nova (uma que ja estivesse aberta e largada).
+    pub(crate) fn open(&mut self, view: W) {
+        self.started = false;
+        self.view = Some(view);
+    }
+
+    /// Fecha: devolve a vista para o chamador a esconder e largar.
+    pub(crate) fn close(&mut self) -> Option<W> {
+        self.started = false;
+        self.view.take()
+    }
+
+    pub(crate) fn view(&self) -> Option<&W> {
+        self.view.as_ref()
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.view.is_some()
+    }
+
+    /// Acompanha o passo e devolve o que o `App` faz a seguir. O script so
+    /// sai daqui DEPOIS de o estado do olho mudar: nao ha forma de arrancar a
+    /// sessao sem o olho ficar vermelho, nem de o esquecer. Sem painel aberto
+    /// nao ha onde correr nada.
+    pub(crate) fn follow(&mut self, step: LiveStep) -> LiveAction {
+        if self.view.is_none() {
+            return match step {
+                LiveStep::Close => LiveAction::Close,
+                _ => LiveAction::Nothing,
+            };
+        }
+        match step {
+            LiveStep::Start(script) => {
+                self.started = true;
+                LiveAction::Run(script)
+            }
+            LiveStep::AskKey(script) => {
+                self.started = false;
+                LiveAction::Run(script)
+            }
+            LiveStep::Stopped => {
+                self.started = false;
+                LiveAction::Nothing
+            }
+            LiveStep::Close => LiveAction::Close,
+        }
+    }
+
+    pub(crate) fn indicator(&self) -> LiveIndicator {
+        match (&self.view, self.started) {
+            (None, _) => LiveIndicator::Off,
+            (Some(_), false) => LiveIndicator::Standby,
+            (Some(_), true) => LiveIndicator::Live,
+        }
     }
 }
 
@@ -689,6 +826,10 @@ return calls;
             parse_live_message(r#"{"action":"forget_key","args":{}}"#),
             Some(LiveMessage::ForgetKey)
         );
+        assert_eq!(
+            parse_live_message(r#"{"action":"stopped","args":{}}"#),
+            Some(LiveMessage::Stopped)
+        );
         let save = |key: &str| json!({ "action": "save_key", "args": { "key": key } }).to_string();
         assert_eq!(
             parse_live_message(&save(&format!("  {TEST_KEY}\n"))),
@@ -756,7 +897,18 @@ return calls;
             "http://NEURALIA-LIVE.localhost/live.html",
         ] {
             assert!(live_panel_allows_navigation(target), "{target}");
+            assert!(live_panel_navigation(target.to_string()), "{target}");
             assert!(live_ipc_source_ok(target), "{target}");
+            assert_eq!(
+                live_ipc_message(target, r#"{"action":"ready","args":{}}"#),
+                Some(LiveMessage::Ready),
+                "{target}"
+            );
+            assert_eq!(
+                live_ipc_message(target, r#"{"action":"eval","args":{}}"#),
+                None,
+                "a pagina certa continua presa a lista fechada"
+            );
         }
         for target in [
             "http://neuralia-live.localhost/",
@@ -777,7 +929,16 @@ return calls;
             "",
         ] {
             assert!(!live_panel_allows_navigation(target), "{target}");
+            assert!(!live_panel_navigation(target.to_string()), "{target}");
             assert!(!live_ipc_source_ok(target), "{target}");
+            // Uma mensagem valida vinda de outro documento nao passa.
+            for body in [
+                r#"{"action":"ready","args":{}}"#,
+                r#"{"action":"forget_key","args":{}}"#,
+                r#"{"action":"close"}"#,
+            ] {
+                assert_eq!(live_ipc_message(target, body), None, "{target} {body}");
+            }
         }
     }
 
@@ -885,8 +1046,20 @@ return calls;
         let dir = temp_dir("step");
         let store = LiveKeyStore::in_dir(&dir);
         let theme = json!({ "--bg": "#101112" });
+        // O passo diz o que o script faz: `Start` arranca (o olho fica
+        // vermelho), `AskKey` pede a chave (nada e capturado).
         let run = |message: LiveMessage| match live_step(message, &store, &theme) {
-            LiveStep::Run(script) => page_call(&script),
+            LiveStep::Start(script) => {
+                let (method, arg) = page_call(&script);
+                assert_eq!(method, "start", "Start corre o start() da pagina");
+                (method, arg)
+            }
+            LiveStep::AskKey(script) => {
+                let (method, arg) = page_call(&script);
+                assert_eq!(method, "askKey", "AskKey corre o askKey() da pagina");
+                (method, arg)
+            }
+            LiveStep::Stopped => ("<parou>".to_string(), Value::Null),
             LiveStep::Close => ("<fechar>".to_string(), Value::Null),
         };
 
@@ -925,13 +1098,18 @@ return calls;
             live_step(LiveMessage::Close, &store, &theme),
             LiveStep::Close
         ));
+        // A pagina diz que a sessao caiu: nada a correr, e a chave fica.
+        assert!(matches!(
+            live_step(LiveMessage::Stopped, &store, &theme),
+            LiveStep::Stopped
+        ));
 
         // Sem onde guardar (a "pasta" e um ficheiro): a sessao arranca na
         // mesma, e o aviso diz que a chave vale so desta vez.
         let blocked = dir.join("bloqueado");
         std::fs::write(&blocked, b"ficheiro").expect("ficheiro");
         let nowhere = LiveKeyStore::in_dir(&blocked);
-        let LiveStep::Run(script) =
+        let LiveStep::Start(script) =
             live_step(LiveMessage::SaveKey(key(OTHER_KEY)), &nowhere, &theme)
         else {
             panic!("esperava arrancar");
@@ -1002,6 +1180,10 @@ return {
   audio: core.audioMessage(Int16Array.from([1, -2])),
   video: core.videoMessage('SlBFRw=='),
   setup: core.setupMessage(),
+  resumed: core.setupMessage('h-1'),
+  keyMax: core.KEY_MAX_CHARS,
+  invalidKey: core.INVALID_KEY_NOTICE,
+  streamEnd: core.audioStreamEndMessage(),
   url: core.socketUrl('AIza a&b'),
   endpoint: core.ENDPOINT,
   frames: [core.frameSize(1920, 1080), core.frameSize(800, 600), core.frameSize(1080, 1920), core.frameSize(0, 10)],
@@ -1051,6 +1233,29 @@ return {
             .as_str()
             .expect("instrucao");
         assert!(instruction.contains("português do Brasil") && instruction.contains("tela"));
+        // Sem compressao do contexto o Google corta uma sessao com video aos
+        // ~2 min; sem sessionResumption a ligacao (~10 min) acaba sem volta.
+        assert_eq!(
+            setup["contextWindowCompression"],
+            json!({ "slidingWindow": {} })
+        );
+        assert_eq!(setup["sessionResumption"], json!({}));
+        assert_eq!(
+            out["resumed"]["setup"]["sessionResumption"],
+            json!({ "handle": "h-1" }),
+            "retomar leva o handle"
+        );
+        assert_eq!(
+            out["resumed"]["setup"]["model"], setup["model"],
+            "o modelo nao muda ao retomar"
+        );
+        assert_eq!(
+            out["streamEnd"],
+            json!({ "realtimeInput": { "audioStreamEnd": true } })
+        );
+        // A pagina recusa sozinha o que o nativo recusaria, com o mesmo texto.
+        assert_eq!(out["keyMax"], LIVE_KEY_MAX_CHARS);
+        assert_eq!(out["invalidKey"], LIVE_INVALID_KEY_NOTICE);
 
         assert_eq!(
             out["endpoint"],
@@ -1095,6 +1300,12 @@ const fromBuffer = core.parseServerMessage(await core.frameText(new TextEncoder(
 const fromView = core.parseServerMessage(await core.frameText(new TextEncoder().encode('{"goAway":{"timeLeft":"5s"}}')));
 const blob = new Blob(['{"setupComplete":{}}']);
 return {
+  handles: [
+    core.parseServerMessage('{"sessionResumptionUpdate":{"newHandle":"h1","resumable":true}}').resumeHandle,
+    core.parseServerMessage('{"sessionResumptionUpdate":{"newHandle":"h2","resumable":false}}').resumeHandle,
+    core.parseServerMessage('{"sessionResumptionUpdate":{"resumable":true}}').resumeHandle,
+    core.parseServerMessage('{"sessionResumptionUpdate":{"newHandle":7,"resumable":true}}').resumeHandle
+  ],
   fromBlob,
   setupComplete: fromBuffer.setupComplete,
   goAway: fromView.goAway,
@@ -1109,15 +1320,24 @@ return {
     core.describeClose(1006, ''),
     core.describeClose(1011, 'Internal error'),
     core.describeClose(1000, '')
-  ]
+  ],
+  quota: core.describeClose(1011, 'You exceeded your current quota, please check your plan and billing details.'),
+  model: core.describeClose(1008, 'models/x is not found for API version v1beta, or is not supported for bidiGenerateContent'),
+  exhausted: core.describeClose(1011, 'RESOURCE_EXHAUSTED'),
+  internal: core.describeClose(1011, 'Internal error.')
 };
 "#,
             Value::Null,
         );
         assert_eq!(
+            out["handles"],
+            json!(["h1", "", "", ""]),
+            "so um handle retomavel conta"
+        );
+        assert_eq!(
             out["fromBlob"],
             json!({
-                "setupComplete": false, "goAway": false, "error": "",
+                "setupComplete": false, "goAway": false, "resumeHandle": "", "error": "",
                 "audio": [{ "data": "ZACc/w==", "rate": 24000 }],
                 "inputText": "Oi", "outputText": "Olá",
                 "interrupted": false, "turnComplete": true
@@ -1144,6 +1364,38 @@ return {
             );
         }
         assert!(closes[3]["message"].as_str().unwrap().contains("1011"));
+        // Em portugues do Brasil, e o motivo cru do servidor (ingles) so
+        // como detalhe, sem ponto dobrado.
+        assert_eq!(
+            closes[2]["message"],
+            "A conexão caiu (rede ou servidor indisponível)."
+        );
+        assert_eq!(closes[3]["detail"], "Internal error");
+        assert_eq!(out["internal"]["detail"], "Internal error");
+        for close in [&out["quota"], &out["exhausted"]] {
+            assert_eq!(close["keyProblem"], false);
+            let message = close["message"].as_str().expect("mensagem");
+            assert!(message.contains("cota"), "{message}");
+            assert!(!message.contains("quota"), "{message}");
+        }
+        assert_eq!(
+            out["quota"]["detail"],
+            "You exceeded your current quota, please check your plan and billing details"
+        );
+        assert_eq!(
+            out["model"]["message"],
+            "O modelo do Gemini Live não está disponível para esta chave."
+        );
+        for close in closes
+            .iter()
+            .chain([&out["quota"], &out["model"], &out["internal"]])
+        {
+            let message = close["message"].as_str().expect("mensagem");
+            assert!(!message.contains(".."), "{message}");
+            for european in ["ligação", "partilh", "ecrã", "A ligar"] {
+                assert!(!message.contains(european), "{message}");
+            }
+        }
     }
 
     /// Dublês do navegador para a sessao: socket, contexto de audio, faixas
@@ -1152,7 +1404,7 @@ return {
     const SESSION_FAKES: &str = r#"
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 function world(options) {
-  const w = { sockets: [], contexts: [], tracks: [], requests: [], ui: { errors: [], notices: [], transcripts: [], camera: [], screen: [], sources: [] }, micChunk: null, micDisconnects: 0, tick: null, cleared: [], pending: [] };
+  const w = { sockets: [], contexts: [], tracks: [], requests: [], ui: { errors: [], notices: [], transcripts: [], camera: [], screen: [], sources: [], statuses: [], ended: 0 }, micChunk: null, micDisconnects: 0, tick: null, cleared: [], pending: [] };
   class Socket {
     constructor(url) { this.url = url; this.readyState = 0; this.sent = []; w.sockets.push(this); }
     send(text) { this.sent.push(JSON.parse(text)); }
@@ -1184,12 +1436,14 @@ function world(options) {
     getDisplayMedia: () => media('screen'),
     createMic: async (ctx, s, onChunk) => { w.micChunk = onChunk; return { rate: ctx.sampleRate, disconnect() { w.micDisconnects++; } }; },
     grabFrame: async () => 'SlBFRw==',
-    setInterval: (fn) => { w.tick = fn; return 7; },
+    setInterval: (fn, ms) => { w.tick = fn; w.intervalMs = ms; return 7; },
     clearInterval: (id) => w.cleared.push(id)
   };
   w.uiHandlers = {
-    error: (message, keyProblem) => w.ui.errors.push({ message, keyProblem }),
-    notice: (text) => w.ui.notices.push(text),
+    error: (message, keyProblem, detail) => w.ui.errors.push({ message, keyProblem, detail }),
+    notice: (kind, text) => w.ui.notices.push([kind, text]),
+    status: (text, tone) => w.ui.statuses.push(tone),
+    ended: () => { w.ui.ended++; },
     transcript: (role, text) => w.ui.transcripts.push([role, text]),
     camera: (s) => w.ui.camera.push(!!s),
     screen: (s) => w.ui.screen.push(!!s),
@@ -1209,7 +1463,7 @@ const w = world();
 const session = core.createSession({ env: w.env, ui: w.uiHandlers, key: input.key });
 await session.start();
 const socket = w.sockets[0];
-const out = { url: socket.url, requests: w.requests.slice().sort() };
+const out = { url: socket.url, requests: w.requests.slice().sort(), intervalMs: w.intervalMs };
 socket.open();
 out.first = socket.sent[0];
 // Antes do setupComplete nada de voz nem de frames sai.
@@ -1270,6 +1524,7 @@ return out;
             )
         );
         assert_eq!(out["requests"], json!(["audio", "screen", "video"]));
+        assert_eq!(out["intervalMs"], 1000, "um frame por segundo");
         assert_eq!(
             out["first"]["setup"]["model"], "models/gemini-2.5-flash-native-audio-preview-12-2025",
             "a primeira mensagem e o setup"
@@ -1332,7 +1587,7 @@ await flush();
 s1.stop();
 for (const grant of late.pending) grant();
 await starting; await flush();
-const out = { late: late.tracks.map((t) => [t.kind, t.stopped]), lateMic: late.micChunk === null, lateNotices: late.ui.notices.length };
+const out = { late: late.tracks.map((t) => [t.kind, t.stopped]), lateMic: late.micChunk === null, lateNotices: late.ui.notices.filter(([, text]) => text).length };
 
 // 2. Camera desligada e ligada de novo antes da primeira resposta: fica so
 //    uma faixa viva.
@@ -1356,7 +1611,7 @@ bad.sockets[0].open();
 bad.sockets[0].receive('{"setupComplete":{}}');
 await flush();
 bad.sockets[0].drop(1007, 'API key not valid. Please pass a valid API key.');
-out.bad = { errors: bad.ui.errors, stopped: bad.tracks.map((t) => t.stopped), contextClosed: bad.contexts[0].closed, live: s3.live };
+out.bad = { errors: bad.ui.errors, stopped: bad.tracks.map((t) => t.stopped), contextClosed: bad.contexts[0].closed, live: s3.live, sockets: bad.sockets.length, ended: bad.ui.ended };
 return out;
 "#
         );
@@ -1377,16 +1632,172 @@ return out;
         assert_eq!(out["bad"]["stopped"], json!([1, 1, 1]));
         assert_eq!(out["bad"]["contextClosed"], 1);
         assert_eq!(out["bad"]["live"], false);
+        assert_eq!(out["bad"]["sockets"], 1, "chave recusada nao se retoma");
+        assert_eq!(out["bad"]["ended"], 1, "a pagina avisa o nativo que parou");
+    }
+
+    #[test]
+    fn live_js_keeps_the_session_across_go_away_and_drops() {
+        let body = format!(
+            "{SESSION_FAKES}{}",
+            r#"
+const ready = async (socket) => { socket.open(); socket.receive('{"setupComplete":{}}'); await flush(); };
+const w = world();
+const session = core.createSession({ env: w.env, ui: w.uiHandlers, key: 'K' });
+await session.start();
+const first = w.sockets[0];
+await ready(first);
+first.receive(JSON.stringify({ sessionResumptionUpdate: { newHandle: 'h1', resumable: true } }));
+await flush();
+// O servidor avisa que vai fechar: a sessao passa ja para uma ligacao nova,
+// com o handle, e a tela, a camera e o microfone continuam ligados.
+first.receive(JSON.stringify({ goAway: { timeLeft: '10s' } }));
+await flush();
+const out = { afterGoAway: { sockets: w.sockets.length, oldClosed: first.closedWith, live: session.live } };
+const second = w.sockets[1];
+second.open();
+out.secondSetup = second.sent[0].setup.sessionResumption;
+out.secondModel = second.sent[0].setup.model;
+second.receive('{"setupComplete":{}}');
+await flush();
+out.resumed = { live: session.live, stopped: w.tracks.map((t) => t.stopped), sources: session.sources(), errors: w.ui.errors.length };
+// A voz vai para a ligacao nova; o fecho tardio da velha nao faz nada.
+w.micChunk(new Float32Array(4800).fill(0.25));
+out.audioOnSecond = realtime(second, 'audio').length;
+first.drop(1000, '');
+await flush();
+out.afterOldClose = { live: session.live, sockets: w.sockets.length, errors: w.ui.errors.length };
+// Uma queda (1011) com handle: retoma de novo.
+second.receive(JSON.stringify({ sessionResumptionUpdate: { newHandle: 'h2', resumable: true } }));
+await flush();
+second.drop(1011, 'Internal error');
+await flush();
+const third = w.sockets[2];
+third.open();
+out.thirdSetup = third.sent[0].setup.sessionResumption;
+// Religacoes que nunca chegam ao setupComplete acabam por desistir.
+third.drop(1006, '');
+await flush();
+w.sockets[3].drop(1006, '');
+await flush();
+out.stillTrying = { sockets: w.sockets.length, errors: w.ui.errors.length };
+w.sockets[4].drop(1006, '');
+await flush();
+out.giveUp = { sockets: w.sockets.length, live: session.live, errors: w.ui.errors.map((e) => e.message), ended: w.ui.ended, stopped: w.tracks.map((t) => t.stopped) };
+
+// Sem handle nao ha como retomar: para tudo e diz porque.
+const n = world();
+const plain = core.createSession({ env: n.env, ui: n.uiHandlers, key: 'K' });
+await plain.start();
+await ready(n.sockets[0]);
+n.sockets[0].drop(1006, '');
+await flush();
+out.noHandle = { sockets: n.sockets.length, errors: n.ui.errors.map((e) => e.message), ended: n.ui.ended, stopped: n.tracks.map((t) => t.stopped) };
+return out;
+"#
+        );
+        let out = node_core(&body, Value::Null);
+        assert_eq!(
+            out["afterGoAway"],
+            json!({ "sockets": 2, "oldClosed": 1000, "live": false })
+        );
+        assert_eq!(out["secondSetup"], json!({ "handle": "h1" }));
+        assert_eq!(
+            out["secondModel"],
+            "models/gemini-2.5-flash-native-audio-preview-12-2025"
+        );
+        assert_eq!(
+            out["resumed"],
+            json!({
+                "live": true,
+                "stopped": [0, 0, 0],
+                "sources": { "screen": true, "camera": true, "mic": true },
+                "errors": 0
+            }),
+            "retomar nao larga nenhuma faixa"
+        );
+        assert_eq!(out["audioOnSecond"], 1);
+        assert_eq!(
+            out["afterOldClose"],
+            json!({ "live": true, "sockets": 2, "errors": 0 })
+        );
+        assert_eq!(out["thirdSetup"], json!({ "handle": "h2" }));
+        assert_eq!(
+            out["stillTrying"],
+            json!({ "sockets": 5, "errors": 0 }),
+            "tres religacoes seguidas antes de desistir"
+        );
+        assert_eq!(
+            out["giveUp"],
+            json!({
+                "sockets": 5,
+                "live": false,
+                "errors": ["A conexão caiu (rede ou servidor indisponível)."],
+                "ended": 1,
+                "stopped": [1, 1, 1]
+            })
+        );
+        assert_eq!(
+            out["noHandle"],
+            json!({
+                "sockets": 1,
+                "errors": ["A conexão caiu (rede ou servidor indisponível)."],
+                "ended": 1,
+                "stopped": [1, 1, 1]
+            })
+        );
+    }
+
+    #[test]
+    fn live_js_mic_off_flushes_and_ends_the_audio_stream() {
+        let body = format!(
+            "{SESSION_FAKES}{}",
+            r#"
+const w = world();
+const session = core.createSession({ env: w.env, ui: w.uiHandlers, key: 'K' });
+await session.start();
+const socket = w.sockets[0];
+socket.open();
+socket.receive('{"setupComplete":{}}');
+await flush();
+// 2048 amostras a 48 kHz: 682 a 16 kHz, menos do que uma mensagem.
+w.micChunk(new Float32Array(2048).fill(0.25));
+const before = socket.sent.length;
+await session.setMic(false);
+const after = socket.sent.slice(before);
+// Desligar outra vez (ou a camera) nao manda mais nada.
+await session.setMic(false);
+await session.setCamera(false);
+return {
+  after: after.map((m) => m.realtimeInput.audioStreamEnd === true ? 'end' : core.base64ToPcm16(m.realtimeInput.audio.data).length),
+  extra: socket.sent.length - before - after.length,
+  micTrack: w.tracks.find((t) => t.kind === 'audio').stopped
+};
+"#
+        );
+        let out = node_core(&body, Value::Null);
+        assert_eq!(
+            out["after"],
+            json!([682, "end"]),
+            "o resto da fila e depois o fim do audio"
+        );
+        assert_eq!(out["extra"], 0);
+        assert_eq!(out["micTrack"], 1);
     }
 
     /// A pagina inteira (HTML, live-core.js e live.js que embarcam) num DOM
     /// de brinquedo. Os ids vem do proprio `LIVE_HTML`: se o live.js pedir
-    /// um elemento que o HTML nao tem, isto rebenta.
+    /// um elemento que o HTML nao tem, isto rebenta. `input.options` afina o
+    /// navegador (`screenFails`: quantas vezes a tela e recusada antes de
+    /// abrir; `suspended`: o som comeca parado, como sem gesto). O cenario e
+    /// `input.body`, corpo de uma funcao async que recebe `t` e devolve JSON.
     const PAGE_HARNESS: &str = r#"
 const vm = require('node:vm');
 const input = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+const options = input.options || {};
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
-const posts = [], sockets = [], contexts = [], tracks = [], requests = [], themeVars = {};
+const posts = [], sockets = [], contexts = [], tracks = [], requests = [], themeVars = {}, docListeners = {};
+let screenFails = options.screenFails || 0;
 function el(id, tag, hidden) {
   const e = {
     id, tagName: String(tag || 'div').toUpperCase(), hidden: !!hidden, value: '', disabled: false,
@@ -1417,11 +1828,19 @@ for (const match of input.html.matchAll(/<(\w+)([^>]*?)\sid="([^"]+)"([^>]*)>/g)
   if (pressed) node.attrs['aria-pressed'] = pressed[1];
   elements[match[3]] = node;
 }
-class Socket { constructor(url) { this.url = url; this.readyState = 0; this.sent = []; sockets.push(this); } send(t) { this.sent.push(t); } close(code) { this.readyState = 3; this.closedWith = code; } }
+class Socket {
+  constructor(url) { this.url = url; this.readyState = 0; this.sent = []; sockets.push(this); }
+  send(t) { this.sent.push(t); }
+  close(code) { this.readyState = 3; this.closedWith = code; }
+  open() { this.readyState = 1; this.onopen && this.onopen({}); }
+  receive(data) { this.onmessage && this.onmessage({ data }); }
+  drop(code, reason) { this.readyState = 3; this.onclose && this.onclose({ code, reason }); }
+}
 class Context {
-  constructor() { this.sampleRate = 48000; this.currentTime = 0; this.state = 'running'; this.destination = {}; this.closed = 0; this.audioWorklet = { addModule: async () => {} }; contexts.push(this); }
+  constructor() { this.sampleRate = 48000; this.currentTime = 0; this.state = options.suspended ? 'suspended' : 'running'; this.destination = {}; this.closed = 0; this.audioWorklet = { addModule: async () => {} }; contexts.push(this); }
   createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
   createGain() { return { gain: { value: 1 }, connect() {}, disconnect() {} }; }
+  resume() { this.state = 'running'; return Promise.resolve(); }
   close() { this.closed++; this.state = 'closed'; return Promise.resolve(); }
 }
 class WorkletNode { constructor() { this.port = { onmessage: null }; } connect() {} disconnect() {} }
@@ -1433,11 +1852,15 @@ const sandbox = {
     createTextNode: (text) => ({ textContent: text }),
     documentElement: { style: { setProperty(k, v) { themeVars[k] = v; } } },
     body: el('body', 'body', false),
-    addEventListener() {}
+    addEventListener(type, fn) { (docListeners[type] = docListeners[type] || []).push(fn); }
   },
   navigator: { mediaDevices: {
     getUserMedia: async (c) => { requests.push(c.audio ? 'mic' : 'camera'); return stream(c.audio ? 'audio' : 'video'); },
-    getDisplayMedia: async () => { requests.push('screen'); return stream('screen'); }
+    getDisplayMedia: async () => {
+      requests.push('screen');
+      if (screenFails > 0) { screenFails--; const error = new Error('sem gesto'); error.name = 'InvalidStateError'; throw error; }
+      return stream('screen');
+    }
   } },
   WebSocket: Socket, AudioContext: Context, AudioWorkletNode: WorkletNode,
   Blob, TextDecoder, TextEncoder, btoa, atob, setTimeout, clearTimeout,
@@ -1451,43 +1874,74 @@ sandbox.top = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(input.core, sandbox, { filename: 'live-core.js' });
 vm.runInContext(input.app, sandbox, { filename: 'live.js' });
-(async () => {
-  const out = { afterLoad: posts.slice() };
-  vm.runInContext(input.askScript, sandbox);
-  out.askKey = { keyHidden: elements['key-screen'].hidden, liveHidden: elements['live-screen'].hidden, errorHidden: elements['key-error'].hidden, bg: themeVars['--bg'] };
-  elements.key.value = '  ' + input.key + '  ';
-  elements.save.click();
-  out.afterSave = { field: elements.key.value, disabled: elements.save.disabled };
-  vm.runInContext(input.startScript, sandbox);
-  for (let i = 0; i < 5; i++) await flush();
-  out.started = {
-    keyHidden: elements['key-screen'].hidden, liveHidden: elements['live-screen'].hidden,
-    socketUrl: sockets[0] && sockets[0].url, requests: requests.slice().sort(),
-    pressed: ['t-screen', 't-camera', 't-mic'].map((id) => elements[id].getAttribute('aria-pressed')),
-    camHidden: elements.cam.hidden
-  };
-  elements['t-camera'].click();
-  for (let i = 0; i < 3; i++) await flush();
-  out.cameraOff = { pressed: elements['t-camera'].getAttribute('aria-pressed'), stopped: tracks.filter((t) => t.kind === 'video').map((t) => t.stopped), camHidden: elements.cam.hidden };
-  elements.off.click();
-  await flush();
-  out.off = { stopped: tracks.map((t) => [t.kind, t.stopped]), socketClosed: sockets[0].closedWith, contextsClosed: contexts.map((c) => c.closed) };
-  elements['change-key'].click();
-  out.posts = posts;
-  process.stdout.write(JSON.stringify(out));
-})().catch((error) => { process.stderr.write(String((error && error.stack) || error)); process.exit(1); });
+const t = { vm, sandbox, input, flush, elements, posts, sockets, contexts, tracks, requests, themeVars, docListeners };
+t.shown = () => (elements.notices.hidden ? [] : elements.notices.children.map((c) => [c.dataset.kind, c.textContent]));
+const AsyncFunction = (async () => {}).constructor;
+new AsyncFunction('t', input.body)(t)
+  .then((out) => process.stdout.write(JSON.stringify(out === undefined ? null : out)))
+  .catch((error) => { process.stderr.write(String((error && error.stack) || error)); process.exit(1); });
 "#;
+
+    fn run_page(body: &str, options: Value, scripts: Value) -> Value {
+        let mut input = json!({
+            "html": LIVE_HTML,
+            "core": LIVE_CORE_JS,
+            "app": LIVE_APP_JS,
+            "key": TEST_KEY,
+            "body": body,
+            "options": options,
+        });
+        for (name, script) in scripts.as_object().expect("scripts") {
+            input[name] = script.clone();
+        }
+        run_node(PAGE_HARNESS, input)
+    }
+
+    /// Tudo o que a pagina publicou passa pelo parser do nativo.
+    fn parsed_posts(posts: &Value) -> Vec<LiveMessage> {
+        posts
+            .as_array()
+            .expect("mensagens")
+            .iter()
+            .map(|post| {
+                let text = post.as_str().expect("texto");
+                parse_live_message(text).unwrap_or_else(|| panic!("o nativo recusou {text}"))
+            })
+            .collect()
+    }
 
     #[test]
     fn the_shipped_page_speaks_only_the_closed_channel_and_off_stops_everything() {
         let theme = json!({ "--bg": "#202124" });
-        let out = run_node(
-            PAGE_HARNESS,
+        let out = run_page(
+            r#"
+const { vm, sandbox, input, flush, elements, posts, sockets, contexts, tracks, requests, themeVars } = t;
+const out = { afterLoad: posts.slice() };
+vm.runInContext(input.askScript, sandbox);
+out.askKey = { keyHidden: elements['key-screen'].hidden, liveHidden: elements['live-screen'].hidden, errorHidden: elements['key-error'].hidden, bg: themeVars['--bg'], sockets: sockets.length, requests: requests.length };
+elements.key.value = '  ' + input.key + '  ';
+elements.save.click();
+out.afterSave = { field: elements.key.value, disabled: elements.save.disabled };
+vm.runInContext(input.startScript, sandbox);
+for (let i = 0; i < 5; i++) await flush();
+out.started = {
+  keyHidden: elements['key-screen'].hidden, liveHidden: elements['live-screen'].hidden,
+  socketUrl: sockets[0] && sockets[0].url, requests: requests.slice().sort(),
+  pressed: ['t-screen', 't-camera', 't-mic'].map((id) => elements[id].getAttribute('aria-pressed')),
+  camHidden: elements.cam.hidden
+};
+elements['t-camera'].click();
+for (let i = 0; i < 3; i++) await flush();
+out.cameraOff = { pressed: elements['t-camera'].getAttribute('aria-pressed'), stopped: tracks.filter((t) => t.kind === 'video').map((t) => t.stopped), camHidden: elements.cam.hidden };
+elements.off.click();
+await flush();
+out.off = { stopped: tracks.map((t) => [t.kind, t.stopped]), socketClosed: sockets[0].closedWith, contextsClosed: contexts.map((c) => c.closed) };
+elements['change-key'].click();
+out.posts = posts;
+return out;
+"#,
+            json!({}),
             json!({
-                "html": LIVE_HTML,
-                "core": LIVE_CORE_JS,
-                "app": LIVE_APP_JS,
-                "key": TEST_KEY,
                 "askScript": live_ask_key_script(&theme, None),
                 "startScript": live_start_script(&key(TEST_KEY), &theme, None),
             }),
@@ -1495,7 +1949,8 @@ vm.runInContext(input.app, sandbox, { filename: 'live.js' });
         assert_eq!(out["afterLoad"], json!([r#"{"action":"ready","args":{}}"#]));
         assert_eq!(
             out["askKey"],
-            json!({ "keyHidden": false, "liveHidden": true, "errorHidden": true, "bg": "#202124" })
+            json!({ "keyHidden": false, "liveHidden": true, "errorHidden": true, "bg": "#202124", "sockets": 0, "requests": 0 }),
+            "o ecra da chave nao abre rede nem pede tela, camera ou microfone"
         );
         assert_eq!(
             out["afterSave"],
@@ -1526,26 +1981,151 @@ vm.runInContext(input.app, sandbox, { filename: 'live.js' });
             }),
             "Desligar parou tudo"
         );
-
-        // Tudo o que a pagina publicou passa pelo parser do nativo, e e a
-        // sequencia que o utilizador fez.
-        let parsed: Vec<LiveMessage> = out["posts"]
-            .as_array()
-            .expect("mensagens")
-            .iter()
-            .map(|post| {
-                let text = post.as_str().expect("texto");
-                parse_live_message(text).unwrap_or_else(|| panic!("o nativo recusou {text}"))
-            })
-            .collect();
+        // A sequencia que o utilizador fez, aceite pelo nativo.
         assert_eq!(
-            parsed,
+            parsed_posts(&out["posts"]),
             [
                 LiveMessage::Ready,
                 LiveMessage::SaveKey(key(TEST_KEY)),
                 LiveMessage::Close,
                 LiveMessage::ForgetKey,
             ]
+        );
+    }
+
+    /// O que o dono ve quando as coisas nao correm bem: uma colagem grande
+    /// demais tem resposta, cada aviso fica ate o seu motivo acabar (o da
+    /// tela nao some debaixo do do som, nem o da chave nao salva), e depois
+    /// de a ligacao cair ha "Conectar de novo" -- que nao apaga a chave -- e
+    /// o nativo fica a saber que ja nada sai.
+    #[test]
+    fn the_shipped_page_keeps_every_notice_and_recovers_after_a_drop() {
+        let theme = json!({ "--bg": "#202124" });
+        // O aviso real do nativo quando a chave nao pode ser salva.
+        let dir = temp_dir("page-notices");
+        let blocked = dir.join("bloqueado");
+        std::fs::write(&blocked, b"ficheiro").expect("ficheiro");
+        let LiveStep::Start(start_script) = live_step(
+            LiveMessage::SaveKey(key(TEST_KEY)),
+            &LiveKeyStore::in_dir(&blocked),
+            &theme,
+        ) else {
+            panic!("esperava arrancar");
+        };
+        let out = run_page(
+            r#"
+const { vm, sandbox, input, flush, elements, posts, sockets, requests, docListeners } = t;
+const out = {};
+vm.runInContext(input.askScript, sandbox);
+// 1100 caracteres: nenhuma chave e assim, e nem cabe no canal do painel.
+elements.key.value = 'A'.repeat(1100);
+elements.save.click();
+out.oversize = { posts: posts.length, disabled: elements.save.disabled, errorHidden: elements['key-error'].hidden, error: elements['key-error'].textContent, field: elements.key.value };
+// Arranca sem gesto: a tela e recusada e o som fica parado.
+vm.runInContext(input.startScript, sandbox);
+for (let i = 0; i < 6; i++) await flush();
+out.started = { notices: t.shown(), screen: elements['t-screen'].getAttribute('aria-pressed') };
+// O primeiro clique ativa o som: so o aviso do som sai.
+for (const fn of docListeners.pointerdown || []) fn({});
+for (let i = 0; i < 3; i++) await flush();
+out.afterClick = t.shown();
+// Clicar em Tela liga-a: o aviso da tela sai.
+elements['t-screen'].click();
+for (let i = 0; i < 3; i++) await flush();
+out.afterScreen = { notices: t.shown(), screen: elements['t-screen'].getAttribute('aria-pressed') };
+// A ligacao cai (sem handle para retomar).
+const socket = sockets[0];
+socket.open();
+socket.receive('{"setupComplete":{}}');
+await flush();
+socket.drop(1006, '');
+for (let i = 0; i < 3; i++) await flush();
+out.dropped = {
+  errorHidden: elements['error-box'].hidden, restartHidden: elements.restart.hidden,
+  changeKeyHidden: elements['error-key'].hidden, error: elements.error.textContent,
+  notices: t.shown(), last: posts[posts.length - 1]
+};
+// Os botoes das fontes de uma sessao morta nao abrem nada.
+const before = { sockets: sockets.length, requests: requests.length };
+elements['t-mic'].click();
+elements['t-camera'].click();
+await flush();
+out.deadToggles = { sockets: sockets.length - before.sockets, requests: requests.length - before.requests };
+elements.restart.click();
+out.restart = { errorHidden: elements['error-box'].hidden, last: posts[posts.length - 1] };
+out.posts = posts;
+return out;
+"#,
+            json!({ "screenFails": 1, "suspended": true }),
+            json!({
+                "askScript": live_ask_key_script(&theme, None),
+                "startScript": start_script,
+            }),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            out["oversize"],
+            json!({
+                "posts": 1,
+                "disabled": false,
+                "errorHidden": false,
+                "error": LIVE_INVALID_KEY_NOTICE,
+                "field": ""
+            }),
+            "colagem grande demais: aviso na hora, botao ativo, nada no canal"
+        );
+
+        let screen_hint =
+            "Tela não compartilhada. Clique em «Tela» para escolher uma janela ou a tela inteira.";
+        let audio_hint = "Clique no painel para ativar o som e o microfone.";
+        let started = out["started"]["notices"].as_array().expect("avisos");
+        let kinds: Vec<&str> = started
+            .iter()
+            .map(|notice| notice[0].as_str().expect("tipo"))
+            .collect();
+        assert_eq!(kinds, ["save", "screen", "audio"], "{started:?}");
+        assert!(
+            started[0][1]
+                .as_str()
+                .is_some_and(|text| text.contains("só para esta sessão")),
+            "{started:?}"
+        );
+        assert_eq!(started[1][1], screen_hint);
+        assert_eq!(started[2][1], audio_hint);
+        assert_eq!(out["started"]["screen"], "false");
+
+        let save_notice = started[0].clone();
+        assert_eq!(
+            out["afterClick"],
+            json!([save_notice, ["screen", screen_hint]]),
+            "o clique so tira o aviso do som"
+        );
+        assert_eq!(
+            out["afterScreen"],
+            json!({ "notices": [save_notice], "screen": "true" }),
+            "a tela ligou: o aviso dela sai, o da chave fica"
+        );
+        assert_eq!(
+            out["dropped"],
+            json!({
+                "errorHidden": false,
+                "restartHidden": false,
+                "changeKeyHidden": true,
+                "error": "A conexão caiu (rede ou servidor indisponível).",
+                "notices": [save_notice],
+                "last": r#"{"action":"stopped","args":{}}"#
+            })
+        );
+        assert_eq!(out["deadToggles"], json!({ "sockets": 0, "requests": 0 }));
+        assert_eq!(
+            out["restart"],
+            json!({ "errorHidden": true, "last": r#"{"action":"ready","args":{}}"# })
+        );
+        assert_eq!(
+            parsed_posts(&out["posts"]),
+            [LiveMessage::Ready, LiveMessage::Stopped, LiveMessage::Ready],
+            "nem a colagem grande nem Conectar de novo apagam a chave"
         );
     }
 }
