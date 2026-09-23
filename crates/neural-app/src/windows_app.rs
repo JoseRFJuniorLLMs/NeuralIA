@@ -1540,6 +1540,8 @@ static RESIZE_X: AtomicI32 = AtomicI32::new(0);
 static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_MOUSEMOVE: u32 = 0x0200;
+/// Chega depois de `track_mouse_leave`: o rato saiu de um botao nativo.
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// Consulta opcional para automacao/benchmarks. Em producao a Home abre em
 /// repouso e nao envia texto a nenhum fornecedor sem acao do utilizador.
@@ -1903,12 +1905,20 @@ fn show_popup_without_activation(hwnd: HWND) {
 
 // Dicas (tooltips). A barra e os botoes nativos sao desenhados a mao, por isso
 // o Windows nao tem texto nenhum para mostrar sozinho. Um unico controlo de
-// tooltip serve a barra (texto conforme o alvo debaixo do rato), o botao Home
-// e os botoes da janela; cada janela e uma "ferramenta" com TTF_SUBCLASS, e o
-// controlo trata sozinho do atraso, da posicao e de esconder a dica.
+// tooltip em modo TTF_TRACK: e o NeuralIA que o mostra, depois de o rato parar
+// TOOLTIP_DELAY_MS sobre um alvo, e que o esconde. Com TTF_SUBCLASS o controlo
+// devia espiar o rato sozinho; ficava registado (4 ferramentas) e nunca
+// aparecia sobre a janela do winit.
 static TOOLTIP_HWND: AtomicUsize = AtomicUsize::new(0);
-static TOOLTIP_TOOLS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// A janela raiz cuja ferramenta esta registada no controlo (0 = nenhuma).
+static TOOLTIP_TOOL_OWNER: AtomicUsize = AtomicUsize::new(0);
+/// A dica que o temporizador vai mostrar: (janela raiz, texto).
+static TOOLTIP_PENDING: Mutex<Option<(usize, String)>> = Mutex::new(None);
+static TOOLTIP_TIMER: AtomicUsize = AtomicUsize::new(0);
+/// O botao Home ja agendou a sua dica nesta passagem do rato.
+static HOME_TOOLTIP_ARMED: AtomicBool = AtomicBool::new(false);
 const TOOLTIP_TOOL_ID: usize = 1;
+const TOOLTIP_DELAY_MS: u32 = 450;
 /// Tamanho do TTTOOLINFOW sem o `lpReserved`. O NeuralIA nao declara o manifesto
 /// de Common Controls v6, por isso o Windows carrega o comctl32 v5, que recusa
 /// a struct com o tamanho completo: o TTM_ADDTOOLW falhava calado (0
@@ -1981,10 +1991,7 @@ fn tooltip_control(tool_window: HWND) -> HWND {
         if !existing.is_null() && IsWindow(existing) != 0 {
             return existing;
         }
-        TOOLTIP_TOOLS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        TOOLTIP_TOOL_OWNER.store(0, Ordering::Release);
         let init = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_WIN95_CLASSES,
@@ -2014,48 +2021,128 @@ fn tooltip_control(tool_window: HWND) -> HWND {
     }
 }
 
-/// Liga `window` ao tooltip com `text` ("" = sem dica: o controlo nao mostra
-/// nada). A primeira chamada regista a janela; as seguintes trocam o texto e
-/// escondem a dica anterior, para a nova aparecer no sitio certo.
-fn set_tooltip(window: HWND, text: &str) {
-    use windows_sys::Win32::UI::Controls::{
-        TTF_SUBCLASS, TTM_ADDTOOLW, TTM_POP, TTM_UPDATETIPTEXTW, TTTOOLINFOW,
-    };
-    if window.is_null() {
+/// A ferramenta unica do controlo, presa a janela raiz.
+fn tooltip_info(root: HWND, text: &mut [u16]) -> windows_sys::Win32::UI::Controls::TTTOOLINFOW {
+    use windows_sys::Win32::UI::Controls::{TTF_ABSOLUTE, TTF_TRACK, TTTOOLINFOW};
+    TTTOOLINFOW {
+        cbSize: TTTOOLINFOW_V2_SIZE,
+        uFlags: TTF_TRACK | TTF_ABSOLUTE,
+        hwnd: root,
+        uId: TOOLTIP_TOOL_ID,
+        rect: RECT::default(),
+        hinst: std::ptr::null_mut(),
+        lpszText: text.as_mut_ptr(),
+        lParam: 0,
+        lpReserved: std::ptr::null_mut(),
+    }
+}
+
+/// O rato entrou num alvo com dica `text`, ou saiu de todos (""). Esconde a
+/// dica que estiver a vista e, se houver texto, agenda a nova.
+fn hover_tooltip(window: HWND, text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, KillTimer, SetTimer};
+    hide_tooltip();
+    let timer = TOOLTIP_TIMER.swap(0, Ordering::AcqRel);
+    if timer != 0 {
+        unsafe {
+            KillTimer(std::ptr::null_mut(), timer);
+        }
+    }
+    let mut pending = TOOLTIP_PENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if window.is_null() || text.is_empty() {
+        *pending = None;
         return;
     }
-    let tooltip = tooltip_control(window);
+    let root = unsafe { GetAncestor(window, GA_ROOT) };
+    *pending = Some((root as usize, text.to_string()));
+    drop(pending);
+    let id = unsafe {
+        SetTimer(
+            std::ptr::null_mut(),
+            0,
+            TOOLTIP_DELAY_MS,
+            Some(tooltip_timer),
+        )
+    };
+    TOOLTIP_TIMER.store(id, Ordering::Release);
+}
+
+unsafe extern "system" fn tooltip_timer(_hwnd: HWND, _message: u32, id: usize, _time: u32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::KillTimer;
+    unsafe {
+        KillTimer(std::ptr::null_mut(), id);
+    }
+    let _ = TOOLTIP_TIMER.compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire);
+    show_pending_tooltip();
+}
+
+/// Mostra a dica agendada logo abaixo do cursor -- por cima dele, tapava o
+/// proprio alvo. Chamada pelo temporizador (e pelos testes, sem esperar).
+fn show_pending_tooltip() {
+    use windows_sys::Win32::UI::Controls::{
+        TTM_ADDTOOLW, TTM_TRACKACTIVATE, TTM_TRACKPOSITION, TTM_UPDATETIPTEXTW,
+    };
+    let Some((root, text)) = TOOLTIP_PENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    else {
+        return;
+    };
+    let root = root as HWND;
+    let tooltip = tooltip_control(root);
     if tooltip.is_null() {
         return;
     }
     let mut wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    let info = TTTOOLINFOW {
-        cbSize: TTTOOLINFOW_V2_SIZE,
-        uFlags: TTF_SUBCLASS,
-        hwnd: window,
-        uId: TOOLTIP_TOOL_ID,
-        // A janela inteira: quem decide se ha dica e o texto, nao o rectangulo.
-        rect: RECT {
-            left: 0,
-            top: 0,
-            right: 0x7fff,
-            bottom: 0x7fff,
-        },
-        hinst: std::ptr::null_mut(),
-        lpszText: wide.as_mut_ptr(),
-        lParam: 0,
-        lpReserved: std::ptr::null_mut(),
-    };
-    let mut tools = TOOLTIP_TOOLS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let info = tooltip_info(root, &mut wide);
     unsafe {
-        if tools.contains(&(window as usize)) {
-            SendMessageW(tooltip, TTM_POP, 0, 0);
-            SendMessageW(tooltip, TTM_UPDATETIPTEXTW, 0, &info as *const _ as LPARAM);
-        } else if SendMessageW(tooltip, TTM_ADDTOOLW, 0, &info as *const _ as LPARAM) != 0 {
-            tools.push(window as usize);
+        if TOOLTIP_TOOL_OWNER.load(Ordering::Acquire) != root as usize {
+            if SendMessageW(tooltip, TTM_ADDTOOLW, 0, &info as *const _ as LPARAM) == 0 {
+                return;
+            }
+            TOOLTIP_TOOL_OWNER.store(root as usize, Ordering::Release);
         }
+        SendMessageW(tooltip, TTM_UPDATETIPTEXTW, 0, &info as *const _ as LPARAM);
+        let mut cursor = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut cursor);
+        let x = cursor.x as i16 as u16 as usize;
+        let y = (cursor.y + 22) as i16 as u16 as usize;
+        SendMessageW(tooltip, TTM_TRACKPOSITION, 0, ((y << 16) | x) as LPARAM);
+        SendMessageW(tooltip, TTM_TRACKACTIVATE, 1, &info as *const _ as LPARAM);
+    }
+}
+
+fn hide_tooltip() {
+    use windows_sys::Win32::UI::Controls::TTM_TRACKACTIVATE;
+    let tooltip = TOOLTIP_HWND.load(Ordering::Acquire) as HWND;
+    let owner = TOOLTIP_TOOL_OWNER.load(Ordering::Acquire) as HWND;
+    if tooltip.is_null() || owner.is_null() {
+        return;
+    }
+    let mut empty = [0u16];
+    let info = tooltip_info(owner, &mut empty);
+    unsafe {
+        SendMessageW(tooltip, TTM_TRACKACTIVATE, 0, &info as *const _ as LPARAM);
+    }
+}
+
+/// Pede o WM_MOUSELEAVE a um botao nativo: sem ele a dica ficava a vista
+/// depois de o rato sair.
+fn track_mouse_leave(hwnd: HWND) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    };
+    let mut track = TRACKMOUSEEVENT {
+        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_LEAVE,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    unsafe {
+        TrackMouseEvent(&mut track);
     }
 }
 
@@ -2248,6 +2335,7 @@ unsafe extern "system" fn caption_buttons_subclass(
                 let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
                 if let Some(index) = native_button_index(width, x) {
                     CAPTION_PRESSED_BUTTON.store(index, Ordering::Release);
+                    hover_tooltip(hwnd, "");
                     SetCapture(hwnd);
                 }
             }
@@ -2293,11 +2381,19 @@ unsafe extern "system" fn caption_buttons_subclass(
                 let last = CAPTION_TOOLTIP_BUTTON
                     .swap(index.unwrap_or(NATIVE_BUTTON_NONE), Ordering::AcqRel);
                 if index != Some(last) {
+                    if last == NATIVE_BUTTON_NONE {
+                        track_mouse_leave(hwnd);
+                    }
                     let maximized = IsZoomed(GetParent(hwnd)) != 0;
                     let text = index.map_or("", |index| caption_tooltip_label(index, maximized));
-                    set_tooltip(hwnd, text);
+                    hover_tooltip(hwnd, text);
                 }
             }
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        }
+        WM_MOUSELEAVE => {
+            CAPTION_TOOLTIP_BUTTON.store(NATIVE_BUTTON_NONE, Ordering::Release);
+            hover_tooltip(hwnd, "");
             DefSubclassProc(hwnd, message, wparam, lparam)
         }
         WM_CAPTURECHANGED | WM_CANCELMODE => {
@@ -2350,7 +2446,20 @@ unsafe extern "system" fn home_button_subclass(
             }
             0
         }
+        WM_MOUSEMOVE => {
+            if !HOME_TOOLTIP_ARMED.swap(true, Ordering::AcqRel) {
+                track_mouse_leave(hwnd);
+                hover_tooltip(hwnd, "Voltar à Home");
+            }
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        }
+        WM_MOUSELEAVE => {
+            HOME_TOOLTIP_ARMED.store(false, Ordering::Release);
+            hover_tooltip(hwnd, "");
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        }
         WM_LBUTTONDOWN => {
+            hover_tooltip(hwnd, "");
             SetCapture(hwnd);
             0
         }
@@ -6600,7 +6709,6 @@ impl App {
                     DestroyWindow(created);
                     return;
                 }
-                set_tooltip(created, "Voltar à Home");
                 let width = rect.width.round() as i32;
                 let height = rect.height.round() as i32;
                 let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, height, height);
@@ -7031,7 +7139,7 @@ impl App {
             self.request_redraw();
             if let Some(owner) = self.window.as_ref().and_then(window_hwnd) {
                 let text = next.and_then(|hit| self.bar_tooltip_text(hit, owner));
-                set_tooltip(owner, text.as_deref().unwrap_or(""));
+                hover_tooltip(owner, text.as_deref().unwrap_or(""));
             }
         }
     }
@@ -7636,6 +7744,9 @@ impl App {
 
     fn click_comparator(&mut self) {
         let hit = self.comparator_bar_hit();
+        // O clique pode trocar a superficie; a dica nao fica a flutuar sobre
+        // a tela nova.
+        hover_tooltip(std::ptr::null_mut(), "");
         match hit {
             Some(BarHit::WindowMinimize) => {
                 if let Some(window) = &self.window {
@@ -10934,9 +11045,12 @@ mod tests {
     }
 
     #[test]
-    fn native_windows_get_one_tooltip_whose_text_follows_the_hover() {
-        use windows_sys::Win32::UI::Controls::{TTM_GETTEXTW, TTM_GETTOOLCOUNT, TTTOOLINFOW};
-        use windows_sys::Win32::UI::WindowsAndMessaging::WS_OVERLAPPEDWINDOW;
+    fn hovering_a_target_shows_its_tooltip_and_leaving_hides_it() {
+        // O teste anterior so provava que a ferramenta ficava registada; as
+        // dicas continuavam invisiveis no app. Este prova o que o utilizador
+        // ve: a dica VISIVEL, com o texto do alvo, e escondida ao sair.
+        use windows_sys::Win32::UI::Controls::TTM_GETTEXTW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindowVisible, WS_OVERLAPPEDWINDOW};
         unsafe {
             let owner = CreateWindowExW(
                 0,
@@ -10953,31 +11067,34 @@ mod tests {
                 std::ptr::null(),
             );
             assert!(!owner.is_null(), "a janela tem de nascer");
-            // O rato passa do minimizar para o fechar.
-            set_tooltip(owner, "Minimizar");
-            set_tooltip(owner, "Fechar");
 
+            // O rato para no minimizar, passa para o fechar e o temporizador
+            // dispara (aqui sem esperar os ${TOOLTIP_DELAY_MS} ms).
+            hover_tooltip(owner, "Minimizar");
+            hover_tooltip(owner, "Fechar");
+            show_pending_tooltip();
             let tooltip = TOOLTIP_HWND.load(Ordering::Acquire) as HWND;
             assert!(!tooltip.is_null(), "o controlo de tooltip tem de existir");
-            let count = SendMessageW(tooltip, TTM_GETTOOLCOUNT, 0, 0);
+            let shown = IsWindowVisible(tooltip) != 0;
             let mut buffer = [0u16; 128];
-            let mut info: TTTOOLINFOW = std::mem::zeroed();
-            info.cbSize = TTTOOLINFOW_V2_SIZE;
-            info.hwnd = owner;
-            info.uId = TOOLTIP_TOOL_ID;
-            info.lpszText = buffer.as_mut_ptr();
+            let mut info = tooltip_info(owner, &mut buffer);
             SendMessageW(
                 tooltip,
                 TTM_GETTEXTW,
                 buffer.len(),
-                &mut info as *mut TTTOOLINFOW as LPARAM,
+                &mut info as *mut _ as LPARAM,
             );
             let end = buffer.iter().position(|&unit| unit == 0).unwrap_or(0);
             let text = String::from_utf16_lossy(&buffer[..end]);
+
+            // O rato sai de todos os alvos.
+            hover_tooltip(owner, "");
+            let hidden = IsWindowVisible(tooltip) == 0;
             DestroyWindow(owner);
 
-            assert_eq!(count, 1, "cada janela e UMA ferramenta, nao uma por dica");
+            assert!(shown, "a dica nao apareceu depois do atraso");
             assert_eq!(text, "Fechar", "a dica nao acompanhou o rato");
+            assert!(hidden, "a dica ficou a vista depois de o rato sair");
         }
     }
 
