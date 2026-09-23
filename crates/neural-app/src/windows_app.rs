@@ -6972,54 +6972,14 @@ impl App {
         }
     }
 
-    /// Monta o WebView do Split a partir do `SplitBuild` que
-    /// `split_open_plan` decidiu: nao volta a decidir script, IPC nem perfil.
+    /// O WebView do Split: o `WebViewBuilder` do tema, configurado por
+    /// `configure_split_webview` com o `SplitBuild` que `split_open_plan`
+    /// decidiu. Nada mais se lhe acrescenta aqui.
     fn split_webview_builder(&self, build: &SplitBuild) -> WebViewBuilder<'static> {
-        let ipc_proxy = self.proxy.clone();
-        let new_window_proxy = self.proxy.clone();
-        let ipc = build.page.ipc;
-        let source_index = ipc.source_index;
-        let local_origin = build.local_origin.clone();
-
-        themed_webview_builder()
-            .with_incognito(build.incognito)
-            .with_initialization_script(build.page.init_script.clone())
-            .with_ipc_handler(split_ipc_handler(
-                build.capability.clone(),
-                ipc,
-                move |event| {
-                    let _ = ipc_proxy.send_event(event);
-                },
-            ))
-            .with_navigation_handler(move |target| {
-                if target
-                    .get(..9)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
-                {
-                    return false;
-                }
-                remote_web_target(&target, local_origin.as_deref())
-                    || is_view_source_target(&target, local_origin.as_deref())
-            })
-            .with_new_window_req_handler(move |target, _features| {
-                if remote_web_target(&target, None) {
-                    let event = if ipc.private {
-                        UserEvent::OpenPrivateSplit {
-                            source_index,
-                            url: target,
-                        }
-                    } else {
-                        UserEvent::OpenSplit {
-                            source_index,
-                            url: target,
-                        }
-                    };
-                    let _ = new_window_proxy.send_event(event);
-                }
-                NewWindowResponse::Deny
-            })
-            .with_permission_handler(|kind| web_media_permission(kind, true))
-            .with_focused(true)
+        let proxy = self.proxy.clone();
+        configure_split_webview(themed_webview_builder(), build, move |event| {
+            let _ = proxy.send_event(event);
+        })
     }
 
     fn open_split(&mut self, source_index: usize, url: String, allow_local: bool) -> bool {
@@ -11857,6 +11817,105 @@ where
             send(event);
         }
     }
+}
+
+/// O que `configure_split_webview` chama no builder, com os nomes do wry. O
+/// produto passa o `WebViewBuilder`; o gate passa um registo e ve o perfil,
+/// o script e os handlers que o WebView2 receberia -- e chama-os.
+trait SplitWebViewTarget: Sized {
+    fn with_incognito(self, incognito: bool) -> Self;
+    fn with_initialization_script(self, script: String) -> Self;
+    fn with_ipc_handler(self, handler: impl Fn(Request<String>) + 'static) -> Self;
+    fn with_navigation_handler(self, handler: impl Fn(String) -> bool + 'static) -> Self;
+    /// So o endereco do popup: as `NewWindowFeatures` do wry trazem o
+    /// ICoreWebView2 de quem abriu, e nao se usam.
+    fn with_new_window_req_handler(
+        self,
+        handler: impl Fn(String) -> NewWindowResponse + 'static,
+    ) -> Self;
+    fn with_permission_handler(
+        self,
+        handler: impl Fn(PermissionKind) -> PermissionResponse + Send + Sync + 'static,
+    ) -> Self;
+    fn with_focused(self, focused: bool) -> Self;
+}
+
+impl SplitWebViewTarget for WebViewBuilder<'static> {
+    fn with_incognito(self, incognito: bool) -> Self {
+        WebViewBuilder::with_incognito(self, incognito)
+    }
+    fn with_initialization_script(self, script: String) -> Self {
+        WebViewBuilder::with_initialization_script(self, script)
+    }
+    fn with_ipc_handler(self, handler: impl Fn(Request<String>) + 'static) -> Self {
+        WebViewBuilder::with_ipc_handler(self, handler)
+    }
+    fn with_navigation_handler(self, handler: impl Fn(String) -> bool + 'static) -> Self {
+        WebViewBuilder::with_navigation_handler(self, handler)
+    }
+    fn with_new_window_req_handler(
+        self,
+        handler: impl Fn(String) -> NewWindowResponse + 'static,
+    ) -> Self {
+        WebViewBuilder::with_new_window_req_handler(self, move |target, _features| handler(target))
+    }
+    fn with_permission_handler(
+        self,
+        handler: impl Fn(PermissionKind) -> PermissionResponse + Send + Sync + 'static,
+    ) -> Self {
+        WebViewBuilder::with_permission_handler(self, handler)
+    }
+    fn with_focused(self, focused: bool) -> Self {
+        WebViewBuilder::with_focused(self, focused)
+    }
+}
+
+/// Monta o WebView do Split a partir do `SplitBuild` que `split_open_plan`
+/// decidiu: nao volta a decidir script, IPC nem perfil. `send` e o proxy do
+/// event loop no produto e um registo no gate.
+fn configure_split_webview<B, S>(builder: B, build: &SplitBuild, send: S) -> B
+where
+    B: SplitWebViewTarget,
+    S: Fn(UserEvent) + Clone + 'static,
+{
+    let ipc = build.page.ipc;
+    let source_index = ipc.source_index;
+    let local_origin = build.local_origin.clone();
+    let new_window_send = send.clone();
+
+    builder
+        .with_incognito(build.incognito)
+        .with_initialization_script(build.page.init_script.clone())
+        .with_ipc_handler(split_ipc_handler(build.capability.clone(), ipc, send))
+        .with_navigation_handler(move |target| {
+            if target
+                .get(..9)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
+            {
+                return false;
+            }
+            remote_web_target(&target, local_origin.as_deref())
+                || is_view_source_target(&target, local_origin.as_deref())
+        })
+        .with_new_window_req_handler(move |target| {
+            if remote_web_target(&target, None) {
+                let event = if ipc.private {
+                    UserEvent::OpenPrivateSplit {
+                        source_index,
+                        url: target,
+                    }
+                } else {
+                    UserEvent::OpenSplit {
+                        source_index,
+                        url: target,
+                    }
+                };
+                new_window_send(event);
+            }
+            NewWindowResponse::Deny
+        })
+        .with_permission_handler(|kind| web_media_permission(kind, true))
+        .with_focused(true)
 }
 
 /// Para onde vai o que o utilizador escreveu na palette. Puro, para se poder
@@ -17465,7 +17524,10 @@ __fire('submit', at(login));
         assert!(!NEURALIA_KEYMAP_SCRIPT.contains("CustomEvent"));
         assert!(NEURALIA_KEYMAP_SCRIPT.contains("act('palette', { col:colIndex })"));
 
-        for builder in ["fn comparator_webview_builder", "fn split_webview_builder"] {
+        for builder in [
+            "fn comparator_webview_builder",
+            "fn configure_split_webview",
+        ] {
             let body = source
                 .split(builder)
                 .nth(1)
@@ -17899,7 +17961,7 @@ __fire('submit', at(login));
             "fn pdf_webview_builder",
             "fn external_webview_builder",
             "fn comparator_webview_builder",
-            "fn split_webview_builder",
+            "fn configure_split_webview",
             "fn maybe_start_gmail_monitor",
         ] {
             let body = source
@@ -19952,14 +20014,14 @@ __state('barra');
             "fn comparator_webview_builder",
             "fn external_webview_builder",
             "fn reader_webview_builder",
-            "fn split_webview_builder",
+            "fn configure_split_webview",
         ] {
             let body = body(builder);
             for forbidden in ["NEURALIA_KEYMAP_SCRIPT", "bind_page_script("] {
                 assert!(!body.contains(forbidden), "{builder}: {forbidden}");
             }
         }
-        let split = body("fn split_webview_builder");
+        let split = body("fn configure_split_webview");
         for forbidden in [
             "split_ipc_event_impl(",
             "with_incognito(private)",
@@ -19974,6 +20036,71 @@ __state('barra');
                 "split_webview_builder: {forbidden}"
             );
         }
+    }
+
+    /// O que `configure_split_webview` pos no builder, no lugar do
+    /// WebViewBuilder (que nao deixa ler o que recebeu).
+    #[derive(Default)]
+    struct RecordedSplitWebView {
+        incognito: Option<bool>,
+        scripts: Vec<String>,
+        ipc: Option<Box<dyn Fn(Request<String>)>>,
+        navigation: Option<Box<dyn Fn(String) -> bool>>,
+        new_window: Option<Box<dyn Fn(String) -> NewWindowResponse>>,
+        permission: bool,
+        focused: Option<bool>,
+    }
+
+    impl SplitWebViewTarget for RecordedSplitWebView {
+        fn with_incognito(mut self, incognito: bool) -> Self {
+            self.incognito = Some(incognito);
+            self
+        }
+        fn with_initialization_script(mut self, script: String) -> Self {
+            self.scripts.push(script);
+            self
+        }
+        fn with_ipc_handler(mut self, handler: impl Fn(Request<String>) + 'static) -> Self {
+            self.ipc = Some(Box::new(handler));
+            self
+        }
+        fn with_navigation_handler(mut self, handler: impl Fn(String) -> bool + 'static) -> Self {
+            self.navigation = Some(Box::new(handler));
+            self
+        }
+        fn with_new_window_req_handler(
+            mut self,
+            handler: impl Fn(String) -> NewWindowResponse + 'static,
+        ) -> Self {
+            self.new_window = Some(Box::new(handler));
+            self
+        }
+        fn with_permission_handler(
+            mut self,
+            _handler: impl Fn(PermissionKind) -> PermissionResponse + Send + Sync + 'static,
+        ) -> Self {
+            self.permission = true;
+            self
+        }
+        fn with_focused(mut self, focused: bool) -> Self {
+            self.focused = Some(focused);
+            self
+        }
+    }
+
+    /// `configure_split_webview` com o registo e um sink de eventos.
+    fn record_split_webview(
+        build: &SplitBuild,
+    ) -> (
+        RecordedSplitWebView,
+        std::rc::Rc<std::cell::RefCell<Vec<UserEvent>>>,
+    ) {
+        let seen: std::rc::Rc<std::cell::RefCell<Vec<UserEvent>>> = Default::default();
+        let sink = std::rc::Rc::clone(&seen);
+        let built = configure_split_webview(RecordedSplitWebView::default(), build, move |event| {
+            sink.borrow_mut().push(event)
+        });
+        (built, seen)
     }
 
     #[test]
@@ -20004,15 +20131,59 @@ __state('barra');
             assert_eq!(build.local_origin, None);
         }
 
+        // O builder a serio (`configure_split_webview`, o que
+        // `split_webview_builder` chama), com um registo no lugar do
+        // WebViewBuilder: o perfil, o script e os handlers que o WebView2
+        // receberia.
+        let (built_private, private_events) = record_split_webview(&private);
+        let (built_normal, normal_events) = record_split_webview(&normal);
+        assert_eq!(
+            built_private.incognito,
+            Some(true),
+            "o builder do Split privado nao pediu o perfil anonimo"
+        );
+        assert_eq!(built_normal.incognito, Some(false));
+        assert_eq!(
+            built_private.scripts,
+            vec![private.page.init_script.clone()]
+        );
+        assert_eq!(built_normal.scripts, vec![normal.page.init_script.clone()]);
+        assert_eq!(built_private.focused, Some(true));
+        assert!(built_private.permission);
+
+        // Um popup da pagina abre ao lado, privado se ela e privada; o
+        // WebView2 nunca abre janela propria.
+        let popup = |built: &RecordedSplitWebView| {
+            let handler = built.new_window.as_ref().expect("new window handler");
+            matches!(
+                handler("https://example.com/popup".to_string()),
+                NewWindowResponse::Deny
+            )
+        };
+        assert!(popup(&built_private) && popup(&built_normal));
+        assert!(
+            matches!(
+                private_events.take().as_slice(),
+                [UserEvent::OpenPrivateSplit { source_index: 1, url }] if url == "https://example.com/popup"
+            ),
+            "o popup do Split privado abriu num Split normal (grava memoria)"
+        );
+        assert!(matches!(
+            normal_events.take().as_slice(),
+            [UserEvent::OpenSplit { source_index: 1, url }] if url == "https://example.com/popup"
+        ));
+        let navigate = built_private
+            .navigation
+            .as_ref()
+            .expect("navigation handler");
+        assert!(navigate("https://example.com/outra".to_string()));
+        assert!(!navigate("neuralia:home".to_string()));
+
         // O handler IPC que o builder instala, com envelopes reais: o privado
         // recusa `search` e continua a fechar-se; o normal leva o texto.
         let deliver = |build: &SplitBuild, action: &str, args: &str| {
-            let seen: std::rc::Rc<std::cell::RefCell<Vec<UserEvent>>> = Default::default();
-            let sink = std::rc::Rc::clone(&seen);
-            let handler =
-                split_ipc_handler(build.capability.clone(), build.page.ipc, move |event| {
-                    sink.borrow_mut().push(event)
-                });
+            let (built, seen) = record_split_webview(build);
+            let handler = built.ipc.as_ref().expect("ipc handler");
             handler(
                 wry::http::Request::builder()
                     .uri("https://example.com/fonte")
@@ -20049,8 +20220,8 @@ __show('Texto da pagina.');
 __state('barra');
 "#;
         let results = run_selection_cases(vec![
-            selection_case("privado", &private.page.init_script, "", &[offered]),
-            selection_case("normal", &normal.page.init_script, "", &[offered]),
+            selection_case("privado", &built_private.scripts[0], "", &[offered]),
+            selection_case("normal", &built_normal.scripts[0], "", &[offered]),
         ]);
         let buttons =
             |result: &serde_json::Value| selection_states(result)["barra"]["buttons"].clone();
@@ -20112,6 +20283,21 @@ __state('barra');
         );
         assert!(open.contains(".split_webview_builder(&build)"));
         assert!(open.contains("let private = build.incognito;"));
+        // E o `split_webview_builder` so entrega o WebViewBuilder do tema a
+        // `configure_split_webview`: nada depois dele troca o perfil, o
+        // script ou os handlers que o gate acima chamou.
+        let wrapper = source
+            .split(
+                "fn split_webview_builder(&self, build: &SplitBuild) -> WebViewBuilder<'static> {",
+            )
+            .nth(1)
+            .and_then(|part| part.split("\n    }\n").next())
+            .expect("split_webview_builder");
+        assert_eq!(
+            squash(wrapper),
+            "let proxy = self.proxy.clone(); configure_split_webview(themed_webview_builder(), build, move |event| { let _ = proxy.send_event(event); })",
+            "split_webview_builder acrescenta algo ao que o gate viu"
+        );
         let panel = source
             .split("fn open_private_panel(&mut self)")
             .nth(1)
