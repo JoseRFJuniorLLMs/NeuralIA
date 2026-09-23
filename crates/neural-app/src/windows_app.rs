@@ -190,6 +190,14 @@ enum UserEvent {
     },
 }
 
+/// O que fazer com um pedido de split conforme a superficie atual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitFallback {
+    OpenSplit,
+    OpenWeb,
+    Ignore,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Surface {
     Home,
@@ -5273,6 +5281,20 @@ impl App {
         self.open_split_mode(source_index, url, allow_local, false, None)
     }
 
+    /// Um pedido de split que chega depois de o comparador desaparecer (o
+    /// popup da pagina ficou na fila atras do Home) ainda pode abrir como Web
+    /// normal. Um pedido PRIVADO nao: web() grava historico, captura memoria
+    /// e usa o perfil com cookies normais.
+    fn split_request_fallback(surface: Surface, private: bool) -> SplitFallback {
+        if surface == Surface::Comparator {
+            SplitFallback::OpenSplit
+        } else if private {
+            SplitFallback::Ignore
+        } else {
+            SplitFallback::OpenWeb
+        }
+    }
+
     fn open_split_mode(
         &mut self,
         source_index: usize,
@@ -5281,9 +5303,13 @@ impl App {
         private: bool,
         existing_context_id: Option<u64>,
     ) -> bool {
-        if self.surface != Surface::Comparator {
-            self.web(url);
-            return true;
+        match Self::split_request_fallback(self.surface, private) {
+            SplitFallback::OpenSplit => {}
+            SplitFallback::OpenWeb => {
+                self.web(url);
+                return true;
+            }
+            SplitFallback::Ignore => return false,
         }
 
         let Ok(valid) = neural_core::validate_web_url(&url) else {
@@ -12923,6 +12949,35 @@ process.stdout.write(JSON.stringify(results));
             current_research.is_none(),
             "the cleared research session is still alive and will be saved again"
         );
+    }
+
+    #[test]
+    fn a_private_split_request_after_leaving_the_comparator_is_dropped() {
+        // Fora do comparador um pedido privado nunca cai em web(): isso
+        // gravava a URL privada no historico e na memoria semantica.
+        for surface in [
+            Surface::Home,
+            Surface::Reader,
+            Surface::External,
+            Surface::Pdf,
+        ] {
+            assert_eq!(
+                App::split_request_fallback(surface, true),
+                SplitFallback::Ignore,
+                "{surface:?}"
+            );
+            assert_eq!(
+                App::split_request_fallback(surface, false),
+                SplitFallback::OpenWeb,
+                "{surface:?}"
+            );
+        }
+        for private in [false, true] {
+            assert_eq!(
+                App::split_request_fallback(Surface::Comparator, private),
+                SplitFallback::OpenSplit
+            );
+        }
     }
 
     #[test]
