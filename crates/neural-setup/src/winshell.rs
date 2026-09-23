@@ -11,10 +11,7 @@
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
-#[cfg(test)]
-use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Foundation::{HANDLE, S_OK};
-#[cfg(test)]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, S_OK};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
@@ -24,8 +21,9 @@ use windows_sys::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
 };
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
-    RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegEnumValueW, RegGetValueW,
+    RegOpenKeyExW, RegSetValueExW,
 };
 use windows_sys::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Programs, SHGetKnownFolderPath};
 use windows_sys::core::GUID;
@@ -153,7 +151,7 @@ pub fn create_shortcut(
         let mut file: *mut c_void = std::ptr::null_mut();
         let hr = ((*vtbl).query_interface)(raw, &IID_IPERSIST_FILE, &mut file);
         if hr != S_OK || file.is_null() {
-            return Err(format!("IPersistFile indisponivel: 0x{hr:08x}"));
+            return Err(format!("IPersistFile indisponível: 0x{hr:08x}"));
         }
         let file_vtbl = *(file as *mut *mut PersistFileVtbl);
         let file_guard = Released(file, (*file_vtbl).release);
@@ -179,11 +177,11 @@ pub struct ShortcutDetails {
     pub working_dir: PathBuf,
 }
 
-// So os testes chamam isto -- e e essa a razao de existir.
-#[allow(dead_code)]
-/// Le de volta tudo o que o `create_shortcut` grava. Existe para o teste de
-/// ida e volta cobrir **todos** os slots que usamos: um slot trocado nao da
-/// erro nenhum, da lixo, e so se ve comparando o que saiu com o que entrou.
+/// Le de volta tudo o que o `create_shortcut` grava. A desinstalacao usa-o
+/// para so apagar um atalho que aponte para a pasta que esta a remover; e o
+/// teste de ida e volta usa-o para cobrir **todos** os slots que usamos: um
+/// slot trocado nao da erro nenhum, da lixo, e so se ve comparando o que saiu
+/// com o que entrou.
 pub fn shortcut_details(link: &Path) -> Result<ShortcutDetails, String> {
     unsafe {
         let mut raw: *mut c_void = std::ptr::null_mut();
@@ -202,7 +200,7 @@ pub fn shortcut_details(link: &Path) -> Result<ShortcutDetails, String> {
 
         let mut file: *mut c_void = std::ptr::null_mut();
         if ((*vtbl).query_interface)(raw, &IID_IPERSIST_FILE, &mut file) != S_OK || file.is_null() {
-            return Err("IPersistFile indisponivel".into());
+            return Err("IPersistFile indisponível".into());
         }
         let file_vtbl = *(file as *mut *mut PersistFileVtbl);
         let file_guard = Released(file, (*file_vtbl).release);
@@ -264,8 +262,6 @@ impl Drop for Released {
     }
 }
 
-const UNINSTALL_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\NeuralIA";
-
 /// As duas linhas de comandos que o Windows corre para desinstalar: a normal
 /// (Definicoes > Aplicacoes) e a silenciosa (`winget uninstall --silent`,
 /// scripts). O desinstalador e o mesmo executavel que o instalador, por isso
@@ -275,9 +271,11 @@ pub fn uninstall_commands(uninstaller: &Path) -> (String, String) {
     (command.clone(), format!("{command} /S"))
 }
 
-/// Escreve a entrada de "Aplicacoes e funcionalidades" no ramo do utilizador.
-/// HKCU, e nao HKLM: a instalacao e do utilizador e nao pediu elevacao.
+/// Escreve a entrada de "Aplicacoes e funcionalidades" no ramo do utilizador,
+/// na chave `key_path` (dentro do HKCU). HKCU, e nao HKLM: a instalacao e do
+/// utilizador e nao pediu elevacao.
 pub fn register_uninstall(
+    key_path: &str,
     root: &Path,
     uninstaller: &Path,
     icon: &Path,
@@ -288,7 +286,7 @@ pub fn register_uninstall(
         let mut key: HKEY = std::ptr::null_mut();
         let status = RegCreateKeyExW(
             HKEY_CURRENT_USER,
-            wide(UNINSTALL_KEY).as_ptr(),
+            wide(key_path).as_ptr(),
             0,
             std::ptr::null(),
             REG_OPTION_NON_VOLATILE,
@@ -298,7 +296,7 @@ pub fn register_uninstall(
             std::ptr::null_mut(),
         );
         if status != 0 {
-            return Err(format!("nao consegui criar a chave: {status}"));
+            return Err(format!("não foi possível criar a chave: {status}"));
         }
 
         let (uninstall, quiet_uninstall) = uninstall_commands(uninstaller);
@@ -311,9 +309,12 @@ pub fn register_uninstall(
             ("UninstallString", uninstall),
             ("QuietUninstallString", quiet_uninstall),
         ];
+        // Uma entrada sem versao ou sem `UninstallString` e uma entrada que
+        // mente em "Aplicacoes": a falha de um valor e a falha do registo.
+        let mut failed = None;
         for (name, value) in &text_values {
             let data = wide(value);
-            RegSetValueExW(
+            let status = RegSetValueExW(
                 key,
                 wide(name).as_ptr(),
                 0,
@@ -321,6 +322,9 @@ pub fn register_uninstall(
                 data.as_ptr() as *const u8,
                 (data.len() * 2) as u32,
             );
+            if status != 0 {
+                failed.get_or_insert(format!("não foi possível gravar {name}: {status}"));
+            }
         }
         for (name, value) in [
             ("EstimatedSize", size_kb),
@@ -337,24 +341,242 @@ pub fn register_uninstall(
             );
         }
         RegCloseKey(key);
-        Ok(())
+        failed.map_or(Ok(()), Err)
     }
 }
 
-pub fn unregister_uninstall() {
+/// Apaga a chave `key_path` (dentro do HKCU), ela e tudo o que tem dentro.
+pub fn delete_key(key_path: &str) {
     unsafe {
-        RegDeleteTreeW(HKEY_CURRENT_USER, wide(UNINSTALL_KEY).as_ptr());
+        RegDeleteTreeW(HKEY_CURRENT_USER, wide(key_path).as_ptr());
     }
 }
 
+/// Os valores de uma chave, tal como estavam: nome, tipo e bytes. E o que a
+/// instalacao guarda antes de escrever a sua entrada, para a poder repor se
+/// um passo depois falhar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeySnapshot {
+    values: Vec<(Vec<u16>, u32, Vec<u8>)>,
+}
+
+/// Le todos os valores de `key_path` (dentro do HKCU). `None` se a chave nao
+/// existe. As entradas de "Aplicativos" nao tem subchaves; so os valores
+/// contam.
+pub fn snapshot_key(key_path: &str) -> Option<KeySnapshot> {
+    unsafe {
+        let mut key: HKEY = std::ptr::null_mut();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            wide(key_path).as_ptr(),
+            0,
+            KEY_READ,
+            &mut key,
+        ) != 0
+        {
+            return None;
+        }
+        let mut values = Vec::new();
+        let mut name = vec![0u16; 16_384];
+        let mut data = vec![0u8; 64 * 1024];
+        for index in 0.. {
+            let mut name_len = name.len() as u32;
+            let mut data_len = data.len() as u32;
+            let mut kind = 0u32;
+            let status = RegEnumValueW(
+                key,
+                index,
+                name.as_mut_ptr(),
+                &mut name_len,
+                std::ptr::null(),
+                &mut kind,
+                data.as_mut_ptr(),
+                &mut data_len,
+            );
+            if status != 0 {
+                // ERROR_NO_MORE_ITEMS, ou um valor maior do que 64 KiB, que
+                // uma entrada de desinstalacao nao tem.
+                break;
+            }
+            values.push((
+                name[..name_len as usize].to_vec(),
+                kind,
+                data[..data_len as usize].to_vec(),
+            ));
+        }
+        RegCloseKey(key);
+        Some(KeySnapshot { values })
+    }
+}
+
+/// Poe `key_path` como estava: sem chave se nao existia, ou exatamente com os
+/// valores guardados.
+pub fn restore_key(key_path: &str, snapshot: Option<&KeySnapshot>) {
+    delete_key(key_path);
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    unsafe {
+        let mut key: HKEY = std::ptr::null_mut();
+        if RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            wide(key_path).as_ptr(),
+            0,
+            std::ptr::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            std::ptr::null(),
+            &mut key,
+            std::ptr::null_mut(),
+        ) != 0
+        {
+            return;
+        }
+        for (name, kind, data) in &snapshot.values {
+            let name: Vec<u16> = name.iter().copied().chain([0]).collect();
+            RegSetValueExW(
+                key,
+                name.as_ptr(),
+                0,
+                *kind,
+                data.as_ptr(),
+                data.len() as u32,
+            );
+        }
+        RegCloseKey(key);
+    }
+}
+
+/// Apaga a chave `key_path` so se ja nao tiver subchaves. So os testes o usam,
+/// para nao deixar a raiz das pastas de ensaio vazia no registo de quem os
+/// corre.
 #[cfg(test)]
+pub fn delete_empty_key(key_path: &str) {
+    unsafe {
+        windows_sys::Win32::System::Registry::RegDeleteKeyW(
+            HKEY_CURRENT_USER,
+            wide(key_path).as_ptr(),
+        );
+    }
+}
+
+/// A chave existe no HKCU?
+pub fn key_exists(key_path: &str) -> bool {
+    unsafe {
+        let mut key: HKEY = std::ptr::null_mut();
+        let status = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            wide(key_path).as_ptr(),
+            0,
+            KEY_READ,
+            &mut key,
+        );
+        if status == 0 {
+            RegCloseKey(key);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Um valor de texto de uma chave do HKCU, se existir e nao estiver vazio.
+pub fn read_string(key_path: &str, name: &str) -> Option<String> {
+    unsafe {
+        let key = wide(key_path);
+        let value = wide(name);
+        let mut bytes = 0u32;
+        let status = RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut bytes,
+        );
+        if status != 0 || bytes < 2 {
+            return None;
+        }
+        let mut buffer = vec![0u16; (bytes as usize).div_ceil(2)];
+        let status = RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr() as *mut c_void,
+            &mut bytes,
+        );
+        if status != 0 {
+            return None;
+        }
+        let text = read_wide(&buffer);
+        (!text.is_empty()).then_some(text)
+    }
+}
+
+/// A pasta que uma entrada de "Aplicacoes" diz ser a da instalacao. O Inno
+/// escreve-a com `\` no fim; tira-se, para a pasta se mostrar como as outras.
+pub fn registered_location(key_path: &str) -> Option<PathBuf> {
+    let text = read_string(key_path, "InstallLocation")?;
+    let trimmed = text.trim_end_matches(['\\', '/']);
+    // `C:\` sem a barra seria `C:`, que e outra coisa: fica como veio.
+    let text = if trimmed.ends_with(':') || trimmed.is_empty() {
+        text.as_str()
+    } else {
+        trimmed
+    };
+    Some(PathBuf::from(text))
+}
+
+/// A entrada que o Inno das 2.1.x deixou, se ainda existir.
+pub fn inno_registration(key_path: &str) -> Option<crate::install::InnoRegistration> {
+    key_exists(key_path).then(|| crate::install::InnoRegistration {
+        install_location: registered_location(key_path),
+        uninstall_string: read_string(key_path, "UninstallString"),
+    })
+}
+
+/// Escreve um valor de texto numa chave do HKCU, criando-a. So os testes o
+/// usam: e como semeiam uma entrada do Inno numa pasta de ensaio.
+#[cfg(test)]
+pub fn write_string(key_path: &str, name: &str, value: &str) {
+    unsafe {
+        let mut key: HKEY = std::ptr::null_mut();
+        let status = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            wide(key_path).as_ptr(),
+            0,
+            std::ptr::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            std::ptr::null(),
+            &mut key,
+            std::ptr::null_mut(),
+        );
+        assert_eq!(status, 0, "criar {key_path}");
+        let data = wide(value);
+        RegSetValueExW(
+            key,
+            wide(name).as_ptr(),
+            0,
+            REG_SZ,
+            data.as_ptr() as *const u8,
+            (data.len() * 2) as u32,
+        );
+        RegCloseKey(key);
+    }
+}
+
+/// O que identifica um ficheiro ou pasta no disco, seja qual for o nome por
+/// que se chega la: o volume e o indice do NTFS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
     volume_serial: u32,
     file_index: u64,
 }
 
-#[cfg(test)]
 fn file_identity(path: &Path) -> Result<FileIdentity, String> {
     let path = wide_path(path);
     unsafe {
@@ -401,6 +623,25 @@ fn file_identity(path: &Path) -> Result<FileIdentity, String> {
 #[cfg(test)]
 fn same_filesystem_object(left: &Path, right: &Path) -> Result<bool, String> {
     Ok(file_identity(left)? == file_identity(right)?)
+}
+
+/// `a` e `b` sao o mesmo ficheiro? Pela identidade no disco quando os dois
+/// existem: `C:\Users\RUNNER~1\x` e `C:\Users\runneradmin\x` sao o mesmo, e o
+/// `IShellLink` devolve sempre o nome longo, seja qual for o que se gravou.
+/// Se um deles ja nao existe, a pasta de cada um decide (com o mesmo nome de
+/// ficheiro); sem nenhuma das duas, o texto.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    if let (Ok(left), Ok(right)) = (file_identity(a), file_identity(b)) {
+        return left == right;
+    }
+    if let (Some(a_dir), Some(b_dir), Some(a_name), Some(b_name)) =
+        (a.parent(), b.parent(), a.file_name(), b.file_name())
+        && let (Ok(left), Ok(right)) = (file_identity(a_dir), file_identity(b_dir))
+    {
+        return left == right
+            && a_name.to_string_lossy().to_lowercase() == b_name.to_string_lossy().to_lowercase();
+    }
+    crate::install::same_path(a, b)
 }
 
 #[cfg(test)]
