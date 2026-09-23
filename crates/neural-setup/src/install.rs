@@ -1846,6 +1846,42 @@ mod tests {
     }
 
     #[test]
+    fn a_payload_file_that_stays_keeps_the_uninstaller_in_place() {
+        // A NeuralIA aberta entre a verificacao e a remocao: o executavel
+        // fica, e a entrada de "Aplicativos" tambem -- o `UninstallString`
+        // dela tem de continuar a abrir um desinstalador, que nao pode ter
+        // saido (nem ido para a pasta temporaria).
+        use std::os::windows::fs::OpenOptionsExt;
+        let base = temp("keep-uninstaller");
+        let root = base.join(PRODUCT);
+        fs::create_dir_all(root.join("assets")).expect("pasta");
+        fs::write(root.join(EXECUTABLE), b"app").expect("exe");
+        fs::write(root.join("assets").join("a.bin"), b"a").expect("a");
+        fs::write(root.join(UNINSTALLER), b"MZ desinstalador").expect("desinstalador");
+        let hold = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(root.join(EXECUTABLE))
+            .expect("a NeuralIA aberta");
+
+        let result = remove_installed(
+            &root,
+            &[entry(EXECUTABLE, 3), entry("assets/a.bin", 1)],
+            &base.join("parking"),
+            |_| {},
+        );
+        drop(hold);
+        let kept = root.join(UNINSTALLER).exists();
+        let _ = fs::remove_dir_all(&base);
+
+        assert_eq!(result, Err(vec![root.join(EXECUTABLE)]));
+        assert!(
+            kept,
+            "o desinstalador saiu com a NeuralIA ainda instalada: a entrada de Aplicativos ficou a apontar para nada"
+        );
+    }
+
+    #[test]
     fn the_removal_command_quotes_the_path_and_refuses_what_cmd_would_expand() {
         let path = Path::new(r"C:\Users\Eu (casa) & cia\Apps\.neuralia-uninstaller-12.exe");
         let command = removal_command(path).expect("comando");
