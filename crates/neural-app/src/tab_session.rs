@@ -13,8 +13,13 @@
 //! - o escritor nunca escreve o que o leitor recusaria (`sanitize` e o mesmo
 //!   dos dois lados) e escreve por ficheiro temporario + `rename`, sem deixar
 //!   o temporario para tras quando falha;
-//! - uma sessao sem abas nao deixa ficheiro nenhum.
+//! - uma sessao sem abas nao deixa ficheiro nenhum;
+//! - os limites de abas podam as soltas mais antigas, nunca pela posicao na
+//!   barra, e nunca uma agrupada antes de todas as soltas (`prune_victims`);
+//! - duas janelas do NeuralIA nao gravam uma por cima da outra, e um "Apagar
+//!   historico" numa nao e desfeito pela outra (`SessionStore`).
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -34,8 +39,9 @@ pub const COLUMNS: usize = 3;
 /// mesma poda da sessao viva (`prune_victims`), para o ficheiro nao trazer de
 /// volta mais do que a barra deixaria existir.
 pub const MAX_TABS_PER_COLUMN: usize = 32;
-/// O tecto de tudo, agrupadas incluidas. So um dono com mais de 64 abas
-/// agrupadas numa coluna perde uma -- e e avisado.
+/// O tecto de tudo, agrupadas incluidas. Acima dele saem primeiro as soltas;
+/// so uma coluna com mais de 64 abas agrupadas perde uma agrupada -- e o dono
+/// e avisado.
 pub const MAX_KEPT_TABS_PER_COLUMN: usize = 64;
 /// URLs maiores nao sao guardadas nem lidas -- nem viram aba na barra
 /// (`storable_url`): a barra e o ficheiro nunca discordam. 8 KiB cabem os
@@ -195,37 +201,46 @@ pub fn storable_url(value: &str) -> bool {
 /// ou a que acabou de nascer.
 ///
 /// Primeiro saem as soltas mais antigas, ate sobrarem `MAX_TABS_PER_COLUMN`
-/// -- nunca uma agrupada nem uma protegida. So acima de
-/// `MAX_KEPT_TABS_PER_COLUMN` sai uma agrupada (a mais antiga). A posicao na
-/// barra nao conta: antes podava-se pela esquerda, e como os grupos ficam
-/// onde foram feitos e os links novos entram no fim, os primeiros a morrer
-/// eram os grupos que o dono arrumou -- e arrastar uma aba para a frente
-/// condenava-a.
+/// soltas -- as agrupadas nao contam para isto e nunca saem aqui, nem uma
+/// protegida. So acima de `MAX_KEPT_TABS_PER_COLUMN` abas ao todo sai mais
+/// alguma: a solta mais antiga que ainda houver e, so sem soltas, a agrupada
+/// mais antiga. A posicao na barra nao conta: antes podava-se pela esquerda,
+/// e como os grupos ficam onde foram feitos e os links novos entram no fim,
+/// os primeiros a morrer eram os grupos que o dono arrumou -- e arrastar uma
+/// aba para a frente condenava-a.
+///
+/// `O(n log n)`: a leitura corre isto sobre um ficheiro que nao controla,
+/// com tantas abas quantas couberem em `MAX_FILE_BYTES`.
 pub fn prune_victims(tabs: &[(u64, bool, bool)]) -> Vec<usize> {
-    let mut victims: Vec<usize> = Vec::new();
-    let mut oldest = |victims: &[usize], grouped_too: bool| {
-        tabs.iter()
-            .enumerate()
-            .filter(|(index, (_, grouped, protected))| {
-                !protected && (grouped_too || !grouped) && !victims.contains(index)
-            })
-            .min_by_key(|(index, (age, _, _))| (*age, *index))
-            .map(|(index, _)| index)
-    };
-    while tabs.len() - victims.len() > MAX_TABS_PER_COLUMN {
-        let Some(index) = oldest(&victims, false) else {
-            break;
-        };
-        victims.push(index);
+    let mut by_age: Vec<usize> = (0..tabs.len()).collect();
+    by_age.sort_by_key(|index| (tabs[*index].0, *index));
+    let mut dropped = vec![false; tabs.len()];
+    let mut loose = tabs.iter().filter(|(_, grouped, _)| !grouped).count();
+    let mut total = tabs.len();
+    // Uma passagem por idade para cada regra: as soltas acima do limite
+    // delas; depois, acima do tecto, soltas e so entao agrupadas.
+    let passes: [(bool, fn(usize, usize) -> bool); 3] = [
+        (false, |loose, _| loose > MAX_TABS_PER_COLUMN),
+        (false, |_, total| total > MAX_KEPT_TABS_PER_COLUMN),
+        (true, |_, total| total > MAX_KEPT_TABS_PER_COLUMN),
+    ];
+    for (grouped_pass, over) in passes {
+        for index in by_age.iter().copied() {
+            if !over(loose, total) {
+                break;
+            }
+            let (_, grouped, protected) = tabs[index];
+            if dropped[index] || protected || grouped != grouped_pass {
+                continue;
+            }
+            dropped[index] = true;
+            total -= 1;
+            if !grouped {
+                loose -= 1;
+            }
+        }
     }
-    while tabs.len() - victims.len() > MAX_KEPT_TABS_PER_COLUMN {
-        let Some(index) = oldest(&victims, true) else {
-            break;
-        };
-        victims.push(index);
-    }
-    victims.sort_unstable();
-    victims
+    (0..tabs.len()).filter(|index| dropped[*index]).collect()
 }
 
 fn clean_url(value: &str) -> Option<String> {
@@ -270,34 +285,37 @@ fn sanitize_column(column: &SessionColumn) -> SessionColumn {
         })
         .collect();
     // Os limites da sessao viva, com a mesma regra (`prune_victims`): saem as
-    // soltas mais antigas; as agrupadas e a aberta ao lado ficam.
-    let known = |id: u64| column.groups.iter().any(|group| group.id == id);
+    // soltas mais antigas; as agrupadas e a aberta ao lado ficam. Conjuntos,
+    // nao buscas lineares: o ficheiro pode trazer milhares de abas e grupos.
+    let known: HashSet<u64> = column.groups.iter().map(|group| group.id).collect();
     let ages: Vec<(u64, bool, bool)> = kept
         .iter()
         .map(|(index, tab)| {
             (
                 tab.id,
-                tab.group.is_some_and(known),
+                tab.group.is_some_and(|id| known.contains(&id)),
                 column.active == Some(*index),
             )
         })
         .collect();
-    let victims = prune_victims(&ages);
+    let mut dropped = vec![false; ages.len()];
+    for victim in prune_victims(&ages) {
+        dropped[victim] = true;
+    }
     let mut kept: Vec<(usize, SessionTab)> = kept
         .into_iter()
         .enumerate()
-        .filter(|(position, _)| !victims.contains(position))
+        .filter(|(position, _)| !dropped[*position])
         .map(|(_, entry)| entry)
         .collect();
 
     // Grupos: o primeiro com cada id, e so os que ainda tem abas. Um grupo
     // vazio seria uma pilula fantasma na barra.
+    let used: HashSet<u64> = kept.iter().filter_map(|(_, tab)| tab.group).collect();
+    let mut seen: HashSet<u64> = HashSet::new();
     let mut groups: Vec<SessionGroup> = Vec::new();
     for group in &column.groups {
-        if groups.iter().any(|seen| seen.id == group.id) {
-            continue;
-        }
-        if !kept.iter().any(|(_, tab)| tab.group == Some(group.id)) {
+        if !used.contains(&group.id) || !seen.insert(group.id) {
             continue;
         }
         let name = clean_text(&group.name, MAX_GROUP_NAME_CHARS);
@@ -315,7 +333,7 @@ fn sanitize_column(column: &SessionColumn) -> SessionColumn {
     // Aba num grupo que nao existe volta a ser solta, em vez de desaparecer.
     for (_, tab) in &mut kept {
         if let Some(id) = tab.group
-            && !groups.iter().any(|group| group.id == id)
+            && !seen.contains(&id)
         {
             tab.group = None;
         }
@@ -613,8 +631,9 @@ pub enum SaveOutcome {
 /// ainda tinha as abas de antes. Por isso:
 /// - so uma instancia grava: a que conseguiu prender o `tabs.lock`; as outras
 ///   leem as abas mas nao escrevem (e o dono e avisado);
-/// - "Apagar historico" sobe a geracao em `tabs.cleared`; quem leu as abas
-///   antes disso deixa de as gravar;
+/// - "Apagar historico" sobe a geracao em `tabs.cleared`; quem tem abas de
+///   uma geracao anterior nao as grava (`SaveOutcome::ClearedElsewhere`) ate
+///   as largar (`acknowledge_clear`);
 /// - um `tabs.json` que nao se conseguiu ler nao e substituido sem copia.
 pub struct SessionStore {
     path: PathBuf,
@@ -626,8 +645,6 @@ pub struct SessionStore {
     cleared_seen: u64,
     /// A ultima leitura falhou sem se saber o que la esta.
     unread: bool,
-    /// Deixou de gravar: o historico foi apagado noutra janela.
-    stopped: bool,
 }
 
 enum WriterLock {
@@ -686,7 +703,6 @@ impl SessionStore {
             writer,
             cleared_seen: read_generation(&data_dir.join(CLEARED_NAME)),
             unread: false,
-            stopped: false,
         }
     }
 
@@ -698,10 +714,21 @@ impl SessionStore {
     /// "Apagar historico" de agora: volta a poder ser gravado.
     pub fn load(&mut self) -> Loaded {
         self.cleared_seen = read_generation(&self.cleared_path);
-        self.stopped = false;
         let loaded = load(&self.path);
         self.unread = matches!(loaded, Loaded::Unreadable(_));
         loaded
+    }
+
+    /// Alguma janela apagou o historico depois de esta ter lido as abas?
+    fn cleared_since_read(&self) -> bool {
+        read_generation(&self.cleared_path) != self.cleared_seen
+    }
+
+    /// O modelo desta instancia largou as abas de antes de um "Apagar
+    /// historico" feito noutra janela: pode voltar a gravar.
+    pub fn acknowledge_clear(&mut self) {
+        self.cleared_seen = read_generation(&self.cleared_path);
+        self.unread = false;
     }
 
     /// Grava a sessao, se esta instancia pode.
@@ -709,8 +736,7 @@ impl SessionStore {
         if !self.writer {
             return Ok(SaveOutcome::NotWriter);
         }
-        if self.stopped || read_generation(&self.cleared_path) != self.cleared_seen {
-            self.stopped = true;
+        if self.cleared_since_read() {
             return Ok(SaveOutcome::ClearedElsewhere);
         }
         if self.unread {
@@ -724,14 +750,22 @@ impl SessionStore {
             self.unread = false;
         }
         save(&self.path, session)?;
+        // Um "Apagar historico" noutra janela entre a verificacao de cima e a
+        // escrita: o que se acabou de escrever sai ja. `forget` sobe a geracao
+        // ANTES de apagar, por isso ou este passo a ve, ou o apagar dela vem
+        // depois desta escrita -- nunca fica de pe o que o dono mandou apagar.
+        if self.cleared_since_read() {
+            let _ = clear(&self.path);
+            return Ok(SaveOutcome::ClearedElsewhere);
+        }
         Ok(SaveOutcome::Written)
     }
 
-    /// "Apagar historico": o ficheiro, as copias e os temporarios, e a
-    /// geracao sobe -- outra janela que ainda tenha as abas de antes deixa de
-    /// as gravar. Apaga mesmo numa instancia que nao grava: e privacidade.
+    /// "Apagar historico": a geracao sobe PRIMEIRO -- outra janela que ainda
+    /// tenha as abas de antes deixa de as gravar -- e depois saem o ficheiro,
+    /// as copias e os temporarios. Apaga mesmo numa instancia que nao grava:
+    /// e privacidade.
     pub fn forget(&mut self) -> io::Result<()> {
-        let removed = clear(&self.path);
         let generation = read_generation(&self.cleared_path).wrapping_add(1);
         let marked = write_atomically(
             &self.cleared_path,
@@ -741,7 +775,7 @@ impl SessionStore {
         if marked.is_ok() {
             self.cleared_seen = generation;
         }
-        self.stopped = false;
+        let removed = clear(&self.path);
         self.unread = false;
         removed.and(marked)
     }
@@ -955,19 +989,78 @@ mod tests {
         let back = decode(&encode(&session)).expect("decode");
         let tabs = &back.columns[0].tabs;
         assert_eq!(tabs.len(), MAX_TABS_PER_COLUMN);
-        // As mais antigas saem, como em `remember_context_tab`.
-        assert_eq!(tabs[0].id, 8);
-        assert_eq!(tabs.last().map(|tab| tab.id), Some(39));
-        // A ativa era uma das podadas: nao aponta para outra aba qualquer.
-        assert_eq!(back.columns[0].active, None);
+        // As mais antigas saem, como em `remember_context_tab` -- menos a que
+        // estava aberta ao lado, que continua a apontar para ela propria.
+        let ids: Vec<u64> = tabs.iter().map(|tab| tab.id).collect();
+        let expected: Vec<u64> = std::iter::once(2).chain(9..40).collect();
+        assert_eq!(ids, expected);
+        assert_eq!(back.columns[0].active, Some(0));
+    }
+
+    /// data-1: o limite poda pela idade (o id), nunca pela posicao, e nunca
+    /// uma agrupada enquanto houver soltas. Antes podava-se a esquerda, onde
+    /// ficam os grupos que o dono fez primeiro.
+    #[test]
+    fn the_tab_limits_prune_the_oldest_loose_tabs_and_keep_the_groups() {
+        // 20 agrupadas a esquerda (as mais antigas) e 40 soltas: saem so as
+        // 8 soltas mais antigas; as agrupadas nao contam para o limite.
+        let mut column = SessionColumn::default();
+        for id in 0..20u64 {
+            column
+                .tabs
+                .push(tab(id, &format!("https://g.example/{id}"), Some(1)));
+        }
+        for id in 20..60u64 {
+            column
+                .tabs
+                .push(tab(id, &format!("https://l.example/{id}"), None));
+        }
+        column.groups.push(group(1, "Pesquisa", "green", true));
+        let clean = sanitize_column(&column);
+        assert_eq!(clean.groups.len(), 1, "o grupo do dono continua");
+        let grouped = clean.tabs.iter().filter(|tab| tab.group.is_some()).count();
+        assert_eq!(grouped, 20, "nenhuma agrupada sai");
+        let loose: Vec<u64> = clean
+            .tabs
+            .iter()
+            .filter(|tab| tab.group.is_none())
+            .map(|tab| tab.id)
+            .collect();
+        assert_eq!(loose, (28..60).collect::<Vec<_>>());
+
+        // A posicao nao conta: a solta mais NOVA posta a frente de tudo fica,
+        // e sai a mais antiga, esteja onde estiver.
+        let mut moved: Vec<(u64, bool, bool)> = (0..33u64).map(|id| (id, false, false)).collect();
+        moved.rotate_right(1);
+        assert_eq!(moved[0].0, 32);
+        assert_eq!(prune_victims(&moved), vec![1], "sai o id 0, na posicao 1");
+
+        // Acima do tecto: primeiro as soltas (menos a protegida), e so depois
+        // a agrupada mais antiga.
+        let mut many: Vec<(u64, bool, bool)> = (0..70u64).map(|id| (id, true, false)).collect();
+        many.push((100, false, true));
+        many.push((5, false, false));
+        let victims = prune_victims(&many);
+        assert_eq!(victims.len(), many.len() - MAX_KEPT_TABS_PER_COLUMN);
+        assert_eq!(
+            victims[..6],
+            [0, 1, 2, 3, 4, 5],
+            "as agrupadas mais antigas"
+        );
+        assert!(
+            victims.contains(&71),
+            "a solta sai antes de qualquer agrupada"
+        );
+        assert!(!victims.contains(&70), "a protegida nunca sai");
     }
 
     #[test]
     fn the_largest_session_the_writer_can_produce_is_still_readable() {
         let long_url = format!("https://example.com/{}", "a".repeat(MAX_URL_BYTES - 20));
         assert_eq!(long_url.len(), MAX_URL_BYTES);
+        // Todas agrupadas: e assim que uma coluna chega ao tecto de tudo.
         let column = SessionColumn {
-            tabs: (0..MAX_TABS_PER_COLUMN as u64)
+            tabs: (0..MAX_KEPT_TABS_PER_COLUMN as u64)
                 .map(|id| SessionTab {
                     id: u64::MAX - id,
                     url: long_url.clone(),
@@ -975,7 +1068,7 @@ mod tests {
                     group: Some(u64::MAX - id),
                 })
                 .collect(),
-            groups: (0..MAX_TABS_PER_COLUMN as u64)
+            groups: (0..MAX_KEPT_TABS_PER_COLUMN as u64)
                 .map(|id| {
                     group(
                         u64::MAX - id,
@@ -995,6 +1088,11 @@ mod tests {
             (bytes.len() as u64) <= MAX_FILE_BYTES,
             "writer produced {} bytes, above the reader cap",
             bytes.len()
+        );
+        assert_eq!(
+            sanitize(&session).columns[0].tabs.len(),
+            MAX_KEPT_TABS_PER_COLUMN,
+            "o pior caso tem de chegar ao tecto, senao nao prova nada"
         );
         assert_eq!(decode(&bytes).expect("decode"), sanitize(&session));
 
@@ -1063,6 +1161,135 @@ mod tests {
         save(&path, &sample()).expect("save");
         save(&path, &TabSession::default()).expect("save empty");
         assert!(!path.exists(), "an empty session must not leave a file");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn one_tab(url: &str) -> TabSession {
+        let mut session = TabSession::default();
+        session.columns[0].tabs.push(tab(1, url, None));
+        session
+    }
+
+    fn saved_urls(path: &Path) -> Vec<String> {
+        match load(path) {
+            Loaded::Restored(session) => session
+                .columns
+                .iter()
+                .flat_map(|column| column.tabs.iter().map(|tab| tab.url.clone()))
+                .collect(),
+            Loaded::Missing => Vec::new(),
+            other => panic!("tabs.json ilegivel: {other:?}"),
+        }
+    }
+
+    /// data-3: duas janelas do NeuralIA no mesmo `data_dir`. So a primeira
+    /// grava -- a segunda ja nao apaga as abas dela --, e um "Apagar
+    /// historico" na segunda nao e desfeito pela gravacao seguinte da
+    /// primeira, que ainda tinha as abas de antes.
+    #[test]
+    fn two_instances_never_overwrite_each_others_tabs_or_undo_a_clear() {
+        let dir = temp_dir("instances");
+        let path = path_in(&dir);
+        save(&path, &one_tab("https://old-secret.example/")).expect("sessao anterior");
+
+        let mut first = SessionStore::open(&dir);
+        let mut second = SessionStore::open(&dir);
+        assert!(first.is_writer());
+        assert!(!second.is_writer(), "o tabs.lock ja esta preso");
+        assert!(matches!(first.load(), Loaded::Restored(_)));
+        assert!(matches!(second.load(), Loaded::Restored(_)));
+
+        assert_eq!(
+            first
+                .save(&one_tab("https://from-a.example/"))
+                .expect("grava"),
+            SaveOutcome::Written
+        );
+        assert_eq!(
+            second
+                .save(&one_tab("https://from-b.example/"))
+                .expect("nao grava"),
+            SaveOutcome::NotWriter
+        );
+        assert_eq!(saved_urls(&path), ["https://from-a.example/"]);
+
+        // "Apagar historico" na janela que nao grava: apaga na mesma.
+        second.forget().expect("apagar");
+        assert!(!path.exists());
+        // A primeira ainda tem as abas de antes: nao as escreve de volta.
+        assert_eq!(
+            first
+                .save(&one_tab("https://old-secret.example/"))
+                .expect("recusa"),
+            SaveOutcome::ClearedElsewhere
+        );
+        assert!(!path.exists(), "o que o dono apagou voltou ao disco");
+        // Depois de largar as abas de antes, volta a gravar.
+        first.acknowledge_clear();
+        assert_eq!(
+            first
+                .save(&one_tab("https://later.example/"))
+                .expect("grava"),
+            SaveOutcome::Written
+        );
+        assert_eq!(saved_urls(&path), ["https://later.example/"]);
+
+        // A trava morre com a instancia: a proxima a abrir grava.
+        drop(first);
+        drop(second);
+        assert!(SessionStore::open(&dir).is_writer());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// data-5: um `tabs.json` que nao se conseguiu ler nao e substituido sem
+    /// copia. Aqui o caminho e um diretorio: ilegivel e impossivel de copiar,
+    /// por isso nada se escreve por cima.
+    #[test]
+    fn an_unreadable_session_is_never_replaced_without_a_copy() {
+        let dir = temp_dir("unreadable-dir");
+        let path = path_in(&dir);
+        fs::create_dir_all(&path).expect("diretorio no lugar do ficheiro");
+        let mut store = SessionStore::open(&dir);
+        assert!(matches!(store.load(), Loaded::Unreadable(_)));
+        assert!(store.save(&one_tab("https://new.example/")).is_err());
+        assert!(path.is_dir(), "o que la estava foi substituido sem copia");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// data-5 no Windows: o ficheiro estava preso por outro programa na
+    /// leitura. A primeira gravacao guarda-o em `tabs.json.unread` antes de o
+    /// substituir, e "Apagar historico" apaga tambem essa copia.
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_session_file_is_copied_before_the_first_save() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = temp_dir("unreadable-lock");
+        let path = path_in(&dir);
+        save(&path, &one_tab("https://before.example/")).expect("sessao anterior");
+        let before = fs::read(&path).expect("read");
+        let mut store = SessionStore::open(&dir);
+        {
+            let _held = OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&path)
+                .expect("prender o ficheiro");
+            assert!(matches!(store.load(), Loaded::Unreadable(_)));
+        }
+        assert_eq!(
+            store
+                .save(&one_tab("https://after.example/"))
+                .expect("grava"),
+            SaveOutcome::Written
+        );
+        assert_eq!(saved_urls(&path), ["https://after.example/"]);
+        assert_eq!(
+            fs::read(unread_backup_path(&path)).expect("copia"),
+            before,
+            "a sessao que nao se leu ficou copiada, byte a byte"
+        );
+        store.forget().expect("apagar");
+        assert!(!unread_backup_path(&path).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

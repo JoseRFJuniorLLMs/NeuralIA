@@ -1964,8 +1964,9 @@ fn prune_empty_groups(tabs: &[ContextTab], groups: &mut Vec<ContextGroup>) {
 }
 
 /// Guarda uma nova aba de contexto e devolve a sua identidade estavel. Se a
-/// ultima aba ja e a mesma URL, reutiliza-a; ao aplicar o limite, poda tambem
-/// o grupo que eventualmente ficou sem o seu ultimo membro.
+/// ultima aba ja e a mesma URL, reutiliza-a; ao aplicar os limites
+/// (`prune_context_tabs`, que nunca tira a aba nova), poda tambem o grupo que
+/// eventualmente ficou sem o seu ultimo membro.
 ///
 /// `opener` e a aba de onde o link saiu. Se ela estiver num grupo, a aba nova
 /// nasce nesse grupo, no fim do seu troco -- como no Chrome, onde o que se
@@ -2001,11 +2002,74 @@ fn remember_context_tab(
             group: opener_group,
         },
     );
-    if tabs.len() > 32 {
-        tabs.remove(0);
+    let _ = prune_context_tabs(tabs, groups, &[id]);
+    id
+}
+
+/// Os limites de abas de uma coluna (`tab_session::prune_victims`, a mesma
+/// regra do `tabs.json`): saem as soltas mais antigas -- pela identidade, que
+/// sobe com cada aba nova, nunca pela posicao na barra --, uma agrupada so
+/// quando ja nao ha soltas acima do tecto, e nunca as `protected` (a que
+/// acabou de nascer, a aberta ao lado). Antes saia a primeira da esquerda: la
+/// ficam os grupos que o dono fez primeiro, e com as abas a sobreviver a
+/// pesquisas e reinicios o limite passou a apaga-los sem aviso.
+fn prune_context_tabs(
+    tabs: &mut Vec<ContextTab>,
+    groups: &mut Vec<ContextGroup>,
+    protected: &[u64],
+) -> Vec<u64> {
+    let ages: Vec<(u64, bool, bool)> = tabs
+        .iter()
+        .map(|tab| {
+            (
+                tab.id,
+                tab.group
+                    .is_some_and(|id| groups.iter().any(|group| group.id == id)),
+                protected.contains(&tab.id),
+            )
+        })
+        .collect();
+    let victims = tab_session::prune_victims(&ages);
+    let removed: Vec<u64> = victims.iter().map(|index| tabs[*index].id).collect();
+    for index in victims.into_iter().rev() {
+        tabs.remove(index);
+    }
+    if !removed.is_empty() {
         prune_empty_groups(tabs, groups);
     }
-    id
+    removed
+}
+
+/// O aviso quando o tecto de abas tirou abas agrupadas (nunca em silencio).
+fn lost_grouped_notice(lost: usize) -> Option<String> {
+    match lost {
+        0 => None,
+        1 => Some(format!(
+            "Limite de {} abas nesta IA: a aba agrupada mais antiga foi fechada.",
+            tab_session::MAX_KEPT_TABS_PER_COLUMN
+        )),
+        _ => Some(format!(
+            "Limite de {} abas nesta IA: as {lost} abas agrupadas mais antigas foram fechadas.",
+            tab_session::MAX_KEPT_TABS_PER_COLUMN
+        )),
+    }
+}
+
+/// As identidades das abas agrupadas de uma coluna.
+fn grouped_tab_ids(tabs: &[ContextTab]) -> Vec<u64> {
+    tabs.iter()
+        .filter(|tab| tab.group.is_some())
+        .map(|tab| tab.id)
+        .collect()
+}
+
+/// Quantas das abas agrupadas `before` ja nao estao na coluna. So o tecto
+/// de abas tira uma agrupada, e isso o dono tem de saber.
+fn lost_grouped_tabs(before: &[u64], tabs: &[ContextTab]) -> usize {
+    before
+        .iter()
+        .filter(|id| !tabs.iter().any(|tab| tab.id == **id))
+        .count()
 }
 
 /// Decide se uma coluna ainda pode ser minimizada sem esconder todas as IAs.
@@ -6327,8 +6391,9 @@ struct App {
     panel_suggestion_query: Option<String>,
     /// Servico aberto no painel lateral (WhatsApp, Meet, YouTube, Gmail).
     service_panel: Option<(Service, WebView)>,
-    /// Gravacao das abas e grupos do comparador em `tabs.json`.
-    tab_session: TabSessionSync,
+    /// Gravacao das abas e grupos do comparador em `tabs.json`. Aberta no
+    /// arranque: a primeira janela do NeuralIA fica com o `tabs.lock`.
+    tab_session: TabPersistence,
     /// Painel do Gemini Live, com o estado do olho da barra. Existir e estar
     /// ligado: fecha-lo desliga tudo.
     live_panel: LivePanel<WebView>,
@@ -6366,6 +6431,7 @@ impl App {
             proxy.clone(),
             Arc::clone(&navigation_generation),
         );
+        let tab_session = TabPersistence::open(&config.data_dir);
         Self {
             document,
             pdf_bytes: Arc::new(Mutex::new(Vec::new())),
@@ -6422,7 +6488,7 @@ impl App {
             side_panel: None,
             panel_suggestion_query: None,
             service_panel: None,
-            tab_session: TabSessionSync::default(),
+            tab_session,
             live_panel: LivePanel::off(),
         }
     }
@@ -7897,15 +7963,9 @@ impl App {
 
         // As abas e os grupos da sessao anterior voltam a barra. Nenhuma
         // carrega agora: a pergunta e o contexto ativo de cada coluna, e cada
-        // aba restaurada so abre quando for escolhida.
-        let (mut restored, tabs_notice) = self.restore_saved_tabs();
-        start_new_search(
-            &mut restored.contexts,
-            &mut restored.groups,
-            &mut restored.next_context_id,
-            &mut restored.next_group_id,
-            &mut restored.active,
-        );
+        // aba restaurada so abre quando for escolhida. O que esta no disco e
+        // o que acabou de ser lido: nada a regravar ate alguma aba mudar.
+        let (restored, tabs_notice) = self.tab_session.restore();
 
         let targets = [
             ("Google Gemini", google_url),
@@ -7954,46 +8014,9 @@ impl App {
             bar_focus: [None; COMPARATOR_COLUMNS],
             panel_width: 0.0,
         });
-        // O que esta no disco e o que acabou de ser lido: nada a regravar ate
-        // alguma aba mudar.
-        let fingerprint = self.comparator.as_ref().map(|comp| {
-            tab_session_fingerprint(&comp.contexts, &comp.groups, comparator_split_key(comp))
-        });
-        self.tab_session.seen = fingerprint;
-        self.tab_session.saved = fingerprint;
         self.activate_comparator(true);
         if let Some(notice) = tabs_notice {
             self.show_splash(notice, 5);
-        }
-    }
-
-    fn tab_session_path(&self) -> std::path::PathBuf {
-        tab_session::path_in(&self.config.data_dir)
-    }
-
-    /// Le o `tabs.json`. Um ficheiro estragado nao impede o comparador de
-    /// abrir: fica guardado como `tabs.json.bak` e a sessao comeca limpa.
-    fn restore_saved_tabs(&self) -> (RestoredTabs, Option<String>) {
-        let empty = TabSession::default();
-        match tab_session::load(&self.tab_session_path()) {
-            Loaded::Restored(session) => (restore_tab_session(&session), None),
-            Loaded::Missing => (restore_tab_session(&empty), None),
-            Loaded::Quarantined(error) => {
-                debug_log(format_args!("tabs.json recusado: {error:?}"));
-                (
-                    restore_tab_session(&empty),
-                    Some(format!(
-                        "Abas anteriores não restauradas: {error}. Cópia em tabs.json.bak."
-                    )),
-                )
-            }
-            Loaded::Unreadable(error) => {
-                debug_log(format_args!("tabs.json ilegivel: {error}"));
-                (
-                    restore_tab_session(&empty),
-                    Some("Não foi possível ler as abas da sessão anterior.".to_string()),
-                )
-            }
         }
     }
 
@@ -8004,57 +8027,56 @@ impl App {
         let Some(comp) = &self.comparator else {
             return;
         };
-        let fingerprint =
-            tab_session_fingerprint(&comp.contexts, &comp.groups, comparator_split_key(comp));
-        if let Some(token) = self.tab_session.observe(fingerprint) {
+        if let Some(token) =
+            self.tab_session
+                .observe(&comp.contexts, &comp.groups, comparator_split_key(comp))
+        {
             self.timers
                 .after(TAB_SESSION_DEBOUNCE, UserEvent::SaveTabSession(token));
         }
     }
 
-    /// Grava ja, se o disco estiver atrasado em relacao a barra. Corre no fim
-    /// do atraso, antes de o comparador ser destruido e ao sair.
-    fn save_tab_session(&mut self) -> std::io::Result<()> {
-        let Some(comp) = &self.comparator else {
-            return Ok(());
+    /// Grava ja, se o disco estiver atrasado em relacao a barra: antes de o
+    /// comparador ser destruido e ao sair (`TabPersistence::save_now`).
+    fn save_tab_session(&mut self) -> std::io::Result<TabSave> {
+        let Some(comp) = &mut self.comparator else {
+            return Ok(TabSave::Unchanged);
         };
         let split = comparator_split_key(comp);
-        let fingerprint = tab_session_fingerprint(&comp.contexts, &comp.groups, split);
-        if self.tab_session.saved == Some(fingerprint) {
-            return Ok(());
-        }
-        let session = snapshot_tab_session(&comp.contexts, &comp.groups, split);
-        match tab_session::save(&self.tab_session_path(), &session) {
-            Ok(()) => {
-                self.tab_session.saved = Some(fingerprint);
-                Ok(())
-            }
-            Err(error) => {
-                self.tab_session.saved = None;
-                debug_log(format_args!("tabs.json nao gravado: {error}"));
-                Err(error)
-            }
+        self.tab_session
+            .save_now(&mut comp.contexts, &mut comp.groups, split)
+    }
+
+    /// O `SaveTabSession(token)` do fim do atraso: grava se ainda for o
+    /// ultimo agendado (`TabPersistence::save_due`) e diz ao dono o que correu
+    /// mal ou o que mudou.
+    fn save_due_tab_session(&mut self, token: u64) {
+        let result = self.comparator.as_mut().and_then(|comp| {
+            let split = comparator_split_key(comp);
+            self.tab_session
+                .save_due(token, &mut comp.contexts, &mut comp.groups, split)
+        });
+        if let Some(notice) = result.as_ref().and_then(tab_save_notice) {
+            self.request_redraw();
+            self.show_splash(notice, 4);
         }
     }
 
-    /// Parte de "Apagar historico": o ficheiro, a copia de um ficheiro
-    /// recusado e o modelo vivo, tudo de uma vez.
+    /// Parte de "Apagar historico": o modelo vivo, o ficheiro e as copias,
+    /// tudo de uma vez (`TabPersistence::forget`).
     fn forget_tab_session(&mut self) {
-        let path = self.tab_session_path();
         let result = match &mut self.comparator {
-            Some(comp) => forget_saved_tabs(&path, &mut comp.contexts, &mut comp.groups),
-            None => forget_saved_tabs(
-                &path,
+            Some(comp) => {
+                let split = comparator_split_key(comp);
+                self.tab_session
+                    .forget(&mut comp.contexts, &mut comp.groups, split)
+            }
+            None => self.tab_session.forget(
                 &mut std::array::from_fn(|_| Vec::new()),
                 &mut std::array::from_fn(|_| Vec::new()),
+                None,
             ),
         };
-        // Disco vazio e barra vazia: nada a gravar ate nascer uma aba nova.
-        let fingerprint = self.comparator.as_ref().map(|comp| {
-            tab_session_fingerprint(&comp.contexts, &comp.groups, comparator_split_key(comp))
-        });
-        self.tab_session.seen = fingerprint;
-        self.tab_session.saved = fingerprint;
         self.request_redraw();
         if let Err(error) = result {
             self.show_splash(
@@ -8814,7 +8836,8 @@ impl App {
                 }
 
                 let _ = webview.zoom(self.zoom);
-                self.install_context_menu(&webview, WebViewHost::Split);
+                self.install_context_menu(&webview, WebViewHost::Split(source_index));
+                let mut lost_grouped = 0usize;
                 if let Some(comp) = &mut self.comparator {
                     let ComparatorState {
                         contexts,
@@ -8822,6 +8845,7 @@ impl App {
                         next_context_id,
                         ..
                     } = comp;
+                    let grouped_before = grouped_tab_ids(&contexts[source_index]);
                     let context_id = record_split_context(
                         &mut contexts[source_index],
                         &mut groups[source_index],
@@ -8831,6 +8855,7 @@ impl App {
                         existing_context_id,
                         opener,
                     );
+                    lost_grouped = lost_grouped_tabs(&grouped_before, &contexts[source_index]);
                     // A aba que se abriu e aquela para onde se olha: nasce a
                     // meio da fila (no fim do grupo de quem a abriu) e fica
                     // a vista.
@@ -8844,6 +8869,9 @@ impl App {
                         fullscreen: false,
                         private,
                     });
+                }
+                if let Some(notice) = lost_grouped_notice(lost_grouped) {
+                    self.show_splash(notice, 5);
                 }
                 self.update_comparator_layout();
                 self.sync_comparator_splitters();
@@ -11444,14 +11472,17 @@ impl App {
         };
         // A dica da pilula nao fica a flutuar por cima do menu.
         hover_tooltip(std::ptr::null_mut(), "");
+        // O mesmo item que o botao direito dentro da coluna, decidido pelo
+        // mesmo `column_menu_responder` (menu proprio: nenhum item nativo).
+        let request = column_menu_responder(col_index, self.auto_scroll.clone())(0);
         // Vive ate ao fim da funcao: o Win32 le o texto enquanto desenha.
-        let label = wide_null(auto_scroll_menu_label(self.auto_scroll.get()));
+        let label = wide_null(request.label);
         let command = unsafe {
             let menu = CreatePopupMenu();
             if menu.is_null() {
                 return;
             }
-            AppendMenuW(menu, MF_STRING, COLUMN_MENU_AUTO_SCROLL, label.as_ptr());
+            AppendMenuW(menu, MF_STRING, request.command, label.as_ptr());
             let mut point = windows_sys::Win32::Foundation::POINT {
                 x: self.cursor.0.round() as i32,
                 y: self.cursor.1.round() as i32,
@@ -11469,7 +11500,9 @@ impl App {
             DestroyMenu(menu);
             selected
         };
-        if let Some(event) = column_menu_event(col_index, command) {
+        if command == request.command
+            && let Some(event) = request.selected()
+        {
             let _ = self.proxy.send_event(event);
         }
     }
@@ -12604,6 +12637,196 @@ impl TabSessionSync {
     }
 }
 
+/// O que uma gravacao das abas fez, para o App dizer ao dono.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabSave {
+    /// O disco ja tinha isto: nada escrito.
+    Unchanged,
+    Written,
+    /// Outra janela do NeuralIA guarda as abas; esta nao escreve.
+    NotWriter,
+    /// O historico foi apagado noutra janela: as abas desta, de antes disso,
+    /// foram largadas em vez de voltarem ao disco.
+    ClearedElsewhere,
+}
+
+/// A ponte entre o modelo da barra e o `tabs.json` de um `data_dir`: tudo o
+/// que o App faz com as abas guardadas -- ler ao abrir o comparador, gravar
+/// no fim do atraso (`SaveTabSession`), ao destruir o comparador e ao sair, e
+/// apagar em "Apagar historico". Nada aqui toca em janelas: os gates
+/// conduzem isto contra um diretorio temporario, pelo mesmo caminho que o App
+/// usa. O App so passa o seu modelo e mostra o aviso.
+struct TabPersistence {
+    store: tab_session::SessionStore,
+    sync: TabSessionSync,
+}
+
+impl TabPersistence {
+    fn open(data_dir: &std::path::Path) -> Self {
+        Self {
+            store: tab_session::SessionStore::open(data_dir),
+            sync: TabSessionSync::default(),
+        }
+    }
+
+    /// O disco e o modelo concordam: nada a gravar ate o modelo mudar.
+    fn synced(
+        &mut self,
+        contexts: &[Vec<ContextTab>; COMPARATOR_COLUMNS],
+        groups: &[Vec<ContextGroup>; COMPARATOR_COLUMNS],
+        split: Option<(usize, Option<u64>, bool)>,
+    ) {
+        let fingerprint = tab_session_fingerprint(contexts, groups, split);
+        self.sync.seen = Some(fingerprint);
+        self.sync.saved = Some(fingerprint);
+    }
+
+    /// As abas da sessao anterior, ja como uma pesquisa nova as ve
+    /// (`start_new_search`), e o aviso para o dono, se houver. Um ficheiro
+    /// estragado nao impede o comparador de abrir: fica em `tabs.json.bak` e
+    /// a sessao comeca limpa; um que nao se leu fica copiado antes da
+    /// primeira gravacao (`SessionStore`).
+    fn restore(&mut self) -> (RestoredTabs, Option<String>) {
+        let empty = TabSession::default();
+        let (mut restored, notice) = match self.store.load() {
+            Loaded::Restored(session) => (restore_tab_session(&session), None),
+            Loaded::Missing => (restore_tab_session(&empty), None),
+            Loaded::Quarantined(error) => {
+                debug_log(format_args!("tabs.json recusado: {error:?}"));
+                (
+                    restore_tab_session(&empty),
+                    Some(format!(
+                        "Abas anteriores não restauradas: {error}. Cópia em tabs.json.bak."
+                    )),
+                )
+            }
+            Loaded::Unreadable(error) => {
+                debug_log(format_args!("tabs.json ilegivel: {error}"));
+                (
+                    restore_tab_session(&empty),
+                    Some(
+                        "Não foi possível ler as abas da sessão anterior. Antes de salvar \
+                         por cima, o arquivo é copiado para tabs.json.unread."
+                            .to_string(),
+                    ),
+                )
+            }
+        };
+        start_new_search(
+            &mut restored.contexts,
+            &mut restored.groups,
+            &mut restored.next_context_id,
+            &mut restored.next_group_id,
+            &mut restored.active,
+        );
+        self.synced(&restored.contexts, &restored.groups, None);
+        let notice = if self.store.is_writer() {
+            notice
+        } else {
+            Some(
+                "Outra janela do NeuralIA já salva as abas: as abas desta janela não serão salvas."
+                    .to_string(),
+            )
+        };
+        (restored, notice)
+    }
+
+    /// O modelo depois de um lote de eventos: o bilhete da gravacao a
+    /// agendar, se mudou.
+    fn observe(
+        &mut self,
+        contexts: &[Vec<ContextTab>; COMPARATOR_COLUMNS],
+        groups: &[Vec<ContextGroup>; COMPARATOR_COLUMNS],
+        split: Option<(usize, Option<u64>, bool)>,
+    ) -> Option<u64> {
+        self.sync
+            .observe(tab_session_fingerprint(contexts, groups, split))
+    }
+
+    /// Grava ja, se o disco estiver atrasado em relacao a barra: ao destruir
+    /// o comparador e ao sair -- uma mudanca feita dentro do atraso de
+    /// `TAB_SESSION_DEBOUNCE` nao se perde. Se o historico foi apagado noutra
+    /// janela, as abas de antes sao largadas do modelo (como o "Apagar
+    /// historico" faz na propria janela) em vez de voltarem ao disco.
+    fn save_now(
+        &mut self,
+        contexts: &mut [Vec<ContextTab>; COMPARATOR_COLUMNS],
+        groups: &mut [Vec<ContextGroup>; COMPARATOR_COLUMNS],
+        split: Option<(usize, Option<u64>, bool)>,
+    ) -> std::io::Result<TabSave> {
+        let fingerprint = tab_session_fingerprint(contexts, groups, split);
+        if self.sync.saved == Some(fingerprint) {
+            return Ok(TabSave::Unchanged);
+        }
+        let session = snapshot_tab_session(contexts, groups, split);
+        match self.store.save(&session) {
+            Ok(tab_session::SaveOutcome::Written) => {
+                self.sync.saved = Some(fingerprint);
+                Ok(TabSave::Written)
+            }
+            Ok(tab_session::SaveOutcome::NotWriter) => {
+                // Nada a tentar outra vez ate o modelo mudar.
+                self.sync.saved = Some(fingerprint);
+                Ok(TabSave::NotWriter)
+            }
+            Ok(tab_session::SaveOutcome::ClearedElsewhere) => {
+                contexts.iter_mut().for_each(Vec::clear);
+                groups.iter_mut().for_each(Vec::clear);
+                self.store.acknowledge_clear();
+                self.synced(contexts, groups, split);
+                Ok(TabSave::ClearedElsewhere)
+            }
+            Err(error) => {
+                self.sync.saved = None;
+                debug_log(format_args!("tabs.json nao gravado: {error}"));
+                Err(error)
+            }
+        }
+    }
+
+    /// O `SaveTabSession(token)` que o atraso entrega: so o ultimo agendado
+    /// grava (`None` para um bilhete ultrapassado por outra mudanca).
+    fn save_due(
+        &mut self,
+        token: u64,
+        contexts: &mut [Vec<ContextTab>; COMPARATOR_COLUMNS],
+        groups: &mut [Vec<ContextGroup>; COMPARATOR_COLUMNS],
+        split: Option<(usize, Option<u64>, bool)>,
+    ) -> Option<std::io::Result<TabSave>> {
+        (token == self.sync.token).then(|| self.save_now(contexts, groups, split))
+    }
+
+    /// Parte de "Apagar historico": o modelo vivo esvazia antes -- senao a
+    /// gravacao seguinte, ou o fecho do comparador, escrevia de volta o que se
+    /// acabou de apagar -- e saem o ficheiro, a copia de um ficheiro recusado
+    /// ou nao lido e os temporarios; a geracao sobe para outra janela aberta
+    /// nao os escrever de volta.
+    fn forget(
+        &mut self,
+        contexts: &mut [Vec<ContextTab>; COMPARATOR_COLUMNS],
+        groups: &mut [Vec<ContextGroup>; COMPARATOR_COLUMNS],
+        split: Option<(usize, Option<u64>, bool)>,
+    ) -> std::io::Result<()> {
+        contexts.iter_mut().for_each(Vec::clear);
+        groups.iter_mut().for_each(Vec::clear);
+        let result = self.store.forget();
+        self.synced(contexts, groups, split);
+        result
+    }
+}
+
+/// O aviso de uma gravacao, para o splash (`None`: nada a dizer).
+fn tab_save_notice(result: &std::io::Result<TabSave>) -> Option<String> {
+    match result {
+        Ok(TabSave::ClearedElsewhere) => Some(
+            "O histórico foi apagado em outra janela do NeuralIA: as abas desta janela também."
+                .to_string(),
+        ),
+        Ok(_) => None,
+        Err(error) => Some(format!("As abas não foram salvas: {error}")),
+    }
+}
+
 /// A aba aberta ao lado, tal como a gravacao a ve: (coluna, aba). `split` e
 /// `(coluna, aba, privado)`. Uma fonte privada nunca conta -- e nem tem aba na
 /// lista, ver `record_split_context`.
@@ -12638,6 +12861,12 @@ fn record_split_context(
         None
     } else if let Some(id) = existing_context_id {
         Some(id)
+    } else if !tab_session::storable_url(&url) {
+        // Um endereco que o `tabs.json` nao guardaria (grande demais) nao vira
+        // aba: a fonte abre ao lado na mesma, mas a barra e o ficheiro nunca
+        // discordam -- antes a aba aparecia e sumia sem aviso no reinicio,
+        // levando o grupo que so ela tinha.
+        None
     } else {
         Some(remember_context_tab(
             contexts,
@@ -12756,10 +12985,21 @@ fn restore_tab_session(session: &TabSession) -> RestoredTabs {
             });
         }
 
+        // As identidades novas guardam a ordem de idade das do ficheiro: os
+        // limites podam pela identidade (a mais baixa e a mais antiga), e uma
+        // aba arrastada para a frente antes de fechar nao pode passar a ser a
+        // mais antiga so por ter reiniciado.
+        let mut by_age: Vec<usize> = (0..column.tabs.len()).collect();
+        by_age.sort_by_key(|position| (column.tabs[*position].id, *position));
+        let mut new_ids = vec![0u64; column.tabs.len()];
+        for (rank, position) in by_age.into_iter().enumerate() {
+            new_ids[position] = restored.next_context_id + rank as u64;
+        }
+        restored.next_context_id += column.tabs.len() as u64;
+
         let mut tabs: Vec<ContextTab> = Vec::with_capacity(column.tabs.len());
         for (position, tab) in column.tabs.iter().enumerate() {
-            let id = restored.next_context_id;
-            restored.next_context_id += 1;
+            let id = new_ids[position];
             let group = tab.group.and_then(|old| {
                 group_ids
                     .iter()
@@ -12814,11 +13054,11 @@ fn start_new_search(
     next_group_id: &mut u64,
     active: &mut [Option<u64>; COMPARATOR_COLUMNS],
 ) {
-    for (tabs, column_groups) in contexts.iter_mut().zip(groups.iter_mut()) {
-        if tabs.len() > tab_session::MAX_TABS_PER_COLUMN {
-            let excess = tabs.len() - tab_session::MAX_TABS_PER_COLUMN;
-            tabs.drain(..excess);
-        }
+    // Os mesmos limites de quando uma aba nasce: saem as soltas mais antigas,
+    // nunca a que fica aberta ao lado nem, antes delas, uma agrupada.
+    for ((tabs, column_groups), open) in contexts.iter_mut().zip(groups.iter_mut()).zip(*active) {
+        let protected: Vec<u64> = open.into_iter().collect();
+        let _ = prune_context_tabs(tabs, column_groups, &protected);
         prune_empty_groups(tabs, column_groups);
     }
     let last_tab = contexts.iter().flatten().map(|tab| tab.id).max();
@@ -12828,23 +13068,12 @@ fn start_new_search(
     *active = [None; COMPARATOR_COLUMNS];
 }
 
-/// "Apagar historico" apaga tambem as abas guardadas. O modelo vivo esvazia
-/// antes: senao a gravacao seguinte -- ou o fecho do comparador -- escrevia
-/// de volta o que se acabou de apagar.
-fn forget_saved_tabs(
-    path: &std::path::Path,
-    contexts: &mut [Vec<ContextTab>; COMPARATOR_COLUMNS],
-    groups: &mut [Vec<ContextGroup>; COMPARATOR_COLUMNS],
-) -> std::io::Result<()> {
-    contexts.iter_mut().for_each(Vec::clear);
-    groups.iter_mut().for_each(Vec::clear);
-    tab_session::clear(path)
-}
-
 /// Gates da persistencia de abas sobre as funcoes que o comparador chama:
 /// `record_split_context` (open_split_mode), `start_new_search`
 /// (open_comparator), `snapshot_tab_session`/`restore_tab_session` (gravacao
-/// e arranque) e `forget_saved_tabs` ("Apagar historico").
+/// e arranque) e `TabPersistence` -- o que o App faz ao abrir o comparador,
+/// no `SaveTabSession`, ao destruir o comparador, ao sair e em "Apagar
+/// historico", contra um `data_dir` temporario.
 #[cfg(test)]
 mod tab_session_gates {
     use super::*;
@@ -13271,17 +13500,22 @@ mod tab_session_gates {
     #[test]
     fn clearing_history_also_forgets_the_saved_tabs() {
         let dir = temp_dir("clear");
-        let path = tab_session::path_in(&dir);
+        // O nome escrito a mao, nao `path_in`: o gate tem de apanhar tambem
+        // um `tabs.json` que o App passasse a procurar noutro sitio.
+        let path = dir.join("tabs.json");
         let (mut contexts, mut groups, _, _, open_tab) = a_working_session();
-        tab_session::save(
-            &path,
-            &snapshot_tab_session(&contexts, &groups, Some((0, Some(open_tab), false))),
-        )
-        .expect("save");
+        let split = Some((0, Some(open_tab), false));
+        let mut app = TabPersistence::open(&dir);
+        assert_eq!(
+            app.save_now(&mut contexts, &mut groups, split)
+                .expect("save"),
+            TabSave::Written
+        );
         std::fs::write(tab_session::backup_path(&path), b"old bad file").expect("bak");
         assert!(path.exists());
 
-        forget_saved_tabs(&path, &mut contexts, &mut groups).expect("forget");
+        app.forget(&mut contexts, &mut groups, split)
+            .expect("forget");
         assert!(!path.exists(), "tabs.json survived \"Apagar histórico\"");
         assert!(
             !tab_session::backup_path(&path).exists(),
@@ -13294,8 +13528,415 @@ mod tab_session_gates {
 
         // O fecho do comparador a seguir grava o que ficou -- nada -- e nao
         // recria o ficheiro.
-        tab_session::save(&path, &snapshot_tab_session(&contexts, &groups, None)).expect("save");
+        let _ = app.save_now(&mut contexts, &mut groups, split);
         assert_eq!(tab_session::load(&path), Loaded::Missing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Uma aba nova na coluna, pelo caminho do split.
+    fn link(
+        contexts: &mut Columns<ContextTab>,
+        groups: &mut Columns<ContextGroup>,
+        next_context_id: &mut u64,
+        url: &str,
+    ) -> Option<u64> {
+        record_split_context(
+            &mut contexts[0],
+            &mut groups[0],
+            next_context_id,
+            url.to_string(),
+            false,
+            None,
+            None,
+        )
+    }
+
+    fn file_urls(path: &std::path::Path) -> Vec<String> {
+        match tab_session::load(path) {
+            Loaded::Restored(session) => session
+                .columns
+                .iter()
+                .flat_map(|column| column.tabs.iter().map(|tab| tab.url.clone()))
+                .collect(),
+            Loaded::Missing => Vec::new(),
+            other => panic!("tabs.json ilegivel: {other:?}"),
+        }
+    }
+
+    /// data-4: o que o App faz com o `tabs.json`, pelo `TabPersistence` que
+    /// ele usa -- abrir o comparador le o ficheiro de verdade; o
+    /// `SaveTabSession` so grava com o bilhete do ultimo agendado; sair (ou
+    /// destruir o comparador) dentro do atraso grava a mudanca; "Apagar
+    /// historico" tira o ficheiro com o nome certo. Antes so havia gates das
+    /// pecas: desligar qualquer um destes caminhos deixava tudo verde.
+    #[test]
+    fn the_app_path_saves_restores_and_forgets_the_real_tabs_json() {
+        let dir = temp_dir("app-path");
+        let path = dir.join("tabs.json");
+        let mut app = TabPersistence::open(&dir);
+        let (mut restored, notice) = app.restore();
+        assert_eq!(notice, None);
+        assert!(restored.contexts.iter().all(Vec::is_empty));
+        let RestoredTabs {
+            contexts,
+            groups,
+            next_context_id,
+            ..
+        } = &mut restored;
+
+        // Duas mudancas seguidas: dois bilhetes; so o ultimo grava.
+        link(contexts, groups, next_context_id, "https://um.example/");
+        let first = app.observe(contexts, groups, None).expect("mudou");
+        link(contexts, groups, next_context_id, "https://dois.example/");
+        let second = app.observe(contexts, groups, None).expect("mudou");
+        assert_eq!(app.observe(contexts, groups, None), None, "nada mudou");
+        assert!(
+            app.save_due(first, contexts, groups, None).is_none(),
+            "um bilhete ultrapassado gravou"
+        );
+        assert!(!path.exists());
+        assert_eq!(
+            app.save_due(second, contexts, groups, None)
+                .expect("o ultimo bilhete grava")
+                .expect("gravado"),
+            TabSave::Written
+        );
+        assert_eq!(
+            file_urls(&path),
+            ["https://um.example/", "https://dois.example/"]
+        );
+
+        // Uma aba aberta e a janela fechada antes do fim do atraso: sair
+        // grava-a na mesma (o bilhete dela nunca chegou a disparar).
+        link(contexts, groups, next_context_id, "https://tres.example/");
+        let _pending = app.observe(contexts, groups, None).expect("mudou");
+        assert_eq!(
+            app.save_now(contexts, groups, None).expect("sair"),
+            TabSave::Written
+        );
+        assert_eq!(file_urls(&path).len(), 3, "a ultima aba perdeu-se ao sair");
+        assert_eq!(
+            app.save_now(contexts, groups, None).expect("sair"),
+            TabSave::Unchanged
+        );
+
+        // O proximo arranque le o mesmo ficheiro.
+        drop(app);
+        let mut app = TabPersistence::open(&dir);
+        let (mut again, notice) = app.restore();
+        assert_eq!(notice, None);
+        let urls: Vec<&str> = again.contexts[0]
+            .iter()
+            .map(|tab| tab.url.as_str())
+            .collect();
+        assert_eq!(
+            urls,
+            [
+                "https://um.example/",
+                "https://dois.example/",
+                "https://tres.example/"
+            ]
+        );
+        assert_eq!(
+            app.save_now(&mut again.contexts, &mut again.groups, None)
+                .expect("nada"),
+            TabSave::Unchanged,
+            "o que acabou de ser lido nao se regrava"
+        );
+
+        // "Apagar historico": o ficheiro de verdade sai, e o modelo tambem.
+        app.forget(&mut again.contexts, &mut again.groups, None)
+            .expect("apagar");
+        assert!(!path.exists(), "\"Apagar histórico\" deixou o tabs.json");
+        assert!(again.contexts.iter().all(Vec::is_empty));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// data-3 pelo caminho do App: duas janelas no mesmo `data_dir`. A
+    /// segunda avisa que nao grava (e nao grava); o "Apagar historico" dela
+    /// faz a primeira largar as abas de antes em vez de as escrever de volta.
+    #[test]
+    fn a_second_window_never_overwrites_the_tabs_or_resurrects_a_clear() {
+        let dir = temp_dir("two-windows");
+        let path = dir.join("tabs.json");
+        tab_session::save(&path, &{
+            let mut session = TabSession::default();
+            session.columns[0].tabs.push(SessionTab {
+                id: 1,
+                url: "https://old-secret.example/".into(),
+                title: String::new(),
+                group: None,
+            });
+            session
+        })
+        .expect("sessao anterior");
+
+        let mut first = TabPersistence::open(&dir);
+        let mut second = TabPersistence::open(&dir);
+        let (mut a, notice_a) = first.restore();
+        let (mut b, notice_b) = second.restore();
+        assert_eq!(notice_a, None);
+        assert!(
+            notice_b.is_some_and(|text| text.contains("Outra janela")),
+            "a segunda janela tem de dizer que nao salva"
+        );
+
+        link(
+            &mut a.contexts,
+            &mut a.groups,
+            &mut a.next_context_id,
+            "https://from-a.example/",
+        );
+        link(
+            &mut b.contexts,
+            &mut b.groups,
+            &mut b.next_context_id,
+            "https://from-b.example/",
+        );
+        assert_eq!(
+            first
+                .save_now(&mut a.contexts, &mut a.groups, None)
+                .expect("a"),
+            TabSave::Written
+        );
+        assert_eq!(
+            second
+                .save_now(&mut b.contexts, &mut b.groups, None)
+                .expect("b"),
+            TabSave::NotWriter
+        );
+        assert!(
+            file_urls(&path).contains(&"https://from-a.example/".to_string()),
+            "a aba aberta na primeira janela foi apagada pela segunda"
+        );
+
+        second
+            .forget(&mut b.contexts, &mut b.groups, None)
+            .expect("apagar");
+        link(
+            &mut a.contexts,
+            &mut a.groups,
+            &mut a.next_context_id,
+            "https://depois.example/",
+        );
+        let result = first.save_now(&mut a.contexts, &mut a.groups, None);
+        assert!(
+            tab_save_notice(&result).is_some_and(|text| text.contains("apagado")),
+            "o dono tem de saber porque as abas sumiram"
+        );
+        assert_eq!(result.expect("a"), TabSave::ClearedElsewhere);
+        assert!(!path.exists(), "o que o dono apagou voltou ao disco");
+        assert!(a.contexts.iter().all(Vec::is_empty));
+
+        // A partir dai, a primeira volta a guardar o que nasce.
+        link(
+            &mut a.contexts,
+            &mut a.groups,
+            &mut a.next_context_id,
+            "https://novo.example/",
+        );
+        assert_eq!(
+            first
+                .save_now(&mut a.contexts, &mut a.groups, None)
+                .expect("a"),
+            TabSave::Written
+        );
+        assert_eq!(file_urls(&path), ["https://novo.example/"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// data-1: com as abas a sobreviver a pesquisas e reinicios, o limite de
+    /// abas passou a ser rotina -- e podava pela esquerda, onde ficam os
+    /// grupos feitos primeiro. Um grupo recolhido do dono sobrevive a quatro
+    /// rondas de pesquisa + gravacao + reinicio + 10 links; e uma aba posta a
+    /// frente nao passa a ser a primeira a sair (nem depois de reiniciar).
+    #[test]
+    fn a_saved_group_survives_searches_restarts_and_many_new_links() {
+        let dir = temp_dir("group-survives");
+        let path = dir.join("tabs.json");
+        {
+            let mut app = TabPersistence::open(&dir);
+            let (mut model, _) = app.restore();
+            let RestoredTabs {
+                contexts,
+                groups,
+                next_context_id,
+                next_group_id,
+                ..
+            } = &mut model;
+            link(contexts, groups, next_context_id, "https://keep.example/1");
+            link(contexts, groups, next_context_id, "https://keep.example/2");
+            let created = regroup_context_tab(&mut contexts[0], &mut groups[0], next_group_id, 0)
+                .expect("grupo");
+            groups[0][created].name = "Pesquisa".into();
+            groups[0][created].collapsed = true;
+            let id = groups[0][created].id;
+            join_context_group(&mut contexts[0], id, 1);
+            app.save_now(contexts, groups, None).expect("gravar");
+        }
+        let saved_groups = || match tab_session::load(&path) {
+            Loaded::Restored(session) => session.columns[0]
+                .groups
+                .iter()
+                .map(|group| group.name.clone())
+                .collect::<Vec<_>>(),
+            other => panic!("{other:?}"),
+        };
+        for round in 0..4 {
+            let mut app = TabPersistence::open(&dir);
+            let (mut model, _) = app.restore();
+            for index in 0..10 {
+                link(
+                    &mut model.contexts,
+                    &mut model.groups,
+                    &mut model.next_context_id,
+                    &format!("https://r{round}.example/{index}"),
+                );
+            }
+            app.save_now(&mut model.contexts, &mut model.groups, None)
+                .expect("gravar");
+            assert_eq!(
+                saved_groups(),
+                ["Pesquisa"],
+                "ronda {round}: o grupo do dono sumiu do tabs.json"
+            );
+        }
+
+        // A coluna esta no limite de soltas. A mais nova vai para a frente
+        // (como num arrasto), grava-se e reinicia-se: o link seguinte tira a
+        // solta MAIS ANTIGA, nao a que esta a frente.
+        let mut app = TabPersistence::open(&dir);
+        let (mut model, _) = app.restore();
+        let loose = model.contexts[0]
+            .iter()
+            .filter(|tab| tab.group.is_none())
+            .count();
+        assert_eq!(loose, tab_session::MAX_TABS_PER_COLUMN);
+        let newest = model.contexts[0].pop().expect("aba");
+        let moved_url = newest.url.clone();
+        model.contexts[0].insert(0, newest);
+        app.save_now(&mut model.contexts, &mut model.groups, None)
+            .expect("gravar");
+        drop(app);
+        let mut app = TabPersistence::open(&dir);
+        let (mut model, _) = app.restore();
+        let oldest_loose = model.contexts[0]
+            .iter()
+            .filter(|tab| tab.group.is_none())
+            .min_by_key(|tab| tab.id)
+            .map(|tab| tab.url.clone())
+            .expect("soltas");
+        assert_ne!(oldest_loose, moved_url, "o reinicio baralhou as idades");
+        link(
+            &mut model.contexts,
+            &mut model.groups,
+            &mut model.next_context_id,
+            "https://final.example/",
+        );
+        let urls: Vec<&str> = model.contexts[0]
+            .iter()
+            .map(|tab| tab.url.as_str())
+            .collect();
+        assert!(
+            urls.contains(&moved_url.as_str()),
+            "a aba posta a frente saiu"
+        );
+        assert!(
+            !urls.contains(&oldest_loose.as_str()),
+            "a mais antiga ficou"
+        );
+        assert_eq!(model.groups[0].len(), 1, "o limite tirou o grupo do dono");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// data-1: so o tecto de tudo tira uma aba agrupada, e nunca em
+    /// silencio.
+    #[test]
+    fn only_the_hard_cap_closes_a_grouped_tab_and_the_owner_is_told() {
+        // Uma coluna no tecto, toda agrupada.
+        let mut contexts: Columns<ContextTab> = empty();
+        let mut groups: Columns<ContextGroup> = empty();
+        groups[0].push(ContextGroup {
+            id: 1,
+            name: "Pesquisa".into(),
+            color: GroupColor::Blue,
+            collapsed: false,
+        });
+        let cap = tab_session::MAX_KEPT_TABS_PER_COLUMN as u64;
+        for id in 1..=cap {
+            contexts[0].push(ContextTab {
+                id,
+                url: format!("https://g.example/{id}"),
+                group: Some(1),
+            });
+        }
+        let mut next_context_id = cap + 1;
+        let oldest = 1;
+
+        let before = grouped_tab_ids(&contexts[0]);
+        let opened = link(
+            &mut contexts,
+            &mut groups,
+            &mut next_context_id,
+            "https://solta.example/",
+        )
+        .expect("aba nova");
+        let lost = lost_grouped_tabs(&before, &contexts[0]);
+        assert_eq!(lost, 1);
+        assert!(
+            contexts[0].iter().any(|tab| tab.id == opened),
+            "a aba nova saiu"
+        );
+        assert!(
+            contexts[0].iter().all(|tab| tab.id != oldest),
+            "saiu outra que nao a agrupada mais antiga"
+        );
+        assert_eq!(contexts[0].len(), tab_session::MAX_KEPT_TABS_PER_COLUMN);
+        assert!(lost_grouped_notice(lost).is_some_and(|text| text.contains("agrupada")));
+        assert_eq!(lost_grouped_notice(0), None);
+    }
+
+    /// data-6: um endereco que o `tabs.json` recusaria nao vira aba (a barra
+    /// e o ficheiro nunca discordam), e um link comprido do Google com
+    /// `#:~:text=` -- mais de 2 KiB -- vira aba e sobrevive ao reinicio.
+    #[test]
+    fn a_long_link_survives_a_restart_and_an_unstorable_one_never_becomes_a_tab() {
+        let dir = temp_dir("long-url");
+        let path = dir.join("tabs.json");
+        let long = format!(
+            "https://www.google.com/search?q=neuralia#:~:text={}",
+            "palavra%20".repeat(400)
+        );
+        assert!(long.len() > 2048 && long.len() <= tab_session::MAX_URL_BYTES);
+        let huge = format!(
+            "https://example.com/{}",
+            "a".repeat(tab_session::MAX_URL_BYTES)
+        );
+
+        let mut contexts: Columns<ContextTab> = empty();
+        let mut groups: Columns<ContextGroup> = empty();
+        let mut next_context_id = 1;
+        let mut next_group_id = 1;
+        link(&mut contexts, &mut groups, &mut next_context_id, &long).expect("aba");
+        let created = regroup_context_tab(&mut contexts[0], &mut groups[0], &mut next_group_id, 0)
+            .expect("grupo so dela");
+        assert_eq!(
+            link(&mut contexts, &mut groups, &mut next_context_id, &huge),
+            None,
+            "um endereco que o ficheiro deitaria fora virou aba"
+        );
+        assert_eq!(contexts[0].len(), 1);
+
+        let mut app = TabPersistence::open(&dir);
+        app.save_now(&mut contexts, &mut groups, None)
+            .expect("gravar");
+        drop(app);
+        let mut app = TabPersistence::open(&dir);
+        let (restored, _) = app.restore();
+        assert_eq!(restored.contexts[0].len(), 1, "a aba comprida sumiu");
+        assert_eq!(restored.groups[0].len(), 1, "o grupo so dela sumiu");
+        assert_eq!(restored.groups[0][0].name, groups[0][created].name);
+        assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -13752,13 +14393,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::ExitRequested => event_loop.exit(),
-            UserEvent::SaveTabSession(token) => {
-                if token == self.tab_session.token
-                    && let Err(error) = self.save_tab_session()
-                {
-                    self.show_splash(format!("As abas não foram salvas: {error}"), 4);
-                }
-            }
+            UserEvent::SaveTabSession(token) => self.save_due_tab_session(token),
             UserEvent::HomeRequested => self.show_home(),
             UserEvent::BackRequested => self.escape_or_back(),
             UserEvent::TabCaptureLost(gesture) => {
@@ -20288,7 +20923,7 @@ __fire('submit', at(login));
 
     /// Ligacao, nao comportamento: o comportamento esta nos gates de
     /// `tab_session_gates`. Isto so prende que os caminhos que embarcam
-    /// chamam as funcoes que esses gates provam -- um `forget_saved_tabs`
+    /// chamam as funcoes que esses gates provam -- um `TabPersistence::forget`
     /// perfeito que "Apagar historico" deixasse de chamar nao apagava nada.
     #[test]
     fn the_shipped_paths_are_wired_to_the_tab_session() {
@@ -20316,12 +20951,28 @@ __fire('submit', at(login));
             confirm < forget,
             "tabs.json is wiped only after the owner confirms"
         );
+        // O comportamento destes caminhos esta em
+        // the_app_path_saves_restores_and_forgets_the_real_tabs_json (sobre o
+        // `TabPersistence`); aqui so se prende que o App os chama.
         let forget_body = body("fn forget_tab_session", "fn activate_comparator");
-        assert!(forget_body.contains("forget_saved_tabs("));
+        assert!(forget_body.contains(".forget(&mut comp.contexts, &mut comp.groups, split)"));
 
-        // Sair do comparador (Home, Reader, Web) grava antes de o destruir.
+        // Sair do comparador (Home, Reader, Web) grava antes de o destruir, e
+        // fechar a janela tambem.
         let destroy = body("fn destroy_web_surfaces", "self.comparator.take()");
         assert!(destroy.contains("self.save_tab_session()"));
+        let exiting = body("fn exiting", "fn user_event");
+        assert!(exiting.contains("self.save_tab_session()"));
+        let save = body("fn save_tab_session", "fn save_due_tab_session");
+        assert!(save.contains(".save_now(&mut comp.contexts, &mut comp.groups, split)"));
+
+        // O fim do atraso grava pelo bilhete.
+        assert!(
+            source
+                .contains("UserEvent::SaveTabSession(token) => self.save_due_tab_session(token),")
+        );
+        let due = body("fn save_due_tab_session", "fn forget_tab_session");
+        assert!(due.contains(".save_due(token, &mut comp.contexts, &mut comp.groups, split)"));
 
         // Depois de cada lote de eventos o modelo e observado: e so por aqui
         // que um arrasto largado, o x e o menu do grupo agendam a gravacao
@@ -20329,17 +20980,28 @@ __fire('submit', at(login));
         let wait = body("fn about_to_wait", "fn exiting");
         assert!(wait.contains("self.observe_tab_session();"));
         let observe = body("fn observe_tab_session", "fn save_tab_session");
-        assert!(observe.contains("self.tab_session.observe(fingerprint)"));
+        assert!(
+            observe.contains(".observe(&comp.contexts, &comp.groups, comparator_split_key(comp))")
+        );
 
         // As duas entradas do comparador passam pelo mesmo modelo.
-        let open = body("fn open_comparator", "fn tab_session_path");
+        let open = body("fn open_comparator", "fn observe_tab_session");
         let (reuse, fresh) = open
             .split_once("let size = window.inner_size();")
             .expect("reuse and fresh paths");
         assert!(reuse.contains("start_new_search("));
         assert!(!reuse.contains("comparator.groups = "));
-        assert!(fresh.contains("self.restore_saved_tabs()"));
-        assert!(fresh.contains("start_new_search("));
+        assert!(fresh.contains("self.tab_session.restore()"));
+
+        // "Adicionar a um novo grupo" abre logo o menu do grupo (com as
+        // cores) junto da pilula nova, como o editor do Chrome.
+        let new_group = body("fn group_context_tab", "fn join_context_tab_group");
+        assert!(new_group.contains("self.show_group_menu(source_index, group_index, true)"));
+        // A fonte ao lado regista o item de rolagem com a coluna dela.
+        assert!(
+            source
+                .contains("self.install_context_menu(&webview, WebViewHost::Split(source_index));")
+        );
     }
 
     #[test]
@@ -20447,23 +21109,27 @@ __fire('submit', at(login));
 
     #[test]
     fn context_limit_prunes_group_orphaned_by_eviction() {
+        // Uma coluna no tecto, toda agrupada: o grupo 77 so tem a aba mais
+        // antiga. A aba nova tira-a -- e o grupo nao fica vazio na barra.
         let mut tabs = vec![tab("https://old.example/", Some(77))];
-        let mut groups = vec![group(77, false)];
-        let mut next_id = 10_000;
-        for index in 0..32 {
-            let _ = remember_context_tab(
-                &mut tabs,
-                &mut groups,
-                &mut next_id,
-                format!("https://example.com/{index}"),
-                None,
-            );
+        for index in 1..tab_session::MAX_KEPT_TABS_PER_COLUMN {
+            tabs.push(tab(&format!("https://g.example/{index}"), Some(78)));
         }
-        assert_eq!(tabs.len(), 32);
+        let mut groups = vec![group(77, false), group(78, false)];
+        let mut next_id = 1 << 40;
+        let _ = remember_context_tab(
+            &mut tabs,
+            &mut groups,
+            &mut next_id,
+            "https://example.com/novo".to_string(),
+            None,
+        );
+        assert_eq!(tabs.len(), tab_session::MAX_KEPT_TABS_PER_COLUMN);
         assert!(
             groups.iter().all(|item| item.id != 77),
             "o limite de abas deixou grupo sem membro"
         );
+        assert!(groups.iter().any(|item| item.id == 78));
     }
 
     #[test]
@@ -21010,17 +21676,23 @@ __fire('keydown', { key: 'F8' });
         assert!(column_menu_event(COMPARATOR_COLUMNS, COLUMN_MENU_AUTO_SCROLL).is_none());
     }
 
+    /// ctx-1: as colunas das IAs E a fonte aberta ao lado -- que o tick da
+    /// rolagem tambem rola e onde o Ctrl+R tambem funciona (a resposta de uma
+    /// IA pedida no painel privado abre ali) -- recebem o item. O painel
+    /// lateral e os servicos, que nao rolam, nao.
     #[test]
-    fn only_comparator_columns_get_the_auto_scroll_menu_item() {
+    fn ai_columns_and_the_split_get_the_auto_scroll_menu_item() {
         for col in 0..COMPARATOR_COLUMNS {
             assert_eq!(context_menu_column(WebViewHost::Column(col)), Some(col));
+            assert_eq!(
+                context_menu_column(WebViewHost::Split(col)),
+                Some(col),
+                "a fonte ao lado da coluna {col} rola e tem de oferecer parar"
+            );
         }
-        assert_eq!(
-            context_menu_column(WebViewHost::Column(COMPARATOR_COLUMNS)),
-            None
-        );
         for host in [
-            WebViewHost::Split,
+            WebViewHost::Column(COMPARATOR_COLUMNS),
+            WebViewHost::Split(COMPARATOR_COLUMNS),
             WebViewHost::SidePanel,
             WebViewHost::Service,
         ] {
@@ -21028,22 +21700,24 @@ __fire('keydown', { key: 'F8' });
         }
 
         // O que `install_context_menu` corre a cada WebView construida: o
-        // registo acontece para as colunas, com o indice certo, e para mais
-        // nenhuma.
+        // registo acontece para as colunas e para a fonte ao lado, com o
+        // indice certo, e para mais nenhuma.
         for col in 0..COMPARATOR_COLUMNS {
-            let mut registered = Vec::new();
-            let missing = install_column_menu(WebViewHost::Column(col), |index| {
-                registered.push(index);
-                Ok(())
-            });
-            assert_eq!(registered, [col]);
-            assert_eq!(missing, None, "coluna {col}");
+            for host in [WebViewHost::Column(col), WebViewHost::Split(col)] {
+                let mut registered = Vec::new();
+                let missing = install_column_menu(host, |index| {
+                    registered.push(index);
+                    Ok(())
+                });
+                assert_eq!(registered, [col], "{host:?}");
+                assert_eq!(missing, None, "{host:?}");
+            }
         }
         for host in [
-            WebViewHost::Split,
             WebViewHost::SidePanel,
             WebViewHost::Service,
             WebViewHost::Column(COMPARATOR_COLUMNS),
+            WebViewHost::Split(COMPARATOR_COLUMNS),
         ] {
             let mut registered = Vec::new();
             let missing = install_column_menu(host, |index| {
@@ -21065,6 +21739,53 @@ __fire('keydown', { key: 'F8' });
         .expect("a falha do registo fica no log");
         assert!(missing.contains("coluna 2"), "{missing}");
         assert!(missing.contains("E_NOINTERFACE"), "{missing}");
+    }
+
+    /// ctx-2: o que o botao direito de uma coluna faz a CADA pedido, pelo
+    /// mesmo `column_menu_responder` que o registo no WebView2 e a pilula
+    /// usam. Criado uma vez (como no registo), le o estado da rolagem em cada
+    /// pedido -- um rotulo lido no registo ficava "Ativar" para sempre --, poe
+    /// o item depois dos nativos e, escolhido, e o Ctrl+R dessa coluna.
+    #[test]
+    fn each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r() {
+        for col in 0..COMPARATOR_COLUMNS {
+            let flag = SharedFlag::default();
+            let respond = column_menu_responder(col, flag.clone());
+
+            let first = respond(7);
+            assert_eq!(first.label, LABEL_TURN_ON, "coluna {col}");
+            assert_eq!(
+                first.placement,
+                ColumnMenuPlacement {
+                    separator_at: Some(7),
+                    item_at: 8,
+                },
+                "copiar, colar e inspecionar ficam onde o WebView2 os pos"
+            );
+            assert!(
+                matches!(first.selected(), Some(UserEvent::ToggleAutoScroll)),
+                "coluna {col}: o item nao faz o Ctrl+R"
+            );
+
+            // Ctrl+R liga a rolagem entre dois botoes direitos: o MESMO
+            // responder, sem novo registo, ja oferece desativar.
+            assert!(flag.toggle());
+            let second = respond(0);
+            assert_eq!(second.label, LABEL_TURN_OFF, "coluna {col}: rotulo preso");
+            assert_eq!(second.placement.separator_at, None);
+            assert!(matches!(
+                second.selected(),
+                Some(UserEvent::ToggleAutoScroll)
+            ));
+
+            // A pilula usa o mesmo responder, sem itens nativos: o id que o
+            // TrackPopupMenu devolve e o do comando, e so esse faz algo.
+            flag.set(false);
+            let pill = column_menu_responder(col, flag.clone())(0);
+            assert_eq!(pill.label, LABEL_TURN_ON);
+            assert_eq!(pill.command, COLUMN_MENU_AUTO_SCROLL);
+            assert_ne!(pill.command, 0, "0 e o menu fechado sem escolha");
+        }
     }
 
     #[test]
@@ -24877,9 +25598,11 @@ __fire('keydown', { key: 'F8' });
         assert!(tabs.iter().all(|tab| tab.group.is_none()));
         assert!(groups.is_empty());
 
-        // 32 abas, o grupo no inicio: a que sai pelo limite e a mais antiga,
-        // e o resto do grupo continua seguido.
-        let mut tabs: Vec<ContextTab> = (0..32)
+        // O grupo no inicio (as abas mais antigas) e 32 soltas. Uma aba
+        // nascida no grupo nao conta para o limite das soltas; uma solta a
+        // mais tira a solta mais antiga -- nao a primeira da esquerda, que e
+        // do grupo -- e o grupo continua inteiro e seguido.
+        let mut tabs: Vec<ContextTab> = (0..35)
             .map(|index| {
                 tab(
                     &format!("https://x.example/{index}"),
@@ -24888,7 +25611,8 @@ __fire('keydown', { key: 'F8' });
             })
             .collect();
         let mut groups = vec![group(5, false)];
-        let mut next_id = 5000;
+        let mut next_id = 1 << 40;
+        let oldest_loose = tabs[3].id;
         let opener = tabs[1].id;
         let _ = remember_context_tab(
             &mut tabs,
@@ -24897,9 +25621,59 @@ __fire('keydown', { key: 'F8' });
             "https://novo.example/".to_string(),
             Some(opener),
         );
-        assert_eq!(tabs.len(), 32);
+        assert_eq!(tabs.len(), 36);
         assert!(group_runs_are_contiguous(&tabs));
-        assert_eq!(tabs.iter().filter(|tab| tab.group == Some(5)).count(), 3);
+        assert_eq!(tabs.iter().filter(|tab| tab.group == Some(5)).count(), 4);
+        let _ = remember_context_tab(
+            &mut tabs,
+            &mut groups,
+            &mut next_id,
+            "https://solta.example/".to_string(),
+            None,
+        );
+        assert_eq!(tabs.len(), 36);
+        assert!(tabs.iter().all(|tab| tab.id != oldest_loose));
+        assert!(group_runs_are_contiguous(&tabs));
+        assert_eq!(tabs.iter().filter(|tab| tab.group == Some(5)).count(), 4);
+    }
+
+    /// parity-5: a cor do grupo muda-se tambem no botao direito de uma aba
+    /// agrupada ("Cor do grupo"), com os mesmos ids do menu da pilula, e muda
+    /// so o grupo DELA. Os ids das cores nunca colidem com os do "Mover para
+    /// o grupo", nem com uma coluna cheia de grupos.
+    #[test]
+    fn a_grouped_tabs_menu_changes_the_colour_of_its_own_group() {
+        let joinable: Vec<(usize, String)> = (0..tab_session::MAX_KEPT_TABS_PER_COLUMN)
+            .map(|index| (index, format!("G{index}")))
+            .collect();
+        assert!(TAB_MENU_GROUP_BASE + joinable.len() <= GROUP_MENU_COLOR_BASE);
+        for (index, color) in GroupColor::ALL.iter().enumerate() {
+            assert_eq!(
+                tab_menu_command(GROUP_MENU_COLOR_BASE + index, &joinable),
+                Some(TabMenuCommand::GroupColor(*color)),
+                "{color:?}"
+            );
+        }
+        let mut tabs = vec![
+            tab("https://a.example/", Some(3)),
+            tab("https://b.example/", Some(4)),
+        ];
+        let mut groups = vec![group(3, false), group(4, false)];
+        let Some(TabMenuCommand::GroupColor(chosen)) =
+            tab_menu_command(GROUP_MENU_COLOR_BASE + 2, &[])
+        else {
+            panic!("o id de uma cor nao e \"Cor do grupo\"");
+        };
+        let own = tabs[0].group.expect("aba agrupada");
+        let closed =
+            apply_group_command(&mut tabs, &mut groups, own, GroupMenuCommand::Color(chosen));
+        assert!(closed.is_empty());
+        assert_eq!(groups[0].color, GroupColor::ALL[2]);
+        assert_eq!(
+            groups[1].color,
+            GroupColor::Blue,
+            "outro grupo mudou de cor"
+        );
     }
 
     #[test]
@@ -25952,21 +26726,27 @@ fn column_menu_event(col_index: usize, command: usize) -> Option<UserEvent> {
 enum WebViewHost {
     /// Uma das colunas das IAs no comparador.
     Column(usize),
-    /// A fonte aberta ao lado de uma coluna.
-    Split,
+    /// A fonte aberta ao lado da coluna indicada -- tambem a resposta de uma
+    /// IA pedida no painel privado, e a unica pagina a vista em tela cheia.
+    Split(usize),
     /// Historico e memoria, a direita.
     SidePanel,
     /// Meet, WhatsApp, YouTube e Gmail no painel.
     Service,
 }
 
-/// So as colunas das IAs recebem o item de rolagem: a fonte ao lado, o painel
-/// lateral e os servicos ficam com o menu nativo do WebView2 tal como vem.
+/// Recebem o item de rolagem as paginas que rolam sozinhas: as colunas das
+/// IAs e a fonte aberta ao lado (o `auto_scroll_tick` rola-a e o Ctrl+R
+/// funciona nela -- sem o item, a resposta de uma IA aberta no painel privado
+/// rolava sem nenhum botao direito para a parar). O painel lateral e os
+/// servicos nao rolam: ficam com o menu nativo do WebView2 tal como vem.
 fn context_menu_column(host: WebViewHost) -> Option<usize> {
     match host {
-        WebViewHost::Column(index) if index < COMPARATOR_COLUMNS => Some(index),
+        WebViewHost::Column(index) | WebViewHost::Split(index) if index < COMPARATOR_COLUMNS => {
+            Some(index)
+        }
         WebViewHost::Column(_)
-        | WebViewHost::Split
+        | WebViewHost::Split(_)
         | WebViewHost::SidePanel
         | WebViewHost::Service => None,
     }
@@ -26010,6 +26790,42 @@ fn column_menu_placement(native: u32) -> ColumnMenuPlacement {
     }
 }
 
+/// O item de rolagem de UM botao direito: o rotulo lido no instante do
+/// pedido, onde entra entre os `native` itens do menu, e o id que o
+/// representa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ColumnMenuRequest {
+    col_index: usize,
+    label: &'static str,
+    placement: ColumnMenuPlacement,
+    command: usize,
+}
+
+impl ColumnMenuRequest {
+    /// O evento de escolher o item: o do Ctrl+R premido na coluna.
+    fn selected(&self) -> Option<UserEvent> {
+        column_menu_event(self.col_index, self.command)
+    }
+}
+
+/// O que responde a cada botao direito de uma coluna. Criado UMA vez, quando
+/// a WebView e registada (ou quando a pilula abre o menu), e chamado a cada
+/// pedido: por isso o rotulo le o `SharedFlag` dentro da resposta, nunca na
+/// criacao -- um rotulo lido no registo ficava preso ao estado do arranque.
+/// `register_column_context_menu` e `column_pill_menu` so copiam para o
+/// Win32/COM o que isto decide.
+fn column_menu_responder(
+    col_index: usize,
+    auto_scroll: SharedFlag,
+) -> impl Fn(u32) -> ColumnMenuRequest {
+    move |native| ColumnMenuRequest {
+        col_index,
+        label: auto_scroll_menu_label(auto_scroll.get()),
+        placement: column_menu_placement(native),
+        command: COLUMN_MENU_AUTO_SCROLL,
+    }
+}
+
 /// Acrescenta ao menu nativo do botao direito de uma coluna o item de
 /// rolagem, com o rotulo do estado no instante do clique, no lugar que
 /// `column_menu_placement` decide. Precisa do ContextMenuRequested
@@ -26042,21 +26858,23 @@ fn register_column_context_menu(
         .cast::<ICoreWebView2Environment9>()
         .map_err(|error| format!("ICoreWebView2Environment9 indisponível: {error}"))?;
 
+    let respond = column_menu_responder(col_index, auto_scroll);
     let add_item =
         move |args: &ICoreWebView2ContextMenuRequestedEventArgs| -> windows_core::Result<()> {
-            let label = HSTRING::from(auto_scroll_menu_label(auto_scroll.get()));
-            let proxy = proxy.clone();
-            let selected = CustomItemSelectedEventHandler::create(Box::new(move |_, _| {
-                if let Some(event) = column_menu_event(col_index, COLUMN_MENU_AUTO_SCROLL) {
-                    let _ = proxy.send_event(event);
-                }
-                Ok(())
-            }));
             unsafe {
                 let items = args.MenuItems()?;
                 let mut native = 0u32;
                 items.Count(&mut native)?;
-                let placement = column_menu_placement(native);
+                let request = respond(native);
+                let label = HSTRING::from(request.label);
+                let placement = request.placement;
+                let proxy = proxy.clone();
+                let selected = CustomItemSelectedEventHandler::create(Box::new(move |_, _| {
+                    if let Some(event) = request.selected() {
+                        let _ = proxy.send_event(event);
+                    }
+                    Ok(())
+                }));
                 // Tudo criado antes de mexer no menu: uma falha a meio nao deixa
                 // um separador solto no fim do menu nativo.
                 let item = environment.CreateContextMenuItem(
