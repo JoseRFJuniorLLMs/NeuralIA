@@ -2160,8 +2160,8 @@ unsafe extern "system" fn search_card_subclass(
             let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
             let y = ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32;
             if let Some(button) = search_card_release(pressed, captured, &client, x, y) {
-                let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
-                let _ = proxy.send_event(UserEvent::SearchCardAnswer {
+                let sink = &*(reference_data as *const SearchCardSink);
+                sink(UserEvent::SearchCardAnswer {
                     token: SEARCH_CARD_PAINTED.load(Ordering::Acquire),
                     button,
                 });
@@ -2707,6 +2707,11 @@ fn save_gmail_setting(path: &std::path::Path, on: bool) -> std::io::Result<()> {
     std::fs::write(&temp, if on { "ligado" } else { "desligado" })?;
     std::fs::rename(&temp, path)
 }
+
+/// Para onde o cartao manda a resposta: o proxy do event loop no app, um
+/// registo nos gates. Em caixa dupla: o `reference_data` da subclasse e um
+/// ponteiro fino.
+type SearchCardSink = Box<dyn Fn(UserEvent)>;
 
 /// Os dois botoes do cartao "Pesquisar nas 3 IAs?".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4825,6 +4830,7 @@ struct App {
     /// O pedido de pesquisa a espera do clique no cartao nativo.
     search_card: SearchCard,
     search_card_popup: Option<HWND>,
+    search_card_sink: Box<SearchCardSink>,
     gmail_monitor: Option<WebView>,
     gmail_probe_token: u64,
     gmail_last_unread: Option<u32>,
@@ -4900,6 +4906,12 @@ impl App {
             Arc::clone(&navigation_generation),
         );
         let omnibox_proxy = Box::new(proxy.clone());
+        let search_card_sink: Box<SearchCardSink> = {
+            let proxy = proxy.clone();
+            Box::new(Box::new(move |event| {
+                let _ = proxy.send_event(event);
+            }))
+        };
         let palette_host = Box::new(PaletteHost {
             proxy: proxy.clone(),
             source: Cell::new(None),
@@ -4938,6 +4950,7 @@ impl App {
             gmail_toast_token: 0,
             search_card: SearchCard::default(),
             search_card_popup: None,
+            search_card_sink,
             gmail_monitor: None,
             gmail_probe_token: 0,
             gmail_last_unread: None,
@@ -11635,7 +11648,7 @@ impl SearchCardHost for App {
                     created,
                     Some(search_card_subclass),
                     SEARCH_CARD_SUBCLASS_ID,
-                    (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize,
+                    (&*self.search_card_sink as *const SearchCardSink) as usize,
                 ) == 0
                 {
                     DestroyWindow(created);
@@ -13646,6 +13659,132 @@ mod tests {
             assert_eq!(
                 hit, HTCLIENT as LRESULT,
                 "o divisor devolveu {hit} (HTTRANSPARENT e -1): o rato atravessa-o"
+            );
+        }
+    }
+
+    #[test]
+    fn the_search_card_window_answers_a_native_press_and_release_with_the_painted_token() {
+        // O cartao a serio: a mesma receita de janela e a mesma subclasse do
+        // produto, com mensagens Win32 reais. So o sink e o do teste.
+        use std::{cell::RefCell, rc::Rc};
+        use windows_sys::Win32::Graphics::Gdi::UpdateWindow;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, SetActiveWindow};
+        use windows_sys::Win32::UI::WindowsAndMessaging::WS_OVERLAPPEDWINDOW;
+        let answers: Rc<RefCell<Vec<(u64, SearchCardButton)>>> = Rc::default();
+        let record = Rc::clone(&answers);
+        let sink: Box<SearchCardSink> = Box::new(Box::new(move |event| {
+            if let UserEvent::SearchCardAnswer { token, button } = event {
+                record.borrow_mut().push((token, button));
+            }
+        }));
+        let width = SEARCH_CARD_WIDTH.round() as i32;
+        let height = SEARCH_CARD_HEIGHT.round() as i32;
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        let layout = search_card_layout(&client, 1.0);
+        let middle = |rect: &RECT| {
+            let x = (rect.left + rect.right) / 2;
+            let y = (rect.top + rect.bottom) / 2;
+            (((y as u32) << 16) | (x as u32 & 0xffff)) as LPARAM
+        };
+        let (on_search, on_cancel, on_text) = (
+            middle(&layout.search),
+            middle(&layout.cancel),
+            middle(&layout.text),
+        );
+        unsafe {
+            let owner = CreateWindowExW(
+                0,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!("NeuralIA dono"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                0,
+                0,
+                640,
+                400,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!owner.is_null(), "a janela dona tem de nascer");
+            SetActiveWindow(owner);
+            let card = CreateWindowExW(
+                AUX_POPUP_EX_STYLE,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!(""),
+                AUX_POPUP_STYLE,
+                0,
+                0,
+                width,
+                height,
+                owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!card.is_null(), "o cartao tem de nascer");
+            let subclassed = SetWindowSubclass(
+                card,
+                Some(search_card_subclass),
+                SEARCH_CARD_SUBCLASS_ID,
+                (&*sink as *const SearchCardSink) as usize,
+            );
+            if let Ok(mut view) = SEARCH_CARD_VIEW.lock() {
+                *view = Some((77, "Texto & mais".to_string()));
+            }
+            show_popup_without_activation(card);
+            InvalidateRect(card, std::ptr::null(), 1);
+            UpdateWindow(card);
+            let active = GetActiveWindow();
+            let hit = SendMessageW(card, WM_NCHITTEST, 0, 0);
+            let activate = SendMessageW(card, WM_MOUSEACTIVATE, owner as WPARAM, 0);
+            let painted = SEARCH_CARD_PAINTED.load(Ordering::Acquire);
+            let click = |down: LPARAM, up: LPARAM| {
+                SendMessageW(card, WM_LBUTTONDOWN, 1, down);
+                SendMessageW(card, WM_LBUTTONUP, 0, up);
+            };
+            click(on_search, on_search);
+            click(on_cancel, on_cancel);
+            // Premido num botao e solto noutro, ou fora deles: nada.
+            click(on_search, on_cancel);
+            click(on_cancel, on_search);
+            click(on_search, on_text);
+            click(on_text, on_search);
+            // Solto sem ter descido no cartao: nada.
+            SendMessageW(card, WM_LBUTTONUP, 0, on_search);
+            // O texto trocou mas ainda nao foi pintado: o clique responde ao
+            // que o utilizador viu (77), nunca ao texto novo.
+            if let Ok(mut view) = SEARCH_CARD_VIEW.lock() {
+                *view = Some((78, "Outro texto".to_string()));
+            }
+            click(on_search, on_search);
+            let answered = answers.borrow().clone();
+            DestroyWindow(card);
+            DestroyWindow(owner);
+            if let Ok(mut view) = SEARCH_CARD_VIEW.lock() {
+                *view = None;
+            }
+            SEARCH_CARD_PAINTED.store(0, Ordering::Release);
+
+            assert_ne!(subclassed, 0, "a subclasse tem de instalar");
+            assert_eq!(active, owner, "mostrar o cartao roubou a ativacao");
+            assert_eq!(hit, HTCLIENT as LRESULT, "o cartao deixa o rato passar");
+            assert_eq!(activate, MA_NOACTIVATE as LRESULT);
+            assert_eq!(painted, 77, "a pintura nao registou o texto que mostrou");
+            assert_eq!(
+                answered,
+                vec![
+                    (77, SearchCardButton::Search),
+                    (77, SearchCardButton::Cancel),
+                    (77, SearchCardButton::Search),
+                ],
+                "o cartao respondeu a outra coisa que um clique nativo num botao"
             );
         }
     }
@@ -21090,6 +21229,10 @@ __state('duplo-clique-no-vazio');
         for (from, to) in [
             ("fn show_splash", "fn position_splash"),
             ("fn show_gmail_toast", "fn position_gmail_toast"),
+            (
+                "fn show_search_card(&mut self, token: u64, preview: &str) {",
+                "fn hide_search_card",
+            ),
             ("fn sync_exit_button", "fn position_exit_button"),
             ("fn sync_comparator_splitters", "fn resize_comparator"),
         ] {

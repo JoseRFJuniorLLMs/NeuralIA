@@ -4,6 +4,20 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+### Added
+- **feat/selection-toolbar — barra de seleção (pedido do dono):** ao selecionar texto numa página (arrastar, duplo ou triplo clique, Shift+clique, Shift+setas, Ctrl+A) aparece uma barra com 🔎 Pesquisar, 📋 Copiar e 🔊 Falar, nas colunas do comparador, no Split, na Web externa e no Reader. Copiar usa a área de transferência; Falar lê com uma voz local do sistema (nunca uma voz online), uma frase de cada vez, e o segundo clique para. No Split privado não há Pesquisar.
+- **feat/selection-toolbar — confirmação nativa do Pesquisar:** o Pesquisar da barra só pede a pesquisa. A NeuralIA mostra no centro da janela um cartão nativo, "Pesquisar nas 3 IAs?", com o texto (até 200 caracteres, depois "…") e os botões Pesquisar e Cancelar. Só um clique em Pesquisar no cartão, a partir de 600 ms depois de o texto aparecer, envia o texto às três IAs; Cancelar ou 12 s sem resposta descartam-no, e um pedido novo substitui o anterior. O cartão não tira o foco da página, e a página não o pode tapar, mover nem clicar.
+
+### Changed
+- **feat/selection-toolbar — duplo clique nas colunas:** um duplo clique numa palavra seleciona-a e mostra a barra de seleção em vez de expandir a coluna; um duplo clique que não deixa texto selecionado continua a expandir.
+
+### Security
+- **feat/selection-toolbar — IPC (SPEC-0005/SPEC-0108/SPEC-0015):** o conjunto fechado passa a 29 ações com `search` (só `text`, de 1 a 2000 caracteres depois de aparado, sem caracteres de controlo além de `\n` e `\t`), aceite das colunas, do Split normal, da Web externa e do Reader e recusado pelo Split privado. O nativo nunca pesquisa só por receber `search`: abre o cartão de confirmação, e o texto segue como pergunta, nunca como comando da omnibox (`agent:`, `tema:` ou uma URL selecionados são perguntas). O gate `protocol_accepts_exactly_the_twenty_nine_published_actions` lê a SPEC-0005.
+- **feat/selection-toolbar — página hostil:** a barra vive numa shadow root fechada montada no document-created e usa primitivas capturadas nesse momento (seleção, eventos, medidas, `String`, e os acessores de `SpeechSynthesisVoice` e `SpeechSynthesisUtterance`): uma página que os redefine não muda o texto enviado nem faz passar uma voz online por local. No Split privado, `open_split_mode` passa o seu `private` a `split_open_plan`, de onde saem o perfil anônimo, o script sem Pesquisar e o handler IPC que recusa `search`.
+
+### Testing
+- **feat/selection-toolbar:** gates sobre o caminho que embarca — os scripts injetados correm no Node com a página hostil simulada; o cartão por `pesquisar_asks_the_native_card_and_only_its_search_click_compares`, `the_search_card_shows_plain_bounded_text_and_answers_only_its_buttons` e `the_search_card_window_answers_a_native_press_and_release_with_the_painted_token`; o Split privado por `open_split_mode_hands_its_private_flag_to_the_builder`; a voz por `falar_never_takes_an_online_voice_the_page_disguised_as_local`; o duplo clique por `double_clicking_a_word_in_a_column_selects_it_instead_of_expanding`. Cada gate foi quebrado de propósito e ficou vermelho (prova de sabotagem nos commits da branch).
+
 ## [2.1.6] - 2026-09-23
 
 ### Changed

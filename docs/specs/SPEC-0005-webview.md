@@ -84,11 +84,16 @@ selection whose end is outside the visible area. It is placed above the whole
 selection when there is room, else below its last line. It lives in a closed
 shadow root built when the document is created, and offers Pesquisar, Copiar
 (clipboard, no IPC) and Falar (local `speechSynthesis` voices, no IPC). Falar
-never picks an online voice: it prefers the page language, then pt-BR, then
+never picks an online voice: it reads `localService`, `lang` and `default`
+through the `SpeechSynthesisVoice` accessors, and sets the utterance's
+`voice` and `lang` through the `SpeechSynthesisUtterance` setters, captured
+when the document is created, so a page that redefines them cannot pass an
+online voice off as local; it prefers the page language, then pt-BR, then
 the system language, and reads one sentence per utterance; while it reads, a
 new selection moves the toolbar and becomes the text Copiar and Pesquisar
 use, and without one only Parar remains. A double click on a word in a
-comparator column selects it instead of expanding the column.
+comparator column selects it and brings the toolbar instead of expanding the
+column; a double click that leaves no text selected still expands it.
 
 Pesquisar counts a click only when the toolbar has been on screen, where it
 was placed (read through the `DOMRectReadOnly` accessors captured when the
@@ -98,23 +103,43 @@ transform, clip-path, mask, blend mode, hidden content or hidden visibility on
 it and no opacity, filter or transform on the document root, and --
 when the engine provides IntersectionObserver v2 (`isVisible`) -- after that
 observer has reported it visible for 500 ms; otherwise nothing is sent and the
-toolbar says why. `search` carries exactly `text` (1..=2000 characters after
-trimming, no control characters except newline and tab); a longer selection
-is not sent and the toolbar says so. The text path uses the `String` and
-`String.prototype` members captured when the document is created. The native
-side opens the normal three-AI comparison with the text as the question,
-directly: it never goes through the omnibox command parser or the palette,
-so a selected `agent:`, `tema:` or URL is a question, not a command. A private
-Split has no Pesquisar button and its handler refuses `search`; the Split's
-script and IPC mapping come from one value
-(`split_page`). Gates: `search_carries_the_selected_text_within_bounds`
-(`ipc.rs`),
+toolbar says why. These checks only filter clicks before they bother the user:
+the page can still shrink or hide the toolbar in ways the page script cannot
+see, so a Pesquisar click only asks. `search` carries exactly `text`
+(1..=2000 characters after trimming, no control characters except newline and
+tab); a longer selection is not sent and the toolbar says so. The text path
+uses the `String` and `String.prototype` members captured when the document is
+created.
+
+The native side never searches on `search` alone. It shows a native
+confirmation card, "Pesquisar nas 3 IAs?", centred in the window: an owned,
+non-activating popup (`WS_EX_NOACTIVATE`, shown with `SW_SHOWNOACTIVATE`) that
+the page cannot cover, move, paint or click, with the text as plain text (at
+most 200 characters, then "…"; line breaks, tabs and control characters become
+one space; bidirectional embedding, override and isolate controls are
+removed; drawn with `DT_NOPREFIX`) and two buttons, Pesquisar and Cancelar,
+handled natively (press and release on the same button, with the mouse
+captured by the card). Only a Pesquisar click on the card, at least 600 ms
+after that text appeared, opens the normal three-AI comparison with the whole
+text as the question; Cancelar, or 12 s without an answer, drops it. There is
+one card at a time: a new request replaces the text and restarts both clocks,
+and a click only counts for the text the card had painted. The comparison
+never goes through the omnibox command parser or the palette, so a selected
+`agent:`, `tema:` or URL is a question, not a command. A private Split has no
+Pesquisar button and its handler refuses `search`, so it never shows the card;
+`open_split_mode` hands its `private` flag to `split_open_plan`, and the
+Split's incognito profile, injected script and IPC handler all come from the
+result. Gates: `search_carries_the_selected_text_within_bounds` (`ipc.rs`),
 `the_selection_toolbar_offers_three_actions_for_a_trusted_selection`,
 `the_selection_toolbar_searches_only_what_fits_and_never_from_private`,
 `pesquisar_only_counts_a_click_on_a_bar_the_user_really_saw`,
+`pesquisar_asks_the_native_card_and_only_its_search_click_compares`,
+`the_search_card_shows_plain_bounded_text_and_answers_only_its_buttons`,
 `the_selection_toolbar_copies_and_speaks_with_local_voices`,
+`falar_never_takes_an_online_voice_the_page_disguised_as_local`,
 `while_reading_a_new_selection_is_what_copy_and_search_take`,
 `every_page_surface_gets_the_toolbar_its_privacy_allows`,
+`open_split_mode_hands_its_private_flag_to_the_builder`,
 `double_clicking_a_word_in_a_column_selects_it_instead_of_expanding`,
 `a_selected_search_reaches_the_comparator_from_every_surface_but_the_private_split`
 and `a_selected_search_is_a_question_never_an_omnibox_command`
