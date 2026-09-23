@@ -2945,8 +2945,7 @@ const PANEL_SHOW_NOTES_SCRIPT: &str =
 
 /// O botao Notas com o painel ja aberto: nas Notas fecha (pelo mesmo
 /// caminho do X, que salva o editor antes), no Historico mostra as Notas.
-const PANEL_NOTES_BUTTON_SCRIPT: &str =
-    "window.__neuraliaNotes && window.__neuraliaNotes.button()";
+const PANEL_NOTES_BUTTON_SCRIPT: &str = "window.__neuraliaNotes && window.__neuraliaNotes.button()";
 
 /// Corre no painel quando o Ctrl+Shift+Z e dado na Home (omnibox) ou com o
 /// teclado na barra: uma nota nova, em branco, no editor. So chega ao disco
@@ -3102,7 +3101,8 @@ fn notes_command_for(message: PanelMessage) -> Option<NotesCommand> {
 }
 
 /// A resposta a um note-save que o parser recusou.
-const NOTE_SAVE_REFUSED: &str = "A nota não foi salva: o título, as tags ou o tamanho passam dos limites.";
+const NOTE_SAVE_REFUSED: &str =
+    "A nota não foi salva: o título, as tags ou o tamanho passam dos limites.";
 
 /// O que o worker das notas lembra entre pedidos: a revisao que ELE
 /// escreveu em cada nota. Um salvar com a revisao de antes de um salvar
@@ -3152,7 +3152,13 @@ fn run_notes_command_in(
                         if &now != opened && session.written.get(&id) != Some(&now) {
                             let title = format!("{} (conflito)", edit.title).trim().to_string();
                             return store
-                                .create(&title, &edit.body, edit.tags, current.source.clone(), now_unix)
+                                .create(
+                                    &title,
+                                    &edit.body,
+                                    edit.tags,
+                                    current.source.clone(),
+                                    now_unix,
+                                )
                                 .map(|copy| (Some(id), copy));
                         }
                     }
@@ -6743,11 +6749,7 @@ impl App {
         }
         self.home_focused = focused;
         if focused {
-            // Um fim de fase do Pomodoro que a janela nao viu (estava
-            // minimizada ou atras de outra) aparece agora.
-            if let Some(message) = self.pomodoro.window_back() {
-                self.show_background_splash(message, POMODORO_PHASE_END_SECONDS);
-            }
+            self.show_unseen_phase_end();
             self.resume_home_animation();
             // Os popups owned reaparecem com o dono, mas a geometria pode ter
             // mudado enquanto estivemos fora (outro ecra, outro DPI, outra
@@ -6771,7 +6773,18 @@ impl App {
         }
         self.home_occluded = occluded;
         if !occluded {
+            // Restaurada da barra de tarefas: o foco pode ir direto para a
+            // WebView e o `Focused` da janela nunca chegar.
+            self.show_unseen_phase_end();
             self.resume_home_animation();
+        }
+    }
+
+    /// Um fim de fase do Pomodoro que a janela nao viu (estava minimizada ou
+    /// atras de outra) aparece quando ela volta -- uma vez.
+    fn show_unseen_phase_end(&mut self) {
+        if let Some(message) = self.pomodoro.window_back() {
+            self.show_background_splash(message, POMODORO_PHASE_END_SECONDS);
         }
     }
 
@@ -11003,7 +11016,10 @@ impl App {
                 }
                 NotesReply::Conflict { note, .. } => {
                     self.show_splash(
-                        format!("A nota mudou fora do NeuralIA; o texto ficou em: {}", note.title),
+                        format!(
+                            "A nota mudou fora do NeuralIA; o texto ficou em: {}",
+                            note.title
+                        ),
                         6,
                     );
                 }
@@ -16244,8 +16260,15 @@ mod tests {
         assert!(controls.live.x + controls.live.width <= controls.services[0].x);
         assert_eq!(controls.leftmost(), controls.live.x);
         // As ferramentas ficam na linha de cima, como na Home.
-        for (tool, home) in controls.tools.iter().zip(home_tool_buttons(1600.0, 1.0, None)) {
-            assert_eq!((tool.x, tool.y, tool.width, tool.height), (home.x, home.y, home.width, home.height));
+        for (tool, home) in controls
+            .tools
+            .iter()
+            .zip(home_tool_buttons(1600.0, 1.0, None))
+        {
+            assert_eq!(
+                (tool.x, tool.y, tool.width, tool.height),
+                (home.x, home.y, home.width, home.height)
+            );
         }
         for tool in controls.tools {
             assert!(tool.y + tool.height <= TITLE_TAB_HEIGHT);
@@ -18525,7 +18548,11 @@ globalThis.__modules = {
     /// Corre o viewer.mjs e o read-aloud.js QUE O serve_pdf_asset SERVE --
     /// os bytes da resposta, nao uma copia -- sobre o PDF de mentira, e
     /// depois o `drive`.
-    fn run_pdf_viewer(pages: serde_json::Value, lang: Option<&str>, drive: &str) -> serde_json::Value {
+    fn run_pdf_viewer(
+        pages: serde_json::Value,
+        lang: Option<&str>,
+        drive: &str,
+    ) -> serde_json::Value {
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let served = |path: &str| {
             let response = serve_pdf_asset(&bytes, &pdf_request(path));
@@ -22178,8 +22205,7 @@ __fire('keydown', { key: 'F8' });
                         continue;
                     }
                     for label in [None, running, paused] {
-                        let layout =
-                            layout_at(client_width, scale, minimized, split_active, label);
+                        let layout = layout_at(client_width, scale, minimized, split_active, label);
                         for index in 0..COMPARATOR_COLUMNS {
                             if minimized[index] {
                                 continue;
@@ -23841,7 +23867,10 @@ process.stdout.write(JSON.stringify({
                 PANEL_NOTES_BUTTON_SCRIPT.into(),
                 "__out.notes = __visible($('view-notes')) && !__visible($('view-history'));".into(),
             ]);
-            assert_eq!(history["out"]["notes"], true, "o botao nao mostrou as Notas");
+            assert_eq!(
+                history["out"]["notes"], true,
+                "o botao nao mostrou as Notas"
+            );
             assert_eq!(
                 posted(&history)
                     .iter()
@@ -23970,15 +23999,22 @@ process.stdout.write(JSON.stringify({
                     at,
                 );
                 assert!(
-                    matches!(reply, NotesReply::Opened { cause: NoteOpened::Saved, .. }),
+                    matches!(
+                        reply,
+                        NotesReply::Opened {
+                            cause: NoteOpened::Saved,
+                            ..
+                        }
+                    ),
                     "{body}: {reply:?}"
                 );
             }
+            assert_eq!(store.get(&own.id).expect("ler").expect("existe").body, "v3");
             assert_eq!(
-                store.get(&own.id).expect("ler").expect("existe").body,
-                "v3"
+                store.list().expect("lista").len(),
+                3,
+                "nenhuma copia a mais"
             );
-            assert_eq!(store.list().expect("lista").len(), 3, "nenhuma copia a mais");
         }
 
         fn opened_id(reply: &NotesReply) -> String {
@@ -24063,7 +24099,11 @@ process.stdout.write(JSON.stringify({
                 .iter()
                 .filter(|m| action_of(m) == "note-save")
                 .collect();
-            assert_eq!(saves.len(), 2, "a nota nova ficou presa em 'A salvar…': {sent:?}");
+            assert_eq!(
+                saves.len(),
+                2,
+                "a nota nova ficou presa em 'A salvar…': {sent:?}"
+            );
             assert!(matches!(
                 parse_panel_message(saves[0]),
                 Some(PanelMessage::NoteSave(NoteEdit { ref title, .. })) if title == "Capítulo 1 Introdução"
@@ -24074,13 +24114,8 @@ process.stdout.write(JSON.stringify({
         /// painel responde com `NOTE_SAVE_REFUSED`, e nunca pelo worker.
         #[test]
         fn a_refused_note_save_is_answered_and_never_reaches_the_disk() {
-            let refused = parse_panel_message(&save_message(
-                Some("../../x"),
-                "t",
-                "b",
-                &[],
-            ))
-            .expect("recusado mas respondido");
+            let refused = parse_panel_message(&save_message(Some("../../x"), "t", "b", &[]))
+                .expect("recusado mas respondido");
             assert_eq!(refused, PanelMessage::NoteSaveRefused);
             assert_eq!(notes_command_for(refused), None);
             assert_eq!(

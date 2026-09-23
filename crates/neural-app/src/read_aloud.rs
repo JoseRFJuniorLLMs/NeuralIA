@@ -72,7 +72,9 @@ pub(crate) mod harness {
         let program = format!("const INPUT = {input};\n{HARNESS}");
         let mut command = Command::new("node");
         if module.is_some() {
-            command.arg("--experimental-vm-modules").arg("--no-warnings");
+            command
+                .arg("--experimental-vm-modules")
+                .arg("--no-warnings");
         }
         let mut child = command
             .arg("-")
@@ -901,7 +903,10 @@ return __speech.log.map((x) => x.voice)[0] || null;
 "#,
                 text = json!(text)
             ));
-            clean_result(&outcome).as_str().unwrap_or_default().to_string()
+            clean_result(&outcome)
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
         };
         let english = "The quick brown fox jumps over the lazy dog. It was sunny and the children were playing in the park with their friends.";
         let portuguese = "A raposa pula por cima do cão. Não é uma história com muito sentido, mas é da tradição dos testes.";
