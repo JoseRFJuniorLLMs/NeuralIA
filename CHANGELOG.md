@@ -4,6 +4,9 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+### Security
+- **fix/audit-cidocs / SPEC-0005, SPEC-0108, SPEC-0015:** as specs publicavam 26 (ou 25) ações IPC e omitiam `link`, que o parser aceita desde 2.1.0 (`col`, `url`, `aside`; com `aside=false` navega as três colunas do comparador). A lista publicada passa a 27 ações e o gate `protocol_accepts_exactly_the_twenty_seven_published_actions` lê a SPEC-0005 e falha se ela divergir do conjunto que o parser aceita.
+
 ## [2.1.5] - 2026-09-22
 
 ### Fixed
@@ -21,7 +24,7 @@ All notable changes to NeuralIA are documented here.
 
 ### Security
 - **PR #128 / SPEC-0109:** câmera, microfone e captura de tela passam pelo consentimento nativo do WebView2 apenas em superfícies visíveis; agente e demais permissões continuam `Deny`.
-- **PR #133 / SPEC-0108:** o conjunto fechado passa a 26 ações com `shortcut-expand`, autenticada pela capability e separada do `expand` de autoridade local à coluna.
+- **PR #133 / SPEC-0108:** o conjunto fechado passa a 27 ações com `shortcut-expand` (as 26 anteriores já incluíam `link`, omitido nesta entrada até à correção em `[Unreleased]`), autenticada pela capability e separada do `expand` de autoridade local à coluna.
 
 ### Testing
 - **PR #128:** gates de comportamento cobrem escopo de grupos, poda de grupos vazios, omnibox desabilitada fora da Home, fallback CSPRNG e política WebRTC.
