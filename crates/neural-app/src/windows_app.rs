@@ -21026,9 +21026,11 @@ __fire('keydown', { key: 'F8' });
         (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
     }
 
-    /// Todos os controlos da direita com area.
+    /// Todos os controlos da direita com area -- o olho do Gemini Live
+    /// incluido, que fica entre as ferramentas e os servicos.
     fn right_control_rects(controls: RightControls) -> Vec<UiRect> {
         let mut rects = controls.tools.to_vec();
+        rects.push(controls.live);
         rects.extend(controls.services);
         rects.push(controls.private);
         if let Some((label, expand, close)) = controls.split {
