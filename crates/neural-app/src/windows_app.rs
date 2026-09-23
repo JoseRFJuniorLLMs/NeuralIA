@@ -19,6 +19,7 @@ use image::RgbaImage;
 #[cfg(test)]
 use crate::ipc::constant_time_eq;
 use crate::ipc::{IpcAction, parse_ipc_message};
+use crate::tab_session::{self, Loaded, SessionColumn, SessionGroup, SessionTab, TabSession};
 use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentRuntimeConfig,
     AgentSecurityAction, CoreConfig, FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent,
@@ -188,6 +189,8 @@ enum UserEvent {
     /// conclui a destruição dos controllers no pump de mensagens.
     RestoreHomeDecorations,
     RestoreComparator,
+    /// Grava as abas e os grupos, se este ainda for o ultimo pedido agendado.
+    SaveTabSession(u64),
     ExitRequested,
     ReaderReady {
         generation: u64,
@@ -4446,6 +4449,8 @@ struct App {
     panel_suggestion_query: Option<String>,
     /// Servico aberto no painel lateral (WhatsApp, Meet, YouTube, Gmail).
     service_panel: Option<(Service, WebView)>,
+    /// Gravacao das abas e grupos do comparador em `tabs.json`.
+    tab_session: TabSessionSync,
 }
 
 impl App {
@@ -4534,6 +4539,7 @@ impl App {
             side_panel: None,
             panel_suggestion_query: None,
             service_panel: None,
+            tab_session: TabSessionSync::default(),
         }
     }
 
@@ -4871,6 +4877,10 @@ impl App {
         // principal. Fazer a troca de chrome com controllers ainda vivos deixa
         // hosts WRY_WEBVIEW da segunda abertura presos ao HWND anterior e eles
         // reaparecem sobre a Home mesmo depois do drop.
+        //
+        // As abas e os grupos morrem com o comparador: gravam-se antes, para
+        // a proxima pesquisa (ou o proximo arranque) os trazer de volta.
+        let _ = self.save_tab_session();
         if let Some(comparator) = self.comparator.take() {
             for view in &comparator.views {
                 let _ = view.webview.set_visible(false);
@@ -5914,14 +5924,31 @@ impl App {
                 comparator.expanded = None;
                 comparator.minimized = [false; COMPARATOR_COLUMNS];
                 comparator.weights = [1.0; COMPARATOR_COLUMNS];
-                if let Some(split) = comparator.split.take() {
+                // A pesquisa nova nao apaga abas nem grupos: passa a ser o
+                // contexto ativo de cada coluna, e a fonte que estava aberta
+                // ao lado fica na barra, por carregar.
+                let mut active = [None; COMPARATOR_COLUMNS];
+                if let Some((column, id)) = persisted_active(comparator_split_key(comparator)) {
+                    active[column] = Some(id);
+                }
+                let ComparatorState {
+                    contexts,
+                    groups,
+                    next_context_id,
+                    next_group_id,
+                    ..
+                } = comparator;
+                start_new_search(contexts, groups, next_context_id, next_group_id, &mut active);
+                let split_stays = comparator.split.as_ref().is_some_and(|split| {
+                    !split.private
+                        && split.context_id.is_some()
+                        && active[split.source_index] == split.context_id
+                });
+                if !split_stays && let Some(split) = comparator.split.take() {
                     let _ = split.webview.set_visible(false);
                     let _ = split.webview.focus_parent();
                     drop(split);
                 }
-                comparator.contexts = std::array::from_fn(|_| Vec::new());
-                comparator.groups = std::array::from_fn(|_| Vec::new());
-                comparator.next_group_id = 1;
                 for (view, url) in comparator.views.iter().zip(urls) {
                     let encoded = match serde_json::to_string(url) {
                         Ok(encoded) => encoded,
@@ -5958,6 +5985,18 @@ impl App {
         let content_y = COMPARATOR_CHROME_HEIGHT;
         let n = 3.0;
         let col_w = logical_w / n;
+
+        // As abas e os grupos da sessao anterior voltam a barra. Nenhuma
+        // carrega agora: a pergunta e o contexto ativo de cada coluna, e cada
+        // aba restaurada so abre quando for escolhida.
+        let (mut restored, tabs_notice) = self.restore_saved_tabs();
+        start_new_search(
+            &mut restored.contexts,
+            &mut restored.groups,
+            &mut restored.next_context_id,
+            &mut restored.next_group_id,
+            &mut restored.active,
+        );
 
         let targets = [
             ("Google Gemini", google_url),
@@ -5998,13 +6037,118 @@ impl App {
             minimized: [false; COMPARATOR_COLUMNS],
             weights: [1.0; COMPARATOR_COLUMNS],
             split: None,
-            contexts: std::array::from_fn(|_| Vec::new()),
-            groups: std::array::from_fn(|_| Vec::new()),
-            next_group_id: 1,
-            next_context_id: 1,
+            contexts: restored.contexts,
+            groups: restored.groups,
+            next_group_id: restored.next_group_id,
+            next_context_id: restored.next_context_id,
             panel_width: 0.0,
         });
+        // O que esta no disco e o que acabou de ser lido: nada a regravar ate
+        // alguma aba mudar.
+        let fingerprint = self.comparator.as_ref().map(|comp| {
+            tab_session_fingerprint(&comp.contexts, &comp.groups, comparator_split_key(comp))
+        });
+        self.tab_session.seen = fingerprint;
+        self.tab_session.saved = fingerprint;
         self.activate_comparator(true);
+        if let Some(notice) = tabs_notice {
+            self.show_splash(notice, 5);
+        }
+    }
+
+    fn tab_session_path(&self) -> std::path::PathBuf {
+        tab_session::path_in(&self.config.data_dir)
+    }
+
+    /// Le o `tabs.json`. Um ficheiro estragado nao impede o comparador de
+    /// abrir: fica guardado como `tabs.json.bak` e a sessao comeca limpa.
+    fn restore_saved_tabs(&self) -> (RestoredTabs, Option<String>) {
+        let empty = TabSession::default();
+        match tab_session::load(&self.tab_session_path()) {
+            Loaded::Restored(session) => (restore_tab_session(&session), None),
+            Loaded::Missing => (restore_tab_session(&empty), None),
+            Loaded::Quarantined(error) => (
+                restore_tab_session(&empty),
+                Some(format!(
+                    "As abas da última sessão não foram restauradas ({error}). Cópia guardada em tabs.json.bak."
+                )),
+            ),
+            Loaded::Unreadable(error) => (
+                restore_tab_session(&empty),
+                Some(format!(
+                    "Não consegui ler as abas da última sessão: {error}"
+                )),
+            ),
+        }
+    }
+
+    /// Corre depois de cada lote de eventos: se as abas ou os grupos mudaram,
+    /// agenda a gravacao. Olhar aqui, e nao em cada sitio que mexe nas abas,
+    /// apanha tambem os gestos da barra que ainda vao nascer.
+    fn observe_tab_session(&mut self) {
+        let Some(comp) = &self.comparator else {
+            return;
+        };
+        let fingerprint =
+            tab_session_fingerprint(&comp.contexts, &comp.groups, comparator_split_key(comp));
+        if self.tab_session.seen == Some(fingerprint) {
+            return;
+        }
+        self.tab_session.seen = Some(fingerprint);
+        self.tab_session.token = self.tab_session.token.wrapping_add(1);
+        self.timers.after(
+            TAB_SESSION_DEBOUNCE,
+            UserEvent::SaveTabSession(self.tab_session.token),
+        );
+    }
+
+    /// Grava ja, se o disco estiver atrasado em relacao a barra. Corre no fim
+    /// do atraso, antes de o comparador ser destruido e ao sair.
+    fn save_tab_session(&mut self) -> std::io::Result<()> {
+        let Some(comp) = &self.comparator else {
+            return Ok(());
+        };
+        let split = comparator_split_key(comp);
+        let fingerprint = tab_session_fingerprint(&comp.contexts, &comp.groups, split);
+        if self.tab_session.saved == Some(fingerprint) {
+            return Ok(());
+        }
+        let session = snapshot_tab_session(&comp.contexts, &comp.groups, split);
+        match tab_session::save(&self.tab_session_path(), &session) {
+            Ok(()) => {
+                self.tab_session.saved = Some(fingerprint);
+                Ok(())
+            }
+            Err(error) => {
+                self.tab_session.saved = None;
+                debug_log(format_args!("tabs.json nao gravado: {error}"));
+                Err(error)
+            }
+        }
+    }
+
+    /// Parte de "Apagar historico": o ficheiro, a copia de um ficheiro
+    /// recusado e o modelo vivo, tudo de uma vez.
+    fn forget_tab_session(&mut self) {
+        let path = self.tab_session_path();
+        let result = match &mut self.comparator {
+            Some(comp) => forget_saved_tabs(&path, &mut comp.contexts, &mut comp.groups),
+            None => forget_saved_tabs(
+                &path,
+                &mut std::array::from_fn(|_| Vec::new()),
+                &mut std::array::from_fn(|_| Vec::new()),
+            ),
+        };
+        // Disco vazio e barra vazia: nada a gravar ate nascer uma aba nova.
+        let fingerprint = self.comparator.as_ref().map(|comp| {
+            tab_session_fingerprint(&comp.contexts, &comp.groups, comparator_split_key(comp))
+        });
+        self.tab_session.seen = fingerprint;
+        self.tab_session.saved = fingerprint;
+        self.request_redraw();
+        if let Err(error) = result {
+            self.show_splash(format!("Não consegui apagar as abas guardadas: {error}"), 4);
+        }
     }
 
     fn activate_comparator(&mut self, sync_remote_buttons: bool) {
@@ -6703,24 +6847,20 @@ impl App {
 
                 let _ = webview.zoom(self.zoom);
                 if let Some(comp) = &mut self.comparator {
-                    let context_id = if private {
-                        None
-                    } else if let Some(id) = existing_context_id {
-                        Some(id)
-                    } else {
-                        let ComparatorState {
-                            contexts,
-                            groups,
-                            next_context_id,
-                            ..
-                        } = comp;
-                        Some(remember_context_tab(
-                            &mut contexts[source_index],
-                            &mut groups[source_index],
-                            next_context_id,
-                            valid.to_string(),
-                        ))
-                    };
+                    let ComparatorState {
+                        contexts,
+                        groups,
+                        next_context_id,
+                        ..
+                    } = comp;
+                    let context_id = record_split_context(
+                        &mut contexts[source_index],
+                        &mut groups[source_index],
+                        next_context_id,
+                        valid.to_string(),
+                        private,
+                        existing_context_id,
+                    );
                     comp.split = Some(SplitView {
                         webview,
                         source_index,
@@ -9691,6 +9831,672 @@ fn context_tab_click_is_noop(
     active == Some((source_index, Some(context_id)))
 }
 
+// ---------------------------------------------------------------------------
+// Abas e grupos entre sessoes (`<data_dir>/tabs.json`). O formato, a leitura
+// tolerante e a escrita atomica vivem em `tab_session.rs`, portatil; aqui fica
+// so a ponte com o modelo da barra.
+
+const _: () = assert!(COMPARATOR_COLUMNS == tab_session::COLUMNS);
+
+/// Quanto se espera, depois da ultima mudanca nas abas, para gravar.
+const TAB_SESSION_DEBOUNCE: Duration = Duration::from_millis(1500);
+
+impl GroupColor {
+    /// Chave estavel no ficheiro. O nome da variante nao serve: renomear uma
+    /// cor no codigo nao pode apagar a cor dos grupos ja guardados.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Blue => "blue",
+            Self::Green => "green",
+            Self::Amber => "amber",
+            Self::Pink => "pink",
+            Self::Purple => "purple",
+            Self::Slate => "slate",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|color| color.key() == key)
+    }
+}
+
+/// O que a gravacao das abas ja viu e o que ja esta no disco.
+#[derive(Debug, Default)]
+struct TabSessionSync {
+    /// Sobe a cada mudanca: so o ultimo `SaveTabSession` agendado grava.
+    token: u64,
+    /// Impressao digital do modelo da ultima vez que se olhou para ele.
+    seen: Option<u64>,
+    /// Impressao digital do que esta no disco.
+    saved: Option<u64>,
+}
+
+/// A aba aberta ao lado, tal como a gravacao a ve: (coluna, aba). `split` e
+/// `(coluna, aba, privado)`. Uma fonte privada nunca conta -- e nem tem aba na
+/// lista, ver `record_split_context`.
+fn persisted_active(split: Option<(usize, Option<u64>, bool)>) -> Option<(usize, u64)> {
+    let (column, context_id, private) = split?;
+    if private {
+        return None;
+    }
+    context_id.map(|id| (column, id))
+}
+
+fn comparator_split_key(comp: &ComparatorState) -> Option<(usize, Option<u64>, bool)> {
+    comp.split
+        .as_ref()
+        .map(|split| (split.source_index, split.context_id, split.private))
+}
+
+/// Que aba de contexto uma fonte aberta ao lado passa a ser. Uma fonte
+/// privada nao entra na lista -- e por isso nunca chega ao `tabs.json`, nem
+/// ao ecra da proxima sessao; reabrir uma aba ja gravada reutiliza a sua
+/// identidade.
+fn record_split_context(
+    contexts: &mut Vec<ContextTab>,
+    groups: &mut Vec<ContextGroup>,
+    next_context_id: &mut u64,
+    url: String,
+    private: bool,
+    existing_context_id: Option<u64>,
+) -> Option<u64> {
+    if private {
+        None
+    } else if let Some(id) = existing_context_id {
+        Some(id)
+    } else {
+        Some(remember_context_tab(contexts, groups, next_context_id, url))
+    }
+}
+
+/// O modelo da barra como vai para o disco. So abas da lista -- onde uma
+/// fonte privada nunca entra -- e a aba aberta ao lado so quando nao e
+/// privada.
+fn snapshot_tab_session(
+    contexts: &[Vec<ContextTab>; COMPARATOR_COLUMNS],
+    groups: &[Vec<ContextGroup>; COMPARATOR_COLUMNS],
+    split: Option<(usize, Option<u64>, bool)>,
+) -> TabSession {
+    let active = persisted_active(split);
+    TabSession {
+        columns: std::array::from_fn(|index| SessionColumn {
+            tabs: contexts[index]
+                .iter()
+                .map(|tab| SessionTab {
+                    id: tab.id,
+                    url: tab.url.clone(),
+                    title: context_tab_label(&tab.url),
+                    group: tab.group,
+                })
+                .collect(),
+            groups: groups[index]
+                .iter()
+                .map(|group| SessionGroup {
+                    id: group.id,
+                    name: group.name.clone(),
+                    color: group.color.key().to_string(),
+                    collapsed: group.collapsed,
+                })
+                .collect(),
+            active: active
+                .filter(|(column, _)| *column == index)
+                .and_then(|(_, id)| contexts[index].iter().position(|tab| tab.id == id)),
+        }),
+    }
+}
+
+/// Impressao digital de tudo o que `snapshot_tab_session` grava. Barata o
+/// bastante para correr depois de cada lote de eventos.
+fn tab_session_fingerprint(
+    contexts: &[Vec<ContextTab>; COMPARATOR_COLUMNS],
+    groups: &[Vec<ContextGroup>; COMPARATOR_COLUMNS],
+    split: Option<(usize, Option<u64>, bool)>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    for (tabs, column_groups) in contexts.iter().zip(groups) {
+        tabs.len().hash(&mut hasher);
+        for tab in tabs {
+            tab.id.hash(&mut hasher);
+            tab.url.hash(&mut hasher);
+            tab.group.hash(&mut hasher);
+        }
+        column_groups.len().hash(&mut hasher);
+        for group in column_groups {
+            group.id.hash(&mut hasher);
+            group.name.hash(&mut hasher);
+            group.color.key().hash(&mut hasher);
+            group.collapsed.hash(&mut hasher);
+        }
+    }
+    persisted_active(split).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// O modelo da barra reconstruido a partir do ficheiro.
+struct RestoredTabs {
+    contexts: [Vec<ContextTab>; COMPARATOR_COLUMNS],
+    groups: [Vec<ContextGroup>; COMPARATOR_COLUMNS],
+    next_context_id: u64,
+    next_group_id: u64,
+    /// A aba que estava aberta ao lado em cada coluna: a unica que teria de
+    /// carregar. As outras voltam so como entradas na barra e carregam quando
+    /// forem escolhidas.
+    active: [Option<u64>; COMPARATOR_COLUMNS],
+}
+
+/// As identidades sao renumeradas: o ficheiro nao escolhe ids da sessao viva
+/// (um id perto de `u64::MAX` dava a volta ao contador e colidia). Os membros
+/// de um grupo voltam juntos, a seguir ao primeiro -- a invariante que
+/// `join_context_group` mantem na sessao viva.
+fn restore_tab_session(session: &TabSession) -> RestoredTabs {
+    let session = tab_session::sanitize(session);
+    let mut restored = RestoredTabs {
+        contexts: std::array::from_fn(|_| Vec::new()),
+        groups: std::array::from_fn(|_| Vec::new()),
+        next_context_id: 1,
+        next_group_id: 1,
+        active: [None; COMPARATOR_COLUMNS],
+    };
+    for (index, column) in session.columns.iter().enumerate() {
+        let mut group_ids: Vec<(u64, u64)> = Vec::new();
+        let mut used: Vec<GroupColor> = Vec::new();
+        for group in &column.groups {
+            let id = restored.next_group_id;
+            restored.next_group_id += 1;
+            group_ids.push((group.id, id));
+            let color =
+                GroupColor::from_key(&group.color).unwrap_or_else(|| GroupColor::next(&used));
+            used.push(color);
+            restored.groups[index].push(ContextGroup {
+                id,
+                name: group.name.clone(),
+                color,
+                collapsed: group.collapsed,
+            });
+        }
+
+        let mut tabs: Vec<ContextTab> = Vec::with_capacity(column.tabs.len());
+        for (position, tab) in column.tabs.iter().enumerate() {
+            let id = restored.next_context_id;
+            restored.next_context_id += 1;
+            let group = tab.group.and_then(|old| {
+                group_ids
+                    .iter()
+                    .find(|(from, _)| *from == old)
+                    .map(|(_, to)| *to)
+            });
+            if column.active == Some(position) {
+                restored.active[index] = Some(id);
+            }
+            tabs.push(ContextTab {
+                id,
+                url: tab.url.clone(),
+                group,
+            });
+        }
+        // Membros de um grupo seguidos, a partir do primeiro, pela ordem em
+        // que aparecem.
+        let mut ordered: Vec<ContextTab> = Vec::with_capacity(tabs.len());
+        let mut placed = vec![false; tabs.len()];
+        for (slot, tab) in tabs.iter().enumerate() {
+            if placed[slot] {
+                continue;
+            }
+            placed[slot] = true;
+            ordered.push(tab.clone());
+            if tab.group.is_none() {
+                continue;
+            }
+            for (later, other) in tabs.iter().enumerate().skip(slot + 1) {
+                if !placed[later] && other.group == tab.group {
+                    placed[later] = true;
+                    ordered.push(other.clone());
+                }
+            }
+        }
+        restored.contexts[index] = ordered;
+        prune_empty_groups(&restored.contexts[index], &mut restored.groups[index]);
+    }
+    restored
+}
+
+/// Uma pesquisa nova no comparador. Como a omnibox do Chrome: a pergunta
+/// substitui a pagina da propria IA -- a aba inicial de cada coluna -- e passa
+/// a ser o contexto ativo; as abas de contexto e os grupos ficam como
+/// estavam, e a que estava aberta ao lado fica na barra, por carregar, ate ser
+/// escolhida. Os contadores nunca recuam: um grupo novo nao pode herdar o id
+/// de um grupo que sobreviveu, senao as abas dos dois fundiam-se.
+fn start_new_search(
+    contexts: &mut [Vec<ContextTab>; COMPARATOR_COLUMNS],
+    groups: &mut [Vec<ContextGroup>; COMPARATOR_COLUMNS],
+    next_context_id: &mut u64,
+    next_group_id: &mut u64,
+    active: &mut [Option<u64>; COMPARATOR_COLUMNS],
+) {
+    for (tabs, column_groups) in contexts.iter_mut().zip(groups.iter_mut()) {
+        if tabs.len() > tab_session::MAX_TABS_PER_COLUMN {
+            let excess = tabs.len() - tab_session::MAX_TABS_PER_COLUMN;
+            tabs.drain(..excess);
+        }
+        prune_empty_groups(tabs, column_groups);
+    }
+    let last_tab = contexts.iter().flatten().map(|tab| tab.id).max();
+    let last_group = groups.iter().flatten().map(|group| group.id).max();
+    *next_context_id = (*next_context_id).max(last_tab.map_or(1, |id| id.saturating_add(1)));
+    *next_group_id = (*next_group_id).max(last_group.map_or(1, |id| id.saturating_add(1)));
+    *active = [None; COMPARATOR_COLUMNS];
+}
+
+/// "Apagar historico" apaga tambem as abas guardadas. O modelo vivo esvazia
+/// antes: senao a gravacao seguinte -- ou o fecho do comparador -- escrevia
+/// de volta o que se acabou de apagar.
+fn forget_saved_tabs(
+    path: &std::path::Path,
+    contexts: &mut [Vec<ContextTab>; COMPARATOR_COLUMNS],
+    groups: &mut [Vec<ContextGroup>; COMPARATOR_COLUMNS],
+) -> std::io::Result<()> {
+    contexts.iter_mut().for_each(Vec::clear);
+    groups.iter_mut().for_each(Vec::clear);
+    tab_session::clear(path)
+}
+
+/// Gates da persistencia de abas sobre as funcoes que o comparador chama:
+/// `record_split_context` (open_split_mode), `start_new_search`
+/// (open_comparator), `snapshot_tab_session`/`restore_tab_session` (gravacao
+/// e arranque) e `forget_saved_tabs` ("Apagar historico").
+#[cfg(test)]
+mod tab_session_gates {
+    use super::*;
+    use std::path::PathBuf;
+
+    type Columns<T> = [Vec<T>; COMPARATOR_COLUMNS];
+
+    fn empty<T>() -> Columns<T> {
+        std::array::from_fn(|_| Vec::new())
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "neuralia-tab-gates-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn open(
+        contexts: &mut Columns<ContextTab>,
+        groups: &mut Columns<ContextGroup>,
+        next_context_id: &mut u64,
+        column: usize,
+        url: &str,
+    ) -> u64 {
+        record_split_context(
+            &mut contexts[column],
+            &mut groups[column],
+            next_context_id,
+            url.to_string(),
+            false,
+            None,
+        )
+        .expect("a public source becomes a tab")
+    }
+
+    /// O que a barra mostra, sem as identidades (que o restauro renumera):
+    /// por coluna, cada aba com o nome, a cor e o estado do seu grupo.
+    fn visible(
+        contexts: &Columns<ContextTab>,
+        groups: &Columns<ContextGroup>,
+    ) -> Vec<Vec<(String, Option<(String, &'static str, bool)>)>> {
+        contexts
+            .iter()
+            .zip(groups)
+            .map(|(tabs, column_groups)| {
+                tabs.iter()
+                    .map(|tab| {
+                        let group = tab.group.map(|id| {
+                            let group = column_groups
+                                .iter()
+                                .find(|group| group.id == id)
+                                .expect("a grouped tab without its group");
+                            (group.name.clone(), group.color.key(), group.collapsed)
+                        });
+                        (tab.url.clone(), group)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Tres colunas como o utilizador as deixa: grupos com cor escolhida, um
+    /// fechado, abas soltas e uma aba aberta ao lado.
+    fn a_working_session() -> (Columns<ContextTab>, Columns<ContextGroup>, u64, u64, u64) {
+        let mut contexts = empty();
+        let mut groups = empty();
+        let mut next_context_id = 1;
+        let mut next_group_id = 1;
+        let a = open(&mut contexts, &mut groups, &mut next_context_id, 0, "https://a.example/");
+        let b = open(&mut contexts, &mut groups, &mut next_context_id, 0, "https://b.example/x");
+        let _ = open(&mut contexts, &mut groups, &mut next_context_id, 0, "https://c.example/");
+        let first = regroup_context_tab(&mut contexts[0], &mut groups[0], &mut next_group_id, 0)
+            .expect("group");
+        groups[0][first].color = GroupColor::Pink;
+        groups[0][first].name = "Leitura".into();
+        let first_id = groups[0][first].id;
+        join_context_group(&mut contexts[0], first_id, 2);
+        let _ = open(&mut contexts, &mut groups, &mut next_context_id, 2, "https://d.example/");
+        let _ = open(&mut contexts, &mut groups, &mut next_context_id, 2, "https://e.example/");
+        let second = regroup_context_tab(&mut contexts[2], &mut groups[2], &mut next_group_id, 1)
+            .expect("group");
+        groups[2][second].collapsed = true;
+        assert_eq!(contexts[0][0].id, a);
+        (contexts, groups, next_context_id, next_group_id, b)
+    }
+
+    #[test]
+    fn a_new_search_keeps_tabs_and_groups_and_never_reuses_their_ids() {
+        let (mut contexts, mut groups, mut next_context_id, mut next_group_id, open_tab) =
+            a_working_session();
+        let before = visible(&contexts, &groups);
+        let mut active = [Some(open_tab), None, None];
+
+        start_new_search(
+            &mut contexts,
+            &mut groups,
+            &mut next_context_id,
+            &mut next_group_id,
+            &mut active,
+        );
+        assert_eq!(visible(&contexts, &groups), before, "a new search lost tabs or groups");
+        assert_eq!(
+            active, [None; COMPARATOR_COLUMNS],
+            "the query must become the active context of every column"
+        );
+
+        // Um grupo e uma aba criados depois da pesquisa nunca herdam a
+        // identidade de quem sobreviveu -- senao as abas dos dois grupos
+        // fundiam-se na barra.
+        let _ = open(&mut contexts, &mut groups, &mut next_context_id, 1, "https://f.example/");
+        let fresh = regroup_context_tab(&mut contexts[1], &mut groups[1], &mut next_group_id, 0)
+            .expect("group");
+        let fresh_id = groups[1][fresh].id;
+        let survivors = groups[0].iter().chain(&groups[2]);
+        assert!(
+            survivors.clone().all(|group| group.id != fresh_id),
+            "new group {fresh_id} reuses the id of a surviving group"
+        );
+        let mut ids: Vec<u64> = contexts.iter().flatten().map(|tab| tab.id).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "a new tab reused a surviving tab id");
+
+        // Contadores atrasados (um estado vindo de outro sitio) sao
+        // corrigidos pela propria pesquisa.
+        let mut stale_context = 1;
+        let mut stale_group = 1;
+        start_new_search(
+            &mut contexts,
+            &mut groups,
+            &mut stale_context,
+            &mut stale_group,
+            &mut active,
+        );
+        assert!(contexts.iter().flatten().all(|tab| tab.id < stale_context));
+        assert!(groups.iter().flatten().all(|group| group.id < stale_group));
+    }
+
+    #[test]
+    fn a_private_split_never_reaches_the_tab_session_file() {
+        let dir = temp_dir("private");
+        let path = tab_session::path_in(&dir);
+        let mut contexts = empty();
+        let mut groups = empty();
+        let mut next_context_id = 1;
+        let public = open(
+            &mut contexts,
+            &mut groups,
+            &mut next_context_id,
+            1,
+            "https://public.example/page",
+        );
+        let private = record_split_context(
+            &mut contexts[1],
+            &mut groups[1],
+            &mut next_context_id,
+            "https://secret.example/private".to_string(),
+            true,
+            None,
+        );
+        assert_eq!(private, None, "a private source became a tab");
+
+        // O painel privado e o que esta aberto ao lado da coluna 1.
+        let session = snapshot_tab_session(&contexts, &groups, Some((1, private, true)));
+        tab_session::save(&path, &session).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("public.example"));
+        assert!(
+            !text.contains("secret.example"),
+            "a private source was written to tabs.json:\n{text}"
+        );
+        assert_eq!(session.columns[1].active, None);
+
+        // Nem uma fonte privada que traga a identidade de uma aba e marcada
+        // como a aba aberta.
+        let session = snapshot_tab_session(&contexts, &groups, Some((1, Some(public), true)));
+        assert_eq!(session.columns[1].active, None, "a private split was saved as active");
+        let session = snapshot_tab_session(&contexts, &groups, Some((1, Some(public), false)));
+        assert_eq!(session.columns[1].active, Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_marks_only_the_saved_active_tab_and_a_search_keeps_every_tab_lazy() {
+        let dir = temp_dir("restore");
+        let path = tab_session::path_in(&dir);
+        let (contexts, groups, _, _, open_tab) = a_working_session();
+        let open_position = contexts[0]
+            .iter()
+            .position(|tab| tab.id == open_tab)
+            .expect("open tab");
+        assert_ne!(open_position + 1, contexts[0].len(), "the test needs a non-last tab");
+
+        tab_session::save(
+            &path,
+            &snapshot_tab_session(&contexts, &groups, Some((0, Some(open_tab), false))),
+        )
+        .expect("save");
+        let Loaded::Restored(session) = tab_session::load(&path) else {
+            panic!("the saved session did not load back");
+        };
+        let mut restored = restore_tab_session(&session);
+
+        assert_eq!(
+            visible(&restored.contexts, &restored.groups),
+            visible(&contexts, &groups),
+            "tabs, group membership, names, colours or collapsed state changed on disk"
+        );
+        // So a aba que estava aberta fica marcada; nenhuma outra coluna
+        // carrega nada.
+        assert_eq!(
+            restored.active,
+            [Some(restored.contexts[0][open_position].id), None, None]
+        );
+        let mut ids: Vec<u64> = restored.contexts.iter().flatten().map(|tab| tab.id).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "restored tab ids collide");
+        assert!(ids.iter().all(|id| *id < restored.next_context_id));
+        assert!(
+            restored
+                .groups
+                .iter()
+                .flatten()
+                .all(|group| group.id < restored.next_group_id)
+        );
+
+        // O comparador so restaura ao abrir uma pesquisa: a pergunta passa a
+        // ser o contexto ativo e nenhuma aba restaurada carrega ate ser
+        // escolhida. As abas continuam todas na barra.
+        start_new_search(
+            &mut restored.contexts,
+            &mut restored.groups,
+            &mut restored.next_context_id,
+            &mut restored.next_group_id,
+            &mut restored.active,
+        );
+        assert_eq!(restored.active, [None; COMPARATOR_COLUMNS]);
+        assert_eq!(
+            visible(&restored.contexts, &restored.groups),
+            visible(&contexts, &groups)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restored_group_comes_back_together_with_its_colour() {
+        for color in GroupColor::ALL {
+            assert_eq!(GroupColor::from_key(color.key()), Some(color));
+        }
+        let session = TabSession {
+            columns: [
+                SessionColumn {
+                    tabs: vec![
+                        SessionTab {
+                            id: 1,
+                            url: "https://a.example/".into(),
+                            title: String::new(),
+                            group: Some(9),
+                        },
+                        SessionTab {
+                            id: 2,
+                            url: "https://solta.example/".into(),
+                            title: String::new(),
+                            group: None,
+                        },
+                        SessionTab {
+                            id: 3,
+                            url: "https://c.example/".into(),
+                            title: String::new(),
+                            group: Some(9),
+                        },
+                    ],
+                    groups: vec![SessionGroup {
+                        id: 9,
+                        name: "Fontes".into(),
+                        color: "cor-de-uma-versao-futura".into(),
+                        collapsed: false,
+                    }],
+                    active: Some(2),
+                },
+                SessionColumn::default(),
+                SessionColumn::default(),
+            ],
+        };
+        let restored = restore_tab_session(&session);
+        let urls: Vec<&str> = restored.contexts[0]
+            .iter()
+            .map(|tab| tab.url.as_str())
+            .collect();
+        // Os membros de um grupo ficam seguidos, senao a pilula rotulava a
+        // aba solta que ficou no meio.
+        assert_eq!(
+            urls,
+            vec![
+                "https://a.example/",
+                "https://c.example/",
+                "https://solta.example/"
+            ]
+        );
+        assert_eq!(restored.groups[0].len(), 1);
+        assert_eq!(restored.groups[0][0].color, GroupColor::Blue);
+        // A ativa segue a aba, nao a posicao.
+        assert_eq!(restored.active[0], Some(restored.contexts[0][1].id));
+    }
+
+    #[test]
+    fn the_tab_fingerprint_sees_every_change_the_file_records() {
+        let (contexts, groups, _, _, open_tab) = a_working_session();
+        let split = Some((0, Some(open_tab), false));
+        let base = tab_session_fingerprint(&contexts, &groups, split);
+        assert_eq!(base, tab_session_fingerprint(&contexts, &groups, split));
+
+        let mut changes: Vec<(&str, u64)> = Vec::new();
+        let mut recolored = groups.clone();
+        recolored[0][0].color = GroupColor::Green;
+        changes.push((
+            "colour",
+            tab_session_fingerprint(&contexts, &recolored, split),
+        ));
+        let mut collapsed = groups.clone();
+        collapsed[0][0].collapsed = !collapsed[0][0].collapsed;
+        changes.push((
+            "collapsed",
+            tab_session_fingerprint(&contexts, &collapsed, split),
+        ));
+        let mut renamed = groups.clone();
+        renamed[0][0].name.push('!');
+        changes.push(("name", tab_session_fingerprint(&contexts, &renamed, split)));
+        let mut moved = contexts.clone();
+        moved[0].swap(0, 1);
+        changes.push(("order", tab_session_fingerprint(&moved, &groups, split)));
+        let mut ungrouped = contexts.clone();
+        ungrouped[0][0].group = None;
+        changes.push((
+            "membership",
+            tab_session_fingerprint(&ungrouped, &groups, split),
+        ));
+        let mut closed = contexts.clone();
+        closed[2].pop();
+        changes.push(("closed", tab_session_fingerprint(&closed, &groups, split)));
+        changes.push(("active", tab_session_fingerprint(&contexts, &groups, None)));
+        for (label, fingerprint) in changes {
+            assert_ne!(fingerprint, base, "{label} would never be saved before exit");
+        }
+        // Um painel privado aberto nao e uma mudanca a gravar.
+        assert_eq!(
+            tab_session_fingerprint(&contexts, &groups, Some((0, None, true))),
+            tab_session_fingerprint(&contexts, &groups, None)
+        );
+    }
+
+    #[test]
+    fn clearing_history_also_forgets_the_saved_tabs() {
+        let dir = temp_dir("clear");
+        let path = tab_session::path_in(&dir);
+        let (mut contexts, mut groups, _, _, open_tab) = a_working_session();
+        tab_session::save(
+            &path,
+            &snapshot_tab_session(&contexts, &groups, Some((0, Some(open_tab), false))),
+        )
+        .expect("save");
+        std::fs::write(tab_session::backup_path(&path), b"old bad file").expect("bak");
+        assert!(path.exists());
+
+        forget_saved_tabs(&path, &mut contexts, &mut groups).expect("forget");
+        assert!(!path.exists(), "tabs.json survived \"Apagar histórico\"");
+        assert!(
+            !tab_session::backup_path(&path).exists(),
+            "tabs.json.bak survived \"Apagar histórico\""
+        );
+        assert!(
+            contexts.iter().all(Vec::is_empty) && groups.iter().all(Vec::is_empty),
+            "the live tabs survived and would be written back"
+        );
+
+        // O fecho do comparador a seguir grava o que ficou -- nada -- e nao
+        // recria o ficheiro.
+        tab_session::save(&path, &snapshot_tab_session(&contexts, &groups, None)).expect("save");
+        assert_eq!(tab_session::load(&path), Loaded::Missing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 fn split_source_memory(
     url: &Url,
     source_name: &str,
@@ -10131,11 +10937,25 @@ impl ApplicationHandler<UserEvent> for App {
             // Sem prazo nenhum: o laco dorme ate chegar um evento de verdade.
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }
+
+        self.observe_tab_session();
+    }
+
+    /// Fechar a janela com o comparador aberto: as abas ficam gravadas.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        let _ = self.save_tab_session();
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::ExitRequested => event_loop.exit(),
+            UserEvent::SaveTabSession(token) => {
+                if token == self.tab_session.token
+                    && let Err(error) = self.save_tab_session()
+                {
+                    self.show_splash(format!("As abas não foram gravadas: {error}"), 4);
+                }
+            }
             UserEvent::HomeRequested => self.show_home(),
             UserEvent::BackRequested => self.go_back(),
             UserEvent::ToggleAutoScroll => self.toggle_auto_scroll(),
@@ -10180,6 +11000,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if !self.confirm_clear_history() {
                     return;
                 }
+                self.forget_tab_session();
                 self.memory.clear(&mut self.current_research);
                 match self.history.clear() {
                     None => {
@@ -15818,8 +16639,10 @@ __fire('submit', at(login));
             .and_then(|part| part.split("fn open_private_panel").next())
             .expect("split body");
         assert!(split.contains("split_source_memory(&valid, source_name, private)"));
-        assert!(split.contains("let context_id = if private"));
-        assert!(split.contains("remember_context_tab("));
+        // Se a aba entra na lista (e no tabs.json) decide-o
+        // `record_split_context`, que tem gate de comportamento proprio em
+        // `a_private_split_never_reaches_the_tab_session_file`.
+        assert!(split.contains("record_split_context("));
         assert!(!split.contains("self.record("));
         let private_split = source
             .split("UserEvent::OpenPrivateSplit { source_index, url } =>")

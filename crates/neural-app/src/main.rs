@@ -12,6 +12,10 @@
 mod ipc;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod pdf_assets;
+// Abas e grupos guardados entre sessoes: JSON e ficheiros, portatil e testado
+// tambem no runner Linux. So o Windows o chama.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod tab_session;
 #[cfg(target_os = "windows")]
 mod windows_app;
 
