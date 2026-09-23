@@ -17447,8 +17447,22 @@ class CSSStyleDeclaration {
 var __pageCss = new Map();
 const __computedDefaults = {
   opacity: '1', visibility: 'visible', display: 'block', transform: 'none',
-  filter: 'none', 'clip-path': 'none', 'mix-blend-mode': 'normal'
+  filter: 'none', 'clip-path': 'none', 'mix-blend-mode': 'normal',
+  'mask-image': 'none', 'content-visibility': 'visible'
 };
+// Medidas com os acessores no prototipo, como no navegador.
+class DOMRectReadOnly {
+  constructor(r) { this.__r = r; }
+  get x() { return this.__r.left; }
+  get y() { return this.__r.top; }
+  get top() { return this.__r.top; }
+  get left() { return this.__r.left; }
+  get right() { return this.__r.right; }
+  get bottom() { return this.__r.bottom; }
+  get width() { return this.__r.width; }
+  get height() { return this.__r.height; }
+}
+function __rect(r) { return new DOMRectReadOnly(r); }
 var getComputedStyle = function (el) {
   const out = new CSSStyleDeclaration();
   const sheet = __pageCss.get(el) || {};
@@ -17517,6 +17531,19 @@ Object.defineProperty(Node.prototype, 'textContent', {
   set(value) { this.__text = __S(value); }
 });
 const __textOf = Object.getOwnPropertyDescriptor(Node.prototype, 'textContent').get;
+// O pai e a raiz tambem sao acessores de prototipo (o setter do pai so
+// existe para o mock montar a arvore).
+Object.defineProperty(Node.prototype, 'parentNode', {
+  configurable: true,
+  get() { return this.__parent || null; },
+  set(value) { this.__parent = value; }
+});
+const __html = document.documentElement;
+delete document.documentElement;
+Object.defineProperty(Document.prototype, 'documentElement', {
+  configurable: true,
+  get() { return __html; }
+});
 Node.prototype.appendChild = function (child) {
   const old = child.parentNode;
   if (old && old.childNodes) {
@@ -17589,7 +17616,7 @@ Element.prototype.getBoundingClientRect = function () {
   const on = this.style.display !== 'none';
   const w = on ? 300 : 0, h = on ? 42 : 0;
   const top = parseFloat(this.style.top) || 0, left = parseFloat(this.style.left) || 0;
-  return { x: left, y: top, top: top, left: left, right: left + w, bottom: top + h, width: w, height: h };
+  return __rect({ top: top, left: left, right: left + w, bottom: top + h, width: w, height: h });
 };
 const __makeElement = Document.prototype.createElement;
 Document.prototype.createElement = function (tag) {
@@ -17611,13 +17638,13 @@ window.innerHeight = 700;
 
 var __sel = { text: '', anchor: null, focus: null, common: null, rects: [], collapsed: true };
 class Range {
-  getClientRects() { return __sel.rects.slice(); }
+  getClientRects() { return __sel.rects.map(__rect); }
   getBoundingClientRect() {
     const r = __sel.rects;
-    if (!r.length) return { top: 0, bottom: 0, left: 0, right: 0, width: 0, height: 0 };
+    if (!r.length) return __rect({ top: 0, bottom: 0, left: 0, right: 0, width: 0, height: 0 });
     const top = Math.min(...r.map((x) => x.top)), bottom = Math.max(...r.map((x) => x.bottom));
     const left = Math.min(...r.map((x) => x.left)), right = Math.max(...r.map((x) => x.right));
-    return { top, bottom, left, right, width: right - left, height: bottom - top };
+    return __rect({ top, bottom, left, right, width: right - left, height: bottom - top });
   }
   get commonAncestorContainer() { return __sel.common; }
 }
@@ -18470,6 +18497,33 @@ __state('descoberta');
                 "pagina-transformada",
                 "__pageCss.set(document.documentElement, { transform: 'scale(2)' });",
             ),
+            (
+                "mascarada",
+                "__root().host.style.setProperty('mask-image', 'linear-gradient(transparent, transparent)', 'important');",
+            ),
+            (
+                "conteudo-oculto",
+                "__root().host.style.setProperty('content-visibility', 'hidden', 'important');",
+            ),
+            // Move a barra e mente nos getters de DOMRectReadOnly: "continua
+            // onde foi posta".
+            (
+                "caixa-mentirosa",
+                "const __h = __root().host, __t = parseFloat(__h.style.top), __l = parseFloat(__h.style.left);
+__h.style.setProperty('top', '400px', 'important');
+__h.style.setProperty('left', '600px', 'important');
+Object.defineProperty(DOMRectReadOnly.prototype, 'top', { configurable: true, get() { return __t; } });
+Object.defineProperty(DOMRectReadOnly.prototype, 'left', { configurable: true, get() { return __l; } });",
+            ),
+            // Leva o host para dentro de um veu quase transparente (a
+            // opacidade do pai nao aparece no estilo calculado do host).
+            (
+                "reparentada",
+                "const __veil = document.createElement('div');
+__pageCss.set(__veil, { opacity: '0.01' });
+document.documentElement.appendChild(__veil);
+__veil.appendChild(__root().host);",
+            ),
         ];
         let tamper_steps: Vec<String> = tampers
             .iter()
@@ -19084,7 +19138,12 @@ __state('duplo-clique-no-vazio');
             .nth(1)
             .and_then(|part| part.lines().next())
             .expect("SearchSelection arm");
-        assert!(!arm.contains("handle_input") && !arm.contains("SubmitText"));
+        // O evento chega ao handler acima, e so a ele.
+        assert_eq!(
+            arm.trim(),
+            "self.search_selection(&text),",
+            "o SearchSelection nao chega ao search_selection"
+        );
     }
 
     #[test]
@@ -21564,6 +21623,19 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     const closestOf = uncurry(Element.prototype.closest);
     const shadowOf = uncurry(Element.prototype.attachShadow);
     const boxOf = uncurry(Element.prototype.getBoundingClientRect);
+    // Onde a barra esta: a raiz do documento e o pai do host. A pagina que
+    // muda de sitio o host (esta na arvore dela) ou mente sobre a raiz nao
+    // o esconde do teste do clique.
+    const rootOf = getterOf(Document.prototype, 'documentElement');
+    const parentOf = getterOf(Node.prototype, 'parentNode');
+    // As medidas tambem: um getter de DOMRectReadOnly da pagina dizia que a
+    // barra continuava onde foi posta depois de ela a mover.
+    const rectTop = getterOf(DOMRectReadOnly.prototype, 'top');
+    const rectLeft = getterOf(DOMRectReadOnly.prototype, 'left');
+    const rectRight = getterOf(DOMRectReadOnly.prototype, 'right');
+    const rectBottom = getterOf(DOMRectReadOnly.prototype, 'bottom');
+    const rectWidth = getterOf(DOMRectReadOnly.prototype, 'width');
+    const rectHeight = getterOf(DOMRectReadOnly.prototype, 'height');
     // Os eventos tambem: a pagina que redefine um acessor de Event recebia o
     // evento de um botao da barra como `this`, com os nos de dentro no
     // composedPath; e um `detail` falso fazia de um clique um gesto.
@@ -21776,7 +21848,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
 
     // A area visivel, sem as barras de rolagem.
     function viewport() {
-      const root = document.documentElement;
+      const root = rootOf(document);
       let width = window.innerWidth || 0;
       let height = window.innerHeight || 0;
       if (root && root.clientWidth > 0 && root.clientWidth < width) width = root.clientWidth;
@@ -21784,13 +21856,22 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       return { width: width, height: height };
     }
 
+    // Um DOMRect lido pelos getters capturados, num objeto so nosso.
+    function edges(r) {
+      if (!r) return null;
+      return {
+        top: rectTop(r), left: rectLeft(r), right: rectRight(r), bottom: rectBottom(r),
+        width: rectWidth(r), height: rectHeight(r)
+      };
+    }
+
     function endRect(range) {
       const rects = rangeRects(range);
       for (let i = rects.length - 1; i >= 0; i--) {
-        const r = rects[i];
+        const r = edges(rects[i]);
         if (r && (r.width > 0 || r.height > 0)) return r;
       }
-      const whole = rangeBox(range);
+      const whole = edges(rangeBox(range));
       return whole && (whole.width > 0 || whole.height > 0) ? whole : null;
     }
 
@@ -21820,7 +21901,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       if (rect.bottom < 0 || rect.top > view.height || rect.right < 0 || rect.left > view.width) {
         return null;
       }
-      const whole = rangeBox(range);
+      const whole = edges(rangeBox(range));
       const top = whole && whole.height > 0 && whole.top < rect.top ? whole.top : rect.top;
       return { text: raw, rect: rect, top: top };
     }
@@ -21938,7 +22019,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     // senao por baixo da ultima linha; sempre dentro da area visivel.
     function place(snap) {
       const view = viewport();
-      const box = boxOf(host);
+      const box = edges(boxOf(host));
       const w = box && box.width > 0 ? box.width : 320;
       const h = box && box.height > 0 ? box.height : 44;
       let top = snap.top - h - MARGIN;
@@ -21957,7 +22038,13 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     }
 
     function show(snap) {
-      if (!connected(host)) appendTo(document.documentElement, host);
+      const root = rootOf(document);
+      // Filho direto da raiz; se a pagina o levou para outro sitio, volta, e
+      // o tempo a vista conta de novo.
+      if (!connected(host) || parentOf(host) !== root) {
+        appendTo(root, host);
+        placed = null;
+      }
       if (!visible) placed = null;
       text = snap.text;
       shownAt = snap;
@@ -22029,25 +22116,37 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       return busy;
     }
 
+    // Uma propriedade que o motor pode nao conhecer: so conta se tiver valor.
+    function unset(style, name, initial) {
+      const value = readStyle(style, name);
+      return !value || value === initial;
+    }
+
     function untouched(el, own) {
-      if (!el) return true;
+      if (!el) return false;
       const style = computed(window, el);
       if (readStyle(style, 'opacity') !== '1' || readStyle(style, 'filter') !== 'none'
           || readStyle(style, 'transform') !== 'none') return false;
       return !own || (readStyle(style, 'visibility') === 'visible'
         && readStyle(style, 'clip-path') === 'none'
-        && readStyle(style, 'mix-blend-mode') === 'normal');
+        && readStyle(style, 'mix-blend-mode') === 'normal'
+        && unset(style, 'mask-image', 'none')
+        && unset(style, '-webkit-mask-image', 'none')
+        && unset(style, 'content-visibility', 'visible'));
     }
 
     // Pronta para um clique em Pesquisar: '' se sim; 'cedo' se ainda nao
-    // esta a vista ha ARM_MS; 'alterada' se a pagina a tapou, moveu ou lhe
-    // mexeu no estilo (a propria ou a raiz do documento).
+    // esta a vista ha ARM_MS; 'alterada' se a pagina a tapou, moveu, mudou
+    // de sitio na arvore ou lhe mexeu no estilo (a propria ou a raiz do
+    // documento).
     function readiness() {
       if (!visible || !placed) return 'alterada';
-      const box = boxOf(host);
+      const root = rootOf(document);
+      if (!connected(host) || parentOf(host) !== root) return 'alterada';
+      const box = edges(boxOf(host));
       if (!box || abs(box.top - placed.top) > 1 || abs(box.left - placed.left) > 1
           || !(box.width > 0) || !(box.height > 0)) return 'alterada';
-      if (!untouched(host, true) || !untouched(document.documentElement, false)) return 'alterada';
+      if (!untouched(host, true) || !untouched(root, false)) return 'alterada';
       const now = clock();
       if (now - steadyAt < ARM_MS) return 'cedo';
       if (watching) {

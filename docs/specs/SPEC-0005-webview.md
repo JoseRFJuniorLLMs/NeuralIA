@@ -91,9 +91,11 @@ use, and without one only Parar remains. A double click on a word in a
 comparator column selects it instead of expanding the column.
 
 Pesquisar counts a click only when the toolbar has been on screen, where it
-was placed, for 500 ms (also when the button went down), with no page-set
-opacity, filter, transform, clip-path, blend mode or hidden visibility on it
-and no opacity, filter or transform on the document root, and --
+was placed (read through the `DOMRectReadOnly` accessors captured when the
+document is created), for 500 ms (also when the button went down), still a
+direct child of the document root, with no page-set opacity, filter,
+transform, clip-path, mask, blend mode, hidden content or hidden visibility on
+it and no opacity, filter or transform on the document root, and --
 when the engine provides IntersectionObserver v2 (`isVisible`) -- after that
 observer has reported it visible for 500 ms; otherwise nothing is sent and the
 toolbar says why. `search` carries exactly `text` (1..=2000 characters after
