@@ -266,6 +266,15 @@ impl Drop for Released {
 
 const UNINSTALL_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\NeuralIA";
 
+/// As duas linhas de comandos que o Windows corre para desinstalar: a normal
+/// (Definicoes > Aplicacoes) e a silenciosa (`winget uninstall --silent`,
+/// scripts). O desinstalador e o mesmo executavel que o instalador, por isso
+/// sem `--uninstall` abria o ecra de instalar.
+pub fn uninstall_commands(uninstaller: &Path) -> (String, String) {
+    let command = format!("\"{}\" --uninstall", uninstaller.display());
+    (command.clone(), format!("{command} /S"))
+}
+
 /// Escreve a entrada de "Aplicacoes e funcionalidades" no ramo do utilizador.
 /// HKCU, e nao HKLM: a instalacao e do utilizador e nao pediu elevacao.
 pub fn register_uninstall(
@@ -292,15 +301,15 @@ pub fn register_uninstall(
             return Err(format!("nao consegui criar a chave: {status}"));
         }
 
-        let quoted = format!("\"{}\"", uninstaller.display());
+        let (uninstall, quiet_uninstall) = uninstall_commands(uninstaller);
         let text_values: [(&str, String); 7] = [
             ("DisplayName", "NeuralIA".to_string()),
             ("DisplayVersion", version.to_string()),
             ("Publisher", "Jose Ribamar Ferreira Junior".to_string()),
             ("DisplayIcon", icon.display().to_string()),
             ("InstallLocation", root.display().to_string()),
-            ("UninstallString", quoted.clone()),
-            ("QuietUninstallString", format!("{quoted} /S")),
+            ("UninstallString", uninstall),
+            ("QuietUninstallString", quiet_uninstall),
         ];
         for (name, value) in &text_values {
             let data = wide(value);

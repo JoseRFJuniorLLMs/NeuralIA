@@ -78,4 +78,45 @@ mod tests {
             );
         }
     }
+
+    /// Parte uma linha de comandos como o Windows a entrega ao processo, e
+    /// devolve os argumentos sem o executavel.
+    fn argv_after_exe(command: &str) -> Vec<String> {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+        let wide: Vec<u16> = command.encode_utf16().chain([0]).collect();
+        let mut count = 0i32;
+        unsafe {
+            let argv = CommandLineToArgvW(wide.as_ptr(), &mut count);
+            assert!(!argv.is_null(), "linha de comandos invalida: {command}");
+            let args = (1..count as usize)
+                .map(|i| {
+                    let arg = *argv.add(i);
+                    let len = (0..).take_while(|&n| *arg.add(n) != 0).count();
+                    String::from_utf16_lossy(std::slice::from_raw_parts(arg, len))
+                })
+                .collect();
+            LocalFree(argv as _);
+            args
+        }
+    }
+
+    #[test]
+    fn the_commands_windows_runs_to_uninstall_really_uninstall() {
+        // Definicoes > Aplicacoes > Desinstalar corre a `UninstallString`;
+        // `winget uninstall --silent` corre a `QuietUninstallString`. Sem o
+        // `--uninstall` as duas abriam o ecra de instalar.
+        let uninstaller = std::path::Path::new(
+            r"C:\Users\alguem\AppData\Local\Programs\NeuralIA\Desinstalar NeuralIA.exe",
+        );
+        let (normal, quiet) = winshell::uninstall_commands(uninstaller);
+        for command in [&normal, &quiet] {
+            let args = argv_after_exe(command);
+            assert_eq!(
+                mode_from(&args),
+                app::Mode::Uninstall,
+                "o Windows corre {command} e recebe {args:?}"
+            );
+        }
+    }
 }
