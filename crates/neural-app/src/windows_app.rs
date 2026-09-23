@@ -52,12 +52,12 @@ use windows_sys::Win32::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
             ES_AUTOHSCROLL, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
             GetForegroundWindow, GetParent, GetWindowTextLengthW, GetWindowTextW,
-            GetWindowThreadProcessId, IDYES, IsZoomed, MB_ICONINFORMATION, MB_OK, MB_YESNO,
-            MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
-            SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetParent, SetWindowPos, SetWindowTextW,
-            ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_CANCELMODE,
-            WM_CAPTURECHANGED, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
-            WS_TABSTOP, WS_VISIBLE,
+            GetWindowThreadProcessId, IDYES, IsZoomed, MB_DEFBUTTON2, MB_ICONINFORMATION,
+            MB_ICONWARNING, MB_OK, MB_YESNO, MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE,
+            SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetParent,
+            SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+            TrackPopupMenu, WM_CANCELMODE, WM_CAPTURECHANGED, WM_KEYDOWN, WS_CHILD,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -365,32 +365,6 @@ const AUTO_SCROLL_SCRIPT: &str = r#"
     } catch (err) { /* outra origem: nao ha nada a fazer daqui */ }
   }
 })();
-"#;
-
-/// Aviso curto dentro da propria pagina: a barra nativa nao esta sempre visivel.
-const AUTO_SCROLL_TOAST: &str = r#"
-(function (on) {
-  var id = 'neuralia-autoscroll-toast';
-  var el = document.getElementById(id);
-  if (!el) {
-    el = document.createElement('div');
-    el.id = id;
-    document.documentElement.appendChild(el);
-  }
-  el.textContent = on ? 'Rolagem automatica ligada — __SECONDS__s (F8 desliga)' : 'Rolagem automatica desligada';
-  el.setAttribute('style', [
-    'position:fixed', 'left:50%', 'bottom:24px', 'transform:translateX(-50%)',
-    'z-index:2147483647', 'padding:10px 18px', 'border-radius:999px',
-    'background:rgba(17,19,20,.92)', 'color:#fff',
-    'font:600 13px Segoe UI, system-ui, sans-serif',
-    'box-shadow:0 8px 28px rgba(0,0,0,.35)', 'pointer-events:none',
-    'opacity:1', 'transition:opacity .4s ease'
-  ].join(';'));
-  clearTimeout(window.__neuralia_toast_timer);
-  window.__neuralia_toast_timer = setTimeout(function () {
-    el.style.opacity = '0';
-  }, 2200);
-})(__ON__);
 "#;
 
 /// O que esta debaixo do rato no chrome nativo do comparador.
@@ -3539,6 +3513,10 @@ unsafe extern "system" fn omnibox_subclass(
                 let _ = proxy.send_event(UserEvent::NewTab(0));
                 return 0;
             }
+            0x52 if ctrl && !shift => {
+                let _ = proxy.send_event(UserEvent::ToggleAutoScroll);
+                return 0;
+            }
             0x2E if ctrl && shift => {
                 let _ = proxy.send_event(UserEvent::ClearHistory);
                 return 0;
@@ -4397,6 +4375,8 @@ struct App {
     comparator: Option<ComparatorState>,
     omnibox: Option<HWND>,
     bar_hover: Option<BarHit>,
+    /// Ctrl/Shift/Alt no teclado da janela principal (a barra com o foco).
+    modifiers: winit::keyboard::ModifiersState,
     /// O rato esta em cima do "Ir" da Home: pinta-se em degradê.
     home_go_hover: bool,
     exit_button: Option<HWND>,
@@ -4504,6 +4484,7 @@ impl App {
             comparator: None,
             omnibox: None,
             bar_hover: None,
+            modifiers: winit::keyboard::ModifiersState::empty(),
             home_go_hover: false,
             exit_button: None,
             home_button: None,
@@ -5028,6 +5009,27 @@ impl App {
             Err(error) => format!("Não foi possível ler o histórico: {error}"),
         };
         self.show_native_text("NeuralIA — Histórico cronológico", &text);
+    }
+
+    /// Ctrl+Shift+Delete apagava historico e memoria local de uma vez, sem
+    /// perguntar e sem volta. Agora pergunta, com o "Nao" por omissao.
+    fn confirm_clear_history(&self) -> bool {
+        let Some(hwnd) = self.window.as_ref().and_then(window_hwnd) else {
+            return false;
+        };
+        let body = wide_null(
+            "Apagar TODO o histórico e a memória local da NeuralIA?\n\nIsto não pode ser desfeito.",
+        );
+        let title = wide_null("NeuralIA — Apagar histórico");
+        let answer = unsafe {
+            MessageBoxW(
+                hwnd,
+                body.as_ptr(),
+                title.as_ptr(),
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+            )
+        };
+        clear_history_confirmed(answer)
     }
 
     fn show_native_text(&self, title: &str, text: &str) {
@@ -6965,29 +6967,10 @@ impl App {
             self.schedule_auto_scroll();
         }
 
-        self.announce_auto_scroll();
-
+        // A mensagem e a do meio da janela, como as outras dicas: o aviso
+        // dentro da pagina ficava no fundo e so aparecia nas colunas.
+        self.show_splash(auto_scroll_message(self.auto_scroll), 3);
         self.request_redraw();
-
-        if self.surface == Surface::Home {
-            self.status = Some(if self.auto_scroll {
-                format!("Rolagem automática ligada — {AUTO_SCROLL_SECONDS}s. F8 desliga.")
-            } else {
-                "Rolagem automática desligada.".to_string()
-            });
-            self.request_redraw();
-        }
-    }
-
-    /// Mostra na propria pagina em que estado esta a rolagem. A barra nativa
-    /// tambem o diz, mas em ecra completo ela esconde-se.
-    fn announce_auto_scroll(&self) {
-        let toast = AUTO_SCROLL_TOAST
-            .replace("__ON__", if self.auto_scroll { "true" } else { "false" })
-            .replace("__SECONDS__", &AUTO_SCROLL_SECONDS.to_string());
-        self.for_each_visible_webview(|webview| {
-            let _ = webview.evaluate_script(&toast);
-        });
     }
 
     /// Aviso flutuante, centrado no fundo da janela, que se apaga sozinho.
@@ -7361,10 +7344,7 @@ impl App {
         if self.auto_scroll {
             self.auto_scroll_token = self.auto_scroll_token.wrapping_add(1);
             self.schedule_auto_scroll();
-            self.show_splash(
-                format!("Rolagem automática a cada {AUTO_SCROLL_SECONDS}s  ·  F8 desliga"),
-                4,
-            );
+            self.show_splash(auto_scroll_message(true), 4);
         }
     }
 
@@ -7387,10 +7367,7 @@ impl App {
         if yes {
             self.auto_scroll_token = self.auto_scroll_token.wrapping_add(1);
             self.schedule_auto_scroll();
-            self.show_splash(
-                format!("Rolagem automática ligada — {AUTO_SCROLL_SECONDS}s  ·  F8 desliga"),
-                4,
-            );
+            self.show_splash(auto_scroll_message(true), 4);
         }
         self.request_redraw();
     }
@@ -9327,6 +9304,35 @@ impl App {
     }
 }
 
+/// Atalhos com Ctrl quando o teclado esta na propria janela (depois de um
+/// clique na barra): os mesmos que o mapa de teclas das paginas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainShortcut {
+    AutoScroll,
+    Reload,
+    History,
+    NewTab,
+}
+
+fn main_window_shortcut(
+    key: &Key,
+    modifiers: winit::keyboard::ModifiersState,
+) -> Option<MainShortcut> {
+    if !modifiers.control_key() || modifiers.alt_key() {
+        return None;
+    }
+    let Key::Character(text) = key else {
+        return None;
+    };
+    match (text.to_lowercase().as_str(), modifiers.shift_key()) {
+        ("r", false) => Some(MainShortcut::AutoScroll),
+        ("r", true) => Some(MainShortcut::Reload),
+        ("h", false) => Some(MainShortcut::History),
+        ("n", false) => Some(MainShortcut::NewTab),
+        _ => None,
+    }
+}
+
 fn parse_browser_agent_plan(spec: &str) -> Result<(String, Vec<BrowserAgentCommand>), String> {
     let parts = spec
         .split('|')
@@ -10123,6 +10129,9 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Panel(message) => self.handle_panel_message(message),
             UserEvent::GmailAnswer(open) => self.answer_gmail(open),
             UserEvent::ClearHistory => {
+                if !self.confirm_clear_history() {
+                    return;
+                }
                 self.memory.clear(&mut self.current_research);
                 match self.history.clear() {
                     None => {
@@ -10412,6 +10421,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.update_home_go_hover();
             }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Focused(focused) => self.on_focus_changed(focused),
             WindowEvent::Occluded(occluded) => self.on_occluded_changed(occluded),
             // O tema do sistema mudou: o cache de 1 s tem de cair agora, e o
@@ -10432,6 +10442,15 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } if self.surface == Surface::Comparator => self.context_menu_comparator(),
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
+                if let Some(shortcut) = main_window_shortcut(&event.logical_key, self.modifiers) {
+                    match shortcut {
+                        MainShortcut::AutoScroll => self.toggle_auto_scroll(),
+                        MainShortcut::Reload => self.reload_page(),
+                        MainShortcut::History => self.toggle_side_panel(),
+                        MainShortcut::NewTab => self.new_tab(0),
+                    }
+                    return;
+                }
                 match event.logical_key {
                     Key::Named(NamedKey::Escape) => self.go_back(),
                     Key::Named(NamedKey::F8) => self.toggle_auto_scroll(),
@@ -16177,6 +16196,99 @@ process.stdout.write(JSON.stringify(results));
     }
 
     #[test]
+    fn ctrl_r_toggles_auto_scroll_and_reload_stays_on_f5_and_ctrl_shift_r() {
+        // Corre o mapa de teclas QUE EMBARCA e le o que ele publica pelo
+        // mesmo parser nativo do produto.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let drive = r#"
+document.readyState = 'interactive';
+__fire('DOMContentLoaded');
+__drain();
+__fire('keydown', { key: 'r', ctrlKey: true });
+__fire('keydown', { key: 'R', ctrlKey: true, shiftKey: true });
+__fire('keydown', { key: 'F5' });
+__fire('keydown', { key: 'F8' });
+"#;
+        let cases = [serde_json::json!({
+            "name": "keymap",
+            "href": "https://example.com/",
+            "script": NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", CAP),
+            "drive": drive,
+        })];
+        let program = format!(
+            "const INPUT = {};\n{}",
+            serde_json::json!({ "cases": cases }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        let actions: Vec<IpcAction> = results[0]["posted"]
+            .as_array()
+            .expect("posted")
+            .iter()
+            .filter_map(|message| parse_ipc_message(message.as_str()?, CAP, 3))
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                IpcAction::AutoScroll,
+                IpcAction::Reload,
+                IpcAction::Reload,
+                IpcAction::AutoScroll,
+            ],
+            "erros: {}",
+            results[0]["errors"]
+        );
+    }
+
+    #[test]
+    fn the_main_window_answers_the_same_ctrl_shortcuts() {
+        use winit::keyboard::ModifiersState;
+        let key = |text: &str| Key::Character(text.into());
+        let ctrl = ModifiersState::CONTROL;
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert_eq!(
+            main_window_shortcut(&key("r"), ctrl),
+            Some(MainShortcut::AutoScroll)
+        );
+        assert_eq!(
+            main_window_shortcut(&key("R"), ctrl_shift),
+            Some(MainShortcut::Reload)
+        );
+        assert_eq!(
+            main_window_shortcut(&key("h"), ctrl),
+            Some(MainShortcut::History)
+        );
+        assert_eq!(
+            main_window_shortcut(&key("n"), ctrl),
+            Some(MainShortcut::NewTab)
+        );
+        // Sem Ctrl, ou com Alt (AltGr no teclado portugues), a tecla e texto.
+        assert_eq!(
+            main_window_shortcut(&key("r"), ModifiersState::empty()),
+            None
+        );
+        assert_eq!(
+            main_window_shortcut(&key("r"), ctrl | ModifiersState::ALT),
+            None
+        );
+    }
+
+    #[test]
+    fn clearing_all_history_needs_an_explicit_yes() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IDCANCEL, IDNO};
+        assert!(clear_history_confirmed(IDYES));
+        for answer in [IDNO, IDCANCEL, 0] {
+            assert!(
+                !clear_history_confirmed(answer),
+                "resposta {answer} apagou tudo"
+            );
+        }
+        assert!(auto_scroll_message(false).contains("desligada"));
+        assert!(auto_scroll_message(true).contains("Ctrl+R desliga"));
+    }
+
+    #[test]
     fn comparator_ctrl_click_on_a_google_search_link_keeps_the_real_url() {
         // `q` numa pesquisa do Google e um termo, nao uma URL. Resolvido
         // contra a origem da coluna virava https://gemini.google.com/app/rust.
@@ -18089,6 +18201,21 @@ fn pill_pixels(
 
 /// Fim do degradê do "Ir" sob o rato; o inicio e a cor de destaque do tema.
 const GO_GRADIENT_END: Rgb = (124, 58, 237);
+/// O que o aviso do meio da janela diz quando a rolagem muda.
+fn auto_scroll_message(on: bool) -> String {
+    if on {
+        format!("Rolagem automática ligada — {AUTO_SCROLL_SECONDS}s  ·  Ctrl+R desliga")
+    } else {
+        "Rolagem automática desligada  ·  Ctrl+R liga".to_string()
+    }
+}
+
+/// Apagar TUDO so com um "Sim" explicito. Fechar a caixa, "Nao" ou uma caixa
+/// que nem abriu (0) deixam o historico como estava.
+fn clear_history_confirmed(answer: i32) -> bool {
+    answer == IDYES
+}
+
 /// Uma volta completa do degradê a deslizar.
 const GO_GRADIENT_PERIOD_MS: u64 = 2400;
 
@@ -18520,7 +18647,9 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       }
       if (key === 'u') { e.preventDefault(); act('viewsource'); return; }
       switch (key) {
-        case 'r': e.preventDefault(); act('reload'); return;
+        // Ctrl+R liga/desliga a rolagem automatica (pedido do dono);
+        // recarregar fica no F5 e no Ctrl+Shift+R.
+        case 'r': e.preventDefault(); act('autoscroll'); return;
         case 'l': e.preventDefault(); act('omnibox'); return;
         case 'h': e.preventDefault(); act('history'); return;
         case 'n':
