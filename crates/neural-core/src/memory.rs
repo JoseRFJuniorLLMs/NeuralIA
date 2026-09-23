@@ -363,6 +363,23 @@ impl MemoryStore {
         Ok(documents)
     }
 
+    /// Todos os documentos legiveis em documents/, sem filtro de tombstones.
+    /// So o forget os usa: tem de voltar a apagar o que um forget anterior
+    /// escondeu mas nao conseguiu remover.
+    fn documents_on_disk(&self) -> Vec<MemoryDocument> {
+        let Ok(entries) = fs::read_dir(self.documents_dir()) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+            })
+            .filter_map(|entry| fs::read(entry.path()).ok())
+            .filter_map(|bytes| serde_json::from_slice::<MemoryDocument>(&bytes).ok())
+            .collect()
+    }
+
     pub fn query(&self, query: &MemoryQuery) -> io::Result<Vec<MemoryHit>> {
         let query_text = query.text.trim();
         if query_text.is_empty() {
@@ -562,51 +579,50 @@ impl MemoryStore {
 
     pub fn forget(&self, scope: ForgetScope) -> io::Result<ForgetReport> {
         self.ensure_layout()?;
-        let documents = self.documents()?;
         let sessions = self.research_sessions_unfiltered()?;
         let mut report = ForgetReport::default();
+        let mut failures = RemovalFailures::default();
 
         // Persist the deny policy before deleting source files. If the process
         // dies halfway through forget(), stale source cannot be re-imported.
-        let mut tombstones = self.load_tombstones()?;
+        let previous = self.load_tombstones()?;
+        let mut tombstones = previous.clone();
         extend_tombstones_for_scope(&mut tombstones, &scope, &sessions);
         self.save_tombstones(&tombstones)?;
 
-        for document in documents {
-            if !matches_scope(&document, &scope) {
-                continue;
+        if matches!(scope, ForgetScope::All) {
+            // Tudo o que esta por baixo destes directorios e derivado das
+            // paginas: JSON truncados e `.tmp` de escritas interrompidas
+            // tambem guardam o corpo, e nao passam por `documents()`.
+            report.documents = self.documents()?.len();
+            for dir in ["documents", "wiki", "sessions"] {
+                remove_files_under(&self.root.join(dir), &mut report.files, &mut failures);
             }
-            for path in [self.document_path(&document.id), self.wiki_path(&document)] {
-                if fs::remove_file(&path).is_ok() {
-                    report.files += 1;
+            let _ = fs::remove_file(self.sqlite_path());
+        } else {
+            // Ficheiros crus, nao `documents()`: um documento que um forget
+            // anterior nao conseguiu apagar ja esta escondido pela tombstone
+            // e tem de ser tentado outra vez.
+            for document in self.documents_on_disk() {
+                let in_scope = matches_scope(&document, &scope);
+                if !in_scope && !tombstone_blocks_document(&document, &tombstones) {
+                    continue;
+                }
+                for path in [self.document_path(&document.id), self.wiki_path(&document)] {
+                    remove_file_counted(&path, &mut report.files, &mut failures);
+                }
+                if in_scope && !tombstone_blocks_document(&document, &previous) {
+                    report.documents += 1;
                 }
             }
-            report.documents += 1;
-        }
-
-        match &scope {
-            ForgetScope::Session(id) => {
+            if let ForgetScope::Session(id) = &scope {
                 let path = self.root.join("sessions").join(format!("{id}.json"));
-                if fs::remove_file(path).is_ok() {
-                    report.files += 1;
-                }
+                remove_file_counted(&path, &mut report.files, &mut failures);
             }
-            ForgetScope::All => {
-                if let Ok(entries) = fs::read_dir(self.root.join("sessions")) {
-                    for entry in entries.flatten() {
-                        if entry.path().extension().and_then(|value| value.to_str()) == Some("json")
-                            && fs::remove_file(entry.path()).is_ok()
-                        {
-                            report.files += 1;
-                        }
-                    }
-                }
-                let _ = fs::remove_file(self.sqlite_path());
-            }
-            _ => {}
         }
 
         self.rebuild()?;
+        failures.into_result()?;
         Ok(report)
     }
 
@@ -1002,6 +1018,71 @@ fn unix_seconds() -> u64 {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Deletes que falharam durante um forget. O forget apaga tudo o que consegue
+/// e so depois devolve o erro: a UI nao pode dizer "apagado" com o corpo de
+/// uma pagina ainda no disco.
+#[derive(Default)]
+struct RemovalFailures {
+    count: usize,
+    first: Option<(PathBuf, io::Error)>,
+}
+
+impl RemovalFailures {
+    fn push(&mut self, path: &Path, error: io::Error) {
+        self.count += 1;
+        if self.first.is_none() {
+            self.first = Some((path.to_path_buf(), error));
+        }
+    }
+
+    fn into_result(self) -> io::Result<()> {
+        match self.first {
+            None => Ok(()),
+            Some((path, error)) => Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "forget incomplete: {} file(s) could not be deleted and will be retried by the next forget; first {}: {error}",
+                    self.count,
+                    path.display()
+                ),
+            )),
+        }
+    }
+}
+
+fn remove_file_counted(path: &Path, removed: &mut usize, failures: &mut RemovalFailures) {
+    match fs::remove_file(path) {
+        Ok(()) => *removed += 1,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => failures.push(path, error),
+    }
+}
+
+/// Apaga todos os ficheiros por baixo de `dir`, seja qual for o conteudo;
+/// mantem os directorios, que fazem parte do layout.
+fn remove_files_under(dir: &Path, removed: &mut usize, failures: &mut RemovalFailures) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => return failures.push(dir, error),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.push(dir, error);
+                continue;
+            }
+        };
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => remove_files_under(&path, removed, failures),
+            Ok(_) => remove_file_counted(&path, removed, failures),
+            Err(error) => failures.push(&path, error),
+        }
+    }
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {

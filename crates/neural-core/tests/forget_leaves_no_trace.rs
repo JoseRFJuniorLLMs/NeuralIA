@@ -97,3 +97,97 @@ fn forget_by_domain_leaves_no_trace_on_disk() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn forget_all_removes_unparseable_and_leftover_temp_files() {
+    // Um JSON truncado (crash a meio, disco cheio) ainda guarda o corpo da
+    // pagina; um `.tmp` do atomic_write tambem. Nenhum deles se deixa ler
+    // como MemoryDocument, e ambos tem de desaparecer na mesma.
+    let (root, store) = store_with_secrets("unparseable");
+    let documents = root.join("documents");
+    fs::write(
+        documents.join("broken.json"),
+        format!("{{\"body\":\"corpo {NEEDLE}"),
+    )
+    .unwrap();
+    fs::write(documents.join(".abc.json.1234.tmp"), NEEDLE).unwrap();
+    let wiki = root.join("wiki").join("sources");
+    fs::create_dir_all(&wiki).unwrap();
+    fs::write(wiki.join(".abc.md.1234.tmp"), NEEDLE).unwrap();
+
+    store.forget(ForgetScope::All).expect("forget corre");
+
+    let remaining = files_containing(&root, NEEDLE);
+    assert!(remaining.is_empty(), "segredo sobreviveu em {remaining:?}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Primeiro `.json` de documents/, e um handle que o prende como um antivirus
+/// ou indexador faria: aberto sem FILE_SHARE_DELETE, o DeleteFileW falha.
+#[cfg(windows)]
+fn lock_one_document(root: &Path) -> (PathBuf, fs::File) {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x1;
+    let path = fs::read_dir(root.join("documents"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .expect("ha documentos");
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&path)
+        .expect("abre sem FILE_SHARE_DELETE");
+    (path, handle)
+}
+
+#[cfg(windows)]
+#[test]
+fn forget_reports_a_failed_delete_and_retries_it_next_time() {
+    // O primeiro forget nao pode dizer "apagado", e o seguinte tem de voltar
+    // a tentar: a tombstone do primeiro nao pode esconder o ficheiro para
+    // sempre.
+    let (root, store) = store_with_secrets("locked");
+    let (locked, handle) = lock_one_document(&root);
+
+    let first = store.forget(ForgetScope::All);
+    assert!(locked.exists(), "o ficheiro devia ter resistido");
+    drop(handle);
+    assert!(
+        first.is_err(),
+        "um delete falhado nao pode ser reportado como sucesso: {first:?}"
+    );
+
+    store
+        .forget(ForgetScope::All)
+        .expect("segundo forget corre");
+    assert!(!locked.exists(), "o forget seguinte nao voltou a tentar");
+    let remaining = files_containing(&root, NEEDLE);
+    assert!(remaining.is_empty(), "segredo sobreviveu em {remaining:?}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(windows)]
+#[test]
+fn forget_by_domain_retries_a_document_an_earlier_forget_failed_to_delete() {
+    let (root, store) = store_with_secrets("locked-domain");
+    let (locked, handle) = lock_one_document(&root);
+
+    let first = store.forget(ForgetScope::Domain("example.com".into()));
+    assert!(locked.exists(), "o ficheiro devia ter resistido");
+    drop(handle);
+    assert!(
+        first.is_err(),
+        "um delete falhado nao pode ser reportado como sucesso: {first:?}"
+    );
+
+    store
+        .forget(ForgetScope::Domain("example.com".into()))
+        .expect("segundo forget corre");
+    assert!(!locked.exists(), "o forget seguinte nao voltou a tentar");
+
+    let _ = fs::remove_dir_all(&root);
+}
