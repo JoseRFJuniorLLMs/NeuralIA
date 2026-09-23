@@ -425,11 +425,26 @@ const CREDENTIAL_PARAMS: &[&str] = &[
     "key",
 ];
 
+/// Nomes que sao credencial mesmo colados a um prefixo sem separador:
+/// `accessToken`, `jsessionid`, `X-Goog-Credential`.
+const GLUED_CREDENTIAL_SUFFIXES: [&str; 6] = [
+    "token",
+    "sessionid",
+    "sessid",
+    "signature",
+    "secret",
+    "credential",
+];
+
 fn looks_like_credential_param(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
+    // `X-Amz-Security-Token` e `x.api.key` chegam aqui como `x_amz_security_token`.
+    let name = name.to_ascii_lowercase().replace(['-', '.'], "_");
     CREDENTIAL_PARAMS
         .iter()
         .any(|needle| name == *needle || name.ends_with(&format!("_{needle}")))
+        || GLUED_CREDENTIAL_SUFFIXES
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
 }
 
 /// Uma URL sem as credenciais que costumam viajar nela, mantendo tudo o resto.
@@ -471,8 +486,10 @@ pub fn redact_url(raw: &str) -> String {
     }
 
     if let Some(fragment) = url.fragment()
+        // `?` tambem separa: uma SPA com hash routing entrega
+        // `#/reset?token=...`, cuja primeira chave seria `/reset?token`.
         && fragment
-            .split(['&', ';'])
+            .split(['&', ';', '?'])
             .filter_map(|pair| pair.split('=').next())
             .any(looks_like_credential_param)
     {
@@ -604,6 +621,59 @@ mod tests {
         let clean = redact_sensitive_text("ya29.SEGREDO-MUITO-LONGO-E-ESTRANHO: api_key");
         assert!(!clean.contains("ya29.SEGREDO"), "{clean}");
     }
+    #[test]
+    fn redact_url_catches_hyphenated_glued_and_hash_routed_credentials() {
+        for (url, secrets) in [
+            (
+                "https://b.s3.amazonaws.com/f?X-Amz-Credential=AKIASECRET&X-Amz-Security-Token=IQoJSECRET&X-Amz-Signature=SIGSECRET&X-Amz-Expires=300",
+                &["AKIASECRET", "IQoJSECRET", "SIGSECRET"][..],
+            ),
+            (
+                "https://storage.googleapis.com/b/o?X-Goog-Credential=GCRSECRET&X-Goog-Signature=GSIGSECRET",
+                &["GCRSECRET", "GSIGSECRET"][..],
+            ),
+            (
+                "https://shop.example/cart?jsessionid=ABC123SECRET",
+                &["ABC123SECRET"][..],
+            ),
+            (
+                "https://shop.example/cart?PHPSESSID=PHPSECRET",
+                &["PHPSECRET"][..],
+            ),
+            (
+                "https://api.example/v1?accessToken=ATSECRET&page=2",
+                &["ATSECRET"][..],
+            ),
+            (
+                "https://app.example/#/reset?token=TOKSECRET",
+                &["TOKSECRET"][..],
+            ),
+            (
+                "https://app.example/#/callback?code=CODESECRET",
+                &["CODESECRET"][..],
+            ),
+            (
+                "https://api.example/v1?X-Api-Key=KEYSECRET&page=2",
+                &["KEYSECRET"][..],
+            ),
+        ] {
+            let out = redact_url(url);
+            for secret in secrets {
+                assert!(!out.contains(secret), "{url} -> {out}");
+            }
+        }
+
+        // O resto da URL continua util.
+        let out = redact_url("https://b.s3.amazonaws.com/f?X-Amz-Signature=S&X-Amz-Expires=300");
+        assert!(out.contains("X-Amz-Expires=300"), "{out}");
+        let out = redact_url("https://api.example/v1?accessToken=A&page=2");
+        assert!(out.contains("page=2"), "{out}");
+        assert_eq!(
+            redact_url("https://exemplo.pt/#/artigo?id=42"),
+            "https://exemplo.pt/#/artigo?id=42"
+        );
+    }
+
     #[test]
     fn secrets_with_spaces_quotes_or_the_other_separator_are_redacted() {
         // Configs INI/TOML/JSON e formularios copiados: a chave e o separador

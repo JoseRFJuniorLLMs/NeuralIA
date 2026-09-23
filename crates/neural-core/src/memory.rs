@@ -1175,6 +1175,23 @@ mod tests {
     }
 
     #[test]
+    fn captured_presigned_url_never_stores_its_session_token() {
+        let document = MemoryDocument::new(
+            MemoryKind::Source,
+            MemorySourceKind::Web,
+            "t",
+            Some(
+                "https://b.s3.amazonaws.com/f?X-Amz-Security-Token=IQoJSECRET&X-Amz-Expires=300"
+                    .into(),
+            ),
+            "x",
+        );
+        let url = document.url.unwrap_or_default();
+        assert!(!url.contains("IQoJSECRET"), "url: {url}");
+        assert!(url.contains("X-Amz-Expires=300"), "url: {url}");
+    }
+
+    #[test]
     fn captured_config_snippet_never_stores_its_password() {
         let root = temp_root("config-snippet-secret");
         let store = MemoryStore::new(&root).unwrap();
