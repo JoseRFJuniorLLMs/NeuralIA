@@ -19871,8 +19871,9 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
 
   function createSelectionBar() {
     // Capturas no document-created, antes de a pagina correr: trocar depois
-    // getSelection, Selection.prototype, Range.prototype ou EventTarget nao
-    // desliga a barra nem lhe muda o texto.
+    // getSelection, Selection/Range/Event.prototype, EventTarget, String ou
+    // String.prototype nao desliga a barra, nao lhe muda o texto e nao da a
+    // pagina um `this` dentro da shadow root fechada.
     function uncurry(fn) {
       if (typeof fn !== 'function') throw new TypeError('primitiva em falta');
       return Function.prototype.call.bind(fn);
@@ -19889,10 +19890,24 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     const setAttr = uncurry(Element.prototype.setAttribute);
     const setText = setterOf(Node.prototype, 'textContent');
     const setStyle = uncurry(CSSStyleDeclaration.prototype.setProperty);
+    const readStyle = uncurry(CSSStyleDeclaration.prototype.getPropertyValue);
+    const computed = uncurry(getComputedStyle);
     const connected = getterOf(Node.prototype, 'isConnected');
     const later = setTimeout;
     const cancelLater = clearTimeout;
+    const clock = Date.now;
+    const round = Math.round;
+    const abs = Math.abs;
     const thenOf = uncurry(Promise.prototype.then);
+    const pushTo = uncurry(Array.prototype.push);
+    const toStr = String;
+    const fromCode = String.fromCharCode;
+    const codeAt = uncurry(String.prototype.charCodeAt);
+    const sliceOf = uncurry(String.prototype.slice);
+    const findIn = uncurry(String.prototype.indexOf);
+    const findLast = uncurry(String.prototype.lastIndexOf);
+    const lower = uncurry(String.prototype.toLowerCase);
+    const upper = uncurry(String.prototype.toUpperCase);
     const docSelection = uncurry(Document.prototype.getSelection);
     const selText = uncurry(Selection.prototype.toString);
     const selRange = uncurry(Selection.prototype.getRangeAt);
@@ -19909,19 +19924,44 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     const closestOf = uncurry(Element.prototype.closest);
     const shadowOf = uncurry(Element.prototype.attachShadow);
     const boxOf = uncurry(Element.prototype.getBoundingClientRect);
+    // Os eventos tambem: a pagina que redefine um acessor de Event recebia o
+    // evento de um botao da barra como `this`, com os nos de dentro no
+    // composedPath; e um `detail` falso fazia de um clique um gesto.
+    const targetOf = getterOf(Event.prototype, 'target');
+    const prevent = uncurry(Event.prototype.preventDefault);
+    const stopHere = uncurry(Event.prototype.stopPropagation);
+    const stopAll = uncurry(Event.prototype.stopImmediatePropagation);
+    const detailOf = getterOf(UIEvent.prototype, 'detail');
+    const buttonOf = getterOf(MouseEvent.prototype, 'button');
+    const xOf = getterOf(MouseEvent.prototype, 'clientX');
+    const yOf = getterOf(MouseEvent.prototype, 'clientY');
+    const mouseShift = getterOf(MouseEvent.prototype, 'shiftKey');
+    const keyOf = getterOf(KeyboardEvent.prototype, 'key');
+    const keyShift = getterOf(KeyboardEvent.prototype, 'shiftKey');
+    const keyCtrl = getterOf(KeyboardEvent.prototype, 'ctrlKey');
+    const keyMeta = getterOf(KeyboardEvent.prototype, 'metaKey');
     const execCommand = typeof Document.prototype.execCommand === 'function'
       ? uncurry(Document.prototype.execCommand) : null;
     const clip = typeof navigator !== 'undefined' ? navigator.clipboard : null;
     const writeText = clip && typeof Clipboard === 'function'
       && typeof Clipboard.prototype.writeText === 'function'
       ? uncurry(Clipboard.prototype.writeText) : null;
-    const navLang = typeof navigator !== 'undefined' ? String(navigator.language || '') : '';
+    const navLang = typeof navigator !== 'undefined' ? toStr(navigator.language || '') : '';
     const synth = window.speechSynthesis || null;
     const Utterance = window.SpeechSynthesisUtterance || null;
     const speakNow = synth && Utterance ? uncurry(synth.speak) : null;
     const cancelSpeech = speakNow ? uncurry(synth.cancel) : null;
     const listVoices = speakNow ? uncurry(synth.getVoices) : null;
     const Sheet = typeof CSSStyleSheet === 'function' ? CSSStyleSheet : null;
+    // IntersectionObserver v2: diz se a barra esta mesmo a vista, sem nada
+    // da pagina por cima (mesmo com pointer-events:none), sem opacidade,
+    // filtro ou transformacao. E a defesa contra um clique enganado.
+    const Watch = typeof IntersectionObserver === 'function'
+      && typeof IntersectionObserverEntry === 'function'
+      && Object.getOwnPropertyDescriptor(IntersectionObserverEntry.prototype, 'isVisible')
+      ? IntersectionObserver : null;
+    const seesIt = Watch ? getterOf(IntersectionObserverEntry.prototype, 'isVisible') : null;
+    const watchOn = Watch ? uncurry(Watch.prototype.observe) : null;
 
     // Painel privado: o texto nunca sai para o comparador (historico e
     // memoria). O nativo tambem recusa o `search` destes WebViews.
@@ -19929,12 +19969,20 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     const SHOW_MAX = 5000;
     const SEARCH_MAX = 2000;
     const SHOW_DELAY_MS = 200;
+    // Pesquisar leva o texto para fora da pagina: so conta um clique com a
+    // barra parada e confirmada a vista ha pelo menos isto.
+    const ARM_MS = 500;
+    // Menos do que isto entre o mousedown e o mouseup e um clique, nao um
+    // arrasto: nao escolhe texto.
+    const DRAG_MIN = 4;
     const FEEDBACK_MS = 1000;
     const VOICE_WAIT_MS = 1500;
     const SPEECH_CHUNK = 200;
     const SPEECH_ABBREVIATION = 5;
     const MARGIN = 8;
     const TOO_LONG = 'Seleção grande demais para pesquisar (máx. 2000 caracteres)';
+    const TOO_SOON = 'Clique de novo em Pesquisar';
+    const TAMPERED = 'A página cobriu ou alterou esta barra: a pesquisa não foi enviada';
     const LABELS = {
       search: '\u{1F50E} Pesquisar',
       copy: '\u{1F4CB} Copiar',
@@ -19952,6 +20000,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       'gap:6px;min-height:34px;padding:0 14px;border-radius:999px;cursor:pointer;',
       'color:inherit;font:inherit;white-space:nowrap}',
       'button:hover{background:rgba(0,0,0,.08)}',
+      '.solo .act{display:none}',
       '.msg{display:none;flex-basis:100%;padding:6px 12px;font-weight:500;line-height:1.35}',
       '.msg.on{display:block}',
       '@media (prefers-color-scheme: dark){',
@@ -19965,8 +20014,19 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     let note = null;
     const buttons = Object.create(null);
     let visible = false;
+    // O texto de Copiar e Pesquisar: a selecao que a barra mostra agora.
+    // Vazio enquanto se le algo que ja nao esta selecionado.
     let text = '';
     let shownAt = null;
+    let placed = null;
+    let steadyAt = 0;
+    let seenAt = 0;
+    let watching = false;
+    let pressReady = 'alterada';
+    let downX = 0;
+    let downY = 0;
+    let gestureText = null;
+    let keySelecting = false;
     let showTimer = 0;
     let feedbackTimer = 0;
     let voiceTimer = 0;
@@ -19996,7 +20056,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     function editable(node) {
       const el = elementOf(node);
       if (!el) return false;
-      const tag = String(el.tagName || '').toUpperCase();
+      const tag = upper(toStr(el.tagName || ''));
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
       if (el.isContentEditable) return true;
       return !!closestOf(el,
@@ -20015,12 +20075,28 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       return !!host && !!node && (node === host || holds(host, node));
     }
 
+    // Os espacos que o trim() do JavaScript tira, sem passar pelo trim() que
+    // a pagina pode trocar.
+    function blank(c) {
+      return c === 32 || (c >= 9 && c <= 13) || c === 0xA0 || c === 0x1680
+        || (c >= 0x2000 && c <= 0x200A) || c === 0x2028 || c === 0x2029
+        || c === 0x202F || c === 0x205F || c === 0x3000 || c === 0xFEFF;
+    }
+
+    function trimmed(value) {
+      let start = 0;
+      let end = value.length;
+      while (start < end && blank(codeAt(value, start))) start++;
+      while (end > start && blank(codeAt(value, end - 1))) end--;
+      return sliceOf(value, start, end);
+    }
+
     function codePoints(value) {
       let count = 0;
       for (let i = 0; i < value.length; i++) {
-        const high = value.charCodeAt(i);
+        const high = codeAt(value, i);
         if (high >= 0xD800 && high <= 0xDBFF && i + 1 < value.length) {
-          const low = value.charCodeAt(i + 1);
+          const low = codeAt(value, i + 1);
           if (low >= 0xDC00 && low <= 0xDFFF) i++;
         }
         count++;
@@ -20028,14 +20104,44 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       return count;
     }
 
-    // O texto que vai para a pesquisa: o que o parser nativo aceita (sem
-    // caracteres de controlo alem de \n e \t, UTF-16 bem formado).
+    // O texto que vai para a pesquisa: o que o parser nativo aceita (CRLF
+    // como LF, controlos alem de \n e \t como espaco, UTF-16 bem formado),
+    // aparado.
     function searchable(value) {
-      return String(value)
-        .replace(/\r\n?/g, '\n')
-        .replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, ' ')
-        .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '�')
-        .trim();
+      const raw = toStr(value);
+      let out = '';
+      for (let i = 0; i < raw.length; i++) {
+        const c = codeAt(raw, i);
+        if (c === 13) {
+          out += '\n';
+          if (codeAt(raw, i + 1) === 10) i++;
+        } else if (c <= 8 || (c >= 11 && c <= 31) || (c >= 127 && c <= 159)) {
+          out += ' ';
+        } else if (c >= 0xD800 && c <= 0xDBFF) {
+          const low = codeAt(raw, i + 1);
+          if (low >= 0xDC00 && low <= 0xDFFF) {
+            out += fromCode(c, low);
+            i++;
+          } else {
+            out += '�';
+          }
+        } else if (c >= 0xDC00 && c <= 0xDFFF) {
+          out += '�';
+        } else {
+          out += fromCode(c);
+        }
+      }
+      return trimmed(out);
+    }
+
+    // A area visivel, sem as barras de rolagem.
+    function viewport() {
+      const root = document.documentElement;
+      let width = window.innerWidth || 0;
+      let height = window.innerHeight || 0;
+      if (root && root.clientWidth > 0 && root.clientWidth < width) width = root.clientWidth;
+      if (root && root.clientHeight > 0 && root.clientHeight < height) height = root.clientHeight;
+      return { width: width, height: height };
     }
 
     function endRect(range) {
@@ -20048,12 +20154,17 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       return whole && (whole.width > 0 || whole.height > 0) ? whole : null;
     }
 
+    function selected() {
+      const sel = docSelection(document);
+      return !!sel && selCount(sel) > 0 && !selCollapsed(sel) ? sel : null;
+    }
+
     // A selecao do utilizador, se for uma que a barra serve; null se nao.
     function snapshot() {
-      const sel = docSelection(document);
-      if (!sel || selCount(sel) < 1 || selCollapsed(sel)) return null;
-      const raw = String(selText(sel));
-      const size = codePoints(raw.trim());
+      const sel = selected();
+      if (!sel) return null;
+      const raw = toStr(selText(sel));
+      const size = codePoints(trimmed(raw));
       if (size < 1 || size > SHOW_MAX) return null;
       const range = selRange(sel, 0);
       const anchor = selAnchor(sel);
@@ -20062,17 +20173,21 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       if (editable(anchor) || editable(focus) || editable(rangeCommon(range))
           || editable(focusedDeep())) return null;
       const rect = endRect(range);
-      return rect ? { text: raw, rect: rect } : null;
-    }
-
-    function selected() {
-      const sel = docSelection(document);
-      return !!sel && selCount(sel) > 0 && !selCollapsed(sel) ? sel : null;
+      if (!rect) return null;
+      // Fim da selecao fora da area visivel (rolou para longe): uma barra
+      // encostada a borda apontaria para nada.
+      const view = viewport();
+      if (rect.bottom < 0 || rect.top > view.height || rect.right < 0 || rect.left > view.width) {
+        return null;
+      }
+      const whole = rangeBox(range);
+      const top = whole && whole.height > 0 && whole.top < rect.top ? whole.top : rect.top;
+      return { text: raw, rect: rect, top: top };
     }
 
     function stillSelected() {
       const sel = selected();
-      return !!sel && String(selText(sel)) === text;
+      return !!sel && toStr(selText(sel)) === text;
     }
 
     function setLabel(name, label) {
@@ -20097,30 +20212,30 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       if (voiceTimer) { cancelLater(voiceTimer); voiceTimer = 0; }
     }
 
-    function button(name, label, run) {
+    function button(name, label, run, kind) {
       const b = makeElement(document, 'button');
       setAttr(b, 'type', 'button');
       // Fora da ordem do Tab e sem foco ao clicar: o foco fica na pagina.
       setAttr(b, 'tabindex', '-1');
       setAttr(b, 'data-action', name);
+      if (kind) setAttr(b, 'class', kind);
       setText(b, label);
       // mousedown sem efeito por omissao: o foco e a selecao ficam na pagina.
-      listen(b, 'mousedown', guard(function (e) { e.preventDefault(); }));
+      listen(b, 'mousedown', guard(function (e) { prevent(e); }));
       listen(b, 'click', guard(function (e) {
         if (!e.isTrusted) { return; }
-        e.preventDefault();
-        e.stopPropagation();
+        prevent(e);
+        stopHere(e);
         run();
       }));
       buttons[name] = b;
       appendTo(bar, b);
     }
 
+    // Montada ja no document-created (fora da arvore ate a primeira vez):
+    // a folha adotada e atribuida antes de a pagina poder trocar o setter
+    // de ShadowRoot.prototype.adoptedStyleSheets.
     function build() {
-      if (host) {
-        if (!connected(host)) appendTo(document.documentElement, host);
-        return;
-      }
       host = makeElement(document, 'div');
       important(host, 'all', 'initial');
       important(host, 'position', 'fixed');
@@ -20151,47 +20266,61 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       setAttr(bar, 'role', 'toolbar');
       setAttr(bar, 'aria-label', 'Texto selecionado');
       appendTo(root, bar);
-      if (searchAllowed) button('search', LABELS.search, search);
-      button('copy', LABELS.copy, copy);
-      if (speakNow) button('speak', LABELS.speak, toggleSpeech);
+      if (searchAllowed) button('search', LABELS.search, search, 'act');
+      button('copy', LABELS.copy, copy, 'act');
+      if (speakNow) button('speak', LABELS.speak, toggleSpeech, '');
       note = makeElement(document, 'div');
       setAttr(note, 'class', 'msg');
       setAttr(note, 'role', 'status');
       appendTo(bar, note);
-      appendTo(document.documentElement, host);
+      if (Watch) {
+        try {
+          const watcher = new Watch(guard(function (entries) {
+            for (let i = 0; i < entries.length; i++) {
+              seenAt = seesIt(entries[i]) ? (seenAt || clock()) : 0;
+            }
+          }), { threshold: [0, 1], trackVisibility: true, delay: 100 });
+          watchOn(watcher, host);
+          watching = true;
+        } catch (err) { watching = false; }
+      }
     }
+    build();
 
-    // Perto do fim da selecao: por cima se couber, senao por baixo; sempre
-    // dentro da area visivel (sem a barra de rolagem).
-    function place(rect) {
-      const root = document.documentElement;
-      let vw = window.innerWidth || 0;
-      let vh = window.innerHeight || 0;
-      if (root && root.clientWidth > 0 && root.clientWidth < vw) vw = root.clientWidth;
-      if (root && root.clientHeight > 0 && root.clientHeight < vh) vh = root.clientHeight;
+    // Perto do fim da selecao na horizontal; por cima da selecao INTEIRA se
+    // couber (numa selecao de varias linhas nunca tapa o texto escolhido),
+    // senao por baixo da ultima linha; sempre dentro da area visivel.
+    function place(snap) {
+      const view = viewport();
       const box = boxOf(host);
       const w = box && box.width > 0 ? box.width : 320;
       const h = box && box.height > 0 ? box.height : 44;
-      let top = rect.top - h - MARGIN;
-      if (top < MARGIN) top = rect.bottom + MARGIN;
-      if (top + h > vh - MARGIN) top = vh - h - MARGIN;
+      let top = snap.top - h - MARGIN;
+      if (top < MARGIN) top = snap.rect.bottom + MARGIN;
+      if (top + h > view.height - MARGIN) top = view.height - h - MARGIN;
       if (top < MARGIN) top = MARGIN;
-      let left = rect.right - w / 2;
-      if (left + w > vw - MARGIN) left = vw - w - MARGIN;
+      let left = snap.rect.right - w / 2;
+      if (left + w > view.width - MARGIN) left = view.width - w - MARGIN;
       if (left < MARGIN) left = MARGIN;
-      important(host, 'top', Math.round(top) + 'px');
-      important(host, 'left', Math.round(left) + 'px');
+      const at = { top: round(top), left: round(left) };
+      // Mexeu-se: o tempo a vista conta de novo.
+      if (!placed || placed.top !== at.top || placed.left !== at.left) steadyAt = clock();
+      placed = at;
+      important(host, 'top', at.top + 'px');
+      important(host, 'left', at.left + 'px');
     }
 
     function show(snap) {
-      build();
+      if (!connected(host)) appendTo(document.documentElement, host);
+      if (!visible) placed = null;
       text = snap.text;
-      shownAt = snap.rect;
+      shownAt = snap;
       clearFeedback();
+      setAttr(bar, 'class', 'bar');
       say('');
       important(host, 'visibility', 'hidden');
       important(host, 'display', 'block');
-      place(shownAt);
+      place(snap);
       important(host, 'visibility', 'visible');
       visible = true;
     }
@@ -20204,19 +20333,42 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       visible = false;
       text = '';
       shownAt = null;
+      placed = null;
+      seenAt = 0;
+      gestureText = null;
+      pressReady = 'alterada';
     }
 
+    // A ler, a barra fica (o Parar tem de estar a mao), mas sem a selecao
+    // antiga: Copiar e Pesquisar nao agem sobre texto que ja nao esta
+    // selecionado.
+    function retire() {
+      if (showTimer) { cancelLater(showTimer); showTimer = 0; }
+      clearFeedback();
+      text = '';
+      gestureText = null;
+      setAttr(bar, 'class', 'bar solo');
+      say('');
+    }
+
+    function drop() {
+      if (speaking) retire(); else hide();
+    }
+
+    // So mostra a selecao que o gesto do utilizador deixou, e so se a pagina
+    // nao a trocou no intervalo.
     function check() {
       showTimer = 0;
-      if (speaking) return;
       const snap = snapshot();
-      if (snap) show(snap); else hide();
+      if (snap && snap.text === gestureText) { show(snap); return; }
+      drop();
     }
 
     // Um clique sem selecao nao deixa relogio nenhum a correr.
     function schedule() {
-      if (speaking) return;
-      if (!selected()) { hide(); return; }
+      const sel = selected();
+      if (!sel) { drop(); return; }
+      gestureText = toStr(selText(sel));
       if (showTimer) cancelLater(showTimer);
       showTimer = later(guard(check), SHOW_DELAY_MS);
     }
@@ -20230,9 +20382,41 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       return busy;
     }
 
+    function untouched(el, own) {
+      if (!el) return true;
+      const style = computed(window, el);
+      if (readStyle(style, 'opacity') !== '1' || readStyle(style, 'filter') !== 'none'
+          || readStyle(style, 'transform') !== 'none') return false;
+      return !own || (readStyle(style, 'visibility') === 'visible'
+        && readStyle(style, 'clip-path') === 'none'
+        && readStyle(style, 'mix-blend-mode') === 'normal');
+    }
+
+    // Pronta para um clique em Pesquisar: '' se sim; 'cedo' se ainda nao
+    // esta a vista ha ARM_MS; 'alterada' se a pagina a tapou, moveu ou lhe
+    // mexeu no estilo (a propria ou a raiz do documento).
+    function readiness() {
+      if (!visible || !placed) return 'alterada';
+      const box = boxOf(host);
+      if (!box || abs(box.top - placed.top) > 1 || abs(box.left - placed.left) > 1
+          || !(box.width > 0) || !(box.height > 0)) return 'alterada';
+      if (!untouched(host, true) || !untouched(document.documentElement, false)) return 'alterada';
+      const now = clock();
+      if (now - steadyAt < ARM_MS) return 'cedo';
+      if (watching) {
+        if (!seenAt) return now - steadyAt < 2 * ARM_MS ? 'cedo' : 'alterada';
+        if (now - seenAt < ARM_MS) return 'cedo';
+      }
+      return '';
+    }
+
     // A pergunta vai inteira ou nao vai: acima do tecto nada sai da pagina
     // e a barra diz porque.
     function search() {
+      if (!text) return;
+      const ready = pressReady || readiness();
+      pressReady = 'alterada';
+      if (ready) { say(ready === 'cedo' ? TOO_SOON : TAMPERED); return; }
       const question = searchable(text);
       if (!question) { hide(); return; }
       if (codePoints(question) > SEARCH_MAX) { say(TOO_LONG); return; }
@@ -20262,6 +20446,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     }
 
     function copy() {
+      if (!text) return;
       if (!writeText) { copyByCommand(); return; }
       try {
         thenOf(writeText(clip, text), guard(function () { copied(true); }), guard(copyByCommand));
@@ -20271,7 +20456,18 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     }
 
     function langTag(value) {
-      return String(value || '').replace(/_/g, '-').toLowerCase();
+      const raw = lower(toStr(value || ''));
+      let out = '';
+      for (let i = 0; i < raw.length; i++) {
+        const c = codeAt(raw, i);
+        out += c === 95 ? '-' : fromCode(c);
+      }
+      return out;
+    }
+
+    function baseOf(tag) {
+      const at = findIn(tag, '-');
+      return at < 0 ? tag : sliceOf(tag, 0, at);
     }
 
     // Voz local (offline) na lingua da pagina; senao pt-BR; senao a do
@@ -20279,7 +20475,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     function chooseVoice(voices) {
       const local = [];
       for (let i = 0; i < voices.length; i++) {
-        if (voices[i] && voices[i].localService !== false) local.push(voices[i]);
+        if (voices[i] && voices[i].localService !== false) pushTo(local, voices[i]);
       }
       let pageLang = '';
       try { pageLang = document.documentElement.lang; } catch (err) { pageLang = ''; }
@@ -20287,12 +20483,12 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       for (let w = 0; w < wanted.length; w++) {
         const tag = langTag(wanted[w]);
         if (!tag) continue;
-        const base = tag.split('-')[0];
+        const base = baseOf(tag);
         let loose = null;
         for (let i = 0; i < local.length; i++) {
           const have = langTag(local[i].lang);
           if (have === tag) return local[i];
-          if (!loose && have.split('-')[0] === base) loose = local[i];
+          if (!loose && baseOf(have) === base) loose = local[i];
         }
         if (loose) return loose;
       }
@@ -20302,37 +20498,70 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       return local.length ? local[0] : null;
     }
 
+    // . ! ? … ; : -- depois de um destes, um espaco acaba a frase.
+    function closes(c) {
+      return c === 46 || c === 33 || c === 63 || c === 0x2026 || c === 59 || c === 58;
+    }
+
+    // As frases do texto, com os espacos de cada uma reduzidos a um so.
+    function pieces(value) {
+      const out = [];
+      let current = '';
+      let gap = false;
+      for (let i = 0; i < value.length; i++) {
+        const c = codeAt(value, i);
+        if (c === 10) {
+          pushTo(out, current);
+          current = '';
+          gap = false;
+        } else if (blank(c)) {
+          if (current && closes(codeAt(current, current.length - 1))) {
+            pushTo(out, current);
+            current = '';
+            gap = false;
+          } else if (current) {
+            gap = true;
+          }
+        } else {
+          if (gap) { current += ' '; gap = false; }
+          current += fromCode(c);
+        }
+      }
+      pushTo(out, current);
+      return out;
+    }
+
     // O Chromium corta falas longas: uma frase por fala. Uma abreviatura
     // solta ("Sr.", "Fig.") cola-se a frase seguinte; uma frase enorme parte
     // em palavras.
     function sentences(value) {
       const out = [];
       let current = '';
-      const pieces = String(value).split(/\n+|(?<=[.!?…;:])\s+/);
-      for (let i = 0; i < pieces.length; i++) {
-        let piece = String(pieces[i] || '').replace(/\s+/g, ' ').trim();
+      const parts = pieces(toStr(value));
+      for (let i = 0; i < parts.length; i++) {
+        let piece = parts[i];
         while (piece.length > SPEECH_CHUNK) {
-          let cut = piece.lastIndexOf(' ', SPEECH_CHUNK);
+          let cut = findLast(piece, ' ', SPEECH_CHUNK);
           if (cut < SPEECH_CHUNK / 2) {
             // Sem espaco: corte seco, mas nunca a meio de um par UTF-16.
             cut = SPEECH_CHUNK;
-            const high = piece.charCodeAt(cut - 1);
+            const high = codeAt(piece, cut - 1);
             if (high >= 0xD800 && high <= 0xDBFF) cut--;
           }
-          if (current) { out.push(current); current = ''; }
-          out.push(piece.slice(0, cut).trim());
-          piece = piece.slice(cut).trim();
+          if (current) { pushTo(out, current); current = ''; }
+          pushTo(out, trimmed(sliceOf(piece, 0, cut)));
+          piece = trimmed(sliceOf(piece, cut));
         }
         if (!piece) continue;
-        if (current && current.length <= SPEECH_ABBREVIATION && current.indexOf(' ') < 0
+        if (current && current.length <= SPEECH_ABBREVIATION && findIn(current, ' ') < 0
             && current.length + 1 + piece.length <= SPEECH_CHUNK) {
           current = current + ' ' + piece;
         } else {
-          if (current) out.push(current);
+          if (current) pushTo(out, current);
           current = piece;
         }
       }
-      if (current) out.push(current);
+      if (current) pushTo(out, current);
       return out;
     }
 
@@ -20372,11 +20601,16 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       speaking = false;
       speechHold = null;
       setLabel('speak', LABELS.speak);
-      if (!stillSelected()) hide();
+      if (!text || !stillSelected()) hide();
     }
 
     function toggleSpeech() {
-      if (speaking) { stopSpeech(); return; }
+      if (speaking) {
+        stopSpeech();
+        // Parada a meio: a barra so fica se ainda mostrar a selecao atual.
+        if (!text || !stillSelected()) hide();
+        return;
+      }
       const parts = sentences(text);
       if (!parts.length) return;
       speechRun++;
@@ -20408,35 +20642,69 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       });
     }
 
+    // Os ouvintes do window em captura sao registados aqui, antes dos da
+    // pagina: correm primeiro e veem a selecao tal como o gesto a deixou.
+    listen(window, 'mousedown', guard(function (e) {
+      if (ours(targetOf(e))) {
+        prevent(e);
+        // O clique em Pesquisar conta com o estado da barra quando o botao
+        // desceu, e outra vez quando sobe.
+        pressReady = e.isTrusted ? readiness() : 'alterada';
+        return;
+      }
+      pressReady = 'alterada';
+      if (e.isTrusted) { downX = xOf(e); downY = yOf(e); }
+      drop();
+    }), true);
+
     listen(window, 'mouseup', guard(function (e) {
-      if (!e.isTrusted || e.button !== 0 || ours(e.target)) return;
+      if (!e.isTrusted || buttonOf(e) !== 0 || ours(targetOf(e))) return;
+      // So um arrasto, um duplo/triplo clique ou Shift+clique escolhem
+      // texto. Um clique simples nao: uma selecao que a pagina pos sozinha
+      // nao traz a barra.
+      const moved = abs(xOf(e) - downX) + abs(yOf(e) - downY);
+      if (moved < DRAG_MIN && detailOf(e) < 2 && !mouseShift(e)) {
+        if (!speaking) hide();
+        return;
+      }
       schedule();
     }), true);
 
-    listen(window, 'keyup', guard(function (e) {
+    function moves(key) {
+      return findIn(key, 'arrow') === 0 || key === 'home' || key === 'end'
+        || key === 'pageup' || key === 'pagedown';
+    }
+
+    // Teclado: so Shift+setas/Home/End/PgUp/PgDn e Ctrl+A escolhem texto.
+    // Setas e PgDn sozinhas so rolam; soltar o Ctrl depois de um Ctrl+C
+    // tambem nao: nenhum deles traz de volta uma barra fechada com Esc.
+    listen(window, 'keydown', guard(function (e) {
       if (!e.isTrusted) return;
-      const key = String(e.key || '').toLowerCase();
-      if (e.shiftKey || key === 'shift' || key === 'control' || key === 'meta'
-          || key.indexOf('arrow') === 0 || key === 'home' || key === 'end'
-          || key === 'pageup' || key === 'pagedown'
-          || ((e.ctrlKey || e.metaKey) && key === 'a')) {
-        schedule();
+      const key = lower(toStr(keyOf(e) || ''));
+      if ((keyShift(e) && moves(key)) || ((keyCtrl(e) || keyMeta(e)) && key === 'a')) {
+        keySelecting = true;
+      } else if (key !== 'shift' && key !== 'control' && key !== 'meta') {
+        keySelecting = false;
       }
     }), true);
 
-    listen(window, 'mousedown', guard(function (e) {
-      if (ours(e.target)) { e.preventDefault(); return; }
-      if (!speaking) hide();
+    listen(window, 'keyup', guard(function (e) {
+      if (!e.isTrusted || !keySelecting) return;
+      const key = lower(toStr(keyOf(e) || ''));
+      if (moves(key) || key === 'a' || key === 'shift' || key === 'control' || key === 'meta') {
+        keySelecting = false;
+        schedule();
+      }
     }), true);
 
     // Duplo clique nos botoes nao chega a pagina (no comparador expandia a
     // coluna).
     listen(window, 'dblclick', guard(function (e) {
-      if (ours(e.target)) { e.stopImmediatePropagation(); }
+      if (ours(targetOf(e))) { stopAll(e); }
     }), true);
 
     listen(document, 'selectionchange', guard(function () {
-      if (visible && !speaking && !stillSelected()) hide();
+      if (visible && !stillSelected()) drop();
     }));
 
     const quietHide = guard(function () { if (!speaking) hide(); });
@@ -20444,7 +20712,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     listen(window, 'resize', quietHide);
     listen(window, 'popstate', quietHide);
     listen(window, 'hashchange', quietHide);
-    listen(window, 'blur', guard(function () { if (!speaking) hide(); }));
+    listen(window, 'blur', quietHide);
     listen(window, 'pagehide', guard(function () { stopSpeech(); hide(); }));
 
     return {
@@ -21634,6 +21902,28 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
     act('link', { col:colIndex, url:target.href, aside:false });
   }, true);
 
+  // Duplo clique numa palavra seleciona-a, e quem responde e a barra de
+  // selecao (Pesquisar/Copiar/Falar). Expandir a coluna redimensionava o
+  // WebView e o 'resize' levava a barra: so expande o duplo clique que nao
+  // deixa texto selecionado. Primitivas capturadas aqui, no document-created.
+  const textSelected = (function () {
+    try {
+      const current = Function.prototype.call.bind(Document.prototype.getSelection);
+      const collapsed = Function.prototype.call.bind(
+        Object.getOwnPropertyDescriptor(Selection.prototype, 'isCollapsed').get);
+      const textOf = Function.prototype.call.bind(Selection.prototype.toString);
+      const trim = Function.prototype.call.bind(String.prototype.trim);
+      return function () {
+        try {
+          const selection = current(document);
+          return !!selection && !collapsed(selection) && trim('' + textOf(selection)) !== '';
+        } catch (_) { return false; }
+      };
+    } catch (_) {
+      return function () { return false; };
+    }
+  })();
+
   listen(document, 'dblclick', (event) => {
     if (!event.isTrusted || event.defaultPrevented) return;
     if (event.target && event.target.closest
@@ -21644,6 +21934,7 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
       ? event.target.tagName.toUpperCase() : '';
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
     if (event.target && event.target.isContentEditable) return;
+    if (textSelected()) return;
     act('expand', { col:colIndex });
   }, true);
 
