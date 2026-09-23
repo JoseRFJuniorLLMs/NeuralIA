@@ -472,18 +472,32 @@ async function load() {
   hud.hidden = false;
   updateHud();
   document.title = 'NeuralIA · PDF · ' + doc.numPages + ' páginas';
-  attachReadAloud();
+  attachReadAloud(await documentLanguage());
+}
+
+// O idioma que o PDF declara (o /Lang do catalogo, que o PDF.js da em
+// info.Language). O lang do viewer.html e o da pagina do NeuralIA, nao o do
+// documento: sem declaracao, a leitura ouve o texto de cada pagina.
+async function documentLanguage() {
+  try {
+    const meta = await doc.getMetadata();
+    const lang = meta && meta.info && meta.info.Language;
+    const tag = typeof lang === 'string' ? lang.trim() : '';
+    return /^[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{1,8})*$/.test(tag) ? tag : '';
+  } catch (err) {
+    return '';
+  }
 }
 
 // Liga o read-aloud.js a este documento. Ele so ve paginas por indice: o
 // texto (getTextContent), os spans da camada de texto ja desenhada e um
 // pedido para trazer a pagina ao ecra.
-function attachReadAloud() {
+function attachReadAloud(lang) {
   const api = window.NeuralIAReadAloud;
   if (!api || readAloud) return;
   readAloud = api.attachPdf({
     window,
-    lang: document.documentElement.lang,
+    lang,
     pageCount: () => slots.length,
     currentPage: () => current - 1,
     textContent: (i) => textContentOf(i).then((content) => (content ? content.items : [])),

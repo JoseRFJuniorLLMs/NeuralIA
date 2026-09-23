@@ -25,6 +25,34 @@ pub(crate) mod harness {
     /// depois `drive` (corpo de uma funcao async). Devolve
     /// `{result, errors, net, posted, nav}`. Sem Node nao ha gate: falha.
     pub(crate) fn run(scripts: &[(&str, &str)], href: &str, drive: &str) -> Value {
+        run_with(scripts, href, None, drive)
+    }
+
+    /// Um modulo ES que embarca: o nome, o texto tal e qual, e o `prelude`
+    /// que lhe monta o DOM e os `__modules` que os `import` dele recebem.
+    pub(crate) struct Module<'a> {
+        pub(crate) name: &'a str,
+        pub(crate) text: &'a str,
+        pub(crate) prelude: &'a str,
+    }
+
+    /// Como `run`, e depois dos scripts avalia `module` no mesmo contexto
+    /// (node com `--experimental-vm-modules`), antes do `drive`.
+    pub(crate) fn run_module(
+        scripts: &[(&str, &str)],
+        href: &str,
+        module: Module<'_>,
+        drive: &str,
+    ) -> Value {
+        run_with(scripts, href, Some(module), drive)
+    }
+
+    fn run_with(
+        scripts: &[(&str, &str)],
+        href: &str,
+        module: Option<Module<'_>>,
+        drive: &str,
+    ) -> Value {
         use std::io::Write;
         use std::process::{Command, Stdio};
 
@@ -34,10 +62,19 @@ pub(crate) mod harness {
                 .map(|(name, text)| serde_json::json!({ "name": name, "text": text }))
                 .collect::<Vec<_>>(),
             "href": href,
+            "module": module.as_ref().map(|module| serde_json::json!({
+                "name": module.name,
+                "text": module.text,
+                "prelude": module.prelude,
+            })),
             "drive": drive,
         });
         let program = format!("const INPUT = {input};\n{HARNESS}");
-        let mut child = Command::new("node")
+        let mut command = Command::new("node");
+        if module.is_some() {
+            command.arg("--experimental-vm-modules").arg("--no-warnings");
+        }
+        let mut child = command
             .arg("-")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -757,6 +794,170 @@ return __speech.log.map((x) => x.rate);
 "#
         ));
         assert_eq!(clean_result(&outcome), &json!([1.5]));
+    }
+
+    /// Gate: num PDF com tags (Word, InDesign, PDF/UA) o PDF.js fecha o texto
+    /// em cada conteudo marcado e o fim de linha chega num item VAZIO
+    /// `{str: '', hasEOL: true}`. A palavra partida por hifen tem de se colar
+    /// na fala na mesma -- antes a voz dizia "exem" ... "plo".
+    #[test]
+    fn read_aloud_joins_a_hyphenated_word_across_an_empty_end_of_line_item() {
+        let outcome = pdf(&format!(
+            r#"{VOICES}
+__contentLoaded();
+__speech.setVoices([LOCAL_BR]);
+// A forma exata que o getTextContent() do PDF.js vendorizado da num PDF com
+// BDC/EMC por linha (medido com o pdf.mjs 6.3.289): o hifen num item, o fim
+// de linha num item vazio, o resto da palavra no seguinte.
+__pdf([[
+  {{ str: 'Isto e um exem-', eol: false }},
+  {{ str: '', eol: true }},
+  {{ str: 'plo de texto. Outra frase com hí-', eol: false }},
+  {{ str: '', eol: true }},
+  {{ str: '', eol: false }},
+  {{ str: 'fen.', eol: false }},
+]]);
+__renderPage(0);
+__key({{ key: 'U', ctrlKey: true, shiftKey: true }});
+await __settle();
+__speech.finish(); await __settle();
+const plain = NeuralIAReadAloud.pageModel([
+  {{ text: 'Isto e um exem-', eol: true }},
+  {{ text: 'plo de texto.', eol: false }},
+]);
+return {{
+  said: __said(),
+  plain: plain.sentences.map((s) => NeuralIAReadAloud.spokenText(plain, s)),
+}};
+"#
+        ));
+        let result = clean_result(&outcome);
+        assert_eq!(
+            strings(&result["said"]),
+            ["Isto e um exemplo de texto.", "Outra frase com hífen."]
+        );
+        assert_eq!(strings(&result["plain"]), ["Isto e um exemplo de texto."]);
+    }
+
+    /// Gate: uma frase que acaba num numero com pontos ("12.000", "R$
+    /// 1.500", "3.14") ou num endereco ("www.exemplo.pt") fecha quando a
+    /// seguinte comeca por maiuscula. As siglas so com letras ("e.g.", "S.A.",
+    /// "Ph.D.") continuam a nao fechar.
+    #[test]
+    fn read_aloud_a_sentence_ending_in_a_number_or_an_address_still_ends() {
+        let outcome = pdf(r#"
+const cases = [
+  'A população é de 12.000. Depois cresceu.',
+  'O valor é 3.14. Depois mudou.',
+  'Visite www.exemplo.pt. Depois volte.',
+  'Custou R$ 1.500. Em seguida caiu.',
+  'Ele nasceu em 1990. Depois estudou.',
+  'A empresa X S.A. Comprou tudo.',
+  'O Ph.D. Silva chegou.',
+];
+return cases.map((text) =>
+  NeuralIAReadAloud.segmentSentences(text).map((s) => text.slice(s.start, s.end)));
+"#);
+        assert_eq!(
+            clean_result(&outcome),
+            &json!([
+                ["A população é de 12.000.", "Depois cresceu."],
+                ["O valor é 3.14.", "Depois mudou."],
+                ["Visite www.exemplo.pt.", "Depois volte."],
+                ["Custou R$ 1.500.", "Em seguida caiu."],
+                ["Ele nasceu em 1990.", "Depois estudou."],
+                ["A empresa X S.A. Comprou tudo."],
+                ["O Ph.D. Silva chegou."]
+            ])
+        );
+    }
+
+    /// Gate: a voz escolhida fica guardada POR IDIOMA. A inglesa escolhida
+    /// para um documento em ingles nao passa a ler os em portugues, e a
+    /// escolha antiga (uma so para tudo) vale so para o idioma da propria voz.
+    #[test]
+    fn read_aloud_remembers_the_chosen_voice_per_language() {
+        let voice_for = |stored: &str, text: &str| {
+            let outcome = pdf(&format!(
+                r#"{VOICES}
+localStorage.setItem('neuralia.readAloud.v1', JSON.stringify({stored}));
+__contentLoaded();
+__speech.setVoices([LOCAL_BR, LOCAL_EN]);
+// Sem idioma declarado (como um PDF sem /Lang): ouve-se o texto.
+const state = {{ current: 0 }};
+__ctl = NeuralIAReadAloud.attachPdf({{
+  window,
+  lang: '',
+  pageCount: () => 1,
+  currentPage: () => 0,
+  textContent: () => Promise.resolve([{{ str: {text}, hasEOL: false }}]),
+  textDivs: () => null,
+  pageOf: () => null,
+  showPage: () => {{}},
+}});
+__key({{ key: 'U', ctrlKey: true, shiftKey: true }});
+await __settle();
+return __speech.log.map((x) => x.voice)[0] || null;
+"#,
+                text = json!(text)
+            ));
+            clean_result(&outcome).as_str().unwrap_or_default().to_string()
+        };
+        let english = "The quick brown fox jumps over the lazy dog. It was sunny and the children were playing in the park with their friends.";
+        let portuguese = "A raposa pula por cima do cão. Não é uma história com muito sentido, mas é da tradição dos testes.";
+        let zira = "Microsoft Zira - English (United States)";
+        let maria = "Microsoft Maria - Portuguese (Brazil)";
+        let per_language = r#"{ "voices": { "en": "Microsoft Zira - English (United States)" } }"#;
+        assert_eq!(voice_for(per_language, english), zira);
+        assert_eq!(voice_for(per_language, portuguese), maria);
+        let legacy = r#"{ "voice": "Microsoft Zira - English (United States)" }"#;
+        assert_eq!(voice_for(legacy, portuguese), maria, "a escolha antiga");
+        assert_eq!(voice_for(legacy, english), zira);
+        // E escolher no seletor guarda para o idioma do documento aberto.
+        let outcome = pdf(&format!(
+            r#"{VOICES}
+__contentLoaded();
+__speech.setVoices([LOCAL_BR, LOCAL_EN]);
+__pdf([[{{ str: {english}, eol: false }}]]);
+__renderPage(0);
+__key({{ key: 'U', ctrlKey: true, shiftKey: true }});
+await __settle();
+__change(__byId('neuralia-ra-voice'), LOCAL_EN.voiceURI);
+await __settle();
+return JSON.parse(__stored()['neuralia.readAloud.v1']).voices;
+"#,
+            english = json!(english)
+        ));
+        // O __pdf do harness declara 'pt' (como o viewer antigo): a escolha
+        // fica para 'pt'.
+        assert_eq!(clean_result(&outcome), &json!({ "pt": zira }));
+    }
+
+    /// Gate: sem voz online nenhuma no runtime, o seletor diz-o por extenso
+    /// no grupo Online, em vez de o grupo simplesmente nao existir.
+    #[test]
+    fn read_aloud_picker_says_when_there_is_no_online_voice() {
+        let outcome = pdf(&format!(
+            r#"{VOICES}
+__contentLoaded();
+__speech.setVoices([LOCAL_EN, LOCAL_BR]);
+__pdf([[{{ str: 'Olá.', eol: false }}]]);
+const select = __byId('neuralia-ra-voice');
+return select.children.map((g) => ({{
+  label: g.getAttribute('label'),
+  options: g.children.map((o) => [o.value, o.textContent, !!o.disabled]),
+}}));
+"#
+        ));
+        let result = clean_result(&outcome);
+        assert_eq!(
+            result[1],
+            json!({
+                "label": "Online — precisa de internet; o texto vai para o provedor da voz",
+                "options": [["", "Nenhuma voz online neste Windows — lê com as vozes instaladas", true]]
+            }),
+            "{result}"
+        );
     }
 
     #[test]

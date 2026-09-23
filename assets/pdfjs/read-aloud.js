@@ -41,6 +41,7 @@
   const NO_VOICE = 'Nenhuma voz do Windows está disponível.\nInstale uma em Configurações › Hora e idioma › Fala.';
   const NO_OFFLINE_VOICE = 'Não há voz offline do Windows.\nEscolha uma voz online no seletor (o texto sai do computador)\nou instale uma em Configurações › Hora e idioma › Fala.';
   const NO_SPEECH = 'Este WebView não oferece síntese de voz.';
+  const NO_ONLINE_VOICE = 'Nenhuma voz online neste Windows — lê com as vozes instaladas';
   const NOTHING_TO_READ = 'Não há texto para ler aqui (página digitalizada?).';
   const END_OF_TEXT = 'Leitura concluída.';
 
@@ -83,8 +84,10 @@
     const bare = word.toLowerCase();
     if (!bare || bare === 'etc') return true;
     if (ABBREVIATIONS.has(bare)) return false;
-    // Iniciais ("J. R. Tolkien") e siglas com pontos ("e.g.", "a.C.").
-    if (/^\p{L}$/u.test(word) || bare.indexOf('.') >= 0) return false;
+    // Iniciais ("J. R. Tolkien") e siglas com pontos ("e.g.", "a.C.", "S.A.",
+    // "Ph.D."): so letras entre os pontos. Um numero ("12.000", "R$ 1.500",
+    // "3.14") ou um endereco ("www.exemplo.pt") no fim da frase fecha-a.
+    if (/^\p{L}$/u.test(word) || /^(?:\p{L}{1,3}\.)+\p{L}{1,3}$/u.test(word)) return false;
     return true;
   }
 
@@ -177,9 +180,16 @@
         continue;
       }
       if (unit.eol) {
-        const next = units[k + 1];
-        const following = next && typeof next.text === 'string' ? next.text : '';
-        if (/\p{L}-$/u.test(piece) && /^\p{Ll}/u.test(following)) {
+        // Num PDF com tags (Word, InDesign, PDF/UA) o PDF.js fecha o texto em
+        // cada conteudo marcado e o fim de linha chega num item VAZIO: o
+        // hifen fica no pedaco anterior e o resto da palavra pode vir depois
+        // de outros vazios. Olha-se o texto ja junto e salta-se o que e vazio.
+        let following = '';
+        for (let n = k + 1; n < units.length && !following; n++) {
+          const next = units[n];
+          following = next && typeof next.text === 'string' ? next.text : '';
+        }
+        if (/\p{L}-$/u.test(text.slice(-3)) && /^\p{Ll}/u.test(following)) {
           drops.push(text.length - 1);
         } else {
           text += '\n';
@@ -251,6 +261,41 @@
     return wanted === primary ? [primary] : [wanted, primary];
   }
 
+  function primaryOf(lang) {
+    return normLang(lang).split('-')[0];
+  }
+
+  // Palavras que so uma das linguas usa a toda a hora. Contam-se no texto da
+  // pagina: o idioma que o documento nao declara (o Modo Leitura e o
+  // visualizador sao paginas NOSSAS, em pt -- o lang delas nao diz nada do
+  // artigo) sai daqui. Sem confianca, nada: fica o pt-BR.
+  const STOPWORDS = {
+    pt: 'não uma os com é são do da dos das nos nas pelo pela também foi ao aos seu sua isso muito já quando então',
+    en: 'the and of to is in that it was for with as are on be this by not or have from which were their has but',
+    es: 'el los las del y en es con una lo al más pero está son fue esta',
+    fr: 'le les des du et est une dans pour pas qui sur au avec il ce ne sont nous vous mais cette',
+    de: 'der die das und ist nicht ein eine zu den mit von auf für sich dem auch im sind werden',
+  };
+  const STOPWORD_SETS = Object.fromEntries(
+    Object.entries(STOPWORDS).map(([code, words]) => [code, new Set(words.split(' '))])
+  );
+  const GUESS_MIN_HITS = 4;
+
+  function guessLang(text) {
+    const counts = {};
+    for (const code of Object.keys(STOPWORD_SETS)) counts[code] = 0;
+    const words = String(text || '').toLowerCase().match(/\p{L}+/gu) || [];
+    for (const word of words.slice(0, 4000)) {
+      for (const code of Object.keys(STOPWORD_SETS)) {
+        if (STOPWORD_SETS[code].has(word)) counts[code] += 1;
+      }
+    }
+    const ranked = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+    const [best, second] = ranked;
+    if (best[1] < GUESS_MIN_HITS || best[1] < second[1] * 1.5) return '';
+    return best[0];
+  }
+
   // A voz a usar. Uma escolha guardada vale enquanto existir (foi o
   // utilizador que a fez, online incluida). Sem ela: so vozes locais -- a do
   // idioma do documento (pt-BR primeiro), depois a predefinida do Windows,
@@ -300,7 +345,8 @@
 
   function prefsStore(win) {
     // Origem local do visualizador: o localStorage basta. No Modo Leitura a
-    // origem e opaca e o acesso lanca -- a escolha vale so para a sessao.
+    // origem e opaca e o acesso lanca, e cada artigo e uma WebView nova: a
+    // escolha vale so para o artigo aberto.
     return {
       load() {
         try {
@@ -315,7 +361,7 @@
         try {
           win.localStorage.setItem(STORE_KEY, JSON.stringify(value));
         } catch (e) {
-          /* sem armazenamento: a escolha vale so para a sessao */
+          /* sem armazenamento: a escolha vale so para esta pagina */
         }
       },
     };
@@ -450,12 +496,27 @@
     const Utterance = options.Utterance;
     const painter = options.painter;
     const notify = options.notify;
-    const lang = options.lang;
+    // O idioma que o DOCUMENTO declara (o /Lang do PDF); vazio quando nao
+    // declara nada -- ai vale o que o texto da pagina diz (`guessLang`).
+    const declared = normLang(options.lang);
     const prefs = options.prefs;
     const saved = prefs.load();
 
     let rate = clampRate(saved.rate);
-    let voiceUri = typeof saved.voice === 'string' ? saved.voice : '';
+    // A voz escolhida POR IDIOMA: a inglesa escolhida para um artigo em
+    // ingles nao passa a ler os documentos em portugues.
+    const byLang = {};
+    if (saved.voices && typeof saved.voices === 'object') {
+      for (const [code, uri] of Object.entries(saved.voices)) {
+        if (typeof uri === 'string' && /^[a-z]{2,3}$/.test(code)) byLang[code] = uri;
+      }
+    }
+    // A escolha de antes desta versao (uma so para tudo) vale para o idioma
+    // da propria voz.
+    const legacy = typeof saved.voice === 'string' ? saved.voice : '';
+    // O ultimo idioma que o texto disse com confianca: uma pagina curta
+    // (titulo, figura) nao troca a voz a meio do documento.
+    let heard = '';
     let state = 'idle';
     // Cada operacao que invalida o que estava em curso incrementa o token:
     // leituras de pagina assincronas que voltam depois disso nao fazem nada.
@@ -486,8 +547,22 @@
       return safe(() => Array.prototype.slice.call(speech.getVoices() || [])) || [];
     }
 
+    // O idioma da leitura agora: o declarado pelo documento; senao o da
+    // pagina a ser lida; senao o ultimo ouvido; senao pt-BR.
+    function language() {
+      return declared || (model && model.lang) || heard || 'pt-br';
+    }
+
+    function storedVoice(primary) {
+      if (byLang[primary]) return byLang[primary];
+      if (!legacy) return '';
+      const kept = voices().find((v) => v && v.voiceURI === legacy);
+      return kept && primaryOf(kept.lang) === primary ? legacy : '';
+    }
+
     function voice() {
-      return chooseVoice(voices(), voiceUri, lang);
+      const lang = language();
+      return chooseVoice(voices(), storedVoice(primaryOf(lang)), lang);
     }
 
     function pageCount() {
@@ -512,7 +587,7 @@
     }
 
     function save() {
-      prefs.save({ voice: voiceUri, rate });
+      prefs.save({ voices: byLang, voice: legacy, rate });
     }
 
     function onVoicesChanged() {
@@ -559,7 +634,11 @@
           .then(
             (units) => pageModel(units || [], !!source.hardBreaks),
             () => pageModel([], false)
-          );
+          )
+          .then((m) => {
+            m.lang = guessLang(m.text);
+            return m;
+          });
         cache.set(p, pending);
         // So a vizinhanca fica em memoria: um livro de 900 paginas lido de
         // ponta a ponta nao acumula o texto todo.
@@ -647,6 +726,7 @@
         advancePage();
         return;
       }
+      if (model.lang) heard = model.lang;
       const chosen = voice();
       if (!chosen) {
         halt();
@@ -655,7 +735,7 @@
       }
       const u = new Utterance(spokenText(model, sentence));
       u.voice = chosen;
-      u.lang = chosen.lang || lang;
+      u.lang = chosen.lang || language();
       u.rate = rate;
       u.onend = () => finished(u);
       u.onerror = (event) => failed(u, event);
@@ -874,7 +954,7 @@
 
     function setVoice(uri) {
       if (!uri) return;
-      voiceUri = String(uri);
+      byLang[primaryOf(language())] = String(uri);
       save();
       restart();
     }
@@ -896,6 +976,7 @@
       pageReady,
       voices,
       voice,
+      language,
       state: () => state,
       rate: () => rate,
       snapshot,
@@ -1007,6 +1088,9 @@
     ':root{--neuralia-ra-surface:#1d2023;--neuralia-ra-fg:#e9ecef;--neuralia-ra-line:rgba(255,255,255,.14);--neuralia-ra-accent:#8ab4f8;--neuralia-ra-on-accent:#111314}',
     '@media (prefers-color-scheme: light){:root{--neuralia-ra-surface:#ffffff;--neuralia-ra-fg:#17191b;--neuralia-ra-line:rgba(0,0,0,.12);--neuralia-ra-accent:#1a73e8;--neuralia-ra-on-accent:#ffffff}}',
     '#neuralia-ra-toggle{position:fixed;top:12px;right:16px;z-index:2147483000;width:38px;height:38px;display:grid;place-items:center;padding:0;border:1px solid var(--neuralia-ra-line);border-radius:999px;background:var(--neuralia-ra-surface);color:var(--neuralia-ra-fg);box-shadow:0 6px 24px rgba(0,0,0,.3);cursor:pointer}',
+    // A barra de procura do Ctrl+F (#neuralia-find, do mapa de teclas) nasce
+    // no mesmo canto: com ela aberta o botao desce para debaixo dela.
+    ':root:has(#neuralia-find) #neuralia-ra-toggle{top:60px}',
     '#neuralia-ra-toggle[aria-pressed="true"]{background:var(--neuralia-ra-accent);color:var(--neuralia-ra-on-accent);border-color:transparent}',
     '#neuralia-ra-bar{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:2147483000;display:flex;align-items:center;gap:4px;padding:6px 8px;max-width:calc(100vw - 32px);border:1px solid var(--neuralia-ra-line);border-radius:999px;background:var(--neuralia-ra-surface);color:var(--neuralia-ra-fg);box-shadow:0 10px 32px rgba(0,0,0,.35);font:600 13px "Segoe UI",system-ui,sans-serif}',
     '#neuralia-ra-bar[hidden],#neuralia-ra-hint[hidden]{display:none}',
@@ -1157,6 +1241,20 @@
         [OFFLINE_GROUP, groups.offline],
         [ONLINE_GROUP, groups.online],
       ]) {
+        if (!members.length && label === ONLINE_GROUP) {
+          // O WebView2 deste Windows nao expoe voz online nenhuma: diz-se
+          // por extenso, em vez de o grupo simplesmente nao existir.
+          const group = make('optgroup');
+          group.label = label;
+          group.setAttribute('label', label);
+          const none = make('option');
+          none.value = '';
+          none.disabled = true;
+          none.textContent = NO_ONLINE_VOICE;
+          group.appendChild(none);
+          voice.appendChild(group);
+          continue;
+        }
         if (!members.length) continue;
         const group = make('optgroup');
         group.label = label;
@@ -1214,7 +1312,10 @@
   function attach(source, options) {
     const win = window;
     const doc = document;
-    const lang = (options && options.lang) || (doc.documentElement && doc.documentElement.lang) || 'pt-BR';
+    // So o idioma que o DOCUMENTO declara. O lang do <html> e o da pagina
+    // do NeuralIA (pt), nao o do artigo nem o do PDF: sem declaracao, o
+    // motor ouve o texto (`guessLang`).
+    const lang = (options && options.lang) || '';
     const ui = createUi(doc);
     const speech = win.speechSynthesis;
     const Utterance = win.SpeechSynthesisUtterance;
@@ -1232,7 +1333,7 @@
         : null;
 
     function refreshVoices() {
-      if (engine) ui.fillVoices(engine.voices(), engine.voice(), lang);
+      if (engine) ui.fillVoices(engine.voices(), engine.voice(), engine.language());
     }
 
     function busy() {
@@ -1333,7 +1434,7 @@
     if (active) return;
     const shell = document.getElementById('neural-shell');
     if (!shell || !shell.classList || !shell.classList.contains('reader')) return;
-    attach(createReaderSource(window, shell), { lang: document.documentElement.lang });
+    attach(createReaderSource(window, shell), {});
   });
 
   window.NeuralIAReadAloud = Object.freeze({
@@ -1348,9 +1449,11 @@
     segmentsFor,
     chooseVoice,
     groupVoices,
+    guessLang,
     RATES,
     MAX_UTTERANCE,
     OFFLINE_GROUP,
     ONLINE_GROUP,
+    NO_ONLINE_VOICE,
   });
 })();

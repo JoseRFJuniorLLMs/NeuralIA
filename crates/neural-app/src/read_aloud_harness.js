@@ -782,6 +782,29 @@ async function main() {
   for (const script of INPUT.scripts) {
     vm.runInContext(script.text, context, { filename: script.name });
   }
+  // Um modulo ES QUE EMBARCA (o viewer.mjs), no mesmo contexto: o
+  // `prelude` monta o DOM dele e poe em `__modules` o que cada `import`
+  // recebe (o pdf.mjs e trocado por um PDF.js de mentira). O texto do
+  // modulo corre tal e qual.
+  if (INPUT.module) {
+    if (INPUT.module.prelude) {
+      vm.runInContext(INPUT.module.prelude, context, { filename: 'module_prelude.js' });
+    }
+    const mod = new vm.SourceTextModule(INPUT.module.text, { context, identifier: INPUT.module.name });
+    await mod.link((specifier) => {
+      const exportsOf = context.__modules && context.__modules[specifier];
+      if (!exportsOf) throw new Error('import nao previsto no gate: ' + specifier);
+      const names = Object.keys(exportsOf);
+      return new vm.SyntheticModule(
+        names,
+        function () {
+          for (const name of names) this.setExport(name, exportsOf[name]);
+        },
+        { context, identifier: specifier }
+      );
+    });
+    await mod.evaluate();
+  }
   let result = null;
   try {
     result = await vm.runInContext('(async () => {\n' + INPUT.drive + '\n})()', context, { filename: 'drive.js' });

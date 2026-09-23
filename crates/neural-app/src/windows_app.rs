@@ -18298,6 +18298,234 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
             .expect("pedido de teste")
     }
 
+    /// O DOM do viewer.html (#status, #hud, #pages), um canvas sem pixeis, o
+    /// scroll da janela (regista o destino e dispara 'scroll') e um PDF.js de
+    /// mentira no lugar do ./pdf.mjs: paginas de 600x800, o texto de cada
+    /// uma, o /Lang do documento e uma TextLayer que cria os textDivs como a
+    /// verdadeira.
+    const VIEWER_PRELUDE: &str = r#"
+globalThis.console = {
+  error: (...parts) => __errors.push('console.error: ' + parts.map(String).join(' ')),
+  warn() {},
+  log() {},
+};
+for (const id of ['status', 'hud', 'pages']) {
+  const el = document.createElement('div');
+  el.id = id;
+  document.body.appendChild(el);
+}
+__byId('hud').hidden = true;
+const __make = document.createElement.bind(document);
+document.createElement = (tag) => {
+  const el = __make(tag);
+  if (String(tag).toLowerCase() === 'canvas') el.getContext = () => ({});
+  return el;
+};
+document.createDocumentFragment = () => __make('fragment');
+globalThis.__scrolledTo = [];
+window.scrollTo = (options) => {
+  const top = options && typeof options === 'object' ? options.top : Number(options);
+  __scrolledTo.push(top);
+  window.scrollY = top;
+  __dispatch(window, 'scroll', { bubbles: false });
+};
+class TextLayer {
+  constructor({ textContentSource, container }) {
+    this.source = textContentSource;
+    this.container = container;
+    this.textDivs = [];
+  }
+  render() {
+    const page = this.source.__page;
+    this.source.items.forEach((item, k) => {
+      if (typeof item.str !== 'string') return;
+      const span = document.createElement('span');
+      span.textContent = item.str;
+      span.setAttribute('data-unit', page + ':' + k);
+      if (item.str !== '') this.container.appendChild(span);
+      this.textDivs.push(span);
+    });
+    return Promise.resolve();
+  }
+  cancel() {}
+}
+const __page = (i) => ({
+  getViewport: ({ scale }) => ({ width: 600 * scale, height: 800 * scale }),
+  render: () => ({ promise: Promise.resolve(), cancel() {} }),
+  getTextContent: () =>
+    Promise.resolve({ items: __pdfPages[i].map((it) => ({ str: it.str, hasEOL: !!it.eol })), __page: i }),
+  cleanup() {},
+});
+const __doc = {
+  numPages: __pdfPages.length,
+  getPage: (n) => Promise.resolve(__page(n - 1)),
+  getMetadata: () => Promise.resolve({ info: __pdfLang ? { Language: __pdfLang } : {} }),
+};
+globalThis.__modules = {
+  './pdf.mjs': {
+    GlobalWorkerOptions: {},
+    getDocument: () => ({ promise: Promise.resolve(__doc) }),
+    TextLayer,
+  },
+};
+"#;
+
+    /// Corre o viewer.mjs e o read-aloud.js QUE O serve_pdf_asset SERVE --
+    /// os bytes da resposta, nao uma copia -- sobre o PDF de mentira, e
+    /// depois o `drive`.
+    fn run_pdf_viewer(pages: serde_json::Value, lang: Option<&str>, drive: &str) -> serde_json::Value {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let served = |path: &str| {
+            let response = serve_pdf_asset(&bytes, &pdf_request(path));
+            assert_eq!(response.status().as_u16(), 200, "{path}");
+            String::from_utf8(response.body().to_vec()).expect("UTF-8")
+        };
+        let viewer = served("/viewer.mjs");
+        let read_aloud = served("/read-aloud.js");
+        let prelude = format!(
+            "const __pdfPages = {pages};\nconst __pdfLang = {};\n{VIEWER_PRELUDE}",
+            serde_json::json!(lang)
+        );
+        let outcome = crate::read_aloud::harness::run_module(
+            &[("read-aloud.js", &read_aloud)],
+            &format!("{PDF_ORIGIN}/viewer.html"),
+            crate::read_aloud::harness::Module {
+                name: "viewer.mjs",
+                text: &viewer,
+                prelude: &prelude,
+            },
+            drive,
+        );
+        crate::read_aloud::harness::clean_result(&outcome).clone()
+    }
+
+    const VIEWER_VOICES: &str = r#"
+const LOCAL_BR = __voice('Microsoft Maria - Portuguese (Brazil)', 'pt-BR', true);
+const LOCAL_EN = __voice('Microsoft Zira - English (United States)', 'en-US', true, { default: true });
+__speech.setVoices([LOCAL_BR, LOCAL_EN]);
+await __settle();
+"#;
+
+    fn three_pages() -> serde_json::Value {
+        serde_json::json!([
+            [{ "str": "Primeira página. Fim um.", "eol": false }],
+            [{ "str": "Segunda página. Fim dois.", "eol": false }],
+            [{ "str": "Terceira página. Fim três.", "eol": false }],
+        ])
+    }
+
+    /// Gate: o visualizador de PDF QUE EMBARCA liga mesmo a leitura em voz
+    /// alta ao documento -- ate aqui os gates usavam um visualizador falso do
+    /// harness e o `attachReadAloud()` podia sair sem nada ficar vermelho.
+    /// Com o viewer.mjs servido e um PDF.js de mentira: (1) o Ctrl+Shift+U le
+    /// a pagina que o HUD mostra e realca a frase nos textDivs da TextLayer;
+    /// (2) chegada a uma pagina ainda sem camada de texto, a leitura rola ate
+    /// ela (tops[i] - 24) e o realce aparece quando a camada fica pronta
+    /// (`renderTextLayer` -> `pageReady`).
+    #[test]
+    fn the_shipped_pdf_viewer_reads_the_page_under_the_hud_and_highlights_late_pages() {
+        let hud = run_pdf_viewer(
+            three_pages(),
+            None,
+            &format!(
+                r#"{VIEWER_VOICES}
+window.scrollY = 1300;
+__dispatch(window, 'scroll', {{ bubbles: false }});
+__tick(20);
+await __settle();
+const hud = __byId('hud').textContent;
+__key({{ key: 'U', ctrlKey: true, shiftKey: true }});
+await __settle();
+return {{ hud, said: __said(), highlight: __highlight().map((h) => h.text) }};
+"#
+            ),
+        );
+        assert_eq!(hud["hud"], "2 / 3", "{hud}");
+        assert_eq!(
+            hud["said"],
+            serde_json::json!(["Segunda página."]),
+            "o Ctrl+Shift+U nao leu a pagina do HUD: {hud}"
+        );
+        assert_eq!(hud["highlight"], serde_json::json!(["Segunda página."]));
+
+        let late = run_pdf_viewer(
+            three_pages(),
+            None,
+            &format!(
+                r#"{VIEWER_VOICES}
+__key({{ key: 'U', ctrlKey: true, shiftKey: true }});
+await __settle();
+for (let i = 0; i < 4; i++) {{ __speech.finish(); await __settle(); }}
+const before = __highlight().map((h) => h.text);
+__tick(20);
+await __settle();
+return {{ said: __said(), scrolledTo: __scrolledTo, before, after: __highlight().map((h) => h.text) }};
+"#
+            ),
+        );
+        assert_eq!(
+            late["said"],
+            serde_json::json!([
+                "Primeira página.",
+                "Fim um.",
+                "Segunda página.",
+                "Fim dois.",
+                "Terceira página."
+            ]),
+            "{late}"
+        );
+        // tops[2] = 200 + 2 x 1280 (paginas de 800 a escala 960/600).
+        assert!(
+            late["scrolledTo"]
+                .as_array()
+                .expect("scrolledTo")
+                .contains(&serde_json::json!(2736)),
+            "a leitura nao levou a pagina 3 ao ecra: {late}"
+        );
+        assert_eq!(late["before"], serde_json::json!([]), "{late}");
+        assert_eq!(
+            late["after"],
+            serde_json::json!(["Terceira página."]),
+            "a camada de texto chegou e o realce nao: {late}"
+        );
+    }
+
+    /// Gate: a voz e a do idioma do DOCUMENTO. O visualizador passa o /Lang
+    /// do PDF (`info.Language`); sem ele, o idioma sai do texto da pagina.
+    /// Antes ia sempre o `lang="pt"` do proprio viewer.html, e um artigo em
+    /// ingles era lido pela voz pt-BR com uma voz inglesa instalada.
+    #[test]
+    fn the_shipped_pdf_viewer_reads_with_the_voice_of_the_document_language() {
+        let voice_for = |pages: serde_json::Value, lang: Option<&str>| {
+            let result = run_pdf_viewer(
+                pages,
+                lang,
+                &format!(
+                    r#"{VIEWER_VOICES}
+__key({{ key: 'U', ctrlKey: true, shiftKey: true }});
+await __settle();
+return __speech.log.map((x) => x.voice);
+"#
+                ),
+            );
+            result[0].as_str().unwrap_or_default().to_string()
+        };
+        let zira = "Microsoft Zira - English (United States)";
+        let maria = "Microsoft Maria - Portuguese (Brazil)";
+        let short = serde_json::json!([[{ "str": "OK. Fim.", "eol": false }]]);
+        let english = serde_json::json!([[{
+            "str": "The quick brown fox jumps over the lazy dog. It was sunny and the children were playing in the park with their friends.",
+            "eol": false
+        }]]);
+        let portuguese = serde_json::json!([[{
+            "str": "A raposa pula por cima do cão. Não é uma história com muito sentido, mas é da tradição dos testes.",
+            "eol": false
+        }]]);
+        assert_eq!(voice_for(short, Some("en-US")), zira, "o /Lang do PDF");
+        assert_eq!(voice_for(english, None), zira, "o texto em ingles");
+        assert_eq!(voice_for(portuguese, None), maria, "o texto em portugues");
+    }
+
     #[test]
     fn pdf_viewer_loads_read_aloud_from_its_own_origin_and_gains_no_network_source() {
         // SPEC-0110, fase offline. O viewer.html pede o read-aloud.js a
@@ -18522,6 +18750,55 @@ return out;
             "o Esc da leitura nao sai do Reader"
         );
         assert_eq!(outcome["net"], serde_json::json!([]));
+    }
+
+    /// Gate: um artigo em ingles no Modo Leitura e lido pela voz inglesa. O
+    /// lang="pt-BR" do HTML do Leitor e o do NeuralIA, nao o do artigo: o
+    /// idioma sai do texto. Um artigo em portugues continua na voz pt-BR.
+    #[test]
+    fn reader_mode_reads_an_english_article_with_the_english_voice() {
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let init = App::reader_init_script(CAP);
+        let voice_for = |title: &str, body: &str| {
+            let drive = format!(
+                r#"
+__speech.setVoices([
+  __voice('Microsoft Maria - Portuguese (Brazil)', 'pt-BR', true),
+  __voice('Microsoft Zira - English (United States)', 'en-US', true, {{ default: true }}),
+]);
+__readerDom({title}, [{{ tag: 'p', text: {body} }}]);
+__contentLoaded();
+__key({{ key: 'U', ctrlKey: true, shiftKey: true }});
+await __settle();
+return __speech.log.map((x) => x.voice)[0] || null;
+"#,
+                title = serde_json::json!(title),
+                body = serde_json::json!(body)
+            );
+            let outcome = crate::read_aloud::harness::run(
+                &[("reader-init", init.as_str())],
+                "about:blank",
+                &drive,
+            );
+            crate::read_aloud::harness::clean_result(&outcome)
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            voice_for(
+                "The quick brown fox",
+                "It was sunny and the children were playing in the park with their friends. The dog was not there, but that is fine."
+            ),
+            "Microsoft Zira - English (United States)"
+        );
+        assert_eq!(
+            voice_for(
+                "A raposa",
+                "A raposa pula por cima do cão. Não é uma história com muito sentido, mas é da tradição dos testes."
+            ),
+            "Microsoft Maria - Portuguese (Brazil)"
+        );
     }
 
     #[test]
