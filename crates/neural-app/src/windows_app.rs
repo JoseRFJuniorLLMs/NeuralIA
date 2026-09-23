@@ -16723,7 +16723,20 @@ __fire('keydown', { key: 'F8' });
         let app = &packages[lock_entry(&packages, "neural-app")];
         let wry = &packages[lock_entry(&packages, "wry")];
 
-        // Nao e vacuo: o neural-app nomeia mesmo cada binding, uma vez so, e
+        // O conjunto de pacotes compilados com as arestas novas e o mesmo que
+        // sem elas: nomear os bindings nao pos crate nenhuma na arvore.
+        let with_bindings = lock_closure(&packages, |_, _| true);
+        let without_bindings = lock_closure(&packages, |from, to| {
+            !(from.name == "neural-app" && BINDINGS.contains(&to.name.as_str()))
+        });
+        let added: Vec<&String> = with_bindings.difference(&without_bindings).collect();
+        assert!(
+            added.is_empty(),
+            "os bindings do WebView2 puseram crates novas no Cargo.lock: {added:?}"
+        );
+        assert!(with_bindings.contains(&format!("wry {}", wry.version)));
+
+        // E nao e vacuo: o neural-app nomeia mesmo cada binding, uma vez so, e
         // a entrada e a MESMA que o wry ja usa -- nao uma segunda versao.
         for binding in BINDINGS {
             let named: Vec<usize> = app
@@ -16744,19 +16757,6 @@ __fire('keydown', { key: 'F8' });
                 packages[named[0]].version
             );
         }
-
-        // O conjunto de pacotes compilados com as arestas novas e o mesmo que
-        // sem elas: nomear os bindings nao pos crate nenhuma na arvore.
-        let with_bindings = lock_closure(&packages, |_, _| true);
-        let without_bindings = lock_closure(&packages, |from, to| {
-            !(from.name == "neural-app" && BINDINGS.contains(&to.name.as_str()))
-        });
-        let added: Vec<&String> = with_bindings.difference(&without_bindings).collect();
-        assert!(
-            added.is_empty(),
-            "os bindings do WebView2 puseram crates novas no Cargo.lock: {added:?}"
-        );
-        assert!(with_bindings.contains(&format!("wry {}", wry.version)));
     }
 
     #[test]
