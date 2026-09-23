@@ -83,6 +83,8 @@ enum PageTarget {
 
 #[derive(Debug)]
 enum UserEvent {
+    /// Escolha de tema feita no menu do botao Home.
+    ThemeChosen(ThemeChoice),
     HomeRequested,
     /// Voltar um nivel: de ecra completo para tres colunas, de la para a Home.
     BackRequested,
@@ -1542,6 +1544,7 @@ const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_MOUSEMOVE: u32 = 0x0200;
 /// Chega depois de `track_mouse_leave`: o rato saiu de um botao nativo.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_RBUTTONUP: u32 = 0x0205;
 
 /// Consulta opcional para automacao/benchmarks. Em producao a Home abre em
 /// repouso e nao envia texto a nenhum fornecedor sem acao do utilizador.
@@ -2129,6 +2132,54 @@ fn hide_tooltip() {
     }
 }
 
+/// Menu de tema no cursor, com a escolha em vigor marcada. Devolve a opcao
+/// clicada, ou None se o menu foi fechado sem escolha.
+fn pick_theme_from_menu(hwnd: HWND) -> Option<ThemeChoice> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, GA_ROOT, GetAncestor, MF_CHECKED, MF_STRING,
+        SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    };
+    let current = ThemeChoice::current();
+    unsafe {
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return None;
+        }
+        for (index, choice) in ThemeChoice::ALL.iter().enumerate() {
+            let flags = if *choice == current {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            };
+            let label: Vec<u16> = choice
+                .label()
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            AppendMenuW(menu, flags, index + 1, label.as_ptr());
+        }
+        let mut cursor = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut cursor);
+        // Sem o dono em primeiro plano, o menu nao fecha ao clicar fora.
+        let root = GetAncestor(hwnd, GA_ROOT);
+        SetForegroundWindow(root);
+        let picked = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            cursor.x,
+            cursor.y,
+            0,
+            root,
+            std::ptr::null(),
+        );
+        DestroyMenu(menu);
+        usize::try_from(picked)
+            .ok()
+            .and_then(|id| id.checked_sub(1))
+            .and_then(|index| ThemeChoice::ALL.get(index).copied())
+    }
+}
+
 /// Pede o WM_MOUSELEAVE a um botao nativo: sem ele a dica ficava a vista
 /// depois de o rato sair.
 fn track_mouse_leave(hwnd: HWND) {
@@ -2449,7 +2500,7 @@ unsafe extern "system" fn home_button_subclass(
         WM_MOUSEMOVE => {
             if !HOME_TOOLTIP_ARMED.swap(true, Ordering::AcqRel) {
                 track_mouse_leave(hwnd);
-                hover_tooltip(hwnd, "Voltar à Home");
+                hover_tooltip(hwnd, "Voltar à Home · Botão direito: tema claro ou escuro");
             }
             DefSubclassProc(hwnd, message, wparam, lparam)
         }
@@ -2461,6 +2512,16 @@ unsafe extern "system" fn home_button_subclass(
         WM_LBUTTONDOWN => {
             hover_tooltip(hwnd, "");
             SetCapture(hwnd);
+            0
+        }
+        WM_RBUTTONUP => {
+            hover_tooltip(hwnd, "");
+            if let Some(choice) = pick_theme_from_menu(hwnd)
+                && reference_data != 0
+            {
+                let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+                let _ = proxy.send_event(UserEvent::ThemeChosen(choice));
+            }
             0
         }
         WM_LBUTTONUP => {
@@ -3508,6 +3569,8 @@ impl App {
         let config = CoreConfig::default();
         let history_store =
             HistoryStore::with_limit(config.data_dir.join("history.jsonl"), config.history_limit);
+        // A escolha de tema vale antes do primeiro desenho.
+        ThemeChoice::load(&config.data_dir.join("theme")).apply();
         let history = HistoryWriter::new(history_store, proxy.clone());
         let memory = MemoryWorker::new(config.data_dir.join("memory"), proxy.clone());
         let timers = Timers::new(proxy.clone());
@@ -4133,6 +4196,11 @@ impl App {
                 self.show_splash("Reconstrução da memória agendada.".to_string(), 3);
             }
             InputRoute::History => self.show_recent_history(),
+            InputRoute::Theme(Some(choice)) => self.choose_theme(choice),
+            InputRoute::Theme(None) => self.show_splash(
+                "Use tema:sistema, tema:claro ou tema:escuro.".to_string(),
+                3,
+            ),
             InputRoute::ResearchCompare => self.compare_current_research(),
             InputRoute::ResearchSynthesize => self.synthesize_current_research(),
             InputRoute::ResearchExport => self.export_current_research(),
@@ -4345,7 +4413,7 @@ impl App {
         let ipc_capability = capability.clone();
         let init_script = NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", &capability);
 
-        WebViewBuilder::new()
+        themed_webview_builder()
             .with_custom_protocol("neuralia-pdf".to_string(), move |_id, request| {
                 serve_pdf_asset(&bytes, &request)
             })
@@ -4459,7 +4527,7 @@ impl App {
         let init_script = format!("{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}")
             .replace("__NEURALIA_CAP__", &capability);
 
-        WebViewBuilder::new()
+        themed_webview_builder()
             .with_initialization_script(init_script)
             .with_ipc_handler(move |request| {
                 if let Some(action) =
@@ -4527,7 +4595,7 @@ impl App {
             format!("{NEURALIA_KEYMAP_SCRIPT}\n{EXTERNAL_RETURN_BUTTON}\n{agent_script}")
                 .replace("__NEURALIA_CAP__", &capability);
 
-        WebViewBuilder::new()
+        themed_webview_builder()
             .with_initialization_script(init_script)
             .with_ipc_handler(move |request| {
                 let Some(action) =
@@ -5353,7 +5421,7 @@ impl App {
         let auto_submit = AI_AUTO_SUBMIT_SCRIPT.replace("__NEURALIA_CAP__", &capability);
         let inject = COMPARATOR_INJECT_SCRIPT.replace("__NEURALIA_CAP__", &capability);
 
-        WebViewBuilder::new()
+        themed_webview_builder()
             .with_initialization_script(prelude)
             .with_initialization_script(keymap)
             .with_initialization_script(auto_submit)
@@ -5503,7 +5571,7 @@ impl App {
         )
         .replace("__NEURALIA_CAP__", &capability);
 
-        WebViewBuilder::new()
+        themed_webview_builder()
             .with_incognito(private)
             .with_initialization_script(init_script)
             .with_ipc_handler(move |request| {
@@ -6206,7 +6274,7 @@ impl App {
             size: LogicalSize::new(1.0, 1.0).into(),
         };
 
-        let result = WebViewBuilder::new()
+        let result = themed_webview_builder()
             .with_initialization_script(init_script)
             .with_ipc_handler(move |request| {
                 let Some(IpcAction::GmailState {
@@ -7142,6 +7210,53 @@ impl App {
                 hover_tooltip(owner, text.as_deref().unwrap_or(""));
             }
         }
+    }
+
+    /// Tema novo (mudou no Windows ou foi escolhido): barra, botoes nativos,
+    /// popups auxiliares e paginas. Antes, na mudanca do Windows, so a barra
+    /// se redesenhava e os botoes nativos ficavam com as cores velhas.
+    fn refresh_theme(&mut self) {
+        use windows_sys::Win32::Graphics::Gdi::{
+            RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RedrawWindow,
+        };
+        use wry::WebViewExtWindows;
+        Theme::invalidate();
+        self.needs_clear = true;
+        self.request_redraw();
+        if let Some(owner) = self.window.as_ref().and_then(window_hwnd) {
+            unsafe {
+                RedrawWindow(
+                    owner,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+                );
+            }
+        }
+        // Os popups owned nao sao filhos: o RDW_ALLCHILDREN nao os alcanca.
+        for hwnd in self.splitters.iter().flatten() {
+            unsafe {
+                InvalidateRect(*hwnd, std::ptr::null(), 1);
+            }
+        }
+        let theme = ThemeChoice::current().webview_theme();
+        if let Some(comp) = &self.comparator {
+            for view in &comp.views {
+                let _ = view.webview.set_theme(theme);
+            }
+            if let Some(split) = &comp.split {
+                let _ = split.webview.set_theme(theme);
+            }
+        }
+    }
+
+    fn choose_theme(&mut self, choice: ThemeChoice) {
+        choice.apply();
+        if let Err(error) = choice.save(&self.config.data_dir.join("theme")) {
+            self.show_native_error(format!("Não foi possível guardar o tema: {error}"));
+        }
+        self.refresh_theme();
+        self.show_splash(format!("{} ativado.", choice.label()), 2);
     }
 
     /// A dica do alvo `hit`, com o nome da IA, o endereco da aba ou o estado
@@ -8099,6 +8214,8 @@ enum InputRoute {
     MemoryQuery(String),
     MemoryRebuild,
     History,
+    /// `tema:claro`, `tema:escuro`, `tema:sistema` (None: palavra desconhecida).
+    Theme(Option<ThemeChoice>),
     ResearchCompare,
     ResearchSynthesize,
     ResearchExport,
@@ -8125,6 +8242,12 @@ fn route_input(input: &str) -> InputRoute {
         }
     }
 
+    if let Some(word) = trimmed
+        .strip_prefix("tema:")
+        .or_else(|| trimmed.strip_prefix("theme:"))
+    {
+        return InputRoute::Theme(ThemeChoice::parse(word));
+    }
     if let Some(spec) = input.strip_prefix("agent:") {
         return InputRoute::Agent(spec.trim().to_string());
     }
@@ -8482,6 +8605,7 @@ impl ApplicationHandler<UserEvent> for App {
             } => self.handle_gmail_state(unread, sender, subject, key),
             UserEvent::HideGmailToast(token) => self.hide_gmail_toast(token),
             UserEvent::ShowHistory => self.show_history(),
+            UserEvent::ThemeChosen(choice) => self.choose_theme(choice),
             UserEvent::ClearHistory => {
                 self.memory.clear();
                 match self.history.clear() {
@@ -8750,11 +8874,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Occluded(occluded) => self.on_occluded_changed(occluded),
             // O tema do sistema mudou: o cache de 1 s tem de cair agora, e o
             // fundo inteiro e repintado porque ate a cor da pagina mudou.
-            WindowEvent::ThemeChanged(_) => {
-                Theme::invalidate();
-                self.needs_clear = true;
-                self.request_redraw();
-            }
+            WindowEvent::ThemeChanged(_) => self.refresh_theme(),
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
@@ -11096,6 +11216,64 @@ mod tests {
             assert_eq!(text, "Fechar", "a dica nao acompanhou o rato");
             assert!(hidden, "a dica ficou a vista depois de o rato sair");
         }
+    }
+
+    #[test]
+    fn theme_choice_is_saved_loaded_and_overrides_the_system() {
+        let dir = std::env::temp_dir().join(format!("neuralia-theme-{}", std::process::id()));
+        let path = dir.join("theme");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            ThemeChoice::load(&path),
+            ThemeChoice::System,
+            "sem ficheiro vale o sistema"
+        );
+        ThemeChoice::Dark
+            .save(&path)
+            .expect("o tema tem de ficar guardado");
+        assert_eq!(
+            ThemeChoice::load(&path),
+            ThemeChoice::Dark,
+            "a escolha nao voltou"
+        );
+        std::fs::write(&path, "roxo").expect("escreve lixo");
+        assert_eq!(
+            ThemeChoice::load(&path),
+            ThemeChoice::System,
+            "lixo vale o sistema"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A escolha manda sobre o Windows; so "sistema" o segue.
+        let accent = system_accent();
+        assert_eq!(
+            Theme::read_for(ThemeChoice::Dark).page_bg,
+            Theme::dark(accent).page_bg
+        );
+        assert_eq!(
+            Theme::read_for(ThemeChoice::Light).page_bg,
+            Theme::light(accent).page_bg
+        );
+        let system = if system_dark_mode() {
+            Theme::dark(accent)
+        } else {
+            Theme::light(accent)
+        };
+        assert_eq!(Theme::read_for(ThemeChoice::System).page_bg, system.page_bg);
+
+        assert_eq!(
+            route_input("tema:escuro"),
+            InputRoute::Theme(Some(ThemeChoice::Dark))
+        );
+        assert_eq!(
+            route_input("tema: claro"),
+            InputRoute::Theme(Some(ThemeChoice::Light))
+        );
+        assert_eq!(
+            route_input("tema:sistema"),
+            InputRoute::Theme(Some(ThemeChoice::System))
+        );
+        assert_eq!(route_input("tema:roxo"), InputRoute::Theme(None));
     }
 
     #[test]
@@ -14280,6 +14458,107 @@ fn system_accent() -> Rgb {
     }
 }
 
+/// O tema que o utilizador escolheu: acompanhar o Windows (o padrao) ou
+/// forcar claro ou escuro. Guarda-se em `<data_dir>/theme`, uma palavra.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemeChoice {
+    System,
+    Light,
+    Dark,
+}
+
+/// Indice em `ThemeChoice::ALL` da escolha em vigor.
+static THEME_CHOICE: AtomicUsize = AtomicUsize::new(0);
+
+impl ThemeChoice {
+    const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::System => "Tema do sistema",
+            Self::Light => "Tema claro",
+            Self::Dark => "Tema escuro",
+        }
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            Self::System => "sistema",
+            Self::Light => "claro",
+            Self::Dark => "escuro",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_lowercase().as_str() {
+            "sistema" | "system" | "auto" => Some(Self::System),
+            "claro" | "light" => Some(Self::Light),
+            "escuro" | "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+
+    fn current() -> Self {
+        Self::ALL
+            .get(THEME_CHOICE.load(Ordering::Acquire))
+            .copied()
+            .unwrap_or(Self::System)
+    }
+
+    /// Escuro ou claro, dado o que o Windows diz agora.
+    fn is_dark(self, system_dark: bool) -> bool {
+        match self {
+            Self::System => system_dark,
+            Self::Light => false,
+            Self::Dark => true,
+        }
+    }
+
+    /// O `prefers-color-scheme` das paginas no WebView2.
+    fn webview_theme(self) -> wry::Theme {
+        match self {
+            Self::System => wry::Theme::Auto,
+            Self::Light => wry::Theme::Light,
+            Self::Dark => wry::Theme::Dark,
+        }
+    }
+
+    /// Sem ficheiro, ou com lixo dentro, vale o padrao: acompanhar o Windows.
+    fn load(path: &std::path::Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| Self::parse(&text))
+            .unwrap_or(Self::System)
+    }
+
+    /// Escreve num temporario ao lado e renomeia: um arranque a meio de uma
+    /// escrita nunca le meia palavra.
+    fn save(self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let temp = path.with_extension("tmp");
+        std::fs::write(&temp, self.word())?;
+        std::fs::rename(&temp, path)
+    }
+
+    /// Passa a valer ja: a proxima leitura do tema usa esta escolha.
+    fn apply(self) {
+        let index = Self::ALL
+            .iter()
+            .position(|choice| *choice == self)
+            .unwrap_or(0);
+        THEME_CHOICE.store(index, Ordering::Release);
+        Theme::invalidate();
+    }
+}
+
+/// Um WebViewBuilder que ja nasce com o tema escolhido nas paginas.
+fn themed_webview_builder<'a>() -> WebViewBuilder<'a> {
+    use wry::WebViewBuilderExtWindows;
+    WebViewBuilder::new().with_theme(ThemeChoice::current().webview_theme())
+}
+
 fn system_dark_mode() -> bool {
     registry_dword(
         "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
@@ -14396,8 +14675,14 @@ impl Theme {
     /// A leitura verdadeira do registo; quem decide quando ela acontece e o
     /// cache acima.
     fn read_system() -> Self {
+        Self::read_for(ThemeChoice::current())
+    }
+
+    /// O tema que `choice` da agora: a escolha manda, o Windows so desempata
+    /// em `ThemeChoice::System`.
+    fn read_for(choice: ThemeChoice) -> Self {
         let accent = system_accent();
-        if system_dark_mode() {
+        if choice.is_dark(system_dark_mode()) {
             Self::dark(accent)
         } else {
             Self::light(accent)
