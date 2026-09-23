@@ -135,6 +135,11 @@ enum UserEvent {
         source_index: usize,
         text: String,
     },
+    /// Pergunta enviada na caixa de uma coluna: vai tambem as outras.
+    AskEverywhere {
+        source_index: usize,
+        text: String,
+    },
     AgentObservation(ObservedPage),
     SubmitText(String),
     OpenExternal(String),
@@ -6293,6 +6298,11 @@ impl App {
                     text,
                 })
             }
+            // Uma coluna so fala por si: o `col` tem de ser o dela.
+            IpcAction::Ask { col, text } if col == col_index => Some(UserEvent::AskEverywhere {
+                source_index: col_index,
+                text,
+            }),
             // Clique simples: a pagina abre nas TRES colunas, para se ver o
             // que cada IA diz dela. Ctrl+clique: abre no painel lateral e a
             // barra de titulo guarda a aba -- o "novo separador" do Chrome.
@@ -6815,6 +6825,44 @@ impl App {
     }
 
     /// URL de pergunta do fornecedor da coluna.
+    /// Pergunta escrita e enviada numa coluna: segue tambem para as outras,
+    /// cada uma no seu fornecedor -- como o clique num link, que abre em
+    /// todas. A coluna de origem nao e tocada: ja esta a enviar e mantem o
+    /// contexto da conversa dela.
+    fn ask_other_columns(&mut self, source_index: usize, text: String) {
+        if self.surface != Surface::Comparator {
+            return;
+        }
+        let Some(count) = self.comparator.as_ref().map(|comp| comp.views.len()) else {
+            return;
+        };
+        let mut urls = Vec::new();
+        for index in ask_targets(source_index, count) {
+            match self.provider_query_url(index, &text) {
+                Ok(url) => urls.push((index, url)),
+                Err(error) => {
+                    self.show_splash(error.to_string(), 3);
+                    return;
+                }
+            }
+        }
+        debug_log(format_args!(
+            "ask: coluna {source_index} -> {} coluna(s), {} chars",
+            urls.len(),
+            text.chars().count()
+        ));
+        if let Some(comp) = &self.comparator {
+            for (index, url) in &urls {
+                if let Some(view) = comp.views.get(*index) {
+                    let _ = view.webview.load_url(url.as_str());
+                }
+            }
+        }
+        if let Some((_, url)) = urls.first() {
+            self.record(HistoryKind::Ask, text, url.to_string());
+        }
+    }
+
     fn provider_query_url(&self, source_index: usize, query: &str) -> neural_core::Result<Url> {
         match source_index {
             0 => google_ai_url(query, &self.config.language),
@@ -10168,6 +10216,9 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                 }
             }
+            UserEvent::AskEverywhere { source_index, text } => {
+                self.ask_other_columns(source_index, text)
+            }
             UserEvent::ResearchAnswer { source_index, text } => {
                 let provider = self
                     .comparator
@@ -10752,6 +10803,11 @@ fn neuralia_action(target: &str) -> Option<UserEvent> {
         "viewsource" => UserEvent::ViewSource,
         _ => return None,
     })
+}
+
+/// Colunas que recebem a pergunta enviada em `source`: todas as outras.
+fn ask_targets(source: usize, count: usize) -> Vec<usize> {
+    (0..count).filter(|index| *index != source).collect()
 }
 
 fn common_ipc_event(action: IpcAction) -> Option<UserEvent> {
@@ -15133,12 +15189,14 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
             }
         }
 
-        // Nenhum handler que dispare acao nativa aceita evento sintetico.
+        // Nenhum handler que dispare acao nativa aceita evento sintetico:
+        // os 4 de sempre + os 4 da pergunta replicada (focusin, Enter,
+        // botao de enviar, submit).
         assert_eq!(
             COMPARATOR_INJECT_SCRIPT
                 .matches("if (!event.isTrusted")
                 .count(),
-            4
+            8
         );
         assert!(!COMPARATOR_INJECT_SCRIPT.contains("expand.onclick"));
         assert!(!COMPARATOR_INJECT_SCRIPT.contains("minimize.onclick"));
@@ -15296,6 +15354,144 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
     /// pos nada no lugar: o clique deixou de ter tratamento nenhum. E o
     /// caminho do Ctrl era testado apenas por uma assercao sobre o TEXTO do
     /// script, que continuava verde com a funcionalidade partida.
+    #[test]
+    fn a_question_typed_in_one_column_goes_to_the_others() {
+        match App::column_ipc_event_impl(
+            1,
+            IpcAction::Ask {
+                col: 1,
+                text: "capital da França".to_string(),
+            },
+        ) {
+            Some(UserEvent::AskEverywhere { source_index, text }) => {
+                assert_eq!(source_index, 1);
+                assert_eq!(text, "capital da França");
+            }
+            other => panic!("a pergunta devia ir as outras colunas, veio {other:?}"),
+        }
+        // Uma pagina nao fala por outra coluna.
+        assert!(
+            App::column_ipc_event_impl(
+                1,
+                IpcAction::Ask {
+                    col: 0,
+                    text: "x".to_string()
+                }
+            )
+            .is_none()
+        );
+        // A origem nao e tocada; as outras sim.
+        assert_eq!(ask_targets(1, 3), vec![0, 2]);
+        assert_eq!(ask_targets(0, 3), vec![1, 2]);
+        assert_eq!(ask_targets(2, 3), vec![0, 1]);
+    }
+
+    #[test]
+    fn typing_and_sending_in_a_column_searches_in_all_of_them() {
+        // Corre o script das colunas QUE EMBARCA e le o que ele publica pelo
+        // parser nativo do produto.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let provider = r#"
+const box = document.createElement('textarea');
+box.value = '  capital da França  ';
+const at = (node) => ({ target: node, composedPath() { return [node]; } });
+__fire('keydown', Object.assign({ key: 'Enter' }, at(box)));
+// o submit/Enter repetido da mesma pergunta nao duplica
+__fire('keydown', Object.assign({ key: 'Enter' }, at(box)));
+// Shift+Enter e uma quebra de linha
+box.value = 'outra coisa';
+__fire('keydown', Object.assign({ key: 'Enter', shiftKey: true }, at(box)));
+// senha nunca
+const pw = document.createElement('input'); pw.type = 'password'; pw.value = 'segredo';
+__fire('keydown', Object.assign({ key: 'Enter' }, at(pw)));
+// botao de enviar com o texto da ultima caixa focada
+const composer = document.createElement('textarea'); composer.value = 'segunda pergunta';
+__fire('focusin', at(composer));
+const toggle = document.createElement('button'); toggle.setAttribute('aria-label', 'Pesquisar na web');
+__fire('click', at(toggle));
+const send = document.createElement('button'); send.setAttribute('aria-label', 'Enviar mensagem');
+__fire('click', at(send));
+// evento sintetico da propria pagina: ignorado
+__fire('keydown', Object.assign({ key: 'Enter', isTrusted: false }, at(composer)));
+"#;
+        let ai_mode_form = r#"
+const q = document.createElement('textarea'); q.name = 'q'; q.value = 'nova pergunta';
+const form = document.createElement('form'); form.elements = [q];
+__fire('submit', { target: form, composedPath() { return [form]; } });
+"#;
+        let site = r#"
+const at = (node) => ({ target: node, composedPath() { return [node]; } });
+const q = document.createElement('input'); q.type = 'search'; q.name = 'q'; q.value = 'rust async';
+// Enter num site qualquer nao e pergunta a IA
+__fire('keydown', Object.assign({ key: 'Enter' }, at(q)));
+const lang = document.createElement('input'); lang.type = 'hidden'; lang.name = 'lang'; lang.value = 'pt';
+const form = document.createElement('form'); form.setAttribute('action', '/search'); form.elements = [q, lang];
+__fire('submit', at(form));
+const post = document.createElement('form'); post.setAttribute('method', 'post'); post.elements = [q];
+__fire('submit', at(post));
+const pw = document.createElement('input'); pw.type = 'password'; pw.name = 'p'; pw.value = 's';
+const login = document.createElement('form'); login.elements = [q, pw];
+__fire('submit', at(login));
+"#;
+        let script = COMPARATOR_INJECT_SCRIPT.replace("__NEURALIA_CAP__", CAP);
+        let cases: Vec<serde_json::Value> = [
+            ("chatgpt", "https://chatgpt.com/c/abc", provider),
+            (
+                "ai-mode",
+                "https://www.google.com/search?q=x&udm=50",
+                ai_mode_form,
+            ),
+            ("site", "https://example.com/artigo", site),
+        ]
+        .into_iter()
+        .map(|(name, href, drive)| {
+            serde_json::json!({ "name": name, "href": href, "script": script, "drive": drive })
+        })
+        .collect();
+        let program = format!(
+            "const INPUT = {};\n{}",
+            serde_json::json!({ "cases": cases }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        let actions = |index: usize| -> Vec<IpcAction> {
+            results[index]["posted"]
+                .as_array()
+                .expect("posted")
+                .iter()
+                .filter_map(|message| parse_ipc_message(message.as_str()?, CAP, 3))
+                .filter(|action| matches!(action, IpcAction::Ask { .. } | IpcAction::Link { .. }))
+                .collect()
+        };
+        let ask = |text: &str| IpcAction::Ask {
+            col: 0,
+            text: text.to_string(),
+        };
+        assert_eq!(
+            actions(0),
+            vec![ask("capital da França"), ask("segunda pergunta")],
+            "erros: {}",
+            results[0]["errors"]
+        );
+        assert_eq!(
+            actions(1),
+            vec![ask("nova pergunta")],
+            "erros: {}",
+            results[1]["errors"]
+        );
+        assert_eq!(
+            actions(2),
+            vec![IpcAction::Link {
+                col: 0,
+                url: "https://example.com/search?q=rust+async&lang=pt".to_string(),
+                aside: false,
+            }],
+            "erros: {}",
+            results[2]["errors"]
+        );
+    }
+
     #[test]
     fn a_plain_click_opens_in_all_three_panels_and_ctrl_click_opens_beside() {
         let url = "https://example.com/fonte".to_string();
@@ -19663,6 +19859,145 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
   listen(window, 'auxclick', (event) => {
     if (event.button !== 1) return;
     routeLink(event, true);
+  }, true);
+
+  // Pergunta escrita numa coluna tambem pesquisa nas outras (pedido do
+  // dono: "escrever pesquisar, tem que pesquisar em todos tambem").
+  //  - Na pagina da propria IA (Google IA, ChatGPT, Claude, Gemini): o texto
+  //    enviado com Enter ou com o botao de enviar vai as OUTRAS colunas
+  //    ('ask'); esta segue a conversa dela.
+  //  - Num site aberto por um link (as colunas no mesmo site): a pesquisa GET
+  //    desse site abre o resultado em todas ('link'), tal como o clique.
+  //  POST, senhas, e-mails e eventos sinteticos nunca sao replicados.
+  const ASK_MAX = 2000;
+  const ASK_REPEAT_MS = 2000;
+  const SEND_LABEL = /\bsend\b|enviar|submit/i;
+  const clock = Date.now;
+  const toArray = Array.from;
+  let lastAsk = { text: '', at: 0 };
+  let lastComposer = null;
+
+  function onProviderPage() {
+    let here;
+    try { here = new URL(location.href); } catch (_) { return false; }
+    const host = here.hostname.toLowerCase();
+    if (host === 'chatgpt.com' || host.endsWith('.chatgpt.com') || host === 'chat.openai.com') return true;
+    if (host === 'claude.ai' || host.endsWith('.claude.ai')) return true;
+    if (host === 'gemini.google.com') return true;
+    return (host === 'google.com' || host.endsWith('.google.com'))
+      && here.searchParams.get('udm') === '50';
+  }
+
+  // Texto de uma caixa onde se escreve uma pergunta; null para tudo o resto
+  // (senhas, e-mails, codigos, botoes...).
+  function composerText(node) {
+    if (!node || !node.tagName) return null;
+    const tag = String(node.tagName).toUpperCase();
+    if (tag === 'TEXTAREA') return String(node.value || '');
+    if (tag === 'INPUT') {
+      const type = String(node.type || 'text').toLowerCase();
+      if (type !== 'text' && type !== 'search') return null;
+      const auto = String((node.getAttribute && node.getAttribute('autocomplete')) || '').toLowerCase();
+      if (/user|mail|pass|code|tel|cc-/.test(auto)) return null;
+      return String(node.value || '');
+    }
+    if (node.isContentEditable) return String(node.innerText || node.textContent || '');
+    return null;
+  }
+
+  function pathOf(event) {
+    return typeof event.composedPath === 'function' ? event.composedPath() : [event.target];
+  }
+
+  function composerFromEvent(event) {
+    for (const candidate of pathOf(event)) {
+      if (composerText(candidate) !== null) return candidate;
+    }
+    return null;
+  }
+
+  function sendAsk(text) {
+    const clean = String(text || '').trim();
+    if (!clean || clean.length > ASK_MAX) return;
+    const at = clock();
+    // Enter e o submit do mesmo formulario chegam os dois: uma pergunta so.
+    if (clean === lastAsk.text && at - lastAsk.at < ASK_REPEAT_MS) return;
+    lastAsk = { text: clean, at: at };
+    act('ask', { col:colIndex, text:clean });
+  }
+
+  // Um GET de um formulario com texto escrito -> a URL que ele abriria.
+  function formSearchUrl(form, submitter) {
+    const method = String((form.getAttribute && form.getAttribute('method')) || 'get').toLowerCase();
+    if (method !== 'get') return null;
+    let target;
+    try {
+      target = new URL((form.getAttribute && form.getAttribute('action')) || location.href, location.href);
+    } catch (_) { return null; }
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') return null;
+    target.search = '';
+    let typed = false;
+    for (const field of toArray(form.elements || [])) {
+      if (!field || !field.name || field.disabled) continue;
+      const type = String(field.type || '').toLowerCase();
+      if (type === 'password' || type === 'file' || type === 'email') return null;
+      if ((type === 'checkbox' || type === 'radio') && !field.checked) continue;
+      if ((type === 'submit' || type === 'button' || type === 'image' || type === 'reset')
+          && field !== submitter) continue;
+      const value = String(field.value == null ? '' : field.value);
+      if ((type === 'search' || type === 'text' || type === 'textarea') && value.trim()) typed = true;
+      target.searchParams.append(String(field.name), value);
+    }
+    return typed ? target : null;
+  }
+
+  listen(window, 'focusin', (event) => {
+    if (!event.isTrusted) return;
+    const node = composerFromEvent(event);
+    if (node) lastComposer = node;
+  }, true);
+
+  listen(window, 'keydown', (event) => {
+    if (!event.isTrusted || event.key !== 'Enter') return;
+    // Shift+Enter e quebra de linha; durante a composicao (acentos, IME) o
+    // Enter ainda nao e envio.
+    if (event.shiftKey || event.ctrlKey || event.altKey || event.metaKey || event.isComposing) return;
+    if (!onProviderPage() || neuraliaControlFromEvent(event)) return;
+    const node = composerFromEvent(event);
+    if (node) sendAsk(composerText(node));
+  }, true);
+
+  listen(window, 'click', (event) => {
+    if (!event.isTrusted || event.button !== 0 || !onProviderPage()) return;
+    if (neuraliaControlFromEvent(event) || !lastComposer) return;
+    const button = pathOf(event).find((node) => node && node.tagName
+      && (String(node.tagName).toUpperCase() === 'BUTTON'
+        || (node.getAttribute && node.getAttribute('role') === 'button')));
+    if (!button || !button.getAttribute) return;
+    const label = [
+      button.getAttribute('aria-label'),
+      button.getAttribute('data-testid'),
+      button.getAttribute('title')
+    ].join(' ');
+    if (SEND_LABEL.test(label)) sendAsk(composerText(lastComposer));
+  }, true);
+
+  listen(window, 'submit', (event) => {
+    if (!event.isTrusted) return;
+    const form = event.target;
+    if (!form || !form.tagName || String(form.tagName).toUpperCase() !== 'FORM') return;
+    if (onProviderPage()) {
+      for (const field of toArray(form.elements || [])) {
+        const text = composerText(field);
+        if (text && text.trim()) { sendAsk(text); return; }
+      }
+      return;
+    }
+    const target = formSearchUrl(form, event.submitter || null);
+    if (!target) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    act('link', { col:colIndex, url:target.href, aside:false });
   }, true);
 
   listen(document, 'dblclick', (event) => {

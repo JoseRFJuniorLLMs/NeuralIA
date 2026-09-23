@@ -2,6 +2,8 @@ use neural_core::{is_local_network_target, validate_web_url};
 use serde_json::{Map, Value};
 
 pub const IPC_MAX_BYTES: usize = 8 * 1024;
+/// Tecto de uma pergunta replicada as outras colunas (`ask`).
+pub const ASK_MAX_CHARS: usize = 2_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpcAction {
@@ -46,6 +48,13 @@ pub enum IpcAction {
         col: usize,
         url: String,
         aside: bool,
+    },
+    /// Pergunta escrita e ENVIADA na caixa de uma IA (Enter ou botao de
+    /// enviar). As outras colunas recebem o mesmo texto, cada uma no seu
+    /// fornecedor; a coluna de origem segue a conversa dela.
+    Ask {
+        col: usize,
+        text: String,
     },
     SplitClose,
     SplitExpand,
@@ -194,6 +203,23 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
                 sender,
                 subject,
                 key,
+            })
+        }
+        "ask" => {
+            exact_keys(args, &["col", "text"])?;
+            let col = bounded_col(args, max_columns)?;
+            let text = bounded_string(args, "text", ASK_MAX_CHARS, false)?;
+            // Caracteres de controlo nao sao algo que alguem escreveu numa
+            // caixa de pergunta; so a quebra de linha e o tab passam.
+            if text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+            {
+                return None;
+            }
+            Some(IpcAction::Ask {
+                col,
+                text: text.trim().to_string(),
             })
         }
         "research-answer" => {
@@ -568,6 +594,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ask_carries_the_typed_question_within_bounds() {
+        let ask = |args: Value| parse_ipc_message(&message("ask", args), CAP, 3);
+        assert_eq!(
+            ask(json!({"col":2,"text":"  capital da França\nem 1900  "})),
+            Some(IpcAction::Ask {
+                col: 2,
+                text: "capital da França\nem 1900".to_string()
+            })
+        );
+        let too_long = "a".repeat(ASK_MAX_CHARS + 1);
+        for (args, why) in [
+            (json!({"col":0,"text":""}), "vazia"),
+            (json!({"col":0,"text":"   \n "}), "so espacos"),
+            (json!({"col":0,"text":too_long}), "longa demais"),
+            (json!({"col":0,"text":"a\u{7}b"}), "caracter de controlo"),
+            (json!({"col":3,"text":"x"}), "coluna fora"),
+            (
+                json!({"col":0,"text":"x","url":"https://e.com"}),
+                "campo a mais",
+            ),
+            (json!({"col":0,"text":7}), "tipo errado"),
+        ] {
+            assert_eq!(ask(args), None, "aceitou uma pergunta {why}");
+        }
+    }
+
     /// SPEC-0005 publica a lista fechada de acoes pagina->nativo. O texto
     /// publicado e lido tal como embarca no repositorio.
     const SPEC_0005: &str = include_str!("../../../docs/specs/SPEC-0005-webview.md");
@@ -598,6 +651,7 @@ mod tests {
             IpcAction::Minimize { .. } => "minimize",
             IpcAction::Split { .. } => "split",
             IpcAction::Link { .. } => "link",
+            IpcAction::Ask { .. } => "ask",
             IpcAction::SplitClose => "split-close",
             IpcAction::SplitExpand => "split-expand",
             IpcAction::Palette { .. } => "palette",
@@ -634,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_accepts_exactly_the_twenty_seven_published_actions() {
+    fn protocol_accepts_exactly_the_twenty_eight_published_actions() {
         let examples = [
             message("home", json!({})),
             message("back", json!({})),
@@ -659,6 +713,7 @@ mod tests {
                 "link",
                 json!({"col":0,"url":"https://example.com/","aside":false}),
             ),
+            message("ask", json!({"col":1,"text":"capital da França"})),
             message("shortcut-expand", json!({"col":1})),
             message("split-close", json!({})),
             message("split-expand", json!({})),
@@ -702,6 +757,6 @@ mod tests {
             accepted, published,
             "a SPEC-0005 publica um conjunto diferente do que o parser aceita"
         );
-        assert_eq!(accepted.len(), 27);
+        assert_eq!(accepted.len(), 28);
     }
 }

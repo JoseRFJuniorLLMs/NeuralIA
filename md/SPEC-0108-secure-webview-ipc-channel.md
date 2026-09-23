@@ -148,7 +148,7 @@ A SPEC-0108 só passa a "Implementada" quando, no CI:
 1. Teste unitário do parser de mensagens: rejeita corpo > 8 KiB, `v != 1`,
    `cap` ausente/errado/com comprimento diferente, `action` fora da lista,
    `args` com tipos errados; aceita cada uma das 27 ações com `args` válidos e o conjunto aceite é
-   exatamente o publicado na SPEC-0005 (`protocol_accepts_exactly_the_twenty_seven_published_actions`).
+   exatamente o publicado na SPEC-0005 (`protocol_accepts_exactly_the_twenty_eight_published_actions`).
 2. Teste: nenhuma constante de script injetado contém `location.href = 'neuralia:`
    nem `neuralia:` + `?cap=` — exceto no HTML do Reader (`render.rs`), que não
    pode conter `cap` de todo.
