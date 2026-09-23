@@ -25,6 +25,7 @@ All notable changes to NeuralIA are documented here.
 - **PR #128:** gates de comportamento cobrem escopo de grupos, poda de grupos vazios, omnibox desabilitada fora da Home, fallback CSPRNG e política WebRTC.
 - **PR #133:** matriz determinística de 100 cenários cobre 5 larguras × 4 escalas de DPI × 5 topologias, além de gates de bordas de clique, alvo por foco, troca transacional de Split, press→release nativo, menu de grupos e duplo clique em elementos interativos.
 - **PR #133 — sabotagem automática:** o job Windows reintroduz temporariamente seis regressões Rust, as falhas de ordem de captura e limite vertical e uma regressão JS no checkout do runner, exige os gates vermelhos, restaura os bytes originais e repete os gates verdes antes de prosseguir.
+- **PR #133 — ciclo de vida:** a medição de cinco ciclos envia press→release ao botão Home nativo, como o produto exige, e verifica zero WebViews visíveis após cada retorno.
 
 ## [2.1.4] - 2026-09-22
 

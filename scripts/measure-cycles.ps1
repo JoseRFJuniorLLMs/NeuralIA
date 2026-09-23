@@ -11,8 +11,9 @@
       startup/omnibox nativa -> o comparador abre e aparecem containers WRY_WEBVIEW
       o comparador só conta como aberto quando o app sinaliza fim da construção
       Home -> nenhum container WRY_WEBVIEW pode continuar visivel
-      o script pede HOME e REOPEN por mensagens Win32 privadas habilitadas
-      somente em NEURALIA_LIFECYCLE_PROBE; cada reopen só ocorre após Home limpa
+      o script clica o botão Home nativo e pede REOPEN por mensagem Win32
+      privada habilitada somente em NEURALIA_LIFECYCLE_PROBE; cada reopen só
+      ocorre após Home limpa
 
     O runtime WebView2 pode manter um pool de subprocessos para reutilizacao.
     Esse pool pode sobreviver aos controllers, mas nao pode crescer de ciclo em
@@ -199,7 +200,9 @@ public static class NeuraliaCycleWindowProbe {
     }
 
     public static bool ReturnHomeViaNativeButton(IntPtr anyWindow) {
+        const uint WM_LBUTTONDOWN = 0x0201;
         const uint WM_LBUTTONUP = 0x0202;
+        const uint SMTO_ABORTIFHUNG = 0x0002;
         var processId = ProcessIdOf(anyWindow);
         if (processId == 0) return false;
 
@@ -214,8 +217,16 @@ public static class NeuraliaCycleWindowProbe {
             // adivinhar geometria/DPI nem confundir splitters/popups.
             var home = FindWindowEx(top, IntPtr.Zero, "STATIC", "NeuralIA.Home");
             if (home != IntPtr.Zero && IsWindowVisible(home)) {
-                if (PostMessage(home, WM_LBUTTONUP, IntPtr.Zero, IntPtr.Zero)) {
-                    delivered = true;
+                // O controle só aceita release após press com captura. Envie
+                // ambos em ordem e espere cada WndProc concluir, como um
+                // clique real, antes de medir o teardown.
+                IntPtr result;
+                var down = SendMessageTimeout(home, WM_LBUTTONDOWN, new IntPtr(1), IntPtr.Zero,
+                    SMTO_ABORTIFHUNG, 1000, out result);
+                if (down != IntPtr.Zero) {
+                    var up = SendMessageTimeout(home, WM_LBUTTONUP, IntPtr.Zero, IntPtr.Zero,
+                        SMTO_ABORTIFHUNG, 1000, out result);
+                    delivered = up != IntPtr.Zero;
                 }
             }
             return true;
