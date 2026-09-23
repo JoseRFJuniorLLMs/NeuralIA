@@ -10,6 +10,7 @@ pub mod history;
 pub mod intent;
 pub mod local_intelligence;
 pub mod memory;
+pub mod pomodoro;
 pub mod reader;
 pub mod render;
 pub mod research;
@@ -42,6 +43,7 @@ pub use memory::{
     CaptureOutcome, ForgetReport, ForgetScope, MemoryDoctorReport, MemoryDocument, MemoryHit,
     MemoryKind, MemoryQuery, MemoryRelation, MemorySourceKind, MemoryStore,
 };
+pub use pomodoro::{Phase, Pomodoro, PomodoroEvent, PomodoroSettings, PomodoroSettingsError};
 pub use research::{
     ComparisonFact, ResearchItem, ResearchItemKind, ResearchSession, SynthesisSnapshot,
 };
