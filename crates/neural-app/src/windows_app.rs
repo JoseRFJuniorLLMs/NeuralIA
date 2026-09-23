@@ -85,6 +85,8 @@ enum PageTarget {
 enum UserEvent {
     /// Escolha de tema feita no menu do botao Home.
     ThemeChosen(ThemeChoice),
+    /// Pedido da pagina local do painel lateral (canal proprio).
+    Panel(PanelMessage),
     HomeRequested,
     /// Voltar um nivel: de ecra completo para tres colunas, de la para a Home.
     BackRequested,
@@ -392,6 +394,9 @@ const AUTO_SCROLL_TOAST: &str = r#"
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BarHit {
     Home,
+    /// ‹ e › ao lado do Home: o historico da pagina.
+    Back,
+    Forward,
     Column(usize),
     AddTab(usize),
     ContextTab {
@@ -445,6 +450,8 @@ struct BarLayout {
     visible: bool,
     height: f64,
     home: UiRect,
+    back: UiRect,
+    forward: UiRect,
     /// Por coluna: a pilula do provedor sobre a sua faixa, ou -- se estiver
     /// minimizada -- o chip compacto encostado aos controlos da direita.
     columns: [UiRect; COMPARATOR_COLUMNS],
@@ -515,6 +522,8 @@ impl BarLayout {
                 visible: false,
                 height: 0.0,
                 home: empty,
+                back: empty,
+                forward: empty,
                 columns: [empty; COMPARATOR_COLUMNS],
                 minimized: [false; COMPARATOR_COLUMNS],
                 add_tabs: [empty; COMPARATOR_COLUMNS],
@@ -561,6 +570,18 @@ impl BarLayout {
             y: row_y,
             width: 72.0 * scale,
             height: row_h,
+        };
+        // ‹ e › logo a seguir ao Home, redondos, como no Chrome.
+        let nav = row_h - 4.0 * scale;
+        let back = UiRect {
+            x: home.x + home.width + 6.0 * scale,
+            y: row_y + 2.0 * scale,
+            width: nav,
+            height: nav,
+        };
+        let forward = UiRect {
+            x: back.x + back.width + 4.0 * scale,
+            ..back
         };
 
         let mut columns_rect = [empty; COMPARATOR_COLUMNS];
@@ -615,7 +636,7 @@ impl BarLayout {
         for (slot, span) in spans.iter().enumerate() {
             let mut left = span.x * scale + group_pad;
             if slot == 0 {
-                left = left.max(home.x + home.width + 8.0 * scale);
+                left = left.max(forward.x + forward.width + 8.0 * scale);
             }
             let right = ((span.x + span.width) * scale - group_pad).min(bar_right);
             // O `.max()` que aqui estava punha o chao ACIMA do tecto: garantia
@@ -739,6 +760,8 @@ impl BarLayout {
             visible: true,
             height,
             home,
+            back,
+            forward,
             columns: columns_rect,
             minimized: columns.minimized,
             add_tabs: plus_rect,
@@ -788,6 +811,12 @@ impl BarLayout {
         }
         if self.home.contains(x, y) {
             return Some(BarHit::Home);
+        }
+        if self.back.contains(x, y) {
+            return Some(BarHit::Back);
+        }
+        if self.forward.contains(x, y) {
+            return Some(BarHit::Forward);
         }
         for index in 0..self.columns_len {
             if self.add_tabs[index].contains(x, y) {
@@ -1941,6 +1970,276 @@ fn splash_origin(client_w: i32, client_h: i32, width: i32, height: i32) -> (i32,
     )
 }
 
+// Painel lateral (Ctrl+H): historico inteligente -- busca semantica, sugestoes
+// de sites e os recentes. E uma WebView LOCAL com canal IPC proprio: so esta
+// WebView fala por `parse_panel_message`, e ela so carrega o HTML abaixo
+// (`panel_allows_navigation`). Nenhuma pagina da internet alcanca este canal,
+// e os dados entram na pagina como texto (`textContent`), nunca como HTML.
+
+/// O que a pagina do painel pode pedir. Lista fechada.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PanelMessage {
+    Ready,
+    Search(String),
+    Open(String),
+    Close,
+}
+
+const PANEL_MESSAGE_MAX_BYTES: usize = 4 * 1024;
+const PANEL_QUERY_MAX_CHARS: usize = 500;
+const PANEL_INPUT_MAX_CHARS: usize = 2048;
+/// Quantos recentes e quantas sugestoes o painel mostra.
+const PANEL_RECENT_LIMIT: usize = 30;
+const PANEL_SUGGESTION_LIMIT: usize = 6;
+
+fn parse_panel_message(body: &str) -> Option<PanelMessage> {
+    if body.len() > PANEL_MESSAGE_MAX_BYTES {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let text = |key: &str, max: usize| -> Option<String> {
+        let text = value.get("args")?.get(key)?.as_str()?.trim();
+        (!text.is_empty() && text.chars().count() <= max).then(|| text.to_string())
+    };
+    match value.get("action")?.as_str()? {
+        "ready" => Some(PanelMessage::Ready),
+        "close" => Some(PanelMessage::Close),
+        "search" => text("query", PANEL_QUERY_MAX_CHARS).map(PanelMessage::Search),
+        "open" => text("input", PANEL_INPUT_MAX_CHARS).map(PanelMessage::Open),
+        _ => None,
+    }
+}
+
+/// So o proprio HTML local (NavigateToString chega como about:blank ou
+/// data:). Um link, um redirect, um file: ou um javascript: nao passam.
+fn panel_allows_navigation(target: &str) -> bool {
+    let lower = target.trim().to_ascii_lowercase();
+    lower == "about:blank" || lower.starts_with("data:text/html")
+}
+
+/// Encostado a direita, abaixo da barra do comparador (ou do topo, fora
+/// dele): 34% da largura, entre 320 e 440 px logicos, nunca mais que a janela.
+fn side_panel_bounds(logical_w: f64, logical_h: f64, top: f64) -> (f64, f64, f64, f64) {
+    let width = (logical_w * 0.34)
+        .clamp(320.0, 440.0)
+        .min(logical_w.max(0.0));
+    let top = top.clamp(0.0, logical_h.max(0.0));
+    (logical_w - width, top, width, logical_h - top)
+}
+
+/// Um item do painel: o que se le e o que o clique volta a abrir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanelItem {
+    title: String,
+    detail: String,
+    input: String,
+}
+
+fn history_panel_items(entries: &[HistoryEntry]) -> Vec<PanelItem> {
+    entries
+        .iter()
+        .filter(|entry| !entry.input.trim().is_empty())
+        .map(|entry| {
+            let kind = match entry.kind {
+                HistoryKind::Ask => "IA",
+                HistoryKind::Read => "Leitor",
+                HistoryKind::Web => "Web",
+            };
+            let detail = if entry.target.trim().is_empty() || entry.target == entry.input {
+                kind.to_string()
+            } else {
+                format!("{kind} · {}", entry.target)
+            };
+            PanelItem {
+                title: entry.input.clone(),
+                detail,
+                input: entry.input.clone(),
+            }
+        })
+        .collect()
+}
+
+fn memory_panel_items(hits: &[MemoryHit]) -> Vec<PanelItem> {
+    hits.iter()
+        .map(|hit| {
+            let source = hit
+                .provider
+                .as_deref()
+                .or(hit.url.as_deref())
+                .unwrap_or("memória local");
+            PanelItem {
+                title: hit.title.clone(),
+                detail: if hit.excerpt.trim().is_empty() {
+                    source.to_string()
+                } else {
+                    format!("{source} · {}", hit.excerpt)
+                },
+                // Com endereco, o clique abre a pagina; sem, repete a busca.
+                input: hit.url.clone().unwrap_or_else(|| hit.title.clone()),
+            }
+        })
+        .collect()
+}
+
+/// Sugestoes de sites: os resultados da memoria que tem endereco web, um por
+/// dominio, na ordem de relevancia.
+fn suggestion_panel_items(hits: &[MemoryHit], limit: usize) -> Vec<PanelItem> {
+    let mut seen = std::collections::HashSet::new();
+    let mut items = Vec::new();
+    for hit in hits {
+        let Some(url) = hit.url.as_deref() else {
+            continue;
+        };
+        let Ok(parsed) = Url::parse(url) else {
+            continue;
+        };
+        if !matches!(parsed.scheme(), "http" | "https") {
+            continue;
+        }
+        let Some(host) = parsed.host_str() else {
+            continue;
+        };
+        let domain = host.trim_start_matches("www.").to_string();
+        if !seen.insert(domain.clone()) {
+            continue;
+        }
+        items.push(PanelItem {
+            title: if hit.title.trim().is_empty() {
+                domain.clone()
+            } else {
+                hit.title.clone()
+            },
+            detail: domain,
+            input: url.to_string(),
+        });
+        if items.len() >= limit {
+            break;
+        }
+    }
+    items
+}
+
+/// O JS que preenche uma secao. Os dados vao como JSON (literal JS valido) e a
+/// pagina so os usa com `textContent`.
+fn panel_render_script(section: &str, title: &str, empty: &str, items: &[PanelItem]) -> String {
+    let items: Vec<serde_json::Value> = items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "title": item.title,
+                "detail": item.detail,
+                "input": item.input,
+            })
+        })
+        .collect();
+    let data = serde_json::json!({
+        "id": section,
+        "title": title,
+        "empty": empty,
+        "items": items,
+    });
+    format!("window.__neuraliaPanel && window.__neuraliaPanel.render({data});")
+}
+
+fn css_color(color: Rgb) -> String {
+    format!("#{:02x}{:02x}{:02x}", color.0, color.1, color.2)
+}
+
+/// As cores do tema em vigor, como variaveis CSS do painel.
+fn panel_theme_vars(theme: &Theme) -> serde_json::Value {
+    serde_json::json!({
+        "--bg": css_color(theme.page_bg),
+        "--surface": css_color(theme.surface),
+        "--fg": css_color(theme.fg),
+        "--muted": css_color(theme.fg_muted),
+        "--line": css_color(theme.surface_line),
+        "--accent": css_color(theme.accent),
+    })
+}
+
+fn panel_html(theme: &Theme) -> String {
+    PANEL_HTML.replace("__THEME__", &panel_theme_vars(theme).to_string())
+}
+
+const PANEL_HTML: &str = r#"<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><title>Histórico inteligente</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:15px "Segoe UI",system-ui,sans-serif}
+body{display:flex;flex-direction:column;border-left:1px solid var(--line)}
+header{display:flex;align-items:center;justify-content:space-between;padding:14px 12px 8px 18px}
+h1{font-size:17px;font-weight:600;margin:0}
+#close{background:none;border:0;color:var(--muted);font-size:18px;cursor:pointer;border-radius:8px;width:32px;height:32px}
+#close:hover{background:var(--surface);color:var(--fg)}
+.search{padding:4px 16px 10px}
+#q{width:100%;padding:10px 14px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--fg);font:inherit;outline:none}
+#q:focus{border-color:var(--accent)}
+main{overflow:auto;flex:1;padding:0 8px 16px}
+section[hidden]{display:none}
+h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:14px 10px 6px;font-weight:600}
+.item{display:block;width:100%;text-align:left;background:none;border:0;color:inherit;font:inherit;padding:8px 10px;border-radius:10px;cursor:pointer}
+.item:hover,.item:focus{background:var(--surface);outline:none}
+.title,.detail{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.detail{font-size:12px;color:var(--muted);margin-top:2px}
+.empty{color:var(--muted);font-size:13px;padding:6px 10px}
+</style></head><body>
+<header><h1>Histórico inteligente</h1><button id="close" title="Fechar (Esc)">✕</button></header>
+<div class="search"><input id="q" placeholder="Descreva o que quer reencontrar e tecle Enter" autocomplete="off" spellcheck="false"></div>
+<main>
+<section id="busca" hidden><h2></h2><div></div></section>
+<section id="sugestoes" hidden><h2></h2><div></div></section>
+<section id="recentes" hidden><h2></h2><div></div></section>
+</main>
+<script>
+(() => {
+  if (window.top !== window) return;
+  const post = (action, args) => window.ipc.postMessage(JSON.stringify({ action, args: args || {} }));
+  const q = document.getElementById('q');
+  document.getElementById('close').addEventListener('click', () => post('close'));
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); post('close'); }
+  });
+  q.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && q.value.trim()) { e.preventDefault(); post('search', { query: q.value.trim() }); }
+  });
+  const theme = (vars) => { for (const k of Object.keys(vars)) document.documentElement.style.setProperty(k, vars[k]); };
+  window.__neuraliaPanel = {
+    theme,
+    render(data) {
+      const section = document.getElementById(data.id);
+      if (!section) return;
+      section.hidden = false;
+      section.querySelector('h2').textContent = data.title;
+      const box = section.querySelector('div');
+      box.textContent = '';
+      if (!data.items.length) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = data.empty;
+        box.appendChild(empty);
+        return;
+      }
+      for (const item of data.items) {
+        const button = document.createElement('button');
+        button.className = 'item';
+        const title = document.createElement('span');
+        title.className = 'title';
+        title.textContent = item.title;
+        const detail = document.createElement('span');
+        detail.className = 'detail';
+        detail.textContent = item.detail;
+        button.append(title, detail);
+        button.addEventListener('click', () => post('open', { input: item.input }));
+        box.appendChild(button);
+      }
+    }
+  };
+  theme(__THEME__);
+  q.focus();
+  post('ready');
+})();
+</script></body></html>"#;
+
 /// Log de depuracao em tempo de execucao, pedido pelo dono para achar bugs
 /// intermitentes. Desligado por padrao; `NEURALIA_DEBUG_LOG=<ficheiro>` liga.
 /// Cada linha: milissegundos desde o arranque e o evento. Nunca leva URLs,
@@ -2004,6 +2303,8 @@ fn bar_tooltip_label(
 ) -> Option<String> {
     Some(match hit {
         BarHit::Home => "Voltar à Home".to_string(),
+        BarHit::Back => "Voltar para a página anterior".to_string(),
+        BarHit::Forward => "Avançar para a próxima página".to_string(),
         BarHit::Column(_) => format!("{provider}: expandir esta coluna"),
         BarHit::AddTab(_) => format!("Nova pergunta ao {provider}"),
         BarHit::ContextTab { .. } => {
@@ -2030,6 +2331,40 @@ fn bar_tooltip_label(
         BarHit::WindowMaximize => caption_tooltip_label(1, maximized).to_string(),
         BarHit::WindowClose => caption_tooltip_label(2, maximized).to_string(),
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryStep {
+    Back,
+    Forward,
+}
+
+/// Qual pagina o ‹ › move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryNav {
+    /// A fonte aberta ao lado de uma coluna (onde se seguem links).
+    Split,
+    /// A coluna expandida.
+    Column(usize),
+    /// A pagina cheia (Web ou Leitor).
+    Page,
+    /// Sem uma pagina so: voltar e o do app.
+    App,
+}
+
+fn history_nav_target(
+    surface: Surface,
+    split_open: bool,
+    expanded: Option<usize>,
+    has_page: bool,
+) -> HistoryNav {
+    match surface {
+        Surface::Comparator if split_open => HistoryNav::Split,
+        Surface::Comparator => expanded.map_or(HistoryNav::App, HistoryNav::Column),
+        Surface::Home => HistoryNav::App,
+        _ if has_page => HistoryNav::Page,
+        _ => HistoryNav::App,
+    }
 }
 
 /// Os tres botoes da janela, na ordem em que `native_button_index` os conta.
@@ -3727,6 +4062,10 @@ struct App {
     /// Janela com o foco do teclado (`WindowEvent::Focused`). Em segundo plano
     /// a animacao continua, mas devagar.
     home_focused: bool,
+    /// Painel lateral do historico inteligente (Ctrl+H).
+    side_panel: Option<WebView>,
+    /// A consulta de memoria que alimenta as sugestoes do painel.
+    panel_suggestion_query: Option<String>,
 }
 
 impl App {
@@ -3806,6 +4145,8 @@ impl App {
             // A janela nasce visivel e com foco; os eventos corrigem se nao for.
             home_occluded: false,
             home_focused: true,
+            side_panel: None,
+            panel_suggestion_query: None,
         }
     }
 
@@ -4218,6 +4559,7 @@ impl App {
 
     fn show_home(&mut self) {
         debug_log(format_args!("show_home (surface era {:?})", self.surface));
+        self.close_side_panel();
         self.next_generation();
         self.surface = Surface::Home;
 
@@ -4256,16 +4598,6 @@ impl App {
             Err(error) => format!("Não foi possível apagar o histórico: {error}"),
         });
         self.request_redraw();
-    }
-
-    fn show_history(&mut self) {
-        self.set_omnibox_text("memory:");
-        self.focus_omnibox();
-        self.show_splash(
-            "Memória semântica: descreva o que você quer reencontrar e pressione Enter."
-                .to_string(),
-            4,
-        );
     }
 
     /// Pede a lista ao worker; a caixa aparece quando `HistoryLoaded` voltar.
@@ -5119,6 +5451,7 @@ impl App {
     }
 
     fn open_comparator(&mut self, query: &str) {
+        self.close_side_panel();
         let reuse_comparator = self
             .comparator
             .as_ref()
@@ -6155,6 +6488,45 @@ impl App {
             }
         }
         self.show_home();
+    }
+
+    /// ‹ e › da barra: o historico da PAGINA, como no Chrome -- na fonte aberta
+    /// ao lado, na coluna expandida ou na pagina cheia. Com as tres colunas
+    /// lado a lado nao ha uma pagina so: o ‹ faz o voltar do app.
+    fn navigate_history(&mut self, step: HistoryStep) {
+        let target = history_nav_target(
+            self.surface,
+            self.comparator
+                .as_ref()
+                .is_some_and(|comp| comp.split.is_some()),
+            self.comparator.as_ref().and_then(|comp| comp.expanded),
+            self.webview.is_some(),
+        );
+        let script = match step {
+            HistoryStep::Back => "window.history.back();",
+            HistoryStep::Forward => "window.history.forward();",
+        };
+        let webview = match target {
+            HistoryNav::Split => self
+                .comparator
+                .as_ref()
+                .and_then(|comp| comp.split.as_ref())
+                .map(|split| &split.webview),
+            HistoryNav::Column(index) => self
+                .comparator
+                .as_ref()
+                .and_then(|comp| comp.views.get(index))
+                .map(|view| &view.webview),
+            HistoryNav::Page => self.webview.as_ref(),
+            HistoryNav::App => None,
+        };
+        match (webview, step) {
+            (Some(webview), _) => {
+                let _ = webview.evaluate_script(script);
+            }
+            (None, HistoryStep::Back) => self.go_back(),
+            (None, HistoryStep::Forward) => {}
+        }
     }
 
     /// Liga/desliga a rolagem de leitura. O temporizador e nativo e nao vive na
@@ -7424,6 +7796,163 @@ impl App {
         }
     }
 
+    /// Ctrl+H: abre o historico inteligente ao lado; de novo (ou Esc), fecha.
+    fn toggle_side_panel(&mut self) {
+        if self.side_panel.is_some() {
+            self.close_side_panel();
+        } else {
+            self.open_side_panel();
+        }
+    }
+
+    fn side_panel_rect(&self) -> Option<wry::Rect> {
+        let window = self.window.as_ref()?;
+        let scale = window.scale_factor().max(1.0);
+        let size = window.inner_size();
+        let top = if self.surface == Surface::Comparator {
+            COMPARATOR_CHROME_HEIGHT
+        } else {
+            0.0
+        };
+        let (x, y, width, height) =
+            side_panel_bounds(size.width as f64 / scale, size.height as f64 / scale, top);
+        Some(wry::Rect {
+            position: LogicalPosition::new(x, y).into(),
+            size: LogicalSize::new(width, height).into(),
+        })
+    }
+
+    fn open_side_panel(&mut self) {
+        let Some(bounds) = self.side_panel_rect() else {
+            return;
+        };
+        let Some(window) = &self.window else {
+            return;
+        };
+        let proxy = self.proxy.clone();
+        // Criado por ultimo, fica por cima das outras WebViews.
+        let built = themed_webview_builder()
+            .with_html(panel_html(&Theme::system()))
+            .with_bounds(bounds)
+            .with_ipc_handler(move |request| {
+                if let Some(message) = parse_panel_message(request.body()) {
+                    let _ = proxy.send_event(UserEvent::Panel(message));
+                }
+            })
+            .with_navigation_handler(|target| panel_allows_navigation(&target))
+            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+            .build_as_child(window);
+        match built {
+            Ok(panel) => {
+                let _ = panel.focus();
+                self.side_panel = Some(panel);
+                debug_log(format_args!(
+                    "side panel: aberto surface={:?}",
+                    self.surface
+                ));
+            }
+            Err(error) => {
+                self.show_splash(format!("Não foi possível abrir o painel: {error}"), 3);
+            }
+        }
+    }
+
+    fn close_side_panel(&mut self) {
+        if self.side_panel.take().is_none() {
+            return;
+        }
+        self.panel_suggestion_query = None;
+        debug_log(format_args!("side panel: fechado"));
+        // Largar a WebView nao devolve o teclado a ninguem.
+        if self.surface == Surface::Home {
+            self.focus_omnibox();
+        }
+    }
+
+    fn position_side_panel(&self) {
+        if let (Some(panel), Some(bounds)) = (&self.side_panel, self.side_panel_rect()) {
+            let _ = panel.set_bounds(bounds);
+        }
+    }
+
+    fn panel_eval(&self, script: &str) {
+        if let Some(panel) = &self.side_panel {
+            let _ = panel.evaluate_script(script);
+        }
+    }
+
+    fn handle_panel_message(&mut self, message: PanelMessage) {
+        match message {
+            PanelMessage::Ready => {
+                if let Some(result) = self.history.recent(PANEL_RECENT_LIMIT) {
+                    self.panel_show_history(result);
+                }
+                // Sugestoes: a pergunta da pesquisa em curso contra a memoria
+                // local. Nada sai do computador.
+                if let Some(question) = self
+                    .current_research
+                    .as_ref()
+                    .map(|session| session.question.trim().to_string())
+                    .filter(|question| !question.is_empty())
+                {
+                    self.panel_suggestion_query = Some(question.clone());
+                    self.memory.query(question);
+                }
+            }
+            PanelMessage::Search(query) => self.memory.query(query),
+            PanelMessage::Open(input) => {
+                self.close_side_panel();
+                self.handle_input(input);
+            }
+            PanelMessage::Close => self.close_side_panel(),
+        }
+    }
+
+    fn panel_show_history(&self, result: Result<Vec<HistoryEntry>, String>) {
+        let (items, empty) = match result {
+            Ok(entries) => (
+                history_panel_items(&entries),
+                "Nenhuma pesquisa gravada ainda.".to_string(),
+            ),
+            Err(error) => (
+                Vec::new(),
+                format!("Não foi possível ler o histórico: {error}"),
+            ),
+        };
+        self.panel_eval(&panel_render_script("recentes", "Recentes", &empty, &items));
+    }
+
+    fn panel_show_memory(&mut self, query: &str, result: Result<Vec<MemoryHit>, String>) {
+        if self.panel_suggestion_query.as_deref() == Some(query) {
+            self.panel_suggestion_query = None;
+            if let Ok(hits) = result {
+                let items = suggestion_panel_items(&hits, PANEL_SUGGESTION_LIMIT);
+                self.panel_eval(&panel_render_script(
+                    "sugestoes",
+                    "Sugestões para esta pesquisa",
+                    "Nenhum site relacionado na sua memória ainda.",
+                    &items,
+                ));
+            }
+            return;
+        }
+        let script = match result {
+            Ok(hits) => panel_render_script(
+                "busca",
+                &format!("Busca: {query}"),
+                "Nada encontrado na memória local.",
+                &memory_panel_items(&hits),
+            ),
+            Err(error) => panel_render_script(
+                "busca",
+                "Busca",
+                &format!("Não foi possível consultar a memória: {error}"),
+                &[],
+            ),
+        };
+        self.panel_eval(&script);
+    }
+
     /// Tema novo (mudou no Windows ou foi escolhido): barra, botoes nativos,
     /// popups auxiliares e paginas. Antes, na mudanca do Windows, so a barra
     /// se redesenhava e os botoes nativos ficavam com as cores velhas.
@@ -7451,6 +7980,10 @@ impl App {
                 InvalidateRect(*hwnd, std::ptr::null(), 1);
             }
         }
+        self.panel_eval(&format!(
+            "window.__neuraliaPanel && window.__neuraliaPanel.theme({});",
+            panel_theme_vars(&Theme::system())
+        ));
         let theme = ThemeChoice::current().webview_theme();
         if let Some(comp) = &self.comparator {
             for view in &comp.views {
@@ -8104,6 +8637,8 @@ impl App {
             Some(BarHit::SplitClose) => self.close_split(),
             Some(BarHit::SplitExpand) => self.toggle_split_fullscreen(),
             Some(BarHit::Home) => self.show_home(),
+            Some(BarHit::Back) => self.navigate_history(HistoryStep::Back),
+            Some(BarHit::Forward) => self.navigate_history(HistoryStep::Forward),
             Some(BarHit::Column(index)) => self.expand_comparator(index),
             Some(BarHit::AddTab(index)) => self.open_ai_palette(index),
             Some(BarHit::ContextTab {
@@ -8934,8 +9469,9 @@ impl ApplicationHandler<UserEvent> for App {
                 key,
             } => self.handle_gmail_state(unread, sender, subject, key),
             UserEvent::HideGmailToast(token) => self.hide_gmail_toast(token),
-            UserEvent::ShowHistory => self.show_history(),
+            UserEvent::ShowHistory => self.toggle_side_panel(),
             UserEvent::ThemeChosen(choice) => self.choose_theme(choice),
+            UserEvent::Panel(message) => self.handle_panel_message(message),
             UserEvent::ClearHistory => {
                 self.memory.clear(&mut self.current_research);
                 match self.history.clear() {
@@ -8948,12 +9484,22 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::HistoryCleared(result) => self.report_history_cleared(result),
-            UserEvent::HistoryLoaded(result) => self.show_history_entries(result),
+            UserEvent::HistoryLoaded(result) => {
+                if self.side_panel.is_some() {
+                    self.panel_show_history(result);
+                } else {
+                    self.show_history_entries(result);
+                }
+            }
             UserEvent::HistoryWriteFailed(error) => {
                 self.show_splash(format!("Histórico não foi gravado: {error}"), 4);
             }
             UserEvent::MemoryQueryReady { query, result } => {
-                self.show_memory_results(&query, result);
+                if self.side_panel.is_some() {
+                    self.panel_show_memory(&query, result);
+                } else {
+                    self.show_memory_results(&query, result);
+                }
             }
             UserEvent::MemoryCleared(result) => {
                 if let Err(error) = result {
@@ -9170,6 +9716,7 @@ impl ApplicationHandler<UserEvent> for App {
                     "resized {}x{} surface={:?}",
                     size.width, size.height, self.surface
                 ));
+                self.position_side_panel();
                 match self.surface {
                     Surface::Home => {
                         self.needs_clear = true;
@@ -10497,6 +11044,14 @@ unsafe fn paint_comparator_bar_with_contexts(
         );
     }
 
+    // ‹ e › ao lado do Home.
+    for (rect, label, hit) in [
+        (layout.back, "‹", BarHit::Back),
+        (layout.forward, "›", BarHit::Forward),
+    ] {
+        draw_button(target, rect, label, hover == Some(hit), scale, font, theme);
+    }
+
     // Os mesmos rectangulos que o hit-testing usa; ver `right_controls`.
     let controls = right_controls(width as f64, scale, active_context.is_some());
     draw_button(
@@ -11459,6 +12014,8 @@ mod tests {
         let url = "https://exemplo.pt/artigo";
         for hit in [
             BarHit::Home,
+            BarHit::Back,
+            BarHit::Forward,
             BarHit::Column(1),
             BarHit::AddTab(1),
             BarHit::ContextTab {
@@ -11668,6 +12225,212 @@ mod tests {
         // Um caminho impossivel nao derruba o app.
         append_debug_line(&dir.join("nao/existe/debug.log"), 1, format_args!("x"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn side_panel_messages_are_a_closed_list_with_limits() {
+        assert_eq!(
+            parse_panel_message(r#"{"action":"ready"}"#),
+            Some(PanelMessage::Ready)
+        );
+        assert_eq!(
+            parse_panel_message(r#"{"action":"close","args":{}}"#),
+            Some(PanelMessage::Close)
+        );
+        assert_eq!(
+            parse_panel_message(r#"{"action":"search","args":{"query":"  receita de bolo "}}"#),
+            Some(PanelMessage::Search("receita de bolo".to_string()))
+        );
+        assert_eq!(
+            parse_panel_message(r#"{"action":"open","args":{"input":"https://exemplo.pt"}}"#),
+            Some(PanelMessage::Open("https://exemplo.pt".to_string()))
+        );
+        for bad in [
+            r#"{"action":"clearhistory"}"#,
+            r#"{"action":"search","args":{"query":"   "}}"#,
+            r#"{"action":"search"}"#,
+            r#"{"action":"open","args":{"input":5}}"#,
+            "nao e json",
+        ] {
+            assert_eq!(parse_panel_message(bad), None, "{bad}");
+        }
+        let long = format!(
+            r#"{{"action":"search","args":{{"query":"{}"}}}}"#,
+            "a".repeat(PANEL_QUERY_MAX_CHARS + 1)
+        );
+        assert_eq!(parse_panel_message(&long), None, "consulta acima do limite");
+        let huge = format!(
+            r#"{{"action":"ready","pad":"{}"}}"#,
+            "x".repeat(PANEL_MESSAGE_MAX_BYTES)
+        );
+        assert_eq!(parse_panel_message(&huge), None, "mensagem acima de 4 KiB");
+    }
+
+    #[test]
+    fn side_panel_only_ever_shows_its_local_page() {
+        assert!(panel_allows_navigation("about:blank"));
+        assert!(panel_allows_navigation("data:text/html,<p>x</p>"));
+        for target in [
+            "https://exemplo.pt",
+            "http://127.0.0.1:8080/",
+            "file:///C:/Windows/win.ini",
+            "javascript:alert(1)",
+            "neuralia-pdf://viewer",
+            "about:blank.evil",
+        ] {
+            assert!(!panel_allows_navigation(target), "{target}");
+        }
+    }
+
+    #[test]
+    fn side_panel_sits_on_the_right_below_the_bar() {
+        // 34% de 1440 = 489.6, limitado a 440; por baixo da barra do comparador.
+        assert_eq!(
+            side_panel_bounds(1440.0, 900.0, 76.0),
+            (1000.0, 76.0, 440.0, 824.0)
+        );
+        // 34% de 900 = 306, levado ao minimo de 320; fora do comparador, do topo.
+        assert_eq!(
+            side_panel_bounds(900.0, 600.0, 0.0),
+            (580.0, 0.0, 320.0, 600.0)
+        );
+        // Janela mais estreita do que o minimo: o painel ocupa-a, nunca sai dela.
+        assert_eq!(
+            side_panel_bounds(250.0, 400.0, 0.0),
+            (0.0, 0.0, 250.0, 400.0)
+        );
+    }
+
+    #[test]
+    fn side_panel_data_reaches_the_page_as_text_never_as_html() {
+        // Os titulos vem de paginas remotas: nunca podem virar HTML no painel.
+        assert!(!PANEL_HTML.contains("innerHTML"));
+        assert!(!PANEL_HTML.contains("insertAdjacentHTML"));
+        assert!(!PANEL_HTML.contains("document.write"));
+        let hostile = PanelItem {
+            title: "<img src=x onerror=alert(1)>".to_string(),
+            detail: "</script><script>alert(2)</script>".to_string(),
+            input: "javascript:alert(3)".to_string(),
+        };
+        let script = panel_render_script("busca", "Busca", "vazio", std::slice::from_ref(&hostile));
+        let json = script
+            .strip_prefix("window.__neuraliaPanel && window.__neuraliaPanel.render(")
+            .and_then(|rest| rest.strip_suffix(");"))
+            .expect("formato do script");
+        let value: serde_json::Value = serde_json::from_str(json).expect("os dados vao como JSON");
+        assert_eq!(value["items"][0]["title"], hostile.title.as_str());
+        assert_eq!(value["items"][0]["detail"], hostile.detail.as_str());
+        assert_eq!(value["id"], "busca");
+    }
+
+    #[test]
+    fn side_panel_lists_history_search_and_one_suggestion_per_site() {
+        let entry = |kind, input: &str, target: &str| HistoryEntry {
+            timestamp_unix: 1,
+            kind,
+            input: input.to_string(),
+            target: target.to_string(),
+        };
+        let items = history_panel_items(&[
+            entry(HistoryKind::Ask, "o que e rust", ""),
+            entry(HistoryKind::Web, "exemplo.pt", "https://exemplo.pt/"),
+            entry(HistoryKind::Read, "   ", "https://vazio.pt/"),
+        ]);
+        assert_eq!(items.len(), 2, "entrada vazia nao vira item");
+        assert_eq!(items[0].detail, "IA");
+        assert_eq!(items[1].detail, "Web · https://exemplo.pt/");
+        assert_eq!(
+            items[1].input, "exemplo.pt",
+            "o clique repete o que foi escrito"
+        );
+
+        let hit = |title: &str, url: Option<&str>| MemoryHit {
+            id: title.to_string(),
+            title: title.to_string(),
+            url: url.map(str::to_string),
+            provider: None,
+            session_id: None,
+            excerpt: String::new(),
+            score: 1.0,
+            matched_by: Vec::new(),
+        };
+        let hits = [
+            hit("Aprender Rust", Some("https://www.rust-lang.org/learn")),
+            hit("Ferramentas", Some("https://rust-lang.org/tools")),
+            hit("Nota sem endereco", None),
+            hit("Ficheiro local", Some("file:///C:/notas.txt")),
+            hit("Docs", Some("https://docs.rs/")),
+        ];
+        let suggestions = suggestion_panel_items(&hits, 6);
+        assert_eq!(
+            suggestions
+                .iter()
+                .map(|item| item.detail.as_str())
+                .collect::<Vec<_>>(),
+            ["rust-lang.org", "docs.rs"],
+            "um site por dominio, so http(s)"
+        );
+        assert_eq!(suggestions[0].input, "https://www.rust-lang.org/learn");
+        assert_eq!(
+            suggestion_panel_items(&hits, 1).len(),
+            1,
+            "respeita o limite"
+        );
+
+        let search = memory_panel_items(&hits[2..3]);
+        assert_eq!(
+            search[0].input, "Nota sem endereco",
+            "sem endereco, o clique repete a busca"
+        );
+    }
+
+    #[test]
+    fn back_and_forward_sit_between_home_and_the_first_provider() {
+        let layout = BarLayout::with_contexts(1440.0, 1.0, true, BarColumns::even(3), [0, 0, 0]);
+        let (home, back, forward) = (layout.home, layout.back, layout.forward);
+        assert!(
+            back.width > 0.0 && forward.width > 0.0,
+            "os botoes tem de existir"
+        );
+        assert!(back.x >= home.x + home.width, "o ‹ vem depois do Home");
+        assert!(forward.x >= back.x + back.width, "o › vem depois do ‹");
+        assert!(
+            layout.columns[0].x >= forward.x + forward.width,
+            "a pilula do primeiro provedor nao pode tapar o ›"
+        );
+        let center = |rect: UiRect| (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+        assert_eq!(
+            layout.hit(center(back).0, center(back).1),
+            Some(BarHit::Back)
+        );
+        assert_eq!(
+            layout.hit(center(forward).0, center(forward).1),
+            Some(BarHit::Forward)
+        );
+        assert_eq!(
+            layout.hit(center(home).0, center(home).1),
+            Some(BarHit::Home)
+        );
+    }
+
+    #[test]
+    fn back_and_forward_move_the_page_the_user_is_reading() {
+        use HistoryNav::*;
+        // A fonte aberta ao lado ganha a tudo: e la que se seguem links.
+        assert_eq!(
+            history_nav_target(Surface::Comparator, true, Some(1), false),
+            Split
+        );
+        assert_eq!(
+            history_nav_target(Surface::Comparator, false, Some(2), false),
+            Column(2)
+        );
+        // Tres colunas lado a lado: nao ha uma pagina so.
+        assert_eq!(
+            history_nav_target(Surface::Comparator, false, None, false),
+            App
+        );
+        assert_eq!(history_nav_target(Surface::Home, false, None, false), App);
     }
 
     #[test]
