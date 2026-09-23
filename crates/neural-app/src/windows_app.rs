@@ -11844,9 +11844,9 @@ mod tests {
     fn browser_agent_bridge_is_bounded_and_has_no_arbitrary_js_channel() {
         assert!(AGENT_OBSERVER_SCRIPT.contains("rows.length >= 32"));
         assert!(AGENT_OBSERVER_SCRIPT.contains("pageText"));
-        assert!(AGENT_OBSERVER_SCRIPT.contains("action:'agent-observation'"));
+        assert!(AGENT_OBSERVER_SCRIPT.contains("post(envelope('agent-observation'"));
         assert!(AGENT_OBSERVER_SCRIPT.contains(".join('\\n').slice(0, 1200)"));
-        assert!(AGENT_OBSERVER_SCRIPT.contains("post(stringify("));
+        assert!(AGENT_OBSERVER_SCRIPT.contains("post(envelope("));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("?cap="));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("eval("));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("new Function"));
@@ -12585,8 +12585,8 @@ mod tests {
         assert!(gmail_is_new_mail(Some(4), Some("thread-a"), 4, "thread-b"));
         assert!(!gmail_is_new_mail(Some(4), Some("thread-a"), 4, "thread-a"));
         assert!(GMAIL_MONITOR_SCRIPT.contains("mail.google.com"));
-        assert!(GMAIL_MONITOR_SCRIPT.contains("action:'gmail-state'"));
-        assert!(GMAIL_MONITOR_SCRIPT.contains("post(stringify("));
+        assert!(GMAIL_MONITOR_SCRIPT.contains("post(envelope('gmail-state'"));
+        assert!(GMAIL_MONITOR_SCRIPT.contains("post(envelope("));
     }
 
     #[test]
@@ -12653,6 +12653,229 @@ mod tests {
             assert!(
                 guard < capability,
                 "{name}: frame guard must run before capability use"
+            );
+        }
+    }
+
+    /// Corre `program` no Node (o mesmo motor de JS que os testes de CI dos
+    /// scripts injetados usam) e devolve o stdout. Sem Node nao ha gate: falha.
+    fn run_node_program(program: &str) -> String {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("node")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("node is required to run the injected-script gates");
+        child
+            .stdin
+            .take()
+            .expect("node stdin")
+            .write_all(program.as_bytes())
+            .expect("write program to node");
+        let output = child.wait_with_output().expect("node output");
+        assert!(
+            output.status.success(),
+            "node failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("node stdout is utf-8")
+    }
+
+    /// Um DOM minimo, criado DENTRO do contexto do vm, para que os literais de
+    /// objeto dos scripts herdem do `Object.prototype` que a "pagina" envenena.
+    const INJECTED_SCRIPT_HARNESS: &str = r##"
+const vm = require('node:vm');
+const MOCK = `
+var __stolen = [], __posted = [], __errors = [], __listeners = [], __timers = [], __observers = [];
+class EventTarget {
+  addEventListener(type, handler) { __listeners.push({ target: this, type: String(type), handler }); }
+  removeEventListener() {}
+  dispatchEvent() { return true; }
+}
+class Node extends EventTarget {
+  appendChild(child) { return child; }
+  removeChild(child) { return child; }
+  insertBefore(child) { return child; }
+}
+class Element extends Node {
+  constructor(tag) {
+    super();
+    this.tagName = String(tag || 'div').toUpperCase();
+    this.style = {}; this.dataset = {}; this.attrs = {}; this.children = [];
+    this.classList = { add() {}, remove() {}, toggle() {}, contains() { return false; } };
+    this.textContent = ''; this.innerText = 'x'.repeat(40); this.value = '';
+  }
+  setAttribute(k, v) { this.attrs[k] = String(v); }
+  getAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k) ? this.attrs[k] : null; }
+  removeAttribute(k) { delete this.attrs[k]; }
+  hasAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k); }
+  querySelector() { return null; }
+  querySelectorAll() { return []; }
+  closest() { return null; }
+  matches() { return false; }
+  getBoundingClientRect() { return { x: 0, y: 0, top: 0, left: 0, right: 10, bottom: 10, width: 10, height: 10 }; }
+  focus() {} blur() {} select() {} remove() {} click() {} scrollIntoView() {} append() {} prepend() {}
+}
+class Document extends Node {
+  constructor() {
+    super();
+    this.readyState = 'loading'; this.title = '';
+    this.documentElement = new Element('html'); this.body = new Element('body'); this.head = new Element('head');
+  }
+  getElementById() { return null; }
+  createElement(tag) { return new Element(tag); }
+  createTextNode(text) { return { textContent: String(text) }; }
+  querySelector() { return null; }
+  querySelectorAll() { return []; }
+}
+var document = new Document();
+var window = new EventTarget();
+window.top = window;
+window.location = location;
+window.history = { back() {}, forward() {} };
+window.chrome = { webview: { postMessage(message) { __posted.push(String(message)); } } };
+window.__neuralia_col_index = 0;
+window.__neuralia_col_name = 'IA';
+function __timer(fn) { const t = { fn, done: false }; __timers.push(t); return __timers.length; }
+function __cancel(id) { const t = __timers[id - 1]; if (t) t.done = true; }
+var setTimeout = __timer, setInterval = __timer, requestAnimationFrame = __timer;
+var clearTimeout = __cancel, clearInterval = __cancel, cancelAnimationFrame = __cancel;
+var getComputedStyle = () => ({ display: 'block', visibility: 'visible' });
+class MutationObserver {
+  constructor(callback) { this.callback = callback; __observers.push(this); }
+  observe() {} disconnect() {} takeRecords() { return []; }
+}
+`;
+const DRIVE = `
+function __event(type, extra) {
+  const target = new Element('div');
+  return Object.assign({
+    type, isTrusted: true, defaultPrevented: false, button: 0, key: '',
+    ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, target,
+    composedPath() { return [target]; },
+    preventDefault() {}, stopPropagation() {}, stopImmediatePropagation() {}
+  }, extra || {});
+}
+function __fire(type, extra) {
+  for (const l of __listeners.slice()) {
+    if (l.type !== type) continue;
+    try {
+      const h = l.handler;
+      (typeof h === 'function' ? h : h.handleEvent).call(l.target, __event(type, extra));
+    } catch (e) { __errors.push(type + ': ' + e.message); }
+  }
+}
+function __drain() {
+  for (let round = 0; round < 20; round++) {
+    const due = __timers.filter((t) => !t.done);
+    if (!due.length) return;
+    for (const t of due) {
+      t.done = true;
+      try { t.fn(); } catch (e) { __errors.push('timer: ' + e.message); }
+    }
+  }
+}
+document.readyState = 'interactive';
+__fire('DOMContentLoaded');
+__fire('load');
+__drain();
+__fire('keydown', { key: 'Escape' });
+__fire('click');
+__fire('dblclick');
+__fire('neuralia-agent-rescan');
+for (const o of __observers) { try { o.callback([], o); } catch (e) { __errors.push('observer: ' + e.message); } }
+__drain();
+`;
+// O que a pagina corre depois do document-created: um getter de toJSON no
+// Object.prototype que guarda qualquer `cap` que lhe passe por `this`.
+const PAGE = `
+Object.defineProperty(Object.prototype, 'toJSON', {
+  configurable: true,
+  get() { if (this && typeof this.cap === 'string') __stolen.push(this.cap); return undefined; }
+});
+`;
+const results = [];
+for (const c of INPUT.cases) {
+  const context = vm.createContext({ location: new URL(c.href), URL });
+  vm.runInContext(MOCK, context);
+  vm.runInContext(c.script, context, { filename: c.name });
+  vm.runInContext(PAGE, context);
+  vm.runInContext(DRIVE, context);
+  results.push({
+    name: c.name,
+    stolen: Array.from(context.__stolen, String),
+    posted: Array.from(context.__posted, String),
+    errors: Array.from(context.__errors, String),
+  });
+}
+process.stdout.write(JSON.stringify(results));
+"##;
+
+    #[test]
+    fn spec_0108_page_cannot_read_the_capability_through_a_to_json_getter() {
+        // Um getter de `toJSON` no Object.prototype e chamado pelo
+        // JSON.stringify com `this` = cada objeto serializado. Se o envelope
+        // com o token passar por la, a pagina fica com o token e forja
+        // `clearhistory`. O gate corre os cinco scripts que embarcam, dispara
+        // os caminhos que postam e exige: ha mensagens, sao validas, e o
+        // getter da pagina nunca viu o token.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let cases: Vec<serde_json::Value> = [
+            ("keymap", NEURALIA_KEYMAP_SCRIPT, "https://example.com/"),
+            ("return", EXTERNAL_RETURN_BUTTON, "https://example.com/"),
+            (
+                "gmail",
+                GMAIL_MONITOR_SCRIPT,
+                "https://mail.google.com/mail/u/0/",
+            ),
+            ("agent", AGENT_OBSERVER_SCRIPT, "https://example.com/"),
+            (
+                "comparator",
+                COMPARATOR_INJECT_SCRIPT,
+                "https://example.com/",
+            ),
+        ]
+        .into_iter()
+        .map(|(name, script, href)| {
+            serde_json::json!({
+                "name": name,
+                "href": href,
+                "script": script.replace("__NEURALIA_CAP__", CAP),
+            })
+        })
+        .collect();
+        let program = format!(
+            "const INPUT = {};\n{}",
+            serde_json::json!({ "cases": cases }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        assert_eq!(results.len(), 5);
+        for result in &results {
+            let name = result["name"].as_str().unwrap_or_default();
+            let stolen = result["stolen"].as_array().expect("stolen");
+            let posted = result["posted"].as_array().expect("posted");
+            assert!(
+                !posted.is_empty(),
+                "{name}: the harness must reach a signing path; errors: {}",
+                result["errors"]
+            );
+            for message in posted {
+                let message = message.as_str().expect("posted string");
+                assert!(
+                    parse_ipc_message(message, CAP, 3).is_some(),
+                    "{name}: posted envelope must stay valid: {message}"
+                );
+            }
+            assert!(
+                stolen.is_empty(),
+                "{name}: page toJSON getter read the capability {} time(s)",
+                stolen.len()
             );
         }
     }
@@ -14474,9 +14697,17 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
   const capability = '__NEURALIA_CAP__';
   const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
   const stringify = JSON.stringify;
+  // O envelope com o token e montado com primitivas. Serializar um objeto
+  // que contem o token faz o serializador consultar toJSON pela cadeia de
+  // prototipos, que a pagina controla: um getter dela recebia o envelope
+  // como `this` e lia `cap`. Strings nao passam por toJSON.
+  function envelope(action, args) {
+    return '{"v":1,"cap":"' + capability + '","action":' + stringify(action)
+      + ',"args":' + stringify(args || {}) + '}';
+  }
   const colIndex = window.__neuralia_col_index;
   function act(action, args) {
-    post(stringify({ v:1, cap:capability, action, args:args || {} }));
+    post(envelope(action, args));
   }
 
   function findBar() {
@@ -14618,6 +14849,14 @@ const EXTERNAL_RETURN_BUTTON: &str = r#"
   const capability = '__NEURALIA_CAP__';
   const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
   const stringify = JSON.stringify;
+  // O envelope com o token e montado com primitivas. Serializar um objeto
+  // que contem o token faz o serializador consultar toJSON pela cadeia de
+  // prototipos, que a pagina controla: um getter dela recebia o envelope
+  // como `this` e lia `cap`. Strings nao passam por toJSON.
+  function envelope(action, args) {
+    return '{"v":1,"cap":"' + capability + '","action":' + stringify(action)
+      + ',"args":' + stringify(args || {}) + '}';
+  }
   const defer = setTimeout;
   const cancelDefer = clearTimeout;
   const byId = document.getElementById.bind(document);
@@ -14639,7 +14878,7 @@ const EXTERNAL_RETURN_BUTTON: &str = r#"
     });
     listen(b, 'click', (event) => {
       if (!event.isTrusted) return;
-      post(stringify({ v:1, cap:capability, action:'home', args:{} }));
+      post(envelope('home', {}));
     });
     append(document.documentElement, b);
   });
@@ -14654,6 +14893,14 @@ const GMAIL_MONITOR_SCRIPT: &str = r#"
   const capability = '__NEURALIA_CAP__';
   const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
   const stringify = JSON.stringify;
+  // O envelope com o token e montado com primitivas. Serializar um objeto
+  // que contem o token faz o serializador consultar toJSON pela cadeia de
+  // prototipos, que a pagina controla: um getter dela recebia o envelope
+  // como `this` e lia `cap`. Strings nao passam por toJSON.
+  function envelope(action, args) {
+    return '{"v":1,"cap":"' + capability + '","action":' + stringify(action)
+      + ',"args":' + stringify(args || {}) + '}';
+  }
   let lastState = '';
   let debounce = 0;
 
@@ -14698,11 +14945,8 @@ const GMAIL_MONITOR_SCRIPT: &str = r#"
     if (state === lastState) return;
     lastState = state;
 
-    post(stringify({
-      v:1,
-      cap:capability,
-      action:'gmail-state',
-      args:{ count, sender:first.sender, subject:first.subject, key:first.key }
+    post(envelope('gmail-state', {
+      count, sender:first.sender, subject:first.subject, key:first.key
     }));
   }
 
@@ -15013,6 +15257,14 @@ const AGENT_OBSERVER_SCRIPT: &str = r#"
   const capability = '__NEURALIA_CAP__';
   const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
   const stringify = JSON.stringify;
+  // O envelope com o token e montado com primitivas. Serializar um objeto
+  // que contem o token faz o serializador consultar toJSON pela cadeia de
+  // prototipos, que a pagina controla: um getter dela recebia o envelope
+  // como `this` e lia `cap`. Strings nao passam por toJSON.
+  function envelope(action, args) {
+    return '{"v":1,"cap":"' + capability + '","action":' + stringify(action)
+      + ',"args":' + stringify(args || {}) + '}';
+  }
   const listen = Function.prototype.call.bind(EventTarget.prototype.addEventListener);
   const defer = setTimeout;
   let generation = 0;
@@ -15083,12 +15335,7 @@ const AGENT_OBSERVER_SCRIPT: &str = r#"
       pageText,
       ...rows
     ].join('\n').slice(0, 1200);
-    post(stringify({
-      v:1,
-      cap:capability,
-      action:'agent-observation',
-      args:{ data:payload }
-    }));
+    post(envelope('agent-observation', { data:payload }));
   }
 
   function schedule() {
@@ -15380,10 +15627,18 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
   const capability = '__NEURALIA_CAP__';
   const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
   const stringify = JSON.stringify;
+  // O envelope com o token e montado com primitivas. Serializar um objeto
+  // que contem o token faz o serializador consultar toJSON pela cadeia de
+  // prototipos, que a pagina controla: um getter dela recebia o envelope
+  // como `this` e lia `cap`. Strings nao passam por toJSON.
+  function envelope(action, args) {
+    return '{"v":1,"cap":"' + capability + '","action":' + stringify(action)
+      + ',"args":' + stringify(args || {}) + '}';
+  }
   const defer = setTimeout;
   const cancelDefer = clearTimeout;
   function act(action, args) {
-    post(stringify({ v:1, cap:capability, action, args:args || {} }));
+    post(envelope(action, args));
   }
   const byId = document.getElementById.bind(document);
   const createElement = document.createElement.bind(document);
