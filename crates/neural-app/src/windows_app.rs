@@ -1063,6 +1063,7 @@ fn plan_tab_row(tabs: &[ContextTab], groups: &[ContextGroup]) -> TabRow {
     // A pilula vem sempre antes das suas abas. Se o corte caiu no meio de um
     // grupo, a pilula ficou de fora -- desce-se ate a proxima pilula ou ate
     // uma aba solta, em vez de mostrar orfas.
+    let window_start = start;
     while start < full.len() {
         match full[start] {
             TabSlot::Group(_) => break,
@@ -1072,6 +1073,38 @@ fn plan_tab_row(tabs: &[ContextTab], groups: &[ContextGroup]) -> TabRow {
     }
 
     let mut row = TabRow::empty();
+    if start == full.len() && window_start < full.len() {
+        // O corte caiu dentro de um grupo com mais abas abertas do que cabem e
+        // nao ha nada inteiro depois dele: a linha ficava vazia e a pilula --
+        // o unico caminho para fechar ou reabrir o grupo -- sumia. Mostra-se a
+        // pilula antes das abas recentes do grupo, e as pilulas dos grupos
+        // fechados anteriores enquanto houver lugar.
+        let mut kept: Vec<TabSlot> = Vec::new();
+        for slot in full[window_start..].iter().copied() {
+            if let TabSlot::Tab(index) = slot
+                && let Some(group) = group_of(index)
+                && !kept.contains(&TabSlot::Group(group))
+            {
+                kept.push(TabSlot::Group(group));
+            }
+            kept.push(slot);
+        }
+        let mut lead: Vec<TabSlot> = Vec::new();
+        for slot in full[..window_start].iter().rev().copied() {
+            if kept.len() + lead.len() >= MAX_VISIBLE_TAB_SLOTS {
+                break;
+            }
+            if let TabSlot::Group(group) = slot
+                && groups[group].collapsed
+            {
+                lead.push(slot);
+            }
+        }
+        for slot in lead.into_iter().rev().chain(kept) {
+            row.push(slot);
+        }
+        return row;
+    }
     for slot in full[start..].iter().copied() {
         row.push(slot);
     }
@@ -13953,6 +13986,67 @@ process.stdout.write(JSON.stringify(results));
             "dois grupos seguidos nao podem nascer da mesma cor"
         );
         assert_ne!(groups[first].id, groups[second].id);
+    }
+
+    #[test]
+    fn a_group_larger_than_the_window_keeps_its_pill_and_recent_tabs() {
+        // Quatro abas abertas num grupo: o corte cai dentro do grupo e nao ha
+        // aba solta depois dele. A linha nao pode ficar vazia -- a pilula e o
+        // unico caminho para fechar ou reabrir o grupo.
+        let mut tabs = vec![
+            tab("https://a.example/1", Some(1)),
+            tab("https://b.example/2", Some(1)),
+            tab("https://c.example/3", Some(1)),
+            tab("https://d.example/4", None),
+        ];
+        let groups = vec![group(1, false)];
+        join_context_group(&mut tabs, 1, 3);
+        let row = plan_tab_row(&tabs, &groups);
+        assert_no_orphans(&row, &tabs, &groups);
+        assert_eq!(
+            row.visible(),
+            &[
+                TabSlot::Group(0),
+                TabSlot::Tab(1),
+                TabSlot::Tab(2),
+                TabSlot::Tab(3)
+            ]
+        );
+        let mut rows = [TabRow::empty(); COMPARATOR_COLUMNS];
+        rows[0] = row;
+        let layout = BarLayout::with_rows(1600.0, 1.0, true, BarColumns::even(3), rows);
+        assert_eq!(layout.group_pill_counts[0], 1);
+        assert_eq!(layout.context_tab_counts[0], 3);
+        let pill = layout.group_pills[0][0];
+        assert_eq!(
+            layout.hit(pill.x + pill.width / 2.0, pill.y + pill.height / 2.0),
+            Some(BarHit::ContextGroup {
+                source_index: 0,
+                group_index: 0
+            })
+        );
+
+        // Um grupo fechado antes dele nao perde a sua pilula.
+        let tabs = vec![
+            tab("https://x.example/0", Some(0)),
+            tab("https://a.example/1", Some(1)),
+            tab("https://b.example/2", Some(1)),
+            tab("https://c.example/3", Some(1)),
+            tab("https://d.example/4", Some(1)),
+        ];
+        let groups = vec![group(0, true), group(1, false)];
+        let row = plan_tab_row(&tabs, &groups);
+        assert_no_orphans(&row, &tabs, &groups);
+        assert_eq!(
+            row.visible(),
+            &[
+                TabSlot::Group(0),
+                TabSlot::Group(1),
+                TabSlot::Tab(2),
+                TabSlot::Tab(3),
+                TabSlot::Tab(4)
+            ]
+        );
     }
 
     #[test]
