@@ -25,7 +25,7 @@ use crate::gemini_live::{
 use crate::ipc::constant_time_eq;
 use crate::ipc::{IpcAction, parse_ipc_message};
 use crate::pomodoro_ui::{
-    POMODORO_COMMAND_HELP, PhaseEnd, PomodoroCommand, PomodoroController, PomodoroMenuItem,
+    POMODORO_COMMAND_HELP, PomodoroCommand, PomodoroController, PomodoroHost, PomodoroMenuItem,
     TickSchedule, TickScheduler, WindowAttention, parse_pomodoro_command, phase_color,
     pomodoro_menu_command,
 };
@@ -1359,13 +1359,18 @@ fn bar_hit_at(
     layout.and_then(|layout| layout.hit(x, y))
 }
 
-struct ComparatorView {
-    webview: WebView,
+/// Uma coluna do comparador. Generica na vista para os gates correrem sem
+/// WebView (`note_read_view`); no app e a `WebView`.
+struct ComparatorView<V = WebView> {
+    webview: V,
     name: &'static str,
 }
 
-struct SplitView {
-    webview: WebView,
+/// A fonte aberta ao lado (Split). Generica na vista como a
+/// `ComparatorView`: quem decide se um Split privado pode ser lido recebe o
+/// Split inteiro, com o `private` dele, e nao um booleano copiado a parte.
+struct SplitView<V = WebView> {
+    webview: V,
     source_index: usize,
     /// Identidade da aba que originou este Split. URL nao e identidade:
     /// a mesma fonte pode existir em dois grupos diferentes.
@@ -3832,21 +3837,22 @@ fn note_capture_decision(target: Option<PageTarget>, split_private: Option<bool>
 /// A WebView de que um Ctrl+Shift+Z le a selecao, no momento de ler: a da
 /// coluna que o pediu (nunca a vizinha), a do Split que existe AGORA -- e
 /// nunca se ele for privado -- ou a WebView unica (Externo, Leitor, PDF).
-/// Generica para o gate a correr sem WebViews: `columns` sao as colunas do
-/// comparador pela ordem delas, `split` o Split atual com o `private` dele.
+/// `columns` e `split` sao os do proprio comparador (`comp.views`,
+/// `comp.split`): o `private` e lido aqui, do Split, e nao passado a parte.
+/// Generica para o gate a correr sem WebViews.
 fn note_read_view<'a, V>(
     target: Option<PageTarget>,
-    columns: &[&'a V],
-    split: Option<(&'a V, bool)>,
+    columns: &'a [ComparatorView<V>],
+    split: Option<&'a SplitView<V>>,
     main: Option<&'a V>,
 ) -> Result<&'a V, NoteCapture> {
-    match note_capture_decision(target, split.map(|(_, private)| private)) {
+    match note_capture_decision(target, split.map(|split| split.private)) {
         NoteCapture::Read => {}
         refused => return Err(refused),
     }
     match target {
-        Some(PageTarget::Column(index)) => columns.get(index).copied(),
-        Some(PageTarget::Split) => split.map(|(view, _)| view),
+        Some(PageTarget::Column(index)) => columns.get(index).map(|column| &column.webview),
+        Some(PageTarget::Split) => split.map(|split| &split.webview),
         None => main,
     }
     .ok_or(NoteCapture::NoPage)
@@ -11392,19 +11398,16 @@ impl App {
     /// Ctrl+Shift+Z numa pagina: le a selecao da WebView `target` e cria a
     /// nota. O Split privado nunca e lido.
     fn request_note_from_page(&mut self, target: Option<PageTarget>) {
-        // Qual WebView e se o Split privado recusa: `note_read_view` (gate
+        // Qual WebView e se o Split privado recusa: `note_read_view`, com as
+        // colunas e o Split do proprio comparador (gate
         // `a_note_request_reads_its_own_webview_and_never_the_private_split`).
-        let columns: Vec<&WebView> = self
-            .comparator
-            .as_ref()
-            .map(|comp| comp.views.iter().map(|view| &view.webview).collect())
-            .unwrap_or_default();
-        let split = self
-            .comparator
-            .as_ref()
-            .and_then(|comp| comp.split.as_ref())
-            .map(|split| (&split.webview, split.private));
-        let webview = match note_read_view(target, &columns, split, self.webview.as_ref()) {
+        let comp = self.comparator.as_ref();
+        let webview = match note_read_view(
+            target,
+            comp.map_or(&[][..], |comp| comp.views.as_slice()),
+            comp.and_then(|comp| comp.split.as_ref()),
+            self.webview.as_ref(),
+        ) {
             Ok(webview) => webview,
             Err(NoteCapture::RefusePrivate) => {
                 self.show_splash(NOTE_PRIVATE_REFUSAL.to_string(), 3);
@@ -11510,34 +11513,13 @@ impl App {
         self.pomodoro_changed();
     }
 
-    /// Um tique: so o da cadeia viva mexe no motor, e `run_tick` ja agendou
-    /// o seguinte (gates `only_one_tick_chain_is_ever_alive` e
-    /// `a_phase_end_the_window_did_not_see_waits_for_it`). No fim de uma
-    /// fase: um som curto do sistema, o aviso no meio da janela e, com ela
-    /// minimizada ou atras de outra, o botao a piscar na barra de tarefas.
+    /// Um tique: o caminho inteiro e `pomodoro_ui::pomodoro_tick` (gate
+    /// `the_app_tick_announces_a_phase_end_as_the_window_can_see_it`): so o
+    /// da cadeia viva mexe no motor, o seguinte fica agendado e o fim de uma
+    /// fase toca o som, pisca a barra de tarefas e mostra o aviso conforme a
+    /// janela. O `App` so da as pecas (`impl PomodoroHost for App`).
     fn pomodoro_tick(&mut self, token: u64) {
-        let window = self.window_attention();
-        let Some(tick) = self
-            .pomodoro
-            .run_tick(token, Instant::now(), &self.timers, window)
-        else {
-            return;
-        };
-        if let Some(phase_end) = tick.phase_end {
-            self.announce_phase_end(phase_end);
-        }
-        self.pomodoro_changed();
-    }
-
-    fn announce_phase_end(&mut self, phase_end: PhaseEnd) {
-        let PhaseEnd { show, flash } = phase_end;
-        pomodoro_sound();
-        if flash && let Some(owner) = self.window.as_ref().and_then(window_hwnd) {
-            flash_taskbar(owner);
-        }
-        if let Some(message) = show {
-            self.show_background_splash(message, POMODORO_PHASE_END_SECONDS);
-        }
+        crate::pomodoro_ui::pomodoro_tick(self, token, Instant::now());
     }
 
     /// Minimizada e a da frente, para o fim de uma fase do Pomodoro.
@@ -13205,6 +13187,37 @@ fn reader_article_memory_text(article: &ReaderArticle) -> String {
         output.truncate(cut);
     }
     output
+}
+
+/// As pecas do `App` que o tique do Pomodoro usa (`pomodoro_ui::pomodoro_tick`).
+impl PomodoroHost for App {
+    type Timers = Timers;
+
+    fn pomodoro_parts(&mut self) -> (&mut PomodoroController, &Timers) {
+        (&mut self.pomodoro, &self.timers)
+    }
+
+    fn attention(&self) -> WindowAttention {
+        self.window_attention()
+    }
+
+    fn chime(&mut self) {
+        pomodoro_sound();
+    }
+
+    fn flash_taskbar(&mut self) {
+        if let Some(owner) = self.window.as_ref().and_then(window_hwnd) {
+            flash_taskbar(owner);
+        }
+    }
+
+    fn notice(&mut self, message: String) {
+        self.show_background_splash(message, POMODORO_PHASE_END_SECONDS);
+    }
+
+    fn repaint(&mut self) {
+        self.pomodoro_changed();
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -25228,11 +25241,22 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
 
             // E a WebView que `request_note_from_page` le: a da coluna que
             // pediu (nunca a vizinha), a do Split de agora (nunca privado) ou
-            // a unica. Os numeros fazem de WebViews.
-            let (c0, c1, c2, split_view, main) = (10u8, 11u8, 12u8, 90u8, 70u8);
-            let columns = [&c0, &c1, &c2];
-            for (index, expected) in columns.iter().enumerate() {
-                for split in [None, Some((&split_view, false)), Some((&split_view, true))] {
+            // a unica. As colunas e o Split sao os tipos do comparador, com
+            // numeros a fazer de WebViews: o `private` vem do proprio Split.
+            let columns: Vec<ComparatorView<u8>> = [(10u8, "a"), (11, "b"), (12, "c")]
+                .into_iter()
+                .map(|(webview, name)| ComparatorView { webview, name })
+                .collect();
+            let split = |private: bool| SplitView {
+                webview: 90u8,
+                source_index: 0,
+                context_id: None,
+                fullscreen: false,
+                private,
+            };
+            let (normal, private, main) = (split(false), split(true), 70u8);
+            for (index, column) in columns.iter().enumerate() {
+                for split in [None, Some(&normal), Some(&private)] {
                     assert_eq!(
                         note_read_view(
                             Some(PageTarget::Column(index)),
@@ -25240,7 +25264,7 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
                             split,
                             Some(&main)
                         ),
-                        Ok(*expected),
+                        Ok(&column.webview),
                         "coluna {index}"
                     );
                 }
@@ -25258,16 +25282,16 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
                 note_read_view(
                     Some(PageTarget::Split),
                     &columns,
-                    Some((&split_view, false)),
+                    Some(&normal),
                     Some(&main)
                 ),
-                Ok(&split_view)
+                Ok(&90)
             );
             assert_eq!(
                 note_read_view(
                     Some(PageTarget::Split),
                     &columns,
-                    Some((&split_view, true)),
+                    Some(&private),
                     Some(&main)
                 ),
                 Err(NoteCapture::RefusePrivate),
@@ -25278,7 +25302,7 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
                 Err(NoteCapture::NoPage)
             );
             assert_eq!(
-                note_read_view(None, &columns, Some((&split_view, true)), Some(&main)),
+                note_read_view(None, &columns, Some(&private), Some(&main)),
                 Ok(&main)
             );
             assert_eq!(
