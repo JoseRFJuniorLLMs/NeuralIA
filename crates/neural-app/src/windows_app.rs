@@ -8009,8 +8009,12 @@ fn js_percent(value: &str) -> String {
 macro_rules! agent_element_identity_js {
     () => {
         r#"
+  // `slice` conta unidades UTF-16 e pode partir um emoji: o surrogate que
+  // fica sozinho vira `\udXXX` no JSON, que o serde_json recusa, e a
+  // observacao inteira sumia. Qualquer surrogate sem par sai.
   function clean(value, limit) {
-    return String(value || '').replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
+    return String(value || '').replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit)
+      .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
   }
 
   function fieldRole(el) {
@@ -11856,6 +11860,29 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
                 &[json!({ "advance": 800 }), json!({ "eval": script })],
             );
             assert_eq!(run.submits, 1, "o submit aprovado não aconteceu");
+        }
+
+        #[test]
+        fn emoji_on_a_cut_boundary_does_not_drop_the_observation() {
+            // `slice` conta unidades UTF-16: um emoji na unidade 96 do nome
+            // (ou 1600 do texto) deixava um surrogate alto sozinho, o JSON
+            // levava `\ud83d`, o serde_json recusava e a observação sumia sem
+            // erro nenhum.
+            let label = format!("{}😀", "a".repeat(95));
+            let page = json!({
+                "url": "https://example.com/",
+                "title": "Emoji",
+                "main": format!("{}😀 fim", "b".repeat(1599)),
+                "elements": [
+                    {"key": "b", "tag": "button", "text": label}
+                ]
+            });
+            let run = run_page(&page, &[json!({ "advance": 800 })]);
+            let post = run.posts.first().expect("o observador publicou");
+            let page = observed(post).expect("observação recusada pelo nativo");
+            assert_eq!(page.elements.len(), 1);
+            assert_eq!(page.elements[0].name, "a".repeat(95));
+            assert!(page.text_excerpt.starts_with("bbbb"));
         }
 
         #[test]
