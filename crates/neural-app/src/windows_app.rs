@@ -10160,12 +10160,15 @@ mod tab_session_gates {
         .expect("a public source becomes a tab")
     }
 
+    /// Uma aba como a barra a mostra: URL e (nome, cor, fechado) do grupo.
+    type VisibleTab = (String, Option<(String, &'static str, bool)>);
+
     /// O que a barra mostra, sem as identidades (que o restauro renumera):
     /// por coluna, cada aba com o nome, a cor e o estado do seu grupo.
     fn visible(
         contexts: &Columns<ContextTab>,
         groups: &Columns<ContextGroup>,
-    ) -> Vec<Vec<(String, Option<(String, &'static str, bool)>)>> {
+    ) -> Vec<Vec<VisibleTab>> {
         contexts
             .iter()
             .zip(groups)

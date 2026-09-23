@@ -609,7 +609,8 @@ mod tests {
             bytes.extend_from_slice(b"\"}");
             bytes
         };
-        let cases: [(&str, Vec<u8>, fn(&LoadError) -> bool); 5] = [
+        type Expected = fn(&LoadError) -> bool;
+        let cases: [(&str, Vec<u8>, Expected); 5] = [
             (
                 "corrupt",
                 b"{\"version\":1,\"columns\":[".to_vec(),
