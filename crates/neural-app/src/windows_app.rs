@@ -1941,6 +1941,31 @@ fn splash_origin(client_w: i32, client_h: i32, width: i32, height: i32) -> (i32,
     )
 }
 
+/// Log de depuracao em tempo de execucao, pedido pelo dono para achar bugs
+/// intermitentes. Desligado por padrao; `NEURALIA_DEBUG_LOG=<ficheiro>` liga.
+/// Cada linha: milissegundos desde o arranque e o evento. Nunca leva URLs,
+/// texto de paginas nem nada da memoria -- so transicoes da janela.
+fn debug_log(event: std::fmt::Arguments<'_>) {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let Some(path) = std::env::var_os("NEURALIA_DEBUG_LOG") else {
+        return;
+    };
+    let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
+    append_debug_line(std::path::Path::new(&path), elapsed, event);
+}
+
+/// Acrescenta uma linha ao log; um log que nao abre nunca derruba o app.
+fn append_debug_line(path: &std::path::Path, elapsed_ms: u128, event: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{elapsed_ms:>8} ms  {event}");
+    }
+}
+
 fn show_popup_without_activation(hwnd: HWND) {
     unsafe {
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -2762,6 +2787,10 @@ unsafe extern "system" fn omnibox_subclass(
         match wparam as u32 {
             13 => {
                 let text = window_text(hwnd);
+                debug_log(format_args!(
+                    "omnibox: Enter ({} chars)",
+                    text.chars().count()
+                ));
                 let _ = proxy.send_event(UserEvent::SubmitText(text));
                 return 0;
             }
@@ -3833,6 +3862,10 @@ impl App {
     /// da Home (66 ms com foco, 250 ms sem) e arruma as janelas auxiliares,
     /// que so fazem sentido enquanto a app esta a frente.
     fn on_focus_changed(&mut self, focused: bool) {
+        debug_log(format_args!(
+            "focus={focused} surface={:?} home_focused={}",
+            self.surface, self.home_focused
+        ));
         if self.home_focused == focused {
             return;
         }
@@ -4184,6 +4217,7 @@ impl App {
     }
 
     fn show_home(&mut self) {
+        debug_log(format_args!("show_home (surface era {:?})", self.surface));
         self.next_generation();
         self.surface = Surface::Home;
 
@@ -4321,6 +4355,11 @@ impl App {
     }
 
     fn handle_input(&mut self, input: String) {
+        debug_log(format_args!(
+            "handle_input ({} chars) surface={:?}",
+            input.chars().count(),
+            self.surface
+        ));
         match route_input(&input) {
             InputRoute::Agent(spec) => self.start_browser_agent(&spec),
             InputRoute::MemoryQuery(query) => {
@@ -5117,6 +5156,7 @@ impl App {
         };
         // No comparador o chrome e nosso: a primeira linha recebe as abas e os
         // controles de janela; a segunda fica reservada aos provedores.
+        debug_log(format_args!("open_comparator: set_decorations(false)"));
         window.set_decorations(false);
         self.ensure_window_subclass();
 
@@ -8101,6 +8141,7 @@ impl App {
         let (x, y) = self.cursor;
 
         if layout.go.contains(x, y) {
+            debug_log(format_args!("click_home: botao Ir"));
             self.submit_current();
         }
     }
@@ -8788,6 +8829,10 @@ impl ApplicationHandler<UserEvent> for App {
                 let startup = startup_input();
                 if !startup.is_empty() {
                     self.set_omnibox_text(&startup);
+                    debug_log(format_args!(
+                        "startup: SubmitText ({} chars)",
+                        startup.chars().count()
+                    ));
                     let _ = self.proxy.send_event(UserEvent::SubmitText(startup));
                 }
             }
@@ -9017,6 +9062,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::RestoreHomeDecorations => {
+                debug_log(format_args!(
+                    "RestoreHomeDecorations: surface={:?}",
+                    self.surface
+                ));
                 if self.surface == Surface::Home {
                     // O controller já foi descartado. Primeiro escondemos
                     // qualquer host WRY que ainda esteja preso ao HWND antigo,
@@ -9026,6 +9075,9 @@ impl ApplicationHandler<UserEvent> for App {
                     // a Home apesar de os WebView Rust já terem sido dropados.
                     if let Some(window) = &self.window {
                         hide_orphaned_wry_hosts(window);
+                        debug_log(format_args!(
+                            "RestoreHomeDecorations: set_decorations(true)"
+                        ));
                         window.set_decorations(true);
                     }
                     self.ensure_window_subclass();
@@ -9113,25 +9165,31 @@ impl ApplicationHandler<UserEvent> for App {
                     _ => {}
                 }
             }
-            WindowEvent::Resized(_) => match self.surface {
-                Surface::Home => {
-                    self.needs_clear = true;
-                    self.position_omnibox();
-                    self.request_redraw();
+            WindowEvent::Resized(size) => {
+                debug_log(format_args!(
+                    "resized {}x{} surface={:?}",
+                    size.width, size.height, self.surface
+                ));
+                match self.surface {
+                    Surface::Home => {
+                        self.needs_clear = true;
+                        self.position_omnibox();
+                        self.request_redraw();
+                    }
+                    Surface::Comparator => {
+                        self.needs_clear = true;
+                        self.update_comparator_layout();
+                        self.sync_comparator_splitters();
+                        self.sync_exit_button();
+                        self.sync_home_button();
+                        self.sync_caption_buttons();
+                        self.position_omnibox();
+                        self.position_palette();
+                        self.request_redraw();
+                    }
+                    _ => {}
                 }
-                Surface::Comparator => {
-                    self.needs_clear = true;
-                    self.update_comparator_layout();
-                    self.sync_comparator_splitters();
-                    self.sync_exit_button();
-                    self.sync_home_button();
-                    self.sync_caption_buttons();
-                    self.position_omnibox();
-                    self.position_palette();
-                    self.request_redraw();
-                }
-                _ => {}
-            },
+            }
             // Splash, toast, botao de saida, divisores e palette sao popups em
             // coordenadas de ECRA: mover a janela nao lhes toca. Ate aqui so o
             // Resized os sincronizava, por isso arrastar a janela deixava-os
@@ -11581,6 +11639,35 @@ mod tests {
             InputRoute::Theme(Some(ThemeChoice::System))
         );
         assert_eq!(route_input("tema:roxo"), InputRoute::Theme(None));
+    }
+
+    #[test]
+    fn debug_log_appends_timestamped_lines_and_never_panics() {
+        let dir = std::env::temp_dir().join(format!("neuralia-debuglog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("pasta temporaria");
+        let path = dir.join("debug.log");
+        append_debug_line(
+            &path,
+            7,
+            format_args!("focus=true surface={:?}", Surface::Home),
+        );
+        append_debug_line(
+            &path,
+            1234,
+            format_args!("open_comparator: set_decorations(false)"),
+        );
+        let text = std::fs::read_to_string(&path).expect("o log tem de existir");
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            [
+                "       7 ms  focus=true surface=Home",
+                "    1234 ms  open_comparator: set_decorations(false)"
+            ]
+        );
+        // Um caminho impossivel nao derruba o app.
+        append_debug_line(&dir.join("nao/existe/debug.log"), 1, format_args!("x"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
