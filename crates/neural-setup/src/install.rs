@@ -45,7 +45,7 @@ pub enum InstallError {
 impl std::fmt::Display for InstallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoPayload => write!(f, "este instalador foi construido sem a NeuralIA la dentro"),
+            Self::NoPayload => write!(f, "este instalador foi gerado sem a NeuralIA dentro dele"),
             Self::InUse(paths) => write!(f, "{}", in_use_message(paths)),
             Self::Io(path, error) => write!(f, "{}: {error}", path.display()),
         }
@@ -60,7 +60,7 @@ pub fn in_use_message(paths: &[PathBuf]) -> String {
         .and_then(|path| path.file_name())
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| EXECUTABLE.to_string());
-    format!("A NeuralIA esta aberta ({first} em uso). Feche-a e tente outra vez.")
+    format!("A NeuralIA está aberta ({first} em uso). Feche-a e tente novamente.")
 }
 
 /// Porque e que a instalacao nao aconteceu. O tipo decide o codigo de saida do
@@ -131,14 +131,19 @@ pub enum Stage {
 }
 
 impl Stage {
-    /// O que se le por baixo da barra.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Preparing => "A preparar a pasta",
-            Self::Writing => "A instalar a NeuralIA",
-            Self::Shortcuts => "A criar os atalhos",
-            Self::Registering => "A registar no sistema",
-            Self::Done => "Instalada",
+    /// O que se le por baixo da barra, a instalar ou (`removing`) a remover.
+    /// Em pt-BR, com acentos: e o que o dono le.
+    pub fn label(self, removing: bool) -> &'static str {
+        match (self, removing) {
+            (Self::Preparing, _) => "Preparando a pasta",
+            (Self::Writing, false) => "Instalando a NeuralIA",
+            (Self::Writing, true) => "Removendo os arquivos",
+            (Self::Shortcuts, false) => "Criando os atalhos",
+            (Self::Shortcuts, true) => "Removendo os atalhos",
+            (Self::Registering, false) => "Registrando no sistema",
+            (Self::Registering, true) => "Removendo o registro",
+            (Self::Done, false) => "Instalada",
+            (Self::Done, true) => "Removida",
         }
     }
 
@@ -219,19 +224,19 @@ pub fn is_within(inner: &Path, outer: &Path) -> bool {
 pub fn validate_install_root(root: &Path, data_dir: &Path) -> Result<(), String> {
     if !root.is_absolute() {
         return Err(format!(
-            "A pasta de instalacao tem de ser um caminho completo, com a unidade: {}",
+            "A pasta de instalação precisa ser um caminho completo, com a unidade: {}",
             root.display()
         ));
     }
     if root.parent().is_none() || !path_key(root).contains('\\') {
         return Err(format!(
-            "A NeuralIA nao se instala na raiz de uma unidade: {}",
+            "A NeuralIA não pode ser instalada na raiz de uma unidade: {}",
             root.display()
         ));
     }
     if is_within(root, data_dir) || is_within(data_dir, root) {
         return Err(format!(
-            "{} mistura-se com a pasta dos seus dados ({}). Escolha outra pasta.",
+            "{} se sobrepõe à pasta dos seus dados ({}). Escolha outra pasta.",
             root.display(),
             data_dir.display()
         ));
@@ -291,9 +296,15 @@ pub fn choose_uninstall_root(
 }
 
 /// So se apaga uma entrada de "Aplicacoes" que aponte para esta pasta: senao,
-/// desinstalar uma copia velha noutro sitio tirava a entrada da boa.
-pub fn registration_points_here(registered: Option<&Path>, root: &Path) -> bool {
-    registered.is_none_or(|location| same_path(location, root))
+/// desinstalar uma copia velha noutro sitio tirava a entrada da boa. `same`
+/// decide se dois caminhos sao a mesma pasta (no Windows, pela identidade no
+/// disco: um nome 8.3 e o nome longo sao a mesma).
+pub fn registration_points_here(
+    registered: Option<&Path>,
+    root: &Path,
+    same: impl Fn(&Path, &Path) -> bool,
+) -> bool {
+    registered.is_none_or(|location| same(location, root))
 }
 
 /// Onde ficam as coisas que nao sao ficheiros da aplicacao: a chave de
@@ -332,7 +343,7 @@ impl Places {
 pub fn sandbox_places(sandbox: &Path) -> Result<Places, String> {
     if !sandbox.is_absolute() {
         return Err(format!(
-            "{SANDBOX_ENV} tem de ser um caminho completo: {}",
+            "{SANDBOX_ENV} precisa ser um caminho completo: {}",
             sandbox.display()
         ));
     }
@@ -345,7 +356,7 @@ pub fn sandbox_places(sandbox: &Path) -> Result<Places, String> {
         .collect();
     if leaf.is_empty() {
         return Err(format!(
-            "{SANDBOX_ENV} precisa de uma pasta com nome: {}",
+            "{SANDBOX_ENV} precisa apontar para uma pasta com nome: {}",
             sandbox.display()
         ));
     }
@@ -435,54 +446,146 @@ pub fn payload_files(root: &Path, entries: &[Entry]) -> Vec<PathBuf> {
     entries.iter().map(|e| target_of(root, e)).collect()
 }
 
-/// Escreve a carga util. `progress` recebe a fracao ja escrita, entre 0 e 1.
-///
-/// Tudo ou nada. Primeiro confirma que nenhum ficheiro a substituir esta em
-/// uso (a NeuralIA aberta); depois escreve cada ficheiro com um nome de
-/// passagem; so quando estao todos no disco e que troca, guardando os antigos
-/// ao lado. Se uma troca falhar, os antigos voltam ao sitio. Um disco cheio a
-/// meio, ou a NeuralIA aberta, deixam a versao anterior inteira -- nunca meia
-/// de cada.
-pub fn write_payload(plan: &Plan, mut progress: impl FnMut(f64)) -> Result<(), InstallError> {
-    if plan.entries.is_empty() {
-        return Err(InstallError::NoPayload);
+/// De onde vem o conteudo de um ficheiro a instalar.
+enum Content<'a> {
+    Bytes(&'a [u8]),
+    /// Uma copia de um ficheiro do disco: o proprio instalador, que fica na
+    /// pasta como desinstalador.
+    CopyOf(&'a Path),
+}
+
+impl Content<'_> {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Bytes(data) => data.len() as u64,
+            Self::CopyOf(path) => fs::metadata(path).map_or(0, |meta| meta.len()),
+        }
     }
-    let targets = payload_files(&plan.root, &plan.entries);
+
+    fn write_to(&self, part: &Path) -> io::Result<()> {
+        match self {
+            Self::Bytes(data) => fs::write(part, data),
+            Self::CopyOf(path) => fs::copy(path, part).map(|_| ()),
+        }
+    }
+}
+
+/// Os ficheiros novos, ja no sitio, com os antigos guardados ao lado
+/// (`.neuralia-old`) e as pastas que foram criadas para eles.
+///
+/// Ainda nao e definitivo: largar isto sem `commit` desfaz a troca -- os
+/// antigos voltam, os novos saem, as pastas criadas vazias desaparecem. E o
+/// que deixa a instalacao desfazer-se inteira quando um passo DEPOIS dos
+/// ficheiros (os atalhos, o registo) falha.
+#[derive(Debug)]
+#[must_use = "sem commit, a troca desfaz-se"]
+pub struct Swapped {
+    replaced: Vec<(PathBuf, Option<PathBuf>)>,
+    created_dirs: Vec<PathBuf>,
+    committed: bool,
+}
+
+impl Swapped {
+    /// Tudo correu bem: as versoes antigas ja nao servem para nada.
+    pub fn commit(mut self) {
+        self.committed = true;
+        for old in self.replaced.iter().filter_map(|(_, old)| old.as_ref()) {
+            let _ = fs::remove_file(old);
+        }
+    }
+}
+
+impl Drop for Swapped {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        roll_back(&self.replaced);
+        remove_dirs(&self.created_dirs);
+    }
+}
+
+/// As pastas que faltam para `dirs` existirem, das mais fundas para as de
+/// cima: as que a instalacao cria e, se falhar, apaga.
+fn missing_dirs(dirs: &[&Path]) -> Vec<PathBuf> {
+    let mut missing: Vec<PathBuf> = dirs
+        .iter()
+        .flat_map(|dir| {
+            dir.ancestors()
+                .take_while(|dir| !dir.as_os_str().is_empty())
+        })
+        .filter(|dir| !dir.exists())
+        .map(Path::to_path_buf)
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    missing
+}
+
+/// Apaga as pastas que ficaram vazias, pela ordem dada (as mais fundas
+/// primeiro). Uma pasta com alguma coisa dentro fica.
+fn remove_dirs(dirs: &[PathBuf]) {
+    for dir in dirs {
+        let _ = fs::remove_dir(dir);
+    }
+}
+
+/// Escreve `items` (destino e conteudo) tudo ou nada.
+///
+/// Primeiro confirma que nenhum ficheiro a substituir esta em uso (a
+/// NeuralIA aberta); depois escreve TODOS com um nome de passagem -- e aqui
+/// que um disco cheio falha, com nada trocado; so entao troca, guardando os
+/// antigos ao lado. Se uma troca falhar, os antigos voltam ao sitio.
+fn write_files(
+    root: &Path,
+    items: &[(PathBuf, Content<'_>)],
+    mut progress: impl FnMut(f64),
+) -> Result<Swapped, InstallError> {
+    let targets: Vec<PathBuf> = items.iter().map(|(target, _)| target.clone()).collect();
     let busy = files_in_use(&targets);
     if !busy.is_empty() {
         return Err(InstallError::InUse(busy));
     }
 
-    let total = plan.total_bytes().max(1);
-    let mut written = 0u64;
-    fs::create_dir_all(&plan.root).map_err(|e| InstallError::Io(plan.root.clone(), e))?;
+    let mut dirs: Vec<&Path> = vec![root];
+    dirs.extend(targets.iter().filter_map(|target| target.parent()));
+    // A partir daqui, qualquer saida antes do fim desfaz o que ja se fez.
+    let mut swapped = Swapped {
+        replaced: Vec::with_capacity(items.len()),
+        created_dirs: missing_dirs(&dirs),
+        committed: false,
+    };
+    for dir in &dirs {
+        fs::create_dir_all(dir).map_err(|e| InstallError::Io(dir.to_path_buf(), e))?;
+    }
 
-    let mut staged: Vec<PathBuf> = Vec::with_capacity(targets.len());
-    for (entry, target) in plan.entries.iter().zip(&targets) {
+    let total = items
+        .iter()
+        .map(|(_, content)| content.len())
+        .sum::<u64>()
+        .max(1);
+    let mut written = 0u64;
+    let mut staged: Vec<PathBuf> = Vec::with_capacity(items.len());
+    for (target, content) in items {
         let part = sibling(target, "neuralia-part");
-        let result = target
-            .parent()
-            .map_or(Ok(()), fs::create_dir_all)
-            .and_then(|()| fs::write(&part, &entry.data));
-        if let Err(error) = result {
+        let _ = fs::remove_file(&part);
+        if let Err(error) = content.write_to(&part) {
             let _ = fs::remove_file(&part);
             discard(&staged);
             return Err(InstallError::Io(part, error));
         }
         staged.push(part);
-        written += entry.data.len() as u64;
+        written += content.len();
         // A troca que falta e instantanea; a barra so chega ao fim com ela.
         progress(written as f64 / total as f64 * 0.99);
     }
 
-    // A troca. `swapped` guarda o que ja trocou, para se poder desfazer.
-    let mut swapped: Vec<(PathBuf, Option<PathBuf>)> = Vec::with_capacity(targets.len());
     for (part, target) in staged.iter().zip(&targets) {
         let old = if target.exists() {
             let old = sibling(target, "neuralia-old");
             let _ = fs::remove_file(&old);
             if let Err(error) = fs::rename(target, &old) {
-                roll_back(&swapped);
                 discard(&staged);
                 return Err(InstallError::Io(target.clone(), error));
             }
@@ -494,19 +597,38 @@ pub fn write_payload(plan: &Plan, mut progress: impl FnMut(f64)) -> Result<(), I
             if let Some(old) = &old {
                 let _ = fs::rename(old, target);
             }
-            roll_back(&swapped);
             discard(&staged);
             return Err(InstallError::Io(target.clone(), error));
         }
-        swapped.push((target.clone(), old));
-    }
-
-    // Tudo no sitio: as versoes antigas ja nao servem para nada.
-    for old in swapped.iter().filter_map(|(_, old)| old.as_ref()) {
-        let _ = fs::remove_file(old);
+        swapped.replaced.push((target.clone(), old));
     }
     progress(1.0);
-    Ok(())
+    Ok(swapped)
+}
+
+/// Escreve a carga util e, com `uninstaller_from`, a copia do instalador que
+/// fica como desinstalador -- as duas coisas no mesmo tudo-ou-nada: o disco
+/// cheio que nao deixa copiar os 14 MB do desinstalador falha antes de a
+/// NeuralIA antiga ser tocada. `progress` recebe a fracao ja escrita.
+///
+/// O resultado so fica definitivo com `Swapped::commit`.
+pub fn write_payload(
+    plan: &Plan,
+    uninstaller_from: Option<&Path>,
+    progress: impl FnMut(f64),
+) -> Result<Swapped, InstallError> {
+    if plan.entries.is_empty() {
+        return Err(InstallError::NoPayload);
+    }
+    let mut items: Vec<(PathBuf, Content<'_>)> = plan
+        .entries
+        .iter()
+        .map(|entry| (target_of(&plan.root, entry), Content::Bytes(&entry.data)))
+        .collect();
+    if let Some(me) = uninstaller_from {
+        items.push((plan.uninstaller(), Content::CopyOf(me)));
+    }
+    write_files(&plan.root, &items, progress)
 }
 
 fn discard(staged: &[PathBuf]) {
@@ -522,22 +644,6 @@ fn roll_back(swapped: &[(PathBuf, Option<PathBuf>)]) {
             let _ = fs::rename(old, target);
         }
     }
-}
-
-/// Copia o proprio instalador para dentro da pasta, onde passa a ser o
-/// desinstalador. Por um nome de passagem, como a carga util. Se o que esta a
-/// correr ja e o desinstalador da pasta, nao ha nada a copiar.
-pub fn place_uninstaller(me: &Path, target: &Path) -> Result<(), InstallError> {
-    if same_path(me, target) {
-        return Ok(());
-    }
-    let part = sibling(target, "neuralia-part");
-    let _ = fs::remove_file(&part);
-    fs::copy(me, &part).map_err(|e| InstallError::Io(part.clone(), e))?;
-    fs::rename(&part, target).map_err(|e| {
-        let _ = fs::remove_file(&part);
-        InstallError::Io(target.to_path_buf(), e)
-    })
 }
 
 /// Tudo o que a desinstalacao apaga dentro da pasta. Nao apaga a pasta do
@@ -567,7 +673,7 @@ pub fn guard_user_data(
         return Err(Failure::new(
             FailureKind::BadArguments,
             format!(
-                "Recusado: {} fica dentro da pasta dos seus dados.",
+                "Recusado: {} está dentro da pasta dos seus dados.",
                 path.display()
             ),
         ));
@@ -599,6 +705,10 @@ pub fn delete_set(root: &Path, entries: &[Entry], legacy: &LegacyCleanup) -> Vec
 /// pasta de cima da instalacao; e a pasta da instalacao fica vazia. As
 /// subpastas da carga util e a raiz so desaparecem se ficaram vazias: o que o
 /// utilizador la tiver posto e dele.
+///
+/// O desinstalador sai por ultimo, e so se a carga util saiu toda: com um
+/// ficheiro da NeuralIA preso, a entrada de "Aplicativos" fica, e o
+/// `UninstallString` dela tem de continuar a abrir um desinstalador.
 pub fn remove_installed(
     root: &Path,
     entries: &[Entry],
@@ -609,16 +719,32 @@ pub fn remove_installed(
     let total = files.len().max(1);
     let mut left = Vec::new();
     for (done, path) in files.iter().enumerate() {
+        let is_uninstaller = path.ends_with(UNINSTALLER);
+        if is_uninstaller && !left.is_empty() {
+            break;
+        }
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(_) if path.ends_with(UNINSTALLER) && park(path, parking, root) => {}
+            Err(_) if is_uninstaller && park(path, parking, root) => {}
             Err(_) => left.push(path.clone()),
         }
         progress((done + 1) as f64 / total as f64);
     }
     remove_empty_folders(root, &files);
     if left.is_empty() { Ok(()) } else { Err(left) }
+}
+
+/// Tira a pasta de trabalho deste processo de dentro de `root`, para a pasta
+/// de cima. O Windows nao apaga a pasta de trabalho de um processo, e um
+/// duplo clique no desinstalador pelo Explorador corre-o com a pasta de
+/// trabalho dentro da pasta de instalacao: sem isto, a pasta ficava e a
+/// desinstalacao dizia que tinha corrido bem.
+pub fn leave_folder(root: &Path) {
+    let inside = std::env::current_dir().is_ok_and(|cwd| is_within(&cwd, root));
+    if inside && let Some(parent) = root.parent() {
+        let _ = std::env::set_current_dir(parent);
+    }
 }
 
 /// O prefixo de um desinstalador estacionado: `neuralia-uninstaller-<pid>.exe`
@@ -641,14 +767,74 @@ pub fn parking_spots(parking: &Path, root: &Path) -> Vec<PathBuf> {
     spots
 }
 
+/// Os desinstaladores que este processo estacionou. Ao sair, cada um fica
+/// com a remocao marcada (`remove_after_exit`).
+static PARKED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 fn park(path: &Path, parking: &Path, root: &Path) -> bool {
-    parking_spots(parking, root).into_iter().any(|spot| {
+    let spot = parking_spots(parking, root).into_iter().find(|spot| {
         if let Some(folder) = spot.parent() {
             let _ = fs::create_dir_all(folder);
         }
-        let _ = fs::remove_file(&spot);
-        fs::rename(path, &spot).is_ok()
-    })
+        let _ = fs::remove_file(spot);
+        fs::rename(path, spot).is_ok()
+    });
+    if let Some(spot) = &spot
+        && let Ok(mut parked) = PARKED.lock()
+    {
+        parked.push(spot.clone());
+    }
+    spot.is_some()
+}
+
+/// O que este processo estacionou, para marcar a remocao antes de sair.
+pub fn take_parked() -> Vec<PathBuf> {
+    PARKED
+        .lock()
+        .map(|mut parked| std::mem::take(&mut *parked))
+        .unwrap_or_default()
+}
+
+/// A linha de comandos do `cmd.exe` que apaga `path` depois de este processo
+/// sair: tenta de segundo a segundo durante meio minuto (o executavel so se
+/// deixa apagar quando o processo que o corre acaba) e para quando consegue.
+/// `None` para um caminho com `%`, que o `cmd` expandiria: esse fica para a
+/// varredura da proxima corrida (`sweep_parked`).
+pub fn removal_command(path: &Path) -> Option<String> {
+    let path = path.to_string_lossy();
+    if path.contains(['%', '"']) || path.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "/d /v:off /c for /l %i in (1,1,30) do @(ping -n 2 127.0.0.1 >nul & del /f /q \"{path}\" >nul 2>&1 & if not exist \"{path}\" exit 0)"
+    ))
+}
+
+/// Marca `path` para ser apagado depois de este processo sair, por um `cmd`
+/// sem janela. O desinstalador a correr nao se pode apagar a si proprio, e
+/// sem isto uma copia inteira do instalador (14 MB, com a NeuralIA dentro)
+/// ficava para sempre na pasta temporaria, ou ao lado da pasta de instalacao.
+#[cfg(windows)]
+pub fn remove_after_exit(path: &Path) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let Some(arguments) = removal_command(path) else {
+        return false;
+    };
+    let system = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    std::process::Command::new(system.join("System32").join("cmd.exe"))
+        .raw_arg(arguments)
+        // Uma pasta que nao e nossa: o `cmd` a correr segura a sua pasta de
+        // trabalho, e nao pode ser a que acabamos de esvaziar.
+        .current_dir(&system)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .is_ok()
 }
 
 /// `neuralia-uninstaller-1234.exe` ou `.neuralia-uninstaller-1234.exe`: um
@@ -928,7 +1114,7 @@ mod tests {
             desktop_shortcut: false,
         };
         assert!(matches!(
-            write_payload(&plan, |_| {}),
+            write_payload(&plan, None, |_| {}),
             Err(InstallError::NoPayload)
         ));
     }
@@ -948,7 +1134,9 @@ mod tests {
         };
 
         let mut seen: Vec<f64> = Vec::new();
-        write_payload(&plan, |fraction| seen.push(fraction)).expect("instalar");
+        write_payload(&plan, None, |fraction| seen.push(fraction))
+            .expect("instalar")
+            .commit();
 
         for path in installed_files(&dir, &plan.entries) {
             if path.ends_with(UNINSTALLER) {
@@ -996,7 +1184,9 @@ mod tests {
             entries: vec![entry("NeuralIA.exe", 4096)],
             desktop_shortcut: false,
         };
-        write_payload(&old, |_| {}).expect("primeira");
+        write_payload(&old, None, |_| {})
+            .expect("primeira")
+            .commit();
         let new = Plan {
             root: dir.clone(),
             entries: vec![Entry {
@@ -1005,7 +1195,7 @@ mod tests {
             }],
             desktop_shortcut: false,
         };
-        write_payload(&new, |_| {}).expect("segunda");
+        write_payload(&new, None, |_| {}).expect("segunda").commit();
         assert_eq!(
             fs::read(dir.join("NeuralIA.exe")).expect("ler"),
             b"nova versao",
@@ -1035,7 +1225,7 @@ mod tests {
             ],
             desktop_shortcut: false,
         };
-        let result = write_payload(&plan, |_| {});
+        let result = write_payload(&plan, None, |_| {}).map(Swapped::commit);
         assert!(matches!(result, Err(InstallError::Io(..))), "{result:?}");
         assert_eq!(
             fs::read(dir.join(EXECUTABLE)).expect("ler"),
@@ -1072,7 +1262,7 @@ mod tests {
             }],
             desktop_shortcut: false,
         };
-        let result = write_payload(&plan, |_| {});
+        let result = write_payload(&plan, None, |_| {}).map(Swapped::commit);
         drop(hold);
         let Err(InstallError::InUse(busy)) = &result else {
             panic!("esperava InUse, veio {result:?}");
@@ -1118,7 +1308,7 @@ mod tests {
             }],
             desktop_shortcut: false,
         };
-        let result = write_payload(&plan, |_| {});
+        let result = write_payload(&plan, None, |_| {}).map(Swapped::commit);
         drop(running.stdin.take());
         let _ = running.kill();
         let _ = running.wait();
@@ -1319,15 +1509,17 @@ mod tests {
     #[test]
     fn only_the_registration_of_this_folder_is_removed() {
         let root = Path::new(r"C:\Temp\smoke\NeuralIA");
-        assert!(registration_points_here(Some(root), root));
+        assert!(registration_points_here(Some(root), root, same_path));
         assert!(registration_points_here(
             Some(Path::new(r"c:\temp\smoke\neuralia\")),
-            root
+            root,
+            same_path
         ));
-        assert!(registration_points_here(None, root));
+        assert!(registration_points_here(None, root, same_path));
         assert!(!registration_points_here(
             Some(Path::new(r"C:\Users\eu\AppData\Local\Programs\NeuralIA")),
-            root
+            root,
+            same_path
         ));
     }
 
@@ -1577,19 +1769,109 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    fn exe_plan(root: &Path, data: &[u8]) -> Plan {
+        Plan {
+            root: root.to_path_buf(),
+            entries: vec![Entry {
+                path: EXECUTABLE.into(),
+                data: data.to_vec(),
+            }],
+            desktop_shortcut: false,
+        }
+    }
+
     #[test]
-    fn placing_the_uninstaller_over_itself_is_a_no_op() {
-        let dir = temp("self-copy");
+    fn the_uninstaller_copy_is_written_with_the_payload_and_undone_with_it() {
+        // O desinstalador (a copia do instalador) entra no mesmo
+        // tudo-ou-nada que a carga util: sem commit, a pasta volta ao que era.
+        let base = temp("uninstaller-copy");
+        let root = base.join("Programs").join(PRODUCT);
+        let me = base.join("NeuralIA-Setup.exe");
+        fs::create_dir_all(&base).expect("pasta");
+        fs::write(&me, b"instalador novo").expect("instalador");
+
+        // Instalacao nova, desfeita: nem a pasta nem a de cima ficam.
+        let swapped =
+            write_payload(&exe_plan(&root, b"nova"), Some(&me), |_| {}).expect("escrever");
+        assert_eq!(
+            fs::read(root.join(UNINSTALLER)).expect("ler"),
+            b"instalador novo"
+        );
+        drop(swapped);
+        assert!(
+            !base.join("Programs").exists(),
+            "a instalacao desfeita deixou pastas"
+        );
+
+        // Por cima de uma instalacao: desfeita, os antigos voltam intactos.
+        fs::create_dir_all(&root).expect("pasta");
+        fs::write(root.join(EXECUTABLE), b"velha").expect("velha");
+        fs::write(root.join(UNINSTALLER), b"desinstalador velho").expect("velho");
+        let swapped =
+            write_payload(&exe_plan(&root, b"nova"), Some(&me), |_| {}).expect("escrever");
+        drop(swapped);
+        assert_eq!(fs::read(root.join(EXECUTABLE)).expect("ler"), b"velha");
+        assert_eq!(
+            fs::read(root.join(UNINSTALLER)).expect("ler"),
+            b"desinstalador velho"
+        );
+        let leftovers: Vec<_> = walk(&root)
+            .into_iter()
+            .filter(|p| p.to_string_lossy().contains(".neuralia-"))
+            .collect();
+        assert!(leftovers.is_empty(), "ficaram restos: {leftovers:?}");
+
+        // Sem o instalador para copiar (o disco cheio da vida real), falha
+        // antes de trocar o que quer que seja.
+        let missing = base.join("nao-existe.exe");
+        let result = write_payload(&exe_plan(&root, b"nova"), Some(&missing), |_| {});
+        assert!(matches!(result, Err(InstallError::Io(..))), "{result:?}");
+        assert_eq!(fs::read(root.join(EXECUTABLE)).expect("ler"), b"velha");
+
+        // Com commit fica, e sem restos.
+        write_payload(&exe_plan(&root, b"nova"), Some(&me), |_| {})
+            .expect("escrever")
+            .commit();
+        assert_eq!(fs::read(root.join(EXECUTABLE)).expect("ler"), b"nova");
+        assert_eq!(
+            fs::read(root.join(UNINSTALLER)).expect("ler"),
+            b"instalador novo"
+        );
+        assert!(
+            walk(&root)
+                .iter()
+                .all(|p| !p.to_string_lossy().contains(".neuralia-"))
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_removal_command_quotes_the_path_and_refuses_what_cmd_would_expand() {
+        let path = Path::new(r"C:\Users\Eu (casa) & cia\Apps\.neuralia-uninstaller-12.exe");
+        let command = removal_command(path).expect("comando");
+        assert!(command.contains(&format!("del /f /q \"{}\"", path.display())));
+        assert!(command.contains(&format!("if not exist \"{}\" exit 0", path.display())));
+        assert!(command.starts_with("/d /v:off /c "), "{command}");
+        assert_eq!(removal_command(Path::new(r"C:\%TEMP%\x.exe")), None);
+    }
+
+    #[test]
+    fn a_parked_uninstaller_is_deleted_after_this_process_is_gone() {
+        // O desinstalador estacionado nao se pode apagar a si proprio. Sem a
+        // remocao marcada, cada desinstalacao deixava uma copia inteira do
+        // instalador (14 MB) na pasta temporaria para sempre.
+        let dir = temp("after-exit");
         fs::create_dir_all(&dir).expect("pasta");
-        let target = dir.join(UNINSTALLER);
-        fs::write(&target, b"eu").expect("eu");
-        place_uninstaller(&target, &target).expect("nada a fazer");
-        assert_eq!(fs::read(&target).expect("ler"), b"eu");
-        let other = dir.join("novo.exe");
-        fs::write(&other, b"novo").expect("novo");
-        place_uninstaller(&other, &target).expect("copiar");
-        assert_eq!(fs::read(&target).expect("ler"), b"novo");
-        assert!(!dir.join("Desinstalar NeuralIA.exe.neuralia-part").exists());
+        let parked = dir.join(format!("{PARKED_PREFIX}{}.exe", std::process::id()));
+        fs::write(&parked, b"MZ copia estacionada").expect("copia");
+
+        assert!(remove_after_exit(&parked), "o cmd nao arrancou");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while parked.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let left = parked.exists();
         let _ = fs::remove_dir_all(&dir);
+        assert!(!left, "a copia estacionada ficou: {}", parked.display());
     }
 }

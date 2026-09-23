@@ -159,6 +159,55 @@ fn resolve(launch: &Launch) -> Result<Target, Failure> {
     })
 }
 
+/// O titulo diz o **estado**, nunca o nome: a arte ja diz "NeuralIA", e
+/// repeti-lo logo por baixo era a mesma palavra duas vezes no mesmo ecra.
+/// Os textos que o dono le sao pt-BR, com acentos, como os da NeuralIA.
+fn title(mode: Mode, screen: Screen) -> &'static str {
+    match (mode, screen) {
+        (_, Screen::Failed) => "Não foi possível",
+        (Mode::Install, Screen::Finished) => "Tudo pronto",
+        (Mode::Uninstall, Screen::Finished) => "Removida",
+        (Mode::Uninstall, Screen::Working) => "Removendo",
+        (Mode::Uninstall, _) => "Remover do computador",
+        (Mode::Install, Screen::Working) => "Instalando",
+        _ => "Pronta para instalar",
+    }
+}
+
+fn primary_label(mode: Mode, screen: Screen) -> &'static str {
+    match (mode, screen) {
+        (_, Screen::Failed) => "Fechar",
+        (Mode::Install, Screen::Finished) => "Abrir a NeuralIA",
+        (Mode::Uninstall, Screen::Finished) => "Fechar",
+        (Mode::Uninstall, _) => "Desinstalar",
+        _ => "Instalar",
+    }
+}
+
+/// O texto por baixo do titulo no ecra de boas-vindas.
+fn welcome_message(mode: Mode, root: &Path) -> String {
+    match mode {
+        Mode::Install => format!("Será instalada em {}", root.display()),
+        Mode::Uninstall => format!("Será removida de {}", root.display()),
+    }
+}
+
+/// O texto do fim, quando correu bem.
+fn finished_message(mode: Mode, root: &Path) -> String {
+    match mode {
+        Mode::Install => format!("Instalada em {}", root.display()),
+        Mode::Uninstall => "A NeuralIA foi removida deste computador.".to_string(),
+    }
+}
+
+const NO_PAYLOAD_MESSAGE: &str = "Este instalador foi gerado sem a NeuralIA dentro dele.";
+const DESKTOP_SHORTCUT_LABEL: &str = "Criar atalho na área de trabalho";
+const CANCEL_LABEL: &str = "Cancelar";
+
+fn version_label() -> String {
+    format!("versão {VERSION}")
+}
+
 struct Setup {
     mode: Mode,
     screen: Screen,
@@ -184,18 +233,8 @@ impl Setup {
         let target = resolve(launch);
         let (screen, message) = match (&target, launch.mode, entries.is_empty()) {
             (Err(failure), _, _) => (Screen::Failed, failure.message.clone()),
-            (Ok(_), Mode::Install, true) => (
-                Screen::Failed,
-                "Este instalador foi construido sem a NeuralIA la dentro.".to_string(),
-            ),
-            (Ok(target), Mode::Install, false) => (
-                Screen::Welcome,
-                format!("Vai ficar em {}", target.root.display()),
-            ),
-            (Ok(target), Mode::Uninstall, _) => (
-                Screen::Welcome,
-                format!("Vai remover {}", target.root.display()),
-            ),
+            (Ok(_), Mode::Install, true) => (Screen::Failed, NO_PAYLOAD_MESSAGE.to_string()),
+            (Ok(target), mode, _) => (Screen::Welcome, welcome_message(mode, &target.root)),
         };
         Self {
             mode: launch.mode,
@@ -215,28 +254,12 @@ impl Setup {
         }
     }
 
-    /// O titulo diz o **estado**, nunca o nome: a arte ja diz "NeuralIA", e
-    /// repeti-lo logo por baixo era a mesma palavra duas vezes no mesmo ecra.
-    fn title(&self) -> &str {
-        match (self.mode, self.screen) {
-            (_, Screen::Failed) => "Nao foi possivel",
-            (Mode::Install, Screen::Finished) => "Tudo pronto",
-            (Mode::Uninstall, Screen::Finished) => "Removida",
-            (Mode::Uninstall, Screen::Working) => "A remover",
-            (Mode::Uninstall, _) => "Remover do computador",
-            (Mode::Install, Screen::Working) => "A instalar",
-            _ => "Pronta a instalar",
-        }
+    fn title(&self) -> &'static str {
+        title(self.mode, self.screen)
     }
 
-    fn primary_label(&self) -> &str {
-        match (self.mode, self.screen) {
-            (_, Screen::Failed) => "Fechar",
-            (Mode::Install, Screen::Finished) => "Abrir a NeuralIA",
-            (Mode::Uninstall, Screen::Finished) => "Fechar",
-            (Mode::Uninstall, _) => "Desinstalar",
-            _ => "Instalar",
-        }
+    fn primary_label(&self) -> &'static str {
+        primary_label(self.mode, self.screen)
     }
 
     fn begin(&mut self, hwnd: HWND) {
@@ -296,11 +319,9 @@ impl Setup {
             Some(Ok(())) => {
                 self.progress = 1.0;
                 self.screen = Screen::Finished;
-                let root = self.target.as_ref().map(|t| t.root.display().to_string());
-                self.message = match self.mode {
-                    Mode::Install => format!("Instalada em {}", root.unwrap_or_default()),
-                    Mode::Uninstall => "A NeuralIA foi removida deste computador.".to_string(),
-                };
+                if let Ok(target) = &self.target {
+                    self.message = finished_message(self.mode, &target.root);
+                }
             }
             Some(Err(failure)) => {
                 self.screen = Screen::Failed;
@@ -317,7 +338,7 @@ impl Setup {
 fn busy_files(mode: Mode, root: &Path, entries: &[Entry], me: Option<&Path>) -> Vec<PathBuf> {
     let mut paths = install::payload_files(root, entries);
     let uninstaller = root.join(install::UNINSTALLER);
-    if mode == Mode::Install && !me.is_some_and(|me| install::same_path(me, &uninstaller)) {
+    if mode == Mode::Install && !me.is_some_and(|me| winshell::same_file(me, &uninstaller)) {
         paths.push(uninstaller);
     }
     install::files_in_use(&paths)
@@ -330,7 +351,7 @@ fn work(mode: Mode, plan: &Plan, target: &Target, shared: &Shared) -> Result<(),
             let me = std::env::current_exe().map_err(|e| {
                 Failure::new(
                     FailureKind::Failed,
-                    format!("nao sei onde estou no disco: {e}"),
+                    format!("Não foi possível localizar o instalador no disco: {e}"),
                 )
             })?;
             install_with(plan, target, &me, shared)
@@ -360,15 +381,117 @@ fn remove_legacy(cleanup: &install::LegacyCleanup, places: &Places) {
     }
 }
 
+/// O que a instalacao faz ao sistema fora da pasta: os atalhos e a entrada de
+/// "Aplicativos". No produto e o `Os`; os testes embrulham-no para um passo
+/// falhar DEPOIS de ter escrito, e provar que a instalacao se desfaz inteira.
+trait Effects {
+    fn shortcut(&self, link: &Path, exe: &Path, root: &Path) -> Result<(), String>;
+    fn register(
+        &self,
+        key: &str,
+        root: &Path,
+        uninstaller: &Path,
+        exe: &Path,
+        size_kb: u32,
+    ) -> Result<(), String>;
+}
+
+/// O sistema de verdade.
+struct Os;
+
+impl Effects for Os {
+    fn shortcut(&self, link: &Path, exe: &Path, root: &Path) -> Result<(), String> {
+        winshell::create_shortcut(link, exe, root, "NeuralIA", exe)
+    }
+
+    fn register(
+        &self,
+        key: &str,
+        root: &Path,
+        uninstaller: &Path,
+        exe: &Path,
+        size_kb: u32,
+    ) -> Result<(), String> {
+        winshell::register_uninstall(key, root, uninstaller, exe, VERSION, size_kb)
+    }
+}
+
+/// O que uma instalacao a meio ja mudou, para o desfazer se um passo falhar:
+/// os ficheiros trocados (com os antigos ao lado), os atalhos (com o que la
+/// estava antes) e a nossa entrada (com os valores de antes). Sem `commit`,
+/// largar isto repoe tudo, pela ordem inversa.
+struct Undo {
+    files: Option<install::Swapped>,
+    links: Vec<(PathBuf, Option<Vec<u8>>)>,
+    key: Option<(String, Option<winshell::KeySnapshot>)>,
+}
+
+impl Undo {
+    fn new(files: install::Swapped) -> Self {
+        Self {
+            files: Some(files),
+            links: Vec::new(),
+            key: None,
+        }
+    }
+
+    /// Guarda o atalho que vai ser escrito, tal como esta (ou que nao existe).
+    fn remember_link(&mut self, link: &Path) {
+        self.links
+            .push((link.to_path_buf(), std::fs::read(link).ok()));
+    }
+
+    /// Guarda a entrada que vai ser escrita, tal como esta (ou que nao existe).
+    fn remember_key(&mut self, key: &str) {
+        self.key = Some((key.to_string(), winshell::snapshot_key(key)));
+    }
+
+    /// Tudo escrito: fica.
+    fn commit(mut self) {
+        self.links.clear();
+        self.key = None;
+        if let Some(files) = self.files.take() {
+            files.commit();
+        }
+    }
+}
+
+impl Drop for Undo {
+    fn drop(&mut self) {
+        if let Some((key, before)) = self.key.take() {
+            winshell::restore_key(&key, before.as_ref());
+        }
+        for (link, before) in self.links.drain(..).rev() {
+            let _ = match before {
+                Some(bytes) => std::fs::write(&link, bytes),
+                None => std::fs::remove_file(&link),
+            };
+        }
+        // Os ficheiros por ultimo: largar o `Swapped` sem commit repoe-os.
+        drop(self.files.take());
+    }
+}
+
 /// A instalacao, com tudo o que toca no sistema a sair do `target`: a pasta, a
-/// chave de "Aplicacoes" e as pastas dos atalhos. Os testes passam-lhe uma
+/// chave de "Aplicativos" e as pastas dos atalhos. Os testes passam-lhe uma
 /// pasta de ensaio e correm exatamente isto.
-///
-/// A ordem e a que nunca deixa o utilizador sem NeuralIA nem com duas: a
-/// guarda dos dados, a NeuralIA aberta, a carga util (tudo ou nada), os
-/// atalhos, o desinstalador e a nossa entrada -- e so no fim, com a nossa
-/// entrada escrita, e que sai o que o Inno deixou.
 fn install_with(plan: &Plan, target: &Target, me: &Path, shared: &Shared) -> Result<(), Failure> {
+    install_using(plan, target, me, shared, &Os)
+}
+
+/// A ordem e a que nunca deixa o utilizador sem NeuralIA nem com meia: a
+/// guarda dos dados, a NeuralIA aberta, os ficheiros (a carga util E o
+/// desinstalador, tudo escrito antes de trocar o que quer que seja), os
+/// atalhos e a nossa entrada. Qualquer falha ate aqui desfaz tudo: a
+/// instalacao anterior volta como estava, ou uma instalacao nova desaparece.
+/// So no fim, com a nossa entrada escrita, e que sai o que o Inno deixou.
+fn install_using(
+    plan: &Plan,
+    target: &Target,
+    me: &Path,
+    shared: &Shared,
+    os: &dyn Effects,
+) -> Result<(), Failure> {
     shared.report(Stage::Preparing, 0.0);
     if plan.entries.is_empty() {
         return Err(InstallError::NoPayload.into());
@@ -381,48 +504,41 @@ fn install_with(plan: &Plan, target: &Target, me: &Path, shared: &Shared) -> Res
     }
     install::sweep_parked(&target.parking_folders());
 
-    install::write_payload(plan, |fraction| shared.report(Stage::Writing, fraction))?;
+    // O desinstalador e este mesmo programa, copiado para o lado da
+    // aplicacao -- salvo se o que corre ja e ele.
+    let uninstaller = plan.uninstaller();
+    let copy_from = (!winshell::same_file(me, &uninstaller)).then_some(me);
+    let files = install::write_payload(plan, copy_from, |fraction| {
+        shared.report(Stage::Writing, fraction)
+    })?;
+    let mut undo = Undo::new(files);
+    let failed = |why: String| Failure::new(FailureKind::Failed, why);
 
     shared.report(Stage::Shortcuts, 0.0);
     let exe = plan.executable();
-    if let Some(programs) = &target.places.start_menu {
-        winshell::create_shortcut(
-            &programs.join(format!("{}.lnk", install::PRODUCT)),
-            &exe,
-            &plan.root,
-            "NeuralIA",
-            &exe,
-        )
-        .map_err(|why| Failure::new(FailureKind::Failed, why))?;
+    let link_name = format!("{}.lnk", install::PRODUCT);
+    let mut links: Vec<PathBuf> = target
+        .places
+        .start_menu
+        .iter()
+        .map(|d| d.join(&link_name))
+        .collect();
+    if plan.desktop_shortcut {
+        links.extend(target.places.desktop.iter().map(|d| d.join(&link_name)));
     }
-    shared.report(Stage::Shortcuts, 0.5);
-    if plan.desktop_shortcut
-        && let Some(desktop) = &target.places.desktop
-    {
-        winshell::create_shortcut(
-            &desktop.join(format!("{}.lnk", install::PRODUCT)),
-            &exe,
-            &plan.root,
-            "NeuralIA",
-            &exe,
-        )
-        .map_err(|why| Failure::new(FailureKind::Failed, why))?;
+    for (done, link) in links.iter().enumerate() {
+        undo.remember_link(link);
+        os.shortcut(link, &exe, &plan.root).map_err(failed)?;
+        shared.report(Stage::Shortcuts, (done + 1) as f64 / links.len() as f64);
     }
 
-    // O desinstalador e este mesmo programa, guardado ao lado da aplicacao.
     shared.report(Stage::Registering, 0.0);
-    let uninstaller = plan.uninstaller();
-    install::place_uninstaller(me, &uninstaller)?;
+    let key = target.places.key();
+    undo.remember_key(&key);
     let size_kb = (plan.total_bytes() / 1024).max(1) as u32;
-    winshell::register_uninstall(
-        &target.places.key(),
-        &plan.root,
-        &uninstaller,
-        &exe,
-        VERSION,
-        size_kb,
-    )
-    .map_err(|why| Failure::new(FailureKind::Failed, why))?;
+    os.register(&key, &plan.root, &uninstaller, &exe, size_kb)
+        .map_err(failed)?;
+    undo.commit();
 
     shared.report(Stage::Registering, 0.5);
     remove_legacy(&legacy_cleanup(&plan.root, &target.places), &target.places);
@@ -430,10 +546,12 @@ fn install_with(plan: &Plan, target: &Target, me: &Path, shared: &Shared) -> Res
 }
 
 /// O atalho `link` abre a NeuralIA desta pasta? So esses se apagam: um atalho
-/// para outra instalacao nao e deste desinstalador.
+/// para outra instalacao nao e deste desinstalador. Pela identidade no disco,
+/// e por isso ANTES de apagar o executavel: o `IShellLink` devolve o nome
+/// longo, e a pasta pode ter chegado pelo nome 8.3.
 fn shortcut_points_into(link: &Path, root: &Path) -> bool {
     winshell::shortcut_details(link)
-        .is_ok_and(|details| install::same_path(&details.target, &root.join(install::EXECUTABLE)))
+        .is_ok_and(|details| winshell::same_file(&details.target, &root.join(install::EXECUTABLE)))
 }
 
 /// A desinstalacao, com o que toca no sistema a sair do `target` -- e assim
@@ -447,9 +565,26 @@ fn uninstall_with(plan: &Plan, target: &Target, shared: &Shared) -> Result<(), F
         return Err(InstallError::InUse(busy).into());
     }
     install::sweep_parked(&target.parking_folders());
+    install::leave_folder(&plan.root);
+
+    // O que e desta pasta decide-se enquanto ela existe: a identidade no
+    // disco precisa dos ficheiros.
+    let links: Vec<PathBuf> = target
+        .places
+        .shortcut_folders()
+        .into_iter()
+        .map(|folder| folder.join(format!("{}.lnk", install::PRODUCT)))
+        .filter(|link| shortcut_points_into(link, &plan.root))
+        .collect();
+    let key = target.places.key();
+    let ours = install::registration_points_here(
+        winshell::registered_location(&key).as_deref(),
+        &plan.root,
+        winshell::same_file,
+    );
 
     // Se algum ficheiro ficou, para aqui: os atalhos e a entrada em
-    // Aplicacoes continuam, para a NeuralIA que ficou poder ser aberta e
+    // Aplicativos continuam, para a NeuralIA que ficou poder ser aberta e
     // desinstalada outra vez depois de fechada.
     install::remove_installed(&plan.root, &plan.entries, &target.parking, |fraction| {
         shared.report(Stage::Writing, fraction)
@@ -463,24 +598,19 @@ fn uninstall_with(plan: &Plan, target: &Target, shared: &Shared) -> Result<(), F
         Failure::new(
             FailureKind::InUse,
             format!(
-                "Feche a NeuralIA e tente outra vez. {} ficheiro(s) em uso nao sairam, a comecar por {first}.",
+                "Feche a NeuralIA e tente novamente. {} arquivo(s) em uso não foram removidos, começando por {first}.",
                 left.len()
             ),
         )
     })?;
 
     shared.report(Stage::Shortcuts, 0.0);
-    for folder in target.places.shortcut_folders() {
-        let link = folder.join(format!("{}.lnk", install::PRODUCT));
-        if shortcut_points_into(&link, &plan.root) {
-            let _ = std::fs::remove_file(link);
-        }
+    for link in links {
+        let _ = std::fs::remove_file(link);
     }
 
     shared.report(Stage::Registering, 0.0);
-    let key = target.places.key();
-    if install::registration_points_here(winshell::registered_location(&key).as_deref(), &plan.root)
-    {
+    if ours {
         winshell::delete_key(&key);
     }
     // Uma NeuralIA que veio do Inno e se remove por aqui tambem leva a
@@ -506,7 +636,17 @@ pub fn run_quiet(launch: &Launch) -> i32 {
         };
         work(launch.mode, &plan, &target, &Shared::new())
     });
+    remove_parked_after_exit();
     install::exit_code(&outcome)
+}
+
+/// O desinstalador que se estacionou a si proprio nao se pode apagar enquanto
+/// corre: marca-se a remocao para depois de o processo acabar. Chamado mesmo
+/// antes de sair.
+fn remove_parked_after_exit() {
+    for parked in install::take_parked() {
+        install::remove_after_exit(&parked);
+    }
 }
 
 pub fn run(launch: &Launch) {
@@ -563,6 +703,7 @@ pub fn run(launch: &Launch) {
             DispatchMessageW(&message);
         }
     }
+    remove_parked_after_exit();
 }
 
 /// Tamanho certo para o DPI do monitor onde a janela nasceu, e ao centro dele.
@@ -762,7 +903,7 @@ unsafe fn paint_window(hwnd: HWND, state: &Setup) {
     );
     paint::text(
         target,
-        &format!("versao {VERSION}"),
+        &version_label(),
         layout.subtitle,
         paint::MUTED,
         small_font,
@@ -785,7 +926,7 @@ unsafe fn paint_window(hwnd: HWND, state: &Setup) {
         paint::progress_bar(target, &layout, state.progress, seconds, tone);
         paint::text(
             target,
-            state.stage.label(),
+            state.stage.label(state.mode == Mode::Uninstall),
             layout.stage,
             paint::FG,
             body_font,
@@ -811,7 +952,7 @@ unsafe fn paint_window(hwnd: HWND, state: &Setup) {
         );
         paint::text(
             target,
-            "Criar atalho no ambiente de trabalho",
+            DESKTOP_SHORTCUT_LABEL,
             Rect {
                 y: layout.checkbox_label.y + layout.checkbox_label.height * 0.5
                     - 10.0 * layout.scale,
@@ -838,7 +979,7 @@ unsafe fn paint_window(hwnd: HWND, state: &Setup) {
             paint::button(
                 target,
                 layout.secondary,
-                "Cancelar",
+                CANCEL_LABEL,
                 false,
                 paint::hovered(state.hover, Hit::Secondary),
                 true,
@@ -878,16 +1019,66 @@ mod tests {
         registry: String,
     }
 
+    /// O nome 8.3 de uma pasta que existe (`C:\Users\RUNNER~1\...`), o que os
+    /// runners do GitHub poem em `%TEMP%`.
+    fn short_form(path: &Path) -> PathBuf {
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let mut buffer = vec![0u16; 1024];
+        let len = unsafe { GetShortPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), 1024) };
+        assert!(
+            len > 0 && (len as usize) < buffer.len(),
+            "GetShortPathNameW falhou para {}",
+            path.display()
+        );
+        PathBuf::from(String::from_utf16_lossy(&buffer[..len as usize]))
+    }
+
     impl Sandbox {
         fn new(tag: &str) -> Self {
-            // Os atalhos passam pelo COM, como na thread de trabalho.
-            winshell::init_com();
             let dir = std::env::temp_dir().join(format!(
                 "neuralia-setup-sandbox-{tag}-{}",
                 std::process::id()
             ));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).expect("pasta de ensaio");
+            Self::at(dir)
+        }
+
+        /// Uma pasta de ensaio vista pelo nome 8.3, como o `%TEMP%` de um
+        /// runner do GitHub (`C:\Users\RUNNER~1\...`): o Windows grava e le
+        /// os atalhos com o nome longo, e comparar os dois como texto dizia
+        /// que o atalho da NeuralIA era de outra pasta.
+        fn short(tag: &str) -> Self {
+            let name = format!(
+                "neuralia setup sandbox with a long name {tag}-{}",
+                std::process::id()
+            );
+            // O `%TEMP%` primeiro (o do runner esta em C:, que gera nomes
+            // 8.3); se esse disco nao os gera, o `%LOCALAPPDATA%\Temp`.
+            for base in [std::env::temp_dir(), local_app_data().join("Temp")] {
+                let long = base.join(&name);
+                let _ = fs::remove_dir_all(&long);
+                if fs::create_dir_all(&long).is_err() {
+                    continue;
+                }
+                let short = short_form(&long);
+                if install::path_key(&short) != install::path_key(&long) {
+                    return Self::at(short);
+                }
+                let _ = fs::remove_dir_all(&long);
+            }
+            panic!("nenhuma pasta temporaria num disco que gere nomes 8.3 (o C: gera)");
+        }
+
+        fn at(dir: PathBuf) -> Self {
+            // Os atalhos passam pelo COM, como na thread de trabalho.
+            winshell::init_com();
             let places = install::sandbox_places(&dir).expect("sitios de ensaio");
             let leaf = dir
                 .file_name()
@@ -1060,7 +1251,9 @@ mod tests {
             &root
         ));
         let link = winshell::shortcut_details(&sandbox.start_menu_link()).expect("atalho");
-        assert!(install::same_path(
+        // Pela identidade no disco: o `IShellLink` devolve o nome longo, e o
+        // `%TEMP%` de um runner do GitHub e um nome 8.3.
+        assert!(winshell::same_file(
             &link.target,
             &root.join(install::EXECUTABLE)
         ));
@@ -1142,7 +1335,9 @@ mod tests {
         )
         .expect("instalacao boa");
         let stale_plan = plan(&stale, b"velha");
-        install::write_payload(&stale_plan, |_| {}).expect("copia velha");
+        install::write_payload(&stale_plan, None, |_| {})
+            .expect("copia velha")
+            .commit();
 
         uninstall_with(&stale_plan, &sandbox.target(&stale), &Shared::new())
             .expect("desinstalar a velha");
@@ -1197,6 +1392,11 @@ mod tests {
             sandbox.start_menu_link().exists(),
             "os atalhos foram apagados com a NeuralIA ainda instalada"
         );
+        // A entrada ficou, e o `UninstallString` dela abre este ficheiro.
+        assert!(
+            plan.uninstaller().exists(),
+            "a entrada de Aplicativos ficou a apontar para um desinstalador que saiu"
+        );
     }
 
     #[test]
@@ -1242,5 +1442,365 @@ mod tests {
             root.display()
         );
         assert!(!sandbox.start_menu_link().exists());
+    }
+
+    #[test]
+    fn under_an_8dot3_temp_the_upgrade_and_the_uninstall_still_find_their_shortcut() {
+        // O `%TEMP%` dos runners do GitHub e `C:\Users\RUNNER~1\...`, e o
+        // `IShellLink` devolve o alvo com o nome longo. Comparados como texto,
+        // o atalho da NeuralIA parecia de outra pasta: a desinstalacao
+        // deixava-o no menu Iniciar a apontar para nada.
+        let sandbox = Sandbox::short("8dot3");
+        let root = sandbox.dir.join("Programs").join("Neural IA");
+        seed_inno(&sandbox, &root);
+        let target = sandbox.target(&root);
+        let data = seed_data(&target);
+        let me = setup_exe(&sandbox);
+        let plan = plan(&root, b"NeuralIA nova");
+
+        install_with(&plan, &target, &me, &Shared::new()).expect("atualizar");
+        let link = winshell::shortcut_details(&sandbox.start_menu_link()).expect("atalho");
+        assert!(
+            winshell::same_file(&link.target, &root.join(install::EXECUTABLE)),
+            "o atalho abre {} e nao a NeuralIA nova",
+            link.target.display()
+        );
+        assert!(!winshell::key_exists(&sandbox.places.inno_key()));
+
+        uninstall_with(&plan, &target, &Shared::new()).expect("desinstalar");
+        assert!(!root.exists(), "a pasta ficou: {}", root.display());
+        assert!(!winshell::key_exists(&sandbox.places.key()));
+        assert!(
+            !sandbox.start_menu_link().exists(),
+            "o atalho do menu Iniciar ficou a apontar para uma NeuralIA que ja nao existe"
+        );
+        assert_data_untouched(&data);
+    }
+
+    /// Os bytes de cada ficheiro debaixo de `dir`, para comparar o antes e o
+    /// depois de uma instalacao que falhou.
+    fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let Ok(read) = fs::read_dir(dir) else {
+            return out;
+        };
+        for item in read.flatten() {
+            let path = item.path();
+            if path.is_dir() {
+                out.extend(snapshot(&path));
+            } else {
+                out.push((path.clone(), fs::read(&path).expect("ler")));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// So os nomes e tamanhos, para as mensagens de erro.
+    fn names(files: &[(PathBuf, Vec<u8>)]) -> Vec<String> {
+        files
+            .iter()
+            .map(|(path, data)| format!("{} ({} B)", path.display(), data.len()))
+            .collect()
+    }
+
+    #[test]
+    fn a_fresh_install_that_fails_after_the_payload_leaves_nothing_behind() {
+        // Disco cheio depois dos 12 MB da NeuralIA e antes dos 14 MB do
+        // desinstalador: o antigo `install_with` deixava o `NeuralIA.exe` e
+        // os atalhos, sem desinstalador e sem entrada em "Aplicativos" -- uma
+        // NeuralIA que o Windows nao sabe remover. Aqui a copia do
+        // desinstalador falha por o instalador nao existir.
+        let sandbox = Sandbox::new("fresh-fail");
+        let root = sandbox.dir.join("Programs").join(install::PRODUCT);
+        let target = sandbox.target(&root);
+        let missing = sandbox.dir.join("nao-existe.exe");
+        let mut plan = plan(&root, b"nova");
+        plan.desktop_shortcut = true;
+
+        let result = install_with(&plan, &target, &missing, &Shared::new());
+
+        let failure = result.expect_err("sem instalador para copiar nao se instala");
+        assert_eq!(install::exit_code(&Err(failure)), install::EXIT_FAILED);
+        assert!(
+            !root.exists(),
+            "ficou meia instalacao: {:?}",
+            names(&snapshot(&root))
+        );
+        assert!(!sandbox.start_menu_link().exists(), "o atalho ficou");
+        assert!(
+            !sandbox
+                .places
+                .desktop
+                .clone()
+                .expect("ambiente")
+                .join("NeuralIA.lnk")
+                .exists()
+        );
+        assert!(!winshell::key_exists(&sandbox.places.key()));
+    }
+
+    #[test]
+    fn an_upgrade_that_fails_at_the_shortcuts_puts_the_inno_install_back_as_it_was() {
+        // A 2.1.5 do Inno, e a atualizacao falha a meio dos atalhos (a pasta
+        // do ambiente de trabalho nao se deixa escrever). O dono tem de ficar
+        // com a NeuralIA que tinha, inteira: o executavel antigo, o
+        // `unins000.*`, a entrada do Inno, o atalho de antes -- e nenhuma
+        // entrada nossa a apontar para uma versao que nao esta la.
+        let sandbox = Sandbox::new("inno-fail");
+        let root = sandbox.dir.join("Programs").join(install::PRODUCT);
+        seed_inno(&sandbox, &root);
+        let target = sandbox.target(&root);
+        let data = seed_data(&target);
+        let before = snapshot(&root);
+        let link_before = fs::read(sandbox.start_menu_link()).expect("atalho do Inno");
+        // `Desktop` e um ficheiro: o atalho do ambiente de trabalho falha.
+        fs::write(sandbox.dir.join("Desktop"), b"bloqueio").expect("bloqueio");
+        let me = setup_exe(&sandbox);
+        let mut plan = plan(&root, b"NeuralIA nova");
+        plan.desktop_shortcut = true;
+
+        let result = install_with(&plan, &target, &me, &Shared::new());
+
+        assert!(result.is_err(), "o atalho falhou e a instalacao disse Ok");
+        let after = snapshot(&root);
+        assert!(
+            after == before,
+            "a pasta nao voltou ao que era antes da atualizacao: {:?} (antes {:?})",
+            names(&after),
+            names(&before)
+        );
+        assert_eq!(
+            fs::read(sandbox.start_menu_link()).expect("atalho"),
+            link_before,
+            "o atalho do menu Iniciar nao voltou ao de antes"
+        );
+        assert!(winshell::key_exists(&sandbox.places.inno_key()));
+        assert!(!winshell::key_exists(&sandbox.places.key()));
+        assert_data_untouched(&data);
+    }
+
+    /// Muda a pasta de trabalho do processo e devolve-a no fim, mesmo que o
+    /// teste falhe.
+    struct WorkingDir(PathBuf);
+
+    impl WorkingDir {
+        fn enter(dir: &Path) -> Self {
+            let previous = std::env::current_dir().expect("pasta de trabalho");
+            std::env::set_current_dir(dir).expect("entrar na pasta");
+            Self(previous)
+        }
+    }
+
+    impl Drop for WorkingDir {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn uninstalling_from_inside_the_install_folder_still_removes_the_folder() {
+        // Um duplo clique no "Desinstalar NeuralIA.exe" pelo Explorador corre
+        // o desinstalador com a pasta de trabalho dentro da pasta de
+        // instalacao, e o Windows nao apaga a pasta de trabalho de um
+        // processo: a pasta ficava, e o ecra dizia "removida".
+        let sandbox = Sandbox::new("cwd");
+        let root = sandbox.dir.join("Programs").join(install::PRODUCT);
+        let plan = plan(&root, &[9; 64]);
+        let target = sandbox.target(&root);
+        let me = setup_exe(&sandbox);
+        install_with(&plan, &target, &me, &Shared::new()).expect("instalar");
+
+        let result = {
+            let _inside = WorkingDir::enter(&root);
+            uninstall_with(&plan, &target, &Shared::new())
+        };
+
+        assert_eq!(result, Ok(()));
+        assert!(
+            !root.exists(),
+            "a pasta de instalacao ficou: {}",
+            root.display()
+        );
+    }
+
+    /// O sistema de verdade, mas a entrada de "Aplicativos" falha DEPOIS de
+    /// escrita -- como o `register_uninstall` quando um dos valores nao se
+    /// grava: a chave fica meio escrita, e a instalacao tem de a repor.
+    struct RegistrationFails;
+
+    impl Effects for RegistrationFails {
+        fn shortcut(&self, link: &Path, exe: &Path, root: &Path) -> Result<(), String> {
+            Os.shortcut(link, exe, root)
+        }
+
+        fn register(
+            &self,
+            key: &str,
+            root: &Path,
+            uninstaller: &Path,
+            exe: &Path,
+            size_kb: u32,
+        ) -> Result<(), String> {
+            Os.register(key, root, uninstaller, exe, size_kb)?;
+            Err("falha simulada depois de gravar a entrada".into())
+        }
+    }
+
+    #[test]
+    fn a_fresh_install_whose_registration_fails_removes_what_it_wrote() {
+        let sandbox = Sandbox::new("reg-fresh");
+        let root = sandbox.dir.join("Programs").join(install::PRODUCT);
+        let target = sandbox.target(&root);
+        let me = setup_exe(&sandbox);
+        let mut plan = plan(&root, b"nova");
+        plan.desktop_shortcut = true;
+
+        let result = install_using(&plan, &target, &me, &Shared::new(), &RegistrationFails);
+
+        let failure = result.expect_err("a entrada falhou");
+        assert_eq!(install::exit_code(&Err(failure)), install::EXIT_FAILED);
+        assert!(
+            !root.exists(),
+            "ficou meia instalacao: {:?}",
+            names(&snapshot(&root))
+        );
+        assert!(!sandbox.start_menu_link().exists(), "o atalho ficou");
+        let desktop = sandbox.places.desktop.clone().expect("ambiente");
+        assert!(!desktop.join("NeuralIA.lnk").exists(), "o atalho ficou");
+        assert!(
+            !winshell::key_exists(&sandbox.places.key()),
+            "ficou uma entrada em Aplicativos para uma NeuralIA que nao esta instalada"
+        );
+    }
+
+    #[test]
+    fn an_upgrade_whose_registration_fails_puts_the_previous_install_back() {
+        // A versao anterior (instalada por nos), com a sua entrada de
+        // "Aplicativos" a dizer 2.1.4. A atualizacao falha na entrada: o
+        // executavel, o desinstalador, o atalho e a entrada voltam a ser os
+        // de antes -- a NeuralIA de antes abre e desinstala-se como antes.
+        let sandbox = Sandbox::new("reg-upgrade");
+        let root = sandbox.dir.join("Programs").join(install::PRODUCT);
+        let target = sandbox.target(&root);
+        let old_setup = sandbox.dir.join("NeuralIA-Setup-antigo.exe");
+        fs::write(&old_setup, b"MZ instalador antigo").expect("antigo");
+        install_with(&plan(&root, b"velha"), &target, &old_setup, &Shared::new())
+            .expect("instalacao anterior");
+        let key = sandbox.places.key();
+        winshell::write_string(&key, "DisplayVersion", "2.1.4");
+        let files_before = snapshot(&root);
+        let link_before = fs::read(sandbox.start_menu_link()).expect("atalho");
+        let key_before = winshell::snapshot_key(&key).expect("entrada anterior");
+        let me = setup_exe(&sandbox);
+
+        let result = install_using(
+            &plan(&root, b"NeuralIA nova"),
+            &target,
+            &me,
+            &Shared::new(),
+            &RegistrationFails,
+        );
+
+        assert!(result.is_err(), "a entrada falhou e a instalacao disse Ok");
+        let files_after = snapshot(&root);
+        assert!(
+            files_after == files_before,
+            "a pasta nao voltou a versao anterior: {:?} (antes {:?})",
+            names(&files_after),
+            names(&files_before)
+        );
+        assert_eq!(
+            fs::read(sandbox.start_menu_link()).expect("atalho"),
+            link_before
+        );
+        assert_eq!(
+            winshell::read_string(&key, "DisplayVersion").as_deref(),
+            Some("2.1.4"),
+            "a entrada de Aplicativos ficou a dizer a versao que nao se instalou"
+        );
+        assert_eq!(winshell::snapshot_key(&key), Some(key_before));
+    }
+
+    #[test]
+    fn what_the_owner_reads_is_pt_br_with_accents() {
+        // A NeuralIA fala pt-BR com acentos ("Ação restrita: controle
+        // devolvido ao usuário."), e o instalador e a primeira coisa dela que
+        // o dono ve. Formas de Portugal ("A instalar", "ficheiro", "ambiente
+        // de trabalho", "tem de") e palavras sem acento nao entram.
+        let root = Path::new(r"C:\Users\eu\AppData\Local\Programs\NeuralIA");
+        let mut texts: Vec<String> = Vec::new();
+        for mode in [Mode::Install, Mode::Uninstall] {
+            for screen in [
+                Screen::Welcome,
+                Screen::Working,
+                Screen::Finished,
+                Screen::Failed,
+            ] {
+                texts.push(title(mode, screen).into());
+                texts.push(primary_label(mode, screen).into());
+            }
+            for stage in [
+                Stage::Preparing,
+                Stage::Writing,
+                Stage::Shortcuts,
+                Stage::Registering,
+                Stage::Done,
+            ] {
+                texts.push(stage.label(mode == Mode::Uninstall).into());
+            }
+            texts.push(welcome_message(mode, root));
+            texts.push(finished_message(mode, root));
+        }
+        texts.extend([
+            NO_PAYLOAD_MESSAGE.to_string(),
+            DESKTOP_SHORTCUT_LABEL.to_string(),
+            CANCEL_LABEL.to_string(),
+            version_label(),
+            install::in_use_message(&[root.join(install::EXECUTABLE)]),
+            InstallError::NoPayload.to_string(),
+        ]);
+        let data = Path::new(r"C:\Users\eu\AppData\Local\NeuralIA");
+        for bad_root in [Path::new("relativa"), Path::new(r"C:\"), data] {
+            texts.push(install::validate_install_root(bad_root, data).expect_err("recusada"));
+        }
+
+        let portugal = [
+            "A preparar",
+            "A instalar",
+            "A criar",
+            "A registar",
+            "A remover",
+            "Pronta a ",
+            "ficheiro",
+            "ambiente de trabalho",
+            "tem de",
+            "outra vez",
+            "Vai ficar",
+        ];
+        let unaccented = [
+            "Nao ",
+            "nao ",
+            "versao",
+            "possivel",
+            "instalacao",
+            "esta aberta",
+            "area de trabalho",
+            "sobrepoe",
+        ];
+        for text in &texts {
+            for word in portugal.iter().chain(&unaccented) {
+                assert!(
+                    !text.contains(word),
+                    "\"{text}\" nao e pt-BR com acentos ({word})"
+                );
+            }
+        }
+        assert!(texts.iter().any(|t| t == "Não foi possível"));
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == "Criar atalho na área de trabalho")
+        );
     }
 }
