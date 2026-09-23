@@ -7969,6 +7969,12 @@ macro_rules! agent_element_identity_js {
     const autocomplete = (el.autocomplete || '').toLowerCase();
     const role = (el.getAttribute('role') || '').toLowerCase();
     const name = (el.name || '').toLowerCase();
+    // Antes de tudo: o que o clique FAZ. Um submit de formulario e `submit`
+    // seja qual for o role ou o nome que a pagina lhe der; e o unico papel
+    // que faz o `app_agent_security_action` pedir confirmacao sem depender de
+    // o rotulo estar na lista de palavras.
+    if ((tag === 'button' && type === 'submit' && el.form) ||
+        (tag === 'input' && (type === 'submit' || type === 'image'))) return 'submit';
     const combined = [type, autocomplete, role, name].join(' ');
     if (combined.includes('password')) return 'password';
     if (combined.includes('one-time') || combined.includes('otp')) return 'otp';
@@ -11464,6 +11470,7 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
         struct DomRun {
             posts: Vec<String>,
             state: Value,
+            submits: u64,
         }
 
         /// Corre o observador que embarca num DOM descrito por `page` e depois
@@ -11506,6 +11513,7 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
                     .map(|post| post.as_str().expect("post").to_string())
                     .collect(),
                 state: result["state"].clone(),
+                submits: result["submits"].as_u64().unwrap_or(0),
             }
         }
 
@@ -11726,6 +11734,65 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
                 );
                 assert!(observed(post).is_some(), "observação recusada pelo nativo");
             }
+        }
+
+        #[test]
+        fn submit_button_in_a_form_waits_for_confirmation() {
+            // `<button type=submit role=button>Salvar</button>`: nenhuma
+            // palavra da lista, e o observador dizia `button`. O ramo
+            // `role.contains("submit")` nunca disparava e o formulário seguia
+            // como clique reversível, sem diálogo.
+            let page = json!({
+                "url": "https://example.com/settings",
+                "title": "Definições",
+                "main": "Preferências",
+                "elements": [
+                    {"key": "save", "tag": "button", "form": true, "attrs": {"type": "submit", "role": "button"}, "text": "Salvar"}
+                ]
+            });
+            let first = first_observation(&page);
+            let mut policy = policy_for("https://example.com");
+            let commands = [BrowserAgentCommand::Click("salvar".into())];
+            let act = act(&commands, 0, &first, &mut policy);
+            assert!(
+                act.confirmation.is_some(),
+                "submit de formulário sem confirmação: {act:?}"
+            );
+            assert!(matches!(act.security, AgentSecurityAction::Submit { .. }));
+
+            // Depois do sim, o guard continua a reconhecer o botão.
+            let script = agent_action_script(&act.action).expect("click executável");
+            let run = run_page(
+                &page,
+                &[json!({ "advance": 800 }), json!({ "eval": script })],
+            );
+            assert_eq!(run.submits, 1, "o submit aprovado não aconteceu");
+        }
+
+        #[test]
+        fn search_never_types_into_a_submit_input() {
+            // `<input type=submit>` era `textbox`: o search escrevia no botão.
+            let page = json!({
+                "url": "https://example.com/",
+                "title": "Busca",
+                "main": "",
+                "elements": [
+                    {"key": "go", "tag": "input", "form": true, "attrs": {"type": "submit", "name": "q", "value": "Buscar"}}
+                ]
+            });
+            let first = first_observation(&page);
+            let mut policy = policy_for("https://example.com");
+            assert_eq!(
+                decide_agent_step(
+                    &[BrowserAgentCommand::Search("rust".into())],
+                    0,
+                    0,
+                    Duration::ZERO,
+                    &first,
+                    &mut policy,
+                ),
+                AgentStepDecision::Stop(AgentTermination::ElementMissing)
+            );
         }
     }
 
