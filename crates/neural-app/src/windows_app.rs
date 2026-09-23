@@ -2367,6 +2367,34 @@ fn history_nav_target(
     }
 }
 
+/// Os botoes da janela do proprio app aparecem sempre que a moldura do Windows
+/// nao esta la: na Home e no comparador (com a barra).
+fn caption_buttons_wanted(surface: Surface, bar_visible: bool) -> bool {
+    match surface {
+        Surface::Home => true,
+        Surface::Comparator => bar_visible,
+        _ => false,
+    }
+}
+
+/// A faixa de cima da Home, onde se agarra a janela sem moldura.
+fn home_drag_strip(y: f64, scale: f64) -> bool {
+    y >= 0.0 && y <= TITLE_TAB_HEIGHT * scale.max(1.0)
+}
+
+/// Vermelho do fechar ao passar o rato, o mesmo do Chrome e do Windows.
+const CLOSE_HOVER_RED: Rgb = (232, 17, 35);
+
+/// Botoes da janela: o fechar fica vermelho com a cruz branca debaixo do rato,
+/// como no Chrome; minimizar e maximizar so realcam.
+fn caption_button_style(index: usize, hovered: bool, theme: &Theme) -> PillStyle {
+    match (index, hovered) {
+        (2, true) => PillStyle::new(CLOSE_HOVER_RED, CLOSE_HOVER_RED, (255, 255, 255)),
+        (_, true) => PillStyle::new(theme.surface_line, theme.surface_line, theme.fg),
+        _ => PillStyle::new(theme.surface, theme.surface_line, theme.fg),
+    }
+}
+
 /// Os tres botoes da janela, na ordem em que `native_button_index` os conta.
 fn caption_tooltip_label(index: usize, maximized: bool) -> &'static str {
     match index {
@@ -2843,8 +2871,9 @@ unsafe extern "system" fn caption_buttons_subclass(
                     let font = create_font((-13.0 * scale) as i32, FW_NORMAL as i32);
                     let maximized = IsZoomed(GetParent(hwnd)) != 0;
                     let labels = ["—", if maximized { "❐" } else { "□" }, "×"];
+                    let hovered = CAPTION_TOOLTIP_BUTTON.load(Ordering::Acquire);
                     for (index, label) in labels.into_iter().enumerate() {
-                        draw_button(
+                        draw_pill(
                             hdc,
                             UiRect {
                                 x: index as f64 * third,
@@ -2857,10 +2886,10 @@ unsafe extern "system" fn caption_buttons_subclass(
                                 height,
                             },
                             label,
-                            false,
+                            caption_button_style(index, hovered == index, &theme),
                             scale,
                             font,
-                            &theme,
+                            theme.page_bg,
                         );
                     }
                     DeleteObject(font as _);
@@ -2928,6 +2957,7 @@ unsafe extern "system" fn caption_buttons_subclass(
                     let maximized = IsZoomed(GetParent(hwnd)) != 0;
                     let text = index.map_or("", |index| caption_tooltip_label(index, maximized));
                     hover_tooltip(hwnd, text);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
             }
             DefSubclassProc(hwnd, message, wparam, lparam)
@@ -2935,6 +2965,7 @@ unsafe extern "system" fn caption_buttons_subclass(
         WM_MOUSELEAVE => {
             CAPTION_TOOLTIP_BUTTON.store(NATIVE_BUTTON_NONE, Ordering::Release);
             hover_tooltip(hwnd, "");
+            InvalidateRect(hwnd, std::ptr::null(), 0);
             DefSubclassProc(hwnd, message, wparam, lparam)
         }
         WM_CAPTURECHANGED | WM_CANCELMODE => {
@@ -7392,7 +7423,7 @@ impl App {
     /// decoracao produzir outro HWND, o controlo e destruido e recriado no
     /// novo pai; nao se usa SetParent neste overlay.
     fn sync_caption_buttons(&mut self) {
-        let wanted = self.surface == Surface::Comparator && self.bar_visible();
+        let wanted = caption_buttons_wanted(self.surface, self.bar_visible());
         if !wanted {
             if let Some(buttons) = self.caption_buttons.take() {
                 unsafe {
@@ -7402,8 +7433,20 @@ impl App {
             return;
         }
 
-        let (Some(window), Some(layout)) = (&self.window, self.bar_layout()) else {
+        let Some(window) = &self.window else {
             return;
+        };
+        // Na Home nao ha barra do comparador, mas os botoes da janela ficam no
+        // mesmo sitio: a geometria deles so depende da largura.
+        let layout = match self.bar_layout() {
+            Some(layout) if self.surface == Surface::Comparator => layout,
+            _ => BarLayout::with_rows(
+                window.inner_size().width as f64,
+                window.scale_factor(),
+                true,
+                BarColumns::even(COMPARATOR_COLUMNS),
+                std::array::from_fn(|_| plan_tab_row(&[], &[])),
+            ),
         };
         let Some(owner) = window_hwnd(window) else {
             return;
@@ -8675,6 +8718,13 @@ impl App {
         let layout = HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
         let (x, y) = self.cursor;
 
+        // Sem a barra do Windows, a faixa de cima arrasta a janela -- como a
+        // barra do comparador.
+        if home_drag_strip(y, window.scale_factor()) && !layout.go.contains(x, y) {
+            let _ = window.drag_window();
+            return;
+        }
+
         if layout.go.contains(x, y) {
             debug_log(format_args!("click_home: botao Ir"));
             self.submit_current();
@@ -9345,6 +9395,9 @@ impl ApplicationHandler<UserEvent> for App {
             // nao cabe com folga em 1120 px. O `inner_size` fica como o tamanho
             // de restauro, para quem carregar no botao do meio.
             .with_maximized(true)
+            // Sem a barra do Windows em lado nenhum: a Home e o comparador desenham
+            // os seus proprios botoes da janela (pedido do dono).
+            .with_decorations(false)
             .with_inner_size(LogicalSize::new(1120.0, 760.0))
             .with_min_inner_size(LogicalSize::new(700.0, 500.0));
 
@@ -9357,6 +9410,7 @@ impl ApplicationHandler<UserEvent> for App {
                 window.set_ime_allowed(true);
                 self.window = Some(window);
                 self.create_omnibox();
+                self.sync_caption_buttons();
                 self.request_redraw();
 
                 // Abertura: a consulta padrao ja entra na omnibox e vai direto
@@ -9613,23 +9667,18 @@ impl ApplicationHandler<UserEvent> for App {
                     self.surface
                 ));
                 if self.surface == Surface::Home {
-                    // O controller já foi descartado. Primeiro escondemos
-                    // qualquer host WRY que ainda esteja preso ao HWND antigo,
-                    // depois restauramos a moldura e repetimos a limpeza no
-                    // HWND efetivo. Isto fecha a regressão em que, do segundo
-                    // ciclo em diante, três WRY_WEBVIEW ficavam visíveis sobre
-                    // a Home apesar de os WebView Rust já terem sido dropados.
+                    // O controller já foi descartado: esconde-se qualquer host
+                    // WRY ainda preso ao HWND (a regressão em que, do segundo
+                    // ciclo em diante, três WRY_WEBVIEW ficavam visíveis sobre a
+                    // Home apesar de os WebView Rust já terem sido dropados).
+                    // A Home fica sem a moldura do Windows, como o comparador;
+                    // aqui so se limpam os hosts WRY orfaos e se mostram os
+                    // botoes da janela do proprio app.
                     if let Some(window) = &self.window {
                         hide_orphaned_wry_hosts(window);
-                        debug_log(format_args!(
-                            "RestoreHomeDecorations: set_decorations(true)"
-                        ));
-                        window.set_decorations(true);
                     }
                     self.ensure_window_subclass();
-                    if let Some(window) = &self.window {
-                        hide_orphaned_wry_hosts(window);
-                    }
+                    self.sync_caption_buttons();
                     self.needs_clear = true;
                     self.position_omnibox();
                     self.request_redraw();
@@ -9717,6 +9766,9 @@ impl ApplicationHandler<UserEvent> for App {
                     size.width, size.height, self.surface
                 ));
                 self.position_side_panel();
+                if self.surface == Surface::Home {
+                    self.sync_caption_buttons();
+                }
                 match self.surface {
                     Surface::Home => {
                         self.needs_clear = true;
@@ -12431,6 +12483,40 @@ mod tests {
             App
         );
         assert_eq!(history_nav_target(Surface::Home, false, None, false), App);
+    }
+
+    #[test]
+    fn home_has_no_windows_title_bar_but_keeps_its_window_buttons() {
+        // A Home ficou sem a barra do Windows (pedido do dono): sem os botoes
+        // do proprio app, nao haveria como minimizar nem fechar.
+        assert!(caption_buttons_wanted(Surface::Home, false));
+        assert!(caption_buttons_wanted(Surface::Comparator, true));
+        assert!(!caption_buttons_wanted(Surface::Comparator, false));
+        // E a janela agarra-se pela faixa de cima, nao pelo meio da Home.
+        assert!(home_drag_strip(4.0, 1.0));
+        assert!(home_drag_strip(TITLE_TAB_HEIGHT * 2.0 - 1.0, 2.0));
+        assert!(!home_drag_strip(TITLE_TAB_HEIGHT + 20.0, 1.0));
+    }
+
+    #[test]
+    fn the_close_button_turns_red_under_the_mouse_like_chrome() {
+        let theme = Theme::dark((0, 120, 215));
+        let close = caption_button_style(2, true, &theme);
+        assert_eq!(
+            close.fill, CLOSE_HOVER_RED,
+            "o fechar debaixo do rato e vermelho"
+        );
+        assert_eq!(close.text, (255, 255, 255), "com a cruz branca");
+        assert_ne!(caption_button_style(2, false, &theme).fill, CLOSE_HOVER_RED);
+        for index in [0, 1] {
+            let style = caption_button_style(index, true, &theme);
+            assert_ne!(style.fill, CLOSE_HOVER_RED, "so o fechar fica vermelho");
+            assert_ne!(
+                style.fill,
+                caption_button_style(index, false, &theme).fill,
+                "realce"
+            );
+        }
     }
 
     #[test]
