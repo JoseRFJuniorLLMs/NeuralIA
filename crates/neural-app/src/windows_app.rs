@@ -12731,7 +12731,7 @@ mod tests {
     const INJECTED_SCRIPT_HARNESS: &str = r##"
 const vm = require('node:vm');
 const MOCK = `
-var __stolen = [], __posted = [], __errors = [], __listeners = [], __timers = [], __observers = [];
+var __stolen = [], __posted = [], __errors = [], __listeners = [], __timers = [], __observers = [], __created = [];
 class EventTarget {
   addEventListener(type, handler) { __listeners.push({ target: this, type: String(type), handler }); }
   removeEventListener() {}
@@ -12768,7 +12768,7 @@ class Document extends Node {
     this.documentElement = new Element('html'); this.body = new Element('body'); this.head = new Element('head');
   }
   getElementById() { return null; }
-  createElement(tag) { return new Element(tag); }
+  createElement(tag) { __created.push(String(tag)); return new Element(tag); }
   createTextNode(text) { return { textContent: String(text) }; }
   querySelector() { return null; }
   querySelectorAll() { return []; }
@@ -12845,6 +12845,7 @@ const results = [];
 for (const c of INPUT.cases) {
   const context = vm.createContext({ location: new URL(c.href), URL });
   vm.runInContext(MOCK, context);
+  if (c.child) vm.runInContext('window.top = {};', context);
   vm.runInContext(c.script, context, { filename: c.name });
   vm.runInContext(PAGE, context);
   vm.runInContext(HELPERS, context);
@@ -12854,6 +12855,7 @@ for (const c of INPUT.cases) {
     stolen: Array.from(context.__stolen, String),
     posted: Array.from(context.__posted, String),
     errors: Array.from(context.__errors, String),
+    created: Array.from(context.__created, String),
   });
 }
 process.stdout.write(JSON.stringify(results));
@@ -12985,6 +12987,50 @@ process.stdout.write(JSON.stringify(results));
                 other => panic!("{name}: expected a link action, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn split_scroll_rail_is_top_frame_only() {
+        // WebView2 corre os initialization scripts tambem nos iframes. O rail
+        // (e o CSS que esconde as barras de rolagem) so pertence ao documento
+        // principal; num iframe cobria e engolia cliques do conteudo dele.
+        let inputs: Vec<serde_json::Value> = [false, true]
+            .into_iter()
+            .map(|child| {
+                serde_json::json!({
+                    "name": if child { "child frame" } else { "top frame" },
+                    "href": "https://example.com/",
+                    "child": child,
+                    "script": SPLIT_SCROLL_RAIL_SCRIPT,
+                })
+            })
+            .collect();
+        let program = format!(
+            "const INPUT = {};
+{}",
+            serde_json::json!({ "cases": inputs }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        let created = |index: usize| -> Vec<String> {
+            results[index]["created"]
+                .as_array()
+                .expect("created")
+                .iter()
+                .map(|tag| tag.as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        assert!(
+            created(0).iter().any(|tag| tag == "style"),
+            "top frame must still mount the rail: {:?}",
+            results[0]["errors"]
+        );
+        assert!(
+            created(1).is_empty(),
+            "child frame mounted rail elements: {:?}",
+            created(1)
+        );
     }
 
     #[test]
@@ -15523,6 +15569,10 @@ const AGENT_OBSERVER_SCRIPT: &str = r#"
 "#;
 
 const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
+(function () {
+  // WRY/WebView2 injeta initialization scripts em child frames no Windows:
+  // o rail e o CSS que esconde as barras so pertencem ao documento principal.
+  if (window.top !== window) return;
 document.addEventListener('DOMContentLoaded', () => {
   if (document.getElementById('neuralia-split-scroll-rail')) return;
 
@@ -15780,6 +15830,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   syncTicks();
 });
+})();
 "#;
 
 /// Tudo o que corre depois do DOMContentLoaded usa as capturas do topo: a
