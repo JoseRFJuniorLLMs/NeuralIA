@@ -19153,6 +19153,10 @@ console.log(JSON.stringify({{ calls, quiet: quiet === undefined }}));
         // Dez "é" sao 20 bytes: cabem oito inteiros, nunca meio.
         let long = BarLabel::new(&"é".repeat(10)).expect("etiqueta");
         assert_eq!(long.as_str(), "é".repeat(8));
+        // Com um "a" a frente, o byte 16 cai a MEIO de um "é": corta-se antes
+        // dele (15 bytes), em vez de guardar meio caractere e perder tudo.
+        let odd = BarLabel::new(&format!("a{}", "é".repeat(10))).expect("etiqueta");
+        assert_eq!(odd.as_str(), format!("a{}", "é".repeat(7)));
         let mixed = BarLabel::new("⏸ 12:00 pausa longa").expect("etiqueta");
         assert!(mixed.as_str().len() <= BAR_LABEL_MAX_BYTES);
         assert!(mixed.as_str().starts_with("⏸ 12:00"));
