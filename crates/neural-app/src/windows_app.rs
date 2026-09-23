@@ -434,6 +434,8 @@ struct BarColumns {
     /// Ha uma gaveta aberta: os botoes do Split ocupam o canto direito e os
     /// chips tem de parar antes deles.
     split_active: bool,
+    /// Largura logica do painel lateral a direita; as colunas ficam antes dele.
+    panel_width: f64,
 }
 
 impl BarColumns {
@@ -445,6 +447,7 @@ impl BarColumns {
             weights: [1.0; COMPARATOR_COLUMNS],
             minimized: [false; COMPARATOR_COLUMNS],
             split_active: false,
+            panel_width: 0.0,
         }
     }
 }
@@ -604,7 +607,7 @@ impl BarLayout {
         // funcao que posiciona os WebViews: depois de arrastar um divisor o
         // rotulo continua sobre a sua coluna, e o hit-testing com ele.
         let spans = visible_column_spans(
-            client_width / scale,
+            (client_width / scale - columns.panel_width).max(1.0),
             columns.count,
             &columns.weights,
             &columns.minimized,
@@ -1385,6 +1388,9 @@ struct ComparatorState {
     next_group_id: u64,
     /// Contador das identidades de abas. Nunca reutiliza durante a sessao.
     next_context_id: u64,
+    /// Largura logica ocupada a direita por um painel lateral aberto (0 sem
+    /// painel): as colunas repartem so o que sobra, como no Chrome.
+    panel_width: f64,
 }
 
 /// Janelas da palette nativa: o popup que desenha a caixa e o EDIT onde o
@@ -1419,6 +1425,7 @@ fn bar_columns(comp: &ComparatorState) -> BarColumns {
     if comp.expanded.is_some() || comp.split.is_some() {
         return BarColumns {
             split_active: comp.split.is_some(),
+            panel_width: comp.panel_width,
             ..BarColumns::even(comp.views.len())
         };
     }
@@ -1427,6 +1434,7 @@ fn bar_columns(comp: &ComparatorState) -> BarColumns {
         weights: comp.weights,
         minimized: comp.minimized,
         split_active: false,
+        panel_width: comp.panel_width,
     }
 }
 
@@ -5937,6 +5945,7 @@ impl App {
             groups: std::array::from_fn(|_| Vec::new()),
             next_group_id: 1,
             next_context_id: 1,
+            panel_width: 0.0,
         });
         self.activate_comparator(true);
     }
@@ -6128,7 +6137,12 @@ impl App {
         };
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
-        let logical_w = size.width as f64 / scale;
+        let logical_w = (size.width as f64 / scale
+            - self
+                .comparator
+                .as_ref()
+                .map_or(0.0, |comp| comp.panel_width))
+        .max(1.0);
         let logical_h = size.height as f64 / scale;
 
         let content_h = (logical_h - COMPARATOR_CHROME_HEIGHT).max(100.0);
@@ -7973,7 +7987,12 @@ impl App {
         let (show, boundaries, content_height, scale) = if let Some(comp) = &self.comparator {
             let scale = window.scale_factor().max(1.0);
             let size = window.inner_size();
-            let logical_w = size.width as f64 / scale;
+            let logical_w = (size.width as f64 / scale
+                - self
+                    .comparator
+                    .as_ref()
+                    .map_or(0.0, |comp| comp.panel_width))
+            .max(1.0);
             let logical_h = size.height as f64 / scale;
             let show = self.surface == Surface::Comparator
                 && comp.split.is_none()
@@ -8193,6 +8212,7 @@ impl App {
                 let _ = panel.focus();
                 debug_log(format_args!("service panel: {service:?}"));
                 self.service_panel = Some((service, panel));
+                self.fit_comparator_to_panel();
             }
             Err(error) => {
                 self.show_splash(
@@ -8206,6 +8226,7 @@ impl App {
     fn close_service_panel(&mut self) {
         if self.service_panel.take().is_some() {
             debug_log(format_args!("service panel: fechado"));
+            self.fit_comparator_to_panel();
         }
     }
 
@@ -8269,6 +8290,44 @@ impl App {
         }
     }
 
+    /// Largura que o painel aberto ocupa a direita do comparador (0 sem painel).
+    fn open_panel_width(&self) -> f64 {
+        let Some(window) = &self.window else {
+            return 0.0;
+        };
+        if self.surface != Surface::Comparator {
+            return 0.0;
+        }
+        let scale = window.scale_factor().max(1.0);
+        let size = window.inner_size();
+        let (width, height) = (size.width as f64 / scale, size.height as f64 / scale);
+        if self.service_panel.is_some() {
+            service_panel_bounds(width, height, COMPARATOR_CHROME_HEIGHT).2
+        } else if self.side_panel.is_some() {
+            side_panel_bounds(width, height, COMPARATOR_CHROME_HEIGHT).2
+        } else {
+            0.0
+        }
+    }
+
+    /// O comparador encolhe para o lado do painel, como no Chrome. Antes o
+    /// painel ficava POR CIMA das colunas, e os divisores e a paleta (popups)
+    /// apareciam por cima dele.
+    fn fit_comparator_to_panel(&mut self) {
+        let width = self.open_panel_width();
+        let Some(comp) = &mut self.comparator else {
+            return;
+        };
+        if (comp.panel_width - width).abs() < 0.5 {
+            return;
+        }
+        comp.panel_width = width;
+        self.update_comparator_layout();
+        self.sync_comparator_splitters();
+        self.position_palette();
+        self.request_redraw();
+    }
+
     /// Ctrl+H: abre o historico inteligente ao lado; de novo (ou Esc), fecha.
     fn toggle_side_panel(&mut self) {
         if self.side_panel.is_some() {
@@ -8321,6 +8380,7 @@ impl App {
             Ok(panel) => {
                 let _ = panel.focus();
                 self.side_panel = Some(panel);
+                self.fit_comparator_to_panel();
                 debug_log(format_args!(
                     "side panel: aberto surface={:?}",
                     self.surface
@@ -8338,6 +8398,7 @@ impl App {
         }
         self.panel_suggestion_query = None;
         debug_log(format_args!("side panel: fechado"));
+        self.fit_comparator_to_panel();
         // Largar a WebView nao devolve o teclado a ninguem.
         if self.surface == Surface::Home {
             self.focus_omnibox();
@@ -8686,7 +8747,12 @@ impl App {
         };
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
-        let logical_w = size.width as f64 / scale;
+        let logical_w = (size.width as f64 / scale
+            - self
+                .comparator
+                .as_ref()
+                .map_or(0.0, |comp| comp.panel_width))
+        .max(1.0);
         let logical_h = size.height as f64 / scale;
         // Coluna sem faixa (minimizada, ou o layout mudou por baixo da
         // palette): usa-se a largura toda em vez de a esconder.
@@ -10200,6 +10266,7 @@ impl ApplicationHandler<UserEvent> for App {
                     "resized {}x{} surface={:?}",
                     size.width, size.height, self.surface
                 ));
+                self.fit_comparator_to_panel();
                 self.position_side_panel();
                 self.position_service_panel();
                 if self.surface == Surface::Home {
@@ -12091,6 +12158,7 @@ mod tests {
                 weights: resized_weights(&weights, &visible, divider, mouse_x, 1120.0),
                 minimized: [false; COMPARATOR_COLUMNS],
                 split_active: false,
+                panel_width: 0.0,
             }
         }
 
@@ -12168,6 +12236,7 @@ mod tests {
                 weights,
                 minimized: [false, true, false],
                 split_active: false,
+                panel_width: 0.0,
             };
             let layout =
                 BarLayout::with_contexts(1120.0, 1.0, true, columns, [0; COMPARATOR_COLUMNS]);
@@ -13084,6 +13153,33 @@ mod tests {
             pixels
                 .chunks(4)
                 .all(|p| p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3])
+        );
+    }
+
+    #[test]
+    fn an_open_side_panel_shrinks_the_comparator_instead_of_covering_it() {
+        let columns = BarColumns {
+            panel_width: 440.0,
+            ..BarColumns::even(3)
+        };
+        let layout = BarLayout::with_contexts(1600.0, 1.0, true, columns, [0, 0, 0]);
+        let content_right = 1600.0 - 440.0;
+        for index in 0..3 {
+            let pill = layout.columns[index];
+            let plus = layout.add_tabs[index];
+            assert!(
+                pill.x + pill.width <= content_right + 0.5
+                    && plus.x + plus.width <= content_right + 0.5,
+                "a coluna {index} ficou por baixo do painel"
+            );
+        }
+        // O painel empurra: a terceira coluna recua em relacao a barra sem painel.
+        let plain = BarLayout::with_contexts(1600.0, 1.0, true, BarColumns::even(3), [0, 0, 0]);
+        assert!(
+            layout.columns[2].x < plain.columns[2].x - 100.0,
+            "a terceira coluna nao recuou: {} vs {}",
+            layout.columns[2].x,
+            plain.columns[2].x
         );
     }
 
@@ -16277,6 +16373,7 @@ process.stdout.write(JSON.stringify(results));
             weights: [2.0, 1.0, 1.0],
             minimized: [false; COMPARATOR_COLUMNS],
             split_active: false,
+            panel_width: 0.0,
         };
         let layout = BarLayout::with_contexts(1600.0, 1.0, true, dragged, [0; 3]);
         let spans = visible_column_spans(1600.0, 3, &dragged.weights, &dragged.minimized);
@@ -16319,6 +16416,7 @@ process.stdout.write(JSON.stringify(results));
             weights: [1.0; COMPARATOR_COLUMNS],
             minimized: [false, true, false],
             split_active: false,
+            panel_width: 0.0,
         };
         let layout = BarLayout::with_contexts(1600.0, 1.0, true, state, [0; 3]);
         assert_eq!(layout.minimized, [false, true, false]);
@@ -17157,6 +17255,7 @@ process.stdout.write(JSON.stringify(results));
                         weights: [1.0; COMPARATOR_COLUMNS],
                         minimized,
                         split_active,
+                        panel_width: 0.0,
                     };
                     let layout =
                         BarLayout::with_contexts(client_width, scale, true, columns, [3, 3, 3]);
