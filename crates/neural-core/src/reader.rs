@@ -740,7 +740,10 @@ fn collect_blocks(root: ElementRef<'_>, budget: &mut Budget<'_>) -> Result<Vec<R
             ignored -= usize::from(hidden);
             nesting -= usize::from(block);
             if let Some(index) = pending_index {
-                debug_assert_eq!(active_blocks.pop(), Some(index));
+                // O pop fica fora do assert: o release embarca sem
+                // debug-assertions e o bloco fechado tem de sair na mesma.
+                let popped = active_blocks.pop();
+                debug_assert_eq!(popped, Some(index));
             }
         }
 
