@@ -149,6 +149,58 @@ pub fn installed_files(root: &Path, entries: &[Entry]) -> Vec<PathBuf> {
     paths
 }
 
+/// Apaga o que a instalacao escreveu e devolve o que ficou no disco.
+///
+/// Um ficheiro que ja nao existe conta como apagado. O desinstalador que o
+/// Windows corre e o que esta dentro da pasta, e um executavel a correr nao se
+/// deixa apagar -- mas deixa-se mover no mesmo disco: vai para `parking` (a
+/// pasta temporaria do utilizador), e a pasta da instalacao fica vazia. As
+/// subpastas da carga util e a raiz so desaparecem se ficaram vazias: o que o
+/// utilizador la tiver posto e dele.
+pub fn remove_installed(
+    root: &Path,
+    entries: &[Entry],
+    parking: &Path,
+    mut progress: impl FnMut(f64),
+) -> Result<(), Vec<PathBuf>> {
+    let files = installed_files(root, entries);
+    let total = files.len().max(1);
+    let mut left = Vec::new();
+    for (done, path) in files.iter().enumerate() {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) if path.ends_with(UNINSTALLER) && park(path, parking) => {}
+            Err(_) => left.push(path.clone()),
+        }
+        progress((done + 1) as f64 / total as f64);
+    }
+
+    let mut folders: Vec<PathBuf> = files
+        .iter()
+        .filter_map(|file| file.parent())
+        .flat_map(|parent| parent.ancestors().take_while(move |dir| *dir != root))
+        .filter(|dir| dir.starts_with(root))
+        .map(Path::to_path_buf)
+        .collect();
+    folders.sort();
+    folders.dedup();
+    // As mais fundas primeiro: uma pasta so sai depois das que tem dentro.
+    folders.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    for folder in folders.iter().map(PathBuf::as_path).chain([root]) {
+        let _ = fs::remove_dir(folder);
+    }
+
+    if left.is_empty() { Ok(()) } else { Err(left) }
+}
+
+fn park(path: &Path, parking: &Path) -> bool {
+    let _ = fs::create_dir_all(parking);
+    let target = parking.join(format!("neuralia-uninstaller-{}.exe", std::process::id()));
+    let _ = fs::remove_file(&target);
+    fs::rename(path, target).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
