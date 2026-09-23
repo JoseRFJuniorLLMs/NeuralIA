@@ -25,8 +25,9 @@ use crate::gemini_live::{
 use crate::ipc::constant_time_eq;
 use crate::ipc::{IpcAction, parse_ipc_message};
 use crate::pomodoro_ui::{
-    POMODORO_COMMAND_HELP, PomodoroCommand, PomodoroController, PomodoroMenuItem, PomodoroTick,
-    TickSchedule, parse_pomodoro_command, phase_color, pomodoro_menu_command,
+    POMODORO_COMMAND_HELP, PhaseEnd, PomodoroCommand, PomodoroController, PomodoroMenuItem,
+    TickSchedule, TickScheduler, WindowAttention, parse_pomodoro_command, phase_color,
+    pomodoro_menu_command,
 };
 use crate::read_aloud::READ_ALOUD_SCRIPT;
 use neural_core::{
@@ -306,6 +307,8 @@ const SPLASH_HEIGHT: f64 = 46.0;
 /// de uma fase (mais tempo: quem estava concentrado pode nao estar a olhar).
 const POMODORO_NOTICE_SECONDS: u64 = 3;
 const POMODORO_PHASE_END_SECONDS: u64 = 8;
+/// A ajuda do `tema:` com uma palavra desconhecida (omnibox e palette).
+const THEME_COMMAND_HELP: &str = "Use tema:sistema, tema:claro ou tema:escuro.";
 const GMAIL_TOAST_WIDTH: f64 = 390.0;
 const GMAIL_TOAST_HEIGHT: f64 = 68.0;
 
@@ -499,6 +502,35 @@ fn tool_hint(tool: Tool, pomodoro: Option<&str>) -> String {
         (Tool::Pomodoro, Some(session)) => session.to_string(),
         _ => tool.tooltip().to_string(),
     }
+}
+
+/// A dica de uma ferramenta em `now`, com o Pomodoro da app: e o que a Home
+/// (`update_home_tool_hover`), a barra (`bar_hint`) e o refresco de cada
+/// segundo (`pomodoro_changed`) mostram.
+fn tool_hint_at(tool: Tool, pomodoro: &PomodoroController, now: Instant) -> String {
+    let session = match tool {
+        Tool::Pomodoro => pomodoro.hint(now),
+        Tool::Notes | Tool::Breath => None,
+    };
+    tool_hint(tool, session.as_deref())
+}
+
+/// A dica de um alvo da barra, como `App::bar_tooltip_text` a mostra: as
+/// ferramentas pela `tool_hint_at` (a do Pomodoro diz a sessao), o resto
+/// pela `bar_tooltip_label`.
+fn bar_hint(
+    hit: BarHit,
+    pomodoro: &PomodoroController,
+    now: Instant,
+    provider: &str,
+    maximized: bool,
+    tab_url: Option<&str>,
+    group: Option<(&str, bool)>,
+) -> Option<String> {
+    if let BarHit::Tool(tool) = hit {
+        return Some(tool_hint_at(tool, pomodoro, now));
+    }
+    bar_tooltip_label(hit, provider, maximized, tab_url, group)
 }
 
 /// Cor do tempo e do contorno do botao do Pomodoro: a da fase
@@ -2428,6 +2460,108 @@ fn splash_origin(client_w: i32, client_h: i32, width: i32, height: i32) -> (i32,
         ((client_w - width) / 2).max(0),
         ((client_h - height) / 2).max(0),
     )
+}
+
+/// Quem pede o popup do meio da janela.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplashKind {
+    /// Resposta a um gesto (zoom, "Nota criada", "Pomodoro iniciado"...):
+    /// aparece ja. Com a pergunta da rolagem a vista, tira-a SEM lhe
+    /// responder -- ela volta a ser feita na proxima leitura.
+    Notice,
+    /// Aviso que chega sozinho (o fim de uma fase do Pomodoro): com a
+    /// pergunta a vista, espera que ela saia.
+    Background,
+    /// "Rolar a pagina sozinho...?" com Sim e Nao.
+    Question,
+}
+
+/// O que o popup passa a mostrar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplashFrame {
+    text: String,
+    /// Com os botoes Sim e Nao (`SPLASH_ASKS`).
+    asks: bool,
+    seconds: u64,
+    /// O `HideSplash` deste quadro.
+    token: u64,
+}
+
+/// O fim de um quadro.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SplashHide {
+    /// Temporizador de um quadro que ja foi substituido.
+    Stale,
+    Hide {
+        /// A pergunta saiu sozinha, sem resposta: "nao" ate ao F8.
+        question_expired: bool,
+        /// O aviso que esperava pela pergunta, a mostrar agora.
+        next: Option<SplashFrame>,
+    },
+}
+
+/// O aviso e a pergunta da rolagem partilham UM popup. Antes, um aviso que
+/// chegasse durante a pergunta (um fim de fase do Pomodoro, "Nota criada")
+/// herdava o Sim/Nao -- um clique em "Sim" ligava a rolagem com o texto do
+/// Pomodoro no ecra -- e o temporizador DELE apagava a pergunta como se ela
+/// tivesse sido respondida "nao" para o resto da sessao. Aqui so a pergunta
+/// tem botoes, e so o fim do quadro dela conta como resposta.
+#[derive(Debug, Default)]
+struct SplashBoard {
+    token: u64,
+    /// Token da pergunta, enquanto e ela que esta a vista.
+    question: Option<u64>,
+    /// Um aviso de fundo que chegou com a pergunta a vista (so o ultimo).
+    waiting: Option<(String, u64)>,
+}
+
+impl SplashBoard {
+    /// `None`: fica a espera da pergunta (`SplashKind::Background`).
+    fn show(&mut self, text: String, seconds: u64, kind: SplashKind) -> Option<SplashFrame> {
+        if kind == SplashKind::Background && self.question.is_some() {
+            self.waiting = Some((text, seconds));
+            return None;
+        }
+        Some(self.frame(text, seconds, kind == SplashKind::Question))
+    }
+
+    fn frame(&mut self, text: String, seconds: u64, asks: bool) -> SplashFrame {
+        self.token = self.token.wrapping_add(1);
+        self.question = asks.then_some(self.token);
+        SplashFrame {
+            text,
+            asks,
+            seconds,
+            token: self.token,
+        }
+    }
+
+    /// O `HideSplash(token)` chegou.
+    fn hide(&mut self, token: u64) -> SplashHide {
+        if token != self.token {
+            return SplashHide::Stale;
+        }
+        let question_expired = self.question.take() == Some(token);
+        let next = self
+            .waiting
+            .take()
+            .map(|(text, seconds)| self.frame(text, seconds, false));
+        SplashHide::Hide {
+            question_expired,
+            next,
+        }
+    }
+
+    /// A pergunta foi respondida (Sim, Nao ou F8): deixa de ser a pergunta.
+    /// O quadro fica ate `hide` ou ate outro o substituir.
+    fn answered(&mut self) {
+        self.question = None;
+    }
+
+    /// O quadro a vista, para o esconder ja.
+    fn current(&self) -> u64 {
+        self.token
+    }
 }
 
 // Painel lateral (Ctrl+H): historico inteligente -- busca semantica, sugestoes
@@ -4540,6 +4674,26 @@ fn pomodoro_sound() {
     }
 }
 
+/// Pisca o botao da janela na barra de tarefas ate ela voltar a frente. Nao
+/// ativa nada nem rouba o foco (e so o aviso que o Windows da a qualquer
+/// app); com o som desligado no Windows, e o que resta de um fim de fase
+/// com a janela minimizada.
+fn flash_taskbar(owner: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx,
+    };
+    let info = FLASHWINFO {
+        cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+        hwnd: owner,
+        dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+        uCount: 0,
+        dwTimeout: 0,
+    };
+    unsafe {
+        FlashWindowEx(&info);
+    }
+}
+
 /// Menu de tema no cursor, com a escolha em vigor marcada. Devolve a opcao
 /// clicada, ou None se o menu foi fechado sem escolha.
 fn pick_theme_from_menu(hwnd: HWND) -> Option<ThemeChoice> {
@@ -5537,6 +5691,13 @@ struct Timers {
     alive: bool,
 }
 
+/// Os tiques do Pomodoro voltam ao event loop como `PomodoroTick(token)`.
+impl TickScheduler for Timers {
+    fn schedule(&self, tick: TickSchedule) {
+        self.after(tick.delay, UserEvent::PomodoroTick(tick.token));
+    }
+}
+
 impl Timers {
     fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
         let shared = Arc::new((Mutex::new(TimerQueue::new()), Condvar::new()));
@@ -6015,7 +6176,7 @@ struct App {
     /// O visualizador de PDF nao aceita script do host: rola-se por tecla.
     reading_pdf: bool,
     splash: Option<HWND>,
-    splash_token: u64,
+    splash_board: SplashBoard,
     gmail_toast: Option<HWND>,
     gmail_toast_token: u64,
     gmail_monitor: Option<WebView>,
@@ -6149,7 +6310,7 @@ impl App {
             zoom: 1.0,
             reading_pdf: false,
             splash: None,
-            splash_token: 0,
+            splash_board: SplashBoard::default(),
             gmail_toast: None,
             gmail_toast_token: 0,
             gmail_monitor: None,
@@ -6252,6 +6413,11 @@ impl App {
         }
         self.home_focused = focused;
         if focused {
+            // Um fim de fase do Pomodoro que a janela nao viu (estava
+            // minimizada ou atras de outra) aparece agora.
+            if let Some(message) = self.pomodoro.window_back() {
+                self.show_background_splash(message, POMODORO_PHASE_END_SECONDS);
+            }
             self.resume_home_animation();
             // Os popups owned reaparecem com o dono, mas a geometria pode ter
             // mudado enquanto estivemos fora (outro ecra, outro DPI, outra
@@ -6782,10 +6948,7 @@ impl App {
             }
             InputRoute::History => self.show_recent_history(),
             InputRoute::Theme(Some(choice)) => self.choose_theme(choice),
-            InputRoute::Theme(None) => self.show_splash(
-                "Use tema:sistema, tema:claro ou tema:escuro.".to_string(),
-                3,
-            ),
+            InputRoute::Theme(None) => self.show_splash(THEME_COMMAND_HELP.to_string(), 3),
             InputRoute::Pomodoro(Some(command)) => self.pomodoro_command(command),
             InputRoute::Pomodoro(None) => {
                 self.show_splash(POMODORO_COMMAND_HELP.to_string(), 4);
@@ -8577,6 +8740,12 @@ impl App {
                 }
             }
             PaletteRoute::Home => self.show_home(),
+            PaletteRoute::Pomodoro(Some(command)) => self.pomodoro_command(command),
+            PaletteRoute::Pomodoro(None) => {
+                self.show_splash(POMODORO_COMMAND_HELP.to_string(), 4);
+            }
+            PaletteRoute::Theme(Some(choice)) => self.choose_theme(choice),
+            PaletteRoute::Theme(None) => self.show_splash(THEME_COMMAND_HELP.to_string(), 3),
             // allow_local: a URL foi digitada num controlo nativo, e entrada
             // do utilizador e nao da pagina (SPEC-0015). Em privado a fonte
             // abre privada: open_split_mode(private) nao grava memoria nem
@@ -8701,7 +8870,8 @@ impl App {
     /// Liga/desliga a rolagem de leitura. O temporizador e nativo e nao vive na
     /// pagina: assim sobrevive a navegacao dentro do site.
     fn toggle_auto_scroll(&mut self) {
-        SPLASH_ASKS.store(false, Ordering::SeqCst);
+        // O F8 responde a pergunta que estiver a vista.
+        self.splash_board.answered();
         self.auto_scroll_answered = true;
         self.auto_scroll = !self.auto_scroll;
         self.auto_scroll_token = self.auto_scroll_token.wrapping_add(1);
@@ -8716,8 +8886,27 @@ impl App {
         self.request_redraw();
     }
 
-    /// Aviso flutuante, centrado no fundo da janela, que se apaga sozinho.
+    /// Aviso flutuante, centrado na janela, que se apaga sozinho: a resposta
+    /// a um gesto do utilizador (`SplashKind::Notice`).
     fn show_splash(&mut self, text: String, seconds: u64) {
+        if let Some(frame) = self.splash_board.show(text, seconds, SplashKind::Notice) {
+            self.present_splash(frame);
+        }
+    }
+
+    /// Aviso que chega sozinho, sem gesto nenhum (o fim de uma fase do
+    /// Pomodoro): com a pergunta da rolagem a vista, espera por ela.
+    fn show_background_splash(&mut self, text: String, seconds: u64) {
+        if let Some(frame) = self
+            .splash_board
+            .show(text, seconds, SplashKind::Background)
+        {
+            self.present_splash(frame);
+        }
+    }
+
+    /// Poe `frame` no popup (criando-o se preciso) e agenda o fim dele.
+    fn present_splash(&mut self, frame: SplashFrame) {
         let Some(window) = &self.window else {
             return;
         };
@@ -8728,6 +8917,18 @@ impl App {
         let width = (SPLASH_WIDTH * scale).round() as i32;
         let height = (SPLASH_HEIGHT * scale).round() as i32;
 
+        // A dica do rato e o aviso nascem os dois no centro da janela: com a
+        // dica viva do Pomodoro por baixo (refrescada a cada segundo), um
+        // fim de fase empilhava duas mensagens no mesmo sitio. A dica sai;
+        // escondida, `refresh_hint_text` ja nao a traz de volta.
+        hover_tooltip(std::ptr::null_mut(), "");
+        let SplashFrame {
+            text,
+            asks,
+            seconds,
+            token,
+        } = frame;
+        SPLASH_ASKS.store(asks, Ordering::SeqCst);
         if let Ok(mut slot) = SPLASH_TEXT.lock() {
             *slot = text;
         }
@@ -8778,11 +8979,8 @@ impl App {
 
         self.position_splash();
 
-        self.splash_token = self.splash_token.wrapping_add(1);
-        self.timers.after(
-            Duration::from_secs(seconds),
-            UserEvent::HideSplash(self.splash_token),
-        );
+        self.timers
+            .after(Duration::from_secs(seconds), UserEvent::HideSplash(token));
     }
 
     /// Centra o aviso no fundo da janela. Vive em coordenadas de ECRA: se
@@ -8821,10 +9019,17 @@ impl App {
     }
 
     fn hide_splash(&mut self, token: u64) {
-        if token != self.splash_token {
+        let SplashHide::Hide {
+            question_expired,
+            next,
+        } = self.splash_board.hide(token)
+        else {
             return;
-        }
-        if SPLASH_ASKS.swap(false, Ordering::SeqCst) {
+        };
+        SPLASH_ASKS.store(false, Ordering::SeqCst);
+        // So o fim do quadro da PROPRIA pergunta e um "nao" (ver
+        // `SplashBoard`); um aviso que a substituiu nao responde nada.
+        if question_expired {
             self.auto_scroll_answered = true;
             self.auto_scroll = false;
         }
@@ -8832,6 +9037,9 @@ impl App {
             unsafe {
                 DestroyWindow(splash);
             }
+        }
+        if let Some(frame) = next {
+            self.present_splash(frame);
         }
     }
 
@@ -9092,25 +9300,31 @@ impl App {
     }
 
     fn ask_auto_scroll(&mut self) {
-        SPLASH_ASKS.store(true, Ordering::SeqCst);
-        self.show_splash(
+        if let Some(frame) = self.splash_board.show(
             format!("Rolar a página sozinho a cada {AUTO_SCROLL_SECONDS}s?"),
             AUTO_SCROLL_PROMPT_SECONDS,
-        );
+            SplashKind::Question,
+        ) {
+            self.present_splash(frame);
+        }
     }
 
     /// Sem resposta nao se mexe: se a pergunta desaparecer sozinha, fica "nao"
     /// ate a pessoa carregar em F8.
     fn answer_auto_scroll(&mut self, yes: bool) {
-        SPLASH_ASKS.store(false, Ordering::SeqCst);
+        self.splash_board.answered();
         self.auto_scroll_answered = true;
         self.auto_scroll = yes;
-        self.hide_splash(self.splash_token);
 
         if yes {
             self.auto_scroll_token = self.auto_scroll_token.wrapping_add(1);
             self.schedule_auto_scroll();
+            // Substitui a pergunta; um aviso que esperava por ela aparece
+            // quando este sair.
             self.show_splash(auto_scroll_message(true), 4);
+        } else {
+            // Sai ja; o aviso que esperava (se houver) aparece agora.
+            self.hide_splash(self.splash_board.current());
         }
         self.request_redraw();
     }
@@ -9968,7 +10182,7 @@ impl App {
         }
         self.home_tool_hover = next;
         if let Some(owner) = window_hwnd(window) {
-            let text = next.map(|tool| self.tool_hint_now(tool));
+            let text = next.map(|tool| tool_hint_at(tool, &self.pomodoro, Instant::now()));
             hover_tooltip(owner, text.as_deref().unwrap_or(""));
         }
         self.request_redraw();
@@ -10531,8 +10745,11 @@ impl App {
     /// Clique, menu e `pomodoro:` passam todos por aqui. A decisao e do
     /// `PomodoroController`; aqui so se faz o que ele devolve.
     fn pomodoro_command(&mut self, command: PomodoroCommand) {
-        let outcome = self.pomodoro.command(command, Instant::now());
-        self.schedule_pomodoro_tick(outcome.tick);
+        // `run_command` agenda a cadeia nova em `self.timers` (gate:
+        // `only_one_tick_chain_is_ever_alive`).
+        let outcome = self
+            .pomodoro
+            .run_command(command, Instant::now(), &self.timers);
         let saved = outcome.save.map(|settings| {
             crate::pomodoro_ui::save_settings(&self.config.data_dir.join("pomodoro"), settings)
         });
@@ -10548,25 +10765,50 @@ impl App {
         self.pomodoro_changed();
     }
 
-    /// Um tique: so o da cadeia viva mexe no motor. No fim de uma fase, o
-    /// aviso no meio da janela e um som curto do sistema.
+    /// Um tique: so o da cadeia viva mexe no motor, e `run_tick` ja agendou
+    /// o seguinte (gates `only_one_tick_chain_is_ever_alive` e
+    /// `a_phase_end_the_window_did_not_see_waits_for_it`). No fim de uma
+    /// fase: um som curto do sistema, o aviso no meio da janela e, com ela
+    /// minimizada ou atras de outra, o botao a piscar na barra de tarefas.
     fn pomodoro_tick(&mut self, token: u64) {
-        let PomodoroTick::Live { next, finished } = self.pomodoro.tick(token, Instant::now())
+        let window = self.window_attention();
+        let Some(tick) = self
+            .pomodoro
+            .run_tick(token, Instant::now(), &self.timers, window)
         else {
             return;
         };
-        self.schedule_pomodoro_tick(next);
-        if let Some(message) = finished {
-            pomodoro_sound();
-            self.show_splash(message, POMODORO_PHASE_END_SECONDS);
+        if let Some(phase_end) = tick.phase_end {
+            self.announce_phase_end(phase_end);
         }
         self.pomodoro_changed();
     }
 
-    fn schedule_pomodoro_tick(&self, tick: Option<TickSchedule>) {
-        if let Some(tick) = tick {
-            self.timers
-                .after(tick.delay, UserEvent::PomodoroTick(tick.token));
+    fn announce_phase_end(&mut self, phase_end: PhaseEnd) {
+        let PhaseEnd { show, flash } = phase_end;
+        pomodoro_sound();
+        if flash && let Some(owner) = self.window.as_ref().and_then(window_hwnd) {
+            flash_taskbar(owner);
+        }
+        if let Some(message) = show {
+            self.show_background_splash(message, POMODORO_PHASE_END_SECONDS);
+        }
+    }
+
+    /// Minimizada e a da frente, para o fim de uma fase do Pomodoro.
+    fn window_attention(&self) -> WindowAttention {
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        let Some(window) = &self.window else {
+            return WindowAttention {
+                minimized: true,
+                foreground: false,
+            };
+        };
+        let foreground =
+            window_hwnd(window).is_some_and(|owner| unsafe { GetForegroundWindow() } == owner);
+        WindowAttention {
+            minimized: window.is_minimized().unwrap_or(false),
+            foreground,
         }
     }
 
@@ -10579,7 +10821,11 @@ impl App {
             _ => false,
         };
         if hovered {
-            refresh_hint_text(&self.tool_hint_now(Tool::Pomodoro));
+            refresh_hint_text(&tool_hint_at(
+                Tool::Pomodoro,
+                &self.pomodoro,
+                Instant::now(),
+            ));
         }
         if matches!(self.surface, Surface::Comparator | Surface::Home) {
             self.request_redraw();
@@ -10590,15 +10836,6 @@ impl App {
     /// lado do icone, ou `None` parado (o botao so com o icone).
     fn pomodoro_label(&self) -> Option<String> {
         self.pomodoro.label(Instant::now())
-    }
-
-    /// A dica de uma ferramenta agora, na barra e na Home (ver `tool_hint`).
-    fn tool_hint_now(&self, tool: Tool) -> String {
-        let session = match tool {
-            Tool::Pomodoro => self.pomodoro.hint(Instant::now()),
-            Tool::Notes | Tool::Breath => None,
-        };
-        tool_hint(tool, session.as_deref())
     }
 
     /// A etiqueta ja no formato que a barra e a Home desenham e medem, com a
@@ -10827,13 +11064,16 @@ impl App {
                 .map(|group| (group.name.as_str(), group.collapsed)),
             _ => None,
         };
-        // As ferramentas pela mesma `tool_hint` da Home: a do Pomodoro diz a
-        // sessao em curso.
-        if let BarHit::Tool(tool) = hit {
-            return Some(self.tool_hint_now(tool));
-        }
         let maximized = unsafe { IsZoomed(owner) != 0 };
-        bar_tooltip_label(hit, provider, maximized, tab_url, group)
+        bar_hint(
+            hit,
+            &self.pomodoro,
+            Instant::now(),
+            provider,
+            maximized,
+            tab_url,
+            group,
+        )
     }
 
     /// Abre a palette nativa sobre a coluna `source_index`. E um popup Win32,
@@ -13062,12 +13302,28 @@ enum PaletteRoute {
     OpenPrivateProvider {
         query: String,
     },
+    /// `pomodoro:` -- o botao do Pomodoro vive na barra do comparador, e e
+    /// aqui (a palette) que o teclado escreve comandos: sem esta rota,
+    /// "pomodoro:pausar" dava "esquema nao permitido" e "pomodoro: 50" ia
+    /// perguntar a IA e ficava no historico. `None`: palavra desconhecida
+    /// (a ajuda).
+    Pomodoro(Option<PomodoroCommand>),
+    /// `tema:` -- o mesmo comando da omnibox da Home.
+    Theme(Option<ThemeChoice>),
 }
 
 fn route_palette(input: &str, source_index: usize, private: bool) -> PaletteRoute {
     let input = input.trim();
     if input.is_empty() || source_index >= COMPARATOR_COLUMNS {
         return PaletteRoute::Invalid(None);
+    }
+    // Os comandos locais da omnibox que fazem sentido sem sair do
+    // comparador, pela MESMA `route_input` da Home. Nada disto sai do
+    // computador, nem num painel privado.
+    match route_input(input) {
+        InputRoute::Pomodoro(command) => return PaletteRoute::Pomodoro(command),
+        InputRoute::Theme(choice) => return PaletteRoute::Theme(choice),
+        _ => {}
     }
     match parse_intent(input) {
         Ok(Intent::Read(url)) | Ok(Intent::Web(url)) => PaletteRoute::OpenSplit { url, private },
@@ -21291,25 +21547,58 @@ __fire('keydown', { key: 'F8' });
     /// nunca herdam a dica do Pomodoro.
     #[test]
     fn pomodoro_hint_follows_the_session_in_the_bar_and_on_home() {
-        let fixed = bar_tooltip_label(BarHit::Tool(Tool::Pomodoro), "IA", false, None, None);
-        assert_eq!(Some(tool_hint(Tool::Pomodoro, None)), fixed);
-
+        // O que a barra mostra (`bar_hint`, pelo `App::bar_tooltip_text`) e
+        // o que a Home e o refresco de cada segundo mostram (`tool_hint_at`).
+        let bar = |hit: BarHit, pomodoro: &PomodoroController, now: Instant| {
+            bar_hint(hit, pomodoro, now, "IA", false, None, None)
+        };
         let mut pomodoro =
             PomodoroController::new(crate::pomodoro_ui::PomodoroPreset::Classic.settings());
         let t0 = Instant::now();
-        assert_eq!(pomodoro.hint(t0), None);
-        pomodoro.command(PomodoroCommand::Click, t0);
-        let session = pomodoro
-            .hint(t0 + Duration::from_secs(90))
-            .expect("sessao em curso");
+        let fixed = Tool::Pomodoro.tooltip().to_string();
         assert_eq!(
-            tool_hint(Tool::Pomodoro, Some(&session)),
-            "Pomodoro — Foco: faltam 23:30 · 0 focos concluídos
-Clique: pausar · botão direito: opções"
+            bar(BarHit::Tool(Tool::Pomodoro), &pomodoro, t0),
+            Some(fixed.clone())
+        );
+        assert_eq!(tool_hint_at(Tool::Pomodoro, &pomodoro, t0), fixed);
+
+        pomodoro.command(PomodoroCommand::Click, t0);
+        let at = t0 + Duration::from_secs(90);
+        let session = "Pomodoro — Foco: faltam 23:30 · 0 focos concluídos
+Clique: pausar · botão direito: opções";
+        assert_eq!(
+            bar(BarHit::Tool(Tool::Pomodoro), &pomodoro, at).as_deref(),
+            Some(session),
+            "a barra"
+        );
+        assert_eq!(
+            tool_hint_at(Tool::Pomodoro, &pomodoro, at),
+            session,
+            "a Home"
         );
         for tool in [Tool::Notes, Tool::Breath] {
-            assert_eq!(tool_hint(tool, Some(&session)), tool.tooltip(), "{tool:?}");
+            assert_eq!(
+                bar(BarHit::Tool(tool), &pomodoro, at).as_deref(),
+                Some(tool.tooltip()),
+                "{tool:?}"
+            );
+            assert_eq!(
+                tool_hint_at(tool, &pomodoro, at),
+                tool.tooltip(),
+                "{tool:?}"
+            );
         }
+        // O resto da barra continua com a sua dica.
+        assert_eq!(
+            bar(BarHit::Home, &pomodoro, at),
+            bar_tooltip_label(BarHit::Home, "IA", false, None, None)
+        );
+        // Parado outra vez: a fixa.
+        pomodoro.command(PomodoroCommand::Stop, at);
+        assert_eq!(
+            bar(BarHit::Tool(Tool::Pomodoro), &pomodoro, at),
+            Some(fixed)
+        );
     }
 
     /// Gate: o tempo do Pomodoro e o contorno vao a tomate no foco e a verde
@@ -21386,6 +21675,141 @@ Clique: pausar · botão direito: opções"
             assert_eq!(route_input(search), InputRoute::Intent, "{search:?}");
         }
         assert!(POMODORO_COMMAND_HELP.contains("pomodoro:iniciar"));
+    }
+
+    /// Gate: no comparador -- onde o botao do Pomodoro vive e o teclado
+    /// escreve na palette, nao na omnibox da Home -- o `pomodoro:` e o
+    /// `tema:` sao comandos. Antes, "pomodoro:pausar" dava "esquema nao
+    /// permitido" e "pomodoro: 50" ia perguntar a IA da coluna e ficava no
+    /// historico. Num painel privado tambem: nada sai do computador.
+    #[test]
+    fn the_palette_runs_pomodoro_and_theme_commands_instead_of_asking_the_ai() {
+        use crate::pomodoro_ui::PomodoroPreset;
+        for private in [false, true] {
+            for source_index in 0..COMPARATOR_COLUMNS {
+                for (input, command) in [
+                    ("pomodoro:pausar", Some(PomodoroCommand::Pause)),
+                    ("pomodoro: pausar", Some(PomodoroCommand::Pause)),
+                    ("pomodoro:", Some(PomodoroCommand::Start)),
+                    (
+                        "Pomodoro: 50",
+                        Some(PomodoroCommand::Preset(PomodoroPreset::Long)),
+                    ),
+                    ("  POMODORO:parar ", Some(PomodoroCommand::Stop)),
+                    ("pomodoro:abacaxi", None),
+                ] {
+                    assert_eq!(
+                        route_palette(input, source_index, private),
+                        PaletteRoute::Pomodoro(command),
+                        "{input:?} coluna {source_index} privado={private}"
+                    );
+                }
+                assert_eq!(
+                    route_palette("tema:escuro", source_index, private),
+                    PaletteRoute::Theme(Some(ThemeChoice::Dark))
+                );
+                assert_eq!(
+                    route_palette("tema:roxo", source_index, private),
+                    PaletteRoute::Theme(None)
+                );
+            }
+        }
+        // Sem os dois pontos continua a ser uma pergunta sobre o metodo.
+        assert_eq!(
+            route_palette("pomodoro técnica", 1, false),
+            PaletteRoute::LoadProvider {
+                query: "pomodoro técnica".to_string()
+            }
+        );
+        assert!(THEME_COMMAND_HELP.contains("tema:escuro"));
+    }
+
+    /// Gate: o popup do meio da janela so tem Sim/Nao com a pergunta da
+    /// rolagem, e so o fim do quadro DELA e um "nao". Um aviso que chega
+    /// sozinho (fim de fase do Pomodoro) espera pela pergunta; a resposta a
+    /// um gesto tira-a sem lhe responder.
+    #[test]
+    fn a_notice_never_inherits_or_answers_the_auto_scroll_question() {
+        let question = || "Rolar a página sozinho a cada 30s?".to_string();
+        let phase_end = "Foco concluído! Pausa curta de 5 min".to_string();
+
+        // 1. Fim de fase com a pergunta a vista: espera, sem botoes.
+        let mut board = SplashBoard::default();
+        let asked = board
+            .show(question(), 20, SplashKind::Question)
+            .expect("a pergunta aparece");
+        assert!(asked.asks);
+        assert_eq!(
+            board.show(phase_end.clone(), 8, SplashKind::Background),
+            None,
+            "o aviso tomou o lugar da pergunta"
+        );
+        // A pergunta sai sozinha: e um "nao", e o aviso aparece, sem botoes.
+        match board.hide(asked.token) {
+            SplashHide::Hide {
+                question_expired: true,
+                next: Some(next),
+            } => {
+                assert_eq!(next.text, phase_end);
+                assert!(!next.asks, "o aviso herdou o Sim/Nao");
+                assert_eq!(next.seconds, 8);
+                assert_eq!(
+                    board.hide(next.token),
+                    SplashHide::Hide {
+                        question_expired: false,
+                        next: None
+                    }
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // 2. Respondida: o aviso que esperava aparece quando ela sai.
+        let mut board = SplashBoard::default();
+        let asked = board.show(question(), 20, SplashKind::Question).expect("q");
+        assert_eq!(
+            board.show(phase_end.clone(), 8, SplashKind::Background),
+            None
+        );
+        board.answered();
+        match board.hide(board.current()) {
+            SplashHide::Hide {
+                question_expired: false,
+                next: Some(next),
+            } => assert_eq!(next.text, phase_end),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(board.hide(asked.token), SplashHide::Stale);
+
+        // 3. Um gesto ("Pomodoro iniciado") tira a pergunta sem botoes e sem
+        //    lhe responder: o fim dele nao e um "nao", e o temporizador da
+        //    pergunta ja nao conta.
+        let mut board = SplashBoard::default();
+        let asked = board.show(question(), 20, SplashKind::Question).expect("q");
+        let notice = board
+            .show(
+                "Pomodoro iniciado: foco de 25 min".to_string(),
+                3,
+                SplashKind::Notice,
+            )
+            .expect("o gesto responde ja");
+        assert!(!notice.asks, "o aviso do gesto herdou o Sim/Nao");
+        assert_eq!(board.hide(asked.token), SplashHide::Stale);
+        assert_eq!(
+            board.hide(notice.token),
+            SplashHide::Hide {
+                question_expired: false,
+                next: None
+            },
+            "o aviso respondeu 'nao' a pergunta"
+        );
+
+        // 4. Sem pergunta, um aviso de fundo aparece ja.
+        let mut board = SplashBoard::default();
+        let shown = board
+            .show(phase_end.clone(), 8, SplashKind::Background)
+            .expect("sem pergunta nao espera");
+        assert!(!shown.asks);
     }
 
     /// Gate: o painel da respiracao e o video que o dono escolheu, em

@@ -206,6 +206,41 @@ pub(crate) struct TickSchedule {
     pub(crate) delay: Duration,
 }
 
+/// Quem entrega os tiques: na app o `Timers` (o evento `PomodoroTick` volta
+/// ao event loop), nos testes um agendador de mentira. `run_command` e
+/// `run_tick` agendam por aqui -- o `App` nao tem de se lembrar de o fazer.
+pub(crate) trait TickScheduler {
+    fn schedule(&self, tick: TickSchedule);
+}
+
+/// A janela no instante do fim de uma fase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowAttention {
+    /// Minimizada: o aviso (um popup owned) esconde-se com a dona.
+    pub(crate) minimized: bool,
+    /// E a janela da frente (`GetForegroundWindow`).
+    pub(crate) foreground: bool,
+}
+
+/// O que o `App` faz no fim de uma fase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PhaseEnd {
+    /// O aviso a mostrar ja. `None` com a janela minimizada: o popup nao se
+    /// via, e o aviso espera por `window_back`.
+    pub(crate) show: Option<String>,
+    /// Piscar o botao na barra de tarefas (`FlashWindowEx` com
+    /// `FLASHW_TRAY | FLASHW_TIMERNOFG`: nao ativa nada nem rouba o foco, e
+    /// para sozinho quando a janela volta a frente).
+    pub(crate) flash: bool,
+}
+
+/// Um tique da cadeia viva, ja com o seguinte agendado.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveTick {
+    /// Fim de fase neste tique.
+    pub(crate) phase_end: Option<PhaseEnd>,
+}
+
 /// O que um comando pede ao `App`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PomodoroOutcome {
@@ -218,9 +253,9 @@ pub(crate) struct PomodoroOutcome {
     pub(crate) save: Option<PomodoroSettings>,
 }
 
-/// O que um tique pede ao `App`.
+/// O que um tique decide (`run_tick` faz o agendamento e o aviso).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PomodoroTick {
+enum PomodoroTick {
     /// Tique de uma cadeia que ja morreu (pausa, paragem, novo arranque):
     /// nao toca no motor e nao se reagenda.
     Stale,
@@ -321,6 +356,9 @@ pub(crate) fn pomodoro_menu_command(
 pub(crate) struct PomodoroController {
     timer: Pomodoro,
     generation: u64,
+    /// O ultimo fim de fase que a janela pode nao ter visto (estava
+    /// minimizada ou atras de outra): volta a aparecer quando ela voltar.
+    unseen: Option<String>,
 }
 
 impl PomodoroController {
@@ -328,7 +366,59 @@ impl PomodoroController {
         Self {
             timer: Pomodoro::new(settings),
             generation: 0,
+            unseen: None,
         }
+    }
+
+    /// Um comando pelo caminho da app: aplica-o e agenda a cadeia nova (se
+    /// o Pomodoro ficar a correr) em `timers`.
+    pub(crate) fn run_command(
+        &mut self,
+        command: PomodoroCommand,
+        now: Instant,
+        timers: &impl TickScheduler,
+    ) -> PomodoroOutcome {
+        let outcome = self.command(command, now);
+        if let Some(tick) = outcome.tick {
+            timers.schedule(tick);
+        }
+        outcome
+    }
+
+    /// Um tique pelo caminho da app. `None`: tique de uma cadeia morta, nada
+    /// a fazer. Vivo, o seguinte ja ficou agendado em `timers` -- sem isso a
+    /// etiqueta congelava e nenhuma fase acabava -- e o fim de fase diz o
+    /// que mostrar e se a barra de tarefas pisca, conforme a janela.
+    pub(crate) fn run_tick(
+        &mut self,
+        token: u64,
+        now: Instant,
+        timers: &impl TickScheduler,
+        window: WindowAttention,
+    ) -> Option<LiveTick> {
+        let PomodoroTick::Live { next, finished } = self.tick(token, now) else {
+            return None;
+        };
+        if let Some(tick) = next {
+            timers.schedule(tick);
+        }
+        let phase_end = finished.map(|message| {
+            // Fora da frente nao ha garantia de que o aviso foi visto (o
+            // popup owned fica atras de outra janela, ou some com a dona
+            // minimizada): guarda-se para quando ela voltar.
+            self.unseen = (!window.foreground).then(|| message.clone());
+            PhaseEnd {
+                show: (!window.minimized).then_some(message),
+                flash: !window.foreground,
+            }
+        });
+        Some(LiveTick { phase_end })
+    }
+
+    /// A janela voltou a frente (restaurada ou ativada): o fim de fase que
+    /// ela nao viu, uma vez.
+    pub(crate) fn window_back(&mut self) -> Option<String> {
+        self.unseen.take()
     }
 
     pub(crate) fn state(&self) -> PomodoroState {
@@ -469,8 +559,9 @@ impl PomodoroController {
         }
     }
 
-    /// Um tique chegou. So o da cadeia viva mexe no motor.
-    pub(crate) fn tick(&mut self, token: u64, now: Instant) -> PomodoroTick {
+    /// Um tique chegou. So o da cadeia viva mexe no motor. Privado: a app
+    /// passa por `run_tick`, que agenda o seguinte.
+    fn tick(&mut self, token: u64, now: Instant) -> PomodoroTick {
         if token != self.generation || !self.timer.is_running() {
             return PomodoroTick::Stale;
         }
@@ -668,46 +759,86 @@ mod tests {
         assert_eq!(pomodoro.label(t0 + secs(4000)).as_deref(), Some("25:00"));
     }
 
-    /// Um agendador de mentira: guarda os tiques pedidos e entrega-os quando
-    /// o relogio de teste passa por eles. Nao dorme.
+    /// A janela a frente: o aviso aparece ja e nada pisca.
+    const FRONT: WindowAttention = WindowAttention {
+        minimized: false,
+        foreground: true,
+    };
+
+    /// Um agendador de mentira com o relogio do teste: guarda os tiques que
+    /// o caminho da app (`run_command`, `run_tick`) lhe pede e entrega-os
+    /// quando o relogio passa por eles. Nao dorme.
     struct FakeTimers {
-        queue: Vec<(Instant, u64)>,
+        now: std::cell::Cell<Instant>,
+        queue: std::cell::RefCell<Vec<(Instant, u64)>>,
+    }
+
+    impl TickScheduler for FakeTimers {
+        fn schedule(&self, tick: TickSchedule) {
+            self.queue
+                .borrow_mut()
+                .push((self.now.get() + tick.delay, tick.token));
+        }
     }
 
     impl FakeTimers {
-        fn schedule(&mut self, now: Instant, tick: Option<TickSchedule>) {
-            if let Some(tick) = tick {
-                self.queue.push((now + tick.delay, tick.token));
+        fn new(now: Instant) -> Self {
+            Self {
+                now: std::cell::Cell::new(now),
+                queue: std::cell::RefCell::new(Vec::new()),
             }
+        }
+
+        /// Um comando em `at`, como a app o da: o tique fica agendado aqui.
+        fn command(
+            &self,
+            pomodoro: &mut PomodoroController,
+            command: PomodoroCommand,
+            at: Instant,
+        ) -> PomodoroOutcome {
+            self.now.set(at);
+            pomodoro.run_command(command, at, self)
+        }
+
+        fn pending(&self) -> usize {
+            self.queue.borrow().len()
         }
 
         /// Tiques ainda por entregar que a cadeia viva reconhece.
         fn live(&self, pomodoro: &PomodoroController) -> usize {
             self.queue
+                .borrow()
                 .iter()
                 .filter(|(_, token)| *token == pomodoro.generation)
                 .count()
         }
 
         /// Entrega tudo o que vence ate `until`, por ordem, como o
-        /// `neural-timers`; devolve os avisos de fim de fase.
-        fn run_until(&mut self, pomodoro: &mut PomodoroController, until: Instant) -> Vec<String> {
+        /// `neural-timers`, pelo `run_tick` da app; devolve os avisos de fim
+        /// de fase.
+        fn run_until(&self, pomodoro: &mut PomodoroController, until: Instant) -> Vec<String> {
             let mut finished = Vec::new();
             loop {
-                self.queue.sort_by_key(|(due, _)| *due);
-                let Some(&(due, token)) = self.queue.first() else {
+                let next = {
+                    let mut queue = self.queue.borrow_mut();
+                    queue.sort_by_key(|(due, _)| *due);
+                    match queue.first() {
+                        Some(&(due, token)) if due <= until => {
+                            queue.remove(0);
+                            Some((due, token))
+                        }
+                        _ => None,
+                    }
+                };
+                let Some((due, token)) = next else {
                     break;
                 };
-                if due > until {
-                    break;
-                }
-                self.queue.remove(0);
-                match pomodoro.tick(token, due) {
-                    PomodoroTick::Stale => {}
-                    PomodoroTick::Live { next, finished: f } => {
-                        finished.extend(f);
-                        self.schedule(due, next);
-                    }
+                self.now.set(due);
+                if let Some(LiveTick {
+                    phase_end: Some(end),
+                }) = pomodoro.run_tick(token, due, self, FRONT)
+                {
+                    finished.extend(end.show);
                 }
                 assert!(self.live(pomodoro) <= 1, "duas cadeias vivas");
             }
@@ -722,15 +853,15 @@ mod tests {
     #[test]
     fn only_one_tick_chain_is_ever_alive() {
         let mut pomodoro = classic();
-        let mut timers = FakeTimers { queue: Vec::new() };
-        let t0 = Instant::now();
+        let timers = FakeTimers::new(Instant::now());
+        let t0 = timers.now.get();
 
         let check = |pomodoro: &PomodoroController, timers: &FakeTimers, at: &str| {
             let expected = usize::from(pomodoro.state() == PomodoroState::Running);
             assert_eq!(timers.live(pomodoro), expected, "{at}");
         };
 
-        timers.schedule(t0, pomodoro.command(PomodoroCommand::Click, t0).tick);
+        timers.command(&mut pomodoro, PomodoroCommand::Click, t0);
         check(&pomodoro, &timers, "iniciado");
         // Cliques e comandos repetidos: pausa, retoma, "iniciar" a correr,
         // pausa, retoma -- cada um deixa tiques velhos na fila.
@@ -747,7 +878,7 @@ mod tests {
         .enumerate()
         {
             now += Duration::from_millis(300);
-            timers.schedule(now, pomodoro.command(command, now).tick);
+            timers.command(&mut pomodoro, command, now);
             check(&pomodoro, &timers, &format!("passo {step} ({command:?})"));
         }
         assert_eq!(pomodoro.state(), PomodoroState::Running);
@@ -756,23 +887,23 @@ mod tests {
         let ten = now + secs(600);
         let finished = timers.run_until(&mut pomodoro, ten);
         assert!(finished.is_empty());
-        let delivered = timers.queue.len();
+        let delivered = timers.pending();
         assert_eq!(delivered, 1, "so a cadeia viva continua na fila");
         check(&pomodoro, &timers, "dez minutos depois");
 
         // Pausado: o tique que estava na fila chega e morre ali, mesmo muito
         // depois do fim da fase.
-        timers.schedule(ten, pomodoro.command(PomodoroCommand::Pause, ten).tick);
+        timers.command(&mut pomodoro, PomodoroCommand::Pause, ten);
         let label = pomodoro.label(ten);
         let finished = timers.run_until(&mut pomodoro, ten + secs(3 * 3600));
         assert!(finished.is_empty(), "um tique velho acabou a fase pausada");
-        assert!(timers.queue.is_empty(), "o tique velho reagendou-se");
+        assert_eq!(timers.pending(), 0, "o tique velho reagendou-se");
         assert_eq!(pomodoro.label(ten + secs(3 * 3600)), label);
         check(&pomodoro, &timers, "pausado");
 
         // Retoma: a cadeia nova leva o foco ate ao fim, com um aviso so.
         let back = ten + secs(3 * 3600);
-        timers.schedule(back, pomodoro.command(PomodoroCommand::Resume, back).tick);
+        timers.command(&mut pomodoro, PomodoroCommand::Resume, back);
         // Faltavam 898,8 s (601,2 s corridos); a pausa curta vai ate 1198,8.
         let finished = timers.run_until(&mut pomodoro, back + secs(1000));
         assert_eq!(finished, vec!["Foco concluído! Pausa curta de 5 min"]);
@@ -781,10 +912,10 @@ mod tests {
 
         // Parado: nenhum tique fica vivo.
         let end = back + secs(1000);
-        timers.schedule(end, pomodoro.command(PomodoroCommand::Stop, end).tick);
+        timers.command(&mut pomodoro, PomodoroCommand::Stop, end);
         let finished = timers.run_until(&mut pomodoro, end + secs(3600));
         assert!(finished.is_empty());
-        assert!(timers.queue.is_empty());
+        assert_eq!(timers.pending(), 0);
         check(&pomodoro, &timers, "parado");
     }
 
@@ -800,15 +931,20 @@ mod tests {
         assert_eq!(next_tick_delay(Duration::ZERO), Duration::ZERO);
 
         let mut pomodoro = classic();
-        let t0 = Instant::now();
-        let first = pomodoro
-            .command(PomodoroCommand::Click, t0)
+        let timers = FakeTimers::new(Instant::now());
+        let t0 = timers.now.get();
+        let first = timers
+            .command(&mut pomodoro, PomodoroCommand::Click, t0)
             .tick
             .expect("tique");
         // Retomado a meio de um segundo: o primeiro tique acerta o passo.
-        pomodoro.command(PomodoroCommand::Pause, t0 + Duration::from_millis(1_600));
-        let resumed = pomodoro
-            .command(PomodoroCommand::Resume, t0 + secs(10))
+        timers.command(
+            &mut pomodoro,
+            PomodoroCommand::Pause,
+            t0 + Duration::from_millis(1_600),
+        );
+        let resumed = timers
+            .command(&mut pomodoro, PomodoroCommand::Resume, t0 + secs(10))
             .tick
             .expect("tique");
         assert_eq!(first.delay, secs(1));
@@ -820,9 +956,8 @@ mod tests {
         assert_eq!((before.as_str(), after.as_str()), ("24:59", "24:58"));
 
         // Tique a tique ate ao fim do foco (faltavam 1498,4 s): o ultimo
-        // tique cai no instante exacto do fim, e e ele que o anuncia.
-        let mut timers = FakeTimers { queue: Vec::new() };
-        timers.schedule(t0 + secs(10), Some(resumed));
+        // tique cai no instante exacto do fim, e e ele que o anuncia. Os
+        // tiques das cadeias mortas (o do arranque) morrem pelo caminho.
         let end = t0 + secs(10) + Duration::from_millis(1_498_400);
         assert!(
             timers
@@ -831,6 +966,73 @@ mod tests {
         );
         let finished = timers.run_until(&mut pomodoro, end);
         assert_eq!(finished, vec!["Foco concluído! Pausa curta de 5 min"]);
+    }
+
+    /// Gate: um fim de fase com a janela minimizada ou atras de outra nao se
+    /// perde. O popup do aviso e owned pela janela e some com ela: a barra
+    /// de tarefas pisca (sem roubar o foco) e o aviso aparece quando ela
+    /// volta -- uma vez. A frente, aparece ja e nada pisca.
+    #[test]
+    fn a_phase_end_the_window_did_not_see_waits_for_it() {
+        let finished = "Foco concluído! Pausa curta de 5 min".to_string();
+        for (window, show_now, flash, later) in [
+            (FRONT, true, false, false),
+            (
+                WindowAttention {
+                    minimized: true,
+                    foreground: false,
+                },
+                false,
+                true,
+                true,
+            ),
+            (
+                WindowAttention {
+                    minimized: false,
+                    foreground: false,
+                },
+                true,
+                true,
+                true,
+            ),
+        ] {
+            let mut pomodoro = classic();
+            let timers = FakeTimers::new(Instant::now());
+            let t0 = timers.now.get();
+            timers.command(&mut pomodoro, PomodoroCommand::Click, t0);
+            let end = t0 + secs(25 * 60);
+            // Tique a tique ate ao fim do foco, pelo caminho da app.
+            let mut seen = None;
+            loop {
+                let next = timers.queue.borrow_mut().pop();
+                let Some((due, token)) = next else {
+                    break;
+                };
+                timers.now.set(due);
+                let at = if due >= end { window } else { FRONT };
+                if let Some(LiveTick {
+                    phase_end: Some(phase_end),
+                }) = pomodoro.run_tick(token, due, &timers, at)
+                {
+                    seen = Some(phase_end);
+                    break;
+                }
+            }
+            let phase_end = seen.expect("o foco acabou");
+            assert_eq!(
+                phase_end.show.as_deref(),
+                show_now.then_some(finished.as_str()),
+                "{window:?}"
+            );
+            assert_eq!(phase_end.flash, flash, "{window:?}");
+            assert_eq!(
+                pomodoro.window_back().as_deref(),
+                later.then_some(finished.as_str()),
+                "{window:?}"
+            );
+            assert_eq!(pomodoro.window_back(), None, "uma vez so: {window:?}");
+            assert_eq!(timers.live(&pomodoro), 1, "a pausa curta continua a contar");
+        }
     }
 
     /// Gate: o texto de cada fim de fase, com as duracoes em uso.
