@@ -16380,19 +16380,29 @@ Object.defineProperty(Object.prototype, 'toJSON', {
 `;
 const results = [];
 for (const c of INPUT.cases) {
-  const context = vm.createContext({ location: new URL(c.href), URL });
+  // `steps`: cada passo e uma avaliacao propria e as promessas resolvidas
+  // num passo (o clipboard, por exemplo) correm antes do seguinte.
+  const context = vm.createContext(
+    { location: new URL(c.href), URL },
+    c.steps ? { microtaskMode: 'afterEvaluate' } : {}
+  );
   vm.runInContext(MOCK, context);
+  // `pre`: o resto do "navegador" que um caso precisa, antes do script.
+  if (c.pre) vm.runInContext(c.pre, context);
   if (c.child) vm.runInContext('window.top = {};', context);
   vm.runInContext(c.script, context, { filename: c.name });
   vm.runInContext(PAGE, context);
   vm.runInContext(HELPERS, context);
-  vm.runInContext(c.drive || DEFAULT_DRIVE, context);
+  for (const step of c.steps || [c.drive || DEFAULT_DRIVE]) {
+    vm.runInContext(step, context);
+  }
   results.push({
     name: c.name,
     stolen: Array.from(context.__stolen, String),
     posted: Array.from(context.__posted, String),
     errors: Array.from(context.__errors, String),
     created: Array.from(context.__created, String),
+    log: Array.from(context.__log || [], String),
   });
 }
 process.stdout.write(JSON.stringify(results));
@@ -16507,6 +16517,948 @@ __fire('keydown', { key: 'F8' });
             "erros: {}",
             results[0]["errors"]
         );
+    }
+
+    const SELECTION_CAP: &str = "0123456789abcdef0123456789abcdef";
+
+    /// O resto do "navegador" que a barra de selecao usa, sobre o DOM minimo
+    /// do harness: arvore com pais, `closest`, shadow root, Selection/Range,
+    /// clipboard, `execCommand` e `speechSynthesis`. Corre antes do script,
+    /// como o navegador que ele encontra no document-created; os `__` sao
+    /// os gestos do utilizador e as leituras do teste.
+    const SELECTION_DOM: &str = r##"
+var __log = [], __clipboard = [], __exec = [], __spoken = [], __shadows = [], __prevented = [];
+var __cancels = 0, __clipboardFails = false, __voices = [];
+const __json = JSON.stringify;
+class CSSStyleDeclaration {
+  setProperty(name, value, priority) {
+    this[String(name)] = String(value);
+    this['!' + String(name)] = String(priority || '');
+  }
+}
+class CSSStyleSheet { replaceSync(css) { this.css = String(css); } }
+class ShadowRoot extends Node {
+  constructor(host, mode) { super(); this.host = host; this.mode = mode; this.adoptedStyleSheets = []; }
+}
+class Text extends Node {
+  constructor(data) { super(); this.data = String(data); }
+}
+Object.defineProperty(Node.prototype, 'nodeType', {
+  configurable: true,
+  get() { return this instanceof Element ? 1 : this instanceof Text ? 3 : this instanceof Document ? 9 : 11; }
+});
+Object.defineProperty(Node.prototype, 'textContent', {
+  configurable: true,
+  get() { return this instanceof Text ? this.data : (this.__text || ''); },
+  set(value) { this.__text = String(value); }
+});
+const __textOf = Object.getOwnPropertyDescriptor(Node.prototype, 'textContent').get;
+Node.prototype.appendChild = function (child) {
+  const old = child.parentNode;
+  if (old && old.childNodes) {
+    const at = old.childNodes.indexOf(child);
+    if (at >= 0) old.childNodes.splice(at, 1);
+  }
+  child.parentNode = this;
+  if (!this.childNodes) this.childNodes = [];
+  this.childNodes.push(child);
+  return child;
+};
+Node.prototype.contains = function (other) {
+  for (let node = other; node; node = node.parentNode) { if (node === this) return true; }
+  return false;
+};
+Object.defineProperty(Node.prototype, 'parentElement', {
+  configurable: true,
+  get() { return this.parentNode instanceof Element ? this.parentNode : null; }
+});
+Object.defineProperty(Node.prototype, 'isConnected', {
+  configurable: true,
+  get() {
+    for (let node = this; node; node = node.parentNode || node.host) { if (node === document) return true; }
+    return false;
+  }
+});
+function __matchOne(el, selector) {
+  const s = String(selector).trim();
+  let m = /^\[([\w-]+)="([^"]*)"\]$/.exec(s);
+  if (m) return el.getAttribute(m[1]) === m[2];
+  m = /^#([\w-]+)$/.exec(s);
+  if (m) return el.id === m[1] || el.getAttribute('id') === m[1];
+  if (/^[a-z]+$/i.test(s)) return el.tagName === s.toUpperCase();
+  throw new Error('seletor fora do mock: ' + s);
+}
+Element.prototype.matches = function (selector) {
+  return String(selector).split(',').some((part) => __matchOne(this, part));
+};
+Element.prototype.closest = function (selector) {
+  for (let node = this; node instanceof Element; node = node.parentNode) {
+    if (node.matches(selector)) return node;
+  }
+  return null;
+};
+Object.defineProperty(Element.prototype, 'isContentEditable', {
+  configurable: true,
+  get() {
+    for (let node = this; node instanceof Element; node = node.parentNode) {
+      const value = node.getAttribute('contenteditable');
+      if (value === '' || value === 'true' || value === 'plaintext-only') return true;
+      if (value === 'false') return false;
+    }
+    return false;
+  }
+});
+Element.prototype.attachShadow = function (init) {
+  const root = new ShadowRoot(this, init && init.mode);
+  __shadows.push(root);
+  this.__shadow = root;
+  if (init && init.mode === 'open') this.shadowRoot = root;
+  return root;
+};
+// A barra mede 300x42 quando esta a vista; escondida nao tem caixa.
+const __box = Element.prototype.getBoundingClientRect;
+Element.prototype.getBoundingClientRect = function () {
+  if (!this.__shadow) return __box.call(this);
+  const on = this.style.display !== 'none';
+  const w = on ? 300 : 0, h = on ? 42 : 0;
+  return { x: 0, y: 0, top: 0, left: 0, right: w, bottom: h, width: w, height: h };
+};
+const __makeElement = Document.prototype.createElement;
+Document.prototype.createElement = function (tag) {
+  const el = __makeElement.call(this, tag);
+  el.style = new CSSStyleDeclaration();
+  return el;
+};
+document.documentElement.parentNode = document;
+document.documentElement.childNodes = [document.head, document.body];
+document.head.parentNode = document.documentElement;
+document.body.parentNode = document.documentElement;
+document.documentElement.lang = '';
+// 1000x700 com uma barra de rolagem de 10 px a direita.
+document.documentElement.clientWidth = 990;
+document.documentElement.clientHeight = 700;
+document.activeElement = document.body;
+window.innerWidth = 1000;
+window.innerHeight = 700;
+
+var __sel = { text: '', anchor: null, focus: null, common: null, rects: [], collapsed: true };
+class Range {
+  getClientRects() { return __sel.rects.slice(); }
+  getBoundingClientRect() {
+    const r = __sel.rects;
+    if (!r.length) return { top: 0, bottom: 0, left: 0, right: 0, width: 0, height: 0 };
+    const top = Math.min(...r.map((x) => x.top)), bottom = Math.max(...r.map((x) => x.bottom));
+    const left = Math.min(...r.map((x) => x.left)), right = Math.max(...r.map((x) => x.right));
+    return { top, bottom, left, right, width: right - left, height: bottom - top };
+  }
+  get commonAncestorContainer() { return __sel.common; }
+}
+class Selection {
+  toString() { return __sel.text; }
+  getRangeAt(index) {
+    if (index !== 0 || !__sel.anchor) throw new Error('IndexSizeError');
+    return new Range();
+  }
+  get rangeCount() { return __sel.anchor ? 1 : 0; }
+  get isCollapsed() { return __sel.collapsed; }
+  get anchorNode() { return __sel.anchor; }
+  get focusNode() { return __sel.focus; }
+}
+const __selection = new Selection();
+Document.prototype.getSelection = function () { return __selection; };
+window.getSelection = function () { return __selection; };
+
+class Clipboard {
+  writeText(text) {
+    __clipboard.push(String(text));
+    return __clipboardFails ? Promise.reject(new Error('negado')) : Promise.resolve();
+  }
+}
+var navigator = { language: 'en-US', clipboard: new Clipboard() };
+Document.prototype.execCommand = function (command) { __exec.push(String(command)); return true; };
+class SpeechSynthesisUtterance extends EventTarget {
+  constructor(text) { super(); this.text = String(text); this.voice = null; this.lang = ''; }
+}
+class SpeechSynthesis extends EventTarget {
+  speak(utterance) { __spoken.push(utterance); }
+  cancel() { __cancels++; }
+  getVoices() { return __voices.slice(); }
+}
+window.speechSynthesis = new SpeechSynthesis();
+window.SpeechSynthesisUtterance = SpeechSynthesisUtterance;
+var __NUVEM = { name: 'Nuvem', lang: 'pt-BR', localService: false, default: false };
+var __MARIA = { name: 'Maria', lang: 'pt-BR', localService: true, default: false };
+var __ZIRA = { name: 'Zira', lang: 'en-US', localService: true, default: true };
+var __HELENA = { name: 'Helena', lang: 'es-ES', localService: true, default: false };
+
+function __el(tag, attrs, parent) {
+  const el = document.createElement(tag);
+  for (const key of Object.keys(attrs || {})) el.setAttribute(key, attrs[key]);
+  (parent || document.body).appendChild(el);
+  return el;
+}
+function __textIn(parent, value) { return parent.appendChild(new Text(value)); }
+var __para = __textIn(__el('p'), 'Um paragrafo da pagina.');
+var __line = { top: 300, bottom: 320, left: 100, right: 400, width: 300, height: 20 };
+function __select(text, node, extra) {
+  const at = node || __para;
+  Object.assign(__sel, {
+    text: String(text), anchor: at, focus: at, common: at,
+    collapsed: String(text) === '', rects: [__line]
+  }, extra || {});
+}
+function __unselect() { Object.assign(__sel, { text: '', collapsed: true, rects: [] }); }
+// Um evento so para os ouvintes deste alvo (o __fire do harness chama todos).
+function __on(target, type, extra) {
+  for (const l of __listeners.slice()) {
+    if (l.target !== target || l.type !== type) continue;
+    try {
+      const h = l.handler;
+      (typeof h === 'function' ? h : h.handleEvent).call(target, __event(type, extra));
+    } catch (e) { __errors.push(type + ': ' + e.message); }
+  }
+}
+function __up(extra) { __on(window, 'mouseup', Object.assign({ target: document.body }, extra)); }
+function __show(text, node, extra) { __select(text, node, extra); __up(); __drain(); }
+function __root() { return __shadows[__shadows.length - 1] || null; }
+function __kids() {
+  const root = __root();
+  const bar = root && (root.childNodes || []).find((n) => n.getAttribute && n.getAttribute('class') === 'bar');
+  return bar ? bar.childNodes || [] : [];
+}
+function __button(action) {
+  return __kids().find((n) => n.tagName === 'BUTTON' && n.getAttribute('data-action') === action) || null;
+}
+// Um clique num botao da barra: fora da shadow root o alvo e o host.
+function __press(action, extra) {
+  const host = __root().host;
+  const b = __button(action);
+  if (!b) throw new Error('sem o botao ' + action);
+  const mark = (where) => ({ preventDefault() { __prevented.push(where); } });
+  __on(window, 'mousedown', Object.assign({ target: host }, mark('window'), extra));
+  __on(b, 'mousedown', Object.assign({ target: b }, mark('botao'), extra));
+  __on(window, 'mouseup', Object.assign({ target: host }, extra));
+  __on(b, 'click', Object.assign({ target: b }, extra));
+}
+function __utterEnd() { __on(__spoken[__spoken.length - 1], 'end'); }
+function __voicesChanged() { __on(window.speechSynthesis, 'voiceschanged'); }
+function __state(tag) {
+  const root = __root();
+  const host = root ? root.host : null;
+  const kids = __kids();
+  const buttons = kids.filter((n) => n.tagName === 'BUTTON');
+  const note = kids.find((n) => n.getAttribute && n.getAttribute('role') === 'status');
+  __log.push(__json({
+    tag: tag,
+    shown: !!host && host.style.display === 'block' && host.isConnected,
+    mode: root ? root.mode : null,
+    sheets: root ? root.adoptedStyleSheets.length : 0,
+    position: host ? host.style.position || '' : '',
+    zIndex: host ? host.style['z-index'] || '' : '',
+    top: host ? parseFloat(host.style.top) : null,
+    left: host ? parseFloat(host.style.left) : null,
+    buttons: buttons.map((n) => __textOf.call(n)),
+    tabindex: buttons.map((n) => n.getAttribute('tabindex')),
+    note: note && note.getAttribute('class') === 'msg on' ? __textOf.call(note) : '',
+    pending: __timers.filter((t) => !t.done).length,
+    clipboard: __clipboard.slice(),
+    exec: __exec.slice(),
+    spoken: __spoken.map((u) => ({ text: u.text, voice: u.voice ? u.voice.name : null, lang: u.lang })),
+    cancels: __cancels,
+    prevented: __prevented.slice(),
+    posted: __posted.length
+  }));
+}
+"##;
+
+    fn selection_case(
+        name: &str,
+        script: &str,
+        pre_extra: &str,
+        steps: &[&str],
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "href": "https://example.com/artigo",
+            "pre": format!("{SELECTION_DOM}\n{pre_extra}"),
+            "script": script,
+            "steps": steps,
+        })
+    }
+
+    fn run_selection_cases(cases: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+        let program = format!(
+            "const INPUT = {};\n{}",
+            serde_json::json!({ "cases": cases }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        for result in &results {
+            let name = &result["name"];
+            assert_eq!(
+                result["errors"].as_array().map(Vec::len),
+                Some(0),
+                "{name}: a barra lancou para dentro da pagina: {}",
+                result["errors"]
+            );
+            assert_eq!(
+                result["stolen"].as_array().map(Vec::len),
+                Some(0),
+                "{name}: o toJSON da pagina leu a capability"
+            );
+        }
+        results
+    }
+
+    /// Os estados que um caso registou com `__state`, por etiqueta.
+    fn selection_states(
+        result: &serde_json::Value,
+    ) -> std::collections::HashMap<String, serde_json::Value> {
+        result["log"]
+            .as_array()
+            .expect("log")
+            .iter()
+            .map(|entry| {
+                let state: serde_json::Value =
+                    serde_json::from_str(entry.as_str().expect("log string")).expect("state json");
+                (state["tag"].as_str().expect("tag").to_string(), state)
+            })
+            .collect()
+    }
+
+    fn selection_posted(result: &serde_json::Value) -> Vec<IpcAction> {
+        result["posted"]
+            .as_array()
+            .expect("posted")
+            .iter()
+            .map(|message| {
+                let message = message.as_str().expect("posted string");
+                parse_ipc_message(message, SELECTION_CAP, COMPARATOR_COLUMNS)
+                    .unwrap_or_else(|| panic!("o parser nativo recusou {message}"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_selection_toolbar_offers_three_actions_for_a_trusted_selection() {
+        // O mapa de teclas QUE EMBARCA, com a capability e o sinal privado
+        // postos pelo mesmo `bind_page_script` dos builders.
+        let script = bind_page_script(NEURALIA_KEYMAP_SCRIPT, SELECTION_CAP, false);
+        let appears = r#"
+__select('  Texto selecionado na pagina.  ');
+__up({ isTrusted: false });
+__state('sintetico');
+__up({ button: 2 });
+__state('botao-direito');
+__up();
+__state('agendada');
+__drain();
+__state('visivel');
+__on(document, 'keydown', { key: 'Escape' });
+__state('esc');
+__on(document, 'keydown', { key: 'Escape' });
+"#;
+        let keyboard = r#"
+__select('Por teclado.');
+__on(window, 'keyup', { key: 'x' });
+__state('tecla-x');
+__on(window, 'keyup', { key: 'ArrowRight', shiftKey: true, isTrusted: false });
+__state('tecla-sintetica');
+__on(window, 'keyup', { key: 'ArrowRight', shiftKey: true });
+__drain();
+__state('shift-seta');
+__on(window, 'mousedown', { target: document.body });
+__state('clique-fora');
+__on(window, 'keyup', { key: 'a', ctrlKey: true });
+__drain();
+__state('ctrl-a');
+"#;
+        let hides = r#"
+for (const kind of ['scroll', 'resize', 'blur', 'popstate', 'hashchange', 'pagehide']) {
+  __show('Texto.');
+  __on(window, kind);
+  __state('some-' + kind);
+}
+__show('Texto.');
+__unselect();
+__on(document, 'selectionchange');
+__state('some-colapsada');
+__select('Texto.');
+__up();
+__on(window, 'scroll');
+__state('rolou-na-espera');
+__drain();
+__state('rolou-na-espera-depois');
+"#;
+        let refuses = r#"
+__show('segredo', __el('input', { type: 'password' }));
+__state('em-senha');
+__show('rascunho', __el('textarea'));
+__state('em-textarea');
+__show('nota', __textIn(__el('span', {}, __el('div', { contenteditable: 'true' })), 'nota'));
+__state('em-editavel');
+__show('nota', __textIn(__el('b', {}, __el('div', { contenteditable: '' })), 'nota'));
+__state('em-editavel-vazio');
+document.activeElement = __el('input', { type: 'text' });
+__show('Texto da pagina.');
+__state('com-foco-num-campo');
+document.activeElement = document.body;
+__show('   \n\t  ');
+__state('so-espacos');
+__show('a'.repeat(5001));
+__state('grande-demais');
+__show('a'.repeat(5000));
+__state('no-limite');
+__show('Pesquisar', __root().host);
+__state('na-barra');
+__show('Texto para os botoes.');
+__prevented.length = 0;
+__press('copy');
+__state('depois-de-premir');
+"#;
+        let positions = r#"
+function __at(tag, rects) {
+  __on(window, 'mousedown', { target: document.body });
+  __show('Texto.', __para, { rects: rects });
+  __state(tag);
+}
+__at('meio', [{ top: 300, bottom: 320, left: 100, right: 400, width: 300, height: 20 }]);
+__at('canto-sup-dir', [{ top: 20, bottom: 40, left: 900, right: 995, width: 95, height: 20 }]);
+__at('canto-inf-esq', [{ top: 670, bottom: 690, left: 0, right: 10, width: 10, height: 20 }]);
+__at('alta', [{ top: 5, bottom: 695, left: 0, right: 500, width: 500, height: 690 }]);
+__at('duas-linhas', [
+  { top: 100, bottom: 120, left: 0, right: 900, width: 900, height: 20 },
+  { top: 130, bottom: 150, left: 0, right: 200, width: 200, height: 20 },
+  { top: 150, bottom: 150, left: 200, right: 200, width: 0, height: 0 }
+]);
+"#;
+        let framed = r#"
+__show('Texto num iframe.');
+__state('quadro');
+"#;
+        let mut child = selection_case("quadro", &script, "", &[framed]);
+        child["child"] = serde_json::Value::Bool(true);
+        let results = run_selection_cases(vec![
+            selection_case("aparece", &script, "", &[appears, keyboard, hides, refuses]),
+            selection_case("posicao", &script, "", &[positions]),
+            child,
+        ]);
+
+        let states = selection_states(&results[0]);
+        let state = |tag: &str| {
+            states
+                .get(tag)
+                .unwrap_or_else(|| panic!("sem o estado {tag}"))
+                .clone()
+        };
+        let shown = |tag: &str| state(tag)["shown"].as_bool() == Some(true);
+
+        // So um gesto real do utilizador, com o botao principal.
+        for tag in ["sintetico", "botao-direito"] {
+            assert!(!shown(tag), "{tag}: a barra apareceu");
+            assert_eq!(state(tag)["pending"], 0, "{tag}: ficou um relogio");
+        }
+        // Espera um instante e so depois volta a olhar para a selecao.
+        assert!(!shown("agendada"));
+        assert_eq!(state("agendada")["pending"], 1);
+        assert!(shown("visivel"), "a selecao confiavel nao trouxe a barra");
+        let visible = state("visivel");
+        assert_eq!(visible["mode"], "closed", "a pagina le a barra");
+        assert_eq!(visible["position"], "fixed");
+        assert_eq!(visible["zIndex"], "2147483647");
+        assert_eq!(visible["sheets"], 1, "a barra ficou sem estilo");
+        assert_eq!(
+            visible["buttons"],
+            serde_json::json!(["🔎 Pesquisar", "📋 Copiar", "🔊 Falar"])
+        );
+        assert_eq!(visible["tabindex"], serde_json::json!(["-1", "-1", "-1"]));
+        // O primeiro Esc so fecha a barra; o segundo volta atras como sempre.
+        assert!(!shown("esc"));
+        assert_eq!(selection_posted(&results[0]), vec![IpcAction::Back]);
+
+        // Teclado: Shift+setas e Ctrl+A; outra tecla ou evento sintetico nao.
+        for tag in ["tecla-x", "tecla-sintetica", "clique-fora"] {
+            assert!(!shown(tag), "{tag}: a barra apareceu");
+            assert_eq!(state(tag)["pending"], 0, "{tag}: ficou um relogio");
+        }
+        assert!(shown("shift-seta"));
+        assert!(shown("ctrl-a"));
+
+        // Some -- e nao deixa relogio a correr -- com cada um destes.
+        for tag in [
+            "some-scroll",
+            "some-resize",
+            "some-blur",
+            "some-popstate",
+            "some-hashchange",
+            "some-pagehide",
+            "some-colapsada",
+            "rolou-na-espera",
+            "rolou-na-espera-depois",
+        ] {
+            assert!(!shown(tag), "{tag}: a barra ficou a vista");
+            assert_eq!(state(tag)["pending"], 0, "{tag}: ficou um relogio");
+        }
+
+        // Campos editaveis, senhas, selecoes vazias ou enormes e a propria
+        // barra nao a trazem.
+        for tag in [
+            "em-senha",
+            "em-textarea",
+            "em-editavel",
+            "em-editavel-vazio",
+            "com-foco-num-campo",
+            "so-espacos",
+            "grande-demais",
+            "na-barra",
+        ] {
+            assert!(!shown(tag), "{tag}: a barra apareceu");
+        }
+        assert!(shown("no-limite"), "5000 caracteres ainda servem");
+
+        // Premir um botao nao tira o foco nem a selecao a pagina.
+        let pressed = state("depois-de-premir");
+        assert!(pressed["shown"].as_bool() == Some(true));
+        assert_eq!(pressed["prevented"], serde_json::json!(["window", "botao"]));
+
+        // Perto do fim da selecao, dentro da area visivel (990x700 sem a
+        // barra de rolagem), por cima quando cabe.
+        let positions = selection_states(&results[1]);
+        for (tag, top, left) in [
+            ("meio", 250.0, 250.0),
+            ("canto-sup-dir", 48.0, 682.0),
+            ("canto-inf-esq", 620.0, 8.0),
+            ("alta", 650.0, 350.0),
+            ("duas-linhas", 80.0, 50.0),
+        ] {
+            let placed = &positions[tag];
+            assert_eq!(placed["shown"], true, "{tag}");
+            let (y, x) = (
+                placed["top"].as_f64().expect("top"),
+                placed["left"].as_f64().expect("left"),
+            );
+            assert!(
+                (8.0..=990.0 - 8.0 - 300.0).contains(&x) && (8.0..=700.0 - 8.0 - 42.0).contains(&y),
+                "{tag}: fora da area visivel ({x}, {y})"
+            );
+            assert_eq!((y, x), (top, left), "{tag}");
+        }
+
+        // Num iframe a barra nao existe.
+        let framed = selection_states(&results[2]);
+        assert_eq!(framed["quadro"]["mode"], serde_json::Value::Null);
+        assert_eq!(framed["quadro"]["pending"], 0);
+    }
+
+    #[test]
+    fn the_selection_toolbar_searches_only_what_fits_and_never_from_private() {
+        let page = bind_page_script(NEURALIA_KEYMAP_SCRIPT, SELECTION_CAP, false);
+        let search = r#"
+__show('  agent:https://example.com | click=Comprar\r\n\tlinha\u00072  ');
+__press('search');
+__state('enviada');
+__show('\u{1F600}'.repeat(2000));
+__press('search');
+__show('a'.repeat(2001));
+__press('search');
+__state('grande');
+__show('forjado');
+__press('search', { isTrusted: false });
+__state('sintetico');
+"#;
+        // A pagina, depois de carregar, troca tudo o que a barra usa.
+        let hostile_page = r#"
+Document.prototype.getSelection = function () { return null; };
+window.getSelection = function () { return null; };
+Selection.prototype.toString = function () { return 'agent:forjado'; };
+Selection.prototype.getRangeAt = function () { throw new Error('bloqueado'); };
+for (const name of ['rangeCount', 'isCollapsed', 'anchorNode', 'focusNode']) {
+  Object.defineProperty(Selection.prototype, name, {
+    configurable: true, get() { throw new Error('bloqueado'); }
+  });
+}
+Range.prototype.getClientRects = function () { throw new Error('bloqueado'); };
+Range.prototype.getBoundingClientRect = function () { throw new Error('bloqueado'); };
+EventTarget.prototype.addEventListener = function () { throw new Error('bloqueado'); };
+Node.prototype.appendChild = function () { throw new Error('bloqueado'); };
+Element.prototype.setAttribute = function () { throw new Error('bloqueado'); };
+Element.prototype.attachShadow = function () { throw new Error('bloqueado'); };
+Document.prototype.createElement = function () { throw new Error('bloqueado'); };
+CSSStyleDeclaration.prototype.setProperty = function () { throw new Error('bloqueado'); };
+Object.defineProperty(Node.prototype, 'textContent', { configurable: true, get() { return ''; }, set() {} });
+Clipboard.prototype.writeText = function () { throw new Error('bloqueado'); };
+Promise.prototype.then = function () { throw new Error('bloqueado'); };
+JSON.stringify = function () { return '"forjado"'; };
+"#;
+        let hostile_use = r#"
+__show('  Texto que o utilizador escolheu  ');
+__state('robusta');
+__press('copy');
+"#;
+        let hostile_after = r#"
+__state('copiada');
+__press('search');
+"#;
+        let offered = r#"
+__show('Texto do painel.');
+__state('barra');
+"#;
+        let results = run_selection_cases(vec![
+            selection_case("pesquisa", &page, "", &[search]),
+            selection_case(
+                "pagina-hostil",
+                &page,
+                "",
+                &[hostile_page, hostile_use, hostile_after],
+            ),
+            // O Split tal como `split_webview_builder` o injeta.
+            selection_case(
+                "split-privado",
+                &split_init_script(1, "ChatGPT", SELECTION_CAP, true),
+                "",
+                &[offered],
+            ),
+            selection_case(
+                "split",
+                &split_init_script(1, "ChatGPT", SELECTION_CAP, false),
+                "",
+                &[offered],
+            ),
+        ]);
+
+        // O texto chega ao parser nativo tal como foi selecionado (aparado,
+        // CRLF como LF, controlos como espaco) e cabe no envelope de 8 KiB
+        // mesmo com 2000 caracteres de 4 bytes.
+        assert_eq!(
+            selection_posted(&results[0]),
+            vec![
+                IpcAction::Search {
+                    text: "agent:https://example.com | click=Comprar\n\tlinha 2".to_string()
+                },
+                IpcAction::Search {
+                    text: "😀".repeat(2000)
+                },
+            ]
+        );
+        let states = selection_states(&results[0]);
+        assert_eq!(states["enviada"]["shown"], false, "a barra ficou depois de pesquisar");
+        assert_eq!(states["enviada"]["pending"], 0);
+        // Acima de 2000 nada sai da pagina e a barra diz porque.
+        assert_eq!(states["grande"]["posted"], 2);
+        assert_eq!(states["grande"]["shown"], true);
+        assert_eq!(
+            states["grande"]["note"],
+            "Seleção grande demais para pesquisar (máx. 2000 caracteres)"
+        );
+        // Um clique sintetico nao pesquisa.
+        assert_eq!(states["sintetico"]["posted"], 2);
+
+        // Com as primitivas trocadas pela pagina, a barra continua a ler a
+        // selecao verdadeira e a mandar o texto certo.
+        let hostile = selection_states(&results[1]);
+        assert_eq!(hostile["robusta"]["shown"], true);
+        assert_eq!(
+            hostile["robusta"]["buttons"],
+            serde_json::json!(["🔎 Pesquisar", "📋 Copiar", "🔊 Falar"])
+        );
+        assert_eq!(
+            hostile["copiada"]["clipboard"],
+            serde_json::json!(["  Texto que o utilizador escolheu  "])
+        );
+        assert_eq!(hostile["copiada"]["buttons"][1], "✓ Copiado");
+        assert_eq!(
+            selection_posted(&results[1]),
+            vec![IpcAction::Search {
+                text: "Texto que o utilizador escolheu".to_string()
+            }]
+        );
+
+        // Painel privado: sem Pesquisar. Painel normal: os tres.
+        let private = selection_states(&results[2]);
+        assert_eq!(private["barra"]["shown"], true);
+        assert_eq!(
+            private["barra"]["buttons"],
+            serde_json::json!(["📋 Copiar", "🔊 Falar"])
+        );
+        assert!(selection_posted(&results[2]).is_empty());
+        let normal = selection_states(&results[3]);
+        assert_eq!(
+            normal["barra"]["buttons"],
+            serde_json::json!(["🔎 Pesquisar", "📋 Copiar", "🔊 Falar"])
+        );
+    }
+
+    #[test]
+    fn the_selection_toolbar_copies_and_speaks_with_local_voices() {
+        let page = bind_page_script(NEURALIA_KEYMAP_SCRIPT, SELECTION_CAP, false);
+        let copy = r#"
+__show('Texto para copiar');
+__press('copy');
+__state('premido');
+"#;
+        let copied = r#"
+__state('copiado');
+__drain();
+__state('volta');
+"#;
+        let speak = r#"
+__voices = [__NUVEM, __MARIA, __ZIRA, __HELENA];
+__show('Olá, mundo. Sr. Silva chegou! Tudo bem?\nFim.\n' + 'palavra '.repeat(50).trim() + '.');
+__press('speak');
+__state('falando');
+for (let i = 0; i < 20; i++) {
+  const before = __spoken.length;
+  __utterEnd();
+  if (__spoken.length === before) break;
+}
+__state('lida');
+__press('speak');
+__state('de-novo');
+__press('speak');
+__state('parada');
+__utterEnd();
+__state('sem-eco');
+__press('speak');
+__on(document, 'keydown', { key: 'Escape' });
+__state('esc');
+"#;
+        let voices = r#"
+function __voz(tag, voices, lang) {
+  __voices = voices;
+  document.documentElement.lang = lang;
+  __show('Uma frase.');
+  __press('speak');
+  __state(tag);
+  __on(document, 'keydown', { key: 'Escape' });
+}
+__voz('lingua-da-pagina', [__NUVEM, __MARIA, __ZIRA, __HELENA], 'es');
+__voz('pt-br', [__NUVEM, __MARIA, __ZIRA, __HELENA], '');
+__voz('lingua-do-sistema', [__NUVEM, __ZIRA, __HELENA], 'fr');
+__voz('qualquer-local', [__NUVEM, __HELENA], 'fr');
+__voz('so-online', [__NUVEM], '');
+document.documentElement.lang = '';
+__voices = [];
+__show('Uma frase.');
+__press('speak');
+__state('tardia-espera');
+__voices = [__MARIA];
+__voicesChanged();
+__state('tardia');
+__on(document, 'keydown', { key: 'Escape' });
+__voices = [];
+__show('Uma frase.');
+__press('speak');
+__drain();
+__state('sem-vozes');
+"#;
+        let results = run_selection_cases(vec![
+            selection_case("copiar", &page, "", &[copy, copied]),
+            selection_case(
+                "copiar-sem-api",
+                &page,
+                "navigator.clipboard = undefined;",
+                &[copy],
+            ),
+            selection_case("copiar-negado", &page, "__clipboardFails = true;", &[copy, copied]),
+            selection_case("falar", &page, "", &[speak]),
+            selection_case("vozes", &page, "", &[voices]),
+        ]);
+        // Copiar e falar ficam na pagina: nenhuma mensagem ao nativo.
+        for result in &results {
+            assert!(
+                selection_posted(result).is_empty(),
+                "{}: postou {}",
+                result["name"],
+                result["posted"]
+            );
+        }
+
+        let copy = selection_states(&results[0]);
+        assert_eq!(
+            copy["premido"]["clipboard"],
+            serde_json::json!(["Texto para copiar"])
+        );
+        assert_eq!(copy["premido"]["exec"], serde_json::json!([]));
+        assert_eq!(copy["copiado"]["buttons"][1], "✓ Copiado");
+        assert_eq!(copy["copiado"]["shown"], true);
+        assert_eq!(copy["volta"]["buttons"][1], "📋 Copiar");
+        assert_eq!(copy["volta"]["pending"], 0);
+        // Sem a API do clipboard, ou com ela a recusar, copia pela selecao.
+        let fallback = selection_states(&results[1]);
+        assert_eq!(fallback["premido"]["exec"], serde_json::json!(["copy"]));
+        assert_eq!(fallback["premido"]["buttons"][1], "✓ Copiado");
+        let refused = selection_states(&results[2]);
+        assert_eq!(refused["copiado"]["exec"], serde_json::json!(["copy"]));
+        assert_eq!(refused["copiado"]["buttons"][1], "✓ Copiado");
+
+        let speech = selection_states(&results[3]);
+        let spoken = |tag: &str| -> Vec<(String, String)> {
+            speech[tag]["spoken"]
+                .as_array()
+                .expect("spoken")
+                .iter()
+                .map(|u| {
+                    (
+                        u["text"].as_str().unwrap_or_default().to_string(),
+                        u["voice"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(speech["falando"]["buttons"][2], "⏹ Parar");
+        assert_eq!(
+            spoken("falando"),
+            vec![("Olá, mundo.".to_string(), "Maria".to_string())]
+        );
+        // Uma frase por fala; a abreviatura cola-se a seguinte; a frase
+        // enorme parte em palavras, sem passar de 200 caracteres.
+        let words = |n: usize| vec!["palavra"; n].join(" ");
+        let read: Vec<String> = spoken("lida").into_iter().map(|(text, _)| text).collect();
+        assert_eq!(
+            read,
+            vec![
+                "Olá, mundo.".to_string(),
+                "Sr. Silva chegou!".to_string(),
+                "Tudo bem?".to_string(),
+                "Fim.".to_string(),
+                words(25),
+                format!("{}.", words(25)),
+            ]
+        );
+        assert!(read.iter().all(|part| part.chars().count() <= 200));
+        assert!(spoken("lida").iter().all(|(_, voice)| voice == "Maria"));
+        assert_eq!(speech["lida"]["buttons"][2], "🔊 Falar");
+        // Segundo clique cala; a fala cancelada nao puxa a frase seguinte.
+        assert_eq!(speech["de-novo"]["buttons"][2], "⏹ Parar");
+        let cancels = speech["de-novo"]["cancels"].as_u64().expect("cancels");
+        assert_eq!(speech["parada"]["buttons"][2], "🔊 Falar");
+        assert_eq!(speech["parada"]["cancels"], cancels + 1);
+        assert_eq!(spoken("sem-eco").len(), spoken("de-novo").len());
+        // Esc tambem cala, fecha a barra e nao volta atras.
+        assert_eq!(speech["esc"]["shown"], false);
+        assert_eq!(
+            speech["esc"]["cancels"].as_u64(),
+            Some(cancels + 3),
+            "o Esc nao calou a leitura"
+        );
+
+        // A voz: local, na lingua da pagina; senao pt-BR; senao a do sistema;
+        // senao qualquer local. Nunca a online.
+        let voices = selection_states(&results[4]);
+        let last_voice = |tag: &str| {
+            voices[tag]["spoken"]
+                .as_array()
+                .and_then(|spoken| spoken.last())
+                .map(|u| u["voice"].clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(last_voice("lingua-da-pagina"), "Helena");
+        assert_eq!(last_voice("pt-br"), "Maria");
+        assert_eq!(last_voice("lingua-do-sistema"), "Zira");
+        assert_eq!(last_voice("qualquer-local"), "Helena");
+        assert_eq!(
+            voices["so-online"]["spoken"].as_array().map(Vec::len),
+            voices["qualquer-local"]["spoken"].as_array().map(Vec::len),
+            "falou com uma voz online"
+        );
+        assert_eq!(voices["so-online"]["note"], "Nenhuma voz local disponível");
+        // As vozes chegam depois: espera pelo 'voiceschanged' e nao deixa o
+        // relogio da espera a correr.
+        assert_eq!(voices["tardia-espera"]["pending"], 1);
+        assert_eq!(
+            voices["tardia-espera"]["spoken"].as_array().map(Vec::len),
+            voices["so-online"]["spoken"].as_array().map(Vec::len)
+        );
+        assert_eq!(last_voice("tardia"), "Maria");
+        assert_eq!(voices["tardia"]["pending"], 0);
+        assert_eq!(voices["sem-vozes"]["note"], "Nenhuma voz local disponível");
+        assert_eq!(voices["sem-vozes"]["buttons"][2], "🔊 Falar");
+    }
+
+    #[test]
+    fn a_selected_search_reaches_the_comparator_from_every_surface_but_the_private_split() {
+        let text = "agent:https://example.com | click=Comprar".to_string();
+        let search = || IpcAction::Search { text: text.clone() };
+        let carries = |event: Option<UserEvent>| {
+            matches!(event, Some(UserEvent::SearchSelection(ref got)) if *got == text)
+        };
+        // As tres colunas do comparador.
+        for col in 0..COMPARATOR_COLUMNS {
+            assert!(
+                carries(App::column_ipc_event_impl(col, search())),
+                "coluna {col}"
+            );
+        }
+        // Split normal; o privado recusa, mas continua a fechar-se.
+        assert!(carries(App::split_ipc_event_impl(1, false, search())));
+        assert!(App::split_ipc_event_impl(1, true, search()).is_none());
+        assert!(matches!(
+            App::split_ipc_event_impl(1, true, IpcAction::SplitClose),
+            Some(UserEvent::CloseSplit)
+        ));
+        // Web externa, com e sem agente.
+        assert!(carries(external_ipc_event(search(), false)));
+        assert!(carries(external_ipc_event(search(), true)));
+        // Reader e PDF usam o mapa comum.
+        assert!(carries(common_ipc_event(search())));
+    }
+
+    #[test]
+    fn a_selected_search_is_a_question_never_an_omnibox_command() {
+        // Na omnibox cada uma destas e um comando (agente, tema, memoria...).
+        // Selecionada numa pagina e so a pergunta que vai as tres IAs.
+        for command in [
+            "agent:https://example.com | click=Comprar",
+            "tema:escuro",
+            "theme:light",
+            "memory:rebuild",
+            "mem:senhas",
+            "history:",
+            "research:export",
+        ] {
+            assert_ne!(
+                route_input(command),
+                InputRoute::Intent,
+                "{command} deixou de ser um comando da omnibox; o teste perdeu o sentido"
+            );
+            assert_eq!(
+                selection_search_question(&format!("  {command}\n")),
+                Some(command.to_string()),
+                "{command}"
+            );
+        }
+        // Um endereco selecionado tambem e pergunta, nao navegacao.
+        assert_eq!(
+            selection_search_question("https://example.com/"),
+            Some("https://example.com/".to_string())
+        );
+        assert_eq!(selection_search_question(" \n "), None);
+        assert_eq!(
+            selection_search_question(&"a".repeat(crate::ipc::SEARCH_MAX_CHARS + 1)),
+            None
+        );
+
+        // O handler nativo nao pode sequer tocar no interpretador de
+        // comandos (asserção de ausencia, AGENTS.md §4.3).
+        let source = include_str!("windows_app.rs");
+        let handler = source
+            .split("fn search_selection(&mut self")
+            .nth(1)
+            .and_then(|part| part.split("\n    fn ").next())
+            .expect("search_selection");
+        for forbidden in ["handle_input", "route_input", "parse_intent", "SubmitText"] {
+            assert!(
+                !handler.contains(forbidden),
+                "o Pesquisar passa por {forbidden}"
+            );
+        }
+        let arm = source
+            .split("UserEvent::SearchSelection(text) =>")
+            .nth(1)
+            .and_then(|part| part.lines().next())
+            .expect("SearchSelection arm");
+        assert!(!arm.contains("handle_input") && !arm.contains("SubmitText"));
     }
 
     #[test]
