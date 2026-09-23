@@ -16584,6 +16584,27 @@ __fire('keydown', { key: 'F8' });
         }
     }
 
+    #[test]
+    fn column_menu_item_goes_after_every_native_item() {
+        // Um menu que o WebView2 abriu vazio recebe so o item, sem separador.
+        assert_eq!(
+            column_menu_placement(0),
+            ColumnMenuPlacement {
+                separator_at: None,
+                item_at: 0,
+            }
+        );
+        for native in 1..=40u32 {
+            let placement = column_menu_placement(native);
+            // Cada inserção empurra o que esta nesse indice para baixo: um
+            // indice abaixo de `native` tiraria copiar/colar/inspecionar do
+            // sitio. O separador fica logo a seguir ao ultimo nativo e o item
+            // logo a seguir ao separador -- o fim do menu, como no Chrome.
+            assert_eq!(placement.separator_at, Some(native), "{native} nativos");
+            assert_eq!(placement.item_at, native + 1, "{native} nativos");
+        }
+    }
+
     /// Um `[[package]]` do Cargo.lock: nome, versao, origem (ausente nos
     /// membros do workspace) e as dependencias tal como o lock as escreve --
     /// "nome", ou "nome versao" quando ha varias versoes da mesma crate.
@@ -18786,11 +18807,35 @@ fn context_menu_column(host: WebViewHost) -> Option<usize> {
     }
 }
 
-/// Acrescenta ao menu nativo do botao direito de uma coluna -- copiar, colar,
-/// inspecionar e o resto ficam todos -- um separador e o item de rolagem, com
-/// o rotulo do estado no instante do clique. Precisa do ContextMenuRequested
+/// Onde o item de rolagem entra num menu nativo com `native` itens: DEPOIS de
+/// todos eles, separado por uma linha quando ha algo acima. Copiar, colar,
+/// inspecionar e o resto ficam nos lugares em que o WebView2 os pos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ColumnMenuPlacement {
+    separator_at: Option<u32>,
+    item_at: u32,
+}
+
+fn column_menu_placement(native: u32) -> ColumnMenuPlacement {
+    if native == 0 {
+        ColumnMenuPlacement {
+            separator_at: None,
+            item_at: 0,
+        }
+    } else {
+        ColumnMenuPlacement {
+            separator_at: Some(native),
+            item_at: native + 1,
+        }
+    }
+}
+
+/// Acrescenta ao menu nativo do botao direito de uma coluna o item de
+/// rolagem, com o rotulo do estado no instante do clique, no lugar que
+/// `column_menu_placement` decide. Precisa do ContextMenuRequested
 /// (ICoreWebView2_11 e ICoreWebView2Environment9); num runtime sem ele devolve
-/// o erro e a coluna fica so com o menu nativo.
+/// o erro e a coluna fica so com o menu nativo. Uma falha a montar um menu
+/// concreto fica no log e esse menu abre como o WebView2 o trouxe.
 fn register_column_context_menu(
     webview: &WebView,
     col_index: usize,
@@ -18802,7 +18847,7 @@ fn register_column_context_menu(
         Microsoft::Web::WebView2::Win32::{
             COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
             COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR, ICoreWebView2_11,
-            ICoreWebView2Environment9,
+            ICoreWebView2ContextMenuRequestedEventArgs, ICoreWebView2Environment9,
         },
     };
     use windows_core::{HSTRING, Interface};
@@ -18817,39 +18862,55 @@ fn register_column_context_menu(
         .cast::<ICoreWebView2Environment9>()
         .map_err(|error| format!("ICoreWebView2Environment9 indisponível: {error}"))?;
 
-    let handler = ContextMenuRequestedEventHandler::create(Box::new(move |_, args| {
-        let Some(args) = args else {
-            return Ok(());
-        };
-        let label = HSTRING::from(auto_scroll_menu_label(auto_scroll.get()));
-        let proxy = proxy.clone();
-        let selected = CustomItemSelectedEventHandler::create(Box::new(move |_, _| {
-            if let Some(event) = column_menu_event(col_index, COLUMN_MENU_AUTO_SCROLL) {
-                let _ = proxy.send_event(event);
+    let add_item =
+        move |args: &ICoreWebView2ContextMenuRequestedEventArgs| -> windows_core::Result<()> {
+            let label = HSTRING::from(auto_scroll_menu_label(auto_scroll.get()));
+            let proxy = proxy.clone();
+            let selected = CustomItemSelectedEventHandler::create(Box::new(move |_, _| {
+                if let Some(event) = column_menu_event(col_index, COLUMN_MENU_AUTO_SCROLL) {
+                    let _ = proxy.send_event(event);
+                }
+                Ok(())
+            }));
+            unsafe {
+                let items = args.MenuItems()?;
+                let mut native = 0u32;
+                items.Count(&mut native)?;
+                let placement = column_menu_placement(native);
+                // Tudo criado antes de mexer no menu: uma falha a meio nao deixa
+                // um separador solto no fim do menu nativo.
+                let item = environment.CreateContextMenuItem(
+                    &label,
+                    None,
+                    COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
+                )?;
+                let mut selected_token = 0i64;
+                item.add_CustomItemSelected(&selected, &mut selected_token)?;
+                let separator = match placement.separator_at {
+                    Some(index) => Some((
+                        index,
+                        environment.CreateContextMenuItem(
+                            &HSTRING::new(),
+                            None,
+                            COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR,
+                        )?,
+                    )),
+                    None => None,
+                };
+                if let Some((index, separator)) = separator {
+                    items.InsertValueAtIndex(index, &separator)?;
+                }
+                items.InsertValueAtIndex(placement.item_at, &item)?;
             }
             Ok(())
-        }));
-        unsafe {
-            let items = args.MenuItems()?;
-            let mut count = 0u32;
-            items.Count(&mut count)?;
-            let item = environment.CreateContextMenuItem(
-                &label,
-                None,
-                COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
-            )?;
-            let mut selected_token = 0i64;
-            item.add_CustomItemSelected(&selected, &mut selected_token)?;
-            if count > 0 {
-                let separator = environment.CreateContextMenuItem(
-                    &HSTRING::new(),
-                    None,
-                    COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR,
-                )?;
-                items.InsertValueAtIndex(count, &separator)?;
-                count += 1;
-            }
-            items.InsertValueAtIndex(count, &item)?;
+        };
+    let handler = ContextMenuRequestedEventHandler::create(Box::new(move |_, args| {
+        if let Some(args) = args
+            && let Err(error) = add_item(&args)
+        {
+            debug_log(format_args!(
+                "context menu: coluna {col_index} abriu sem o item de rolagem ({error})"
+            ));
         }
         Ok(())
     }));
