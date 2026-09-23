@@ -62,9 +62,19 @@ try {
 
     # A `cargo` that only records what it sees. `metadata` answers with the
     # fake target directory; `build` writes a fake NeuralIA-Setup.exe there.
+    # pwsh 7 when present (GitHub runners). Windows PowerShell 5.1 launched
+    # from pwsh 7 inherits pwsh's PSModulePath and cannot load its own
+    # Microsoft.PowerShell.Utility (Get-FileHash, ConvertTo-Json vanish), so
+    # the 5.1 fallback starts with PSModulePath cleared.
     Set-Content -LiteralPath (Join-Path $fakeBin "cargo.cmd") -Encoding ASCII -Value @(
         "@echo off",
-        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""%~dp0fake-cargo.ps1"" %*",
+        "where pwsh >nul 2>nul",
+        "if not errorlevel 1 (",
+        "  pwsh -NoProfile -NonInteractive -File ""%~dp0fake-cargo.ps1"" %*",
+        ") else (",
+        "  set ""PSModulePath=""",
+        "  powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""%~dp0fake-cargo.ps1"" %*",
+        ")",
         "exit /b %ERRORLEVEL%"
     )
     Set-Content -LiteralPath (Join-Path $fakeBin "fake-cargo.ps1") -Encoding UTF8 -Value @'
