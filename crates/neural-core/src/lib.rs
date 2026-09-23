@@ -17,6 +17,7 @@ pub mod search;
 pub mod security;
 pub mod semantic_timeline;
 pub mod tissue;
+pub mod zettel;
 
 pub use config::CoreConfig;
 pub use error::{NeuralError, Result};
@@ -48,3 +49,4 @@ pub use research::{
 
 pub use agent_protocol::{AgentAction, AgentElement, AgentRuntimeConfig, ObservedPage};
 pub use semantic_timeline::{SemanticAnchor, SemanticAnchorKind, semantic_anchors_html};
+pub use zettel::{Note, ZettelError, ZettelStore};
