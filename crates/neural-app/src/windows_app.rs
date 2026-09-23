@@ -192,6 +192,14 @@ enum UserEvent {
     },
 }
 
+/// O que fazer com um pedido de split conforme a superficie atual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitFallback {
+    OpenSplit,
+    OpenWeb,
+    Ignore,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Surface {
     Home,
@@ -1057,6 +1065,7 @@ fn plan_tab_row(tabs: &[ContextTab], groups: &[ContextGroup]) -> TabRow {
     // A pilula vem sempre antes das suas abas. Se o corte caiu no meio de um
     // grupo, a pilula ficou de fora -- desce-se ate a proxima pilula ou ate
     // uma aba solta, em vez de mostrar orfas.
+    let window_start = start;
     while start < full.len() {
         match full[start] {
             TabSlot::Group(_) => break,
@@ -1066,6 +1075,38 @@ fn plan_tab_row(tabs: &[ContextTab], groups: &[ContextGroup]) -> TabRow {
     }
 
     let mut row = TabRow::empty();
+    if start == full.len() && window_start < full.len() {
+        // O corte caiu dentro de um grupo com mais abas abertas do que cabem e
+        // nao ha nada inteiro depois dele: a linha ficava vazia e a pilula --
+        // o unico caminho para fechar ou reabrir o grupo -- sumia. Mostra-se a
+        // pilula antes das abas recentes do grupo, e as pilulas dos grupos
+        // fechados anteriores enquanto houver lugar.
+        let mut kept: Vec<TabSlot> = Vec::new();
+        for slot in full[window_start..].iter().copied() {
+            if let TabSlot::Tab(index) = slot
+                && let Some(group) = group_of(index)
+                && !kept.contains(&TabSlot::Group(group))
+            {
+                kept.push(TabSlot::Group(group));
+            }
+            kept.push(slot);
+        }
+        let mut lead: Vec<TabSlot> = Vec::new();
+        for slot in full[..window_start].iter().rev().copied() {
+            if kept.len() + lead.len() >= MAX_VISIBLE_TAB_SLOTS {
+                break;
+            }
+            if let TabSlot::Group(group) = slot
+                && groups[group].collapsed
+            {
+                lead.push(slot);
+            }
+        }
+        for slot in lead.into_iter().rev().chain(kept) {
+            row.push(slot);
+        }
+        return row;
+    }
     for slot in full[start..].iter().copied() {
         row.push(slot);
     }
@@ -3436,7 +3477,13 @@ impl MemoryWorker {
         }
     }
 
-    fn clear(&self) {
+    /// Apagar a memoria esquece tambem a sessao de pesquisa viva. O worker
+    /// apaga sessions/<id>.json e poe tombstone no id; uma sessao que ficasse
+    /// na app voltava ao disco no proximo save_session (com a pergunta ja
+    /// apagada) e cada captura nova com esse id era recusada em silencio.
+    /// Pedir a sessao aqui obriga quem apaga a larga-la.
+    fn clear(&self, current_research: &mut Option<ResearchSession>) {
+        *current_research = None;
         if self.tx.try_send(MemoryCommand::Clear).is_err() {
             eprintln!("memory queue saturated; clear not scheduled");
         }
@@ -4713,8 +4760,8 @@ impl App {
                     || is_view_source_target(&target, nav_origin.as_deref())
             })
             .with_new_window_req_handler(move |target, _features| {
-                if remote_web_target(&target, local_origin.as_deref()) {
-                    let _ = new_window_proxy.send_event(UserEvent::OpenExternal(target));
+                if let Some(event) = external_new_window_event(target, local_origin.as_deref()) {
+                    let _ = new_window_proxy.send_event(event);
                 }
                 NewWindowResponse::Deny
             })
@@ -5726,6 +5773,20 @@ impl App {
         self.open_split_mode(source_index, url, allow_local, false, None)
     }
 
+    /// Um pedido de split que chega depois de o comparador desaparecer (o
+    /// popup da pagina ficou na fila atras do Home) ainda pode abrir como Web
+    /// normal. Um pedido PRIVADO nao: web() grava historico, captura memoria
+    /// e usa o perfil com cookies normais.
+    fn split_request_fallback(surface: Surface, private: bool) -> SplitFallback {
+        if surface == Surface::Comparator {
+            SplitFallback::OpenSplit
+        } else if private {
+            SplitFallback::Ignore
+        } else {
+            SplitFallback::OpenWeb
+        }
+    }
+
     fn open_split_mode(
         &mut self,
         source_index: usize,
@@ -5734,9 +5795,13 @@ impl App {
         private: bool,
         existing_context_id: Option<u64>,
     ) -> bool {
-        if self.surface != Surface::Comparator {
-            self.web(url);
-            return true;
+        match Self::split_request_fallback(self.surface, private) {
+            SplitFallback::OpenSplit => {}
+            SplitFallback::OpenWeb => {
+                self.web(url);
+                return true;
+            }
+            SplitFallback::Ignore => return false,
         }
 
         let Ok(valid) = neural_core::validate_web_url(&url) else {
@@ -5822,8 +5887,9 @@ impl App {
 
                 // So uma fonte que abriu de verdade entra na memoria/sessao.
                 // Antes, uma falha de build deixava uma fonte fantasma gravada.
-                if let Some((title, mut document)) =
-                    split_source_memory(&valid, source_name, private)
+                if split_open_records_source(existing_context_id, private)
+                    && let Some((title, mut document)) =
+                        split_source_memory(&valid, source_name, private)
                 {
                     let value = valid.to_string();
                     if let Some(session) = &mut self.current_research {
@@ -7664,14 +7730,26 @@ impl App {
     }
 
     fn open_context_tab(&mut self, source_index: usize, context_index: usize) -> bool {
+        let active = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.split.as_ref())
+            .map(|split| (split.source_index, split.context_id));
         self.context_tab_identity(source_index, context_index)
             .is_some_and(|(context_id, url)| {
-                self.open_split_mode(source_index, url, false, false, Some(context_id))
+                context_tab_click_is_noop(active, source_index, context_id)
+                    || self.open_split_mode(source_index, url, false, false, Some(context_id))
             })
     }
 
     fn open_context_tab_fullscreen(&mut self, source_index: usize, context_index: usize) {
-        if self.open_context_tab(source_index, context_index) {
+        if self.open_context_tab(source_index, context_index)
+            && !self
+                .comparator
+                .as_ref()
+                .and_then(|comp| comp.split.as_ref())
+                .is_some_and(|split| split.fullscreen)
+        {
             self.toggle_split_fullscreen();
         }
     }
@@ -8320,6 +8398,24 @@ fn decide_agent_step(
 /// restrições inegociáveis do `md/README.md`. É aqui que isso se decide para
 /// este caminho, fora de qualquer janela, para um teste poder ficar vermelho se
 /// alguém inverter a condição.
+/// Reabrir uma aba de contexto ja gravada nao e uma fonte nova: a fonte
+/// entrou na sessao e na memoria quando a aba nasceu. Sem isto, cada clique
+/// A, B, A, B acrescentava outra copia a sessao persistida.
+fn split_open_records_source(existing_context_id: Option<u64>, private: bool) -> bool {
+    existing_context_id.is_none() && !private
+}
+
+/// Clicar na aba de contexto que o split ja mostra nao reconstroi o WebView:
+/// reconstruir voltava a URL original da aba e perdia o que o utilizador
+/// escreveu ou navegou.
+fn context_tab_click_is_noop(
+    active: Option<(usize, Option<u64>)>,
+    source_index: usize,
+    context_id: u64,
+) -> bool {
+    active == Some((source_index, Some(context_id)))
+}
+
 fn split_source_memory(
     url: &Url,
     source_name: &str,
@@ -8796,7 +8892,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ShowHistory => self.show_history(),
             UserEvent::ThemeChosen(choice) => self.choose_theme(choice),
             UserEvent::ClearHistory => {
-                self.memory.clear();
+                self.memory.clear(&mut self.current_research);
                 match self.history.clear() {
                     None => {
                         self.show_home();
@@ -9528,6 +9624,15 @@ fn web_media_permission(kind: PermissionKind, user_visible: bool) -> PermissionR
         }
         _ => PermissionResponse::Deny,
     }
+}
+
+/// Pedido de janela nova vindo da pagina em Web completa. `window.open('',
+/// '_blank')` chega como `about:blank`: aceite pelo `remote_web_target` (para
+/// a navegacao), mas como destino de OpenExternal falha no validate_web_url e
+/// o erro destruia a pagina do utilizador e voltava ao Home.
+fn external_new_window_event(target: String, local_origin: Option<&str>) -> Option<UserEvent> {
+    (!target.eq_ignore_ascii_case("about:blank") && remote_web_target(&target, local_origin))
+        .then_some(UserEvent::OpenExternal(target))
 }
 
 fn remote_web_target(target: &str, local_origin: Option<&str>) -> bool {
@@ -13220,8 +13325,7 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
     fn browser_agent_bridge_is_bounded_and_has_no_arbitrary_js_channel() {
         assert!(AGENT_OBSERVER_SCRIPT.contains("rows.length >= 32"));
         assert!(AGENT_OBSERVER_SCRIPT.contains("pageText"));
-        assert!(AGENT_OBSERVER_SCRIPT.contains("action:'agent-observation'"));
-        assert!(AGENT_OBSERVER_SCRIPT.contains("post(stringify("));
+        assert!(AGENT_OBSERVER_SCRIPT.contains("post(envelope('agent-observation'"));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("?cap="));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("eval("));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("new Function"));
@@ -13960,8 +14064,8 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
         assert!(gmail_is_new_mail(Some(4), Some("thread-a"), 4, "thread-b"));
         assert!(!gmail_is_new_mail(Some(4), Some("thread-a"), 4, "thread-a"));
         assert!(GMAIL_MONITOR_SCRIPT.contains("mail.google.com"));
-        assert!(GMAIL_MONITOR_SCRIPT.contains("action:'gmail-state'"));
-        assert!(GMAIL_MONITOR_SCRIPT.contains("post(stringify("));
+        assert!(GMAIL_MONITOR_SCRIPT.contains("post(envelope('gmail-state'"));
+        assert!(GMAIL_MONITOR_SCRIPT.contains("post(envelope("));
     }
 
     #[test]
@@ -14032,6 +14136,341 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
         }
     }
 
+    /// Corre `program` no Node (o mesmo motor de JS que os testes de CI dos
+    /// scripts injetados usam) e devolve o stdout. Sem Node nao ha gate: falha.
+    fn run_node_program(program: &str) -> String {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("node")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("node is required to run the injected-script gates");
+        child
+            .stdin
+            .take()
+            .expect("node stdin")
+            .write_all(program.as_bytes())
+            .expect("write program to node");
+        let output = child.wait_with_output().expect("node output");
+        assert!(
+            output.status.success(),
+            "node failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("node stdout is utf-8")
+    }
+
+    /// Um DOM minimo, criado DENTRO do contexto do vm, para que os literais de
+    /// objeto dos scripts herdem do `Object.prototype` que a "pagina" envenena.
+    const INJECTED_SCRIPT_HARNESS: &str = r##"
+const vm = require('node:vm');
+const MOCK = `
+var __stolen = [], __posted = [], __errors = [], __listeners = [], __timers = [], __observers = [], __created = [];
+class EventTarget {
+  addEventListener(type, handler) { __listeners.push({ target: this, type: String(type), handler }); }
+  removeEventListener() {}
+  dispatchEvent() { return true; }
+}
+class Node extends EventTarget {
+  appendChild(child) { return child; }
+  removeChild(child) { return child; }
+  insertBefore(child) { return child; }
+}
+class Element extends Node {
+  constructor(tag) {
+    super();
+    this.tagName = String(tag || 'div').toUpperCase();
+    this.style = {}; this.dataset = {}; this.attrs = {}; this.children = [];
+    this.classList = { add() {}, remove() {}, toggle() {}, contains() { return false; } };
+    this.textContent = ''; this.innerText = 'x'.repeat(40); this.value = '';
+  }
+  setAttribute(k, v) { this.attrs[k] = String(v); }
+  getAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k) ? this.attrs[k] : null; }
+  removeAttribute(k) { delete this.attrs[k]; }
+  hasAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k); }
+  querySelector() { return null; }
+  querySelectorAll() { return []; }
+  closest() { return null; }
+  matches() { return false; }
+  getBoundingClientRect() { return { x: 0, y: 0, top: 0, left: 0, right: 10, bottom: 10, width: 10, height: 10 }; }
+  focus() {} blur() {} select() {} remove() {} click() {} scrollIntoView() {} append() {} prepend() {}
+}
+class Document extends Node {
+  constructor() {
+    super();
+    this.readyState = 'loading'; this.title = '';
+    this.documentElement = new Element('html'); this.body = new Element('body'); this.head = new Element('head');
+  }
+  getElementById() { return null; }
+  createElement(tag) { __created.push(String(tag)); return new Element(tag); }
+  createTextNode(text) { return { textContent: String(text) }; }
+  querySelector() { return null; }
+  querySelectorAll() { return []; }
+}
+var document = new Document();
+var window = new EventTarget();
+window.top = window;
+window.location = location;
+window.history = { back() {}, forward() {} };
+window.chrome = { webview: { postMessage(message) { __posted.push(String(message)); } } };
+window.__neuralia_col_index = 0;
+window.__neuralia_col_name = 'IA';
+function __timer(fn) { const t = { fn, done: false }; __timers.push(t); return __timers.length; }
+function __cancel(id) { const t = __timers[id - 1]; if (t) t.done = true; }
+var setTimeout = __timer, setInterval = __timer, requestAnimationFrame = __timer;
+var clearTimeout = __cancel, clearInterval = __cancel, cancelAnimationFrame = __cancel;
+var getComputedStyle = () => ({ display: 'block', visibility: 'visible' });
+class MutationObserver {
+  constructor(callback) { this.callback = callback; __observers.push(this); }
+  observe() {} disconnect() {} takeRecords() { return []; }
+}
+`;
+const HELPERS = `
+function __event(type, extra) {
+  const target = new Element('div');
+  return Object.assign({
+    type, isTrusted: true, defaultPrevented: false, button: 0, key: '',
+    ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, target,
+    composedPath() { return [target]; },
+    preventDefault() {}, stopPropagation() {}, stopImmediatePropagation() {}
+  }, extra || {});
+}
+function __fire(type, extra) {
+  for (const l of __listeners.slice()) {
+    if (l.type !== type) continue;
+    try {
+      const h = l.handler;
+      (typeof h === 'function' ? h : h.handleEvent).call(l.target, __event(type, extra));
+    } catch (e) { __errors.push(type + ': ' + e.message); }
+  }
+}
+function __drain() {
+  for (let round = 0; round < 20; round++) {
+    const due = __timers.filter((t) => !t.done);
+    if (!due.length) return;
+    for (const t of due) {
+      t.done = true;
+      try { t.fn(); } catch (e) { __errors.push('timer: ' + e.message); }
+    }
+  }
+}
+`;
+const DEFAULT_DRIVE = `
+document.readyState = 'interactive';
+__fire('DOMContentLoaded');
+__fire('load');
+__drain();
+__fire('keydown', { key: 'Escape' });
+__fire('click');
+__fire('dblclick');
+__fire('neuralia-agent-rescan');
+for (const o of __observers) { try { o.callback([], o); } catch (e) { __errors.push('observer: ' + e.message); } }
+__drain();
+`;
+// O que a pagina corre depois do document-created: um getter de toJSON no
+// Object.prototype que guarda qualquer `cap` que lhe passe por `this`.
+const PAGE = `
+Object.defineProperty(Object.prototype, 'toJSON', {
+  configurable: true,
+  get() { if (this && typeof this.cap === 'string') __stolen.push(this.cap); return undefined; }
+});
+`;
+const results = [];
+for (const c of INPUT.cases) {
+  const context = vm.createContext({ location: new URL(c.href), URL });
+  vm.runInContext(MOCK, context);
+  if (c.child) vm.runInContext('window.top = {};', context);
+  vm.runInContext(c.script, context, { filename: c.name });
+  vm.runInContext(PAGE, context);
+  vm.runInContext(HELPERS, context);
+  vm.runInContext(c.drive || DEFAULT_DRIVE, context);
+  results.push({
+    name: c.name,
+    stolen: Array.from(context.__stolen, String),
+    posted: Array.from(context.__posted, String),
+    errors: Array.from(context.__errors, String),
+    created: Array.from(context.__created, String),
+  });
+}
+process.stdout.write(JSON.stringify(results));
+"##;
+
+    #[test]
+    fn spec_0108_page_cannot_read_the_capability_through_a_to_json_getter() {
+        // Um getter de `toJSON` no Object.prototype e chamado pelo
+        // JSON.stringify com `this` = cada objeto serializado. Se o envelope
+        // com o token passar por la, a pagina fica com o token e forja
+        // `clearhistory`. O gate corre os cinco scripts que embarcam, dispara
+        // os caminhos que postam e exige: ha mensagens, sao validas, e o
+        // getter da pagina nunca viu o token.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let cases: Vec<serde_json::Value> = [
+            ("keymap", NEURALIA_KEYMAP_SCRIPT, "https://example.com/"),
+            ("return", EXTERNAL_RETURN_BUTTON, "https://example.com/"),
+            (
+                "gmail",
+                GMAIL_MONITOR_SCRIPT,
+                "https://mail.google.com/mail/u/0/",
+            ),
+            ("agent", AGENT_OBSERVER_SCRIPT, "https://example.com/"),
+            (
+                "comparator",
+                COMPARATOR_INJECT_SCRIPT,
+                "https://example.com/",
+            ),
+        ]
+        .into_iter()
+        .map(|(name, script, href)| {
+            serde_json::json!({
+                "name": name,
+                "href": href,
+                "script": script.replace("__NEURALIA_CAP__", CAP),
+            })
+        })
+        .collect();
+        let program = format!(
+            "const INPUT = {};\n{}",
+            serde_json::json!({ "cases": cases }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        assert_eq!(results.len(), 5);
+        for result in &results {
+            let name = result["name"].as_str().unwrap_or_default();
+            let stolen = result["stolen"].as_array().expect("stolen");
+            let posted = result["posted"].as_array().expect("posted");
+            assert!(
+                !posted.is_empty(),
+                "{name}: the harness must reach a signing path; errors: {}",
+                result["errors"]
+            );
+            for message in posted {
+                let message = message.as_str().expect("posted string");
+                assert!(
+                    parse_ipc_message(message, CAP, 3).is_some(),
+                    "{name}: posted envelope must stay valid: {message}"
+                );
+            }
+            assert!(
+                stolen.is_empty(),
+                "{name}: page toJSON getter read the capability {} time(s)",
+                stolen.len()
+            );
+        }
+    }
+
+    #[test]
+    fn comparator_ctrl_click_on_a_google_search_link_keeps_the_real_url() {
+        // `q` numa pesquisa do Google e um termo, nao uma URL. Resolvido
+        // contra a origem da coluna virava https://gemini.google.com/app/rust.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let search = "https://www.google.com/search?q=rust";
+        let cases = [
+            ("https://gemini.google.com/app/abc", search, search),
+            ("https://chatgpt.com/c/abc", search, search),
+            ("https://www.google.com/search?q=x&udm=50", search, search),
+            (
+                "https://gemini.google.com/app/abc",
+                "https://maps.google.com/?q=Paris",
+                "https://maps.google.com/?q=Paris",
+            ),
+            // O embrulho real do Google continua a ser desembrulhado.
+            (
+                "https://gemini.google.com/app/abc",
+                "https://www.google.com/url?q=https%3A%2F%2Fexample.com%2F",
+                "https://example.com/",
+            ),
+        ];
+        let inputs: Vec<serde_json::Value> = cases
+            .iter()
+            .map(|(location, href, _)| {
+                serde_json::json!({
+                    "name": format!("{location} -> {href}"),
+                    "href": location,
+                    "script": COMPARATOR_INJECT_SCRIPT.replace("__NEURALIA_CAP__", CAP),
+                    "drive": format!(
+                        "const anchor = new Element('a');\n\
+                         anchor.href = {};\n\
+                         anchor.matches = () => true;\n\
+                         __fire('click', {{ ctrlKey: true, target: anchor, \
+                         composedPath() {{ return [anchor]; }} }});\n",
+                        serde_json::Value::from(*href)
+                    ),
+                })
+            })
+            .collect();
+        let program = format!(
+            "const INPUT = {};\n{}",
+            serde_json::json!({ "cases": inputs }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        assert_eq!(results.len(), cases.len());
+        for (result, (_, _, expected)) in results.iter().zip(cases) {
+            let name = result["name"].as_str().unwrap_or_default();
+            let posted = result["posted"].as_array().expect("posted");
+            assert_eq!(posted.len(), 1, "{name}: errors {}", result["errors"]);
+            let message = posted[0].as_str().expect("posted string");
+            match parse_ipc_message(message, CAP, 3) {
+                Some(IpcAction::Link { url, aside, .. }) => {
+                    assert!(aside, "{name}");
+                    assert_eq!(url, expected, "{name}");
+                }
+                other => panic!("{name}: expected a link action, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn split_scroll_rail_is_top_frame_only() {
+        // WebView2 corre os initialization scripts tambem nos iframes. O rail
+        // (e o CSS que esconde as barras de rolagem) so pertence ao documento
+        // principal; num iframe cobria e engolia cliques do conteudo dele.
+        let inputs: Vec<serde_json::Value> = [false, true]
+            .into_iter()
+            .map(|child| {
+                serde_json::json!({
+                    "name": if child { "child frame" } else { "top frame" },
+                    "href": "https://example.com/",
+                    "child": child,
+                    "script": SPLIT_SCROLL_RAIL_SCRIPT,
+                })
+            })
+            .collect();
+        let program = format!(
+            "const INPUT = {};
+{}",
+            serde_json::json!({ "cases": inputs }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        let created = |index: usize| -> Vec<String> {
+            results[index]["created"]
+                .as_array()
+                .expect("created")
+                .iter()
+                .map(|tag| tag.as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        assert!(
+            created(0).iter().any(|tag| tag == "style"),
+            "top frame must still mount the rail: {:?}",
+            results[0]["errors"]
+        );
+        assert!(
+            created(1).is_empty(),
+            "child frame mounted rail elements: {:?}",
+            created(1)
+        );
+    }
+
     #[test]
     fn spec_0108_comparator_captures_timers_with_ipc_primitives() {
         let top = COMPARATOR_INJECT_SCRIPT
@@ -14042,6 +14481,84 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
         assert!(top.contains("JSON.stringify"));
         assert!(top.contains("const defer = setTimeout;"));
         assert!(top.contains("const cancelDefer = clearTimeout;"));
+    }
+
+    #[test]
+    fn clearing_memory_drops_the_live_research_session() {
+        // Depois de "Apagar historico" a sessao viva nao pode continuar a
+        // receber fontes: o proximo save_session reescrevia no disco a
+        // pergunta que o utilizador acabou de apagar.
+        let (tx, rx) = sync_channel::<MemoryCommand>(4);
+        let worker = MemoryWorker { tx };
+        let mut current_research = Some(ResearchSession::new("pergunta secreta"));
+        worker.clear(&mut current_research);
+        assert!(matches!(rx.try_recv(), Ok(MemoryCommand::Clear)));
+        assert!(
+            current_research.is_none(),
+            "the cleared research session is still alive and will be saved again"
+        );
+    }
+
+    #[test]
+    fn a_private_split_request_after_leaving_the_comparator_is_dropped() {
+        // Fora do comparador um pedido privado nunca cai em web(): isso
+        // gravava a URL privada no historico e na memoria semantica.
+        for surface in [
+            Surface::Home,
+            Surface::Reader,
+            Surface::External,
+            Surface::Pdf,
+        ] {
+            assert_eq!(
+                App::split_request_fallback(surface, true),
+                SplitFallback::Ignore,
+                "{surface:?}"
+            );
+            assert_eq!(
+                App::split_request_fallback(surface, false),
+                SplitFallback::OpenWeb,
+                "{surface:?}"
+            );
+        }
+        for private in [false, true] {
+            assert_eq!(
+                App::split_request_fallback(Surface::Comparator, private),
+                SplitFallback::OpenSplit
+            );
+        }
+    }
+
+    #[test]
+    fn full_web_new_window_about_blank_does_not_replace_the_page() {
+        for blank in ["about:blank", "ABOUT:BLANK"] {
+            assert!(
+                external_new_window_event(blank.to_string(), None).is_none(),
+                "{blank} must be denied, not opened as OpenExternal"
+            );
+        }
+        assert!(matches!(
+            external_new_window_event("https://example.com/".to_string(), None),
+            Some(UserEvent::OpenExternal(url)) if url == "https://example.com/"
+        ));
+        assert!(external_new_window_event("http://192.168.0.1/".to_string(), None).is_none());
+    }
+
+    #[test]
+    fn reopening_a_context_tab_does_not_rebuild_or_duplicate_the_source() {
+        assert!(split_open_records_source(None, false));
+        assert!(!split_open_records_source(None, true));
+        assert!(
+            !split_open_records_source(Some(7), false),
+            "a reopened context tab must not add another session source"
+        );
+        assert!(
+            context_tab_click_is_noop(Some((0, Some(1))), 0, 1),
+            "clicking the active context tab must not rebuild the split"
+        );
+        assert!(!context_tab_click_is_noop(Some((0, Some(1))), 0, 2));
+        assert!(!context_tab_click_is_noop(Some((1, Some(1))), 0, 1));
+        assert!(!context_tab_click_is_noop(Some((0, None)), 0, 1));
+        assert!(!context_tab_click_is_noop(None, 0, 1));
     }
 
     #[test]
@@ -14832,6 +15349,67 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
             "dois grupos seguidos nao podem nascer da mesma cor"
         );
         assert_ne!(groups[first].id, groups[second].id);
+    }
+
+    #[test]
+    fn a_group_larger_than_the_window_keeps_its_pill_and_recent_tabs() {
+        // Quatro abas abertas num grupo: o corte cai dentro do grupo e nao ha
+        // aba solta depois dele. A linha nao pode ficar vazia -- a pilula e o
+        // unico caminho para fechar ou reabrir o grupo.
+        let mut tabs = vec![
+            tab("https://a.example/1", Some(1)),
+            tab("https://b.example/2", Some(1)),
+            tab("https://c.example/3", Some(1)),
+            tab("https://d.example/4", None),
+        ];
+        let groups = vec![group(1, false)];
+        join_context_group(&mut tabs, 1, 3);
+        let row = plan_tab_row(&tabs, &groups);
+        assert_no_orphans(&row, &tabs, &groups);
+        assert_eq!(
+            row.visible(),
+            &[
+                TabSlot::Group(0),
+                TabSlot::Tab(1),
+                TabSlot::Tab(2),
+                TabSlot::Tab(3)
+            ]
+        );
+        let mut rows = [TabRow::empty(); COMPARATOR_COLUMNS];
+        rows[0] = row;
+        let layout = BarLayout::with_rows(1600.0, 1.0, true, BarColumns::even(3), rows);
+        assert_eq!(layout.group_pill_counts[0], 1);
+        assert_eq!(layout.context_tab_counts[0], 3);
+        let pill = layout.group_pills[0][0];
+        assert_eq!(
+            layout.hit(pill.x + pill.width / 2.0, pill.y + pill.height / 2.0),
+            Some(BarHit::ContextGroup {
+                source_index: 0,
+                group_index: 0
+            })
+        );
+
+        // Um grupo fechado antes dele nao perde a sua pilula.
+        let tabs = vec![
+            tab("https://x.example/0", Some(0)),
+            tab("https://a.example/1", Some(1)),
+            tab("https://b.example/2", Some(1)),
+            tab("https://c.example/3", Some(1)),
+            tab("https://d.example/4", Some(1)),
+        ];
+        let groups = vec![group(0, true), group(1, false)];
+        let row = plan_tab_row(&tabs, &groups);
+        assert_no_orphans(&row, &tabs, &groups);
+        assert_eq!(
+            row.visible(),
+            &[
+                TabSlot::Group(0),
+                TabSlot::Group(1),
+                TabSlot::Tab(2),
+                TabSlot::Tab(3),
+                TabSlot::Tab(4)
+            ]
+        );
     }
 
     #[test]
@@ -15945,9 +16523,17 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
   const capability = '__NEURALIA_CAP__';
   const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
   const stringify = JSON.stringify;
+  // O envelope com o token e montado com primitivas. Serializar um objeto
+  // que contem o token faz o serializador consultar toJSON pela cadeia de
+  // prototipos, que a pagina controla: um getter dela recebia o envelope
+  // como `this` e lia `cap`. Strings nao passam por toJSON.
+  function envelope(action, args) {
+    return '{"v":1,"cap":"' + capability + '","action":' + stringify(action)
+      + ',"args":' + stringify(args || {}) + '}';
+  }
   const colIndex = window.__neuralia_col_index;
   function act(action, args) {
-    post(stringify({ v:1, cap:capability, action, args:args || {} }));
+    post(envelope(action, args));
   }
 
   function findBar() {
@@ -16089,6 +16675,14 @@ const EXTERNAL_RETURN_BUTTON: &str = r#"
   const capability = '__NEURALIA_CAP__';
   const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
   const stringify = JSON.stringify;
+  // O envelope com o token e montado com primitivas. Serializar um objeto
+  // que contem o token faz o serializador consultar toJSON pela cadeia de
+  // prototipos, que a pagina controla: um getter dela recebia o envelope
+  // como `this` e lia `cap`. Strings nao passam por toJSON.
+  function envelope(action, args) {
+    return '{"v":1,"cap":"' + capability + '","action":' + stringify(action)
+      + ',"args":' + stringify(args || {}) + '}';
+  }
   const defer = setTimeout;
   const cancelDefer = clearTimeout;
   const byId = document.getElementById.bind(document);
@@ -16110,7 +16704,7 @@ const EXTERNAL_RETURN_BUTTON: &str = r#"
     });
     listen(b, 'click', (event) => {
       if (!event.isTrusted) return;
-      post(stringify({ v:1, cap:capability, action:'home', args:{} }));
+      post(envelope('home', {}));
     });
     append(document.documentElement, b);
   });
@@ -16125,6 +16719,14 @@ const GMAIL_MONITOR_SCRIPT: &str = r#"
   const capability = '__NEURALIA_CAP__';
   const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
   const stringify = JSON.stringify;
+  // O envelope com o token e montado com primitivas. Serializar um objeto
+  // que contem o token faz o serializador consultar toJSON pela cadeia de
+  // prototipos, que a pagina controla: um getter dela recebia o envelope
+  // como `this` e lia `cap`. Strings nao passam por toJSON.
+  function envelope(action, args) {
+    return '{"v":1,"cap":"' + capability + '","action":' + stringify(action)
+      + ',"args":' + stringify(args || {}) + '}';
+  }
   let lastState = '';
   let debounce = 0;
 
@@ -16169,11 +16771,8 @@ const GMAIL_MONITOR_SCRIPT: &str = r#"
     if (state === lastState) return;
     lastState = state;
 
-    post(stringify({
-      v:1,
-      cap:capability,
-      action:'gmail-state',
-      args:{ count, sender:first.sender, subject:first.subject, key:first.key }
+    post(envelope('gmail-state', {
+      count, sender:first.sender, subject:first.subject, key:first.key
     }));
   }
 
@@ -16485,6 +17084,14 @@ const AGENT_OBSERVER_SCRIPT: &str = concat!(
   const capability = '__NEURALIA_CAP__';
   const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
   const stringify = JSON.stringify;
+  // O envelope com o token e montado com primitivas. Serializar um objeto
+  // que contem o token faz o serializador consultar toJSON pela cadeia de
+  // prototipos, que a pagina controla: um getter dela recebia o envelope
+  // como `this` e lia `cap`. Strings nao passam por toJSON.
+  function envelope(action, args) {
+    return '{"v":1,"cap":"' + capability + '","action":' + stringify(action)
+      + ',"args":' + stringify(args || {}) + '}';
+  }
   const listen = Function.prototype.call.bind(EventTarget.prototype.addEventListener);
   const defer = setTimeout;
   let generation = 0;
@@ -16579,12 +17186,7 @@ const AGENT_OBSERVER_SCRIPT: &str = concat!(
       left -= rowCost;
     }
     const payload = [head, fitJson(pageText, left)].concat(kept).join('\n');
-    post(stringify({
-      v:1,
-      cap:capability,
-      action:'agent-observation',
-      args:{ data:payload }
-    }));
+    post(envelope('agent-observation', { data:payload }));
   }
 
   function schedule() {
@@ -16606,6 +17208,10 @@ const AGENT_OBSERVER_SCRIPT: &str = concat!(
 );
 
 const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
+(function () {
+  // WRY/WebView2 injeta initialization scripts em child frames no Windows:
+  // o rail e o CSS que esconde as barras so pertencem ao documento principal.
+  if (window.top !== window) return;
 document.addEventListener('DOMContentLoaded', () => {
   if (document.getElementById('neuralia-split-scroll-rail')) return;
 
@@ -16863,6 +17469,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   syncTicks();
 });
+})();
 "#;
 
 /// Tudo o que corre depois do DOMContentLoaded usa as capturas do topo: a
@@ -16877,10 +17484,18 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
   const capability = '__NEURALIA_CAP__';
   const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
   const stringify = JSON.stringify;
+  // O envelope com o token e montado com primitivas. Serializar um objeto
+  // que contem o token faz o serializador consultar toJSON pela cadeia de
+  // prototipos, que a pagina controla: um getter dela recebia o envelope
+  // como `this` e lia `cap`. Strings nao passam por toJSON.
+  function envelope(action, args) {
+    return '{"v":1,"cap":"' + capability + '","action":' + stringify(action)
+      + ',"args":' + stringify(args || {}) + '}';
+  }
   const defer = setTimeout;
   const cancelDefer = clearTimeout;
   function act(action, args) {
-    post(stringify({ v:1, cap:capability, action, args:args || {} }));
+    post(envelope(action, args));
   }
   const byId = document.getElementById.bind(document);
   const createElement = document.createElement.bind(document);
@@ -16948,7 +17563,9 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
         const actual = target.searchParams.get(name);
         if (!actual) continue;
         try {
-          const unwrapped = new URL(actual, location.href);
+          // So URL absoluta: em /search o `q` e um termo, e resolvido contra a
+          // coluna virava uma URL falsa na origem da IA.
+          const unwrapped = new URL(actual);
           if (unwrapped.protocol === 'http:' || unwrapped.protocol === 'https:') {
             target = unwrapped;
             break;
