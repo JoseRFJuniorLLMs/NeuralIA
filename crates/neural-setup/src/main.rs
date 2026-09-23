@@ -19,9 +19,30 @@ mod paint;
 #[cfg(windows)]
 mod winshell;
 
-/// O que o utilizador pediu na linha de comandos. `/S` e o silencioso de
-/// sempre nos desinstaladores do Windows, e e o que a chave
-/// `QuietUninstallString` manda -- por isso tem de ser entendido.
+/// O que o utilizador pediu na linha de comandos: o que fazer, e se ha
+/// alguem a frente do ecra para carregar em botoes.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Launch {
+    mode: app::Mode,
+    quiet: bool,
+}
+
+/// `/S` e o silencioso de sempre nos desinstaladores do Windows, e e o que a
+/// chave `QuietUninstallString` manda (`winget uninstall --silent`, scripts):
+/// quem o corre espera que o processo acabe sozinho, sem janela.
+#[cfg(windows)]
+fn launch_from(args: &[String]) -> Launch {
+    let quiet = args.iter().any(|arg| {
+        let arg = arg.trim_start_matches(['-', '/']).to_ascii_lowercase();
+        arg == "s" || arg == "silent" || arg == "quiet"
+    });
+    Launch {
+        mode: mode_from(args),
+        quiet,
+    }
+}
+
 #[cfg(windows)]
 fn mode_from(args: &[String]) -> app::Mode {
     let wants_removal = args.iter().any(|arg| {
@@ -38,7 +59,11 @@ fn mode_from(args: &[String]) -> app::Mode {
 #[cfg(windows)]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    app::run(mode_from(&args));
+    let launch = launch_from(&args);
+    if launch.quiet {
+        std::process::exit(app::run_quiet(launch.mode));
+    }
+    app::run(launch.mode);
 }
 
 #[cfg(not(windows))]
@@ -75,6 +100,34 @@ mod tests {
                 mode_from(&args),
                 app::Mode::Install,
                 "{args:?} devia instalar"
+            );
+        }
+    }
+
+    #[test]
+    fn the_silent_flag_runs_without_a_window() {
+        // `winget uninstall --silent` e os scripts esperam que o processo
+        // acabe sozinho; uma janela a espera de um clique pendura-os.
+        for flag in ["/S", "/s", "-silent", "--quiet", "/QUIET"] {
+            let args = vec!["--uninstall".to_string(), flag.to_string()];
+            assert_eq!(
+                launch_from(&args),
+                Launch {
+                    mode: app::Mode::Uninstall,
+                    quiet: true
+                },
+                "{args:?} devia desinstalar sem janela"
+            );
+        }
+        // E o comando que o registo manda para o modo silencioso.
+        let (normal, quiet) =
+            winshell::uninstall_commands(std::path::Path::new(r"C:\x\Desinstalar NeuralIA.exe"));
+        assert!(launch_from(&argv_after_exe(&quiet)).quiet);
+        assert!(!launch_from(&argv_after_exe(&normal)).quiet);
+        for args in [vec!["--uninstall".to_string()], vec![]] {
+            assert!(
+                !launch_from(&args).quiet,
+                "{args:?} tem uma pessoa a frente do ecra"
             );
         }
     }

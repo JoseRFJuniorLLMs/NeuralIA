@@ -292,6 +292,24 @@ fn uninstall_with(
     Ok(())
 }
 
+/// O modo silencioso (`/S`): o mesmo trabalho que o botao faria, sem janela, e
+/// o resultado no codigo de saida -- 0 correu bem, 1 nao. Quem o corre (um
+/// script, o `winget --silent`) nao tem ecra onde carregar num botao.
+pub fn run_quiet(mode: Mode) -> i32 {
+    winshell::init_com();
+    let setup = Setup::new(mode);
+    let plan = Plan {
+        root: setup.root.clone(),
+        entries: setup.entries.clone(),
+        desktop_shortcut: setup.desktop_shortcut,
+    };
+    let result = match mode {
+        Mode::Install => do_install(&plan, &setup.shared),
+        Mode::Uninstall => do_uninstall(&plan, &setup.shared),
+    };
+    if result.is_ok() { 0 } else { 1 }
+}
+
 pub fn run(mode: Mode) {
     unsafe {
         winshell::init_com();
