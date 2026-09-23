@@ -53,10 +53,11 @@ use windows_sys::Win32::{
             ES_AUTOHSCROLL, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
             GetForegroundWindow, GetParent, GetWindowTextLengthW, GetWindowTextW,
             GetWindowThreadProcessId, IDYES, IsZoomed, MB_ICONINFORMATION, MB_OK, MB_YESNO,
-            MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
-            SendMessageW, SetParent, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD,
-            TPM_RIGHTBUTTON, TrackPopupMenu, WM_CANCELMODE, WM_CAPTURECHANGED, WM_KEYDOWN,
-            WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+            MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
+            SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetParent, SetWindowPos, SetWindowTextW,
+            ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_CANCELMODE,
+            WM_CAPTURECHANGED, WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+            WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -1868,6 +1869,36 @@ unsafe extern "system" fn gmail_toast_subclass(
         return 0;
     }
     DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+// Popups auxiliares owned pela janela principal -- divisores do comparador,
+// botao de saida, splash e aviso do Gmail. Nascem invisiveis: WS_VISIBLE no
+// CreateWindowExW mostra-os com SW_SHOW, que os ativa.
+const AUX_POPUP_EX_STYLE: u32 = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+const AUX_POPUP_STYLE: u32 = WS_POPUP;
+
+/// Mostra um popup auxiliar SEM lhe dar a ativacao. `SW_SHOW` ativa a janela
+/// mesmo com `WS_EX_NOACTIVATE` (a flag so trava a ativacao pelo clique), e
+/// `on_focus_changed` volta a mostrar divisores e botao de saida sempre que a
+/// janela ganha foco. Resultado na 2.1.5: cada clique numa pagina devolvia a
+/// ativacao a um divisor, que depois ficava escondido e ATIVO -- a pagina
+/// nunca tinha foco: links sem efeito, nenhum cursor de texto, teclado no
+/// vazio. So a roda, que vai para a janela debaixo do cursor, funcionava.
+/// Canto do splash (pergunta da rolagem automatica e afins) relativo ao
+/// cliente: centrado nos dois eixos. Ficava a 48 px do fundo, e ao arrancar
+/// lia-se como um rodape perdido por baixo das colunas. Nunca sai pelo topo
+/// nem pela esquerda numa janela mais pequena do que ele.
+fn splash_origin(client_w: i32, client_h: i32, width: i32, height: i32) -> (i32, i32) {
+    (
+        ((client_w - width) / 2).max(0),
+        ((client_h - height) / 2).max(0),
+    )
+}
+
+fn show_popup_without_activation(hwnd: HWND) {
+    unsafe {
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
 }
 
 unsafe extern "system" fn comparator_splitter_subclass(
@@ -5623,10 +5654,10 @@ impl App {
                 // punha este aviso por cima de TODAS as aplicacoes depois de
                 // um Alt+Tab, que nunca foi o que se queria.
                 let created = CreateWindowExW(
-                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    AUX_POPUP_EX_STYLE,
                     windows_sys::w!("STATIC"),
                     windows_sys::w!(""),
-                    WS_POPUP | WS_VISIBLE,
+                    AUX_POPUP_STYLE,
                     0,
                     0,
                     width,
@@ -5687,16 +5718,17 @@ impl App {
             }
             let mut origin = POINT { x: 0, y: 0 };
             ClientToScreen(owner, &mut origin);
+            let (x, y) = splash_origin(client.right, client.bottom, width, height);
             SetWindowPos(
                 splash,
                 std::ptr::null_mut(),
-                origin.x + (client.right - width) / 2,
-                origin.y + client.bottom - height - (48.0 * scale) as i32,
+                origin.x + x,
+                origin.y + y,
                 width,
                 height,
                 SWP_NOACTIVATE,
             );
-            ShowWindow(splash, SW_SHOW);
+            show_popup_without_activation(splash);
             InvalidateRect(splash, std::ptr::null(), 1);
         }
     }
@@ -5744,10 +5776,10 @@ impl App {
                 // trabalho -- um aviso de email nosso nao tem nada que tapar a
                 // aplicacao de outra pessoa.
                 let created = CreateWindowExW(
-                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    AUX_POPUP_EX_STYLE,
                     windows_sys::w!("STATIC"),
                     windows_sys::w!(""),
-                    WS_POPUP | WS_VISIBLE,
+                    AUX_POPUP_STYLE,
                     0,
                     0,
                     width,
@@ -5817,7 +5849,7 @@ impl App {
                 height,
                 SWP_NOACTIVATE,
             );
-            ShowWindow(toast, SW_SHOW);
+            show_popup_without_activation(toast);
             InvalidateRect(toast, std::ptr::null(), 1);
         }
     }
@@ -6538,10 +6570,10 @@ impl App {
                 // dele; o TOPMOST so acrescentava ficar por cima das outras
                 // aplicacoes depois de um Alt+Tab.
                 let created = CreateWindowExW(
-                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    AUX_POPUP_EX_STYLE,
                     windows_sys::w!("STATIC"),
                     windows_sys::w!(""),
-                    WS_POPUP | WS_VISIBLE,
+                    AUX_POPUP_STYLE,
                     0,
                     0,
                     width,
@@ -6606,7 +6638,7 @@ impl App {
                 height,
                 SWP_NOACTIVATE,
             );
-            ShowWindow(button, SW_SHOW);
+            show_popup_without_activation(button);
         }
     }
 
@@ -6696,10 +6728,10 @@ impl App {
                     // de trabalho inteiro. Um divisor a flutuar por cima de
                     // outra aplicacao era o que o TOPMOST daqui fazia.
                     let created = CreateWindowExW(
-                        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                        AUX_POPUP_EX_STYLE,
                         windows_sys::w!("STATIC"),
                         windows_sys::w!(""),
-                        WS_POPUP | WS_VISIBLE,
+                        AUX_POPUP_STYLE,
                         0,
                         0,
                         width,
@@ -6744,7 +6776,7 @@ impl App {
                     height,
                     SWP_NOACTIVATE,
                 );
-                ShowWindow(hwnd, SW_SHOW);
+                show_popup_without_activation(hwnd);
                 InvalidateRect(hwnd, std::ptr::null(), 1);
             }
         }
@@ -10438,6 +10470,194 @@ mod tests {
                 "o divisor devolveu {hit} (HTTRANSPARENT e -1): o rato atravessa-o"
             );
         }
+    }
+
+    #[test]
+    fn auxiliary_popups_never_steal_activation_from_the_main_window() {
+        // Regressao 2.1.5: on_focus_changed volta a mostrar divisores e botao
+        // de saida a cada foco, e SW_SHOW ativava-os apesar de
+        // WS_EX_NOACTIVATE. A pagina clicada perdia o foco para um divisor
+        // escondido: cliques sem efeito, sem cursor, teclado no vazio.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, SetActiveWindow};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindowVisible, WS_OVERLAPPEDWINDOW};
+        unsafe {
+            let owner = CreateWindowExW(
+                0,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!("NeuralIA dono"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                0,
+                0,
+                320,
+                240,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!owner.is_null(), "a janela dona tem de nascer");
+            SetActiveWindow(owner);
+            assert_eq!(
+                GetActiveWindow(),
+                owner,
+                "pre-condicao: o dono e a janela ativa"
+            );
+
+            // A mesma receita de criacao que o produto usa nos quatro popups.
+            let popup = CreateWindowExW(
+                AUX_POPUP_EX_STYLE,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!(""),
+                AUX_POPUP_STYLE,
+                0,
+                0,
+                7,
+                100,
+                owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!popup.is_null(), "o popup auxiliar tem de nascer");
+            let after_create = GetActiveWindow();
+
+            // Cada ganho de foco da janela volta a mostrar o popup.
+            let mut stolen_on_show = None;
+            for cycle in 0..3 {
+                show_popup_without_activation(popup);
+                if GetActiveWindow() != owner && stolen_on_show.is_none() {
+                    stolen_on_show = Some(cycle);
+                }
+            }
+            let visible = IsWindowVisible(popup) != 0;
+            DestroyWindow(popup);
+            DestroyWindow(owner);
+
+            assert_eq!(
+                after_create, owner,
+                "criar o popup roubou a ativacao ao dono"
+            );
+            assert_eq!(
+                stolen_on_show, None,
+                "mostrar o popup roubou a ativacao ao dono no ciclo {stolen_on_show:?}"
+            );
+            assert!(visible, "o popup tem de ficar visivel depois de mostrado");
+        }
+    }
+
+    #[test]
+    fn small_button_glyphs_draw_on_the_pill_not_on_a_white_box() {
+        // Regressao 2.1.5: o botao Home e os botoes -/□/x pintam num DC de
+        // BeginPaint, que nasce OPAQUE com fundo branco -- o texto saia num
+        // quadrado branco. E o "+" dos botoes redondos virava "-." porque a
+        // margem de 11 px deixava ~10 px de texto e o DT_END_ELLIPSIS cortava.
+        use windows_sys::Win32::Graphics::Gdi::{
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC,
+            DIB_RGB_COLORS, DeleteDC, GetDC, RGBQUAD, ReleaseDC,
+        };
+        // O botao "+" tal como a barra real o calcula (26x26 a escala 1).
+        let plus =
+            BarLayout::with_contexts(1440.0, 1.0, true, BarColumns::even(3), [0, 0, 0]).add_tabs[0];
+        let (width, height) = (plus.width.round() as i32, plus.height.round() as i32);
+        assert!(width > 0 && height > 0, "a barra tem de ter o botao \"+\"");
+        let mut theme = Theme::dark((0, 120, 215));
+        // Texto vermelho: distinguivel do fundo escuro e do branco do bug.
+        theme.fg = (220, 30, 30);
+        unsafe {
+            let screen = GetDC(std::ptr::null_mut());
+            let mem = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, width, height);
+            ReleaseDC(std::ptr::null_mut(), screen);
+            assert!(!mem.is_null() && !bitmap.is_null());
+            let old = SelectObject(mem, bitmap as _);
+            let font = create_font(-13, FW_NORMAL as i32);
+            draw_button(
+                mem,
+                UiRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: width as f64,
+                    height: height as f64,
+                },
+                "+",
+                false,
+                1.0,
+                font,
+                &theme,
+            );
+            let mut info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    biSizeImage: (width * height * 4) as u32,
+                    biXPelsPerMeter: 0,
+                    biYPelsPerMeter: 0,
+                    biClrUsed: 0,
+                    biClrImportant: 0,
+                },
+                bmiColors: [RGBQUAD {
+                    rgbBlue: 0,
+                    rgbGreen: 0,
+                    rgbRed: 0,
+                    rgbReserved: 0,
+                }; 1],
+            };
+            let mut pixels = vec![0u8; (width * height * 4) as usize];
+            let read = GetDIBits(
+                mem,
+                bitmap,
+                0,
+                height as u32,
+                pixels.as_mut_ptr() as _,
+                &mut info,
+                DIB_RGB_COLORS,
+            );
+            SelectObject(mem, old);
+            DeleteObject(font as _);
+            DeleteObject(bitmap as _);
+            DeleteDC(mem);
+            assert_eq!(read, height, "GetDIBits tem de ler o botao inteiro");
+
+            let at = |x: i32, y: i32| {
+                let i = ((y * width + x) * 4) as usize;
+                (pixels[i + 2], pixels[i + 1], pixels[i]) // BGRA -> RGB
+            };
+            let white = (0..height)
+                .flat_map(|y| (0..width).map(move |x| (x, y)))
+                .filter(|&(x, y)| at(x, y) == (255, 255, 255))
+                .count();
+            assert_eq!(
+                white, 0,
+                "{white} pixels brancos: o texto pintou o seu fundo opaco"
+            );
+
+            // O "+" tem traco vertical: tinta vermelha acima E abaixo do centro.
+            let red = |x: i32, y: i32| {
+                let (r, g, _) = at(x, y);
+                r > 110 && r as i32 > g as i32 + 50
+            };
+            let column = |ys: std::ops::Range<i32>| {
+                ys.into_iter()
+                    .any(|y| (width / 2 - 2..=width / 2 + 2).any(|x| red(x, y)))
+            };
+            let mid = height / 2;
+            assert!(
+                column(mid - 6..mid - 1) && column(mid + 2..mid + 7),
+                "sem traco vertical no centro: o \"+\" foi cortado em reticencias"
+            );
+        }
+    }
+
+    #[test]
+    fn the_splash_question_opens_in_the_center_of_the_window() {
+        // Janela 1440x900, splash 400x120: centro exacto, nao o rodape.
+        assert_eq!(splash_origin(1440, 900, 400, 120), (520, 390));
+        // Janela mais pequena do que o splash: encosta ao canto, nao foge.
+        assert_eq!(splash_origin(300, 100, 400, 120), (0, 0));
     }
 
     #[test]
@@ -14163,6 +14383,7 @@ unsafe fn draw_pill(
 
     let padding = 11.0 * scale;
     let mut text_left = rect.x + padding;
+    let mut text_right = rect.x + rect.width - padding * 0.6;
     let mut format = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
 
     match style.icon {
@@ -14180,15 +14401,26 @@ unsafe fn draw_pill(
             );
             text_left += size as f64 + 8.0 * scale;
         }
-        None => format |= DT_CENTER,
+        // Texto centrado usa a pilula inteira. Com a margem de 11 px dos dois
+        // lados, um botao redondo de ~30 px ficava com ~10 px para o "+" e o
+        // DT_END_ELLIPSIS desenhava "-." no lugar dele.
+        None => {
+            text_left = rect.x;
+            text_right = rect.x + rect.width;
+            format |= DT_CENTER;
+        }
     }
 
     SelectObject(hdc, font as _);
     SetTextColor(hdc, rgb3(style.text));
+    // O DC de um BeginPaint nasce OPAQUE com fundo branco. Quem chamava sem
+    // SetBkMode (botao Home, botoes -/□/x) pintava o texto num rectangulo
+    // branco por cima da pilula -- os "icones" viravam quadrados brancos.
+    SetBkMode(hdc, TRANSPARENT as i32);
     let mut text_rect = RECT {
         left: text_left.round() as i32,
         top: rect.y as i32,
-        right: (rect.x + rect.width - padding * 0.6) as i32,
+        right: text_right as i32,
         bottom: (rect.y + rect.height) as i32,
     };
     draw_text(hdc, label, &mut text_rect, format);
