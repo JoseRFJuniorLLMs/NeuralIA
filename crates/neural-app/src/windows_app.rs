@@ -7378,15 +7378,10 @@ impl App {
         };
         let fingerprint =
             tab_session_fingerprint(&comp.contexts, &comp.groups, comparator_split_key(comp));
-        if self.tab_session.seen == Some(fingerprint) {
-            return;
+        if let Some(token) = self.tab_session.observe(fingerprint) {
+            self.timers
+                .after(TAB_SESSION_DEBOUNCE, UserEvent::SaveTabSession(token));
         }
-        self.tab_session.seen = Some(fingerprint);
-        self.tab_session.token = self.tab_session.token.wrapping_add(1);
-        self.timers.after(
-            TAB_SESSION_DEBOUNCE,
-            UserEvent::SaveTabSession(self.tab_session.token),
-        );
     }
 
     /// Grava ja, se o disco estiver atrasado em relacao a barra. Corre no fim
@@ -11592,6 +11587,21 @@ struct TabSessionSync {
     seen: Option<u64>,
     /// Impressao digital do que esta no disco.
     saved: Option<u64>,
+}
+
+impl TabSessionSync {
+    /// O modelo depois de um lote de eventos. Se mudou desde a ultima vez,
+    /// devolve o bilhete da gravacao a agendar (o anterior deixa de valer);
+    /// se nao mudou, nada. Um arrasto so muda o modelo ao largar -- a meio,
+    /// a barra desenha uma copia --, e por isso so o largar agenda.
+    fn observe(&mut self, fingerprint: u64) -> Option<u64> {
+        if self.seen == Some(fingerprint) {
+            return None;
+        }
+        self.seen = Some(fingerprint);
+        self.token = self.token.wrapping_add(1);
+        Some(self.token)
+    }
 }
 
 /// A aba aberta ao lado, tal como a gravacao a ve: (coluna, aba). `split` e
@@ -18685,6 +18695,14 @@ __fire('submit', at(login));
         let destroy = body("fn destroy_web_surfaces", "self.comparator.take()");
         assert!(destroy.contains("self.save_tab_session()"));
 
+        // Depois de cada lote de eventos o modelo e observado: e so por aqui
+        // que um arrasto largado, o x e o menu do grupo agendam a gravacao
+        // (o comportamento esta em a_dropped_tab_drag_is_saved_and_an_unfinished_one_never_is).
+        let wait = body("fn about_to_wait", "fn exiting");
+        assert!(wait.contains("self.observe_tab_session();"));
+        let observe = body("fn observe_tab_session", "fn save_tab_session");
+        assert!(observe.contains("self.tab_session.observe(fingerprint)"));
+
         // As duas entradas do comparador passam pelo mesmo modelo.
         let open = body("fn open_comparator", "fn tab_session_path");
         let (reuse, fresh) = open
@@ -21820,6 +21838,282 @@ __fire('keydown', { key: 'F8' });
             "o largar que vem depois ja nao encontra nada"
         );
         assert_eq!(rig.order(), before);
+    }
+
+    // ---------- a barra (tabs-ui) contra a gravacao das abas (tabs-persist) ----------
+
+    /// Pasta temporaria so deste teste.
+    fn integration_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "neuralia-tabs-integration-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("pasta temporaria");
+        dir
+    }
+
+    /// A coluna como a barra a mostra, sem as identidades (que o arranque
+    /// renumera): url e (nome, cor, recolhido) do grupo de cada aba.
+    type SavedRow = Vec<(String, Option<(String, GroupColor, bool)>)>;
+
+    fn saved_row(tabs: &[ContextTab], groups: &[ContextGroup]) -> SavedRow {
+        tabs.iter()
+            .map(|tab| {
+                let group = tab.group.map(|id| {
+                    let group = groups
+                        .iter()
+                        .find(|group| group.id == id)
+                        .expect("aba num grupo que existe");
+                    (group.name.clone(), group.color, group.collapsed)
+                });
+                (tab.url.clone(), group)
+            })
+            .collect()
+    }
+
+    /// O que o `SaveTabSession` grava e o que o proximo arranque le de volta:
+    /// `snapshot_tab_session` -> `tabs.json` -> `restore_tab_session`.
+    fn save_and_restart(
+        path: &std::path::Path,
+        contexts: &[Vec<ContextTab>; COMPARATOR_COLUMNS],
+        groups: &[Vec<ContextGroup>; COMPARATOR_COLUMNS],
+        split: Option<(usize, Option<u64>, bool)>,
+    ) -> RestoredTabs {
+        tab_session::save(path, &snapshot_tab_session(contexts, groups, split)).expect("gravar");
+        match tab_session::load(path) {
+            Loaded::Restored(session) => restore_tab_session(&session),
+            other => panic!("o tabs.json gravado nao volta: {other:?}"),
+        }
+    }
+
+    /// O arrasto so muda o modelo ao largar, e a gravacao das abas so olha
+    /// para o modelo (`observe_tab_session`, depois de cada lote de eventos).
+    /// Por isso: a meio do arrasto -- com a barra ja a mostrar a fila
+    /// reordenada -- nada se agenda; ao largar, agenda-se uma gravacao, e o
+    /// que o proximo arranque le e a fila largada, com o grupo, a cor e o
+    /// recolhido. Esc e largar fora da fila nao agendam nada.
+    #[test]
+    fn a_dropped_tab_drag_is_saved_and_an_unfinished_one_never_is() {
+        // Tres abas: a barra mostra no maximo tres por coluna.
+        let (a, c, d) = (
+            "https://a.example/",
+            "https://c.example/",
+            "https://d.example/",
+        );
+        let mut rig = DragRig::new(
+            vec![tab(a, Some(1)), tab(c, None), tab(d, None)],
+            vec![ContextGroup {
+                id: 1,
+                name: "Pesquisa".to_string(),
+                color: GroupColor::Pink,
+                collapsed: false,
+            }],
+            1.0,
+        );
+        let fingerprint = |rig: &DragRig| tab_session_fingerprint(&rig.contexts, &rig.groups, None);
+        // O comparador acabou de abrir: o disco ja tem o que a barra mostra.
+        let mut sync = TabSessionSync {
+            seen: Some(fingerprint(&rig)),
+            saved: Some(fingerprint(&rig)),
+            ..TabSessionSync::default()
+        };
+        let pink = Some(("Pesquisa".to_string(), GroupColor::Pink, false));
+        let dir = integration_dir("drag");
+        let path = tab_session::path_in(&dir);
+
+        // 1. D, solta, levada para antes de C, solta: so a ordem muda.
+        let origin = center_of(rig.tab_rect(d));
+        let y = origin.1;
+        let mut press = rig.press(origin, 1);
+        assert_eq!(sync.observe(fingerprint(&rig)), None, "premir nao grava");
+        assert_eq!(
+            rig.drag_to(&mut press, (origin.0 - 6.0, y)),
+            TabGestureEffect::Started
+        );
+        assert_eq!(sync.observe(fingerprint(&rig)), None, "arrancar nao grava");
+        let c_rect = rig.tab_rect(c);
+        let over_c = (c_rect.x + c_rect.width * 0.25, y);
+        let effect = rig.drag_to(&mut press, over_c);
+        assert_eq!(
+            sync.observe(fingerprint(&rig)),
+            None,
+            "a meio do arrasto o modelo nao mudou: nada se agenda"
+        );
+        assert_eq!(effect, TabGestureEffect::Moved);
+        let shown = rig.shown(rig.paint(press, over_c).expect("a arrastar"));
+        assert_eq!(shown, row(&[(a, Some(1)), (d, None), (c, None)]));
+        assert!(matches!(
+            rig.release(&mut press, over_c),
+            TabGestureEffect::Drop { .. }
+        ));
+        assert_eq!(rig.order(), shown);
+        let token = sync
+            .observe(fingerprint(&rig))
+            .expect("largar tem de agendar a gravacao");
+        assert_eq!(
+            sync.observe(fingerprint(&rig)),
+            None,
+            "uma gravacao por mudanca"
+        );
+        assert_eq!(token, sync.token, "e o bilhete que o atraso vai apresentar");
+        let restored = save_and_restart(&path, &rig.contexts, &rig.groups, None);
+        assert_eq!(
+            saved_row(&restored.contexts[0], &restored.groups[0]),
+            vec![
+                (a.to_string(), pink.clone()),
+                (d.to_string(), None),
+                (c.to_string(), None),
+            ],
+            "o arranque seguinte ve a fila largada"
+        );
+
+        // 2. Esc a meio do arrasto: a fila fica, nada a gravar.
+        let a_rect = rig.tab_rect(a);
+        let into_group = (a_rect.x + a_rect.width * 0.75, y);
+        let origin = center_of(rig.tab_rect(c));
+        let mut press = rig.press(origin, 2);
+        rig.drag_to(&mut press, (origin.0 - 6.0, y));
+        rig.drag_to(&mut press, into_group);
+        assert_eq!(
+            rig.step(&mut press, TabGestureInput::Escape),
+            TabGestureEffect::Cancelled { was_dragging: true }
+        );
+        rig.release(&mut press, into_group);
+        assert_eq!(sync.observe(fingerprint(&rig)), None, "Esc nao grava");
+
+        // 3. Largar abaixo da fila: cancela, nada a gravar.
+        let mut press = rig.press(origin, 3);
+        rig.drag_to(&mut press, (origin.0 - 6.0, y));
+        assert!(matches!(
+            rig.release(&mut press, (origin.0, 200.0)),
+            TabGestureEffect::Cancelled { .. }
+        ));
+        assert_eq!(
+            sync.observe(fingerprint(&rig)),
+            None,
+            "largar fora nao grava"
+        );
+
+        // 4. C largada na metade direita de A: entra no grupo, e e isso que
+        // volta do disco -- no lugar, com a cor do grupo.
+        let mut press = rig.press(origin, 4);
+        rig.drag_to(&mut press, (origin.0 - 6.0, y));
+        rig.drag_to(&mut press, into_group);
+        assert!(matches!(
+            rig.release(&mut press, into_group),
+            TabGestureEffect::Drop { .. }
+        ));
+        assert!(
+            sync.observe(fingerprint(&rig)).is_some(),
+            "entrar num grupo tem de agendar a gravacao"
+        );
+        let restored = save_and_restart(&path, &rig.contexts, &rig.groups, None);
+        assert_eq!(
+            saved_row(&restored.contexts[0], &restored.groups[0]),
+            vec![
+                (a.to_string(), pink.clone()),
+                (c.to_string(), pink.clone()),
+                (d.to_string(), None),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Um link aberto a partir de uma aba agrupada nasce no grupo dela
+    /// (tabs-ui) tambem pelo caminho que a gravacao conhece
+    /// (`record_split_context`, tabs-persist); uma fonte privada nunca vira
+    /// aba, nem com um opener agrupado. A cor e o recolhido escolhidos no
+    /// menu do grupo agendam a gravacao e voltam do disco, com a aba aberta
+    /// ao lado marcada como a ativa.
+    #[test]
+    fn a_link_from_a_grouped_tab_and_the_group_menu_reach_the_saved_tabs() {
+        let mut contexts: [Vec<ContextTab>; COMPARATOR_COLUMNS] =
+            std::array::from_fn(|_| Vec::new());
+        let mut groups: [Vec<ContextGroup>; COMPARATOR_COLUMNS] =
+            std::array::from_fn(|_| Vec::new());
+        contexts[0] = vec![
+            tab("https://a.example/", Some(1)),
+            tab("https://b.example/", Some(1)),
+            tab("https://c.example/", None),
+        ];
+        groups[0] = vec![ContextGroup {
+            id: 1,
+            name: "Pesquisa".to_string(),
+            color: GroupColor::Pink,
+            collapsed: false,
+        }];
+        let mut next_context_id = 9_000;
+        let opener = contexts[0][0].id;
+        let mut sync = TabSessionSync {
+            seen: Some(tab_session_fingerprint(&contexts, &groups, None)),
+            ..TabSessionSync::default()
+        };
+
+        let opened = record_split_context(
+            &mut contexts[0],
+            &mut groups[0],
+            &mut next_context_id,
+            "https://novo.example/".to_string(),
+            false,
+            None,
+            Some(opener),
+        )
+        .expect("uma fonte publica vira aba");
+        let split = Some((0, Some(opened), false));
+        assert!(
+            sync.observe(tab_session_fingerprint(&contexts, &groups, split))
+                .is_some()
+        );
+
+        let private = record_split_context(
+            &mut contexts[0],
+            &mut groups[0],
+            &mut next_context_id,
+            "https://secreto.example/".to_string(),
+            true,
+            None,
+            Some(opener),
+        );
+        assert_eq!(private, None, "uma fonte privada nunca vira aba");
+        assert_eq!(
+            sync.observe(tab_session_fingerprint(&contexts, &groups, split)),
+            None,
+            "e nao ha nada a gravar"
+        );
+
+        for command in [
+            GroupMenuCommand::Color(GroupColor::Green),
+            GroupMenuCommand::ToggleCollapsed,
+        ] {
+            let closed = apply_group_command(&mut contexts[0], &mut groups[0], 1, command);
+            assert!(closed.is_empty());
+            assert!(
+                sync.observe(tab_session_fingerprint(&contexts, &groups, split))
+                    .is_some(),
+                "{command:?} tem de agendar a gravacao"
+            );
+        }
+
+        let dir = integration_dir("group-menu");
+        let restored = save_and_restart(&tab_session::path_in(&dir), &contexts, &groups, split);
+        let green = Some(("Pesquisa".to_string(), GroupColor::Green, true));
+        assert_eq!(
+            saved_row(&restored.contexts[0], &restored.groups[0]),
+            vec![
+                ("https://a.example/".to_string(), green.clone()),
+                ("https://b.example/".to_string(), green.clone()),
+                ("https://novo.example/".to_string(), green.clone()),
+                ("https://c.example/".to_string(), None),
+            ],
+            "o link nasce no fim do grupo de quem o abriu; o grupo volta com a cor e recolhido"
+        );
+        assert_eq!(
+            restored.active[0],
+            Some(restored.contexts[0][2].id),
+            "a aba aberta ao lado e a que volta marcada"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Largar fora da fila da coluna -- abaixo das abas, antes do inicio ou
