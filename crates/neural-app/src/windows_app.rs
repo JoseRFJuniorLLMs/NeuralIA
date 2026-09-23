@@ -92,6 +92,9 @@ enum UserEvent {
     HomeRequested,
     /// Voltar um nivel: de ecra completo para tres colunas, de la para a Home.
     BackRequested,
+    /// Outra janela ficou com o rato a meio do gesto numero N na fila de
+    /// abas (WM_CAPTURECHANGED): o arrasto desse gesto cancela-se.
+    TabCaptureLost(u64),
     ToggleAutoScroll,
     AutoScrollAnswer(bool),
     ZoomIn,
@@ -1906,13 +1909,6 @@ enum DropSpot {
     },
 }
 
-/// O sitio onde largar e o x do marcador que o mostra enquanto se arrasta.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct DropPlan {
-    spot: DropSpot,
-    marker_x: f64,
-}
-
 /// Um lugar da fila de uma coluna tal como esta desenhado.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct RowItem {
@@ -1931,41 +1927,54 @@ enum RowKind {
     },
 }
 
-/// Quanto o rato anda com o botao em baixo antes de o gesto deixar de ser um
-/// clique e passar a ser um arrasto (pixeis logicos).
-const DRAG_THRESHOLD: f64 = 6.0;
+/// Quanto o rato tem de andar com o botao em baixo, PARA ALEM disto, antes de
+/// o gesto deixar de ser um clique e passar a ser um arrasto (pixeis
+/// logicos). Ate 4 px e a mao a tremer num clique.
+const DRAG_THRESHOLD: f64 = 4.0;
 /// Folga, alem das pontas da fila da coluna, onde ainda se pode largar.
 const DROP_MARGIN: f64 = 24.0;
 
 fn drag_started(origin: (f64, f64), now: (f64, f64), scale: f64) -> bool {
     let limit = DRAG_THRESHOLD * scale.max(1.0);
-    (now.0 - origin.0).abs() >= limit || (now.1 - origin.1).abs() >= limit
+    (now.0 - origin.0).abs() > limit || (now.1 - origin.1).abs() > limit
 }
 
-/// Onde cai o que se arrasta com o rato em `cursor`. `None`: largar ali nao
-/// muda nada -- em cima de si proprio, ou fora da fila da coluna (as abas sao
-/// da IA desta coluna e nao mudam de IA).
-///
-/// Regras, como no Chrome: entre dois membros de um grupo, ou sobre a metade
-/// direita de um membro ou da pilula aberta, a aba entra no grupo; antes de
-/// uma pilula ou sobre uma aba solta, fica solta. Um grupo nunca cai no meio
-/// de outro: encosta-se ao lado mais proximo.
-fn plan_drop(
-    layout: &BarLayout,
-    column: usize,
+/// Se o lugar `kind` da fila e o que se arrasta: a propria aba, ou a pilula e
+/// os membros do grupo arrastado.
+fn row_item_is_dragged(
+    kind: RowKind,
+    item: DragItem,
     tabs: &[ContextTab],
     groups: &[ContextGroup],
-    item: DragItem,
-    cursor: (f64, f64),
-    scale: f64,
-) -> Option<DropPlan> {
+) -> bool {
+    let group_id = |index: usize| groups.get(index).map(|group| group.id);
+    match (item, kind) {
+        (DragItem::Tab(id), RowKind::Tab { context, .. }) => {
+            tabs.get(context).is_some_and(|tab| tab.id == id)
+        }
+        (DragItem::Group(id), RowKind::Chip(group))
+        | (
+            DragItem::Group(id),
+            RowKind::Tab {
+                owner: Some(group), ..
+            },
+        ) => group_id(group) == Some(id),
+        _ => false,
+    }
+}
+
+/// A faixa onde largar ainda e largar na fila da coluna: a propria fila, com
+/// uma folga nas pontas e por baixo das abas. A folga nunca invade a fila de
+/// outra IA -- as abas sao da IA desta coluna e nao mudam de IA. Fora daqui,
+/// largar cancela o arrasto.
+fn in_drop_zone(layout: &BarLayout, column: usize, cursor: (f64, f64), scale: f64) -> bool {
     let scale = scale.max(1.0);
     let items = layout.row_items(column);
-    let (first, last) = (items.first()?, items.last()?);
+    let (Some(first), Some(last)) = (items.first(), items.last()) else {
+        return false;
+    };
     let (x, y) = cursor;
     let margin = DROP_MARGIN * scale;
-    // A folga nas pontas nunca invade a fila de outra IA: por cima de uma aba
-    // da coluna vizinha nao se larga nada nesta.
     let mut low = first.rect.x - margin;
     let mut high = last.rect.x + last.rect.width + margin;
     if let Some(previous) = (0..column)
@@ -1979,24 +1988,36 @@ fn plan_drop(
     {
         high = high.min(next.rect.x);
     }
-    if y < 0.0 || y > first.rect.y + first.rect.height + margin || x < low || x >= high {
+    y >= 0.0 && y <= first.rect.y + first.rect.height + margin && x >= low && x < high
+}
+
+/// Onde cai o que se arrasta com o rato em `cursor`, contado contra a fila
+/// tal como esta desenhada ANTES do arrasto (o modelo so muda ao largar, por
+/// isso esta conta nao anda aos saltos com a pre-visualizacao). `None`:
+/// largar ali nao muda nada -- em cima de si proprio, ou fora da faixa da
+/// coluna (`in_drop_zone`).
+///
+/// Regras, como no Chrome: entre dois membros de um grupo, ou sobre a metade
+/// direita de um membro ou da pilula aberta, a aba entra no grupo; antes de
+/// uma pilula, depois do ultimo membro ou sobre uma aba solta, fica solta --
+/// e uma aba de um grupo levada para fora do troco sai dele. Um grupo nunca
+/// cai no meio de outro: encosta-se ao lado mais proximo.
+fn plan_drop(
+    layout: &BarLayout,
+    column: usize,
+    tabs: &[ContextTab],
+    groups: &[ContextGroup],
+    item: DragItem,
+    cursor: (f64, f64),
+    scale: f64,
+) -> Option<DropSpot> {
+    if !in_drop_zone(layout, column, cursor, scale) {
         return None;
     }
-
+    let items = layout.row_items(column);
+    let x = cursor.0;
     let group_id = |index: usize| groups.get(index).map(|group| group.id);
-    let own = |kind: RowKind| match (item, kind) {
-        (DragItem::Tab(id), RowKind::Tab { context, .. }) => {
-            tabs.get(context).is_some_and(|tab| tab.id == id)
-        }
-        (DragItem::Group(id), RowKind::Chip(group))
-        | (
-            DragItem::Group(id),
-            RowKind::Tab {
-                owner: Some(group), ..
-            },
-        ) => group_id(group) == Some(id),
-        _ => false,
-    };
+    let own = |kind: RowKind| row_item_is_dragged(kind, item, tabs, groups);
     let mut own_span: Option<(f64, f64)> = None;
     for entry in items.iter().filter(|entry| own(entry.kind)) {
         let right = entry.rect.x + entry.rect.width;
@@ -2026,7 +2047,7 @@ fn plan_drop(
     let run = |group: usize| group_id(group).and_then(|id| group_run(tabs, id));
     let collapsed = |group: usize| groups.get(group).is_some_and(|group| group.collapsed);
 
-    let (spot, join) = match item {
+    Some(match item {
         DragItem::Tab(_) => {
             let (before, join) = match (attach_left, left, right) {
                 (true, Some(entry), _) => match entry.kind {
@@ -2042,13 +2063,10 @@ fn plan_drop(
                 },
                 _ => (None, None),
             };
-            (
-                DropSpot::Tab(TabDrop {
-                    before,
-                    group: join.and_then(group_id),
-                }),
-                join,
-            )
+            DropSpot::Tab(TabDrop {
+                before,
+                group: join.and_then(group_id),
+            })
         }
         DragItem::Group(_) => {
             let before = match (attach_left, left, right) {
@@ -2070,32 +2088,9 @@ fn plan_drop(
                 },
                 _ => None,
             };
-            (DropSpot::Group { before }, None)
+            DropSpot::Group { before }
         }
-    };
-
-    // O marcador fica antes do primeiro lugar da fila que vem depois do sitio
-    // de largada -- a pilula do grupo onde se entra conta como estando antes.
-    let before = match spot {
-        DropSpot::Tab(drop) => drop.before,
-        DropSpot::Group { before } => before,
-    };
-    let model_index = |entry: &RowItem| match entry.kind {
-        RowKind::Chip(group) => run(group).map_or(usize::MAX, |(start, _)| start),
-        RowKind::Tab { context, .. } => context,
-    };
-    let half_gap = 1.5 * scale;
-    let next = others.iter().find(|entry| {
-        before.is_some_and(|before| model_index(entry) >= before)
-            && !join.is_some_and(|group| entry.kind == RowKind::Chip(group))
-    });
-    let marker_x = match next {
-        Some(entry) => entry.rect.x - half_gap,
-        None => others
-            .last()
-            .map_or(x, |entry| entry.rect.x + entry.rect.width + half_gap),
-    };
-    Some(DropPlan { spot, marker_x })
+    })
 }
 
 /// Aplica a largada ao modelo da coluna. Devolve `false` se nada mudou de
@@ -2114,6 +2109,56 @@ fn apply_drop(
         (DragItem::Group(id), DropSpot::Group { before }) => move_context_group(tabs, id, before),
         _ => false,
     }
+}
+
+/// A fila da coluna como fica se o que se arrasta cair em `spot`: e o que a
+/// barra desenha a meio do arrasto, com as outras abas ja a abrir-lhe lugar.
+/// Sem sitio (fora da faixa, ou em cima de si proprio) e a fila de sempre.
+/// Trabalha numa copia: o modelo so muda ao largar, e por isso o Esc, a
+/// captura perdida e o largar fora da fila deixam tudo como estava sem ter
+/// de desfazer nada.
+fn drag_preview(
+    tabs: &[ContextTab],
+    groups: &[ContextGroup],
+    item: DragItem,
+    spot: Option<DropSpot>,
+) -> (Vec<ContextTab>, Vec<ContextGroup>) {
+    let mut tabs = tabs.to_vec();
+    let mut groups = groups.to_vec();
+    if let Some(spot) = spot {
+        let _ = apply_drop(&mut tabs, &mut groups, item, spot);
+    }
+    (tabs, groups)
+}
+
+/// Quanto o que se arrasta sai do seu lugar na fila desenhada (`layout` ja e
+/// a pre-visualizacao) para a borda esquerda ficar em `float_left` -- o rato
+/// menos o ponto por onde foi agarrado --, sem sair da fila da sua coluna.
+fn drag_float_offset(
+    layout: &BarLayout,
+    column: usize,
+    tabs: &[ContextTab],
+    groups: &[ContextGroup],
+    item: DragItem,
+    float_left: f64,
+) -> Option<f64> {
+    let items = layout.row_items(column);
+    let (first, last) = (items.first()?, items.last()?);
+    let mut block: Option<(f64, f64)> = None;
+    for entry in items
+        .iter()
+        .filter(|entry| row_item_is_dragged(entry.kind, item, tabs, groups))
+    {
+        let right = entry.rect.x + entry.rect.width;
+        block = Some(block.map_or((entry.rect.x, right), |(left, end)| {
+            (left.min(entry.rect.x), end.max(right))
+        }));
+    }
+    let (left, right) = block?;
+    let row_left = first.rect.x;
+    let row_right = last.rect.x + last.rect.width;
+    let wanted = float_left.clamp(row_left, (row_right - (right - left)).max(row_left));
+    Some(wanted - left)
 }
 
 /// Fecha a aba `index` da coluna (o x dela ou "Fechar aba" no menu) e poda o
@@ -2144,8 +2189,61 @@ struct TabPress {
     /// A coluna e o que se arrasta se o rato andar; `None` no x, que nao se
     /// arrasta (como no Chrome).
     drag: Option<(usize, DragItem)>,
+    /// Distancia do rato a borda esquerda do que foi premido (a aba, ou a
+    /// pilula do grupo): o arrastado segue o rato agarrado por este ponto.
+    anchor: f64,
+    /// Numero deste gesto (nunca 0). O subclass da janela so ve estaticos; e
+    /// por este numero que um WM_CAPTURECHANGED que chega atrasado se
+    /// reconhece como de um gesto que ja acabou.
+    gesture: u64,
     /// Ja passou o limiar: e um arrasto, ja nao e um clique.
     dragging: bool,
+}
+
+/// O premir do botao esquerdo em `origin`, sobre `hit` da barra `layout`.
+/// So abas, o x delas e as pilulas esperam pelo largar; o resto nao e um
+/// gesto da fila e responde logo.
+fn tab_press(
+    layout: &BarLayout,
+    contexts: &[Vec<ContextTab>; COMPARATOR_COLUMNS],
+    groups: &[Vec<ContextGroup>; COMPARATOR_COLUMNS],
+    hit: BarHit,
+    origin: (f64, f64),
+    gesture: u64,
+) -> Option<TabPress> {
+    let drag = match hit {
+        BarHit::ContextTab {
+            source_index,
+            context_index,
+        } => Some((
+            source_index,
+            DragItem::Tab(contexts.get(source_index)?.get(context_index)?.id),
+        )),
+        BarHit::ContextGroup {
+            source_index,
+            group_index,
+        } => Some((
+            source_index,
+            DragItem::Group(groups.get(source_index)?.get(group_index)?.id),
+        )),
+        BarHit::CloseTab { .. } => None,
+        _ => return None,
+    };
+    let anchor = drag
+        .and_then(|(column, item)| {
+            layout.row_items(column).into_iter().find(|entry| {
+                row_item_is_dragged(entry.kind, item, &contexts[column], &groups[column])
+            })
+        })
+        .map_or(0.0, |entry| origin.0 - entry.rect.x);
+    Some(TabPress {
+        origin,
+        hit,
+        drag,
+        anchor,
+        gesture,
+        dragging: false,
+    })
 }
 
 /// O que o largar do botao esquerdo faz depois de um `TabPress`.
@@ -2175,11 +2273,215 @@ fn tab_release(press: TabPress, released: Option<BarHit>) -> TabRelease {
     }
 }
 
-/// Esc a meio de um arrasto de aba ou grupo cancela o arrasto, como no
-/// Chrome, em vez de fazer o "voltar" de sempre -- que podia sair da coluna
-/// expandida ou ir para a Home com o botao ainda em baixo.
-fn escape_cancels_tab_drag(press: Option<TabPress>) -> bool {
-    press.is_some_and(|press| press.dragging)
+/// A fila de abas tal como o gesto a ve: a barra desenhada e o modelo das
+/// colunas de onde ela saiu.
+struct TabRowView<'a> {
+    layout: &'a BarLayout,
+    contexts: &'a [Vec<ContextTab>; COMPARATOR_COLUMNS],
+    groups: &'a [Vec<ContextGroup>; COMPARATOR_COLUMNS],
+    scale: f64,
+}
+
+impl TabRowView<'_> {
+    fn plan(&self, column: usize, item: DragItem, cursor: (f64, f64)) -> Option<DropSpot> {
+        plan_drop(
+            self.layout,
+            column,
+            self.contexts.get(column)?,
+            self.groups.get(column)?,
+            item,
+            cursor,
+            self.scale,
+        )
+    }
+}
+
+/// O que chega ao gesto sobre a fila de abas.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TabGestureInput {
+    /// O rato andou; `button_down` e o botao esquerdo tal como a fila de
+    /// mensagens o ve.
+    Move {
+        cursor: (f64, f64),
+        button_down: bool,
+    },
+    /// O botao esquerdo subiu com o rato em `cursor`, sobre `hit`.
+    Release {
+        cursor: (f64, f64),
+        hit: Option<BarHit>,
+    },
+    /// Esc -- na janela, ou o "voltar" que a pagina manda quando o teclado
+    /// esta nela.
+    Escape,
+    /// Outra janela ficou com o rato (WM_CAPTURECHANGED) durante o gesto
+    /// numero `gesture`.
+    CaptureLost { gesture: u64 },
+}
+
+/// O que o App faz depois de um passo do gesto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabGestureEffect {
+    /// Nao ha gesto, ou isto nao e com ele: o Esc volta a ser o "voltar".
+    Ignored,
+    /// Botao em baixo, ainda dentro do limiar: pode ser um clique.
+    Pending,
+    /// Passou o limiar agora: o rato fica preso a janela e a barra passa a
+    /// desenhar a pre-visualizacao.
+    Started,
+    /// O arrasto continua: redesenhar a pre-visualizacao.
+    Moved,
+    /// Premido e largado no mesmo alvo, sem arrastar.
+    Click(BarHit),
+    /// Largado dentro da fila: e so aqui que o modelo muda. Nenhuma pagina
+    /// navega nem recarrega -- muda a ordem e o grupo, mais nada.
+    Drop {
+        source_index: usize,
+        item: DragItem,
+        spot: DropSpot,
+    },
+    /// Acabou sem mudar nada: Esc, captura perdida, botao solto noutro sitio
+    /// ou largado fora da fila.
+    Cancelled { was_dragging: bool },
+}
+
+/// A maquina do gesto sobre a fila de abas: premir (`tab_press`), limiar,
+/// alvo, largar, Esc e captura perdida. Pura -- recebe a fila desenhada e o
+/// modelo, devolve o que o App faz --, e e por aqui que o App passa em cada
+/// evento. O largar TIRA o gesto antes de mais nada: o ReleaseCapture que se
+/// lhe segue manda um WM_CAPTURECHANGED, e esse ja nao encontra nada.
+fn tab_gesture_step(
+    press: &mut Option<TabPress>,
+    input: TabGestureInput,
+    row: &TabRowView,
+) -> TabGestureEffect {
+    let Some(current) = *press else {
+        return TabGestureEffect::Ignored;
+    };
+    match input {
+        TabGestureInput::Move {
+            cursor,
+            button_down,
+        } => {
+            // Sem o botao em baixo, o largar perdeu-se (foi para outra
+            // janela): o gesto acaba aqui sem fazer nada.
+            if !button_down {
+                *press = None;
+                return TabGestureEffect::Cancelled {
+                    was_dragging: current.dragging,
+                };
+            }
+            if current.dragging {
+                return TabGestureEffect::Moved;
+            }
+            if current.drag.is_some() && drag_started(current.origin, cursor, row.scale) {
+                *press = Some(TabPress {
+                    dragging: true,
+                    ..current
+                });
+                return TabGestureEffect::Started;
+            }
+            TabGestureEffect::Pending
+        }
+        TabGestureInput::Release { cursor, hit } => {
+            *press = None;
+            match tab_release(current, hit) {
+                TabRelease::Click(hit) => TabGestureEffect::Click(hit),
+                TabRelease::Drop { source_index, item } => {
+                    match row.plan(source_index, item, cursor) {
+                        Some(spot) => TabGestureEffect::Drop {
+                            source_index,
+                            item,
+                            spot,
+                        },
+                        None => TabGestureEffect::Cancelled { was_dragging: true },
+                    }
+                }
+                TabRelease::Nothing => TabGestureEffect::Cancelled {
+                    was_dragging: current.dragging,
+                },
+            }
+        }
+        // Esc a meio de um arrasto cancela-o, como no Chrome, em vez do
+        // "voltar" de sempre -- que podia sair da coluna expandida ou ir para
+        // a Home com o botao ainda em baixo. Antes do limiar ainda e um
+        // clique, e o Esc continua a ser o "voltar".
+        TabGestureInput::Escape if current.dragging => {
+            *press = None;
+            TabGestureEffect::Cancelled { was_dragging: true }
+        }
+        TabGestureInput::Escape => TabGestureEffect::Ignored,
+        TabGestureInput::CaptureLost { gesture } if gesture == current.gesture => {
+            *press = None;
+            TabGestureEffect::Cancelled {
+                was_dragging: current.dragging,
+            }
+        }
+        TabGestureInput::CaptureLost { .. } => TabGestureEffect::Ignored,
+    }
+}
+
+/// O que um passo do gesto faz ao modelo das colunas: so o largar dentro da
+/// fila o muda. Devolve se alguma aba mudou de sitio ou de grupo.
+fn apply_tab_gesture(
+    contexts: &mut [Vec<ContextTab>; COMPARATOR_COLUMNS],
+    groups: &mut [Vec<ContextGroup>; COMPARATOR_COLUMNS],
+    effect: TabGestureEffect,
+) -> bool {
+    match effect {
+        TabGestureEffect::Drop {
+            source_index,
+            item,
+            spot,
+        } if source_index < COMPARATOR_COLUMNS => apply_drop(
+            &mut contexts[source_index],
+            &mut groups[source_index],
+            item,
+            spot,
+        ),
+        _ => false,
+    }
+}
+
+/// O que a barra desenha enquanto se arrasta: a fila ja reordenada
+/// (`drag_preview` com `spot`) e o que se arrasta a seguir o rato por cima
+/// dela. Fora da faixa onde se larga (`float_left` a `None`) o item volta ao
+/// seu lugar, esbatido: largar ali cancela.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DragPaint {
+    source_index: usize,
+    item: DragItem,
+    spot: Option<DropSpot>,
+    float_left: Option<f64>,
+}
+
+fn tab_drag_paint(press: TabPress, row: &TabRowView, cursor: (f64, f64)) -> Option<DragPaint> {
+    if !press.dragging {
+        return None;
+    }
+    let (source_index, item) = press.drag?;
+    let inside = in_drop_zone(row.layout, source_index, cursor, row.scale);
+    Some(DragPaint {
+        source_index,
+        item,
+        spot: row.plan(source_index, item, cursor),
+        float_left: inside.then_some(cursor.0 - press.anchor),
+    })
+}
+
+/// O gesto da fila de abas que tem o rato preso (0: nenhum). O App publica-o
+/// a cada passo; o subclass da janela le-o no WM_CAPTURECHANGED.
+static TAB_GESTURE_LIVE: AtomicU64 = AtomicU64::new(0);
+
+/// WM_CAPTURECHANGED em `hwnd`: `new_owner` (nulo quando ninguem) ficou com o
+/// rato. Havendo um gesto vivo, devolve o numero dele -- o App cancela-o se
+/// ainda for o mesmo quando o aviso chegar. O SetCapture sobre quem ja tinha
+/// o rato tambem manda esta mensagem, e ai nada se perdeu.
+fn tab_gesture_capture_lost(live: &AtomicU64, hwnd: HWND, new_owner: HWND) -> Option<u64> {
+    if new_owner == hwnd {
+        return None;
+    }
+    let gesture = live.load(Ordering::Acquire);
+    (gesture != 0).then_some(gesture)
 }
 
 fn split_build_is_current(
@@ -2637,6 +2939,18 @@ unsafe extern "system" fn window_subclass(
             }
         }
         return 0;
+    }
+
+    // O rato foi para outra janela a meio de um gesto na fila de abas. O
+    // aviso vai pela fila de eventos: o WM_CAPTURECHANGED do ReleaseCapture
+    // normal chega antes do largar, e o App tem de ver o largar primeiro. A
+    // mensagem segue para o winit, que tambem conta com ela.
+    if message == WM_CAPTURECHANGED
+        && reference_data != 0
+        && let Some(gesture) = tab_gesture_capture_lost(&TAB_GESTURE_LIVE, hwnd, lparam as HWND)
+    {
+        let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+        let _ = proxy.send_event(UserEvent::TabCaptureLost(gesture));
     }
 
     if message == WM_ERASEBKGND {
@@ -5332,6 +5646,8 @@ struct App {
     /// Botao esquerdo em baixo sobre uma aba, o x dela ou a pilula de um
     /// grupo: o que acontece so se decide ao largar (ou ao arrastar).
     tab_press: Option<TabPress>,
+    /// Numero do ultimo gesto na fila de abas; o proximo e este mais um.
+    tab_gesture_count: u64,
     /// Ctrl/Shift/Alt no teclado da janela principal (a barra com o foco).
     modifiers: winit::keyboard::ModifiersState,
     /// O rato esta em cima do "Ir" da Home: pinta-se em degradê.
@@ -5442,6 +5758,7 @@ impl App {
             omnibox: None,
             bar_hover: None,
             tab_press: None,
+            tab_gesture_count: 0,
             modifiers: winit::keyboard::ModifiersState::empty(),
             home_go_hover: false,
             exit_button: None,
@@ -5912,7 +6229,7 @@ impl App {
         self.schedule_home_restoration();
 
         self.bar_hover = None;
-        self.tab_press = None;
+        self.forget_tab_gesture();
         self.status = None;
         self.next_home_frame = Instant::now();
         self.show_omnibox(true);
@@ -6963,7 +7280,7 @@ impl App {
 
     fn activate_comparator(&mut self, sync_remote_buttons: bool) {
         self.bar_hover = None;
-        self.tab_press = None;
+        self.forget_tab_gesture();
         self.surface = Surface::Comparator;
 
         // build_as_child nasce antes de self.comparator existir, portanto o
@@ -7026,7 +7343,7 @@ impl App {
             comp.minimized[idx] = false;
             comp.expanded = None;
             self.bar_hover = None;
-            self.tab_press = None;
+            self.forget_tab_gesture();
             self.needs_clear = true;
             self.update_comparator_layout();
             self.sync_comparator_splitters();
@@ -7045,7 +7362,7 @@ impl App {
             };
         }
         self.bar_hover = None;
-        self.tab_press = None;
+        self.forget_tab_gesture();
         self.needs_clear = true;
 
         // Expandir ocupa apenas a área de conteúdo. A titlebar do NeuralIA e
@@ -7103,7 +7420,7 @@ impl App {
         }
 
         self.bar_hover = None;
-        self.tab_press = None;
+        self.forget_tab_gesture();
         self.needs_clear = true;
         self.update_comparator_layout();
         self.sync_comparator_splitters();
@@ -10148,7 +10465,7 @@ impl App {
     fn context_menu_comparator(&mut self) {
         // Um arrasto a meio acaba aqui: o menu tem o seu proprio ciclo de
         // mensagens e o largar do botao esquerdo ja nao chegaria a barra.
-        self.tab_press = None;
+        self.forget_tab_gesture();
         hover_tooltip(std::ptr::null_mut(), "");
         match self.comparator_bar_hit() {
             Some(
@@ -10426,7 +10743,20 @@ impl App {
     /// grupos so decidem ao largar (podem virar arrasto); o resto responde ja.
     fn press_comparator(&mut self) {
         let hit = self.comparator_bar_hit();
-        self.tab_press = hit.and_then(|hit| self.tab_press_for(hit));
+        self.tab_gesture_count = self.tab_gesture_count.wrapping_add(1).max(1);
+        let gesture = self.tab_gesture_count;
+        self.tab_press = match (hit, self.bar_layout(), &self.comparator) {
+            (Some(hit), Some(layout), Some(comp)) => tab_press(
+                &layout,
+                &comp.contexts,
+                &comp.groups,
+                hit,
+                self.cursor,
+                gesture,
+            ),
+            _ => None,
+        };
+        self.publish_tab_gesture();
         if self.tab_press.is_some() {
             hover_tooltip(std::ptr::null_mut(), "");
             return;
@@ -10434,140 +10764,150 @@ impl App {
         self.click_comparator(hit);
     }
 
-    fn tab_press_for(&self, hit: BarHit) -> Option<TabPress> {
-        let comp = self.comparator.as_ref()?;
-        let drag = match hit {
-            BarHit::ContextTab {
-                source_index,
-                context_index,
-            } => Some((
-                source_index,
-                DragItem::Tab(comp.contexts.get(source_index)?.get(context_index)?.id),
-            )),
-            BarHit::ContextGroup {
-                source_index,
-                group_index,
-            } => Some((
-                source_index,
-                DragItem::Group(comp.groups.get(source_index)?.get(group_index)?.id),
-            )),
-            BarHit::CloseTab { .. } => None,
-            _ => return None,
-        };
-        Some(TabPress {
-            origin: self.cursor,
-            hit,
-            drag,
-            dragging: false,
-        })
+    /// Diz ao subclass da janela que gesto tem o rato (0: nenhum).
+    fn publish_tab_gesture(&self) {
+        TAB_GESTURE_LIVE.store(
+            self.tab_press.map_or(0, |press| press.gesture),
+            Ordering::Release,
+        );
     }
 
-    /// O rato andou com o botao em baixo sobre uma aba ou pilula. Devolve
-    /// `true` enquanto for um arrasto: a barra redesenha o marcador e a dica
-    /// fica calada.
-    fn track_tab_drag(&mut self) -> bool {
-        let Some(mut press) = self.tab_press else {
-            return false;
-        };
-        // Sem o botao em baixo, o largar perdeu-se (outra janela ficou com o
-        // rato a meio do gesto): o gesto acaba aqui sem fazer nada.
-        if !left_button_down() {
-            self.tab_press = None;
-            if press.dragging {
-                self.request_redraw();
-            }
-            return false;
+    /// Esquece o gesto da fila sem fazer nada com ele (a superficie mudou por
+    /// baixo dele). O botao que ainda estiver em baixo solta o rato sozinho.
+    fn forget_tab_gesture(&mut self) {
+        self.tab_press = None;
+        self.publish_tab_gesture();
+    }
+
+    /// Um passo do gesto sobre a fila de abas, contra a barra e o modelo de
+    /// agora (`tab_gesture_step`). O arrasto so mexe na ordem e nos grupos
+    /// das abas: nenhuma pagina navega nem recarrega, e a aba aberta ao lado
+    /// continua aberta, porque e reconhecida pela identidade e nao pelo sitio.
+    fn tab_gesture(&mut self, input: TabGestureInput) -> TabGestureEffect {
+        if self.tab_press.is_none() {
+            return TabGestureEffect::Ignored;
         }
         let scale = self
             .window
             .as_ref()
             .map_or(1.0, |window| window.scale_factor().max(1.0));
-        if !press.dragging && press.drag.is_some() && drag_started(press.origin, self.cursor, scale)
-        {
-            press.dragging = true;
-            self.bar_hover = None;
-            hover_tooltip(std::ptr::null_mut(), "");
+        let layout = self.bar_layout();
+        let effect = match (layout, &self.comparator) {
+            (Some(layout), Some(comp)) => tab_gesture_step(
+                &mut self.tab_press,
+                input,
+                &TabRowView {
+                    layout: &layout,
+                    contexts: &comp.contexts,
+                    groups: &comp.groups,
+                    scale,
+                },
+            ),
+            // Sem comparador nao ha fila: o gesto que ficou para tras acaba.
+            _ => TabGestureEffect::Cancelled {
+                was_dragging: self.tab_press.take().is_some_and(|press| press.dragging),
+            },
+        };
+        // O gesto sai de publicacao ANTES de o rato ser solto: o
+        // WM_CAPTURECHANGED que o ReleaseCapture manda ja nao encontra nada.
+        self.publish_tab_gesture();
+        if matches!(input, TabGestureInput::Release { .. }) {
+            self.release_tab_capture();
         }
-        self.tab_press = Some(press);
-        if press.dragging {
-            self.request_redraw();
+        match effect {
+            TabGestureEffect::Started => {
+                self.hold_tab_capture();
+                self.bar_hover = None;
+                hover_tooltip(std::ptr::null_mut(), "");
+                self.request_redraw();
+            }
+            TabGestureEffect::Moved | TabGestureEffect::Cancelled { was_dragging: true } => {
+                self.request_redraw();
+            }
+            TabGestureEffect::Click(hit) => self.click_comparator(Some(hit)),
+            TabGestureEffect::Drop { .. } => {
+                if let Some(comp) = &mut self.comparator {
+                    let _ = apply_tab_gesture(&mut comp.contexts, &mut comp.groups, effect);
+                }
+                self.request_redraw();
+            }
+            TabGestureEffect::Cancelled { .. }
+            | TabGestureEffect::Pending
+            | TabGestureEffect::Ignored => {}
         }
-        press.dragging
+        effect
+    }
+
+    /// Enquanto se arrasta, o rato e desta janela mesmo fora dela: o largar
+    /// chega sempre aqui, e largar fora da fila cancela. O winit ja prende o
+    /// rato ao premir; isto garante-o se alguem o tiver soltado entretanto.
+    fn hold_tab_capture(&self) {
+        if let Some(hwnd) = self.window.as_ref().and_then(window_hwnd) {
+            unsafe {
+                if GetCapture() != hwnd {
+                    SetCapture(hwnd);
+                }
+            }
+        }
+    }
+
+    /// Solta o rato no fim do gesto -- sempre DEPOIS de o gesto ter sido
+    /// tirado, que o ReleaseCapture manda o WM_CAPTURECHANGED na hora.
+    fn release_tab_capture(&self) {
+        if let Some(hwnd) = self.window.as_ref().and_then(window_hwnd) {
+            unsafe {
+                if GetCapture() == hwnd {
+                    ReleaseCapture();
+                }
+            }
+        }
     }
 
     /// Botao esquerdo largado: completa o clique, larga o arrasto ou nada.
     fn release_comparator(&mut self) {
-        let Some(press) = self.tab_press.take() else {
+        if self.tab_press.is_none() {
             return;
-        };
+        }
         if self.surface != Surface::Comparator {
+            self.forget_tab_gesture();
             return;
         }
-        let released = self.comparator_bar_hit();
-        match tab_release(press, released) {
-            TabRelease::Click(hit) => self.click_comparator(Some(hit)),
-            TabRelease::Drop { source_index, item } => self.drop_dragged(source_index, item),
-            TabRelease::Nothing => {}
-        }
+        let hit = self.comparator_bar_hit();
+        let _ = self.tab_gesture(TabGestureInput::Release {
+            cursor: self.cursor,
+            hit,
+        });
         self.update_bar_hover();
         self.request_redraw();
     }
 
-    /// Larga a aba (ou o grupo) arrastada onde o rato esta, com o mesmo plano
-    /// que a barra desenhou durante o arrasto.
-    fn drop_dragged(&mut self, source_index: usize, item: DragItem) {
-        let Some(layout) = self.bar_layout() else {
-            return;
-        };
-        let scale = self
-            .window
-            .as_ref()
-            .map_or(1.0, |window| window.scale_factor().max(1.0));
-        let cursor = self.cursor;
-        let Some(comp) = &mut self.comparator else {
-            return;
-        };
-        if source_index >= COMPARATOR_COLUMNS {
-            return;
-        }
-        if let Some(plan) = plan_drop(
-            &layout,
-            source_index,
-            &comp.contexts[source_index],
-            &comp.groups[source_index],
-            item,
-            cursor,
-            scale,
-        ) {
-            let _ = apply_drop(
-                &mut comp.contexts[source_index],
-                &mut comp.groups[source_index],
-                item,
-                plan.spot,
-            );
+    /// Esc -- da janela, ou o "voltar" que a pagina manda quando o teclado
+    /// esta nela: a meio de um arrasto cancela-o; fora dele e o "voltar".
+    fn escape_or_back(&mut self) {
+        if self.tab_gesture(TabGestureInput::Escape) == TabGestureEffect::Ignored {
+            self.go_back();
         }
     }
 
     /// O que a barra desenha do arrasto em curso, se houver um.
     fn drag_paint(&self) -> Option<DragPaint> {
         let press = self.tab_press.filter(|press| press.dragging)?;
-        let (source_index, item) = press.drag?;
         let layout = self.bar_layout()?;
         let comp = self.comparator.as_ref()?;
         let scale = self
             .window
             .as_ref()
             .map_or(1.0, |window| window.scale_factor().max(1.0));
-        let plan = plan_drop(
-            &layout,
-            source_index,
-            comp.contexts.get(source_index)?,
-            comp.groups.get(source_index)?,
-            item,
+        tab_drag_paint(
+            press,
+            &TabRowView {
+                layout: &layout,
+                contexts: &comp.contexts,
+                groups: &comp.groups,
+                scale,
+            },
             self.cursor,
-            scale,
-        );
-        Some(DragPaint::from_plan(source_index, item, plan))
+        )
     }
 
     /// O que um clique no alvo `hit` da barra faz. Os botoes respondem ao
@@ -11440,7 +11780,10 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::ExitRequested => event_loop.exit(),
             UserEvent::HomeRequested => self.show_home(),
-            UserEvent::BackRequested => self.go_back(),
+            UserEvent::BackRequested => self.escape_or_back(),
+            UserEvent::TabCaptureLost(gesture) => {
+                let _ = self.tab_gesture(TabGestureInput::CaptureLost { gesture });
+            }
             UserEvent::ToggleAutoScroll => self.toggle_auto_scroll(),
             UserEvent::AutoScrollAnswer(yes) => self.answer_auto_scroll(yes),
             UserEvent::ZoomIn => self.step_zoom(1),
@@ -11768,9 +12111,16 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
-                // A arrastar uma aba ou um grupo, a barra so redesenha o
-                // marcador; o realce e as dicas esperam pelo largar.
-                let dragging = self.surface == Surface::Comparator && self.track_tab_drag();
+                // A arrastar uma aba ou um grupo, a barra so redesenha a fila
+                // reordenada; o realce e as dicas esperam pelo largar.
+                let dragging = self.surface == Surface::Comparator
+                    && matches!(
+                        self.tab_gesture(TabGestureInput::Move {
+                            cursor: self.cursor,
+                            button_down: left_button_down(),
+                        }),
+                        TabGestureEffect::Started | TabGestureEffect::Moved
+                    );
                 if !dragging && self.surface == Surface::Comparator && self.bar_visible() {
                     self.update_bar_hover();
                 }
@@ -11819,12 +12169,7 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 match event.logical_key {
-                    Key::Named(NamedKey::Escape) if escape_cancels_tab_drag(self.tab_press) => {
-                        // O largar que vier depois ja nao encontra nada.
-                        self.tab_press = None;
-                        self.request_redraw();
-                    }
-                    Key::Named(NamedKey::Escape) => self.go_back(),
+                    Key::Named(NamedKey::Escape) => self.escape_or_back(),
                     Key::Named(NamedKey::F8) => self.toggle_auto_scroll(),
                     Key::Character(ref c) if self.surface == Surface::Comparator => {
                         match c.as_str() {
@@ -12743,32 +13088,6 @@ fn draw_home(window: &Window, status: Option<&str>, go_hover: bool) {
     }
 }
 
-/// O que a barra desenha enquanto se arrasta: o item arrastado esbatido e,
-/// havendo onde largar, o marcador -- na cor do grupo em que a aba vai entrar.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct DragPaint {
-    source_index: usize,
-    item: DragItem,
-    /// (x do marcador, grupo em que a aba entra).
-    marker: Option<(f64, Option<u64>)>,
-}
-
-impl DragPaint {
-    fn from_plan(source_index: usize, item: DragItem, plan: Option<DropPlan>) -> Self {
-        Self {
-            source_index,
-            item,
-            marker: plan.map(|plan| {
-                let join = match plan.spot {
-                    DropSpot::Tab(drop) => drop.group,
-                    DropSpot::Group { .. } => None,
-                };
-                (plan.marker_x, join)
-            }),
-        }
-    }
-}
-
 fn draw_comparator_bar(
     window: &Window,
     comp: &ComparatorState,
@@ -12904,6 +13223,27 @@ unsafe fn paint_comparator_bar_with_contexts(
     drag: Option<DragPaint>,
     theme: &Theme,
 ) {
+    // A meio de um arrasto a fila da coluna desenha-se ja como ficara se o
+    // botao subir agora: as outras abas abrem lugar ao que se arrasta.
+    let preview = drag
+        .filter(|drag| drag.source_index < COMPARATOR_COLUMNS)
+        .map(|drag| {
+            let mut all_tabs = contexts.clone();
+            let mut all_groups = groups.clone();
+            let (tabs, column_groups) = drag_preview(
+                &contexts[drag.source_index],
+                &groups[drag.source_index],
+                drag.item,
+                drag.spot,
+            );
+            all_tabs[drag.source_index] = tabs;
+            all_groups[drag.source_index] = column_groups;
+            (all_tabs, all_groups)
+        });
+    let (contexts, groups) = match &preview {
+        Some((tabs, column_groups)) => (tabs, column_groups),
+        None => (contexts, groups),
+    };
     let layout = BarLayout::with_rows(
         width as f64,
         scale,
@@ -12976,126 +13316,146 @@ unsafe fn paint_comparator_bar_with_contexts(
     for (index, source_contexts) in contexts.iter().enumerate().take(layout.columns_len) {
         let brand = theme.brand(index);
         let dragging = drag.filter(|drag| drag.source_index == index);
-        // A pilula do grupo, como no Chrome: cheia da cor do grupo, com o nome
-        // legivel por cima, e um fio da mesma cor por baixo das abas do grupo
-        // -- e isso que mostra, de relance, que abas estao dentro dele.
-        for visual in 0..layout.group_pill_counts[index] {
-            let group_index = layout.group_pill_indices[index][visual];
-            let Some(group) = groups[index].get(group_index) else {
-                continue;
+        // O que se arrasta segue o rato por cima da fila ja reordenada, e por
+        // isso e desenhado por ultimo; fora da faixa onde se larga volta ao
+        // seu lugar, esbatido.
+        let float_dx = dragging.and_then(|drag| {
+            drag.float_left.and_then(|left| {
+                drag_float_offset(
+                    &layout,
+                    index,
+                    source_contexts,
+                    &groups[index],
+                    drag.item,
+                    left,
+                )
+            })
+        });
+        let is_dragged = |kind: RowKind| {
+            dragging.is_some_and(|drag| {
+                row_item_is_dragged(kind, drag.item, source_contexts, &groups[index])
+            })
+        };
+        let shifted = |rect: UiRect, dx: f64| UiRect {
+            x: rect.x + dx,
+            ..rect
+        };
+        for floating in [false, true] {
+            let Some(dx) = (if floating { float_dx } else { Some(0.0) }) else {
+                break;
             };
-            let color = group.color.rgb();
-            let hovered = hover
-                == Some(BarHit::ContextGroup {
-                    source_index: index,
-                    group_index,
-                });
-            let dragged = dragging.is_some_and(|drag| drag.item == DragItem::Group(group.id));
-            let fill = if dragged {
-                mix(theme.bar_bg, color, 0.45)
-            } else if hovered {
-                mix(color, theme.bar_bg, 0.18)
-            } else {
-                color
-            };
-            draw_pill(
-                target,
-                layout.group_pills[index][visual],
-                &group.name,
-                PillStyle::new(fill, fill, on_color(fill)),
-                scale,
-                chip_font,
-                theme.bar_bg,
-            );
-            let line = layout.group_lines[index][visual];
-            if line.width > 0.0 {
-                fill_pill(target, line, line.height / 2.0, color, None, theme.bar_bg);
+            // A pilula do grupo, como no Chrome: cheia da cor do grupo, com o
+            // nome legivel por cima, e um fio da mesma cor por baixo das abas
+            // do grupo -- e isso que mostra, de relance, que abas estao
+            // dentro dele.
+            for visual in 0..layout.group_pill_counts[index] {
+                let group_index = layout.group_pill_indices[index][visual];
+                let Some(group) = groups[index].get(group_index) else {
+                    continue;
+                };
+                let dragged = is_dragged(RowKind::Chip(group_index));
+                if (dragged && float_dx.is_some()) != floating {
+                    continue;
+                }
+                let color = group.color.rgb();
+                let hovered = hover
+                    == Some(BarHit::ContextGroup {
+                        source_index: index,
+                        group_index,
+                    });
+                let fill = if dragged && !floating {
+                    mix(theme.bar_bg, color, 0.45)
+                } else if hovered {
+                    mix(color, theme.bar_bg, 0.18)
+                } else {
+                    color
+                };
+                draw_pill(
+                    target,
+                    shifted(layout.group_pills[index][visual], dx),
+                    &group.name,
+                    PillStyle::new(fill, fill, on_color(fill)),
+                    scale,
+                    chip_font,
+                    theme.bar_bg,
+                );
+                let line = shifted(layout.group_lines[index][visual], dx);
+                if line.width > 0.0 {
+                    fill_pill(target, line, line.height / 2.0, color, None, theme.bar_bg);
+                }
             }
-        }
-        for visual in 0..layout.context_tab_counts[index] {
-            let context_index = layout.context_indices[index][visual];
-            let Some(tab) = source_contexts.get(context_index) else {
-                continue;
-            };
-            let url = tab.url.as_str();
-            // Uma aba agrupada veste a cor do grupo, nao a do provedor: e assim
-            // que se ve de relance onde acaba um grupo e comeca o outro.
-            let group_color = layout.tab_owners[index][visual]
-                .and_then(|owner| groups[index].get(owner))
-                .map(|group| group.color.rgb());
-            let tint = group_color.unwrap_or(brand);
-            let active = active_context.is_some_and(|(source, active_id, _, _)| {
-                source == index && active_id == Some(tab.id)
-            });
-            let close_hovered = hover
-                == Some(BarHit::CloseTab {
-                    source_index: index,
-                    context_index,
+            for visual in 0..layout.context_tab_counts[index] {
+                let context_index = layout.context_indices[index][visual];
+                let Some(tab) = source_contexts.get(context_index) else {
+                    continue;
+                };
+                let owner = layout.tab_owners[index][visual];
+                let dragged = is_dragged(RowKind::Tab {
+                    context: context_index,
+                    owner,
                 });
-            let hovered = close_hovered
-                || hover
-                    == Some(BarHit::ContextTab {
+                if (dragged && float_dx.is_some()) != floating {
+                    continue;
+                }
+                let url = tab.url.as_str();
+                // Uma aba agrupada veste a cor do grupo, nao a do provedor: e
+                // assim que se ve de relance onde acaba um grupo e comeca o
+                // outro. A arrastada ja veste a do grupo onde vai cair.
+                let group_color = owner
+                    .and_then(|owner| groups[index].get(owner))
+                    .map(|group| group.color.rgb());
+                let tint = group_color.unwrap_or(brand);
+                let active = active_context.is_some_and(|(source, active_id, _, _)| {
+                    source == index && active_id == Some(tab.id)
+                });
+                let close_hovered = hover
+                    == Some(BarHit::CloseTab {
                         source_index: index,
                         context_index,
                     });
-            let dragged = dragging.is_some_and(|drag| match drag.item {
-                DragItem::Tab(id) => id == tab.id,
-                DragItem::Group(id) => tab.group == Some(id),
-            });
-            let mut fill = if active {
-                mix(theme.bar_bg, tint, 0.48)
-            } else if hovered {
-                mix(theme.bar_bg, tint, 0.30)
-            } else {
-                mix(theme.bar_bg, tint, 0.12)
-            };
-            if dragged {
-                fill = mix(fill, theme.bar_bg, 0.5);
+                let hovered = close_hovered
+                    || hover
+                        == Some(BarHit::ContextTab {
+                            source_index: index,
+                            context_index,
+                        });
+                // A que vai na mao do rato fica levantada, como sob o rato.
+                let mut fill = if active {
+                    mix(theme.bar_bg, tint, 0.48)
+                } else if hovered || floating {
+                    mix(theme.bar_bg, tint, 0.30)
+                } else {
+                    mix(theme.bar_bg, tint, 0.12)
+                };
+                if dragged && !floating {
+                    fill = mix(fill, theme.bar_bg, 0.5);
+                }
+                // A aba aberta de um grupo leva o contorno na cor do grupo,
+                // como a aba ativa de um grupo no Chrome.
+                let border = match (active, group_color) {
+                    (true, Some(color)) => (color, 2.0 * scale),
+                    _ => (mix(theme.bar_bg, tint, 0.30), scale),
+                };
+                let close_slot = shifted(layout.tab_closes[index][visual], dx);
+                let close = if close_slot.width > 0.0 && !dragged {
+                    tab_close_style(hovered, close_hovered, active, fill, theme)
+                } else {
+                    None
+                };
+                draw_context_tab(
+                    target,
+                    shifted(layout.context_tabs[index][visual], dx),
+                    &context_tab_label(url),
+                    fill,
+                    border,
+                    if active { theme.fg } else { theme.fg_muted },
+                    close_slot,
+                    close,
+                    scale,
+                    (tab_font, font),
+                    theme.bar_bg,
+                );
             }
-            // A aba aberta de um grupo leva o contorno na cor do grupo, como a
-            // aba ativa de um grupo no Chrome.
-            let border = match (active, group_color) {
-                (true, Some(color)) => (color, 2.0 * scale),
-                _ => (mix(theme.bar_bg, tint, 0.30), scale),
-            };
-            let close_slot = layout.tab_closes[index][visual];
-            let close = if close_slot.width > 0.0 && !dragged {
-                tab_close_style(hovered, close_hovered, active, fill, theme)
-            } else {
-                None
-            };
-            draw_context_tab(
-                target,
-                layout.context_tabs[index][visual],
-                &context_tab_label(url),
-                fill,
-                border,
-                if active { theme.fg } else { theme.fg_muted },
-                close_slot,
-                close,
-                scale,
-                (tab_font, font),
-                theme.bar_bg,
-            );
-        }
-        // Onde vai cair o que se arrasta.
-        if let Some(DragPaint {
-            marker: Some((marker_x, join)),
-            ..
-        }) = dragging
-        {
-            let color = join
-                .and_then(|id| groups[index].iter().find(|group| group.id == id))
-                .map_or(theme.accent, |group| group.color.rgb());
-            let marker = RECT {
-                left: (marker_x - scale).round() as i32,
-                top: (4.0 * scale).round() as i32,
-                right: (marker_x + scale).round() as i32,
-                bottom: title_h - (4.0 * scale).round() as i32,
-            };
-            let brush = CreateSolidBrush(rgb3(color));
-            FillRect(target, &marker, brush);
-            DeleteObject(brush as _);
         }
     }
 
@@ -19589,6 +19949,8 @@ __fire('keydown', { key: 'F8' });
             origin: (10.0, 10.0),
             hit: close,
             drag: None,
+            anchor: 0.0,
+            gesture: 1,
             dragging: false,
         };
         assert_eq!(tab_release(on_close, Some(close)), TabRelease::Click(close));
@@ -19605,6 +19967,8 @@ __fire('keydown', { key: 'F8' });
             origin: (10.0, 10.0),
             hit: body,
             drag: Some((0, DragItem::Tab(42))),
+            anchor: 0.0,
+            gesture: 2,
             dragging: false,
         };
         assert_eq!(tab_release(on_tab, Some(body)), TabRelease::Click(body));
@@ -19622,31 +19986,829 @@ __fire('keydown', { key: 'F8' });
             "um arrasto larga, mesmo que acabe em cima da propria aba"
         );
 
-        assert!(!drag_started((0.0, 0.0), (5.0, 0.0), 1.0));
-        assert!(drag_started((0.0, 0.0), (6.0, 0.0), 1.0));
-        assert!(drag_started((0.0, 0.0), (0.0, -6.0), 1.0));
-        assert!(!drag_started((0.0, 0.0), (10.0, 0.0), 2.0));
+        // So PASSAR de 4 px (logicos) e arrasto; ate la e um clique.
+        assert!(!drag_started((0.0, 0.0), (4.0, 0.0), 1.0));
+        assert!(!drag_started((0.0, 0.0), (-4.0, 4.0), 1.0));
+        assert!(drag_started((0.0, 0.0), (4.5, 0.0), 1.0));
+        assert!(drag_started((0.0, 0.0), (0.0, -4.5), 1.0));
+        assert!(!drag_started((0.0, 0.0), (8.0, 0.0), 2.0));
+        assert!(drag_started((0.0, 0.0), (8.5, 0.0), 2.0));
     }
 
-    /// Esc a meio do arrasto cancela-o; sem arrasto (nem sequer com o botao
-    /// em baixo numa aba, ainda a ser clique) continua a ser o "voltar".
+    // ---------- o gesto de arrastar abas e grupos ----------
+
+    /// As colunas entregues ao gesto como o App as entrega: a barra montada
+    /// pelo `tab_rows` de sempre e o modelo de onde ela saiu. `step` faz ao
+    /// modelo o que o App faz com cada efeito (`apply_tab_gesture`).
+    struct DragRig {
+        contexts: [Vec<ContextTab>; COMPARATOR_COLUMNS],
+        groups: [Vec<ContextGroup>; COMPARATOR_COLUMNS],
+        scale: f64,
+    }
+
+    impl DragRig {
+        fn new(tabs: Vec<ContextTab>, groups: Vec<ContextGroup>, scale: f64) -> Self {
+            let mut contexts: [Vec<ContextTab>; COMPARATOR_COLUMNS] =
+                std::array::from_fn(|_| Vec::new());
+            let mut all_groups: [Vec<ContextGroup>; COMPARATOR_COLUMNS] =
+                std::array::from_fn(|_| Vec::new());
+            contexts[0] = tabs;
+            all_groups[0] = groups;
+            Self {
+                contexts,
+                groups: all_groups,
+                scale,
+            }
+        }
+
+        fn layout(&self) -> BarLayout {
+            BarLayout::with_rows(
+                1600.0 * self.scale,
+                self.scale,
+                true,
+                BarColumns::even(3),
+                tab_rows(&self.contexts, &self.groups, None),
+            )
+        }
+
+        fn press(&self, at: (f64, f64), gesture: u64) -> Option<TabPress> {
+            let layout = self.layout();
+            let hit = layout.hit(at.0, at.1)?;
+            tab_press(&layout, &self.contexts, &self.groups, hit, at, gesture)
+        }
+
+        fn step(
+            &mut self,
+            press: &mut Option<TabPress>,
+            input: TabGestureInput,
+        ) -> TabGestureEffect {
+            let layout = self.layout();
+            let effect = tab_gesture_step(
+                press,
+                input,
+                &TabRowView {
+                    layout: &layout,
+                    contexts: &self.contexts,
+                    groups: &self.groups,
+                    scale: self.scale,
+                },
+            );
+            apply_tab_gesture(&mut self.contexts, &mut self.groups, effect);
+            effect
+        }
+
+        fn drag_to(&mut self, press: &mut Option<TabPress>, at: (f64, f64)) -> TabGestureEffect {
+            self.step(
+                press,
+                TabGestureInput::Move {
+                    cursor: at,
+                    button_down: true,
+                },
+            )
+        }
+
+        fn release(&mut self, press: &mut Option<TabPress>, at: (f64, f64)) -> TabGestureEffect {
+            let hit = self.layout().hit(at.0, at.1);
+            self.step(press, TabGestureInput::Release { cursor: at, hit })
+        }
+
+        fn paint(&self, press: Option<TabPress>, at: (f64, f64)) -> Option<DragPaint> {
+            let layout = self.layout();
+            tab_drag_paint(
+                press?,
+                &TabRowView {
+                    layout: &layout,
+                    contexts: &self.contexts,
+                    groups: &self.groups,
+                    scale: self.scale,
+                },
+                at,
+            )
+        }
+
+        /// A coluna 0: url e grupo de cada aba, pela ordem do modelo.
+        fn order(&self) -> Vec<(String, Option<u64>)> {
+            self.contexts[0]
+                .iter()
+                .map(|tab| (tab.url.clone(), tab.group))
+                .collect()
+        }
+
+        /// A coluna 0 como a barra a desenha a meio do arrasto `drag`.
+        fn shown(&self, drag: DragPaint) -> Vec<(String, Option<u64>)> {
+            let (tabs, _) = drag_preview(&self.contexts[0], &self.groups[0], drag.item, drag.spot);
+            tabs.iter()
+                .map(|tab| (tab.url.clone(), tab.group))
+                .collect()
+        }
+
+        fn id(&self, url: &str) -> u64 {
+            self.contexts[0]
+                .iter()
+                .find(|tab| tab.url == url)
+                .expect("aba no modelo")
+                .id
+        }
+
+        fn tab_rect(&self, url: &str) -> UiRect {
+            let layout = self.layout();
+            let index = self.contexts[0]
+                .iter()
+                .position(|tab| tab.url == url)
+                .expect("aba no modelo");
+            (0..layout.context_tab_counts[0])
+                .find(|visual| layout.context_indices[0][*visual] == index)
+                .map(|visual| layout.context_tabs[0][visual])
+                .expect("aba na barra")
+        }
+
+        fn chip_rect(&self, group_id: u64) -> UiRect {
+            let layout = self.layout();
+            let index = self.groups[0]
+                .iter()
+                .position(|group| group.id == group_id)
+                .expect("grupo no modelo");
+            (0..layout.group_pill_counts[0])
+                .find(|visual| layout.group_pill_indices[0][*visual] == index)
+                .map(|visual| layout.group_pills[0][visual])
+                .expect("pilula na barra")
+        }
+    }
+
+    fn row(entries: &[(&str, Option<u64>)]) -> Vec<(String, Option<u64>)> {
+        entries
+            .iter()
+            .map(|(url, group)| (url.to_string(), *group))
+            .collect()
+    }
+
+    /// A maquina do gesto contra a fila real, com coordenadas de rato: o
+    /// limiar (so passar de 4 px e arrasto, em pixeis logicos), o alvo tirado
+    /// do x, entrar num grupo entre membros ou na metade direita do ultimo,
+    /// sair dele na ponta do troco ou antes da pilula, e o grupo inteiro a
+    /// mudar de sitio pela pilula. Em cada passo, o que a barra mostra a meio
+    /// do arrasto e exatamente o que fica depois de largar.
     #[test]
-    fn escape_cancels_a_tab_drag_instead_of_going_back() {
-        let press = TabPress {
-            origin: (0.0, 0.0),
-            hit: BarHit::ContextGroup {
-                source_index: 0,
-                group_index: 0,
-            },
-            drag: Some((0, DragItem::Group(3))),
-            dragging: false,
+    fn a_tab_drag_reorders_joins_and_leaves_groups_along_the_real_row() {
+        for scale in [1.0, 1.5] {
+            let mut rig = DragRig::new(
+                vec![tab("A", Some(1)), tab("B", Some(1)), tab("C", None)],
+                vec![group(1, false)],
+                scale,
+            );
+            let c_id = rig.id("C");
+            let (a, b, c) = (rig.tab_rect("A"), rig.tab_rect("B"), rig.tab_rect("C"));
+            let y = center_of(c).1;
+
+            // Premir C e tremer ate 4 px: ainda e um clique.
+            let origin = center_of(c);
+            let mut press = rig.press(origin, 1);
+            assert_eq!(
+                press.and_then(|press| press.drag),
+                Some((0, DragItem::Tab(c_id)))
+            );
+            assert_eq!(
+                rig.drag_to(&mut press, (origin.0 - 3.0 * scale, origin.1 + 3.0 * scale)),
+                TabGestureEffect::Pending,
+                "@{scale}x: 3 px nao arrastam"
+            );
+            assert_eq!(
+                rig.drag_to(&mut press, (origin.0 - 6.0 * scale, y)),
+                TabGestureEffect::Started,
+                "@{scale}x: 6 px arrastam"
+            );
+
+            // Entre A e B: entra no grupo 1, no lugar de B. A barra ja o
+            // mostra assim; o modelo so muda ao largar.
+            let between = (a.x + a.width + (b.x - a.x - a.width) / 2.0, y);
+            assert_eq!(rig.drag_to(&mut press, between), TabGestureEffect::Moved);
+            let paint = rig.paint(press, between).expect("a arrastar");
+            assert_eq!(
+                paint.spot,
+                Some(DropSpot::Tab(TabDrop {
+                    before: Some(1),
+                    group: Some(1)
+                })),
+                "@{scale}x: o alvo sai do x"
+            );
+            let shown = rig.shown(paint);
+            assert_eq!(
+                shown,
+                row(&[("A", Some(1)), ("C", Some(1)), ("B", Some(1))])
+            );
+            assert_eq!(
+                rig.order(),
+                row(&[("A", Some(1)), ("B", Some(1)), ("C", None)]),
+                "@{scale}x: a meio do arrasto o modelo nao mudou"
+            );
+            assert!(matches!(
+                rig.release(&mut press, between),
+                TabGestureEffect::Drop { .. }
+            ));
+            assert!(press.is_none());
+            assert_eq!(rig.order(), shown, "@{scale}x: fica o que se via");
+
+            // C, agora membro do meio, levada para la da ponta do troco: sai
+            // do grupo e o grupo fica inteiro.
+            let b = rig.tab_rect("B");
+            let origin = center_of(rig.tab_rect("C"));
+            let mut press = rig.press(origin, 2);
+            assert_eq!(
+                rig.drag_to(&mut press, (origin.0 + 6.0 * scale, y)),
+                TabGestureEffect::Started
+            );
+            let past_end = (b.x + b.width + 12.0 * scale, y);
+            rig.drag_to(&mut press, past_end);
+            let shown = rig.shown(rig.paint(press, past_end).expect("a arrastar"));
+            rig.release(&mut press, past_end);
+            assert_eq!(
+                rig.order(),
+                row(&[("A", Some(1)), ("B", Some(1)), ("C", None)]),
+                "@{scale}x: na ponta do troco fica solta"
+            );
+            assert_eq!(rig.order(), shown);
+
+            // Na metade direita do ultimo membro volta a entrar, no fim.
+            let b = rig.tab_rect("B");
+            let origin = center_of(rig.tab_rect("C"));
+            let mut press = rig.press(origin, 3);
+            rig.drag_to(&mut press, (origin.0 - 6.0 * scale, y));
+            let right_half = (b.x + b.width * 0.75, y);
+            rig.drag_to(&mut press, right_half);
+            let shown = rig.shown(rig.paint(press, right_half).expect("a arrastar"));
+            rig.release(&mut press, right_half);
+            assert_eq!(
+                rig.order(),
+                row(&[("A", Some(1)), ("B", Some(1)), ("C", Some(1))])
+            );
+            assert_eq!(rig.order(), shown);
+
+            // Antes da pilula (metade esquerda) sai do grupo, para a frente.
+            let chip = rig.chip_rect(1);
+            let origin = center_of(rig.tab_rect("C"));
+            let mut press = rig.press(origin, 4);
+            rig.drag_to(&mut press, (origin.0 - 6.0 * scale, y));
+            let before_chip = (chip.x + 2.0 * scale, y);
+            rig.drag_to(&mut press, before_chip);
+            let shown = rig.shown(rig.paint(press, before_chip).expect("a arrastar"));
+            rig.release(&mut press, before_chip);
+            assert_eq!(
+                rig.order(),
+                row(&[("C", None), ("A", Some(1)), ("B", Some(1))])
+            );
+            assert_eq!(rig.order(), shown);
+
+            // O grupo arrastado pela pilula leva o troco inteiro, pilula e
+            // membros, para antes de C.
+            let chip = rig.chip_rect(1);
+            let c = rig.tab_rect("C");
+            let origin = center_of(chip);
+            let mut press = rig.press(origin, 5);
+            assert_eq!(
+                press.and_then(|press| press.drag),
+                Some((0, DragItem::Group(1)))
+            );
+            assert_eq!(
+                rig.drag_to(&mut press, (origin.0 + 6.0 * scale, y)),
+                TabGestureEffect::Started
+            );
+            let before_c = (c.x + 2.0 * scale, y);
+            rig.drag_to(&mut press, before_c);
+            let paint = rig.paint(press, before_c).expect("a arrastar");
+            assert_eq!(paint.spot, Some(DropSpot::Group { before: Some(0) }));
+            let shown = rig.shown(paint);
+            assert!(matches!(
+                rig.release(&mut press, before_c),
+                TabGestureEffect::Drop { .. }
+            ));
+            assert_eq!(
+                rig.order(),
+                row(&[("A", Some(1)), ("B", Some(1)), ("C", None)])
+            );
+            assert_eq!(rig.order(), shown);
+            let chip = rig.chip_rect(1);
+            assert!(
+                chip.x < rig.tab_rect("A").x && rig.tab_rect("B").x < rig.tab_rect("C").x,
+                "@{scale}x: a pilula vai a frente do seu troco"
+            );
+            assert!(group_runs_are_contiguous(&rig.contexts[0]));
+        }
+    }
+
+    /// Um grupo arrastado nunca cai no meio de outro -- encosta-se antes ou
+    /// depois dele --, e nenhum x da fila parte um troco, nem a arrastar um
+    /// grupo nem a arrastar uma aba: a pre-visualizacao de cada posicao do
+    /// rato e o que ficaria ao largar ali.
+    #[test]
+    fn a_dragged_group_snaps_around_other_groups_and_no_x_breaks_a_run() {
+        let rig = DragRig::new(
+            vec![tab("A", Some(1)), tab("B", Some(2)), tab("C", Some(2))],
+            vec![group(1, false), group(2, false)],
+            1.0,
+        );
+        let (b, c) = (rig.tab_rect("B"), rig.tab_rect("C"));
+        let y = center_of(b).1;
+
+        // A pilula 1 largada entre B e C (dentro do grupo 2): vai para
+        // depois do grupo 2, inteiro.
+        let mut snap = DragRig::new(rig.contexts[0].clone(), rig.groups[0].clone(), 1.0);
+        let origin = center_of(snap.chip_rect(1));
+        let mut press = snap.press(origin, 1);
+        assert_eq!(
+            snap.drag_to(&mut press, (origin.0 + 6.0, y)),
+            TabGestureEffect::Started
+        );
+        let inside = (b.x + b.width + (c.x - b.x - b.width) / 2.0, y);
+        snap.drag_to(&mut press, inside);
+        assert_eq!(
+            snap.paint(press, inside).map(|paint| paint.spot),
+            Some(Some(DropSpot::Group { before: Some(3) }))
+        );
+        snap.release(&mut press, inside);
+        assert_eq!(
+            snap.order(),
+            row(&[("B", Some(2)), ("C", Some(2)), ("A", Some(1))])
+        );
+
+        // Varrimento de toda a fila, 1 px de cada vez, com um grupo e com
+        // uma aba na mao.
+        let layout = rig.layout();
+        let items = layout.row_items(0);
+        let left = items.first().expect("fila").rect.x - DROP_MARGIN;
+        let right = {
+            let last = items.last().expect("fila");
+            last.rect.x + last.rect.width + DROP_MARGIN
         };
-        assert!(!escape_cancels_tab_drag(None));
-        assert!(!escape_cancels_tab_drag(Some(press)));
-        assert!(escape_cancels_tab_drag(Some(TabPress {
-            dragging: true,
-            ..press
-        })));
+        for (grabbed, gesture) in [
+            (center_of(rig.chip_rect(1)), 10),
+            (center_of(rig.chip_rect(2)), 11),
+            (center_of(rig.tab_rect("A")), 12),
+            (center_of(rig.tab_rect("C")), 13),
+        ] {
+            let mut press = rig.press(grabbed, gesture);
+            let mut moving = DragRig::new(rig.contexts[0].clone(), rig.groups[0].clone(), 1.0);
+            assert_eq!(
+                moving.drag_to(&mut press, (grabbed.0 + 6.0, y)),
+                TabGestureEffect::Started
+            );
+            let mut x = left;
+            while x < right {
+                let paint = moving.paint(press, (x, y)).expect("a arrastar");
+                let (tabs, groups) =
+                    drag_preview(&rig.contexts[0], &rig.groups[0], paint.item, paint.spot);
+                assert!(
+                    group_runs_are_contiguous(&tabs),
+                    "x={x}: um troco partido na pre-visualizacao"
+                );
+                // Com um grupo na mao, o grupo 2 continua B e C seguidas, por
+                // esta ordem. (Uma aba pode entrar nele, entre B e C.)
+                let urls: Vec<&str> = tabs.iter().map(|tab| tab.url.as_str()).collect();
+                if gesture <= 11 {
+                    let at = urls.iter().position(|url| *url == "B").expect("B");
+                    assert_eq!(urls.get(at + 1), Some(&"C"), "x={x}: o grupo 2 partiu-se");
+                    assert!(tabs[at].group == Some(2) && tabs[at + 1].group == Some(2));
+                }
+                assert!(
+                    tabs.iter().all(|tab| tab
+                        .group
+                        .is_none_or(|id| groups.iter().any(|group| group.id == id))),
+                    "x={x}: aba num grupo que ja nao existe"
+                );
+                x += 1.0;
+            }
+        }
+    }
+
+    /// Premir e largar sem mexer (ate 4 px) e o clique de sempre: a aba abre
+    /// ao lado, a pilula recolhe. Um arrasto nunca e um clique -- nem quando
+    /// acaba em cima da propria aba --, por isso nunca abre nem recarrega a
+    /// pagina: so muda a ordem. O x nao se arrasta.
+    #[test]
+    fn a_click_without_movement_selects_the_tab_and_a_drag_never_clicks() {
+        let mut rig = DragRig::new(
+            vec![tab("A", Some(1)), tab("B", None)],
+            vec![group(1, false)],
+            1.0,
+        );
+        let before = rig.order();
+        let b = rig.tab_rect("B");
+        let at = center_of(b);
+
+        let mut press = rig.press(at, 1);
+        assert_eq!(
+            rig.drag_to(&mut press, (at.0 + 3.0, at.1 - 2.0)),
+            TabGestureEffect::Pending
+        );
+        assert_eq!(
+            rig.release(&mut press, (at.0 + 3.0, at.1 - 2.0)),
+            TabGestureEffect::Click(BarHit::ContextTab {
+                source_index: 0,
+                context_index: 1
+            }),
+            "premir e largar na mesma aba seleciona-a"
+        );
+        assert!(press.is_none());
+        assert_eq!(rig.order(), before);
+
+        let chip = center_of(rig.chip_rect(1));
+        let mut press = rig.press(chip, 2);
+        assert_eq!(
+            rig.release(&mut press, chip),
+            TabGestureEffect::Click(BarHit::ContextGroup {
+                source_index: 0,
+                group_index: 0
+            })
+        );
+
+        // Largado noutra aba sem arrastar: nada.
+        let mut press = rig.press(at, 3);
+        assert_eq!(
+            rig.release(&mut press, center_of(rig.tab_rect("A"))),
+            TabGestureEffect::Cancelled {
+                was_dragging: false
+            }
+        );
+
+        // Arrastado e trazido de volta: largar em cima de si propria nao e
+        // um clique nem muda nada.
+        let mut press = rig.press(at, 4);
+        assert_eq!(
+            rig.drag_to(&mut press, (at.0 + 30.0, at.1)),
+            TabGestureEffect::Started
+        );
+        assert_eq!(rig.drag_to(&mut press, at), TabGestureEffect::Moved);
+        assert_eq!(
+            rig.release(&mut press, at),
+            TabGestureEffect::Cancelled { was_dragging: true }
+        );
+        assert_eq!(rig.order(), before);
+
+        // O x: 40 px com o botao em baixo nao o arrastam; largar nele fecha.
+        let close = rig.layout().tab_closes[0][1];
+        assert!(close.width > 0.0);
+        let on_close = center_of(close);
+        let mut press = rig.press(on_close, 5);
+        assert_eq!(press.and_then(|press| press.drag), None);
+        assert_eq!(
+            rig.drag_to(&mut press, (on_close.0 - 40.0, on_close.1)),
+            TabGestureEffect::Pending
+        );
+        assert_eq!(
+            rig.release(&mut press, on_close),
+            TabGestureEffect::Click(BarHit::CloseTab {
+                source_index: 0,
+                context_index: 1
+            })
+        );
+    }
+
+    /// Esc a meio do arrasto cancela-o e a fila volta a ordem de antes -- a
+    /// que o ecra ja mostrava reordenada. Antes do limiar ainda e um clique:
+    /// o Esc continua a ser o "voltar" e o gesto segue.
+    #[test]
+    fn escape_cancels_a_tab_drag_and_restores_the_order() {
+        let mut rig = DragRig::new(
+            vec![tab("A", Some(1)), tab("B", Some(1)), tab("C", None)],
+            vec![group(1, false)],
+            1.0,
+        );
+        let before = rig.order();
+        let (a, b) = (rig.tab_rect("A"), rig.tab_rect("B"));
+        let origin = center_of(rig.tab_rect("C"));
+        let y = origin.1;
+
+        let mut press = rig.press(origin, 1);
+        assert_eq!(
+            rig.step(&mut press, TabGestureInput::Escape),
+            TabGestureEffect::Ignored,
+            "sem arrasto o Esc e o voltar"
+        );
+        assert!(press.is_some(), "e o gesto continua");
+
+        rig.drag_to(&mut press, (origin.0 - 6.0, y));
+        let between = (a.x + a.width + (b.x - a.x - a.width) / 2.0, y);
+        rig.drag_to(&mut press, between);
+        let paint = rig.paint(press, between).expect("a arrastar");
+        assert_ne!(
+            rig.shown(paint),
+            before,
+            "a barra mostrava a fila reordenada"
+        );
+
+        assert_eq!(
+            rig.step(&mut press, TabGestureInput::Escape),
+            TabGestureEffect::Cancelled { was_dragging: true }
+        );
+        assert!(press.is_none());
+        assert_eq!(rig.order(), before);
+        assert_eq!(rig.paint(press, between), None, "a barra volta ao normal");
+        assert_eq!(
+            rig.release(&mut press, between),
+            TabGestureEffect::Ignored,
+            "o largar que vem depois ja nao encontra nada"
+        );
+        assert_eq!(rig.order(), before);
+    }
+
+    /// Largar fora da fila da coluna -- abaixo das abas, antes do inicio ou
+    /// sobre a fila da IA ao lado -- cancela. A meio do caminho a barra ja o
+    /// avisa: a aba volta ao seu lugar e deixa de seguir o rato.
+    #[test]
+    fn releasing_a_dragged_tab_outside_its_row_cancels_it() {
+        let mut rig = DragRig::new(
+            vec![tab("A", Some(1)), tab("B", Some(1)), tab("C", None)],
+            vec![group(1, false)],
+            1.0,
+        );
+        rig.contexts[1] = vec![tab("https://ao-lado.example/", None)];
+        let before = rig.order();
+        let neighbour = rig.layout().context_tabs[1][0];
+        let origin = center_of(rig.tab_rect("C"));
+        let y = origin.1;
+        let first = rig.layout().row_items(0)[0].rect;
+
+        for (gesture, outside) in [
+            (1, (origin.0, 200.0)),
+            (2, center_of(neighbour)),
+            (3, (first.x - DROP_MARGIN - 2.0, y)),
+        ] {
+            let mut press = rig.press(origin, gesture);
+            assert_eq!(
+                rig.drag_to(&mut press, (origin.0 - 6.0, y)),
+                TabGestureEffect::Started
+            );
+            assert!(
+                rig.paint(press, (origin.0 - 6.0, y))
+                    .is_some_and(|paint| paint.float_left.is_some()),
+                "dentro da fila segue o rato"
+            );
+            rig.drag_to(&mut press, outside);
+            let paint = rig.paint(press, outside).expect("a arrastar");
+            assert_eq!(paint.spot, None, "{outside:?}: nao ha onde largar");
+            assert_eq!(paint.float_left, None, "{outside:?}: volta ao seu lugar");
+            assert_eq!(
+                rig.release(&mut press, outside),
+                TabGestureEffect::Cancelled { was_dragging: true },
+                "{outside:?}"
+            );
+            assert_eq!(rig.order(), before, "{outside:?}");
+        }
+    }
+
+    /// Outra janela ficou com o rato a meio do arrasto (WM_CAPTURECHANGED):
+    /// cancela. O aviso atrasado de um gesto que ja acabou -- o ReleaseCapture
+    /// do largar normal manda-o antes de o largar chegar ao App -- nao cancela
+    /// nada, nem o gesto seguinte.
+    #[test]
+    fn losing_the_mouse_capture_mid_drag_cancels_it() {
+        let mut rig = DragRig::new(
+            vec![tab("A", Some(1)), tab("B", Some(1)), tab("C", None)],
+            vec![group(1, false)],
+            1.0,
+        );
+        let before = rig.order();
+        let (a, b) = (rig.tab_rect("A"), rig.tab_rect("B"));
+        let origin = center_of(rig.tab_rect("C"));
+        let y = origin.1;
+        let between = (a.x + a.width + (b.x - a.x - a.width) / 2.0, y);
+
+        let mut press = rig.press(origin, 7);
+        rig.drag_to(&mut press, (origin.0 - 6.0, y));
+        rig.drag_to(&mut press, between);
+        assert_eq!(
+            rig.step(&mut press, TabGestureInput::CaptureLost { gesture: 6 }),
+            TabGestureEffect::Ignored,
+            "aviso de outro gesto"
+        );
+        assert!(press.is_some_and(|press| press.dragging));
+        assert_eq!(
+            rig.step(&mut press, TabGestureInput::CaptureLost { gesture: 7 }),
+            TabGestureEffect::Cancelled { was_dragging: true }
+        );
+        assert!(press.is_none());
+        assert_eq!(rig.order(), before);
+        assert_eq!(rig.release(&mut press, between), TabGestureEffect::Ignored);
+        assert_eq!(rig.order(), before);
+
+        // Antes do limiar tambem: o largar ja nao seria um clique fiavel.
+        let mut press = rig.press(origin, 8);
+        assert_eq!(
+            rig.step(&mut press, TabGestureInput::CaptureLost { gesture: 8 }),
+            TabGestureEffect::Cancelled {
+                was_dragging: false
+            }
+        );
+        assert!(press.is_none());
+
+        // O subclass so avisa com um gesto vivo e o rato noutra janela.
+        let live = AtomicU64::new(0);
+        let me: HWND = std::ptr::without_provenance_mut(0x10);
+        let other: HWND = std::ptr::without_provenance_mut(0x20);
+        assert_eq!(tab_gesture_capture_lost(&live, me, other), None);
+        live.store(9, Ordering::Release);
+        assert_eq!(
+            tab_gesture_capture_lost(&live, me, me),
+            None,
+            "SetCapture sobre quem ja tinha o rato"
+        );
+        assert_eq!(tab_gesture_capture_lost(&live, me, other), Some(9));
+        assert_eq!(
+            tab_gesture_capture_lost(&live, me, std::ptr::null_mut()),
+            Some(9)
+        );
+
+        // Largar normal: o winit solta o rato antes de entregar o largar, e
+        // o aviso so e atendido depois dele.
+        let mut press = rig.press(origin, 9);
+        rig.drag_to(&mut press, (origin.0 - 6.0, y));
+        rig.drag_to(&mut press, between);
+        let late = tab_gesture_capture_lost(&live, me, std::ptr::null_mut()).expect("aviso");
+        assert!(matches!(
+            rig.release(&mut press, between),
+            TabGestureEffect::Drop { .. }
+        ));
+        let dropped = rig.order();
+        assert_ne!(dropped, before, "o largar valeu");
+        let mut next = rig.press(center_of(rig.tab_rect("A")), 10);
+        assert_eq!(
+            rig.step(&mut next, TabGestureInput::CaptureLost { gesture: late }),
+            TabGestureEffect::Ignored
+        );
+        assert!(next.is_some(), "o gesto seguinte nao e cancelado");
+        assert_eq!(rig.order(), dropped);
+    }
+
+    /// A barra pinta, num bitmap, a fila reordenada a meio do arrasto: o fio
+    /// do grupo ja passa por baixo do lugar que a aba vai ocupar, e a aba
+    /// arrastada esta onde o rato a leva, por cima das outras. Fora da fila
+    /// volta ao seu lugar, esbatida.
+    #[test]
+    fn the_row_reorders_live_under_the_dragged_tab() {
+        let mut groups = vec![group(1, false)];
+        groups[0].color = GroupColor::Pink;
+        let pink = GroupColor::Pink.rgb();
+        let rig = DragRig::new(
+            vec![tab("A", Some(1)), tab("B", Some(1)), tab("C", None)],
+            groups,
+            1.0,
+        );
+        let theme = Theme::dark((0, 120, 215));
+        let width = 1600i32;
+        let height = COMPARATOR_CHROME_HEIGHT as i32;
+        let paint = |drag: Option<DragPaint>| unsafe {
+            let screen = GetDC(core::ptr::null_mut());
+            assert!(!screen.is_null());
+            let mem = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, width, height);
+            assert!(!mem.is_null() && !bitmap.is_null());
+            let old = SelectObject(mem, bitmap as _);
+            paint_comparator_bar_with_contexts(
+                mem,
+                width,
+                1.0,
+                &["Google Gemini", "ChatGPT", "Claude"],
+                BarColumns::even(3),
+                &rig.contexts,
+                &rig.groups,
+                None,
+                true,
+                None,
+                true,
+                drag,
+                &theme,
+            );
+            let mut info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    biSizeImage: (width * height * 4) as u32,
+                    biXPelsPerMeter: 0,
+                    biYPelsPerMeter: 0,
+                    biClrUsed: 0,
+                    biClrImportant: 0,
+                },
+                bmiColors: [windows_sys::Win32::Graphics::Gdi::RGBQUAD {
+                    rgbBlue: 0,
+                    rgbGreen: 0,
+                    rgbRed: 0,
+                    rgbReserved: 0,
+                }; 1],
+            };
+            let mut pixels = vec![0u8; (width * height * 4) as usize];
+            let copied = GetDIBits(
+                mem,
+                bitmap,
+                0,
+                height as u32,
+                pixels.as_mut_ptr() as *mut _,
+                &mut info,
+                DIB_RGB_COLORS,
+            );
+            SelectObject(mem, old);
+            DeleteObject(bitmap as _);
+            DeleteDC(mem);
+            ReleaseDC(core::ptr::null_mut(), screen);
+            assert!(copied > 0, "GetDIBits falhou");
+            pixels
+        };
+        let read = |pixels: &[u8], x: f64, y: f64| -> Rgb {
+            let offset = ((y.floor() as i32 * width + x.floor() as i32) * 4) as usize;
+            (pixels[offset + 2], pixels[offset + 1], pixels[offset])
+        };
+
+        let layout = rig.layout();
+        let (a, b, c) = (rig.tab_rect("A"), rig.tab_rect("B"), rig.tab_rect("C"));
+        let line = layout.group_lines[0][0];
+        let line_y = line.y + line.height / 2.0;
+        let mid_y = c.y + c.height / 2.0;
+        let origin = center_of(c);
+        let mut press = rig.press(origin, 1);
+        let mut moving = DragRig::new(rig.contexts[0].clone(), rig.groups[0].clone(), 1.0);
+        assert_eq!(
+            moving.drag_to(&mut press, (origin.0 - 6.0, mid_y)),
+            TabGestureEffect::Started
+        );
+        // Agarrada pelo meio e levada para entre A e B: entra no grupo, no
+        // lugar de B, e flutua a meio caminho, por cima da metade direita de
+        // A -- longe do lugar novo, que fica vazio por baixo dela.
+        let grab = (a.x + a.width + (b.x - a.x - a.width) / 2.0, mid_y);
+        let drag = rig.paint(press, grab).expect("a arrastar");
+        assert_eq!(
+            drag.spot,
+            Some(DropSpot::Tab(TabDrop {
+                before: Some(1),
+                group: Some(1)
+            }))
+        );
+        let float_left = drag.float_left.expect("dentro da fila");
+
+        let still = paint(None);
+        let live = paint(Some(drag));
+
+        // Para ver sem ecra: `NEURALIA_PREVIEW_DIR` escolhe onde fica o PNG.
+        let mut rgba = Vec::with_capacity(live.len());
+        for bgrx in live.as_chunks::<4>().0 {
+            rgba.extend_from_slice(&[bgrx[2], bgrx[1], bgrx[0], 255]);
+        }
+        let dir = std::env::var_os("NEURALIA_PREVIEW_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let _ = image::save_buffer(
+            dir.join("neuralia-bar-tab-drag.png"),
+            &rgba,
+            width as u32,
+            height as u32,
+            image::ExtendedColorType::Rgba8,
+        );
+
+        // Parada, a aba solta C nao tem fio por baixo; a meio do arrasto o
+        // lugar dela ja e o ultimo membro do grupo, e o fio chega la.
+        let last_slot = (c.x + c.width / 2.0, line_y);
+        assert_ne!(read(&still, last_slot.0, last_slot.1), pink);
+        assert_eq!(
+            read(&live, last_slot.0, last_slot.1),
+            pink,
+            "o fio ja passa por baixo do lugar novo"
+        );
+
+        // A aba arrastada esta onde o rato a leva (por cima de A), levantada
+        // e ja na cor do grupo em que vai entrar.
+        // Entre o titulo de A e o da aba arrastada, e antes do lugar novo.
+        let probe = (float_left.round() + 38.0, mid_y);
+        assert!(
+            probe.0 > a.x + a.width / 2.0 + 20.0 && probe.0 < b.x - 10.0,
+            "a sonda fica na metade direita de A, fora do lugar novo"
+        );
+        assert_eq!(
+            read(&still, probe.0, probe.1),
+            mix(theme.bar_bg, pink, 0.12),
+            "parada, ali esta A"
+        );
+        assert_eq!(
+            read(&live, probe.0, probe.1),
+            mix(theme.bar_bg, pink, 0.30),
+            "a aba arrastada segue o rato"
+        );
+
+        // Fora da fila, a aba volta ao seu lugar, esbatida.
+        let away = (grab.0, 200.0);
+        let outside = rig.paint(press, away).expect("a arrastar");
+        assert_eq!(outside.float_left, None);
+        let parked = paint(Some(outside));
+        let slot = (c.x + 20.0, mid_y);
+        assert_eq!(
+            read(&parked, slot.0, slot.1),
+            mix(mix(theme.bar_bg, theme.brand(0), 0.12), theme.bar_bg, 0.5)
+        );
+        assert_eq!(
+            read(&parked, probe.0, probe.1),
+            read(&still, probe.0, probe.1),
+            "e nao fica nada a flutuar"
+        );
     }
 
     /// A aba aberta a partir de uma aba agrupada nasce no grupo dela, no fim
@@ -20138,18 +21300,17 @@ __fire('keydown', { key: 'F8' });
         let between = (a.x + a.width + (b.x - a.x - a.width) / 2.0, y);
         let plan = plan_drop(&layout, 0, &tabs, &groups, item, between, scale).expect("larga");
         assert_eq!(
-            plan.spot,
+            plan,
             DropSpot::Tab(TabDrop {
                 before: Some(1),
                 group: Some(1)
             })
         );
-        assert!(plan.marker_x > a.x + a.width && plan.marker_x < b.x);
         // Na metade direita de A: o mesmo sitio.
         let right_half = (a.x + a.width * 0.75, y);
         assert_eq!(
-            plan_drop(&layout, 0, &tabs, &groups, item, right_half, scale).map(|plan| plan.spot),
-            Some(plan.spot)
+            plan_drop(&layout, 0, &tabs, &groups, item, right_half, scale),
+            Some(plan)
         );
         // Em cima de si propria, fora da faixa ou sem nada a mudar: nada.
         assert_eq!(
@@ -20161,7 +21322,7 @@ __fire('keydown', { key: 'F8' });
             None
         );
 
-        assert!(apply_drop(&mut tabs, &mut groups, item, plan.spot));
+        assert!(apply_drop(&mut tabs, &mut groups, item, plan));
         assert_eq!(urls(&tabs), ["A", "C", "B"]);
         assert!(tabs.iter().all(|tab| tab.group == Some(1)));
         assert!(group_runs_are_contiguous(&tabs));
@@ -20181,13 +21342,13 @@ __fire('keydown', { key: 'F8' });
         )
         .expect("larga antes do grupo");
         assert_eq!(
-            plan.spot,
+            plan,
             DropSpot::Tab(TabDrop {
                 before: Some(0),
                 group: None
             })
         );
-        assert!(apply_drop(&mut tabs, &mut groups, dragged, plan.spot));
+        assert!(apply_drop(&mut tabs, &mut groups, dragged, plan));
         assert_eq!(urls(&tabs), ["B", "A", "C"]);
         assert_eq!(tabs[0].group, None);
         assert!(group_runs_are_contiguous(&tabs));
@@ -20205,13 +21366,8 @@ __fire('keydown', { key: 'F8' });
             scale,
         )
         .expect("larga o grupo");
-        assert_eq!(plan.spot, DropSpot::Group { before: Some(0) });
-        assert!(apply_drop(
-            &mut tabs,
-            &mut groups,
-            DragItem::Group(1),
-            plan.spot
-        ));
+        assert_eq!(plan, DropSpot::Group { before: Some(0) });
+        assert!(apply_drop(&mut tabs, &mut groups, DragItem::Group(1), plan));
         assert_eq!(urls(&tabs), ["A", "C", "B"]);
         assert!(group_runs_are_contiguous(&tabs));
 
