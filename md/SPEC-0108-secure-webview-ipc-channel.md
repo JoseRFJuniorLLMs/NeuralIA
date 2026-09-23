@@ -69,15 +69,16 @@ Uma string JSON, sempre com estes quatro campos e nenhum outro:
 - `action` — um nome da lista fechada de SPEC-0005 (`home`, `back`, `restore`,
   `autoscroll`, `zoomin`, `zoomout`, `zoomreset`, `reload`, `print`, `omnibox`,
   `history`, `clearhistory`, `fullscreen`, `devtools`, `viewsource`, `newtab`,
-  `expand`, `shortcut-expand`, `minimize`, `split`, `link`, `split-close`, `split-expand`, `palette`,
-  `gmail-state`, `research-answer`, `agent-observation`). Nome fora da lista →
+  `expand`, `shortcut-expand`, `minimize`, `split`, `link`, `ask`, `search`, `split-close`,
+  `split-expand`, `palette`, `gmail-state`, `research-answer`, `agent-observation`). Nome fora da lista →
   ignorado.
 - `args` — objeto com os parâmetros exatos da ação (`col`, `url`, `aside`, `count`,
   `sender`, `subject`, `key`, `text`, `data`). Campos extras ou tipos errados
   são rejeitados; índices são validados contra `COMPARATOR_COLUMNS`; `url`
   passa por `validate_web_url` e rejeita alvos locais/privados/special óbvios
   antes de DNS; a camada IPC não afirma filtragem DNS pré-conexão do WebView2; strings são
-  recusadas acima dos limites definidos (180/2048 chars e payload do observer
+  recusadas acima dos limites definidos (180/2048 chars, 2000 chars no `text` de `ask` e
+  `search`, e payload do observer
   limitado antes da serialização).
 
 Tamanho máximo da mensagem: 8 KiB. Acima disso é descartada sem parse.

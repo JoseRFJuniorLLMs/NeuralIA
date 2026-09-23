@@ -234,7 +234,10 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
             let raw = args.get("text")?.as_str()?;
             // Os mesmos caracteres que uma pergunta escrita: dos de controlo
             // so a quebra de linha e o tab passam.
-            if raw.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+            if raw
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+            {
                 return None;
             }
             let text = raw.trim();

@@ -10880,12 +10880,10 @@ fn selection_search_question(text: &str) -> Option<String> {
 /// o sinal de superficie privada postos. Um painel privado nao mostra o
 /// "Pesquisar": o texto dele nao pode ir parar ao historico nem a memoria.
 fn bind_page_script(script: &str, capability: &str, private: bool) -> String {
-    script
-        .replace("__NEURALIA_CAP__", capability)
-        .replace(
-            "__NEURALIA_PRIVATE__",
-            if private { "true" } else { "false" },
-        )
+    script.replace("__NEURALIA_CAP__", capability).replace(
+        "__NEURALIA_PRIVATE__",
+        if private { "true" } else { "false" },
+    )
 }
 
 /// Scripts de inicializacao do painel Split, tal como o builder os injeta.
@@ -16393,8 +16391,13 @@ for (const c of INPUT.cases) {
   vm.runInContext(c.script, context, { filename: c.name });
   vm.runInContext(PAGE, context);
   vm.runInContext(HELPERS, context);
-  for (const step of c.steps || [c.drive || DEFAULT_DRIVE]) {
-    vm.runInContext(step, context);
+  if (c.steps) {
+    // Um passo que falha fica nos erros do caso, que o teste le.
+    for (const step of c.steps) {
+      try { vm.runInContext(step, context); } catch (e) { context.__errors.push('passo: ' + e.message); }
+    }
+  } else {
+    vm.runInContext(c.drive || DEFAULT_DRIVE, context);
   }
   results.push({
     name: c.name,
@@ -16799,7 +16802,7 @@ function __state(tag) {
             assert_eq!(
                 result["errors"].as_array().map(Vec::len),
                 Some(0),
-                "{name}: a barra lancou para dentro da pagina: {}",
+                "{name}: erro na pagina ou num passo do teste: {}",
                 result["errors"]
             );
             assert_eq!(
@@ -17142,7 +17145,10 @@ __state('barra');
             ]
         );
         let states = selection_states(&results[0]);
-        assert_eq!(states["enviada"]["shown"], false, "a barra ficou depois de pesquisar");
+        assert_eq!(
+            states["enviada"]["shown"], false,
+            "a barra ficou depois de pesquisar"
+        );
         assert_eq!(states["enviada"]["pending"], 0);
         // Acima de 2000 nada sai da pagina e a barra diz porque.
         assert_eq!(states["grande"]["posted"], 2);
@@ -17260,7 +17266,12 @@ __state('sem-vozes');
                 "navigator.clipboard = undefined;",
                 &[copy],
             ),
-            selection_case("copiar-negado", &page, "__clipboardFails = true;", &[copy, copied]),
+            selection_case(
+                "copiar-negado",
+                &page,
+                "__clipboardFails = true;",
+                &[copy, copied],
+            ),
             selection_case("falar", &page, "", &[speak]),
             selection_case("vozes", &page, "", &[voices]),
         ]);
@@ -17380,9 +17391,7 @@ __state('sem-vozes');
     fn a_selected_search_reaches_the_comparator_from_every_surface_but_the_private_split() {
         let text = "agent:https://example.com | click=Comprar".to_string();
         let search = || IpcAction::Search { text: text.clone() };
-        let carries = |event: Option<UserEvent>| {
-            matches!(event, Some(UserEvent::SearchSelection(ref got)) if *got == text)
-        };
+        let carries = |event: Option<UserEvent>| matches!(event, Some(UserEvent::SearchSelection(ref got)) if *got == text);
         // As tres colunas do comparador.
         for col in 0..COMPARATOR_COLUMNS {
             assert!(

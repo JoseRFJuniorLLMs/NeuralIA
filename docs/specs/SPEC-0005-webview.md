@@ -77,7 +77,9 @@ receives that script: the comparator columns, the Split panel, external web,
 the Reader and the PDF viewer (top frame only). It appears after a trusted
 mouse or keyboard selection of 1..=5000 characters outside editable fields,
 lives in a closed shadow root and offers Pesquisar, Copiar (clipboard, no IPC)
-and Falar (local `speechSynthesis` voices, no IPC). `search` carries exactly
+and Falar (local `speechSynthesis` voices, no IPC). Falar never picks an
+online voice: it prefers the page language, then pt-BR, then the system
+language, and reads one sentence per utterance. `search` carries exactly
 `text` (1..=2000 characters after trimming, no control characters except
 newline and tab); a longer selection is not sent and the toolbar says so. The
 native side opens the normal three-AI comparison with the text as the
@@ -87,6 +89,7 @@ no Pesquisar button and its handler refuses `search`. Gates:
 `search_carries_the_selected_text_within_bounds` (`ipc.rs`),
 `the_selection_toolbar_offers_three_actions_for_a_trusted_selection`,
 `the_selection_toolbar_searches_only_what_fits_and_never_from_private`,
+`the_selection_toolbar_copies_and_speaks_with_local_voices`,
 `a_selected_search_reaches_the_comparator_from_every_surface_but_the_private_split`
 and `a_selected_search_is_a_question_never_an_omnibox_command`
 (`windows_app.rs`).
