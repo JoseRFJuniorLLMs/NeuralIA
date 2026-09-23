@@ -1901,6 +1901,164 @@ fn show_popup_without_activation(hwnd: HWND) {
     }
 }
 
+// Dicas (tooltips). A barra e os botoes nativos sao desenhados a mao, por isso
+// o Windows nao tem texto nenhum para mostrar sozinho. Um unico controlo de
+// tooltip serve a barra (texto conforme o alvo debaixo do rato), o botao Home
+// e os botoes da janela; cada janela e uma "ferramenta" com TTF_SUBCLASS, e o
+// controlo trata sozinho do atraso, da posicao e de esconder a dica.
+static TOOLTIP_HWND: AtomicUsize = AtomicUsize::new(0);
+static TOOLTIP_TOOLS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+const TOOLTIP_TOOL_ID: usize = 1;
+/// Tamanho do TTTOOLINFOW sem o `lpReserved`. O NeuralIA nao declara o manifesto
+/// de Common Controls v6, por isso o Windows carrega o comctl32 v5, que recusa
+/// a struct com o tamanho completo: o TTM_ADDTOOLW falhava calado (0
+/// ferramentas) e nenhuma dica aparecia. O tamanho V2 serve o v5 e o v6.
+const TTTOOLINFOW_V2_SIZE: u32 =
+    (std::mem::size_of::<windows_sys::Win32::UI::Controls::TTTOOLINFOW>()
+        - std::mem::size_of::<*mut core::ffi::c_void>()) as u32;
+
+/// O que o clique em cada alvo da barra FAZ -- o mesmo match que trata o
+/// clique --, nao so o nome do botao.
+fn bar_tooltip_label(
+    hit: BarHit,
+    provider: &str,
+    maximized: bool,
+    tab_url: Option<&str>,
+    group: Option<(&str, bool)>,
+) -> Option<String> {
+    Some(match hit {
+        BarHit::Home => "Voltar à Home".to_string(),
+        BarHit::Column(_) => format!("{provider}: expandir esta coluna"),
+        BarHit::AddTab(_) => format!("Nova pergunta ao {provider}"),
+        BarHit::ContextTab { .. } => {
+            format!(
+                "{}\nClique: abrir ao lado · Botão direito: fechar e grupos",
+                tab_url?
+            )
+        }
+        BarHit::ContextGroup { .. } => {
+            let (name, collapsed) = group?;
+            let action = if collapsed {
+                "mostrar as abas"
+            } else {
+                "recolher"
+            };
+            format!("Grupo \"{name}\": clique para {action}")
+        }
+        BarHit::SplitExpand => "Expandir ou reduzir a fonte aberta ao lado".to_string(),
+        BarHit::SplitClose => "Fechar a fonte aberta ao lado".to_string(),
+        BarHit::Private => {
+            "Painel privado: abre ao lado sem gravar histórico nem memória".to_string()
+        }
+        BarHit::WindowMinimize => caption_tooltip_label(0, maximized).to_string(),
+        BarHit::WindowMaximize => caption_tooltip_label(1, maximized).to_string(),
+        BarHit::WindowClose => caption_tooltip_label(2, maximized).to_string(),
+    })
+}
+
+/// Os tres botoes da janela, na ordem em que `native_button_index` os conta.
+fn caption_tooltip_label(index: usize, maximized: bool) -> &'static str {
+    match index {
+        0 => "Minimizar",
+        1 if maximized => "Restaurar",
+        1 => "Maximizar",
+        _ => "Fechar",
+    }
+}
+
+/// O controlo de tooltip, criado na primeira dica. Se a janela dona morreu
+/// (o controlo morre com ela), cria-se outro e esquecem-se as ferramentas.
+fn tooltip_control(tool_window: HWND) -> HWND {
+    use windows_sys::Win32::UI::Controls::{
+        ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASSW,
+        TTM_SETMAXTIPWIDTH, TTS_ALWAYSTIP, TTS_NOPREFIX,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CW_USEDEFAULT, GA_ROOT, GetAncestor, IsWindow, WS_EX_TOPMOST,
+    };
+    let existing = TOOLTIP_HWND.load(Ordering::Acquire) as HWND;
+    unsafe {
+        if !existing.is_null() && IsWindow(existing) != 0 {
+            return existing;
+        }
+        TOOLTIP_TOOLS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let init = INITCOMMONCONTROLSEX {
+            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_WIN95_CLASSES,
+        };
+        InitCommonControlsEx(&init);
+        let tooltip = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            TOOLTIPS_CLASSW,
+            std::ptr::null(),
+            WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            GetAncestor(tool_window, GA_ROOT),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        if tooltip.is_null() {
+            return tooltip;
+        }
+        // Com largura maxima o controlo passa a respeitar o "\n" das dicas.
+        SendMessageW(tooltip, TTM_SETMAXTIPWIDTH, 0, 420);
+        TOOLTIP_HWND.store(tooltip as usize, Ordering::Release);
+        tooltip
+    }
+}
+
+/// Liga `window` ao tooltip com `text` ("" = sem dica: o controlo nao mostra
+/// nada). A primeira chamada regista a janela; as seguintes trocam o texto e
+/// escondem a dica anterior, para a nova aparecer no sitio certo.
+fn set_tooltip(window: HWND, text: &str) {
+    use windows_sys::Win32::UI::Controls::{
+        TTF_SUBCLASS, TTM_ADDTOOLW, TTM_POP, TTM_UPDATETIPTEXTW, TTTOOLINFOW,
+    };
+    if window.is_null() {
+        return;
+    }
+    let tooltip = tooltip_control(window);
+    if tooltip.is_null() {
+        return;
+    }
+    let mut wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let info = TTTOOLINFOW {
+        cbSize: TTTOOLINFOW_V2_SIZE,
+        uFlags: TTF_SUBCLASS,
+        hwnd: window,
+        uId: TOOLTIP_TOOL_ID,
+        // A janela inteira: quem decide se ha dica e o texto, nao o rectangulo.
+        rect: RECT {
+            left: 0,
+            top: 0,
+            right: 0x7fff,
+            bottom: 0x7fff,
+        },
+        hinst: std::ptr::null_mut(),
+        lpszText: wide.as_mut_ptr(),
+        lParam: 0,
+        lpReserved: std::ptr::null_mut(),
+    };
+    let mut tools = TOOLTIP_TOOLS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    unsafe {
+        if tools.contains(&(window as usize)) {
+            SendMessageW(tooltip, TTM_POP, 0, 0);
+            SendMessageW(tooltip, TTM_UPDATETIPTEXTW, 0, &info as *const _ as LPARAM);
+        } else if SendMessageW(tooltip, TTM_ADDTOOLW, 0, &info as *const _ as LPARAM) != 0 {
+            tools.push(window as usize);
+        }
+    }
+}
+
 unsafe extern "system" fn comparator_splitter_subclass(
     hwnd: HWND,
     message: u32,
@@ -1979,6 +2137,8 @@ unsafe extern "system" fn comparator_splitter_subclass(
 
 const NATIVE_BUTTON_NONE: usize = usize::MAX;
 static CAPTION_PRESSED_BUTTON: AtomicUsize = AtomicUsize::new(NATIVE_BUTTON_NONE);
+/// O botao da janela cuja dica esta carregada no tooltip.
+static CAPTION_TOOLTIP_BUTTON: AtomicUsize = AtomicUsize::new(NATIVE_BUTTON_NONE);
 
 fn native_button_index(width: i32, x: i32) -> Option<usize> {
     if width <= 0 || x < 0 || x >= width {
@@ -2123,6 +2283,22 @@ unsafe extern "system" fn caption_buttons_subclass(
             };
             SendMessageW(parent, WM_SYSCOMMAND_NATIVE, command, 0);
             0
+        }
+        WM_MOUSEMOVE => {
+            // A dica muda quando o rato passa de um botao para outro.
+            let mut client = RECT::default();
+            if GetClientRect(hwnd, &mut client) != 0 {
+                let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
+                let index = native_button_index(client.right - client.left, x);
+                let last = CAPTION_TOOLTIP_BUTTON
+                    .swap(index.unwrap_or(NATIVE_BUTTON_NONE), Ordering::AcqRel);
+                if index != Some(last) {
+                    let maximized = IsZoomed(GetParent(hwnd)) != 0;
+                    let text = index.map_or("", |index| caption_tooltip_label(index, maximized));
+                    set_tooltip(hwnd, text);
+                }
+            }
+            DefSubclassProc(hwnd, message, wparam, lparam)
         }
         WM_CAPTURECHANGED | WM_CANCELMODE => {
             CAPTION_PRESSED_BUTTON.store(NATIVE_BUTTON_NONE, Ordering::Release);
@@ -6424,6 +6600,7 @@ impl App {
                     DestroyWindow(created);
                     return;
                 }
+                set_tooltip(created, "Voltar à Home");
                 let width = rect.width.round() as i32;
                 let height = rect.height.round() as i32;
                 let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, height, height);
@@ -6852,7 +7029,49 @@ impl App {
         if next != self.bar_hover {
             self.bar_hover = next;
             self.request_redraw();
+            if let Some(owner) = self.window.as_ref().and_then(window_hwnd) {
+                let text = next.and_then(|hit| self.bar_tooltip_text(hit, owner));
+                set_tooltip(owner, text.as_deref().unwrap_or(""));
+            }
         }
+    }
+
+    /// A dica do alvo `hit`, com o nome da IA, o endereco da aba ou o estado
+    /// do grupo que o clique vai usar.
+    fn bar_tooltip_text(&self, hit: BarHit, owner: HWND) -> Option<String> {
+        let comp = self.comparator.as_ref();
+        let column = match hit {
+            BarHit::Column(index) | BarHit::AddTab(index) => Some(index),
+            BarHit::ContextTab { source_index, .. } | BarHit::ContextGroup { source_index, .. } => {
+                Some(source_index)
+            }
+            _ => None,
+        };
+        let provider = column
+            .and_then(|index| comp.and_then(|comp| comp.views.get(index)))
+            .map_or("IA", |view| view.name);
+        let tab_url = match hit {
+            BarHit::ContextTab {
+                source_index,
+                context_index,
+            } => comp
+                .and_then(|comp| comp.contexts.get(source_index))
+                .and_then(|tabs| tabs.get(context_index))
+                .map(|tab| tab.url.as_str()),
+            _ => None,
+        };
+        let group = match hit {
+            BarHit::ContextGroup {
+                source_index,
+                group_index,
+            } => comp
+                .and_then(|comp| comp.groups.get(source_index))
+                .and_then(|groups| groups.get(group_index))
+                .map(|group| (group.name.as_str(), group.collapsed)),
+            _ => None,
+        };
+        let maximized = unsafe { IsZoomed(owner) != 0 };
+        bar_tooltip_label(hit, provider, maximized, tab_url, group)
     }
 
     /// Abre a palette nativa sobre a coluna `source_index`. E um popup Win32,
@@ -10649,6 +10868,116 @@ mod tests {
                 column(mid - 6..mid - 1) && column(mid + 2..mid + 7),
                 "sem traco vertical no centro: o \"+\" foi cortado em reticencias"
             );
+        }
+    }
+
+    #[test]
+    fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
+        let url = "https://exemplo.pt/artigo";
+        for hit in [
+            BarHit::Home,
+            BarHit::Column(1),
+            BarHit::AddTab(1),
+            BarHit::ContextTab {
+                source_index: 1,
+                context_index: 0,
+            },
+            BarHit::ContextGroup {
+                source_index: 1,
+                group_index: 0,
+            },
+            BarHit::SplitExpand,
+            BarHit::SplitClose,
+            BarHit::Private,
+            BarHit::WindowMinimize,
+            BarHit::WindowMaximize,
+            BarHit::WindowClose,
+        ] {
+            let label =
+                bar_tooltip_label(hit, "ChatGPT", false, Some(url), Some(("Pesquisa", true)));
+            assert!(
+                label.as_deref().is_some_and(|text| !text.trim().is_empty()),
+                "{hit:?} ficou sem dica"
+            );
+        }
+        let label = |hit, maximized| {
+            bar_tooltip_label(
+                hit,
+                "ChatGPT",
+                maximized,
+                Some(url),
+                Some(("Pesquisa", true)),
+            )
+        };
+        assert_eq!(
+            label(BarHit::AddTab(1), false).as_deref(),
+            Some("Nova pergunta ao ChatGPT")
+        );
+        assert_eq!(
+            label(BarHit::WindowMaximize, false).as_deref(),
+            Some("Maximizar")
+        );
+        assert_eq!(
+            label(BarHit::WindowMaximize, true).as_deref(),
+            Some("Restaurar")
+        );
+        let tab = BarHit::ContextTab {
+            source_index: 1,
+            context_index: 0,
+        };
+        assert!(label(tab, false).is_some_and(|text| text.starts_with(url)));
+        let group = BarHit::ContextGroup {
+            source_index: 1,
+            group_index: 0,
+        };
+        assert!(label(group, false).is_some_and(|text| text.contains("mostrar as abas")));
+    }
+
+    #[test]
+    fn native_windows_get_one_tooltip_whose_text_follows_the_hover() {
+        use windows_sys::Win32::UI::Controls::{TTM_GETTEXTW, TTM_GETTOOLCOUNT, TTTOOLINFOW};
+        use windows_sys::Win32::UI::WindowsAndMessaging::WS_OVERLAPPEDWINDOW;
+        unsafe {
+            let owner = CreateWindowExW(
+                0,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!("NeuralIA dono"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                0,
+                0,
+                320,
+                240,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!owner.is_null(), "a janela tem de nascer");
+            // O rato passa do minimizar para o fechar.
+            set_tooltip(owner, "Minimizar");
+            set_tooltip(owner, "Fechar");
+
+            let tooltip = TOOLTIP_HWND.load(Ordering::Acquire) as HWND;
+            assert!(!tooltip.is_null(), "o controlo de tooltip tem de existir");
+            let count = SendMessageW(tooltip, TTM_GETTOOLCOUNT, 0, 0);
+            let mut buffer = [0u16; 128];
+            let mut info: TTTOOLINFOW = std::mem::zeroed();
+            info.cbSize = TTTOOLINFOW_V2_SIZE;
+            info.hwnd = owner;
+            info.uId = TOOLTIP_TOOL_ID;
+            info.lpszText = buffer.as_mut_ptr();
+            SendMessageW(
+                tooltip,
+                TTM_GETTEXTW,
+                buffer.len(),
+                &mut info as *mut TTTOOLINFOW as LPARAM,
+            );
+            let end = buffer.iter().position(|&unit| unit == 0).unwrap_or(0);
+            let text = String::from_utf16_lossy(&buffer[..end]);
+            DestroyWindow(owner);
+
+            assert_eq!(count, 1, "cada janela e UMA ferramenta, nao uma por dica");
+            assert_eq!(text, "Fechar", "a dica nao acompanhou o rato");
         }
     }
 
