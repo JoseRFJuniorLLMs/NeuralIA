@@ -313,7 +313,15 @@ impl MemoryStore {
         }
 
         let session = self.session_for_document(&document);
-        sqlite_v01::upsert(&self.sqlite_path(), &document, session.as_ref())?;
+        match sqlite_v01::upsert(&self.sqlite_path(), &document, session.as_ref()) {
+            // Indice da v2.0.x: migra-se reconstruindo do corpus em disco,
+            // que ja inclui este documento.
+            Err(error) if sqlite_v01::is_legacy_index_error(&error) => {
+                self.rebuild()?;
+                return Ok(CaptureOutcome::Stored(document.id));
+            }
+            result => result?,
+        }
         if !sqlite_existed && !tombstones.is_empty() {
             sqlite_v01::sync_tombstones(&self.sqlite_path(), &tombstones)?;
         }
@@ -387,13 +395,25 @@ impl MemoryStore {
         }
 
         let candidate_limit = query.limit.clamp(1, 100).saturating_mul(16).min(512);
-        let candidate_ids = match sqlite_v01::candidate_ids(
-            &self.sqlite_path(),
-            query_text,
-            query.provider.as_deref(),
-            query.session_id.as_deref(),
-            candidate_limit,
-        ) {
+        let candidates = || {
+            sqlite_v01::candidate_ids(
+                &self.sqlite_path(),
+                query_text,
+                query.provider.as_deref(),
+                query.session_id.as_deref(),
+                candidate_limit,
+            )
+        };
+        let candidate_ids = match candidates() {
+            // Indice da v2.0.x: migra-se uma vez, do corpus, e responde-se
+            // com o indice novo.
+            Err(error) if sqlite_v01::is_legacy_index_error(&error) => {
+                self.rebuild()?;
+                candidates()
+            }
+            result => result,
+        };
+        let candidate_ids = match candidate_ids {
             Ok(ids) => ids,
             Err(error)
                 if error.kind() == io::ErrorKind::NotFound && self.document_file_count()? == 0 =>
@@ -1301,6 +1321,98 @@ mod tests {
                 assert!(ids.contains(&id_b.as_str()), "B sumiu: {ids:?}");
             }
         }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// O indice que a v2.0.x deixava em db/: schema_meta, documents e uma
+    /// tabela FTS5 (que cria as suas tabelas-sombra memory_fts_*).
+    fn legacy_2_0_store(name: &str) -> (PathBuf, MemoryStore, String) {
+        let root = temp_root(name);
+        let store = MemoryStore::new(&root).unwrap();
+        let CaptureOutcome::Stored(id_a) = store
+            .capture(MemoryDocument::new(
+                MemoryKind::Source,
+                MemorySourceKind::Reader,
+                "Rust ownership",
+                None,
+                "rust ownership borrowing lifetimes",
+            ))
+            .unwrap()
+        else {
+            panic!("A devia ficar guardado");
+        };
+        sqlite_v01::remove_sqlite_sidecars(&store.sqlite_path());
+        let legacy = rusqlite::Connection::open(store.sqlite_path()).unwrap();
+        legacy
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE schema_meta(version INTEGER NOT NULL);
+                 INSERT INTO schema_meta VALUES(1);
+                 CREATE TABLE documents(id TEXT PRIMARY KEY,title TEXT NOT NULL,url TEXT,
+                   body TEXT NOT NULL,provider TEXT,session_id TEXT,entities TEXT,
+                   last_seen INTEGER NOT NULL);
+                 CREATE VIRTUAL TABLE memory_fts USING fts5(id UNINDEXED,title,body,entities,
+                   tokenize='unicode61 remove_diacritics 2');",
+            )
+            .unwrap();
+        drop(legacy);
+        (root, store, id_a)
+    }
+
+    #[test]
+    fn capture_migrates_a_2_0_index_without_losing_the_older_corpus() {
+        let (root, store, id_a) = legacy_2_0_store("legacy-capture");
+
+        let CaptureOutcome::Stored(id_b) = store
+            .capture(MemoryDocument::new(
+                MemoryKind::Source,
+                MemorySourceKind::Reader,
+                "Rust async",
+                None,
+                "rust async runtime tokio",
+            ))
+            .expect("captura depois do upgrade")
+        else {
+            panic!("B devia ficar guardado");
+        };
+
+        let hits = store.query(&MemoryQuery::new("rust")).expect("consulta");
+        let ids = hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>();
+        assert!(ids.contains(&id_a.as_str()), "A sumiu: {ids:?}");
+        assert!(ids.contains(&id_b.as_str()), "B sumiu: {ids:?}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_migrates_a_2_0_index_before_answering() {
+        let (root, store, id_a) = legacy_2_0_store("legacy-query");
+
+        let hits = store
+            .query(&MemoryQuery::new("rust"))
+            .expect("consulta depois do upgrade");
+        let ids = hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>();
+        assert!(ids.contains(&id_a.as_str()), "A sumiu: {ids:?}");
+
+        // Depois da migracao o indice serve candidatos por FTS, sem cair no
+        // full scan: uma captura nova nao pode esconder o corpus antigo.
+        let CaptureOutcome::Stored(id_b) = store
+            .capture(MemoryDocument::new(
+                MemoryKind::Source,
+                MemorySourceKind::Reader,
+                "Rust async",
+                None,
+                "rust async runtime tokio",
+            ))
+            .unwrap()
+        else {
+            panic!("B devia ficar guardado");
+        };
+        let hits = store.query(&MemoryQuery::new("rust")).unwrap();
+        let ids = hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>();
+        assert!(ids.contains(&id_a.as_str()), "A sumiu: {ids:?}");
+        assert!(ids.contains(&id_b.as_str()), "B sumiu: {ids:?}");
 
         let _ = fs::remove_dir_all(root);
     }

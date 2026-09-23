@@ -42,7 +42,7 @@ fn schema_hash() -> String {
     format!("{:x}", Sha256::digest(SCHEMA_V01.as_bytes()))
 }
 
-fn remove_sqlite_sidecars(path: &Path) {
+pub(super) fn remove_sqlite_sidecars(path: &Path) {
     let _ = fs::remove_file(path);
     remove_wal_shm(path);
 }
@@ -154,9 +154,21 @@ fn has_only_legacy_mirror_schema(connection: &Connection) -> io::Result<bool> {
     if names.is_empty() {
         return Err(io::Error::other("empty schema is not legacy"));
     }
-    Ok(names
-        .iter()
-        .all(|name| matches!(name.as_str(), "schema_meta" | "documents" | "memory_fts")))
+    // O FTS5 cria tabelas-sombra (memory_fts_data, _idx, _content, _docsize,
+    // _config) que tambem aparecem como 'table' no sqlite_master.
+    Ok(names.iter().all(|name| {
+        matches!(name.as_str(), "schema_meta" | "documents" | "memory_fts")
+            || name.starts_with("memory_fts_")
+    }))
+}
+
+const LEGACY_INDEX_ERROR: &str = "legacy 2.0.x memory index must be rebuilt from the corpus";
+
+/// O indice e o espelho da v2.0.x. Nao se esvazia aqui: um indice V01 vazio
+/// seguido de um upsert seria um indice parcial que esconde o corpus. Quem
+/// tem o corpus (MemoryStore) reconstroi-o inteiro.
+pub(super) fn is_legacy_index_error(error: &io::Error) -> bool {
+    error.to_string().contains(LEGACY_INDEX_ERROR)
 }
 
 fn configure_connection(connection: &Connection) -> io::Result<()> {
@@ -267,12 +279,10 @@ fn open_ready(path: &Path) -> io::Result<Connection> {
                 .contains("partial or legacy memory schema requires rebuild")
                 && has_only_legacy_mirror_schema(&connection).unwrap_or(false) =>
         {
-            drop(connection);
-            remove_sqlite_sidecars(path);
-            let mut connection = Connection::open(path).map_err(io_error)?;
-            configure_connection(&connection)?;
-            ensure_schema(&mut connection)?;
-            Ok(connection)
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                LEGACY_INDEX_ERROR,
+            ))
         }
         Err(error) => Err(error),
     }
