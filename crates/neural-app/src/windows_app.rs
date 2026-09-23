@@ -12791,7 +12791,7 @@ class MutationObserver {
   observe() {} disconnect() {} takeRecords() { return []; }
 }
 `;
-const DRIVE = `
+const HELPERS = `
 function __event(type, extra) {
   const target = new Element('div');
   return Object.assign({
@@ -12820,6 +12820,8 @@ function __drain() {
     }
   }
 }
+`;
+const DEFAULT_DRIVE = `
 document.readyState = 'interactive';
 __fire('DOMContentLoaded');
 __fire('load');
@@ -12845,7 +12847,8 @@ for (const c of INPUT.cases) {
   vm.runInContext(MOCK, context);
   vm.runInContext(c.script, context, { filename: c.name });
   vm.runInContext(PAGE, context);
-  vm.runInContext(DRIVE, context);
+  vm.runInContext(HELPERS, context);
+  vm.runInContext(c.drive || DEFAULT_DRIVE, context);
   results.push({
     name: c.name,
     stolen: Array.from(context.__stolen, String),
@@ -12918,6 +12921,69 @@ process.stdout.write(JSON.stringify(results));
                 "{name}: page toJSON getter read the capability {} time(s)",
                 stolen.len()
             );
+        }
+    }
+
+    #[test]
+    fn comparator_ctrl_click_on_a_google_search_link_keeps_the_real_url() {
+        // `q` numa pesquisa do Google e um termo, nao uma URL. Resolvido
+        // contra a origem da coluna virava https://gemini.google.com/app/rust.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let search = "https://www.google.com/search?q=rust";
+        let cases = [
+            ("https://gemini.google.com/app/abc", search, search),
+            ("https://chatgpt.com/c/abc", search, search),
+            ("https://www.google.com/search?q=x&udm=50", search, search),
+            (
+                "https://gemini.google.com/app/abc",
+                "https://maps.google.com/?q=Paris",
+                "https://maps.google.com/?q=Paris",
+            ),
+            // O embrulho real do Google continua a ser desembrulhado.
+            (
+                "https://gemini.google.com/app/abc",
+                "https://www.google.com/url?q=https%3A%2F%2Fexample.com%2F",
+                "https://example.com/",
+            ),
+        ];
+        let inputs: Vec<serde_json::Value> = cases
+            .iter()
+            .map(|(location, href, _)| {
+                serde_json::json!({
+                    "name": format!("{location} -> {href}"),
+                    "href": location,
+                    "script": COMPARATOR_INJECT_SCRIPT.replace("__NEURALIA_CAP__", CAP),
+                    "drive": format!(
+                        "const anchor = new Element('a');\n\
+                         anchor.href = {};\n\
+                         anchor.matches = () => true;\n\
+                         __fire('click', {{ ctrlKey: true, target: anchor, \
+                         composedPath() {{ return [anchor]; }} }});\n",
+                        serde_json::Value::from(*href)
+                    ),
+                })
+            })
+            .collect();
+        let program = format!(
+            "const INPUT = {};\n{}",
+            serde_json::json!({ "cases": inputs }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        assert_eq!(results.len(), cases.len());
+        for (result, (_, _, expected)) in results.iter().zip(cases) {
+            let name = result["name"].as_str().unwrap_or_default();
+            let posted = result["posted"].as_array().expect("posted");
+            assert_eq!(posted.len(), 1, "{name}: errors {}", result["errors"]);
+            let message = posted[0].as_str().expect("posted string");
+            match parse_ipc_message(message, CAP, 3) {
+                Some(IpcAction::Link { url, aside, .. }) => {
+                    assert!(aside, "{name}");
+                    assert_eq!(url, expected, "{name}");
+                }
+                other => panic!("{name}: expected a link action, got {other:?}"),
+            }
         }
     }
 
@@ -15807,7 +15873,9 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
         const actual = target.searchParams.get(name);
         if (!actual) continue;
         try {
-          const unwrapped = new URL(actual, location.href);
+          // So URL absoluta: em /search o `q` e um termo, e resolvido contra a
+          // coluna virava uma URL falsa na origem da IA.
+          const unwrapped = new URL(actual);
           if (unwrapped.protocol === 'http:' || unwrapped.protocol === 'https:') {
             target = unwrapped;
             break;
