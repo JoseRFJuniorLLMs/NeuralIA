@@ -4,6 +4,14 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+## [2.1.7] - 2026-09-23
+
+### Fixed
+- **Instalador — sem elipse escura:** o `neural-setup` abria uma zona de silêncio em forma de elipse à volta da marca e do texto, e via-se como um buraco escuro no meio do tecido. Saiu: os neurónios passam por trás da logo, como na Home do navegador. O título, a versão, o caminho de instalação, a etapa e a legenda leem-se por cima do tecido graças a uma orla fina na cor da página (`paint::text_on_tissue`); os botões mantêm o fundo próprio.
+
+### Testing
+- `the_neurons_pass_behind_the_brand_and_the_text` (sem zona de silêncio; neurónios por trás da marca e do texto ao longo do tempo) e `text_over_the_tissue_gets_a_thin_ring_not_a_box` (anel simétrico nas oito direções). Sabotagens: a elipse de volta e um anel torto ficam vermelhos.
+
 ## [2.1.6] - 2026-09-23
 
 ### Changed

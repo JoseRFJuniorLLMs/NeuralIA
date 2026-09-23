@@ -893,23 +893,25 @@ unsafe fn paint_window(hwnd: HWND, state: &Setup) {
     let body_font = paint::font(-(15.0 * layout.scale) as i32, 400);
     let small_font = paint::font(-(13.0 * layout.scale) as i32, 400);
 
-    paint::text(
+    paint::text_on_tissue(
         target,
         state.title(),
         layout.title,
         paint::FG,
         title_font,
         DT_CENTER | DT_SINGLELINE,
+        layout.scale,
     );
-    paint::text(
+    paint::text_on_tissue(
         target,
         &version_label(),
         layout.subtitle,
         paint::MUTED,
         small_font,
         DT_CENTER | DT_SINGLELINE,
+        layout.scale,
     );
-    paint::text(
+    paint::text_on_tissue(
         target,
         &state.message,
         layout.note,
@@ -920,25 +922,28 @@ unsafe fn paint_window(hwnd: HWND, state: &Setup) {
         },
         small_font,
         DT_CENTER | DT_WORDBREAK,
+        layout.scale,
     );
 
     if state.screen != Screen::Welcome {
         paint::progress_bar(target, &layout, state.progress, seconds, tone);
-        paint::text(
+        paint::text_on_tissue(
             target,
             state.stage.label(state.mode == Mode::Uninstall),
             layout.stage,
             paint::FG,
             body_font,
             DT_LEFT | DT_SINGLELINE,
+            layout.scale,
         );
-        paint::text(
+        paint::text_on_tissue(
             target,
             &format!("{:.0}%", state.progress * 100.0),
             layout.percent,
             tone,
             body_font,
             DT_RIGHT | DT_SINGLELINE,
+            layout.scale,
         );
     }
 
@@ -950,7 +955,7 @@ unsafe fn paint_window(hwnd: HWND, state: &Setup) {
             paint::hovered(state.hover, Hit::DesktopShortcut),
             layout.scale,
         );
-        paint::text(
+        paint::text_on_tissue(
             target,
             DESKTOP_SHORTCUT_LABEL,
             Rect {
@@ -961,6 +966,7 @@ unsafe fn paint_window(hwnd: HWND, state: &Setup) {
             paint::MUTED,
             small_font,
             DT_LEFT | DT_SINGLELINE,
+            layout.scale,
         );
     }
 
