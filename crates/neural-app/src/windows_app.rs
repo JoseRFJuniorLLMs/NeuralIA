@@ -7948,13 +7948,53 @@ fn js_percent(value: &str) -> String {
         .replace('+', "%20")
 }
 
+/// Como o agente dá papel e nome a um elemento, num só texto que entra no
+/// `AGENT_OBSERVER_SCRIPT` e no guard do `agent_action_script`.
+///
+/// Eram duas fórmulas: o observador dizia `textbox`/`button`/`select` e o
+/// guard recalculava `el.type` (`text`, `submit`, `select-one`), sem o
+/// placeholder no nome. Nos controlos mais comuns o guard desistia em silêncio
+/// e o passo ficava no trace como feito. Com uma só definição não há o que
+/// divergir.
+macro_rules! agent_element_identity_js {
+    () => {
+        r#"
+  function clean(value, limit) {
+    return String(value || '').replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
+  }
+
+  function fieldRole(el) {
+    const tag = (el.tagName || '').toLowerCase();
+    const type = (el.type || '').toLowerCase();
+    const autocomplete = (el.autocomplete || '').toLowerCase();
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    const name = (el.name || '').toLowerCase();
+    const combined = [type, autocomplete, role, name].join(' ');
+    if (combined.includes('password')) return 'password';
+    if (combined.includes('one-time') || combined.includes('otp')) return 'otp';
+    if (combined.includes('cc-') || combined.includes('card') || combined.includes('payment')) return 'payment-card';
+    if (combined.includes('email')) return 'email';
+    if (combined.includes('search')) return 'search';
+    if (tag === 'select') return 'select';
+    if (tag === 'input' || tag === 'textarea') return 'textbox';
+    return role || tag || 'element';
+  }
+
+  function elementName(el) {
+    return clean(el.getAttribute('aria-label') || el.name || el.innerText || el.textContent || el.placeholder, 96);
+  }
+"#
+    };
+}
+
 fn agent_action_script(action: &AgentAction) -> Result<String, String> {
     fn guard(target: &AgentElement) -> String {
         let id = js_percent(&target.id);
         let name = js_percent(&target.name);
         let role = js_percent(&target.role);
         format!(
-            "const id=decodeURIComponent('{id}');const expectedName=decodeURIComponent('{name}');             const expectedRole=decodeURIComponent('{role}');             const el=document.querySelector('[data-neuralia-agent-id=\"'+id+'\"]');             if(!el)return;             const actualName=((el.getAttribute('aria-label')||el.name||el.innerText||el.textContent||'').replace(/\\s+/g,' ').trim().slice(0,96));             const actualRole=(el.getAttribute('role')||el.type||el.tagName||'').toLowerCase();             if(expectedName && actualName!==expectedName)return;             if(expectedRole && actualRole!==expectedRole)return;"
+            "{identity}const id=decodeURIComponent('{id}');const expectedName=decodeURIComponent('{name}');             const expectedRole=decodeURIComponent('{role}');             const el=document.querySelector('[data-neuralia-agent-id=\"'+id+'\"]');             if(!el)return;             if(expectedName && elementName(el)!==expectedName)return;             if(expectedRole && fieldRole(el)!==expectedRole)return;",
+            identity = agent_element_identity_js!()
         )
     }
 
@@ -11540,6 +11580,81 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
                 run.state["send"]["clicks"], 1,
                 "o clique aprovado não chegou ao elemento"
             );
+        }
+
+        /// Observa, decide os `commands` sobre a primeira observação e corre os
+        /// scripts resultantes, logo a seguir, na mesma página.
+        fn plan_and_run(page: &Value, origin: &str, commands: &[BrowserAgentCommand]) -> DomRun {
+            let first = first_observation(page);
+            let mut policy = policy_for(origin);
+            let mut steps = vec![json!({ "advance": 800 })];
+            for next in 0..commands.len() {
+                let act = act(commands, next, &first, &mut policy);
+                let script = agent_action_script(&act.action).expect("executável");
+                steps.push(json!({ "eval": script }));
+            }
+            run_page(page, &steps)
+        }
+
+        #[test]
+        fn observer_and_guard_agree_on_ordinary_controls() {
+            // `<input type=text>`, `<button>` e `<select>`: o observador dizia
+            // textbox/button/select e o guard recalculava text/submit/select-one,
+            // desistia, e o passo ficava no trace como feito.
+            let page = json!({
+                "url": "https://shop.example/",
+                "title": "Loja",
+                "main": "Produtos",
+                "elements": [
+                    {"key": "q", "tag": "input", "attrs": {"type": "text", "name": "q"}},
+                    {"key": "go", "tag": "button", "text": "Buscar"},
+                    {"key": "sort", "tag": "select", "attrs": {"name": "ordenar"}, "options": ["a", "preco"]}
+                ]
+            });
+            let run = plan_and_run(
+                &page,
+                "https://shop.example",
+                &[
+                    BrowserAgentCommand::Search("rust".into()),
+                    BrowserAgentCommand::Click("Buscar".into()),
+                    BrowserAgentCommand::Select {
+                        label: "ordenar".into(),
+                        value: "preco".into(),
+                    },
+                ],
+            );
+            assert_eq!(run.state["q"]["value"], "rust", "texto não escrito");
+            assert_eq!(run.state["go"]["clicks"], 1, "botão não clicado");
+            assert_eq!(run.state["sort"]["value"], "preco", "select não mudou");
+        }
+
+        #[test]
+        fn guard_accepts_combobox_textarea_and_placeholder_named_input() {
+            // A caixa do Google (`<textarea role=combobox>`) e um campo cujo
+            // único nome é o placeholder.
+            for (field, expected) in [
+                (
+                    json!({"key": "f", "tag": "textarea", "attrs": {"role": "combobox", "name": "q", "aria-label": "Pesquisar"}}),
+                    "rust",
+                ),
+                (
+                    json!({"key": "f", "tag": "input", "attrs": {"type": "text", "placeholder": "Pesquisar"}}),
+                    "rust",
+                ),
+            ] {
+                let page = json!({
+                    "url": "https://www.example.com/",
+                    "title": "Busca",
+                    "main": "",
+                    "elements": [field]
+                });
+                let run = plan_and_run(
+                    &page,
+                    "https://www.example.com",
+                    &[BrowserAgentCommand::Search("rust".into())],
+                );
+                assert_eq!(run.state["f"]["value"], expected, "{field}");
+            }
         }
     }
 
@@ -15288,7 +15403,8 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
 })();
 "#;
 
-const AGENT_OBSERVER_SCRIPT: &str = r#"
+const AGENT_OBSERVER_SCRIPT: &str = concat!(
+    r#"
 (function () {
   if (window.top !== window) return;
   const capability = '__NEURALIA_CAP__';
@@ -15308,28 +15424,9 @@ const AGENT_OBSERVER_SCRIPT: &str = r#"
   // recebe um id seu.
   const agentIds = new WeakMap();
   let nextAgentId = 0;
-
-  function clean(value, limit) {
-    return String(value || '').replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
-  }
-
-  function fieldRole(el) {
-    const tag = (el.tagName || '').toLowerCase();
-    const type = (el.type || '').toLowerCase();
-    const autocomplete = (el.autocomplete || '').toLowerCase();
-    const role = (el.getAttribute('role') || '').toLowerCase();
-    const name = (el.name || '').toLowerCase();
-    const combined = [type, autocomplete, role, name].join(' ');
-    if (combined.includes('password')) return 'password';
-    if (combined.includes('one-time') || combined.includes('otp')) return 'otp';
-    if (combined.includes('cc-') || combined.includes('card') || combined.includes('payment')) return 'payment-card';
-    if (combined.includes('email')) return 'email';
-    if (combined.includes('search')) return 'search';
-    if (tag === 'select') return 'select';
-    if (tag === 'input' || tag === 'textarea') return 'textbox';
-    return role || tag || 'element';
-  }
-
+"#,
+    agent_element_identity_js!(),
+    r#"
   function observe() {
     timer = 0;
     const root = document.querySelector('main,[role="main"]') || document.body || document.documentElement;
@@ -15350,8 +15447,7 @@ const AGENT_OBSERVER_SCRIPT: &str = r#"
         agentIds.set(el, id);
       }
       if (el.getAttribute('data-neuralia-agent-id') !== id) el.setAttribute('data-neuralia-agent-id', id);
-      const name = clean(el.getAttribute('aria-label') || el.name || el.innerText || el.textContent || el.placeholder, 96);
-      rows.push([id, fieldRole(el), name, clean(el.tagName, 20), el.disabled ? '0' : '1'].join('\t'));
+      rows.push([id, fieldRole(el), elementName(el), clean(el.tagName, 20), el.disabled ? '0' : '1'].join('\t'));
     }
 
     const material = [location.href, document.title || '', pageText, rows.join('\n')].join('\n');
@@ -15392,7 +15488,8 @@ const AGENT_OBSERVER_SCRIPT: &str = r#"
     childList:true, subtree:true, attributes:true
   });
 })();
-"#;
+"#
+);
 
 const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
 document.addEventListener('DOMContentLoaded', () => {
