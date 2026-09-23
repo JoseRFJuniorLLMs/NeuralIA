@@ -20213,6 +20213,971 @@ console.log(JSON.stringify({{ calls, quiet: quiet === undefined }}));
         assert!(mixed.as_str().len() <= BAR_LABEL_MAX_BYTES);
         assert!(mixed.as_str().starts_with("⏸ 12:00"));
     }
+
+    /// Gates das notas (Zettelkasten): o painel que embarca, o parser dele,
+    /// o trabalho do worker e o Ctrl+Shift+Z das paginas.
+    mod notes_gates {
+        use super::*;
+
+        /// Um instante fixo: 2026-09-23 ~ 12:12 UTC.
+        const T0: u64 = 1_790_172_725;
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+
+        /// Pasta de notas temporaria, apagada no fim do teste.
+        struct NotesDir(std::path::PathBuf);
+
+        impl NotesDir {
+            fn new(tag: &str) -> Self {
+                static NEXT: AtomicUsize = AtomicUsize::new(0);
+                let dir = std::env::temp_dir().join(format!(
+                    "neuralia-notes-{tag}-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                let _ = std::fs::remove_dir_all(&dir);
+                Self(dir)
+            }
+
+            fn store(&self) -> ZettelStore {
+                ZettelStore::open(&self.0).expect("pasta de notas")
+            }
+        }
+
+        impl Drop for NotesDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// O caminho que um pedido do painel faz no produto, menos a thread:
+        /// parser do canal -> `notes_command_for` -> `run_notes_command`.
+        fn panel_request(store: &ZettelStore, body: &str, now: u64) -> NotesReply {
+            let message = parse_panel_message(body)
+                .unwrap_or_else(|| panic!("o parser recusou um pedido do painel: {body}"));
+            let command = notes_command_for(message)
+                .unwrap_or_else(|| panic!("nao e um pedido das notas: {body}"));
+            run_notes_command(store, command, now)
+        }
+
+        /// Um DOM pequeno, criado DENTRO do contexto do vm, onde corre o
+        /// `<script>` do `PANEL_HTML` que embarca sobre a marcacao dele.
+        /// `innerHTML`, `outerHTML`, `insertAdjacentHTML` e `document.write`
+        /// nao interpretam nada: so ficam registados em `__html`.
+        const PANEL_DOM_HARNESS: &str = r##"
+const vm = require('node:vm');
+const DOM = String.raw`
+var __posted = [], __errors = [], __html = [], __timers = [], __created = [], __out = {};
+class Node {
+  constructor() { this.childNodes = []; this.parentNode = null; this.__listeners = []; }
+  addEventListener(type, handler) { this.__listeners.push({ type: String(type), handler }); }
+  removeEventListener() {}
+  appendChild(child) {
+    if (child.parentNode) child.parentNode.removeChild(child);
+    child.parentNode = this; this.childNodes.push(child); return child;
+  }
+  removeChild(child) {
+    const i = this.childNodes.indexOf(child);
+    if (i >= 0) this.childNodes.splice(i, 1);
+    child.parentNode = null; return child;
+  }
+  append(...nodes) { for (const n of nodes) this.appendChild(typeof n === 'string' ? new Text(n) : n); }
+  get textContent() { return this.childNodes.map((n) => n.textContent).join(''); }
+  set textContent(value) {
+    for (const c of this.childNodes) c.parentNode = null;
+    this.childNodes = [];
+    const text = String(value);
+    if (text) this.appendChild(new Text(text));
+  }
+}
+class Text extends Node {
+  constructor(data) { super(); this.data = String(data); }
+  get textContent() { return this.data; }
+  set textContent(value) { this.data = String(value); }
+}
+class Element extends Node {
+  constructor(tag) {
+    super();
+    this.tagName = String(tag).toUpperCase(); this.attributes = {};
+    this.style = { setProperty() {} }; this.value = ''; this.hidden = false;
+    this.className = ''; this.disabled = false; this.title = ''; this.id = '';
+  }
+  setAttribute(k, v) { this.attributes[k] = String(v); }
+  getAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attributes, k) ? this.attributes[k] : null; }
+  removeAttribute(k) { delete this.attributes[k]; }
+  get children() { return this.childNodes.filter((n) => n instanceof Element); }
+  querySelector(selector) {
+    const want = String(selector).toUpperCase();
+    const walk = (node) => {
+      for (const c of node.children) { if (c.tagName === want) return c; const f = walk(c); if (f) return f; }
+      return null;
+    };
+    return walk(this);
+  }
+  focus() { document.activeElement = this; }
+  blur() {}
+  select() {}
+  get innerHTML() { return ''; }
+  set innerHTML(v) { __html.push(String(v)); }
+  get outerHTML() { return ''; }
+  set outerHTML(v) { __html.push(String(v)); }
+  insertAdjacentHTML(_where, v) { __html.push(String(v)); }
+}
+class Document extends Node {
+  constructor() {
+    super();
+    this.documentElement = new Element('html');
+    this.body = new Element('body');
+    this.documentElement.appendChild(this.body);
+    this.activeElement = null;
+  }
+  createElement(tag) { __created.push(String(tag).toLowerCase()); return new Element(tag); }
+  createTextNode(text) { return new Text(text); }
+  getElementById(id) {
+    const walk = (node) => {
+      for (const c of node.children) { if (c.id === id) return c; const f = walk(c); if (f) return f; }
+      return null;
+    };
+    return walk(this.documentElement);
+  }
+  write(v) { __html.push(String(v)); }
+}
+var document = new Document();
+var window = { ipc: { postMessage(message) { __posted.push(String(message)); } } };
+window.top = window;
+function setTimeout(fn) { __timers.push({ fn, done: false }); return __timers.length; }
+function clearTimeout(id) { const t = __timers[id - 1]; if (t) t.done = true; }
+function __drain() {
+  for (let round = 0; round < 20; round++) {
+    const due = __timers.filter((t) => !t.done);
+    if (!due.length) return;
+    for (const t of due) { t.done = true; try { t.fn(); } catch (e) { __errors.push('timer: ' + e.message); } }
+  }
+}
+function __fire(target, type, extra) {
+  const event = Object.assign({
+    type, target, key: '', ctrlKey: false, metaKey: false, shiftKey: false, altKey: false,
+    defaultPrevented: false, stopped: false,
+    preventDefault() { this.defaultPrevented = true; }, stopPropagation() { this.stopped = true; }
+  }, extra || {});
+  const run = (node) => {
+    for (const l of node.__listeners.slice()) {
+      if (l.type !== type) continue;
+      try { l.handler.call(node, event); } catch (e) { __errors.push(type + ': ' + e.message); }
+    }
+  };
+  for (let node = target; node && !event.stopped; node = node.parentNode) run(node);
+  if (!event.stopped && target !== document) run(document);
+  return event;
+}
+function __build(html) {
+  const start = html.indexOf('<body>') + '<body>'.length;
+  const scriptAt = html.indexOf('<script>');
+  const markup = html.slice(start, scriptAt);
+  const stack = [document.body];
+  const VOID = { input: 1, meta: 1, br: 1, img: 1, hr: 1 };
+  const tag = /<(\/?)([a-zA-Z][a-zA-Z0-9]*)([^>]*)>|([^<]+)/g;
+  let m;
+  while ((m = tag.exec(markup))) {
+    if (m[4] !== undefined) {
+      if (m[4].trim()) stack[stack.length - 1].appendChild(new Text(m[4]));
+      continue;
+    }
+    if (m[1]) { stack.pop(); continue; }
+    const el = new Element(m[2]);
+    const attr = /([a-zA-Z-]+)(?:="([^"]*)")?/g;
+    let a;
+    while ((a = attr.exec(m[3]))) {
+      const name = a[1], value = a[2] === undefined ? '' : a[2];
+      if (name === 'hidden') el.hidden = true;
+      else if (name === 'id') el.id = value;
+      else if (name === 'class') el.className = value;
+      else if (name === 'title') el.title = value;
+      else el.setAttribute(name, value);
+    }
+    stack[stack.length - 1].appendChild(el);
+    if (!VOID[m[2].toLowerCase()]) stack.push(el);
+  }
+  return html.slice(scriptAt + '<script>'.length, html.indexOf('</script>'));
+}
+const $ = (id) => document.getElementById(id);
+function __type(el, value) { el.value = value; __fire(el, 'input'); }
+function __click(el) { return __fire(el, 'click'); }
+function __key(el, key, mods) { return __fire(el, 'keydown', Object.assign({ key }, mods || {})); }
+function __visible(el) {
+  for (let node = el; node && node !== document.body; node = node.parentNode) if (node.hidden) return false;
+  return true;
+}
+function __buttons(el) { return el.children.filter((c) => c.tagName === 'BUTTON'); }
+`;
+const context = vm.createContext({ TextEncoder, URL });
+vm.runInContext(DOM, context);
+context.__panelHtml = INPUT.html;
+const script = vm.runInContext('__build(__panelHtml)', context);
+vm.runInContext(script, context, { filename: 'PANEL_HTML' });
+INPUT.steps.forEach((step, index) => {
+  try { vm.runInContext(step, context, { filename: 'step' + index }); }
+  catch (e) { context.__errors.push('step ' + index + ': ' + e.message); }
+});
+process.stdout.write(JSON.stringify({
+  out: context.__out,
+  posted: Array.from(context.__posted, String),
+  errors: Array.from(context.__errors, String),
+  html: Array.from(context.__html, String),
+  created: Array.from(context.__created, String),
+  pwned: context.__pwned === undefined ? null : String(context.__pwned),
+}));
+"##;
+
+        /// Corre o `PANEL_HTML` que embarca (com o tema posto por
+        /// `panel_html`) e depois cada passo, pela ordem, no mesmo contexto.
+        fn run_panel(steps: &[String]) -> serde_json::Value {
+            let input = serde_json::json!({
+                "html": panel_html(&Theme::dark((0, 120, 215))),
+                "steps": steps,
+            });
+            let program = format!("const INPUT = {input};\n{PANEL_DOM_HARNESS}");
+            let output = run_node_program(&program);
+            let result: serde_json::Value =
+                serde_json::from_str(&output).expect("o harness devolve JSON");
+            assert_eq!(
+                result["errors"],
+                serde_json::json!([]),
+                "o painel lancou excecoes"
+            );
+            result
+        }
+
+        fn posted(result: &serde_json::Value) -> Vec<String> {
+            result["posted"]
+                .as_array()
+                .expect("posted")
+                .iter()
+                .map(|message| message.as_str().expect("string").to_string())
+                .collect()
+        }
+
+        fn action_of(message: &str) -> String {
+            let value: serde_json::Value = serde_json::from_str(message).expect("json");
+            value["action"].as_str().unwrap_or_default().to_string()
+        }
+
+        fn save_message(id: Option<&str>, title: &str, body: &str, tags: &[&str]) -> String {
+            serde_json::json!({
+                "action": "note-save",
+                "args": { "id": id, "title": title, "body": body, "tags": tags },
+            })
+            .to_string()
+        }
+
+        /// Gate: o canal do painel so aceita pedidos de notas dentro dos
+        /// tectos, so o `note-save` passa dos 4 KiB, e um id que nao e um id
+        /// de nota (`../`, `C:\`, letras) morre no parser, antes do disco.
+        #[test]
+        fn notes_panel_messages_are_capped_and_note_ids_are_validated() {
+            assert_eq!(
+                parse_panel_message(r#"{"action":"notes-list","args":{}}"#),
+                Some(PanelMessage::NotesList)
+            );
+            assert_eq!(
+                parse_panel_message(r#"{"action":"notes-search","args":{"query":"  zettel  "}}"#),
+                Some(PanelMessage::NotesSearch("zettel".to_string()))
+            );
+            assert_eq!(
+                parse_panel_message(r#"{"action":"note-open","args":{"id":"202609231212"}}"#),
+                Some(PanelMessage::NoteOpen("202609231212".to_string()))
+            );
+            assert_eq!(
+                parse_panel_message(r#"{"action":"note-delete","args":{"id":"20260923121205-2"}}"#),
+                Some(PanelMessage::NoteDelete("20260923121205-2".to_string()))
+            );
+            let long_query = format!(
+                r#"{{"action":"notes-search","args":{{"query":"{}"}}}}"#,
+                "a".repeat(PANEL_QUERY_MAX_CHARS + 1)
+            );
+            assert_eq!(
+                parse_panel_message(&long_query),
+                None,
+                "busca acima do tecto"
+            );
+            assert_eq!(
+                parse_panel_message(r#"{"action":"notes-search","args":{"query":"   "}}"#),
+                None
+            );
+
+            // Ids que viravam caminho fora da pasta, ou nome de outro ficheiro.
+            for id in [
+                serde_json::json!("../../Windows/win"),
+                serde_json::json!("..\\..\\x"),
+                serde_json::json!("C:\\x"),
+                serde_json::json!("/etc/passwd"),
+                serde_json::json!("2026/../x"),
+                serde_json::json!("12a"),
+                serde_json::json!("-1"),
+                serde_json::json!(""),
+                serde_json::json!("1".repeat(65)),
+                serde_json::json!(202609231212u64),
+                serde_json::Value::Null,
+            ] {
+                for action in ["note-open", "note-delete"] {
+                    let body =
+                        serde_json::json!({"action": action, "args": {"id": id}}).to_string();
+                    assert_eq!(
+                        parse_panel_message(&body),
+                        None,
+                        "{action} aceitou o id {id}"
+                    );
+                }
+                let save = serde_json::json!({
+                    "action": "note-save",
+                    "args": {"id": id, "title": "t", "body": "b", "tags": []},
+                })
+                .to_string();
+                if !id.is_null() {
+                    assert_eq!(
+                        parse_panel_message(&save),
+                        None,
+                        "note-save aceitou o id {id}"
+                    );
+                }
+            }
+            assert_eq!(
+                parse_panel_message(
+                    r#"{"action":"note-open","args":{"id":"202609231212","path":"../x"}}"#
+                ),
+                None,
+                "campo a mais"
+            );
+
+            // Salvar: nota nova (id null) e nota existente.
+            assert_eq!(
+                parse_panel_message(&save_message(
+                    None,
+                    "  Título  ",
+                    "corpo\n",
+                    &[" a ", "", "b"]
+                )),
+                Some(PanelMessage::NoteSave(NoteEdit {
+                    id: None,
+                    title: "Título".to_string(),
+                    body: "corpo\n".to_string(),
+                    tags: vec!["a".to_string(), "b".to_string()],
+                }))
+            );
+            assert!(matches!(
+                parse_panel_message(&save_message(Some("202609231212"), "t", "b", &[])),
+                Some(PanelMessage::NoteSave(NoteEdit { id: Some(ref id), .. })) if id == "202609231212"
+            ));
+            let bad_saves = [
+                save_message(None, &"t".repeat(NOTE_TITLE_MAX_CHARS + 1), "b", &[]),
+                save_message(None, "linha\nquebrada", "b", &[]),
+                save_message(None, "t", &"b".repeat(NOTE_BODY_MAX_BYTES + 1), &[]),
+                save_message(None, "t", "b", &["x"; NOTE_TAGS_MAX + 1]),
+                save_message(None, "t", "b", &[&"x".repeat(NOTE_TAG_MAX_CHARS + 1)]),
+                r#"{"action":"note-save","args":{"id":null,"title":"t","body":"b","tags":[7]}}"#
+                    .to_string(),
+                r#"{"action":"note-save","args":{"id":null,"title":"t","body":"b"}}"#.to_string(),
+                r#"{"action":"note-save","args":{"id":null,"title":"t","body":"b","tags":[],"source":"https://x"}}"#
+                    .to_string(),
+            ];
+            for bad in &bad_saves {
+                assert_eq!(
+                    parse_panel_message(bad),
+                    None,
+                    "note-save aceito: {:.120}",
+                    bad
+                );
+            }
+
+            // O corpo no tecto passa, mesmo no pior caso do JSON (cada byte
+            // escrito como \u00XX): a mensagem fica muito acima dos 4 KiB.
+            let body = "b".repeat(NOTE_BODY_MAX_BYTES);
+            let big = save_message(None, "t", &body, &[]);
+            assert!(big.len() > PANEL_MESSAGE_MAX_BYTES);
+            assert!(matches!(
+                parse_panel_message(&big),
+                Some(PanelMessage::NoteSave(_))
+            ));
+            let controls = "\u{1}".repeat(NOTE_BODY_MAX_BYTES);
+            let worst = save_message(
+                None,
+                &"\u{e9}".repeat(NOTE_TITLE_MAX_CHARS),
+                &controls,
+                &["\u{e9}"; NOTE_TAGS_MAX],
+            );
+            assert!(
+                worst.len() > 5 * NOTE_BODY_MAX_BYTES,
+                "o JSON escapou os controlos"
+            );
+            assert!(
+                matches!(parse_panel_message(&worst), Some(PanelMessage::NoteSave(_))),
+                "o pior caso legitimo tem de caber"
+            );
+            let over = format!(
+                r#"{{"action":"note-save","args":{{"id":null,"title":"t","body":"b","tags":[]}},"pad":"{}"}}"#,
+                "x".repeat(NOTE_SAVE_MESSAGE_MAX_BYTES)
+            );
+            assert_eq!(
+                parse_panel_message(&over),
+                None,
+                "acima do tecto do note-save"
+            );
+
+            // Todos os OUTROS pedidos continuam presos aos 4 KiB.
+            let pad = "x".repeat(PANEL_MESSAGE_MAX_BYTES);
+            for small in [
+                r#"{"action":"ready","pad":"PAD"}"#,
+                r#"{"action":"close","pad":"PAD"}"#,
+                r#"{"action":"notes-list","args":{},"pad":"PAD"}"#,
+                r#"{"action":"notes-search","args":{"query":"x"},"pad":"PAD"}"#,
+                r#"{"action":"note-open","args":{"id":"202609231212"},"pad":"PAD"}"#,
+                r#"{"action":"note-delete","args":{"id":"202609231212"},"pad":"PAD"}"#,
+                r#"{"action":"search","args":{"query":"x"},"pad":"PAD"}"#,
+                r#"{"action":"open","args":{"input":"https://exemplo.pt"},"pad":"PAD"}"#,
+            ] {
+                let body = small.replace("PAD", &pad);
+                assert!(body.len() > PANEL_MESSAGE_MAX_BYTES);
+                assert_eq!(
+                    parse_panel_message(&body),
+                    None,
+                    "{:.60} passou dos 4 KiB",
+                    body
+                );
+                // O mesmo pedido, pequeno, e aceite: a recusa e so do tamanho.
+                assert!(
+                    parse_panel_message(&small.replace("PAD", "x")).is_some(),
+                    "{small}"
+                );
+            }
+        }
+
+        /// Gate: o editor do painel que embarca, conduzido como o utilizador
+        /// (Nova nota, escrever, Ctrl+S, buscar, abrir, Excluir, confirmar),
+        /// e cada pedido que ele manda levado pelo parser e pelo trabalho do
+        /// worker a uma pasta temporaria.
+        #[test]
+        fn notes_panel_saves_lists_searches_and_deletes_through_the_shipped_handler() {
+            let dir = NotesDir::new("roundtrip");
+            let store = dir.store();
+
+            // 1. Nova nota, escrita e salva com Ctrl+S; depois uma busca.
+            let first = run_panel(&[
+                "__out.readyFirst = __posted.length === 1 && JSON.parse(__posted[0]).action === 'ready';".into(),
+                "__posted.length = 0; window.neuraliaShowSection('notes');".into(),
+                "__out.notesVisible = __visible($('view-notes')) && !__visible($('view-history'));".into(),
+                "__click($('note-new'));".into(),
+                "__out.editorVisible = __visible($('note-body'));".into(),
+                "__type($('note-title'), 'Método Zettelkasten');".into(),
+                "__type($('note-body'), 'Uma ideia por nota.\\nLiga com [[202601010000]].');".into(),
+                "__type($('note-tags'), 'método,  zettel ,');".into(),
+                "__out.ctrlS = __key($('note-body'), 's', { ctrlKey: true }).defaultPrevented;".into(),
+                "__click($('note-back'));".into(),
+                "__type($('nq'), 'zettel');".into(),
+                "__drain();".into(),
+            ]);
+            assert_eq!(first["out"]["readyFirst"], true);
+            assert_eq!(first["out"]["notesVisible"], true);
+            assert_eq!(first["out"]["editorVisible"], true);
+            assert_eq!(first["out"]["ctrlS"], true, "Ctrl+S e do editor");
+            let sent = posted(&first);
+            let actions: Vec<String> = sent.iter().map(|m| action_of(m)).collect();
+            assert_eq!(
+                actions,
+                ["notes-list", "note-save", "notes-list", "notes-search"],
+                "{sent:?}"
+            );
+
+            // O note-save do painel grava na pasta.
+            let saved = match panel_request(&store, &sent[1], T0) {
+                NotesReply::Opened {
+                    cause: NoteOpened::Saved,
+                    note,
+                    ..
+                } => note,
+                other => panic!("salvar devolveu {other:?}"),
+            };
+            assert_eq!(saved.title, "Método Zettelkasten");
+            assert_eq!(
+                saved.body,
+                "Uma ideia por nota.\nLiga com [[202601010000]]."
+            );
+            assert_eq!(saved.tags, ["método", "zettel"]);
+            let file = dir.0.join(format!("{}.md", saved.id));
+            let text = std::fs::read_to_string(&file).expect("a nota esta no disco");
+            assert!(text.contains("title: Método Zettelkasten"), "{text}");
+            assert!(text.ends_with("Liga com [[202601010000]]."), "{text}");
+
+            // A lista e a busca que o painel pediu encontram-na.
+            match panel_request(&store, &sent[2], T0) {
+                NotesReply::Listed {
+                    query: None,
+                    total: 1,
+                    notes,
+                } => {
+                    assert_eq!(notes[0].id, saved.id);
+                }
+                other => panic!("lista devolveu {other:?}"),
+            }
+            match panel_request(&store, &sent[3], T0) {
+                NotesReply::Listed {
+                    query: Some(query),
+                    notes,
+                    ..
+                } => {
+                    assert_eq!(query, "zettel");
+                    assert_eq!(notes.len(), 1);
+                }
+                other => panic!("busca devolveu {other:?}"),
+            }
+            assert!(matches!(
+                panel_request(
+                    &store,
+                    r#"{"action":"notes-search","args":{"query":"inexistente"}}"#,
+                    T0
+                ),
+                NotesReply::Listed { total: 0, .. }
+            ));
+
+            // 2. A nota aberta no editor: editar e salvar outra vez mantem o
+            //    id; Excluir pede confirmacao e so depois manda o pedido.
+            let opened = panel_request(
+                &store,
+                &serde_json::json!({"action": "note-open", "args": {"id": saved.id}}).to_string(),
+                T0 + 60,
+            );
+            assert!(matches!(
+                opened,
+                NotesReply::Opened {
+                    cause: NoteOpened::Open,
+                    ..
+                }
+            ));
+            let second = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                notes_reply_script(&opened),
+                "__out.title = $('note-title').value;".into(),
+                "__type($('note-body'), $('note-body').value + '\\nMais uma linha.');".into(),
+                "__click($('note-save'));".into(),
+                "__click($('note-delete'));".into(),
+                "__out.askedFirst = __posted.length === 1 && __visible($('note-confirm'));".into(),
+                "__click($('note-confirm-yes'));".into(),
+            ]);
+            assert_eq!(second["out"]["title"], "Método Zettelkasten");
+            assert_eq!(second["out"]["askedFirst"], true, "Excluir pergunta antes");
+            let sent = posted(&second);
+            let actions: Vec<String> = sent.iter().map(|m| action_of(m)).collect();
+            assert_eq!(actions, ["note-save", "note-delete"], "{sent:?}");
+
+            match panel_request(&store, &sent[0], T0 + 120) {
+                NotesReply::Opened { note, .. } => {
+                    assert_eq!(note.id, saved.id, "salvar de novo nao cria outra nota");
+                    assert!(note.body.ends_with("Mais uma linha."));
+                    assert_eq!(note.updated_unix, T0 + 120);
+                    assert_eq!(note.created_unix, T0);
+                }
+                other => panic!("salvar devolveu {other:?}"),
+            }
+            assert_eq!(
+                panel_request(&store, &sent[1], T0 + 180),
+                NotesReply::Deleted {
+                    id: saved.id.clone()
+                }
+            );
+            assert!(!file.exists(), "a nota saiu da pasta");
+            assert!(
+                dir.0
+                    .join(zettel::TRASH_DIR)
+                    .join(format!("{}.md", saved.id))
+                    .is_file(),
+                "e foi para a lixeira"
+            );
+            assert!(matches!(
+                panel_request(&store, r#"{"action":"notes-list","args":{}}"#, T0),
+                NotesReply::Listed { total: 0, .. }
+            ));
+            assert_eq!(
+                panel_request(&store, &sent[1], T0 + 240),
+                NotesReply::Missing { id: saved.id }
+            );
+        }
+
+        /// Gate: uma nota com HTML e JS no titulo, no corpo, nas tags e na
+        /// fonte chega ao painel que embarca byte a byte como TEXTO. O
+        /// payload vai em JSON: aspas, `'); ...`, `</script>` e U+2028 nao
+        /// fecham nada. Nenhum elemento sai do que a nota diz.
+        #[test]
+        fn notes_render_keeps_hostile_note_text_inert() {
+            let dir = NotesDir::new("hostile");
+            let store = dir.store();
+            let target = store
+                .create("Alvo", "texto", Vec::new(), None, T0)
+                .expect("alvo");
+            let title = "<img src=x onerror=\"globalThis.__pwned='title'\">";
+            let body = format!(
+                "</script><script>globalThis.__pwned='script'</script>\n\
+                 '); globalThis.__pwned = 'quote'; ('\n\
+                 \" \\\" \\\\ \u{2028} \u{2029} ${{globalThis.__pwned='template'}}\n\
+                 Ver [[{}|<b onclick=\"globalThis.__pwned='alias'\">alvo</b>]] e [[nao-e-id]].",
+                target.id
+            );
+            let hostile = store
+                .create(
+                    title,
+                    &body,
+                    vec!["<i>tag</i>".to_string()],
+                    Some("https://example.com/?q=<script>alert(1)</script>".to_string()),
+                    T0 + 60,
+                )
+                .expect("nota hostil");
+            // O alvo ganha um backlink com o titulo hostil.
+            let listed = run_notes_command(&store, NotesCommand::List, T0);
+            let opened = run_notes_command(&store, NotesCommand::Open(hostile.id.clone()), T0);
+            let target_opened =
+                run_notes_command(&store, NotesCommand::Open(target.id.clone()), T0);
+            match &target_opened {
+                NotesReply::Opened { backlinks, .. } => {
+                    assert_eq!(backlinks.len(), 1);
+                    assert_eq!(backlinks[0].title, title);
+                }
+                other => panic!("{other:?}"),
+            }
+
+            let result = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                notes_reply_script(&listed),
+                "__out.listTitles = $('notes-list').children.map((b) => b.children[0].textContent);".into(),
+                notes_reply_script(&opened),
+                "__out.title = $('note-title').value; __out.body = $('note-body').value;".into(),
+                "__out.tags = $('note-tags').value; __out.source = $('note-source').textContent;".into(),
+                "__out.links = __buttons($('note-preview')).map((b) => b.textContent);".into(),
+                "__out.preview = $('note-preview').textContent;".into(),
+                "__click(__buttons($('note-preview'))[0]);".into(),
+                "__click($('note-source'));".into(),
+                notes_reply_script(&target_opened),
+                "__out.backlinks = __buttons($('note-backlinks')).map((b) => b.textContent);".into(),
+            ]);
+            let out = &result["out"];
+            assert_eq!(
+                result["pwned"],
+                serde_json::Value::Null,
+                "codigo da nota correu"
+            );
+            assert_eq!(
+                result["html"],
+                serde_json::json!([]),
+                "a nota passou por HTML"
+            );
+            for tag in result["created"].as_array().expect("created") {
+                assert!(
+                    matches!(tag.as_str(), Some("button" | "span" | "div")),
+                    "a nota criou um <{tag}>"
+                );
+            }
+            assert_eq!(out["listTitles"], serde_json::json!([title, "Alvo"]));
+            assert_eq!(out["title"], title);
+            assert_eq!(out["body"], body.as_str(), "o corpo chega byte a byte");
+            assert_eq!(out["tags"], "<i>tag</i>");
+            assert_eq!(
+                out["source"],
+                "https://example.com/?q=<script>alert(1)</script>"
+            );
+            // So o [[id|..]] valido vira link; o rotulo e texto.
+            assert_eq!(
+                out["links"],
+                serde_json::json!(["<b onclick=\"globalThis.__pwned='alias'\">alvo</b>"])
+            );
+            assert_eq!(
+                out["preview"],
+                body.as_str().replace(
+                    &format!(
+                        "[[{}|<b onclick=\"globalThis.__pwned='alias'\">alvo</b>]]",
+                        target.id
+                    ),
+                    "<b onclick=\"globalThis.__pwned='alias'\">alvo</b>"
+                )
+            );
+            assert_eq!(out["backlinks"], serde_json::json!([title]));
+            let sent: Vec<PanelMessage> = posted(&result)
+                .iter()
+                .map(|m| parse_panel_message(m).unwrap_or_else(|| panic!("recusado: {m}")))
+                .collect();
+            assert_eq!(
+                sent,
+                [
+                    PanelMessage::NoteOpen(target.id.clone()),
+                    PanelMessage::Open(
+                        "https://example.com/?q=<script>alert(1)</script>".to_string()
+                    ),
+                ]
+            );
+        }
+
+        /// Gate: o Ctrl+Shift+Z do mapa de teclas que embarca pede uma nota
+        /// sem mandar nada da pagina; o Ctrl+Z e o refazer dos campos
+        /// editaveis ficam com a pagina.
+        #[test]
+        fn ctrl_shift_z_on_a_page_posts_a_bare_note_request() {
+            let drive = r#"
+document.readyState = 'interactive';
+__fire('DOMContentLoaded');
+__drain();
+__fire('keydown', { key: 'z', ctrlKey: true });
+__fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true, target: new Element('textarea') });
+__fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true, target: Object.assign(new Element('div'), { isContentEditable: true }) });
+__fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
+"#;
+            let cases = [serde_json::json!({
+                "name": "keymap",
+                "href": "https://example.com/",
+                "script": NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", CAP),
+                "drive": drive,
+            })];
+            let program = format!(
+                "const INPUT = {};\n{}",
+                serde_json::json!({ "cases": cases }),
+                INJECTED_SCRIPT_HARNESS
+            );
+            let results: Vec<serde_json::Value> =
+                serde_json::from_str(&run_node_program(&program)).expect("harness json");
+            let sent = results[0]["posted"].as_array().expect("posted");
+            assert_eq!(
+                sent.len(),
+                1,
+                "so o Ctrl+Shift+Z fora de um campo: {sent:?}"
+            );
+            let message = sent[0].as_str().expect("string");
+            assert_eq!(
+                parse_ipc_message(message, CAP, 3),
+                Some(IpcAction::Note),
+                "{message}"
+            );
+            let value: serde_json::Value = serde_json::from_str(message).expect("json");
+            assert_eq!(
+                value["args"],
+                serde_json::json!({}),
+                "a pagina nao manda dados"
+            );
+        }
+
+        /// Gate: o `note` vai para a WebView que o mandou -- a coluna dela, o
+        /// Split, a WebView unica -- e o Split privado recusa sem ler. A
+        /// decisao repete-se na hora de ler, com o Split que existe entao.
+        #[test]
+        fn a_note_request_reads_its_own_webview_and_never_the_private_split() {
+            for col in 0..COMPARATOR_COLUMNS {
+                assert!(matches!(
+                    App::column_ipc_event_impl(col, IpcAction::Note),
+                    Some(UserEvent::NoteRequested(Some(PageTarget::Column(c)))) if c == col
+                ));
+            }
+            assert!(matches!(
+                App::split_ipc_event_impl(1, false, IpcAction::Note),
+                Some(UserEvent::NoteRequested(Some(PageTarget::Split)))
+            ));
+            assert!(matches!(
+                App::split_ipc_event_impl(1, true, IpcAction::Note),
+                Some(UserEvent::NoteRefusedPrivate)
+            ));
+            assert!(matches!(
+                common_ipc_event(IpcAction::Note),
+                Some(UserEvent::NoteRequested(None))
+            ));
+            // Na hora de ler.
+            assert_eq!(
+                note_capture_decision(Some(PageTarget::Split), Some(true)),
+                NoteCapture::RefusePrivate
+            );
+            assert_eq!(
+                note_capture_decision(Some(PageTarget::Split), Some(false)),
+                NoteCapture::Read
+            );
+            assert_eq!(
+                note_capture_decision(Some(PageTarget::Split), None),
+                NoteCapture::NoPage
+            );
+            for target in [
+                Some(PageTarget::Column(0)),
+                Some(PageTarget::Column(2)),
+                None,
+            ] {
+                for split in [None, Some(false), Some(true)] {
+                    assert_eq!(
+                        note_capture_decision(target, split),
+                        NoteCapture::Read,
+                        "{target:?} com split {split:?}"
+                    );
+                }
+            }
+            assert_eq!(NOTE_PRIVATE_REFUSAL, "Modo privado: notas não são criadas");
+        }
+
+        /// Gate: a selecao vira uma nota com a citacao, a fonte e a tag
+        /// "web"; o que a pagina devolve e cortado e validado outra vez.
+        #[test]
+        fn a_selection_becomes_a_quoted_note_with_its_source() {
+            let capture = |text: &str, url: &str, title: &str| {
+                serde_json::json!({ "text": text, "url": url, "title": title }).to_string()
+            };
+            let draft = note_draft_from_capture(
+                &capture(
+                    "  Linha 1\r\nLinha 2\n\n  Linha 4  \n",
+                    "https://example.com/artigo#parte",
+                    "  Artigo\tde   teste ",
+                ),
+                None,
+            )
+            .expect("nota");
+            assert_eq!(
+                draft,
+                NoteDraft {
+                    title: "Artigo de teste".to_string(),
+                    body: "> Linha 1\n> Linha 2\n>\n>   Linha 4\n\nFonte: https://example.com/artigo#parte\n"
+                        .to_string(),
+                    tags: vec!["web".to_string()],
+                    source: Some("https://example.com/artigo#parte".to_string()),
+                }
+            );
+
+            // Sem titulo na pagina: as primeiras palavras da selecao.
+            let untitled = note_draft_from_capture(
+                &capture(
+                    "um dois tres quatro cinco seis sete oito nove dez",
+                    "https://example.com/",
+                    "   ",
+                ),
+                None,
+            )
+            .expect("nota");
+            assert_eq!(untitled.title, "um dois tres quatro cinco seis sete oito");
+
+            // Nada selecionado.
+            for empty in ["", "   \n\t "] {
+                assert_eq!(
+                    note_draft_from_capture(&capture(empty, "https://example.com/", "T"), None),
+                    Err(NoteCaptureError::EmptySelection)
+                );
+            }
+            // Resposta que nao e o objeto do script.
+            for raw in [
+                "null".to_string(),
+                "\"texto\"".to_string(),
+                "nao e json".to_string(),
+                capture(
+                    &"a".repeat(NOTE_CAPTURE_MAX_BYTES),
+                    "https://example.com/",
+                    "T",
+                ),
+            ] {
+                assert_eq!(
+                    note_draft_from_capture(&raw, None),
+                    Err(NoteCaptureError::Unreadable),
+                    "{:.40}",
+                    raw
+                );
+            }
+
+            // A pagina pode mentir sobre o corte: o lado nativo corta.
+            let long = note_draft_from_capture(
+                &capture(
+                    &"q".repeat(NOTE_SELECTION_MAX_CHARS + 5_000),
+                    "https://example.com/",
+                    "T",
+                ),
+                None,
+            )
+            .expect("nota");
+            assert_eq!(
+                long.body.matches('q').count(),
+                NOTE_SELECTION_MAX_CHARS,
+                "a selecao fica no tecto"
+            );
+
+            // Enderecos que nao sao fonte: sem fonte e sem a linha "Fonte:".
+            let pdf_viewer = format!("{PDF_ORIGIN}/viewer.html");
+            for url in [
+                "javascript:alert(1)",
+                "file:///C:/Windows/win.ini",
+                "about:blank",
+                "data:text/html,<p>x</p>",
+                pdf_viewer.as_str(),
+            ] {
+                let draft =
+                    note_draft_from_capture(&capture("texto", url, "T"), None).expect("nota");
+                assert_eq!(draft.source, None, "{url}");
+                assert_eq!(draft.body, "> texto\n", "{url}");
+            }
+            // O endereco que o lado nativo conhece (Leitor, PDF) manda.
+            let from_pdf = note_draft_from_capture(
+                &capture("texto", &pdf_viewer, "Doc"),
+                Some("https://example.com/doc.pdf"),
+            )
+            .expect("nota");
+            assert_eq!(
+                from_pdf.source.as_deref(),
+                Some("https://example.com/doc.pdf")
+            );
+
+            // E a nota vai para a pasta, pelo mesmo trabalho do worker.
+            let dir = NotesDir::new("selection");
+            let store = dir.store();
+            match run_notes_command(&store, NotesCommand::Create(draft), T0) {
+                NotesReply::Opened {
+                    cause: NoteOpened::Created,
+                    note,
+                    ..
+                } => {
+                    let text = std::fs::read_to_string(dir.0.join(format!("{}.md", note.id)))
+                        .expect("ficheiro");
+                    assert!(
+                        text.contains("source: https://example.com/artigo#parte"),
+                        "{text}"
+                    );
+                    assert!(text.contains("tags: [web]"), "{text}");
+                    assert!(
+                        text.ends_with("Fonte: https://example.com/artigo#parte\n"),
+                        "{text}"
+                    );
+                }
+                other => panic!("criar devolveu {other:?}"),
+            }
+        }
+
+        /// Gate: com o teclado na janela (Home ou barra), Ctrl+Shift+Z e uma
+        /// nota nova; o Ctrl+Z sozinho nao e.
+        #[test]
+        fn ctrl_shift_z_in_the_main_window_is_a_new_note() {
+            use winit::keyboard::ModifiersState;
+            let key = |text: &str| Key::Character(text.into());
+            let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+            assert_eq!(
+                main_window_shortcut(&key("Z"), ctrl_shift),
+                Some(MainShortcut::NewNote)
+            );
+            assert_eq!(
+                main_window_shortcut(&key("z"), ctrl_shift),
+                Some(MainShortcut::NewNote)
+            );
+            assert_eq!(
+                main_window_shortcut(&key("z"), ModifiersState::CONTROL),
+                None
+            );
+            // O script que a Home manda ao painel: sem a pagina das notas, nada.
+            let program = format!(
+                r#"
+const vm = require('node:vm');
+const script = {script};
+const calls = [];
+vm.runInNewContext(script, {{ window: {{ __neuraliaNotes: {{ newNote: () => calls.push('new') }} }} }});
+const quiet = vm.runInNewContext(script, {{ window: {{}} }});
+console.log(JSON.stringify({{ calls, quiet: quiet === undefined }}));
+"#,
+                script = serde_json::to_string(PANEL_NEW_NOTE_SCRIPT).expect("json")
+            );
+            assert_eq!(
+                run_node_program(&program).trim(),
+                r#"{"calls":["new"],"quiet":true}"#
+            );
+        }
+    }
 }
 
 // ===================== tema do sistema (cor de destaque + claro/escuro) =====================
