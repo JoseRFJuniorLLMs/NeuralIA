@@ -106,7 +106,7 @@ side opens the normal three-AI comparison with the text as the question,
 directly: it never goes through the omnibox command parser or the palette,
 so a selected `agent:`, `tema:` or URL is a question, not a command. A private
 Split has no Pesquisar button and its handler refuses `search`; the Split's
-script, IPC mapping and incognito profile come from one value
+script and IPC mapping come from one value
 (`split_page`). Gates: `search_carries_the_selected_text_within_bounds`
 (`ipc.rs`),
 `the_selection_toolbar_offers_three_actions_for_a_trusted_selection`,
