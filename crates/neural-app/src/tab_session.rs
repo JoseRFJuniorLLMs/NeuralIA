@@ -15,7 +15,7 @@
 //!   o temporario para tras quando falha;
 //! - uma sessao sem abas nao deixa ficheiro nenhum.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -29,18 +29,25 @@ pub const VERSION: u64 = 1;
 /// Colunas do comparador. O `windows_app.rs` prende isto ao seu
 /// `COMPARATOR_COLUMNS` em tempo de compilacao.
 pub const COLUMNS: usize = 3;
-/// O mesmo limite da poda em `remember_context_tab`: um ficheiro nao traz de
-/// volta mais abas do que a sessao viva deixaria existir.
+/// Quantas abas SOLTAS uma coluna guarda: acima disto sai a solta mais antiga.
+/// As agrupadas -- as que o dono arrumou -- nao contam para este limite. E a
+/// mesma poda da sessao viva (`prune_victims`), para o ficheiro nao trazer de
+/// volta mais do que a barra deixaria existir.
 pub const MAX_TABS_PER_COLUMN: usize = 32;
-/// URLs maiores nao sao guardadas nem lidas.
-pub const MAX_URL_BYTES: usize = 2048;
+/// O tecto de tudo, agrupadas incluidas. So um dono com mais de 64 abas
+/// agrupadas numa coluna perde uma -- e e avisado.
+pub const MAX_KEPT_TABS_PER_COLUMN: usize = 64;
+/// URLs maiores nao sao guardadas nem lidas -- nem viram aba na barra
+/// (`storable_url`): a barra e o ficheiro nunca discordam. 8 KiB cabem os
+/// links compridos do Google com `#:~:text=`.
+pub const MAX_URL_BYTES: usize = 8192;
 pub const MAX_TITLE_CHARS: usize = 120;
 pub const MAX_GROUP_NAME_CHARS: usize = 64;
 const MAX_COLOR_KEY_BYTES: usize = 16;
-/// Tecto do ficheiro. O pior caso que o escritor consegue produzir (3 x 32
+/// Tecto do ficheiro. O pior caso que o escritor consegue produzir (3 x 64
 /// abas com URL e titulo no maximo, cada uma no seu grupo) cabe com folga --
 /// ha um teste para isso.
-pub const MAX_FILE_BYTES: u64 = 512 * 1024;
+pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionTab {
@@ -128,6 +135,12 @@ pub fn backup_path(path: &Path) -> PathBuf {
     sibling(path, ".bak")
 }
 
+/// Onde fica a copia de um ficheiro que nao se conseguiu ler (outro programa
+/// tinha-o preso), feita antes de a primeira gravacao o substituir.
+pub fn unread_backup_path(path: &Path) -> PathBuf {
+    sibling(path, ".unread")
+}
+
 fn sibling(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path
         .file_name()
@@ -169,6 +182,52 @@ fn clean_text(value: &str, max_chars: usize) -> String {
         .collect()
 }
 
+/// Uma aba com este endereco sobrevive a gravacao? A barra so cria abas que
+/// sim: uma aba que o ficheiro deitasse fora sumia sem aviso no arranque
+/// seguinte, levando consigo o grupo que so ela tinha.
+pub fn storable_url(value: &str) -> bool {
+    clean_url(value).is_some()
+}
+
+/// As abas que uma coluna perde para os limites, pela ordem da barra. Cada
+/// aba vem como `(idade, agrupada, protegida)`: a idade e a identidade (sobe
+/// com cada aba nova e sobrevive a um reinicio), protegida e a aberta ao lado
+/// ou a que acabou de nascer.
+///
+/// Primeiro saem as soltas mais antigas, ate sobrarem `MAX_TABS_PER_COLUMN`
+/// -- nunca uma agrupada nem uma protegida. So acima de
+/// `MAX_KEPT_TABS_PER_COLUMN` sai uma agrupada (a mais antiga). A posicao na
+/// barra nao conta: antes podava-se pela esquerda, e como os grupos ficam
+/// onde foram feitos e os links novos entram no fim, os primeiros a morrer
+/// eram os grupos que o dono arrumou -- e arrastar uma aba para a frente
+/// condenava-a.
+pub fn prune_victims(tabs: &[(u64, bool, bool)]) -> Vec<usize> {
+    let mut victims: Vec<usize> = Vec::new();
+    let mut oldest = |victims: &[usize], grouped_too: bool| {
+        tabs.iter()
+            .enumerate()
+            .filter(|(index, (_, grouped, protected))| {
+                !protected && (grouped_too || !grouped) && !victims.contains(index)
+            })
+            .min_by_key(|(index, (age, _, _))| (*age, *index))
+            .map(|(index, _)| index)
+    };
+    while tabs.len() - victims.len() > MAX_TABS_PER_COLUMN {
+        let Some(index) = oldest(&victims, false) else {
+            break;
+        };
+        victims.push(index);
+    }
+    while tabs.len() - victims.len() > MAX_KEPT_TABS_PER_COLUMN {
+        let Some(index) = oldest(&victims, true) else {
+            break;
+        };
+        victims.push(index);
+    }
+    victims.sort_unstable();
+    victims
+}
+
 fn clean_url(value: &str) -> Option<String> {
     if value.len() > MAX_URL_BYTES {
         return None;
@@ -194,7 +253,7 @@ fn clean_color(value: &str) -> String {
 /// na leitura: por isso `decode(encode(s)) == sanitize(s)`.
 fn sanitize_column(column: &SessionColumn) -> SessionColumn {
     // Abas validas, com o indice original para reencontrar a ativa.
-    let mut kept: Vec<(usize, SessionTab)> = column
+    let kept: Vec<(usize, SessionTab)> = column
         .tabs
         .iter()
         .enumerate()
@@ -210,10 +269,26 @@ fn sanitize_column(column: &SessionColumn) -> SessionColumn {
             ))
         })
         .collect();
-    // O limite da sessao viva: saem as mais antigas.
-    if kept.len() > MAX_TABS_PER_COLUMN {
-        kept.drain(..kept.len() - MAX_TABS_PER_COLUMN);
-    }
+    // Os limites da sessao viva, com a mesma regra (`prune_victims`): saem as
+    // soltas mais antigas; as agrupadas e a aberta ao lado ficam.
+    let known = |id: u64| column.groups.iter().any(|group| group.id == id);
+    let ages: Vec<(u64, bool, bool)> = kept
+        .iter()
+        .map(|(index, tab)| {
+            (
+                tab.id,
+                tab.group.is_some_and(known),
+                column.active == Some(*index),
+            )
+        })
+        .collect();
+    let victims = prune_victims(&ages);
+    let mut kept: Vec<(usize, SessionTab)> = kept
+        .into_iter()
+        .enumerate()
+        .filter(|(position, _)| !victims.contains(position))
+        .map(|(_, entry)| entry)
+        .collect();
 
     // Grupos: o primeiro com cada id, e so os que ainda tem abas. Um grupo
     // vazio seria uma pilula fantasma na barra.
@@ -490,6 +565,7 @@ pub fn clear(path: &Path) -> io::Result<()> {
     };
     remove(path);
     remove(&backup_path(path));
+    remove(&unread_backup_path(path));
     if let Some(parent) = path.parent()
         && let Ok(entries) = fs::read_dir(if parent.as_os_str().is_empty() {
             Path::new(".")
@@ -510,6 +586,164 @@ pub fn clear(path: &Path) -> io::Result<()> {
     match first_error {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+/// O ficheiro que a janela que grava as abas mantem preso enquanto vive.
+pub const LOCK_NAME: &str = "tabs.lock";
+/// A geracao de "Apagar historico": sobe a cada vez, em qualquer janela.
+pub const CLEARED_NAME: &str = "tabs.cleared";
+
+/// O que uma gravacao fez.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveOutcome {
+    Written,
+    /// Outra janela do NeuralIA ja guarda as abas; esta nao escreve por cima.
+    NotWriter,
+    /// O historico foi apagado noutra janela depois de esta ter lido as abas:
+    /// gravar agora trazia de volta o que o dono mandou apagar.
+    ClearedElsewhere,
+}
+
+/// Como uma instancia do NeuralIA guarda as abas em `<data_dir>`.
+///
+/// Duas janelas abertas ao mesmo tempo escreviam cada uma o seu modelo por
+/// cima do da outra (ganhava a ultima, e as abas da primeira sumiam), e um
+/// "Apagar historico" numa era desfeito pela gravacao seguinte da outra, que
+/// ainda tinha as abas de antes. Por isso:
+/// - so uma instancia grava: a que conseguiu prender o `tabs.lock`; as outras
+///   leem as abas mas nao escrevem (e o dono e avisado);
+/// - "Apagar historico" sobe a geracao em `tabs.cleared`; quem leu as abas
+///   antes disso deixa de as gravar;
+/// - um `tabs.json` que nao se conseguiu ler nao e substituido sem copia.
+pub struct SessionStore {
+    path: PathBuf,
+    cleared_path: PathBuf,
+    /// Preso enquanto esta instancia viver. O sistema solta-o se ela morrer.
+    _lock: Option<File>,
+    writer: bool,
+    /// A geracao de `tabs.cleared` que o modelo desta instancia ja reflete.
+    cleared_seen: u64,
+    /// A ultima leitura falhou sem se saber o que la esta.
+    unread: bool,
+    /// Deixou de gravar: o historico foi apagado noutra janela.
+    stopped: bool,
+}
+
+enum WriterLock {
+    Held(File),
+    Taken,
+    /// O sistema de ficheiros nao tranca: grava-se como antes, sozinho.
+    Unavailable,
+}
+
+fn try_writer_lock(path: &Path) -> WriterLock {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = fs::create_dir_all(parent);
+    }
+    let Ok(file) = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+    else {
+        return WriterLock::Unavailable;
+    };
+    match file.try_lock() {
+        Ok(()) => WriterLock::Held(file),
+        Err(fs::TryLockError::WouldBlock) => WriterLock::Taken,
+        Err(fs::TryLockError::Error(_)) => WriterLock::Unavailable,
+    }
+}
+
+/// A geracao guardada em `tabs.cleared` (0 sem ficheiro ou com lixo).
+fn read_generation(path: &Path) -> u64 {
+    let Ok(file) = File::open(path) else {
+        return 0;
+    };
+    let mut text = String::new();
+    if file.take(64).read_to_string(&mut text).is_err() {
+        return 0;
+    }
+    text.trim().parse().unwrap_or(0)
+}
+
+impl SessionStore {
+    /// Abre as abas de `data_dir`. A primeira instancia fica com o
+    /// `tabs.lock` e e a unica que grava enquanto viver.
+    pub fn open(data_dir: &Path) -> Self {
+        let (lock, writer) = match try_writer_lock(&data_dir.join(LOCK_NAME)) {
+            WriterLock::Held(file) => (Some(file), true),
+            WriterLock::Taken => (None, false),
+            WriterLock::Unavailable => (None, true),
+        };
+        Self {
+            path: path_in(data_dir),
+            cleared_path: data_dir.join(CLEARED_NAME),
+            _lock: lock,
+            writer,
+            cleared_seen: read_generation(&data_dir.join(CLEARED_NAME)),
+            unread: false,
+            stopped: false,
+        }
+    }
+
+    pub fn is_writer(&self) -> bool {
+        self.writer
+    }
+
+    /// Le as abas guardadas. O modelo que nascer disto reflete a geracao de
+    /// "Apagar historico" de agora: volta a poder ser gravado.
+    pub fn load(&mut self) -> Loaded {
+        self.cleared_seen = read_generation(&self.cleared_path);
+        self.stopped = false;
+        let loaded = load(&self.path);
+        self.unread = matches!(loaded, Loaded::Unreadable(_));
+        loaded
+    }
+
+    /// Grava a sessao, se esta instancia pode.
+    pub fn save(&mut self, session: &TabSession) -> io::Result<SaveOutcome> {
+        if !self.writer {
+            return Ok(SaveOutcome::NotWriter);
+        }
+        if self.stopped || read_generation(&self.cleared_path) != self.cleared_seen {
+            self.stopped = true;
+            return Ok(SaveOutcome::ClearedElsewhere);
+        }
+        if self.unread {
+            // O que estava no ficheiro nunca foi lido: fica uma copia antes de
+            // o substituir. Se nem copiar se consegue, nao se escreve.
+            match fs::copy(&self.path, unread_backup_path(&self.path)) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            self.unread = false;
+        }
+        save(&self.path, session)?;
+        Ok(SaveOutcome::Written)
+    }
+
+    /// "Apagar historico": o ficheiro, as copias e os temporarios, e a
+    /// geracao sobe -- outra janela que ainda tenha as abas de antes deixa de
+    /// as gravar. Apaga mesmo numa instancia que nao grava: e privacidade.
+    pub fn forget(&mut self) -> io::Result<()> {
+        let removed = clear(&self.path);
+        let generation = read_generation(&self.cleared_path).wrapping_add(1);
+        let marked = write_atomically(
+            &self.cleared_path,
+            generation.to_string().as_bytes(),
+            |from, to| fs::rename(from, to),
+        );
+        if marked.is_ok() {
+            self.cleared_seen = generation;
+        }
+        self.stopped = false;
+        self.unread = false;
+        removed.and(marked)
     }
 }
 
