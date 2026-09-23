@@ -422,6 +422,49 @@ enum BarHit {
     WindowClose,
 }
 
+/// O menu que o botao direito abre na barra.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BarMenu {
+    Tab {
+        source_index: usize,
+        context_index: usize,
+    },
+    Group {
+        source_index: usize,
+        group_index: usize,
+    },
+    /// A pilula de uma IA: o item da rolagem automatica (Ctrl+R).
+    Column(usize),
+}
+
+/// Que menu o botao direito abre, pelo que esta debaixo do rato: o da aba
+/// (tambem sobre o x dela), o do grupo (a pilula dele) ou o da IA (a pilula
+/// da coluna). O resto da barra nao tem menu.
+fn bar_menu_for(hit: Option<BarHit>) -> Option<BarMenu> {
+    match hit? {
+        BarHit::ContextTab {
+            source_index,
+            context_index,
+        }
+        | BarHit::CloseTab {
+            source_index,
+            context_index,
+        } => Some(BarMenu::Tab {
+            source_index,
+            context_index,
+        }),
+        BarHit::ContextGroup {
+            source_index,
+            group_index,
+        } => Some(BarMenu::Group {
+            source_index,
+            group_index,
+        }),
+        BarHit::Column(col_index) => Some(BarMenu::Column(col_index)),
+        _ => None,
+    }
+}
+
 /// O estado do comparador de que a barra precisa. Anda sempre junto -- quem
 /// arrasta um divisor muda os pesos, quem minimiza muda as duas coisas -- e
 /// agrupa-lo evita que a barra receba uma parte e esqueca a outra, que era
@@ -10680,24 +10723,17 @@ impl App {
         // mensagens e o largar do botao esquerdo ja nao chegaria a barra.
         self.forget_tab_gesture();
         hover_tooltip(std::ptr::null_mut(), "");
-        match self.comparator_bar_hit() {
-            Some(
-                BarHit::ContextTab {
-                    source_index,
-                    context_index,
-                }
-                | BarHit::CloseTab {
-                    source_index,
-                    context_index,
-                },
-            ) => self.show_tab_menu(source_index, context_index),
-            Some(BarHit::ContextGroup {
+        match bar_menu_for(self.comparator_bar_hit()) {
+            Some(BarMenu::Tab {
+                source_index,
+                context_index,
+            }) => self.show_tab_menu(source_index, context_index),
+            Some(BarMenu::Group {
                 source_index,
                 group_index,
             }) => self.show_group_menu(source_index, group_index),
-            // A pilula de uma IA: o item da rolagem automatica (Ctrl+R).
-            Some(BarHit::Column(col_index)) => self.column_pill_menu(col_index),
-            _ => {}
+            Some(BarMenu::Column(col_index)) => self.column_pill_menu(col_index),
+            None => {}
         }
     }
 
@@ -22114,6 +22150,67 @@ __fire('keydown', { key: 'F8' });
             "a aba aberta ao lado e a que volta marcada"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// O botao direito na barra, contra a barra real: a aba e o x dela abrem
+    /// o menu da aba e a pilula do grupo o do grupo (tabs-ui); a pilula da IA
+    /// abre o da rolagem automatica (ctx-autoscroll). Os dois ramos
+    /// reescreveram o mesmo `context_menu_comparator`; nenhum dos menus se
+    /// pode perder no encontro.
+    #[test]
+    fn right_click_on_the_bar_opens_the_menu_of_what_is_under_the_mouse() {
+        let rig = DragRig::new(
+            vec![
+                tab("https://a.example/", Some(1)),
+                tab("https://c.example/", None),
+            ],
+            vec![group(1, false)],
+            1.0,
+        );
+        let layout = rig.layout();
+        let at = |rect: UiRect| bar_menu_for(layout.hit(center_of(rect).0, center_of(rect).1));
+
+        assert_eq!(
+            at(rig.tab_rect("https://c.example/")),
+            Some(BarMenu::Tab {
+                source_index: 0,
+                context_index: 1
+            })
+        );
+        let close = layout.tab_closes[0][0];
+        assert!(close.width > 0.0, "a aba tem o seu x");
+        assert_eq!(
+            layout.hit(center_of(close).0, center_of(close).1),
+            Some(BarHit::CloseTab {
+                source_index: 0,
+                context_index: layout.context_indices[0][0]
+            })
+        );
+        assert_eq!(
+            at(close),
+            Some(BarMenu::Tab {
+                source_index: 0,
+                context_index: layout.context_indices[0][0]
+            }),
+            "o x tambem e a aba"
+        );
+        assert_eq!(
+            at(rig.chip_rect(1)),
+            Some(BarMenu::Group {
+                source_index: 0,
+                group_index: 0
+            })
+        );
+        for column in 0..3 {
+            assert_eq!(
+                at(layout.columns[column]),
+                Some(BarMenu::Column(column)),
+                "a pilula da IA {column} abre o menu da rolagem automatica"
+            );
+        }
+        assert_eq!(at(layout.home), None, "o resto da barra nao tem menu");
+        assert_eq!(at(layout.add_tabs[0]), None);
+        assert_eq!(bar_menu_for(None), None);
     }
 
     /// Largar fora da fila da coluna -- abaixo das abas, antes do inicio ou
