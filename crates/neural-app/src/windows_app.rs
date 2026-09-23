@@ -440,7 +440,9 @@ impl Tool {
     /// A dica: o que o clique FAZ, como as outras dicas da barra.
     fn tooltip(self) -> &'static str {
         match self {
-            Self::Pomodoro => "Pomodoro: foco e pausas (clique inicia/pausa; botão direito: opções)",
+            Self::Pomodoro => {
+                "Pomodoro: foco e pausas (clique inicia/pausa; botão direito: opções)"
+            }
             Self::Notes => "Notas (Zettelkasten) — Ctrl+Shift+Z cria nota da seleção",
             Self::Breath => "Respiração guiada — método Wim Hof (vídeo em modo anônimo)",
         }
@@ -2832,7 +2834,15 @@ unsafe fn draw_tool_button(
     let size = (rect.height * 0.6).round() as i32;
     let x = (rect.x + (rect.height - size as f64) / 2.0).round() as i32;
     let y = (rect.y + (rect.height - size as f64) / 2.0).round() as i32;
-    draw_icon(hdc, tool.icon_slot(), x, y, size, fill, tool.icon_tint(theme));
+    draw_icon(
+        hdc,
+        tool.icon_slot(),
+        x,
+        y,
+        size,
+        fill,
+        tool.icon_tint(theme),
+    );
 
     // So ha etiqueta se o botao alargou para ela; senao seria escrita por
     // cima do icone.
@@ -3055,7 +3065,11 @@ fn home_drag_strip(y: f64, scale: f64) -> bool {
 /// (os tres de 46 px que `sync_caption_buttons` poe no canto): a mesma
 /// ordem e o mesmo desenho da barra do comparador, so um pouco mais baixos
 /// para caberem na faixa de 32 px.
-fn home_tool_buttons(client_width: f64, scale: f64, pomodoro_label: Option<BarLabel>) -> [UiRect; 3] {
+fn home_tool_buttons(
+    client_width: f64,
+    scale: f64,
+    pomodoro_label: Option<BarLabel>,
+) -> [UiRect; 3] {
     let scale = scale.max(1.0);
     let caption_left = client_width - 3.0 * 46.0 * scale;
     let size = (TITLE_TAB_HEIGHT - 6.0) * scale;
@@ -8748,17 +8762,19 @@ impl App {
         let Some(window) = &self.window else {
             return;
         };
-        let next = (self.surface == Surface::Home)
-            .then(|| {
-                home_tool_hit(
-                    window.inner_size().width as f64,
-                    window.scale_factor(),
-                    self.pomodoro_bar_label(),
-                    self.cursor.0,
-                    self.cursor.1,
-                )
-            })
-            .flatten();
+        if self.surface != Surface::Home {
+            // Fora da Home a dica e da barra (`update_bar_hover` correu antes
+            // neste mesmo movimento): so se esquece o realce, sem a apagar.
+            self.home_tool_hover = None;
+            return;
+        }
+        let next = home_tool_hit(
+            window.inner_size().width as f64,
+            window.scale_factor(),
+            self.pomodoro_bar_label(),
+            self.cursor.0,
+            self.cursor.1,
+        );
         if next == self.home_tool_hover {
             return;
         }
@@ -9076,7 +9092,10 @@ impl App {
     /// `self.timers.after(..)` e pede `request_redraw` para a etiqueta de
     /// `pomodoro_label` mudar. Ate la avisa, para o clique nao ser mudo.
     fn pomodoro_click(&mut self) {
-        self.show_splash("Pomodoro: ainda não disponível nesta versão.".to_string(), 2);
+        self.show_splash(
+            "Pomodoro: ainda não disponível nesta versão.".to_string(),
+            2,
+        );
     }
 
     /// Botao direito no Pomodoro: o menu de opcoes (duracoes, parar, saltar
@@ -18860,7 +18879,10 @@ __fire('keydown', { key: 'F8' });
             "https://consent.google.com/ml?continue=x",
             "about:blank",
         ] {
-            assert!(service_panel_navigation(Service::Breath, target), "{target}");
+            assert!(
+                service_panel_navigation(Service::Breath, target),
+                "{target}"
+            );
         }
         for target in [
             "http://www.youtube.com/watch?v=UJBknAsxfrA",
@@ -18937,7 +18959,10 @@ __fire('keydown', { key: 'F8' });
             bar_tool_action(Some(BarHit::Service(Service::Meet)), ToolClick::Right),
             None
         );
-        assert_eq!(bar_tool_action(Some(BarHit::Private), ToolClick::Left), None);
+        assert_eq!(
+            bar_tool_action(Some(BarHit::Private), ToolClick::Left),
+            None
+        );
         assert_eq!(bar_tool_action(None, ToolClick::Right), None);
 
         for pomodoro_label in [None, BarLabel::new("25:00")] {
@@ -19070,12 +19095,7 @@ __fire('keydown', { key: 'F8' });
             .collect();
         for (index, icon) in icons.iter().enumerate() {
             assert_eq!(icon.dimensions(), (256, 256));
-            assert_ne!(
-                icon.as_raw(),
-                incognito.as_raw(),
-                "{:?}",
-                Tool::ALL[index]
-            );
+            assert_ne!(icon.as_raw(), incognito.as_raw(), "{:?}", Tool::ALL[index]);
             for other in &icons[index + 1..] {
                 assert_ne!(icon.as_raw(), other.as_raw());
             }

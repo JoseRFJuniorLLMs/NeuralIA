@@ -367,25 +367,32 @@ def breath() -> None:
     mask = Image.new("L", (N, N), 0)
     draw = ImageDraw.Draw(mask)
 
-    def curl(center, radius, start, end):
-        """Arco do PIL (graus a partir das 3 h, no sentido horario do ecra).
-        Os dois remoinhos acabam no ponto mais a esquerda do circulo."""
-        box = [center[0] - radius, center[1] - radius, center[0] + radius, center[1] + radius]
-        draw.arc(box, start=start, end=end, fill=255, width=int(stroke))
-        # A ponta solta do remoinho tambem leva a ponta redonda.
-        round_cap(draw, (center[0] - radius, center[1]), stroke)
+    def curl(center, radius, start, end, steps=96):
+        """Remoinho como polilinha de segmentos com pontas redondas, sobre o
+        EIXO do traco. O `draw.arc` do PIL poe a espessura para dentro da
+        caixa: o eixo ficava `stroke / 2` mais perto do centro e o arco nao
+        encontrava a linha reta nem a ponta redonda -- o remoinho saia partido.
+        Angulos em graus, 0 = 3 h, a crescer no sentido horario do ecra."""
+        points = []
+        for step in range(steps + 1):
+            angle = math.radians(start + (end - start) * step / steps)
+            points.append((center[0] + radius * math.cos(angle), center[1] + radius * math.sin(angle)))
+        for a, b in zip(points, points[1:]):
+            stroked(draw, a, b, stroke)
 
-    # Em cima: a linha chega a base do circulo e o remoinho sobe pela direita
-    # ate a esquerda -- o mesmo arco que vai de -180 (esquerda) a 90 (base).
-    r = N * 0.12
-    stroked(draw, (N * 0.10, N * 0.34), (N * 0.60, N * 0.34), stroke)
-    curl((N * 0.60, N * 0.34 - r), r, -180, 90)
+    r = N * 0.11
+    # Em cima: a linha chega a base do circulo (90) e o remoinho sobe pela
+    # direita e pelo topo ate a esquerda (-180).
+    top_y = N * 0.36
+    stroked(draw, (N * 0.10, top_y), (N * 0.62, top_y), stroke)
+    curl((N * 0.62, top_y - r), r, 90, -180)
     # Ao meio: a linha mais longa, sem remoinho.
-    stroked(draw, (N * 0.10, N * 0.52), (N * 0.88, N * 0.52), stroke)
-    # Em baixo: a linha chega ao topo do circulo e o remoinho desce pela
-    # direita ate a esquerda (de -90, o topo, a 180).
-    stroked(draw, (N * 0.10, N * 0.68), (N * 0.52, N * 0.68), stroke)
-    curl((N * 0.52, N * 0.68 + r), r, -90, 180)
+    stroked(draw, (N * 0.10, N * 0.51), (N * 0.86, N * 0.51), stroke)
+    # Em baixo: a linha chega ao topo do circulo (-90) e o remoinho desce pela
+    # direita e pela base ate a esquerda (180).
+    low_y = N * 0.66
+    stroked(draw, (N * 0.10, low_y), (N * 0.54, low_y), stroke)
+    curl((N * 0.54, low_y + r), r, -90, 180)
 
     finish(mask, solid((255, 255, 255)), "breath.png")
 
