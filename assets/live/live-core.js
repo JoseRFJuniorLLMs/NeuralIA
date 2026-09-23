@@ -31,6 +31,13 @@
     'Isso não parece uma chave da API do Gemini. Copie de novo da AI Studio.';
   /// Religacoes seguidas sem um setupComplete pelo meio antes de desistir.
   const MAX_RESUMES = 3;
+  /// Tectos por SESSAO, que o setupComplete nao zera: um servidor que aceita
+  /// o setup e volta a fechar religaria sem fim, a gastar a cota do dono.
+  /// Quedas inesperadas: 6. Rotacoes avisadas (goAway, ~1 a cada 10 min): 36.
+  const MAX_DROP_RESUMES = 6;
+  const MAX_GOAWAY_RESUMES = 36;
+  const TOO_MANY_DROPS =
+    'A conexão caiu várias vezes e a sessão foi encerrada para não gastar a sua cota. Ligue de novo quando quiser.';
   const SYSTEM_INSTRUCTION =
     'Você é a assistente de voz do NeuralIA, um navegador para Windows. ' +
     'Você vê a tela do usuário (e a câmera, quando ligada) e ouve o microfone. ' +
@@ -346,6 +353,8 @@
       socket: null,
       resumeHandle: null,
       resumes: 0,
+      dropResumes: 0,
+      goAwayResumes: 0,
       context: null,
       frameTimer: null,
       grabbing: false,
@@ -457,7 +466,7 @@
       if (message.error) notify('error', 'Erro do servidor: ' + message.error, false, '');
       // Por ultimo: retomar troca o socket, e o resto desta mensagem ainda
       // era da ligacao velha.
-      if (message.goAway && !resume()) {
+      if (message.goAway && !resume('goaway')) {
         notify('status', 'O servidor vai encerrar a sessão em breve…', 'warn');
       }
     }
@@ -599,9 +608,14 @@
 
     /// Continua a mesma sessao numa ligacao nova, com o ultimo handle. A tela,
     /// a camera e o microfone ficam como estao: so o socket muda.
-    function resume() {
+    function resume(kind) {
       if (state.closed || !state.resumeHandle || state.resumes >= MAX_RESUMES) return false;
+      if (kind === 'drop' ? state.dropResumes >= MAX_DROP_RESUMES : state.goAwayResumes >= MAX_GOAWAY_RESUMES) {
+        return false;
+      }
       state.resumes += 1;
+      if (kind === 'drop') state.dropResumes += 1;
+      else state.goAwayResumes += 1;
       const old = state.socket;
       state.socket = null;
       state.ready = false;
@@ -618,9 +632,10 @@
     /// tudo e diz porque.
     function lost(code, reason) {
       const closed = describeClose(code, reason);
-      if (!closed.keyProblem && resume()) return;
+      if (!closed.keyProblem && resume('drop')) return;
+      const exhausted = !closed.keyProblem && state.dropResumes >= MAX_DROP_RESUMES;
       stop();
-      notify('error', closed.message, closed.keyProblem, closed.detail);
+      notify('error', exhausted ? TOO_MANY_DROPS : closed.message, closed.keyProblem, closed.detail);
       notify('ended');
     }
 
@@ -702,6 +717,8 @@
     KEY_MAX_CHARS,
     INVALID_KEY_NOTICE,
     MAX_RESUMES,
+    MAX_DROP_RESUMES,
+    MAX_GOAWAY_RESUMES,
     SYSTEM_INSTRUCTION,
     WORKLET_NAME,
     WORKLET_SOURCE,

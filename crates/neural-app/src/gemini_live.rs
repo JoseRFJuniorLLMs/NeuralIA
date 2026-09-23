@@ -1637,6 +1637,54 @@ return out;
     }
 
     #[test]
+    fn a_server_that_keeps_dropping_after_setup_cannot_reconnect_forever() {
+        // O setupComplete zera o tecto de religacoes SEGUIDAS; sem um tecto
+        // por sessao, um servidor que aceita e volta a fechar religava sem
+        // fim, a gastar a cota do dono.
+        let body = format!(
+            "{SESSION_FAKES}{}",
+            r#"
+const w = world();
+const session = core.createSession({ env: w.env, ui: w.uiHandlers, key: 'K' });
+await session.start();
+for (let round = 0; round < 12; round++) {
+  const socket = w.sockets[w.sockets.length - 1];
+  if (!socket || socket.closedWith) break;
+  socket.open();
+  socket.receive('{"setupComplete":{}}');
+  socket.receive(JSON.stringify({ sessionResumptionUpdate: { newHandle: 'h' + round, resumable: true } }));
+  await flush();
+  socket.drop(1011, 'Internal error');
+  await flush();
+}
+return {
+  sockets: w.sockets.length,
+  live: session.live,
+  errors: w.ui.errors.map((e) => e.message),
+  ended: w.ui.ended,
+  stopped: w.tracks.map((t) => t.stopped),
+  caps: [core.MAX_DROP_RESUMES, core.MAX_GOAWAY_RESUMES]
+};
+"#
+        );
+        let out = node_core(&body, Value::Null);
+        assert_eq!(out["caps"], json!([6, 36]));
+        assert_eq!(
+            out["sockets"], 7,
+            "a primeira ligacao + 6 religacoes, e para: {out}"
+        );
+        assert_eq!(out["live"], false);
+        assert_eq!(out["ended"], 1);
+        assert_eq!(out["stopped"], json!([1, 1, 1]), "tela, camera e mic param");
+        assert_eq!(
+            out["errors"],
+            json!([
+                "A conexão caiu várias vezes e a sessão foi encerrada para não gastar a sua cota. Ligue de novo quando quiser."
+            ])
+        );
+    }
+
+    #[test]
     fn live_js_keeps_the_session_across_go_away_and_drops() {
         let body = format!(
             "{SESSION_FAKES}{}",
