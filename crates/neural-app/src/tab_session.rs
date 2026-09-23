@@ -93,14 +93,16 @@ pub enum LoadError {
     UnknownVersion(Option<u64>),
 }
 
+/// Texto para o aviso na interface (pt-BR). O pormenor do `serde_json`, em
+/// ingles, fica so no `Debug`, para o log.
 impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Oversized(bytes) => write!(f, "ficheiro com {bytes} bytes, acima do máximo"),
-            Self::NotUtf8 => f.write_str("ficheiro que não é texto UTF-8"),
-            Self::Corrupt(reason) => write!(f, "ficheiro danificado ({reason})"),
+            Self::Oversized(_) => f.write_str("arquivo grande demais"),
+            Self::NotUtf8 => f.write_str("arquivo que não é texto"),
+            Self::Corrupt(_) => f.write_str("arquivo danificado"),
             Self::UnknownVersion(Some(version)) => write!(f, "versão {version} desconhecida"),
-            Self::UnknownVersion(None) => f.write_str("ficheiro sem versão"),
+            Self::UnknownVersion(None) => f.write_str("arquivo sem versão"),
         }
     }
 }
@@ -608,12 +610,16 @@ mod tests {
             bytes
         };
         let cases: [(&str, Vec<u8>, fn(&LoadError) -> bool); 5] = [
-            ("corrupt", b"{\"version\":1,\"columns\":[".to_vec(), |error| {
-                matches!(error, LoadError::Corrupt(_))
-            }),
-            ("future", br#"{"version":2,"columns":[]}"#.to_vec(), |error| {
-                *error == LoadError::UnknownVersion(Some(2))
-            }),
+            (
+                "corrupt",
+                b"{\"version\":1,\"columns\":[".to_vec(),
+                |error| matches!(error, LoadError::Corrupt(_)),
+            ),
+            (
+                "future",
+                br#"{"version":2,"columns":[]}"#.to_vec(),
+                |error| *error == LoadError::UnknownVersion(Some(2)),
+            ),
             ("unversioned", br#"{"columns":[]}"#.to_vec(), |error| {
                 *error == LoadError::UnknownVersion(None)
             }),
@@ -679,11 +685,22 @@ mod tests {
             vec!["https://example.com/ok", "https://example.com/solta"],
             "script, credentials and non-objects never come back"
         );
-        assert_eq!(first.active, Some(0), "active follows its tab, not its index");
-        assert_eq!(first.groups.len(), 1, "duplicate and empty groups are dropped");
+        assert_eq!(
+            first.active,
+            Some(0),
+            "active follows its tab, not its index"
+        );
+        assert_eq!(
+            first.groups.len(),
+            1,
+            "duplicate and empty groups are dropped"
+        );
         assert_eq!(first.groups[0].name, "Linhaquebrada");
         assert_eq!(first.groups[0].color, "blue");
-        assert_eq!(first.tabs[1].group, None, "a missing group leaves the tab loose");
+        assert_eq!(
+            first.tabs[1].group, None,
+            "a missing group leaves the tab loose"
+        );
         assert!(session.columns[1].tabs.is_empty());
         assert!(session.columns[2].tabs.is_empty());
     }
@@ -724,7 +741,14 @@ mod tests {
                 })
                 .collect(),
             groups: (0..MAX_TABS_PER_COLUMN as u64)
-                .map(|id| group(u64::MAX - id, &"é".repeat(MAX_GROUP_NAME_CHARS), "slate", true))
+                .map(|id| {
+                    group(
+                        u64::MAX - id,
+                        &"é".repeat(MAX_GROUP_NAME_CHARS),
+                        "slate",
+                        true,
+                    )
+                })
                 .collect(),
             active: Some(0),
         };
@@ -753,8 +777,15 @@ mod tests {
         let path = path_in(&dir);
         fs::create_dir_all(&path).expect("directory in the way");
         assert!(save(&path, &sample()).is_err());
-        assert!(path.is_dir(), "the failed write must not replace what was there");
-        assert_eq!(files_in(&dir), vec![FILE_NAME.to_string()], "temp left behind");
+        assert!(
+            path.is_dir(),
+            "the failed write must not replace what was there"
+        );
+        assert_eq!(
+            files_in(&dir),
+            vec![FILE_NAME.to_string()],
+            "temp left behind"
+        );
         let _ = fs::remove_dir_all(&dir);
 
         // 2. O rename falha a meio de uma substituicao: o ficheiro antigo
@@ -772,7 +803,11 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(fs::read(&path).expect("read"), before, "old file damaged");
-        assert_eq!(files_in(&dir), vec![FILE_NAME.to_string()], "temp left behind");
+        assert_eq!(
+            files_in(&dir),
+            vec![FILE_NAME.to_string()],
+            "temp left behind"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
