@@ -87,6 +87,8 @@ enum UserEvent {
     ThemeChosen(ThemeChoice),
     /// Pedido da pagina local do painel lateral (canal proprio).
     Panel(PanelMessage),
+    /// "Abrir?" do aviso do Gmail: Sim (true) ou Nao.
+    GmailAnswer(bool),
     HomeRequested,
     /// Voltar um nivel: de ecra completo para tres colunas, de la para a Home.
     BackRequested,
@@ -232,7 +234,8 @@ const AUTO_SCROLL_PROMPT_SECONDS: u64 = 20;
 /// WebViews presos na geometria anterior ate o primeiro movimento do rato.
 const COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS: [u64; 2] = [40, 220];
 /// Quanto tempo o aviso de correio novo fica no canto.
-const GMAIL_TOAST_SECONDS: u64 = 7;
+/// Com a pergunta "Abrir?" o aviso fica mais tempo a vista.
+const GMAIL_TOAST_SECONDS: u64 = 12;
 /// Quantas entradas do historico a caixa "history:" mostra.
 const HISTORY_RECENT_LIMIT: usize = 20;
 /// Tecto, em chars, de cada campo que o monitor do Gmail nos envia. O script
@@ -411,6 +414,9 @@ enum BarHit {
     SplitExpand,
     SplitClose,
     Private,
+    /// Icones do canto direito: servicos no painel e avisos do Gmail.
+    Service(Service),
+    GmailToggle,
     WindowMinimize,
     WindowMaximize,
     WindowClose,
@@ -623,9 +629,7 @@ impl BarLayout {
         } else {
             hidden.len() as f64 * chip_w + chip_gap * hidden.len().saturating_sub(1) as f64
         };
-        let controls_left = right_controls(client_width, scale, columns.split_active)
-            .private
-            .x;
+        let controls_left = right_controls(client_width, scale, columns.split_active).leftmost();
         let reserved = if hidden.is_empty() {
             0.0
         } else {
@@ -852,6 +856,8 @@ unsafe fn apply_omnibox_interactivity(edit: HWND, surface: Surface) {
 #[derive(Debug, Clone, Copy)]
 struct RightControls {
     private: UiRect,
+    /// Videochamada, WhatsApp, YouTube e Gmail, a esquerda do Privado.
+    services: [UiRect; 4],
     /// Rotulo, expandir e fechar da gaveta; `None` quando nao ha gaveta.
     split: Option<(UiRect, UiRect, UiRect)>,
 }
@@ -891,17 +897,51 @@ fn right_controls(client_width: f64, scale: f64, split_active: bool) -> RightCon
         Some((label, _, _)) => label.x - 6.0 * scale,
         None => client_width - margin,
     };
+    // Botoes redondos so com icone, como no Chrome: Privado a direita e, a
+    // esquerda dele, videochamada, WhatsApp, YouTube e Gmail.
+    let icon = row_h;
+    let icon_gap = 4.0 * scale;
     let private = UiRect {
-        x: right - 78.0 * scale,
+        x: right - icon,
         y: row_y,
-        width: 78.0 * scale,
-        height: row_h,
+        width: icon,
+        height: icon,
     };
+    let services = std::array::from_fn(|index| UiRect {
+        x: private.x - (4 - index) as f64 * (icon + icon_gap),
+        y: row_y,
+        width: icon,
+        height: icon,
+    });
 
-    RightControls { private, split }
+    RightControls {
+        private,
+        services,
+        split,
+    }
 }
 
+impl RightControls {
+    /// Onde comecam os controlos da direita: o resto da barra acaba aqui.
+    fn leftmost(&self) -> f64 {
+        self.services[0].x
+    }
+}
+
+/// O que cada icone do canto direito faz, na ordem de `RightControls::services`.
+const SERVICE_BUTTON_HITS: [BarHit; 4] = [
+    BarHit::Service(Service::Meet),
+    BarHit::Service(Service::WhatsApp),
+    BarHit::Service(Service::YouTube),
+    BarHit::GmailToggle,
+];
+
 fn right_controls_hit(controls: RightControls, x: f64, y: f64) -> Option<BarHit> {
+    for (rect, hit) in controls.services.iter().zip(SERVICE_BUTTON_HITS) {
+        if rect.contains(x, y) {
+            return Some(hit);
+        }
+    }
     if controls.private.contains(x, y) {
         return Some(BarHit::Private);
     }
@@ -1883,8 +1923,30 @@ unsafe extern "system" fn gmail_toast_subclass(
     wparam: WPARAM,
     lparam: LPARAM,
     _subclass_id: usize,
-    _reference_data: usize,
+    reference_data: usize,
 ) -> LRESULT {
+    // A pergunta recebe cliques: um STATIC devolve HTTRANSPARENT.
+    if message == WM_NCHITTEST {
+        return HTCLIENT as LRESULT;
+    }
+    if message == WM_LBUTTONUP && reference_data != 0 {
+        let mut client = RECT::default();
+        if GetClientRect(hwnd, &mut client) != 0 {
+            let scale = ((client.bottom - client.top) as f64 / GMAIL_TOAST_HEIGHT).max(1.0);
+            let (open, no) = gmail_toast_buttons(&client, scale);
+            let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
+            let y = ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32;
+            let inside =
+                |rect: &RECT| x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
+            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+            if inside(&open) {
+                let _ = proxy.send_event(UserEvent::GmailAnswer(true));
+            } else if inside(&no) {
+                let _ = proxy.send_event(UserEvent::GmailAnswer(false));
+            }
+        }
+        return 0;
+    }
     if message == WM_PAINT {
         let mut paint = PAINTSTRUCT::default();
         let hdc = BeginPaint(hwnd, &mut paint);
@@ -1899,6 +1961,8 @@ unsafe extern "system" fn gmail_toast_subclass(
                 let scale = ((client.bottom - client.top) as f64 / GMAIL_TOAST_HEIGHT).max(1.0);
                 let title_font = create_font((-13.0 * scale) as i32, FW_BOLD as i32);
                 let body_font = create_font((-12.0 * scale) as i32, FW_NORMAL as i32);
+                let (open_button, no_button) = gmail_toast_buttons(&client, scale);
+                let buttons_left = open_button.left - (8.0 * scale) as i32;
                 let old_font = SelectObject(hdc, title_font as _);
                 SetBkMode(hdc, TRANSPARENT as i32);
 
@@ -1906,12 +1970,12 @@ unsafe extern "system" fn gmail_toast_subclass(
                 let mut title = RECT {
                     left: (16.0 * scale) as i32,
                     top: (7.0 * scale) as i32,
-                    right: client.right - (14.0 * scale) as i32,
+                    right: buttons_left,
                     bottom: (28.0 * scale) as i32,
                 };
                 draw_text(
                     hdc,
-                    "Gmail · novo e-mail",
+                    "Gmail · novo e-mail — abrir?",
                     &mut title,
                     DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
                 );
@@ -1925,7 +1989,7 @@ unsafe extern "system" fn gmail_toast_subclass(
                 let mut body = RECT {
                     left: (16.0 * scale) as i32,
                     top: (28.0 * scale) as i32,
-                    right: client.right - (14.0 * scale) as i32,
+                    right: buttons_left,
                     bottom: client.bottom - (7.0 * scale) as i32,
                 };
                 draw_text(
@@ -1934,6 +1998,23 @@ unsafe extern "system" fn gmail_toast_subclass(
                     &mut body,
                     DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
                 );
+
+                for (rect, label, primary) in
+                    [(open_button, "Abrir", true), (no_button, "Não", false)]
+                {
+                    let pill = UiRect {
+                        x: rect.left as f64,
+                        y: rect.top as f64,
+                        width: (rect.right - rect.left) as f64,
+                        height: (rect.bottom - rect.top) as f64,
+                    };
+                    let style = if primary {
+                        PillStyle::new(theme.accent, theme.accent, on_color(theme.accent))
+                    } else {
+                        PillStyle::new(theme.surface_line, theme.surface_line, theme.fg)
+                    };
+                    draw_pill(hdc, pill, label, style, scale, body_font, theme.surface);
+                }
 
                 SelectObject(hdc, old_font);
                 DeleteObject(title_font as _);
@@ -2240,6 +2321,130 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
 })();
 </script></body></html>"#;
 
+// Servicos no painel lateral (caminho A do WebRTC, aprovado pelo dono): o
+// servico corre como uma pagina da internet comum -- contatos e chamadas sao
+// os dele; o NeuralIA so libera camera e microfone pelo aviso do WebView2.
+// Sem scripts injetados e sem o canal IPC do painel do historico.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Service {
+    /// Videochamada: o Google Meet.
+    Meet,
+    WhatsApp,
+    YouTube,
+    Gmail,
+}
+
+impl Service {
+    fn url(self) -> &'static str {
+        match self {
+            Self::Meet => "https://meet.google.com/",
+            Self::WhatsApp => "https://web.whatsapp.com/",
+            Self::YouTube => "https://www.youtube.com/",
+            Self::Gmail => "https://mail.google.com/mail/u/0/#inbox",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Meet => "Videochamada (Google Meet)",
+            Self::WhatsApp => "WhatsApp",
+            Self::YouTube => "YouTube",
+            Self::Gmail => "Gmail",
+        }
+    }
+}
+
+/// So paginas da internet: um servico nunca abre file:, javascript: nem os
+/// esquemas internos do NeuralIA.
+fn service_panel_allows_navigation(target: &str) -> bool {
+    let lower = target.trim().to_ascii_lowercase();
+    lower == "about:blank" || lower.starts_with("https://") || lower.starts_with("http://")
+}
+
+/// Mais largo do que o do historico: o WhatsApp e o Meet precisam de espaco.
+fn service_panel_bounds(logical_w: f64, logical_h: f64, top: f64) -> (f64, f64, f64, f64) {
+    let width = (logical_w * 0.42)
+        .clamp(400.0, 640.0)
+        .min(logical_w.max(0.0));
+    let top = top.clamp(0.0, logical_h.max(0.0));
+    (logical_w - width, top, width, logical_h - top)
+}
+
+/// Botao redondo so com icone (servicos, Gmail, Privado). O icone branco e
+/// pintado com `tint`; os coloridos (WhatsApp, YouTube) vao com `None`.
+unsafe fn draw_icon_button(
+    hdc: *mut core::ffi::c_void,
+    rect: UiRect,
+    slot: usize,
+    tint: Option<Rgb>,
+    hovered: bool,
+    scale: f64,
+    theme: &Theme,
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let fill = if hovered {
+        theme.surface_line
+    } else {
+        theme.surface
+    };
+    fill_pill(
+        hdc,
+        rect,
+        rect.height / 2.0,
+        fill,
+        Some((theme.surface_line, scale)),
+        theme.bar_bg,
+    );
+    let size = (rect.height * 0.6).round() as i32;
+    let x = (rect.x + (rect.width - size as f64) / 2.0).round() as i32;
+    let y = (rect.y + (rect.height - size as f64) / 2.0).round() as i32;
+    draw_icon(hdc, slot, x, y, size, fill, tint);
+}
+
+/// Avisos do Gmail ligados (o botao do envelope). Guardado em
+/// `<data_dir>/gmail` como "ligado"/"desligado"; sem ficheiro, ligado.
+static GMAIL_NOTIFICATIONS: AtomicBool = AtomicBool::new(true);
+
+fn load_gmail_setting(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|text| !text.trim().eq_ignore_ascii_case("desligado"))
+        .unwrap_or(true)
+}
+
+fn save_gmail_setting(path: &std::path::Path, on: bool) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let temp = path.with_extension("tmp");
+    std::fs::write(&temp, if on { "ligado" } else { "desligado" })?;
+    std::fs::rename(&temp, path)
+}
+
+/// "Abrir" e "Nao" no canto direito do aviso do Gmail, em pixeis do cliente.
+fn gmail_toast_buttons(client: &RECT, scale: f64) -> (RECT, RECT) {
+    let height = (26.0 * scale).round() as i32;
+    let top = (client.bottom - height) / 2;
+    let gap = (6.0 * scale).round() as i32;
+    let right = client.right - (12.0 * scale).round() as i32;
+    let no_width = (54.0 * scale).round() as i32;
+    let open_width = (70.0 * scale).round() as i32;
+    let no = RECT {
+        left: right - no_width,
+        top,
+        right,
+        bottom: top + height,
+    };
+    let open = RECT {
+        left: no.left - gap - open_width,
+        top,
+        right: no.left - gap,
+        bottom: top + height,
+    };
+    (open, no)
+}
+
 /// Log de depuracao em tempo de execucao, pedido pelo dono para achar bugs
 /// intermitentes. Desligado por padrao; `NEURALIA_DEBUG_LOG=<ficheiro>` liga.
 /// Cada linha: milissegundos desde o arranque e o evento. Nunca leva URLs,
@@ -2327,6 +2532,13 @@ fn bar_tooltip_label(
         BarHit::Private => {
             "Painel privado: abre ao lado sem gravar histórico nem memória".to_string()
         }
+        BarHit::Service(service) => format!("{} no painel ao lado", service.label()),
+        BarHit::GmailToggle => if GMAIL_NOTIFICATIONS.load(Ordering::Acquire) {
+            "Avisos do Gmail: ligados · clique para desligar"
+        } else {
+            "Avisos do Gmail: desligados · clique para ligar"
+        }
+        .to_string(),
         BarHit::WindowMinimize => caption_tooltip_label(0, maximized).to_string(),
         BarHit::WindowMaximize => caption_tooltip_label(1, maximized).to_string(),
         BarHit::WindowClose => caption_tooltip_label(2, maximized).to_string(),
@@ -4097,6 +4309,8 @@ struct App {
     side_panel: Option<WebView>,
     /// A consulta de memoria que alimenta as sugestoes do painel.
     panel_suggestion_query: Option<String>,
+    /// Servico aberto no painel lateral (WhatsApp, Meet, YouTube, Gmail).
+    service_panel: Option<(Service, WebView)>,
 }
 
 impl App {
@@ -4106,6 +4320,10 @@ impl App {
             HistoryStore::with_limit(config.data_dir.join("history.jsonl"), config.history_limit);
         // A escolha de tema vale antes do primeiro desenho.
         ThemeChoice::load(&config.data_dir.join("theme")).apply();
+        GMAIL_NOTIFICATIONS.store(
+            load_gmail_setting(&config.data_dir.join("gmail")),
+            Ordering::Release,
+        );
         let history = HistoryWriter::new(history_store, proxy.clone());
         let memory = MemoryWorker::new(config.data_dir.join("memory"), proxy.clone());
         let timers = Timers::new(proxy.clone());
@@ -4178,6 +4396,7 @@ impl App {
             home_focused: true,
             side_panel: None,
             panel_suggestion_query: None,
+            service_panel: None,
         }
     }
 
@@ -4591,6 +4810,7 @@ impl App {
     fn show_home(&mut self) {
         debug_log(format_args!("show_home (surface era {:?})", self.surface));
         self.close_side_panel();
+        self.close_service_panel();
         self.next_generation();
         self.surface = Surface::Home;
 
@@ -5483,6 +5703,7 @@ impl App {
 
     fn open_comparator(&mut self, query: &str) {
         self.close_side_panel();
+        self.close_service_panel();
         let reuse_comparator = self
             .comparator
             .as_ref()
@@ -6764,7 +6985,7 @@ impl App {
                     created,
                     Some(gmail_toast_subclass),
                     GMAIL_TOAST_SUBCLASS_ID,
-                    0,
+                    (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize,
                 ) == 0
                 {
                     DestroyWindow(created);
@@ -7839,6 +8060,122 @@ impl App {
         }
     }
 
+    /// Os icones da barra: o servico abre no painel ao lado; de novo, fecha.
+    fn open_service_panel(&mut self, service: Service) {
+        let already = self
+            .service_panel
+            .as_ref()
+            .is_some_and(|(open, _)| *open == service);
+        self.close_service_panel();
+        if already {
+            return;
+        }
+        // Um painel de cada vez.
+        self.close_side_panel();
+        let Some(window) = &self.window else {
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
+        let size = window.inner_size();
+        let top = if self.surface == Surface::Comparator {
+            COMPARATOR_CHROME_HEIGHT
+        } else {
+            0.0
+        };
+        let (x, y, width, height) =
+            service_panel_bounds(size.width as f64 / scale, size.height as f64 / scale, top);
+        let built = themed_webview_builder()
+            .with_url(service.url())
+            .with_bounds(wry::Rect {
+                position: LogicalPosition::new(x, y).into(),
+                size: LogicalSize::new(width, height).into(),
+            })
+            .with_navigation_handler(|target| service_panel_allows_navigation(&target))
+            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+            // Caminho A do WebRTC: camera e microfone pelo aviso do WebView2.
+            .with_permission_handler(|kind| web_media_permission(kind, true))
+            .build_as_child(window);
+        match built {
+            Ok(panel) => {
+                let _ = panel.focus();
+                debug_log(format_args!("service panel: {service:?}"));
+                self.service_panel = Some((service, panel));
+            }
+            Err(error) => {
+                self.show_splash(
+                    format!("Não foi possível abrir {}: {error}", service.label()),
+                    3,
+                );
+            }
+        }
+    }
+
+    fn close_service_panel(&mut self) {
+        if self.service_panel.take().is_some() {
+            debug_log(format_args!("service panel: fechado"));
+        }
+    }
+
+    fn position_service_panel(&self) {
+        let (Some((_, panel)), Some(window)) = (&self.service_panel, &self.window) else {
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
+        let size = window.inner_size();
+        let top = if self.surface == Surface::Comparator {
+            COMPARATOR_CHROME_HEIGHT
+        } else {
+            0.0
+        };
+        let (x, y, width, height) =
+            service_panel_bounds(size.width as f64 / scale, size.height as f64 / scale, top);
+        let _ = panel.set_bounds(wry::Rect {
+            position: LogicalPosition::new(x, y).into(),
+            size: LogicalSize::new(width, height).into(),
+        });
+    }
+
+    /// O envelope da barra: liga e desliga os avisos do Gmail, e guarda.
+    fn toggle_gmail_notifications(&mut self) {
+        let on = !GMAIL_NOTIFICATIONS.load(Ordering::Acquire);
+        GMAIL_NOTIFICATIONS.store(on, Ordering::Release);
+        if let Err(error) = save_gmail_setting(&self.config.data_dir.join("gmail"), on) {
+            self.show_native_error(format!("Não foi possível guardar a escolha: {error}"));
+        }
+        if on {
+            self.schedule_gmail_probe(1);
+        } else {
+            // Desligar e mesmo desligar: sem WebView escondida a ler o Gmail.
+            self.gmail_monitor = None;
+            if let Some(toast) = self.gmail_toast {
+                unsafe {
+                    ShowWindow(toast, SW_HIDE);
+                }
+            }
+        }
+        self.show_splash(
+            if on {
+                "Avisos do Gmail ligados.".to_string()
+            } else {
+                "Avisos do Gmail desligados.".to_string()
+            },
+            2,
+        );
+        self.request_redraw();
+    }
+
+    /// Resposta ao "Abrir?" do aviso do Gmail.
+    fn answer_gmail(&mut self, open: bool) {
+        if let Some(toast) = self.gmail_toast {
+            unsafe {
+                ShowWindow(toast, SW_HIDE);
+            }
+        }
+        if open {
+            self.open_service_panel(Service::Gmail);
+        }
+    }
+
     /// Ctrl+H: abre o historico inteligente ao lado; de novo (ou Esc), fecha.
     fn toggle_side_panel(&mut self) {
         if self.side_panel.is_some() {
@@ -7866,6 +8203,8 @@ impl App {
     }
 
     fn open_side_panel(&mut self) {
+        // Um painel de cada vez.
+        self.close_service_panel();
         let Some(bounds) = self.side_panel_rect() else {
             return;
         };
@@ -8677,6 +9016,8 @@ impl App {
                 let _ = self.proxy.send_event(UserEvent::ExitRequested);
             }
             Some(BarHit::Private) => self.open_private_panel(),
+            Some(BarHit::Service(service)) => self.open_service_panel(service),
+            Some(BarHit::GmailToggle) => self.toggle_gmail_notifications(),
             Some(BarHit::SplitClose) => self.close_split(),
             Some(BarHit::SplitExpand) => self.toggle_split_fullscreen(),
             Some(BarHit::Home) => self.show_home(),
@@ -9526,6 +9867,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ShowHistory => self.toggle_side_panel(),
             UserEvent::ThemeChosen(choice) => self.choose_theme(choice),
             UserEvent::Panel(message) => self.handle_panel_message(message),
+            UserEvent::GmailAnswer(open) => self.answer_gmail(open),
             UserEvent::ClearHistory => {
                 self.memory.clear(&mut self.current_research);
                 match self.history.clear() {
@@ -9766,6 +10108,7 @@ impl ApplicationHandler<UserEvent> for App {
                     size.width, size.height, self.surface
                 ));
                 self.position_side_panel();
+                self.position_service_panel();
                 if self.surface == Surface::Home {
                     self.sync_caption_buttons();
                 }
@@ -10390,6 +10733,7 @@ fn home_frame_interval(minimized: bool, occluded: bool, focused: bool) -> Option
 /// excepcao intencional de um vazamento.
 fn gmail_monitor_enabled() -> bool {
     gmail_monitor_enabled_for(std::env::var_os("NEURALIA_NO_GMAIL"))
+        && GMAIL_NOTIFICATIONS.load(Ordering::Acquire)
 }
 
 /// Basta a variavel EXISTIR, como em NEURALIA_REDUCE_MOTION: `=0` ou vazia
@@ -11106,13 +11450,29 @@ unsafe fn paint_comparator_bar_with_contexts(
 
     // Os mesmos rectangulos que o hit-testing usa; ver `right_controls`.
     let controls = right_controls(width as f64, scale, active_context.is_some());
-    draw_button(
+    let gmail_tint = if GMAIL_NOTIFICATIONS.load(Ordering::Acquire) {
+        theme.fg
+    } else {
+        theme.fg_muted
+    };
+    let icons = [
+        (ICON_SLOT_VIDEO, Some(theme.fg)),
+        (ICON_SLOT_WHATSAPP, None),
+        (ICON_SLOT_YOUTUBE, None),
+        (ICON_SLOT_MAIL, Some(gmail_tint)),
+    ];
+    for ((rect, hit), (slot, tint)) in controls.services.iter().zip(SERVICE_BUTTON_HITS).zip(icons)
+    {
+        draw_icon_button(target, *rect, slot, tint, hover == Some(hit), scale, theme);
+    }
+    // Privado: o chapeu e os oculos, sem nome (pedido do dono).
+    draw_icon_button(
         target,
         controls.private,
-        "Privado",
+        ICON_SLOT_INCOGNITO,
+        Some(theme.fg),
         hover == Some(BarHit::Private),
         scale,
-        tab_font,
         theme,
     );
 
@@ -12081,6 +12441,8 @@ mod tests {
             BarHit::SplitExpand,
             BarHit::SplitClose,
             BarHit::Private,
+            BarHit::Service(Service::WhatsApp),
+            BarHit::GmailToggle,
             BarHit::WindowMinimize,
             BarHit::WindowMaximize,
             BarHit::WindowClose,
@@ -12517,6 +12879,91 @@ mod tests {
                 "realce"
             );
         }
+    }
+
+    #[test]
+    fn service_icons_sit_left_of_private_without_overlap_and_hit_their_service() {
+        let controls = right_controls(1600.0, 1.0, false);
+        let order = [
+            BarHit::Service(Service::Meet),
+            BarHit::Service(Service::WhatsApp),
+            BarHit::Service(Service::YouTube),
+            BarHit::GmailToggle,
+        ];
+        let mut previous_right = f64::MIN;
+        for (rect, hit) in controls.services.iter().zip(order) {
+            assert!(rect.width > 0.0, "{hit:?} tem de existir");
+            assert!(rect.x >= previous_right, "{hit:?} sobrepoe o vizinho");
+            previous_right = rect.x + rect.width;
+            let center = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+            assert_eq!(right_controls_hit(controls, center.0, center.1), Some(hit));
+        }
+        assert!(
+            previous_right <= controls.private.x,
+            "os icones ficam a esquerda do Privado"
+        );
+        assert_eq!(controls.leftmost(), controls.services[0].x);
+        // O Privado passa a ser um botao redondo so com o icone.
+        assert_eq!(controls.private.width, controls.private.height);
+        // Com a gaveta aberta tudo continua a esquerda dela.
+        let drawer = right_controls(1600.0, 1.0, true);
+        let (label, _, _) = drawer.split.expect("gaveta");
+        assert!(drawer.private.x + drawer.private.width <= label.x);
+    }
+
+    #[test]
+    fn a_service_panel_only_loads_web_pages_and_is_wider() {
+        for target in [
+            "https://web.whatsapp.com/",
+            "https://meet.google.com/abc",
+            "about:blank",
+        ] {
+            assert!(service_panel_allows_navigation(target), "{target}");
+        }
+        for target in [
+            "file:///C:/Windows/win.ini",
+            "javascript:alert(1)",
+            "neuralia-pdf://x",
+            "data:text/html,x",
+        ] {
+            assert!(!service_panel_allows_navigation(target), "{target}");
+        }
+        // 42% de 1440 = 604.8 (entre 400 e 640), encostado a direita.
+        let (x, top, width, height) = service_panel_bounds(1440.0, 900.0, 76.0);
+        assert!((width - 604.8).abs() < 1e-6, "{width}");
+        assert!((x + width - 1440.0).abs() < 1e-6 && top == 76.0 && height == 824.0);
+        // 42% de 900 = 378, levado ao minimo de 400.
+        assert_eq!(
+            service_panel_bounds(900.0, 600.0, 0.0),
+            (500.0, 0.0, 400.0, 600.0)
+        );
+    }
+
+    #[test]
+    fn gmail_setting_round_trips_and_the_toast_answers_by_button() {
+        let dir = std::env::temp_dir().join(format!("neuralia-gmail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("gmail");
+        assert!(load_gmail_setting(&path), "sem ficheiro, ligado");
+        save_gmail_setting(&path, false).expect("grava");
+        assert!(!load_gmail_setting(&path), "desligado voltou ligado");
+        save_gmail_setting(&path, true).expect("grava");
+        assert!(load_gmail_setting(&path));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: 360,
+            bottom: 64,
+        };
+        let (open, no) = gmail_toast_buttons(&client, 1.0);
+        assert!(
+            open.right <= no.left,
+            "Abrir fica antes de Nao, sem se tocarem"
+        );
+        assert!(no.right <= client.right && open.left >= 0);
+        assert!(open.top >= 0 && open.bottom <= client.bottom);
     }
 
     #[test]
@@ -17195,6 +17642,13 @@ unsafe fn fill_pill(
 
 /// Slot 0..2 = icones das IAs, slot 3 = glifo da casa (pintado com a cor do tema).
 const ICON_SLOT_HOME: usize = COMPARATOR_COLUMNS;
+/// Icones dos botoes do canto direito (gerados por scripts/gen-ai-icons.py).
+const ICON_SLOT_VIDEO: usize = COMPARATOR_COLUMNS + 1;
+const ICON_SLOT_WHATSAPP: usize = COMPARATOR_COLUMNS + 2;
+const ICON_SLOT_YOUTUBE: usize = COMPARATOR_COLUMNS + 3;
+const ICON_SLOT_MAIL: usize = COMPARATOR_COLUMNS + 4;
+const ICON_SLOT_INCOGNITO: usize = COMPARATOR_COLUMNS + 5;
+static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 5] = [const { OnceLock::new() }; 5];
 
 static AI_ICON_IMAGES: [OnceLock<RgbaImage>; COMPARATOR_COLUMNS] =
     [OnceLock::new(), OnceLock::new(), OnceLock::new()];
@@ -17261,6 +17715,24 @@ fn home_icon() -> &'static RgbaImage {
     })
 }
 
+fn extra_icon(slot: usize) -> &'static RgbaImage {
+    let index = slot
+        .saturating_sub(ICON_SLOT_VIDEO)
+        .min(EXTRA_ICON_IMAGES.len() - 1);
+    EXTRA_ICON_IMAGES[index].get_or_init(|| {
+        let raw: &[u8] = match slot {
+            ICON_SLOT_VIDEO => include_bytes!("../../../assets/ai/video.png"),
+            ICON_SLOT_WHATSAPP => include_bytes!("../../../assets/ai/whatsapp.png"),
+            ICON_SLOT_YOUTUBE => include_bytes!("../../../assets/ai/youtube.png"),
+            ICON_SLOT_MAIL => include_bytes!("../../../assets/ai/mail.png"),
+            _ => include_bytes!("../../../assets/ai/incognito.png"),
+        };
+        image::load_from_memory(raw)
+            .expect("assets/ai/*.png must be valid PNG")
+            .to_rgba8()
+    })
+}
+
 fn icon_scaled(slot: usize, size: u32) -> Arc<RgbaImage> {
     let key = (slot, size);
     let mut guard = ICON_SCALE_CACHE.lock().unwrap_or_else(|p| p.into_inner());
@@ -17271,6 +17743,8 @@ fn icon_scaled(slot: usize, size: u32) -> Arc<RgbaImage> {
 
     let source = if slot == ICON_SLOT_HOME {
         home_icon()
+    } else if slot >= ICON_SLOT_VIDEO {
+        extra_icon(slot)
     } else {
         ai_icon(slot)
     };
