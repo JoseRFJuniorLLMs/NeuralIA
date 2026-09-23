@@ -2175,6 +2175,13 @@ fn tab_release(press: TabPress, released: Option<BarHit>) -> TabRelease {
     }
 }
 
+/// Esc a meio de um arrasto de aba ou grupo cancela o arrasto, como no
+/// Chrome, em vez de fazer o "voltar" de sempre -- que podia sair da coluna
+/// expandida ou ir para a Home com o botao ainda em baixo.
+fn escape_cancels_tab_drag(press: Option<TabPress>) -> bool {
+    press.is_some_and(|press| press.dragging)
+}
+
 fn split_build_is_current(
     start_generation: u64,
     current_generation: u64,
@@ -11812,6 +11819,11 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 match event.logical_key {
+                    Key::Named(NamedKey::Escape) if escape_cancels_tab_drag(self.tab_press) => {
+                        // O largar que vier depois ja nao encontra nada.
+                        self.tab_press = None;
+                        self.request_redraw();
+                    }
                     Key::Named(NamedKey::Escape) => self.go_back(),
                     Key::Named(NamedKey::F8) => self.toggle_auto_scroll(),
                     Key::Character(ref c) if self.surface == Surface::Comparator => {
@@ -19614,6 +19626,27 @@ __fire('keydown', { key: 'F8' });
         assert!(drag_started((0.0, 0.0), (6.0, 0.0), 1.0));
         assert!(drag_started((0.0, 0.0), (0.0, -6.0), 1.0));
         assert!(!drag_started((0.0, 0.0), (10.0, 0.0), 2.0));
+    }
+
+    /// Esc a meio do arrasto cancela-o; sem arrasto (nem sequer com o botao
+    /// em baixo numa aba, ainda a ser clique) continua a ser o "voltar".
+    #[test]
+    fn escape_cancels_a_tab_drag_instead_of_going_back() {
+        let press = TabPress {
+            origin: (0.0, 0.0),
+            hit: BarHit::ContextGroup {
+                source_index: 0,
+                group_index: 0,
+            },
+            drag: Some((0, DragItem::Group(3))),
+            dragging: false,
+        };
+        assert!(!escape_cancels_tab_drag(None));
+        assert!(!escape_cancels_tab_drag(Some(press)));
+        assert!(escape_cancels_tab_drag(Some(TabPress {
+            dragging: true,
+            ..press
+        })));
     }
 
     /// A aba aberta a partir de uma aba agrupada nasce no grupo dela, no fim
