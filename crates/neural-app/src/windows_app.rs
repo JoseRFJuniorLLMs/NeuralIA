@@ -19849,9 +19849,12 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
     return true;
   }
 
+  // UM so listener de clique no window (o gate scripts/test-link-routing.mjs
+  // exige-o): primeiro o link; se nao era link, o botao de enviar da IA.
   listen(window, 'click', (event) => {
     if (event.button !== 0) return;
-    routeLink(event, !!(event.ctrlKey || event.metaKey));
+    if (routeLink(event, !!(event.ctrlKey || event.metaKey))) return;
+    askFromSendButton(event);
   }, true);
 
   // O botao do meio usa auxclick. Captura no window pela mesma razao: sites de
@@ -19967,7 +19970,9 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
     if (node) sendAsk(composerText(node));
   }, true);
 
-  listen(window, 'click', (event) => {
+  // Chamado pelo listener de clique do window, depois do encaminhamento de
+  // links.
+  function askFromSendButton(event) {
     if (!event.isTrusted || event.button !== 0 || !onProviderPage()) return;
     if (neuraliaControlFromEvent(event) || !lastComposer) return;
     const button = pathOf(event).find((node) => node && node.tagName
@@ -19980,7 +19985,7 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
       button.getAttribute('title')
     ].join(' ');
     if (SEND_LABEL.test(label)) sendAsk(composerText(lastComposer));
-  }, true);
+  }
 
   listen(window, 'submit', (event) => {
     if (!event.isTrusted) return;
