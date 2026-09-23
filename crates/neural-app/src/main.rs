@@ -15,6 +15,11 @@ mod pdf_assets;
 #[cfg(target_os = "windows")]
 mod windows_app;
 
+// Pomodoro da barra: so decisoes (clique, menu, `pomodoro:`, tique, opcoes em
+// disco), sem Win32 -- testavel em qualquer plataforma.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod pomodoro_ui;
+
 #[cfg(target_os = "windows")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     windows_app::run()

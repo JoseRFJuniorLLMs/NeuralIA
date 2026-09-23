@@ -19,13 +19,17 @@ use image::RgbaImage;
 #[cfg(test)]
 use crate::ipc::constant_time_eq;
 use crate::ipc::{IpcAction, parse_ipc_message};
+use crate::pomodoro_ui::{
+    POMODORO_COMMAND_HELP, PomodoroCommand, PomodoroController, PomodoroMenuItem, PomodoroTick,
+    TickSchedule, parse_pomodoro_command, phase_color, pomodoro_menu_command,
+};
 use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentRuntimeConfig,
     AgentSecurityAction, CoreConfig, FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent,
     MemoryDocument, MemoryHit, MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore,
-    ObservedPage, ReaderArticle, ReaderBlock, ReaderClient, ResearchItemKind, ResearchSession,
-    chatgpt_search_url, claude_search_url, google_ai_url, is_local_network_target, is_pdf_url,
-    parse_intent, reader_html, redact_sensitive_text, tissue,
+    ObservedPage, Phase, ReaderArticle, ReaderBlock, ReaderClient, ResearchItemKind,
+    ResearchSession, chatgpt_search_url, claude_search_url, google_ai_url, is_local_network_target,
+    is_pdf_url, parse_intent, reader_html, redact_sensitive_text, tissue,
 };
 use url::Url;
 use windows_sys::Win32::{
@@ -108,6 +112,9 @@ enum UserEvent {
     ViewSource,
     ViewSourceTarget(PageTarget),
     AutoScrollTick(u64),
+    /// Tique do Pomodoro; so conta o da cadeia viva
+    /// (`PomodoroController::tick`).
+    PomodoroTick(u64),
     HideSplash(u64),
     GmailProbe(u64),
     GmailInboxState {
@@ -266,6 +273,10 @@ const PALETTE_HINT_TOP: f64 = 48.0;
 const PALETTE_TOP_RATIO: f64 = 0.18;
 const SPLASH_WIDTH: f64 = 470.0;
 const SPLASH_HEIGHT: f64 = 46.0;
+/// Quanto ficam no ecra os avisos do Pomodoro: os dos comandos, e os do fim
+/// de uma fase (mais tempo: quem estava concentrado pode nao estar a olhar).
+const POMODORO_NOTICE_SECONDS: u64 = 3;
+const POMODORO_PHASE_END_SECONDS: u64 = 8;
 const GMAIL_TOAST_WIDTH: f64 = 390.0;
 const GMAIL_TOAST_HEIGHT: f64 = 68.0;
 
@@ -449,6 +460,26 @@ impl Tool {
     }
 }
 
+/// A dica de uma ferramenta, na barra e na Home. A do Pomodoro, com uma
+/// sessao em curso, diz a fase, o que falta e os focos feitos
+/// (`PomodoroController::hint`); parado, e nas outras duas, a fixa.
+fn tool_hint(tool: Tool, pomodoro: Option<&str>) -> String {
+    match (tool, pomodoro) {
+        (Tool::Pomodoro, Some(session)) => session.to_string(),
+        _ => tool.tooltip().to_string(),
+    }
+}
+
+/// Cor do tempo e do contorno do botao do Pomodoro: a da fase
+/// (`phase_color`: tomate no foco, verde nas pausas) acertada ao fundo do
+/// botao para ler bem nos dois temas; sem sessao, a letra de sempre.
+fn tool_label_color(phase: Option<Phase>, fill: Rgb, theme: &Theme) -> Rgb {
+    match phase {
+        Some(phase) => readable(phase_color(phase), fill, 4.5),
+        None => theme.fg,
+    }
+}
+
 /// Botao do rato que carregou numa ferramenta.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolClick {
@@ -493,11 +524,13 @@ fn bar_tool_action(hit: Option<BarHit>, click: ToolClick) -> Option<ToolAction> 
 
 /// Etiqueta curta ao lado do icone do Pomodoro ("mm:ss"). Tamanho fixo e
 /// `Copy` para poder andar dentro de `BarColumns`: desenho e hit-testing leem
-/// a MESMA etiqueta, e por isso a mesma largura.
+/// a MESMA etiqueta, e por isso a mesma largura. Leva tambem a fase da
+/// sessao, que so o desenho usa (a cor do tempo); a largura nao depende dela.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct BarLabel {
     bytes: [u8; BAR_LABEL_MAX_BYTES],
     len: u8,
+    phase: Option<Phase>,
 }
 
 const BAR_LABEL_MAX_BYTES: usize = 16;
@@ -524,7 +557,13 @@ impl BarLabel {
         Some(Self {
             bytes,
             len: end as u8,
+            phase: None,
         })
+    }
+
+    /// A mesma etiqueta, pintada na cor de `phase` (`tool_label_color`).
+    fn with_phase(self, phase: Option<Phase>) -> Self {
+        Self { phase, ..self }
     }
 
     fn as_str(&self) -> &str {
@@ -2803,12 +2842,15 @@ unsafe fn draw_icon_button(
 /// Botao de uma ferramenta: o mesmo circulo dos servicos, com o icone no
 /// quadrado da esquerda e, se houver, a etiqueta (o tempo do Pomodoro) no
 /// resto -- `right_controls` e `home_tool_buttons` ja alargaram o botao.
+/// Com `phase` (uma sessao do Pomodoro em curso) o tempo e o contorno vao na
+/// cor da fase.
 #[allow(clippy::too_many_arguments)]
 unsafe fn draw_tool_button(
     hdc: *mut core::ffi::c_void,
     rect: UiRect,
     tool: Tool,
     label: Option<&str>,
+    phase: Option<Phase>,
     hovered: bool,
     scale: f64,
     font: *mut core::ffi::c_void,
@@ -2823,12 +2865,18 @@ unsafe fn draw_tool_button(
     } else {
         theme.surface
     };
+    let label_color = tool_label_color(phase, fill, theme);
+    let border = if phase.is_some() {
+        label_color
+    } else {
+        theme.surface_line
+    };
     fill_pill(
         hdc,
         rect,
         rect.height / 2.0,
         fill,
-        Some((theme.surface_line, scale)),
+        Some((border, scale)),
         background,
     );
     let size = (rect.height * 0.6).round() as i32;
@@ -2850,7 +2898,7 @@ unsafe fn draw_tool_button(
         && rect.width > rect.height + 1.0
     {
         SelectObject(hdc, font as _);
-        SetTextColor(hdc, rgb3(theme.fg));
+        SetTextColor(hdc, rgb3(label_color));
         SetBkMode(hdc, TRANSPARENT as i32);
         let mut text_rect = RECT {
             left: (rect.x + rect.height * 0.85).round() as i32,
@@ -3489,6 +3537,50 @@ fn hide_tooltip() {
     }
 }
 
+/// A dica a vista -- ou a espera do atraso -- passa a dizer `text`, sem se
+/// esconder nem voltar a esperar: o tempo do Pomodoro muda a cada segundo
+/// com o rato parado em cima do botao. Escondida, fica escondida.
+fn refresh_hint_text(text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GW_OWNER, GetWindow, IsWindowVisible};
+    {
+        let mut pending = TOOLTIP_PENDING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((_, waiting)) = pending.as_mut() {
+            *waiting = text.to_string();
+            return;
+        }
+    }
+    let hint = HINT_HWND.load(Ordering::Acquire) as HWND;
+    if hint.is_null() || unsafe { IsWindowVisible(hint) } == 0 {
+        return;
+    }
+    let unchanged = *HINT_TEXT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        == text;
+    if unchanged {
+        return;
+    }
+    let root = unsafe { GetWindow(hint, GW_OWNER) };
+    *TOOLTIP_PENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((root as usize, text.to_string()));
+    // Volta a centrar e a dimensionar pelo texto novo; `show_popup_without_activation`
+    // la dentro, como sempre: a dica nunca rouba o foco.
+    show_pending_tooltip();
+}
+
+/// Som curto do sistema no fim de uma fase do Pomodoro (o "Asterisco" do
+/// esquema de sons do Windows; sem som configurado, nada).
+fn pomodoro_sound() {
+    use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
+    use windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK;
+    unsafe {
+        MessageBeep(MB_ICONASTERISK);
+    }
+}
+
 /// Menu de tema no cursor, com a escolha em vigor marcada. Devolve a opcao
 /// clicada, ou None se o menu foi fechado sem escolha.
 fn pick_theme_from_menu(hwnd: HWND) -> Option<ThemeChoice> {
@@ -3534,6 +3626,61 @@ fn pick_theme_from_menu(hwnd: HWND) -> Option<ThemeChoice> {
             .ok()
             .and_then(|id| id.checked_sub(1))
             .and_then(|index| ThemeChoice::ALL.get(index).copied())
+    }
+}
+
+/// Menu do botao direito do Pomodoro no cursor, feito das linhas de
+/// `PomodoroController::menu_items` (o modelo e o `pick_theme_from_menu`).
+/// Devolve o id escolhido; 0 se o menu fechou sem escolha.
+fn pick_pomodoro_from_menu(hwnd: HWND, items: &[PomodoroMenuItem]) -> usize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GA_ROOT, GetAncestor, MF_CHECKED, MF_GRAYED, SetForegroundWindow,
+    };
+    unsafe {
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return 0;
+        }
+        for item in items {
+            match *item {
+                PomodoroMenuItem::Separator => {
+                    AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+                }
+                PomodoroMenuItem::Command {
+                    id,
+                    label,
+                    enabled,
+                    checked,
+                    ..
+                } => {
+                    let mut flags = MF_STRING;
+                    if checked {
+                        flags |= MF_CHECKED;
+                    }
+                    if !enabled {
+                        flags |= MF_GRAYED;
+                    }
+                    let text: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
+                    AppendMenuW(menu, flags, id, text.as_ptr());
+                }
+            }
+        }
+        let mut cursor = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut cursor);
+        // Sem o dono em primeiro plano, o menu nao fecha ao clicar fora.
+        let root = GetAncestor(hwnd, GA_ROOT);
+        SetForegroundWindow(root);
+        let picked = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            cursor.x,
+            cursor.y,
+            0,
+            root,
+            std::ptr::null(),
+        );
+        DestroyMenu(menu);
+        usize::try_from(picked).unwrap_or(0)
     }
 }
 
@@ -4951,6 +5098,9 @@ struct App {
     /// o painel aberto pelo botao Notas, a espera do "pronto" da pagina.
     home_tool_hover: Option<Tool>,
     panel_notes_pending: bool,
+    /// O Pomodoro do botao da barra e da Home, com a cadeia de tiques viva.
+    /// As duracoes vivem em `<data_dir>/pomodoro`.
+    pomodoro: PomodoroController,
 }
 
 impl App {
@@ -4964,6 +5114,9 @@ impl App {
             load_gmail_setting(&config.data_dir.join("gmail")),
             Ordering::Release,
         );
+        let pomodoro = PomodoroController::new(crate::pomodoro_ui::load_settings(
+            &config.data_dir.join("pomodoro"),
+        ));
         let history = HistoryWriter::new(history_store, proxy.clone());
         let memory = MemoryWorker::new(config.data_dir.join("memory"), proxy.clone());
         let timers = Timers::new(proxy.clone());
@@ -5041,6 +5194,7 @@ impl App {
             service_panel: None,
             home_tool_hover: None,
             panel_notes_pending: false,
+            pomodoro,
         }
     }
 
@@ -5624,6 +5778,10 @@ impl App {
                 "Use tema:sistema, tema:claro ou tema:escuro.".to_string(),
                 3,
             ),
+            InputRoute::Pomodoro(Some(command)) => self.pomodoro_command(command),
+            InputRoute::Pomodoro(None) => {
+                self.show_splash(POMODORO_COMMAND_HELP.to_string(), 4);
+            }
             InputRoute::ResearchCompare => self.compare_current_research(),
             InputRoute::ResearchSynthesize => self.synthesize_current_research(),
             InputRoute::ResearchExport => self.export_current_research(),
@@ -8780,7 +8938,8 @@ impl App {
         }
         self.home_tool_hover = next;
         if let Some(owner) = window_hwnd(window) {
-            hover_tooltip(owner, next.map_or("", Tool::tooltip));
+            let text = next.map(|tool| self.tool_hint_now(tool));
+            hover_tooltip(owner, text.as_deref().unwrap_or(""));
         }
         self.request_redraw();
     }
@@ -9084,40 +9243,106 @@ impl App {
         }
     }
 
-    /// Clique no botao do Pomodoro (barra ou Home).
-    ///
-    /// ESQUELETO: o trabalho do Pomodoro liga isto a um
-    /// `neural_core::pomodoro::Pomodoro` guardado no `App` -- `start` quando
-    /// parado, `pause`/`resume` quando a correr --, agenda o tique com
-    /// `self.timers.after(..)` e pede `request_redraw` para a etiqueta de
-    /// `pomodoro_label` mudar. Ate la avisa, para o clique nao ser mudo.
+    /// Clique no botao do Pomodoro (barra ou Home): parado inicia, a correr
+    /// pausa, pausado retoma.
     fn pomodoro_click(&mut self) {
-        self.show_splash(
-            "Pomodoro: ainda não disponível nesta versão.".to_string(),
-            2,
-        );
+        self.pomodoro_command(PomodoroCommand::Click);
     }
 
-    /// Botao direito no Pomodoro: o menu de opcoes (duracoes, parar, saltar
-    /// a fase). ESQUELETO, como `pomodoro_click`; o `TrackPopupMenu` do
-    /// `pick_theme_from_menu` e o modelo a seguir.
+    /// Botao direito no Pomodoro: o menu nativo do estado de agora (so a
+    /// accao que se aplica, Pular fase, Parar e os presets com a marca no
+    /// que esta em uso).
     fn pomodoro_menu(&mut self) {
-        self.show_splash(
-            "Opções do Pomodoro: ainda não disponíveis nesta versão.".to_string(),
-            2,
-        );
+        let Some(owner) = self.window.as_ref().and_then(window_hwnd) else {
+            return;
+        };
+        let items = self.pomodoro.menu_items();
+        let picked = pick_pomodoro_from_menu(owner, &items);
+        if let Some(command) = pomodoro_menu_command(&items, picked) {
+            self.pomodoro_command(command);
+        }
     }
 
-    /// O tempo que falta no Pomodoro ("mm:ss") para ir ao lado do icone, ou
-    /// `None` para o botao so com o icone. ESQUELETO: o trabalho do Pomodoro
-    /// devolve aqui `remaining_label(now)` enquanto houver uma fase a correr.
+    /// Clique, menu e `pomodoro:` passam todos por aqui. A decisao e do
+    /// `PomodoroController`; aqui so se faz o que ele devolve.
+    fn pomodoro_command(&mut self, command: PomodoroCommand) {
+        let outcome = self.pomodoro.command(command, Instant::now());
+        self.schedule_pomodoro_tick(outcome.tick);
+        let saved = outcome.save.map(|settings| {
+            crate::pomodoro_ui::save_settings(&self.config.data_dir.join("pomodoro"), settings)
+        });
+        let notice = match saved {
+            Some(Err(error)) => Some(format!(
+                "Não foi possível gravar as opções do Pomodoro: {error}"
+            )),
+            _ => outcome.notice,
+        };
+        if let Some(notice) = notice {
+            self.show_splash(notice, POMODORO_NOTICE_SECONDS);
+        }
+        self.pomodoro_changed();
+    }
+
+    /// Um tique: so o da cadeia viva mexe no motor. No fim de uma fase, o
+    /// aviso no meio da janela e um som curto do sistema.
+    fn pomodoro_tick(&mut self, token: u64) {
+        let PomodoroTick::Live { next, finished } = self.pomodoro.tick(token, Instant::now())
+        else {
+            return;
+        };
+        self.schedule_pomodoro_tick(next);
+        if let Some(message) = finished {
+            pomodoro_sound();
+            self.show_splash(message, POMODORO_PHASE_END_SECONDS);
+        }
+        self.pomodoro_changed();
+    }
+
+    fn schedule_pomodoro_tick(&self, tick: Option<TickSchedule>) {
+        if let Some(tick) = tick {
+            self.timers
+                .after(tick.delay, UserEvent::PomodoroTick(tick.token));
+        }
+    }
+
+    /// O tempo mudou: repinta o botao (a barra, ou a Home) e, se a dica do
+    /// Pomodoro estiver a vista, poe-lhe o tempo novo sem a esconder.
+    fn pomodoro_changed(&mut self) {
+        let hovered = match self.surface {
+            Surface::Comparator => self.bar_hover == Some(BarHit::Tool(Tool::Pomodoro)),
+            Surface::Home => self.home_tool_hover == Some(Tool::Pomodoro),
+            _ => false,
+        };
+        if hovered {
+            refresh_hint_text(&self.tool_hint_now(Tool::Pomodoro));
+        }
+        if matches!(self.surface, Surface::Comparator | Surface::Home) {
+            self.request_redraw();
+        }
+    }
+
+    /// O tempo que falta no Pomodoro ("mm:ss", "⏸ mm:ss" pausado) para ir ao
+    /// lado do icone, ou `None` parado (o botao so com o icone).
     fn pomodoro_label(&self) -> Option<String> {
-        None
+        self.pomodoro.label(Instant::now())
     }
 
-    /// A etiqueta ja no formato que a barra e a Home desenham e medem.
+    /// A dica de uma ferramenta agora, na barra e na Home (ver `tool_hint`).
+    fn tool_hint_now(&self, tool: Tool) -> String {
+        let session = match tool {
+            Tool::Pomodoro => self.pomodoro.hint(Instant::now()),
+            Tool::Notes | Tool::Breath => None,
+        };
+        tool_hint(tool, session.as_deref())
+    }
+
+    /// A etiqueta ja no formato que a barra e a Home desenham e medem, com a
+    /// fase para a cor.
     fn pomodoro_bar_label(&self) -> Option<BarLabel> {
-        self.pomodoro_label().as_deref().and_then(BarLabel::new)
+        self.pomodoro_label()
+            .as_deref()
+            .and_then(BarLabel::new)
+            .map(|label| label.with_phase(self.pomodoro.active_phase()))
     }
 
     fn run_tool_action(&mut self, action: ToolAction) {
@@ -9325,6 +9550,11 @@ impl App {
                 .map(|group| (group.name.as_str(), group.collapsed)),
             _ => None,
         };
+        // As ferramentas pela mesma `tool_hint` da Home: a do Pomodoro diz a
+        // sessao em curso.
+        if let BarHit::Tool(tool) = hit {
+            return Some(self.tool_hint_now(tool));
+        }
         let maximized = unsafe { IsZoomed(owner) != 0 };
         bar_tooltip_label(hit, provider, maximized, tab_url, group)
     }
@@ -10374,11 +10604,21 @@ enum InputRoute {
     History,
     /// `tema:claro`, `tema:escuro`, `tema:sistema` (None: palavra desconhecida).
     Theme(Option<ThemeChoice>),
+    /// `pomodoro:`, `pomodoro:pausar`, `pomodoro:50`... (None: palavra
+    /// desconhecida -> a ajuda).
+    Pomodoro(Option<PomodoroCommand>),
     ResearchCompare,
     ResearchSynthesize,
     ResearchExport,
     /// Sem comando próprio: segue para o `parse_intent`.
     Intent,
+}
+
+/// `text` sem `prefix` a frente, se comecar por ele (maiusculas ou nao).
+fn strip_prefix_ignore_ascii_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &text[prefix.len()..])
 }
 
 fn route_input(input: &str) -> InputRoute {
@@ -10405,6 +10645,12 @@ fn route_input(input: &str) -> InputRoute {
         .or_else(|| trimmed.strip_prefix("theme:"))
     {
         return InputRoute::Theme(ThemeChoice::parse(word));
+    }
+    // Sem distinguir maiusculas, como os `research:`. Os dois pontos sao
+    // obrigatorios, como no `tema:`: "pomodoro tecnica" continua a ser uma
+    // pesquisa sobre o metodo.
+    if let Some(word) = strip_prefix_ignore_ascii_case(trimmed, "pomodoro:") {
+        return InputRoute::Pomodoro(parse_pomodoro_command(word));
     }
     if let Some(spec) = input.strip_prefix("agent:") {
         return InputRoute::Agent(spec.trim().to_string());
@@ -10802,6 +11048,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ViewSource => self.view_source(),
             UserEvent::ViewSourceTarget(target) => self.view_source_target(target),
             UserEvent::AutoScrollTick(token) => self.auto_scroll_tick(token),
+            UserEvent::PomodoroTick(token) => self.pomodoro_tick(token),
             UserEvent::HideSplash(token) => self.hide_splash(token),
             UserEvent::GmailProbe(token) => {
                 if token == self.gmail_probe_token && self.gmail_monitor.is_none() {
@@ -12054,6 +12301,7 @@ fn draw_home(
                 *rect,
                 tool,
                 label.as_ref().map(BarLabel::as_str),
+                label.and_then(|label| label.phase),
                 tool_hover == Some(tool),
                 scale,
                 small_font,
@@ -12503,6 +12751,7 @@ unsafe fn paint_comparator_bar_with_contexts(
             *rect,
             tool,
             label.as_ref().map(BarLabel::as_str),
+            label.and_then(|label| label.phase),
             hover == Some(BarHit::Tool(tool)),
             scale,
             font,
@@ -18620,7 +18869,17 @@ __fire('keydown', { key: 'F8' });
     /// sempre: quem cede primeiro e o rotulo da gaveta.
     #[test]
     fn tool_buttons_never_overlap_the_bar_at_any_width() {
-        let label = BarLabel::new("24:59");
+        // As etiquetas que a app mostra, tiradas do `PomodoroController`: a
+        // correr ("24:59") e pausada ("⏸ 24:59", a mais larga).
+        let (running, paused) = shipped_pomodoro_labels();
+        assert_eq!(
+            running.map(|label| label.as_str().to_string()).as_deref(),
+            Some("24:59")
+        );
+        assert_eq!(
+            paused.map(|label| label.as_str().to_string()).as_deref(),
+            Some("⏸ 24:59")
+        );
         // Com a gaveta a barra reparte em partes iguais e nao ha chips (ver
         // `bar_columns`), por isso a gaveta so aparece sem minimizadas.
         let topologies = [
@@ -18637,7 +18896,7 @@ __fire('keydown', { key: 'F8' });
             for scale in [1.0, 1.25, 1.5, 2.0] {
                 let client_width = logical_width * scale;
                 for (minimized, split_active) in topologies {
-                    for pomodoro_label in [None, label] {
+                    for pomodoro_label in [None, running, paused] {
                         scenarios += 1;
                         let columns = BarColumns {
                             count: COMPARATOR_COLUMNS,
@@ -18701,7 +18960,21 @@ __fire('keydown', { key: 'F8' });
                 }
             }
         }
-        assert_eq!(scenarios, 1041 * 4 * 6 * 2);
+        assert_eq!(scenarios, 1041 * 4 * 6 * 3);
+    }
+
+    /// A etiqueta do Pomodoro a correr e pausada, um segundo depois de
+    /// arrancar, pelo caminho que a barra usa (`label` -> `BarLabel::new`).
+    fn shipped_pomodoro_labels() -> (Option<BarLabel>, Option<BarLabel>) {
+        let mut pomodoro =
+            PomodoroController::new(crate::pomodoro_ui::PomodoroPreset::Classic.settings());
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        pomodoro.command(PomodoroCommand::Click, t0);
+        let running = pomodoro.label(t1).as_deref().and_then(BarLabel::new);
+        pomodoro.command(PomodoroCommand::Click, t1);
+        let paused = pomodoro.label(t1).as_deref().and_then(BarLabel::new);
+        (running, paused)
     }
 
     /// Gate: o centro de cada ferramenta -- e o fim da etiqueta do Pomodoro --
@@ -18710,7 +18983,8 @@ __fire('keydown', { key: 'F8' });
     /// faixa de arrastar da Home as engolir e sem tocar nos botoes da janela.
     #[test]
     fn each_tool_button_hits_its_tool_in_the_bar_and_on_home() {
-        for pomodoro_label in [None, BarLabel::new("07:30")] {
+        let (running, paused) = shipped_pomodoro_labels();
+        for pomodoro_label in [None, BarLabel::new("07:30"), running, paused] {
             for scale in [1.0, 1.25, 1.5, 2.0] {
                 for logical_width in [700.0, 1120.0, 1600.0] {
                     let client_width = logical_width * scale;
@@ -18826,6 +19100,108 @@ __fire('keydown', { key: 'F8' });
                 Some(text)
             );
         }
+    }
+
+    /// Gate: a dica do Pomodoro na barra e na Home e a da sessao em curso
+    /// (fase, tempo, focos feitos); parado, a fixa. As outras ferramentas
+    /// nunca herdam a dica do Pomodoro.
+    #[test]
+    fn pomodoro_hint_follows_the_session_in_the_bar_and_on_home() {
+        let fixed = bar_tooltip_label(BarHit::Tool(Tool::Pomodoro), "IA", false, None, None);
+        assert_eq!(Some(tool_hint(Tool::Pomodoro, None)), fixed);
+
+        let mut pomodoro =
+            PomodoroController::new(crate::pomodoro_ui::PomodoroPreset::Classic.settings());
+        let t0 = Instant::now();
+        assert_eq!(pomodoro.hint(t0), None);
+        pomodoro.command(PomodoroCommand::Click, t0);
+        let session = pomodoro
+            .hint(t0 + Duration::from_secs(90))
+            .expect("sessao em curso");
+        assert_eq!(
+            tool_hint(Tool::Pomodoro, Some(&session)),
+            "Pomodoro — Foco: faltam 23:30 · 0 focos concluídos
+Clique: pausar · botão direito: opções"
+        );
+        for tool in [Tool::Notes, Tool::Breath] {
+            assert_eq!(tool_hint(tool, Some(&session)), tool.tooltip(), "{tool:?}");
+        }
+    }
+
+    /// Gate: o tempo do Pomodoro e o contorno vao a tomate no foco e a verde
+    /// nas pausas, legiveis (4,5:1) no fundo do botao nos dois temas, com e
+    /// sem o rato em cima; sem sessao, a letra de sempre. A cor anda na
+    /// etiqueta e nao lhe muda a largura.
+    #[test]
+    fn pomodoro_phase_colors_read_on_both_themes() {
+        for theme in [Theme::dark((0, 120, 212)), Theme::light((0, 120, 212))] {
+            for fill in [theme.surface, theme.surface_line] {
+                let focus = tool_label_color(Some(Phase::Focus), fill, &theme);
+                assert!(focus.0 > focus.1 && focus.0 > focus.2, "foco {focus:?}");
+                for phase in [Phase::ShortBreak, Phase::LongBreak] {
+                    let rest = tool_label_color(Some(phase), fill, &theme);
+                    assert!(rest.1 > rest.0 && rest.1 > rest.2, "{phase:?} {rest:?}");
+                    assert!(
+                        contrast(rest, fill) >= 4.5,
+                        "{phase:?} {rest:?} em {fill:?}"
+                    );
+                }
+                assert!(contrast(focus, fill) >= 4.5, "foco {focus:?} em {fill:?}");
+                assert_eq!(tool_label_color(None, fill, &theme), theme.fg);
+            }
+        }
+        let plain = BarLabel::new("⏸ 12:34").expect("etiqueta");
+        let tinted = plain.with_phase(Some(Phase::Focus));
+        assert_eq!(tinted.phase, Some(Phase::Focus));
+        assert_eq!(plain.phase, None);
+        assert_eq!(tinted.as_str(), plain.as_str());
+        assert_eq!(tinted.width(), plain.width());
+    }
+
+    /// Gate: o `pomodoro:` da omnibox chega ao Pomodoro, sem distinguir
+    /// maiusculas e com espacos depois dos dois pontos; sem os dois pontos e
+    /// uma pesquisa, e um acento no sitio do prefixo nao rebenta nada.
+    #[test]
+    fn pomodoro_command_routes_from_the_omnibox() {
+        use crate::pomodoro_ui::PomodoroPreset;
+        for (input, command) in [
+            ("pomodoro:", PomodoroCommand::Start),
+            ("pomodoro:iniciar", PomodoroCommand::Start),
+            ("Pomodoro:Pausar", PomodoroCommand::Pause),
+            ("  POMODORO: parar ", PomodoroCommand::Stop),
+            ("pomodoro:retomar", PomodoroCommand::Resume),
+            ("pomodoro:pular", PomodoroCommand::Skip),
+            (
+                "pomodoro:25",
+                PomodoroCommand::Preset(PomodoroPreset::Classic),
+            ),
+            (
+                "pomodoro: 50",
+                PomodoroCommand::Preset(PomodoroPreset::Long),
+            ),
+            (
+                "pomodoro:15 min",
+                PomodoroCommand::Preset(PomodoroPreset::Short),
+            ),
+        ] {
+            assert_eq!(
+                route_input(input),
+                InputRoute::Pomodoro(Some(command)),
+                "{input:?}"
+            );
+        }
+        assert_eq!(route_input("pomodoro:abacaxi"), InputRoute::Pomodoro(None));
+        assert_eq!(route_input("pomodoro:30"), InputRoute::Pomodoro(None));
+        for search in [
+            "pomodoro",
+            "pomodoro técnica",
+            "técnica pomodoro:",
+            "pomodorõ:",
+            "pomodor€x",
+        ] {
+            assert_eq!(route_input(search), InputRoute::Intent, "{search:?}");
+        }
+        assert!(POMODORO_COMMAND_HELP.contains("pomodoro:iniciar"));
     }
 
     /// Gate: o painel da respiracao e o video que o dono escolheu, em
