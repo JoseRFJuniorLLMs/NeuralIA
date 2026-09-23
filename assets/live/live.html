@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gemini Live</title>
+<link rel="stylesheet" href="/live.css">
+</head>
+<body data-state="idle">
+<header>
+  <span class="dot" aria-hidden="true"></span>
+  <h1>Gemini Live</h1>
+  <button id="off" class="off" title="Desliga a tela, a câmera e o microfone e fecha o painel">Desligar</button>
+</header>
+
+<section id="key-screen" hidden>
+  <h2>Chave da API do Gemini</h2>
+  <p>Crie a chave em aistudio.google.com/apikey e cole-a aqui.</p>
+  <input id="key" type="password" autocomplete="off" spellcheck="false" placeholder="Chave da API">
+  <button id="save" class="primary">Guardar e ligar</button>
+  <p id="key-error" class="error" hidden></p>
+  <p class="muted">A chave fica neste computador, cifrada para o seu usuário do Windows, e só é usada para falar com a API do Gemini.</p>
+</section>
+
+<section id="live-screen" hidden>
+  <p class="warning">Enquanto estiver ligado, o que estiver ativo abaixo é enviado ao Google (API do Gemini).</p>
+  <div class="toggles">
+    <button id="t-screen" class="toggle" aria-pressed="false">Tela</button>
+    <button id="t-camera" class="toggle" aria-pressed="false">Câmera</button>
+    <button id="t-mic" class="toggle" aria-pressed="false">Microfone</button>
+  </div>
+  <p id="status" class="status">A ligar…</p>
+  <p id="notice" class="notice" hidden></p>
+  <div id="error-box" class="error-box" hidden>
+    <p id="error"></p>
+    <button id="error-key">Trocar chave</button>
+  </div>
+  <video id="cam" class="cam" muted playsinline hidden></video>
+  <div id="log" class="log" aria-live="polite"></div>
+  <footer>
+    <button id="change-key" class="link">Trocar chave</button>
+    <span class="muted">Use fones de ouvido para evitar eco.</span>
+  </footer>
+</section>
+
+<script src="/live-core.js"></script>
+<script src="/live.js"></script>
+</body>
+</html>

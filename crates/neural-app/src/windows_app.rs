@@ -16,6 +16,11 @@ use std::{
 
 use image::RgbaImage;
 
+use crate::gemini_live::{
+    LIVE_PROTOCOL, LiveKeyStore, LiveMessage, LiveStep, live_ipc_source_ok, live_page_url,
+    live_panel_allows_navigation, live_step, live_theme_script, parse_live_message,
+    redact_debug_secrets, serve_live_asset,
+};
 #[cfg(test)]
 use crate::ipc::constant_time_eq;
 use crate::ipc::{IpcAction, parse_ipc_message};
@@ -87,6 +92,9 @@ enum UserEvent {
     ThemeChosen(ThemeChoice),
     /// Pedido da pagina local do painel lateral (canal proprio).
     Panel(PanelMessage),
+    /// Pedido da pagina do painel do Gemini Live (canal proprio, lista
+    /// fechada em `gemini_live::parse_live_message`).
+    Live(LiveMessage),
     /// "Abrir?" do aviso do Gmail: Sim (true) ou Nao.
     GmailAnswer(bool),
     HomeRequested,
@@ -420,6 +428,8 @@ enum BarHit {
     /// Icones do canto direito: servicos no painel e avisos do Gmail.
     Service(Service),
     GmailToggle,
+    /// O olho: liga e desliga o Gemini Live (tela, camera e microfone).
+    GeminiLive,
     WindowMinimize,
     WindowMaximize,
     WindowClose,
@@ -889,6 +899,8 @@ struct RightControls {
     private: UiRect,
     /// Videochamada, WhatsApp, YouTube e Gmail, a esquerda do Privado.
     services: [UiRect; 4],
+    /// Gemini Live, a esquerda dos servicos: o primeiro dos controlos.
+    live: UiRect,
     /// Rotulo, expandir e fechar da gaveta; `None` quando nao ha gaveta.
     split: Option<(UiRect, UiRect, UiRect)>,
     /// ‹ e › da fonte da gaveta, a esquerda do rotulo.
@@ -954,16 +966,23 @@ fn right_controls(client_width: f64, scale: f64, split_active: bool) -> RightCon
         width: icon,
         height: icon,
     };
-    let services = std::array::from_fn(|index| UiRect {
+    let services: [UiRect; 4] = std::array::from_fn(|index| UiRect {
         x: private.x - (4 - index) as f64 * (icon + icon_gap),
         y: row_y,
         width: icon,
         height: icon,
     });
+    let live = UiRect {
+        x: services[0].x - (icon + icon_gap),
+        y: row_y,
+        width: icon,
+        height: icon,
+    };
 
     RightControls {
         private,
         services,
+        live,
         split,
         split_nav,
     }
@@ -972,7 +991,7 @@ fn right_controls(client_width: f64, scale: f64, split_active: bool) -> RightCon
 impl RightControls {
     /// Onde comecam os controlos da direita: o resto da barra acaba aqui.
     fn leftmost(&self) -> f64 {
-        self.services[0].x
+        self.live.x
     }
 }
 
@@ -985,6 +1004,9 @@ const SERVICE_BUTTON_HITS: [BarHit; 4] = [
 ];
 
 fn right_controls_hit(controls: RightControls, x: f64, y: f64) -> Option<BarHit> {
+    if controls.live.contains(x, y) {
+        return Some(BarHit::GeminiLive);
+    }
     for (rect, hit) in controls.services.iter().zip(SERVICE_BUTTON_HITS) {
         if rect.contains(x, y) {
             return Some(hit);
@@ -2456,6 +2478,56 @@ unsafe fn draw_icon_button(
     draw_icon(hdc, slot, x, y, size, fill, tint);
 }
 
+/// Gemini Live ligado. So o painel mexe nisto (abrir liga, fechar desliga);
+/// a barra le-o para pintar o botao, como os avisos do Gmail.
+static LIVE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// A dica do olho. O estado ve-se na cor do botao.
+const LIVE_TOOLTIP: &str = "Gemini Live: ver a tela, câmera e microfone (liga/desliga)";
+
+/// Vermelho de "a gravar": com o Gemini Live ligado o botao fica cheio desta
+/// cor, para ninguem esquecer que a tela, a camera e o microfone estao a sair.
+const LIVE_ON_RED: Rgb = (217, 48, 37);
+
+/// Fundo, borda e cor do olho no botao do Gemini Live.
+fn live_button_colors(active: bool, hovered: bool, theme: &Theme) -> (Rgb, Rgb, Rgb) {
+    match (active, hovered) {
+        (true, false) => (LIVE_ON_RED, LIVE_ON_RED, (255, 255, 255)),
+        (true, true) => {
+            let deep = mix(LIVE_ON_RED, (0, 0, 0), 0.18);
+            (deep, deep, (255, 255, 255))
+        }
+        (false, true) => (theme.surface_line, theme.surface_line, theme.fg),
+        (false, false) => (theme.surface, theme.surface_line, theme.fg),
+    }
+}
+
+unsafe fn draw_live_button(
+    hdc: *mut core::ffi::c_void,
+    rect: UiRect,
+    active: bool,
+    hovered: bool,
+    scale: f64,
+    theme: &Theme,
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let (fill, border, tint) = live_button_colors(active, hovered, theme);
+    fill_pill(
+        hdc,
+        rect,
+        rect.height / 2.0,
+        fill,
+        Some((border, scale)),
+        theme.bar_bg,
+    );
+    let size = (rect.height * 0.6).round() as i32;
+    let x = (rect.x + (rect.width - size as f64) / 2.0).round() as i32;
+    let y = (rect.y + (rect.height - size as f64) / 2.0).round() as i32;
+    draw_icon(hdc, ICON_SLOT_LIVE, x, y, size, fill, Some(tint));
+}
+
 /// Avisos do Gmail ligados (o botao do envelope). Guardado em
 /// `<data_dir>/gmail` como "ligado"/"desligado"; sem ficheiro, ligado.
 static GMAIL_NOTIFICATIONS: AtomicBool = AtomicBool::new(true);
@@ -2519,7 +2591,10 @@ fn append_debug_line(path: &std::path::Path, elapsed_ms: u128, event: std::fmt::
         .append(true)
         .open(path)
     {
-        let _ = writeln!(file, "{elapsed_ms:>8} ms  {event}");
+        // A linha passa pela redacao antes do disco: se alguma um dia levar
+        // a chave do Gemini Live, sai com um marcador no lugar dela.
+        let line = event.to_string();
+        let _ = writeln!(file, "{elapsed_ms:>8} ms  {}", redact_debug_secrets(&line));
     }
 }
 
@@ -2594,6 +2669,7 @@ fn bar_tooltip_label(
             "Avisos do Gmail: desligados · clique para ligar"
         }
         .to_string(),
+        BarHit::GeminiLive => LIVE_TOOLTIP.to_string(),
         BarHit::WindowMinimize => caption_tooltip_label(0, maximized).to_string(),
         BarHit::WindowMaximize => caption_tooltip_label(1, maximized).to_string(),
         BarHit::WindowClose => caption_tooltip_label(2, maximized).to_string(),
@@ -4459,6 +4535,8 @@ struct App {
     panel_suggestion_query: Option<String>,
     /// Servico aberto no painel lateral (WhatsApp, Meet, YouTube, Gmail).
     service_panel: Option<(Service, WebView)>,
+    /// Painel do Gemini Live. Existir e estar ligado: fecha-lo desliga tudo.
+    live_panel: Option<WebView>,
 }
 
 impl App {
@@ -4545,6 +4623,7 @@ impl App {
             side_panel: None,
             panel_suggestion_query: None,
             service_panel: None,
+            live_panel: None,
         }
     }
 
@@ -4959,6 +5038,7 @@ impl App {
         debug_log(format_args!("show_home (surface era {:?})", self.surface));
         self.close_side_panel();
         self.close_service_panel();
+        self.close_live_panel();
         self.next_generation();
         self.surface = Surface::Home;
 
@@ -5852,6 +5932,7 @@ impl App {
     fn open_comparator(&mut self, query: &str) {
         self.close_side_panel();
         self.close_service_panel();
+        self.close_live_panel();
         let reuse_comparator = self
             .comparator
             .as_ref()
@@ -8246,6 +8327,7 @@ impl App {
         }
         // Um painel de cada vez.
         self.close_side_panel();
+        self.close_live_panel();
         let Some(window) = &self.window else {
             return;
         };
@@ -8311,6 +8393,115 @@ impl App {
         });
     }
 
+    /// O olho da barra: liga o Gemini Live (abre o painel, que pede a chave
+    /// na primeira vez e depois liga tela, camera e microfone); de novo,
+    /// desliga -- fechar o painel destroi a pagina e com ela tudo o que
+    /// estava a ser capturado.
+    fn toggle_live_panel(&mut self) {
+        if self.live_panel.is_some() {
+            self.close_live_panel();
+        } else {
+            self.open_live_panel();
+        }
+    }
+
+    fn live_panel_rect(&self) -> Option<wry::Rect> {
+        let window = self.window.as_ref()?;
+        let scale = window.scale_factor().max(1.0);
+        let size = window.inner_size();
+        let top = if self.surface == Surface::Comparator {
+            COMPARATOR_CHROME_HEIGHT
+        } else {
+            0.0
+        };
+        let (x, y, width, height) =
+            service_panel_bounds(size.width as f64 / scale, size.height as f64 / scale, top);
+        Some(wry::Rect {
+            position: LogicalPosition::new(x, y).into(),
+            size: LogicalSize::new(width, height).into(),
+        })
+    }
+
+    fn open_live_panel(&mut self) {
+        // Um painel de cada vez.
+        self.close_service_panel();
+        self.close_side_panel();
+        let Some(bounds) = self.live_panel_rect() else {
+            return;
+        };
+        let Some(window) = &self.window else {
+            return;
+        };
+        let proxy = self.proxy.clone();
+        let built = themed_webview_builder()
+            // Origem propria: `http://neuralia-live.localhost` e contexto
+            // seguro, e sem isso nao ha getUserMedia nem getDisplayMedia.
+            .with_custom_protocol(LIVE_PROTOCOL.to_string(), move |_id, request| {
+                serve_live_asset(&request)
+            })
+            .with_url(live_page_url())
+            .with_bounds(bounds)
+            .with_ipc_handler(move |request| {
+                if live_ipc_source_ok(&request.uri().to_string())
+                    && let Some(message) = parse_live_message(request.body())
+                {
+                    let _ = proxy.send_event(UserEvent::Live(message));
+                }
+            })
+            .with_navigation_handler(|target| live_panel_allows_navigation(&target))
+            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+            // Camera, microfone e captura de ecra so por este painel, e so
+            // pelo aviso do proprio WebView2 (nunca um Allow silencioso).
+            .with_permission_handler(|kind| web_media_permission(kind, true))
+            .build_as_child(window);
+        match built {
+            Ok(panel) => {
+                let _ = panel.focus();
+                debug_log(format_args!("live panel: ligado"));
+                self.live_panel = Some(panel);
+                LIVE_ACTIVE.store(true, Ordering::Release);
+                self.fit_comparator_to_panel();
+                self.request_redraw();
+            }
+            Err(error) => {
+                self.show_splash(format!("Não foi possível abrir o Gemini Live: {error}"), 3);
+            }
+        }
+    }
+
+    fn close_live_panel(&mut self) {
+        let Some(panel) = self.live_panel.take() else {
+            return;
+        };
+        let _ = panel.set_visible(false);
+        let _ = panel.focus_parent();
+        drop(panel);
+        LIVE_ACTIVE.store(false, Ordering::Release);
+        debug_log(format_args!("live panel: desligado"));
+        self.fit_comparator_to_panel();
+        self.request_redraw();
+    }
+
+    fn position_live_panel(&self) {
+        if let (Some(panel), Some(bounds)) = (&self.live_panel, self.live_panel_rect()) {
+            let _ = panel.set_bounds(bounds);
+        }
+    }
+
+    fn live_eval(&self, script: &str) {
+        if let Some(panel) = &self.live_panel {
+            let _ = panel.evaluate_script(script);
+        }
+    }
+
+    fn handle_live_message(&mut self, message: LiveMessage) {
+        let store = LiveKeyStore::in_dir(&self.config.data_dir);
+        match live_step(message, &store, &panel_theme_vars(&Theme::system())) {
+            LiveStep::Run(script) => self.live_eval(&script),
+            LiveStep::Close => self.close_live_panel(),
+        }
+    }
+
     /// O envelope da barra: liga e desliga os avisos do Gmail, e guarda.
     fn toggle_gmail_notifications(&mut self) {
         let on = !GMAIL_NOTIFICATIONS.load(Ordering::Acquire);
@@ -8363,7 +8554,7 @@ impl App {
         let scale = window.scale_factor().max(1.0);
         let size = window.inner_size();
         let (width, height) = (size.width as f64 / scale, size.height as f64 / scale);
-        if self.service_panel.is_some() {
+        if self.service_panel.is_some() || self.live_panel.is_some() {
             service_panel_bounds(width, height, COMPARATOR_CHROME_HEIGHT).2
         } else if self.side_panel.is_some() {
             side_panel_bounds(width, height, COMPARATOR_CHROME_HEIGHT).2
@@ -8419,6 +8610,7 @@ impl App {
     fn open_side_panel(&mut self) {
         // Um painel de cada vez.
         self.close_service_panel();
+        self.close_live_panel();
         let Some(bounds) = self.side_panel_rect() else {
             return;
         };
@@ -8582,6 +8774,7 @@ impl App {
             "window.__neuraliaPanel && window.__neuraliaPanel.theme({});",
             panel_theme_vars(&Theme::system())
         ));
+        self.live_eval(&live_theme_script(&panel_theme_vars(&Theme::system())));
         let theme = ThemeChoice::current().webview_theme();
         if let Some(comp) = &self.comparator {
             for view in &comp.views {
@@ -9242,6 +9435,7 @@ impl App {
             Some(BarHit::Private) => self.open_private_panel(),
             Some(BarHit::Service(service)) => self.open_service_panel(service),
             Some(BarHit::GmailToggle) => self.toggle_gmail_notifications(),
+            Some(BarHit::GeminiLive) => self.toggle_live_panel(),
             Some(BarHit::SplitClose) => self.close_split(),
             Some(BarHit::SplitExpand) => self.toggle_split_fullscreen(),
             Some(BarHit::Home) => self.show_home(),
@@ -10093,6 +10287,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ShowHistory => self.toggle_side_panel(),
             UserEvent::ThemeChosen(choice) => self.choose_theme(choice),
             UserEvent::Panel(message) => self.handle_panel_message(message),
+            UserEvent::Live(message) => self.handle_live_message(message),
             UserEvent::GmailAnswer(open) => self.answer_gmail(open),
             UserEvent::ClearHistory => {
                 self.memory.clear(&mut self.current_research);
@@ -10336,6 +10531,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.fit_comparator_to_panel();
                 self.position_side_panel();
                 self.position_service_panel();
+                self.position_live_panel();
                 if self.surface == Surface::Home {
                     self.sync_caption_buttons();
                 }
@@ -11703,6 +11899,14 @@ unsafe fn paint_comparator_bar_with_contexts(
     {
         draw_icon_button(target, *rect, slot, tint, hover == Some(hit), scale, theme);
     }
+    draw_live_button(
+        target,
+        controls.live,
+        LIVE_ACTIVE.load(Ordering::Acquire),
+        hover == Some(BarHit::GeminiLive),
+        scale,
+        theme,
+    );
     // Privado: o chapeu e os oculos, sem nome (pedido do dono).
     draw_icon_button(
         target,
@@ -12686,6 +12890,7 @@ mod tests {
             BarHit::Private,
             BarHit::Service(Service::WhatsApp),
             BarHit::GmailToggle,
+            BarHit::GeminiLive,
             BarHit::WindowMinimize,
             BarHit::WindowMaximize,
             BarHit::WindowClose,
@@ -13184,13 +13389,203 @@ mod tests {
             previous_right <= controls.private.x,
             "os icones ficam a esquerda do Privado"
         );
-        assert_eq!(controls.leftmost(), controls.services[0].x);
+        // O olho do Gemini Live abre a fila, a esquerda da videochamada.
+        assert!(controls.live.x + controls.live.width <= controls.services[0].x);
+        assert_eq!(controls.leftmost(), controls.live.x);
         // O Privado passa a ser um botao redondo so com o icone.
         assert_eq!(controls.private.width, controls.private.height);
         // Com a gaveta aberta tudo continua a esquerda dela.
         let drawer = right_controls(1600.0, 1.0, true);
         let (label, _, _) = drawer.split.expect("gaveta");
         assert!(drawer.private.x + drawer.private.width <= label.x);
+    }
+
+    #[test]
+    fn the_gemini_live_eye_toggles_live_and_says_what_it_sends() {
+        for (width, split) in [(1600.0, false), (1440.0, true), (1120.0, false)] {
+            let controls = right_controls(width, 1.0, split);
+            let live = controls.live;
+            assert!(
+                live.width > 0.0 && live.width == live.height,
+                "botao redondo"
+            );
+            assert_eq!(
+                live.y, controls.services[0].y,
+                "na mesma linha dos servicos"
+            );
+            assert!(
+                live.x + live.width <= controls.services[0].x,
+                "sem sobrepor a videochamada"
+            );
+            let (cx, cy) = (live.x + live.width / 2.0, live.y + live.height / 2.0);
+            assert_eq!(
+                right_controls_hit(controls, cx, cy),
+                Some(BarHit::GeminiLive)
+            );
+            // A borda do vizinho continua do vizinho.
+            let meet = controls.services[0];
+            assert_eq!(
+                right_controls_hit(controls, meet.x + 1.0, cy),
+                Some(BarHit::Service(Service::Meet))
+            );
+            // As pilulas e os "+" das colunas param antes do olho.
+            let columns = BarColumns {
+                split_active: split,
+                ..BarColumns::even(3)
+            };
+            let layout = BarLayout::with_contexts(width, 1.0, true, columns, [0, 0, 0]);
+            for index in 0..3 {
+                for rect in [
+                    layout.columns[index],
+                    layout.add_tabs[index],
+                    layout.column_forward[index],
+                ] {
+                    assert!(
+                        rect.width == 0.0 || rect.x + rect.width <= live.x,
+                        "a {width}px a coluna {index} invade o Gemini Live"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            bar_tooltip_label(BarHit::GeminiLive, "IA", false, None, None).as_deref(),
+            Some("Gemini Live: ver a tela, câmera e microfone (liga/desliga)")
+        );
+    }
+
+    /// O botao do Gemini Live, desenhado de verdade num bitmap: ligado fica
+    /// vermelho cheio com o olho branco; desligado tem as cores dos outros.
+    #[test]
+    fn the_gemini_live_eye_is_red_while_live() {
+        let theme = Theme::dark((0, 120, 212));
+        let paint = |active: bool| -> Vec<(u8, u8, u8)> {
+            let (width, height) = (40i32, 40i32);
+            unsafe {
+                let screen = GetDC(std::ptr::null_mut());
+                let mem = CreateCompatibleDC(screen);
+                let bitmap = CreateCompatibleBitmap(screen, width, height);
+                ReleaseDC(std::ptr::null_mut(), screen);
+                assert!(!mem.is_null() && !bitmap.is_null());
+                let old = SelectObject(mem, bitmap as _);
+                draw_live_button(
+                    mem,
+                    UiRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: width as f64,
+                        height: height as f64,
+                    },
+                    active,
+                    false,
+                    1.0,
+                    &theme,
+                );
+                let mut info = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: width,
+                        biHeight: -height,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB,
+                        biSizeImage: (width * height * 4) as u32,
+                        biXPelsPerMeter: 0,
+                        biYPelsPerMeter: 0,
+                        biClrUsed: 0,
+                        biClrImportant: 0,
+                    },
+                    bmiColors: [windows_sys::Win32::Graphics::Gdi::RGBQUAD {
+                        rgbBlue: 0,
+                        rgbGreen: 0,
+                        rgbRed: 0,
+                        rgbReserved: 0,
+                    }; 1],
+                };
+                let mut pixels = vec![0u8; (width * height * 4) as usize];
+                let read = GetDIBits(
+                    mem,
+                    bitmap,
+                    0,
+                    height as u32,
+                    pixels.as_mut_ptr() as _,
+                    &mut info,
+                    DIB_RGB_COLORS,
+                );
+                SelectObject(mem, old);
+                DeleteObject(bitmap as _);
+                DeleteDC(mem);
+                assert_eq!(read, height, "GetDIBits tem de ler o botao inteiro");
+                pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|bgrx| (bgrx[2], bgrx[1], bgrx[0]))
+                    .collect()
+            }
+        };
+        let at = |pixels: &[(u8, u8, u8)], x: usize, y: usize| pixels[y * 40 + x];
+        let near = |a: (u8, u8, u8), b: (u8, u8, u8)| {
+            (a.0 as i32 - b.0 as i32).abs() <= 3
+                && (a.1 as i32 - b.1 as i32).abs() <= 3
+                && (a.2 as i32 - b.2 as i32).abs() <= 3
+        };
+        let on = paint(true);
+        let off = paint(false);
+        // Dentro da pilula e fora do olho (que ocupa os 60% do meio).
+        for (x, y) in [(5, 20), (34, 20), (20, 4), (20, 35)] {
+            assert!(
+                near(at(&on, x, y), LIVE_ON_RED),
+                "ligado ({x},{y}) = {:?}",
+                at(&on, x, y)
+            );
+            assert!(
+                near(at(&off, x, y), theme.surface),
+                "desligado ({x},{y}) = {:?}",
+                at(&off, x, y)
+            );
+        }
+        // O olho aparece nos dois: branco sobre o vermelho, a cor do texto
+        // do tema sobre o fundo normal.
+        let count = |pixels: &[(u8, u8, u8)], color: (u8, u8, u8)| {
+            pixels.iter().filter(|pixel| near(**pixel, color)).count()
+        };
+        assert!(
+            count(&on, (255, 255, 255)) > 20,
+            "sem olho branco no botao ligado"
+        );
+        assert!(count(&off, theme.fg) > 20, "sem olho no botao desligado");
+        assert_eq!(count(&off, LIVE_ON_RED), 0, "desligado nao tem vermelho");
+    }
+
+    /// O log de depuracao e o unico sitio do app onde texto livre vai para
+    /// o disco sem o utilizador pedir. Uma linha que leve a chave (o script
+    /// que arranca a sessao, o URL do socket) sai de la sem ela.
+    #[test]
+    fn the_debug_log_never_writes_the_gemini_key() {
+        let key = "AIzaSyTESTONLY-not-a-real-key_0123456789";
+        let dir = std::env::temp_dir().join(format!("neuralia-livelog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("pasta temporaria");
+        let path = dir.join("debug.log");
+        let script = crate::gemini_live::live_start_script(
+            &crate::gemini_live::validate_live_key(key).expect("chave de teste"),
+            &serde_json::json!({}),
+            None,
+        );
+        append_debug_line(&path, 1, format_args!("eval {script}"));
+        append_debug_line(
+            &path,
+            2,
+            format_args!("socket wss://generativelanguage.googleapis.com/ws/x?key={key}"),
+        );
+        append_debug_line(&path, 3, format_args!("chave {key}"));
+        append_debug_line(&path, 4, format_args!("live panel: ligado"));
+        let text = std::fs::read_to_string(&path).expect("o log existe");
+        assert!(!text.contains(key), "{text}");
+        assert!(!text.contains(&key[4..20]), "pedaco da chave: {text}");
+        assert_eq!(text.matches("[chave omitida]").count(), 3, "{text}");
+        assert!(text.contains("       4 ms  live panel: ligado"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -17399,6 +17794,26 @@ process.stdout.write(JSON.stringify(results));
                         None,
                         "controle Privado sobrepoe alvo da barra em {logical_width}px @{scale}x"
                     );
+                    // O olho do Gemini Live, o mais a esquerda dos controlos:
+                    // nenhum alvo da barra lhe toca, nem no centro nem nas
+                    // bordas.
+                    let live = controls.live;
+                    let (lx, ly) = center(live);
+                    assert_eq!(
+                        right_controls_hit(controls, lx, ly),
+                        Some(BarHit::GeminiLive)
+                    );
+                    for (x, y) in [
+                        (lx, ly),
+                        (live.x + 1.0, ly),
+                        (live.x + live.width - 1.0, ly),
+                    ] {
+                        assert_eq!(
+                            layout.hit(x, y),
+                            None,
+                            "Gemini Live sobrepoe alvo da barra em {logical_width}px @{scale}x"
+                        );
+                    }
 
                     if let Some((_label, expand, close)) = controls.split {
                         for (rect, expected) in
@@ -17985,7 +18400,9 @@ const ICON_SLOT_WHATSAPP: usize = COMPARATOR_COLUMNS + 2;
 const ICON_SLOT_YOUTUBE: usize = COMPARATOR_COLUMNS + 3;
 const ICON_SLOT_MAIL: usize = COMPARATOR_COLUMNS + 4;
 const ICON_SLOT_INCOGNITO: usize = COMPARATOR_COLUMNS + 5;
-static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 5] = [const { OnceLock::new() }; 5];
+/// O olho do Gemini Live.
+const ICON_SLOT_LIVE: usize = COMPARATOR_COLUMNS + 6;
+static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 6] = [const { OnceLock::new() }; 6];
 
 static AI_ICON_IMAGES: [OnceLock<RgbaImage>; COMPARATOR_COLUMNS] =
     [OnceLock::new(), OnceLock::new(), OnceLock::new()];
@@ -18062,6 +18479,7 @@ fn extra_icon(slot: usize) -> &'static RgbaImage {
             ICON_SLOT_WHATSAPP => include_bytes!("../../../assets/ai/whatsapp.png"),
             ICON_SLOT_YOUTUBE => include_bytes!("../../../assets/ai/youtube.png"),
             ICON_SLOT_MAIL => include_bytes!("../../../assets/ai/mail.png"),
+            ICON_SLOT_LIVE => include_bytes!("../../../assets/ai/live.png"),
             _ => include_bytes!("../../../assets/ai/incognito.png"),
         };
         image::load_from_memory(raw)
