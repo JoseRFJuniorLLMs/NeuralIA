@@ -2,7 +2,7 @@
 
 #![cfg(windows)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -240,27 +240,55 @@ fn do_install(plan: &Plan, shared: &Shared) -> Result<(), String> {
 }
 
 fn do_uninstall(plan: &Plan, shared: &Shared) -> Result<(), String> {
-    shared.report(Stage::Preparing, 0.0);
-    let files = install::installed_files(&plan.root, &plan.entries);
-    let total = files.len().max(1);
-    for (done, path) in files.iter().enumerate() {
-        let _ = std::fs::remove_file(path);
-        shared.report(Stage::Writing, (done + 1) as f64 / total as f64);
-    }
-
-    shared.report(Stage::Shortcuts, 0.0);
-    for folder in [winshell::start_menu_programs(), winshell::desktop()]
+    let shortcut_folders: Vec<PathBuf> = [winshell::start_menu_programs(), winshell::desktop()]
         .into_iter()
         .flatten()
-    {
+        .collect();
+    uninstall_with(
+        plan,
+        shared,
+        &std::env::temp_dir(),
+        &shortcut_folders,
+        winshell::unregister_uninstall,
+    )
+}
+
+/// A desinstalacao, com o que toca no sistema (as pastas dos atalhos e a
+/// entrada do registo) passado de fora -- e assim que os testes a correm sem
+/// apagar a instalacao verdadeira de quem os corre.
+fn uninstall_with(
+    plan: &Plan,
+    shared: &Shared,
+    parking: &Path,
+    shortcut_folders: &[PathBuf],
+    unregister: impl FnOnce(),
+) -> Result<(), String> {
+    shared.report(Stage::Preparing, 0.0);
+    // Se algum ficheiro ficou, para aqui: os atalhos e a entrada em
+    // Aplicacoes continuam, para a NeuralIA que ficou poder ser aberta e
+    // desinstalada outra vez depois de fechada.
+    install::remove_installed(&plan.root, &plan.entries, parking, |fraction| {
+        shared.report(Stage::Writing, fraction)
+    })
+    .map_err(|left| {
+        let first = left
+            .first()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        format!(
+            "Feche a NeuralIA e tente outra vez. {} ficheiro(s) em uso nao sairam, a comecar por {first}.",
+            left.len()
+        )
+    })?;
+
+    shared.report(Stage::Shortcuts, 0.0);
+    for folder in shortcut_folders {
         let _ = std::fs::remove_file(folder.join(format!("{}.lnk", install::PRODUCT)));
     }
 
     shared.report(Stage::Registering, 0.0);
-    winshell::unregister_uninstall();
-    // A pasta so desaparece se ficou vazia. O que o utilizador la tiver posto
-    // e dele.
-    let _ = std::fs::remove_dir(&plan.root);
+    unregister();
     Ok(())
 }
 
@@ -604,4 +632,135 @@ unsafe fn paint_window(hwnd: HWND, state: &Setup) {
         DeleteDC(mem_dc);
     }
     EndPaint(hwnd, &ps);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::fs;
+
+    fn shared() -> Shared {
+        Shared {
+            stage: AtomicU64::new(0),
+            within: AtomicU64::new(0),
+            outcome: Mutex::new(None),
+        }
+    }
+
+    /// Uma instalacao de verdade numa pasta temporaria: a carga util, o
+    /// desinstalador ao lado, e um atalho numa "pasta de atalhos" falsa.
+    fn installed(tag: &str) -> (PathBuf, Plan, PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("neuralia-uninst-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("Programs").join(install::PRODUCT);
+        let plan = Plan {
+            root: root.clone(),
+            entries: vec![
+                Entry {
+                    path: install::EXECUTABLE.into(),
+                    data: vec![9; 2048],
+                },
+                Entry {
+                    path: "resources/a/b.bin".into(),
+                    data: vec![7; 64],
+                },
+            ],
+            desktop_shortcut: false,
+        };
+        install::write_payload(&plan, |_| {}).expect("instalar");
+        fs::write(root.join(install::UNINSTALLER), b"desinstalador").expect("desinstalador");
+        let shortcuts = base.join("atalhos");
+        fs::create_dir_all(&shortcuts).expect("atalhos");
+        fs::write(shortcuts.join(format!("{}.lnk", install::PRODUCT)), b"lnk").expect("lnk");
+        (base, plan, shortcuts)
+    }
+
+    #[test]
+    fn an_uninstall_that_cannot_delete_the_browser_fails_and_keeps_the_apps_entry() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (base, plan, shortcuts) = installed("locked");
+        let exe = plan.executable();
+        // O navegador aberto: o executavel nao se deixa apagar.
+        let hold = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&exe)
+            .expect("segurar o executavel");
+
+        let unregistered = Cell::new(false);
+        let result = uninstall_with(
+            &plan,
+            &shared(),
+            &base.join("parking"),
+            std::slice::from_ref(&shortcuts),
+            || unregistered.set(true),
+        );
+        drop(hold);
+
+        assert!(
+            matches!(&result, Err(why) if why.contains(install::EXECUTABLE)),
+            "o NeuralIA.exe ficou no disco e a desinstalacao disse {result:?}"
+        );
+        assert!(exe.exists());
+        assert!(
+            !unregistered.get(),
+            "a entrada de Aplicacoes foi apagada com a NeuralIA ainda instalada"
+        );
+        assert!(
+            shortcuts.join(format!("{}.lnk", install::PRODUCT)).exists(),
+            "os atalhos foram apagados com a NeuralIA ainda instalada"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn uninstalling_from_the_install_folder_leaves_nothing_behind() {
+        let (base, plan, shortcuts) = installed("self");
+        // O desinstalador que o Windows corre e o que esta dentro da pasta.
+        // Um executavel a correr de verdade (nao um ficheiro aberto) e o que
+        // o Windows recusa apagar.
+        let uninstaller = plan.root.join(install::UNINSTALLER);
+        let system = std::env::var_os("SystemRoot").expect("SystemRoot");
+        fs::copy(
+            PathBuf::from(system).join("System32").join("sort.exe"),
+            &uninstaller,
+        )
+        .expect("copiar um executavel");
+        let mut running = std::process::Command::new(&uninstaller)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("correr o desinstalador");
+        assert!(
+            fs::remove_file(&uninstaller).is_err(),
+            "o Windows devia recusar apagar um executavel a correr"
+        );
+
+        let parking = base.join("parking");
+        let unregistered = Cell::new(false);
+        let result = uninstall_with(
+            &plan,
+            &shared(),
+            &parking,
+            std::slice::from_ref(&shortcuts),
+            || unregistered.set(true),
+        );
+        let root_left = plan.root.exists();
+        drop(running.stdin.take());
+        let _ = running.kill();
+        let _ = running.wait();
+
+        assert_eq!(result, Ok(()));
+        assert!(unregistered.get());
+        assert!(
+            !root_left,
+            "a pasta de instalacao ficou para tras: {}",
+            plan.root.display()
+        );
+        assert!(!shortcuts.join(format!("{}.lnk", install::PRODUCT)).exists());
+        let _ = fs::remove_dir_all(&base);
+    }
 }
