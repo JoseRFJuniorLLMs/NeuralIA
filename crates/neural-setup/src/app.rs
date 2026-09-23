@@ -1080,12 +1080,13 @@ mod tests {
             // Os atalhos passam pelo COM, como na thread de trabalho.
             winshell::init_com();
             let places = install::sandbox_places(&dir).expect("sitios de ensaio");
-            let leaf = dir
-                .file_name()
-                .expect("nome")
-                .to_string_lossy()
-                .into_owned();
-            let registry = format!("{}\\{leaf}", install::SANDBOX_REGISTRY_ROOT);
+            // O ramo que o `sandbox_places` escolheu (o nome da pasta so com
+            // letras, digitos e `-_.`: `NEURAL~1` vira `NEURAL1`).
+            let registry = places
+                .uninstall_base
+                .strip_suffix("\\Uninstall")
+                .expect("ramo de ensaio")
+                .to_string();
             winshell::delete_key(&registry);
             Self {
                 dir,

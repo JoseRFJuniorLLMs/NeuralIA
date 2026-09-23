@@ -24,6 +24,30 @@ Set-StrictMode -Version Latest
 # the exact -ExePath bytes embedded as its payload. The Inno Setup script that
 # shipped 2.1.x is gone; neural-setup upgrades those installs in place.
 
+# The Authenticode secrets are read here, once, and removed from this
+# process's environment before anything else runs. cargo passes its
+# environment to every build script and proc-macro it compiles (third-party
+# code), and none of them may see the release signing key. The script
+# consumes the variables: they are not put back. Gate:
+# scripts/test-build-installer-isolation.ps1.
+$signingSecretNames = @("NEURALIA_AUTHENTICODE_PFX_B64", "NEURALIA_AUTHENTICODE_PFX_PASSWORD")
+$signingPfxBase64 = $env:NEURALIA_AUTHENTICODE_PFX_B64
+$signingPfxPassword = $env:NEURALIA_AUTHENTICODE_PFX_PASSWORD
+foreach ($name in $signingSecretNames) {
+    [Environment]::SetEnvironmentVariable($name, $null, "Process")
+}
+
+function Invoke-Cargo {
+    # Every cargo call goes through here, and refuses to run with a signing
+    # secret in the environment.
+    foreach ($name in $signingSecretNames) {
+        if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($name, "Process"))) {
+            throw "Refusing to run cargo with $name in the environment."
+        }
+    }
+    & cargo @args
+}
+
 function Get-WorkspaceVersion {
     param([Parameter(Mandatory = $true)][string]$RepoRoot)
 
@@ -50,7 +74,7 @@ function Get-CargoTargetDirectory {
     # assuming target/.
     Push-Location $RepoRoot
     try {
-        $metadata = & cargo metadata --format-version 1 --no-deps --locked
+        $metadata = Invoke-Cargo metadata --format-version 1 --no-deps --locked
         if ($LASTEXITCODE -ne 0) {
             throw "cargo metadata failed with exit code $LASTEXITCODE."
         }
@@ -207,7 +231,7 @@ try {
     $env:NEURALIA_PAYLOAD_DIR = $payloadDir
     Push-Location $repoRoot
     try {
-        & cargo build --release --locked -p neural-setup
+        Invoke-Cargo build --release --locked -p neural-setup
         if ($LASTEXITCODE -ne 0) {
             throw "cargo build -p neural-setup failed with exit code $LASTEXITCODE."
         }
@@ -227,8 +251,8 @@ if (-not (Test-Path -LiteralPath $builtSetup -PathType Leaf)) {
 Copy-Item -LiteralPath $builtSetup -Destination $installer -Force
 
 if ($Sign) {
-    $pfxBase64 = $env:NEURALIA_AUTHENTICODE_PFX_B64
-    $pfxPassword = $env:NEURALIA_AUTHENTICODE_PFX_PASSWORD
+    $pfxBase64 = $signingPfxBase64
+    $pfxPassword = $signingPfxPassword
     if ([string]::IsNullOrWhiteSpace($pfxBase64) -or [string]::IsNullOrWhiteSpace($pfxPassword)) {
         throw "Signing was requested but NEURALIA_AUTHENTICODE_PFX_B64 and NEURALIA_AUTHENTICODE_PFX_PASSWORD are not both configured."
     }
@@ -282,5 +306,7 @@ if ($Sign) {
         $pfxPassword = $null
     }
 }
+$signingPfxBase64 = $null
+$signingPfxPassword = $null
 
 Write-Output (Resolve-Path -LiteralPath $installer).Path

@@ -306,6 +306,13 @@ jobs:
         with:
           name: neuralia-windows-tested-${{ github.sha }}
           path: ci-tested
+      - name: Prove cargo never sees the signing secrets and packs the exact payload
+        shell: pwsh
+        run: |
+          # A fake cargo records what every cargo call of the build script can
+          # see: never NEURALIA_AUTHENTICODE_* (build scripts and proc-macros
+          # inherit cargo's environment), always exactly the -ExePath bytes.
+          ./scripts/test-build-installer-isolation.ps1
       - name: Prove the installer build refuses a version it would not register
         shell: pwsh
         run: |

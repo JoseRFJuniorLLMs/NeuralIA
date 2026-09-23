@@ -29,7 +29,9 @@ param(
 #      uninstall registration, the uninstaller and the Start menu shortcut
 #      exist; a NeuralIA.exe in use makes a reinstall exit 3 without touching
 #      anything; the data folder is refused as an install folder (exit 2);
-#      silent uninstall removes files, folder, shortcut and registration;
+#      silent uninstall, started with the install folder as its working
+#      directory, removes files, folder, shortcut and registration, and the
+#      uninstaller's parked copy is gone shortly after it exits;
 #   2. upgrade over a 2.1.x Inno Setup install (no /D=): the installer adopts
 #      the Inno folder, replaces NeuralIA.exe, deletes unins000.* and the
 #      {AppId}_is1 key, keeps the Start menu shortcut working; uninstall
@@ -107,7 +109,8 @@ $cleanupUninstallers = @(
 function Invoke-Setup {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
-        [Parameter(Mandatory = $true)][string]$Arguments
+        [Parameter(Mandatory = $true)][string]$Arguments,
+        [string]$WorkingDirectory = ""
     )
     # The raw argument string reaches the process as typed: /D= must be the
     # last argument and may contain spaces without quotes.
@@ -115,6 +118,9 @@ function Invoke-Setup {
     $info.FileName = $FilePath
     $info.Arguments = $Arguments
     $info.UseShellExecute = $false
+    if ($WorkingDirectory) {
+        $info.WorkingDirectory = $WorkingDirectory
+    }
     $process = [System.Diagnostics.Process]::Start($info)
     $launchedPids.Add($process.Id)
     if (-not $process.WaitForExit(180000)) {
@@ -177,6 +183,30 @@ function Assert-InstalledPayload([string]$Folder) {
     if ($installedHash -ne $expectedHash) {
         throw "Installed NeuralIA.exe differs from the CI-tested payload."
     }
+}
+
+function Get-ParkedCopies([int]$ProcessId, [string]$Folder) {
+    # Where a running uninstaller moves itself: %TEMP%, or next to the install
+    # folder when %TEMP% is on another disk (RUNNER_TEMP on D: in CI).
+    $name = "neuralia-uninstaller-$ProcessId.exe"
+    return @(
+        (Join-Path ([IO.Path]::GetTempPath()) $name),
+        (Join-Path (Split-Path -Parent $Folder) ".$name")
+    )
+}
+
+function Assert-NoParkedCopy([int]$ProcessId, [string]$Folder) {
+    # The parked uninstaller is a whole installer (payload included). It must
+    # be gone shortly after the uninstaller exits, not left for a later run.
+    $deadline = [DateTime]::UtcNow.AddSeconds(60)
+    do {
+        $left = @(Get-ParkedCopies $ProcessId $Folder | Where-Object { Test-Path -LiteralPath $_ })
+        if ($left.Count -eq 0) {
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "The parked uninstaller copy is still on disk 60 s after uninstall: $($left -join ', ')."
 }
 
 function Assert-Uninstalled([string]$Folder) {
@@ -253,11 +283,14 @@ try {
         throw "The installer wrote NeuralIA.exe into the data folder."
     }
 
-    $code = Invoke-Setup (Join-Path $installDir $uninstallerName) "--uninstall /S"
+    # Started with the install folder as its working directory, like a
+    # double-click on the uninstaller in Explorer: the folder must still go.
+    $code = Invoke-Setup (Join-Path $installDir $uninstallerName) "--uninstall /S" -WorkingDirectory $installDir
     if ($code -ne 0) {
         throw "Uninstaller exited with code $code."
     }
     Assert-Uninstalled $installDir
+    Assert-NoParkedCopy $launchedPids[$launchedPids.Count - 1] $installDir
 
     # --- 2. Upgrade over the Inno Setup 2.1.x install ---------------------
     New-Item -ItemType Directory -Force -Path $upgradeDir | Out-Null
@@ -316,6 +349,7 @@ try {
         throw "Uninstaller exited with code $code after the upgrade."
     }
     Assert-Uninstalled $upgradeDir
+    Assert-NoParkedCopy $launchedPids[$launchedPids.Count - 1] $upgradeDir
 
     # --- 3. The owner's data ----------------------------------------------
     foreach ($name in $dataFiles.Keys) {
@@ -324,7 +358,7 @@ try {
             throw "The data file $name changed during install, upgrade or uninstall."
         }
     }
-    Write-Host "Installer smoke passed: exact payload, registration $ExpectedVersion, in-use refusal, data-folder refusal, Inno upgrade, clean uninstall, data untouched."
+    Write-Host "Installer smoke passed: exact payload, registration $ExpectedVersion, in-use refusal, data-folder refusal, Inno upgrade, clean uninstall (also from inside the folder, no parked copy left), data untouched."
 }
 finally {
     foreach ($candidate in $cleanupUninstallers) {
@@ -347,8 +381,13 @@ finally {
             Remove-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue
         }
     }
+    # Only reached with copies left when a check above already failed.
     foreach ($launched in $launchedPids) {
-        Remove-Item -LiteralPath (Join-Path ([IO.Path]::GetTempPath()) "neuralia-uninstaller-$launched.exe") -Force -ErrorAction SilentlyContinue
+        foreach ($folder in @($installDir, $upgradeDir)) {
+            foreach ($parked in @(Get-ParkedCopies $launched $folder)) {
+                Remove-Item -LiteralPath $parked -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
     foreach ($folder in @($freshWork, $tempWork)) {
         Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction SilentlyContinue

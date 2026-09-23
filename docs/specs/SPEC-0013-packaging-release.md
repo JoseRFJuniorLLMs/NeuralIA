@@ -50,6 +50,15 @@ installer, with the brand and the animated neural tissue of the Home.
   package digest before writing anything;
 - it refuses a `-Version` other than the workspace version, because the
   installer registers its own `CARGO_PKG_VERSION` in Windows "Apps";
+- it reads `NEURALIA_AUTHENTICODE_PFX_B64`/`_PASSWORD` once and removes them
+  from its environment before any cargo call, and every cargo call refuses to
+  run with them set: cargo hands its environment to every build script and
+  proc-macro it compiles. `scripts/test-build-installer-isolation.ps1` (CI
+  `installer-smoke`, before any installer build) runs the script against a
+  fake `cargo` and fails if any call sees a secret, if the packed payload is
+  not exactly the `-ExePath` bytes, or if `-Sign` no longer receives the
+  secrets. `scripts/build-windows-installer.ps1` is the only installer build
+  script;
 - the payload is that single file: `NeuralIA.exe` links the WebView2 loader
   statically and embeds PDF.js, Live and the Home art. The system WebView2
   runtime remains a prerequisite.
@@ -65,10 +74,13 @@ The installer:
   install folder, 3 `NeuralIA.exe` in use, 4 built without payload),
   `--uninstall`, and `/D=<folder>` (the last argument, NSIS-style: the folder
   runs to the end of the command line, spaces included);
-- writes the payload all-or-nothing. A `NeuralIA.exe` in use stops the install
-  before anything is written (the window asks to close NeuralIA; `/S` exits
-  with 3); the files are staged under temporary names and swapped with
-  rollback;
+- installs all-or-nothing. A `NeuralIA.exe` in use stops the install before
+  anything is written (the window asks to close NeuralIA; `/S` exits with 3).
+  The payload and the uninstaller copy are all written under temporary names
+  before anything is swapped, so a full disk fails with nothing changed. If a
+  later step fails (a shortcut, the "Apps" entry), the previous files, the
+  shortcuts as they were and the previous entry are put back, and a fresh
+  install is removed with the folders it created;
 - upgrades a 2.1.x Inno Setup install in place. Without `/D=` it reuses the
   folder of its own previous registration, else the one of the Inno
   registration. Only after its own registration is written does it delete
@@ -84,13 +96,22 @@ The installer:
   checked against it first (`guard_user_data`);
 - uninstalls only the folder its uninstaller lives in, and removes only
   shortcuts that open that folder's `NeuralIA.exe` and only a registration
-  that points at that folder;
+  that points at that folder. Both are decided by file identity (volume and
+  file index) before anything is deleted, so an 8.3 path such as
+  `C:\Users\RUNNER~1\...` and its long form are the same folder. It first
+  moves its working directory out of the folder (Explorer starts it inside);
+  it keeps the uninstaller while any payload file is still in use, so the
+  "Apps" entry keeps working; the running uninstaller moves itself to
+  `%TEMP%` (or next to the folder when `%TEMP%` is on another disk) and a
+  windowless `cmd` deletes that copy once the process has exited;
+- shows its texts in pt-BR with accents, like the application;
 - animates the neural tissue: each timer tick advances the tissue clock
   (`TissueClock`) with wall time only while the window is visible, so the
   neurons move while it is shown and stop while it is minimized.
 
 These behaviours are gated by the `neural-setup` tests (the upgrade, in-use,
-data-folder and uninstall flows run against a sandboxed registry branch).
+data-folder, failure-rollback, 8.3-path and uninstall flows run against a
+sandboxed registry branch).
 
 CI (`installer-smoke`) builds an unsigned installer candidate and runs
 `scripts/test-windows-installer.ps1` against the runner's real per-user
@@ -101,8 +122,9 @@ registration:
   registration (`DisplayName`, `DisplayVersion`, `InstallLocation`, uninstall
   commands), the uninstaller and the shortcuts exist; with `NeuralIA.exe` held
   open a reinstall exits 3 and changes nothing; the data folder as install
-  folder exits 2; silent uninstall removes files, folder, shortcuts and
-  registration;
+  folder exits 2; silent uninstall, started with the install folder as its
+  working directory, removes files, folder, shortcuts and registration, and
+  the uninstaller's parked copy is gone within 60 s;
 - an upgrade without `/D=` over a simulated Inno Setup 2.1.x install, then
   uninstall;
 - the data folder is byte-identical at the end.
