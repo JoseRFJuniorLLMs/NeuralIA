@@ -171,6 +171,7 @@ before the site sees the key. They work on every surface unless noted.
 | `Ctrl+F` | in-page find bar (Enter / Shift+Enter / Esc) |
 | `Ctrl+P` | print the page you are looking at |
 | `Ctrl+H` | semantic local memory search (`memory:`) |
+| `Ctrl+Shift+Z` | note from the selected text, with the page as its source, opened in the Notes tab of the side panel (inside a text field it stays redo; refused in the private split); on Home, a new blank note |
 | `Ctrl+Shift+Delete` | clear local history (the WebView2 profile is untouched) |
 | `F12` · `Ctrl+Shift+I/J/C` | Chromium DevTools |
 | `Ctrl+U` | view page source |

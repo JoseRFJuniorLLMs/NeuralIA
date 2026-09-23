@@ -26,10 +26,12 @@ use crate::pomodoro_ui::{
 use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentRuntimeConfig,
     AgentSecurityAction, CoreConfig, FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent,
-    MemoryDocument, MemoryHit, MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore,
+    MemoryDocument, MemoryHit, MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore, Note,
     ObservedPage, Phase, ReaderArticle, ReaderBlock, ReaderClient, ResearchItemKind,
-    ResearchSession, chatgpt_search_url, claude_search_url, google_ai_url, is_local_network_target,
-    is_pdf_url, parse_intent, reader_html, redact_sensitive_text, tissue,
+    ResearchSession, ZettelError, ZettelStore, chatgpt_search_url, claude_search_url,
+    google_ai_url, is_local_network_target, is_pdf_url, parse_intent, reader_html,
+    redact_sensitive_text, tissue,
+    zettel::{self, is_valid_note_id},
 };
 use url::Url;
 use windows_sys::Win32::{
@@ -91,6 +93,24 @@ enum UserEvent {
     ThemeChosen(ThemeChoice),
     /// Pedido da pagina local do painel lateral (canal proprio).
     Panel(PanelMessage),
+    /// Resposta do worker das notas.
+    NotesReady {
+        origin: NotesOrigin,
+        reply: NotesReply,
+    },
+    /// Ctrl+Shift+Z numa pagina: ler a selecao DESSA WebView. `None` e a
+    /// WebView unica da web externa, do Leitor e do PDF.
+    NoteRequested(Option<PageTarget>),
+    /// Ctrl+Shift+Z no Split privado: recusado sem ler a pagina.
+    NoteRefusedPrivate,
+    /// O que a pagina devolveu ao `NOTE_CAPTURE_SCRIPT` (JSON, dado dela) e
+    /// a fonte que o lado nativo conhece (o artigo do Leitor, o PDF).
+    NoteCaptured {
+        raw: String,
+        source: Option<String>,
+    },
+    /// Ctrl+Shift+Z na Home ou com o teclado na barra: nota nova em branco.
+    NewNote,
     /// "Abrir?" do aviso do Gmail: Sim (true) ou Nao.
     GmailAnswer(bool),
     HomeRequested,
@@ -2398,6 +2418,26 @@ enum PanelMessage {
     Search(String),
     Open(String),
     Close,
+    /// Notas: todas, pela ordem de atualizacao.
+    NotesList,
+    /// Notas com todos os termos (`ZettelStore::search`).
+    NotesSearch(String),
+    /// Abrir no editor; o id ja foi validado.
+    NoteOpen(String),
+    NoteSave(NoteEdit),
+    /// Mover para `.trash`; o id ja foi validado.
+    NoteDelete(String),
+}
+
+/// O que o editor do painel manda gravar. `id: None` e uma nota nova; um id
+/// que chega aqui ja passou por `is_valid_note_id` -- nunca vira caminho sem
+/// isso. A fonte nao vem do painel: fica a que a nota ja tinha.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NoteEdit {
+    id: Option<String>,
+    title: String,
+    body: String,
+    tags: Vec<String>,
 }
 
 const PANEL_MESSAGE_MAX_BYTES: usize = 4 * 1024;
@@ -2406,23 +2446,96 @@ const PANEL_INPUT_MAX_CHARS: usize = 2048;
 /// Quantos recentes e quantas sugestoes o painel mostra.
 const PANEL_RECENT_LIMIT: usize = 30;
 const PANEL_SUGGESTION_LIMIT: usize = 6;
+const NOTE_TITLE_MAX_CHARS: usize = 300;
+/// Tecto do corpo de uma nota, em bytes UTF-8 (o que vai para o disco).
+const NOTE_BODY_MAX_BYTES: usize = 200 * 1024;
+const NOTE_TAGS_MAX: usize = 20;
+const NOTE_TAG_MAX_CHARS: usize = 60;
+/// O UNICO pedido do painel que pode passar dos 4 KiB: `note-save`, porque
+/// leva o corpo da nota. O `JSON.stringify` do painel escreve cada byte, no
+/// pior caso, como `\u00XX` (6 bytes): o tecto cobre um corpo, um titulo e
+/// as tags no maximo com esse pior caso, e mais o envelope.
+const NOTE_SAVE_MESSAGE_MAX_BYTES: usize = 6
+    * (NOTE_BODY_MAX_BYTES + 4 * (NOTE_TITLE_MAX_CHARS + NOTE_TAGS_MAX * NOTE_TAG_MAX_CHARS))
+    + 1024;
 
 fn parse_panel_message(body: &str) -> Option<PanelMessage> {
-    if body.len() > PANEL_MESSAGE_MAX_BYTES {
+    if body.len() > NOTE_SAVE_MESSAGE_MAX_BYTES {
         return None;
     }
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let action = value.get("action")?.as_str()?;
+    // Todos os outros pedidos continuam presos aos 4 KiB.
+    if body.len() > PANEL_MESSAGE_MAX_BYTES && action != "note-save" {
+        return None;
+    }
     let text = |key: &str, max: usize| -> Option<String> {
         let text = value.get("args")?.get(key)?.as_str()?.trim();
         (!text.is_empty() && text.chars().count() <= max).then(|| text.to_string())
     };
-    match value.get("action")?.as_str()? {
+    // `{"id": "<id valido>"}` e mais nada: um `../x` ou `C:\x` nunca chega ao
+    // disco, nem sequer ao worker das notas.
+    let note_id = || -> Option<String> {
+        let args = value.get("args")?.as_object()?;
+        if args.len() != 1 {
+            return None;
+        }
+        let id = args.get("id")?.as_str()?;
+        is_valid_note_id(id).then(|| id.to_string())
+    };
+    match action {
         "ready" => Some(PanelMessage::Ready),
         "close" => Some(PanelMessage::Close),
         "search" => text("query", PANEL_QUERY_MAX_CHARS).map(PanelMessage::Search),
         "open" => text("input", PANEL_INPUT_MAX_CHARS).map(PanelMessage::Open),
+        "notes-list" => Some(PanelMessage::NotesList),
+        "notes-search" => text("query", PANEL_QUERY_MAX_CHARS).map(PanelMessage::NotesSearch),
+        "note-open" => note_id().map(PanelMessage::NoteOpen),
+        "note-delete" => note_id().map(PanelMessage::NoteDelete),
+        "note-save" => parse_note_edit(value.get("args")?).map(PanelMessage::NoteSave),
         _ => None,
     }
+}
+
+/// `{"id": null | "<id>", "title", "body", "tags": [..]}`, exatamente.
+fn parse_note_edit(args: &serde_json::Value) -> Option<NoteEdit> {
+    let args = args.as_object()?;
+    if args.len() != 4 {
+        return None;
+    }
+    let id = match args.get("id")? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(id) if is_valid_note_id(id) => Some(id.clone()),
+        _ => return None,
+    };
+    let title = args.get("title")?.as_str()?.trim();
+    if title.chars().count() > NOTE_TITLE_MAX_CHARS || title.chars().any(char::is_control) {
+        return None;
+    }
+    let body = args.get("body")?.as_str()?;
+    if body.len() > NOTE_BODY_MAX_BYTES {
+        return None;
+    }
+    let raw_tags = args.get("tags")?.as_array()?;
+    if raw_tags.len() > NOTE_TAGS_MAX {
+        return None;
+    }
+    let mut tags = Vec::with_capacity(raw_tags.len());
+    for tag in raw_tags {
+        let tag = tag.as_str()?.trim();
+        if tag.chars().count() > NOTE_TAG_MAX_CHARS || tag.chars().any(char::is_control) {
+            return None;
+        }
+        if !tag.is_empty() {
+            tags.push(tag.to_string());
+        }
+    }
+    Some(NoteEdit {
+        id,
+        title: title.to_string(),
+        body: body.to_string(),
+        tags,
+    })
 }
 
 /// So o proprio HTML local (NavigateToString chega como about:blank ou
@@ -2581,19 +2694,493 @@ fn panel_html(theme: &Theme) -> String {
 const PANEL_SHOW_NOTES_SCRIPT: &str =
     "window.neuraliaShowSection && window.neuraliaShowSection('notes')";
 
+/// Corre no painel quando o Ctrl+Shift+Z e dado na Home (omnibox) ou com o
+/// teclado na barra: uma nota nova, em branco, no editor. So chega ao disco
+/// quando se salva -- um atalho nao enche a pasta de ficheiros vazios.
+const PANEL_NEW_NOTE_SCRIPT: &str = "window.__neuraliaNotes && window.__neuraliaNotes.newNote()";
+
+// Notas (Zettelkasten): a pasta `<data_dir>/zettel`, em Markdown que o
+// Obsidian abre (`neural_core::zettel`). O `ZettelStore` le o disco a cada
+// chamada, e `list`, `search` e `backlinks` leem TODAS as notas: numa pasta
+// grande isso nao pode correr no event loop. Corre no `ZettelWorker`, e o
+// resultado volta como `UserEvent::NotesReady`.
+
+/// Quantas notas a lista do painel recebe de uma vez (a busca refina).
+const NOTES_LIST_LIMIT: usize = 500;
+/// Tecto do texto selecionado que vira nota. O script ja corta, mas quem
+/// responde e a pagina: o lado nativo corta outra vez.
+const NOTE_SELECTION_MAX_CHARS: usize = 20_000;
+/// O que se aceita de volta do ExecuteScript antes de o ler: a selecao
+/// cortada, escapada em JSON no pior caso, mais o endereco e o titulo.
+const NOTE_CAPTURE_MAX_BYTES: usize = 512 * 1024;
+const NOTE_SOURCE_MAX_CHARS: usize = 2048;
+/// Sem titulo na pagina, as primeiras palavras da selecao dao o titulo.
+const NOTE_TITLE_WORDS: usize = 8;
+const NOTE_FALLBACK_TITLE_MAX_CHARS: usize = 80;
+
+/// Corre na WebView que pediu a nota -- nunca numa privada. O que devolve e
+/// dado da pagina (ela pode ter trocado o `getSelection`), nao uma ordem:
+/// `note_draft_from_capture` volta a cortar e a validar tudo.
+const NOTE_CAPTURE_SCRIPT: &str = r#"(function () {
+  var text = '';
+  try { text = String(window.getSelection ? window.getSelection() : ''); } catch (e) {}
+  return { text: text.slice(0, 20000), url: String(location.href), title: String(document.title || '') };
+})()"#;
+
+/// Uma nota nova feita pelo NeuralIA (hoje, a partir de uma selecao).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NoteDraft {
+    title: String,
+    body: String,
+    tags: Vec<String>,
+    source: Option<String>,
+}
+
+/// O que o worker das notas faz. Lista fechada.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NotesCommand {
+    List,
+    Search(String),
+    Open(String),
+    Save(NoteEdit),
+    Delete(String),
+    Create(NoteDraft),
+}
+
+/// Porque e que uma nota vai para o editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteOpened {
+    Open,
+    Saved,
+    Created,
+}
+
+impl NoteOpened {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Saved => "saved",
+            Self::Created => "created",
+        }
+    }
+}
+
+/// Uma linha da lista (ou dos backlinks): sem o corpo, que a lista nao mostra.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NoteSummary {
+    id: String,
+    title: String,
+    updated_unix: u64,
+    tags: Vec<String>,
+}
+
+impl NoteSummary {
+    fn of(note: &Note) -> Self {
+        Self {
+            id: note.id.clone(),
+            title: note.title.clone(),
+            updated_unix: note.updated_unix,
+            tags: note.tags.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NotesReply {
+    Listed {
+        /// `None` para a lista toda; a busca volta com a consulta, para o
+        /// painel ignorar a resposta a uma busca que ja nao e a da caixa.
+        query: Option<String>,
+        total: usize,
+        notes: Vec<NoteSummary>,
+    },
+    Opened {
+        cause: NoteOpened,
+        note: Note,
+        backlinks: Vec<NoteSummary>,
+    },
+    Deleted {
+        id: String,
+    },
+    Missing {
+        id: String,
+    },
+    Failed(String),
+}
+
+/// De onde veio o pedido: a resposta a uma selecao abre o painel; a do
+/// painel so vai para o painel, se ainda estiver aberto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotesOrigin {
+    Panel,
+    Selection,
+}
+
+/// O pedido do painel que e das notas. Exaustivo de proposito: uma mensagem
+/// nova do painel tem de dizer aqui se e ou nao das notas.
+fn notes_command_for(message: PanelMessage) -> Option<NotesCommand> {
+    Some(match message {
+        PanelMessage::NotesList => NotesCommand::List,
+        PanelMessage::NotesSearch(query) => NotesCommand::Search(query),
+        PanelMessage::NoteOpen(id) => NotesCommand::Open(id),
+        PanelMessage::NoteSave(edit) => NotesCommand::Save(edit),
+        PanelMessage::NoteDelete(id) => NotesCommand::Delete(id),
+        PanelMessage::Ready
+        | PanelMessage::Search(_)
+        | PanelMessage::Open(_)
+        | PanelMessage::Close => {
+            return None;
+        }
+    })
+}
+
+/// O trabalho do worker das notas, sem thread nem janela: e isto que os
+/// gates correm, sobre uma pasta temporaria.
+fn run_notes_command(store: &ZettelStore, command: NotesCommand, now_unix: u64) -> NotesReply {
+    match command {
+        NotesCommand::List => notes_listed(store.list(), None),
+        NotesCommand::Search(query) => notes_listed(store.search(&query), Some(query)),
+        NotesCommand::Open(id) => match store.get(&id) {
+            Ok(Some(note)) => notes_opened(store, NoteOpened::Open, note),
+            Ok(None) => NotesReply::Missing { id },
+            Err(error) => NotesReply::Failed(format!("Não foi possível abrir a nota: {error}")),
+        },
+        NotesCommand::Save(edit) => {
+            let saved = match edit.id {
+                None => store.create(&edit.title, &edit.body, edit.tags, None, now_unix),
+                // A fonte, as datas e as propriedades que o Obsidian escreveu
+                // ficam as do ficheiro. Se a nota foi apagada por fora enquanto
+                // estava aberta, grava-se o que o editor tem.
+                Some(id) => store.get(&id).and_then(|existing| {
+                    let mut note = existing.unwrap_or_else(|| Note {
+                        id,
+                        ..Note::default()
+                    });
+                    note.title = edit.title;
+                    note.body = edit.body;
+                    note.tags = edit.tags;
+                    store.save(&note, now_unix)
+                }),
+            };
+            match saved {
+                Ok(note) => notes_opened(store, NoteOpened::Saved, note),
+                Err(error) => {
+                    NotesReply::Failed(format!("Não foi possível salvar a nota: {error}"))
+                }
+            }
+        }
+        NotesCommand::Delete(id) => match store.delete(&id) {
+            Ok(_) => NotesReply::Deleted { id },
+            Err(ZettelError::NotFound(_)) => NotesReply::Missing { id },
+            Err(error) => NotesReply::Failed(format!("Não foi possível excluir a nota: {error}")),
+        },
+        NotesCommand::Create(draft) => {
+            match store.create(
+                &draft.title,
+                &draft.body,
+                draft.tags,
+                draft.source,
+                now_unix,
+            ) {
+                Ok(note) => notes_opened(store, NoteOpened::Created, note),
+                Err(error) => NotesReply::Failed(format!("Não foi possível criar a nota: {error}")),
+            }
+        }
+    }
+}
+
+fn notes_listed(result: Result<Vec<Note>, ZettelError>, query: Option<String>) -> NotesReply {
+    match result {
+        Ok(notes) => NotesReply::Listed {
+            query,
+            total: notes.len(),
+            notes: notes
+                .iter()
+                .take(NOTES_LIST_LIMIT)
+                .map(NoteSummary::of)
+                .collect(),
+        },
+        Err(error) => NotesReply::Failed(format!("Não foi possível ler as notas: {error}")),
+    }
+}
+
+fn notes_opened(store: &ZettelStore, cause: NoteOpened, note: Note) -> NotesReply {
+    // Os backlinks leem a pasta toda; uma falha ali nao esconde a nota.
+    let backlinks = zettel::backlinks(store, &note.id)
+        .map(|notes| notes.iter().map(NoteSummary::of).collect())
+        .unwrap_or_default();
+    NotesReply::Opened {
+        cause,
+        note,
+        backlinks,
+    }
+}
+
+/// O JS que entrega uma resposta ao painel. Os dados vao como JSON
+/// (`serde_json::to_string`: um literal JS valido, com aspas, barras e
+/// `</script>` escapados) e a pagina so os usa como texto.
+fn notes_reply_script(reply: &NotesReply) -> String {
+    let summary = |note: &NoteSummary| {
+        serde_json::json!({
+            "id": note.id,
+            "title": note.title,
+            "updated": note.updated_unix,
+            "tags": note.tags,
+        })
+    };
+    let data = match reply {
+        NotesReply::Listed {
+            query,
+            total,
+            notes,
+        } => serde_json::json!({
+            "kind": "listed",
+            "query": query.as_deref().unwrap_or(""),
+            "total": total,
+            "notes": notes.iter().map(summary).collect::<Vec<_>>(),
+        }),
+        NotesReply::Opened {
+            cause,
+            note,
+            backlinks,
+        } => serde_json::json!({
+            "kind": "opened",
+            "cause": cause.as_str(),
+            "note": {
+                "id": note.id,
+                "title": note.title,
+                "body": note.body,
+                "tags": note.tags,
+                "source": note.source,
+                "created": note.created_unix,
+                "updated": note.updated_unix,
+            },
+            "backlinks": backlinks.iter().map(summary).collect::<Vec<_>>(),
+        }),
+        NotesReply::Deleted { id } => serde_json::json!({ "kind": "deleted", "id": id }),
+        NotesReply::Missing { id } => serde_json::json!({ "kind": "missing", "id": id }),
+        NotesReply::Failed(message) => serde_json::json!({ "kind": "failed", "message": message }),
+    };
+    let payload = serde_json::to_string(&data).unwrap_or_else(|_| "null".to_string());
+    format!("window.__neuraliaNotes && window.__neuraliaNotes.receive({payload});")
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+struct NotesJob {
+    command: NotesCommand,
+    origin: NotesOrigin,
+}
+
+/// Uma thread para as notas, como o historico e a memoria: os pedidos
+/// correm por ordem (um salvar nunca passa a frente do abrir que o
+/// antecedeu) e o event loop nunca le a pasta.
+#[derive(Clone)]
+struct ZettelWorker {
+    tx: SyncSender<NotesJob>,
+}
+
+impl ZettelWorker {
+    fn new(dir: std::path::PathBuf, proxy: EventLoopProxy<UserEvent>) -> Self {
+        let (tx, rx) = sync_channel::<NotesJob>(64);
+        let _ = thread::Builder::new()
+            .name("neural-zettel".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    // `open` so cria a pasta se faltar; abrir a cada pedido
+                    // aguenta a pasta ter sido apagada com o app aberto.
+                    let reply = match ZettelStore::open(&dir) {
+                        Ok(store) => run_notes_command(&store, job.command, unix_now()),
+                        Err(error) => NotesReply::Failed(format!(
+                            "Não foi possível abrir a pasta das notas: {error}"
+                        )),
+                    };
+                    let _ = proxy.send_event(UserEvent::NotesReady {
+                        origin: job.origin,
+                        reply,
+                    });
+                }
+            });
+        Self { tx }
+    }
+
+    /// Nunca espera: com a fila cheia (ou sem worker) o erro volta ja, para
+    /// ser mostrado, em vez de congelar a interface.
+    fn submit(&self, command: NotesCommand, origin: NotesOrigin) -> Result<(), String> {
+        self.tx
+            .try_send(NotesJob { command, origin })
+            .map_err(|_| "As notas estão ocupadas; tente de novo.".to_string())
+    }
+}
+
+/// A selecao nao pode virar nota.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteCaptureError {
+    /// Nada selecionado (so espacos conta como nada).
+    EmptySelection,
+    /// A resposta nao e o objeto que o script devolve.
+    Unreadable,
+}
+
+/// O endereco que fica como fonte: so paginas da web, e nunca a origem do
+/// nosso visualizador de PDF.
+fn note_source(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty() || url.chars().count() > NOTE_SOURCE_MAX_CHARS {
+        return None;
+    }
+    let parsed = Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.origin().ascii_serialization() == PDF_ORIGIN
+    {
+        return None;
+    }
+    Some(parsed.to_string())
+}
+
+/// Uma linha, sem controlos nem espacos repetidos, com no maximo `max` chars.
+fn one_line(text: &str, max: usize) -> String {
+    let joined = text
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    joined.chars().take(max).collect()
+}
+
+/// A nota que o Ctrl+Shift+Z cria: titulo = o da pagina (ou as primeiras
+/// palavras da selecao); corpo = a selecao como citacao Markdown, uma linha
+/// em branco e "Fonte: <url>"; fonte = o endereco; tag "web".
+///
+/// `raw` e o JSON que o `NOTE_CAPTURE_SCRIPT` devolveu -- dado da pagina.
+/// `source` e o endereco que o lado nativo conhece e a pagina nao (o
+/// artigo do Leitor, o PDF aberto); quando existe, manda ele.
+fn note_draft_from_capture(raw: &str, source: Option<&str>) -> Result<NoteDraft, NoteCaptureError> {
+    if raw.len() > NOTE_CAPTURE_MAX_BYTES {
+        return Err(NoteCaptureError::Unreadable);
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| NoteCaptureError::Unreadable)?;
+    if !value.is_object() {
+        return Err(NoteCaptureError::Unreadable);
+    }
+    let field = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    let selection: String = field("text")
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .take(NOTE_SELECTION_MAX_CHARS)
+        .collect();
+    let selection = selection.trim();
+    if selection.is_empty() {
+        return Err(NoteCaptureError::EmptySelection);
+    }
+    let source = match source {
+        Some(known) => note_source(known),
+        None => note_source(field("url")),
+    };
+    let title = Some(one_line(field("title"), NOTE_TITLE_MAX_CHARS))
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| {
+            let words = selection
+                .split_whitespace()
+                .take(NOTE_TITLE_WORDS)
+                .collect::<Vec<_>>()
+                .join(" ");
+            one_line(&words, NOTE_FALLBACK_TITLE_MAX_CHARS)
+        });
+    let quote = selection
+        .lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                ">".to_string()
+            } else {
+                format!("> {}", line.trim_end())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = match &source {
+        Some(url) => format!("{quote}\n\nFonte: {url}\n"),
+        None => format!("{quote}\n"),
+    };
+    Ok(NoteDraft {
+        title,
+        body,
+        tags: vec!["web".to_string()],
+        source,
+    })
+}
+
+/// De que WebView se le a selecao de um Ctrl+Shift+Z.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteCapture {
+    Read,
+    /// O Split privado: nada se le, nada se grava.
+    RefusePrivate,
+    /// A WebView ja nao existe (o Split fechou entretanto).
+    NoPage,
+}
+
+/// Decide no momento de ler, nao no do pedido: entre o Ctrl+Shift+Z num
+/// Split normal e o evento chegar aqui, o Split pode ter sido trocado por um
+/// privado. `split_private` e o do Split que existe AGORA.
+fn note_capture_decision(target: Option<PageTarget>, split_private: Option<bool>) -> NoteCapture {
+    match target {
+        Some(PageTarget::Split) => match split_private {
+            Some(true) => NoteCapture::RefusePrivate,
+            Some(false) => NoteCapture::Read,
+            None => NoteCapture::NoPage,
+        },
+        Some(PageTarget::Column(_)) | None => NoteCapture::Read,
+    }
+}
+
+/// O aviso do painel privado.
+const NOTE_PRIVATE_REFUSAL: &str = "Modo privado: notas não são criadas";
+
+/// A fonte que o lado nativo conhece e a pagina nao: o artigo do Leitor (o
+/// HTML e local) e o PDF (o visualizador e nosso). So vale para a WebView
+/// unica dessas superficies; nas colunas e no Split manda o endereco da pagina.
+fn note_page_source(
+    target: Option<PageTarget>,
+    surface: Surface,
+    page_source: Option<&str>,
+) -> Option<String> {
+    match (target, surface) {
+        (None, Surface::Reader | Surface::Pdf) => page_source.map(str::to_string),
+        _ => None,
+    }
+}
+
 const PANEL_HTML: &str = r#"<!doctype html>
-<html lang="pt-BR"><head><meta charset="utf-8"><title>Histórico inteligente</title>
+<html lang="pt-BR"><head><meta charset="utf-8"><title>Histórico e notas</title>
 <style>
 *{box-sizing:border-box}
 html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:15px "Segoe UI",system-ui,sans-serif}
 body{display:flex;flex-direction:column;border-left:1px solid var(--line)}
-header{display:flex;align-items:center;justify-content:space-between;padding:14px 12px 8px 18px}
-h1{font-size:17px;font-weight:600;margin:0}
+header{display:flex;align-items:center;justify-content:space-between;padding:10px 12px 8px 12px}
+.tabs{display:flex;gap:4px}
+.tab{background:none;border:0;color:var(--muted);font:inherit;font-weight:600;padding:7px 16px;border-radius:999px;cursor:pointer}
+.tab:hover{background:var(--surface)}
+.tab[aria-selected="true"]{background:var(--surface);color:var(--fg);box-shadow:inset 0 0 0 1px var(--line)}
 #close{background:none;border:0;color:var(--muted);font-size:18px;cursor:pointer;border-radius:8px;width:32px;height:32px}
 #close:hover{background:#e81123;color:#fff}
+.view{display:flex;flex-direction:column;flex:1;min-height:0}
+.view[hidden]{display:none}
 .search{padding:4px 16px 10px}
-#q{width:100%;padding:10px 14px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--fg);font:inherit;outline:none}
-#q:focus{border-color:var(--accent)}
+.field{width:100%;padding:10px 14px;border-radius:12px;border:1px solid var(--line);background:var(--surface);color:var(--fg);font:inherit;outline:none}
+.field:focus{border-color:var(--accent)}
+#q,#nq{border-radius:999px}
 main{overflow:auto;flex:1;padding:0 8px 16px}
 section[hidden]{display:none}
 h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:14px 10px 6px;font-weight:600}
@@ -2602,23 +3189,63 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
 .title,.detail{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .detail{font-size:12px;color:var(--muted);margin-top:2px}
 .empty{color:var(--muted);font-size:13px;padding:6px 10px}
+.row{display:flex;gap:8px;align-items:center;padding:4px 16px 10px}
+.btn{flex:none;background:var(--surface);border:1px solid var(--line);color:var(--fg);font:inherit;font-size:13px;padding:8px 14px;border-radius:999px;cursor:pointer}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.danger:hover{background:#e81123;border-color:#e81123;color:#fff}
+#notes-msg{font-size:12px;color:var(--muted);min-height:18px;padding:0 18px 4px}
+#note-editor{display:flex;flex-direction:column;gap:8px;overflow:auto;flex:1;padding:0 16px 16px}
+#note-editor h2{margin:10px 2px 0}
+#note-title{font-weight:600}
+#note-body{min-height:200px;resize:vertical;font:14px/1.45 "Segoe UI",system-ui,sans-serif}
+.meta{font-size:12px;color:var(--muted);word-break:break-all}
+.link{background:none;border:0;padding:0;color:var(--accent);font:inherit;cursor:pointer;text-decoration:underline;text-align:left}
+#note-preview{white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5;max-height:30vh;overflow:auto;padding:8px 10px;border-radius:10px;background:var(--surface)}
+.confirm{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px;border-radius:12px;border:1px solid #e81123;font-size:13px}
+.confirm[hidden]{display:none}
 </style></head><body>
-<header><h1>Histórico inteligente</h1><button id="close" title="Fechar (Esc)">✕</button></header>
-<div class="search"><input id="q" placeholder="Descreva o que quer reencontrar e tecle Enter" autocomplete="off" spellcheck="false"></div>
+<header><nav class="tabs" role="tablist"><button class="tab" id="tab-history" role="tab" aria-selected="true">Histórico</button><button class="tab" id="tab-notes" role="tab" aria-selected="false">Notas</button></nav><button id="close" title="Fechar (Esc)">✕</button></header>
+<div class="view" id="view-history">
+<div class="search"><input id="q" class="field" placeholder="Descreva o que quer reencontrar e tecle Enter" autocomplete="off" spellcheck="false"></div>
 <main>
 <section id="busca" hidden><h2></h2><div></div></section>
 <section id="sugestoes" hidden><h2></h2><div></div></section>
 <section id="recentes" hidden><h2></h2><div></div></section>
 </main>
+</div>
+<div class="view" id="view-notes" hidden>
+<div id="notes-msg" role="status"></div>
+<div class="view" id="notes-browse">
+<div class="row"><input id="nq" class="field" placeholder="Buscar nas notas" autocomplete="off" spellcheck="false"><button id="note-new" class="btn primary">Nova nota</button></div>
+<main><div id="notes-list"></div></main>
+</div>
+<div class="view" id="notes-edit" hidden>
+<div class="row"><button id="note-back" class="btn" title="Voltar à lista">← Notas</button><button id="note-save" class="btn primary" title="Salvar (Ctrl+S)">Salvar</button><button id="note-delete" class="btn danger">Excluir</button></div>
+<div id="note-editor">
+<div id="note-confirm" class="confirm" hidden><span>Excluir esta nota? Ela vai para a lixeira (.trash) da pasta das notas.</span><button id="note-confirm-yes" class="btn danger">Excluir</button><button id="note-confirm-no" class="btn">Cancelar</button></div>
+<input id="note-title" class="field" placeholder="Título" autocomplete="off">
+<textarea id="note-body" class="field" placeholder="Escreva em Markdown. Ligue outra nota com [[id]] ou [[id|nome]]."></textarea>
+<input id="note-tags" class="field" placeholder="Tags, separadas por vírgula" autocomplete="off" spellcheck="false">
+<div id="note-source-row" class="meta" hidden><span>Fonte: </span><button id="note-source" class="link"></button></div>
+<div id="note-meta" class="meta"></div>
+<section id="note-preview-box" hidden><h2>Pré-visualização</h2><div id="note-preview"></div></section>
+<section id="note-backlinks-box" hidden><h2>Notas que ligam para esta</h2><div id="note-backlinks"></div></section>
+</div>
+</div>
+</div>
 <script>
 (() => {
   if (window.top !== window) return;
   const post = (action, args) => window.ipc.postMessage(JSON.stringify({ action, args: args || {} }));
-  const q = document.getElementById('q');
-  document.getElementById('close').addEventListener('click', () => post('close'));
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { e.preventDefault(); post('close'); }
-  });
+  const byId = (id) => document.getElementById(id);
+  const make = (tag, className, text) => {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+  const q = byId('q');
   q.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && q.value.trim()) { e.preventDefault(); post('search', { query: q.value.trim() }); }
   });
@@ -2626,34 +3253,285 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
   window.__neuraliaPanel = {
     theme,
     render(data) {
-      const section = document.getElementById(data.id);
+      const section = byId(data.id);
       if (!section) return;
       section.hidden = false;
       section.querySelector('h2').textContent = data.title;
       const box = section.querySelector('div');
       box.textContent = '';
       if (!data.items.length) {
-        const empty = document.createElement('div');
-        empty.className = 'empty';
-        empty.textContent = data.empty;
-        box.appendChild(empty);
+        box.appendChild(make('div', 'empty', data.empty));
         return;
       }
       for (const item of data.items) {
-        const button = document.createElement('button');
-        button.className = 'item';
-        const title = document.createElement('span');
-        title.className = 'title';
-        title.textContent = item.title;
-        const detail = document.createElement('span');
-        detail.className = 'detail';
-        detail.textContent = item.detail;
-        button.append(title, detail);
+        const button = make('button', 'item');
+        button.append(make('span', 'title', item.title), make('span', 'detail', item.detail));
         button.addEventListener('click', () => post('open', { input: item.input }));
         box.appendChild(button);
       }
     }
   };
+
+  // Notas (Zettelkasten). Tudo o que vem de uma nota -- e o corpo pode ser
+  // texto copiado de qualquer pagina -- entra como texto: textContent,
+  // value e createTextNode. Nunca como HTML.
+  const notes = (() => {
+    const ID = /^[0-9][0-9-]{0,63}$/;
+    const WIKI = /\[\[([^\[\]|\n]+)(?:\|([^\[\]\n]*))?\]\]/g;
+    const BODY_MAX_BYTES = 200 * 1024;
+    const TITLE_MAX = 300;
+    const TAGS_MAX = 20;
+    const TAG_MAX = 60;
+    const QUERY_MAX = 500;
+    const SOURCE_MAX = 2048;
+    const nq = byId('nq'), list = byId('notes-list'), msg = byId('notes-msg');
+    const browse = byId('notes-browse'), edit = byId('notes-edit');
+    const title = byId('note-title'), body = byId('note-body'), tags = byId('note-tags');
+    const sourceRow = byId('note-source-row'), source = byId('note-source'), meta = byId('note-meta');
+    const previewBox = byId('note-preview-box'), preview = byId('note-preview');
+    const backBox = byId('note-backlinks-box'), backlinks = byId('note-backlinks');
+    const confirmBox = byId('note-confirm');
+    // Nota no editor: o id dela, ou null para uma nota nova ainda por salvar.
+    let openId = null;
+    let openSource = '';
+    let dirty = false;
+    let savingNew = false;
+    let searchTimer = 0;
+    let previewTimer = 0;
+
+    const say = (text) => { msg.textContent = text || ''; };
+    const when = (unix) => {
+      if (!unix) return '';
+      try { return new Date(unix * 1000).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' }); } catch (e) { return ''; }
+    };
+    const query = () => nq.value.trim().slice(0, QUERY_MAX);
+    const refresh = () => {
+      const text = query();
+      if (text) post('notes-search', { query: text }); else post('notes-list');
+    };
+    const open = (id) => { if (ID.test(id)) { leave(); post('note-open', { id }); } };
+    const showList = () => { confirmBox.hidden = true; edit.hidden = true; browse.hidden = false; };
+    const showEditor = () => { browse.hidden = true; edit.hidden = false; };
+
+    function renderList(data) {
+      // Resposta a uma busca que ja nao e a da caixa: a seguinte vem a caminho.
+      if ((data.query || '') !== query()) return;
+      list.textContent = '';
+      if (!data.notes.length) {
+        list.appendChild(make('div', 'empty', data.query
+          ? 'Nenhuma nota encontrada.'
+          : 'Nenhuma nota ainda. Crie uma em Nova nota, ou selecione um texto numa página e tecle Ctrl+Shift+Z.'));
+        return;
+      }
+      if (data.total > data.notes.length) {
+        list.appendChild(make('div', 'empty', 'Mostrando ' + data.notes.length + ' de ' + data.total + ' notas. Refine a busca.'));
+      }
+      for (const note of data.notes) {
+        const button = make('button', 'item');
+        const detail = [when(note.updated), note.tags.map((tag) => '#' + tag).join(' ')].filter(Boolean).join(' · ');
+        button.append(make('span', 'title', note.title), make('span', 'detail', detail));
+        button.addEventListener('click', () => open(note.id));
+        list.appendChild(button);
+      }
+    }
+
+    // O corpo com os [[id]] e [[id|nome]] clicaveis; o resto e texto.
+    function renderPreview() {
+      preview.textContent = '';
+      const text = body.value;
+      let last = 0;
+      let match;
+      WIKI.lastIndex = 0;
+      while ((match = WIKI.exec(text)) !== null) {
+        const id = match[1].trim();
+        if (!ID.test(id)) continue;
+        if (match.index > last) preview.appendChild(document.createTextNode(text.slice(last, match.index)));
+        const link = make('button', 'link', (match[2] || '').trim() || id);
+        link.title = 'Abrir a nota ' + id;
+        link.addEventListener('click', () => open(id));
+        preview.appendChild(link);
+        last = match.index + match[0].length;
+      }
+      if (last < text.length) preview.appendChild(document.createTextNode(text.slice(last)));
+      previewBox.hidden = !text.trim();
+    }
+
+    // Fonte, datas e backlinks: o que o editor mostra da nota sem ser editavel.
+    function describe(note, links) {
+      openSource = note && note.source ? note.source : '';
+      source.textContent = openSource;
+      source.disabled = !/^https?:\/\//i.test(openSource) || openSource.length > SOURCE_MAX;
+      sourceRow.hidden = !openSource;
+      meta.textContent = note
+        ? ['Criada ' + when(note.created), 'atualizada ' + when(note.updated), 'id ' + note.id].join(' · ')
+        : 'Nota nova: ainda não foi salva.';
+      backlinks.textContent = '';
+      for (const other of links || []) {
+        const button = make('button', 'item', other.title);
+        button.addEventListener('click', () => open(other.id));
+        backlinks.appendChild(button);
+      }
+      backBox.hidden = !(links && links.length);
+    }
+
+    function fill(note, links) {
+      openId = note ? note.id : null;
+      // Outra nota no editor: a resposta ao salvar de uma nota nova que
+      // ainda venha a caminho ja nao e desta.
+      savingNew = false;
+      title.value = note ? note.title : '';
+      body.value = note ? note.body : '';
+      tags.value = note ? note.tags.join(', ') : '';
+      describe(note, links);
+      confirmBox.hidden = true;
+      dirty = false;
+      renderPreview();
+    }
+
+    function save() {
+      const tagList = tags.value.split(',').map((tag) => tag.trim()).filter(Boolean);
+      if (tagList.length > TAGS_MAX || tagList.some((tag) => tag.length > TAG_MAX)) {
+        say('Até ' + TAGS_MAX + ' tags, cada uma com até ' + TAG_MAX + ' caracteres.');
+        return false;
+      }
+      if (title.value.trim().length > TITLE_MAX) { say('O título passa de ' + TITLE_MAX + ' caracteres.'); return false; }
+      if (new TextEncoder().encode(body.value).length > BODY_MAX_BYTES) {
+        say('A nota passa de 200 KiB. Divida-a em duas.');
+        return false;
+      }
+      // Uma nota nova ainda sem id: um segundo pedido criava outra nota. O
+      // que se escrever entretanto fica por salvar ate o id chegar.
+      if (openId === null && savingNew) { say('A salvar…'); return false; }
+      post('note-save', { id: openId, title: title.value.trim(), body: body.value, tags: tagList });
+      savingNew = openId === null;
+      dirty = false;
+      say('A salvar…');
+      return true;
+    }
+
+    // Sair do editor nao deita fora o que se escreveu.
+    function leave() {
+      if (dirty && !edit.hidden && (title.value.trim() || body.value.trim())) save();
+    }
+
+    function newNote() {
+      leave();
+      fill(null, []);
+      showEditor();
+      say('');
+      title.focus();
+    }
+
+    function receive(data) {
+      switch (data.kind) {
+        case 'listed':
+          renderList(data);
+          break;
+        case 'opened': {
+          const note = data.note;
+          if (data.cause === 'saved') {
+            // So mexe no editor se ele ainda mostra esta nota (ou a nova que
+            // acabou de ganhar id); senao o utilizador ja seguiu em frente.
+            // O texto nao e reescrito: o cursor ficava no fim a cada Ctrl+S.
+            const same = openId === note.id || (openId === null && savingNew);
+            savingNew = false;
+            if (same) {
+              openId = note.id;
+              if (!title.value.trim()) title.value = note.title;
+              describe(note, data.backlinks);
+            }
+            say('Nota salva.');
+            refresh();
+          } else {
+            // Uma nota que chega de fora (Ctrl+Shift+Z) nao deita fora o que
+            // estava por salvar no editor.
+            if (openId !== note.id) leave();
+            fill(note, data.backlinks);
+            showEditor();
+            say(data.cause === 'created' ? 'Nota criada a partir da seleção.' : '');
+            if (data.cause === 'created') refresh();
+          }
+          break;
+        }
+        case 'deleted':
+          if (openId === data.id) { fill(null, []); showList(); }
+          say('Nota movida para a lixeira (.trash).');
+          refresh();
+          break;
+        case 'missing':
+          say('Essa nota já não existe.');
+          refresh();
+          break;
+        case 'failed':
+          savingNew = false;
+          say(data.message);
+          break;
+      }
+    }
+
+    nq.addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(refresh, 250);
+    });
+    nq.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); clearTimeout(searchTimer); refresh(); }
+    });
+    byId('note-new').addEventListener('click', newNote);
+    byId('note-back').addEventListener('click', () => { leave(); showList(); refresh(); });
+    byId('note-save').addEventListener('click', save);
+    byId('note-delete').addEventListener('click', () => { confirmBox.hidden = false; });
+    byId('note-confirm-no').addEventListener('click', () => { confirmBox.hidden = true; });
+    byId('note-confirm-yes').addEventListener('click', () => {
+      confirmBox.hidden = true;
+      if (openId === null) { fill(null, []); showList(); return; }
+      post('note-delete', { id: openId });
+    });
+    source.addEventListener('click', () => {
+      if (!source.disabled && openSource) post('open', { input: openSource });
+    });
+    for (const field of [title, body, tags]) {
+      field.addEventListener('input', () => { dirty = true; say('Alterações por salvar.'); });
+    }
+    body.addEventListener('input', () => {
+      clearTimeout(previewTimer);
+      previewTimer = setTimeout(renderPreview, 200);
+    });
+    edit.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (e.key || '').toLowerCase() === 's') {
+        e.preventDefault();
+        save();
+      }
+    });
+    return { refresh, receive, newNote, leave, focus: () => (edit.hidden ? nq : title).focus() };
+  })();
+
+  // Abas: Historico e Notas.
+  const tabs = { history: byId('tab-history'), notes: byId('tab-notes') };
+  const views = { history: byId('view-history'), notes: byId('view-notes') };
+  function showSection(name) {
+    const key = name === 'notes' || name === 'notas' ? 'notes'
+      : name === 'history' || name === 'historico' ? 'history' : '';
+    if (!key) return false;
+    for (const other of Object.keys(views)) {
+      views[other].hidden = other !== key;
+      tabs[other].setAttribute('aria-selected', other === key ? 'true' : 'false');
+    }
+    if (key === 'notes') { notes.refresh(); notes.focus(); } else { notes.leave(); q.focus(); }
+    return true;
+  }
+  window.neuraliaShowSection = showSection;
+  window.__neuraliaNotes = {
+    receive: notes.receive,
+    newNote() { showSection('notes'); notes.newNote(); }
+  };
+  tabs.history.addEventListener('click', () => showSection('history'));
+  tabs.notes.addEventListener('click', () => showSection('notes'));
+  const close = () => { notes.leave(); post('close'); };
+  byId('close').addEventListener('click', close);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); close(); }
+  });
+
   theme(__THEME__);
   q.focus();
   post('ready');
@@ -4173,8 +5051,22 @@ unsafe extern "system" fn omnibox_subclass(
                 let _ = proxy.send_event(UserEvent::ClearHistory);
                 return 0;
             }
+            // Ctrl+Shift+Z (Z = 0x5A): nota nova no painel. Na omnibox nao
+            // ha pagina com selecao; o Ctrl+Z sozinho continua a desfazer.
+            0x5A if ctrl && shift => {
+                let _ = proxy.send_event(UserEvent::NewNote);
+                return 0;
+            }
             _ => {}
         }
+    }
+    // O Ctrl+Shift+Z acima ja foi tratado: o carater 0x1A que o
+    // TranslateMessage gera a seguir seria o "desfazer" do EDIT.
+    if message == WM_CHAR
+        && wparam == 0x1A
+        && (GetAsyncKeyState(VK_SHIFT as i32) as u16 & 0x8000) != 0
+    {
+        return 0;
     }
 
     DefSubclassProc(hwnd, message, wparam, lparam)
@@ -5094,10 +5986,21 @@ struct App {
     /// Servico aberto no painel lateral (WhatsApp, Meet, YouTube, Gmail e o
     /// video da respiracao, este em InPrivate).
     service_panel: Option<(Service, WebView)>,
-    /// Ferramentas: o botao da Home sob o rato (a barra usa `bar_hover`) e
-    /// o painel aberto pelo botao Notas, a espera do "pronto" da pagina.
+    /// Ferramentas: o botao da Home sob o rato (a barra usa `bar_hover`).
     home_tool_hover: Option<Tool>,
-    panel_notes_pending: bool,
+    /// O painel ja correu o script dele (mandou "ready"). Antes disso um
+    /// `evaluate_script` corria no documento vazio e perdia-se.
+    panel_ready: bool,
+    /// Scripts para o painel que esperam pelo "ready" (abrir nas Notas, a
+    /// nota acabada de criar), pela ordem em que foram pedidos.
+    panel_pending: Vec<String>,
+    /// Notas (Zettelkasten) em `<data_dir>/zettel`, lidas e gravadas fora do
+    /// event loop.
+    notes: ZettelWorker,
+    /// O endereco verdadeiro da pagina da WebView unica quando o dela nao o
+    /// e: o artigo do Leitor (o HTML e local) e o PDF (o visualizador e
+    /// nosso). E a fonte das notas feitas ali.
+    page_source: Option<String>,
     /// O Pomodoro do botao da barra e da Home, com a cadeia de tiques viva.
     /// As duracoes vivem em `<data_dir>/pomodoro`.
     pomodoro: PomodoroController,
@@ -5119,6 +6022,7 @@ impl App {
         ));
         let history = HistoryWriter::new(history_store, proxy.clone());
         let memory = MemoryWorker::new(config.data_dir.join("memory"), proxy.clone());
+        let notes = ZettelWorker::new(config.data_dir.join("zettel"), proxy.clone());
         let timers = Timers::new(proxy.clone());
         let reader_client = ReaderClient::new(config.reader_timeout_secs, config.reader_max_bytes);
         let navigation_generation = Arc::new(AtomicU64::new(0));
@@ -5193,7 +6097,10 @@ impl App {
             panel_suggestion_query: None,
             service_panel: None,
             home_tool_hover: None,
-            panel_notes_pending: false,
+            panel_ready: false,
+            panel_pending: Vec::new(),
+            notes,
+            page_source: None,
             pomodoro,
         }
     }
@@ -5595,6 +6502,7 @@ impl App {
             *bytes = Vec::new();
         }
         self.reading_pdf = false;
+        self.page_source = None;
     }
 
     fn schedule_home_restoration(&self) {
@@ -6047,6 +6955,7 @@ impl App {
                 let _ = webview.zoom(self.zoom);
                 self.webview = Some(webview);
                 self.surface = Surface::Pdf;
+                self.page_source = Some(url.to_string());
                 self.record(HistoryKind::Read, url.to_string(), url.to_string());
                 let mut document = MemoryDocument::new(
                     MemoryKind::Source,
@@ -6516,6 +7425,7 @@ impl App {
                 let _ = webview.zoom(self.zoom);
                 self.webview = Some(webview);
                 self.surface = Surface::Reader;
+                self.page_source = Some(article.source_url.clone());
                 self.begin_reading_session(false);
             }
             Err(error) => {
@@ -7006,6 +7916,10 @@ impl App {
             IpcAction::Expand { col } if col == col_index => {
                 Some(UserEvent::ExpandComparator(col_index))
             }
+            // Ctrl+Shift+Z: a selecao e lida DESTA coluna, pelo lado nativo.
+            IpcAction::Note => Some(UserEvent::NoteRequested(Some(PageTarget::Column(
+                col_index,
+            )))),
             other => common_ipc_event(other),
         }
     }
@@ -7145,8 +8059,15 @@ impl App {
         self.request_redraw();
     }
 
-    fn split_ipc_event_impl(source_index: usize, action: IpcAction) -> Option<UserEvent> {
+    fn split_ipc_event_impl(
+        source_index: usize,
+        private: bool,
+        action: IpcAction,
+    ) -> Option<UserEvent> {
         match action {
+            // O Split privado nao faz notas: a pagina nem chega a ser lida.
+            IpcAction::Note if private => Some(UserEvent::NoteRefusedPrivate),
+            IpcAction::Note => Some(UserEvent::NoteRequested(Some(PageTarget::Split))),
             IpcAction::SplitClose => Some(UserEvent::CloseSplit),
             IpcAction::SplitExpand | IpcAction::Fullscreen => {
                 Some(UserEvent::ToggleSplitFullscreen)
@@ -7192,7 +8113,7 @@ impl App {
                 else {
                     return;
                 };
-                let event = Self::split_ipc_event_impl(source_index, action);
+                let event = Self::split_ipc_event_impl(source_index, private, action);
                 if let Some(event) = event {
                     let _ = ipc_proxy.send_event(event);
                 }
@@ -9185,6 +10106,9 @@ impl App {
             Ok(panel) => {
                 let _ = panel.focus();
                 self.side_panel = Some(panel);
+                // Pagina nova: o que estava pendente era para a anterior.
+                self.panel_ready = false;
+                self.panel_pending.clear();
                 self.fit_comparator_to_panel();
                 debug_log(format_args!(
                     "side panel: aberto surface={:?}",
@@ -9202,7 +10126,8 @@ impl App {
             return;
         }
         self.panel_suggestion_query = None;
-        self.panel_notes_pending = false;
+        self.panel_ready = false;
+        self.panel_pending.clear();
         debug_log(format_args!("side panel: fechado"));
         self.fit_comparator_to_panel();
         // Largar a WebView nao devolve o teclado a ninguem.
@@ -9223,24 +10148,146 @@ impl App {
         }
     }
 
+    /// Corre `script` no painel, ou guarda-o para o "ready" se a pagina
+    /// ainda nao correu o script dela. Sem painel, nao faz nada.
+    fn panel_run(&mut self, script: String) {
+        if self.side_panel.is_none() {
+            return;
+        }
+        if self.panel_ready {
+            self.panel_eval(&script);
+        } else {
+            self.panel_pending.push(script);
+        }
+    }
+
+    /// Abre (se preciso -- nunca fecha) o painel ja nas Notas e corre la os
+    /// `scripts`, pela ordem.
+    fn show_notes_panel(&mut self, scripts: Vec<String>) {
+        if self.side_panel.is_none() {
+            self.open_side_panel();
+        }
+        if self.side_panel.is_none() {
+            return;
+        }
+        self.panel_run(PANEL_SHOW_NOTES_SCRIPT.to_string());
+        for script in scripts {
+            self.panel_run(script);
+        }
+    }
+
+    fn submit_notes(&mut self, command: NotesCommand, origin: NotesOrigin) {
+        if let Err(error) = self.notes.submit(command, origin) {
+            match origin {
+                NotesOrigin::Panel => {
+                    self.panel_run(notes_reply_script(&NotesReply::Failed(error)))
+                }
+                NotesOrigin::Selection => self.show_splash(error, 3),
+            }
+        }
+    }
+
+    /// Resposta do worker das notas. A de uma selecao abre o painel na nota
+    /// criada; a do painel so vai para o painel que ainda estiver aberto.
+    fn notes_ready(&mut self, origin: NotesOrigin, reply: NotesReply) {
+        match origin {
+            NotesOrigin::Panel => self.panel_run(notes_reply_script(&reply)),
+            NotesOrigin::Selection => match &reply {
+                NotesReply::Opened { .. } => {
+                    self.show_notes_panel(vec![notes_reply_script(&reply)]);
+                    self.show_splash("Nota criada".to_string(), 2);
+                }
+                NotesReply::Failed(error) => self.show_splash(error.clone(), 4),
+                NotesReply::Listed { .. }
+                | NotesReply::Deleted { .. }
+                | NotesReply::Missing { .. } => {}
+            },
+        }
+    }
+
+    /// Ctrl+Shift+Z numa pagina: le a selecao da WebView `target` e cria a
+    /// nota. O Split privado nunca e lido.
+    fn request_note_from_page(&mut self, target: Option<PageTarget>) {
+        let split_private = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.split.as_ref())
+            .map(|split| split.private);
+        match note_capture_decision(target, split_private) {
+            NoteCapture::Read => {}
+            NoteCapture::RefusePrivate => {
+                self.show_splash(NOTE_PRIVATE_REFUSAL.to_string(), 3);
+                return;
+            }
+            NoteCapture::NoPage => return,
+        }
+        let webview = match target {
+            Some(PageTarget::Column(index)) => self
+                .comparator
+                .as_ref()
+                .and_then(|comp| comp.views.get(index))
+                .map(|view| &view.webview),
+            Some(PageTarget::Split) => self
+                .comparator
+                .as_ref()
+                .and_then(|comp| comp.split.as_ref())
+                .map(|split| &split.webview),
+            None => self.webview.as_ref(),
+        };
+        let Some(webview) = webview else {
+            return;
+        };
+        let source = note_page_source(target, self.surface, self.page_source.as_deref());
+        let proxy = self.proxy.clone();
+        let asked = webview.evaluate_script_with_callback(NOTE_CAPTURE_SCRIPT, move |raw| {
+            let _ = proxy.send_event(UserEvent::NoteCaptured {
+                raw,
+                source: source.clone(),
+            });
+        });
+        if asked.is_err() {
+            self.show_splash(
+                "Não foi possível ler a seleção desta página.".to_string(),
+                3,
+            );
+        }
+    }
+
+    fn note_captured(&mut self, raw: &str, source: Option<&str>) {
+        match note_draft_from_capture(raw, source) {
+            Ok(draft) => self.submit_notes(NotesCommand::Create(draft), NotesOrigin::Selection),
+            Err(NoteCaptureError::EmptySelection) => {
+                self.show_splash("Selecione um texto para criar a nota".to_string(), 3);
+            }
+            Err(NoteCaptureError::Unreadable) => {
+                self.show_splash(
+                    "Não foi possível ler a seleção desta página.".to_string(),
+                    3,
+                );
+            }
+        }
+    }
+
+    /// Ctrl+Shift+Z na Home ou na barra: o painel nas Notas, com uma nota
+    /// nova em branco no editor.
+    fn new_note_in_panel(&mut self) {
+        self.show_notes_panel(vec![PANEL_NEW_NOTE_SCRIPT.to_string()]);
+    }
+
     /// Botao Notas (Zettelkasten): abre o painel do Ctrl+H ja na secao das
     /// notas; com o painel aberto, o mesmo botao fecha-o.
     ///
     /// A pagina do painel acabou de nascer e ainda nao correu o script dela:
     /// um `evaluate_script` agora corria no documento vazio e perdia-se. Por
-    /// isso a secao fica pendente e o `PanelMessage::Ready` (o "pronto" que a
-    /// pagina manda no fim do script) entrega-a com `PANEL_SHOW_NOTES_SCRIPT`.
-    /// Quem acrescentar a secao das notas define `window.neuraliaShowSection`
-    /// no `PANEL_HTML`; sem ela, o script nao faz nada.
+    /// isso `show_notes_panel` guarda o `PANEL_SHOW_NOTES_SCRIPT` em
+    /// `panel_pending`, e o `PanelMessage::Ready` (o "pronto" que a pagina
+    /// manda no fim do script) corre-o.
     fn open_notes(&mut self) {
         if self.side_panel.is_some() {
             self.close_side_panel();
             return;
         }
-        self.open_side_panel();
-        if self.side_panel.is_some() {
-            self.panel_notes_pending = true;
-        }
+        self.show_notes_panel(Vec::new());
     }
 
     /// Clique no botao do Pomodoro (barra ou Home): parado inicia, a correr
@@ -9403,9 +10450,11 @@ impl App {
                     self.panel_suggestion_query = Some(question.clone());
                     self.memory.query(question);
                 }
-                // Aberto pelo botao Notas: agora a pagina ja existe.
-                if std::mem::take(&mut self.panel_notes_pending) {
-                    self.panel_eval(PANEL_SHOW_NOTES_SCRIPT);
+                // Aberto pelas Notas (botao, Ctrl+Shift+Z): agora a pagina
+                // ja existe e o que esperava corre, pela ordem.
+                self.panel_ready = true;
+                for script in std::mem::take(&mut self.panel_pending) {
+                    self.panel_eval(&script);
                 }
             }
             PanelMessage::Search(query) => self.memory.query(query),
@@ -9414,6 +10463,15 @@ impl App {
                 self.handle_input(input);
             }
             PanelMessage::Close => self.close_side_panel(),
+            notes @ (PanelMessage::NotesList
+            | PanelMessage::NotesSearch(_)
+            | PanelMessage::NoteOpen(_)
+            | PanelMessage::NoteSave(_)
+            | PanelMessage::NoteDelete(_)) => {
+                if let Some(command) = notes_command_for(notes) {
+                    self.submit_notes(command, NotesOrigin::Panel);
+                }
+            }
         }
     }
 
@@ -10238,6 +11296,8 @@ enum MainShortcut {
     Reload,
     History,
     NewTab,
+    /// Ctrl+Shift+Z sem pagina com selecao: nota nova no painel.
+    NewNote,
 }
 
 fn main_window_shortcut(
@@ -10255,6 +11315,7 @@ fn main_window_shortcut(
         ("r", true) => Some(MainShortcut::Reload),
         ("h", false) => Some(MainShortcut::History),
         ("n", false) => Some(MainShortcut::NewTab),
+        ("z", true) => Some(MainShortcut::NewNote),
         _ => None,
     }
 }
@@ -11070,6 +12131,13 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ShowHistory => self.toggle_side_panel(),
             UserEvent::ThemeChosen(choice) => self.choose_theme(choice),
             UserEvent::Panel(message) => self.handle_panel_message(message),
+            UserEvent::NotesReady { origin, reply } => self.notes_ready(origin, reply),
+            UserEvent::NoteRequested(target) => self.request_note_from_page(target),
+            UserEvent::NoteRefusedPrivate => {
+                self.show_splash(NOTE_PRIVATE_REFUSAL.to_string(), 3);
+            }
+            UserEvent::NoteCaptured { raw, source } => self.note_captured(&raw, source.as_deref()),
+            UserEvent::NewNote => self.new_note_in_panel(),
             UserEvent::GmailAnswer(open) => self.answer_gmail(open),
             UserEvent::ClearHistory => {
                 if !self.confirm_clear_history() {
@@ -11407,6 +12475,7 @@ impl ApplicationHandler<UserEvent> for App {
                         MainShortcut::Reload => self.reload_page(),
                         MainShortcut::History => self.toggle_side_panel(),
                         MainShortcut::NewTab => self.new_tab(0),
+                        MainShortcut::NewNote => self.new_note_in_panel(),
                     }
                     return;
                 }
@@ -11736,6 +12805,9 @@ fn common_ipc_event(action: IpcAction) -> Option<UserEvent> {
         IpcAction::DevTools => UserEvent::OpenDevTools,
         IpcAction::ViewSource => UserEvent::ViewSource,
         IpcAction::NewTab { col } => UserEvent::NewTab(col.unwrap_or(0)),
+        // A WebView unica (web externa, Leitor, PDF). As colunas e o Split
+        // tratam o `note` antes de chegar aqui.
+        IpcAction::Note => UserEvent::NoteRequested(None),
         _ => return None,
     })
 }
@@ -16671,10 +17743,10 @@ __fire('submit', at(login));
             Some(UserEvent::OpenPalette(1))
         ));
         assert!(matches!(
-            App::split_ipc_event_impl(1, IpcAction::Palette { col: 1 }),
+            App::split_ipc_event_impl(1, false, IpcAction::Palette { col: 1 }),
             Some(UserEvent::OpenPalette(1))
         ));
-        assert!(App::split_ipc_event_impl(1, IpcAction::Palette { col: 0 }).is_none());
+        assert!(App::split_ipc_event_impl(1, false, IpcAction::Palette { col: 0 }).is_none());
 
         let edit = source
             .split("fn palette_edit_subclass")
@@ -18611,19 +19683,19 @@ __fire('keydown', { key: 'F8' });
         assert!(App::column_ipc_event_impl(0, IpcAction::Expand { col: 1 }).is_none());
 
         assert!(matches!(
-            App::split_ipc_event_impl(2, IpcAction::Fullscreen),
+            App::split_ipc_event_impl(2, false, IpcAction::Fullscreen),
             Some(UserEvent::ToggleSplitFullscreen)
         ));
         assert!(matches!(
-            App::split_ipc_event_impl(2, IpcAction::Omnibox),
+            App::split_ipc_event_impl(2, false, IpcAction::Omnibox),
             Some(UserEvent::OpenPalette(2))
         ));
         assert!(matches!(
-            App::split_ipc_event_impl(2, IpcAction::Print),
+            App::split_ipc_event_impl(2, false, IpcAction::Print),
             Some(UserEvent::PrintTarget(PageTarget::Split))
         ));
         assert!(matches!(
-            App::split_ipc_event_impl(2, IpcAction::ShortcutExpand { col: 0 }),
+            App::split_ipc_event_impl(2, false, IpcAction::ShortcutExpand { col: 0 }),
             Some(UserEvent::ExpandComparator(0))
         ));
     }
@@ -19536,6 +20608,1057 @@ console.log(JSON.stringify({{ calls, quiet: quiet === undefined }}));
         let mixed = BarLabel::new("⏸ 12:00 pausa longa").expect("etiqueta");
         assert!(mixed.as_str().len() <= BAR_LABEL_MAX_BYTES);
         assert!(mixed.as_str().starts_with("⏸ 12:00"));
+    }
+
+    /// Gates das notas (Zettelkasten): o painel que embarca, o parser dele,
+    /// o trabalho do worker e o Ctrl+Shift+Z das paginas.
+    mod notes_gates {
+        use super::*;
+
+        /// Um instante fixo: 2026-09-23 ~ 12:12 UTC.
+        const T0: u64 = 1_790_172_725;
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+
+        /// Pasta de notas temporaria, apagada no fim do teste.
+        struct NotesDir(std::path::PathBuf);
+
+        impl NotesDir {
+            fn new(tag: &str) -> Self {
+                static NEXT: AtomicUsize = AtomicUsize::new(0);
+                let dir = std::env::temp_dir().join(format!(
+                    "neuralia-notes-{tag}-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                let _ = std::fs::remove_dir_all(&dir);
+                Self(dir)
+            }
+
+            fn store(&self) -> ZettelStore {
+                ZettelStore::open(&self.0).expect("pasta de notas")
+            }
+        }
+
+        impl Drop for NotesDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// O caminho que um pedido do painel faz no produto, menos a thread:
+        /// parser do canal -> `notes_command_for` -> `run_notes_command`.
+        fn panel_request(store: &ZettelStore, body: &str, now: u64) -> NotesReply {
+            let message = parse_panel_message(body)
+                .unwrap_or_else(|| panic!("o parser recusou um pedido do painel: {body}"));
+            let command = notes_command_for(message)
+                .unwrap_or_else(|| panic!("nao e um pedido das notas: {body}"));
+            run_notes_command(store, command, now)
+        }
+
+        /// Um DOM pequeno, criado DENTRO do contexto do vm, onde corre o
+        /// `<script>` do `PANEL_HTML` que embarca sobre a marcacao dele.
+        /// `innerHTML`, `outerHTML`, `insertAdjacentHTML` e `document.write`
+        /// nao interpretam nada: so ficam registados em `__html`.
+        const PANEL_DOM_HARNESS: &str = r##"
+const vm = require('node:vm');
+const DOM = String.raw`
+var __posted = [], __errors = [], __html = [], __timers = [], __created = [], __out = {};
+class Node {
+  constructor() { this.childNodes = []; this.parentNode = null; this.__listeners = []; }
+  addEventListener(type, handler) { this.__listeners.push({ type: String(type), handler }); }
+  removeEventListener() {}
+  appendChild(child) {
+    if (child.parentNode) child.parentNode.removeChild(child);
+    child.parentNode = this; this.childNodes.push(child); return child;
+  }
+  removeChild(child) {
+    const i = this.childNodes.indexOf(child);
+    if (i >= 0) this.childNodes.splice(i, 1);
+    child.parentNode = null; return child;
+  }
+  append(...nodes) { for (const n of nodes) this.appendChild(typeof n === 'string' ? new Text(n) : n); }
+  get textContent() { return this.childNodes.map((n) => n.textContent).join(''); }
+  set textContent(value) {
+    for (const c of this.childNodes) c.parentNode = null;
+    this.childNodes = [];
+    const text = String(value);
+    if (text) this.appendChild(new Text(text));
+  }
+}
+class Text extends Node {
+  constructor(data) { super(); this.data = String(data); }
+  get textContent() { return this.data; }
+  set textContent(value) { this.data = String(value); }
+}
+class Element extends Node {
+  constructor(tag) {
+    super();
+    this.tagName = String(tag).toUpperCase(); this.attributes = {};
+    this.style = { setProperty() {} }; this.value = ''; this.hidden = false;
+    this.className = ''; this.disabled = false; this.title = ''; this.id = '';
+  }
+  setAttribute(k, v) { this.attributes[k] = String(v); }
+  getAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attributes, k) ? this.attributes[k] : null; }
+  removeAttribute(k) { delete this.attributes[k]; }
+  get children() { return this.childNodes.filter((n) => n instanceof Element); }
+  querySelector(selector) {
+    const want = String(selector).toUpperCase();
+    const walk = (node) => {
+      for (const c of node.children) { if (c.tagName === want) return c; const f = walk(c); if (f) return f; }
+      return null;
+    };
+    return walk(this);
+  }
+  focus() { document.activeElement = this; }
+  blur() {}
+  select() {}
+  get innerHTML() { return ''; }
+  set innerHTML(v) { __html.push(String(v)); }
+  get outerHTML() { return ''; }
+  set outerHTML(v) { __html.push(String(v)); }
+  insertAdjacentHTML(_where, v) { __html.push(String(v)); }
+}
+class Document extends Node {
+  constructor() {
+    super();
+    this.documentElement = new Element('html');
+    this.body = new Element('body');
+    this.documentElement.appendChild(this.body);
+    this.activeElement = null;
+  }
+  createElement(tag) { __created.push(String(tag).toLowerCase()); return new Element(tag); }
+  createTextNode(text) { return new Text(text); }
+  getElementById(id) {
+    const walk = (node) => {
+      for (const c of node.children) { if (c.id === id) return c; const f = walk(c); if (f) return f; }
+      return null;
+    };
+    return walk(this.documentElement);
+  }
+  write(v) { __html.push(String(v)); }
+}
+var document = new Document();
+var window = { ipc: { postMessage(message) { __posted.push(String(message)); } } };
+window.top = window;
+function setTimeout(fn) { __timers.push({ fn, done: false }); return __timers.length; }
+function clearTimeout(id) { const t = __timers[id - 1]; if (t) t.done = true; }
+function __drain() {
+  for (let round = 0; round < 20; round++) {
+    const due = __timers.filter((t) => !t.done);
+    if (!due.length) return;
+    for (const t of due) { t.done = true; try { t.fn(); } catch (e) { __errors.push('timer: ' + e.message); } }
+  }
+}
+function __fire(target, type, extra) {
+  const event = Object.assign({
+    type, target, key: '', ctrlKey: false, metaKey: false, shiftKey: false, altKey: false,
+    defaultPrevented: false, stopped: false,
+    preventDefault() { this.defaultPrevented = true; }, stopPropagation() { this.stopped = true; }
+  }, extra || {});
+  const run = (node) => {
+    for (const l of node.__listeners.slice()) {
+      if (l.type !== type) continue;
+      try { l.handler.call(node, event); } catch (e) { __errors.push(type + ': ' + e.message); }
+    }
+  };
+  for (let node = target; node && !event.stopped; node = node.parentNode) run(node);
+  if (!event.stopped && target !== document) run(document);
+  return event;
+}
+function __build(html) {
+  const start = html.indexOf('<body>') + '<body>'.length;
+  const scriptAt = html.indexOf('<script>');
+  const markup = html.slice(start, scriptAt);
+  const stack = [document.body];
+  const VOID = { input: 1, meta: 1, br: 1, img: 1, hr: 1 };
+  const tag = /<(\/?)([a-zA-Z][a-zA-Z0-9]*)([^>]*)>|([^<]+)/g;
+  let m;
+  while ((m = tag.exec(markup))) {
+    if (m[4] !== undefined) {
+      if (m[4].trim()) stack[stack.length - 1].appendChild(new Text(m[4]));
+      continue;
+    }
+    if (m[1]) { stack.pop(); continue; }
+    const el = new Element(m[2]);
+    const attr = /([a-zA-Z-]+)(?:="([^"]*)")?/g;
+    let a;
+    while ((a = attr.exec(m[3]))) {
+      const name = a[1], value = a[2] === undefined ? '' : a[2];
+      if (name === 'hidden') el.hidden = true;
+      else if (name === 'id') el.id = value;
+      else if (name === 'class') el.className = value;
+      else if (name === 'title') el.title = value;
+      else el.setAttribute(name, value);
+    }
+    stack[stack.length - 1].appendChild(el);
+    if (!VOID[m[2].toLowerCase()]) stack.push(el);
+  }
+  return html.slice(scriptAt + '<script>'.length, html.indexOf('</script>'));
+}
+const $ = (id) => document.getElementById(id);
+function __type(el, value) { el.value = value; __fire(el, 'input'); }
+function __click(el) { return __fire(el, 'click'); }
+function __key(el, key, mods) { return __fire(el, 'keydown', Object.assign({ key }, mods || {})); }
+function __visible(el) {
+  for (let node = el; node && node !== document.body; node = node.parentNode) if (node.hidden) return false;
+  return true;
+}
+function __buttons(el) { return el.children.filter((c) => c.tagName === 'BUTTON'); }
+`;
+const context = vm.createContext({ TextEncoder, URL });
+vm.runInContext(DOM, context);
+context.__panelHtml = INPUT.html;
+const script = vm.runInContext('__build(__panelHtml)', context);
+vm.runInContext(script, context, { filename: 'PANEL_HTML' });
+INPUT.steps.forEach((step, index) => {
+  try { vm.runInContext(step, context, { filename: 'step' + index }); }
+  catch (e) { context.__errors.push('step ' + index + ': ' + e.message); }
+});
+process.stdout.write(JSON.stringify({
+  out: context.__out,
+  posted: Array.from(context.__posted, String),
+  errors: Array.from(context.__errors, String),
+  html: Array.from(context.__html, String),
+  created: Array.from(context.__created, String),
+  pwned: context.__pwned === undefined ? null : String(context.__pwned),
+}));
+"##;
+
+        /// Corre o `PANEL_HTML` que embarca (com o tema posto por
+        /// `panel_html`) e depois cada passo, pela ordem, no mesmo contexto.
+        fn run_panel(steps: &[String]) -> serde_json::Value {
+            let input = serde_json::json!({
+                "html": panel_html(&Theme::dark((0, 120, 215))),
+                "steps": steps,
+            });
+            let program = format!("const INPUT = {input};\n{PANEL_DOM_HARNESS}");
+            let output = run_node_program(&program);
+            let result: serde_json::Value =
+                serde_json::from_str(&output).expect("o harness devolve JSON");
+            assert_eq!(
+                result["errors"],
+                serde_json::json!([]),
+                "o painel lancou excecoes"
+            );
+            result
+        }
+
+        fn posted(result: &serde_json::Value) -> Vec<String> {
+            result["posted"]
+                .as_array()
+                .expect("posted")
+                .iter()
+                .map(|message| message.as_str().expect("string").to_string())
+                .collect()
+        }
+
+        fn action_of(message: &str) -> String {
+            let value: serde_json::Value = serde_json::from_str(message).expect("json");
+            value["action"].as_str().unwrap_or_default().to_string()
+        }
+
+        fn save_message(id: Option<&str>, title: &str, body: &str, tags: &[&str]) -> String {
+            serde_json::json!({
+                "action": "note-save",
+                "args": { "id": id, "title": title, "body": body, "tags": tags },
+            })
+            .to_string()
+        }
+
+        /// Gate: o canal do painel so aceita pedidos de notas dentro dos
+        /// tectos, so o `note-save` passa dos 4 KiB, e um id que nao e um id
+        /// de nota (`../`, `C:\`, letras) morre no parser, antes do disco.
+        #[test]
+        fn notes_panel_messages_are_capped_and_note_ids_are_validated() {
+            assert_eq!(
+                parse_panel_message(r#"{"action":"notes-list","args":{}}"#),
+                Some(PanelMessage::NotesList)
+            );
+            assert_eq!(
+                parse_panel_message(r#"{"action":"notes-search","args":{"query":"  zettel  "}}"#),
+                Some(PanelMessage::NotesSearch("zettel".to_string()))
+            );
+            assert_eq!(
+                parse_panel_message(r#"{"action":"note-open","args":{"id":"202609231212"}}"#),
+                Some(PanelMessage::NoteOpen("202609231212".to_string()))
+            );
+            assert_eq!(
+                parse_panel_message(r#"{"action":"note-delete","args":{"id":"20260923121205-2"}}"#),
+                Some(PanelMessage::NoteDelete("20260923121205-2".to_string()))
+            );
+            let long_query = format!(
+                r#"{{"action":"notes-search","args":{{"query":"{}"}}}}"#,
+                "a".repeat(PANEL_QUERY_MAX_CHARS + 1)
+            );
+            assert_eq!(
+                parse_panel_message(&long_query),
+                None,
+                "busca acima do tecto"
+            );
+            assert_eq!(
+                parse_panel_message(r#"{"action":"notes-search","args":{"query":"   "}}"#),
+                None
+            );
+
+            // Ids que viravam caminho fora da pasta, ou nome de outro ficheiro.
+            for id in [
+                serde_json::json!("../../Windows/win"),
+                serde_json::json!("..\\..\\x"),
+                serde_json::json!("C:\\x"),
+                serde_json::json!("/etc/passwd"),
+                serde_json::json!("2026/../x"),
+                serde_json::json!("12a"),
+                serde_json::json!("-1"),
+                serde_json::json!(""),
+                serde_json::json!("1".repeat(65)),
+                serde_json::json!(202609231212u64),
+                serde_json::Value::Null,
+            ] {
+                for action in ["note-open", "note-delete"] {
+                    let body =
+                        serde_json::json!({"action": action, "args": {"id": id}}).to_string();
+                    assert_eq!(
+                        parse_panel_message(&body),
+                        None,
+                        "{action} aceitou o id {id}"
+                    );
+                }
+                let save = serde_json::json!({
+                    "action": "note-save",
+                    "args": {"id": id, "title": "t", "body": "b", "tags": []},
+                })
+                .to_string();
+                if !id.is_null() {
+                    assert_eq!(
+                        parse_panel_message(&save),
+                        None,
+                        "note-save aceitou o id {id}"
+                    );
+                }
+            }
+            assert_eq!(
+                parse_panel_message(
+                    r#"{"action":"note-open","args":{"id":"202609231212","path":"../x"}}"#
+                ),
+                None,
+                "campo a mais"
+            );
+
+            // Salvar: nota nova (id null) e nota existente.
+            assert_eq!(
+                parse_panel_message(&save_message(
+                    None,
+                    "  Título  ",
+                    "corpo\n",
+                    &[" a ", "", "b"]
+                )),
+                Some(PanelMessage::NoteSave(NoteEdit {
+                    id: None,
+                    title: "Título".to_string(),
+                    body: "corpo\n".to_string(),
+                    tags: vec!["a".to_string(), "b".to_string()],
+                }))
+            );
+            assert!(matches!(
+                parse_panel_message(&save_message(Some("202609231212"), "t", "b", &[])),
+                Some(PanelMessage::NoteSave(NoteEdit { id: Some(ref id), .. })) if id == "202609231212"
+            ));
+            let bad_saves = [
+                save_message(None, &"t".repeat(NOTE_TITLE_MAX_CHARS + 1), "b", &[]),
+                save_message(None, "linha\nquebrada", "b", &[]),
+                save_message(None, "t", &"b".repeat(NOTE_BODY_MAX_BYTES + 1), &[]),
+                save_message(None, "t", "b", &["x"; NOTE_TAGS_MAX + 1]),
+                save_message(None, "t", "b", &[&"x".repeat(NOTE_TAG_MAX_CHARS + 1)]),
+                r#"{"action":"note-save","args":{"id":null,"title":"t","body":"b","tags":[7]}}"#
+                    .to_string(),
+                r#"{"action":"note-save","args":{"id":null,"title":"t","body":"b"}}"#.to_string(),
+                r#"{"action":"note-save","args":{"id":null,"title":"t","body":"b","tags":[],"source":"https://x"}}"#
+                    .to_string(),
+            ];
+            for bad in &bad_saves {
+                assert_eq!(
+                    parse_panel_message(bad),
+                    None,
+                    "note-save aceito: {:.120}",
+                    bad
+                );
+            }
+
+            // O corpo no tecto passa, mesmo no pior caso do JSON (cada byte
+            // escrito como \u00XX): a mensagem fica muito acima dos 4 KiB.
+            let body = "b".repeat(NOTE_BODY_MAX_BYTES);
+            let big = save_message(None, "t", &body, &[]);
+            assert!(big.len() > PANEL_MESSAGE_MAX_BYTES);
+            assert!(matches!(
+                parse_panel_message(&big),
+                Some(PanelMessage::NoteSave(_))
+            ));
+            let controls = "\u{1}".repeat(NOTE_BODY_MAX_BYTES);
+            let worst = save_message(
+                None,
+                &"\u{e9}".repeat(NOTE_TITLE_MAX_CHARS),
+                &controls,
+                &["\u{e9}"; NOTE_TAGS_MAX],
+            );
+            assert!(
+                worst.len() > 5 * NOTE_BODY_MAX_BYTES,
+                "o JSON escapou os controlos"
+            );
+            assert!(
+                matches!(parse_panel_message(&worst), Some(PanelMessage::NoteSave(_))),
+                "o pior caso legitimo tem de caber"
+            );
+            let over = format!(
+                r#"{{"action":"note-save","args":{{"id":null,"title":"t","body":"b","tags":[]}},"pad":"{}"}}"#,
+                "x".repeat(NOTE_SAVE_MESSAGE_MAX_BYTES)
+            );
+            assert_eq!(
+                parse_panel_message(&over),
+                None,
+                "acima do tecto do note-save"
+            );
+
+            // Todos os OUTROS pedidos continuam presos aos 4 KiB.
+            let pad = "x".repeat(PANEL_MESSAGE_MAX_BYTES);
+            for small in [
+                r#"{"action":"ready","pad":"PAD"}"#,
+                r#"{"action":"close","pad":"PAD"}"#,
+                r#"{"action":"notes-list","args":{},"pad":"PAD"}"#,
+                r#"{"action":"notes-search","args":{"query":"x"},"pad":"PAD"}"#,
+                r#"{"action":"note-open","args":{"id":"202609231212"},"pad":"PAD"}"#,
+                r#"{"action":"note-delete","args":{"id":"202609231212"},"pad":"PAD"}"#,
+                r#"{"action":"search","args":{"query":"x"},"pad":"PAD"}"#,
+                r#"{"action":"open","args":{"input":"https://exemplo.pt"},"pad":"PAD"}"#,
+            ] {
+                let body = small.replace("PAD", &pad);
+                assert!(body.len() > PANEL_MESSAGE_MAX_BYTES);
+                assert_eq!(
+                    parse_panel_message(&body),
+                    None,
+                    "{:.60} passou dos 4 KiB",
+                    body
+                );
+                // O mesmo pedido, pequeno, e aceite: a recusa e so do tamanho.
+                assert!(
+                    parse_panel_message(&small.replace("PAD", "x")).is_some(),
+                    "{small}"
+                );
+            }
+        }
+
+        /// Gate: o editor do painel que embarca, conduzido como o utilizador
+        /// (Nova nota, escrever, Ctrl+S, buscar, abrir, Excluir, confirmar),
+        /// e cada pedido que ele manda levado pelo parser e pelo trabalho do
+        /// worker a uma pasta temporaria.
+        #[test]
+        fn notes_panel_saves_lists_searches_and_deletes_through_the_shipped_handler() {
+            let dir = NotesDir::new("roundtrip");
+            let store = dir.store();
+
+            // 1. Nova nota, escrita e salva com Ctrl+S; depois uma busca.
+            let first = run_panel(&[
+                "__out.readyFirst = __posted.length === 1 && JSON.parse(__posted[0]).action === 'ready';".into(),
+                "__posted.length = 0; window.neuraliaShowSection('notes');".into(),
+                "__out.notesVisible = __visible($('view-notes')) && !__visible($('view-history'));".into(),
+                "__click($('note-new'));".into(),
+                "__out.editorVisible = __visible($('note-body'));".into(),
+                "__type($('note-title'), 'Método Zettelkasten');".into(),
+                "__type($('note-body'), 'Uma ideia por nota.\\nLiga com [[202601010000]].');".into(),
+                "__type($('note-tags'), 'método,  zettel ,');".into(),
+                "__out.ctrlS = __key($('note-body'), 's', { ctrlKey: true }).defaultPrevented;".into(),
+                "__click($('note-back'));".into(),
+                "__type($('nq'), 'zettel');".into(),
+                "__drain();".into(),
+            ]);
+            assert_eq!(first["out"]["readyFirst"], true);
+            assert_eq!(first["out"]["notesVisible"], true);
+            assert_eq!(first["out"]["editorVisible"], true);
+            assert_eq!(first["out"]["ctrlS"], true, "Ctrl+S e do editor");
+            let sent = posted(&first);
+            let actions: Vec<String> = sent.iter().map(|m| action_of(m)).collect();
+            assert_eq!(
+                actions,
+                ["notes-list", "note-save", "notes-list", "notes-search"],
+                "{sent:?}"
+            );
+
+            // O note-save do painel grava na pasta.
+            let saved = match panel_request(&store, &sent[1], T0) {
+                NotesReply::Opened {
+                    cause: NoteOpened::Saved,
+                    note,
+                    ..
+                } => note,
+                other => panic!("salvar devolveu {other:?}"),
+            };
+            assert_eq!(saved.title, "Método Zettelkasten");
+            assert_eq!(
+                saved.body,
+                "Uma ideia por nota.\nLiga com [[202601010000]]."
+            );
+            assert_eq!(saved.tags, ["método", "zettel"]);
+            let file = dir.0.join(format!("{}.md", saved.id));
+            let text = std::fs::read_to_string(&file).expect("a nota esta no disco");
+            assert!(text.contains("title: Método Zettelkasten"), "{text}");
+            assert!(text.ends_with("Liga com [[202601010000]]."), "{text}");
+
+            // A lista e a busca que o painel pediu encontram-na.
+            match panel_request(&store, &sent[2], T0) {
+                NotesReply::Listed {
+                    query: None,
+                    total: 1,
+                    notes,
+                } => {
+                    assert_eq!(notes[0].id, saved.id);
+                }
+                other => panic!("lista devolveu {other:?}"),
+            }
+            match panel_request(&store, &sent[3], T0) {
+                NotesReply::Listed {
+                    query: Some(query),
+                    notes,
+                    ..
+                } => {
+                    assert_eq!(query, "zettel");
+                    assert_eq!(notes.len(), 1);
+                }
+                other => panic!("busca devolveu {other:?}"),
+            }
+            assert!(matches!(
+                panel_request(
+                    &store,
+                    r#"{"action":"notes-search","args":{"query":"inexistente"}}"#,
+                    T0
+                ),
+                NotesReply::Listed { total: 0, .. }
+            ));
+
+            // 2. A nota aberta no editor: editar e salvar outra vez mantem o
+            //    id; Excluir pede confirmacao e so depois manda o pedido.
+            let opened = panel_request(
+                &store,
+                &serde_json::json!({"action": "note-open", "args": {"id": saved.id}}).to_string(),
+                T0 + 60,
+            );
+            assert!(matches!(
+                opened,
+                NotesReply::Opened {
+                    cause: NoteOpened::Open,
+                    ..
+                }
+            ));
+            let second = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                notes_reply_script(&opened),
+                "__out.title = $('note-title').value;".into(),
+                "__type($('note-body'), $('note-body').value + '\\nMais uma linha.');".into(),
+                "__click($('note-save'));".into(),
+                "__click($('note-delete'));".into(),
+                "__out.askedFirst = __posted.length === 1 && __visible($('note-confirm'));".into(),
+                "__click($('note-confirm-yes'));".into(),
+            ]);
+            assert_eq!(second["out"]["title"], "Método Zettelkasten");
+            assert_eq!(second["out"]["askedFirst"], true, "Excluir pergunta antes");
+            let sent = posted(&second);
+            let actions: Vec<String> = sent.iter().map(|m| action_of(m)).collect();
+            assert_eq!(actions, ["note-save", "note-delete"], "{sent:?}");
+
+            match panel_request(&store, &sent[0], T0 + 120) {
+                NotesReply::Opened { note, .. } => {
+                    assert_eq!(note.id, saved.id, "salvar de novo nao cria outra nota");
+                    assert!(note.body.ends_with("Mais uma linha."));
+                    assert_eq!(note.updated_unix, T0 + 120);
+                    assert_eq!(note.created_unix, T0);
+                }
+                other => panic!("salvar devolveu {other:?}"),
+            }
+            assert_eq!(
+                panel_request(&store, &sent[1], T0 + 180),
+                NotesReply::Deleted {
+                    id: saved.id.clone()
+                }
+            );
+            assert!(!file.exists(), "a nota saiu da pasta");
+            assert!(
+                dir.0
+                    .join(zettel::TRASH_DIR)
+                    .join(format!("{}.md", saved.id))
+                    .is_file(),
+                "e foi para a lixeira"
+            );
+            assert!(matches!(
+                panel_request(&store, r#"{"action":"notes-list","args":{}}"#, T0),
+                NotesReply::Listed { total: 0, .. }
+            ));
+            assert_eq!(
+                panel_request(&store, &sent[1], T0 + 240),
+                NotesReply::Missing { id: saved.id }
+            );
+        }
+
+        /// Gate: a resposta ao salvar de uma nota nova da-lhe o id (o
+        /// salvar seguinte grava a MESMA nota), mas so enquanto o editor
+        /// ainda a mostra: com outra nota nova ja no editor, a resposta
+        /// atrasada nao lhe passa o id -- senao o salvar dela esmagava a
+        /// primeira. E um segundo Salvar antes do id nao cria outra nota.
+        #[test]
+        fn a_late_save_reply_never_hands_its_id_to_another_note() {
+            let dir = NotesDir::new("late");
+            let store = dir.store();
+            let start: Vec<String> = vec![
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                "__click($('note-new')); __type($('note-title'), 'Primeira');".into(),
+                "__click($('note-save')); __click($('note-save'));".into(),
+            ];
+            let first = run_panel(&start);
+            let sent = posted(&first);
+            assert_eq!(sent.len(), 1, "dois Salvar antes do id: {sent:?}");
+            let reply = panel_request(&store, &sent[0], T0);
+            let NotesReply::Opened { note: primeira, .. } = &reply else {
+                panic!("{reply:?}");
+            };
+
+            // A resposta chega com a Primeira ainda no editor: fica com o id.
+            let mut same = start.clone();
+            same.push(notes_reply_script(&reply));
+            same.push("__posted.length = 0; __type($('note-body'), 'mais');".into());
+            same.push("__click($('note-save'));".into());
+            let kept = posted(&run_panel(&same));
+            assert_eq!(kept.len(), 1);
+            assert!(matches!(
+                parse_panel_message(&kept[0]),
+                Some(PanelMessage::NoteSave(NoteEdit { id: Some(ref id), .. })) if *id == primeira.id
+            ));
+
+            // A resposta chega depois de "Nova nota": a Segunda fica nova.
+            let mut other = start;
+            other.push("__click($('note-new')); __type($('note-title'), 'Segunda');".into());
+            other.push(notes_reply_script(&reply));
+            other.push("__posted.length = 0; __click($('note-save'));".into());
+            let result = run_panel(&other);
+            let fresh = posted(&result);
+            assert_eq!(fresh.len(), 1);
+            assert_eq!(
+                parse_panel_message(&fresh[0]),
+                Some(PanelMessage::NoteSave(NoteEdit {
+                    id: None,
+                    title: "Segunda".to_string(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                }))
+            );
+            // E, gravada, e uma segunda nota: a Primeira fica como estava.
+            let NotesReply::Opened { note: segunda, .. } =
+                panel_request(&store, &fresh[0], T0 + 60)
+            else {
+                panic!("salvar a Segunda");
+            };
+            assert_ne!(segunda.id, primeira.id);
+            assert_eq!(
+                store.get(&primeira.id).expect("ler").expect("existe").title,
+                "Primeira"
+            );
+        }
+
+        /// Gate: uma nota com HTML e JS no titulo, no corpo, nas tags e na
+        /// fonte chega ao painel que embarca byte a byte como TEXTO. O
+        /// payload vai em JSON: aspas, `'); ...`, `</script>` e U+2028 nao
+        /// fecham nada. Nenhum elemento sai do que a nota diz.
+        #[test]
+        fn notes_render_keeps_hostile_note_text_inert() {
+            let dir = NotesDir::new("hostile");
+            let store = dir.store();
+            let target = store
+                .create("Alvo", "texto", Vec::new(), None, T0)
+                .expect("alvo");
+            let title = "<img src=x onerror=\"globalThis.__pwned='title'\">";
+            let body = format!(
+                "</script><script>globalThis.__pwned='script'</script>\n\
+                 '); globalThis.__pwned = 'quote'; ('\n\
+                 \" \\\" \\\\ \u{2028} \u{2029} ${{globalThis.__pwned='template'}}\n\
+                 Ver [[{}|<b onclick=\"globalThis.__pwned='alias'\">alvo</b>]] e [[nao-e-id]].",
+                target.id
+            );
+            let hostile = store
+                .create(
+                    title,
+                    &body,
+                    vec!["<i>tag</i>".to_string()],
+                    Some("https://example.com/?q=<script>alert(1)</script>".to_string()),
+                    T0 + 60,
+                )
+                .expect("nota hostil");
+            // O alvo ganha um backlink com o titulo hostil.
+            let listed = run_notes_command(&store, NotesCommand::List, T0);
+            let opened = run_notes_command(&store, NotesCommand::Open(hostile.id.clone()), T0);
+            let target_opened =
+                run_notes_command(&store, NotesCommand::Open(target.id.clone()), T0);
+            match &target_opened {
+                NotesReply::Opened { backlinks, .. } => {
+                    assert_eq!(backlinks.len(), 1);
+                    assert_eq!(backlinks[0].title, title);
+                }
+                other => panic!("{other:?}"),
+            }
+
+            let result = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                notes_reply_script(&listed),
+                "__out.listTitles = $('notes-list').children.map((b) => b.children[0].textContent);".into(),
+                notes_reply_script(&opened),
+                "__out.title = $('note-title').value; __out.body = $('note-body').value;".into(),
+                "__out.tags = $('note-tags').value; __out.source = $('note-source').textContent;".into(),
+                "__out.links = __buttons($('note-preview')).map((b) => b.textContent);".into(),
+                "__out.preview = $('note-preview').textContent;".into(),
+                "__click(__buttons($('note-preview'))[0]);".into(),
+                "__click($('note-source'));".into(),
+                notes_reply_script(&target_opened),
+                "__out.backlinks = __buttons($('note-backlinks')).map((b) => b.textContent);".into(),
+            ]);
+            let out = &result["out"];
+            assert_eq!(
+                result["pwned"],
+                serde_json::Value::Null,
+                "codigo da nota correu"
+            );
+            assert_eq!(
+                result["html"],
+                serde_json::json!([]),
+                "a nota passou por HTML"
+            );
+            for tag in result["created"].as_array().expect("created") {
+                assert!(
+                    matches!(tag.as_str(), Some("button" | "span" | "div")),
+                    "a nota criou um <{tag}>"
+                );
+            }
+            assert_eq!(out["listTitles"], serde_json::json!([title, "Alvo"]));
+            assert_eq!(out["title"], title);
+            assert_eq!(out["body"], body.as_str(), "o corpo chega byte a byte");
+            assert_eq!(out["tags"], "<i>tag</i>");
+            assert_eq!(
+                out["source"],
+                "https://example.com/?q=<script>alert(1)</script>"
+            );
+            // So o [[id|..]] valido vira link; o rotulo e texto.
+            assert_eq!(
+                out["links"],
+                serde_json::json!(["<b onclick=\"globalThis.__pwned='alias'\">alvo</b>"])
+            );
+            assert_eq!(
+                out["preview"],
+                body.as_str().replace(
+                    &format!(
+                        "[[{}|<b onclick=\"globalThis.__pwned='alias'\">alvo</b>]]",
+                        target.id
+                    ),
+                    "<b onclick=\"globalThis.__pwned='alias'\">alvo</b>"
+                )
+            );
+            assert_eq!(out["backlinks"], serde_json::json!([title]));
+            let sent: Vec<PanelMessage> = posted(&result)
+                .iter()
+                .map(|m| parse_panel_message(m).unwrap_or_else(|| panic!("recusado: {m}")))
+                .collect();
+            assert_eq!(
+                sent,
+                [
+                    PanelMessage::NoteOpen(target.id.clone()),
+                    PanelMessage::Open(
+                        "https://example.com/?q=<script>alert(1)</script>".to_string()
+                    ),
+                ]
+            );
+        }
+
+        /// Gate: o Ctrl+Shift+Z do mapa de teclas que embarca pede uma nota
+        /// sem mandar nada da pagina; o Ctrl+Z e o refazer dos campos
+        /// editaveis ficam com a pagina.
+        #[test]
+        fn ctrl_shift_z_on_a_page_posts_a_bare_note_request() {
+            let drive = r#"
+document.readyState = 'interactive';
+__fire('DOMContentLoaded');
+__drain();
+__fire('keydown', { key: 'z', ctrlKey: true });
+__fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true, target: new Element('textarea') });
+__fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true, target: Object.assign(new Element('div'), { isContentEditable: true }) });
+__fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
+"#;
+            let cases = [serde_json::json!({
+                "name": "keymap",
+                "href": "https://example.com/",
+                "script": NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", CAP),
+                "drive": drive,
+            })];
+            let program = format!(
+                "const INPUT = {};\n{}",
+                serde_json::json!({ "cases": cases }),
+                INJECTED_SCRIPT_HARNESS
+            );
+            let results: Vec<serde_json::Value> =
+                serde_json::from_str(&run_node_program(&program)).expect("harness json");
+            let sent = results[0]["posted"].as_array().expect("posted");
+            assert_eq!(
+                sent.len(),
+                1,
+                "so o Ctrl+Shift+Z fora de um campo: {sent:?}"
+            );
+            let message = sent[0].as_str().expect("string");
+            assert_eq!(
+                parse_ipc_message(message, CAP, 3),
+                Some(IpcAction::Note),
+                "{message}"
+            );
+            let value: serde_json::Value = serde_json::from_str(message).expect("json");
+            assert_eq!(
+                value["args"],
+                serde_json::json!({}),
+                "a pagina nao manda dados"
+            );
+        }
+
+        /// Gate: o `note` vai para a WebView que o mandou -- a coluna dela, o
+        /// Split, a WebView unica -- e o Split privado recusa sem ler. A
+        /// decisao repete-se na hora de ler, com o Split que existe entao.
+        #[test]
+        fn a_note_request_reads_its_own_webview_and_never_the_private_split() {
+            for col in 0..COMPARATOR_COLUMNS {
+                assert!(matches!(
+                    App::column_ipc_event_impl(col, IpcAction::Note),
+                    Some(UserEvent::NoteRequested(Some(PageTarget::Column(c)))) if c == col
+                ));
+            }
+            assert!(matches!(
+                App::split_ipc_event_impl(1, false, IpcAction::Note),
+                Some(UserEvent::NoteRequested(Some(PageTarget::Split)))
+            ));
+            assert!(matches!(
+                App::split_ipc_event_impl(1, true, IpcAction::Note),
+                Some(UserEvent::NoteRefusedPrivate)
+            ));
+            assert!(matches!(
+                common_ipc_event(IpcAction::Note),
+                Some(UserEvent::NoteRequested(None))
+            ));
+            // Na hora de ler.
+            assert_eq!(
+                note_capture_decision(Some(PageTarget::Split), Some(true)),
+                NoteCapture::RefusePrivate
+            );
+            assert_eq!(
+                note_capture_decision(Some(PageTarget::Split), Some(false)),
+                NoteCapture::Read
+            );
+            assert_eq!(
+                note_capture_decision(Some(PageTarget::Split), None),
+                NoteCapture::NoPage
+            );
+            for target in [
+                Some(PageTarget::Column(0)),
+                Some(PageTarget::Column(2)),
+                None,
+            ] {
+                for split in [None, Some(false), Some(true)] {
+                    assert_eq!(
+                        note_capture_decision(target, split),
+                        NoteCapture::Read,
+                        "{target:?} com split {split:?}"
+                    );
+                }
+            }
+            assert_eq!(NOTE_PRIVATE_REFUSAL, "Modo privado: notas não são criadas");
+        }
+
+        /// Gate: a selecao vira uma nota com a citacao, a fonte e a tag
+        /// "web"; o que a pagina devolve e cortado e validado outra vez.
+        #[test]
+        fn a_selection_becomes_a_quoted_note_with_its_source() {
+            let capture = |text: &str, url: &str, title: &str| {
+                serde_json::json!({ "text": text, "url": url, "title": title }).to_string()
+            };
+            let draft = note_draft_from_capture(
+                &capture(
+                    "  Linha 1\r\nLinha 2\n\n  Linha 4  \n",
+                    "https://example.com/artigo#parte",
+                    "  Artigo\tde   teste ",
+                ),
+                None,
+            )
+            .expect("nota");
+            assert_eq!(
+                draft,
+                NoteDraft {
+                    title: "Artigo de teste".to_string(),
+                    body: "> Linha 1\n> Linha 2\n>\n>   Linha 4\n\nFonte: https://example.com/artigo#parte\n"
+                        .to_string(),
+                    tags: vec!["web".to_string()],
+                    source: Some("https://example.com/artigo#parte".to_string()),
+                }
+            );
+
+            // Sem titulo na pagina: as primeiras palavras da selecao.
+            let untitled = note_draft_from_capture(
+                &capture(
+                    "um dois tres quatro cinco seis sete oito nove dez",
+                    "https://example.com/",
+                    "   ",
+                ),
+                None,
+            )
+            .expect("nota");
+            assert_eq!(untitled.title, "um dois tres quatro cinco seis sete oito");
+
+            // Nada selecionado.
+            for empty in ["", "   \n\t "] {
+                assert_eq!(
+                    note_draft_from_capture(&capture(empty, "https://example.com/", "T"), None),
+                    Err(NoteCaptureError::EmptySelection)
+                );
+            }
+            // Resposta que nao e o objeto do script.
+            for raw in [
+                "null".to_string(),
+                "\"texto\"".to_string(),
+                "nao e json".to_string(),
+                capture(
+                    &"a".repeat(NOTE_CAPTURE_MAX_BYTES),
+                    "https://example.com/",
+                    "T",
+                ),
+            ] {
+                assert_eq!(
+                    note_draft_from_capture(&raw, None),
+                    Err(NoteCaptureError::Unreadable),
+                    "{:.40}",
+                    raw
+                );
+            }
+
+            // A pagina pode mentir sobre o corte: o lado nativo corta.
+            let long = note_draft_from_capture(
+                &capture(
+                    &"q".repeat(NOTE_SELECTION_MAX_CHARS + 5_000),
+                    "https://example.com/",
+                    "T",
+                ),
+                None,
+            )
+            .expect("nota");
+            assert_eq!(
+                long.body.matches('q').count(),
+                NOTE_SELECTION_MAX_CHARS,
+                "a selecao fica no tecto"
+            );
+
+            // Enderecos que nao sao fonte: sem fonte e sem a linha "Fonte:".
+            let pdf_viewer = format!("{PDF_ORIGIN}/viewer.html");
+            for url in [
+                "javascript:alert(1)",
+                "file:///C:/Windows/win.ini",
+                "about:blank",
+                "data:text/html,<p>x</p>",
+                pdf_viewer.as_str(),
+            ] {
+                let draft =
+                    note_draft_from_capture(&capture("texto", url, "T"), None).expect("nota");
+                assert_eq!(draft.source, None, "{url}");
+                assert_eq!(draft.body, "> texto\n", "{url}");
+            }
+            // O endereco que o lado nativo conhece (Leitor, PDF) manda.
+            let from_pdf = note_draft_from_capture(
+                &capture("texto", &pdf_viewer, "Doc"),
+                Some("https://example.com/doc.pdf"),
+            )
+            .expect("nota");
+            assert_eq!(
+                from_pdf.source.as_deref(),
+                Some("https://example.com/doc.pdf")
+            );
+            // E so no Leitor e no PDF, na WebView unica.
+            let known = Some("https://example.com/doc.pdf");
+            for surface in [Surface::Reader, Surface::Pdf] {
+                assert_eq!(
+                    note_page_source(None, surface, known).as_deref(),
+                    known,
+                    "{surface:?}"
+                );
+            }
+            for (target, surface) in [
+                (None, Surface::External),
+                (None, Surface::Home),
+                (Some(PageTarget::Column(0)), Surface::Comparator),
+                (Some(PageTarget::Split), Surface::Comparator),
+                (Some(PageTarget::Column(1)), Surface::Pdf),
+            ] {
+                assert_eq!(
+                    note_page_source(target, surface, known),
+                    None,
+                    "{target:?} {surface:?}"
+                );
+            }
+
+            // E a nota vai para a pasta, pelo mesmo trabalho do worker.
+            let dir = NotesDir::new("selection");
+            let store = dir.store();
+            match run_notes_command(&store, NotesCommand::Create(draft), T0) {
+                NotesReply::Opened {
+                    cause: NoteOpened::Created,
+                    note,
+                    ..
+                } => {
+                    let text = std::fs::read_to_string(dir.0.join(format!("{}.md", note.id)))
+                        .expect("ficheiro");
+                    assert!(
+                        text.contains("source: https://example.com/artigo#parte"),
+                        "{text}"
+                    );
+                    assert!(text.contains("tags: [web]"), "{text}");
+                    assert!(
+                        text.ends_with("Fonte: https://example.com/artigo#parte\n"),
+                        "{text}"
+                    );
+                }
+                other => panic!("criar devolveu {other:?}"),
+            }
+        }
+
+        /// Gate: com o teclado na janela (Home ou barra), Ctrl+Shift+Z e uma
+        /// nota nova; o Ctrl+Z sozinho nao e.
+        #[test]
+        fn ctrl_shift_z_in_the_main_window_is_a_new_note() {
+            use winit::keyboard::ModifiersState;
+            let key = |text: &str| Key::Character(text.into());
+            let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+            assert_eq!(
+                main_window_shortcut(&key("Z"), ctrl_shift),
+                Some(MainShortcut::NewNote)
+            );
+            assert_eq!(
+                main_window_shortcut(&key("z"), ctrl_shift),
+                Some(MainShortcut::NewNote)
+            );
+            assert_eq!(
+                main_window_shortcut(&key("z"), ModifiersState::CONTROL),
+                None
+            );
+            // O script que a Home manda ao painel: sem a pagina das notas, nada.
+            let program = format!(
+                r#"
+const vm = require('node:vm');
+const script = {script};
+const calls = [];
+vm.runInNewContext(script, {{ window: {{ __neuraliaNotes: {{ newNote: () => calls.push('new') }} }} }});
+const quiet = vm.runInNewContext(script, {{ window: {{}} }});
+console.log(JSON.stringify({{ calls, quiet: quiet === undefined }}));
+"#,
+                script = serde_json::to_string(PANEL_NEW_NOTE_SCRIPT).expect("json")
+            );
+            assert_eq!(
+                run_node_program(&program).trim(),
+                r#"{"calls":["new"],"quiet":true}"#
+            );
+        }
     }
 }
 
@@ -20531,6 +22654,15 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       if (e.shiftKey && key === 'r') { e.preventDefault(); act('reload'); return; }
       if (e.shiftKey && (key === 'i' || key === 'j' || key === 'c')) {
         e.preventDefault(); act('devtools'); return;
+      }
+      // Ctrl+Shift+Z: nota com o texto selecionado. A pagina so pede; a
+      // selecao e lida pelo lado nativo. Num campo editavel continua a ser o
+      // refazer do editor.
+      if (e.shiftKey && key === 'z') {
+        var field = e.target || {};
+        var fieldTag = (field.tagName || '').toUpperCase();
+        if (fieldTag === 'INPUT' || fieldTag === 'TEXTAREA' || field.isContentEditable) { return; }
+        e.preventDefault(); act('note'); return;
       }
       if (key === 'u') { e.preventDefault(); act('viewsource'); return; }
       switch (key) {
