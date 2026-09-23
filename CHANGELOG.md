@@ -4,6 +4,24 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+### Added
+- **feat/tools — Pomodoro (c58783f, fd02f27, 1b9f846, 956e92d, 1278242):** botão na linha do título, na barra e na Home, com o tempo que falta ("mm:ss", "⏸ mm:ss" pausado) sem tirar largura às colunas das IAs. Clique inicia, pausa e retoma; o botão direito abre o menu (Pular fase, Parar, 25/5, 50/10 e 15/3 min); `pomodoro:` funciona na omnibox e na paleta. No fim de cada fase há um som, um aviso no meio da janela e, com ela minimizada ou atrás de outra, o botão a piscar na barra de tarefas sem roubar o foco; o aviso que a janela não viu aparece quando ela volta. As durações ficam em `<data_dir>/pomodoro`.
+- **feat/tools — Notas (Zettelkasten) (9603fac, 42653f4, d5c7cd7, 956e92d, bfb8156):** aba Notas no painel do Ctrl+H, com busca, lista, editor (título, corpo, tags), ligações `[[id]]`, notas que ligam para esta e Excluir para `.trash`, em Markdown em `<data_dir>/zettel`. Ctrl+Shift+Z numa página cria uma nota da seleção com a fonte (nunca no Split privado); na Home abre uma nota em branco. O salvar leva a revisão aberta: se a nota mudou fora deste editor (outra janela, o Obsidian), o texto vai para uma cópia "(conflito)" em vez de a esmagar.
+- **feat/tools — Respiração (c58783f):** botão que abre o vídeo de respiração guiada (método Wim Hof) no painel lateral, em WebView2 InPrivate, sem câmera nem microfone, sem login e preso ao YouTube.
+- **feat/tools — Ler em voz alta no PDF e no Modo Leitura (068bd8f, f334e85, 956e92d; SPEC-0110, fase offline):** Ctrl+Shift+U ou o botão de alto-falante lê frase a frase com as vozes instaladas do Windows, com realce, velocidade e a voz escolhida por língua; a língua é a do documento (`/Lang` do PDF ou o texto). Por omissão só vozes locais: uma voz online só aparece se o runtime do WebView2 a oferecer, e só por escolha.
+
+### Fixed
+- **feat/tools — uma nota a meio nunca se perde quando o painel fecha (bfb8156):** todas as saídas do painel do Ctrl+H (X, Ctrl+H, abrir um item, outro painel, Home, pesquisa nova, a tela de erro, a Web completa, o Leitor, o PDF, um link externo, fechar a janela) passam por uma saída única que grava o que o editor tinha por salvar antes de a página sair, uma vez só. Antes, a troca de superfície (`destroy_web_surfaces`) largava o painel sem gravar. Uma cópia que chega de um painel já fechado é gravada em vez de ser substituída pela do painel seguinte; com a fila das notas cheia, o texto espera a vez em vez de ser descartado; ao fechar a janela, a fila inteira chega ao disco (no máximo 3 s de espera). A cópia do editor segue a escrita com no máximo 200 ms de atraso, mesmo a escrever sem parar (antes, uma rajada inteira ficava sem cópia até a pausa).
+- **feat/tools — teclado de volta ao fechar um painel (d5c7cd7, bfb8156):** fechar a Respiração, outro serviço ou o Ctrl+H na Home devolve o teclado à omnibox; fora da Home, à janela.
+
+### Known limitations
+- Um fecho do painel pelo lado nativo (Ctrl+H, outro painel, Home, troca de superfície, fechar a janela) perde o que se escreveu nos últimos 200 ms antes dele.
+- Fechar o painel enquanto o primeiro Salvar de uma nota **nova** ainda está a caminho pode gravá-la em duplicado (nunca perdida).
+- Ler em voz alta: a voz online depende do que o runtime do WebView2 oferece; o motor online próprio (API oficial, com chave, custo e envio do texto decididos pelo dono) não está nesta versão.
+
+### Testing
+- **feat/tools (bfb8156, 1278242):** gates sobre o caminho que embarca, cada um visto vermelho com a sua sabotagem e restaurado byte a byte: `every_way_out_of_the_side_panel_saves_the_note_being_typed_once` (o editor que embarca, o parser do canal, o `SidePanel` e o `ZettelWorker` real sobre uma pasta temporária, por cada saída), `a_note_sent_by_a_panel_that_already_closed_is_saved_and_never_reaches_the_next_one`, `a_full_notes_queue_still_takes_the_note_of_a_closing_panel`, `the_native_copy_of_a_note_is_never_more_than_200_ms_behind`, `closing_a_panel_gives_the_keyboard_back` (um EDIT Win32 escondido e `GetFocus`), `the_app_tick_announces_a_phase_end_as_the_window_can_see_it` e `a_note_request_reads_its_own_webview_and_never_the_private_split` sobre os tipos do comparador. O painel do Ctrl+H só sai por `SidePanel::dismiss`: largá-lo de outra forma já não compila.
+
 ## [2.1.6] - 2026-09-23
 
 ### Changed
