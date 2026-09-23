@@ -16,6 +16,11 @@ use std::{
 
 use image::RgbaImage;
 
+use crate::gemini_live::{
+    LIVE_PROTOCOL, LiveAction, LiveIndicator, LiveKeyStore, LiveMessage, LivePanel,
+    live_ipc_message, live_page_url, live_panel_navigation, live_step, live_theme_script,
+    redact_debug_secrets, serve_live_asset,
+};
 #[cfg(test)]
 use crate::ipc::constant_time_eq;
 use crate::ipc::{IpcAction, parse_ipc_message};
@@ -52,11 +57,12 @@ use windows_sys::Win32::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
             ES_AUTOHSCROLL, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
             GetForegroundWindow, GetParent, GetWindowTextLengthW, GetWindowTextW,
-            GetWindowThreadProcessId, IDYES, IsZoomed, MB_ICONINFORMATION, MB_OK, MB_YESNO,
-            MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
-            SendMessageW, SetParent, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD,
-            TPM_RIGHTBUTTON, TrackPopupMenu, WM_CANCELMODE, WM_CAPTURECHANGED, WM_KEYDOWN,
-            WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+            GetWindowThreadProcessId, IDYES, IsZoomed, MB_DEFBUTTON2, MB_ICONINFORMATION,
+            MB_ICONWARNING, MB_OK, MB_YESNO, MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE,
+            SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetParent,
+            SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+            TrackPopupMenu, WM_CANCELMODE, WM_CAPTURECHANGED, WM_KEYDOWN, WS_CHILD,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -67,7 +73,7 @@ use winit::{
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, NamedKey},
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
-    window::{Fullscreen, Icon, Window, WindowId},
+    window::{CursorIcon, Fullscreen, Icon, Window, WindowId},
 };
 use wry::{
     NewWindowResponse, PermissionKind, PermissionResponse, WebView, WebViewBuilder,
@@ -82,6 +88,15 @@ enum PageTarget {
 
 #[derive(Debug)]
 enum UserEvent {
+    /// Escolha de tema feita no menu do botao Home.
+    ThemeChosen(ThemeChoice),
+    /// Pedido da pagina local do painel lateral (canal proprio).
+    Panel(PanelMessage),
+    /// Pedido da pagina do painel do Gemini Live (canal proprio, lista
+    /// fechada em `gemini_live::parse_live_message`).
+    Live(LiveMessage),
+    /// "Abrir?" do aviso do Gmail: Sim (true) ou Nao.
+    GmailAnswer(bool),
     HomeRequested,
     /// Voltar um nivel: de ecra completo para tres colunas, de la para a Home.
     BackRequested,
@@ -125,6 +140,11 @@ enum UserEvent {
     },
     MemoryCleared(Result<(), String>),
     ResearchAnswer {
+        source_index: usize,
+        text: String,
+    },
+    /// Pergunta enviada na caixa de uma coluna: vai tambem as outras.
+    AskEverywhere {
         source_index: usize,
         text: String,
     },
@@ -189,6 +209,14 @@ enum UserEvent {
     },
 }
 
+/// O que fazer com um pedido de split conforme a superficie atual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitFallback {
+    OpenSplit,
+    OpenWeb,
+    Ignore,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Surface {
     Home,
@@ -219,7 +247,8 @@ const AUTO_SCROLL_PROMPT_SECONDS: u64 = 20;
 /// WebViews presos na geometria anterior ate o primeiro movimento do rato.
 const COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS: [u64; 2] = [40, 220];
 /// Quanto tempo o aviso de correio novo fica no canto.
-const GMAIL_TOAST_SECONDS: u64 = 7;
+/// Com a pergunta "Abrir?" o aviso fica mais tempo a vista.
+const GMAIL_TOAST_SECONDS: u64 = 12;
 /// Quantas entradas do historico a caixa "history:" mostra.
 const HISTORY_RECENT_LIMIT: usize = 20;
 /// Tecto, em chars, de cada campo que o monitor do Gmail nos envia. O script
@@ -351,36 +380,16 @@ const AUTO_SCROLL_SCRIPT: &str = r#"
 })();
 "#;
 
-/// Aviso curto dentro da propria pagina: a barra nativa nao esta sempre visivel.
-const AUTO_SCROLL_TOAST: &str = r#"
-(function (on) {
-  var id = 'neuralia-autoscroll-toast';
-  var el = document.getElementById(id);
-  if (!el) {
-    el = document.createElement('div');
-    el.id = id;
-    document.documentElement.appendChild(el);
-  }
-  el.textContent = on ? 'Rolagem automatica ligada — __SECONDS__s (F8 desliga)' : 'Rolagem automatica desligada';
-  el.setAttribute('style', [
-    'position:fixed', 'left:50%', 'bottom:24px', 'transform:translateX(-50%)',
-    'z-index:2147483647', 'padding:10px 18px', 'border-radius:999px',
-    'background:rgba(17,19,20,.92)', 'color:#fff',
-    'font:600 13px Segoe UI, system-ui, sans-serif',
-    'box-shadow:0 8px 28px rgba(0,0,0,.35)', 'pointer-events:none',
-    'opacity:1', 'transition:opacity .4s ease'
-  ].join(';'));
-  clearTimeout(window.__neuralia_toast_timer);
-  window.__neuralia_toast_timer = setTimeout(function () {
-    el.style.opacity = '0';
-  }, 2200);
-})(__ON__);
-"#;
-
 /// O que esta debaixo do rato no chrome nativo do comparador.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BarHit {
     Home,
+    /// ‹ e › da fonte aberta ao lado de uma coluna, junto do rotulo dela.
+    Back,
+    Forward,
+    /// ‹ e › de cada IA, logo depois do "+" da coluna.
+    ColumnBack(usize),
+    ColumnForward(usize),
     Column(usize),
     AddTab(usize),
     ContextTab {
@@ -395,6 +404,11 @@ enum BarHit {
     SplitExpand,
     SplitClose,
     Private,
+    /// Icones do canto direito: servicos no painel e avisos do Gmail.
+    Service(Service),
+    GmailToggle,
+    /// O olho: liga e desliga o Gemini Live (tela, camera e microfone).
+    GeminiLive,
     WindowMinimize,
     WindowMaximize,
     WindowClose,
@@ -412,6 +426,8 @@ struct BarColumns {
     /// Ha uma gaveta aberta: os botoes do Split ocupam o canto direito e os
     /// chips tem de parar antes deles.
     split_active: bool,
+    /// Largura logica do painel lateral a direita; as colunas ficam antes dele.
+    panel_width: f64,
 }
 
 impl BarColumns {
@@ -423,6 +439,7 @@ impl BarColumns {
             weights: [1.0; COMPARATOR_COLUMNS],
             minimized: [false; COMPARATOR_COLUMNS],
             split_active: false,
+            panel_width: 0.0,
         }
     }
 }
@@ -434,6 +451,10 @@ struct BarLayout {
     visible: bool,
     height: f64,
     home: UiRect,
+    back: UiRect,
+    forward: UiRect,
+    column_back: [UiRect; COMPARATOR_COLUMNS],
+    column_forward: [UiRect; COMPARATOR_COLUMNS],
     /// Por coluna: a pilula do provedor sobre a sua faixa, ou -- se estiver
     /// minimizada -- o chip compacto encostado aos controlos da direita.
     columns: [UiRect; COMPARATOR_COLUMNS],
@@ -504,6 +525,10 @@ impl BarLayout {
                 visible: false,
                 height: 0.0,
                 home: empty,
+                back: empty,
+                forward: empty,
+                column_back: [empty; COMPARATOR_COLUMNS],
+                column_forward: [empty; COMPARATOR_COLUMNS],
                 columns: [empty; COMPARATOR_COLUMNS],
                 minimized: [false; COMPARATOR_COLUMNS],
                 add_tabs: [empty; COMPARATOR_COLUMNS],
@@ -554,6 +579,8 @@ impl BarLayout {
 
         let mut columns_rect = [empty; COMPARATOR_COLUMNS];
         let mut plus_rect = [empty; COMPARATOR_COLUMNS];
+        let mut column_back = [empty; COMPARATOR_COLUMNS];
+        let mut column_forward = [empty; COMPARATOR_COLUMNS];
         let mut tabs = [[empty; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS];
         let mut tab_indices = [[0usize; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS];
         let mut tab_counts = [0usize; COMPARATOR_COLUMNS];
@@ -566,7 +593,7 @@ impl BarLayout {
         // funcao que posiciona os WebViews: depois de arrastar um divisor o
         // rotulo continua sobre a sua coluna, e o hit-testing com ele.
         let spans = visible_column_spans(
-            client_width / scale,
+            (client_width / scale - columns.panel_width).max(1.0),
             columns.count,
             &columns.weights,
             &columns.minimized,
@@ -591,9 +618,9 @@ impl BarLayout {
         } else {
             hidden.len() as f64 * chip_w + chip_gap * hidden.len().saturating_sub(1) as f64
         };
-        let controls_left = right_controls(client_width, scale, columns.split_active)
-            .private
-            .x;
+        let controls = right_controls(client_width, scale, columns.split_active);
+        let controls_left = controls.leftmost();
+        let (back, forward) = controls.split_nav.unwrap_or((empty, empty));
         let reserved = if hidden.is_empty() {
             0.0
         } else {
@@ -611,7 +638,11 @@ impl BarLayout {
             // `available >= provider_width + plus_width + gap`, o que tornava o
             // `.min()` de baixo matematicamente morto e a pilula nunca encolhia.
             let available = (right - left).max(0.0);
-            let pill = provider_width.min((available - plus_width - gap).max(0.0));
+            // "+", ‹ e › depois da pilula: ela encolhe primeiro.
+            let nav_width = plus_width;
+            let nav_gap = 4.0 * scale;
+            let reserved_after = plus_width + gap + 2.0 * (nav_width + nav_gap);
+            let pill = provider_width.min((available - reserved_after).max(0.0));
             columns_rect[span.index] = UiRect {
                 x: left,
                 y: row_y,
@@ -631,6 +662,21 @@ impl BarLayout {
                     0.0
                 },
                 height: row_h - 4.0 * scale,
+            };
+            // ‹ e › desta IA. Tal como o "+", ou cabem na faixa ou nao existem.
+            let back_x = plus_x + plus_width + nav_gap;
+            let forward_x = back_x + nav_width + nav_gap;
+            let fits = forward_x + nav_width <= right;
+            column_back[span.index] = UiRect {
+                x: back_x,
+                y: row_y + 2.0 * scale,
+                width: if fits { nav_width } else { 0.0 },
+                height: row_h - 4.0 * scale,
+            };
+            column_forward[span.index] = UiRect {
+                x: forward_x,
+                width: if fits { nav_width } else { 0.0 },
+                ..column_back[span.index]
             };
         }
 
@@ -728,6 +774,10 @@ impl BarLayout {
             visible: true,
             height,
             home,
+            back,
+            forward,
+            column_back,
+            column_forward,
             columns: columns_rect,
             minimized: columns.minimized,
             add_tabs: plus_rect,
@@ -778,6 +828,20 @@ impl BarLayout {
         if self.home.contains(x, y) {
             return Some(BarHit::Home);
         }
+        if self.back.contains(x, y) {
+            return Some(BarHit::Back);
+        }
+        if self.forward.contains(x, y) {
+            return Some(BarHit::Forward);
+        }
+        for index in 0..self.columns_len {
+            if self.column_back[index].contains(x, y) {
+                return Some(BarHit::ColumnBack(index));
+            }
+            if self.column_forward[index].contains(x, y) {
+                return Some(BarHit::ColumnForward(index));
+            }
+        }
         for index in 0..self.columns_len {
             if self.add_tabs[index].contains(x, y) {
                 return Some(BarHit::AddTab(index));
@@ -812,8 +876,14 @@ unsafe fn apply_omnibox_interactivity(edit: HWND, surface: Surface) {
 #[derive(Debug, Clone, Copy)]
 struct RightControls {
     private: UiRect,
+    /// Videochamada, WhatsApp, YouTube e Gmail, a esquerda do Privado.
+    services: [UiRect; 4],
+    /// Gemini Live, a esquerda dos servicos: o primeiro dos controlos.
+    live: UiRect,
     /// Rotulo, expandir e fechar da gaveta; `None` quando nao ha gaveta.
     split: Option<(UiRect, UiRect, UiRect)>,
+    /// ‹ e › da fonte da gaveta, a esquerda do rotulo.
+    split_nav: Option<(UiRect, UiRect)>,
 }
 
 /// Geometria dos controlos encostados a direita. A mesma conta estava escrita
@@ -847,21 +917,80 @@ fn right_controls(client_width: f64, scale: f64, split_active: bool) -> RightCon
         (label, expand, close)
     });
 
-    let right = match split {
-        Some((label, _, _)) => label.x - 6.0 * scale,
+    let split_nav = split.map(|(label, _, _)| {
+        let size = row_h - 4.0 * scale;
+        let forward = UiRect {
+            x: label.x - 6.0 * scale - size,
+            y: row_y + 2.0 * scale,
+            width: size,
+            height: size,
+        };
+        let back = UiRect {
+            x: forward.x - 4.0 * scale - size,
+            ..forward
+        };
+        (back, forward)
+    });
+    let right = match split_nav {
+        Some((back, _)) => back.x - 6.0 * scale,
         None => client_width - margin,
     };
+    // Botoes redondos so com icone, como no Chrome: Privado a direita e, a
+    // esquerda dele, videochamada, WhatsApp, YouTube e Gmail.
+    let icon = row_h;
+    let icon_gap = 4.0 * scale;
     let private = UiRect {
-        x: right - 78.0 * scale,
+        x: right - icon,
         y: row_y,
-        width: 78.0 * scale,
-        height: row_h,
+        width: icon,
+        height: icon,
+    };
+    let services: [UiRect; 4] = std::array::from_fn(|index| UiRect {
+        x: private.x - (4 - index) as f64 * (icon + icon_gap),
+        y: row_y,
+        width: icon,
+        height: icon,
+    });
+    let live = UiRect {
+        x: services[0].x - (icon + icon_gap),
+        y: row_y,
+        width: icon,
+        height: icon,
     };
 
-    RightControls { private, split }
+    RightControls {
+        private,
+        services,
+        live,
+        split,
+        split_nav,
+    }
 }
 
+impl RightControls {
+    /// Onde comecam os controlos da direita: o resto da barra acaba aqui.
+    fn leftmost(&self) -> f64 {
+        self.live.x
+    }
+}
+
+/// O que cada icone do canto direito faz, na ordem de `RightControls::services`.
+const SERVICE_BUTTON_HITS: [BarHit; 4] = [
+    BarHit::Service(Service::Meet),
+    BarHit::Service(Service::WhatsApp),
+    BarHit::Service(Service::YouTube),
+    BarHit::GmailToggle,
+];
+
 fn right_controls_hit(controls: RightControls, x: f64, y: f64) -> Option<BarHit> {
+    if controls.live.contains(x, y) {
+        return Some(BarHit::GeminiLive);
+    }
+    for (rect, hit) in controls.services.iter().zip(SERVICE_BUTTON_HITS) {
+        if rect.contains(x, y) {
+            return Some(hit);
+        }
+    }
     if controls.private.contains(x, y) {
         return Some(BarHit::Private);
     }
@@ -1054,6 +1183,7 @@ fn plan_tab_row(tabs: &[ContextTab], groups: &[ContextGroup]) -> TabRow {
     // A pilula vem sempre antes das suas abas. Se o corte caiu no meio de um
     // grupo, a pilula ficou de fora -- desce-se ate a proxima pilula ou ate
     // uma aba solta, em vez de mostrar orfas.
+    let window_start = start;
     while start < full.len() {
         match full[start] {
             TabSlot::Group(_) => break,
@@ -1063,6 +1193,38 @@ fn plan_tab_row(tabs: &[ContextTab], groups: &[ContextGroup]) -> TabRow {
     }
 
     let mut row = TabRow::empty();
+    if start == full.len() && window_start < full.len() {
+        // O corte caiu dentro de um grupo com mais abas abertas do que cabem e
+        // nao ha nada inteiro depois dele: a linha ficava vazia e a pilula --
+        // o unico caminho para fechar ou reabrir o grupo -- sumia. Mostra-se a
+        // pilula antes das abas recentes do grupo, e as pilulas dos grupos
+        // fechados anteriores enquanto houver lugar.
+        let mut kept: Vec<TabSlot> = Vec::new();
+        for slot in full[window_start..].iter().copied() {
+            if let TabSlot::Tab(index) = slot
+                && let Some(group) = group_of(index)
+                && !kept.contains(&TabSlot::Group(group))
+            {
+                kept.push(TabSlot::Group(group));
+            }
+            kept.push(slot);
+        }
+        let mut lead: Vec<TabSlot> = Vec::new();
+        for slot in full[..window_start].iter().rev().copied() {
+            if kept.len() + lead.len() >= MAX_VISIBLE_TAB_SLOTS {
+                break;
+            }
+            if let TabSlot::Group(group) = slot
+                && groups[group].collapsed
+            {
+                lead.push(slot);
+            }
+        }
+        for slot in lead.into_iter().rev().chain(kept) {
+            row.push(slot);
+        }
+        return row;
+    }
     for slot in full[start..].iter().copied() {
         row.push(slot);
     }
@@ -1272,6 +1434,9 @@ struct ComparatorState {
     next_group_id: u64,
     /// Contador das identidades de abas. Nunca reutiliza durante a sessao.
     next_context_id: u64,
+    /// Largura logica ocupada a direita por um painel lateral aberto (0 sem
+    /// painel): as colunas repartem so o que sobra, como no Chrome.
+    panel_width: f64,
 }
 
 /// Janelas da palette nativa: o popup que desenha a caixa e o EDIT onde o
@@ -1306,6 +1471,7 @@ fn bar_columns(comp: &ComparatorState) -> BarColumns {
     if comp.expanded.is_some() || comp.split.is_some() {
         return BarColumns {
             split_active: comp.split.is_some(),
+            panel_width: comp.panel_width,
             ..BarColumns::even(comp.views.len())
         };
     }
@@ -1314,6 +1480,7 @@ fn bar_columns(comp: &ComparatorState) -> BarColumns {
         weights: comp.weights,
         minimized: comp.minimized,
         split_active: false,
+        panel_width: comp.panel_width,
     }
 }
 
@@ -1539,6 +1706,9 @@ static RESIZE_X: AtomicI32 = AtomicI32::new(0);
 static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_MOUSEMOVE: u32 = 0x0200;
+/// Chega depois de `track_mouse_leave`: o rato saiu de um botao nativo.
+const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_RBUTTONUP: u32 = 0x0205;
 
 /// Consulta opcional para automacao/benchmarks. Em producao a Home abre em
 /// repouso e nao envia texto a nenhum fornecedor sem acao do utilizador.
@@ -1807,8 +1977,30 @@ unsafe extern "system" fn gmail_toast_subclass(
     wparam: WPARAM,
     lparam: LPARAM,
     _subclass_id: usize,
-    _reference_data: usize,
+    reference_data: usize,
 ) -> LRESULT {
+    // A pergunta recebe cliques: um STATIC devolve HTTRANSPARENT.
+    if message == WM_NCHITTEST {
+        return HTCLIENT as LRESULT;
+    }
+    if message == WM_LBUTTONUP && reference_data != 0 {
+        let mut client = RECT::default();
+        if GetClientRect(hwnd, &mut client) != 0 {
+            let scale = ((client.bottom - client.top) as f64 / GMAIL_TOAST_HEIGHT).max(1.0);
+            let (open, no) = gmail_toast_buttons(&client, scale);
+            let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
+            let y = ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32;
+            let inside =
+                |rect: &RECT| x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
+            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+            if inside(&open) {
+                let _ = proxy.send_event(UserEvent::GmailAnswer(true));
+            } else if inside(&no) {
+                let _ = proxy.send_event(UserEvent::GmailAnswer(false));
+            }
+        }
+        return 0;
+    }
     if message == WM_PAINT {
         let mut paint = PAINTSTRUCT::default();
         let hdc = BeginPaint(hwnd, &mut paint);
@@ -1823,6 +2015,8 @@ unsafe extern "system" fn gmail_toast_subclass(
                 let scale = ((client.bottom - client.top) as f64 / GMAIL_TOAST_HEIGHT).max(1.0);
                 let title_font = create_font((-13.0 * scale) as i32, FW_BOLD as i32);
                 let body_font = create_font((-12.0 * scale) as i32, FW_NORMAL as i32);
+                let (open_button, no_button) = gmail_toast_buttons(&client, scale);
+                let buttons_left = open_button.left - (8.0 * scale) as i32;
                 let old_font = SelectObject(hdc, title_font as _);
                 SetBkMode(hdc, TRANSPARENT as i32);
 
@@ -1830,12 +2024,12 @@ unsafe extern "system" fn gmail_toast_subclass(
                 let mut title = RECT {
                     left: (16.0 * scale) as i32,
                     top: (7.0 * scale) as i32,
-                    right: client.right - (14.0 * scale) as i32,
+                    right: buttons_left,
                     bottom: (28.0 * scale) as i32,
                 };
                 draw_text(
                     hdc,
-                    "Gmail · novo e-mail",
+                    "Gmail · novo e-mail — abrir?",
                     &mut title,
                     DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
                 );
@@ -1849,7 +2043,7 @@ unsafe extern "system" fn gmail_toast_subclass(
                 let mut body = RECT {
                     left: (16.0 * scale) as i32,
                     top: (28.0 * scale) as i32,
-                    right: client.right - (14.0 * scale) as i32,
+                    right: buttons_left,
                     bottom: client.bottom - (7.0 * scale) as i32,
                 };
                 draw_text(
@@ -1858,6 +2052,23 @@ unsafe extern "system" fn gmail_toast_subclass(
                     &mut body,
                     DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
                 );
+
+                for (rect, label, primary) in
+                    [(open_button, "Abrir", true), (no_button, "Não", false)]
+                {
+                    let pill = UiRect {
+                        x: rect.left as f64,
+                        y: rect.top as f64,
+                        width: (rect.right - rect.left) as f64,
+                        height: (rect.bottom - rect.top) as f64,
+                    };
+                    let style = if primary {
+                        PillStyle::new(theme.accent, theme.accent, on_color(theme.accent))
+                    } else {
+                        PillStyle::new(theme.surface_line, theme.surface_line, theme.fg)
+                    };
+                    draw_pill(hdc, pill, label, style, scale, body_font, theme.surface);
+                }
 
                 SelectObject(hdc, old_font);
                 DeleteObject(title_font as _);
@@ -1868,6 +2079,1055 @@ unsafe extern "system" fn gmail_toast_subclass(
         return 0;
     }
     DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+// Popups auxiliares owned pela janela principal -- divisores do comparador,
+// botao de saida, splash e aviso do Gmail. Nascem invisiveis: WS_VISIBLE no
+// CreateWindowExW mostra-os com SW_SHOW, que os ativa.
+const AUX_POPUP_EX_STYLE: u32 = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+const AUX_POPUP_STYLE: u32 = WS_POPUP;
+
+/// Mostra um popup auxiliar SEM lhe dar a ativacao. `SW_SHOW` ativa a janela
+/// mesmo com `WS_EX_NOACTIVATE` (a flag so trava a ativacao pelo clique), e
+/// `on_focus_changed` volta a mostrar divisores e botao de saida sempre que a
+/// janela ganha foco. Resultado na 2.1.5: cada clique numa pagina devolvia a
+/// ativacao a um divisor, que depois ficava escondido e ATIVO -- a pagina
+/// nunca tinha foco: links sem efeito, nenhum cursor de texto, teclado no
+/// vazio. So a roda, que vai para a janela debaixo do cursor, funcionava.
+/// Canto do splash (pergunta da rolagem automatica e afins) relativo ao
+/// cliente: centrado nos dois eixos. Ficava a 48 px do fundo, e ao arrancar
+/// lia-se como um rodape perdido por baixo das colunas. Nunca sai pelo topo
+/// nem pela esquerda numa janela mais pequena do que ele.
+fn splash_origin(client_w: i32, client_h: i32, width: i32, height: i32) -> (i32, i32) {
+    (
+        ((client_w - width) / 2).max(0),
+        ((client_h - height) / 2).max(0),
+    )
+}
+
+// Painel lateral (Ctrl+H): historico inteligente -- busca semantica, sugestoes
+// de sites e os recentes. E uma WebView LOCAL com canal IPC proprio: so esta
+// WebView fala por `parse_panel_message`, e ela so carrega o HTML abaixo
+// (`panel_allows_navigation`). Nenhuma pagina da internet alcanca este canal,
+// e os dados entram na pagina como texto (`textContent`), nunca como HTML.
+
+/// O que a pagina do painel pode pedir. Lista fechada.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PanelMessage {
+    Ready,
+    Search(String),
+    Open(String),
+    Close,
+}
+
+const PANEL_MESSAGE_MAX_BYTES: usize = 4 * 1024;
+const PANEL_QUERY_MAX_CHARS: usize = 500;
+const PANEL_INPUT_MAX_CHARS: usize = 2048;
+/// Quantos recentes e quantas sugestoes o painel mostra.
+const PANEL_RECENT_LIMIT: usize = 30;
+const PANEL_SUGGESTION_LIMIT: usize = 6;
+
+fn parse_panel_message(body: &str) -> Option<PanelMessage> {
+    if body.len() > PANEL_MESSAGE_MAX_BYTES {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let text = |key: &str, max: usize| -> Option<String> {
+        let text = value.get("args")?.get(key)?.as_str()?.trim();
+        (!text.is_empty() && text.chars().count() <= max).then(|| text.to_string())
+    };
+    match value.get("action")?.as_str()? {
+        "ready" => Some(PanelMessage::Ready),
+        "close" => Some(PanelMessage::Close),
+        "search" => text("query", PANEL_QUERY_MAX_CHARS).map(PanelMessage::Search),
+        "open" => text("input", PANEL_INPUT_MAX_CHARS).map(PanelMessage::Open),
+        _ => None,
+    }
+}
+
+/// So o proprio HTML local (NavigateToString chega como about:blank ou
+/// data:). Um link, um redirect, um file: ou um javascript: nao passam.
+fn panel_allows_navigation(target: &str) -> bool {
+    let lower = target.trim().to_ascii_lowercase();
+    lower == "about:blank" || lower.starts_with("data:text/html")
+}
+
+/// Encostado a direita, abaixo da barra do comparador (ou do topo, fora
+/// dele): 34% da largura, entre 320 e 440 px logicos, nunca mais que a janela.
+fn side_panel_bounds(logical_w: f64, logical_h: f64, top: f64) -> (f64, f64, f64, f64) {
+    let width = (logical_w * 0.34)
+        .clamp(320.0, 440.0)
+        .min(logical_w.max(0.0));
+    let top = top.clamp(0.0, logical_h.max(0.0));
+    (logical_w - width, top, width, logical_h - top)
+}
+
+/// Um item do painel: o que se le e o que o clique volta a abrir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanelItem {
+    title: String,
+    detail: String,
+    input: String,
+}
+
+fn history_panel_items(entries: &[HistoryEntry]) -> Vec<PanelItem> {
+    entries
+        .iter()
+        .filter(|entry| !entry.input.trim().is_empty())
+        .map(|entry| {
+            let kind = match entry.kind {
+                HistoryKind::Ask => "IA",
+                HistoryKind::Read => "Leitor",
+                HistoryKind::Web => "Web",
+            };
+            let detail = if entry.target.trim().is_empty() || entry.target == entry.input {
+                kind.to_string()
+            } else {
+                format!("{kind} · {}", entry.target)
+            };
+            PanelItem {
+                title: entry.input.clone(),
+                detail,
+                input: entry.input.clone(),
+            }
+        })
+        .collect()
+}
+
+fn memory_panel_items(hits: &[MemoryHit]) -> Vec<PanelItem> {
+    hits.iter()
+        .map(|hit| {
+            let source = hit
+                .provider
+                .as_deref()
+                .or(hit.url.as_deref())
+                .unwrap_or("memória local");
+            PanelItem {
+                title: hit.title.clone(),
+                detail: if hit.excerpt.trim().is_empty() {
+                    source.to_string()
+                } else {
+                    format!("{source} · {}", hit.excerpt)
+                },
+                // Com endereco, o clique abre a pagina; sem, repete a busca.
+                input: hit.url.clone().unwrap_or_else(|| hit.title.clone()),
+            }
+        })
+        .collect()
+}
+
+/// Sugestoes de sites: os resultados da memoria que tem endereco web, um por
+/// dominio, na ordem de relevancia.
+fn suggestion_panel_items(hits: &[MemoryHit], limit: usize) -> Vec<PanelItem> {
+    let mut seen = std::collections::HashSet::new();
+    let mut items = Vec::new();
+    for hit in hits {
+        let Some(url) = hit.url.as_deref() else {
+            continue;
+        };
+        let Ok(parsed) = Url::parse(url) else {
+            continue;
+        };
+        if !matches!(parsed.scheme(), "http" | "https") {
+            continue;
+        }
+        let Some(host) = parsed.host_str() else {
+            continue;
+        };
+        let domain = host.trim_start_matches("www.").to_string();
+        if !seen.insert(domain.clone()) {
+            continue;
+        }
+        items.push(PanelItem {
+            title: if hit.title.trim().is_empty() {
+                domain.clone()
+            } else {
+                hit.title.clone()
+            },
+            detail: domain,
+            input: url.to_string(),
+        });
+        if items.len() >= limit {
+            break;
+        }
+    }
+    items
+}
+
+/// O JS que preenche uma secao. Os dados vao como JSON (literal JS valido) e a
+/// pagina so os usa com `textContent`.
+fn panel_render_script(section: &str, title: &str, empty: &str, items: &[PanelItem]) -> String {
+    let items: Vec<serde_json::Value> = items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "title": item.title,
+                "detail": item.detail,
+                "input": item.input,
+            })
+        })
+        .collect();
+    let data = serde_json::json!({
+        "id": section,
+        "title": title,
+        "empty": empty,
+        "items": items,
+    });
+    format!("window.__neuraliaPanel && window.__neuraliaPanel.render({data});")
+}
+
+fn css_color(color: Rgb) -> String {
+    format!("#{:02x}{:02x}{:02x}", color.0, color.1, color.2)
+}
+
+/// As cores do tema em vigor, como variaveis CSS do painel.
+fn panel_theme_vars(theme: &Theme) -> serde_json::Value {
+    serde_json::json!({
+        "--bg": css_color(theme.page_bg),
+        "--surface": css_color(theme.surface),
+        "--fg": css_color(theme.fg),
+        "--muted": css_color(theme.fg_muted),
+        "--line": css_color(theme.surface_line),
+        "--accent": css_color(theme.accent),
+    })
+}
+
+fn panel_html(theme: &Theme) -> String {
+    PANEL_HTML.replace("__THEME__", &panel_theme_vars(theme).to_string())
+}
+
+const PANEL_HTML: &str = r#"<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><title>Histórico inteligente</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:15px "Segoe UI",system-ui,sans-serif}
+body{display:flex;flex-direction:column;border-left:1px solid var(--line)}
+header{display:flex;align-items:center;justify-content:space-between;padding:14px 12px 8px 18px}
+h1{font-size:17px;font-weight:600;margin:0}
+#close{background:none;border:0;color:var(--muted);font-size:18px;cursor:pointer;border-radius:8px;width:32px;height:32px}
+#close:hover{background:#e81123;color:#fff}
+.search{padding:4px 16px 10px}
+#q{width:100%;padding:10px 14px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--fg);font:inherit;outline:none}
+#q:focus{border-color:var(--accent)}
+main{overflow:auto;flex:1;padding:0 8px 16px}
+section[hidden]{display:none}
+h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:14px 10px 6px;font-weight:600}
+.item{display:block;width:100%;text-align:left;background:none;border:0;color:inherit;font:inherit;padding:8px 10px;border-radius:10px;cursor:pointer}
+.item:hover,.item:focus{background:var(--surface);outline:none}
+.title,.detail{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.detail{font-size:12px;color:var(--muted);margin-top:2px}
+.empty{color:var(--muted);font-size:13px;padding:6px 10px}
+</style></head><body>
+<header><h1>Histórico inteligente</h1><button id="close" title="Fechar (Esc)">✕</button></header>
+<div class="search"><input id="q" placeholder="Descreva o que quer reencontrar e tecle Enter" autocomplete="off" spellcheck="false"></div>
+<main>
+<section id="busca" hidden><h2></h2><div></div></section>
+<section id="sugestoes" hidden><h2></h2><div></div></section>
+<section id="recentes" hidden><h2></h2><div></div></section>
+</main>
+<script>
+(() => {
+  if (window.top !== window) return;
+  const post = (action, args) => window.ipc.postMessage(JSON.stringify({ action, args: args || {} }));
+  const q = document.getElementById('q');
+  document.getElementById('close').addEventListener('click', () => post('close'));
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); post('close'); }
+  });
+  q.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && q.value.trim()) { e.preventDefault(); post('search', { query: q.value.trim() }); }
+  });
+  const theme = (vars) => { for (const k of Object.keys(vars)) document.documentElement.style.setProperty(k, vars[k]); };
+  window.__neuraliaPanel = {
+    theme,
+    render(data) {
+      const section = document.getElementById(data.id);
+      if (!section) return;
+      section.hidden = false;
+      section.querySelector('h2').textContent = data.title;
+      const box = section.querySelector('div');
+      box.textContent = '';
+      if (!data.items.length) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = data.empty;
+        box.appendChild(empty);
+        return;
+      }
+      for (const item of data.items) {
+        const button = document.createElement('button');
+        button.className = 'item';
+        const title = document.createElement('span');
+        title.className = 'title';
+        title.textContent = item.title;
+        const detail = document.createElement('span');
+        detail.className = 'detail';
+        detail.textContent = item.detail;
+        button.append(title, detail);
+        button.addEventListener('click', () => post('open', { input: item.input }));
+        box.appendChild(button);
+      }
+    }
+  };
+  theme(__THEME__);
+  q.focus();
+  post('ready');
+})();
+</script></body></html>"#;
+
+// Servicos no painel lateral (caminho A do WebRTC, aprovado pelo dono): o
+// servico corre como uma pagina da internet comum -- contatos e chamadas sao
+// os dele; o NeuralIA so libera camera e microfone pelo aviso do WebView2.
+// Sem scripts injetados e sem o canal IPC do painel do historico.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Service {
+    /// Videochamada: o Google Meet.
+    Meet,
+    WhatsApp,
+    YouTube,
+    Gmail,
+}
+
+impl Service {
+    fn url(self) -> &'static str {
+        match self {
+            Self::Meet => "https://meet.google.com/",
+            Self::WhatsApp => "https://web.whatsapp.com/",
+            Self::YouTube => "https://www.youtube.com/",
+            Self::Gmail => "https://mail.google.com/mail/u/0/#inbox",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Meet => "Videochamada (Google Meet)",
+            Self::WhatsApp => "WhatsApp",
+            Self::YouTube => "YouTube",
+            Self::Gmail => "Gmail",
+        }
+    }
+}
+
+/// So paginas da internet: um servico nunca abre file:, javascript: nem os
+/// esquemas internos do NeuralIA.
+fn service_panel_allows_navigation(target: &str) -> bool {
+    let lower = target.trim().to_ascii_lowercase();
+    lower == "about:blank" || lower.starts_with("https://") || lower.starts_with("http://")
+}
+
+/// Mais largo do que o do historico: o WhatsApp e o Meet precisam de espaco.
+fn service_panel_bounds(logical_w: f64, logical_h: f64, top: f64) -> (f64, f64, f64, f64) {
+    let width = (logical_w * 0.42)
+        .clamp(400.0, 640.0)
+        .min(logical_w.max(0.0));
+    let top = top.clamp(0.0, logical_h.max(0.0));
+    (logical_w - width, top, width, logical_h - top)
+}
+
+/// Botao redondo so com icone (servicos, Gmail, Privado). O icone branco e
+/// pintado com `tint`; os coloridos (WhatsApp, YouTube) vao com `None`.
+unsafe fn draw_icon_button(
+    hdc: *mut core::ffi::c_void,
+    rect: UiRect,
+    slot: usize,
+    tint: Option<Rgb>,
+    hovered: bool,
+    scale: f64,
+    theme: &Theme,
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let fill = if hovered {
+        theme.surface_line
+    } else {
+        theme.surface
+    };
+    fill_pill(
+        hdc,
+        rect,
+        rect.height / 2.0,
+        fill,
+        Some((theme.surface_line, scale)),
+        theme.bar_bg,
+    );
+    let size = (rect.height * 0.6).round() as i32;
+    let x = (rect.x + (rect.width - size as f64) / 2.0).round() as i32;
+    let y = (rect.y + (rect.height - size as f64) / 2.0).round() as i32;
+    draw_icon(hdc, slot, x, y, size, fill, tint);
+}
+
+/// A dica do olho. O estado ve-se na cor do botao.
+const LIVE_TOOLTIP: &str = "Gemini Live: ver a tela, câmera e microfone (liga/desliga)";
+
+/// Vermelho de "a gravar": com o Gemini Live ligado o botao fica cheio desta
+/// cor, para ninguem esquecer que a tela, a camera e o microfone estao a sair.
+const LIVE_ON_RED: Rgb = (217, 48, 37);
+
+/// Fundo, borda e cor do olho no botao do Gemini Live. Cheio de vermelho so
+/// quando algo pode estar a sair; com o painel aberto e nada a sair (a pedir
+/// a chave, ou a sessao caiu) o olho e a borda ficam vermelhos, o fundo nao.
+fn live_button_colors(indicator: LiveIndicator, hovered: bool, theme: &Theme) -> (Rgb, Rgb, Rgb) {
+    match (indicator, hovered) {
+        (LiveIndicator::Live, false) => (LIVE_ON_RED, LIVE_ON_RED, (255, 255, 255)),
+        (LiveIndicator::Live, true) => {
+            let deep = mix(LIVE_ON_RED, (0, 0, 0), 0.18);
+            (deep, deep, (255, 255, 255))
+        }
+        (LiveIndicator::Standby, true) => (theme.surface_line, LIVE_ON_RED, LIVE_ON_RED),
+        (LiveIndicator::Standby, false) => (theme.surface, LIVE_ON_RED, LIVE_ON_RED),
+        (LiveIndicator::Off, true) => (theme.surface_line, theme.surface_line, theme.fg),
+        (LiveIndicator::Off, false) => (theme.surface, theme.surface_line, theme.fg),
+    }
+}
+
+unsafe fn draw_live_button(
+    hdc: *mut core::ffi::c_void,
+    rect: UiRect,
+    indicator: LiveIndicator,
+    hovered: bool,
+    scale: f64,
+    theme: &Theme,
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let (fill, border, tint) = live_button_colors(indicator, hovered, theme);
+    fill_pill(
+        hdc,
+        rect,
+        rect.height / 2.0,
+        fill,
+        Some((border, scale)),
+        theme.bar_bg,
+    );
+    let size = (rect.height * 0.6).round() as i32;
+    let x = (rect.x + (rect.width - size as f64) / 2.0).round() as i32;
+    let y = (rect.y + (rect.height - size as f64) / 2.0).round() as i32;
+    draw_icon(hdc, ICON_SLOT_LIVE, x, y, size, fill, Some(tint));
+}
+
+/// Avisos do Gmail ligados (o botao do envelope). Guardado em
+/// `<data_dir>/gmail` como "ligado"/"desligado"; sem ficheiro, ligado.
+static GMAIL_NOTIFICATIONS: AtomicBool = AtomicBool::new(true);
+
+fn load_gmail_setting(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|text| !text.trim().eq_ignore_ascii_case("desligado"))
+        .unwrap_or(true)
+}
+
+fn save_gmail_setting(path: &std::path::Path, on: bool) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let temp = path.with_extension("tmp");
+    std::fs::write(&temp, if on { "ligado" } else { "desligado" })?;
+    std::fs::rename(&temp, path)
+}
+
+/// "Abrir" e "Nao" no canto direito do aviso do Gmail, em pixeis do cliente.
+fn gmail_toast_buttons(client: &RECT, scale: f64) -> (RECT, RECT) {
+    let height = (26.0 * scale).round() as i32;
+    let top = (client.bottom - height) / 2;
+    let gap = (6.0 * scale).round() as i32;
+    let right = client.right - (12.0 * scale).round() as i32;
+    let no_width = (54.0 * scale).round() as i32;
+    let open_width = (70.0 * scale).round() as i32;
+    let no = RECT {
+        left: right - no_width,
+        top,
+        right,
+        bottom: top + height,
+    };
+    let open = RECT {
+        left: no.left - gap - open_width,
+        top,
+        right: no.left - gap,
+        bottom: top + height,
+    };
+    (open, no)
+}
+
+/// Log de depuracao em tempo de execucao, pedido pelo dono para achar bugs
+/// intermitentes. Desligado por padrao; `NEURALIA_DEBUG_LOG=<ficheiro>` liga.
+/// Cada linha: milissegundos desde o arranque e o evento. Nunca leva URLs,
+/// texto de paginas nem nada da memoria -- so transicoes da janela.
+fn debug_log(event: std::fmt::Arguments<'_>) {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let Some(path) = std::env::var_os("NEURALIA_DEBUG_LOG") else {
+        return;
+    };
+    let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
+    append_debug_line(std::path::Path::new(&path), elapsed, event);
+}
+
+/// Acrescenta uma linha ao log; um log que nao abre nunca derruba o app.
+fn append_debug_line(path: &std::path::Path, elapsed_ms: u128, event: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        // A linha passa pela redacao antes do disco: se alguma um dia levar
+        // a chave do Gemini Live, sai com um marcador no lugar dela.
+        let line = event.to_string();
+        let _ = writeln!(file, "{elapsed_ms:>8} ms  {}", redact_debug_secrets(&line));
+    }
+}
+
+fn show_popup_without_activation(hwnd: HWND) {
+    unsafe {
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+}
+
+// Dicas. A barra e os botoes nativos sao desenhados a mao, por isso o Windows
+// nao tem texto nenhum para mostrar sozinho. A dica e uma MENSAGEM no centro da
+// janela, com o visual dos avisos (fundo e texto do tema, letra grande), como o
+// dono pediu: o balao do Windows junto ao cursor era pequeno -- e, em modo
+// TTF_SUBCLASS, nem aparecia sobre a janela do winit. Aparece depois de o rato
+// parar TOOLTIP_DELAY_MS sobre um alvo; some quando ele sai ou clica.
+static HINT_HWND: AtomicUsize = AtomicUsize::new(0);
+static HINT_TEXT: Mutex<String> = Mutex::new(String::new());
+/// A dica que o temporizador vai mostrar: (janela raiz, texto).
+static TOOLTIP_PENDING: Mutex<Option<(usize, String)>> = Mutex::new(None);
+static TOOLTIP_TIMER: AtomicUsize = AtomicUsize::new(0);
+/// O botao Home ja agendou a sua dica nesta passagem do rato.
+static HOME_TOOLTIP_ARMED: AtomicBool = AtomicBool::new(false);
+const TOOLTIP_DELAY_MS: u32 = 450;
+/// Letra, margem, largura maxima e raio da dica, em pixels a 96 dpi.
+const HINT_FONT_PX: f64 = 20.0;
+/// Margens da dica: mais largas dos lados, onde a pilula se arredonda.
+const HINT_PADDING_X_PX: f64 = 24.0;
+const HINT_PADDING_Y_PX: f64 = 14.0;
+const HINT_MAX_WIDTH_PX: f64 = 640.0;
+
+/// O que o clique em cada alvo da barra FAZ -- o mesmo match que trata o
+/// clique --, nao so o nome do botao.
+fn bar_tooltip_label(
+    hit: BarHit,
+    provider: &str,
+    maximized: bool,
+    tab_url: Option<&str>,
+    group: Option<(&str, bool)>,
+) -> Option<String> {
+    Some(match hit {
+        BarHit::Home => "Voltar à Home".to_string(),
+        BarHit::Back => "Voltar na fonte aberta ao lado".to_string(),
+        BarHit::Forward => "Avançar na fonte aberta ao lado".to_string(),
+        BarHit::ColumnBack(_) => format!("Voltar no {provider}"),
+        BarHit::ColumnForward(_) => format!("Avançar no {provider}"),
+        BarHit::Column(_) => format!("{provider}: expandir esta coluna"),
+        BarHit::AddTab(_) => format!("Nova pergunta ao {provider}"),
+        BarHit::ContextTab { .. } => {
+            format!(
+                "{}\nClique: abrir ao lado · Botão direito: fechar e grupos",
+                tab_url?
+            )
+        }
+        BarHit::ContextGroup { .. } => {
+            let (name, collapsed) = group?;
+            let action = if collapsed {
+                "mostrar as abas"
+            } else {
+                "recolher"
+            };
+            format!("Grupo \"{name}\": clique para {action}")
+        }
+        BarHit::SplitExpand => "Expandir ou reduzir a fonte aberta ao lado".to_string(),
+        BarHit::SplitClose => "Fechar a fonte aberta ao lado".to_string(),
+        BarHit::Private => {
+            "Painel privado: abre ao lado sem gravar histórico nem memória".to_string()
+        }
+        BarHit::Service(service) => format!("{} no painel ao lado", service.label()),
+        BarHit::GmailToggle => if GMAIL_NOTIFICATIONS.load(Ordering::Acquire) {
+            "Avisos do Gmail: ligados · clique para desligar"
+        } else {
+            "Avisos do Gmail: desligados · clique para ligar"
+        }
+        .to_string(),
+        BarHit::GeminiLive => LIVE_TOOLTIP.to_string(),
+        BarHit::WindowMinimize => caption_tooltip_label(0, maximized).to_string(),
+        BarHit::WindowMaximize => caption_tooltip_label(1, maximized).to_string(),
+        BarHit::WindowClose => caption_tooltip_label(2, maximized).to_string(),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryStep {
+    Back,
+    Forward,
+}
+
+/// Qual pagina o ‹ › move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryNav {
+    /// A fonte aberta ao lado de uma coluna (onde se seguem links).
+    Split,
+    /// A coluna expandida.
+    Column(usize),
+    /// A pagina cheia (Web ou Leitor).
+    Page,
+    /// Sem uma pagina so: voltar e o do app.
+    App,
+}
+
+fn history_nav_target(
+    surface: Surface,
+    split_open: bool,
+    expanded: Option<usize>,
+    has_page: bool,
+) -> HistoryNav {
+    match surface {
+        Surface::Comparator if split_open => HistoryNav::Split,
+        Surface::Comparator => expanded.map_or(HistoryNav::App, HistoryNav::Column),
+        Surface::Home => HistoryNav::App,
+        _ if has_page => HistoryNav::Page,
+        _ => HistoryNav::App,
+    }
+}
+
+/// Os botoes da janela do proprio app aparecem sempre que a moldura do Windows
+/// nao esta la: na Home e no comparador (com a barra).
+fn caption_buttons_wanted(surface: Surface, bar_visible: bool) -> bool {
+    match surface {
+        Surface::Home => true,
+        Surface::Comparator => bar_visible,
+        _ => false,
+    }
+}
+
+/// A faixa de cima da Home, onde se agarra a janela sem moldura.
+fn home_drag_strip(y: f64, scale: f64) -> bool {
+    y >= 0.0 && y <= TITLE_TAB_HEIGHT * scale.max(1.0)
+}
+
+/// Vermelho do fechar ao passar o rato, o mesmo do Chrome e do Windows.
+const CLOSE_HOVER_RED: Rgb = (232, 17, 35);
+
+/// Botoes da janela: o fechar fica vermelho com a cruz branca debaixo do rato,
+/// como no Chrome; minimizar e maximizar so realcam.
+fn caption_button_style(index: usize, hovered: bool, theme: &Theme) -> PillStyle {
+    match (index, hovered) {
+        (2, true) => PillStyle::new(CLOSE_HOVER_RED, CLOSE_HOVER_RED, (255, 255, 255)),
+        (_, true) => PillStyle::new(theme.surface_line, theme.surface_line, theme.fg),
+        _ => PillStyle::new(theme.surface, theme.surface_line, theme.fg),
+    }
+}
+
+/// Os tres botoes da janela, na ordem em que `native_button_index` os conta.
+fn caption_tooltip_label(index: usize, maximized: bool) -> &'static str {
+    match index {
+        0 => "Minimizar",
+        1 if maximized => "Restaurar",
+        1 => "Maximizar",
+        _ => "Fechar",
+    }
+}
+
+/// O rato entrou num alvo com dica `text`, ou saiu de todos (""). Esconde a
+/// dica que estiver a vista e, se houver texto, agenda a nova.
+fn hover_tooltip(window: HWND, text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, KillTimer, SetTimer};
+    hide_tooltip();
+    let timer = TOOLTIP_TIMER.swap(0, Ordering::AcqRel);
+    if timer != 0 {
+        unsafe {
+            KillTimer(std::ptr::null_mut(), timer);
+        }
+    }
+    let mut pending = TOOLTIP_PENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if window.is_null() || text.is_empty() {
+        *pending = None;
+        return;
+    }
+    let root = unsafe { GetAncestor(window, GA_ROOT) };
+    *pending = Some((root as usize, text.to_string()));
+    drop(pending);
+    let id = unsafe {
+        SetTimer(
+            std::ptr::null_mut(),
+            0,
+            TOOLTIP_DELAY_MS,
+            Some(tooltip_timer),
+        )
+    };
+    TOOLTIP_TIMER.store(id, Ordering::Release);
+}
+
+unsafe extern "system" fn tooltip_timer(_hwnd: HWND, _message: u32, id: usize, _time: u32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::KillTimer;
+    unsafe {
+        KillTimer(std::ptr::null_mut(), id);
+    }
+    let _ = TOOLTIP_TIMER.compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire);
+    show_pending_tooltip();
+}
+
+/// Escala do ecra (1.0 a 96 dpi): a letra da dica acompanha o DPI.
+fn screen_scale() -> f64 {
+    use windows_sys::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, LOGPIXELSY, ReleaseDC};
+    unsafe {
+        let screen = GetDC(std::ptr::null_mut());
+        if screen.is_null() {
+            return 1.0;
+        }
+        let dpi = GetDeviceCaps(screen, LOGPIXELSY as i32);
+        ReleaseDC(std::ptr::null_mut(), screen);
+        (dpi as f64 / 96.0).max(1.0)
+    }
+}
+
+/// Largura e altura do texto da dica, medidas com a letra dela.
+fn hint_text_size(text: &str, scale: f64) -> (i32, i32) {
+    use windows_sys::Win32::Graphics::Gdi::{DT_CALCRECT, DT_WORDBREAK, GetDC, ReleaseDC};
+    unsafe {
+        let screen = GetDC(std::ptr::null_mut());
+        if screen.is_null() {
+            return (0, 0);
+        }
+        let font = create_font(-(HINT_FONT_PX * scale).round() as i32, FW_NORMAL as i32);
+        let old = SelectObject(screen, font as _);
+        let mut area = RECT {
+            left: 0,
+            top: 0,
+            right: (HINT_MAX_WIDTH_PX * scale).round() as i32,
+            bottom: 0,
+        };
+        draw_text(
+            screen,
+            text,
+            &mut area,
+            DT_CALCRECT | DT_CENTER | DT_WORDBREAK | DT_NOPREFIX,
+        );
+        SelectObject(screen, old);
+        DeleteObject(font as _);
+        ReleaseDC(std::ptr::null_mut(), screen);
+        (area.right - area.left, area.bottom - area.top)
+    }
+}
+
+/// A janela da dica, criada na primeira vez (e de novo se o dono mudou).
+fn hint_popup(root: HWND) -> Option<HWND> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GW_OWNER, GetWindow, IsWindow, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+    };
+    let existing = HINT_HWND.load(Ordering::Acquire) as HWND;
+    unsafe {
+        if !existing.is_null() && IsWindow(existing) != 0 {
+            if GetWindow(existing, GW_OWNER) == root {
+                return Some(existing);
+            }
+            DestroyWindow(existing);
+        }
+        // Transparente ao rato: fica por cima das paginas e nao pode comer o
+        // clique de ninguem.
+        let hint = CreateWindowExW(
+            AUX_POPUP_EX_STYLE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+            windows_sys::w!("STATIC"),
+            windows_sys::w!(""),
+            AUX_POPUP_STYLE,
+            0,
+            0,
+            1,
+            1,
+            root,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        if hint.is_null() {
+            return None;
+        }
+        // Sem SetLayeredWindowAttributes: quem pinta e o UpdateLayeredWindow,
+        // com alfa por pixel (render_hint).
+        HINT_HWND.store(hint as usize, Ordering::Release);
+        Some(hint)
+    }
+}
+
+/// Raio da dica: pilula, como os botoes (metade da altura), limitado para
+/// dicas de varias linhas nao ficarem ovais.
+fn hint_radius(height: f64, scale: f64) -> f64 {
+    (height / 2.0).min(28.0 * scale.max(1.0))
+}
+
+/// Aplica a forma da dica a um bitmap BGRA ja pintado (fundo + texto):
+/// cobertura suave pela distancia ao rectangulo arredondado, um fio de borda
+/// na cor dos botoes e o resultado PRE-MULTIPLICADO, como o
+/// UpdateLayeredWindow exige. O recorte por regiao do GDI deixava escadinhas.
+fn apply_hint_shape(pixels: &mut [u8], width: usize, height: usize, radius: f32, line: Rgb) {
+    for y in 0..height {
+        for x in 0..width {
+            let distance = round_rect_sdf(
+                x as f32 + 0.5,
+                y as f32 + 0.5,
+                width as f32,
+                height as f32,
+                radius,
+            );
+            let coverage = (0.5 - distance).clamp(0.0, 1.0);
+            // Fio de 1 px por dentro do contorno.
+            let border = (1.0 - (distance + 1.0).abs()).clamp(0.0, 1.0);
+            let index = (y * width + x) * 4;
+            let Some(pixel) = pixels.get_mut(index..index + 4) else {
+                return;
+            };
+            for (channel, target) in [(0, line.2), (1, line.1), (2, line.0)] {
+                let base = pixel[channel] as f32;
+                let mixed = base + (target as f32 - base) * border;
+                pixel[channel] = (mixed * coverage).round() as u8;
+            }
+            pixel[3] = (coverage * 255.0).round() as u8;
+        }
+    }
+}
+
+/// Pinta a dica e entrega-a ao Windows com alfa por pixel (cantos suaves).
+/// Posiciona e dimensiona a janela na mesma chamada.
+fn render_hint(hint: HWND, x: i32, y: i32, width: i32, height: i32, text: &str, scale: f64) {
+    use windows_sys::Win32::Foundation::SIZE;
+    use windows_sys::Win32::Graphics::Gdi::{
+        AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+        CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DT_WORDBREAK, DeleteDC, GetDC,
+        RGBQUAD, ReleaseDC,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ULW_ALPHA, UpdateLayeredWindow};
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    unsafe {
+        let screen = GetDC(std::ptr::null_mut());
+        if screen.is_null() {
+            return;
+        }
+        let memory = CreateCompatibleDC(screen);
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            bmiColors: [RGBQUAD {
+                rgbBlue: 0,
+                rgbGreen: 0,
+                rgbRed: 0,
+                rgbReserved: 0,
+            }; 1],
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(
+            screen,
+            &info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            std::ptr::null_mut(),
+            0,
+        );
+        if memory.is_null() || bitmap.is_null() || bits.is_null() {
+            if !bitmap.is_null() {
+                DeleteObject(bitmap as _);
+            }
+            if !memory.is_null() {
+                DeleteDC(memory);
+            }
+            ReleaseDC(std::ptr::null_mut(), screen);
+            return;
+        }
+        let old_bitmap = SelectObject(memory, bitmap as _);
+
+        // Fundo opaco e texto primeiro (o GDI nao escreve alfa); a forma vem
+        // depois, pixel a pixel.
+        let theme = Theme::system();
+        let all = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        let fill = CreateSolidBrush(rgb3(theme.surface));
+        FillRect(memory, &all, fill);
+        DeleteObject(fill as _);
+        let font = create_font(-(HINT_FONT_PX * scale).round() as i32, FW_NORMAL as i32);
+        let old_font = SelectObject(memory, font as _);
+        SetBkMode(memory, TRANSPARENT as i32);
+        SetTextColor(memory, rgb3(theme.fg));
+        let pad_x = (HINT_PADDING_X_PX * scale).round() as i32;
+        let pad_y = (HINT_PADDING_Y_PX * scale).round() as i32;
+        let mut area = RECT {
+            left: pad_x,
+            top: pad_y,
+            right: width - pad_x,
+            bottom: height - pad_y,
+        };
+        draw_text(
+            memory,
+            text,
+            &mut area,
+            DT_CENTER | DT_WORDBREAK | DT_NOPREFIX,
+        );
+        SelectObject(memory, old_font);
+        DeleteObject(font as _);
+
+        let pixels = std::slice::from_raw_parts_mut(bits as *mut u8, (width * height * 4) as usize);
+        apply_hint_shape(
+            pixels,
+            width as usize,
+            height as usize,
+            hint_radius(height as f64, scale) as f32,
+            theme.surface_line,
+        );
+
+        let position = POINT { x, y };
+        let size = SIZE {
+            cx: width,
+            cy: height,
+        };
+        let source = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        UpdateLayeredWindow(
+            hint, screen, &position, &size, memory, &source, 0, &blend, ULW_ALPHA,
+        );
+
+        SelectObject(memory, old_bitmap);
+        DeleteObject(bitmap as _);
+        DeleteDC(memory);
+        ReleaseDC(std::ptr::null_mut(), screen);
+    }
+}
+
+/// Mostra a dica agendada no centro da janela. Chamada pelo temporizador (e
+/// pelos testes, sem esperar).
+fn show_pending_tooltip() {
+    let Some((root, text)) = TOOLTIP_PENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    else {
+        return;
+    };
+    let root = root as HWND;
+    let Some(hint) = hint_popup(root) else {
+        return;
+    };
+    let scale = screen_scale();
+    let pad_x = (HINT_PADDING_X_PX * scale).round() as i32;
+    let pad_y = (HINT_PADDING_Y_PX * scale).round() as i32;
+    let (text_w, text_h) = hint_text_size(&text, scale);
+    let (width, height) = (text_w + 2 * pad_x, text_h + 2 * pad_y);
+    unsafe {
+        let mut client = RECT::default();
+        if GetClientRect(root, &mut client) == 0 {
+            return;
+        }
+        let mut origin = POINT { x: 0, y: 0 };
+        ClientToScreen(root, &mut origin);
+        let (x, y) = splash_origin(client.right, client.bottom, width, height);
+        render_hint(
+            hint,
+            origin.x + x,
+            origin.y + y,
+            width,
+            height,
+            &text,
+            scale,
+        );
+        show_popup_without_activation(hint);
+    }
+    *HINT_TEXT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = text;
+}
+
+fn hide_tooltip() {
+    let hint = HINT_HWND.load(Ordering::Acquire) as HWND;
+    if !hint.is_null() {
+        unsafe {
+            ShowWindow(hint, SW_HIDE);
+        }
+    }
+}
+
+/// Menu de tema no cursor, com a escolha em vigor marcada. Devolve a opcao
+/// clicada, ou None se o menu foi fechado sem escolha.
+fn pick_theme_from_menu(hwnd: HWND) -> Option<ThemeChoice> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, GA_ROOT, GetAncestor, MF_CHECKED, MF_STRING,
+        SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    };
+    let current = ThemeChoice::current();
+    unsafe {
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return None;
+        }
+        for (index, choice) in ThemeChoice::ALL.iter().enumerate() {
+            let flags = if *choice == current {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            };
+            let label: Vec<u16> = choice
+                .label()
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            AppendMenuW(menu, flags, index + 1, label.as_ptr());
+        }
+        let mut cursor = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut cursor);
+        // Sem o dono em primeiro plano, o menu nao fecha ao clicar fora.
+        let root = GetAncestor(hwnd, GA_ROOT);
+        SetForegroundWindow(root);
+        let picked = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            cursor.x,
+            cursor.y,
+            0,
+            root,
+            std::ptr::null(),
+        );
+        DestroyMenu(menu);
+        usize::try_from(picked)
+            .ok()
+            .and_then(|id| id.checked_sub(1))
+            .and_then(|index| ThemeChoice::ALL.get(index).copied())
+    }
+}
+
+/// Pede o WM_MOUSELEAVE a um botao nativo: sem ele a dica ficava a vista
+/// depois de o rato sair.
+fn track_mouse_leave(hwnd: HWND) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    };
+    let mut track = TRACKMOUSEEVENT {
+        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_LEAVE,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    unsafe {
+        TrackMouseEvent(&mut track);
+    }
 }
 
 unsafe extern "system" fn comparator_splitter_subclass(
@@ -1948,6 +3208,8 @@ unsafe extern "system" fn comparator_splitter_subclass(
 
 const NATIVE_BUTTON_NONE: usize = usize::MAX;
 static CAPTION_PRESSED_BUTTON: AtomicUsize = AtomicUsize::new(NATIVE_BUTTON_NONE);
+/// O botao da janela cuja dica esta carregada no tooltip.
+static CAPTION_TOOLTIP_BUTTON: AtomicUsize = AtomicUsize::new(NATIVE_BUTTON_NONE);
 
 fn native_button_index(width: i32, x: i32) -> Option<usize> {
     if width <= 0 || x < 0 || x >= width {
@@ -2024,8 +3286,9 @@ unsafe extern "system" fn caption_buttons_subclass(
                     let font = create_font((-13.0 * scale) as i32, FW_NORMAL as i32);
                     let maximized = IsZoomed(GetParent(hwnd)) != 0;
                     let labels = ["—", if maximized { "❐" } else { "□" }, "×"];
+                    let hovered = CAPTION_TOOLTIP_BUTTON.load(Ordering::Acquire);
                     for (index, label) in labels.into_iter().enumerate() {
-                        draw_button(
+                        draw_pill(
                             hdc,
                             UiRect {
                                 x: index as f64 * third,
@@ -2038,10 +3301,10 @@ unsafe extern "system" fn caption_buttons_subclass(
                                 height,
                             },
                             label,
-                            false,
+                            caption_button_style(index, hovered == index, &theme),
                             scale,
                             font,
-                            &theme,
+                            theme.page_bg,
                         );
                     }
                     DeleteObject(font as _);
@@ -2057,6 +3320,7 @@ unsafe extern "system" fn caption_buttons_subclass(
                 let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
                 if let Some(index) = native_button_index(width, x) {
                     CAPTION_PRESSED_BUTTON.store(index, Ordering::Release);
+                    hover_tooltip(hwnd, "");
                     SetCapture(hwnd);
                 }
             }
@@ -2092,6 +3356,32 @@ unsafe extern "system" fn caption_buttons_subclass(
             };
             SendMessageW(parent, WM_SYSCOMMAND_NATIVE, command, 0);
             0
+        }
+        WM_MOUSEMOVE => {
+            // A dica muda quando o rato passa de um botao para outro.
+            let mut client = RECT::default();
+            if GetClientRect(hwnd, &mut client) != 0 {
+                let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
+                let index = native_button_index(client.right - client.left, x);
+                let last = CAPTION_TOOLTIP_BUTTON
+                    .swap(index.unwrap_or(NATIVE_BUTTON_NONE), Ordering::AcqRel);
+                if index != Some(last) {
+                    if last == NATIVE_BUTTON_NONE {
+                        track_mouse_leave(hwnd);
+                    }
+                    let maximized = IsZoomed(GetParent(hwnd)) != 0;
+                    let text = index.map_or("", |index| caption_tooltip_label(index, maximized));
+                    hover_tooltip(hwnd, text);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+            }
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        }
+        WM_MOUSELEAVE => {
+            CAPTION_TOOLTIP_BUTTON.store(NATIVE_BUTTON_NONE, Ordering::Release);
+            hover_tooltip(hwnd, "");
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            DefSubclassProc(hwnd, message, wparam, lparam)
         }
         WM_CAPTURECHANGED | WM_CANCELMODE => {
             CAPTION_PRESSED_BUTTON.store(NATIVE_BUTTON_NONE, Ordering::Release);
@@ -2143,8 +3433,31 @@ unsafe extern "system" fn home_button_subclass(
             }
             0
         }
+        WM_MOUSEMOVE => {
+            if !HOME_TOOLTIP_ARMED.swap(true, Ordering::AcqRel) {
+                track_mouse_leave(hwnd);
+                hover_tooltip(hwnd, "Voltar à Home · Botão direito: tema claro ou escuro");
+            }
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        }
+        WM_MOUSELEAVE => {
+            HOME_TOOLTIP_ARMED.store(false, Ordering::Release);
+            hover_tooltip(hwnd, "");
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        }
         WM_LBUTTONDOWN => {
+            hover_tooltip(hwnd, "");
             SetCapture(hwnd);
+            0
+        }
+        WM_RBUTTONUP => {
+            hover_tooltip(hwnd, "");
+            if let Some(choice) = pick_theme_from_menu(hwnd)
+                && reference_data != 0
+            {
+                let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+                let _ = proxy.send_event(UserEvent::ThemeChosen(choice));
+            }
             0
         }
         WM_LBUTTONUP => {
@@ -2255,6 +3568,10 @@ unsafe extern "system" fn omnibox_subclass(
         match wparam as u32 {
             13 => {
                 let text = window_text(hwnd);
+                debug_log(format_args!(
+                    "omnibox: Enter ({} chars)",
+                    text.chars().count()
+                ));
                 let _ = proxy.send_event(UserEvent::SubmitText(text));
                 return 0;
             }
@@ -2275,6 +3592,10 @@ unsafe extern "system" fn omnibox_subclass(
             }
             0x4E if ctrl => {
                 let _ = proxy.send_event(UserEvent::NewTab(0));
+                return 0;
+            }
+            0x52 if ctrl && !shift => {
+                let _ = proxy.send_event(UserEvent::ToggleAutoScroll);
                 return 0;
             }
             0x2E if ctrl && shift => {
@@ -2970,7 +4291,13 @@ impl MemoryWorker {
         }
     }
 
-    fn clear(&self) {
+    /// Apagar a memoria esquece tambem a sessao de pesquisa viva. O worker
+    /// apaga sessions/<id>.json e poe tombstone no id; uma sessao que ficasse
+    /// na app voltava ao disco no proximo save_session (com a pergunta ja
+    /// apagada) e cada captura nova com esse id era recusada em silencio.
+    /// Pedir a sessao aqui obriga quem apaga a larga-la.
+    fn clear(&self, current_research: &mut Option<ResearchSession>) {
+        *current_research = None;
         if self.tx.try_send(MemoryCommand::Clear).is_err() {
             eprintln!("memory queue saturated; clear not scheduled");
         }
@@ -3129,6 +4456,10 @@ struct App {
     comparator: Option<ComparatorState>,
     omnibox: Option<HWND>,
     bar_hover: Option<BarHit>,
+    /// Ctrl/Shift/Alt no teclado da janela principal (a barra com o foco).
+    modifiers: winit::keyboard::ModifiersState,
+    /// O rato esta em cima do "Ir" da Home: pinta-se em degradê.
+    home_go_hover: bool,
     exit_button: Option<HWND>,
     home_button: Option<HWND>,
     caption_buttons: Option<HWND>,
@@ -3185,6 +4516,15 @@ struct App {
     /// Janela com o foco do teclado (`WindowEvent::Focused`). Em segundo plano
     /// a animacao continua, mas devagar.
     home_focused: bool,
+    /// Painel lateral do historico inteligente (Ctrl+H).
+    side_panel: Option<WebView>,
+    /// A consulta de memoria que alimenta as sugestoes do painel.
+    panel_suggestion_query: Option<String>,
+    /// Servico aberto no painel lateral (WhatsApp, Meet, YouTube, Gmail).
+    service_panel: Option<(Service, WebView)>,
+    /// Painel do Gemini Live, com o estado do olho da barra. Existir e estar
+    /// ligado: fecha-lo desliga tudo.
+    live_panel: LivePanel<WebView>,
 }
 
 impl App {
@@ -3192,6 +4532,12 @@ impl App {
         let config = CoreConfig::default();
         let history_store =
             HistoryStore::with_limit(config.data_dir.join("history.jsonl"), config.history_limit);
+        // A escolha de tema vale antes do primeiro desenho.
+        ThemeChoice::load(&config.data_dir.join("theme")).apply();
+        GMAIL_NOTIFICATIONS.store(
+            load_gmail_setting(&config.data_dir.join("gmail")),
+            Ordering::Release,
+        );
         let history = HistoryWriter::new(history_store, proxy.clone());
         let memory = MemoryWorker::new(config.data_dir.join("memory"), proxy.clone());
         let timers = Timers::new(proxy.clone());
@@ -3222,6 +4568,8 @@ impl App {
             comparator: None,
             omnibox: None,
             bar_hover: None,
+            modifiers: winit::keyboard::ModifiersState::empty(),
+            home_go_hover: false,
             exit_button: None,
             home_button: None,
             caption_buttons: None,
@@ -3262,6 +4610,10 @@ impl App {
             // A janela nasce visivel e com foco; os eventos corrigem se nao for.
             home_occluded: false,
             home_focused: true,
+            side_panel: None,
+            panel_suggestion_query: None,
+            service_panel: None,
+            live_panel: LivePanel::off(),
         }
     }
 
@@ -3318,6 +4670,10 @@ impl App {
     /// da Home (66 ms com foco, 250 ms sem) e arruma as janelas auxiliares,
     /// que so fazem sentido enquanto a app esta a frente.
     fn on_focus_changed(&mut self, focused: bool) {
+        debug_log(format_args!(
+            "focus={focused} surface={:?} home_focused={}",
+            self.surface, self.home_focused
+        ));
         if self.home_focused == focused {
             return;
         }
@@ -3611,6 +4967,20 @@ impl App {
             let _ = webview.focus_parent();
             drop(webview);
         }
+        // Os paineis da direita tambem sao superficies web e nao sobrevivem a
+        // esta saida. O do Gemini Live em especial: so escondido pelo
+        // `hide_orphaned_wry_hosts` la em baixo, continuava vivo a mandar a
+        // tela, a camera e o microfone ao Google, sem o olho vermelho (a barra
+        // so se pinta no comparador) e sem o botao Desligar -- bastava um erro
+        // nativo (`show_native_error`) ou um link para a Web completa.
+        self.close_live_panel();
+        self.close_service_panel();
+        // O historico sai sem `close_side_panel`: esse devolve o teclado a
+        // omnibox, e na Home isso passa pela `show_home` -- que agendaria a
+        // moldura da Home a meio desta troca de superficie.
+        if self.side_panel.take().is_some() {
+            self.panel_suggestion_query = None;
+        }
 
         if let Some(button) = self.exit_button.take() {
             unsafe {
@@ -3669,6 +5039,10 @@ impl App {
     }
 
     fn show_home(&mut self) {
+        debug_log(format_args!("show_home (surface era {:?})", self.surface));
+        self.close_side_panel();
+        self.close_service_panel();
+        self.close_live_panel();
         self.next_generation();
         self.surface = Surface::Home;
 
@@ -3709,16 +5083,6 @@ impl App {
         self.request_redraw();
     }
 
-    fn show_history(&mut self) {
-        self.set_omnibox_text("memory:");
-        self.focus_omnibox();
-        self.show_splash(
-            "Memória semântica: descreva o que você quer reencontrar e pressione Enter."
-                .to_string(),
-            4,
-        );
-    }
-
     /// Pede a lista ao worker; a caixa aparece quando `HistoryLoaded` voltar.
     /// A leitura (lock + ficheiro inteiro) nunca corre no event loop.
     fn show_recent_history(&self) {
@@ -3745,6 +5109,27 @@ impl App {
             Err(error) => format!("Não foi possível ler o histórico: {error}"),
         };
         self.show_native_text("NeuralIA — Histórico cronológico", &text);
+    }
+
+    /// Ctrl+Shift+Delete apagava historico e memoria local de uma vez, sem
+    /// perguntar e sem volta. Agora pergunta, com o "Nao" por omissao.
+    fn confirm_clear_history(&self) -> bool {
+        let Some(hwnd) = self.window.as_ref().and_then(window_hwnd) else {
+            return false;
+        };
+        let body = wide_null(
+            "Apagar TODO o histórico e a memória local da NeuralIA?\n\nIsto não pode ser desfeito.",
+        );
+        let title = wide_null("NeuralIA — Apagar histórico");
+        let answer = unsafe {
+            MessageBoxW(
+                hwnd,
+                body.as_ptr(),
+                title.as_ptr(),
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+            )
+        };
+        clear_history_confirmed(answer)
     }
 
     fn show_native_text(&self, title: &str, text: &str) {
@@ -3806,6 +5191,11 @@ impl App {
     }
 
     fn handle_input(&mut self, input: String) {
+        debug_log(format_args!(
+            "handle_input ({} chars) surface={:?}",
+            input.chars().count(),
+            self.surface
+        ));
         match route_input(&input) {
             InputRoute::Agent(spec) => self.start_browser_agent(&spec),
             InputRoute::MemoryQuery(query) => {
@@ -3817,6 +5207,11 @@ impl App {
                 self.show_splash("Reconstrução da memória agendada.".to_string(), 3);
             }
             InputRoute::History => self.show_recent_history(),
+            InputRoute::Theme(Some(choice)) => self.choose_theme(choice),
+            InputRoute::Theme(None) => self.show_splash(
+                "Use tema:sistema, tema:claro ou tema:escuro.".to_string(),
+                3,
+            ),
             InputRoute::ResearchCompare => self.compare_current_research(),
             InputRoute::ResearchSynthesize => self.synthesize_current_research(),
             InputRoute::ResearchExport => self.export_current_research(),
@@ -4029,7 +5424,7 @@ impl App {
         let ipc_capability = capability.clone();
         let init_script = NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", &capability);
 
-        WebViewBuilder::new()
+        themed_webview_builder()
             .with_custom_protocol("neuralia-pdf".to_string(), move |_id, request| {
                 serve_pdf_asset(&bytes, &request)
             })
@@ -4143,7 +5538,7 @@ impl App {
         let init_script = format!("{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}")
             .replace("__NEURALIA_CAP__", &capability);
 
-        WebViewBuilder::new()
+        themed_webview_builder()
             .with_initialization_script(init_script)
             .with_ipc_handler(move |request| {
                 if let Some(action) =
@@ -4211,7 +5606,7 @@ impl App {
             format!("{NEURALIA_KEYMAP_SCRIPT}\n{EXTERNAL_RETURN_BUTTON}\n{agent_script}")
                 .replace("__NEURALIA_CAP__", &capability);
 
-        WebViewBuilder::new()
+        themed_webview_builder()
             .with_initialization_script(init_script)
             .with_ipc_handler(move |request| {
                 let Some(action) =
@@ -4240,8 +5635,8 @@ impl App {
                     || is_view_source_target(&target, nav_origin.as_deref())
             })
             .with_new_window_req_handler(move |target, _features| {
-                if remote_web_target(&target, local_origin.as_deref()) {
-                    let _ = new_window_proxy.send_event(UserEvent::OpenExternal(target));
+                if let Some(event) = external_new_window_event(target, local_origin.as_deref()) {
+                    let _ = new_window_proxy.send_event(event);
                 }
                 NewWindowResponse::Deny
             })
@@ -4346,6 +5741,23 @@ impl App {
                 self.finish_agent(reason);
             }
             AgentStepDecision::Extract => self.extract_agent_observation(&page),
+            AgentStepDecision::ConfirmExtract { security, reason } => {
+                let action = AgentAction::Extract {
+                    target: None,
+                    schema: "page-text".into(),
+                };
+                let approved =
+                    self.confirm_agent_action(&format!("{reason}: {}", page.url), &action);
+                if let Some(agent) = self.active_agent.as_mut() {
+                    agent.policy.record_user_confirmation(&security, approved);
+                }
+                if !approved {
+                    self.show_splash("Ação do agente cancelada.".to_string(), 3);
+                    self.finish_agent(AgentTermination::UserRejected);
+                    return;
+                }
+                self.extract_agent_observation(&page);
+            }
             AgentStepDecision::Act(act) => {
                 let AgentAct {
                     action,
@@ -4543,6 +5955,9 @@ impl App {
     }
 
     fn open_comparator(&mut self, query: &str) {
+        self.close_side_panel();
+        self.close_service_panel();
+        self.close_live_panel();
         let reuse_comparator = self
             .comparator
             .as_ref()
@@ -4580,6 +5995,7 @@ impl App {
         };
         // No comparador o chrome e nosso: a primeira linha recebe as abas e os
         // controles de janela; a segunda fica reservada aos provedores.
+        debug_log(format_args!("open_comparator: set_decorations(false)"));
         window.set_decorations(false);
         self.ensure_window_subclass();
 
@@ -4682,6 +6098,7 @@ impl App {
             groups: std::array::from_fn(|_| Vec::new()),
             next_group_id: 1,
             next_context_id: 1,
+            panel_width: 0.0,
         });
         self.activate_comparator(true);
     }
@@ -4873,7 +6290,12 @@ impl App {
         };
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
-        let logical_w = size.width as f64 / scale;
+        let logical_w = (size.width as f64 / scale
+            - self
+                .comparator
+                .as_ref()
+                .map_or(0.0, |comp| comp.panel_width))
+        .max(1.0);
         let logical_h = size.height as f64 / scale;
 
         let content_h = (logical_h - COMPARATOR_CHROME_HEIGHT).max(100.0);
@@ -4972,6 +6394,11 @@ impl App {
                     text,
                 })
             }
+            // Uma coluna so fala por si: o `col` tem de ser o dela.
+            IpcAction::Ask { col, text } if col == col_index => Some(UserEvent::AskEverywhere {
+                source_index: col_index,
+                text,
+            }),
             // Clique simples: a pagina abre nas TRES colunas, para se ver o
             // que cada IA diz dela. Ctrl+clique: abre no painel lateral e a
             // barra de titulo guarda a aba -- o "novo separador" do Chrome.
@@ -5037,7 +6464,7 @@ impl App {
         let auto_submit = AI_AUTO_SUBMIT_SCRIPT.replace("__NEURALIA_CAP__", &capability);
         let inject = COMPARATOR_INJECT_SCRIPT.replace("__NEURALIA_CAP__", &capability);
 
-        WebViewBuilder::new()
+        themed_webview_builder()
             .with_initialization_script(prelude)
             .with_initialization_script(keymap)
             .with_initialization_script(auto_submit)
@@ -5187,7 +6614,7 @@ impl App {
         )
         .replace("__NEURALIA_CAP__", &capability);
 
-        WebViewBuilder::new()
+        themed_webview_builder()
             .with_incognito(private)
             .with_initialization_script(init_script)
             .with_ipc_handler(move |request| {
@@ -5236,6 +6663,20 @@ impl App {
         self.open_split_mode(source_index, url, allow_local, false, None)
     }
 
+    /// Um pedido de split que chega depois de o comparador desaparecer (o
+    /// popup da pagina ficou na fila atras do Home) ainda pode abrir como Web
+    /// normal. Um pedido PRIVADO nao: web() grava historico, captura memoria
+    /// e usa o perfil com cookies normais.
+    fn split_request_fallback(surface: Surface, private: bool) -> SplitFallback {
+        if surface == Surface::Comparator {
+            SplitFallback::OpenSplit
+        } else if private {
+            SplitFallback::Ignore
+        } else {
+            SplitFallback::OpenWeb
+        }
+    }
+
     fn open_split_mode(
         &mut self,
         source_index: usize,
@@ -5244,9 +6685,13 @@ impl App {
         private: bool,
         existing_context_id: Option<u64>,
     ) -> bool {
-        if self.surface != Surface::Comparator {
-            self.web(url);
-            return true;
+        match Self::split_request_fallback(self.surface, private) {
+            SplitFallback::OpenSplit => {}
+            SplitFallback::OpenWeb => {
+                self.web(url);
+                return true;
+            }
+            SplitFallback::Ignore => return false,
         }
 
         let Ok(valid) = neural_core::validate_web_url(&url) else {
@@ -5332,8 +6777,9 @@ impl App {
 
                 // So uma fonte que abriu de verdade entra na memoria/sessao.
                 // Antes, uma falha de build deixava uma fonte fantasma gravada.
-                if let Some((title, mut document)) =
-                    split_source_memory(&valid, source_name, private)
+                if split_open_records_source(existing_context_id, private)
+                    && let Some((title, mut document)) =
+                        split_source_memory(&valid, source_name, private)
                 {
                     let value = valid.to_string();
                     if let Some(session) = &mut self.current_research {
@@ -5475,6 +6921,44 @@ impl App {
     }
 
     /// URL de pergunta do fornecedor da coluna.
+    /// Pergunta escrita e enviada numa coluna: segue tambem para as outras,
+    /// cada uma no seu fornecedor -- como o clique num link, que abre em
+    /// todas. A coluna de origem nao e tocada: ja esta a enviar e mantem o
+    /// contexto da conversa dela.
+    fn ask_other_columns(&mut self, source_index: usize, text: String) {
+        if self.surface != Surface::Comparator {
+            return;
+        }
+        let Some(count) = self.comparator.as_ref().map(|comp| comp.views.len()) else {
+            return;
+        };
+        let mut urls = Vec::new();
+        for index in ask_targets(source_index, count) {
+            match self.provider_query_url(index, &text) {
+                Ok(url) => urls.push((index, url)),
+                Err(error) => {
+                    self.show_splash(error.to_string(), 3);
+                    return;
+                }
+            }
+        }
+        debug_log(format_args!(
+            "ask: coluna {source_index} -> {} coluna(s), {} chars",
+            urls.len(),
+            text.chars().count()
+        ));
+        if let Some(comp) = &self.comparator {
+            for (index, url) in &urls {
+                if let Some(view) = comp.views.get(*index) {
+                    let _ = view.webview.load_url(url.as_str());
+                }
+            }
+        }
+        if let Some((_, url)) = urls.first() {
+            self.record(HistoryKind::Ask, text, url.to_string());
+        }
+    }
+
     fn provider_query_url(&self, source_index: usize, query: &str) -> neural_core::Result<Url> {
         match source_index {
             0 => google_ai_url(query, &self.config.language),
@@ -5561,6 +7045,60 @@ impl App {
         self.show_home();
     }
 
+    /// ‹ e › da barra: o historico da PAGINA, como no Chrome -- na fonte aberta
+    /// ao lado, na coluna expandida ou na pagina cheia. Com as tres colunas
+    /// lado a lado nao ha uma pagina so: o ‹ faz o voltar do app.
+    fn navigate_history(&mut self, step: HistoryStep) {
+        let target = history_nav_target(
+            self.surface,
+            self.comparator
+                .as_ref()
+                .is_some_and(|comp| comp.split.is_some()),
+            self.comparator.as_ref().and_then(|comp| comp.expanded),
+            self.webview.is_some(),
+        );
+        let script = match step {
+            HistoryStep::Back => "window.history.back();",
+            HistoryStep::Forward => "window.history.forward();",
+        };
+        let webview = match target {
+            HistoryNav::Split => self
+                .comparator
+                .as_ref()
+                .and_then(|comp| comp.split.as_ref())
+                .map(|split| &split.webview),
+            HistoryNav::Column(index) => self
+                .comparator
+                .as_ref()
+                .and_then(|comp| comp.views.get(index))
+                .map(|view| &view.webview),
+            HistoryNav::Page => self.webview.as_ref(),
+            HistoryNav::App => None,
+        };
+        match (webview, step) {
+            (Some(webview), _) => {
+                let _ = webview.evaluate_script(script);
+            }
+            (None, HistoryStep::Back) => self.go_back(),
+            (None, HistoryStep::Forward) => {}
+        }
+    }
+
+    /// ‹ › de uma IA: o historico da pagina daquela coluna, so dela.
+    fn navigate_column(&mut self, index: usize, step: HistoryStep) {
+        let script = match step {
+            HistoryStep::Back => "window.history.back();",
+            HistoryStep::Forward => "window.history.forward();",
+        };
+        if let Some(view) = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.views.get(index))
+        {
+            let _ = view.webview.evaluate_script(script);
+        }
+    }
+
     /// Liga/desliga a rolagem de leitura. O temporizador e nativo e nao vive na
     /// pagina: assim sobrevive a navegacao dentro do site.
     fn toggle_auto_scroll(&mut self) {
@@ -5573,29 +7111,10 @@ impl App {
             self.schedule_auto_scroll();
         }
 
-        self.announce_auto_scroll();
-
+        // A mensagem e a do meio da janela, como as outras dicas: o aviso
+        // dentro da pagina ficava no fundo e so aparecia nas colunas.
+        self.show_splash(auto_scroll_message(self.auto_scroll), 3);
         self.request_redraw();
-
-        if self.surface == Surface::Home {
-            self.status = Some(if self.auto_scroll {
-                format!("Rolagem automática ligada — {AUTO_SCROLL_SECONDS}s. F8 desliga.")
-            } else {
-                "Rolagem automática desligada.".to_string()
-            });
-            self.request_redraw();
-        }
-    }
-
-    /// Mostra na propria pagina em que estado esta a rolagem. A barra nativa
-    /// tambem o diz, mas em ecra completo ela esconde-se.
-    fn announce_auto_scroll(&self) {
-        let toast = AUTO_SCROLL_TOAST
-            .replace("__ON__", if self.auto_scroll { "true" } else { "false" })
-            .replace("__SECONDS__", &AUTO_SCROLL_SECONDS.to_string());
-        self.for_each_visible_webview(|webview| {
-            let _ = webview.evaluate_script(&toast);
-        });
     }
 
     /// Aviso flutuante, centrado no fundo da janela, que se apaga sozinho.
@@ -5623,10 +7142,10 @@ impl App {
                 // punha este aviso por cima de TODAS as aplicacoes depois de
                 // um Alt+Tab, que nunca foi o que se queria.
                 let created = CreateWindowExW(
-                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    AUX_POPUP_EX_STYLE,
                     windows_sys::w!("STATIC"),
                     windows_sys::w!(""),
-                    WS_POPUP | WS_VISIBLE,
+                    AUX_POPUP_STYLE,
                     0,
                     0,
                     width,
@@ -5687,16 +7206,17 @@ impl App {
             }
             let mut origin = POINT { x: 0, y: 0 };
             ClientToScreen(owner, &mut origin);
+            let (x, y) = splash_origin(client.right, client.bottom, width, height);
             SetWindowPos(
                 splash,
                 std::ptr::null_mut(),
-                origin.x + (client.right - width) / 2,
-                origin.y + client.bottom - height - (48.0 * scale) as i32,
+                origin.x + x,
+                origin.y + y,
                 width,
                 height,
                 SWP_NOACTIVATE,
             );
-            ShowWindow(splash, SW_SHOW);
+            show_popup_without_activation(splash);
             InvalidateRect(splash, std::ptr::null(), 1);
         }
     }
@@ -5744,10 +7264,10 @@ impl App {
                 // trabalho -- um aviso de email nosso nao tem nada que tapar a
                 // aplicacao de outra pessoa.
                 let created = CreateWindowExW(
-                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    AUX_POPUP_EX_STYLE,
                     windows_sys::w!("STATIC"),
                     windows_sys::w!(""),
-                    WS_POPUP | WS_VISIBLE,
+                    AUX_POPUP_STYLE,
                     0,
                     0,
                     width,
@@ -5764,7 +7284,7 @@ impl App {
                     created,
                     Some(gmail_toast_subclass),
                     GMAIL_TOAST_SUBCLASS_ID,
-                    0,
+                    (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize,
                 ) == 0
                 {
                     DestroyWindow(created);
@@ -5817,7 +7337,7 @@ impl App {
                 height,
                 SWP_NOACTIVATE,
             );
-            ShowWindow(toast, SW_SHOW);
+            show_popup_without_activation(toast);
             InvalidateRect(toast, std::ptr::null(), 1);
         }
     }
@@ -5889,7 +7409,7 @@ impl App {
             size: LogicalSize::new(1.0, 1.0).into(),
         };
 
-        let result = WebViewBuilder::new()
+        let result = themed_webview_builder()
             .with_initialization_script(init_script)
             .with_ipc_handler(move |request| {
                 let Some(IpcAction::GmailState {
@@ -5968,10 +7488,7 @@ impl App {
         if self.auto_scroll {
             self.auto_scroll_token = self.auto_scroll_token.wrapping_add(1);
             self.schedule_auto_scroll();
-            self.show_splash(
-                format!("Rolagem automática a cada {AUTO_SCROLL_SECONDS}s  ·  F8 desliga"),
-                4,
-            );
+            self.show_splash(auto_scroll_message(true), 4);
         }
     }
 
@@ -5994,10 +7511,7 @@ impl App {
         if yes {
             self.auto_scroll_token = self.auto_scroll_token.wrapping_add(1);
             self.schedule_auto_scroll();
-            self.show_splash(
-                format!("Rolagem automática ligada — {AUTO_SCROLL_SECONDS}s  ·  F8 desliga"),
-                4,
-            );
+            self.show_splash(auto_scroll_message(true), 4);
         }
         self.request_redraw();
     }
@@ -6423,7 +7937,7 @@ impl App {
     /// decoracao produzir outro HWND, o controlo e destruido e recriado no
     /// novo pai; nao se usa SetParent neste overlay.
     fn sync_caption_buttons(&mut self) {
-        let wanted = self.surface == Surface::Comparator && self.bar_visible();
+        let wanted = caption_buttons_wanted(self.surface, self.bar_visible());
         if !wanted {
             if let Some(buttons) = self.caption_buttons.take() {
                 unsafe {
@@ -6433,8 +7947,20 @@ impl App {
             return;
         }
 
-        let (Some(window), Some(layout)) = (&self.window, self.bar_layout()) else {
+        let Some(window) = &self.window else {
             return;
+        };
+        // Na Home nao ha barra do comparador, mas os botoes da janela ficam no
+        // mesmo sitio: a geometria deles so depende da largura.
+        let layout = match self.bar_layout() {
+            Some(layout) if self.surface == Surface::Comparator => layout,
+            _ => BarLayout::with_rows(
+                window.inner_size().width as f64,
+                window.scale_factor(),
+                true,
+                BarColumns::even(COMPARATOR_COLUMNS),
+                std::array::from_fn(|_| plan_tab_row(&[], &[])),
+            ),
         };
         let Some(owner) = window_hwnd(window) else {
             return;
@@ -6538,10 +8064,10 @@ impl App {
                 // dele; o TOPMOST so acrescentava ficar por cima das outras
                 // aplicacoes depois de um Alt+Tab.
                 let created = CreateWindowExW(
-                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    AUX_POPUP_EX_STYLE,
                     windows_sys::w!("STATIC"),
                     windows_sys::w!(""),
-                    WS_POPUP | WS_VISIBLE,
+                    AUX_POPUP_STYLE,
                     0,
                     0,
                     width,
@@ -6606,7 +8132,7 @@ impl App {
                 height,
                 SWP_NOACTIVATE,
             );
-            ShowWindow(button, SW_SHOW);
+            show_popup_without_activation(button);
         }
     }
 
@@ -6647,7 +8173,12 @@ impl App {
         let (show, boundaries, content_height, scale) = if let Some(comp) = &self.comparator {
             let scale = window.scale_factor().max(1.0);
             let size = window.inner_size();
-            let logical_w = size.width as f64 / scale;
+            let logical_w = (size.width as f64 / scale
+                - self
+                    .comparator
+                    .as_ref()
+                    .map_or(0.0, |comp| comp.panel_width))
+            .max(1.0);
             let logical_h = size.height as f64 / scale;
             let show = self.surface == Surface::Comparator
                 && comp.split.is_none()
@@ -6696,10 +8227,10 @@ impl App {
                     // de trabalho inteiro. Um divisor a flutuar por cima de
                     // outra aplicacao era o que o TOPMOST daqui fazia.
                     let created = CreateWindowExW(
-                        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                        AUX_POPUP_EX_STYLE,
                         windows_sys::w!("STATIC"),
                         windows_sys::w!(""),
-                        WS_POPUP | WS_VISIBLE,
+                        AUX_POPUP_STYLE,
                         0,
                         0,
                         width,
@@ -6744,7 +8275,7 @@ impl App {
                     height,
                     SWP_NOACTIVATE,
                 );
-                ShowWindow(hwnd, SW_SHOW);
+                show_popup_without_activation(hwnd);
                 InvalidateRect(hwnd, std::ptr::null(), 1);
             }
         }
@@ -6815,12 +8346,559 @@ impl App {
             .and_then(|layout| layout.hit(self.cursor.0, self.cursor.1))
     }
 
+    /// "Ir" da Home sob o rato: degradê e mao, para se ver que esta vivo e
+    /// responde ao clique. Fora da Home volta tudo ao normal.
+    fn update_home_go_hover(&mut self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let size = window.inner_size();
+        let hovered = home_go_hovered(
+            self.surface,
+            (size.width as f64, size.height as f64),
+            window.scale_factor(),
+            self.cursor,
+        );
+        if hovered == self.home_go_hover {
+            return;
+        }
+        self.home_go_hover = hovered;
+        window.set_cursor(if hovered {
+            CursorIcon::Pointer
+        } else {
+            CursorIcon::Default
+        });
+        self.request_redraw();
+    }
+
     fn update_bar_hover(&mut self) {
         let next = self.comparator_bar_hit();
         if next != self.bar_hover {
             self.bar_hover = next;
             self.request_redraw();
+            if let Some(owner) = self.window.as_ref().and_then(window_hwnd) {
+                let text = next.and_then(|hit| self.bar_tooltip_text(hit, owner));
+                hover_tooltip(owner, text.as_deref().unwrap_or(""));
+            }
         }
+    }
+
+    /// Os icones da barra: o servico abre no painel ao lado; de novo, fecha.
+    fn open_service_panel(&mut self, service: Service) {
+        let already = self
+            .service_panel
+            .as_ref()
+            .is_some_and(|(open, _)| *open == service);
+        self.close_service_panel();
+        if already {
+            return;
+        }
+        // Um painel de cada vez.
+        self.close_side_panel();
+        self.close_live_panel();
+        let Some(window) = &self.window else {
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
+        let size = window.inner_size();
+        let top = if self.surface == Surface::Comparator {
+            COMPARATOR_CHROME_HEIGHT
+        } else {
+            0.0
+        };
+        let (x, y, width, height) =
+            service_panel_bounds(size.width as f64 / scale, size.height as f64 / scale, top);
+        let built = themed_webview_builder()
+            .with_url(service.url())
+            .with_bounds(wry::Rect {
+                position: LogicalPosition::new(x, y).into(),
+                size: LogicalSize::new(width, height).into(),
+            })
+            .with_navigation_handler(|target| service_panel_allows_navigation(&target))
+            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+            // Caminho A do WebRTC: camera e microfone pelo aviso do WebView2.
+            .with_permission_handler(|kind| web_media_permission(kind, true))
+            .build_as_child(window);
+        match built {
+            Ok(panel) => {
+                let _ = panel.focus();
+                debug_log(format_args!("service panel: {service:?}"));
+                self.service_panel = Some((service, panel));
+                self.fit_comparator_to_panel();
+            }
+            Err(error) => {
+                self.show_splash(
+                    format!("Não foi possível abrir {}: {error}", service.label()),
+                    3,
+                );
+            }
+        }
+    }
+
+    fn close_service_panel(&mut self) {
+        if self.service_panel.take().is_some() {
+            debug_log(format_args!("service panel: fechado"));
+            self.fit_comparator_to_panel();
+        }
+    }
+
+    fn position_service_panel(&self) {
+        let (Some((_, panel)), Some(window)) = (&self.service_panel, &self.window) else {
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
+        let size = window.inner_size();
+        let top = if self.surface == Surface::Comparator {
+            COMPARATOR_CHROME_HEIGHT
+        } else {
+            0.0
+        };
+        let (x, y, width, height) =
+            service_panel_bounds(size.width as f64 / scale, size.height as f64 / scale, top);
+        let _ = panel.set_bounds(wry::Rect {
+            position: LogicalPosition::new(x, y).into(),
+            size: LogicalSize::new(width, height).into(),
+        });
+    }
+
+    /// O olho da barra: liga o Gemini Live (abre o painel, que pede a chave
+    /// na primeira vez e depois liga tela, camera e microfone); de novo,
+    /// desliga -- fechar o painel destroi a pagina e com ela tudo o que
+    /// estava a ser capturado.
+    fn toggle_live_panel(&mut self) {
+        if self.live_panel.is_open() {
+            self.close_live_panel();
+        } else {
+            self.open_live_panel();
+        }
+    }
+
+    fn live_panel_rect(&self) -> Option<wry::Rect> {
+        let window = self.window.as_ref()?;
+        let scale = window.scale_factor().max(1.0);
+        let size = window.inner_size();
+        let top = if self.surface == Surface::Comparator {
+            COMPARATOR_CHROME_HEIGHT
+        } else {
+            0.0
+        };
+        let (x, y, width, height) =
+            service_panel_bounds(size.width as f64 / scale, size.height as f64 / scale, top);
+        Some(wry::Rect {
+            position: LogicalPosition::new(x, y).into(),
+            size: LogicalSize::new(width, height).into(),
+        })
+    }
+
+    fn open_live_panel(&mut self) {
+        // Um painel de cada vez.
+        self.close_service_panel();
+        self.close_side_panel();
+        let Some(bounds) = self.live_panel_rect() else {
+            return;
+        };
+        let Some(window) = &self.window else {
+            return;
+        };
+        let proxy = self.proxy.clone();
+        let built = themed_webview_builder()
+            // Origem propria: `http://neuralia-live.localhost` e contexto
+            // seguro, e sem isso nao ha getUserMedia nem getDisplayMedia.
+            .with_custom_protocol(LIVE_PROTOCOL.to_string(), move |_id, request| {
+                serve_live_asset(&request)
+            })
+            .with_url(live_page_url())
+            .with_bounds(bounds)
+            .with_ipc_handler(live_panel_ipc_handler(move |event| {
+                let _ = proxy.send_event(event);
+            }))
+            .with_navigation_handler(live_panel_navigation)
+            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+            .with_permission_handler(live_panel_permission)
+            .build_as_child(window);
+        match built {
+            Ok(panel) => {
+                let _ = panel.focus();
+                debug_log(format_args!("live panel: ligado"));
+                self.live_panel.open(panel);
+                self.fit_comparator_to_panel();
+                self.request_redraw();
+            }
+            Err(error) => {
+                self.show_splash(format!("Não foi possível abrir o Gemini Live: {error}"), 3);
+            }
+        }
+    }
+
+    fn close_live_panel(&mut self) {
+        let Some(panel) = self.live_panel.close() else {
+            return;
+        };
+        let _ = panel.set_visible(false);
+        let _ = panel.focus_parent();
+        drop(panel);
+        debug_log(format_args!("live panel: desligado"));
+        self.fit_comparator_to_panel();
+        self.request_redraw();
+    }
+
+    fn position_live_panel(&self) {
+        if let (Some(panel), Some(bounds)) = (self.live_panel.view(), self.live_panel_rect()) {
+            let _ = panel.set_bounds(bounds);
+        }
+    }
+
+    fn live_eval(&self, script: &str) {
+        if let Some(panel) = self.live_panel.view() {
+            let _ = panel.evaluate_script(script);
+        }
+    }
+
+    fn handle_live_message(&mut self, message: LiveMessage) {
+        let store = LiveKeyStore::in_dir(&self.config.data_dir);
+        let step = live_step(message, &store, &panel_theme_vars(&Theme::system()));
+        // O script vem do painel depois de o olho mudar: vermelho antes de a
+        // captura poder comecar.
+        match self.live_panel.follow(step) {
+            LiveAction::Run(script) => self.live_eval(&script),
+            LiveAction::Close => self.close_live_panel(),
+            LiveAction::Nothing => {}
+        }
+        self.request_redraw();
+    }
+
+    /// O envelope da barra: liga e desliga os avisos do Gmail, e guarda.
+    fn toggle_gmail_notifications(&mut self) {
+        let on = !GMAIL_NOTIFICATIONS.load(Ordering::Acquire);
+        GMAIL_NOTIFICATIONS.store(on, Ordering::Release);
+        if let Err(error) = save_gmail_setting(&self.config.data_dir.join("gmail"), on) {
+            self.show_native_error(format!("Não foi possível guardar a escolha: {error}"));
+        }
+        if on {
+            self.schedule_gmail_probe(1);
+        } else {
+            // Desligar e mesmo desligar: sem WebView escondida a ler o Gmail.
+            self.gmail_monitor = None;
+            if let Some(toast) = self.gmail_toast {
+                unsafe {
+                    ShowWindow(toast, SW_HIDE);
+                }
+            }
+        }
+        self.show_splash(
+            if on {
+                "Avisos do Gmail ligados.".to_string()
+            } else {
+                "Avisos do Gmail desligados.".to_string()
+            },
+            2,
+        );
+        self.request_redraw();
+    }
+
+    /// Resposta ao "Abrir?" do aviso do Gmail.
+    fn answer_gmail(&mut self, open: bool) {
+        if let Some(toast) = self.gmail_toast {
+            unsafe {
+                ShowWindow(toast, SW_HIDE);
+            }
+        }
+        if open {
+            self.open_service_panel(Service::Gmail);
+        }
+    }
+
+    /// Largura que o painel aberto ocupa a direita do comparador (0 sem painel).
+    fn open_panel_width(&self) -> f64 {
+        let Some(window) = &self.window else {
+            return 0.0;
+        };
+        if self.surface != Surface::Comparator {
+            return 0.0;
+        }
+        let scale = window.scale_factor().max(1.0);
+        let size = window.inner_size();
+        let (width, height) = (size.width as f64 / scale, size.height as f64 / scale);
+        if self.service_panel.is_some() || self.live_panel.is_open() {
+            service_panel_bounds(width, height, COMPARATOR_CHROME_HEIGHT).2
+        } else if self.side_panel.is_some() {
+            side_panel_bounds(width, height, COMPARATOR_CHROME_HEIGHT).2
+        } else {
+            0.0
+        }
+    }
+
+    /// O comparador encolhe para o lado do painel, como no Chrome. Antes o
+    /// painel ficava POR CIMA das colunas, e os divisores e a paleta (popups)
+    /// apareciam por cima dele.
+    fn fit_comparator_to_panel(&mut self) {
+        let width = self.open_panel_width();
+        let Some(comp) = &mut self.comparator else {
+            return;
+        };
+        if (comp.panel_width - width).abs() < 0.5 {
+            return;
+        }
+        comp.panel_width = width;
+        self.update_comparator_layout();
+        self.sync_comparator_splitters();
+        self.position_palette();
+        self.request_redraw();
+    }
+
+    /// Ctrl+H: abre o historico inteligente ao lado; de novo (ou Esc), fecha.
+    fn toggle_side_panel(&mut self) {
+        if self.side_panel.is_some() {
+            self.close_side_panel();
+        } else {
+            self.open_side_panel();
+        }
+    }
+
+    fn side_panel_rect(&self) -> Option<wry::Rect> {
+        let window = self.window.as_ref()?;
+        let scale = window.scale_factor().max(1.0);
+        let size = window.inner_size();
+        let top = if self.surface == Surface::Comparator {
+            COMPARATOR_CHROME_HEIGHT
+        } else {
+            0.0
+        };
+        let (x, y, width, height) =
+            side_panel_bounds(size.width as f64 / scale, size.height as f64 / scale, top);
+        Some(wry::Rect {
+            position: LogicalPosition::new(x, y).into(),
+            size: LogicalSize::new(width, height).into(),
+        })
+    }
+
+    fn open_side_panel(&mut self) {
+        // Um painel de cada vez.
+        self.close_service_panel();
+        self.close_live_panel();
+        let Some(bounds) = self.side_panel_rect() else {
+            return;
+        };
+        let Some(window) = &self.window else {
+            return;
+        };
+        let proxy = self.proxy.clone();
+        // Criado por ultimo, fica por cima das outras WebViews.
+        let built = themed_webview_builder()
+            .with_html(panel_html(&Theme::system()))
+            .with_bounds(bounds)
+            .with_ipc_handler(move |request| {
+                if let Some(message) = parse_panel_message(request.body()) {
+                    let _ = proxy.send_event(UserEvent::Panel(message));
+                }
+            })
+            .with_navigation_handler(|target| panel_allows_navigation(&target))
+            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+            .build_as_child(window);
+        match built {
+            Ok(panel) => {
+                let _ = panel.focus();
+                self.side_panel = Some(panel);
+                self.fit_comparator_to_panel();
+                debug_log(format_args!(
+                    "side panel: aberto surface={:?}",
+                    self.surface
+                ));
+            }
+            Err(error) => {
+                self.show_splash(format!("Não foi possível abrir o painel: {error}"), 3);
+            }
+        }
+    }
+
+    fn close_side_panel(&mut self) {
+        if self.side_panel.take().is_none() {
+            return;
+        }
+        self.panel_suggestion_query = None;
+        debug_log(format_args!("side panel: fechado"));
+        self.fit_comparator_to_panel();
+        // Largar a WebView nao devolve o teclado a ninguem.
+        if self.surface == Surface::Home {
+            self.focus_omnibox();
+        }
+    }
+
+    fn position_side_panel(&self) {
+        if let (Some(panel), Some(bounds)) = (&self.side_panel, self.side_panel_rect()) {
+            let _ = panel.set_bounds(bounds);
+        }
+    }
+
+    fn panel_eval(&self, script: &str) {
+        if let Some(panel) = &self.side_panel {
+            let _ = panel.evaluate_script(script);
+        }
+    }
+
+    fn handle_panel_message(&mut self, message: PanelMessage) {
+        match message {
+            PanelMessage::Ready => {
+                if let Some(result) = self.history.recent(PANEL_RECENT_LIMIT) {
+                    self.panel_show_history(result);
+                }
+                // Sugestoes: a pergunta da pesquisa em curso contra a memoria
+                // local. Nada sai do computador.
+                if let Some(question) = self
+                    .current_research
+                    .as_ref()
+                    .map(|session| session.question.trim().to_string())
+                    .filter(|question| !question.is_empty())
+                {
+                    self.panel_suggestion_query = Some(question.clone());
+                    self.memory.query(question);
+                }
+            }
+            PanelMessage::Search(query) => self.memory.query(query),
+            PanelMessage::Open(input) => {
+                self.close_side_panel();
+                self.handle_input(input);
+            }
+            PanelMessage::Close => self.close_side_panel(),
+        }
+    }
+
+    fn panel_show_history(&self, result: Result<Vec<HistoryEntry>, String>) {
+        let (items, empty) = match result {
+            Ok(entries) => (
+                history_panel_items(&entries),
+                "Nenhuma pesquisa gravada ainda.".to_string(),
+            ),
+            Err(error) => (
+                Vec::new(),
+                format!("Não foi possível ler o histórico: {error}"),
+            ),
+        };
+        self.panel_eval(&panel_render_script("recentes", "Recentes", &empty, &items));
+    }
+
+    fn panel_show_memory(&mut self, query: &str, result: Result<Vec<MemoryHit>, String>) {
+        if self.panel_suggestion_query.as_deref() == Some(query) {
+            self.panel_suggestion_query = None;
+            if let Ok(hits) = result {
+                let items = suggestion_panel_items(&hits, PANEL_SUGGESTION_LIMIT);
+                self.panel_eval(&panel_render_script(
+                    "sugestoes",
+                    "Sugestões para esta pesquisa",
+                    "Nenhum site relacionado na sua memória ainda.",
+                    &items,
+                ));
+            }
+            return;
+        }
+        let script = match result {
+            Ok(hits) => panel_render_script(
+                "busca",
+                &format!("Busca: {query}"),
+                "Nada encontrado na memória local.",
+                &memory_panel_items(&hits),
+            ),
+            Err(error) => panel_render_script(
+                "busca",
+                "Busca",
+                &format!("Não foi possível consultar a memória: {error}"),
+                &[],
+            ),
+        };
+        self.panel_eval(&script);
+    }
+
+    /// Tema novo (mudou no Windows ou foi escolhido): barra, botoes nativos,
+    /// popups auxiliares e paginas. Antes, na mudanca do Windows, so a barra
+    /// se redesenhava e os botoes nativos ficavam com as cores velhas.
+    fn refresh_theme(&mut self) {
+        use windows_sys::Win32::Graphics::Gdi::{
+            RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RedrawWindow,
+        };
+        use wry::WebViewExtWindows;
+        Theme::invalidate();
+        self.needs_clear = true;
+        self.request_redraw();
+        if let Some(owner) = self.window.as_ref().and_then(window_hwnd) {
+            unsafe {
+                RedrawWindow(
+                    owner,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+                );
+            }
+        }
+        // Os popups owned nao sao filhos: o RDW_ALLCHILDREN nao os alcanca.
+        for hwnd in self.splitters.iter().flatten() {
+            unsafe {
+                InvalidateRect(*hwnd, std::ptr::null(), 1);
+            }
+        }
+        self.panel_eval(&format!(
+            "window.__neuraliaPanel && window.__neuraliaPanel.theme({});",
+            panel_theme_vars(&Theme::system())
+        ));
+        self.live_eval(&live_theme_script(&panel_theme_vars(&Theme::system())));
+        let theme = ThemeChoice::current().webview_theme();
+        if let Some(comp) = &self.comparator {
+            for view in &comp.views {
+                let _ = view.webview.set_theme(theme);
+            }
+            if let Some(split) = &comp.split {
+                let _ = split.webview.set_theme(theme);
+            }
+        }
+    }
+
+    fn choose_theme(&mut self, choice: ThemeChoice) {
+        choice.apply();
+        if let Err(error) = choice.save(&self.config.data_dir.join("theme")) {
+            self.show_native_error(format!("Não foi possível guardar o tema: {error}"));
+        }
+        self.refresh_theme();
+        self.show_splash(format!("{} ativado.", choice.label()), 2);
+    }
+
+    /// A dica do alvo `hit`, com o nome da IA, o endereco da aba ou o estado
+    /// do grupo que o clique vai usar.
+    fn bar_tooltip_text(&self, hit: BarHit, owner: HWND) -> Option<String> {
+        let comp = self.comparator.as_ref();
+        let column = match hit {
+            BarHit::Column(index)
+            | BarHit::AddTab(index)
+            | BarHit::ColumnBack(index)
+            | BarHit::ColumnForward(index) => Some(index),
+            BarHit::ContextTab { source_index, .. } | BarHit::ContextGroup { source_index, .. } => {
+                Some(source_index)
+            }
+            _ => None,
+        };
+        let provider = column
+            .and_then(|index| comp.and_then(|comp| comp.views.get(index)))
+            .map_or("IA", |view| view.name);
+        let tab_url = match hit {
+            BarHit::ContextTab {
+                source_index,
+                context_index,
+            } => comp
+                .and_then(|comp| comp.contexts.get(source_index))
+                .and_then(|tabs| tabs.get(context_index))
+                .map(|tab| tab.url.as_str()),
+            _ => None,
+        };
+        let group = match hit {
+            BarHit::ContextGroup {
+                source_index,
+                group_index,
+            } => comp
+                .and_then(|comp| comp.groups.get(source_index))
+                .and_then(|groups| groups.get(group_index))
+                .map(|group| (group.name.as_str(), group.collapsed)),
+            _ => None,
+        };
+        let maximized = unsafe { IsZoomed(owner) != 0 };
+        bar_tooltip_label(hit, provider, maximized, tab_url, group)
     }
 
     /// Abre a palette nativa sobre a coluna `source_index`. E um popup Win32,
@@ -6992,7 +9070,12 @@ impl App {
         };
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
-        let logical_w = size.width as f64 / scale;
+        let logical_w = (size.width as f64 / scale
+            - self
+                .comparator
+                .as_ref()
+                .map_or(0.0, |comp| comp.panel_width))
+        .max(1.0);
         let logical_h = size.height as f64 / scale;
         // Coluna sem faixa (minimizada, ou o layout mudou por baixo da
         // palette): usa-se a largura toda em vez de a esconder.
@@ -7084,14 +9167,26 @@ impl App {
     }
 
     fn open_context_tab(&mut self, source_index: usize, context_index: usize) -> bool {
+        let active = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.split.as_ref())
+            .map(|split| (split.source_index, split.context_id));
         self.context_tab_identity(source_index, context_index)
             .is_some_and(|(context_id, url)| {
-                self.open_split_mode(source_index, url, false, false, Some(context_id))
+                context_tab_click_is_noop(active, source_index, context_id)
+                    || self.open_split_mode(source_index, url, false, false, Some(context_id))
             })
     }
 
     fn open_context_tab_fullscreen(&mut self, source_index: usize, context_index: usize) {
-        if self.open_context_tab(source_index, context_index) {
+        if self.open_context_tab(source_index, context_index)
+            && !self
+                .comparator
+                .as_ref()
+                .and_then(|comp| comp.split.as_ref())
+                .is_some_and(|split| split.fullscreen)
+        {
             self.toggle_split_fullscreen();
         }
     }
@@ -7385,6 +9480,9 @@ impl App {
 
     fn click_comparator(&mut self) {
         let hit = self.comparator_bar_hit();
+        // O clique pode trocar a superficie; a dica nao fica a flutuar sobre
+        // a tela nova.
+        hover_tooltip(std::ptr::null_mut(), "");
         match hit {
             Some(BarHit::WindowMinimize) => {
                 if let Some(window) = &self.window {
@@ -7400,9 +9498,16 @@ impl App {
                 let _ = self.proxy.send_event(UserEvent::ExitRequested);
             }
             Some(BarHit::Private) => self.open_private_panel(),
+            Some(BarHit::Service(service)) => self.open_service_panel(service),
+            Some(BarHit::GmailToggle) => self.toggle_gmail_notifications(),
+            Some(BarHit::GeminiLive) => self.toggle_live_panel(),
             Some(BarHit::SplitClose) => self.close_split(),
             Some(BarHit::SplitExpand) => self.toggle_split_fullscreen(),
             Some(BarHit::Home) => self.show_home(),
+            Some(BarHit::Back) => self.navigate_history(HistoryStep::Back),
+            Some(BarHit::Forward) => self.navigate_history(HistoryStep::Forward),
+            Some(BarHit::ColumnBack(index)) => self.navigate_column(index, HistoryStep::Back),
+            Some(BarHit::ColumnForward(index)) => self.navigate_column(index, HistoryStep::Forward),
             Some(BarHit::Column(index)) => self.expand_comparator(index),
             Some(BarHit::AddTab(index)) => self.open_ai_palette(index),
             Some(BarHit::ContextTab {
@@ -7439,9 +9544,46 @@ impl App {
         let layout = HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
         let (x, y) = self.cursor;
 
+        // Sem a barra do Windows, a faixa de cima arrasta a janela -- como a
+        // barra do comparador.
+        if home_drag_strip(y, window.scale_factor()) && !layout.go.contains(x, y) {
+            let _ = window.drag_window();
+            return;
+        }
+
         if layout.go.contains(x, y) {
+            debug_log(format_args!("click_home: botao Ir"));
             self.submit_current();
         }
+    }
+}
+
+/// Atalhos com Ctrl quando o teclado esta na propria janela (depois de um
+/// clique na barra): os mesmos que o mapa de teclas das paginas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainShortcut {
+    AutoScroll,
+    Reload,
+    History,
+    NewTab,
+}
+
+fn main_window_shortcut(
+    key: &Key,
+    modifiers: winit::keyboard::ModifiersState,
+) -> Option<MainShortcut> {
+    if !modifiers.control_key() || modifiers.alt_key() {
+        return None;
+    }
+    let Key::Character(text) = key else {
+        return None;
+    };
+    match (text.to_lowercase().as_str(), modifiers.shift_key()) {
+        ("r", false) => Some(MainShortcut::AutoScroll),
+        ("r", true) => Some(MainShortcut::Reload),
+        ("h", false) => Some(MainShortcut::History),
+        ("n", false) => Some(MainShortcut::NewTab),
+        _ => None,
     }
 }
 
@@ -7605,6 +9747,12 @@ enum AgentStepDecision {
     Stop(AgentTermination),
     /// O comando `extract`: guardar o texto observado e terminar.
     Extract,
+    /// O `extract` que a política só deixa seguir com um sim humano (a
+    /// página está numa origem que a sessão não aprovou).
+    ConfirmExtract {
+        security: AgentSecurityAction,
+        reason: String,
+    },
     /// Executar a ação (em `Box` porque é muitas vezes maior do que as outras
     /// duas variantes).
     Act(Box<AgentAct>),
@@ -7640,7 +9788,34 @@ fn decide_agent_step(
     };
 
     let action = match command {
-        BrowserAgentCommand::Extract => return AgentStepDecision::Extract,
+        // O `extract` escreve a página na memória semântica: passa pelo gate
+        // como os outros. Saltava-o, e depois de um clique que levasse a outra
+        // origem a página dessa origem entrava na memória sem diálogo e sem
+        // entrada na auditoria (SPEC-0105 §4).
+        BrowserAgentCommand::Extract => {
+            let security = app_agent_security_action(
+                &AgentAction::Extract {
+                    target: None,
+                    schema: "page-text".into(),
+                },
+                page,
+            );
+            let decision = policy.evaluate(&security);
+            if decision.allowed {
+                return AgentStepDecision::Extract;
+            }
+            if decision.risk == ActionRisk::Restricted {
+                return AgentStepDecision::Stop(AgentTermination::RestrictedAction);
+            }
+            if !decision.requires_confirmation {
+                policy.record_user_confirmation(&security, false);
+                return AgentStepDecision::Stop(AgentTermination::UserRejected);
+            }
+            return AgentStepDecision::ConfirmExtract {
+                security,
+                reason: decision.reason,
+            };
+        }
         BrowserAgentCommand::Search(value) => page
             .elements
             .iter()
@@ -7704,6 +9879,24 @@ fn decide_agent_step(
 /// restrições inegociáveis do `md/README.md`. É aqui que isso se decide para
 /// este caminho, fora de qualquer janela, para um teste poder ficar vermelho se
 /// alguém inverter a condição.
+/// Reabrir uma aba de contexto ja gravada nao e uma fonte nova: a fonte
+/// entrou na sessao e na memoria quando a aba nasceu. Sem isto, cada clique
+/// A, B, A, B acrescentava outra copia a sessao persistida.
+fn split_open_records_source(existing_context_id: Option<u64>, private: bool) -> bool {
+    existing_context_id.is_none() && !private
+}
+
+/// Clicar na aba de contexto que o split ja mostra nao reconstroi o WebView:
+/// reconstruir voltava a URL original da aba e perdia o que o utilizador
+/// escreveu ou navegou.
+fn context_tab_click_is_noop(
+    active: Option<(usize, Option<u64>)>,
+    source_index: usize,
+    context_id: u64,
+) -> bool {
+    active == Some((source_index, Some(context_id)))
+}
+
 fn split_source_memory(
     url: &Url,
     source_name: &str,
@@ -7737,6 +9930,8 @@ enum InputRoute {
     MemoryQuery(String),
     MemoryRebuild,
     History,
+    /// `tema:claro`, `tema:escuro`, `tema:sistema` (None: palavra desconhecida).
+    Theme(Option<ThemeChoice>),
     ResearchCompare,
     ResearchSynthesize,
     ResearchExport,
@@ -7763,6 +9958,12 @@ fn route_input(input: &str) -> InputRoute {
         }
     }
 
+    if let Some(word) = trimmed
+        .strip_prefix("tema:")
+        .or_else(|| trimmed.strip_prefix("theme:"))
+    {
+        return InputRoute::Theme(ThemeChoice::parse(word));
+    }
     if let Some(spec) = input.strip_prefix("agent:") {
         return InputRoute::Agent(spec.trim().to_string());
     }
@@ -7916,13 +10117,63 @@ fn js_percent(value: &str) -> String {
         .replace('+', "%20")
 }
 
+/// Como o agente dá papel e nome a um elemento, num só texto que entra no
+/// `AGENT_OBSERVER_SCRIPT` e no guard do `agent_action_script`.
+///
+/// Eram duas fórmulas: o observador dizia `textbox`/`button`/`select` e o
+/// guard recalculava `el.type` (`text`, `submit`, `select-one`), sem o
+/// placeholder no nome. Nos controlos mais comuns o guard desistia em silêncio
+/// e o passo ficava no trace como feito. Com uma só definição não há o que
+/// divergir.
+macro_rules! agent_element_identity_js {
+    () => {
+        r#"
+  // `slice` conta unidades UTF-16 e pode partir um emoji: o surrogate que
+  // fica sozinho vira `\udXXX` no JSON, que o serde_json recusa, e a
+  // observacao inteira sumia. Qualquer surrogate sem par sai.
+  function clean(value, limit) {
+    return String(value || '').replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit)
+      .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
+  }
+
+  function fieldRole(el) {
+    const tag = (el.tagName || '').toLowerCase();
+    const type = (el.type || '').toLowerCase();
+    const autocomplete = (el.autocomplete || '').toLowerCase();
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    const name = (el.name || '').toLowerCase();
+    // Antes de tudo: o que o clique FAZ. Um submit de formulario e `submit`
+    // seja qual for o role ou o nome que a pagina lhe der; e o unico papel
+    // que faz o `app_agent_security_action` pedir confirmacao sem depender de
+    // o rotulo estar na lista de palavras.
+    if ((tag === 'button' && type === 'submit' && el.form) ||
+        (tag === 'input' && (type === 'submit' || type === 'image'))) return 'submit';
+    const combined = [type, autocomplete, role, name].join(' ');
+    if (combined.includes('password')) return 'password';
+    if (combined.includes('one-time') || combined.includes('otp')) return 'otp';
+    if (combined.includes('cc-') || combined.includes('card') || combined.includes('payment')) return 'payment-card';
+    if (combined.includes('email')) return 'email';
+    if (combined.includes('search')) return 'search';
+    if (tag === 'select') return 'select';
+    if (tag === 'input' || tag === 'textarea') return 'textbox';
+    return role || tag || 'element';
+  }
+
+  function elementName(el) {
+    return clean(el.getAttribute('aria-label') || el.name || el.innerText || el.textContent || el.placeholder, 96);
+  }
+"#
+    };
+}
+
 fn agent_action_script(action: &AgentAction) -> Result<String, String> {
     fn guard(target: &AgentElement) -> String {
         let id = js_percent(&target.id);
         let name = js_percent(&target.name);
         let role = js_percent(&target.role);
         format!(
-            "const id=decodeURIComponent('{id}');const expectedName=decodeURIComponent('{name}');             const expectedRole=decodeURIComponent('{role}');             const el=document.querySelector('[data-neuralia-agent-id=\"'+id+'\"]');             if(!el)return;             const actualName=((el.getAttribute('aria-label')||el.name||el.innerText||el.textContent||'').replace(/\\s+/g,' ').trim().slice(0,96));             const actualRole=(el.getAttribute('role')||el.type||el.tagName||'').toLowerCase();             if(expectedName && actualName!==expectedName)return;             if(expectedRole && actualRole!==expectedRole)return;"
+            "{identity}const id=decodeURIComponent('{id}');const expectedName=decodeURIComponent('{name}');             const expectedRole=decodeURIComponent('{role}');             const el=document.querySelector('[data-neuralia-agent-id=\"'+id+'\"]');             if(!el)return;             if(expectedName && elementName(el)!==expectedName)return;             if(expectedRole && fieldRole(el)!==expectedRole)return;",
+            identity = agent_element_identity_js!()
         )
     }
 
@@ -7999,6 +10250,9 @@ impl ApplicationHandler<UserEvent> for App {
             // nao cabe com folga em 1120 px. O `inner_size` fica como o tamanho
             // de restauro, para quem carregar no botao do meio.
             .with_maximized(true)
+            // Sem a barra do Windows em lado nenhum: a Home e o comparador desenham
+            // os seus proprios botoes da janela (pedido do dono).
+            .with_decorations(false)
             .with_inner_size(LogicalSize::new(1120.0, 760.0))
             .with_min_inner_size(LogicalSize::new(700.0, 500.0));
 
@@ -8011,6 +10265,7 @@ impl ApplicationHandler<UserEvent> for App {
                 window.set_ime_allowed(true);
                 self.window = Some(window);
                 self.create_omnibox();
+                self.sync_caption_buttons();
                 self.request_redraw();
 
                 // Abertura: a consulta padrao ja entra na omnibox e vai direto
@@ -8018,6 +10273,10 @@ impl ApplicationHandler<UserEvent> for App {
                 let startup = startup_input();
                 if !startup.is_empty() {
                     self.set_omnibox_text(&startup);
+                    debug_log(format_args!(
+                        "startup: SubmitText ({} chars)",
+                        startup.chars().count()
+                    ));
                     let _ = self.proxy.send_event(UserEvent::SubmitText(startup));
                 }
             }
@@ -8119,9 +10378,16 @@ impl ApplicationHandler<UserEvent> for App {
                 key,
             } => self.handle_gmail_state(unread, sender, subject, key),
             UserEvent::HideGmailToast(token) => self.hide_gmail_toast(token),
-            UserEvent::ShowHistory => self.show_history(),
+            UserEvent::ShowHistory => self.toggle_side_panel(),
+            UserEvent::ThemeChosen(choice) => self.choose_theme(choice),
+            UserEvent::Panel(message) => self.handle_panel_message(message),
+            UserEvent::Live(message) => self.handle_live_message(message),
+            UserEvent::GmailAnswer(open) => self.answer_gmail(open),
             UserEvent::ClearHistory => {
-                self.memory.clear();
+                if !self.confirm_clear_history() {
+                    return;
+                }
+                self.memory.clear(&mut self.current_research);
                 match self.history.clear() {
                     None => {
                         self.show_home();
@@ -8132,12 +10398,22 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::HistoryCleared(result) => self.report_history_cleared(result),
-            UserEvent::HistoryLoaded(result) => self.show_history_entries(result),
+            UserEvent::HistoryLoaded(result) => {
+                if self.side_panel.is_some() {
+                    self.panel_show_history(result);
+                } else {
+                    self.show_history_entries(result);
+                }
+            }
             UserEvent::HistoryWriteFailed(error) => {
                 self.show_splash(format!("Histórico não foi gravado: {error}"), 4);
             }
             UserEvent::MemoryQueryReady { query, result } => {
-                self.show_memory_results(&query, result);
+                if self.side_panel.is_some() {
+                    self.panel_show_memory(&query, result);
+                } else {
+                    self.show_memory_results(&query, result);
+                }
             }
             UserEvent::MemoryCleared(result) => {
                 if let Err(error) = result {
@@ -8146,6 +10422,9 @@ impl ApplicationHandler<UserEvent> for App {
                     self.status = Some("Histórico e memória semântica apagados.".to_string());
                     self.request_redraw();
                 }
+            }
+            UserEvent::AskEverywhere { source_index, text } => {
+                self.ask_other_columns(source_index, text)
             }
             UserEvent::ResearchAnswer { source_index, text } => {
                 let provider = self
@@ -8246,21 +10525,23 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::RestoreHomeDecorations => {
+                debug_log(format_args!(
+                    "RestoreHomeDecorations: surface={:?}",
+                    self.surface
+                ));
                 if self.surface == Surface::Home {
-                    // O controller já foi descartado. Primeiro escondemos
-                    // qualquer host WRY que ainda esteja preso ao HWND antigo,
-                    // depois restauramos a moldura e repetimos a limpeza no
-                    // HWND efetivo. Isto fecha a regressão em que, do segundo
-                    // ciclo em diante, três WRY_WEBVIEW ficavam visíveis sobre
-                    // a Home apesar de os WebView Rust já terem sido dropados.
+                    // O controller já foi descartado: esconde-se qualquer host
+                    // WRY ainda preso ao HWND (a regressão em que, do segundo
+                    // ciclo em diante, três WRY_WEBVIEW ficavam visíveis sobre a
+                    // Home apesar de os WebView Rust já terem sido dropados).
+                    // A Home fica sem a moldura do Windows, como o comparador;
+                    // aqui so se limpam os hosts WRY orfaos e se mostram os
+                    // botoes da janela do proprio app.
                     if let Some(window) = &self.window {
                         hide_orphaned_wry_hosts(window);
-                        window.set_decorations(true);
                     }
                     self.ensure_window_subclass();
-                    if let Some(window) = &self.window {
-                        hide_orphaned_wry_hosts(window);
-                    }
+                    self.sync_caption_buttons();
                     self.needs_clear = true;
                     self.position_omnibox();
                     self.request_redraw();
@@ -8323,7 +10604,7 @@ impl ApplicationHandler<UserEvent> for App {
                 match self.surface {
                     Surface::Home => {
                         if let Some(window) = &self.window {
-                            draw_home(window, self.status.as_deref());
+                            draw_home(window, self.status.as_deref(), self.home_go_hover);
                         }
                     }
                     Surface::Comparator => {
@@ -8336,31 +10617,45 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.bar_hover,
                                 self.bar_visible(),
                                 self.auto_scroll,
+                                &self.live_panel,
                             );
                         }
                     }
                     _ => {}
                 }
             }
-            WindowEvent::Resized(_) => match self.surface {
-                Surface::Home => {
-                    self.needs_clear = true;
-                    self.position_omnibox();
-                    self.request_redraw();
-                }
-                Surface::Comparator => {
-                    self.needs_clear = true;
-                    self.update_comparator_layout();
-                    self.sync_comparator_splitters();
-                    self.sync_exit_button();
-                    self.sync_home_button();
+            WindowEvent::Resized(size) => {
+                debug_log(format_args!(
+                    "resized {}x{} surface={:?}",
+                    size.width, size.height, self.surface
+                ));
+                self.fit_comparator_to_panel();
+                self.position_side_panel();
+                self.position_service_panel();
+                self.position_live_panel();
+                if self.surface == Surface::Home {
                     self.sync_caption_buttons();
-                    self.position_omnibox();
-                    self.position_palette();
-                    self.request_redraw();
                 }
-                _ => {}
-            },
+                match self.surface {
+                    Surface::Home => {
+                        self.needs_clear = true;
+                        self.position_omnibox();
+                        self.request_redraw();
+                    }
+                    Surface::Comparator => {
+                        self.needs_clear = true;
+                        self.update_comparator_layout();
+                        self.sync_comparator_splitters();
+                        self.sync_exit_button();
+                        self.sync_home_button();
+                        self.sync_caption_buttons();
+                        self.position_omnibox();
+                        self.position_palette();
+                        self.request_redraw();
+                    }
+                    _ => {}
+                }
+            }
             // Splash, toast, botao de saida, divisores e palette sao popups em
             // coordenadas de ECRA: mover a janela nao lhes toca. Ate aqui so o
             // Resized os sincronizava, por isso arrastar a janela deixava-os
@@ -8377,22 +10672,21 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.surface == Surface::Comparator && self.bar_visible() {
                     self.update_bar_hover();
                 }
+                self.update_home_go_hover();
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor = (-1.0, -1.0);
                 if self.surface == Surface::Comparator {
                     self.update_bar_hover();
                 }
+                self.update_home_go_hover();
             }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Focused(focused) => self.on_focus_changed(focused),
             WindowEvent::Occluded(occluded) => self.on_occluded_changed(occluded),
             // O tema do sistema mudou: o cache de 1 s tem de cair agora, e o
             // fundo inteiro e repintado porque ate a cor da pagina mudou.
-            WindowEvent::ThemeChanged(_) => {
-                Theme::invalidate();
-                self.needs_clear = true;
-                self.request_redraw();
-            }
+            WindowEvent::ThemeChanged(_) => self.refresh_theme(),
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
@@ -8408,6 +10702,15 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } if self.surface == Surface::Comparator => self.context_menu_comparator(),
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
+                if let Some(shortcut) = main_window_shortcut(&event.logical_key, self.modifiers) {
+                    match shortcut {
+                        MainShortcut::AutoScroll => self.toggle_auto_scroll(),
+                        MainShortcut::Reload => self.reload_page(),
+                        MainShortcut::History => self.toggle_side_panel(),
+                        MainShortcut::NewTab => self.new_tab(0),
+                    }
+                    return;
+                }
                 match event.logical_key {
                     Key::Named(NamedKey::Escape) => self.go_back(),
                     Key::Named(NamedKey::F8) => self.toggle_auto_scroll(),
@@ -8711,6 +11014,11 @@ fn neuralia_action(target: &str) -> Option<UserEvent> {
     })
 }
 
+/// Colunas que recebem a pergunta enviada em `source`: todas as outras.
+fn ask_targets(source: usize, count: usize) -> Vec<usize> {
+    (0..count).filter(|index| *index != source).collect()
+}
+
 fn common_ipc_event(action: IpcAction) -> Option<UserEvent> {
     Some(match action {
         IpcAction::Home => UserEvent::HomeRequested,
@@ -8845,6 +11153,28 @@ fn local_origin_of(url: &Url) -> Option<String> {
     is_local_network_target(url).then(|| url.origin().ascii_serialization())
 }
 
+/// Os pedidos de permissao do painel do Gemini Live. Camera, microfone e
+/// captura de ecra so pelo aviso do proprio WebView2 (`Default`); o resto e
+/// recusado. Nunca um `Allow`: e o utilizador quem decide, no aviso. O painel
+/// passa ESTA funcao ao `with_permission_handler`, e e ela que o gate chama.
+fn live_panel_permission(kind: PermissionKind) -> PermissionResponse {
+    web_media_permission(kind, true)
+}
+
+/// O handler do canal do painel do Gemini Live, tal como o wry o recebe. So
+/// mensagens publicadas pela pagina do painel e da lista fechada chegam a
+/// `send` (no app, o proxy do event loop; nos gates, um registo).
+fn live_panel_ipc_handler<S>(send: S) -> impl Fn(wry::http::Request<String>) + 'static
+where
+    S: Fn(UserEvent) + 'static,
+{
+    move |request| {
+        if let Some(message) = live_ipc_message(&request.uri().to_string(), request.body()) {
+            send(UserEvent::Live(message));
+        }
+    }
+}
+
 fn web_media_permission(kind: PermissionKind, user_visible: bool) -> PermissionResponse {
     if !user_visible {
         return PermissionResponse::Deny;
@@ -8857,6 +11187,15 @@ fn web_media_permission(kind: PermissionKind, user_visible: bool) -> PermissionR
         }
         _ => PermissionResponse::Deny,
     }
+}
+
+/// Pedido de janela nova vindo da pagina em Web completa. `window.open('',
+/// '_blank')` chega como `about:blank`: aceite pelo `remote_web_target` (para
+/// a navegacao), mas como destino de OpenExternal falha no validate_web_url e
+/// o erro destruia a pagina do utilizador e voltava ao Home.
+fn external_new_window_event(target: String, local_origin: Option<&str>) -> Option<UserEvent> {
+    (!target.eq_ignore_ascii_case("about:blank") && remote_web_target(&target, local_origin))
+        .then_some(UserEvent::OpenExternal(target))
 }
 
 fn remote_web_target(target: &str, local_origin: Option<&str>) -> bool {
@@ -8957,6 +11296,7 @@ fn home_frame_interval(minimized: bool, occluded: bool, focused: bool) -> Option
 /// excepcao intencional de um vazamento.
 fn gmail_monitor_enabled() -> bool {
     gmail_monitor_enabled_for(std::env::var_os("NEURALIA_NO_GMAIL"))
+        && GMAIL_NOTIFICATIONS.load(Ordering::Acquire)
 }
 
 /// Basta a variavel EXISTIR, como em NEURALIA_REDUCE_MOTION: `=0` ou vazia
@@ -9174,7 +11514,7 @@ unsafe fn draw_neural_tissue(
     }
 }
 
-fn draw_home(window: &Window, status: Option<&str>) {
+fn draw_home(window: &Window, status: Option<&str>, go_hover: bool) {
     let Ok(handle) = window.window_handle() else {
         return;
     };
@@ -9256,7 +11596,18 @@ fn draw_home(window: &Window, status: Option<&str>) {
             Some((theme.surface_line, scale)),
             theme.page_bg,
         );
-        draw_button(target, layout.go, "Ir", true, scale, body_font, &theme);
+        if go_hover {
+            // Parado com NEURALIA_REDUCE_MOTION; senao o degradê desliza ao
+            // ritmo dos frames da Home.
+            let phase = if home_animation_enabled() {
+                (now_ms() % GO_GRADIENT_PERIOD_MS) as f32 / GO_GRADIENT_PERIOD_MS as f32
+            } else {
+                0.0
+            };
+            draw_go_gradient(target, layout.go, phase, body_font, &theme);
+        } else {
+            draw_button(target, layout.go, "Ir", true, scale, body_font, &theme);
+        }
 
         if let Some(message) = status {
             SelectObject(target, small_font as _);
@@ -9302,12 +11653,13 @@ fn draw_home(window: &Window, status: Option<&str>) {
     }
 }
 
-fn draw_comparator_bar(
+fn draw_comparator_bar<W>(
     window: &Window,
     comp: &ComparatorState,
     hover: Option<BarHit>,
     visible: bool,
     auto_scroll: bool,
+    live: &LivePanel<W>,
 ) {
     let Ok(handle) = window.window_handle() else {
         return;
@@ -9370,6 +11722,7 @@ fn draw_comparator_bar(
             visible,
             hover,
             auto_scroll,
+            live,
             &Theme::system(),
         );
 
@@ -9390,7 +11743,7 @@ fn draw_comparator_bar(
 /// bitmap em memoria nos testes, que e como este visual se inspeciona sem ecra.
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
-unsafe fn paint_comparator_bar(
+unsafe fn paint_comparator_bar<W>(
     target: *mut core::ffi::c_void,
     width: i32,
     scale: f64,
@@ -9398,6 +11751,7 @@ unsafe fn paint_comparator_bar(
     visible: bool,
     hover: Option<BarHit>,
     auto_scroll: bool,
+    live: &LivePanel<W>,
     theme: &Theme,
 ) {
     let empty: [Vec<ContextTab>; COMPARATOR_COLUMNS] = std::array::from_fn(|_| Vec::new());
@@ -9414,12 +11768,15 @@ unsafe fn paint_comparator_bar(
         visible,
         hover,
         auto_scroll,
+        live,
         theme,
     );
 }
 
+/// `live` e o proprio painel do Gemini Live: o olho pinta-se do estado dele,
+/// nao de um booleano que o chamador possa trocar por `false`.
 #[allow(clippy::too_many_arguments)]
-unsafe fn paint_comparator_bar_with_contexts(
+unsafe fn paint_comparator_bar_with_contexts<W>(
     target: *mut core::ffi::c_void,
     width: i32,
     scale: f64,
@@ -9431,6 +11788,7 @@ unsafe fn paint_comparator_bar_with_contexts(
     visible: bool,
     hover: Option<BarHit>,
     auto_scroll: bool,
+    live: &LivePanel<W>,
     theme: &Theme,
 ) {
     let layout = BarLayout::with_rows(
@@ -9663,15 +12021,58 @@ unsafe fn paint_comparator_bar_with_contexts(
         );
     }
 
+    // ‹ e › da fonte aberta ao lado (so existem com a gaveta) e de cada IA.
+    let mut pairs = vec![
+        (layout.back, "‹", BarHit::Back),
+        (layout.forward, "›", BarHit::Forward),
+    ];
+    for index in 0..layout.columns_len {
+        pairs.push((layout.column_back[index], "‹", BarHit::ColumnBack(index)));
+        pairs.push((
+            layout.column_forward[index],
+            "›",
+            BarHit::ColumnForward(index),
+        ));
+    }
+    for (rect, label, hit) in pairs {
+        if rect.width > 0.0 {
+            draw_button(target, rect, label, hover == Some(hit), scale, font, theme);
+        }
+    }
+
     // Os mesmos rectangulos que o hit-testing usa; ver `right_controls`.
     let controls = right_controls(width as f64, scale, active_context.is_some());
-    draw_button(
+    let gmail_tint = if GMAIL_NOTIFICATIONS.load(Ordering::Acquire) {
+        theme.fg
+    } else {
+        theme.fg_muted
+    };
+    let icons = [
+        (ICON_SLOT_VIDEO, Some(theme.fg)),
+        (ICON_SLOT_WHATSAPP, None),
+        (ICON_SLOT_YOUTUBE, None),
+        (ICON_SLOT_MAIL, Some(gmail_tint)),
+    ];
+    for ((rect, hit), (slot, tint)) in controls.services.iter().zip(SERVICE_BUTTON_HITS).zip(icons)
+    {
+        draw_icon_button(target, *rect, slot, tint, hover == Some(hit), scale, theme);
+    }
+    draw_live_button(
+        target,
+        controls.live,
+        live.indicator(),
+        hover == Some(BarHit::GeminiLive),
+        scale,
+        theme,
+    );
+    // Privado: o chapeu e os oculos, sem nome (pedido do dono).
+    draw_icon_button(
         target,
         controls.private,
-        "Privado",
+        ICON_SLOT_INCOGNITO,
+        Some(theme.fg),
         hover == Some(BarHit::Private),
         scale,
-        tab_font,
         theme,
     );
 
@@ -9701,14 +12102,15 @@ unsafe fn paint_comparator_bar_with_contexts(
             font,
             theme,
         );
-        draw_button(
+        // Fechar a fonte: vermelho debaixo do rato, como o fechar da janela.
+        draw_pill(
             target,
             close,
             "×",
-            hover == Some(BarHit::SplitClose),
+            caption_button_style(2, hover == Some(BarHit::SplitClose), theme),
             scale,
             font,
-            theme,
+            theme.bar_bg,
         );
     }
 
@@ -10196,6 +12598,7 @@ mod tests {
                 weights: resized_weights(&weights, &visible, divider, mouse_x, 1120.0),
                 minimized: [false; COMPARATOR_COLUMNS],
                 split_active: false,
+                panel_width: 0.0,
             }
         }
 
@@ -10273,6 +12676,7 @@ mod tests {
                 weights,
                 minimized: [false, true, false],
                 split_active: false,
+                panel_width: 0.0,
             };
             let layout =
                 BarLayout::with_contexts(1120.0, 1.0, true, columns, [0; COMPARATOR_COLUMNS]);
@@ -10441,6 +12845,1469 @@ mod tests {
     }
 
     #[test]
+    fn auxiliary_popups_never_steal_activation_from_the_main_window() {
+        // Regressao 2.1.5: on_focus_changed volta a mostrar divisores e botao
+        // de saida a cada foco, e SW_SHOW ativava-os apesar de
+        // WS_EX_NOACTIVATE. A pagina clicada perdia o foco para um divisor
+        // escondido: cliques sem efeito, sem cursor, teclado no vazio.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, SetActiveWindow};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindowVisible, WS_OVERLAPPEDWINDOW};
+        unsafe {
+            let owner = CreateWindowExW(
+                0,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!("NeuralIA dono"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                0,
+                0,
+                320,
+                240,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!owner.is_null(), "a janela dona tem de nascer");
+            SetActiveWindow(owner);
+            assert_eq!(
+                GetActiveWindow(),
+                owner,
+                "pre-condicao: o dono e a janela ativa"
+            );
+
+            // A mesma receita de criacao que o produto usa nos quatro popups.
+            let popup = CreateWindowExW(
+                AUX_POPUP_EX_STYLE,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!(""),
+                AUX_POPUP_STYLE,
+                0,
+                0,
+                7,
+                100,
+                owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!popup.is_null(), "o popup auxiliar tem de nascer");
+            let after_create = GetActiveWindow();
+
+            // Cada ganho de foco da janela volta a mostrar o popup.
+            let mut stolen_on_show = None;
+            for cycle in 0..3 {
+                show_popup_without_activation(popup);
+                if GetActiveWindow() != owner && stolen_on_show.is_none() {
+                    stolen_on_show = Some(cycle);
+                }
+            }
+            let visible = IsWindowVisible(popup) != 0;
+            DestroyWindow(popup);
+            DestroyWindow(owner);
+
+            assert_eq!(
+                after_create, owner,
+                "criar o popup roubou a ativacao ao dono"
+            );
+            assert_eq!(
+                stolen_on_show, None,
+                "mostrar o popup roubou a ativacao ao dono no ciclo {stolen_on_show:?}"
+            );
+            assert!(visible, "o popup tem de ficar visivel depois de mostrado");
+        }
+    }
+
+    #[test]
+    fn small_button_glyphs_draw_on_the_pill_not_on_a_white_box() {
+        // Regressao 2.1.5: o botao Home e os botoes -/□/x pintam num DC de
+        // BeginPaint, que nasce OPAQUE com fundo branco -- o texto saia num
+        // quadrado branco. E o "+" dos botoes redondos virava "-." porque a
+        // margem de 11 px deixava ~10 px de texto e o DT_END_ELLIPSIS cortava.
+        use windows_sys::Win32::Graphics::Gdi::{
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC,
+            DIB_RGB_COLORS, DeleteDC, GetDC, RGBQUAD, ReleaseDC,
+        };
+        // O botao "+" tal como a barra real o calcula (26x26 a escala 1).
+        let plus =
+            BarLayout::with_contexts(1440.0, 1.0, true, BarColumns::even(3), [0, 0, 0]).add_tabs[0];
+        let (width, height) = (plus.width.round() as i32, plus.height.round() as i32);
+        assert!(width > 0 && height > 0, "a barra tem de ter o botao \"+\"");
+        let mut theme = Theme::dark((0, 120, 215));
+        // Texto vermelho: distinguivel do fundo escuro e do branco do bug.
+        theme.fg = (220, 30, 30);
+        unsafe {
+            let screen = GetDC(std::ptr::null_mut());
+            let mem = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, width, height);
+            ReleaseDC(std::ptr::null_mut(), screen);
+            assert!(!mem.is_null() && !bitmap.is_null());
+            let old = SelectObject(mem, bitmap as _);
+            let font = create_font(-13, FW_NORMAL as i32);
+            draw_button(
+                mem,
+                UiRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: width as f64,
+                    height: height as f64,
+                },
+                "+",
+                false,
+                1.0,
+                font,
+                &theme,
+            );
+            let mut info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    biSizeImage: (width * height * 4) as u32,
+                    biXPelsPerMeter: 0,
+                    biYPelsPerMeter: 0,
+                    biClrUsed: 0,
+                    biClrImportant: 0,
+                },
+                bmiColors: [RGBQUAD {
+                    rgbBlue: 0,
+                    rgbGreen: 0,
+                    rgbRed: 0,
+                    rgbReserved: 0,
+                }; 1],
+            };
+            let mut pixels = vec![0u8; (width * height * 4) as usize];
+            let read = GetDIBits(
+                mem,
+                bitmap,
+                0,
+                height as u32,
+                pixels.as_mut_ptr() as _,
+                &mut info,
+                DIB_RGB_COLORS,
+            );
+            SelectObject(mem, old);
+            DeleteObject(font as _);
+            DeleteObject(bitmap as _);
+            DeleteDC(mem);
+            assert_eq!(read, height, "GetDIBits tem de ler o botao inteiro");
+
+            let at = |x: i32, y: i32| {
+                let i = ((y * width + x) * 4) as usize;
+                (pixels[i + 2], pixels[i + 1], pixels[i]) // BGRA -> RGB
+            };
+            let white = (0..height)
+                .flat_map(|y| (0..width).map(move |x| (x, y)))
+                .filter(|&(x, y)| at(x, y) == (255, 255, 255))
+                .count();
+            assert_eq!(
+                white, 0,
+                "{white} pixels brancos: o texto pintou o seu fundo opaco"
+            );
+
+            // O "+" tem traco vertical: tinta vermelha acima E abaixo do centro.
+            let red = |x: i32, y: i32| {
+                let (r, g, _) = at(x, y);
+                r > 110 && r as i32 > g as i32 + 50
+            };
+            let column = |ys: std::ops::Range<i32>| {
+                ys.into_iter()
+                    .any(|y| (width / 2 - 2..=width / 2 + 2).any(|x| red(x, y)))
+            };
+            let mid = height / 2;
+            assert!(
+                column(mid - 6..mid - 1) && column(mid + 2..mid + 7),
+                "sem traco vertical no centro: o \"+\" foi cortado em reticencias"
+            );
+        }
+    }
+
+    #[test]
+    fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
+        let url = "https://exemplo.pt/artigo";
+        for hit in [
+            BarHit::Home,
+            BarHit::Back,
+            BarHit::Forward,
+            BarHit::ColumnBack(1),
+            BarHit::ColumnForward(1),
+            BarHit::Column(1),
+            BarHit::AddTab(1),
+            BarHit::ContextTab {
+                source_index: 1,
+                context_index: 0,
+            },
+            BarHit::ContextGroup {
+                source_index: 1,
+                group_index: 0,
+            },
+            BarHit::SplitExpand,
+            BarHit::SplitClose,
+            BarHit::Private,
+            BarHit::Service(Service::WhatsApp),
+            BarHit::GmailToggle,
+            BarHit::GeminiLive,
+            BarHit::WindowMinimize,
+            BarHit::WindowMaximize,
+            BarHit::WindowClose,
+        ] {
+            let label =
+                bar_tooltip_label(hit, "ChatGPT", false, Some(url), Some(("Pesquisa", true)));
+            assert!(
+                label.as_deref().is_some_and(|text| !text.trim().is_empty()),
+                "{hit:?} ficou sem dica"
+            );
+        }
+        let label = |hit, maximized| {
+            bar_tooltip_label(
+                hit,
+                "ChatGPT",
+                maximized,
+                Some(url),
+                Some(("Pesquisa", true)),
+            )
+        };
+        assert_eq!(
+            label(BarHit::AddTab(1), false).as_deref(),
+            Some("Nova pergunta ao ChatGPT")
+        );
+        assert_eq!(
+            label(BarHit::WindowMaximize, false).as_deref(),
+            Some("Maximizar")
+        );
+        assert_eq!(
+            label(BarHit::WindowMaximize, true).as_deref(),
+            Some("Restaurar")
+        );
+        let tab = BarHit::ContextTab {
+            source_index: 1,
+            context_index: 0,
+        };
+        assert!(label(tab, false).is_some_and(|text| text.starts_with(url)));
+        let group = BarHit::ContextGroup {
+            source_index: 1,
+            group_index: 0,
+        };
+        assert!(label(group, false).is_some_and(|text| text.contains("mostrar as abas")));
+    }
+
+    #[test]
+    fn hovering_a_target_shows_its_hint_in_the_center_and_leaving_hides_it() {
+        // O que o dono ve: a dica como mensagem no MEIO da janela, visivel,
+        // com o texto do alvo, sem roubar a ativacao, e escondida ao sair.
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, SetActiveWindow};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindowRect, IsWindowVisible, WS_OVERLAPPEDWINDOW,
+        };
+        unsafe {
+            let owner = CreateWindowExW(
+                0,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!("NeuralIA dono"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                0,
+                0,
+                900,
+                600,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!owner.is_null(), "a janela tem de nascer");
+            SetActiveWindow(owner);
+
+            // O rato para no minimizar, passa para o fechar e o temporizador
+            // dispara (aqui sem esperar os 450 ms).
+            hover_tooltip(owner, "Minimizar");
+            hover_tooltip(owner, "Fechar");
+            show_pending_tooltip();
+            let hint = HINT_HWND.load(Ordering::Acquire) as HWND;
+            let shown = !hint.is_null() && IsWindowVisible(hint) != 0;
+            let text = HINT_TEXT
+                .lock()
+                .map(|value| value.clone())
+                .unwrap_or_default();
+            let active = GetActiveWindow();
+            let mut box_rect = RECT::default();
+            GetWindowRect(hint, &mut box_rect);
+            let mut client = RECT::default();
+            GetClientRect(owner, &mut client);
+            let mut origin = POINT { x: 0, y: 0 };
+            ClientToScreen(owner, &mut origin);
+            let owner_center = (origin.x + client.right / 2, origin.y + client.bottom / 2);
+            let hint_center = (
+                (box_rect.left + box_rect.right) / 2,
+                (box_rect.top + box_rect.bottom) / 2,
+            );
+
+            // O rato sai de todos os alvos.
+            hover_tooltip(owner, "");
+            let hidden = IsWindowVisible(hint) == 0;
+            DestroyWindow(owner);
+
+            assert!(shown, "a dica nao apareceu depois do atraso");
+            assert_eq!(text, "Fechar", "a dica nao acompanhou o rato");
+            assert_eq!(active, owner, "a dica roubou a ativacao a janela");
+            assert!(
+                (hint_center.0 - owner_center.0).abs() <= 1
+                    && (hint_center.1 - owner_center.1).abs() <= 1,
+                "a dica nao esta no meio: {hint_center:?} vs {owner_center:?}"
+            );
+            assert!(hidden, "a dica ficou a vista depois de o rato sair");
+        }
+    }
+
+    #[test]
+    fn theme_choice_is_saved_loaded_and_overrides_the_system() {
+        let dir = std::env::temp_dir().join(format!("neuralia-theme-{}", std::process::id()));
+        let path = dir.join("theme");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            ThemeChoice::load(&path),
+            ThemeChoice::System,
+            "sem ficheiro vale o sistema"
+        );
+        ThemeChoice::Dark
+            .save(&path)
+            .expect("o tema tem de ficar guardado");
+        assert_eq!(
+            ThemeChoice::load(&path),
+            ThemeChoice::Dark,
+            "a escolha nao voltou"
+        );
+        std::fs::write(&path, "roxo").expect("escreve lixo");
+        assert_eq!(
+            ThemeChoice::load(&path),
+            ThemeChoice::System,
+            "lixo vale o sistema"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A escolha manda sobre o Windows; so "sistema" o segue.
+        let accent = system_accent();
+        assert_eq!(
+            Theme::read_for(ThemeChoice::Dark).page_bg,
+            Theme::dark(accent).page_bg
+        );
+        assert_eq!(
+            Theme::read_for(ThemeChoice::Light).page_bg,
+            Theme::light(accent).page_bg
+        );
+        let system = if system_dark_mode() {
+            Theme::dark(accent)
+        } else {
+            Theme::light(accent)
+        };
+        assert_eq!(Theme::read_for(ThemeChoice::System).page_bg, system.page_bg);
+
+        assert_eq!(
+            route_input("tema:escuro"),
+            InputRoute::Theme(Some(ThemeChoice::Dark))
+        );
+        assert_eq!(
+            route_input("tema: claro"),
+            InputRoute::Theme(Some(ThemeChoice::Light))
+        );
+        assert_eq!(
+            route_input("tema:sistema"),
+            InputRoute::Theme(Some(ThemeChoice::System))
+        );
+        assert_eq!(route_input("tema:roxo"), InputRoute::Theme(None));
+    }
+
+    #[test]
+    fn debug_log_appends_timestamped_lines_and_never_panics() {
+        let dir = std::env::temp_dir().join(format!("neuralia-debuglog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("pasta temporaria");
+        let path = dir.join("debug.log");
+        append_debug_line(
+            &path,
+            7,
+            format_args!("focus=true surface={:?}", Surface::Home),
+        );
+        append_debug_line(
+            &path,
+            1234,
+            format_args!("open_comparator: set_decorations(false)"),
+        );
+        let text = std::fs::read_to_string(&path).expect("o log tem de existir");
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            [
+                "       7 ms  focus=true surface=Home",
+                "    1234 ms  open_comparator: set_decorations(false)"
+            ]
+        );
+        // Um caminho impossivel nao derruba o app.
+        append_debug_line(&dir.join("nao/existe/debug.log"), 1, format_args!("x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn side_panel_messages_are_a_closed_list_with_limits() {
+        assert_eq!(
+            parse_panel_message(r#"{"action":"ready"}"#),
+            Some(PanelMessage::Ready)
+        );
+        assert_eq!(
+            parse_panel_message(r#"{"action":"close","args":{}}"#),
+            Some(PanelMessage::Close)
+        );
+        assert_eq!(
+            parse_panel_message(r#"{"action":"search","args":{"query":"  receita de bolo "}}"#),
+            Some(PanelMessage::Search("receita de bolo".to_string()))
+        );
+        assert_eq!(
+            parse_panel_message(r#"{"action":"open","args":{"input":"https://exemplo.pt"}}"#),
+            Some(PanelMessage::Open("https://exemplo.pt".to_string()))
+        );
+        for bad in [
+            r#"{"action":"clearhistory"}"#,
+            r#"{"action":"search","args":{"query":"   "}}"#,
+            r#"{"action":"search"}"#,
+            r#"{"action":"open","args":{"input":5}}"#,
+            "nao e json",
+        ] {
+            assert_eq!(parse_panel_message(bad), None, "{bad}");
+        }
+        let long = format!(
+            r#"{{"action":"search","args":{{"query":"{}"}}}}"#,
+            "a".repeat(PANEL_QUERY_MAX_CHARS + 1)
+        );
+        assert_eq!(parse_panel_message(&long), None, "consulta acima do limite");
+        let huge = format!(
+            r#"{{"action":"ready","pad":"{}"}}"#,
+            "x".repeat(PANEL_MESSAGE_MAX_BYTES)
+        );
+        assert_eq!(parse_panel_message(&huge), None, "mensagem acima de 4 KiB");
+    }
+
+    #[test]
+    fn side_panel_only_ever_shows_its_local_page() {
+        assert!(panel_allows_navigation("about:blank"));
+        assert!(panel_allows_navigation("data:text/html,<p>x</p>"));
+        for target in [
+            "https://exemplo.pt",
+            "http://127.0.0.1:8080/",
+            "file:///C:/Windows/win.ini",
+            "javascript:alert(1)",
+            "neuralia-pdf://viewer",
+            "about:blank.evil",
+        ] {
+            assert!(!panel_allows_navigation(target), "{target}");
+        }
+    }
+
+    #[test]
+    fn side_panel_sits_on_the_right_below_the_bar() {
+        // 34% de 1440 = 489.6, limitado a 440; por baixo da barra do comparador.
+        assert_eq!(
+            side_panel_bounds(1440.0, 900.0, 76.0),
+            (1000.0, 76.0, 440.0, 824.0)
+        );
+        // 34% de 900 = 306, levado ao minimo de 320; fora do comparador, do topo.
+        assert_eq!(
+            side_panel_bounds(900.0, 600.0, 0.0),
+            (580.0, 0.0, 320.0, 600.0)
+        );
+        // Janela mais estreita do que o minimo: o painel ocupa-a, nunca sai dela.
+        assert_eq!(
+            side_panel_bounds(250.0, 400.0, 0.0),
+            (0.0, 0.0, 250.0, 400.0)
+        );
+    }
+
+    #[test]
+    fn side_panel_data_reaches_the_page_as_text_never_as_html() {
+        // Os titulos vem de paginas remotas: nunca podem virar HTML no painel.
+        assert!(!PANEL_HTML.contains("innerHTML"));
+        assert!(!PANEL_HTML.contains("insertAdjacentHTML"));
+        assert!(!PANEL_HTML.contains("document.write"));
+        let hostile = PanelItem {
+            title: "<img src=x onerror=alert(1)>".to_string(),
+            detail: "</script><script>alert(2)</script>".to_string(),
+            input: "javascript:alert(3)".to_string(),
+        };
+        let script = panel_render_script("busca", "Busca", "vazio", std::slice::from_ref(&hostile));
+        let json = script
+            .strip_prefix("window.__neuraliaPanel && window.__neuraliaPanel.render(")
+            .and_then(|rest| rest.strip_suffix(");"))
+            .expect("formato do script");
+        let value: serde_json::Value = serde_json::from_str(json).expect("os dados vao como JSON");
+        assert_eq!(value["items"][0]["title"], hostile.title.as_str());
+        assert_eq!(value["items"][0]["detail"], hostile.detail.as_str());
+        assert_eq!(value["id"], "busca");
+    }
+
+    #[test]
+    fn side_panel_lists_history_search_and_one_suggestion_per_site() {
+        let entry = |kind, input: &str, target: &str| HistoryEntry {
+            timestamp_unix: 1,
+            kind,
+            input: input.to_string(),
+            target: target.to_string(),
+        };
+        let items = history_panel_items(&[
+            entry(HistoryKind::Ask, "o que e rust", ""),
+            entry(HistoryKind::Web, "exemplo.pt", "https://exemplo.pt/"),
+            entry(HistoryKind::Read, "   ", "https://vazio.pt/"),
+        ]);
+        assert_eq!(items.len(), 2, "entrada vazia nao vira item");
+        assert_eq!(items[0].detail, "IA");
+        assert_eq!(items[1].detail, "Web · https://exemplo.pt/");
+        assert_eq!(
+            items[1].input, "exemplo.pt",
+            "o clique repete o que foi escrito"
+        );
+
+        let hit = |title: &str, url: Option<&str>| MemoryHit {
+            id: title.to_string(),
+            title: title.to_string(),
+            url: url.map(str::to_string),
+            provider: None,
+            session_id: None,
+            excerpt: String::new(),
+            score: 1.0,
+            matched_by: Vec::new(),
+        };
+        let hits = [
+            hit("Aprender Rust", Some("https://www.rust-lang.org/learn")),
+            hit("Ferramentas", Some("https://rust-lang.org/tools")),
+            hit("Nota sem endereco", None),
+            hit("Ficheiro local", Some("file:///C:/notas.txt")),
+            hit("Docs", Some("https://docs.rs/")),
+        ];
+        let suggestions = suggestion_panel_items(&hits, 6);
+        assert_eq!(
+            suggestions
+                .iter()
+                .map(|item| item.detail.as_str())
+                .collect::<Vec<_>>(),
+            ["rust-lang.org", "docs.rs"],
+            "um site por dominio, so http(s)"
+        );
+        assert_eq!(suggestions[0].input, "https://www.rust-lang.org/learn");
+        assert_eq!(
+            suggestion_panel_items(&hits, 1).len(),
+            1,
+            "respeita o limite"
+        );
+
+        let search = memory_panel_items(&hits[2..3]);
+        assert_eq!(
+            search[0].input, "Nota sem endereco",
+            "sem endereco, o clique repete a busca"
+        );
+    }
+
+    #[test]
+    fn every_ai_column_has_its_own_back_and_forward_after_its_plus() {
+        let layout = BarLayout::with_contexts(1440.0, 1.0, true, BarColumns::even(3), [0, 0, 0]);
+        for index in 0..3 {
+            let (plus, back, forward) = (
+                layout.add_tabs[index],
+                layout.column_back[index],
+                layout.column_forward[index],
+            );
+            assert!(
+                back.width > 0.0 && forward.width > 0.0,
+                "coluna {index} sem ‹ ›"
+            );
+            assert!(
+                back.x >= plus.x + plus.width,
+                "o ‹ vem depois do + na coluna {index}"
+            );
+            assert!(
+                forward.x >= back.x + back.width,
+                "o › vem depois do ‹ na coluna {index}"
+            );
+            if index + 1 < 3 {
+                assert!(
+                    forward.x + forward.width <= layout.columns[index + 1].x,
+                    "os ‹ › da coluna {index} invadem a coluna seguinte"
+                );
+            }
+            let center = |rect: UiRect| (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+            assert_eq!(
+                layout.hit(center(back).0, center(back).1),
+                Some(BarHit::ColumnBack(index))
+            );
+            assert_eq!(
+                layout.hit(center(forward).0, center(forward).1),
+                Some(BarHit::ColumnForward(index))
+            );
+        }
+        // Janela estreita: a pilula encolhe primeiro; o par ou cabe na faixa da
+        // coluna ou desaparece -- nunca fica por cima da IA seguinte.
+        for width in (560..=1600).step_by(20) {
+            let narrow =
+                BarLayout::with_contexts(width as f64, 1.0, true, BarColumns::even(3), [0, 0, 0]);
+            for index in 0..2 {
+                let forward = narrow.column_forward[index];
+                assert!(
+                    forward.width == 0.0
+                        || forward.x + forward.width <= narrow.columns[index + 1].x,
+                    "a {width}px os ‹ › da coluna {index} invadem a coluna seguinte"
+                );
+            }
+        }
+        // Sem fonte aberta ao lado, nao ha o par da fonte.
+        assert_eq!(layout.back.width, 0.0);
+        // Com a fonte aberta, o par dela fica a esquerda do rotulo.
+        let drawer = right_controls(1440.0, 1.0, true);
+        let ((back, forward), (label, _, _)) = (
+            drawer.split_nav.expect("‹ › da fonte"),
+            drawer.split.expect("gaveta"),
+        );
+        assert!(forward.x + forward.width <= label.x && back.x + back.width <= forward.x);
+        assert!(
+            drawer.private.x + drawer.private.width <= back.x,
+            "Privado antes do par"
+        );
+    }
+
+    #[test]
+    fn back_and_forward_move_the_page_the_user_is_reading() {
+        use HistoryNav::*;
+        // A fonte aberta ao lado ganha a tudo: e la que se seguem links.
+        assert_eq!(
+            history_nav_target(Surface::Comparator, true, Some(1), false),
+            Split
+        );
+        assert_eq!(
+            history_nav_target(Surface::Comparator, false, Some(2), false),
+            Column(2)
+        );
+        // Tres colunas lado a lado: nao ha uma pagina so.
+        assert_eq!(
+            history_nav_target(Surface::Comparator, false, None, false),
+            App
+        );
+        assert_eq!(history_nav_target(Surface::Home, false, None, false), App);
+    }
+
+    #[test]
+    fn home_has_no_windows_title_bar_but_keeps_its_window_buttons() {
+        // A Home ficou sem a barra do Windows (pedido do dono): sem os botoes
+        // do proprio app, nao haveria como minimizar nem fechar.
+        assert!(caption_buttons_wanted(Surface::Home, false));
+        assert!(caption_buttons_wanted(Surface::Comparator, true));
+        assert!(!caption_buttons_wanted(Surface::Comparator, false));
+        // E a janela agarra-se pela faixa de cima, nao pelo meio da Home.
+        assert!(home_drag_strip(4.0, 1.0));
+        assert!(home_drag_strip(TITLE_TAB_HEIGHT * 2.0 - 1.0, 2.0));
+        assert!(!home_drag_strip(TITLE_TAB_HEIGHT + 20.0, 1.0));
+    }
+
+    #[test]
+    fn the_close_button_turns_red_under_the_mouse_like_chrome() {
+        let theme = Theme::dark((0, 120, 215));
+        let close = caption_button_style(2, true, &theme);
+        assert_eq!(
+            close.fill, CLOSE_HOVER_RED,
+            "o fechar debaixo do rato e vermelho"
+        );
+        assert_eq!(close.text, (255, 255, 255), "com a cruz branca");
+        assert_ne!(caption_button_style(2, false, &theme).fill, CLOSE_HOVER_RED);
+        // O ✕ do painel lateral segue a mesma regra (CSS da pagina local).
+        assert!(PANEL_HTML.contains("#close:hover{background:#e81123;color:#fff}"));
+        for index in [0, 1] {
+            let style = caption_button_style(index, true, &theme);
+            assert_ne!(style.fill, CLOSE_HOVER_RED, "so o fechar fica vermelho");
+            assert_ne!(
+                style.fill,
+                caption_button_style(index, false, &theme).fill,
+                "realce"
+            );
+        }
+    }
+
+    #[test]
+    fn service_icons_sit_left_of_private_without_overlap_and_hit_their_service() {
+        let controls = right_controls(1600.0, 1.0, false);
+        let order = [
+            BarHit::Service(Service::Meet),
+            BarHit::Service(Service::WhatsApp),
+            BarHit::Service(Service::YouTube),
+            BarHit::GmailToggle,
+        ];
+        let mut previous_right = f64::MIN;
+        for (rect, hit) in controls.services.iter().zip(order) {
+            assert!(rect.width > 0.0, "{hit:?} tem de existir");
+            assert!(rect.x >= previous_right, "{hit:?} sobrepoe o vizinho");
+            previous_right = rect.x + rect.width;
+            let center = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+            assert_eq!(right_controls_hit(controls, center.0, center.1), Some(hit));
+        }
+        assert!(
+            previous_right <= controls.private.x,
+            "os icones ficam a esquerda do Privado"
+        );
+        // O olho do Gemini Live abre a fila, a esquerda da videochamada.
+        assert!(controls.live.x + controls.live.width <= controls.services[0].x);
+        assert_eq!(controls.leftmost(), controls.live.x);
+        // O Privado passa a ser um botao redondo so com o icone.
+        assert_eq!(controls.private.width, controls.private.height);
+        // Com a gaveta aberta tudo continua a esquerda dela.
+        let drawer = right_controls(1600.0, 1.0, true);
+        let (label, _, _) = drawer.split.expect("gaveta");
+        assert!(drawer.private.x + drawer.private.width <= label.x);
+    }
+
+    #[test]
+    fn the_gemini_live_eye_toggles_live_and_says_what_it_sends() {
+        for (width, split) in [(1600.0, false), (1440.0, true), (1120.0, false)] {
+            let controls = right_controls(width, 1.0, split);
+            let live = controls.live;
+            assert!(
+                live.width > 0.0 && live.width == live.height,
+                "botao redondo"
+            );
+            assert_eq!(
+                live.y, controls.services[0].y,
+                "na mesma linha dos servicos"
+            );
+            assert!(
+                live.x + live.width <= controls.services[0].x,
+                "sem sobrepor a videochamada"
+            );
+            let (cx, cy) = (live.x + live.width / 2.0, live.y + live.height / 2.0);
+            assert_eq!(
+                right_controls_hit(controls, cx, cy),
+                Some(BarHit::GeminiLive)
+            );
+            // A borda do vizinho continua do vizinho.
+            let meet = controls.services[0];
+            assert_eq!(
+                right_controls_hit(controls, meet.x + 1.0, cy),
+                Some(BarHit::Service(Service::Meet))
+            );
+            // As pilulas e os "+" das colunas param antes do olho.
+            let columns = BarColumns {
+                split_active: split,
+                ..BarColumns::even(3)
+            };
+            let layout = BarLayout::with_contexts(width, 1.0, true, columns, [0, 0, 0]);
+            for index in 0..3 {
+                for rect in [
+                    layout.columns[index],
+                    layout.add_tabs[index],
+                    layout.column_forward[index],
+                ] {
+                    assert!(
+                        rect.width == 0.0 || rect.x + rect.width <= live.x,
+                        "a {width}px a coluna {index} invade o Gemini Live"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            bar_tooltip_label(BarHit::GeminiLive, "IA", false, None, None).as_deref(),
+            Some("Gemini Live: ver a tela, câmera e microfone (liga/desliga)")
+        );
+    }
+
+    /// O botao do Gemini Live, desenhado de verdade num bitmap: ligado fica
+    /// vermelho cheio com o olho branco; desligado tem as cores dos outros; em
+    /// espera (painel aberto, nada a sair) so o olho e a borda sao vermelhos.
+    #[test]
+    fn the_gemini_live_eye_is_red_while_live() {
+        let theme = Theme::dark((0, 120, 212));
+        let paint = |indicator: LiveIndicator| -> Vec<(u8, u8, u8)> {
+            let (width, height) = (40i32, 40i32);
+            unsafe {
+                let screen = GetDC(std::ptr::null_mut());
+                let mem = CreateCompatibleDC(screen);
+                let bitmap = CreateCompatibleBitmap(screen, width, height);
+                ReleaseDC(std::ptr::null_mut(), screen);
+                assert!(!mem.is_null() && !bitmap.is_null());
+                let old = SelectObject(mem, bitmap as _);
+                draw_live_button(
+                    mem,
+                    UiRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: width as f64,
+                        height: height as f64,
+                    },
+                    indicator,
+                    false,
+                    1.0,
+                    &theme,
+                );
+                let mut info = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: width,
+                        biHeight: -height,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB,
+                        biSizeImage: (width * height * 4) as u32,
+                        biXPelsPerMeter: 0,
+                        biYPelsPerMeter: 0,
+                        biClrUsed: 0,
+                        biClrImportant: 0,
+                    },
+                    bmiColors: [windows_sys::Win32::Graphics::Gdi::RGBQUAD {
+                        rgbBlue: 0,
+                        rgbGreen: 0,
+                        rgbRed: 0,
+                        rgbReserved: 0,
+                    }; 1],
+                };
+                let mut pixels = vec![0u8; (width * height * 4) as usize];
+                let read = GetDIBits(
+                    mem,
+                    bitmap,
+                    0,
+                    height as u32,
+                    pixels.as_mut_ptr() as _,
+                    &mut info,
+                    DIB_RGB_COLORS,
+                );
+                SelectObject(mem, old);
+                DeleteObject(bitmap as _);
+                DeleteDC(mem);
+                assert_eq!(read, height, "GetDIBits tem de ler o botao inteiro");
+                pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|bgrx| (bgrx[2], bgrx[1], bgrx[0]))
+                    .collect()
+            }
+        };
+        let at = |pixels: &[(u8, u8, u8)], x: usize, y: usize| pixels[y * 40 + x];
+        let near = |a: (u8, u8, u8), b: (u8, u8, u8)| {
+            (a.0 as i32 - b.0 as i32).abs() <= 3
+                && (a.1 as i32 - b.1 as i32).abs() <= 3
+                && (a.2 as i32 - b.2 as i32).abs() <= 3
+        };
+        let on = paint(LiveIndicator::Live);
+        let off = paint(LiveIndicator::Off);
+        let standby = paint(LiveIndicator::Standby);
+        // Dentro da pilula e fora do olho (que ocupa os 60% do meio).
+        for (x, y) in [(5, 20), (34, 20), (20, 4), (20, 35)] {
+            assert!(
+                near(at(&on, x, y), LIVE_ON_RED),
+                "ligado ({x},{y}) = {:?}",
+                at(&on, x, y)
+            );
+            assert!(
+                near(at(&off, x, y), theme.surface),
+                "desligado ({x},{y}) = {:?}",
+                at(&off, x, y)
+            );
+            assert!(
+                near(at(&standby, x, y), theme.surface),
+                "em espera o fundo nao e vermelho ({x},{y}) = {:?}",
+                at(&standby, x, y)
+            );
+        }
+        // O olho aparece nos dois: branco sobre o vermelho, a cor do texto
+        // do tema sobre o fundo normal.
+        let count = |pixels: &[(u8, u8, u8)], color: (u8, u8, u8)| {
+            pixels.iter().filter(|pixel| near(**pixel, color)).count()
+        };
+        assert!(
+            count(&on, (255, 255, 255)) > 20,
+            "sem olho branco no botao ligado"
+        );
+        assert!(count(&off, theme.fg) > 20, "sem olho no botao desligado");
+        assert_eq!(count(&off, LIVE_ON_RED), 0, "desligado nao tem vermelho");
+        assert!(
+            count(&standby, LIVE_ON_RED) > 20,
+            "em espera o olho continua vermelho: o painel esta aberto"
+        );
+        assert!(
+            count(&standby, LIVE_ON_RED) < count(&on, LIVE_ON_RED) / 2,
+            "em espera nao e o botao cheio"
+        );
+    }
+
+    /// Le a barra de topo inteira pintada por `paint_comparator_bar` (o mesmo
+    /// `paint_comparator_bar_with_contexts` do ecra) com este painel do Gemini
+    /// Live. Devolve os pixeis RGB, linha a linha.
+    fn painted_bar_with_live(width: i32, live: &LivePanel<u8>, theme: &Theme) -> Vec<(u8, u8, u8)> {
+        let height = COMPARATOR_CHROME_HEIGHT as i32;
+        unsafe {
+            let screen = GetDC(std::ptr::null_mut());
+            let mem = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, width, height);
+            ReleaseDC(std::ptr::null_mut(), screen);
+            assert!(!mem.is_null() && !bitmap.is_null());
+            let old = SelectObject(mem, bitmap as _);
+            paint_comparator_bar(
+                mem,
+                width,
+                1.0,
+                &["Google Gemini", "ChatGPT", "Claude"],
+                true,
+                None,
+                false,
+                live,
+                theme,
+            );
+            let mut info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    biSizeImage: (width * height * 4) as u32,
+                    biXPelsPerMeter: 0,
+                    biYPelsPerMeter: 0,
+                    biClrUsed: 0,
+                    biClrImportant: 0,
+                },
+                bmiColors: [windows_sys::Win32::Graphics::Gdi::RGBQUAD {
+                    rgbBlue: 0,
+                    rgbGreen: 0,
+                    rgbRed: 0,
+                    rgbReserved: 0,
+                }; 1],
+            };
+            let mut pixels = vec![0u8; (width * height * 4) as usize];
+            let read = GetDIBits(
+                mem,
+                bitmap,
+                0,
+                height as u32,
+                pixels.as_mut_ptr() as _,
+                &mut info,
+                DIB_RGB_COLORS,
+            );
+            SelectObject(mem, old);
+            DeleteObject(bitmap as _);
+            DeleteDC(mem);
+            assert_eq!(read, height, "GetDIBits tem de ler a barra inteira");
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bgrx| (bgrx[2], bgrx[1], bgrx[0]))
+                .collect()
+        }
+    }
+
+    /// O olho da barra de verdade segue o painel de verdade: abrir poe-no em
+    /// espera, arrancar a sessao enche-o de vermelho, a sessao cair ou pedir a
+    /// chave tira o vermelho do fundo, e fechar apaga-o. Nao ha bandeira a
+    /// parte para alguem se esquecer de repor, nem booleano para o chamador
+    /// trocar por `false`: a barra pinta-se do proprio `LivePanel`.
+    #[test]
+    fn the_gemini_live_eye_on_the_painted_bar_follows_the_panel() {
+        let theme = Theme::dark((0, 120, 212));
+        let width = 1600i32;
+        let eye = right_controls(width as f64, 1.0, false).live;
+        let near = |a: (u8, u8, u8), b: (u8, u8, u8)| {
+            (a.0 as i32 - b.0 as i32).abs() <= 3
+                && (a.1 as i32 - b.1 as i32).abs() <= 3
+                && (a.2 as i32 - b.2 as i32).abs() <= 3
+        };
+        // Dentro da pilula, fora do desenho do olho (os 60% do meio).
+        let fill = |pixels: &[(u8, u8, u8)]| {
+            let x = (eye.x + eye.width * 0.14) as usize;
+            let y = (eye.y + eye.height / 2.0) as usize;
+            pixels[y * width as usize + x]
+        };
+        let red_in_eye = |pixels: &[(u8, u8, u8)]| {
+            let mut count = 0;
+            for y in eye.y as usize..(eye.y + eye.height) as usize {
+                for x in eye.x as usize..(eye.x + eye.width) as usize {
+                    if near(pixels[y * width as usize + x], LIVE_ON_RED) {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        };
+        use crate::gemini_live::LiveStep;
+        let start = || LiveStep::Start("arranca()".to_string());
+        let run = |action: LiveAction| match action {
+            LiveAction::Run(script) => script,
+            LiveAction::Close => "<fechar>".to_string(),
+            LiveAction::Nothing => "<nada>".to_string(),
+        };
+
+        let mut panel: LivePanel<u8> = LivePanel::off();
+        assert_eq!(panel.indicator(), LiveIndicator::Off);
+        let off = painted_bar_with_live(width, &panel, &theme);
+        assert_eq!(red_in_eye(&off), 0, "fechado nao tem vermelho");
+        assert!(near(fill(&off), theme.surface), "{:?}", fill(&off));
+
+        // Abrir: a pedir a chave, nada sai ainda.
+        panel.open(7);
+        assert_eq!(panel.indicator(), LiveIndicator::Standby);
+        let waiting = painted_bar_with_live(width, &panel, &theme);
+        assert!(near(fill(&waiting), theme.surface), "{:?}", fill(&waiting));
+        assert!(red_in_eye(&waiting) > 20, "painel aberto sem olho vermelho");
+
+        // O nativo manda arrancar: o script sai, e o olho ja esta cheio.
+        assert_eq!(run(panel.follow(start())), "arranca()");
+        assert_eq!(panel.indicator(), LiveIndicator::Live);
+        let live = painted_bar_with_live(width, &panel, &theme);
+        assert!(near(fill(&live), LIVE_ON_RED), "{:?}", fill(&live));
+
+        // A sessao caiu (a pagina disse "stopped"): ja nada sai.
+        assert_eq!(run(panel.follow(LiveStep::Stopped)), "<nada>");
+        assert_eq!(panel.indicator(), LiveIndicator::Standby);
+        let stopped = painted_bar_with_live(width, &panel, &theme);
+        assert!(near(fill(&stopped), theme.surface), "{:?}", fill(&stopped));
+
+        // "Conectar de novo" volta a arrancar; "Trocar chave" volta a esperar.
+        assert_eq!(run(panel.follow(start())), "arranca()");
+        assert_eq!(panel.indicator(), LiveIndicator::Live);
+        assert_eq!(
+            run(panel.follow(LiveStep::AskKey("chave()".to_string()))),
+            "chave()"
+        );
+        assert_eq!(panel.indicator(), LiveIndicator::Standby);
+
+        // Fechar a meio de uma sessao: devolve a vista e apaga o olho.
+        assert_eq!(run(panel.follow(start())), "arranca()");
+        assert_eq!(run(panel.follow(LiveStep::Close)), "<fechar>");
+        assert_eq!(
+            panel.indicator(),
+            LiveIndicator::Live,
+            "o Close so pede; quem fecha e o close()"
+        );
+        assert_eq!(panel.view(), Some(&7));
+        assert_eq!(panel.close(), Some(7));
+        assert!(!panel.is_open());
+        assert_eq!(panel.indicator(), LiveIndicator::Off);
+        let closed = painted_bar_with_live(width, &panel, &theme);
+        assert_eq!(red_in_eye(&closed), 0, "fechado ficou vermelho");
+        assert!(near(fill(&closed), theme.surface), "{:?}", fill(&closed));
+        assert_eq!(panel.close(), None, "fechar duas vezes nao devolve nada");
+
+        // Um passo que chega depois de fechar nao acende nada, e reabrir
+        // comeca sempre em espera -- nunca herda o vermelho da sessao velha.
+        assert_eq!(run(panel.follow(start())), "<nada>", "sem painel nao corre");
+        assert_eq!(panel.indicator(), LiveIndicator::Off);
+        assert_eq!(run(panel.follow(LiveStep::Close)), "<fechar>");
+        panel.open(8);
+        assert_eq!(panel.indicator(), LiveIndicator::Standby);
+        assert_eq!(run(panel.follow(start())), "arranca()");
+        panel.open(9);
+        assert_eq!(panel.indicator(), LiveIndicator::Standby);
+    }
+
+    /// Os tres porteiros do painel do Gemini Live, tal como o `open_live_panel`
+    /// os entrega ao wry: o handler de IPC (so a pagina do painel, so a lista
+    /// fechada), a regra de navegacao e as permissoes (nunca um Allow).
+    #[test]
+    fn the_live_panel_handlers_are_the_gatekeepers_it_ships_with() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let seen: Rc<RefCell<Vec<UserEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&seen);
+        let handler = live_panel_ipc_handler(move |event| sink.borrow_mut().push(event));
+        let post = |source: &str, body: &str| {
+            handler(
+                wry::http::Request::builder()
+                    .uri(source)
+                    .body(body.to_string())
+                    .expect("pedido"),
+            )
+        };
+        let page = live_page_url();
+        post(&page, r#"{"action":"ready","args":{}}"#);
+        post(&page, r#"{"action":"stopped","args":{}}"#);
+        // Outro documento, mesmo com uma mensagem valida: nada.
+        post(
+            "https://exemplo.com/live.html",
+            r#"{"action":"forget_key","args":{}}"#,
+        );
+        post(
+            "http://neuralia-live.localhost/outra.html",
+            r#"{"action":"close"}"#,
+        );
+        post(
+            "http://neuralia-live.localhost.exemplo.com/live.html",
+            r#"{"action":"ready","args":{}}"#,
+        );
+        // A pagina certa, fora da lista: nada.
+        post(&page, r#"{"action":"eval","args":{"code":"x"}}"#);
+        // A pagina certa, na lista: passa.
+        post(&page, r#"{"action":"close"}"#);
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert!(matches!(seen[0], UserEvent::Live(LiveMessage::Ready)));
+        assert!(matches!(seen[1], UserEvent::Live(LiveMessage::Stopped)));
+        assert!(matches!(seen[2], UserEvent::Live(LiveMessage::Close)));
+
+        assert!(live_panel_navigation(page.clone()));
+        for target in [
+            "https://aistudio.google.com/apikey",
+            "http://neuralia-live.localhost/live.js",
+            "about:blank",
+        ] {
+            assert!(!live_panel_navigation(target.to_string()), "{target}");
+        }
+
+        for kind in [
+            PermissionKind::Microphone,
+            PermissionKind::Camera,
+            PermissionKind::Geolocation,
+            PermissionKind::Notifications,
+            PermissionKind::ClipboardRead,
+            PermissionKind::DisplayCapture,
+            PermissionKind::Midi,
+            PermissionKind::Sensors,
+            PermissionKind::MediaKeySystemAccess,
+            PermissionKind::LocalFonts,
+            PermissionKind::WindowManagement,
+            PermissionKind::PointerLock,
+            PermissionKind::AutomaticDownloads,
+            PermissionKind::FileSystemAccess,
+            PermissionKind::Autoplay,
+            PermissionKind::Other,
+        ] {
+            let response = live_panel_permission(kind);
+            assert_ne!(response, PermissionResponse::Allow, "{kind:?}");
+            let media = matches!(
+                kind,
+                PermissionKind::Microphone
+                    | PermissionKind::Camera
+                    | PermissionKind::DisplayCapture
+            );
+            assert_eq!(
+                response,
+                if media {
+                    PermissionResponse::Default
+                } else {
+                    PermissionResponse::Deny
+                },
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// Presenca e ordem no texto do ficheiro (AGENTS.md §4.3: isto nao prova
+    /// comportamento -- o do painel e do olho esta provado acima, sobre o
+    /// `LivePanel` e a barra pintada). Prende o que so o `App` faz: a saida
+    /// unica das superficies web fecha o Gemini Live (e os outros paineis)
+    /// antes de esconder os hosts orfaos, e nenhuma funcao troca para uma
+    /// superficie que nao e o comparador sem passar por ela. Antes, um erro
+    /// nativo (`show_native_error`) ia para a Home com a captura a correr num
+    /// painel escondido, sem olho e sem Desligar.
+    #[test]
+    fn leaving_a_web_surface_turns_gemini_live_off() {
+        let source = include_str!("windows_app.rs");
+        let body = |start: &str, end: &str| {
+            source
+                .split(start)
+                .nth(1)
+                .and_then(|part| part.split(end).next())
+                .unwrap_or_else(|| panic!("{start}"))
+        };
+        let destroy = body("fn destroy_web_surfaces", "fn schedule_home_restoration");
+        let hide = destroy
+            .find("hide_orphaned_wry_hosts(window)")
+            .expect("destroy_web_surfaces esconde os hosts orfaos");
+        for close in [
+            "self.close_live_panel();",
+            "self.close_service_panel();",
+            "self.side_panel.take()",
+        ] {
+            assert!(
+                destroy.find(close).is_some_and(|at| at < hide),
+                "destroy_web_surfaces tem de chamar {close} antes de esconder os hosts"
+            );
+        }
+        assert!(
+            body("fn show_native_error", "fn report_history_cleared")
+                .contains("self.destroy_web_surfaces();")
+        );
+
+        // Cada metodo que poe outra superficie passa pela saida unica (ou,
+        // como a Home, fecha o Gemini Live ele proprio).
+        let mut checked = 0;
+        for method in source
+            .split(
+                "
+    fn ",
+            )
+            .skip(1)
+        {
+            let name = method.split('(').next().unwrap_or_default();
+            let leaves = [
+                "Surface::Home;",
+                "Surface::External;",
+                "Surface::Reader;",
+                "Surface::Pdf;",
+            ]
+            .iter()
+            .any(|surface| method.contains(&format!("self.surface = {surface}")));
+            if !leaves {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                method.contains("self.destroy_web_surfaces();")
+                    || method.contains("self.close_live_panel();"),
+                "{name} troca de superficie sem desligar o Gemini Live"
+            );
+        }
+        assert!(checked >= 8, "so {checked} metodos trocam de superficie?");
+    }
+
+    /// O painel pinta ja com as cores do tema do app (claro e escuro), antes
+    /// de o nativo mandar as do tema em vigor: sem isto, quem usa o tema
+    /// escuro via o painel abrir branco e so depois escurecer.
+    #[test]
+    fn the_live_panel_first_paint_uses_the_app_theme() {
+        let css = crate::gemini_live::LIVE_CSS;
+        let vars = |block: &str| -> std::collections::HashMap<String, String> {
+            block
+                .lines()
+                .filter_map(|line| {
+                    let (name, value) = line.trim().strip_prefix("--")?.split_once(':')?;
+                    Some((
+                        format!("--{}", name.trim()),
+                        value.trim().trim_end_matches(';').trim().to_string(),
+                    ))
+                })
+                .collect()
+        };
+        let light = css
+            .split(":root {")
+            .nth(1)
+            .and_then(|part| part.split('}').next())
+            .expect("bloco claro");
+        let dark = css
+            .split("@media (prefers-color-scheme: dark)")
+            .nth(1)
+            .and_then(|part| part.split(":root {").nth(1))
+            .and_then(|part| part.split('}').next())
+            .expect("bloco escuro");
+        // O acento padrao do Windows; o do utilizador chega com o tema.
+        let accent = (0, 120, 212);
+        for (block, theme) in [(light, Theme::light(accent)), (dark, Theme::dark(accent))] {
+            let found = vars(block);
+            let expected = panel_theme_vars(&theme);
+            for (name, value) in expected.as_object().expect("variaveis") {
+                assert_eq!(
+                    found.get(name).map(String::as_str),
+                    value.as_str(),
+                    "{name} (escuro: {})",
+                    theme.dark
+                );
+            }
+        }
+    }
+
+    /// O log de depuracao e o unico sitio do app onde texto livre vai para
+    /// o disco sem o utilizador pedir. Uma linha que leve a chave (o script
+    /// que arranca a sessao, o URL do socket) sai de la sem ela.
+    #[test]
+    fn the_debug_log_never_writes_the_gemini_key() {
+        // `concat!`: o texto do codigo nao pode ter a forma de uma chave Google.
+        let key = concat!("AIza", "SyTESTONLY-not-a-real-key_0123456789");
+        let dir = std::env::temp_dir().join(format!("neuralia-livelog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("pasta temporaria");
+        let path = dir.join("debug.log");
+        let script = crate::gemini_live::live_start_script(
+            &crate::gemini_live::validate_live_key(key).expect("chave de teste"),
+            &serde_json::json!({}),
+            None,
+        );
+        append_debug_line(&path, 1, format_args!("eval {script}"));
+        append_debug_line(
+            &path,
+            2,
+            format_args!("socket wss://generativelanguage.googleapis.com/ws/x?key={key}"),
+        );
+        append_debug_line(&path, 3, format_args!("chave {key}"));
+        append_debug_line(&path, 4, format_args!("live panel: ligado"));
+        let text = std::fs::read_to_string(&path).expect("o log existe");
+        assert!(!text.contains(key), "{text}");
+        assert!(!text.contains(&key[4..20]), "pedaco da chave: {text}");
+        assert_eq!(text.matches("[chave omitida]").count(), 3, "{text}");
+        assert!(text.contains("       4 ms  live panel: ligado"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_service_panel_only_loads_web_pages_and_is_wider() {
+        for target in [
+            "https://web.whatsapp.com/",
+            "https://meet.google.com/abc",
+            "about:blank",
+        ] {
+            assert!(service_panel_allows_navigation(target), "{target}");
+        }
+        for target in [
+            "file:///C:/Windows/win.ini",
+            "javascript:alert(1)",
+            "neuralia-pdf://x",
+            "data:text/html,x",
+        ] {
+            assert!(!service_panel_allows_navigation(target), "{target}");
+        }
+        // 42% de 1440 = 604.8 (entre 400 e 640), encostado a direita.
+        let (x, top, width, height) = service_panel_bounds(1440.0, 900.0, 76.0);
+        assert!((width - 604.8).abs() < 1e-6, "{width}");
+        assert!((x + width - 1440.0).abs() < 1e-6 && top == 76.0 && height == 824.0);
+        // 42% de 900 = 378, levado ao minimo de 400.
+        assert_eq!(
+            service_panel_bounds(900.0, 600.0, 0.0),
+            (500.0, 0.0, 400.0, 600.0)
+        );
+    }
+
+    #[test]
+    fn gmail_setting_round_trips_and_the_toast_answers_by_button() {
+        let dir = std::env::temp_dir().join(format!("neuralia-gmail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("gmail");
+        assert!(load_gmail_setting(&path), "sem ficheiro, ligado");
+        save_gmail_setting(&path, false).expect("grava");
+        assert!(!load_gmail_setting(&path), "desligado voltou ligado");
+        save_gmail_setting(&path, true).expect("grava");
+        assert!(load_gmail_setting(&path));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: 360,
+            bottom: 64,
+        };
+        let (open, no) = gmail_toast_buttons(&client, 1.0);
+        assert!(
+            open.right <= no.left,
+            "Abrir fica antes de Nao, sem se tocarem"
+        );
+        assert!(no.right <= client.right && open.left >= 0);
+        assert!(open.top >= 0 && open.bottom <= client.bottom);
+    }
+
+    #[test]
+    fn hint_is_a_smooth_pill_like_the_buttons() {
+        // Pilula como os botoes: metade da altura de raio (limitado).
+        assert_eq!(hint_radius(48.0, 1.0), 24.0);
+        assert_eq!(hint_radius(120.0, 1.0), 28.0, "dica alta nao fica oval");
+        let (width, height) = (160usize, 48usize);
+        let surface = (37u8, 41u8, 44u8);
+        let mut pixels: Vec<u8> = (0..width * height)
+            .flat_map(|_| [surface.2, surface.1, surface.0, 255])
+            .collect();
+        apply_hint_shape(&mut pixels, width, height, 24.0, (70, 76, 80));
+        let alpha = |x: usize, y: usize| pixels[(y * width + x) * 4 + 3];
+        assert_eq!(alpha(0, 0), 0, "o canto e transparente");
+        assert_eq!(alpha(width / 2, height / 2), 255, "o meio e opaco");
+        // Anti-aliasing: ao longo da curva ha alfa intermedio, nao escadinhas.
+        let soft = (0..height).any(|y| (0..24).any(|x| (1..255).contains(&alpha(x, y))));
+        assert!(soft, "a borda nao e suave: so ha alfa 0 ou 255");
+        // Pre-multiplicado: nenhum canal de cor acima do alfa.
+        assert!(
+            pixels
+                .chunks(4)
+                .all(|p| p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3])
+        );
+    }
+
+    #[test]
+    fn an_open_side_panel_shrinks_the_comparator_instead_of_covering_it() {
+        let columns = BarColumns {
+            panel_width: 440.0,
+            ..BarColumns::even(3)
+        };
+        let layout = BarLayout::with_contexts(1600.0, 1.0, true, columns, [0, 0, 0]);
+        let content_right = 1600.0 - 440.0;
+        for index in 0..3 {
+            let pill = layout.columns[index];
+            let plus = layout.add_tabs[index];
+            assert!(
+                pill.x + pill.width <= content_right + 0.5
+                    && plus.x + plus.width <= content_right + 0.5,
+                "a coluna {index} ficou por baixo do painel"
+            );
+        }
+        // O painel empurra: a terceira coluna recua em relacao a barra sem painel.
+        let plain = BarLayout::with_contexts(1600.0, 1.0, true, BarColumns::even(3), [0, 0, 0]);
+        assert!(
+            layout.columns[2].x < plain.columns[2].x - 100.0,
+            "a terceira coluna nao recuou: {} vs {}",
+            layout.columns[2].x,
+            plain.columns[2].x
+        );
+    }
+
+    #[test]
+    fn the_go_button_lights_up_only_under_the_mouse_on_home() {
+        let (size, scale) = ((1600.0, 900.0), 1.0);
+        let go = HomeLayout::new(size.0, size.1, scale).go;
+        let center = (go.x + go.width / 2.0, go.y + go.height / 2.0);
+        assert!(home_go_hovered(Surface::Home, size, scale, center));
+        assert!(!home_go_hovered(
+            Surface::Home,
+            size,
+            scale,
+            (go.x - 2.0, center.1)
+        ));
+        assert!(!home_go_hovered(Surface::Home, size, scale, (-1.0, -1.0)));
+        assert!(
+            !home_go_hovered(Surface::Comparator, size, scale, center),
+            "o Ir nao existe fora da Home"
+        );
+    }
+
+    #[test]
+    fn the_go_button_turns_into_a_sliding_gradient() {
+        let (from, to) = ((26, 115, 232), GO_GRADIENT_END);
+        // Fase 0: da cor de destaque (esquerda) ao violeta (direita).
+        assert_eq!(go_gradient_color(from, to, 0.0, 0.0), from);
+        assert_eq!(go_gradient_color(from, to, 1.0, 0.0), to);
+        // A fase desliza a onda: a ponta esquerda muda de cor com o tempo.
+        assert_ne!(go_gradient_color(from, to, 0.0, 0.25), from);
+        // Nos pixels da pilula: o corpo a esquerda e a direita difere mesmo.
+        let (width, height) = (84, 54);
+        let pixels = pill_pixels(
+            width,
+            height,
+            27.0,
+            &|t| go_gradient_color(from, to, t, 0.0),
+            None,
+            (255, 255, 255),
+        );
+        let at = |x: i32| {
+            let index = ((height / 2 * width + x) * 4) as usize;
+            (pixels[index + 2], pixels[index + 1], pixels[index])
+        };
+        let near = |a: Rgb, b: Rgb| {
+            (a.0 as i32 - b.0 as i32).abs() <= 24
+                && (a.1 as i32 - b.1 as i32).abs() <= 24
+                && (a.2 as i32 - b.2 as i32).abs() <= 24
+        };
+        assert!(near(at(2), from), "esquerda {:?}", at(2));
+        assert!(near(at(width - 3), to), "direita {:?}", at(width - 3));
+        // Solido continua solido: o refactor nao mexeu nos outros botoes.
+        let solid = pill_pixels(width, height, 27.0, &|_| from, None, (255, 255, 255));
+        let index = ((height / 2 * width + width / 2) * 4) as usize;
+        assert_eq!((solid[index + 2], solid[index + 1], solid[index]), from);
+    }
+
+    #[test]
+    fn the_splash_question_opens_in_the_center_of_the_window() {
+        // Janela 1440x900, splash 400x120: centro exacto, nao o rodape.
+        assert_eq!(splash_origin(1440, 900, 400, 120), (520, 390));
+        // Janela mais pequena do que o splash: encosta ao canto, nao foge.
+        assert_eq!(splash_origin(300, 100, 400, 120), (0, 0));
+    }
+
+    #[test]
     fn the_brand_keeps_its_transparency_instead_of_becoming_a_rectangle() {
         // Isto foi rejeitado duas vezes no ecra: a arte compunha-se contra a
         // cor da pagina e ia para o ecra opaca, o que apagava o tecido num
@@ -10575,6 +14442,7 @@ mod tests {
                     visible,
                     hover,
                     true,
+                    &LivePanel::<()>::off(),
                     &theme,
                 );
 
@@ -11039,6 +14907,556 @@ mod tests {
                 }
             ));
             assert_eq!(policy.audit().len(), 1);
+        }
+
+        #[test]
+        fn extract_goes_through_the_policy_gate() {
+            // Um clique em A leva a B; o `extract` seguinte guardava a página
+            // de B na memória semântica sem diálogo e sem entrada de auditoria.
+            let mut other = page(vec![]);
+            other.url = "https://outra.example/conta".into();
+            let mut policy = policy();
+            let decision = decide(&[BrowserAgentCommand::Extract], &other, &mut policy);
+
+            assert_ne!(
+                decision,
+                AgentStepDecision::Extract,
+                "extract noutra origem sem um sim humano"
+            );
+            assert!(
+                matches!(
+                    &decision,
+                    AgentStepDecision::ConfirmExtract {
+                        security: AgentSecurityAction::Extract { origin },
+                        ..
+                    } if origin == "https://outra.example"
+                ),
+                "{decision:?}"
+            );
+            assert_eq!(policy.audit().len(), 1, "extract fora da auditoria");
+            let entry = &policy.audit()[0];
+            assert_eq!(entry.action, "extract");
+            assert!(entry.confirmation_required);
+            assert!(entry.reason.contains("cross-origin"), "{}", entry.reason);
+
+            // Na origem aprovada segue sem diálogo, mas fica auditado.
+            let same = page(vec![]);
+            let mut policy = self::policy();
+            let decision = decide(&[BrowserAgentCommand::Extract], &same, &mut policy);
+            assert_eq!(decision, AgentStepDecision::Extract);
+            assert_eq!(policy.audit().len(), 1);
+            assert!(policy.audit()[0].allowed);
+        }
+    }
+
+    /// Os gates do agente sobre o JavaScript que EMBARCA.
+    ///
+    /// O `AGENT_OBSERVER_SCRIPT` e o `agent_action_script` correm aqui dentro
+    /// de um DOM mínimo em Node (`node:vm`), e o que eles publicam passa pelo
+    /// mesmo caminho nativo do produto: `parse_ipc_message` →
+    /// `parse_agent_observation` → `decide_agent_step`. Asserções sobre o texto
+    /// do script não apanhavam nenhum destes defeitos (AGENTS.md §4.3): o
+    /// observador e o guard falavam vocabulários diferentes e os testes de
+    /// texto ficavam verdes.
+    mod agent_dom_gates {
+        use super::*;
+        use serde_json::{Value, json};
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+
+        /// Um DOM de brinquedo, com o que o observador e o guard usam: tipos
+        /// por omissão como no HTML (`<button>` é `submit`, `<select>` é
+        /// `select-one`), `setAttribute` a disparar o `MutationObserver`,
+        /// relógio falso para os `setTimeout` e o `postMessage` capturado.
+        const HARNESS: &str = r#"
+const vm = require('node:vm');
+const input = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+const page = input.page;
+const posts = [];
+const timers = new Map();
+const observers = [];
+let now = 0, seq = 0, mutated = false;
+function listeners(target, type) {
+  if (!target.__l) target.__l = {};
+  return target.__l[type] || (target.__l[type] = []);
+}
+class FakeEventTarget {}
+FakeEventTarget.prototype.addEventListener = function (type, fn) { listeners(this, type).push(fn); };
+FakeEventTarget.prototype.dispatchEvent = function (event) {
+  if (this.events) this.events.push(event.type);
+  for (const fn of listeners(this, event.type).slice()) fn.call(this, event);
+  return true;
+};
+class FakeEvent { constructor(type, init) { this.type = type; this.bubbles = !!(init && init.bubbles); this.isTrusted = false; } }
+const form = { submits: 0 };
+const NAMED = ['input', 'select', 'textarea', 'button', 'a'];
+class FakeElement extends FakeEventTarget {
+  constructor(spec) {
+    super();
+    this.spec = spec; this.tag = spec.tag; this.tagName = spec.tag.toUpperCase();
+    this.attrs = new Map(Object.entries(spec.attrs || {}));
+    this.clicks = 0; this.events = []; this.form = spec.form ? form : null;
+  }
+  getAttribute(name) { return this.attrs.has(name) ? String(this.attrs.get(name)) : null; }
+  setAttribute(name, value) { this.attrs.set(name, String(value)); mutated = true; }
+  get disabled() { return this.attrs.has('disabled'); }
+  get type() {
+    const t = (this.getAttribute('type') || '').toLowerCase();
+    if (this.tag === 'input') return t || 'text';
+    if (this.tag === 'button') return t === 'button' || t === 'reset' ? t : 'submit';
+    if (this.tag === 'select') return 'select-one';
+    if (this.tag === 'textarea') return 'textarea';
+    if (this.tag === 'a') return this.getAttribute('type') || '';
+    return undefined;
+  }
+  get name() { return NAMED.includes(this.tag) ? (this.getAttribute('name') || '') : undefined; }
+  get autocomplete() { return ['input', 'select', 'textarea'].includes(this.tag) ? (this.getAttribute('autocomplete') || '') : undefined; }
+  get placeholder() { return ['input', 'textarea'].includes(this.tag) ? (this.getAttribute('placeholder') || '') : undefined; }
+  get innerText() {
+    if (this.tag === 'select') return (this.spec.options || []).join('\n');
+    if (this.tag === 'input' || this.tag === 'textarea') return '';
+    return this.spec.text || '';
+  }
+  get textContent() {
+    if (this.tag === 'select') return (this.spec.options || []).join('');
+    if (this.tag === 'input') return '';
+    return this.spec.text || '';
+  }
+  getBoundingClientRect() { return this.spec.hidden ? { width: 0, height: 0 } : { width: 120, height: 24 }; }
+  focus() {}
+  click() { this.clicks += 1; if (this.form && this.type === 'submit') form.submits += 1; }
+}
+class FakeField extends FakeElement {
+  get value() { return this._value !== undefined ? this._value : (this.getAttribute('value') || ''); }
+  set value(v) { this._value = String(v); }
+}
+class FakeSelect extends FakeElement {
+  get value() { return this._value !== undefined ? this._value : ((this.spec.options || [])[0] || ''); }
+  set value(v) { v = String(v); this._value = (this.spec.options || []).includes(v) ? v : ''; }
+}
+const elements = (page.elements || []).map((spec) =>
+  spec.tag === 'select' ? new FakeSelect(spec)
+    : (spec.tag === 'input' || spec.tag === 'textarea') ? new FakeField(spec)
+    : new FakeElement(spec));
+function matchesPart(el, part) {
+  const m = /^([a-z]*)(?:\[([a-z-]+)(?:="([^"]*)")?\])?$/.exec(part.trim());
+  if (!m) throw new Error('unsupported selector: ' + part);
+  const [, tag, attr, value] = m;
+  if (tag && el.tag !== tag) return false;
+  if (attr) {
+    if (!el.attrs.has(attr)) return false;
+    if (value !== undefined && el.getAttribute(attr) !== value) return false;
+  }
+  return true;
+}
+function matches(el, selector) { return selector.split(',').some((part) => matchesPart(el, part)); }
+const textRoot = (t) => ({ innerText: t, textContent: t });
+const main = page.main !== undefined ? textRoot(page.main) : null;
+const document = Object.assign(new FakeEventTarget(), {
+  readyState: 'complete',
+  title: page.title || '',
+  documentElement: {},
+  body: textRoot(page.body || ''),
+  querySelectorAll(selector) { return elements.filter((el) => matches(el, selector)); },
+  querySelector(selector) {
+    if (selector === 'main,[role="main"]') return main;
+    return elements.find((el) => matches(el, selector)) || null;
+  }
+});
+function advance(ms) {
+  const target = now + ms;
+  for (let guard = 0; guard < 100000; guard++) {
+    if (mutated) { mutated = false; for (const o of observers) o.cb([], o); continue; }
+    let next = null;
+    for (const t of timers.values()) {
+      if (t.due <= target && (!next || t.due < next.due || (t.due === next.due && t.id < next.id))) next = t;
+    }
+    if (!next) break;
+    timers.delete(next.id);
+    now = next.due;
+    next.fn();
+  }
+  now = target;
+}
+const sandbox = {
+  document,
+  location: { href: page.url },
+  getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
+  MutationObserver: class { constructor(cb) { this.cb = cb; observers.push(this); } observe() {} disconnect() {} },
+  setTimeout: (fn, ms) => { const id = ++seq; timers.set(id, { id, due: now + (ms || 0), fn }); return id; },
+  clearTimeout: (id) => { timers.delete(id); },
+  Event: FakeEvent,
+  EventTarget: FakeEventTarget,
+  chrome: { webview: { postMessage: (message) => posts.push(String(message)) } }
+};
+sandbox.window = sandbox;
+sandbox.top = sandbox;
+sandbox.addEventListener = FakeEventTarget.prototype.addEventListener;
+sandbox.dispatchEvent = FakeEventTarget.prototype.dispatchEvent;
+vm.createContext(sandbox);
+vm.runInContext(input.observer, sandbox);
+for (const step of input.steps) {
+  if ('advance' in step) advance(step.advance);
+  else vm.runInContext(step.eval, sandbox);
+}
+const state = {};
+for (const el of elements) {
+  if (el.spec.key) state[el.spec.key] = { value: 'value' in el ? String(el.value) : null, clicks: el.clicks, events: el.events };
+}
+process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
+"#;
+
+        struct DomRun {
+            posts: Vec<String>,
+            state: Value,
+            submits: u64,
+        }
+
+        /// Corre o observador que embarca num DOM descrito por `page` e depois
+        /// os `steps` (`{"advance": ms}` ou `{"eval": script}`), por ordem.
+        /// O DOM é determinístico: a mesma página e os mesmos passos dão os
+        /// mesmos ids, e é isso que deixa um teste observar numa corrida e
+        /// executar noutra.
+        fn run_page(page: &Value, steps: &[Value]) -> DomRun {
+            let input = json!({
+                "observer": AGENT_OBSERVER_SCRIPT.replace("__NEURALIA_CAP__", CAP),
+                "page": page,
+                "steps": steps,
+            });
+            let mut child = Command::new("node")
+                .arg("-e")
+                .arg(HARNESS)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("os gates do agente precisam do `node` no PATH (o CI já o usa)");
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(input.to_string().as_bytes())
+                .expect("escrever o cenário");
+            let output = child.wait_with_output().expect("node terminou");
+            assert!(
+                output.status.success(),
+                "harness falhou: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: Value = serde_json::from_slice(&output.stdout).expect("JSON do harness");
+            DomRun {
+                posts: result["posts"]
+                    .as_array()
+                    .expect("posts")
+                    .iter()
+                    .map(|post| post.as_str().expect("post").to_string())
+                    .collect(),
+                state: result["state"].clone(),
+                submits: result["submits"].as_u64().unwrap_or(0),
+            }
+        }
+
+        /// O caminho nativo de uma mensagem publicada, igual ao do
+        /// `external_webview_builder`: `None` é uma observação que o produto
+        /// deita fora.
+        fn observed(post: &str) -> Option<ObservedPage> {
+            match parse_ipc_message(post, CAP, COMPARATOR_COLUMNS)? {
+                IpcAction::AgentObservation { data } => parse_agent_observation(&data),
+                _ => None,
+            }
+        }
+
+        fn first_observation(page: &Value) -> ObservedPage {
+            let run = run_page(page, &[json!({ "advance": 800 })]);
+            let post = run.posts.first().expect("o observador publicou");
+            observed(post).expect("a observação chegou ao nativo")
+        }
+
+        fn policy_for(origin: &str) -> AgentPermissionPolicy {
+            let mut policy = AgentPermissionPolicy::new(Some(origin.into()));
+            policy.grant_reversible_session_actions(true);
+            policy
+        }
+
+        fn act(
+            commands: &[BrowserAgentCommand],
+            next: usize,
+            page: &ObservedPage,
+            policy: &mut AgentPermissionPolicy,
+        ) -> AgentAct {
+            match decide_agent_step(commands, next, 0, Duration::ZERO, page, policy) {
+                AgentStepDecision::Act(act) => *act,
+                other => panic!("esperava Act para {:?}, veio {other:?}", commands[next]),
+            }
+        }
+
+        #[test]
+        fn approved_action_still_finds_its_element_after_the_dialog() {
+            // O MessageBox de confirmação é modal: o utilizador lê-o durante
+            // segundos. O script aprovado tem de encontrar o mesmo elemento
+            // depois disso, numa página que não mudou.
+            let page = json!({
+                "url": "https://site.example/",
+                "title": "Contacto",
+                "main": "Formulário de contacto",
+                "elements": [
+                    {"key": "send", "tag": "a", "attrs": {"role": "button", "href": "#"}, "text": "Enviar"}
+                ]
+            });
+            let first = first_observation(&page);
+            let mut policy = policy_for("https://site.example");
+            let commands = [BrowserAgentCommand::Click("Enviar".into())];
+            let act = act(&commands, 0, &first, &mut policy);
+            assert!(act.confirmation.is_some(), "Enviar pede um sim: {act:?}");
+            let script = agent_action_script(&act.action).expect("click executável");
+
+            let run = run_page(
+                &page,
+                &[
+                    json!({ "advance": 800 }),
+                    json!({ "advance": 2000 }),
+                    json!({ "eval": script }),
+                ],
+            );
+            assert_eq!(
+                run.posts.len(),
+                1,
+                "página parada não pode ser re-observada com ids novos"
+            );
+            assert_eq!(
+                run.state["send"]["clicks"], 1,
+                "o clique aprovado não chegou ao elemento"
+            );
+        }
+
+        /// Observa, decide os `commands` sobre a primeira observação e corre os
+        /// scripts resultantes, logo a seguir, na mesma página.
+        fn plan_and_run(page: &Value, origin: &str, commands: &[BrowserAgentCommand]) -> DomRun {
+            let first = first_observation(page);
+            let mut policy = policy_for(origin);
+            let mut steps = vec![json!({ "advance": 800 })];
+            for next in 0..commands.len() {
+                let act = act(commands, next, &first, &mut policy);
+                let script = agent_action_script(&act.action).expect("executável");
+                steps.push(json!({ "eval": script }));
+            }
+            run_page(page, &steps)
+        }
+
+        #[test]
+        fn observer_and_guard_agree_on_ordinary_controls() {
+            // `<input type=text>`, `<button>` e `<select>`: o observador dizia
+            // textbox/button/select e o guard recalculava text/submit/select-one,
+            // desistia, e o passo ficava no trace como feito.
+            let page = json!({
+                "url": "https://shop.example/",
+                "title": "Loja",
+                "main": "Produtos",
+                "elements": [
+                    {"key": "q", "tag": "input", "attrs": {"type": "text", "name": "q"}},
+                    {"key": "go", "tag": "button", "text": "Buscar"},
+                    {"key": "sort", "tag": "select", "attrs": {"name": "ordenar"}, "options": ["a", "preco"]}
+                ]
+            });
+            let run = plan_and_run(
+                &page,
+                "https://shop.example",
+                &[
+                    BrowserAgentCommand::Search("rust".into()),
+                    BrowserAgentCommand::Click("Buscar".into()),
+                    BrowserAgentCommand::Select {
+                        label: "ordenar".into(),
+                        value: "preco".into(),
+                    },
+                ],
+            );
+            assert_eq!(run.state["q"]["value"], "rust", "texto não escrito");
+            assert_eq!(run.state["go"]["clicks"], 1, "botão não clicado");
+            assert_eq!(run.state["sort"]["value"], "preco", "select não mudou");
+        }
+
+        #[test]
+        fn guard_accepts_combobox_textarea_and_placeholder_named_input() {
+            // A caixa do Google (`<textarea role=combobox>`) e um campo cujo
+            // único nome é o placeholder.
+            for (field, expected) in [
+                (
+                    json!({"key": "f", "tag": "textarea", "attrs": {"role": "combobox", "name": "q", "aria-label": "Pesquisar"}}),
+                    "rust",
+                ),
+                (
+                    json!({"key": "f", "tag": "input", "attrs": {"type": "text", "placeholder": "Pesquisar"}}),
+                    "rust",
+                ),
+            ] {
+                let page = json!({
+                    "url": "https://www.example.com/",
+                    "title": "Busca",
+                    "main": "",
+                    "elements": [field]
+                });
+                let run = plan_and_run(
+                    &page,
+                    "https://www.example.com",
+                    &[BrowserAgentCommand::Search("rust".into())],
+                );
+                assert_eq!(run.state["f"]["value"], expected, "{field}");
+            }
+        }
+
+        #[test]
+        fn observation_keeps_controls_on_text_heavy_pages() {
+            // Um artigo com mais de ~1.1K caracteres de texto: o corte do
+            // payload inteiro a 1200 unidades levava todas as linhas de
+            // elementos, e click/search paravam com ElementMissing.
+            let text = "Rust é uma linguagem de programação de sistemas. ".repeat(60);
+            let page = json!({
+                "url": "https://pt.wikipedia.org/wiki/Rust",
+                "title": "Rust – Wikipédia",
+                "main": text,
+                "elements": [
+                    {"key": "search", "tag": "input", "attrs": {"type": "search", "name": "search"}},
+                    {"key": "edit", "tag": "a", "attrs": {"role": "button", "href": "#editar"}, "text": "Editar"}
+                ]
+            });
+            let first = first_observation(&page);
+            assert_eq!(first.elements.len(), 2, "{first:?}");
+            assert!(
+                first.text_excerpt.chars().count() >= 1000,
+                "o extract continua a levar o texto: {}",
+                first.text_excerpt.chars().count()
+            );
+
+            let mut policy = policy_for("https://pt.wikipedia.org");
+            let commands = [
+                BrowserAgentCommand::Click("Editar".into()),
+                BrowserAgentCommand::Search("ownership".into()),
+            ];
+            let click = act(&commands, 0, &first, &mut policy);
+            assert!(
+                matches!(&click.action, AgentAction::Click { target } if target.name == "Editar")
+            );
+            let search = act(&commands, 1, &first, &mut policy);
+            assert!(
+                matches!(&search.action, AgentAction::TypeText { target, .. } if target.role == "search")
+            );
+        }
+
+        #[test]
+        fn spec_0108_agent_observation_stays_below_ipc_envelope_limit() {
+            // O pior caso do JSON: cada unidade de controlo vira `\u0001`, seis
+            // bytes. Nenhuma observação pode passar do envelope de 8 KiB, que o
+            // nativo recusa por inteiro.
+            let control = "\u{1}";
+            let elements = (0..40)
+                .map(|index| {
+                    json!({
+                        "key": format!("b{index}"),
+                        "tag": "button",
+                        "attrs": {"aria-label": format!("{index}{}", control.repeat(95))}
+                    })
+                })
+                .collect::<Vec<_>>();
+            let page = json!({
+                "url": format!("https://example.com/{}", "a".repeat(1300)),
+                "title": control.repeat(300),
+                "main": control.repeat(2000),
+                "elements": elements
+            });
+            let run = run_page(&page, &[json!({ "advance": 800 })]);
+            assert!(!run.posts.is_empty());
+            for post in &run.posts {
+                assert!(
+                    post.len() <= crate::ipc::IPC_MAX_BYTES,
+                    "observação com {} bytes",
+                    post.len()
+                );
+                assert!(observed(post).is_some(), "observação recusada pelo nativo");
+            }
+        }
+
+        #[test]
+        fn submit_button_in_a_form_waits_for_confirmation() {
+            // `<button type=submit role=button>Salvar</button>`: nenhuma
+            // palavra da lista, e o observador dizia `button`. O ramo
+            // `role.contains("submit")` nunca disparava e o formulário seguia
+            // como clique reversível, sem diálogo.
+            let page = json!({
+                "url": "https://example.com/settings",
+                "title": "Definições",
+                "main": "Preferências",
+                "elements": [
+                    {"key": "save", "tag": "button", "form": true, "attrs": {"type": "submit", "role": "button"}, "text": "Salvar"}
+                ]
+            });
+            let first = first_observation(&page);
+            let mut policy = policy_for("https://example.com");
+            let commands = [BrowserAgentCommand::Click("salvar".into())];
+            let act = act(&commands, 0, &first, &mut policy);
+            assert!(
+                act.confirmation.is_some(),
+                "submit de formulário sem confirmação: {act:?}"
+            );
+            assert!(matches!(act.security, AgentSecurityAction::Submit { .. }));
+
+            // Depois do sim, o guard continua a reconhecer o botão.
+            let script = agent_action_script(&act.action).expect("click executável");
+            let run = run_page(
+                &page,
+                &[json!({ "advance": 800 }), json!({ "eval": script })],
+            );
+            assert_eq!(run.submits, 1, "o submit aprovado não aconteceu");
+        }
+
+        #[test]
+        fn emoji_on_a_cut_boundary_does_not_drop_the_observation() {
+            // `slice` conta unidades UTF-16: um emoji na unidade 96 do nome
+            // (ou 1600 do texto) deixava um surrogate alto sozinho, o JSON
+            // levava `\ud83d`, o serde_json recusava e a observação sumia sem
+            // erro nenhum.
+            let label = format!("{}😀", "a".repeat(95));
+            let page = json!({
+                "url": "https://example.com/",
+                "title": "Emoji",
+                "main": format!("{}😀 fim", "b".repeat(1599)),
+                "elements": [
+                    {"key": "b", "tag": "button", "text": label}
+                ]
+            });
+            let run = run_page(&page, &[json!({ "advance": 800 })]);
+            let post = run.posts.first().expect("o observador publicou");
+            let page = observed(post).expect("observação recusada pelo nativo");
+            assert_eq!(page.elements.len(), 1);
+            assert_eq!(page.elements[0].name, "a".repeat(95));
+            assert!(page.text_excerpt.starts_with("bbbb"));
+        }
+
+        #[test]
+        fn search_never_types_into_a_submit_input() {
+            // `<input type=submit>` era `textbox`: o search escrevia no botão.
+            let page = json!({
+                "url": "https://example.com/",
+                "title": "Busca",
+                "main": "",
+                "elements": [
+                    {"key": "go", "tag": "input", "form": true, "attrs": {"type": "submit", "name": "q", "value": "Buscar"}}
+                ]
+            });
+            let first = first_observation(&page);
+            let mut policy = policy_for("https://example.com");
+            assert_eq!(
+                decide_agent_step(
+                    &[BrowserAgentCommand::Search("rust".into())],
+                    0,
+                    0,
+                    Duration::ZERO,
+                    &first,
+                    &mut policy,
+                ),
+                AgentStepDecision::Stop(AgentTermination::ElementMissing)
+            );
         }
     }
 
@@ -11601,12 +16019,14 @@ mod tests {
             }
         }
 
-        // Nenhum handler que dispare acao nativa aceita evento sintetico.
+        // Nenhum handler que dispare acao nativa aceita evento sintetico:
+        // os 4 de sempre + os 4 da pergunta replicada (focusin, Enter,
+        // botao de enviar, submit).
         assert_eq!(
             COMPARATOR_INJECT_SCRIPT
                 .matches("if (!event.isTrusted")
                 .count(),
-            4
+            8
         );
         assert!(!COMPARATOR_INJECT_SCRIPT.contains("expand.onclick"));
         assert!(!COMPARATOR_INJECT_SCRIPT.contains("minimize.onclick"));
@@ -11624,9 +16044,7 @@ mod tests {
     fn browser_agent_bridge_is_bounded_and_has_no_arbitrary_js_channel() {
         assert!(AGENT_OBSERVER_SCRIPT.contains("rows.length >= 32"));
         assert!(AGENT_OBSERVER_SCRIPT.contains("pageText"));
-        assert!(AGENT_OBSERVER_SCRIPT.contains("action:'agent-observation'"));
-        assert!(AGENT_OBSERVER_SCRIPT.contains(".join('\\n').slice(0, 1200)"));
-        assert!(AGENT_OBSERVER_SCRIPT.contains("post(stringify("));
+        assert!(AGENT_OBSERVER_SCRIPT.contains("post(envelope('agent-observation'"));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("?cap="));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("eval("));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("new Function"));
@@ -11766,6 +16184,144 @@ mod tests {
     /// pos nada no lugar: o clique deixou de ter tratamento nenhum. E o
     /// caminho do Ctrl era testado apenas por uma assercao sobre o TEXTO do
     /// script, que continuava verde com a funcionalidade partida.
+    #[test]
+    fn a_question_typed_in_one_column_goes_to_the_others() {
+        match App::column_ipc_event_impl(
+            1,
+            IpcAction::Ask {
+                col: 1,
+                text: "capital da França".to_string(),
+            },
+        ) {
+            Some(UserEvent::AskEverywhere { source_index, text }) => {
+                assert_eq!(source_index, 1);
+                assert_eq!(text, "capital da França");
+            }
+            other => panic!("a pergunta devia ir as outras colunas, veio {other:?}"),
+        }
+        // Uma pagina nao fala por outra coluna.
+        assert!(
+            App::column_ipc_event_impl(
+                1,
+                IpcAction::Ask {
+                    col: 0,
+                    text: "x".to_string()
+                }
+            )
+            .is_none()
+        );
+        // A origem nao e tocada; as outras sim.
+        assert_eq!(ask_targets(1, 3), vec![0, 2]);
+        assert_eq!(ask_targets(0, 3), vec![1, 2]);
+        assert_eq!(ask_targets(2, 3), vec![0, 1]);
+    }
+
+    #[test]
+    fn typing_and_sending_in_a_column_searches_in_all_of_them() {
+        // Corre o script das colunas QUE EMBARCA e le o que ele publica pelo
+        // parser nativo do produto.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let provider = r#"
+const box = document.createElement('textarea');
+box.value = '  capital da França  ';
+const at = (node) => ({ target: node, composedPath() { return [node]; } });
+__fire('keydown', Object.assign({ key: 'Enter' }, at(box)));
+// o submit/Enter repetido da mesma pergunta nao duplica
+__fire('keydown', Object.assign({ key: 'Enter' }, at(box)));
+// Shift+Enter e uma quebra de linha
+box.value = 'outra coisa';
+__fire('keydown', Object.assign({ key: 'Enter', shiftKey: true }, at(box)));
+// senha nunca
+const pw = document.createElement('input'); pw.type = 'password'; pw.value = 'segredo';
+__fire('keydown', Object.assign({ key: 'Enter' }, at(pw)));
+// botao de enviar com o texto da ultima caixa focada
+const composer = document.createElement('textarea'); composer.value = 'segunda pergunta';
+__fire('focusin', at(composer));
+const toggle = document.createElement('button'); toggle.setAttribute('aria-label', 'Pesquisar na web');
+__fire('click', at(toggle));
+const send = document.createElement('button'); send.setAttribute('aria-label', 'Enviar mensagem');
+__fire('click', at(send));
+// evento sintetico da propria pagina: ignorado
+__fire('keydown', Object.assign({ key: 'Enter', isTrusted: false }, at(composer)));
+"#;
+        let ai_mode_form = r#"
+const q = document.createElement('textarea'); q.name = 'q'; q.value = 'nova pergunta';
+const form = document.createElement('form'); form.elements = [q];
+__fire('submit', { target: form, composedPath() { return [form]; } });
+"#;
+        let site = r#"
+const at = (node) => ({ target: node, composedPath() { return [node]; } });
+const q = document.createElement('input'); q.type = 'search'; q.name = 'q'; q.value = 'rust async';
+// Enter num site qualquer nao e pergunta a IA
+__fire('keydown', Object.assign({ key: 'Enter' }, at(q)));
+const lang = document.createElement('input'); lang.type = 'hidden'; lang.name = 'lang'; lang.value = 'pt';
+const form = document.createElement('form'); form.setAttribute('action', '/search'); form.elements = [q, lang];
+__fire('submit', at(form));
+const post = document.createElement('form'); post.setAttribute('method', 'post'); post.elements = [q];
+__fire('submit', at(post));
+const pw = document.createElement('input'); pw.type = 'password'; pw.name = 'p'; pw.value = 's';
+const login = document.createElement('form'); login.elements = [q, pw];
+__fire('submit', at(login));
+"#;
+        let script = COMPARATOR_INJECT_SCRIPT.replace("__NEURALIA_CAP__", CAP);
+        let cases: Vec<serde_json::Value> = [
+            ("chatgpt", "https://chatgpt.com/c/abc", provider),
+            (
+                "ai-mode",
+                "https://www.google.com/search?q=x&udm=50",
+                ai_mode_form,
+            ),
+            ("site", "https://example.com/artigo", site),
+        ]
+        .into_iter()
+        .map(|(name, href, drive)| {
+            serde_json::json!({ "name": name, "href": href, "script": script, "drive": drive })
+        })
+        .collect();
+        let program = format!(
+            "const INPUT = {};\n{}",
+            serde_json::json!({ "cases": cases }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        let actions = |index: usize| -> Vec<IpcAction> {
+            results[index]["posted"]
+                .as_array()
+                .expect("posted")
+                .iter()
+                .filter_map(|message| parse_ipc_message(message.as_str()?, CAP, 3))
+                .filter(|action| matches!(action, IpcAction::Ask { .. } | IpcAction::Link { .. }))
+                .collect()
+        };
+        let ask = |text: &str| IpcAction::Ask {
+            col: 0,
+            text: text.to_string(),
+        };
+        assert_eq!(
+            actions(0),
+            vec![ask("capital da França"), ask("segunda pergunta")],
+            "erros: {}",
+            results[0]["errors"]
+        );
+        assert_eq!(
+            actions(1),
+            vec![ask("nova pergunta")],
+            "erros: {}",
+            results[1]["errors"]
+        );
+        assert_eq!(
+            actions(2),
+            vec![IpcAction::Link {
+                col: 0,
+                url: "https://example.com/search?q=rust+async&lang=pt".to_string(),
+                aside: false,
+            }],
+            "erros: {}",
+            results[2]["errors"]
+        );
+    }
+
     #[test]
     fn a_plain_click_opens_in_all_three_panels_and_ctrl_click_opens_beside() {
         let url = "https://example.com/fonte".to_string();
@@ -12365,8 +16921,8 @@ mod tests {
         assert!(gmail_is_new_mail(Some(4), Some("thread-a"), 4, "thread-b"));
         assert!(!gmail_is_new_mail(Some(4), Some("thread-a"), 4, "thread-a"));
         assert!(GMAIL_MONITOR_SCRIPT.contains("mail.google.com"));
-        assert!(GMAIL_MONITOR_SCRIPT.contains("action:'gmail-state'"));
-        assert!(GMAIL_MONITOR_SCRIPT.contains("post(stringify("));
+        assert!(GMAIL_MONITOR_SCRIPT.contains("post(envelope('gmail-state'"));
+        assert!(GMAIL_MONITOR_SCRIPT.contains("post(envelope("));
     }
 
     #[test]
@@ -12437,15 +16993,432 @@ mod tests {
         }
     }
 
-    #[test]
-    fn spec_0108_agent_observation_stays_below_ipc_envelope_limit() {
+    /// Corre `program` no Node (o mesmo motor de JS que os testes de CI dos
+    /// scripts injetados usam) e devolve o stdout. Sem Node nao ha gate: falha.
+    fn run_node_program(program: &str) -> String {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("node")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("node is required to run the injected-script gates");
+        child
+            .stdin
+            .take()
+            .expect("node stdin")
+            .write_all(program.as_bytes())
+            .expect("write program to node");
+        let output = child.wait_with_output().expect("node output");
         assert!(
-            AGENT_OBSERVER_SCRIPT.contains(".join('\\n').slice(0, 1200)"),
-            "agent payload must be bounded before JSON serialization"
+            output.status.success(),
+            "node failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
-        // JSON escaping may expand one UTF-16 code unit to six ASCII bytes.
-        // 1200 * 6 leaves >900 bytes for the protocol envelope under 8 KiB.
-        const { assert!(1200 * 6 + 900 < crate::ipc::IPC_MAX_BYTES) };
+        String::from_utf8(output.stdout).expect("node stdout is utf-8")
+    }
+
+    /// Um DOM minimo, criado DENTRO do contexto do vm, para que os literais de
+    /// objeto dos scripts herdem do `Object.prototype` que a "pagina" envenena.
+    const INJECTED_SCRIPT_HARNESS: &str = r##"
+const vm = require('node:vm');
+const MOCK = `
+var __stolen = [], __posted = [], __errors = [], __listeners = [], __timers = [], __observers = [], __created = [];
+class EventTarget {
+  addEventListener(type, handler) { __listeners.push({ target: this, type: String(type), handler }); }
+  removeEventListener() {}
+  dispatchEvent() { return true; }
+}
+class Node extends EventTarget {
+  appendChild(child) { return child; }
+  removeChild(child) { return child; }
+  insertBefore(child) { return child; }
+}
+class Element extends Node {
+  constructor(tag) {
+    super();
+    this.tagName = String(tag || 'div').toUpperCase();
+    this.style = {}; this.dataset = {}; this.attrs = {}; this.children = [];
+    this.classList = { add() {}, remove() {}, toggle() {}, contains() { return false; } };
+    this.textContent = ''; this.innerText = 'x'.repeat(40); this.value = '';
+  }
+  setAttribute(k, v) { this.attrs[k] = String(v); }
+  getAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k) ? this.attrs[k] : null; }
+  removeAttribute(k) { delete this.attrs[k]; }
+  hasAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k); }
+  querySelector() { return null; }
+  querySelectorAll() { return []; }
+  closest() { return null; }
+  matches() { return false; }
+  getBoundingClientRect() { return { x: 0, y: 0, top: 0, left: 0, right: 10, bottom: 10, width: 10, height: 10 }; }
+  focus() {} blur() {} select() {} remove() {} click() {} scrollIntoView() {} append() {} prepend() {}
+}
+class Document extends Node {
+  constructor() {
+    super();
+    this.readyState = 'loading'; this.title = '';
+    this.documentElement = new Element('html'); this.body = new Element('body'); this.head = new Element('head');
+  }
+  getElementById() { return null; }
+  createElement(tag) { __created.push(String(tag)); return new Element(tag); }
+  createTextNode(text) { return { textContent: String(text) }; }
+  querySelector() { return null; }
+  querySelectorAll() { return []; }
+}
+var document = new Document();
+var window = new EventTarget();
+window.top = window;
+window.location = location;
+window.history = { back() {}, forward() {} };
+window.chrome = { webview: { postMessage(message) { __posted.push(String(message)); } } };
+window.__neuralia_col_index = 0;
+window.__neuralia_col_name = 'IA';
+function __timer(fn) { const t = { fn, done: false }; __timers.push(t); return __timers.length; }
+function __cancel(id) { const t = __timers[id - 1]; if (t) t.done = true; }
+var setTimeout = __timer, setInterval = __timer, requestAnimationFrame = __timer;
+var clearTimeout = __cancel, clearInterval = __cancel, cancelAnimationFrame = __cancel;
+var getComputedStyle = () => ({ display: 'block', visibility: 'visible' });
+class MutationObserver {
+  constructor(callback) { this.callback = callback; __observers.push(this); }
+  observe() {} disconnect() {} takeRecords() { return []; }
+}
+`;
+const HELPERS = `
+function __event(type, extra) {
+  const target = new Element('div');
+  return Object.assign({
+    type, isTrusted: true, defaultPrevented: false, button: 0, key: '',
+    ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, target,
+    composedPath() { return [target]; },
+    preventDefault() {}, stopPropagation() {}, stopImmediatePropagation() {}
+  }, extra || {});
+}
+function __fire(type, extra) {
+  for (const l of __listeners.slice()) {
+    if (l.type !== type) continue;
+    try {
+      const h = l.handler;
+      (typeof h === 'function' ? h : h.handleEvent).call(l.target, __event(type, extra));
+    } catch (e) { __errors.push(type + ': ' + e.message); }
+  }
+}
+function __drain() {
+  for (let round = 0; round < 20; round++) {
+    const due = __timers.filter((t) => !t.done);
+    if (!due.length) return;
+    for (const t of due) {
+      t.done = true;
+      try { t.fn(); } catch (e) { __errors.push('timer: ' + e.message); }
+    }
+  }
+}
+`;
+const DEFAULT_DRIVE = `
+document.readyState = 'interactive';
+__fire('DOMContentLoaded');
+__fire('load');
+__drain();
+__fire('keydown', { key: 'Escape' });
+__fire('click');
+__fire('dblclick');
+__fire('neuralia-agent-rescan');
+for (const o of __observers) { try { o.callback([], o); } catch (e) { __errors.push('observer: ' + e.message); } }
+__drain();
+`;
+// O que a pagina corre depois do document-created: um getter de toJSON no
+// Object.prototype que guarda qualquer `cap` que lhe passe por `this`.
+const PAGE = `
+Object.defineProperty(Object.prototype, 'toJSON', {
+  configurable: true,
+  get() { if (this && typeof this.cap === 'string') __stolen.push(this.cap); return undefined; }
+});
+`;
+const results = [];
+for (const c of INPUT.cases) {
+  const context = vm.createContext({ location: new URL(c.href), URL });
+  vm.runInContext(MOCK, context);
+  if (c.child) vm.runInContext('window.top = {};', context);
+  vm.runInContext(c.script, context, { filename: c.name });
+  vm.runInContext(PAGE, context);
+  vm.runInContext(HELPERS, context);
+  vm.runInContext(c.drive || DEFAULT_DRIVE, context);
+  results.push({
+    name: c.name,
+    stolen: Array.from(context.__stolen, String),
+    posted: Array.from(context.__posted, String),
+    errors: Array.from(context.__errors, String),
+    created: Array.from(context.__created, String),
+  });
+}
+process.stdout.write(JSON.stringify(results));
+"##;
+
+    #[test]
+    fn spec_0108_page_cannot_read_the_capability_through_a_to_json_getter() {
+        // Um getter de `toJSON` no Object.prototype e chamado pelo
+        // JSON.stringify com `this` = cada objeto serializado. Se o envelope
+        // com o token passar por la, a pagina fica com o token e forja
+        // `clearhistory`. O gate corre os cinco scripts que embarcam, dispara
+        // os caminhos que postam e exige: ha mensagens, sao validas, e o
+        // getter da pagina nunca viu o token.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let cases: Vec<serde_json::Value> = [
+            ("keymap", NEURALIA_KEYMAP_SCRIPT, "https://example.com/"),
+            ("return", EXTERNAL_RETURN_BUTTON, "https://example.com/"),
+            (
+                "gmail",
+                GMAIL_MONITOR_SCRIPT,
+                "https://mail.google.com/mail/u/0/",
+            ),
+            ("agent", AGENT_OBSERVER_SCRIPT, "https://example.com/"),
+            (
+                "comparator",
+                COMPARATOR_INJECT_SCRIPT,
+                "https://example.com/",
+            ),
+        ]
+        .into_iter()
+        .map(|(name, script, href)| {
+            serde_json::json!({
+                "name": name,
+                "href": href,
+                "script": script.replace("__NEURALIA_CAP__", CAP),
+            })
+        })
+        .collect();
+        let program = format!(
+            "const INPUT = {};\n{}",
+            serde_json::json!({ "cases": cases }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        assert_eq!(results.len(), 5);
+        for result in &results {
+            let name = result["name"].as_str().unwrap_or_default();
+            let stolen = result["stolen"].as_array().expect("stolen");
+            let posted = result["posted"].as_array().expect("posted");
+            assert!(
+                !posted.is_empty(),
+                "{name}: the harness must reach a signing path; errors: {}",
+                result["errors"]
+            );
+            for message in posted {
+                let message = message.as_str().expect("posted string");
+                assert!(
+                    parse_ipc_message(message, CAP, 3).is_some(),
+                    "{name}: posted envelope must stay valid: {message}"
+                );
+            }
+            assert!(
+                stolen.is_empty(),
+                "{name}: page toJSON getter read the capability {} time(s)",
+                stolen.len()
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_r_toggles_auto_scroll_and_reload_stays_on_f5_and_ctrl_shift_r() {
+        // Corre o mapa de teclas QUE EMBARCA e le o que ele publica pelo
+        // mesmo parser nativo do produto.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let drive = r#"
+document.readyState = 'interactive';
+__fire('DOMContentLoaded');
+__drain();
+__fire('keydown', { key: 'r', ctrlKey: true });
+__fire('keydown', { key: 'R', ctrlKey: true, shiftKey: true });
+__fire('keydown', { key: 'F5' });
+__fire('keydown', { key: 'F8' });
+"#;
+        let cases = [serde_json::json!({
+            "name": "keymap",
+            "href": "https://example.com/",
+            "script": NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", CAP),
+            "drive": drive,
+        })];
+        let program = format!(
+            "const INPUT = {};\n{}",
+            serde_json::json!({ "cases": cases }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        let actions: Vec<IpcAction> = results[0]["posted"]
+            .as_array()
+            .expect("posted")
+            .iter()
+            .filter_map(|message| parse_ipc_message(message.as_str()?, CAP, 3))
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                IpcAction::AutoScroll,
+                IpcAction::Reload,
+                IpcAction::Reload,
+                IpcAction::AutoScroll,
+            ],
+            "erros: {}",
+            results[0]["errors"]
+        );
+    }
+
+    #[test]
+    fn the_main_window_answers_the_same_ctrl_shortcuts() {
+        use winit::keyboard::ModifiersState;
+        let key = |text: &str| Key::Character(text.into());
+        let ctrl = ModifiersState::CONTROL;
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert_eq!(
+            main_window_shortcut(&key("r"), ctrl),
+            Some(MainShortcut::AutoScroll)
+        );
+        assert_eq!(
+            main_window_shortcut(&key("R"), ctrl_shift),
+            Some(MainShortcut::Reload)
+        );
+        assert_eq!(
+            main_window_shortcut(&key("h"), ctrl),
+            Some(MainShortcut::History)
+        );
+        assert_eq!(
+            main_window_shortcut(&key("n"), ctrl),
+            Some(MainShortcut::NewTab)
+        );
+        // Sem Ctrl, ou com Alt (AltGr no teclado portugues), a tecla e texto.
+        assert_eq!(
+            main_window_shortcut(&key("r"), ModifiersState::empty()),
+            None
+        );
+        assert_eq!(
+            main_window_shortcut(&key("r"), ctrl | ModifiersState::ALT),
+            None
+        );
+    }
+
+    #[test]
+    fn clearing_all_history_needs_an_explicit_yes() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IDCANCEL, IDNO};
+        assert!(clear_history_confirmed(IDYES));
+        for answer in [IDNO, IDCANCEL, 0] {
+            assert!(
+                !clear_history_confirmed(answer),
+                "resposta {answer} apagou tudo"
+            );
+        }
+        assert!(auto_scroll_message(false).contains("desligada"));
+        assert!(auto_scroll_message(true).contains("Ctrl+R desliga"));
+    }
+
+    #[test]
+    fn comparator_ctrl_click_on_a_google_search_link_keeps_the_real_url() {
+        // `q` numa pesquisa do Google e um termo, nao uma URL. Resolvido
+        // contra a origem da coluna virava https://gemini.google.com/app/rust.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let search = "https://www.google.com/search?q=rust";
+        let cases = [
+            ("https://gemini.google.com/app/abc", search, search),
+            ("https://chatgpt.com/c/abc", search, search),
+            ("https://www.google.com/search?q=x&udm=50", search, search),
+            (
+                "https://gemini.google.com/app/abc",
+                "https://maps.google.com/?q=Paris",
+                "https://maps.google.com/?q=Paris",
+            ),
+            // O embrulho real do Google continua a ser desembrulhado.
+            (
+                "https://gemini.google.com/app/abc",
+                "https://www.google.com/url?q=https%3A%2F%2Fexample.com%2F",
+                "https://example.com/",
+            ),
+        ];
+        let inputs: Vec<serde_json::Value> = cases
+            .iter()
+            .map(|(location, href, _)| {
+                serde_json::json!({
+                    "name": format!("{location} -> {href}"),
+                    "href": location,
+                    "script": COMPARATOR_INJECT_SCRIPT.replace("__NEURALIA_CAP__", CAP),
+                    "drive": format!(
+                        "const anchor = new Element('a');\n\
+                         anchor.href = {};\n\
+                         anchor.matches = () => true;\n\
+                         __fire('click', {{ ctrlKey: true, target: anchor, \
+                         composedPath() {{ return [anchor]; }} }});\n",
+                        serde_json::Value::from(*href)
+                    ),
+                })
+            })
+            .collect();
+        let program = format!(
+            "const INPUT = {};\n{}",
+            serde_json::json!({ "cases": inputs }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        assert_eq!(results.len(), cases.len());
+        for (result, (_, _, expected)) in results.iter().zip(cases) {
+            let name = result["name"].as_str().unwrap_or_default();
+            let posted = result["posted"].as_array().expect("posted");
+            assert_eq!(posted.len(), 1, "{name}: errors {}", result["errors"]);
+            let message = posted[0].as_str().expect("posted string");
+            match parse_ipc_message(message, CAP, 3) {
+                Some(IpcAction::Link { url, aside, .. }) => {
+                    assert!(aside, "{name}");
+                    assert_eq!(url, expected, "{name}");
+                }
+                other => panic!("{name}: expected a link action, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn split_scroll_rail_is_top_frame_only() {
+        // WebView2 corre os initialization scripts tambem nos iframes. O rail
+        // (e o CSS que esconde as barras de rolagem) so pertence ao documento
+        // principal; num iframe cobria e engolia cliques do conteudo dele.
+        let inputs: Vec<serde_json::Value> = [false, true]
+            .into_iter()
+            .map(|child| {
+                serde_json::json!({
+                    "name": if child { "child frame" } else { "top frame" },
+                    "href": "https://example.com/",
+                    "child": child,
+                    "script": SPLIT_SCROLL_RAIL_SCRIPT,
+                })
+            })
+            .collect();
+        let program = format!(
+            "const INPUT = {};
+{}",
+            serde_json::json!({ "cases": inputs }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        let created = |index: usize| -> Vec<String> {
+            results[index]["created"]
+                .as_array()
+                .expect("created")
+                .iter()
+                .map(|tag| tag.as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        assert!(
+            created(0).iter().any(|tag| tag == "style"),
+            "top frame must still mount the rail: {:?}",
+            results[0]["errors"]
+        );
+        assert!(
+            created(1).is_empty(),
+            "child frame mounted rail elements: {:?}",
+            created(1)
+        );
     }
 
     #[test]
@@ -12458,6 +17431,84 @@ mod tests {
         assert!(top.contains("JSON.stringify"));
         assert!(top.contains("const defer = setTimeout;"));
         assert!(top.contains("const cancelDefer = clearTimeout;"));
+    }
+
+    #[test]
+    fn clearing_memory_drops_the_live_research_session() {
+        // Depois de "Apagar historico" a sessao viva nao pode continuar a
+        // receber fontes: o proximo save_session reescrevia no disco a
+        // pergunta que o utilizador acabou de apagar.
+        let (tx, rx) = sync_channel::<MemoryCommand>(4);
+        let worker = MemoryWorker { tx };
+        let mut current_research = Some(ResearchSession::new("pergunta secreta"));
+        worker.clear(&mut current_research);
+        assert!(matches!(rx.try_recv(), Ok(MemoryCommand::Clear)));
+        assert!(
+            current_research.is_none(),
+            "the cleared research session is still alive and will be saved again"
+        );
+    }
+
+    #[test]
+    fn a_private_split_request_after_leaving_the_comparator_is_dropped() {
+        // Fora do comparador um pedido privado nunca cai em web(): isso
+        // gravava a URL privada no historico e na memoria semantica.
+        for surface in [
+            Surface::Home,
+            Surface::Reader,
+            Surface::External,
+            Surface::Pdf,
+        ] {
+            assert_eq!(
+                App::split_request_fallback(surface, true),
+                SplitFallback::Ignore,
+                "{surface:?}"
+            );
+            assert_eq!(
+                App::split_request_fallback(surface, false),
+                SplitFallback::OpenWeb,
+                "{surface:?}"
+            );
+        }
+        for private in [false, true] {
+            assert_eq!(
+                App::split_request_fallback(Surface::Comparator, private),
+                SplitFallback::OpenSplit
+            );
+        }
+    }
+
+    #[test]
+    fn full_web_new_window_about_blank_does_not_replace_the_page() {
+        for blank in ["about:blank", "ABOUT:BLANK"] {
+            assert!(
+                external_new_window_event(blank.to_string(), None).is_none(),
+                "{blank} must be denied, not opened as OpenExternal"
+            );
+        }
+        assert!(matches!(
+            external_new_window_event("https://example.com/".to_string(), None),
+            Some(UserEvent::OpenExternal(url)) if url == "https://example.com/"
+        ));
+        assert!(external_new_window_event("http://192.168.0.1/".to_string(), None).is_none());
+    }
+
+    #[test]
+    fn reopening_a_context_tab_does_not_rebuild_or_duplicate_the_source() {
+        assert!(split_open_records_source(None, false));
+        assert!(!split_open_records_source(None, true));
+        assert!(
+            !split_open_records_source(Some(7), false),
+            "a reopened context tab must not add another session source"
+        );
+        assert!(
+            context_tab_click_is_noop(Some((0, Some(1))), 0, 1),
+            "clicking the active context tab must not rebuild the split"
+        );
+        assert!(!context_tab_click_is_noop(Some((0, Some(1))), 0, 2));
+        assert!(!context_tab_click_is_noop(Some((1, Some(1))), 0, 1));
+        assert!(!context_tab_click_is_noop(Some((0, None)), 0, 1));
+        assert!(!context_tab_click_is_noop(None, 0, 1));
     }
 
     #[test]
@@ -12672,6 +17723,7 @@ mod tests {
             weights: [2.0, 1.0, 1.0],
             minimized: [false; COMPARATOR_COLUMNS],
             split_active: false,
+            panel_width: 0.0,
         };
         let layout = BarLayout::with_contexts(1600.0, 1.0, true, dragged, [0; 3]);
         let spans = visible_column_spans(1600.0, 3, &dragged.weights, &dragged.minimized);
@@ -12714,6 +17766,7 @@ mod tests {
             weights: [1.0; COMPARATOR_COLUMNS],
             minimized: [false, true, false],
             split_active: false,
+            panel_width: 0.0,
         };
         let layout = BarLayout::with_contexts(1600.0, 1.0, true, state, [0; 3]);
         assert_eq!(layout.minimized, [false, true, false]);
@@ -13251,6 +18304,67 @@ mod tests {
     }
 
     #[test]
+    fn a_group_larger_than_the_window_keeps_its_pill_and_recent_tabs() {
+        // Quatro abas abertas num grupo: o corte cai dentro do grupo e nao ha
+        // aba solta depois dele. A linha nao pode ficar vazia -- a pilula e o
+        // unico caminho para fechar ou reabrir o grupo.
+        let mut tabs = vec![
+            tab("https://a.example/1", Some(1)),
+            tab("https://b.example/2", Some(1)),
+            tab("https://c.example/3", Some(1)),
+            tab("https://d.example/4", None),
+        ];
+        let groups = vec![group(1, false)];
+        join_context_group(&mut tabs, 1, 3);
+        let row = plan_tab_row(&tabs, &groups);
+        assert_no_orphans(&row, &tabs, &groups);
+        assert_eq!(
+            row.visible(),
+            &[
+                TabSlot::Group(0),
+                TabSlot::Tab(1),
+                TabSlot::Tab(2),
+                TabSlot::Tab(3)
+            ]
+        );
+        let mut rows = [TabRow::empty(); COMPARATOR_COLUMNS];
+        rows[0] = row;
+        let layout = BarLayout::with_rows(1600.0, 1.0, true, BarColumns::even(3), rows);
+        assert_eq!(layout.group_pill_counts[0], 1);
+        assert_eq!(layout.context_tab_counts[0], 3);
+        let pill = layout.group_pills[0][0];
+        assert_eq!(
+            layout.hit(pill.x + pill.width / 2.0, pill.y + pill.height / 2.0),
+            Some(BarHit::ContextGroup {
+                source_index: 0,
+                group_index: 0
+            })
+        );
+
+        // Um grupo fechado antes dele nao perde a sua pilula.
+        let tabs = vec![
+            tab("https://x.example/0", Some(0)),
+            tab("https://a.example/1", Some(1)),
+            tab("https://b.example/2", Some(1)),
+            tab("https://c.example/3", Some(1)),
+            tab("https://d.example/4", Some(1)),
+        ];
+        let groups = vec![group(0, true), group(1, false)];
+        let row = plan_tab_row(&tabs, &groups);
+        assert_no_orphans(&row, &tabs, &groups);
+        assert_eq!(
+            row.visible(),
+            &[
+                TabSlot::Group(0),
+                TabSlot::Group(1),
+                TabSlot::Tab(2),
+                TabSlot::Tab(3),
+                TabSlot::Tab(4)
+            ]
+        );
+    }
+
+    #[test]
     fn the_group_pill_is_hit_tested_where_it_is_drawn() {
         let tabs = vec![
             tab("https://a.example/1", Some(1)),
@@ -13491,6 +18605,7 @@ mod tests {
                         weights: [1.0; COMPARATOR_COLUMNS],
                         minimized,
                         split_active,
+                        panel_width: 0.0,
                     };
                     let layout =
                         BarLayout::with_contexts(client_width, scale, true, columns, [3, 3, 3]);
@@ -13517,6 +18632,26 @@ mod tests {
                         None,
                         "controle Privado sobrepoe alvo da barra em {logical_width}px @{scale}x"
                     );
+                    // O olho do Gemini Live, o mais a esquerda dos controlos:
+                    // nenhum alvo da barra lhe toca, nem no centro nem nas
+                    // bordas.
+                    let live = controls.live;
+                    let (lx, ly) = center(live);
+                    assert_eq!(
+                        right_controls_hit(controls, lx, ly),
+                        Some(BarHit::GeminiLive)
+                    );
+                    for (x, y) in [
+                        (lx, ly),
+                        (live.x + 1.0, ly),
+                        (live.x + live.width - 1.0, ly),
+                    ] {
+                        assert_eq!(
+                            layout.hit(x, y),
+                            None,
+                            "Gemini Live sobrepoe alvo da barra em {logical_width}px @{scale}x"
+                        );
+                    }
 
                     if let Some((_label, expand, close)) = controls.split {
                         for (rect, expected) in
@@ -13612,6 +18747,107 @@ fn system_accent() -> Rgb {
         ),
         None => (0, 120, 212),
     }
+}
+
+/// O tema que o utilizador escolheu: acompanhar o Windows (o padrao) ou
+/// forcar claro ou escuro. Guarda-se em `<data_dir>/theme`, uma palavra.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemeChoice {
+    System,
+    Light,
+    Dark,
+}
+
+/// Indice em `ThemeChoice::ALL` da escolha em vigor.
+static THEME_CHOICE: AtomicUsize = AtomicUsize::new(0);
+
+impl ThemeChoice {
+    const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::System => "Tema do sistema",
+            Self::Light => "Tema claro",
+            Self::Dark => "Tema escuro",
+        }
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            Self::System => "sistema",
+            Self::Light => "claro",
+            Self::Dark => "escuro",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_lowercase().as_str() {
+            "sistema" | "system" | "auto" => Some(Self::System),
+            "claro" | "light" => Some(Self::Light),
+            "escuro" | "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+
+    fn current() -> Self {
+        Self::ALL
+            .get(THEME_CHOICE.load(Ordering::Acquire))
+            .copied()
+            .unwrap_or(Self::System)
+    }
+
+    /// Escuro ou claro, dado o que o Windows diz agora.
+    fn is_dark(self, system_dark: bool) -> bool {
+        match self {
+            Self::System => system_dark,
+            Self::Light => false,
+            Self::Dark => true,
+        }
+    }
+
+    /// O `prefers-color-scheme` das paginas no WebView2.
+    fn webview_theme(self) -> wry::Theme {
+        match self {
+            Self::System => wry::Theme::Auto,
+            Self::Light => wry::Theme::Light,
+            Self::Dark => wry::Theme::Dark,
+        }
+    }
+
+    /// Sem ficheiro, ou com lixo dentro, vale o padrao: acompanhar o Windows.
+    fn load(path: &std::path::Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| Self::parse(&text))
+            .unwrap_or(Self::System)
+    }
+
+    /// Escreve num temporario ao lado e renomeia: um arranque a meio de uma
+    /// escrita nunca le meia palavra.
+    fn save(self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let temp = path.with_extension("tmp");
+        std::fs::write(&temp, self.word())?;
+        std::fs::rename(&temp, path)
+    }
+
+    /// Passa a valer ja: a proxima leitura do tema usa esta escolha.
+    fn apply(self) {
+        let index = Self::ALL
+            .iter()
+            .position(|choice| *choice == self)
+            .unwrap_or(0);
+        THEME_CHOICE.store(index, Ordering::Release);
+        Theme::invalidate();
+    }
+}
+
+/// Um WebViewBuilder que ja nasce com o tema escolhido nas paginas.
+fn themed_webview_builder<'a>() -> WebViewBuilder<'a> {
+    use wry::WebViewBuilderExtWindows;
+    WebViewBuilder::new().with_theme(ThemeChoice::current().webview_theme())
 }
 
 fn system_dark_mode() -> bool {
@@ -13730,8 +18966,14 @@ impl Theme {
     /// A leitura verdadeira do registo; quem decide quando ela acontece e o
     /// cache acima.
     fn read_system() -> Self {
+        Self::read_for(ThemeChoice::current())
+    }
+
+    /// O tema que `choice` da agora: a escolha manda, o Windows so desempata
+    /// em `ThemeChoice::System`.
+    fn read_for(choice: ThemeChoice) -> Self {
         let accent = system_accent();
-        if system_dark_mode() {
+        if choice.is_dark(system_dark_mode()) {
             Self::dark(accent)
         } else {
             Self::light(accent)
@@ -13947,14 +19189,37 @@ unsafe fn fill_pill(
     if width <= 0 || height <= 0 {
         return;
     }
+    let pixels = pill_pixels(width, height, radius, &|_| fill, border, background);
+    blit_bgrx(
+        hdc,
+        &pixels,
+        rect.x.round() as i32,
+        rect.y.round() as i32,
+        width,
+        height,
+    );
+}
 
-    let (border_color, border_width) = border.unwrap_or((fill, 0.0));
-    let border_width = border_width as f32;
-    let radius = radius.min(rect.width.min(rect.height) / 2.0).max(0.0) as f32;
+/// Pixels BGRX de uma pilula com contorno suave. `fill_at(t)` da a cor do
+/// corpo na fraccao `t` da largura (0 a esquerda, 1 a direita): cor unica nos
+/// botoes normais, degradê no "Ir" sob o rato. Sem borda, o fio tem a cor do
+/// proprio corpo.
+fn pill_pixels(
+    width: i32,
+    height: i32,
+    radius: f64,
+    fill_at: &dyn Fn(f32) -> Rgb,
+    border: Option<(Rgb, f64)>,
+    background: Rgb,
+) -> Vec<u8> {
+    let border_width = border.map_or(0.0, |(_, width)| width) as f32;
+    let radius = radius.min(width.min(height) as f64 / 2.0).max(0.0) as f32;
 
-    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    let mut pixels = Vec::with_capacity((width.max(0) * height.max(0) * 4) as usize);
     for py in 0..height {
         for px in 0..width {
+            let fill = fill_at((px as f32 + 0.5) / width as f32);
+            let border_color = border.map_or(fill, |(color, _)| color);
             let distance = round_rect_sdf(
                 px as f32 + 0.5,
                 py as f32 + 0.5,
@@ -13977,7 +19242,67 @@ unsafe fn fill_pill(
             pixels.push(0);
         }
     }
+    pixels
+}
 
+/// Fim do degradê do "Ir" sob o rato; o inicio e a cor de destaque do tema.
+const GO_GRADIENT_END: Rgb = (124, 58, 237);
+/// O que o aviso do meio da janela diz quando a rolagem muda.
+fn auto_scroll_message(on: bool) -> String {
+    if on {
+        format!("Rolagem automática ligada — {AUTO_SCROLL_SECONDS}s  ·  Ctrl+R desliga")
+    } else {
+        "Rolagem automática desligada  ·  Ctrl+R liga".to_string()
+    }
+}
+
+/// Apagar TUDO so com um "Sim" explicito. Fechar a caixa, "Nao" ou uma caixa
+/// que nem abriu (0) deixam o historico como estava.
+fn clear_history_confirmed(answer: i32) -> bool {
+    answer == IDYES
+}
+
+/// Uma volta completa do degradê a deslizar.
+const GO_GRADIENT_PERIOD_MS: u64 = 2400;
+
+/// Cor do degradê do "Ir" na fraccao `t` da largura. A `phase` (0..1) faz a
+/// onda deslizar com o tempo: o botao "respira" enquanto o rato esta nele.
+fn go_gradient_color(from: Rgb, to: Rgb, t: f32, phase: f32) -> Rgb {
+    let wave = 0.5 - 0.5 * (std::f32::consts::TAU * (t * 0.5 + phase)).cos();
+    mix(from, to, wave)
+}
+
+/// O rato esta sobre o "Ir"? So na Home; noutras superficies o rect da Home
+/// nao existe e o botao nao se acende por baixo das colunas.
+fn home_go_hovered(surface: Surface, size: (f64, f64), scale: f64, cursor: (f64, f64)) -> bool {
+    surface == Surface::Home
+        && HomeLayout::new(size.0, size.1, scale)
+            .go
+            .contains(cursor.0, cursor.1)
+}
+
+/// O "Ir" em degradê, texto legivel sobre o meio do degradê.
+unsafe fn draw_go_gradient(
+    hdc: *mut core::ffi::c_void,
+    rect: UiRect,
+    phase: f32,
+    font: *mut core::ffi::c_void,
+    theme: &Theme,
+) {
+    let width = rect.width.round() as i32;
+    let height = rect.height.round() as i32;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let (from, to) = (theme.accent, GO_GRADIENT_END);
+    let pixels = pill_pixels(
+        width,
+        height,
+        rect.height / 2.0,
+        &|t| go_gradient_color(from, to, t, phase),
+        None,
+        theme.page_bg,
+    );
     blit_bgrx(
         hdc,
         &pixels,
@@ -13986,10 +19311,34 @@ unsafe fn fill_pill(
         width,
         height,
     );
+    SelectObject(hdc, font as _);
+    SetTextColor(hdc, rgb3(on_color(mix(from, to, 0.5))));
+    SetBkMode(hdc, TRANSPARENT as i32);
+    let mut text_rect = RECT {
+        left: rect.x.round() as i32,
+        top: rect.y as i32,
+        right: (rect.x + rect.width) as i32,
+        bottom: (rect.y + rect.height) as i32,
+    };
+    draw_text(
+        hdc,
+        "Ir",
+        &mut text_rect,
+        DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
+    );
 }
 
 /// Slot 0..2 = icones das IAs, slot 3 = glifo da casa (pintado com a cor do tema).
 const ICON_SLOT_HOME: usize = COMPARATOR_COLUMNS;
+/// Icones dos botoes do canto direito (gerados por scripts/gen-ai-icons.py).
+const ICON_SLOT_VIDEO: usize = COMPARATOR_COLUMNS + 1;
+const ICON_SLOT_WHATSAPP: usize = COMPARATOR_COLUMNS + 2;
+const ICON_SLOT_YOUTUBE: usize = COMPARATOR_COLUMNS + 3;
+const ICON_SLOT_MAIL: usize = COMPARATOR_COLUMNS + 4;
+const ICON_SLOT_INCOGNITO: usize = COMPARATOR_COLUMNS + 5;
+/// O olho do Gemini Live.
+const ICON_SLOT_LIVE: usize = COMPARATOR_COLUMNS + 6;
+static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 6] = [const { OnceLock::new() }; 6];
 
 static AI_ICON_IMAGES: [OnceLock<RgbaImage>; COMPARATOR_COLUMNS] =
     [OnceLock::new(), OnceLock::new(), OnceLock::new()];
@@ -14056,6 +19405,25 @@ fn home_icon() -> &'static RgbaImage {
     })
 }
 
+fn extra_icon(slot: usize) -> &'static RgbaImage {
+    let index = slot
+        .saturating_sub(ICON_SLOT_VIDEO)
+        .min(EXTRA_ICON_IMAGES.len() - 1);
+    EXTRA_ICON_IMAGES[index].get_or_init(|| {
+        let raw: &[u8] = match slot {
+            ICON_SLOT_VIDEO => include_bytes!("../../../assets/ai/video.png"),
+            ICON_SLOT_WHATSAPP => include_bytes!("../../../assets/ai/whatsapp.png"),
+            ICON_SLOT_YOUTUBE => include_bytes!("../../../assets/ai/youtube.png"),
+            ICON_SLOT_MAIL => include_bytes!("../../../assets/ai/mail.png"),
+            ICON_SLOT_LIVE => include_bytes!("../../../assets/ai/live.png"),
+            _ => include_bytes!("../../../assets/ai/incognito.png"),
+        };
+        image::load_from_memory(raw)
+            .expect("assets/ai/*.png must be valid PNG")
+            .to_rgba8()
+    })
+}
+
 fn icon_scaled(slot: usize, size: u32) -> Arc<RgbaImage> {
     let key = (slot, size);
     let mut guard = ICON_SCALE_CACHE.lock().unwrap_or_else(|p| p.into_inner());
@@ -14066,6 +19434,8 @@ fn icon_scaled(slot: usize, size: u32) -> Arc<RgbaImage> {
 
     let source = if slot == ICON_SLOT_HOME {
         home_icon()
+    } else if slot >= ICON_SLOT_VIDEO {
+        extra_icon(slot)
     } else {
         ai_icon(slot)
     };
@@ -14163,6 +19533,7 @@ unsafe fn draw_pill(
 
     let padding = 11.0 * scale;
     let mut text_left = rect.x + padding;
+    let mut text_right = rect.x + rect.width - padding * 0.6;
     let mut format = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
 
     match style.icon {
@@ -14180,15 +19551,26 @@ unsafe fn draw_pill(
             );
             text_left += size as f64 + 8.0 * scale;
         }
-        None => format |= DT_CENTER,
+        // Texto centrado usa a pilula inteira. Com a margem de 11 px dos dois
+        // lados, um botao redondo de ~30 px ficava com ~10 px para o "+" e o
+        // DT_END_ELLIPSIS desenhava "-." no lugar dele.
+        None => {
+            text_left = rect.x;
+            text_right = rect.x + rect.width;
+            format |= DT_CENTER;
+        }
     }
 
     SelectObject(hdc, font as _);
     SetTextColor(hdc, rgb3(style.text));
+    // O DC de um BeginPaint nasce OPAQUE com fundo branco. Quem chamava sem
+    // SetBkMode (botao Home, botoes -/□/x) pintava o texto num rectangulo
+    // branco por cima da pilula -- os "icones" viravam quadrados brancos.
+    SetBkMode(hdc, TRANSPARENT as i32);
     let mut text_rect = RECT {
         left: text_left.round() as i32,
         top: rect.y as i32,
-        right: (rect.x + rect.width - padding * 0.6) as i32,
+        right: text_right as i32,
         bottom: (rect.y + rect.height) as i32,
     };
     draw_text(hdc, label, &mut text_rect, format);
@@ -14242,9 +19624,17 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
   const capability = '__NEURALIA_CAP__';
   const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
   const stringify = JSON.stringify;
+  // O envelope com o token e montado com primitivas. Serializar um objeto
+  // que contem o token faz o serializador consultar toJSON pela cadeia de
+  // prototipos, que a pagina controla: um getter dela recebia o envelope
+  // como `this` e lia `cap`. Strings nao passam por toJSON.
+  function envelope(action, args) {
+    return '{"v":1,"cap":"' + capability + '","action":' + stringify(action)
+      + ',"args":' + stringify(args || {}) + '}';
+  }
   const colIndex = window.__neuralia_col_index;
   function act(action, args) {
-    post(stringify({ v:1, cap:capability, action, args:args || {} }));
+    post(envelope(action, args));
   }
 
   function findBar() {
@@ -14306,7 +19696,9 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       }
       if (key === 'u') { e.preventDefault(); act('viewsource'); return; }
       switch (key) {
-        case 'r': e.preventDefault(); act('reload'); return;
+        // Ctrl+R liga/desliga a rolagem automatica (pedido do dono);
+        // recarregar fica no F5 e no Ctrl+Shift+R.
+        case 'r': e.preventDefault(); act('autoscroll'); return;
         case 'l': e.preventDefault(); act('omnibox'); return;
         case 'h': e.preventDefault(); act('history'); return;
         case 'n':
@@ -14386,6 +19778,14 @@ const EXTERNAL_RETURN_BUTTON: &str = r#"
   const capability = '__NEURALIA_CAP__';
   const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
   const stringify = JSON.stringify;
+  // O envelope com o token e montado com primitivas. Serializar um objeto
+  // que contem o token faz o serializador consultar toJSON pela cadeia de
+  // prototipos, que a pagina controla: um getter dela recebia o envelope
+  // como `this` e lia `cap`. Strings nao passam por toJSON.
+  function envelope(action, args) {
+    return '{"v":1,"cap":"' + capability + '","action":' + stringify(action)
+      + ',"args":' + stringify(args || {}) + '}';
+  }
   const defer = setTimeout;
   const cancelDefer = clearTimeout;
   const byId = document.getElementById.bind(document);
@@ -14407,7 +19807,7 @@ const EXTERNAL_RETURN_BUTTON: &str = r#"
     });
     listen(b, 'click', (event) => {
       if (!event.isTrusted) return;
-      post(stringify({ v:1, cap:capability, action:'home', args:{} }));
+      post(envelope('home', {}));
     });
     append(document.documentElement, b);
   });
@@ -14422,6 +19822,14 @@ const GMAIL_MONITOR_SCRIPT: &str = r#"
   const capability = '__NEURALIA_CAP__';
   const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
   const stringify = JSON.stringify;
+  // O envelope com o token e montado com primitivas. Serializar um objeto
+  // que contem o token faz o serializador consultar toJSON pela cadeia de
+  // prototipos, que a pagina controla: um getter dela recebia o envelope
+  // como `this` e lia `cap`. Strings nao passam por toJSON.
+  function envelope(action, args) {
+    return '{"v":1,"cap":"' + capability + '","action":' + stringify(action)
+      + ',"args":' + stringify(args || {}) + '}';
+  }
   let lastState = '';
   let debounce = 0;
 
@@ -14466,11 +19874,8 @@ const GMAIL_MONITOR_SCRIPT: &str = r#"
     if (state === lastState) return;
     lastState = state;
 
-    post(stringify({
-      v:1,
-      cap:capability,
-      action:'gmail-state',
-      args:{ count, sender:first.sender, subject:first.subject, key:first.key }
+    post(envelope('gmail-state', {
+      count, sender:first.sender, subject:first.subject, key:first.key
     }));
   }
 
@@ -14775,37 +20180,66 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
 })();
 "#;
 
-const AGENT_OBSERVER_SCRIPT: &str = r#"
+const AGENT_OBSERVER_SCRIPT: &str = concat!(
+    r#"
 (function () {
   if (window.top !== window) return;
   const capability = '__NEURALIA_CAP__';
   const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
   const stringify = JSON.stringify;
+  // O envelope com o token e montado com primitivas. Serializar um objeto
+  // que contem o token faz o serializador consultar toJSON pela cadeia de
+  // prototipos, que a pagina controla: um getter dela recebia o envelope
+  // como `this` e lia `cap`. Strings nao passam por toJSON.
+  function envelope(action, args) {
+    return '{"v":1,"cap":"' + capability + '","action":' + stringify(action)
+      + ',"args":' + stringify(args || {}) + '}';
+  }
   const listen = Function.prototype.call.bind(EventTarget.prototype.addEventListener);
   const defer = setTimeout;
   let generation = 0;
   let lastMaterial = '';
   let timer = 0;
-
-  function clean(value, limit) {
-    return String(value || '').replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
+  // Um id por ELEMENTO, dado uma vez e nunca renomeado. Os ids por geracao
+  // mudavam a cada observacao: o proprio setAttribute disparava o
+  // MutationObserver, a observacao seguinte trazia ids novos e o material
+  // nunca repetia, por isso os ids mudavam a cada ~700 ms. Um clique aprovado
+  // depois de o utilizador ler o dialogo procurava um id que ja nao existia e
+  // nao fazia nada. Um clone copia o atributo mas nao a entrada do mapa, e
+  // recebe um id seu.
+  const agentIds = new WeakMap();
+  let nextAgentId = 0;
+"#,
+    agent_element_identity_js!(),
+    r#"
+  // Bytes UTF-8 que uma unidade UTF-16 ocupa depois de serializada em JSON, no
+  // pior caso: controlo e surrogate viram \uXXXX (6), aspas e barra levam
+  // escape (2).
+  function unitCost(code) {
+    if (code < 0x20 || (code >= 0xd800 && code <= 0xdfff)) return 6;
+    if (code === 0x22 || code === 0x5c) return 2;
+    if (code < 0x80) return 1;
+    return code < 0x800 ? 2 : 3;
   }
 
-  function fieldRole(el) {
-    const tag = (el.tagName || '').toLowerCase();
-    const type = (el.type || '').toLowerCase();
-    const autocomplete = (el.autocomplete || '').toLowerCase();
-    const role = (el.getAttribute('role') || '').toLowerCase();
-    const name = (el.name || '').toLowerCase();
-    const combined = [type, autocomplete, role, name].join(' ');
-    if (combined.includes('password')) return 'password';
-    if (combined.includes('one-time') || combined.includes('otp')) return 'otp';
-    if (combined.includes('cc-') || combined.includes('card') || combined.includes('payment')) return 'payment-card';
-    if (combined.includes('email')) return 'email';
-    if (combined.includes('search')) return 'search';
-    if (tag === 'select') return 'select';
-    if (tag === 'input' || tag === 'textarea') return 'textbox';
-    return role || tag || 'element';
+  function jsonCost(value) {
+    let total = 0;
+    for (let i = 0; i < value.length; i++) total += unitCost(value.charCodeAt(i));
+    return total;
+  }
+
+  // O prefixo mais longo que cabe em `budget`, sem deixar um surrogate alto
+  // sozinho no fim.
+  function fitJson(value, budget) {
+    let total = 0;
+    let end = 0;
+    for (; end < value.length; end++) {
+      const cost = unitCost(value.charCodeAt(end));
+      if (total + cost > budget) break;
+      total += cost;
+    }
+    const code = end > 0 ? value.charCodeAt(end - 1) : 0;
+    return value.slice(0, code >= 0xd800 && code <= 0xdbff ? end - 1 : end);
   }
 
   function observe() {
@@ -14816,47 +20250,46 @@ const AGENT_OBSERVER_SCRIPT: &str = r#"
       'input,textarea,select,button,a[href],[role="button"],[role="textbox"],[role="combobox"]'
     );
     const rows = [];
-    let ordinal = 0;
     for (const el of candidates) {
       if (rows.length >= 32) break;
       const rect = el.getBoundingClientRect();
       const css = getComputedStyle(el);
       if (rect.width <= 0 || rect.height <= 0 || css.display === 'none' || css.visibility === 'hidden') continue;
-      const id = 'n' + (generation + 1) + '-' + ordinal++;
-      el.setAttribute('data-neuralia-agent-id', id);
-      const name = clean(el.getAttribute('aria-label') || el.name || el.innerText || el.textContent || el.placeholder, 96);
-      rows.push([id, fieldRole(el), name, clean(el.tagName, 20), el.disabled ? '0' : '1'].join('\t'));
+      let id = agentIds.get(el);
+      if (!id) {
+        nextAgentId += 1;
+        id = 'n' + nextAgentId;
+        agentIds.set(el, id);
+      }
+      if (el.getAttribute('data-neuralia-agent-id') !== id) el.setAttribute('data-neuralia-agent-id', id);
+      rows.push([id, fieldRole(el), elementName(el), clean(el.tagName, 20), el.disabled ? '0' : '1'].join('\t'));
     }
 
     const material = [location.href, document.title || '', pageText, rows.join('\n')].join('\n');
     if (material === lastMaterial) return;
     lastMaterial = material;
     generation += 1;
-    // IDs carry the generation used by the native stale-element guard.
-    rows.forEach((row, index) => {
-      const oldId = row.split('\t', 1)[0];
-      const newId = 'n' + generation + '-' + index;
-      const el = document.querySelector('[data-neuralia-agent-id="' + oldId + '"]');
-      if (el) el.setAttribute('data-neuralia-agent-id', newId);
-      rows[index] = row.replace(oldId, newId);
-    });
 
-    // O envelope nativo aceita no maximo 8 KiB. 1200 unidades UTF-16
-    // continuam abaixo desse teto mesmo no pior caso JSON (surrogates
-    // escapados como \\uXXXX), deixando margem para cap/action/args.
-    const payload = [
-      String(generation),
-      clean(location.href, 1200),
-      clean(document.title, 256),
-      pageText,
-      ...rows
-    ].join('\n').slice(0, 1200);
-    post(stringify({
-      v:1,
-      cap:capability,
-      action:'agent-observation',
-      args:{ data:payload }
-    }));
+    // O envelope nativo aceita no maximo 8 KiB. Antes cortava-se a string
+    // inteira a 1200 unidades, e as linhas de elementos vinham no fim: numa
+    // pagina com mais de ~1.1K caracteres de texto o agente deixava de ver
+    // qualquer controlo, e um URL longo levava ate a linha do titulo. Agora
+    // cada parte paga o seu custo em bytes do JSON no pior caso: o cabecalho
+    // vai inteiro, as linhas entram antes do texto (com uma reserva para ele)
+    // e o texto fica com o que sobra. 7000 bytes deixam >1 KiB para
+    // cap/action/args.
+    const head = [String(generation), clean(location.href, 1200), clean(document.title, 256)].join('\n');
+    let left = 7000 - jsonCost(head) - jsonCost('\n');
+    const textReserve = Math.min(jsonCost(pageText), 1500);
+    const kept = [];
+    for (const row of rows) {
+      const rowCost = jsonCost('\n' + row);
+      if (rowCost > left - textReserve) break;
+      kept.push(row);
+      left -= rowCost;
+    }
+    const payload = [head, fitJson(pageText, left)].concat(kept).join('\n');
+    post(envelope('agent-observation', { data:payload }));
   }
 
   function schedule() {
@@ -14874,9 +20307,14 @@ const AGENT_OBSERVER_SCRIPT: &str = r#"
     childList:true, subtree:true, attributes:true
   });
 })();
-"#;
+"#
+);
 
 const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
+(function () {
+  // WRY/WebView2 injeta initialization scripts em child frames no Windows:
+  // o rail e o CSS que esconde as barras so pertencem ao documento principal.
+  if (window.top !== window) return;
 document.addEventListener('DOMContentLoaded', () => {
   if (document.getElementById('neuralia-split-scroll-rail')) return;
 
@@ -15134,6 +20572,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   syncTicks();
 });
+})();
 "#;
 
 /// Tudo o que corre depois do DOMContentLoaded usa as capturas do topo: a
@@ -15148,10 +20587,18 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
   const capability = '__NEURALIA_CAP__';
   const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
   const stringify = JSON.stringify;
+  // O envelope com o token e montado com primitivas. Serializar um objeto
+  // que contem o token faz o serializador consultar toJSON pela cadeia de
+  // prototipos, que a pagina controla: um getter dela recebia o envelope
+  // como `this` e lia `cap`. Strings nao passam por toJSON.
+  function envelope(action, args) {
+    return '{"v":1,"cap":"' + capability + '","action":' + stringify(action)
+      + ',"args":' + stringify(args || {}) + '}';
+  }
   const defer = setTimeout;
   const cancelDefer = clearTimeout;
   function act(action, args) {
-    post(stringify({ v:1, cap:capability, action, args:args || {} }));
+    post(envelope(action, args));
   }
   const byId = document.getElementById.bind(document);
   const createElement = document.createElement.bind(document);
@@ -15219,7 +20666,9 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
         const actual = target.searchParams.get(name);
         if (!actual) continue;
         try {
-          const unwrapped = new URL(actual, location.href);
+          // So URL absoluta: em /search o `q` e um termo, e resolvido contra a
+          // coluna virava uma URL falsa na origem da IA.
+          const unwrapped = new URL(actual);
           if (unwrapped.protocol === 'http:' || unwrapped.protocol === 'https:') {
             target = unwrapped;
             break;
@@ -15253,9 +20702,12 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
     return true;
   }
 
+  // UM so listener de clique no window (o gate scripts/test-link-routing.mjs
+  // exige-o): primeiro o link; se nao era link, o botao de enviar da IA.
   listen(window, 'click', (event) => {
     if (event.button !== 0) return;
-    routeLink(event, !!(event.ctrlKey || event.metaKey));
+    if (routeLink(event, !!(event.ctrlKey || event.metaKey))) return;
+    askFromSendButton(event);
   }, true);
 
   // O botao do meio usa auxclick. Captura no window pela mesma razao: sites de
@@ -15263,6 +20715,147 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
   listen(window, 'auxclick', (event) => {
     if (event.button !== 1) return;
     routeLink(event, true);
+  }, true);
+
+  // Pergunta escrita numa coluna tambem pesquisa nas outras (pedido do
+  // dono: "escrever pesquisar, tem que pesquisar em todos tambem").
+  //  - Na pagina da propria IA (Google IA, ChatGPT, Claude, Gemini): o texto
+  //    enviado com Enter ou com o botao de enviar vai as OUTRAS colunas
+  //    ('ask'); esta segue a conversa dela.
+  //  - Num site aberto por um link (as colunas no mesmo site): a pesquisa GET
+  //    desse site abre o resultado em todas ('link'), tal como o clique.
+  //  POST, senhas, e-mails e eventos sinteticos nunca sao replicados.
+  const ASK_MAX = 2000;
+  const ASK_REPEAT_MS = 2000;
+  const SEND_LABEL = /\bsend\b|enviar|submit/i;
+  const clock = Date.now;
+  const toArray = Array.from;
+  let lastAsk = { text: '', at: 0 };
+  let lastComposer = null;
+
+  function onProviderPage() {
+    let here;
+    try { here = new URL(location.href); } catch (_) { return false; }
+    const host = here.hostname.toLowerCase();
+    if (host === 'chatgpt.com' || host.endsWith('.chatgpt.com') || host === 'chat.openai.com') return true;
+    if (host === 'claude.ai' || host.endsWith('.claude.ai')) return true;
+    if (host === 'gemini.google.com') return true;
+    return (host === 'google.com' || host.endsWith('.google.com'))
+      && here.searchParams.get('udm') === '50';
+  }
+
+  // Texto de uma caixa onde se escreve uma pergunta; null para tudo o resto
+  // (senhas, e-mails, codigos, botoes...).
+  function composerText(node) {
+    if (!node || !node.tagName) return null;
+    const tag = String(node.tagName).toUpperCase();
+    if (tag === 'TEXTAREA') return String(node.value || '');
+    if (tag === 'INPUT') {
+      const type = String(node.type || 'text').toLowerCase();
+      if (type !== 'text' && type !== 'search') return null;
+      const auto = String((node.getAttribute && node.getAttribute('autocomplete')) || '').toLowerCase();
+      if (/user|mail|pass|code|tel|cc-/.test(auto)) return null;
+      return String(node.value || '');
+    }
+    if (node.isContentEditable) return String(node.innerText || node.textContent || '');
+    return null;
+  }
+
+  function pathOf(event) {
+    return typeof event.composedPath === 'function' ? event.composedPath() : [event.target];
+  }
+
+  function composerFromEvent(event) {
+    for (const candidate of pathOf(event)) {
+      if (composerText(candidate) !== null) return candidate;
+    }
+    return null;
+  }
+
+  function sendAsk(text) {
+    const clean = String(text || '').trim();
+    if (!clean || clean.length > ASK_MAX) return;
+    const at = clock();
+    // Enter e o submit do mesmo formulario chegam os dois: uma pergunta so.
+    if (clean === lastAsk.text && at - lastAsk.at < ASK_REPEAT_MS) return;
+    lastAsk = { text: clean, at: at };
+    act('ask', { col:colIndex, text:clean });
+  }
+
+  // Um GET de um formulario com texto escrito -> a URL que ele abriria.
+  function formSearchUrl(form, submitter) {
+    const method = String((form.getAttribute && form.getAttribute('method')) || 'get').toLowerCase();
+    if (method !== 'get') return null;
+    let target;
+    try {
+      target = new URL((form.getAttribute && form.getAttribute('action')) || location.href, location.href);
+    } catch (_) { return null; }
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') return null;
+    target.search = '';
+    let typed = false;
+    for (const field of toArray(form.elements || [])) {
+      if (!field || !field.name || field.disabled) continue;
+      const type = String(field.type || '').toLowerCase();
+      if (type === 'password' || type === 'file' || type === 'email') return null;
+      if ((type === 'checkbox' || type === 'radio') && !field.checked) continue;
+      if ((type === 'submit' || type === 'button' || type === 'image' || type === 'reset')
+          && field !== submitter) continue;
+      const value = String(field.value == null ? '' : field.value);
+      if ((type === 'search' || type === 'text' || type === 'textarea') && value.trim()) typed = true;
+      target.searchParams.append(String(field.name), value);
+    }
+    return typed ? target : null;
+  }
+
+  listen(window, 'focusin', (event) => {
+    if (!event.isTrusted) return;
+    const node = composerFromEvent(event);
+    if (node) lastComposer = node;
+  }, true);
+
+  listen(window, 'keydown', (event) => {
+    if (!event.isTrusted || event.key !== 'Enter') return;
+    // Shift+Enter e quebra de linha; durante a composicao (acentos, IME) o
+    // Enter ainda nao e envio.
+    if (event.shiftKey || event.ctrlKey || event.altKey || event.metaKey || event.isComposing) return;
+    if (!onProviderPage() || neuraliaControlFromEvent(event)) return;
+    const node = composerFromEvent(event);
+    if (node) sendAsk(composerText(node));
+  }, true);
+
+  // Chamado pelo listener de clique do window, depois do encaminhamento de
+  // links.
+  function askFromSendButton(event) {
+    if (!event.isTrusted || event.button !== 0 || !onProviderPage()) return;
+    if (neuraliaControlFromEvent(event) || !lastComposer) return;
+    const button = pathOf(event).find((node) => node && node.tagName
+      && (String(node.tagName).toUpperCase() === 'BUTTON'
+        || (node.getAttribute && node.getAttribute('role') === 'button')));
+    if (!button || !button.getAttribute) return;
+    const label = [
+      button.getAttribute('aria-label'),
+      button.getAttribute('data-testid'),
+      button.getAttribute('title')
+    ].join(' ');
+    if (SEND_LABEL.test(label)) sendAsk(composerText(lastComposer));
+  }
+
+  listen(window, 'submit', (event) => {
+    if (!event.isTrusted) return;
+    const form = event.target;
+    if (!form || !form.tagName || String(form.tagName).toUpperCase() !== 'FORM') return;
+    if (onProviderPage()) {
+      for (const field of toArray(form.elements || [])) {
+        const text = composerText(field);
+        if (text && text.trim()) { sendAsk(text); return; }
+      }
+      return;
+    }
+    const target = formSearchUrl(form, event.submitter || null);
+    if (!target) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    act('link', { col:colIndex, url:target.href, aside:false });
   }, true);
 
   listen(document, 'dblclick', (event) => {

@@ -274,6 +274,10 @@ impl MemoryStore {
             return Ok(CaptureOutcome::SkippedForgotten);
         }
         let sqlite_existed = self.sqlite_path().exists();
+        // Indice perdido com corpus em disco: um upsert de um so documento
+        // criaria um indice parcial e as consultas deixariam de ver o resto.
+        // So neste caminho se paga O(corpus); com indice presente e constante.
+        let rebuild_index = !sqlite_existed && self.document_file_count()? > 0;
 
         document.title = redact_sensitive_text(&document.title);
         document.url = document.url.take().map(|value| redact_url(&value));
@@ -303,8 +307,21 @@ impl MemoryStore {
         }
         atomic_write(&wiki_path, self.markdown(&document).as_bytes())?;
 
+        if rebuild_index {
+            self.rebuild()?;
+            return Ok(CaptureOutcome::Stored(document.id));
+        }
+
         let session = self.session_for_document(&document);
-        sqlite_v01::upsert(&self.sqlite_path(), &document, session.as_ref())?;
+        match sqlite_v01::upsert(&self.sqlite_path(), &document, session.as_ref()) {
+            // Indice da v2.0.x: migra-se reconstruindo do corpus em disco,
+            // que ja inclui este documento.
+            Err(error) if sqlite_v01::is_legacy_index_error(&error) => {
+                self.rebuild()?;
+                return Ok(CaptureOutcome::Stored(document.id));
+            }
+            result => result?,
+        }
         if !sqlite_existed && !tombstones.is_empty() {
             sqlite_v01::sync_tombstones(&self.sqlite_path(), &tombstones)?;
         }
@@ -354,6 +371,23 @@ impl MemoryStore {
         Ok(documents)
     }
 
+    /// Todos os documentos legiveis em documents/, sem filtro de tombstones.
+    /// So o forget os usa: tem de voltar a apagar o que um forget anterior
+    /// escondeu mas nao conseguiu remover.
+    fn documents_on_disk(&self) -> Vec<MemoryDocument> {
+        let Ok(entries) = fs::read_dir(self.documents_dir()) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+            })
+            .filter_map(|entry| fs::read(entry.path()).ok())
+            .filter_map(|bytes| serde_json::from_slice::<MemoryDocument>(&bytes).ok())
+            .collect()
+    }
+
     pub fn query(&self, query: &MemoryQuery) -> io::Result<Vec<MemoryHit>> {
         let query_text = query.text.trim();
         if query_text.is_empty() {
@@ -361,13 +395,25 @@ impl MemoryStore {
         }
 
         let candidate_limit = query.limit.clamp(1, 100).saturating_mul(16).min(512);
-        let candidate_ids = match sqlite_v01::candidate_ids(
-            &self.sqlite_path(),
-            query_text,
-            query.provider.as_deref(),
-            query.session_id.as_deref(),
-            candidate_limit,
-        ) {
+        let candidates = || {
+            sqlite_v01::candidate_ids(
+                &self.sqlite_path(),
+                query_text,
+                query.provider.as_deref(),
+                query.session_id.as_deref(),
+                candidate_limit,
+            )
+        };
+        let candidate_ids = match candidates() {
+            // Indice da v2.0.x: migra-se uma vez, do corpus, e responde-se
+            // com o indice novo.
+            Err(error) if sqlite_v01::is_legacy_index_error(&error) => {
+                self.rebuild()?;
+                candidates()
+            }
+            result => result,
+        };
+        let candidate_ids = match candidate_ids {
             Ok(ids) => ids,
             Err(error)
                 if error.kind() == io::ErrorKind::NotFound && self.document_file_count()? == 0 =>
@@ -553,51 +599,55 @@ impl MemoryStore {
 
     pub fn forget(&self, scope: ForgetScope) -> io::Result<ForgetReport> {
         self.ensure_layout()?;
-        let documents = self.documents()?;
         let sessions = self.research_sessions_unfiltered()?;
         let mut report = ForgetReport::default();
+        let mut failures = RemovalFailures::default();
 
         // Persist the deny policy before deleting source files. If the process
         // dies halfway through forget(), stale source cannot be re-imported.
-        let mut tombstones = self.load_tombstones()?;
+        let previous = self.load_tombstones()?;
+        let mut tombstones = previous.clone();
         extend_tombstones_for_scope(&mut tombstones, &scope, &sessions);
         self.save_tombstones(&tombstones)?;
 
-        for document in documents {
-            if !matches_scope(&document, &scope) {
-                continue;
+        if matches!(scope, ForgetScope::All) {
+            // Tudo o que esta por baixo destes directorios e derivado das
+            // paginas: JSON truncados e `.tmp` de escritas interrompidas
+            // tambem guardam o corpo, e nao passam por `documents()`.
+            report.documents = self.documents()?.len();
+            for dir in ["documents", "wiki", "sessions"] {
+                remove_files_under(&self.root.join(dir), &mut report.files, &mut failures);
             }
-            for path in [self.document_path(&document.id), self.wiki_path(&document)] {
-                if fs::remove_file(&path).is_ok() {
-                    report.files += 1;
+            let _ = fs::remove_file(self.sqlite_path());
+            // Copias de rebuilds interrompidos, seja qual for o pid: um pid
+            // reutilizado nao pode esconder uma copia do corpus do forget.
+            for (leftover, _) in sqlite_v01::rebuild_temp_files(&self.sqlite_path()) {
+                remove_file_counted(&leftover, &mut report.files, &mut failures);
+            }
+        } else {
+            // Ficheiros crus, nao `documents()`: um documento que um forget
+            // anterior nao conseguiu apagar ja esta escondido pela tombstone
+            // e tem de ser tentado outra vez.
+            for document in self.documents_on_disk() {
+                let in_scope = matches_scope(&document, &scope);
+                if !in_scope && !tombstone_blocks_document(&document, &tombstones) {
+                    continue;
+                }
+                for path in [self.document_path(&document.id), self.wiki_path(&document)] {
+                    remove_file_counted(&path, &mut report.files, &mut failures);
+                }
+                if in_scope && !tombstone_blocks_document(&document, &previous) {
+                    report.documents += 1;
                 }
             }
-            report.documents += 1;
-        }
-
-        match &scope {
-            ForgetScope::Session(id) => {
+            if let ForgetScope::Session(id) = &scope {
                 let path = self.root.join("sessions").join(format!("{id}.json"));
-                if fs::remove_file(path).is_ok() {
-                    report.files += 1;
-                }
+                remove_file_counted(&path, &mut report.files, &mut failures);
             }
-            ForgetScope::All => {
-                if let Ok(entries) = fs::read_dir(self.root.join("sessions")) {
-                    for entry in entries.flatten() {
-                        if entry.path().extension().and_then(|value| value.to_str()) == Some("json")
-                            && fs::remove_file(entry.path()).is_ok()
-                        {
-                            report.files += 1;
-                        }
-                    }
-                }
-                let _ = fs::remove_file(self.sqlite_path());
-            }
-            _ => {}
         }
 
         self.rebuild()?;
+        failures.into_result()?;
         Ok(report)
     }
 
@@ -995,6 +1045,71 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Deletes que falharam durante um forget. O forget apaga tudo o que consegue
+/// e so depois devolve o erro: a UI nao pode dizer "apagado" com o corpo de
+/// uma pagina ainda no disco.
+#[derive(Default)]
+struct RemovalFailures {
+    count: usize,
+    first: Option<(PathBuf, io::Error)>,
+}
+
+impl RemovalFailures {
+    fn push(&mut self, path: &Path, error: io::Error) {
+        self.count += 1;
+        if self.first.is_none() {
+            self.first = Some((path.to_path_buf(), error));
+        }
+    }
+
+    fn into_result(self) -> io::Result<()> {
+        match self.first {
+            None => Ok(()),
+            Some((path, error)) => Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "forget incomplete: {} file(s) could not be deleted and will be retried by the next forget; first {}: {error}",
+                    self.count,
+                    path.display()
+                ),
+            )),
+        }
+    }
+}
+
+fn remove_file_counted(path: &Path, removed: &mut usize, failures: &mut RemovalFailures) {
+    match fs::remove_file(path) {
+        Ok(()) => *removed += 1,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => failures.push(path, error),
+    }
+}
+
+/// Apaga todos os ficheiros por baixo de `dir`, seja qual for o conteudo;
+/// mantem os directorios, que fazem parte do layout.
+fn remove_files_under(dir: &Path, removed: &mut usize, failures: &mut RemovalFailures) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => return failures.push(dir, error),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.push(dir, error);
+                continue;
+            }
+        };
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => remove_files_under(&path, removed, failures),
+            Ok(_) => remove_file_counted(&path, removed, failures),
+            Err(error) => failures.push(&path, error),
+        }
+    }
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let Some(parent) = path.parent() else {
         return Err(io::Error::other("path without parent"));
@@ -1057,6 +1172,51 @@ mod tests {
 
         // Nao sendo URL, cai no redactor de texto.
         assert!(!redact_url("password=hunter2").contains("hunter2"));
+    }
+
+    #[test]
+    fn captured_presigned_url_never_stores_its_session_token() {
+        let document = MemoryDocument::new(
+            MemoryKind::Source,
+            MemorySourceKind::Web,
+            "t",
+            Some(
+                "https://b.s3.amazonaws.com/f?X-Amz-Security-Token=IQoJSECRET&X-Amz-Expires=300"
+                    .into(),
+            ),
+            "x",
+        );
+        let url = document.url.unwrap_or_default();
+        assert!(!url.contains("IQoJSECRET"), "url: {url}");
+        assert!(url.contains("X-Amz-Expires=300"), "url: {url}");
+    }
+
+    #[test]
+    fn captured_config_snippet_never_stores_its_password() {
+        let root = temp_root("config-snippet-secret");
+        let store = MemoryStore::new(&root).unwrap();
+        let pw = "password";
+        let body = format!("[database]\nhost = db.local\n{pw} = hunter2\n{{\"{pw}\": \"s3cr3t\"}}");
+        let CaptureOutcome::Stored(id) = store
+            .capture(MemoryDocument::new(
+                MemoryKind::Source,
+                MemorySourceKind::Reader,
+                "config",
+                None,
+                body,
+            ))
+            .unwrap()
+        else {
+            panic!("documento devia ficar guardado");
+        };
+
+        let stored = store.get(&id).unwrap().expect("documento existe");
+        assert!(stored.body.contains("host = db.local"), "{}", stored.body);
+        for secret in ["hunter2", "s3cr3t"] {
+            assert!(!stored.body.contains(secret), "{}", stored.body);
+        }
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1163,6 +1323,141 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("candidate index"), "{message}");
         assert!(message.contains("rebuild"), "{message}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn capture_after_index_loss_does_not_hide_the_older_corpus() {
+        let root = temp_root("missing-index-recreated-by-capture");
+        let store = MemoryStore::new(&root).unwrap();
+        let CaptureOutcome::Stored(id_a) = store
+            .capture(MemoryDocument::new(
+                MemoryKind::Source,
+                MemorySourceKind::Reader,
+                "Rust ownership",
+                None,
+                "rust ownership borrowing lifetimes",
+            ))
+            .unwrap()
+        else {
+            panic!("A devia ficar guardado");
+        };
+        fs::remove_file(store.sqlite_path()).unwrap();
+
+        let CaptureOutcome::Stored(id_b) = store
+            .capture(MemoryDocument::new(
+                MemoryKind::Source,
+                MemorySourceKind::Reader,
+                "Rust async",
+                None,
+                "rust async runtime tokio",
+            ))
+            .unwrap()
+        else {
+            panic!("B devia ficar guardado");
+        };
+
+        match store.query(&MemoryQuery::new("rust")) {
+            Err(error) => assert!(error.to_string().contains("rebuild"), "{error}"),
+            Ok(hits) => {
+                let ids = hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>();
+                assert!(ids.contains(&id_a.as_str()), "A sumiu: {ids:?}");
+                assert!(ids.contains(&id_b.as_str()), "B sumiu: {ids:?}");
+            }
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// O indice que a v2.0.x deixava em db/: schema_meta, documents e uma
+    /// tabela FTS5 (que cria as suas tabelas-sombra memory_fts_*).
+    fn legacy_2_0_store(name: &str) -> (PathBuf, MemoryStore, String) {
+        let root = temp_root(name);
+        let store = MemoryStore::new(&root).unwrap();
+        let CaptureOutcome::Stored(id_a) = store
+            .capture(MemoryDocument::new(
+                MemoryKind::Source,
+                MemorySourceKind::Reader,
+                "Rust ownership",
+                None,
+                "rust ownership borrowing lifetimes",
+            ))
+            .unwrap()
+        else {
+            panic!("A devia ficar guardado");
+        };
+        sqlite_v01::remove_sqlite_sidecars(&store.sqlite_path());
+        let legacy = rusqlite::Connection::open(store.sqlite_path()).unwrap();
+        legacy
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE schema_meta(version INTEGER NOT NULL);
+                 INSERT INTO schema_meta VALUES(1);
+                 CREATE TABLE documents(id TEXT PRIMARY KEY,title TEXT NOT NULL,url TEXT,
+                   body TEXT NOT NULL,provider TEXT,session_id TEXT,entities TEXT,
+                   last_seen INTEGER NOT NULL);
+                 CREATE VIRTUAL TABLE memory_fts USING fts5(id UNINDEXED,title,body,entities,
+                   tokenize='unicode61 remove_diacritics 2');",
+            )
+            .unwrap();
+        drop(legacy);
+        (root, store, id_a)
+    }
+
+    #[test]
+    fn capture_migrates_a_2_0_index_without_losing_the_older_corpus() {
+        let (root, store, id_a) = legacy_2_0_store("legacy-capture");
+
+        let CaptureOutcome::Stored(id_b) = store
+            .capture(MemoryDocument::new(
+                MemoryKind::Source,
+                MemorySourceKind::Reader,
+                "Rust async",
+                None,
+                "rust async runtime tokio",
+            ))
+            .expect("captura depois do upgrade")
+        else {
+            panic!("B devia ficar guardado");
+        };
+
+        let hits = store.query(&MemoryQuery::new("rust")).expect("consulta");
+        let ids = hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>();
+        assert!(ids.contains(&id_a.as_str()), "A sumiu: {ids:?}");
+        assert!(ids.contains(&id_b.as_str()), "B sumiu: {ids:?}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_migrates_a_2_0_index_before_answering() {
+        let (root, store, id_a) = legacy_2_0_store("legacy-query");
+
+        let hits = store
+            .query(&MemoryQuery::new("rust"))
+            .expect("consulta depois do upgrade");
+        let ids = hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>();
+        assert!(ids.contains(&id_a.as_str()), "A sumiu: {ids:?}");
+
+        // Depois da migracao o indice serve candidatos por FTS, sem cair no
+        // full scan: uma captura nova nao pode esconder o corpus antigo.
+        let CaptureOutcome::Stored(id_b) = store
+            .capture(MemoryDocument::new(
+                MemoryKind::Source,
+                MemorySourceKind::Reader,
+                "Rust async",
+                None,
+                "rust async runtime tokio",
+            ))
+            .unwrap()
+        else {
+            panic!("B devia ficar guardado");
+        };
+        let hits = store.query(&MemoryQuery::new("rust")).unwrap();
+        let ids = hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>();
+        assert!(ids.contains(&id_a.as_str()), "A sumiu: {ids:?}");
+        assert!(ids.contains(&id_b.as_str()), "B sumiu: {ids:?}");
 
         let _ = fs::remove_dir_all(root);
     }

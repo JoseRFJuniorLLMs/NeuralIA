@@ -199,16 +199,40 @@ fn looks_like_domain(input: &str) -> bool {
 }
 
 fn strip_prefix_ascii<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    if value.len() < prefix.len() {
-        return None;
-    }
-    let (head, tail) = value.split_at(prefix.len());
+    // `get` e nao `split_at`: o comprimento do prefixo ASCII pode cair a meio
+    // de um caracter multibyte -- "ação" tem o byte 4 dentro do "ã" -- e o
+    // split_at entrava em panico. Com panic=abort em release, escrever uma
+    // palavra acentuada na omnibox fechava o browser.
+    let head = value.get(..prefix.len())?;
+    let tail = value.get(prefix.len()..)?;
     head.eq_ignore_ascii_case(prefix).then_some(tail.trim())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accented_input_never_panics_on_prefix_boundaries() {
+        // Cada palavra poe um caracter multibyte por cima de um dos cortes
+        // dos prefixos (4 a 9 bytes): antes, qualquer uma fechava o browser.
+        for input in [
+            "ação",
+            "manhã",
+            "notícia",
+            "coração partido",
+            "comparação de preços",
+            "leitura rápida",
+            "日本語のテキスト",
+            "🔥🔥🔥",
+        ] {
+            let parsed = std::panic::catch_unwind(|| parse_intent(input));
+            assert!(parsed.is_ok(), "parse_intent({input:?}) entrou em panico");
+        }
+        // Os prefixos continuam a funcionar com texto acentuado depois deles.
+        assert!(strip_prefix_ascii("compare: ação", "compare:") == Some("ação"));
+        assert!(strip_prefix_ascii("ação", "web:").is_none());
+    }
 
     #[test]
     fn compare_prefix_is_explicit_fan_out() {

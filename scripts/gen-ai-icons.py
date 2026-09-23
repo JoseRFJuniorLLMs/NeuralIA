@@ -5,13 +5,15 @@ reduzidas com Lanczos, porque o GDI nao tem anti-aliasing: o unico suavizado que
 a barra de topo tem vem destes PNGs. Nada e descarregado e nenhuma arte de marca
 registada e embutida.
 
-    python scripts/gen-ai-icons.py
+    python scripts/gen-ai-icons.py          # todos
+    python scripts/gen-ai-icons.py live     # so o do Gemini Live
 """
 
 from __future__ import annotations
 
 import math
 import os
+import sys
 
 from PIL import Image, ImageDraw
 
@@ -191,13 +193,133 @@ def home() -> None:
     finish(mask, solid((255, 255, 255)), "home.png")
 
 
-def main() -> None:
+# ------------------------------------------------------------- Videochamada
+def video() -> None:
+    """Camara de video em contorno, branca (a barra pinta-a com o tema)."""
+    stroke = N * 0.07
+    left, right = N * 0.14, N * 0.66
+    top, bottom = N * 0.30, N * 0.70
+    mask = Image.new("L", (N, N), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.rounded_rectangle([left, top, right, bottom], radius=N * 0.09, outline=255, width=int(stroke))
+    # Objectiva: trapezio a direita do corpo.
+    draw.polygon(
+        [(right + N * 0.03, N * 0.45), (N * 0.87, N * 0.33), (N * 0.87, N * 0.67), (right + N * 0.03, N * 0.55)],
+        fill=255,
+    )
+    finish(mask, solid((255, 255, 255)), "video.png")
+
+
+# ------------------------------------------------------------------ WhatsApp
+def whatsapp() -> None:
+    """Balao redondo verde com cauda e um auscultador branco dentro."""
+    green = (37, 211, 102)
+    radius = N * 0.40
+    mask = Image.new("L", (N, N), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.ellipse([CENTER - radius, CENTER - radius, CENTER + radius, CENTER + radius], fill=255)
+    # Cauda do balao, em baixo a esquerda.
+    draw.polygon([(N * 0.16, N * 0.90), (N * 0.24, N * 0.66), (N * 0.38, N * 0.80)], fill=255)
+
+    paint = solid(green)
+    hand = ImageDraw.Draw(paint)
+    # Auscultador: arco grosso com duas pontas arredondadas.
+    box = [N * 0.33, N * 0.30, N * 0.70, N * 0.67]
+    hand.arc(box, start=110, end=250, fill=(255, 255, 255), width=int(N * 0.085))
+    for angle in (110, 250):
+        a = math.radians(angle)
+        cx = (box[0] + box[2]) / 2 + (box[2] - box[0]) / 2 * math.cos(a)
+        cy = (box[1] + box[3]) / 2 + (box[3] - box[1]) / 2 * math.sin(a)
+        r = N * 0.07
+        hand.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 255, 255))
+    finish(mask, paint, "whatsapp.png")
+
+
+# ------------------------------------------------------------------- YouTube
+def youtube() -> None:
+    """Rectangulo vermelho arredondado com o triangulo de play branco."""
+    mask = Image.new("L", (N, N), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([N * 0.08, N * 0.22, N * 0.92, N * 0.78], radius=N * 0.16, fill=255)
+    paint = solid((255, 0, 0))
+    ImageDraw.Draw(paint).polygon([(N * 0.42, N * 0.36), (N * 0.42, N * 0.64), (N * 0.66, N * 0.50)], fill=(255, 255, 255))
+    finish(mask, paint, "youtube.png")
+
+
+# -------------------------------------------------------------------- E-mail
+def mail() -> None:
+    """Envelope em contorno, branco (a barra pinta-o com o tema)."""
+    stroke = N * 0.068
+    left, right, top, bottom = N * 0.12, N * 0.88, N * 0.24, N * 0.76
+    mask = Image.new("L", (N, N), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.rounded_rectangle([left, top, right, bottom], radius=N * 0.06, outline=255, width=int(stroke))
+    stroked(draw, (left + stroke, top + stroke), (CENTER, N * 0.53), stroke)
+    stroked(draw, (right - stroke, top + stroke), (CENTER, N * 0.53), stroke)
+    finish(mask, solid((255, 255, 255)), "mail.png")
+
+
+# ----------------------------------------------------------------- Anonimo
+def incognito() -> None:
+    """Chapeu e oculos, branco: o simbolo de navegacao privada."""
+    mask = Image.new("L", (N, N), 0)
+    draw = ImageDraw.Draw(mask)
+    # Copa do chapeu e aba.
+    draw.polygon([(N * 0.30, N * 0.46), (N * 0.36, N * 0.18), (N * 0.64, N * 0.18), (N * 0.70, N * 0.46)], fill=255)
+    draw.rounded_rectangle([N * 0.10, N * 0.44, N * 0.90, N * 0.53], radius=N * 0.04, fill=255)
+    # Oculos: duas lentes em anel e a ponte.
+    stroke = int(N * 0.06)
+    for cx in (N * 0.33, N * 0.67):
+        r = N * 0.13
+        draw.ellipse([cx - r, N * 0.72 - r, cx + r, N * 0.72 + r], outline=255, width=stroke)
+    stroked(draw, (N * 0.44, N * 0.70), (N * 0.56, N * 0.70), stroke)
+    finish(mask, solid((255, 255, 255)), "incognito.png")
+
+
+# --------------------------------------------------------------- Gemini Live
+def live() -> None:
+    """Olho em contorno com a pupila cheia, branco: o botao que liga a IA que
+    ve a tela. Marca generica -- nenhuma arte de marca registada."""
+    stroke = N * 0.075
+    left, right = (N * 0.06, CENTER), (N * 0.94, CENTER)
+    top_c, bottom_c = (CENTER, N * 0.02), (CENTER, N * 0.98)
+
+    mask = Image.new("L", (N, N), 0)
+    draw = ImageDraw.Draw(mask)
+    outer = quad_bezier(left, top_c, right) + quad_bezier(right, bottom_c, left)
+    draw.polygon(outer, fill=255)
+    # Miolo: a mesma amendoa recolhida pela espessura do traco.
+    inset = stroke * 1.9
+    inner_left, inner_right = (left[0] + inset, CENTER), (right[0] - inset, CENTER)
+    inner = quad_bezier(inner_left, (CENTER, top_c[1] + 2.0 * stroke), inner_right) + quad_bezier(
+        inner_right, (CENTER, bottom_c[1] - 2.0 * stroke), inner_left
+    )
+    draw.polygon(inner, fill=0)
+    # Pupila.
+    r = N * 0.12
+    draw.ellipse([CENTER - r, CENTER - r, CENTER + r, CENTER + r], fill=255)
+    finish(mask, solid((255, 255, 255)), "live.png")
+
+
+ICONS = {
+    "gemini": gemini,
+    "chatgpt": chatgpt,
+    "claude": claude,
+    "home": home,
+    "video": video,
+    "whatsapp": whatsapp,
+    "youtube": youtube,
+    "mail": mail,
+    "incognito": incognito,
+    "live": live,
+}
+
+
+def main(names: list[str]) -> None:
+    """Sem argumentos gera todos; com nomes (ex.: `live`) so esses."""
     os.makedirs(OUT_DIR, exist_ok=True)
-    gemini()
-    chatgpt()
-    claude()
-    home()
+    for name in names or list(ICONS):
+        ICONS[name]()
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

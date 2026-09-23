@@ -42,7 +42,7 @@ fn schema_hash() -> String {
     format!("{:x}", Sha256::digest(SCHEMA_V01.as_bytes()))
 }
 
-fn remove_sqlite_sidecars(path: &Path) {
+pub(super) fn remove_sqlite_sidecars(path: &Path) {
     let _ = fs::remove_file(path);
     remove_wal_shm(path);
 }
@@ -74,7 +74,45 @@ fn rebuild_temp_path(path: &Path) -> PathBuf {
     parent.join(format!(".{name}.rebuild-{}-{nonce}", std::process::id()))
 }
 
+/// Ficheiros `.<nome>.rebuild-<pid>-<nonce>` (e os seus -wal/-shm) ao lado de
+/// `path`, com o pid de quem os criou. O `.rebuild-backup` nao entra: e
+/// tratado pelo `recover_interrupted_rebuild`.
+pub(super) fn rebuild_temp_files(path: &Path) -> Vec<(PathBuf, u32)> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("memory.sqlite");
+    let prefix = format!(".{name}.rebuild-");
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let file_name = entry.file_name();
+            let pid = file_name
+                .to_str()?
+                .strip_prefix(&prefix)?
+                .split('-')
+                .next()?
+                .parse::<u32>()
+                .ok()?;
+            Some((entry.path(), pid))
+        })
+        .collect()
+}
+
 fn recover_interrupted_rebuild(path: &Path) -> io::Result<()> {
+    // Copias de rebuild com o pid de outro processo sao de um processo que
+    // morreu a meio (o worker da memoria morre com a app) e guardam o corpus
+    // inteiro. As deste processo pertencem a um rebuild em curso.
+    let own = std::process::id();
+    for (leftover, pid) in rebuild_temp_files(path) {
+        if pid != own {
+            let _ = fs::remove_file(leftover);
+        }
+    }
     let backup = rebuild_backup_path(path);
     match (path.exists(), backup.exists()) {
         (false, true) => fs::rename(&backup, path),
@@ -116,9 +154,21 @@ fn has_only_legacy_mirror_schema(connection: &Connection) -> io::Result<bool> {
     if names.is_empty() {
         return Err(io::Error::other("empty schema is not legacy"));
     }
-    Ok(names
-        .iter()
-        .all(|name| matches!(name.as_str(), "schema_meta" | "documents" | "memory_fts")))
+    // O FTS5 cria tabelas-sombra (memory_fts_data, _idx, _content, _docsize,
+    // _config) que tambem aparecem como 'table' no sqlite_master.
+    Ok(names.iter().all(|name| {
+        matches!(name.as_str(), "schema_meta" | "documents" | "memory_fts")
+            || name.starts_with("memory_fts_")
+    }))
+}
+
+const LEGACY_INDEX_ERROR: &str = "legacy 2.0.x memory index must be rebuilt from the corpus";
+
+/// O indice e o espelho da v2.0.x. Nao se esvazia aqui: um indice V01 vazio
+/// seguido de um upsert seria um indice parcial que esconde o corpus. Quem
+/// tem o corpus (MemoryStore) reconstroi-o inteiro.
+pub(super) fn is_legacy_index_error(error: &io::Error) -> bool {
+    error.to_string().contains(LEGACY_INDEX_ERROR)
 }
 
 fn configure_connection(connection: &Connection) -> io::Result<()> {
@@ -229,12 +279,10 @@ fn open_ready(path: &Path) -> io::Result<Connection> {
                 .contains("partial or legacy memory schema requires rebuild")
                 && has_only_legacy_mirror_schema(&connection).unwrap_or(false) =>
         {
-            drop(connection);
-            remove_sqlite_sidecars(path);
-            let mut connection = Connection::open(path).map_err(io_error)?;
-            configure_connection(&connection)?;
-            ensure_schema(&mut connection)?;
-            Ok(connection)
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                LEGACY_INDEX_ERROR,
+            ))
         }
         Err(error) => Err(error),
     }
@@ -650,7 +698,11 @@ pub(super) fn rebuild(
     let had_existing = path.exists();
     if had_existing {
         remove_wal_shm(path);
-        fs::rename(path, &backup)?;
+        if let Err(error) = fs::rename(path, &backup) {
+            // O temporario e uma copia completa do corpus: nao pode ficar.
+            remove_sqlite_sidecars(&temp);
+            return Err(error);
+        }
     }
 
     if let Err(error) = fs::rename(&temp, path) {

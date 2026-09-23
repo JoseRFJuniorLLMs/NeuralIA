@@ -7,7 +7,10 @@ fn main() {
     let mut res = winres::WindowsResource::new();
     res.set_icon(icon_path.to_str().unwrap());
     res.set("ProductName", "NeuralIA");
-    res.set("FileDescription", "NeuralIA Desktop");
+    // O Gerenciador de Tarefas usa a FileDescription como nome do grupo do
+    // app (onde ficam, por baixo, os processos WebView2): tem de ser o nome
+    // do produto, nao uma variante dele.
+    res.set("FileDescription", "NeuralIA");
     res.set("LegalCopyright", "© 2026 Jose Ribamar Ferreira Junior");
     // Em release o recurso PE (icone, ProductName, copyright) faz parte do
     // artefacto: falhar aqui em silencio ja produziu um binario publicado sem
