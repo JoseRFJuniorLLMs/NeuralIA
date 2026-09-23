@@ -274,6 +274,10 @@ impl MemoryStore {
             return Ok(CaptureOutcome::SkippedForgotten);
         }
         let sqlite_existed = self.sqlite_path().exists();
+        // Indice perdido com corpus em disco: um upsert de um so documento
+        // criaria um indice parcial e as consultas deixariam de ver o resto.
+        // So neste caminho se paga O(corpus); com indice presente e constante.
+        let rebuild_index = !sqlite_existed && self.document_file_count()? > 0;
 
         document.title = redact_sensitive_text(&document.title);
         document.url = document.url.take().map(|value| redact_url(&value));
@@ -302,6 +306,11 @@ impl MemoryStore {
             fs::create_dir_all(parent)?;
         }
         atomic_write(&wiki_path, self.markdown(&document).as_bytes())?;
+
+        if rebuild_index {
+            self.rebuild()?;
+            return Ok(CaptureOutcome::Stored(document.id));
+        }
 
         let session = self.session_for_document(&document);
         sqlite_v01::upsert(&self.sqlite_path(), &document, session.as_ref())?;
@@ -1163,6 +1172,49 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("candidate index"), "{message}");
         assert!(message.contains("rebuild"), "{message}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn capture_after_index_loss_does_not_hide_the_older_corpus() {
+        let root = temp_root("missing-index-recreated-by-capture");
+        let store = MemoryStore::new(&root).unwrap();
+        let CaptureOutcome::Stored(id_a) = store
+            .capture(MemoryDocument::new(
+                MemoryKind::Source,
+                MemorySourceKind::Reader,
+                "Rust ownership",
+                None,
+                "rust ownership borrowing lifetimes",
+            ))
+            .unwrap()
+        else {
+            panic!("A devia ficar guardado");
+        };
+        fs::remove_file(store.sqlite_path()).unwrap();
+
+        let CaptureOutcome::Stored(id_b) = store
+            .capture(MemoryDocument::new(
+                MemoryKind::Source,
+                MemorySourceKind::Reader,
+                "Rust async",
+                None,
+                "rust async runtime tokio",
+            ))
+            .unwrap()
+        else {
+            panic!("B devia ficar guardado");
+        };
+
+        match store.query(&MemoryQuery::new("rust")) {
+            Err(error) => assert!(error.to_string().contains("rebuild"), "{error}"),
+            Ok(hits) => {
+                let ids = hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>();
+                assert!(ids.contains(&id_a.as_str()), "A sumiu: {ids:?}");
+                assert!(ids.contains(&id_b.as_str()), "B sumiu: {ids:?}");
+            }
+        }
 
         let _ = fs::remove_dir_all(root);
     }
