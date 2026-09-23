@@ -4,12 +4,21 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+## [2.1.6] - 2026-09-23
+
 ### Changed
 - **feat/animated-installer — o instalador publicado volta a ser o `neural-setup`:** o `NeuralIA-Setup-<versão>-x64.exe` da release é o instalador próprio, com a marca e o tecido neuronal animado da Home, compilado por `scripts/build-windows-installer.ps1` à volta dos bytes exatos do `NeuralIA.exe` medido pelo CI (cópia conferida por SHA-256, `cargo build --release --locked -p neural-setup`). O script recusa um `-Version` diferente da versão do workspace, que é a que o instalador regista. O Inno Setup (`installer/NeuralIA.iss`) saiu.
 - **feat/animated-installer — atualização por cima das 2.1.x:** sem `/D=`, o instalador reutiliza a pasta da instalação anterior (a sua entrada, senão a do Inno), substitui a NeuralIA e só depois de escrever a sua entrada apaga o `unins000.*` do Inno (reconhecido pelo `AppId` no cabeçalho do `unins000.dat`) e a chave `{8B2A98F4-7D55-4C43-ABF0-0D7D1A02C4B9}_is1`: "Aplicativos" passa a mostrar uma só NeuralIA, e o atalho do menu Iniciar abre a versão nova.
 - **feat/animated-installer — linha de comandos:** `/D=<pasta>` (último argumento, à NSIS, espaços incluídos) e códigos de saída do modo silencioso: 0 sucesso, 1 falha, 2 argumentos/pasta recusados, 3 `NeuralIA.exe` em uso, 4 instalador sem carga útil.
 
 ### Fixed
+- **Cliques e digitação mortos (2.1.5):** quatro popups auxiliares (divisores do comparador, botão de saída, splash e aviso do Gmail) eram mostrados com `SW_SHOW` e roubavam o foco da janela; cliques em links e botões não chegavam às páginas e a omnibox deixava de aceitar texto. Agora nascem `WS_EX_NOACTIVATE` e aparecem com `SW_SHOWNOACTIVATE`; o foco volta às páginas e os botões nativos são repintados.
+- **Crash com acentos:** texto acentuado na omnibox (por exemplo "ação") fazia o prefixo de um comando cortar a meio de um caractere UTF-8 e derrubava o navegador.
+- **Ícones:** os botões Home, minimizar, maximizar e fechar apareciam como quadrados brancos (o DC nascia opaco) e o "+" aparecia como "-." (elipse num botão estreito).
+- **Nome no Gerenciador de Tarefas:** o processo aparece como "NeuralIA".
+- **Aviso de rolagem:** a pergunta inicial aparece no centro da janela.
+- **Painel lateral:** abre ao lado do comparador e empurra as colunas em vez de ficar por cima delas (a lista da paleta já não se sobrepõe).
+- **Pesquisa escrita num painel:** uma pergunta escrita e enviada na caixa de uma IA (Enter ou botão de enviar) vai também às outras colunas, cada uma no seu fornecedor; num site aberto por um link, a pesquisa GET do site abre em todas as colunas, como o clique. Senhas, e-mails e formulários POST nunca são replicados.
 - **feat/animated-installer — NeuralIA aberta durante a instalação:** a carga útil passa a ser escrita tudo-ou-nada (nomes de passagem, troca com reversão); um `NeuralIA.exe` em uso trava a instalação antes de qualquer escrita — a janela pede para fechar a NeuralIA, o `/S` sai com 3. Antes, um executável a correr podia ser renomeado por baixo da aplicação aberta.
 - **feat/animated-installer — o desinstalador só remove a sua própria pasta:** corrido de uma cópia noutra pasta, apagava a instalação em `%LOCALAPPDATA%\Programs\NeuralIA`, o atalho e a entrada de "Aplicativos" da instalação boa. Agora apaga só a pasta onde vive, só atalhos que abram essa pasta e só uma entrada que aponte para ela; com a pasta temporária noutro disco, estaciona-se ao lado da pasta em vez de falhar com "feche a NeuralIA".
 - **feat/animated-installer — dados do utilizador:** uma pasta de instalação que seja, contenha ou fique dentro da pasta dos dados (`%LOCALAPPDATA%\NeuralIA` ou `NEURALIA_DATA_DIR`: histórico, memória, notas, chave do Gemini, perfil WebView2) é recusada, e tudo o que instalar, atualizar ou desinstalar apaga é conferido contra ela antes de começar.
@@ -19,13 +28,30 @@ All notable changes to NeuralIA are documented here.
 - **feat/animated-installer (revisão) — desinstalar pelo Explorador:** o desinstalador sai da própria pasta antes de a apagar (o duplo clique corre-o lá dentro, e a pasta ficava vazia para trás); mantém-se enquanto um arquivo da NeuralIA estiver em uso, para a entrada de "Aplicativos" continuar a funcionar; e a cópia estacionada em `%TEMP%` é apagada por um `cmd` sem janela quando o processo termina, em vez de ficar para sempre.
 - **feat/animated-installer (revisão) — textos em pt-BR:** o instalador fala como a NeuralIA ("Não foi possível", "Instalando a NeuralIA", "Criar atalho na área de trabalho", "versão").
 
+### Added
+- **Dicas (hints):** todos os botões explicam o que fazem, numa mensagem grande, centrada, em pílula com cantos suaves nas cores do tema.
+- **Tema:** Sistema, Claro ou Escuro (menu no botão Home, comando `tema:`); a barra acompanha o sistema.
+- **Ctrl+H:** painel lateral com o histórico inteligente, pesquisa na memória e sugestões de sites.
+- **Home em tela cheia**, sem barra de título, com os botões da própria app; o × de fechar fica vermelho sob o mouse, como no Chrome, em todos os fechos.
+- **Barra de ícones:** Meet, WhatsApp, YouTube, Gmail (liga/desliga avisos de e-mail, com pergunta "abrir?" que abre no painel lateral) e Privado, com o serviço a abrir no painel lateral (câmera e microfone só com o consentimento do WebView2).
+- **‹ › por IA:** cada coluna tem os seus botões voltar/avançar logo depois do "+"; a fonte aberta ao lado tem o seu par junto ao rótulo.
+- **"Ir" vivo:** sob o mouse o botão vira um degradê em movimento e o cursor passa a mão.
+- **Ctrl+R** liga/desliga a rolagem automática com um aviso no meio da janela (recarregar continua no F5 e no Ctrl+Shift+R).
+- **Gemini Live** (botão com um olho, vermelho quando ligado): o Gemini vê a tela, a câmera e ouve o microfone, e responde por voz. Pede a chave da API na primeira vez e guarda-a cifrada (DPAPI) em `gemini-live.key`; modelo `gemini-2.5-flash-native-audio-preview-12-2025`. Tudo para ao desligar, ao ir para a Home ou numa tela de erro; sessões longas sobrevivem aos limites de 2 e 10 minutos do servidor; reconexões limitadas por sessão.
+- **Log de depuração** em tempo de execução (`NEURALIA_DEBUG_LOG`) para bugs intermitentes de janela.
+- **Núcleo:** motores de Pomodoro e Zettelkasten em `neural-core` (a interface chega na próxima versão).
+
 ### Security
+- **Ctrl+Shift+Delete** pede confirmação ("Não" por omissão) antes de apagar todo o histórico e a memória local.
+- **IPC (SPEC-0005/SPEC-0108/SPEC-0015):** o conjunto fechado passa a 28 ações com `ask` (`col`, `text` de 1 a 2000 caracteres, sem caracteres de controlo além de `\n` e `\t`); uma coluna só fala por si. As specs publicavam 26 (ou 25) ações e omitiam `link`; o gate `protocol_accepts_exactly_the_twenty_eight_published_actions` lê a SPEC-0005 e falha se ela divergir do parser.
+- **Gemini Live:** destino de rede novo (`generativelanguage.googleapis.com`, só enquanto ligado), documentado no `SECURITY.md`; a chave nunca vai para o log, o histórico, a memória nem para a URL da página.
+- 32 correções de auditoria verificadas (instalador, core, CI/docs, agente e canal IPC), cada uma com teste e prova de sabotagem.
 - **feat/animated-installer (revisão) — segredos de assinatura fora do cargo:** `scripts/build-windows-installer.ps1` lê `NEURALIA_AUTHENTICODE_PFX_B64`/`_PASSWORD` e tira-os do ambiente antes de chamar o cargo, que os passava a todos os build scripts e proc-macros compilados no passo de release. O gate `scripts/test-build-installer-isolation.ps1` (CI `installer-smoke`) corre o script com um `cargo` falso e fica vermelho se alguma chamada vir um segredo. O `packaging/build-installer.ps1`, que recompilava o `NeuralIA.exe` sem `--locked` nem smoke, saiu.
-- **fix/audit-cidocs / SPEC-0005, SPEC-0108, SPEC-0015:** as specs publicavam 26 (ou 25) ações IPC e omitiam `link`, que o parser aceita desde 2.1.0 (`col`, `url`, `aside`; com `aside=false` navega as três colunas do comparador). A lista publicada passa a 27 ações e o gate `protocol_accepts_exactly_the_twenty_seven_published_actions` lê a SPEC-0005 e falha se ela divergir do conjunto que o parser aceita.
 
 ### Testing
 - **fix/audit-cidocs — prova de sabotagem da UI no CI:** o passo aplicava as seis regressões Rust de uma vez e só verificava se o nome de cada gate aparecia no log, o que acontece também quando o teste passa; cinco dos seis gates podiam estar mortos com o passo verde. Agora cada uma das oito sabotagens Rust é aplicada sozinha, corre só o seu gate e exige a linha `test ...::<gate> ... FAILED`; depois de restaurar, exige `... ok` para cada gate.
 - **feat/animated-installer — `installer-smoke` sobre o `neural-setup`:** `scripts/test-windows-installer.ps1` instala em silêncio com `/S /D=` numa pasta com espaço, confere o SHA-256 do `NeuralIA.exe` instalado contra o testado pelo CI, a entrada `...\Uninstall\NeuralIA` (nome, versão, pasta, comandos), o desinstalador e os atalhos, o código 3 com o executável aberto, o código 2 para a pasta dos dados e a desinstalação silenciosa; depois atualiza por cima de uma instalação Inno 2.1.x simulada e confere que os dados ficaram byte a byte iguais. Recusa correr onde a NeuralIA já está registada; `-Isolated` usa uma pasta de ensaio (`NEURALIA_SETUP_SANDBOX`). O job passa a instalar a toolchain fixada e prova também que um `-Version` diferente do workspace é recusado; o contrato de release exige o instalador à volta do binário testado.
+- Os scripts Node do CI (`scripts/test-*.mjs`) passam a ser corridos localmente antes de cada push (um segundo listener de clique na coluna quebrou o `core` uma vez).
 
 ## [2.1.5] - 2026-09-22
 
