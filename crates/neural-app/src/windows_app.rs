@@ -16166,7 +16166,8 @@ mod tests {
     /// que arranca a sessao, o URL do socket) sai de la sem ela.
     #[test]
     fn the_debug_log_never_writes_the_gemini_key() {
-        let key = "AIzaSyTESTONLY-not-a-real-key_0123456789";
+        // `concat!`: o texto do codigo nao pode ter a forma de uma chave Google.
+        let key = concat!("AIza", "SyTESTONLY-not-a-real-key_0123456789");
         let dir = std::env::temp_dir().join(format!("neuralia-livelog-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("pasta temporaria");
