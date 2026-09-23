@@ -277,9 +277,11 @@ await __settle();
 __speech.finish(); await __settle();
 const state = () => __byId('neuralia-ra-bar').getAttribute('data-state');
 const out = {{ speaking: state(), said: __said().slice() }};
+const cancelsBefore = __speech.cancels;
 __click(__byId('neuralia-ra-play'));
 out.paused = state();
-out.cancels = __speech.cancels;
+out.pauseCancels = __speech.cancels - cancelsBefore;
+out.engineSpeakingWhilePaused = __speech.speaking;
 // O Chromium entrega o 'end' da utterance cancelada depois do cancel().
 __speech.deliverStale('end');
 await __settle();
@@ -292,6 +294,11 @@ out.resumed = __said().slice();
 __click(__byId('neuralia-ra-next'));
 await __settle();
 out.next = __said().slice();
+// O 'end' atrasado da frase saltada chega com a seguinte ja a falar: so a
+// utterance viva faz a fila andar.
+__speech.deliverStale('end');
+await __settle();
+out.afterStaleWhileSpeaking = __said().slice();
 __click(__byId('neuralia-ra-prev'));
 await __settle();
 out.prev = __said().slice();
@@ -310,7 +317,12 @@ return out;
         assert_eq!(result["speaking"], json!("speaking"));
         assert_eq!(strings(&result["said"]), ["Um.", "Dois."]);
         assert_eq!(result["paused"], json!("paused"));
-        assert!(result["cancels"].as_u64().unwrap_or(0) >= 1, "pausa cala");
+        assert_eq!(result["pauseCancels"], json!(1), "a pausa cala o motor");
+        assert_eq!(
+            result["engineSpeakingWhilePaused"],
+            json!(false),
+            "em pausa o motor nao continua a falar"
+        );
         assert_eq!(
             strings(&result["afterStaleEnd"]),
             ["Um.", "Dois."],
@@ -324,6 +336,11 @@ return out;
             "continuar repete a frase interrompida"
         );
         assert_eq!(strings(&result["next"]), ["Um.", "Dois.", "Dois.", "Três."]);
+        assert_eq!(
+            strings(&result["afterStaleWhileSpeaking"]),
+            ["Um.", "Dois.", "Dois.", "Três."],
+            "o 'end' da utterance saltada nao salta outra frase"
+        );
         assert_eq!(
             strings(&result["prev"]),
             ["Um.", "Dois.", "Dois.", "Três.", "Dois."]
@@ -412,6 +429,10 @@ __pdf([[{{ str: 'Texto sensível do documento.', eol: false }}]]);
 __renderPage(0);
 __key({{ key: 'U', ctrlKey: true, shiftKey: true }});
 await __settle();
+// Espera um pouco pelas vozes do Windows (podem chegar numa segunda leva)
+// e depois diz que nao ha nenhuma.
+__tick(1500);
+await __settle();
 const out = {{
   said: __said().slice(),
   hint: __byId('neuralia-ra-hint').textContent,
@@ -465,6 +486,46 @@ return out;
                 .contains("Francisca Online"),
             "{}",
             result["stored"]
+        );
+    }
+
+    #[test]
+    fn read_aloud_waits_for_the_windows_voices_that_arrive_after_the_online_ones() {
+        // Medido no Edge (o motor do WebView2): o primeiro 'voiceschanged'
+        // traz so as vozes online e as do Windows chegam ~50 ms depois. Um
+        // Ctrl+Shift+U nesse intervalo nao pode desistir nem ler com a online.
+        let outcome = pdf(&format!(
+            r#"{VOICES}
+__contentLoaded();
+__pdf([[{{ str: 'Olá mundo.', eol: false }}]]);
+__renderPage(0);
+__key({{ key: 'U', ctrlKey: true, shiftKey: true }});
+await __settle();
+__speech.setVoices([ONLINE_BR]);
+await __settle();
+const out = {{
+  early: __said().slice(),
+  hintEarly: __byId('neuralia-ra-hint').hidden,
+  stateEarly: __byId('neuralia-ra-bar').getAttribute('data-state'),
+}};
+__tick(50);
+__speech.setVoices([ONLINE_BR, LOCAL_EN, LOCAL_BR]);
+await __settle();
+out.voices = __speech.log.map((x) => [x.text, x.voice]);
+return out;
+"#
+        ));
+        let result = clean_result(&outcome);
+        assert_eq!(result["early"], json!([]));
+        assert_eq!(
+            result["hintEarly"],
+            json!(true),
+            "nao diz que falta a voz offline"
+        );
+        assert_eq!(result["stateEarly"], json!("loading"));
+        assert_eq!(
+            result["voices"],
+            json!([["Olá mundo.", "Microsoft Maria - Portuguese (Brazil)"]])
         );
     }
 
@@ -579,6 +640,76 @@ return out;
             "frase fora do ecra: centra o primeiro span dela"
         );
         assert_eq!(result["fallback"], json!(["0:0", "0:1"]));
+    }
+
+    #[test]
+    fn read_aloud_highlight_skips_marked_content_markers_like_the_text_layer() {
+        // PDFs marcados (Word, LaTeX com tagpdf) trazem marcadores de conteudo
+        // marcado sem `str`. A TextLayer nao lhes da textDiv; se a leitura os
+        // contasse como unidades, o realce caia no span errado.
+        let outcome = pdf(&format!(
+            r#"{VOICES}
+__contentLoaded();
+__speech.setVoices([LOCAL_BR]);
+__pdf([[
+  {{ mark: 'begin' }},
+  {{ str: 'Primeira frase.', eol: false }},
+  {{ mark: 'end' }},
+  {{ mark: 'begin' }},
+  {{ str: ' Segunda frase.', eol: false }},
+  {{ mark: 'end' }},
+]]);
+__renderPage(0);
+__key({{ key: 'U', ctrlKey: true, shiftKey: true }});
+await __settle();
+const out = {{ first: __highlight().map((r) => [r.unit, r.text]) }};
+__speech.finish(); await __settle();
+out.second = __highlight().map((r) => [r.unit, r.text]);
+out.said = __said();
+return out;
+"#
+        ));
+        let result = clean_result(&outcome);
+        assert_eq!(result["first"], json!([["0:1", "Primeira frase."]]));
+        assert_eq!(result["second"], json!([["0:4", "Segunda frase."]]));
+        assert_eq!(
+            strings(&result["said"]),
+            ["Primeira frase.", "Segunda frase."]
+        );
+    }
+
+    #[test]
+    fn read_aloud_remembers_the_chosen_voice_and_speed() {
+        // A escolha guardada (origem local do visualizador) vale na leitura
+        // seguinte; uma velocidade fora das opcoes vai para a mais proxima e o
+        // seletor mostra-a.
+        let outcome = pdf(&format!(
+            r#"{VOICES}
+const LOCAL_PT = __voice('Microsoft Helia - Portuguese (Portugal)', 'pt-PT', true);
+localStorage.setItem('neuralia.readAloud.v1', JSON.stringify({{ voice: LOCAL_PT.voiceURI, rate: 1.1 }}));
+__contentLoaded();
+__speech.setVoices([LOCAL_BR, LOCAL_PT]);
+__pdf([[{{ str: 'Olá mundo.', eol: false }}]]);
+__renderPage(0);
+__key({{ key: 'U', ctrlKey: true, shiftKey: true }});
+await __settle();
+return {{
+  log: __speech.log.map((x) => [x.voice, x.rate]),
+  picker: __byId('neuralia-ra-voice').value,
+  rate: __byId('neuralia-ra-rate').value,
+}};
+"#
+        ));
+        let result = clean_result(&outcome);
+        assert_eq!(
+            result["log"],
+            json!([["Microsoft Helia - Portuguese (Portugal)", 1]])
+        );
+        assert_eq!(
+            result["picker"],
+            json!("Microsoft Helia - Portuguese (Portugal)")
+        );
+        assert_eq!(result["rate"], json!("1"));
     }
 
     #[test]

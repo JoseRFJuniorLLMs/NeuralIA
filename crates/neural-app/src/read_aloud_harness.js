@@ -664,9 +664,14 @@ function setup() {
       .filter((el) => el.classList.contains('neuralia-ra-hl'))
       .map((el) => el.getAttribute('data-unit'));
 
+  // Um item de conteudo marcado ({ mark: 'begin' | 'end' }) chega ao texto
+  // como o PDF.js o da -- sem `str` -- e, como na TextLayer, nao tem textDiv.
+  const textItem = (it) =>
+    it.mark ? { type: it.mark === 'end' ? 'endMarkedContent' : 'beginMarkedContent', id: 'mc' } : { str: it.str, hasEOL: !!it.eol };
+
   // Um visualizador de PDF falso com as mesmas ligacoes que o viewer.mjs da
-  // ao attachPdf(): paginas por indice, textDivs paralelos aos itens, e as
-  // camadas de texto so existem depois de __renderPage(i).
+  // ao attachPdf(): paginas por indice, textDivs paralelos aos itens com
+  // `str`, e as camadas de texto so existem depois de __renderPage(i).
   g.__pdf = (pages) => {
     const state = { pages, current: 0, shown: [], divs: [], textCalls: [] };
     const container = g.document.createElement('div');
@@ -687,7 +692,7 @@ function setup() {
       currentPage: () => state.current,
       textContent: (i) => {
         state.textCalls.push(i);
-        return Promise.resolve(pages[i].map((it) => ({ str: it.str, hasEOL: !!it.eol })));
+        return Promise.resolve(pages[i].map(textItem));
       },
       textDivs: (i) => state.divs[i] || null,
       pageOf: (el) => {
@@ -706,13 +711,30 @@ function setup() {
     const layer = g.document.createElement('div');
     layer.className = 'textLayer';
     state.els[i].appendChild(layer);
-    state.divs[i] = state.pages[i].map((it, k) => {
+    // Como a TextLayer: um marcador abre/fecha um <span class="markedContent">
+    // e nao entra nos textDivs; um item vazio tem textDiv mas fica fora do
+    // DOM. `data-unit` e a posicao do item no getTextContent().
+    const divs = [];
+    let parent = layer;
+    state.pages[i].forEach((it, k) => {
+      if (it.mark === 'end') {
+        parent = parent.parentNode || layer;
+        return;
+      }
+      if (it.mark) {
+        const marked = g.document.createElement('span');
+        marked.className = 'markedContent';
+        parent.appendChild(marked);
+        parent = marked;
+        return;
+      }
       const span = g.document.createElement('span');
       span.textContent = it.str;
       span.setAttribute('data-unit', i + ':' + k);
-      if (it.str !== '') layer.appendChild(span);
-      return span;
+      if (it.str !== '') parent.appendChild(span);
+      divs.push(span);
     });
+    state.divs[i] = divs;
     g.__ctl.pageReady(i);
     return state.divs[i];
   };

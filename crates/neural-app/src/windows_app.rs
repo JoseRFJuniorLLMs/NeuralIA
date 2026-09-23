@@ -15054,6 +15054,55 @@ return out;
     }
 
     #[test]
+    fn esc_in_the_find_bar_closes_the_find_bar_and_keeps_reading() {
+        // A barra de procura do Ctrl+F (mapa de teclas) tem o seu Esc. Com a
+        // leitura a correr, o Esc escrito nela fecha-a e a leitura continua;
+        // o Esc seguinte, fora do campo, e que para a leitura.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let keymap = NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", CAP);
+        let drive = r#"
+__contentLoaded();
+__speech.setVoices([__voice('br', 'pt-BR', true)]);
+__pdf([[{ str: 'Uma frase. Outra frase.', eol: false }]]);
+__renderPage(0);
+const state = () => __byId('neuralia-ra-bar').getAttribute('data-state');
+__key({ key: 'U', ctrlKey: true, shiftKey: true });
+await __settle();
+__key({ key: 'f', ctrlKey: true });
+const out = { findOpen: !!__byId('neuralia-find'), focus: document.activeElement.tagName };
+__key({ key: 'Escape' });
+await __settle();
+out.findAfterEsc = !!__byId('neuralia-find');
+out.stateAfterFindEsc = state();
+document.activeElement = document.body;
+__key({ key: 'Escape' });
+await __settle();
+out.stateAfterSecondEsc = state();
+out.posted = __posted.length;
+return out;
+"#;
+        let outcome = crate::read_aloud::harness::run(
+            &[
+                ("keymap", keymap.as_str()),
+                ("read-aloud.js", READ_ALOUD_SCRIPT),
+            ],
+            "http://neuralia-pdf.localhost/viewer.html",
+            drive,
+        );
+        let result = crate::read_aloud::harness::clean_result(&outcome);
+        assert_eq!(result["findOpen"], serde_json::json!(true));
+        assert_eq!(result["focus"], serde_json::json!("INPUT"));
+        assert_eq!(result["findAfterEsc"], serde_json::json!(false));
+        assert_eq!(
+            result["stateAfterFindEsc"],
+            serde_json::json!("speaking"),
+            "o Esc da barra de procura nao e o Esc da leitura"
+        );
+        assert_eq!(result["stateAfterSecondEsc"], serde_json::json!("idle"));
+        assert_eq!(result["posted"], serde_json::json!(0));
+    }
+
+    #[test]
     fn reader_mode_reads_the_article_aloud_from_its_init_script() {
         // O initialization script do Modo Leitura tal como o builder o monta:
         // a leitura liga-se sozinha ao artigo, le titulo e blocos (cada bloco

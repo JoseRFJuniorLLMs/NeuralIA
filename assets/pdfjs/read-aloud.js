@@ -284,10 +284,18 @@
     return { offline: offline.sort(order), online: online.sort(order) };
   }
 
+  // A velocidade e sempre uma das opcoes do seletor: um valor guardado fora da
+  // lista (outra versao, armazenamento mexido) vai para a mais proxima, para o
+  // seletor nunca ficar em branco.
   function clampRate(value) {
     const n = Number(value);
     if (!Number.isFinite(n)) return 1;
-    return Math.min(MAX_RATE, Math.max(MIN_RATE, n));
+    const bounded = Math.min(MAX_RATE, Math.max(MIN_RATE, n));
+    let best = RATES[0];
+    for (const option of RATES) {
+      if (Math.abs(option - bounded) < Math.abs(best - bounded)) best = option;
+    }
+    return best;
   }
 
   function prefsStore(win) {
@@ -519,9 +527,13 @@
       speech.onvoiceschanged = onVoicesChanged;
     }
 
-    // O Chromium so enche getVoices() depois de 'voiceschanged'.
+    // O Chromium so enche getVoices() depois de 'voiceschanged' -- e o Edge
+    // (o motor do WebView2) enche-o em duas levas: primeiro as vozes online,
+    // dezenas de milissegundos depois as do Windows. Espera-se por uma voz
+    // utilizavel (a guardada ou uma local), nao pela primeira leva: senao um
+    // Ctrl+Shift+U logo a abrir dizia "nao ha voz offline" com ela a caminho.
     function waitForVoices() {
-      if (voices().length) return Promise.resolve();
+      if (voice()) return Promise.resolve();
       return new Promise((resolve) => {
         let done = false;
         const finish = () => {
@@ -529,7 +541,12 @@
           done = true;
           resolve();
         };
-        voiceWaiters.push(finish);
+        const check = () => {
+          if (done) return;
+          if (voice()) finish();
+          else voiceWaiters.push(check);
+        };
+        voiceWaiters.push(check);
         setTimeout(finish, VOICE_WAIT_MS);
       });
     }
@@ -890,7 +907,10 @@
   // ---------------------------------------------------------------- fontes
 
   // PDF.js: uma pagina e a lista de itens do getTextContent(); os nos sao os
-  // textDivs da TextLayer, paralelos aos itens.
+  // textDivs da TextLayer. A TextLayer so cria um textDiv por item com `str`
+  // -- os marcadores de conteudo marcado (beginMarkedContent/endMarkedContent,
+  // sem `str`) viram contentores, nao textDivs. Saltam-se aqui pela mesma
+  // regra, senao cada marcador desalinhava o realce uma unidade.
   function createPdfSource(hooks) {
     const win = hooks.window || window;
     return {
@@ -899,10 +919,9 @@
       currentPage: () => hooks.currentPage(),
       pageUnits: (p) =>
         Promise.resolve(hooks.textContent(p)).then((items) =>
-          Array.prototype.map.call(items || [], (item) => ({
-            text: item && typeof item.str === 'string' ? item.str : '',
-            eol: !!(item && item.hasEOL),
-          }))
+          Array.prototype.filter
+            .call(items || [], (item) => !!item && typeof item.str === 'string')
+            .map((item) => ({ text: item.str, eol: !!item.hasEOL }))
         ),
       nodes: (p) => {
         const divs = hooks.textDivs(p);
@@ -1273,6 +1292,17 @@
     return attach(createPdfSource(hooks), { lang: hooks.lang });
   }
 
+  // Um campo de texto que nao e da leitura (a barra de procura do Ctrl+F, por
+  // exemplo) fica com o seu Esc.
+  function foreignField(target) {
+    if (!target || target.nodeType !== 1) return false;
+    const tag = String(target.tagName || '').toUpperCase();
+    const editable = tag === 'INPUT' || tag === 'TEXTAREA' || target.isContentEditable === true;
+    if (!editable) return false;
+    const bar = document.getElementById('neuralia-ra-bar');
+    return !(bar && bar.contains(target));
+  }
+
   // Ctrl+Shift+U (o atalho do Edge) liga e desliga; Esc para a leitura. Na
   // fase de captura da janela, antes do mapa de teclas do NeuralIA (captura no
   // document): sem isto o Ctrl+Shift+U seria o Ctrl+U de ver o codigo e o Esc
@@ -1288,7 +1318,7 @@
         if (active) active.toggle();
         return;
       }
-      if (key === 'escape' && active && active.busy()) {
+      if (key === 'escape' && active && active.busy() && !foreignField(event.target)) {
         event.preventDefault();
         event.stopPropagation();
         active.close();
