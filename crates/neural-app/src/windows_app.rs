@@ -3001,7 +3001,13 @@ impl MemoryWorker {
         }
     }
 
-    fn clear(&self) {
+    /// Apagar a memoria esquece tambem a sessao de pesquisa viva. O worker
+    /// apaga sessions/<id>.json e poe tombstone no id; uma sessao que ficasse
+    /// na app voltava ao disco no proximo save_session (com a pergunta ja
+    /// apagada) e cada captura nova com esse id era recusada em silencio.
+    /// Pedir a sessao aqui obriga quem apaga a larga-la.
+    fn clear(&self, current_research: &mut Option<ResearchSession>) {
+        *current_research = None;
         if self.tx.try_send(MemoryCommand::Clear).is_err() {
             eprintln!("memory queue saturated; clear not scheduled");
         }
@@ -8153,7 +8159,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::HideGmailToast(token) => self.hide_gmail_toast(token),
             UserEvent::ShowHistory => self.show_history(),
             UserEvent::ClearHistory => {
-                self.memory.clear();
+                self.memory.clear(&mut self.current_research);
                 match self.history.clear() {
                     None => {
                         self.show_home();
@@ -12901,6 +12907,22 @@ process.stdout.write(JSON.stringify(results));
         assert!(top.contains("JSON.stringify"));
         assert!(top.contains("const defer = setTimeout;"));
         assert!(top.contains("const cancelDefer = clearTimeout;"));
+    }
+
+    #[test]
+    fn clearing_memory_drops_the_live_research_session() {
+        // Depois de "Apagar historico" a sessao viva nao pode continuar a
+        // receber fontes: o proximo save_session reescrevia no disco a
+        // pergunta que o utilizador acabou de apagar.
+        let (tx, rx) = sync_channel::<MemoryCommand>(4);
+        let worker = MemoryWorker { tx };
+        let mut current_research = Some(ResearchSession::new("pergunta secreta"));
+        worker.clear(&mut current_research);
+        assert!(matches!(rx.try_recv(), Ok(MemoryCommand::Clear)));
+        assert!(
+            current_research.is_none(),
+            "the cleared research session is still alive and will be saved again"
+        );
     }
 
     #[test]
