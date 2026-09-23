@@ -7,6 +7,7 @@ registada e embutida.
 
     python scripts/gen-ai-icons.py                          # todos
     python scripts/gen-ai-icons.py pomodoro notes breath    # so estes
+    python scripts/gen-ai-icons.py live                     # so o do Gemini Live
 """
 
 from __future__ import annotations
@@ -397,6 +398,31 @@ def breath() -> None:
     finish(mask, solid((255, 255, 255)), "breath.png")
 
 
+# --------------------------------------------------------------- Gemini Live
+def live() -> None:
+    """Olho em contorno com a pupila cheia, branco: o botao que liga a IA que
+    ve a tela. Marca generica -- nenhuma arte de marca registada."""
+    stroke = N * 0.075
+    left, right = (N * 0.06, CENTER), (N * 0.94, CENTER)
+    top_c, bottom_c = (CENTER, N * 0.02), (CENTER, N * 0.98)
+
+    mask = Image.new("L", (N, N), 0)
+    draw = ImageDraw.Draw(mask)
+    outer = quad_bezier(left, top_c, right) + quad_bezier(right, bottom_c, left)
+    draw.polygon(outer, fill=255)
+    # Miolo: a mesma amendoa recolhida pela espessura do traco.
+    inset = stroke * 1.9
+    inner_left, inner_right = (left[0] + inset, CENTER), (right[0] - inset, CENTER)
+    inner = quad_bezier(inner_left, (CENTER, top_c[1] + 2.0 * stroke), inner_right) + quad_bezier(
+        inner_right, (CENTER, bottom_c[1] - 2.0 * stroke), inner_left
+    )
+    draw.polygon(inner, fill=0)
+    # Pupila.
+    r = N * 0.12
+    draw.ellipse([CENTER - r, CENTER - r, CENTER + r, CENTER + r], fill=255)
+    finish(mask, solid((255, 255, 255)), "live.png")
+
+
 ICONS = {
     "gemini": gemini,
     "chatgpt": chatgpt,
@@ -407,6 +433,7 @@ ICONS = {
     "youtube": youtube,
     "mail": mail,
     "incognito": incognito,
+    "live": live,
     "pomodoro": pomodoro,
     "notes": notes,
     "breath": breath,
@@ -414,7 +441,7 @@ ICONS = {
 
 
 def main(names: list[str]) -> None:
-    """Sem argumentos gera todos; com nomes (ex.: `pomodoro notes`) so esses,
+    """Sem argumentos gera todos; com nomes (ex.: `live` ou `pomodoro notes`) so esses,
     para nao regravar PNGs que nao mudaram."""
     os.makedirs(OUT_DIR, exist_ok=True)
     for name in names or list(ICONS):

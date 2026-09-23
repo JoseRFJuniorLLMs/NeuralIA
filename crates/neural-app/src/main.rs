@@ -16,6 +16,9 @@ mod pdf_assets;
 // Windows: correm tambem no CI Linux.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod read_aloud;
+// Gemini Live: origem propria, canal fechado e chave com DPAPI (Windows).
+#[cfg(target_os = "windows")]
+mod gemini_live;
 #[cfg(target_os = "windows")]
 mod windows_app;
 
