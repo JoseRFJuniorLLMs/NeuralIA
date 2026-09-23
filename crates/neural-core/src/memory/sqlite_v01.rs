@@ -74,7 +74,45 @@ fn rebuild_temp_path(path: &Path) -> PathBuf {
     parent.join(format!(".{name}.rebuild-{}-{nonce}", std::process::id()))
 }
 
+/// Ficheiros `.<nome>.rebuild-<pid>-<nonce>` (e os seus -wal/-shm) ao lado de
+/// `path`, com o pid de quem os criou. O `.rebuild-backup` nao entra: e
+/// tratado pelo `recover_interrupted_rebuild`.
+pub(super) fn rebuild_temp_files(path: &Path) -> Vec<(PathBuf, u32)> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("memory.sqlite");
+    let prefix = format!(".{name}.rebuild-");
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let file_name = entry.file_name();
+            let pid = file_name
+                .to_str()?
+                .strip_prefix(&prefix)?
+                .split('-')
+                .next()?
+                .parse::<u32>()
+                .ok()?;
+            Some((entry.path(), pid))
+        })
+        .collect()
+}
+
 fn recover_interrupted_rebuild(path: &Path) -> io::Result<()> {
+    // Copias de rebuild com o pid de outro processo sao de um processo que
+    // morreu a meio (o worker da memoria morre com a app) e guardam o corpus
+    // inteiro. As deste processo pertencem a um rebuild em curso.
+    let own = std::process::id();
+    for (leftover, pid) in rebuild_temp_files(path) {
+        if pid != own {
+            let _ = fs::remove_file(leftover);
+        }
+    }
     let backup = rebuild_backup_path(path);
     match (path.exists(), backup.exists()) {
         (false, true) => fs::rename(&backup, path),
@@ -650,7 +688,11 @@ pub(super) fn rebuild(
     let had_existing = path.exists();
     if had_existing {
         remove_wal_shm(path);
-        fs::rename(path, &backup)?;
+        if let Err(error) = fs::rename(path, &backup) {
+            // O temporario e uma copia completa do corpus: nao pode ficar.
+            remove_sqlite_sidecars(&temp);
+            return Err(error);
+        }
     }
 
     if let Err(error) = fs::rename(&temp, path) {

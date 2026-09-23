@@ -599,6 +599,11 @@ impl MemoryStore {
                 remove_files_under(&self.root.join(dir), &mut report.files, &mut failures);
             }
             let _ = fs::remove_file(self.sqlite_path());
+            // Copias de rebuilds interrompidos, seja qual for o pid: um pid
+            // reutilizado nao pode esconder uma copia do corpus do forget.
+            for (leftover, _) in sqlite_v01::rebuild_temp_files(&self.sqlite_path()) {
+                remove_file_counted(&leftover, &mut report.files, &mut failures);
+            }
         } else {
             // Ficheiros crus, nao `documents()`: um documento que um forget
             // anterior nao conseguiu apagar ja esta escondido pela tombstone

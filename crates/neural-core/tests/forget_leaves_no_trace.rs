@@ -191,3 +191,72 @@ fn forget_by_domain_retries_a_document_an_earlier_forget_failed_to_delete() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn forget_all_removes_the_copy_left_by_a_killed_rebuild() {
+    // memory:rebuild constroi uma copia completa do corpus num temporario
+    // antes de a trocar. Se o processo morre a meio, a copia fica em db/.
+    let (root, store) = store_with_secrets("killed-rebuild");
+    let db = root.join("db");
+    fs::write(db.join(".neural-memory.sqlite.rebuild-1-1"), NEEDLE).unwrap();
+    fs::write(db.join(".neural-memory.sqlite.rebuild-1-1-wal"), NEEDLE).unwrap();
+    // Um pid reutilizado: o mesmo numero do processo actual.
+    let own = std::process::id();
+    fs::write(
+        db.join(format!(".neural-memory.sqlite.rebuild-{own}-7")),
+        NEEDLE,
+    )
+    .unwrap();
+
+    store.forget(ForgetScope::All).expect("forget corre");
+
+    let remaining = files_containing(&root, NEEDLE);
+    assert!(remaining.is_empty(), "segredo sobreviveu em {remaining:?}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(windows)]
+#[test]
+fn failed_rebuild_swap_does_not_leave_a_copy_of_the_corpus() {
+    use std::os::windows::fs::OpenOptionsExt;
+    // O SQLite abre o ficheiro sem FILE_SHARE_DELETE; com outro handle assim
+    // o rename do indice antigo falha, e cada tentativa deixava uma copia.
+    const FILE_SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+    let (root, store) = store_with_secrets("held-index");
+    let db = root.join("db");
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ_WRITE)
+        .open(db.join("neural-memory.sqlite"))
+        .expect("indice existe");
+
+    let result = store.rebuild();
+    drop(held);
+    assert!(result.is_err(), "o rename devia ter falhado: {result:?}");
+
+    let leftovers = fs::read_dir(&db)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".rebuild-"))
+        .collect::<Vec<_>>();
+    assert!(
+        leftovers.is_empty(),
+        "copia do corpus ficou em {leftovers:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rebuild_sweeps_the_copy_left_by_a_dead_process() {
+    let (root, store) = store_with_secrets("dead-rebuild");
+    let leftover = root.join("db").join(".neural-memory.sqlite.rebuild-1-1");
+    fs::write(&leftover, NEEDLE).unwrap();
+
+    store.rebuild().expect("rebuild corre");
+
+    assert!(!leftover.exists(), "copia de um rebuild morto ficou em db/");
+    let _ = fs::remove_dir_all(&root);
+}
