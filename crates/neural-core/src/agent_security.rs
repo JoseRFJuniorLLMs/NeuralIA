@@ -486,6 +486,35 @@ pub fn redact_url(raw: &str) -> String {
 
     url.to_string()
 }
+/// Nomes de campo que, seguidos de `:` ou `=`, marcam a linha como segredo.
+const SENSITIVE_KEYS: [&str; 12] = [
+    "password",
+    "passwd",
+    "pwd",
+    "otp",
+    "token",
+    "cvv",
+    "cvc",
+    "card number",
+    "card_number",
+    "card-number",
+    "authorization",
+    "cookie",
+];
+
+/// A chave sensivel de `lower` quando ela e seguida -- depois de espacos,
+/// tabs ou aspas -- por `:` ou `=`. Apanha `password = x`, `"password": "x"`
+/// e `CVV: 123`, que as agulhas com o separador colado deixavam passar.
+fn keyed_secret(lower: &str) -> Option<&'static str> {
+    SENSITIVE_KEYS.iter().copied().find(|key| {
+        lower.match_indices(key).any(|(at, _)| {
+            lower[at + key.len()..]
+                .trim_start_matches([' ', '\t', '"', '\''])
+                .starts_with([':', '='])
+        })
+    })
+}
+
 pub fn redact_sensitive_text(input: &str) -> String {
     let mut output = Vec::new();
     for raw in input.lines() {
@@ -515,7 +544,8 @@ pub fn redact_sensitive_text(input: &str) -> String {
         ]
         .iter()
         .find(|needle| lower.contains(*needle))
-        .copied();
+        .copied()
+        .or_else(|| keyed_secret(&lower));
 
         if let Some(needle) = sensitive {
             // O nome do campo so se escreve quando foi ELE o reconhecido.
@@ -574,6 +604,37 @@ mod tests {
         let clean = redact_sensitive_text("ya29.SEGREDO-MUITO-LONGO-E-ESTRANHO: api_key");
         assert!(!clean.contains("ya29.SEGREDO"), "{clean}");
     }
+    #[test]
+    fn secrets_with_spaces_quotes_or_the_other_separator_are_redacted() {
+        // Configs INI/TOML/JSON e formularios copiados: a chave e o separador
+        // nem sempre vem colados. Montado em tempo de execucao pelo mesmo
+        // motivo do fixture abaixo (scanner de segredos do CI).
+        let pw = "password";
+        for (line, secret) in [
+            (format!("{pw} = hunter2"), "hunter2"),
+            (format!("{{\"{pw}\": \"hunter2\"}}"), "hunter2"),
+            (format!("{pw} : hunter2"), "hunter2"),
+            ("CVV: 123".to_string(), "123"),
+            ("OTP: 482913".to_string(), "482913"),
+            ("Token: abc-secret".to_string(), "abc-secret"),
+            ("card number: 4111 1111 1111 1111".to_string(), "4111"),
+            ("Cookie = sid=abc-secret".to_string(), "abc-secret"),
+        ] {
+            let clean = redact_sensitive_text(&line);
+            assert!(!clean.contains(secret), "{line} -> {clean}");
+            assert!(clean.contains("[REDACTED]"), "{line} -> {clean}");
+        }
+
+        // Palavras que so contem a chave, sem separador a seguir, ficam.
+        for line in [
+            "tokenize='unicode61' e uma opcao do FTS5",
+            "The footprint: small",
+            "Os tokens do modelo sao baratos",
+        ] {
+            assert_eq!(redact_sensitive_text(line), line);
+        }
+    }
+
     #[test]
     fn sensitive_values_are_redacted_before_storage_or_model_context() {
         let input = "title: ok\nAuthorization: Bearer abc\npassword=hunter2\nbody: visible";

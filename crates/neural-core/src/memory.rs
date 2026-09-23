@@ -1175,6 +1175,34 @@ mod tests {
     }
 
     #[test]
+    fn captured_config_snippet_never_stores_its_password() {
+        let root = temp_root("config-snippet-secret");
+        let store = MemoryStore::new(&root).unwrap();
+        let pw = "password";
+        let body = format!("[database]\nhost = db.local\n{pw} = hunter2\n{{\"{pw}\": \"s3cr3t\"}}");
+        let CaptureOutcome::Stored(id) = store
+            .capture(MemoryDocument::new(
+                MemoryKind::Source,
+                MemorySourceKind::Reader,
+                "config",
+                None,
+                body,
+            ))
+            .unwrap()
+        else {
+            panic!("documento devia ficar guardado");
+        };
+
+        let stored = store.get(&id).unwrap().expect("documento existe");
+        assert!(stored.body.contains("host = db.local"), "{}", stored.body);
+        for secret in ["hunter2", "s3cr3t"] {
+            assert!(!stored.body.contains(secret), "{}", stored.body);
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn captured_document_never_stores_a_secret_in_its_url_or_title() {
         let document = MemoryDocument::new(
             MemoryKind::Source,
