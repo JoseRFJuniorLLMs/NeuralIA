@@ -218,15 +218,16 @@ pub fn prune_victims(tabs: &[(u64, bool, bool)]) -> Vec<usize> {
     let mut loose = tabs.iter().filter(|(_, grouped, _)| !grouped).count();
     let mut total = tabs.len();
     // Uma passagem por idade para cada regra: as soltas acima do limite
-    // delas; depois, acima do tecto, soltas e so entao agrupadas.
-    let passes: [(bool, fn(usize, usize) -> bool); 3] = [
-        (false, |loose, _| loose > MAX_TABS_PER_COLUMN),
-        (false, |_, total| total > MAX_KEPT_TABS_PER_COLUMN),
-        (true, |_, total| total > MAX_KEPT_TABS_PER_COLUMN),
-    ];
-    for (grouped_pass, over) in passes {
+    // delas (`true`: conta so as soltas); depois, acima do tecto, soltas e
+    // so entao agrupadas.
+    for (grouped_pass, loose_limit) in [(false, true), (false, false), (true, false)] {
         for index in by_age.iter().copied() {
-            if !over(loose, total) {
+            let over = if loose_limit {
+                loose > MAX_TABS_PER_COLUMN
+            } else {
+                total > MAX_KEPT_TABS_PER_COLUMN
+            };
+            if !over {
                 break;
             }
             let (_, grouped, protected) = tabs[index];
