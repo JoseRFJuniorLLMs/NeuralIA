@@ -2584,6 +2584,16 @@ enum PanelMessage {
     /// Abrir no editor; o id ja foi validado.
     NoteOpen(String),
     NoteSave(NoteEdit),
+    /// Um `note-save` que o parser recusou (id invalido, campos a mais,
+    /// acima dos tectos): o painel recebe um "failed" em vez de silencio --
+    /// senao ficava em "A salvar…" para sempre e a nota nova nunca mais se
+    /// salvava.
+    NoteSaveRefused,
+    /// O que o editor tem por salvar (`None`: nada). O lado nativo guarda a
+    /// copia e grava-a se o painel fechar por fora -- botao Notas, Ctrl+H,
+    /// outro painel, Home, uma pesquisa nova, fechar a janela --, porque ai
+    /// a pagina ja nao corre (`take_note_draft_on_close`).
+    NoteDraft(Option<NoteEdit>),
     /// Mover para `.trash`; o id ja foi validado.
     NoteDelete(String),
 }
@@ -2625,7 +2635,7 @@ fn parse_panel_message(body: &str) -> Option<PanelMessage> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let action = value.get("action")?.as_str()?;
     // Todos os outros pedidos continuam presos aos 4 KiB.
-    if body.len() > PANEL_MESSAGE_MAX_BYTES && action != "note-save" {
+    if body.len() > PANEL_MESSAGE_MAX_BYTES && !matches!(action, "note-save" | "note-draft") {
         return None;
     }
     let text = |key: &str, max: usize| -> Option<String> {
@@ -2651,9 +2661,36 @@ fn parse_panel_message(body: &str) -> Option<PanelMessage> {
         "notes-search" => text("query", PANEL_QUERY_MAX_CHARS).map(PanelMessage::NotesSearch),
         "note-open" => note_id().map(PanelMessage::NoteOpen),
         "note-delete" => note_id().map(PanelMessage::NoteDelete),
-        "note-save" => parse_note_edit(value.get("args")?).map(PanelMessage::NoteSave),
+        // Um note-save recusado responde "failed" (`NoteSaveRefused`); o
+        // resto do que o parser recusa continua a morrer aqui.
+        "note-save" => Some(
+            value
+                .get("args")
+                .and_then(parse_note_edit)
+                .map_or(PanelMessage::NoteSaveRefused, PanelMessage::NoteSave),
+        ),
+        "note-draft" => {
+            let args = value.get("args")?;
+            if args.as_object()?.is_empty() {
+                Some(PanelMessage::NoteDraft(None))
+            } else {
+                parse_note_edit(args).map(|edit| PanelMessage::NoteDraft(Some(edit)))
+            }
+        }
         _ => None,
     }
+}
+
+/// Uma linha para o titulo e as tags: cada controlo (o TAB de uma celula de
+/// tabela colada, uma quebra de linha, o titulo de uma nota que o Obsidian
+/// gravou com TAB) vira um espaco. Antes era recusado, e o note-save morria
+/// em silencio.
+fn note_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// `{"id": null | "<id>", "title", "body", "tags": [..]}`, exatamente.
@@ -2667,8 +2704,8 @@ fn parse_note_edit(args: &serde_json::Value) -> Option<NoteEdit> {
         serde_json::Value::String(id) if is_valid_note_id(id) => Some(id.clone()),
         _ => return None,
     };
-    let title = args.get("title")?.as_str()?.trim();
-    if title.chars().count() > NOTE_TITLE_MAX_CHARS || title.chars().any(char::is_control) {
+    let title = note_line(args.get("title")?.as_str()?);
+    if title.chars().count() > NOTE_TITLE_MAX_CHARS {
         return None;
     }
     let body = args.get("body")?.as_str()?;
@@ -2681,20 +2718,45 @@ fn parse_note_edit(args: &serde_json::Value) -> Option<NoteEdit> {
     }
     let mut tags = Vec::with_capacity(raw_tags.len());
     for tag in raw_tags {
-        let tag = tag.as_str()?.trim();
-        if tag.chars().count() > NOTE_TAG_MAX_CHARS || tag.chars().any(char::is_control) {
+        let tag = note_line(tag.as_str()?);
+        if tag.chars().count() > NOTE_TAG_MAX_CHARS {
             return None;
         }
         if !tag.is_empty() {
-            tags.push(tag.to_string());
+            tags.push(tag);
         }
     }
     Some(NoteEdit {
         id,
-        title: title.to_string(),
+        title,
         body: body.to_string(),
         tags,
     })
+}
+
+/// O lado nativo segue o que o editor tem por salvar: o `note-draft` mais
+/// recente, e nada depois de um `note-save` (o salvar leva o texto todo).
+fn track_note_draft(draft: &mut Option<NoteEdit>, message: &PanelMessage) {
+    match message {
+        PanelMessage::NoteDraft(edit) => draft.clone_from(edit),
+        PanelMessage::NoteSave(_) => *draft = None,
+        PanelMessage::Ready
+        | PanelMessage::Search(_)
+        | PanelMessage::Open(_)
+        | PanelMessage::Close
+        | PanelMessage::NotesList
+        | PanelMessage::NotesSearch(_)
+        | PanelMessage::NoteOpen(_)
+        | PanelMessage::NoteSaveRefused
+        | PanelMessage::NoteDelete(_) => {}
+    }
+}
+
+/// O painel fecha por fora (a pagina ja nao corre): o que estava por salvar
+/// vai para o disco pelo worker. Uma nota nova cujo primeiro Salvar ainda
+/// nao voltou pode sair em duplicado -- nunca perdida.
+fn take_note_draft_on_close(draft: &mut Option<NoteEdit>) -> Option<NotesCommand> {
+    draft.take().map(NotesCommand::Save)
 }
 
 /// So o proprio HTML local (NavigateToString chega como about:blank ou
@@ -2853,6 +2915,11 @@ fn panel_html(theme: &Theme) -> String {
 const PANEL_SHOW_NOTES_SCRIPT: &str =
     "window.neuraliaShowSection && window.neuraliaShowSection('notes')";
 
+/// O botao Notas com o painel ja aberto: nas Notas fecha (pelo mesmo
+/// caminho do X, que salva o editor antes), no Historico mostra as Notas.
+const PANEL_NOTES_BUTTON_SCRIPT: &str =
+    "window.__neuraliaNotes && window.__neuraliaNotes.button()";
+
 /// Corre no painel quando o Ctrl+Shift+Z e dado na Home (omnibox) ou com o
 /// teclado na barra: uma nota nova, em branco, no editor. So chega ao disco
 /// quando se salva -- um atalho nao enche a pasta de ficheiros vazios.
@@ -2973,6 +3040,9 @@ enum NotesReply {
 enum NotesOrigin {
     Panel,
     Selection,
+    /// O rascunho que o painel deixou ao fechar por fora: a resposta so diz
+    /// no aviso do meio se ficou salvo.
+    Closed,
 }
 
 /// O pedido do painel que e das notas. Exaustivo de proposito: uma mensagem
@@ -2984,6 +3054,9 @@ fn notes_command_for(message: PanelMessage) -> Option<NotesCommand> {
         PanelMessage::NoteOpen(id) => NotesCommand::Open(id),
         PanelMessage::NoteSave(edit) => NotesCommand::Save(edit),
         PanelMessage::NoteDelete(id) => NotesCommand::Delete(id),
+        // O rascunho fica do lado nativo (`track_note_draft`); a recusa
+        // responde sem passar pelo worker (`NOTE_SAVE_REFUSED`).
+        PanelMessage::NoteDraft(_) | PanelMessage::NoteSaveRefused => return None,
         PanelMessage::Ready
         | PanelMessage::Search(_)
         | PanelMessage::Open(_)
@@ -2992,6 +3065,9 @@ fn notes_command_for(message: PanelMessage) -> Option<NotesCommand> {
         }
     })
 }
+
+/// A resposta a um note-save que o parser recusou.
+const NOTE_SAVE_REFUSED: &str = "A nota não foi salva: o título, as tags ou o tamanho passam dos limites.";
 
 /// O trabalho do worker das notas, sem thread nem janela: e isto que os
 /// gates correm, sobre uma pasta temporaria.
@@ -3133,6 +3209,9 @@ fn unix_now() -> u64 {
 struct NotesJob {
     command: NotesCommand,
     origin: NotesOrigin,
+    /// Avisado depois do trabalho feito: e por aqui que a saida da app
+    /// espera pelo rascunho do painel (`save_before_exit`).
+    done: Option<SyncSender<()>>,
 }
 
 /// Uma thread para as notas, como o historico e a memoria: os pedidos
@@ -3162,6 +3241,9 @@ impl ZettelWorker {
                         origin: job.origin,
                         reply,
                     });
+                    if let Some(done) = job.done {
+                        let _ = done.try_send(());
+                    }
                 }
             });
         Self { tx }
@@ -3171,8 +3253,31 @@ impl ZettelWorker {
     /// ser mostrado, em vez de congelar a interface.
     fn submit(&self, command: NotesCommand, origin: NotesOrigin) -> Result<(), String> {
         self.tx
-            .try_send(NotesJob { command, origin })
+            .try_send(NotesJob {
+                command,
+                origin,
+                done: None,
+            })
             .map_err(|_| "As notas estão ocupadas; tente de novo.".to_string())
+    }
+
+    /// A app vai sair com texto por salvar no painel: o processo acaba com o
+    /// event loop e levava o worker a meio. Espera que ESTE trabalho (e os
+    /// que estavam antes dele na fila) acabe, com um tecto para um disco
+    /// que nao responde nunca prender o fecho da janela.
+    fn save_before_exit(&self, command: NotesCommand, limit: Duration) {
+        let (done, finished) = sync_channel(1);
+        if self
+            .tx
+            .try_send(NotesJob {
+                command,
+                origin: NotesOrigin::Closed,
+                done: Some(done),
+            })
+            .is_ok()
+        {
+            let _ = finished.recv_timeout(limit);
+        }
     }
 }
 
@@ -3302,6 +3407,29 @@ fn note_capture_decision(target: Option<PageTarget>, split_private: Option<bool>
         },
         Some(PageTarget::Column(_)) | None => NoteCapture::Read,
     }
+}
+
+/// A WebView de que um Ctrl+Shift+Z le a selecao, no momento de ler: a da
+/// coluna que o pediu (nunca a vizinha), a do Split que existe AGORA -- e
+/// nunca se ele for privado -- ou a WebView unica (Externo, Leitor, PDF).
+/// Generica para o gate a correr sem WebViews: `columns` sao as colunas do
+/// comparador pela ordem delas, `split` o Split atual com o `private` dele.
+fn note_read_view<'a, V>(
+    target: Option<PageTarget>,
+    columns: &[&'a V],
+    split: Option<(&'a V, bool)>,
+    main: Option<&'a V>,
+) -> Result<&'a V, NoteCapture> {
+    match note_capture_decision(target, split.map(|(_, private)| private)) {
+        NoteCapture::Read => {}
+        refused => return Err(refused),
+    }
+    match target {
+        Some(PageTarget::Column(index)) => columns.get(index).copied(),
+        Some(PageTarget::Split) => split.map(|(view, _)| view),
+        None => main,
+    }
+    .ok_or(NoteCapture::NoPage)
 }
 
 /// O aviso do painel privado.
@@ -3455,6 +3583,14 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
     let openSource = '';
     let dirty = false;
     let savingNew = false;
+    // Um note-save a caminho (o id da nota): se voltar "failed", o texto
+    // volta a estar por salvar em vez de se perder ao sair do editor.
+    let saving = undefined;
+    // O lado nativo guarda uma copia do que esta por salvar (note-draft) e
+    // grava-a quando o painel fecha por fora -- botao Notas, Ctrl+H, outro
+    // painel, Home, fechar a janela --, porque ai esta pagina ja nao corre.
+    let draftPosted = false;
+    let draftTimer = 0;
     let searchTimer = 0;
     let previewTimer = 0;
 
@@ -3468,7 +3604,30 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
       const text = query();
       if (text) post('notes-search', { query: text }); else post('notes-list');
     };
-    const open = (id) => { if (ID.test(id)) { leave(); post('note-open', { id }); } };
+    const open = (id) => { if (ID.test(id) && leave()) post('note-open', { id }); };
+    // Texto que o JSON leva inteiro (sem metades de um par UTF-16, que o
+    // parser do lado nativo recusava) e titulo e tags numa linha: o TAB de
+    // uma tabela colada ou do titulo de uma nota do Obsidian vira espaco.
+    const whole = (text) => (typeof text.toWellFormed === 'function' ? text.toWellFormed() : text);
+    const line = (text) => whole(String(text)).replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').trim();
+    const edited = () => ({
+      id: openId,
+      title: line(title.value),
+      body: whole(body.value),
+      tags: tags.value.split(',').map(line).filter(Boolean),
+    });
+    // Manda (ou limpa) a copia do lado nativo.
+    function postDraft() {
+      clearTimeout(draftTimer);
+      const note = edited();
+      if (dirty && !edit.hidden && (note.title || note.body.trim())) {
+        post('note-draft', note);
+        draftPosted = true;
+      } else if (draftPosted) {
+        post('note-draft', {});
+        draftPosted = false;
+      }
+    }
     const showList = () => { confirmBox.hidden = true; edit.hidden = true; browse.hidden = false; };
     const showEditor = () => { browse.hidden = true; edit.hidden = false; };
 
@@ -3544,37 +3703,48 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
       describe(note, links);
       confirmBox.hidden = true;
       dirty = false;
+      saving = undefined;
+      postDraft();
       renderPreview();
     }
 
     function save() {
-      const tagList = tags.value.split(',').map((tag) => tag.trim()).filter(Boolean);
-      if (tagList.length > TAGS_MAX || tagList.some((tag) => tag.length > TAG_MAX)) {
+      const note = edited();
+      if (note.tags.length > TAGS_MAX || note.tags.some((tag) => tag.length > TAG_MAX)) {
         say('Até ' + TAGS_MAX + ' tags, cada uma com até ' + TAG_MAX + ' caracteres.');
         return false;
       }
-      if (title.value.trim().length > TITLE_MAX) { say('O título passa de ' + TITLE_MAX + ' caracteres.'); return false; }
-      if (new TextEncoder().encode(body.value).length > BODY_MAX_BYTES) {
+      if (note.title.length > TITLE_MAX) { say('O título passa de ' + TITLE_MAX + ' caracteres.'); return false; }
+      if (new TextEncoder().encode(note.body).length > BODY_MAX_BYTES) {
         say('A nota passa de 200 KiB. Divida-a em duas.');
         return false;
       }
       // Uma nota nova ainda sem id: um segundo pedido criava outra nota. O
       // que se escrever entretanto fica por salvar ate o id chegar.
       if (openId === null && savingNew) { say('A salvar…'); return false; }
-      post('note-save', { id: openId, title: title.value.trim(), body: body.value, tags: tagList });
+      clearTimeout(draftTimer);
+      post('note-save', note);
       savingNew = openId === null;
+      saving = openId;
       dirty = false;
+      // O note-save leva o texto todo: o lado nativo larga a copia.
+      draftPosted = false;
       say('A salvar…');
       return true;
     }
 
-    // Sair do editor nao deita fora o que se escreveu.
+    // Sair do editor nao deita fora o que se escreveu. `false`: nao da para
+    // salvar agora (acima dos tectos, ou a nota nova ainda sem id) -- quem
+    // ia sair fica, com o aviso a vista.
     function leave() {
-      if (dirty && !edit.hidden && (title.value.trim() || body.value.trim())) save();
+      if (!dirty || edit.hidden) return true;
+      const note = edited();
+      if (!note.title && !note.body.trim()) return true;
+      return save();
     }
 
     function newNote() {
-      leave();
+      if (!leave()) return;
       fill(null, []);
       showEditor();
       say('');
@@ -3595,16 +3765,25 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
             const same = openId === note.id || (openId === null && savingNew);
             savingNew = false;
             if (same) {
+              saving = undefined;
               openId = note.id;
               if (!title.value.trim()) title.value = note.title;
               describe(note, data.backlinks);
+              // O que se escreveu enquanto a nota nova esperava pelo id: a
+              // copia do lado nativo passa a ser a desta nota.
+              if (dirty) postDraft();
             }
             say('Nota salva.');
             refresh();
+          } else if (openId !== note.id && !leave()) {
+            // Uma nota que chega de fora (Ctrl+Shift+Z) com o editor por
+            // salvar e que nao da para salvar agora: o editor fica como esta
+            // e a nota nova aparece na lista.
+            say(data.cause === 'created' ? 'Nota criada a partir da seleção; está na lista.' : '');
+            if (data.cause === 'created') refresh();
           } else {
             // Uma nota que chega de fora (Ctrl+Shift+Z) nao deita fora o que
-            // estava por salvar no editor.
-            if (openId !== note.id) leave();
+            // estava por salvar no editor: o `leave` acima ja o salvou.
             fill(note, data.backlinks);
             showEditor();
             say(data.cause === 'created' ? 'Nota criada a partir da seleção.' : '');
@@ -3623,6 +3802,15 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
           break;
         case 'failed':
           savingNew = false;
+          // Um salvar que falhou (pasta ocupada, disco cheio, ficheiro preso
+          // por outro programa, pedido recusado): o texto continua por salvar
+          // -- sair do editor tenta outra vez -- e o lado nativo volta a ter
+          // a copia.
+          if (saving !== undefined && saving === openId && !edit.hidden) {
+            dirty = true;
+            postDraft();
+          }
+          saving = undefined;
           say(data.message);
           break;
       }
@@ -3636,7 +3824,7 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
       if (e.key === 'Enter') { e.preventDefault(); clearTimeout(searchTimer); refresh(); }
     });
     byId('note-new').addEventListener('click', newNote);
-    byId('note-back').addEventListener('click', () => { leave(); showList(); refresh(); });
+    byId('note-back').addEventListener('click', () => { if (leave()) { showList(); refresh(); } });
     byId('note-save').addEventListener('click', save);
     byId('note-delete').addEventListener('click', () => { confirmBox.hidden = false; });
     byId('note-confirm-no').addEventListener('click', () => { confirmBox.hidden = true; });
@@ -3645,11 +3833,17 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
       if (openId === null) { fill(null, []); showList(); return; }
       post('note-delete', { id: openId });
     });
+    // A fonte abre fora do painel, que fecha: salva antes, como o X.
     source.addEventListener('click', () => {
-      if (!source.disabled && openSource) post('open', { input: openSource });
+      if (!source.disabled && openSource && leave()) post('open', { input: openSource });
     });
     for (const field of [title, body, tags]) {
-      field.addEventListener('input', () => { dirty = true; say('Alterações por salvar.'); });
+      field.addEventListener('input', () => {
+        dirty = true;
+        say('Alterações por salvar.');
+        clearTimeout(draftTimer);
+        draftTimer = setTimeout(postDraft, 200);
+      });
     }
     body.addEventListener('input', () => {
       clearTimeout(previewTimer);
@@ -3671,21 +3865,26 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
     const key = name === 'notes' || name === 'notas' ? 'notes'
       : name === 'history' || name === 'historico' ? 'history' : '';
     if (!key) return false;
+    // Sair das Notas salva o editor; se nao der agora, fica-se nas Notas.
+    if (key === 'history' && !views.notes.hidden && !notes.leave()) return false;
     for (const other of Object.keys(views)) {
       views[other].hidden = other !== key;
       tabs[other].setAttribute('aria-selected', other === key ? 'true' : 'false');
     }
-    if (key === 'notes') { notes.refresh(); notes.focus(); } else { notes.leave(); q.focus(); }
+    if (key === 'notes') { notes.refresh(); notes.focus(); } else { q.focus(); }
     return true;
   }
+  const close = () => { if (notes.leave()) post('close'); };
   window.neuraliaShowSection = showSection;
   window.__neuraliaNotes = {
     receive: notes.receive,
-    newNote() { showSection('notes'); notes.newNote(); }
+    newNote() { if (showSection('notes')) notes.newNote(); },
+    // O botao Notas da barra/Home com o painel aberto: nas Notas fecha
+    // (como o X, salvando antes), no Historico mostra as Notas.
+    button() { if (views.notes.hidden) showSection('notes'); else close(); }
   };
   tabs.history.addEventListener('click', () => showSection('history'));
   tabs.notes.addEventListener('click', () => showSection('notes'));
-  const close = () => { notes.leave(); post('close'); };
   byId('close').addEventListener('click', close);
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { e.preventDefault(); close(); }
@@ -6239,6 +6438,9 @@ struct App {
     /// Notas (Zettelkasten) em `<data_dir>/zettel`, lidas e gravadas fora do
     /// event loop.
     notes: ZettelWorker,
+    /// Copia do que o editor do painel tem por salvar (`track_note_draft`):
+    /// e gravada quando o painel fecha por fora.
+    notes_draft: Option<NoteEdit>,
     /// O endereco verdadeiro da pagina da WebView unica quando o dela nao o
     /// e: o artigo do Leitor (o HTML e local) e o PDF (o visualizador e
     /// nosso). E a fonte das notas feitas ali.
@@ -6345,6 +6547,7 @@ impl App {
             panel_ready: false,
             panel_pending: Vec::new(),
             notes,
+            notes_draft: None,
             page_source: None,
             pomodoro,
             live_panel: LivePanel::off(),
@@ -10557,6 +10760,12 @@ impl App {
         if self.side_panel.take().is_none() {
             return;
         }
+        // Fechado por fora, a pagina ja nao salva nada: o que o editor tinha
+        // por salvar vai pelo worker (gate
+        // `a_note_being_typed_survives_every_native_close_of_the_panel`).
+        if let Some(command) = take_note_draft_on_close(&mut self.notes_draft) {
+            self.submit_notes(command, NotesOrigin::Closed);
+        }
         self.panel_suggestion_query = None;
         self.panel_ready = false;
         self.panel_pending.clear();
@@ -10614,8 +10823,16 @@ impl App {
                 NotesOrigin::Panel => {
                     self.panel_run(notes_reply_script(&NotesReply::Failed(error)))
                 }
-                NotesOrigin::Selection => self.show_splash(error, 3),
+                NotesOrigin::Selection | NotesOrigin::Closed => self.show_splash(error, 3),
             }
+        }
+    }
+
+    /// A app vai sair: o que o editor do painel tinha por salvar vai para o
+    /// disco antes de o processo acabar.
+    fn save_notes_draft_before_exit(&mut self) {
+        if let Some(command) = take_note_draft_on_close(&mut self.notes_draft) {
+            self.notes.save_before_exit(command, Duration::from_secs(3));
         }
     }
 
@@ -10634,40 +10851,40 @@ impl App {
                 | NotesReply::Deleted { .. }
                 | NotesReply::Missing { .. } => {}
             },
+            NotesOrigin::Closed => match &reply {
+                NotesReply::Opened { note, .. } => {
+                    self.show_splash(format!("Nota salva: {}", note.title), 3);
+                }
+                NotesReply::Failed(error) => self.show_splash(error.clone(), 6),
+                NotesReply::Listed { .. }
+                | NotesReply::Deleted { .. }
+                | NotesReply::Missing { .. } => {}
+            },
         }
     }
 
     /// Ctrl+Shift+Z numa pagina: le a selecao da WebView `target` e cria a
     /// nota. O Split privado nunca e lido.
     fn request_note_from_page(&mut self, target: Option<PageTarget>) {
-        let split_private = self
+        // Qual WebView e se o Split privado recusa: `note_read_view` (gate
+        // `a_note_request_reads_its_own_webview_and_never_the_private_split`).
+        let columns: Vec<&WebView> = self
+            .comparator
+            .as_ref()
+            .map(|comp| comp.views.iter().map(|view| &view.webview).collect())
+            .unwrap_or_default();
+        let split = self
             .comparator
             .as_ref()
             .and_then(|comp| comp.split.as_ref())
-            .map(|split| split.private);
-        match note_capture_decision(target, split_private) {
-            NoteCapture::Read => {}
-            NoteCapture::RefusePrivate => {
+            .map(|split| (&split.webview, split.private));
+        let webview = match note_read_view(target, &columns, split, self.webview.as_ref()) {
+            Ok(webview) => webview,
+            Err(NoteCapture::RefusePrivate) => {
                 self.show_splash(NOTE_PRIVATE_REFUSAL.to_string(), 3);
                 return;
             }
-            NoteCapture::NoPage => return,
-        }
-        let webview = match target {
-            Some(PageTarget::Column(index)) => self
-                .comparator
-                .as_ref()
-                .and_then(|comp| comp.views.get(index))
-                .map(|view| &view.webview),
-            Some(PageTarget::Split) => self
-                .comparator
-                .as_ref()
-                .and_then(|comp| comp.split.as_ref())
-                .map(|split| &split.webview),
-            None => self.webview.as_ref(),
-        };
-        let Some(webview) = webview else {
-            return;
+            Err(NoteCapture::Read | NoteCapture::NoPage) => return,
         };
         let source = note_page_source(target, self.surface, self.page_source.as_deref());
         let proxy = self.proxy.clone();
@@ -10707,7 +10924,9 @@ impl App {
     }
 
     /// Botao Notas (Zettelkasten): abre o painel do Ctrl+H ja na secao das
-    /// notas; com o painel aberto, o mesmo botao fecha-o.
+    /// notas. Com o painel aberto quem decide e a pagina
+    /// (`PANEL_NOTES_BUTTON_SCRIPT`): nas Notas fecha -- salvando antes o
+    /// que o editor tinha, como o X --, no Historico passa para as Notas.
     ///
     /// A pagina do painel acabou de nascer e ainda nao correu o script dela:
     /// um `evaluate_script` agora corria no documento vazio e perdia-se. Por
@@ -10716,7 +10935,7 @@ impl App {
     /// manda no fim do script) corre-o.
     fn open_notes(&mut self) {
         if self.side_panel.is_some() {
-            self.close_side_panel();
+            self.panel_run(PANEL_NOTES_BUTTON_SCRIPT.to_string());
             return;
         }
         self.show_notes_panel(Vec::new());
@@ -10889,6 +11108,7 @@ impl App {
     }
 
     fn handle_panel_message(&mut self, message: PanelMessage) {
+        track_note_draft(&mut self.notes_draft, &message);
         match message {
             PanelMessage::Ready => {
                 if let Some(result) = self.history.recent(PANEL_RECENT_LIMIT) {
@@ -10918,6 +11138,11 @@ impl App {
                 self.handle_input(input);
             }
             PanelMessage::Close => self.close_side_panel(),
+            // Ja seguido por `track_note_draft`.
+            PanelMessage::NoteDraft(_) => {}
+            PanelMessage::NoteSaveRefused => self.panel_run(notes_reply_script(
+                &NotesReply::Failed(NOTE_SAVE_REFUSED.to_string()),
+            )),
             notes @ (PanelMessage::NotesList
             | PanelMessage::NotesSearch(_)
             | PanelMessage::NoteOpen(_)
@@ -12550,7 +12775,10 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::ExitRequested => event_loop.exit(),
+            UserEvent::ExitRequested => {
+                self.save_notes_draft_before_exit();
+                event_loop.exit();
+            }
             UserEvent::HomeRequested => self.show_home(),
             UserEvent::BackRequested => self.go_back(),
             UserEvent::ToggleAutoScroll => self.toggle_auto_scroll(),
@@ -12812,7 +13040,10 @@ impl ApplicationHandler<UserEvent> for App {
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.save_notes_draft_before_exit();
+                event_loop.exit();
+            }
             WindowEvent::RedrawRequested => {
                 if self.needs_clear {
                     self.clear_client();
@@ -22493,9 +22724,10 @@ process.stdout.write(JSON.stringify({
                 })
                 .to_string();
                 if !id.is_null() {
+                    // Recusado -- e o painel recebe "failed" em vez de silencio.
                     assert_eq!(
                         parse_panel_message(&save),
-                        None,
+                        Some(PanelMessage::NoteSaveRefused),
                         "note-save aceitou o id {id}"
                     );
                 }
@@ -22529,7 +22761,6 @@ process.stdout.write(JSON.stringify({
             ));
             let bad_saves = [
                 save_message(None, &"t".repeat(NOTE_TITLE_MAX_CHARS + 1), "b", &[]),
-                save_message(None, "linha\nquebrada", "b", &[]),
                 save_message(None, "t", &"b".repeat(NOTE_BODY_MAX_BYTES + 1), &[]),
                 save_message(None, "t", "b", &["x"; NOTE_TAGS_MAX + 1]),
                 save_message(None, "t", "b", &[&"x".repeat(NOTE_TAG_MAX_CHARS + 1)]),
@@ -22542,11 +22773,56 @@ process.stdout.write(JSON.stringify({
             for bad in &bad_saves {
                 assert_eq!(
                     parse_panel_message(bad),
-                    None,
+                    Some(PanelMessage::NoteSaveRefused),
                     "note-save aceito: {:.120}",
                     bad
                 );
+                // O rascunho com os mesmos campos morre no parser (nao ha a
+                // quem responder: o painel manda outro no proximo tecla).
+                let draft = bad.replace("\"note-save\"", "\"note-draft\"");
+                assert_eq!(parse_panel_message(&draft), None, "{:.120}", draft);
             }
+            // Controlos no titulo e nas tags (o TAB de uma tabela colada, o
+            // titulo de uma nota do Obsidian com TAB) viram espaco, em vez de
+            // o salvar morrer em silencio.
+            assert_eq!(
+                parse_panel_message(&save_message(
+                    None,
+                    "Capítulo 1\tIntrodução",
+                    "corpo com\ttab",
+                    &["a\tb", "linha\nquebrada"]
+                )),
+                Some(PanelMessage::NoteSave(NoteEdit {
+                    id: None,
+                    title: "Capítulo 1 Introdução".to_string(),
+                    body: "corpo com\ttab".to_string(),
+                    tags: vec!["a b".to_string(), "linha quebrada".to_string()],
+                }))
+            );
+            // O rascunho: o mesmo formato do salvar, ou {} para "nada".
+            assert_eq!(
+                parse_panel_message(r#"{"action":"note-draft","args":{}}"#),
+                Some(PanelMessage::NoteDraft(None))
+            );
+            assert_eq!(
+                parse_panel_message(
+                    &save_message(Some("202609231212"), "t", "b", &[])
+                        .replace("\"note-save\"", "\"note-draft\"")
+                ),
+                Some(PanelMessage::NoteDraft(Some(NoteEdit {
+                    id: Some("202609231212".to_string()),
+                    title: "t".to_string(),
+                    body: "b".to_string(),
+                    tags: Vec::new(),
+                })))
+            );
+            let big_draft = save_message(None, "t", &"b".repeat(NOTE_BODY_MAX_BYTES), &[])
+                .replace("\"note-save\"", "\"note-draft\"");
+            assert!(big_draft.len() > PANEL_MESSAGE_MAX_BYTES);
+            assert!(matches!(
+                parse_panel_message(&big_draft),
+                Some(PanelMessage::NoteDraft(Some(_)))
+            ));
 
             // O corpo no tecto passa, mesmo no pior caso do JSON (cada byte
             // escrito como \u00XX): a mensagem fica muito acima dos 4 KiB.
@@ -22824,6 +23100,263 @@ process.stdout.write(JSON.stringify({
             );
         }
 
+        /// O que o lado nativo tem por salvar depois de o painel mandar
+        /// `sent`: cada mensagem pelo parser do canal e por `track_note_draft`,
+        /// como no `handle_panel_message`.
+        fn draft_after(sent: &[String]) -> Option<NoteEdit> {
+            let mut draft = None;
+            for message in sent {
+                let parsed = parse_panel_message(message)
+                    .unwrap_or_else(|| panic!("o parser recusou {message:.120}"));
+                track_note_draft(&mut draft, &parsed);
+            }
+            draft
+        }
+
+        /// Gate: o texto que se esta a escrever numa nota sobrevive a TODOS os
+        /// fechos do painel que nao passam pelo X/Esc dele -- botao Notas,
+        /// Ctrl+H, outro painel, Home, pesquisa nova, fechar a janela --, que
+        /// largam a WebView sem a pagina correr mais nada. O editor que
+        /// embarca manda a copia (`note-draft`), o lado nativo segue-a e, ao
+        /// fechar, `take_note_draft_on_close` grava-a pelo trabalho do worker.
+        /// E o link "Fonte" e o botao Notas salvam antes de fechar.
+        #[test]
+        fn a_note_being_typed_survives_every_native_close_of_the_panel() {
+            let dir = NotesDir::new("close");
+            let store = dir.store();
+
+            // 1. Nota nova, escrita e nunca salva; o painel fecha por fora.
+            let typed = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                "__click($('note-new'));".into(),
+                "__type($('note-title'), 'Ideia');".into(),
+                "__type($('note-body'), 'Escrita e nunca salva.');".into(),
+                "__drain();".into(),
+            ]);
+            let sent = posted(&typed);
+            let mut draft = draft_after(&sent);
+            let command =
+                take_note_draft_on_close(&mut draft).expect("o fecho nativo nao salvou nada");
+            assert_eq!(draft, None, "a copia sai de uma vez");
+            let NotesReply::Opened {
+                cause: NoteOpened::Saved,
+                note,
+                ..
+            } = run_notes_command(&store, command, T0)
+            else {
+                panic!("salvar o rascunho");
+            };
+            assert_eq!(
+                (note.title.as_str(), note.body.as_str()),
+                ("Ideia", "Escrita e nunca salva.")
+            );
+            assert_eq!(store.list().expect("lista").len(), 1);
+
+            // 2. Uma nota que ja existe, editada: o rascunho grava a MESMA.
+            let opened = run_notes_command(&store, NotesCommand::Open(note.id.clone()), T0 + 60);
+            let edited = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                notes_reply_script(&opened),
+                "__type($('note-body'), $('note-body').value + '\\nMais.');".into(),
+                "__drain();".into(),
+            ]);
+            let mut draft = draft_after(&posted(&edited));
+            let command = take_note_draft_on_close(&mut draft).expect("rascunho da nota aberta");
+            assert!(matches!(
+                run_notes_command(&store, command, T0 + 120),
+                NotesReply::Opened { ref note, .. } if note.id == opened_id(&opened)
+            ));
+            let reread = store.get(&note.id).expect("ler").expect("existe");
+            assert_eq!(reread.body, "Escrita e nunca salva.\nMais.");
+            assert_eq!(store.list().expect("lista").len(), 1, "nao criou outra");
+
+            // 3. Salvo com Ctrl+S: nada fica por salvar, o fecho nao grava.
+            let saved = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                notes_reply_script(&opened),
+                "__type($('note-body'), 'x');".into(),
+                "__key($('note-body'), 's', { ctrlKey: true });".into(),
+                "__drain();".into(),
+            ]);
+            let sent = posted(&saved);
+            assert_eq!(
+                sent.iter().map(|m| action_of(m)).collect::<Vec<_>>(),
+                ["note-save"]
+            );
+            assert_eq!(draft_after(&sent), None);
+
+            // 4. Escrito e apagado: a copia do lado nativo e limpa.
+            let erased = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                "__click($('note-new')); __type($('note-body'), 'rascunho'); __drain();".into(),
+                "__type($('note-body'), ''); __drain();".into(),
+            ]);
+            let sent = posted(&erased);
+            assert_eq!(
+                sent.iter().map(|m| action_of(m)).collect::<Vec<_>>(),
+                ["note-draft", "note-draft"]
+            );
+            assert_eq!(draft_after(&sent), None);
+
+            // 5. O link "Fonte" fecha o painel: salva ANTES de o pedir.
+            let cited = store
+                .create(
+                    "Com fonte",
+                    "> citado\n",
+                    vec!["web".to_string()],
+                    Some("https://exemplo.pt/artigo".to_string()),
+                    T0,
+                )
+                .expect("nota com fonte");
+            let with_source = run_notes_command(&store, NotesCommand::Open(cited.id), T0);
+            let source = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                notes_reply_script(&with_source),
+                "__type($('note-body'), $('note-body').value + 'comentario');".into(),
+                "__click($('note-source'));".into(),
+            ]);
+            let sent = posted(&source);
+            assert_eq!(
+                sent.iter().map(|m| action_of(m)).collect::<Vec<_>>(),
+                ["note-save", "open"],
+                "{sent:?}"
+            );
+
+            // 6. O botao Notas com o editor por salvar: salva e fecha, como o
+            //    X. Com o Historico a vista, mostra as Notas em vez de fechar.
+            let button = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                notes_reply_script(&opened),
+                "__type($('note-body'), 'pelo botao');".into(),
+                PANEL_NOTES_BUTTON_SCRIPT.into(),
+            ]);
+            let sent = posted(&button);
+            assert_eq!(
+                sent.iter().map(|m| action_of(m)).collect::<Vec<_>>(),
+                ["note-save", "close"],
+                "{sent:?}"
+            );
+            let history = run_panel(&[
+                "__posted.length = 0;".into(),
+                PANEL_NOTES_BUTTON_SCRIPT.into(),
+                "__out.notes = __visible($('view-notes')) && !__visible($('view-history'));".into(),
+            ]);
+            assert_eq!(history["out"]["notes"], true, "o botao nao mostrou as Notas");
+            assert_eq!(
+                posted(&history)
+                    .iter()
+                    .map(|m| action_of(m))
+                    .collect::<Vec<_>>(),
+                ["notes-list"],
+                "no Historico o botao nao fecha o painel"
+            );
+        }
+
+        fn opened_id(reply: &NotesReply) -> String {
+            match reply {
+                NotesReply::Opened { note, .. } => note.id.clone(),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        /// Gate: um salvar que falha (pasta ocupada, disco cheio, ficheiro
+        /// preso) ou que o parser recusa deixa o texto por salvar -- sair do
+        /// editor tenta outra vez, o lado nativo volta a ter a copia, e uma
+        /// nota nova pode voltar a ser salva. E um TAB no titulo (tabela
+        /// colada, nota do Obsidian) ja nao faz o salvar morrer em silencio.
+        #[test]
+        fn a_failed_or_refused_save_keeps_the_text_to_save() {
+            let dir = NotesDir::new("failed");
+            let store = dir.store();
+            let note = store
+                .create("Tabela\tResumo", "v1", Vec::new(), None, T0)
+                .expect("nota");
+            assert_eq!(note.title, "Tabela\tResumo", "o motor guarda o TAB");
+            let opened = run_notes_command(&store, NotesCommand::Open(note.id.clone()), T0);
+            let failed = notes_reply_script(&NotesReply::Failed(
+                "As notas estão ocupadas; tente de novo.".to_string(),
+            ));
+
+            // 1. Falhou: voltar a lista tenta outra vez.
+            let result = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                notes_reply_script(&opened),
+                "__type($('note-body'), 'v2 importante');".into(),
+                "__click($('note-save'));".into(),
+                failed.clone(),
+                "__click($('note-back'));".into(),
+            ]);
+            let sent = posted(&result);
+            assert_eq!(
+                sent.iter().map(|m| action_of(m)).collect::<Vec<_>>(),
+                ["note-save", "note-draft", "note-save", "notes-list"],
+                "{sent:?}"
+            );
+            // O titulo do disco com TAB sai numa linha, e o salvar passa.
+            let retry = parse_panel_message(&sent[2]).expect("o salvar de novo passa no parser");
+            assert_eq!(
+                retry,
+                PanelMessage::NoteSave(NoteEdit {
+                    id: Some(note.id.clone()),
+                    title: "Tabela Resumo".to_string(),
+                    body: "v2 importante".to_string(),
+                    tags: Vec::new(),
+                })
+            );
+            // Enquanto falhado, o fecho nativo grava a copia.
+            let mut draft = draft_after(&sent[..2]);
+            assert!(take_note_draft_on_close(&mut draft).is_some());
+            let command = notes_command_for(retry).expect("comando");
+            assert!(matches!(
+                run_notes_command(&store, command, T0 + 60),
+                NotesReply::Opened { ref note, .. } if note.body == "v2 importante"
+            ));
+
+            // 2. Nota nova com TAB colado no titulo: o salvar chega ao disco
+            //    numa linha; recusado, o painel volta a poder salvar.
+            let result = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                "__click($('note-new'));".into(),
+                "__type($('note-title'), 'Capítulo 1\\tIntrodução');".into(),
+                "__click($('note-save'));".into(),
+                notes_reply_script(&NotesReply::Failed(NOTE_SAVE_REFUSED.to_string())),
+                "__out.msg = $('notes-msg').textContent;".into(),
+                "__type($('note-body'), 'mais');".into(),
+                "__click($('note-save'));".into(),
+            ]);
+            assert_eq!(result["out"]["msg"], NOTE_SAVE_REFUSED);
+            let sent = posted(&result);
+            let saves: Vec<&String> = sent
+                .iter()
+                .filter(|m| action_of(m) == "note-save")
+                .collect();
+            assert_eq!(saves.len(), 2, "a nota nova ficou presa em 'A salvar…': {sent:?}");
+            assert!(matches!(
+                parse_panel_message(saves[0]),
+                Some(PanelMessage::NoteSave(NoteEdit { ref title, .. })) if title == "Capítulo 1 Introdução"
+            ));
+        }
+
+        /// Gate: um note-save que o parser recusa tem resposta. O canal do
+        /// painel responde com `NOTE_SAVE_REFUSED`, e nunca pelo worker.
+        #[test]
+        fn a_refused_note_save_is_answered_and_never_reaches_the_disk() {
+            let refused = parse_panel_message(&save_message(
+                Some("../../x"),
+                "t",
+                "b",
+                &[],
+            ))
+            .expect("recusado mas respondido");
+            assert_eq!(refused, PanelMessage::NoteSaveRefused);
+            assert_eq!(notes_command_for(refused), None);
+            assert_eq!(
+                notes_command_for(PanelMessage::NoteDraft(None)),
+                None,
+                "o rascunho nao vai ao disco enquanto o painel esta aberto"
+            );
+        }
+
         /// Gate: uma nota com HTML e JS no titulo, no corpo, nas tags e na
         /// fonte chega ao painel que embarca byte a byte como TEXTO. O
         /// payload vai em JSON: aspas, `'); ...`, `</script>` e U+2028 nao
@@ -23032,6 +23565,66 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
                 }
             }
             assert_eq!(NOTE_PRIVATE_REFUSAL, "Modo privado: notas não são criadas");
+
+            // E a WebView que `request_note_from_page` le: a da coluna que
+            // pediu (nunca a vizinha), a do Split de agora (nunca privado) ou
+            // a unica. Os numeros fazem de WebViews.
+            let (c0, c1, c2, split_view, main) = (10u8, 11u8, 12u8, 90u8, 70u8);
+            let columns = [&c0, &c1, &c2];
+            for (index, expected) in columns.iter().enumerate() {
+                for split in [None, Some((&split_view, false)), Some((&split_view, true))] {
+                    assert_eq!(
+                        note_read_view(
+                            Some(PageTarget::Column(index)),
+                            &columns,
+                            split,
+                            Some(&main)
+                        ),
+                        Ok(*expected),
+                        "coluna {index}"
+                    );
+                }
+            }
+            assert_eq!(
+                note_read_view(
+                    Some(PageTarget::Column(COMPARATOR_COLUMNS)),
+                    &columns,
+                    None,
+                    Some(&main)
+                ),
+                Err(NoteCapture::NoPage)
+            );
+            assert_eq!(
+                note_read_view(
+                    Some(PageTarget::Split),
+                    &columns,
+                    Some((&split_view, false)),
+                    Some(&main)
+                ),
+                Ok(&split_view)
+            );
+            assert_eq!(
+                note_read_view(
+                    Some(PageTarget::Split),
+                    &columns,
+                    Some((&split_view, true)),
+                    Some(&main)
+                ),
+                Err(NoteCapture::RefusePrivate),
+                "o Split privado foi lido"
+            );
+            assert_eq!(
+                note_read_view(Some(PageTarget::Split), &columns, None, Some(&main)),
+                Err(NoteCapture::NoPage)
+            );
+            assert_eq!(
+                note_read_view(None, &columns, Some((&split_view, true)), Some(&main)),
+                Ok(&main)
+            );
+            assert_eq!(
+                note_read_view::<u8>(None, &[], None, None),
+                Err(NoteCapture::NoPage)
+            );
         }
 
         /// Gate: a selecao vira uma nota com a citacao, a fonte e a tag
