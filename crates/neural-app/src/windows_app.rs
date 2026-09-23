@@ -5395,8 +5395,9 @@ impl App {
 
                 // So uma fonte que abriu de verdade entra na memoria/sessao.
                 // Antes, uma falha de build deixava uma fonte fantasma gravada.
-                if let Some((title, mut document)) =
-                    split_source_memory(&valid, source_name, private)
+                if split_open_records_source(existing_context_id, private)
+                    && let Some((title, mut document)) =
+                        split_source_memory(&valid, source_name, private)
                 {
                     let value = valid.to_string();
                     if let Some(session) = &mut self.current_research {
@@ -7148,14 +7149,26 @@ impl App {
     }
 
     fn open_context_tab(&mut self, source_index: usize, context_index: usize) -> bool {
+        let active = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.split.as_ref())
+            .map(|split| (split.source_index, split.context_id));
         self.context_tab_identity(source_index, context_index)
             .is_some_and(|(context_id, url)| {
-                self.open_split_mode(source_index, url, false, false, Some(context_id))
+                context_tab_click_is_noop(active, source_index, context_id)
+                    || self.open_split_mode(source_index, url, false, false, Some(context_id))
             })
     }
 
     fn open_context_tab_fullscreen(&mut self, source_index: usize, context_index: usize) {
-        if self.open_context_tab(source_index, context_index) {
+        if self.open_context_tab(source_index, context_index)
+            && !self
+                .comparator
+                .as_ref()
+                .and_then(|comp| comp.split.as_ref())
+                .is_some_and(|split| split.fullscreen)
+        {
             self.toggle_split_fullscreen();
         }
     }
@@ -7768,6 +7781,24 @@ fn decide_agent_step(
 /// restrições inegociáveis do `md/README.md`. É aqui que isso se decide para
 /// este caminho, fora de qualquer janela, para um teste poder ficar vermelho se
 /// alguém inverter a condição.
+/// Reabrir uma aba de contexto ja gravada nao e uma fonte nova: a fonte
+/// entrou na sessao e na memoria quando a aba nasceu. Sem isto, cada clique
+/// A, B, A, B acrescentava outra copia a sessao persistida.
+fn split_open_records_source(existing_context_id: Option<u64>, private: bool) -> bool {
+    existing_context_id.is_none() && !private
+}
+
+/// Clicar na aba de contexto que o split ja mostra nao reconstroi o WebView:
+/// reconstruir voltava a URL original da aba e perdia o que o utilizador
+/// escreveu ou navegou.
+fn context_tab_click_is_noop(
+    active: Option<(usize, Option<u64>)>,
+    source_index: usize,
+    context_id: u64,
+) -> bool {
+    active == Some((source_index, Some(context_id)))
+}
+
 fn split_source_memory(
     url: &Url,
     source_name: &str,
@@ -13114,6 +13145,24 @@ process.stdout.write(JSON.stringify(results));
             Some(UserEvent::OpenExternal(url)) if url == "https://example.com/"
         ));
         assert!(external_new_window_event("http://192.168.0.1/".to_string(), None).is_none());
+    }
+
+    #[test]
+    fn reopening_a_context_tab_does_not_rebuild_or_duplicate_the_source() {
+        assert!(split_open_records_source(None, false));
+        assert!(!split_open_records_source(None, true));
+        assert!(
+            !split_open_records_source(Some(7), false),
+            "a reopened context tab must not add another session source"
+        );
+        assert!(
+            context_tab_click_is_noop(Some((0, Some(1))), 0, 1),
+            "clicking the active context tab must not rebuild the split"
+        );
+        assert!(!context_tab_click_is_noop(Some((0, Some(1))), 0, 2));
+        assert!(!context_tab_click_is_noop(Some((1, Some(1))), 0, 1));
+        assert!(!context_tab_click_is_noop(Some((0, None)), 0, 1));
+        assert!(!context_tab_click_is_noop(None, 0, 1));
     }
 
     #[test]
