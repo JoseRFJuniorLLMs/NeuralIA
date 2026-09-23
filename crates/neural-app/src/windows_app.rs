@@ -11656,6 +11656,77 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
                 assert_eq!(run.state["f"]["value"], expected, "{field}");
             }
         }
+
+        #[test]
+        fn observation_keeps_controls_on_text_heavy_pages() {
+            // Um artigo com mais de ~1.1K caracteres de texto: o corte do
+            // payload inteiro a 1200 unidades levava todas as linhas de
+            // elementos, e click/search paravam com ElementMissing.
+            let text = "Rust é uma linguagem de programação de sistemas. ".repeat(60);
+            let page = json!({
+                "url": "https://pt.wikipedia.org/wiki/Rust",
+                "title": "Rust – Wikipédia",
+                "main": text,
+                "elements": [
+                    {"key": "search", "tag": "input", "attrs": {"type": "search", "name": "search"}},
+                    {"key": "edit", "tag": "a", "attrs": {"role": "button", "href": "#editar"}, "text": "Editar"}
+                ]
+            });
+            let first = first_observation(&page);
+            assert_eq!(first.elements.len(), 2, "{first:?}");
+            assert!(
+                first.text_excerpt.chars().count() >= 1000,
+                "o extract continua a levar o texto: {}",
+                first.text_excerpt.chars().count()
+            );
+
+            let mut policy = policy_for("https://pt.wikipedia.org");
+            let commands = [
+                BrowserAgentCommand::Click("Editar".into()),
+                BrowserAgentCommand::Search("ownership".into()),
+            ];
+            let click = act(&commands, 0, &first, &mut policy);
+            assert!(
+                matches!(&click.action, AgentAction::Click { target } if target.name == "Editar")
+            );
+            let search = act(&commands, 1, &first, &mut policy);
+            assert!(
+                matches!(&search.action, AgentAction::TypeText { target, .. } if target.role == "search")
+            );
+        }
+
+        #[test]
+        fn spec_0108_agent_observation_stays_below_ipc_envelope_limit() {
+            // O pior caso do JSON: cada unidade de controlo vira `\u0001`, seis
+            // bytes. Nenhuma observação pode passar do envelope de 8 KiB, que o
+            // nativo recusa por inteiro.
+            let control = "\u{1}";
+            let elements = (0..40)
+                .map(|index| {
+                    json!({
+                        "key": format!("b{index}"),
+                        "tag": "button",
+                        "attrs": {"aria-label": format!("{index}{}", control.repeat(95))}
+                    })
+                })
+                .collect::<Vec<_>>();
+            let page = json!({
+                "url": format!("https://example.com/{}", "a".repeat(1300)),
+                "title": control.repeat(300),
+                "main": control.repeat(2000),
+                "elements": elements
+            });
+            let run = run_page(&page, &[json!({ "advance": 800 })]);
+            assert!(!run.posts.is_empty());
+            for post in &run.posts {
+                assert!(
+                    post.len() <= crate::ipc::IPC_MAX_BYTES,
+                    "observação com {} bytes",
+                    post.len()
+                );
+                assert!(observed(post).is_some(), "observação recusada pelo nativo");
+            }
+        }
     }
 
     #[test]
@@ -12241,7 +12312,6 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
         assert!(AGENT_OBSERVER_SCRIPT.contains("rows.length >= 32"));
         assert!(AGENT_OBSERVER_SCRIPT.contains("pageText"));
         assert!(AGENT_OBSERVER_SCRIPT.contains("action:'agent-observation'"));
-        assert!(AGENT_OBSERVER_SCRIPT.contains(".join('\\n').slice(0, 1200)"));
         assert!(AGENT_OBSERVER_SCRIPT.contains("post(stringify("));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("?cap="));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("eval("));
@@ -13051,17 +13121,6 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
                 "{name}: frame guard must run before capability use"
             );
         }
-    }
-
-    #[test]
-    fn spec_0108_agent_observation_stays_below_ipc_envelope_limit() {
-        assert!(
-            AGENT_OBSERVER_SCRIPT.contains(".join('\\n').slice(0, 1200)"),
-            "agent payload must be bounded before JSON serialization"
-        );
-        // JSON escaping may expand one UTF-16 code unit to six ASCII bytes.
-        // 1200 * 6 leaves >900 bytes for the protocol envelope under 8 KiB.
-        const { assert!(1200 * 6 + 900 < crate::ipc::IPC_MAX_BYTES) };
     }
 
     #[test]
@@ -15427,6 +15486,36 @@ const AGENT_OBSERVER_SCRIPT: &str = concat!(
 "#,
     agent_element_identity_js!(),
     r#"
+  // Bytes UTF-8 que uma unidade UTF-16 ocupa depois de serializada em JSON, no
+  // pior caso: controlo e surrogate viram \uXXXX (6), aspas e barra levam
+  // escape (2).
+  function unitCost(code) {
+    if (code < 0x20 || (code >= 0xd800 && code <= 0xdfff)) return 6;
+    if (code === 0x22 || code === 0x5c) return 2;
+    if (code < 0x80) return 1;
+    return code < 0x800 ? 2 : 3;
+  }
+
+  function jsonCost(value) {
+    let total = 0;
+    for (let i = 0; i < value.length; i++) total += unitCost(value.charCodeAt(i));
+    return total;
+  }
+
+  // O prefixo mais longo que cabe em `budget`, sem deixar um surrogate alto
+  // sozinho no fim.
+  function fitJson(value, budget) {
+    let total = 0;
+    let end = 0;
+    for (; end < value.length; end++) {
+      const cost = unitCost(value.charCodeAt(end));
+      if (total + cost > budget) break;
+      total += cost;
+    }
+    const code = end > 0 ? value.charCodeAt(end - 1) : 0;
+    return value.slice(0, code >= 0xd800 && code <= 0xdbff ? end - 1 : end);
+  }
+
   function observe() {
     timer = 0;
     const root = document.querySelector('main,[role="main"]') || document.body || document.documentElement;
@@ -15455,16 +15544,25 @@ const AGENT_OBSERVER_SCRIPT: &str = concat!(
     lastMaterial = material;
     generation += 1;
 
-    // O envelope nativo aceita no maximo 8 KiB. 1200 unidades UTF-16
-    // continuam abaixo desse teto mesmo no pior caso JSON (surrogates
-    // escapados como \\uXXXX), deixando margem para cap/action/args.
-    const payload = [
-      String(generation),
-      clean(location.href, 1200),
-      clean(document.title, 256),
-      pageText,
-      ...rows
-    ].join('\n').slice(0, 1200);
+    // O envelope nativo aceita no maximo 8 KiB. Antes cortava-se a string
+    // inteira a 1200 unidades, e as linhas de elementos vinham no fim: numa
+    // pagina com mais de ~1.1K caracteres de texto o agente deixava de ver
+    // qualquer controlo, e um URL longo levava ate a linha do titulo. Agora
+    // cada parte paga o seu custo em bytes do JSON no pior caso: o cabecalho
+    // vai inteiro, as linhas entram antes do texto (com uma reserva para ele)
+    // e o texto fica com o que sobra. 7000 bytes deixam >1 KiB para
+    // cap/action/args.
+    const head = [String(generation), clean(location.href, 1200), clean(document.title, 256)].join('\n');
+    let left = 7000 - jsonCost(head) - jsonCost('\n');
+    const textReserve = Math.min(jsonCost(pageText), 1500);
+    const kept = [];
+    for (const row of rows) {
+      const rowCost = jsonCost('\n' + row);
+      if (rowCost > left - textReserve) break;
+      kept.push(row);
+      left -= rowCost;
+    }
+    const payload = [head, fitJson(pageText, left)].concat(kept).join('\n');
     post(stringify({
       v:1,
       cap:capability,
