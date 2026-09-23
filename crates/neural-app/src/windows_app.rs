@@ -3108,6 +3108,20 @@ fn note_capture_decision(target: Option<PageTarget>, split_private: Option<bool>
 /// O aviso do painel privado.
 const NOTE_PRIVATE_REFUSAL: &str = "Modo privado: notas não são criadas";
 
+/// A fonte que o lado nativo conhece e a pagina nao: o artigo do Leitor (o
+/// HTML e local) e o PDF (o visualizador e nosso). So vale para a WebView
+/// unica dessas superficies; nas colunas e no Split manda o endereco da pagina.
+fn note_page_source(
+    target: Option<PageTarget>,
+    surface: Surface,
+    page_source: Option<&str>,
+) -> Option<String> {
+    match (target, surface) {
+        (None, Surface::Reader | Surface::Pdf) => page_source.map(str::to_string),
+        _ => None,
+    }
+}
+
 const PANEL_HTML: &str = r#"<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8"><title>Histórico e notas</title>
 <style>
@@ -10063,10 +10077,7 @@ impl App {
         let Some(webview) = webview else {
             return;
         };
-        let source = match (target, self.surface) {
-            (None, Surface::Reader | Surface::Pdf) => self.page_source.clone(),
-            _ => None,
-        };
+        let source = note_page_source(target, self.surface, self.page_source.as_deref());
         let proxy = self.proxy.clone();
         let asked = webview.evaluate_script_with_callback(NOTE_CAPTURE_SCRIPT, move |raw| {
             let _ = proxy.send_event(UserEvent::NoteCaptured {
@@ -10108,10 +10119,9 @@ impl App {
     ///
     /// A pagina do painel acabou de nascer e ainda nao correu o script dela:
     /// um `evaluate_script` agora corria no documento vazio e perdia-se. Por
-    /// isso a secao fica pendente e o `PanelMessage::Ready` (o "pronto" que a
-    /// pagina manda no fim do script) entrega-a com `PANEL_SHOW_NOTES_SCRIPT`.
-    /// Quem acrescentar a secao das notas define `window.neuraliaShowSection`
-    /// no `PANEL_HTML`; sem ela, o script nao faz nada.
+    /// isso `show_notes_panel` guarda o `PANEL_SHOW_NOTES_SCRIPT` em
+    /// `panel_pending`, e o `PanelMessage::Ready` (o "pronto" que a pagina
+    /// manda no fim do script) corre-o.
     fn open_notes(&mut self) {
         if self.side_panel.is_some() {
             self.close_side_panel();
@@ -21188,6 +21198,28 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
                 from_pdf.source.as_deref(),
                 Some("https://example.com/doc.pdf")
             );
+            // E so no Leitor e no PDF, na WebView unica.
+            let known = Some("https://example.com/doc.pdf");
+            for surface in [Surface::Reader, Surface::Pdf] {
+                assert_eq!(
+                    note_page_source(None, surface, known).as_deref(),
+                    known,
+                    "{surface:?}"
+                );
+            }
+            for (target, surface) in [
+                (None, Surface::External),
+                (None, Surface::Home),
+                (Some(PageTarget::Column(0)), Surface::Comparator),
+                (Some(PageTarget::Split), Surface::Comparator),
+                (Some(PageTarget::Column(1)), Surface::Pdf),
+            ] {
+                assert_eq!(
+                    note_page_source(target, surface, known),
+                    None,
+                    "{target:?} {surface:?}"
+                );
+            }
 
             // E a nota vai para a pasta, pelo mesmo trabalho do worker.
             let dir = NotesDir::new("selection");
