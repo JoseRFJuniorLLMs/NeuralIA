@@ -5,13 +5,15 @@ reduzidas com Lanczos, porque o GDI nao tem anti-aliasing: o unico suavizado que
 a barra de topo tem vem destes PNGs. Nada e descarregado e nenhuma arte de marca
 registada e embutida.
 
-    python scripts/gen-ai-icons.py
+    python scripts/gen-ai-icons.py                          # todos
+    python scripts/gen-ai-icons.py pomodoro notes breath    # so estes
 """
 
 from __future__ import annotations
 
 import math
 import os
+import sys
 
 from PIL import Image, ImageDraw
 
@@ -273,18 +275,144 @@ def incognito() -> None:
     finish(mask, solid((255, 255, 255)), "incognito.png")
 
 
-def main() -> None:
+def round_cap(draw: ImageDraw.ImageDraw, p, stroke: float, fill=255) -> None:
+    r = stroke / 2.0
+    draw.ellipse([p[0] - r, p[1] - r, p[0] + r, p[1] + r], fill=fill)
+
+
+# ----------------------------------------------------------------- Pomodoro
+def pomodoro() -> None:
+    """Tomate vermelho com a coroa de folhas verde e dois ponteiros brancos:
+    o temporizador de cozinha que da nome a tecnica. Desenho generico."""
+    red = (229, 57, 53)
+    green = (67, 160, 71)
+    white = (255, 255, 255)
+    body = [N * 0.10, N * 0.25, N * 0.90, N * 0.92]
+    calyx = (CENTER, N * 0.27)
+
+    mask = Image.new("L", (N, N), 0)
+    shape = ImageDraw.Draw(mask)
+    paint = solid(red)
+    brush = ImageDraw.Draw(paint)
+
+    shape.ellipse(body, fill=255)
+
+    # Folhas: fusos que saem do topo e se deitam sobre o tomate.
+    leaf_len = N * 0.21
+    leaf_half = N * 0.052
+    for degrees in (200, 240, 300, 340):
+        angle = math.radians(degrees)
+        ux, uy = math.cos(angle), -math.sin(angle)
+        nx, ny = -uy, ux
+        outline = []
+        steps = 48
+        for side in (1, -1):
+            points = range(steps + 1) if side == 1 else range(steps, -1, -1)
+            for step in points:
+                t = step / steps
+                w = leaf_half * math.sin(math.pi * t) ** 0.9 * side
+                outline.append((calyx[0] + ux * leaf_len * t + nx * w, calyx[1] + uy * leaf_len * t + ny * w))
+        shape.polygon(outline, fill=255)
+        brush.polygon(outline, fill=green)
+
+    # Pe: um traco curto para cima, ligeiramente inclinado.
+    stem = N * 0.075
+    top = (CENTER + N * 0.03, N * 0.14)
+    for target in (shape, brush):
+        fill = 255 if target is shape else green
+        target.line([calyx, top], fill=fill, width=int(stem))
+        round_cap(target, calyx, stem, fill)
+        round_cap(target, top, stem, fill)
+
+    # Ponteiros: minutos para cima, horas para a direita.
+    hand = N * 0.075
+    hub = (CENTER, N * 0.64)
+    for tip in ((CENTER, N * 0.47), (N * 0.64, N * 0.64)):
+        brush.line([hub, tip], fill=white, width=int(hand))
+        round_cap(brush, hub, hand, white)
+        round_cap(brush, tip, hand, white)
+
+    finish(mask, paint, "pomodoro.png")
+
+
+# -------------------------------------------------------------------- Notas
+def notes() -> None:
+    """Ficha de nota com o canto dobrado e tres linhas de texto, em contorno
+    branco (a barra pinta-a com o tema)."""
+    stroke = N * 0.07
+    left, right, top, bottom = N * 0.19, N * 0.81, N * 0.11, N * 0.89
+    fold = N * 0.20
+
+    mask = Image.new("L", (N, N), 0)
+    draw = ImageDraw.Draw(mask)
+    corner = (right - fold, top)
+    edges = [(left, top), corner, (right, top + fold), (right, bottom), (left, bottom), (left, top)]
+    for a, b in zip(edges, edges[1:]):
+        stroked(draw, a, b, stroke)
+    # A dobra: o triangulo do canto.
+    stroked(draw, corner, (right - fold, top + fold), stroke)
+    stroked(draw, (right - fold, top + fold), (right, top + fold), stroke)
+    # Linhas de texto.
+    for y, end in ((N * 0.45, N * 0.66), (N * 0.59, N * 0.66), (N * 0.73, N * 0.54)):
+        stroked(draw, (N * 0.33, y), (end, y), stroke)
+
+    finish(mask, solid((255, 255, 255)), "notes.png")
+
+
+# --------------------------------------------------------------- Respiracao
+def breath() -> None:
+    """Tres linhas de vento, duas com remoinho na ponta: ar a entrar e a sair.
+    Contorno branco (a barra pinta-o com o tema); nenhuma marca de terceiros."""
+    stroke = N * 0.07
+    mask = Image.new("L", (N, N), 0)
+    draw = ImageDraw.Draw(mask)
+
+    def curl(center, radius, start, end):
+        """Arco do PIL (graus a partir das 3 h, no sentido horario do ecra).
+        Os dois remoinhos acabam no ponto mais a esquerda do circulo."""
+        box = [center[0] - radius, center[1] - radius, center[0] + radius, center[1] + radius]
+        draw.arc(box, start=start, end=end, fill=255, width=int(stroke))
+        # A ponta solta do remoinho tambem leva a ponta redonda.
+        round_cap(draw, (center[0] - radius, center[1]), stroke)
+
+    # Em cima: a linha chega a base do circulo e o remoinho sobe pela direita
+    # ate a esquerda -- o mesmo arco que vai de -180 (esquerda) a 90 (base).
+    r = N * 0.12
+    stroked(draw, (N * 0.10, N * 0.34), (N * 0.60, N * 0.34), stroke)
+    curl((N * 0.60, N * 0.34 - r), r, -180, 90)
+    # Ao meio: a linha mais longa, sem remoinho.
+    stroked(draw, (N * 0.10, N * 0.52), (N * 0.88, N * 0.52), stroke)
+    # Em baixo: a linha chega ao topo do circulo e o remoinho desce pela
+    # direita ate a esquerda (de -90, o topo, a 180).
+    stroked(draw, (N * 0.10, N * 0.68), (N * 0.52, N * 0.68), stroke)
+    curl((N * 0.52, N * 0.68 + r), r, -90, 180)
+
+    finish(mask, solid((255, 255, 255)), "breath.png")
+
+
+ICONS = {
+    "gemini": gemini,
+    "chatgpt": chatgpt,
+    "claude": claude,
+    "home": home,
+    "video": video,
+    "whatsapp": whatsapp,
+    "youtube": youtube,
+    "mail": mail,
+    "incognito": incognito,
+    "pomodoro": pomodoro,
+    "notes": notes,
+    "breath": breath,
+}
+
+
+def main(names: list[str]) -> None:
+    """Sem argumentos gera todos; com nomes (ex.: `pomodoro notes`) so esses,
+    para nao regravar PNGs que nao mudaram."""
     os.makedirs(OUT_DIR, exist_ok=True)
-    gemini()
-    chatgpt()
-    claude()
-    home()
-    video()
-    whatsapp()
-    youtube()
-    mail()
-    incognito()
+    for name in names or list(ICONS):
+        ICONS[name]()
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

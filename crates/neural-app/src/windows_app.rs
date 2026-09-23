@@ -399,9 +399,168 @@ enum BarHit {
     /// Icones do canto direito: servicos no painel e avisos do Gmail.
     Service(Service),
     GmailToggle,
+    /// Ferramentas (Pomodoro, Notas, Respiracao), a esquerda dos servicos.
+    Tool(Tool),
     WindowMinimize,
     WindowMaximize,
     WindowClose,
+}
+
+/// As ferramentas da barra e da Home, na ordem em que aparecem (da esquerda
+/// para a direita): pedidas pelo dono como botoes, ao lado dos servicos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    Pomodoro,
+    /// Zettelkasten: as notas vivem no painel do Ctrl+H.
+    Notes,
+    /// Respiracao guiada (metodo Wim Hof): o video no painel anonimo.
+    Breath,
+}
+
+impl Tool {
+    const ALL: [Tool; 3] = [Tool::Pomodoro, Tool::Notes, Tool::Breath];
+
+    fn icon_slot(self) -> usize {
+        match self {
+            Self::Pomodoro => ICON_SLOT_POMODORO,
+            Self::Notes => ICON_SLOT_NOTES,
+            Self::Breath => ICON_SLOT_BREATH,
+        }
+    }
+
+    /// O tomate tem cor propria; as outras duas marcas sao brancas e seguem
+    /// o tema, como a videochamada e o envelope.
+    fn icon_tint(self, theme: &Theme) -> Option<Rgb> {
+        match self {
+            Self::Pomodoro => None,
+            Self::Notes | Self::Breath => Some(theme.fg),
+        }
+    }
+
+    /// A dica: o que o clique FAZ, como as outras dicas da barra.
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::Pomodoro => "Pomodoro: foco e pausas (clique inicia/pausa; botão direito: opções)",
+            Self::Notes => "Notas (Zettelkasten) — Ctrl+Shift+Z cria nota da seleção",
+            Self::Breath => "Respiração guiada — método Wim Hof (vídeo em modo anônimo)",
+        }
+    }
+}
+
+/// Botao do rato que carregou numa ferramenta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolClick {
+    Left,
+    Right,
+}
+
+/// O que um clique numa ferramenta faz -- na barra ou na Home, e o mesmo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolAction {
+    /// Inicia, pausa ou retoma o Pomodoro (`App::pomodoro_click`).
+    PomodoroClick,
+    /// Menu de opcoes do Pomodoro (`App::pomodoro_menu`).
+    PomodoroMenu,
+    /// Abre o painel do Ctrl+H nas notas; aberto, fecha-o.
+    ToggleNotes,
+    /// Abre o video da respiracao no painel anonimo; aberto, fecha-o.
+    ToggleBreath,
+}
+
+/// A unica tabela clique -> accao das ferramentas. O botao direito so faz
+/// alguma coisa no Pomodoro: nas outras duas nao ha menu, e um clique direito
+/// perdido nao pode abrir nem fechar paineis.
+fn tool_action(tool: Tool, click: ToolClick) -> Option<ToolAction> {
+    match (tool, click) {
+        (Tool::Pomodoro, ToolClick::Left) => Some(ToolAction::PomodoroClick),
+        (Tool::Pomodoro, ToolClick::Right) => Some(ToolAction::PomodoroMenu),
+        (Tool::Notes, ToolClick::Left) => Some(ToolAction::ToggleNotes),
+        (Tool::Breath, ToolClick::Left) => Some(ToolAction::ToggleBreath),
+        (Tool::Notes | Tool::Breath, ToolClick::Right) => None,
+    }
+}
+
+/// Clique na barra do comparador: so os botoes das ferramentas dao uma
+/// `ToolAction`; o resto da barra segue o caminho que ja tinha.
+fn bar_tool_action(hit: Option<BarHit>, click: ToolClick) -> Option<ToolAction> {
+    match hit {
+        Some(BarHit::Tool(tool)) => tool_action(tool, click),
+        _ => None,
+    }
+}
+
+/// Etiqueta curta ao lado do icone do Pomodoro ("mm:ss"). Tamanho fixo e
+/// `Copy` para poder andar dentro de `BarColumns`: desenho e hit-testing leem
+/// a MESMA etiqueta, e por isso a mesma largura.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BarLabel {
+    bytes: [u8; BAR_LABEL_MAX_BYTES],
+    len: u8,
+}
+
+const BAR_LABEL_MAX_BYTES: usize = 16;
+/// Largura reservada por caractere e margem da etiqueta, em pixeis logicos a
+/// letra de 13 px da barra. Reserva-se por caractere e nao pelo texto medido:
+/// "11:11" e "00:00" ocupam o mesmo, e a barra nao treme a cada segundo.
+const BAR_LABEL_CHAR_WIDTH: f64 = 7.5;
+const BAR_LABEL_PADDING: f64 = 8.0;
+
+impl BarLabel {
+    /// `None` para texto vazio. Texto comprido e cortado numa fronteira de
+    /// caractere, nunca a meio de um.
+    fn new(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        let mut end = text.len().min(BAR_LABEL_MAX_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut bytes = [0u8; BAR_LABEL_MAX_BYTES];
+        bytes[..end].copy_from_slice(&text.as_bytes()[..end]);
+        Some(Self {
+            bytes,
+            len: end as u8,
+        })
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("")
+    }
+
+    /// Quanto o botao alarga para a etiqueta, em pixeis logicos.
+    fn width(&self) -> f64 {
+        self.as_str().chars().count() as f64 * BAR_LABEL_CHAR_WIDTH + BAR_LABEL_PADDING
+    }
+}
+
+impl std::fmt::Debug for BarLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BarLabel({:?})", self.as_str())
+    }
+}
+
+/// Os tres botoes das ferramentas, encostados a `right`: Respiracao na ponta,
+/// Notas antes e o Pomodoro por ultimo -- e so ele alarga para a esquerda
+/// com a etiqueta, para os outros dois nao saltarem quando ela aparece.
+fn tool_button_row(right: f64, y: f64, size: f64, gap: f64, label_width: f64) -> [UiRect; 3] {
+    let breath = UiRect {
+        x: right - size,
+        y,
+        width: size,
+        height: size,
+    };
+    let notes = UiRect {
+        x: breath.x - gap - size,
+        ..breath
+    };
+    let pomodoro = UiRect {
+        x: notes.x - gap - size - label_width,
+        width: size + label_width,
+        ..breath
+    };
+    [pomodoro, notes, breath]
 }
 
 /// O estado do comparador de que a barra precisa. Anda sempre junto -- quem
@@ -418,6 +577,8 @@ struct BarColumns {
     split_active: bool,
     /// Largura logica do painel lateral a direita; as colunas ficam antes dele.
     panel_width: f64,
+    /// Tempo que falta no Pomodoro, ao lado do icone dele; alarga o botao.
+    pomodoro_label: Option<BarLabel>,
 }
 
 impl BarColumns {
@@ -430,6 +591,7 @@ impl BarColumns {
             minimized: [false; COMPARATOR_COLUMNS],
             split_active: false,
             panel_width: 0.0,
+            pomodoro_label: None,
         }
     }
 }
@@ -608,7 +770,12 @@ impl BarLayout {
         } else {
             hidden.len() as f64 * chip_w + chip_gap * hidden.len().saturating_sub(1) as f64
         };
-        let controls = right_controls(client_width, scale, columns.split_active);
+        let controls = right_controls(
+            client_width,
+            scale,
+            columns.split_active,
+            columns.pomodoro_label,
+        );
         let controls_left = controls.leftmost();
         let (back, forward) = controls.split_nav.unwrap_or((empty, empty));
         let reserved = if hidden.is_empty() {
@@ -868,20 +1035,80 @@ struct RightControls {
     private: UiRect,
     /// Videochamada, WhatsApp, YouTube e Gmail, a esquerda do Privado.
     services: [UiRect; 4],
+    /// Pomodoro, Notas e Respiracao, a esquerda dos servicos (ordem de
+    /// `Tool::ALL`). O do Pomodoro alarga com a etiqueta do tempo.
+    tools: [UiRect; 3],
     /// Rotulo, expandir e fechar da gaveta; `None` quando nao ha gaveta.
     split: Option<(UiRect, UiRect, UiRect)>,
     /// ‹ e › da fonte da gaveta, a esquerda do rotulo.
     split_nav: Option<(UiRect, UiRect)>,
 }
 
+/// Onde acaba o botao Home da segunda linha (7 + 72 px) mais a folga de 8:
+/// os controlos da direita nunca descem daqui.
+const RIGHT_CONTROLS_MIN_LEFT: f64 = 87.0;
+/// Rotulo da gaveta ("Fonte · ChatGPT") inteiro, e o minimo que ainda se le.
+const SPLIT_LABEL_WIDTH: f64 = 150.0;
+const SPLIT_LABEL_MIN_WIDTH: f64 = 60.0;
+/// Folga entre o grupo das ferramentas e o dos servicos.
+const TOOLS_GROUP_GAP: f64 = 8.0;
+
+/// Quanto cedem, numa janela estreita, as duas partes que so informam: o
+/// rotulo da gaveta encolhe primeiro (ate desaparecer abaixo do minimo) e a
+/// etiqueta do Pomodoro so sai quando nem assim cabe. Devolve (rotulo,
+/// etiqueta) em pixeis logicos; `room` e o que sobra aos dois.
+fn right_controls_flex(room: f64, split_active: bool, label_width: f64) -> (f64, f64) {
+    let split_label = if split_active {
+        let fits = (room - label_width).min(SPLIT_LABEL_WIDTH);
+        if fits >= SPLIT_LABEL_MIN_WIDTH {
+            fits
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+    let label = if room - split_label >= label_width {
+        label_width
+    } else {
+        0.0
+    };
+    (split_label, label)
+}
+
 /// Geometria dos controlos encostados a direita. A mesma conta estava escrita
 /// tres vezes -- no desenho, no hit-testing e agora nos chips -- e as copias
 /// ja tinham comecado a divergir; aqui ela e uma so.
-fn right_controls(client_width: f64, scale: f64, split_active: bool) -> RightControls {
+fn right_controls(
+    client_width: f64,
+    scale: f64,
+    split_active: bool,
+    pomodoro_label: Option<BarLabel>,
+) -> RightControls {
     let margin = 8.0 * scale;
     let row_y = (TITLE_TAB_HEIGHT + 7.0) * scale;
     let row_h = 30.0 * scale;
     let gap = 5.0 * scale;
+    // Botoes redondos so com icone, como no Chrome.
+    let icon = row_h;
+    let icon_gap = 4.0 * scale;
+
+    // Tudo o que tem largura fixa, em pixeis logicos: a gaveta sem o rotulo
+    // (fechar, expandir, ‹ e › e as folgas), o Privado, os quatro servicos e
+    // as tres ferramentas. O resto e do rotulo da gaveta e da etiqueta.
+    let logical = |value: f64| value / scale;
+    let split_fixed = if split_active {
+        30.0 + 5.0 + 30.0 + 5.0 + 6.0 + 26.0 + 4.0 + 26.0 + 6.0
+    } else {
+        0.0
+    };
+    let icons = logical(icon) * 8.0 + logical(icon_gap) * 6.0 + TOOLS_GROUP_GAP;
+    let room = logical(client_width) - 8.0 - split_fixed - icons - RIGHT_CONTROLS_MIN_LEFT;
+    let (split_label_w, label_w) = right_controls_flex(
+        room,
+        split_active,
+        pomodoro_label.map_or(0.0, |label| label.width()),
+    );
 
     let split = split_active.then(|| {
         let close = UiRect {
@@ -897,9 +1124,9 @@ fn right_controls(client_width: f64, scale: f64, split_active: bool) -> RightCon
             height: row_h,
         };
         let label = UiRect {
-            x: expand.x - gap - 150.0 * scale,
+            x: expand.x - gap - split_label_w * scale,
             y: row_y,
-            width: 150.0 * scale,
+            width: split_label_w * scale,
             height: row_h,
         };
         (label, expand, close)
@@ -923,26 +1150,32 @@ fn right_controls(client_width: f64, scale: f64, split_active: bool) -> RightCon
         Some((back, _)) => back.x - 6.0 * scale,
         None => client_width - margin,
     };
-    // Botoes redondos so com icone, como no Chrome: Privado a direita e, a
-    // esquerda dele, videochamada, WhatsApp, YouTube e Gmail.
-    let icon = row_h;
-    let icon_gap = 4.0 * scale;
+    // Privado a direita e, a esquerda dele, videochamada, WhatsApp, YouTube e
+    // Gmail; depois, num grupo proprio, as ferramentas.
     let private = UiRect {
         x: right - icon,
         y: row_y,
         width: icon,
         height: icon,
     };
-    let services = std::array::from_fn(|index| UiRect {
+    let services: [UiRect; 4] = std::array::from_fn(|index| UiRect {
         x: private.x - (4 - index) as f64 * (icon + icon_gap),
         y: row_y,
         width: icon,
         height: icon,
     });
+    let tools = tool_button_row(
+        services[0].x - TOOLS_GROUP_GAP * scale,
+        row_y,
+        icon,
+        icon_gap,
+        label_w * scale,
+    );
 
     RightControls {
         private,
         services,
+        tools,
         split,
         split_nav,
     }
@@ -951,7 +1184,7 @@ fn right_controls(client_width: f64, scale: f64, split_active: bool) -> RightCon
 impl RightControls {
     /// Onde comecam os controlos da direita: o resto da barra acaba aqui.
     fn leftmost(&self) -> f64 {
-        self.services[0].x
+        self.tools[0].x
     }
 }
 
@@ -964,6 +1197,11 @@ const SERVICE_BUTTON_HITS: [BarHit; 4] = [
 ];
 
 fn right_controls_hit(controls: RightControls, x: f64, y: f64) -> Option<BarHit> {
+    for (rect, tool) in controls.tools.iter().zip(Tool::ALL) {
+        if rect.contains(x, y) {
+            return Some(BarHit::Tool(tool));
+        }
+    }
     for (rect, hit) in controls.services.iter().zip(SERVICE_BUTTON_HITS) {
         if rect.contains(x, y) {
             return Some(hit);
@@ -981,6 +1219,23 @@ fn right_controls_hit(controls: RightControls, x: f64, y: f64) -> Option<BarHit>
         }
     }
     None
+}
+
+/// O alvo da barra num ponto: os controlos da direita primeiro, depois o
+/// resto. E o que `App::comparator_bar_hit` usa para o clique esquerdo, o
+/// direito e a dica -- os tres veem o mesmo botao.
+fn bar_hit_at(
+    controls: Option<RightControls>,
+    layout: Option<BarLayout>,
+    x: f64,
+    y: f64,
+) -> Option<BarHit> {
+    if let Some(controls) = controls
+        && let Some(hit) = right_controls_hit(controls, x, y)
+    {
+        return Some(hit);
+    }
+    layout.and_then(|layout| layout.hit(x, y))
 }
 
 struct ComparatorView {
@@ -1442,7 +1697,11 @@ struct PaletteHost {
 
 /// O que a barra precisa de saber sobre o comparador, tirado do proprio
 /// estado. Desenho e hit-testing chamam isto -- nunca montam o seu proprio.
-fn bar_columns(comp: &ComparatorState) -> BarColumns {
+///
+/// A etiqueta do Pomodoro nao e estado do comparador, mas muda a largura dos
+/// controlos da direita; entra aqui para desenho e hit-testing a receberem
+/// pelo mesmo caminho (ver `App::pomodoro_bar_label`).
+fn bar_columns(comp: &ComparatorState, pomodoro_label: Option<BarLabel>) -> BarColumns {
     // Em ecra completo ou com a gaveta aberta o conteudo ja nao esta em
     // faixas por peso, por isso a barra tambem nao finge que esta: reparte-se
     // em partes iguais e nenhuma coluna vira chip.
@@ -1450,6 +1709,7 @@ fn bar_columns(comp: &ComparatorState) -> BarColumns {
         return BarColumns {
             split_active: comp.split.is_some(),
             panel_width: comp.panel_width,
+            pomodoro_label,
             ..BarColumns::even(comp.views.len())
         };
     }
@@ -1459,6 +1719,7 @@ fn bar_columns(comp: &ComparatorState) -> BarColumns {
         minimized: comp.minimized,
         split_active: false,
         panel_width: comp.panel_width,
+        pomodoro_label,
     }
 }
 
@@ -2274,6 +2535,11 @@ fn panel_html(theme: &Theme) -> String {
     PANEL_HTML.replace("__THEME__", &panel_theme_vars(theme).to_string())
 }
 
+/// Corre no painel do Ctrl+H quando ele foi aberto pelo botao Notas. A
+/// guarda deixa-o inofensivo enquanto o `PANEL_HTML` nao tiver a secao.
+const PANEL_SHOW_NOTES_SCRIPT: &str =
+    "window.neuraliaShowSection && window.neuraliaShowSection('notes')";
+
 const PANEL_HTML: &str = r#"<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8"><title>Histórico inteligente</title>
 <style>
@@ -2364,7 +2630,13 @@ enum Service {
     WhatsApp,
     YouTube,
     Gmail,
+    /// Respiracao guiada (metodo Wim Hof), pedida pelo dono "em modo
+    /// anonimo": o video no painel InPrivate, sem camera nem microfone.
+    Breath,
 }
+
+/// O video de respiracao que o dono escolheu.
+const BREATH_VIDEO_URL: &str = "https://www.youtube.com/watch?v=UJBknAsxfrA";
 
 impl Service {
     fn url(self) -> &'static str {
@@ -2373,6 +2645,7 @@ impl Service {
             Self::WhatsApp => "https://web.whatsapp.com/",
             Self::YouTube => "https://www.youtube.com/",
             Self::Gmail => "https://mail.google.com/mail/u/0/#inbox",
+            Self::Breath => BREATH_VIDEO_URL,
         }
     }
 
@@ -2382,6 +2655,18 @@ impl Service {
             Self::WhatsApp => "WhatsApp",
             Self::YouTube => "YouTube",
             Self::Gmail => "Gmail",
+            Self::Breath => "Respiração guiada (método Wim Hof)",
+        }
+    }
+
+    /// Painel anonimo: WebView2 InPrivate (nada fica no perfil -- cookies,
+    /// cache, historico do WebView), camera e microfone recusados, e a pagina
+    /// presa ao que a abriu. Os outros servicos precisam da conta do
+    /// utilizador e por isso nao podem ser privados.
+    fn private(self) -> bool {
+        match self {
+            Self::Breath => true,
+            Self::Meet | Self::WhatsApp | Self::YouTube | Self::Gmail => false,
         }
     }
 }
@@ -2391,6 +2676,84 @@ impl Service {
 fn service_panel_allows_navigation(target: &str) -> bool {
     let lower = target.trim().to_ascii_lowercase();
     lower == "about:blank" || lower.starts_with("https://") || lower.starts_with("http://")
+}
+
+/// O painel da respiracao existe para um video. Fica preso ao YouTube (e a
+/// pagina de consentimento de cookies que ele mostra a uma sessao sem
+/// cookies, como e sempre a InPrivate), so em https -- para nao virar um
+/// navegador anonimo sem as protecoes do painel Privado. Nem o login da
+/// Google: entrar numa conta no painel "anonimo" contradiz o pedido.
+fn breath_panel_allows_navigation(target: &str) -> bool {
+    let target = target.trim();
+    if target.eq_ignore_ascii_case("about:blank") {
+        return true;
+    }
+    let Ok(url) = Url::parse(target) else {
+        return false;
+    };
+    if url.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host == "youtube.com"
+        || host.ends_with(".youtube.com")
+        || host == "youtu.be"
+        || host == "consent.google.com"
+}
+
+/// A politica de navegacao de cada servico, num so sitio.
+fn service_panel_navigation(service: Service, target: &str) -> bool {
+    match service {
+        Service::Breath => breath_panel_allows_navigation(target),
+        Service::Meet | Service::WhatsApp | Service::YouTube | Service::Gmail => {
+            service_panel_allows_navigation(target)
+        }
+    }
+}
+
+/// Camera e microfone: pelo aviso do WebView2 nos servicos da conta do
+/// utilizador; recusados, sem perguntar, no painel privado.
+fn service_panel_permission(service: Service, kind: PermissionKind) -> PermissionResponse {
+    if service.private() {
+        return PermissionResponse::Deny;
+    }
+    web_media_permission(kind, true)
+}
+
+/// Onde comecam os paineis da direita. No comparador, debaixo da barra; na
+/// Home, debaixo da faixa de cima -- que tem os botoes da janela e as
+/// ferramentas, e um painel por cima deles escondia o proprio botao que o
+/// fecha. Nas outras superficies a moldura e a do Windows.
+fn panel_top(surface: Surface) -> f64 {
+    match surface {
+        Surface::Comparator => COMPARATOR_CHROME_HEIGHT,
+        Surface::Home => TITLE_TAB_HEIGHT,
+        _ => 0.0,
+    }
+}
+
+/// Largura logica que o painel aberto tira ao comparador (0 fora dele ou
+/// sem painel). Qualquer servico conta -- a Respiracao incluida --, porque
+/// o painel dele fica ao lado das colunas como os outros.
+fn open_panel_width_for(
+    surface: Surface,
+    service: Option<Service>,
+    side_panel: bool,
+    logical_w: f64,
+    logical_h: f64,
+) -> f64 {
+    if surface != Surface::Comparator {
+        return 0.0;
+    }
+    if service.is_some() {
+        service_panel_bounds(logical_w, logical_h, COMPARATOR_CHROME_HEIGHT).2
+    } else if side_panel {
+        side_panel_bounds(logical_w, logical_h, COMPARATOR_CHROME_HEIGHT).2
+    } else {
+        0.0
+    }
 }
 
 /// Mais largo do que o do historico: o WhatsApp e o Meet precisam de espaco.
@@ -2433,6 +2796,65 @@ unsafe fn draw_icon_button(
     let x = (rect.x + (rect.width - size as f64) / 2.0).round() as i32;
     let y = (rect.y + (rect.height - size as f64) / 2.0).round() as i32;
     draw_icon(hdc, slot, x, y, size, fill, tint);
+}
+
+/// Botao de uma ferramenta: o mesmo circulo dos servicos, com o icone no
+/// quadrado da esquerda e, se houver, a etiqueta (o tempo do Pomodoro) no
+/// resto -- `right_controls` e `home_tool_buttons` ja alargaram o botao.
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_tool_button(
+    hdc: *mut core::ffi::c_void,
+    rect: UiRect,
+    tool: Tool,
+    label: Option<&str>,
+    hovered: bool,
+    scale: f64,
+    font: *mut core::ffi::c_void,
+    theme: &Theme,
+    background: Rgb,
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let fill = if hovered {
+        theme.surface_line
+    } else {
+        theme.surface
+    };
+    fill_pill(
+        hdc,
+        rect,
+        rect.height / 2.0,
+        fill,
+        Some((theme.surface_line, scale)),
+        background,
+    );
+    let size = (rect.height * 0.6).round() as i32;
+    let x = (rect.x + (rect.height - size as f64) / 2.0).round() as i32;
+    let y = (rect.y + (rect.height - size as f64) / 2.0).round() as i32;
+    draw_icon(hdc, tool.icon_slot(), x, y, size, fill, tool.icon_tint(theme));
+
+    // So ha etiqueta se o botao alargou para ela; senao seria escrita por
+    // cima do icone.
+    if let Some(text) = label
+        && rect.width > rect.height + 1.0
+    {
+        SelectObject(hdc, font as _);
+        SetTextColor(hdc, rgb3(theme.fg));
+        SetBkMode(hdc, TRANSPARENT as i32);
+        let mut text_rect = RECT {
+            left: (rect.x + rect.height * 0.85).round() as i32,
+            top: rect.y.round() as i32,
+            right: (rect.x + rect.width - rect.height * 0.25).round() as i32,
+            bottom: (rect.y + rect.height).round() as i32,
+        };
+        draw_text(
+            hdc,
+            text,
+            &mut text_rect,
+            DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
+        );
+    }
 }
 
 /// Avisos do Gmail ligados (o botao do envelope). Guardado em
@@ -2573,6 +2995,7 @@ fn bar_tooltip_label(
             "Avisos do Gmail: desligados · clique para ligar"
         }
         .to_string(),
+        BarHit::Tool(tool) => tool.tooltip().to_string(),
         BarHit::WindowMinimize => caption_tooltip_label(0, maximized).to_string(),
         BarHit::WindowMaximize => caption_tooltip_label(1, maximized).to_string(),
         BarHit::WindowClose => caption_tooltip_label(2, maximized).to_string(),
@@ -2626,6 +3049,69 @@ fn caption_buttons_wanted(surface: Surface, bar_visible: bool) -> bool {
 /// A faixa de cima da Home, onde se agarra a janela sem moldura.
 fn home_drag_strip(y: f64, scale: f64) -> bool {
     y >= 0.0 && y <= TITLE_TAB_HEIGHT * scale.max(1.0)
+}
+
+/// As ferramentas na faixa de cima da Home, encostadas aos botoes da janela
+/// (os tres de 46 px que `sync_caption_buttons` poe no canto): a mesma
+/// ordem e o mesmo desenho da barra do comparador, so um pouco mais baixos
+/// para caberem na faixa de 32 px.
+fn home_tool_buttons(client_width: f64, scale: f64, pomodoro_label: Option<BarLabel>) -> [UiRect; 3] {
+    let scale = scale.max(1.0);
+    let caption_left = client_width - 3.0 * 46.0 * scale;
+    let size = (TITLE_TAB_HEIGHT - 6.0) * scale;
+    tool_button_row(
+        caption_left - 8.0 * scale,
+        3.0 * scale,
+        size,
+        4.0 * scale,
+        pomodoro_label.map_or(0.0, |label| label.width()) * scale,
+    )
+}
+
+fn home_tool_hit(
+    client_width: f64,
+    scale: f64,
+    pomodoro_label: Option<BarLabel>,
+    x: f64,
+    y: f64,
+) -> Option<Tool> {
+    home_tool_buttons(client_width, scale, pomodoro_label)
+        .iter()
+        .zip(Tool::ALL)
+        .find_map(|(rect, tool)| rect.contains(x, y).then_some(tool))
+}
+
+/// O que um clique na Home apanha.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeClick {
+    Tool(Tool),
+    /// O botao "Ir" da omnibox.
+    Go,
+    /// A faixa de cima fora dos botoes: arrasta a janela.
+    Drag,
+    Nothing,
+}
+
+/// A unica decisao do clique na Home. As ferramentas ficam DENTRO da faixa
+/// de arrastar, por isso sao vistas primeiro: sem isso o clique nelas
+/// arrastava a janela em vez de carregar no botao.
+fn home_click_target(
+    size: (f64, f64),
+    scale: f64,
+    pomodoro_label: Option<BarLabel>,
+    x: f64,
+    y: f64,
+) -> HomeClick {
+    if let Some(tool) = home_tool_hit(size.0, scale, pomodoro_label, x, y) {
+        return HomeClick::Tool(tool);
+    }
+    if HomeLayout::new(size.0, size.1, scale).go.contains(x, y) {
+        return HomeClick::Go;
+    }
+    if home_drag_strip(y, scale) {
+        return HomeClick::Drag;
+    }
+    HomeClick::Nothing
 }
 
 /// Vermelho do fechar ao passar o rato, o mesmo do Chrome e do Windows.
@@ -4444,8 +4930,13 @@ struct App {
     side_panel: Option<WebView>,
     /// A consulta de memoria que alimenta as sugestoes do painel.
     panel_suggestion_query: Option<String>,
-    /// Servico aberto no painel lateral (WhatsApp, Meet, YouTube, Gmail).
+    /// Servico aberto no painel lateral (WhatsApp, Meet, YouTube, Gmail e o
+    /// video da respiracao, este em InPrivate).
     service_panel: Option<(Service, WebView)>,
+    /// Ferramentas: o botao da Home sob o rato (a barra usa `bar_hover`) e
+    /// o painel aberto pelo botao Notas, a espera do "pronto" da pagina.
+    home_tool_hover: Option<Tool>,
+    panel_notes_pending: bool,
 }
 
 impl App {
@@ -4534,6 +5025,8 @@ impl App {
             side_panel: None,
             panel_suggestion_query: None,
             service_panel: None,
+            home_tool_hover: None,
+            panel_notes_pending: false,
         }
     }
 
@@ -7749,7 +8242,7 @@ impl App {
             window.inner_size().width as f64,
             window.scale_factor(),
             self.bar_visible(),
-            bar_columns(comp),
+            bar_columns(comp, self.pomodoro_bar_label()),
             std::array::from_fn(|index| plan_tab_row(&comp.contexts[index], &comp.groups[index])),
         ))
     }
@@ -8237,17 +8730,43 @@ impl App {
             window.inner_size().width as f64,
             window.scale_factor().max(1.0),
             split_active,
+            self.pomodoro_bar_label(),
         ))
     }
 
     fn comparator_bar_hit(&self) -> Option<BarHit> {
-        if let Some(controls) = self.right_controls()
-            && let Some(hit) = right_controls_hit(controls, self.cursor.0, self.cursor.1)
-        {
-            return Some(hit);
+        bar_hit_at(
+            self.right_controls(),
+            self.bar_layout(),
+            self.cursor.0,
+            self.cursor.1,
+        )
+    }
+
+    /// Ferramentas da Home sob o rato: realce e dica, como na barra.
+    fn update_home_tool_hover(&mut self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let next = (self.surface == Surface::Home)
+            .then(|| {
+                home_tool_hit(
+                    window.inner_size().width as f64,
+                    window.scale_factor(),
+                    self.pomodoro_bar_label(),
+                    self.cursor.0,
+                    self.cursor.1,
+                )
+            })
+            .flatten();
+        if next == self.home_tool_hover {
+            return;
         }
-        self.bar_layout()
-            .and_then(|layout| layout.hit(self.cursor.0, self.cursor.1))
+        self.home_tool_hover = next;
+        if let Some(owner) = window_hwnd(window) {
+            hover_tooltip(owner, next.map_or("", Tool::tooltip));
+        }
+        self.request_redraw();
     }
 
     /// "Ir" da Home sob o rato: degradê e mao, para se ver que esta vivo e
@@ -8304,23 +8823,27 @@ impl App {
         };
         let scale = window.scale_factor().max(1.0);
         let size = window.inner_size();
-        let top = if self.surface == Surface::Comparator {
-            COMPARATOR_CHROME_HEIGHT
-        } else {
-            0.0
-        };
-        let (x, y, width, height) =
-            service_panel_bounds(size.width as f64 / scale, size.height as f64 / scale, top);
+        let (x, y, width, height) = service_panel_bounds(
+            size.width as f64 / scale,
+            size.height as f64 / scale,
+            panel_top(self.surface),
+        );
+        // Sem IPC, sem scripts injetados, sem `record`/`capture`: nada do que
+        // corre num painel de servico chega ao historico ou a memoria do
+        // NeuralIA. O privado (Respiracao) tambem nao deixa nada no perfil
+        // do WebView2: e InPrivate.
         let built = themed_webview_builder()
+            .with_incognito(service.private())
             .with_url(service.url())
             .with_bounds(wry::Rect {
                 position: LogicalPosition::new(x, y).into(),
                 size: LogicalSize::new(width, height).into(),
             })
-            .with_navigation_handler(|target| service_panel_allows_navigation(&target))
+            .with_navigation_handler(move |target| service_panel_navigation(service, &target))
             .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
-            // Caminho A do WebRTC: camera e microfone pelo aviso do WebView2.
-            .with_permission_handler(|kind| web_media_permission(kind, true))
+            // Caminho A do WebRTC: camera e microfone pelo aviso do WebView2
+            // -- salvo no painel privado, onde sao recusados.
+            .with_permission_handler(move |kind| service_panel_permission(service, kind))
             .build_as_child(window);
         match built {
             Ok(panel) => {
@@ -8351,13 +8874,11 @@ impl App {
         };
         let scale = window.scale_factor().max(1.0);
         let size = window.inner_size();
-        let top = if self.surface == Surface::Comparator {
-            COMPARATOR_CHROME_HEIGHT
-        } else {
-            0.0
-        };
-        let (x, y, width, height) =
-            service_panel_bounds(size.width as f64 / scale, size.height as f64 / scale, top);
+        let (x, y, width, height) = service_panel_bounds(
+            size.width as f64 / scale,
+            size.height as f64 / scale,
+            panel_top(self.surface),
+        );
         let _ = panel.set_bounds(wry::Rect {
             position: LogicalPosition::new(x, y).into(),
             size: LogicalSize::new(width, height).into(),
@@ -8410,19 +8931,15 @@ impl App {
         let Some(window) = &self.window else {
             return 0.0;
         };
-        if self.surface != Surface::Comparator {
-            return 0.0;
-        }
         let scale = window.scale_factor().max(1.0);
         let size = window.inner_size();
-        let (width, height) = (size.width as f64 / scale, size.height as f64 / scale);
-        if self.service_panel.is_some() {
-            service_panel_bounds(width, height, COMPARATOR_CHROME_HEIGHT).2
-        } else if self.side_panel.is_some() {
-            side_panel_bounds(width, height, COMPARATOR_CHROME_HEIGHT).2
-        } else {
-            0.0
-        }
+        open_panel_width_for(
+            self.surface,
+            self.service_panel.as_ref().map(|(service, _)| *service),
+            self.side_panel.is_some(),
+            size.width as f64 / scale,
+            size.height as f64 / scale,
+        )
     }
 
     /// O comparador encolhe para o lado do painel, como no Chrome. Antes o
@@ -8456,13 +8973,11 @@ impl App {
         let window = self.window.as_ref()?;
         let scale = window.scale_factor().max(1.0);
         let size = window.inner_size();
-        let top = if self.surface == Surface::Comparator {
-            COMPARATOR_CHROME_HEIGHT
-        } else {
-            0.0
-        };
-        let (x, y, width, height) =
-            side_panel_bounds(size.width as f64 / scale, size.height as f64 / scale, top);
+        let (x, y, width, height) = side_panel_bounds(
+            size.width as f64 / scale,
+            size.height as f64 / scale,
+            panel_top(self.surface),
+        );
         Some(wry::Rect {
             position: LogicalPosition::new(x, y).into(),
             size: LogicalSize::new(width, height).into(),
@@ -8512,6 +9027,7 @@ impl App {
             return;
         }
         self.panel_suggestion_query = None;
+        self.panel_notes_pending = false;
         debug_log(format_args!("side panel: fechado"));
         self.fit_comparator_to_panel();
         // Largar a WebView nao devolve o teclado a ninguem.
@@ -8532,6 +9048,100 @@ impl App {
         }
     }
 
+    /// Botao Notas (Zettelkasten): abre o painel do Ctrl+H ja na secao das
+    /// notas; com o painel aberto, o mesmo botao fecha-o.
+    ///
+    /// A pagina do painel acabou de nascer e ainda nao correu o script dela:
+    /// um `evaluate_script` agora corria no documento vazio e perdia-se. Por
+    /// isso a secao fica pendente e o `PanelMessage::Ready` (o "pronto" que a
+    /// pagina manda no fim do script) entrega-a com `PANEL_SHOW_NOTES_SCRIPT`.
+    /// Quem acrescentar a secao das notas define `window.neuraliaShowSection`
+    /// no `PANEL_HTML`; sem ela, o script nao faz nada.
+    fn open_notes(&mut self) {
+        if self.side_panel.is_some() {
+            self.close_side_panel();
+            return;
+        }
+        self.open_side_panel();
+        if self.side_panel.is_some() {
+            self.panel_notes_pending = true;
+        }
+    }
+
+    /// Clique no botao do Pomodoro (barra ou Home).
+    ///
+    /// ESQUELETO: o trabalho do Pomodoro liga isto a um
+    /// `neural_core::pomodoro::Pomodoro` guardado no `App` -- `start` quando
+    /// parado, `pause`/`resume` quando a correr --, agenda o tique com
+    /// `self.timers.after(..)` e pede `request_redraw` para a etiqueta de
+    /// `pomodoro_label` mudar. Ate la avisa, para o clique nao ser mudo.
+    fn pomodoro_click(&mut self) {
+        self.show_splash("Pomodoro: ainda não disponível nesta versão.".to_string(), 2);
+    }
+
+    /// Botao direito no Pomodoro: o menu de opcoes (duracoes, parar, saltar
+    /// a fase). ESQUELETO, como `pomodoro_click`; o `TrackPopupMenu` do
+    /// `pick_theme_from_menu` e o modelo a seguir.
+    fn pomodoro_menu(&mut self) {
+        self.show_splash(
+            "Opções do Pomodoro: ainda não disponíveis nesta versão.".to_string(),
+            2,
+        );
+    }
+
+    /// O tempo que falta no Pomodoro ("mm:ss") para ir ao lado do icone, ou
+    /// `None` para o botao so com o icone. ESQUELETO: o trabalho do Pomodoro
+    /// devolve aqui `remaining_label(now)` enquanto houver uma fase a correr.
+    fn pomodoro_label(&self) -> Option<String> {
+        None
+    }
+
+    /// A etiqueta ja no formato que a barra e a Home desenham e medem.
+    fn pomodoro_bar_label(&self) -> Option<BarLabel> {
+        self.pomodoro_label().as_deref().and_then(BarLabel::new)
+    }
+
+    fn run_tool_action(&mut self, action: ToolAction) {
+        // O clique pode abrir um painel por cima do botao: a dica nao fica.
+        hover_tooltip(std::ptr::null_mut(), "");
+        match action {
+            ToolAction::PomodoroClick => self.pomodoro_click(),
+            ToolAction::PomodoroMenu => self.pomodoro_menu(),
+            ToolAction::ToggleNotes => self.open_notes(),
+            ToolAction::ToggleBreath => self.open_service_panel(Service::Breath),
+        }
+    }
+
+    /// Botao direito no comparador: nas ferramentas vai para elas (so o
+    /// Pomodoro tem menu); no resto, o menu das abas de sempre.
+    fn right_click_comparator(&mut self) {
+        let hit = self.comparator_bar_hit();
+        if matches!(hit, Some(BarHit::Tool(_))) {
+            if let Some(action) = bar_tool_action(hit, ToolClick::Right) {
+                self.run_tool_action(action);
+            }
+            return;
+        }
+        self.context_menu_comparator();
+    }
+
+    fn right_click_home(&mut self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let size = window.inner_size();
+        if let HomeClick::Tool(tool) = home_click_target(
+            (size.width as f64, size.height as f64),
+            window.scale_factor(),
+            self.pomodoro_bar_label(),
+            self.cursor.0,
+            self.cursor.1,
+        ) && let Some(action) = tool_action(tool, ToolClick::Right)
+        {
+            self.run_tool_action(action);
+        }
+    }
+
     fn handle_panel_message(&mut self, message: PanelMessage) {
         match message {
             PanelMessage::Ready => {
@@ -8548,6 +9158,10 @@ impl App {
                 {
                     self.panel_suggestion_query = Some(question.clone());
                     self.memory.query(question);
+                }
+                // Aberto pelo botao Notas: agora a pagina ja existe.
+                if std::mem::take(&mut self.panel_notes_pending) {
+                    self.panel_eval(PANEL_SHOW_NOTES_SCRIPT);
                 }
             }
             PanelMessage::Search(query) => self.memory.query(query),
@@ -9295,6 +9909,11 @@ impl App {
             Some(BarHit::Private) => self.open_private_panel(),
             Some(BarHit::Service(service)) => self.open_service_panel(service),
             Some(BarHit::GmailToggle) => self.toggle_gmail_notifications(),
+            Some(BarHit::Tool(_)) => {
+                if let Some(action) = bar_tool_action(hit, ToolClick::Left) {
+                    self.run_tool_action(action);
+                }
+            }
             Some(BarHit::SplitClose) => self.close_split(),
             Some(BarHit::SplitExpand) => self.toggle_split_fullscreen(),
             Some(BarHit::Home) => self.show_home(),
@@ -9335,19 +9954,29 @@ impl App {
             return;
         };
         let size = window.inner_size();
-        let layout = HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
         let (x, y) = self.cursor;
-
-        // Sem a barra do Windows, a faixa de cima arrasta a janela -- como a
-        // barra do comparador.
-        if home_drag_strip(y, window.scale_factor()) && !layout.go.contains(x, y) {
-            let _ = window.drag_window();
-            return;
-        }
-
-        if layout.go.contains(x, y) {
-            debug_log(format_args!("click_home: botao Ir"));
-            self.submit_current();
+        match home_click_target(
+            (size.width as f64, size.height as f64),
+            window.scale_factor(),
+            self.pomodoro_bar_label(),
+            x,
+            y,
+        ) {
+            HomeClick::Tool(tool) => {
+                if let Some(action) = tool_action(tool, ToolClick::Left) {
+                    self.run_tool_action(action);
+                }
+            }
+            // Sem a barra do Windows, a faixa de cima arrasta a janela -- como
+            // a barra do comparador.
+            HomeClick::Drag => {
+                let _ = window.drag_window();
+            }
+            HomeClick::Go => {
+                debug_log(format_args!("click_home: botao Ir"));
+                self.submit_current();
+            }
+            HomeClick::Nothing => {}
         }
     }
 }
@@ -10397,7 +11026,13 @@ impl ApplicationHandler<UserEvent> for App {
                 match self.surface {
                     Surface::Home => {
                         if let Some(window) = &self.window {
-                            draw_home(window, self.status.as_deref(), self.home_go_hover);
+                            draw_home(
+                                window,
+                                self.status.as_deref(),
+                                self.home_go_hover,
+                                self.home_tool_hover,
+                                self.pomodoro_bar_label(),
+                            );
                         }
                     }
                     Surface::Comparator => {
@@ -10410,6 +11045,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.bar_hover,
                                 self.bar_visible(),
                                 self.auto_scroll,
+                                self.pomodoro_bar_label(),
                             );
                         }
                     }
@@ -10464,6 +11100,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.update_bar_hover();
                 }
                 self.update_home_go_hover();
+                self.update_home_tool_hover();
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor = (-1.0, -1.0);
@@ -10471,6 +11108,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.update_bar_hover();
                 }
                 self.update_home_go_hover();
+                self.update_home_tool_hover();
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Focused(focused) => self.on_focus_changed(focused),
@@ -10491,7 +11129,11 @@ impl ApplicationHandler<UserEvent> for App {
                 state: ElementState::Pressed,
                 button: MouseButton::Right,
                 ..
-            } if self.surface == Surface::Comparator => self.context_menu_comparator(),
+            } => match self.surface {
+                Surface::Comparator => self.right_click_comparator(),
+                Surface::Home => self.right_click_home(),
+                _ => {}
+            },
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
                 if let Some(shortcut) = main_window_shortcut(&event.logical_key, self.modifiers) {
                     match shortcut {
@@ -11283,7 +11925,13 @@ unsafe fn draw_neural_tissue(
     }
 }
 
-fn draw_home(window: &Window, status: Option<&str>, go_hover: bool) {
+fn draw_home(
+    window: &Window,
+    status: Option<&str>,
+    go_hover: bool,
+    tool_hover: Option<Tool>,
+    pomodoro_label: Option<BarLabel>,
+) {
     let Ok(handle) = window.window_handle() else {
         return;
     };
@@ -11378,6 +12026,23 @@ fn draw_home(window: &Window, status: Option<&str>, go_hover: bool) {
             draw_button(target, layout.go, "Ir", true, scale, body_font, &theme);
         }
 
+        // Ferramentas no canto de cima, a esquerda dos botoes da janela.
+        let tools = home_tool_buttons(width, scale, pomodoro_label);
+        let labels = [pomodoro_label, None, None];
+        for ((rect, tool), label) in tools.iter().zip(Tool::ALL).zip(labels) {
+            draw_tool_button(
+                target,
+                *rect,
+                tool,
+                label.as_ref().map(BarLabel::as_str),
+                tool_hover == Some(tool),
+                scale,
+                small_font,
+                &theme,
+                theme.page_bg,
+            );
+        }
+
         if let Some(message) = status {
             SelectObject(target, small_font as _);
             SetTextColor(target, rgb3(theme.fg_muted));
@@ -11428,6 +12093,7 @@ fn draw_comparator_bar(
     hover: Option<BarHit>,
     visible: bool,
     auto_scroll: bool,
+    pomodoro_label: Option<BarLabel>,
 ) {
     let Ok(handle) = window.window_handle() else {
         return;
@@ -11476,7 +12142,7 @@ fn draw_comparator_bar(
             width,
             scale,
             &names,
-            bar_columns(comp),
+            bar_columns(comp, pomodoro_label),
             &comp.contexts,
             &comp.groups,
             comp.split.as_ref().map(|split| {
@@ -11803,7 +12469,28 @@ unsafe fn paint_comparator_bar_with_contexts(
     }
 
     // Os mesmos rectangulos que o hit-testing usa; ver `right_controls`.
-    let controls = right_controls(width as f64, scale, active_context.is_some());
+    let controls = right_controls(
+        width as f64,
+        scale,
+        active_context.is_some(),
+        columns.pomodoro_label,
+    );
+    // Ferramentas, num grupo a esquerda dos servicos. O Pomodoro leva o tempo
+    // ao lado do icone quando `right_controls` lhe deu largura para isso.
+    let labels = [columns.pomodoro_label, None, None];
+    for ((rect, tool), label) in controls.tools.iter().zip(Tool::ALL).zip(labels) {
+        draw_tool_button(
+            target,
+            *rect,
+            tool,
+            label.as_ref().map(BarLabel::as_str),
+            hover == Some(BarHit::Tool(tool)),
+            scale,
+            font,
+            theme,
+            theme.bar_bg,
+        );
+    }
     let gmail_tint = if GMAIL_NOTIFICATIONS.load(Ordering::Acquire) {
         theme.fg
     } else {
@@ -11834,19 +12521,23 @@ unsafe fn paint_comparator_bar_with_contexts(
         (active_context, controls.split)
     {
         let source = names.get(source_index).copied().unwrap_or("IA");
-        draw_pill(
-            target,
-            label,
-            &if private_split {
-                format!("Privado · {source}")
-            } else {
-                format!("Fonte · {source}")
-            },
-            PillStyle::new(theme.surface, theme.surface_line, theme.fg_muted),
-            scale,
-            tab_font,
-            theme.bar_bg,
-        );
+        // Numa janela estreita o rotulo cede lugar (ver `right_controls_flex`)
+        // e pode nem existir: sem largura nao se escreve nada.
+        if label.width > 0.0 {
+            draw_pill(
+                target,
+                label,
+                &if private_split {
+                    format!("Privado · {source}")
+                } else {
+                    format!("Fonte · {source}")
+                },
+                PillStyle::new(theme.surface, theme.surface_line, theme.fg_muted),
+                scale,
+                tab_font,
+                theme.bar_bg,
+            );
+        }
         draw_button(
             target,
             expand,
@@ -12353,6 +13044,7 @@ mod tests {
                 minimized: [false; COMPARATOR_COLUMNS],
                 split_active: false,
                 panel_width: 0.0,
+                pomodoro_label: None,
             }
         }
 
@@ -12403,7 +13095,7 @@ mod tests {
             let columns = dragged([1.0; COMPARATOR_COLUMNS], 1, 1120.0);
             let layout =
                 BarLayout::with_contexts(1120.0, 1.0, true, columns, [0; COMPARATOR_COLUMNS]);
-            let private = right_controls(1120.0, 1.0, false).private;
+            let private = right_controls(1120.0, 1.0, false, None).private;
 
             for index in 0..COMPARATOR_COLUMNS {
                 let plus = layout.add_tabs[index];
@@ -12431,6 +13123,7 @@ mod tests {
                 minimized: [false, true, false],
                 split_active: false,
                 panel_width: 0.0,
+                pomodoro_label: None,
             };
             let layout =
                 BarLayout::with_contexts(1120.0, 1.0, true, columns, [0; COMPARATOR_COLUMNS]);
@@ -13211,7 +13904,7 @@ mod tests {
         // Sem fonte aberta ao lado, nao ha o par da fonte.
         assert_eq!(layout.back.width, 0.0);
         // Com a fonte aberta, o par dela fica a esquerda do rotulo.
-        let drawer = right_controls(1440.0, 1.0, true);
+        let drawer = right_controls(1440.0, 1.0, true, None);
         let ((back, forward), (label, _, _)) = (
             drawer.split_nav.expect("‹ › da fonte"),
             drawer.split.expect("gaveta"),
@@ -13281,7 +13974,7 @@ mod tests {
 
     #[test]
     fn service_icons_sit_left_of_private_without_overlap_and_hit_their_service() {
-        let controls = right_controls(1600.0, 1.0, false);
+        let controls = right_controls(1600.0, 1.0, false, None);
         let order = [
             BarHit::Service(Service::Meet),
             BarHit::Service(Service::WhatsApp),
@@ -13300,11 +13993,13 @@ mod tests {
             previous_right <= controls.private.x,
             "os icones ficam a esquerda do Privado"
         );
-        assert_eq!(controls.leftmost(), controls.services[0].x);
+        // As ferramentas vem antes dos servicos: sao elas o inicio do canto.
+        assert_eq!(controls.leftmost(), controls.tools[0].x);
+        assert!(controls.tools[2].x + controls.tools[2].width < controls.services[0].x);
         // O Privado passa a ser um botao redondo so com o icone.
         assert_eq!(controls.private.width, controls.private.height);
         // Com a gaveta aberta tudo continua a esquerda dela.
-        let drawer = right_controls(1600.0, 1.0, true);
+        let drawer = right_controls(1600.0, 1.0, true, None);
         let (label, _, _) = drawer.split.expect("gaveta");
         assert!(drawer.private.x + drawer.private.width <= label.x);
     }
@@ -16894,6 +17589,7 @@ __fire('keydown', { key: 'F8' });
             minimized: [false; COMPARATOR_COLUMNS],
             split_active: false,
             panel_width: 0.0,
+            pomodoro_label: None,
         };
         let layout = BarLayout::with_contexts(1600.0, 1.0, true, dragged, [0; 3]);
         let spans = visible_column_spans(1600.0, 3, &dragged.weights, &dragged.minimized);
@@ -16937,12 +17633,13 @@ __fire('keydown', { key: 'F8' });
             minimized: [false, true, false],
             split_active: false,
             panel_width: 0.0,
+            pomodoro_label: None,
         };
         let layout = BarLayout::with_contexts(1600.0, 1.0, true, state, [0; 3]);
         assert_eq!(layout.minimized, [false, true, false]);
 
         let chip = layout.columns[1];
-        let controls = right_controls(1600.0, 1.0, false);
+        let controls = right_controls(1600.0, 1.0, false, None);
         assert!(chip.width > 0.0);
         assert!(
             chip.x + chip.width <= controls.private.x,
@@ -16974,11 +17671,11 @@ __fire('keydown', { key: 'F8' });
     /// recua e tudo o que se encosta a direita recua com ele.
     #[test]
     fn right_controls_make_room_for_the_split_drawer() {
-        let plain = right_controls(1600.0, 1.0, false);
+        let plain = right_controls(1600.0, 1.0, false, None);
         assert!(plain.split.is_none());
         assert_eq!(plain.private.x + plain.private.width, 1600.0 - 8.0);
 
-        let drawer = right_controls(1600.0, 1.0, true);
+        let drawer = right_controls(1600.0, 1.0, true, None);
         let (label, expand, close) = drawer.split.expect("ha gaveta");
         assert_eq!(close.x + close.width, 1600.0 - 8.0);
         assert!(expand.x + expand.width < close.x);
@@ -17776,6 +18473,7 @@ __fire('keydown', { key: 'F8' });
                         minimized,
                         split_active,
                         panel_width: 0.0,
+                        pomodoro_label: None,
                     };
                     let layout =
                         BarLayout::with_contexts(client_width, scale, true, columns, [3, 3, 3]);
@@ -17794,7 +18492,7 @@ __fire('keydown', { key: 'F8' });
                         );
                     }
 
-                    let controls = right_controls(client_width, scale, split_active);
+                    let controls = right_controls(client_width, scale, split_active, None);
                     let (px, py) = center(controls.private);
                     assert_eq!(right_controls_hit(controls, px, py), Some(BarHit::Private));
                     assert_eq!(
@@ -17859,6 +18557,585 @@ __fire('keydown', { key: 'F8' });
             scenarios, 100,
             "o gate precisa exercitar exatamente cem combinacoes de tela/estado"
         );
+    }
+
+    // ===================== ferramentas: Pomodoro, Notas, Respiracao =====================
+
+    fn rects_overlap(a: UiRect, b: UiRect) -> bool {
+        a.width > 0.0
+            && a.height > 0.0
+            && b.width > 0.0
+            && b.height > 0.0
+            && a.x < b.x + b.width
+            && b.x < a.x + a.width
+            && a.y < b.y + b.height
+            && b.y < a.y + a.height
+    }
+
+    fn center_of(rect: UiRect) -> (f64, f64) {
+        (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
+    }
+
+    /// Todos os controlos da direita com area.
+    fn right_control_rects(controls: RightControls) -> Vec<UiRect> {
+        let mut rects = controls.tools.to_vec();
+        rects.extend(controls.services);
+        rects.push(controls.private);
+        if let Some((label, expand, close)) = controls.split {
+            rects.extend([label, expand, close]);
+        }
+        if let Some((back, forward)) = controls.split_nav {
+            rects.extend([back, forward]);
+        }
+        rects
+            .into_iter()
+            .filter(|rect| rect.width > 0.0 && rect.height > 0.0)
+            .collect()
+    }
+
+    /// Gate: em qualquer largura de 560 a 1600 px (logicos, pixel a pixel),
+    /// a quatro escalas, com e sem gaveta, com colunas minimizadas e com e
+    /// sem o tempo do Pomodoro ao lado do icone, nenhum controlo da direita
+    /// pisa outro, nem o Home, nem as pilulas, os "+" e os ‹ › das colunas,
+    /// nem sai da janela. Da janela minima (700) para cima o tempo aparece
+    /// sempre: quem cede primeiro e o rotulo da gaveta.
+    #[test]
+    fn tool_buttons_never_overlap_the_bar_at_any_width() {
+        let label = BarLabel::new("24:59");
+        // Com a gaveta a barra reparte em partes iguais e nao ha chips (ver
+        // `bar_columns`), por isso a gaveta so aparece sem minimizadas.
+        let topologies = [
+            ([false, false, false], false),
+            ([true, false, false], false),
+            ([false, true, false], false),
+            ([false, false, true], false),
+            ([true, true, false], false),
+            ([false, false, false], true),
+        ];
+        let mut scenarios = 0usize;
+        for logical_width in 560..=1600 {
+            let logical_width = logical_width as f64;
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                let client_width = logical_width * scale;
+                for (minimized, split_active) in topologies {
+                    for pomodoro_label in [None, label] {
+                        scenarios += 1;
+                        let columns = BarColumns {
+                            count: COMPARATOR_COLUMNS,
+                            weights: [1.0; COMPARATOR_COLUMNS],
+                            minimized,
+                            split_active,
+                            panel_width: 0.0,
+                            pomodoro_label,
+                        };
+                        let layout =
+                            BarLayout::with_contexts(client_width, scale, true, columns, [2, 2, 2]);
+                        let controls =
+                            right_controls(client_width, scale, split_active, pomodoro_label);
+                        let at = format!(
+                            "{logical_width}px @{scale}x gaveta={split_active} min={minimized:?} etiqueta={}",
+                            pomodoro_label.is_some()
+                        );
+
+                        let rights = right_control_rects(controls);
+                        for (index, rect) in rights.iter().enumerate() {
+                            assert!(
+                                rect.x >= 0.0 && rect.x + rect.width <= client_width + 1e-6,
+                                "controlo fora da janela: {rect:?} em {at}"
+                            );
+                            for other in &rights[index + 1..] {
+                                assert!(
+                                    !rects_overlap(*rect, *other),
+                                    "{rect:?} pisa {other:?} em {at}"
+                                );
+                            }
+                        }
+
+                        let mut bar = vec![layout.home];
+                        for index in 0..COMPARATOR_COLUMNS {
+                            bar.push(layout.columns[index]);
+                            bar.push(layout.add_tabs[index]);
+                            bar.push(layout.column_back[index]);
+                            bar.push(layout.column_forward[index]);
+                        }
+                        for piece in bar {
+                            for rect in &rights {
+                                assert!(
+                                    !rects_overlap(piece, *rect),
+                                    "a barra ({piece:?}) pisa o controlo {rect:?} em {at}"
+                                );
+                            }
+                        }
+
+                        let [pomodoro, notes, breath] = controls.tools;
+                        assert_eq!(notes.width, notes.height, "{at}");
+                        assert_eq!(breath.width, breath.height, "{at}");
+                        if pomodoro_label.is_none() {
+                            assert_eq!(pomodoro.width, pomodoro.height, "{at}");
+                        } else if logical_width >= 700.0 {
+                            assert!(
+                                pomodoro.width > pomodoro.height + 30.0 * scale,
+                                "o tempo do Pomodoro sumiu em {at}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(scenarios, 1041 * 4 * 6 * 2);
+    }
+
+    /// Gate: o centro de cada ferramenta -- e o fim da etiqueta do Pomodoro --
+    /// da a ferramenta certa, na barra (pelo mesmo `bar_hit_at` do clique e da
+    /// dica) e na Home (pelo mesmo `home_click_target` do clique), sem a
+    /// faixa de arrastar da Home as engolir e sem tocar nos botoes da janela.
+    #[test]
+    fn each_tool_button_hits_its_tool_in_the_bar_and_on_home() {
+        for pomodoro_label in [None, BarLabel::new("07:30")] {
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                for logical_width in [700.0, 1120.0, 1600.0] {
+                    let client_width = logical_width * scale;
+                    for split_active in [false, true] {
+                        let columns = BarColumns {
+                            split_active,
+                            pomodoro_label,
+                            ..BarColumns::even(COMPARATOR_COLUMNS)
+                        };
+                        let layout =
+                            BarLayout::with_contexts(client_width, scale, true, columns, [3, 3, 3]);
+                        let controls =
+                            right_controls(client_width, scale, split_active, pomodoro_label);
+                        for (rect, tool) in controls.tools.iter().zip(Tool::ALL) {
+                            let (x, y) = center_of(*rect);
+                            assert_eq!(
+                                bar_hit_at(Some(controls), Some(layout), x, y),
+                                Some(BarHit::Tool(tool)),
+                                "{tool:?} em {logical_width}px @{scale}x"
+                            );
+                            assert_eq!(layout.hit(x, y), None, "a barra rouba {tool:?}");
+                        }
+                        let pomodoro = controls.tools[0];
+                        let label_end = pomodoro.x + pomodoro.width - 4.0 * scale;
+                        assert_eq!(
+                            right_controls_hit(
+                                controls,
+                                label_end,
+                                pomodoro.y + pomodoro.height / 2.0
+                            ),
+                            Some(BarHit::Tool(Tool::Pomodoro))
+                        );
+                    }
+
+                    // Home: mesmas ferramentas, na faixa de cima.
+                    let height = 800.0 * scale;
+                    let caption = BarLayout::new(client_width, scale, true, COMPARATOR_COLUMNS);
+                    let tools = home_tool_buttons(client_width, scale, pomodoro_label);
+                    for (index, (rect, tool)) in tools.iter().zip(Tool::ALL).enumerate() {
+                        let (x, y) = center_of(*rect);
+                        assert_eq!(
+                            home_click_target((client_width, height), scale, pomodoro_label, x, y),
+                            HomeClick::Tool(tool),
+                            "Home: {tool:?} em {logical_width}px @{scale}x"
+                        );
+                        assert!(
+                            rect.y >= 0.0 && rect.y + rect.height <= TITLE_TAB_HEIGHT * scale,
+                            "fora da faixa de cima"
+                        );
+                        assert!(
+                            rect.x + rect.width <= caption.window_minimize.x,
+                            "{tool:?} pisa os botoes da janela"
+                        );
+                        for other in &tools[index + 1..] {
+                            assert!(!rects_overlap(*rect, *other));
+                        }
+                    }
+                    // A faixa fora dos botoes continua a arrastar; o "Ir" continua
+                    // a ser o "Ir"; o fundo da pagina nao e nada.
+                    let strip_y = TITLE_TAB_HEIGHT * scale / 2.0;
+                    assert_eq!(
+                        home_click_target(
+                            (client_width, height),
+                            scale,
+                            pomodoro_label,
+                            tools[0].x - 20.0 * scale,
+                            strip_y
+                        ),
+                        HomeClick::Drag
+                    );
+                    let go = HomeLayout::new(client_width, height, scale).go;
+                    let (gx, gy) = center_of(go);
+                    assert_eq!(
+                        home_click_target((client_width, height), scale, pomodoro_label, gx, gy),
+                        HomeClick::Go
+                    );
+                    assert_eq!(
+                        home_click_target(
+                            (client_width, height),
+                            scale,
+                            pomodoro_label,
+                            client_width / 2.0,
+                            height - 10.0
+                        ),
+                        HomeClick::Nothing
+                    );
+                }
+            }
+        }
+    }
+
+    /// Gate: a dica de cada ferramenta e a frase que o dono aprovou, pelo
+    /// mesmo `bar_tooltip_label` que a barra mostra.
+    #[test]
+    fn tool_hints_say_what_the_click_does() {
+        let expected = [
+            (
+                Tool::Pomodoro,
+                "Pomodoro: foco e pausas (clique inicia/pausa; botão direito: opções)",
+            ),
+            (
+                Tool::Notes,
+                "Notas (Zettelkasten) — Ctrl+Shift+Z cria nota da seleção",
+            ),
+            (
+                Tool::Breath,
+                "Respiração guiada — método Wim Hof (vídeo em modo anônimo)",
+            ),
+        ];
+        for (tool, text) in expected {
+            assert_eq!(
+                bar_tooltip_label(BarHit::Tool(tool), "IA", false, None, None).as_deref(),
+                Some(text)
+            );
+        }
+    }
+
+    /// Gate: o painel da respiracao e o video que o dono escolheu, em
+    /// InPrivate, sem camera, microfone nem nada que peca permissao, e preso
+    /// ao YouTube. Os servicos de conta continuam como estavam.
+    #[test]
+    fn breath_panel_is_private_denies_media_and_stays_on_youtube() {
+        assert_eq!(
+            Service::Breath.url(),
+            "https://www.youtube.com/watch?v=UJBknAsxfrA"
+        );
+        assert!(Service::Breath.private());
+        for service in [
+            Service::Meet,
+            Service::WhatsApp,
+            Service::YouTube,
+            Service::Gmail,
+        ] {
+            assert!(!service.private(), "{service:?} precisa da conta");
+        }
+
+        for kind in [
+            PermissionKind::Microphone,
+            PermissionKind::Camera,
+            PermissionKind::DisplayCapture,
+            PermissionKind::Geolocation,
+            PermissionKind::Notifications,
+            PermissionKind::ClipboardRead,
+            PermissionKind::FileSystemAccess,
+            PermissionKind::Other,
+        ] {
+            assert_eq!(
+                service_panel_permission(Service::Breath, kind),
+                PermissionResponse::Deny,
+                "{kind:?}"
+            );
+        }
+        // O Meet continua a perguntar pelo aviso do WebView2.
+        for kind in [PermissionKind::Microphone, PermissionKind::Camera] {
+            assert_eq!(
+                service_panel_permission(Service::Meet, kind),
+                PermissionResponse::Default
+            );
+        }
+
+        for target in [
+            BREATH_VIDEO_URL,
+            "https://youtu.be/UJBknAsxfrA",
+            "https://m.youtube.com/watch?v=UJBknAsxfrA",
+            "https://consent.youtube.com/m?continue=x",
+            "https://consent.google.com/ml?continue=x",
+            "about:blank",
+        ] {
+            assert!(service_panel_navigation(Service::Breath, target), "{target}");
+        }
+        for target in [
+            "http://www.youtube.com/watch?v=UJBknAsxfrA",
+            "https://youtube.com.evil.example/",
+            "https://evil.example/?u=https://www.youtube.com/",
+            "https://www.youtube.com@evil.example/",
+            "https://notyoutube.com/",
+            "https://accounts.google.com/ServiceLogin",
+            "https://www.google.com/",
+            "file:///C:/Windows/win.ini",
+            "javascript:alert(1)",
+            "neuralia-pdf://x",
+        ] {
+            assert!(
+                !service_panel_navigation(Service::Breath, target),
+                "{target}"
+            );
+        }
+        assert!(service_panel_navigation(
+            Service::Meet,
+            "https://www.google.com/"
+        ));
+    }
+
+    /// Gate (so de ausencia, como o §4.3 permite): o caminho que abre os
+    /// paineis de servico -- a Respiracao incluida -- nao grava historico nem
+    /// memoria e nao liga IPC nem scripts injetados. E so por isso que nada
+    /// do que la corre chega ao NeuralIA.
+    #[test]
+    fn service_panels_never_reach_history_or_memory() {
+        let source = include_str!("windows_app.rs");
+        let body = source
+            .split("fn open_service_panel(&mut self")
+            .nth(1)
+            .and_then(|part| part.split("fn close_service_panel").next())
+            .expect("corpo de open_service_panel");
+        for forbidden in [
+            "self.record(",
+            "history.append",
+            "memory.capture",
+            "save_session",
+            "with_ipc_handler",
+            "with_initialization_script",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "open_service_panel nao pode ter {forbidden}"
+            );
+        }
+    }
+
+    /// Gate: a tabela das ferramentas. O botao direito so abre o menu do
+    /// Pomodoro; em qualquer outro ponto da linha dos controlos, na barra ou
+    /// na Home, nao faz nada de ferramenta -- varrido pixel a pixel.
+    #[test]
+    fn tool_clicks_route_to_their_action() {
+        use ToolAction::*;
+        assert_eq!(
+            tool_action(Tool::Pomodoro, ToolClick::Left),
+            Some(PomodoroClick)
+        );
+        assert_eq!(
+            tool_action(Tool::Pomodoro, ToolClick::Right),
+            Some(PomodoroMenu)
+        );
+        assert_eq!(tool_action(Tool::Notes, ToolClick::Left), Some(ToggleNotes));
+        assert_eq!(
+            tool_action(Tool::Breath, ToolClick::Left),
+            Some(ToggleBreath)
+        );
+        assert_eq!(tool_action(Tool::Notes, ToolClick::Right), None);
+        assert_eq!(tool_action(Tool::Breath, ToolClick::Right), None);
+        assert_eq!(
+            bar_tool_action(Some(BarHit::Service(Service::Meet)), ToolClick::Right),
+            None
+        );
+        assert_eq!(bar_tool_action(Some(BarHit::Private), ToolClick::Left), None);
+        assert_eq!(bar_tool_action(None, ToolClick::Right), None);
+
+        for pomodoro_label in [None, BarLabel::new("25:00")] {
+            for scale in [1.0, 1.5] {
+                for split_active in [false, true] {
+                    let client_width = 1120.0 * scale;
+                    let columns = BarColumns {
+                        split_active,
+                        pomodoro_label,
+                        ..BarColumns::even(COMPARATOR_COLUMNS)
+                    };
+                    let layout =
+                        BarLayout::with_contexts(client_width, scale, true, columns, [3, 3, 3]);
+                    let controls =
+                        right_controls(client_width, scale, split_active, pomodoro_label);
+                    let pomodoro = controls.tools[0];
+                    let y = pomodoro.y + pomodoro.height / 2.0;
+                    let mut menus = 0usize;
+                    for step in 0..(client_width as usize) {
+                        let x = step as f64 + 0.5;
+                        let right = bar_tool_action(
+                            bar_hit_at(Some(controls), Some(layout), x, y),
+                            ToolClick::Right,
+                        );
+                        let expected = pomodoro.contains(x, y).then_some(PomodoroMenu);
+                        assert_eq!(right, expected, "botao direito em x={x}");
+                        menus += usize::from(right.is_some());
+                    }
+                    assert!(menus as f64 >= pomodoro.width - 1.0);
+
+                    let height = 800.0 * scale;
+                    let home = home_tool_buttons(client_width, scale, pomodoro_label)[0];
+                    let strip_y = home.y + home.height / 2.0;
+                    for step in 0..(client_width as usize) {
+                        let x = step as f64 + 0.5;
+                        let right = match home_click_target(
+                            (client_width, height),
+                            scale,
+                            pomodoro_label,
+                            x,
+                            strip_y,
+                        ) {
+                            HomeClick::Tool(tool) => tool_action(tool, ToolClick::Right),
+                            _ => None,
+                        };
+                        assert_eq!(right, home.contains(x, strip_y).then_some(PomodoroMenu));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Gate: aberto no comparador, o painel da respiracao tira-lhe a largura
+    /// como os outros, e as colunas acabam antes dele; na Home nao ha colunas
+    /// a empurrar.
+    #[test]
+    fn an_open_breath_panel_pushes_the_comparator() {
+        let (w, h) = (1440.0, 900.0);
+        let width = open_panel_width_for(Surface::Comparator, Some(Service::Breath), false, w, h);
+        assert!((width - 604.8).abs() < 1e-6, "{width}");
+        assert_eq!(
+            width,
+            open_panel_width_for(Surface::Comparator, Some(Service::WhatsApp), false, w, h)
+        );
+        assert_eq!(
+            open_panel_width_for(Surface::Home, Some(Service::Breath), false, w, h),
+            0.0
+        );
+        assert_eq!(
+            open_panel_width_for(Surface::Comparator, None, false, w, h),
+            0.0
+        );
+        let spans = visible_column_spans(
+            w - width,
+            COMPARATOR_COLUMNS,
+            &[1.0; COMPARATOR_COLUMNS],
+            &[false; COMPARATOR_COLUMNS],
+        );
+        let last = spans.last().expect("colunas");
+        assert!(last.x + last.width <= w - width + 1e-6);
+    }
+
+    /// Gate: na Home os paineis comecam debaixo da faixa de cima. Um painel
+    /// a partir do topo tapava os botoes da janela e as ferramentas -- o
+    /// proprio botao que fecha a Respiracao.
+    #[test]
+    fn panels_opened_from_home_leave_its_top_strip_clear() {
+        assert_eq!(panel_top(Surface::Comparator), COMPARATOR_CHROME_HEIGHT);
+        for scale in [1.0, 1.25, 2.0] {
+            for (w, h) in [(700.0, 500.0), (1280.0, 800.0), (1920.0, 1080.0)] {
+                let client_width = w * scale;
+                let caption = BarLayout::new(client_width, scale, true, COMPARATOR_COLUMNS);
+                let mut guarded =
+                    home_tool_buttons(client_width, scale, BarLabel::new("24:59")).to_vec();
+                guarded.extend([
+                    caption.window_minimize,
+                    caption.window_maximize,
+                    caption.window_close,
+                ]);
+                for (x, y, width, height) in [
+                    service_panel_bounds(w, h, panel_top(Surface::Home)),
+                    side_panel_bounds(w, h, panel_top(Surface::Home)),
+                ] {
+                    let panel = UiRect {
+                        x: x * scale,
+                        y: y * scale,
+                        width: width * scale,
+                        height: height * scale,
+                    };
+                    for rect in &guarded {
+                        assert!(
+                            !rects_overlap(panel, *rect),
+                            "o painel tapa {rect:?} na Home {w}x{h} @{scale}x"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Gate: cada ferramenta tem o seu PNG (e nao o do Privado, que e o que o
+    /// `_` do `extra_icon` devolve a um slot esquecido). O tomate e colorido;
+    /// as outras duas sao brancas para o tema as pintar.
+    #[test]
+    fn tool_icons_are_their_own_pngs() {
+        let incognito = extra_icon(ICON_SLOT_INCOGNITO);
+        let icons: Vec<&RgbaImage> = Tool::ALL
+            .iter()
+            .map(|tool| extra_icon(tool.icon_slot()))
+            .collect();
+        for (index, icon) in icons.iter().enumerate() {
+            assert_eq!(icon.dimensions(), (256, 256));
+            assert_ne!(
+                icon.as_raw(),
+                incognito.as_raw(),
+                "{:?}",
+                Tool::ALL[index]
+            );
+            for other in &icons[index + 1..] {
+                assert_ne!(icon.as_raw(), other.as_raw());
+            }
+        }
+        let red = icons[0]
+            .pixels()
+            .any(|pixel| pixel[3] > 200 && pixel[0] > 200 && pixel[1] < 90);
+        assert!(red, "o Pomodoro e um tomate vermelho");
+        for icon in &icons[1..] {
+            assert!(
+                icon.pixels()
+                    .filter(|pixel| pixel[3] > 0)
+                    .all(|pixel| pixel[0] == 255 && pixel[1] == 255 && pixel[2] == 255),
+                "marca branca, pintada com o tema"
+            );
+        }
+    }
+
+    /// Gate: o script que o botao Notas corre no painel -- o texto que
+    /// embarca --, numa pagina com e sem a secao das notas.
+    #[test]
+    fn notes_script_opens_the_notes_section_only_when_the_panel_has_it() {
+        let program = format!(
+            r#"
+const vm = require('node:vm');
+const script = {script};
+const calls = [];
+const withHook = {{ window: {{ neuraliaShowSection: (name) => {{ calls.push(name); return true; }} }} }};
+vm.runInNewContext(script, withHook);
+const quiet = vm.runInNewContext(script, {{ window: {{}} }});
+console.log(JSON.stringify({{ calls, quiet: quiet === undefined }}));
+"#,
+            script = serde_json::to_string(PANEL_SHOW_NOTES_SCRIPT).expect("json")
+        );
+        let output = run_node_program(&program);
+        assert_eq!(output.trim(), r#"{"calls":["notes"],"quiet":true}"#);
+    }
+
+    /// Gate: a etiqueta corta numa fronteira de caractere e mede por
+    /// caractere, para a largura nao mudar a cada segundo.
+    #[test]
+    fn bar_label_cuts_at_a_char_boundary_and_sizes_by_chars() {
+        assert!(BarLabel::new("").is_none());
+        assert!(BarLabel::new("   ").is_none());
+        let clock = BarLabel::new("24:59").expect("etiqueta");
+        assert_eq!(clock.as_str(), "24:59");
+        assert_eq!(
+            clock.width(),
+            BarLabel::new("11:11").expect("etiqueta").width()
+        );
+        assert_eq!(
+            clock.width(),
+            5.0 * BAR_LABEL_CHAR_WIDTH + BAR_LABEL_PADDING
+        );
+        // Dez "é" sao 20 bytes: cabem oito inteiros, nunca meio.
+        let long = BarLabel::new(&"é".repeat(10)).expect("etiqueta");
+        assert_eq!(long.as_str(), "é".repeat(8));
+        let mixed = BarLabel::new("⏸ 12:00 pausa longa").expect("etiqueta");
+        assert!(mixed.as_str().len() <= BAR_LABEL_MAX_BYTES);
+        assert!(mixed.as_str().starts_with("⏸ 12:00"));
     }
 }
 
@@ -18486,7 +19763,11 @@ const ICON_SLOT_WHATSAPP: usize = COMPARATOR_COLUMNS + 2;
 const ICON_SLOT_YOUTUBE: usize = COMPARATOR_COLUMNS + 3;
 const ICON_SLOT_MAIL: usize = COMPARATOR_COLUMNS + 4;
 const ICON_SLOT_INCOGNITO: usize = COMPARATOR_COLUMNS + 5;
-static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 5] = [const { OnceLock::new() }; 5];
+/// Ferramentas: Pomodoro, Notas e Respiracao.
+const ICON_SLOT_POMODORO: usize = COMPARATOR_COLUMNS + 6;
+const ICON_SLOT_NOTES: usize = COMPARATOR_COLUMNS + 7;
+const ICON_SLOT_BREATH: usize = COMPARATOR_COLUMNS + 8;
+static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 8] = [const { OnceLock::new() }; 8];
 
 static AI_ICON_IMAGES: [OnceLock<RgbaImage>; COMPARATOR_COLUMNS] =
     [OnceLock::new(), OnceLock::new(), OnceLock::new()];
@@ -18563,6 +19844,9 @@ fn extra_icon(slot: usize) -> &'static RgbaImage {
             ICON_SLOT_WHATSAPP => include_bytes!("../../../assets/ai/whatsapp.png"),
             ICON_SLOT_YOUTUBE => include_bytes!("../../../assets/ai/youtube.png"),
             ICON_SLOT_MAIL => include_bytes!("../../../assets/ai/mail.png"),
+            ICON_SLOT_POMODORO => include_bytes!("../../../assets/ai/pomodoro.png"),
+            ICON_SLOT_NOTES => include_bytes!("../../../assets/ai/notes.png"),
+            ICON_SLOT_BREATH => include_bytes!("../../../assets/ai/breath.png"),
             _ => include_bytes!("../../../assets/ai/incognito.png"),
         };
         image::load_from_memory(raw)
@@ -18669,6 +19953,13 @@ unsafe fn draw_pill(
     font: *mut core::ffi::c_void,
     background: Rgb,
 ) {
+    // Uma pilula que nao coube (a da coluna espremida pelos controlos da
+    // direita) tem largura zero. O `fill_pill` ja nao a pintava, mas o icone
+    // era desenhado na mesma, solto na barra -- e aparecia nas folgas entre
+    // os botoes das ferramentas.
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
     fill_pill(
         hdc,
         rect,
