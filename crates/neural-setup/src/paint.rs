@@ -113,6 +113,46 @@ pub unsafe fn text(hdc: HDC, value: &str, rect: Rect, color: Rgb, hfont: HFONT, 
     SelectObject(hdc, old);
 }
 
+/// Deslocamentos do contorno do texto: um disco de raio `radius` px sem o
+/// centro. Desenhar o texto na cor do fundo em cada um destes deslocamentos, e
+/// so depois na sua cor, da-lhe uma orla escura fina -- le-se por cima dos
+/// neuronios sem abrir uma zona escura a volta dele.
+pub fn halo_offsets(radius: i32) -> Vec<(i32, i32)> {
+    let mut offsets = Vec::new();
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            if (dx, dy) != (0, 0) && dx * dx + dy * dy <= radius * radius + radius {
+                offsets.push((dx, dy));
+            }
+        }
+    }
+    offsets
+}
+
+/// Texto desenhado diretamente por cima do tecido (titulo, versao, caminho,
+/// etapa, legenda): primeiro a orla na cor da pagina, depois o texto. Os
+/// botoes nao usam isto -- tem fundo proprio.
+pub unsafe fn text_on_tissue(
+    hdc: HDC,
+    value: &str,
+    rect: Rect,
+    color: Rgb,
+    hfont: HFONT,
+    format: u32,
+    scale: f64,
+) {
+    let radius = (2.0 * scale).round().max(1.0) as i32;
+    for (dx, dy) in halo_offsets(radius) {
+        let shifted = Rect {
+            x: rect.x + f64::from(dx),
+            y: rect.y + f64::from(dy),
+            ..rect
+        };
+        text(hdc, value, shifted, PAGE, hfont, format);
+    }
+    text(hdc, value, rect, color, hfont, format);
+}
+
 /// O fundo: neuronios, sinapses e impulsos. E o mesmo tecido do navegador,
 /// vindo do `neural-core`.
 pub unsafe fn tissue_background(hdc: HDC, layout: &Layout, seconds: f64) {
@@ -575,6 +615,34 @@ pub fn hovered(hover: Option<Hit>, what: Hit) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_over_the_tissue_gets_a_thin_ring_not_a_box() {
+        // Sem a zona de silencio, o texto le-se gracas a uma orla fina na cor
+        // da pagina: um anel a volta de cada letra, simetrico, que cobre as
+        // oito direcoes e nao passa do raio pedido.
+        assert!(halo_offsets(0).is_empty());
+        for radius in 1..=4 {
+            let ring = halo_offsets(radius);
+            assert!(!ring.contains(&(0, 0)), "o centro e o proprio texto");
+            for &(dx, dy) in &ring {
+                assert!(dx.abs() <= radius && dy.abs() <= radius);
+                assert!(ring.contains(&(-dx, -dy)), "orla torta em ({dx}, {dy})");
+            }
+            for direction in [
+                (1, 0),
+                (-1, 0),
+                (0, 1),
+                (0, -1),
+                (1, 1),
+                (-1, -1),
+                (1, -1),
+                (-1, 1),
+            ] {
+                assert!(ring.contains(&direction), "raio {radius} sem {direction:?}");
+            }
+        }
+    }
 
     #[test]
     fn the_brand_rect_matches_the_art_it_draws() {

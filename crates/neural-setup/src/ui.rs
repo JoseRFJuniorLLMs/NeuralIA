@@ -36,6 +36,8 @@ impl Rect {
         self.y + self.height
     }
 
+    /// So os testes o usam desde que a zona de silencio saiu do tecido.
+    #[cfg(test)]
     pub fn center_x(&self) -> f64 {
         self.x + self.width / 2.0
     }
@@ -88,22 +90,13 @@ impl TissueClock {
     }
 }
 
-/// A tela do tecido para esta janela.
-///
-/// A zona de silencio cobre a coluna inteira do texto, nao so a marca: uma
-/// sinapse a passar por cima do caminho de instalacao torna-o ilegivel, e o
-/// caminho e a unica coisa nesta janela que o utilizador precisa mesmo de
-/// conseguir ler.
+/// A tela do tecido para esta janela: a janela inteira, como na Home do
+/// navegador. A zona de silencio que aqui havia abria uma elipse escura a
+/// volta da marca e do texto -- o dono viu-a como um defeito ("tira esse
+/// fundo, deixa os neuronios passarem por tras da logo"). A legibilidade do
+/// texto vem agora do contorno de `paint::text_on_tissue`.
 pub fn tissue_field(layout: &Layout) -> neural_core::tissue::Field {
-    let top = layout.logo.y;
-    let bottom = layout.note.bottom();
     neural_core::tissue::Field::new(layout.client.width, layout.client.height, layout.scale)
-        .with_quiet_ellipse(
-            layout.client.center_x(),
-            (top + bottom) / 2.0,
-            layout.client.width * 0.42,
-            (bottom - top) / 2.0 + 10.0 * layout.scale,
-        )
 }
 
 /// O que esta debaixo do rato.
@@ -477,6 +470,31 @@ mod tests {
     /// O tecido tal como o instalador o desenha, no instante do relogio.
     fn frame(clock: TissueClock) -> neural_core::tissue::Tissue {
         neural_core::tissue::tissue_at(&tissue_field(&layout()), clock.seconds)
+    }
+
+    #[test]
+    fn the_neurons_pass_behind_the_brand_and_the_text() {
+        // O dono, com o print da 2.1.6: "tira esse fundo, deixa os neuronios
+        // passarem por tras da logo". Nao ha zona de silencio, e ao longo de
+        // alguns segundos ha neuronios por tras da marca e das linhas de texto.
+        let layout = layout();
+        let field = tissue_field(&layout);
+        assert!(
+            field.quiet.is_none(),
+            "voltou a zona de silencio: {:?}",
+            field.quiet
+        );
+        let (mut behind_logo, mut behind_text) = (false, false);
+        for step in 0..60 {
+            let tissue = neural_core::tissue::tissue_at(&field, f64::from(step) * 0.25);
+            behind_logo |= tissue.nodes.iter().any(|n| layout.logo.contains(n.x, n.y));
+            behind_text |= tissue
+                .nodes
+                .iter()
+                .any(|n| layout.title.contains(n.x, n.y) || layout.note.contains(n.x, n.y));
+        }
+        assert!(behind_logo, "nenhum neuronio passa por tras da logo");
+        assert!(behind_text, "nenhum neuronio passa por tras do texto");
     }
 
     #[test]

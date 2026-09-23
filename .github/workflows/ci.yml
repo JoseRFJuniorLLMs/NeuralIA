@@ -218,6 +218,41 @@ jobs:
               New = @'
               (captured)
           '@
+            },
+            @{
+              Label = "tab-save-stale-token"
+              Test = "the_app_path_saves_restores_and_forgets_the_real_tabs_json"
+              Old = @'
+                  (token == self.sync.token).then(|| self.save_now(contexts, groups, split))
+          '@
+              New = @'
+                  (token == self.sync.token.wrapping_add(1)).then(|| self.save_now(contexts, groups, split))
+          '@
+            },
+            @{
+              Label = "clear-history-keeps-tabs-json"
+              Test = "the_app_path_saves_restores_and_forgets_the_real_tabs_json"
+              Old = @'
+                  let result = self.store.forget();
+          '@
+              New = @'
+                  let result: std::io::Result<()> = Ok(());
+          '@
+            },
+            @{
+              Label = "menu-label-frozen-at-registration"
+              Test = "each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r"
+              Old = @'
+              move |native| ColumnMenuRequest {
+                  col_index,
+                  label: auto_scroll_menu_label(auto_scroll.get()),
+          '@
+              New = @'
+              let frozen = auto_scroll_menu_label(auto_scroll.get());
+              move |native| ColumnMenuRequest {
+                  col_index,
+                  label: frozen,
+          '@
             }
           )
 

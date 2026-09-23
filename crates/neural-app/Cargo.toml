@@ -30,6 +30,13 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 winit = "0.30"
 wry = { version = "0.57", features = ["devtools"] }
+# Os bindings COM do WebView2 que o wry 0.57 JA puxa, nas versoes exatas do
+# Cargo.lock: nomea-los aqui nao acrescenta crate nenhuma a arvore (gate
+# `webview2_bindings_add_no_crate_to_the_lock`). O wry nao expoe o evento
+# ContextMenuRequested (ICoreWebView2_11); sem estes nomes o item "rolagem
+# automatica" do botao direito das colunas nao se consegue registar.
+webview2-com = "0.39.1"
+windows-core = "0.62.2"
 
 [build-dependencies]
 winres = "0.1.12"

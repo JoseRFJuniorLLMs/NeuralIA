@@ -1620,12 +1620,14 @@ dependencies = [
 
 [[package]]
 name = "neural-app"
-version = "2.1.6"
+version = "2.1.7"
 dependencies = [
  "image",
  "neural-core",
  "serde_json",
  "url",
+ "webview2-com",
+ "windows-core",
  "windows-sys 0.61.2",
  "winit",
  "winres",
@@ -1634,7 +1636,7 @@ dependencies = [
 
 [[package]]
 name = "neural-core"
-version = "2.1.6"
+version = "2.1.7"
 dependencies = [
  "rusqlite",
  "scraper",
@@ -1648,7 +1650,7 @@ dependencies = [
 
 [[package]]
 name = "neural-setup"
-version = "2.1.6"
+version = "2.1.7"
 dependencies = [
  "image",
  "neural-core",
