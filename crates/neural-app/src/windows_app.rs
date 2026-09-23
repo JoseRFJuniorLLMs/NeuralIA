@@ -4285,8 +4285,8 @@ impl App {
                     || is_view_source_target(&target, nav_origin.as_deref())
             })
             .with_new_window_req_handler(move |target, _features| {
-                if remote_web_target(&target, local_origin.as_deref()) {
-                    let _ = new_window_proxy.send_event(UserEvent::OpenExternal(target));
+                if let Some(event) = external_new_window_event(target, local_origin.as_deref()) {
+                    let _ = new_window_proxy.send_event(event);
                 }
                 NewWindowResponse::Deny
             })
@@ -8923,6 +8923,15 @@ fn web_media_permission(kind: PermissionKind, user_visible: bool) -> PermissionR
     }
 }
 
+/// Pedido de janela nova vindo da pagina em Web completa. `window.open('',
+/// '_blank')` chega como `about:blank`: aceite pelo `remote_web_target` (para
+/// a navegacao), mas como destino de OpenExternal falha no validate_web_url e
+/// o erro destruia a pagina do utilizador e voltava ao Home.
+fn external_new_window_event(target: String, local_origin: Option<&str>) -> Option<UserEvent> {
+    (!target.eq_ignore_ascii_case("about:blank") && remote_web_target(&target, local_origin))
+        .then_some(UserEvent::OpenExternal(target))
+}
+
 fn remote_web_target(target: &str, local_origin: Option<&str>) -> bool {
     if target.eq_ignore_ascii_case("about:blank") {
         return true;
@@ -12978,6 +12987,21 @@ process.stdout.write(JSON.stringify(results));
                 SplitFallback::OpenSplit
             );
         }
+    }
+
+    #[test]
+    fn full_web_new_window_about_blank_does_not_replace_the_page() {
+        for blank in ["about:blank", "ABOUT:BLANK"] {
+            assert!(
+                external_new_window_event(blank.to_string(), None).is_none(),
+                "{blank} must be denied, not opened as OpenExternal"
+            );
+        }
+        assert!(matches!(
+            external_new_window_event("https://example.com/".to_string(), None),
+            Some(UserEvent::OpenExternal(url)) if url == "https://example.com/"
+        ));
+        assert!(external_new_window_event("http://192.168.0.1/".to_string(), None).is_none());
     }
 
     #[test]
