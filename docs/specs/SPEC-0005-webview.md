@@ -41,14 +41,15 @@ message transport through WebView2, but every accepted message is a bounded JSON
 envelope authenticated with a per-WebView capability. The native side exposes
 no filesystem API, credential API or arbitrary native-call object.
 
-The closed action set has 28 names: `home`, `back`, `restore`,
+The closed action set has 29 names: `home`, `back`, `restore`,
 `autoscroll`, `zoomin`, `zoomout`, `zoomreset`, `reload`, `print`,
 `omnibox`, `history`, `clearhistory`, `fullscreen`, `devtools`,
 `viewsource`, `newtab`, `expand`, `shortcut-expand`, `minimize`, `split`,
-`link`, `ask`, `split-close`, `split-expand`, `palette`, `gmail-state`,
-`research-answer` and `agent-observation`. Unknown actions, extra fields,
-wrong types, oversized messages and invalid per-action arguments are rejected.
-The parser gate `protocol_accepts_exactly_the_twenty_eight_published_actions`
+`link`, `ask`, `search`, `split-close`, `split-expand`, `palette`,
+`gmail-state`, `research-answer` and `agent-observation`. Unknown actions,
+extra fields, wrong types, oversized messages and invalid per-action arguments
+are rejected.
+The parser gate `protocol_accepts_exactly_the_twenty_nine_published_actions`
 (`crates/neural-app/src/ipc.rs`) reads this list and fails when it differs from
 the set the shipped parser accepts.
 
@@ -69,6 +70,26 @@ no control characters except newline and tab). The OTHER columns load the same
 question in their own provider; the emitting column is not touched. Gates:
 `ask_carries_the_typed_question_within_bounds` (`ipc.rs`) and
 `a_question_typed_in_one_column_goes_to_the_others` (`windows_app.rs`).
+
+`search` reports the "Pesquisar" button of the selection toolbar. The toolbar
+is part of the keyboard-shortcut script, so it exists in every WebView that
+receives that script: the comparator columns, the Split panel, external web,
+the Reader and the PDF viewer (top frame only). It appears after a trusted
+mouse or keyboard selection of 1..=5000 characters outside editable fields,
+lives in a closed shadow root and offers Pesquisar, Copiar (clipboard, no IPC)
+and Falar (local `speechSynthesis` voices, no IPC). `search` carries exactly
+`text` (1..=2000 characters after trimming, no control characters except
+newline and tab); a longer selection is not sent and the toolbar says so. The
+native side opens the normal three-AI comparison with the text as the
+question, directly: it never goes through the omnibox command parser, so a
+selected `agent:` or `tema:` is a question, not a command. A private Split has
+no Pesquisar button and its handler refuses `search`. Gates:
+`search_carries_the_selected_text_within_bounds` (`ipc.rs`),
+`the_selection_toolbar_offers_three_actions_for_a_trusted_selection`,
+`the_selection_toolbar_searches_only_what_fits_and_never_from_private`,
+`a_selected_search_reaches_the_comparator_from_every_surface_but_the_private_split`
+and `a_selected_search_is_a_question_never_an_omnibox_command`
+(`windows_app.rs`).
 
 Every accepted message MUST carry the per-WebView capability token. The token:
 

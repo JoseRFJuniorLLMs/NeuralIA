@@ -18,7 +18,7 @@ use image::RgbaImage;
 
 #[cfg(test)]
 use crate::ipc::constant_time_eq;
-use crate::ipc::{IpcAction, parse_ipc_message};
+use crate::ipc::{IpcAction, SEARCH_MAX_CHARS, parse_ipc_message};
 use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentRuntimeConfig,
     AgentSecurityAction, CoreConfig, FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent,
@@ -140,6 +140,9 @@ enum UserEvent {
         source_index: usize,
         text: String,
     },
+    /// "Pesquisar" da barra de selecao: o texto selecionado e uma pergunta
+    /// para as tres IAs (`App::compare`), nunca um comando da omnibox.
+    SearchSelection(String),
     AgentObservation(ObservedPage),
     SubmitText(String),
     OpenExternal(String),
@@ -5246,6 +5249,15 @@ impl App {
         self.open_external(url.as_str());
     }
 
+    /// "Pesquisar" da barra de selecao. Vai direto ao `compare`: o texto
+    /// selecionado numa pagina e uma pergunta, nunca um comando da omnibox
+    /// (ver `selection_search_question`).
+    fn search_selection(&mut self, text: &str) {
+        if let Some(question) = selection_search_question(text) {
+            self.compare(question);
+        }
+    }
+
     /// Destino normal de uma pergunta: a mesma consulta segue em simultaneo
     /// para o Google AI Mode, o ChatGPT e o Claude, lado a lado.
     fn compare(&mut self, query: String) {
@@ -5327,7 +5339,7 @@ impl App {
         let bytes = Arc::clone(&self.pdf_bytes);
         let capability = remote_capability();
         let ipc_capability = capability.clone();
-        let init_script = NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", &capability);
+        let init_script = bind_page_script(NEURALIA_KEYMAP_SCRIPT, &capability, false);
 
         themed_webview_builder()
             .with_custom_protocol("neuralia-pdf".to_string(), move |_id, request| {
@@ -5440,8 +5452,11 @@ impl App {
         let ipc_proxy = self.proxy.clone();
         let capability = remote_capability();
         let ipc_capability = capability.clone();
-        let init_script = format!("{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}")
-            .replace("__NEURALIA_CAP__", &capability);
+        let init_script = bind_page_script(
+            &format!("{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}"),
+            &capability,
+            false,
+        );
 
         themed_webview_builder()
             .with_initialization_script(init_script)
@@ -5507,9 +5522,11 @@ impl App {
         } else {
             ""
         };
-        let init_script =
-            format!("{NEURALIA_KEYMAP_SCRIPT}\n{EXTERNAL_RETURN_BUTTON}\n{agent_script}")
-                .replace("__NEURALIA_CAP__", &capability);
+        let init_script = bind_page_script(
+            &format!("{NEURALIA_KEYMAP_SCRIPT}\n{EXTERNAL_RETURN_BUTTON}\n{agent_script}"),
+            &capability,
+            false,
+        );
 
         themed_webview_builder()
             .with_initialization_script(init_script)
@@ -5519,13 +5536,7 @@ impl App {
                 else {
                     return;
                 };
-                let event = match action {
-                    IpcAction::AgentObservation { data } if agent_enabled => {
-                        parse_agent_observation(&data).map(UserEvent::AgentObservation)
-                    }
-                    other => common_ipc_event(other),
-                };
-                if let Some(event) = event {
+                if let Some(event) = external_ipc_event(action, agent_enabled) {
                     let _ = ipc_proxy.send_event(event);
                 }
             })
@@ -6364,7 +6375,7 @@ impl App {
         let prelude = format!(
             "window.__neuralia_col_index = {col_index}; window.__neuralia_col_name = '{col_name}';"
         );
-        let keymap = NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", &capability);
+        let keymap = bind_page_script(NEURALIA_KEYMAP_SCRIPT, &capability, false);
         let auto_submit = AI_AUTO_SUBMIT_SCRIPT.replace("__NEURALIA_CAP__", &capability);
         let inject = COMPARATOR_INJECT_SCRIPT.replace("__NEURALIA_CAP__", &capability);
 
@@ -6480,8 +6491,16 @@ impl App {
         self.request_redraw();
     }
 
-    fn split_ipc_event_impl(source_index: usize, action: IpcAction) -> Option<UserEvent> {
+    fn split_ipc_event_impl(
+        source_index: usize,
+        private: bool,
+        action: IpcAction,
+    ) -> Option<UserEvent> {
         match action {
+            // Defesa em profundidade: a barra de um painel privado nem mostra
+            // o "Pesquisar", e mesmo que uma mensagem chegasse o texto nao
+            // pode sair para o comparador (historico e memoria).
+            IpcAction::Search { .. } if private => None,
             IpcAction::SplitClose => Some(UserEvent::CloseSplit),
             IpcAction::SplitExpand | IpcAction::Fullscreen => {
                 Some(UserEvent::ToggleSplitFullscreen)
@@ -6513,10 +6532,7 @@ impl App {
         let new_window_proxy = self.proxy.clone();
         let capability = remote_capability();
         let ipc_capability = capability.clone();
-        let init_script = format!(
-            "window.__neuralia_col_index = {source_index}; window.__neuralia_col_name = '{source_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}"
-        )
-        .replace("__NEURALIA_CAP__", &capability);
+        let init_script = split_init_script(source_index, source_name, &capability, private);
 
         themed_webview_builder()
             .with_incognito(private)
@@ -6527,7 +6543,7 @@ impl App {
                 else {
                     return;
                 };
-                let event = Self::split_ipc_event_impl(source_index, action);
+                let event = Self::split_ipc_event_impl(source_index, private, action);
                 if let Some(event) = event {
                     let _ = ipc_proxy.send_event(event);
                 }
@@ -10219,6 +10235,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::AskEverywhere { source_index, text } => {
                 self.ask_other_columns(source_index, text)
             }
+            UserEvent::SearchSelection(text) => self.search_selection(&text),
             UserEvent::ResearchAnswer { source_index, text } => {
                 let provider = self
                     .comparator
@@ -10828,8 +10845,63 @@ fn common_ipc_event(action: IpcAction) -> Option<UserEvent> {
         IpcAction::DevTools => UserEvent::OpenDevTools,
         IpcAction::ViewSource => UserEvent::ViewSource,
         IpcAction::NewTab { col } => UserEvent::NewTab(col.unwrap_or(0)),
+        // Colunas, Split normal, Web externa, Reader e PDF. O Split privado
+        // recusa antes de chegar aqui (`split_ipc_event_impl`).
+        IpcAction::Search { text } => UserEvent::SearchSelection(text),
         _ => return None,
     })
+}
+
+/// O que um WebView de Web externa pode pedir. Fora do closure do builder
+/// para se poder exercitar sem janela.
+fn external_ipc_event(action: IpcAction, agent_enabled: bool) -> Option<UserEvent> {
+    match action {
+        IpcAction::AgentObservation { data } if agent_enabled => {
+            parse_agent_observation(&data).map(UserEvent::AgentObservation)
+        }
+        other => common_ipc_event(other),
+    }
+}
+
+/// A pergunta que o "Pesquisar" da barra de selecao leva ao comparador.
+///
+/// E o texto selecionado, aparado, e mais nada: nao passa pelo
+/// `route_input` nem pelo `parse_intent`. Quem seleciona "agent:https://x"
+/// ou "tema:escuro" numa pagina quer saber o que aquilo e, nao correr um
+/// agente nem mudar o tema -- e a pagina, que escolhe o texto, nunca pode
+/// dar ordens ao navegador por esta via.
+fn selection_search_question(text: &str) -> Option<String> {
+    let question = text.trim();
+    (!question.is_empty() && question.chars().count() <= SEARCH_MAX_CHARS)
+        .then(|| question.to_string())
+}
+
+/// O mapa de teclas (e a barra de selecao que vive nele) com a capability e
+/// o sinal de superficie privada postos. Um painel privado nao mostra o
+/// "Pesquisar": o texto dele nao pode ir parar ao historico nem a memoria.
+fn bind_page_script(script: &str, capability: &str, private: bool) -> String {
+    script
+        .replace("__NEURALIA_CAP__", capability)
+        .replace(
+            "__NEURALIA_PRIVATE__",
+            if private { "true" } else { "false" },
+        )
+}
+
+/// Scripts de inicializacao do painel Split, tal como o builder os injeta.
+fn split_init_script(
+    source_index: usize,
+    source_name: &str,
+    capability: &str,
+    private: bool,
+) -> String {
+    bind_page_script(
+        &format!(
+            "window.__neuralia_col_index = {source_index}; window.__neuralia_col_name = '{source_name}';\n{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}"
+        ),
+        capability,
+        private,
+    )
 }
 /// Para onde vai o que o utilizador escreveu na palette. Puro, para se poder
 /// testar sem janela: e aqui que se decide que um painel privado nunca
@@ -15708,10 +15780,10 @@ __fire('submit', at(login));
             Some(UserEvent::OpenPalette(1))
         ));
         assert!(matches!(
-            App::split_ipc_event_impl(1, IpcAction::Palette { col: 1 }),
+            App::split_ipc_event_impl(1, false, IpcAction::Palette { col: 1 }),
             Some(UserEvent::OpenPalette(1))
         ));
-        assert!(App::split_ipc_event_impl(1, IpcAction::Palette { col: 0 }).is_none());
+        assert!(App::split_ipc_event_impl(1, false, IpcAction::Palette { col: 0 }).is_none());
 
         let edit = source
             .split("fn palette_edit_subclass")
@@ -17646,19 +17718,19 @@ __fire('keydown', { key: 'F8' });
         assert!(App::column_ipc_event_impl(0, IpcAction::Expand { col: 1 }).is_none());
 
         assert!(matches!(
-            App::split_ipc_event_impl(2, IpcAction::Fullscreen),
+            App::split_ipc_event_impl(2, false, IpcAction::Fullscreen),
             Some(UserEvent::ToggleSplitFullscreen)
         ));
         assert!(matches!(
-            App::split_ipc_event_impl(2, IpcAction::Omnibox),
+            App::split_ipc_event_impl(2, false, IpcAction::Omnibox),
             Some(UserEvent::OpenPalette(2))
         ));
         assert!(matches!(
-            App::split_ipc_event_impl(2, IpcAction::Print),
+            App::split_ipc_event_impl(2, false, IpcAction::Print),
             Some(UserEvent::PrintTarget(PageTarget::Split))
         ));
         assert!(matches!(
-            App::split_ipc_event_impl(2, IpcAction::ShortcutExpand { col: 0 }),
+            App::split_ipc_event_impl(2, false, IpcAction::ShortcutExpand { col: 0 }),
             Some(UserEvent::ExpandComparator(0))
         ));
     }
@@ -18829,6 +18901,564 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     input.focus();
   }
 
+  // Barra de selecao (pedido do dono: "quando eu selecionar um texto, tem
+  // que aparecer a pergunta mandar para pesquisa ? ou copiar ? ou falar ?
+  // 3 botoes"). Vive neste script porque e o que todas as paginas recebem.
+  // Se faltar uma primitiva, a barra fica desligada e os atalhos seguem.
+  let selectionBar = null;
+  try { selectionBar = createSelectionBar(); } catch (err) { selectionBar = null; }
+
+  function createSelectionBar() {
+    // Capturas no document-created, antes de a pagina correr: trocar depois
+    // getSelection, Selection.prototype, Range.prototype ou EventTarget nao
+    // desliga a barra nem lhe muda o texto.
+    function uncurry(fn) {
+      if (typeof fn !== 'function') throw new TypeError('primitiva em falta');
+      return Function.prototype.call.bind(fn);
+    }
+    function getterOf(proto, name) {
+      const found = Object.getOwnPropertyDescriptor(proto, name);
+      return uncurry(found && found.get);
+    }
+    const listen = uncurry(EventTarget.prototype.addEventListener);
+    const later = setTimeout;
+    const cancelLater = clearTimeout;
+    const thenOf = uncurry(Promise.prototype.then);
+    const docSelection = uncurry(Document.prototype.getSelection);
+    const selText = uncurry(Selection.prototype.toString);
+    const selRange = uncurry(Selection.prototype.getRangeAt);
+    const selCount = getterOf(Selection.prototype, 'rangeCount');
+    const selCollapsed = getterOf(Selection.prototype, 'isCollapsed');
+    const selAnchor = getterOf(Selection.prototype, 'anchorNode');
+    const selFocus = getterOf(Selection.prototype, 'focusNode');
+    const rangeRects = uncurry(Range.prototype.getClientRects);
+    const rangeBox = uncurry(Range.prototype.getBoundingClientRect);
+    const rangeCommon = getterOf(Range.prototype, 'commonAncestorContainer');
+    const makeElement = uncurry(Document.prototype.createElement);
+    const appendTo = uncurry(Node.prototype.appendChild);
+    const holds = uncurry(Node.prototype.contains);
+    const closestOf = uncurry(Element.prototype.closest);
+    const shadowOf = uncurry(Element.prototype.attachShadow);
+    const boxOf = uncurry(Element.prototype.getBoundingClientRect);
+    const execCommand = typeof Document.prototype.execCommand === 'function'
+      ? uncurry(Document.prototype.execCommand) : null;
+    const clip = typeof navigator !== 'undefined' ? navigator.clipboard : null;
+    const writeText = clip && typeof Clipboard === 'function'
+      && typeof Clipboard.prototype.writeText === 'function'
+      ? uncurry(Clipboard.prototype.writeText) : null;
+    const navLang = typeof navigator !== 'undefined' ? String(navigator.language || '') : '';
+    const synth = window.speechSynthesis || null;
+    const Utterance = window.SpeechSynthesisUtterance || null;
+    const speakNow = synth && Utterance ? uncurry(synth.speak) : null;
+    const cancelSpeech = speakNow ? uncurry(synth.cancel) : null;
+    const listVoices = speakNow ? uncurry(synth.getVoices) : null;
+    const Sheet = typeof CSSStyleSheet === 'function' ? CSSStyleSheet : null;
+
+    // Painel privado: o texto nunca sai para o comparador (historico e
+    // memoria). O nativo tambem recusa o `search` destes WebViews.
+    const searchAllowed = '__NEURALIA_PRIVATE__' === 'false';
+    const SHOW_MAX = 5000;
+    const SEARCH_MAX = 2000;
+    const SHOW_DELAY_MS = 200;
+    const FEEDBACK_MS = 1000;
+    const VOICE_WAIT_MS = 1500;
+    const SPEECH_CHUNK = 200;
+    const SPEECH_ABBREVIATION = 5;
+    const MARGIN = 8;
+    const TOO_LONG = 'Seleção grande demais para pesquisar (máx. 2000 caracteres)';
+    const LABELS = {
+      search: '\u{1F50E} Pesquisar',
+      copy: '\u{1F4CB} Copiar',
+      copied: '✓ Copiado',
+      speak: '\u{1F50A} Falar',
+      stop: '⏹ Parar'
+    };
+    const CSS = [
+      '.bar{display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:4px;',
+      'border-radius:22px;background:#ffffff;color:#111314;',
+      'border:1px solid rgba(0,0,0,.14);box-shadow:0 8px 28px rgba(0,0,0,.22);',
+      'font:600 13px "Segoe UI",system-ui,sans-serif;max-width:420px;',
+      'user-select:none;-webkit-user-select:none;cursor:default}',
+      'button{all:unset;box-sizing:border-box;display:inline-flex;align-items:center;',
+      'gap:6px;min-height:34px;padding:0 14px;border-radius:999px;cursor:pointer;',
+      'color:inherit;font:inherit;white-space:nowrap}',
+      'button:hover{background:rgba(0,0,0,.08)}',
+      '.msg{display:none;flex-basis:100%;padding:6px 12px;font-weight:500;line-height:1.35}',
+      '.msg.on{display:block}',
+      '@media (prefers-color-scheme: dark){',
+      '.bar{background:#1c1f22;color:#f1f3f4;border-color:rgba(255,255,255,.16);',
+      'box-shadow:0 8px 28px rgba(0,0,0,.55)}',
+      'button:hover{background:rgba(255,255,255,.12)}}'
+    ].join('');
+
+    let host = null;
+    let bar = null;
+    let note = null;
+    const buttons = {};
+    let visible = false;
+    let text = '';
+    let showTimer = 0;
+    let feedbackTimer = 0;
+    let voiceTimer = 0;
+    let waitingVoices = null;
+    let voicesHooked = false;
+    let speaking = false;
+    let speechRun = 0;
+
+    function guard(fn) {
+      return function (event) {
+        try { fn(event); } catch (err) {}
+      };
+    }
+
+    function important(node, name, value) {
+      node.style.setProperty(name, value, 'important');
+    }
+
+    function elementOf(node) {
+      if (!node) return null;
+      return node.nodeType === 1 ? node : node.parentElement || null;
+    }
+
+    function editable(node) {
+      const el = elementOf(node);
+      if (!el) return false;
+      const tag = String(el.tagName || '').toUpperCase();
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+      if (el.isContentEditable) return true;
+      return !!closestOf(el,
+        'input,textarea,select,[contenteditable=""],[contenteditable="true"],[contenteditable="plaintext-only"]');
+    }
+
+    function focusedDeep() {
+      let el = document.activeElement;
+      while (el && el.shadowRoot && el.shadowRoot.activeElement) {
+        el = el.shadowRoot.activeElement;
+      }
+      return el;
+    }
+
+    function ours(node) {
+      return !!host && !!node && (node === host || holds(host, node));
+    }
+
+    function codePoints(value) {
+      let count = 0;
+      for (let i = 0; i < value.length; i++) {
+        const high = value.charCodeAt(i);
+        if (high >= 0xD800 && high <= 0xDBFF && i + 1 < value.length) {
+          const low = value.charCodeAt(i + 1);
+          if (low >= 0xDC00 && low <= 0xDFFF) i++;
+        }
+        count++;
+      }
+      return count;
+    }
+
+    // O texto que vai para a pesquisa: o que o parser nativo aceita (sem
+    // caracteres de controlo alem de \n e \t, UTF-16 bem formado).
+    function searchable(value) {
+      return String(value)
+        .replace(/\r\n?/g, '\n')
+        .replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, ' ')
+        .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '�')
+        .trim();
+    }
+
+    function endRect(range) {
+      const rects = rangeRects(range);
+      for (let i = rects.length - 1; i >= 0; i--) {
+        const r = rects[i];
+        if (r && (r.width > 0 || r.height > 0)) return r;
+      }
+      const whole = rangeBox(range);
+      return whole && (whole.width > 0 || whole.height > 0) ? whole : null;
+    }
+
+    // A selecao do utilizador, se for uma que a barra serve; null se nao.
+    function snapshot() {
+      const sel = docSelection(document);
+      if (!sel || selCount(sel) < 1 || selCollapsed(sel)) return null;
+      const raw = String(selText(sel));
+      const size = codePoints(raw.trim());
+      if (size < 1 || size > SHOW_MAX) return null;
+      const range = selRange(sel, 0);
+      const anchor = selAnchor(sel);
+      const focus = selFocus(sel);
+      if (ours(anchor) || ours(focus)) return null;
+      if (editable(anchor) || editable(focus) || editable(rangeCommon(range))
+          || editable(focusedDeep())) return null;
+      const rect = endRect(range);
+      return rect ? { text: raw, rect: rect } : null;
+    }
+
+    function selected() {
+      const sel = docSelection(document);
+      return !!sel && selCount(sel) > 0 && !selCollapsed(sel) ? sel : null;
+    }
+
+    function stillSelected() {
+      const sel = selected();
+      return !!sel && String(selText(sel)) === text;
+    }
+
+    function setLabel(name, label) {
+      if (buttons[name]) buttons[name].textContent = label;
+    }
+
+    function say(message) {
+      if (!note) return;
+      note.textContent = message;
+      note.className = message ? 'msg on' : 'msg';
+    }
+
+    function clearFeedback() {
+      if (feedbackTimer) { cancelLater(feedbackTimer); feedbackTimer = 0; }
+      setLabel('copy', LABELS.copy);
+    }
+
+    function clearVoiceWait() {
+      waitingVoices = null;
+      if (voiceTimer) { cancelLater(voiceTimer); voiceTimer = 0; }
+    }
+
+    function button(name, label, run) {
+      const b = makeElement(document, 'button');
+      b.setAttribute('type', 'button');
+      b.setAttribute('tabindex', '-1');
+      b.setAttribute('data-action', name);
+      b.textContent = label;
+      // mousedown sem efeito por omissao: o foco e a selecao ficam na pagina.
+      listen(b, 'mousedown', guard(function (e) { e.preventDefault(); }));
+      listen(b, 'click', guard(function (e) {
+        if (!e.isTrusted) { return; }
+        e.preventDefault();
+        e.stopPropagation();
+        run();
+      }));
+      buttons[name] = b;
+      appendTo(bar, b);
+    }
+
+    function build() {
+      if (host) {
+        if (!host.isConnected) appendTo(document.documentElement, host);
+        return;
+      }
+      host = makeElement(document, 'div');
+      important(host, 'all', 'initial');
+      important(host, 'position', 'fixed');
+      important(host, 'z-index', '2147483647');
+      important(host, 'display', 'none');
+      important(host, 'top', '0px');
+      important(host, 'left', '0px');
+      // Fechada: CSS e JS da pagina nao leem nem restilizam o que ha dentro.
+      const root = shadowOf(host, { mode: 'closed' });
+      // Folha construida primeiro: um CSP de style-src sem 'unsafe-inline'
+      // bloqueia um <style>, nao uma CSSStyleSheet adotada.
+      let styled = false;
+      if (Sheet) {
+        try {
+          const sheet = new Sheet();
+          sheet.replaceSync(CSS);
+          root.adoptedStyleSheets = [sheet];
+          styled = true;
+        } catch (err) { styled = false; }
+      }
+      if (!styled) {
+        const style = makeElement(document, 'style');
+        style.textContent = CSS;
+        appendTo(root, style);
+      }
+      bar = makeElement(document, 'div');
+      bar.className = 'bar';
+      bar.setAttribute('role', 'toolbar');
+      bar.setAttribute('aria-label', 'Texto selecionado');
+      appendTo(root, bar);
+      if (searchAllowed) button('search', LABELS.search, search);
+      button('copy', LABELS.copy, copy);
+      if (speakNow) button('speak', LABELS.speak, toggleSpeech);
+      note = makeElement(document, 'div');
+      note.className = 'msg';
+      note.setAttribute('role', 'status');
+      appendTo(bar, note);
+      appendTo(document.documentElement, host);
+    }
+
+    function place(rect) {
+      const vw = window.innerWidth || 0;
+      const vh = window.innerHeight || 0;
+      const box = boxOf(host);
+      const w = box && box.width > 0 ? box.width : 320;
+      const h = box && box.height > 0 ? box.height : 44;
+      let top = rect.top - h - MARGIN;
+      if (top < MARGIN) top = rect.bottom + MARGIN;
+      if (top + h > vh - MARGIN) top = vh - h - MARGIN;
+      if (top < MARGIN) top = MARGIN;
+      let left = rect.right - w / 2;
+      if (left + w > vw - MARGIN) left = vw - w - MARGIN;
+      if (left < MARGIN) left = MARGIN;
+      important(host, 'top', Math.round(top) + 'px');
+      important(host, 'left', Math.round(left) + 'px');
+    }
+
+    function show(snap) {
+      build();
+      text = snap.text;
+      clearFeedback();
+      say('');
+      important(host, 'visibility', 'hidden');
+      important(host, 'display', 'block');
+      place(snap.rect);
+      important(host, 'visibility', 'visible');
+      visible = true;
+    }
+
+    function hide(keepPending) {
+      if (!keepPending && showTimer) { cancelLater(showTimer); showTimer = 0; }
+      clearFeedback();
+      if (host) important(host, 'display', 'none');
+      visible = false;
+      text = '';
+    }
+
+    function check() {
+      showTimer = 0;
+      if (speaking) return;
+      const snap = snapshot();
+      if (snap) show(snap); else hide();
+    }
+
+    // Um clique sem selecao nao deixa relogio nenhum a correr.
+    function schedule() {
+      if (speaking) return;
+      if (!selected()) { hide(); return; }
+      if (showTimer) cancelLater(showTimer);
+      showTimer = later(guard(check), SHOW_DELAY_MS);
+    }
+
+    // Esc: fecha a barra (e cala a leitura) em vez de voltar atras. Sem
+    // barra a vista, o Esc segue para o 'back' de sempre.
+    function dismiss() {
+      const busy = visible || speaking;
+      stopSpeech();
+      hide();
+      return busy;
+    }
+
+    function search() {
+      const question = searchable(text);
+      if (!question) { hide(); return; }
+      if (codePoints(question) > SEARCH_MAX) { say(TOO_LONG); return; }
+      // Envelope montado so com strings: o serializador nunca ve um objeto
+      // em que a pagina possa pendurar um toJSON.
+      post('{"v":1,"cap":"' + capability + '","action":"search","args":{"text":'
+        + stringify(question) + '}}');
+      hide();
+    }
+
+    function copied(ok) {
+      if (!visible) return;
+      if (!ok) { say('Não foi possível copiar'); return; }
+      setLabel('copy', LABELS.copied);
+      if (feedbackTimer) cancelLater(feedbackTimer);
+      feedbackTimer = later(guard(function () {
+        feedbackTimer = 0;
+        setLabel('copy', LABELS.copy);
+      }), FEEDBACK_MS);
+    }
+
+    function copyByCommand() {
+      let ok = false;
+      try { ok = !!(execCommand && execCommand(document, 'copy')); } catch (err) { ok = false; }
+      copied(ok);
+    }
+
+    function copy() {
+      if (!writeText) { copyByCommand(); return; }
+      try {
+        thenOf(writeText(clip, text), guard(function () { copied(true); }), guard(copyByCommand));
+      } catch (err) {
+        copyByCommand();
+      }
+    }
+
+    function langTag(value) {
+      return String(value || '').replace(/_/g, '-').toLowerCase();
+    }
+
+    // Voz local (offline) na lingua da pagina; senao pt-BR; senao a do
+    // sistema; senao qualquer voz local. Nunca uma voz online por omissao.
+    function chooseVoice(voices) {
+      const local = [];
+      for (let i = 0; i < voices.length; i++) {
+        if (voices[i] && voices[i].localService !== false) local.push(voices[i]);
+      }
+      let pageLang = '';
+      try { pageLang = document.documentElement.lang; } catch (err) { pageLang = ''; }
+      const wanted = [pageLang, 'pt-BR', navLang];
+      for (let w = 0; w < wanted.length; w++) {
+        const tag = langTag(wanted[w]);
+        if (!tag) continue;
+        const base = tag.split('-')[0];
+        let loose = null;
+        for (let i = 0; i < local.length; i++) {
+          const have = langTag(local[i].lang);
+          if (have === tag) return local[i];
+          if (!loose && have.split('-')[0] === base) loose = local[i];
+        }
+        if (loose) return loose;
+      }
+      for (let i = 0; i < local.length; i++) {
+        if (local[i].default) return local[i];
+      }
+      return local.length ? local[0] : null;
+    }
+
+    // O Chromium corta falas longas: uma frase por fala. Uma abreviatura
+    // solta ("Sr.", "Fig.") cola-se a frase seguinte; uma frase enorme parte
+    // em palavras.
+    function sentences(value) {
+      const out = [];
+      let current = '';
+      const pieces = String(value).split(/\n+|(?<=[.!?…;:])\s+/);
+      for (let i = 0; i < pieces.length; i++) {
+        let piece = String(pieces[i] || '').replace(/\s+/g, ' ').trim();
+        while (piece.length > SPEECH_CHUNK) {
+          let cut = piece.lastIndexOf(' ', SPEECH_CHUNK);
+          if (cut < SPEECH_CHUNK / 2) cut = SPEECH_CHUNK;
+          if (current) { out.push(current); current = ''; }
+          out.push(piece.slice(0, cut).trim());
+          piece = piece.slice(cut).trim();
+        }
+        if (!piece) continue;
+        if (current && current.length <= SPEECH_ABBREVIATION && current.indexOf(' ') < 0
+            && current.length + 1 + piece.length <= SPEECH_CHUNK) {
+          current = current + ' ' + piece;
+        } else {
+          if (current) out.push(current);
+          current = piece;
+        }
+      }
+      if (current) out.push(current);
+      return out;
+    }
+
+    function withVoice(run, done) {
+      if (listVoices(synth).length) { done(chooseVoice(listVoices(synth))); return; }
+      // As vozes chegam depois ('voiceschanged'); a primeira lista vem vazia.
+      waitingVoices = function () {
+        if (run !== speechRun) return;
+        clearVoiceWait();
+        done(chooseVoice(listVoices(synth)));
+      };
+      if (!voicesHooked) {
+        voicesHooked = true;
+        listen(synth, 'voiceschanged', guard(function () {
+          if (waitingVoices) waitingVoices();
+        }));
+      }
+      voiceTimer = later(guard(function () {
+        voiceTimer = 0;
+        if (waitingVoices) waitingVoices();
+      }), VOICE_WAIT_MS);
+    }
+
+    function stopSpeech() {
+      speechRun++;
+      clearVoiceWait();
+      if (speaking) {
+        speaking = false;
+        try { cancelSpeech(synth); } catch (err) {}
+      }
+      setLabel('speak', LABELS.speak);
+    }
+
+    function spoken(run) {
+      if (run !== speechRun) return;
+      speaking = false;
+      setLabel('speak', LABELS.speak);
+      if (!stillSelected()) hide();
+    }
+
+    function toggleSpeech() {
+      if (speaking) { stopSpeech(); return; }
+      const parts = sentences(text);
+      if (!parts.length) return;
+      speechRun++;
+      const run = speechRun;
+      speaking = true;
+      setLabel('speak', LABELS.stop);
+      withVoice(run, function (voice) {
+        if (run !== speechRun) return;
+        if (!voice) {
+          speaking = false;
+          setLabel('speak', LABELS.speak);
+          say('Nenhuma voz local disponível');
+          return;
+        }
+        try { cancelSpeech(synth); } catch (err) {}
+        let next = 0;
+        function sayNext() {
+          if (run !== speechRun) return;
+          if (next >= parts.length) { spoken(run); return; }
+          const utterance = new Utterance(parts[next++]);
+          utterance.voice = voice;
+          utterance.lang = voice.lang;
+          listen(utterance, 'end', guard(sayNext));
+          listen(utterance, 'error', guard(function () { spoken(run); }));
+          speakNow(synth, utterance);
+        }
+        sayNext();
+      });
+    }
+
+    listen(window, 'mouseup', guard(function (e) {
+      if (!e.isTrusted || e.button !== 0 || ours(e.target)) return;
+      schedule();
+    }), true);
+
+    listen(window, 'keyup', guard(function (e) {
+      if (!e.isTrusted) return;
+      const key = String(e.key || '').toLowerCase();
+      if (e.shiftKey || key === 'shift' || key === 'control' || key === 'meta'
+          || key.indexOf('arrow') === 0 || key === 'home' || key === 'end'
+          || key === 'pageup' || key === 'pagedown'
+          || ((e.ctrlKey || e.metaKey) && key === 'a')) {
+        schedule();
+      }
+    }), true);
+
+    listen(window, 'mousedown', guard(function (e) {
+      if (ours(e.target)) { e.preventDefault(); return; }
+      if (!speaking) hide();
+    }), true);
+
+    // Duplo clique nos botoes nao chega a pagina (no comparador expandia a
+    // coluna).
+    listen(window, 'dblclick', guard(function (e) {
+      if (ours(e.target)) { e.stopImmediatePropagation(); }
+    }), true);
+
+    listen(document, 'selectionchange', guard(function () {
+      if (visible && !speaking && !stillSelected()) hide();
+    }));
+
+    const quietHide = guard(function () { if (!speaking) hide(true); });
+    listen(window, 'scroll', quietHide, true);
+    listen(window, 'resize', quietHide);
+    listen(window, 'popstate', quietHide);
+    listen(window, 'hashchange', quietHide);
+    listen(window, 'blur', guard(function () { if (!speaking) hide(); }));
+    listen(window, 'pagehide', guard(function () { stopSpeech(); hide(); }));
+
+    return {
+      dismiss: function () {
+        try { return dismiss(); } catch (err) { return false; }
+      }
+    };
+  }
+
   document.addEventListener('keydown', function (e) {
     if (!e.isTrusted) { return; }
     var mod = e.ctrlKey || e.metaKey;
@@ -18887,6 +19517,10 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     if (key === 'f12') { e.preventDefault(); act('devtools'); return; }
     if (key === 'f8') { e.preventDefault(); act('autoscroll'); return; }
     if (key === 'f11') { e.preventDefault(); act('fullscreen'); return; }
+    // Com a barra de selecao aberta (ou a ler), o Esc fecha-a e fica por ai.
+    if (key === 'escape' && selectionBar && selectionBar.dismiss()) {
+      e.preventDefault(); e.stopPropagation(); return;
+    }
     if (key === 'escape') { e.preventDefault(); e.stopPropagation(); act('back'); return; }
 
     var tag = (target.tagName || '').toUpperCase();
