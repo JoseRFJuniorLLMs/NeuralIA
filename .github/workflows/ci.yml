@@ -293,15 +293,43 @@ jobs:
   installer-smoke:
     needs: windows
     runs-on: windows-latest
-    timeout-minutes: 10
+    # The installer is neural-setup, compiled here around the CI-tested
+    # NeuralIA.exe: the first release build of the workspace dependencies
+    # dominates, each later installer build only recompiles neural-setup.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: neuralia-windows-tested-${{ github.sha }}
           path: ci-tested
+      - name: Prove the installer build refuses a version it would not register
+        shell: pwsh
+        run: |
+          # neural-setup writes the workspace version to Windows Apps. An
+          # installer named for any other version would lie about itself.
+          $refused = $false
+          try {
+            ./scripts/build-windows-installer.ps1 -ExePath ci-tested/NeuralIA.exe -Version 0.0.1 -OutputDir version-mismatch
+          }
+          catch {
+            if ($_.Exception.Message -match "does not match the workspace version") {
+              $refused = $true
+              Write-Host "Version gate: mismatched -Version was refused: $($_.Exception.Message)"
+            }
+            else {
+              throw
+            }
+          }
+          if (-not $refused) {
+            throw "Installer build accepted -Version 0.0.1, which differs from the workspace version."
+          }
+          if (Test-Path -LiteralPath version-mismatch/NeuralIA-Setup-0.0.1-x64.exe) {
+            throw "A refused build still produced an installer."
+          }
       - name: Build unsigned installer candidate
         shell: pwsh
         run: |
@@ -317,7 +345,8 @@ jobs:
           if (-not $installer) { throw "Installer candidate was not produced." }
           ./scripts/test-windows-installer.ps1 -InstallerPath $installer.FullName -ExpectedExePath ci-tested/NeuralIA.exe -ExpectedVersion $version
       - name: Exercise Authenticode path with an ephemeral CI certificate
-        timeout-minutes: 3
+        # Rebuilds neural-setup (only that crate) and runs the full smoke.
+        timeout-minutes: 8
         shell: pwsh
         run: |
           $line = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1

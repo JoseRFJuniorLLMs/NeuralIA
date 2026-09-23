@@ -4,11 +4,23 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+### Changed
+- **feat/animated-installer — o instalador publicado volta a ser o `neural-setup`:** o `NeuralIA-Setup-<versão>-x64.exe` da release é o instalador próprio, com a marca e o tecido neuronal animado da Home, compilado por `scripts/build-windows-installer.ps1` à volta dos bytes exatos do `NeuralIA.exe` medido pelo CI (cópia conferida por SHA-256, `cargo build --release --locked -p neural-setup`). O script recusa um `-Version` diferente da versão do workspace, que é a que o instalador regista. O Inno Setup (`installer/NeuralIA.iss`) saiu.
+- **feat/animated-installer — atualização por cima das 2.1.x:** sem `/D=`, o instalador reutiliza a pasta da instalação anterior (a sua entrada, senão a do Inno), substitui a NeuralIA e só depois de escrever a sua entrada apaga o `unins000.*` do Inno (reconhecido pelo `AppId` no cabeçalho do `unins000.dat`) e a chave `{8B2A98F4-7D55-4C43-ABF0-0D7D1A02C4B9}_is1`: "Aplicativos" passa a mostrar uma só NeuralIA, e o atalho do menu Iniciar abre a versão nova.
+- **feat/animated-installer — linha de comandos:** `/D=<pasta>` (último argumento, à NSIS, espaços incluídos) e códigos de saída do modo silencioso: 0 sucesso, 1 falha, 2 argumentos/pasta recusados, 3 `NeuralIA.exe` em uso, 4 instalador sem carga útil.
+
+### Fixed
+- **feat/animated-installer — NeuralIA aberta durante a instalação:** a carga útil passa a ser escrita tudo-ou-nada (nomes de passagem, troca com reversão); um `NeuralIA.exe` em uso trava a instalação antes de qualquer escrita — a janela pede para fechar a NeuralIA, o `/S` sai com 3. Antes, um executável a correr podia ser renomeado por baixo da aplicação aberta.
+- **feat/animated-installer — o desinstalador só remove a sua própria pasta:** corrido de uma cópia noutra pasta, apagava a instalação em `%LOCALAPPDATA%\Programs\NeuralIA`, o atalho e a entrada de "Aplicativos" da instalação boa. Agora apaga só a pasta onde vive, só atalhos que abram essa pasta e só uma entrada que aponte para ela; com a pasta temporária noutro disco, estaciona-se ao lado da pasta em vez de falhar com "feche a NeuralIA".
+- **feat/animated-installer — dados do utilizador:** uma pasta de instalação que seja, contenha ou fique dentro da pasta dos dados (`%LOCALAPPDATA%\NeuralIA` ou `NEURALIA_DATA_DIR`: histórico, memória, notas, chave do Gemini, perfil WebView2) é recusada, e tudo o que instalar, atualizar ou desinstalar apaga é conferido contra ela antes de começar.
+- **feat/animated-installer — tecido do instalador:** o relógio do tecido só anda com a janela visível; minimizada, deixa de redesenhar e retoma de onde estava.
+
 ### Security
 - **fix/audit-cidocs / SPEC-0005, SPEC-0108, SPEC-0015:** as specs publicavam 26 (ou 25) ações IPC e omitiam `link`, que o parser aceita desde 2.1.0 (`col`, `url`, `aside`; com `aside=false` navega as três colunas do comparador). A lista publicada passa a 27 ações e o gate `protocol_accepts_exactly_the_twenty_seven_published_actions` lê a SPEC-0005 e falha se ela divergir do conjunto que o parser aceita.
 
 ### Testing
 - **fix/audit-cidocs — prova de sabotagem da UI no CI:** o passo aplicava as seis regressões Rust de uma vez e só verificava se o nome de cada gate aparecia no log, o que acontece também quando o teste passa; cinco dos seis gates podiam estar mortos com o passo verde. Agora cada uma das oito sabotagens Rust é aplicada sozinha, corre só o seu gate e exige a linha `test ...::<gate> ... FAILED`; depois de restaurar, exige `... ok` para cada gate.
+- **feat/animated-installer — `installer-smoke` sobre o `neural-setup`:** `scripts/test-windows-installer.ps1` instala em silêncio com `/S /D=` numa pasta com espaço, confere o SHA-256 do `NeuralIA.exe` instalado contra o testado pelo CI, a entrada `...\Uninstall\NeuralIA` (nome, versão, pasta, comandos), o desinstalador e os atalhos, o código 3 com o executável aberto, o código 2 para a pasta dos dados e a desinstalação silenciosa; depois atualiza por cima de uma instalação Inno 2.1.x simulada e confere que os dados ficaram byte a byte iguais. Recusa correr onde a NeuralIA já está registada; `-Isolated` usa uma pasta de ensaio (`NEURALIA_SETUP_SANDBOX`). O job passa a instalar a toolchain fixada e prova também que um `-Version` diferente do workspace é recusado; o contrato de release exige o instalador à volta do binário testado.
 
 ## [2.1.5] - 2026-09-22
 

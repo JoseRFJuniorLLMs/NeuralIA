@@ -19,24 +19,46 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-function Resolve-InnoCompiler {
-    $command = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-    if ($command) {
-        return $command.Source
-    }
+# Builds the NeuralIA installer: neural-setup (crates/neural-setup), the
+# project's own installer with the brand and the animated neural tissue, with
+# the exact -ExePath bytes embedded as its payload. The Inno Setup script that
+# shipped 2.1.x is gone; neural-setup upgrades those installs in place.
 
-    $candidates = @(
-        (Join-Path ([Environment]::GetFolderPath("ProgramFilesX86")) "Inno Setup 6\ISCC.exe"),
-        (Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "Inno Setup 6\ISCC.exe")
-    )
+function Get-WorkspaceVersion {
+    param([Parameter(Mandatory = $true)][string]$RepoRoot)
 
-    foreach ($candidate in $candidates) {
-        if (Test-Path -LiteralPath $candidate) {
-            return (Resolve-Path -LiteralPath $candidate).Path
+    # The version neural-setup writes to Windows "Apps" is its
+    # CARGO_PKG_VERSION, i.e. [workspace.package] version.
+    $manifest = Join-Path $RepoRoot "Cargo.toml"
+    $section = ""
+    foreach ($line in [IO.File]::ReadAllLines($manifest)) {
+        if ($line -match '^\s*\[([^\]]+)\]\s*$') {
+            $section = $Matches[1].Trim()
+            continue
+        }
+        if ($section -eq "workspace.package" -and $line -match '^\s*version\s*=\s*"([^"]+)"') {
+            return $Matches[1]
         }
     }
+    throw "No [workspace.package] version found in $manifest."
+}
 
-    throw "Inno Setup compiler (ISCC.exe) was not found on this Windows host."
+function Get-CargoTargetDirectory {
+    param([Parameter(Mandatory = $true)][string]$RepoRoot)
+
+    # CARGO_TARGET_DIR may redirect the build output; ask cargo instead of
+    # assuming target/.
+    Push-Location $RepoRoot
+    try {
+        $metadata = & cargo metadata --format-version 1 --no-deps --locked
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo metadata failed with exit code $LASTEXITCODE."
+        }
+    }
+    finally {
+        Pop-Location
+    }
+    return ($metadata | Out-String | ConvertFrom-Json).target_directory
 }
 
 function Resolve-SignTool {
@@ -128,6 +150,7 @@ function Import-SigningCertificate {
     }
 }
 
+
 if ($AllowUntrustedTestCertificate -and -not $Sign) {
     throw "-AllowUntrustedTestCertificate is valid only together with -Sign."
 }
@@ -136,41 +159,72 @@ if ($AllowUntrustedTestCertificate -and -not $SkipTimestamp) {
 }
 
 $sourceExe = (Resolve-Path -LiteralPath $ExePath).Path
+if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) {
+    throw "-ExePath '$ExePath' is not a file."
+}
 if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
     throw "Version '$Version' is not a supported semantic version."
 }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$definition = Join-Path $repoRoot "installer\NeuralIA.iss"
-$icon = Join-Path $repoRoot "assets\logo.ico"
-if (-not (Test-Path -LiteralPath $definition)) {
-    throw "Installer definition not found: $definition"
-}
-if (-not (Test-Path -LiteralPath $icon)) {
-    throw "Installer icon not found: $icon"
+$workspaceVersion = Get-WorkspaceVersion -RepoRoot $repoRoot
+if ($Version -ne $workspaceVersion) {
+    throw "Version '$Version' does not match the workspace version '$workspaceVersion'. neural-setup registers the workspace version in Windows Apps, so an installer named $Version would report $workspaceVersion."
 }
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 $output = (Resolve-Path -LiteralPath $OutputDir).Path
-$iscc = Resolve-InnoCompiler
-
-$arguments = @(
-    "/Qp",
-    "/DAppVersion=$Version",
-    "/DSourceExe=$sourceExe",
-    "/DOutputDir=$output",
-    "/DIconPath=$icon",
-    $definition
-)
-& $iscc @arguments
-if ($LASTEXITCODE -ne 0) {
-    throw "Inno Setup failed with exit code $LASTEXITCODE."
-}
-
 $installer = Join-Path $output "NeuralIA-Setup-$Version-x64.exe"
-if (-not (Test-Path -LiteralPath $installer)) {
-    throw "Inno Setup completed but the expected installer was not produced: $installer"
+# A stale file with the final name must never pass for this build's output.
+Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+
+$targetDirectory = Get-CargoTargetDirectory -RepoRoot $repoRoot
+$builtSetup = Join-Path $targetDirectory "release\NeuralIA-Setup.exe"
+
+# The payload is staged in a fresh directory that holds exactly one file: the
+# -ExePath bytes, named NeuralIA.exe. NeuralIA.exe is self-contained (the
+# WebView2 loader is linked statically; PDF.js, Live and the Home art are
+# embedded), so nothing else is needed at runtime besides the system WebView2
+# runtime -- the same single file the Inno installer shipped.
+$payloadDir = Join-Path ([IO.Path]::GetTempPath()) ("neuralia-payload-" + [Guid]::NewGuid().ToString("N"))
+$previousPayloadDir = $env:NEURALIA_PAYLOAD_DIR
+New-Item -ItemType Directory -Force -Path $payloadDir | Out-Null
+try {
+    $stagedExe = Join-Path $payloadDir "NeuralIA.exe"
+    [IO.File]::Copy($sourceExe, $stagedExe, $true)
+    $sourceHash = (Get-FileHash -LiteralPath $sourceExe -Algorithm SHA256).Hash
+    $stagedHash = (Get-FileHash -LiteralPath $stagedExe -Algorithm SHA256).Hash
+    if ($stagedHash -ne $sourceHash) {
+        throw "Staged NeuralIA.exe ($stagedHash) differs from -ExePath ($sourceHash)."
+    }
+    Write-Host "Installer payload: NeuralIA.exe SHA256 $sourceHash"
+
+    # Deleting the previous output makes a silent no-op build impossible to
+    # mistake for a fresh one: cargo either writes it again or the check below
+    # fails.
+    Remove-Item -LiteralPath $builtSetup -Force -ErrorAction SilentlyContinue
+
+    $env:NEURALIA_PAYLOAD_DIR = $payloadDir
+    Push-Location $repoRoot
+    try {
+        & cargo build --release --locked -p neural-setup
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo build -p neural-setup failed with exit code $LASTEXITCODE."
+        }
+    }
+    finally {
+        Pop-Location
+    }
 }
+finally {
+    $env:NEURALIA_PAYLOAD_DIR = $previousPayloadDir
+    Remove-Item -LiteralPath $payloadDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+if (-not (Test-Path -LiteralPath $builtSetup -PathType Leaf)) {
+    throw "cargo completed but $builtSetup was not produced."
+}
+Copy-Item -LiteralPath $builtSetup -Destination $installer -Force
 
 if ($Sign) {
     $pfxBase64 = $env:NEURALIA_AUTHENTICODE_PFX_B64
