@@ -69,10 +69,10 @@ Uma string JSON, sempre com estes quatro campos e nenhum outro:
 - `action` — um nome da lista fechada de SPEC-0005 (`home`, `back`, `restore`,
   `autoscroll`, `zoomin`, `zoomout`, `zoomreset`, `reload`, `print`, `omnibox`,
   `history`, `clearhistory`, `fullscreen`, `devtools`, `viewsource`, `newtab`,
-  `expand`, `shortcut-expand`, `minimize`, `split`, `split-close`, `split-expand`, `palette`,
+  `expand`, `shortcut-expand`, `minimize`, `split`, `link`, `split-close`, `split-expand`, `palette`,
   `gmail-state`, `research-answer`, `agent-observation`). Nome fora da lista →
   ignorado.
-- `args` — objeto com os parâmetros exatos da ação (`col`, `url`, `count`,
+- `args` — objeto com os parâmetros exatos da ação (`col`, `url`, `aside`, `count`,
   `sender`, `subject`, `key`, `text`, `data`). Campos extras ou tipos errados
   são rejeitados; índices são validados contra `COMPARATOR_COLUMNS`; `url`
   passa por `validate_web_url` e rejeita alvos locais/privados/special óbvios
@@ -147,7 +147,8 @@ A SPEC-0108 só passa a "Implementada" quando, no CI:
 
 1. Teste unitário do parser de mensagens: rejeita corpo > 8 KiB, `v != 1`,
    `cap` ausente/errado/com comprimento diferente, `action` fora da lista,
-   `args` com tipos errados; aceita cada uma das 26 ações com `args` válidos.
+   `args` com tipos errados; aceita cada uma das 27 ações com `args` válidos e o conjunto aceite é
+   exatamente o publicado na SPEC-0005 (`protocol_accepts_exactly_the_twenty_seven_published_actions`).
 2. Teste: nenhuma constante de script injetado contém `location.href = 'neuralia:`
    nem `neuralia:` + `?cap=` — exceto no HTML do Reader (`render.rs`), que não
    pode conter `cap` de todo.

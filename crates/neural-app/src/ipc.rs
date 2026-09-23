@@ -568,9 +568,74 @@ mod tests {
         );
     }
 
+    /// SPEC-0005 publica a lista fechada de acoes pagina->nativo. O texto
+    /// publicado e lido tal como embarca no repositorio.
+    const SPEC_0005: &str = include_str!("../../../docs/specs/SPEC-0005-webview.md");
+
+    /// Nome de fio de cada variante. O `match` e exaustivo de proposito: uma
+    /// variante nova nao compila sem passar por aqui, e o teste abaixo exige
+    /// entao um exemplo aceite pelo parser e o nome na SPEC-0005.
+    fn wire_name(action: &IpcAction) -> &'static str {
+        match action {
+            IpcAction::Home => "home",
+            IpcAction::Back => "back",
+            IpcAction::Restore => "restore",
+            IpcAction::AutoScroll => "autoscroll",
+            IpcAction::ZoomIn => "zoomin",
+            IpcAction::ZoomOut => "zoomout",
+            IpcAction::ZoomReset => "zoomreset",
+            IpcAction::Reload => "reload",
+            IpcAction::Print => "print",
+            IpcAction::Omnibox => "omnibox",
+            IpcAction::History => "history",
+            IpcAction::ClearHistory => "clearhistory",
+            IpcAction::Fullscreen => "fullscreen",
+            IpcAction::DevTools => "devtools",
+            IpcAction::ViewSource => "viewsource",
+            IpcAction::NewTab { .. } => "newtab",
+            IpcAction::Expand { .. } => "expand",
+            IpcAction::ShortcutExpand { .. } => "shortcut-expand",
+            IpcAction::Minimize { .. } => "minimize",
+            IpcAction::Split { .. } => "split",
+            IpcAction::Link { .. } => "link",
+            IpcAction::SplitClose => "split-close",
+            IpcAction::SplitExpand => "split-expand",
+            IpcAction::Palette { .. } => "palette",
+            IpcAction::GmailState { .. } => "gmail-state",
+            IpcAction::ResearchAnswer { .. } => "research-answer",
+            IpcAction::AgentObservation { .. } => "agent-observation",
+        }
+    }
+
+    /// Le "The closed action set has N names: `a`, `b` ... Unknown actions"
+    /// da SPEC-0005 e devolve (N, nomes entre crases).
+    fn published_action_set() -> (usize, Vec<String>) {
+        let marker = "The closed action set has ";
+        let start = SPEC_0005
+            .find(marker)
+            .expect("SPEC-0005 publica a lista fechada")
+            + marker.len();
+        let rest = &SPEC_0005[start..];
+        let count: usize = rest
+            .split_whitespace()
+            .next()
+            .and_then(|word| word.parse().ok())
+            .expect("SPEC-0005 publica a contagem em algarismos");
+        let list = &rest[..rest
+            .find("Unknown actions")
+            .expect("fim da lista na SPEC-0005")];
+        let names = list
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        (count, names)
+    }
+
     #[test]
-    fn protocol_covers_twenty_six_real_actions() {
-        let messages = [
+    fn protocol_accepts_exactly_the_twenty_seven_published_actions() {
+        let examples = [
             message("home", json!({})),
             message("back", json!({})),
             message("restore", json!({})),
@@ -590,6 +655,10 @@ mod tests {
             message("expand", json!({"col":0})),
             message("minimize", json!({"col":0})),
             message("split", json!({"col":0,"url":"https://example.com"})),
+            message(
+                "link",
+                json!({"col":0,"url":"https://example.com/","aside":false}),
+            ),
             message("shortcut-expand", json!({"col":1})),
             message("split-close", json!({})),
             message("split-expand", json!({})),
@@ -607,11 +676,32 @@ mod tests {
                 json!({"data":"1\nhttps://example.com"}),
             ),
         ];
-        assert_eq!(messages.len(), 26);
-        assert!(
-            messages
-                .iter()
-                .all(|body| parse_ipc_message(body, CAP, 3).is_some())
+
+        // O que o parser que embarca aceita, pelo nome da variante devolvida.
+        let accepted: std::collections::BTreeSet<&str> = examples
+            .iter()
+            .map(|body| {
+                let action = parse_ipc_message(body, CAP, 3)
+                    .unwrap_or_else(|| panic!("o parser recusou um exemplo valido: {body}"));
+                let name = wire_name(&action);
+                let sent: Value = serde_json::from_str(body).expect("json");
+                assert_eq!(sent["action"], name, "a acao chegou como outra variante");
+                name
+            })
+            .collect();
+
+        let (published_count, published_names) = published_action_set();
+        let published: std::collections::BTreeSet<&str> =
+            published_names.iter().map(String::as_str).collect();
+        assert_eq!(
+            published_count,
+            published_names.len(),
+            "a contagem publicada na SPEC-0005 nao bate com a lista publicada"
         );
+        assert_eq!(
+            accepted, published,
+            "a SPEC-0005 publica um conjunto diferente do que o parser aceita"
+        );
+        assert_eq!(accepted.len(), 27);
     }
 }

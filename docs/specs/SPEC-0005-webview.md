@@ -41,13 +41,26 @@ message transport through WebView2, but every accepted message is a bounded JSON
 envelope authenticated with a per-WebView capability. The native side exposes
 no filesystem API, credential API or arbitrary native-call object.
 
-The closed action set has 26 names: `home`, `back`, `restore`,
+The closed action set has 27 names: `home`, `back`, `restore`,
 `autoscroll`, `zoomin`, `zoomout`, `zoomreset`, `reload`, `print`,
 `omnibox`, `history`, `clearhistory`, `fullscreen`, `devtools`,
 `viewsource`, `newtab`, `expand`, `shortcut-expand`, `minimize`, `split`,
-`split-close`, `split-expand`, `palette`, `gmail-state`,
+`link`, `split-close`, `split-expand`, `palette`, `gmail-state`,
 `research-answer` and `agent-observation`. Unknown actions, extra fields,
 wrong types, oversized messages and invalid per-action arguments are rejected.
+The parser gate `protocol_accepts_exactly_the_twenty_seven_published_actions`
+(`crates/neural-app/src/ipc.rs`) reads this list and fails when it differs from
+the set the shipped parser accepts.
+
+`link` reports a click on a link inside a comparator column. Its arguments are
+exactly `col`, `url` and `aside` (boolean); `url` goes through the same
+validation and local-network rejection as `split`. With `aside=true` the URL
+opens in the Split panel beside the emitting column. With `aside=false` it
+navigates all three comparator columns to that URL. It is the one action whose
+effect reaches columns other than the one that emitted it (gate:
+`a_plain_click_opens_in_all_three_panels_and_ctrl_click_opens_beside` in
+`crates/neural-app/src/windows_app.rs`; argument policy:
+`a_link_click_obeys_the_same_policy_as_the_split` in `ipc.rs`).
 
 Every accepted message MUST carry the per-WebView capability token. The token:
 

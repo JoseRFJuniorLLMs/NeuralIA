@@ -15,7 +15,7 @@
 | 0105 | `handle_agent_observation` → `decide_agent_step` | testes comportamentais sobre `decide_agent_step` | **caminho real** | decisão arquitetural sobre o destino do `neural-core::AgentRuntime` |
 | 0106 | composição de memória/pesquisa/timeline/IPC/agente | roadmap + wiring; não é um único runtime gate | **roadmap, não feature** | manter cada fase presa ao seu gate comportamental próprio |
 | 0107 | store SQLite/FTS5 derivado + tombstones/rebuild/retrieval | testes operacionais de Phase 1 + proveniência vendorizada | **Fase 1 parcial** | integração/UX/performance completas e critérios restantes |
-| 0108 | `neural-app/src/ipc.rs` + scripts/builders WebView2 | parser, 25 ações, capability, child-frame guard, navegação remota | **melhor gate do grupo** | revisão adversarial independente/release gate |
+| 0108 | `neural-app/src/ipc.rs` + scripts/builders WebView2 | parser, 27 ações, capability, child-frame guard, navegação remota | **melhor gate do grupo** | revisão adversarial independente/release gate |
 
 ## Achados que mudaram o desenho dos gates
 
