@@ -7,6 +7,9 @@ All notable changes to NeuralIA are documented here.
 ### Security
 - **fix/audit-cidocs / SPEC-0005, SPEC-0108, SPEC-0015:** as specs publicavam 26 (ou 25) ações IPC e omitiam `link`, que o parser aceita desde 2.1.0 (`col`, `url`, `aside`; com `aside=false` navega as três colunas do comparador). A lista publicada passa a 27 ações e o gate `protocol_accepts_exactly_the_twenty_seven_published_actions` lê a SPEC-0005 e falha se ela divergir do conjunto que o parser aceita.
 
+### Testing
+- **fix/audit-cidocs — prova de sabotagem da UI no CI:** o passo aplicava as seis regressões Rust de uma vez e só verificava se o nome de cada gate aparecia no log, o que acontece também quando o teste passa; cinco dos seis gates podiam estar mortos com o passo verde. Agora cada uma das oito sabotagens Rust é aplicada sozinha, corre só o seu gate e exige a linha `test ...::<gate> ... FAILED`; depois de restaurar, exige `... ok` para cada gate.
+
 ## [2.1.5] - 2026-09-22
 
 ### Fixed
@@ -29,7 +32,7 @@ All notable changes to NeuralIA are documented here.
 ### Testing
 - **PR #128:** gates de comportamento cobrem escopo de grupos, poda de grupos vazios, omnibox desabilitada fora da Home, fallback CSPRNG e política WebRTC.
 - **PR #133:** matriz determinística de 100 cenários cobre 5 larguras × 4 escalas de DPI × 5 topologias, além de gates de bordas de clique, alvo por foco, troca transacional de Split, press→release nativo, menu de grupos e duplo clique em elementos interativos.
-- **PR #133 — sabotagem automática:** o job Windows reintroduz temporariamente seis regressões Rust, as falhas de ordem de captura e limite vertical e uma regressão JS no checkout do runner, exige os gates vermelhos, restaura os bytes originais e repete os gates verdes antes de prosseguir.
+- **PR #133 — sabotagem automática:** o job Windows reintroduz temporariamente seis regressões Rust, as falhas de ordem de captura e limite vertical e uma regressão JS no checkout do runner, exige os gates vermelhos (até à correção em `[Unreleased]`, o passo só provava que pelo menos uma das seis regressões Rust ficava vermelha), restaura os bytes originais e repete os gates verdes antes de prosseguir.
 - **PR #133 — ciclo de vida:** a medição de cinco ciclos envia press→release ao botão Home nativo, como o produto exige, e verifica zero WebViews visíveis após cada retorno.
 - **PR #134 — medição WebView2:** a contagem de processos aguarda até quinze segundos quando ultrapassa o pico de aquecimento; um excesso que persiste continua a reprovar o gate de ciclo de vida.
 
