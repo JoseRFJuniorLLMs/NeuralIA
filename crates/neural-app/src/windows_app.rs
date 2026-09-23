@@ -68,7 +68,7 @@ use winit::{
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, NamedKey},
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
-    window::{Fullscreen, Icon, Window, WindowId},
+    window::{CursorIcon, Fullscreen, Icon, Window, WindowId},
 };
 use wry::{
     NewWindowResponse, PermissionKind, PermissionResponse, WebView, WebViewBuilder,
@@ -4397,6 +4397,8 @@ struct App {
     comparator: Option<ComparatorState>,
     omnibox: Option<HWND>,
     bar_hover: Option<BarHit>,
+    /// O rato esta em cima do "Ir" da Home: pinta-se em degradê.
+    home_go_hover: bool,
     exit_button: Option<HWND>,
     home_button: Option<HWND>,
     caption_buttons: Option<HWND>,
@@ -4502,6 +4504,7 @@ impl App {
             comparator: None,
             omnibox: None,
             bar_hover: None,
+            home_go_hover: false,
             exit_button: None,
             home_button: None,
             caption_buttons: None,
@@ -8222,6 +8225,31 @@ impl App {
             .and_then(|layout| layout.hit(self.cursor.0, self.cursor.1))
     }
 
+    /// "Ir" da Home sob o rato: degradê e mao, para se ver que esta vivo e
+    /// responde ao clique. Fora da Home volta tudo ao normal.
+    fn update_home_go_hover(&mut self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let size = window.inner_size();
+        let hovered = home_go_hovered(
+            self.surface,
+            (size.width as f64, size.height as f64),
+            window.scale_factor(),
+            self.cursor,
+        );
+        if hovered == self.home_go_hover {
+            return;
+        }
+        self.home_go_hover = hovered;
+        window.set_cursor(if hovered {
+            CursorIcon::Pointer
+        } else {
+            CursorIcon::Default
+        });
+        self.request_redraw();
+    }
+
     fn update_bar_hover(&mut self) {
         let next = self.comparator_bar_hit();
         if next != self.bar_hover {
@@ -10309,7 +10337,7 @@ impl ApplicationHandler<UserEvent> for App {
                 match self.surface {
                     Surface::Home => {
                         if let Some(window) = &self.window {
-                            draw_home(window, self.status.as_deref());
+                            draw_home(window, self.status.as_deref(), self.home_go_hover);
                         }
                     }
                     Surface::Comparator => {
@@ -10375,12 +10403,14 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.surface == Surface::Comparator && self.bar_visible() {
                     self.update_bar_hover();
                 }
+                self.update_home_go_hover();
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor = (-1.0, -1.0);
                 if self.surface == Surface::Comparator {
                     self.update_bar_hover();
                 }
+                self.update_home_go_hover();
             }
             WindowEvent::Focused(focused) => self.on_focus_changed(focused),
             WindowEvent::Occluded(occluded) => self.on_occluded_changed(occluded),
@@ -11178,7 +11208,7 @@ unsafe fn draw_neural_tissue(
     }
 }
 
-fn draw_home(window: &Window, status: Option<&str>) {
+fn draw_home(window: &Window, status: Option<&str>, go_hover: bool) {
     let Ok(handle) = window.window_handle() else {
         return;
     };
@@ -11260,7 +11290,18 @@ fn draw_home(window: &Window, status: Option<&str>) {
             Some((theme.surface_line, scale)),
             theme.page_bg,
         );
-        draw_button(target, layout.go, "Ir", true, scale, body_font, &theme);
+        if go_hover {
+            // Parado com NEURALIA_REDUCE_MOTION; senao o degradê desliza ao
+            // ritmo dos frames da Home.
+            let phase = if home_animation_enabled() {
+                (now_ms() % GO_GRADIENT_PERIOD_MS) as f32 / GO_GRADIENT_PERIOD_MS as f32
+            } else {
+                0.0
+            };
+            draw_go_gradient(target, layout.go, phase, body_font, &theme);
+        } else {
+            draw_button(target, layout.go, "Ir", true, scale, body_font, &theme);
+        }
 
         if let Some(message) = status {
             SelectObject(target, small_font as _);
@@ -13298,6 +13339,60 @@ mod tests {
             layout.columns[2].x,
             plain.columns[2].x
         );
+    }
+
+    #[test]
+    fn the_go_button_lights_up_only_under_the_mouse_on_home() {
+        let (size, scale) = ((1600.0, 900.0), 1.0);
+        let go = HomeLayout::new(size.0, size.1, scale).go;
+        let center = (go.x + go.width / 2.0, go.y + go.height / 2.0);
+        assert!(home_go_hovered(Surface::Home, size, scale, center));
+        assert!(!home_go_hovered(
+            Surface::Home,
+            size,
+            scale,
+            (go.x - 2.0, center.1)
+        ));
+        assert!(!home_go_hovered(Surface::Home, size, scale, (-1.0, -1.0)));
+        assert!(
+            !home_go_hovered(Surface::Comparator, size, scale, center),
+            "o Ir nao existe fora da Home"
+        );
+    }
+
+    #[test]
+    fn the_go_button_turns_into_a_sliding_gradient() {
+        let (from, to) = ((26, 115, 232), GO_GRADIENT_END);
+        // Fase 0: da cor de destaque (esquerda) ao violeta (direita).
+        assert_eq!(go_gradient_color(from, to, 0.0, 0.0), from);
+        assert_eq!(go_gradient_color(from, to, 1.0, 0.0), to);
+        // A fase desliza a onda: a ponta esquerda muda de cor com o tempo.
+        assert_ne!(go_gradient_color(from, to, 0.0, 0.25), from);
+        // Nos pixels da pilula: o corpo a esquerda e a direita difere mesmo.
+        let (width, height) = (84, 54);
+        let pixels = pill_pixels(
+            width,
+            height,
+            27.0,
+            &|t| go_gradient_color(from, to, t, 0.0),
+            None,
+            (255, 255, 255),
+        );
+        let at = |x: i32| {
+            let index = ((height / 2 * width + x) * 4) as usize;
+            (pixels[index + 2], pixels[index + 1], pixels[index])
+        };
+        let near = |a: Rgb, b: Rgb| {
+            (a.0 as i32 - b.0 as i32).abs() <= 24
+                && (a.1 as i32 - b.1 as i32).abs() <= 24
+                && (a.2 as i32 - b.2 as i32).abs() <= 24
+        };
+        assert!(near(at(2), from), "esquerda {:?}", at(2));
+        assert!(near(at(width - 3), to), "direita {:?}", at(width - 3));
+        // Solido continua solido: o refactor nao mexeu nos outros botoes.
+        let solid = pill_pixels(width, height, 27.0, &|_| from, None, (255, 255, 255));
+        let index = ((height / 2 * width + width / 2) * 4) as usize;
+        assert_eq!((solid[index + 2], solid[index + 1], solid[index]), from);
     }
 
     #[test]
@@ -17936,14 +18031,37 @@ unsafe fn fill_pill(
     if width <= 0 || height <= 0 {
         return;
     }
+    let pixels = pill_pixels(width, height, radius, &|_| fill, border, background);
+    blit_bgrx(
+        hdc,
+        &pixels,
+        rect.x.round() as i32,
+        rect.y.round() as i32,
+        width,
+        height,
+    );
+}
 
-    let (border_color, border_width) = border.unwrap_or((fill, 0.0));
-    let border_width = border_width as f32;
-    let radius = radius.min(rect.width.min(rect.height) / 2.0).max(0.0) as f32;
+/// Pixels BGRX de uma pilula com contorno suave. `fill_at(t)` da a cor do
+/// corpo na fraccao `t` da largura (0 a esquerda, 1 a direita): cor unica nos
+/// botoes normais, degradê no "Ir" sob o rato. Sem borda, o fio tem a cor do
+/// proprio corpo.
+fn pill_pixels(
+    width: i32,
+    height: i32,
+    radius: f64,
+    fill_at: &dyn Fn(f32) -> Rgb,
+    border: Option<(Rgb, f64)>,
+    background: Rgb,
+) -> Vec<u8> {
+    let border_width = border.map_or(0.0, |(_, width)| width) as f32;
+    let radius = radius.min(width.min(height) as f64 / 2.0).max(0.0) as f32;
 
-    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    let mut pixels = Vec::with_capacity((width.max(0) * height.max(0) * 4) as usize);
     for py in 0..height {
         for px in 0..width {
+            let fill = fill_at((px as f32 + 0.5) / width as f32);
+            let border_color = border.map_or(fill, |(color, _)| color);
             let distance = round_rect_sdf(
                 px as f32 + 0.5,
                 py as f32 + 0.5,
@@ -17966,7 +18084,52 @@ unsafe fn fill_pill(
             pixels.push(0);
         }
     }
+    pixels
+}
 
+/// Fim do degradê do "Ir" sob o rato; o inicio e a cor de destaque do tema.
+const GO_GRADIENT_END: Rgb = (124, 58, 237);
+/// Uma volta completa do degradê a deslizar.
+const GO_GRADIENT_PERIOD_MS: u64 = 2400;
+
+/// Cor do degradê do "Ir" na fraccao `t` da largura. A `phase` (0..1) faz a
+/// onda deslizar com o tempo: o botao "respira" enquanto o rato esta nele.
+fn go_gradient_color(from: Rgb, to: Rgb, t: f32, phase: f32) -> Rgb {
+    let wave = 0.5 - 0.5 * (std::f32::consts::TAU * (t * 0.5 + phase)).cos();
+    mix(from, to, wave)
+}
+
+/// O rato esta sobre o "Ir"? So na Home; noutras superficies o rect da Home
+/// nao existe e o botao nao se acende por baixo das colunas.
+fn home_go_hovered(surface: Surface, size: (f64, f64), scale: f64, cursor: (f64, f64)) -> bool {
+    surface == Surface::Home
+        && HomeLayout::new(size.0, size.1, scale)
+            .go
+            .contains(cursor.0, cursor.1)
+}
+
+/// O "Ir" em degradê, texto legivel sobre o meio do degradê.
+unsafe fn draw_go_gradient(
+    hdc: *mut core::ffi::c_void,
+    rect: UiRect,
+    phase: f32,
+    font: *mut core::ffi::c_void,
+    theme: &Theme,
+) {
+    let width = rect.width.round() as i32;
+    let height = rect.height.round() as i32;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let (from, to) = (theme.accent, GO_GRADIENT_END);
+    let pixels = pill_pixels(
+        width,
+        height,
+        rect.height / 2.0,
+        &|t| go_gradient_color(from, to, t, phase),
+        None,
+        theme.page_bg,
+    );
     blit_bgrx(
         hdc,
         &pixels,
@@ -17974,6 +18137,21 @@ unsafe fn fill_pill(
         rect.y.round() as i32,
         width,
         height,
+    );
+    SelectObject(hdc, font as _);
+    SetTextColor(hdc, rgb3(on_color(mix(from, to, 0.5))));
+    SetBkMode(hdc, TRANSPARENT as i32);
+    let mut text_rect = RECT {
+        left: rect.x.round() as i32,
+        top: rect.y as i32,
+        right: (rect.x + rect.width) as i32,
+        bottom: (rect.y + rect.height) as i32,
+    };
+    draw_text(
+        hdc,
+        "Ir",
+        &mut text_rect,
+        DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
     );
 }
 
