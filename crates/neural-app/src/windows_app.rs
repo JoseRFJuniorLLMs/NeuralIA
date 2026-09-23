@@ -5,6 +5,7 @@ use std::{
     cell::Cell,
     collections::BinaryHeap,
     ffi::OsString,
+    rc::Rc,
     sync::{
         Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
@@ -5659,7 +5660,10 @@ struct App {
     home_button: Option<HWND>,
     caption_buttons: Option<HWND>,
     splitters: [Option<HWND>; COMPARATOR_COLUMNS - 1],
-    auto_scroll: bool,
+    /// Partilhado com o menu do botao direito de cada coluna: o WebView2 monta
+    /// esse menu num callback fora do `&mut App`, e o rotulo tem de dizer o
+    /// estado de AGORA, mudado pelo Ctrl+R, pela pergunta ou pelo proprio menu.
+    auto_scroll: SharedFlag,
     auto_scroll_answered: bool,
     auto_scroll_token: u64,
     zoom: f64,
@@ -5772,7 +5776,7 @@ impl App {
             splitters: [None; COMPARATOR_COLUMNS - 1],
             // Ligada por omissao: a aplicacao serve para ler.
             // Nada rola sem o utilizador dizer que sim.
-            auto_scroll: false,
+            auto_scroll: SharedFlag::default(),
             auto_scroll_answered: false,
             auto_scroll_token: 0,
             zoom: 1.0,
@@ -7300,6 +7304,7 @@ impl App {
             match builder.build_as_child(window) {
                 Ok(wv) => {
                     let _ = wv.zoom(self.zoom);
+                    self.install_context_menu(&wv, WebViewHost::Column(i));
                     views.push(ComparatorView { webview: wv, name });
                 }
                 Err(error) => {
@@ -7841,6 +7846,24 @@ impl App {
             .with_focused(true)
     }
 
+    /// A unica porta para mexer no menu do botao direito de uma WebView: cada
+    /// uma que o comparador constroi passa aqui com o que e, e so as colunas
+    /// das IAs ganham o item de rolagem. Um runtime WebView2 sem o evento
+    /// ContextMenuRequested deixa a coluna com o menu nativo e fica no log.
+    fn install_context_menu(&self, webview: &WebView, host: WebViewHost) {
+        let missing = install_column_menu(host, |col_index| {
+            register_column_context_menu(
+                webview,
+                col_index,
+                self.auto_scroll.clone(),
+                self.proxy.clone(),
+            )
+        });
+        if let Some(line) = missing {
+            debug_log(format_args!("{line}"));
+        }
+    }
+
     /// O login abre-se com `window.open`, e ate aqui isso destruia as tres
     /// colunas para pôr um WebView unico no lugar delas -- perdia-se a
     /// comparacao e o ecra ficava com os pixeis das janelas mortas. O popup
@@ -8168,6 +8191,7 @@ impl App {
                 }
 
                 let _ = webview.zoom(self.zoom);
+                self.install_context_menu(&webview, WebViewHost::Split);
                 if let Some(comp) = &mut self.comparator {
                     let ComparatorState {
                         contexts,
@@ -8471,16 +8495,16 @@ impl App {
     fn toggle_auto_scroll(&mut self) {
         SPLASH_ASKS.store(false, Ordering::SeqCst);
         self.auto_scroll_answered = true;
-        self.auto_scroll = !self.auto_scroll;
+        let on = self.auto_scroll.toggle();
         self.auto_scroll_token = self.auto_scroll_token.wrapping_add(1);
 
-        if self.auto_scroll {
+        if on {
             self.schedule_auto_scroll();
         }
 
         // A mensagem e a do meio da janela, como as outras dicas: o aviso
         // dentro da pagina ficava no fundo e so aparecia nas colunas.
-        self.show_splash(auto_scroll_message(self.auto_scroll), 3);
+        self.show_splash(auto_scroll_message(on), 3);
         self.request_redraw();
     }
 
@@ -8594,7 +8618,7 @@ impl App {
         }
         if SPLASH_ASKS.swap(false, Ordering::SeqCst) {
             self.auto_scroll_answered = true;
-            self.auto_scroll = false;
+            self.auto_scroll.set(false);
         }
         if let Some(splash) = self.splash.take() {
             unsafe {
@@ -8852,7 +8876,7 @@ impl App {
             return;
         }
 
-        if self.auto_scroll {
+        if self.auto_scroll.get() {
             self.auto_scroll_token = self.auto_scroll_token.wrapping_add(1);
             self.schedule_auto_scroll();
             self.show_splash(auto_scroll_message(true), 4);
@@ -8872,7 +8896,7 @@ impl App {
     fn answer_auto_scroll(&mut self, yes: bool) {
         SPLASH_ASKS.store(false, Ordering::SeqCst);
         self.auto_scroll_answered = true;
-        self.auto_scroll = yes;
+        self.auto_scroll.set(yes);
         self.hide_splash(self.splash_token);
 
         if yes {
@@ -9082,7 +9106,7 @@ impl App {
     }
 
     fn auto_scroll_tick(&mut self, token: u64) {
-        if !self.auto_scroll || token != self.auto_scroll_token {
+        if !self.auto_scroll.get() || token != self.auto_scroll_token {
             return;
         }
         // O script avanca tudo o que e nosso ou HTML: nas tres colunas a tecla
@@ -9788,6 +9812,7 @@ impl App {
         match built {
             Ok(panel) => {
                 let _ = panel.focus();
+                self.install_context_menu(&panel, WebViewHost::Service);
                 debug_log(format_args!("service panel: {service:?}"));
                 self.service_panel = Some((service, panel));
                 self.fit_comparator_to_panel();
@@ -9957,6 +9982,7 @@ impl App {
         match built {
             Ok(panel) => {
                 let _ = panel.focus();
+                self.install_context_menu(&panel, WebViewHost::SidePanel);
                 self.side_panel = Some(panel);
                 self.fit_comparator_to_panel();
                 debug_log(format_args!(
@@ -10616,6 +10642,44 @@ impl App {
             .collect()
     }
 
+    /// Botao direito na pilula de uma IA: o mesmo item de rolagem que o menu
+    /// dentro da coluna oferece, para se descobrir tambem pela barra.
+    fn column_pill_menu(&mut self, col_index: usize) {
+        let Some(hwnd) = self.window.as_ref().and_then(window_hwnd) else {
+            return;
+        };
+        // A dica da pilula nao fica a flutuar por cima do menu.
+        hover_tooltip(std::ptr::null_mut(), "");
+        // Vive ate ao fim da funcao: o Win32 le o texto enquanto desenha.
+        let label = wide_null(auto_scroll_menu_label(self.auto_scroll.get()));
+        let command = unsafe {
+            let menu = CreatePopupMenu();
+            if menu.is_null() {
+                return;
+            }
+            AppendMenuW(menu, MF_STRING, COLUMN_MENU_AUTO_SCROLL, label.as_ptr());
+            let mut point = windows_sys::Win32::Foundation::POINT {
+                x: self.cursor.0.round() as i32,
+                y: self.cursor.1.round() as i32,
+            };
+            ClientToScreen(hwnd, &mut point);
+            let selected = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                point.x,
+                point.y,
+                0,
+                hwnd,
+                std::ptr::null(),
+            ) as usize;
+            DestroyMenu(menu);
+            selected
+        };
+        if let Some(event) = column_menu_event(col_index, command) {
+            let _ = self.proxy.send_event(event);
+        }
+    }
+
     fn context_menu_comparator(&mut self) {
         // Um arrasto a meio acaba aqui: o menu tem o seu proprio ciclo de
         // mensagens e o largar do botao esquerdo ja nao chegaria a barra.
@@ -10636,6 +10700,8 @@ impl App {
                 source_index,
                 group_index,
             }) => self.show_group_menu(source_index, group_index),
+            // A pilula de uma IA: o item da rolagem automatica (Ctrl+R).
+            Some(BarHit::Column(col_index)) => self.column_pill_menu(col_index),
             _ => {}
         }
     }
@@ -12964,7 +13030,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 comp,
                                 self.bar_hover,
                                 self.bar_visible(),
-                                self.auto_scroll,
+                                self.auto_scroll.get(),
                                 drag,
                             );
                         }
@@ -19239,6 +19305,297 @@ __fire('keydown', { key: 'F8' });
         );
     }
 
+    const LABEL_TURN_OFF: &str = "Desativar rolagem automática (Ctrl+R)";
+    const LABEL_TURN_ON: &str = "Ativar rolagem automática (Ctrl+R)";
+
+    #[test]
+    fn column_menu_label_follows_the_shared_auto_scroll_state() {
+        assert_eq!(auto_scroll_menu_label(true), LABEL_TURN_OFF);
+        assert_eq!(auto_scroll_menu_label(false), LABEL_TURN_ON);
+
+        // O App guarda um lado; o handler do WebView2 de cada coluna guarda
+        // um clone e le-o no instante do botao direito, fora do `&mut App`.
+        let app_side = SharedFlag::default();
+        let menu_side = [app_side.clone(), app_side.clone(), app_side.clone()];
+        let labels = |flags: &[SharedFlag; 3]| {
+            flags
+                .each_ref()
+                .map(|flag| auto_scroll_menu_label(flag.get()))
+        };
+
+        // Nada rola sem um sim: o primeiro menu oferece ativar.
+        assert_eq!(labels(&menu_side), [LABEL_TURN_ON; 3]);
+        // Ctrl+R (toggle_auto_scroll) liga: todas as colunas oferecem desativar.
+        assert!(app_side.toggle());
+        assert_eq!(labels(&menu_side), [LABEL_TURN_OFF; 3]);
+        // A pergunta expirou ou "Nao" (hide_splash / answer_auto_scroll).
+        app_side.set(false);
+        assert_eq!(labels(&menu_side), [LABEL_TURN_ON; 3]);
+        // "Sim" na pergunta.
+        app_side.set(true);
+        assert_eq!(labels(&menu_side), [LABEL_TURN_OFF; 3]);
+        // E o proprio item, pelo evento, volta a desligar.
+        assert!(!app_side.toggle());
+        assert_eq!(labels(&menu_side), [LABEL_TURN_ON; 3]);
+    }
+
+    #[test]
+    fn column_menu_item_routes_to_that_columns_ctrl_r_toggle() {
+        for col in 0..COMPARATOR_COLUMNS {
+            // O item de rolagem faz o que o Ctrl+R premido nessa coluna faz.
+            assert!(
+                matches!(
+                    column_menu_event(col, COLUMN_MENU_AUTO_SCROLL),
+                    Some(UserEvent::ToggleAutoScroll)
+                ),
+                "coluna {col}"
+            );
+            assert!(matches!(
+                App::column_ipc_event_impl(col, IpcAction::AutoScroll),
+                Some(UserEvent::ToggleAutoScroll)
+            ));
+            // 0 e o TrackPopupMenu fechado sem escolha; outro id nao e nosso.
+            assert!(column_menu_event(col, 0).is_none(), "coluna {col}");
+            assert!(
+                column_menu_event(col, COLUMN_MENU_AUTO_SCROLL + 1).is_none(),
+                "coluna {col}"
+            );
+        }
+        assert!(column_menu_event(COMPARATOR_COLUMNS, COLUMN_MENU_AUTO_SCROLL).is_none());
+    }
+
+    #[test]
+    fn only_comparator_columns_get_the_auto_scroll_menu_item() {
+        for col in 0..COMPARATOR_COLUMNS {
+            assert_eq!(context_menu_column(WebViewHost::Column(col)), Some(col));
+        }
+        assert_eq!(
+            context_menu_column(WebViewHost::Column(COMPARATOR_COLUMNS)),
+            None
+        );
+        for host in [
+            WebViewHost::Split,
+            WebViewHost::SidePanel,
+            WebViewHost::Service,
+        ] {
+            assert_eq!(context_menu_column(host), None, "{host:?}");
+        }
+
+        // O que `install_context_menu` corre a cada WebView construida: o
+        // registo acontece para as colunas, com o indice certo, e para mais
+        // nenhuma.
+        for col in 0..COMPARATOR_COLUMNS {
+            let mut registered = Vec::new();
+            let missing = install_column_menu(WebViewHost::Column(col), |index| {
+                registered.push(index);
+                Ok(())
+            });
+            assert_eq!(registered, [col]);
+            assert_eq!(missing, None, "coluna {col}");
+        }
+        for host in [
+            WebViewHost::Split,
+            WebViewHost::SidePanel,
+            WebViewHost::Service,
+            WebViewHost::Column(COMPARATOR_COLUMNS),
+        ] {
+            let mut registered = Vec::new();
+            let missing = install_column_menu(host, |index| {
+                registered.push(index);
+                Ok(())
+            });
+            assert!(
+                registered.is_empty(),
+                "{host:?} ganhou o item: {registered:?}"
+            );
+            assert_eq!(missing, None, "{host:?}");
+        }
+
+        // Um runtime sem ContextMenuRequested: nada sobe nem para, a falha
+        // vira uma linha de log que diz a coluna e porque.
+        let missing = install_column_menu(WebViewHost::Column(2), |_| {
+            Err("ICoreWebView2_11 indisponível: E_NOINTERFACE".to_string())
+        })
+        .expect("a falha do registo fica no log");
+        assert!(missing.contains("coluna 2"), "{missing}");
+        assert!(missing.contains("E_NOINTERFACE"), "{missing}");
+    }
+
+    #[test]
+    fn column_menu_item_goes_after_every_native_item() {
+        // Um menu que o WebView2 abriu vazio recebe so o item, sem separador.
+        assert_eq!(
+            column_menu_placement(0),
+            ColumnMenuPlacement {
+                separator_at: None,
+                item_at: 0,
+            }
+        );
+        for native in 1..=40u32 {
+            let placement = column_menu_placement(native);
+            // Cada inserção empurra o que esta nesse indice para baixo: um
+            // indice abaixo de `native` tiraria copiar/colar/inspecionar do
+            // sitio. O separador fica logo a seguir ao ultimo nativo e o item
+            // logo a seguir ao separador -- o fim do menu, como no Chrome.
+            assert_eq!(placement.separator_at, Some(native), "{native} nativos");
+            assert_eq!(placement.item_at, native + 1, "{native} nativos");
+        }
+    }
+
+    /// Um `[[package]]` do Cargo.lock: nome, versao, origem (ausente nos
+    /// membros do workspace) e as dependencias tal como o lock as escreve --
+    /// "nome", ou "nome versao" quando ha varias versoes da mesma crate.
+    struct LockPackage {
+        name: String,
+        version: String,
+        source: Option<String>,
+        dependencies: Vec<String>,
+    }
+
+    fn parse_cargo_lock(text: &str) -> Vec<LockPackage> {
+        let quoted = |line: &str, key: &str| {
+            line.strip_prefix(key)
+                .and_then(|rest| rest.strip_prefix(" = \""))
+                .and_then(|rest| rest.strip_suffix('"'))
+                .map(str::to_string)
+        };
+        let mut packages: Vec<LockPackage> = Vec::new();
+        let mut in_dependencies = false;
+        for line in text.lines() {
+            if line == "[[package]]" {
+                packages.push(LockPackage {
+                    name: String::new(),
+                    version: String::new(),
+                    source: None,
+                    dependencies: Vec::new(),
+                });
+                in_dependencies = false;
+                continue;
+            }
+            let Some(package) = packages.last_mut() else {
+                continue;
+            };
+            if in_dependencies {
+                if line == "]" {
+                    in_dependencies = false;
+                } else if let Some(dependency) = line
+                    .trim()
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix("\","))
+                {
+                    package.dependencies.push(dependency.to_string());
+                }
+            } else if line == "dependencies = [" {
+                in_dependencies = true;
+            } else if let Some(name) = quoted(line, "name") {
+                package.name = name;
+            } else if let Some(version) = quoted(line, "version") {
+                package.version = version;
+            } else if let Some(source) = quoted(line, "source") {
+                package.source = Some(source);
+            }
+        }
+        packages
+    }
+
+    /// A entrada do lock a que uma dependencia ("nome" ou "nome versao ...")
+    /// se refere. Uma referencia que nao resolve e um lock que este parser
+    /// nao entende, e isso tem de falhar alto, nao encolher o conjunto.
+    fn lock_entry(packages: &[LockPackage], dependency: &str) -> usize {
+        let mut parts = dependency.split(' ');
+        let name = parts.next().unwrap_or_default();
+        let version = parts.next();
+        let found: Vec<usize> = packages
+            .iter()
+            .enumerate()
+            .filter(|(_, package)| {
+                package.name == name && version.is_none_or(|version| package.version == version)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(found.len(), 1, "dependencia {dependency:?} no Cargo.lock");
+        found[0]
+    }
+
+    /// Os pacotes ("nome versao") que a arvore compila a partir dos membros do
+    /// workspace, seguindo as arestas que `keep(de, para)` deixa passar.
+    fn lock_closure(
+        packages: &[LockPackage],
+        keep: impl Fn(&LockPackage, &LockPackage) -> bool,
+    ) -> std::collections::BTreeSet<String> {
+        let mut seen = vec![false; packages.len()];
+        let mut pending: Vec<usize> = packages
+            .iter()
+            .enumerate()
+            .filter(|(_, package)| package.source.is_none())
+            .map(|(index, _)| index)
+            .collect();
+        while let Some(index) = pending.pop() {
+            if std::mem::replace(&mut seen[index], true) {
+                continue;
+            }
+            let from = &packages[index];
+            for dependency in &from.dependencies {
+                let to = lock_entry(packages, dependency);
+                if keep(from, &packages[to]) {
+                    pending.push(to);
+                }
+            }
+        }
+        packages
+            .iter()
+            .zip(seen)
+            .filter(|(_, seen)| *seen)
+            .map(|(package, _)| format!("{} {}", package.name, package.version))
+            .collect()
+    }
+
+    #[test]
+    fn webview2_bindings_add_no_crate_to_the_lock() {
+        // Os dois nomes que o neural-app passou a declarar para chegar ao
+        // ContextMenuRequested (ICoreWebView2_11).
+        const BINDINGS: [&str; 2] = ["webview2-com", "windows-core"];
+
+        let packages = parse_cargo_lock(include_str!("../../../Cargo.lock"));
+        let app = &packages[lock_entry(&packages, "neural-app")];
+        let wry = &packages[lock_entry(&packages, "wry")];
+
+        // O conjunto de pacotes compilados com as arestas novas e o mesmo que
+        // sem elas: nomear os bindings nao pos crate nenhuma na arvore.
+        let with_bindings = lock_closure(&packages, |_, _| true);
+        let without_bindings = lock_closure(&packages, |from, to| {
+            !(from.name == "neural-app" && BINDINGS.contains(&to.name.as_str()))
+        });
+        let added: Vec<&String> = with_bindings.difference(&without_bindings).collect();
+        assert!(
+            added.is_empty(),
+            "os bindings do WebView2 puseram crates novas no Cargo.lock: {added:?}"
+        );
+        assert!(with_bindings.contains(&format!("wry {}", wry.version)));
+
+        // E nao e vacuo: o neural-app nomeia mesmo cada binding, uma vez so, e
+        // a entrada e a MESMA que o wry ja usa -- nao uma segunda versao.
+        for binding in BINDINGS {
+            let named: Vec<usize> = app
+                .dependencies
+                .iter()
+                .map(|dependency| lock_entry(&packages, dependency))
+                .filter(|&entry| packages[entry].name == binding)
+                .collect();
+            assert_eq!(named.len(), 1, "neural-app -> {binding}");
+            let via_wry = wry
+                .dependencies
+                .iter()
+                .map(|dependency| lock_entry(&packages, dependency))
+                .any(|entry| entry == named[0]);
+            assert!(
+                via_wry,
+                "neural-app usa {binding} {} e o wry nao",
+                packages[named[0]].version
+            );
+        }
+    }
+
     #[test]
     fn the_main_window_answers_the_same_ctrl_shortcuts() {
         use winit::keyboard::ModifiersState;
@@ -23010,6 +23367,212 @@ fn auto_scroll_message(on: bool) -> String {
     } else {
         "Rolagem automática desligada  ·  Ctrl+R liga".to_string()
     }
+}
+
+/// Um interruptor partilhado entre a aplicacao e callbacks nativos que correm
+/// fora do `&mut App` -- o menu do botao direito das colunas, que o WebView2
+/// monta no instante do clique. Clonar partilha a MESMA celula: uma copia
+/// envelheceria, e o menu ofereceria "Ativar" com a rolagem ja ligada pelo
+/// Ctrl+R. Tudo corre na thread da interface (o WebView2 chama os handlers
+/// nela), por isso `Rc<Cell>` e nao atomicos.
+#[derive(Clone, Default)]
+struct SharedFlag(Rc<Cell<bool>>);
+
+impl SharedFlag {
+    fn get(&self) -> bool {
+        self.0.get()
+    }
+
+    fn set(&self, on: bool) {
+        self.0.set(on);
+    }
+
+    /// Inverte e devolve o estado novo.
+    fn toggle(&self) -> bool {
+        let on = !self.0.get();
+        self.0.set(on);
+        on
+    }
+}
+
+/// O item de rolagem dos menus de coluna diz o que o clique FAZ: com a
+/// rolagem ligada oferece desativar, desligada oferece ativar.
+fn auto_scroll_menu_label(on: bool) -> &'static str {
+    if on {
+        "Desativar rolagem automática (Ctrl+R)"
+    } else {
+        "Ativar rolagem automática (Ctrl+R)"
+    }
+}
+
+/// Id do item de rolagem nos menus de uma coluna: o que o `TrackPopupMenu` da
+/// pilula devolve e o que o item acrescentado ao menu do WebView2 entrega.
+/// Zero e o "fechou sem escolher" do Win32, por isso nunca e um comando.
+const COLUMN_MENU_AUTO_SCROLL: usize = 1;
+
+/// O item escolhido num menu de coluna vira o evento que o Ctrl+R premido
+/// DENTRO dessa coluna produz -- o mesmo despacho, `column_ipc_event_impl`,
+/// para o atalho e o menu nunca divergirem.
+fn column_menu_event(col_index: usize, command: usize) -> Option<UserEvent> {
+    if col_index >= COMPARATOR_COLUMNS {
+        return None;
+    }
+    match command {
+        COLUMN_MENU_AUTO_SCROLL => App::column_ipc_event_impl(col_index, IpcAction::AutoScroll),
+        _ => None,
+    }
+}
+
+/// Que WebView e esta, para quem decide o que o botao direito lhe acrescenta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebViewHost {
+    /// Uma das colunas das IAs no comparador.
+    Column(usize),
+    /// A fonte aberta ao lado de uma coluna.
+    Split,
+    /// Historico e memoria, a direita.
+    SidePanel,
+    /// Meet, WhatsApp, YouTube e Gmail no painel.
+    Service,
+}
+
+/// So as colunas das IAs recebem o item de rolagem: a fonte ao lado, o painel
+/// lateral e os servicos ficam com o menu nativo do WebView2 tal como vem.
+fn context_menu_column(host: WebViewHost) -> Option<usize> {
+    match host {
+        WebViewHost::Column(index) if index < COMPARATOR_COLUMNS => Some(index),
+        WebViewHost::Column(_)
+        | WebViewHost::Split
+        | WebViewHost::SidePanel
+        | WebViewHost::Service => None,
+    }
+}
+
+/// O que `install_context_menu` faz com uma WebView acabada de construir:
+/// chama `register` so para uma coluna, com o indice dela, e devolve a linha
+/// de log quando o registo falha -- um runtime WebView2 sem o
+/// ContextMenuRequested. Essa falha nao sobe: a coluna abre, com o menu
+/// nativo inteiro, e so o item de rolagem fica de fora.
+fn install_column_menu(
+    host: WebViewHost,
+    register: impl FnOnce(usize) -> Result<(), String>,
+) -> Option<String> {
+    let col_index = context_menu_column(host)?;
+    register(col_index)
+        .err()
+        .map(|error| format!("context menu: coluna {col_index} sem o item de rolagem ({error})"))
+}
+
+/// Onde o item de rolagem entra num menu nativo com `native` itens: DEPOIS de
+/// todos eles, separado por uma linha quando ha algo acima. Copiar, colar,
+/// inspecionar e o resto ficam nos lugares em que o WebView2 os pos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ColumnMenuPlacement {
+    separator_at: Option<u32>,
+    item_at: u32,
+}
+
+fn column_menu_placement(native: u32) -> ColumnMenuPlacement {
+    if native == 0 {
+        ColumnMenuPlacement {
+            separator_at: None,
+            item_at: 0,
+        }
+    } else {
+        ColumnMenuPlacement {
+            separator_at: Some(native),
+            item_at: native + 1,
+        }
+    }
+}
+
+/// Acrescenta ao menu nativo do botao direito de uma coluna o item de
+/// rolagem, com o rotulo do estado no instante do clique, no lugar que
+/// `column_menu_placement` decide. Precisa do ContextMenuRequested
+/// (ICoreWebView2_11 e ICoreWebView2Environment9); num runtime sem ele devolve
+/// o erro e a coluna fica so com o menu nativo. Uma falha a montar um menu
+/// concreto fica no log e esse menu abre como o WebView2 o trouxe.
+fn register_column_context_menu(
+    webview: &WebView,
+    col_index: usize,
+    auto_scroll: SharedFlag,
+    proxy: EventLoopProxy<UserEvent>,
+) -> Result<(), String> {
+    use webview2_com::{
+        ContextMenuRequestedEventHandler, CustomItemSelectedEventHandler,
+        Microsoft::Web::WebView2::Win32::{
+            COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
+            COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR, ICoreWebView2_11,
+            ICoreWebView2ContextMenuRequestedEventArgs, ICoreWebView2Environment9,
+        },
+    };
+    use windows_core::{HSTRING, Interface};
+    use wry::WebViewExtWindows;
+
+    let core = webview
+        .webview()
+        .cast::<ICoreWebView2_11>()
+        .map_err(|error| format!("ICoreWebView2_11 indisponível: {error}"))?;
+    let environment = webview
+        .environment()
+        .cast::<ICoreWebView2Environment9>()
+        .map_err(|error| format!("ICoreWebView2Environment9 indisponível: {error}"))?;
+
+    let add_item =
+        move |args: &ICoreWebView2ContextMenuRequestedEventArgs| -> windows_core::Result<()> {
+            let label = HSTRING::from(auto_scroll_menu_label(auto_scroll.get()));
+            let proxy = proxy.clone();
+            let selected = CustomItemSelectedEventHandler::create(Box::new(move |_, _| {
+                if let Some(event) = column_menu_event(col_index, COLUMN_MENU_AUTO_SCROLL) {
+                    let _ = proxy.send_event(event);
+                }
+                Ok(())
+            }));
+            unsafe {
+                let items = args.MenuItems()?;
+                let mut native = 0u32;
+                items.Count(&mut native)?;
+                let placement = column_menu_placement(native);
+                // Tudo criado antes de mexer no menu: uma falha a meio nao deixa
+                // um separador solto no fim do menu nativo.
+                let item = environment.CreateContextMenuItem(
+                    &label,
+                    None,
+                    COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
+                )?;
+                let mut selected_token = 0i64;
+                item.add_CustomItemSelected(&selected, &mut selected_token)?;
+                let separator = match placement.separator_at {
+                    Some(index) => Some((
+                        index,
+                        environment.CreateContextMenuItem(
+                            &HSTRING::new(),
+                            None,
+                            COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR,
+                        )?,
+                    )),
+                    None => None,
+                };
+                if let Some((index, separator)) = separator {
+                    items.InsertValueAtIndex(index, &separator)?;
+                }
+                items.InsertValueAtIndex(placement.item_at, &item)?;
+            }
+            Ok(())
+        };
+    let handler = ContextMenuRequestedEventHandler::create(Box::new(move |_, args| {
+        if let Some(args) = args
+            && let Err(error) = add_item(&args)
+        {
+            debug_log(format_args!(
+                "context menu: coluna {col_index} abriu sem o item de rolagem ({error})"
+            ));
+        }
+        Ok(())
+    }));
+    let mut token = 0i64;
+    unsafe { core.add_ContextMenuRequested(&handler, &mut token) }
+        .map_err(|error| format!("add_ContextMenuRequested falhou: {error}"))
 }
 
 /// Apagar TUDO so com um "Sim" explicito. Fechar a caixa, "Nao" ou uma caixa
