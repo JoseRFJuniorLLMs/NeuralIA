@@ -961,9 +961,14 @@ impl BarLayout {
             }
         }
 
-        // Linha superior: todas as fontes/abas, antes dos controles da janela.
+        // Linha superior: todas as fontes/abas, antes das ferramentas e dos
+        // controles da janela. A etiqueta do Pomodoro ja vai reservada: as
+        // abas nao mexem quando ele arranca.
         let tabs_left = 90.0 * scale;
-        let tabs_right = (window_minimize.x - 8.0 * scale).max(tabs_left);
+        let tabs_right = (title_tools_left(client_width, scale, columns.pomodoro_label)
+            - 8.0 * scale)
+            .min(window_minimize.x - 8.0 * scale)
+            .max(tabs_left);
         let visible_rows = &rows[..columns_len];
         let total_slots: usize = visible_rows.iter().map(|row| row.len).sum();
         let total_pills: usize = visible_rows
@@ -1139,11 +1144,13 @@ struct RightControls {
     private: UiRect,
     /// Videochamada, WhatsApp, YouTube e Gmail, a esquerda do Privado.
     services: [UiRect; 4],
-    /// Gemini Live, logo a esquerda dos servicos.
+    /// Gemini Live, logo a esquerda dos servicos: o inicio do canto.
     live: UiRect,
-    /// Pomodoro, Notas e Respiracao, num grupo proprio a esquerda do Gemini
-    /// Live (ordem de `Tool::ALL`): o inicio do canto. O do Pomodoro alarga
-    /// com a etiqueta do tempo.
+    /// Pomodoro, Notas e Respiracao (ordem de `Tool::ALL`) na linha de CIMA,
+    /// antes dos botoes da janela -- o mesmo sitio da Home
+    /// (`home_tool_buttons`). Na segunda linha tiravam a largura toda a
+    /// ultima coluna: a 1280 px a terceira IA ficava sem pilula, sem ‹ › e,
+    /// com o Pomodoro a correr, sem "+". O do Pomodoro alarga com o tempo.
     tools: [UiRect; 3],
     /// Rotulo, expandir e fechar da gaveta; `None` quando nao ha gaveta.
     split: Option<(UiRect, UiRect, UiRect)>,
@@ -1157,30 +1164,33 @@ const RIGHT_CONTROLS_MIN_LEFT: f64 = 87.0;
 /// Rotulo da gaveta ("Fonte · ChatGPT") inteiro, e o minimo que ainda se le.
 const SPLIT_LABEL_WIDTH: f64 = 150.0;
 const SPLIT_LABEL_MIN_WIDTH: f64 = 60.0;
-/// Folga entre o grupo das ferramentas e o dos servicos.
-const TOOLS_GROUP_GAP: f64 = 8.0;
 
-/// Quanto cedem, numa janela estreita, as duas partes que so informam: o
-/// rotulo da gaveta encolhe primeiro (ate desaparecer abaixo do minimo) e a
-/// etiqueta do Pomodoro so sai quando nem assim cabe. Devolve (rotulo,
-/// etiqueta) em pixeis logicos; `room` e o que sobra aos dois.
-fn right_controls_flex(room: f64, split_active: bool, label_width: f64) -> (f64, f64) {
-    let split_label = if split_active {
-        let fits = (room - label_width).min(SPLIT_LABEL_WIDTH);
-        if fits >= SPLIT_LABEL_MIN_WIDTH {
-            fits
-        } else {
-            0.0
-        }
+/// Quanto cede, numa janela estreita, o rotulo da gaveta (so informa):
+/// encolhe ate desaparecer abaixo do minimo. Em pixeis logicos; `room` e o
+/// que sobra depois dos botoes.
+fn split_label_width(room: f64, split_active: bool) -> f64 {
+    if !split_active {
+        return 0.0;
+    }
+    let fits = room.min(SPLIT_LABEL_WIDTH);
+    if fits >= SPLIT_LABEL_MIN_WIDTH {
+        fits
     } else {
         0.0
-    };
-    let label = if room - split_label >= label_width {
-        label_width
-    } else {
-        0.0
-    };
-    (split_label, label)
+    }
+}
+
+/// A etiqueta mais larga que o Pomodoro mostra ("⏸ mm:ss"). As abas da
+/// linha de cima param antes dela sempre, com ou sem sessao: arrancar ou
+/// pausar um Pomodoro nao mexe em nenhuma aba.
+const POMODORO_LABEL_RESERVE: &str = "⏸ 00:00";
+
+/// Onde comecam as ferramentas na linha de cima, com a etiqueta do Pomodoro
+/// ja reservada: as abas acabam antes disto.
+fn title_tools_left(client_width: f64, scale: f64, pomodoro_label: Option<BarLabel>) -> f64 {
+    let reserved = home_tool_buttons(client_width, scale, BarLabel::new(POMODORO_LABEL_RESERVE));
+    let actual = home_tool_buttons(client_width, scale, pomodoro_label);
+    reserved[0].x.min(actual[0].x)
 }
 
 /// Geometria dos controlos encostados a direita. A mesma conta estava escrita
@@ -1201,22 +1211,17 @@ fn right_controls(
     let icon_gap = 4.0 * scale;
 
     // Tudo o que tem largura fixa, em pixeis logicos: a gaveta sem o rotulo
-    // (fechar, expandir, ‹ e › e as folgas), o Privado, os quatro servicos,
-    // o Gemini Live e as tres ferramentas. O resto e do rotulo da gaveta e da
-    // etiqueta.
+    // (fechar, expandir, ‹ e › e as folgas), o Privado, os quatro servicos e
+    // o Gemini Live. O resto e do rotulo da gaveta.
     let logical = |value: f64| value / scale;
     let split_fixed = if split_active {
         30.0 + 5.0 + 30.0 + 5.0 + 6.0 + 26.0 + 4.0 + 26.0 + 6.0
     } else {
         0.0
     };
-    let icons = logical(icon) * 9.0 + logical(icon_gap) * 7.0 + TOOLS_GROUP_GAP;
+    let icons = logical(icon) * 6.0 + logical(icon_gap) * 5.0;
     let room = logical(client_width) - 8.0 - split_fixed - icons - RIGHT_CONTROLS_MIN_LEFT;
-    let (split_label_w, label_w) = right_controls_flex(
-        room,
-        split_active,
-        pomodoro_label.map_or(0.0, |label| label.width()),
-    );
+    let split_label_w = split_label_width(room, split_active);
 
     let split = split_active.then(|| {
         let close = UiRect {
@@ -1259,7 +1264,7 @@ fn right_controls(
         None => client_width - margin,
     };
     // Privado a direita e, a esquerda dele, videochamada, WhatsApp, YouTube,
-    // Gmail e o Gemini Live; depois, num grupo proprio, as ferramentas.
+    // Gmail e o Gemini Live. As ferramentas ficam na linha de cima.
     let private = UiRect {
         x: right - icon,
         y: row_y,
@@ -1278,13 +1283,7 @@ fn right_controls(
         width: icon,
         height: icon,
     };
-    let tools = tool_button_row(
-        live.x - TOOLS_GROUP_GAP * scale,
-        row_y,
-        icon,
-        icon_gap,
-        label_w * scale,
-    );
+    let tools = home_tool_buttons(client_width, scale, pomodoro_label);
 
     RightControls {
         private,
@@ -1297,9 +1296,10 @@ fn right_controls(
 }
 
 impl RightControls {
-    /// Onde comecam os controlos da direita: o resto da barra acaba aqui.
+    /// Onde comecam os controlos da direita na segunda linha: as colunas
+    /// acabam aqui. As ferramentas, na linha de cima, nao contam.
     fn leftmost(&self) -> f64 {
-        self.tools[0].x
+        self.live.x
     }
 }
 
@@ -16090,8 +16090,14 @@ mod tests {
         // ferramentas, num grupo proprio, vem antes dele e sao o inicio do
         // canto.
         assert!(controls.live.x + controls.live.width <= controls.services[0].x);
-        assert!(controls.tools[2].x + controls.tools[2].width < controls.live.x);
-        assert_eq!(controls.leftmost(), controls.tools[0].x);
+        assert_eq!(controls.leftmost(), controls.live.x);
+        // As ferramentas ficam na linha de cima, como na Home.
+        for (tool, home) in controls.tools.iter().zip(home_tool_buttons(1600.0, 1.0, None)) {
+            assert_eq!((tool.x, tool.y, tool.width, tool.height), (home.x, home.y, home.width, home.height));
+        }
+        for tool in controls.tools {
+            assert!(tool.y + tool.height <= TITLE_TAB_HEIGHT);
+        }
         // O Privado passa a ser um botao redondo so com o icone.
         assert_eq!(controls.private.width, controls.private.height);
         // Com a gaveta aberta tudo continua a esquerda dela.
@@ -21600,13 +21606,25 @@ __fire('keydown', { key: 'F8' });
                             }
                         }
 
-                        let mut bar = vec![layout.home];
+                        let mut bar = vec![
+                            layout.home,
+                            layout.window_minimize,
+                            layout.window_maximize,
+                            layout.window_close,
+                        ];
                         for index in 0..COMPARATOR_COLUMNS {
                             bar.push(layout.columns[index]);
                             bar.push(layout.add_tabs[index]);
                             bar.push(layout.column_back[index]);
                             bar.push(layout.column_forward[index]);
+                            bar.extend(layout.context_tabs[index]);
+                            bar.extend(layout.group_pills[index]);
                         }
+                        // As ferramentas nunca entram na faixa da marca.
+                        assert!(
+                            controls.tools[0].x >= 90.0 * scale,
+                            "as ferramentas pisam a marca em {at}"
+                        );
                         for piece in bar {
                             for rect in &rights {
                                 assert!(
@@ -21632,6 +21650,132 @@ __fire('keydown', { key: 'F8' });
             }
         }
         assert_eq!(scenarios, 1041 * 4 * 6 * 3);
+    }
+
+    /// A segunda linha que a barra desenha e onde clica: pilulas, "+", ‹ ›
+    /// e chips de cada coluna, e as abas da linha de cima.
+    fn provider_row(layout: &BarLayout) -> Vec<[f64; 4]> {
+        let mut rects = Vec::new();
+        for index in 0..COMPARATOR_COLUMNS {
+            for rect in [
+                layout.columns[index],
+                layout.add_tabs[index],
+                layout.column_back[index],
+                layout.column_forward[index],
+            ]
+            .into_iter()
+            .chain(layout.context_tabs[index])
+            .chain(layout.group_pills[index])
+            {
+                rects.push([rect.x, rect.y, rect.width, rect.height]);
+            }
+        }
+        rects
+    }
+
+    /// Gate: as ferramentas e o tempo do Pomodoro nunca tiram lugar as
+    /// colunas das IAs. Antes viviam na segunda linha e a ultima coluna
+    /// pagava tudo: a 1280 px (1920x1080 a 150%) a terceira pilula tinha
+    /// 8,7 px, e com o Pomodoro a correr ficava sem pilula e sem ‹ ›; a
+    /// 1100 perdia o "+". Agora (1) arrancar, pausar ou parar o Pomodoro nao
+    /// mexe em NADA da segunda linha nem nas abas, a qualquer largura e
+    /// escala; e (2) nas larguras comuns cada coluna visivel tem a sua
+    /// pilula (legivel a partir de 1280), o "+" e os ‹ ›.
+    #[test]
+    fn the_tools_never_take_room_from_the_ai_columns() {
+        let (running, paused) = shipped_pomodoro_labels();
+        let topologies = [
+            ([false, false, false], false),
+            ([true, false, false], false),
+            ([false, true, false], false),
+            ([false, false, true], false),
+            ([true, true, false], false),
+            ([false, false, false], true),
+        ];
+        let layout_at = |client_width: f64,
+                         scale: f64,
+                         minimized: [bool; COMPARATOR_COLUMNS],
+                         split_active: bool,
+                         pomodoro_label: Option<BarLabel>| {
+            BarLayout::with_contexts(
+                client_width,
+                scale,
+                true,
+                BarColumns {
+                    count: COMPARATOR_COLUMNS,
+                    weights: [1.0; COMPARATOR_COLUMNS],
+                    minimized,
+                    split_active,
+                    panel_width: 0.0,
+                    pomodoro_label,
+                },
+                [3, 3, 3],
+            )
+        };
+        for logical_width in 700..=1920 {
+            let logical_width = logical_width as f64;
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                let client_width = logical_width * scale;
+                for (minimized, split_active) in topologies {
+                    let stopped = provider_row(&layout_at(
+                        client_width,
+                        scale,
+                        minimized,
+                        split_active,
+                        None,
+                    ));
+                    for label in [running, paused] {
+                        assert_eq!(
+                            provider_row(&layout_at(
+                                client_width,
+                                scale,
+                                minimized,
+                                split_active,
+                                label
+                            )),
+                            stopped,
+                            "o Pomodoro ({label:?}) mexeu nas colunas em {logical_width}px @{scale}x min={minimized:?} gaveta={split_active}"
+                        );
+                    }
+                }
+            }
+        }
+
+        for logical_width in [1024.0, 1100.0, 1280.0, 1366.0, 1440.0, 1920.0] {
+            for scale in [1.0, 1.5] {
+                let client_width = logical_width * scale;
+                for (minimized, split_active) in topologies {
+                    if split_active {
+                        continue;
+                    }
+                    for label in [None, running, paused] {
+                        let layout =
+                            layout_at(client_width, scale, minimized, split_active, label);
+                        for index in 0..COMPARATOR_COLUMNS {
+                            if minimized[index] {
+                                continue;
+                            }
+                            let at = format!(
+                                "coluna {index} a {logical_width}px @{scale}x min={minimized:?} etiqueta={label:?}"
+                            );
+                            let pill = layout.columns[index].width / scale;
+                            assert!(pill > 0.0, "sem pilula: {at}");
+                            if logical_width >= 1280.0 {
+                                assert!(pill >= 60.0, "pilula de {pill:.1} px: {at}");
+                            }
+                            assert!(layout.add_tabs[index].width > 0.0, "sem \"+\": {at}");
+                            assert!(layout.column_back[index].width > 0.0, "sem ‹: {at}");
+                            assert!(layout.column_forward[index].width > 0.0, "sem ›: {at}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Numa pilula espremida o icone do provedor nao sai pela borda.
+        assert!(!pill_fits_icon(29.0, 1.0));
+        assert!(pill_fits_icon(116.0, 1.0));
+        assert!(pill_fits_icon(116.0 * 1.5, 1.5));
     }
 
     /// A etiqueta do Pomodoro a correr e pausada, um segundo depois de
@@ -24627,6 +24771,14 @@ impl PillStyle {
 }
 
 /// Pilula com icone a esquerda e legenda; sem icone, a legenda fica centrada.
+/// O icone de 18 px da pilula so entra com as margens dos dois lados; numa
+/// pilula mais estreita (a coluna espremida) ele saia pela borda e caia na
+/// folga ou debaixo do "+".
+fn pill_fits_icon(width: f64, scale: f64) -> bool {
+    let padding = 11.0 * scale;
+    width >= padding + (18.0 * scale).round() + padding * 0.6
+}
+
 unsafe fn draw_pill(
     hdc: *mut core::ffi::c_void,
     rect: UiRect,
@@ -24657,7 +24809,7 @@ unsafe fn draw_pill(
     let mut text_right = rect.x + rect.width - padding * 0.6;
     let mut format = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
 
-    match style.icon {
+    match style.icon.filter(|_| pill_fits_icon(rect.width, scale)) {
         Some(slot) => {
             let size = (18.0 * scale).round() as i32;
             let icon_y = (rect.y + (rect.height - size as f64) / 2.0).round() as i32;
