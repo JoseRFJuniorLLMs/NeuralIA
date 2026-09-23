@@ -9,5 +9,5 @@ NeuralIA-data/
 *.WebView2/
 release/
 
-# Artefactos do instalador (packaging/build-installer.ps1).
+# Artefactos do instalador (scripts/build-windows-installer.ps1 -OutputDir dist).
 dist/
