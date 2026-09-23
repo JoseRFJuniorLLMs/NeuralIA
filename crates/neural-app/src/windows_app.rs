@@ -397,9 +397,12 @@ const AUTO_SCROLL_TOAST: &str = r#"
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BarHit {
     Home,
-    /// ‹ e › ao lado do Home: o historico da pagina.
+    /// ‹ e › da fonte aberta ao lado de uma coluna, junto do rotulo dela.
     Back,
     Forward,
+    /// ‹ e › de cada IA, logo depois do "+" da coluna.
+    ColumnBack(usize),
+    ColumnForward(usize),
     Column(usize),
     AddTab(usize),
     ContextTab {
@@ -461,6 +464,8 @@ struct BarLayout {
     home: UiRect,
     back: UiRect,
     forward: UiRect,
+    column_back: [UiRect; COMPARATOR_COLUMNS],
+    column_forward: [UiRect; COMPARATOR_COLUMNS],
     /// Por coluna: a pilula do provedor sobre a sua faixa, ou -- se estiver
     /// minimizada -- o chip compacto encostado aos controlos da direita.
     columns: [UiRect; COMPARATOR_COLUMNS],
@@ -533,6 +538,8 @@ impl BarLayout {
                 home: empty,
                 back: empty,
                 forward: empty,
+                column_back: [empty; COMPARATOR_COLUMNS],
+                column_forward: [empty; COMPARATOR_COLUMNS],
                 columns: [empty; COMPARATOR_COLUMNS],
                 minimized: [false; COMPARATOR_COLUMNS],
                 add_tabs: [empty; COMPARATOR_COLUMNS],
@@ -580,21 +587,11 @@ impl BarLayout {
             width: 72.0 * scale,
             height: row_h,
         };
-        // ‹ e › logo a seguir ao Home, redondos, como no Chrome.
-        let nav = row_h - 4.0 * scale;
-        let back = UiRect {
-            x: home.x + home.width + 6.0 * scale,
-            y: row_y + 2.0 * scale,
-            width: nav,
-            height: nav,
-        };
-        let forward = UiRect {
-            x: back.x + back.width + 4.0 * scale,
-            ..back
-        };
 
         let mut columns_rect = [empty; COMPARATOR_COLUMNS];
         let mut plus_rect = [empty; COMPARATOR_COLUMNS];
+        let mut column_back = [empty; COMPARATOR_COLUMNS];
+        let mut column_forward = [empty; COMPARATOR_COLUMNS];
         let mut tabs = [[empty; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS];
         let mut tab_indices = [[0usize; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS];
         let mut tab_counts = [0usize; COMPARATOR_COLUMNS];
@@ -632,7 +629,9 @@ impl BarLayout {
         } else {
             hidden.len() as f64 * chip_w + chip_gap * hidden.len().saturating_sub(1) as f64
         };
-        let controls_left = right_controls(client_width, scale, columns.split_active).leftmost();
+        let controls = right_controls(client_width, scale, columns.split_active);
+        let controls_left = controls.leftmost();
+        let (back, forward) = controls.split_nav.unwrap_or((empty, empty));
         let reserved = if hidden.is_empty() {
             0.0
         } else {
@@ -643,14 +642,18 @@ impl BarLayout {
         for (slot, span) in spans.iter().enumerate() {
             let mut left = span.x * scale + group_pad;
             if slot == 0 {
-                left = left.max(forward.x + forward.width + 8.0 * scale);
+                left = left.max(home.x + home.width + 8.0 * scale);
             }
             let right = ((span.x + span.width) * scale - group_pad).min(bar_right);
             // O `.max()` que aqui estava punha o chao ACIMA do tecto: garantia
             // `available >= provider_width + plus_width + gap`, o que tornava o
             // `.min()` de baixo matematicamente morto e a pilula nunca encolhia.
             let available = (right - left).max(0.0);
-            let pill = provider_width.min((available - plus_width - gap).max(0.0));
+            // "+", ‹ e › depois da pilula: ela encolhe primeiro.
+            let nav_width = plus_width;
+            let nav_gap = 4.0 * scale;
+            let reserved_after = plus_width + gap + 2.0 * (nav_width + nav_gap);
+            let pill = provider_width.min((available - reserved_after).max(0.0));
             columns_rect[span.index] = UiRect {
                 x: left,
                 y: row_y,
@@ -670,6 +673,21 @@ impl BarLayout {
                     0.0
                 },
                 height: row_h - 4.0 * scale,
+            };
+            // ‹ e › desta IA. Tal como o "+", ou cabem na faixa ou nao existem.
+            let back_x = plus_x + plus_width + nav_gap;
+            let forward_x = back_x + nav_width + nav_gap;
+            let fits = forward_x + nav_width <= right;
+            column_back[span.index] = UiRect {
+                x: back_x,
+                y: row_y + 2.0 * scale,
+                width: if fits { nav_width } else { 0.0 },
+                height: row_h - 4.0 * scale,
+            };
+            column_forward[span.index] = UiRect {
+                x: forward_x,
+                width: if fits { nav_width } else { 0.0 },
+                ..column_back[span.index]
             };
         }
 
@@ -769,6 +787,8 @@ impl BarLayout {
             home,
             back,
             forward,
+            column_back,
+            column_forward,
             columns: columns_rect,
             minimized: columns.minimized,
             add_tabs: plus_rect,
@@ -826,6 +846,14 @@ impl BarLayout {
             return Some(BarHit::Forward);
         }
         for index in 0..self.columns_len {
+            if self.column_back[index].contains(x, y) {
+                return Some(BarHit::ColumnBack(index));
+            }
+            if self.column_forward[index].contains(x, y) {
+                return Some(BarHit::ColumnForward(index));
+            }
+        }
+        for index in 0..self.columns_len {
             if self.add_tabs[index].contains(x, y) {
                 return Some(BarHit::AddTab(index));
             }
@@ -863,6 +891,8 @@ struct RightControls {
     services: [UiRect; 4],
     /// Rotulo, expandir e fechar da gaveta; `None` quando nao ha gaveta.
     split: Option<(UiRect, UiRect, UiRect)>,
+    /// ‹ e › da fonte da gaveta, a esquerda do rotulo.
+    split_nav: Option<(UiRect, UiRect)>,
 }
 
 /// Geometria dos controlos encostados a direita. A mesma conta estava escrita
@@ -896,8 +926,22 @@ fn right_controls(client_width: f64, scale: f64, split_active: bool) -> RightCon
         (label, expand, close)
     });
 
-    let right = match split {
-        Some((label, _, _)) => label.x - 6.0 * scale,
+    let split_nav = split.map(|(label, _, _)| {
+        let size = row_h - 4.0 * scale;
+        let forward = UiRect {
+            x: label.x - 6.0 * scale - size,
+            y: row_y + 2.0 * scale,
+            width: size,
+            height: size,
+        };
+        let back = UiRect {
+            x: forward.x - 4.0 * scale - size,
+            ..forward
+        };
+        (back, forward)
+    });
+    let right = match split_nav {
+        Some((back, _)) => back.x - 6.0 * scale,
         None => client_width - margin,
     };
     // Botoes redondos so com icone, como no Chrome: Privado a direita e, a
@@ -921,6 +965,7 @@ fn right_controls(client_width: f64, scale: f64, split_active: bool) -> RightCon
         private,
         services,
         split,
+        split_nav,
     }
 }
 
@@ -2516,8 +2561,10 @@ fn bar_tooltip_label(
 ) -> Option<String> {
     Some(match hit {
         BarHit::Home => "Voltar à Home".to_string(),
-        BarHit::Back => "Voltar para a página anterior".to_string(),
-        BarHit::Forward => "Avançar para a próxima página".to_string(),
+        BarHit::Back => "Voltar na fonte aberta ao lado".to_string(),
+        BarHit::Forward => "Avançar na fonte aberta ao lado".to_string(),
+        BarHit::ColumnBack(_) => format!("Voltar no {provider}"),
+        BarHit::ColumnForward(_) => format!("Avançar no {provider}"),
         BarHit::Column(_) => format!("{provider}: expandir esta coluna"),
         BarHit::AddTab(_) => format!("Nova pergunta ao {provider}"),
         BarHit::ContextTab { .. } => {
@@ -6888,6 +6935,21 @@ impl App {
         }
     }
 
+    /// ‹ › de uma IA: o historico da pagina daquela coluna, so dela.
+    fn navigate_column(&mut self, index: usize, step: HistoryStep) {
+        let script = match step {
+            HistoryStep::Back => "window.history.back();",
+            HistoryStep::Forward => "window.history.forward();",
+        };
+        if let Some(view) = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.views.get(index))
+        {
+            let _ = view.webview.evaluate_script(script);
+        }
+    }
+
     /// Liga/desliga a rolagem de leitura. O temporizador e nativo e nao vive na
     /// pagina: assim sobrevive a navegacao dentro do site.
     fn toggle_auto_scroll(&mut self) {
@@ -8545,7 +8607,10 @@ impl App {
     fn bar_tooltip_text(&self, hit: BarHit, owner: HWND) -> Option<String> {
         let comp = self.comparator.as_ref();
         let column = match hit {
-            BarHit::Column(index) | BarHit::AddTab(index) => Some(index),
+            BarHit::Column(index)
+            | BarHit::AddTab(index)
+            | BarHit::ColumnBack(index)
+            | BarHit::ColumnForward(index) => Some(index),
             BarHit::ContextTab { source_index, .. } | BarHit::ContextGroup { source_index, .. } => {
                 Some(source_index)
             }
@@ -9182,6 +9247,8 @@ impl App {
             Some(BarHit::Home) => self.show_home(),
             Some(BarHit::Back) => self.navigate_history(HistoryStep::Back),
             Some(BarHit::Forward) => self.navigate_history(HistoryStep::Forward),
+            Some(BarHit::ColumnBack(index)) => self.navigate_column(index, HistoryStep::Back),
+            Some(BarHit::ColumnForward(index)) => self.navigate_column(index, HistoryStep::Forward),
             Some(BarHit::Column(index)) => self.expand_comparator(index),
             Some(BarHit::AddTab(index)) => self.open_ai_palette(index),
             Some(BarHit::ContextTab {
@@ -11600,12 +11667,23 @@ unsafe fn paint_comparator_bar_with_contexts(
         );
     }
 
-    // ‹ e › ao lado do Home.
-    for (rect, label, hit) in [
+    // ‹ e › da fonte aberta ao lado (so existem com a gaveta) e de cada IA.
+    let mut pairs = vec![
         (layout.back, "‹", BarHit::Back),
         (layout.forward, "›", BarHit::Forward),
-    ] {
-        draw_button(target, rect, label, hover == Some(hit), scale, font, theme);
+    ];
+    for index in 0..layout.columns_len {
+        pairs.push((layout.column_back[index], "‹", BarHit::ColumnBack(index)));
+        pairs.push((
+            layout.column_forward[index],
+            "›",
+            BarHit::ColumnForward(index),
+        ));
+    }
+    for (rect, label, hit) in pairs {
+        if rect.width > 0.0 {
+            draw_button(target, rect, label, hover == Some(hit), scale, font, theme);
+        }
     }
 
     // Os mesmos rectangulos que o hit-testing usa; ver `right_controls`.
@@ -12591,6 +12669,8 @@ mod tests {
             BarHit::Home,
             BarHit::Back,
             BarHit::Forward,
+            BarHit::ColumnBack(1),
+            BarHit::ColumnForward(1),
             BarHit::Column(1),
             BarHit::AddTab(1),
             BarHit::ContextTab {
@@ -12962,31 +13042,68 @@ mod tests {
     }
 
     #[test]
-    fn back_and_forward_sit_between_home_and_the_first_provider() {
+    fn every_ai_column_has_its_own_back_and_forward_after_its_plus() {
         let layout = BarLayout::with_contexts(1440.0, 1.0, true, BarColumns::even(3), [0, 0, 0]);
-        let (home, back, forward) = (layout.home, layout.back, layout.forward);
+        for index in 0..3 {
+            let (plus, back, forward) = (
+                layout.add_tabs[index],
+                layout.column_back[index],
+                layout.column_forward[index],
+            );
+            assert!(
+                back.width > 0.0 && forward.width > 0.0,
+                "coluna {index} sem ‹ ›"
+            );
+            assert!(
+                back.x >= plus.x + plus.width,
+                "o ‹ vem depois do + na coluna {index}"
+            );
+            assert!(
+                forward.x >= back.x + back.width,
+                "o › vem depois do ‹ na coluna {index}"
+            );
+            if index + 1 < 3 {
+                assert!(
+                    forward.x + forward.width <= layout.columns[index + 1].x,
+                    "os ‹ › da coluna {index} invadem a coluna seguinte"
+                );
+            }
+            let center = |rect: UiRect| (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+            assert_eq!(
+                layout.hit(center(back).0, center(back).1),
+                Some(BarHit::ColumnBack(index))
+            );
+            assert_eq!(
+                layout.hit(center(forward).0, center(forward).1),
+                Some(BarHit::ColumnForward(index))
+            );
+        }
+        // Janela estreita: a pilula encolhe primeiro; o par ou cabe na faixa da
+        // coluna ou desaparece -- nunca fica por cima da IA seguinte.
+        for width in (560..=1600).step_by(20) {
+            let narrow =
+                BarLayout::with_contexts(width as f64, 1.0, true, BarColumns::even(3), [0, 0, 0]);
+            for index in 0..2 {
+                let forward = narrow.column_forward[index];
+                assert!(
+                    forward.width == 0.0
+                        || forward.x + forward.width <= narrow.columns[index + 1].x,
+                    "a {width}px os ‹ › da coluna {index} invadem a coluna seguinte"
+                );
+            }
+        }
+        // Sem fonte aberta ao lado, nao ha o par da fonte.
+        assert_eq!(layout.back.width, 0.0);
+        // Com a fonte aberta, o par dela fica a esquerda do rotulo.
+        let drawer = right_controls(1440.0, 1.0, true);
+        let ((back, forward), (label, _, _)) = (
+            drawer.split_nav.expect("‹ › da fonte"),
+            drawer.split.expect("gaveta"),
+        );
+        assert!(forward.x + forward.width <= label.x && back.x + back.width <= forward.x);
         assert!(
-            back.width > 0.0 && forward.width > 0.0,
-            "os botoes tem de existir"
-        );
-        assert!(back.x >= home.x + home.width, "o ‹ vem depois do Home");
-        assert!(forward.x >= back.x + back.width, "o › vem depois do ‹");
-        assert!(
-            layout.columns[0].x >= forward.x + forward.width,
-            "a pilula do primeiro provedor nao pode tapar o ›"
-        );
-        let center = |rect: UiRect| (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
-        assert_eq!(
-            layout.hit(center(back).0, center(back).1),
-            Some(BarHit::Back)
-        );
-        assert_eq!(
-            layout.hit(center(forward).0, center(forward).1),
-            Some(BarHit::Forward)
-        );
-        assert_eq!(
-            layout.hit(center(home).0, center(home).1),
-            Some(BarHit::Home)
+            drawer.private.x + drawer.private.width <= back.x,
+            "Privado antes do par"
         );
     }
 
