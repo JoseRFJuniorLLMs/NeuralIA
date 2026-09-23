@@ -174,9 +174,13 @@ fn benign_two_mib_fixture_extracts_quickly() {
 }
 
 #[test]
-fn deeply_nested_blocks_do_not_rewalk_the_tree() {
+fn deeply_nested_blocks_preserve_inner_text() {
     // blockquote dentro de blockquote: cada bloco lia a subarvore toda e o
-    // texto identico nunca contava para MAX_BLOCKS, logo quadratico.
+    // texto identico nunca contava para MAX_BLOCKS, logo quadratico. A
+    // linearidade do extractor e medida por razoes em
+    // hostile_nested_containers_extract_in_linear_time. Nesta fixture, o parse
+    // do html5ever domina o tempo e depende da velocidade do runner; o que
+    // importa aqui e preservar o texto do bloco mais profundo.
     let depth = 4_000;
     let mut html = String::from("<html><head><title>Fundo</title></head><body><article>");
     html.push_str(&"<blockquote>".repeat(depth));
@@ -184,13 +188,8 @@ fn deeply_nested_blocks_do_not_rewalk_the_tree() {
     html.push_str(&"</blockquote>".repeat(depth));
     html.push_str("</article></body></html>");
 
-    let (result, elapsed) = timed("blockquotes aninhados", &html);
-    let article = result.expect("blocos aninhados extraem");
+    let article = extract_article(&url(), &html).expect("blocos aninhados extraem");
     assert!(format!("{:?}", article.blocks).contains("fundo do poco"));
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "{depth} blockquotes demoraram {elapsed:?}"
-    );
 }
 
 #[test]
