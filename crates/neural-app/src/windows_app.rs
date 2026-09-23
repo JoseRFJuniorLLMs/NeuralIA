@@ -3322,6 +3322,9 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
 
     function fill(note, links) {
       openId = note ? note.id : null;
+      // Outra nota no editor: a resposta ao salvar de uma nota nova que
+      // ainda venha a caminho ja nao e desta.
+      savingNew = false;
       title.value = note ? note.title : '';
       body.value = note ? note.body : '';
       tags.value = note ? note.tags.join(', ') : '';
@@ -3342,6 +3345,9 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
         say('A nota passa de 200 KiB. Divida-a em duas.');
         return false;
       }
+      // Uma nota nova ainda sem id: um segundo pedido criava outra nota. O
+      // que se escrever entretanto fica por salvar ate o id chegar.
+      if (openId === null && savingNew) { say('A salvar…'); return false; }
       post('note-save', { id: openId, title: title.value.trim(), body: body.value, tags: tagList });
       savingNew = openId === null;
       dirty = false;
@@ -3383,6 +3389,9 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
             say('Nota salva.');
             refresh();
           } else {
+            // Uma nota que chega de fora (Ctrl+Shift+Z) nao deita fora o que
+            // estava por salvar no editor.
+            if (openId !== note.id) leave();
             fill(note, data.backlinks);
             showEditor();
             say(data.cause === 'created' ? 'Nota criada a partir da seleção.' : '');
@@ -20797,6 +20806,70 @@ process.stdout.write(JSON.stringify({
             assert_eq!(
                 panel_request(&store, &sent[1], T0 + 240),
                 NotesReply::Missing { id: saved.id }
+            );
+        }
+
+        /// Gate: a resposta ao salvar de uma nota nova da-lhe o id (o
+        /// salvar seguinte grava a MESMA nota), mas so enquanto o editor
+        /// ainda a mostra: com outra nota nova ja no editor, a resposta
+        /// atrasada nao lhe passa o id -- senao o salvar dela esmagava a
+        /// primeira. E um segundo Salvar antes do id nao cria outra nota.
+        #[test]
+        fn a_late_save_reply_never_hands_its_id_to_another_note() {
+            let dir = NotesDir::new("late");
+            let store = dir.store();
+            let start: Vec<String> = vec![
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                "__click($('note-new')); __type($('note-title'), 'Primeira');".into(),
+                "__click($('note-save')); __click($('note-save'));".into(),
+            ];
+            let first = run_panel(&start);
+            let sent = posted(&first);
+            assert_eq!(sent.len(), 1, "dois Salvar antes do id: {sent:?}");
+            let reply = panel_request(&store, &sent[0], T0);
+            let NotesReply::Opened { note: primeira, .. } = &reply else {
+                panic!("{reply:?}");
+            };
+
+            // A resposta chega com a Primeira ainda no editor: fica com o id.
+            let mut same = start.clone();
+            same.push(notes_reply_script(&reply));
+            same.push("__posted.length = 0; __type($('note-body'), 'mais');".into());
+            same.push("__click($('note-save'));".into());
+            let kept = posted(&run_panel(&same));
+            assert_eq!(kept.len(), 1);
+            assert!(matches!(
+                parse_panel_message(&kept[0]),
+                Some(PanelMessage::NoteSave(NoteEdit { id: Some(ref id), .. })) if *id == primeira.id
+            ));
+
+            // A resposta chega depois de "Nova nota": a Segunda fica nova.
+            let mut other = start;
+            other.push("__click($('note-new')); __type($('note-title'), 'Segunda');".into());
+            other.push(notes_reply_script(&reply));
+            other.push("__posted.length = 0; __click($('note-save'));".into());
+            let result = run_panel(&other);
+            let fresh = posted(&result);
+            assert_eq!(fresh.len(), 1);
+            assert_eq!(
+                parse_panel_message(&fresh[0]),
+                Some(PanelMessage::NoteSave(NoteEdit {
+                    id: None,
+                    title: "Segunda".to_string(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                }))
+            );
+            // E, gravada, e uma segunda nota: a Primeira fica como estava.
+            let NotesReply::Opened { note: segunda, .. } =
+                panel_request(&store, &fresh[0], T0 + 60)
+            else {
+                panic!("salvar a Segunda");
+            };
+            assert_ne!(segunda.id, primeira.id);
+            assert_eq!(
+                store.get(&primeira.id).expect("ler").expect("existe").title,
+                "Primeira"
             );
         }
 
