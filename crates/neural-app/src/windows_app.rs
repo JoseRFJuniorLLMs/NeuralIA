@@ -155,6 +155,12 @@ enum UserEvent {
         source_index: usize,
         url: String,
     },
+    /// Link que a propria fonte aberta ao lado mandou abrir noutra aba: a aba
+    /// nova herda o grupo da aba de onde saiu.
+    OpenSplitFromSplit {
+        source_index: usize,
+        url: String,
+    },
     OpenPrivateSplit {
         source_index: usize,
         url: String,
@@ -908,15 +914,13 @@ impl BarLayout {
                 kind: RowKind::Chip(self.group_pill_indices[column][visual]),
                 rect: self.group_pills[column][visual],
             })
-            .chain(
-                (0..self.context_tab_counts[column]).map(|visual| RowItem {
-                    kind: RowKind::Tab {
-                        context: self.context_indices[column][visual],
-                        owner: self.tab_owners[column][visual],
-                    },
-                    rect: self.context_tabs[column][visual],
-                }),
-            )
+            .chain((0..self.context_tab_counts[column]).map(|visual| RowItem {
+                kind: RowKind::Tab {
+                    context: self.context_indices[column][visual],
+                    owner: self.tab_owners[column][visual],
+                },
+                rect: self.context_tabs[column][visual],
+            }))
             .collect();
         items.sort_by(|a, b| a.rect.x.total_cmp(&b.rect.x));
         items
@@ -1582,11 +1586,12 @@ fn move_context_tab(
         .group
         .filter(|id| groups.iter().any(|group| group.id == *id));
     let mut tab = tabs.remove(from);
-    let at = drop
-        .before
-        .map_or(tabs.len(), |before| {
+    let at = drop.before.map_or(
+        tabs.len(),
+        |before| {
             if before > from { before - 1 } else { before }
-        });
+        },
+    );
     let at = contiguous_slot(tabs, at, group);
     tab.group = group;
     tabs.insert(at, tab);
@@ -1959,11 +1964,22 @@ fn plan_drop(
     let (first, last) = (items.first()?, items.last()?);
     let (x, y) = cursor;
     let margin = DROP_MARGIN * scale;
-    if y < 0.0
-        || y > first.rect.y + first.rect.height + margin
-        || x < first.rect.x - margin
-        || x > last.rect.x + last.rect.width + margin
+    // A folga nas pontas nunca invade a fila de outra IA: por cima de uma aba
+    // da coluna vizinha nao se larga nada nesta.
+    let mut low = first.rect.x - margin;
+    let mut high = last.rect.x + last.rect.width + margin;
+    if let Some(previous) = (0..column)
+        .rev()
+        .find_map(|index| layout.row_items(index).last().copied())
     {
+        low = low.max(previous.rect.x + previous.rect.width);
+    }
+    if let Some(next) =
+        (column + 1..layout.columns_len).find_map(|index| layout.row_items(index).first().copied())
+    {
+        high = high.min(next.rect.x);
+    }
+    if y < 0.0 || y > first.rect.y + first.rect.height + margin || x < low || x >= high {
         return None;
     }
 
@@ -2048,8 +2064,7 @@ fn plan_drop(
                     RowKind::Tab {
                         context,
                         owner: Some(group),
-                    } => run(group)
-                        .map(|(start, end)| if context == start { start } else { end }),
+                    } => run(group).map(|(start, end)| if context == start { start } else { end }),
                     RowKind::Tab { context, .. } => Some(context),
                     RowKind::Chip(group) => run(group).map(|(start, _)| start),
                 },
@@ -2098,6 +2113,65 @@ fn apply_drop(
             .is_some_and(|from| move_context_tab(tabs, groups, from, drop)),
         (DragItem::Group(id), DropSpot::Group { before }) => move_context_group(tabs, id, before),
         _ => false,
+    }
+}
+
+/// Fecha a aba `index` da coluna (o x dela ou "Fechar aba" no menu) e poda o
+/// grupo que fique vazio. Devolve a identidade da aba fechada, para o App
+/// saber se era a que estava aberta ao lado. A coluna nunca fica sem nada: a
+/// IA dela continua la, as abas sao so o que se abriu a partir dela.
+fn remove_context_tab(
+    tabs: &mut Vec<ContextTab>,
+    groups: &mut Vec<ContextGroup>,
+    index: usize,
+) -> Option<u64> {
+    if index >= tabs.len() {
+        return None;
+    }
+    let closed = tabs.remove(index);
+    prune_empty_groups(tabs, groups);
+    Some(closed.id)
+}
+
+/// Botao esquerdo em baixo sobre um alvo da fila de abas (aba, x ou pilula).
+/// O clique so se decide ao largar: ate la o gesto pode virar arrasto.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TabPress {
+    /// Onde o botao desceu, em pixeis do cliente.
+    origin: (f64, f64),
+    /// O alvo sob o rato quando o botao desceu.
+    hit: BarHit,
+    /// A coluna e o que se arrasta se o rato andar; `None` no x, que nao se
+    /// arrasta (como no Chrome).
+    drag: Option<(usize, DragItem)>,
+    /// Ja passou o limiar: e um arrasto, ja nao e um clique.
+    dragging: bool,
+}
+
+/// O que o largar do botao esquerdo faz depois de um `TabPress`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabRelease {
+    /// Premido e largado no mesmo alvo: e um clique nele.
+    Click(BarHit),
+    /// Fim de um arrasto: o item cai onde o rato esta.
+    Drop { source_index: usize, item: DragItem },
+    /// Largado noutro sitio sem arrastar: nada. Carregar no x e fugir com o
+    /// rato nao fecha a aba -- a mesma regra dos botoes da janela.
+    Nothing,
+}
+
+fn tab_release(press: TabPress, released: Option<BarHit>) -> TabRelease {
+    if press.dragging {
+        return press
+            .drag
+            .map_or(TabRelease::Nothing, |(source_index, item)| {
+                TabRelease::Drop { source_index, item }
+            });
+    }
+    if released == Some(press.hit) {
+        TabRelease::Click(press.hit)
+    } else {
+        TabRelease::Nothing
     }
 }
 
@@ -3786,6 +3860,123 @@ fn pick_theme_from_menu(hwnd: HWND) -> Option<ThemeChoice> {
             .and_then(|id| id.checked_sub(1))
             .and_then(|index| ThemeChoice::ALL.get(index).copied())
     }
+}
+
+/// Pixeis BGRA de um disco da cor `color` com a borda suave, com o alfa ja
+/// multiplicado nos canais -- o que o menu espera de um bitmap de 32 bits.
+fn swatch_pixels(color: Rgb, size: i32) -> Vec<u8> {
+    let size = size.max(1);
+    let center = size as f32 / 2.0;
+    let radius = center - 1.0;
+    let mut pixels = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 + 0.5 - center;
+            let dy = y as f32 + 0.5 - center;
+            let coverage = (radius - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0);
+            let alpha = (coverage * 255.0).round() as u32;
+            let channel = |value: u8| ((value as u32 * alpha + 127) / 255) as u8;
+            pixels.extend_from_slice(&[
+                channel(color.2),
+                channel(color.1),
+                channel(color.0),
+                alpha as u8,
+            ]);
+        }
+    }
+    pixels
+}
+
+/// A amostra redonda de uma cor para um item de menu. Quem a pede apaga-a
+/// com `DeleteObject` depois do `DestroyMenu`: o menu nao e dono dos
+/// bitmaps dos seus itens. Nulo se o GDI recusar -- o item fica so com texto.
+unsafe fn color_swatch_bitmap(color: Rgb, size: i32) -> *mut core::ffi::c_void {
+    let size = size.max(8);
+    let screen = GetDC(std::ptr::null_mut());
+    if screen.is_null() {
+        return std::ptr::null_mut();
+    }
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: size,
+            biHeight: -size,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            biSizeImage: 0,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        },
+        bmiColors: [windows_sys::Win32::Graphics::Gdi::RGBQUAD {
+            rgbBlue: 0,
+            rgbGreen: 0,
+            rgbRed: 0,
+            rgbReserved: 0,
+        }; 1],
+    };
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let bitmap = CreateDIBSection(
+        screen,
+        &info,
+        DIB_RGB_COLORS,
+        &mut bits,
+        std::ptr::null_mut(),
+        0,
+    );
+    ReleaseDC(std::ptr::null_mut(), screen);
+    if bitmap.is_null() || bits.is_null() {
+        if !bitmap.is_null() {
+            DeleteObject(bitmap as _);
+        }
+        return std::ptr::null_mut();
+    }
+    let pixels = swatch_pixels(color, size);
+    std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u8, pixels.len());
+    bitmap as _
+}
+
+/// Acrescenta ao menu um item com texto e, a esquerda, a amostra `swatch`
+/// (pode ser nula). `checked` marca-o como a escolha em vigor.
+unsafe fn append_swatch_item(
+    menu: *mut core::ffi::c_void,
+    id: usize,
+    label: &[u16],
+    swatch: *mut core::ffi::c_void,
+    checked: bool,
+) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetMenuItemCount, InsertMenuItemW, MENUITEMINFOW, MFS_CHECKED, MFT_RADIOCHECK, MFT_STRING,
+        MIIM_BITMAP, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING,
+    };
+    let info = MENUITEMINFOW {
+        cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+        fMask: MIIM_ID
+            | MIIM_STRING
+            | MIIM_FTYPE
+            | MIIM_STATE
+            | if swatch.is_null() { 0 } else { MIIM_BITMAP },
+        fType: MFT_STRING | if checked { MFT_RADIOCHECK } else { 0 },
+        fState: if checked { MFS_CHECKED } else { 0 },
+        wID: id as u32,
+        hSubMenu: std::ptr::null_mut(),
+        hbmpChecked: std::ptr::null_mut(),
+        hbmpUnchecked: std::ptr::null_mut(),
+        dwItemData: 0,
+        dwTypeData: label.as_ptr() as *mut u16,
+        cch: label.len().saturating_sub(1) as u32,
+        hbmpItem: swatch as _,
+    };
+    InsertMenuItemW(menu, GetMenuItemCount(menu).max(0) as u32, 1, &info);
+}
+
+/// O botao principal do rato esta em baixo, tal como a fila de mensagens o
+/// ve (botoes trocados nas Definicoes incluidos: e o estado logico).
+fn left_button_down() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_LBUTTON};
+    unsafe { GetKeyState(VK_LBUTTON as i32) < 0 }
 }
 
 /// Pede o WM_MOUSELEAVE a um botao nativo: sem ele a dica ficava a vista
@@ -5714,6 +5905,7 @@ impl App {
         self.schedule_home_restoration();
 
         self.bar_hover = None;
+        self.tab_press = None;
         self.status = None;
         self.next_home_frame = Instant::now();
         self.show_omnibox(true);
@@ -6764,6 +6956,7 @@ impl App {
 
     fn activate_comparator(&mut self, sync_remote_buttons: bool) {
         self.bar_hover = None;
+        self.tab_press = None;
         self.surface = Surface::Comparator;
 
         // build_as_child nasce antes de self.comparator existir, portanto o
@@ -6826,6 +7019,7 @@ impl App {
             comp.minimized[idx] = false;
             comp.expanded = None;
             self.bar_hover = None;
+            self.tab_press = None;
             self.needs_clear = true;
             self.update_comparator_layout();
             self.sync_comparator_splitters();
@@ -6844,6 +7038,7 @@ impl App {
             };
         }
         self.bar_hover = None;
+        self.tab_press = None;
         self.needs_clear = true;
 
         // Expandir ocupa apenas a área de conteúdo. A titlebar do NeuralIA e
@@ -6901,6 +7096,7 @@ impl App {
         }
 
         self.bar_hover = None;
+        self.tab_press = None;
         self.needs_clear = true;
         self.update_comparator_layout();
         self.sync_comparator_splitters();
@@ -7305,7 +7501,7 @@ impl App {
                             url: target,
                         }
                     } else {
-                        UserEvent::OpenSplit {
+                        UserEvent::OpenSplitFromSplit {
                             source_index,
                             url: target,
                         }
@@ -7343,6 +7539,39 @@ impl App {
         allow_local: bool,
         private: bool,
         existing_context_id: Option<u64>,
+    ) -> bool {
+        self.open_split_opened_by(
+            source_index,
+            url,
+            allow_local,
+            private,
+            existing_context_id,
+            None,
+        )
+    }
+
+    /// Um link que a fonte aberta ao lado mandou abrir noutra aba: a aba nova
+    /// nasce no grupo da aba de onde saiu, como no Chrome.
+    fn open_split_from_split(&mut self, source_index: usize, url: String) {
+        let opener = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.split.as_ref())
+            .filter(|split| split.source_index == source_index && !split.private)
+            .and_then(|split| split.context_id);
+        let _ = self.open_split_opened_by(source_index, url, false, false, None, opener);
+    }
+
+    /// `opener`: a aba de onde o link saiu, quando saiu de uma aba. Se ela
+    /// estiver num grupo, a aba nova entra no fim do troco desse grupo.
+    fn open_split_opened_by(
+        &mut self,
+        source_index: usize,
+        url: String,
+        allow_local: bool,
+        private: bool,
+        existing_context_id: Option<u64>,
+        opener: Option<u64>,
     ) -> bool {
         match Self::split_request_fallback(self.surface, private) {
             SplitFallback::OpenSplit => {}
@@ -7474,6 +7703,7 @@ impl App {
                             &mut groups[source_index],
                             next_context_id,
                             valid.to_string(),
+                            opener,
                         ))
                     };
                     comp.split = Some(SplitView {
@@ -9756,11 +9986,12 @@ impl App {
         if closes_active {
             self.close_split();
         }
-        if let Some(comp) = &mut self.comparator
-            && context_index < comp.contexts[source_index].len()
-        {
-            comp.contexts[source_index].remove(context_index);
-            prune_empty_groups(&comp.contexts[source_index], &mut comp.groups[source_index]);
+        if let Some(comp) = &mut self.comparator {
+            let _ = remove_context_tab(
+                &mut comp.contexts[source_index],
+                &mut comp.groups[source_index],
+                context_index,
+            );
         }
         self.request_redraw();
     }
@@ -9908,42 +10139,74 @@ impl App {
     }
 
     fn context_menu_comparator(&mut self) {
-        let hit = self.comparator_bar_hit();
-        let Some(BarHit::ContextTab {
-            source_index,
-            context_index,
-        }) = hit
-        else {
+        // Um arrasto a meio acaba aqui: o menu tem o seu proprio ciclo de
+        // mensagens e o largar do botao esquerdo ja nao chegaria a barra.
+        self.tab_press = None;
+        hover_tooltip(std::ptr::null_mut(), "");
+        match self.comparator_bar_hit() {
+            Some(
+                BarHit::ContextTab {
+                    source_index,
+                    context_index,
+                }
+                | BarHit::CloseTab {
+                    source_index,
+                    context_index,
+                },
+            ) => self.show_tab_menu(source_index, context_index),
+            Some(BarHit::ContextGroup {
+                source_index,
+                group_index,
+            }) => self.show_group_menu(source_index, group_index),
+            _ => {}
+        }
+    }
+
+    /// Onde o menu do botao direito abre: no cursor, em coordenadas de ecra.
+    fn bar_menu_point(&self, hwnd: HWND) -> POINT {
+        let mut point = POINT {
+            x: self.cursor.0.round() as i32,
+            y: self.cursor.1.round() as i32,
+        };
+        unsafe {
+            ClientToScreen(hwnd, &mut point);
+        }
+        point
+    }
+
+    fn show_tab_menu(&mut self, source_index: usize, context_index: usize) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::MF_POPUP;
+        let Some(hwnd) = self.window.as_ref().and_then(window_hwnd) else {
             return;
         };
-        let Some(window) = &self.window else {
-            return;
-        };
-        let Some(hwnd) = window_hwnd(window) else {
-            return;
-        };
+        let scale = self
+            .window
+            .as_ref()
+            .map_or(1.0, |window| window.scale_factor().max(1.0));
 
         // Lidos antes de abrir o menu: dentro do bloco `unsafe` ja nao ha
         // emprestimo do estado que sobreviva ao `TrackPopupMenu`.
-        let (existing_groups, in_group) = self
-            .comparator
-            .as_ref()
-            .map(|comp| {
-                let current_group = comp.contexts[source_index]
-                    .get(context_index)
-                    .and_then(|tab| tab.group);
-                (
-                    Self::joinable_context_groups(&comp.groups[source_index], current_group),
-                    current_group.is_some(),
-                )
-            })
-            .unwrap_or_default();
+        let Some((joinable, colors, in_group)) = self.comparator.as_ref().and_then(|comp| {
+            let tab = comp.contexts.get(source_index)?.get(context_index)?;
+            let groups = &comp.groups[source_index];
+            let joinable = Self::joinable_context_groups(groups, tab.group);
+            let colors: Vec<Rgb> = joinable
+                .iter()
+                .map(|(index, _)| groups.get(*index).map_or((0, 0, 0), |g| g.color.rgb()))
+                .collect();
+            Some((joinable, colors, tab.group.is_some()))
+        }) else {
+            return;
+        };
+        let point = self.bar_menu_point(hwnd);
 
-        let command = unsafe {
+        let selected = unsafe {
             let menu = CreatePopupMenu();
             if menu.is_null() {
                 return;
             }
+            // Os textos vivem ate ao fim do bloco: o menu so os le enquanto
+            // esta aberto.
             let open = wide_null("Abrir");
             let fullscreen = wide_null("Abrir em tela cheia");
             let close = wide_null("Fechar aba");
@@ -9957,6 +10220,12 @@ impl App {
             } else {
                 "Fechar todas as abas sem grupo"
             });
+            let new_group = wide_null("Adicionar a um novo grupo");
+            let move_to = wide_null("Mover para o grupo");
+            let ungroup = wide_null("Remover do grupo");
+            let join_labels: Vec<Vec<u16>> =
+                joinable.iter().map(|(_, name)| wide_null(name)).collect();
+
             AppendMenuW(menu, MF_STRING, TAB_MENU_OPEN, open.as_ptr());
             AppendMenuW(menu, MF_STRING, TAB_MENU_FULLSCREEN, fullscreen.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
@@ -9969,32 +10238,35 @@ impl App {
             );
             AppendMenuW(menu, MF_STRING, TAB_MENU_CLOSE_ALL, close_all.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-            let new_group = wide_null("Novo grupo com esta aba");
             AppendMenuW(menu, MF_STRING, TAB_MENU_NEW_GROUP, new_group.as_ptr());
-            // As entradas "juntar a" tem de sobreviver ao fim do bloco, senao
-            // o Win32 le ponteiros ja libertados enquanto desenha o menu.
-            let join_labels: Vec<Vec<u16>> = existing_groups
-                .iter()
-                .map(|(_, name)| wide_null(&format!("Juntar ao grupo \u{201C}{name}\u{201D}")))
-                .collect();
-            for (offset, label) in join_labels.iter().enumerate() {
-                AppendMenuW(
-                    menu,
-                    MF_STRING,
-                    TAB_MENU_GROUP_BASE + offset,
-                    label.as_ptr(),
-                );
+            // "Mover para o grupo ▸": um submenu com os outros grupos da
+            // coluna, cada um com a amostra da sua cor, como no Chrome.
+            let mut swatches: Vec<*mut core::ffi::c_void> = Vec::new();
+            if !joinable.is_empty() {
+                let submenu = CreatePopupMenu();
+                if !submenu.is_null() {
+                    let size = (16.0 * scale).round() as i32;
+                    for (offset, label) in join_labels.iter().enumerate() {
+                        let swatch = color_swatch_bitmap(colors[offset], size);
+                        if !swatch.is_null() {
+                            swatches.push(swatch);
+                        }
+                        append_swatch_item(
+                            submenu,
+                            TAB_MENU_GROUP_BASE + offset,
+                            label,
+                            swatch,
+                            false,
+                        );
+                    }
+                    // MF_POPUP: o submenu passa a ser do menu e morre com ele.
+                    AppendMenuW(menu, MF_POPUP, submenu as usize, move_to.as_ptr());
+                }
             }
             if in_group {
-                let ungroup = wide_null("Remover do grupo");
                 AppendMenuW(menu, MF_STRING, TAB_MENU_UNGROUP, ungroup.as_ptr());
             }
 
-            let mut point = windows_sys::Win32::Foundation::POINT {
-                x: self.cursor.0.round() as i32,
-                y: self.cursor.1.round() as i32,
-            };
-            ClientToScreen(hwnd, &mut point);
             let selected = TrackPopupMenu(
                 menu,
                 TPM_RETURNCMD | TPM_RIGHTBUTTON,
@@ -10005,31 +10277,296 @@ impl App {
                 std::ptr::null(),
             ) as usize;
             DestroyMenu(menu);
+            // Os bitmaps dos itens nao sao do menu: apagam-se depois dele.
+            for swatch in swatches {
+                DeleteObject(swatch as _);
+            }
             selected
         };
 
-        match command {
-            TAB_MENU_OPEN => {
+        match tab_menu_command(selected, &joinable) {
+            Some(TabMenuCommand::Open) => {
                 self.open_context_tab(source_index, context_index);
             }
-            TAB_MENU_FULLSCREEN => self.open_context_tab_fullscreen(source_index, context_index),
-            TAB_MENU_CLOSE => self.close_context_tab(source_index, context_index),
-            TAB_MENU_CLOSE_OTHERS => self.close_other_context_tabs(source_index, context_index),
-            TAB_MENU_CLOSE_ALL => self.close_all_context_tabs(source_index, context_index),
-            TAB_MENU_NEW_GROUP => self.group_context_tab(source_index, context_index),
-            TAB_MENU_UNGROUP => self.ungroup_context_tab(source_index, context_index),
-            other if other >= TAB_MENU_GROUP_BASE => {
-                let menu_index = other - TAB_MENU_GROUP_BASE;
-                if let Some((group_index, _)) = existing_groups.get(menu_index) {
-                    self.join_context_tab_group(source_index, context_index, *group_index);
-                }
+            Some(TabMenuCommand::Fullscreen) => {
+                self.open_context_tab_fullscreen(source_index, context_index)
             }
-            _ => {}
+            Some(TabMenuCommand::Close) => self.close_context_tab(source_index, context_index),
+            Some(TabMenuCommand::CloseOthers) => {
+                self.close_other_context_tabs(source_index, context_index)
+            }
+            Some(TabMenuCommand::CloseAll) => {
+                self.close_all_context_tabs(source_index, context_index)
+            }
+            Some(TabMenuCommand::NewGroup) => self.group_context_tab(source_index, context_index),
+            Some(TabMenuCommand::Ungroup) => self.ungroup_context_tab(source_index, context_index),
+            Some(TabMenuCommand::MoveToGroup(group_index)) => {
+                self.join_context_tab_group(source_index, context_index, group_index)
+            }
+            None => {}
         }
     }
 
-    fn click_comparator(&mut self) {
+    /// Botao direito na pilula de um grupo: a cor (com a atual marcada),
+    /// recolher/expandir, desagrupar e fechar -- o menu do grupo do Chrome.
+    fn show_group_menu(&mut self, source_index: usize, group_index: usize) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MF_DISABLED, MF_GRAYED};
+        let Some(hwnd) = self.window.as_ref().and_then(window_hwnd) else {
+            return;
+        };
+        let scale = self
+            .window
+            .as_ref()
+            .map_or(1.0, |window| window.scale_factor().max(1.0));
+        let Some((group_id, name, current, collapsed)) = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.groups.get(source_index))
+            .and_then(|groups| groups.get(group_index))
+            .map(|group| (group.id, group.name.clone(), group.color, group.collapsed))
+        else {
+            return;
+        };
+        let point = self.bar_menu_point(hwnd);
+
+        let selected = unsafe {
+            let menu = CreatePopupMenu();
+            if menu.is_null() {
+                return;
+            }
+            let title = wide_null(&format!("Grupo \u{201C}{name}\u{201D}"));
+            let toggle = wide_null(if collapsed {
+                "Expandir grupo"
+            } else {
+                "Recolher grupo"
+            });
+            let ungroup = wide_null("Desagrupar");
+            let close = wide_null("Fechar grupo");
+            let color_labels: Vec<Vec<u16>> = GroupColor::ALL
+                .iter()
+                .map(|color| wide_null(group_color_label(*color)))
+                .collect();
+
+            AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, title.as_ptr());
+            AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+            let size = (16.0 * scale).round() as i32;
+            let mut swatches: Vec<*mut core::ffi::c_void> = Vec::new();
+            for (index, color) in GroupColor::ALL.iter().enumerate() {
+                let swatch = color_swatch_bitmap(color.rgb(), size);
+                if !swatch.is_null() {
+                    swatches.push(swatch);
+                }
+                append_swatch_item(
+                    menu,
+                    GROUP_MENU_COLOR_BASE + index,
+                    &color_labels[index],
+                    swatch,
+                    *color == current,
+                );
+            }
+            AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+            AppendMenuW(menu, MF_STRING, GROUP_MENU_TOGGLE, toggle.as_ptr());
+            AppendMenuW(menu, MF_STRING, GROUP_MENU_UNGROUP, ungroup.as_ptr());
+            AppendMenuW(menu, MF_STRING, GROUP_MENU_CLOSE, close.as_ptr());
+
+            let selected = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                point.x,
+                point.y,
+                0,
+                hwnd,
+                std::ptr::null(),
+            ) as usize;
+            DestroyMenu(menu);
+            for swatch in swatches {
+                DeleteObject(swatch as _);
+            }
+            selected
+        };
+
+        if let Some(command) = group_menu_command(selected) {
+            self.apply_group_menu(source_index, group_id, command);
+        }
+    }
+
+    /// Executa um comando do menu do grupo. Se fechar a aba que esta aberta
+    /// ao lado, a gaveta fecha com ela.
+    fn apply_group_menu(&mut self, source_index: usize, group_id: u64, command: GroupMenuCommand) {
+        let Some(comp) = &mut self.comparator else {
+            return;
+        };
+        if source_index >= COMPARATOR_COLUMNS {
+            return;
+        }
+        let closed = apply_group_command(
+            &mut comp.contexts[source_index],
+            &mut comp.groups[source_index],
+            group_id,
+            command,
+        );
+        let closes_active = comp.split.as_ref().is_some_and(|split| {
+            split.source_index == source_index
+                && split.context_id.is_some_and(|id| closed.contains(&id))
+        });
+        if closes_active {
+            self.close_split();
+        }
+        self.request_redraw();
+    }
+
+    /// Botao esquerdo em baixo na barra. Abas, o x delas e as pilulas dos
+    /// grupos so decidem ao largar (podem virar arrasto); o resto responde ja.
+    fn press_comparator(&mut self) {
         let hit = self.comparator_bar_hit();
+        self.tab_press = hit.and_then(|hit| self.tab_press_for(hit));
+        if self.tab_press.is_some() {
+            hover_tooltip(std::ptr::null_mut(), "");
+            return;
+        }
+        self.click_comparator(hit);
+    }
+
+    fn tab_press_for(&self, hit: BarHit) -> Option<TabPress> {
+        let comp = self.comparator.as_ref()?;
+        let drag = match hit {
+            BarHit::ContextTab {
+                source_index,
+                context_index,
+            } => Some((
+                source_index,
+                DragItem::Tab(comp.contexts.get(source_index)?.get(context_index)?.id),
+            )),
+            BarHit::ContextGroup {
+                source_index,
+                group_index,
+            } => Some((
+                source_index,
+                DragItem::Group(comp.groups.get(source_index)?.get(group_index)?.id),
+            )),
+            BarHit::CloseTab { .. } => None,
+            _ => return None,
+        };
+        Some(TabPress {
+            origin: self.cursor,
+            hit,
+            drag,
+            dragging: false,
+        })
+    }
+
+    /// O rato andou com o botao em baixo sobre uma aba ou pilula. Devolve
+    /// `true` enquanto for um arrasto: a barra redesenha o marcador e a dica
+    /// fica calada.
+    fn track_tab_drag(&mut self) -> bool {
+        let Some(mut press) = self.tab_press else {
+            return false;
+        };
+        // Sem o botao em baixo, o largar perdeu-se (outra janela ficou com o
+        // rato a meio do gesto): o gesto acaba aqui sem fazer nada.
+        if !left_button_down() {
+            self.tab_press = None;
+            if press.dragging {
+                self.request_redraw();
+            }
+            return false;
+        }
+        let scale = self
+            .window
+            .as_ref()
+            .map_or(1.0, |window| window.scale_factor().max(1.0));
+        if !press.dragging && press.drag.is_some() && drag_started(press.origin, self.cursor, scale)
+        {
+            press.dragging = true;
+            self.bar_hover = None;
+            hover_tooltip(std::ptr::null_mut(), "");
+        }
+        self.tab_press = Some(press);
+        if press.dragging {
+            self.request_redraw();
+        }
+        press.dragging
+    }
+
+    /// Botao esquerdo largado: completa o clique, larga o arrasto ou nada.
+    fn release_comparator(&mut self) {
+        let Some(press) = self.tab_press.take() else {
+            return;
+        };
+        if self.surface != Surface::Comparator {
+            return;
+        }
+        let released = self.comparator_bar_hit();
+        match tab_release(press, released) {
+            TabRelease::Click(hit) => self.click_comparator(Some(hit)),
+            TabRelease::Drop { source_index, item } => self.drop_dragged(source_index, item),
+            TabRelease::Nothing => {}
+        }
+        self.update_bar_hover();
+        self.request_redraw();
+    }
+
+    /// Larga a aba (ou o grupo) arrastada onde o rato esta, com o mesmo plano
+    /// que a barra desenhou durante o arrasto.
+    fn drop_dragged(&mut self, source_index: usize, item: DragItem) {
+        let Some(layout) = self.bar_layout() else {
+            return;
+        };
+        let scale = self
+            .window
+            .as_ref()
+            .map_or(1.0, |window| window.scale_factor().max(1.0));
+        let cursor = self.cursor;
+        let Some(comp) = &mut self.comparator else {
+            return;
+        };
+        if source_index >= COMPARATOR_COLUMNS {
+            return;
+        }
+        if let Some(plan) = plan_drop(
+            &layout,
+            source_index,
+            &comp.contexts[source_index],
+            &comp.groups[source_index],
+            item,
+            cursor,
+            scale,
+        ) {
+            let _ = apply_drop(
+                &mut comp.contexts[source_index],
+                &mut comp.groups[source_index],
+                item,
+                plan.spot,
+            );
+        }
+    }
+
+    /// O que a barra desenha do arrasto em curso, se houver um.
+    fn drag_paint(&self) -> Option<DragPaint> {
+        let press = self.tab_press.filter(|press| press.dragging)?;
+        let (source_index, item) = press.drag?;
+        let layout = self.bar_layout()?;
+        let comp = self.comparator.as_ref()?;
+        let scale = self
+            .window
+            .as_ref()
+            .map_or(1.0, |window| window.scale_factor().max(1.0));
+        let plan = plan_drop(
+            &layout,
+            source_index,
+            comp.contexts.get(source_index)?,
+            comp.groups.get(source_index)?,
+            item,
+            self.cursor,
+            scale,
+        );
+        Some(DragPaint::from_plan(source_index, item, plan))
+    }
+
+    /// O que um clique no alvo `hit` da barra faz. Os botoes respondem ao
+    /// premir; abas, o x e as pilulas chegam aqui ao largar, pelo
+    /// `release_comparator`.
+    fn click_comparator(&mut self, hit: Option<BarHit>) {
         // O clique pode trocar a superficie; a dica nao fica a flutuar sobre
         // a tela nova.
         hover_tooltip(std::ptr::null_mut(), "");
@@ -10065,6 +10602,10 @@ impl App {
             }) => {
                 self.open_context_tab(source_index, context_index);
             }
+            Some(BarHit::CloseTab {
+                source_index,
+                context_index,
+            }) => self.close_context_tab(source_index, context_index),
             Some(BarHit::ContextGroup {
                 source_index,
                 group_index,
@@ -11002,6 +11543,9 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::OpenSplit { source_index, url } => {
                 let _ = self.open_split(source_index, url, false);
             }
+            UserEvent::OpenSplitFromSplit { source_index, url } => {
+                self.open_split_from_split(source_index, url);
+            }
             UserEvent::OpenPrivateSplit { source_index, url } => {
                 let _ = self.open_split_mode(source_index, url, false, true, None);
             }
@@ -11156,6 +11700,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     Surface::Comparator => {
+                        let drag = self.drag_paint();
                         if let Some(window) = &self.window
                             && let Some(comp) = &self.comparator
                         {
@@ -11165,6 +11710,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.bar_hover,
                                 self.bar_visible(),
                                 self.auto_scroll,
+                                drag,
                             );
                         }
                     }
@@ -11215,7 +11761,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
-                if self.surface == Surface::Comparator && self.bar_visible() {
+                // A arrastar uma aba ou um grupo, a barra so redesenha o
+                // marcador; o realce e as dicas esperam pelo largar.
+                let dragging = self.surface == Surface::Comparator && self.track_tab_drag();
+                if !dragging && self.surface == Surface::Comparator && self.bar_visible() {
                     self.update_bar_hover();
                 }
                 self.update_home_go_hover();
@@ -11239,9 +11788,14 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => match self.surface {
                 Surface::Home => self.click_home(),
-                Surface::Comparator => self.click_comparator(),
+                Surface::Comparator => self.press_comparator(),
                 _ => {}
             },
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => self.release_comparator(),
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Right,
@@ -12738,14 +13292,7 @@ unsafe fn draw_context_tab(
     (label_font, glyph_font): (*mut core::ffi::c_void, *mut core::ffi::c_void),
     background: Rgb,
 ) {
-    fill_pill(
-        hdc,
-        rect,
-        rect.height / 2.0,
-        fill,
-        Some(border),
-        background,
-    );
+    fill_pill(hdc, rect, rect.height / 2.0, fill, Some(border), background);
     let right_edge = rect.x + rect.width;
     let inset = if close_slot.width > 0.0 {
         right_edge - close_slot.x + 2.0 * scale
@@ -16870,6 +17417,7 @@ __fire('submit', at(login));
                 &mut groups,
                 &mut next_id,
                 format!("https://example.com/{index}"),
+                None,
             );
         }
         assert_eq!(tabs.len(), 32);
