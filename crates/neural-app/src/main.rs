@@ -12,6 +12,10 @@
 mod ipc;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod pdf_assets;
+// O script da leitura em voz alta e os seus gates (node:vm) nao dependem do
+// Windows: correm tambem no CI Linux.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod read_aloud;
 #[cfg(target_os = "windows")]
 mod windows_app;
 

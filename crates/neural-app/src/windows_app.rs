@@ -23,6 +23,7 @@ use crate::pomodoro_ui::{
     POMODORO_COMMAND_HELP, PomodoroCommand, PomodoroController, PomodoroMenuItem, PomodoroTick,
     TickSchedule, parse_pomodoro_command, phase_color, pomodoro_menu_command,
 };
+use crate::read_aloud::READ_ALOUD_SCRIPT;
 use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentRuntimeConfig,
     AgentSecurityAction, CoreConfig, FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent,
@@ -7014,8 +7015,7 @@ impl App {
         let ipc_proxy = self.proxy.clone();
         let capability = remote_capability();
         let ipc_capability = capability.clone();
-        let init_script = format!("{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}")
-            .replace("__NEURALIA_CAP__", &capability);
+        let init_script = Self::reader_init_script(&capability);
 
         themed_webview_builder()
             .with_initialization_script(init_script)
@@ -7064,6 +7064,15 @@ impl App {
             })
             .with_permission_handler(|_| PermissionResponse::Deny)
             .with_focused(true)
+    }
+
+    /// O que o Modo Leitura injeta no document-created: o mapa de teclas, o
+    /// rail de secoes e a leitura em voz alta (SPEC-0110), que se liga sozinha
+    /// ao artigo. O HTML do Reader tem `script-src 'none'`; os
+    /// initialization scripts do WebView2 correm na mesma.
+    fn reader_init_script(capability: &str) -> String {
+        format!("{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}\n{READ_ALOUD_SCRIPT}")
+            .replace("__NEURALIA_CAP__", capability)
     }
 
     fn external_webview_builder(
@@ -12559,6 +12568,11 @@ fn serve_pdf_asset(
             Cow::Borrowed(PDF_VIEWER_HTML),
         ),
         "/viewer.mjs" => (200, "text/javascript", Cow::Borrowed(PDF_VIEWER_JS)),
+        "/read-aloud.js" => (
+            200,
+            "text/javascript",
+            Cow::Borrowed(READ_ALOUD_SCRIPT.as_bytes()),
+        ),
         "/pdf.mjs" => (200, "text/javascript", Cow::Borrowed(PDFJS_CORE)),
         "/pdf.worker.mjs" => (200, "text/javascript", Cow::Borrowed(PDFJS_WORKER)),
         "/document.pdf" => {
@@ -16847,6 +16861,7 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
             ("/viewer.html", true, "text/html; charset=utf-8", 200),
             ("/", true, "text/html; charset=utf-8", 200),
             ("/viewer.mjs", false, "text/javascript", 200),
+            ("/read-aloud.js", false, "text/javascript", 200),
             ("/pdf.mjs", false, "text/javascript", 200),
             ("/pdf.worker.mjs", false, "text/javascript", 200),
             ("/document.pdf", false, "application/pdf", 200),
@@ -16945,6 +16960,239 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
         assert!(PDF_VIEWER_CSP.contains("connect-src 'self'"));
         assert!(!PDF_VIEWER_CSP.contains("https:"));
         assert!(!PDF_VIEWER_CSP.contains("http:"));
+    }
+
+    fn pdf_request(path: &str) -> Request<Vec<u8>> {
+        Request::builder()
+            .uri(format!("{PDF_ORIGIN}{path}"))
+            .body(Vec::new())
+            .expect("pedido de teste")
+    }
+
+    #[test]
+    fn pdf_viewer_loads_read_aloud_from_its_own_origin_and_gains_no_network_source() {
+        // SPEC-0110, fase offline. O viewer.html pede o read-aloud.js a
+        // propria origem, e ele sai do serve_pdf_asset byte a byte como
+        // embarca, com o tipo certo.
+        let html = std::str::from_utf8(PDF_VIEWER_HTML).expect("viewer.html e UTF-8");
+        let sources: Vec<&str> = html
+            .split("<script")
+            .skip(1)
+            .filter_map(|tag| {
+                let tag = tag.split('>').next()?;
+                tag.split("src=\"").nth(1)?.split('"').next()
+            })
+            .collect();
+        assert!(
+            sources.contains(&"./read-aloud.js"),
+            "viewer.html tem de carregar o read-aloud.js: {sources:?}"
+        );
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        for source in &sources {
+            let path = source.trim_start_matches('.');
+            let response = serve_pdf_asset(&bytes, &pdf_request(path));
+            assert_eq!(response.status().as_u16(), 200, "{path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("Content-Type")
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/javascript"),
+                "{path}"
+            );
+        }
+        let served = serve_pdf_asset(&bytes, &pdf_request("/read-aloud.js"));
+        assert_eq!(served.body().as_ref(), READ_ALOUD_SCRIPT.as_bytes());
+
+        // A leitura offline nao abre ligacao nenhuma: o connect-src continua a
+        // ser so 'self' e nenhuma diretiva ganha uma origem de rede (ws:,
+        // wss:, http:, https: ou um host). So blob: e data: tem ':'.
+        let directives: Vec<(&str, Vec<&str>)> = PDF_VIEWER_CSP
+            .split(';')
+            .filter_map(|directive| {
+                let mut parts = directive.split_whitespace();
+                Some((parts.next()?, parts.collect()))
+            })
+            .collect();
+        let connect = directives
+            .iter()
+            .find(|(name, _)| *name == "connect-src")
+            .map(|(_, values)| values.clone());
+        assert_eq!(connect, Some(vec!["'self'"]));
+        for (name, values) in &directives {
+            for value in values {
+                assert!(
+                    !value.contains(':') || *value == "blob:" || *value == "data:",
+                    "{name} ganhou uma origem de rede: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_shift_u_reads_the_pdf_aloud_and_esc_stops_without_leaving_the_document() {
+        // O mapa de teclas QUE EMBARCA (initialization script do PDF) e o
+        // read-aloud.js que a pagina carrega, no mesmo DOM, com propagacao
+        // real. Sem a captura na janela, Ctrl+Shift+U era o Ctrl+U de ver o
+        // codigo e o Esc da leitura saia do documento.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let keymap = NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", CAP);
+        let drive = r#"
+__contentLoaded();
+__speech.setVoices([__voice('br', 'pt-BR', true)]);
+__pdf([[{ str: 'Uma frase. Outra frase.', eol: false }]]);
+__renderPage(0);
+const state = () => __byId('neuralia-ra-bar').getAttribute('data-state');
+__key({ key: 'U', ctrlKey: true, shiftKey: true });
+await __settle();
+const out = { reading: state(), said: __said().slice(), posted: __posted.length };
+__key({ key: 'Escape' });
+await __settle();
+out.afterEsc = state();
+out.barHidden = __byId('neuralia-ra-bar').hidden;
+out.postedAfterEsc = __posted.length;
+// Leitura fechada: o Esc e o Ctrl+U voltam a ser do mapa de teclas.
+__key({ key: 'Escape' });
+__key({ key: 'u', ctrlKey: true });
+return out;
+"#;
+        let outcome = crate::read_aloud::harness::run(
+            &[
+                ("keymap", keymap.as_str()),
+                ("read-aloud.js", READ_ALOUD_SCRIPT),
+            ],
+            "http://neuralia-pdf.localhost/viewer.html",
+            drive,
+        );
+        let result = crate::read_aloud::harness::clean_result(&outcome);
+        assert_eq!(result["reading"], serde_json::json!("speaking"));
+        assert_eq!(result["said"], serde_json::json!(["Uma frase."]));
+        assert_eq!(
+            result["posted"],
+            serde_json::json!(0),
+            "Ctrl+Shift+U nao e ver o codigo"
+        );
+        assert_eq!(result["afterEsc"], serde_json::json!("idle"));
+        assert_eq!(result["barHidden"], serde_json::json!(true));
+        assert_eq!(
+            result["postedAfterEsc"],
+            serde_json::json!(0),
+            "o Esc que para a leitura nao fecha o PDF"
+        );
+        let actions: Vec<IpcAction> = outcome["posted"]
+            .as_array()
+            .expect("posted")
+            .iter()
+            .filter_map(|message| parse_ipc_message(message.as_str()?, CAP, 3))
+            .collect();
+        assert_eq!(actions, vec![IpcAction::Back, IpcAction::ViewSource]);
+    }
+
+    #[test]
+    fn esc_in_the_find_bar_closes_the_find_bar_and_keeps_reading() {
+        // A barra de procura do Ctrl+F (mapa de teclas) tem o seu Esc. Com a
+        // leitura a correr, o Esc escrito nela fecha-a e a leitura continua;
+        // o Esc seguinte, fora do campo, e que para a leitura.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let keymap = NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", CAP);
+        let drive = r#"
+__contentLoaded();
+__speech.setVoices([__voice('br', 'pt-BR', true)]);
+__pdf([[{ str: 'Uma frase. Outra frase.', eol: false }]]);
+__renderPage(0);
+const state = () => __byId('neuralia-ra-bar').getAttribute('data-state');
+__key({ key: 'U', ctrlKey: true, shiftKey: true });
+await __settle();
+__key({ key: 'f', ctrlKey: true });
+const out = { findOpen: !!__byId('neuralia-find'), focus: document.activeElement.tagName };
+__key({ key: 'Escape' });
+await __settle();
+out.findAfterEsc = !!__byId('neuralia-find');
+out.stateAfterFindEsc = state();
+document.activeElement = document.body;
+__key({ key: 'Escape' });
+await __settle();
+out.stateAfterSecondEsc = state();
+out.posted = __posted.length;
+return out;
+"#;
+        let outcome = crate::read_aloud::harness::run(
+            &[
+                ("keymap", keymap.as_str()),
+                ("read-aloud.js", READ_ALOUD_SCRIPT),
+            ],
+            "http://neuralia-pdf.localhost/viewer.html",
+            drive,
+        );
+        let result = crate::read_aloud::harness::clean_result(&outcome);
+        assert_eq!(result["findOpen"], serde_json::json!(true));
+        assert_eq!(result["focus"], serde_json::json!("INPUT"));
+        assert_eq!(result["findAfterEsc"], serde_json::json!(false));
+        assert_eq!(
+            result["stateAfterFindEsc"],
+            serde_json::json!("speaking"),
+            "o Esc da barra de procura nao e o Esc da leitura"
+        );
+        assert_eq!(result["stateAfterSecondEsc"], serde_json::json!("idle"));
+        assert_eq!(result["posted"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn reader_mode_reads_the_article_aloud_from_its_init_script() {
+        // O initialization script do Modo Leitura tal como o builder o monta:
+        // a leitura liga-se sozinha ao artigo, le titulo e blocos (cada bloco
+        // fecha a sua frase, codigo nao se le) e o Esc so para a leitura.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let init = App::reader_init_script(CAP);
+        let drive = r#"
+__speech.setVoices([__voice('br', 'pt-BR', true)]);
+__readerDom('Título do artigo', [
+  { tag: 'p', text: 'Primeiro parágrafo sem ponto final' },
+  { tag: 'h2', text: 'Secção' },
+  { tag: 'pre', text: 'codigo();' },
+  { tag: 'p', text: 'Fim do texto. Mesmo.' },
+]);
+__contentLoaded();
+__key({ key: 'U', ctrlKey: true, shiftKey: true });
+await __settle();
+const out = { first: __highlight().map((r) => [r.unit, r.text]) };
+for (let i = 0; i < 4; i++) { __speech.finish(); await __settle(); }
+out.said = __said().slice();
+out.highlight = __highlight().map((r) => [r.unit, r.text]);
+__key({ key: 'Escape' });
+await __settle();
+out.state = __byId('neuralia-ra-bar').getAttribute('data-state');
+out.posted = __posted.length;
+return out;
+"#;
+        let outcome = crate::read_aloud::harness::run(
+            &[("reader-init", init.as_str())],
+            "about:blank",
+            drive,
+        );
+        let result = crate::read_aloud::harness::clean_result(&outcome);
+        assert_eq!(
+            result["first"],
+            serde_json::json!([["r:title", "Título do artigo"]])
+        );
+        assert_eq!(
+            result["said"],
+            serde_json::json!([
+                "Título do artigo",
+                "Primeiro parágrafo sem ponto final",
+                "Secção",
+                "Fim do texto.",
+                "Mesmo."
+            ])
+        );
+        assert_eq!(result["highlight"], serde_json::json!([["r:3", "Mesmo."]]));
+        assert_eq!(result["state"], serde_json::json!("idle"));
+        assert_eq!(
+            result["posted"],
+            serde_json::json!(0),
+            "o Esc da leitura nao sai do Reader"
+        );
+        assert_eq!(outcome["net"], serde_json::json!([]));
     }
 
     #[test]

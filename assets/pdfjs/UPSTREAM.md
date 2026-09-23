@@ -1,8 +1,9 @@
 # Proveniência do PDF.js vendorizado
 
 `pdf.mjs` e `pdf.worker.mjs` são do PDF.js, copiados sem alterações. Os outros
-ficheiros desta pasta (`viewer.html`, `viewer.mjs`) são do NeuralIA e não têm
-upstream.
+ficheiros desta pasta (`viewer.html`, `viewer.mjs`, `read-aloud.js`) são do
+NeuralIA e não têm upstream. As regras CSS da camada de texto no `viewer.html`
+são adaptadas do `pdf_viewer.css` do PDF.js 6.3.289 (Apache-2.0, `LICENSE`).
 
 | Campo | Valor |
 |---|---|
