@@ -4377,6 +4377,23 @@ impl App {
                 self.finish_agent(reason);
             }
             AgentStepDecision::Extract => self.extract_agent_observation(&page),
+            AgentStepDecision::ConfirmExtract { security, reason } => {
+                let action = AgentAction::Extract {
+                    target: None,
+                    schema: "page-text".into(),
+                };
+                let approved =
+                    self.confirm_agent_action(&format!("{reason}: {}", page.url), &action);
+                if let Some(agent) = self.active_agent.as_mut() {
+                    agent.policy.record_user_confirmation(&security, approved);
+                }
+                if !approved {
+                    self.show_splash("Ação do agente cancelada.".to_string(), 3);
+                    self.finish_agent(AgentTermination::UserRejected);
+                    return;
+                }
+                self.extract_agent_observation(&page);
+            }
             AgentStepDecision::Act(act) => {
                 let AgentAct {
                     action,
@@ -7637,6 +7654,12 @@ enum AgentStepDecision {
     Stop(AgentTermination),
     /// O comando `extract`: guardar o texto observado e terminar.
     Extract,
+    /// O `extract` que a política só deixa seguir com um sim humano (a
+    /// página está numa origem que a sessão não aprovou).
+    ConfirmExtract {
+        security: AgentSecurityAction,
+        reason: String,
+    },
     /// Executar a ação (em `Box` porque é muitas vezes maior do que as outras
     /// duas variantes).
     Act(Box<AgentAct>),
@@ -7672,7 +7695,34 @@ fn decide_agent_step(
     };
 
     let action = match command {
-        BrowserAgentCommand::Extract => return AgentStepDecision::Extract,
+        // O `extract` escreve a página na memória semântica: passa pelo gate
+        // como os outros. Saltava-o, e depois de um clique que levasse a outra
+        // origem a página dessa origem entrava na memória sem diálogo e sem
+        // entrada na auditoria (SPEC-0105 §4).
+        BrowserAgentCommand::Extract => {
+            let security = app_agent_security_action(
+                &AgentAction::Extract {
+                    target: None,
+                    schema: "page-text".into(),
+                },
+                page,
+            );
+            let decision = policy.evaluate(&security);
+            if decision.allowed {
+                return AgentStepDecision::Extract;
+            }
+            if decision.risk == ActionRisk::Restricted {
+                return AgentStepDecision::Stop(AgentTermination::RestrictedAction);
+            }
+            if !decision.requires_confirmation {
+                policy.record_user_confirmation(&security, false);
+                return AgentStepDecision::Stop(AgentTermination::UserRejected);
+            }
+            return AgentStepDecision::ConfirmExtract {
+                security,
+                reason: decision.reason,
+            };
+        }
         BrowserAgentCommand::Search(value) => page
             .elements
             .iter()
@@ -11305,6 +11355,45 @@ mod tests {
                 }
             ));
             assert_eq!(policy.audit().len(), 1);
+        }
+
+        #[test]
+        fn extract_goes_through_the_policy_gate() {
+            // Um clique em A leva a B; o `extract` seguinte guardava a página
+            // de B na memória semântica sem diálogo e sem entrada de auditoria.
+            let mut other = page(vec![]);
+            other.url = "https://outra.example/conta".into();
+            let mut policy = policy();
+            let decision = decide(&[BrowserAgentCommand::Extract], &other, &mut policy);
+
+            assert_ne!(
+                decision,
+                AgentStepDecision::Extract,
+                "extract noutra origem sem um sim humano"
+            );
+            assert!(
+                matches!(
+                    &decision,
+                    AgentStepDecision::ConfirmExtract {
+                        security: AgentSecurityAction::Extract { origin },
+                        ..
+                    } if origin == "https://outra.example"
+                ),
+                "{decision:?}"
+            );
+            assert_eq!(policy.audit().len(), 1, "extract fora da auditoria");
+            let entry = &policy.audit()[0];
+            assert_eq!(entry.action, "extract");
+            assert!(entry.confirmation_required);
+            assert!(entry.reason.contains("cross-origin"), "{}", entry.reason);
+
+            // Na origem aprovada segue sem diálogo, mas fica auditado.
+            let same = page(vec![]);
+            let mut policy = self::policy();
+            let decision = decide(&[BrowserAgentCommand::Extract], &same, &mut policy);
+            assert_eq!(decision, AgentStepDecision::Extract);
+            assert_eq!(policy.audit().len(), 1);
+            assert!(policy.audit()[0].allowed);
         }
     }
 
