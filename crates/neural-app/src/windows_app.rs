@@ -4819,6 +4819,23 @@ impl App {
                 self.finish_agent(reason);
             }
             AgentStepDecision::Extract => self.extract_agent_observation(&page),
+            AgentStepDecision::ConfirmExtract { security, reason } => {
+                let action = AgentAction::Extract {
+                    target: None,
+                    schema: "page-text".into(),
+                };
+                let approved =
+                    self.confirm_agent_action(&format!("{reason}: {}", page.url), &action);
+                if let Some(agent) = self.active_agent.as_mut() {
+                    agent.policy.record_user_confirmation(&security, approved);
+                }
+                if !approved {
+                    self.show_splash("Ação do agente cancelada.".to_string(), 3);
+                    self.finish_agent(AgentTermination::UserRejected);
+                    return;
+                }
+                self.extract_agent_observation(&page);
+            }
             AgentStepDecision::Act(act) => {
                 let AgentAct {
                     action,
@@ -8171,6 +8188,12 @@ enum AgentStepDecision {
     Stop(AgentTermination),
     /// O comando `extract`: guardar o texto observado e terminar.
     Extract,
+    /// O `extract` que a política só deixa seguir com um sim humano (a
+    /// página está numa origem que a sessão não aprovou).
+    ConfirmExtract {
+        security: AgentSecurityAction,
+        reason: String,
+    },
     /// Executar a ação (em `Box` porque é muitas vezes maior do que as outras
     /// duas variantes).
     Act(Box<AgentAct>),
@@ -8206,7 +8229,34 @@ fn decide_agent_step(
     };
 
     let action = match command {
-        BrowserAgentCommand::Extract => return AgentStepDecision::Extract,
+        // O `extract` escreve a página na memória semântica: passa pelo gate
+        // como os outros. Saltava-o, e depois de um clique que levasse a outra
+        // origem a página dessa origem entrava na memória sem diálogo e sem
+        // entrada na auditoria (SPEC-0105 §4).
+        BrowserAgentCommand::Extract => {
+            let security = app_agent_security_action(
+                &AgentAction::Extract {
+                    target: None,
+                    schema: "page-text".into(),
+                },
+                page,
+            );
+            let decision = policy.evaluate(&security);
+            if decision.allowed {
+                return AgentStepDecision::Extract;
+            }
+            if decision.risk == ActionRisk::Restricted {
+                return AgentStepDecision::Stop(AgentTermination::RestrictedAction);
+            }
+            if !decision.requires_confirmation {
+                policy.record_user_confirmation(&security, false);
+                return AgentStepDecision::Stop(AgentTermination::UserRejected);
+            }
+            return AgentStepDecision::ConfirmExtract {
+                security,
+                reason: decision.reason,
+            };
+        }
         BrowserAgentCommand::Search(value) => page
             .elements
             .iter()
@@ -8490,13 +8540,63 @@ fn js_percent(value: &str) -> String {
         .replace('+', "%20")
 }
 
+/// Como o agente dá papel e nome a um elemento, num só texto que entra no
+/// `AGENT_OBSERVER_SCRIPT` e no guard do `agent_action_script`.
+///
+/// Eram duas fórmulas: o observador dizia `textbox`/`button`/`select` e o
+/// guard recalculava `el.type` (`text`, `submit`, `select-one`), sem o
+/// placeholder no nome. Nos controlos mais comuns o guard desistia em silêncio
+/// e o passo ficava no trace como feito. Com uma só definição não há o que
+/// divergir.
+macro_rules! agent_element_identity_js {
+    () => {
+        r#"
+  // `slice` conta unidades UTF-16 e pode partir um emoji: o surrogate que
+  // fica sozinho vira `\udXXX` no JSON, que o serde_json recusa, e a
+  // observacao inteira sumia. Qualquer surrogate sem par sai.
+  function clean(value, limit) {
+    return String(value || '').replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit)
+      .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
+  }
+
+  function fieldRole(el) {
+    const tag = (el.tagName || '').toLowerCase();
+    const type = (el.type || '').toLowerCase();
+    const autocomplete = (el.autocomplete || '').toLowerCase();
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    const name = (el.name || '').toLowerCase();
+    // Antes de tudo: o que o clique FAZ. Um submit de formulario e `submit`
+    // seja qual for o role ou o nome que a pagina lhe der; e o unico papel
+    // que faz o `app_agent_security_action` pedir confirmacao sem depender de
+    // o rotulo estar na lista de palavras.
+    if ((tag === 'button' && type === 'submit' && el.form) ||
+        (tag === 'input' && (type === 'submit' || type === 'image'))) return 'submit';
+    const combined = [type, autocomplete, role, name].join(' ');
+    if (combined.includes('password')) return 'password';
+    if (combined.includes('one-time') || combined.includes('otp')) return 'otp';
+    if (combined.includes('cc-') || combined.includes('card') || combined.includes('payment')) return 'payment-card';
+    if (combined.includes('email')) return 'email';
+    if (combined.includes('search')) return 'search';
+    if (tag === 'select') return 'select';
+    if (tag === 'input' || tag === 'textarea') return 'textbox';
+    return role || tag || 'element';
+  }
+
+  function elementName(el) {
+    return clean(el.getAttribute('aria-label') || el.name || el.innerText || el.textContent || el.placeholder, 96);
+  }
+"#
+    };
+}
+
 fn agent_action_script(action: &AgentAction) -> Result<String, String> {
     fn guard(target: &AgentElement) -> String {
         let id = js_percent(&target.id);
         let name = js_percent(&target.name);
         let role = js_percent(&target.role);
         format!(
-            "const id=decodeURIComponent('{id}');const expectedName=decodeURIComponent('{name}');             const expectedRole=decodeURIComponent('{role}');             const el=document.querySelector('[data-neuralia-agent-id=\"'+id+'\"]');             if(!el)return;             const actualName=((el.getAttribute('aria-label')||el.name||el.innerText||el.textContent||'').replace(/\\s+/g,' ').trim().slice(0,96));             const actualRole=(el.getAttribute('role')||el.type||el.tagName||'').toLowerCase();             if(expectedName && actualName!==expectedName)return;             if(expectedRole && actualRole!==expectedRole)return;"
+            "{identity}const id=decodeURIComponent('{id}');const expectedName=decodeURIComponent('{name}');             const expectedRole=decodeURIComponent('{role}');             const el=document.querySelector('[data-neuralia-agent-id=\"'+id+'\"]');             if(!el)return;             if(expectedName && elementName(el)!==expectedName)return;             if(expectedRole && fieldRole(el)!==expectedRole)return;",
+            identity = agent_element_identity_js!()
         )
     }
 
@@ -11986,6 +12086,556 @@ mod tests {
             ));
             assert_eq!(policy.audit().len(), 1);
         }
+
+        #[test]
+        fn extract_goes_through_the_policy_gate() {
+            // Um clique em A leva a B; o `extract` seguinte guardava a página
+            // de B na memória semântica sem diálogo e sem entrada de auditoria.
+            let mut other = page(vec![]);
+            other.url = "https://outra.example/conta".into();
+            let mut policy = policy();
+            let decision = decide(&[BrowserAgentCommand::Extract], &other, &mut policy);
+
+            assert_ne!(
+                decision,
+                AgentStepDecision::Extract,
+                "extract noutra origem sem um sim humano"
+            );
+            assert!(
+                matches!(
+                    &decision,
+                    AgentStepDecision::ConfirmExtract {
+                        security: AgentSecurityAction::Extract { origin },
+                        ..
+                    } if origin == "https://outra.example"
+                ),
+                "{decision:?}"
+            );
+            assert_eq!(policy.audit().len(), 1, "extract fora da auditoria");
+            let entry = &policy.audit()[0];
+            assert_eq!(entry.action, "extract");
+            assert!(entry.confirmation_required);
+            assert!(entry.reason.contains("cross-origin"), "{}", entry.reason);
+
+            // Na origem aprovada segue sem diálogo, mas fica auditado.
+            let same = page(vec![]);
+            let mut policy = self::policy();
+            let decision = decide(&[BrowserAgentCommand::Extract], &same, &mut policy);
+            assert_eq!(decision, AgentStepDecision::Extract);
+            assert_eq!(policy.audit().len(), 1);
+            assert!(policy.audit()[0].allowed);
+        }
+    }
+
+    /// Os gates do agente sobre o JavaScript que EMBARCA.
+    ///
+    /// O `AGENT_OBSERVER_SCRIPT` e o `agent_action_script` correm aqui dentro
+    /// de um DOM mínimo em Node (`node:vm`), e o que eles publicam passa pelo
+    /// mesmo caminho nativo do produto: `parse_ipc_message` →
+    /// `parse_agent_observation` → `decide_agent_step`. Asserções sobre o texto
+    /// do script não apanhavam nenhum destes defeitos (AGENTS.md §4.3): o
+    /// observador e o guard falavam vocabulários diferentes e os testes de
+    /// texto ficavam verdes.
+    mod agent_dom_gates {
+        use super::*;
+        use serde_json::{Value, json};
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+
+        /// Um DOM de brinquedo, com o que o observador e o guard usam: tipos
+        /// por omissão como no HTML (`<button>` é `submit`, `<select>` é
+        /// `select-one`), `setAttribute` a disparar o `MutationObserver`,
+        /// relógio falso para os `setTimeout` e o `postMessage` capturado.
+        const HARNESS: &str = r#"
+const vm = require('node:vm');
+const input = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+const page = input.page;
+const posts = [];
+const timers = new Map();
+const observers = [];
+let now = 0, seq = 0, mutated = false;
+function listeners(target, type) {
+  if (!target.__l) target.__l = {};
+  return target.__l[type] || (target.__l[type] = []);
+}
+class FakeEventTarget {}
+FakeEventTarget.prototype.addEventListener = function (type, fn) { listeners(this, type).push(fn); };
+FakeEventTarget.prototype.dispatchEvent = function (event) {
+  if (this.events) this.events.push(event.type);
+  for (const fn of listeners(this, event.type).slice()) fn.call(this, event);
+  return true;
+};
+class FakeEvent { constructor(type, init) { this.type = type; this.bubbles = !!(init && init.bubbles); this.isTrusted = false; } }
+const form = { submits: 0 };
+const NAMED = ['input', 'select', 'textarea', 'button', 'a'];
+class FakeElement extends FakeEventTarget {
+  constructor(spec) {
+    super();
+    this.spec = spec; this.tag = spec.tag; this.tagName = spec.tag.toUpperCase();
+    this.attrs = new Map(Object.entries(spec.attrs || {}));
+    this.clicks = 0; this.events = []; this.form = spec.form ? form : null;
+  }
+  getAttribute(name) { return this.attrs.has(name) ? String(this.attrs.get(name)) : null; }
+  setAttribute(name, value) { this.attrs.set(name, String(value)); mutated = true; }
+  get disabled() { return this.attrs.has('disabled'); }
+  get type() {
+    const t = (this.getAttribute('type') || '').toLowerCase();
+    if (this.tag === 'input') return t || 'text';
+    if (this.tag === 'button') return t === 'button' || t === 'reset' ? t : 'submit';
+    if (this.tag === 'select') return 'select-one';
+    if (this.tag === 'textarea') return 'textarea';
+    if (this.tag === 'a') return this.getAttribute('type') || '';
+    return undefined;
+  }
+  get name() { return NAMED.includes(this.tag) ? (this.getAttribute('name') || '') : undefined; }
+  get autocomplete() { return ['input', 'select', 'textarea'].includes(this.tag) ? (this.getAttribute('autocomplete') || '') : undefined; }
+  get placeholder() { return ['input', 'textarea'].includes(this.tag) ? (this.getAttribute('placeholder') || '') : undefined; }
+  get innerText() {
+    if (this.tag === 'select') return (this.spec.options || []).join('\n');
+    if (this.tag === 'input' || this.tag === 'textarea') return '';
+    return this.spec.text || '';
+  }
+  get textContent() {
+    if (this.tag === 'select') return (this.spec.options || []).join('');
+    if (this.tag === 'input') return '';
+    return this.spec.text || '';
+  }
+  getBoundingClientRect() { return this.spec.hidden ? { width: 0, height: 0 } : { width: 120, height: 24 }; }
+  focus() {}
+  click() { this.clicks += 1; if (this.form && this.type === 'submit') form.submits += 1; }
+}
+class FakeField extends FakeElement {
+  get value() { return this._value !== undefined ? this._value : (this.getAttribute('value') || ''); }
+  set value(v) { this._value = String(v); }
+}
+class FakeSelect extends FakeElement {
+  get value() { return this._value !== undefined ? this._value : ((this.spec.options || [])[0] || ''); }
+  set value(v) { v = String(v); this._value = (this.spec.options || []).includes(v) ? v : ''; }
+}
+const elements = (page.elements || []).map((spec) =>
+  spec.tag === 'select' ? new FakeSelect(spec)
+    : (spec.tag === 'input' || spec.tag === 'textarea') ? new FakeField(spec)
+    : new FakeElement(spec));
+function matchesPart(el, part) {
+  const m = /^([a-z]*)(?:\[([a-z-]+)(?:="([^"]*)")?\])?$/.exec(part.trim());
+  if (!m) throw new Error('unsupported selector: ' + part);
+  const [, tag, attr, value] = m;
+  if (tag && el.tag !== tag) return false;
+  if (attr) {
+    if (!el.attrs.has(attr)) return false;
+    if (value !== undefined && el.getAttribute(attr) !== value) return false;
+  }
+  return true;
+}
+function matches(el, selector) { return selector.split(',').some((part) => matchesPart(el, part)); }
+const textRoot = (t) => ({ innerText: t, textContent: t });
+const main = page.main !== undefined ? textRoot(page.main) : null;
+const document = Object.assign(new FakeEventTarget(), {
+  readyState: 'complete',
+  title: page.title || '',
+  documentElement: {},
+  body: textRoot(page.body || ''),
+  querySelectorAll(selector) { return elements.filter((el) => matches(el, selector)); },
+  querySelector(selector) {
+    if (selector === 'main,[role="main"]') return main;
+    return elements.find((el) => matches(el, selector)) || null;
+  }
+});
+function advance(ms) {
+  const target = now + ms;
+  for (let guard = 0; guard < 100000; guard++) {
+    if (mutated) { mutated = false; for (const o of observers) o.cb([], o); continue; }
+    let next = null;
+    for (const t of timers.values()) {
+      if (t.due <= target && (!next || t.due < next.due || (t.due === next.due && t.id < next.id))) next = t;
+    }
+    if (!next) break;
+    timers.delete(next.id);
+    now = next.due;
+    next.fn();
+  }
+  now = target;
+}
+const sandbox = {
+  document,
+  location: { href: page.url },
+  getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
+  MutationObserver: class { constructor(cb) { this.cb = cb; observers.push(this); } observe() {} disconnect() {} },
+  setTimeout: (fn, ms) => { const id = ++seq; timers.set(id, { id, due: now + (ms || 0), fn }); return id; },
+  clearTimeout: (id) => { timers.delete(id); },
+  Event: FakeEvent,
+  EventTarget: FakeEventTarget,
+  chrome: { webview: { postMessage: (message) => posts.push(String(message)) } }
+};
+sandbox.window = sandbox;
+sandbox.top = sandbox;
+sandbox.addEventListener = FakeEventTarget.prototype.addEventListener;
+sandbox.dispatchEvent = FakeEventTarget.prototype.dispatchEvent;
+vm.createContext(sandbox);
+vm.runInContext(input.observer, sandbox);
+for (const step of input.steps) {
+  if ('advance' in step) advance(step.advance);
+  else vm.runInContext(step.eval, sandbox);
+}
+const state = {};
+for (const el of elements) {
+  if (el.spec.key) state[el.spec.key] = { value: 'value' in el ? String(el.value) : null, clicks: el.clicks, events: el.events };
+}
+process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
+"#;
+
+        struct DomRun {
+            posts: Vec<String>,
+            state: Value,
+            submits: u64,
+        }
+
+        /// Corre o observador que embarca num DOM descrito por `page` e depois
+        /// os `steps` (`{"advance": ms}` ou `{"eval": script}`), por ordem.
+        /// O DOM é determinístico: a mesma página e os mesmos passos dão os
+        /// mesmos ids, e é isso que deixa um teste observar numa corrida e
+        /// executar noutra.
+        fn run_page(page: &Value, steps: &[Value]) -> DomRun {
+            let input = json!({
+                "observer": AGENT_OBSERVER_SCRIPT.replace("__NEURALIA_CAP__", CAP),
+                "page": page,
+                "steps": steps,
+            });
+            let mut child = Command::new("node")
+                .arg("-e")
+                .arg(HARNESS)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("os gates do agente precisam do `node` no PATH (o CI já o usa)");
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(input.to_string().as_bytes())
+                .expect("escrever o cenário");
+            let output = child.wait_with_output().expect("node terminou");
+            assert!(
+                output.status.success(),
+                "harness falhou: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: Value = serde_json::from_slice(&output.stdout).expect("JSON do harness");
+            DomRun {
+                posts: result["posts"]
+                    .as_array()
+                    .expect("posts")
+                    .iter()
+                    .map(|post| post.as_str().expect("post").to_string())
+                    .collect(),
+                state: result["state"].clone(),
+                submits: result["submits"].as_u64().unwrap_or(0),
+            }
+        }
+
+        /// O caminho nativo de uma mensagem publicada, igual ao do
+        /// `external_webview_builder`: `None` é uma observação que o produto
+        /// deita fora.
+        fn observed(post: &str) -> Option<ObservedPage> {
+            match parse_ipc_message(post, CAP, COMPARATOR_COLUMNS)? {
+                IpcAction::AgentObservation { data } => parse_agent_observation(&data),
+                _ => None,
+            }
+        }
+
+        fn first_observation(page: &Value) -> ObservedPage {
+            let run = run_page(page, &[json!({ "advance": 800 })]);
+            let post = run.posts.first().expect("o observador publicou");
+            observed(post).expect("a observação chegou ao nativo")
+        }
+
+        fn policy_for(origin: &str) -> AgentPermissionPolicy {
+            let mut policy = AgentPermissionPolicy::new(Some(origin.into()));
+            policy.grant_reversible_session_actions(true);
+            policy
+        }
+
+        fn act(
+            commands: &[BrowserAgentCommand],
+            next: usize,
+            page: &ObservedPage,
+            policy: &mut AgentPermissionPolicy,
+        ) -> AgentAct {
+            match decide_agent_step(commands, next, 0, Duration::ZERO, page, policy) {
+                AgentStepDecision::Act(act) => *act,
+                other => panic!("esperava Act para {:?}, veio {other:?}", commands[next]),
+            }
+        }
+
+        #[test]
+        fn approved_action_still_finds_its_element_after_the_dialog() {
+            // O MessageBox de confirmação é modal: o utilizador lê-o durante
+            // segundos. O script aprovado tem de encontrar o mesmo elemento
+            // depois disso, numa página que não mudou.
+            let page = json!({
+                "url": "https://site.example/",
+                "title": "Contacto",
+                "main": "Formulário de contacto",
+                "elements": [
+                    {"key": "send", "tag": "a", "attrs": {"role": "button", "href": "#"}, "text": "Enviar"}
+                ]
+            });
+            let first = first_observation(&page);
+            let mut policy = policy_for("https://site.example");
+            let commands = [BrowserAgentCommand::Click("Enviar".into())];
+            let act = act(&commands, 0, &first, &mut policy);
+            assert!(act.confirmation.is_some(), "Enviar pede um sim: {act:?}");
+            let script = agent_action_script(&act.action).expect("click executável");
+
+            let run = run_page(
+                &page,
+                &[
+                    json!({ "advance": 800 }),
+                    json!({ "advance": 2000 }),
+                    json!({ "eval": script }),
+                ],
+            );
+            assert_eq!(
+                run.posts.len(),
+                1,
+                "página parada não pode ser re-observada com ids novos"
+            );
+            assert_eq!(
+                run.state["send"]["clicks"], 1,
+                "o clique aprovado não chegou ao elemento"
+            );
+        }
+
+        /// Observa, decide os `commands` sobre a primeira observação e corre os
+        /// scripts resultantes, logo a seguir, na mesma página.
+        fn plan_and_run(page: &Value, origin: &str, commands: &[BrowserAgentCommand]) -> DomRun {
+            let first = first_observation(page);
+            let mut policy = policy_for(origin);
+            let mut steps = vec![json!({ "advance": 800 })];
+            for next in 0..commands.len() {
+                let act = act(commands, next, &first, &mut policy);
+                let script = agent_action_script(&act.action).expect("executável");
+                steps.push(json!({ "eval": script }));
+            }
+            run_page(page, &steps)
+        }
+
+        #[test]
+        fn observer_and_guard_agree_on_ordinary_controls() {
+            // `<input type=text>`, `<button>` e `<select>`: o observador dizia
+            // textbox/button/select e o guard recalculava text/submit/select-one,
+            // desistia, e o passo ficava no trace como feito.
+            let page = json!({
+                "url": "https://shop.example/",
+                "title": "Loja",
+                "main": "Produtos",
+                "elements": [
+                    {"key": "q", "tag": "input", "attrs": {"type": "text", "name": "q"}},
+                    {"key": "go", "tag": "button", "text": "Buscar"},
+                    {"key": "sort", "tag": "select", "attrs": {"name": "ordenar"}, "options": ["a", "preco"]}
+                ]
+            });
+            let run = plan_and_run(
+                &page,
+                "https://shop.example",
+                &[
+                    BrowserAgentCommand::Search("rust".into()),
+                    BrowserAgentCommand::Click("Buscar".into()),
+                    BrowserAgentCommand::Select {
+                        label: "ordenar".into(),
+                        value: "preco".into(),
+                    },
+                ],
+            );
+            assert_eq!(run.state["q"]["value"], "rust", "texto não escrito");
+            assert_eq!(run.state["go"]["clicks"], 1, "botão não clicado");
+            assert_eq!(run.state["sort"]["value"], "preco", "select não mudou");
+        }
+
+        #[test]
+        fn guard_accepts_combobox_textarea_and_placeholder_named_input() {
+            // A caixa do Google (`<textarea role=combobox>`) e um campo cujo
+            // único nome é o placeholder.
+            for (field, expected) in [
+                (
+                    json!({"key": "f", "tag": "textarea", "attrs": {"role": "combobox", "name": "q", "aria-label": "Pesquisar"}}),
+                    "rust",
+                ),
+                (
+                    json!({"key": "f", "tag": "input", "attrs": {"type": "text", "placeholder": "Pesquisar"}}),
+                    "rust",
+                ),
+            ] {
+                let page = json!({
+                    "url": "https://www.example.com/",
+                    "title": "Busca",
+                    "main": "",
+                    "elements": [field]
+                });
+                let run = plan_and_run(
+                    &page,
+                    "https://www.example.com",
+                    &[BrowserAgentCommand::Search("rust".into())],
+                );
+                assert_eq!(run.state["f"]["value"], expected, "{field}");
+            }
+        }
+
+        #[test]
+        fn observation_keeps_controls_on_text_heavy_pages() {
+            // Um artigo com mais de ~1.1K caracteres de texto: o corte do
+            // payload inteiro a 1200 unidades levava todas as linhas de
+            // elementos, e click/search paravam com ElementMissing.
+            let text = "Rust é uma linguagem de programação de sistemas. ".repeat(60);
+            let page = json!({
+                "url": "https://pt.wikipedia.org/wiki/Rust",
+                "title": "Rust – Wikipédia",
+                "main": text,
+                "elements": [
+                    {"key": "search", "tag": "input", "attrs": {"type": "search", "name": "search"}},
+                    {"key": "edit", "tag": "a", "attrs": {"role": "button", "href": "#editar"}, "text": "Editar"}
+                ]
+            });
+            let first = first_observation(&page);
+            assert_eq!(first.elements.len(), 2, "{first:?}");
+            assert!(
+                first.text_excerpt.chars().count() >= 1000,
+                "o extract continua a levar o texto: {}",
+                first.text_excerpt.chars().count()
+            );
+
+            let mut policy = policy_for("https://pt.wikipedia.org");
+            let commands = [
+                BrowserAgentCommand::Click("Editar".into()),
+                BrowserAgentCommand::Search("ownership".into()),
+            ];
+            let click = act(&commands, 0, &first, &mut policy);
+            assert!(
+                matches!(&click.action, AgentAction::Click { target } if target.name == "Editar")
+            );
+            let search = act(&commands, 1, &first, &mut policy);
+            assert!(
+                matches!(&search.action, AgentAction::TypeText { target, .. } if target.role == "search")
+            );
+        }
+
+        #[test]
+        fn spec_0108_agent_observation_stays_below_ipc_envelope_limit() {
+            // O pior caso do JSON: cada unidade de controlo vira `\u0001`, seis
+            // bytes. Nenhuma observação pode passar do envelope de 8 KiB, que o
+            // nativo recusa por inteiro.
+            let control = "\u{1}";
+            let elements = (0..40)
+                .map(|index| {
+                    json!({
+                        "key": format!("b{index}"),
+                        "tag": "button",
+                        "attrs": {"aria-label": format!("{index}{}", control.repeat(95))}
+                    })
+                })
+                .collect::<Vec<_>>();
+            let page = json!({
+                "url": format!("https://example.com/{}", "a".repeat(1300)),
+                "title": control.repeat(300),
+                "main": control.repeat(2000),
+                "elements": elements
+            });
+            let run = run_page(&page, &[json!({ "advance": 800 })]);
+            assert!(!run.posts.is_empty());
+            for post in &run.posts {
+                assert!(
+                    post.len() <= crate::ipc::IPC_MAX_BYTES,
+                    "observação com {} bytes",
+                    post.len()
+                );
+                assert!(observed(post).is_some(), "observação recusada pelo nativo");
+            }
+        }
+
+        #[test]
+        fn submit_button_in_a_form_waits_for_confirmation() {
+            // `<button type=submit role=button>Salvar</button>`: nenhuma
+            // palavra da lista, e o observador dizia `button`. O ramo
+            // `role.contains("submit")` nunca disparava e o formulário seguia
+            // como clique reversível, sem diálogo.
+            let page = json!({
+                "url": "https://example.com/settings",
+                "title": "Definições",
+                "main": "Preferências",
+                "elements": [
+                    {"key": "save", "tag": "button", "form": true, "attrs": {"type": "submit", "role": "button"}, "text": "Salvar"}
+                ]
+            });
+            let first = first_observation(&page);
+            let mut policy = policy_for("https://example.com");
+            let commands = [BrowserAgentCommand::Click("salvar".into())];
+            let act = act(&commands, 0, &first, &mut policy);
+            assert!(
+                act.confirmation.is_some(),
+                "submit de formulário sem confirmação: {act:?}"
+            );
+            assert!(matches!(act.security, AgentSecurityAction::Submit { .. }));
+
+            // Depois do sim, o guard continua a reconhecer o botão.
+            let script = agent_action_script(&act.action).expect("click executável");
+            let run = run_page(
+                &page,
+                &[json!({ "advance": 800 }), json!({ "eval": script })],
+            );
+            assert_eq!(run.submits, 1, "o submit aprovado não aconteceu");
+        }
+
+        #[test]
+        fn emoji_on_a_cut_boundary_does_not_drop_the_observation() {
+            // `slice` conta unidades UTF-16: um emoji na unidade 96 do nome
+            // (ou 1600 do texto) deixava um surrogate alto sozinho, o JSON
+            // levava `\ud83d`, o serde_json recusava e a observação sumia sem
+            // erro nenhum.
+            let label = format!("{}😀", "a".repeat(95));
+            let page = json!({
+                "url": "https://example.com/",
+                "title": "Emoji",
+                "main": format!("{}😀 fim", "b".repeat(1599)),
+                "elements": [
+                    {"key": "b", "tag": "button", "text": label}
+                ]
+            });
+            let run = run_page(&page, &[json!({ "advance": 800 })]);
+            let post = run.posts.first().expect("o observador publicou");
+            let page = observed(post).expect("observação recusada pelo nativo");
+            assert_eq!(page.elements.len(), 1);
+            assert_eq!(page.elements[0].name, "a".repeat(95));
+            assert!(page.text_excerpt.starts_with("bbbb"));
+        }
+
+        #[test]
+        fn search_never_types_into_a_submit_input() {
+            // `<input type=submit>` era `textbox`: o search escrevia no botão.
+            let page = json!({
+                "url": "https://example.com/",
+                "title": "Busca",
+                "main": "",
+                "elements": [
+                    {"key": "go", "tag": "input", "form": true, "attrs": {"type": "submit", "name": "q", "value": "Buscar"}}
+                ]
+            });
+            let first = first_observation(&page);
+            let mut policy = policy_for("https://example.com");
+            assert_eq!(
+                decide_agent_step(
+                    &[BrowserAgentCommand::Search("rust".into())],
+                    0,
+                    0,
+                    Duration::ZERO,
+                    &first,
+                    &mut policy,
+                ),
+                AgentStepDecision::Stop(AgentTermination::ElementMissing)
+            );
+        }
     }
 
     #[test]
@@ -12571,7 +13221,6 @@ mod tests {
         assert!(AGENT_OBSERVER_SCRIPT.contains("rows.length >= 32"));
         assert!(AGENT_OBSERVER_SCRIPT.contains("pageText"));
         assert!(AGENT_OBSERVER_SCRIPT.contains("action:'agent-observation'"));
-        assert!(AGENT_OBSERVER_SCRIPT.contains(".join('\\n').slice(0, 1200)"));
         assert!(AGENT_OBSERVER_SCRIPT.contains("post(stringify("));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("?cap="));
         assert!(!AGENT_OBSERVER_SCRIPT.contains("eval("));
@@ -13381,17 +14030,6 @@ mod tests {
                 "{name}: frame guard must run before capability use"
             );
         }
-    }
-
-    #[test]
-    fn spec_0108_agent_observation_stays_below_ipc_envelope_limit() {
-        assert!(
-            AGENT_OBSERVER_SCRIPT.contains(".join('\\n').slice(0, 1200)"),
-            "agent payload must be bounded before JSON serialization"
-        );
-        // JSON escaping may expand one UTF-16 code unit to six ASCII bytes.
-        // 1200 * 6 leaves >900 bytes for the protocol envelope under 8 KiB.
-        const { assert!(1200 * 6 + 900 < crate::ipc::IPC_MAX_BYTES) };
     }
 
     #[test]
@@ -15840,7 +16478,8 @@ const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
 })();
 "#;
 
-const AGENT_OBSERVER_SCRIPT: &str = r#"
+const AGENT_OBSERVER_SCRIPT: &str = concat!(
+    r#"
 (function () {
   if (window.top !== window) return;
   const capability = '__NEURALIA_CAP__';
@@ -15851,26 +16490,46 @@ const AGENT_OBSERVER_SCRIPT: &str = r#"
   let generation = 0;
   let lastMaterial = '';
   let timer = 0;
-
-  function clean(value, limit) {
-    return String(value || '').replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
+  // Um id por ELEMENTO, dado uma vez e nunca renomeado. Os ids por geracao
+  // mudavam a cada observacao: o proprio setAttribute disparava o
+  // MutationObserver, a observacao seguinte trazia ids novos e o material
+  // nunca repetia, por isso os ids mudavam a cada ~700 ms. Um clique aprovado
+  // depois de o utilizador ler o dialogo procurava um id que ja nao existia e
+  // nao fazia nada. Um clone copia o atributo mas nao a entrada do mapa, e
+  // recebe um id seu.
+  const agentIds = new WeakMap();
+  let nextAgentId = 0;
+"#,
+    agent_element_identity_js!(),
+    r#"
+  // Bytes UTF-8 que uma unidade UTF-16 ocupa depois de serializada em JSON, no
+  // pior caso: controlo e surrogate viram \uXXXX (6), aspas e barra levam
+  // escape (2).
+  function unitCost(code) {
+    if (code < 0x20 || (code >= 0xd800 && code <= 0xdfff)) return 6;
+    if (code === 0x22 || code === 0x5c) return 2;
+    if (code < 0x80) return 1;
+    return code < 0x800 ? 2 : 3;
   }
 
-  function fieldRole(el) {
-    const tag = (el.tagName || '').toLowerCase();
-    const type = (el.type || '').toLowerCase();
-    const autocomplete = (el.autocomplete || '').toLowerCase();
-    const role = (el.getAttribute('role') || '').toLowerCase();
-    const name = (el.name || '').toLowerCase();
-    const combined = [type, autocomplete, role, name].join(' ');
-    if (combined.includes('password')) return 'password';
-    if (combined.includes('one-time') || combined.includes('otp')) return 'otp';
-    if (combined.includes('cc-') || combined.includes('card') || combined.includes('payment')) return 'payment-card';
-    if (combined.includes('email')) return 'email';
-    if (combined.includes('search')) return 'search';
-    if (tag === 'select') return 'select';
-    if (tag === 'input' || tag === 'textarea') return 'textbox';
-    return role || tag || 'element';
+  function jsonCost(value) {
+    let total = 0;
+    for (let i = 0; i < value.length; i++) total += unitCost(value.charCodeAt(i));
+    return total;
+  }
+
+  // O prefixo mais longo que cabe em `budget`, sem deixar um surrogate alto
+  // sozinho no fim.
+  function fitJson(value, budget) {
+    let total = 0;
+    let end = 0;
+    for (; end < value.length; end++) {
+      const cost = unitCost(value.charCodeAt(end));
+      if (total + cost > budget) break;
+      total += cost;
+    }
+    const code = end > 0 ? value.charCodeAt(end - 1) : 0;
+    return value.slice(0, code >= 0xd800 && code <= 0xdbff ? end - 1 : end);
   }
 
   function observe() {
@@ -15881,41 +16540,45 @@ const AGENT_OBSERVER_SCRIPT: &str = r#"
       'input,textarea,select,button,a[href],[role="button"],[role="textbox"],[role="combobox"]'
     );
     const rows = [];
-    let ordinal = 0;
     for (const el of candidates) {
       if (rows.length >= 32) break;
       const rect = el.getBoundingClientRect();
       const css = getComputedStyle(el);
       if (rect.width <= 0 || rect.height <= 0 || css.display === 'none' || css.visibility === 'hidden') continue;
-      const id = 'n' + (generation + 1) + '-' + ordinal++;
-      el.setAttribute('data-neuralia-agent-id', id);
-      const name = clean(el.getAttribute('aria-label') || el.name || el.innerText || el.textContent || el.placeholder, 96);
-      rows.push([id, fieldRole(el), name, clean(el.tagName, 20), el.disabled ? '0' : '1'].join('\t'));
+      let id = agentIds.get(el);
+      if (!id) {
+        nextAgentId += 1;
+        id = 'n' + nextAgentId;
+        agentIds.set(el, id);
+      }
+      if (el.getAttribute('data-neuralia-agent-id') !== id) el.setAttribute('data-neuralia-agent-id', id);
+      rows.push([id, fieldRole(el), elementName(el), clean(el.tagName, 20), el.disabled ? '0' : '1'].join('\t'));
     }
 
     const material = [location.href, document.title || '', pageText, rows.join('\n')].join('\n');
     if (material === lastMaterial) return;
     lastMaterial = material;
     generation += 1;
-    // IDs carry the generation used by the native stale-element guard.
-    rows.forEach((row, index) => {
-      const oldId = row.split('\t', 1)[0];
-      const newId = 'n' + generation + '-' + index;
-      const el = document.querySelector('[data-neuralia-agent-id="' + oldId + '"]');
-      if (el) el.setAttribute('data-neuralia-agent-id', newId);
-      rows[index] = row.replace(oldId, newId);
-    });
 
-    // O envelope nativo aceita no maximo 8 KiB. 1200 unidades UTF-16
-    // continuam abaixo desse teto mesmo no pior caso JSON (surrogates
-    // escapados como \\uXXXX), deixando margem para cap/action/args.
-    const payload = [
-      String(generation),
-      clean(location.href, 1200),
-      clean(document.title, 256),
-      pageText,
-      ...rows
-    ].join('\n').slice(0, 1200);
+    // O envelope nativo aceita no maximo 8 KiB. Antes cortava-se a string
+    // inteira a 1200 unidades, e as linhas de elementos vinham no fim: numa
+    // pagina com mais de ~1.1K caracteres de texto o agente deixava de ver
+    // qualquer controlo, e um URL longo levava ate a linha do titulo. Agora
+    // cada parte paga o seu custo em bytes do JSON no pior caso: o cabecalho
+    // vai inteiro, as linhas entram antes do texto (com uma reserva para ele)
+    // e o texto fica com o que sobra. 7000 bytes deixam >1 KiB para
+    // cap/action/args.
+    const head = [String(generation), clean(location.href, 1200), clean(document.title, 256)].join('\n');
+    let left = 7000 - jsonCost(head) - jsonCost('\n');
+    const textReserve = Math.min(jsonCost(pageText), 1500);
+    const kept = [];
+    for (const row of rows) {
+      const rowCost = jsonCost('\n' + row);
+      if (rowCost > left - textReserve) break;
+      kept.push(row);
+      left -= rowCost;
+    }
+    const payload = [head, fitJson(pageText, left)].concat(kept).join('\n');
     post(stringify({
       v:1,
       cap:capability,
@@ -15939,7 +16602,8 @@ const AGENT_OBSERVER_SCRIPT: &str = r#"
     childList:true, subtree:true, attributes:true
   });
 })();
-"#;
+"#
+);
 
 const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
 document.addEventListener('DOMContentLoaded', () => {
