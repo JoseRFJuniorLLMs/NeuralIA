@@ -40,11 +40,11 @@ use windows_sys::Win32::{
         BeginPaint, BitBlt, CLEARTYPE_QUALITY, ClientToScreen, CreateCompatibleBitmap,
         CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateRoundRectRgn,
         CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER,
-        DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW,
-        Ellipse, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC, GetStockObject, InvalidateRect,
-        LineTo, MoveToEx, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC,
-        SRCCOPY, ScreenToClient, SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn,
-        StretchDIBits, TRANSPARENT,
+        DT_EDITCONTROL, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
+        DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC,
+        GetStockObject, InvalidateRect, LineTo, MoveToEx, NULL_BRUSH, OUT_DEFAULT_PRECIS,
+        PAINTSTRUCT, PS_SOLID, ReleaseDC, SRCCOPY, ScreenToClient, SelectObject, SetBkColor,
+        SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits, TRANSPARENT,
     },
     Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom},
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
@@ -148,9 +148,20 @@ enum UserEvent {
         source_index: usize,
         text: String,
     },
-    /// "Pesquisar" da barra de selecao: o texto selecionado e uma pergunta
-    /// para as tres IAs (`App::compare`), nunca um comando da omnibox.
+    /// "Pesquisar" da barra de selecao. So PEDE a pesquisa: o texto aparece
+    /// no cartao nativo "Pesquisar nas 3 IAs?" e so o clique nativo em
+    /// Pesquisar o leva as tres IAs (`App::compare`), como pergunta e nunca
+    /// como comando da omnibox.
     SearchSelection(String),
+    /// Clique nativo num botao do cartao "Pesquisar nas 3 IAs?"; `token` e o
+    /// do cartao que estava pintado quando o botao foi solto.
+    SearchCardAnswer {
+        token: u64,
+        button: SearchCardButton,
+    },
+    /// Os segundos do cartao `token` passaram sem resposta: conta como
+    /// Cancelar.
+    SearchCardExpired(u64),
     AgentObservation(ObservedPage),
     SubmitText(String),
     OpenExternal(String),
@@ -279,11 +290,32 @@ const SPLASH_WIDTH: f64 = 470.0;
 const SPLASH_HEIGHT: f64 = 46.0;
 const GMAIL_TOAST_WIDTH: f64 = 390.0;
 const GMAIL_TOAST_HEIGHT: f64 = 68.0;
+const SEARCH_CARD_SUBCLASS_ID: usize = 0x4E71;
+/// Cartao "Pesquisar nas 3 IAs?", em pixeis logicos, centrado na janela.
+const SEARCH_CARD_WIDTH: f64 = 560.0;
+const SEARCH_CARD_HEIGHT: f64 = 250.0;
+const SEARCH_CARD_TITLE: &str = "Pesquisar nas 3 IAs?";
+/// Sem resposta, o cartao some e conta como Cancelar.
+const SEARCH_CARD_SECONDS: u64 = 12;
+/// Um Pesquisar que chega antes disto, contado desde que o cartao (ou o texto
+/// que o trocou) apareceu, nao conta: um duplo clique que a pagina pediu no
+/// sitio onde o cartao ia nascer nao o confirma.
+const SEARCH_CARD_ARM: Duration = Duration::from_millis(600);
+/// Quanto do texto o cartao mostra; o resto fica no "…".
+const SEARCH_CARD_PREVIEW_CHARS: usize = 200;
 
 /// Texto do aviso flutuante. Vive fora do App porque quem o pinta e o
 /// procedimento de janela, que nao tem acesso ao estado da aplicacao.
 static SPLASH_TEXT: Mutex<String> = Mutex::new(String::new());
 static GMAIL_TOAST_TEXT: Mutex<String> = Mutex::new(String::new());
+/// O cartao de pesquisa a mostrar: (token, texto ja preparado por
+/// `search_card_preview`).
+static SEARCH_CARD_VIEW: Mutex<Option<(u64, String)>> = Mutex::new(None);
+/// O token que o cartao pintou por ultimo. Um clique leva ESTE: o texto que o
+/// utilizador viu, e nao um que o trocou e ainda nao foi pintado.
+static SEARCH_CARD_PAINTED: AtomicU64 = AtomicU64::new(0);
+/// O botao do cartao onde o rato desceu (indice de `SearchCardButton`).
+static SEARCH_CARD_PRESSED: AtomicUsize = AtomicUsize::new(NATIVE_BUTTON_NONE);
 /// Legenda da palette nativa (para onde vao URL e texto). Fora do App pela
 /// mesma razao que SPLASH_TEXT: quem a pinta e o procedimento de janela.
 static PALETTE_HINT: Mutex<String> = Mutex::new(String::new());
@@ -1675,6 +1707,8 @@ const WM_PAINT: u32 = 0x000F;
 const WM_LBUTTONUP: u32 = 0x0202;
 const WM_NCHITTEST: u32 = 0x0084;
 const HTCLIENT: u32 = 1;
+const WM_MOUSEACTIVATE: u32 = 0x0021;
+const MA_NOACTIVATE: u32 = 3;
 /// Botao flutuante de saida, em pixeis logicos. Fica centrado no topo: nos
 /// cantos chocava com a propria interface dos sites (o login do Google estava
 /// exatamente por baixo dele).
@@ -2082,6 +2116,151 @@ unsafe extern "system" fn gmail_toast_subclass(
         return 0;
     }
     DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+/// O cartao "Pesquisar nas 3 IAs?". Nativo e owned pela janela principal: a
+/// pagina que escolheu o texto nao o tapa, nao o move, nao o pinta e nao lhe
+/// manda cliques. Nao se ativa (como o aviso do Gmail): o foco fica onde
+/// estava, por isso Enter e Esc nao lhe chegam -- responde-se com o rato.
+unsafe extern "system" fn search_card_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    reference_data: usize,
+) -> LRESULT {
+    match message {
+        // Um STATIC devolve HTTRANSPARENT e os cliques iam para a pagina.
+        WM_NCHITTEST => HTCLIENT as LRESULT,
+        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        WM_LBUTTONDOWN => {
+            let mut client = RECT::default();
+            if GetClientRect(hwnd, &mut client) != 0 {
+                let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
+                let y = ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32;
+                if let Some(button) = search_card_hit(&client, search_card_scale(&client), x, y) {
+                    SEARCH_CARD_PRESSED.store(button.index(), Ordering::Release);
+                    SetCapture(hwnd);
+                }
+            }
+            0
+        }
+        WM_LBUTTONUP => {
+            let captured = GetCapture() == hwnd;
+            let pressed = take_native_pressed_button(&SEARCH_CARD_PRESSED, || {
+                if captured {
+                    ReleaseCapture();
+                }
+            });
+            let mut client = RECT::default();
+            if GetClientRect(hwnd, &mut client) == 0 || reference_data == 0 {
+                return 0;
+            }
+            let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
+            let y = ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32;
+            if let Some(button) = search_card_release(pressed, captured, &client, x, y) {
+                let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+                let _ = proxy.send_event(UserEvent::SearchCardAnswer {
+                    token: SEARCH_CARD_PAINTED.load(Ordering::Acquire),
+                    button,
+                });
+            }
+            0
+        }
+        WM_CAPTURECHANGED | WM_CANCELMODE => {
+            SEARCH_CARD_PRESSED.store(NATIVE_BUTTON_NONE, Ordering::Release);
+            0
+        }
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut paint);
+            if !hdc.is_null() {
+                let mut client = RECT::default();
+                if GetClientRect(hwnd, &mut client) != 0 {
+                    let (token, text) = SEARCH_CARD_VIEW
+                        .lock()
+                        .ok()
+                        .and_then(|view| view.clone())
+                        .unwrap_or_default();
+                    paint_search_card(hdc, &client, &text);
+                    // So agora o utilizador ve este texto: e ele que um
+                    // clique a seguir confirma.
+                    SEARCH_CARD_PAINTED.store(token, Ordering::Release);
+                }
+                EndPaint(hwnd, &paint);
+            }
+            0
+        }
+        _ => DefSubclassProc(hwnd, message, wparam, lparam),
+    }
+}
+
+unsafe fn paint_search_card(hdc: *mut core::ffi::c_void, client: &RECT, text: &str) {
+    let theme = Theme::system();
+    let background = CreateSolidBrush(rgb3(theme.surface));
+    FillRect(hdc, client, background);
+    DeleteObject(background as _);
+
+    let scale = search_card_scale(client);
+    let layout = search_card_layout(client, scale);
+    let title_font = create_font((-22.0 * scale) as i32, FW_BOLD as i32);
+    let text_font = create_font((-18.0 * scale) as i32, FW_NORMAL as i32);
+    let button_font = create_font((-16.0 * scale) as i32, FW_BOLD as i32);
+    let old_font = SelectObject(hdc, title_font as _);
+    SetBkMode(hdc, TRANSPARENT as i32);
+
+    SetTextColor(hdc, rgb3(theme.accent));
+    let mut title = layout.title;
+    draw_text(
+        hdc,
+        SEARCH_CARD_TITLE,
+        &mut title,
+        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+    );
+
+    // O texto numa caixa propria, para se ver onde comeca e acaba.
+    let quote = CreateSolidBrush(rgb3(theme.page_bg));
+    FillRect(hdc, &layout.quote, quote);
+    DeleteObject(quote as _);
+    SelectObject(hdc, text_font as _);
+    SetTextColor(hdc, rgb3(theme.fg));
+    let mut body = layout.text;
+    draw_text(hdc, text, &mut body, SEARCH_CARD_TEXT_FORMAT);
+
+    for (rect, button) in [
+        (layout.search, SearchCardButton::Search),
+        (layout.cancel, SearchCardButton::Cancel),
+    ] {
+        let pill = UiRect {
+            x: rect.left as f64,
+            y: rect.top as f64,
+            width: (rect.right - rect.left) as f64,
+            height: (rect.bottom - rect.top) as f64,
+        };
+        let style = match button {
+            SearchCardButton::Search => {
+                PillStyle::new(theme.accent, theme.accent, on_color(theme.accent))
+            }
+            SearchCardButton::Cancel => {
+                PillStyle::new(theme.surface_line, theme.surface_line, theme.fg)
+            }
+        };
+        draw_pill(
+            hdc,
+            pill,
+            button.label(),
+            style,
+            scale,
+            button_font,
+            theme.surface,
+        );
+    }
+
+    SelectObject(hdc, old_font);
+    DeleteObject(title_font as _);
+    DeleteObject(text_font as _);
+    DeleteObject(button_font as _);
 }
 
 // Popups auxiliares owned pela janela principal -- divisores do comparador,
@@ -2527,6 +2706,172 @@ fn save_gmail_setting(path: &std::path::Path, on: bool) -> std::io::Result<()> {
     let temp = path.with_extension("tmp");
     std::fs::write(&temp, if on { "ligado" } else { "desligado" })?;
     std::fs::rename(&temp, path)
+}
+
+/// Os dois botoes do cartao "Pesquisar nas 3 IAs?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchCardButton {
+    Search,
+    Cancel,
+}
+
+impl SearchCardButton {
+    fn index(self) -> usize {
+        match self {
+            Self::Search => 0,
+            Self::Cancel => 1,
+        }
+    }
+
+    fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::Search),
+            1 => Some(Self::Cancel),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Search => "Pesquisar",
+            Self::Cancel => "Cancelar",
+        }
+    }
+}
+
+/// O texto do cartao e texto simples: DrawTextW com DT_NOPREFIX (um "&" da
+/// pagina e um "&", nao um sublinhado), quebra por palavras e, numa palavra
+/// maior que a linha, por caracteres.
+const SEARCH_CARD_TEXT_FORMAT: u32 = DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX | DT_END_ELLIPSIS;
+
+/// Onde fica cada coisa no cartao, em pixeis do cliente. Uma so funcao para o
+/// desenho e o clique concordarem sempre.
+struct SearchCardLayout {
+    title: RECT,
+    /// A caixa do texto e, dentro dela, o texto.
+    quote: RECT,
+    text: RECT,
+    search: RECT,
+    cancel: RECT,
+}
+
+fn search_card_scale(client: &RECT) -> f64 {
+    ((client.bottom - client.top) as f64 / SEARCH_CARD_HEIGHT).max(1.0)
+}
+
+fn search_card_layout(client: &RECT, scale: f64) -> SearchCardLayout {
+    let px = |value: f64| (value * scale).round() as i32;
+    let pad = px(24.0);
+    let right = client.right - pad;
+    let bottom = client.bottom - px(20.0);
+    let top = bottom - px(40.0);
+    let cancel = RECT {
+        left: right - px(124.0),
+        top,
+        right,
+        bottom,
+    };
+    let search = RECT {
+        left: cancel.left - px(12.0) - px(140.0),
+        top,
+        right: cancel.left - px(12.0),
+        bottom,
+    };
+    let title = RECT {
+        left: client.left + pad,
+        top: client.top + px(16.0),
+        right,
+        bottom: client.top + px(50.0),
+    };
+    let quote = RECT {
+        left: title.left,
+        top: title.bottom + px(6.0),
+        right,
+        bottom: top - px(14.0),
+    };
+    let text = RECT {
+        left: quote.left + px(12.0),
+        top: quote.top + px(8.0),
+        right: quote.right - px(12.0),
+        bottom: quote.bottom - px(8.0),
+    };
+    SearchCardLayout {
+        title,
+        quote,
+        text,
+        search,
+        cancel,
+    }
+}
+
+/// O botao do cartao debaixo de (x, y); bordas semiabertas, como o resto da UI.
+fn search_card_hit(client: &RECT, scale: f64, x: i32, y: i32) -> Option<SearchCardButton> {
+    let layout = search_card_layout(client, scale);
+    let inside = |rect: &RECT| x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
+    if inside(&layout.search) {
+        Some(SearchCardButton::Search)
+    } else if inside(&layout.cancel) {
+        Some(SearchCardButton::Cancel)
+    } else {
+        None
+    }
+}
+
+/// O clique que o cartao aceita: o botao desceu E subiu no mesmo botao, com o
+/// cartao a segurar o rato desde que desceu. Arrastar de fora para cima de
+/// Pesquisar, ou premir e sair, nao responde nada.
+fn search_card_release(
+    pressed: Option<usize>,
+    captured: bool,
+    client: &RECT,
+    x: i32,
+    y: i32,
+) -> Option<SearchCardButton> {
+    if !captured {
+        return None;
+    }
+    let released = search_card_hit(client, search_card_scale(client), x, y);
+    native_release_matches(pressed, released.map(SearchCardButton::index))
+        .and_then(SearchCardButton::from_index)
+}
+
+/// Controlos bidi que mudam a ORDEM em que o texto aparece. A pagina escolhe
+/// o texto; nao escolhe que ele se leia de outra maneira no cartao.
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// O que o cartao mostra do texto que vai as IAs: quebras de linha, tabs e
+/// outros espacos ou controlos viram um so espaco, os controlos bidi saem, e
+/// acima de `SEARCH_CARD_PREVIEW_CHARS` caracteres corta-se com "…". So para
+/// mostrar: a pergunta que segue e o texto inteiro.
+fn search_card_preview(question: &str) -> String {
+    let mut chars: Vec<char> = Vec::new();
+    let mut gap = false;
+    for c in question.chars() {
+        if is_bidi_control(c) {
+            continue;
+        }
+        if c.is_whitespace() || c.is_control() {
+            gap = !chars.is_empty();
+            continue;
+        }
+        if gap {
+            chars.push(' ');
+            gap = false;
+        }
+        chars.push(c);
+    }
+    if chars.len() <= SEARCH_CARD_PREVIEW_CHARS {
+        return chars.into_iter().collect();
+    }
+    let mut preview: String = chars[..SEARCH_CARD_PREVIEW_CHARS].iter().collect();
+    preview.truncate(preview.trim_end().len());
+    preview.push('…');
+    preview
 }
 
 /// "Abrir" e "Nao" no canto direito do aviso do Gmail, em pixeis do cliente.
@@ -4477,6 +4822,9 @@ struct App {
     splash_token: u64,
     gmail_toast: Option<HWND>,
     gmail_toast_token: u64,
+    /// O pedido de pesquisa a espera do clique no cartao nativo.
+    search_card: SearchCard,
+    search_card_popup: Option<HWND>,
     gmail_monitor: Option<WebView>,
     gmail_probe_token: u64,
     gmail_last_unread: Option<u32>,
@@ -4588,6 +4936,8 @@ impl App {
             splash_token: 0,
             gmail_toast: None,
             gmail_toast_token: 0,
+            search_card: SearchCard::default(),
+            search_card_popup: None,
             gmail_monitor: None,
             gmail_probe_token: 0,
             gmail_last_unread: None,
@@ -5344,13 +5694,12 @@ impl App {
         self.open_external(url.as_str());
     }
 
-    /// "Pesquisar" da barra de selecao. A decisao e a de `selection_search`
-    /// (pura, testada); aqui so se executa: o texto selecionado numa pagina
-    /// e uma pergunta para as tres IAs, nunca um comando da omnibox.
-    fn search_selection(&mut self, text: &str) {
-        if let Some(SelectionSearch::Compare(question)) = selection_search(text) {
-            self.compare(question);
-        }
+    /// O cartao "Pesquisar nas 3 IAs?": a decisao e a de `SearchCard::step`
+    /// (pura, testada) e o efeito o de `apply_search_card`; aqui so se junta
+    /// o relogio. O `compare` so corre para um `Confirmed`.
+    fn search_card_event(&mut self, input: SearchCardInput) {
+        let outcome = self.search_card.step(input, Instant::now());
+        apply_search_card(self, outcome);
     }
 
     /// Destino normal de uma pergunta: a mesma consulta segue em simultaneo
@@ -6610,33 +6959,25 @@ impl App {
         }
     }
 
-    fn split_webview_builder(
-        &self,
-        source_index: usize,
-        source_name: &'static str,
-        local_origin: Option<String>,
-        private: bool,
-    ) -> WebViewBuilder<'static> {
+    /// Monta o WebView do Split a partir do `SplitBuild` que
+    /// `split_open_plan` decidiu: nao volta a decidir script, IPC nem perfil.
+    fn split_webview_builder(&self, build: &SplitBuild) -> WebViewBuilder<'static> {
         let ipc_proxy = self.proxy.clone();
         let new_window_proxy = self.proxy.clone();
-        let capability = remote_capability();
-        let ipc_capability = capability.clone();
-        let SplitPage { init_script, ipc } =
-            split_page(source_index, source_name, &capability, private);
+        let ipc = build.page.ipc;
+        let source_index = ipc.source_index;
+        let local_origin = build.local_origin.clone();
 
         themed_webview_builder()
-            .with_incognito(ipc.private)
-            .with_initialization_script(init_script)
-            .with_ipc_handler(move |request| {
-                let Some(action) =
-                    parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
-                else {
-                    return;
-                };
-                if let Some(event) = ipc.event(action) {
+            .with_incognito(build.incognito)
+            .with_initialization_script(build.page.init_script.clone())
+            .with_ipc_handler(split_ipc_handler(
+                build.capability.clone(),
+                ipc,
+                move |event| {
                     let _ = ipc_proxy.send_event(event);
-                }
-            })
+                },
+            ))
             .with_navigation_handler(move |target| {
                 if target
                     .get(..9)
@@ -6694,35 +7035,37 @@ impl App {
         private: bool,
         existing_context_id: Option<u64>,
     ) -> bool {
-        match Self::split_request_fallback(self.surface, private) {
-            SplitFallback::OpenSplit => {}
-            SplitFallback::OpenWeb => {
-                self.web(url);
-                return true;
-            }
-            SplitFallback::Ignore => return false,
-        }
-
-        let Ok(valid) = neural_core::validate_web_url(&url) else {
-            self.show_splash("URL da fonte inválida.".to_string(), 3);
-            return false;
-        };
-        if !allow_local && neural_core::is_local_network_target(&valid) {
-            self.show_splash(
-                "A página não pode redirecionar a fonte para a rede local.".to_string(),
-                4,
-            );
-            return false;
-        }
-
-        let Some(source_name) = self
+        let column_name = self
             .comparator
             .as_ref()
             .and_then(|comp| comp.views.get(source_index))
-            .map(|view| view.name)
-        else {
-            return false;
+            .map(|view| view.name);
+        // Tudo o que depende do `private` sai daqui (ver `split_open_plan`).
+        let build = match split_open_plan(
+            self.surface,
+            column_name,
+            source_index,
+            url,
+            allow_local,
+            private,
+            remote_capability,
+        ) {
+            SplitOpenPlan::Web(url) => {
+                self.web(url);
+                return true;
+            }
+            SplitOpenPlan::Ignore => return false,
+            SplitOpenPlan::Refuse { message, seconds } => {
+                self.show_splash(message.to_string(), seconds);
+                return false;
+            }
+            SplitOpenPlan::Build(build) => build,
         };
+        // Memoria, sessao, aba de contexto e o SplitView leem o mesmo valor
+        // que o builder recebeu.
+        let private = build.incognito;
+        let valid = build.url.clone();
+        let source_name = build.source_name;
 
         let generation = self.current_generation();
         let Some(window) = &self.window else {
@@ -6746,12 +7089,7 @@ impl App {
         // ou entrar num pump aninhado; uma tentativa falhada nao pode destruir
         // o Split que o utilizador ainda esta a ver nem sair da expansao atual.
         let built = self
-            .split_webview_builder(
-                source_index,
-                source_name,
-                allow_local.then(|| valid.origin().ascii_serialization()),
-                private,
-            )
+            .split_webview_builder(&build)
             .with_bounds(bounds)
             .with_url(valid.as_str())
             .build_as_child(window);
@@ -7359,6 +7697,40 @@ impl App {
             unsafe {
                 DestroyWindow(toast);
             }
+        }
+    }
+
+    /// Centra o cartao de pesquisa na janela. Em coordenadas de ECRA, como o
+    /// splash: refaz-se quando a janela se mexe.
+    fn position_search_card(&self) {
+        let (Some(window), Some(card)) = (&self.window, self.search_card_popup) else {
+            return;
+        };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
+        let width = (SEARCH_CARD_WIDTH * scale).round() as i32;
+        let height = (SEARCH_CARD_HEIGHT * scale).round() as i32;
+        let mut client = RECT::default();
+        unsafe {
+            if GetClientRect(owner, &mut client) == 0 {
+                return;
+            }
+            let mut origin = POINT { x: 0, y: 0 };
+            ClientToScreen(owner, &mut origin);
+            let (x, y) = splash_origin(client.right, client.bottom, width, height);
+            SetWindowPos(
+                card,
+                std::ptr::null_mut(),
+                origin.x + x,
+                origin.y + y,
+                width,
+                height,
+                SWP_NOACTIVATE,
+            );
+            show_popup_without_activation(card);
+            InvalidateRect(card, std::ptr::null(), 1);
         }
     }
 
@@ -10435,7 +10807,15 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::AskEverywhere { source_index, text } => {
                 self.ask_other_columns(source_index, text)
             }
-            UserEvent::SearchSelection(text) => self.search_selection(&text),
+            UserEvent::SearchSelection(text) => {
+                self.search_card_event(SearchCardInput::Request(text))
+            }
+            UserEvent::SearchCardAnswer { token, button } => {
+                self.search_card_event(SearchCardInput::Answer { token, button })
+            }
+            UserEvent::SearchCardExpired(token) => {
+                self.search_card_event(SearchCardInput::Expire(token))
+            }
             UserEvent::ResearchAnswer { source_index, text } => {
                 let provider = self
                     .comparator
@@ -10643,6 +11023,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.position_side_panel();
                 self.position_service_panel();
                 self.position_live_panel();
+                self.position_search_card();
                 if self.surface == Surface::Home {
                     self.sync_caption_buttons();
                 }
@@ -10673,6 +11054,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Moved(_) => {
                 self.position_splash();
                 self.position_gmail_toast();
+                self.position_search_card();
                 self.position_exit_button();
                 self.position_palette();
                 self.sync_comparator_splitters();
@@ -11084,6 +11466,215 @@ fn selection_search(text: &str) -> Option<SelectionSearch> {
         .then(|| SelectionSearch::Compare(question.to_string()))
 }
 
+/// O que chega ao cartao "Pesquisar nas 3 IAs?".
+#[derive(Debug, PartialEq)]
+enum SearchCardInput {
+    /// `search` de uma barra de selecao (o Split privado ja o recusou).
+    Request(String),
+    /// Clique nativo num botao do cartao que tinha `token` pintado.
+    Answer {
+        token: u64,
+        button: SearchCardButton,
+    },
+    /// Os segundos do cartao `token` passaram.
+    Expire(u64),
+}
+
+/// O que o cartao faz com uma entrada.
+#[derive(Debug, Clone, PartialEq)]
+enum SearchCardOutcome {
+    /// Mostrar o cartao; `replaced` quando troca um que ainda esperava.
+    Show {
+        token: u64,
+        preview: String,
+        replaced: bool,
+    },
+    /// O clique em Pesquisar: a unica saida que leva o texto as tres IAs.
+    Confirmed(String),
+    Cancelled,
+    Expired,
+    /// Nada muda: pedido invalido, token de um cartao que ja nao esta la,
+    /// Pesquisar cedo demais.
+    Ignored,
+}
+
+struct PendingSearch {
+    token: u64,
+    question: String,
+    shown_at: Instant,
+}
+
+/// Um cartao de cada vez: pendente -> confirmado, cancelado, expirado ou
+/// trocado por um pedido novo.
+#[derive(Default)]
+struct SearchCard {
+    pending: Option<PendingSearch>,
+    last_token: u64,
+}
+
+impl SearchCard {
+    fn step(&mut self, input: SearchCardInput, now: Instant) -> SearchCardOutcome {
+        match input {
+            SearchCardInput::Request(text) => {
+                let Some(SelectionSearch::Compare(question)) = selection_search(&text) else {
+                    return SearchCardOutcome::Ignored;
+                };
+                self.last_token = self.last_token.wrapping_add(1).max(1);
+                let token = self.last_token;
+                let preview = search_card_preview(&question);
+                let replaced = self
+                    .pending
+                    .replace(PendingSearch {
+                        token,
+                        question,
+                        shown_at: now,
+                    })
+                    .is_some();
+                SearchCardOutcome::Show {
+                    token,
+                    preview,
+                    replaced,
+                }
+            }
+            SearchCardInput::Answer { token, button } => {
+                let Some(pending) = self.pending.take_if(|pending| pending.token == token) else {
+                    return SearchCardOutcome::Ignored;
+                };
+                match button {
+                    SearchCardButton::Cancel => SearchCardOutcome::Cancelled,
+                    SearchCardButton::Search
+                        if now.saturating_duration_since(pending.shown_at) >= SEARCH_CARD_ARM =>
+                    {
+                        SearchCardOutcome::Confirmed(pending.question)
+                    }
+                    SearchCardButton::Search => {
+                        // Cedo demais: o cartao fica, a espera de um clique
+                        // a serio.
+                        self.pending = Some(pending);
+                        SearchCardOutcome::Ignored
+                    }
+                }
+            }
+            SearchCardInput::Expire(token) => {
+                if self
+                    .pending
+                    .take_if(|pending| pending.token == token)
+                    .is_some()
+                {
+                    SearchCardOutcome::Expired
+                } else {
+                    SearchCardOutcome::Ignored
+                }
+            }
+        }
+    }
+}
+
+/// Quem executa o cartao: o App no produto, um registo nos gates.
+trait SearchCardHost {
+    fn show_search_card(&mut self, token: u64, preview: &str);
+    fn hide_search_card(&mut self);
+    fn expire_search_card_after(&mut self, token: u64, delay: Duration);
+    fn compare_selection(&mut self, question: String);
+}
+
+fn apply_search_card(host: &mut impl SearchCardHost, outcome: SearchCardOutcome) {
+    match outcome {
+        SearchCardOutcome::Show { token, preview, .. } => {
+            host.show_search_card(token, &preview);
+            host.expire_search_card_after(token, Duration::from_secs(SEARCH_CARD_SECONDS));
+        }
+        SearchCardOutcome::Confirmed(question) => {
+            host.hide_search_card();
+            host.compare_selection(question);
+        }
+        SearchCardOutcome::Cancelled | SearchCardOutcome::Expired => host.hide_search_card(),
+        SearchCardOutcome::Ignored => {}
+    }
+}
+
+impl SearchCardHost for App {
+    fn show_search_card(&mut self, token: u64, preview: &str) {
+        if let Ok(mut view) = SEARCH_CARD_VIEW.lock() {
+            *view = Some((token, preview.to_string()));
+        }
+        // Um clique a meio no cartao anterior nao passa para o novo.
+        SEARCH_CARD_PRESSED.store(NATIVE_BUTTON_NONE, Ordering::Release);
+        if self.search_card_popup.is_none() {
+            let Some(window) = &self.window else {
+                return;
+            };
+            let Some(owner) = window_hwnd(window) else {
+                return;
+            };
+            let scale = window.scale_factor().max(1.0);
+            let width = (SEARCH_CARD_WIDTH * scale).round() as i32;
+            let height = (SEARCH_CARD_HEIGHT * scale).round() as i32;
+            unsafe {
+                // Owned pela janela principal, como o splash e o aviso do
+                // Gmail: acima do WebView2 e da pagina, nao acima das outras
+                // aplicacoes; nasce invisivel e sem ativacao.
+                let created = CreateWindowExW(
+                    AUX_POPUP_EX_STYLE,
+                    windows_sys::w!("STATIC"),
+                    windows_sys::w!(""),
+                    AUX_POPUP_STYLE,
+                    0,
+                    0,
+                    width,
+                    height,
+                    owner,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                );
+                if created.is_null() {
+                    return;
+                }
+                if SetWindowSubclass(
+                    created,
+                    Some(search_card_subclass),
+                    SEARCH_CARD_SUBCLASS_ID,
+                    (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize,
+                ) == 0
+                {
+                    DestroyWindow(created);
+                    return;
+                }
+                let corner = (18.0 * scale).round() as i32;
+                let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, corner, corner);
+                if !region.is_null() {
+                    SetWindowRgn(created, region, 1);
+                }
+                self.search_card_popup = Some(created);
+            }
+        }
+        self.position_search_card();
+    }
+
+    fn hide_search_card(&mut self) {
+        if let Some(card) = self.search_card_popup.take() {
+            unsafe {
+                DestroyWindow(card);
+            }
+        }
+        if let Ok(mut view) = SEARCH_CARD_VIEW.lock() {
+            *view = None;
+        }
+        SEARCH_CARD_PAINTED.store(0, Ordering::Release);
+        SEARCH_CARD_PRESSED.store(NATIVE_BUTTON_NONE, Ordering::Release);
+    }
+
+    fn expire_search_card_after(&mut self, token: u64, delay: Duration) {
+        self.timers
+            .after(delay, UserEvent::SearchCardExpired(token));
+    }
+
+    fn compare_selection(&mut self, question: String) {
+        self.compare(question);
+    }
+}
+
 /// O mapa de teclas (e a barra de selecao que vive nele) com a capability e
 /// o sinal de superficie privada postos. Um painel privado nao mostra o
 /// "Pesquisar": o texto dele nao pode ir parar ao historico nem a memoria.
@@ -11161,6 +11752,100 @@ fn split_page(
         },
     }
 }
+
+/// O que `open_split_mode` faz com um pedido, decidido sem janela.
+enum SplitOpenPlan {
+    /// O comparador ja nao esta la: abre como Web normal (nunca um privado).
+    Web(String),
+    Ignore,
+    /// Recusado; a mensagem vai para o aviso do meio da janela.
+    Refuse {
+        message: &'static str,
+        seconds: u64,
+    },
+    Build(SplitBuild),
+}
+
+/// Tudo o que o builder do Split recebe. O `private` do pedido entra UMA vez
+/// (em `split_open_plan`) e daqui saem o script injetado (sem o Pesquisar), o
+/// mapa IPC (que recusa `search`) e o perfil anonimo do WebView2; o builder
+/// e o resto de `open_split_mode` so leem isto.
+struct SplitBuild {
+    url: Url,
+    source_name: &'static str,
+    /// A origem local que a URL digitada autorizou (ver `local_origin_of`).
+    local_origin: Option<String>,
+    capability: String,
+    page: SplitPage,
+    incognito: bool,
+}
+
+/// A decisao de `open_split_mode`, com os mesmos argumentos que ele recebe
+/// (o nome da coluna de origem, se o comparador ainda a tem, e a fonte da
+/// capability). E aqui que o `private` chega ao builder.
+fn split_open_plan(
+    surface: Surface,
+    source_name: Option<&'static str>,
+    source_index: usize,
+    url: String,
+    allow_local: bool,
+    private: bool,
+    capability: impl FnOnce() -> String,
+) -> SplitOpenPlan {
+    match App::split_request_fallback(surface, private) {
+        SplitFallback::OpenSplit => {}
+        SplitFallback::OpenWeb => return SplitOpenPlan::Web(url),
+        SplitFallback::Ignore => return SplitOpenPlan::Ignore,
+    }
+    let Ok(valid) = neural_core::validate_web_url(&url) else {
+        return SplitOpenPlan::Refuse {
+            message: "URL da fonte inválida.",
+            seconds: 3,
+        };
+    };
+    if !allow_local && neural_core::is_local_network_target(&valid) {
+        return SplitOpenPlan::Refuse {
+            message: "A página não pode redirecionar a fonte para a rede local.",
+            seconds: 4,
+        };
+    }
+    let Some(source_name) = source_name else {
+        return SplitOpenPlan::Ignore;
+    };
+    let capability = capability();
+    let page = split_page(source_index, source_name, &capability, private);
+    SplitOpenPlan::Build(SplitBuild {
+        local_origin: allow_local.then(|| valid.origin().ascii_serialization()),
+        url: valid,
+        source_name,
+        capability,
+        incognito: page.ipc.private,
+        page,
+    })
+}
+
+/// O handler IPC do Split, tal como o wry o recebe: envelope autenticado
+/// pela capability e depois o mapa do painel (o privado recusa `search`).
+/// `send` e o proxy do event loop no app e um registo nos gates.
+fn split_ipc_handler<S>(
+    capability: String,
+    ipc: SplitIpc,
+    send: S,
+) -> impl Fn(wry::http::Request<String>) + 'static
+where
+    S: Fn(UserEvent) + 'static,
+{
+    move |request| {
+        let Some(action) = parse_ipc_message(request.body(), &capability, COMPARATOR_COLUMNS)
+        else {
+            return;
+        };
+        if let Some(event) = ipc.event(action) {
+            send(event);
+        }
+    }
+}
+
 /// Para onde vai o que o utilizador escreveu na palette. Puro, para se poder
 /// testar sem janela: e aqui que se decide que um painel privado nunca
 /// carrega nada na coluna normal nem passa pelo historico.
@@ -17671,8 +18356,25 @@ class Clipboard {
 }
 var navigator = { language: 'en-US', clipboard: new Clipboard() };
 Document.prototype.execCommand = function (command) { __exec.push(__S(command)); return true; };
+// Vozes e falas com os acessores no prototipo, como no navegador; o teste
+// le o que ficou nos campos internos, nao pelos acessores (a pagina pode
+// troca-los).
+class SpeechSynthesisVoice {
+  constructor(fields) { this.__f = fields; }
+  get name() { return this.__f.name; }
+  get lang() { return this.__f.lang; }
+  get localService() { return this.__f.localService; }
+  get default() { return this.__f.default; }
+  get voiceURI() { return 'urn:' + this.__f.name; }
+}
 class SpeechSynthesisUtterance extends EventTarget {
-  constructor(text) { super(); this.text = __S(text); this.voice = null; this.lang = ''; }
+  constructor(text) { super(); this.__text = __S(text); this.__voice = null; this.__lang = ''; }
+  get text() { return this.__text; }
+  set text(value) { this.__text = __S(value); }
+  get voice() { return this.__voice; }
+  set voice(value) { this.__voice = value; }
+  get lang() { return this.__lang; }
+  set lang(value) { this.__lang = __S(value); }
 }
 class SpeechSynthesis extends EventTarget {
   speak(utterance) { __spoken.push(utterance); }
@@ -17681,10 +18383,10 @@ class SpeechSynthesis extends EventTarget {
 }
 window.speechSynthesis = new SpeechSynthesis();
 window.SpeechSynthesisUtterance = SpeechSynthesisUtterance;
-var __NUVEM = { name: 'Nuvem', lang: 'pt-BR', localService: false, default: false };
-var __MARIA = { name: 'Maria', lang: 'pt-BR', localService: true, default: false };
-var __ZIRA = { name: 'Zira', lang: 'en-US', localService: true, default: true };
-var __HELENA = { name: 'Helena', lang: 'es-ES', localService: true, default: false };
+var __NUVEM = new SpeechSynthesisVoice({ name: 'Nuvem', lang: 'pt-BR', localService: false, default: false });
+var __MARIA = new SpeechSynthesisVoice({ name: 'Maria', lang: 'pt-BR', localService: true, default: false });
+var __ZIRA = new SpeechSynthesisVoice({ name: 'Zira', lang: 'en-US', localService: true, default: true });
+var __HELENA = new SpeechSynthesisVoice({ name: 'Helena', lang: 'es-ES', localService: true, default: false });
 
 // IntersectionObserver v2: `isVisible` so e verdade com a barra na arvore,
 // a mostra e sem nada da pagina por cima (`__covered`).
@@ -17810,7 +18512,7 @@ function __state(tag) {
     pending: __timers.filter((t) => !t.done).length,
     clipboard: __clipboard.slice(),
     exec: __exec.slice(),
-    spoken: __spoken.map((u) => ({ text: u.text, voice: u.voice ? u.voice.name : null, lang: u.lang })),
+    spoken: __spoken.map((u) => ({ text: u.__text, voice: u.__voice ? u.__voice.__f.name : null, lang: u.__lang })),
     cancels: __cancels,
     prevented: __prevented.slice(),
     leaks: __leaks.slice(),
@@ -18804,6 +19506,85 @@ __state('sem-vozes');
     }
 
     #[test]
+    fn falar_never_takes_an_online_voice_the_page_disguised_as_local() {
+        // A pagina, depois do document-created, faz a voz online parecer
+        // local, na lingua da pagina e a de omissao; troca o getVoices; e
+        // tira o setter `voice`/`lang` da fala (sem voz, o motor usava a de
+        // omissao, que pode ser online). O texto nao pode sair do dispositivo.
+        let hostile = r#"
+Object.defineProperty(SpeechSynthesisVoice.prototype, 'localService', {
+  configurable: true, get() { return true; }
+});
+Object.defineProperty(SpeechSynthesisVoice.prototype, 'lang', {
+  configurable: true, get() { return this.__f.name === 'Nuvem' ? 'pt-BR' : 'xx-XX'; }
+});
+Object.defineProperty(SpeechSynthesisVoice.prototype, 'default', {
+  configurable: true, get() { return this.__f.name === 'Nuvem'; }
+});
+Object.defineProperty(SpeechSynthesisUtterance.prototype, 'voice', {
+  configurable: true, get() { return null; }, set(value) { __leaks.push('voice'); }
+});
+Object.defineProperty(SpeechSynthesisUtterance.prototype, 'lang', {
+  configurable: true, get() { return ''; }, set(value) { __leaks.push('lang'); }
+});
+SpeechSynthesis.prototype.getVoices = function () { return [__NUVEM]; };
+window.speechSynthesis.getVoices = function () { return [__NUVEM]; };
+document.documentElement.lang = 'pt-BR';
+__voices = [__NUVEM, __MARIA];
+__show('Uma frase privada.');
+__press('speak');
+__state('disfarcada');
+__on(document, 'keydown', { key: 'Escape' });
+__voices = [__NUVEM];
+__show('Outra frase.');
+__press('speak');
+__state('so-a-online');
+"#;
+        let results = run_selection_cases(vec![
+            selection_case(
+                "normal",
+                &bind_page_script(NEURALIA_KEYMAP_SCRIPT, SELECTION_CAP, false),
+                "",
+                &[hostile],
+            ),
+            selection_case(
+                "split-privado",
+                &split_page(1, "ChatGPT", SELECTION_CAP, true).init_script,
+                "",
+                &[hostile],
+            ),
+        ]);
+        for result in &results {
+            let name = result["name"].as_str().expect("name");
+            assert!(selection_posted(result).is_empty(), "{name}: postou");
+            let states = selection_states(result);
+            let spoken = states["disfarcada"]["spoken"].as_array().expect("spoken");
+            assert_eq!(
+                spoken
+                    .last()
+                    .map(|u| (u["voice"].clone(), u["lang"].clone())),
+                Some((serde_json::json!("Maria"), serde_json::json!("pt-BR"))),
+                "{name}: a fala nao foi com a voz local (falou: {spoken:?})"
+            );
+            assert_eq!(
+                states["disfarcada"]["leaks"],
+                serde_json::json!([]),
+                "{name}: a voz passou pelo setter da pagina"
+            );
+            // So a voz online: nada e dito, e a barra diz porque.
+            assert_eq!(
+                states["so-a-online"]["spoken"].as_array().map(Vec::len),
+                Some(spoken.len()),
+                "{name}: falou com a voz online"
+            );
+            assert_eq!(
+                states["so-a-online"]["note"], "Nenhuma voz local disponível",
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn while_reading_a_new_selection_is_what_copy_and_search_take() {
         // A ler o paragrafo A, o utilizador seleciona a frase B: a barra vai
         // para B e Copiar/Pesquisar levam B. Sem nova selecao, so fica o
@@ -18982,12 +19763,165 @@ __state('barra');
             "split_ipc_event_impl(",
             "with_incognito(private)",
             "if private",
+            "split_page(",
+            "remote_capability",
+            "with_incognito(true",
+            "with_incognito(false",
         ] {
             assert!(
                 !split.contains(forbidden),
                 "split_webview_builder: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn open_split_mode_hands_its_private_flag_to_the_builder() {
+        // `split_open_plan` e a decisao de `open_split_mode`, com os mesmos
+        // argumentos; o `SplitBuild` que ela devolve e tudo o que o builder
+        // usa: perfil anonimo, script injetado e handler IPC.
+        let plan = |private: bool| match split_open_plan(
+            Surface::Comparator,
+            Some("ChatGPT"),
+            1,
+            "https://example.com/fonte".to_string(),
+            false,
+            private,
+            || SELECTION_CAP.to_string(),
+        ) {
+            SplitOpenPlan::Build(build) => build,
+            _ => panic!("o comparador abre o Split (private={private})"),
+        };
+        let private = plan(true);
+        let normal = plan(false);
+        assert!(private.incognito, "o Split privado perdeu o perfil anonimo");
+        assert!(!normal.incognito, "o Split normal ficou anonimo");
+        for build in [&private, &normal] {
+            assert_eq!(build.url.as_str(), "https://example.com/fonte");
+            assert_eq!(build.source_name, "ChatGPT");
+            assert_eq!(build.capability, SELECTION_CAP);
+            assert_eq!(build.local_origin, None);
+        }
+
+        // O handler IPC que o builder instala, com envelopes reais: o privado
+        // recusa `search` e continua a fechar-se; o normal leva o texto.
+        let deliver = |build: &SplitBuild, action: &str, args: &str| {
+            let seen: std::rc::Rc<std::cell::RefCell<Vec<UserEvent>>> = Default::default();
+            let sink = std::rc::Rc::clone(&seen);
+            let handler =
+                split_ipc_handler(build.capability.clone(), build.page.ipc, move |event| {
+                    sink.borrow_mut().push(event)
+                });
+            handler(
+                wry::http::Request::builder()
+                    .uri("https://example.com/fonte")
+                    .body(format!(
+                        r#"{{"v":1,"cap":"{SELECTION_CAP}","action":"{action}","args":{args}}}"#
+                    ))
+                    .expect("pedido"),
+            );
+            seen.take()
+        };
+        let search = r#"{"text":"Texto da pagina."}"#;
+        assert!(
+            deliver(&private, "search", search).is_empty(),
+            "o Split privado aceitou o search"
+        );
+        assert!(matches!(
+            deliver(&private, "split-close", "{}").as_slice(),
+            [UserEvent::CloseSplit]
+        ));
+        assert!(matches!(
+            deliver(&normal, "search", search).as_slice(),
+            [UserEvent::SearchSelection(text)] if text == "Texto da pagina."
+        ));
+        // Um envelope sem a capability deste painel nao chega a lado nenhum.
+        let forged = SplitBuild {
+            capability: "f".repeat(32),
+            ..plan(false)
+        };
+        assert!(deliver(&forged, "search", search).is_empty());
+
+        // O script injetado: o privado nao tem o Pesquisar.
+        let offered = r#"
+__show('Texto da pagina.');
+__state('barra');
+"#;
+        let results = run_selection_cases(vec![
+            selection_case("privado", &private.page.init_script, "", &[offered]),
+            selection_case("normal", &normal.page.init_script, "", &[offered]),
+        ]);
+        let buttons =
+            |result: &serde_json::Value| selection_states(result)["barra"]["buttons"].clone();
+        assert_eq!(
+            buttons(&results[0]),
+            serde_json::json!(["📋 Copiar", "🔊 Falar"]),
+            "o Split privado mostra o Pesquisar"
+        );
+        assert_eq!(
+            buttons(&results[1]),
+            serde_json::json!(["🔎 Pesquisar", "📋 Copiar", "🔊 Falar"])
+        );
+
+        // Fora do comparador um pedido privado cai; um normal vai para a Web.
+        assert!(matches!(
+            split_open_plan(
+                Surface::Home,
+                Some("ChatGPT"),
+                1,
+                "https://example.com/".to_string(),
+                false,
+                true,
+                || unreachable!("sem Split nao ha capability"),
+            ),
+            SplitOpenPlan::Ignore
+        ));
+        assert!(matches!(
+            split_open_plan(
+                Surface::Home,
+                Some("ChatGPT"),
+                1,
+                "https://example.com/".to_string(),
+                false,
+                false,
+                || unreachable!("sem Split nao ha capability"),
+            ),
+            SplitOpenPlan::Web(url) if url == "https://example.com/"
+        ));
+
+        // A ultima ligacao e texto (AGENTS.md §4.3; o App nao se constroi sem
+        // janela): `open_split_mode` passa ao plano o `private` que recebeu,
+        // e as entradas privadas passam `true`.
+        let source = include_str!("windows_app.rs");
+        let squash = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let open = source
+            .split("fn open_split_mode(")
+            .nth(1)
+            .and_then(|part| part.split("fn open_private_panel").next())
+            .expect("open_split_mode");
+        let call = open
+            .split("split_open_plan(")
+            .nth(1)
+            .and_then(|part| part.split(") {").next())
+            .expect("chamada ao plano");
+        assert_eq!(
+            squash(call),
+            "self.surface, column_name, source_index, url, allow_local, private, remote_capability,",
+            "open_split_mode nao passa o seu `private` ao plano"
+        );
+        assert!(open.contains(".split_webview_builder(&build)"));
+        assert!(open.contains("let private = build.incognito;"));
+        let panel = source
+            .split("fn open_private_panel(&mut self)")
+            .nth(1)
+            .and_then(|part| part.split("\n    fn ").next())
+            .expect("open_private_panel");
+        assert!(
+            squash(panel).contains(
+                r#"self.open_split_mode( source_index, "https://www.google.com/".to_string(), false, true, None, )"#
+            ),
+            "o botao Privado deixou de pedir um Split privado"
+        );
     }
 
     #[test]
@@ -19023,8 +19957,17 @@ __state('duplo-clique-no-vazio');
             states["duplo-clique-na-palavra"]["shown"], true,
             "duplo clique numa palavra da coluna: a barra nao aparece"
         );
-        assert_eq!(states["duplo-clique-na-palavra"]["posted"], 0);
-        // Sem texto selecionado, o duplo clique continua a expandir.
+        assert_eq!(
+            states["duplo-clique-na-palavra"]["posted"], 0,
+            "duplo clique numa palavra da coluna: a coluna expandiu"
+        );
+        // Sem texto selecionado, o duplo clique continua a expandir -- e so
+        // ele: um `expand`, o da coluna, e nenhuma barra.
+        assert_eq!(
+            states["duplo-clique-no-vazio"]["posted"], 1,
+            "duplo clique no vazio da coluna: a coluna nao expandiu"
+        );
+        assert_eq!(states["duplo-clique-no-vazio"]["shown"], false);
         assert_eq!(
             selection_posted(&results[0]),
             vec![IpcAction::Expand { col: 0 }]
@@ -19098,27 +20041,55 @@ __state('duplo-clique-no-vazio');
             None
         );
 
-        // O handler nativo so executa a decisao acima: a unica chamada que
-        // faz e `self.compare` -- nada de omnibox, palette, Split ou Web
-        // (asserção sobre o texto; ver AGENTS.md §4.3).
+        // Um comando selecionado so chega ao `compare` como pergunta, e so
+        // depois do clique no cartao nativo.
+        let t0 = Instant::now();
+        let mut card = SearchCard::default();
+        let mut log = CardLog::default();
+        let shown = drive_card(
+            &mut card,
+            &mut log,
+            SearchCardInput::Request("  tema:escuro\n".to_string()),
+            t0,
+        );
+        assert!(matches!(shown, SearchCardOutcome::Show { token: 1, .. }));
+        assert!(log.compared.is_empty(), "o pedido pesquisou sem o cartao");
+        drive_card(
+            &mut card,
+            &mut log,
+            SearchCardInput::Answer {
+                token: 1,
+                button: SearchCardButton::Search,
+            },
+            t0 + SEARCH_CARD_ARM,
+        );
+        assert_eq!(log.compared, vec!["tema:escuro".to_string()]);
+
+        // O App so liga os eventos ao cartao: o SearchSelection nunca chama
+        // `compare` (nem omnibox, palette, Split ou Web); o `compare` so esta
+        // no `compare_selection` do host, que so um `Confirmed` chama
+        // (asserções sobre o texto; ver AGENTS.md §4.3).
         let source = include_str!("windows_app.rs");
-        let handler = source
-            .split("fn search_selection(&mut self")
-            .nth(1)
-            .and_then(|part| part.split("\n    fn ").next())
-            .expect("search_selection");
-        let calls: Vec<&str> = handler
-            .match_indices("self.")
-            .map(|(at, _)| {
-                let rest = &handler[at + 5..];
-                let end = rest
-                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-                    .unwrap_or(rest.len());
-                &rest[..end]
-            })
-            .collect();
-        assert_eq!(calls, vec!["compare"], "o Pesquisar faz outra coisa");
+        let squash = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let between = |from: &str, to: &str| {
+            source
+                .split(from)
+                .nth(1)
+                .and_then(|part| part.split(to).next())
+                .unwrap_or_else(|| panic!("{from}"))
+                .to_string()
+        };
+        let arm = between(
+            "UserEvent::SearchSelection(text) =>",
+            "UserEvent::SearchCardAnswer",
+        );
+        assert_eq!(
+            squash(&arm),
+            "{ self.search_card_event(SearchCardInput::Request(text)) }",
+            "o SearchSelection nao passa pelo cartao"
+        );
         for forbidden in [
+            "compare",
             "handle_input",
             "route_input",
             "parse_intent",
@@ -19129,21 +20100,385 @@ __state('duplo-clique-no-vazio');
             "web(",
         ] {
             assert!(
-                !handler.contains(forbidden),
+                !arm.contains(forbidden),
                 "o Pesquisar passa por {forbidden}"
             );
         }
-        let arm = source
-            .split("UserEvent::SearchSelection(text) =>")
-            .nth(1)
-            .and_then(|part| part.lines().next())
-            .expect("SearchSelection arm");
-        // O evento chega ao handler acima, e so a ele.
         assert_eq!(
-            arm.trim(),
-            "self.search_selection(&text),",
-            "o SearchSelection nao chega ao search_selection"
+            squash(&between(
+                "UserEvent::SearchCardAnswer { token, button } =>",
+                "UserEvent::SearchCardExpired"
+            )),
+            "{ self.search_card_event(SearchCardInput::Answer { token, button }) }"
         );
+        assert_eq!(
+            squash(&between(
+                "UserEvent::SearchCardExpired(token) =>",
+                "UserEvent::ResearchAnswer"
+            )),
+            "{ self.search_card_event(SearchCardInput::Expire(token)) }"
+        );
+        let driver = between(
+            "fn search_card_event(&mut self, input: SearchCardInput) {",
+            "\n    }\n",
+        );
+        assert_eq!(
+            squash(&driver),
+            "let outcome = self.search_card.step(input, Instant::now()); apply_search_card(self, outcome);",
+            "o cartao faz outra coisa"
+        );
+        let host = between("impl SearchCardHost for App {", "\n}\n");
+        let compare = host
+            .split("fn compare_selection(&mut self, question: String)")
+            .nth(1)
+            .expect("compare_selection");
+        assert_eq!(squash(compare), "{ self.compare(question); }");
+        // No codigo que embarca, `compare` so e chamado pela omnibox (uma
+        // pergunta escrita) e pelo host do cartao.
+        let shipped = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("codigo antes dos testes");
+        let callers: Vec<&str> = shipped
+            .lines()
+            .filter(|line| line.contains("self.compare("))
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            callers,
+            vec![
+                "Ok(Intent::Compare(query)) => self.compare(query),",
+                "self.compare(question);"
+            ],
+            "um caminho novo chama o compare sem o cartao"
+        );
+    }
+
+    /// O host de mentira dos gates do cartao: regista o que o App faria.
+    #[derive(Default)]
+    struct CardLog {
+        steps: Vec<String>,
+        compared: Vec<String>,
+    }
+
+    impl SearchCardHost for CardLog {
+        fn show_search_card(&mut self, token: u64, preview: &str) {
+            self.steps.push(format!("mostra {token}: {preview}"));
+        }
+        fn hide_search_card(&mut self) {
+            self.steps.push("esconde".to_string());
+        }
+        fn expire_search_card_after(&mut self, token: u64, delay: Duration) {
+            self.steps
+                .push(format!("expira {token} em {} s", delay.as_secs()));
+        }
+        fn compare_selection(&mut self, question: String) {
+            self.steps.push(format!("compara {question}"));
+            self.compared.push(question);
+        }
+    }
+
+    /// `App::search_card_event` com o relogio na mao do teste.
+    fn drive_card(
+        card: &mut SearchCard,
+        log: &mut CardLog,
+        input: SearchCardInput,
+        now: Instant,
+    ) -> SearchCardOutcome {
+        let outcome = card.step(input, now);
+        apply_search_card(log, outcome.clone());
+        outcome
+    }
+
+    #[test]
+    fn pesquisar_asks_the_native_card_and_only_its_search_click_compares() {
+        let t0 = Instant::now();
+        let ms = |value: u64| Duration::from_millis(value);
+        let search = |token: u64| SearchCardInput::Answer {
+            token,
+            button: SearchCardButton::Search,
+        };
+        let cancel = |token: u64| SearchCardInput::Answer {
+            token,
+            button: SearchCardButton::Cancel,
+        };
+        let request = |text: &str| SearchCardInput::Request(text.to_string());
+        let mut card = SearchCard::default();
+        let mut log = CardLog::default();
+
+        // Pendente: o pedido mostra o cartao, arma os 12 s e nao pesquisa.
+        assert_eq!(
+            drive_card(
+                &mut card,
+                &mut log,
+                request("  agent:https://x.com | click=Comprar \n"),
+                t0
+            ),
+            SearchCardOutcome::Show {
+                token: 1,
+                preview: "agent:https://x.com | click=Comprar".to_string(),
+                replaced: false,
+            }
+        );
+        assert_eq!(
+            log.steps,
+            vec![
+                "mostra 1: agent:https://x.com | click=Comprar".to_string(),
+                format!("expira 1 em {SEARCH_CARD_SECONDS} s"),
+            ]
+        );
+        assert_eq!(SEARCH_CARD_SECONDS, 12);
+        assert!(log.compared.is_empty(), "o pedido pesquisou sem o clique");
+        // Pesquisar cedo demais (um duplo clique pedido pela pagina): nada.
+        assert_eq!(
+            drive_card(&mut card, &mut log, search(1), t0 + ms(100)),
+            SearchCardOutcome::Ignored
+        );
+        assert!(log.compared.is_empty(), "clique aos 100 ms pesquisou");
+        // Confirmado: esconde e pesquisa, uma vez.
+        assert_eq!(
+            drive_card(&mut card, &mut log, search(1), t0 + SEARCH_CARD_ARM),
+            SearchCardOutcome::Confirmed("agent:https://x.com | click=Comprar".to_string())
+        );
+        assert_eq!(
+            log.steps[2..],
+            [
+                "esconde".to_string(),
+                "compara agent:https://x.com | click=Comprar".to_string()
+            ]
+        );
+        // Um segundo clique, ou a expiracao atrasada, nao pesquisa de novo.
+        assert_eq!(
+            drive_card(&mut card, &mut log, search(1), t0 + ms(900)),
+            SearchCardOutcome::Ignored
+        );
+        assert_eq!(
+            drive_card(
+                &mut card,
+                &mut log,
+                SearchCardInput::Expire(1),
+                t0 + ms(950)
+            ),
+            SearchCardOutcome::Ignored
+        );
+        assert_eq!(log.compared.len(), 1);
+
+        // Cancelado: logo, sem esperar; depois disso o Pesquisar nao conta.
+        let t1 = t0 + ms(2_000);
+        assert!(matches!(
+            drive_card(&mut card, &mut log, request("segundo"), t1),
+            SearchCardOutcome::Show { token: 2, .. }
+        ));
+        assert_eq!(
+            drive_card(&mut card, &mut log, cancel(2), t1 + ms(10)),
+            SearchCardOutcome::Cancelled
+        );
+        assert_eq!(log.steps.last().map(String::as_str), Some("esconde"));
+        assert_eq!(
+            drive_card(&mut card, &mut log, search(2), t1 + ms(1_000)),
+            SearchCardOutcome::Ignored
+        );
+
+        // Expirado (12 s sem resposta = Cancelar).
+        let t2 = t0 + ms(4_000);
+        drive_card(&mut card, &mut log, request("terceiro"), t2);
+        assert_eq!(
+            drive_card(
+                &mut card,
+                &mut log,
+                SearchCardInput::Expire(3),
+                t2 + ms(12_000)
+            ),
+            SearchCardOutcome::Expired
+        );
+        assert_eq!(log.steps.last().map(String::as_str), Some("esconde"));
+        assert_eq!(
+            drive_card(&mut card, &mut log, search(3), t2 + ms(12_100)),
+            SearchCardOutcome::Ignored
+        );
+
+        // Trocado: um pedido novo substitui o cartao; o clique e a expiracao
+        // do antigo ja nao contam, e o relogio do Pesquisar recomeca.
+        let t3 = t0 + ms(20_000);
+        drive_card(&mut card, &mut log, request("quarto"), t3);
+        assert_eq!(
+            drive_card(&mut card, &mut log, request("quinto"), t3 + ms(700)),
+            SearchCardOutcome::Show {
+                token: 5,
+                preview: "quinto".to_string(),
+                replaced: true,
+            }
+        );
+        assert_eq!(
+            drive_card(&mut card, &mut log, search(4), t3 + ms(2_000)),
+            SearchCardOutcome::Ignored,
+            "o clique no cartao trocado pesquisou"
+        );
+        assert_eq!(
+            drive_card(
+                &mut card,
+                &mut log,
+                SearchCardInput::Expire(4),
+                t3 + ms(2_100)
+            ),
+            SearchCardOutcome::Ignored,
+            "a expiracao do antigo levou o novo"
+        );
+        assert_eq!(
+            drive_card(&mut card, &mut log, search(5), t3 + ms(1_000)),
+            SearchCardOutcome::Ignored,
+            "o texto novo foi confirmado 300 ms depois de aparecer"
+        );
+        // Um pedido invalido nao mexe no cartao que espera.
+        for invalid in [" \n ".to_string(), "a".repeat(SEARCH_MAX_CHARS + 1)] {
+            assert_eq!(
+                drive_card(
+                    &mut card,
+                    &mut log,
+                    SearchCardInput::Request(invalid),
+                    t3 + ms(1_100)
+                ),
+                SearchCardOutcome::Ignored
+            );
+        }
+        assert_eq!(
+            drive_card(
+                &mut card,
+                &mut log,
+                search(5),
+                t3 + ms(700) + SEARCH_CARD_ARM
+            ),
+            SearchCardOutcome::Confirmed("quinto".to_string())
+        );
+
+        // Em tudo isto, o `compare` correu exatamente duas vezes: uma por
+        // clique aceite em Pesquisar.
+        assert_eq!(
+            log.compared,
+            vec![
+                "agent:https://x.com | click=Comprar".to_string(),
+                "quinto".to_string()
+            ]
+        );
+        assert_eq!(
+            log.steps
+                .iter()
+                .filter(|step| step.starts_with("compara "))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn the_search_card_shows_plain_bounded_text_and_answers_only_its_buttons() {
+        // O texto: no maximo 200 caracteres e "…"; espacos, quebras e
+        // controlos viram um espaco; os controlos bidi saem; "&" fica "&".
+        let exact = "é".repeat(SEARCH_CARD_PREVIEW_CHARS);
+        assert_eq!(search_card_preview(&exact), exact);
+        let long = format!("{exact}ü mais");
+        let preview = search_card_preview(&long);
+        assert_eq!(preview, format!("{exact}…"));
+        assert_eq!(preview.chars().count(), SEARCH_CARD_PREVIEW_CHARS + 1);
+        let emoji = "🔎".repeat(SEARCH_CARD_PREVIEW_CHARS + 5);
+        assert_eq!(
+            search_card_preview(&emoji),
+            format!("{}…", "🔎".repeat(SEARCH_CARD_PREVIEW_CHARS))
+        );
+        let spaced = format!("{} fim", "a".repeat(SEARCH_CARD_PREVIEW_CHARS - 1));
+        assert_eq!(
+            search_card_preview(&spaced),
+            format!("{}…", "a".repeat(SEARCH_CARD_PREVIEW_CHARS - 1)),
+            "o corte deixou um espaco antes do …"
+        );
+        assert_eq!(
+            search_card_preview("  Linha 1\r\n\tLinha\u{0}2  \u{2028} & <b>x</b> "),
+            "Linha 1 Linha 2 & <b>x</b>"
+        );
+        assert_eq!(
+            search_card_preview("pagar \u{202E}0001\u{202C} reais \u{2067}x\u{2069}\u{200F}"),
+            "pagar 0001 reais x",
+            "um controlo bidi reordenou o texto do cartao"
+        );
+        assert_ne!(SEARCH_CARD_TEXT_FORMAT & DT_NOPREFIX, 0, "& vira atalho");
+        assert_ne!(SEARCH_CARD_TEXT_FORMAT & DT_WORDBREAK, 0);
+        assert_eq!(SEARCH_CARD_TEXT_FORMAT & DT_SINGLELINE, 0);
+        assert_eq!(SEARCH_CARD_TITLE, "Pesquisar nas 3 IAs?");
+        assert_eq!(SearchCardButton::Search.label(), "Pesquisar");
+        assert_eq!(SearchCardButton::Cancel.label(), "Cancelar");
+
+        // Geometria e clique, com o tamanho real do cartao em tres escalas.
+        for scale in [1.0, 1.5, 2.0] {
+            let client = RECT {
+                left: 0,
+                top: 0,
+                right: (SEARCH_CARD_WIDTH * scale).round() as i32,
+                bottom: (SEARCH_CARD_HEIGHT * scale).round() as i32,
+            };
+            assert_eq!(search_card_scale(&client), scale);
+            let layout = search_card_layout(&client, scale);
+            let within = |rect: &RECT| {
+                rect.left >= client.left
+                    && rect.right <= client.right
+                    && rect.top >= client.top
+                    && rect.bottom <= client.bottom
+                    && rect.left < rect.right
+                    && rect.top < rect.bottom
+            };
+            for rect in [
+                &layout.title,
+                &layout.quote,
+                &layout.text,
+                &layout.search,
+                &layout.cancel,
+            ] {
+                assert!(within(rect), "escala {scale}: fora do cartao");
+            }
+            assert!(layout.search.right < layout.cancel.left, "botoes colados");
+            assert!(layout.title.bottom <= layout.quote.top);
+            assert!(layout.quote.bottom <= layout.search.top);
+            assert!(layout.text.bottom - layout.text.top >= (100.0 * scale) as i32);
+
+            let hit = |x: i32, y: i32| search_card_hit(&client, scale, x, y);
+            let middle = |rect: &RECT| ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+            let (sx, sy) = middle(&layout.search);
+            let (cx, cy) = middle(&layout.cancel);
+            assert_eq!(hit(sx, sy), Some(SearchCardButton::Search));
+            assert_eq!(hit(cx, cy), Some(SearchCardButton::Cancel));
+            assert_eq!(
+                hit(layout.search.right - 1, sy),
+                Some(SearchCardButton::Search)
+            );
+            assert_eq!(
+                hit(layout.search.right, sy),
+                None,
+                "borda direita semiaberta"
+            );
+            assert_eq!(hit(layout.search.left - 1, sy), None);
+            assert_eq!(hit(sx, layout.search.bottom), None);
+            assert_eq!(hit(layout.cancel.right, cy), None);
+            let (tx, ty) = middle(&layout.text);
+            assert_eq!(hit(tx, ty), None, "o texto nao e um botao");
+            let (hx, hy) = middle(&layout.title);
+            assert_eq!(hit(hx, hy), None);
+
+            // Premido e solto no mesmo botao, com o rato preso ao cartao.
+            let search = Some(SearchCardButton::Search.index());
+            let cancel = Some(SearchCardButton::Cancel.index());
+            let release =
+                |pressed, captured, x, y| search_card_release(pressed, captured, &client, x, y);
+            assert_eq!(
+                release(search, true, sx, sy),
+                Some(SearchCardButton::Search)
+            );
+            assert_eq!(
+                release(cancel, true, cx, cy),
+                Some(SearchCardButton::Cancel)
+            );
+            assert_eq!(release(cancel, true, sx, sy), None, "arrasto de Cancelar");
+            assert_eq!(release(None, true, sx, sy), None, "sem ter descido ali");
+            assert_eq!(release(search, false, sx, sy), None, "sem captura");
+            assert_eq!(release(search, true, tx, ty), None, "solto fora");
+        }
     }
 
     #[test]
@@ -21661,13 +22996,32 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     const navLang = typeof navigator !== 'undefined' ? toStr(navigator.language || '') : '';
     const synth = window.speechSynthesis || null;
     const Utterance = window.SpeechSynthesisUtterance || null;
-    const speakNow = synth && Utterance ? uncurry(synth.speak) : null;
+    // A voz tambem se le pelos acessores capturados aqui: a pagina que
+    // redefine `localService`, `lang` ou `default` de SpeechSynthesisVoice,
+    // ou o setter `voice` da fala, fazia passar uma voz online por local --
+    // e o texto saia do dispositivo, mesmo no painel privado. Sem eles nao ha
+    // Falar.
+    let voiceApi = null;
+    try {
+      const Voice = typeof SpeechSynthesisVoice === 'function' ? SpeechSynthesisVoice : null;
+      if (synth && Utterance && Voice) {
+        voiceApi = {
+          local: getterOf(Voice.prototype, 'localService'),
+          lang: getterOf(Voice.prototype, 'lang'),
+          isDefault: getterOf(Voice.prototype, 'default'),
+          use: setterOf(Utterance.prototype, 'voice'),
+          speakIn: setterOf(Utterance.prototype, 'lang')
+        };
+      }
+    } catch (err) { voiceApi = null; }
+    const speakNow = voiceApi ? uncurry(synth.speak) : null;
     const cancelSpeech = speakNow ? uncurry(synth.cancel) : null;
     const listVoices = speakNow ? uncurry(synth.getVoices) : null;
     const Sheet = typeof CSSStyleSheet === 'function' ? CSSStyleSheet : null;
     // IntersectionObserver v2: diz se a barra esta mesmo a vista, sem nada
     // da pagina por cima (mesmo com pointer-events:none), sem opacidade,
-    // filtro ou transformacao. E a defesa contra um clique enganado.
+    // filtro ou transformacao. Filtra cliques enganados antes de incomodar o
+    // utilizador; quem decide a pesquisa e o cartao nativo.
     const Watch = typeof IntersectionObserver === 'function'
       && typeof IntersectionObserverEntry === 'function'
       && Object.getOwnPropertyDescriptor(IntersectionObserverEntry.prototype, 'isVisible')
@@ -21681,8 +23035,11 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     const SHOW_MAX = 5000;
     const SEARCH_MAX = 2000;
     const SHOW_DELAY_MS = 200;
-    // Pesquisar leva o texto para fora da pagina: so conta um clique com a
-    // barra parada e confirmada a vista ha pelo menos isto.
+    // Pesquisar so PEDE a pesquisa: o nativo mostra o texto num cartao seu
+    // ("Pesquisar nas 3 IAs?") e so um clique nesse cartao a faz. A pagina
+    // pode encolher ou tornar transparente esta barra de formas que daqui nao
+    // se veem; o cartao ela nao alcanca. Antes de pedir, a barra ainda exige
+    // estar parada e a vista ha pelo menos isto.
     const ARM_MS = 500;
     // Menos do que isto entre o mousedown e o mouseup e um clique, nao um
     // arrasto: nao escolhe texto.
@@ -22157,7 +23514,8 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     }
 
     // A pergunta vai inteira ou nao vai: acima do tecto nada sai da pagina
-    // e a barra diz porque.
+    // e a barra diz porque. O `search` abre o cartao nativo de confirmacao;
+    // nada e pesquisado sem o clique la.
     function search() {
       if (!text) return;
       const ready = pressReady || readiness();
@@ -22216,15 +23574,24 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       return at < 0 ? tag : sliceOf(tag, 0, at);
     }
 
+    // Uma voz que o motor diz ser local, lida pelo acessor capturado.
+    function isLocal(voice) {
+      try { return !!voice && voiceApi.local(voice) === true; } catch (err) { return false; }
+    }
+
+    function langOf(voice) {
+      try { return voiceApi.lang(voice); } catch (err) { return ''; }
+    }
+
     // Voz local (offline) na lingua da pagina; senao pt-BR; senao a do
-    // sistema; senao qualquer voz local. Nunca uma voz online por omissao.
+    // sistema; senao qualquer voz local. Nunca uma voz online.
     function chooseVoice(voices) {
       const local = [];
       for (let i = 0; i < voices.length; i++) {
-        if (voices[i] && voices[i].localService !== false) pushTo(local, voices[i]);
+        if (isLocal(voices[i])) pushTo(local, voices[i]);
       }
       let pageLang = '';
-      try { pageLang = document.documentElement.lang; } catch (err) { pageLang = ''; }
+      try { pageLang = rootOf(document).lang; } catch (err) { pageLang = ''; }
       const wanted = [pageLang, 'pt-BR', navLang];
       for (let w = 0; w < wanted.length; w++) {
         const tag = langTag(wanted[w]);
@@ -22232,14 +23599,16 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
         const base = baseOf(tag);
         let loose = null;
         for (let i = 0; i < local.length; i++) {
-          const have = langTag(local[i].lang);
+          const have = langTag(langOf(local[i]));
           if (have === tag) return local[i];
           if (!loose && baseOf(have) === base) loose = local[i];
         }
         if (loose) return loose;
       }
       for (let i = 0; i < local.length; i++) {
-        if (local[i].default) return local[i];
+        let preferred = false;
+        try { preferred = voiceApi.isDefault(local[i]) === true; } catch (err) { preferred = false; }
+        if (preferred) return local[i];
       }
       return local.length ? local[0] : null;
     }
@@ -22377,8 +23746,8 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
           if (run !== speechRun) return;
           if (next >= parts.length) { spoken(run); return; }
           const utterance = new Utterance(parts[next++]);
-          utterance.voice = voice;
-          utterance.lang = voice.lang;
+          voiceApi.use(utterance, voice);
+          voiceApi.speakIn(utterance, langOf(voice));
           listen(utterance, 'end', guard(sayNext));
           listen(utterance, 'error', guard(function () { spoken(run); }));
           speechHold = utterance;
