@@ -505,12 +505,12 @@ function Get-WebViewCount([int]$RootId) {
     return $owned.Count
 }
 
-function Wait-ForWebViews([int]$RootId, [scriptblock]$Predicate, [int]$TimeoutSec) {
+function Wait-ForWebViewPoolAtMost([int]$RootId, [int]$Ceiling, [int]$TimeoutSec) {
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
         $count = Get-WebViewCount -RootId $RootId
-        if (& $Predicate $count) { return $count }
-        Start-Sleep -Milliseconds 400
+        if ($count -le $Ceiling) { return $count }
+        Start-Sleep -Milliseconds 250
     }
     return Get-WebViewCount -RootId $RootId
 }
@@ -614,9 +614,11 @@ try {
             $warmGdiCount = $postHomeGdi
         }
 
-        # O Edge WebView2 pode manter um pool de subprocessos para reutilizacao
-        # mesmo depois de os controllers terem sido fechados. O que nao pode
-        # acontecer e esse pool crescer a cada ciclo: isso sim denuncia leak.
+        # O Edge WebView2 pode manter subprocessos vivos brevemente depois de
+        # os controllers terem sido fechados. Uma leitura isolada acima do pico
+        # de aquecimento mede esse atraso, nao crescimento persistente. Se o
+        # limite for excedido, aguardamos ate 15 s pela saida desses processos;
+        # exceder o limite mesmo assim continua a reprovar o gate.
         $pooled = Get-WebViewCount -RootId $process.Id
         if ($cycle -le $webViewPoolWarmupCycles) {
             # O runtime pode completar o pool gradualmente até a terceira
@@ -627,8 +629,11 @@ try {
             }
         }
         elseif ($pooled -gt $webViewPoolCeiling) {
-            $null = $failures.Add("ciclo ${cycle}: pool WebView2 cresceu de ${webViewPoolCeiling} para ${pooled} processo(s) depois do aquecimento")
-            $webViewPoolCeiling = $pooled
+            $pooled = Wait-ForWebViewPoolAtMost -RootId $process.Id -Ceiling $webViewPoolCeiling -TimeoutSec 15
+            if ($pooled -gt $webViewPoolCeiling) {
+                $null = $failures.Add("ciclo ${cycle}: pool WebView2 permaneceu acima de ${webViewPoolCeiling}, com ${pooled} processo(s) apos 15 s de estabilizacao")
+                $webViewPoolCeiling = $pooled
+            }
         }
 
         $process.Refresh()
