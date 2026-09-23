@@ -17938,6 +17938,14 @@ __fire('submit', at(login));
         }
     }
 
+    /// Este ficheiro com fins de linha LF. Num checkout Windows com
+    /// `core.autocrlf=true` (o padrao do Git for Windows, e o do CI
+    /// windows-latest) o `include_str!` traz CRLF, e um `split("\n}\n")` nao
+    /// encontrava nada: o gate corria sobre o resto do ficheiro.
+    fn shipped_source() -> String {
+        include_str!("windows_app.rs").replace("\r\n", "\n")
+    }
+
     /// Corre `program` no Node (o mesmo motor de JS que os testes de CI dos
     /// scripts injetados usam) e devolve o stdout. Sem Node nao ha gate: falha.
     fn run_node_program(program: &str) -> String {
@@ -19721,6 +19729,60 @@ __state('so-a-online');
                 "{name}"
             );
         }
+
+        // Sem tocar em nada de SpeechSynthesis*: um acessor no indice 0 do
+        // Array.prototype (ou do Object.prototype) engolia a voz local que o
+        // `push` escrevia e devolvia a online a quem lia `local[0]`; as
+        // frases a dizer passavam pelo mesmo caminho.
+        let index_trap = |proto: &str| {
+            format!(
+                r#"
+Object.defineProperty({proto}, '0', {{
+  configurable: true,
+  get() {{ return __NUVEM; }},
+  set(value) {{
+    if (value instanceof SpeechSynthesisVoice || value === 'Uma frase privada.') return;
+    Object.defineProperty(this, '0', {{ value, writable: true, enumerable: true, configurable: true }});
+  }}
+}});
+document.documentElement.lang = 'pt-BR';
+__voices = [__NUVEM, __MARIA];
+__show('Uma frase privada. E outra.');
+__press('speak');
+__utterEnd();
+__state('indice');
+"#
+            )
+        };
+        let mut cases = Vec::new();
+        for proto in ["Array.prototype", "Object.prototype"] {
+            let trap = index_trap(proto);
+            cases.push(selection_case(
+                &format!("normal {proto}"),
+                &bind_page_script(NEURALIA_KEYMAP_SCRIPT, SELECTION_CAP, false),
+                "",
+                &[&trap],
+            ));
+            cases.push(selection_case(
+                &format!("split-privado {proto}"),
+                &split_page(1, "ChatGPT", SELECTION_CAP, true).init_script,
+                "",
+                &[&trap],
+            ));
+        }
+        for result in run_selection_cases(cases) {
+            let name = result["name"].as_str().expect("name");
+            assert!(selection_posted(&result).is_empty(), "{name}: postou");
+            let spoken = selection_states(&result)["indice"]["spoken"].clone();
+            assert_eq!(
+                spoken,
+                serde_json::json!([
+                    { "text": "Uma frase privada.", "voice": "Maria", "lang": "pt-BR" },
+                    { "text": "E outra.", "voice": "Maria", "lang": "pt-BR" }
+                ]),
+                "{name}: a pagina escolheu a voz ou o texto da fala"
+            );
+        }
     }
 
     #[test]
@@ -20031,7 +20093,7 @@ __state('barra');
         // A ultima ligacao e texto (AGENTS.md §4.3; o App nao se constroi sem
         // janela): `open_split_mode` passa ao plano o `private` que recebeu,
         // e as entradas privadas passam `true`.
-        let source = include_str!("windows_app.rs");
+        let source = shipped_source();
         let squash = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let open = source
             .split("fn open_split_mode(")
@@ -20208,7 +20270,7 @@ __state('duplo-clique-no-vazio');
         // `compare` (nem omnibox, palette, Split ou Web); o `compare` so esta
         // no `compare_selection` do host, que so um `Confirmed` chama
         // (asserções sobre o texto; ver AGENTS.md §4.3).
-        let source = include_str!("windows_app.rs");
+        let source = shipped_source();
         let squash = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let between = |from: &str, to: &str| {
             source
@@ -23076,7 +23138,15 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     const round = Math.round;
     const abs = Math.abs;
     const thenOf = uncurry(Promise.prototype.then);
-    const pushTo = uncurry(Array.prototype.push);
+    // Acrescentar a uma lista sem [[Set]]: o `push` escrevia pelo
+    // Array.prototype, e um acessor da pagina no indice 0 engolia a voz local
+    // e devolvia a online (ou uma frase dela) a quem lia a lista.
+    const defineOwn = Object.defineProperty;
+    function pushTo(list, value) {
+      defineOwn(list, list.length, {
+        __proto__: null, value: value, writable: true, enumerable: true, configurable: true
+      });
+    }
     const toStr = String;
     const fromCode = String.fromCharCode;
     const codeAt = uncurry(String.prototype.charCodeAt);
@@ -23726,34 +23796,39 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       try { return voiceApi.lang(voice); } catch (err) { return ''; }
     }
 
-    // Voz local (offline) na lingua da pagina; senao pt-BR; senao a do
-    // sistema; senao qualquer voz local. Nunca uma voz online.
-    function chooseVoice(voices) {
-      const local = [];
-      for (let i = 0; i < voices.length; i++) {
-        if (isLocal(voices[i])) pushTo(local, voices[i]);
+    // Quanto uma voz local serve: 0/1 na lingua da pagina (exata / so a
+    // base), 2/3 em pt-BR, 4/5 na do sistema, 6 a de omissao, 7 outra.
+    function voiceRank(voice, wanted) {
+      const have = langTag(langOf(voice));
+      for (let w = 0; w < wanted.length; w++) {
+        const tag = wanted[w];
+        if (!tag) continue;
+        if (have === tag) return 2 * w;
+        if (baseOf(have) === baseOf(tag)) return 2 * w + 1;
       }
+      let preferred = false;
+      try { preferred = voiceApi.isDefault(voice) === true; } catch (err) { preferred = false; }
+      return preferred ? 6 : 7;
+    }
+
+    // Voz local (offline) na lingua da pagina; senao pt-BR; senao a do
+    // sistema; senao a de omissao; senao qualquer voz local. Nunca uma voz
+    // online. Uma so passagem, sem listas intermedias: entre ver que a voz e
+    // local e devolve-la nao ha nada que a pagina possa trocar.
+    function chooseVoice(voices) {
       let pageLang = '';
       try { pageLang = rootOf(document).lang; } catch (err) { pageLang = ''; }
-      const wanted = [pageLang, 'pt-BR', navLang];
-      for (let w = 0; w < wanted.length; w++) {
-        const tag = langTag(wanted[w]);
-        if (!tag) continue;
-        const base = baseOf(tag);
-        let loose = null;
-        for (let i = 0; i < local.length; i++) {
-          const have = langTag(langOf(local[i]));
-          if (have === tag) return local[i];
-          if (!loose && baseOf(have) === base) loose = local[i];
-        }
-        if (loose) return loose;
+      const wanted = [langTag(pageLang), langTag('pt-BR'), langTag(navLang)];
+      let best = null;
+      let bestRank = 8;
+      const count = voices.length;
+      for (let i = 0; i < count; i++) {
+        const voice = voices[i];
+        if (!isLocal(voice)) continue;
+        const rank = voiceRank(voice, wanted);
+        if (rank < bestRank) { best = voice; bestRank = rank; }
       }
-      for (let i = 0; i < local.length; i++) {
-        let preferred = false;
-        try { preferred = voiceApi.isDefault(local[i]) === true; } catch (err) { preferred = false; }
-        if (preferred) return local[i];
-      }
-      return local.length ? local[0] : null;
+      return best;
     }
 
     // . ! ? … ; : -- depois de um destes, um espaco acaba a frase.
@@ -23877,7 +23952,8 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       setLabel('speak', LABELS.stop);
       withVoice(run, function (voice) {
         if (run !== speechRun) return;
-        if (!voice) {
+        // Outra vez, pelo acessor capturado, mesmo antes de usar.
+        if (!voice || !isLocal(voice)) {
           speaking = false;
           setLabel('speak', LABELS.speak);
           say('Nenhuma voz local disponível');
