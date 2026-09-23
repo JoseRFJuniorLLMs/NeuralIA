@@ -88,8 +88,14 @@ never picks an online voice: it reads `localService`, `lang` and `default`
 through the `SpeechSynthesisVoice` accessors, and sets the utterance's
 `voice` and `lang` through the `SpeechSynthesisUtterance` setters, captured
 when the document is created, so a page that redefines them cannot pass an
-online voice off as local; it prefers the page language, then pt-BR, then
-the system language, and reads one sentence per utterance; while it reads, a
+online voice off as local. It picks the voice in one pass over
+`getVoices()`, with no intermediate list, and checks `localService` again
+right before speaking; the toolbar's own lists grow through the
+`Object.defineProperty` captured when the document is created, never through
+`[[Set]]`, so an index accessor the page puts on `Array.prototype` or
+`Object.prototype` changes neither the voice nor the sentences read. It
+prefers the page language, then pt-BR, then the system language, then the
+default local voice, and reads one sentence per utterance; while it reads, a
 new selection moves the toolbar and becomes the text Copiar and Pesquisar
 use, and without one only Parar remains. A double click on a word in a
 comparator column selects it and brings the toolbar instead of expanding the
@@ -114,27 +120,39 @@ created.
 The native side never searches on `search` alone. It shows a native
 confirmation card, "Pesquisar nas 3 IAs?", centred in the window: an owned,
 non-activating popup (`WS_EX_NOACTIVATE`, shown with `SW_SHOWNOACTIVATE`) that
-the page cannot cover, move, paint or click, with the text as plain text (at
-most 200 characters, then "…"; line breaks, tabs and control characters become
-one space; bidirectional embedding, override and isolate controls are
-removed; drawn with `DT_NOPREFIX`) and two buttons, Pesquisar and Cancelar,
-handled natively (press and release on the same button, with the mouse
-captured by the card). Only a Pesquisar click on the card, at least 600 ms
-after that text appeared, opens the normal three-AI comparison with the whole
-text as the question; Cancelar, or 12 s without an answer, drops it. There is
-one card at a time: a new request replaces the text and restarts both clocks,
-and a click only counts for the text the card had painted. The comparison
+the page cannot cover, move, paint or click, with the text as plain text and
+two buttons, Pesquisar and Cancelar, handled natively (press and release on
+the same button, with the mouse captured by the card). The question is
+cleaned natively before the card shows it, and the cleaned text is the
+question itself, not only what is drawn: line breaks, tabs and control
+characters become one space, and characters that would paint as nothing are
+removed -- Unicode Default_Ignorable_Code_Points (tag characters, variation
+selectors, zero-width and bidirectional controls, soft hyphen, BOM, Hangul
+fillers), the blank braille pattern, interlinear annotation characters and
+U+FFFC, private-use code points and noncharacters. The card measures the text
+with the font and `DrawTextW` format it draws with (`DT_WORDBREAK`,
+`DT_EDITCONTROL`, `DT_NOPREFIX`, measured with `DT_CALCRECT`): what fits is
+drawn whole; otherwise it draws the longest start that fits, then "…", and
+"+N caracteres ficam de fora" -- and the part left out is not sent. Only a
+Pesquisar click on the card, at least 600 ms after that text appeared, opens
+the normal three-AI comparison, with exactly the text the card last painted
+as the question; Cancelar, or 12 s without an answer, drops it. There is one
+card at a time: a new request replaces the text and restarts both clocks, and
+a click only counts for the text the card had painted. The comparison
 never goes through the omnibox command parser or the palette, so a selected
 `agent:`, `tema:` or URL is a question, not a command. A private Split has no
 Pesquisar button and its handler refuses `search`, so it never shows the card;
 `open_split_mode` hands its `private` flag to `split_open_plan`, and the
-Split's incognito profile, injected script and IPC handler all come from the
-result. Gates: `search_carries_the_selected_text_within_bounds` (`ipc.rs`),
+Split's incognito profile, injected script, IPC handler and new-window handler
+(a private Split's popups open as private Splits) are all set by
+`configure_split_webview` from the result. Gates: `search_carries_the_selected_text_within_bounds` (`ipc.rs`),
 `the_selection_toolbar_offers_three_actions_for_a_trusted_selection`,
 `the_selection_toolbar_searches_only_what_fits_and_never_from_private`,
 `pesquisar_only_counts_a_click_on_a_bar_the_user_really_saw`,
 `pesquisar_asks_the_native_card_and_only_its_search_click_compares`,
 `the_search_card_shows_plain_bounded_text_and_answers_only_its_buttons`,
+`the_search_card_confirms_only_the_text_it_painted`,
+`the_search_card_window_answers_a_native_press_and_release_with_the_painted_token`,
 `the_selection_toolbar_copies_and_speaks_with_local_voices`,
 `falar_never_takes_an_online_voice_the_page_disguised_as_local`,
 `while_reading_a_new_selection_is_what_copy_and_search_take`,
