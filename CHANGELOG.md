@@ -28,6 +28,7 @@ All notable changes to NeuralIA are documented here.
 - **PR #133:** matriz determinística de 100 cenários cobre 5 larguras × 4 escalas de DPI × 5 topologias, além de gates de bordas de clique, alvo por foco, troca transacional de Split, press→release nativo, menu de grupos e duplo clique em elementos interativos.
 - **PR #133 — sabotagem automática:** o job Windows reintroduz temporariamente seis regressões Rust, as falhas de ordem de captura e limite vertical e uma regressão JS no checkout do runner, exige os gates vermelhos, restaura os bytes originais e repete os gates verdes antes de prosseguir.
 - **PR #133 — ciclo de vida:** a medição de cinco ciclos envia press→release ao botão Home nativo, como o produto exige, e verifica zero WebViews visíveis após cada retorno.
+- **PR #134 — medição WebView2:** a contagem de processos aguarda até quinze segundos quando ultrapassa o pico de aquecimento; um excesso que persiste continua a reprovar o gate de ciclo de vida.
 
 ## [2.1.4] - 2026-09-22
 
