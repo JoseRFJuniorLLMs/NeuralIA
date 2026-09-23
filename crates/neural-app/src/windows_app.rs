@@ -2490,12 +2490,12 @@ static TOOLTIP_TIMER: AtomicUsize = AtomicUsize::new(0);
 /// O botao Home ja agendou a sua dica nesta passagem do rato.
 static HOME_TOOLTIP_ARMED: AtomicBool = AtomicBool::new(false);
 const TOOLTIP_DELAY_MS: u32 = 450;
-const HINT_SUBCLASS_ID: usize = 0x4E48;
 /// Letra, margem, largura maxima e raio da dica, em pixels a 96 dpi.
 const HINT_FONT_PX: f64 = 20.0;
-const HINT_PADDING_PX: f64 = 18.0;
+/// Margens da dica: mais largas dos lados, onde a pilula se arredonda.
+const HINT_PADDING_X_PX: f64 = 24.0;
+const HINT_PADDING_Y_PX: f64 = 14.0;
 const HINT_MAX_WIDTH_PX: f64 = 640.0;
-const HINT_RADIUS_PX: f64 = 14.0;
 
 /// O que o clique em cada alvo da barra FAZ -- o mesmo match que trata o
 /// clique --, nao so o nome do botao.
@@ -2704,8 +2704,7 @@ fn hint_text_size(text: &str, scale: f64) -> (i32, i32) {
 /// A janela da dica, criada na primeira vez (e de novo se o dono mudou).
 fn hint_popup(root: HWND) -> Option<HWND> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GW_OWNER, GetWindow, IsWindow, LWA_ALPHA, SetLayeredWindowAttributes, WS_EX_LAYERED,
-        WS_EX_TRANSPARENT,
+        GW_OWNER, GetWindow, IsWindow, WS_EX_LAYERED, WS_EX_TRANSPARENT,
     };
     let existing = HINT_HWND.load(Ordering::Acquire) as HWND;
     unsafe {
@@ -2734,75 +2733,174 @@ fn hint_popup(root: HWND) -> Option<HWND> {
         if hint.is_null() {
             return None;
         }
-        SetLayeredWindowAttributes(hint, 0, 255, LWA_ALPHA);
-        if SetWindowSubclass(hint, Some(hint_subclass), HINT_SUBCLASS_ID, 0) == 0 {
-            DestroyWindow(hint);
-            return None;
-        }
+        // Sem SetLayeredWindowAttributes: quem pinta e o UpdateLayeredWindow,
+        // com alfa por pixel (render_hint).
         HINT_HWND.store(hint as usize, Ordering::Release);
         Some(hint)
     }
 }
 
-unsafe extern "system" fn hint_subclass(
-    hwnd: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    _subclass_id: usize,
-    _reference_data: usize,
-) -> LRESULT {
-    use windows_sys::Win32::Graphics::Gdi::{DT_WORDBREAK, FrameRgn};
-    if message != WM_PAINT {
-        return DefSubclassProc(hwnd, message, wparam, lparam);
-    }
-    let mut paint = PAINTSTRUCT::default();
-    let hdc = BeginPaint(hwnd, &mut paint);
-    if !hdc.is_null() {
-        let mut client = RECT::default();
-        if GetClientRect(hwnd, &mut client) != 0 {
-            // O mesmo visual dos avisos: fundo e texto do tema, fio de borda.
-            let theme = Theme::system();
-            let scale = screen_scale();
-            let fill = CreateSolidBrush(rgb3(theme.surface));
-            FillRect(hdc, &client, fill);
-            DeleteObject(fill as _);
-            let radius = (HINT_RADIUS_PX * scale).round() as i32;
-            let outline =
-                CreateRoundRectRgn(0, 0, client.right + 1, client.bottom + 1, radius, radius);
-            if !outline.is_null() {
-                let line = CreateSolidBrush(rgb3(theme.surface_line));
-                FrameRgn(hdc, outline, line, 1, 1);
-                DeleteObject(line as _);
-                DeleteObject(outline as _);
-            }
-            let font = create_font(-(HINT_FONT_PX * scale).round() as i32, FW_NORMAL as i32);
-            let old = SelectObject(hdc, font as _);
-            SetBkMode(hdc, TRANSPARENT as i32);
-            SetTextColor(hdc, rgb3(theme.fg));
-            let text = HINT_TEXT
-                .lock()
-                .map(|value| value.clone())
-                .unwrap_or_default();
-            let pad = (HINT_PADDING_PX * scale).round() as i32;
-            let mut area = RECT {
-                left: pad,
-                top: pad,
-                right: client.right - pad,
-                bottom: client.bottom - pad,
-            };
-            draw_text(
-                hdc,
-                &text,
-                &mut area,
-                DT_CENTER | DT_WORDBREAK | DT_NOPREFIX,
+/// Raio da dica: pilula, como os botoes (metade da altura), limitado para
+/// dicas de varias linhas nao ficarem ovais.
+fn hint_radius(height: f64, scale: f64) -> f64 {
+    (height / 2.0).min(28.0 * scale.max(1.0))
+}
+
+/// Aplica a forma da dica a um bitmap BGRA ja pintado (fundo + texto):
+/// cobertura suave pela distancia ao rectangulo arredondado, um fio de borda
+/// na cor dos botoes e o resultado PRE-MULTIPLICADO, como o
+/// UpdateLayeredWindow exige. O recorte por regiao do GDI deixava escadinhas.
+fn apply_hint_shape(pixels: &mut [u8], width: usize, height: usize, radius: f32, line: Rgb) {
+    for y in 0..height {
+        for x in 0..width {
+            let distance = round_rect_sdf(
+                x as f32 + 0.5,
+                y as f32 + 0.5,
+                width as f32,
+                height as f32,
+                radius,
             );
-            SelectObject(hdc, old);
-            DeleteObject(font as _);
+            let coverage = (0.5 - distance).clamp(0.0, 1.0);
+            // Fio de 1 px por dentro do contorno.
+            let border = (1.0 - (distance + 1.0).abs()).clamp(0.0, 1.0);
+            let index = (y * width + x) * 4;
+            let Some(pixel) = pixels.get_mut(index..index + 4) else {
+                return;
+            };
+            for (channel, target) in [(0, line.2), (1, line.1), (2, line.0)] {
+                let base = pixel[channel] as f32;
+                let mixed = base + (target as f32 - base) * border;
+                pixel[channel] = (mixed * coverage).round() as u8;
+            }
+            pixel[3] = (coverage * 255.0).round() as u8;
         }
-        EndPaint(hwnd, &paint);
     }
-    0
+}
+
+/// Pinta a dica e entrega-a ao Windows com alfa por pixel (cantos suaves).
+/// Posiciona e dimensiona a janela na mesma chamada.
+fn render_hint(hint: HWND, x: i32, y: i32, width: i32, height: i32, text: &str, scale: f64) {
+    use windows_sys::Win32::Foundation::SIZE;
+    use windows_sys::Win32::Graphics::Gdi::{
+        AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+        CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DT_WORDBREAK, DeleteDC, GetDC,
+        RGBQUAD, ReleaseDC,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ULW_ALPHA, UpdateLayeredWindow};
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    unsafe {
+        let screen = GetDC(std::ptr::null_mut());
+        if screen.is_null() {
+            return;
+        }
+        let memory = CreateCompatibleDC(screen);
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            bmiColors: [RGBQUAD {
+                rgbBlue: 0,
+                rgbGreen: 0,
+                rgbRed: 0,
+                rgbReserved: 0,
+            }; 1],
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(
+            screen,
+            &info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            std::ptr::null_mut(),
+            0,
+        );
+        if memory.is_null() || bitmap.is_null() || bits.is_null() {
+            if !bitmap.is_null() {
+                DeleteObject(bitmap as _);
+            }
+            if !memory.is_null() {
+                DeleteDC(memory);
+            }
+            ReleaseDC(std::ptr::null_mut(), screen);
+            return;
+        }
+        let old_bitmap = SelectObject(memory, bitmap as _);
+
+        // Fundo opaco e texto primeiro (o GDI nao escreve alfa); a forma vem
+        // depois, pixel a pixel.
+        let theme = Theme::system();
+        let all = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        let fill = CreateSolidBrush(rgb3(theme.surface));
+        FillRect(memory, &all, fill);
+        DeleteObject(fill as _);
+        let font = create_font(-(HINT_FONT_PX * scale).round() as i32, FW_NORMAL as i32);
+        let old_font = SelectObject(memory, font as _);
+        SetBkMode(memory, TRANSPARENT as i32);
+        SetTextColor(memory, rgb3(theme.fg));
+        let pad_x = (HINT_PADDING_X_PX * scale).round() as i32;
+        let pad_y = (HINT_PADDING_Y_PX * scale).round() as i32;
+        let mut area = RECT {
+            left: pad_x,
+            top: pad_y,
+            right: width - pad_x,
+            bottom: height - pad_y,
+        };
+        draw_text(
+            memory,
+            text,
+            &mut area,
+            DT_CENTER | DT_WORDBREAK | DT_NOPREFIX,
+        );
+        SelectObject(memory, old_font);
+        DeleteObject(font as _);
+
+        let pixels = std::slice::from_raw_parts_mut(bits as *mut u8, (width * height * 4) as usize);
+        apply_hint_shape(
+            pixels,
+            width as usize,
+            height as usize,
+            hint_radius(height as f64, scale) as f32,
+            theme.surface_line,
+        );
+
+        let position = POINT { x, y };
+        let size = SIZE {
+            cx: width,
+            cy: height,
+        };
+        let source = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        UpdateLayeredWindow(
+            hint, screen, &position, &size, memory, &source, 0, &blend, ULW_ALPHA,
+        );
+
+        SelectObject(memory, old_bitmap);
+        DeleteObject(bitmap as _);
+        DeleteDC(memory);
+        ReleaseDC(std::ptr::null_mut(), screen);
+    }
 }
 
 /// Mostra a dica agendada no centro da janela. Chamada pelo temporizador (e
@@ -2820,12 +2918,10 @@ fn show_pending_tooltip() {
         return;
     };
     let scale = screen_scale();
-    let pad = (HINT_PADDING_PX * scale).round() as i32;
+    let pad_x = (HINT_PADDING_X_PX * scale).round() as i32;
+    let pad_y = (HINT_PADDING_Y_PX * scale).round() as i32;
     let (text_w, text_h) = hint_text_size(&text, scale);
-    let (width, height) = (text_w + 2 * pad, text_h + 2 * pad);
-    *HINT_TEXT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = text;
+    let (width, height) = (text_w + 2 * pad_x, text_h + 2 * pad_y);
     unsafe {
         let mut client = RECT::default();
         if GetClientRect(root, &mut client) == 0 {
@@ -2834,23 +2930,20 @@ fn show_pending_tooltip() {
         let mut origin = POINT { x: 0, y: 0 };
         ClientToScreen(root, &mut origin);
         let (x, y) = splash_origin(client.right, client.bottom, width, height);
-        SetWindowPos(
+        render_hint(
             hint,
-            std::ptr::null_mut(),
             origin.x + x,
             origin.y + y,
             width,
             height,
-            SWP_NOACTIVATE,
+            &text,
+            scale,
         );
-        let radius = (HINT_RADIUS_PX * scale).round() as i32;
-        let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius);
-        if !region.is_null() && SetWindowRgn(hint, region, 1) == 0 {
-            DeleteObject(region as _);
-        }
         show_popup_without_activation(hint);
-        InvalidateRect(hint, std::ptr::null(), 1);
     }
+    *HINT_TEXT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = text;
 }
 
 fn hide_tooltip() {
@@ -12967,6 +13060,31 @@ mod tests {
         );
         assert!(no.right <= client.right && open.left >= 0);
         assert!(open.top >= 0 && open.bottom <= client.bottom);
+    }
+
+    #[test]
+    fn hint_is_a_smooth_pill_like_the_buttons() {
+        // Pilula como os botoes: metade da altura de raio (limitado).
+        assert_eq!(hint_radius(48.0, 1.0), 24.0);
+        assert_eq!(hint_radius(120.0, 1.0), 28.0, "dica alta nao fica oval");
+        let (width, height) = (160usize, 48usize);
+        let surface = (37u8, 41u8, 44u8);
+        let mut pixels: Vec<u8> = (0..width * height)
+            .flat_map(|_| [surface.2, surface.1, surface.0, 255])
+            .collect();
+        apply_hint_shape(&mut pixels, width, height, 24.0, (70, 76, 80));
+        let alpha = |x: usize, y: usize| pixels[(y * width + x) * 4 + 3];
+        assert_eq!(alpha(0, 0), 0, "o canto e transparente");
+        assert_eq!(alpha(width / 2, height / 2), 255, "o meio e opaco");
+        // Anti-aliasing: ao longo da curva ha alfa intermedio, nao escadinhas.
+        let soft = (0..height).any(|y| (0..24).any(|x| (1..255).contains(&alpha(x, y))));
+        assert!(soft, "a borda nao e suave: so ha alfa 0 ou 255");
+        // Pre-multiplicado: nenhum canal de cor acima do alfa.
+        assert!(
+            pixels
+                .chunks(4)
+                .all(|p| p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3])
+        );
     }
 
     #[test]
