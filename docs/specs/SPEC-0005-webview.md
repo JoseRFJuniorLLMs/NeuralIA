@@ -72,24 +72,48 @@ question in their own provider; the emitting column is not touched. Gates:
 `a_question_typed_in_one_column_goes_to_the_others` (`windows_app.rs`).
 
 `search` reports the "Pesquisar" button of the selection toolbar. The toolbar
-is part of the keyboard-shortcut script, so it exists in every WebView that
-receives that script: the comparator columns, the Split panel, external web,
-the Reader and the PDF viewer (top frame only). It appears after a trusted
-mouse or keyboard selection of 1..=5000 characters outside editable fields,
-lives in a closed shadow root and offers Pesquisar, Copiar (clipboard, no IPC)
-and Falar (local `speechSynthesis` voices, no IPC). Falar never picks an
-online voice: it prefers the page language, then pt-BR, then the system
-language, and reads one sentence per utterance. `search` carries exactly
-`text` (1..=2000 characters after trimming, no control characters except
-newline and tab); a longer selection is not sent and the toolbar says so. The
-native side opens the normal three-AI comparison with the text as the
-question, directly: it never goes through the omnibox command parser, so a
-selected `agent:` or `tema:` is a question, not a command. A private Split has
-no Pesquisar button and its handler refuses `search`. Gates:
-`search_carries_the_selected_text_within_bounds` (`ipc.rs`),
+is part of the keyboard-shortcut script and is offered in the comparator
+columns, the Split panel, external web and the Reader (top frame only). It
+appears when a trusted user gesture that selects text -- a mouse drag, a double
+or triple click, Shift+click, Shift with an arrow/Home/End/PgUp/PgDn key, or
+Ctrl+A -- leaves a selection of 1..=5000 characters outside editable fields,
+and the selection is still the same 200 ms later: a selection the page makes
+by itself, or swaps in that interval, does not bring it. After Esc or a scroll
+it stays closed until the next such gesture, and it is not shown for a
+selection whose end is outside the visible area. It is placed above the whole
+selection when there is room, else below its last line. It lives in a closed
+shadow root built when the document is created, and offers Pesquisar, Copiar
+(clipboard, no IPC) and Falar (local `speechSynthesis` voices, no IPC). Falar
+never picks an online voice: it prefers the page language, then pt-BR, then
+the system language, and reads one sentence per utterance; while it reads, a
+new selection moves the toolbar and becomes the text Copiar and Pesquisar
+use, and without one only Parar remains. A double click on a word in a
+comparator column selects it instead of expanding the column.
+
+Pesquisar counts a click only when the toolbar has been on screen, where it
+was placed, for 500 ms (also when the button went down), with no page-set
+opacity, filter, transform, clip-path, blend mode or hidden visibility on it
+and no opacity, filter or transform on the document root, and --
+when the engine provides IntersectionObserver v2 (`isVisible`) -- after that
+observer has reported it visible for 500 ms; otherwise nothing is sent and the
+toolbar says why. `search` carries exactly `text` (1..=2000 characters after
+trimming, no control characters except newline and tab); a longer selection
+is not sent and the toolbar says so. The text path uses the `String` and
+`String.prototype` members captured when the document is created. The native
+side opens the normal three-AI comparison with the text as the question,
+directly: it never goes through the omnibox command parser or the palette,
+so a selected `agent:`, `tema:` or URL is a question, not a command. A private
+Split has no Pesquisar button and its handler refuses `search`; the Split's
+script, IPC mapping and incognito profile come from one value
+(`split_page`). Gates: `search_carries_the_selected_text_within_bounds`
+(`ipc.rs`),
 `the_selection_toolbar_offers_three_actions_for_a_trusted_selection`,
 `the_selection_toolbar_searches_only_what_fits_and_never_from_private`,
+`pesquisar_only_counts_a_click_on_a_bar_the_user_really_saw`,
 `the_selection_toolbar_copies_and_speaks_with_local_voices`,
+`while_reading_a_new_selection_is_what_copy_and_search_take`,
+`every_page_surface_gets_the_toolbar_its_privacy_allows`,
+`double_clicking_a_word_in_a_column_selects_it_instead_of_expanding`,
 `a_selected_search_reaches_the_comparator_from_every_surface_but_the_private_split`
 and `a_selected_search_is_a_question_never_an_omnibox_command`
 (`windows_app.rs`).

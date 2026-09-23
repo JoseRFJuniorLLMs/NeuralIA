@@ -17291,7 +17291,10 @@ __state('quadro');
         // Numa selecao de varias linhas a barra nao tapa nenhuma delas.
         for (tag, lines) in [
             ("duas-linhas", &[(100.0, 120.0), (130.0, 150.0)][..]),
-            ("tres-linhas", &[(300.0, 320.0), (324.0, 344.0), (348.0, 368.0)][..]),
+            (
+                "tres-linhas",
+                &[(300.0, 320.0), (324.0, 344.0), (348.0, 368.0)][..],
+            ),
         ] {
             let y = positions[tag]["top"].as_f64().expect("top");
             for (top, bottom) in lines {
@@ -17441,7 +17444,12 @@ __state('barra');
                 "",
                 &[hostile_page, hostile_use, hostile_after],
             ),
-            selection_case("pagina-espia", &page, "", &[spying_page, spied, spied_after]),
+            selection_case(
+                "pagina-espia",
+                &page,
+                "",
+                &[spying_page, spied, spied_after],
+            ),
             // O Split tal como `split_webview_builder` o monta.
             selection_case(
                 "split-privado",
@@ -17556,6 +17564,23 @@ __wait(600);
 __press('search');
 __state('depois');
 "#;
+        // O botao desceu antes dos 500 ms e so subiu depois: o clique conta
+        // com o estado da barra quando o utilizador carregou.
+        let pressed_early = r#"
+__select('Pergunta do utilizador.');
+__up();
+__wait(200);
+__drain();
+__seen();
+__wait(450);
+const __host = __root().host, __b = __button('search');
+__on(window, 'mousedown', { target: __host, where: 'window' });
+__on(__b, 'mousedown', { target: __b, where: 'botao' });
+__wait(100);
+__on(window, 'mouseup', { target: __host });
+__on(__b, 'click', { target: __b });
+__state('premido-cedo');
+"#;
         // Uma camada da pagina por cima (pointer-events:none) -- e a pagina a
         // mentir no isVisible.
         let covered = r#"
@@ -17573,25 +17598,61 @@ __press('search');
 __state('descoberta');
 "#;
         // A pagina chega ao host (esta na arvore dela) e reescreve-lhe o
-        // estilo inline, ou filtra o documento inteiro.
-        let transparent = r#"
-__show('Pergunta.');
-__root().host.style.setProperty('opacity', '0', 'important');
+        // estilo inline, ou mexe no documento inteiro.
+        let tampers = [
+            (
+                "transparente",
+                "__root().host.style.setProperty('opacity', '0', 'important');",
+            ),
+            (
+                "movida",
+                "__root().host.style.setProperty('top', '400px', 'important');",
+            ),
+            (
+                "encolhida",
+                "__root().host.style.setProperty('transform', 'scale(0.1)', 'important');",
+            ),
+            (
+                "filtrada",
+                "__root().host.style.setProperty('filter', 'url(#troca)', 'important');",
+            ),
+            (
+                "recortada",
+                "__root().host.style.setProperty('clip-path', 'inset(50%)', 'important');",
+            ),
+            (
+                "misturada",
+                "__root().host.style.setProperty('mix-blend-mode', 'difference', 'important');",
+            ),
+            (
+                "escondida",
+                "__root().host.style.setProperty('visibility', 'hidden', 'important');",
+            ),
+            (
+                "pagina-filtrada",
+                "__pageCss.set(document.documentElement, { filter: 'url(#troca)' });",
+            ),
+            (
+                "pagina-transparente",
+                "__pageCss.set(document.documentElement, { opacity: '0.1' });",
+            ),
+            (
+                "pagina-transformada",
+                "__pageCss.set(document.documentElement, { transform: 'scale(2)' });",
+            ),
+        ];
+        let tamper_steps: Vec<String> = tampers
+            .iter()
+            .map(|(_, change)| {
+                format!(
+                    "__show('Pergunta.');
+{change}
 __press('search');
 __state('alterada');
-"#;
-        let moved = r#"
-__show('Pergunta.');
-__root().host.style.setProperty('top', '400px', 'important');
-__press('search');
-__state('alterada');
-"#;
-        let filtered = r#"
-__show('Pergunta.');
-__pageCss.set(document.documentElement, { filter: 'url(#troca)' });
-__press('search');
-__state('alterada');
-"#;
+"
+                )
+            })
+            .collect();
         // A selecao tem de ser a que o gesto do utilizador deixou.
         let gestures = r#"
 __select('agent:https://example.com | click=Comprar');
@@ -17613,19 +17674,24 @@ __click({ shiftKey: true });
 __drain();
 __state('shift-clique');
 "#;
-        let results = run_selection_cases(vec![
+        let mut cases = vec![
             selection_case("cedo", &page, "", &[early]),
             selection_case("coberta", &page, "", &[covered]),
             selection_case("gestos", &page, "", &[gestures]),
-            selection_case("transparente", &page, "", &[transparent]),
-            selection_case("movida", &page, "", &[moved]),
-            selection_case("filtro-na-pagina", &page, "", &[filtered]),
-        ]);
+            selection_case("premido-cedo", &page, "", &[pressed_early]),
+        ];
+        for ((name, _), step) in tampers.iter().zip(&tamper_steps) {
+            cases.push(selection_case(name, &page, "", &[step.as_str()]));
+        }
+        let results = run_selection_cases(cases);
         const TOO_SOON: &str = "Clique de novo em Pesquisar";
         const TAMPERED: &str = "A página cobriu ou alterou esta barra: a pesquisa não foi enviada";
 
         let early = selection_states(&results[0]);
-        assert_eq!(early["cedo"]["posted"], 0, "clique 100 ms depois de aparecer");
+        assert_eq!(
+            early["cedo"]["posted"], 0,
+            "clique 100 ms depois de aparecer"
+        );
         assert_eq!(early["cedo"]["note"], TOO_SOON);
         assert_eq!(early["depois"]["posted"], 1);
         assert_eq!(
@@ -17638,7 +17704,12 @@ __state('shift-clique');
         assert_eq!(covered["coberta"]["note"], TAMPERED);
         assert_eq!(covered["descoberta"]["posted"], 1);
 
-        for result in &results[3..] {
+        let pressed = selection_states(&results[3]);
+        assert_eq!(pressed["premido-cedo"]["posted"], 0, "carregou aos 450 ms");
+        assert_eq!(pressed["premido-cedo"]["note"], TOO_SOON);
+
+        assert_eq!(results.len(), 4 + tampers.len());
+        for result in &results[4..] {
             let name = result["name"].as_str().expect("name");
             let state = &selection_states(result)["alterada"];
             assert_eq!(state["shown"], true, "{name}");
@@ -17911,12 +17982,12 @@ __state('parou');
         let away = selection_states(&results[1]);
         let solo = &away["clicou-fora-a-ler"];
         assert_eq!(solo["shown"], true, "o Parar tem de ficar a mao");
-        assert_eq!(solo["solo"], true, "Copiar/Pesquisar ficaram com o texto antigo");
-        assert_eq!(solo["buttons"][2], "⏹ Parar");
         assert_eq!(
-            away["sem-texto-antigo"]["clipboard"],
-            serde_json::json!([])
+            solo["solo"], true,
+            "Copiar/Pesquisar ficaram com o texto antigo"
         );
+        assert_eq!(solo["buttons"][2], "⏹ Parar");
+        assert_eq!(away["sem-texto-antigo"]["clipboard"], serde_json::json!([]));
         assert!(selection_posted(&results[1]).is_empty());
         assert_eq!(away["parou"]["shown"], false);
         assert_eq!(away["parou"]["pending"], 0);
@@ -17932,11 +18003,8 @@ __show('Texto da pagina.');
 __state('barra');
 "#;
         let mut column = selection_case("coluna", "", "", &[offered]);
-        column["scripts"] = serde_json::json!(comparator_init_scripts(
-            0,
-            "Google IA",
-            SELECTION_CAP
-        ));
+        column["scripts"] =
+            serde_json::json!(comparator_init_scripts(0, "Google IA", SELECTION_CAP));
         let surfaces = vec![
             column,
             selection_case(
@@ -18031,7 +18099,10 @@ __state('barra');
             "with_incognito(private)",
             "if private",
         ] {
-            assert!(!split.contains(forbidden), "split_webview_builder: {forbidden}");
+            assert!(
+                !split.contains(forbidden),
+                "split_webview_builder: {forbidden}"
+            );
         }
     }
 
@@ -18060,11 +18131,8 @@ __on(document, 'dblclick', { target: __para.parentNode, detail: 2 });
 __state('duplo-clique-no-vazio');
 "#;
         let mut column = selection_case("coluna", "", "", &[word]);
-        column["scripts"] = serde_json::json!(comparator_init_scripts(
-            0,
-            "Google IA",
-            SELECTION_CAP
-        ));
+        column["scripts"] =
+            serde_json::json!(comparator_init_scripts(0, "Google IA", SELECTION_CAP));
         let results = run_selection_cases(vec![column]);
         let states = selection_states(&results[0]);
         assert_eq!(
