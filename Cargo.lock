@@ -1622,6 +1622,7 @@ dependencies = [
 name = "neural-app"
 version = "2.1.5"
 dependencies = [
+ "flate2",
  "image",
  "neural-core",
  "serde_json",

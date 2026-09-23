@@ -5,6 +5,7 @@ use std::{
     cell::Cell,
     collections::BinaryHeap,
     ffi::OsString,
+    path::PathBuf,
     sync::{
         Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
@@ -16,6 +17,11 @@ use std::{
 
 use image::RgbaImage;
 
+use crate::epub_app::{
+    EPUB_SCHEME, EpubJob, EpubNotice, EpubResponse, EpubRuntime, EpubUiRequest, ServeJob,
+    dispatch_epub_request, epub_dialog_filter, epub_drop_job, epub_navigation_allowed,
+    handle_epub_ipc, is_epub_path, library_url, notice_script, parse_dialog_selection, reader_url,
+};
 #[cfg(test)]
 use crate::ipc::constant_time_eq;
 use crate::ipc::{IpcAction, parse_ipc_message};
@@ -199,6 +205,16 @@ enum UserEvent {
         url: String,
         result: Result<Vec<u8>, String>,
     },
+    /// Resultado do worker da biblioteca de livros (adicionados, removidos,
+    /// marcador gravado, erro).
+    EpubNotice(EpubNotice),
+    /// Pedido das paginas EPUB que so a thread da interface pode atender
+    /// (dialogo de arquivos, link externo, voltar a Home).
+    EpubUi(EpubUiRequest),
+    /// Arquivos largados sobre o WebView da biblioteca/leitor.
+    EpubDropped(Vec<PathBuf>),
+    /// Ctrl+O na omnibox da Home: o dialogo de livros.
+    OpenEpubDialog,
 }
 
 /// O que fazer com um pedido de split conforme a superficie atual.
@@ -217,6 +233,8 @@ enum Surface {
     Comparator,
     /// O nosso visualizador de PDF (PDF.js embutido), numa origem nossa.
     Pdf,
+    /// A biblioteca e o leitor de EPUB, na origem `neuralia-epub`.
+    Epub,
 }
 
 /// Linha superior sem moldura: abas + minimizar/maximizar/fechar, como num browser.
@@ -3518,6 +3536,11 @@ unsafe extern "system" fn omnibox_subclass(
                 let _ = proxy.send_event(UserEvent::NewTab(0));
                 return 0;
             }
+            // Ctrl+O: adicionar e abrir livros EPUB.
+            0x4F if ctrl && !shift => {
+                let _ = proxy.send_event(UserEvent::OpenEpubDialog);
+                return 0;
+            }
             0x52 if ctrl && !shift => {
                 let _ = proxy.send_event(UserEvent::ToggleAutoScroll);
                 return 0;
@@ -4446,6 +4469,12 @@ struct App {
     panel_suggestion_query: Option<String>,
     /// Servico aberto no painel lateral (WhatsApp, Meet, YouTube, Gmail).
     service_panel: Option<(Service, WebView)>,
+    /// Biblioteca de livros (worker) e servidor da origem `neuralia-epub`.
+    /// Nascem na primeira vez que se abre um livro e vivem com a app.
+    epub: Option<EpubRuntime>,
+    /// Arquivos largados na janela neste lote de eventos. O winit entrega um
+    /// `DroppedFile` por arquivo; o lote segue inteiro no `about_to_wait`.
+    pending_drops: Vec<PathBuf>,
 }
 
 impl App {
@@ -4534,6 +4563,8 @@ impl App {
             side_panel: None,
             panel_suggestion_query: None,
             service_panel: None,
+            epub: None,
+            pending_drops: Vec::new(),
         }
     }
 
@@ -5120,6 +5151,9 @@ impl App {
             InputRoute::ResearchCompare => self.compare_current_research(),
             InputRoute::ResearchSynthesize => self.synthesize_current_research(),
             InputRoute::ResearchExport => self.export_current_research(),
+            InputRoute::Library => self.open_library(),
+            InputRoute::OpenEpub(None) => self.open_epub_dialog(true),
+            InputRoute::OpenEpub(Some(path)) => self.open_epub(path),
             InputRoute::Intent => match parse_intent(&input) {
                 Ok(Intent::Home) => self.show_home(),
                 Ok(Intent::Ask(query)) => self.ask(query),
@@ -5403,6 +5437,222 @@ impl App {
             Err(error) => {
                 self.show_native_error(format!("WebView2 não pôde abrir o PDF: {error}"));
             }
+        }
+    }
+
+    /// Arranca (uma vez) o worker da biblioteca de livros e o servidor da
+    /// origem `neuralia-epub`. Nada disto corre na thread da interface.
+    fn ensure_epub(&mut self) -> bool {
+        if self.epub.is_some() {
+            return true;
+        }
+        let proxy = self.proxy.clone();
+        let notify = Box::new(move |notice| {
+            let _ = proxy.send_event(UserEvent::EpubNotice(notice));
+        });
+        match EpubRuntime::start(self.config.data_dir.join("library"), notify) {
+            Ok(runtime) => {
+                self.epub = Some(runtime);
+                true
+            }
+            Err(error) => {
+                self.show_native_error(format!(
+                    "A biblioteca de livros não pôde ser iniciada: {error}"
+                ));
+                false
+            }
+        }
+    }
+
+    /// A biblioteca de livros (estilo Calibre). `livros:` na omnibox; o
+    /// botão da Home vem depois, pela mão de quem integra.
+    fn open_library(&mut self) {
+        self.open_epub_page(library_url());
+    }
+
+    /// Acrescenta o EPUB à biblioteca (numa thread própria: um livro grande
+    /// pode demorar) e abre-o no leitor quando estiver lá.
+    fn open_epub(&mut self, path: PathBuf) {
+        self.submit_epub_job(EpubJob::Add {
+            paths: vec![path],
+            open: true,
+        });
+    }
+
+    fn submit_epub_job(&mut self, job: EpubJob) {
+        if !self.ensure_epub() {
+            return;
+        }
+        let adding = match &job {
+            EpubJob::Add { paths, .. } => paths.len(),
+            _ => 0,
+        };
+        let submitted = self
+            .epub
+            .as_ref()
+            .is_some_and(|epub| epub.worker.submit(job));
+        if submitted && adding > 0 && self.surface == Surface::Home {
+            self.status = Some(if adding == 1 {
+                "A adicionar o livro à biblioteca…".to_string()
+            } else {
+                format!("A adicionar {adding} livros à biblioteca…")
+            });
+            self.request_redraw();
+        }
+    }
+
+    /// Arquivos largados na janela (ou no WebView dos livros): os `.epub`
+    /// entram e abrem, o resto é ignorado.
+    fn route_dropped_files(&mut self, paths: Vec<PathBuf>) {
+        if let Some(job) = epub_drop_job(paths) {
+            self.submit_epub_job(job);
+        }
+    }
+
+    /// Ctrl+O e `epub:`: o diálogo "Abrir" do Windows, só `*.epub`.
+    fn open_epub_dialog(&mut self, open: bool) {
+        let Some(owner) = self.window.as_ref().and_then(window_hwnd) else {
+            return;
+        };
+        let paths = pick_epub_files(owner);
+        if !paths.is_empty() {
+            self.submit_epub_job(EpubJob::Add { paths, open });
+        }
+    }
+
+    fn open_epub_reader(&mut self, id: &str) {
+        if let Some(url) = reader_url(id) {
+            self.open_epub_page(url);
+        }
+    }
+
+    fn open_epub_page(&mut self, url: String) {
+        if !self.ensure_epub() {
+            return;
+        }
+        if self.surface == Surface::Epub
+            && let Some(webview) = &self.webview
+        {
+            let _ = webview.load_url(&url);
+            return;
+        }
+        self.close_side_panel();
+        self.close_service_panel();
+        self.next_generation();
+        self.destroy_web_surfaces();
+        self.show_omnibox(false);
+        self.status = None;
+        let result = match (&self.window, &self.epub) {
+            (Some(window), Some(runtime)) => self
+                .epub_webview_builder(runtime)
+                .with_url(url)
+                .build(window),
+            _ => return,
+        };
+        match result {
+            Ok(webview) => {
+                let _ = webview.zoom(self.zoom);
+                let _ = webview.focus();
+                self.webview = Some(webview);
+                self.surface = Surface::Epub;
+            }
+            Err(error) => {
+                self.show_native_error(format!("WebView2 não pôde abrir os livros: {error}"));
+            }
+        }
+    }
+
+    /// O WebView da biblioteca e do leitor: a origem `neuralia-epub` servida
+    /// fora da thread da interface, o IPC fechado das páginas EPUB (nunca o
+    /// `ipc.rs` nem a capability das páginas remotas), navegação de topo só
+    /// para as duas páginas, sem popups, downloads nem permissões.
+    fn epub_webview_builder(&self, runtime: &EpubRuntime) -> WebViewBuilder<'static> {
+        let server = runtime.server.clone();
+        let worker = runtime.worker.clone();
+        let ipc_proxy = self.proxy.clone();
+        let drop_proxy = self.proxy.clone();
+        themed_webview_builder()
+            .with_asynchronous_custom_protocol(
+                EPUB_SCHEME.to_string(),
+                move |_id, request, responder| {
+                    let job = ServeJob {
+                        method: request.method().as_str().to_string(),
+                        path: request.uri().path().to_string(),
+                        reply: Box::new(move |response| {
+                            responder.respond(epub_http_response(response));
+                        }),
+                    };
+                    dispatch_epub_request(&server, job);
+                },
+            )
+            .with_ipc_handler(move |request| {
+                let source = request.uri().to_string();
+                if let Some(ui) = handle_epub_ipc(&source, request.body(), &worker) {
+                    let _ = ipc_proxy.send_event(UserEvent::EpubUi(ui));
+                }
+            })
+            .with_navigation_handler(|target| epub_navigation_allowed(&target))
+            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+            .with_download_started_handler(|_, _| false)
+            .with_drag_drop_handler(move |event| {
+                if let wry::DragDropEvent::Drop { paths, .. } = event {
+                    let _ = drop_proxy.send_event(UserEvent::EpubDropped(paths));
+                }
+                true
+            })
+            .with_permission_handler(|_| PermissionResponse::Deny)
+            .with_focused(true)
+    }
+
+    fn handle_epub_notice(&mut self, notice: EpubNotice) {
+        let on_epub = self.surface == Surface::Epub;
+        if on_epub && let Some(webview) = &self.webview {
+            let _ = webview.evaluate_script(&notice_script(&notice));
+        }
+        if let EpubNotice::Added {
+            books,
+            failures,
+            open: true,
+        } = &notice
+        {
+            if let ([book], true) = (books.as_slice(), failures.is_empty()) {
+                let id = book.id.clone();
+                self.open_epub_reader(&id);
+                return;
+            }
+            if !books.is_empty() && !on_epub {
+                self.open_library();
+                if let Some(line) = notice.status_line() {
+                    self.show_splash(line, 8);
+                }
+                return;
+            }
+        }
+        if on_epub {
+            return;
+        }
+        if let Some(line) = notice.status_line() {
+            if self.surface == Surface::Home {
+                self.status = Some(line);
+                self.request_redraw();
+            } else {
+                self.show_splash(line, 8);
+            }
+        } else if matches!(notice, EpubNotice::Added { .. }) && self.surface == Surface::Home {
+            self.status = None;
+            self.request_redraw();
+        }
+    }
+
+    fn handle_epub_ui(&mut self, request: EpubUiRequest) {
+        // Um pedido que chega depois de a página ter saído já não vale.
+        if self.surface != Surface::Epub {
+            return;
+        }
+        match request {
+            EpubUiRequest::AddBooks => self.open_epub_dialog(false),
+            EpubUiRequest::OpenExternal(url) => self.web(url),
+            EpubUiRequest::Close => self.show_home(),
         }
     }
 
@@ -7645,7 +7895,8 @@ impl App {
                     let _ = webview.evaluate_script(AUTO_SCROLL_SCRIPT);
                 }
             }
-            Surface::Home => {}
+            // O leitor de livros vira as proprias paginas; a biblioteca nao rola.
+            Surface::Home | Surface::Epub => {}
         }
         self.schedule_auto_scroll();
     }
@@ -8636,6 +8887,12 @@ impl App {
             panel_theme_vars(&Theme::system())
         ));
         let theme = ThemeChoice::current().webview_theme();
+        // O tema "Sistema" do leitor de livros acompanha o tema da app.
+        if self.surface == Surface::Epub
+            && let Some(webview) = &self.webview
+        {
+            let _ = webview.set_theme(theme);
+        }
         if let Some(comp) = &self.comparator {
             for view in &comp.views {
                 let _ = view.webview.set_theme(theme);
@@ -9360,6 +9617,10 @@ enum MainShortcut {
     Reload,
     History,
     NewTab,
+    /// Ctrl+O: o dialogo de livros EPUB. So nativo: o mapa de teclas das
+    /// paginas (`NEURALIA_KEYMAP_SCRIPT`) nao o conhece, para nao nascer uma
+    /// accao IPC nova no canal das paginas remotas.
+    OpenEpub,
 }
 
 fn main_window_shortcut(
@@ -9377,6 +9638,7 @@ fn main_window_shortcut(
         ("r", true) => Some(MainShortcut::Reload),
         ("h", false) => Some(MainShortcut::History),
         ("n", false) => Some(MainShortcut::NewTab),
+        ("o", false) => Some(MainShortcut::OpenEpub),
         _ => None,
     }
 }
@@ -9729,6 +9991,11 @@ enum InputRoute {
     ResearchCompare,
     ResearchSynthesize,
     ResearchExport,
+    /// `livros:` (e `biblioteca:`, `books:`, `library:`): a biblioteca.
+    Library,
+    /// `epub:` sozinho abre o diálogo de arquivos; `epub:<caminho>` abre esse
+    /// arquivo.
+    OpenEpub(Option<PathBuf>),
     /// Sem comando próprio: segue para o `parse_intent`.
     Intent,
 }
@@ -9746,10 +10013,22 @@ fn route_input(input: &str) -> InputRoute {
         ("research:export", InputRoute::ResearchExport),
         ("memory:rebuild", InputRoute::MemoryRebuild),
         ("mem:rebuild", InputRoute::MemoryRebuild),
+        ("livros:", InputRoute::Library),
+        ("biblioteca:", InputRoute::Library),
+        ("books:", InputRoute::Library),
+        ("library:", InputRoute::Library),
     ] {
         if trimmed.eq_ignore_ascii_case(command) {
             return route;
         }
+    }
+
+    if trimmed
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("epub:"))
+    {
+        let path = trimmed[5..].trim().trim_matches('"').trim();
+        return InputRoute::OpenEpub((!path.is_empty()).then(|| PathBuf::from(path)));
     }
 
     if let Some(word) = trimmed
@@ -10089,6 +10368,13 @@ impl ApplicationHandler<UserEvent> for App {
         // continuem chegando à janela REAL também na segunda abertura.
         self.ensure_window_subclass();
 
+        // Os `DroppedFile` de um mesmo gesto chegam no mesmo lote: seguem
+        // juntos, e so o ultimo livro adicionado abre.
+        if !self.pending_drops.is_empty() {
+            let dropped = std::mem::take(&mut self.pending_drops);
+            self.route_dropped_files(dropped);
+        }
+
         if lifecycle_probe_enabled()
             && self.surface == Surface::Comparator
             && self.comparator.is_some()
@@ -10378,6 +10664,14 @@ impl ApplicationHandler<UserEvent> for App {
                     Err(error) => self.show_native_error(format!("Reader: {error}")),
                 }
             }
+            UserEvent::EpubNotice(notice) => self.handle_epub_notice(notice),
+            UserEvent::EpubUi(request) => self.handle_epub_ui(request),
+            UserEvent::EpubDropped(paths) => {
+                if self.surface == Surface::Epub {
+                    self.route_dropped_files(paths);
+                }
+            }
+            UserEvent::OpenEpubDialog => self.open_epub_dialog(true),
         }
     }
 
@@ -10472,6 +10766,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.update_home_go_hover();
             }
+            // Um evento por arquivo; o lote inteiro segue no `about_to_wait`.
+            WindowEvent::DroppedFile(path) => self.pending_drops.push(path),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Focused(focused) => self.on_focus_changed(focused),
             WindowEvent::Occluded(occluded) => self.on_occluded_changed(occluded),
@@ -10499,6 +10795,7 @@ impl ApplicationHandler<UserEvent> for App {
                         MainShortcut::Reload => self.reload_page(),
                         MainShortcut::History => self.toggle_side_panel(),
                         MainShortcut::NewTab => self.new_tab(0),
+                        MainShortcut::OpenEpub => self.open_epub_dialog(true),
                     }
                     return;
                 }
@@ -10551,6 +10848,60 @@ fn pin_webview_profile() {
     unsafe {
         std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &profile);
     }
+}
+
+/// A resposta da origem `neuralia-epub` no tipo HTTP do wry.
+fn epub_http_response(response: EpubResponse) -> HttpResponse<Cow<'static, [u8]>> {
+    let mut builder = HttpResponse::builder().status(response.status);
+    for (name, value) in response.headers() {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(response.body)
+        .unwrap_or_else(|_| HttpResponse::new(Cow::Borrowed(b"" as &[u8])))
+}
+
+/// Capacidade do buffer do dialogo (em UTF-16): muitos livros de uma vez,
+/// cada um com um caminho longo.
+const EPUB_DIALOG_BUFFER: usize = 64 * 1024;
+
+/// O dialogo "Abrir" do Windows, so com `*.epub` e selecao multipla. Modal
+/// sobre a janela principal; devolve os caminhos escolhidos (nenhum se a
+/// pessoa cancelou).
+fn pick_epub_files(owner: HWND) -> Vec<PathBuf> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OFN_ALLOWMULTISELECT, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
+        OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    let filter = epub_dialog_filter();
+    let title = wide_null("Adicionar livros EPUB");
+    let mut buffer = vec![0u16; EPUB_DIALOG_BUFFER];
+    let mut dialog = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: owner,
+        lpstrFilter: filter.as_ptr(),
+        nFilterIndex: 1,
+        lpstrFile: buffer.as_mut_ptr(),
+        nMaxFile: buffer.len() as u32,
+        lpstrTitle: title.as_ptr(),
+        Flags: OFN_ALLOWMULTISELECT
+            | OFN_EXPLORER
+            | OFN_FILEMUSTEXIST
+            | OFN_PATHMUSTEXIST
+            | OFN_NOCHANGEDIR
+            | OFN_HIDEREADONLY,
+        ..Default::default()
+    };
+    // SAFETY: `dialog` aponta para buffers vivos ate ao fim da chamada; o
+    // Windows escreve no maximo `nMaxFile` unidades em `buffer`.
+    let chosen = unsafe { GetOpenFileNameW(&mut dialog) };
+    if chosen == 0 {
+        return Vec::new();
+    }
+    parse_dialog_selection(&buffer)
+        .into_iter()
+        .filter(|path| is_epub_path(path))
+        .collect()
 }
 
 /// Responde a origem do visualizador: os tres ficheiros do PDF.js e o

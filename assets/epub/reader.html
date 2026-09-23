@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="pt-BR" data-page="reader">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Leitor — NeuralIA</title>
+<link rel="stylesheet" href="/epub.css">
+<script src="/common.js" defer></script>
+<script src="/reader.js" defer></script>
+</head>
+<body class="reader-page">
+<header class="reader-bar">
+  <button id="back" class="icon-button" type="button" title="Voltar à biblioteca (Esc)" aria-label="Voltar à biblioteca">⟵</button>
+  <div class="reader-titles">
+    <div id="book-title" class="reader-book-title"></div>
+    <div id="chapter-title" class="reader-chapter-title"></div>
+  </div>
+  <nav class="reader-actions" aria-label="Ferramentas do leitor">
+    <button id="btn-toc" type="button" title="Sumário (T)" aria-controls="panel-toc">Sumário</button>
+    <button id="btn-search" type="button" title="Pesquisar no livro (Ctrl+F)" aria-controls="panel-search">Pesquisar</button>
+    <button id="btn-bookmarks" type="button" title="Marcadores (B)" aria-controls="panel-bookmarks">Marcadores</button>
+    <button id="btn-settings" type="button" title="Aparência do texto" aria-controls="panel-settings">Aa</button>
+    <button id="btn-speak" type="button" title="Ler em voz alta (L)">Ler em voz alta</button>
+    <button id="btn-help" class="icon-button" type="button" title="Atalhos do teclado (?)" aria-label="Atalhos do teclado">?</button>
+  </nav>
+</header>
+<div class="reader-body">
+  <aside id="panel-toc" class="panel" aria-label="Sumário" hidden>
+    <div class="panel-head"><h2>Sumário</h2><button class="icon-button small panel-close" type="button" aria-label="Fechar">×</button></div>
+    <ul id="toc" class="toc-tree"></ul>
+  </aside>
+  <aside id="panel-search" class="panel" aria-label="Pesquisar no livro" hidden>
+    <div class="panel-head"><h2>Pesquisar no livro</h2><button class="icon-button small panel-close" type="button" aria-label="Fechar">×</button></div>
+    <form id="search-form" class="search-form">
+      <input id="search-input" type="search" placeholder="Palavra ou frase" aria-label="Palavra ou frase" autocomplete="off" spellcheck="false">
+      <button type="submit">Buscar</button>
+    </form>
+    <div id="search-status" class="muted"></div>
+    <ol id="search-results" class="search-results"></ol>
+  </aside>
+  <aside id="panel-bookmarks" class="panel" aria-label="Marcadores" hidden>
+    <div class="panel-head"><h2>Marcadores</h2><button class="icon-button small panel-close" type="button" aria-label="Fechar">×</button></div>
+    <button id="bookmark-add" class="primary-button" type="button">Adicionar marcador aqui</button>
+    <ul id="bookmark-list" class="bookmark-list"></ul>
+    <p id="bookmark-empty" class="muted">Nenhum marcador neste livro.</p>
+  </aside>
+  <aside id="panel-settings" class="panel" aria-label="Aparência do texto" hidden>
+    <div class="panel-head"><h2>Aparência</h2><button class="icon-button small panel-close" type="button" aria-label="Fechar">×</button></div>
+    <div class="setting">
+      <span class="setting-label">Tamanho da fonte</span>
+      <div class="setting-row">
+        <button id="font-smaller" type="button" title="Diminuir (-)">A−</button>
+        <span id="font-size-label" class="setting-value">100%</span>
+        <button id="font-larger" type="button" title="Aumentar (+)">A+</button>
+      </div>
+    </div>
+    <label class="setting"><span class="setting-label">Fonte</span>
+      <select id="font-family">
+        <option value="original">Original do livro</option>
+        <option value="serif">Serifada</option>
+        <option value="sans">Sem serifa</option>
+      </select>
+    </label>
+    <label class="setting"><span class="setting-label">Espaçamento entre linhas</span>
+      <select id="line-height">
+        <option value="original">Original</option>
+        <option value="1.3">1,3</option>
+        <option value="1.5">1,5</option>
+        <option value="1.7">1,7</option>
+        <option value="2.0">2,0</option>
+      </select>
+    </label>
+    <label class="setting"><span class="setting-label">Margens</span>
+      <select id="margins">
+        <option value="narrow">Estreitas</option>
+        <option value="normal">Normais</option>
+        <option value="wide">Largas</option>
+      </select>
+    </label>
+    <label class="setting"><span class="setting-label">Alinhamento</span>
+      <select id="align">
+        <option value="original">Original do livro</option>
+        <option value="justify">Justificado</option>
+        <option value="left">À esquerda</option>
+      </select>
+    </label>
+    <div class="setting">
+      <span class="setting-label">Tema</span>
+      <div class="setting-row theme-row">
+        <button type="button" class="theme-choice" data-theme-choice="system">Sistema</button>
+        <button type="button" class="theme-choice" data-theme-choice="light">Claro</button>
+        <button type="button" class="theme-choice" data-theme-choice="sepia">Sépia</button>
+        <button type="button" class="theme-choice" data-theme-choice="dark">Escuro</button>
+      </div>
+    </div>
+    <label class="setting"><span class="setting-label">Modo de leitura</span>
+      <select id="mode">
+        <option value="paged">Páginas</option>
+        <option value="scroll">Rolagem contínua</option>
+      </select>
+    </label>
+    <label class="setting"><span class="setting-label">Colunas</span>
+      <select id="columns">
+        <option value="auto">Automático (pela largura)</option>
+        <option value="1">Uma coluna</option>
+        <option value="2">Duas colunas</option>
+      </select>
+    </label>
+    <label class="setting"><span class="setting-label">Velocidade da voz</span>
+      <select id="rate">
+        <option value="0.8">Devagar</option>
+        <option value="1">Normal</option>
+        <option value="1.2">Rápida</option>
+        <option value="1.5">Muito rápida</option>
+      </select>
+    </label>
+    <p id="voice-name" class="muted"></p>
+  </aside>
+  <main id="stage" class="stage">
+    <div id="frame-host" class="frame-host"></div>
+    <div id="reader-message" class="reader-message" hidden>
+      <p id="reader-message-text"></p>
+      <a href="/library.html">Voltar à biblioteca</a>
+    </div>
+  </main>
+</div>
+<footer class="reader-foot">
+  <div id="progress-track" class="progress-track big" title="Clique para ir a outro ponto do livro"><div id="progress-fill" class="progress-fill"></div></div>
+  <div class="reader-foot-row">
+    <span id="progress-chapter" class="muted"></span>
+    <span id="progress-page" class="muted"></span>
+    <span id="progress-percent" class="progress-percent"></span>
+  </div>
+</footer>
+<div id="toast" class="toast" role="status" hidden></div>
+<div id="help" class="modal" role="dialog" aria-modal="true" aria-labelledby="help-title" hidden>
+  <div class="modal-box help-box">
+    <h2 id="help-title">Atalhos do teclado</h2>
+    <dl class="shortcuts">
+      <dt>→ &nbsp; PageDown &nbsp; Espaço</dt><dd>Próxima página</dd>
+      <dt>← &nbsp; PageUp &nbsp; Shift+Espaço</dt><dd>Página anterior</dd>
+      <dt>Roda do rato</dt><dd>Virar a página</dd>
+      <dt>Clique na margem esquerda / direita</dt><dd>Página anterior / próxima</dd>
+      <dt>Home / End</dt><dd>Início / fim do capítulo</dd>
+      <dt>T</dt><dd>Sumário</dd>
+      <dt>Ctrl+F</dt><dd>Pesquisar no livro</dd>
+      <dt>B</dt><dd>Marcadores</dd>
+      <dt>M</dt><dd>Adicionar marcador</dd>
+      <dt>L</dt><dd>Ler em voz alta / parar</dd>
+      <dt>+ / −</dt><dd>Aumentar / diminuir a fonte</dd>
+      <dt>Ctrl+O</dt><dd>Adicionar livros</dd>
+      <dt>Esc</dt><dd>Fechar painel; voltar à biblioteca</dd>
+      <dt>?</dt><dd>Mostrar estes atalhos</dd>
+    </dl>
+    <div class="modal-actions"><button id="help-close" type="button">Fechar</button></div>
+  </div>
+</div>
+</body>
+</html>

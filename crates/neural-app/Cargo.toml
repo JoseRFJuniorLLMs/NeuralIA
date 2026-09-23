@@ -25,11 +25,17 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Graphics_Gdi",
     "Win32_Security_Cryptography",
     "Win32_System_Registry",
+    "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
 winit = "0.30"
 wry = { version = "0.57", features = ["devtools"] }
+
+[dev-dependencies]
+# Os testes do leitor de EPUB montam livros num ZIP escrito à mão (stored e
+# deflate). O flate2 já está no Cargo.lock (via neural-core); nenhum crate novo.
+flate2 = "1.1.10"
 
 [build-dependencies]
 winres = "0.1.12"
