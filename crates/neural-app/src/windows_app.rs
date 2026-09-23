@@ -1966,8 +1966,32 @@ fn native_release_matches(pressed: Option<usize>, released: Option<usize>) -> Op
     pressed.filter(|index| Some(*index) == released)
 }
 
+// ReleaseCapture envia WM_CAPTURECHANGED antes de voltar. Retirar o estado
+// antes da chamada preserva o clique legitimo sem deixar um press pendurado.
+fn take_native_pressed_button(
+    pressed: &AtomicUsize,
+    release_capture: impl FnOnce(),
+) -> Option<usize> {
+    let index = pressed.swap(NATIVE_BUTTON_NONE, Ordering::AcqRel);
+    release_capture();
+    (index != NATIVE_BUTTON_NONE).then_some(index)
+}
+
 fn point_inside_client(width: i32, height: i32, x: i32, y: i32) -> bool {
     width > 0 && height > 0 && x >= 0 && x < width && y >= 0 && y < height
+}
+
+fn native_caption_release(
+    pressed: Option<usize>,
+    captured: bool,
+    width: i32,
+    height: i32,
+    x: i32,
+    y: i32,
+) -> Option<usize> {
+    (captured && point_inside_client(width, height, x, y))
+        .then(|| native_release_matches(pressed, native_button_index(width, x)))
+        .flatten()
 }
 
 unsafe extern "system" fn caption_buttons_subclass(
@@ -2040,14 +2064,11 @@ unsafe extern "system" fn caption_buttons_subclass(
         }
         WM_LBUTTONUP => {
             let captured = GetCapture() == hwnd;
-            if captured {
-                ReleaseCapture();
-            }
-            let pressed_raw = CAPTION_PRESSED_BUTTON.swap(NATIVE_BUTTON_NONE, Ordering::AcqRel);
-            if !captured || pressed_raw == NATIVE_BUTTON_NONE {
-                return 0;
-            }
-
+            let pressed = take_native_pressed_button(&CAPTION_PRESSED_BUTTON, || {
+                if captured {
+                    ReleaseCapture();
+                }
+            });
             let parent = GetParent(hwnd);
             if parent.is_null() {
                 return 0;
@@ -2057,10 +2078,10 @@ unsafe extern "system" fn caption_buttons_subclass(
                 return 0;
             }
             let width = client.right - client.left;
+            let height = client.bottom - client.top;
             let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
-            let Some(index) =
-                native_release_matches(Some(pressed_raw), native_button_index(width, x))
-            else {
+            let y = ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32;
+            let Some(index) = native_caption_release(pressed, captured, width, height, x, y) else {
                 return 0;
             };
             let command = match index {
@@ -6784,14 +6805,6 @@ impl App {
         ))
     }
 
-    fn private_bar_rect(&self) -> Option<UiRect> {
-        Some(self.right_controls()?.private)
-    }
-
-    fn split_bar_rects(&self) -> Option<(UiRect, UiRect, UiRect)> {
-        self.right_controls()?.split
-    }
-
     fn comparator_bar_hit(&self) -> Option<BarHit> {
         if let Some(controls) = self.right_controls()
             && let Some(hit) = right_controls_hit(controls, self.cursor.0, self.cursor.1)
@@ -7351,7 +7364,9 @@ impl App {
         };
 
         match command {
-            TAB_MENU_OPEN => self.open_context_tab(source_index, context_index),
+            TAB_MENU_OPEN => {
+                self.open_context_tab(source_index, context_index);
+            }
             TAB_MENU_FULLSCREEN => self.open_context_tab_fullscreen(source_index, context_index),
             TAB_MENU_CLOSE => self.close_context_tab(source_index, context_index),
             TAB_MENU_CLOSE_OTHERS => self.close_other_context_tabs(source_index, context_index),
@@ -7393,7 +7408,9 @@ impl App {
             Some(BarHit::ContextTab {
                 source_index,
                 context_index,
-            }) => self.open_context_tab(source_index, context_index),
+            }) => {
+                self.open_context_tab(source_index, context_index);
+            }
             Some(BarHit::ContextGroup {
                 source_index,
                 group_index,
@@ -11964,15 +11981,11 @@ mod tests {
             App::column_ipc_event_impl(1, IpcAction::Palette { col: 1 }),
             Some(UserEvent::OpenPalette(1))
         ));
-        // O painel lateral mantem o despacho dentro do closure, e por isso
-        // continua a ser so presenca.
-        let split_body = source
-            .split("fn split_webview_builder")
-            .nth(1)
-            .and_then(|part| part.split(".with_new_window_req_handler").next())
-            .expect("split builder");
-        assert!(split_body.contains("IpcAction::Palette"));
-        assert!(split_body.contains("UserEvent::OpenPalette("));
+        assert!(matches!(
+            App::split_ipc_event_impl(1, IpcAction::Palette { col: 1 }),
+            Some(UserEvent::OpenPalette(1))
+        ));
+        assert!(App::split_ipc_event_impl(1, IpcAction::Palette { col: 0 }).is_none());
 
         let edit = source
             .split("fn palette_edit_subclass")
@@ -13412,9 +13425,27 @@ mod tests {
         assert_eq!(native_release_matches(Some(0), Some(0)), Some(0));
         assert_eq!(native_release_matches(Some(0), Some(2)), None);
         assert_eq!(native_release_matches(None, Some(2)), None);
+        assert_eq!(
+            native_caption_release(Some(1), true, 90, 30, 45, 15),
+            Some(1)
+        );
+        assert_eq!(native_caption_release(Some(1), true, 90, 30, 45, 30), None);
+        assert_eq!(native_caption_release(Some(1), true, 90, 30, 45, -1), None);
+        assert_eq!(native_caption_release(Some(1), false, 90, 30, 45, 15), None);
         assert!(point_inside_client(100, 30, 99, 29));
         assert!(!point_inside_client(100, 30, 100, 29));
         assert!(!point_inside_client(100, 30, 99, 30));
+
+        let pressed = AtomicUsize::new(1);
+        assert_eq!(
+            take_native_pressed_button(&pressed, || {
+                // WM_CAPTURECHANGED chega sincronamente durante ReleaseCapture.
+                pressed.store(NATIVE_BUTTON_NONE, Ordering::Release);
+            }),
+            Some(1)
+        );
+        assert_eq!(pressed.load(Ordering::Acquire), NATIVE_BUTTON_NONE);
+        assert_eq!(take_native_pressed_button(&pressed, || {}), None);
     }
 
     fn ninety_for_test() -> i32 {

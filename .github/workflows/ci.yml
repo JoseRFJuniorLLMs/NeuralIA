@@ -166,6 +166,32 @@ jobs:
 
             Write-Exact $sourcePath $originalSource
 
+            $brokenCapture = Replace-Exact $originalSource @'
+    let index = pressed.swap(NATIVE_BUTTON_NONE, Ordering::AcqRel);
+    release_capture();
+'@ @'
+    release_capture();
+    let index = pressed.swap(NATIVE_BUTTON_NONE, Ordering::AcqRel);
+'@ "capture-release-order"
+            Write-Exact $sourcePath $brokenCapture
+            cargo test --locked -p neural-app native_buttons_only_activate_when_press_and_release_match
+            if ($LASTEXITCODE -eq 0) {
+              throw "Capture-release ordering sabotage unexpectedly stayed green."
+            }
+            Write-Exact $sourcePath $originalSource
+
+            $brokenVertical = Replace-Exact $originalSource @'
+    (captured && point_inside_client(width, height, x, y))
+'@ @'
+    (captured)
+'@ "caption-vertical-boundary"
+            Write-Exact $sourcePath $brokenVertical
+            cargo test --locked -p neural-app native_buttons_only_activate_when_press_and_release_match
+            if ($LASTEXITCODE -eq 0) {
+              throw "Caption vertical-boundary sabotage unexpectedly stayed green."
+            }
+            Write-Exact $sourcePath $originalSource
+
             $brokenJs = Replace-Exact $originalSource @'
           '#neuralia-comp-controls,#neuralia-palette,a[href],button,input,textarea,select,option,label,summary,[role="button"],[role="link"],[contenteditable="true"]'
           '@ @'

@@ -60,10 +60,9 @@ fn spec_0100_product_memory_is_worker_backed_reader_wired_and_private_safe() {
     // `windows_app::tests::private_split_source_never_becomes_a_memory_document`.
     let split = between(APP, "fn open_split_mode", "fn open_private_panel");
     assert!(split.contains("split_source_memory(&valid, source_name, private)"));
-    assert!(
-        split.matches("if !private").count() >= 1,
-        "o histórico do Split View continua fora do caminho privado"
-    );
+    assert!(split.contains("let context_id = if private"));
+    assert!(split.contains("remember_context_tab("));
+    assert!(!split.contains("self.record("));
 }
 
 #[test]
