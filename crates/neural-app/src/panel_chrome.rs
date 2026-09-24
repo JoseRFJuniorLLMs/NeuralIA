@@ -226,7 +226,7 @@ impl PanelWidths {
 
     /// `{"historico":380,"servicos":560}`; o que nao for um numero plausivel
     /// fica de fora e vale a largura de sempre.
-    pub fn to_json(&self) -> String {
+    pub fn to_json(self) -> String {
         let mut map = serde_json::Map::new();
         if let Some(width) = self.history {
             map.insert("historico".into(), serde_json::json!(width));
@@ -263,7 +263,7 @@ impl PanelWidths {
     /// Escrita atomica: um ficheiro temporario ao lado e um `rename` por
     /// cima. Um arranque a meio de uma escrita le a largura antiga, nunca
     /// meio ficheiro.
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+    pub fn save(self, path: &Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -515,13 +515,136 @@ impl ServicePanelState {
             ServiceBadge::Minimized
         })
     }
+
+    /// Tudo o que o nativo aplica a janela para este modo, de uma vez.
+    pub fn frame(
+        &self,
+        width: f64,
+        logical_w: f64,
+        logical_h: f64,
+        top: f64,
+        strip: f64,
+    ) -> ServiceFrame {
+        ServiceFrame {
+            panel: self.panel_area(width, logical_w, logical_h, top, strip),
+            strip: self.strip_area(width, logical_w, top, strip),
+            reserved_width: self.reserved_width(width),
+            window_fullscreen: self.fullscreen(),
+            exit_button: self.app_fullscreen(),
+            resize_handle: self.docked(),
+        }
+    }
 }
 
-/// Esc (tecla em baixo) e connosco so com o painel em tela cheia; fora disso
-/// pertence a pagina.
-pub fn escape_is_ours(virtual_key: u32, key_down: bool, state: ServicePanelState) -> bool {
+/// O que um modo do painel de servicos pede a janela. `covers_window` e
+/// `window_fullscreen` sao a mesma coisa: em tela cheia o painel vai para
+/// cima de tudo e os divisores das colunas (popups) saem da frente.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ServiceFrame {
+    /// Onde fica a WebView (`None`: escondida, a tocar).
+    pub panel: Option<Area>,
+    /// A faixa de controlos nativa (so encostado, no comparador).
+    pub strip: Option<Area>,
+    /// A largura que as colunas cedem.
+    pub reserved_width: f64,
+    /// A janela inteira em tela cheia, com o painel por cima de tudo.
+    pub window_fullscreen: bool,
+    /// O "Sair da tela cheia" nativo (so a tela cheia pedida pela faixa).
+    pub exit_button: bool,
+    /// A pega de arrastar a borda (so com o painel encostado).
+    pub resize_handle: bool,
+}
+
+/// Os tres botoes da faixa, encostados a direita dela, por esta ordem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StripButton {
+    Minimize,
+    Fullscreen,
+    Close,
+}
+
+impl StripButton {
+    pub const ALL: [StripButton; 3] = [
+        StripButton::Minimize,
+        StripButton::Fullscreen,
+        StripButton::Close,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            StripButton::Minimize => "\u{2014} Minimizar",
+            StripButton::Fullscreen => "\u{26F6} Tela cheia",
+            StripButton::Close => "\u{00D7} Fechar",
+        }
+    }
+
+    /// A dica centrada do app: o que o clique FAZ.
+    pub fn hint(self, service: &str) -> String {
+        match self {
+            StripButton::Minimize => {
+                format!("Minimizar {service}: sai da frente e continua a tocar")
+            }
+            StripButton::Fullscreen => format!("{service} em tela cheia (Esc volta)"),
+            StripButton::Close => format!("Fechar {service}"),
+        }
+    }
+
+    pub fn input(self) -> ServiceInput {
+        match self {
+            StripButton::Minimize => ServiceInput::Minimize,
+            StripButton::Fullscreen => ServiceInput::ToggleFullscreen,
+            StripButton::Close => ServiceInput::Close,
+        }
+    }
+}
+
+/// Onde ficam os botoes dentro da faixa, nas unidades dela (`scale` converte
+/// as larguras logicas). Se a faixa for estreita demais, os botoes encolhem
+/// por igual e nunca saem dela.
+pub fn strip_buttons(strip: Area, scale: f64) -> [Area; 3] {
+    let scale = scale.max(0.1);
+    let margin = 6.0 * scale;
+    let gap = 6.0 * scale;
+    let height = (strip.height - 2.0 * margin).max(1.0);
+    let wanted = [112.0 * scale, 112.0 * scale, 88.0 * scale];
+    let room = (strip.width - 2.0 * margin - 2.0 * gap).max(3.0);
+    let total: f64 = wanted.iter().sum();
+    let shrink = (room / total).min(1.0);
+    let mut right = strip.x + strip.width - margin;
+    let mut out = [Area {
+        x: 0.0,
+        y: 0.0,
+        width: 0.0,
+        height: 0.0,
+    }; 3];
+    for index in (0..3).rev() {
+        let width = wanted[index] * shrink;
+        out[index] = Area {
+            x: right - width,
+            y: strip.y + margin,
+            width,
+            height,
+        };
+        right -= width + gap;
+    }
+    out
+}
+
+/// O botao da faixa debaixo do ponto, se houver.
+pub fn strip_hit(strip: Area, scale: f64, x: f64, y: f64) -> Option<StripButton> {
+    strip_buttons(strip, scale)
+        .iter()
+        .zip(StripButton::ALL)
+        .find(|(area, _)| area.contains(x, y))
+        .map(|(_, button)| button)
+}
+
+/// Tecla que o WebView2 do painel de servicos viu (AcceleratorKeyPressed): so
+/// o Esc em baixo interessa -- e ao modo do painel que cabe decidir se e dele
+/// (`ServiceInput::Escape`) ou da pagina.
+pub fn is_escape_down(virtual_key: u32, key_down: bool) -> bool {
     const VK_ESCAPE: u32 = 0x1B;
-    virtual_key == VK_ESCAPE && key_down && state.fullscreen()
+    virtual_key == VK_ESCAPE && key_down
 }
 
 /// O script (nosso, constante, sem dados da pagina) que pede a pagina para
@@ -863,12 +986,96 @@ mod tests {
 
     #[test]
     fn escape_belongs_to_the_page_unless_the_panel_is_fullscreen() {
+        assert!(is_escape_down(0x1B, true));
+        assert!(!is_escape_down(0x1B, false), "so a tecla em baixo");
+        assert!(!is_escape_down(0x0D, true));
+        // O Esc so muda alguma coisa com o painel em tela cheia.
         let mut state = ServicePanelState::default();
-        assert!(!escape_is_ours(0x1B, true, state));
-        state.step(ServiceInput::PageFullscreen(true));
-        assert!(escape_is_ours(0x1B, true, state));
-        assert!(!escape_is_ours(0x1B, false, state), "so a tecla em baixo");
-        assert!(!escape_is_ours(0x0D, true, state));
+        assert_eq!(state.step(ServiceInput::Escape), ServiceEffect::Nothing);
+        state.step(ServiceInput::Minimize);
+        assert_eq!(state.step(ServiceInput::Escape), ServiceEffect::Nothing);
         assert!(EXIT_PAGE_FULLSCREEN_SCRIPT.contains("document.exitFullscreen()"));
+    }
+
+    #[test]
+    fn each_service_mode_gives_the_window_one_consistent_frame() {
+        let mut state = ServicePanelState::default();
+        let frame = |state: &ServicePanelState| state.frame(560.0, 1600.0, 900.0, 88.0, 34.0);
+
+        // Encostado: painel abaixo da faixa, colunas cedem a largura, pega.
+        let docked = frame(&state);
+        assert_eq!(docked.reserved_width, 560.0);
+        assert_eq!(docked.panel.map(|p| (p.x, p.y)), Some((1040.0, 122.0)));
+        assert!(docked.strip.is_some() && docked.resize_handle);
+        assert!(!docked.window_fullscreen && !docked.exit_button);
+
+        // Minimizado: nada a vista, as colunas recuperam tudo.
+        state.step(ServiceInput::Minimize);
+        let minimized = frame(&state);
+        assert_eq!(minimized.panel, None);
+        assert_eq!(minimized.reserved_width, 0.0);
+        assert!(minimized.strip.is_none() && !minimized.resize_handle);
+        assert!(!minimized.window_fullscreen);
+        state.step(ServiceInput::IconClick);
+
+        // A pagina em tela cheia: janela inteira, sem pega nem faixa, e sem
+        // o "Sair" nativo (a pagina tem o dela e o Esc).
+        state.step(ServiceInput::PageFullscreen(true));
+        let page = frame(&state);
+        assert!(page.window_fullscreen && !page.exit_button && !page.resize_handle);
+        assert_eq!(
+            page.panel.map(|p| (p.x, p.y, p.width, p.height)),
+            Some((0.0, 0.0, 1600.0, 900.0))
+        );
+        state.step(ServiceInput::PageFullscreen(false));
+        assert_eq!(frame(&state), docked, "sair devolve exatamente o encostado");
+
+        // Pela faixa: com o "Sair" nativo.
+        state.step(ServiceInput::ToggleFullscreen);
+        let app = frame(&state);
+        assert!(app.window_fullscreen && app.exit_button);
+        state.step(ServiceInput::Escape);
+        assert_eq!(frame(&state), docked);
+    }
+
+    #[test]
+    fn the_strip_buttons_are_hit_where_they_are_drawn() {
+        let strip = Area {
+            x: 1040.0,
+            y: 88.0,
+            width: 560.0,
+            height: 34.0,
+        };
+        let buttons = strip_buttons(strip, 1.0);
+        for (area, button) in buttons.iter().zip(StripButton::ALL) {
+            assert!(area.x >= strip.x && area.x + area.width <= strip.x + strip.width);
+            assert!(area.y >= strip.y && area.y + area.height <= strip.y + strip.height);
+            let (cx, cy) = (area.x + area.width / 2.0, area.y + area.height / 2.0);
+            assert_eq!(strip_hit(strip, 1.0, cx, cy), Some(button));
+        }
+        // Por ordem da esquerda para a direita, sem se tocarem.
+        assert!(buttons[0].x + buttons[0].width < buttons[1].x);
+        assert!(buttons[1].x + buttons[1].width < buttons[2].x);
+        // O resto da faixa (o nome do servico) nao e botao.
+        assert_eq!(strip_hit(strip, 1.0, 1060.0, 105.0), None);
+        // Faixa estreita: encolhem, nunca saem dela.
+        let narrow = Area {
+            width: 200.0,
+            ..strip
+        };
+        for area in strip_buttons(narrow, 1.5) {
+            assert!(area.x >= narrow.x && area.x + area.width <= narrow.x + narrow.width);
+        }
+        assert_eq!(StripButton::Minimize.input(), ServiceInput::Minimize);
+        assert_eq!(
+            StripButton::Fullscreen.input(),
+            ServiceInput::ToggleFullscreen
+        );
+        assert_eq!(StripButton::Close.input(), ServiceInput::Close);
+        assert!(
+            StripButton::Minimize
+                .hint("YouTube")
+                .contains("continua a tocar")
+        );
     }
 }
