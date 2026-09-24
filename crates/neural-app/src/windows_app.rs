@@ -20,7 +20,8 @@ use image::RgbaImage;
 use crate::epub_app::{
     EPUB_SCHEME, EpubJob, EpubNotice, EpubResponse, EpubRuntime, EpubUiRequest, ServeJob,
     dispatch_epub_request, epub_dialog_filter, epub_drop_job, epub_navigation_allowed,
-    handle_epub_ipc, is_epub_path, library_url, notice_script, parse_dialog_selection, reader_url,
+    epub_request_target, handle_epub_ipc, is_epub_path, library_url, notice_script,
+    parse_dialog_selection, reader_url,
 };
 use crate::gemini_live::{
     LIVE_PROTOCOL, LiveAction, LiveIndicator, LiveKeyStore, LiveMessage, LivePanel,
@@ -5158,7 +5159,7 @@ impl App {
             return false;
         };
         let body = wide_null(
-            "Apagar TODO o histórico e a memória local da NeuralIA?\n\nIsto não pode ser desfeito.",
+            "Apagar TODO o histórico e a memória local da NeuralIA?\n\nNos livros, some o registro de quando cada um foi aberto; a posição de leitura e os marcadores ficam.\n\nIsto não pode ser desfeito.",
         );
         let title = wide_null("NeuralIA — Apagar histórico");
         let answer = unsafe {
@@ -5679,16 +5680,12 @@ impl App {
             .with_asynchronous_custom_protocol(
                 EPUB_SCHEME.to_string(),
                 move |_id, request, responder| {
-                    let job = ServeJob {
-                        method: request.method().as_str().to_string(),
-                        target: request
-                            .uri()
-                            .path_and_query()
-                            .map_or_else(|| "/".to_string(), |target| target.as_str().to_string()),
-                        reply: Box::new(move |response| {
+                    let job = epub_serve_job(
+                        &request,
+                        Box::new(move |response| {
                             responder.respond(epub_http_response(response));
                         }),
-                    };
+                    );
                     dispatch_epub_request(&server, job);
                 },
             )
@@ -10686,6 +10683,18 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 self.memory.clear(&mut self.current_research);
+                // Na biblioteca de livros, some quando cada livro foi aberto
+                // ("Continuar lendo", recentes); posições e marcadores ficam.
+                if self.epub.is_some()
+                    || self
+                        .config
+                        .data_dir
+                        .join("library")
+                        .join(neural_core::library::INDEX_FILE)
+                        .exists()
+                {
+                    self.submit_epub_job(EpubJob::ClearReadingHistory);
+                }
                 match self.history.clear() {
                     None => {
                         self.show_home();
@@ -11093,6 +11102,11 @@ enum EpubNoticePlan {
 
 fn plan_epub_notice(notice: &EpubNotice, surface: Surface) -> EpubNoticePlan {
     let on_epub = surface == Surface::Epub;
+    // Abrir o leitor ou a biblioteca destrói a superfície atual. Só por cima
+    // da Home ou das páginas de livros: uma importação lenta (livro grande,
+    // pen drive, rede) que acaba depois de a pessoa ter ido para uma página
+    // web ou para o comparador não lhe tira o que está a fazer.
+    let may_replace = matches!(surface, Surface::Home | Surface::Epub);
     if let EpubNotice::Added {
         books,
         failures,
@@ -11100,10 +11114,29 @@ fn plan_epub_notice(notice: &EpubNotice, surface: Surface) -> EpubNoticePlan {
     } = notice
     {
         if let ([book], true) = (books.as_slice(), failures.is_empty()) {
-            return EpubNoticePlan::OpenReader(book.id.clone());
+            return if may_replace {
+                EpubNoticePlan::OpenReader(book.id.clone())
+            } else {
+                EpubNoticePlan::Splash(format!(
+                    "“{}” entrou na biblioteca. Para ler, abra Livros (livros: na Home).",
+                    book.title
+                ))
+            };
         }
         if !books.is_empty() && !on_epub {
-            return EpubNoticePlan::OpenLibrary(notice.status_line());
+            if may_replace {
+                return EpubNoticePlan::OpenLibrary(notice.status_line());
+            }
+            let count = books.len();
+            let added = if count == 1 {
+                "1 livro entrou na biblioteca.".to_string()
+            } else {
+                format!("{count} livros entraram na biblioteca.")
+            };
+            return EpubNoticePlan::Splash(match notice.status_line() {
+                Some(line) => format!("{added} {line}"),
+                None => added,
+            });
         }
     }
     if on_epub {
@@ -11119,7 +11152,22 @@ fn plan_epub_notice(notice: &EpubNotice, surface: Surface) -> EpubNoticePlan {
     }
 }
 
-/// A resposta da origem `neuralia-epub` no tipo HTTP do wry.
+/// O pedido do WebView para a origem `neuralia-epub` como o servidor o lê:
+/// método e caminho COM a query (o `?as=html` dos capítulos).
+fn epub_serve_job(
+    request: &Request<Vec<u8>>,
+    reply: Box<dyn FnOnce(EpubResponse) + Send>,
+) -> ServeJob {
+    ServeJob {
+        method: request.method().as_str().to_string(),
+        target: epub_request_target(request.uri().path_and_query().map(|target| target.as_str())),
+        reply,
+    }
+}
+
+/// A resposta da origem `neuralia-epub` no tipo HTTP do wry, com TODOS os
+/// cabeçalhos do servidor (a CSP dos livros é o que impede um livro de
+/// carregar imagens ou fontes da rede).
 fn epub_http_response(response: EpubResponse) -> HttpResponse<Cow<'static, [u8]>> {
     let mut builder = HttpResponse::builder().status(response.status);
     for (name, value) in response.headers() {
@@ -17697,11 +17745,36 @@ __fire('keydown', { key: 'F8' });
                 open,
             };
         // Um livro largado, escolhido no diálogo ou em `epub:`: abre no
-        // leitor, esteja a pessoa onde estiver.
-        for surface in [Surface::Home, Surface::External, Surface::Epub] {
+        // leitor quando a pessoa está na Home ou nos livros.
+        for surface in [Surface::Home, Surface::Epub] {
             assert_eq!(
                 plan_epub_notice(&added(vec![book("aaaa")], vec![], true), surface),
                 EpubNoticePlan::OpenReader("aaaa".to_string()),
+                "{surface:?}"
+            );
+        }
+        // Uma importação lenta que acaba depois de a pessoa ir para uma
+        // página web, o comparador ou um PDF não os destrói: um aviso.
+        for surface in [
+            Surface::External,
+            Surface::Comparator,
+            Surface::Pdf,
+            Surface::Reader,
+        ] {
+            assert_eq!(
+                plan_epub_notice(&added(vec![book("aaaa")], vec![], true), surface),
+                EpubNoticePlan::Splash(
+                    "“Livro” entrou na biblioteca. Para ler, abra Livros (livros: na Home)."
+                        .to_string()
+                ),
+                "{surface:?}"
+            );
+            assert_eq!(
+                plan_epub_notice(
+                    &added(vec![book("aaaa"), book("bbbb")], vec![drm.clone()], true),
+                    surface
+                ),
+                EpubNoticePlan::Splash(format!("2 livros entraram na biblioteca. {line}")),
                 "{surface:?}"
             );
         }
@@ -17768,6 +17841,102 @@ __fire('keydown', { key: 'F8' });
             plan_epub_notice(&bookmarks, Surface::Epub),
             EpubNoticePlan::PageOnly
         );
+    }
+
+    /// O código que entrega as respostas da origem `neuralia-epub` ao
+    /// WebView2: o pedido vira `ServeJob` com a query (o `?as=html` dos
+    /// capítulos) e a resposta leva TODOS os cabeçalhos do servidor.
+    #[test]
+    fn the_epub_protocol_handler_keeps_the_query_and_every_header() {
+        use crate::epub_app::{BOOK_CACHE, BOOK_CSP, EpubResponse, PAGE_CSP};
+        let fx = crate::epub_app::tests::fixture();
+        let mut server = fx.server();
+        let chapter = fx.chapter_href();
+        let serve = |server: &mut crate::epub_app::EpubServer, uri: &str| {
+            let request = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Vec::new())
+                .expect("pedido");
+            let (sender, answer) = std::sync::mpsc::channel::<EpubResponse>();
+            let job = epub_serve_job(
+                &request,
+                Box::new(move |response| {
+                    let _ = sender.send(response);
+                }),
+            );
+            let target = job.target.clone();
+            let response = server.respond(&job.method, &job.target);
+            (job.reply)(response);
+            (target, epub_http_response(answer.recv().expect("resposta")))
+        };
+        let header = |response: &HttpResponse<Cow<'static, [u8]>>, name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+
+        // O capítulo pedido outra vez como HTML: a query chega ao servidor.
+        let (target, html) = serve(
+            &mut server,
+            &format!("http://neuralia-epub.localhost{chapter}?as=html"),
+        );
+        assert_eq!(target, format!("{chapter}?as=html"));
+        assert_eq!(html.status(), 200);
+        assert_eq!(header(&html, "Content-Type").as_deref(), Some("text/html"));
+        assert_eq!(
+            header(&html, "Content-Security-Policy").as_deref(),
+            Some(BOOK_CSP)
+        );
+        assert_eq!(
+            header(&html, "X-Content-Type-Options").as_deref(),
+            Some("nosniff")
+        );
+        assert_eq!(header(&html, "Cache-Control").as_deref(), Some(BOOK_CACHE));
+        assert_eq!(
+            header(&html, "Referrer-Policy").as_deref(),
+            Some("no-referrer")
+        );
+        let (_, xhtml) = serve(
+            &mut server,
+            &format!("http://neuralia-epub.localhost{chapter}"),
+        );
+        assert_eq!(
+            header(&xhtml, "Content-Type").as_deref(),
+            Some("application/xhtml+xml")
+        );
+        assert_eq!(xhtml.body().as_ref(), html.body().as_ref());
+
+        // As nossas páginas: a CSP das páginas, nunca em cache.
+        let (target, page) = serve(
+            &mut server,
+            "http://neuralia-epub.localhost/reader.html?book=x",
+        );
+        assert_eq!(target, "/reader.html?book=x");
+        assert_eq!(
+            header(&page, "Content-Security-Policy").as_deref(),
+            Some(PAGE_CSP)
+        );
+        assert_eq!(header(&page, "Cache-Control").as_deref(), Some("no-store"));
+        assert_eq!(
+            header(&page, "X-Content-Type-Options").as_deref(),
+            Some("nosniff")
+        );
+        // Cada cabeçalho que o servidor manda chega ao WebView.
+        for path in ["/reader.html", "/api/library", chapter.as_str(), "/nada"] {
+            let response = server.respond("GET", path);
+            let expected = response.headers();
+            let http = epub_http_response(response);
+            for (name, value) in expected {
+                assert_eq!(
+                    header(&http, name).as_deref(),
+                    Some(value.as_str()),
+                    "{path}: {name}"
+                );
+            }
+        }
     }
 
     #[test]

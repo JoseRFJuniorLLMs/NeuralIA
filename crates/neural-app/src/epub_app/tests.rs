@@ -203,6 +203,26 @@ fn sample_epub() -> Vec<u8> {
     sample_zip().finish()
 }
 
+/// Um EPUB mínimo com um capítulo e o título dado.
+fn plain_book(title: &str) -> Vec<u8> {
+    let opf = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="uid">urn:neuralia:{title}</dc:identifier><dc:title>{title}</dc:title>
+  </metadata>
+  <manifest><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="c1"/></spine>
+</package>"#
+    );
+    Zip::default()
+        .add("mimetype", b"application/epub+zip", false)
+        .add("META-INF/container.xml", CONTAINER.as_bytes(), true)
+        .add("OEBPS/content.opf", opf.as_bytes(), true)
+        .add("OEBPS/c1.xhtml", CHAPTER_2.as_bytes(), true)
+        .finish()
+}
+
 fn drm_epub() -> Vec<u8> {
     sample_zip()
         .add(
@@ -239,7 +259,7 @@ fn flush(worker: &EpubWorker) {
 }
 
 /// Biblioteca numa pasta temporária com o livro de teste já dentro.
-struct Fixture {
+pub(crate) struct Fixture {
     _temp: TempDir,
     library: PathBuf,
     worker: EpubWorker,
@@ -247,7 +267,7 @@ struct Fixture {
     id: String,
 }
 
-fn fixture() -> Fixture {
+pub(crate) fn fixture() -> Fixture {
     let temp = TempDir::new("fixture");
     let library = temp.path().join("library");
     let source = write_file(temp.path(), "teste.epub", &sample_epub());
@@ -280,8 +300,13 @@ fn fixture() -> Fixture {
 }
 
 impl Fixture {
-    fn server(&self) -> EpubServer {
+    pub(crate) fn server(&self) -> EpubServer {
         EpubServer::new(self.worker.shared())
+    }
+
+    /// O endereço do primeiro capítulo do livro de teste.
+    pub(crate) fn chapter_href(&self) -> String {
+        book_href(&self.id, "OEBPS/Text/ch1.xhtml")
     }
 }
 
@@ -434,9 +459,28 @@ fn book_resources_are_served_by_exact_path_with_their_type_and_the_book_csp() {
             "{path}: todo o recurso do livro leva a CSP dos livros"
         );
         assert_eq!(header(&headers, "X-Content-Type-Options"), Some("nosniff"));
+        // O id é o SHA-256 do arquivo: o mesmo endereço é sempre o mesmo
+        // conteúdo, e pode ficar em cache (privada).
+        assert_eq!(
+            header(&headers, "Cache-Control"),
+            Some(BOOK_CACHE),
+            "{path}"
+        );
         assert_eq!(
             response.body.as_ref(),
             archive.read(entry).expect("entrada").as_slice(),
+            "{path}"
+        );
+    }
+    // A API e o que falha nunca ficam em cache.
+    for path in [
+        format!("/api/book/{}", fx.id),
+        "/api/library".to_string(),
+        format!("{base}nada.xhtml"),
+    ] {
+        assert_eq!(
+            header(&get(&mut server, &path).headers(), "Cache-Control"),
+            Some("no-store"),
             "{path}"
         );
     }
@@ -670,6 +714,145 @@ fn a_stored_book_that_became_unreadable_answers_with_a_pt_br_error() {
         json_body(&response)["error"],
         "Este arquivo está corrompido ou não é um EPUB válido."
     );
+}
+
+#[test]
+fn a_damaged_chapter_is_a_pt_br_page_under_the_book_csp() {
+    let fx = fixture();
+    let stored = fx.library.join("books").join(format!("{}.epub", fx.id));
+    // Um byte trocado no capítulo 2 (guardado sem compressão): o CRC falha
+    // só ao ler esse capítulo; o livro continua a abrir.
+    let mut bytes = sample_epub();
+    let at = bytes
+        .windows(b"Fim da a".len())
+        .position(|window| window == b"Fim da a")
+        .expect("capítulo 2 guardado");
+    bytes[at] = b'X';
+    std::fs::write(&stored, &bytes).unwrap();
+    let mut server = fx.server();
+    assert_eq!(
+        get(&mut server, &format!("/api/book/{}", fx.id)).status,
+        200
+    );
+    let damaged = get(&mut server, &book_href(&fx.id, "OEBPS/Text/ch 2.xhtml"));
+    assert_eq!(damaged.status, 500);
+    assert_eq!(damaged.content_type, "text/html; charset=utf-8");
+    let body = String::from_utf8(damaged.body.to_vec()).unwrap();
+    assert!(
+        body.contains("Este capítulo está danificado e não pode ser mostrado."),
+        "{body}"
+    );
+    assert!(!body.contains("unreadable"));
+    let headers = damaged.headers();
+    assert_eq!(header(&headers, "Content-Security-Policy"), Some(BOOK_CSP));
+    assert_eq!(header(&headers, "Cache-Control"), Some("no-store"));
+    // O capítulo são continua a ser servido.
+    assert_eq!(get(&mut server, &fx.chapter_href()).status, 200);
+}
+
+#[test]
+fn the_opening_notice_waits_for_the_library_page_and_lost_books_come_back() {
+    let temp = TempDir::new("notice");
+    let dir = temp.path().join("library");
+    // Um livro já na biblioteca, com posição; depois o índice estraga-se.
+    let first = {
+        let mut library = Library::open(&dir).expect("biblioteca");
+        let source = write_file(temp.path(), "primeiro.epub", &sample_epub());
+        let id = library.add_at(&source, 1_000).expect("primeiro").id;
+        library
+            .set_position(
+                &id,
+                Position {
+                    spine_index: 1,
+                    fraction: 0.5,
+                    updated_unix: 1_001,
+                },
+            )
+            .expect("posição");
+        id
+    };
+    std::fs::write(dir.join("library.json"), b"{ estragado").unwrap();
+    // A primeira coisa que a pessoa faz é abrir outro livro (Ctrl+O, largar).
+    let (worker, notices) = worker_in(&dir);
+    let other = write_file(temp.path(), "outro.epub", &plain_book("Outro"));
+    assert!(worker.submit(EpubJob::Add {
+        paths: vec![other],
+        open: true,
+    }));
+    flush(&worker);
+    let id = match notices.recv().expect("aviso") {
+        EpubNotice::Added { books, .. } => books[0].id.clone(),
+        other => panic!("{other:?}"),
+    };
+    let mut server = EpubServer::new(worker.shared());
+    assert_eq!(get(&mut server, &format!("/api/book/{id}")).status, 200);
+    let reader = format!("{EPUB_ORIGIN}{READER_PATH}?book={id}");
+    assert!(
+        handle_epub_ipc(
+            &reader,
+            &json!({"t": "opened", "id": id}).to_string(),
+            &worker
+        )
+        .is_none()
+    );
+    flush(&worker);
+    // Só depois vai à biblioteca: o aviso ainda lá está, e o livro perdido
+    // voltou com a posição.
+    let library = json_body(&get(&mut server, "/api/library"));
+    let notice = library["notice"].as_str().expect("aviso da abertura");
+    assert!(notice.contains("danificado"), "{notice}");
+    assert!(notice.contains("1 livro foi recuperado"), "{notice}");
+    let books = library["books"].as_array().expect("livros");
+    assert_eq!(books.len(), 2);
+    let recovered = books
+        .iter()
+        .find(|book| book["id"] == first.as_str())
+        .expect("o livro que o índice perdeu");
+    assert!(
+        recovered["progress"]
+            .as_f64()
+            .is_some_and(|progress| progress > 0.0)
+    );
+    // Dito uma vez.
+    assert_eq!(
+        json_body(&get(&mut server, "/api/library"))["notice"],
+        Value::Null
+    );
+}
+
+#[test]
+fn clearing_the_history_reaches_the_library_but_keeps_the_place() {
+    let fx = fixture();
+    let reader = format!("{EPUB_ORIGIN}{READER_PATH}?book={}", fx.id);
+    for body in [
+        json!({"t": "opened", "id": fx.id}),
+        json!({"t": "savePosition", "id": fx.id, "spine": 1, "fraction": 0.5}),
+    ] {
+        assert!(handle_epub_ipc(&reader, &body.to_string(), &fx.worker).is_none());
+    }
+    flush(&fx.worker);
+    let mut server = fx.server();
+    let before = json_body(&get(&mut server, "/api/library"));
+    assert!(before["books"][0]["lastOpened"].is_u64());
+    assert!(fx.worker.submit(EpubJob::ClearReadingHistory));
+    flush(&fx.worker);
+    let after = json_body(&get(&mut server, "/api/library"));
+    assert_eq!(after["books"][0]["lastOpened"], Value::Null);
+    assert!(
+        after["books"][0]["progress"]
+            .as_f64()
+            .is_some_and(|progress| progress > 0.0)
+    );
+    assert_eq!(after["books"][0]["authorSort"], "Autora, Ana");
+    assert_eq!(
+        library_error_message(&LibraryError::Write(std::io::Error::other("disco cheio"))),
+        "Não foi possível gravar na biblioteca: disco cheio."
+    );
+    assert_eq!(
+        epub_request_target(Some("/book/a/b.xhtml?as=html")),
+        "/book/a/b.xhtml?as=html"
+    );
+    assert_eq!(epub_request_target(None), "/");
 }
 
 // ------------------------------------------------------- worker e erros

@@ -1075,7 +1075,16 @@ fn read_state(dir: &Path, id: &str) -> LibraryResult<Option<ReadingState>> {
                 format!("{} não é um arquivo", path.display()),
             )));
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        // Sem o arquivo (ou sem a pasta `state/`): ainda não há estado; gravar
+        // é que dirá se a pasta serve.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
         Err(error) => return Err(error.into()),
     };
     match serde_json::from_slice::<ReadingState>(&bytes) {

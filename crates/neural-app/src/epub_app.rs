@@ -157,9 +157,28 @@ impl LibrarySnapshot {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SharedLibrary {
     inner: Arc<(Mutex<Option<Arc<LibrarySnapshot>>>, Condvar)>,
+    /// O aviso da abertura (índice danificado, livros recuperados): fica
+    /// guardado até a página da biblioteca o mostrar, por mais trabalhos
+    /// (abrir um livro, virar páginas) que venham antes.
+    opening_notice: Arc<Mutex<Option<String>>>,
 }
 
 impl SharedLibrary {
+    fn set_opening_notice(&self, notice: Option<String>) {
+        *self
+            .opening_notice
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = notice;
+    }
+
+    /// O aviso da abertura, uma vez: quem o pede é a página da biblioteca.
+    fn take_opening_notice(&self) -> Option<String> {
+        self.opening_notice
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+    }
+
     fn publish(&self, snapshot: LibrarySnapshot) {
         let (slot, ready) = &*self.inner;
         let mut guard = slot.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -193,6 +212,9 @@ pub(crate) fn library_error_message(error: &LibraryError) -> String {
             "Este livro é grande demais para a biblioteca e não pode ser aberto.".to_string()
         }
         LibraryError::Io(error) => format!("Não foi possível ler o arquivo: {error}."),
+        LibraryError::Write(error) => {
+            format!("Não foi possível gravar na biblioteca: {error}.")
+        }
         LibraryError::NotFound(_) | LibraryError::InvalidId(_) => {
             "Este livro não está mais na biblioteca.".to_string()
         }
@@ -229,18 +251,29 @@ pub(crate) fn epub_error_message(error: &EpubError) -> String {
 
 fn load_notice(library: &Library) -> Option<String> {
     let report = library.load_report();
-    if let Some(backup) = &report.backup {
-        return Some(format!(
-            "O índice da biblioteca estava danificado; uma cópia foi guardada em {}.",
+    let recovered = match report.recovered {
+        0 => String::new(),
+        1 => " 1 livro foi recuperado da pasta da biblioteca, com a posição e os marcadores."
+            .to_string(),
+        count => format!(
+            " {count} livros foram recuperados da pasta da biblioteca, com as posições e os marcadores."
+        ),
+    };
+    match (&report.backup, report.skipped_entries) {
+        (Some(backup), 0) => Some(format!(
+            "O índice da biblioteca estava danificado; uma cópia foi guardada em {}.{recovered}",
             backup.display()
-        ));
+        )),
+        (backup, skipped) if skipped > 0 => Some(format!(
+            "{skipped} registro(s) inválido(s) do índice foram ignorados{}.{recovered}",
+            backup
+                .as_ref()
+                .map(|backup| format!("; o original foi guardado em {}", backup.display()))
+                .unwrap_or_default()
+        )),
+        _ if report.recovered > 0 => Some(recovered.trim_start().to_string()),
+        _ => None,
     }
-    (report.skipped_entries > 0).then(|| {
-        format!(
-            "{} registro(s) inválido(s) do índice foram ignorados.",
-            report.skipped_entries
-        )
-    })
 }
 
 fn now_unix() -> u64 {
@@ -283,6 +316,9 @@ pub(crate) enum EpubJob {
     Remove {
         id: String,
     },
+    /// "Apagar histórico" (Ctrl+Shift+Delete): esquece quando cada livro foi
+    /// aberto; posições e marcadores ficam.
+    ClearReadingHistory,
     /// Responde quando tudo o que veio antes já foi feito (testes, sem
     /// relógio).
     #[cfg(test)]
@@ -398,18 +434,19 @@ impl EpubWorker {
     }
 }
 
-fn publish_library(shared: &SharedLibrary, library: &Library, notice: Option<String>) {
+fn publish_library(shared: &SharedLibrary, library: &Library) {
     shared.publish(LibrarySnapshot {
         dir: library.dir().to_path_buf(),
         books: library.list().to_vec(),
-        notice,
+        notice: None,
     });
 }
 
 fn run_worker(dir: PathBuf, receiver: Receiver<EpubJob>, shared: SharedLibrary, notify: Notify) {
     let mut library = match Library::open(&dir) {
         Ok(library) => {
-            publish_library(&shared, &library, load_notice(&library));
+            shared.set_opening_notice(load_notice(&library));
+            publish_library(&shared, &library);
             Some(library)
         }
         Err(error) => {
@@ -424,8 +461,6 @@ fn run_worker(dir: PathBuf, receiver: Receiver<EpubJob>, shared: SharedLibrary, 
             None
         }
     };
-    let mut notice = library.as_ref().and_then(load_notice);
-
     for job in receiver {
         #[cfg(test)]
         if let EpubJob::Flush(done) = job {
@@ -438,14 +473,15 @@ fn run_worker(dir: PathBuf, receiver: Receiver<EpubJob>, shared: SharedLibrary, 
             });
             continue;
         };
+        // Outra janela do NeuralIA pode ter gravado a mesma biblioteca.
+        if let Err(error) = library.refresh() {
+            eprintln!("epub: não foi possível reler o índice da biblioteca: {error}");
+        }
         let result = apply_job(library, job);
-        publish_library(&shared, library, notice.clone());
+        publish_library(&shared, library);
         if let Some(outcome) = result {
             notify(outcome);
         }
-        // O aviso do índice é dito uma vez; depois de uma gravação bem
-        // sucedida o índice é o novo.
-        notice = None;
     }
 }
 
@@ -519,6 +555,7 @@ fn apply_job(library: &mut Library, job: EpubJob) -> Option<EpubNotice> {
             }),
             Err(error) => failed(error),
         },
+        EpubJob::ClearReadingHistory => library.clear_last_opened().err().and_then(failed),
         #[cfg(test)]
         EpubJob::Flush(done) => {
             let _ = done.send(());
@@ -824,6 +861,16 @@ pub(crate) fn parse_dialog_selection(buffer: &[u16]) -> Vec<PathBuf> {
 // O servidor da origem neuralia-epub
 // ---------------------------------------------------------------------------
 
+/// O que um recurso de um livro pode ficar em cache: o id é um prefixo do
+/// SHA-256 do arquivo, por isso o mesmo endereço é sempre o mesmo conteúdo.
+/// Só para o livro e a capa; as páginas e a API nunca.
+pub(crate) const BOOK_CACHE: &str = "private, max-age=31536000, immutable";
+const NO_STORE: &str = "no-store";
+
+/// O que o leitor mostra no lugar de um capítulo que não se lê (CRC errado,
+/// arquivo cortado): uma página em português, com a mesma CSP dos livros.
+pub(crate) const DAMAGED_CHAPTER_HTML: &str = "<!DOCTYPE html><html lang=\"pt-BR\"><head><meta charset=\"utf-8\"><title>Capítulo danificado</title></head><body><p>Este capítulo está danificado e não pode ser mostrado. O resto do livro continua a abrir.</p></body></html>";
+
 /// Uma resposta da origem, independente do tipo HTTP do wry (assim os testes
 /// correm fora do Windows).
 #[derive(Debug, Clone)]
@@ -831,6 +878,7 @@ pub(crate) struct EpubResponse {
     pub status: u16,
     pub content_type: Cow<'static, str>,
     pub csp: &'static str,
+    pub cache: &'static str,
     pub body: Cow<'static, [u8]>,
 }
 
@@ -845,8 +893,14 @@ impl EpubResponse {
             status,
             content_type: content_type.into(),
             csp,
+            cache: NO_STORE,
             body: body.into(),
         }
+    }
+
+    fn cached(mut self) -> Self {
+        self.cache = BOOK_CACHE;
+        self
     }
 
     fn not_found() -> Self {
@@ -873,7 +927,7 @@ impl EpubResponse {
             ("Content-Type", self.content_type.to_string()),
             ("Content-Security-Policy", self.csp.to_string()),
             ("X-Content-Type-Options", "nosniff".to_string()),
-            ("Cache-Control", "no-store".to_string()),
+            ("Cache-Control", self.cache.to_string()),
             ("Referrer-Policy", "no-referrer".to_string()),
         ]
     }
@@ -1020,6 +1074,7 @@ impl EpubServer {
                 "id": book.id,
                 "title": book.title,
                 "authors": book.authors,
+                "authorSort": book.author_sort,
                 "language": book.language,
                 "publisher": book.publisher,
                 "series": book.series,
@@ -1035,7 +1090,12 @@ impl EpubServer {
         // Livros que já não existem deixam de ocupar o cache.
         self.sizes
             .retain(|id, _| snapshot.books.iter().any(|book| &book.id == id));
-        json!({"books": books, "notice": snapshot.notice})
+        // O aviso da abertura sai uma vez, para a página da biblioteca.
+        let notice = snapshot
+            .notice
+            .clone()
+            .or_else(|| self.shared.take_opening_notice());
+        json!({"books": books, "notice": notice})
     }
 
     fn book_json(&mut self, snapshot: &LibrarySnapshot, id: &str) -> EpubResponse {
@@ -1133,12 +1193,12 @@ impl EpubServer {
             content_type = "text/html";
         }
         match open.archive.read_capped(&entry_name, MAX_SERVED_BYTES) {
-            Ok(bytes) => EpubResponse::new(200, content_type, BOOK_CSP, bytes),
+            Ok(bytes) => EpubResponse::new(200, content_type, BOOK_CSP, bytes).cached(),
             Err(_) => EpubResponse::new(
                 500,
-                "text/plain; charset=utf-8",
+                "text/html; charset=utf-8",
                 BOOK_CSP,
-                b"unreadable entry".as_slice(),
+                DAMAGED_CHAPTER_HTML.as_bytes(),
             ),
         }
     }
@@ -1153,7 +1213,7 @@ fn serve_cover(snapshot: &LibrarySnapshot, id: &str) -> EpubResponse {
         _ => return EpubResponse::not_found(),
     }
     match std::fs::read(&file) {
-        Ok(bytes) => EpubResponse::new(200, mime, DATA_CSP, bytes),
+        Ok(bytes) => EpubResponse::new(200, mime, DATA_CSP, bytes).cached(),
         Err(_) => EpubResponse::not_found(),
     }
 }
@@ -1314,6 +1374,15 @@ fn known_media_type(declared: &str) -> Option<&'static str> {
     })
 }
 
+/// O `target` de um pedido (caminho E query, como vêm no URI): sem a query o
+/// `?as=html` de um capítulo nunca chegava ao servidor.
+pub(crate) fn epub_request_target(path_and_query: Option<&str>) -> String {
+    match path_and_query {
+        Some(target) if target.starts_with('/') => target.to_string(),
+        _ => "/".to_string(),
+    }
+}
+
 /// Um pedido para o servidor: método, caminho (com a query) e a quem
 /// responder.
 pub(crate) struct ServeJob {
@@ -1406,4 +1475,4 @@ pub(crate) fn notice_script(notice: &EpubNotice) -> String {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
