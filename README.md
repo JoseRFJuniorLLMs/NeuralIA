@@ -6,7 +6,7 @@
 
 ## What NeuralIA is
 
-NeuralIA **v2.1.7** is an AI-first, reader-first, system-WebView information client written in Rust.
+NeuralIA **v2.1.8** is an AI-first, reader-first, system-WebView information client written in Rust.
 
 It deliberately refuses the usual browser arms race. It does not ship Chromium, does not implement its own JavaScript engine, does not carry a local LLM, and does not recreate a full browser tab strip just to prove that rectangles can multiply.
 

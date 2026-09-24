@@ -4,6 +4,8 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+## [2.1.8] - 2026-09-24
+
 ### Fixed
 - **Instalador sem quadrado à volta da marca (item 1 do dono, e591f1a):** o `neural-setup` desenha a `assets/neuralia-home.png` (1200×868, sem fundo) com o alfa dela por cima do tecido; o retângulo opaco que apagava os neurónios por trás da marca saiu. Revisão: o quadro inteiro da janela passou a `paint_frame`, e o gate pinta esse quadro numa secção DIB — sem a marca, ou com um quadrado à volta dela, fica vermelho.
 - **Marca e ícone novos em todo o lado (item 2, e591f1a):** `neuralia-home.png` é a marca da Home, do instalador e do Reader (neste, uma versão reduzida e recortada, `assets/neuralia-home-reader.png`, para caber no limite de 2 MB do `NavigateToString`); o `assets/logo.ico` é o ícone do projeto, regenerado a partir da arte em 10 tamanhos quadrados (16 a 256 px) por `scripts/brand-assets`, e é ele que o executável, a janela e a barra de tarefas mostram. O ícone original do dono fica em `scripts/assets-src/logo.owner.ico`. Revisão: a janela principal é criada por `main_window_attributes`, e um gate falha se ela perder o ícone da barra de título ou o da barra de tarefas; a verificação de que nada inclui os ficheiros apagados passou a apanhar caminhos com `\`.
