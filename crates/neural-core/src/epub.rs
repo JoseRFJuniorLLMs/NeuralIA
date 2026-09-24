@@ -39,8 +39,8 @@ pub use archive::{
 };
 pub use book::{
     ADOBE_FONT_OBFUSCATION, CoverImage, Creator, EpubBook, EpubMetadata, IDPF_FONT_OBFUSCATION,
-    MAX_ATTR_CHARS, MAX_MEDIA_TYPE_CHARS, MAX_SPINE_ITEMS, MAX_WARNINGS, ManifestItem,
-    PageProgression, SpineItem,
+    MAX_ATTR_CHARS, MAX_FIELD_CHARS, MAX_MEDIA_TYPE_CHARS, MAX_METADATA_ITEMS,
+    MAX_METADATA_REFINES, MAX_SPINE_ITEMS, MAX_WARNINGS, ManifestItem, PageProgression, SpineItem,
 };
 pub use toc::{MAX_TOC_DEPTH, MAX_TOC_ENTRIES, TocEntry};
 pub use xml::{MAX_XML_BYTES, MAX_XML_DEPTH, MAX_XML_NODES};

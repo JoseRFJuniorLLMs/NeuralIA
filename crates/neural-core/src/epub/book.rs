@@ -25,8 +25,39 @@ const EPUB_MIMETYPE: &str = "application/epub+zip";
 const OPF_MEDIA_TYPE: &str = "application/oebps-package+xml";
 /// Uma página de capa (XHTML) maior do que isto não é aberta para procurar a imagem.
 const MAX_COVER_PAGE_BYTES: u64 = 1024 * 1024;
-const MAX_FIELD_CHARS: usize = 1024;
+/// Caracteres de cada campo de metadados (título, autor, assunto...).
+pub const MAX_FIELD_CHARS: usize = 1024;
 const MAX_DESCRIPTION_CHARS: usize = 64 * 1024;
+/// Itens de cada lista dos metadados: autores, colaboradores e assuntos, e os
+/// títulos, identificadores, datas e coleções de onde se escolhe um. O resto
+/// é ignorado; cada item custa até [`MAX_FIELD_CHARS`] caracteres, e os
+/// autores e assuntos vão para o índice da biblioteca.
+pub const MAX_METADATA_ITEMS: usize = 64;
+/// Refinamentos (`<meta refines>`) guardados, contados por alvo e
+/// propriedade; só os das propriedades em [`REFINED_PROPERTIES`].
+pub const MAX_METADATA_REFINES: usize = 512;
+/// Os elementos de metadados que se leem. Um deles dentro de outro faz parte
+/// do de fora (o texto dele entra no do de fora) e não é lido de novo.
+const METADATA_FIELDS: [&str; 10] = [
+    "meta",
+    "title",
+    "creator",
+    "contributor",
+    "language",
+    "identifier",
+    "publisher",
+    "description",
+    "date",
+    "subject",
+];
+/// Propriedades de `<meta refines>` que a leitura usa.
+const REFINED_PROPERTIES: [&str; 5] = [
+    "role",
+    "file-as",
+    "title-type",
+    "collection-type",
+    "group-position",
+];
 /// `id`, `href`, `properties`, `fallback` de um item do manifest: acima disto
 /// o valor não é de um livro, é um ataque (cada `itemref` copiaria o valor
 /// de novo). Item com `id`/`href` maior é ignorado; o resto fica vazio.
@@ -332,10 +363,11 @@ fn find_opf(archive: &EpubArchive, warnings: &mut Vec<String>) -> EpubResult<Str
         .ok_or_else(|| EpubError::NotEpub("sem META-INF/container.xml e sem arquivo .opf".into()))
 }
 
-fn clip(text: String, max_chars: usize) -> String {
+/// Os primeiros `max_chars` caracteres, sem copiar o resto.
+fn clip(text: &str, max_chars: usize) -> String {
     match text.char_indices().nth(max_chars) {
         Some((cut, _)) => text[..cut].to_string(),
-        None => text,
+        None => text.to_string(),
     }
 }
 
@@ -368,19 +400,35 @@ fn field(dom: &Dom, node: usize) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// Um dos [`METADATA_FIELDS`], pelo nome local.
+fn metadata_field(dom: &Dom, node: usize) -> Option<&'static str> {
+    METADATA_FIELDS
+        .iter()
+        .copied()
+        .find(|field| dom.is(node, field))
+}
+
+/// Metadados do OPF. Cada texto do `<metadata>` é copiado no máximo uma vez
+/// (um campo dentro de outro faz parte do de fora), cada campo com teto
+/// ([`MAX_FIELD_CHARS`]) e cada lista com teto ([`MAX_METADATA_ITEMS`],
+/// [`MAX_METADATA_REFINES`]), verificado ANTES de ler o texto: um OPF feito
+/// para isso não multiplica memória nem incha o índice da biblioteca.
 fn parse_metadata(dom: &Dom, package: usize) -> EpubMetadata {
     let mut metadata = EpubMetadata::default();
     let Some(section) = dom.child(package, "metadata") else {
         return metadata;
     };
-    // OPF 2 às vezes embrulha tudo em <dc-metadata>/<x-metadata>: descendentes.
-    let nodes = dom.descendants(section);
+    // OPF 2 às vezes embrulha tudo em <dc-metadata>/<x-metadata>: desce-se
+    // por esses, mas nunca para dentro de um campo.
+    let nodes = dom.descendants_until(section, |node| metadata_field(dom, node).is_some());
 
     // Refinamentos do EPUB 3: <meta refines="#id" property="role">aut</meta>.
-    let mut refines: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    // Pares do EPUB 2: <meta name="cover" content="..."/>. Vale o primeiro.
-    let mut named: HashMap<String, String> = HashMap::new();
-    let mut collections: Vec<(Option<String>, String)> = Vec::new();
+    // Vale o primeiro valor não vazio de cada alvo e propriedade.
+    let mut refines: HashMap<(&str, &str), String> = HashMap::new();
+    // Pares do EPUB 2 (<meta name content>) que se usam. Vale o primeiro.
+    let mut calibre_series: Option<&str> = None;
+    let mut calibre_series_index: Option<&str> = None;
+    let mut collections: Vec<(Option<&str>, String)> = Vec::new();
     for &node in &nodes {
         if !dom.is(node, "meta") {
             continue;
@@ -388,47 +436,61 @@ fn parse_metadata(dom: &Dom, package: usize) -> EpubMetadata {
         if let (Some(target), Some(property)) =
             (dom.attr(node, "refines"), dom.attr(node, "property"))
         {
-            // Cada valor com teto, e o texto cortado DURANTE a leitura: metas
-            // aninhados não copiam o texto dos descendentes uma vez por nível.
-            let target = clip(
-                target.trim().trim_start_matches('#').to_string(),
-                MAX_FIELD_CHARS,
-            );
-            refines.entry(target).or_default().push((
-                clip(property.trim().to_string(), MAX_FIELD_CHARS),
-                dom.text_capped(node, MAX_FIELD_CHARS),
-            ));
+            let property = property.trim();
+            let Some(property) = REFINED_PROPERTIES
+                .iter()
+                .copied()
+                .find(|known| *known == property)
+            else {
+                continue;
+            };
+            let key = (target.trim().trim_start_matches('#'), property);
+            let room = refines.len() < MAX_METADATA_REFINES;
+            match refines.get_mut(&key) {
+                Some(value) if value.is_empty() => {
+                    *value = dom.text_capped(node, MAX_FIELD_CHARS);
+                }
+                Some(_) => {}
+                None if room => {
+                    refines.insert(key, dom.text_capped(node, MAX_FIELD_CHARS));
+                }
+                None => {}
+            }
         } else if dom.attr(node, "property").map(str::trim) == Some("belongs-to-collection") {
-            let id = dom
-                .attr(node, "id")
-                .map(|id| clip(id.trim().to_string(), MAX_FIELD_CHARS));
-            collections.push((id, dom.text_capped(node, MAX_FIELD_CHARS)));
+            if collections.len() < MAX_METADATA_ITEMS {
+                collections.push((
+                    dom.attr(node, "id").map(str::trim),
+                    dom.text_capped(node, MAX_FIELD_CHARS),
+                ));
+            }
         } else if let (Some(name), Some(content)) =
             (dom.attr(node, "name"), dom.attr(node, "content"))
         {
-            named
-                .entry(clip(name.trim().to_ascii_lowercase(), MAX_FIELD_CHARS))
-                .or_insert_with(|| clip(content.trim().to_string(), MAX_FIELD_CHARS));
+            let name = name.trim();
+            if name.eq_ignore_ascii_case("calibre:series") {
+                calibre_series.get_or_insert(content.trim());
+            } else if name.eq_ignore_ascii_case("calibre:series_index") {
+                calibre_series_index.get_or_insert(content.trim());
+            }
         }
     }
     let refined = |id: Option<&str>, property: &str| -> Option<String> {
-        let values = refines.get(id?.trim())?;
-        values
-            .iter()
-            .find(|(key, value)| key == property && !value.is_empty())
-            .map(|(_, value)| value.clone())
+        refines
+            .get(&(id?.trim(), property))
+            .filter(|value| !value.is_empty())
+            .cloned()
     };
     let creator = |node: usize| -> Option<Creator> {
         let name = field(dom, node)?;
         let id = dom.attr(node, "id");
         let role = dom
             .attr(node, "role")
-            .map(|role| clip(role.trim().to_string(), MAX_FIELD_CHARS))
+            .map(|role| clip(role.trim(), MAX_FIELD_CHARS))
             .filter(|role| !role.is_empty())
             .or_else(|| refined(id, "role"));
         let file_as = dom
             .attr(node, "file-as")
-            .map(|value| clip(value.trim().to_string(), MAX_FIELD_CHARS))
+            .map(|value| clip(value.trim(), MAX_FIELD_CHARS))
             .filter(|value| !value.is_empty())
             .or_else(|| refined(id, "file-as"));
         Some(Creator {
@@ -443,36 +505,35 @@ fn parse_metadata(dom: &Dom, package: usize) -> EpubMetadata {
     let mut identifiers: Vec<(Option<&str>, String)> = Vec::new();
     let mut dates: Vec<(bool, String)> = Vec::new();
     for &node in &nodes {
-        match dom.local(node).to_ascii_lowercase().as_str() {
-            "title" => {
+        // Uma lista cheia deixa de ler: o teto vem antes do texto.
+        match metadata_field(dom, node) {
+            Some("title") if titles.len() < MAX_METADATA_ITEMS => {
                 if let Some(title) = field(dom, node) {
                     titles.push((dom.attr(node, "id"), title));
                 }
             }
-            "creator" => metadata.creators.extend(creator(node)),
-            "contributor" => metadata.contributors.extend(creator(node)),
-            "language" => {
-                if metadata.language.is_none() {
-                    metadata.language = field(dom, node);
-                }
+            Some("creator") if metadata.creators.len() < MAX_METADATA_ITEMS => {
+                metadata.creators.extend(creator(node));
             }
-            "identifier" => {
+            Some("contributor") if metadata.contributors.len() < MAX_METADATA_ITEMS => {
+                metadata.contributors.extend(creator(node));
+            }
+            Some("language") if metadata.language.is_none() => {
+                metadata.language = field(dom, node);
+            }
+            Some("identifier") if identifiers.len() < MAX_METADATA_ITEMS => {
                 if let Some(value) = field(dom, node) {
                     identifiers.push((dom.attr(node, "id"), value));
                 }
             }
-            "publisher" => {
-                if metadata.publisher.is_none() {
-                    metadata.publisher = field(dom, node);
-                }
+            Some("publisher") if metadata.publisher.is_none() => {
+                metadata.publisher = field(dom, node);
             }
-            "description" => {
-                if metadata.description.is_none() {
-                    let text = dom.text_capped(node, MAX_DESCRIPTION_CHARS);
-                    metadata.description = (!text.is_empty()).then_some(text);
-                }
+            Some("description") if metadata.description.is_none() => {
+                let text = dom.text_capped(node, MAX_DESCRIPTION_CHARS);
+                metadata.description = (!text.is_empty()).then_some(text);
             }
-            "date" => {
+            Some("date") if dates.len() < MAX_METADATA_ITEMS => {
                 if let Some(value) = field(dom, node) {
                     let publication = dom
                         .attr(node, "event")
@@ -480,7 +541,9 @@ fn parse_metadata(dom: &Dom, package: usize) -> EpubMetadata {
                     dates.push((publication, value));
                 }
             }
-            "subject" => metadata.subjects.extend(field(dom, node)),
+            Some("subject") if metadata.subjects.len() < MAX_METADATA_ITEMS => {
+                metadata.subjects.extend(field(dom, node));
+            }
             _ => {}
         }
     }
@@ -501,24 +564,17 @@ fn parse_metadata(dom: &Dom, package: usize) -> EpubMetadata {
         .map(|(_, value)| value.clone());
 
     // Série: primeiro a do Calibre, depois a coleção do EPUB 3.
-    if let Some(series) = named
-        .get("calibre:series")
-        .filter(|value| !value.is_empty())
-    {
-        metadata.series = Some(clip(series.clone(), MAX_FIELD_CHARS));
-        metadata.series_index = named
-            .get("calibre:series_index")
-            .and_then(|value| parse_index(value));
+    if let Some(series) = calibre_series.filter(|value| !value.is_empty()) {
+        metadata.series = Some(clip(series, MAX_FIELD_CHARS));
+        metadata.series_index = calibre_series_index.and_then(parse_index);
     } else if let Some((id, name)) = collections
         .iter()
         .filter(|(_, name)| !name.is_empty())
-        .find(|(id, _)| {
-            refined(id.as_deref(), "collection-type").is_none_or(|kind| kind == "series")
-        })
+        .find(|(id, _)| refined(*id, "collection-type").is_none_or(|kind| kind == "series"))
     {
-        metadata.series = Some(clip(name.clone(), MAX_FIELD_CHARS));
+        metadata.series = Some(name.clone());
         metadata.series_index =
-            refined(id.as_deref(), "group-position").and_then(|value| parse_index(&value));
+            refined(*id, "group-position").and_then(|value| parse_index(&value));
     }
     metadata
 }

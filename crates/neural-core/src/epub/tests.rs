@@ -1129,6 +1129,68 @@ fn xml_documents_have_node_and_size_limits() {
 }
 
 #[test]
+fn a_metadata_field_inside_another_is_part_of_it_not_a_second_field() {
+    // Antes, cada nível era lido como outro campo e copiava o texto de
+    // todos os de dentro: 4 assuntos, 2 autores, o papel do de dentro.
+    let metadata = r##"
+<dc:subject>Ficção <dc:subject>Terror <dc:subject>Gótico</dc:subject></dc:subject></dc:subject>
+<dc:subject>Contos</dc:subject>
+<dc:creator id="a">Ana <dc:creator id="b">Bia</dc:creator></dc:creator>
+<meta refines="#a" property="file-as">Silva, Ana <meta refines="#a" property="role">ill</meta></meta>
+<meta refines="#b" property="role">aut</meta>
+<meta property="belongs-to-collection" id="s">Série <meta refines="#s" property="group-position">7</meta></meta>
+"##;
+    let book = parse(book_with_opf(&opf(metadata, P1_ITEM, P1_SPINE, ""), &[])).unwrap();
+    assert_eq!(book.metadata.subjects, ["Ficção Terror Gótico", "Contos"]);
+    assert_eq!(
+        book.metadata.creators,
+        [Creator {
+            name: "Ana Bia".into(),
+            role: None,
+            file_as: Some("Silva, Ana ill".into()),
+        }]
+    );
+    assert_eq!(book.metadata.authors(), ["Ana Bia"]);
+    assert_eq!(book.metadata.series.as_deref(), Some("Série 7"));
+    assert_eq!(book.metadata.series_index, None);
+}
+
+#[test]
+fn metadata_lists_and_refines_stop_at_their_caps() {
+    let mut metadata = String::new();
+    // Propriedades que a leitura não usa não são guardadas nem contam.
+    for n in 0..1000 {
+        metadata.push_str(&format!(
+            r##"<meta refines="#x{n}" property="display-seq">{n}</meta>"##
+        ));
+    }
+    // Refinamentos para ninguém enchem o teto até faltar um.
+    for n in 1..MAX_METADATA_REFINES {
+        metadata.push_str(&format!(
+            r##"<meta refines="#x{n}" property="role">aut</meta>"##
+        ));
+    }
+    metadata.push_str(
+        r##"<dc:creator id="z">Zé</dc:creator><meta refines="#z" property="file-as">Zé, Z</meta>
+<dc:creator id="y">Yara</dc:creator><meta refines="#y" property="file-as">Yara, Y</meta>"##,
+    );
+    for n in 0..100 {
+        metadata.push_str(&format!(
+            "<dc:subject>s{n}</dc:subject><dc:creator>c{n}</dc:creator><dc:contributor>k{n}</dc:contributor>"
+        ));
+    }
+    let book = parse(book_with_opf(&opf(&metadata, P1_ITEM, P1_SPINE, ""), &[])).unwrap();
+    let meta = &book.metadata;
+    // O último refinamento que cabe fica; o seguinte não.
+    assert_eq!(meta.creators[0].file_as.as_deref(), Some("Zé, Z"));
+    assert_eq!(meta.creators[1].file_as, None);
+    assert_eq!(meta.creators.len(), MAX_METADATA_ITEMS);
+    assert_eq!(meta.contributors.len(), MAX_METADATA_ITEMS);
+    assert_eq!(meta.subjects.len(), MAX_METADATA_ITEMS);
+    assert_eq!(meta.subjects.last().map(String::as_str), Some("s63"));
+}
+
+#[test]
 fn an_open_archive_can_be_shared_across_threads() {
     // Falha na compilação se `EpubArchive` deixar de ser `Send + Sync`.
     fn shareable<T: Send + Sync>(_: &T) {}

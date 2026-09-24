@@ -1801,6 +1801,34 @@ mod tests {
         ));
     }
 
+    /// O outro caminho da gravação: a pasta existe e o estado lê-se, mas o
+    /// arquivo está aberto por outro programa sem partilhar o apagar (um
+    /// antivírus, um backup) e o `rename` por cima falha.
+    #[cfg(windows)]
+    #[test]
+    fn a_state_file_that_cannot_be_replaced_is_a_write_failure() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        let temp = TempDir::new("write-error-rename");
+        let mut library = temp.library();
+        let id = library
+            .add_at(temp.source("a.epub", &epub3_sample()), T0)
+            .unwrap()
+            .id;
+        library.set_position(&id, at(1, 0.25, T0 + 1)).unwrap();
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(state_path(&temp.lib_dir(), &id))
+            .unwrap();
+        let error = library.set_position(&id, at(2, 0.5, T0 + 2)).unwrap_err();
+        assert!(matches!(error, LibraryError::Write(_)), "{error:?}");
+        assert_eq!(library.get(&id).unwrap().position, Some(at(1, 0.25, T0 + 1)));
+        drop(held);
+        library.set_position(&id, at(2, 0.5, T0 + 3)).unwrap();
+        assert_eq!(library.get(&id).unwrap().position, Some(at(2, 0.5, T0 + 3)));
+    }
+
     // ------------------------------------------------ duas janelas, uma pasta
 
     #[test]
@@ -2132,9 +2160,14 @@ mod tests {
             .map(|level| format!(r##"<meta refines="#t" property="p{level}">"##))
             .collect();
         let close = "</meta>".repeat(levels);
-        let metadata = format!("{open}{}{close}", "x".repeat(1024 * 1024));
+        book_with_metadata(&format!("{open}{}{close}", "x".repeat(1024 * 1024)))
+    }
+
+    /// Um EPUB com estes metadados a mais (ZIP sem compressão: o tamanho do
+    /// arquivo é o do OPF).
+    fn book_with_metadata(metadata: &str) -> Vec<u8> {
         let opf = opf(
-            &metadata,
+            metadata,
             r#"<item id="c" href="c.xhtml" media-type="application/xhtml+xml"/>"#,
             r#"<itemref idref="c"/>"#,
             "",
@@ -2146,6 +2179,70 @@ mod tests {
             .stored("OEBPS/content.opf", opf.as_bytes())
             .stored("OEBPS/c.xhtml", page.as_bytes())
             .build()
+    }
+
+    /// U+1F4D6: 4 bytes em UTF-8, o pior caso por caractere.
+    const WIDE: char = '\u{1F4D6}';
+
+    /// Os campos de metadados que a leitura usa, abertos e fechados; `{n}`
+    /// vira o nível (refinamentos com alvos diferentes não se juntam).
+    const NESTABLE: [(&str, &str); 8] = [
+        ("<dc:subject>", "</dc:subject>"),
+        (r#"<dc:creator id="a{n}">"#, "</dc:creator>"),
+        ("<dc:contributor>", "</dc:contributor>"),
+        ("<dc:title>", "</dc:title>"),
+        ("<dc:identifier>", "</dc:identifier>"),
+        ("<dc:date>", "</dc:date>"),
+        (r##"<meta refines="#a{n}" property="file-as">"##, "</meta>"),
+        (
+            r#"<meta property="belongs-to-collection" id="s{n}">"#,
+            "</meta>",
+        ),
+    ];
+
+    /// `chains` cadeias de `depth` campos (os oito tipos em rodízio), com
+    /// `MAX_FIELD_CHARS` caracteres de 4 bytes no fim de cada cadeia. Com
+    /// `nested`, os campos de uma cadeia estão um dentro do outro; sem, são
+    /// irmãos. Os dois livros têm os mesmos bytes, a mesma quantidade de
+    /// elementos e o mesmo texto: só o aninhamento muda.
+    fn metadata_chains_book(chains: usize, depth: usize, nested: bool) -> Vec<u8> {
+        use crate::epub::MAX_FIELD_CHARS;
+        let text: String = std::iter::repeat_n(WIDE, MAX_FIELD_CHARS).collect();
+        let mut metadata = String::new();
+        for chain in 0..chains {
+            let (open, close) = NESTABLE[chain % NESTABLE.len()];
+            let open = |level: usize| open.replace("{n}", &format!("{chain}-{level}"));
+            if nested {
+                for level in 0..depth {
+                    metadata.push_str(&open(level));
+                }
+                metadata.push_str(&text);
+                metadata.push_str(&close.repeat(depth));
+            } else {
+                for level in 0..depth {
+                    metadata.push_str(&open(level));
+                    if level + 1 == depth {
+                        metadata.push_str(&text);
+                    }
+                    metadata.push_str(close);
+                }
+            }
+        }
+        book_with_metadata(&metadata)
+    }
+
+    /// Importa `bytes` numa biblioteca só dele, pelo caminho que embarca:
+    /// o registro, o pico de memória e o tamanho do `library.json`.
+    fn import_alone(name: &str, bytes: &[u8]) -> (BookEntry, usize, u64) {
+        let temp = TempDir::new(name);
+        let source = temp.source("livro.epub", bytes);
+        let mut library = temp.library();
+        let (added, peak) = peak_during(|| library.add_at(&source, T0));
+        let entry = added.expect("o livro hostil entra, com os valores cortados");
+        let index = fs::metadata(temp.lib_dir().join(INDEX_FILE))
+            .unwrap()
+            .len();
+        (entry, peak, index)
     }
 
     /// Pico de memória de importar `bytes` pelo caminho que embarca
@@ -2239,6 +2336,76 @@ mod tests {
             deep_peak < 16 * deep.len() + 4 * 1024 * 1024,
             "pico {deep_peak} para um arquivo de {} bytes",
             deep.len()
+        );
+    }
+
+    #[test]
+    fn metadata_nested_in_width_and_depth_costs_what_the_flat_book_costs() {
+        // 32 cadeias de 128 campos (todos os tipos lidos), 4 KiB de texto
+        // no fim de cada uma. Antes, cada nível copiava o texto de novo:
+        // 128 cópias por cadeia, ~16 MiB de pico e ~4 MiB de índice para
+        // ~0,4 MB de arquivo. O livro irmão tem os mesmos bytes sem o
+        // aninhamento: o custo tem de ser o mesmo.
+        let (chains, depth) = (32, 128);
+        let nested = metadata_chains_book(chains, depth, true);
+        let flat = metadata_chains_book(chains, depth, false);
+        assert_eq!(nested.len(), flat.len(), "os mesmos bytes");
+        let (nested_entry, nested_peak, nested_index) = import_alone("aninhado", &nested);
+        let (flat_entry, flat_peak, flat_index) = import_alone("plano", &flat);
+        let grown = nested_peak.saturating_sub(flat_peak);
+        assert!(
+            grown < 1024 * 1024,
+            "pico plano {flat_peak} -> aninhado {nested_peak} bytes (+{grown}) para {} bytes de arquivo",
+            nested.len()
+        );
+        assert!(
+            nested_index < flat_index + 16 * 1024,
+            "library.json plano {flat_index} -> aninhado {nested_index} bytes"
+        );
+        // Um campo dentro de outro faz parte do de fora: uma cadeia de
+        // assuntos é UM assunto, com o texto do fundo.
+        assert_eq!(nested_entry.subjects.len(), chains / NESTABLE.len());
+        assert_eq!(nested_entry.subjects, flat_entry.subjects);
+        assert_eq!(nested_entry.authors.len(), chains / NESTABLE.len());
+    }
+
+    #[test]
+    fn metadata_lists_are_capped_so_the_index_entry_has_a_fixed_ceiling() {
+        use crate::epub::{MAX_FIELD_CHARS, MAX_METADATA_ITEMS};
+        // 200 assuntos, 200 autores e 200 de cada outro campo, cada um com
+        // mais do que o máximo de caracteres, de 4 bytes: sem teto, ~3 MiB
+        // só de assuntos e autores no library.json, relido a cada abertura.
+        let text: String = std::iter::repeat_n(WIDE, MAX_FIELD_CHARS + 100).collect();
+        let mut metadata = String::new();
+        for item in 0..200 {
+            for (open, close) in NESTABLE {
+                let open = open.replace("{n}", &item.to_string());
+                metadata.push_str(&format!("{open}{text}{close}"));
+            }
+        }
+        let bytes = book_with_metadata(&metadata);
+        let (entry, peak, index) = import_alone("largo", &bytes);
+        assert_eq!(entry.subjects.len(), MAX_METADATA_ITEMS);
+        assert_eq!(entry.authors.len(), MAX_METADATA_ITEMS);
+        // Cada campo cortado no teto.
+        assert!(
+            entry
+                .subjects
+                .iter()
+                .chain(&entry.authors)
+                .all(|value| value.chars().count() == MAX_FIELD_CHARS)
+        );
+        // O teto do registro: autores e assuntos cheios, mais título, data,
+        // série e ordenação (um campo cada), a 4 bytes por caractere.
+        let ceiling = (2 * MAX_METADATA_ITEMS + 8) * MAX_FIELD_CHARS * 4 + 64 * 1024;
+        assert!(
+            (index as usize) < ceiling,
+            "library.json com {index} bytes (teto {ceiling})"
+        );
+        assert!(
+            peak < 16 * bytes.len() + 4 * 1024 * 1024,
+            "pico {peak} para um arquivo de {} bytes",
+            bytes.len()
         );
     }
 }

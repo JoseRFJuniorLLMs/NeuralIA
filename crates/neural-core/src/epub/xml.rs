@@ -371,11 +371,27 @@ impl Dom {
 
     /// Descendentes em pré-ordem (ordem do documento), sem recursão.
     pub(crate) fn descendants(&self, node: usize) -> Vec<usize> {
+        self.descendants_until(node, |_| false)
+    }
+
+    /// Descendentes em pré-ordem, sem entrar nos que `stop` aceita: esses
+    /// entram na lista, os elementos dentro deles não. Com `stop` a aceitar os
+    /// campos que se leem, cada texto do documento pertence a no máximo um
+    /// campo da lista: um campo dentro de outro não é lido de novo (nem copia
+    /// o mesmo texto uma vez por nível).
+    pub(crate) fn descendants_until(
+        &self,
+        node: usize,
+        stop: impl Fn(usize) -> bool,
+    ) -> Vec<usize> {
         let mut out = Vec::new();
         let mut stack: Vec<usize> = self.elements(node).collect();
         stack.reverse();
         while let Some(next) = stack.pop() {
             out.push(next);
+            if stop(next) {
+                continue;
+            }
             let first = stack.len();
             stack.extend(self.elements(next));
             stack[first..].reverse();
@@ -392,10 +408,10 @@ impl Dom {
 
     /// O texto dentro do nó (descendentes incluídos), com espaços colapsados,
     /// cortado em `max_chars` caracteres. O corte acontece DURANTE a
-    /// travessia: um `<meta>` dentro de outro dentro de outro (até
-    /// [`MAX_XML_DEPTH`] níveis) nunca copia o texto inteiro de todos os
-    /// descendentes uma vez por nível. O resultado é o mesmo que colapsar o
-    /// texto todo e depois cortar.
+    /// travessia (uma chamada copia no máximo `max_chars` caracteres); o
+    /// resultado é o mesmo que colapsar o texto todo e depois cortar. Chamar
+    /// isto para um nó e também para os nós dentro dele copia o mesmo texto
+    /// outra vez: quem lê campos usa [`Dom::descendants_until`].
     pub(crate) fn text_capped(&self, node: usize, max_chars: usize) -> String {
         let mut out = String::new();
         let mut count = 0usize;
