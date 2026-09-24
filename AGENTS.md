@@ -70,6 +70,20 @@ Não é cerimónia. Foi assim que se soube, a 19/09/2026, que o teste de aceita�
 
 Um teste que nunca se viu falhar é uma esperança, não uma garantia.
 
+**Onde é obrigatória (decisão do dono, 24/09/2026: "só nos críticos"; "se der alguma merda nós fazemos em todos").**
+A sabotagem é obrigatória nos gates **críticos**:
+
+- segurança: canal IPC e capability, scripts injetados, permissões (câmera, microfone, tela, agentes), modo privado, chaves e segredos, navegação e origens locais, confirmações que protegem o utilizador (cartão do Pesquisar, "Apagar histórico");
+- dados do utilizador: tudo o que grava, apaga, restaura ou migra (histórico, memória, notas, abas, biblioteca, chaves, instalar/atualizar/desinstalar);
+- entrada não confiável: parsers de conteúdo remoto ou de ficheiros (HTML, PDF, EPUB/ZIP/XML, mensagens de páginas), limites e prazos;
+- release: instalador, carga útil, assinatura, contrato de release e gates do CI.
+
+Nos gates **não críticos** (layout, pintura, dicas, textos, cores, animação) basta uma **amostra**: sabota-se pelo menos um gate por tarefa, escolhendo o mais complexo, e os restantes correm só como testes normais.
+
+**Recuo:** se um bug escapar num gate que foi só amostrado, a área volta a ter sabotagem em todos os gates novos até ordem contrária do dono, e o incidente fica registado no PR.
+
+**Custo:** a sabotagem mede-se com uma compilação por quebra. Restaurar não pede compilação própria — a quebra seguinte ou a compilação final da suite servem de prova de que o estado restaurado volta a verde.
+
 **E depois restaura-se.** A sabotagem é uma medição, não uma entrega. Antes de `git add`, o passo é
 sempre: desfazer a quebra, correr `cargo test` outra vez e **ver verde** — e só então commitar. Sem
 isto, a disciplina que existe para provar o gate passa a ser a via mais rápida para desligar o gate:

@@ -4,7 +4,7 @@
 
 #![cfg(windows)]
 
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use neural_core::tissue::{self, Tissue};
 use windows_sys::Win32::Foundation::RECT;
@@ -455,98 +455,99 @@ pub unsafe fn checkbox(hdc: HDC, rect: Rect, checked: bool, hovered: bool, scale
 
 static BRAND: OnceLock<image::RgbaImage> = OnceLock::new();
 
-/// A arte da marca.
+/// A arte da marca: `assets/neuralia-home.png`, a mesma da Home do navegador.
+/// Nao tem fundo -- o que nao e marca e transparente --, por isso nao ha nada
+/// a recortar nem a dissolver: basta respeitar o alfa que ela traz.
 fn brand_image() -> &'static image::RgbaImage {
     BRAND.get_or_init(|| {
-        let raw = include_bytes!("../../../assets/logo.png");
+        let raw = include_bytes!("../../../assets/neuralia-home.png");
         image::load_from_memory(raw)
-            .expect("assets/logo.png tem de ser um PNG valido")
+            .expect("assets/neuralia-home.png tem de ser um PNG valido")
             .to_rgba8()
     })
 }
 
-/// Quanto da arte se ve num ponto, entre 0 na borda e 1 no interior.
+/// (largura, altura, pixeis RGBA pre-multiplicados de cima para baixo).
+type ScaledBrand = Option<(u32, u32, Arc<Vec<u8>>)>;
+static SCALED_BRAND: Mutex<ScaledBrand> = Mutex::new(None);
+
+/// A arte ja reduzida ao retangulo dela, com o alfa multiplicado nas cores.
 ///
-/// A arte e opaca: o fundo dela e um degrade escuro que nao e exatamente a cor
-/// desta janela, e desenhada tal e qual aparecia dentro de um retangulo
-/// visivel. Em vez de a recortar -- o recorte deixa franjas brancas a volta da
-/// esfera -- dissolve-se a moldura no fundo. O que fica e a arte inteira, sem
-/// caixa.
-fn feather_alpha(x: u32, y: u32, width: u32, height: u32, feather: f64) -> f64 {
-    if feather <= 0.0 {
-        return 1.0;
+/// Reduz-se uma vez por tamanho: o retangulo so muda quando muda o DPI, e
+/// redimensionar 1200x868 com Lanczos a 30 quadros por segundo era o que mais
+/// custava a cada pintura. Pre-multiplica-se ANTES de reduzir: a cor dos
+/// pixeis transparentes nao se ve, e sem isto escorria para a orla da marca.
+pub(crate) fn scaled_brand(width: u32, height: u32) -> Arc<Vec<u8>> {
+    let mut cache = SCALED_BRAND.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((w, h, pixels)) = cache.as_ref()
+        && (*w, *h) == (width, height)
+    {
+        return Arc::clone(pixels);
     }
-    let dx = (x as f64).min((width.saturating_sub(1).saturating_sub(x)) as f64);
-    let dy = (y as f64).min((height.saturating_sub(1).saturating_sub(y)) as f64);
-    let t = (dx.min(dy) / feather).clamp(0.0, 1.0);
-    // Rampa suave: uma rampa linear deixa-se ver como uma linha.
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// A largura da dissolucao, em pixeis da arte ja redimensionada.
-fn feather_width(width: u32, height: u32) -> f64 {
-    (width.min(height) as f64 * 0.16).max(1.0)
-}
-
-/// Abaixo desta luminancia a arte e fundo e nao se mostra; acima desta,
-/// e marca e mostra-se inteira. No meio, desvanece.
-const ART_FLOOR: f64 = 0.10;
-const ART_CEILING: f64 = 0.26;
-
-/// Quanto de um pixel da arte se ve, pela sua luminancia.
-///
-/// A arte tem um fundo proprio -- um degrade azul-escuro -- que **nao** e a
-/// cor desta janela: desenhada tal e qual, a marca aparecia dentro de um
-/// retangulo mais claro. Recortar pelo alfa nao resolve, porque a arte e
-/// opaca; e recortar a mao deixa franjas. Entao usa-se a propria luminancia
-/// como mascara: o que e escuro era fundo e da lugar a pagina, o que brilha e
-/// a esfera e as letras e fica. O halo a volta da esfera, que esta no meio,
-/// desvanece na proporcao certa -- que e o que faz a marca parecer pousada no
-/// fundo em vez de colada por cima.
-fn art_visibility(pixel: [u8; 4]) -> f64 {
-    let luma =
-        (0.2126 * pixel[0] as f64 + 0.7152 * pixel[1] as f64 + 0.0722 * pixel[2] as f64) / 255.0;
-    let t = ((luma - ART_FLOOR) / (ART_CEILING - ART_FLOOR)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// A marca, composta sobre a cor de fundo. Nao ha `AlphaBlend` nenhum: a zona
-/// onde a marca cai e a zona de silencio do tecido, portanto e cor lisa, e
-/// compor a mao da o mesmo resultado sem carregar a msimg32.
-pub unsafe fn logo(hdc: HDC, rect: Rect) {
-    let width = rect.width.round().max(1.0) as u32;
-    let height = rect.height.round().max(1.0) as u32;
-    let scaled = image::imageops::resize(
-        brand_image(),
+    let mut premultiplied = brand_image().clone();
+    for pixel in premultiplied.pixels_mut() {
+        let alpha = pixel[3] as u32;
+        for channel in 0..3 {
+            pixel[channel] = ((pixel[channel] as u32 * alpha + 127) / 255) as u8;
+        }
+    }
+    let mut scaled = image::imageops::resize(
+        &premultiplied,
         width,
         height,
         image::imageops::FilterType::Lanczos3,
     );
-
-    // GDI quer BGRA de baixo para cima; a `image` da RGBA de cima para baixo.
-    let feather = feather_width(width, height);
-    let mut bgra = Vec::with_capacity((width * height * 4) as usize);
-    for y in (0..height).rev() {
-        for x in 0..width {
-            let px = scaled.get_pixel(x, y).0;
-            let alpha = px[3] as f64 / 255.0
-                * feather_alpha(x, y, width, height, feather)
-                * art_visibility(px);
-            let over = |channel: u8, back: u8| {
-                (channel as f64 * alpha + back as f64 * (1.0 - alpha)).round() as u8
-            };
-            bgra.push(over(px[2], PAGE.2));
-            bgra.push(over(px[1], PAGE.1));
-            bgra.push(over(px[0], PAGE.0));
-            bgra.push(255);
+    // O Lanczos passa um pouco do sitio nas orlas; uma cor pre-multiplicada
+    // acima do proprio alfa acenderia o tecido por baixo.
+    for pixel in scaled.pixels_mut() {
+        for channel in 0..3 {
+            pixel[channel] = pixel[channel].min(pixel[3]);
         }
     }
+    let pixels = Arc::new(scaled.into_raw());
+    *cache = Some((width, height, Arc::clone(&pixels)));
+    pixels
+}
+
+/// Pousa a arte (RGBA pre-multiplicado) sobre o que ja esta pintado (BGRA,
+/// como a seccao DIB o da): `arte + fundo * (1 - alfa)`. Onde a arte e
+/// transparente, o fundo fica exatamente como estava.
+fn compose_over(back: &mut [u8], art: &[u8]) {
+    for (dst, src) in back
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(art.as_chunks::<4>().0)
+    {
+        let keep = 255 - src[3] as u32;
+        let over =
+            |ink: u8, under: u8| (ink as u32 + (under as u32 * keep + 127) / 255).min(255) as u8;
+        dst[0] = over(src[2], dst[0]);
+        dst[1] = over(src[1], dst[1]);
+        dst[2] = over(src[0], dst[2]);
+    }
+}
+
+/// A marca, pousada em cima do tecido.
+///
+/// Ate a 2.1.7 a arte era opaca e ia para o ecra com `SRCCOPY`, composta
+/// sobre a cor da pagina: um retangulo liso que apagava os neuronios que
+/// passavam por tras -- o quadrado que o dono via a volta da marca. Agora le-se
+/// o que ja esta pintado naquele retangulo, compoe-se a arte por cima com o
+/// alfa dela e devolve-se: o tecido continua a ver-se por todo o lado onde a
+/// arte e transparente. Sem `AlphaBlend`, que obrigaria a carregar a msimg32.
+pub unsafe fn logo(hdc: HDC, rect: Rect) {
+    let width = rect.width.round().max(1.0) as u32;
+    let height = rect.height.round().max(1.0) as u32;
+    let (x, y) = (rect.x.round() as i32, rect.y.round() as i32);
+    let art = scaled_brand(width, height);
 
     let info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
             biWidth: width as i32,
-            biHeight: height as i32,
+            // Negativo: de cima para baixo, como a `image` da os pixeis.
+            biHeight: -(height as i32),
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB,
@@ -563,21 +564,55 @@ pub unsafe fn logo(hdc: HDC, rect: Rect) {
             rgbReserved: 0,
         }],
     };
-    StretchDIBits(
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let dib = CreateDIBSection(
         hdc,
-        rect.x.round() as i32,
-        rect.y.round() as i32,
-        width as i32,
-        height as i32,
-        0,
-        0,
-        width as i32,
-        height as i32,
-        bgra.as_ptr() as *const _,
         &info,
         DIB_RGB_COLORS,
+        &mut bits,
+        std::ptr::null_mut(),
+        0,
+    );
+    let scratch = CreateCompatibleDC(hdc);
+    if dib.is_null() || bits.is_null() || scratch.is_null() {
+        if !dib.is_null() {
+            DeleteObject(dib as _);
+        }
+        if !scratch.is_null() {
+            DeleteDC(scratch);
+        }
+        return;
+    }
+    let old = SelectObject(scratch, dib as _);
+    // O que ja la esta: o tecido.
+    BitBlt(
+        scratch,
+        0,
+        0,
+        width as i32,
+        height as i32,
+        hdc,
+        x,
+        y,
         SRCCOPY,
     );
+    GdiFlush();
+    let pixels = std::slice::from_raw_parts_mut(bits as *mut u8, (width * height * 4) as usize);
+    compose_over(pixels, &art);
+    BitBlt(
+        hdc,
+        x,
+        y,
+        width as i32,
+        height as i32,
+        scratch,
+        0,
+        0,
+        SRCCOPY,
+    );
+    SelectObject(scratch, old);
+    DeleteDC(scratch);
+    DeleteObject(dib as _);
 }
 
 pub unsafe fn close_button(hdc: HDC, layout: &Layout, hovered: bool) {
@@ -659,103 +694,147 @@ mod tests {
     }
 
     #[test]
-    fn the_border_of_the_art_dissolves_completely_into_the_page() {
-        // A arte e opaca. Se a dissolucao nao chegar a zero na borda, fica um
-        // retangulo visivel a volta da marca -- foi exatamente o que o dono
-        // viu e rejeitou.
-        let (w, h) = (240u32, 167u32);
-        let feather = feather_width(w, h);
-        for (x, y) in [
-            (0, 0),
-            (w - 1, 0),
-            (0, h - 1),
-            (w - 1, h - 1),
-            (w / 2, 0),
-            (0, h / 2),
-            (w / 2, h - 1),
-            (w - 1, h / 2),
-        ] {
-            assert_eq!(
-                feather_alpha(x, y, w, h, feather),
-                0.0,
-                "a borda em ({x}, {y}) ainda mostra arte: vai aparecer a caixa"
-            );
+    fn the_installer_brand_is_the_home_art() {
+        // O dono: "neuralia-home.png nao tem fundo usa ela para tudo". A arte
+        // que o instalador desenha tem de ser essa -- a do disco, nao so a que
+        // o `include_bytes!` diz ser.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/neuralia-home.png"
+        );
+        let on_disk = image::open(path)
+            .expect("assets/neuralia-home.png")
+            .to_rgba8();
+        let drawn = brand_image();
+        assert_eq!(drawn.dimensions(), (1200, 868));
+        assert!(
+            drawn.as_raw() == on_disk.as_raw(),
+            "o instalador nao desenha a assets/neuralia-home.png"
+        );
+        // E essa arte nao traz fundo: os cantos sao transparentes.
+        for (x, y) in [(0, 0), (1199, 0), (0, 867), (1199, 867)] {
+            assert_eq!(drawn.get_pixel(x, y)[3], 0, "fundo no canto ({x}, {y})");
         }
-        // E no meio a arte aparece inteira, senao o que se dissolveu foi ela.
-        assert_eq!(feather_alpha(w / 2, h / 2, w, h, feather), 1.0);
+    }
+
+    /// Um tecido que se reconhece pixel a pixel (BGR): um xadrez de duas
+    /// cores que a marca nao tem.
+    fn probe(x: u32, y: u32) -> [u8; 3] {
+        if (x / 5 + y / 5).is_multiple_of(2) {
+            [90, 30, 200]
+        } else {
+            [40, 160, 20]
+        }
     }
 
     #[test]
-    fn no_square_survives_around_the_brand() {
-        // O dono rejeitou isto duas vezes: "nao quero contorno quadrado ao
-        // redor da logo marca". A arte e opaca, portanto o que nao pode
-        // aparecer e o fundo DELA. Percorre-se a moldura da arte real e
-        // exige-se que nenhum desses pixeis se veja.
-        let art = brand_image();
-        let (w, h) = art.dimensions();
-        let mut worst = 0.0f64;
-        let mut worst_at = (0u32, 0u32);
-        for y in 0..h {
-            for x in 0..w {
-                // A moldura: a faixa exterior de 6% de cada lado.
-                let band_x = (w as f64 * 0.06) as u32;
-                let band_y = (h as f64 * 0.06) as u32;
-                let on_frame = x < band_x || y < band_y || x >= w - band_x || y >= h - band_y;
-                if !on_frame {
-                    continue;
+    fn the_brand_lands_on_the_tissue_without_a_square() {
+        // "nao quero contorno quadrado ao redor da logo marca". Pinta-se a
+        // marca com o `logo` que embarca por cima de um tecido conhecido, numa
+        // seccao DIB, e le-se o que ficou: onde a arte e transparente o tecido
+        // tem de continuar la, igual; onde e opaca, tem de estar a arte.
+        const W: u32 = 520;
+        const H: u32 = 400;
+        let rect = Rect {
+            x: 30.0,
+            y: 40.0,
+            width: 440.0,
+            height: 440.0 / crate::ui::BRAND_ASPECT,
+        };
+        let (rx, ry) = (rect.x.round() as u32, rect.y.round() as u32);
+        let (rw, rh) = (rect.width.round() as u32, rect.height.round() as u32);
+        let painted = unsafe {
+            let dc = CreateCompatibleDC(std::ptr::null_mut());
+            assert!(!dc.is_null());
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: W as i32,
+                    biHeight: -(H as i32),
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    biSizeImage: 0,
+                    biXPelsPerMeter: 0,
+                    biYPelsPerMeter: 0,
+                    biClrUsed: 0,
+                    biClrImportant: 0,
+                },
+                bmiColors: [RGBQUAD {
+                    rgbBlue: 0,
+                    rgbGreen: 0,
+                    rgbRed: 0,
+                    rgbReserved: 0,
+                }],
+            };
+            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let dib = CreateDIBSection(
+                dc,
+                &info,
+                DIB_RGB_COLORS,
+                &mut bits,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert!(!dib.is_null() && !bits.is_null());
+            let old = SelectObject(dc, dib as _);
+            let pixels = std::slice::from_raw_parts_mut(bits as *mut u8, (W * H * 4) as usize);
+            for y in 0..H {
+                for x in 0..W {
+                    let at = ((y * W + x) * 4) as usize;
+                    pixels[at..at + 3].copy_from_slice(&probe(x, y));
+                    pixels[at + 3] = 255;
                 }
-                let seen = art_visibility(art.get_pixel(x, y).0);
-                if seen > worst {
-                    worst = seen;
-                    worst_at = (x, y);
+            }
+            logo(dc, rect);
+            GdiFlush();
+            let painted = pixels.to_vec();
+            SelectObject(dc, old);
+            DeleteObject(dib as _);
+            DeleteDC(dc);
+            painted
+        };
+
+        let art = scaled_brand(rw, rh);
+        let (mut clear, mut inked) = (0usize, 0usize);
+        for y in 0..H {
+            for x in 0..W {
+                let at = ((y * W + x) * 4) as usize;
+                let seen = [painted[at], painted[at + 1], painted[at + 2]];
+                let inside = (rx..rx + rw).contains(&x) && (ry..ry + rh).contains(&y);
+                let ink = if inside {
+                    let a = (((y - ry) * rw + (x - rx)) * 4) as usize;
+                    Some([art[a + 2], art[a + 1], art[a], art[a + 3]])
+                } else {
+                    None
+                };
+                match ink {
+                    None | Some([_, _, _, 0]) => {
+                        assert_eq!(
+                            seen,
+                            probe(x, y),
+                            "em ({x}, {y}) a arte e transparente e o tecido \
+                             desapareceu: e o quadrado a volta da marca"
+                        );
+                        clear += usize::from(inside);
+                    }
+                    Some([b, g, r, 255]) => {
+                        assert_eq!(seen, [b, g, r], "em ({x}, {y}) a marca nao foi desenhada");
+                        inked += 1;
+                    }
+                    Some(_) => {}
                 }
             }
         }
+        // A arte tem mesmo margem transparente, e a marca esta la.
+        let area = (rw * rh) as usize;
         assert!(
-            worst < 0.02,
-            "o fundo da arte ainda se ve a {:.3} em {worst_at:?}: isso desenha \
-             o quadrado a volta da marca",
-            worst
+            clear * 100 >= area * 30,
+            "so {clear} de {area} pixeis do retangulo mostram o tecido"
         );
-    }
-
-    #[test]
-    fn the_brand_itself_is_not_dissolved_along_with_its_background() {
-        // A mascara nao pode comer a marca. O pixel mais claro da arte -- as
-        // letras -- tem de aparecer inteiro.
-        let art = brand_image();
-        let brightest = art
-            .pixels()
-            .map(|p| art_visibility(p.0))
-            .fold(0.0f64, f64::max);
-        assert_eq!(
-            brightest, 1.0,
-            "a marca esta a ser apagada junto com o fundo dela"
+        assert!(
+            inked * 100 >= area * 10,
+            "so {inked} de {area} pixeis do retangulo tem a marca inteira"
         );
-    }
-
-    #[test]
-    fn the_dissolve_never_goes_backwards_from_the_border_inwards() {
-        // Uma rampa que sobe e desce desenha aneis a volta da marca.
-        let (w, h) = (300u32, 208u32);
-        let feather = feather_width(w, h);
-        let mut last = -1.0;
-        for x in 0..(w / 2) {
-            let value = feather_alpha(x, h / 2, w, h, feather);
-            assert!(value >= last, "recuou em x={x}: {last} -> {value}");
-            assert!((0.0..=1.0).contains(&value));
-            last = value;
-        }
-    }
-
-    #[test]
-    fn a_tiny_brand_still_dissolves_instead_of_dividing_by_zero() {
-        // A janela pode ficar minuscula antes de o layout a travar.
-        for (w, h) in [(1u32, 1u32), (2, 2), (8, 5)] {
-            let feather = feather_width(w, h);
-            assert!(feather > 0.0);
-            let value = feather_alpha(0, 0, w, h, feather);
-            assert!(value.is_finite() && (0.0..=1.0).contains(&value));
-        }
     }
 }
