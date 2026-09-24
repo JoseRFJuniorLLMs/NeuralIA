@@ -1823,7 +1823,10 @@ mod tests {
             .unwrap();
         let error = library.set_position(&id, at(2, 0.5, T0 + 2)).unwrap_err();
         assert!(matches!(error, LibraryError::Write(_)), "{error:?}");
-        assert_eq!(library.get(&id).unwrap().position, Some(at(1, 0.25, T0 + 1)));
+        assert_eq!(
+            library.get(&id).unwrap().position,
+            Some(at(1, 0.25, T0 + 1))
+        );
         drop(held);
         library.set_position(&id, at(2, 0.5, T0 + 3)).unwrap();
         assert_eq!(library.get(&id).unwrap().position, Some(at(2, 0.5, T0 + 3)));
@@ -2239,9 +2242,7 @@ mod tests {
         let mut library = temp.library();
         let (added, peak) = peak_during(|| library.add_at(&source, T0));
         let entry = added.expect("o livro hostil entra, com os valores cortados");
-        let index = fs::metadata(temp.lib_dir().join(INDEX_FILE))
-            .unwrap()
-            .len();
+        let index = fs::metadata(temp.lib_dir().join(INDEX_FILE)).unwrap().len();
         (entry, peak, index)
     }
 
