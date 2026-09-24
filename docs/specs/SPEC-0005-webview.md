@@ -54,41 +54,54 @@ the set the shipped parser accepts; the count is the test constant
 `PUBLISHED_ACTION_COUNT`, and the same gate holds the list and count repeated in
 SPEC-0108 and the count in SPEC-0015 to it.
 
-`note` is the request "make a note of what I selected". It carries no page
-data: the page only asks, and says which gesture asked. With no arguments it
-is Ctrl+Shift+Z; with exactly `via` set to the closed name `bar` it is the
-selection toolbar's "📝 Salvar nota". Any other key, value, case or type
-(a `text`, `url` or `title`, `via: "page"`, `via: "Bar"`, `via: true`) is
+`note` is the request "make a note of what I selected". It never carries an
+address or a title from the page. With no arguments it is Ctrl+Shift+Z: the
+page only asks. With exactly `via` set to the closed name `bar` and `text` it
+is the selection toolbar's "📝 Salvar nota", and `text` is the text the
+toolbar shows, read through the primitives it captured when the document was
+created (the same text path as `search`): 1..=5000 characters after trimming
+(`NOTE_TEXT_MAX_CHARS`), no control characters except newline and tab, and
+the whole message still within 8 KiB -- the toolbar does not send a text that
+does not fit and says so ("Seleção grande demais para Salvar nota"). Any
+other key, value, case or type (a `url` or `title`, `via: "bar"` without
+`text`, a `text` without `via`, `via: "page"`, `via: "Bar"`, `via: true`) is
 rejected. Inside an editable field (input, textarea, contenteditable) the
-keymap leaves Ctrl+Shift+Z to the page as redo. The native side then reads
-the selection (capped at 20 000 characters, again natively), `location.href`
-and `document.title` from the WebView that sent the request -- the emitting
-comparator column, the split, or the single External/Reader/PDF WebView --
-and treats that reply as page data. For Ctrl+Shift+Z only an http(s) address
-becomes the note's source, and on the Reader and PDF surfaces the source is
-the address the native side opened. For Salvar nota the reply's
-`location.href` and `document.title` are not used at all: the source is an
-address the native side knows -- the Reader article or the PDF it opened,
-otherwise the WebView's own `Source` (`webview.url()`), kept only when it is
-http(s) -- and the title is the first 60 characters of the selection on one
-line, with "…" when it goes on (`bar_note_step`, `note_capture_source`).
-Salvar nota is local: there is no card and the notes panel does not open; a
-native centred notice says "Nota salva: <title>". The same selected text
-saved again within 2 s is not another note, also with another text saved in
-between (`BarNoteGuard`). The note is written under `<data_dir>/zettel` by a
-worker thread, and the Salvar nota path writes neither history nor memory. A
-Ctrl+Shift+Z from the private split is refused ("Modo privado: notas não são
-criadas") without reading the page, and the split's privacy is checked again
-when the read would happen. A Salvar nota from the private split is an
-explicit request from the reader and is saved; its notice then says "Modo
-privado: a nota foi guardada". The choice of WebView, that check and whether
-the WebView read is the private split's (which picks that notice) all come
-from `note_read_view`, which the shipped `request_note_from_page` calls. Gates:
+keymap leaves Ctrl+Shift+Z to the page as redo, and a held Ctrl+Shift+Z asks
+once (key repeats do not ask again). For Ctrl+Shift+Z the native side then
+reads the selection (capped at 20 000 characters, again natively),
+`location.href` and `document.title` from the WebView that sent the request
+-- the emitting comparator column, the split, or the single
+External/Reader/PDF WebView -- and treats that reply as page data: only an
+http(s) address becomes the note's source, and on the Reader and PDF surfaces
+the source is the address the native side opened. Salvar nota does not read
+the page again: the note is the `text` of the request, so a page that swaps
+`getSelection`, `Selection.prototype.toString` or `String` after the document
+was created changes neither the note nor its notice. Its source is an address
+the native side knows -- the Reader article or the PDF it opened, otherwise
+the WebView's own `Source` (`webview.url()`), kept only when it is http(s) --
+and its title is the first 60 characters of the text on one line, with "…"
+when it goes on (`bar_note_step`, `note_capture_source`). Salvar nota is
+local: there is no card and the notes panel does not open; a native centred
+notice says "Nota salva: <title>". The same text saved again within 2 s is
+not another note, also with another text saved in between (`BarNoteGuard`);
+the same holds for the note of a Ctrl+Shift+Z (`shortcut_note_step`, its own
+guard). The note is written under `<data_dir>/zettel` by a worker thread, and
+the Salvar nota path writes neither history nor memory. A Ctrl+Shift+Z from
+the private split is refused ("Modo privado: notas não são criadas") without
+reading the page, and the split's privacy is checked again when the read would
+happen. A Salvar nota from the private split is an explicit request from the
+reader and is saved; its notice then says "Modo privado: a nota foi
+guardada". The choice of WebView, that check and whether the WebView is the
+private split's (which picks that notice) all come from `note_read_view`,
+which the shipped `request_note_from_page` calls. Gates:
 `note_is_a_bare_request_and_carries_no_page_data` (`ipc.rs`),
 `ctrl_shift_z_on_a_page_posts_a_bare_note_request`,
+`a_held_ctrl_shift_z_saves_one_note`,
 `a_note_request_reads_its_own_webview_and_never_the_private_split`,
-`a_selection_becomes_a_quoted_note_with_its_source` and
-`salvar_nota_saves_one_note_with_the_native_source_and_never_twice_in_two_seconds`
+`a_selection_becomes_a_quoted_note_with_its_source`,
+`salvar_nota_saves_one_note_with_the_native_source_and_never_twice_in_two_seconds`,
+`salvar_nota_saves_the_readers_text_even_when_the_page_swaps_get_selection` and
+`salvar_nota_sends_only_what_fits_in_the_channel`
 (`crates/neural-app/src/windows_app.rs`).
 
 `link` reports a click on a link inside a comparator column. Its arguments are
@@ -132,20 +145,29 @@ it stays closed until the next such gesture, and it is not shown for a
 selection whose end is outside the visible area. It is placed above the whole
 selection when there is room, else below its last line. It lives in a closed
 shadow root built when the document is created, and offers, in this order,
-"🤖 Mandar para IA", "📝 Salvar nota" (`note` with `via: "bar"`, above),
+"🤖 Mandar para IA", "📝 Salvar nota" (`note` with `via: "bar"` and the text, above),
 "🌐 Traduzir", "📋 Copiar" (clipboard, no IPC) and "⋯" (`aria-label` and
-`title` "Mais"). The "⋯" opens a small menu inside the same bar and shadow
-root (`role="menu"`, entries `role="menuitem"`) with what does not fit in the
+`title` "Mais"). The "⋯" opens a small menu in the same shadow root
+(`role="menu"`, entries `role="menuitem"`) with what does not fit in the
 bar: today only "🔊 Falar" (local `speechSynthesis` voices, no IPC). The menu
 is the closed list `MORE_MENU` of the injected script, and an entry is offered
-only when the document has what it needs: without local speech synthesis
-there is no "⋯" at all, never a dead button. Clicking "⋯" opens the menu
+only when the document has what it needs: a document without speech synthesis
+(`speechSynthesis` and the voice accessors) has no "⋯" at all, never a dead
+button; with speech synthesis but no local voice, Falar is offered and says
+"Nenhuma voz local disponível". The menu floats next to the "⋯", outside the
+bar's box (`position:absolute`), so opening or closing it neither resizes nor
+moves the toolbar: the "⋯" stays under the pointer and a second click on the
+same spot closes the menu. It opens away from the selection -- above the bar
+when the bar is above the text, below when the bar is below it or when there
+is no room above -- aligned with the bar's right edge (its left edge when that
+would leave the screen). Clicking "⋯" opens the menu
 (`aria-expanded="true"`) and moves the focus to its first entry; the arrow
 keys (wrapping), Home and End move inside it; a trusted Enter or Space runs
 the focused entry once; Tab closes it; clicking "⋯" again, clicking outside
-or a new selection close it. The first Esc closes only the menu and gives the
-focus back to the page, the next closes the toolbar, and only the one after
-that goes back. The bar's buttons stay out of the page's Tab order
+or a new selection close it. While nothing is being read, the first Esc
+closes only the menu and gives the focus back to the page, the next closes
+the toolbar, and only the one after that goes back; while Falar reads, the
+first Esc stops the reading and closes the toolbar. The bar's buttons stay out of the page's Tab order
 (`tabindex="-1"`). Falar never picks an online voice: it reads `localService`, `lang` and `default`
 through the `SpeechSynthesisVoice` accessors, and sets the utterance's
 `voice` and `lang` through the `SpeechSynthesisUtterance` setters, captured
@@ -210,7 +232,12 @@ that text appeared, opens the normal three-AI comparison, with exactly the
 text the card last painted as the question -- for Traduzir, inside the fixed
 request written natively (`TRANSLATE_PROMPT`): "Traduza para o português do
 Brasil (se o texto já estiver em português, traduza para o inglês):", a blank
-line, then that text. Cancelar, or 12 s without an answer, drops it. There is
+line, then that text. A Traduzir is named by the reader's text, not by the
+fixed request: its research session and memory entry are "Traduzir: <text>"
+and history keeps `traduzir:<text>`, an omnibox command that sends the same
+request again when the entry is reopened (`CompareRequest`,
+`compare_records`); a Mandar keeps the question as name and `compare:<text>`
+in history. Cancelar, or 12 s without an answer, drops it. There is
 one card at a time: a new request from either button replaces the text, the
 title and the confirm button and restarts both clocks, and a click only
 counts for the card it had painted. The comparison never goes through the
@@ -226,10 +253,12 @@ as a tab in the group of the tab it came from) are all set by
 `configure_split_webview` from the result. Gates: `search_carries_the_selected_text_within_bounds` (`ipc.rs`),
 `the_selection_toolbar_offers_four_actions_and_a_menu_for_a_trusted_selection`,
 `the_selection_menu_opens_closes_and_is_reachable_by_keyboard`,
+`the_more_menu_opens_without_moving_the_bar`,
 `the_selection_toolbar_searches_only_what_fits_and_never_from_private`,
 `pesquisar_only_counts_a_click_on_a_bar_the_user_really_saw`,
 `pesquisar_asks_the_native_card_and_only_its_search_click_compares`,
 `traduzir_sends_the_fixed_prompt_only_after_the_native_confirm`,
+`each_translation_is_named_by_its_text_and_reopens_from_history`,
 `the_search_card_shows_plain_bounded_text_and_answers_only_its_buttons`,
 `the_search_card_confirms_only_the_text_it_painted`,
 `the_search_card_window_answers_a_native_press_and_release_with_the_painted_token`,

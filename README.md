@@ -124,6 +124,7 @@ NeuralIA/
 | `como funciona Raft?` | Comparador: Gemini + ChatGPT + Claude |
 | `? MVCC vs OCC` | Google AI Mode |
 | `compare: MVCC vs OCC` | Comparador explícito: Gemini + ChatGPT + Claude |
+| `traduzir: Good morning` | Tradução nas 3 IAs (para o português do Brasil; um texto já em português vai para o inglês) — é o que o Histórico guarda de um Traduzir da barra de seleção |
 | `https://example.com/paper.pdf` | Visualizador de PDF embutido (o Reader só lê HTML) |
 | `https://example.com/article` | Reader |
 | `reader:https://example.com` | Reader |

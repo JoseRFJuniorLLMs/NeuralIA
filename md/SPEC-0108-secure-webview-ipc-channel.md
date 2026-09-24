@@ -77,12 +77,14 @@ Uma string JSON, sempre com estes quatro campos e nenhum outro:
   são rejeitados; os nomes fechados também: `search` leva `text` e `intent`, que é
   exatamente `ask` (Mandar para IA) ou `translate` (Traduzir) — sem `intent`, ou com
   outro nome, maiúsculas ou outro tipo, é recusado, nunca lido como `ask`; `note` vai
-  sem argumentos (Ctrl+Shift+Z) ou só com `via` igual a `bar` (o Salvar nota da barra
-  de seleção), e nenhum texto, endereço ou título da página; índices são validados contra `COMPARATOR_COLUMNS`; `url`
+  sem argumentos (Ctrl+Shift+Z) ou com exatamente `via` igual a `bar` e `text` (o Salvar
+  nota da barra de seleção, com o texto que a barra mostra), e nunca um endereço ou
+  título da página; índices são validados contra `COMPARATOR_COLUMNS`; `url`
   passa por `validate_web_url` e rejeita alvos locais/privados/special óbvios
   antes de DNS; a camada IPC não afirma filtragem DNS pré-conexão do WebView2; strings são
   recusadas acima dos limites definidos (180/2048 chars, 2000 chars no `text` de `ask` e
-  `search`, e payload do observer
+  `search`, 5000 chars no `text` de `note`, sem caracteres de controle além de `\n` e
+  `\t` nos dois da barra, e payload do observer
   limitado antes da serialização).
 
 Tamanho máximo da mensagem: 8 KiB. Acima disso é descartada sem parse.

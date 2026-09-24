@@ -69,7 +69,12 @@ fn spec_0100_product_memory_is_worker_backed_reader_wired_and_private_safe() {
 
 #[test]
 fn spec_0101_product_research_session_wires_capture_compare_synthesis_and_export() {
-    assert!(APP.contains("let session = ResearchSession::new(query.clone());"));
+    // A sessao e a memoria de uma comparacao saem de `compare_records` (o
+    // Traduzir leva o nome do texto, nao o do pedido fixo), testado pelo
+    // comportamento em
+    // `windows_app::tests::each_translation_is_named_by_its_text_and_reopens_from_history`.
+    assert!(APP.contains("ResearchSession::new(request.prompt.clone()).titled(&request.label)"));
+    assert!(APP.contains("let (session, question_memory, reopen) = compare_records(&request);"));
     assert!(APP.contains("self.memory.capture(question_memory);"));
     assert!(APP.contains("self.memory.save_session(session.clone());"));
     assert!(APP.contains("let facts = session.comparison(&ids);"));
@@ -178,7 +183,7 @@ fn spec_0106_roadmap_product_composition_is_wired_not_just_constructible() {
     assert!(APP.contains("fn route_input("));
     assert!(APP.contains("match route_input(&input)"));
 
-    assert!(APP.contains("ResearchSession::new(query.clone())"));
+    assert!(APP.contains("ResearchSession::new(request.prompt.clone())"));
     assert!(APP.contains("self.memory.capture(question_memory);"));
     assert!(APP.contains("decide_agent_step("));
     assert!(APP.contains("function semanticAnchors()"));
