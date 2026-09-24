@@ -221,13 +221,45 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
                 walk(&path, out);
             }
         } else if path.extension().is_some_and(|ext| {
-            ["rs", "toml", "ps1", "mjs", "yml", "html", "css", "js"]
-                .iter()
-                .any(|known| ext == *known)
+            [
+                "rs", "toml", "ps1", "mjs", "yml", "html", "css", "js", "py", "bat", "cmd",
+            ]
+            .iter()
+            .any(|known| ext == *known)
         }) {
             out.push(path);
         }
     }
+}
+
+/// O texto com os caminhos escritos de uma maneira so: `\`, `\\` (o escape
+/// de um literal) e `/` repetidos viram um `/`, e as maiusculas nao contam
+/// (o NTFS nao as distingue). Um `assets\neuralia-brand.jpg` num .ps1 ou um
+/// `"assets\\logo.png"` num .rs passavam por baixo de uma busca literal.
+fn normalized_paths(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut separator = false;
+    for ch in text.chars() {
+        if ch == '\\' || ch == '/' {
+            if !separator {
+                out.push('/');
+            }
+            separator = true;
+        } else {
+            separator = false;
+            out.extend(ch.to_lowercase());
+        }
+    }
+    out
+}
+
+/// Os ficheiros apagados que `text` nomeia, com qualquer separador.
+fn deleted_mentions(text: &str) -> Vec<&'static str> {
+    let text = normalized_paths(text);
+    DELETED
+        .into_iter()
+        .filter(|deleted| text.contains(deleted))
+        .collect()
 }
 
 #[test]
@@ -243,6 +275,15 @@ fn nothing_includes_the_brand_files_the_owner_deleted() {
             "{deleted} voltou: o dono apagou-o por ter fundo quadrado"
         );
     }
+    // O detetor ve as maneiras como os scripts de Windows os escrevem.
+    for written in [
+        r"Copy-Item assets\neuralia-brand.jpg",
+        r#"include_bytes!("..\\..\\..\\assets\\logo.png")"#,
+        "ASSETS//Neuralia-Logo.svg",
+    ] {
+        assert_eq!(deleted_mentions(written).len(), 1, "{written}");
+    }
+    assert!(deleted_mentions("assets/neuralia-home.png assets\\logo.ico").is_empty());
     // Este ficheiro nomeia-os, para os proibir.
     let this_file = root.join("crates/neural-app/tests/brand_assets.rs");
     let mut files = Vec::new();
@@ -262,10 +303,8 @@ fn nothing_includes_the_brand_files_the_owner_deleted() {
         let Ok(text) = std::fs::read_to_string(&file) else {
             continue;
         };
-        for deleted in DELETED {
-            if text.contains(deleted) {
-                offenders.push(format!("{} -> {deleted}", file.display()));
-            }
+        for deleted in deleted_mentions(&text) {
+            offenders.push(format!("{} -> {deleted}", file.display()));
         }
     }
     assert!(

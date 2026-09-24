@@ -882,10 +882,28 @@ unsafe fn paint_window(hwnd: HWND, state: &Setup) {
         std::ptr::null_mut()
     };
 
+    paint_frame(target, &layout, state);
+
+    if buffered {
+        BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
+        SelectObject(mem_dc, old_bmp);
+        DeleteObject(mem_bmp as _);
+        DeleteDC(mem_dc);
+    } else if !mem_dc.is_null() {
+        DeleteDC(mem_dc);
+    }
+    EndPaint(hwnd, &ps);
+}
+
+/// Um quadro inteiro do instalador em `target`: tecido, marca, textos,
+/// progresso, botoes. E o que a janela mostra -- `paint_window` so lhe da o
+/// bitmap fora do ecra e o copia -- e o que o gate do instalador pinta numa
+/// seccao DIB para ver a marca no sitio dela.
+unsafe fn paint_frame(target: HDC, layout: &Layout, state: &Setup) {
     let seconds = state.clock.seconds;
     let tone = paint::tone_for(state.screen);
     paint::fill(target, layout.client, paint::PAGE);
-    paint::tissue_background(target, &layout, seconds);
+    paint::tissue_background(target, layout, seconds);
 
     paint::logo(target, layout.logo);
 
@@ -926,7 +944,7 @@ unsafe fn paint_window(hwnd: HWND, state: &Setup) {
     );
 
     if state.screen != Screen::Welcome {
-        paint::progress_bar(target, &layout, state.progress, seconds, tone);
+        paint::progress_bar(target, layout, state.progress, seconds, tone);
         paint::text_on_tissue(
             target,
             state.stage.label(state.mode == Mode::Uninstall),
@@ -995,21 +1013,11 @@ unsafe fn paint_window(hwnd: HWND, state: &Setup) {
         }
     }
 
-    paint::close_button(target, &layout, paint::hovered(state.hover, Hit::Close));
+    paint::close_button(target, layout, paint::hovered(state.hover, Hit::Close));
 
     DeleteObject(title_font as _);
     DeleteObject(body_font as _);
     DeleteObject(small_font as _);
-
-    if buffered {
-        BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
-        SelectObject(mem_dc, old_bmp);
-        DeleteObject(mem_bmp as _);
-        DeleteDC(mem_dc);
-    } else if !mem_dc.is_null() {
-        DeleteDC(mem_dc);
-    }
-    EndPaint(hwnd, &ps);
 }
 
 #[cfg(test)]
@@ -1808,6 +1816,134 @@ mod tests {
             texts
                 .iter()
                 .any(|t| t == "Criar atalho na área de trabalho")
+        );
+    }
+
+    /// Pinta `draw` numa seccao DIB de `width` x `height` e devolve os
+    /// pixeis (BGRA, de cima para baixo).
+    fn painted(width: i32, height: i32, draw: impl FnOnce(HDC)) -> Vec<u8> {
+        unsafe {
+            let dc = CreateCompatibleDC(std::ptr::null_mut());
+            assert!(!dc.is_null());
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    biSizeImage: 0,
+                    biXPelsPerMeter: 0,
+                    biYPelsPerMeter: 0,
+                    biClrUsed: 0,
+                    biClrImportant: 0,
+                },
+                bmiColors: [RGBQUAD {
+                    rgbBlue: 0,
+                    rgbGreen: 0,
+                    rgbRed: 0,
+                    rgbReserved: 0,
+                }],
+            };
+            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let dib = CreateDIBSection(
+                dc,
+                &info,
+                DIB_RGB_COLORS,
+                &mut bits,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert!(!dib.is_null() && !bits.is_null());
+            let old = SelectObject(dc, dib as _);
+            draw(dc);
+            GdiFlush();
+            let pixels =
+                std::slice::from_raw_parts(bits as *const u8, (width * height * 4) as usize)
+                    .to_vec();
+            SelectObject(dc, old);
+            DeleteObject(dib as _);
+            DeleteDC(dc);
+            pixels
+        }
+    }
+
+    #[test]
+    fn the_installer_window_paints_the_brand_on_the_tissue() {
+        // O `paint_window` que embarca pinta o quadro com `paint_frame`. Aqui
+        // pinta-se o mesmo quadro numa seccao DIB e, a parte, so o tecido
+        // desse instante. Dentro do retangulo da marca: onde a arte e opaca
+        // tem de estar a arte (sem a chamada a `paint::logo`, o instalador
+        // ficava sem marca e nenhum teste reparava); onde e transparente tem
+        // de estar o tecido, igual (nada de quadrado a volta).
+        let layout = Layout::new(WINDOW_W, WINDOW_H, 1.0);
+        let mut clock = TissueClock::default();
+        clock.seconds = 3.25;
+        let setup = Setup {
+            mode: Mode::Install,
+            screen: Screen::Welcome,
+            hover: None,
+            desktop_shortcut: true,
+            progress: 0.0,
+            stage: Stage::Preparing,
+            message: welcome_message(Mode::Install, Path::new(r"C:\NeuralIA")),
+            warning: false,
+            started: Instant::now(),
+            clock,
+            shared: Arc::new(Shared::new()),
+            entries: Vec::new(),
+            target: Err(Failure::new(FailureKind::BadArguments, "ensaio")),
+            open_after: false,
+        };
+        let (w, h) = (
+            layout.client.width.round() as i32,
+            layout.client.height.round() as i32,
+        );
+        let frame = painted(w, h, |dc| unsafe { paint_frame(dc, &layout, &setup) });
+        let tissue = painted(w, h, |dc| unsafe {
+            paint::fill(dc, layout.client, paint::PAGE);
+            paint::tissue_background(dc, &layout, setup.clock.seconds);
+        });
+
+        let (rx, ry) = (layout.logo.x.round() as i32, layout.logo.y.round() as i32);
+        let (rw, rh) = (
+            layout.logo.width.round().max(1.0) as u32,
+            layout.logo.height.round().max(1.0) as u32,
+        );
+        let art = paint::scaled_brand(rw, rh);
+        let (mut opaque, mut inked, mut clear, mut tissue_kept) = (0usize, 0, 0, 0);
+        for y in 0..rh as i32 {
+            for x in 0..rw as i32 {
+                let a = ((y as u32 * rw + x as u32) * 4) as usize;
+                let at = (((ry + y) * w + (rx + x)) * 4) as usize;
+                let seen = &frame[at..at + 3];
+                match art[a + 3] {
+                    255 => {
+                        opaque += 1;
+                        inked += usize::from(seen == [art[a + 2], art[a + 1], art[a]]);
+                    }
+                    0 => {
+                        clear += 1;
+                        tissue_kept += usize::from(seen == &tissue[at..at + 3]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let area = (rw * rh) as usize;
+        assert!(
+            opaque * 100 >= area * 5 && clear * 100 >= area * 30,
+            "a arte mudou: {opaque} opacos e {clear} transparentes em {area}"
+        );
+        assert!(
+            inked * 100 >= opaque * 99,
+            "a janela nao desenha a marca: so {inked} de {opaque} pixeis opacos da arte"
+        );
+        assert!(
+            tissue_kept * 100 >= clear * 99,
+            "quadrado a volta da marca: so {tissue_kept} de {clear} pixeis transparentes \
+             mostram o tecido"
         );
     }
 }

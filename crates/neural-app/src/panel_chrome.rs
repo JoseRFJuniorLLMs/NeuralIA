@@ -303,14 +303,22 @@ pub enum WheelRoute {
 }
 
 /// A decisao inteira: so com o NeuralIA em primeiro plano, so com um painel a
-/// vista, e so com o cursor dentro dele. Tudo o resto passa intocado.
+/// vista, so com o cursor dentro dele -- e so quando a janela debaixo do
+/// cursor e mesmo a do painel (`hit_is_panel`: o `WindowFromPoint` e o
+/// contentor do painel ou uma filha dele). Uma janela por cima do painel (o
+/// seletor de emojis do Win+., o historico do Win+V, a lista de um <select>
+/// ou o menu de contexto do Chromium, o PiP de outra aplicacao) fica com a
+/// roda dela. Tudo o resto passa intocado.
 pub fn wheel_route(
     point: (i32, i32),
     panel: Option<ScreenRect>,
     app_in_foreground: bool,
+    hit_is_panel: bool,
 ) -> WheelRoute {
     match panel {
-        Some(rect) if app_in_foreground && rect.contains(point.0, point.1) => WheelRoute::Panel,
+        Some(rect) if app_in_foreground && hit_is_panel && rect.contains(point.0, point.1) => {
+            WheelRoute::Panel
+        }
         _ => WheelRoute::PassThrough,
     }
 }
@@ -532,6 +540,43 @@ impl ServicePanelState {
             window_fullscreen: self.fullscreen(),
             exit_button: self.app_fullscreen(),
             resize_handle: self.docked(),
+        }
+    }
+}
+
+/// A tela cheia da JANELA que o painel de servicos pediu. Guarda se foi o
+/// proprio painel que a pos: com o split ja em tela cheia a janela nao muda
+/// ao entrar, e sair da tela cheia do painel nao pode tirar a do split (a
+/// janela voltava a ter moldura com o split a julgar-se em tela cheia, e o
+/// botao dele precisava de dois cliques).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PanelWindowFullscreen {
+    active: bool,
+    owns_window: bool,
+}
+
+impl PanelWindowFullscreen {
+    /// O painel esta (para a janela) em tela cheia.
+    pub fn active(&self) -> bool {
+        self.active
+    }
+
+    /// O painel quer (`wanted`) ou deixou de querer a janela em tela cheia;
+    /// `window_fullscreen` e como a janela esta agora. Devolve o que pedir a
+    /// janela: `Some(true)` entrar, `Some(false)` sair, `None` nada -- so se
+    /// desfaz o que o painel fez.
+    pub fn step(&mut self, wanted: bool, window_fullscreen: bool) -> Option<bool> {
+        match (self.active, wanted) {
+            (false, true) => {
+                self.active = true;
+                self.owns_window = !window_fullscreen;
+                self.owns_window.then_some(true)
+            }
+            (true, false) => {
+                self.active = false;
+                std::mem::take(&mut self.owns_window).then_some(false)
+            }
+            _ => None,
         }
     }
 }
@@ -824,33 +869,33 @@ mod tests {
             bottom: 900,
         };
         assert_eq!(
-            wheel_route((1300, 400), Some(panel), true),
+            wheel_route((1300, 400), Some(panel), true, true),
             WheelRoute::Panel
         );
         assert_eq!(
-            wheel_route((1100, 88), Some(panel), true),
+            wheel_route((1100, 88), Some(panel), true, true),
             WheelRoute::Panel
         );
         // As colunas, a barra e fora da janela: o Windows decide como sempre.
         assert_eq!(
-            wheel_route((1099, 400), Some(panel), true),
+            wheel_route((1099, 400), Some(panel), true, true),
             WheelRoute::PassThrough
         );
         assert_eq!(
-            wheel_route((1300, 87), Some(panel), true),
+            wheel_route((1300, 87), Some(panel), true, true),
             WheelRoute::PassThrough
         );
         assert_eq!(
-            wheel_route((1600, 400), Some(panel), true),
+            wheel_route((1600, 400), Some(panel), true, true),
             WheelRoute::PassThrough
         );
         // Outra aplicacao em primeiro plano, ou nenhum painel a vista.
         assert_eq!(
-            wheel_route((1300, 400), Some(panel), false),
+            wheel_route((1300, 400), Some(panel), false, true),
             WheelRoute::PassThrough
         );
         assert_eq!(
-            wheel_route((1300, 400), None, true),
+            wheel_route((1300, 400), None, true, true),
             WheelRoute::PassThrough
         );
 
@@ -863,6 +908,60 @@ mod tests {
         // Monitor a esquerda do principal: x negativo.
         let (_, lparam) = wheel_message_params(120, 0, -500, 20);
         assert_eq!((lparam & 0xffff) as u16 as i16, -500);
+    }
+
+    #[test]
+    fn a_window_over_the_panel_keeps_its_own_wheel() {
+        // O gancho so via o retangulo do painel: o seletor de emojis (Win+.)
+        // aberto a partir da caixa do WhatsApp, a lista de um <select>, o menu
+        // de contexto do Chromium ou o PiP de outra aplicacao por cima do
+        // painel perdiam a roda para a pagina de tras.
+        let panel = ScreenRect {
+            left: 1100,
+            top: 88,
+            right: 1600,
+            bottom: 900,
+        };
+        for point in [(1300, 400), (1100, 88), (1599, 899)] {
+            assert_eq!(
+                wheel_route(point, Some(panel), true, false),
+                WheelRoute::PassThrough,
+                "em {point:?} a janela de cima perdeu a roda"
+            );
+            assert_eq!(
+                wheel_route(point, Some(panel), true, true),
+                WheelRoute::Panel
+            );
+        }
+    }
+
+    #[test]
+    fn leaving_the_panel_fullscreen_undoes_only_what_the_panel_did() {
+        // Janela com moldura: o painel pede tela cheia e devolve-a ao sair.
+        let mut own = PanelWindowFullscreen::default();
+        assert!(!own.active());
+        assert_eq!(own.step(true, false), Some(true));
+        assert!(own.active());
+        assert_eq!(own.step(true, true), None, "aviso repetido");
+        assert_eq!(own.step(false, true), Some(false));
+        assert!(!own.active());
+        assert_eq!(own.step(false, false), None);
+
+        // O split ja estava em tela cheia: entrar e sair nao mexe na janela.
+        let mut split = PanelWindowFullscreen::default();
+        assert_eq!(split.step(true, true), None);
+        assert!(split.active());
+        assert_eq!(
+            split.step(false, true),
+            None,
+            "sair do YouTube tirou a tela cheia do split"
+        );
+        assert!(!split.active());
+
+        // Depois disso, uma tela cheia nova numa janela com moldura volta a
+        // ser do painel.
+        assert_eq!(split.step(true, false), Some(true));
+        assert_eq!(split.step(false, true), Some(false));
     }
 
     #[test]

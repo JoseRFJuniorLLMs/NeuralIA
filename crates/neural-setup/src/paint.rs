@@ -477,7 +477,7 @@ static SCALED_BRAND: Mutex<ScaledBrand> = Mutex::new(None);
 /// redimensionar 1200x868 com Lanczos a 30 quadros por segundo era o que mais
 /// custava a cada pintura. Pre-multiplica-se ANTES de reduzir: a cor dos
 /// pixeis transparentes nao se ve, e sem isto escorria para a orla da marca.
-fn scaled_brand(width: u32, height: u32) -> Arc<Vec<u8>> {
+pub(crate) fn scaled_brand(width: u32, height: u32) -> Arc<Vec<u8>> {
     let mut cache = SCALED_BRAND.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((w, h, pixels)) = cache.as_ref()
         && (*w, *h) == (width, height)

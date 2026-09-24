@@ -27,10 +27,11 @@ use crate::ipc::constant_time_eq;
 use crate::ipc::{ColumnHint, IpcAction, parse_ipc_message};
 use crate::panel_chrome::{
     Area, CAPTION_HOT_MARGIN, CaptionReveal, EXIT_PAGE_FULLSCREEN_SCRIPT, PANEL_HANDLE_WIDTH,
-    PANEL_WIDTHS_FILE, PanelKind, PanelWidths, RevealStep, SERVICE_STRIP_HEIGHT, ScreenRect,
-    ServiceBadge, ServiceEffect, ServiceFrame, ServiceInput, ServicePanelState, StripButton,
-    WheelRoute, caption_hot_zone, is_escape_down, panel_area, panel_handle_area, panel_width,
-    panel_width_from_drag, strip_buttons, strip_hit, wheel_message_params, wheel_route,
+    PANEL_WIDTHS_FILE, PanelKind, PanelWidths, PanelWindowFullscreen, RevealStep,
+    SERVICE_STRIP_HEIGHT, ScreenRect, ServiceBadge, ServiceEffect, ServiceFrame, ServiceInput,
+    ServicePanelState, StripButton, WheelRoute, caption_hot_zone, is_escape_down, panel_area,
+    panel_handle_area, panel_width, panel_width_from_drag, strip_buttons, strip_hit,
+    wheel_message_params, wheel_route,
 };
 use crate::tab_session::{self, Loaded, SessionColumn, SessionGroup, SessionTab, TabSession};
 use neural_core::{
@@ -3513,9 +3514,19 @@ fn panel_window_at(host: HWND, point: POINT) -> Option<HWND> {
     Some(current)
 }
 
+/// A janela `hit` (a que o Windows ve debaixo do cursor) e o contentor do
+/// painel ou uma descendente dele -- e nao uma janela por cima do painel: um
+/// popup do Chromium (lista de um <select>, menu de contexto), o seletor de
+/// emojis, o historico da area de transferencia, outra aplicacao.
+fn wheel_hit_in_panel(host: HWND, hit: HWND) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsChild;
+    !host.is_null() && !hit.is_null() && (hit == host || unsafe { IsChild(host, hit) } != 0)
+}
+
 unsafe extern "system" fn wheel_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, HC_ACTION, MSLLHOOKSTRUCT, PostMessageW, WM_MOUSEHWHEEL, WM_MOUSEWHEEL,
+        WindowFromPoint,
     };
     let message = wparam as u32;
     if code == HC_ACTION as i32
@@ -3525,9 +3536,15 @@ unsafe extern "system" fn wheel_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
         let info = &*(lparam as *const MSLLHOOKSTRUCT);
         let app = WHEEL_APP_HWND.load(Ordering::Acquire) as HWND;
         let foreground = !app.is_null() && GetForegroundWindow() == app;
-        if wheel_route((info.pt.x, info.pt.y), wheel_panel_rect(), foreground) == WheelRoute::Panel
-            && let Some(target) =
-                panel_window_at(WHEEL_PANEL_HOST.load(Ordering::Acquire) as HWND, info.pt)
+        let host = WHEEL_PANEL_HOST.load(Ordering::Acquire) as HWND;
+        let panel = wheel_panel_rect();
+        // So se pergunta ao Windows quem esta debaixo do cursor quando o
+        // resto ja apontava para o painel: fora dele o gancho nao gasta nada.
+        let hit_is_panel = foreground
+            && panel.is_some_and(|rect| rect.contains(info.pt.x, info.pt.y))
+            && wheel_hit_in_panel(host, WindowFromPoint(info.pt));
+        if wheel_route((info.pt.x, info.pt.y), panel, foreground, hit_is_panel) == WheelRoute::Panel
+            && let Some(target) = panel_window_at(host, info.pt)
         {
             let delta = (info.mouseData >> 16) as u16 as i16;
             let (w, l) = wheel_message_params(delta, wheel_key_state(), info.pt.x, info.pt.y);
@@ -4874,6 +4891,44 @@ fn history_nav_target(
 
 /// Os botoes da janela do proprio app aparecem sempre que a moldura do Windows
 /// nao esta la: na Home e no comparador (com a barra).
+/// Os tres botoes da janela (minimizar, maximizar, fechar) juntos, em pixels
+/// do cliente, tal como a barra os desenha.
+fn caption_area(layout: &BarLayout) -> Area {
+    let left = layout.window_minimize.x;
+    let right = layout.window_close.x + layout.window_close.width;
+    Area {
+        x: left,
+        y: 0.0,
+        width: (right - left).max(1.0),
+        height: layout.window_close.height.max(1.0),
+    }
+}
+
+/// Os botoes da janela na Home: sem barra do comparador, mas no mesmo sitio
+/// que nela -- a geometria so depende da largura e da escala.
+fn home_caption_rect(client_width: f64, scale: f64) -> Area {
+    caption_area(&BarLayout::with_rows(
+        client_width,
+        scale,
+        true,
+        BarColumns::even(COMPARATOR_COLUMNS),
+        [TabRow::empty(); COMPARATOR_COLUMNS],
+    ))
+}
+
+/// Onde comecam os paineis da direita (Ctrl+H, servicos, Gemini Live), em
+/// pixels logicos. No comparador, abaixo da barra. Na Home, abaixo da fila dos
+/// botoes da janela: com o painel a comecar no topo, a WebView dele tapava a
+/// zona que os acorda, a janela principal nunca via o rato la e minimizar,
+/// maximizar e fechar ficavam impossiveis de encontrar com o painel aberto.
+fn right_panel_top(surface: Surface) -> f64 {
+    match surface {
+        Surface::Comparator => COMPARATOR_CHROME_HEIGHT,
+        Surface::Home => TITLE_TAB_HEIGHT,
+        _ => 0.0,
+    }
+}
+
 fn caption_buttons_wanted(surface: Surface, bar_visible: bool) -> bool {
     match surface {
         Surface::Home => true,
@@ -4884,11 +4939,40 @@ fn caption_buttons_wanted(surface: Surface, bar_visible: bool) -> bool {
 
 /// Se os botoes da janela se veem agora. No comparador fazem parte da barra e
 /// estao sempre la; na Home so com o rato perto (pedido do dono: "nao quero
-/// os botoes visiveis so quando mover o mouse na direcao deles").
-fn caption_buttons_visible(surface: Surface, revealed: bool) -> bool {
+/// os botoes visiveis so quando mover o mouse na direcao deles"). Com o
+/// painel de servicos a cobrir a janela (tela cheia do YouTube, "Tela cheia"
+/// da faixa) nao se veem em lado nenhum: ficavam no canto do video e o x
+/// apanhava o clique de quem queria o video -- e fechava a NeuralIA.
+fn caption_buttons_visible(surface: Surface, revealed: bool, panel_covers_window: bool) -> bool {
+    if panel_covers_window {
+        return false;
+    }
     match surface {
         Surface::Home => revealed,
         _ => true,
+    }
+}
+
+/// Poe o controlo dos botoes da janela no sitio. A vista vai para o topo dos
+/// irmaos (por cima das WebViews, que nascem depois dele); escondido nao muda
+/// de lugar na ordem Z -- sem o SWP_NOZORDER, cada Resized ou regresso do
+/// foco punha-o por cima do painel em tela cheia.
+fn place_caption_buttons(buttons: HWND, x: i32, width: i32, height: i32, visible: bool) {
+    let z = if visible { 0 } else { SWP_NOZORDER };
+    unsafe {
+        SetWindowPos(
+            buttons,
+            std::ptr::null_mut(),
+            x,
+            0,
+            width,
+            height,
+            SWP_NOACTIVATE | z,
+        );
+        // SW_SHOWNOACTIVATE: mostrar os botoes nunca rouba o foco a quem
+        // esta a escrever.
+        ShowWindow(buttons, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+        InvalidateRect(buttons, std::ptr::null(), 1);
     }
 }
 
@@ -4920,6 +5004,55 @@ fn column_hint_text(hint: ColumnHint, provider: &str) -> String {
     }
 }
 
+/// A dica centrada que um controlo injetado pediu: da coluna `col`, e o
+/// numero do pedido de dica (`hover_tooltip`) que a agendou.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ColumnHintOwner {
+    col: usize,
+    request: u64,
+}
+
+/// O que fazer com uma dica pedida por uma coluna.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnHintStep {
+    /// O rato entrou num controlo: mostrar a dica dele.
+    Show,
+    /// O rato saiu e a dica a vista ainda e a dele: apaga-la.
+    Clear,
+    /// O "none" chegou atrasado: a dica a vista ja e de outro (a barra, a
+    /// pega do painel, outra coluna). Fica.
+    Keep,
+}
+
+/// O "none" (o rato saiu do controlo) atravessa pagina, browser e anfitriao
+/// e chega muitas vezes DEPOIS do WM_MOUSEMOVE da janela, quando o rato vai
+/// do "−"/"⛶" direto para a barra ou para a pega. Apagar sempre apagava a
+/// dica da barra, que so e pedida quando o alvo muda e ja nao voltava. So se
+/// apaga a dica que ainda e desta coluna e que ninguem substituiu desde
+/// entao (`latest_request` e o numero do ultimo pedido de dica).
+fn column_hint_step(
+    owner: Option<ColumnHintOwner>,
+    col: usize,
+    hint: ColumnHint,
+    latest_request: u64,
+) -> ColumnHintStep {
+    match hint {
+        ColumnHint::Minimize | ColumnHint::Expand => ColumnHintStep::Show,
+        ColumnHint::None => {
+            if owner
+                == Some(ColumnHintOwner {
+                    col,
+                    request: latest_request,
+                })
+            {
+                ColumnHintStep::Clear
+            } else {
+                ColumnHintStep::Keep
+            }
+        }
+    }
+}
+
 /// Os tres botoes da janela, na ordem em que `native_button_index` os conta.
 fn caption_tooltip_label(index: usize, maximized: bool) -> &'static str {
     match index {
@@ -4930,10 +5063,20 @@ fn caption_tooltip_label(index: usize, maximized: bool) -> &'static str {
     }
 }
 
+/// Quantas vezes `hover_tooltip` foi chamada: cada chamada substitui a dica
+/// anterior, seja de quem for.
+static TOOLTIP_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+fn latest_tooltip_request() -> u64 {
+    TOOLTIP_REQUESTS.load(Ordering::Acquire)
+}
+
 /// O rato entrou num alvo com dica `text`, ou saiu de todos (""). Esconde a
-/// dica que estiver a vista e, se houver texto, agenda a nova.
-fn hover_tooltip(window: HWND, text: &str) {
+/// dica que estiver a vista e, se houver texto, agenda a nova. Devolve o
+/// numero deste pedido.
+fn hover_tooltip(window: HWND, text: &str) -> u64 {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, KillTimer, SetTimer};
+    let request = TOOLTIP_REQUESTS.fetch_add(1, Ordering::AcqRel) + 1;
     hide_tooltip();
     let timer = TOOLTIP_TIMER.swap(0, Ordering::AcqRel);
     if timer != 0 {
@@ -4946,7 +5089,7 @@ fn hover_tooltip(window: HWND, text: &str) {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if window.is_null() || text.is_empty() {
         *pending = None;
-        return;
+        return request;
     }
     let root = unsafe { GetAncestor(window, GA_ROOT) };
     *pending = Some((root as usize, text.to_string()));
@@ -4960,6 +5103,7 @@ fn hover_tooltip(window: HWND, text: &str) {
         )
     };
     TOOLTIP_TIMER.store(id, Ordering::Release);
+    request
 }
 
 unsafe extern "system" fn tooltip_timer(_hwnd: HWND, _message: u32, id: usize, _time: u32) {
@@ -6894,9 +7038,12 @@ struct App {
     /// Numero do ultimo painel de servicos aberto: os avisos do WebView2 de
     /// um painel ja fechado chegam com o numero dele e caem.
     service_generation: u64,
-    /// A janela esta em tela cheia por causa do painel de servicos (e so
-    /// entao este a devolve ao sair).
-    panel_window_fullscreen: bool,
+    /// A tela cheia da janela pedida pelo painel de servicos, e se foi ele
+    /// que a pos (so entao a devolve ao sair).
+    panel_window_fullscreen: PanelWindowFullscreen,
+    /// De que coluna e a dica centrada pedida por um controlo injetado (o
+    /// "none" atrasado de uma coluna so apaga a dica dela).
+    column_hint: Option<ColumnHintOwner>,
     /// Larguras escolhidas para os paineis da direita, gravadas em
     /// `<data_dir>/panel-width.json`.
     panel_widths: PanelWidths,
@@ -7002,7 +7149,8 @@ impl App {
             panel_suggestion_query: None,
             service_panel: None,
             service_generation: 0,
-            panel_window_fullscreen: false,
+            panel_window_fullscreen: PanelWindowFullscreen::default(),
+            column_hint: None,
             panel_widths,
             panel_handle: None,
             tab_session,
@@ -10525,23 +10673,16 @@ impl App {
         };
         // Na Home nao ha barra do comparador, mas os botoes da janela ficam no
         // mesmo sitio: a geometria deles so depende da largura.
-        let layout = match self.bar_layout() {
-            Some(layout) if self.surface == Surface::Comparator => layout,
-            _ => BarLayout::with_rows(
-                window.inner_size().width as f64,
-                window.scale_factor(),
-                true,
-                BarColumns::even(COMPARATOR_COLUMNS),
-                [TabRow::empty(); COMPARATOR_COLUMNS],
-            ),
+        let area = match self.bar_layout() {
+            Some(layout) if self.surface == Surface::Comparator => caption_area(&layout),
+            _ => home_caption_rect(window.inner_size().width as f64, window.scale_factor()),
         };
         let Some(owner) = window_hwnd(window) else {
             return;
         };
-        let left = layout.window_minimize.x;
-        let right = layout.window_close.x + layout.window_close.width;
-        let width = (right - left).max(1.0);
-        let height = layout.window_close.height.max(1.0);
+        let left = area.x;
+        let width = area.width;
+        let height = area.height;
 
         if let Some(buttons) = self.caption_buttons
             && unsafe { GetParent(buttons) } != owner
@@ -10552,7 +10693,11 @@ impl App {
             self.caption_buttons = None;
         }
 
-        let visible = caption_buttons_visible(self.surface, self.caption_reveal.shown());
+        let visible = caption_buttons_visible(
+            self.surface,
+            self.caption_reveal.shown(),
+            self.service_covers_window(),
+        );
         if self.caption_buttons.is_none() {
             unsafe {
                 // Nasce escondida na Home: aparecer e desaparecer logo a
@@ -10594,42 +10739,23 @@ impl App {
         }
 
         if let Some(buttons) = self.caption_buttons {
-            unsafe {
-                SetWindowPos(
-                    buttons,
-                    std::ptr::null_mut(),
-                    left.round() as i32,
-                    0,
-                    width.round() as i32,
-                    height.round() as i32,
-                    SWP_NOACTIVATE,
-                );
-                // SW_SHOWNOACTIVATE: mostrar os botoes nunca rouba o foco a
-                // quem esta a escrever.
-                ShowWindow(buttons, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
-                InvalidateRect(buttons, std::ptr::null(), 1);
-            }
+            place_caption_buttons(
+                buttons,
+                left.round() as i32,
+                width.round() as i32,
+                height.round() as i32,
+                visible,
+            );
         }
     }
 
     /// Onde estao os tres botoes da janela na Home, em pixels do cliente.
     fn home_caption_area(&self) -> Option<Area> {
         let window = self.window.as_ref()?;
-        let layout = BarLayout::with_rows(
+        Some(home_caption_rect(
             window.inner_size().width as f64,
             window.scale_factor(),
-            true,
-            BarColumns::even(COMPARATOR_COLUMNS),
-            [TabRow::empty(); COMPARATOR_COLUMNS],
-        );
-        let left = layout.window_minimize.x;
-        let right = layout.window_close.x + layout.window_close.width;
-        Some(Area {
-            x: left,
-            y: 0.0,
-            width: (right - left).max(1.0),
-            height: layout.window_close.height.max(1.0),
-        })
+        ))
     }
 
     /// Na Home: os botoes aparecem quando o rato entra na zona deles e
@@ -11028,18 +11154,30 @@ impl App {
 
     /// A dica centrada de um controlo injetado numa coluna. O texto e o nome
     /// da IA saem daqui; a pagina so disse qual dos controlos tem o rato.
-    fn show_column_hint(&self, col: usize, hint: ColumnHint) {
+    fn show_column_hint(&mut self, col: usize, hint: ColumnHint) {
         let Some(owner) = self.window.as_ref().and_then(window_hwnd) else {
             return;
         };
-        let provider = self
-            .comparator
-            .as_ref()
-            .filter(|_| self.surface == Surface::Comparator)
-            .and_then(|comp| comp.views.get(col))
-            .map(|view| view.name);
-        let text = provider.map_or(String::new(), |name| column_hint_text(hint, name));
-        hover_tooltip(owner, &text);
+        match column_hint_step(self.column_hint, col, hint, latest_tooltip_request()) {
+            ColumnHintStep::Show => {
+                let Some(provider) = self
+                    .comparator
+                    .as_ref()
+                    .filter(|_| self.surface == Surface::Comparator)
+                    .and_then(|comp| comp.views.get(col))
+                    .map(|view| view.name)
+                else {
+                    return;
+                };
+                let request = hover_tooltip(owner, &column_hint_text(hint, provider));
+                self.column_hint = Some(ColumnHintOwner { col, request });
+            }
+            ColumnHintStep::Clear => {
+                hover_tooltip(owner, "");
+                self.column_hint = None;
+            }
+            ColumnHintStep::Keep => {}
+        }
     }
 
     fn update_bar_hover(&mut self) {
@@ -11139,34 +11277,35 @@ impl App {
             return;
         }
         debug_log(format_args!("service panel: fechado"));
-        if std::mem::take(&mut self.panel_window_fullscreen)
+        let window_fullscreen = self
+            .window
+            .as_ref()
+            .is_some_and(|window| window.fullscreen().is_some());
+        if let Some(on) = self.panel_window_fullscreen.step(false, window_fullscreen)
             && let Some(window) = &self.window
         {
-            window.set_fullscreen(None);
+            window.set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
         }
         self.fit_comparator_to_panel();
         self.sync_comparator_splitters();
         self.sync_exit_button();
+        self.sync_caption_buttons();
         self.after_panel_change();
         self.needs_clear = true;
         self.request_redraw();
     }
 
-    /// A janela em pixels logicos e o topo dos paineis da direita (abaixo da
-    /// barra no comparador, do topo fora dele).
+    /// A janela em pixels logicos e o topo dos paineis da direita
+    /// (`right_panel_top`: abaixo da barra no comparador, abaixo dos botoes
+    /// da janela na Home).
     fn panel_space(&self) -> Option<(f64, f64, f64, f64)> {
         let window = self.window.as_ref()?;
         let scale = window.scale_factor().max(1.0);
         let size = window.inner_size();
-        let top = if self.surface == Surface::Comparator {
-            COMPARATOR_CHROME_HEIGHT
-        } else {
-            0.0
-        };
         Some((
             size.width as f64 / scale,
             size.height as f64 / scale,
-            top,
+            right_panel_top(self.surface),
             scale,
         ))
     }
@@ -11251,21 +11390,33 @@ impl App {
     /// janela, painel, colunas, divisores, "Sair", pega e roda.
     fn apply_service_frame(&mut self) {
         let fullscreen = self.service_covers_window();
-        if fullscreen != self.panel_window_fullscreen {
-            self.panel_window_fullscreen = fullscreen;
-            if let Some(window) = &self.window {
-                window.set_fullscreen(fullscreen.then_some(Fullscreen::Borderless(None)));
-            }
-            // Em tela cheia o teclado vai para o painel: o Esc (e as teclas
-            // do proprio video) chegam a ele e nao a uma coluna escondida.
-            if fullscreen && let Some(panel) = &self.service_panel {
-                let _ = panel.webview.focus();
-            }
+        let entering = fullscreen && !self.panel_window_fullscreen.active();
+        let window_fullscreen = self
+            .window
+            .as_ref()
+            .is_some_and(|window| window.fullscreen().is_some());
+        // So se desfaz o que o painel fez: com o split ja em tela cheia, sair
+        // do YouTube deixa a janela como o split a quer.
+        if let Some(on) = self
+            .panel_window_fullscreen
+            .step(fullscreen, window_fullscreen)
+            && let Some(window) = &self.window
+        {
+            window.set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
+        }
+        // Em tela cheia o teclado vai para o painel: o Esc (e as teclas do
+        // proprio video) chegam a ele e nao a uma coluna escondida.
+        if entering && let Some(panel) = &self.service_panel {
+            let _ = panel.webview.focus();
         }
         self.position_service_panel();
         self.fit_comparator_to_panel();
         self.sync_comparator_splitters();
         self.sync_exit_button();
+        // Os botoes da janela saem da frente do painel em tela cheia e voltam
+        // ao sair -- tambem quando a janela ja estava em tela cheia e nao ha
+        // Resized nenhum a sincroniza-los.
+        self.sync_caption_buttons();
         self.after_panel_change();
         self.needs_clear = true;
         self.request_redraw();
@@ -15289,27 +15440,7 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
 
-        let mut attributes = Window::default_attributes()
-            .with_title("NeuralIA")
-            // Maximizada a abrir: e um browser, e o comparador de tres colunas
-            // nao cabe com folga em 1120 px. O `inner_size` fica como o tamanho
-            // de restauro, para quem carregar no botao do meio.
-            .with_maximized(true)
-            // Sem a barra do Windows em lado nenhum: a Home e o comparador desenham
-            // os seus proprios botoes da janela (pedido do dono).
-            .with_decorations(false)
-            .with_inner_size(LogicalSize::new(1120.0, 760.0))
-            .with_min_inner_size(LogicalSize::new(700.0, 500.0));
-
-        let (small_icon, big_icon) = app_icons();
-        {
-            use winit::platform::windows::WindowAttributesExtWindows;
-            attributes = attributes
-                .with_window_icon(small_icon)
-                .with_taskbar_icon(big_icon);
-        }
-
-        match event_loop.create_window(attributes) {
+        match event_loop.create_window(main_window_attributes()) {
             Ok(window) => {
                 window.set_ime_allowed(true);
                 self.window = Some(window);
@@ -17673,6 +17804,26 @@ fn app_icons() -> (Option<Icon>, Option<Icon>) {
     (load(small), load(big))
 }
 
+/// A janela principal, tal como o `resumed` a cria: o icone do projeto na
+/// barra de titulo/Alt+Tab (pequeno) e na barra de tarefas (grande).
+fn main_window_attributes() -> winit::window::WindowAttributes {
+    use winit::platform::windows::WindowAttributesExtWindows;
+    let (small_icon, big_icon) = app_icons();
+    Window::default_attributes()
+        .with_title("NeuralIA")
+        // Maximizada a abrir: e um browser, e o comparador de tres colunas nao
+        // cabe com folga em 1120 px. O `inner_size` fica como o tamanho de
+        // restauro, para quem carregar no botao do meio.
+        .with_maximized(true)
+        // Sem a barra do Windows em lado nenhum: a Home e o comparador
+        // desenham os seus proprios botoes da janela (pedido do dono).
+        .with_decorations(false)
+        .with_inner_size(LogicalSize::new(1120.0, 760.0))
+        .with_min_inner_size(LogicalSize::new(700.0, 500.0))
+        .with_window_icon(small_icon)
+        .with_taskbar_icon(big_icon)
+}
+
 /// A marca, misturada com o que estiver por tras dela.
 ///
 /// Antes compunha-se o alfa da arte contra a cor da pagina e blitava-se um
@@ -18924,13 +19075,385 @@ mod tests {
     /// "esconder 300 ms depois" e `CaptionReveal` (panel_chrome).
     #[test]
     fn home_window_buttons_show_only_once_revealed_and_the_bar_keeps_them() {
-        assert!(!caption_buttons_visible(Surface::Home, false));
-        assert!(caption_buttons_visible(Surface::Home, true));
-        assert!(caption_buttons_visible(Surface::Comparator, false));
+        assert!(!caption_buttons_visible(Surface::Home, false, false));
+        assert!(caption_buttons_visible(Surface::Home, true, false));
+        assert!(caption_buttons_visible(Surface::Comparator, false, false));
         let mut reveal = CaptionReveal::default();
-        assert!(!caption_buttons_visible(Surface::Home, reveal.shown()));
+        assert!(!caption_buttons_visible(
+            Surface::Home,
+            reveal.shown(),
+            false
+        ));
         assert_eq!(reveal.observe(true, 0), RevealStep::Show);
-        assert!(caption_buttons_visible(Surface::Home, reveal.shown()));
+        assert!(caption_buttons_visible(
+            Surface::Home,
+            reveal.shown(),
+            false
+        ));
+    }
+
+    /// Em tela cheia do painel de servicos (o botao do YouTube ou o "Tela
+    /// cheia" da faixa) os botoes da janela nao se veem: o `sync_caption_buttons`
+    /// que corre a cada Resized e a cada regresso do foco punha-os por cima do
+    /// video, no canto, e o x fechava a NeuralIA. O modo vem da mesma maquina
+    /// de estados que poe o painel por cima de tudo (`service_covers_window`).
+    #[test]
+    fn the_window_buttons_stay_hidden_under_the_fullscreen_service_panel() {
+        let covers = |state: &ServicePanelState| {
+            state
+                .frame(560.0, 1600.0, 900.0, COMPARATOR_CHROME_HEIGHT, 34.0)
+                .window_fullscreen
+        };
+        let mut state = ServicePanelState::default();
+        assert!(caption_buttons_visible(
+            Surface::Comparator,
+            false,
+            covers(&state)
+        ));
+        for enter in [
+            ServiceInput::PageFullscreen(true),
+            ServiceInput::ToggleFullscreen,
+        ] {
+            state.step(enter);
+            assert!(covers(&state));
+            for (surface, revealed) in [
+                (Surface::Comparator, false),
+                (Surface::Comparator, true),
+                (Surface::Home, true),
+            ] {
+                assert!(
+                    !caption_buttons_visible(surface, revealed, covers(&state)),
+                    "{surface:?}: os botoes voltaram por cima do painel em tela cheia"
+                );
+            }
+            state.step(ServiceInput::Escape);
+            if state.fullscreen() {
+                state.step(ServiceInput::PageFullscreen(false));
+            }
+            assert!(state.docked());
+            assert!(caption_buttons_visible(
+                Surface::Comparator,
+                false,
+                covers(&state)
+            ));
+        }
+        // Minimizado o painel nao cobre nada: a barra mantem os botoes.
+        state.step(ServiceInput::Minimize);
+        assert!(caption_buttons_visible(
+            Surface::Comparator,
+            false,
+            covers(&state)
+        ));
+    }
+
+    /// Escondido, o controlo dos botoes nao sobe na ordem Z: sem isto cada
+    /// Resized ou regresso do foco o punha por cima do painel que acabou de
+    /// ser levantado. A vista, sobe (tem de ficar por cima das WebViews, que
+    /// nascem depois dele). Janelas reais, escondidas, com o `place` que embarca.
+    #[test]
+    fn hidden_caption_buttons_keep_their_place_under_the_raised_panel() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GW_CHILD, GetWindow, HWND_TOP, SWP_NOMOVE, SWP_NOSIZE,
+        };
+        unsafe {
+            let parent = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!(""),
+                WS_POPUP,
+                0,
+                0,
+                400,
+                300,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!parent.is_null());
+            let child = |x: i32| {
+                CreateWindowExW(
+                    0,
+                    windows_sys::w!("STATIC"),
+                    windows_sys::w!(""),
+                    WS_CHILD | WS_VISIBLE,
+                    x,
+                    0,
+                    100,
+                    40,
+                    parent,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            };
+            let buttons = child(260);
+            let panel = child(0);
+            assert!(!buttons.is_null() && !panel.is_null());
+            // O painel em tela cheia sobe por cima de todos os irmaos.
+            SetWindowPos(
+                panel,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            let top_after_raise = GetWindow(parent, GW_CHILD);
+            place_caption_buttons(buttons, 262, 138, 32, false);
+            let top_hidden = GetWindow(parent, GW_CHILD);
+            place_caption_buttons(buttons, 262, 138, 32, true);
+            let top_shown = GetWindow(parent, GW_CHILD);
+            DestroyWindow(parent);
+            assert_eq!(top_after_raise, panel);
+            assert_eq!(
+                top_hidden, panel,
+                "os botoes escondidos subiram por cima do painel"
+            );
+            assert_eq!(top_shown, buttons, "a vista, os botoes ficam por cima");
+        }
+    }
+
+    /// Na Home, o painel do Ctrl+H (e o de servicos, e o Gemini Live) comecava
+    /// no topo da janela e a WebView dele tapava a zona que acorda os botoes:
+    /// a janela principal nunca via o rato la e minimizar, maximizar e fechar
+    /// nao se encontravam com o painel aberto. Com a geometria que embarca
+    /// (botoes da Home, topo dos paineis, largura escolhida ou de sempre), em
+    /// larguras e escalas reais, os botoes inteiros ficam fora do painel.
+    #[test]
+    fn the_home_panels_leave_the_window_buttons_reachable() {
+        let mut layouts = 0;
+        for width in [1024.0, 1280.0, 1366.0, 1600.0, 1920.0, 2560.0, 3840.0] {
+            for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+                let buttons = home_caption_rect(width, scale);
+                let logical_w = width / scale;
+                let logical_h = 1080.0 / scale;
+                let top = right_panel_top(Surface::Home);
+                let mut panels = Vec::new();
+                for kind in [PanelKind::History, PanelKind::Service] {
+                    for chosen in [None, Some(300.0), Some(100_000.0)] {
+                        let (x, y, w, h) = panel_bounds(kind, chosen, logical_w, logical_h, top);
+                        panels.push(Area {
+                            x,
+                            y,
+                            width: w,
+                            height: h,
+                        });
+                    }
+                }
+                let service = ServicePanelState::default()
+                    .frame(
+                        panel_width(PanelKind::Service, None, logical_w),
+                        logical_w,
+                        logical_h,
+                        top,
+                        0.0,
+                    )
+                    .panel
+                    .expect("painel encostado");
+                panels.push(service);
+                for panel in panels {
+                    // Pixels do cliente, como os botoes.
+                    let panel_top = panel.y * scale;
+                    let overlaps_x = panel.x * scale < buttons.x + buttons.width
+                        && buttons.x < (panel.x + panel.width) * scale;
+                    assert!(overlaps_x, "o painel esta encostado a direita");
+                    assert!(
+                        buttons.y + buttons.height <= panel_top + 0.5,
+                        "{width}x{scale}: o painel (topo {panel_top}) tapa os botoes \
+                         (ate {})",
+                        buttons.y + buttons.height
+                    );
+                    // E o rato que chega aos botoes esta na zona que os acorda.
+                    let zone = caption_hot_zone(buttons, CAPTION_HOT_MARGIN * scale);
+                    let center = (
+                        buttons.x + buttons.width / 2.0,
+                        buttons.y + buttons.height / 2.0,
+                    );
+                    assert!(zone.contains(center.0, center.1));
+                    assert!(center.1 < panel_top);
+                    layouts += 1;
+                }
+            }
+        }
+        assert_eq!(layouts, 7 * 5 * 7);
+        // No comparador continua abaixo da barra inteira.
+        assert_eq!(
+            right_panel_top(Surface::Comparator),
+            COMPARATOR_CHROME_HEIGHT
+        );
+    }
+
+    /// A roda so vai para o painel quando a janela que o Windows ve debaixo do
+    /// cursor e o contentor do painel ou uma filha dele. Um popup por cima
+    /// (a lista de um <select> e o menu do Chromium sao janelas de topo, so
+    /// "owned"; o seletor de emojis e de outro processo) fica com a roda dele.
+    /// Janelas reais, escondidas, com a funcao que o gancho usa.
+    #[test]
+    fn the_wheel_hook_only_redirects_when_the_panel_is_under_the_cursor() {
+        unsafe {
+            let make = |style: u32, parent: HWND| {
+                CreateWindowExW(
+                    if parent.is_null() {
+                        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+                    } else {
+                        0
+                    },
+                    windows_sys::w!("STATIC"),
+                    windows_sys::w!(""),
+                    style,
+                    0,
+                    0,
+                    100,
+                    100,
+                    parent,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            };
+            let app = make(WS_POPUP, std::ptr::null_mut());
+            let host = make(WS_CHILD, app);
+            let webview = make(WS_CHILD, host);
+            let render = make(WS_CHILD, webview);
+            let column = make(WS_CHILD, app);
+            // Popup "owned" pela janela (como a lista de um <select>): nao e
+            // filha de ninguem.
+            let popup = make(WS_POPUP, app);
+            let other = make(WS_POPUP, std::ptr::null_mut());
+            assert!(
+                [app, host, webview, render, column, popup, other]
+                    .iter()
+                    .all(|hwnd| !hwnd.is_null())
+            );
+            let results = [
+                wheel_hit_in_panel(host, host),
+                wheel_hit_in_panel(host, webview),
+                wheel_hit_in_panel(host, render),
+                wheel_hit_in_panel(host, column),
+                wheel_hit_in_panel(host, popup),
+                wheel_hit_in_panel(host, other),
+                wheel_hit_in_panel(host, app),
+                wheel_hit_in_panel(host, std::ptr::null_mut()),
+                wheel_hit_in_panel(std::ptr::null_mut(), render),
+            ];
+            DestroyWindow(other);
+            DestroyWindow(app);
+            assert_eq!(
+                results,
+                [true, true, true, false, false, false, false, false, false]
+            );
+        }
+        // E so com a janela certa debaixo do cursor a decisao vai para o painel.
+        let panel = ScreenRect {
+            left: 1100,
+            top: 88,
+            right: 1600,
+            bottom: 900,
+        };
+        assert_eq!(
+            wheel_route((1300, 400), Some(panel), true, false),
+            WheelRoute::PassThrough
+        );
+        assert_eq!(
+            wheel_route((1300, 400), Some(panel), true, true),
+            WheelRoute::Panel
+        );
+    }
+
+    /// O "none" de uma coluna (o rato saiu do "−"/"⛶") chega pelo IPC depois
+    /// do WM_MOUSEMOVE da janela quando o rato vai direto para a barra: so
+    /// apaga a dica se ela ainda for dessa coluna e ninguem tiver pedido outra.
+    #[test]
+    fn a_late_none_from_a_column_does_not_erase_another_hint() {
+        let mut owner: Option<ColumnHintOwner> = None;
+        let mut requests = 0u64;
+        // O que o `show_column_hint` faz com cada passo, e o contador de
+        // pedidos de dica de toda a app (`hover_tooltip`).
+        let column = |owner: &mut Option<ColumnHintOwner>,
+                      requests: &mut u64,
+                      col: usize,
+                      hint: ColumnHint| {
+            let step = column_hint_step(*owner, col, hint, *requests);
+            match step {
+                ColumnHintStep::Show => {
+                    *requests += 1;
+                    *owner = Some(ColumnHintOwner {
+                        col,
+                        request: *requests,
+                    });
+                }
+                ColumnHintStep::Clear => {
+                    *requests += 1;
+                    *owner = None;
+                }
+                ColumnHintStep::Keep => {}
+            }
+            step
+        };
+
+        // "−" da coluna 1 e sair dele para a pagina: a dica some.
+        assert_eq!(
+            column(&mut owner, &mut requests, 1, ColumnHint::Minimize),
+            ColumnHintStep::Show
+        );
+        assert_eq!(
+            column(&mut owner, &mut requests, 1, ColumnHint::None),
+            ColumnHintStep::Clear
+        );
+
+        // "⛶" da coluna 1 e direto para a barra: a barra pede a dica dela
+        // (update_bar_hover -> hover_tooltip) antes de o "none" chegar.
+        column(&mut owner, &mut requests, 1, ColumnHint::Expand);
+        requests += 1; // a dica do botao da barra
+        assert_eq!(
+            column(&mut owner, &mut requests, 1, ColumnHint::None),
+            ColumnHintStep::Keep,
+            "o none atrasado apagou a dica da barra"
+        );
+
+        // Da coluna 1 para a coluna 2: o none atrasado da 1 nao apaga a da 2.
+        column(&mut owner, &mut requests, 1, ColumnHint::Minimize);
+        column(&mut owner, &mut requests, 2, ColumnHint::Expand);
+        assert_eq!(
+            column(&mut owner, &mut requests, 1, ColumnHint::None),
+            ColumnHintStep::Keep
+        );
+        assert_eq!(
+            column(&mut owner, &mut requests, 2, ColumnHint::None),
+            ColumnHintStep::Clear
+        );
+        // Sem dica de coluna nenhuma, um none nao mexe em nada.
+        assert_eq!(
+            column(&mut owner, &mut requests, 0, ColumnHint::None),
+            ColumnHintStep::Keep
+        );
+    }
+
+    /// O `resumed` cria a janela com `main_window_attributes`: o icone do
+    /// projeto na barra de titulo/Alt+Tab e na barra de tarefas. Sem os
+    /// `with_window_icon`/`with_taskbar_icon` a janela ficava com o icone
+    /// generico do Windows e nenhum outro teste reparava.
+    #[test]
+    fn the_main_window_is_created_with_the_project_icons() {
+        let attributes = main_window_attributes();
+        assert!(
+            attributes.window_icon.is_some(),
+            "a barra de titulo e o Alt+Tab ficaram sem o icone"
+        );
+        // O icone da barra de tarefas vive nos atributos so do Windows, que o
+        // winit nao expoe; o Debug deles mostra-o.
+        let text = format!("{attributes:?}");
+        let taskbar = text
+            .split("taskbar_icon: ")
+            .nth(1)
+            .expect("atributos do Windows no Debug");
+        assert!(
+            taskbar.starts_with("Some("),
+            "a barra de tarefas ficou sem o icone: {taskbar:.40}"
+        );
+        assert!(!attributes.decorations && attributes.maximized);
     }
 
     #[test]
@@ -22940,6 +23463,125 @@ __drain();
         let source = include_str!("windows_app.rs");
         let forbidden = ["with_hotkeys_zoom(", "true)"].concat();
         assert!(!source.contains(&forbidden));
+    }
+
+    /// Ctrl+roda e pinca por cima de um iframe (previa de artefacto do Claude,
+    /// canvas do Gemini, YouTube/Maps embutido) nao faziam nada: a roda nao
+    /// atravessa o frame e o mapa de teclas so vive no documento principal. O
+    /// mapa que embarca corre duas vezes no Node: no frame filho (so
+    /// reencaminha, sem token nem canal) e no principal, que recebe o que o
+    /// filho mandou e publica os mesmos zoomin/zoomout, lidos pelo parser
+    /// nativo.
+    #[test]
+    fn ctrl_wheel_over_a_frame_zooms_through_the_top_keymap() {
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let child_drive = r#"
+const __sent = [];
+window.top.postMessage = function (message, origin) { __sent.push([message, origin]); };
+document.readyState = 'interactive';
+__fire('DOMContentLoaded');
+__drain();
+__fire('wheel', { ctrlKey: true, deltaY: -100, deltaMode: 0 });
+__fire('wheel', { ctrlKey: false, deltaY: -100, deltaMode: 0 });
+__fire('wheel', { ctrlKey: true, deltaY: -100, deltaMode: 0, isTrusted: false });
+__fire('wheel', { ctrlKey: true, deltaY: -100, deltaMode: 0, defaultPrevented: true });
+__fire('wheel', { ctrlKey: true, deltaY: 3, deltaMode: 1 });
+__drain();
+for (const [message, origin] of __sent) {
+  __created.push('fwd ' + origin + ' ' + JSON.stringify(message));
+}
+"#;
+        let keymap = NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", CAP);
+        let child = [serde_json::json!({
+            "name": "child frame",
+            "href": "https://claude.site/artifacts/1",
+            "child": true,
+            "script": keymap,
+            "drive": child_drive,
+        })];
+        let program = format!(
+            "const INPUT = {};\n{}",
+            serde_json::json!({ "cases": child }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        let errors = &results[0]["errors"];
+        assert_eq!(errors.as_array().map(Vec::len), Some(0), "erros: {errors}");
+        // O frame filho nunca fala com o nativo: nem token, nem canal.
+        assert_eq!(
+            results[0]["posted"].as_array().map(Vec::len),
+            Some(0),
+            "o frame filho publicou no canal: {}",
+            results[0]["posted"]
+        );
+        let forwarded: Vec<serde_json::Value> = results[0]["created"]
+            .as_array()
+            .expect("created")
+            .iter()
+            .filter_map(|line| line.as_str()?.strip_prefix("fwd * "))
+            .map(|json| serde_json::from_str(json).expect("mensagem reencaminhada"))
+            .collect();
+        // So os dois gestos do utilizador com Ctrl que a pagina do frame nao
+        // tratou: nada sem Ctrl, sintetico ou com preventDefault.
+        assert_eq!(
+            forwarded,
+            vec![
+                serde_json::json!({ "neuraliaWheelZoom": 1, "dy": -100, "mode": 0 }),
+                serde_json::json!({ "neuraliaWheelZoom": 1, "dy": 3, "mode": 1 }),
+            ]
+        );
+
+        // O documento principal recebe-os de um frame dele e publica o zoom;
+        // o mesmo dado vindo da propria janela, de outra janela ou torto cai.
+        let top_drive = format!(
+            r#"
+document.readyState = 'interactive';
+__fire('DOMContentLoaded');
+__drain();
+const frame = {{ top: window }};
+const DATA = {data};
+for (const data of DATA) __fire('message', {{ data, source: frame }});
+__fire('message', {{ data: DATA[0], source: window }});
+__fire('message', {{ data: DATA[0], source: {{ top: {{}} }} }});
+__fire('message', {{ data: DATA[0], source: null }});
+__fire('message', {{ data: {{ neuraliaWheelZoom: 1, dy: 'x', mode: 0 }}, source: frame }});
+__fire('message', {{ data: 'neuraliaWheelZoom', source: frame }});
+__drain();
+"#,
+            data = serde_json::Value::Array(forwarded)
+        );
+        let top = [serde_json::json!({
+            "name": "top frame",
+            "href": "https://claude.ai/chat/1",
+            "script": keymap,
+            "drive": top_drive,
+        })];
+        let program = format!(
+            "const INPUT = {};\n{}",
+            serde_json::json!({ "cases": top }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        let errors = &results[0]["errors"];
+        assert_eq!(errors.as_array().map(Vec::len), Some(0), "erros: {errors}");
+        let actions: Vec<IpcAction> = results[0]["posted"]
+            .as_array()
+            .expect("posted")
+            .iter()
+            .filter_map(|message| parse_ipc_message(message.as_str()?, CAP, 3))
+            .collect();
+        assert_eq!(
+            actions,
+            vec![IpcAction::ZoomIn, IpcAction::ZoomOut],
+            "um entalhe para cima e uma linha para baixo, vindos do frame"
+        );
+        assert_eq!(
+            results[0]["posted"].as_array().map(Vec::len),
+            Some(2),
+            "o principal so publica o zoom"
+        );
     }
 
     /// O painel do Ctrl+H tinha a barra de rolagem classica do Windows (setas,
@@ -28718,6 +29360,29 @@ const fn rgb3(color: Rgb) -> u32 {
 /// na fase de captura, que se apanham os atalhos antes de o site os consumir.
 const NEURALIA_KEYMAP_SCRIPT: &str = r#"
 (function () {
+  // Frames filhos (a previa de um artefacto do Claude, o canvas do Gemini, um
+  // YouTube ou um Maps embutido): a roda nao atravessa a fronteira do frame, e
+  // ctrl+roda ou a pinca por cima deles nao faziam nada. Aqui nao ha token nem
+  // canal -- so se passa ao documento principal, por postMessage, o giro de um
+  // ctrl+wheel do utilizador que a pagina do frame nao tratou. O principal so
+  // o transforma em zoomin/zoomout (os degraus do app), mais nada.
+  if (window.top === window) return;
+  if (window.__neuralia_wheel_forward) { return; }
+  window.__neuralia_wheel_forward = true;
+  const top = window.top;
+  const later = setTimeout;
+  window.addEventListener('wheel', function (e) {
+    if (!e.isTrusted || !e.ctrlKey) { return; }
+    const wheel = e;
+    later(function () {
+      if (wheel.defaultPrevented) { return; }
+      try {
+        top.postMessage({ neuraliaWheelZoom: 1, dy: Number(wheel.deltaY), mode: Number(wheel.deltaMode) }, '*');
+      } catch (err) {}
+    }, 0);
+  }, { passive: true });
+})();
+(function () {
   // WRY/WebView2 injeta initialization scripts em child frames no Windows.
   // Capability e controles nativos pertencem somente ao documento principal.
   if (window.top !== window) return;
@@ -28907,6 +29572,23 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       if (action) { act(action); }
     }, 0);
   }, { passive: true });
+  // O ctrl+wheel reencaminhado por um frame DESTA pagina (source.top e esta
+  // janela; a propria janela nao conta). Qualquer frame o pode forjar: por
+  // isso daqui so sai um degrau de zoom de cada vez, pelo mesmo acumulador.
+  window.addEventListener('message', function (e) {
+    const data = e.data;
+    if (!data || typeof data !== 'object' || data.neuraliaWheelZoom !== 1) { return; }
+    let fromFrame = false;
+    try { fromFrame = !!e.source && e.source !== window && e.source.top === window; } catch (err) {}
+    if (!fromFrame) { return; }
+    const mode = Number(data.mode);
+    const action = wheelZoomAction({
+      deltaY: Number(data.dy),
+      deltaMode: (mode === 1 || mode === 2) ? mode : 0,
+      timeStamp: e.timeStamp
+    });
+    if (action) { act(action); }
+  });
 })();
 "#;
 
