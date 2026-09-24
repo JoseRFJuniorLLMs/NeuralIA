@@ -11348,8 +11348,12 @@ fn resized_weights_keep_the_total_and_the_minimum() {
 /// flutuavam sobre outras aplicacoes depois de um Alt+Tab.
 #[test]
 fn owned_popups_are_not_topmost() {
-    let source = include_str!("../windows_app.rs");
-    let body = |from: &str, to: &str| {
+    let wap = include_str!("../windows_app.rs");
+    let sc = include_str!("../windows_app/search_card.rs");
+    // show_search_card foi movido para search_card.rs; os outros ainda estao
+    // em windows_app.rs. Concatena os dois para a pesquisa ser uniforme.
+    let source_combined = format!("{wap}\n{sc}");
+    let body = |source: &str, from: &str, to: &str| {
         source
             .split(from)
             .nth(1)
@@ -11360,14 +11364,10 @@ fn owned_popups_are_not_topmost() {
     for (from, to) in [
         ("fn show_splash", "fn position_splash"),
         ("fn show_gmail_toast", "fn position_gmail_toast"),
-        (
-            "fn show_search_card(&mut self, token: u64, intent: SearchIntent, text: &str) {",
-            "fn hide_search_card",
-        ),
         ("fn sync_exit_button", "fn position_exit_button"),
         ("fn sync_comparator_splitters", "fn resize_comparator"),
     ] {
-        let text = body(from, to);
+        let text = body(wap, from, to);
         assert!(
             text.contains("CreateWindowExW"),
             "{from} devia criar a janela"
@@ -11377,6 +11377,20 @@ fn owned_popups_are_not_topmost() {
             "{from} nao pode pousar sobre as outras aplicacoes"
         );
     }
+    // show_search_card mora agora em search_card.rs
+    let sc_text = body(
+        &source_combined,
+        "fn show_search_card(&mut self, token: u64, intent: SearchIntent, text: &str) {",
+        "fn hide_search_card",
+    );
+    assert!(
+        sc_text.contains("CreateWindowExW"),
+        "show_search_card devia criar a janela"
+    );
+    assert!(
+        !sc_text.contains("WS_EX_TOPMOST"),
+        "show_search_card nao pode pousar sobre as outras aplicacoes"
+    );
 }
 
 #[test]
