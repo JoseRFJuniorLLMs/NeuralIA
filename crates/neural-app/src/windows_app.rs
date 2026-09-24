@@ -23545,6 +23545,7 @@ for (const data of DATA) __fire('message', {{ data, source: frame }});
 __fire('message', {{ data: DATA[0], source: window }});
 __fire('message', {{ data: DATA[0], source: {{ top: {{}} }} }});
 __fire('message', {{ data: DATA[0], source: null }});
+__fire('message', {{ data: DATA[0], source: frame, isTrusted: false }});
 __fire('message', {{ data: {{ neuraliaWheelZoom: 1, dy: 'x', mode: 0 }}, source: frame }});
 __fire('message', {{ data: 'neuraliaWheelZoom', source: frame }});
 __drain();
@@ -23614,6 +23615,19 @@ __drain();
             let vars = panel_theme_vars(&theme);
             assert!(vars["--line"].is_string() && vars["--muted"].is_string());
         }
+        // A pagina do Gemini Live (a folha que o painel dele serve) tem a
+        // mesma barra fina, nas variaveis do tema dela.
+        let live = crate::gemini_live::LIVE_CSS;
+        let live_rule = |selector: &str| {
+            live.lines()
+                .find(|line| line.starts_with(selector))
+                .unwrap_or_else(|| panic!("live.css sem regra {selector}"))
+                .to_string()
+        };
+        assert!(live_rule("::-webkit-scrollbar {").contains("width: 10px"));
+        let live_thumb = live_rule("::-webkit-scrollbar-thumb {");
+        assert!(live_thumb.contains("var(--line)") && live_thumb.contains("border-radius: 999px"));
+        assert!(live_rule("::-webkit-scrollbar-button {").contains("display: none"));
     }
 
     /// Arrastar a borda do painel muda a largura dele e as colunas das IAs
@@ -29576,6 +29590,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
   // janela; a propria janela nao conta). Qualquer frame o pode forjar: por
   // isso daqui so sai um degrau de zoom de cada vez, pelo mesmo acumulador.
   window.addEventListener('message', function (e) {
+    if (!e.isTrusted) { return; }
     const data = e.data;
     if (!data || typeof data !== 'object' || data.neuraliaWheelZoom !== 1) { return; }
     let fromFrame = false;

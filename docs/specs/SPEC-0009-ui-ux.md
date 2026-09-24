@@ -2,7 +2,7 @@
 
 **Status:** Normative
 
-The official identity is the supplied NeuralIA mark: white neural symbol on a black rounded square. The product UI is monochrome, spacious, text-first, and deliberately avoids dashboard clutter.
+The official identity is `assets/neuralia-home.png`: the blue neural globe and the NeuralIA wordmark on a transparent background, with no square around it, used by the Home, the installer and the Reader; `assets/logo.ico`, the project icon, is generated from it (gates in `crates/neural-app/tests/brand_assets.rs` and `neural-setup`). The product UI is monochrome, spacious, text-first, and deliberately avoids dashboard clutter.
 
 ## Home
 
@@ -38,6 +38,15 @@ only one channel is a bug, not a limitation.
   controls stay off, so nothing zooms twice. Gate:
   `ctrl_wheel_and_touchpad_pinch_zoom_through_the_app_steps` (runs the shipped
   keymap under Node). The pinch path was not exercised on touchpad hardware.
+- The same gesture over an iframe (an artifact preview, an embedded video or
+  map) zooms too: the wheel event does not cross the frame boundary, so the
+  keymap's child-frame part forwards a trusted, unhandled ctrl+wheel to the top
+  document with `postMessage` (no capability, no native message), and the top
+  keymap accepts it only from a frame of its own page, feeding the same
+  accumulator. Any frame of the page can send that message, so a page can step
+  the zoom this way; nothing but `zoomin`/`zoomout` comes out of it. Gate:
+  `ctrl_wheel_over_a_frame_zooms_through_the_top_keymap` (runs the shipped
+  keymap as a child frame and as the top frame under Node).
 - F11 toggles fullscreen for the current comparator column; F8 toggles auto-scroll;
   1/2/3 expand a column and 0 restores.
 - Backspace and the digits are ignored while typing in a field.
@@ -51,9 +60,21 @@ only one channel is a bug, not a limitation.
   `caption_hot_zone_is_the_buttons_plus_the_margin_and_nothing_else`
   (`panel_chrome.rs`) and
   `home_window_buttons_show_only_once_revealed_and_the_bar_keeps_them`.
+- On the Home the right-hand panels start below the row of window buttons, so
+  the buttons stay reachable with a panel open (gate:
+  `the_home_panels_leave_the_window_buttons_reachable`, over real widths and
+  scales).
+- While a service panel covers the window (fullscreen) the window buttons are
+  hidden and take no clicks, on the Home and in the comparator; hidden, they
+  do not move above the panel in the Z order. Gates:
+  `the_window_buttons_stay_hidden_under_the_fullscreen_service_panel` and
+  `hidden_caption_buttons_keep_their_place_under_the_raised_panel` (real
+  hidden windows).
 - The `−` and `⛶ <AI>` controls injected into each column show the app's
   centered hint ("Minimizar <AI>", "Expandir <AI>") through the closed `hint`
-  action (SPEC-0005).
+  action (SPEC-0005). Leaving a control clears only a hint that still belongs
+  to that column: a late `none` does not erase the bar's or another column's
+  hint (`a_late_none_from_a_column_does_not_erase_another_hint`).
 - The right-hand panel (Ctrl+H history, services, Gemini Live) is resized by
   dragging its left edge: between 300 px and 60% of the window, stored per
   panel kind in `<data_dir>/panel-width.json` (atomic write) and the AI
@@ -63,17 +84,25 @@ only one channel is a bug, not a limitation.
   `the_resize_handle_sits_on_the_left_edge_away_from_the_scrollbar` and
   `the_columns_reflow_to_the_panel_edge_and_reclaim_it_when_minimized`.
 - The mouse wheel over a visible right-hand panel scrolls the panel even when
-  the keyboard focus is in an AI column. The routing decision is gated
-  (`the_wheel_over_the_open_panel_goes_to_the_panel_and_nothing_else_is_touched`);
-  its delivery, a low-level mouse hook that exists only while a panel is
-  visible and acts only with NeuralIA in the foreground, has no automated test
-  and was not observed on hardware.
+  the keyboard focus is in an AI column. It is redirected only when the window
+  under the pointer is the panel or one of its child windows: a Chromium popup,
+  the emoji picker, the clipboard history or another application's window over
+  the panel keeps its own wheel. The routing decision is gated
+  (`the_wheel_over_the_open_panel_goes_to_the_panel_and_nothing_else_is_touched`,
+  `a_window_over_the_panel_keeps_its_own_wheel`), and so is the window check
+  the hook uses (`the_wheel_hook_only_redirects_when_the_panel_is_under_the_cursor`,
+  real hidden windows); the delivery itself, a low-level mouse hook that exists
+  only while a panel is visible and acts only with NeuralIA in the foreground,
+  has no automated test and was not observed on hardware.
 - Service panels (Meet, WhatsApp, YouTube, Gmail) have a native strip in the
   comparator: Minimizar hides the panel while the page keeps running, the
   columns take the width back and the service icon gets a dot (red while the
   page plays sound); clicking the icon restores it. Tela cheia, or the page's
   own fullscreen (e.g. YouTube's button), fills the window; Esc or the page's
-  exit returns. Gates: `service_panel_minimize_fullscreen_and_close_follow_one_state_machine`,
+  exit returns, undoing only what the panel changed: with the split already in
+  fullscreen, the window stays fullscreen
+  (`leaving_the_panel_fullscreen_undoes_only_what_the_panel_did`). Gates:
+  `service_panel_minimize_fullscreen_and_close_follow_one_state_machine`,
   `each_service_mode_gives_the_window_one_consistent_frame`,
   `the_strip_buttons_are_hit_where_they_are_drawn` and
   `service_panel_webview_signals_reach_only_the_panel_that_sent_them`. That
@@ -81,8 +110,9 @@ only one channel is a bug, not a limitation.
   hidden controller like a background tab; it was not observed on hardware.
 - NeuralIA's own panel pages draw a thin, theme-coloured scrollbar instead of
   the classic Windows one (`the_history_panel_scrollbar_is_thin_and_follows_the_theme`
-  checks the shipped stylesheet, not pixels). Third-party service pages keep
-  their own scrollbars: nothing is injected into them.
+  checks the shipped stylesheets of the Ctrl+H panel and the Gemini Live page,
+  not pixels). Third-party service pages keep their own scrollbars: nothing is
+  injected into them.
 
 ## Auto-scroll
 
