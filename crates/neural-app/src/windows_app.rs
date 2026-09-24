@@ -24,7 +24,14 @@ use crate::gemini_live::{
 };
 #[cfg(test)]
 use crate::ipc::constant_time_eq;
-use crate::ipc::{IpcAction, parse_ipc_message};
+use crate::ipc::{ColumnHint, IpcAction, parse_ipc_message};
+use crate::panel_chrome::{
+    Area, CAPTION_HOT_MARGIN, CaptionReveal, EXIT_PAGE_FULLSCREEN_SCRIPT, PANEL_HANDLE_WIDTH,
+    PANEL_WIDTHS_FILE, PanelKind, PanelWidths, RevealStep, SERVICE_STRIP_HEIGHT, ScreenRect,
+    ServiceBadge, ServiceEffect, ServiceFrame, ServiceInput, ServicePanelState, StripButton,
+    WheelRoute, caption_hot_zone, is_escape_down, panel_area, panel_handle_area, panel_width,
+    panel_width_from_drag, strip_buttons, strip_hit, wheel_message_params, wheel_route,
+};
 use crate::tab_session::{self, Loaded, SessionColumn, SessionGroup, SessionTab, TabSession};
 use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentRuntimeConfig,
@@ -195,6 +202,33 @@ enum UserEvent {
     ClosePalette(u64),
     ExpandComparator(usize),
     MinimizeComparator(usize),
+    /// Voltar a olhar para os botoes da janela na Home: o rato saiu deles,
+    /// ou chegou o prazo de os esconder.
+    CaptionReveal,
+    /// A pega da borda do painel da direita foi arrastada; a posicao vem de
+    /// `PANEL_RESIZE_X` (os movimentos em fila substituem-se).
+    ResizePanel,
+    /// Largou a pega: gravar a largura.
+    PanelResizeDone,
+    /// A pagina do painel de servicos numero `generation` entrou (ou saiu)
+    /// de tela cheia -- o botao de tela cheia do YouTube.
+    ServiceFullscreen {
+        generation: u64,
+        on: bool,
+    },
+    /// A pagina do painel de servicos comecou (ou parou) de tocar som.
+    ServiceAudio {
+        generation: u64,
+        playing: bool,
+    },
+    /// Esc no painel de servicos (AcceleratorKeyPressed do WebView2).
+    ServiceEscape(u64),
+    /// O rato entrou (ou saiu) do "−" ou do "⛶ <IA>" injetados na coluna:
+    /// a dica centrada do app, com o texto escolhido aqui.
+    ColumnHint {
+        col: usize,
+        hint: ColumnHint,
+    },
     /// Ha um arrasto de divisor por atender. O divisor e o x vem dos statics
     /// `RESIZE_*`, nao do evento: assim os movimentos que chegam enquanto
     /// este esta na fila substituem-se uns aos outros em vez de se somarem.
@@ -425,6 +459,8 @@ enum BarHit {
     SplitExpand,
     SplitClose,
     Private,
+    /// A faixa por cima do painel de servicos: minimizar, tela cheia, fechar.
+    ServiceStrip(StripButton),
     /// Icones do canto direito: servicos no painel e avisos do Gmail.
     Service(Service),
     GmailToggle,
@@ -3389,6 +3425,244 @@ const TAB_MENU_UNGROUP: usize = 7;
 /// Os grupos ja existentes ocupam ids a partir daqui, um por grupo da coluna.
 const TAB_MENU_GROUP_BASE: usize = 100;
 const SPLITTER_SUBCLASS_BASE: usize = 0x4E60;
+const PANEL_HANDLE_SUBCLASS_ID: usize = 0x4E74;
+const WM_SETCURSOR: u32 = 0x0020;
+
+/// Ultima posicao (x de ecra) pedida pelo arrasto da pega do painel, e se ha
+/// um pedido por atender -- o mesmo esquema do divisor das colunas.
+static PANEL_RESIZE_X: AtomicI32 = AtomicI32::new(0);
+static PANEL_RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
+/// A pega ja agendou a sua dica nesta passagem do rato.
+static PANEL_HANDLE_HINT: AtomicBool = AtomicBool::new(false);
+
+// A roda do rato sobre o painel da direita. O Windows entrega a roda da
+// janela ativa a janela com o FOCO do teclado: com uma coluna das IAs focada,
+// girar a roda por cima do painel (historico, YouTube...) rolava a coluna --
+// o Chromium rola a pagina dele mesmo com o ponto fora dela. O gancho de rato
+// de baixo nivel so existe enquanto um painel da direita esta a vista, so age
+// com o NeuralIA em primeiro plano e com o cursor dentro do painel
+// (`panel_chrome::wheel_route`), e entrega o giro a janela do painel debaixo
+// do cursor. Tudo o resto passa intocado.
+static WHEEL_HOOK: AtomicUsize = AtomicUsize::new(0);
+static WHEEL_APP_HWND: AtomicUsize = AtomicUsize::new(0);
+static WHEEL_PANEL_HOST: AtomicUsize = AtomicUsize::new(0);
+static WHEEL_PANEL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static WHEEL_PANEL_LEFT: AtomicI32 = AtomicI32::new(0);
+static WHEEL_PANEL_TOP: AtomicI32 = AtomicI32::new(0);
+static WHEEL_PANEL_RIGHT: AtomicI32 = AtomicI32::new(0);
+static WHEEL_PANEL_BOTTOM: AtomicI32 = AtomicI32::new(0);
+
+fn wheel_panel_rect() -> Option<ScreenRect> {
+    WHEEL_PANEL_ACTIVE
+        .load(Ordering::Acquire)
+        .then(|| ScreenRect {
+            left: WHEEL_PANEL_LEFT.load(Ordering::Acquire),
+            top: WHEEL_PANEL_TOP.load(Ordering::Acquire),
+            right: WHEEL_PANEL_RIGHT.load(Ordering::Acquire),
+            bottom: WHEEL_PANEL_BOTTOM.load(Ordering::Acquire),
+        })
+}
+
+/// Teclas e botoes em baixo, no formato MK_* da palavra baixa do wParam.
+fn wheel_key_state() -> u16 {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
+    };
+    let down = |key: u16| unsafe { GetAsyncKeyState(key as i32) } < 0;
+    [
+        (VK_LBUTTON, 0x0001),
+        (VK_RBUTTON, 0x0002),
+        (VK_SHIFT, 0x0004),
+        (VK_CONTROL, 0x0008),
+        (VK_MBUTTON, 0x0010),
+        (VK_XBUTTON1, 0x0020),
+        (VK_XBUTTON2, 0x0040),
+    ]
+    .into_iter()
+    .filter(|(key, _)| down(*key))
+    .fold(0, |keys, (_, flag)| keys | flag)
+}
+
+/// A janela visivel mais funda de `host` debaixo do ponto de ecra: a do
+/// WebView2 do painel (o Chrome_*), nao o contentor do wry.
+fn panel_window_at(host: HWND, point: POINT) -> Option<HWND> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CWP_SKIPDISABLED, CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, ChildWindowFromPointEx, IsWindow,
+    };
+    if host.is_null() || unsafe { IsWindow(host) } == 0 {
+        return None;
+    }
+    let mut current = host;
+    for _ in 0..16 {
+        let mut local = point;
+        unsafe {
+            ScreenToClient(current, &mut local);
+        }
+        let child = unsafe {
+            ChildWindowFromPointEx(
+                current,
+                local,
+                CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT,
+            )
+        };
+        if child.is_null() || child == current {
+            break;
+        }
+        current = child;
+    }
+    Some(current)
+}
+
+unsafe extern "system" fn wheel_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, HC_ACTION, MSLLHOOKSTRUCT, PostMessageW, WM_MOUSEHWHEEL, WM_MOUSEWHEEL,
+    };
+    let message = wparam as u32;
+    if code == HC_ACTION as i32
+        && (message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL)
+        && lparam != 0
+    {
+        let info = &*(lparam as *const MSLLHOOKSTRUCT);
+        let app = WHEEL_APP_HWND.load(Ordering::Acquire) as HWND;
+        let foreground = !app.is_null() && GetForegroundWindow() == app;
+        if wheel_route((info.pt.x, info.pt.y), wheel_panel_rect(), foreground) == WheelRoute::Panel
+            && let Some(target) =
+                panel_window_at(WHEEL_PANEL_HOST.load(Ordering::Acquire) as HWND, info.pt)
+        {
+            let delta = (info.mouseData >> 16) as u16 as i16;
+            let (w, l) = wheel_message_params(delta, wheel_key_state(), info.pt.x, info.pt.y);
+            // PostMessage e nao SendMessage: o gancho nunca espera pelo
+            // processo do WebView2.
+            if PostMessageW(target, message, w, l) != 0 {
+                return 1;
+            }
+        }
+    }
+    CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
+}
+
+fn install_wheel_hook() {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowsHookExW, WH_MOUSE_LL};
+    if WHEEL_HOOK.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    unsafe {
+        let hook = SetWindowsHookExW(
+            WH_MOUSE_LL,
+            Some(wheel_hook),
+            GetModuleHandleW(std::ptr::null()),
+            0,
+        );
+        if !hook.is_null() {
+            WHEEL_HOOK.store(hook as usize, Ordering::Release);
+        }
+    }
+}
+
+fn uninstall_wheel_hook() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx;
+    let hook = WHEEL_HOOK.swap(0, Ordering::AcqRel);
+    if hook != 0 {
+        unsafe {
+            UnhookWindowsHookEx(hook as _);
+        }
+    }
+}
+
+/// A pega de arrastar a borda do painel da direita. Mesma mecanica do divisor
+/// das colunas: SetCapture no premir, posicao mais recente num static, um so
+/// pedido em fila; o largar grava.
+unsafe extern "system" fn panel_handle_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    reference_data: usize,
+) -> LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IDC_SIZEWE, LoadCursorW, SetCursor};
+    let send = |event: UserEvent| {
+        if reference_data != 0 {
+            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+            proxy.send_event(event).is_ok()
+        } else {
+            false
+        }
+    };
+    match message {
+        // STATIC devolve HTTRANSPARENT: sem isto o rato ia para o WebView.
+        WM_NCHITTEST => return HTCLIENT as LRESULT,
+        WM_SETCURSOR => {
+            SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_SIZEWE));
+            return 1;
+        }
+        WM_LBUTTONDOWN => {
+            hover_tooltip(hwnd, "");
+            SetCapture(hwnd);
+            return 0;
+        }
+        WM_MOUSEMOVE => {
+            if GetCapture() == hwnd {
+                let mut point = POINT { x: 0, y: 0 };
+                if GetCursorPos(&mut point) != 0 {
+                    PANEL_RESIZE_X.store(point.x, Ordering::Release);
+                    if !PANEL_RESIZE_PENDING.swap(true, Ordering::AcqRel)
+                        && !send(UserEvent::ResizePanel)
+                    {
+                        PANEL_RESIZE_PENDING.store(false, Ordering::Release);
+                    }
+                }
+            } else if !PANEL_HANDLE_HINT.swap(true, Ordering::AcqRel) {
+                track_mouse_leave(hwnd);
+                hover_tooltip(hwnd, "Arraste para alargar ou estreitar o painel");
+            }
+            return 0;
+        }
+        WM_MOUSELEAVE => {
+            PANEL_HANDLE_HINT.store(false, Ordering::Release);
+            hover_tooltip(hwnd, "");
+        }
+        WM_LBUTTONUP => {
+            if GetCapture() == hwnd {
+                ReleaseCapture();
+            }
+            return 0;
+        }
+        // Fim do arrasto (largar, ou o rato levado por outra janela): grava.
+        WM_CAPTURECHANGED => {
+            send(UserEvent::PanelResizeDone);
+            return 0;
+        }
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut paint);
+            if !hdc.is_null() {
+                let mut client = RECT::default();
+                if GetClientRect(hwnd, &mut client) != 0 {
+                    let theme = Theme::system();
+                    let bg = CreateSolidBrush(rgb3(theme.bar_bg));
+                    FillRect(hdc, &client, bg);
+                    DeleteObject(bg as _);
+                    let center = (client.right - client.left) / 2;
+                    let line = RECT {
+                        left: center,
+                        top: 0,
+                        right: center + 1,
+                        bottom: client.bottom,
+                    };
+                    let brush = CreateSolidBrush(rgb3(theme.surface_line));
+                    FillRect(hdc, &line, brush);
+                    DeleteObject(brush as _);
+                }
+                EndPaint(hwnd, &paint);
+            }
+            return 0;
+        }
+        _ => {}
+    }
+    DefSubclassProc(hwnd, message, wparam, lparam)
+}
 const SPLITTER_WIDTH: f64 = 7.0;
 const MIN_PANEL_WIDTH: f64 = 180.0;
 
@@ -3864,12 +4138,36 @@ fn panel_allows_navigation(target: &str) -> bool {
 
 /// Encostado a direita, abaixo da barra do comparador (ou do topo, fora
 /// dele): 34% da largura, entre 320 e 440 px logicos, nunca mais que a janela.
+#[cfg(test)]
 fn side_panel_bounds(logical_w: f64, logical_h: f64, top: f64) -> (f64, f64, f64, f64) {
-    let width = (logical_w * 0.34)
-        .clamp(320.0, 440.0)
-        .min(logical_w.max(0.0));
-    let top = top.clamp(0.0, logical_h.max(0.0));
-    (logical_w - width, top, width, logical_h - top)
+    panel_bounds(PanelKind::History, None, logical_w, logical_h, top)
+}
+
+/// Um painel da direita com a largura `chosen` (arrastada pela borda e
+/// gravada) ou, sem escolha, a de sempre -- presa sempre a [300 px, 60% da
+/// janela] (`panel_chrome::panel_width`).
+fn panel_bounds(
+    kind: PanelKind,
+    chosen: Option<f64>,
+    logical_w: f64,
+    logical_h: f64,
+    top: f64,
+) -> (f64, f64, f64, f64) {
+    let area = panel_area(
+        panel_width(kind, chosen, logical_w),
+        logical_w,
+        logical_h,
+        top,
+    );
+    (area.x, area.y, area.width, area.height)
+}
+
+/// A largura das colunas do comparador: a janela menos o painel da direita.
+/// Layout, divisores e o arrasto dos divisores usam TODOS esta conta; o
+/// arrasto usava a janela inteira e o divisor fugia do rato com o painel
+/// aberto.
+fn comparator_logical_width(window_logical_w: f64, panel_width: f64) -> f64 {
+    (window_logical_w - panel_width.max(0.0)).max(1.0)
 }
 
 /// Um item do painel: o que se le e o que o clique volta a abrir.
@@ -4020,6 +4318,11 @@ h1{font-size:17px;font-weight:600;margin:0}
 #q{width:100%;padding:10px 14px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--fg);font:inherit;outline:none}
 #q:focus{border-color:var(--accent)}
 main{overflow:auto;flex:1;padding:0 8px 16px}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track,::-webkit-scrollbar-corner{background:transparent}
+::-webkit-scrollbar-thumb{background-color:var(--line);border:3px solid transparent;border-radius:999px;background-clip:padding-box}
+::-webkit-scrollbar-thumb:hover{background-color:var(--muted)}
+::-webkit-scrollbar-button{display:none;width:0;height:0}
 section[hidden]{display:none}
 h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:14px 10px 6px;font-weight:600}
 .item{display:block;width:100%;text-align:left;background:none;border:0;color:inherit;font:inherit;padding:8px 10px;border-radius:10px;cursor:pointer}
@@ -4118,6 +4421,162 @@ impl Service {
     }
 }
 
+/// O servico aberto no painel da direita e o modo em que esta.
+struct ServicePanel {
+    service: Service,
+    webview: WebView,
+    /// Encostado, minimizado (a tocar, escondido) ou em tela cheia.
+    state: ServicePanelState,
+    /// A pagina esta a tocar som (IsDocumentPlayingAudio do WebView2).
+    audio: bool,
+    /// Numero deste painel; os avisos do WebView2 trazem-no.
+    generation: u64,
+}
+
+/// Um aviso do WebView2 do painel `event` so vale se esse painel ainda for
+/// o aberto: fechar e abrir outro deixa avisos atrasados do anterior na fila.
+fn service_event_is_current(open: Option<u64>, event: u64) -> bool {
+    open == Some(event)
+}
+
+/// A tecla que o WebView2 do painel de servicos viu: so o Esc em baixo vira
+/// evento; se e dele ou da pagina decide o modo do painel.
+fn service_key_event(generation: u64, virtual_key: u32, key_down: bool) -> Option<UserEvent> {
+    is_escape_down(virtual_key, key_down).then_some(UserEvent::ServiceEscape(generation))
+}
+
+/// A largura que as colunas cedem ao painel da direita aberto. O de servicos
+/// minimizado nao cede nada: as colunas voltam a ocupar a janela toda.
+fn reserved_panel_width(
+    service: Option<ServicePanelState>,
+    live_open: bool,
+    side_open: bool,
+    service_width: f64,
+    history_width: f64,
+) -> f64 {
+    // O de servicos minimizado nao cede nada; se ao lado houver outro painel
+    // aberto, e esse que conta.
+    match service.map(|state| state.reserved_width(service_width)) {
+        Some(width) if width > 0.0 => width,
+        _ if live_open => service_width,
+        _ if side_open => history_width,
+        _ => 0.0,
+    }
+}
+
+fn logical_rect(area: Area) -> wry::Rect {
+    wry::Rect {
+        position: LogicalPosition::new(area.x, area.y).into(),
+        size: LogicalSize::new(area.width.max(1.0), area.height.max(1.0)).into(),
+    }
+}
+
+/// Poe o contentor da WebView por cima de todos os irmaos (as colunas, os
+/// botoes nativos), sem o ativar.
+fn raise_webview_host(webview: &WebView) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_TOP, SWP_NOMOVE, SWP_NOSIZE};
+    use wry::WebViewExtWindows;
+    let host = webview.hwnd().0 as HWND;
+    if host.is_null() {
+        return;
+    }
+    unsafe {
+        SetWindowPos(
+            host,
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Os avisos do WebView2 do painel de servicos: a pagina entrou/saiu de tela
+/// cheia (ContainsFullScreenElementChanged), comecou/parou de tocar som
+/// (IsDocumentPlayingAudioChanged) e o Esc (AcceleratorKeyPressed, que o
+/// WebView2 levanta para o Esc mesmo com o foco na pagina). Cada closure so
+/// le o que o WebView2 diz e manda um evento com o numero do painel.
+fn register_service_panel_events(
+    webview: &WebView,
+    generation: u64,
+    proxy: EventLoopProxy<UserEvent>,
+) -> Result<(), String> {
+    use webview2_com::{
+        AcceleratorKeyPressedEventHandler, ContainsFullScreenElementChangedEventHandler,
+        IsDocumentPlayingAudioChangedEventHandler,
+        Microsoft::Web::WebView2::Win32::{
+            COREWEBVIEW2_KEY_EVENT_KIND, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
+            COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN, ICoreWebView2_8,
+        },
+    };
+    use windows_core::{BOOL, Interface};
+    use wry::WebViewExtWindows;
+
+    let core = webview.webview();
+    let fullscreen_proxy = proxy.clone();
+    let fullscreen =
+        ContainsFullScreenElementChangedEventHandler::create(Box::new(move |sender, _| {
+            if let Some(sender) = sender {
+                let mut contains = BOOL::default();
+                unsafe { sender.ContainsFullScreenElement(&mut contains)? };
+                let _ = fullscreen_proxy.send_event(UserEvent::ServiceFullscreen {
+                    generation,
+                    on: contains.as_bool(),
+                });
+            }
+            Ok(())
+        }));
+    let mut token = 0i64;
+    unsafe { core.add_ContainsFullScreenElementChanged(&fullscreen, &mut token) }
+        .map_err(|error| format!("ContainsFullScreenElementChanged: {error}"))?;
+
+    // O som e so para o ponto no icone: um runtime sem ICoreWebView2_8 fica
+    // sem ele e o resto funciona.
+    if let Ok(core8) = core.cast::<ICoreWebView2_8>() {
+        let audio_proxy = proxy.clone();
+        let audio =
+            IsDocumentPlayingAudioChangedEventHandler::create(Box::new(move |sender, _| {
+                if let Some(sender) =
+                    sender.and_then(|sender| sender.cast::<ICoreWebView2_8>().ok())
+                {
+                    let mut playing = BOOL::default();
+                    unsafe { sender.IsDocumentPlayingAudio(&mut playing)? };
+                    let _ = audio_proxy.send_event(UserEvent::ServiceAudio {
+                        generation,
+                        playing: playing.as_bool(),
+                    });
+                }
+                Ok(())
+            }));
+        let mut token = 0i64;
+        let _ = unsafe { core8.add_IsDocumentPlayingAudioChanged(&audio, &mut token) };
+    }
+
+    let controller = webview.controller();
+    let keys = AcceleratorKeyPressedEventHandler::create(Box::new(move |_, args| {
+        if let Some(args) = args {
+            let mut kind = COREWEBVIEW2_KEY_EVENT_KIND(0);
+            let mut key = 0u32;
+            unsafe {
+                args.KeyEventKind(&mut kind)?;
+                args.VirtualKey(&mut key)?;
+            }
+            let down = kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
+                || kind == COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN;
+            // Sem marcar "tratado": a pagina recebe o Esc como sempre.
+            if let Some(event) = service_key_event(generation, key, down) {
+                let _ = proxy.send_event(event);
+            }
+        }
+        Ok(())
+    }));
+    let mut token = 0i64;
+    unsafe { controller.add_AcceleratorKeyPressed(&keys, &mut token) }
+        .map_err(|error| format!("AcceleratorKeyPressed: {error}"))
+}
+
 /// So paginas da internet: um servico nunca abre file:, javascript: nem os
 /// esquemas internos do NeuralIA.
 fn service_panel_allows_navigation(target: &str) -> bool {
@@ -4126,12 +4585,9 @@ fn service_panel_allows_navigation(target: &str) -> bool {
 }
 
 /// Mais largo do que o do historico: o WhatsApp e o Meet precisam de espaco.
+#[cfg(test)]
 fn service_panel_bounds(logical_w: f64, logical_h: f64, top: f64) -> (f64, f64, f64, f64) {
-    let width = (logical_w * 0.42)
-        .clamp(400.0, 640.0)
-        .min(logical_w.max(0.0));
-    let top = top.clamp(0.0, logical_h.max(0.0));
-    (logical_w - width, top, width, logical_h - top)
+    panel_bounds(PanelKind::Service, None, logical_w, logical_h, top)
 }
 
 /// Botao redondo so com icone (servicos, Gmail, Privado). O icone branco e
@@ -4314,6 +4770,20 @@ const HINT_PADDING_X_PX: f64 = 24.0;
 const HINT_PADDING_Y_PX: f64 = 14.0;
 const HINT_MAX_WIDTH_PX: f64 = 640.0;
 
+/// A dica do icone do servico aberto: minimizado, diz que volta ao clique (e
+/// se continua a tocar); aberto, que fecha.
+fn service_icon_hint(label: &str, badge: Option<ServiceBadge>) -> String {
+    match badge {
+        Some(ServiceBadge::Playing) => {
+            format!("{label} minimizado, a tocar · clique para voltar ao painel")
+        }
+        Some(ServiceBadge::Minimized) => {
+            format!("{label} minimizado · clique para voltar ao painel")
+        }
+        None => format!("{label} aberto ao lado · clique para fechar"),
+    }
+}
+
 /// O que o clique em cada alvo da barra FAZ -- o mesmo match que trata o
 /// clique --, nao so o nome do botao.
 fn bar_tooltip_label(
@@ -4354,6 +4824,7 @@ fn bar_tooltip_label(
             "Painel privado: abre ao lado sem gravar histórico nem memória".to_string()
         }
         BarHit::Service(service) => format!("{} no painel ao lado", service.label()),
+        BarHit::ServiceStrip(button) => button.hint("o serviço"),
         BarHit::GmailToggle => if GMAIL_NOTIFICATIONS.load(Ordering::Acquire) {
             "Avisos do Gmail: ligados · clique para desligar"
         } else {
@@ -4411,6 +4882,16 @@ fn caption_buttons_wanted(surface: Surface, bar_visible: bool) -> bool {
     }
 }
 
+/// Se os botoes da janela se veem agora. No comparador fazem parte da barra e
+/// estao sempre la; na Home so com o rato perto (pedido do dono: "nao quero
+/// os botoes visiveis so quando mover o mouse na direcao deles").
+fn caption_buttons_visible(surface: Surface, revealed: bool) -> bool {
+    match surface {
+        Surface::Home => revealed,
+        _ => true,
+    }
+}
+
 /// A faixa de cima da Home, onde se agarra a janela sem moldura.
 fn home_drag_strip(y: f64, scale: f64) -> bool {
     y >= 0.0 && y <= TITLE_TAB_HEIGHT * scale.max(1.0)
@@ -4426,6 +4907,16 @@ fn caption_button_style(index: usize, hovered: bool, theme: &Theme) -> PillStyle
         (2, true) => PillStyle::new(CLOSE_HOVER_RED, CLOSE_HOVER_RED, (255, 255, 255)),
         (_, true) => PillStyle::new(theme.surface_line, theme.surface_line, theme.fg),
         _ => PillStyle::new(theme.surface, theme.surface_line, theme.fg),
+    }
+}
+
+/// O que a dica centrada diz sobre um controlo injetado numa coluna. Vazio
+/// quando o rato saiu dele: a dica some.
+fn column_hint_text(hint: ColumnHint, provider: &str) -> String {
+    match hint {
+        ColumnHint::Minimize => format!("Minimizar {provider}"),
+        ColumnHint::Expand => format!("Expandir {provider}"),
+        ColumnHint::None => String::new(),
     }
 }
 
@@ -5123,7 +5614,7 @@ unsafe extern "system" fn caption_buttons_subclass(
     wparam: WPARAM,
     lparam: LPARAM,
     _subclass_id: usize,
-    _reference_data: usize,
+    reference_data: usize,
 ) -> LRESULT {
     const WM_SYSCOMMAND_NATIVE: u32 = 0x0112;
     const SC_MINIMIZE_NATIVE: usize = 0xF020;
@@ -5242,6 +5733,13 @@ unsafe extern "system" fn caption_buttons_subclass(
             CAPTION_TOOLTIP_BUTTON.store(NATIVE_BUTTON_NONE, Ordering::Release);
             hover_tooltip(hwnd, "");
             InvalidateRect(hwnd, std::ptr::null(), 0);
+            // Saiu dos botoes -- talvez para fora da janela, onde a janela
+            // principal ja nao recebe movimento: o prazo de os esconder tem de
+            // comecar daqui.
+            if reference_data != 0 {
+                let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+                let _ = proxy.send_event(UserEvent::CaptionReveal);
+            }
             DefSubclassProc(hwnd, message, wparam, lparam)
         }
         WM_CAPTURECHANGED | WM_CANCELMODE => {
@@ -6329,6 +6827,8 @@ struct App {
     exit_button: Option<HWND>,
     home_button: Option<HWND>,
     caption_buttons: Option<HWND>,
+    /// Na Home os botoes da janela so se veem com o rato perto deles.
+    caption_reveal: CaptionReveal,
     splitters: [Option<HWND>; COMPARATOR_COLUMNS - 1],
     /// Partilhado com o menu do botao direito de cada coluna: o WebView2 monta
     /// esse menu num callback fora do `&mut App`, e o rotulo tem de dizer o
@@ -6390,7 +6890,18 @@ struct App {
     /// A consulta de memoria que alimenta as sugestoes do painel.
     panel_suggestion_query: Option<String>,
     /// Servico aberto no painel lateral (WhatsApp, Meet, YouTube, Gmail).
-    service_panel: Option<(Service, WebView)>,
+    service_panel: Option<ServicePanel>,
+    /// Numero do ultimo painel de servicos aberto: os avisos do WebView2 de
+    /// um painel ja fechado chegam com o numero dele e caem.
+    service_generation: u64,
+    /// A janela esta em tela cheia por causa do painel de servicos (e so
+    /// entao este a devolve ao sair).
+    panel_window_fullscreen: bool,
+    /// Larguras escolhidas para os paineis da direita, gravadas em
+    /// `<data_dir>/panel-width.json`.
+    panel_widths: PanelWidths,
+    /// A pega de arrastar a borda esquerda do painel aberto.
+    panel_handle: Option<HWND>,
     /// Gravacao das abas e grupos do comparador em `tabs.json`. Aberta no
     /// arranque: a primeira janela do NeuralIA fica com o `tabs.lock`.
     tab_session: TabPersistence,
@@ -6421,6 +6932,7 @@ impl App {
             Arc::clone(&navigation_generation),
         );
         let omnibox_proxy = Box::new(proxy.clone());
+        let panel_widths = PanelWidths::load(&config.data_dir.join(PANEL_WIDTHS_FILE));
         let palette_host = Box::new(PaletteHost {
             proxy: proxy.clone(),
             source: Cell::new(None),
@@ -6448,6 +6960,7 @@ impl App {
             exit_button: None,
             home_button: None,
             caption_buttons: None,
+            caption_reveal: CaptionReveal::default(),
             splitters: [None; COMPARATOR_COLUMNS - 1],
             // Ligada por omissao: a aplicacao serve para ler.
             // Nada rola sem o utilizador dizer que sim.
@@ -6488,6 +7001,10 @@ impl App {
             side_panel: None,
             panel_suggestion_query: None,
             service_panel: None,
+            service_generation: 0,
+            panel_window_fullscreen: false,
+            panel_widths,
+            panel_handle: None,
             tab_session,
             live_panel: LivePanel::off(),
         }
@@ -6562,12 +7079,14 @@ impl App {
             self.sync_comparator_splitters();
             self.sync_exit_button();
             self.sync_caption_buttons();
+            self.sync_panel_handle();
             return;
         }
         // Sem foco nao ha o que arrastar nem de onde sair: as auxiliares que
         // so servem o rato saem da frente ate a janela voltar.
         self.hide_comparator_splitters();
         self.hide_exit_button();
+        self.hide_panel_handle();
     }
 
     /// A janela ficou inteiramente tapada (ou deixou de estar). Enquanto esta
@@ -6861,6 +7380,8 @@ impl App {
         if self.side_panel.take().is_some() {
             self.panel_suggestion_query = None;
         }
+        // Sem painel: a pega some e o gancho da roda sai.
+        self.after_panel_change();
 
         if let Some(button) = self.exit_button.take() {
             unsafe {
@@ -6920,6 +7441,7 @@ impl App {
 
     fn show_home(&mut self) {
         debug_log(format_args!("show_home (surface era {:?})", self.surface));
+        self.caption_reveal.reset();
         self.close_side_panel();
         self.close_service_panel();
         self.close_live_panel();
@@ -8277,12 +8799,7 @@ impl App {
         };
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
-        let logical_w = (size.width as f64 / scale
-            - self
-                .comparator
-                .as_ref()
-                .map_or(0.0, |comp| comp.panel_width))
-        .max(1.0);
+        let logical_w = comparator_logical_width(size.width as f64 / scale, comp.panel_width);
         let logical_h = size.height as f64 / scale;
 
         let content_h = (logical_h - COMPARATOR_CHROME_HEIGHT).max(100.0);
@@ -8423,6 +8940,9 @@ impl App {
             }
             IpcAction::Expand { col } if col == col_index => {
                 Some(UserEvent::ExpandComparator(col_index))
+            }
+            IpcAction::Hint { col, hint } if col == col_index => {
+                Some(UserEvent::ColumnHint { col, hint })
             }
             other => common_ipc_event(other),
         }
@@ -10032,13 +10552,20 @@ impl App {
             self.caption_buttons = None;
         }
 
+        let visible = caption_buttons_visible(self.surface, self.caption_reveal.shown());
         if self.caption_buttons.is_none() {
             unsafe {
+                // Nasce escondida na Home: aparecer e desaparecer logo a
+                // seguir era um piscar no canto a cada regresso a Home.
                 let created = CreateWindowExW(
                     0,
                     windows_sys::w!("STATIC"),
                     windows_sys::w!("NeuralIA.CaptionControls"),
-                    WS_CHILD | WS_VISIBLE,
+                    if visible {
+                        WS_CHILD | WS_VISIBLE
+                    } else {
+                        WS_CHILD
+                    },
                     left.round() as i32,
                     0,
                     width.round() as i32,
@@ -10051,11 +10578,12 @@ impl App {
                 if created.is_null() {
                     return;
                 }
+                let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
                 if SetWindowSubclass(
                     created,
                     Some(caption_buttons_subclass),
                     CAPTION_BUTTONS_SUBCLASS_ID,
-                    0,
+                    proxy_ptr,
                 ) == 0
                 {
                     DestroyWindow(created);
@@ -10076,9 +10604,61 @@ impl App {
                     height.round() as i32,
                     SWP_NOACTIVATE,
                 );
-                ShowWindow(buttons, SW_SHOW);
+                // SW_SHOWNOACTIVATE: mostrar os botoes nunca rouba o foco a
+                // quem esta a escrever.
+                ShowWindow(buttons, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
                 InvalidateRect(buttons, std::ptr::null(), 1);
             }
+        }
+    }
+
+    /// Onde estao os tres botoes da janela na Home, em pixels do cliente.
+    fn home_caption_area(&self) -> Option<Area> {
+        let window = self.window.as_ref()?;
+        let layout = BarLayout::with_rows(
+            window.inner_size().width as f64,
+            window.scale_factor(),
+            true,
+            BarColumns::even(COMPARATOR_COLUMNS),
+            [TabRow::empty(); COMPARATOR_COLUMNS],
+        );
+        let left = layout.window_minimize.x;
+        let right = layout.window_close.x + layout.window_close.width;
+        Some(Area {
+            x: left,
+            y: 0.0,
+            width: (right - left).max(1.0),
+            height: layout.window_close.height.max(1.0),
+        })
+    }
+
+    /// Na Home: os botoes aparecem quando o rato entra na zona deles e
+    /// somem 300 ms depois de ele sair (CaptionReveal). A posicao do rato e
+    /// lida ao Windows, nao ao ultimo CursorMoved: por cima dos proprios
+    /// botoes (outra janela) ou fora da janela a janela principal nao ve
+    /// movimento nenhum.
+    fn refresh_caption_reveal(&mut self) {
+        if self.surface != Surface::Home {
+            return;
+        }
+        let (Some(window), Some(area)) = (&self.window, self.home_caption_area()) else {
+            return;
+        };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
+        let mut point = POINT { x: 0, y: 0 };
+        let inside =
+            unsafe { GetCursorPos(&mut point) != 0 && ScreenToClient(owner, &mut point) != 0 }
+                && caption_hot_zone(area, CAPTION_HOT_MARGIN * scale)
+                    .contains(point.x as f64, point.y as f64);
+        match self.caption_reveal.observe(inside, now_ms()) {
+            RevealStep::Show | RevealStep::Hide => self.sync_caption_buttons(),
+            RevealStep::ScheduleHide(delay) => self
+                .timers
+                .after(Duration::from_millis(delay), UserEvent::CaptionReveal),
+            RevealStep::Nothing => {}
         }
     }
 
@@ -10088,7 +10668,8 @@ impl App {
     fn sync_exit_button(&mut self) {
         // Em fullscreen e o controlo nativo permanente de saida. Nao depende
         // de hover nem de redimensionar o WebView.
-        let wanted = self.surface == Surface::Comparator && self.is_fullscreen_column();
+        let wanted = (self.surface == Surface::Comparator && self.is_fullscreen_column())
+            || self.service_frame().is_some_and(|frame| frame.exit_button);
 
         if !wanted {
             if let Some(button) = self.exit_button.take() {
@@ -10226,16 +10807,15 @@ impl App {
         let (show, boundaries, content_height, scale) = if let Some(comp) = &self.comparator {
             let scale = window.scale_factor().max(1.0);
             let size = window.inner_size();
-            let logical_w = (size.width as f64 / scale
-                - self
-                    .comparator
-                    .as_ref()
-                    .map_or(0.0, |comp| comp.panel_width))
-            .max(1.0);
+            let logical_w = comparator_logical_width(size.width as f64 / scale, comp.panel_width);
             let logical_h = size.height as f64 / scale;
+            // Com o painel de servicos em tela cheia por cima de tudo, os
+            // divisores (popups, acima das WebViews) ficavam a flutuar sobre
+            // o video.
             let show = self.surface == Surface::Comparator
                 && comp.split.is_none()
-                && comp.expanded.is_none();
+                && comp.expanded.is_none()
+                && !self.service_covers_window();
             // Um divisor por fronteira entre colunas visiveis: o fim de cada
             // faixa menos a ultima, na mesma geometria que as WebViews usam.
             let spans =
@@ -10360,7 +10940,8 @@ impl App {
             ScreenToClient(owner, &mut point);
         }
         let scale = window.scale_factor().max(1.0);
-        let logical_w = window.inner_size().width as f64 / scale;
+        let logical_w =
+            comparator_logical_width(window.inner_size().width as f64 / scale, comp.panel_width);
         let mouse_x = (point.x as f64 / scale).clamp(0.0, logical_w);
 
         comp.weights = resized_weights(&comp.weights, &visible, divider, mouse_x, logical_w);
@@ -10389,7 +10970,28 @@ impl App {
         ))
     }
 
+    /// A faixa do painel de servicos, em pixels do cliente (os do rato).
+    fn service_strip_physical(&self) -> Option<Area> {
+        let strip = self.service_frame()?.strip?;
+        let scale = self.window.as_ref()?.scale_factor().max(1.0);
+        Some(Area {
+            x: strip.x * scale,
+            y: strip.y * scale,
+            width: strip.width * scale,
+            height: strip.height * scale,
+        })
+    }
+
     fn comparator_bar_hit(&self) -> Option<BarHit> {
+        if let Some(strip) = self.service_strip_physical() {
+            let scale = self
+                .window
+                .as_ref()
+                .map_or(1.0, |window| window.scale_factor().max(1.0));
+            if let Some(button) = strip_hit(strip, scale, self.cursor.0, self.cursor.1) {
+                return Some(BarHit::ServiceStrip(button));
+            }
+        }
         if let Some(controls) = self.right_controls()
             && let Some(hit) = right_controls_hit(controls, self.cursor.0, self.cursor.1)
         {
@@ -10424,6 +11026,22 @@ impl App {
         self.request_redraw();
     }
 
+    /// A dica centrada de um controlo injetado numa coluna. O texto e o nome
+    /// da IA saem daqui; a pagina so disse qual dos controlos tem o rato.
+    fn show_column_hint(&self, col: usize, hint: ColumnHint) {
+        let Some(owner) = self.window.as_ref().and_then(window_hwnd) else {
+            return;
+        };
+        let provider = self
+            .comparator
+            .as_ref()
+            .filter(|_| self.surface == Surface::Comparator)
+            .and_then(|comp| comp.views.get(col))
+            .map(|view| view.name);
+        let text = provider.map_or(String::new(), |name| column_hint_text(hint, name));
+        hover_tooltip(owner, &text);
+    }
+
     fn update_bar_hover(&mut self) {
         let next = self.comparator_bar_hit();
         if next != self.bar_hover {
@@ -10436,37 +11054,38 @@ impl App {
         }
     }
 
-    /// Os icones da barra: o servico abre no painel ao lado; de novo, fecha.
+    /// Os icones da barra: o servico abre no painel ao lado; de novo, fecha
+    /// -- ou, minimizado, volta (`ServicePanelState`).
     fn open_service_panel(&mut self, service: Service) {
-        let already = self
+        if let Some(panel) = self
             .service_panel
             .as_ref()
-            .is_some_and(|(open, _)| *open == service);
-        self.close_service_panel();
-        if already {
+            .filter(|panel| panel.service == service)
+        {
+            // Voltar do minimizado ocupa o lugar do painel que estiver aberto.
+            if panel.state.minimized() {
+                self.close_side_panel();
+                self.close_live_panel();
+            }
+            self.service_input(ServiceInput::IconClick);
             return;
         }
+        self.close_service_panel();
         // Um painel de cada vez.
         self.close_side_panel();
         self.close_live_panel();
+        let Some(area) = self
+            .service_frame_for(ServicePanelState::default())
+            .and_then(|frame| frame.panel)
+        else {
+            return;
+        };
         let Some(window) = &self.window else {
             return;
         };
-        let scale = window.scale_factor().max(1.0);
-        let size = window.inner_size();
-        let top = if self.surface == Surface::Comparator {
-            COMPARATOR_CHROME_HEIGHT
-        } else {
-            0.0
-        };
-        let (x, y, width, height) =
-            service_panel_bounds(size.width as f64 / scale, size.height as f64 / scale, top);
         let built = themed_webview_builder()
             .with_url(service.url())
-            .with_bounds(wry::Rect {
-                position: LogicalPosition::new(x, y).into(),
-                size: LogicalSize::new(width, height).into(),
-            })
+            .with_bounds(logical_rect(area))
             .with_navigation_handler(|target| service_panel_allows_navigation(&target))
             .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
             // Caminho A do WebRTC: camera e microfone pelo aviso do WebView2.
@@ -10476,9 +11095,24 @@ impl App {
             Ok(panel) => {
                 let _ = panel.focus();
                 self.install_context_menu(&panel, WebViewHost::Service);
+                self.service_generation = self.service_generation.wrapping_add(1);
+                let generation = self.service_generation;
+                // Sem estes avisos o painel abre na mesma; so a tela cheia da
+                // pagina, o ponto "a tocar" e o Esc ficam de fora.
+                if let Err(error) =
+                    register_service_panel_events(&panel, generation, self.proxy.clone())
+                {
+                    debug_log(format_args!("service panel: sem avisos ({error})"));
+                }
                 debug_log(format_args!("service panel: {service:?}"));
-                self.service_panel = Some((service, panel));
-                self.fit_comparator_to_panel();
+                self.service_panel = Some(ServicePanel {
+                    service,
+                    webview: panel,
+                    state: ServicePanelState::default(),
+                    audio: false,
+                    generation,
+                });
+                self.apply_service_frame();
             }
             Err(error) => {
                 self.show_splash(
@@ -10489,17 +11123,39 @@ impl App {
         }
     }
 
-    fn close_service_panel(&mut self) {
-        if self.service_panel.take().is_some() {
-            debug_log(format_args!("service panel: fechado"));
-            self.fit_comparator_to_panel();
+    /// Fecha o painel de servicos so se ele estiver a vista.
+    fn close_docked_service_panel(&mut self) {
+        if self
+            .service_panel
+            .as_ref()
+            .is_some_and(|panel| !panel.state.minimized())
+        {
+            self.close_service_panel();
         }
     }
 
-    fn position_service_panel(&self) {
-        let (Some((_, panel)), Some(window)) = (&self.service_panel, &self.window) else {
+    fn close_service_panel(&mut self) {
+        if self.service_panel.take().is_none() {
             return;
-        };
+        }
+        debug_log(format_args!("service panel: fechado"));
+        if std::mem::take(&mut self.panel_window_fullscreen)
+            && let Some(window) = &self.window
+        {
+            window.set_fullscreen(None);
+        }
+        self.fit_comparator_to_panel();
+        self.sync_comparator_splitters();
+        self.sync_exit_button();
+        self.after_panel_change();
+        self.needs_clear = true;
+        self.request_redraw();
+    }
+
+    /// A janela em pixels logicos e o topo dos paineis da direita (abaixo da
+    /// barra no comparador, do topo fora dele).
+    fn panel_space(&self) -> Option<(f64, f64, f64, f64)> {
+        let window = self.window.as_ref()?;
         let scale = window.scale_factor().max(1.0);
         let size = window.inner_size();
         let top = if self.surface == Surface::Comparator {
@@ -10507,12 +11163,335 @@ impl App {
         } else {
             0.0
         };
-        let (x, y, width, height) =
-            service_panel_bounds(size.width as f64 / scale, size.height as f64 / scale, top);
-        let _ = panel.set_bounds(wry::Rect {
-            position: LogicalPosition::new(x, y).into(),
-            size: LogicalSize::new(width, height).into(),
+        Some((
+            size.width as f64 / scale,
+            size.height as f64 / scale,
+            top,
+            scale,
+        ))
+    }
+
+    fn chosen_panel_width(&self, kind: PanelKind, logical_w: f64) -> f64 {
+        panel_width(kind, self.panel_widths.get(kind), logical_w)
+    }
+
+    /// O que o painel de servicos, no modo `state`, pede a janela agora.
+    fn service_frame_for(&self, state: ServicePanelState) -> Option<ServiceFrame> {
+        let (logical_w, logical_h, top, _) = self.panel_space()?;
+        // A faixa de controlos so existe no comparador, que e onde ha barra.
+        let strip = if self.surface == Surface::Comparator {
+            SERVICE_STRIP_HEIGHT
+        } else {
+            0.0
+        };
+        Some(state.frame(
+            self.chosen_panel_width(PanelKind::Service, logical_w),
+            logical_w,
+            logical_h,
+            top,
+            strip,
+        ))
+    }
+
+    fn service_frame(&self) -> Option<ServiceFrame> {
+        self.service_frame_for(self.service_panel.as_ref()?.state)
+    }
+
+    fn service_covers_window(&self) -> bool {
+        self.service_frame()
+            .is_some_and(|frame| frame.window_fullscreen)
+    }
+
+    fn service_event_is_current(&self, generation: u64) -> bool {
+        service_event_is_current(
+            self.service_panel.as_ref().map(|panel| panel.generation),
+            generation,
+        )
+    }
+
+    fn position_service_panel(&self) {
+        let (Some(panel), Some(frame)) = (&self.service_panel, self.service_frame()) else {
+            return;
+        };
+        match frame.panel {
+            Some(area) => {
+                let _ = panel.webview.set_bounds(logical_rect(area));
+                let _ = panel.webview.set_visible(true);
+                if frame.window_fullscreen {
+                    // Por cima das colunas e de todos os filhos da janela.
+                    raise_webview_host(&panel.webview);
+                }
+            }
+            // Minimizado: sai da frente, a pagina continua viva (o som
+            // continua, como numa aba em segundo plano), e o teclado nao fica
+            // preso nela -- uma tecla perdida pausava o video.
+            None => {
+                let _ = panel.webview.set_visible(false);
+                let _ = panel.webview.focus_parent();
+            }
+        }
+    }
+
+    /// Um passo do painel de servicos: faixa, icone, a propria pagina, Esc.
+    fn service_input(&mut self, input: ServiceInput) {
+        let Some(panel) = self.service_panel.as_mut() else {
+            return;
+        };
+        match panel.state.step(input) {
+            ServiceEffect::Relayout => self.apply_service_frame(),
+            ServiceEffect::ExitPageFullscreen => {
+                let _ = panel.webview.evaluate_script(EXIT_PAGE_FULLSCREEN_SCRIPT);
+            }
+            ServiceEffect::Close => self.close_service_panel(),
+            ServiceEffect::Nothing => {}
+        }
+    }
+
+    /// Aplica o modo do painel de servicos a janela inteira: tela cheia da
+    /// janela, painel, colunas, divisores, "Sair", pega e roda.
+    fn apply_service_frame(&mut self) {
+        let fullscreen = self.service_covers_window();
+        if fullscreen != self.panel_window_fullscreen {
+            self.panel_window_fullscreen = fullscreen;
+            if let Some(window) = &self.window {
+                window.set_fullscreen(fullscreen.then_some(Fullscreen::Borderless(None)));
+            }
+            // Em tela cheia o teclado vai para o painel: o Esc (e as teclas
+            // do proprio video) chegam a ele e nao a uma coluna escondida.
+            if fullscreen && let Some(panel) = &self.service_panel {
+                let _ = panel.webview.focus();
+            }
+        }
+        self.position_service_panel();
+        self.fit_comparator_to_panel();
+        self.sync_comparator_splitters();
+        self.sync_exit_button();
+        self.after_panel_change();
+        self.needs_clear = true;
+        self.request_redraw();
+    }
+
+    /// O painel da direita a vista e encostado (o que tem pega), em pixels
+    /// logicos, e o tipo de largura que ele usa.
+    fn docked_right_panel(&self) -> Option<(PanelKind, Area)> {
+        let (logical_w, logical_h, top, _) = self.panel_space()?;
+        // O de servicos minimizado nao esta a vista: conta o outro painel.
+        if let Some(frame) = self.service_frame().filter(|frame| frame.panel.is_some()) {
+            return frame
+                .resize_handle
+                .then_some(frame.panel)
+                .flatten()
+                .map(|area| (PanelKind::Service, area));
+        }
+        let kind = if self.live_panel.is_open() {
+            PanelKind::Service
+        } else if self.side_panel.is_some() {
+            PanelKind::History
+        } else {
+            return None;
+        };
+        Some((
+            kind,
+            panel_area(
+                self.chosen_panel_width(kind, logical_w),
+                logical_w,
+                logical_h,
+                top,
+            ),
+        ))
+    }
+
+    /// O painel da direita a vista (encostado ou em tela cheia) e a janela
+    /// hospedeira dele, para a roda do rato.
+    fn visible_right_panel(&self) -> Option<(Area, HWND)> {
+        use wry::WebViewExtWindows;
+        if let Some(panel) = &self.service_panel
+            && let Some(area) = self.service_frame().and_then(|frame| frame.panel)
+        {
+            return Some((area, panel.webview.hwnd().0 as HWND));
+        }
+        let (_, area) = self.docked_right_panel()?;
+        let host = self
+            .live_panel
+            .view()
+            .or(self.side_panel.as_ref())?
+            .hwnd()
+            .0 as HWND;
+        Some((area, host))
+    }
+
+    /// Depois de qualquer mudanca nos paineis da direita: a pega e a roda.
+    fn after_panel_change(&mut self) {
+        self.sync_panel_handle();
+        self.sync_wheel_route();
+    }
+
+    /// A roda sobre o painel da direita vai para o painel (`wheel_hook`).
+    fn sync_wheel_route(&self) {
+        let target = self.visible_right_panel().and_then(|(area, host)| {
+            let window = self.window.as_ref()?;
+            let owner = window_hwnd(window)?;
+            let scale = window.scale_factor().max(1.0);
+            let mut origin = POINT { x: 0, y: 0 };
+            unsafe {
+                ClientToScreen(owner, &mut origin);
+            }
+            let rect = ScreenRect {
+                left: origin.x + (area.x * scale).round() as i32,
+                top: origin.y + (area.y * scale).round() as i32,
+                right: origin.x + ((area.x + area.width) * scale).round() as i32,
+                bottom: origin.y + ((area.y + area.height) * scale).round() as i32,
+            };
+            Some((rect, host, owner))
         });
+        match target {
+            Some((rect, host, owner)) => {
+                WHEEL_PANEL_LEFT.store(rect.left, Ordering::Release);
+                WHEEL_PANEL_TOP.store(rect.top, Ordering::Release);
+                WHEEL_PANEL_RIGHT.store(rect.right, Ordering::Release);
+                WHEEL_PANEL_BOTTOM.store(rect.bottom, Ordering::Release);
+                WHEEL_PANEL_HOST.store(host as usize, Ordering::Release);
+                WHEEL_APP_HWND.store(owner as usize, Ordering::Release);
+                WHEEL_PANEL_ACTIVE.store(true, Ordering::Release);
+                install_wheel_hook();
+            }
+            None => {
+                WHEEL_PANEL_ACTIVE.store(false, Ordering::Release);
+                uninstall_wheel_hook();
+            }
+        }
+    }
+
+    /// A pega da borda esquerda do painel: popup owned como os divisores das
+    /// colunas, nunca ativa, so com o painel encostado.
+    fn sync_panel_handle(&mut self) {
+        let wanted = self.docked_right_panel();
+        let (Some((_, panel)), Some(window)) = (wanted, &self.window) else {
+            if let Some(handle) = self.panel_handle {
+                unsafe {
+                    ShowWindow(handle, SW_HIDE);
+                }
+            }
+            return;
+        };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
+        let area = panel_handle_area(panel, PANEL_HANDLE_WIDTH);
+
+        if let Some(handle) = self.panel_handle
+            && unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindow(handle, 4) } != owner
+        {
+            unsafe {
+                DestroyWindow(handle);
+            }
+            self.panel_handle = None;
+        }
+        let handle = match self.panel_handle {
+            Some(handle) => handle,
+            None => unsafe {
+                let created = CreateWindowExW(
+                    AUX_POPUP_EX_STYLE,
+                    windows_sys::w!("STATIC"),
+                    windows_sys::w!("NeuralIA.PanelResize"),
+                    AUX_POPUP_STYLE,
+                    0,
+                    0,
+                    1,
+                    1,
+                    owner,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                );
+                if created.is_null() {
+                    return;
+                }
+                let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
+                if SetWindowSubclass(
+                    created,
+                    Some(panel_handle_subclass),
+                    PANEL_HANDLE_SUBCLASS_ID,
+                    proxy_ptr,
+                ) == 0
+                {
+                    DestroyWindow(created);
+                    return;
+                }
+                self.panel_handle = Some(created);
+                created
+            },
+        };
+        let mut origin = POINT { x: 0, y: 0 };
+        unsafe {
+            ClientToScreen(owner, &mut origin);
+            SetWindowPos(
+                handle,
+                std::ptr::null_mut(),
+                origin.x + (area.x * scale).round() as i32,
+                origin.y + (area.y * scale).round() as i32,
+                (area.width * scale).round().max(3.0) as i32,
+                (area.height * scale).round().max(1.0) as i32,
+                SWP_NOACTIVATE,
+            );
+            show_popup_without_activation(handle);
+            InvalidateRect(handle, std::ptr::null(), 1);
+        }
+    }
+
+    fn hide_panel_handle(&self) {
+        if let Some(handle) = self.panel_handle {
+            unsafe {
+                ShowWindow(handle, SW_HIDE);
+            }
+        }
+    }
+
+    /// A pega foi arrastada: a borda do painel segue o rato, presa a
+    /// [300 px, 60% da janela], e as colunas refluem para o lado.
+    fn resize_panel(&mut self) {
+        // Limpar a marca ANTES de ler, como no divisor das colunas.
+        PANEL_RESIZE_PENDING.store(false, Ordering::Release);
+        let Some((kind, _)) = self.docked_right_panel() else {
+            return;
+        };
+        let (Some(window), Some((logical_w, _, _, scale))) = (&self.window, self.panel_space())
+        else {
+            return;
+        };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let mut point = POINT {
+            x: PANEL_RESIZE_X.load(Ordering::Acquire),
+            y: 0,
+        };
+        unsafe {
+            ScreenToClient(owner, &mut point);
+        }
+        let width = panel_width_from_drag(point.x as f64 / scale, logical_w);
+        self.panel_widths.set(kind, width);
+        self.relayout_right_panels();
+    }
+
+    /// Recoloca os paineis da direita e as colunas depois de mudar a largura.
+    fn relayout_right_panels(&mut self) {
+        self.position_side_panel();
+        self.position_service_panel();
+        self.position_live_panel();
+        self.fit_comparator_to_panel();
+        self.after_panel_change();
+        self.needs_clear = true;
+        self.request_redraw();
+    }
+
+    /// Largou a pega: a largura fica gravada (escrita atomica).
+    fn save_panel_widths(&mut self) {
+        let path = self.config.data_dir.join(PANEL_WIDTHS_FILE);
+        if let Err(error) = self.panel_widths.save(&path) {
+            self.show_splash(format!("A largura do painel não foi gravada: {error}"), 3);
+        }
     }
 
     /// O olho da barra: liga o Gemini Live (abre o painel, que pede a chave
@@ -10528,16 +11507,14 @@ impl App {
     }
 
     fn live_panel_rect(&self) -> Option<wry::Rect> {
-        let window = self.window.as_ref()?;
-        let scale = window.scale_factor().max(1.0);
-        let size = window.inner_size();
-        let top = if self.surface == Surface::Comparator {
-            COMPARATOR_CHROME_HEIGHT
-        } else {
-            0.0
-        };
-        let (x, y, width, height) =
-            service_panel_bounds(size.width as f64 / scale, size.height as f64 / scale, top);
+        let (logical_w, logical_h, top, _) = self.panel_space()?;
+        let (x, y, width, height) = panel_bounds(
+            PanelKind::Service,
+            self.panel_widths.get(PanelKind::Service),
+            logical_w,
+            logical_h,
+            top,
+        );
         Some(wry::Rect {
             position: LogicalPosition::new(x, y).into(),
             size: LogicalSize::new(width, height).into(),
@@ -10545,8 +11522,9 @@ impl App {
     }
 
     fn open_live_panel(&mut self) {
-        // Um painel de cada vez.
-        self.close_service_panel();
+        // Um painel de cada vez -- o de servicos minimizado nao esta a vista e
+        // continua a tocar.
+        self.close_docked_service_panel();
         self.close_side_panel();
         let Some(bounds) = self.live_panel_rect() else {
             return;
@@ -10576,6 +11554,7 @@ impl App {
                 debug_log(format_args!("live panel: ligado"));
                 self.live_panel.open(panel);
                 self.fit_comparator_to_panel();
+                self.after_panel_change();
                 self.request_redraw();
             }
             Err(error) => {
@@ -10593,6 +11572,7 @@ impl App {
         drop(panel);
         debug_log(format_args!("live panel: desligado"));
         self.fit_comparator_to_panel();
+        self.after_panel_change();
         self.request_redraw();
     }
 
@@ -10671,15 +11651,14 @@ impl App {
             return 0.0;
         }
         let scale = window.scale_factor().max(1.0);
-        let size = window.inner_size();
-        let (width, height) = (size.width as f64 / scale, size.height as f64 / scale);
-        if self.service_panel.is_some() || self.live_panel.is_open() {
-            service_panel_bounds(width, height, COMPARATOR_CHROME_HEIGHT).2
-        } else if self.side_panel.is_some() {
-            side_panel_bounds(width, height, COMPARATOR_CHROME_HEIGHT).2
-        } else {
-            0.0
-        }
+        let logical_w = window.inner_size().width as f64 / scale;
+        reserved_panel_width(
+            self.service_panel.as_ref().map(|panel| panel.state),
+            self.live_panel.is_open(),
+            self.side_panel.is_some(),
+            self.chosen_panel_width(PanelKind::Service, logical_w),
+            self.chosen_panel_width(PanelKind::History, logical_w),
+        )
     }
 
     /// O comparador encolhe para o lado do painel, como no Chrome. Antes o
@@ -10710,16 +11689,14 @@ impl App {
     }
 
     fn side_panel_rect(&self) -> Option<wry::Rect> {
-        let window = self.window.as_ref()?;
-        let scale = window.scale_factor().max(1.0);
-        let size = window.inner_size();
-        let top = if self.surface == Surface::Comparator {
-            COMPARATOR_CHROME_HEIGHT
-        } else {
-            0.0
-        };
-        let (x, y, width, height) =
-            side_panel_bounds(size.width as f64 / scale, size.height as f64 / scale, top);
+        let (logical_w, logical_h, top, _) = self.panel_space()?;
+        let (x, y, width, height) = panel_bounds(
+            PanelKind::History,
+            self.panel_widths.get(PanelKind::History),
+            logical_w,
+            logical_h,
+            top,
+        );
         Some(wry::Rect {
             position: LogicalPosition::new(x, y).into(),
             size: LogicalSize::new(width, height).into(),
@@ -10727,8 +11704,9 @@ impl App {
     }
 
     fn open_side_panel(&mut self) {
-        // Um painel de cada vez.
-        self.close_service_panel();
+        // Um painel de cada vez -- o de servicos minimizado nao esta a vista e
+        // continua a tocar.
+        self.close_docked_service_panel();
         self.close_live_panel();
         let Some(bounds) = self.side_panel_rect() else {
             return;
@@ -10755,6 +11733,7 @@ impl App {
                 self.install_context_menu(&panel, WebViewHost::SidePanel);
                 self.side_panel = Some(panel);
                 self.fit_comparator_to_panel();
+                self.after_panel_change();
                 debug_log(format_args!(
                     "side panel: aberto surface={:?}",
                     self.surface
@@ -10773,6 +11752,7 @@ impl App {
         self.panel_suggestion_query = None;
         debug_log(format_args!("side panel: fechado"));
         self.fit_comparator_to_panel();
+        self.after_panel_change();
         // Largar a WebView nao devolve o teclado a ninguem.
         if self.surface == Surface::Home {
             self.focus_omnibox();
@@ -10918,6 +11898,19 @@ impl App {
     /// A dica do alvo `hit`, com o nome da IA, o endereco da aba ou o estado
     /// do grupo que o clique vai usar.
     fn bar_tooltip_text(&self, hit: BarHit, owner: HWND) -> Option<String> {
+        // A faixa e o icone do servico aberto falam do servico e do modo dele.
+        if let Some(panel) = &self.service_panel {
+            match hit {
+                BarHit::ServiceStrip(button) => return Some(button.hint(panel.service.label())),
+                BarHit::Service(service) if service == panel.service => {
+                    return Some(service_icon_hint(
+                        service.label(),
+                        panel.state.badge(panel.audio),
+                    ));
+                }
+                _ => {}
+            }
+        }
         let comp = self.comparator.as_ref();
         let column = match hit {
             BarHit::Column(index)
@@ -12127,6 +13120,13 @@ impl App {
     /// Esc -- da janela, ou o "voltar" que a pagina manda quando o teclado
     /// esta nela: a meio de um arrasto cancela-o; fora dele e o "voltar".
     fn escape_or_back(&mut self) {
+        // Com o painel de servicos em tela cheia, o Esc so sai da tela cheia
+        // -- venha de onde vier (o teclado pode ter ficado numa coluna, por
+        // baixo do painel).
+        if self.service_covers_window() {
+            self.service_input(ServiceInput::Escape);
+            return;
+        }
         if self.tab_gesture(TabGestureInput::Escape) == TabGestureEffect::Ignored {
             self.go_back();
         }
@@ -12176,6 +13176,7 @@ impl App {
             }
             Some(BarHit::Private) => self.open_private_panel(),
             Some(BarHit::Service(service)) => self.open_service_panel(service),
+            Some(BarHit::ServiceStrip(button)) => self.service_input(button.input()),
             Some(BarHit::GmailToggle) => self.toggle_gmail_notifications(),
             Some(BarHit::GeminiLive) => self.toggle_live_panel(),
             Some(BarHit::SplitClose) => self.close_split(),
@@ -14420,6 +15421,32 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ViewSourceTarget(target) => self.view_source_target(target),
             UserEvent::AutoScrollTick(token) => self.auto_scroll_tick(token),
             UserEvent::HideSplash(token) => self.hide_splash(token),
+            UserEvent::CaptionReveal => self.refresh_caption_reveal(),
+            UserEvent::ResizePanel => self.resize_panel(),
+            UserEvent::PanelResizeDone => self.save_panel_widths(),
+            UserEvent::ServiceFullscreen { generation, on } => {
+                if self.service_event_is_current(generation) {
+                    self.service_input(ServiceInput::PageFullscreen(on));
+                }
+            }
+            UserEvent::ServiceAudio {
+                generation,
+                playing,
+            } => {
+                if let Some(panel) = self
+                    .service_panel
+                    .as_mut()
+                    .filter(|panel| panel.generation == generation)
+                {
+                    panel.audio = playing;
+                    self.request_redraw();
+                }
+            }
+            UserEvent::ServiceEscape(generation) => {
+                if self.service_event_is_current(generation) {
+                    self.service_input(ServiceInput::Escape);
+                }
+            }
             UserEvent::GmailProbe(token) => {
                 if token == self.gmail_probe_token && self.gmail_monitor.is_none() {
                     self.maybe_start_gmail_monitor();
@@ -14555,6 +15582,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.minimize_comparator(idx);
                 }
             }
+            UserEvent::ColumnHint { col, hint } => self.show_column_hint(col, hint),
             UserEvent::ResizeComparator => {
                 // Limpar a marca ANTES de ler: um movimento que chegue durante
                 // o reposicionamento volta a enfileirar e nao se perde. Ao
@@ -14605,6 +15633,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     self.ensure_window_subclass();
                     self.sync_caption_buttons();
+                    self.refresh_caption_reveal();
                     self.needs_clear = true;
                     self.position_omnibox();
                     self.request_redraw();
@@ -14614,7 +15643,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::RestoreComparator => {
-                if self.surface == Surface::Comparator {
+                if self.service_frame().is_some_and(|frame| frame.exit_button) {
+                    self.service_input(ServiceInput::ToggleFullscreen);
+                } else if self.surface == Surface::Comparator {
                     self.restore_comparator();
                 }
             }
@@ -14675,6 +15706,13 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Some(window) = &self.window
                             && let Some(comp) = &self.comparator
                         {
+                            let service = self.service_panel.as_ref().map(|panel| {
+                                (
+                                    panel.service,
+                                    panel.state.badge(panel.audio),
+                                    self.service_strip_physical(),
+                                )
+                            });
                             draw_comparator_bar(
                                 window,
                                 comp,
@@ -14684,6 +15722,16 @@ impl ApplicationHandler<UserEvent> for App {
                                 drag,
                                 &self.live_panel,
                             );
+                            if let Some((service, badge, strip)) = service {
+                                draw_service_chrome(
+                                    window,
+                                    comp.split.is_some(),
+                                    service,
+                                    badge,
+                                    strip,
+                                    self.bar_hover,
+                                );
+                            }
                         }
                     }
                     _ => {}
@@ -14698,6 +15746,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.position_side_panel();
                 self.position_service_panel();
                 self.position_live_panel();
+                self.after_panel_change();
                 if self.surface == Surface::Home {
                     self.sync_caption_buttons();
                 }
@@ -14731,6 +15780,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.position_exit_button();
                 self.position_palette();
                 self.sync_comparator_splitters();
+                self.after_panel_change();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
@@ -14748,6 +15798,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.update_bar_hover();
                 }
                 self.update_home_go_hover();
+                self.refresh_caption_reveal();
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor = (-1.0, -1.0);
@@ -14755,6 +15806,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.update_bar_hover();
                 }
                 self.update_home_go_hover();
+                self.refresh_caption_reveal();
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Focused(focused) => self.on_focus_changed(focused),
@@ -15819,6 +16871,131 @@ fn draw_comparator_bar<W>(
         }
 
         let _ = ReleaseDC(hwnd, hdc);
+    }
+}
+
+/// O que o painel de servicos acrescenta ao chrome nativo: o ponto no icone
+/// do servico minimizado (vermelho a tocar, na cor de destaque em silencio) e
+/// a faixa [— Minimizar] [⛶ Tela cheia] [× Fechar] por cima do painel.
+fn draw_service_chrome(
+    window: &Window,
+    split_active: bool,
+    service: Service,
+    badge: Option<ServiceBadge>,
+    strip: Option<Area>,
+    hover: Option<BarHit>,
+) {
+    let Some(hwnd) = window_hwnd(window) else {
+        return;
+    };
+    let scale = window.scale_factor().max(1.0);
+    let theme = Theme::system();
+    unsafe {
+        let hdc = GetDC(hwnd);
+        if hdc.is_null() {
+            return;
+        }
+        let mut client = RECT::default();
+        GetClientRect(hwnd, &mut client);
+
+        if let Some(badge) = badge {
+            let controls = right_controls(client.right.max(1) as f64, scale, split_active);
+            if let Some(icon) = controls
+                .services
+                .iter()
+                .zip(SERVICE_BUTTON_HITS)
+                .find(|(_, hit)| *hit == BarHit::Service(service))
+                .map(|(rect, _)| *rect)
+            {
+                let color = match badge {
+                    ServiceBadge::Playing => LIVE_ON_RED,
+                    ServiceBadge::Minimized => theme.accent,
+                };
+                let radius = (icon.height * 0.17).max(3.0);
+                let cx = icon.x + icon.width - radius * 0.9;
+                let cy = icon.y + radius * 0.9;
+                let brush = CreateSolidBrush(rgb3(color));
+                let pen = CreatePen(
+                    PS_SOLID as _,
+                    (1.5 * scale).round() as i32,
+                    rgb3(theme.bar_bg),
+                );
+                let old_brush = SelectObject(hdc, brush as _);
+                let old_pen = SelectObject(hdc, pen as _);
+                Ellipse(
+                    hdc,
+                    (cx - radius).round() as i32,
+                    (cy - radius).round() as i32,
+                    (cx + radius).round() as i32,
+                    (cy + radius).round() as i32,
+                );
+                SelectObject(hdc, old_pen);
+                SelectObject(hdc, old_brush);
+                DeleteObject(pen as _);
+                DeleteObject(brush as _);
+            }
+        }
+
+        if let Some(strip) = strip {
+            let area = RECT {
+                left: strip.x.round() as i32,
+                top: strip.y.round() as i32,
+                right: (strip.x + strip.width).round() as i32,
+                bottom: (strip.y + strip.height).round() as i32,
+            };
+            let bg = CreateSolidBrush(rgb3(theme.bar_bg));
+            FillRect(hdc, &area, bg);
+            DeleteObject(bg as _);
+            let line = RECT {
+                top: area.bottom - 1,
+                ..area
+            };
+            let line_brush = CreateSolidBrush(rgb3(theme.bar_line));
+            FillRect(hdc, &line, line_brush);
+            DeleteObject(line_brush as _);
+
+            let font = create_font((-12.5 * scale).round() as i32, FW_NORMAL as i32);
+            let old_font = SelectObject(hdc, font as _);
+            SetBkMode(hdc, TRANSPARENT as i32);
+            SetTextColor(hdc, rgb3(theme.fg_muted));
+            let buttons = strip_buttons(strip, scale);
+            let mut label = RECT {
+                left: area.left + (12.0 * scale).round() as i32,
+                right: (buttons[0].x - 6.0 * scale).round() as i32,
+                ..area
+            };
+            draw_text(
+                hdc,
+                service.label(),
+                &mut label,
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+            for (rect, button) in buttons.iter().zip(StripButton::ALL) {
+                let hovered = hover == Some(BarHit::ServiceStrip(button));
+                let style = match (button, hovered) {
+                    (StripButton::Close, _) => caption_button_style(2, hovered, &theme),
+                    (_, true) => PillStyle::new(theme.surface_line, theme.surface_line, theme.fg),
+                    (_, false) => PillStyle::new(theme.surface, theme.surface_line, theme.fg),
+                };
+                draw_pill(
+                    hdc,
+                    UiRect {
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
+                    },
+                    button.label(),
+                    style,
+                    scale,
+                    font,
+                    theme.bar_bg,
+                );
+            }
+            SelectObject(hdc, old_font);
+            DeleteObject(font as _);
+        }
+        ReleaseDC(hwnd, hdc);
     }
 }
 
@@ -17739,6 +18916,21 @@ mod tests {
             App
         );
         assert_eq!(history_nav_target(Surface::Home, false, None, false), App);
+    }
+
+    /// Na Home os botoes da janela existem mas so se veem (e so aceitam o
+    /// clique) depois de o rato chegar a zona deles; no comparador fazem parte
+    /// da barra e estao sempre la. A maquina de estado do "chegar" e do
+    /// "esconder 300 ms depois" e `CaptionReveal` (panel_chrome).
+    #[test]
+    fn home_window_buttons_show_only_once_revealed_and_the_bar_keeps_them() {
+        assert!(!caption_buttons_visible(Surface::Home, false));
+        assert!(caption_buttons_visible(Surface::Home, true));
+        assert!(caption_buttons_visible(Surface::Comparator, false));
+        let mut reveal = CaptionReveal::default();
+        assert!(!caption_buttons_visible(Surface::Home, reveal.shown()));
+        assert_eq!(reveal.observe(true, 0), RevealStep::Show);
+        assert!(caption_buttons_visible(Surface::Home, reveal.shown()));
     }
 
     #[test]
@@ -20272,12 +21464,12 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
 
         // Nenhum handler que dispare acao nativa aceita evento sintetico:
         // os 4 de sempre + os 4 da pergunta replicada (focusin, Enter,
-        // botao de enviar, submit).
+        // botao de enviar, submit) + os 2 da dica centrada (entrar e sair).
         assert_eq!(
             COMPARATOR_INJECT_SCRIPT
                 .matches("if (!event.isTrusted")
                 .count(),
-            8
+            10
         );
         assert!(!COMPARATOR_INJECT_SCRIPT.contains("expand.onclick"));
         assert!(!COMPARATOR_INJECT_SCRIPT.contains("minimize.onclick"));
@@ -21606,6 +22798,267 @@ __fire('keydown', { key: 'F8' });
             "erros: {}",
             results[0]["errors"]
         );
+    }
+
+    /// O "−" e o "⛶ <IA>" que embarcam no COMPARATOR_INJECT_SCRIPT pedem a
+    /// dica centrada do app ao passar o rato, e so com eventos do utilizador.
+    /// Corre o script QUE EMBARCA no Node e leva o que ele publica pelo mesmo
+    /// caminho nativo: parser do canal -> evento da coluna -> texto da dica.
+    #[test]
+    fn column_controls_ask_for_the_centered_hint_on_trusted_hover() {
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let drive = r#"
+document.readyState = 'interactive';
+__fire('DOMContentLoaded');
+__drain();
+function __on(id, type, extra) {
+  for (const l of __listeners.slice()) {
+    if (l.type !== type || !l.target || l.target.id !== id) continue;
+    try { l.handler.call(l.target, __event(type, extra)); }
+    catch (e) { __errors.push(type + ': ' + e.message); }
+  }
+}
+__on('neuralia-comp-minimize', 'mouseenter');
+__on('neuralia-comp-minimize', 'mouseleave');
+__on('neuralia-comp-expand', 'mouseenter', { isTrusted: false });
+__on('neuralia-comp-expand', 'mouseenter');
+__on('neuralia-comp-expand', 'mouseleave');
+"#;
+        let script = format!(
+            "window.__neuralia_col_index = 1; window.__neuralia_col_name = 'ChatGPT';\n{}",
+            COMPARATOR_INJECT_SCRIPT.replace("__NEURALIA_CAP__", CAP)
+        );
+        let cases = [serde_json::json!({
+            "name": "comparator",
+            "href": "https://chatgpt.com/",
+            "script": script,
+            "drive": drive,
+        })];
+        let program = format!(
+            "const INPUT = {};\n{}",
+            serde_json::json!({ "cases": cases }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        let errors = &results[0]["errors"];
+        assert_eq!(errors.as_array().map(Vec::len), Some(0), "erros: {errors}");
+        let texts: Vec<String> = results[0]["posted"]
+            .as_array()
+            .expect("posted")
+            .iter()
+            .filter_map(|message| parse_ipc_message(message.as_str()?, CAP, 3))
+            .map(|action| match App::column_ipc_event_impl(1, action) {
+                Some(UserEvent::ColumnHint { col: 1, hint }) => column_hint_text(hint, "ChatGPT"),
+                other => panic!("a coluna publicou outra coisa: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            ["Minimizar ChatGPT", "", "Expandir ChatGPT", ""],
+            "o mouseenter sintetico nao pode pedir dica"
+        );
+
+        // Uma coluna so pede dicas para si propria.
+        assert!(
+            App::column_ipc_event_impl(
+                0,
+                IpcAction::Hint {
+                    col: 1,
+                    hint: ColumnHint::Expand
+                }
+            )
+            .is_none()
+        );
+    }
+
+    /// Ctrl+roda e a pinca do touchpad (que o Chromium entrega como
+    /// ctrl+wheel) passam pelo mapa de teclas QUE EMBARCA e chegam ao nativo
+    /// como os mesmos zoomin/zoomout do Ctrl+= e do Ctrl+-. Sem Ctrl a roda e
+    /// da pagina; uma pagina que trata o gesto (preventDefault) fica com ele.
+    #[test]
+    fn ctrl_wheel_and_touchpad_pinch_zoom_through_the_app_steps() {
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let drive = r#"
+document.readyState = 'interactive';
+__fire('DOMContentLoaded');
+__drain();
+__fire('wheel', { ctrlKey: true, deltaY: -100, deltaMode: 0 });
+__fire('wheel', { ctrlKey: false, deltaY: -100, deltaMode: 0 });
+__fire('wheel', { ctrlKey: true, deltaY: 100, deltaMode: 0 });
+__fire('wheel', { ctrlKey: true, deltaY: -100, deltaMode: 0, defaultPrevented: true });
+__fire('wheel', { ctrlKey: true, deltaY: -100, deltaMode: 0, isTrusted: false });
+for (let i = 0; i < 10; i++) __fire('wheel', { ctrlKey: true, deltaY: -4, deltaMode: 0 });
+__fire('wheel', { ctrlKey: true, deltaY: 3, deltaMode: 0 });
+__fire('wheel', { ctrlKey: true, deltaY: 1, deltaMode: 1 });
+__drain();
+"#;
+        let cases = [serde_json::json!({
+            "name": "keymap",
+            "href": "https://example.com/",
+            "script": NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", CAP),
+            "drive": drive,
+        })];
+        let program = format!(
+            "const INPUT = {};
+{}",
+            serde_json::json!({ "cases": cases }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        let errors = &results[0]["errors"];
+        assert_eq!(errors.as_array().map(Vec::len), Some(0), "erros: {errors}");
+        let actions: Vec<IpcAction> = results[0]["posted"]
+            .as_array()
+            .expect("posted")
+            .iter()
+            .filter_map(|message| parse_ipc_message(message.as_str()?, CAP, 3))
+            .collect();
+        // Entalhe para cima, entalhe para baixo, dez pedacos de pinca que
+        // somam um degrau, e uma linha (deltaMode 1) para baixo.
+        assert_eq!(
+            actions,
+            vec![
+                IpcAction::ZoomIn,
+                IpcAction::ZoomOut,
+                IpcAction::ZoomIn,
+                IpcAction::ZoomOut,
+            ]
+        );
+        // O nativo trata-os como o Ctrl+= e o Ctrl+-: os degraus do app.
+        assert!(matches!(
+            App::column_ipc_event_impl(0, IpcAction::ZoomIn),
+            Some(UserEvent::ZoomIn)
+        ));
+        assert!(matches!(
+            App::column_ipc_event_impl(0, IpcAction::ZoomOut),
+            Some(UserEvent::ZoomOut)
+        ));
+        // Um mecanismo so: nenhuma WebView liga o zoom proprio do WebView2
+        // (Ctrl+roda e pinca do Chromium), que somaria ao nosso.
+        let source = include_str!("windows_app.rs");
+        let forbidden = ["with_hotkeys_zoom(", "true)"].concat();
+        assert!(!source.contains(&forbidden));
+    }
+
+    /// O painel do Ctrl+H tinha a barra de rolagem classica do Windows (setas,
+    /// calha cinzenta), que destoava do resto do NeuralIA. Nao ha browser nos
+    /// testes para medir pixels: isto so prova que a folha que embarca declara
+    /// a barra fina nas variaveis do tema -- as mesmas que o nativo reescreve
+    /// ao mudar de tema claro/escuro (panel_theme_vars).
+    #[test]
+    fn the_history_panel_scrollbar_is_thin_and_follows_the_theme() {
+        let html = panel_html(&Theme::light((0, 120, 212)));
+        let style = html
+            .split("<style>")
+            .nth(1)
+            .and_then(|rest| rest.split("</style>").next())
+            .expect("folha do painel");
+        let rule = |selector: &str| {
+            style
+                .lines()
+                .find(|line| line.starts_with(selector))
+                .unwrap_or_else(|| panic!("sem regra {selector}"))
+                .to_string()
+        };
+        assert!(rule("::-webkit-scrollbar{").contains("width:10px"));
+        let thumb = rule("::-webkit-scrollbar-thumb{");
+        assert!(thumb.contains("var(--line)") && thumb.contains("border-radius:999px"));
+        assert!(rule("::-webkit-scrollbar-thumb:hover{").contains("var(--muted)"));
+        assert!(rule("::-webkit-scrollbar-button{").contains("display:none"));
+        // As variaveis existem nos dois temas.
+        for theme in [Theme::light((0, 120, 212)), Theme::dark((0, 120, 212))] {
+            let vars = panel_theme_vars(&theme);
+            assert!(vars["--line"].is_string() && vars["--muted"].is_string());
+        }
+    }
+
+    /// Arrastar a borda do painel muda a largura dele e as colunas das IAs
+    /// refluem ate a borda nova, sem buraco nem sobreposicao; minimizado, o
+    /// painel de servicos devolve a largura inteira as colunas. E a mesma conta
+    /// que o layout, os divisores e o arrasto dos divisores usam.
+    #[test]
+    fn the_columns_reflow_to_the_panel_edge_and_reclaim_it_when_minimized() {
+        let window_w = 1600.0;
+        let mut widths = PanelWidths::default();
+        for dragged_to in [1300.0, 1100.0, 700.0, 50.0] {
+            let width = panel_width_from_drag(dragged_to, window_w);
+            widths.set(PanelKind::Service, width);
+            let chosen = panel_width(PanelKind::Service, widths.get(PanelKind::Service), window_w);
+            let (panel_x, _, panel_w, _) = panel_bounds(
+                PanelKind::Service,
+                widths.get(PanelKind::Service),
+                window_w,
+                900.0,
+                COMPARATOR_CHROME_HEIGHT,
+            );
+            assert_eq!(panel_w, chosen);
+            let reserved = reserved_panel_width(
+                Some(ServicePanelState::default()),
+                false,
+                false,
+                chosen,
+                440.0,
+            );
+            let columns = comparator_logical_width(window_w, reserved);
+            let spans = visible_column_spans(
+                columns,
+                COMPARATOR_COLUMNS,
+                &[1.0; COMPARATOR_COLUMNS],
+                &[false; COMPARATOR_COLUMNS],
+            );
+            let last = spans.last().expect("colunas");
+            assert!(
+                (last.x + last.width - panel_x).abs() < 1e-6,
+                "arrastado ate {dragged_to}: colunas acabam em {} e o painel comeca em {panel_x}",
+                last.x + last.width
+            );
+            // Nunca menos de 300 px nem mais de 60% da janela.
+            assert!((300.0..=960.0).contains(&panel_w), "{panel_w}");
+        }
+
+        // Minimizado: as colunas voltam a ocupar a janela toda.
+        let mut minimized = ServicePanelState::default();
+        minimized.step(ServiceInput::Minimize);
+        let reserved = reserved_panel_width(Some(minimized), false, false, 600.0, 440.0);
+        assert_eq!(reserved, 0.0);
+        assert_eq!(comparator_logical_width(window_w, reserved), window_w);
+        // Minimizado e com o historico aberto ao lado: conta o historico.
+        assert_eq!(
+            reserved_panel_width(Some(minimized), false, true, 600.0, 440.0),
+            440.0
+        );
+        // Os outros paineis cedem a largura deles.
+        assert_eq!(reserved_panel_width(None, true, false, 600.0, 440.0), 600.0);
+        assert_eq!(reserved_panel_width(None, false, true, 600.0, 440.0), 440.0);
+        assert_eq!(reserved_panel_width(None, false, false, 600.0, 440.0), 0.0);
+    }
+
+    /// Os avisos do WebView2 do painel de servicos (tela cheia da pagina, Esc)
+    /// so contam para o painel que os mandou, e so o Esc em baixo vira evento.
+    #[test]
+    fn service_panel_webview_signals_reach_only_the_panel_that_sent_them() {
+        assert!(matches!(
+            service_key_event(7, 0x1B, true),
+            Some(UserEvent::ServiceEscape(7))
+        ));
+        assert!(service_key_event(7, 0x1B, false).is_none());
+        assert!(service_key_event(7, 0x0D, true).is_none());
+        assert!(service_event_is_current(Some(7), 7));
+        assert!(
+            !service_event_is_current(Some(8), 7),
+            "aviso de um painel ja fechado"
+        );
+        assert!(!service_event_is_current(None, 7));
+
+        // O icone do servico diz o que o clique faz em cada modo.
+        assert_eq!(
+            service_icon_hint("YouTube", Some(ServiceBadge::Playing)),
+            "YouTube minimizado, a tocar · clique para voltar ao painel"
+        );
+        assert!(service_icon_hint("YouTube", Some(ServiceBadge::Minimized)).contains("voltar"));
+        assert!(service_icon_hint("YouTube", None).contains("fechar"));
     }
 
     const LABEL_TURN_OFF: &str = "Desativar rolagem automática (Ctrl+R)";
@@ -27413,6 +28866,47 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       act('restore');
     }
   }, true);
+
+  // Ctrl + roda do rato, e a pinca do touchpad (o Chromium entrega-a como
+  // ctrl+wheel), sobem e descem os mesmos degraus do Ctrl+= e do Ctrl+-, com
+  // o mesmo aviso. O zoom do proprio WebView2 esta desligado (o wry deixa
+  // IsZoomControlEnabled e IsPinchZoomEnabled a false): um mecanismo so, sem
+  // zoom a dobrar.
+  const defer = setTimeout;
+  // Pixels de roda por degrau: um entalhe de rato (100) sobe um degrau; a
+  // pinca, que chega em pedacos pequenos, soma ate la.
+  const WHEEL_ZOOM_STEP = 30;
+  // Uma pausa maior do que isto comeca um gesto novo.
+  const WHEEL_ZOOM_IDLE_MS = 400;
+  let wheelZoomSum = 0;
+  let wheelZoomAt = -Infinity;
+  function wheelZoomAction(e) {
+    const unit = e.deltaMode === 1 ? 33 : (e.deltaMode === 2 ? 800 : 1);
+    const dy = Number(e.deltaY) * unit;
+    if (!isFinite(dy) || dy === 0) { return null; }
+    const at = Number(e.timeStamp) || 0;
+    if (at - wheelZoomAt > WHEEL_ZOOM_IDLE_MS || (wheelZoomSum < 0) !== (dy < 0)) {
+      wheelZoomSum = 0;
+    }
+    wheelZoomAt = at;
+    wheelZoomSum += dy;
+    if (Math.abs(wheelZoomSum) < WHEEL_ZOOM_STEP) { return null; }
+    const action = wheelZoomSum < 0 ? 'zoomin' : 'zoomout';
+    wheelZoomSum = 0;
+    return action;
+  }
+  window.addEventListener('wheel', function (e) {
+    if (!e.isTrusted || !e.ctrlKey) { return; }
+    const wheel = e;
+    // Decide-se depois de o evento passar por todos: uma pagina que trata o
+    // gesto ela propria (um mapa, um editor) chama preventDefault, e ai o
+    // zoom e dela -- como no Chrome.
+    defer(function () {
+      if (wheel.defaultPrevented) { return; }
+      const action = wheelZoomAction(wheel);
+      if (action) { act(action); }
+    }, 0);
+  }, { passive: true });
 })();
 "#;
 
@@ -28637,13 +30131,16 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
       listen(expand, 'click', (event) => {
         if (!event.isTrusted) return;
         event.preventDefault(); event.stopPropagation();
+        act('hint', { col:colIndex, id:'none' });
         act('expand', { col:colIndex });
       });
 
       const minimize = createElement('button');
       minimize.id = 'neuralia-comp-minimize';
       minimize.textContent = '−';
-      minimize.title = 'Minimizar ' + colName;
+      // A dica e a centrada do app (canal 'hint'), nao o title do browser:
+      // com os dois, apareciam duas dicas diferentes ao mesmo tempo.
+      minimize.ariaLabel = 'Minimizar ' + colName;
       assign(minimize.style, {
         position:'absolute', top:'10px', right:'112px',
         pointerEvents:'auto', width:'30px', height:'28px',
@@ -28656,8 +30153,25 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
       listen(minimize, 'click', (event) => {
         if (!event.isTrusted) return;
         event.preventDefault(); event.stopPropagation();
+        act('hint', { col:colIndex, id:'none' });
         act('minimize', { col:colIndex });
       });
+
+      // Passar o rato pelo "−" e pelo "⛶ <IA>" mostra a dica centrada do
+      // app, a mesma da barra. So eventos do utilizador (isTrusted); a pagina
+      // escolhe apenas QUAL das dicas, o texto e o nome vem do nativo.
+      function hintOn(button, id) {
+        listen(button, 'mouseenter', (event) => {
+          if (!event.isTrusted) return;
+          act('hint', { col:colIndex, id:id });
+        });
+        listen(button, 'mouseleave', (event) => {
+          if (!event.isTrusted) return;
+          act('hint', { col:colIndex, id:'none' });
+        });
+      }
+      hintOn(minimize, 'minimize');
+      hintOn(expand, 'expand');
 
       const rail = createElement('div');
       rail.id = 'neuralia-response-rail';

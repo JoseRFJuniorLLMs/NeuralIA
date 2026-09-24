@@ -10,6 +10,10 @@
 // Fora do Windows ninguém o chama ainda; daí o `allow(dead_code)`.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod ipc;
+// Botoes da janela na Home, largura do painel lateral, roda do rato sobre ele
+// e modos do painel de servicos: decisoes puras, testadas tambem no Linux.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod panel_chrome;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod pdf_assets;
 // Abas e grupos guardados entre sessoes: JSON e ficheiros, portatil e testado
