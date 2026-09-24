@@ -50,9 +50,10 @@ impl Rect {
 /// Tamanho da janela em unidades logicas, antes do DPI.
 pub const WINDOW_W: f64 = 760.0;
 pub const WINDOW_H: f64 = 500.0;
-/// Proporcao de `assets/neuralia-home.png`, a arte da marca. O retangulo dela
-/// sai daqui: esticar a marca para caber num quadrado descaracteriza-a.
-pub const BRAND_ASPECT: f64 = 1254.0 / 874.0;
+/// Proporcao de `assets/neuralia-home.png` (1200x868), a arte da marca. O
+/// retangulo dela sai daqui: esticar a marca para caber num quadrado
+/// descaracteriza-a.
+pub const BRAND_ASPECT: f64 = 1200.0 / 868.0;
 
 /// De quanto em quanto tempo o temporizador acorda a janela, em milissegundos:
 /// ~30 quadros por segundo, o mesmo ritmo do tecido na Home da NeuralIA.

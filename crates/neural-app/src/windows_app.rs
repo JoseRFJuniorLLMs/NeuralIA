@@ -14300,8 +14300,12 @@ impl ApplicationHandler<UserEvent> for App {
             .with_inner_size(LogicalSize::new(1120.0, 760.0))
             .with_min_inner_size(LogicalSize::new(700.0, 500.0));
 
-        if let Some(icon) = get_app_icon() {
-            attributes = attributes.with_window_icon(Some(icon));
+        let (small_icon, big_icon) = app_icons();
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attributes = attributes
+                .with_window_icon(small_icon)
+                .with_taskbar_icon(big_icon);
         }
 
         match event_loop.create_window(attributes) {
@@ -16457,18 +16461,8 @@ const PDF_VIEWER_CSP: &str = "default-src 'none'; script-src 'self' blob: 'wasm-
 const PDF_MAX_BYTES: usize = 32 * 1024 * 1024;
 const PDF_TIMEOUT_SECS: u64 = 90;
 
-static LOGO_IMAGE: OnceLock<RgbaImage> = OnceLock::new();
 static BRAND_IMAGE: OnceLock<RgbaImage> = OnceLock::new();
 static SPLASH_CACHE: Mutex<SplashCache> = Mutex::new(None);
-
-fn get_logo_image() -> &'static RgbaImage {
-    LOGO_IMAGE.get_or_init(|| {
-        let raw = include_bytes!("../../../assets/logo.png");
-        image::load_from_memory(raw)
-            .expect("assets/logo.png must be valid PNG")
-            .to_rgba8()
-    })
-}
 
 /// Arte da marca mostrada na tela inicial: e a unica coisa la, com a barra.
 fn get_brand_image() -> &'static RgbaImage {
@@ -16480,41 +16474,26 @@ fn get_brand_image() -> &'static RgbaImage {
     })
 }
 
-fn get_app_icon() -> Option<Icon> {
-    let img = get_logo_image();
-    let size = 64u32;
-    let resized = image::imageops::resize(img, size, size, image::imageops::FilterType::Lanczos3);
-    let mut rgba = resized.into_raw();
-    let radius = (size as f32) * 0.20;
-    for y in 0..size {
-        for x in 0..size {
-            let dx = if (x as f32) < radius {
-                radius - (x as f32)
-            } else if (x as f32) > (size as f32) - 1.0 - radius {
-                (x as f32) - ((size as f32) - 1.0 - radius)
-            } else {
-                0.0
-            };
-            let dy = if (y as f32) < radius {
-                radius - (y as f32)
-            } else if (y as f32) > (size as f32) - 1.0 - radius {
-                (y as f32) - ((size as f32) - 1.0 - radius)
-            } else {
-                0.0
-            };
-            if dx > 0.0 && dy > 0.0 {
-                let dist = (dx * dx + dy * dy).sqrt();
-                let idx = ((y * size + x) * 4) as usize;
-                if dist > radius {
-                    rgba[idx + 3] = 0;
-                } else if dist > radius - 1.0 {
-                    let coverage = (radius - dist).clamp(0.0, 1.0);
-                    rgba[idx + 3] = ((rgba[idx + 3] as f32) * coverage) as u8;
-                }
-            }
-        }
-    }
-    Icon::from_rgba(rgba, size, size).ok()
+/// O icone do projeto e o grupo 1 dos recursos do proprio executavel: o
+/// `build.rs` compila la o `assets/logo.ico` (tests/brand_assets.rs confere-o
+/// no NeuralIA.exe). O mesmo que o Explorador e o atalho mostram.
+const APP_ICON_RESOURCE: u16 = 1;
+
+/// (pequeno, grande): o da barra de titulo e do Alt+Tab, e o da barra de
+/// tarefas. Cada um pedido no tamanho que o sistema usa a esta escala, para o
+/// Windows escolher a entrada certa do icone em vez de esticar uma so -- o
+/// icone anterior era uma imagem de 64 px com os cantos arredondados a mao,
+/// reduzida ou ampliada a tudo.
+fn app_icons() -> (Option<Icon>, Option<Icon>) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXICON, SM_CXSMICON};
+    use winit::{dpi::PhysicalSize, platform::windows::IconExtWindows};
+
+    let load = |side: i32| {
+        let side = side.clamp(16, 256) as u32;
+        Icon::from_resource(APP_ICON_RESOURCE, Some(PhysicalSize::new(side, side))).ok()
+    };
+    let (small, big) = unsafe { (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CXICON)) };
+    (load(small), load(big))
 }
 
 /// A marca, misturada com o que estiver por tras dela.
@@ -16643,6 +16622,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_window_and_taskbar_icons_come_from_the_project_icon() {
+        // O `resumed` pousa na janela o que `app_icons` devolve. Com o id do
+        // recurso errado (ou sem o assets/logo.ico compilado no executavel) a
+        // janela ficava com o icone generico do Windows sem erro nenhum. Que o
+        // recurso e o assets/logo.ico, com todos os tamanhos, prova-o
+        // tests/brand_assets.rs no NeuralIA.exe compilado.
+        let (small, big) = app_icons();
+        assert!(small.is_some(), "a barra de titulo ficou sem o icone");
+        assert!(big.is_some(), "a barra de tarefas ficou sem o icone");
     }
 
     #[test]
