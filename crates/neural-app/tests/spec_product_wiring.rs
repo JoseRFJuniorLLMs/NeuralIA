@@ -45,6 +45,8 @@ const ALL_SOURCES: &str = concat!(
     include_str!("../src/windows_app/notes.rs"),
     "\n",
     include_str!("../src/windows_app/side_panel.rs"),
+    "\n",
+    include_str!("../src/windows_app/services.rs"),
 );
 const APP: &str = ALL_SOURCES;
 const IPC: &str = include_str!("../src/ipc.rs");
