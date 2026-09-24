@@ -4030,6 +4030,11 @@ h1{font-size:17px;font-weight:600;margin:0}
 #q{width:100%;padding:10px 14px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--fg);font:inherit;outline:none}
 #q:focus{border-color:var(--accent)}
 main{overflow:auto;flex:1;padding:0 8px 16px}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track,::-webkit-scrollbar-corner{background:transparent}
+::-webkit-scrollbar-thumb{background-color:var(--line);border:3px solid transparent;border-radius:999px;background-clip:padding-box}
+::-webkit-scrollbar-thumb:hover{background-color:var(--muted)}
+::-webkit-scrollbar-button{display:none;width:0;height:0}
 section[hidden]{display:none}
 h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:14px 10px 6px;font-weight:600}
 .item{display:block;width:100%;text-align:left;background:none;border:0;color:inherit;font:inherit;padding:8px 10px;border-radius:10px;cursor:pointer}
@@ -21805,6 +21810,108 @@ __on('neuralia-comp-expand', 'mouseleave');
         );
     }
 
+    /// Ctrl+roda e a pinca do touchpad (que o Chromium entrega como
+    /// ctrl+wheel) passam pelo mapa de teclas QUE EMBARCA e chegam ao nativo
+    /// como os mesmos zoomin/zoomout do Ctrl+= e do Ctrl+-. Sem Ctrl a roda e
+    /// da pagina; uma pagina que trata o gesto (preventDefault) fica com ele.
+    #[test]
+    fn ctrl_wheel_and_touchpad_pinch_zoom_through_the_app_steps() {
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let drive = r#"
+document.readyState = 'interactive';
+__fire('DOMContentLoaded');
+__drain();
+__fire('wheel', { ctrlKey: true, deltaY: -100, deltaMode: 0 });
+__fire('wheel', { ctrlKey: false, deltaY: -100, deltaMode: 0 });
+__fire('wheel', { ctrlKey: true, deltaY: 100, deltaMode: 0 });
+__fire('wheel', { ctrlKey: true, deltaY: -100, deltaMode: 0, defaultPrevented: true });
+__fire('wheel', { ctrlKey: true, deltaY: -100, deltaMode: 0, isTrusted: false });
+for (let i = 0; i < 10; i++) __fire('wheel', { ctrlKey: true, deltaY: -4, deltaMode: 0 });
+__fire('wheel', { ctrlKey: true, deltaY: 3, deltaMode: 0 });
+__fire('wheel', { ctrlKey: true, deltaY: 1, deltaMode: 1 });
+__drain();
+"#;
+        let cases = [serde_json::json!({
+            "name": "keymap",
+            "href": "https://example.com/",
+            "script": NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", CAP),
+            "drive": drive,
+        })];
+        let program = format!(
+            "const INPUT = {};
+{}",
+            serde_json::json!({ "cases": cases }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        let errors = &results[0]["errors"];
+        assert_eq!(errors.as_array().map(Vec::len), Some(0), "erros: {errors}");
+        let actions: Vec<IpcAction> = results[0]["posted"]
+            .as_array()
+            .expect("posted")
+            .iter()
+            .filter_map(|message| parse_ipc_message(message.as_str()?, CAP, 3))
+            .collect();
+        // Entalhe para cima, entalhe para baixo, dez pedacos de pinca que
+        // somam um degrau, e uma linha (deltaMode 1) para baixo.
+        assert_eq!(
+            actions,
+            vec![
+                IpcAction::ZoomIn,
+                IpcAction::ZoomOut,
+                IpcAction::ZoomIn,
+                IpcAction::ZoomOut,
+            ]
+        );
+        // O nativo trata-os como o Ctrl+= e o Ctrl+-: os degraus do app.
+        assert!(matches!(
+            App::column_ipc_event_impl(0, IpcAction::ZoomIn),
+            Some(UserEvent::ZoomIn)
+        ));
+        assert!(matches!(
+            App::column_ipc_event_impl(0, IpcAction::ZoomOut),
+            Some(UserEvent::ZoomOut)
+        ));
+        // Um mecanismo so: nenhuma WebView liga o zoom proprio do WebView2
+        // (Ctrl+roda e pinca do Chromium), que somaria ao nosso.
+        let source = include_str!("windows_app.rs");
+        let forbidden = ["with_hotkeys_zoom(", "true)"].concat();
+        assert!(!source.contains(&forbidden));
+    }
+
+    /// O painel do Ctrl+H tinha a barra de rolagem classica do Windows (setas,
+    /// calha cinzenta), que destoava do resto do NeuralIA. Nao ha browser nos
+    /// testes para medir pixels: isto so prova que a folha que embarca declara
+    /// a barra fina nas variaveis do tema -- as mesmas que o nativo reescreve
+    /// ao mudar de tema claro/escuro (panel_theme_vars).
+    #[test]
+    fn the_history_panel_scrollbar_is_thin_and_follows_the_theme() {
+        let html = panel_html(&Theme::light((0, 120, 212)));
+        let style = html
+            .split("<style>")
+            .nth(1)
+            .and_then(|rest| rest.split("</style>").next())
+            .expect("folha do painel");
+        let rule = |selector: &str| {
+            style
+                .lines()
+                .find(|line| line.starts_with(selector))
+                .unwrap_or_else(|| panic!("sem regra {selector}"))
+                .to_string()
+        };
+        assert!(rule("::-webkit-scrollbar{").contains("width:10px"));
+        let thumb = rule("::-webkit-scrollbar-thumb{");
+        assert!(thumb.contains("var(--line)") && thumb.contains("border-radius:999px"));
+        assert!(rule("::-webkit-scrollbar-thumb:hover{").contains("var(--muted)"));
+        assert!(rule("::-webkit-scrollbar-button{").contains("display:none"));
+        // As variaveis existem nos dois temas.
+        for theme in [Theme::light((0, 120, 212)), Theme::dark((0, 120, 212))] {
+            let vars = panel_theme_vars(&theme);
+            assert!(vars["--line"].is_string() && vars["--muted"].is_string());
+        }
+    }
+
     const LABEL_TURN_OFF: &str = "Desativar rolagem automática (Ctrl+R)";
     const LABEL_TURN_ON: &str = "Ativar rolagem automática (Ctrl+R)";
 
@@ -27610,6 +27717,47 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       act('restore');
     }
   }, true);
+
+  // Ctrl + roda do rato, e a pinca do touchpad (o Chromium entrega-a como
+  // ctrl+wheel), sobem e descem os mesmos degraus do Ctrl+= e do Ctrl+-, com
+  // o mesmo aviso. O zoom do proprio WebView2 esta desligado (o wry deixa
+  // IsZoomControlEnabled e IsPinchZoomEnabled a false): um mecanismo so, sem
+  // zoom a dobrar.
+  const defer = setTimeout;
+  // Pixels de roda por degrau: um entalhe de rato (100) sobe um degrau; a
+  // pinca, que chega em pedacos pequenos, soma ate la.
+  const WHEEL_ZOOM_STEP = 30;
+  // Uma pausa maior do que isto comeca um gesto novo.
+  const WHEEL_ZOOM_IDLE_MS = 400;
+  let wheelZoomSum = 0;
+  let wheelZoomAt = -Infinity;
+  function wheelZoomAction(e) {
+    const unit = e.deltaMode === 1 ? 33 : (e.deltaMode === 2 ? 800 : 1);
+    const dy = Number(e.deltaY) * unit;
+    if (!isFinite(dy) || dy === 0) { return null; }
+    const at = Number(e.timeStamp) || 0;
+    if (at - wheelZoomAt > WHEEL_ZOOM_IDLE_MS || (wheelZoomSum < 0) !== (dy < 0)) {
+      wheelZoomSum = 0;
+    }
+    wheelZoomAt = at;
+    wheelZoomSum += dy;
+    if (Math.abs(wheelZoomSum) < WHEEL_ZOOM_STEP) { return null; }
+    const action = wheelZoomSum < 0 ? 'zoomin' : 'zoomout';
+    wheelZoomSum = 0;
+    return action;
+  }
+  window.addEventListener('wheel', function (e) {
+    if (!e.isTrusted || !e.ctrlKey) { return; }
+    const wheel = e;
+    // Decide-se depois de o evento passar por todos: uma pagina que trata o
+    // gesto ela propria (um mapa, um editor) chama preventDefault, e ai o
+    // zoom e dela -- como no Chrome.
+    defer(function () {
+      if (wheel.defaultPrevented) { return; }
+      const action = wheelZoomAction(wheel);
+      if (action) { act(action); }
+    }, 0);
+  }, { passive: true });
 })();
 "#;
 
