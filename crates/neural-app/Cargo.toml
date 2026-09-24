@@ -11,6 +11,13 @@ publish = false
 name = "NeuralIA"
 path = "src/main.rs"
 
+# Gera assets/logo.ico e assets/neuralia-home-reader.png a partir de
+# assets/neuralia-home.png (ver scripts/brand-assets/brand.rs). Vive em
+# scripts/ e usa o `image` que o produto ja tem: nao entra crate nenhuma.
+[[example]]
+name = "brand-assets"
+path = "../../scripts/brand-assets/main.rs"
+
 [dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 neural-core = { path = "../neural-core" }
@@ -37,6 +44,15 @@ wry = { version = "0.57", features = ["devtools"] }
 # automatica" do botao direito das colunas nao se consegue registar.
 webview2-com = "0.39.1"
 windows-core = "0.62.2"
+
+[target.'cfg(windows)'.dev-dependencies]
+# So para os testes lerem o recurso de icone do NeuralIA.exe compilado
+# (tests/brand_assets.rs); a mesma windows-sys do Cargo.lock.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [build-dependencies]
 winres = "0.1.12"
