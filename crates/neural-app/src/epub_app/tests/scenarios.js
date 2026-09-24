@@ -36,7 +36,7 @@ function chapterFor(data, src) {
 }
 
 function load(page, data, layout) {
-  return h.loadFrame(page.frame, chapterFor(data, page.frame.src), layout);
+  return h.loadFrame(page.frame, chapterFor(data, page.frame.current), layout);
 }
 
 function key(target, name, extra) {
@@ -101,7 +101,7 @@ return {
     assert.equal(R.clickZone(1100, WIDTH), 1);
 
     // O leitor de verdade: três páginas no capítulo 1, duas no 2.
-    assert.equal(page.frame.src, data.hrefs[0]);
+    assert.equal(page.frame.current, data.hrefs[0]);
     let book = load(page, data, { scrollWidth: PAGES(3) });
     const style = book.doc.getElementById('neuralia-reader-style');
     assert.ok(style, 'o estilo de paginação entra no documento do livro');
@@ -122,13 +122,13 @@ return {
     assert.equal(pageLabel(), 'Página 3 de 3 do capítulo');
     // Da última página, Espaço atravessa para o capítulo seguinte.
     key(page.doc, ' ');
-    assert.equal(page.frame.src, data.hrefs[1]);
+    assert.equal(page.frame.current, data.hrefs[1]);
     book = load(page, data, { scrollWidth: PAGES(2) });
     assert.deepEqual(lastScroll(book), [0, 0]);
     assert.equal(pageLabel(), 'Página 1 de 2 do capítulo');
     // E Shift+Espaço volta para a ÚLTIMA página do anterior.
     key(page.doc, ' ', { shiftKey: true });
-    assert.equal(page.frame.src, data.hrefs[0]);
+    assert.equal(page.frame.current, data.hrefs[0]);
     book = load(page, data, { scrollWidth: PAGES(3) });
     assert.deepEqual(lastScroll(book), [2400, 0]);
     key(page.doc, 'PageUp');
@@ -215,11 +215,13 @@ return {
     assert.equal(page.doc.getElementById('panel-toc').hidden, false);
     assert.ok(items[2].scrolledIntoView >= 1);
     items[3].querySelector('button').fire('click');
-    assert.equal(page.frame.src, data.hrefs[2]);
+    assert.equal(page.frame.current, data.hrefs[2]);
+    assert.equal(page.doc.getElementById('panel-toc').hidden, true,
+      'o painel fecha: o capítulo aberto não fica debaixo dele');
     book = load(page, data, { scrollWidth: PAGES(1) });
     assert.equal(title(), 'Capítulo Três');
     items[1].querySelector('button').fire('click');
-    assert.equal(page.frame.src, data.hrefs[0]);
+    assert.equal(page.frame.current, data.hrefs[0]);
     book = load(page, data, { scrollWidth: PAGES(3), places: { s2: { x: 1300 } } });
     assert.deepEqual(lastScroll(book), [1200, 0], 'a entrada com fragmento abre na página da âncora');
     assert.equal(title(), 'Seção 1.2');
@@ -251,7 +253,7 @@ return {
     // guardada como 0.3333).
     assert.deepEqual(data.book.position, { spine: 1, fraction: 0.3333 });
     assert.deepEqual(page.posts[0], { t: 'opened', id: data.id });
-    assert.equal(page.frame.src, data.hrefs[1], 'reabre no capítulo gravado');
+    assert.equal(page.frame.current, data.hrefs[1], 'reabre no capítulo gravado');
     const book = load(page, data, { scrollWidth: PAGES(3) });
     assert.deepEqual(lastScroll(book), [1200, 0], 'e na página da fração gravada');
     page.timers.run();
@@ -267,6 +269,16 @@ return {
     // Sair da página grava já, sem esperar o prazo.
     key(page.doc, 'ArrowLeft');
     page.win.fireWindow('pagehide');
+    assert.deepEqual(page.posts[page.posts.length - 1], { t: 'savePosition', id: data.id, spine: 1, fraction: 0.3333 });
+    // A gravação falhou (disco cheio): o nativo avisa, e a mesma posição volta
+    // a ir na próxima vez, em vez de ficar por gravar.
+    h.run(page.context, 'window.neuraliaEpubNotice({"kind":"error","message":"Não foi possível gravar na biblioteca: disco cheio."})');
+    assert.equal(page.doc.getElementById('toast').textContent, 'Não foi possível gravar na biblioteca: disco cheio.');
+    const beforeRetry = page.posts.length;
+    key(page.doc, 'ArrowRight');
+    key(page.doc, 'ArrowLeft');
+    page.win.fireWindow('pagehide');
+    assert.equal(page.posts.length, beforeRetry + 1);
     assert.deepEqual(page.posts[page.posts.length - 1], { t: 'savePosition', id: data.id, spine: 1, fraction: 0.3333 });
     // Esc volta à biblioteca.
     key(page.doc, 'Escape');
@@ -285,6 +297,13 @@ return {
     assert.equal(hits[1].before, '…e a ');
     assert.equal(hits[1].after, ', aç…');
     assert.equal(R.searchText('abc', 'a', 10, 4).length, 0, 'menos de 2 letras não pesquisa');
+    // Espaços em sequência no texto (quebra de linha e recuo, nbsp + espaço,
+    // espaço duplo) contam como um, como na frase pesquisada.
+    assert.equal(R.searchText('uma palavra\n      seguinte aqui', 'palavra seguinte', 10, 0).length, 1);
+    const spaced = 'a amarela ficava' + String.fromCharCode(160) + ' no  alto';
+    const phrase = R.searchText(spaced, 'ficava no alto', 10, 0);
+    assert.equal(phrase.length, 1);
+    assert.equal(spaced.slice(phrase[0].start, phrase[0].end), 'ficava' + String.fromCharCode(160) + ' no  alto');
     assert.equal(R.searchText('aa aa aa', 'aa', 2, 0).length, 2, 'o limite vale');
 
     load(page, data, { scrollWidth: PAGES(3) });
@@ -308,7 +327,9 @@ return {
     // Saltar para o resultado do capítulo 2: abre-o, marca a palavra e mostra
     // a página onde ela está.
     results[1].querySelector('button').fire('click');
-    assert.equal(page.frame.src, data.hrefs[1]);
+    assert.equal(page.frame.current, data.hrefs[1]);
+    assert.equal(page.doc.getElementById('panel-search').hidden, true,
+      'o painel fecha: a palavra encontrada não fica debaixo dele');
     const book = load(page, data, { scrollWidth: PAGES(2), places: { meio: { x: 1250 } } });
     const mark = book.win.CSS.highlights.get('neuralia-search');
     assert.ok(mark, 'a ocorrência fica realçada');
@@ -526,7 +547,7 @@ return {
     }
     // Interno: capítulo 2, na âncora.
     click(anchor('interno'));
-    assert.equal(page.frame.src, data.hrefs[1]);
+    assert.equal(page.frame.current, data.hrefs[1]);
     const next = load(page, data, { scrollWidth: PAGES(2), places: { meio: { x: 1250 } } });
     assert.deepEqual(lastScroll(next), [1200, 0]);
     return { posts: page.posts.slice(posts) };
@@ -571,7 +592,7 @@ return {
     assert.equal(R.htmlFallbackHref('/book/x/a.xhtml?as=html'), null);
     const broken = '<html><head><title>x</title></head><body><p>Um&nbsp;espaço</p></body></html>';
     h.loadFrame(page.frame, broken, { scrollWidth: PAGES(1) });
-    assert.equal(page.frame.src, h.ORIGIN + data.hrefs[0] + '?as=html', 'volta a pedir como HTML');
+    assert.equal(page.frame.current, h.ORIGIN + data.hrefs[0] + '?as=html', 'volta a pedir como HTML');
     // Como HTML abre; e um segundo erro não faz ciclo.
     const html = h.loadFrame(page.frame, broken, { scrollWidth: PAGES(2), type: 'text/html' });
     assert.deepEqual(lastScroll(html), [0, 0]);
@@ -580,6 +601,297 @@ return {
     h.loadFrame(page.frame, broken, { scrollWidth: PAGES(1) });
     assert.equal(page.frame.loads.length, loads);
     return { loads: page.frame.loads };
+  },
+
+  // ---------------------------------- última página, direita para a esquerda
+  async last_page_and_rtl(data) {
+    const page = await openReader(data);
+    const label = () => page.doc.getElementById('progress-page').textContent;
+    const stage = page.doc.getElementById('stage');
+    // Duas colunas: o capítulo acaba na coluna da esquerda da 4.ª página
+    // (o conteúdo não chega ao fim dela).
+    const odd = 3 * WIDTH + 40 + 520;
+    const book = load(page, data, { scrollWidth: odd });
+    assert.equal(label(), 'Página 1 de 4 do capítulo');
+    key(page.doc, 'End');
+    assert.equal(label(), 'Página 4 de 4 do capítulo');
+    const last = lastScroll(book);
+    // Uma coluna (janela estreita): a última página começa na borda dela,
+    // não meia margem depois.
+    stage.clientWidth = 800;
+    page.win.fireWindow('resize');
+    page.timers.run();
+    key(page.doc, 'End');
+    const pages = Number(/de (\d+) do/.exec(label())[1]);
+    assert.equal(label(), 'Página ' + pages + ' de ' + pages + ' do capítulo');
+    const narrow = lastScroll(book);
+    stage.clientWidth = WIDTH;
+    page.win.fireWindow('resize');
+    page.timers.run();
+
+    // Um capítulo da direita para a esquerda: as páginas seguintes ficam à
+    // esquerda (scroll negativo), e a seta para a esquerda avança.
+    const rtl = '<html xmlns="http://www.w3.org/1999/xhtml" dir="rtl"><head><title>RTL</title></head>' +
+      '<body><h1>فصل واحد</h1><p>نص عربي طويل.</p></body></html>';
+    const arabic = h.loadFrame(page.frame, rtl, { scrollWidth: PAGES(3) });
+    assert.equal(label(), 'Página 1 de 3 do capítulo');
+    assert.deepEqual(lastScroll(arabic), [0, 0]);
+    const moves = [];
+    key(page.doc, 'ArrowLeft');
+    moves.push(lastScroll(arabic));
+    assert.equal(label(), 'Página 2 de 3 do capítulo');
+    key(page.doc, 'ArrowLeft');
+    moves.push(lastScroll(arabic));
+    assert.equal(label(), 'Página 3 de 3 do capítulo', 'a última página chega-se');
+    key(page.doc, 'ArrowRight');
+    moves.push(lastScroll(arabic));
+    // Clique na margem esquerda: avança (a próxima página está à esquerda).
+    arabic.doc.fire('click', { target: arabic.doc.body, clientX: 100 });
+    moves.push(lastScroll(arabic));
+    return { last, narrow, pages, rtl: moves };
+  },
+
+  // ------------------------------- o mesmo ponto do texto depois de relayout
+  async relayout(data) {
+    const page = await openReader(data);
+    const paragraphs = [];
+    for (let i = 1; i <= 60; i++) {
+      paragraphs.push('<p id="p' + i + '">P' + i + ' ' + 'palavra '.repeat(12).trim() + '.</p>');
+    }
+    const markup = '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Longo</title></head>' +
+      '<body><h1>Capítulo longo</h1>' + paragraphs.join('') + '</body></html>';
+    const book = h.loadFrame(page.frame, markup, { flow: { chars: 600, px: 2 } });
+    const byId = (id) => page.doc.getElementById(id);
+    const label = () => byId('progress-page').textContent;
+    // O primeiro ponto do texto visível (o canto de cima da página, ou o topo
+    // na rolagem), como o navegador o daria.
+    const caret = (x, y) => {
+      const range = book.doc.caretRangeFromPoint(x, y);
+      return { node: range.startContainer, offset: range.startOffset };
+    };
+    const same = (a, b) => a.node === b.node && a.offset === b.offset;
+    const onPage = (point) => {
+      const rect = book.doc.flowRectAt(point.node, point.offset);
+      return rect.left >= 0 && rect.left < WIDTH;
+    };
+    key(page.doc, 'ArrowRight');
+    key(page.doc, 'ArrowRight');
+    const startLabel = label();
+    assert.match(startLabel, /^Página 3 de \d+ do capítulo$/);
+    const start = caret(42, 30);
+    const where = start.node.parentNode.getAttribute('id');
+
+    // A+ três vezes: o ponto fica sempre na página mostrada.
+    const growing = [];
+    for (let i = 0; i < 3; i++) {
+      byId('font-larger').fire('click');
+      growing.push([label(), onPage(start)]);
+    }
+    assert.ok(growing.every(([, visible]) => visible), JSON.stringify(growing));
+    // A- três vezes: exatamente a página e o ponto do início.
+    for (let i = 0; i < 3; i++) byId('font-smaller').fire('click');
+    assert.equal(label(), startLabel);
+    assert.ok(same(caret(42, 30), start), 'A+ e A- voltam ao mesmo texto');
+
+    // Estreitar e alargar a janela: o mesmo.
+    byId('stage').clientWidth = 900;
+    page.win.fireWindow('resize');
+    page.timers.run();
+    const narrowVisible = book.doc.flowRectAt(start.node, start.offset).left;
+    assert.ok(narrowVisible >= 0 && narrowVisible < 900, 'na janela estreita o ponto está à vista');
+    byId('stage').clientWidth = WIDTH;
+    page.win.fireWindow('resize');
+    page.timers.run();
+    assert.equal(label(), startLabel);
+    assert.ok(same(caret(42, 30), start), 'a janela volta ao mesmo texto');
+
+    // Páginas -> Rolagem contínua: o mesmo texto no topo, não o início.
+    const mode = byId('mode');
+    mode.value = 'scroll';
+    mode.fire('change');
+    assert.ok(book.win.scrollY > 0);
+    const top = caret(600, 2);
+    assert.ok(same(top, start), 'na rolagem o texto do topo é o mesmo');
+    // E de volta: a mesma página.
+    mode.value = 'paged';
+    mode.fire('change');
+    assert.equal(label(), startLabel);
+    assert.ok(same(caret(42, 30), start), 'e voltar às páginas também');
+    return { start: startLabel, paragraph: where, growing, back: label() };
+  },
+
+  // ------------------------------ paginado antes das imagens; histórico
+  async early_layout(data) {
+    const page = await openReader(data);
+    const label = () => page.doc.getElementById('progress-page').textContent;
+    // O capítulo chegou, uma imagem ainda não: documento lido, sem `load`.
+    const book = h.commitFrame(page.frame, chapterFor(data, page.frame.current),
+      { scrollWidth: PAGES(3), places: { s2: { x: 1300 } } });
+    assert.equal(book.doc.readyState, 'interactive');
+    assert.equal(book.doc.getElementById('neuralia-reader-style'), null);
+    page.timers.run();
+    const style = book.doc.getElementById('neuralia-reader-style');
+    assert.ok(style, 'paginado e com tema sem esperar pelas imagens');
+    assert.match(style.textContent, /column-width: 520px !important/);
+    assert.equal(label(), 'Página 1 de 3 do capítulo');
+    assert.equal(page.doc.getElementById('chapter-title').textContent, 'Capítulo Um');
+    key(page.doc, 'ArrowRight');
+    assert.deepEqual(lastScroll(book), [1200, 0], 'virar a página já funciona');
+    // A imagem chega e o capítulo cresce: mede-se outra vez, no mesmo sítio.
+    book.layout.scrollWidth = PAGES(4);
+    const image = book.doc.createElement('img');
+    book.doc.fire('load', { target: image });
+    page.timers.run();
+    assert.equal(label(), 'Página 2 de 4 do capítulo');
+    // O `load` do iframe (tudo carregado): mede de novo, sem saltar.
+    book.doc.readyState = 'complete';
+    page.frame.fire('load');
+    assert.equal(label(), 'Página 2 de 4 do capítulo');
+    assert.deepEqual(lastScroll(book), [1200, 0]);
+
+    // Mudar de capítulo troca o documento sem acrescentar entradas ao
+    // histórico: o Voltar do rato não passeia pelos capítulos.
+    key(page.doc, 'End');
+    key(page.doc, ' ');
+    assert.equal(page.frame.current, data.hrefs[1]);
+    h.loadFrame(page.frame, chapterFor(data, page.frame.current), { scrollWidth: PAGES(2) });
+    key(page.doc, ' ');
+    key(page.doc, ' ');
+    assert.equal(page.frame.current, data.hrefs[2]);
+    h.loadFrame(page.frame, chapterFor(data, page.frame.current), { scrollWidth: PAGES(1) });
+    key(page.doc, ' ', { shiftKey: true });
+    assert.equal(page.frame.current, data.hrefs[1]);
+    return { historyAdded: page.frame.historyAdded, how: page.frame.how };
+  },
+
+  // ----------------------------------------- tipografia, temas, CSS do livro
+  async typography(data) {
+    const page = await openReader(data);
+    const R = page.R;
+    const book = load(page, data, { scrollWidth: PAGES(3) });
+    const byId = (id) => page.doc.getElementById(id);
+    const css = () => book.doc.getElementById('neuralia-reader-style').textContent;
+    const saved = () => JSON.parse(page.win.localStorage.getItem('neuralia-epub-settings'));
+    const choose = (id, value) => {
+      byId(id).value = value;
+      byId(id).fire('change');
+    };
+    const theme = (name) => page.doc.querySelectorAll('[data-theme-choice]')
+      .find((button) => button.getAttribute('data-theme-choice') === name).fire('click');
+    assert.match(css(), /html \{ font-size: 100% !important/);
+    byId('font-larger').fire('click');
+    assert.match(css(), /html \{ font-size: 110% !important/);
+    assert.equal(byId('font-size-label').textContent, '110%');
+    byId('font-smaller').fire('click');
+    byId('font-smaller').fire('click');
+    assert.match(css(), /html \{ font-size: 90% !important/);
+    assert.equal(byId('font-size-label').textContent, '90%');
+    choose('font-family', 'serif');
+    assert.match(css(), /body, body \* \{ font-family: Georgia/);
+    choose('line-height', '1.5');
+    assert.match(css(), /line-height: 1\.5 !important/);
+    choose('margins', 'wide');
+    assert.match(css(), /column-gap: 160px !important/);
+    choose('align', 'justify');
+    assert.match(css(), /text-align: justify !important/);
+    theme('sepia');
+    assert.match(css(), /html, body \{ background-color: #f4ecd8 !important; color: #5b4636 !important; \}/);
+    assert.equal(page.doc.documentElement.getAttribute('data-theme'), 'sepia');
+    theme('dark');
+    assert.match(css(), /html, body \{ background-color: #1c1d20 !important; color: #d9d9d6 !important; \}/);
+    theme('light');
+    assert.match(css(), /html \{ background-color: #ffffff; color: #1b1b1b; \}/);
+    assert.doesNotMatch(css(), /#1c1d20/);
+    // Palavra longa, <pre> e tabela larga não invadem a coluna seguinte.
+    for (const rule of [
+      /body, body \* \{ overflow-wrap: break-word !important; \}/,
+      /pre, pre \* \{ white-space: pre-wrap !important; \}/,
+      /table \{ max-width: 100% !important; \}/,
+      /td, th \{ overflow-wrap: anywhere !important; \}/,
+    ]) {
+      assert.match(css(), rule);
+    }
+    const settings = saved();
+    assert.deepEqual(
+      [settings.fontSize, settings.fontFamily, settings.lineHeight, settings.margin, settings.align, settings.theme],
+      [90, 'serif', '1.5', 'wide', 'justify', 'light']);
+
+    // O CSS do próprio livro: tamanhos absolutos viram rem (o A+/A- passa a
+    // mudá-los) e as quebras de página forçadas viram quebras de coluna.
+    for (const [value, expected] of [['12pt', '1rem'], ['24px', '1.5rem'], ['0.5in', '3rem'], ['large', '1.125rem'],
+      ['medium', '1rem'], ['1.2em', null], ['150%', null], ['2rem', null], ['calc(1px + 1em)', null]]) {
+      assert.equal(R.relativeFontSize(value), expected, value);
+    }
+    const styled = '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Estilos</title>' +
+      '<style>body { font-size: 12pt } p { font-size: 16px } h2 { font-size: large !important } small { font-size: 80% }</style></head>' +
+      '<body><h1 id="a">A</h1><h1 id="b" style="page-break-before: always">B</h1>' +
+      '<h1 id="c" style="break-before: page">C</h1><p id="d" style="font-size: 18px; page-break-after: always">D</p>' +
+      '<p id="e">E</p></body></html>';
+    const styledBook = h.loadFrame(page.frame, styled, { scrollWidth: PAGES(2) });
+    const rules = styledBook.doc.styleSheets[0].cssRules;
+    const size = (selector) => {
+      const rule = rules.find((item) => item.selectorText === selector);
+      return [rule.style.getPropertyValue('font-size'), rule.style.getPropertyPriority('font-size')];
+    };
+    assert.deepEqual(['body', 'p', 'h2', 'small'].map(size),
+      [['1rem', ''], ['1rem', ''], ['1.125rem', 'important'], ['80%', '']]);
+    const el = (id) => styledBook.doc.getElementById(id);
+    assert.equal(el('d').style.getPropertyValue('font-size'), '1.125rem');
+    assert.equal(el('b').style.props['break-before'], 'column !important');
+    assert.equal(el('c').style.props['break-before'], 'column !important');
+    assert.equal(el('d').style.props['break-after'], 'column !important');
+    assert.equal(el('a').style.props['break-before'], undefined);
+    assert.equal(el('e').style.props['break-before'], undefined);
+    return { css: css(), saved: settings };
+  },
+
+  // ------------------------------------------------------ escolher a voz
+  async voice(data) {
+    const voices = [
+      { name: 'Microsoft Maria', lang: 'pt-BR', localService: true },
+      { name: 'Microsoft Zira', lang: 'en-US', localService: true, default: true },
+      { name: 'Google US English', lang: 'en-US', localService: false },
+    ];
+    const tts = h.speech(voices);
+    const page = await openReader(data, { speech: tts });
+    const R = page.R;
+    load(page, data, { scrollWidth: PAGES(3) });
+    const select = page.doc.getElementById('voice');
+    assert.deepEqual(select.querySelectorAll('option').map((option) => [option.value, option.textContent]), [
+      ['auto', 'Automática (pela língua do livro)'],
+      ['Microsoft Maria', 'Microsoft Maria (pt-BR)'],
+      ['Microsoft Zira', 'Microsoft Zira (en-US)'],
+    ], 'só as vozes deste computador');
+    assert.equal(select.value, 'auto');
+    // O livro é pt-BR; a pessoa escolhe outra voz.
+    select.value = 'Microsoft Zira';
+    select.fire('change');
+    key(page.doc, 'l');
+    assert.equal(tts.synth.spoken[0].voice.name, 'Microsoft Zira');
+    key(page.doc, 'l');
+    const stored = page.win.localStorage.getItem('neuralia-epub-settings');
+    assert.deepEqual(JSON.parse(stored).voices, { pt: 'Microsoft Zira' });
+    // Outra abertura com as mesmas preferências: a escolha fica.
+    const again = h.speech(voices);
+    const other = await openReader(data, { speech: again, storage: { 'neuralia-epub-settings': stored } });
+    load(other, data, { scrollWidth: PAGES(3) });
+    const otherSelect = other.doc.getElementById('voice');
+    assert.equal(otherSelect.value, 'Microsoft Zira');
+    key(other.doc, 'l');
+    assert.equal(again.synth.spoken[0].voice.name, 'Microsoft Zira');
+    key(other.doc, 'l');
+    // "Automática" volta à voz da língua do livro.
+    otherSelect.value = 'auto';
+    otherSelect.fire('change');
+    key(other.doc, 'l');
+    assert.equal(again.synth.spoken[again.synth.spoken.length - 1].voice.name, 'Microsoft Maria');
+    // Uma voz que já não está instalada cai na automática; lixo nas
+    // preferências é ignorado.
+    assert.equal(R.chooseVoice(voices, 'pt-BR', 'Voz Removida').name, 'Microsoft Maria');
+    assert.equal(R.chooseVoice(voices, 'pt-BR', 'Google US English').name, 'Microsoft Maria', 'nunca online');
+    const junk = JSON.parse('{"voices":{"pt":"X","__proto__":"y","pt-BR":"z","en":5}}');
+    assert.deepEqual(R.normalizeSettings(junk).voices, { pt: 'X' });
+    return { voice: tts.synth.spoken[0].voice.name };
   },
 
   // --------------------------------------------------------- biblioteca
@@ -599,7 +911,8 @@ return {
     assert.deepEqual(titles(L.filterBooks(books, 'xyz')), []);
     assert.equal(L.filterBooks(books, '  ').length, books.length);
     assert.deepEqual(titles(L.sortBooks(books, 'title')), ['Abelha Rainha', 'Ágata e o Mar', 'O Livro de Teste']);
-    assert.deepEqual(titles(L.sortBooks(books, 'author')), ['O Livro de Teste', 'Abelha Rainha', 'Ágata e o Mar']);
+    // Pelo último nome, como o Calibre: Autora, Ninguém, Zanetti.
+    assert.deepEqual(titles(L.sortBooks(books, 'author')), ['O Livro de Teste', 'Ágata e o Mar', 'Abelha Rainha']);
     assert.deepEqual(titles(L.sortBooks(books, 'recent')).slice(0, 1), ['O Livro de Teste']);
     assert.equal(L.continueReading(books).title, 'O Livro de Teste');
     assert.equal(L.coverHue('Ágata'), L.coverHue('Ágata'));
@@ -636,12 +949,17 @@ return {
     const sort = doc.getElementById('sort');
     sort.value = 'author';
     sort.fire('change');
-    assert.deepEqual(cardTitles(), ['O Livro de Teste', 'Abelha Rainha', 'Ágata e o Mar']);
+    assert.deepEqual(cardTitles(), ['O Livro de Teste', 'Ágata e o Mar', 'Abelha Rainha']);
     assert.equal(page.win.localStorage.getItem('neuralia-epub-sort'), 'author');
     sort.value = 'title';
     sort.fire('change');
     assert.deepEqual(cardTitles(), ['Abelha Rainha', 'Ágata e o Mar', 'O Livro de Teste']);
 
+    // Enter no botão Remover é do botão: não abre o livro.
+    const firstRemove = cards()[0].querySelector('.card-remove');
+    const enter = cards()[0].fire('keydown', { key: 'Enter', target: firstRemove });
+    assert.equal(enter.defaultPrevented, false);
+    assert.deepEqual(page.navigations, []);
     // Remover pede confirmação na página; cancelar não manda nada.
     const confirm = doc.getElementById('confirm');
     cards()[0].querySelector('.card-remove').fire('click');

@@ -26,17 +26,23 @@
     return (book.authors && book.authors[0]) || '';
   }
 
+  // Como o Calibre: pelo "file-as" do livro ou pelo último nome ("Assis,
+  // Machado de"), nunca pelo primeiro nome.
+  function authorSortKey(book) {
+    return (typeof book.authorSort === 'string' && book.authorSort.trim()) || firstAuthor(book);
+  }
+
   // Recentes: o último aberto ou adicionado primeiro. Título e Autor em
   // ordem alfabética do português (sem acentos a contar).
   function sortBooks(books, mode) {
     const list = books.slice();
     const byTitle = (a, b) => collator.compare(a.title || '', b.title || '');
     if (mode === 'title') {
-      list.sort((a, b) => byTitle(a, b) || collator.compare(firstAuthor(a), firstAuthor(b)));
+      list.sort((a, b) => byTitle(a, b) || collator.compare(authorSortKey(a), authorSortKey(b)));
     } else if (mode === 'author') {
       list.sort((a, b) => {
-        const left = firstAuthor(a);
-        const right = firstAuthor(b);
+        const left = authorSortKey(a);
+        const right = authorSortKey(b);
         if (!left !== !right) return left ? -1 : 1;
         return collator.compare(left, right) || byTitle(a, b);
       });
@@ -282,6 +288,8 @@
       card.title = (book.title || '') + ' — ' + authorLine(book);
       card.addEventListener('click', () => this.open(book));
       card.addEventListener('keydown', (event) => {
+        // Só as teclas do próprio cartão: Enter no botão Remover é do botão.
+        if (event.target !== card) return;
         if (event.key === 'Enter') {
           event.preventDefault();
           this.open(book);

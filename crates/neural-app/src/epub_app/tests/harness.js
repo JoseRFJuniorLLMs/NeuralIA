@@ -130,12 +130,40 @@ class FakeClassList {
 }
 
 function makeStyle() {
-  return {
+  const style = {
     props: {},
     setProperty(name, value, priority) {
       this.props[name] = priority ? value + ' !' + priority : value;
     },
+    getPropertyValue(name) {
+      return String(this.props[name] || '').replace(/\s*!important$/, '');
+    },
+    getPropertyPriority(name) {
+      return /!important$/.test(String(this.props[name] || '')) ? 'important' : '';
+    },
+    removeProperty(name) {
+      delete this.props[name];
+    },
   };
+  Object.defineProperty(style, 'fontSize', {
+    get() {
+      return this.getPropertyValue('font-size');
+    },
+  });
+  return style;
+}
+
+// `a: b; c: d !important` -> style.props (o que o navegador faz com style="").
+function parseDeclarations(text, style) {
+  for (const part of String(text || '').split(';')) {
+    const at = part.indexOf(':');
+    if (at < 0) continue;
+    const name = part.slice(0, at).trim().toLowerCase();
+    const raw = part.slice(at + 1).trim();
+    if (!name) continue;
+    const important = /!\s*important$/i.test(raw);
+    style.setProperty(name, raw.replace(/\s*!\s*important$/i, ''), important ? 'important' : '');
+  }
 }
 
 class FakeElement extends FakeNode {
@@ -184,6 +212,7 @@ class FakeElement extends FakeNode {
       return;
     }
     this.attrs.set(name, String(value));
+    if (name === 'style') parseDeclarations(value, this.style);
   }
 
   getAttribute(name) {
@@ -232,6 +261,19 @@ class FakeElement extends FakeNode {
     return this.querySelectorAll(selector)[0] || null;
   }
 
+  getElementsByTagName(name) {
+    const all = descendants(this);
+    const wanted = String(name).toLowerCase();
+    return wanted === '*' ? all : all.filter((node) => node.localName === wanted);
+  }
+
+  contains(node) {
+    for (let current = node; current; current = current.parentNode) {
+      if (current === this) return true;
+    }
+    return false;
+  }
+
   focus() {
     this.ownerDocument.activeElement = this;
   }
@@ -245,8 +287,11 @@ class FakeElement extends FakeNode {
   }
 
   // Posição "de layout" que o teste escolhe (absX/absY), vista a partir do
-  // scroll atual da janela do documento, como no navegador.
+  // scroll atual da janela do documento, como no navegador. Com o modelo de
+  // fluxo (`flow`), a posição sai do texto e do CSS em vigor.
   getBoundingClientRect() {
+    const flowed = this.ownerDocument.flowRectOf ? this.ownerDocument.flowRectOf(this) : null;
+    if (flowed) return flowed;
     const win = this.ownerDocument.defaultView;
     const x = (this.absX || 0) - (win ? win.scrollX || 0 : 0);
     const y = (this.absY || 0) - (win ? win.scrollY || 0 : 0);
@@ -262,11 +307,20 @@ class FakeFrame extends FakeElement {
   constructor(doc) {
     super(doc, 'iframe');
     this.loads = [];
+    // Como cada carga foi pedida: 'src' (atributo) ou 'replace'
+    // (contentWindow.location.replace).
+    this.how = [];
     // O sandbox em vigor no momento de cada carga.
     this.sandboxAtLoad = [];
     this.contentDocument = null;
     this.contentWindow = null;
     this.srcValue = '';
+    // O endereço que o iframe está a carregar (o último pedido).
+    this.current = '';
+    // Entradas que as cargas acrescentaram ao histórico da página: mudar o
+    // `src` de um iframe que já mostra um documento acrescenta uma, como no
+    // Chromium; `location.replace` não.
+    this.historyAdded = 0;
   }
 
   get src() {
@@ -275,7 +329,14 @@ class FakeFrame extends FakeElement {
 
   set src(value) {
     this.srcValue = String(value);
-    this.loads.push(this.srcValue);
+    this.navigate(this.srcValue, 'src');
+  }
+
+  navigate(url, how) {
+    if (how === 'src' && this.contentDocument) this.historyAdded++;
+    this.current = String(url);
+    this.loads.push(this.current);
+    this.how.push(how);
     this.sandboxAtLoad.push(this.getAttribute('sandbox'));
   }
 }
@@ -326,6 +387,16 @@ class FakeRange {
   }
 
   // O texto coberto (os nós de texto entre o início e o fim).
+  collapse(toStart) {
+    if (toStart) {
+      this.endContainer = this.startContainer;
+      this.endOffset = this.startOffset;
+    } else {
+      this.startContainer = this.endContainer;
+      this.startOffset = this.endOffset;
+    }
+  }
+
   toString() {
     const nodes = textNodes(this.doc.documentElement);
     const from = nodes.indexOf(this.startContainer);
@@ -338,6 +409,8 @@ class FakeRange {
   }
 
   getClientRects() {
+    const flowed = this.doc.flowRectAt ? this.doc.flowRectAt(this.startContainer, this.startOffset) : null;
+    if (flowed) return [flowed];
     const element = this.startContainer && this.startContainer.parentNode;
     return element && element.getBoundingClientRect ? [element.getBoundingClientRect()] : [];
   }
@@ -403,6 +476,27 @@ class FakeDocument extends FakeNode {
     if (!this.documentElement) return [];
     const all = [this.documentElement].concat(descendants(this.documentElement));
     return all.filter((node) => node.localName === name);
+  }
+
+  // As folhas dos <style> do documento, como CSSOM mínimo: regras com
+  // `style` (getPropertyValue/setProperty). Uma mudança via CSSOM fica na
+  // regra, como no navegador.
+  get styleSheets() {
+    return this.getElementsByTagName('style').map((element) => {
+      const text = element.textContent;
+      if (!element.sheetCache || element.sheetCache.text !== text) {
+        const cssRules = [];
+        for (const chunk of text.split('}')) {
+          const open = chunk.indexOf('{');
+          if (open < 0) continue;
+          const style = makeStyle();
+          parseDeclarations(chunk.slice(open + 1), style);
+          cssRules.push({ selectorText: chunk.slice(0, open).trim(), style, cssRules: null });
+        }
+        element.sheetCache = { text, sheet: { cssRules } };
+      }
+      return element.sheetCache.sheet;
+    });
   }
 
   querySelectorAll(selector) {
@@ -632,25 +726,98 @@ function parseChapterMarkup(source, type) {
   return doc;
 }
 
+// Um modelo de paginação para os cenários que mudam a tipografia: o texto
+// corre em colunas de `flow.chars` letras (a 100% e com coluna de 520 px;
+// menos com a fonte maior, mais com a coluna mais larga), e no modo de
+// rolagem cada letra ocupa `flow.px` píxeis de altura. Lê o CSS que o leitor
+// injetou, como o navegador.
+function flowState(doc, flow) {
+  const style = doc.getElementById('neuralia-reader-style');
+  const css = style ? style.textContent : '';
+  const num = (re, fallback) => {
+    const match = css.match(re);
+    return match ? Number(match[1]) : fallback;
+  };
+  const fontSize = num(/font-size: (\d+)% !important/, 100);
+  const paged = /column-width: [\d.]+px/.test(css);
+  const pageWidth = num(/html \{ width: (\d+)px !important/, flow.width || 1200);
+  const columnWidth = num(/column-width: ([\d.]+)px/, pageWidth);
+  const gap = num(/column-gap: ([\d.]+)px/, 0);
+  const perPage = paged ? Math.max(1, Math.round(pageWidth / (columnWidth + gap))) : 1;
+  const step = pageWidth / perPage;
+  const capacity = Math.max(1, Math.floor(flow.chars * (100 / fontSize) * (columnWidth / 520)));
+  const pxPerChar = (flow.px || 2) * fontSize / 100;
+  const runs = [];
+  let total = 0;
+  for (const node of textNodes(doc.body || doc.documentElement)) {
+    runs.push({ node, start: total });
+    total += node.data.length;
+  }
+  const columns = Math.max(1, Math.ceil(total / capacity));
+  return {
+    paged, step, gap, capacity, pxPerChar, runs, total, pageWidth,
+    contentWidth: paged ? columns * step - gap / 2 : pageWidth,
+    contentHeight: Math.ceil(total * pxPerChar),
+  };
+}
+
 // O documento do capítulo dentro do iframe, e a sua janela.
 function makeBookDocument(markup, url, layout) {
   const opts = layout || {};
   const doc = parseChapterMarkup(markup, opts.type || 'application/xhtml+xml');
   doc.baseURI = url;
-  doc.documentElement.scrollWidth = opts.scrollWidth || 0;
-  doc.documentElement.scrollHeight = opts.scrollHeight || 0;
-  doc.documentElement.clientHeight = opts.clientHeight || 0;
+  doc.readyState = opts.ready || 'complete';
+  const root = doc.documentElement;
+  const rtl = String(root.getAttribute('dir') || '').toLowerCase() === 'rtl';
+  const flow = opts.flow || null;
+  const state = () => flowState(doc, flow);
+  // Como o Chromium: o que se pode rolar vai até ao fim do conteúdo OU de um
+  // elemento posicionado (o marcador de fim de página do leitor).
+  const extent = (content) => {
+    let far = content;
+    for (const node of descendants(root)) {
+      const props = node.style && node.style.props;
+      if (!props || !/absolute/.test(props.position || '') || /none/.test(props.display || '')) continue;
+      const left = parseFloat(props.left);
+      const offset = left >= 0 ? left : parseFloat(props.right);
+      if (offset >= 0) far = Math.max(far, offset + 1);
+    }
+    return far;
+  };
+  Object.defineProperty(root, 'scrollWidth', {
+    configurable: true,
+    get: () => extent(flow ? state().contentWidth : opts.scrollWidth || 0),
+  });
+  Object.defineProperty(root, 'scrollHeight', {
+    configurable: true,
+    get: () => (flow ? state().contentHeight : opts.scrollHeight || 0),
+  });
+  root.clientHeight = opts.clientHeight || 0;
   const selection = { isCollapsed: true, ranges: [], removeAllRanges() { this.ranges = []; }, addRange(range) { this.ranges.push(range); } };
+  const viewport = () => (opts.frame ? parseFloat(opts.frame.style.width) : NaN);
   const win = {
-    location: { href: url },
+    location: {
+      href: url,
+      replace(next) {
+        if (opts.frame) opts.frame.navigate(next, 'replace');
+      },
+    },
     scrollX: 0,
     scrollY: 0,
     scrolls: [],
+    // O navegador não rola além do conteúdo: [0, scrollWidth - largura], e
+    // da direita para a esquerda [-(scrollWidth - largura), 0].
     scrollTo(x, y) {
-      this.scrollX = x;
+      let left = x;
+      const width = viewport();
+      if (width > 0) {
+        const max = Math.max(0, root.scrollWidth - width);
+        left = rtl ? Math.min(0, Math.max(-max, x)) : Math.max(0, Math.min(max, x));
+      }
+      this.scrollX = left;
       this.scrollY = y;
-      doc.documentElement.scrollTop = y;
-      this.scrolls.push([x, y]);
+      root.scrollTop = y;
+      this.scrolls.push([left, y]);
     },
     scrollBy(dx, dy) {
       this.scrollTo(this.scrollX + dx, this.scrollY + dy);
@@ -662,24 +829,108 @@ function makeBookDocument(markup, url, layout) {
         this.ranges = ranges;
       }
     },
+    // O estilo calculado que o leitor consulta: direção (atributo `dir`) e
+    // quebras (do `style=""`; `page-break-*: always` vira `break-*: page`).
+    getComputedStyle(element) {
+      let direction = 'ltr';
+      for (let node = element; node && node.nodeType === 1; node = node.parentNode) {
+        const dir = node.getAttribute('dir');
+        if (dir) {
+          direction = dir.toLowerCase() === 'rtl' ? 'rtl' : 'ltr';
+          break;
+        }
+      }
+      const read = (name) => (element.style ? element.style.getPropertyValue(name) : '');
+      const legacy = (name) => read('page-break-' + name) || 'auto';
+      const modern = (name) => read('break-' + name) || (legacy(name) === 'always' ? 'page' : 'auto');
+      return {
+        direction,
+        breakBefore: modern('before'),
+        breakAfter: modern('after'),
+        pageBreakBefore: legacy('before'),
+        pageBreakAfter: legacy('after'),
+      };
+    },
   };
   doc.defaultView = win;
+  if (flow) {
+    const indexOf = (node, offset) => {
+      const s = state();
+      const run = s.runs.find((item) => item.node === node);
+      if (run) return run.start + Math.max(0, Math.min(offset || 0, node.data.length));
+      const first = node && node.nodeType === 1 ? textNodes(node)[0] : null;
+      const inner = first ? s.runs.find((item) => item.node === first) : null;
+      return inner ? inner.start : null;
+    };
+    const rectAt = (index) => {
+      const s = state();
+      let x;
+      let y;
+      if (s.paged) {
+        const column = Math.floor(index / s.capacity);
+        // Da direita para a esquerda a coluna 0 é a da direita da página 0.
+        x = rtl ? s.pageWidth - (column + 1) * s.step + s.gap / 2 : column * s.step + s.gap / 2;
+        y = 40 + (index % s.capacity) / s.capacity * 600;
+      } else {
+        x = 100;
+        y = index * s.pxPerChar;
+      }
+      const left = x - win.scrollX;
+      const top = y - win.scrollY;
+      return { left, top, right: left + 8, bottom: top + 16, width: 8, height: 16 };
+    };
+    doc.flowRectAt = (node, offset) => {
+      const index = indexOf(node, offset);
+      return index == null ? null : rectAt(index);
+    };
+    doc.flowRectOf = (element) => {
+      const index = indexOf(element, 0);
+      return index == null ? null : rectAt(index);
+    };
+    // O ponto de texto num ponto do iframe: no modo de páginas, o início da
+    // coluna que está ali; na rolagem, a letra àquela altura.
+    doc.caretRangeFromPoint = (x, y) => {
+      const s = state();
+      if (!s.total) return null;
+      let index;
+      if (s.paged) {
+        const absolute = x + win.scrollX;
+        const column = rtl ? Math.floor((s.pageWidth - absolute) / s.step) : Math.floor(absolute / s.step);
+        index = Math.max(0, column) * s.capacity;
+      } else {
+        index = Math.floor((y + win.scrollY) / s.pxPerChar);
+      }
+      index = Math.max(0, Math.min(s.total - 1, index));
+      const run = s.runs.filter((item) => item.start <= index).pop();
+      const range = doc.createRange();
+      range.setStart(run.node, index - run.start);
+      range.setEnd(run.node, index - run.start);
+      return range;
+    };
+  }
   for (const [id, where] of Object.entries(opts.places || {})) {
     const element = doc.getElementById(id);
     if (!element) throw new Error('sem elemento #' + id);
     element.absX = where.x;
     element.absY = where.y || 0;
   }
-  return { doc, win };
+  return { doc, win, layout: opts };
+}
+
+// O documento novo entra no iframe (lido, "interactive"), sem o `load`: as
+// imagens ainda estão a chegar.
+function commitFrame(frame, markup, layout) {
+  const src = frame.current;
+  const url = src.startsWith('http') ? src : ORIGIN + src;
+  const book = makeBookDocument(markup, url, Object.assign({ ready: 'interactive' }, layout || {}, { frame }));
+  frame.contentDocument = book.doc;
+  frame.contentWindow = book.win;
+  return book;
 }
 
 // Entrega o capítulo ao iframe do leitor e dispara o `load`.
 function loadFrame(frame, markup, layout) {
-  const src = frame.src;
-  const url = src.startsWith('http') ? src : ORIGIN + src;
-  const book = makeBookDocument(markup, url, layout);
-  frame.contentDocument = book.doc;
-  frame.contentWindow = book.win;
+  const book = commitFrame(frame, markup, Object.assign({}, layout || {}, { ready: 'complete' }));
   frame.fire('load');
   return book;
 }
@@ -741,6 +992,7 @@ const helpers = {
   documentFrom,
   makePage,
   makeBookDocument,
+  commitFrame,
   loadFrame,
   parseChapterMarkup,
   speech,

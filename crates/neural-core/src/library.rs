@@ -1163,7 +1163,7 @@ fn recover_orphans(dir: &Path, books: &mut Vec<BookEntry>) -> usize {
     if count > 0 {
         books.extend(found);
         // Mais recente primeiro (estável: a ordem do índice fica).
-        books.sort_by(|a, b| b.added_unix.cmp(&a.added_unix));
+        books.sort_by_key(|book| std::cmp::Reverse(book.added_unix));
     }
     count
 }
@@ -2187,6 +2187,38 @@ mod tests {
             .find(|entry| entry.source_name == "grande.epub")
             .unwrap();
         assert_eq!(entry.spine_len, 400, "os itemrefs válidos continuam lá");
+    }
+
+    #[test]
+    fn a_spine_past_the_cap_is_cut_and_warnings_stay_bounded() {
+        use crate::epub::{MAX_SPINE_ITEMS, MAX_WARNINGS};
+        let refs = format!(
+            "{}{}",
+            r#"<itemref idref="nada"/>"#.repeat(500),
+            r#"<itemref idref="c"/>"#.repeat(MAX_SPINE_ITEMS + 50)
+        );
+        let opf = opf(
+            "",
+            r#"<item id="c" href="c.xhtml" media-type="application/xhtml+xml"/>"#,
+            &refs,
+            "",
+        );
+        let page = chapter("C", "<p>texto</p>");
+        let bytes = ZipBuilder::new()
+            .stored("mimetype", b"application/epub+zip")
+            .stored("META-INF/container.xml", CONTAINER_XML.as_bytes())
+            .stored("OEBPS/content.opf", opf.as_bytes())
+            .stored("OEBPS/c.xhtml", page.as_bytes())
+            .build();
+        let archive = EpubArchive::from_bytes(bytes).unwrap();
+        let book = EpubBook::parse(&archive).unwrap();
+        assert_eq!(book.spine.len(), MAX_SPINE_ITEMS);
+        assert_eq!(book.warnings.len(), MAX_WARNINGS);
+        assert!(
+            book.warnings
+                .iter()
+                .all(|warning| warning.chars().count() < 300)
+        );
     }
 
     #[test]

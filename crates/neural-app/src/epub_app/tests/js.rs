@@ -374,6 +374,56 @@ fn shipped_reader_retries_an_xhtml_chapter_the_xml_parser_refused_as_html() {
 }
 
 #[test]
+fn shipped_reader_turns_to_the_true_last_page_and_leftwards_in_rtl_chapters() {
+    let book = js_book();
+    let out = scenario("last_page_and_rtl", book.reader_data());
+    // A 4.ª página começa em 3 x 1200, não onde o conteúdo deixa de rolar.
+    assert_eq!(out["last"], json!([3600, 0]));
+    let pages = out["pages"].as_u64().expect("páginas");
+    assert_eq!(out["narrow"], json!([(pages - 1) * 800, 0]));
+    assert_eq!(
+        out["rtl"],
+        json!([[-1200, 0], [-2400, 0], [-1200, 0], [-2400, 0]])
+    );
+}
+
+#[test]
+fn shipped_reader_keeps_the_reading_point_across_relayouts_and_mode_switches() {
+    let book = js_book();
+    let out = scenario("relayout", book.reader_data());
+    assert!(
+        out["start"]
+            .as_str()
+            .is_some_and(|label| label.starts_with("Página 3 de ")),
+        "{out}"
+    );
+    assert_eq!(out["back"], out["start"]);
+}
+
+#[test]
+fn shipped_reader_lays_a_chapter_out_before_its_images_and_keeps_history_flat() {
+    let book = js_book();
+    let out = scenario("early_layout", book.reader_data());
+    assert_eq!(out["historyAdded"], 0);
+    assert_eq!(out["how"], json!(["src", "replace", "replace", "replace"]));
+}
+
+#[test]
+fn shipped_reader_applies_typography_themes_and_fixes_the_book_css() {
+    let book = js_book();
+    let out = scenario("typography", book.reader_data());
+    assert_eq!(out["saved"]["fontSize"], 90);
+    assert_eq!(out["saved"]["theme"], "light");
+}
+
+#[test]
+fn shipped_reader_reads_aloud_with_the_voice_the_person_picks() {
+    let book = js_book();
+    let out = scenario("voice", book.reader_data());
+    assert_eq!(out["voice"], "Microsoft Zira");
+}
+
+#[test]
 fn shipped_library_searches_sorts_continues_and_removes_with_confirmation() {
     let temp = TempDir::new("js-library");
     let dir = temp.path().join("library");
@@ -388,7 +438,7 @@ fn shipped_library_searches_sorts_continues_and_removes_with_confirmation() {
         let abelha = write_file(
             temp.path(),
             "abelha.epub",
-            &plain_epub("Abelha Rainha", "Bruno Barros"),
+            &plain_epub("Abelha Rainha", "Bruno Zanetti"),
         );
         let read = library.add_at(&read, 1_000).expect("lido").id;
         let agata = library.add_at(&agata, 2_000).expect("ágata").id;

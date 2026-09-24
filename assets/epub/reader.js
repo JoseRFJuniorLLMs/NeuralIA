@@ -12,6 +12,10 @@
   const SVG_NS = 'http://www.w3.org/2000/svg';
   const XLINK_NS = 'http://www.w3.org/1999/xlink';
   const STYLE_ID = 'neuralia-reader-style';
+  // Elementos do livro que o leitor olha de uma vez (quebras forçadas,
+  // tamanhos de fonte): um capítulo gigante não congela a página.
+  const MAX_STYLED_ELEMENTS = 20000;
+  const RELAYOUT_DELAY_MS = 120;
   const SETTINGS_KEY = 'neuralia-epub-settings';
   const SAVE_DELAY_MS = 800;
   const TWO_COLUMN_MIN_WIDTH = 1000;
@@ -48,6 +52,7 @@
     mode: 'paged',
     columns: 'auto',
     rate: '1',
+    voices: Object.freeze({}),
   });
   const LANGUAGE_ALIASES = { por: 'pt', eng: 'en', spa: 'es', fra: 'fr', fre: 'fr', deu: 'de', ger: 'de', ita: 'it' };
 
@@ -315,12 +320,40 @@
   // Ocorrências de `query` em `text`, sem distinguir maiúsculas nem
   // acentos, com o contexto à volta. `occurrence` é a ordem da ocorrência
   // no documento: é por ela que se volta a encontrar o ponto ao abrir.
+  // O texto dobrado com cada sequência de espaços (quebra de linha e recuo,
+  // nbsp + espaço, espaço duplo) reduzida a um espaço, como na busca; o mapa
+  // de volta ao original cobre a sequência inteira.
+  function collapsedFold(text) {
+    const folded = E.foldWithMap(text);
+    const chars = [];
+    const starts = [];
+    const ends = [];
+    let space = false;
+    for (let i = 0; i < folded.text.length; i++) {
+      const ch = folded.text[i];
+      if (/\s/.test(ch)) {
+        if (space) {
+          ends[ends.length - 1] = folded.ends[i];
+          continue;
+        }
+        space = true;
+        chars.push(' ');
+      } else {
+        space = false;
+        chars.push(ch);
+      }
+      starts.push(folded.starts[i]);
+      ends.push(folded.ends[i]);
+    }
+    return { text: chars.join(''), starts, ends };
+  }
+
   function searchText(text, query, limit, context) {
     const needle = E.fold(String(query || '')).replace(/\s+/g, ' ').trim();
     const results = [];
     if (needle.length < 2 || !(limit > 0)) return results;
-    const folded = E.foldWithMap(text);
-    const hay = folded.text.replace(/\s/g, ' ');
+    const folded = collapsedFold(text);
+    const hay = folded.text;
     let from = 0;
     while (results.length < limit) {
       const at = hay.indexOf(needle, from);
@@ -557,9 +590,15 @@
   // Uma voz LOCAL (nunca uma voz online) que fale a língua do livro; entre
   // as de português, pt-BR primeiro. Sem língua conhecida, ou sem voz para
   // ela: pt-BR, depois a voz local padrão. `null` se não há voz local.
-  function chooseVoice(voices, bookLanguage) {
+  // `preferred`: a voz que a pessoa escolheu para esta língua (nome), se
+  // ainda estiver instalada.
+  function chooseVoice(voices, bookLanguage, preferred) {
     const local = (Array.isArray(voices) ? voices : []).filter((voice) => voice && voice.localService === true);
     if (!local.length) return null;
+    if (preferred) {
+      const chosen = local.find((voice) => voice.name === preferred);
+      if (chosen) return chosen;
+    }
     const lang = languageTag(bookLanguage);
     const base = lang.split('-')[0];
     const rank = (voice) => {
@@ -729,6 +768,111 @@
     return frame;
   }
 
+  // Tamanho de fonte absoluto (px, pt...) ou palavra (medium, large) em rem:
+  // assim o A+/A- (a percentagem do <html>) também muda os livros que fixam o
+  // tamanho, como o Calibre faz. Relativos (em, %, rem) ficam como estão.
+  const KEYWORD_FONT_SIZES = {
+    'xx-small': 0.5625, 'x-small': 0.625, small: 0.8125, medium: 1,
+    large: 1.125, 'x-large': 1.5, 'xx-large': 2, 'xxx-large': 3,
+  };
+  const ABSOLUTE_UNITS = { px: 1, pt: 4 / 3, pc: 16, in: 96, cm: 96 / 2.54, mm: 96 / 25.4 };
+
+  function relativeFontSize(value) {
+    const text = String(value || '').trim().toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(KEYWORD_FONT_SIZES, text)) return KEYWORD_FONT_SIZES[text] + 'rem';
+    const match = /^(\d*\.?\d+)(px|pt|pc|in|cm|mm)$/.exec(text);
+    if (!match) return null;
+    const px = Number(match[1]) * ABSOLUTE_UNITS[match[2]];
+    if (!(px > 0)) return null;
+    return (Math.round(px / 16 * 10000) / 10000) + 'rem';
+  }
+
+  function relativizeStyle(style) {
+    if (!style || typeof style.getPropertyValue !== 'function') return 0;
+    const next = relativeFontSize(style.getPropertyValue('font-size'));
+    if (!next) return 0;
+    style.setProperty('font-size', next, style.getPropertyPriority('font-size'));
+    return 1;
+  }
+
+  // As regras das folhas do livro (e as de @media dentro delas) e os
+  // `style=""` do corpo. Idempotente: corre quando o capítulo abre e outra vez
+  // quando as folhas de estilo acabam de chegar.
+  function relativizeFontSizes(doc) {
+    let changed = 0;
+    let visited = 0;
+    const sheets = doc && doc.styleSheets ? Array.from(doc.styleSheets) : [];
+    for (const sheet of sheets) {
+      let rules = null;
+      try {
+        rules = sheet.cssRules;
+      } catch (_) {
+        rules = null;
+      }
+      const stack = rules ? Array.from(rules) : [];
+      while (stack.length && visited < MAX_STYLED_ELEMENTS) {
+        visited++;
+        const rule = stack.pop();
+        if (rule.style) changed += relativizeStyle(rule.style);
+        let inner = null;
+        try {
+          inner = rule.cssRules;
+        } catch (_) {
+          inner = null;
+        }
+        if (inner) for (let i = 0; i < inner.length; i++) stack.push(inner[i]);
+      }
+    }
+    const body = doc && doc.body;
+    if (body && typeof body.querySelectorAll === 'function') {
+      const inline = body.querySelectorAll('[style]');
+      for (let i = 0; i < inline.length && i < MAX_STYLED_ELEMENTS; i++) changed += relativizeStyle(inline[i].style);
+    }
+    return changed;
+  }
+
+  // `page-break-before: always` e `break-before: page` não quebram coluna
+  // dentro de colunas CSS: a parte, o capítulo de um EPUB de um só arquivo ou
+  // a imagem de página inteira corriam na mesma coluna. Como o Calibre, cada
+  // quebra de página forçada vira quebra de coluna.
+  const FORCED_BREAK = /^(page|left|right|recto|verso|always)$/;
+
+  function columnBreaks(doc, win) {
+    if (!doc || !doc.body || !win || typeof win.getComputedStyle !== 'function') return 0;
+    const all = doc.body.getElementsByTagName('*');
+    let changed = 0;
+    for (let i = 0; i < all.length && i < MAX_STYLED_ELEMENTS; i++) {
+      const element = all[i];
+      let computed = null;
+      try {
+        computed = win.getComputedStyle(element);
+      } catch (_) {
+        computed = null;
+      }
+      if (!computed || !element.style) continue;
+      for (const side of ['before', 'after']) {
+        const modern = side === 'before' ? computed.breakBefore : computed.breakAfter;
+        const legacy = side === 'before' ? computed.pageBreakBefore : computed.pageBreakAfter;
+        if (FORCED_BREAK.test(String(modern || '')) || FORCED_BREAK.test(String(legacy || ''))) {
+          element.style.setProperty('break-' + side, 'column', 'important');
+          changed++;
+        }
+      }
+    }
+    return changed;
+  }
+
+  function documentDirection(doc, win) {
+    const element = doc && doc.documentElement;
+    if (!element || !win || typeof win.getComputedStyle !== 'function') return 'ltr';
+    try {
+      const computed = win.getComputedStyle(element);
+      return computed && computed.direction === 'rtl' ? 'rtl' : 'ltr';
+    } catch (_) {
+      return 'ltr';
+    }
+  }
+
   function verticalPadding(height) {
     return Math.round(E.clamp(height * 0.04, 12, 40));
   }
@@ -759,6 +903,10 @@
         'px !important; object-fit: contain; box-sizing: border-box; break-inside: avoid; }');
       lines.push('img { height: auto; }');
       lines.push('p, li, blockquote, h1, h2, h3, h4, h5, h6 { orphans: 2; widows: 2; }');
+      lines.push('figure { break-inside: avoid; }');
+      // O marcador do fim da última página (ver `measure`) mede a partir da
+      // página: um livro que posiciona o <html> não o desloca.
+      lines.push('html { position: static !important; transform: none !important; }');
     } else {
       lines.push('html { width: auto !important; height: auto !important; margin: 0 !important; padding: 0 !important;' +
         ' overflow-x: hidden !important; overflow-y: auto !important; column-width: auto !important; column-count: auto !important; }');
@@ -767,6 +915,12 @@
       lines.push('img, svg, video, canvas { max-width: 100% !important; object-fit: contain; }');
       lines.push('img { height: auto; }');
     }
+    // Palavra longa, URL, <pre> e tabela larga nunca atravessam a margem para
+    // a coluna (ou a página) seguinte e tapam o texto de lá.
+    lines.push('body, body * { overflow-wrap: break-word !important; }');
+    lines.push('pre, pre * { white-space: pre-wrap !important; }');
+    lines.push('table { max-width: 100% !important; }');
+    lines.push('td, th { overflow-wrap: anywhere !important; }');
     const family = FONT_FAMILIES[settings.fontFamily];
     if (family) {
       lines.push('body, body * { font-family: ' + family + ' !important; }');
@@ -793,6 +947,21 @@
     return lines.join('\n');
   }
 
+  // A voz escolhida por língua do livro: { pt: 'Microsoft Maria', en: ... }.
+  function cleanVoices(raw) {
+    const out = {};
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+    let count = 0;
+    for (const [lang, name] of Object.entries(raw)) {
+      if (count >= 32) break;
+      if (/^([a-z]{2,3}|und)$/.test(lang) && typeof name === 'string' && name && name.length <= 200) {
+        out[lang] = name;
+        count++;
+      }
+    }
+    return out;
+  }
+
   function normalizeSettings(raw) {
     const input = raw && typeof raw === 'object' ? raw : {};
     const pick = (value, allowed, fallback) => (allowed.includes(value) ? value : fallback);
@@ -807,6 +976,7 @@
       mode: pick(input.mode, ['paged', 'scroll'], DEFAULT_SETTINGS.mode),
       columns: pick(input.columns, ['auto', '1', '2'], DEFAULT_SETTINGS.columns),
       rate: pick(input.rate, RATES, DEFAULT_SETTINGS.rate),
+      voices: cleanVoices(input.voices),
     };
   }
 
@@ -888,6 +1058,20 @@
       this.scrollQueued = false;
       this.toastTimer = null;
       this.resizeTimer = null;
+      this.relayoutTimer = null;
+      // Navegação do iframe: cada carga tem um número; o documento que estava
+      // lá antes não conta como o novo.
+      this.loadToken = 0;
+      this.staleDoc = null;
+      this.readyDoc = null;
+      this.loadedOnce = false;
+      // O documento do capítulo corre da direita para a esquerda.
+      this.rtl = false;
+      // O ponto do texto onde a pessoa está, guardado entre mudanças de
+      // tipografia/janela enquanto ela não vira a página.
+      this.stickyAnchor = null;
+      this.filler = null;
+      this.fillerDoc = null;
       const byId = (id) => doc.getElementById(id);
       this.ui = {
         back: byId('back'),
@@ -915,6 +1099,7 @@
         mode: byId('mode'),
         columns: byId('columns'),
         rate: byId('rate'),
+        voice: byId('voice'),
         voiceName: byId('voice-name'),
         speak: byId('btn-speak'),
         help: byId('help'),
@@ -1011,6 +1196,11 @@
       this.doc.title = (book.title || 'Livro') + ' — NeuralIA';
       this.renderToc();
       this.renderBookmarks();
+      this.renderVoices();
+      const synth = this.win.speechSynthesis;
+      if (synth && typeof synth.addEventListener === 'function') {
+        synth.addEventListener('voiceschanged', () => this.renderVoices());
+      }
       E.onNotice((notice) => this.onNotice(notice));
       E.post({ t: 'opened', id });
       const start = restorePosition(book.position, book.spine.length);
@@ -1042,6 +1232,7 @@
       bindSelect(ui.mode, 'mode');
       bindSelect(ui.columns, 'columns');
       bindSelect(ui.rate, 'rate');
+      if (ui.voice) ui.voice.addEventListener('change', () => this.setVoice(ui.voice.value));
       for (const button of this.doc.querySelectorAll('[data-theme-choice]')) {
         button.addEventListener('click', () => this.setSetting('theme', button.getAttribute('data-theme-choice')));
       }
@@ -1099,13 +1290,16 @@
     }
 
     setSetting(key, value) {
+      // Onde a pessoa está, lido com a tipografia e o modo AINDA em vigor:
+      // trocar de Páginas para Rolagem (ou o contrário) não volta ao início.
+      const anchor = key === 'rate' ? null : this.readingAnchor();
       const next = normalizeSettings(Object.assign({}, this.settings, { [key]: value }));
       this.settings = next;
       this.saveSettings();
       this.syncSettingsUi();
       this.applyChromeTheme();
       if (key === 'rate' && this.speech) this.speech.rate = Number(next.rate) || 1;
-      if (key !== 'rate') this.relayout();
+      if (key !== 'rate') this.relayout(anchor);
     }
 
     changeFont(direction) {
@@ -1142,6 +1336,7 @@
       if (!this.book) return;
       const index = Math.trunc(Number(spine));
       if (!(index >= 0 && index < this.book.spine.length)) return;
+      this.stickyAnchor = null;
       if (index === this.spine && this.frameReady) {
         this.applyTarget(target || { page: 0 });
         return;
@@ -1149,11 +1344,75 @@
       this.spine = index;
       this.frameReady = false;
       this.pendingTarget = target || { page: 0 };
-      this.frame.src = this.book.spine[index].href;
+      this.load(this.book.spine[index].href);
+    }
+
+    // Troca o documento do iframe. Depois da primeira carga, com
+    // `location.replace`: mudar de capítulo não cria entradas no histórico
+    // (o Voltar do rato ou Alt+Esquerda não reabre capítulos antigos na
+    // página 1 nem grava essa posição). A página só é preparada quando o
+    // documento NOVO já está lá (ver `watchFrame`).
+    load(href) {
+      this.loadToken++;
+      this.staleDoc = this.frameDoc();
+      this.readyDoc = null;
+      let replaced = false;
+      const win = this.loadedOnce ? this.frameWin() : null;
+      if (win) {
+        try {
+          win.location.replace(href);
+          replaced = true;
+        } catch (_) {
+          replaced = false;
+        }
+      }
+      if (!replaced) this.frame.src = href;
+      this.loadedOnce = true;
+      this.watchFrame(this.loadToken);
+    }
+
+    // O capítulo aparece paginado, com o tema e a tipografia, assim que o
+    // documento está lido (readyState "interactive"), sem esperar por cada
+    // imagem; o `load` (e o de cada imagem) refaz a medição depois.
+    watchFrame(token) {
+      const check = () => {
+        if (token !== this.loadToken || this.frameReady) return;
+        const doc = this.frameDoc();
+        if (doc && doc !== this.staleDoc && this.isChapterDocument(doc) &&
+            (doc.readyState === 'interactive' || doc.readyState === 'complete')) {
+          this.onFrameReady(doc);
+          return;
+        }
+        this.win.requestAnimationFrame(check);
+      };
+      this.win.requestAnimationFrame(check);
+    }
+
+    isChapterDocument(doc) {
+      let href = '';
+      try {
+        href = String(this.frameWin().location.href);
+      } catch (_) {
+        href = '';
+      }
+      return Boolean(doc.documentElement) && href !== '' && href !== 'about:blank';
     }
 
     onFrameLoad() {
       const doc = this.frameDoc();
+      if (!doc || !this.book || doc === this.staleDoc) return;
+      if (doc !== this.readyDoc) {
+        // Carregou antes de a vigia o ver: prepara agora, tudo de uma vez.
+        this.onFrameReady(doc);
+        return;
+      }
+      // Já estava preparado desde o "interactive": as folhas de estilo e as
+      // imagens chegaram agora; o texto fica onde estava.
+      this.polishDocument(doc);
+      this.relayout();
+    }
+
+    onFrameReady(doc) {
       if (!doc || !this.book) return;
       let location = '';
       try {
@@ -1164,7 +1423,7 @@
         if (retry) {
           // O alvo pendente fica para quando o capítulo abrir como HTML.
           if (!this.pendingTarget) this.pendingTarget = { page: 0 };
-          this.frame.src = retry;
+          this.load(retry);
           return;
         }
       }
@@ -1175,7 +1434,10 @@
         if (!this.pendingTarget) this.pendingTarget = here.fragment ? { fragment: here.fragment } : { page: 0 };
       }
       this.frameReady = true;
+      this.readyDoc = doc;
+      this.stickyAnchor = null;
       this.prepareDocument(doc);
+      this.rtl = documentDirection(doc, this.frameWin()) === 'rtl';
       this.layout();
       const target = this.pendingTarget || { page: 0 };
       this.pendingTarget = null;
@@ -1208,6 +1470,25 @@
       // Formulários do livro nunca enviam nada (o sandbox e a CSP já o
       // impedem; isto só evita o clique morto).
       doc.addEventListener('submit', (event) => event.preventDefault(), true);
+      // Uma imagem que chega muda a altura do que está antes dela: mede-se
+      // outra vez, com o texto no mesmo lugar.
+      doc.addEventListener('load', (event) => {
+        if (event && event.target !== doc && this.frameDoc() === doc) this.scheduleRelayout();
+      }, true);
+      this.polishDocument(doc);
+    }
+
+    polishDocument(doc) {
+      relativizeFontSizes(doc);
+      columnBreaks(doc, this.frameWin());
+    }
+
+    scheduleRelayout() {
+      if (this.relayoutTimer != null) this.win.clearTimeout(this.relayoutTimer);
+      this.relayoutTimer = this.win.setTimeout(() => {
+        this.relayoutTimer = null;
+        this.relayout();
+      }, RELAYOUT_DELAY_MS);
     }
 
     layout() {
@@ -1243,20 +1524,134 @@
       only.style.setProperty('object-fit', 'contain');
     }
 
+    // O conteúdo acaba na borda da última coluna, e o navegador não rola além
+    // de scrollWidth - largura: a última página ficava desalinhada (repetia
+    // a coluna da anterior, sem a margem da direita). Um marcador de 1 px no
+    // fim exato da última página estende o que se pode rolar até lá.
     measure() {
       const doc = this.frameDoc();
+      const filler = doc ? this.pageFiller(doc) : null;
+      if (filler) filler.style.setProperty('display', 'none', 'important');
       if (!doc || this.settings.mode !== 'paged') {
         this.pages = 1;
         return;
       }
       this.pages = pageCount(doc.documentElement.scrollWidth, this.geometry.pageWidth);
+      if (filler) {
+        const edge = this.pages * this.geometry.pageWidth - 1;
+        filler.style.setProperty(this.rtl ? 'right' : 'left', edge + 'px', 'important');
+        filler.style.setProperty(this.rtl ? 'left' : 'right', 'auto', 'important');
+        filler.style.setProperty('display', 'block', 'important');
+      }
     }
 
-    relayout() {
+    pageFiller(doc) {
+      if (this.fillerDoc === doc && this.filler) return this.filler;
+      const root = doc.documentElement;
+      if (!root || root.namespaceURI === SVG_NS) return null;
+      const filler = doc.createElementNS(XHTML_NS, 'div');
+      filler.setAttribute('aria-hidden', 'true');
+      for (const [name, value] of [['position', 'absolute'], ['top', '0'], ['width', '1px'], ['height', '1px'],
+        ['margin', '0'], ['padding', '0'], ['border', '0'], ['visibility', 'hidden'], ['pointer-events', 'none']]) {
+        filler.style.setProperty(name, value, 'important');
+      }
+      root.appendChild(filler);
+      this.filler = filler;
+      this.fillerDoc = doc;
+      return filler;
+    }
+
+    // Refaz a paginação (fonte, margens, colunas, modo, janela, imagens) e
+    // volta ao MESMO ponto do texto; a fração só se o ponto se perdeu.
+    relayout(anchor) {
       if (!this.frameReady) return;
-      const fraction = this.currentFraction();
+      const keep = anchor || this.readingAnchor();
       this.layout();
-      this.applyTarget({ fraction });
+      this.stickyAnchor = keep;
+      this.applyTarget(keep ? { anchor: keep, fraction: keep.fraction } : { page: 0 });
+    }
+
+    // O ponto guardado (no modo de páginas, enquanto a pessoa não vira a
+    // página: A+ três vezes e A- três vezes volta exatamente à mesma página),
+    // ou o primeiro ponto visível agora.
+    readingAnchor() {
+      const doc = this.frameDoc();
+      const sticky = this.stickyAnchor;
+      if (sticky && sticky.doc === doc && this.settings.mode === 'paged' &&
+          (!sticky.node || (doc.documentElement && doc.documentElement.contains(sticky.node)))) {
+        return sticky;
+      }
+      return this.captureAnchor();
+    }
+
+    // O primeiro ponto do texto visível no canto de cima da página (o
+    // Calibre guarda um CFI), mais a fração, para o caso de ele se perder.
+    captureAnchor() {
+      const doc = this.frameDoc();
+      if (!doc || !this.frameReady) return null;
+      const anchor = { doc, node: null, offset: 0, fraction: this.currentFraction() };
+      if (typeof doc.caretRangeFromPoint === 'function') {
+        const point = this.firstVisiblePoint();
+        let caret = null;
+        try {
+          caret = doc.caretRangeFromPoint(point.x, point.y);
+        } catch (_) {
+          caret = null;
+        }
+        if (caret && caret.startContainer) {
+          anchor.node = caret.startContainer;
+          anchor.offset = caret.startOffset;
+        }
+      }
+      return anchor;
+    }
+
+    // Onde começa o texto visível, em coordenadas do iframe.
+    firstVisiblePoint() {
+      if (this.settings.mode !== 'paged') {
+        return { x: Math.round(Math.max(1, this.ui.stage.clientWidth) / 2), y: 2 };
+      }
+      const inset = this.geometry.gap / 2 + 2;
+      return {
+        x: this.rtl ? this.geometry.pageWidth - inset : inset,
+        y: verticalPadding(this.geometry.pageHeight) + 2,
+      };
+    }
+
+    // A página onde está um ponto (coordenadas do documento). Da direita
+    // para a esquerda as páginas seguintes ficam em x negativo.
+    pageAt(x) {
+      const width = this.geometry.pageWidth;
+      if (!(width > 0)) return 0;
+      if (this.rtl) return Math.max(0, Math.ceil(-x / width - 1e-9));
+      return Math.max(0, Math.floor(x / width));
+    }
+
+    // As páginas avançam para a esquerda (livro RTL: árabe, hebraico, mangá).
+    pagesGoLeft() {
+      const direction = this.book && this.book.direction;
+      return direction === 'rtl' || (direction !== 'ltr' && this.rtl);
+    }
+
+    pointOfPosition(node, offset) {
+      const doc = this.frameDoc();
+      if (!doc || !node || !doc.documentElement || !doc.documentElement.contains(node)) return null;
+      let rect = null;
+      if (node.nodeType === 3) {
+        const length = node.data.length;
+        const start = Math.max(0, Math.min(offset, Math.max(0, length - 1)));
+        const range = doc.createRange();
+        range.setStart(node, start);
+        range.setEnd(node, Math.min(length, start + 1));
+        const rects = range.getClientRects();
+        rect = rects.length ? rects[0] : range.getBoundingClientRect();
+      } else if (node.nodeType === 1) {
+        const child = node.childNodes && node.childNodes[offset];
+        const element = child && child.nodeType === 1 ? child : node;
+        rect = element.getBoundingClientRect();
+      }
+      if (!rect || (!rect.width && !rect.height && !rect.left && !rect.top)) return null;
+      return this.pointOf(rect);
     }
 
     currentFraction() {
@@ -1289,7 +1684,7 @@
     anchorAt(fragment) {
       const point = this.pointOfFragment(fragment);
       if (!point) return null;
-      if (this.settings.mode === 'paged') return Math.floor(point.x / this.geometry.pageWidth);
+      if (this.settings.mode === 'paged') return this.pageAt(point.x);
       return point.y;
     }
 
@@ -1302,9 +1697,10 @@
       let where = null;
       if (range) where = this.pointOfRange(range);
       else if (target.fragment) where = this.pointOfFragment(target.fragment);
+      else if (target.anchor) where = this.pointOfPosition(target.anchor.node, target.anchor.offset);
       if (this.settings.mode === 'paged') {
         let page;
-        if (where) page = Math.floor(where.x / this.geometry.pageWidth);
+        if (where) page = this.pageAt(where.x);
         else if (target.page === 'last') page = this.pages - 1;
         else if (typeof target.fraction === 'number') page = pageForFraction(target.fraction, this.pages);
         else page = typeof target.page === 'number' ? target.page : 0;
@@ -1314,7 +1710,7 @@
       const scroller = this.scroller();
       if (!scroller) return;
       let top;
-      if (where) top = where.y - 24;
+      if (where) top = target.anchor ? where.y - 2 : where.y - 24;
       else if (target.page === 'last') top = scroller.scrollHeight;
       else if (typeof target.fraction === 'number') top = E.clamp(target.fraction, 0, 1) * scroller.scrollHeight;
       else top = 0;
@@ -1325,7 +1721,8 @@
     showPage(page) {
       this.page = Math.max(0, Math.min(this.pages - 1, Math.trunc(Number(page)) || 0));
       const win = this.frameWin();
-      if (win) win.scrollTo(this.page * this.geometry.pageWidth, 0);
+      const x = this.page * this.geometry.pageWidth;
+      if (win) win.scrollTo((this.rtl ? -x : x) || 0, 0);
       this.afterMove();
     }
 
@@ -1351,6 +1748,7 @@
 
     move(direction) {
       if (!this.frameReady || !this.book) return;
+      this.stickyAnchor = null;
       this.stopSpeech();
       if (this.settings.mode === 'paged') {
         const step = stepPaged(this.page, this.pages, this.spine, this.book.spine.length, direction);
@@ -1429,7 +1827,8 @@
       if (this.settings.mode !== 'paged' || event.button !== 0) return;
       const selection = this.frameWin().getSelection();
       if (selection && !selection.isCollapsed) return;
-      const zone = clickZone(event.clientX, this.geometry.pageWidth);
+      let zone = clickZone(event.clientX, this.geometry.pageWidth);
+      if (this.pagesGoLeft()) zone = -zone;
       if (zone < 0) this.prev();
       else if (zone > 0) this.next();
     }
@@ -1480,8 +1879,12 @@
         return;
       }
       if (typing) return;
-      const action = keyAction(key, event.shiftKey);
+      let action = keyAction(key, event.shiftKey);
       if (!action) return;
+      // Num livro da direita para a esquerda a seta para a esquerda avança.
+      if (this.pagesGoLeft() && (key === 'ArrowLeft' || key === 'ArrowRight')) {
+        action = action === 'next' ? 'prev' : 'next';
+      }
       event.preventDefault();
       switch (action) {
         case 'next':
@@ -1569,7 +1972,12 @@
         if (entry.spine == null) {
           button.disabled = true;
         } else {
-          button.addEventListener('click', () => this.goTo(entry.spine, entry.fragment ? { fragment: entry.fragment } : { page: 0 }));
+          button.addEventListener('click', () => {
+            // O painel fica por cima da coluna da esquerda: fecha, para o
+            // capítulo aberto não ficar escondido debaixo dele.
+            this.closePanels();
+            this.goTo(entry.spine, entry.fragment ? { fragment: entry.fragment } : { page: 0 });
+          });
         }
         item.appendChild(button);
         list.appendChild(item);
@@ -1648,7 +2056,12 @@
           line.appendChild(E.el(this.doc, 'mark', null, hit.match));
           line.appendChild(this.doc.createTextNode(hit.after));
           button.appendChild(line);
-          button.addEventListener('click', () => this.goTo(spine, { search: { query, occurrence: hit.occurrence } }));
+          button.addEventListener('click', () => {
+            // Os resultados continuam lá (Ctrl+F reabre o painel); a palavra
+            // encontrada não fica debaixo dele.
+            this.closePanels();
+            this.goTo(spine, { search: { query, occurrence: hit.occurrence } });
+          });
           item.appendChild(button);
           ui.searchResults.appendChild(item);
         }
@@ -1710,7 +2123,10 @@
         const item = E.el(this.doc, 'li', 'bookmark');
         const go = E.el(this.doc, 'button', 'bookmark-go', mark.label);
         go.type = 'button';
-        go.addEventListener('click', () => this.goTo(mark.spine, { fraction: mark.fraction }));
+        go.addEventListener('click', () => {
+          this.closePanels();
+          this.goTo(mark.spine, { fraction: mark.fraction });
+        });
         const remove = E.el(this.doc, 'button', 'icon-button small bookmark-remove', '×');
         remove.type = 'button';
         remove.title = 'Remover marcador';
@@ -1738,6 +2154,9 @@
       if (notice.kind === 'bookmarks' && notice.id === this.id) {
         this.reloadBookmarks();
       } else if (notice.kind === 'error') {
+        // Uma gravação falhou (disco cheio...): a próxima posição volta a ir,
+        // mesmo que seja a mesma.
+        if (this.saver) this.saver.last = null;
         this.toast(notice.message || 'Algo deu errado.', true);
       } else if (notice.kind === 'added') {
         const errors = Array.isArray(notice.errors) ? notice.errors : [];
@@ -1764,7 +2183,7 @@
         return;
       }
       const begin = () => {
-        const voice = chooseVoice(synth.getVoices(), this.book.language);
+        const voice = chooseVoice(synth.getVoices(), this.book.language, this.preferredVoiceName());
         if (!voice) {
           this.toast('Nenhuma voz instalada neste computador pode ler este livro.', true);
           return;
@@ -1804,9 +2223,8 @@
       if (!doc) return 0;
       const collected = collectText(doc);
       if (typeof doc.caretRangeFromPoint === 'function') {
-        const x = this.settings.mode === 'paged' ? this.geometry.gap / 2 + 4 : 24;
-        const y = verticalPadding(this.geometry.pageHeight) + 4;
-        const caret = doc.caretRangeFromPoint(x, y);
+        const point = this.firstVisiblePoint();
+        const caret = doc.caretRangeFromPoint(point.x, point.y);
         if (caret && caret.startContainer && caret.startContainer.nodeType === 3) {
           const segment = collected.segments.find((item) => item.node === caret.startContainer);
           if (segment) return segment.start + caret.startOffset;
@@ -1839,12 +2257,67 @@
       this.setHighlight('neuralia-speech', range);
       const point = this.pointOfRange(range);
       if (this.settings.mode === 'paged') {
-        const page = Math.floor(point.x / this.geometry.pageWidth);
+        const page = this.pageAt(point.x);
+        this.stickyAnchor = null;
         if (page !== this.page) this.showPage(page);
       } else {
         const scroller = this.scroller();
         if (scroller && (point.y < scroller.scrollTop || point.y > scroller.scrollTop + scroller.clientHeight - 40)) {
           this.frameWin().scrollTo(0, Math.max(0, point.y - 40));
+        }
+      }
+    }
+
+    // ------------------------------------------------------------- vozes
+
+    // A língua da escolha de voz: a base da língua do livro ("pt", "en").
+    voiceLanguage() {
+      return languageTag(this.book && this.book.language).split('-')[0] || 'und';
+    }
+
+    preferredVoiceName() {
+      const voices = this.settings.voices || {};
+      return Object.prototype.hasOwnProperty.call(voices, this.voiceLanguage()) ? voices[this.voiceLanguage()] : null;
+    }
+
+    localVoices() {
+      const synth = this.win.speechSynthesis;
+      const voices = synth && typeof synth.getVoices === 'function' ? synth.getVoices() : [];
+      return Array.from(voices || []).filter((voice) => voice && voice.localService === true);
+    }
+
+    // "Voz": Automática (pela língua do livro) ou uma das vozes instaladas.
+    renderVoices() {
+      const select = this.ui.voice;
+      if (!select) return;
+      const local = this.localVoices();
+      select.textContent = '';
+      const auto = E.el(this.doc, 'option', null, 'Automática (pela língua do livro)');
+      auto.value = 'auto';
+      select.appendChild(auto);
+      for (const voice of local) {
+        const option = E.el(this.doc, 'option', null, voice.name + ' (' + voice.lang + ')');
+        option.value = voice.name;
+        select.appendChild(option);
+      }
+      const chosen = this.preferredVoiceName();
+      select.value = chosen && local.some((voice) => voice.name === chosen) ? chosen : 'auto';
+    }
+
+    // Guarda a voz para a língua deste livro (um livro em português marcado
+    // como "en" pode ser lido com a voz certa, e fica assim nos outros).
+    setVoice(name) {
+      const voices = Object.assign({}, this.settings.voices);
+      const lang = this.voiceLanguage();
+      if (name && name !== 'auto') voices[lang] = String(name);
+      else delete voices[lang];
+      this.settings = normalizeSettings(Object.assign({}, this.settings, { voices }));
+      this.saveSettings();
+      if (this.speech && this.speaking) {
+        const voice = chooseVoice(this.localVoices(), this.book.language, this.preferredVoiceName());
+        if (voice) {
+          this.speech.voice = voice;
+          this.ui.voiceName.textContent = 'Voz: ' + voice.name + ' (' + voice.lang + ')';
         }
       }
     }
@@ -1902,6 +2375,7 @@
     findAnchor,
     anchorHref,
     searchText,
+    collapsedFold,
     collectText,
     locateInSegments,
     rangeFor,
@@ -1913,6 +2387,9 @@
     ReadAloud,
     createBookFrame,
     bookCss,
+    relativeFontSize,
+    relativizeFontSizes,
+    columnBreaks,
     resolveTheme,
     normalizeSettings,
     stepFont,
