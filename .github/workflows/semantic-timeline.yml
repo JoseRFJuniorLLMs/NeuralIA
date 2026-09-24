@@ -6,6 +6,7 @@ on:
       - 'crates/neural-core/src/semantic_timeline.rs'
       - 'crates/neural-core/tests/timeline_acceptance.rs'
       - 'crates/neural-app/src/windows_app.rs'
+      - 'crates/neural-app/src/windows_app/**'
       - '.github/workflows/semantic-timeline.yml'
       - 'md/SPEC-0103-semantic-timeline.md'
   push:
@@ -14,6 +15,7 @@ on:
       - 'crates/neural-core/src/semantic_timeline.rs'
       - 'crates/neural-core/tests/timeline_acceptance.rs'
       - 'crates/neural-app/src/windows_app.rs'
+      - 'crates/neural-app/src/windows_app/**'
       - '.github/workflows/semantic-timeline.yml'
       - 'md/SPEC-0103-semantic-timeline.md'
 
@@ -38,7 +40,11 @@ jobs:
           cat > "$RUNNER_TEMP/timeline-shipped-gate.mjs" <<'NODE'
           import fs from 'node:fs';
 
-          let source = fs.readFileSync('crates/neural-app/src/windows_app.rs', 'utf8');
+          const SOURCES = [
+            'crates/neural-app/src/windows_app.rs',
+            'crates/neural-app/src/windows_app/page_scripts.rs',
+          ];
+          let source = SOURCES.filter(fs.existsSync).map(p => fs.readFileSync(p, 'utf8')).join('\n');
           if (process.env.TIMELINE_SABOTAGE === '1') {
             source = source.replaceAll(
               "if (role === 'user') return 'pergunta';",

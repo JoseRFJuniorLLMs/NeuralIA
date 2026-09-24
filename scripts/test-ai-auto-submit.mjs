@@ -2,7 +2,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-const source = fs.readFileSync('crates/neural-app/src/windows_app.rs', 'utf8');
+const SOURCES = [
+  'crates/neural-app/src/windows_app.rs',
+  'crates/neural-app/src/windows_app/page_scripts.rs',
+];
+const source = SOURCES.filter(fs.existsSync).map(p => fs.readFileSync(p, 'utf8')).join('\n');
 const match = source.match(/const AI_AUTO_SUBMIT_SCRIPT: &str = r#"\r?\n([\s\S]*?)\r?\n"#;/);
 assert.ok(match, 'AI_AUTO_SUBMIT_SCRIPT must remain extractable');
 const script = match[1];

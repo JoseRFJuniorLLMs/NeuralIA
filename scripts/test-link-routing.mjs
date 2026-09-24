@@ -2,7 +2,11 @@ import fs from "node:fs";
 import vm from "node:vm";
 import assert from "node:assert/strict";
 
-const source = fs.readFileSync("crates/neural-app/src/windows_app.rs", "utf8");
+const SOURCES = [
+  "crates/neural-app/src/windows_app.rs",
+  "crates/neural-app/src/windows_app/page_scripts.rs",
+];
+const source = SOURCES.filter(fs.existsSync).map(p => fs.readFileSync(p, "utf8")).join("\n");
 const match = source.match(/const COMPARATOR_INJECT_SCRIPT: &str = r#"([\s\S]*?)"#;/);
 assert.ok(match, "COMPARATOR_INJECT_SCRIPT not found");
 const script = match[1].replaceAll("__NEURALIA_CAP__", "test-cap");

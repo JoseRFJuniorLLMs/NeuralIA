@@ -8,6 +8,7 @@ on:
       - 'scripts/test-pdfjs-aux-assets.mjs'
       - 'crates/neural-app/src/pdf_assets.rs'
       - 'crates/neural-app/src/windows_app.rs'
+      - 'crates/neural-app/src/windows_app/**'
       - '.github/workflows/pdf-viewer.yml'
   push:
     branches: [main]
@@ -17,6 +18,7 @@ on:
       - 'scripts/test-pdfjs-aux-assets.mjs'
       - 'crates/neural-app/src/pdf_assets.rs'
       - 'crates/neural-app/src/windows_app.rs'
+      - 'crates/neural-app/src/windows_app/**'
       - '.github/workflows/pdf-viewer.yml'
 
 permissions:

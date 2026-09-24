@@ -72,9 +72,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $sourcePath = "crates/neural-app/src/windows_app.rs"
+          $defaultSourcePath = "crates/neural-app/src/windows_app.rs"
           $utf8 = [Text.UTF8Encoding]::new($false)
-          $originalSource = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $sourcePath), $utf8)
 
           function Write-Exact([string]$path, [string]$text) {
             [IO.File]::WriteAllText((Resolve-Path -LiteralPath $path), $text, $utf8)
@@ -107,13 +106,16 @@ jobs:
 
           # Each sabotage is applied alone and only its gate runs, so every gate has
           # to turn red by itself. A build error or another failing test does not count.
-          function Assert-GateRed([string]$label, [string]$test, [string]$brokenSource) {
-            Write-Exact $sourcePath $brokenSource
+          function Assert-GateRed([string]$label, [string]$test, [string]$targetPath, [string]$old, [string]$new) {
+            $resolved = (Resolve-Path -LiteralPath $targetPath).Path
+            $original = [IO.File]::ReadAllText($resolved, $utf8)
+            $broken = Replace-Exact $original $old $new $label
+            Write-Exact $resolved $broken
             try {
               $run = Invoke-GateTest @($test)
             }
             finally {
-              Write-Exact $sourcePath $originalSource
+              Write-Exact $resolved $original
             }
             if ($run.Code -eq 0) {
               throw "Sabotage '$label' unexpectedly stayed green: $test"
@@ -258,28 +260,34 @@ jobs:
 
           try {
             foreach ($sabotage in $sabotages) {
-              $broken = Replace-Exact $originalSource $sabotage.Old $sabotage.New $sabotage.Label
-              Assert-GateRed $sabotage.Label $sabotage.Test $broken
+              $target = if ($sabotage.SourcePath) { $sabotage.SourcePath } else { $defaultSourcePath }
+              Assert-GateRed $sabotage.Label $sabotage.Test $target $sabotage.Old $sabotage.New
             }
             Write-Host "Sabotage proof: each of the $($sabotages.Count) Rust UI sabotages turned its own shipped-path gate red."
 
-
-            $brokenJs = Replace-Exact $originalSource @'
+            $jsTarget = if ($comparatorInjectPath) { $comparatorInjectPath } else { $defaultSourcePath }
+            $resolvedJs = (Resolve-Path -LiteralPath $jsTarget).Path
+            $originalJs = [IO.File]::ReadAllText($resolvedJs, $utf8)
+            $brokenJs = Replace-Exact $originalJs @'
           '#neuralia-comp-controls,#neuralia-palette,a[href],button,input,textarea,select,option,label,summary,[role="button"],[role="link"],[contenteditable="true"]'
           '@ @'
           '#neuralia-comp-controls,#neuralia-palette,button,input,textarea,select,option,label,summary,[role="button"],[role="link"],[contenteditable="true"]'
           '@ "double-click-link-guard"
-            Write-Exact $sourcePath $brokenJs
-
-            node scripts/test-link-routing.mjs
-            $jsResult = $LASTEXITCODE
-            if ($jsResult -eq 0) {
-              throw "Double-click routing sabotage unexpectedly stayed green."
+            Write-Exact $resolvedJs $brokenJs
+            try {
+              node scripts/test-link-routing.mjs
+              $jsResult = $LASTEXITCODE
+              if ($jsResult -eq 0) {
+                throw "Double-click routing sabotage unexpectedly stayed green."
+              }
+              Write-Host "Sabotage proof: removing the link guard turns the runtime routing gate red."
             }
-            Write-Host "Sabotage proof: removing the link guard turns the runtime routing gate red."
+            finally {
+              Write-Exact $resolvedJs $originalJs
+            }
           }
           finally {
-            Write-Exact $sourcePath $originalSource
+            git checkout -- crates/neural-app/src
           }
 
           cargo fmt --all -- --check
@@ -293,7 +301,7 @@ jobs:
             }
           }
           node scripts/test-link-routing.mjs
-          git diff --exit-code -- $sourcePath
+          git diff --exit-code -- crates/neural-app/src
       - name: Exercise ChatGPT/Claude auto-submit runtime
         run: node scripts/test-ai-auto-submit.mjs
       - name: Exercise shipped provider link routing

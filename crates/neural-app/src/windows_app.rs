@@ -28239,7 +28239,7 @@ __fire('submit', at(login));
 
     #[test]
     fn palette_is_native_and_the_page_can_only_ask_for_it() {
-        let source = include_str!("windows_app.rs");
+        let source = all_sources();
         assert!(!source.contains(concat!("NEURALIA_PALETTE", "_SCRIPT")));
         assert!(!source.contains(concat!("neuralia-open-", "palette")));
         assert!(!NEURALIA_KEYMAP_SCRIPT.contains("CustomEvent"));
@@ -28811,12 +28811,53 @@ __fire('submit', at(login));
         }
     }
 
+    pub(super) const ALL_MODULES: &[(&str, &str)] = &[
+        // Added as child modules are created
+    ];
+
+    pub(super) fn all_sources() -> String {
+        let mut out = include_str!("windows_app.rs").replace("\r\n", "\n");
+        for (_, content) in ALL_MODULES {
+            out.push('\n');
+            out.push_str(&content.replace("\r\n", "\n"));
+        }
+        out
+    }
+
+    #[test]
+    fn all_sources_lists_every_module() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let dir = std::path::Path::new(manifest_dir).join("src/windows_app");
+        let mut dir_files: Vec<String> = Vec::new();
+        if dir.is_dir() {
+            for entry in std::fs::read_dir(&dir).expect("read src/windows_app") {
+                let entry = entry.expect("dir entry");
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                    dir_files.push(path.file_name().unwrap().to_str().unwrap().to_string());
+                }
+            }
+        }
+        dir_files.sort();
+
+        let mut registered: Vec<String> = ALL_MODULES
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        registered.sort();
+
+        assert_eq!(
+            registered, dir_files,
+            "ALL_SOURCES must list every module in src/windows_app without escaping"
+        );
+    }
+
     /// Este ficheiro com fins de linha LF. Num checkout Windows com
     /// `core.autocrlf=true` (o padrao do Git for Windows, e o do CI
     /// windows-latest) o `include_str!` traz CRLF, e um `split("\n}\n")` nao
     /// encontrava nada: o gate corria sobre o resto do ficheiro.
     fn shipped_source() -> String {
-        include_str!("windows_app.rs").replace("\r\n", "\n")
+        all_sources()
     }
 
     /// Corre `program` no Node (o mesmo motor de JS que os testes de CI dos
@@ -29253,7 +29294,7 @@ __drain();
         ));
         // Um mecanismo so: nenhuma WebView liga o zoom proprio do WebView2
         // (Ctrl+roda e pinca do Chromium), que somaria ao nosso.
-        let source = include_str!("windows_app.rs");
+        let source = all_sources();
         let forbidden = ["with_hotkeys_zoom(", "true)"].concat();
         assert!(!source.contains(&forbidden));
     }
