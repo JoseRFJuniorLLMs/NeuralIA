@@ -94,6 +94,13 @@ impl ResearchSession {
         session
     }
 
+    /// A mesma sessao com o nome de `label` em vez do da pergunta (o
+    /// Traduzir: as IAs recebem o pedido de traducao, a lista mostra o texto).
+    pub fn titled(mut self, label: &str) -> Self {
+        self.title = short_title(label, 72);
+        self
+    }
+
     pub fn add_provider_answer(
         &mut self,
         provider: impl Into<String>,

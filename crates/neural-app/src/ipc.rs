@@ -6,6 +6,10 @@ pub const IPC_MAX_BYTES: usize = 8 * 1024;
 pub const ASK_MAX_CHARS: usize = 2_000;
 /// Tecto do texto selecionado mandado as IAs (`search`).
 pub const SEARCH_MAX_CHARS: usize = 2_000;
+/// Tecto do texto do "Salvar nota" (`note` com `via: bar`): o da barra de
+/// selecao, que so aparece ate 5000 caracteres. O envelope inteiro continua
+/// preso aos `IPC_MAX_BYTES`, e a barra nao manda o que nao cabe neles.
+pub const NOTE_TEXT_MAX_CHARS: usize = 5_000;
 
 /// O que a barra de selecao pede com o texto em `search`. Lista fechada: a
 /// pagina so escolhe QUAL dos dois botoes foi; o titulo do cartao, o botao
@@ -18,13 +22,17 @@ pub enum SearchIntent {
     Translate,
 }
 
-/// Quem pediu a nota. Lista fechada: nenhum dos dois leva dados da pagina.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Quem pediu a nota. Lista fechada; nenhum dos dois leva um endereco nem
+/// um titulo da pagina.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoteVia {
-    /// Ctrl+Shift+Z: o `note` sem argumentos.
+    /// Ctrl+Shift+Z: o `note` sem argumentos. A selecao e lida pelo nativo.
     Shortcut,
-    /// O "Salvar nota" da barra de selecao: `{"via":"bar"}`.
-    Bar,
+    /// O "Salvar nota" da barra de selecao: `{"via":"bar","text":...}`. O
+    /// texto e o que a barra mostra, lido pelas primitivas que ela capturou
+    /// no document-created -- a mesma origem do texto do `search` --, e e
+    /// ele que vira a nota: o nativo nao volta a perguntar a pagina.
+    Bar { text: String },
 }
 
 /// A dica centrada que uma coluna pede ao passar o rato pelos controlos
@@ -121,10 +129,11 @@ pub enum IpcAction {
         hint: ColumnHint,
     },
     /// Ctrl+Shift+Z ou o "Salvar nota" da barra: "cria uma nota com o que
-    /// selecionei". Sem dados da pagina de proposito -- a pagina so PEDE; o
-    /// texto selecionado e lido pelo lado nativo, da WebView que mandou o
-    /// pedido. `via` so diz qual dos dois gestos foi: a barra grava tambem
-    /// no Split privado, o Ctrl+Shift+Z nao.
+    /// selecionei". Nunca um endereco nem um titulo da pagina: a fonte vem do
+    /// lado nativo, da WebView que mandou o pedido. No Ctrl+Shift+Z a pagina
+    /// so PEDE e o nativo le a selecao; no Salvar nota o texto vem com o
+    /// pedido, da barra (`NoteVia::Bar`). A barra grava tambem no Split
+    /// privado, o Ctrl+Shift+Z nao.
     Note {
         via: NoteVia,
     },
@@ -186,19 +195,22 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
         "devtools" => no_args(args, IpcAction::DevTools),
         "viewsource" => no_args(args, IpcAction::ViewSource),
         "note" => {
-            // `{}` e o Ctrl+Shift+Z; `{"via":"bar"}` o botao da barra. Mais
-            // nada: um texto, um endereco ou um titulo vindos da pagina sao
-            // recusados.
+            // `{}` e o Ctrl+Shift+Z; `{"via":"bar","text":...}` o botao da
+            // barra, com o texto que ela mostra. Mais nada: um endereco ou um
+            // titulo, outro `via` ou um texto sem `via` sao recusados.
             if args.is_empty() {
                 return Some(IpcAction::Note {
                     via: NoteVia::Shortcut,
                 });
             }
-            exact_keys(args, &["via"])?;
-            match args.get("via")?.as_str()? {
-                "bar" => Some(IpcAction::Note { via: NoteVia::Bar }),
-                _ => None,
+            exact_keys(args, &["via", "text"])?;
+            if args.get("via")?.as_str()? != "bar" {
+                return None;
             }
+            let text = selected_text(args, NOTE_TEXT_MAX_CHARS)?;
+            Some(IpcAction::Note {
+                via: NoteVia::Bar { text },
+            })
         }
         "newtab" => {
             if args.is_empty() {
@@ -300,23 +312,8 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
                 "translate" => SearchIntent::Translate,
                 _ => return None,
             };
-            let raw = args.get("text")?.as_str()?;
-            // Os mesmos caracteres que uma pergunta escrita: dos de controlo
-            // so a quebra de linha e o tab passam.
-            if raw
-                .chars()
-                .any(|c| c.is_control() && c != '\n' && c != '\t')
-            {
-                return None;
-            }
-            let text = raw.trim();
-            if text.is_empty() || text.chars().count() > SEARCH_MAX_CHARS {
-                return None;
-            }
-            Some(IpcAction::Search {
-                text: text.to_string(),
-                intent,
-            })
+            let text = selected_text(args, SEARCH_MAX_CHARS)?;
+            Some(IpcAction::Search { text, intent })
         }
         "research-answer" => {
             exact_keys(args, &["col", "text"])?;
@@ -342,6 +339,24 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
         }
         _ => None,
     }
+}
+
+/// O `text` que a barra de selecao manda (`search`, `note` da barra): os
+/// mesmos caracteres que uma pergunta escrita -- dos de controlo so a quebra
+/// de linha e o tab passam --, aparado, de 1 a `max_chars` caracteres.
+fn selected_text(args: &Map<String, Value>, max_chars: usize) -> Option<String> {
+    let raw = args.get("text")?.as_str()?;
+    if raw
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return None;
+    }
+    let text = raw.trim();
+    if text.is_empty() || text.chars().count() > max_chars {
+        return None;
+    }
+    Some(text.to_string())
 }
 
 fn no_args(args: &Map<String, Value>, action: IpcAction) -> Option<IpcAction> {
@@ -765,38 +780,60 @@ mod tests {
 
     #[test]
     fn note_is_a_bare_request_and_carries_no_page_data() {
-        // A pagina so pede a nota. O texto e lido pelo lado nativo da WebView
-        // que pediu: um `note` com dados e recusado, para ninguem passar a
-        // confiar no que a pagina diz de si propria. O unico argumento e QUAL
-        // gesto foi -- o botao da barra --, por um nome fechado.
+        // O Ctrl+Shift+Z so pede a nota; o texto e lido pelo lado nativo da
+        // WebView que pediu. O Salvar nota da barra manda, por um nome
+        // fechado, o texto que a barra mostra -- o mesmo filtro do texto do
+        // `search`. Um endereco ou um titulo nunca: a fonte e sempre a que o
+        // nativo conhece.
+        let note = |args: Value| parse_ipc_message(&message("note", args), CAP, 3);
         assert_eq!(
-            parse_ipc_message(&message("note", json!({})), CAP, 3),
+            note(json!({})),
             Some(IpcAction::Note {
                 via: NoteVia::Shortcut
             })
         );
         assert_eq!(
-            parse_ipc_message(&message("note", json!({"via":"bar"})), CAP, 3),
-            Some(IpcAction::Note { via: NoteVia::Bar })
+            note(json!({"via":"bar","text":"  Linha 1\n\tLinha 2  "})),
+            Some(IpcAction::Note {
+                via: NoteVia::Bar {
+                    text: "Linha 1\n\tLinha 2".to_string()
+                }
+            })
         );
+        // O tecto conta so depois de aparar (e o envelope inteiro continua
+        // preso aos 8 KiB).
+        let at_limit = "a".repeat(NOTE_TEXT_MAX_CHARS);
+        assert_eq!(
+            note(json!({"via":"bar","text": format!(" {at_limit} ")})),
+            Some(IpcAction::Note {
+                via: NoteVia::Bar { text: at_limit }
+            })
+        );
+        let too_long = "a".repeat(NOTE_TEXT_MAX_CHARS + 1);
         for args in [
             json!({"text":"texto escolhido pela pagina"}),
             json!({"url":"https://example.com/"}),
             json!({"col":0}),
             json!({"title":"x","text":"y","url":"https://example.com/"}),
+            json!({"via":"bar"}),
             json!({"via":"bar","url":"https://example.com/"}),
-            json!({"via":"bar","text":"texto"}),
+            json!({"via":"bar","text":"texto","url":"https://example.com/"}),
+            json!({"via":"bar","text":"texto","title":"Titulo"}),
+            json!({"via":"bar","text":""}),
+            json!({"via":"bar","text":" \n\t "}),
+            json!({"via":"bar","text":too_long}),
+            json!({"via":"bar","text":"a\u{7}b"}),
+            json!({"via":"bar","text":"a\rb"}),
+            json!({"via":"bar","text":7}),
+            json!({"via":"bar","text":null}),
+            json!({"via":"page","text":"texto"}),
+            json!({"via":"Bar","text":"texto"}),
+            json!({"via":"shortcut","text":"texto"}),
+            json!({"via":true,"text":"texto"}),
+            json!({"via":null,"text":"texto"}),
             json!({"via":"page"}),
-            json!({"via":"Bar"}),
-            json!({"via":"shortcut"}),
-            json!({"via":true}),
-            json!({"via":null}),
         ] {
-            assert_eq!(
-                parse_ipc_message(&message("note", args.clone()), CAP, 3),
-                None,
-                "note aceitou argumentos: {args}"
-            );
+            assert_eq!(note(args.clone()), None, "note aceitou argumentos: {args}");
         }
     }
 

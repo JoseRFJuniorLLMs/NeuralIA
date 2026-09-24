@@ -120,24 +120,23 @@ enum UserEvent {
         origin: NotesOrigin,
         reply: NotesReply,
     },
-    /// Ctrl+Shift+Z ou o "Salvar nota" da barra numa pagina: ler a selecao
-    /// DESSA WebView. `target` `None` e a WebView unica da web externa, do
-    /// Leitor e do PDF; `via` diz qual dos dois gestos foi.
+    /// Ctrl+Shift+Z ou o "Salvar nota" da barra numa pagina: a nota DESSA
+    /// WebView. `target` `None` e a WebView unica da web externa, do Leitor e
+    /// do PDF; `via` diz qual dos dois gestos foi (e, no Salvar nota, traz o
+    /// texto que a barra mostrava).
     NoteRequested {
         target: Option<PageTarget>,
         via: NoteVia,
     },
     /// Ctrl+Shift+Z no Split privado: recusado sem ler a pagina.
     NoteRefusedPrivate,
-    /// O que a pagina devolveu ao `NOTE_CAPTURE_SCRIPT` (JSON, dado dela) e
-    /// a fonte que o lado nativo conhece: o artigo do Leitor, o PDF e -- no
-    /// "Salvar nota" da barra -- o endereco da propria WebView. `private`: a
-    /// WebView lida era a do Split privado.
+    /// O que a pagina devolveu ao `NOTE_CAPTURE_SCRIPT` (JSON, dado dela)
+    /// num Ctrl+Shift+Z, e a fonte que o lado nativo conhece (o artigo do
+    /// Leitor, o PDF). O Salvar nota nunca passa por aqui: o texto dele veio
+    /// no pedido.
     NoteCaptured {
         raw: String,
         source: Option<String>,
-        via: NoteVia,
-        private: bool,
     },
     /// Ctrl+Shift+Z na Home ou com o teclado na barra: nota nova em branco.
     NewNote,
@@ -6138,10 +6137,18 @@ fn note_capture_value(raw: &str) -> Result<serde_json::Value, NoteCaptureError> 
 /// A selecao da resposta, cortada outra vez aqui (quem responde e a
 /// pagina), em LF e aparada; so espacos conta como nada.
 fn note_capture_selection(value: &serde_json::Value) -> Result<String, NoteCaptureError> {
-    let selection: String = value
-        .get("text")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
+    note_selection(
+        value
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+    )
+}
+
+/// O texto de uma nota: em LF, cortado a `NOTE_SELECTION_MAX_CHARS` e
+/// aparado; so espacos conta como nada.
+fn note_selection(text: &str) -> Result<String, NoteCaptureError> {
+    let selection: String = text
         .replace("\r\n", "\n")
         .replace('\r', "\n")
         .chars()
@@ -6213,9 +6220,9 @@ fn bar_note_notice(private: bool, title: &str) -> String {
     }
 }
 
-/// Os textos que o "Salvar nota" gravou nos ultimos `BAR_NOTE_REPEAT`, e
-/// quando: o mesmo texto outra vez antes disso nao e outra nota -- tambem
-/// com outro texto gravado pelo meio.
+/// Os textos que o "Salvar nota" (ou o Ctrl+Shift+Z, noutra guarda) gravou
+/// nos ultimos `BAR_NOTE_REPEAT`, e quando: o mesmo texto outra vez antes
+/// disso nao e outra nota -- tambem com outro texto gravado pelo meio.
 #[derive(Debug, Default)]
 struct BarNoteGuard {
     recent: Vec<(String, Instant)>,
@@ -6235,7 +6242,7 @@ impl BarNoteGuard {
     }
 }
 
-/// O que um "Salvar nota" faz com a resposta da pagina.
+/// O que um "Salvar nota" (ou um Ctrl+Shift+Z) faz com o texto que chegou.
 #[derive(Debug, PartialEq)]
 enum BarNoteStep {
     /// Gravar esta nota nova (`NotesCommand::Create`), e so isso.
@@ -6245,17 +6252,17 @@ enum BarNoteStep {
     Refused(NoteCaptureError),
 }
 
-/// A decisao do "Salvar nota", sem janela: da resposta da pagina so conta a
-/// selecao; o `url` e o `title` que ela devolveu ficam de fora. A fonte e
-/// `native_source`, o endereco que o nativo conhece da WebView lida
-/// (`note_capture_source`), e o titulo o inicio da selecao.
+/// A decisao do "Salvar nota", sem janela. `text` e o que a barra mostrava
+/// e mandou no pedido (`NoteVia::Bar`) -- nunca uma resposta que a pagina de
+/// depois. A fonte e `native_source`, o endereco que o nativo conhece da
+/// WebView (`note_capture_source`), e o titulo o inicio do texto.
 fn bar_note_step(
     guard: &mut BarNoteGuard,
-    raw: &str,
+    text: &str,
     native_source: Option<&str>,
     now: Instant,
 ) -> BarNoteStep {
-    let selection = match note_capture_value(raw).and_then(|value| note_capture_selection(&value)) {
+    let selection = match note_selection(text) {
         Ok(selection) => selection,
         Err(error) => return BarNoteStep::Refused(error),
     };
@@ -6269,13 +6276,29 @@ fn bar_note_step(
     ))
 }
 
+/// A decisao do Ctrl+Shift+Z, sem janela: a nota da resposta da pagina
+/// (`note_draft_from_capture`) e, como no Salvar nota, a mesma nota outra
+/// vez em menos de 2 s nao e outra -- a tecla presa repete o keydown.
+fn shortcut_note_step(
+    guard: &mut BarNoteGuard,
+    raw: &str,
+    source: Option<&str>,
+    now: Instant,
+) -> BarNoteStep {
+    match note_draft_from_capture(raw, source) {
+        Ok(draft) if guard.admit(&draft.body, now) => BarNoteStep::Save(draft),
+        Ok(_) => BarNoteStep::Repeated,
+        Err(error) => BarNoteStep::Refused(error),
+    }
+}
+
 /// A fonte que acompanha a leitura da selecao. No Ctrl+Shift+Z, so a do
 /// Leitor e a do PDF (`note_page_source`); nas outras paginas vale o
 /// `location.href` que o script devolve. No "Salvar nota" da barra e sempre
 /// uma que o nativo conhece: essa, ou o endereco da propria WebView
 /// (`webview_url`, o `Source` do WebView2) -- nunca um que a pagina diga.
 fn note_capture_source(
-    via: NoteVia,
+    via: &NoteVia,
     target: Option<PageTarget>,
     surface: Surface,
     page_source: Option<&str>,
@@ -6284,11 +6307,12 @@ fn note_capture_source(
     let known = note_page_source(target, surface, page_source);
     match via {
         NoteVia::Shortcut => known,
-        NoteVia::Bar => known.or_else(webview_url),
+        NoteVia::Bar { .. } => known.or_else(webview_url),
     }
 }
 
-/// De que WebView se le a selecao de um Ctrl+Shift+Z ou de um Salvar nota.
+/// De que WebView e a nota de um Ctrl+Shift+Z (que le a selecao dela) ou de
+/// um Salvar nota (que traz o texto e so pede a fonte e o modo privado).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoteCapture {
     Read,
@@ -6304,12 +6328,12 @@ enum NoteCapture {
 /// da barra le tambem o Split privado: e um pedido explicito de quem le.
 fn note_capture_decision(
     target: Option<PageTarget>,
-    via: NoteVia,
+    via: &NoteVia,
     split_private: Option<bool>,
 ) -> NoteCapture {
     match target {
         Some(PageTarget::Split) => match split_private {
-            Some(true) if via == NoteVia::Shortcut => NoteCapture::RefusePrivate,
+            Some(true) if *via == NoteVia::Shortcut => NoteCapture::RefusePrivate,
             Some(_) => NoteCapture::Read,
             None => NoteCapture::NoPage,
         },
@@ -6317,8 +6341,9 @@ fn note_capture_decision(
     }
 }
 
-/// A WebView de que um Ctrl+Shift+Z (ou um Salvar nota) le a selecao, no
-/// momento de ler: a da coluna que o pediu (nunca a vizinha), a do Split que
+/// A WebView de que um Ctrl+Shift+Z le a selecao (e de que um Salvar nota
+/// tira a fonte), no momento de ler: a da coluna que o pediu (nunca a
+/// vizinha), a do Split que
 /// existe AGORA -- e, no Ctrl+Shift+Z, nunca se ele for privado -- ou a
 /// WebView unica (Externo, Leitor, PDF). `columns` e `split` sao os do
 /// proprio comparador (`comp.views`, `comp.split`): o `private` e lido aqui,
@@ -6327,7 +6352,7 @@ fn note_capture_decision(
 /// sem WebViews.
 fn note_read_view<'a, V>(
     target: Option<PageTarget>,
-    via: NoteVia,
+    via: &NoteVia,
     columns: &'a [ComparatorView<V>],
     split: Option<&'a SplitView<V>>,
     main: Option<&'a V>,
@@ -7463,6 +7488,71 @@ fn selection_prompt(intent: SearchIntent, seen: &str) -> String {
     }
 }
 
+/// O comando da omnibox que traduz nas tres IAs: e o que o Historico guarda
+/// de um Traduzir, e o clique la refaz o pedido (`route_input`).
+const TRANSLATE_COMMAND: &str = "traduzir:";
+
+/// Uma comparacao nas tres IAs: o que elas recebem (`prompt`) e como fica no
+/// Historico, na memoria e na sessao de pesquisa. Numa pergunta e tudo o
+/// mesmo texto. No Traduzir as IAs recebem o pedido fixo, mas o nome e o do
+/// texto de quem le ("Traduzir: <texto>") -- o pedido fixo a frente deixava
+/// todas as traducoes com o mesmo titulo -- e o Historico guarda
+/// `traduzir:<texto>`, que reabre refazendo o pedido (com o pedido inteiro,
+/// um texto longo passava do tecto do painel e ja nao reabria).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompareRequest {
+    /// O que as tres IAs recebem.
+    prompt: String,
+    /// O nome da sessao de pesquisa e da memoria.
+    label: String,
+    /// O que o Historico guarda e o clique la volta a abrir (`handle_input`).
+    reopen: String,
+}
+
+impl CompareRequest {
+    /// Uma pergunta: o mesmo texto para as IAs, o nome e o Historico.
+    fn ask(query: String) -> Self {
+        Self {
+            label: query.clone(),
+            reopen: format!("compare:{query}"),
+            prompt: query,
+        }
+    }
+
+    /// O Traduzir de `text` (`selection_prompt`).
+    fn translate(text: &str) -> Self {
+        Self {
+            prompt: selection_prompt(SearchIntent::Translate, text),
+            label: format!("Traduzir: {text}"),
+            reopen: format!("{TRANSLATE_COMMAND}{text}"),
+        }
+    }
+
+    /// O que o clique em confirmar no cartao manda: o texto que ele pintou,
+    /// pelo botao da barra que o pediu.
+    fn selection(intent: SearchIntent, seen: &str) -> Self {
+        match intent {
+            SearchIntent::Ask => Self::ask(seen.to_string()),
+            SearchIntent::Translate => Self::translate(seen),
+        }
+    }
+}
+
+/// O que um `compare` deixa, sem janela: a sessao de pesquisa (com o nome
+/// de `label`), a memoria da pergunta e a entrada do Historico.
+fn compare_records(request: &CompareRequest) -> (ResearchSession, MemoryDocument, String) {
+    let session = ResearchSession::new(request.prompt.clone()).titled(&request.label);
+    let memory = MemoryDocument::new(
+        MemoryKind::ResearchResult,
+        MemorySourceKind::Note,
+        format!("Pesquisa · {}", session.title),
+        None,
+        request.prompt.clone(),
+    )
+    .session(session.id.clone());
+    (session, memory, request.reopen.clone())
+}
+
 /// O texto do cartao e texto simples: DrawTextW com DT_NOPREFIX (um "&" da
 /// pagina e um "&", nao um sublinhado), quebra por palavras e, numa palavra
 /// maior que a linha, por caracteres. Sem DT_END_ELLIPSIS: o corte e o de
@@ -7808,6 +7898,29 @@ fn service_icon_hint(label: &str, badge: Option<ServiceBadge>) -> String {
             format!("{label} minimizado · clique para voltar ao painel")
         }
         None => format!("{label} aberto ao lado · clique para fechar"),
+    }
+}
+
+/// A dica que o painel de servicos aberto (`service`, no modo `badge`) da
+/// ao alvo `hit` da barra: a faixa dele e o botao que o abriu -- o icone do
+/// servico ou, na Respiracao, o botao dela nas ferramentas, onde o ponto de
+/// minimizado fica (`service_icon_rect`) e que o clique restaura ou fecha
+/// (`open_service_panel`). `None`: o alvo nao e do painel, e a dica e a de
+/// sempre.
+fn service_panel_hint(
+    hit: BarHit,
+    service: Service,
+    badge: Option<ServiceBadge>,
+) -> Option<String> {
+    match hit {
+        BarHit::ServiceStrip(button) => Some(button.hint(service.label())),
+        BarHit::Service(hit_service) if hit_service == service => {
+            Some(service_icon_hint(service.label(), badge))
+        }
+        BarHit::Tool(Tool::Breath) if service == Service::Breath => {
+            Some(service_icon_hint(service.label(), badge))
+        }
+        _ => None,
     }
 }
 
@@ -10208,9 +10321,11 @@ struct App {
     /// O pedido da barra (Mandar para IA, Traduzir) a espera do clique no
     /// cartao nativo.
     search_card: SearchCard,
-    /// O ultimo "Salvar nota" gravado: o mesmo texto em menos de 2 s nao e
-    /// outra nota.
+    /// Os "Salvar nota" gravados ha menos de 2 s: o mesmo texto nao e outra
+    /// nota.
     bar_notes: BarNoteGuard,
+    /// O mesmo para o Ctrl+Shift+Z (a tecla presa repete o keydown).
+    shortcut_notes: BarNoteGuard,
     search_card_popup: Option<HWND>,
     search_card_sink: Box<SearchCardSink>,
     gmail_monitor: Option<WebView>,
@@ -10374,6 +10489,7 @@ impl App {
             gmail_toast_token: 0,
             search_card: SearchCard::default(),
             bar_notes: BarNoteGuard::default(),
+            shortcut_notes: BarNoteGuard::default(),
             search_card_popup: None,
             search_card_sink,
             gmail_monitor: None,
@@ -11039,10 +11155,14 @@ impl App {
             InputRoute::ResearchCompare => self.compare_current_research(),
             InputRoute::ResearchSynthesize => self.synthesize_current_research(),
             InputRoute::ResearchExport => self.export_current_research(),
+            InputRoute::Translate(Some(text)) => self.compare(CompareRequest::translate(&text)),
+            InputRoute::Translate(None) => {
+                self.show_splash(TRANSLATE_COMMAND_HELP.to_string(), 3);
+            }
             InputRoute::Intent => match parse_intent(&input) {
                 Ok(Intent::Home) => self.show_home(),
                 Ok(Intent::Ask(query)) => self.ask(query),
-                Ok(Intent::Compare(query)) => self.compare(query),
+                Ok(Intent::Compare(query)) => self.compare(CompareRequest::ask(query)),
                 Ok(Intent::Read(url)) => self.read(url.to_string()),
                 Ok(Intent::Web(url)) => self.web(url.to_string()),
                 Err(error) => self.show_native_error(error.to_string()),
@@ -11175,29 +11295,18 @@ impl App {
     }
 
     /// Destino normal de uma pergunta: a mesma consulta segue em simultaneo
-    /// para o Google AI Mode, o ChatGPT e o Claude, lado a lado.
-    fn compare(&mut self, query: String) {
+    /// para o Google AI Mode, o ChatGPT e o Claude, lado a lado. O nome e a
+    /// entrada do Historico sao os de `compare_records`.
+    fn compare(&mut self, request: CompareRequest) {
         self.next_generation();
 
-        let session = ResearchSession::new(query.clone());
-        let question_memory = MemoryDocument::new(
-            MemoryKind::ResearchResult,
-            MemorySourceKind::Note,
-            format!("Pesquisa · {}", session.title),
-            None,
-            query.clone(),
-        )
-        .session(session.id.clone());
+        let (session, question_memory, reopen) = compare_records(&request);
         self.memory.capture(question_memory);
         self.memory.save_session(session.clone());
         self.current_research = Some(session);
 
-        self.record(
-            HistoryKind::Ask,
-            format!("compare:{query}"),
-            "comparator-3col".to_string(),
-        );
-        self.open_comparator(&query);
+        self.record(HistoryKind::Ask, reopen, "comparator-3col".to_string());
+        self.open_comparator(&request.prompt);
     }
 
     fn read(&mut self, url: String) {
@@ -15396,21 +15505,22 @@ impl App {
         }
     }
 
-    /// Ctrl+Shift+Z ou "Salvar nota" numa pagina: le a selecao da WebView
-    /// `target` e cria a nota. O Ctrl+Shift+Z nunca le o Split privado.
+    /// Ctrl+Shift+Z ou "Salvar nota" numa pagina: a nota da WebView
+    /// `target`. O Ctrl+Shift+Z le a selecao dela e nunca le o Split privado;
+    /// o Salvar nota traz o texto no pedido e so tira dela a fonte.
     fn request_note_from_page(&mut self, target: Option<PageTarget>, via: NoteVia) {
         // Qual WebView e se o Split privado recusa: `note_read_view`, com as
         // colunas e o Split do proprio comparador (gate
         // `a_note_request_reads_its_own_webview_and_never_the_private_split`).
         let comp = self.comparator.as_ref();
-        // So o "Salvar nota" chega a ler o Split privado; `private` vem da
-        // mesma decisao, e o aviso di-lo-a.
+        // So o "Salvar nota" chega ao Split privado; `private` vem da mesma
+        // decisao, e o aviso di-lo-a.
         let NoteRead {
             view: webview,
             private,
         } = match note_read_view(
             target,
-            via,
+            &via,
             comp.map_or(&[][..], |comp| comp.views.as_slice()),
             comp.and_then(|comp| comp.split.as_ref()),
             self.webview.as_ref(),
@@ -15423,51 +15533,66 @@ impl App {
             Err(NoteCapture::Read | NoteCapture::NoPage) => return,
         };
         let source = note_capture_source(
-            via,
+            &via,
             target,
             self.surface,
             self.page_source.as_deref(),
             || webview.url().ok(),
         );
-        let proxy = self.proxy.clone();
-        let asked = webview.evaluate_script_with_callback(NOTE_CAPTURE_SCRIPT, move |raw| {
-            let _ = proxy.send_event(UserEvent::NoteCaptured {
-                raw,
-                source: source.clone(),
-                via,
-                private,
-            });
-        });
-        if asked.is_err() {
-            self.show_splash(
-                "Não foi possível ler a seleção desta página.".to_string(),
-                3,
-            );
+        match via {
+            // O texto e o que a barra mostrava, e veio no pedido: nada se
+            // volta a ler da pagina (que podia ter trocado o getSelection).
+            NoteVia::Bar { text } => self.save_bar_note(&text, source.as_deref(), private),
+            NoteVia::Shortcut => {
+                let proxy = self.proxy.clone();
+                let asked =
+                    webview.evaluate_script_with_callback(NOTE_CAPTURE_SCRIPT, move |raw| {
+                        let _ = proxy.send_event(UserEvent::NoteCaptured {
+                            raw,
+                            source: source.clone(),
+                        });
+                    });
+                if asked.is_err() {
+                    self.show_splash(
+                        "Não foi possível ler a seleção desta página.".to_string(),
+                        3,
+                    );
+                }
+            }
         }
     }
 
-    fn note_captured(&mut self, raw: &str, source: Option<&str>, via: NoteVia, private: bool) {
-        let draft = match via {
-            NoteVia::Shortcut => note_draft_from_capture(raw, source),
-            // O "Salvar nota": a fonte e a que o nativo leu da WebView, o
-            // mesmo texto em menos de 2 s nao e outra nota, e a resposta so
-            // aparece no aviso do meio (`NotesOrigin::Bar`). Nada disto passa
-            // pelo historico nem pela memoria.
-            NoteVia::Bar => match bar_note_step(&mut self.bar_notes, raw, source, Instant::now()) {
-                BarNoteStep::Save(draft) => {
-                    self.submit_notes(NotesCommand::Create(draft), NotesOrigin::Bar { private });
-                    return;
-                }
-                BarNoteStep::Repeated => return,
-                BarNoteStep::Refused(error) => Err(error),
-            },
-        };
-        match draft {
-            Ok(draft) => self.submit_notes(NotesCommand::Create(draft), NotesOrigin::Selection),
-            Err(NoteCaptureError::EmptySelection) => {
+    /// O "Salvar nota": a fonte e a que o nativo conhece da WebView, o mesmo
+    /// texto em menos de 2 s nao e outra nota, e a resposta so aparece no
+    /// aviso do meio (`NotesOrigin::Bar`). Nada disto passa pelo historico
+    /// nem pela memoria.
+    fn save_bar_note(&mut self, text: &str, source: Option<&str>, private: bool) {
+        match bar_note_step(&mut self.bar_notes, text, source, Instant::now()) {
+            BarNoteStep::Save(draft) => {
+                self.submit_notes(NotesCommand::Create(draft), NotesOrigin::Bar { private });
+            }
+            BarNoteStep::Repeated => {}
+            BarNoteStep::Refused(error) => self.note_refused(error),
+        }
+    }
+
+    /// A resposta da pagina a um Ctrl+Shift+Z.
+    fn note_captured(&mut self, raw: &str, source: Option<&str>) {
+        match shortcut_note_step(&mut self.shortcut_notes, raw, source, Instant::now()) {
+            BarNoteStep::Save(draft) => {
+                self.submit_notes(NotesCommand::Create(draft), NotesOrigin::Selection);
+            }
+            BarNoteStep::Repeated => {}
+            BarNoteStep::Refused(error) => self.note_refused(error),
+        }
+    }
+
+    fn note_refused(&mut self, error: NoteCaptureError) {
+        match error {
+            NoteCaptureError::EmptySelection => {
                 self.show_splash("Selecione um texto para criar a nota".to_string(), 3);
             }
-            Err(NoteCaptureError::Unreadable) => {
+            NoteCaptureError::Unreadable => {
                 self.show_splash(
                     "Não foi possível ler a seleção desta página.".to_string(),
                     3,
@@ -15806,18 +15931,12 @@ impl App {
     /// A dica do alvo `hit`, com o nome da IA, o endereco da aba ou o estado
     /// do grupo que o clique vai usar.
     fn bar_tooltip_text(&self, hit: BarHit, owner: HWND) -> Option<String> {
-        // A faixa e o icone do servico aberto falam do servico e do modo dele.
-        if let Some(panel) = &self.service_panel {
-            match hit {
-                BarHit::ServiceStrip(button) => return Some(button.hint(panel.service.label())),
-                BarHit::Service(service) if service == panel.service => {
-                    return Some(service_icon_hint(
-                        service.label(),
-                        panel.state.badge(panel.audio),
-                    ));
-                }
-                _ => {}
-            }
+        // A faixa e o botao do servico aberto falam do servico e do modo dele.
+        if let Some(panel) = &self.service_panel
+            && let Some(hint) =
+                service_panel_hint(hit, panel.service, panel.state.badge(panel.audio))
+        {
+            return Some(hint);
         }
         let comp = self.comparator.as_ref();
         let column = match hit {
@@ -18917,9 +19036,16 @@ enum InputRoute {
     ResearchCompare,
     ResearchSynthesize,
     ResearchExport,
+    /// `traduzir:<texto>`: o texto nas tres IAs com o pedido fixo de
+    /// traducao (`CompareRequest::translate`) -- e o que o Historico guarda de
+    /// um Traduzir da barra. None: sem texto -> a ajuda.
+    Translate(Option<String>),
     /// Sem comando próprio: segue para o `parse_intent`.
     Intent,
 }
+
+/// A ajuda de um `traduzir:` sem texto.
+const TRANSLATE_COMMAND_HELP: &str = "Escreva o texto depois de traduzir:";
 
 /// `text` sem `prefix` a frente, se comecar por ele (maiusculas ou nao).
 fn strip_prefix_ignore_ascii_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
@@ -18958,6 +19084,10 @@ fn route_input(input: &str) -> InputRoute {
     // pesquisa sobre o metodo.
     if let Some(word) = strip_prefix_ignore_ascii_case(trimmed, "pomodoro:") {
         return InputRoute::Pomodoro(parse_pomodoro_command(word));
+    }
+    if let Some(text) = strip_prefix_ignore_ascii_case(trimmed, TRANSLATE_COMMAND) {
+        let text = text.trim();
+        return InputRoute::Translate((!text.is_empty()).then(|| text.to_string()));
     }
     if let Some(spec) = input.strip_prefix("agent:") {
         return InputRoute::Agent(spec.trim().to_string());
@@ -19437,12 +19567,9 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::NoteRefusedPrivate => {
                 self.show_splash(NOTE_PRIVATE_REFUSAL.to_string(), 3);
             }
-            UserEvent::NoteCaptured {
-                raw,
-                source,
-                via,
-                private,
-            } => self.note_captured(&raw, source.as_deref(), via, private),
+            UserEvent::NoteCaptured { raw, source } => {
+                self.note_captured(&raw, source.as_deref());
+            }
             UserEvent::NewNote => self.new_note_in_panel(),
             UserEvent::Live(message) => self.handle_live_message(message),
             UserEvent::GmailAnswer(open) => self.answer_gmail(open),
@@ -20256,8 +20383,8 @@ enum SearchCardOutcome {
     },
     /// O clique em confirmar: a unica saida que leva texto as tres IAs -- e
     /// so o que o cartao mostrou, ja com o pedido de traducao quando foi o
-    /// Traduzir (`selection_prompt`).
-    Confirmed(String),
+    /// Traduzir (`CompareRequest::selection`).
+    Confirmed(CompareRequest),
     Cancelled,
     Expired,
     /// Nada muda: pedido invalido, token de um cartao que ja nao esta la,
@@ -20324,7 +20451,10 @@ impl SearchCard {
                             && now.saturating_duration_since(pending.shown_at)
                                 >= SEARCH_CARD_ARM =>
                     {
-                        SearchCardOutcome::Confirmed(selection_prompt(pending.intent, seen))
+                        SearchCardOutcome::Confirmed(CompareRequest::selection(
+                            pending.intent,
+                            seen,
+                        ))
                     }
                     SearchCardButton::Confirm => {
                         // Cedo demais, ou nada a vista: o cartao fica, a
@@ -20354,7 +20484,7 @@ trait SearchCardHost {
     fn show_search_card(&mut self, token: u64, intent: SearchIntent, text: &str);
     fn hide_search_card(&mut self);
     fn expire_search_card_after(&mut self, token: u64, delay: Duration);
-    fn compare_selection(&mut self, question: String);
+    fn compare_selection(&mut self, request: CompareRequest);
 }
 
 fn apply_search_card(host: &mut impl SearchCardHost, outcome: SearchCardOutcome) {
@@ -20368,9 +20498,9 @@ fn apply_search_card(host: &mut impl SearchCardHost, outcome: SearchCardOutcome)
             host.show_search_card(token, intent, &text);
             host.expire_search_card_after(token, Duration::from_secs(SEARCH_CARD_SECONDS));
         }
-        SearchCardOutcome::Confirmed(question) => {
+        SearchCardOutcome::Confirmed(request) => {
             host.hide_search_card();
-            host.compare_selection(question);
+            host.compare_selection(request);
         }
         SearchCardOutcome::Cancelled | SearchCardOutcome::Expired => host.hide_search_card(),
         SearchCardOutcome::Ignored => {}
@@ -20456,8 +20586,8 @@ impl SearchCardHost for App {
             .after(delay, UserEvent::SearchCardExpired(token));
     }
 
-    fn compare_selection(&mut self, question: String) {
-        self.compare(question);
+    fn compare_selection(&mut self, request: CompareRequest) {
+        self.compare(request);
     }
 }
 
@@ -29226,6 +29356,13 @@ __drain();
 
     const SELECTION_CAP: &str = "0123456789abcdef0123456789abcdef";
 
+    /// O `via` de um "Salvar nota" da barra com `text`.
+    fn bar_note(text: &str) -> NoteVia {
+        NoteVia::Bar {
+            text: text.to_string(),
+        }
+    }
+
     /// O resto do "navegador" que a barra de selecao usa, sobre o DOM minimo
     /// do harness: arvore com pais, `closest`, shadow root, Selection/Range,
     /// eventos com acessores no prototipo, estilo calculado, relogio,
@@ -29428,15 +29565,30 @@ Element.prototype.attachShadow = function (init) {
   return root;
 };
 // A barra mede 300x42 quando esta a vista, onde o estilo inline a pos;
-// escondida nao tem caixa.
+// escondida nao tem caixa. Como no navegador, o menu do "⋯" aberto so a faz
+// crescer (uma linha de 45 px) se estiver no fluxo dela: com
+// `position:absolute` na regra `.menu` da folha da barra, flutua fora da
+// caixa dela.
+function __menuOn(menu) {
+  return !!menu && /(^| )on( |$)/.test(menu.getAttribute('class') || '');
+}
+function __menuInFlow(shadow) {
+  const sheet = shadow.__sheets[0];
+  const css = sheet ? sheet.css : ((shadow.childNodes || []).find((n) => n.tagName === 'STYLE') || {}).__text || '';
+  const rule = /\.menu\{([^}]*)\}/.exec(css);
+  return !rule || !/position:absolute/.test(rule[1]);
+}
 const __box = Element.prototype.getBoundingClientRect;
 Element.prototype.getBoundingClientRect = function () {
-  if (!this.__shadow) return __box.call(this);
+  if (!this.__shadow) return __rect(__box.call(this));
   const on = this.style.display !== 'none';
-  const w = on ? 300 : 0, h = on ? 42 : 0;
+  const grows = on && __menuOn(__menu()) && __menuInFlow(this.__shadow);
+  const w = on ? 300 : 0, h = on ? (grows ? 87 : 42) : 0;
   const top = parseFloat(this.style.top) || 0, left = parseFloat(this.style.left) || 0;
   return __rect({ top: top, left: left, right: left + w, bottom: top + h, width: w, height: h });
 };
+// A caixa da barra para o teste, mesmo que a pagina troque o metodo.
+const __hostBox = Element.prototype.getBoundingClientRect;
 const __makeElement = Document.prototype.createElement;
 Document.prototype.createElement = function (tag) {
   const el = __makeElement.call(this, tag);
@@ -29632,7 +29784,7 @@ function __press(action, extra) {
 // Falar (ou Parar) como o utilizador: pelo "⋯", se o menu estiver fechado.
 function __falar(extra) {
   const menu = __menu();
-  if (menu && menu.getAttribute('class') !== 'menu on') __press('more');
+  if (menu && !__menuOn(menu)) __press('more');
   __press('speak', extra);
 }
 function __utterEnd() { __on(__spoken[__spoken.length - 1], 'end'); }
@@ -29657,6 +29809,7 @@ function __state(tag) {
     zIndex: host ? host.style['z-index'] || '' : '',
     top: host ? parseFloat(host.style.top) : null,
     left: host ? parseFloat(host.style.left) : null,
+    height: host ? __hostBox.call(host).__r.height : null,
     buttons: buttons.map((n) => __textOf.call(n)),
     tabindex: buttons.concat(items).map((n) => n.getAttribute('tabindex')),
     // O "⋯": rotulos acessiveis, estado, e o menu -- aberto?, as entradas
@@ -29665,7 +29818,8 @@ function __state(tag) {
       label: more.getAttribute('aria-label'), title: more.getAttribute('title'),
       popup: more.getAttribute('aria-haspopup'), expanded: more.getAttribute('aria-expanded')
     } : null,
-    menuOpen: !!menu && menu.getAttribute('class') === 'menu on',
+    menuOpen: __menuOn(menu),
+    menuClass: menu ? menu.getAttribute('class') : null,
     menuRole: menu ? menu.getAttribute('role') : null,
     menu: items.map((n) => __textOf.call(n)),
     itemRoles: items.map((n) => n.getAttribute('role')),
@@ -30246,6 +30400,90 @@ __state('fechado');
         );
         assert_eq!(mute["fechado"]["menu"], serde_json::json!([]));
         assert_eq!(mute["fechado"]["more"], serde_json::Value::Null);
+    }
+
+    /// Gate: abrir o menu do "⋯" nao muda a caixa da barra nem o sitio
+    /// dela -- o "⋯" fica debaixo do rato, e um segundo clique no mesmo
+    /// ponto fecha o menu em vez de cair no Falar. O menu abre longe da
+    /// selecao: por cima da barra quando ela esta por cima do texto, por
+    /// baixo quando esta por baixo ou quando em cima nao ha lugar. O mock
+    /// faz a barra crescer 45 px com o menu aberto quando ele esta no fluxo
+    /// dela, como o navegador (sem `position:absolute` na regra `.menu`).
+    #[test]
+    fn the_more_menu_opens_without_moving_the_bar() {
+        let page = bind_page_script(NEURALIA_KEYMAP_SCRIPT, SELECTION_CAP, false);
+        let at = |tag: &str, top: u32| {
+            format!(
+                r#"
+__voices = [__MARIA];
+__show('Texto do menu.', undefined, {{ rects: [{{ top: {top}, bottom: {bottom}, left: 100, right: 400, width: 300, height: 20 }}] }});
+__state('{tag}-antes');
+__press('more');
+__state('{tag}-aberto');
+__press('more');
+__state('{tag}-fechado');
+__press('more');
+__on(document, 'keydown', {{ key: 'Escape' }});
+__state('{tag}-esc');
+"#,
+                bottom = top + 20
+            )
+        };
+        let steps = [
+            at("acima", 300),
+            at("abaixo", 20),
+            at("sem-lugar-acima", 60),
+        ];
+        let results = run_selection_cases(
+            steps
+                .iter()
+                .enumerate()
+                .map(|(index, step)| {
+                    selection_case(&format!("menu-{index}"), &page, "", &[step.as_str()])
+                })
+                .collect(),
+        );
+        for (result, (tag, side)) in results.iter().zip([
+            ("acima", "up"),
+            ("abaixo", "down"),
+            ("sem-lugar-acima", "down"),
+        ]) {
+            let states = selection_states(result);
+            let before = &states[&format!("{tag}-antes")];
+            assert_eq!(before["shown"], true, "{tag}");
+            assert_eq!(before["menuOpen"], false, "{tag}");
+            for moment in ["aberto", "fechado", "esc"] {
+                let now = &states[&format!("{tag}-{moment}")];
+                assert_eq!(now["shown"], true, "{tag}-{moment}: a barra fechou");
+                assert_eq!(
+                    (&now["top"], &now["left"], &now["height"]),
+                    (&before["top"], &before["left"], &before["height"]),
+                    "{tag}-{moment}: a barra (e o ⋯) mudou de sitio ou de tamanho"
+                );
+            }
+            let open = &states[&format!("{tag}-aberto")];
+            assert_eq!(open["menuOpen"], true, "{tag}");
+            assert_eq!(
+                open["menuClass"],
+                format!("menu on {side}"),
+                "{tag}: o menu abriu para o lado errado"
+            );
+            // O segundo clique no "⋯" fechou o menu; nada foi lido.
+            let closed = &states[&format!("{tag}-fechado")];
+            assert_eq!(closed["menuOpen"], false, "{tag}");
+            assert_eq!(closed["spoken"], serde_json::json!([]), "{tag}");
+            assert_eq!(states[&format!("{tag}-esc")]["menuOpen"], false, "{tag}");
+        }
+        // Onde a barra ficou: por cima do texto no primeiro caso, por baixo
+        // nos outros dois (e o menu longe do texto ou onde cabe).
+        let top = |index: usize, tag: &str| {
+            selection_states(&results[index])[&format!("{tag}-antes")]["top"]
+                .as_f64()
+                .expect("top")
+        };
+        assert_eq!(top(0, "acima"), 250.0);
+        assert_eq!(top(1, "abaixo"), 48.0);
+        assert_eq!(top(2, "sem-lugar-acima"), 10.0);
     }
 
     #[test]
@@ -31186,11 +31424,11 @@ __state('barra');
             Some(UserEvent::CloseSplit)
         ));
         assert!(matches!(
-            private.event(IpcAction::Note { via: NoteVia::Bar }),
+            private.event(IpcAction::Note { via: bar_note("texto") }),
             Some(UserEvent::NoteRequested {
                 target: Some(PageTarget::Split),
-                via: NoteVia::Bar
-            })
+                via: NoteVia::Bar { ref text }
+            }) if text == "texto"
         ));
         let normal = split_page(1, "ChatGPT", SELECTION_CAP, false).ipc;
         assert!(!normal.private);
@@ -31424,11 +31662,11 @@ __state('barra');
         // O Salvar nota do Split privado chega (e explicito); o Ctrl+Shift+Z
         // la continua recusado sem ler a pagina.
         assert!(matches!(
-            deliver(&private, "note", r#"{"via":"bar"}"#).as_slice(),
+            deliver(&private, "note", r#"{"via":"bar","text":"Texto da pagina."}"#).as_slice(),
             [UserEvent::NoteRequested {
                 target: Some(PageTarget::Split),
-                via: NoteVia::Bar
-            }]
+                via: NoteVia::Bar { text }
+            }] if text == "Texto da pagina."
         ));
         assert!(matches!(
             deliver(&private, "note", "{}").as_slice(),
@@ -31765,12 +32003,13 @@ __state('duplo-clique-no-vazio');
         );
         let host = between("impl SearchCardHost for App {", "\n}\n");
         let compare = host
-            .split("fn compare_selection(&mut self, question: String)")
+            .split("fn compare_selection(&mut self, request: CompareRequest)")
             .nth(1)
             .expect("compare_selection");
-        assert_eq!(squash(compare), "{ self.compare(question); }");
+        assert_eq!(squash(compare), "{ self.compare(request); }");
         // No codigo que embarca, `compare` so e chamado pela omnibox (uma
-        // pergunta escrita) e pelo host do cartao.
+        // pergunta ou um `traduzir:` escritos, ou reabertos do Historico) e
+        // pelo host do cartao.
         let shipped = source
             .split("#[cfg(test)]\nmod tests {")
             .next()
@@ -31783,8 +32022,9 @@ __state('duplo-clique-no-vazio');
         assert_eq!(
             callers,
             vec![
-                "Ok(Intent::Compare(query)) => self.compare(query),",
-                "self.compare(question);"
+                "InputRoute::Translate(Some(text)) => self.compare(CompareRequest::translate(&text)),",
+                "Ok(Intent::Compare(query)) => self.compare(CompareRequest::ask(query)),",
+                "self.compare(request);"
             ],
             "um caminho novo chama o compare sem o cartao"
         );
@@ -31813,9 +32053,9 @@ __state('duplo-clique-no-vazio');
             self.steps
                 .push(format!("expira {token} em {} s", delay.as_secs()));
         }
-        fn compare_selection(&mut self, question: String) {
-            self.steps.push(format!("compara {question}"));
-            self.compared.push(question);
+        fn compare_selection(&mut self, request: CompareRequest) {
+            self.steps.push(format!("compara {}", request.prompt));
+            self.compared.push(request.prompt);
         }
     }
 
@@ -31891,7 +32131,9 @@ __state('duplo-clique-no-vazio');
         // Confirmado: esconde e pesquisa, uma vez.
         assert_eq!(
             drive_card(&mut card, &mut log, search(1), t0 + SEARCH_CARD_ARM),
-            SearchCardOutcome::Confirmed("agent:https://x.com | click=Comprar".to_string())
+            SearchCardOutcome::Confirmed(CompareRequest::ask(
+                "agent:https://x.com | click=Comprar".to_string()
+            ))
         );
         assert_eq!(
             log.steps[2..],
@@ -32005,7 +32247,7 @@ __state('duplo-clique-no-vazio');
                 search(5),
                 t3 + ms(700) + SEARCH_CARD_ARM
             ),
-            SearchCardOutcome::Confirmed("quinto".to_string())
+            SearchCardOutcome::Confirmed(CompareRequest::ask("quinto".to_string()))
         );
 
         // Em tudo isto, o `compare` correu exatamente duas vezes: uma por
@@ -32092,7 +32334,7 @@ __state('duplo-clique-no-vazio');
                 answer(1, SearchCardButton::Confirm, usize::MAX),
                 t0 + SEARCH_CARD_ARM
             ),
-            SearchCardOutcome::Confirmed(prompt("Good morning, world"))
+            SearchCardOutcome::Confirmed(CompareRequest::translate("Good morning, world"))
         );
         assert_eq!(log.compared, vec![prompt("Good morning, world")]);
         assert_eq!(
@@ -32115,7 +32357,7 @@ __state('duplo-clique-no-vazio');
                 answer(2, SearchCardButton::Confirm, 4),
                 t1 + SEARCH_CARD_ARM
             ),
-            SearchCardOutcome::Confirmed(prompt("abc"))
+            SearchCardOutcome::Confirmed(CompareRequest::translate("abc"))
         );
         // Cancelar e expirar nao traduzem nada.
         let t2 = t0 + ms(4_000);
@@ -32161,7 +32403,7 @@ __state('duplo-clique-no-vazio');
                 answer(6, SearchCardButton::Confirm, usize::MAX),
                 t3 + ms(10) + SEARCH_CARD_ARM
             ),
-            SearchCardOutcome::Confirmed("segundo".to_string())
+            SearchCardOutcome::Confirmed(CompareRequest::ask("segundo".to_string()))
         );
         assert_eq!(
             log.compared,
@@ -32182,6 +32424,127 @@ __state('duplo-clique-no-vazio');
         assert_ne!(
             ask_pixels, translate_pixels,
             "o cartao do Traduzir pinta-se como o do Mandar"
+        );
+    }
+
+    /// Gate: cada Traduzir confirmado fica no Historico, na memoria e na
+    /// sessao de pesquisa com o texto de quem le -- dois textos diferentes,
+    /// dois titulos diferentes a vista --, e o Historico reabre-o (tambem com
+    /// 2000 caracteres), refazendo o mesmo pedido as IAs. O Mandar fica como
+    /// era.
+    #[test]
+    fn each_translation_is_named_by_its_text_and_reopens_from_history() {
+        let t0 = Instant::now();
+        let confirm = |text: &str| -> CompareRequest {
+            let mut card = SearchCard::default();
+            let SearchCardOutcome::Show { token, .. } = card.step(
+                SearchCardInput::Request {
+                    text: text.to_string(),
+                    intent: SearchIntent::Translate,
+                },
+                t0,
+            ) else {
+                panic!("o Traduzir nao mostrou o cartao");
+            };
+            match card.step(
+                SearchCardInput::Answer {
+                    token,
+                    button: SearchCardButton::Confirm,
+                    shown: usize::MAX,
+                },
+                t0 + SEARCH_CARD_ARM,
+            ) {
+                SearchCardOutcome::Confirmed(request) => request,
+                other => panic!("o Traduzir nao confirmou: {other:?}"),
+            }
+        };
+        let visible = |request: &CompareRequest| {
+            let (session, memory, reopen) = compare_records(request);
+            let item = history_panel_items(&[HistoryEntry::now(
+                HistoryKind::Ask,
+                reopen,
+                "comparator-3col",
+            )])
+            .remove(0);
+            (
+                session.title,
+                memory.title,
+                item.title.chars().take(60).collect::<String>(),
+            )
+        };
+        let first = confirm("Good morning, world.");
+        let second = confirm("The quick brown fox jumps over the lazy dog.");
+        // As IAs recebem o pedido fixo e o texto...
+        assert_eq!(
+            first.prompt,
+            format!("{TRANSLATE_PROMPT}\n\nGood morning, world.")
+        );
+        let (session, memory, _) = compare_records(&first);
+        assert_eq!(session.question, first.prompt);
+        assert_eq!(memory.body, first.prompt);
+        // ...mas o nome e o do texto.
+        let (a, b) = (visible(&first), visible(&second));
+        assert_ne!(a.0, b.0, "duas traducoes com o mesmo titulo de sessao");
+        assert_ne!(a.1, b.1, "duas traducoes com o mesmo titulo na memoria");
+        assert_ne!(a.2, b.2, "o Historico mostra as duas traducoes iguais");
+        assert_eq!(
+            a,
+            (
+                "Traduzir: Good morning, world.".to_string(),
+                "Pesquisa · Traduzir: Good morning, world.".to_string(),
+                "traduzir:Good morning, world.".to_string()
+            )
+        );
+
+        // Reabrir: o clique no Historico manda a entrada ao painel (`open`,
+        // ate 2048 caracteres) e dai ao `handle_input`, que refaz o pedido.
+        for text in [
+            "Good morning, world.".to_string(),
+            "a".repeat(SEARCH_MAX_CHARS),
+        ] {
+            let request = confirm(&text);
+            let (_, _, reopen) = compare_records(&request);
+            let items = history_panel_items(&[HistoryEntry::now(
+                HistoryKind::Ask,
+                reopen,
+                "comparator-3col",
+            )]);
+            let open =
+                serde_json::json!({"action":"open","args":{"input": items[0].input}}).to_string();
+            let Some(PanelMessage::Open(input)) = parse_panel_message(&open) else {
+                panic!(
+                    "o Historico nao reabre um Traduzir de {} caracteres",
+                    text.chars().count()
+                );
+            };
+            assert_eq!(
+                route_input(&input),
+                InputRoute::Translate(Some(text.clone()))
+            );
+            assert_eq!(
+                CompareRequest::translate(&text),
+                request,
+                "reaberto, o pedido mudou"
+            );
+        }
+
+        // O Mandar: o mesmo texto para as IAs, o nome e o Historico.
+        let ask = CompareRequest::selection(SearchIntent::Ask, "capital da França");
+        let (session, memory, reopen) = compare_records(&ask);
+        assert_eq!(ask.prompt, "capital da França");
+        assert_eq!(session.title, "capital da França");
+        assert_eq!(memory.title, "Pesquisa · capital da França");
+        assert_eq!(reopen, "compare:capital da França");
+        assert_eq!(route_input(&reopen), InputRoute::Intent);
+        assert_eq!(
+            parse_intent(&reopen).ok(),
+            Some(Intent::Compare("capital da França".to_string()))
+        );
+        // A omnibox: `traduzir:` sem texto e a ajuda.
+        assert_eq!(route_input("traduzir:   "), InputRoute::Translate(None));
+        assert_eq!(
+            route_input("  Traduzir: Bom dia "),
+            InputRoute::Translate(Some("Bom dia".to_string()))
         );
     }
 
@@ -32474,7 +32837,7 @@ __state('duplo-clique-no-vazio');
                 },
                 t0 + SEARCH_CARD_ARM,
             ) {
-                SearchCardOutcome::Confirmed(question) => question,
+                SearchCardOutcome::Confirmed(request) => request.prompt,
                 other => panic!("Pesquisar nao confirmou {text:?}: {other:?}"),
             };
             let digest = {
@@ -37909,6 +38272,73 @@ Clique: pausar · botão direito: opções";
         }
     }
 
+    /// Gate: o botao que abriu o painel de servicos -- o icone do servico ou,
+    /// na Respiracao, o botao dela nas ferramentas, onde fica o ponto de
+    /// minimizado -- diz o que o clique faz no modo do painel: minimizado,
+    /// que volta (e se continua a tocar); aberto, que fecha. Sem o painel
+    /// dele aberto, a dica e a de sempre.
+    #[test]
+    fn the_button_that_opened_a_service_panel_hints_its_state() {
+        let breath = Service::Breath.label();
+        for (badge, expected) in [
+            (
+                Some(ServiceBadge::Minimized),
+                format!("{breath} minimizado · clique para voltar ao painel"),
+            ),
+            (
+                Some(ServiceBadge::Playing),
+                format!("{breath} minimizado, a tocar · clique para voltar ao painel"),
+            ),
+            (
+                None,
+                format!("{breath} aberto ao lado · clique para fechar"),
+            ),
+        ] {
+            assert_eq!(
+                service_panel_hint(BarHit::Tool(Tool::Breath), Service::Breath, badge),
+                Some(expected),
+                "{badge:?}"
+            );
+        }
+        // O hint do bar_tooltip_text e este (a dica de sempre so quando nao
+        // ha nada do painel no alvo).
+        let meet = Service::Meet;
+        assert_eq!(
+            service_panel_hint(BarHit::Service(meet), meet, Some(ServiceBadge::Minimized)),
+            Some(service_icon_hint(
+                meet.label(),
+                Some(ServiceBadge::Minimized)
+            ))
+        );
+        // Outro servico aberto: a Respiracao, o Pomodoro e as Notas ficam com
+        // a dica delas.
+        for tool in Tool::ALL {
+            assert_eq!(
+                service_panel_hint(BarHit::Tool(tool), meet, Some(ServiceBadge::Minimized)),
+                None,
+                "{tool:?}"
+            );
+        }
+        for tool in [Tool::Pomodoro, Tool::Notes] {
+            assert_eq!(
+                service_panel_hint(BarHit::Tool(tool), Service::Breath, None),
+                None,
+                "{tool:?}"
+            );
+        }
+        let source = shipped_source();
+        let tooltip = source
+            .split("fn bar_tooltip_text(&self, hit: BarHit, owner: HWND) -> Option<String> {")
+            .nth(1)
+            .and_then(|part| part.split("let comp = self.comparator.as_ref();").next())
+            .expect("bar_tooltip_text");
+        assert!(
+            tooltip
+                .contains("service_panel_hint(hit, panel.service, panel.state.badge(panel.audio))"),
+            "a dica da barra nao passa pelo painel aberto"
+        );
+    }
+
     /// Gate: cada ferramenta tem o seu PNG (e nao o do Privado, que e o que o
     /// `_` do `extra_icon` devolve a um slot esquecido). O tomate e colorido;
     /// as outras duas sao brancas para o tema as pintar.
@@ -40035,8 +40465,9 @@ process.stdout.write(JSON.stringify({
         }
 
         /// Gate: o Ctrl+Shift+Z do mapa de teclas que embarca pede uma nota
-        /// sem mandar nada da pagina; o Ctrl+Z e o refazer dos campos
-        /// editaveis ficam com a pagina.
+        /// sem mandar nada da pagina -- uma so, com a tecla presa (as
+        /// repeticoes do keydown nao pedem outra); o Ctrl+Z e o refazer dos
+        /// campos editaveis ficam com a pagina.
         #[test]
         fn ctrl_shift_z_on_a_page_posts_a_bare_note_request() {
             let drive = r#"
@@ -40047,6 +40478,9 @@ __fire('keydown', { key: 'z', ctrlKey: true });
 __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true, target: new Element('textarea') });
 __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true, target: Object.assign(new Element('div'), { isContentEditable: true }) });
 __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
+for (let i = 0; i < 5; i++) {
+  __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true, repeat: true });
+}
 "#;
             let cases = [serde_json::json!({
                 "name": "keymap",
@@ -40065,7 +40499,7 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
             assert_eq!(
                 sent.len(),
                 1,
-                "so o Ctrl+Shift+Z fora de um campo: {sent:?}"
+                "so o primeiro Ctrl+Shift+Z fora de um campo: {sent:?}"
             );
             let message = sent[0].as_str().expect("string");
             assert_eq!(
@@ -40128,15 +40562,15 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
             ));
             // Na hora de ler.
             assert_eq!(
-                note_capture_decision(Some(PageTarget::Split), NoteVia::Shortcut, Some(true)),
+                note_capture_decision(Some(PageTarget::Split), &NoteVia::Shortcut, Some(true)),
                 NoteCapture::RefusePrivate
             );
             assert_eq!(
-                note_capture_decision(Some(PageTarget::Split), NoteVia::Shortcut, Some(false)),
+                note_capture_decision(Some(PageTarget::Split), &NoteVia::Shortcut, Some(false)),
                 NoteCapture::Read
             );
             assert_eq!(
-                note_capture_decision(Some(PageTarget::Split), NoteVia::Shortcut, None),
+                note_capture_decision(Some(PageTarget::Split), &NoteVia::Shortcut, None),
                 NoteCapture::NoPage
             );
             for target in [
@@ -40146,7 +40580,7 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
             ] {
                 for split in [None, Some(false), Some(true)] {
                     assert_eq!(
-                        note_capture_decision(target, NoteVia::Shortcut, split),
+                        note_capture_decision(target, &NoteVia::Shortcut, split),
                         NoteCapture::Read,
                         "{target:?} com split {split:?}"
                     );
@@ -40175,7 +40609,7 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
                     assert_eq!(
                         note_read_view(
                             Some(PageTarget::Column(index)),
-                            NoteVia::Shortcut,
+                            &NoteVia::Shortcut,
                             &columns,
                             split,
                             Some(&main)
@@ -40191,7 +40625,7 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
             assert_eq!(
                 note_read_view(
                     Some(PageTarget::Column(COMPARATOR_COLUMNS)),
-                    NoteVia::Shortcut,
+                    &NoteVia::Shortcut,
                     &columns,
                     None,
                     Some(&main)
@@ -40201,7 +40635,7 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
             assert_eq!(
                 note_read_view(
                     Some(PageTarget::Split),
-                    NoteVia::Shortcut,
+                    &NoteVia::Shortcut,
                     &columns,
                     Some(&normal),
                     Some(&main)
@@ -40214,7 +40648,7 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
             assert_eq!(
                 note_read_view(
                     Some(PageTarget::Split),
-                    NoteVia::Shortcut,
+                    &NoteVia::Shortcut,
                     &columns,
                     Some(&private),
                     Some(&main)
@@ -40225,7 +40659,7 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
             assert_eq!(
                 note_read_view(
                     Some(PageTarget::Split),
-                    NoteVia::Shortcut,
+                    &NoteVia::Shortcut,
                     &columns,
                     None,
                     Some(&main)
@@ -40235,7 +40669,7 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
             assert_eq!(
                 note_read_view(
                     None,
-                    NoteVia::Shortcut,
+                    &NoteVia::Shortcut,
                     &columns,
                     Some(&private),
                     Some(&main)
@@ -40246,7 +40680,7 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
                 })
             );
             assert_eq!(
-                note_read_view::<u8>(None, NoteVia::Shortcut, &[], None, None),
+                note_read_view::<u8>(None, &NoteVia::Shortcut, &[], None, None),
                 Err(NoteCapture::NoPage)
             );
         }
@@ -40404,16 +40838,17 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
             }
         }
 
-        /// Gate: o "Salvar nota" da barra que embarca pede a nota (`note`
-        /// com `via: bar`, sem dados da pagina) -- tambem no Split privado,
+        /// Gate: o "Salvar nota" da barra que embarca manda no pedido (`note`
+        /// com `via: bar`) o texto que ela mostra -- tambem no Split privado,
         /// onde o Ctrl+Shift+Z continua recusado --, e o nativo grava UMA
-        /// nota com a fonte que ele conhece da WebView: o `url` e o `title`
-        /// que a pagina devolve nao entram. O mesmo texto antes de 2 s nao e
-        /// outra nota. Nada vai ao historico nem a memoria, e no privado o
-        /// aviso diz que a nota foi guardada.
+        /// nota com esse texto e com a fonte que ele conhece da WebView:
+        /// nunca um endereco nem um titulo da pagina. O mesmo texto antes de
+        /// 2 s nao e outra nota. Nada vai ao historico nem a memoria, e no
+        /// privado o aviso diz que a nota foi guardada.
         #[test]
         fn salvar_nota_saves_one_note_with_the_native_source_and_never_twice_in_two_seconds() {
-            // 1. A barra que embarca, normal e no Split privado.
+            // 1. A barra que embarca, normal e no Split privado: o texto que
+            //    ela mostra vai no pedido, e so ele.
             let press = r#"
 __show('  Linha 1\r\nLinha 2  ');
 __press('note');
@@ -40437,15 +40872,17 @@ __state('salva');
                 let name = result["name"].as_str().expect("name");
                 assert_eq!(
                     selection_posted(result),
-                    vec![IpcAction::Note { via: NoteVia::Bar }],
+                    vec![IpcAction::Note {
+                        via: bar_note("Linha 1\nLinha 2")
+                    }],
                     "{name}"
                 );
                 let sent = result["posted"][0].as_str().expect("posted");
                 let value: serde_json::Value = serde_json::from_str(sent).expect("json");
                 assert_eq!(
                     value["args"],
-                    serde_json::json!({"via":"bar"}),
-                    "{name}: a pagina mandou dados"
+                    serde_json::json!({"via":"bar","text":"Linha 1\nLinha 2"}),
+                    "{name}: a barra mandou outra coisa"
                 );
                 assert_eq!(
                     selection_states(result)["salva"]["shown"],
@@ -40455,15 +40892,19 @@ __state('salva');
             }
 
             // 2. O pedido chega da coluna, do Split (tambem o privado) e da
-            //    WebView unica; so o Ctrl+Shift+Z e recusado no privado.
-            let bar = IpcAction::Note { via: NoteVia::Bar };
+            //    WebView unica, com o texto; so o Ctrl+Shift+Z e recusado no
+            //    privado.
+            let text = "Linha 1\nLinha 2";
+            let bar = IpcAction::Note {
+                via: bar_note(text),
+            };
             for col in 0..COMPARATOR_COLUMNS {
                 assert!(matches!(
                     App::column_ipc_event_impl(col, bar.clone()),
                     Some(UserEvent::NoteRequested {
                         target: Some(PageTarget::Column(c)),
-                        via: NoteVia::Bar
-                    }) if c == col
+                        via: NoteVia::Bar { text: ref got }
+                    }) if c == col && got == text
                 ));
             }
             for private in [false, true] {
@@ -40472,8 +40913,8 @@ __state('salva');
                         App::split_ipc_event_impl(1, private, bar.clone()),
                         Some(UserEvent::NoteRequested {
                             target: Some(PageTarget::Split),
-                            via: NoteVia::Bar
-                        })
+                            via: NoteVia::Bar { text: ref got }
+                        }) if got == text
                     ),
                     "Split privado={private}"
                 );
@@ -40482,13 +40923,13 @@ __state('salva');
                 common_ipc_event(bar.clone()),
                 Some(UserEvent::NoteRequested {
                     target: None,
-                    via: NoteVia::Bar
-                })
+                    via: NoteVia::Bar { text: ref got }
+                }) if got == text
             ));
             assert_eq!(
-                note_capture_decision(Some(PageTarget::Split), NoteVia::Bar, Some(true)),
+                note_capture_decision(Some(PageTarget::Split), &bar_note(text), Some(true)),
                 NoteCapture::Read,
-                "o Salvar nota do Split privado nao leu a pagina"
+                "o Salvar nota do Split privado foi recusado"
             );
             let columns: Vec<ComparatorView<u8>> = [(10u8, "a"), (11, "b"), (12, "c")]
                 .into_iter()
@@ -40501,12 +40942,12 @@ __state('salva');
                 fullscreen: false,
                 private: true,
             };
-            // Le o Split privado e sabe que e ele: o aviso diz "Modo
+            // Chega ao Split privado e sabe que e ele: o aviso diz "Modo
             // privado". Nas colunas, no Split normal e na WebView unica, nao.
             assert_eq!(
                 note_read_view(
                     Some(PageTarget::Split),
-                    NoteVia::Bar,
+                    &bar_note(text),
                     &columns,
                     Some(&private_split),
                     Some(&70)
@@ -40530,7 +40971,7 @@ __state('salva');
                 (None, &private_split, &70),
             ] {
                 assert_eq!(
-                    note_read_view(target, NoteVia::Bar, &columns, Some(split), Some(&70)),
+                    note_read_view(target, &bar_note(text), &columns, Some(split), Some(&70)),
                     Ok(NoteRead {
                         view: expected,
                         private: false
@@ -40545,7 +40986,7 @@ __state('salva');
             let webview_url = || Some(native.to_string());
             assert_eq!(
                 note_capture_source(
-                    NoteVia::Bar,
+                    &bar_note(text),
                     Some(PageTarget::Column(0)),
                     Surface::Comparator,
                     None,
@@ -40555,13 +40996,13 @@ __state('salva');
                 Some(native)
             );
             assert_eq!(
-                note_capture_source(NoteVia::Bar, None, Surface::External, None, webview_url)
+                note_capture_source(&bar_note(text), None, Surface::External, None, webview_url)
                     .as_deref(),
                 Some(native)
             );
             assert_eq!(
                 note_capture_source(
-                    NoteVia::Bar,
+                    &bar_note(text),
                     None,
                     Surface::Reader,
                     Some("https://example.com/doc"),
@@ -40573,7 +41014,7 @@ __state('salva');
             );
             assert_eq!(
                 note_capture_source(
-                    NoteVia::Shortcut,
+                    &NoteVia::Shortcut,
                     Some(PageTarget::Split),
                     Surface::Comparator,
                     None,
@@ -40582,24 +41023,12 @@ __state('salva');
                 None
             );
 
-            // 4. A resposta da pagina mente no endereco e no titulo: nenhum
-            //    dos dois entra na nota.
-            let capture = |text: &str| {
-                serde_json::json!({
-                    "text": text,
-                    "url": "https://evil.example/phish",
-                    "title": "Titulo falso da pagina"
-                })
-                .to_string()
-            };
+            // 4. A nota e o texto do pedido: citacao, titulo do inicio dele e
+            //    a fonte nativa.
             let t0 = Instant::now();
             let mut guard = BarNoteGuard::default();
-            let draft = match bar_note_step(
-                &mut guard,
-                &capture("  Linha 1\r\nLinha 2  "),
-                Some(native),
-                t0,
-            ) {
+            let draft = match bar_note_step(&mut guard, "  Linha 1\r\nLinha 2  ", Some(native), t0)
+            {
                 BarNoteStep::Save(draft) => draft,
                 other => panic!("o Salvar nota nao gravou: {other:?}"),
             };
@@ -40612,18 +41041,13 @@ __state('salva');
                     source: Some(native.to_string()),
                 }
             );
-            // Sem fonte nativa que sirva: sem fonte -- nunca a da pagina.
+            // Sem fonte nativa que sirva: sem fonte.
             for unusable in [
                 None,
                 Some("about:blank"),
                 Some("file:///C:/Windows/win.ini"),
             ] {
-                match bar_note_step(
-                    &mut BarNoteGuard::default(),
-                    &capture("texto"),
-                    unusable,
-                    t0,
-                ) {
+                match bar_note_step(&mut BarNoteGuard::default(), "texto", unusable, t0) {
                     BarNoteStep::Save(draft) => {
                         assert_eq!(draft.source, None, "{unusable:?}");
                         assert_eq!(draft.body, "> texto\n", "{unusable:?}");
@@ -40631,8 +41055,8 @@ __state('salva');
                     other => panic!("{unusable:?}: {other:?}"),
                 }
             }
-            // O titulo e o inicio da selecao, com "…" se ela continua; o
-            // aviso diz-lo, ou diz que foi no modo privado.
+            // O titulo e o inicio do texto, com "…" se ele continua; o aviso
+            // diz-lo, ou diz que foi no modo privado.
             let long = "palavra ".repeat(20);
             assert_eq!(
                 bar_note_title(&long),
@@ -40652,19 +41076,10 @@ __state('salva');
                 bar_note_notice(true, "Linha 1 Linha 2"),
                 "Modo privado: a nota foi guardada"
             );
-            // Nada selecionado, ou uma resposta que nao e a do script.
+            // So espacos nao e nota.
             assert_eq!(
-                bar_note_step(
-                    &mut BarNoteGuard::default(),
-                    &capture("  \n "),
-                    Some(native),
-                    t0
-                ),
+                bar_note_step(&mut BarNoteGuard::default(), "  \n ", Some(native), t0),
                 BarNoteStep::Refused(NoteCaptureError::EmptySelection)
-            );
-            assert_eq!(
-                bar_note_step(&mut BarNoteGuard::default(), "null", Some(native), t0),
-                BarNoteStep::Refused(NoteCaptureError::Unreadable)
             );
 
             // 5. Pela pasta, com o trabalho do worker: o mesmo texto em menos
@@ -40685,7 +41100,7 @@ __state('salva');
                 ("Linha 1\nLinha 2", ms(3_000)),
             ] {
                 if let BarNoteStep::Save(draft) =
-                    bar_note_step(&mut guard, &capture(text), Some(native), t0 + at)
+                    bar_note_step(&mut guard, text, Some(native), t0 + at)
                 {
                     match run_notes_command(&store, NotesCommand::Create(draft), T0) {
                         NotesReply::Opened {
@@ -40716,19 +41131,27 @@ __state('salva');
             assert_eq!(files.len(), 3, "notas no disco: {files:?}");
             for text in &files {
                 assert!(text.contains(&format!("source: {native}")), "{text}");
-                assert!(!text.contains("evil.example"), "{text}");
-                assert!(!text.contains("Titulo falso"), "{text}");
             }
 
-            // 6. O caminho do App: o "Salvar nota" so manda criar a nota e so
-            //    mostra o aviso -- nem historico, nem memoria, nem o painel
-            //    (asserção de ausencia sobre o texto; ver AGENTS.md §4.3).
+            // 6. O caminho do App: o "Salvar nota" grava o texto que veio no
+            //    pedido -- sem voltar a perguntar a pagina -- e so mostra o
+            //    aviso: nem historico, nem memoria, nem o painel (asserção de
+            //    ausencia sobre o texto; ver AGENTS.md §4.3).
             let source = shipped_source();
-            let arm = source
-                .split("NoteVia::Bar => match bar_note_step(")
+            let request = source
+                .split("NoteVia::Bar { text } =>")
                 .nth(1)
-                .and_then(|part| part.split("match draft {").next())
-                .expect("o ramo do Salvar nota em note_captured");
+                .and_then(|part| part.split("NoteVia::Shortcut =>").next())
+                .expect("o ramo do Salvar nota em request_note_from_page");
+            assert!(request.contains("self.save_bar_note(&text, source.as_deref(), private)"));
+            let arm = source
+                .split("fn save_bar_note(&mut self, text: &str, source: Option<&str>, private: bool) {")
+                .nth(1)
+                .and_then(|part| part.split("\n    }\n").next())
+                .expect("save_bar_note");
+            assert!(
+                arm.contains("bar_note_step(&mut self.bar_notes, text, source, Instant::now())")
+            );
             assert!(arm.contains("NotesCommand::Create(draft), NotesOrigin::Bar { private }"));
             let reply = source
                 .split("NotesOrigin::Bar { private } => match &reply {")
@@ -40736,6 +41159,12 @@ __state('salva');
                 .and_then(|part| part.split("NotesOrigin::Closed =>").next())
                 .expect("a resposta do Salvar nota em notes_ready");
             assert!(reply.contains("bar_note_notice(private, &note.title)"));
+            for forbidden in ["evaluate_script", "NOTE_CAPTURE_SCRIPT", "NoteCaptured"] {
+                assert!(
+                    !request.contains(forbidden) && !arm.contains(forbidden),
+                    "o Salvar nota volta a ler a pagina: {forbidden}"
+                );
+            }
             for forbidden in [
                 "record(",
                 "memory",
@@ -40750,6 +41179,194 @@ __state('salva');
                 );
                 assert!(!reply.contains(forbidden), "o aviso passa por {forbidden}");
             }
+        }
+
+        /// Gate (pagina hostil): depois do document-created a pagina troca o
+        /// `getSelection` (da janela e do Document), o
+        /// `Selection.prototype.toString`, o `String` e o `JSON.stringify`;
+        /// quem le seleciona um texto e clica em Salvar nota. A nota -- corpo,
+        /// titulo e o aviso nativo -- e o texto de quem le, pelo caminho que
+        /// embarca: a barra injetada, o parser do canal, o evento da coluna e
+        /// o `bar_note_step`. (Uma nova leitura da pagina, o
+        /// `NOTE_CAPTURE_SCRIPT` que o Salvar nota usava, devolve ai o texto
+        /// da pagina.)
+        #[test]
+        fn salvar_nota_saves_the_readers_text_even_when_the_page_swaps_get_selection() {
+            let planted = "Aviso do banco: confirme a sua conta em https://phish.example/login";
+            let chosen = "Texto que o utilizador escolheu";
+            let hostile = format!(
+                r#"
+const __planted = {planted:?};
+window.getSelection = function () {{
+  return {{ toString() {{ return __planted; }}, rangeCount: 1, isCollapsed: false }};
+}};
+Document.prototype.getSelection = window.getSelection;
+Selection.prototype.toString = function () {{ return __planted; }};
+String = function () {{ return __planted; }};
+JSON.stringify = function () {{ return JSON_STRINGIFY_ORIGINAL(__planted); }};
+"#
+            );
+            let press = format!(
+                r#"
+__show({chosen:?});
+__press('note');
+__state('salva');
+__log.push(__json({{ tag: 'releitura', value: {NOTE_CAPTURE_SCRIPT} }}));
+"#
+            );
+            let pre = "var JSON_STRINGIFY_ORIGINAL = JSON.stringify;";
+            let results = run_selection_cases(vec![selection_case(
+                "hostil",
+                &bind_page_script(NEURALIA_KEYMAP_SCRIPT, SELECTION_CAP, false),
+                pre,
+                &[&hostile, &press],
+            )]);
+            let result = &results[0];
+            // A pagina que troca o getSelection decide o que uma releitura
+            // devolve...
+            let states = selection_states(result);
+            assert_eq!(
+                states["releitura"]["value"]["text"], planted,
+                "a pagina hostil do gate nao controla uma releitura"
+            );
+            // ...mas a barra manda o texto de quem le.
+            let posted = selection_posted(result);
+            assert_eq!(
+                posted,
+                vec![IpcAction::Note {
+                    via: bar_note(chosen)
+                }],
+                "a barra mandou o texto da pagina"
+            );
+            // E o nativo grava-o, pelo evento que a coluna entrega.
+            let Some(UserEvent::NoteRequested {
+                target: Some(PageTarget::Column(0)),
+                via: NoteVia::Bar { text },
+            }) = App::column_ipc_event_impl(0, posted[0].clone())
+            else {
+                panic!("o Salvar nota nao chegou como nota da barra");
+            };
+            let native = "https://example.com/artigo";
+            let draft = match bar_note_step(
+                &mut BarNoteGuard::default(),
+                &text,
+                Some(native),
+                Instant::now(),
+            ) {
+                BarNoteStep::Save(draft) => draft,
+                other => panic!("o Salvar nota nao gravou: {other:?}"),
+            };
+            assert_eq!(draft.title, chosen);
+            assert_eq!(draft.body, format!("> {chosen}\n\nFonte: {native}\n"));
+            assert_eq!(
+                bar_note_notice(false, &draft.title),
+                format!("Nota salva: {chosen}")
+            );
+            for field in [&draft.title, &draft.body] {
+                assert!(!field.contains("phish"), "{field}");
+            }
+        }
+
+        /// Gate: o texto do Salvar nota vai no pedido so se o envelope inteiro
+        /// couber nos 8 KiB do canal. No limite vai e o parser nativo aceita-o;
+        /// um byte a mais e a barra nao manda nada e diz porque.
+        #[test]
+        fn salvar_nota_sends_only_what_fits_in_the_channel() {
+            let envelope = |text: &str| {
+                format!(
+                    r#"{{"v":1,"cap":"{SELECTION_CAP}","action":"note","args":{{"via":"bar","text":{}}}}}"#,
+                    serde_json::to_string(text).expect("json")
+                )
+            };
+            // Caracteres de 3 bytes em UTF-8 ate ao limite do canal.
+            let overhead = envelope("").len();
+            let fits = "語".repeat((crate::ipc::IPC_MAX_BYTES - overhead) / 3);
+            assert!(envelope(&fits).len() <= crate::ipc::IPC_MAX_BYTES);
+            let over = format!("{fits}{}", "a".repeat(3));
+            assert!(envelope(&over).len() > crate::ipc::IPC_MAX_BYTES);
+            let step =
+                |text: &str| format!("__show({text:?});\n__press('note');\n__state('fim');\n");
+            let page = bind_page_script(NEURALIA_KEYMAP_SCRIPT, SELECTION_CAP, false);
+            let fits_step = step(&fits);
+            let over_step = step(&over);
+            let results = run_selection_cases(vec![
+                selection_case("cabe", &page, "", &[&fits_step]),
+                selection_case("nao-cabe", &page, "", &[&over_step]),
+            ]);
+            assert_eq!(
+                selection_posted(&results[0]),
+                vec![IpcAction::Note {
+                    via: bar_note(&fits)
+                }]
+            );
+            assert_eq!(
+                results[0]["posted"][0].as_str().map(str::len),
+                Some(envelope(&fits).len())
+            );
+            assert_eq!(selection_posted(&results[1]), vec![]);
+            let states = selection_states(&results[1]);
+            assert_eq!(
+                states["fim"]["shown"], true,
+                "a barra fechou sem dizer nada"
+            );
+            assert_eq!(
+                states["fim"]["note"],
+                "Seleção grande demais para Salvar nota"
+            );
+        }
+
+        /// Gate: o Ctrl+Shift+Z preso nao faz uma nota por repeticao da
+        /// tecla: o mesmo texto em menos de 2 s e uma nota; outro texto, ou o
+        /// mesmo 2 s depois, e outra.
+        #[test]
+        fn a_held_ctrl_shift_z_saves_one_note() {
+            let capture = |text: &str| {
+                serde_json::json!({ "text": text, "url": "https://example.com/a", "title": "Pagina" })
+                    .to_string()
+            };
+            let t0 = Instant::now();
+            let ms = |value: u64| Duration::from_millis(value);
+            let mut guard = BarNoteGuard::default();
+            let mut saved = Vec::new();
+            for (text, at) in [
+                ("Texto escolhido", ms(0)),
+                ("Texto escolhido", ms(500)),
+                ("Texto escolhido", ms(533)),
+                ("Texto escolhido", ms(566)),
+                ("Texto escolhido", ms(1_900)),
+                ("Outro texto", ms(1_950)),
+                ("Texto escolhido", ms(2_000)),
+            ] {
+                match shortcut_note_step(&mut guard, &capture(text), None, t0 + at) {
+                    BarNoteStep::Save(draft) => saved.push(draft.body),
+                    BarNoteStep::Repeated => {}
+                    BarNoteStep::Refused(error) => panic!("{text}: {error:?}"),
+                }
+            }
+            assert_eq!(
+                saved,
+                [
+                    "> Texto escolhido\n\nFonte: https://example.com/a\n",
+                    "> Outro texto\n\nFonte: https://example.com/a\n",
+                    "> Texto escolhido\n\nFonte: https://example.com/a\n",
+                ],
+                "a tecla presa fez uma nota por repeticao"
+            );
+            assert_eq!(
+                shortcut_note_step(&mut guard, &capture("  "), None, t0 + ms(2_100)),
+                BarNoteStep::Refused(NoteCaptureError::EmptySelection)
+            );
+            // O App passa por aqui (asserção de presenca; o comportamento e o
+            // do teste acima).
+            let source = shipped_source();
+            let captured = source
+                .split("fn note_captured(&mut self, raw: &str, source: Option<&str>) {")
+                .nth(1)
+                .and_then(|part| part.split("\n    }\n").next())
+                .expect("note_captured");
+            assert!(captured.contains(
+                "shortcut_note_step(&mut self.shortcut_notes, raw, source, Instant::now())"
+            ));
         }
 
         /// Gate: com o teclado na janela (Home ou barra), Ctrl+Shift+Z e uma
@@ -42190,6 +42807,11 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     const searchAllowed = '__NEURALIA_PRIVATE__' === 'false';
     const SHOW_MAX = 5000;
     const SEARCH_MAX = 2000;
+    // Salvar nota manda o texto no pedido: ate 5000 caracteres
+    // (`NOTE_TEXT_MAX_CHARS`) e so se o envelope inteiro couber nos 8 KiB do
+    // canal (`IPC_MAX_BYTES`); o que nao cabe nao sai, e a barra diz porque.
+    const NOTE_MAX = 5000;
+    const IPC_MAX_BYTES = 8192;
     const SHOW_DELAY_MS = 200;
     // Mandar para IA e Traduzir so PEDEM: o nativo mostra o texto num cartao
     // seu ("Mandar para as 3 IAs?", "Traduzir nas 3 IAs?") e so um clique
@@ -42207,6 +42829,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     const SPEECH_ABBREVIATION = 5;
     const MARGIN = 8;
     const TOO_LONG = 'Seleção grande demais para as IAs (máx. 2000 caracteres)';
+    const NOTE_TOO_LONG = 'Seleção grande demais para Salvar nota';
     // Clicado cedo demais: o nome do botao que foi.
     const TOO_SOON = {
       ask: 'Clique de novo em Mandar para IA',
@@ -42225,7 +42848,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       stop: '⏹ Parar'
     };
     const CSS = [
-      '.bar{display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:4px;',
+      '.bar{position:relative;display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:4px;',
       'border-radius:22px;background:#ffffff;color:#111314;',
       'border:1px solid rgba(0,0,0,.14);box-shadow:0 8px 28px rgba(0,0,0,.22);',
       'font:600 13px "Segoe UI",system-ui,sans-serif;max-width:560px;',
@@ -42237,16 +42860,22 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       'button:focus-visible{outline:2px solid #1a73e8;outline-offset:-2px}',
       '.more{min-width:34px;justify-content:center;padding:0 10px}',
       '.solo .act{display:none}',
-      '.menu{display:none;flex-basis:100%;flex-direction:column;align-items:stretch;',
-      'gap:2px;padding:4px 0 0;border-top:1px solid rgba(0,0,0,.10)}',
+      // O menu flutua junto do "⋯", fora da caixa da barra: abrir nao muda
+      // o tamanho nem o sitio dela, e o "⋯" fica debaixo do rato.
+      '.menu{display:none;position:absolute;right:0;min-width:150px;flex-direction:column;',
+      'align-items:stretch;gap:2px;padding:4px;border-radius:16px;',
+      'background:#ffffff;color:#111314;border:1px solid rgba(0,0,0,.14);',
+      'box-shadow:0 8px 28px rgba(0,0,0,.22)}',
+      '.menu.up{bottom:calc(100% + 6px)}',
+      '.menu.down{top:calc(100% + 6px)}',
+      '.menu.start{right:auto;left:0}',
       '.menu.on{display:flex}',
       '.menu button{border-radius:12px}',
       '.msg{display:none;flex-basis:100%;padding:6px 12px;font-weight:500;line-height:1.35}',
       '.msg.on{display:block}',
       '@media (prefers-color-scheme: dark){',
-      '.bar{background:#1c1f22;color:#f1f3f4;border-color:rgba(255,255,255,.16);',
+      '.bar,.menu{background:#1c1f22;color:#f1f3f4;border-color:rgba(255,255,255,.16);',
       'box-shadow:0 8px 28px rgba(0,0,0,.55)}',
-      '.menu{border-top-color:rgba(255,255,255,.14)}',
       'button:hover{background:rgba(255,255,255,.12)}',
       'button:focus-visible{outline-color:#8ab4f8}}'
     ].join('');
@@ -42544,6 +43173,34 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       if (focusOn) { try { focusOn(menuFocused, { preventScroll: true }); } catch (err) {} }
     }
 
+    // O lado da barra onde o menu abre: longe da selecao (por cima quando a
+    // barra esta por cima dela, por baixo quando esta por baixo), ou o outro
+    // se desse lado nao couber; encostado a direita da barra, onde esta o
+    // "⋯", ou a esquerda se assim saisse do ecra. O menu flutua fora da
+    // caixa da barra: ela nao muda de tamanho nem de sitio, e o "⋯" fica
+    // debaixo do rato -- um segundo clique no mesmo ponto fecha o menu, nunca
+    // cai no Falar.
+    function fitMenu() {
+      setAttr(menu, 'class', 'menu on up');
+      let up = true;
+      let start = false;
+      try {
+        const view = viewport();
+        const own = edges(boxOf(host));
+        const size = edges(boxOf(menu));
+        const tall = size && size.height > 0 ? size.height : 0;
+        const wide = size && size.width > 0 ? size.width : 0;
+        if (own) {
+          const above = !placed || !shownAt || placed.top < shownAt.top;
+          const roomUp = own.top - 6 - tall >= MARGIN;
+          const roomDown = own.bottom + 6 + tall <= view.height - MARGIN;
+          up = above ? (roomUp || !roomDown) : (!roomDown && roomUp);
+          start = own.right - wide < MARGIN;
+        }
+      } catch (err) { up = true; start = false; }
+      setAttr(menu, 'class', 'menu on ' + (up ? 'up' : 'down') + (start ? ' start' : ''));
+    }
+
     // `focus`: o clique no "⋯" leva o foco a primeira entrada, e dai o
     // teclado anda no menu. Aberto sozinho (a ler, sem selecao) nao tira o
     // foco a pagina.
@@ -42551,14 +43208,14 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       if (!menu) return;
       if (!menuOpen) {
         menuOpen = true;
-        setAttr(menu, 'class', 'menu on');
         setAttr(moreButton, 'aria-expanded', 'true');
-        if (visible && shownAt) place(shownAt);
+        fitMenu();
       }
       if (focus) focusItem(0);
     }
 
-    // Fecha o menu; o foco que estava nele volta a pagina.
+    // Fecha o menu; o foco que estava nele volta a pagina. A barra fica
+    // onde estava.
     function closeMenu() {
       if (!menu || !menuOpen) return;
       menuOpen = false;
@@ -42568,7 +43225,6 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       menuFocused = null;
       menuAt = 0;
       if (had && blurOf) { try { blurOf(had); } catch (err) {} }
-      if (visible && shownAt) place(shownAt);
     }
 
     function toggleMenu() {
@@ -42711,6 +43367,8 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       important(host, 'visibility', 'hidden');
       important(host, 'display', 'block');
       place(snap);
+      // A ler, o menu que ficou aberto segue a barra para o lado certo.
+      if (menuOpen) fitMenu();
       important(host, 'visibility', 'visible');
       visible = true;
     }
@@ -42850,15 +43508,44 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       hide();
     }
 
-    // Salvar nota: local, sem cartao. So PEDE a nota (`note` com
-    // `via: bar`): o texto e lido pelo nativo na propria WebView, e a fonte
-    // que fica na nota e o endereco que o nativo conhece dela -- nunca um que
-    // a pagina diga. O mesmo filtro de clique que o Mandar.
+    // Bytes UTF-8 de uma mensagem que o `stringify` capturado escreveu (um
+    // substituto solto sai como \uXXXX: 6 bytes).
+    function utf8Bytes(value) {
+      let bytes = 0;
+      for (let i = 0; i < value.length; i++) {
+        const c = codeAt(value, i);
+        if (c < 0x80) bytes += 1;
+        else if (c < 0x800) bytes += 2;
+        else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < value.length
+            && codeAt(value, i + 1) >= 0xDC00 && codeAt(value, i + 1) <= 0xDFFF) {
+          bytes += 4;
+          i++;
+        } else if (c >= 0xD800 && c <= 0xDFFF) bytes += 6;
+        else bytes += 3;
+      }
+      return bytes;
+    }
+
+    // Salvar nota: local, sem cartao. Manda no pedido (`note` com
+    // `via: bar`) o texto que a barra mostra -- lido pelas primitivas
+    // capturadas no document-created, como o do Mandar --, e o nativo grava-o
+    // sem voltar a perguntar a pagina: um getSelection trocado depois nao
+    // muda a nota. A fonte que fica nela e o endereco que o nativo conhece da
+    // WebView, nunca um que a pagina diga. O mesmo filtro de clique que o
+    // Mandar.
     function saveNote() {
       if (!text) return;
       if (!armed('note')) return;
-      if (!searchable(text)) { hide(); return; }
-      post('{"v":1,"cap":"' + capability + '","action":"note","args":{"via":"bar"}}');
+      const body = searchable(text);
+      if (!body) { hide(); return; }
+      // Envelope montado so com strings, como o do Mandar.
+      const message = '{"v":1,"cap":"' + capability + '","action":"note","args":{"via":"bar","text":'
+        + stringify(body) + '}}';
+      if (codePoints(body) > NOTE_MAX || utf8Bytes(message) > IPC_MAX_BYTES) {
+        say(NOTE_TOO_LONG);
+        return;
+      }
+      post(message);
       drop();
     }
 
@@ -43187,12 +43874,16 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       }
       // Ctrl+Shift+Z: nota com o texto selecionado. A pagina so pede; a
       // selecao e lida pelo lado nativo. Num campo editavel continua a ser o
-      // refazer do editor.
+      // refazer do editor. A tecla presa repete o keydown: so o primeiro
+      // pede a nota (o nativo tambem nao grava a mesma nota duas vezes em
+      // 2 s).
       if (e.shiftKey && key === 'z') {
         var field = e.target || {};
         var fieldTag = (field.tagName || '').toUpperCase();
         if (fieldTag === 'INPUT' || fieldTag === 'TEXTAREA' || field.isContentEditable) { return; }
-        e.preventDefault(); act('note'); return;
+        e.preventDefault();
+        if (!e.repeat) { act('note'); }
+        return;
       }
       if (key === 'u') { e.preventDefault(); act('viewsource'); return; }
       switch (key) {
