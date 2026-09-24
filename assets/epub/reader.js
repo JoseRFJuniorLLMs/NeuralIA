@@ -317,9 +317,6 @@
     return text.replace(/\s+/g, ' ');
   }
 
-  // Ocorrências de `query` em `text`, sem distinguir maiúsculas nem
-  // acentos, com o contexto à volta. `occurrence` é a ordem da ocorrência
-  // no documento: é por ela que se volta a encontrar o ponto ao abrir.
   // O texto dobrado com cada sequência de espaços (quebra de linha e recuo,
   // nbsp + espaço, espaço duplo) reduzida a um espaço, como na busca; o mapa
   // de volta ao original cobre a sequência inteira.
@@ -348,6 +345,9 @@
     return { text: chars.join(''), starts, ends };
   }
 
+  // Ocorrências de `query` em `text`, sem distinguir maiúsculas nem
+  // acentos, com o contexto à volta. `occurrence` é a ordem da ocorrência
+  // no documento: é por ela que se volta a encontrar o ponto ao abrir.
   function searchText(text, query, limit, context) {
     const needle = E.fold(String(query || '')).replace(/\s+/g, ' ').trim();
     const results = [];
