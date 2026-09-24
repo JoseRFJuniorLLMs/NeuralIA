@@ -35,6 +35,8 @@ const ALL_SOURCES: &str = concat!(
     include_str!("../src/windows_app/bar_layout.rs"),
     "\n",
     include_str!("../src/windows_app/tab_row.rs"),
+    "\n",
+    include_str!("../src/windows_app/native.rs"),
 );
 const APP: &str = ALL_SOURCES;
 const IPC: &str = include_str!("../src/ipc.rs");
