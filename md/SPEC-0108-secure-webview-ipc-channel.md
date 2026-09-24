@@ -73,8 +73,12 @@ Uma string JSON, sempre com estes quatro campos e nenhum outro:
   `gmail-state`, `research-answer`, `agent-observation`, `hint`, `note`). Nome fora da lista →
   ignorado.
 - `args` — objeto com os parâmetros exatos da ação (`col`, `url`, `aside`, `count`,
-  `sender`, `subject`, `key`, `text`, `data`, `id`). Campos extras ou tipos errados
-  são rejeitados; índices são validados contra `COMPARATOR_COLUMNS`; `url`
+  `sender`, `subject`, `key`, `text`, `data`, `id`, `intent`, `via`). Campos extras ou tipos errados
+  são rejeitados; os nomes fechados também: `search` leva `text` e `intent`, que é
+  exatamente `ask` (Mandar para IA) ou `translate` (Traduzir) — sem `intent`, ou com
+  outro nome, maiúsculas ou outro tipo, é recusado, nunca lido como `ask`; `note` vai
+  sem argumentos (Ctrl+Shift+Z) ou só com `via` igual a `bar` (o Salvar nota da barra
+  de seleção), e nenhum texto, endereço ou título da página; índices são validados contra `COMPARATOR_COLUMNS`; `url`
   passa por `validate_web_url` e rejeita alvos locais/privados/special óbvios
   antes de DNS; a camada IPC não afirma filtragem DNS pré-conexão do WebView2; strings são
   recusadas acima dos limites definidos (180/2048 chars, 2000 chars no `text` de `ask` e

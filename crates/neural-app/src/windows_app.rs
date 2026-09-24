@@ -6213,24 +6213,24 @@ fn bar_note_notice(private: bool, title: &str) -> String {
     }
 }
 
-/// O ultimo texto que o "Salvar nota" gravou, e quando: o mesmo texto outra
-/// vez antes de `BAR_NOTE_REPEAT` nao e outra nota.
+/// Os textos que o "Salvar nota" gravou nos ultimos `BAR_NOTE_REPEAT`, e
+/// quando: o mesmo texto outra vez antes disso nao e outra nota -- tambem
+/// com outro texto gravado pelo meio.
 #[derive(Debug, Default)]
 struct BarNoteGuard {
-    last: Option<(String, Instant)>,
+    recent: Vec<(String, Instant)>,
 }
 
 impl BarNoteGuard {
-    /// `true` e fica a ser o ultimo; um repetido nao conta como novo (nem
-    /// adia a vez seguinte).
+    /// `true` e fica registado; um repetido nao conta como novo (nem adia a
+    /// vez seguinte). So guarda o que ainda esta dentro da janela.
     fn admit(&mut self, selection: &str, now: Instant) -> bool {
-        if let Some((last, at)) = &self.last
-            && last == selection
-            && now.saturating_duration_since(*at) < BAR_NOTE_REPEAT
-        {
+        self.recent
+            .retain(|(_, at)| now.saturating_duration_since(*at) < BAR_NOTE_REPEAT);
+        if self.recent.iter().any(|(saved, _)| saved == selection) {
             return false;
         }
-        self.last = Some((selection.to_string(), now));
+        self.recent.push((selection.to_string(), now));
         true
     }
 }
@@ -40617,9 +40617,9 @@ __state('salva');
                 BarNoteStep::Refused(NoteCaptureError::Unreadable)
             );
 
-            // 5. Pela pasta, com o trabalho do worker: dois cliques no mesmo
-            //    texto em menos de 2 s sao UMA nota; outro texto conta; o
-            //    mesmo texto 2 s depois tambem.
+            // 5. Pela pasta, com o trabalho do worker: o mesmo texto em menos
+            //    de 2 s e UMA nota -- tambem com outro texto gravado pelo
+            //    meio --; outro texto conta; o mesmo texto 2 s depois tambem.
             let dir = NotesDir::new("bar");
             let store = dir.store();
             let mut guard = BarNoteGuard::default();
@@ -40628,9 +40628,11 @@ __state('salva');
             for (text, at) in [
                 ("Linha 1\nLinha 2", ms(0)),
                 ("Linha 1\nLinha 2", ms(300)),
-                ("  Linha 1\r\nLinha 2 ", ms(1_900)),
-                ("Outro texto", ms(1_950)),
+                ("Outro texto", ms(1_000)),
+                ("  Linha 1\r\nLinha 2 ", ms(1_999)),
                 ("Linha 1\nLinha 2", ms(2_000)),
+                ("Outro texto", ms(2_500)),
+                ("Linha 1\nLinha 2", ms(3_000)),
             ] {
                 if let BarNoteStep::Save(draft) =
                     bar_note_step(&mut guard, &capture(text), Some(native), t0 + at)
@@ -40651,7 +40653,7 @@ __state('salva');
                     .map(|note| note.title.as_str())
                     .collect::<Vec<_>>(),
                 ["Linha 1 Linha 2", "Outro texto", "Linha 1 Linha 2"],
-                "o mesmo texto em menos de 2 s virou outra nota"
+                "o mesmo texto em menos de 2 s virou outra nota (ou 2 s depois nao)"
             );
             let files: Vec<String> = std::fs::read_dir(&dir.0)
                 .expect("pasta")
