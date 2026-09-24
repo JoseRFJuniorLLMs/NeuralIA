@@ -43,7 +43,11 @@ pub use intent::{Intent, is_pdf_url, parse_intent};
 pub use library::{BookEntry, Bookmark, Library, LibraryError, Position};
 pub use reader::{ReaderArticle, ReaderBlock, ReaderClient};
 pub use render::reader_html;
-pub use search::{chatgpt_search_url, claude_search_url, google_ai_url, perplexity_search_url};
+pub use search::{
+    ProviderId, ProviderInfo, all_self_names, chatgpt_search_url, claude_search_url,
+    copilot_search_url, deepseek_search_url, gemini_search_url, google_ai_url, grok_search_url,
+    is_ai_provider_host, is_login_host, login_hosts, mistral_search_url, perplexity_search_url,
+};
 pub use security::{
     is_forbidden_ip, is_local_network_target, validate_redirect_target, validate_web_url,
 };
