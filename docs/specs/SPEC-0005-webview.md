@@ -41,14 +41,14 @@ message transport through WebView2, but every accepted message is a bounded JSON
 envelope authenticated with a per-WebView capability. The native side exposes
 no filesystem API, credential API or arbitrary native-call object.
 
-The closed action set has 28 names: `home`, `back`, `restore`,
+The closed action set has 29 names: `home`, `back`, `restore`,
 `autoscroll`, `zoomin`, `zoomout`, `zoomreset`, `reload`, `print`,
 `omnibox`, `history`, `clearhistory`, `fullscreen`, `devtools`,
 `viewsource`, `newtab`, `expand`, `shortcut-expand`, `minimize`, `split`,
 `link`, `ask`, `split-close`, `split-expand`, `palette`, `gmail-state`,
-`research-answer` and `agent-observation`. Unknown actions, extra fields,
+`research-answer`, `agent-observation` and `hint`. Unknown actions, extra fields,
 wrong types, oversized messages and invalid per-action arguments are rejected.
-The parser gate `protocol_accepts_exactly_the_twenty_eight_published_actions`
+The parser gate `protocol_accepts_exactly_the_twenty_nine_published_actions`
 (`crates/neural-app/src/ipc.rs`) reads this list and fails when it differs from
 the set the shipped parser accepts.
 
@@ -61,6 +61,17 @@ effect reaches columns other than the one that emitted it (gate:
 `a_plain_click_opens_in_all_three_panels_and_ctrl_click_opens_beside` in
 `crates/neural-app/src/windows_app.rs`; argument policy:
 `a_link_click_obeys_the_same_policy_as_the_split` in `ipc.rs`).
+
+`hint` reports that the pointer entered (or left) one of the controls the
+comparator injects into a column (the `−` minimize and `⛶ <AI>` expand
+buttons). Its arguments are exactly `col` and `id`, and `id` is one of the
+closed names `minimize`, `expand` or `none`; free text is rejected. Only
+trusted `mouseenter`/`mouseleave` events post it, a column only speaks for
+itself, and the native side picks the text ("Minimizar <AI>", "Expandir <AI>")
+and shows it in the app's centered hint. Gates:
+`hint_names_one_of_three_closed_hints_for_its_own_column` (`ipc.rs`) and
+`column_controls_ask_for_the_centered_hint_on_trusted_hover`
+(`windows_app.rs`, runs the shipped script under Node).
 
 `ask` reports a question the user typed and sent in a comparator column (Enter
 or the send button, trusted events only, on the column's own AI page). Its
@@ -99,6 +110,10 @@ Handlers on injected user controls MUST require `event.isTrusted`; synthesized
 pointer and keyboard events are ignored. Automatic observers such as Gmail,
 research-answer capture and the bounded agent observer are not user-event
 handlers, but their messages still require the private per-WebView capability.
+No injected handler acts on a page message instead of a user gesture: a ctrl+wheel
+over a child frame does not zoom (the wheel does not cross the frame boundary),
+and page `postMessage` traffic never reaches `act` (gate
+`a_page_message_never_zooms_the_app_and_frames_forward_nothing`).
 
 The floating omnibox (palette) is a native Win32 control, not an `<input>`
 inside page DOM. A remote page can only request that it open through the

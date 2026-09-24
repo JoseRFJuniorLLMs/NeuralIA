@@ -5,6 +5,17 @@ pub const IPC_MAX_BYTES: usize = 8 * 1024;
 /// Tecto de uma pergunta replicada as outras colunas (`ask`).
 pub const ASK_MAX_CHARS: usize = 2_000;
 
+/// A dica centrada que uma coluna pede ao passar o rato pelos controlos
+/// injetados (o "−" e o "⛶ <IA>"). Lista fechada: a pagina so escolhe QUAL
+/// dica; o texto e o nome da IA vem do nativo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnHint {
+    Minimize,
+    Expand,
+    /// O rato saiu do controlo: a dica some.
+    None,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpcAction {
     Home,
@@ -73,6 +84,11 @@ pub enum IpcAction {
     },
     AgentObservation {
         data: String,
+    },
+    /// O rato entrou (ou saiu) de um controlo injetado numa coluna.
+    Hint {
+        col: usize,
+        hint: ColumnHint,
     },
 }
 
@@ -232,6 +248,17 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
             exact_keys(args, &["data"])?;
             let data = bounded_string(args, "data", 7_500, false)?;
             Some(IpcAction::AgentObservation { data })
+        }
+        "hint" => {
+            exact_keys(args, &["col", "id"])?;
+            let col = bounded_col(args, max_columns)?;
+            let hint = match args.get("id")?.as_str()? {
+                "minimize" => ColumnHint::Minimize,
+                "expand" => ColumnHint::Expand,
+                "none" => ColumnHint::None,
+                _ => return None,
+            };
+            Some(IpcAction::Hint { col, hint })
         }
         _ => None,
     }
@@ -595,6 +622,35 @@ mod tests {
     }
 
     #[test]
+    fn hint_names_one_of_three_closed_hints_for_its_own_column() {
+        let hint = |args: Value| parse_ipc_message(&message("hint", args), CAP, 3);
+        for (id, expected) in [
+            ("minimize", ColumnHint::Minimize),
+            ("expand", ColumnHint::Expand),
+            ("none", ColumnHint::None),
+        ] {
+            assert_eq!(
+                hint(json!({"col":1,"id":id})),
+                Some(IpcAction::Hint {
+                    col: 1,
+                    hint: expected
+                }),
+                "{id}"
+            );
+        }
+        for (args, why) in [
+            (json!({"col":1,"id":"Minimizar ChatGPT"}), "texto livre"),
+            (json!({"col":1,"id":"close"}), "dica inventada"),
+            (json!({"col":1,"id":7}), "tipo errado"),
+            (json!({"col":3,"id":"expand"}), "coluna fora"),
+            (json!({"col":1}), "sem id"),
+            (json!({"col":1,"id":"expand","text":"x"}), "campo a mais"),
+        ] {
+            assert_eq!(hint(args), None, "aceitou uma dica com {why}");
+        }
+    }
+
+    #[test]
     fn ask_carries_the_typed_question_within_bounds() {
         let ask = |args: Value| parse_ipc_message(&message("ask", args), CAP, 3);
         assert_eq!(
@@ -658,6 +714,7 @@ mod tests {
             IpcAction::GmailState { .. } => "gmail-state",
             IpcAction::ResearchAnswer { .. } => "research-answer",
             IpcAction::AgentObservation { .. } => "agent-observation",
+            IpcAction::Hint { .. } => "hint",
         }
     }
 
@@ -688,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_accepts_exactly_the_twenty_eight_published_actions() {
+    fn protocol_accepts_exactly_the_twenty_nine_published_actions() {
         let examples = [
             message("home", json!({})),
             message("back", json!({})),
@@ -730,6 +787,7 @@ mod tests {
                 "agent-observation",
                 json!({"data":"1\nhttps://example.com"}),
             ),
+            message("hint", json!({"col":2,"id":"expand"})),
         ];
 
         // O que o parser que embarca aceita, pelo nome da variante devolvida.
@@ -757,6 +815,6 @@ mod tests {
             accepted, published,
             "a SPEC-0005 publica um conjunto diferente do que o parser aceita"
         );
-        assert_eq!(accepted.len(), 28);
+        assert_eq!(accepted.len(), 29);
     }
 }

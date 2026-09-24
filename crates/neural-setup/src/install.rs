@@ -1295,6 +1295,10 @@ mod tests {
         .expect("copiar");
         let before = fs::read(&exe).expect("ler");
         let mut running = std::process::Command::new(&exe)
+            // Pasta de trabalho propria: sem ela, o filho herdava a do processo de
+            // testes, que outro teste pode ter posto DENTRO de uma pasta de
+            // instalacao -- e o Windows nao apaga a pasta de trabalho de um processo.
+            .current_dir(std::env::temp_dir())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

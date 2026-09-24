@@ -101,7 +101,9 @@ function act(action, args) {
 Nenhum script usa `window.ipc` (global do wry, envenenável pela página antes
 de ser lido tarde) nem `location.href` para ações.
 
-Todos os handlers que chamam `act` continuam a exigir `event.isTrusted`.
+Todos os handlers que chamam `act` continuam a exigir `event.isTrusted`. Nenhum
+reage a uma mensagem da página em vez de um gesto: o ctrl+roda por cima de um
+iframe não faz zoom (gate `a_page_message_never_zooms_the_app_and_frames_forward_nothing`).
 
 ### 3.3 Lado nativo
 
@@ -147,8 +149,8 @@ A SPEC-0108 só passa a "Implementada" quando, no CI:
 
 1. Teste unitário do parser de mensagens: rejeita corpo > 8 KiB, `v != 1`,
    `cap` ausente/errado/com comprimento diferente, `action` fora da lista,
-   `args` com tipos errados; aceita cada uma das 28 ações com `args` válidos e o conjunto aceite é
-   exatamente o publicado na SPEC-0005 (`protocol_accepts_exactly_the_twenty_eight_published_actions`).
+   `args` com tipos errados; aceita cada uma das 29 ações com `args` válidos e o conjunto aceite é
+   exatamente o publicado na SPEC-0005 (`protocol_accepts_exactly_the_twenty_nine_published_actions`).
 2. Teste: nenhuma constante de script injetado contém `location.href = 'neuralia:`
    nem `neuralia:` + `?cap=` — exceto no HTML do Reader (`render.rs`), que não
    pode conter `cap` de todo.
