@@ -11256,6 +11256,11 @@ impl App {
             if let Some(window) = &self.window {
                 window.set_fullscreen(fullscreen.then_some(Fullscreen::Borderless(None)));
             }
+            // Em tela cheia o teclado vai para o painel: o Esc (e as teclas
+            // do proprio video) chegam a ele e nao a uma coluna escondida.
+            if fullscreen && let Some(panel) = &self.service_panel {
+                let _ = panel.webview.focus();
+            }
         }
         self.position_service_panel();
         self.fit_comparator_to_panel();
@@ -13115,6 +13120,13 @@ impl App {
     /// Esc -- da janela, ou o "voltar" que a pagina manda quando o teclado
     /// esta nela: a meio de um arrasto cancela-o; fora dele e o "voltar".
     fn escape_or_back(&mut self) {
+        // Com o painel de servicos em tela cheia, o Esc so sai da tela cheia
+        // -- venha de onde vier (o teclado pode ter ficado numa coluna, por
+        // baixo do painel).
+        if self.service_covers_window() {
+            self.service_input(ServiceInput::Escape);
+            return;
+        }
         if self.tab_gesture(TabGestureInput::Escape) == TabGestureEffect::Ignored {
             self.go_back();
         }
@@ -18904,6 +18916,21 @@ mod tests {
             App
         );
         assert_eq!(history_nav_target(Surface::Home, false, None, false), App);
+    }
+
+    /// Na Home os botoes da janela existem mas so se veem (e so aceitam o
+    /// clique) depois de o rato chegar a zona deles; no comparador fazem parte
+    /// da barra e estao sempre la. A maquina de estado do "chegar" e do
+    /// "esconder 300 ms depois" e `CaptionReveal` (panel_chrome).
+    #[test]
+    fn home_window_buttons_show_only_once_revealed_and_the_bar_keeps_them() {
+        assert!(!caption_buttons_visible(Surface::Home, false));
+        assert!(caption_buttons_visible(Surface::Home, true));
+        assert!(caption_buttons_visible(Surface::Comparator, false));
+        let mut reveal = CaptionReveal::default();
+        assert!(!caption_buttons_visible(Surface::Home, reveal.shown()));
+        assert_eq!(reveal.observe(true, 0), RevealStep::Show);
+        assert!(caption_buttons_visible(Surface::Home, reveal.shown()));
     }
 
     #[test]
