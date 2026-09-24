@@ -681,9 +681,15 @@ mod tests {
     /// publicado e lido tal como embarca no repositorio.
     const SPEC_0005: &str = include_str!("../../../docs/specs/SPEC-0005-webview.md");
 
+    /// Quantas acoes o canal publica. E o UNICO numero a mudar quando entra
+    /// ou sai uma acao: o gate abaixo exige um exemplo aceite por acao e que
+    /// a SPEC-0005 (lista e contagem), a SPEC-0108 (lista e contagem) e a
+    /// SPEC-0015 (contagem) digam exatamente isto.
+    const PUBLISHED_ACTION_COUNT: usize = 29;
+
     /// Nome de fio de cada variante. O `match` e exaustivo de proposito: uma
     /// variante nova nao compila sem passar por aqui, e o teste abaixo exige
-    /// entao um exemplo aceite pelo parser e o nome na SPEC-0005.
+    /// entao um exemplo aceite pelo parser e o nome nas specs publicadas.
     fn wire_name(action: &IpcAction) -> &'static str {
         match action {
             IpcAction::Home => "home",
@@ -718,34 +724,48 @@ mod tests {
         }
     }
 
-    /// Le "The closed action set has N names: `a`, `b` ... Unknown actions"
-    /// da SPEC-0005 e devolve (N, nomes entre crases).
-    fn published_action_set() -> (usize, Vec<String>) {
-        let marker = "The closed action set has ";
-        let start = SPEC_0005
-            .find(marker)
-            .expect("SPEC-0005 publica a lista fechada")
-            + marker.len();
-        let rest = &SPEC_0005[start..];
-        let count: usize = rest
-            .split_whitespace()
-            .next()
-            .and_then(|word| word.parse().ok())
-            .expect("SPEC-0005 publica a contagem em algarismos");
-        let list = &rest[..rest
-            .find("Unknown actions")
-            .expect("fim da lista na SPEC-0005")];
-        let names = list
-            .split('`')
+    /// SPEC-0108 repete a lista (secao do envelope) e a contagem (criterio de
+    /// aceitacao 1); SPEC-0015 repete a contagem no modelo de ameacas.
+    const SPEC_0108: &str = include_str!("../../../md/SPEC-0108-secure-webview-ipc-channel.md");
+    const SPEC_0015: &str = include_str!("../../../docs/specs/SPEC-0015-threat-model.md");
+
+    /// O texto entre `start` e o primeiro `end` que se lhe segue.
+    fn between<'a>(text: &'a str, start: &str, end: &str, what: &str) -> &'a str {
+        let from = text
+            .find(start)
+            .unwrap_or_else(|| panic!("{what}: marcador {start:?} ausente"))
+            + start.len();
+        let rest = &text[from..];
+        &rest[..rest
+            .find(end)
+            .unwrap_or_else(|| panic!("{what}: fim {end:?} ausente"))]
+    }
+
+    /// Os nomes entre crases de um trecho publicado, pela ordem.
+    fn backticked(list: &str) -> Vec<String> {
+        list.split('`')
             .skip(1)
             .step_by(2)
             .map(str::to_string)
-            .collect();
-        (count, names)
+            .collect()
+    }
+
+    /// A contagem em algarismos logo apos `marker` ("29 names", "29-action").
+    fn published_count(text: &str, marker: &str, what: &str) -> usize {
+        let from = text
+            .find(marker)
+            .unwrap_or_else(|| panic!("{what}: marcador {marker:?} ausente"))
+            + marker.len();
+        text[from..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .unwrap_or_else(|_| panic!("{what}: contagem em algarismos apos {marker:?}"))
     }
 
     #[test]
-    fn protocol_accepts_exactly_the_twenty_nine_published_actions() {
+    fn protocol_accepts_exactly_the_published_actions() {
         let examples = [
             message("home", json!({})),
             message("back", json!({})),
@@ -803,18 +823,63 @@ mod tests {
             })
             .collect();
 
-        let (published_count, published_names) = published_action_set();
-        let published: std::collections::BTreeSet<&str> =
-            published_names.iter().map(String::as_str).collect();
+        // Um exemplo por acao, nem mais nem menos.
         assert_eq!(
-            published_count,
-            published_names.len(),
-            "a contagem publicada na SPEC-0005 nao bate com a lista publicada"
+            examples.len(),
+            PUBLISHED_ACTION_COUNT,
+            "exemplos a mais ou a menos para PUBLISHED_ACTION_COUNT"
         );
         assert_eq!(
-            accepted, published,
-            "a SPEC-0005 publica um conjunto diferente do que o parser aceita"
+            accepted.len(),
+            PUBLISHED_ACTION_COUNT,
+            "o parser aceita um numero de acoes diferente de PUBLISHED_ACTION_COUNT"
         );
-        assert_eq!(accepted.len(), 29);
+
+        // Cada lista publicada e o conjunto aceite, sem repetidos.
+        for (what, names) in [
+            (
+                "SPEC-0005",
+                backticked(between(
+                    SPEC_0005,
+                    "The closed action set has ",
+                    "Unknown actions",
+                    "SPEC-0005",
+                )),
+            ),
+            (
+                "SPEC-0108",
+                backticked(between(
+                    SPEC_0108,
+                    "um nome da lista fechada de SPEC-0005 (",
+                    "Nome fora da lista",
+                    "SPEC-0108",
+                )),
+            ),
+        ] {
+            let published: std::collections::BTreeSet<&str> =
+                names.iter().map(String::as_str).collect();
+            assert_eq!(
+                published.len(),
+                names.len(),
+                "{what} repete um nome na lista publicada"
+            );
+            assert_eq!(
+                accepted, published,
+                "{what} publica um conjunto diferente do que o parser aceita"
+            );
+        }
+
+        // Cada contagem publicada e PUBLISHED_ACTION_COUNT.
+        for (what, text, marker) in [
+            ("SPEC-0005", SPEC_0005, "The closed action set has "),
+            ("SPEC-0108", SPEC_0108, "aceita cada uma das "),
+            ("SPEC-0015", SPEC_0015, "a closed "),
+        ] {
+            assert_eq!(
+                published_count(text, marker, what),
+                PUBLISHED_ACTION_COUNT,
+                "{what} publica outra contagem de acoes"
+            );
+        }
     }
 }

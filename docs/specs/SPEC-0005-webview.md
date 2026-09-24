@@ -48,9 +48,11 @@ The closed action set has 29 names: `home`, `back`, `restore`,
 `link`, `ask`, `split-close`, `split-expand`, `palette`, `gmail-state`,
 `research-answer`, `agent-observation` and `hint`. Unknown actions, extra fields,
 wrong types, oversized messages and invalid per-action arguments are rejected.
-The parser gate `protocol_accepts_exactly_the_twenty_nine_published_actions`
+The parser gate `protocol_accepts_exactly_the_published_actions`
 (`crates/neural-app/src/ipc.rs`) reads this list and fails when it differs from
-the set the shipped parser accepts.
+the set the shipped parser accepts; the count is the test constant
+`PUBLISHED_ACTION_COUNT`, and the same gate holds the list and count repeated in
+SPEC-0108 and the count in SPEC-0015 to it.
 
 `link` reports a click on a link inside a comparator column. Its arguments are
 exactly `col`, `url` and `aside` (boolean); `url` goes through the same

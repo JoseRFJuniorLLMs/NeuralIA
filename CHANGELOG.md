@@ -4,6 +4,9 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+### Testing
+- **release/2.2.0 — gate do conjunto fechado do IPC sem contagem no nome:** `protocol_accepts_exactly_the_twenty_nine_published_actions` passa a `protocol_accepts_exactly_the_published_actions`. A contagem vive numa só constante de teste (`PUBLISHED_ACTION_COUNT`, junto de `wire_name` em `crates/neural-app/src/ipc.rs`) e o gate exige um exemplo aceite por ação e que a lista e a contagem da SPEC-0005, a lista e a contagem da SPEC-0108 e a contagem da SPEC-0015 digam exatamente o que o parser aceita; uma ação nova muda um número e as specs, não o nome do gate. A lista da SPEC-0108 passa a ter `ask` e `hint`, que o parser já aceitava. Sabotagens (uma compilação cada, todas vermelhas): uma ação `fake` com parser, `wire_name`, exemplo e contagem 30 mas fora da SPEC-0005; a SPEC-0108 sem `hint`; a SPEC-0015 a dizer 28.
+
 ## [2.1.8] - 2026-09-24
 
 ### Fixed
