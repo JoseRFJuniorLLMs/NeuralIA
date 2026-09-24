@@ -23,7 +23,11 @@
 //! (`decide_agent_step` e `route_input` são os modelos). Aqui fica só o que o
 //! texto consegue provar: presença e, sobretudo, **ausência**.
 
-const ALL_SOURCES: &str = concat!(include_str!("../src/windows_app.rs"),);
+const ALL_SOURCES: &str = concat!(
+    include_str!("../src/windows_app.rs"),
+    "\n",
+    include_str!("../src/windows_app/tests.rs"),
+);
 const APP: &str = ALL_SOURCES;
 const IPC: &str = include_str!("../src/ipc.rs");
 const CORE_MEMORY: &str = include_str!("../../neural-core/src/memory.rs");
