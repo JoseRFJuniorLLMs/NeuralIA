@@ -4,6 +4,8 @@ use serde_json::{Map, Value};
 pub const IPC_MAX_BYTES: usize = 8 * 1024;
 /// Tecto de uma pergunta replicada as outras colunas (`ask`).
 pub const ASK_MAX_CHARS: usize = 2_000;
+/// Tecto do texto selecionado mandado para pesquisa (`search`).
+pub const SEARCH_MAX_CHARS: usize = 2_000;
 
 /// A dica centrada que uma coluna pede ao passar o rato pelos controlos
 /// injetados (o "−" e o "⛶ <IA>"). Lista fechada: a pagina so escolhe QUAL
@@ -65,6 +67,11 @@ pub enum IpcAction {
     /// fornecedor; a coluna de origem segue a conversa dela.
     Ask {
         col: usize,
+        text: String,
+    },
+    /// "Pesquisar" da barra de selecao: o texto selecionado vai as tres IAs
+    /// como PERGUNTA. Nunca passa pelo interpretador de comandos da omnibox.
+    Search {
         text: String,
     },
     SplitClose,
@@ -242,6 +249,25 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
             Some(IpcAction::Ask {
                 col,
                 text: text.trim().to_string(),
+            })
+        }
+        "search" => {
+            exact_keys(args, &["text"])?;
+            let raw = args.get("text")?.as_str()?;
+            // Os mesmos caracteres que uma pergunta escrita: dos de controlo
+            // so a quebra de linha e o tab passam.
+            if raw
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+            {
+                return None;
+            }
+            let text = raw.trim();
+            if text.is_empty() || text.chars().count() > SEARCH_MAX_CHARS {
+                return None;
+            }
+            Some(IpcAction::Search {
+                text: text.to_string(),
             })
         }
         "research-answer" => {
@@ -707,6 +733,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn search_carries_the_selected_text_within_bounds() {
+        let search = |args: Value| parse_ipc_message(&message("search", args), CAP, 3);
+        // O texto chega tal como foi selecionado, aparado nas pontas: um
+        // "agent:" selecionado e so texto, nao um comando.
+        assert_eq!(
+            search(json!({"text":"  agent:https://example.com | click=Comprar\n\tlinha 2  "})),
+            Some(IpcAction::Search {
+                text: "agent:https://example.com | click=Comprar\n\tlinha 2".to_string()
+            })
+        );
+        // O tecto conta caracteres, nao bytes, e so depois de aparar.
+        let at_limit = "ç".repeat(SEARCH_MAX_CHARS);
+        assert_eq!(
+            search(json!({"text": format!("  {at_limit}  ")})),
+            Some(IpcAction::Search { text: at_limit })
+        );
+        let too_long = "a".repeat(SEARCH_MAX_CHARS + 1);
+        for (args, why) in [
+            (json!({"text":""}), "vazia"),
+            (json!({"text":" \n\t "}), "so com espacos"),
+            (json!({"text":too_long}), "longa demais"),
+            (json!({"text":"a\u{7}b"}), "com caracter de controlo"),
+            (json!({"text":"a\rb"}), "com retorno de carro"),
+            (json!({"text":"x","col":0}), "com campo a mais"),
+            (json!({}), "sem texto"),
+            (json!({"text":7}), "de tipo errado"),
+        ] {
+            assert_eq!(search(args), None, "aceitou uma pesquisa {why}");
+        }
+    }
+
     /// SPEC-0005 publica a lista fechada de acoes pagina->nativo. O texto
     /// publicado e lido tal como embarca no repositorio.
     const SPEC_0005: &str = include_str!("../../../docs/specs/SPEC-0005-webview.md");
@@ -715,7 +773,7 @@ mod tests {
     /// ou sai uma acao: o gate abaixo exige um exemplo aceite por acao e que
     /// a SPEC-0005 (lista e contagem), a SPEC-0108 (lista e contagem) e a
     /// SPEC-0015 (contagem) digam exatamente isto.
-    const PUBLISHED_ACTION_COUNT: usize = 30;
+    const PUBLISHED_ACTION_COUNT: usize = 31;
 
     /// Nome de fio de cada variante. O `match` e exaustivo de proposito: uma
     /// variante nova nao compila sem passar por aqui, e o teste abaixo exige
@@ -744,6 +802,7 @@ mod tests {
             IpcAction::Split { .. } => "split",
             IpcAction::Link { .. } => "link",
             IpcAction::Ask { .. } => "ask",
+            IpcAction::Search { .. } => "search",
             IpcAction::SplitClose => "split-close",
             IpcAction::SplitExpand => "split-expand",
             IpcAction::Palette { .. } => "palette",
@@ -822,6 +881,7 @@ mod tests {
                 json!({"col":0,"url":"https://example.com/","aside":false}),
             ),
             message("ask", json!({"col":1,"text":"capital da França"})),
+            message("search", json!({"text":"texto selecionado"})),
             message("shortcut-expand", json!({"col":1})),
             message("split-close", json!({})),
             message("split-expand", json!({})),
