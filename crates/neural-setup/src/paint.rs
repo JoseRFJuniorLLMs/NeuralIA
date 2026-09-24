@@ -513,7 +513,12 @@ fn scaled_brand(width: u32, height: u32) -> Arc<Vec<u8>> {
 /// como a seccao DIB o da): `arte + fundo * (1 - alfa)`. Onde a arte e
 /// transparente, o fundo fica exatamente como estava.
 fn compose_over(back: &mut [u8], art: &[u8]) {
-    for (dst, src) in back.chunks_exact_mut(4).zip(art.chunks_exact(4)) {
+    for (dst, src) in back
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(art.as_chunks::<4>().0)
+    {
         let keep = 255 - src[3] as u32;
         let over =
             |ink: u8, under: u8| (ink as u32 + (under as u32 * keep + 127) / 255).min(255) as u8;
@@ -715,7 +720,7 @@ mod tests {
     /// Um tecido que se reconhece pixel a pixel (BGR): um xadrez de duas
     /// cores que a marca nao tem.
     fn probe(x: u32, y: u32) -> [u8; 3] {
-        if (x / 5 + y / 5) % 2 == 0 {
+        if (x / 5 + y / 5).is_multiple_of(2) {
             [90, 30, 200]
         } else {
             [40, 160, 20]

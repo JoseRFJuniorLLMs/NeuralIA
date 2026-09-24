@@ -221,7 +221,7 @@ pub fn decode_bmp_entry(data: &[u8]) -> Option<RgbaImage> {
     let mut image = RgbaImage::new(w, h);
     for (row, line) in pixels.chunks_exact((w * 4) as usize).enumerate() {
         let y = h - 1 - row as u32;
-        for (x, p) in line.chunks_exact(4).enumerate() {
+        for (x, p) in line.as_chunks::<4>().0.iter().enumerate() {
             image.put_pixel(x as u32, y, Rgba([p[2], p[1], p[0], p[3]]));
         }
     }
