@@ -20,11 +20,20 @@ mod pdf_assets;
 // tambem no runner Linux. So o Windows o chama.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod tab_session;
+// O script da leitura em voz alta e os seus gates (node:vm) nao dependem do
+// Windows: correm tambem no CI Linux.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod read_aloud;
 // Gemini Live: origem propria, canal fechado e chave com DPAPI (Windows).
 #[cfg(target_os = "windows")]
 mod gemini_live;
 #[cfg(target_os = "windows")]
 mod windows_app;
+
+// Pomodoro da barra: so decisoes (clique, menu, `pomodoro:`, tique, opcoes em
+// disco), sem Win32 -- testavel em qualquer plataforma.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod pomodoro_ui;
 
 #[cfg(target_os = "windows")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -9,7 +9,7 @@ use std::{
     sync::{
         Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
-        mpsc::{SyncSender, sync_channel},
+        mpsc::{Sender, SyncSender, channel, sync_channel},
     },
     thread,
     time::{Duration, Instant},
@@ -33,14 +33,22 @@ use crate::panel_chrome::{
     panel_handle_area, panel_width, panel_width_from_drag, strip_buttons, strip_hit,
     wheel_message_params, wheel_route,
 };
+use crate::pomodoro_ui::{
+    POMODORO_COMMAND_HELP, PomodoroCommand, PomodoroController, PomodoroHost, PomodoroMenuItem,
+    TickSchedule, TickScheduler, WindowAttention, parse_pomodoro_command, phase_color,
+    pomodoro_menu_command,
+};
+use crate::read_aloud::READ_ALOUD_SCRIPT;
 use crate::tab_session::{self, Loaded, SessionColumn, SessionGroup, SessionTab, TabSession};
 use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentRuntimeConfig,
     AgentSecurityAction, CoreConfig, FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent,
-    MemoryDocument, MemoryHit, MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore,
-    ObservedPage, ReaderArticle, ReaderBlock, ReaderClient, ResearchItemKind, ResearchSession,
-    chatgpt_search_url, claude_search_url, google_ai_url, is_local_network_target, is_pdf_url,
-    parse_intent, reader_html, redact_sensitive_text, tissue,
+    MemoryDocument, MemoryHit, MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore, Note,
+    ObservedPage, Phase, ReaderArticle, ReaderBlock, ReaderClient, ResearchItemKind,
+    ResearchSession, ZettelError, ZettelStore, chatgpt_search_url, claude_search_url,
+    google_ai_url, is_local_network_target, is_pdf_url, parse_intent, reader_html,
+    redact_sensitive_text, tissue,
+    zettel::{self, is_valid_note_id},
 };
 use url::Url;
 use windows_sys::Win32::{
@@ -90,6 +98,8 @@ use wry::{
     http::{Request, Response as HttpResponse},
 };
 
+use side_panel::PanelExit;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PageTarget {
     Column(usize),
@@ -100,8 +110,27 @@ enum PageTarget {
 enum UserEvent {
     /// Escolha de tema feita no menu do botao Home.
     ThemeChosen(ThemeChoice),
-    /// Pedido da pagina local do painel lateral (canal proprio).
-    Panel(PanelMessage),
+    /// Pedido da pagina local do painel lateral (canal proprio), com o
+    /// numero da pagina que o mandou.
+    Panel(side_panel::PanelPost),
+    /// Resposta do worker das notas.
+    NotesReady {
+        origin: NotesOrigin,
+        reply: NotesReply,
+    },
+    /// Ctrl+Shift+Z numa pagina: ler a selecao DESSA WebView. `None` e a
+    /// WebView unica da web externa, do Leitor e do PDF.
+    NoteRequested(Option<PageTarget>),
+    /// Ctrl+Shift+Z no Split privado: recusado sem ler a pagina.
+    NoteRefusedPrivate,
+    /// O que a pagina devolveu ao `NOTE_CAPTURE_SCRIPT` (JSON, dado dela) e
+    /// a fonte que o lado nativo conhece (o artigo do Leitor, o PDF).
+    NoteCaptured {
+        raw: String,
+        source: Option<String>,
+    },
+    /// Ctrl+Shift+Z na Home ou com o teclado na barra: nota nova em branco.
+    NewNote,
     /// Pedido da pagina do painel do Gemini Live (canal proprio, lista
     /// fechada em `gemini_live::parse_live_message`).
     Live(LiveMessage),
@@ -129,6 +158,9 @@ enum UserEvent {
     ViewSource,
     ViewSourceTarget(PageTarget),
     AutoScrollTick(u64),
+    /// Tique do Pomodoro; so conta o da cadeia viva
+    /// (`PomodoroController::tick`).
+    PomodoroTick(u64),
     HideSplash(u64),
     GmailProbe(u64),
     GmailInboxState {
@@ -322,6 +354,12 @@ const PALETTE_HINT_TOP: f64 = 48.0;
 const PALETTE_TOP_RATIO: f64 = 0.18;
 const SPLASH_WIDTH: f64 = 470.0;
 const SPLASH_HEIGHT: f64 = 46.0;
+/// Quanto ficam no ecra os avisos do Pomodoro: os dos comandos, e os do fim
+/// de uma fase (mais tempo: quem estava concentrado pode nao estar a olhar).
+const POMODORO_NOTICE_SECONDS: u64 = 3;
+const POMODORO_PHASE_END_SECONDS: u64 = 8;
+/// A ajuda do `tema:` com uma palavra desconhecida (omnibox e palette).
+const THEME_COMMAND_HELP: &str = "Use tema:sistema, tema:claro ou tema:escuro.";
 const GMAIL_TOAST_WIDTH: f64 = 390.0;
 const GMAIL_TOAST_HEIGHT: f64 = 68.0;
 
@@ -465,6 +503,8 @@ enum BarHit {
     /// Icones do canto direito: servicos no painel e avisos do Gmail.
     Service(Service),
     GmailToggle,
+    /// Ferramentas (Pomodoro, Notas, Respiracao), a esquerda do Gemini Live.
+    Tool(Tool),
     /// O olho: liga e desliga o Gemini Live (tela, camera e microfone).
     GeminiLive,
     WindowMinimize,
@@ -515,6 +555,222 @@ fn bar_menu_for(hit: Option<BarHit>) -> Option<BarMenu> {
     }
 }
 
+/// As ferramentas da barra e da Home, na ordem em que aparecem (da esquerda
+/// para a direita): pedidas pelo dono como botoes, ao lado dos servicos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    Pomodoro,
+    /// Zettelkasten: as notas vivem no painel do Ctrl+H.
+    Notes,
+    /// Respiracao guiada (metodo Wim Hof): o video no painel anonimo.
+    Breath,
+}
+
+impl Tool {
+    const ALL: [Tool; 3] = [Tool::Pomodoro, Tool::Notes, Tool::Breath];
+
+    fn icon_slot(self) -> usize {
+        match self {
+            Self::Pomodoro => ICON_SLOT_POMODORO,
+            Self::Notes => ICON_SLOT_NOTES,
+            Self::Breath => ICON_SLOT_BREATH,
+        }
+    }
+
+    /// O tomate tem cor propria; as outras duas marcas sao brancas e seguem
+    /// o tema, como a videochamada e o envelope.
+    fn icon_tint(self, theme: &Theme) -> Option<Rgb> {
+        match self {
+            Self::Pomodoro => None,
+            Self::Notes | Self::Breath => Some(theme.fg),
+        }
+    }
+
+    /// A dica: o que o clique FAZ, como as outras dicas da barra.
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::Pomodoro => {
+                "Pomodoro: foco e pausas (clique inicia/pausa; botão direito: opções)"
+            }
+            Self::Notes => "Notas (Zettelkasten) — Ctrl+Shift+Z cria nota da seleção",
+            Self::Breath => "Respiração guiada — método Wim Hof (vídeo em modo anônimo)",
+        }
+    }
+}
+
+/// A dica de uma ferramenta, na barra e na Home. A do Pomodoro, com uma
+/// sessao em curso, diz a fase, o que falta e os focos feitos
+/// (`PomodoroController::hint`); parado, e nas outras duas, a fixa.
+fn tool_hint(tool: Tool, pomodoro: Option<&str>) -> String {
+    match (tool, pomodoro) {
+        (Tool::Pomodoro, Some(session)) => session.to_string(),
+        _ => tool.tooltip().to_string(),
+    }
+}
+
+/// A dica de uma ferramenta em `now`, com o Pomodoro da app: e o que a Home
+/// (`update_home_tool_hover`), a barra (`bar_hint`) e o refresco de cada
+/// segundo (`pomodoro_changed`) mostram.
+fn tool_hint_at(tool: Tool, pomodoro: &PomodoroController, now: Instant) -> String {
+    let session = match tool {
+        Tool::Pomodoro => pomodoro.hint(now),
+        Tool::Notes | Tool::Breath => None,
+    };
+    tool_hint(tool, session.as_deref())
+}
+
+/// A dica de um alvo da barra, como `App::bar_tooltip_text` a mostra: as
+/// ferramentas pela `tool_hint_at` (a do Pomodoro diz a sessao), o resto
+/// pela `bar_tooltip_label`.
+fn bar_hint(
+    hit: BarHit,
+    pomodoro: &PomodoroController,
+    now: Instant,
+    provider: &str,
+    maximized: bool,
+    tab_url: Option<&str>,
+    group: Option<(&str, bool)>,
+) -> Option<String> {
+    if let BarHit::Tool(tool) = hit {
+        return Some(tool_hint_at(tool, pomodoro, now));
+    }
+    bar_tooltip_label(hit, provider, maximized, tab_url, group)
+}
+
+/// Cor do tempo e do contorno do botao do Pomodoro: a da fase
+/// (`phase_color`: tomate no foco, verde nas pausas) acertada ao fundo do
+/// botao para ler bem nos dois temas; sem sessao, a letra de sempre.
+fn tool_label_color(phase: Option<Phase>, fill: Rgb, theme: &Theme) -> Rgb {
+    match phase {
+        Some(phase) => readable(phase_color(phase), fill, 4.5),
+        None => theme.fg,
+    }
+}
+
+/// Botao do rato que carregou numa ferramenta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolClick {
+    Left,
+    Right,
+}
+
+/// O que um clique numa ferramenta faz -- na barra ou na Home, e o mesmo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolAction {
+    /// Inicia, pausa ou retoma o Pomodoro (`App::pomodoro_click`).
+    PomodoroClick,
+    /// Menu de opcoes do Pomodoro (`App::pomodoro_menu`).
+    PomodoroMenu,
+    /// Abre o painel do Ctrl+H nas notas; aberto, fecha-o.
+    ToggleNotes,
+    /// Abre o video da respiracao no painel anonimo; aberto, fecha-o.
+    ToggleBreath,
+}
+
+/// A unica tabela clique -> accao das ferramentas. O botao direito so faz
+/// alguma coisa no Pomodoro: nas outras duas nao ha menu, e um clique direito
+/// perdido nao pode abrir nem fechar paineis.
+fn tool_action(tool: Tool, click: ToolClick) -> Option<ToolAction> {
+    match (tool, click) {
+        (Tool::Pomodoro, ToolClick::Left) => Some(ToolAction::PomodoroClick),
+        (Tool::Pomodoro, ToolClick::Right) => Some(ToolAction::PomodoroMenu),
+        (Tool::Notes, ToolClick::Left) => Some(ToolAction::ToggleNotes),
+        (Tool::Breath, ToolClick::Left) => Some(ToolAction::ToggleBreath),
+        (Tool::Notes | Tool::Breath, ToolClick::Right) => None,
+    }
+}
+
+/// Clique na barra do comparador: so os botoes das ferramentas dao uma
+/// `ToolAction`; o resto da barra segue o caminho que ja tinha.
+fn bar_tool_action(hit: Option<BarHit>, click: ToolClick) -> Option<ToolAction> {
+    match hit {
+        Some(BarHit::Tool(tool)) => tool_action(tool, click),
+        _ => None,
+    }
+}
+
+/// Etiqueta curta ao lado do icone do Pomodoro ("mm:ss"). Tamanho fixo e
+/// `Copy` para poder andar dentro de `BarColumns`: desenho e hit-testing leem
+/// a MESMA etiqueta, e por isso a mesma largura. Leva tambem a fase da
+/// sessao, que so o desenho usa (a cor do tempo); a largura nao depende dela.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BarLabel {
+    bytes: [u8; BAR_LABEL_MAX_BYTES],
+    len: u8,
+    phase: Option<Phase>,
+}
+
+const BAR_LABEL_MAX_BYTES: usize = 16;
+/// Largura reservada por caractere e margem da etiqueta, em pixeis logicos a
+/// letra de 13 px da barra. Reserva-se por caractere e nao pelo texto medido:
+/// "11:11" e "00:00" ocupam o mesmo, e a barra nao treme a cada segundo.
+const BAR_LABEL_CHAR_WIDTH: f64 = 7.5;
+const BAR_LABEL_PADDING: f64 = 8.0;
+
+impl BarLabel {
+    /// `None` para texto vazio. Texto comprido e cortado numa fronteira de
+    /// caractere, nunca a meio de um.
+    fn new(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        let mut end = text.len().min(BAR_LABEL_MAX_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut bytes = [0u8; BAR_LABEL_MAX_BYTES];
+        bytes[..end].copy_from_slice(&text.as_bytes()[..end]);
+        Some(Self {
+            bytes,
+            len: end as u8,
+            phase: None,
+        })
+    }
+
+    /// A mesma etiqueta, pintada na cor de `phase` (`tool_label_color`).
+    fn with_phase(self, phase: Option<Phase>) -> Self {
+        Self { phase, ..self }
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("")
+    }
+
+    /// Quanto o botao alarga para a etiqueta, em pixeis logicos.
+    fn width(&self) -> f64 {
+        self.as_str().chars().count() as f64 * BAR_LABEL_CHAR_WIDTH + BAR_LABEL_PADDING
+    }
+}
+
+impl std::fmt::Debug for BarLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BarLabel({:?})", self.as_str())
+    }
+}
+
+/// Os tres botoes das ferramentas, encostados a `right`: Respiracao na ponta,
+/// Notas antes e o Pomodoro por ultimo -- e so ele alarga para a esquerda
+/// com a etiqueta, para os outros dois nao saltarem quando ela aparece.
+fn tool_button_row(right: f64, y: f64, size: f64, gap: f64, label_width: f64) -> [UiRect; 3] {
+    let breath = UiRect {
+        x: right - size,
+        y,
+        width: size,
+        height: size,
+    };
+    let notes = UiRect {
+        x: breath.x - gap - size,
+        ..breath
+    };
+    let pomodoro = UiRect {
+        x: notes.x - gap - size - label_width,
+        width: size + label_width,
+        ..breath
+    };
+    [pomodoro, notes, breath]
+}
+
 /// O estado do comparador de que a barra precisa. Anda sempre junto -- quem
 /// arrasta um divisor muda os pesos, quem minimiza muda as duas coisas -- e
 /// agrupa-lo evita que a barra receba uma parte e esqueca a outra, que era
@@ -529,6 +785,8 @@ struct BarColumns {
     split_active: bool,
     /// Largura logica do painel lateral a direita; as colunas ficam antes dele.
     panel_width: f64,
+    /// Tempo que falta no Pomodoro, ao lado do icone dele; alarga o botao.
+    pomodoro_label: Option<BarLabel>,
 }
 
 impl BarColumns {
@@ -541,6 +799,7 @@ impl BarColumns {
             minimized: [false; COMPARATOR_COLUMNS],
             split_active: false,
             panel_width: 0.0,
+            pomodoro_label: None,
         }
     }
 }
@@ -743,7 +1002,12 @@ impl BarLayout {
         } else {
             hidden.len() as f64 * chip_w + chip_gap * hidden.len().saturating_sub(1) as f64
         };
-        let controls = right_controls(client_width, scale, columns.split_active);
+        let controls = right_controls(
+            client_width,
+            scale,
+            columns.split_active,
+            columns.pomodoro_label,
+        );
         let controls_left = controls.leftmost();
         let (back, forward) = controls.split_nav.unwrap_or((empty, empty));
         let reserved = if hidden.is_empty() {
@@ -825,9 +1089,14 @@ impl BarLayout {
             }
         }
 
-        // Linha superior: todas as fontes/abas, antes dos controles da janela.
+        // Linha superior: todas as fontes/abas, antes das ferramentas e dos
+        // controles da janela. A etiqueta do Pomodoro ja vai reservada: as
+        // abas nao mexem quando ele arranca.
         let tabs_left = 90.0 * scale;
-        let tabs_right = (window_minimize.x - 8.0 * scale).max(tabs_left);
+        let tabs_right = (title_tools_left(client_width, scale, columns.pomodoro_label)
+            - 8.0 * scale)
+            .min(window_minimize.x - 8.0 * scale)
+            .max(tabs_left);
         let visible_rows = &rows[..columns_len];
         let total_slots: usize = visible_rows.iter().map(|row| row.len).sum();
         let mut overflow = [empty; COMPARATOR_COLUMNS];
@@ -1291,22 +1560,84 @@ struct RightControls {
     private: UiRect,
     /// Videochamada, WhatsApp, YouTube e Gmail, a esquerda do Privado.
     services: [UiRect; 4],
-    /// Gemini Live, a esquerda dos servicos: o primeiro dos controlos.
+    /// Gemini Live, logo a esquerda dos servicos: o inicio do canto.
     live: UiRect,
+    /// Pomodoro, Notas e Respiracao (ordem de `Tool::ALL`) na linha de CIMA,
+    /// antes dos botoes da janela -- o mesmo sitio da Home
+    /// (`home_tool_buttons`). Na segunda linha tiravam a largura toda a
+    /// ultima coluna: a 1280 px a terceira IA ficava sem pilula, sem ‹ › e,
+    /// com o Pomodoro a correr, sem "+". O do Pomodoro alarga com o tempo.
+    tools: [UiRect; 3],
     /// Rotulo, expandir e fechar da gaveta; `None` quando nao ha gaveta.
     split: Option<(UiRect, UiRect, UiRect)>,
     /// ‹ e › da fonte da gaveta, a esquerda do rotulo.
     split_nav: Option<(UiRect, UiRect)>,
 }
 
+/// Onde acaba o botao Home da segunda linha (7 + 72 px) mais a folga de 8:
+/// os controlos da direita nunca descem daqui.
+const RIGHT_CONTROLS_MIN_LEFT: f64 = 87.0;
+/// Rotulo da gaveta ("Fonte · ChatGPT") inteiro, e o minimo que ainda se le.
+const SPLIT_LABEL_WIDTH: f64 = 150.0;
+const SPLIT_LABEL_MIN_WIDTH: f64 = 60.0;
+
+/// Quanto cede, numa janela estreita, o rotulo da gaveta (so informa):
+/// encolhe ate desaparecer abaixo do minimo. Em pixeis logicos; `room` e o
+/// que sobra depois dos botoes.
+fn split_label_width(room: f64, split_active: bool) -> f64 {
+    if !split_active {
+        return 0.0;
+    }
+    let fits = room.min(SPLIT_LABEL_WIDTH);
+    if fits >= SPLIT_LABEL_MIN_WIDTH {
+        fits
+    } else {
+        0.0
+    }
+}
+
+/// A etiqueta mais larga que o Pomodoro mostra ("⏸ mm:ss"). As abas da
+/// linha de cima param antes dela sempre, com ou sem sessao: arrancar ou
+/// pausar um Pomodoro nao mexe em nenhuma aba.
+const POMODORO_LABEL_RESERVE: &str = "⏸ 00:00";
+
+/// Onde comecam as ferramentas na linha de cima, com a etiqueta do Pomodoro
+/// ja reservada: as abas acabam antes disto.
+fn title_tools_left(client_width: f64, scale: f64, pomodoro_label: Option<BarLabel>) -> f64 {
+    let reserved = home_tool_buttons(client_width, scale, BarLabel::new(POMODORO_LABEL_RESERVE));
+    let actual = home_tool_buttons(client_width, scale, pomodoro_label);
+    reserved[0].x.min(actual[0].x)
+}
+
 /// Geometria dos controlos encostados a direita. A mesma conta estava escrita
 /// tres vezes -- no desenho, no hit-testing e agora nos chips -- e as copias
 /// ja tinham comecado a divergir; aqui ela e uma so.
-fn right_controls(client_width: f64, scale: f64, split_active: bool) -> RightControls {
+fn right_controls(
+    client_width: f64,
+    scale: f64,
+    split_active: bool,
+    pomodoro_label: Option<BarLabel>,
+) -> RightControls {
     let margin = 8.0 * scale;
     let row_y = (TITLE_TAB_HEIGHT + 7.0) * scale;
     let row_h = 30.0 * scale;
     let gap = 5.0 * scale;
+    // Botoes redondos so com icone, como no Chrome.
+    let icon = row_h;
+    let icon_gap = 4.0 * scale;
+
+    // Tudo o que tem largura fixa, em pixeis logicos: a gaveta sem o rotulo
+    // (fechar, expandir, ‹ e › e as folgas), o Privado, os quatro servicos e
+    // o Gemini Live. O resto e do rotulo da gaveta.
+    let logical = |value: f64| value / scale;
+    let split_fixed = if split_active {
+        30.0 + 5.0 + 30.0 + 5.0 + 6.0 + 26.0 + 4.0 + 26.0 + 6.0
+    } else {
+        0.0
+    };
+    let icons = logical(icon) * 6.0 + logical(icon_gap) * 5.0;
+    let room = logical(client_width) - 8.0 - split_fixed - icons - RIGHT_CONTROLS_MIN_LEFT;
+    let split_label_w = split_label_width(room, split_active);
 
     let split = split_active.then(|| {
         let close = UiRect {
@@ -1322,9 +1653,9 @@ fn right_controls(client_width: f64, scale: f64, split_active: bool) -> RightCon
             height: row_h,
         };
         let label = UiRect {
-            x: expand.x - gap - 150.0 * scale,
+            x: expand.x - gap - split_label_w * scale,
             y: row_y,
-            width: 150.0 * scale,
+            width: split_label_w * scale,
             height: row_h,
         };
         (label, expand, close)
@@ -1348,10 +1679,8 @@ fn right_controls(client_width: f64, scale: f64, split_active: bool) -> RightCon
         Some((back, _)) => back.x - 6.0 * scale,
         None => client_width - margin,
     };
-    // Botoes redondos so com icone, como no Chrome: Privado a direita e, a
-    // esquerda dele, videochamada, WhatsApp, YouTube e Gmail.
-    let icon = row_h;
-    let icon_gap = 4.0 * scale;
+    // Privado a direita e, a esquerda dele, videochamada, WhatsApp, YouTube,
+    // Gmail e o Gemini Live. As ferramentas ficam na linha de cima.
     let private = UiRect {
         x: right - icon,
         y: row_y,
@@ -1370,18 +1699,21 @@ fn right_controls(client_width: f64, scale: f64, split_active: bool) -> RightCon
         width: icon,
         height: icon,
     };
+    let tools = home_tool_buttons(client_width, scale, pomodoro_label);
 
     RightControls {
         private,
         services,
         live,
+        tools,
         split,
         split_nav,
     }
 }
 
 impl RightControls {
-    /// Onde comecam os controlos da direita: o resto da barra acaba aqui.
+    /// Onde comecam os controlos da direita na segunda linha: as colunas
+    /// acabam aqui. As ferramentas, na linha de cima, nao contam.
     fn leftmost(&self) -> f64 {
         self.live.x
     }
@@ -1395,7 +1727,31 @@ const SERVICE_BUTTON_HITS: [BarHit; 4] = [
     BarHit::GmailToggle,
 ];
 
+/// O botao da barra que abre `service`: um dos icones dos servicos ou, para
+/// a Respiracao (uma ferramenta), o botao dela na linha do titulo. E nele que
+/// o painel minimizado poe o ponto (`draw_service_chrome`).
+fn service_icon_rect(controls: RightControls, service: Service) -> Option<UiRect> {
+    if service == Service::Breath {
+        return Tool::ALL
+            .iter()
+            .zip(controls.tools)
+            .find(|(tool, _)| **tool == Tool::Breath)
+            .map(|(_, rect)| rect);
+    }
+    controls
+        .services
+        .iter()
+        .zip(SERVICE_BUTTON_HITS)
+        .find(|(_, hit)| *hit == BarHit::Service(service))
+        .map(|(rect, _)| *rect)
+}
+
 fn right_controls_hit(controls: RightControls, x: f64, y: f64) -> Option<BarHit> {
+    for (rect, tool) in controls.tools.iter().zip(Tool::ALL) {
+        if rect.contains(x, y) {
+            return Some(BarHit::Tool(tool));
+        }
+    }
     if controls.live.contains(x, y) {
         return Some(BarHit::GeminiLive);
     }
@@ -1418,13 +1774,35 @@ fn right_controls_hit(controls: RightControls, x: f64, y: f64) -> Option<BarHit>
     None
 }
 
-struct ComparatorView {
-    webview: WebView,
+/// O alvo da barra num ponto: os controlos da direita primeiro, depois o
+/// resto. E o que `App::comparator_bar_hit` usa para o clique esquerdo, o
+/// direito e a dica -- os tres veem o mesmo botao.
+fn bar_hit_at(
+    controls: Option<RightControls>,
+    layout: Option<BarLayout>,
+    x: f64,
+    y: f64,
+) -> Option<BarHit> {
+    if let Some(controls) = controls
+        && let Some(hit) = right_controls_hit(controls, x, y)
+    {
+        return Some(hit);
+    }
+    layout.and_then(|layout| layout.hit(x, y))
+}
+
+/// Uma coluna do comparador. Generica na vista para os gates correrem sem
+/// WebView (`note_read_view`); no app e a `WebView`.
+struct ComparatorView<V = WebView> {
+    webview: V,
     name: &'static str,
 }
 
-struct SplitView {
-    webview: WebView,
+/// A fonte aberta ao lado (Split). Generica na vista como a
+/// `ComparatorView`: quem decide se um Split privado pode ser lido recebe o
+/// Split inteiro, com o `private` dele, e nao um booleano copiado a parte.
+struct SplitView<V = WebView> {
+    webview: V,
     source_index: usize,
     /// Identidade da aba que originou este Split. URL nao e identidade:
     /// a mesma fonte pode existir em dois grupos diferentes.
@@ -3152,7 +3530,11 @@ struct PaletteHost {
 
 /// O que a barra precisa de saber sobre o comparador, tirado do proprio
 /// estado. Desenho e hit-testing chamam isto -- nunca montam o seu proprio.
-fn bar_columns(comp: &ComparatorState) -> BarColumns {
+///
+/// A etiqueta do Pomodoro nao e estado do comparador, mas muda a largura dos
+/// controlos da direita; entra aqui para desenho e hit-testing a receberem
+/// pelo mesmo caminho (ver `App::pomodoro_bar_label`).
+fn bar_columns(comp: &ComparatorState, pomodoro_label: Option<BarLabel>) -> BarColumns {
     // Em ecra completo ou com a gaveta aberta o conteudo ja nao esta em
     // faixas por peso, por isso a barra tambem nao finge que esta: reparte-se
     // em partes iguais e nenhuma coluna vira chip.
@@ -3160,6 +3542,7 @@ fn bar_columns(comp: &ComparatorState) -> BarColumns {
         return BarColumns {
             split_active: comp.split.is_some(),
             panel_width: comp.panel_width,
+            pomodoro_label,
             ..BarColumns::even(comp.views.len())
         };
     }
@@ -3169,6 +3552,7 @@ fn bar_columns(comp: &ComparatorState) -> BarColumns {
         minimized: comp.minimized,
         split_active: false,
         panel_width: comp.panel_width,
+        pomodoro_label,
     }
 }
 
@@ -4106,6 +4490,108 @@ fn splash_origin(client_w: i32, client_h: i32, width: i32, height: i32) -> (i32,
     )
 }
 
+/// Quem pede o popup do meio da janela.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplashKind {
+    /// Resposta a um gesto (zoom, "Nota criada", "Pomodoro iniciado"...):
+    /// aparece ja. Com a pergunta da rolagem a vista, tira-a SEM lhe
+    /// responder -- ela volta a ser feita na proxima leitura.
+    Notice,
+    /// Aviso que chega sozinho (o fim de uma fase do Pomodoro): com a
+    /// pergunta a vista, espera que ela saia.
+    Background,
+    /// "Rolar a pagina sozinho...?" com Sim e Nao.
+    Question,
+}
+
+/// O que o popup passa a mostrar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplashFrame {
+    text: String,
+    /// Com os botoes Sim e Nao (`SPLASH_ASKS`).
+    asks: bool,
+    seconds: u64,
+    /// O `HideSplash` deste quadro.
+    token: u64,
+}
+
+/// O fim de um quadro.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SplashHide {
+    /// Temporizador de um quadro que ja foi substituido.
+    Stale,
+    Hide {
+        /// A pergunta saiu sozinha, sem resposta: "nao" ate ao F8.
+        question_expired: bool,
+        /// O aviso que esperava pela pergunta, a mostrar agora.
+        next: Option<SplashFrame>,
+    },
+}
+
+/// O aviso e a pergunta da rolagem partilham UM popup. Antes, um aviso que
+/// chegasse durante a pergunta (um fim de fase do Pomodoro, "Nota criada")
+/// herdava o Sim/Nao -- um clique em "Sim" ligava a rolagem com o texto do
+/// Pomodoro no ecra -- e o temporizador DELE apagava a pergunta como se ela
+/// tivesse sido respondida "nao" para o resto da sessao. Aqui so a pergunta
+/// tem botoes, e so o fim do quadro dela conta como resposta.
+#[derive(Debug, Default)]
+struct SplashBoard {
+    token: u64,
+    /// Token da pergunta, enquanto e ela que esta a vista.
+    question: Option<u64>,
+    /// Um aviso de fundo que chegou com a pergunta a vista (so o ultimo).
+    waiting: Option<(String, u64)>,
+}
+
+impl SplashBoard {
+    /// `None`: fica a espera da pergunta (`SplashKind::Background`).
+    fn show(&mut self, text: String, seconds: u64, kind: SplashKind) -> Option<SplashFrame> {
+        if kind == SplashKind::Background && self.question.is_some() {
+            self.waiting = Some((text, seconds));
+            return None;
+        }
+        Some(self.frame(text, seconds, kind == SplashKind::Question))
+    }
+
+    fn frame(&mut self, text: String, seconds: u64, asks: bool) -> SplashFrame {
+        self.token = self.token.wrapping_add(1);
+        self.question = asks.then_some(self.token);
+        SplashFrame {
+            text,
+            asks,
+            seconds,
+            token: self.token,
+        }
+    }
+
+    /// O `HideSplash(token)` chegou.
+    fn hide(&mut self, token: u64) -> SplashHide {
+        if token != self.token {
+            return SplashHide::Stale;
+        }
+        let question_expired = self.question.take() == Some(token);
+        let next = self
+            .waiting
+            .take()
+            .map(|(text, seconds)| self.frame(text, seconds, false));
+        SplashHide::Hide {
+            question_expired,
+            next,
+        }
+    }
+
+    /// A pergunta foi respondida (Sim, Nao ou F8): deixa de ser a pergunta.
+    /// O quadro fica ate `hide` ou ate outro o substituir.
+    fn answered(&mut self) {
+        self.question = None;
+    }
+
+    /// O quadro a vista, para o esconder ja.
+    fn current(&self) -> u64 {
+        self.token
+    }
+}
+
 // Painel lateral (Ctrl+H): historico inteligente -- busca semantica, sugestoes
 // de sites e os recentes. E uma WebView LOCAL com canal IPC proprio: so esta
 // WebView fala por `parse_panel_message`, e ela so carrega o HTML abaixo
@@ -4119,6 +4605,40 @@ enum PanelMessage {
     Search(String),
     Open(String),
     Close,
+    /// Notas: todas, pela ordem de atualizacao.
+    NotesList,
+    /// Notas com todos os termos (`ZettelStore::search`).
+    NotesSearch(String),
+    /// Abrir no editor; o id ja foi validado.
+    NoteOpen(String),
+    NoteSave(NoteEdit),
+    /// Um `note-save` que o parser recusou (id invalido, campos a mais,
+    /// acima dos tectos): o painel recebe um "failed" em vez de silencio --
+    /// senao ficava em "A salvar…" para sempre e a nota nova nunca mais se
+    /// salvava.
+    NoteSaveRefused,
+    /// O que o editor tem por salvar (`None`: nada). O lado nativo guarda a
+    /// copia e grava-a se o painel fechar por fora -- botao Notas, Ctrl+H,
+    /// outro painel, Home, uma pesquisa nova, fechar a janela --, porque ai
+    /// a pagina ja nao corre (`take_note_draft_on_close`).
+    NoteDraft(Option<NoteEdit>),
+    /// Mover para `.trash`; o id ja foi validado.
+    NoteDelete(String),
+}
+
+/// O que o editor do painel manda gravar. `id: None` e uma nota nova; um id
+/// que chega aqui ja passou por `is_valid_note_id` -- nunca vira caminho sem
+/// isso. A fonte nao vem do painel: fica a que a nota ja tinha.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NoteEdit {
+    id: Option<String>,
+    title: String,
+    body: String,
+    tags: Vec<String>,
+    /// A revisao da nota que o editor abriu (`note_rev`): se o ficheiro ja
+    /// nao e esse -- outra janela do NeuralIA ou o Obsidian gravaram por
+    /// cima --, o salvar vai para uma copia em vez de esmagar o outro.
+    rev: Option<String>,
 }
 
 const PANEL_MESSAGE_MAX_BYTES: usize = 4 * 1024;
@@ -4127,22 +4647,478 @@ const PANEL_INPUT_MAX_CHARS: usize = 2048;
 /// Quantos recentes e quantas sugestoes o painel mostra.
 const PANEL_RECENT_LIMIT: usize = 30;
 const PANEL_SUGGESTION_LIMIT: usize = 6;
+const NOTE_TITLE_MAX_CHARS: usize = 300;
+/// Tecto do corpo de uma nota, em bytes UTF-8 (o que vai para o disco).
+const NOTE_BODY_MAX_BYTES: usize = 200 * 1024;
+const NOTE_TAGS_MAX: usize = 20;
+const NOTE_TAG_MAX_CHARS: usize = 60;
+/// O UNICO pedido do painel que pode passar dos 4 KiB: `note-save`, porque
+/// leva o corpo da nota. O `JSON.stringify` do painel escreve cada byte, no
+/// pior caso, como `\u00XX` (6 bytes): o tecto cobre um corpo, um titulo e
+/// as tags no maximo com esse pior caso, e mais o envelope.
+const NOTE_SAVE_MESSAGE_MAX_BYTES: usize = 6
+    * (NOTE_BODY_MAX_BYTES + 4 * (NOTE_TITLE_MAX_CHARS + NOTE_TAGS_MAX * NOTE_TAG_MAX_CHARS))
+    + 1024;
 
 fn parse_panel_message(body: &str) -> Option<PanelMessage> {
-    if body.len() > PANEL_MESSAGE_MAX_BYTES {
+    if body.len() > NOTE_SAVE_MESSAGE_MAX_BYTES {
         return None;
     }
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let action = value.get("action")?.as_str()?;
+    // Todos os outros pedidos continuam presos aos 4 KiB.
+    if body.len() > PANEL_MESSAGE_MAX_BYTES && !matches!(action, "note-save" | "note-draft") {
+        return None;
+    }
     let text = |key: &str, max: usize| -> Option<String> {
         let text = value.get("args")?.get(key)?.as_str()?.trim();
         (!text.is_empty() && text.chars().count() <= max).then(|| text.to_string())
     };
-    match value.get("action")?.as_str()? {
+    // `{"id": "<id valido>"}` e mais nada: um `../x` ou `C:\x` nunca chega ao
+    // disco, nem sequer ao worker das notas.
+    let note_id = || -> Option<String> {
+        let args = value.get("args")?.as_object()?;
+        if args.len() != 1 {
+            return None;
+        }
+        let id = args.get("id")?.as_str()?;
+        is_valid_note_id(id).then(|| id.to_string())
+    };
+    match action {
         "ready" => Some(PanelMessage::Ready),
         "close" => Some(PanelMessage::Close),
         "search" => text("query", PANEL_QUERY_MAX_CHARS).map(PanelMessage::Search),
         "open" => text("input", PANEL_INPUT_MAX_CHARS).map(PanelMessage::Open),
+        "notes-list" => Some(PanelMessage::NotesList),
+        "notes-search" => text("query", PANEL_QUERY_MAX_CHARS).map(PanelMessage::NotesSearch),
+        "note-open" => note_id().map(PanelMessage::NoteOpen),
+        "note-delete" => note_id().map(PanelMessage::NoteDelete),
+        // Um note-save recusado responde "failed" (`NoteSaveRefused`); o
+        // resto do que o parser recusa continua a morrer aqui.
+        "note-save" => Some(
+            value
+                .get("args")
+                .and_then(parse_note_edit)
+                .map_or(PanelMessage::NoteSaveRefused, PanelMessage::NoteSave),
+        ),
+        "note-draft" => {
+            let args = value.get("args")?;
+            if args.as_object()?.is_empty() {
+                Some(PanelMessage::NoteDraft(None))
+            } else {
+                parse_note_edit(args).map(|edit| PanelMessage::NoteDraft(Some(edit)))
+            }
+        }
         _ => None,
+    }
+}
+
+/// Uma linha para o titulo e as tags: cada controlo (o TAB de uma celula de
+/// tabela colada, uma quebra de linha, o titulo de uma nota que o Obsidian
+/// gravou com TAB) vira um espaco. Antes era recusado, e o note-save morria
+/// em silencio.
+fn note_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// `{"id": null | "<id>", "title", "body", "tags": [..]}` e, opcional,
+/// `"rev": null | "<16 hex>"` -- e mais nada.
+fn parse_note_edit(args: &serde_json::Value) -> Option<NoteEdit> {
+    let args = args.as_object()?;
+    let rev = match args.get("rev") {
+        None => None,
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(rev)) if is_note_rev(rev) => Some(rev.clone()),
+        Some(_) => return None,
+    };
+    if args.len() != 4 + usize::from(args.contains_key("rev")) {
+        return None;
+    }
+    let id = match args.get("id")? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(id) if is_valid_note_id(id) => Some(id.clone()),
+        _ => return None,
+    };
+    let title = note_line(args.get("title")?.as_str()?);
+    if title.chars().count() > NOTE_TITLE_MAX_CHARS {
+        return None;
+    }
+    let body = args.get("body")?.as_str()?;
+    if body.len() > NOTE_BODY_MAX_BYTES {
+        return None;
+    }
+    let raw_tags = args.get("tags")?.as_array()?;
+    if raw_tags.len() > NOTE_TAGS_MAX {
+        return None;
+    }
+    let mut tags = Vec::with_capacity(raw_tags.len());
+    for tag in raw_tags {
+        let tag = note_line(tag.as_str()?);
+        if tag.chars().count() > NOTE_TAG_MAX_CHARS {
+            return None;
+        }
+        if !tag.is_empty() {
+            tags.push(tag);
+        }
+    }
+    Some(NoteEdit {
+        id,
+        title,
+        body: body.to_string(),
+        tags,
+        rev,
+    })
+}
+
+/// A revisao de uma nota: FNV-1a de 64 bits do Markdown que ela e no disco.
+/// Muda com qualquer mudanca de titulo, corpo, tags, fonte, datas ou das
+/// propriedades que o Obsidian la escreveu.
+fn note_rev(note: &Note) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in note.to_markdown().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn is_note_rev(text: &str) -> bool {
+    text.len() == 16 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// O lado nativo segue o que o editor tem por salvar: o `note-draft` mais
+/// recente, e nada depois de um `note-save` (o salvar leva o texto todo).
+fn track_note_draft(draft: &mut Option<NoteEdit>, message: &PanelMessage) {
+    match message {
+        PanelMessage::NoteDraft(edit) => draft.clone_from(edit),
+        PanelMessage::NoteSave(_) => *draft = None,
+        PanelMessage::Ready
+        | PanelMessage::Search(_)
+        | PanelMessage::Open(_)
+        | PanelMessage::Close
+        | PanelMessage::NotesList
+        | PanelMessage::NotesSearch(_)
+        | PanelMessage::NoteOpen(_)
+        | PanelMessage::NoteSaveRefused
+        | PanelMessage::NoteDelete(_) => {}
+    }
+}
+
+/// O painel fecha por fora (a pagina ja nao corre): o que estava por salvar
+/// vai para o disco pelo worker. Uma nota nova cujo primeiro Salvar ainda
+/// nao voltou pode sair em duplicado -- nunca perdida.
+fn take_note_draft_on_close(draft: &mut Option<NoteEdit>) -> Option<NotesCommand> {
+    draft.take().map(NotesCommand::Save)
+}
+
+/// O painel do Ctrl+H e o texto de uma nota a meio, num bloco so.
+///
+/// O caminho normal de saida e `SidePanel::dismiss` (o `App` chama-o por
+/// `close_side_panel`): grava primeiro o que o editor tinha por salvar, e so
+/// DEPOIS larga a vista e devolve o teclado. Os campos sao privados deste
+/// modulo, por isso um `take()` direto da vista (o que o
+/// `destroy_web_surfaces` fazia) nao compila. Largar o painel INTEIRO por
+/// outro caminho compila -- uma atribuicao por cima
+/// (`self.side_panel = SidePanel::closed(..)`), um `mem::replace`, um `drop`,
+/// o `App` a sair --, mas nao perde o texto: o painel leva consigo quem grava
+/// (`DraftRescue`) e o `Drop` dele manda o rascunho para a fila das notas
+/// antes de a vista sair, uma vez so (depois de `dismiss` ja nao ha
+/// rascunho). O que esse caminho nao faz e devolver o teclado. So um
+/// `mem::forget` do painel, ou o processo morto a meio, passa por cima. E os
+/// pedidos da pagina so chegam ao `App` por `SidePanel::receive`, que segue
+/// a copia do editor antes de os entregar.
+///
+/// Fica uma janela de ate 200 ms: a pagina manda a copia (`note-draft`) no
+/// maximo 200 ms depois de uma tecla, mesmo a escrever sem parar, e o que se
+/// escreveu nesse intervalo antes de um fecho nativo perde-se. Pedir a copia
+/// a pagina no fecho seria assincrono (`evaluate_script_with_callback`) e a
+/// pagina ja nao existe quando a resposta viesse.
+mod side_panel {
+    use std::time::Duration;
+
+    use windows_sys::Win32::Foundation::HWND;
+
+    use super::{
+        NotesCommand, PanelCloseFocus, PanelMessage, PanelView, Surface, focus_after_panel_close,
+        parse_panel_message, release_panel, take_note_draft_on_close, track_note_draft,
+    };
+
+    /// Por onde o painel sai. Todas gravam primeiro o que o editor tinha por
+    /// salvar; muda so para onde vai o teclado depois.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum PanelExit {
+        /// O X ou o Esc da pagina, e o botao Notas com as Notas a vista (a
+        /// pagina salva e manda `close`).
+        CloseButton,
+        /// Ctrl+H de novo (ou o `ShowHistory` do menu).
+        CtrlH,
+        /// Um item do historico, ou a fonte de uma nota, aberto a partir do
+        /// painel.
+        OpenItem,
+        /// Um servico da barra (a Respiracao incluida) ou o Gemini Live abrem
+        /// no lugar dele.
+        OtherPanel,
+        /// A Home.
+        Home,
+        /// Uma pesquisa nova no comparador.
+        NewSearch,
+        /// `destroy_web_surfaces`: o ecra de erro (`show_native_error`), a
+        /// Web completa, o Leitor, o PDF, um link externo, o agente.
+        SurfaceChange,
+        /// A janela fecha (`SidePanel::exit`).
+        AppExit,
+    }
+
+    impl PanelExit {
+        #[cfg(test)]
+        pub(super) const ALL: [Self; 8] = [
+            Self::CloseButton,
+            Self::CtrlH,
+            Self::OpenItem,
+            Self::OtherPanel,
+            Self::Home,
+            Self::NewSearch,
+            Self::SurfaceChange,
+            Self::AppExit,
+        ];
+
+        /// Uma troca de superficie trata do teclado ela propria (e na Home
+        /// passaria pelo `show_home` a meio dela); a saida da app nao precisa.
+        fn keyboard(self, surface: Surface) -> Option<PanelCloseFocus> {
+            match self {
+                Self::SurfaceChange | Self::AppExit => None,
+                Self::CloseButton
+                | Self::CtrlH
+                | Self::OpenItem
+                | Self::OtherPanel
+                | Self::Home
+                | Self::NewSearch => Some(focus_after_panel_close(surface)),
+            }
+        }
+    }
+
+    /// Quem grava o rascunho: o worker das notas (`ZettelWorker`). O painel
+    /// leva o seu, para o `Drop` ter por onde gravar.
+    pub(super) trait DraftRescue {
+        /// Poe a gravacao no fim da fila, sem esperar pelo disco e sem a
+        /// deitar fora com a fila cheia. `Err`: o aviso para o utilizador.
+        fn rescue(&self, command: NotesCommand) -> Result<(), String>;
+        /// Espera, ate `limit`, que tudo o que ja esta na fila -- o que
+        /// `rescue` pos la antes incluido -- chegue ao disco.
+        fn settle(&self, limit: Duration);
+    }
+
+    /// O numero de uma pagina do painel: vai no canal dela
+    /// (`PanelPost::parse`) e distingue-a das que ja sairam.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct PanelTicket(u64);
+
+    /// Um pedido da pagina do painel, ja pelo parser do canal e com o numero
+    /// da pagina que o mandou.
+    #[derive(Debug)]
+    pub(super) struct PanelPost {
+        page: u64,
+        message: PanelMessage,
+    }
+
+    impl PanelPost {
+        /// O unico caminho de um pedido da pagina ate ao `App`:
+        /// `parse_panel_message`, carimbado com a pagina.
+        pub(super) fn parse(ticket: PanelTicket, body: &str) -> Option<Self> {
+            parse_panel_message(body).map(|message| Self {
+                page: ticket.0,
+                message,
+            })
+        }
+    }
+
+    /// O que `receive` entrega ao `App`.
+    #[derive(Debug)]
+    pub(super) enum Received {
+        /// Da pagina viva: o `App` trata.
+        Current(PanelMessage),
+        /// De uma pagina que ja saiu (o pedido estava na fila do event loop
+        /// quando ela fechou). O texto que trazia -- um `note-draft` ou um
+        /// `note-save` -- ja foi para a fila das notas (`Some`, com o
+        /// resultado); o resto morre aqui, e nunca chega a outra pagina.
+        Late(Option<Result<(), String>>),
+    }
+
+    /// O painel acabou de sair. `saved`: o que o editor tinha por salvar foi
+    /// para a fila das notas (ou nao havia nada), ou o aviso do erro.
+    #[derive(Debug)]
+    pub(super) struct Dismissed {
+        pub(super) saved: Result<(), String>,
+    }
+
+    /// O painel do Ctrl+H: a vista (a `WebView` no app, uma de mentira nos
+    /// gates), a copia do que o editor tem por salvar, quem a grava e os
+    /// scripts que esperam pelo "ready" da pagina.
+    pub(super) struct SidePanel<W, N: DraftRescue> {
+        view: Option<W>,
+        /// Quem grava o rascunho: o `dismiss`, o `receive` de uma pagina que
+        /// ja saiu e o `Drop`.
+        notes: N,
+        /// A pagina viva.
+        page: u64,
+        /// O ultimo numero dado por `ticket`.
+        issued: u64,
+        /// Copia do que o editor tem por salvar (`track_note_draft`).
+        draft: Option<super::NoteEdit>,
+        /// A pagina ja correu o script dela (mandou "ready"). Antes disso um
+        /// `evaluate_script` corria no documento vazio e perdia-se.
+        ready: bool,
+        /// Scripts que esperam pelo "ready", pela ordem em que foram pedidos.
+        pending: Vec<String>,
+    }
+
+    impl<W: PanelView, N: DraftRescue> SidePanel<W, N> {
+        /// Sem pagina, com `notes` para gravar o que as paginas deixarem.
+        pub(super) fn closed(notes: N) -> Self {
+            Self {
+                view: None,
+                notes,
+                page: 0,
+                issued: 0,
+                draft: None,
+                ready: false,
+                pending: Vec::new(),
+            }
+        }
+
+        pub(super) fn is_open(&self) -> bool {
+            self.view.is_some()
+        }
+
+        pub(super) fn view(&self) -> Option<&W> {
+            self.view.as_ref()
+        }
+
+        /// O numero da proxima pagina, para o canal dela, antes de a criar.
+        pub(super) fn ticket(&mut self) -> PanelTicket {
+            self.issued += 1;
+            PanelTicket(self.issued)
+        }
+
+        /// A pagina nova, com o numero que o canal dela leva. Com um painel
+        /// ja aberto a vista nova volta para o chamador: a aberta nao e
+        /// substituida aqui.
+        pub(super) fn open(&mut self, ticket: PanelTicket, view: W) -> Result<(), W> {
+            if self.view.is_some() {
+                return Err(view);
+            }
+            self.view = Some(view);
+            self.page = ticket.0;
+            self.ready = false;
+            self.pending.clear();
+            Ok(())
+        }
+
+        /// Um pedido da pagina. Da viva: a copia do editor fica seguida e o
+        /// pedido vai para o `App`. De uma que ja saiu: o texto que trazia vai
+        /// ja para o disco -- nao fica a espera de um painel que nao volta, e
+        /// nunca passa por copia do painel novo.
+        pub(super) fn receive(&mut self, post: PanelPost) -> Received {
+            let PanelPost { page, message } = post;
+            if self.view.is_some() && page == self.page {
+                track_note_draft(&mut self.draft, &message);
+                return Received::Current(message);
+            }
+            let text = match message {
+                PanelMessage::NoteDraft(Some(edit)) | PanelMessage::NoteSave(edit) => Some(edit),
+                PanelMessage::NoteDraft(None)
+                | PanelMessage::Ready
+                | PanelMessage::Search(_)
+                | PanelMessage::Open(_)
+                | PanelMessage::Close
+                | PanelMessage::NotesList
+                | PanelMessage::NotesSearch(_)
+                | PanelMessage::NoteOpen(_)
+                | PanelMessage::NoteSaveRefused
+                | PanelMessage::NoteDelete(_) => None,
+            };
+            Received::Late(text.map(|edit| self.notes.rescue(NotesCommand::Save(edit))))
+        }
+
+        /// `Some(script)`: correr ja. Sem painel nao ha onde; antes do
+        /// "ready" fica a espera dele.
+        pub(super) fn run(&mut self, script: String) -> Option<String> {
+            self.view.as_ref()?;
+            if self.ready {
+                return Some(script);
+            }
+            self.pending.push(script);
+            None
+        }
+
+        /// A pagina correu o script dela: o que esperava, pela ordem.
+        pub(super) fn mark_ready(&mut self) -> Vec<String> {
+            self.ready = true;
+            std::mem::take(&mut self.pending)
+        }
+
+        /// A saida normal do painel. Primeiro o que o editor tinha por salvar
+        /// vai para a fila das notas (`take_note_draft_on_close`, que o
+        /// tira do painel: o `Drop` ja nao o grava outra vez), e so depois a
+        /// vista sai (`release_panel`, que devolve o teclado). `None`: nao
+        /// havia painel.
+        pub(super) fn dismiss(
+            &mut self,
+            exit: PanelExit,
+            surface: Surface,
+            omnibox: Option<HWND>,
+        ) -> Option<Dismissed> {
+            let view = self.view.take()?;
+            let saved = match take_note_draft_on_close(&mut self.draft) {
+                Some(command) => self.notes.rescue(command),
+                None => Ok(()),
+            };
+            self.ready = false;
+            self.pending.clear();
+            release_panel(view, exit.keyboard(surface), omnibox);
+            Some(Dismissed { saved })
+        }
+
+        /// A janela fecha. O processo acaba com o event loop e levava a
+        /// thread das notas a meio: o rascunho do painel aberto vai para a
+        /// fila como em qualquer fecho, e so DEPOIS a marca do `settle`, pela
+        /// mesma fila -- espera-se (ate `limit`) que tudo ate ela, o
+        /// rascunho e o que fechos anteriores ainda tinham por gravar,
+        /// chegue ao disco.
+        pub(super) fn exit(&mut self, limit: Duration) -> Result<(), String> {
+            let saved = self
+                .dismiss(PanelExit::AppExit, Surface::Home, None)
+                .map_or(Ok(()), |closed| closed.saved);
+            self.notes.settle(limit);
+            saved
+        }
+
+        #[cfg(test)]
+        pub(super) fn draft(&self) -> Option<&super::NoteEdit> {
+            self.draft.as_ref()
+        }
+    }
+
+    /// Largar o painel sem `dismiss` -- uma atribuicao por cima, um
+    /// `mem::replace`, um `drop`, o `App` a sair -- nao perde o texto: o que
+    /// o editor tinha por salvar vai para a fila das notas, e so depois a
+    /// vista sai (os campos largam-se depois deste `drop`). Depois de um
+    /// `dismiss` ja nao ha rascunho e nada se grava outra vez. O teclado,
+    /// esse, so o `dismiss` devolve.
+    impl<W, N: DraftRescue> Drop for SidePanel<W, N> {
+        fn drop(&mut self) {
+            if let Some(command) = take_note_draft_on_close(&mut self.draft)
+                && let Err(error) = self.notes.rescue(command)
+            {
+                super::debug_log(format_args!(
+                    "side panel: largado sem dismiss e o rascunho nao foi gravado: {error}"
+                ));
+            }
+        }
     }
 }
 
@@ -4321,19 +5297,704 @@ fn panel_html(theme: &Theme) -> String {
     PANEL_HTML.replace("__THEME__", &panel_theme_vars(theme).to_string())
 }
 
+/// Corre no painel do Ctrl+H quando ele foi aberto pelo botao Notas. A
+/// guarda deixa-o inofensivo enquanto o `PANEL_HTML` nao tiver a secao.
+const PANEL_SHOW_NOTES_SCRIPT: &str =
+    "window.neuraliaShowSection && window.neuraliaShowSection('notes')";
+
+/// O botao Notas com o painel ja aberto: nas Notas fecha (pelo mesmo
+/// caminho do X, que salva o editor antes), no Historico mostra as Notas.
+const PANEL_NOTES_BUTTON_SCRIPT: &str = "window.__neuraliaNotes && window.__neuraliaNotes.button()";
+
+/// Corre no painel quando o Ctrl+Shift+Z e dado na Home (omnibox) ou com o
+/// teclado na barra: uma nota nova, em branco, no editor. So chega ao disco
+/// quando se salva -- um atalho nao enche a pasta de ficheiros vazios.
+const PANEL_NEW_NOTE_SCRIPT: &str = "window.__neuraliaNotes && window.__neuraliaNotes.newNote()";
+
+// Notas (Zettelkasten): a pasta `<data_dir>/zettel`, em Markdown que o
+// Obsidian abre (`neural_core::zettel`). O `ZettelStore` le o disco a cada
+// chamada, e `list`, `search` e `backlinks` leem TODAS as notas: numa pasta
+// grande isso nao pode correr no event loop. Corre no `ZettelWorker`, e o
+// resultado volta como `UserEvent::NotesReady`.
+
+/// Quantas notas a lista do painel recebe de uma vez (a busca refina).
+const NOTES_LIST_LIMIT: usize = 500;
+/// Tecto do texto selecionado que vira nota. O script ja corta, mas quem
+/// responde e a pagina: o lado nativo corta outra vez.
+const NOTE_SELECTION_MAX_CHARS: usize = 20_000;
+/// O que se aceita de volta do ExecuteScript antes de o ler: a selecao
+/// cortada, escapada em JSON no pior caso, mais o endereco e o titulo.
+const NOTE_CAPTURE_MAX_BYTES: usize = 512 * 1024;
+const NOTE_SOURCE_MAX_CHARS: usize = 2048;
+/// Sem titulo na pagina, as primeiras palavras da selecao dao o titulo.
+const NOTE_TITLE_WORDS: usize = 8;
+const NOTE_FALLBACK_TITLE_MAX_CHARS: usize = 80;
+
+/// Corre na WebView que pediu a nota -- nunca numa privada. O que devolve e
+/// dado da pagina (ela pode ter trocado o `getSelection`), nao uma ordem:
+/// `note_draft_from_capture` volta a cortar e a validar tudo.
+const NOTE_CAPTURE_SCRIPT: &str = r#"(function () {
+  var text = '';
+  try { text = String(window.getSelection ? window.getSelection() : ''); } catch (e) {}
+  return { text: text.slice(0, 20000), url: String(location.href), title: String(document.title || '') };
+})()"#;
+
+/// Uma nota nova feita pelo NeuralIA (hoje, a partir de uma selecao).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NoteDraft {
+    title: String,
+    body: String,
+    tags: Vec<String>,
+    source: Option<String>,
+}
+
+/// O que o worker das notas faz. Lista fechada.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NotesCommand {
+    List,
+    Search(String),
+    Open(String),
+    Save(NoteEdit),
+    Delete(String),
+    Create(NoteDraft),
+}
+
+/// Porque e que uma nota vai para o editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteOpened {
+    Open,
+    Saved,
+    Created,
+}
+
+impl NoteOpened {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Saved => "saved",
+            Self::Created => "created",
+        }
+    }
+}
+
+/// Uma linha da lista (ou dos backlinks): sem o corpo, que a lista nao mostra.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NoteSummary {
+    id: String,
+    title: String,
+    updated_unix: u64,
+    tags: Vec<String>,
+}
+
+impl NoteSummary {
+    fn of(note: &Note) -> Self {
+        Self {
+            id: note.id.clone(),
+            title: note.title.clone(),
+            updated_unix: note.updated_unix,
+            tags: note.tags.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NotesReply {
+    Listed {
+        /// `None` para a lista toda; a busca volta com a consulta, para o
+        /// painel ignorar a resposta a uma busca que ja nao e a da caixa.
+        query: Option<String>,
+        total: usize,
+        notes: Vec<NoteSummary>,
+    },
+    Opened {
+        cause: NoteOpened,
+        note: Note,
+        backlinks: Vec<NoteSummary>,
+    },
+    Deleted {
+        id: String,
+    },
+    Missing {
+        id: String,
+    },
+    /// A nota `original` mudou fora deste editor desde que ele a abriu; o
+    /// que o editor tinha ficou na copia `note`, e a original ficou como o
+    /// outro a deixou.
+    Conflict {
+        original: String,
+        note: Note,
+    },
+    Failed(String),
+}
+
+/// De onde veio o pedido: a resposta a uma selecao abre o painel; a do
+/// painel so vai para o painel, se ainda estiver aberto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotesOrigin {
+    Panel,
+    Selection,
+    /// O rascunho que o painel deixou ao fechar por fora: a resposta so diz
+    /// no aviso do meio se ficou salvo.
+    Closed,
+}
+
+/// O pedido do painel que e das notas. Exaustivo de proposito: uma mensagem
+/// nova do painel tem de dizer aqui se e ou nao das notas.
+fn notes_command_for(message: PanelMessage) -> Option<NotesCommand> {
+    Some(match message {
+        PanelMessage::NotesList => NotesCommand::List,
+        PanelMessage::NotesSearch(query) => NotesCommand::Search(query),
+        PanelMessage::NoteOpen(id) => NotesCommand::Open(id),
+        PanelMessage::NoteSave(edit) => NotesCommand::Save(edit),
+        PanelMessage::NoteDelete(id) => NotesCommand::Delete(id),
+        // O rascunho fica do lado nativo (`track_note_draft`); a recusa
+        // responde sem passar pelo worker (`NOTE_SAVE_REFUSED`).
+        PanelMessage::NoteDraft(_) | PanelMessage::NoteSaveRefused => return None,
+        PanelMessage::Ready
+        | PanelMessage::Search(_)
+        | PanelMessage::Open(_)
+        | PanelMessage::Close => {
+            return None;
+        }
+    })
+}
+
+/// A resposta a um note-save que o parser recusou.
+const NOTE_SAVE_REFUSED: &str =
+    "A nota não foi salva: o título, as tags ou o tamanho passam dos limites.";
+
+/// O que o worker das notas lembra entre pedidos: a revisao que ELE
+/// escreveu em cada nota. Um salvar com a revisao de antes de um salvar
+/// nosso (o segundo Ctrl+S antes da resposta ao primeiro) nao e conflito.
+#[derive(Debug, Default)]
+struct NotesSession {
+    written: std::collections::HashMap<String, String>,
+}
+
+/// Um pedido fora de uma sessao (os gates que nao sao sobre conflitos).
+#[cfg(test)]
+fn run_notes_command(store: &ZettelStore, command: NotesCommand, now_unix: u64) -> NotesReply {
+    run_notes_command_in(&mut NotesSession::default(), store, command, now_unix)
+}
+
+/// O trabalho do worker das notas, sem thread nem janela: e isto que os
+/// gates correm, sobre uma pasta temporaria.
+fn run_notes_command_in(
+    session: &mut NotesSession,
+    store: &ZettelStore,
+    command: NotesCommand,
+    now_unix: u64,
+) -> NotesReply {
+    match command {
+        NotesCommand::List => notes_listed(store.list(), None),
+        NotesCommand::Search(query) => notes_listed(store.search(&query), Some(query)),
+        NotesCommand::Open(id) => match store.get(&id) {
+            Ok(Some(note)) => notes_opened(store, NoteOpened::Open, note),
+            Ok(None) => NotesReply::Missing { id },
+            Err(error) => NotesReply::Failed(format!("Não foi possível abrir a nota: {error}")),
+        },
+        NotesCommand::Save(edit) => {
+            let saved = match edit.id {
+                None => store
+                    .create(&edit.title, &edit.body, edit.tags, None, now_unix)
+                    .map(|note| (None, note)),
+                // A fonte, as datas e as propriedades que o Obsidian escreveu
+                // ficam as do ficheiro. Se a nota foi apagada por fora enquanto
+                // estava aberta, grava-se o que o editor tem.
+                Some(id) => store.get(&id).and_then(|existing| {
+                    // Mudou fora deste editor desde que ele a abriu (outra
+                    // janela do NeuralIA, o Obsidian) e nao por um salvar
+                    // nosso: o texto do editor vai para uma copia e a nota
+                    // fica como o outro a deixou. Antes o salvar esmagava-a.
+                    if let (Some(current), Some(opened)) = (&existing, &edit.rev) {
+                        let now = note_rev(current);
+                        if &now != opened && session.written.get(&id) != Some(&now) {
+                            let title = format!("{} (conflito)", edit.title).trim().to_string();
+                            return store
+                                .create(
+                                    &title,
+                                    &edit.body,
+                                    edit.tags,
+                                    current.source.clone(),
+                                    now_unix,
+                                )
+                                .map(|copy| (Some(id), copy));
+                        }
+                    }
+                    let mut note = existing.unwrap_or_else(|| Note {
+                        id,
+                        ..Note::default()
+                    });
+                    note.title = edit.title;
+                    note.body = edit.body;
+                    note.tags = edit.tags;
+                    store.save(&note, now_unix).map(|note| (None, note))
+                }),
+            };
+            match saved {
+                Ok((conflict, note)) => {
+                    session.written.insert(note.id.clone(), note_rev(&note));
+                    match conflict {
+                        Some(original) => NotesReply::Conflict { original, note },
+                        None => notes_opened(store, NoteOpened::Saved, note),
+                    }
+                }
+                Err(error) => {
+                    NotesReply::Failed(format!("Não foi possível salvar a nota: {error}"))
+                }
+            }
+        }
+        NotesCommand::Delete(id) => match store.delete(&id) {
+            Ok(_) => NotesReply::Deleted { id },
+            Err(ZettelError::NotFound(_)) => NotesReply::Missing { id },
+            Err(error) => NotesReply::Failed(format!("Não foi possível excluir a nota: {error}")),
+        },
+        NotesCommand::Create(draft) => {
+            match store.create(
+                &draft.title,
+                &draft.body,
+                draft.tags,
+                draft.source,
+                now_unix,
+            ) {
+                Ok(note) => notes_opened(store, NoteOpened::Created, note),
+                Err(error) => NotesReply::Failed(format!("Não foi possível criar a nota: {error}")),
+            }
+        }
+    }
+}
+
+fn notes_listed(result: Result<Vec<Note>, ZettelError>, query: Option<String>) -> NotesReply {
+    match result {
+        Ok(notes) => NotesReply::Listed {
+            query,
+            total: notes.len(),
+            notes: notes
+                .iter()
+                .take(NOTES_LIST_LIMIT)
+                .map(NoteSummary::of)
+                .collect(),
+        },
+        Err(error) => NotesReply::Failed(format!("Não foi possível ler as notas: {error}")),
+    }
+}
+
+fn notes_opened(store: &ZettelStore, cause: NoteOpened, note: Note) -> NotesReply {
+    // Os backlinks leem a pasta toda; uma falha ali nao esconde a nota.
+    let backlinks = zettel::backlinks(store, &note.id)
+        .map(|notes| notes.iter().map(NoteSummary::of).collect())
+        .unwrap_or_default();
+    NotesReply::Opened {
+        cause,
+        note,
+        backlinks,
+    }
+}
+
+/// O JS que entrega uma resposta ao painel. Os dados vao como JSON
+/// (`serde_json::to_string`: um literal JS valido, com aspas, barras e
+/// `</script>` escapados) e a pagina so os usa como texto.
+fn notes_reply_script(reply: &NotesReply) -> String {
+    let note_json = |note: &Note| {
+        serde_json::json!({
+            "id": note.id,
+            "title": note.title,
+            "body": note.body,
+            "tags": note.tags,
+            "source": note.source,
+            "created": note.created_unix,
+            "updated": note.updated_unix,
+            "rev": note_rev(note),
+        })
+    };
+    let summary = |note: &NoteSummary| {
+        serde_json::json!({
+            "id": note.id,
+            "title": note.title,
+            "updated": note.updated_unix,
+            "tags": note.tags,
+        })
+    };
+    let data = match reply {
+        NotesReply::Listed {
+            query,
+            total,
+            notes,
+        } => serde_json::json!({
+            "kind": "listed",
+            "query": query.as_deref().unwrap_or(""),
+            "total": total,
+            "notes": notes.iter().map(summary).collect::<Vec<_>>(),
+        }),
+        NotesReply::Opened {
+            cause,
+            note,
+            backlinks,
+        } => serde_json::json!({
+            "kind": "opened",
+            "cause": cause.as_str(),
+            "note": note_json(note),
+            "backlinks": backlinks.iter().map(summary).collect::<Vec<_>>(),
+        }),
+        NotesReply::Conflict { original, note } => serde_json::json!({
+            "kind": "conflict",
+            "original": original,
+            "note": note_json(note),
+        }),
+        NotesReply::Deleted { id } => serde_json::json!({ "kind": "deleted", "id": id }),
+        NotesReply::Missing { id } => serde_json::json!({ "kind": "missing", "id": id }),
+        NotesReply::Failed(message) => serde_json::json!({ "kind": "failed", "message": message }),
+    };
+    let payload = serde_json::to_string(&data).unwrap_or_else(|_| "null".to_string());
+    format!("window.__neuraliaNotes && window.__neuraliaNotes.receive({payload});")
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+struct NotesJob {
+    /// `None`: so uma marca na fila (`settle`) -- nada corre e ninguem
+    /// recebe resposta.
+    command: Option<NotesCommand>,
+    origin: NotesOrigin,
+    /// Avisado depois do trabalho feito: e por aqui que a saida da app
+    /// espera pela fila (`settle`).
+    done: Option<SyncSender<()>>,
+}
+
+/// A thread das notas morreu: o que estava por salvar nao tem para onde ir.
+const NOTES_WORKER_GONE: &str = "Não foi possível salvar a nota: as notas deixaram de responder.";
+
+/// A resposta a um pedido que pode esperar pelo utilizador (listar, buscar,
+/// abrir, excluir, criar da selecao) com a fila cheia.
+const NOTES_BUSY: &str = "As notas estão ocupadas; tente de novo.";
+
+/// Quantos pedidos (na fila ou a correr) as notas aceitam antes de
+/// responder `NOTES_BUSY` a um pedido que se pode repetir. O texto do
+/// utilizador (`ZettelWorker::keep`) nao conta com este tecto.
+const NOTES_QUEUE_LIMIT: usize = 64;
+
+/// Quanto a saida da app espera pelas notas (um disco que nao responde nao
+/// prende o fecho da janela para sempre).
+const NOTES_EXIT_WAIT: Duration = Duration::from_secs(3);
+
+/// Uma thread para as notas, como o historico e a memoria, e UMA fila, por
+/// ordem de chegada: um salvar nunca passa a frente do abrir que o
+/// antecedeu, o rascunho de um fecho nunca passa a frente do salvar de
+/// antes, e a marca do `settle` so volta depois de tudo o que entrou antes
+/// dela -- o rascunho do fecho da janela incluido. O event loop nunca le a
+/// pasta nem espera pela fila.
+#[derive(Clone)]
+struct ZettelWorker {
+    tx: Sender<NotesJob>,
+    /// Pedidos na fila ou a correr; a thread desconta cada um depois de o
+    /// acabar.
+    queued: Arc<AtomicUsize>,
+}
+
+impl ZettelWorker {
+    fn new(dir: std::path::PathBuf, proxy: EventLoopProxy<UserEvent>) -> Self {
+        Self::spawn(dir, move |origin, reply| {
+            let _ = proxy.send_event(UserEvent::NotesReady { origin, reply });
+        })
+    }
+
+    /// A thread das notas; cada resposta vai para `reply` (no app, o event
+    /// loop; nos gates, um canal).
+    fn spawn(
+        dir: std::path::PathBuf,
+        reply: impl Fn(NotesOrigin, NotesReply) + Send + 'static,
+    ) -> Self {
+        let (tx, rx) = channel::<NotesJob>();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let pending = Arc::clone(&queued);
+        let _ = thread::Builder::new()
+            .name("neural-zettel".into())
+            .spawn(move || {
+                let mut session = NotesSession::default();
+                while let Ok(job) = rx.recv() {
+                    if let Some(command) = job.command {
+                        // `open` so cria a pasta se faltar; abrir a cada
+                        // pedido aguenta a pasta ter sido apagada com o app
+                        // aberto.
+                        let answer = match ZettelStore::open(&dir) {
+                            Ok(store) => {
+                                run_notes_command_in(&mut session, &store, command, unix_now())
+                            }
+                            Err(error) => NotesReply::Failed(format!(
+                                "Não foi possível abrir a pasta das notas: {error}"
+                            )),
+                        };
+                        reply(job.origin, answer);
+                    }
+                    if let Some(done) = job.done {
+                        let _ = done.try_send(());
+                    }
+                    pending.fetch_sub(1, Ordering::SeqCst);
+                }
+            });
+        Self { tx, queued }
+    }
+
+    /// Um pedido do painel ou de uma pagina. Nunca espera. Um salvar leva o
+    /// texto todo, e o lado nativo ja largou a copia dele
+    /// (`track_note_draft`): entra sempre (`keep`), mesmo com a fila cheia
+    /// -- o X do painel manda o salvar e logo a seguir o `close`, e a pagina
+    /// ja nao esta la para tentar outra vez. O resto, com a fila cheia,
+    /// volta ja com `NOTES_BUSY`, para quem pediu repetir.
+    fn submit(&self, command: NotesCommand, origin: NotesOrigin) -> Result<(), String> {
+        let job = NotesJob {
+            command: Some(command),
+            origin,
+            done: None,
+        };
+        if matches!(job.command, Some(NotesCommand::Save(_))) {
+            return self.keep(job);
+        }
+        if self
+            .queued
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |queued| {
+                (queued < NOTES_QUEUE_LIMIT).then_some(queued + 1)
+            })
+            .is_err()
+        {
+            return Err(NOTES_BUSY.to_string());
+        }
+        self.tx.send(job).map_err(|_| {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+            NOTES_WORKER_GONE.to_string()
+        })
+    }
+
+    /// Poe `job` no fim da fila, sem tecto e sem esperar: nem o event loop
+    /// fica preso a um disco que nao responde, nem o texto e deitado fora,
+    /// nem passa a frente (ou fica atras) do que entrou antes dele. So a
+    /// thread das notas morta o perde -- e ai o erro diz.
+    fn keep(&self, job: NotesJob) -> Result<(), String> {
+        self.queued.fetch_add(1, Ordering::SeqCst);
+        self.tx.send(job).map_err(|_| {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+            NOTES_WORKER_GONE.to_string()
+        })
+    }
+}
+
+/// O painel do Ctrl+H grava o que o editor tinha por salvar por aqui.
+impl side_panel::DraftRescue for ZettelWorker {
+    fn rescue(&self, command: NotesCommand) -> Result<(), String> {
+        self.keep(NotesJob {
+            command: Some(command),
+            origin: NotesOrigin::Closed,
+            done: None,
+        })
+    }
+
+    /// A marca vai pela MESMA fila que o `rescue` (`keep`): so volta depois
+    /// de tudo o que entrou antes dela estar no disco.
+    fn settle(&self, limit: Duration) {
+        let (done, finished) = sync_channel(1);
+        let barrier = NotesJob {
+            command: None,
+            origin: NotesOrigin::Closed,
+            done: Some(done),
+        };
+        if self.keep(barrier).is_ok() {
+            let _ = finished.recv_timeout(limit);
+        }
+    }
+}
+
+/// A selecao nao pode virar nota.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteCaptureError {
+    /// Nada selecionado (so espacos conta como nada).
+    EmptySelection,
+    /// A resposta nao e o objeto que o script devolve.
+    Unreadable,
+}
+
+/// O endereco que fica como fonte: so paginas da web, e nunca a origem do
+/// nosso visualizador de PDF.
+fn note_source(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty() || url.chars().count() > NOTE_SOURCE_MAX_CHARS {
+        return None;
+    }
+    let parsed = Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.origin().ascii_serialization() == PDF_ORIGIN
+    {
+        return None;
+    }
+    Some(parsed.to_string())
+}
+
+/// Uma linha, sem controlos nem espacos repetidos, com no maximo `max` chars.
+fn one_line(text: &str, max: usize) -> String {
+    let joined = text
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    joined.chars().take(max).collect()
+}
+
+/// A nota que o Ctrl+Shift+Z cria: titulo = o da pagina (ou as primeiras
+/// palavras da selecao); corpo = a selecao como citacao Markdown, uma linha
+/// em branco e "Fonte: <url>"; fonte = o endereco; tag "web".
+///
+/// `raw` e o JSON que o `NOTE_CAPTURE_SCRIPT` devolveu -- dado da pagina.
+/// `source` e o endereco que o lado nativo conhece e a pagina nao (o
+/// artigo do Leitor, o PDF aberto); quando existe, manda ele.
+fn note_draft_from_capture(raw: &str, source: Option<&str>) -> Result<NoteDraft, NoteCaptureError> {
+    if raw.len() > NOTE_CAPTURE_MAX_BYTES {
+        return Err(NoteCaptureError::Unreadable);
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| NoteCaptureError::Unreadable)?;
+    if !value.is_object() {
+        return Err(NoteCaptureError::Unreadable);
+    }
+    let field = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    let selection: String = field("text")
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .take(NOTE_SELECTION_MAX_CHARS)
+        .collect();
+    let selection = selection.trim();
+    if selection.is_empty() {
+        return Err(NoteCaptureError::EmptySelection);
+    }
+    let source = match source {
+        Some(known) => note_source(known),
+        None => note_source(field("url")),
+    };
+    let title = Some(one_line(field("title"), NOTE_TITLE_MAX_CHARS))
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| {
+            let words = selection
+                .split_whitespace()
+                .take(NOTE_TITLE_WORDS)
+                .collect::<Vec<_>>()
+                .join(" ");
+            one_line(&words, NOTE_FALLBACK_TITLE_MAX_CHARS)
+        });
+    let quote = selection
+        .lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                ">".to_string()
+            } else {
+                format!("> {}", line.trim_end())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = match &source {
+        Some(url) => format!("{quote}\n\nFonte: {url}\n"),
+        None => format!("{quote}\n"),
+    };
+    Ok(NoteDraft {
+        title,
+        body,
+        tags: vec!["web".to_string()],
+        source,
+    })
+}
+
+/// De que WebView se le a selecao de um Ctrl+Shift+Z.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteCapture {
+    Read,
+    /// O Split privado: nada se le, nada se grava.
+    RefusePrivate,
+    /// A WebView ja nao existe (o Split fechou entretanto).
+    NoPage,
+}
+
+/// Decide no momento de ler, nao no do pedido: entre o Ctrl+Shift+Z num
+/// Split normal e o evento chegar aqui, o Split pode ter sido trocado por um
+/// privado. `split_private` e o do Split que existe AGORA.
+fn note_capture_decision(target: Option<PageTarget>, split_private: Option<bool>) -> NoteCapture {
+    match target {
+        Some(PageTarget::Split) => match split_private {
+            Some(true) => NoteCapture::RefusePrivate,
+            Some(false) => NoteCapture::Read,
+            None => NoteCapture::NoPage,
+        },
+        Some(PageTarget::Column(_)) | None => NoteCapture::Read,
+    }
+}
+
+/// A WebView de que um Ctrl+Shift+Z le a selecao, no momento de ler: a da
+/// coluna que o pediu (nunca a vizinha), a do Split que existe AGORA -- e
+/// nunca se ele for privado -- ou a WebView unica (Externo, Leitor, PDF).
+/// `columns` e `split` sao os do proprio comparador (`comp.views`,
+/// `comp.split`): o `private` e lido aqui, do Split, e nao passado a parte.
+/// Generica para o gate a correr sem WebViews.
+fn note_read_view<'a, V>(
+    target: Option<PageTarget>,
+    columns: &'a [ComparatorView<V>],
+    split: Option<&'a SplitView<V>>,
+    main: Option<&'a V>,
+) -> Result<&'a V, NoteCapture> {
+    match note_capture_decision(target, split.map(|split| split.private)) {
+        NoteCapture::Read => {}
+        refused => return Err(refused),
+    }
+    match target {
+        Some(PageTarget::Column(index)) => columns.get(index).map(|column| &column.webview),
+        Some(PageTarget::Split) => split.map(|split| &split.webview),
+        None => main,
+    }
+    .ok_or(NoteCapture::NoPage)
+}
+
+/// O aviso do painel privado.
+const NOTE_PRIVATE_REFUSAL: &str = "Modo privado: notas não são criadas";
+
+/// A fonte que o lado nativo conhece e a pagina nao: o artigo do Leitor (o
+/// HTML e local) e o PDF (o visualizador e nosso). So vale para a WebView
+/// unica dessas superficies; nas colunas e no Split manda o endereco da pagina.
+fn note_page_source(
+    target: Option<PageTarget>,
+    surface: Surface,
+    page_source: Option<&str>,
+) -> Option<String> {
+    match (target, surface) {
+        (None, Surface::Reader | Surface::Pdf) => page_source.map(str::to_string),
+        _ => None,
+    }
+}
+
 const PANEL_HTML: &str = r#"<!doctype html>
-<html lang="pt-BR"><head><meta charset="utf-8"><title>Histórico inteligente</title>
+<html lang="pt-BR"><head><meta charset="utf-8"><title>Histórico e notas</title>
 <style>
 *{box-sizing:border-box}
 html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:15px "Segoe UI",system-ui,sans-serif}
 body{display:flex;flex-direction:column;border-left:1px solid var(--line)}
-header{display:flex;align-items:center;justify-content:space-between;padding:14px 12px 8px 18px}
-h1{font-size:17px;font-weight:600;margin:0}
+header{display:flex;align-items:center;justify-content:space-between;padding:10px 12px 8px 12px}
+.tabs{display:flex;gap:4px}
+.tab{background:none;border:0;color:var(--muted);font:inherit;font-weight:600;padding:7px 16px;border-radius:999px;cursor:pointer}
+.tab:hover{background:var(--surface)}
+.tab[aria-selected="true"]{background:var(--surface);color:var(--fg);box-shadow:inset 0 0 0 1px var(--line)}
 #close{background:none;border:0;color:var(--muted);font-size:18px;cursor:pointer;border-radius:8px;width:32px;height:32px}
 #close:hover{background:#e81123;color:#fff}
+.view{display:flex;flex-direction:column;flex:1;min-height:0}
+.view[hidden]{display:none}
 .search{padding:4px 16px 10px}
-#q{width:100%;padding:10px 14px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--fg);font:inherit;outline:none}
-#q:focus{border-color:var(--accent)}
+.field{width:100%;padding:10px 14px;border-radius:12px;border:1px solid var(--line);background:var(--surface);color:var(--fg);font:inherit;outline:none}
+.field:focus{border-color:var(--accent)}
+#q,#nq{border-radius:999px}
 main{overflow:auto;flex:1;padding:0 8px 16px}
 ::-webkit-scrollbar{width:10px;height:10px}
 ::-webkit-scrollbar-track,::-webkit-scrollbar-corner{background:transparent}
@@ -4347,23 +6008,63 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
 .title,.detail{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .detail{font-size:12px;color:var(--muted);margin-top:2px}
 .empty{color:var(--muted);font-size:13px;padding:6px 10px}
+.row{display:flex;gap:8px;align-items:center;padding:4px 16px 10px}
+.btn{flex:none;background:var(--surface);border:1px solid var(--line);color:var(--fg);font:inherit;font-size:13px;padding:8px 14px;border-radius:999px;cursor:pointer}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.danger:hover{background:#e81123;border-color:#e81123;color:#fff}
+#notes-msg{font-size:12px;color:var(--muted);min-height:18px;padding:0 18px 4px}
+#note-editor{display:flex;flex-direction:column;gap:8px;overflow:auto;flex:1;padding:0 16px 16px}
+#note-editor h2{margin:10px 2px 0}
+#note-title{font-weight:600}
+#note-body{min-height:200px;resize:vertical;font:14px/1.45 "Segoe UI",system-ui,sans-serif}
+.meta{font-size:12px;color:var(--muted);word-break:break-all}
+.link{background:none;border:0;padding:0;color:var(--accent);font:inherit;cursor:pointer;text-decoration:underline;text-align:left}
+#note-preview{white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5;max-height:30vh;overflow:auto;padding:8px 10px;border-radius:10px;background:var(--surface)}
+.confirm{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px;border-radius:12px;border:1px solid #e81123;font-size:13px}
+.confirm[hidden]{display:none}
 </style></head><body>
-<header><h1>Histórico inteligente</h1><button id="close" title="Fechar (Esc)">✕</button></header>
-<div class="search"><input id="q" placeholder="Descreva o que quer reencontrar e tecle Enter" autocomplete="off" spellcheck="false"></div>
+<header><nav class="tabs" role="tablist"><button class="tab" id="tab-history" role="tab" aria-selected="true">Histórico</button><button class="tab" id="tab-notes" role="tab" aria-selected="false">Notas</button></nav><button id="close" title="Fechar (Esc)">✕</button></header>
+<div class="view" id="view-history">
+<div class="search"><input id="q" class="field" placeholder="Descreva o que quer reencontrar e tecle Enter" autocomplete="off" spellcheck="false"></div>
 <main>
 <section id="busca" hidden><h2></h2><div></div></section>
 <section id="sugestoes" hidden><h2></h2><div></div></section>
 <section id="recentes" hidden><h2></h2><div></div></section>
 </main>
+</div>
+<div class="view" id="view-notes" hidden>
+<div id="notes-msg" role="status"></div>
+<div class="view" id="notes-browse">
+<div class="row"><input id="nq" class="field" placeholder="Buscar nas notas" autocomplete="off" spellcheck="false"><button id="note-new" class="btn primary">Nova nota</button></div>
+<main><div id="notes-list"></div></main>
+</div>
+<div class="view" id="notes-edit" hidden>
+<div class="row"><button id="note-back" class="btn" title="Voltar à lista">← Notas</button><button id="note-save" class="btn primary" title="Salvar (Ctrl+S)">Salvar</button><button id="note-delete" class="btn danger">Excluir</button></div>
+<div id="note-editor">
+<div id="note-confirm" class="confirm" hidden><span>Excluir esta nota? Ela vai para a lixeira (.trash) da pasta das notas.</span><button id="note-confirm-yes" class="btn danger">Excluir</button><button id="note-confirm-no" class="btn">Cancelar</button></div>
+<input id="note-title" class="field" placeholder="Título" autocomplete="off">
+<textarea id="note-body" class="field" placeholder="Escreva em Markdown. Ligue outra nota com [[id]] ou [[id|nome]]."></textarea>
+<input id="note-tags" class="field" placeholder="Tags, separadas por vírgula" autocomplete="off" spellcheck="false">
+<div id="note-source-row" class="meta" hidden><span>Fonte: </span><button id="note-source" class="link"></button></div>
+<div id="note-meta" class="meta"></div>
+<section id="note-preview-box" hidden><h2>Pré-visualização</h2><div id="note-preview"></div></section>
+<section id="note-backlinks-box" hidden><h2>Notas que ligam para esta</h2><div id="note-backlinks"></div></section>
+</div>
+</div>
+</div>
 <script>
 (() => {
   if (window.top !== window) return;
   const post = (action, args) => window.ipc.postMessage(JSON.stringify({ action, args: args || {} }));
-  const q = document.getElementById('q');
-  document.getElementById('close').addEventListener('click', () => post('close'));
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { e.preventDefault(); post('close'); }
-  });
+  const byId = (id) => document.getElementById(id);
+  const make = (tag, className, text) => {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+  const q = byId('q');
   q.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && q.value.trim()) { e.preventDefault(); post('search', { query: q.value.trim() }); }
   });
@@ -4371,34 +6072,382 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
   window.__neuraliaPanel = {
     theme,
     render(data) {
-      const section = document.getElementById(data.id);
+      const section = byId(data.id);
       if (!section) return;
       section.hidden = false;
       section.querySelector('h2').textContent = data.title;
       const box = section.querySelector('div');
       box.textContent = '';
       if (!data.items.length) {
-        const empty = document.createElement('div');
-        empty.className = 'empty';
-        empty.textContent = data.empty;
-        box.appendChild(empty);
+        box.appendChild(make('div', 'empty', data.empty));
         return;
       }
       for (const item of data.items) {
-        const button = document.createElement('button');
-        button.className = 'item';
-        const title = document.createElement('span');
-        title.className = 'title';
-        title.textContent = item.title;
-        const detail = document.createElement('span');
-        detail.className = 'detail';
-        detail.textContent = item.detail;
-        button.append(title, detail);
+        const button = make('button', 'item');
+        button.append(make('span', 'title', item.title), make('span', 'detail', item.detail));
         button.addEventListener('click', () => post('open', { input: item.input }));
         box.appendChild(button);
       }
     }
   };
+
+  // Notas (Zettelkasten). Tudo o que vem de uma nota -- e o corpo pode ser
+  // texto copiado de qualquer pagina -- entra como texto: textContent,
+  // value e createTextNode. Nunca como HTML.
+  const notes = (() => {
+    const ID = /^[0-9][0-9-]{0,63}$/;
+    const WIKI = /\[\[([^\[\]|\n]+)(?:\|([^\[\]\n]*))?\]\]/g;
+    const BODY_MAX_BYTES = 200 * 1024;
+    const TITLE_MAX = 300;
+    const TAGS_MAX = 20;
+    const TAG_MAX = 60;
+    const QUERY_MAX = 500;
+    const SOURCE_MAX = 2048;
+    const nq = byId('nq'), list = byId('notes-list'), msg = byId('notes-msg');
+    const browse = byId('notes-browse'), edit = byId('notes-edit');
+    const title = byId('note-title'), body = byId('note-body'), tags = byId('note-tags');
+    const sourceRow = byId('note-source-row'), source = byId('note-source'), meta = byId('note-meta');
+    const previewBox = byId('note-preview-box'), preview = byId('note-preview');
+    const backBox = byId('note-backlinks-box'), backlinks = byId('note-backlinks');
+    const confirmBox = byId('note-confirm');
+    // Nota no editor: o id dela, ou null para uma nota nova ainda por salvar.
+    let openId = null;
+    // A revisao da nota que o editor mostra (do disco, ou do nosso ultimo
+    // salvar): o salvar leva-a, e o worker nao esmaga uma nota que mudou fora
+    // daqui desde entao.
+    let openRev = null;
+    let openSource = '';
+    let dirty = false;
+    let savingNew = false;
+    // Um note-save a caminho (o id da nota): se voltar "failed", o texto
+    // volta a estar por salvar em vez de se perder ao sair do editor.
+    let saving = undefined;
+    // O lado nativo guarda uma copia do que esta por salvar (note-draft) e
+    // grava-a quando o painel fecha por fora -- botao Notas, Ctrl+H, outro
+    // painel, Home, fechar a janela --, porque ai esta pagina ja nao corre.
+    let draftPosted = false;
+    let draftTimer = 0;
+    let searchTimer = 0;
+    let previewTimer = 0;
+
+    const say = (text) => { msg.textContent = text || ''; };
+    const when = (unix) => {
+      if (!unix) return '';
+      try { return new Date(unix * 1000).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' }); } catch (e) { return ''; }
+    };
+    const query = () => nq.value.trim().slice(0, QUERY_MAX);
+    const refresh = () => {
+      const text = query();
+      if (text) post('notes-search', { query: text }); else post('notes-list');
+    };
+    const open = (id) => { if (ID.test(id) && leave()) post('note-open', { id }); };
+    // Texto que o JSON leva inteiro (sem metades de um par UTF-16, que o
+    // parser do lado nativo recusava) e titulo e tags numa linha: o TAB de
+    // uma tabela colada ou do titulo de uma nota do Obsidian vira espaco.
+    const whole = (text) => (typeof text.toWellFormed === 'function' ? text.toWellFormed() : text);
+    const line = (text) => whole(String(text)).replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').trim();
+    const edited = () => ({
+      id: openId,
+      rev: openId === null ? null : openRev,
+      title: line(title.value),
+      body: whole(body.value),
+      tags: tags.value.split(',').map(line).filter(Boolean),
+    });
+    // Manda (ou limpa) a copia do lado nativo.
+    function postDraft() {
+      clearTimeout(draftTimer);
+      draftTimer = 0;
+      const note = edited();
+      if (dirty && !edit.hidden && (note.title || note.body.trim())) {
+        post('note-draft', note);
+        draftPosted = true;
+      } else if (draftPosted) {
+        post('note-draft', {});
+        draftPosted = false;
+      }
+    }
+    const showList = () => { confirmBox.hidden = true; edit.hidden = true; browse.hidden = false; };
+    const showEditor = () => { browse.hidden = true; edit.hidden = false; };
+
+    function renderList(data) {
+      // Resposta a uma busca que ja nao e a da caixa: a seguinte vem a caminho.
+      if ((data.query || '') !== query()) return;
+      list.textContent = '';
+      if (!data.notes.length) {
+        list.appendChild(make('div', 'empty', data.query
+          ? 'Nenhuma nota encontrada.'
+          : 'Nenhuma nota ainda. Crie uma em Nova nota, ou selecione um texto numa página e tecle Ctrl+Shift+Z.'));
+        return;
+      }
+      if (data.total > data.notes.length) {
+        list.appendChild(make('div', 'empty', 'Mostrando ' + data.notes.length + ' de ' + data.total + ' notas. Refine a busca.'));
+      }
+      for (const note of data.notes) {
+        const button = make('button', 'item');
+        const detail = [when(note.updated), note.tags.map((tag) => '#' + tag).join(' ')].filter(Boolean).join(' · ');
+        button.append(make('span', 'title', note.title), make('span', 'detail', detail));
+        button.addEventListener('click', () => open(note.id));
+        list.appendChild(button);
+      }
+    }
+
+    // O corpo com os [[id]] e [[id|nome]] clicaveis; o resto e texto.
+    function renderPreview() {
+      preview.textContent = '';
+      const text = body.value;
+      let last = 0;
+      let match;
+      WIKI.lastIndex = 0;
+      while ((match = WIKI.exec(text)) !== null) {
+        const id = match[1].trim();
+        if (!ID.test(id)) continue;
+        if (match.index > last) preview.appendChild(document.createTextNode(text.slice(last, match.index)));
+        const link = make('button', 'link', (match[2] || '').trim() || id);
+        link.title = 'Abrir a nota ' + id;
+        link.addEventListener('click', () => open(id));
+        preview.appendChild(link);
+        last = match.index + match[0].length;
+      }
+      if (last < text.length) preview.appendChild(document.createTextNode(text.slice(last)));
+      previewBox.hidden = !text.trim();
+    }
+
+    // Fonte, datas e backlinks: o que o editor mostra da nota sem ser editavel.
+    function describe(note, links) {
+      openSource = note && note.source ? note.source : '';
+      source.textContent = openSource;
+      source.disabled = !/^https?:\/\//i.test(openSource) || openSource.length > SOURCE_MAX;
+      sourceRow.hidden = !openSource;
+      meta.textContent = note
+        ? ['Criada ' + when(note.created), 'atualizada ' + when(note.updated), 'id ' + note.id].join(' · ')
+        : 'Nota nova: ainda não foi salva.';
+      backlinks.textContent = '';
+      for (const other of links || []) {
+        const button = make('button', 'item', other.title);
+        button.addEventListener('click', () => open(other.id));
+        backlinks.appendChild(button);
+      }
+      backBox.hidden = !(links && links.length);
+    }
+
+    function fill(note, links) {
+      openId = note ? note.id : null;
+      openRev = note && note.rev ? note.rev : null;
+      // Outra nota no editor: a resposta ao salvar de uma nota nova que
+      // ainda venha a caminho ja nao e desta.
+      savingNew = false;
+      title.value = note ? note.title : '';
+      body.value = note ? note.body : '';
+      tags.value = note ? note.tags.join(', ') : '';
+      describe(note, links);
+      confirmBox.hidden = true;
+      dirty = false;
+      saving = undefined;
+      postDraft();
+      renderPreview();
+    }
+
+    function save() {
+      const note = edited();
+      if (note.tags.length > TAGS_MAX || note.tags.some((tag) => tag.length > TAG_MAX)) {
+        say('Até ' + TAGS_MAX + ' tags, cada uma com até ' + TAG_MAX + ' caracteres.');
+        return false;
+      }
+      if (note.title.length > TITLE_MAX) { say('O título passa de ' + TITLE_MAX + ' caracteres.'); return false; }
+      if (new TextEncoder().encode(note.body).length > BODY_MAX_BYTES) {
+        say('A nota passa de 200 KiB. Divida-a em duas.');
+        return false;
+      }
+      // Uma nota nova ainda sem id: um segundo pedido criava outra nota. O
+      // que se escrever entretanto fica por salvar ate o id chegar.
+      if (openId === null && savingNew) { say('A salvar…'); return false; }
+      clearTimeout(draftTimer);
+      draftTimer = 0;
+      post('note-save', note);
+      savingNew = openId === null;
+      saving = openId;
+      dirty = false;
+      // O note-save leva o texto todo: o lado nativo larga a copia.
+      draftPosted = false;
+      say('A salvar…');
+      return true;
+    }
+
+    // Sair do editor nao deita fora o que se escreveu. `false`: nao da para
+    // salvar agora (acima dos tectos, ou a nota nova ainda sem id) -- quem
+    // ia sair fica, com o aviso a vista.
+    function leave() {
+      if (!dirty || edit.hidden) return true;
+      const note = edited();
+      if (!note.title && !note.body.trim()) return true;
+      return save();
+    }
+
+    function newNote() {
+      if (!leave()) return;
+      fill(null, []);
+      showEditor();
+      say('');
+      title.focus();
+    }
+
+    function receive(data) {
+      switch (data.kind) {
+        case 'listed':
+          renderList(data);
+          break;
+        case 'opened': {
+          const note = data.note;
+          if (data.cause === 'saved') {
+            // So mexe no editor se ele ainda mostra esta nota (ou a nova que
+            // acabou de ganhar id); senao o utilizador ja seguiu em frente.
+            // O texto nao e reescrito: o cursor ficava no fim a cada Ctrl+S.
+            const same = openId === note.id || (openId === null && savingNew);
+            savingNew = false;
+            if (same) {
+              saving = undefined;
+              openId = note.id;
+              openRev = note.rev || null;
+              if (!title.value.trim()) title.value = note.title;
+              describe(note, data.backlinks);
+              // O que se escreveu enquanto a nota nova esperava pelo id: a
+              // copia do lado nativo passa a ser a desta nota.
+              if (dirty) postDraft();
+            }
+            say('Nota salva.');
+            refresh();
+          } else if (openId !== note.id && !leave()) {
+            // Uma nota que chega de fora (Ctrl+Shift+Z) com o editor por
+            // salvar e que nao da para salvar agora: o editor fica como esta
+            // e a nota nova aparece na lista.
+            say(data.cause === 'created' ? 'Nota criada a partir da seleção; está na lista.' : '');
+            if (data.cause === 'created') refresh();
+          } else {
+            // Uma nota que chega de fora (Ctrl+Shift+Z) nao deita fora o que
+            // estava por salvar no editor: o `leave` acima ja o salvou.
+            fill(note, data.backlinks);
+            showEditor();
+            say(data.cause === 'created' ? 'Nota criada a partir da seleção.' : '');
+            if (data.cause === 'created') refresh();
+          }
+          break;
+        }
+        case 'deleted':
+          if (openId === data.id) { fill(null, []); showList(); }
+          say('Nota movida para a lixeira (.trash).');
+          refresh();
+          break;
+        case 'missing':
+          say('Essa nota já não existe.');
+          refresh();
+          break;
+        case 'conflict': {
+          // A nota mudou fora deste editor (outra janela, o Obsidian): o
+          // texto dele ficou numa copia, e o editor passa a mostra-la.
+          const note = data.note;
+          if (openId === data.original) {
+            saving = undefined;
+            openId = note.id;
+            openRev = note.rev || null;
+            title.value = note.title;
+            describe(note, []);
+          }
+          say('Esta nota mudou fora deste editor (outra janela ou o Obsidian). O seu texto ficou numa cópia: ' + note.title);
+          refresh();
+          break;
+        }
+        case 'failed':
+          savingNew = false;
+          // Um salvar que falhou (pasta ocupada, disco cheio, ficheiro preso
+          // por outro programa, pedido recusado): o texto continua por salvar
+          // -- sair do editor tenta outra vez -- e o lado nativo volta a ter
+          // a copia.
+          if (saving !== undefined && saving === openId && !edit.hidden) {
+            dirty = true;
+            postDraft();
+          }
+          saving = undefined;
+          say(data.message);
+          break;
+      }
+    }
+
+    nq.addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(refresh, 250);
+    });
+    nq.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); clearTimeout(searchTimer); refresh(); }
+    });
+    byId('note-new').addEventListener('click', newNote);
+    byId('note-back').addEventListener('click', () => { if (leave()) { showList(); refresh(); } });
+    byId('note-save').addEventListener('click', save);
+    byId('note-delete').addEventListener('click', () => { confirmBox.hidden = false; });
+    byId('note-confirm-no').addEventListener('click', () => { confirmBox.hidden = true; });
+    byId('note-confirm-yes').addEventListener('click', () => {
+      confirmBox.hidden = true;
+      if (openId === null) { fill(null, []); showList(); return; }
+      post('note-delete', { id: openId });
+    });
+    // A fonte abre fora do painel, que fecha: salva antes, como o X.
+    source.addEventListener('click', () => {
+      if (!source.disabled && openSource && leave()) post('open', { input: openSource });
+    });
+    for (const field of [title, body, tags]) {
+      field.addEventListener('input', () => {
+        dirty = true;
+        say('Alterações por salvar.');
+        // A copia do lado nativo nunca fica mais de 200 ms atras, mesmo a
+        // escrever sem parar: um temporizador que ja corre nao recomeca
+        // (recomecar a cada tecla deixava uma rajada inteira sem copia).
+        if (!draftTimer) draftTimer = setTimeout(postDraft, 200);
+      });
+    }
+    body.addEventListener('input', () => {
+      clearTimeout(previewTimer);
+      previewTimer = setTimeout(renderPreview, 200);
+    });
+    edit.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (e.key || '').toLowerCase() === 's') {
+        e.preventDefault();
+        save();
+      }
+    });
+    return { refresh, receive, newNote, leave, focus: () => (edit.hidden ? nq : title).focus() };
+  })();
+
+  // Abas: Historico e Notas.
+  const tabs = { history: byId('tab-history'), notes: byId('tab-notes') };
+  const views = { history: byId('view-history'), notes: byId('view-notes') };
+  function showSection(name) {
+    const key = name === 'notes' || name === 'notas' ? 'notes'
+      : name === 'history' || name === 'historico' ? 'history' : '';
+    if (!key) return false;
+    // Sair das Notas salva o editor; se nao der agora, fica-se nas Notas.
+    if (key === 'history' && !views.notes.hidden && !notes.leave()) return false;
+    for (const other of Object.keys(views)) {
+      views[other].hidden = other !== key;
+      tabs[other].setAttribute('aria-selected', other === key ? 'true' : 'false');
+    }
+    if (key === 'notes') { notes.refresh(); notes.focus(); } else { q.focus(); }
+    return true;
+  }
+  const close = () => { if (notes.leave()) post('close'); };
+  window.neuraliaShowSection = showSection;
+  window.__neuraliaNotes = {
+    receive: notes.receive,
+    newNote() { if (showSection('notes')) notes.newNote(); },
+    // O botao Notas da barra/Home com o painel aberto: nas Notas fecha
+    // (como o X, salvando antes), no Historico mostra as Notas.
+    button() { if (views.notes.hidden) showSection('notes'); else close(); }
+  };
+  tabs.history.addEventListener('click', () => showSection('history'));
+  tabs.notes.addEventListener('click', () => showSection('notes'));
+  byId('close').addEventListener('click', close);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); close(); }
+  });
+
   theme(__THEME__);
   q.focus();
   post('ready');
@@ -4416,7 +6465,13 @@ enum Service {
     WhatsApp,
     YouTube,
     Gmail,
+    /// Respiracao guiada (metodo Wim Hof), pedida pelo dono "em modo
+    /// anonimo": o video no painel InPrivate, sem camera nem microfone.
+    Breath,
 }
+
+/// O video de respiracao que o dono escolheu.
+const BREATH_VIDEO_URL: &str = "https://www.youtube.com/watch?v=UJBknAsxfrA";
 
 impl Service {
     fn url(self) -> &'static str {
@@ -4425,6 +6480,7 @@ impl Service {
             Self::WhatsApp => "https://web.whatsapp.com/",
             Self::YouTube => "https://www.youtube.com/",
             Self::Gmail => "https://mail.google.com/mail/u/0/#inbox",
+            Self::Breath => BREATH_VIDEO_URL,
         }
     }
 
@@ -4434,8 +6490,88 @@ impl Service {
             Self::WhatsApp => "WhatsApp",
             Self::YouTube => "YouTube",
             Self::Gmail => "Gmail",
+            Self::Breath => "Respiração guiada (método Wim Hof)",
         }
     }
+
+    /// Painel anonimo: WebView2 InPrivate (nada fica no perfil -- cookies,
+    /// cache, historico do WebView), camera e microfone recusados, e a pagina
+    /// presa ao que a abriu. Os outros servicos precisam da conta do
+    /// utilizador e por isso nao podem ser privados.
+    fn private(self) -> bool {
+        match self {
+            Self::Breath => true,
+            Self::Meet | Self::WhatsApp | Self::YouTube | Self::Gmail => false,
+        }
+    }
+}
+
+/// Para onde vai o teclado quando um painel ao lado fecha.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelCloseFocus {
+    /// Na Home: a omnibox, para continuar a escrever.
+    Omnibox,
+    /// No resto: a janela (os atalhos da barra continuam a funcionar).
+    Window,
+}
+
+fn focus_after_panel_close(surface: Surface) -> PanelCloseFocus {
+    match surface {
+        Surface::Home => PanelCloseFocus::Omnibox,
+        Surface::Reader | Surface::External | Surface::Comparator | Surface::Pdf => {
+            PanelCloseFocus::Window
+        }
+    }
+}
+
+/// O que fechar um painel da direita faz a vista dele antes de a largar.
+/// Generico para os gates correrem sem WebView; no app e a `WebView`.
+trait PanelView {
+    /// A janela principal fica com o teclado (`WebView::focus_parent`).
+    fn give_keyboard_to_window(&self);
+}
+
+impl PanelView for WebView {
+    fn give_keyboard_to_window(&self) {
+        let _ = self.focus_parent();
+    }
+}
+
+/// A saida de um painel da direita: a de um servico
+/// (`close_service_panel_in`) e a do Ctrl+H (`side_panel::SidePanel::dismiss`).
+/// O painel tinha o teclado (`panel.focus()` ao abrir) e largar a WebView nao
+/// o devolve a ninguem: fechar o video da respiracao na Home deixava a omnibox
+/// sem teclado ate um clique. Fora da Home a janela fica com ele ANTES de a
+/// vista sair; na Home o EDIT da omnibox (`omnibox`), DEPOIS -- direto, sem
+/// `focus_omnibox`, que passa pelo `show_home`. `focus: None` (uma troca de
+/// superficie, que trata do teclado ela propria, ou a saida da app): so larga.
+fn release_panel<V: PanelView>(view: V, focus: Option<PanelCloseFocus>, omnibox: Option<HWND>) {
+    if focus == Some(PanelCloseFocus::Window) {
+        view.give_keyboard_to_window();
+    }
+    drop(view);
+    if focus == Some(PanelCloseFocus::Omnibox)
+        && let Some(edit) = omnibox
+    {
+        unsafe {
+            SetFocus(edit);
+        }
+    }
+}
+
+/// Fecha o painel de servico que houver, com o teclado devolvido por
+/// `release_panel`. `false`: nao havia nenhum. No app a vista e o
+/// `ServicePanel` inteiro (a WebView dele); nos gates, uma de mentira.
+fn close_service_panel_in<V: PanelView>(
+    slot: &mut Option<V>,
+    surface: Surface,
+    omnibox: Option<HWND>,
+) -> bool {
+    let Some(view) = slot.take() else {
+        return false;
+    };
+    release_panel(view, Some(focus_after_panel_close(surface)), omnibox);
+    true
 }
 
 /// O servico aberto no painel da direita e o modo em que esta.
@@ -4448,6 +6584,14 @@ struct ServicePanel {
     audio: bool,
     /// Numero deste painel; os avisos do WebView2 trazem-no.
     generation: u64,
+}
+
+/// Fechar o painel de servicos devolve o teclado pela WebView dele
+/// (`close_service_panel_in`).
+impl PanelView for ServicePanel {
+    fn give_keyboard_to_window(&self) {
+        self.webview.give_keyboard_to_window();
+    }
 }
 
 /// Um aviso do WebView2 do painel `event` so vale se esse painel ainda for
@@ -4601,6 +6745,85 @@ fn service_panel_allows_navigation(target: &str) -> bool {
     lower == "about:blank" || lower.starts_with("https://") || lower.starts_with("http://")
 }
 
+/// O painel da respiracao existe para um video. Fica preso ao YouTube (e a
+/// pagina de consentimento de cookies que ele mostra a uma sessao sem
+/// cookies, como e sempre a InPrivate), so em https -- para nao virar um
+/// navegador anonimo sem as protecoes do painel Privado. Nem o login da
+/// Google: entrar numa conta no painel "anonimo" contradiz o pedido.
+fn breath_panel_allows_navigation(target: &str) -> bool {
+    let target = target.trim();
+    if target.eq_ignore_ascii_case("about:blank") {
+        return true;
+    }
+    let Ok(url) = Url::parse(target) else {
+        return false;
+    };
+    if url.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host == "youtube.com"
+        || host.ends_with(".youtube.com")
+        || host == "youtu.be"
+        || host == "consent.google.com"
+}
+
+/// A politica de navegacao de cada servico, num so sitio.
+fn service_panel_navigation(service: Service, target: &str) -> bool {
+    match service {
+        Service::Breath => breath_panel_allows_navigation(target),
+        Service::Meet | Service::WhatsApp | Service::YouTube | Service::Gmail => {
+            service_panel_allows_navigation(target)
+        }
+    }
+}
+
+/// Camera e microfone: pelo aviso do WebView2 nos servicos da conta do
+/// utilizador; recusados, sem perguntar, no painel privado.
+fn service_panel_permission(service: Service, kind: PermissionKind) -> PermissionResponse {
+    if service.private() {
+        return PermissionResponse::Deny;
+    }
+    web_media_permission(kind, true)
+}
+
+/// Largura logica que o painel aberto tira ao comparador (0 fora dele ou
+/// sem painel). Qualquer servico conta -- a Respiracao incluida --, porque
+/// o painel dele fica ao lado das colunas como os outros (o estado vem do
+/// `ServicePanel`, igual para todos); o do Gemini Live (`live_panel`) tem a
+/// largura dos servicos. As larguras sao as escolhidas pela borda
+/// (`panel-width.json`), e o de servicos minimizado nao cede nada
+/// (`reserved_panel_width`).
+fn open_panel_width_for(
+    surface: Surface,
+    service: Option<ServicePanelState>,
+    live_panel: bool,
+    side_panel: bool,
+    logical_w: f64,
+    widths: PanelWidths,
+) -> f64 {
+    if surface != Surface::Comparator {
+        return 0.0;
+    }
+    reserved_panel_width(
+        service,
+        live_panel,
+        side_panel,
+        panel_width(
+            PanelKind::Service,
+            widths.get(PanelKind::Service),
+            logical_w,
+        ),
+        panel_width(
+            PanelKind::History,
+            widths.get(PanelKind::History),
+            logical_w,
+        ),
+    )
+}
+
 /// Mais largo do que o do historico: o WhatsApp e o Meet precisam de espaco.
 #[cfg(test)]
 fn service_panel_bounds(logical_w: f64, logical_h: f64, top: f64) -> (f64, f64, f64, f64) {
@@ -4638,6 +6861,82 @@ unsafe fn draw_icon_button(
     let x = (rect.x + (rect.width - size as f64) / 2.0).round() as i32;
     let y = (rect.y + (rect.height - size as f64) / 2.0).round() as i32;
     draw_icon(hdc, slot, x, y, size, fill, tint);
+}
+
+/// Botao de uma ferramenta: o mesmo circulo dos servicos, com o icone no
+/// quadrado da esquerda e, se houver, a etiqueta (o tempo do Pomodoro) no
+/// resto -- `right_controls` e `home_tool_buttons` ja alargaram o botao.
+/// Com `phase` (uma sessao do Pomodoro em curso) o tempo e o contorno vao na
+/// cor da fase.
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_tool_button(
+    hdc: *mut core::ffi::c_void,
+    rect: UiRect,
+    tool: Tool,
+    label: Option<&str>,
+    phase: Option<Phase>,
+    hovered: bool,
+    scale: f64,
+    font: *mut core::ffi::c_void,
+    theme: &Theme,
+    background: Rgb,
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let fill = if hovered {
+        theme.surface_line
+    } else {
+        theme.surface
+    };
+    let label_color = tool_label_color(phase, fill, theme);
+    let border = if phase.is_some() {
+        label_color
+    } else {
+        theme.surface_line
+    };
+    fill_pill(
+        hdc,
+        rect,
+        rect.height / 2.0,
+        fill,
+        Some((border, scale)),
+        background,
+    );
+    let size = (rect.height * 0.6).round() as i32;
+    let x = (rect.x + (rect.height - size as f64) / 2.0).round() as i32;
+    let y = (rect.y + (rect.height - size as f64) / 2.0).round() as i32;
+    draw_icon(
+        hdc,
+        tool.icon_slot(),
+        x,
+        y,
+        size,
+        fill,
+        tool.icon_tint(theme),
+    );
+
+    // So ha etiqueta se o botao alargou para ela; senao seria escrita por
+    // cima do icone.
+    if let Some(text) = label
+        && rect.width > rect.height + 1.0
+    {
+        SelectObject(hdc, font as _);
+        SetTextColor(hdc, rgb3(label_color));
+        SetBkMode(hdc, TRANSPARENT as i32);
+        let mut text_rect = RECT {
+            left: (rect.x + rect.height * 0.85).round() as i32,
+            top: rect.y.round() as i32,
+            right: (rect.x + rect.width - rect.height * 0.25).round() as i32,
+            bottom: (rect.y + rect.height).round() as i32,
+        };
+        draw_text(
+            hdc,
+            text,
+            &mut text_rect,
+            DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
+        );
+    }
 }
 
 /// A dica do olho. O estado ve-se na cor do botao.
@@ -4848,6 +7147,7 @@ fn bar_tooltip_label(
             "Avisos do Gmail: desligados · clique para ligar"
         }
         .to_string(),
+        BarHit::Tool(tool) => tool.tooltip().to_string(),
         BarHit::GeminiLive => LIVE_TOOLTIP.to_string(),
         BarHit::WindowMinimize => caption_tooltip_label(0, maximized).to_string(),
         BarHit::WindowMaximize => caption_tooltip_label(1, maximized).to_string(),
@@ -4979,6 +7279,73 @@ fn place_caption_buttons(buttons: HWND, x: i32, width: i32, height: i32, visible
 /// A faixa de cima da Home, onde se agarra a janela sem moldura.
 fn home_drag_strip(y: f64, scale: f64) -> bool {
     y >= 0.0 && y <= TITLE_TAB_HEIGHT * scale.max(1.0)
+}
+
+/// As ferramentas na faixa de cima da Home, encostadas aos botoes da janela
+/// (os tres de 46 px que `sync_caption_buttons` poe no canto): a mesma
+/// ordem e o mesmo desenho da barra do comparador, so um pouco mais baixos
+/// para caberem na faixa de 32 px.
+fn home_tool_buttons(
+    client_width: f64,
+    scale: f64,
+    pomodoro_label: Option<BarLabel>,
+) -> [UiRect; 3] {
+    let scale = scale.max(1.0);
+    let caption_left = client_width - 3.0 * 46.0 * scale;
+    let size = (TITLE_TAB_HEIGHT - 6.0) * scale;
+    tool_button_row(
+        caption_left - 8.0 * scale,
+        3.0 * scale,
+        size,
+        4.0 * scale,
+        pomodoro_label.map_or(0.0, |label| label.width()) * scale,
+    )
+}
+
+fn home_tool_hit(
+    client_width: f64,
+    scale: f64,
+    pomodoro_label: Option<BarLabel>,
+    x: f64,
+    y: f64,
+) -> Option<Tool> {
+    home_tool_buttons(client_width, scale, pomodoro_label)
+        .iter()
+        .zip(Tool::ALL)
+        .find_map(|(rect, tool)| rect.contains(x, y).then_some(tool))
+}
+
+/// O que um clique na Home apanha.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeClick {
+    Tool(Tool),
+    /// O botao "Ir" da omnibox.
+    Go,
+    /// A faixa de cima fora dos botoes: arrasta a janela.
+    Drag,
+    Nothing,
+}
+
+/// A unica decisao do clique na Home. As ferramentas ficam DENTRO da faixa
+/// de arrastar, por isso sao vistas primeiro: sem isso o clique nelas
+/// arrastava a janela em vez de carregar no botao.
+fn home_click_target(
+    size: (f64, f64),
+    scale: f64,
+    pomodoro_label: Option<BarLabel>,
+    x: f64,
+    y: f64,
+) -> HomeClick {
+    if let Some(tool) = home_tool_hit(size.0, scale, pomodoro_label, x, y) {
+        return HomeClick::Tool(tool);
+    }
+    if HomeLayout::new(size.0, size.1, scale).go.contains(x, y) {
+        return HomeClick::Go;
+    }
+    if home_drag_strip(y, scale) {
+        return HomeClick::Drag;
+    }
+    HomeClick::Nothing
 }
 
 /// Vermelho do fechar ao passar o rato, o mesmo do Chrome e do Windows.
@@ -5412,6 +7779,70 @@ fn hide_tooltip() {
     }
 }
 
+/// A dica a vista -- ou a espera do atraso -- passa a dizer `text`, sem se
+/// esconder nem voltar a esperar: o tempo do Pomodoro muda a cada segundo
+/// com o rato parado em cima do botao. Escondida, fica escondida.
+fn refresh_hint_text(text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GW_OWNER, GetWindow, IsWindowVisible};
+    {
+        let mut pending = TOOLTIP_PENDING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((_, waiting)) = pending.as_mut() {
+            *waiting = text.to_string();
+            return;
+        }
+    }
+    let hint = HINT_HWND.load(Ordering::Acquire) as HWND;
+    if hint.is_null() || unsafe { IsWindowVisible(hint) } == 0 {
+        return;
+    }
+    let unchanged = *HINT_TEXT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        == text;
+    if unchanged {
+        return;
+    }
+    let root = unsafe { GetWindow(hint, GW_OWNER) };
+    *TOOLTIP_PENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((root as usize, text.to_string()));
+    // Volta a centrar e a dimensionar pelo texto novo; `show_popup_without_activation`
+    // la dentro, como sempre: a dica nunca rouba o foco.
+    show_pending_tooltip();
+}
+
+/// Som curto do sistema no fim de uma fase do Pomodoro (o "Asterisco" do
+/// esquema de sons do Windows; sem som configurado, nada).
+fn pomodoro_sound() {
+    use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
+    use windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK;
+    unsafe {
+        MessageBeep(MB_ICONASTERISK);
+    }
+}
+
+/// Pisca o botao da janela na barra de tarefas ate ela voltar a frente. Nao
+/// ativa nada nem rouba o foco (e so o aviso que o Windows da a qualquer
+/// app); com o som desligado no Windows, e o que resta de um fim de fase
+/// com a janela minimizada.
+fn flash_taskbar(owner: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx,
+    };
+    let info = FLASHWINFO {
+        cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+        hwnd: owner,
+        dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+        uCount: 0,
+        dwTimeout: 0,
+    };
+    unsafe {
+        FlashWindowEx(&info);
+    }
+}
+
 /// Menu de tema no cursor, com a escolha em vigor marcada. Devolve a opcao
 /// clicada, ou None se o menu foi fechado sem escolha.
 fn pick_theme_from_menu(hwnd: HWND) -> Option<ThemeChoice> {
@@ -5607,6 +8038,61 @@ unsafe fn append_swatch_submenu(
 fn left_button_down() -> bool {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_LBUTTON};
     unsafe { GetKeyState(VK_LBUTTON as i32) < 0 }
+}
+
+/// Menu do botao direito do Pomodoro no cursor, feito das linhas de
+/// `PomodoroController::menu_items` (o modelo e o `pick_theme_from_menu`).
+/// Devolve o id escolhido; 0 se o menu fechou sem escolha.
+fn pick_pomodoro_from_menu(hwnd: HWND, items: &[PomodoroMenuItem]) -> usize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GA_ROOT, GetAncestor, MF_CHECKED, MF_GRAYED, SetForegroundWindow,
+    };
+    unsafe {
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return 0;
+        }
+        for item in items {
+            match *item {
+                PomodoroMenuItem::Separator => {
+                    AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+                }
+                PomodoroMenuItem::Command {
+                    id,
+                    label,
+                    enabled,
+                    checked,
+                    ..
+                } => {
+                    let mut flags = MF_STRING;
+                    if checked {
+                        flags |= MF_CHECKED;
+                    }
+                    if !enabled {
+                        flags |= MF_GRAYED;
+                    }
+                    let text: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
+                    AppendMenuW(menu, flags, id, text.as_ptr());
+                }
+            }
+        }
+        let mut cursor = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut cursor);
+        // Sem o dono em primeiro plano, o menu nao fecha ao clicar fora.
+        let root = GetAncestor(hwnd, GA_ROOT);
+        SetForegroundWindow(root);
+        let picked = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            cursor.x,
+            cursor.y,
+            0,
+            root,
+            std::ptr::null(),
+        );
+        DestroyMenu(menu);
+        usize::try_from(picked).unwrap_or(0)
+    }
 }
 
 /// Pede o WM_MOUSELEAVE a um botao nativo: sem ele a dica ficava a vista
@@ -6105,8 +8591,22 @@ unsafe extern "system" fn omnibox_subclass(
                 let _ = proxy.send_event(UserEvent::ClearHistory);
                 return 0;
             }
+            // Ctrl+Shift+Z (Z = 0x5A): nota nova no painel. Na omnibox nao
+            // ha pagina com selecao; o Ctrl+Z sozinho continua a desfazer.
+            0x5A if ctrl && shift => {
+                let _ = proxy.send_event(UserEvent::NewNote);
+                return 0;
+            }
             _ => {}
         }
+    }
+    // O Ctrl+Shift+Z acima ja foi tratado: o carater 0x1A que o
+    // TranslateMessage gera a seguir seria o "desfazer" do EDIT.
+    if message == WM_CHAR
+        && wparam == 0x1A
+        && (GetAsyncKeyState(VK_SHIFT as i32) as u16 & 0x8000) != 0
+    {
+        return 0;
     }
 
     DefSubclassProc(hwnd, message, wparam, lparam)
@@ -6494,6 +8994,13 @@ struct Timers {
     /// So para o fallback: a thread de servico tem a sua propria copia.
     proxy: EventLoopProxy<UserEvent>,
     alive: bool,
+}
+
+/// Os tiques do Pomodoro voltam ao event loop como `PomodoroTick(token)`.
+impl TickScheduler for Timers {
+    fn schedule(&self, tick: TickSchedule) {
+        self.after(tick.delay, UserEvent::PomodoroTick(tick.token));
+    }
 }
 
 impl Timers {
@@ -6984,7 +9491,7 @@ struct App {
     /// O visualizador de PDF nao aceita script do host: rola-se por tecla.
     reading_pdf: bool,
     splash: Option<HWND>,
-    splash_token: u64,
+    splash_board: SplashBoard,
     gmail_toast: Option<HWND>,
     gmail_toast_token: u64,
     gmail_monitor: Option<WebView>,
@@ -7029,11 +9536,15 @@ struct App {
     /// Janela com o foco do teclado (`WindowEvent::Focused`). Em segundo plano
     /// a animacao continua, mas devagar.
     home_focused: bool,
-    /// Painel lateral do historico inteligente (Ctrl+H).
-    side_panel: Option<WebView>,
+    /// Painel lateral do historico inteligente e das notas (Ctrl+H). Sai por
+    /// `close_side_panel`, que grava primeiro o que o editor tinha por
+    /// salvar e devolve o teclado (`side_panel::SidePanel::dismiss`);
+    /// largado de outra forma, o `Drop` dele ainda grava o rascunho.
+    side_panel: side_panel::SidePanel<WebView, ZettelWorker>,
     /// A consulta de memoria que alimenta as sugestoes do painel.
     panel_suggestion_query: Option<String>,
-    /// Servico aberto no painel lateral (WhatsApp, Meet, YouTube, Gmail).
+    /// Servico aberto no painel lateral (WhatsApp, Meet, YouTube, Gmail e o
+    /// video da respiracao, este em InPrivate).
     service_panel: Option<ServicePanel>,
     /// Numero do ultimo painel de servicos aberto: os avisos do WebView2 de
     /// um painel ja fechado chegam com o numero dele e caem.
@@ -7052,6 +9563,18 @@ struct App {
     /// Gravacao das abas e grupos do comparador em `tabs.json`. Aberta no
     /// arranque: a primeira janela do NeuralIA fica com o `tabs.lock`.
     tab_session: TabPersistence,
+    /// Ferramentas: o botao da Home sob o rato (a barra usa `bar_hover`).
+    home_tool_hover: Option<Tool>,
+    /// Notas (Zettelkasten) em `<data_dir>/zettel`, lidas e gravadas fora do
+    /// event loop.
+    notes: ZettelWorker,
+    /// O endereco verdadeiro da pagina da WebView unica quando o dela nao o
+    /// e: o artigo do Leitor (o HTML e local) e o PDF (o visualizador e
+    /// nosso). E a fonte das notas feitas ali.
+    page_source: Option<String>,
+    /// O Pomodoro do botao da barra e da Home, com a cadeia de tiques viva.
+    /// As duracoes vivem em `<data_dir>/pomodoro`.
+    pomodoro: PomodoroController,
     /// Painel do Gemini Live, com o estado do olho da barra. Existir e estar
     /// ligado: fecha-lo desliga tudo.
     live_panel: LivePanel<WebView>,
@@ -7068,8 +9591,12 @@ impl App {
             load_gmail_setting(&config.data_dir.join("gmail")),
             Ordering::Release,
         );
+        let pomodoro = PomodoroController::new(crate::pomodoro_ui::load_settings(
+            &config.data_dir.join("pomodoro"),
+        ));
         let history = HistoryWriter::new(history_store, proxy.clone());
         let memory = MemoryWorker::new(config.data_dir.join("memory"), proxy.clone());
+        let notes = ZettelWorker::new(config.data_dir.join("zettel"), proxy.clone());
         let timers = Timers::new(proxy.clone());
         let reader_client = ReaderClient::new(config.reader_timeout_secs, config.reader_max_bytes);
         let navigation_generation = Arc::new(AtomicU64::new(0));
@@ -7117,7 +9644,7 @@ impl App {
             zoom: 1.0,
             reading_pdf: false,
             splash: None,
-            splash_token: 0,
+            splash_board: SplashBoard::default(),
             gmail_toast: None,
             gmail_toast_token: 0,
             gmail_monitor: None,
@@ -7145,7 +9672,7 @@ impl App {
             // A janela nasce visivel e com foco; os eventos corrigem se nao for.
             home_occluded: false,
             home_focused: true,
-            side_panel: None,
+            side_panel: side_panel::SidePanel::closed(notes.clone()),
             panel_suggestion_query: None,
             service_panel: None,
             service_generation: 0,
@@ -7154,6 +9681,10 @@ impl App {
             panel_widths,
             panel_handle: None,
             tab_session,
+            home_tool_hover: None,
+            notes,
+            page_source: None,
+            pomodoro,
             live_panel: LivePanel::off(),
         }
     }
@@ -7220,6 +9751,7 @@ impl App {
         }
         self.home_focused = focused;
         if focused {
+            self.show_unseen_phase_end();
             self.resume_home_animation();
             // Os popups owned reaparecem com o dono, mas a geometria pode ter
             // mudado enquanto estivemos fora (outro ecra, outro DPI, outra
@@ -7245,7 +9777,18 @@ impl App {
         }
         self.home_occluded = occluded;
         if !occluded {
+            // Restaurada da barra de tarefas: o foco pode ir direto para a
+            // WebView e o `Focused` da janela nunca chegar.
+            self.show_unseen_phase_end();
             self.resume_home_animation();
+        }
+    }
+
+    /// Um fim de fase do Pomodoro que a janela nao viu (estava minimizada ou
+    /// atras de outra) aparece quando ela volta -- uma vez.
+    fn show_unseen_phase_end(&mut self) {
+        if let Some(message) = self.pomodoro.window_back() {
+            self.show_background_splash(message, POMODORO_PHASE_END_SECONDS);
         }
     }
 
@@ -7522,12 +10065,11 @@ impl App {
         // nativo (`show_native_error`) ou um link para a Web completa.
         self.close_live_panel();
         self.close_service_panel();
-        // O historico sai sem `close_side_panel`: esse devolve o teclado a
-        // omnibox, e na Home isso passa pela `show_home` -- que agendaria a
-        // moldura da Home a meio desta troca de superficie.
-        if self.side_panel.take().is_some() {
-            self.panel_suggestion_query = None;
-        }
+        // O do Ctrl+H pela saida unica: o texto de uma nota a meio vai para
+        // o disco antes de a pagina sair (gate
+        // `every_way_out_of_the_side_panel_saves_the_note_being_typed_once`).
+        // `SurfaceChange` nao mexe no teclado: esta troca trata dele.
+        self.close_side_panel(PanelExit::SurfaceChange);
         // Sem painel: a pega some e o gancho da roda sai.
         self.after_panel_change();
 
@@ -7577,6 +10119,7 @@ impl App {
             *bytes = Vec::new();
         }
         self.reading_pdf = false;
+        self.page_source = None;
     }
 
     fn schedule_home_restoration(&self) {
@@ -7590,7 +10133,7 @@ impl App {
     fn show_home(&mut self) {
         debug_log(format_args!("show_home (surface era {:?})", self.surface));
         self.caption_reveal.reset();
-        self.close_side_panel();
+        self.close_side_panel(PanelExit::Home);
         self.close_service_panel();
         self.close_live_panel();
         self.next_generation();
@@ -7759,10 +10302,11 @@ impl App {
             }
             InputRoute::History => self.show_recent_history(),
             InputRoute::Theme(Some(choice)) => self.choose_theme(choice),
-            InputRoute::Theme(None) => self.show_splash(
-                "Use tema:sistema, tema:claro ou tema:escuro.".to_string(),
-                3,
-            ),
+            InputRoute::Theme(None) => self.show_splash(THEME_COMMAND_HELP.to_string(), 3),
+            InputRoute::Pomodoro(Some(command)) => self.pomodoro_command(command),
+            InputRoute::Pomodoro(None) => {
+                self.show_splash(POMODORO_COMMAND_HELP.to_string(), 4);
+            }
             InputRoute::ResearchCompare => self.compare_current_research(),
             InputRoute::ResearchSynthesize => self.synthesize_current_research(),
             InputRoute::ResearchExport => self.export_current_research(),
@@ -8028,6 +10572,7 @@ impl App {
                 let _ = webview.zoom(self.zoom);
                 self.webview = Some(webview);
                 self.surface = Surface::Pdf;
+                self.page_source = Some(url.to_string());
                 self.record(HistoryKind::Read, url.to_string(), url.to_string());
                 let mut document = MemoryDocument::new(
                     MemoryKind::Source,
@@ -8086,8 +10631,7 @@ impl App {
         let ipc_proxy = self.proxy.clone();
         let capability = remote_capability();
         let ipc_capability = capability.clone();
-        let init_script = format!("{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}")
-            .replace("__NEURALIA_CAP__", &capability);
+        let init_script = Self::reader_init_script(&capability);
 
         themed_webview_builder()
             .with_initialization_script(init_script)
@@ -8136,6 +10680,15 @@ impl App {
             })
             .with_permission_handler(|_| PermissionResponse::Deny)
             .with_focused(true)
+    }
+
+    /// O que o Modo Leitura injeta no document-created: o mapa de teclas, o
+    /// rail de secoes e a leitura em voz alta (SPEC-0110), que se liga sozinha
+    /// ao artigo. O HTML do Reader tem `script-src 'none'`; os
+    /// initialization scripts do WebView2 correm na mesma.
+    fn reader_init_script(capability: &str) -> String {
+        format!("{NEURALIA_KEYMAP_SCRIPT}\n{SPLIT_SCROLL_RAIL_SCRIPT}\n{READ_ALOUD_SCRIPT}")
+            .replace("__NEURALIA_CAP__", capability)
     }
 
     fn external_webview_builder(
@@ -8497,6 +11050,7 @@ impl App {
                 let _ = webview.zoom(self.zoom);
                 self.webview = Some(webview);
                 self.surface = Surface::Reader;
+                self.page_source = Some(article.source_url.clone());
                 self.begin_reading_session(false);
             }
             Err(error) => {
@@ -8506,7 +11060,7 @@ impl App {
     }
 
     fn open_comparator(&mut self, query: &str) {
-        self.close_side_panel();
+        self.close_side_panel(PanelExit::NewSearch);
         self.close_service_panel();
         self.close_live_panel();
         let reuse_comparator = self
@@ -9092,6 +11646,10 @@ impl App {
             IpcAction::Hint { col, hint } if col == col_index => {
                 Some(UserEvent::ColumnHint { col, hint })
             }
+            // Ctrl+Shift+Z: a selecao e lida DESTA coluna, pelo lado nativo.
+            IpcAction::Note => Some(UserEvent::NoteRequested(Some(PageTarget::Column(
+                col_index,
+            )))),
             other => common_ipc_event(other),
         }
     }
@@ -9249,8 +11807,15 @@ impl App {
         self.request_redraw();
     }
 
-    fn split_ipc_event_impl(source_index: usize, action: IpcAction) -> Option<UserEvent> {
+    fn split_ipc_event_impl(
+        source_index: usize,
+        private: bool,
+        action: IpcAction,
+    ) -> Option<UserEvent> {
         match action {
+            // O Split privado nao faz notas: a pagina nem chega a ser lida.
+            IpcAction::Note if private => Some(UserEvent::NoteRefusedPrivate),
+            IpcAction::Note => Some(UserEvent::NoteRequested(Some(PageTarget::Split))),
             IpcAction::SplitClose => Some(UserEvent::CloseSplit),
             IpcAction::SplitExpand | IpcAction::Fullscreen => {
                 Some(UserEvent::ToggleSplitFullscreen)
@@ -9296,7 +11861,7 @@ impl App {
                 else {
                     return;
                 };
-                let event = Self::split_ipc_event_impl(source_index, action);
+                let event = Self::split_ipc_event_impl(source_index, private, action);
                 if let Some(event) = event {
                     let _ = ipc_proxy.send_event(event);
                 }
@@ -9694,6 +12259,12 @@ impl App {
                 }
             }
             PaletteRoute::Home => self.show_home(),
+            PaletteRoute::Pomodoro(Some(command)) => self.pomodoro_command(command),
+            PaletteRoute::Pomodoro(None) => {
+                self.show_splash(POMODORO_COMMAND_HELP.to_string(), 4);
+            }
+            PaletteRoute::Theme(Some(choice)) => self.choose_theme(choice),
+            PaletteRoute::Theme(None) => self.show_splash(THEME_COMMAND_HELP.to_string(), 3),
             // allow_local: a URL foi digitada num controlo nativo, e entrada
             // do utilizador e nao da pagina (SPEC-0015). Em privado a fonte
             // abre privada: open_split_mode(private) nao grava memoria nem
@@ -9818,7 +12389,8 @@ impl App {
     /// Liga/desliga a rolagem de leitura. O temporizador e nativo e nao vive na
     /// pagina: assim sobrevive a navegacao dentro do site.
     fn toggle_auto_scroll(&mut self) {
-        SPLASH_ASKS.store(false, Ordering::SeqCst);
+        // O F8 responde a pergunta que estiver a vista.
+        self.splash_board.answered();
         self.auto_scroll_answered = true;
         let on = self.auto_scroll.toggle();
         self.auto_scroll_token = self.auto_scroll_token.wrapping_add(1);
@@ -9833,8 +12405,27 @@ impl App {
         self.request_redraw();
     }
 
-    /// Aviso flutuante, centrado no fundo da janela, que se apaga sozinho.
+    /// Aviso flutuante, centrado na janela, que se apaga sozinho: a resposta
+    /// a um gesto do utilizador (`SplashKind::Notice`).
     fn show_splash(&mut self, text: String, seconds: u64) {
+        if let Some(frame) = self.splash_board.show(text, seconds, SplashKind::Notice) {
+            self.present_splash(frame);
+        }
+    }
+
+    /// Aviso que chega sozinho, sem gesto nenhum (o fim de uma fase do
+    /// Pomodoro): com a pergunta da rolagem a vista, espera por ela.
+    fn show_background_splash(&mut self, text: String, seconds: u64) {
+        if let Some(frame) = self
+            .splash_board
+            .show(text, seconds, SplashKind::Background)
+        {
+            self.present_splash(frame);
+        }
+    }
+
+    /// Poe `frame` no popup (criando-o se preciso) e agenda o fim dele.
+    fn present_splash(&mut self, frame: SplashFrame) {
         let Some(window) = &self.window else {
             return;
         };
@@ -9845,6 +12436,18 @@ impl App {
         let width = (SPLASH_WIDTH * scale).round() as i32;
         let height = (SPLASH_HEIGHT * scale).round() as i32;
 
+        // A dica do rato e o aviso nascem os dois no centro da janela: com a
+        // dica viva do Pomodoro por baixo (refrescada a cada segundo), um
+        // fim de fase empilhava duas mensagens no mesmo sitio. A dica sai;
+        // escondida, `refresh_hint_text` ja nao a traz de volta.
+        hover_tooltip(std::ptr::null_mut(), "");
+        let SplashFrame {
+            text,
+            asks,
+            seconds,
+            token,
+        } = frame;
+        SPLASH_ASKS.store(asks, Ordering::SeqCst);
         if let Ok(mut slot) = SPLASH_TEXT.lock() {
             *slot = text;
         }
@@ -9895,11 +12498,8 @@ impl App {
 
         self.position_splash();
 
-        self.splash_token = self.splash_token.wrapping_add(1);
-        self.timers.after(
-            Duration::from_secs(seconds),
-            UserEvent::HideSplash(self.splash_token),
-        );
+        self.timers
+            .after(Duration::from_secs(seconds), UserEvent::HideSplash(token));
     }
 
     /// Centra o aviso no fundo da janela. Vive em coordenadas de ECRA: se
@@ -9938,10 +12538,17 @@ impl App {
     }
 
     fn hide_splash(&mut self, token: u64) {
-        if token != self.splash_token {
+        let SplashHide::Hide {
+            question_expired,
+            next,
+        } = self.splash_board.hide(token)
+        else {
             return;
-        }
-        if SPLASH_ASKS.swap(false, Ordering::SeqCst) {
+        };
+        SPLASH_ASKS.store(false, Ordering::SeqCst);
+        // So o fim do quadro da PROPRIA pergunta e um "nao" (ver
+        // `SplashBoard`); um aviso que a substituiu nao responde nada.
+        if question_expired {
             self.auto_scroll_answered = true;
             self.auto_scroll.set(false);
         }
@@ -9949,6 +12556,9 @@ impl App {
             unsafe {
                 DestroyWindow(splash);
             }
+        }
+        if let Some(frame) = next {
+            self.present_splash(frame);
         }
     }
 
@@ -10209,25 +12819,31 @@ impl App {
     }
 
     fn ask_auto_scroll(&mut self) {
-        SPLASH_ASKS.store(true, Ordering::SeqCst);
-        self.show_splash(
+        if let Some(frame) = self.splash_board.show(
             format!("Rolar a página sozinho a cada {AUTO_SCROLL_SECONDS}s?"),
             AUTO_SCROLL_PROMPT_SECONDS,
-        );
+            SplashKind::Question,
+        ) {
+            self.present_splash(frame);
+        }
     }
 
     /// Sem resposta nao se mexe: se a pergunta desaparecer sozinha, fica "nao"
     /// ate a pessoa carregar em F8.
     fn answer_auto_scroll(&mut self, yes: bool) {
-        SPLASH_ASKS.store(false, Ordering::SeqCst);
+        self.splash_board.answered();
         self.auto_scroll_answered = true;
         self.auto_scroll.set(yes);
-        self.hide_splash(self.splash_token);
 
         if yes {
             self.auto_scroll_token = self.auto_scroll_token.wrapping_add(1);
             self.schedule_auto_scroll();
+            // Substitui a pergunta; um aviso que esperava por ela aparece
+            // quando este sair.
             self.show_splash(auto_scroll_message(true), 4);
+        } else {
+            // Sai ja; o aviso que esperava (se houver) aparece agora.
+            self.hide_splash(self.splash_board.current());
         }
         self.request_redraw();
     }
@@ -10561,7 +13177,7 @@ impl App {
             window.inner_size().width as f64,
             window.scale_factor(),
             self.bar_visible(),
-            bar_columns(comp),
+            bar_columns(comp, self.pomodoro_bar_label()),
             tab_rows_focused(
                 &comp.contexts,
                 &comp.groups,
@@ -11093,6 +13709,7 @@ impl App {
             window.inner_size().width as f64,
             window.scale_factor().max(1.0),
             split_active,
+            self.pomodoro_bar_label(),
         ))
     }
 
@@ -11118,13 +13735,41 @@ impl App {
                 return Some(BarHit::ServiceStrip(button));
             }
         }
-        if let Some(controls) = self.right_controls()
-            && let Some(hit) = right_controls_hit(controls, self.cursor.0, self.cursor.1)
-        {
-            return Some(hit);
+        bar_hit_at(
+            self.right_controls(),
+            self.bar_layout(),
+            self.cursor.0,
+            self.cursor.1,
+        )
+    }
+
+    /// Ferramentas da Home sob o rato: realce e dica, como na barra.
+    fn update_home_tool_hover(&mut self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        if self.surface != Surface::Home {
+            // Fora da Home a dica e da barra (`update_bar_hover` correu antes
+            // neste mesmo movimento): so se esquece o realce, sem a apagar.
+            self.home_tool_hover = None;
+            return;
         }
-        self.bar_layout()
-            .and_then(|layout| layout.hit(self.cursor.0, self.cursor.1))
+        let next = home_tool_hit(
+            window.inner_size().width as f64,
+            window.scale_factor(),
+            self.pomodoro_bar_label(),
+            self.cursor.0,
+            self.cursor.1,
+        );
+        if next == self.home_tool_hover {
+            return;
+        }
+        self.home_tool_hover = next;
+        if let Some(owner) = window_hwnd(window) {
+            let text = next.map(|tool| tool_hint_at(tool, &self.pomodoro, Instant::now()));
+            hover_tooltip(owner, text.as_deref().unwrap_or(""));
+        }
+        self.request_redraw();
     }
 
     /// "Ir" da Home sob o rato: degradê e mao, para se ver que esta vivo e
@@ -11202,7 +13847,7 @@ impl App {
         {
             // Voltar do minimizado ocupa o lugar do painel que estiver aberto.
             if panel.state.minimized() {
-                self.close_side_panel();
+                self.close_side_panel(PanelExit::OtherPanel);
                 self.close_live_panel();
             }
             self.service_input(ServiceInput::IconClick);
@@ -11210,7 +13855,7 @@ impl App {
         }
         self.close_service_panel();
         // Um painel de cada vez.
-        self.close_side_panel();
+        self.close_side_panel(PanelExit::OtherPanel);
         self.close_live_panel();
         let Some(area) = self
             .service_frame_for(ServicePanelState::default())
@@ -11221,13 +13866,19 @@ impl App {
         let Some(window) = &self.window else {
             return;
         };
+        // Sem IPC, sem scripts injetados, sem `record`/`capture`: nada do que
+        // corre num painel de servico chega ao historico ou a memoria do
+        // NeuralIA. O privado (Respiracao) tambem nao deixa nada no perfil
+        // do WebView2: e InPrivate.
         let built = themed_webview_builder()
+            .with_incognito(service.private())
             .with_url(service.url())
             .with_bounds(logical_rect(area))
-            .with_navigation_handler(|target| service_panel_allows_navigation(&target))
+            .with_navigation_handler(move |target| service_panel_navigation(service, &target))
             .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
-            // Caminho A do WebRTC: camera e microfone pelo aviso do WebView2.
-            .with_permission_handler(|kind| web_media_permission(kind, true))
+            // Caminho A do WebRTC: camera e microfone pelo aviso do WebView2
+            // -- salvo no painel privado, onde sao recusados.
+            .with_permission_handler(move |kind| service_panel_permission(service, kind))
             .build_as_child(window);
         match built {
             Ok(panel) => {
@@ -11273,7 +13924,9 @@ impl App {
     }
 
     fn close_service_panel(&mut self) {
-        if self.service_panel.take().is_none() {
+        // O teclado volta a omnibox (Home) ou a janela: `release_panel`
+        // (gate `closing_a_panel_gives_the_keyboard_back`).
+        if !close_service_panel_in(&mut self.service_panel, self.surface, self.omnibox) {
             return;
         }
         debug_log(format_args!("service panel: fechado"));
@@ -11436,7 +14089,7 @@ impl App {
         }
         let kind = if self.live_panel.is_open() {
             PanelKind::Service
-        } else if self.side_panel.is_some() {
+        } else if self.side_panel.is_open() {
             PanelKind::History
         } else {
             return None;
@@ -11462,12 +14115,7 @@ impl App {
             return Some((area, panel.webview.hwnd().0 as HWND));
         }
         let (_, area) = self.docked_right_panel()?;
-        let host = self
-            .live_panel
-            .view()
-            .or(self.side_panel.as_ref())?
-            .hwnd()
-            .0 as HWND;
+        let host = self.live_panel.view().or(self.side_panel.view())?.hwnd().0 as HWND;
         Some((area, host))
     }
 
@@ -11676,7 +14324,7 @@ impl App {
         // Um painel de cada vez -- o de servicos minimizado nao esta a vista e
         // continua a tocar.
         self.close_docked_service_panel();
-        self.close_side_panel();
+        self.close_side_panel(PanelExit::OtherPanel);
         let Some(bounds) = self.live_panel_rect() else {
             return;
         };
@@ -11798,17 +14446,14 @@ impl App {
         let Some(window) = &self.window else {
             return 0.0;
         };
-        if self.surface != Surface::Comparator {
-            return 0.0;
-        }
         let scale = window.scale_factor().max(1.0);
-        let logical_w = window.inner_size().width as f64 / scale;
-        reserved_panel_width(
+        open_panel_width_for(
+            self.surface,
             self.service_panel.as_ref().map(|panel| panel.state),
             self.live_panel.is_open(),
-            self.side_panel.is_some(),
-            self.chosen_panel_width(PanelKind::Service, logical_w),
-            self.chosen_panel_width(PanelKind::History, logical_w),
+            self.side_panel.is_open(),
+            window.inner_size().width as f64 / scale,
+            self.panel_widths,
         )
     }
 
@@ -11832,8 +14477,8 @@ impl App {
 
     /// Ctrl+H: abre o historico inteligente ao lado; de novo (ou Esc), fecha.
     fn toggle_side_panel(&mut self) {
-        if self.side_panel.is_some() {
-            self.close_side_panel();
+        if self.side_panel.is_open() {
+            self.close_side_panel(PanelExit::CtrlH);
         } else {
             self.open_side_panel();
         }
@@ -11866,13 +14511,16 @@ impl App {
             return;
         };
         let proxy = self.proxy.clone();
+        // O numero desta pagina vai no canal dela: um pedido que chegue
+        // depois de ela sair nao se confunde com o da seguinte.
+        let ticket = self.side_panel.ticket();
         // Criado por ultimo, fica por cima das outras WebViews.
         let built = themed_webview_builder()
             .with_html(panel_html(&Theme::system()))
             .with_bounds(bounds)
             .with_ipc_handler(move |request| {
-                if let Some(message) = parse_panel_message(request.body()) {
-                    let _ = proxy.send_event(UserEvent::Panel(message));
+                if let Some(post) = side_panel::PanelPost::parse(ticket, request.body()) {
+                    let _ = proxy.send_event(UserEvent::Panel(post));
                 }
             })
             .with_navigation_handler(|target| panel_allows_navigation(&target))
@@ -11882,7 +14530,12 @@ impl App {
             Ok(panel) => {
                 let _ = panel.focus();
                 self.install_context_menu(&panel, WebViewHost::SidePanel);
-                self.side_panel = Some(panel);
+                // So com o painel fechado se chega aqui; um aberto nunca e
+                // largado sem `close_side_panel`.
+                if let Err(extra) = self.side_panel.open(ticket, panel) {
+                    drop(extra);
+                    return;
+                }
                 self.fit_comparator_to_panel();
                 self.after_panel_change();
                 debug_log(format_args!(
@@ -11896,33 +14549,356 @@ impl App {
         }
     }
 
-    fn close_side_panel(&mut self) {
-        if self.side_panel.take().is_none() {
+    /// A saida unica do painel do Ctrl+H, venha de onde vier: o X, o Ctrl+H,
+    /// outro painel, a Home, uma pesquisa nova, `destroy_web_surfaces` (o
+    /// ecra de erro, a Web completa, o Leitor, o PDF, um link externo) e a
+    /// saida da app. `SidePanel::dismiss` grava primeiro o que o editor
+    /// tinha por salvar e so depois larga a WebView, devolvendo o teclado
+    /// (gate `every_way_out_of_the_side_panel_saves_the_note_being_typed_once`).
+    fn close_side_panel(&mut self, exit: PanelExit) {
+        let Some(closed) = self.side_panel.dismiss(exit, self.surface, self.omnibox) else {
             return;
-        }
+        };
         self.panel_suggestion_query = None;
-        debug_log(format_args!("side panel: fechado"));
+        debug_log(format_args!("side panel: fechado ({exit:?})"));
+        if let Err(error) = closed.saved {
+            self.show_splash(error, 6);
+        }
         self.fit_comparator_to_panel();
         self.after_panel_change();
-        // Largar a WebView nao devolve o teclado a ninguem.
+        // Na Home, o sitio do painel volta a ser a Home.
         if self.surface == Surface::Home {
-            self.focus_omnibox();
+            self.needs_clear = true;
+            self.request_redraw();
         }
     }
 
     fn position_side_panel(&self) {
-        if let (Some(panel), Some(bounds)) = (&self.side_panel, self.side_panel_rect()) {
+        if let (Some(panel), Some(bounds)) = (self.side_panel.view(), self.side_panel_rect()) {
             let _ = panel.set_bounds(bounds);
         }
     }
 
     fn panel_eval(&self, script: &str) {
-        if let Some(panel) = &self.side_panel {
+        if let Some(panel) = self.side_panel.view() {
             let _ = panel.evaluate_script(script);
         }
     }
 
-    fn handle_panel_message(&mut self, message: PanelMessage) {
+    /// Corre `script` no painel, ou guarda-o para o "ready" se a pagina
+    /// ainda nao correu o script dela. Sem painel, nao faz nada.
+    fn panel_run(&mut self, script: String) {
+        if let Some(script) = self.side_panel.run(script) {
+            self.panel_eval(&script);
+        }
+    }
+
+    /// Abre (se preciso -- nunca fecha) o painel ja nas Notas e corre la os
+    /// `scripts`, pela ordem.
+    fn show_notes_panel(&mut self, scripts: Vec<String>) {
+        if !self.side_panel.is_open() {
+            self.open_side_panel();
+        }
+        if !self.side_panel.is_open() {
+            return;
+        }
+        self.panel_run(PANEL_SHOW_NOTES_SCRIPT.to_string());
+        for script in scripts {
+            self.panel_run(script);
+        }
+    }
+
+    fn submit_notes(&mut self, command: NotesCommand, origin: NotesOrigin) {
+        if let Err(error) = self.notes.submit(command, origin) {
+            match origin {
+                NotesOrigin::Panel => {
+                    self.panel_run(notes_reply_script(&NotesReply::Failed(error)))
+                }
+                NotesOrigin::Selection | NotesOrigin::Closed => self.show_splash(error, 3),
+            }
+        }
+    }
+
+    /// A app vai sair: o que o editor do painel tinha por salvar -- e o que
+    /// fechos anteriores ainda tinham na fila -- chega ao disco antes de o
+    /// processo acabar (`SidePanel::exit`).
+    fn save_notes_draft_before_exit(&mut self) {
+        let _ = self.side_panel.exit(NOTES_EXIT_WAIT);
+    }
+
+    /// Resposta do worker das notas. A de uma selecao abre o painel na nota
+    /// criada; a do painel so vai para o painel que ainda estiver aberto.
+    fn notes_ready(&mut self, origin: NotesOrigin, reply: NotesReply) {
+        match origin {
+            NotesOrigin::Panel => self.panel_run(notes_reply_script(&reply)),
+            NotesOrigin::Selection => match &reply {
+                NotesReply::Opened { .. } => {
+                    self.show_notes_panel(vec![notes_reply_script(&reply)]);
+                    self.show_splash("Nota criada".to_string(), 2);
+                }
+                NotesReply::Failed(error) => self.show_splash(error.clone(), 4),
+                NotesReply::Listed { .. }
+                | NotesReply::Deleted { .. }
+                | NotesReply::Missing { .. }
+                | NotesReply::Conflict { .. } => {}
+            },
+            NotesOrigin::Closed => match &reply {
+                NotesReply::Opened { note, .. } => {
+                    self.show_splash(format!("Nota salva: {}", note.title), 3);
+                }
+                NotesReply::Conflict { note, .. } => {
+                    self.show_splash(
+                        format!(
+                            "A nota mudou fora do NeuralIA; o texto ficou em: {}",
+                            note.title
+                        ),
+                        6,
+                    );
+                }
+                NotesReply::Failed(error) => self.show_splash(error.clone(), 6),
+                NotesReply::Listed { .. }
+                | NotesReply::Deleted { .. }
+                | NotesReply::Missing { .. } => {}
+            },
+        }
+    }
+
+    /// Ctrl+Shift+Z numa pagina: le a selecao da WebView `target` e cria a
+    /// nota. O Split privado nunca e lido.
+    fn request_note_from_page(&mut self, target: Option<PageTarget>) {
+        // Qual WebView e se o Split privado recusa: `note_read_view`, com as
+        // colunas e o Split do proprio comparador (gate
+        // `a_note_request_reads_its_own_webview_and_never_the_private_split`).
+        let comp = self.comparator.as_ref();
+        let webview = match note_read_view(
+            target,
+            comp.map_or(&[][..], |comp| comp.views.as_slice()),
+            comp.and_then(|comp| comp.split.as_ref()),
+            self.webview.as_ref(),
+        ) {
+            Ok(webview) => webview,
+            Err(NoteCapture::RefusePrivate) => {
+                self.show_splash(NOTE_PRIVATE_REFUSAL.to_string(), 3);
+                return;
+            }
+            Err(NoteCapture::Read | NoteCapture::NoPage) => return,
+        };
+        let source = note_page_source(target, self.surface, self.page_source.as_deref());
+        let proxy = self.proxy.clone();
+        let asked = webview.evaluate_script_with_callback(NOTE_CAPTURE_SCRIPT, move |raw| {
+            let _ = proxy.send_event(UserEvent::NoteCaptured {
+                raw,
+                source: source.clone(),
+            });
+        });
+        if asked.is_err() {
+            self.show_splash(
+                "Não foi possível ler a seleção desta página.".to_string(),
+                3,
+            );
+        }
+    }
+
+    fn note_captured(&mut self, raw: &str, source: Option<&str>) {
+        match note_draft_from_capture(raw, source) {
+            Ok(draft) => self.submit_notes(NotesCommand::Create(draft), NotesOrigin::Selection),
+            Err(NoteCaptureError::EmptySelection) => {
+                self.show_splash("Selecione um texto para criar a nota".to_string(), 3);
+            }
+            Err(NoteCaptureError::Unreadable) => {
+                self.show_splash(
+                    "Não foi possível ler a seleção desta página.".to_string(),
+                    3,
+                );
+            }
+        }
+    }
+
+    /// Ctrl+Shift+Z na Home ou na barra: o painel nas Notas, com uma nota
+    /// nova em branco no editor.
+    fn new_note_in_panel(&mut self) {
+        self.show_notes_panel(vec![PANEL_NEW_NOTE_SCRIPT.to_string()]);
+    }
+
+    /// Botao Notas (Zettelkasten): abre o painel do Ctrl+H ja na secao das
+    /// notas. Com o painel aberto quem decide e a pagina
+    /// (`PANEL_NOTES_BUTTON_SCRIPT`): nas Notas fecha -- salvando antes o
+    /// que o editor tinha, como o X --, no Historico passa para as Notas.
+    ///
+    /// A pagina do painel acabou de nascer e ainda nao correu o script dela:
+    /// um `evaluate_script` agora corria no documento vazio e perdia-se. Por
+    /// isso `show_notes_panel` guarda o `PANEL_SHOW_NOTES_SCRIPT` em
+    /// `panel_pending`, e o `PanelMessage::Ready` (o "pronto" que a pagina
+    /// manda no fim do script) corre-o.
+    fn open_notes(&mut self) {
+        if self.side_panel.is_open() {
+            self.panel_run(PANEL_NOTES_BUTTON_SCRIPT.to_string());
+            return;
+        }
+        self.show_notes_panel(Vec::new());
+    }
+
+    /// Clique no botao do Pomodoro (barra ou Home): parado inicia, a correr
+    /// pausa, pausado retoma.
+    fn pomodoro_click(&mut self) {
+        self.pomodoro_command(PomodoroCommand::Click);
+    }
+
+    /// Botao direito no Pomodoro: o menu nativo do estado de agora (so a
+    /// accao que se aplica, Pular fase, Parar e os presets com a marca no
+    /// que esta em uso).
+    fn pomodoro_menu(&mut self) {
+        let Some(owner) = self.window.as_ref().and_then(window_hwnd) else {
+            return;
+        };
+        let items = self.pomodoro.menu_items();
+        let picked = pick_pomodoro_from_menu(owner, &items);
+        if let Some(command) = pomodoro_menu_command(&items, picked) {
+            self.pomodoro_command(command);
+        }
+    }
+
+    /// Clique, menu e `pomodoro:` passam todos por aqui. A decisao e do
+    /// `PomodoroController`; aqui so se faz o que ele devolve.
+    fn pomodoro_command(&mut self, command: PomodoroCommand) {
+        // `run_command` agenda a cadeia nova em `self.timers` (gate:
+        // `only_one_tick_chain_is_ever_alive`).
+        let outcome = self
+            .pomodoro
+            .run_command(command, Instant::now(), &self.timers);
+        let saved = outcome.save.map(|settings| {
+            crate::pomodoro_ui::save_settings(&self.config.data_dir.join("pomodoro"), settings)
+        });
+        let notice = match saved {
+            Some(Err(error)) => Some(format!(
+                "Não foi possível gravar as opções do Pomodoro: {error}"
+            )),
+            _ => outcome.notice,
+        };
+        if let Some(notice) = notice {
+            self.show_splash(notice, POMODORO_NOTICE_SECONDS);
+        }
+        self.pomodoro_changed();
+    }
+
+    /// Um tique: o caminho inteiro e `pomodoro_ui::pomodoro_tick` (gate
+    /// `the_app_tick_announces_a_phase_end_as_the_window_can_see_it`): so o
+    /// da cadeia viva mexe no motor, o seguinte fica agendado e o fim de uma
+    /// fase toca o som, pisca a barra de tarefas e mostra o aviso conforme a
+    /// janela. O `App` so da as pecas (`impl PomodoroHost for App`).
+    fn pomodoro_tick(&mut self, token: u64) {
+        crate::pomodoro_ui::pomodoro_tick(self, token, Instant::now());
+    }
+
+    /// Minimizada e a da frente, para o fim de uma fase do Pomodoro.
+    fn window_attention(&self) -> WindowAttention {
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        let Some(window) = &self.window else {
+            return WindowAttention {
+                minimized: true,
+                foreground: false,
+            };
+        };
+        let foreground =
+            window_hwnd(window).is_some_and(|owner| unsafe { GetForegroundWindow() } == owner);
+        WindowAttention {
+            minimized: window.is_minimized().unwrap_or(false),
+            foreground,
+        }
+    }
+
+    /// O tempo mudou: repinta o botao (a barra, ou a Home) e, se a dica do
+    /// Pomodoro estiver a vista, poe-lhe o tempo novo sem a esconder.
+    fn pomodoro_changed(&mut self) {
+        let hovered = match self.surface {
+            Surface::Comparator => self.bar_hover == Some(BarHit::Tool(Tool::Pomodoro)),
+            Surface::Home => self.home_tool_hover == Some(Tool::Pomodoro),
+            _ => false,
+        };
+        if hovered {
+            refresh_hint_text(&tool_hint_at(
+                Tool::Pomodoro,
+                &self.pomodoro,
+                Instant::now(),
+            ));
+        }
+        if matches!(self.surface, Surface::Comparator | Surface::Home) {
+            self.request_redraw();
+        }
+    }
+
+    /// O tempo que falta no Pomodoro ("mm:ss", "⏸ mm:ss" pausado) para ir ao
+    /// lado do icone, ou `None` parado (o botao so com o icone).
+    fn pomodoro_label(&self) -> Option<String> {
+        self.pomodoro.label(Instant::now())
+    }
+
+    /// A etiqueta ja no formato que a barra e a Home desenham e medem, com a
+    /// fase para a cor.
+    fn pomodoro_bar_label(&self) -> Option<BarLabel> {
+        self.pomodoro_label()
+            .as_deref()
+            .and_then(BarLabel::new)
+            .map(|label| label.with_phase(self.pomodoro.active_phase()))
+    }
+
+    fn run_tool_action(&mut self, action: ToolAction) {
+        // O clique pode abrir um painel por cima do botao: a dica nao fica.
+        hover_tooltip(std::ptr::null_mut(), "");
+        match action {
+            ToolAction::PomodoroClick => self.pomodoro_click(),
+            ToolAction::PomodoroMenu => self.pomodoro_menu(),
+            ToolAction::ToggleNotes => self.open_notes(),
+            ToolAction::ToggleBreath => self.open_service_panel(Service::Breath),
+        }
+    }
+
+    /// Botao direito no comparador: nas ferramentas vai para elas (so o
+    /// Pomodoro tem menu); no resto, o menu das abas de sempre.
+    fn right_click_comparator(&mut self) {
+        let hit = self.comparator_bar_hit();
+        if matches!(hit, Some(BarHit::Tool(_))) {
+            // O menu do Pomodoro tem o seu proprio ciclo de mensagens, como o
+            // das abas (`context_menu_comparator`): um arrasto a meio acaba
+            // aqui, ou o largar do botao esquerdo ja nao chegaria a barra.
+            self.forget_tab_gesture();
+            if let Some(action) = bar_tool_action(hit, ToolClick::Right) {
+                self.run_tool_action(action);
+            }
+            return;
+        }
+        self.context_menu_comparator();
+    }
+
+    fn right_click_home(&mut self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let size = window.inner_size();
+        if let HomeClick::Tool(tool) = home_click_target(
+            (size.width as f64, size.height as f64),
+            window.scale_factor(),
+            self.pomodoro_bar_label(),
+            self.cursor.0,
+            self.cursor.1,
+        ) && let Some(action) = tool_action(tool, ToolClick::Right)
+        {
+            self.run_tool_action(action);
+        }
+    }
+
+    fn handle_panel_message(&mut self, post: side_panel::PanelPost) {
+        // `receive` segue a copia do editor; um pedido de uma pagina que ja
+        // saiu nao chega aqui (o texto que trazia ja foi gravado).
+        let message = match self.side_panel.receive(post) {
+            side_panel::Received::Current(message) => message,
+            side_panel::Received::Late(saved) => {
+                if let Some(Err(error)) = saved {
+                    self.show_splash(error, 6);
+                }
+                return;
+            }
+        };
         match message {
             PanelMessage::Ready => {
                 if let Some(result) = self.history.recent(PANEL_RECENT_LIMIT) {
@@ -11939,13 +14915,32 @@ impl App {
                     self.panel_suggestion_query = Some(question.clone());
                     self.memory.query(question);
                 }
+                // Aberto pelas Notas (botao, Ctrl+Shift+Z): agora a pagina
+                // ja existe e o que esperava corre, pela ordem.
+                for script in self.side_panel.mark_ready() {
+                    self.panel_eval(&script);
+                }
             }
             PanelMessage::Search(query) => self.memory.query(query),
             PanelMessage::Open(input) => {
-                self.close_side_panel();
+                self.close_side_panel(PanelExit::OpenItem);
                 self.handle_input(input);
             }
-            PanelMessage::Close => self.close_side_panel(),
+            PanelMessage::Close => self.close_side_panel(PanelExit::CloseButton),
+            // Ja seguido por `SidePanel::receive`.
+            PanelMessage::NoteDraft(_) => {}
+            PanelMessage::NoteSaveRefused => self.panel_run(notes_reply_script(
+                &NotesReply::Failed(NOTE_SAVE_REFUSED.to_string()),
+            )),
+            notes @ (PanelMessage::NotesList
+            | PanelMessage::NotesSearch(_)
+            | PanelMessage::NoteOpen(_)
+            | PanelMessage::NoteSave(_)
+            | PanelMessage::NoteDelete(_)) => {
+                if let Some(command) = notes_command_for(notes) {
+                    self.submit_notes(command, NotesOrigin::Panel);
+                }
+            }
         }
     }
 
@@ -12110,7 +15105,15 @@ impl App {
             _ => None,
         };
         let maximized = unsafe { IsZoomed(owner) != 0 };
-        bar_tooltip_label(hit, provider, maximized, tab_url, group)
+        bar_hint(
+            hit,
+            &self.pomodoro,
+            Instant::now(),
+            provider,
+            maximized,
+            tab_url,
+            group,
+        )
     }
 
     /// Abre a palette nativa sobre a coluna `source_index`. E um popup Win32,
@@ -13329,6 +16332,11 @@ impl App {
             Some(BarHit::Service(service)) => self.open_service_panel(service),
             Some(BarHit::ServiceStrip(button)) => self.service_input(button.input()),
             Some(BarHit::GmailToggle) => self.toggle_gmail_notifications(),
+            Some(BarHit::Tool(_)) => {
+                if let Some(action) = bar_tool_action(hit, ToolClick::Left) {
+                    self.run_tool_action(action);
+                }
+            }
             Some(BarHit::GeminiLive) => self.toggle_live_panel(),
             Some(BarHit::SplitClose) => self.close_split(),
             Some(BarHit::SplitExpand) => self.toggle_split_fullscreen(),
@@ -13375,19 +16383,29 @@ impl App {
             return;
         };
         let size = window.inner_size();
-        let layout = HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
         let (x, y) = self.cursor;
-
-        // Sem a barra do Windows, a faixa de cima arrasta a janela -- como a
-        // barra do comparador.
-        if home_drag_strip(y, window.scale_factor()) && !layout.go.contains(x, y) {
-            let _ = window.drag_window();
-            return;
-        }
-
-        if layout.go.contains(x, y) {
-            debug_log(format_args!("click_home: botao Ir"));
-            self.submit_current();
+        match home_click_target(
+            (size.width as f64, size.height as f64),
+            window.scale_factor(),
+            self.pomodoro_bar_label(),
+            x,
+            y,
+        ) {
+            HomeClick::Tool(tool) => {
+                if let Some(action) = tool_action(tool, ToolClick::Left) {
+                    self.run_tool_action(action);
+                }
+            }
+            // Sem a barra do Windows, a faixa de cima arrasta a janela -- como
+            // a barra do comparador.
+            HomeClick::Drag => {
+                let _ = window.drag_window();
+            }
+            HomeClick::Go => {
+                debug_log(format_args!("click_home: botao Ir"));
+                self.submit_current();
+            }
+            HomeClick::Nothing => {}
         }
     }
 }
@@ -13400,6 +16418,8 @@ enum MainShortcut {
     Reload,
     History,
     NewTab,
+    /// Ctrl+Shift+Z sem pagina com selecao: nota nova no painel.
+    NewNote,
 }
 
 fn main_window_shortcut(
@@ -13417,6 +16437,7 @@ fn main_window_shortcut(
         ("r", true) => Some(MainShortcut::Reload),
         ("h", false) => Some(MainShortcut::History),
         ("n", false) => Some(MainShortcut::NewTab),
+        ("z", true) => Some(MainShortcut::NewNote),
         _ => None,
     }
 }
@@ -15128,11 +18149,21 @@ enum InputRoute {
     History,
     /// `tema:claro`, `tema:escuro`, `tema:sistema` (None: palavra desconhecida).
     Theme(Option<ThemeChoice>),
+    /// `pomodoro:`, `pomodoro:pausar`, `pomodoro:50`... (None: palavra
+    /// desconhecida -> a ajuda).
+    Pomodoro(Option<PomodoroCommand>),
     ResearchCompare,
     ResearchSynthesize,
     ResearchExport,
     /// Sem comando próprio: segue para o `parse_intent`.
     Intent,
+}
+
+/// `text` sem `prefix` a frente, se comecar por ele (maiusculas ou nao).
+fn strip_prefix_ignore_ascii_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &text[prefix.len()..])
 }
 
 fn route_input(input: &str) -> InputRoute {
@@ -15159,6 +18190,12 @@ fn route_input(input: &str) -> InputRoute {
         .or_else(|| trimmed.strip_prefix("theme:"))
     {
         return InputRoute::Theme(ThemeChoice::parse(word));
+    }
+    // Sem distinguir maiusculas, como os `research:`. Os dois pontos sao
+    // obrigatorios, como no `tema:`: "pomodoro tecnica" continua a ser uma
+    // pesquisa sobre o metodo.
+    if let Some(word) = strip_prefix_ignore_ascii_case(trimmed, "pomodoro:") {
+        return InputRoute::Pomodoro(parse_pomodoro_command(word));
     }
     if let Some(spec) = input.strip_prefix("agent:") {
         return InputRoute::Agent(spec.trim().to_string());
@@ -15434,6 +18471,37 @@ fn reader_article_memory_text(article: &ReaderArticle) -> String {
     output
 }
 
+/// As pecas do `App` que o tique do Pomodoro usa (`pomodoro_ui::pomodoro_tick`).
+impl PomodoroHost for App {
+    type Timers = Timers;
+
+    fn pomodoro_parts(&mut self) -> (&mut PomodoroController, &Timers) {
+        (&mut self.pomodoro, &self.timers)
+    }
+
+    fn attention(&self) -> WindowAttention {
+        self.window_attention()
+    }
+
+    fn chime(&mut self) {
+        pomodoro_sound();
+    }
+
+    fn flash_taskbar(&mut self) {
+        if let Some(owner) = self.window.as_ref().and_then(window_hwnd) {
+            flash_taskbar(owner);
+        }
+    }
+
+    fn notice(&mut self, message: String) {
+        self.show_background_splash(message, POMODORO_PHASE_END_SECONDS);
+    }
+
+    fn repaint(&mut self) {
+        self.pomodoro_changed();
+    }
+}
+
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -15528,7 +18596,10 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::ExitRequested => event_loop.exit(),
+            UserEvent::ExitRequested => {
+                self.save_notes_draft_before_exit();
+                event_loop.exit();
+            }
             UserEvent::SaveTabSession(token) => self.save_due_tab_session(token),
             UserEvent::HomeRequested => self.show_home(),
             UserEvent::BackRequested => self.escape_or_back(),
@@ -15551,6 +18622,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ViewSource => self.view_source(),
             UserEvent::ViewSourceTarget(target) => self.view_source_target(target),
             UserEvent::AutoScrollTick(token) => self.auto_scroll_tick(token),
+            UserEvent::PomodoroTick(token) => self.pomodoro_tick(token),
             UserEvent::HideSplash(token) => self.hide_splash(token),
             UserEvent::CaptionReveal => self.refresh_caption_reveal(),
             UserEvent::ResizePanel => self.resize_panel(),
@@ -15597,7 +18669,14 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::HideGmailToast(token) => self.hide_gmail_toast(token),
             UserEvent::ShowHistory => self.toggle_side_panel(),
             UserEvent::ThemeChosen(choice) => self.choose_theme(choice),
-            UserEvent::Panel(message) => self.handle_panel_message(message),
+            UserEvent::Panel(post) => self.handle_panel_message(post),
+            UserEvent::NotesReady { origin, reply } => self.notes_ready(origin, reply),
+            UserEvent::NoteRequested(target) => self.request_note_from_page(target),
+            UserEvent::NoteRefusedPrivate => {
+                self.show_splash(NOTE_PRIVATE_REFUSAL.to_string(), 3);
+            }
+            UserEvent::NoteCaptured { raw, source } => self.note_captured(&raw, source.as_deref()),
+            UserEvent::NewNote => self.new_note_in_panel(),
             UserEvent::Live(message) => self.handle_live_message(message),
             UserEvent::GmailAnswer(open) => self.answer_gmail(open),
             UserEvent::ClearHistory => {
@@ -15617,7 +18696,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::HistoryCleared(result) => self.report_history_cleared(result),
             UserEvent::HistoryLoaded(result) => {
-                if self.side_panel.is_some() {
+                if self.side_panel.is_open() {
                     self.panel_show_history(result);
                 } else {
                     self.show_history_entries(result);
@@ -15627,7 +18706,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.show_splash(format!("Histórico não foi gravado: {error}"), 4);
             }
             UserEvent::MemoryQueryReady { query, result } => {
-                if self.side_panel.is_some() {
+                if self.side_panel.is_open() {
                     self.panel_show_memory(&query, result);
                 } else {
                     self.show_memory_results(&query, result);
@@ -15820,7 +18899,10 @@ impl ApplicationHandler<UserEvent> for App {
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.save_notes_draft_before_exit();
+                event_loop.exit();
+            }
             WindowEvent::RedrawRequested => {
                 if self.needs_clear {
                     self.clear_client();
@@ -15829,7 +18911,13 @@ impl ApplicationHandler<UserEvent> for App {
                 match self.surface {
                     Surface::Home => {
                         if let Some(window) = &self.window {
-                            draw_home(window, self.status.as_deref(), self.home_go_hover);
+                            draw_home(
+                                window,
+                                self.status.as_deref(),
+                                self.home_go_hover,
+                                self.home_tool_hover,
+                                self.pomodoro_bar_label(),
+                            );
                         }
                     }
                     Surface::Comparator => {
@@ -15851,6 +18939,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.bar_visible(),
                                 self.auto_scroll.get(),
                                 drag,
+                                self.pomodoro_bar_label(),
                                 &self.live_panel,
                             );
                             if let Some((service, badge, strip)) = service {
@@ -15930,6 +19019,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.update_home_go_hover();
                 self.refresh_caption_reveal();
+                self.update_home_tool_hover();
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor = (-1.0, -1.0);
@@ -15938,6 +19028,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.update_home_go_hover();
                 self.refresh_caption_reveal();
+                self.update_home_tool_hover();
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Focused(focused) => self.on_focus_changed(focused),
@@ -15963,7 +19054,11 @@ impl ApplicationHandler<UserEvent> for App {
                 state: ElementState::Pressed,
                 button: MouseButton::Right,
                 ..
-            } if self.surface == Surface::Comparator => self.context_menu_comparator(),
+            } => match self.surface {
+                Surface::Comparator => self.right_click_comparator(),
+                Surface::Home => self.right_click_home(),
+                _ => {}
+            },
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
                 if let Some(shortcut) = main_window_shortcut(&event.logical_key, self.modifiers) {
                     match shortcut {
@@ -15971,6 +19066,7 @@ impl ApplicationHandler<UserEvent> for App {
                         MainShortcut::Reload => self.reload_page(),
                         MainShortcut::History => self.toggle_side_panel(),
                         MainShortcut::NewTab => self.new_tab(0),
+                        MainShortcut::NewNote => self.new_note_in_panel(),
                     }
                     return;
                 }
@@ -16054,6 +19150,11 @@ fn serve_pdf_asset(
             Cow::Borrowed(PDF_VIEWER_HTML),
         ),
         "/viewer.mjs" => (200, "text/javascript", Cow::Borrowed(PDF_VIEWER_JS)),
+        "/read-aloud.js" => (
+            200,
+            "text/javascript",
+            Cow::Borrowed(READ_ALOUD_SCRIPT.as_bytes()),
+        ),
         "/pdf.mjs" => (200, "text/javascript", Cow::Borrowed(PDFJS_CORE)),
         "/pdf.worker.mjs" => (200, "text/javascript", Cow::Borrowed(PDFJS_WORKER)),
         "/document.pdf" => {
@@ -16300,6 +19401,9 @@ fn common_ipc_event(action: IpcAction) -> Option<UserEvent> {
         IpcAction::DevTools => UserEvent::OpenDevTools,
         IpcAction::ViewSource => UserEvent::ViewSource,
         IpcAction::NewTab { col } => UserEvent::NewTab(col.unwrap_or(0)),
+        // A WebView unica (web externa, Leitor, PDF). As colunas e o Split
+        // tratam o `note` antes de chegar aqui.
+        IpcAction::Note => UserEvent::NoteRequested(None),
         _ => return None,
     })
 }
@@ -16326,12 +19430,28 @@ enum PaletteRoute {
     OpenPrivateProvider {
         query: String,
     },
+    /// `pomodoro:` -- o botao do Pomodoro vive na barra do comparador, e e
+    /// aqui (a palette) que o teclado escreve comandos: sem esta rota,
+    /// "pomodoro:pausar" dava "esquema nao permitido" e "pomodoro: 50" ia
+    /// perguntar a IA e ficava no historico. `None`: palavra desconhecida
+    /// (a ajuda).
+    Pomodoro(Option<PomodoroCommand>),
+    /// `tema:` -- o mesmo comando da omnibox da Home.
+    Theme(Option<ThemeChoice>),
 }
 
 fn route_palette(input: &str, source_index: usize, private: bool) -> PaletteRoute {
     let input = input.trim();
     if input.is_empty() || source_index >= COMPARATOR_COLUMNS {
         return PaletteRoute::Invalid(None);
+    }
+    // Os comandos locais da omnibox que fazem sentido sem sair do
+    // comparador, pela MESMA `route_input` da Home. Nada disto sai do
+    // computador, nem num painel privado.
+    match route_input(input) {
+        InputRoute::Pomodoro(command) => return PaletteRoute::Pomodoro(command),
+        InputRoute::Theme(choice) => return PaletteRoute::Theme(choice),
+        _ => {}
     }
     match parse_intent(input) {
         Ok(Intent::Read(url)) | Ok(Intent::Web(url)) => PaletteRoute::OpenSplit { url, private },
@@ -16777,7 +19897,13 @@ unsafe fn draw_neural_tissue(
     }
 }
 
-fn draw_home(window: &Window, status: Option<&str>, go_hover: bool) {
+fn draw_home(
+    window: &Window,
+    status: Option<&str>,
+    go_hover: bool,
+    tool_hover: Option<Tool>,
+    pomodoro_label: Option<BarLabel>,
+) {
     let Ok(handle) = window.window_handle() else {
         return;
     };
@@ -16872,6 +19998,24 @@ fn draw_home(window: &Window, status: Option<&str>, go_hover: bool) {
             draw_button(target, layout.go, "Ir", true, scale, body_font, &theme);
         }
 
+        // Ferramentas no canto de cima, a esquerda dos botoes da janela.
+        let tools = home_tool_buttons(width, scale, pomodoro_label);
+        let labels = [pomodoro_label, None, None];
+        for ((rect, tool), label) in tools.iter().zip(Tool::ALL).zip(labels) {
+            draw_tool_button(
+                target,
+                *rect,
+                tool,
+                label.as_ref().map(BarLabel::as_str),
+                label.and_then(|label| label.phase),
+                tool_hover == Some(tool),
+                scale,
+                small_font,
+                &theme,
+                theme.page_bg,
+            );
+        }
+
         if let Some(message) = status {
             SelectObject(target, small_font as _);
             SetTextColor(target, rgb3(theme.fg_muted));
@@ -16916,6 +20060,8 @@ fn draw_home(window: &Window, status: Option<&str>, go_hover: bool) {
     }
 }
 
+// O arrasto das abas (2.1.7) e a etiqueta do Pomodoro chegam ambos da `App`.
+#[allow(clippy::too_many_arguments)]
 fn draw_comparator_bar<W>(
     window: &Window,
     comp: &ComparatorState,
@@ -16923,6 +20069,7 @@ fn draw_comparator_bar<W>(
     visible: bool,
     auto_scroll: bool,
     drag: Option<DragPaint>,
+    pomodoro_label: Option<BarLabel>,
     live: &LivePanel<W>,
 ) {
     let Ok(handle) = window.window_handle() else {
@@ -16972,7 +20119,7 @@ fn draw_comparator_bar<W>(
             width,
             scale,
             &names,
-            bar_columns(comp),
+            bar_columns(comp, pomodoro_label),
             &comp.contexts,
             &comp.groups,
             comp.split.as_ref().map(|split| {
@@ -17030,14 +20177,10 @@ fn draw_service_chrome(
         GetClientRect(hwnd, &mut client);
 
         if let Some(badge) = badge {
-            let controls = right_controls(client.right.max(1) as f64, scale, split_active);
-            if let Some(icon) = controls
-                .services
-                .iter()
-                .zip(SERVICE_BUTTON_HITS)
-                .find(|(_, hit)| *hit == BarHit::Service(service))
-                .map(|(rect, _)| *rect)
-            {
+            // Os icones dos servicos e o botao da Respiracao nao dependem da
+            // etiqueta do Pomodoro (so o proprio Pomodoro alarga).
+            let controls = right_controls(client.right.max(1) as f64, scale, split_active, None);
+            if let Some(icon) = service_icon_rect(controls, service) {
                 let color = match badge {
                     ServiceBadge::Playing => LIVE_ON_RED,
                     ServiceBadge::Minimized => theme.accent,
@@ -17538,7 +20681,29 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
     }
 
     // Os mesmos rectangulos que o hit-testing usa; ver `right_controls`.
-    let controls = right_controls(width as f64, scale, active_context.is_some());
+    let controls = right_controls(
+        width as f64,
+        scale,
+        active_context.is_some(),
+        columns.pomodoro_label,
+    );
+    // Ferramentas, num grupo a esquerda do Gemini Live. O Pomodoro leva o tempo
+    // ao lado do icone quando `right_controls` lhe deu largura para isso.
+    let labels = [columns.pomodoro_label, None, None];
+    for ((rect, tool), label) in controls.tools.iter().zip(Tool::ALL).zip(labels) {
+        draw_tool_button(
+            target,
+            *rect,
+            tool,
+            label.as_ref().map(BarLabel::as_str),
+            label.and_then(|label| label.phase),
+            hover == Some(BarHit::Tool(tool)),
+            scale,
+            font,
+            theme,
+            theme.bar_bg,
+        );
+    }
     let gmail_tint = if GMAIL_NOTIFICATIONS.load(Ordering::Acquire) {
         theme.fg
     } else {
@@ -17577,19 +20742,23 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
         (active_context, controls.split)
     {
         let source = names.get(source_index).copied().unwrap_or("IA");
-        draw_pill(
-            target,
-            label,
-            &if private_split {
-                format!("Privado · {source}")
-            } else {
-                format!("Fonte · {source}")
-            },
-            PillStyle::new(theme.surface, theme.surface_line, theme.fg_muted),
-            scale,
-            tab_font,
-            theme.bar_bg,
-        );
+        // Numa janela estreita o rotulo cede lugar (ver `right_controls_flex`)
+        // e pode nem existir: sem largura nao se escreve nada.
+        if label.width > 0.0 {
+            draw_pill(
+                target,
+                label,
+                &if private_split {
+                    format!("Privado · {source}")
+                } else {
+                    format!("Fonte · {source}")
+                },
+                PillStyle::new(theme.surface, theme.surface_line, theme.fg_muted),
+                scale,
+                tab_font,
+                theme.bar_bg,
+            );
+        }
         draw_button(
             target,
             expand,
@@ -18169,6 +21338,7 @@ mod tests {
                 minimized: [false; COMPARATOR_COLUMNS],
                 split_active: false,
                 panel_width: 0.0,
+                pomodoro_label: None,
             }
         }
 
@@ -18219,7 +21389,7 @@ mod tests {
             let columns = dragged([1.0; COMPARATOR_COLUMNS], 1, 1120.0);
             let layout =
                 BarLayout::with_contexts(1120.0, 1.0, true, columns, [0; COMPARATOR_COLUMNS]);
-            let private = right_controls(1120.0, 1.0, false).private;
+            let private = right_controls(1120.0, 1.0, false, None).private;
 
             for index in 0..COMPARATOR_COLUMNS {
                 let plus = layout.add_tabs[index];
@@ -18247,6 +21417,7 @@ mod tests {
                 minimized: [false, true, false],
                 split_active: false,
                 panel_width: 0.0,
+                pomodoro_label: None,
             };
             let layout =
                 BarLayout::with_contexts(1120.0, 1.0, true, columns, [0; COMPARATOR_COLUMNS]);
@@ -19037,7 +22208,7 @@ mod tests {
         // Sem fonte aberta ao lado, nao ha o par da fonte.
         assert_eq!(layout.back.width, 0.0);
         // Com a fonte aberta, o par dela fica a esquerda do rotulo.
-        let drawer = right_controls(1440.0, 1.0, true);
+        let drawer = right_controls(1440.0, 1.0, true, None);
         let ((back, forward), (label, _, _)) = (
             drawer.split_nav.expect("‹ › da fonte"),
             drawer.split.expect("gaveta"),
@@ -19494,7 +22665,7 @@ mod tests {
 
     #[test]
     fn service_icons_sit_left_of_private_without_overlap_and_hit_their_service() {
-        let controls = right_controls(1600.0, 1.0, false);
+        let controls = right_controls(1600.0, 1.0, false, None);
         let order = [
             BarHit::Service(Service::Meet),
             BarHit::Service(Service::WhatsApp),
@@ -19513,13 +22684,29 @@ mod tests {
             previous_right <= controls.private.x,
             "os icones ficam a esquerda do Privado"
         );
-        // O olho do Gemini Live abre a fila, a esquerda da videochamada.
+        // O olho do Gemini Live fica logo a esquerda da videochamada; as
+        // ferramentas, num grupo proprio, vem antes dele e sao o inicio do
+        // canto.
         assert!(controls.live.x + controls.live.width <= controls.services[0].x);
         assert_eq!(controls.leftmost(), controls.live.x);
+        // As ferramentas ficam na linha de cima, como na Home.
+        for (tool, home) in controls
+            .tools
+            .iter()
+            .zip(home_tool_buttons(1600.0, 1.0, None))
+        {
+            assert_eq!(
+                (tool.x, tool.y, tool.width, tool.height),
+                (home.x, home.y, home.width, home.height)
+            );
+        }
+        for tool in controls.tools {
+            assert!(tool.y + tool.height <= TITLE_TAB_HEIGHT);
+        }
         // O Privado passa a ser um botao redondo so com o icone.
         assert_eq!(controls.private.width, controls.private.height);
         // Com a gaveta aberta tudo continua a esquerda dela.
-        let drawer = right_controls(1600.0, 1.0, true);
+        let drawer = right_controls(1600.0, 1.0, true, None);
         let (label, _, _) = drawer.split.expect("gaveta");
         assert!(drawer.private.x + drawer.private.width <= label.x);
     }
@@ -19527,7 +22714,7 @@ mod tests {
     #[test]
     fn the_gemini_live_eye_toggles_live_and_says_what_it_sends() {
         for (width, split) in [(1600.0, false), (1440.0, true), (1120.0, false)] {
-            let controls = right_controls(width, 1.0, split);
+            let controls = right_controls(width, 1.0, split, None);
             let live = controls.live;
             assert!(
                 live.width > 0.0 && live.width == live.height,
@@ -19772,7 +22959,7 @@ mod tests {
     fn the_gemini_live_eye_on_the_painted_bar_follows_the_panel() {
         let theme = Theme::dark((0, 120, 212));
         let width = 1600i32;
-        let eye = right_controls(width as f64, 1.0, false).live;
+        let eye = right_controls(width as f64, 1.0, false, None).live;
         let near = |a: (u8, u8, u8), b: (u8, u8, u8)| {
             (a.0 as i32 - b.0 as i32).abs() <= 3
                 && (a.1 as i32 - b.1 as i32).abs() <= 3
@@ -19983,7 +23170,7 @@ mod tests {
         for close in [
             "self.close_live_panel();",
             "self.close_service_panel();",
-            "self.side_panel.take()",
+            "self.close_side_panel(PanelExit::SurfaceChange);",
         ] {
             assert!(
                 destroy.find(close).is_some_and(|at| at < hide),
@@ -21608,6 +24795,7 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
             ("/viewer.html", true, "text/html; charset=utf-8", 200),
             ("/", true, "text/html; charset=utf-8", 200),
             ("/viewer.mjs", false, "text/javascript", 200),
+            ("/read-aloud.js", false, "text/javascript", 200),
             ("/pdf.mjs", false, "text/javascript", 200),
             ("/pdf.worker.mjs", false, "text/javascript", 200),
             ("/document.pdf", false, "application/pdf", 200),
@@ -21706,6 +24894,520 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
         assert!(PDF_VIEWER_CSP.contains("connect-src 'self'"));
         assert!(!PDF_VIEWER_CSP.contains("https:"));
         assert!(!PDF_VIEWER_CSP.contains("http:"));
+    }
+
+    fn pdf_request(path: &str) -> Request<Vec<u8>> {
+        Request::builder()
+            .uri(format!("{PDF_ORIGIN}{path}"))
+            .body(Vec::new())
+            .expect("pedido de teste")
+    }
+
+    /// O DOM do viewer.html (#status, #hud, #pages), um canvas sem pixeis, o
+    /// scroll da janela (regista o destino e dispara 'scroll') e um PDF.js de
+    /// mentira no lugar do ./pdf.mjs: paginas de 600x800, o texto de cada
+    /// uma, o /Lang do documento e uma TextLayer que cria os textDivs como a
+    /// verdadeira.
+    const VIEWER_PRELUDE: &str = r#"
+globalThis.console = {
+  error: (...parts) => __errors.push('console.error: ' + parts.map(String).join(' ')),
+  warn() {},
+  log() {},
+};
+for (const id of ['status', 'hud', 'pages']) {
+  const el = document.createElement('div');
+  el.id = id;
+  document.body.appendChild(el);
+}
+__byId('hud').hidden = true;
+const __make = document.createElement.bind(document);
+document.createElement = (tag) => {
+  const el = __make(tag);
+  if (String(tag).toLowerCase() === 'canvas') el.getContext = () => ({});
+  return el;
+};
+document.createDocumentFragment = () => __make('fragment');
+globalThis.__scrolledTo = [];
+window.scrollTo = (options) => {
+  const top = options && typeof options === 'object' ? options.top : Number(options);
+  __scrolledTo.push(top);
+  window.scrollY = top;
+  __dispatch(window, 'scroll', { bubbles: false });
+};
+class TextLayer {
+  constructor({ textContentSource, container }) {
+    this.source = textContentSource;
+    this.container = container;
+    this.textDivs = [];
+  }
+  render() {
+    const page = this.source.__page;
+    this.source.items.forEach((item, k) => {
+      if (typeof item.str !== 'string') return;
+      const span = document.createElement('span');
+      span.textContent = item.str;
+      span.setAttribute('data-unit', page + ':' + k);
+      if (item.str !== '') this.container.appendChild(span);
+      this.textDivs.push(span);
+    });
+    return Promise.resolve();
+  }
+  cancel() {}
+}
+const __page = (i) => ({
+  getViewport: ({ scale }) => ({ width: 600 * scale, height: 800 * scale }),
+  render: () => ({ promise: Promise.resolve(), cancel() {} }),
+  getTextContent: () =>
+    Promise.resolve({ items: __pdfPages[i].map((it) => ({ str: it.str, hasEOL: !!it.eol })), __page: i }),
+  cleanup() {},
+});
+const __doc = {
+  numPages: __pdfPages.length,
+  getPage: (n) => Promise.resolve(__page(n - 1)),
+  getMetadata: () => Promise.resolve({ info: __pdfLang ? { Language: __pdfLang } : {} }),
+};
+globalThis.__modules = {
+  './pdf.mjs': {
+    GlobalWorkerOptions: {},
+    getDocument: () => ({ promise: Promise.resolve(__doc) }),
+    TextLayer,
+  },
+};
+"#;
+
+    /// Corre o viewer.mjs e o read-aloud.js QUE O serve_pdf_asset SERVE --
+    /// os bytes da resposta, nao uma copia -- sobre o PDF de mentira, e
+    /// depois o `drive`.
+    fn run_pdf_viewer(
+        pages: serde_json::Value,
+        lang: Option<&str>,
+        drive: &str,
+    ) -> serde_json::Value {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let served = |path: &str| {
+            let response = serve_pdf_asset(&bytes, &pdf_request(path));
+            assert_eq!(response.status().as_u16(), 200, "{path}");
+            String::from_utf8(response.body().to_vec()).expect("UTF-8")
+        };
+        let viewer = served("/viewer.mjs");
+        let read_aloud = served("/read-aloud.js");
+        let prelude = format!(
+            "const __pdfPages = {pages};\nconst __pdfLang = {};\n{VIEWER_PRELUDE}",
+            serde_json::json!(lang)
+        );
+        let outcome = crate::read_aloud::harness::run_module(
+            &[("read-aloud.js", &read_aloud)],
+            &format!("{PDF_ORIGIN}/viewer.html"),
+            crate::read_aloud::harness::Module {
+                name: "viewer.mjs",
+                text: &viewer,
+                prelude: &prelude,
+            },
+            drive,
+        );
+        crate::read_aloud::harness::clean_result(&outcome).clone()
+    }
+
+    const VIEWER_VOICES: &str = r#"
+const LOCAL_BR = __voice('Microsoft Maria - Portuguese (Brazil)', 'pt-BR', true);
+const LOCAL_EN = __voice('Microsoft Zira - English (United States)', 'en-US', true, { default: true });
+__speech.setVoices([LOCAL_BR, LOCAL_EN]);
+await __settle();
+"#;
+
+    fn three_pages() -> serde_json::Value {
+        serde_json::json!([
+            [{ "str": "Primeira página. Fim um.", "eol": false }],
+            [{ "str": "Segunda página. Fim dois.", "eol": false }],
+            [{ "str": "Terceira página. Fim três.", "eol": false }],
+        ])
+    }
+
+    /// Gate: o visualizador de PDF QUE EMBARCA liga mesmo a leitura em voz
+    /// alta ao documento -- ate aqui os gates usavam um visualizador falso do
+    /// harness e o `attachReadAloud()` podia sair sem nada ficar vermelho.
+    /// Com o viewer.mjs servido e um PDF.js de mentira: (1) o Ctrl+Shift+U le
+    /// a pagina que o HUD mostra e realca a frase nos textDivs da TextLayer;
+    /// (2) chegada a uma pagina ainda sem camada de texto, a leitura rola ate
+    /// ela (tops[i] - 24) e o realce aparece quando a camada fica pronta
+    /// (`renderTextLayer` -> `pageReady`).
+    #[test]
+    fn the_shipped_pdf_viewer_reads_the_page_under_the_hud_and_highlights_late_pages() {
+        let hud = run_pdf_viewer(
+            three_pages(),
+            None,
+            &format!(
+                r#"{VIEWER_VOICES}
+window.scrollY = 1300;
+__dispatch(window, 'scroll', {{ bubbles: false }});
+__tick(20);
+await __settle();
+const hud = __byId('hud').textContent;
+__key({{ key: 'U', ctrlKey: true, shiftKey: true }});
+await __settle();
+return {{ hud, said: __said(), highlight: __highlight().map((h) => h.text) }};
+"#
+            ),
+        );
+        assert_eq!(hud["hud"], "2 / 3", "{hud}");
+        assert_eq!(
+            hud["said"],
+            serde_json::json!(["Segunda página."]),
+            "o Ctrl+Shift+U nao leu a pagina do HUD: {hud}"
+        );
+        assert_eq!(hud["highlight"], serde_json::json!(["Segunda página."]));
+
+        let late = run_pdf_viewer(
+            three_pages(),
+            None,
+            &format!(
+                r#"{VIEWER_VOICES}
+__key({{ key: 'U', ctrlKey: true, shiftKey: true }});
+await __settle();
+for (let i = 0; i < 4; i++) {{ __speech.finish(); await __settle(); }}
+const before = __highlight().map((h) => h.text);
+__tick(20);
+await __settle();
+return {{ said: __said(), scrolledTo: __scrolledTo, before, after: __highlight().map((h) => h.text) }};
+"#
+            ),
+        );
+        assert_eq!(
+            late["said"],
+            serde_json::json!([
+                "Primeira página.",
+                "Fim um.",
+                "Segunda página.",
+                "Fim dois.",
+                "Terceira página."
+            ]),
+            "{late}"
+        );
+        // tops[2] = 200 + 2 x 1280 (paginas de 800 a escala 960/600).
+        assert!(
+            late["scrolledTo"]
+                .as_array()
+                .expect("scrolledTo")
+                .contains(&serde_json::json!(2736)),
+            "a leitura nao levou a pagina 3 ao ecra: {late}"
+        );
+        assert_eq!(late["before"], serde_json::json!([]), "{late}");
+        assert_eq!(
+            late["after"],
+            serde_json::json!(["Terceira página."]),
+            "a camada de texto chegou e o realce nao: {late}"
+        );
+    }
+
+    /// Gate: a voz e a do idioma do DOCUMENTO. O visualizador passa o /Lang
+    /// do PDF (`info.Language`); sem ele, o idioma sai do texto da pagina.
+    /// Antes ia sempre o `lang="pt"` do proprio viewer.html, e um artigo em
+    /// ingles era lido pela voz pt-BR com uma voz inglesa instalada.
+    #[test]
+    fn the_shipped_pdf_viewer_reads_with_the_voice_of_the_document_language() {
+        let voice_for = |pages: serde_json::Value, lang: Option<&str>| {
+            let result = run_pdf_viewer(
+                pages,
+                lang,
+                &format!(
+                    r#"{VIEWER_VOICES}
+__key({{ key: 'U', ctrlKey: true, shiftKey: true }});
+await __settle();
+return __speech.log.map((x) => x.voice);
+"#
+                ),
+            );
+            result[0].as_str().unwrap_or_default().to_string()
+        };
+        let zira = "Microsoft Zira - English (United States)";
+        let maria = "Microsoft Maria - Portuguese (Brazil)";
+        let short = serde_json::json!([[{ "str": "OK. Fim.", "eol": false }]]);
+        let english = serde_json::json!([[{
+            "str": "The quick brown fox jumps over the lazy dog. It was sunny and the children were playing in the park with their friends.",
+            "eol": false
+        }]]);
+        let portuguese = serde_json::json!([[{
+            "str": "A raposa pula por cima do cão. Não é uma história com muito sentido, mas é da tradição dos testes.",
+            "eol": false
+        }]]);
+        assert_eq!(voice_for(short, Some("en-US")), zira, "o /Lang do PDF");
+        assert_eq!(voice_for(english, None), zira, "o texto em ingles");
+        assert_eq!(voice_for(portuguese, None), maria, "o texto em portugues");
+    }
+
+    #[test]
+    fn pdf_viewer_loads_read_aloud_from_its_own_origin_and_gains_no_network_source() {
+        // SPEC-0110, fase offline. O viewer.html pede o read-aloud.js a
+        // propria origem, e ele sai do serve_pdf_asset byte a byte como
+        // embarca, com o tipo certo.
+        let html = std::str::from_utf8(PDF_VIEWER_HTML).expect("viewer.html e UTF-8");
+        let sources: Vec<&str> = html
+            .split("<script")
+            .skip(1)
+            .filter_map(|tag| {
+                let tag = tag.split('>').next()?;
+                tag.split("src=\"").nth(1)?.split('"').next()
+            })
+            .collect();
+        assert!(
+            sources.contains(&"./read-aloud.js"),
+            "viewer.html tem de carregar o read-aloud.js: {sources:?}"
+        );
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        for source in &sources {
+            let path = source.trim_start_matches('.');
+            let response = serve_pdf_asset(&bytes, &pdf_request(path));
+            assert_eq!(response.status().as_u16(), 200, "{path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("Content-Type")
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/javascript"),
+                "{path}"
+            );
+        }
+        let served = serve_pdf_asset(&bytes, &pdf_request("/read-aloud.js"));
+        assert_eq!(served.body().as_ref(), READ_ALOUD_SCRIPT.as_bytes());
+
+        // A leitura offline nao abre ligacao nenhuma: o connect-src continua a
+        // ser so 'self' e nenhuma diretiva ganha uma origem de rede (ws:,
+        // wss:, http:, https: ou um host). So blob: e data: tem ':'.
+        let directives: Vec<(&str, Vec<&str>)> = PDF_VIEWER_CSP
+            .split(';')
+            .filter_map(|directive| {
+                let mut parts = directive.split_whitespace();
+                Some((parts.next()?, parts.collect()))
+            })
+            .collect();
+        let connect = directives
+            .iter()
+            .find(|(name, _)| *name == "connect-src")
+            .map(|(_, values)| values.clone());
+        assert_eq!(connect, Some(vec!["'self'"]));
+        for (name, values) in &directives {
+            for value in values {
+                assert!(
+                    !value.contains(':') || *value == "blob:" || *value == "data:",
+                    "{name} ganhou uma origem de rede: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_shift_u_reads_the_pdf_aloud_and_esc_stops_without_leaving_the_document() {
+        // O mapa de teclas QUE EMBARCA (initialization script do PDF) e o
+        // read-aloud.js que a pagina carrega, no mesmo DOM, com propagacao
+        // real. Sem a captura na janela, Ctrl+Shift+U era o Ctrl+U de ver o
+        // codigo e o Esc da leitura saia do documento.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let keymap = NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", CAP);
+        let drive = r#"
+__contentLoaded();
+__speech.setVoices([__voice('br', 'pt-BR', true)]);
+__pdf([[{ str: 'Uma frase. Outra frase.', eol: false }]]);
+__renderPage(0);
+const state = () => __byId('neuralia-ra-bar').getAttribute('data-state');
+__key({ key: 'U', ctrlKey: true, shiftKey: true });
+await __settle();
+const out = { reading: state(), said: __said().slice(), posted: __posted.length };
+__key({ key: 'Escape' });
+await __settle();
+out.afterEsc = state();
+out.barHidden = __byId('neuralia-ra-bar').hidden;
+out.postedAfterEsc = __posted.length;
+// Leitura fechada: o Esc e o Ctrl+U voltam a ser do mapa de teclas.
+__key({ key: 'Escape' });
+__key({ key: 'u', ctrlKey: true });
+return out;
+"#;
+        let outcome = crate::read_aloud::harness::run(
+            &[
+                ("keymap", keymap.as_str()),
+                ("read-aloud.js", READ_ALOUD_SCRIPT),
+            ],
+            "http://neuralia-pdf.localhost/viewer.html",
+            drive,
+        );
+        let result = crate::read_aloud::harness::clean_result(&outcome);
+        assert_eq!(result["reading"], serde_json::json!("speaking"));
+        assert_eq!(result["said"], serde_json::json!(["Uma frase."]));
+        assert_eq!(
+            result["posted"],
+            serde_json::json!(0),
+            "Ctrl+Shift+U nao e ver o codigo"
+        );
+        assert_eq!(result["afterEsc"], serde_json::json!("idle"));
+        assert_eq!(result["barHidden"], serde_json::json!(true));
+        assert_eq!(
+            result["postedAfterEsc"],
+            serde_json::json!(0),
+            "o Esc que para a leitura nao fecha o PDF"
+        );
+        let actions: Vec<IpcAction> = outcome["posted"]
+            .as_array()
+            .expect("posted")
+            .iter()
+            .filter_map(|message| parse_ipc_message(message.as_str()?, CAP, 3))
+            .collect();
+        assert_eq!(actions, vec![IpcAction::Back, IpcAction::ViewSource]);
+    }
+
+    #[test]
+    fn esc_in_the_find_bar_closes_the_find_bar_and_keeps_reading() {
+        // A barra de procura do Ctrl+F (mapa de teclas) tem o seu Esc. Com a
+        // leitura a correr, o Esc escrito nela fecha-a e a leitura continua;
+        // o Esc seguinte, fora do campo, e que para a leitura.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let keymap = NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", CAP);
+        let drive = r#"
+__contentLoaded();
+__speech.setVoices([__voice('br', 'pt-BR', true)]);
+__pdf([[{ str: 'Uma frase. Outra frase.', eol: false }]]);
+__renderPage(0);
+const state = () => __byId('neuralia-ra-bar').getAttribute('data-state');
+__key({ key: 'U', ctrlKey: true, shiftKey: true });
+await __settle();
+__key({ key: 'f', ctrlKey: true });
+const out = { findOpen: !!__byId('neuralia-find'), focus: document.activeElement.tagName };
+__key({ key: 'Escape' });
+await __settle();
+out.findAfterEsc = !!__byId('neuralia-find');
+out.stateAfterFindEsc = state();
+document.activeElement = document.body;
+__key({ key: 'Escape' });
+await __settle();
+out.stateAfterSecondEsc = state();
+out.posted = __posted.length;
+return out;
+"#;
+        let outcome = crate::read_aloud::harness::run(
+            &[
+                ("keymap", keymap.as_str()),
+                ("read-aloud.js", READ_ALOUD_SCRIPT),
+            ],
+            "http://neuralia-pdf.localhost/viewer.html",
+            drive,
+        );
+        let result = crate::read_aloud::harness::clean_result(&outcome);
+        assert_eq!(result["findOpen"], serde_json::json!(true));
+        assert_eq!(result["focus"], serde_json::json!("INPUT"));
+        assert_eq!(result["findAfterEsc"], serde_json::json!(false));
+        assert_eq!(
+            result["stateAfterFindEsc"],
+            serde_json::json!("speaking"),
+            "o Esc da barra de procura nao e o Esc da leitura"
+        );
+        assert_eq!(result["stateAfterSecondEsc"], serde_json::json!("idle"));
+        assert_eq!(result["posted"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn reader_mode_reads_the_article_aloud_from_its_init_script() {
+        // O initialization script do Modo Leitura tal como o builder o monta:
+        // a leitura liga-se sozinha ao artigo, le titulo e blocos (cada bloco
+        // fecha a sua frase, codigo nao se le) e o Esc so para a leitura.
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let init = App::reader_init_script(CAP);
+        let drive = r#"
+__speech.setVoices([__voice('br', 'pt-BR', true)]);
+__readerDom('Título do artigo', [
+  { tag: 'p', text: 'Primeiro parágrafo sem ponto final' },
+  { tag: 'h2', text: 'Secção' },
+  { tag: 'pre', text: 'codigo();' },
+  { tag: 'p', text: 'Fim do texto. Mesmo.' },
+]);
+__contentLoaded();
+__key({ key: 'U', ctrlKey: true, shiftKey: true });
+await __settle();
+const out = { first: __highlight().map((r) => [r.unit, r.text]) };
+for (let i = 0; i < 4; i++) { __speech.finish(); await __settle(); }
+out.said = __said().slice();
+out.highlight = __highlight().map((r) => [r.unit, r.text]);
+__key({ key: 'Escape' });
+await __settle();
+out.state = __byId('neuralia-ra-bar').getAttribute('data-state');
+out.posted = __posted.length;
+return out;
+"#;
+        let outcome = crate::read_aloud::harness::run(
+            &[("reader-init", init.as_str())],
+            "about:blank",
+            drive,
+        );
+        let result = crate::read_aloud::harness::clean_result(&outcome);
+        assert_eq!(
+            result["first"],
+            serde_json::json!([["r:title", "Título do artigo"]])
+        );
+        assert_eq!(
+            result["said"],
+            serde_json::json!([
+                "Título do artigo",
+                "Primeiro parágrafo sem ponto final",
+                "Secção",
+                "Fim do texto.",
+                "Mesmo."
+            ])
+        );
+        assert_eq!(result["highlight"], serde_json::json!([["r:3", "Mesmo."]]));
+        assert_eq!(result["state"], serde_json::json!("idle"));
+        assert_eq!(
+            result["posted"],
+            serde_json::json!(0),
+            "o Esc da leitura nao sai do Reader"
+        );
+        assert_eq!(outcome["net"], serde_json::json!([]));
+    }
+
+    /// Gate: um artigo em ingles no Modo Leitura e lido pela voz inglesa. O
+    /// lang="pt-BR" do HTML do Leitor e o do NeuralIA, nao o do artigo: o
+    /// idioma sai do texto. Um artigo em portugues continua na voz pt-BR.
+    #[test]
+    fn reader_mode_reads_an_english_article_with_the_english_voice() {
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let init = App::reader_init_script(CAP);
+        let voice_for = |title: &str, body: &str| {
+            let drive = format!(
+                r#"
+__speech.setVoices([
+  __voice('Microsoft Maria - Portuguese (Brazil)', 'pt-BR', true),
+  __voice('Microsoft Zira - English (United States)', 'en-US', true, {{ default: true }}),
+]);
+__readerDom({title}, [{{ tag: 'p', text: {body} }}]);
+__contentLoaded();
+__key({{ key: 'U', ctrlKey: true, shiftKey: true }});
+await __settle();
+return __speech.log.map((x) => x.voice)[0] || null;
+"#,
+                title = serde_json::json!(title),
+                body = serde_json::json!(body)
+            );
+            let outcome = crate::read_aloud::harness::run(
+                &[("reader-init", init.as_str())],
+                "about:blank",
+                &drive,
+            );
+            crate::read_aloud::harness::clean_result(&outcome)
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            voice_for(
+                "The quick brown fox",
+                "It was sunny and the children were playing in the park with their friends. The dog was not there, but that is fine."
+            ),
+            "Microsoft Zira - English (United States)"
+        );
+        assert_eq!(
+            voice_for(
+                "A raposa",
+                "A raposa pula por cima do cão. Não é uma história com muito sentido, mas é da tradição dos testes."
+            ),
+            "Microsoft Maria - Portuguese (Brazil)"
+        );
     }
 
     #[test]
@@ -22504,10 +26206,10 @@ __fire('submit', at(login));
             Some(UserEvent::OpenPalette(1))
         ));
         assert!(matches!(
-            App::split_ipc_event_impl(1, IpcAction::Palette { col: 1 }),
+            App::split_ipc_event_impl(1, false, IpcAction::Palette { col: 1 }),
             Some(UserEvent::OpenPalette(1))
         ));
-        assert!(App::split_ipc_event_impl(1, IpcAction::Palette { col: 0 }).is_none());
+        assert!(App::split_ipc_event_impl(1, false, IpcAction::Palette { col: 0 }).is_none());
 
         let edit = source
             .split("fn palette_edit_subclass")
@@ -24479,9 +28181,16 @@ __drain();
             minimized: [false; COMPARATOR_COLUMNS],
             split_active: false,
             panel_width: 0.0,
+            pomodoro_label: None,
         };
-        let layout = BarLayout::with_contexts(1600.0, 1.0, true, dragged, [0; 3]);
-        let spans = visible_column_spans(1600.0, 3, &dragged.weights, &dragged.minimized);
+        // 1920 px: com 2:1:1 a terceira coluna tem 480 px, e o canto direito
+        // (Privado, quatro servicos, Gemini Live e as tres ferramentas) leva
+        // ~314 deles. A 1600 px sobravam-lhe 400 -- menos do que esse canto
+        // mais a pilula --, e a pilula encolhia ate sumir, como manda o
+        // layout quando nao cabe; aqui o assunto sao os pesos, nao o aperto.
+        let width = 1920.0;
+        let layout = BarLayout::with_contexts(width, 1.0, true, dragged, [0; 3]);
+        let spans = visible_column_spans(width, 3, &dragged.weights, &dragged.minimized);
 
         for span in &spans {
             let provider = layout.columns[span.index];
@@ -24508,7 +28217,7 @@ __drain();
 
         // A primeira coluna e a mais larga: o rotulo do meio tem de ter
         // andado para a direita face as colunas iguais.
-        let even = BarLayout::new(1600.0, 1.0, true, 3);
+        let even = BarLayout::new(width, 1.0, true, 3);
         assert!(layout.columns[1].x > even.columns[1].x);
     }
 
@@ -24522,12 +28231,13 @@ __drain();
             minimized: [false, true, false],
             split_active: false,
             panel_width: 0.0,
+            pomodoro_label: None,
         };
         let layout = BarLayout::with_contexts(1600.0, 1.0, true, state, [0; 3]);
         assert_eq!(layout.minimized, [false, true, false]);
 
         let chip = layout.columns[1];
-        let controls = right_controls(1600.0, 1.0, false);
+        let controls = right_controls(1600.0, 1.0, false, None);
         assert!(chip.width > 0.0);
         assert!(
             chip.x + chip.width <= controls.private.x,
@@ -24559,11 +28269,11 @@ __drain();
     /// recua e tudo o que se encosta a direita recua com ele.
     #[test]
     fn right_controls_make_room_for_the_split_drawer() {
-        let plain = right_controls(1600.0, 1.0, false);
+        let plain = right_controls(1600.0, 1.0, false, None);
         assert!(plain.split.is_none());
         assert_eq!(plain.private.x + plain.private.width, 1600.0 - 8.0);
 
-        let drawer = right_controls(1600.0, 1.0, true);
+        let drawer = right_controls(1600.0, 1.0, true, None);
         let (label, expand, close) = drawer.split.expect("ha gaveta");
         assert_eq!(close.x + close.width, 1600.0 - 8.0);
         assert!(expand.x + expand.width < close.x);
@@ -25142,7 +28852,11 @@ __drain();
                         assert_eq!(layout.hit(x, y), Some(BarHit::TabOverflow(col)), "{at}");
                     }
                 }
-                if logical >= 800.0 {
+                // A linha do titulo tambem leva as ferramentas (Pomodoro, com a
+                // etiqueta reservada, Notas e Respiracao) antes dos botoes da
+                // janela: tudo cabe, encolhido, a partir de ~880 px logicos (a
+                // 800 px sobra o "‹N"; so as abas que nao cabem saem).
+                if logical >= 900.0 {
                     for col in 0..COMPARATOR_COLUMNS {
                         assert_eq!(
                             layout.context_tab_counts[col], 3,
@@ -25730,19 +29444,19 @@ __drain();
         assert!(App::column_ipc_event_impl(0, IpcAction::Expand { col: 1 }).is_none());
 
         assert!(matches!(
-            App::split_ipc_event_impl(2, IpcAction::Fullscreen),
+            App::split_ipc_event_impl(2, false, IpcAction::Fullscreen),
             Some(UserEvent::ToggleSplitFullscreen)
         ));
         assert!(matches!(
-            App::split_ipc_event_impl(2, IpcAction::Omnibox),
+            App::split_ipc_event_impl(2, false, IpcAction::Omnibox),
             Some(UserEvent::OpenPalette(2))
         ));
         assert!(matches!(
-            App::split_ipc_event_impl(2, IpcAction::Print),
+            App::split_ipc_event_impl(2, false, IpcAction::Print),
             Some(UserEvent::PrintTarget(PageTarget::Split))
         ));
         assert!(matches!(
-            App::split_ipc_event_impl(2, IpcAction::ShortcutExpand { col: 0 }),
+            App::split_ipc_event_impl(2, false, IpcAction::ShortcutExpand { col: 0 }),
             Some(UserEvent::ExpandComparator(0))
         ));
     }
@@ -28076,6 +31790,7 @@ __drain();
                         minimized,
                         split_active,
                         panel_width: 0.0,
+                        pomodoro_label: None,
                     };
                     let layout =
                         BarLayout::with_contexts(client_width, scale, true, columns, [3, 3, 3]);
@@ -28094,7 +31809,7 @@ __drain();
                         );
                     }
 
-                    let controls = right_controls(client_width, scale, split_active);
+                    let controls = right_controls(client_width, scale, split_active, None);
                     let (px, py) = center(controls.private);
                     assert_eq!(right_controls_hit(controls, px, py), Some(BarHit::Private));
                     assert_eq!(
@@ -28179,6 +31894,3609 @@ __drain();
             scenarios, 100,
             "o gate precisa exercitar exatamente cem combinacoes de tela/estado"
         );
+    }
+
+    // ===================== ferramentas: Pomodoro, Notas, Respiracao =====================
+
+    fn rects_overlap(a: UiRect, b: UiRect) -> bool {
+        a.width > 0.0
+            && a.height > 0.0
+            && b.width > 0.0
+            && b.height > 0.0
+            && a.x < b.x + b.width
+            && b.x < a.x + a.width
+            && a.y < b.y + b.height
+            && b.y < a.y + a.height
+    }
+
+    /// Todos os controlos da direita com area -- o olho do Gemini Live
+    /// incluido, que fica entre as ferramentas e os servicos.
+    fn right_control_rects(controls: RightControls) -> Vec<UiRect> {
+        let mut rects = controls.tools.to_vec();
+        rects.push(controls.live);
+        rects.extend(controls.services);
+        rects.push(controls.private);
+        if let Some((label, expand, close)) = controls.split {
+            rects.extend([label, expand, close]);
+        }
+        if let Some((back, forward)) = controls.split_nav {
+            rects.extend([back, forward]);
+        }
+        rects
+            .into_iter()
+            .filter(|rect| rect.width > 0.0 && rect.height > 0.0)
+            .collect()
+    }
+
+    /// Gate: em qualquer largura de 560 a 1600 px (logicos, pixel a pixel),
+    /// a quatro escalas, com e sem gaveta, com colunas minimizadas e com e
+    /// sem o tempo do Pomodoro ao lado do icone, nenhum controlo da direita
+    /// pisa outro, nem o Home, nem as pilulas, os "+" e os ‹ › das colunas,
+    /// nem sai da janela. Da janela minima (700) para cima o tempo aparece
+    /// sempre: quem cede primeiro e o rotulo da gaveta.
+    #[test]
+    fn tool_buttons_never_overlap_the_bar_at_any_width() {
+        // As etiquetas que a app mostra, tiradas do `PomodoroController`: a
+        // correr ("24:59") e pausada ("⏸ 24:59", a mais larga).
+        let (running, paused) = shipped_pomodoro_labels();
+        assert_eq!(
+            running.map(|label| label.as_str().to_string()).as_deref(),
+            Some("24:59")
+        );
+        assert_eq!(
+            paused.map(|label| label.as_str().to_string()).as_deref(),
+            Some("⏸ 24:59")
+        );
+        // Com a gaveta a barra reparte em partes iguais e nao ha chips (ver
+        // `bar_columns`), por isso a gaveta so aparece sem minimizadas.
+        let topologies = [
+            ([false, false, false], false),
+            ([true, false, false], false),
+            ([false, true, false], false),
+            ([false, false, true], false),
+            ([true, true, false], false),
+            ([false, false, false], true),
+        ];
+        let mut scenarios = 0usize;
+        for logical_width in 560..=1600 {
+            let logical_width = logical_width as f64;
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                let client_width = logical_width * scale;
+                for (minimized, split_active) in topologies {
+                    for pomodoro_label in [None, running, paused] {
+                        scenarios += 1;
+                        let columns = BarColumns {
+                            count: COMPARATOR_COLUMNS,
+                            weights: [1.0; COMPARATOR_COLUMNS],
+                            minimized,
+                            split_active,
+                            panel_width: 0.0,
+                            pomodoro_label,
+                        };
+                        let layout =
+                            BarLayout::with_contexts(client_width, scale, true, columns, [2, 2, 2]);
+                        let controls =
+                            right_controls(client_width, scale, split_active, pomodoro_label);
+                        let at = format!(
+                            "{logical_width}px @{scale}x gaveta={split_active} min={minimized:?} etiqueta={}",
+                            pomodoro_label.is_some()
+                        );
+
+                        let rights = right_control_rects(controls);
+                        for (index, rect) in rights.iter().enumerate() {
+                            assert!(
+                                rect.x >= 0.0 && rect.x + rect.width <= client_width + 1e-6,
+                                "controlo fora da janela: {rect:?} em {at}"
+                            );
+                            for other in &rights[index + 1..] {
+                                assert!(
+                                    !rects_overlap(*rect, *other),
+                                    "{rect:?} pisa {other:?} em {at}"
+                                );
+                            }
+                        }
+
+                        let mut bar = vec![
+                            layout.home,
+                            layout.window_minimize,
+                            layout.window_maximize,
+                            layout.window_close,
+                        ];
+                        for index in 0..COMPARATOR_COLUMNS {
+                            bar.push(layout.columns[index]);
+                            bar.push(layout.add_tabs[index]);
+                            bar.push(layout.column_back[index]);
+                            bar.push(layout.column_forward[index]);
+                            bar.extend(layout.context_tabs[index]);
+                            bar.extend(layout.group_pills[index]);
+                        }
+                        // As ferramentas nunca entram na faixa da marca.
+                        assert!(
+                            controls.tools[0].x >= 90.0 * scale,
+                            "as ferramentas pisam a marca em {at}"
+                        );
+                        for piece in bar {
+                            for rect in &rights {
+                                assert!(
+                                    !rects_overlap(piece, *rect),
+                                    "a barra ({piece:?}) pisa o controlo {rect:?} em {at}"
+                                );
+                            }
+                        }
+
+                        let [pomodoro, notes, breath] = controls.tools;
+                        assert_eq!(notes.width, notes.height, "{at}");
+                        assert_eq!(breath.width, breath.height, "{at}");
+                        if pomodoro_label.is_none() {
+                            assert_eq!(pomodoro.width, pomodoro.height, "{at}");
+                        } else if logical_width >= 700.0 {
+                            assert!(
+                                pomodoro.width > pomodoro.height + 30.0 * scale,
+                                "o tempo do Pomodoro sumiu em {at}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(scenarios, 1041 * 4 * 6 * 3);
+    }
+
+    /// A segunda linha que a barra desenha e onde clica: pilulas, "+", ‹ ›
+    /// e chips de cada coluna, e as abas da linha de cima.
+    fn provider_row(layout: &BarLayout) -> Vec<[f64; 4]> {
+        let mut rects = Vec::new();
+        for index in 0..COMPARATOR_COLUMNS {
+            for rect in [
+                layout.columns[index],
+                layout.add_tabs[index],
+                layout.column_back[index],
+                layout.column_forward[index],
+            ]
+            .into_iter()
+            .chain(layout.context_tabs[index])
+            .chain(layout.group_pills[index])
+            {
+                rects.push([rect.x, rect.y, rect.width, rect.height]);
+            }
+        }
+        rects
+    }
+
+    /// Gate: as ferramentas e o tempo do Pomodoro nunca tiram lugar as
+    /// colunas das IAs. Antes viviam na segunda linha e a ultima coluna
+    /// pagava tudo: a 1280 px (1920x1080 a 150%) a terceira pilula tinha
+    /// 8,7 px, e com o Pomodoro a correr ficava sem pilula e sem ‹ ›; a
+    /// 1100 perdia o "+". Agora (1) arrancar, pausar ou parar o Pomodoro nao
+    /// mexe em NADA da segunda linha nem nas abas, a qualquer largura e
+    /// escala; e (2) nas larguras comuns cada coluna visivel tem a sua
+    /// pilula (legivel a partir de 1280), o "+" e os ‹ ›.
+    #[test]
+    fn the_tools_never_take_room_from_the_ai_columns() {
+        let (running, paused) = shipped_pomodoro_labels();
+        let topologies = [
+            ([false, false, false], false),
+            ([true, false, false], false),
+            ([false, true, false], false),
+            ([false, false, true], false),
+            ([true, true, false], false),
+            ([false, false, false], true),
+        ];
+        let layout_at = |client_width: f64,
+                         scale: f64,
+                         minimized: [bool; COMPARATOR_COLUMNS],
+                         split_active: bool,
+                         pomodoro_label: Option<BarLabel>| {
+            BarLayout::with_contexts(
+                client_width,
+                scale,
+                true,
+                BarColumns {
+                    count: COMPARATOR_COLUMNS,
+                    weights: [1.0; COMPARATOR_COLUMNS],
+                    minimized,
+                    split_active,
+                    panel_width: 0.0,
+                    pomodoro_label,
+                },
+                [3, 3, 3],
+            )
+        };
+        for logical_width in 700..=1920 {
+            let logical_width = logical_width as f64;
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                let client_width = logical_width * scale;
+                for (minimized, split_active) in topologies {
+                    let stopped = provider_row(&layout_at(
+                        client_width,
+                        scale,
+                        minimized,
+                        split_active,
+                        None,
+                    ));
+                    for label in [running, paused] {
+                        assert_eq!(
+                            provider_row(&layout_at(
+                                client_width,
+                                scale,
+                                minimized,
+                                split_active,
+                                label
+                            )),
+                            stopped,
+                            "o Pomodoro ({label:?}) mexeu nas colunas em {logical_width}px @{scale}x min={minimized:?} gaveta={split_active}"
+                        );
+                    }
+                }
+            }
+        }
+
+        for logical_width in [1024.0, 1100.0, 1280.0, 1366.0, 1440.0, 1920.0] {
+            for scale in [1.0, 1.5] {
+                let client_width = logical_width * scale;
+                for (minimized, split_active) in topologies {
+                    if split_active {
+                        continue;
+                    }
+                    for label in [None, running, paused] {
+                        let layout = layout_at(client_width, scale, minimized, split_active, label);
+                        for index in 0..COMPARATOR_COLUMNS {
+                            if minimized[index] {
+                                continue;
+                            }
+                            let at = format!(
+                                "coluna {index} a {logical_width}px @{scale}x min={minimized:?} etiqueta={label:?}"
+                            );
+                            let pill = layout.columns[index].width / scale;
+                            assert!(pill > 0.0, "sem pilula: {at}");
+                            if logical_width >= 1280.0 {
+                                assert!(pill >= 60.0, "pilula de {pill:.1} px: {at}");
+                            }
+                            assert!(layout.add_tabs[index].width > 0.0, "sem \"+\": {at}");
+                            assert!(layout.column_back[index].width > 0.0, "sem ‹: {at}");
+                            assert!(layout.column_forward[index].width > 0.0, "sem ›: {at}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Numa pilula espremida o icone do provedor nao sai pela borda.
+        assert!(!pill_fits_icon(29.0, 1.0));
+        assert!(pill_fits_icon(116.0, 1.0));
+        assert!(pill_fits_icon(116.0 * 1.5, 1.5));
+    }
+
+    /// A etiqueta do Pomodoro a correr e pausada, um segundo depois de
+    /// arrancar, pelo caminho que a barra usa (`label` -> `BarLabel::new`).
+    fn shipped_pomodoro_labels() -> (Option<BarLabel>, Option<BarLabel>) {
+        let mut pomodoro =
+            PomodoroController::new(crate::pomodoro_ui::PomodoroPreset::Classic.settings());
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        pomodoro.command(PomodoroCommand::Click, t0);
+        let running = pomodoro.label(t1).as_deref().and_then(BarLabel::new);
+        pomodoro.command(PomodoroCommand::Click, t1);
+        let paused = pomodoro.label(t1).as_deref().and_then(BarLabel::new);
+        (running, paused)
+    }
+
+    /// Gate: o centro de cada ferramenta -- e o fim da etiqueta do Pomodoro --
+    /// da a ferramenta certa, na barra (pelo mesmo `bar_hit_at` do clique e da
+    /// dica) e na Home (pelo mesmo `home_click_target` do clique), sem a
+    /// faixa de arrastar da Home as engolir e sem tocar nos botoes da janela.
+    #[test]
+    fn each_tool_button_hits_its_tool_in_the_bar_and_on_home() {
+        let (running, paused) = shipped_pomodoro_labels();
+        for pomodoro_label in [None, BarLabel::new("07:30"), running, paused] {
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                for logical_width in [700.0, 1120.0, 1600.0] {
+                    let client_width = logical_width * scale;
+                    for split_active in [false, true] {
+                        let columns = BarColumns {
+                            split_active,
+                            pomodoro_label,
+                            ..BarColumns::even(COMPARATOR_COLUMNS)
+                        };
+                        let layout =
+                            BarLayout::with_contexts(client_width, scale, true, columns, [3, 3, 3]);
+                        let controls =
+                            right_controls(client_width, scale, split_active, pomodoro_label);
+                        for (rect, tool) in controls.tools.iter().zip(Tool::ALL) {
+                            let (x, y) = center_of(*rect);
+                            assert_eq!(
+                                bar_hit_at(Some(controls), Some(layout), x, y),
+                                Some(BarHit::Tool(tool)),
+                                "{tool:?} em {logical_width}px @{scale}x"
+                            );
+                            assert_eq!(layout.hit(x, y), None, "a barra rouba {tool:?}");
+                        }
+                        let pomodoro = controls.tools[0];
+                        let label_end = pomodoro.x + pomodoro.width - 4.0 * scale;
+                        assert_eq!(
+                            right_controls_hit(
+                                controls,
+                                label_end,
+                                pomodoro.y + pomodoro.height / 2.0
+                            ),
+                            Some(BarHit::Tool(Tool::Pomodoro))
+                        );
+                    }
+
+                    // Home: mesmas ferramentas, na faixa de cima.
+                    let height = 800.0 * scale;
+                    let caption = BarLayout::new(client_width, scale, true, COMPARATOR_COLUMNS);
+                    let tools = home_tool_buttons(client_width, scale, pomodoro_label);
+                    for (index, (rect, tool)) in tools.iter().zip(Tool::ALL).enumerate() {
+                        let (x, y) = center_of(*rect);
+                        assert_eq!(
+                            home_click_target((client_width, height), scale, pomodoro_label, x, y),
+                            HomeClick::Tool(tool),
+                            "Home: {tool:?} em {logical_width}px @{scale}x"
+                        );
+                        assert!(
+                            rect.y >= 0.0 && rect.y + rect.height <= TITLE_TAB_HEIGHT * scale,
+                            "fora da faixa de cima"
+                        );
+                        assert!(
+                            rect.x + rect.width <= caption.window_minimize.x,
+                            "{tool:?} pisa os botoes da janela"
+                        );
+                        for other in &tools[index + 1..] {
+                            assert!(!rects_overlap(*rect, *other));
+                        }
+                    }
+                    // A faixa fora dos botoes continua a arrastar; o "Ir" continua
+                    // a ser o "Ir"; o fundo da pagina nao e nada.
+                    let strip_y = TITLE_TAB_HEIGHT * scale / 2.0;
+                    assert_eq!(
+                        home_click_target(
+                            (client_width, height),
+                            scale,
+                            pomodoro_label,
+                            tools[0].x - 20.0 * scale,
+                            strip_y
+                        ),
+                        HomeClick::Drag
+                    );
+                    let go = HomeLayout::new(client_width, height, scale).go;
+                    let (gx, gy) = center_of(go);
+                    assert_eq!(
+                        home_click_target((client_width, height), scale, pomodoro_label, gx, gy),
+                        HomeClick::Go
+                    );
+                    assert_eq!(
+                        home_click_target(
+                            (client_width, height),
+                            scale,
+                            pomodoro_label,
+                            client_width / 2.0,
+                            height - 10.0
+                        ),
+                        HomeClick::Nothing
+                    );
+                }
+            }
+        }
+    }
+
+    /// Gate: a dica de cada ferramenta e a frase que o dono aprovou, pelo
+    /// mesmo `bar_tooltip_label` que a barra mostra.
+    #[test]
+    fn tool_hints_say_what_the_click_does() {
+        let expected = [
+            (
+                Tool::Pomodoro,
+                "Pomodoro: foco e pausas (clique inicia/pausa; botão direito: opções)",
+            ),
+            (
+                Tool::Notes,
+                "Notas (Zettelkasten) — Ctrl+Shift+Z cria nota da seleção",
+            ),
+            (
+                Tool::Breath,
+                "Respiração guiada — método Wim Hof (vídeo em modo anônimo)",
+            ),
+        ];
+        for (tool, text) in expected {
+            assert_eq!(
+                bar_tooltip_label(BarHit::Tool(tool), "IA", false, None, None).as_deref(),
+                Some(text)
+            );
+        }
+    }
+
+    /// Gate: a dica do Pomodoro na barra e na Home e a da sessao em curso
+    /// (fase, tempo, focos feitos); parado, a fixa. As outras ferramentas
+    /// nunca herdam a dica do Pomodoro.
+    #[test]
+    fn pomodoro_hint_follows_the_session_in_the_bar_and_on_home() {
+        // O que a barra mostra (`bar_hint`, pelo `App::bar_tooltip_text`) e
+        // o que a Home e o refresco de cada segundo mostram (`tool_hint_at`).
+        let bar = |hit: BarHit, pomodoro: &PomodoroController, now: Instant| {
+            bar_hint(hit, pomodoro, now, "IA", false, None, None)
+        };
+        let mut pomodoro =
+            PomodoroController::new(crate::pomodoro_ui::PomodoroPreset::Classic.settings());
+        let t0 = Instant::now();
+        let fixed = Tool::Pomodoro.tooltip().to_string();
+        assert_eq!(
+            bar(BarHit::Tool(Tool::Pomodoro), &pomodoro, t0),
+            Some(fixed.clone())
+        );
+        assert_eq!(tool_hint_at(Tool::Pomodoro, &pomodoro, t0), fixed);
+
+        pomodoro.command(PomodoroCommand::Click, t0);
+        let at = t0 + Duration::from_secs(90);
+        let session = "Pomodoro — Foco: faltam 23:30 · 0 focos concluídos
+Clique: pausar · botão direito: opções";
+        assert_eq!(
+            bar(BarHit::Tool(Tool::Pomodoro), &pomodoro, at).as_deref(),
+            Some(session),
+            "a barra"
+        );
+        assert_eq!(
+            tool_hint_at(Tool::Pomodoro, &pomodoro, at),
+            session,
+            "a Home"
+        );
+        for tool in [Tool::Notes, Tool::Breath] {
+            assert_eq!(
+                bar(BarHit::Tool(tool), &pomodoro, at).as_deref(),
+                Some(tool.tooltip()),
+                "{tool:?}"
+            );
+            assert_eq!(
+                tool_hint_at(tool, &pomodoro, at),
+                tool.tooltip(),
+                "{tool:?}"
+            );
+        }
+        // O resto da barra continua com a sua dica.
+        assert_eq!(
+            bar(BarHit::Home, &pomodoro, at),
+            bar_tooltip_label(BarHit::Home, "IA", false, None, None)
+        );
+        // Parado outra vez: a fixa.
+        pomodoro.command(PomodoroCommand::Stop, at);
+        assert_eq!(
+            bar(BarHit::Tool(Tool::Pomodoro), &pomodoro, at),
+            Some(fixed)
+        );
+    }
+
+    /// Gate: o tempo do Pomodoro e o contorno vao a tomate no foco e a verde
+    /// nas pausas, legiveis (4,5:1) no fundo do botao nos dois temas, com e
+    /// sem o rato em cima; sem sessao, a letra de sempre. A cor anda na
+    /// etiqueta e nao lhe muda a largura.
+    #[test]
+    fn pomodoro_phase_colors_read_on_both_themes() {
+        for theme in [Theme::dark((0, 120, 212)), Theme::light((0, 120, 212))] {
+            for fill in [theme.surface, theme.surface_line] {
+                let focus = tool_label_color(Some(Phase::Focus), fill, &theme);
+                assert!(focus.0 > focus.1 && focus.0 > focus.2, "foco {focus:?}");
+                for phase in [Phase::ShortBreak, Phase::LongBreak] {
+                    let rest = tool_label_color(Some(phase), fill, &theme);
+                    assert!(rest.1 > rest.0 && rest.1 > rest.2, "{phase:?} {rest:?}");
+                    assert!(
+                        contrast(rest, fill) >= 4.5,
+                        "{phase:?} {rest:?} em {fill:?}"
+                    );
+                }
+                assert!(contrast(focus, fill) >= 4.5, "foco {focus:?} em {fill:?}");
+                assert_eq!(tool_label_color(None, fill, &theme), theme.fg);
+            }
+        }
+        let plain = BarLabel::new("⏸ 12:34").expect("etiqueta");
+        let tinted = plain.with_phase(Some(Phase::Focus));
+        assert_eq!(tinted.phase, Some(Phase::Focus));
+        assert_eq!(plain.phase, None);
+        assert_eq!(tinted.as_str(), plain.as_str());
+        assert_eq!(tinted.width(), plain.width());
+    }
+
+    /// Gate: o `pomodoro:` da omnibox chega ao Pomodoro, sem distinguir
+    /// maiusculas e com espacos depois dos dois pontos; sem os dois pontos e
+    /// uma pesquisa, e um acento no sitio do prefixo nao rebenta nada.
+    #[test]
+    fn pomodoro_command_routes_from_the_omnibox() {
+        use crate::pomodoro_ui::PomodoroPreset;
+        for (input, command) in [
+            ("pomodoro:", PomodoroCommand::Start),
+            ("pomodoro:iniciar", PomodoroCommand::Start),
+            ("Pomodoro:Pausar", PomodoroCommand::Pause),
+            ("  POMODORO: parar ", PomodoroCommand::Stop),
+            ("pomodoro:retomar", PomodoroCommand::Resume),
+            ("pomodoro:pular", PomodoroCommand::Skip),
+            (
+                "pomodoro:25",
+                PomodoroCommand::Preset(PomodoroPreset::Classic),
+            ),
+            (
+                "pomodoro: 50",
+                PomodoroCommand::Preset(PomodoroPreset::Long),
+            ),
+            (
+                "pomodoro:15 min",
+                PomodoroCommand::Preset(PomodoroPreset::Short),
+            ),
+        ] {
+            assert_eq!(
+                route_input(input),
+                InputRoute::Pomodoro(Some(command)),
+                "{input:?}"
+            );
+        }
+        assert_eq!(route_input("pomodoro:abacaxi"), InputRoute::Pomodoro(None));
+        assert_eq!(route_input("pomodoro:30"), InputRoute::Pomodoro(None));
+        for search in [
+            "pomodoro",
+            "pomodoro técnica",
+            "técnica pomodoro:",
+            "pomodorõ:",
+            "pomodor€x",
+        ] {
+            assert_eq!(route_input(search), InputRoute::Intent, "{search:?}");
+        }
+        assert!(POMODORO_COMMAND_HELP.contains("pomodoro:iniciar"));
+    }
+
+    /// Gate: no comparador -- onde o botao do Pomodoro vive e o teclado
+    /// escreve na palette, nao na omnibox da Home -- o `pomodoro:` e o
+    /// `tema:` sao comandos. Antes, "pomodoro:pausar" dava "esquema nao
+    /// permitido" e "pomodoro: 50" ia perguntar a IA da coluna e ficava no
+    /// historico. Num painel privado tambem: nada sai do computador.
+    #[test]
+    fn the_palette_runs_pomodoro_and_theme_commands_instead_of_asking_the_ai() {
+        use crate::pomodoro_ui::PomodoroPreset;
+        for private in [false, true] {
+            for source_index in 0..COMPARATOR_COLUMNS {
+                for (input, command) in [
+                    ("pomodoro:pausar", Some(PomodoroCommand::Pause)),
+                    ("pomodoro: pausar", Some(PomodoroCommand::Pause)),
+                    ("pomodoro:", Some(PomodoroCommand::Start)),
+                    (
+                        "Pomodoro: 50",
+                        Some(PomodoroCommand::Preset(PomodoroPreset::Long)),
+                    ),
+                    ("  POMODORO:parar ", Some(PomodoroCommand::Stop)),
+                    ("pomodoro:abacaxi", None),
+                ] {
+                    assert_eq!(
+                        route_palette(input, source_index, private),
+                        PaletteRoute::Pomodoro(command),
+                        "{input:?} coluna {source_index} privado={private}"
+                    );
+                }
+                assert_eq!(
+                    route_palette("tema:escuro", source_index, private),
+                    PaletteRoute::Theme(Some(ThemeChoice::Dark))
+                );
+                assert_eq!(
+                    route_palette("tema:roxo", source_index, private),
+                    PaletteRoute::Theme(None)
+                );
+            }
+        }
+        // Sem os dois pontos continua a ser uma pergunta sobre o metodo.
+        assert_eq!(
+            route_palette("pomodoro técnica", 1, false),
+            PaletteRoute::LoadProvider {
+                query: "pomodoro técnica".to_string()
+            }
+        );
+        assert!(THEME_COMMAND_HELP.contains("tema:escuro"));
+    }
+
+    /// Gate: o popup do meio da janela so tem Sim/Nao com a pergunta da
+    /// rolagem, e so o fim do quadro DELA e um "nao". Um aviso que chega
+    /// sozinho (fim de fase do Pomodoro) espera pela pergunta; a resposta a
+    /// um gesto tira-a sem lhe responder.
+    #[test]
+    fn a_notice_never_inherits_or_answers_the_auto_scroll_question() {
+        let question = || "Rolar a página sozinho a cada 30s?".to_string();
+        let phase_end = "Foco concluído! Pausa curta de 5 min".to_string();
+
+        // 1. Fim de fase com a pergunta a vista: espera, sem botoes.
+        let mut board = SplashBoard::default();
+        let asked = board
+            .show(question(), 20, SplashKind::Question)
+            .expect("a pergunta aparece");
+        assert!(asked.asks);
+        assert_eq!(
+            board.show(phase_end.clone(), 8, SplashKind::Background),
+            None,
+            "o aviso tomou o lugar da pergunta"
+        );
+        // A pergunta sai sozinha: e um "nao", e o aviso aparece, sem botoes.
+        match board.hide(asked.token) {
+            SplashHide::Hide {
+                question_expired: true,
+                next: Some(next),
+            } => {
+                assert_eq!(next.text, phase_end);
+                assert!(!next.asks, "o aviso herdou o Sim/Nao");
+                assert_eq!(next.seconds, 8);
+                assert_eq!(
+                    board.hide(next.token),
+                    SplashHide::Hide {
+                        question_expired: false,
+                        next: None
+                    }
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // 2. Respondida: o aviso que esperava aparece quando ela sai.
+        let mut board = SplashBoard::default();
+        let asked = board.show(question(), 20, SplashKind::Question).expect("q");
+        assert_eq!(
+            board.show(phase_end.clone(), 8, SplashKind::Background),
+            None
+        );
+        board.answered();
+        match board.hide(board.current()) {
+            SplashHide::Hide {
+                question_expired: false,
+                next: Some(next),
+            } => assert_eq!(next.text, phase_end),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(board.hide(asked.token), SplashHide::Stale);
+
+        // 3. Um gesto ("Pomodoro iniciado") tira a pergunta sem botoes e sem
+        //    lhe responder: o fim dele nao e um "nao", e o temporizador da
+        //    pergunta ja nao conta.
+        let mut board = SplashBoard::default();
+        let asked = board.show(question(), 20, SplashKind::Question).expect("q");
+        let notice = board
+            .show(
+                "Pomodoro iniciado: foco de 25 min".to_string(),
+                3,
+                SplashKind::Notice,
+            )
+            .expect("o gesto responde ja");
+        assert!(!notice.asks, "o aviso do gesto herdou o Sim/Nao");
+        assert_eq!(board.hide(asked.token), SplashHide::Stale);
+        assert_eq!(
+            board.hide(notice.token),
+            SplashHide::Hide {
+                question_expired: false,
+                next: None
+            },
+            "o aviso respondeu 'nao' a pergunta"
+        );
+
+        // 4. Sem pergunta, um aviso de fundo aparece ja.
+        let mut board = SplashBoard::default();
+        let shown = board
+            .show(phase_end.clone(), 8, SplashKind::Background)
+            .expect("sem pergunta nao espera");
+        assert!(!shown.asks);
+    }
+
+    /// Gate: o painel da respiracao e o video que o dono escolheu, em
+    /// InPrivate, sem camera, microfone nem nada que peca permissao, e preso
+    /// ao YouTube. Os servicos de conta continuam como estavam.
+    #[test]
+    fn breath_panel_is_private_denies_media_and_stays_on_youtube() {
+        assert_eq!(
+            Service::Breath.url(),
+            "https://www.youtube.com/watch?v=UJBknAsxfrA"
+        );
+        assert!(Service::Breath.private());
+        for service in [
+            Service::Meet,
+            Service::WhatsApp,
+            Service::YouTube,
+            Service::Gmail,
+        ] {
+            assert!(!service.private(), "{service:?} precisa da conta");
+        }
+
+        for kind in [
+            PermissionKind::Microphone,
+            PermissionKind::Camera,
+            PermissionKind::DisplayCapture,
+            PermissionKind::Geolocation,
+            PermissionKind::Notifications,
+            PermissionKind::ClipboardRead,
+            PermissionKind::FileSystemAccess,
+            PermissionKind::Other,
+        ] {
+            assert_eq!(
+                service_panel_permission(Service::Breath, kind),
+                PermissionResponse::Deny,
+                "{kind:?}"
+            );
+        }
+        // O Meet continua a perguntar pelo aviso do WebView2.
+        for kind in [PermissionKind::Microphone, PermissionKind::Camera] {
+            assert_eq!(
+                service_panel_permission(Service::Meet, kind),
+                PermissionResponse::Default
+            );
+        }
+
+        for target in [
+            BREATH_VIDEO_URL,
+            "https://youtu.be/UJBknAsxfrA",
+            "https://m.youtube.com/watch?v=UJBknAsxfrA",
+            "https://consent.youtube.com/m?continue=x",
+            "https://consent.google.com/ml?continue=x",
+            "about:blank",
+        ] {
+            assert!(
+                service_panel_navigation(Service::Breath, target),
+                "{target}"
+            );
+        }
+        for target in [
+            "http://www.youtube.com/watch?v=UJBknAsxfrA",
+            "https://youtube.com.evil.example/",
+            "https://evil.example/?u=https://www.youtube.com/",
+            "https://www.youtube.com@evil.example/",
+            "https://notyoutube.com/",
+            "https://accounts.google.com/ServiceLogin",
+            "https://www.google.com/",
+            "file:///C:/Windows/win.ini",
+            "javascript:alert(1)",
+            "neuralia-pdf://x",
+        ] {
+            assert!(
+                !service_panel_navigation(Service::Breath, target),
+                "{target}"
+            );
+        }
+        assert!(service_panel_navigation(
+            Service::Meet,
+            "https://www.google.com/"
+        ));
+    }
+
+    /// Gate (so de ausencia, como o §4.3 permite): o caminho que abre os
+    /// paineis de servico -- a Respiracao incluida -- nao grava historico nem
+    /// memoria e nao liga IPC nem scripts injetados. E so por isso que nada
+    /// do que la corre chega ao NeuralIA.
+    #[test]
+    fn service_panels_never_reach_history_or_memory() {
+        let source = include_str!("windows_app.rs");
+        let body = source
+            .split("fn open_service_panel(&mut self")
+            .nth(1)
+            .and_then(|part| part.split("fn close_service_panel").next())
+            .expect("corpo de open_service_panel");
+        for forbidden in [
+            "self.record(",
+            "history.append",
+            "memory.capture",
+            "save_session",
+            "with_ipc_handler",
+            "with_initialization_script",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "open_service_panel nao pode ter {forbidden}"
+            );
+        }
+    }
+
+    /// Gate: a tabela das ferramentas. O botao direito so abre o menu do
+    /// Pomodoro; em qualquer outro ponto da linha dos controlos, na barra ou
+    /// na Home, nao faz nada de ferramenta -- varrido pixel a pixel.
+    #[test]
+    fn tool_clicks_route_to_their_action() {
+        use ToolAction::*;
+        assert_eq!(
+            tool_action(Tool::Pomodoro, ToolClick::Left),
+            Some(PomodoroClick)
+        );
+        assert_eq!(
+            tool_action(Tool::Pomodoro, ToolClick::Right),
+            Some(PomodoroMenu)
+        );
+        assert_eq!(tool_action(Tool::Notes, ToolClick::Left), Some(ToggleNotes));
+        assert_eq!(
+            tool_action(Tool::Breath, ToolClick::Left),
+            Some(ToggleBreath)
+        );
+        assert_eq!(tool_action(Tool::Notes, ToolClick::Right), None);
+        assert_eq!(tool_action(Tool::Breath, ToolClick::Right), None);
+        assert_eq!(
+            bar_tool_action(Some(BarHit::Service(Service::Meet)), ToolClick::Right),
+            None
+        );
+        assert_eq!(
+            bar_tool_action(Some(BarHit::Private), ToolClick::Left),
+            None
+        );
+        assert_eq!(bar_tool_action(None, ToolClick::Right), None);
+
+        for pomodoro_label in [None, BarLabel::new("25:00")] {
+            for scale in [1.0, 1.5] {
+                for split_active in [false, true] {
+                    let client_width = 1120.0 * scale;
+                    let columns = BarColumns {
+                        split_active,
+                        pomodoro_label,
+                        ..BarColumns::even(COMPARATOR_COLUMNS)
+                    };
+                    let layout =
+                        BarLayout::with_contexts(client_width, scale, true, columns, [3, 3, 3]);
+                    let controls =
+                        right_controls(client_width, scale, split_active, pomodoro_label);
+                    let pomodoro = controls.tools[0];
+                    let y = pomodoro.y + pomodoro.height / 2.0;
+                    let mut menus = 0usize;
+                    for step in 0..(client_width as usize) {
+                        let x = step as f64 + 0.5;
+                        let right = bar_tool_action(
+                            bar_hit_at(Some(controls), Some(layout), x, y),
+                            ToolClick::Right,
+                        );
+                        let expected = pomodoro.contains(x, y).then_some(PomodoroMenu);
+                        assert_eq!(right, expected, "botao direito em x={x}");
+                        menus += usize::from(right.is_some());
+                    }
+                    assert!(menus as f64 >= pomodoro.width - 1.0);
+
+                    let height = 800.0 * scale;
+                    let home = home_tool_buttons(client_width, scale, pomodoro_label)[0];
+                    let strip_y = home.y + home.height / 2.0;
+                    for step in 0..(client_width as usize) {
+                        let x = step as f64 + 0.5;
+                        let right = match home_click_target(
+                            (client_width, height),
+                            scale,
+                            pomodoro_label,
+                            x,
+                            strip_y,
+                        ) {
+                            HomeClick::Tool(tool) => tool_action(tool, ToolClick::Right),
+                            _ => None,
+                        };
+                        assert_eq!(right, home.contains(x, strip_y).then_some(PomodoroMenu));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Uma vista de painel de mentira: regista no diario quando devolve o
+    /// teclado a janela e quando e largada.
+    struct FakePanel(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+
+    impl PanelView for FakePanel {
+        fn give_keyboard_to_window(&self) {
+            self.0.borrow_mut().push("teclado".to_string());
+        }
+    }
+
+    impl Drop for FakePanel {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("largada".to_string());
+        }
+    }
+
+    /// Notas que aceitam tudo e nao gravam nada (os gates do teclado).
+    struct NoNotes;
+
+    impl side_panel::DraftRescue for NoNotes {
+        fn rescue(&self, _command: NotesCommand) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn settle(&self, _limit: Duration) {}
+    }
+
+    /// Gate: fechar um painel da direita devolve o teclado -- o painel
+    /// tinha-o, e largar a WebView nao o devolvia a ninguem: fechar o video
+    /// da respiracao na Home deixava a omnibox sem teclado ate um clique. Na
+    /// Home vai para o EDIT da omnibox, DEPOIS de a vista sair; no resto a
+    /// janela fica com ele ANTES. Corre o caminho do `close_service_panel`
+    /// (`close_service_panel_in`) e o `SidePanel::dismiss` do Ctrl+H com uma
+    /// vista de mentira e um EDIT Win32 de verdade, escondido: o `GetFocus`
+    /// diz onde o teclado ficou.
+    #[test]
+    fn closing_a_panel_gives_the_keyboard_back() {
+        use std::{cell::RefCell, rc::Rc};
+        assert_eq!(
+            focus_after_panel_close(Surface::Home),
+            PanelCloseFocus::Omnibox
+        );
+        let surfaces = [
+            Surface::Home,
+            Surface::Comparator,
+            Surface::Reader,
+            Surface::Pdf,
+            Surface::External,
+        ];
+        unsafe {
+            let host = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!(""),
+                WS_POPUP,
+                0,
+                0,
+                240,
+                80,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!host.is_null(), "a janela de teste tem de nascer");
+            let child = |y: i32| {
+                CreateWindowExW(
+                    0,
+                    windows_sys::w!("EDIT"),
+                    windows_sys::w!(""),
+                    WS_CHILD | WS_VISIBLE,
+                    0,
+                    y,
+                    200,
+                    24,
+                    host,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            };
+            let omnibox = child(0);
+            // Quem tem o teclado antes: o sitio onde ele fica fora da Home.
+            let elsewhere = child(30);
+            assert!(!omnibox.is_null() && !elsewhere.is_null());
+
+            let mut seen = Vec::new();
+            for surface in surfaces {
+                // Um servico (a Respiracao).
+                SetFocus(elsewhere);
+                assert_eq!(GetFocus(), elsewhere, "pre-condicao");
+                let log = Rc::new(RefCell::new(Vec::new()));
+                let mut slot = Some(FakePanel(Rc::clone(&log)));
+                assert!(close_service_panel_in(&mut slot, surface, Some(omnibox)));
+                assert!(slot.is_none());
+                let service = (log.borrow().clone(), GetFocus() == omnibox);
+
+                // O Ctrl+H, pela saida unica.
+                SetFocus(elsewhere);
+                let log = Rc::new(RefCell::new(Vec::new()));
+                let mut panel = side_panel::SidePanel::closed(NoNotes);
+                let ticket = panel.ticket();
+                assert!(panel.open(ticket, FakePanel(Rc::clone(&log))).is_ok());
+                assert!(
+                    panel
+                        .dismiss(PanelExit::CtrlH, surface, Some(omnibox))
+                        .is_some()
+                );
+                let side = (log.borrow().clone(), GetFocus() == omnibox);
+                seen.push((surface, service, side));
+            }
+            // Uma troca de superficie (`destroy_web_surfaces`) nao mexe no
+            // teclado: ela propria trata dele.
+            SetFocus(elsewhere);
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut panel = side_panel::SidePanel::closed(NoNotes);
+            let ticket = panel.ticket();
+            assert!(panel.open(ticket, FakePanel(Rc::clone(&log))).is_ok());
+            let _ = panel.dismiss(PanelExit::SurfaceChange, Surface::Home, Some(omnibox));
+            let teardown = (log.borrow().clone(), GetFocus());
+            // Sem painel, nada.
+            let mut none: Option<FakePanel> = None;
+            let nothing = close_service_panel_in(&mut none, Surface::Home, Some(omnibox));
+            DestroyWindow(host);
+
+            for (surface, service, side) in seen {
+                let expected = if surface == Surface::Home {
+                    (vec!["largada".to_string()], true)
+                } else {
+                    (vec!["teclado".to_string(), "largada".to_string()], false)
+                };
+                assert_eq!(service, expected, "servico em {surface:?}");
+                assert_eq!(side, expected, "Ctrl+H em {surface:?}");
+            }
+            assert_eq!(teardown, (vec!["largada".to_string()], elsewhere));
+            assert!(!nothing);
+        }
+    }
+
+    /// Gate: aberto no comparador, o painel da respiracao tira-lhe a largura
+    /// como os outros -- e o do Gemini Live tambem --, e as colunas acabam
+    /// antes dele; na Home nao ha colunas a empurrar.
+    #[test]
+    fn an_open_breath_panel_pushes_the_comparator() {
+        let w = 1440.0;
+        let widths = PanelWidths::default();
+        // O painel da Respiracao e um `ServicePanel` como os outros: o que
+        // conta e o estado dele, encostado ao abrir.
+        let breath = Some(ServicePanelState::default());
+        let width = open_panel_width_for(Surface::Comparator, breath, false, false, w, widths);
+        assert!((width - 604.8).abs() < 1e-6, "{width}");
+        // O painel do Gemini Live tem a largura dos servicos.
+        assert_eq!(
+            width,
+            open_panel_width_for(Surface::Comparator, None, true, false, w, widths)
+        );
+        assert_eq!(
+            open_panel_width_for(Surface::Home, breath, false, false, w, widths),
+            0.0
+        );
+        assert_eq!(
+            open_panel_width_for(Surface::Comparator, None, false, false, w, widths),
+            0.0
+        );
+        let spans = visible_column_spans(
+            w - width,
+            COMPARATOR_COLUMNS,
+            &[1.0; COMPARATOR_COLUMNS],
+            &[false; COMPARATOR_COLUMNS],
+        );
+        let last = spans.last().expect("colunas");
+        assert!(last.x + last.width <= w - width + 1e-6);
+    }
+
+    /// Gate: na Home os paineis comecam debaixo da faixa de cima. Um painel
+    /// a partir do topo tapava os botoes da janela e as ferramentas -- o
+    /// proprio botao que fecha a Respiracao.
+    #[test]
+    fn panels_opened_from_home_leave_its_top_strip_clear() {
+        assert_eq!(
+            right_panel_top(Surface::Comparator),
+            COMPARATOR_CHROME_HEIGHT
+        );
+        for scale in [1.0, 1.25, 2.0] {
+            for (w, h) in [(700.0, 500.0), (1280.0, 800.0), (1920.0, 1080.0)] {
+                let client_width = w * scale;
+                let caption = BarLayout::new(client_width, scale, true, COMPARATOR_COLUMNS);
+                let mut guarded =
+                    home_tool_buttons(client_width, scale, BarLabel::new("24:59")).to_vec();
+                guarded.extend([
+                    caption.window_minimize,
+                    caption.window_maximize,
+                    caption.window_close,
+                ]);
+                for (x, y, width, height) in [
+                    service_panel_bounds(w, h, right_panel_top(Surface::Home)),
+                    side_panel_bounds(w, h, right_panel_top(Surface::Home)),
+                ] {
+                    let panel = UiRect {
+                        x: x * scale,
+                        y: y * scale,
+                        width: width * scale,
+                        height: height * scale,
+                    };
+                    for rect in &guarded {
+                        assert!(
+                            !rects_overlap(panel, *rect),
+                            "o painel tapa {rect:?} na Home {w}x{h} @{scale}x"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Gate: o ponto do painel de servicos minimizado fica no botao que o
+    /// abriu -- o da Respiracao nas ferramentas da linha do titulo, os outros
+    /// no icone deles. O desenho pede os controlos sem a etiqueta do
+    /// Pomodoro: o botao da Respiracao nao sai do sitio com ela.
+    #[test]
+    fn a_minimized_service_marks_the_button_that_opened_it() {
+        for scale in [1.0, 1.25, 2.0] {
+            for split in [false, true] {
+                let width = 1280.0 * scale;
+                let bare = right_controls(width, scale, split, None);
+                let running = right_controls(width, scale, split, BarLabel::new("⏸ 24:59"));
+                let breath = service_icon_rect(bare, Service::Breath).expect("respiracao");
+                assert_eq!(
+                    Some(breath),
+                    service_icon_rect(running, Service::Breath),
+                    "a etiqueta do Pomodoro mexeu no botao da Respiracao"
+                );
+                let (x, y) = center_of(breath);
+                assert_eq!(
+                    right_controls_hit(running, x, y),
+                    Some(BarHit::Tool(Tool::Breath))
+                );
+                for service in [Service::Meet, Service::WhatsApp, Service::YouTube] {
+                    let icon = service_icon_rect(bare, service).expect("icone do servico");
+                    let (x, y) = center_of(icon);
+                    assert_eq!(
+                        right_controls_hit(running, x, y),
+                        Some(BarHit::Service(service)),
+                        "{service:?} @{scale}x split={split}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Gate: cada ferramenta tem o seu PNG (e nao o do Privado, que e o que o
+    /// `_` do `extra_icon` devolve a um slot esquecido). O tomate e colorido;
+    /// as outras duas sao brancas para o tema as pintar.
+    #[test]
+    fn tool_icons_are_their_own_pngs() {
+        let incognito = extra_icon(ICON_SLOT_INCOGNITO);
+        let icons: Vec<&RgbaImage> = Tool::ALL
+            .iter()
+            .map(|tool| extra_icon(tool.icon_slot()))
+            .collect();
+        for (index, icon) in icons.iter().enumerate() {
+            assert_eq!(icon.dimensions(), (256, 256));
+            assert_ne!(icon.as_raw(), incognito.as_raw(), "{:?}", Tool::ALL[index]);
+            for other in &icons[index + 1..] {
+                assert_ne!(icon.as_raw(), other.as_raw());
+            }
+        }
+        let red = icons[0]
+            .pixels()
+            .any(|pixel| pixel[3] > 200 && pixel[0] > 200 && pixel[1] < 90);
+        assert!(red, "o Pomodoro e um tomate vermelho");
+        for icon in &icons[1..] {
+            assert!(
+                icon.pixels()
+                    .filter(|pixel| pixel[3] > 0)
+                    .all(|pixel| pixel[0] == 255 && pixel[1] == 255 && pixel[2] == 255),
+                "marca branca, pintada com o tema"
+            );
+        }
+        // O olho do Gemini Live tambem tem o seu: as duas branches tinham
+        // posto o primeiro icone novo no mesmo slot (+6), e um slot a mais
+        // do que o cache tem cai no ultimo lugar dele.
+        let live = extra_icon(ICON_SLOT_LIVE);
+        assert_eq!(live.dimensions(), (256, 256));
+        assert_ne!(live.as_raw(), incognito.as_raw(), "Gemini Live");
+        for (index, icon) in icons.iter().enumerate() {
+            assert_ne!(live.as_raw(), icon.as_raw(), "{:?}", Tool::ALL[index]);
+        }
+    }
+
+    /// Gate: o script que o botao Notas corre no painel -- o texto que
+    /// embarca --, numa pagina com e sem a secao das notas.
+    #[test]
+    fn notes_script_opens_the_notes_section_only_when_the_panel_has_it() {
+        let program = format!(
+            r#"
+const vm = require('node:vm');
+const script = {script};
+const calls = [];
+const withHook = {{ window: {{ neuraliaShowSection: (name) => {{ calls.push(name); return true; }} }} }};
+vm.runInNewContext(script, withHook);
+const quiet = vm.runInNewContext(script, {{ window: {{}} }});
+console.log(JSON.stringify({{ calls, quiet: quiet === undefined }}));
+"#,
+            script = serde_json::to_string(PANEL_SHOW_NOTES_SCRIPT).expect("json")
+        );
+        let output = run_node_program(&program);
+        assert_eq!(output.trim(), r#"{"calls":["notes"],"quiet":true}"#);
+    }
+
+    /// Gate: a etiqueta corta numa fronteira de caractere e mede por
+    /// caractere, para a largura nao mudar a cada segundo.
+    #[test]
+    fn bar_label_cuts_at_a_char_boundary_and_sizes_by_chars() {
+        assert!(BarLabel::new("").is_none());
+        assert!(BarLabel::new("   ").is_none());
+        let clock = BarLabel::new("24:59").expect("etiqueta");
+        assert_eq!(clock.as_str(), "24:59");
+        assert_eq!(
+            clock.width(),
+            BarLabel::new("11:11").expect("etiqueta").width()
+        );
+        assert_eq!(
+            clock.width(),
+            5.0 * BAR_LABEL_CHAR_WIDTH + BAR_LABEL_PADDING
+        );
+        // Dez "é" sao 20 bytes: cabem oito inteiros, nunca meio.
+        let long = BarLabel::new(&"é".repeat(10)).expect("etiqueta");
+        assert_eq!(long.as_str(), "é".repeat(8));
+        // Com um "a" a frente, o byte 16 cai a MEIO de um "é": corta-se antes
+        // dele (15 bytes), em vez de guardar meio caractere e perder tudo.
+        let odd = BarLabel::new(&format!("a{}", "é".repeat(10))).expect("etiqueta");
+        assert_eq!(odd.as_str(), format!("a{}", "é".repeat(7)));
+        let mixed = BarLabel::new("⏸ 12:00 pausa longa").expect("etiqueta");
+        assert!(mixed.as_str().len() <= BAR_LABEL_MAX_BYTES);
+        assert!(mixed.as_str().starts_with("⏸ 12:00"));
+    }
+
+    /// Gates das notas (Zettelkasten): o painel que embarca, o parser dele,
+    /// o trabalho do worker e o Ctrl+Shift+Z das paginas.
+    mod notes_gates {
+        use super::*;
+
+        /// Um instante fixo: 2026-09-23 ~ 12:12 UTC.
+        const T0: u64 = 1_790_172_725;
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+
+        /// Pasta de notas temporaria, apagada no fim do teste.
+        struct NotesDir(std::path::PathBuf);
+
+        impl NotesDir {
+            fn new(tag: &str) -> Self {
+                static NEXT: AtomicUsize = AtomicUsize::new(0);
+                let dir = std::env::temp_dir().join(format!(
+                    "neuralia-notes-{tag}-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                let _ = std::fs::remove_dir_all(&dir);
+                Self(dir)
+            }
+
+            fn store(&self) -> ZettelStore {
+                ZettelStore::open(&self.0).expect("pasta de notas")
+            }
+        }
+
+        impl Drop for NotesDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// O caminho que um pedido do painel faz no produto, menos a thread:
+        /// parser do canal -> `notes_command_for` -> `run_notes_command`.
+        fn panel_request(store: &ZettelStore, body: &str, now: u64) -> NotesReply {
+            let message = parse_panel_message(body)
+                .unwrap_or_else(|| panic!("o parser recusou um pedido do painel: {body}"));
+            let command = notes_command_for(message)
+                .unwrap_or_else(|| panic!("nao e um pedido das notas: {body}"));
+            run_notes_command(store, command, now)
+        }
+
+        /// Um DOM pequeno, criado DENTRO do contexto do vm, onde corre o
+        /// `<script>` do `PANEL_HTML` que embarca sobre a marcacao dele.
+        /// `innerHTML`, `outerHTML`, `insertAdjacentHTML` e `document.write`
+        /// nao interpretam nada: so ficam registados em `__html`.
+        const PANEL_DOM_HARNESS: &str = r##"
+const vm = require('node:vm');
+const DOM = String.raw`
+var __posted = [], __errors = [], __html = [], __timers = [], __created = [], __out = {};
+class Node {
+  constructor() { this.childNodes = []; this.parentNode = null; this.__listeners = []; }
+  addEventListener(type, handler) { this.__listeners.push({ type: String(type), handler }); }
+  removeEventListener() {}
+  appendChild(child) {
+    if (child.parentNode) child.parentNode.removeChild(child);
+    child.parentNode = this; this.childNodes.push(child); return child;
+  }
+  removeChild(child) {
+    const i = this.childNodes.indexOf(child);
+    if (i >= 0) this.childNodes.splice(i, 1);
+    child.parentNode = null; return child;
+  }
+  append(...nodes) { for (const n of nodes) this.appendChild(typeof n === 'string' ? new Text(n) : n); }
+  get textContent() { return this.childNodes.map((n) => n.textContent).join(''); }
+  set textContent(value) {
+    for (const c of this.childNodes) c.parentNode = null;
+    this.childNodes = [];
+    const text = String(value);
+    if (text) this.appendChild(new Text(text));
+  }
+}
+class Text extends Node {
+  constructor(data) { super(); this.data = String(data); }
+  get textContent() { return this.data; }
+  set textContent(value) { this.data = String(value); }
+}
+class Element extends Node {
+  constructor(tag) {
+    super();
+    this.tagName = String(tag).toUpperCase(); this.attributes = {};
+    this.style = { setProperty() {} }; this.value = ''; this.hidden = false;
+    this.className = ''; this.disabled = false; this.title = ''; this.id = '';
+  }
+  setAttribute(k, v) { this.attributes[k] = String(v); }
+  getAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attributes, k) ? this.attributes[k] : null; }
+  removeAttribute(k) { delete this.attributes[k]; }
+  get children() { return this.childNodes.filter((n) => n instanceof Element); }
+  querySelector(selector) {
+    const want = String(selector).toUpperCase();
+    const walk = (node) => {
+      for (const c of node.children) { if (c.tagName === want) return c; const f = walk(c); if (f) return f; }
+      return null;
+    };
+    return walk(this);
+  }
+  focus() { document.activeElement = this; }
+  blur() {}
+  select() {}
+  get innerHTML() { return ''; }
+  set innerHTML(v) { __html.push(String(v)); }
+  get outerHTML() { return ''; }
+  set outerHTML(v) { __html.push(String(v)); }
+  insertAdjacentHTML(_where, v) { __html.push(String(v)); }
+}
+class Document extends Node {
+  constructor() {
+    super();
+    this.documentElement = new Element('html');
+    this.body = new Element('body');
+    this.documentElement.appendChild(this.body);
+    this.activeElement = null;
+  }
+  createElement(tag) { __created.push(String(tag).toLowerCase()); return new Element(tag); }
+  createTextNode(text) { return new Text(text); }
+  getElementById(id) {
+    const walk = (node) => {
+      for (const c of node.children) { if (c.id === id) return c; const f = walk(c); if (f) return f; }
+      return null;
+    };
+    return walk(this.documentElement);
+  }
+  write(v) { __html.push(String(v)); }
+}
+var document = new Document();
+var window = { ipc: { postMessage(message) { __posted.push(String(message)); } } };
+window.top = window;
+var __now = 0;
+function setTimeout(fn, ms) { __timers.push({ fn, done: false, due: __now + (Number(ms) || 0) }); return __timers.length; }
+function clearTimeout(id) { const t = __timers[id - 1]; if (t) t.done = true; }
+function __advance(ms) {
+  const until = __now + ms;
+  for (;;) {
+    const next = __timers.filter((t) => !t.done && t.due <= until).sort((a, b) => a.due - b.due)[0];
+    if (!next) break;
+    __now = Math.max(__now, next.due);
+    next.done = true;
+    try { next.fn(); } catch (e) { __errors.push('timer: ' + e.message); }
+  }
+  __now = until;
+}
+function __drain() {
+  for (let round = 0; round < 20; round++) {
+    const due = __timers.filter((t) => !t.done);
+    if (!due.length) return;
+    for (const t of due) { t.done = true; try { t.fn(); } catch (e) { __errors.push('timer: ' + e.message); } }
+  }
+}
+function __fire(target, type, extra) {
+  const event = Object.assign({
+    type, target, key: '', ctrlKey: false, metaKey: false, shiftKey: false, altKey: false,
+    defaultPrevented: false, stopped: false,
+    preventDefault() { this.defaultPrevented = true; }, stopPropagation() { this.stopped = true; }
+  }, extra || {});
+  const run = (node) => {
+    for (const l of node.__listeners.slice()) {
+      if (l.type !== type) continue;
+      try { l.handler.call(node, event); } catch (e) { __errors.push(type + ': ' + e.message); }
+    }
+  };
+  for (let node = target; node && !event.stopped; node = node.parentNode) run(node);
+  if (!event.stopped && target !== document) run(document);
+  return event;
+}
+function __build(html) {
+  const start = html.indexOf('<body>') + '<body>'.length;
+  const scriptAt = html.indexOf('<script>');
+  const markup = html.slice(start, scriptAt);
+  const stack = [document.body];
+  const VOID = { input: 1, meta: 1, br: 1, img: 1, hr: 1 };
+  const tag = /<(\/?)([a-zA-Z][a-zA-Z0-9]*)([^>]*)>|([^<]+)/g;
+  let m;
+  while ((m = tag.exec(markup))) {
+    if (m[4] !== undefined) {
+      if (m[4].trim()) stack[stack.length - 1].appendChild(new Text(m[4]));
+      continue;
+    }
+    if (m[1]) { stack.pop(); continue; }
+    const el = new Element(m[2]);
+    const attr = /([a-zA-Z-]+)(?:="([^"]*)")?/g;
+    let a;
+    while ((a = attr.exec(m[3]))) {
+      const name = a[1], value = a[2] === undefined ? '' : a[2];
+      if (name === 'hidden') el.hidden = true;
+      else if (name === 'id') el.id = value;
+      else if (name === 'class') el.className = value;
+      else if (name === 'title') el.title = value;
+      else el.setAttribute(name, value);
+    }
+    stack[stack.length - 1].appendChild(el);
+    if (!VOID[m[2].toLowerCase()]) stack.push(el);
+  }
+  return html.slice(scriptAt + '<script>'.length, html.indexOf('</script>'));
+}
+const $ = (id) => document.getElementById(id);
+function __type(el, value) { el.value = value; __fire(el, 'input'); }
+function __click(el) { return __fire(el, 'click'); }
+function __key(el, key, mods) { return __fire(el, 'keydown', Object.assign({ key }, mods || {})); }
+function __visible(el) {
+  for (let node = el; node && node !== document.body; node = node.parentNode) if (node.hidden) return false;
+  return true;
+}
+function __buttons(el) { return el.children.filter((c) => c.tagName === 'BUTTON'); }
+`;
+const context = vm.createContext({ TextEncoder, URL });
+vm.runInContext(DOM, context);
+context.__panelHtml = INPUT.html;
+const script = vm.runInContext('__build(__panelHtml)', context);
+vm.runInContext(script, context, { filename: 'PANEL_HTML' });
+INPUT.steps.forEach((step, index) => {
+  try { vm.runInContext(step, context, { filename: 'step' + index }); }
+  catch (e) { context.__errors.push('step ' + index + ': ' + e.message); }
+});
+process.stdout.write(JSON.stringify({
+  out: context.__out,
+  posted: Array.from(context.__posted, String),
+  errors: Array.from(context.__errors, String),
+  html: Array.from(context.__html, String),
+  created: Array.from(context.__created, String),
+  pwned: context.__pwned === undefined ? null : String(context.__pwned),
+}));
+"##;
+
+        /// Corre o `PANEL_HTML` que embarca (com o tema posto por
+        /// `panel_html`) e depois cada passo, pela ordem, no mesmo contexto.
+        fn run_panel(steps: &[String]) -> serde_json::Value {
+            let input = serde_json::json!({
+                "html": panel_html(&Theme::dark((0, 120, 215))),
+                "steps": steps,
+            });
+            let program = format!("const INPUT = {input};\n{PANEL_DOM_HARNESS}");
+            let output = run_node_program(&program);
+            let result: serde_json::Value =
+                serde_json::from_str(&output).expect("o harness devolve JSON");
+            assert_eq!(
+                result["errors"],
+                serde_json::json!([]),
+                "o painel lancou excecoes"
+            );
+            result
+        }
+
+        fn posted(result: &serde_json::Value) -> Vec<String> {
+            result["posted"]
+                .as_array()
+                .expect("posted")
+                .iter()
+                .map(|message| message.as_str().expect("string").to_string())
+                .collect()
+        }
+
+        fn action_of(message: &str) -> String {
+            let value: serde_json::Value = serde_json::from_str(message).expect("json");
+            value["action"].as_str().unwrap_or_default().to_string()
+        }
+
+        fn save_message(id: Option<&str>, title: &str, body: &str, tags: &[&str]) -> String {
+            serde_json::json!({
+                "action": "note-save",
+                "args": { "id": id, "title": title, "body": body, "tags": tags },
+            })
+            .to_string()
+        }
+
+        /// Gate: o canal do painel so aceita pedidos de notas dentro dos
+        /// tectos, so o `note-save` passa dos 4 KiB, e um id que nao e um id
+        /// de nota (`../`, `C:\`, letras) morre no parser, antes do disco.
+        #[test]
+        fn notes_panel_messages_are_capped_and_note_ids_are_validated() {
+            assert_eq!(
+                parse_panel_message(r#"{"action":"notes-list","args":{}}"#),
+                Some(PanelMessage::NotesList)
+            );
+            assert_eq!(
+                parse_panel_message(r#"{"action":"notes-search","args":{"query":"  zettel  "}}"#),
+                Some(PanelMessage::NotesSearch("zettel".to_string()))
+            );
+            assert_eq!(
+                parse_panel_message(r#"{"action":"note-open","args":{"id":"202609231212"}}"#),
+                Some(PanelMessage::NoteOpen("202609231212".to_string()))
+            );
+            assert_eq!(
+                parse_panel_message(r#"{"action":"note-delete","args":{"id":"20260923121205-2"}}"#),
+                Some(PanelMessage::NoteDelete("20260923121205-2".to_string()))
+            );
+            let long_query = format!(
+                r#"{{"action":"notes-search","args":{{"query":"{}"}}}}"#,
+                "a".repeat(PANEL_QUERY_MAX_CHARS + 1)
+            );
+            assert_eq!(
+                parse_panel_message(&long_query),
+                None,
+                "busca acima do tecto"
+            );
+            assert_eq!(
+                parse_panel_message(r#"{"action":"notes-search","args":{"query":"   "}}"#),
+                None
+            );
+
+            // Ids que viravam caminho fora da pasta, ou nome de outro ficheiro.
+            for id in [
+                serde_json::json!("../../Windows/win"),
+                serde_json::json!("..\\..\\x"),
+                serde_json::json!("C:\\x"),
+                serde_json::json!("/etc/passwd"),
+                serde_json::json!("2026/../x"),
+                serde_json::json!("12a"),
+                serde_json::json!("-1"),
+                serde_json::json!(""),
+                serde_json::json!("1".repeat(65)),
+                serde_json::json!(202609231212u64),
+                serde_json::Value::Null,
+            ] {
+                for action in ["note-open", "note-delete"] {
+                    let body =
+                        serde_json::json!({"action": action, "args": {"id": id}}).to_string();
+                    assert_eq!(
+                        parse_panel_message(&body),
+                        None,
+                        "{action} aceitou o id {id}"
+                    );
+                }
+                let save = serde_json::json!({
+                    "action": "note-save",
+                    "args": {"id": id, "title": "t", "body": "b", "tags": []},
+                })
+                .to_string();
+                if !id.is_null() {
+                    // Recusado -- e o painel recebe "failed" em vez de silencio.
+                    assert_eq!(
+                        parse_panel_message(&save),
+                        Some(PanelMessage::NoteSaveRefused),
+                        "note-save aceitou o id {id}"
+                    );
+                }
+            }
+            assert_eq!(
+                parse_panel_message(
+                    r#"{"action":"note-open","args":{"id":"202609231212","path":"../x"}}"#
+                ),
+                None,
+                "campo a mais"
+            );
+
+            // Salvar: nota nova (id null) e nota existente.
+            assert_eq!(
+                parse_panel_message(&save_message(
+                    None,
+                    "  Título  ",
+                    "corpo\n",
+                    &[" a ", "", "b"]
+                )),
+                Some(PanelMessage::NoteSave(NoteEdit {
+                    id: None,
+                    title: "Título".to_string(),
+                    body: "corpo\n".to_string(),
+                    tags: vec!["a".to_string(), "b".to_string()],
+                    rev: None,
+                }))
+            );
+            assert!(matches!(
+                parse_panel_message(&save_message(Some("202609231212"), "t", "b", &[])),
+                Some(PanelMessage::NoteSave(NoteEdit { id: Some(ref id), .. })) if id == "202609231212"
+            ));
+            let bad_saves = [
+                save_message(None, &"t".repeat(NOTE_TITLE_MAX_CHARS + 1), "b", &[]),
+                save_message(None, "t", &"b".repeat(NOTE_BODY_MAX_BYTES + 1), &[]),
+                save_message(None, "t", "b", &["x"; NOTE_TAGS_MAX + 1]),
+                save_message(None, "t", "b", &[&"x".repeat(NOTE_TAG_MAX_CHARS + 1)]),
+                r#"{"action":"note-save","args":{"id":null,"title":"t","body":"b","tags":[7]}}"#
+                    .to_string(),
+                r#"{"action":"note-save","args":{"id":null,"title":"t","body":"b"}}"#.to_string(),
+                r#"{"action":"note-save","args":{"id":null,"title":"t","body":"b","tags":[],"source":"https://x"}}"#
+                    .to_string(),
+            ];
+            for bad in &bad_saves {
+                assert_eq!(
+                    parse_panel_message(bad),
+                    Some(PanelMessage::NoteSaveRefused),
+                    "note-save aceito: {:.120}",
+                    bad
+                );
+                // O rascunho com os mesmos campos morre no parser (nao ha a
+                // quem responder: o painel manda outro no proximo tecla).
+                let draft = bad.replace("\"note-save\"", "\"note-draft\"");
+                assert_eq!(parse_panel_message(&draft), None, "{:.120}", draft);
+            }
+            // Controlos no titulo e nas tags (o TAB de uma tabela colada, o
+            // titulo de uma nota do Obsidian com TAB) viram espaco, em vez de
+            // o salvar morrer em silencio.
+            assert_eq!(
+                parse_panel_message(&save_message(
+                    None,
+                    "Capítulo 1\tIntrodução",
+                    "corpo com\ttab",
+                    &["a\tb", "linha\nquebrada"]
+                )),
+                Some(PanelMessage::NoteSave(NoteEdit {
+                    id: None,
+                    title: "Capítulo 1 Introdução".to_string(),
+                    body: "corpo com\ttab".to_string(),
+                    tags: vec!["a b".to_string(), "linha quebrada".to_string()],
+                    rev: None,
+                }))
+            );
+            // O rascunho: o mesmo formato do salvar, ou {} para "nada".
+            assert_eq!(
+                parse_panel_message(r#"{"action":"note-draft","args":{}}"#),
+                Some(PanelMessage::NoteDraft(None))
+            );
+            assert_eq!(
+                parse_panel_message(
+                    &save_message(Some("202609231212"), "t", "b", &[])
+                        .replace("\"note-save\"", "\"note-draft\"")
+                ),
+                Some(PanelMessage::NoteDraft(Some(NoteEdit {
+                    id: Some("202609231212".to_string()),
+                    title: "t".to_string(),
+                    body: "b".to_string(),
+                    tags: Vec::new(),
+                    rev: None,
+                })))
+            );
+            let big_draft = save_message(None, "t", &"b".repeat(NOTE_BODY_MAX_BYTES), &[])
+                .replace("\"note-save\"", "\"note-draft\"");
+            assert!(big_draft.len() > PANEL_MESSAGE_MAX_BYTES);
+            assert!(matches!(
+                parse_panel_message(&big_draft),
+                Some(PanelMessage::NoteDraft(Some(_)))
+            ));
+
+            // O corpo no tecto passa, mesmo no pior caso do JSON (cada byte
+            // escrito como \u00XX): a mensagem fica muito acima dos 4 KiB.
+            let body = "b".repeat(NOTE_BODY_MAX_BYTES);
+            let big = save_message(None, "t", &body, &[]);
+            assert!(big.len() > PANEL_MESSAGE_MAX_BYTES);
+            assert!(matches!(
+                parse_panel_message(&big),
+                Some(PanelMessage::NoteSave(_))
+            ));
+            let controls = "\u{1}".repeat(NOTE_BODY_MAX_BYTES);
+            let worst = save_message(
+                None,
+                &"\u{e9}".repeat(NOTE_TITLE_MAX_CHARS),
+                &controls,
+                &["\u{e9}"; NOTE_TAGS_MAX],
+            );
+            assert!(
+                worst.len() > 5 * NOTE_BODY_MAX_BYTES,
+                "o JSON escapou os controlos"
+            );
+            assert!(
+                matches!(parse_panel_message(&worst), Some(PanelMessage::NoteSave(_))),
+                "o pior caso legitimo tem de caber"
+            );
+            let over = format!(
+                r#"{{"action":"note-save","args":{{"id":null,"title":"t","body":"b","tags":[]}},"pad":"{}"}}"#,
+                "x".repeat(NOTE_SAVE_MESSAGE_MAX_BYTES)
+            );
+            assert_eq!(
+                parse_panel_message(&over),
+                None,
+                "acima do tecto do note-save"
+            );
+
+            // Todos os OUTROS pedidos continuam presos aos 4 KiB.
+            let pad = "x".repeat(PANEL_MESSAGE_MAX_BYTES);
+            for small in [
+                r#"{"action":"ready","pad":"PAD"}"#,
+                r#"{"action":"close","pad":"PAD"}"#,
+                r#"{"action":"notes-list","args":{},"pad":"PAD"}"#,
+                r#"{"action":"notes-search","args":{"query":"x"},"pad":"PAD"}"#,
+                r#"{"action":"note-open","args":{"id":"202609231212"},"pad":"PAD"}"#,
+                r#"{"action":"note-delete","args":{"id":"202609231212"},"pad":"PAD"}"#,
+                r#"{"action":"search","args":{"query":"x"},"pad":"PAD"}"#,
+                r#"{"action":"open","args":{"input":"https://exemplo.pt"},"pad":"PAD"}"#,
+            ] {
+                let body = small.replace("PAD", &pad);
+                assert!(body.len() > PANEL_MESSAGE_MAX_BYTES);
+                assert_eq!(
+                    parse_panel_message(&body),
+                    None,
+                    "{:.60} passou dos 4 KiB",
+                    body
+                );
+                // O mesmo pedido, pequeno, e aceite: a recusa e so do tamanho.
+                assert!(
+                    parse_panel_message(&small.replace("PAD", "x")).is_some(),
+                    "{small}"
+                );
+            }
+        }
+
+        /// Gate: o editor do painel que embarca, conduzido como o utilizador
+        /// (Nova nota, escrever, Ctrl+S, buscar, abrir, Excluir, confirmar),
+        /// e cada pedido que ele manda levado pelo parser e pelo trabalho do
+        /// worker a uma pasta temporaria.
+        #[test]
+        fn notes_panel_saves_lists_searches_and_deletes_through_the_shipped_handler() {
+            let dir = NotesDir::new("roundtrip");
+            let store = dir.store();
+
+            // 1. Nova nota, escrita e salva com Ctrl+S; depois uma busca.
+            let first = run_panel(&[
+                "__out.readyFirst = __posted.length === 1 && JSON.parse(__posted[0]).action === 'ready';".into(),
+                "__posted.length = 0; window.neuraliaShowSection('notes');".into(),
+                "__out.notesVisible = __visible($('view-notes')) && !__visible($('view-history'));".into(),
+                "__click($('note-new'));".into(),
+                "__out.editorVisible = __visible($('note-body'));".into(),
+                "__type($('note-title'), 'Método Zettelkasten');".into(),
+                "__type($('note-body'), 'Uma ideia por nota.\\nLiga com [[202601010000]].');".into(),
+                "__type($('note-tags'), 'método,  zettel ,');".into(),
+                "__out.ctrlS = __key($('note-body'), 's', { ctrlKey: true }).defaultPrevented;".into(),
+                "__click($('note-back'));".into(),
+                "__type($('nq'), 'zettel');".into(),
+                "__drain();".into(),
+            ]);
+            assert_eq!(first["out"]["readyFirst"], true);
+            assert_eq!(first["out"]["notesVisible"], true);
+            assert_eq!(first["out"]["editorVisible"], true);
+            assert_eq!(first["out"]["ctrlS"], true, "Ctrl+S e do editor");
+            let sent = posted(&first);
+            let actions: Vec<String> = sent.iter().map(|m| action_of(m)).collect();
+            assert_eq!(
+                actions,
+                ["notes-list", "note-save", "notes-list", "notes-search"],
+                "{sent:?}"
+            );
+
+            // O note-save do painel grava na pasta.
+            let saved = match panel_request(&store, &sent[1], T0) {
+                NotesReply::Opened {
+                    cause: NoteOpened::Saved,
+                    note,
+                    ..
+                } => note,
+                other => panic!("salvar devolveu {other:?}"),
+            };
+            assert_eq!(saved.title, "Método Zettelkasten");
+            assert_eq!(
+                saved.body,
+                "Uma ideia por nota.\nLiga com [[202601010000]]."
+            );
+            assert_eq!(saved.tags, ["método", "zettel"]);
+            let file = dir.0.join(format!("{}.md", saved.id));
+            let text = std::fs::read_to_string(&file).expect("a nota esta no disco");
+            assert!(text.contains("title: Método Zettelkasten"), "{text}");
+            assert!(text.ends_with("Liga com [[202601010000]]."), "{text}");
+
+            // A lista e a busca que o painel pediu encontram-na.
+            match panel_request(&store, &sent[2], T0) {
+                NotesReply::Listed {
+                    query: None,
+                    total: 1,
+                    notes,
+                } => {
+                    assert_eq!(notes[0].id, saved.id);
+                }
+                other => panic!("lista devolveu {other:?}"),
+            }
+            match panel_request(&store, &sent[3], T0) {
+                NotesReply::Listed {
+                    query: Some(query),
+                    notes,
+                    ..
+                } => {
+                    assert_eq!(query, "zettel");
+                    assert_eq!(notes.len(), 1);
+                }
+                other => panic!("busca devolveu {other:?}"),
+            }
+            assert!(matches!(
+                panel_request(
+                    &store,
+                    r#"{"action":"notes-search","args":{"query":"inexistente"}}"#,
+                    T0
+                ),
+                NotesReply::Listed { total: 0, .. }
+            ));
+
+            // 2. A nota aberta no editor: editar e salvar outra vez mantem o
+            //    id; Excluir pede confirmacao e so depois manda o pedido.
+            let opened = panel_request(
+                &store,
+                &serde_json::json!({"action": "note-open", "args": {"id": saved.id}}).to_string(),
+                T0 + 60,
+            );
+            assert!(matches!(
+                opened,
+                NotesReply::Opened {
+                    cause: NoteOpened::Open,
+                    ..
+                }
+            ));
+            let second = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                notes_reply_script(&opened),
+                "__out.title = $('note-title').value;".into(),
+                "__type($('note-body'), $('note-body').value + '\\nMais uma linha.');".into(),
+                "__click($('note-save'));".into(),
+                "__click($('note-delete'));".into(),
+                "__out.askedFirst = __posted.length === 1 && __visible($('note-confirm'));".into(),
+                "__click($('note-confirm-yes'));".into(),
+            ]);
+            assert_eq!(second["out"]["title"], "Método Zettelkasten");
+            assert_eq!(second["out"]["askedFirst"], true, "Excluir pergunta antes");
+            let sent = posted(&second);
+            let actions: Vec<String> = sent.iter().map(|m| action_of(m)).collect();
+            assert_eq!(actions, ["note-save", "note-delete"], "{sent:?}");
+
+            match panel_request(&store, &sent[0], T0 + 120) {
+                NotesReply::Opened { note, .. } => {
+                    assert_eq!(note.id, saved.id, "salvar de novo nao cria outra nota");
+                    assert!(note.body.ends_with("Mais uma linha."));
+                    assert_eq!(note.updated_unix, T0 + 120);
+                    assert_eq!(note.created_unix, T0);
+                }
+                other => panic!("salvar devolveu {other:?}"),
+            }
+            assert_eq!(
+                panel_request(&store, &sent[1], T0 + 180),
+                NotesReply::Deleted {
+                    id: saved.id.clone()
+                }
+            );
+            assert!(!file.exists(), "a nota saiu da pasta");
+            assert!(
+                dir.0
+                    .join(zettel::TRASH_DIR)
+                    .join(format!("{}.md", saved.id))
+                    .is_file(),
+                "e foi para a lixeira"
+            );
+            assert!(matches!(
+                panel_request(&store, r#"{"action":"notes-list","args":{}}"#, T0),
+                NotesReply::Listed { total: 0, .. }
+            ));
+            assert_eq!(
+                panel_request(&store, &sent[1], T0 + 240),
+                NotesReply::Missing { id: saved.id }
+            );
+        }
+
+        /// Gate: a resposta ao salvar de uma nota nova da-lhe o id (o
+        /// salvar seguinte grava a MESMA nota), mas so enquanto o editor
+        /// ainda a mostra: com outra nota nova ja no editor, a resposta
+        /// atrasada nao lhe passa o id -- senao o salvar dela esmagava a
+        /// primeira. E um segundo Salvar antes do id nao cria outra nota.
+        #[test]
+        fn a_late_save_reply_never_hands_its_id_to_another_note() {
+            let dir = NotesDir::new("late");
+            let store = dir.store();
+            let start: Vec<String> = vec![
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                "__click($('note-new')); __type($('note-title'), 'Primeira');".into(),
+                "__click($('note-save')); __click($('note-save'));".into(),
+            ];
+            let first = run_panel(&start);
+            let sent = posted(&first);
+            assert_eq!(sent.len(), 1, "dois Salvar antes do id: {sent:?}");
+            let reply = panel_request(&store, &sent[0], T0);
+            let NotesReply::Opened { note: primeira, .. } = &reply else {
+                panic!("{reply:?}");
+            };
+
+            // A resposta chega com a Primeira ainda no editor: fica com o id.
+            let mut same = start.clone();
+            same.push(notes_reply_script(&reply));
+            same.push("__posted.length = 0; __type($('note-body'), 'mais');".into());
+            same.push("__click($('note-save'));".into());
+            let kept = posted(&run_panel(&same));
+            assert_eq!(kept.len(), 1);
+            assert!(matches!(
+                parse_panel_message(&kept[0]),
+                Some(PanelMessage::NoteSave(NoteEdit { id: Some(ref id), .. })) if *id == primeira.id
+            ));
+
+            // A resposta chega depois de "Nova nota": a Segunda fica nova.
+            let mut other = start;
+            other.push("__click($('note-new')); __type($('note-title'), 'Segunda');".into());
+            other.push(notes_reply_script(&reply));
+            other.push("__posted.length = 0; __click($('note-save'));".into());
+            let result = run_panel(&other);
+            let fresh = posted(&result);
+            assert_eq!(fresh.len(), 1);
+            assert_eq!(
+                parse_panel_message(&fresh[0]),
+                Some(PanelMessage::NoteSave(NoteEdit {
+                    id: None,
+                    title: "Segunda".to_string(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    rev: None,
+                }))
+            );
+            // E, gravada, e uma segunda nota: a Primeira fica como estava.
+            let NotesReply::Opened { note: segunda, .. } =
+                panel_request(&store, &fresh[0], T0 + 60)
+            else {
+                panic!("salvar a Segunda");
+            };
+            assert_ne!(segunda.id, primeira.id);
+            assert_eq!(
+                store.get(&primeira.id).expect("ler").expect("existe").title,
+                "Primeira"
+            );
+        }
+
+        /// O que o lado nativo tem por salvar depois de o painel mandar
+        /// `sent`: cada mensagem pelo parser do canal e por `track_note_draft`,
+        /// como no `handle_panel_message`.
+        fn draft_after(sent: &[String]) -> Option<NoteEdit> {
+            let mut draft = None;
+            for message in sent {
+                let parsed = parse_panel_message(message)
+                    .unwrap_or_else(|| panic!("o parser recusou {message:.120}"));
+                track_note_draft(&mut draft, &parsed);
+            }
+            draft
+        }
+
+        /// Gate: o texto que se esta a escrever numa nota sobrevive a TODOS os
+        /// fechos do painel que nao passam pelo X/Esc dele -- botao Notas,
+        /// Ctrl+H, outro painel, Home, pesquisa nova, fechar a janela --, que
+        /// largam a WebView sem a pagina correr mais nada. O editor que
+        /// embarca manda a copia (`note-draft`), o lado nativo segue-a e, ao
+        /// fechar, `take_note_draft_on_close` grava-a pelo trabalho do worker.
+        /// E o link "Fonte" e o botao Notas salvam antes de fechar.
+        #[test]
+        fn a_note_being_typed_survives_every_native_close_of_the_panel() {
+            let dir = NotesDir::new("close");
+            let store = dir.store();
+
+            // 1. Nota nova, escrita e nunca salva; o painel fecha por fora.
+            let typed = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                "__click($('note-new'));".into(),
+                "__type($('note-title'), 'Ideia');".into(),
+                "__type($('note-body'), 'Escrita e nunca salva.');".into(),
+                "__drain();".into(),
+            ]);
+            let sent = posted(&typed);
+            let mut draft = draft_after(&sent);
+            let command =
+                take_note_draft_on_close(&mut draft).expect("o fecho nativo nao salvou nada");
+            assert_eq!(draft, None, "a copia sai de uma vez");
+            let NotesReply::Opened {
+                cause: NoteOpened::Saved,
+                note,
+                ..
+            } = run_notes_command(&store, command, T0)
+            else {
+                panic!("salvar o rascunho");
+            };
+            assert_eq!(
+                (note.title.as_str(), note.body.as_str()),
+                ("Ideia", "Escrita e nunca salva.")
+            );
+            assert_eq!(store.list().expect("lista").len(), 1);
+
+            // 2. Uma nota que ja existe, editada: o rascunho grava a MESMA.
+            let opened = run_notes_command(&store, NotesCommand::Open(note.id.clone()), T0 + 60);
+            let edited = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                notes_reply_script(&opened),
+                "__type($('note-body'), $('note-body').value + '\\nMais.');".into(),
+                "__drain();".into(),
+            ]);
+            let mut draft = draft_after(&posted(&edited));
+            let command = take_note_draft_on_close(&mut draft).expect("rascunho da nota aberta");
+            assert!(matches!(
+                run_notes_command(&store, command, T0 + 120),
+                NotesReply::Opened { ref note, .. } if note.id == opened_id(&opened)
+            ));
+            let reread = store.get(&note.id).expect("ler").expect("existe");
+            assert_eq!(reread.body, "Escrita e nunca salva.\nMais.");
+            assert_eq!(store.list().expect("lista").len(), 1, "nao criou outra");
+
+            // 3. Salvo com Ctrl+S: nada fica por salvar, o fecho nao grava.
+            let saved = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                notes_reply_script(&opened),
+                "__type($('note-body'), 'x');".into(),
+                "__key($('note-body'), 's', { ctrlKey: true });".into(),
+                "__drain();".into(),
+            ]);
+            let sent = posted(&saved);
+            assert_eq!(
+                sent.iter().map(|m| action_of(m)).collect::<Vec<_>>(),
+                ["note-save"]
+            );
+            assert_eq!(draft_after(&sent), None);
+
+            // 4. Escrito e apagado: a copia do lado nativo e limpa.
+            let erased = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                "__click($('note-new')); __type($('note-body'), 'rascunho'); __drain();".into(),
+                "__type($('note-body'), ''); __drain();".into(),
+            ]);
+            let sent = posted(&erased);
+            assert_eq!(
+                sent.iter().map(|m| action_of(m)).collect::<Vec<_>>(),
+                ["note-draft", "note-draft"]
+            );
+            assert_eq!(draft_after(&sent), None);
+
+            // 5. O link "Fonte" fecha o painel: salva ANTES de o pedir.
+            let cited = store
+                .create(
+                    "Com fonte",
+                    "> citado\n",
+                    vec!["web".to_string()],
+                    Some("https://exemplo.pt/artigo".to_string()),
+                    T0,
+                )
+                .expect("nota com fonte");
+            let with_source = run_notes_command(&store, NotesCommand::Open(cited.id), T0);
+            let source = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                notes_reply_script(&with_source),
+                "__type($('note-body'), $('note-body').value + 'comentario');".into(),
+                "__click($('note-source'));".into(),
+            ]);
+            let sent = posted(&source);
+            assert_eq!(
+                sent.iter().map(|m| action_of(m)).collect::<Vec<_>>(),
+                ["note-save", "open"],
+                "{sent:?}"
+            );
+
+            // 6. O botao Notas com o editor por salvar: salva e fecha, como o
+            //    X. Com o Historico a vista, mostra as Notas em vez de fechar.
+            let button = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                notes_reply_script(&opened),
+                "__type($('note-body'), 'pelo botao');".into(),
+                PANEL_NOTES_BUTTON_SCRIPT.into(),
+            ]);
+            let sent = posted(&button);
+            assert_eq!(
+                sent.iter().map(|m| action_of(m)).collect::<Vec<_>>(),
+                ["note-save", "close"],
+                "{sent:?}"
+            );
+            let history = run_panel(&[
+                "__posted.length = 0;".into(),
+                PANEL_NOTES_BUTTON_SCRIPT.into(),
+                "__out.notes = __visible($('view-notes')) && !__visible($('view-history'));".into(),
+            ]);
+            assert_eq!(
+                history["out"]["notes"], true,
+                "o botao nao mostrou as Notas"
+            );
+            assert_eq!(
+                posted(&history)
+                    .iter()
+                    .map(|m| action_of(m))
+                    .collect::<Vec<_>>(),
+                ["notes-list"],
+                "no Historico o botao nao fecha o painel"
+            );
+        }
+
+        /// O worker das notas de verdade (a thread, a fila, o disco), com cada
+        /// gravacao registada no diario ANTES de ir para a fila.
+        #[derive(Clone)]
+        struct LoggedNotes {
+            worker: ZettelWorker,
+            log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        }
+
+        impl side_panel::DraftRescue for LoggedNotes {
+            fn rescue(&self, command: NotesCommand) -> Result<(), String> {
+                let what = match &command {
+                    NotesCommand::Save(edit) => format!("salvar {}", edit.title),
+                    other => format!("{other:?}"),
+                };
+                self.log.borrow_mut().push(what);
+                self.worker.rescue(command)
+            }
+
+            fn settle(&self, limit: Duration) {
+                self.worker.settle(limit);
+            }
+        }
+
+        /// Um worker das notas em `dir`, com as respostas num canal.
+        fn notes_worker(
+            dir: &NotesDir,
+        ) -> (
+            ZettelWorker,
+            std::sync::mpsc::Receiver<(NotesOrigin, NotesReply)>,
+        ) {
+            let (reply_tx, replies) = std::sync::mpsc::channel();
+            let worker = ZettelWorker::spawn(dir.0.clone(), move |origin, reply| {
+                let _ = reply_tx.send((origin, reply));
+            });
+            (worker, replies)
+        }
+
+        const SETTLE: Duration = Duration::from_secs(20);
+
+        /// Gate: cada saida do painel do Ctrl+H grava o texto de uma nota a
+        /// meio -- uma vez -- antes de a pagina sair. Cada caminho do `App`
+        /// que tira o painel passa por `close_side_panel(exit)` ->
+        /// `SidePanel::dismiss` (e a saida da app por `SidePanel::exit`); um
+        /// `take()` direto da vista nem compila (campos privados do modulo
+        /// `side_panel`), e largar o painel inteiro por outro caminho passa
+        /// pelo `Drop` dele (gate
+        /// `dropping_or_overwriting_an_open_side_panel_still_saves_the_note_once`).
+        /// Aqui corre o editor que embarca (as copias que ele manda), o parser
+        /// do canal, o `SidePanel` com uma vista de mentira e o `ZettelWorker`
+        /// de verdade sobre uma pasta temporaria: uma nota no disco com o
+        /// texto, uma resposta de fecho, a gravacao antes da vista sair, e
+        /// nenhuma segunda gravacao no fecho seguinte (o `show_home` fecha e
+        /// depois chama o `destroy_web_surfaces`), na saida da app nem quando
+        /// o painel e largado no fim.
+        #[test]
+        fn every_way_out_of_the_side_panel_saves_the_note_being_typed_once() {
+            use side_panel::{PanelPost, Received, SidePanel};
+            use std::{cell::RefCell, rc::Rc};
+
+            let typed = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                "__click($('note-new'));".into(),
+                "__type($('note-title'), 'Ideia');".into(),
+                "__type($('note-body'), 'Escrita e nunca salva.');".into(),
+                "__drain();".into(),
+            ]);
+            let sent = posted(&typed);
+            assert!(
+                sent.iter().any(|m| action_of(m) == "note-draft"),
+                "{sent:?}"
+            );
+
+            // Cada caminho do `App` que tira o painel, e a saida dele.
+            let entries = [
+                ("o X / Esc da pagina (close)", PanelExit::CloseButton),
+                ("o botao Notas nas Notas (close)", PanelExit::CloseButton),
+                ("Ctrl+H (toggle_side_panel)", PanelExit::CtrlH),
+                ("um item do historico (open)", PanelExit::OpenItem),
+                ("um servico da barra", PanelExit::OtherPanel),
+                ("a Respiracao", PanelExit::OtherPanel),
+                ("o Gemini Live", PanelExit::OtherPanel),
+                ("a Home (show_home)", PanelExit::Home),
+                ("uma pesquisa nova (open_comparator)", PanelExit::NewSearch),
+                (
+                    "o ecra de erro (show_native_error -> destroy_web_surfaces)",
+                    PanelExit::SurfaceChange,
+                ),
+                (
+                    "a Web completa (web -> open_external -> destroy_web_surfaces)",
+                    PanelExit::SurfaceChange,
+                ),
+                (
+                    "o Leitor (read / open_reader -> destroy_web_surfaces)",
+                    PanelExit::SurfaceChange,
+                ),
+                (
+                    "um link externo (open_external -> destroy_web_surfaces)",
+                    PanelExit::SurfaceChange,
+                ),
+                (
+                    "o PDF (read_pdf / open_pdf -> destroy_web_surfaces)",
+                    PanelExit::SurfaceChange,
+                ),
+                (
+                    "o agente (start_browser_agent -> destroy_web_surfaces)",
+                    PanelExit::SurfaceChange,
+                ),
+                ("fechar a janela", PanelExit::AppExit),
+            ];
+            for exit in PanelExit::ALL {
+                assert!(
+                    entries.iter().any(|(_, e)| *e == exit),
+                    "{exit:?} sem caminho"
+                );
+            }
+
+            for (entry, exit) in entries {
+                for surface in [Surface::Comparator, Surface::Home] {
+                    let dir = NotesDir::new("exit");
+                    let (worker, replies) = notes_worker(&dir);
+                    let log = Rc::new(RefCell::new(Vec::new()));
+                    let mut panel = SidePanel::closed(LoggedNotes {
+                        worker: worker.clone(),
+                        log: Rc::clone(&log),
+                    });
+                    let ticket = panel.ticket();
+                    assert!(panel.open(ticket, FakePanel(Rc::clone(&log))).is_ok());
+                    for message in &sent {
+                        let post = PanelPost::parse(ticket, message).expect("o parser aceitou");
+                        assert!(
+                            matches!(panel.receive(post), Received::Current(_)),
+                            "{entry}"
+                        );
+                    }
+
+                    let saved = if exit == PanelExit::AppExit {
+                        panel.exit(SETTLE)
+                    } else {
+                        let closed = panel.dismiss(exit, surface, None).expect("havia painel");
+                        closed.saved
+                    };
+                    assert_eq!(saved, Ok(()), "{entry}");
+                    assert!(!panel.is_open(), "{entry}");
+                    // O teclado vai para a janela, antes de a vista sair, fora
+                    // da Home e fora das trocas de superficie.
+                    let keyboard = surface != Surface::Home
+                        && !matches!(exit, PanelExit::SurfaceChange | PanelExit::AppExit);
+                    let expected: &[&str] = if keyboard {
+                        &["salvar Ideia", "teclado", "largada"]
+                    } else {
+                        &["salvar Ideia", "largada"]
+                    };
+                    assert_eq!(
+                        *log.borrow(),
+                        expected,
+                        "{entry} em {surface:?}: o rascunho tem de ir antes de a pagina sair"
+                    );
+
+                    // Uma vez so: nem no fecho seguinte, nem na saida da app,
+                    // nem quando o painel e largado.
+                    assert!(
+                        panel
+                            .dismiss(PanelExit::SurfaceChange, surface, None)
+                            .is_none()
+                    );
+                    assert_eq!(panel.exit(SETTLE), Ok(()));
+                    drop(panel);
+                    side_panel::DraftRescue::settle(&worker, SETTLE);
+                    assert_eq!(
+                        log.borrow()
+                            .iter()
+                            .filter(|line| line.starts_with("salvar"))
+                            .count(),
+                        1,
+                        "{entry}"
+                    );
+                    let store = dir.store();
+                    let list = store.list().expect("lista");
+                    assert_eq!(list.len(), 1, "{entry} em {surface:?}: {list:?}");
+                    let note = store.get(&list[0].id).expect("ler").expect("existe");
+                    assert_eq!(
+                        (note.title.as_str(), note.body.as_str()),
+                        ("Ideia", "Escrita e nunca salva."),
+                        "{entry}"
+                    );
+                    // A resposta e a de um fecho (o aviso "Nota salva: ...").
+                    let (origin, reply) = replies.recv_timeout(SETTLE).expect("resposta");
+                    assert_eq!(origin, NotesOrigin::Closed, "{entry}");
+                    assert!(
+                        matches!(
+                            reply,
+                            NotesReply::Opened {
+                                cause: NoteOpened::Saved,
+                                ..
+                            }
+                        ),
+                        "{entry}: {reply:?}"
+                    );
+                    assert!(replies.try_recv().is_err(), "{entry}: duas respostas");
+                }
+            }
+        }
+
+        /// Gate: um pedido que a pagina mandou antes de sair e que so chega
+        /// depois (estava na fila do event loop atras do Ctrl+H) nao se
+        /// perde nem passa por outra pagina. A copia (`note-draft`) que
+        /// trazia vai ja para o disco -- nao fica a espera de um painel que
+        /// nao volta, onde a copia do painel seguinte a apagava --, e nada
+        /// do que a pagina velha manda (um `close`, por exemplo) toca na nova.
+        #[test]
+        fn a_note_sent_by_a_panel_that_already_closed_is_saved_and_never_reaches_the_next_one() {
+            use side_panel::{PanelPost, Received, SidePanel};
+            use std::{cell::RefCell, rc::Rc};
+
+            let dir = NotesDir::new("late");
+            let store = dir.store();
+            let note = store
+                .create("Ideia", "linha A", Vec::new(), None, T0)
+                .expect("nota");
+            let other = store
+                .create("Outra", "x", Vec::new(), None, T0)
+                .expect("nota");
+            let (worker, _replies) = notes_worker(&dir);
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut panel = SidePanel::closed(LoggedNotes {
+                worker,
+                log: Rc::clone(&log),
+            });
+
+            // A pagina 1 com a Ideia no editor: duas copias, a segunda ainda
+            // na fila quando o Ctrl+H a fecha.
+            let opened = run_notes_command(&store, NotesCommand::Open(note.id.clone()), T0);
+            let first = run_panel(&[
+                "window.neuraliaShowSection('notes');".into(),
+                notes_reply_script(&opened),
+                "__posted.length = 0;".into(),
+                "__type($('note-body'), 'linha A\\nlinha B'); __drain();".into(),
+                "__type($('note-body'), 'linha A\\nlinha B\\nlinha C'); __drain();".into(),
+            ]);
+            let drafts: Vec<String> = posted(&first)
+                .into_iter()
+                .filter(|m| action_of(m) == "note-draft")
+                .collect();
+            assert_eq!(drafts.len(), 2, "{drafts:?}");
+
+            let page1 = panel.ticket();
+            assert!(panel.open(page1, FakePanel(Rc::clone(&log))).is_ok());
+            let post = PanelPost::parse(page1, &drafts[0]).expect("parser");
+            assert!(matches!(panel.receive(post), Received::Current(_)));
+            let closed = panel
+                .dismiss(PanelExit::CtrlH, Surface::Comparator, None)
+                .expect("painel");
+            assert_eq!(closed.saved, Ok(()));
+
+            // A pagina 2, com a Outra a ser escrita.
+            let page2 = panel.ticket();
+            assert!(panel.open(page2, FakePanel(Rc::clone(&log))).is_ok());
+            let opened_other = run_notes_command(&store, NotesCommand::Open(other.id.clone()), T0);
+            let second = run_panel(&[
+                "window.neuraliaShowSection('notes');".into(),
+                notes_reply_script(&opened_other),
+                "__posted.length = 0;".into(),
+                "__type($('note-body'), 'x mais'); __drain();".into(),
+            ]);
+            for message in posted(&second) {
+                let post = PanelPost::parse(page2, &message).expect("parser");
+                assert!(matches!(panel.receive(post), Received::Current(_)));
+            }
+
+            // Agora chega a segunda copia da pagina 1.
+            let late = PanelPost::parse(page1, &drafts[1]).expect("parser");
+            assert!(
+                matches!(panel.receive(late), Received::Late(Some(Ok(())))),
+                "a copia atrasada nao foi gravada"
+            );
+            assert_eq!(
+                panel.draft().map(|draft| draft.title.as_str()),
+                Some("Outra"),
+                "a copia da pagina velha tomou o lugar da nova"
+            );
+            // Um `close` atrasado da pagina 1 nao fecha a 2.
+            let close = PanelPost::parse(page1, r#"{"action":"close"}"#).expect("parser");
+            assert!(matches!(panel.receive(close), Received::Late(None)));
+            assert!(panel.is_open());
+
+            // A pagina 2 fecha: grava a dela.
+            assert_eq!(panel.exit(SETTLE), Ok(()));
+            assert_eq!(
+                log.borrow()
+                    .iter()
+                    .filter(|line| line.starts_with("salvar"))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                ["salvar Ideia", "salvar Ideia", "salvar Outra"]
+            );
+            let reread = |id: &str| store.get(id).expect("ler").expect("existe").body;
+            assert_eq!(reread(&note.id), "linha A\nlinha B\nlinha C");
+            assert_eq!(reread(&other.id), "x mais");
+            assert_eq!(
+                store.list().expect("lista").len(),
+                2,
+                "nem copia nem conflito"
+            );
+        }
+
+        /// Quantas gravacoes de fecho o diario de um `LoggedNotes` viu.
+        fn rescues(log: &std::cell::RefCell<Vec<String>>) -> usize {
+            log.borrow()
+                .iter()
+                .filter(|line| line.starts_with("salvar"))
+                .count()
+        }
+
+        /// O que o editor que embarca manda quando se escreve uma nota nova
+        /// ("Ideia") sem a salvar, e depois `then` (o fecho pela pagina).
+        fn typed_note(then: &[&str]) -> Vec<String> {
+            let mut steps: Vec<String> = vec![
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                "__click($('note-new'));".into(),
+                "__type($('note-title'), 'Ideia');".into(),
+                "__type($('note-body'), 'Escrita e nunca salva.');".into(),
+                "__drain();".into(),
+            ];
+            steps.extend(then.iter().map(|step| step.to_string()));
+            let sent = posted(&run_panel(&steps));
+            assert!(
+                sent.iter().any(|m| action_of(m) == "note-draft"),
+                "{sent:?}"
+            );
+            sent
+        }
+
+        /// A nota "Ideia" esta no disco, uma vez, com o texto todo.
+        fn assert_one_note_on_disk(dir: &NotesDir, what: &str) {
+            let store = dir.store();
+            let list = store.list().expect("lista");
+            assert_eq!(list.len(), 1, "{what}: {list:?}");
+            let note = store.get(&list[0].id).expect("ler").expect("existe");
+            assert_eq!(
+                (note.title.as_str(), note.body.as_str()),
+                ("Ideia", "Escrita e nunca salva."),
+                "{what}"
+            );
+        }
+
+        /// Um disco que nao responde: a thread das notas de verdade fica
+        /// presa na primeira resposta ate `release`.
+        #[derive(Clone)]
+        struct Held(Arc<(Mutex<bool>, Condvar)>);
+
+        impl Held {
+            fn release(&self) {
+                let (open, turn) = &*self.0;
+                *open
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                turn.notify_all();
+            }
+
+            fn wait(&self) {
+                let (open, turn) = &*self.0;
+                let mut guard = open
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*guard {
+                    guard = turn
+                        .wait(guard)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            }
+        }
+
+        /// Um worker das notas em `dir` preso (`Held`) ate ser solto, com as
+        /// respostas num canal. A resposta a uma gravacao de fecho chega ao
+        /// canal 100 ms depois de o disco a ter escrito: a margem que torna
+        /// visivel uma marca do `settle` que lhe passasse a frente.
+        fn held_notes_worker(
+            dir: &NotesDir,
+        ) -> (
+            ZettelWorker,
+            std::sync::mpsc::Receiver<(NotesOrigin, NotesReply)>,
+            Held,
+        ) {
+            let held = Held(Arc::new((Mutex::new(false), Condvar::new())));
+            let gate = held.clone();
+            let (reply_tx, replies) = std::sync::mpsc::channel();
+            let worker = ZettelWorker::spawn(dir.0.clone(), move |origin, reply| {
+                gate.wait();
+                if origin == NotesOrigin::Closed {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                let _ = reply_tx.send((origin, reply));
+            });
+            (worker, replies, held)
+        }
+
+        /// Enche a fila de `worker` com listagens ate ela responder
+        /// "ocupadas": sao `NOTES_QUEUE_LIMIT`.
+        fn fill_notes_queue(worker: &ZettelWorker) {
+            let mut accepted = 0;
+            let refused = loop {
+                match worker.submit(NotesCommand::List, NotesOrigin::Panel) {
+                    Ok(()) => accepted += 1,
+                    Err(error) => break error,
+                }
+                assert!(accepted <= NOTES_QUEUE_LIMIT, "a fila nao tem tecto");
+            };
+            assert_eq!(accepted, NOTES_QUEUE_LIMIT);
+            assert_eq!(refused, NOTES_BUSY);
+        }
+
+        /// Gate: largar um painel ABERTO com uma nota a meio sem `dismiss` --
+        /// uma atribuicao por cima (`self.side_panel = SidePanel::closed(..)`),
+        /// um `mem::replace`, um `drop` -- compila, e por isso nao pode perder
+        /// o texto: o `Drop` do `SidePanel` grava-o, uma vez, antes de a vista
+        /// sair. E depois de um `dismiss` (que ja gravou) largar o painel nao
+        /// grava outra vez. O editor que embarca, o parser do canal, o
+        /// `SidePanel` com uma vista de mentira e o `ZettelWorker` de verdade
+        /// sobre uma pasta temporaria.
+        #[test]
+        fn dropping_or_overwriting_an_open_side_panel_still_saves_the_note_once() {
+            use side_panel::{DraftRescue, PanelPost, Received, SidePanel};
+            use std::{cell::RefCell, rc::Rc};
+
+            let sent = typed_note(&[]);
+            let ways = [
+                "atribuicao por cima",
+                "mem::replace",
+                "drop",
+                "dismiss e depois drop",
+                "dismiss e depois atribuicao por cima",
+            ];
+            for way in ways {
+                let dir = NotesDir::new("drop");
+                let (worker, replies) = notes_worker(&dir);
+                let log = Rc::new(RefCell::new(Vec::new()));
+                let notes = LoggedNotes {
+                    worker: worker.clone(),
+                    log: Rc::clone(&log),
+                };
+                let mut panel = SidePanel::closed(notes.clone());
+                let ticket = panel.ticket();
+                assert!(panel.open(ticket, FakePanel(Rc::clone(&log))).is_ok());
+                for message in &sent {
+                    let post = PanelPost::parse(ticket, message).expect("o parser aceitou");
+                    assert!(matches!(panel.receive(post), Received::Current(_)));
+                }
+                assert!(panel.draft().is_some(), "{way}: sem copia do editor");
+
+                match way {
+                    "atribuicao por cima" => {
+                        panel = SidePanel::closed(notes.clone());
+                        assert!(!panel.is_open());
+                        drop(panel);
+                    }
+                    "mem::replace" => {
+                        let old = std::mem::replace(&mut panel, SidePanel::closed(notes.clone()));
+                        drop(old);
+                        drop(panel);
+                    }
+                    "drop" => drop(panel),
+                    "dismiss e depois drop" => {
+                        let closed = panel
+                            .dismiss(PanelExit::SurfaceChange, Surface::Comparator, None)
+                            .expect("painel");
+                        assert_eq!(closed.saved, Ok(()));
+                        drop(panel);
+                    }
+                    "dismiss e depois atribuicao por cima" => {
+                        let closed = panel
+                            .dismiss(PanelExit::SurfaceChange, Surface::Comparator, None)
+                            .expect("painel");
+                        assert_eq!(closed.saved, Ok(()));
+                        panel = SidePanel::closed(notes.clone());
+                        drop(panel);
+                    }
+                    other => unreachable!("{other}"),
+                }
+                worker.settle(SETTLE);
+
+                assert_eq!(
+                    *log.borrow(),
+                    ["salvar Ideia", "largada"],
+                    "{way}: o texto tem de ir uma vez, antes de a pagina sair"
+                );
+                assert_eq!(rescues(&log), 1, "{way}");
+                assert_one_note_on_disk(&dir, way);
+                let (origin, reply) = replies.recv_timeout(SETTLE).expect("resposta");
+                assert_eq!(origin, NotesOrigin::Closed, "{way}");
+                assert!(
+                    matches!(
+                        reply,
+                        NotesReply::Opened {
+                            cause: NoteOpened::Saved,
+                            ..
+                        }
+                    ),
+                    "{way}: {reply:?}"
+                );
+                assert!(replies.try_recv().is_err(), "{way}: duas gravacoes");
+            }
+        }
+
+        /// Gate: o X, o Esc e o botao Notas fecham o painel pela pagina -- ela
+        /// manda o `note-save` com o texto todo e logo a seguir o `close`, e o
+        /// lado nativo larga a copia dele (`track_note_draft`). Com a fila das
+        /// notas cheia (um disco que nao responde, 64 pedidos), esse salvar
+        /// nao pode ser recusado como uma listagem: a pagina sai no `close`
+        /// seguinte e nao ha quem tente outra vez. Corre o editor que embarca,
+        /// o parser do canal, o `SidePanel` e o que o `handle_panel_message`
+        /// faz com cada pedido (`notes_command_for` -> `ZettelWorker::submit`,
+        /// o `close` -> `dismiss`) sobre o `ZettelWorker` de verdade, preso:
+        /// nada espera pelo disco, e quando ele volta o texto esta la.
+        #[test]
+        fn closing_the_panel_by_its_x_saves_the_note_even_with_the_notes_queue_full() {
+            use side_panel::{DraftRescue, PanelPost, Received, SidePanel};
+            use std::{cell::RefCell, rc::Rc};
+
+            let closes = [
+                ("o X", "__click($('close'));".to_string()),
+                (
+                    "o Esc",
+                    "__fire(document, 'keydown', { key: 'Escape' });".to_string(),
+                ),
+                ("o botao Notas", PANEL_NOTES_BUTTON_SCRIPT.to_string()),
+            ];
+            for (entry, close) in closes {
+                let sent = typed_note(&[close.as_str()]);
+                let actions: Vec<String> = sent.iter().map(|m| action_of(m)).collect();
+                assert!(
+                    actions.ends_with(&["note-save".to_string(), "close".to_string()]),
+                    "{entry}: {actions:?}"
+                );
+
+                let dir = NotesDir::new("x-cheia");
+                let (worker, replies, held) = held_notes_worker(&dir);
+                // Se alguma coisa esperasse pelo disco, o teste nao ficava
+                // preso: o disco volta sozinho, e fica dito.
+                let waited = Arc::new(AtomicBool::new(false));
+                {
+                    let (held, waited) = (held.clone(), Arc::clone(&waited));
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_secs(20));
+                        waited.store(true, Ordering::SeqCst);
+                        held.release();
+                    });
+                }
+                fill_notes_queue(&worker);
+
+                let log = Rc::new(RefCell::new(Vec::new()));
+                let mut panel = SidePanel::closed(LoggedNotes {
+                    worker: worker.clone(),
+                    log: Rc::clone(&log),
+                });
+                let ticket = panel.ticket();
+                assert!(panel.open(ticket, FakePanel(Rc::clone(&log))).is_ok());
+                let mut submitted = Vec::new();
+                for message in &sent {
+                    let post = PanelPost::parse(ticket, message).expect("o parser aceitou");
+                    // O que o `handle_panel_message` faz com cada pedido.
+                    match panel.receive(post) {
+                        Received::Current(PanelMessage::Close) => {
+                            let closed = panel
+                                .dismiss(PanelExit::CloseButton, Surface::Comparator, None)
+                                .expect("painel");
+                            assert_eq!(closed.saved, Ok(()), "{entry}");
+                        }
+                        Received::Current(PanelMessage::NoteDraft(_)) => {}
+                        Received::Current(message) => {
+                            if let Some(command) = notes_command_for(message) {
+                                submitted.push(worker.submit(command, NotesOrigin::Panel));
+                            }
+                        }
+                        Received::Late(saved) => panic!("{entry}: pagina viva ({saved:?})"),
+                    }
+                }
+                assert!(
+                    !waited.load(Ordering::SeqCst),
+                    "{entry}: o fecho ficou a espera do disco"
+                );
+                assert!(!panel.is_open(), "{entry}");
+                assert_eq!(
+                    submitted,
+                    [Ok(())],
+                    "{entry}: o salvar da pagina foi recusado com a fila cheia"
+                );
+                // O salvar levou o texto; o fecho ja nao tinha copia a gravar.
+                assert_eq!(rescues(&log), 0, "{entry}");
+
+                held.release();
+                worker.settle(SETTLE);
+                assert_one_note_on_disk(&dir, entry);
+                let saved: Vec<NotesReply> = replies
+                    .try_iter()
+                    .filter(|(origin, _)| *origin == NotesOrigin::Panel)
+                    .map(|(_, reply)| reply)
+                    .filter(|reply| !matches!(reply, NotesReply::Listed { .. }))
+                    .collect();
+                assert!(
+                    matches!(
+                        saved.as_slice(),
+                        [NotesReply::Opened {
+                            cause: NoteOpened::Saved,
+                            ..
+                        }]
+                    ),
+                    "{entry}: {saved:?}"
+                );
+            }
+        }
+
+        /// Gate: a saida da app so larga a janela depois de o rascunho do
+        /// painel aberto estar no disco, mesmo com a fila cheia (64 pedidos a
+        /// espera de um disco lento). O rascunho e a marca do `settle` vao
+        /// pela MESMA fila, por esta ordem: primeiro, a ordem em que chegam a
+        /// fila (lida por quem a esvazia); depois, o `ZettelWorker` de verdade
+        /// -- quando o `exit` volta, a nota esta no disco e a resposta de
+        /// fecho ja chegou.
+        #[test]
+        fn closing_the_window_waits_for_the_rescued_note_behind_a_full_queue() {
+            use side_panel::{PanelPost, Received, SidePanel};
+            use std::{cell::RefCell, rc::Rc};
+
+            let sent = typed_note(&[]);
+
+            // A ordem na fila: a fila cheia, e quem a esvazia regista o que
+            // chega e responde a marca.
+            let (tx, rx) = channel::<NotesJob>();
+            let worker = ZettelWorker {
+                tx,
+                queued: Arc::new(AtomicUsize::new(NOTES_QUEUE_LIMIT)),
+            };
+            assert_eq!(
+                worker.submit(NotesCommand::List, NotesOrigin::Panel),
+                Err(NOTES_BUSY.to_string()),
+                "a fila tinha de estar cheia"
+            );
+            let drain = thread::spawn(move || {
+                let mut seen = Vec::new();
+                while seen.len() < 2 {
+                    let Ok(job) = rx.recv_timeout(SETTLE) else {
+                        break;
+                    };
+                    match (job.command, job.done) {
+                        (Some(NotesCommand::Save(edit)), None) => {
+                            seen.push(format!("salvar {}", edit.title));
+                        }
+                        (None, Some(done)) => {
+                            seen.push("marca".to_string());
+                            let _ = done.try_send(());
+                        }
+                        (other, _) => seen.push(format!("{other:?}")),
+                    }
+                }
+                seen
+            });
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut panel = SidePanel::closed(worker.clone());
+            let ticket = panel.ticket();
+            assert!(panel.open(ticket, FakePanel(Rc::clone(&log))).is_ok());
+            for message in &sent {
+                let post = PanelPost::parse(ticket, message).expect("o parser aceitou");
+                assert!(matches!(panel.receive(post), Received::Current(_)));
+            }
+            assert_eq!(panel.exit(SETTLE), Ok(()));
+            assert_eq!(
+                drain.join().expect("quem esvazia a fila"),
+                ["salvar Ideia", "marca"],
+                "a marca do settle passou a frente do rascunho"
+            );
+
+            // O worker de verdade, preso atras de 64 pedidos.
+            let dir = NotesDir::new("settle");
+            let (worker, replies, held) = held_notes_worker(&dir);
+            fill_notes_queue(&worker);
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut panel = SidePanel::closed(worker.clone());
+            let ticket = panel.ticket();
+            assert!(panel.open(ticket, FakePanel(Rc::clone(&log))).is_ok());
+            for message in &sent {
+                let post = PanelPost::parse(ticket, message).expect("o parser aceitou");
+                assert!(matches!(panel.receive(post), Received::Current(_)));
+            }
+            let disk = {
+                let held = held.clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(200));
+                    held.release();
+                })
+            };
+            assert_eq!(panel.exit(SETTLE), Ok(()));
+            // O que ja tinha chegado quando o `exit` voltou.
+            let arrived: Vec<(NotesOrigin, NotesReply)> = replies.try_iter().collect();
+            assert_one_note_on_disk(&dir, "saida da app");
+            disk.join().expect("disco");
+            let closed: Vec<&NotesReply> = arrived
+                .iter()
+                .filter(|(origin, _)| *origin == NotesOrigin::Closed)
+                .map(|(_, reply)| reply)
+                .collect();
+            assert!(
+                matches!(
+                    closed.as_slice(),
+                    [NotesReply::Opened {
+                        cause: NoteOpened::Saved,
+                        ..
+                    }]
+                ),
+                "a janela fechava antes de o rascunho estar gravado: {closed:?}"
+            );
+            assert_eq!(
+                arrived.len(),
+                NOTES_QUEUE_LIMIT + 1,
+                "o que estava na fila antes do rascunho tambem chegou"
+            );
+        }
+
+        /// Gate: com a fila das notas cheia, o texto de um painel que fecha
+        /// (o rascunho de um fecho nativo, `rescue`) e o salvar da pagina
+        /// entram na fila na mesma, pela ordem, sem esperar pelo disco; as
+        /// listagens e buscas, essas, respondem "ocupadas". So a thread das
+        /// notas morta perde o texto -- e ai o aviso diz.
+        #[test]
+        fn a_full_notes_queue_still_takes_the_note_of_a_closing_panel() {
+            use side_panel::DraftRescue;
+            let (tx, rx) = channel::<NotesJob>();
+            let worker = ZettelWorker {
+                tx,
+                queued: Arc::new(AtomicUsize::new(NOTES_QUEUE_LIMIT)),
+            };
+            let edit = |body: &str| NoteEdit {
+                id: None,
+                title: "Ideia".to_string(),
+                body: body.to_string(),
+                tags: Vec::new(),
+                rev: None,
+            };
+            assert_eq!(
+                worker.submit(NotesCommand::List, NotesOrigin::Panel),
+                Err(NOTES_BUSY.to_string())
+            );
+            assert_eq!(
+                worker.submit(NotesCommand::Search("x".into()), NotesOrigin::Panel),
+                Err(NOTES_BUSY.to_string())
+            );
+            assert_eq!(worker.rescue(NotesCommand::Save(edit("fecho"))), Ok(()));
+            assert_eq!(
+                worker.submit(NotesCommand::Save(edit("salvar")), NotesOrigin::Panel),
+                Ok(())
+            );
+            let first = rx.recv_timeout(SETTLE).expect("o rascunho perdeu-se");
+            assert_eq!(first.command, Some(NotesCommand::Save(edit("fecho"))));
+            assert_eq!(first.origin, NotesOrigin::Closed);
+            let second = rx.recv_timeout(SETTLE).expect("o salvar perdeu-se");
+            assert_eq!(second.command, Some(NotesCommand::Save(edit("salvar"))));
+            assert_eq!(second.origin, NotesOrigin::Panel);
+            assert!(rx.try_recv().is_err(), "as listagens nao entraram");
+            drop(rx);
+            assert_eq!(
+                worker.rescue(NotesCommand::Save(edit("fecho"))),
+                Err(NOTES_WORKER_GONE.to_string())
+            );
+            assert_eq!(
+                worker.submit(NotesCommand::Save(edit("salvar")), NotesOrigin::Panel),
+                Err(NOTES_WORKER_GONE.to_string())
+            );
+        }
+
+        /// Gate: a copia do que se escreve (`note-draft`) nunca fica mais de
+        /// 200 ms atras, mesmo a escrever sem parar. Uma tecla a cada 50 ms
+        /// durante 2 s pelo relogio da pagina que embarca: em cada instante,
+        /// o lado nativo tem o texto de ha no maximo 200 ms (4 teclas). E a
+        /// janela que um fecho nativo ainda perde (`side_panel`).
+        #[test]
+        fn the_native_copy_of_a_note_is_never_more_than_200_ms_behind() {
+            let result = run_panel(&[
+                "window.neuraliaShowSection('notes');".into(),
+                "__click($('note-new'));".into(),
+                "__type($('note-title'), 'Rajada'); __advance(1000); __posted.length = 0;".into(),
+                r#"
+                __out.behind = [];
+                let text = '';
+                for (let i = 0; i < 40; i++) {
+                  text += 'a';
+                  __type($('note-body'), text);
+                  __advance(50);
+                  const drafts = __posted.map((m) => JSON.parse(m)).filter((m) => m.action === 'note-draft');
+                  const copy = drafts.length ? drafts[drafts.length - 1].args.body.length : 0;
+                  __out.behind.push(text.length - copy);
+                }
+                __advance(200);
+                const drafts = __posted.map((m) => JSON.parse(m)).filter((m) => m.action === 'note-draft');
+                __out.last = drafts.length ? drafts[drafts.length - 1].args.body : null;
+                "#
+                .into(),
+            ]);
+            let behind: Vec<u64> = result["out"]["behind"]
+                .as_array()
+                .expect("behind")
+                .iter()
+                .map(|value| value.as_u64().expect("numero"))
+                .collect();
+            assert_eq!(behind.len(), 40);
+            let worst = behind.iter().max().copied().unwrap_or_default();
+            assert!(
+                worst <= 4,
+                "a copia ficou {worst} teclas ({} ms) atras: {behind:?}",
+                worst * 50
+            );
+            assert_eq!(
+                result["out"]["last"],
+                "a".repeat(40),
+                "parada, a copia e o texto todo"
+            );
+        }
+
+        /// Gate: o salvar do painel nunca esmaga uma nota que mudou fora
+        /// deste editor desde que ele a abriu -- outra janela do NeuralIA (o
+        /// NeuralIA nao e instancia unica e cada processo tem o seu worker) ou
+        /// o Obsidian. O texto do editor vai para uma copia "(conflito)", a
+        /// nota fica como o outro a deixou, e o editor passa a mostrar a copia.
+        /// Dois salvar seguidos do MESMO editor (o segundo antes da resposta
+        /// ao primeiro) nao sao conflito.
+        #[test]
+        fn a_panel_save_never_overwrites_a_note_changed_elsewhere() {
+            let dir = NotesDir::new("conflict");
+            let store = dir.store();
+            let note = store
+                .create("Ideia", "linha A", Vec::new(), None, T0)
+                .expect("nota");
+            let opened = run_notes_command(&store, NotesCommand::Open(note.id.clone()), T0);
+            let opened_rev = match &opened {
+                NotesReply::Opened { note, .. } => note_rev(note),
+                other => panic!("{other:?}"),
+            };
+
+            // Esta janela abre a nota e escreve.
+            let steps: Vec<String> = vec![
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                notes_reply_script(&opened),
+                "__type($('note-body'), 'linha A\\nlinha C');".into(),
+                "__click($('note-save'));".into(),
+            ];
+            let sent = posted(&run_panel(&steps));
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            let mine = parse_panel_message(&sent[0]).expect("note-save");
+
+            // Entretanto outra janela (outro processo, outro worker) grava.
+            let mut elsewhere = NotesSession::default();
+            let other = run_notes_command_in(
+                &mut elsewhere,
+                &store,
+                NotesCommand::Save(NoteEdit {
+                    id: Some(note.id.clone()),
+                    title: "Ideia".to_string(),
+                    body: "linha A\nlinha B escrita noutra janela".to_string(),
+                    tags: Vec::new(),
+                    rev: Some(opened_rev.clone()),
+                }),
+                T0 + 30,
+            );
+            assert!(matches!(other, NotesReply::Opened { .. }), "{other:?}");
+
+            // O salvar desta janela chega ao worker dela.
+            let mut session = NotesSession::default();
+            let reply = run_notes_command_in(
+                &mut session,
+                &store,
+                notes_command_for(mine).expect("comando"),
+                T0 + 60,
+            );
+            let NotesReply::Conflict {
+                original,
+                note: copy,
+            } = &reply
+            else {
+                panic!("o salvar esmagou a nota da outra janela: {reply:?}");
+            };
+            assert_eq!(original, &note.id);
+            assert_eq!(
+                store.get(&note.id).expect("ler").expect("existe").body,
+                "linha A\nlinha B escrita noutra janela",
+                "a linha B perdeu-se"
+            );
+            assert_eq!(copy.body, "linha A\nlinha C");
+            assert_eq!(copy.title, "Ideia (conflito)");
+            assert_ne!(copy.id, note.id);
+
+            // O painel passa a mostrar a copia: o salvar seguinte vai para ela.
+            let mut follow = steps.clone();
+            follow.push(notes_reply_script(&reply));
+            follow.push("__out.msg = $('notes-msg').textContent; __posted.length = 0;".into());
+            follow.push("__type($('note-body'), 'linha A\\nlinha C\\nlinha D');".into());
+            follow.push("__click($('note-save'));".into());
+            let result = run_panel(&follow);
+            assert!(
+                result["out"]["msg"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("cópia"),
+                "{result}"
+            );
+            let sent = posted(&result);
+            let next: Vec<&String> = sent
+                .iter()
+                .filter(|m| action_of(m) == "note-save")
+                .collect();
+            assert_eq!(next.len(), 1, "{sent:?}");
+            assert!(matches!(
+                parse_panel_message(next[0]),
+                Some(PanelMessage::NoteSave(NoteEdit { id: Some(ref id), .. })) if *id == copy.id
+            ));
+
+            // Dois salvar seguidos do mesmo editor, com a revisao da abertura:
+            // o segundo nao e conflito (o ficheiro mudou pelo primeiro).
+            let own = store
+                .create("Propria", "v1", Vec::new(), None, T0)
+                .expect("nota");
+            let rev = note_rev(&store.get(&own.id).expect("ler").expect("existe"));
+            let mut session = NotesSession::default();
+            for (body, at) in [("v2", T0 + 100), ("v3", T0 + 101)] {
+                let reply = run_notes_command_in(
+                    &mut session,
+                    &store,
+                    NotesCommand::Save(NoteEdit {
+                        id: Some(own.id.clone()),
+                        title: "Propria".to_string(),
+                        body: body.to_string(),
+                        tags: Vec::new(),
+                        rev: Some(rev.clone()),
+                    }),
+                    at,
+                );
+                assert!(
+                    matches!(
+                        reply,
+                        NotesReply::Opened {
+                            cause: NoteOpened::Saved,
+                            ..
+                        }
+                    ),
+                    "{body}: {reply:?}"
+                );
+            }
+            assert_eq!(store.get(&own.id).expect("ler").expect("existe").body, "v3");
+            assert_eq!(
+                store.list().expect("lista").len(),
+                3,
+                "nenhuma copia a mais"
+            );
+        }
+
+        fn opened_id(reply: &NotesReply) -> String {
+            match reply {
+                NotesReply::Opened { note, .. } => note.id.clone(),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        /// Gate: um salvar que falha (pasta ocupada, disco cheio, ficheiro
+        /// preso) ou que o parser recusa deixa o texto por salvar -- sair do
+        /// editor tenta outra vez, o lado nativo volta a ter a copia, e uma
+        /// nota nova pode voltar a ser salva. E um TAB no titulo (tabela
+        /// colada, nota do Obsidian) ja nao faz o salvar morrer em silencio.
+        #[test]
+        fn a_failed_or_refused_save_keeps_the_text_to_save() {
+            let dir = NotesDir::new("failed");
+            let store = dir.store();
+            let note = store
+                .create("Tabela\tResumo", "v1", Vec::new(), None, T0)
+                .expect("nota");
+            assert_eq!(note.title, "Tabela\tResumo", "o motor guarda o TAB");
+            let opened = run_notes_command(&store, NotesCommand::Open(note.id.clone()), T0);
+            let failed = notes_reply_script(&NotesReply::Failed(
+                "As notas estão ocupadas; tente de novo.".to_string(),
+            ));
+
+            // 1. Falhou: voltar a lista tenta outra vez.
+            let result = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                notes_reply_script(&opened),
+                "__type($('note-body'), 'v2 importante');".into(),
+                "__click($('note-save'));".into(),
+                failed.clone(),
+                "__click($('note-back'));".into(),
+            ]);
+            let sent = posted(&result);
+            assert_eq!(
+                sent.iter().map(|m| action_of(m)).collect::<Vec<_>>(),
+                ["note-save", "note-draft", "note-save", "notes-list"],
+                "{sent:?}"
+            );
+            // O titulo do disco com TAB sai numa linha, e o salvar passa.
+            let retry = parse_panel_message(&sent[2]).expect("o salvar de novo passa no parser");
+            assert_eq!(
+                retry,
+                PanelMessage::NoteSave(NoteEdit {
+                    id: Some(note.id.clone()),
+                    title: "Tabela Resumo".to_string(),
+                    body: "v2 importante".to_string(),
+                    tags: Vec::new(),
+                    rev: Some(match &opened {
+                        NotesReply::Opened { note, .. } => note_rev(note),
+                        other => panic!("{other:?}"),
+                    }),
+                })
+            );
+            // Enquanto falhado, o fecho nativo grava a copia.
+            let mut draft = draft_after(&sent[..2]);
+            assert!(take_note_draft_on_close(&mut draft).is_some());
+            let command = notes_command_for(retry).expect("comando");
+            assert!(matches!(
+                run_notes_command(&store, command, T0 + 60),
+                NotesReply::Opened { ref note, .. } if note.body == "v2 importante"
+            ));
+
+            // 2. Nota nova com TAB colado no titulo: o salvar chega ao disco
+            //    numa linha; recusado, o painel volta a poder salvar.
+            let result = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                "__click($('note-new'));".into(),
+                "__type($('note-title'), 'Capítulo 1\\tIntrodução');".into(),
+                "__click($('note-save'));".into(),
+                notes_reply_script(&NotesReply::Failed(NOTE_SAVE_REFUSED.to_string())),
+                "__out.msg = $('notes-msg').textContent;".into(),
+                "__type($('note-body'), 'mais');".into(),
+                "__click($('note-save'));".into(),
+            ]);
+            assert_eq!(result["out"]["msg"], NOTE_SAVE_REFUSED);
+            let sent = posted(&result);
+            let saves: Vec<&String> = sent
+                .iter()
+                .filter(|m| action_of(m) == "note-save")
+                .collect();
+            assert_eq!(
+                saves.len(),
+                2,
+                "a nota nova ficou presa em 'A salvar…': {sent:?}"
+            );
+            assert!(matches!(
+                parse_panel_message(saves[0]),
+                Some(PanelMessage::NoteSave(NoteEdit { ref title, .. })) if title == "Capítulo 1 Introdução"
+            ));
+        }
+
+        /// Gate: um note-save que o parser recusa tem resposta. O canal do
+        /// painel responde com `NOTE_SAVE_REFUSED`, e nunca pelo worker.
+        #[test]
+        fn a_refused_note_save_is_answered_and_never_reaches_the_disk() {
+            let refused = parse_panel_message(&save_message(Some("../../x"), "t", "b", &[]))
+                .expect("recusado mas respondido");
+            assert_eq!(refused, PanelMessage::NoteSaveRefused);
+            assert_eq!(notes_command_for(refused), None);
+            assert_eq!(
+                notes_command_for(PanelMessage::NoteDraft(None)),
+                None,
+                "o rascunho nao vai ao disco enquanto o painel esta aberto"
+            );
+        }
+
+        /// Gate: uma nota com HTML e JS no titulo, no corpo, nas tags e na
+        /// fonte chega ao painel que embarca byte a byte como TEXTO. O
+        /// payload vai em JSON: aspas, `'); ...`, `</script>` e U+2028 nao
+        /// fecham nada. Nenhum elemento sai do que a nota diz.
+        #[test]
+        fn notes_render_keeps_hostile_note_text_inert() {
+            let dir = NotesDir::new("hostile");
+            let store = dir.store();
+            let target = store
+                .create("Alvo", "texto", Vec::new(), None, T0)
+                .expect("alvo");
+            let title = "<img src=x onerror=\"globalThis.__pwned='title'\">";
+            let body = format!(
+                "</script><script>globalThis.__pwned='script'</script>\n\
+                 '); globalThis.__pwned = 'quote'; ('\n\
+                 \" \\\" \\\\ \u{2028} \u{2029} ${{globalThis.__pwned='template'}}\n\
+                 Ver [[{}|<b onclick=\"globalThis.__pwned='alias'\">alvo</b>]] e [[nao-e-id]].",
+                target.id
+            );
+            let hostile = store
+                .create(
+                    title,
+                    &body,
+                    vec!["<i>tag</i>".to_string()],
+                    Some("https://example.com/?q=<script>alert(1)</script>".to_string()),
+                    T0 + 60,
+                )
+                .expect("nota hostil");
+            // O alvo ganha um backlink com o titulo hostil.
+            let listed = run_notes_command(&store, NotesCommand::List, T0);
+            let opened = run_notes_command(&store, NotesCommand::Open(hostile.id.clone()), T0);
+            let target_opened =
+                run_notes_command(&store, NotesCommand::Open(target.id.clone()), T0);
+            match &target_opened {
+                NotesReply::Opened { backlinks, .. } => {
+                    assert_eq!(backlinks.len(), 1);
+                    assert_eq!(backlinks[0].title, title);
+                }
+                other => panic!("{other:?}"),
+            }
+
+            let result = run_panel(&[
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                notes_reply_script(&listed),
+                "__out.listTitles = $('notes-list').children.map((b) => b.children[0].textContent);".into(),
+                notes_reply_script(&opened),
+                "__out.title = $('note-title').value; __out.body = $('note-body').value;".into(),
+                "__out.tags = $('note-tags').value; __out.source = $('note-source').textContent;".into(),
+                "__out.links = __buttons($('note-preview')).map((b) => b.textContent);".into(),
+                "__out.preview = $('note-preview').textContent;".into(),
+                "__click(__buttons($('note-preview'))[0]);".into(),
+                "__click($('note-source'));".into(),
+                notes_reply_script(&target_opened),
+                "__out.backlinks = __buttons($('note-backlinks')).map((b) => b.textContent);".into(),
+            ]);
+            let out = &result["out"];
+            assert_eq!(
+                result["pwned"],
+                serde_json::Value::Null,
+                "codigo da nota correu"
+            );
+            assert_eq!(
+                result["html"],
+                serde_json::json!([]),
+                "a nota passou por HTML"
+            );
+            for tag in result["created"].as_array().expect("created") {
+                assert!(
+                    matches!(tag.as_str(), Some("button" | "span" | "div")),
+                    "a nota criou um <{tag}>"
+                );
+            }
+            assert_eq!(out["listTitles"], serde_json::json!([title, "Alvo"]));
+            assert_eq!(out["title"], title);
+            assert_eq!(out["body"], body.as_str(), "o corpo chega byte a byte");
+            assert_eq!(out["tags"], "<i>tag</i>");
+            assert_eq!(
+                out["source"],
+                "https://example.com/?q=<script>alert(1)</script>"
+            );
+            // So o [[id|..]] valido vira link; o rotulo e texto.
+            assert_eq!(
+                out["links"],
+                serde_json::json!(["<b onclick=\"globalThis.__pwned='alias'\">alvo</b>"])
+            );
+            assert_eq!(
+                out["preview"],
+                body.as_str().replace(
+                    &format!(
+                        "[[{}|<b onclick=\"globalThis.__pwned='alias'\">alvo</b>]]",
+                        target.id
+                    ),
+                    "<b onclick=\"globalThis.__pwned='alias'\">alvo</b>"
+                )
+            );
+            assert_eq!(out["backlinks"], serde_json::json!([title]));
+            let sent: Vec<PanelMessage> = posted(&result)
+                .iter()
+                .map(|m| parse_panel_message(m).unwrap_or_else(|| panic!("recusado: {m}")))
+                .collect();
+            assert_eq!(
+                sent,
+                [
+                    PanelMessage::NoteOpen(target.id.clone()),
+                    PanelMessage::Open(
+                        "https://example.com/?q=<script>alert(1)</script>".to_string()
+                    ),
+                ]
+            );
+        }
+
+        /// Gate: o Ctrl+Shift+Z do mapa de teclas que embarca pede uma nota
+        /// sem mandar nada da pagina; o Ctrl+Z e o refazer dos campos
+        /// editaveis ficam com a pagina.
+        #[test]
+        fn ctrl_shift_z_on_a_page_posts_a_bare_note_request() {
+            let drive = r#"
+document.readyState = 'interactive';
+__fire('DOMContentLoaded');
+__drain();
+__fire('keydown', { key: 'z', ctrlKey: true });
+__fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true, target: new Element('textarea') });
+__fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true, target: Object.assign(new Element('div'), { isContentEditable: true }) });
+__fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
+"#;
+            let cases = [serde_json::json!({
+                "name": "keymap",
+                "href": "https://example.com/",
+                "script": NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", CAP),
+                "drive": drive,
+            })];
+            let program = format!(
+                "const INPUT = {};\n{}",
+                serde_json::json!({ "cases": cases }),
+                INJECTED_SCRIPT_HARNESS
+            );
+            let results: Vec<serde_json::Value> =
+                serde_json::from_str(&run_node_program(&program)).expect("harness json");
+            let sent = results[0]["posted"].as_array().expect("posted");
+            assert_eq!(
+                sent.len(),
+                1,
+                "so o Ctrl+Shift+Z fora de um campo: {sent:?}"
+            );
+            let message = sent[0].as_str().expect("string");
+            assert_eq!(
+                parse_ipc_message(message, CAP, 3),
+                Some(IpcAction::Note),
+                "{message}"
+            );
+            let value: serde_json::Value = serde_json::from_str(message).expect("json");
+            assert_eq!(
+                value["args"],
+                serde_json::json!({}),
+                "a pagina nao manda dados"
+            );
+        }
+
+        /// Gate: o `note` vai para a WebView que o mandou -- a coluna dela, o
+        /// Split, a WebView unica -- e o Split privado recusa sem ler. A
+        /// decisao repete-se na hora de ler, com o Split que existe entao.
+        #[test]
+        fn a_note_request_reads_its_own_webview_and_never_the_private_split() {
+            for col in 0..COMPARATOR_COLUMNS {
+                assert!(matches!(
+                    App::column_ipc_event_impl(col, IpcAction::Note),
+                    Some(UserEvent::NoteRequested(Some(PageTarget::Column(c)))) if c == col
+                ));
+            }
+            assert!(matches!(
+                App::split_ipc_event_impl(1, false, IpcAction::Note),
+                Some(UserEvent::NoteRequested(Some(PageTarget::Split)))
+            ));
+            assert!(matches!(
+                App::split_ipc_event_impl(1, true, IpcAction::Note),
+                Some(UserEvent::NoteRefusedPrivate)
+            ));
+            assert!(matches!(
+                common_ipc_event(IpcAction::Note),
+                Some(UserEvent::NoteRequested(None))
+            ));
+            // Na hora de ler.
+            assert_eq!(
+                note_capture_decision(Some(PageTarget::Split), Some(true)),
+                NoteCapture::RefusePrivate
+            );
+            assert_eq!(
+                note_capture_decision(Some(PageTarget::Split), Some(false)),
+                NoteCapture::Read
+            );
+            assert_eq!(
+                note_capture_decision(Some(PageTarget::Split), None),
+                NoteCapture::NoPage
+            );
+            for target in [
+                Some(PageTarget::Column(0)),
+                Some(PageTarget::Column(2)),
+                None,
+            ] {
+                for split in [None, Some(false), Some(true)] {
+                    assert_eq!(
+                        note_capture_decision(target, split),
+                        NoteCapture::Read,
+                        "{target:?} com split {split:?}"
+                    );
+                }
+            }
+            assert_eq!(NOTE_PRIVATE_REFUSAL, "Modo privado: notas não são criadas");
+
+            // E a WebView que `request_note_from_page` le: a da coluna que
+            // pediu (nunca a vizinha), a do Split de agora (nunca privado) ou
+            // a unica. As colunas e o Split sao os tipos do comparador, com
+            // numeros a fazer de WebViews: o `private` vem do proprio Split.
+            let columns: Vec<ComparatorView<u8>> = [(10u8, "a"), (11, "b"), (12, "c")]
+                .into_iter()
+                .map(|(webview, name)| ComparatorView { webview, name })
+                .collect();
+            let split = |private: bool| SplitView {
+                webview: 90u8,
+                source_index: 0,
+                context_id: None,
+                fullscreen: false,
+                private,
+            };
+            let (normal, private, main) = (split(false), split(true), 70u8);
+            for (index, column) in columns.iter().enumerate() {
+                for split in [None, Some(&normal), Some(&private)] {
+                    assert_eq!(
+                        note_read_view(
+                            Some(PageTarget::Column(index)),
+                            &columns,
+                            split,
+                            Some(&main)
+                        ),
+                        Ok(&column.webview),
+                        "coluna {index}"
+                    );
+                }
+            }
+            assert_eq!(
+                note_read_view(
+                    Some(PageTarget::Column(COMPARATOR_COLUMNS)),
+                    &columns,
+                    None,
+                    Some(&main)
+                ),
+                Err(NoteCapture::NoPage)
+            );
+            assert_eq!(
+                note_read_view(
+                    Some(PageTarget::Split),
+                    &columns,
+                    Some(&normal),
+                    Some(&main)
+                ),
+                Ok(&90)
+            );
+            assert_eq!(
+                note_read_view(
+                    Some(PageTarget::Split),
+                    &columns,
+                    Some(&private),
+                    Some(&main)
+                ),
+                Err(NoteCapture::RefusePrivate),
+                "o Split privado foi lido"
+            );
+            assert_eq!(
+                note_read_view(Some(PageTarget::Split), &columns, None, Some(&main)),
+                Err(NoteCapture::NoPage)
+            );
+            assert_eq!(
+                note_read_view(None, &columns, Some(&private), Some(&main)),
+                Ok(&main)
+            );
+            assert_eq!(
+                note_read_view::<u8>(None, &[], None, None),
+                Err(NoteCapture::NoPage)
+            );
+        }
+
+        /// Gate: a selecao vira uma nota com a citacao, a fonte e a tag
+        /// "web"; o que a pagina devolve e cortado e validado outra vez.
+        #[test]
+        fn a_selection_becomes_a_quoted_note_with_its_source() {
+            let capture = |text: &str, url: &str, title: &str| {
+                serde_json::json!({ "text": text, "url": url, "title": title }).to_string()
+            };
+            let draft = note_draft_from_capture(
+                &capture(
+                    "  Linha 1\r\nLinha 2\n\n  Linha 4  \n",
+                    "https://example.com/artigo#parte",
+                    "  Artigo\tde   teste ",
+                ),
+                None,
+            )
+            .expect("nota");
+            assert_eq!(
+                draft,
+                NoteDraft {
+                    title: "Artigo de teste".to_string(),
+                    body: "> Linha 1\n> Linha 2\n>\n>   Linha 4\n\nFonte: https://example.com/artigo#parte\n"
+                        .to_string(),
+                    tags: vec!["web".to_string()],
+                    source: Some("https://example.com/artigo#parte".to_string()),
+                }
+            );
+
+            // Sem titulo na pagina: as primeiras palavras da selecao.
+            let untitled = note_draft_from_capture(
+                &capture(
+                    "um dois tres quatro cinco seis sete oito nove dez",
+                    "https://example.com/",
+                    "   ",
+                ),
+                None,
+            )
+            .expect("nota");
+            assert_eq!(untitled.title, "um dois tres quatro cinco seis sete oito");
+
+            // Nada selecionado.
+            for empty in ["", "   \n\t "] {
+                assert_eq!(
+                    note_draft_from_capture(&capture(empty, "https://example.com/", "T"), None),
+                    Err(NoteCaptureError::EmptySelection)
+                );
+            }
+            // Resposta que nao e o objeto do script.
+            for raw in [
+                "null".to_string(),
+                "\"texto\"".to_string(),
+                "nao e json".to_string(),
+                capture(
+                    &"a".repeat(NOTE_CAPTURE_MAX_BYTES),
+                    "https://example.com/",
+                    "T",
+                ),
+            ] {
+                assert_eq!(
+                    note_draft_from_capture(&raw, None),
+                    Err(NoteCaptureError::Unreadable),
+                    "{:.40}",
+                    raw
+                );
+            }
+
+            // A pagina pode mentir sobre o corte: o lado nativo corta.
+            let long = note_draft_from_capture(
+                &capture(
+                    &"q".repeat(NOTE_SELECTION_MAX_CHARS + 5_000),
+                    "https://example.com/",
+                    "T",
+                ),
+                None,
+            )
+            .expect("nota");
+            assert_eq!(
+                long.body.matches('q').count(),
+                NOTE_SELECTION_MAX_CHARS,
+                "a selecao fica no tecto"
+            );
+
+            // Enderecos que nao sao fonte: sem fonte e sem a linha "Fonte:".
+            let pdf_viewer = format!("{PDF_ORIGIN}/viewer.html");
+            for url in [
+                "javascript:alert(1)",
+                "file:///C:/Windows/win.ini",
+                "about:blank",
+                "data:text/html,<p>x</p>",
+                pdf_viewer.as_str(),
+            ] {
+                let draft =
+                    note_draft_from_capture(&capture("texto", url, "T"), None).expect("nota");
+                assert_eq!(draft.source, None, "{url}");
+                assert_eq!(draft.body, "> texto\n", "{url}");
+            }
+            // O endereco que o lado nativo conhece (Leitor, PDF) manda.
+            let from_pdf = note_draft_from_capture(
+                &capture("texto", &pdf_viewer, "Doc"),
+                Some("https://example.com/doc.pdf"),
+            )
+            .expect("nota");
+            assert_eq!(
+                from_pdf.source.as_deref(),
+                Some("https://example.com/doc.pdf")
+            );
+            // E so no Leitor e no PDF, na WebView unica.
+            let known = Some("https://example.com/doc.pdf");
+            for surface in [Surface::Reader, Surface::Pdf] {
+                assert_eq!(
+                    note_page_source(None, surface, known).as_deref(),
+                    known,
+                    "{surface:?}"
+                );
+            }
+            for (target, surface) in [
+                (None, Surface::External),
+                (None, Surface::Home),
+                (Some(PageTarget::Column(0)), Surface::Comparator),
+                (Some(PageTarget::Split), Surface::Comparator),
+                (Some(PageTarget::Column(1)), Surface::Pdf),
+            ] {
+                assert_eq!(
+                    note_page_source(target, surface, known),
+                    None,
+                    "{target:?} {surface:?}"
+                );
+            }
+
+            // E a nota vai para a pasta, pelo mesmo trabalho do worker.
+            let dir = NotesDir::new("selection");
+            let store = dir.store();
+            match run_notes_command(&store, NotesCommand::Create(draft), T0) {
+                NotesReply::Opened {
+                    cause: NoteOpened::Created,
+                    note,
+                    ..
+                } => {
+                    let text = std::fs::read_to_string(dir.0.join(format!("{}.md", note.id)))
+                        .expect("ficheiro");
+                    assert!(
+                        text.contains("source: https://example.com/artigo#parte"),
+                        "{text}"
+                    );
+                    assert!(text.contains("tags: [web]"), "{text}");
+                    assert!(
+                        text.ends_with("Fonte: https://example.com/artigo#parte\n"),
+                        "{text}"
+                    );
+                }
+                other => panic!("criar devolveu {other:?}"),
+            }
+        }
+
+        /// Gate: com o teclado na janela (Home ou barra), Ctrl+Shift+Z e uma
+        /// nota nova; o Ctrl+Z sozinho nao e.
+        #[test]
+        fn ctrl_shift_z_in_the_main_window_is_a_new_note() {
+            use winit::keyboard::ModifiersState;
+            let key = |text: &str| Key::Character(text.into());
+            let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+            assert_eq!(
+                main_window_shortcut(&key("Z"), ctrl_shift),
+                Some(MainShortcut::NewNote)
+            );
+            assert_eq!(
+                main_window_shortcut(&key("z"), ctrl_shift),
+                Some(MainShortcut::NewNote)
+            );
+            assert_eq!(
+                main_window_shortcut(&key("z"), ModifiersState::CONTROL),
+                None
+            );
+            // O script que a Home manda ao painel: sem a pagina das notas, nada.
+            let program = format!(
+                r#"
+const vm = require('node:vm');
+const script = {script};
+const calls = [];
+vm.runInNewContext(script, {{ window: {{ __neuraliaNotes: {{ newNote: () => calls.push('new') }} }} }});
+const quiet = vm.runInNewContext(script, {{ window: {{}} }});
+console.log(JSON.stringify({{ calls, quiet: quiet === undefined }}));
+"#,
+                script = serde_json::to_string(PANEL_NEW_NOTE_SCRIPT).expect("json")
+            );
+            assert_eq!(
+                run_node_program(&program).trim(),
+                r#"{"calls":["new"],"quiet":true}"#
+            );
+        }
     }
 }
 
@@ -29056,9 +36374,13 @@ const ICON_SLOT_WHATSAPP: usize = COMPARATOR_COLUMNS + 2;
 const ICON_SLOT_YOUTUBE: usize = COMPARATOR_COLUMNS + 3;
 const ICON_SLOT_MAIL: usize = COMPARATOR_COLUMNS + 4;
 const ICON_SLOT_INCOGNITO: usize = COMPARATOR_COLUMNS + 5;
+/// Ferramentas: Pomodoro, Notas e Respiracao.
+const ICON_SLOT_POMODORO: usize = COMPARATOR_COLUMNS + 6;
+const ICON_SLOT_NOTES: usize = COMPARATOR_COLUMNS + 7;
+const ICON_SLOT_BREATH: usize = COMPARATOR_COLUMNS + 8;
 /// O olho do Gemini Live.
-const ICON_SLOT_LIVE: usize = COMPARATOR_COLUMNS + 6;
-static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 6] = [const { OnceLock::new() }; 6];
+const ICON_SLOT_LIVE: usize = COMPARATOR_COLUMNS + 9;
+static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 9] = [const { OnceLock::new() }; 9];
 
 static AI_ICON_IMAGES: [OnceLock<RgbaImage>; COMPARATOR_COLUMNS] =
     [OnceLock::new(), OnceLock::new(), OnceLock::new()];
@@ -29135,6 +36457,9 @@ fn extra_icon(slot: usize) -> &'static RgbaImage {
             ICON_SLOT_WHATSAPP => include_bytes!("../../../assets/ai/whatsapp.png"),
             ICON_SLOT_YOUTUBE => include_bytes!("../../../assets/ai/youtube.png"),
             ICON_SLOT_MAIL => include_bytes!("../../../assets/ai/mail.png"),
+            ICON_SLOT_POMODORO => include_bytes!("../../../assets/ai/pomodoro.png"),
+            ICON_SLOT_NOTES => include_bytes!("../../../assets/ai/notes.png"),
+            ICON_SLOT_BREATH => include_bytes!("../../../assets/ai/breath.png"),
             ICON_SLOT_LIVE => include_bytes!("../../../assets/ai/live.png"),
             _ => include_bytes!("../../../assets/ai/incognito.png"),
         };
@@ -29233,6 +36558,14 @@ impl PillStyle {
 }
 
 /// Pilula com icone a esquerda e legenda; sem icone, a legenda fica centrada.
+/// O icone de 18 px da pilula so entra com as margens dos dois lados; numa
+/// pilula mais estreita (a coluna espremida) ele saia pela borda e caia na
+/// folga ou debaixo do "+".
+fn pill_fits_icon(width: f64, scale: f64) -> bool {
+    let padding = 11.0 * scale;
+    width >= padding + (18.0 * scale).round() + padding * 0.6
+}
+
 unsafe fn draw_pill(
     hdc: *mut core::ffi::c_void,
     rect: UiRect,
@@ -29242,6 +36575,13 @@ unsafe fn draw_pill(
     font: *mut core::ffi::c_void,
     background: Rgb,
 ) {
+    // Uma pilula que nao coube (a da coluna espremida pelos controlos da
+    // direita) tem largura zero. O `fill_pill` ja nao a pintava, mas o icone
+    // era desenhado na mesma, solto na barra -- e aparecia nas folgas entre
+    // os botoes das ferramentas.
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
     fill_pill(
         hdc,
         rect,
@@ -29256,7 +36596,7 @@ unsafe fn draw_pill(
     let mut text_right = rect.x + rect.width - padding * 0.6;
     let mut format = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
 
-    match style.icon {
+    match style.icon.filter(|_| pill_fits_icon(rect.width, scale)) {
         Some(slot) => {
             let size = (18.0 * scale).round() as i32;
             let icon_y = (rect.y + (rect.height - size as f64) / 2.0).round() as i32;
@@ -29413,6 +36753,15 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       if (e.shiftKey && key === 'r') { e.preventDefault(); act('reload'); return; }
       if (e.shiftKey && (key === 'i' || key === 'j' || key === 'c')) {
         e.preventDefault(); act('devtools'); return;
+      }
+      // Ctrl+Shift+Z: nota com o texto selecionado. A pagina so pede; a
+      // selecao e lida pelo lado nativo. Num campo editavel continua a ser o
+      // refazer do editor.
+      if (e.shiftKey && key === 'z') {
+        var field = e.target || {};
+        var fieldTag = (field.tagName || '').toUpperCase();
+        if (fieldTag === 'INPUT' || fieldTag === 'TEXTAREA' || field.isContentEditable) { return; }
+        e.preventDefault(); act('note'); return;
       }
       if (key === 'u') { e.preventDefault(); act('viewsource'); return; }
       switch (key) {

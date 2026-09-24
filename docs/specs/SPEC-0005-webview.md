@@ -41,18 +41,38 @@ message transport through WebView2, but every accepted message is a bounded JSON
 envelope authenticated with a per-WebView capability. The native side exposes
 no filesystem API, credential API or arbitrary native-call object.
 
-The closed action set has 29 names: `home`, `back`, `restore`,
+The closed action set has 30 names: `home`, `back`, `restore`,
 `autoscroll`, `zoomin`, `zoomout`, `zoomreset`, `reload`, `print`,
 `omnibox`, `history`, `clearhistory`, `fullscreen`, `devtools`,
 `viewsource`, `newtab`, `expand`, `shortcut-expand`, `minimize`, `split`,
 `link`, `ask`, `split-close`, `split-expand`, `palette`, `gmail-state`,
-`research-answer`, `agent-observation` and `hint`. Unknown actions, extra fields,
+`research-answer`, `agent-observation`, `hint` and `note`. Unknown actions, extra fields,
 wrong types, oversized messages and invalid per-action arguments are rejected.
 The parser gate `protocol_accepts_exactly_the_published_actions`
 (`crates/neural-app/src/ipc.rs`) reads this list and fails when it differs from
 the set the shipped parser accepts; the count is the test constant
 `PUBLISHED_ACTION_COUNT`, and the same gate holds the list and count repeated in
 SPEC-0108 and the count in SPEC-0015 to it.
+
+`note` is the Ctrl+Shift+Z request "make a note of what I selected". It takes
+no arguments: the page only asks. Inside an editable field (input, textarea,
+contenteditable) the keymap leaves Ctrl+Shift+Z to the page as redo. The
+native side then reads the selection (capped at 20 000 characters, again
+natively), `location.href` and `document.title` from the WebView that sent
+the request -- the emitting comparator column, the split, or the single
+External/Reader/PDF WebView -- and treats that reply as page data: only an
+http(s) address becomes the note's source, and on the Reader and PDF surfaces
+the source is the address the native side opened. The note is written under
+`<data_dir>/zettel` by a worker thread. A request from the private split is
+refused ("Modo privado: notas não são criadas") without reading the page, and
+the split's privacy is checked again when the read would happen; both the
+choice of WebView and that check live in `note_read_view`, which the shipped
+`request_note_from_page` calls. Gates:
+`note_is_a_bare_request_and_carries_no_page_data` (`ipc.rs`),
+`ctrl_shift_z_on_a_page_posts_a_bare_note_request`,
+`a_note_request_reads_its_own_webview_and_never_the_private_split` and
+`a_selection_becomes_a_quoted_note_with_its_source`
+(`crates/neural-app/src/windows_app.rs`).
 
 `link` reports a click on a link inside a comparator column. Its arguments are
 exactly `col`, `url` and `aside` (boolean); `url` goes through the same

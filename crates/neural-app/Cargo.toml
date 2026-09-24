@@ -32,6 +32,8 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Graphics_Gdi",
     "Win32_Security_Cryptography",
     "Win32_System_LibraryLoader",
+    # MessageBeep: o som curto do fim de uma fase do Pomodoro.
+    "Win32_System_Diagnostics_Debug",
     "Win32_System_Registry",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

@@ -90,6 +90,11 @@ pub enum IpcAction {
         col: usize,
         hint: ColumnHint,
     },
+    /// Ctrl+Shift+Z: "cria uma nota com o que selecionei". Sem argumentos de
+    /// proposito -- a pagina so PEDE; o texto selecionado, o endereco e o
+    /// titulo sao lidos pelo lado nativo, da WebView que mandou o pedido, e
+    /// nunca de uma WebView privada.
+    Note,
 }
 
 pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -147,6 +152,7 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
         "fullscreen" => no_args(args, IpcAction::Fullscreen),
         "devtools" => no_args(args, IpcAction::DevTools),
         "viewsource" => no_args(args, IpcAction::ViewSource),
+        "note" => no_args(args, IpcAction::Note),
         "newtab" => {
             if args.is_empty() {
                 Some(IpcAction::NewTab { col: None })
@@ -390,6 +396,7 @@ mod tests {
             ("fullscreen", IpcAction::Fullscreen),
             ("devtools", IpcAction::DevTools),
             ("viewsource", IpcAction::ViewSource),
+            ("note", IpcAction::Note),
         ];
         for (name, expected) in cases {
             assert_eq!(
@@ -677,6 +684,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn note_is_a_bare_request_and_carries_no_page_data() {
+        // A pagina so pede a nota. Texto, endereco e titulo sao lidos pelo
+        // lado nativo da WebView que pediu: um `note` com dados e recusado,
+        // para ninguem passar a confiar no que a pagina diz de si propria.
+        assert_eq!(
+            parse_ipc_message(&message("note", json!({})), CAP, 3),
+            Some(IpcAction::Note)
+        );
+        for args in [
+            json!({"text":"texto escolhido pela pagina"}),
+            json!({"url":"https://example.com/"}),
+            json!({"col":0}),
+            json!({"title":"x","text":"y","url":"https://example.com/"}),
+        ] {
+            assert_eq!(
+                parse_ipc_message(&message("note", args.clone()), CAP, 3),
+                None,
+                "note aceitou argumentos: {args}"
+            );
+        }
+    }
+
     /// SPEC-0005 publica a lista fechada de acoes pagina->nativo. O texto
     /// publicado e lido tal como embarca no repositorio.
     const SPEC_0005: &str = include_str!("../../../docs/specs/SPEC-0005-webview.md");
@@ -685,7 +715,7 @@ mod tests {
     /// ou sai uma acao: o gate abaixo exige um exemplo aceite por acao e que
     /// a SPEC-0005 (lista e contagem), a SPEC-0108 (lista e contagem) e a
     /// SPEC-0015 (contagem) digam exatamente isto.
-    const PUBLISHED_ACTION_COUNT: usize = 29;
+    const PUBLISHED_ACTION_COUNT: usize = 30;
 
     /// Nome de fio de cada variante. O `match` e exaustivo de proposito: uma
     /// variante nova nao compila sem passar por aqui, e o teste abaixo exige
@@ -721,6 +751,7 @@ mod tests {
             IpcAction::ResearchAnswer { .. } => "research-answer",
             IpcAction::AgentObservation { .. } => "agent-observation",
             IpcAction::Hint { .. } => "hint",
+            IpcAction::Note => "note",
         }
     }
 
@@ -808,6 +839,7 @@ mod tests {
                 json!({"data":"1\nhttps://example.com"}),
             ),
             message("hint", json!({"col":2,"id":"expand"})),
+            message("note", json!({})),
         ];
 
         // O que o parser que embarca aceita, pelo nome da variante devolvida.

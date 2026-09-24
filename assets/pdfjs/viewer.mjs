@@ -95,6 +95,8 @@ let defaultSize = null;
 let renderGeneration = 0;
 let resizeTimer = 0;
 let hudQueued = false;
+// Leitura em voz alta (read-aloud.js, carregado antes deste modulo).
+let readAloud = null;
 
 function pixelRatio() {
   return Math.max(1, Math.min(window.devicePixelRatio || 1, 3));
@@ -145,6 +147,8 @@ function measureLayout() {
 }
 
 function layoutAll() {
+  // A camada de texto do PDF.js dimensiona-se por esta variavel CSS.
+  pagesEl.style.setProperty('--scale-factor', String(scale));
   for (let i = 0; i < slots.length; i++) layoutSlot(i);
   measureLayout();
 }
@@ -167,8 +171,19 @@ function attachCanvas(slot, index) {
   return canvas;
 }
 
+// A camada de texto vive e morre com o canvas: mudar a escala ou afastar a
+// pagina larga as duas.
+function releaseTextLayer(slot) {
+  if (slot.textLayer) slot.textLayer.cancel();
+  if (slot.textEl) slot.textEl.remove();
+  slot.textLayer = null;
+  slot.textEl = null;
+  slot.textReady = false;
+}
+
 // width = 0 liberta o bitmap ja; tirar o no do DOM poupa o resto.
 function releaseCanvas(slot) {
+  releaseTextLayer(slot);
   const canvas = slot.canvas;
   if (!canvas) return;
   canvas.width = 0;
@@ -176,6 +191,54 @@ function releaseCanvas(slot) {
   canvas.remove();
   slot.canvas = null;
   slot.rendered = false;
+}
+
+// O texto de uma pagina (getTextContent) serve a camada de texto e a leitura
+// em voz alta: pede-se uma vez e partilha-se. Os textDivs da TextLayer ficam
+// paralelos a estes itens, que e o que a leitura usa para realcar a frase.
+function textContentOf(index) {
+  const slot = slots[index];
+  if (!slot || !doc) return Promise.resolve(null);
+  if (!slot.text) {
+    live.add(index);
+    const page = slot.page
+      ? Promise.resolve(slot.page)
+      : doc.getPage(index + 1).then((proxy) => (slot.page = slot.page || proxy));
+    const pending = page.then((proxy) => proxy.getTextContent());
+    slot.text = pending;
+    pending.catch(() => {
+      if (slot.text === pending) slot.text = null;
+    });
+  }
+  return slot.text;
+}
+
+async function renderTextLayer(index, viewport, generation) {
+  const slot = slots[index];
+  if (!slot || slot.textLayer || typeof pdfjsLib.TextLayer !== 'function') return;
+  let content;
+  try {
+    content = await textContentOf(index);
+  } catch (err) {
+    console.error('texto da pagina', index + 1, err);
+    return;
+  }
+  if (!content || generation !== renderGeneration || !slot.canvas || slot.textLayer) return;
+  const container = document.createElement('div');
+  container.className = 'textLayer';
+  slot.el.appendChild(container);
+  const layer = new pdfjsLib.TextLayer({ textContentSource: content, container, viewport });
+  slot.textLayer = layer;
+  slot.textEl = container;
+  try {
+    await layer.render();
+  } catch (err) {
+    if (!err || err.name !== 'AbortException') console.error('texto da pagina', index + 1, err);
+    return;
+  }
+  if (slot.textLayer !== layer) return;
+  slot.textReady = true;
+  if (readAloud) readAloud.pageReady(index);
 }
 
 function cleanupPage(slot) {
@@ -210,7 +273,10 @@ async function render(index) {
     });
     slot.task = task;
     await task.promise;
-    if (generation === renderGeneration) slot.rendered = true;
+    if (generation === renderGeneration) {
+      slot.rendered = true;
+      renderTextLayer(index, viewport, generation);
+    }
   } catch (err) {
     if (!err || err.name !== 'RenderingCancelledException') {
       console.error('pagina', index + 1, err);
@@ -246,8 +312,9 @@ function evictFarPages() {
         cleanupPage(slot);
         slot.page = null;
       }
+      if (distance > EVICT_RADIUS) slot.text = null;
     }
-    if (!slot.canvas && !slot.page) live.delete(i);
+    if (!slot.canvas && !slot.page && !slot.text) live.delete(i);
   }
 }
 
@@ -392,7 +459,8 @@ async function load() {
 
     slots.push({
       el, canvas: null, page: i === 0 ? first : null, size: known[i] || null, cssWidth: 0,
-      rendered: false, rendering: false, task: null, generation: renderGeneration
+      rendered: false, rendering: false, task: null, generation: renderGeneration,
+      text: null, textLayer: null, textEl: null, textReady: false
     });
   }
   pagesEl.appendChild(fragment);
@@ -404,6 +472,45 @@ async function load() {
   hud.hidden = false;
   updateHud();
   document.title = 'NeuralIA · PDF · ' + doc.numPages + ' páginas';
+  attachReadAloud(await documentLanguage());
+}
+
+// O idioma que o PDF declara (o /Lang do catalogo, que o PDF.js da em
+// info.Language). O lang do viewer.html e o da pagina do NeuralIA, nao o do
+// documento: sem declaracao, a leitura ouve o texto de cada pagina.
+async function documentLanguage() {
+  try {
+    const meta = await doc.getMetadata();
+    const lang = meta && meta.info && meta.info.Language;
+    const tag = typeof lang === 'string' ? lang.trim() : '';
+    return /^[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{1,8})*$/.test(tag) ? tag : '';
+  } catch (err) {
+    return '';
+  }
+}
+
+// Liga o read-aloud.js a este documento. Ele so ve paginas por indice: o
+// texto (getTextContent), os spans da camada de texto ja desenhada e um
+// pedido para trazer a pagina ao ecra.
+function attachReadAloud(lang) {
+  const api = window.NeuralIAReadAloud;
+  if (!api || readAloud) return;
+  readAloud = api.attachPdf({
+    window,
+    lang,
+    pageCount: () => slots.length,
+    currentPage: () => current - 1,
+    textContent: (i) => textContentOf(i).then((content) => (content ? content.items : [])),
+    textDivs: (i) => {
+      const slot = slots[i];
+      return slot && slot.textReady && slot.textLayer ? slot.textLayer.textDivs : null;
+    },
+    pageOf: (el) => {
+      const pageEl = el && typeof el.closest === 'function' ? el.closest('.page') : null;
+      return pageEl ? Number(pageEl.dataset.index) : null;
+    },
+    showPage: (i) => scrollToPage(i + 1)
+  });
 }
 
 // Nova escala: cancela o que estava a desenhar, larga todos os canvases (a
@@ -419,7 +526,7 @@ function relayout() {
     slot.rendering = false;
     slot.task = null;
     releaseCanvas(slot);
-    if (!slot.page) live.delete(i);
+    if (!slot.page && !slot.text) live.delete(i);
   }
 
   scale = targetWidth() / baseWidth;
