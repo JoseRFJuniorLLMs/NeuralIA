@@ -4,8 +4,28 @@ use serde_json::{Map, Value};
 pub const IPC_MAX_BYTES: usize = 8 * 1024;
 /// Tecto de uma pergunta replicada as outras colunas (`ask`).
 pub const ASK_MAX_CHARS: usize = 2_000;
-/// Tecto do texto selecionado mandado para pesquisa (`search`).
+/// Tecto do texto selecionado mandado as IAs (`search`).
 pub const SEARCH_MAX_CHARS: usize = 2_000;
+
+/// O que a barra de selecao pede com o texto em `search`. Lista fechada: a
+/// pagina so escolhe QUAL dos dois botoes foi; o titulo do cartao, o botao
+/// de confirmar e o pedido de traducao vem todos do nativo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchIntent {
+    /// "Mandar para IA": o texto vai as tres IAs como pergunta.
+    Ask,
+    /// "Traduzir": o texto vai as tres IAs dentro do pedido fixo de traducao.
+    Translate,
+}
+
+/// Quem pediu a nota. Lista fechada: nenhum dos dois leva dados da pagina.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteVia {
+    /// Ctrl+Shift+Z: o `note` sem argumentos.
+    Shortcut,
+    /// O "Salvar nota" da barra de selecao: `{"via":"bar"}`.
+    Bar,
+}
 
 /// A dica centrada que uma coluna pede ao passar o rato pelos controlos
 /// injetados (o "−" e o "⛶ <IA>"). Lista fechada: a pagina so escolhe QUAL
@@ -69,10 +89,13 @@ pub enum IpcAction {
         col: usize,
         text: String,
     },
-    /// "Pesquisar" da barra de selecao: o texto selecionado vai as tres IAs
-    /// como PERGUNTA. Nunca passa pelo interpretador de comandos da omnibox.
+    /// "Mandar para IA" ou "Traduzir" da barra de selecao: o texto
+    /// selecionado vai as tres IAs como PERGUNTA (ou dentro do pedido fixo de
+    /// traducao), e so depois do cartao nativo. Nunca passa pelo
+    /// interpretador de comandos da omnibox.
     Search {
         text: String,
+        intent: SearchIntent,
     },
     SplitClose,
     SplitExpand,
@@ -97,11 +120,14 @@ pub enum IpcAction {
         col: usize,
         hint: ColumnHint,
     },
-    /// Ctrl+Shift+Z: "cria uma nota com o que selecionei". Sem argumentos de
-    /// proposito -- a pagina so PEDE; o texto selecionado, o endereco e o
-    /// titulo sao lidos pelo lado nativo, da WebView que mandou o pedido, e
-    /// nunca de uma WebView privada.
-    Note,
+    /// Ctrl+Shift+Z ou o "Salvar nota" da barra: "cria uma nota com o que
+    /// selecionei". Sem dados da pagina de proposito -- a pagina so PEDE; o
+    /// texto selecionado e lido pelo lado nativo, da WebView que mandou o
+    /// pedido. `via` so diz qual dos dois gestos foi: a barra grava tambem
+    /// no Split privado, o Ctrl+Shift+Z nao.
+    Note {
+        via: NoteVia,
+    },
 }
 
 pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -159,7 +185,21 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
         "fullscreen" => no_args(args, IpcAction::Fullscreen),
         "devtools" => no_args(args, IpcAction::DevTools),
         "viewsource" => no_args(args, IpcAction::ViewSource),
-        "note" => no_args(args, IpcAction::Note),
+        "note" => {
+            // `{}` e o Ctrl+Shift+Z; `{"via":"bar"}` o botao da barra. Mais
+            // nada: um texto, um endereco ou um titulo vindos da pagina sao
+            // recusados.
+            if args.is_empty() {
+                return Some(IpcAction::Note {
+                    via: NoteVia::Shortcut,
+                });
+            }
+            exact_keys(args, &["via"])?;
+            match args.get("via")?.as_str()? {
+                "bar" => Some(IpcAction::Note { via: NoteVia::Bar }),
+                _ => None,
+            }
+        }
         "newtab" => {
             if args.is_empty() {
                 Some(IpcAction::NewTab { col: None })
@@ -252,7 +292,14 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
             })
         }
         "search" => {
-            exact_keys(args, &["text"])?;
+            exact_keys(args, &["text", "intent"])?;
+            // Um dos dois botoes, pelo nome; outro nome e recusado, nunca
+            // lido como o de omissao.
+            let intent = match args.get("intent")?.as_str()? {
+                "ask" => SearchIntent::Ask,
+                "translate" => SearchIntent::Translate,
+                _ => return None,
+            };
             let raw = args.get("text")?.as_str()?;
             // Os mesmos caracteres que uma pergunta escrita: dos de controlo
             // so a quebra de linha e o tab passam.
@@ -268,6 +315,7 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
             }
             Some(IpcAction::Search {
                 text: text.to_string(),
+                intent,
             })
         }
         "research-answer" => {
@@ -422,7 +470,12 @@ mod tests {
             ("fullscreen", IpcAction::Fullscreen),
             ("devtools", IpcAction::DevTools),
             ("viewsource", IpcAction::ViewSource),
-            ("note", IpcAction::Note),
+            (
+                "note",
+                IpcAction::Note {
+                    via: NoteVia::Shortcut,
+                },
+            ),
         ];
         for (name, expected) in cases {
             assert_eq!(
@@ -712,18 +765,32 @@ mod tests {
 
     #[test]
     fn note_is_a_bare_request_and_carries_no_page_data() {
-        // A pagina so pede a nota. Texto, endereco e titulo sao lidos pelo
-        // lado nativo da WebView que pediu: um `note` com dados e recusado,
-        // para ninguem passar a confiar no que a pagina diz de si propria.
+        // A pagina so pede a nota. O texto e lido pelo lado nativo da WebView
+        // que pediu: um `note` com dados e recusado, para ninguem passar a
+        // confiar no que a pagina diz de si propria. O unico argumento e QUAL
+        // gesto foi -- o botao da barra --, por um nome fechado.
         assert_eq!(
             parse_ipc_message(&message("note", json!({})), CAP, 3),
-            Some(IpcAction::Note)
+            Some(IpcAction::Note {
+                via: NoteVia::Shortcut
+            })
+        );
+        assert_eq!(
+            parse_ipc_message(&message("note", json!({"via":"bar"})), CAP, 3),
+            Some(IpcAction::Note { via: NoteVia::Bar })
         );
         for args in [
             json!({"text":"texto escolhido pela pagina"}),
             json!({"url":"https://example.com/"}),
             json!({"col":0}),
             json!({"title":"x","text":"y","url":"https://example.com/"}),
+            json!({"via":"bar","url":"https://example.com/"}),
+            json!({"via":"bar","text":"texto"}),
+            json!({"via":"page"}),
+            json!({"via":"Bar"}),
+            json!({"via":"shortcut"}),
+            json!({"via":true}),
+            json!({"via":null}),
         ] {
             assert_eq!(
                 parse_ipc_message(&message("note", args.clone()), CAP, 3),
@@ -739,29 +806,70 @@ mod tests {
         // O texto chega tal como foi selecionado, aparado nas pontas: um
         // "agent:" selecionado e so texto, nao um comando.
         assert_eq!(
-            search(json!({"text":"  agent:https://example.com | click=Comprar\n\tlinha 2  "})),
+            search(json!({
+                "text":"  agent:https://example.com | click=Comprar\n\tlinha 2  ",
+                "intent":"ask"
+            })),
             Some(IpcAction::Search {
-                text: "agent:https://example.com | click=Comprar\n\tlinha 2".to_string()
+                text: "agent:https://example.com | click=Comprar\n\tlinha 2".to_string(),
+                intent: SearchIntent::Ask,
+            })
+        );
+        // O botao Traduzir: o mesmo texto, o outro nome fechado.
+        assert_eq!(
+            search(json!({"text":" Good morning ","intent":"translate"})),
+            Some(IpcAction::Search {
+                text: "Good morning".to_string(),
+                intent: SearchIntent::Translate,
             })
         );
         // O tecto conta caracteres, nao bytes, e so depois de aparar.
         let at_limit = "ç".repeat(SEARCH_MAX_CHARS);
         assert_eq!(
-            search(json!({"text": format!("  {at_limit}  ")})),
-            Some(IpcAction::Search { text: at_limit })
+            search(json!({"text": format!("  {at_limit}  "), "intent":"translate"})),
+            Some(IpcAction::Search {
+                text: at_limit,
+                intent: SearchIntent::Translate,
+            })
         );
         let too_long = "a".repeat(SEARCH_MAX_CHARS + 1);
         for (args, why) in [
-            (json!({"text":""}), "vazia"),
-            (json!({"text":" \n\t "}), "so com espacos"),
-            (json!({"text":too_long}), "longa demais"),
-            (json!({"text":"a\u{7}b"}), "com caracter de controlo"),
-            (json!({"text":"a\rb"}), "com retorno de carro"),
-            (json!({"text":"x","col":0}), "com campo a mais"),
-            (json!({}), "sem texto"),
-            (json!({"text":7}), "de tipo errado"),
+            (json!({"text":"","intent":"ask"}), "vazia"),
+            (json!({"text":" \n\t ","intent":"ask"}), "so com espacos"),
+            (json!({"text":too_long,"intent":"ask"}), "longa demais"),
+            (
+                json!({"text":"a\u{7}b","intent":"translate"}),
+                "com caracter de controlo",
+            ),
+            (
+                json!({"text":"a\rb","intent":"ask"}),
+                "com retorno de carro",
+            ),
+            (
+                json!({"text":"x","intent":"ask","col":0}),
+                "com campo a mais",
+            ),
+            (json!({"intent":"ask"}), "sem texto"),
+            (json!({"text":7,"intent":"ask"}), "de tipo errado"),
+            // O pedido a IA e so um dos dois nomes: sem ele, com outro
+            // (inventado, em maiusculas, de uma onda futura) ou com outro
+            // tipo, nada chega ao cartao -- nunca como "ask" por omissao.
+            (json!({"text":"x"}), "sem intent"),
+            (
+                json!({"text":"x","intent":"explain"}),
+                "com intent inventado",
+            ),
+            (json!({"text":"x","intent":"extract"}), "com intent futuro"),
+            (
+                json!({"text":"x","intent":"Ask"}),
+                "com intent em maiusculas",
+            ),
+            (json!({"text":"x","intent":""}), "com intent vazio"),
+            (json!({"text":"x","intent":1}), "com intent numerico"),
+            (json!({"text":"x","intent":null}), "com intent nulo"),
+            (json!({"text":"x","intent":["ask"]}), "com intent em lista"),
         ] {
-            assert_eq!(search(args), None, "aceitou uma pesquisa {why}");
+            assert_eq!(search(args), None, "aceitou um pedido {why}");
         }
     }
 
@@ -810,7 +918,7 @@ mod tests {
             IpcAction::ResearchAnswer { .. } => "research-answer",
             IpcAction::AgentObservation { .. } => "agent-observation",
             IpcAction::Hint { .. } => "hint",
-            IpcAction::Note => "note",
+            IpcAction::Note { .. } => "note",
         }
     }
 
@@ -881,7 +989,7 @@ mod tests {
                 json!({"col":0,"url":"https://example.com/","aside":false}),
             ),
             message("ask", json!({"col":1,"text":"capital da França"})),
-            message("search", json!({"text":"texto selecionado"})),
+            message("search", json!({"text":"texto selecionado","intent":"ask"})),
             message("shortcut-expand", json!({"col":1})),
             message("split-close", json!({})),
             message("split-expand", json!({})),

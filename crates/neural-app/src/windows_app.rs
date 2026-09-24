@@ -24,7 +24,9 @@ use crate::gemini_live::{
 };
 #[cfg(test)]
 use crate::ipc::constant_time_eq;
-use crate::ipc::{ColumnHint, IpcAction, SEARCH_MAX_CHARS, parse_ipc_message};
+use crate::ipc::{
+    ColumnHint, IpcAction, NoteVia, SEARCH_MAX_CHARS, SearchIntent, parse_ipc_message,
+};
 use crate::panel_chrome::{
     Area, CAPTION_HOT_MARGIN, CaptionReveal, EXIT_PAGE_FULLSCREEN_SCRIPT, PANEL_HANDLE_WIDTH,
     PANEL_WIDTHS_FILE, PanelKind, PanelWidths, PanelWindowFullscreen, RevealStep,
@@ -118,16 +120,24 @@ enum UserEvent {
         origin: NotesOrigin,
         reply: NotesReply,
     },
-    /// Ctrl+Shift+Z numa pagina: ler a selecao DESSA WebView. `None` e a
-    /// WebView unica da web externa, do Leitor e do PDF.
-    NoteRequested(Option<PageTarget>),
+    /// Ctrl+Shift+Z ou o "Salvar nota" da barra numa pagina: ler a selecao
+    /// DESSA WebView. `target` `None` e a WebView unica da web externa, do
+    /// Leitor e do PDF; `via` diz qual dos dois gestos foi.
+    NoteRequested {
+        target: Option<PageTarget>,
+        via: NoteVia,
+    },
     /// Ctrl+Shift+Z no Split privado: recusado sem ler a pagina.
     NoteRefusedPrivate,
     /// O que a pagina devolveu ao `NOTE_CAPTURE_SCRIPT` (JSON, dado dela) e
-    /// a fonte que o lado nativo conhece (o artigo do Leitor, o PDF).
+    /// a fonte que o lado nativo conhece: o artigo do Leitor, o PDF e -- no
+    /// "Salvar nota" da barra -- o endereco da propria WebView. `private`: a
+    /// WebView lida era a do Split privado.
     NoteCaptured {
         raw: String,
         source: Option<String>,
+        via: NoteVia,
+        private: bool,
     },
     /// Ctrl+Shift+Z na Home ou com o teclado na barra: nota nova em branco.
     NewNote,
@@ -193,14 +203,18 @@ enum UserEvent {
         source_index: usize,
         text: String,
     },
-    /// "Pesquisar" da barra de selecao. So PEDE a pesquisa: o texto aparece
-    /// no cartao nativo "Pesquisar nas 3 IAs?" e so o clique nativo em
-    /// Pesquisar o leva as tres IAs (`App::compare`), como pergunta e nunca
-    /// como comando da omnibox.
-    SearchSelection(String),
-    /// Clique nativo num botao do cartao "Pesquisar nas 3 IAs?"; `token` e o
-    /// do cartao que estava pintado quando o botao foi solto, e `shown`
-    /// quantos caracteres do texto essa pintura mostrou.
+    /// "Mandar para IA" ou "Traduzir" da barra de selecao. So PEDE: o texto
+    /// aparece no cartao nativo ("Mandar para as 3 IAs?", "Traduzir nas 3
+    /// IAs?") e so o clique nativo no botao de confirmar o leva as tres IAs
+    /// (`App::compare`), como pergunta (ou dentro do pedido fixo de
+    /// traducao) e nunca como comando da omnibox.
+    SearchSelection {
+        text: String,
+        intent: SearchIntent,
+    },
+    /// Clique nativo num botao do cartao; `token` e o do cartao que estava
+    /// pintado quando o botao foi solto, e `shown` quantos caracteres do
+    /// texto essa pintura mostrou.
     SearchCardAnswer {
         token: u64,
         button: SearchCardButton,
@@ -379,25 +393,29 @@ const THEME_COMMAND_HELP: &str = "Use tema:sistema, tema:claro ou tema:escuro.";
 const GMAIL_TOAST_WIDTH: f64 = 390.0;
 const GMAIL_TOAST_HEIGHT: f64 = 68.0;
 const SEARCH_CARD_SUBCLASS_ID: usize = 0x4E71;
-/// Cartao "Pesquisar nas 3 IAs?", em pixeis logicos, centrado na janela. A
-/// caixa do texto leva umas oito linhas: o que nao cabe nao vai.
+/// Cartao de confirmacao da barra de selecao ("Mandar para as 3 IAs?",
+/// "Traduzir nas 3 IAs?"), em pixeis logicos, centrado na janela. A caixa do
+/// texto leva umas oito linhas: o que nao cabe nao vai.
 const SEARCH_CARD_WIDTH: f64 = 600.0;
 const SEARCH_CARD_HEIGHT: f64 = 340.0;
-const SEARCH_CARD_TITLE: &str = "Pesquisar nas 3 IAs?";
 /// Sem resposta, o cartao some e conta como Cancelar.
 const SEARCH_CARD_SECONDS: u64 = 12;
-/// Um Pesquisar que chega antes disto, contado desde que o cartao (ou o texto
+/// Um confirmar que chega antes disto, contado desde que o cartao (ou o texto
 /// que o trocou) apareceu, nao conta: um duplo clique que a pagina pediu no
 /// sitio onde o cartao ia nascer nao o confirma.
 const SEARCH_CARD_ARM: Duration = Duration::from_millis(600);
+/// O pedido fixo do Traduzir, escrito pelo nativo: as tres IAs recebem isto,
+/// uma linha em branco e o texto que o cartao pintou.
+const TRANSLATE_PROMPT: &str = "Traduza para o português do Brasil (se o texto já estiver em português, traduza para o inglês):";
 
 /// Texto do aviso flutuante. Vive fora do App porque quem o pinta e o
 /// procedimento de janela, que nao tem acesso ao estado da aplicacao.
 static SPLASH_TEXT: Mutex<String> = Mutex::new(String::new());
 static GMAIL_TOAST_TEXT: Mutex<String> = Mutex::new(String::new());
-/// O cartao de pesquisa a mostrar: (token, a pergunta ja limpa por
+/// O cartao a mostrar: (token, o botao da barra que o pediu -- que da o
+/// titulo e o botao de confirmar --, a pergunta ja limpa por
 /// `selection_question`).
-static SEARCH_CARD_VIEW: Mutex<Option<(u64, String)>> = Mutex::new(None);
+static SEARCH_CARD_VIEW: Mutex<Option<(u64, SearchIntent, String)>> = Mutex::new(None);
 /// O que o cartao pintou por ultimo: (token, caracteres da pergunta que
 /// couberam e se viram). Um clique leva ISTO: o texto que o utilizador viu, e
 /// nao um que o trocou e ainda nao foi pintado, nem o que ficou de fora.
@@ -4505,9 +4523,9 @@ unsafe extern "system" fn gmail_toast_subclass(
     DefSubclassProc(hwnd, message, wparam, lparam)
 }
 
-/// O cartao "Pesquisar nas 3 IAs?". Nativo e owned pela janela principal: a
-/// pagina que escolheu o texto nao o tapa, nao o move, nao o pinta e nao lhe
-/// manda cliques. Nao se ativa (como o aviso do Gmail): o foco fica onde
+/// O cartao "Mandar para as 3 IAs?" / "Traduzir nas 3 IAs?". Nativo e owned
+/// pela janela principal: a pagina que escolheu o texto nao o tapa, nao o
+/// move, nao o pinta e nao lhe manda cliques. Nao se ativa (como o aviso do Gmail): o foco fica onde
 /// estava, por isso Enter e Esc nao lhe chegam -- responde-se com o rato.
 unsafe extern "system" fn search_card_subclass(
     hwnd: HWND,
@@ -4570,12 +4588,12 @@ unsafe extern "system" fn search_card_subclass(
             if !hdc.is_null() {
                 let mut client = RECT::default();
                 if GetClientRect(hwnd, &mut client) != 0 {
-                    let (token, text) = SEARCH_CARD_VIEW
+                    let (token, intent, text) = SEARCH_CARD_VIEW
                         .lock()
                         .ok()
                         .and_then(|view| view.clone())
-                        .unwrap_or_default();
-                    let shown = paint_search_card(hdc, &client, &text);
+                        .unwrap_or((0, SearchIntent::Ask, String::new()));
+                    let shown = paint_search_card(hdc, &client, intent, &text);
                     // So agora o utilizador ve este texto: e ele -- e so a
                     // parte que coube -- que um clique a seguir confirma.
                     if let Ok(mut painted) = SEARCH_CARD_PAINTED.lock() {
@@ -4590,9 +4608,15 @@ unsafe extern "system" fn search_card_subclass(
     }
 }
 
-/// Pinta o cartao e devolve quantos caracteres de `text` mostrou: todos, ou
-/// o inicio que coube na caixa (com "…" e a conta do que ficou de fora).
-unsafe fn paint_search_card(hdc: *mut core::ffi::c_void, client: &RECT, text: &str) -> usize {
+/// Pinta o cartao de `intent` (titulo e botao de confirmar) e devolve quantos
+/// caracteres de `text` mostrou: todos, ou o inicio que coube na caixa (com
+/// "…" e a conta do que ficou de fora).
+unsafe fn paint_search_card(
+    hdc: *mut core::ffi::c_void,
+    client: &RECT,
+    intent: SearchIntent,
+    text: &str,
+) -> usize {
     let theme = Theme::system();
     let background = CreateSolidBrush(rgb3(theme.surface));
     FillRect(hdc, client, background);
@@ -4611,7 +4635,7 @@ unsafe fn paint_search_card(hdc: *mut core::ffi::c_void, client: &RECT, text: &s
     let mut title = layout.title;
     draw_text(
         hdc,
-        SEARCH_CARD_TITLE,
+        search_card_title(intent),
         &mut title,
         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
     );
@@ -4646,7 +4670,7 @@ unsafe fn paint_search_card(hdc: *mut core::ffi::c_void, client: &RECT, text: &s
     }
 
     for (rect, button) in [
-        (layout.search, SearchCardButton::Search),
+        (layout.search, SearchCardButton::Confirm),
         (layout.cancel, SearchCardButton::Cancel),
     ] {
         let pill = UiRect {
@@ -4656,7 +4680,7 @@ unsafe fn paint_search_card(hdc: *mut core::ffi::c_void, client: &RECT, text: &s
             height: (rect.bottom - rect.top) as f64,
         };
         let style = match button {
-            SearchCardButton::Search => {
+            SearchCardButton::Confirm => {
                 PillStyle::new(theme.accent, theme.accent, on_color(theme.accent))
             }
             SearchCardButton::Cancel => {
@@ -4666,7 +4690,7 @@ unsafe fn paint_search_card(hdc: *mut core::ffi::c_void, client: &RECT, text: &s
         draw_pill(
             hdc,
             pill,
-            button.label(),
+            button.label(intent),
             style,
             scale,
             button_font,
@@ -5649,6 +5673,12 @@ enum NotesReply {
 enum NotesOrigin {
     Panel,
     Selection,
+    /// O "Salvar nota" da barra de selecao: a resposta so diz, no aviso do
+    /// meio, que a nota ficou salva (`bar_note_notice`) -- sem abrir o
+    /// painel. `private`: veio do Split privado.
+    Bar {
+        private: bool,
+    },
     /// O rascunho que o painel deixou ao fechar por fora: a resposta so diz
     /// no aviso do meio se ficou salvo.
     Closed,
@@ -6066,30 +6096,14 @@ fn one_line(text: &str, max: usize) -> String {
 /// `source` e o endereco que o lado nativo conhece e a pagina nao (o
 /// artigo do Leitor, o PDF aberto); quando existe, manda ele.
 fn note_draft_from_capture(raw: &str, source: Option<&str>) -> Result<NoteDraft, NoteCaptureError> {
-    if raw.len() > NOTE_CAPTURE_MAX_BYTES {
-        return Err(NoteCaptureError::Unreadable);
-    }
-    let value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|_| NoteCaptureError::Unreadable)?;
-    if !value.is_object() {
-        return Err(NoteCaptureError::Unreadable);
-    }
+    let value = note_capture_value(raw)?;
+    let selection = note_capture_selection(&value)?;
     let field = |key: &str| {
         value
             .get(key)
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
     };
-    let selection: String = field("text")
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .chars()
-        .take(NOTE_SELECTION_MAX_CHARS)
-        .collect();
-    let selection = selection.trim();
-    if selection.is_empty() {
-        return Err(NoteCaptureError::EmptySelection);
-    }
     let source = match source {
         Some(known) => note_source(known),
         None => note_source(field("url")),
@@ -6104,6 +6118,45 @@ fn note_draft_from_capture(raw: &str, source: Option<&str>) -> Result<NoteDraft,
                 .join(" ");
             one_line(&words, NOTE_FALLBACK_TITLE_MAX_CHARS)
         });
+    Ok(quoted_note(&selection, title, source))
+}
+
+/// A resposta do `NOTE_CAPTURE_SCRIPT` lida como o objeto que ele devolve;
+/// grande demais, ou outra coisa, nao se le.
+fn note_capture_value(raw: &str) -> Result<serde_json::Value, NoteCaptureError> {
+    if raw.len() > NOTE_CAPTURE_MAX_BYTES {
+        return Err(NoteCaptureError::Unreadable);
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| NoteCaptureError::Unreadable)?;
+    if !value.is_object() {
+        return Err(NoteCaptureError::Unreadable);
+    }
+    Ok(value)
+}
+
+/// A selecao da resposta, cortada outra vez aqui (quem responde e a
+/// pagina), em LF e aparada; so espacos conta como nada.
+fn note_capture_selection(value: &serde_json::Value) -> Result<String, NoteCaptureError> {
+    let selection: String = value
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .take(NOTE_SELECTION_MAX_CHARS)
+        .collect();
+    let selection = selection.trim();
+    if selection.is_empty() {
+        return Err(NoteCaptureError::EmptySelection);
+    }
+    Ok(selection.to_string())
+}
+
+/// A nota de uma selecao: a citacao Markdown, uma linha em branco e
+/// "Fonte: <url>" (so com fonte), a tag "web".
+fn quoted_note(selection: &str, title: String, source: Option<String>) -> NoteDraft {
     let quote = selection
         .lines()
         .map(|line| {
@@ -6119,19 +6172,127 @@ fn note_draft_from_capture(raw: &str, source: Option<&str>) -> Result<NoteDraft,
         Some(url) => format!("{quote}\n\nFonte: {url}\n"),
         None => format!("{quote}\n"),
     };
-    Ok(NoteDraft {
+    NoteDraft {
         title,
         body,
         tags: vec!["web".to_string()],
         source,
-    })
+    }
 }
 
-/// De que WebView se le a selecao de um Ctrl+Shift+Z.
+/// Quantos caracteres do inicio da selecao dao o titulo de uma nota do
+/// "Salvar nota" -- e o aviso "Nota salva: ...".
+const BAR_NOTE_TITLE_CHARS: usize = 60;
+/// Um "Salvar nota" com o mesmo texto antes disto nao grava outra nota.
+const BAR_NOTE_REPEAT: Duration = Duration::from_secs(2);
+
+/// O titulo de uma nota do "Salvar nota": os primeiros 60 caracteres da
+/// selecao numa linha, com "…" se ela continua. Vem do texto, nunca do
+/// `document.title` que a pagina escolhe.
+fn bar_note_title(selection: &str) -> String {
+    let line = one_line(selection, BAR_NOTE_TITLE_CHARS + 1);
+    if line.chars().count() <= BAR_NOTE_TITLE_CHARS {
+        return line;
+    }
+    let start: String = line.chars().take(BAR_NOTE_TITLE_CHARS).collect();
+    // Na ultima palavra inteira, se nao ficar curto demais.
+    let whole_words = line.chars().nth(BAR_NOTE_TITLE_CHARS) == Some(' ');
+    let cut = match start.rfind(' ') {
+        Some(at) if !whole_words && at >= start.len() / 2 => &start[..at],
+        _ => start.as_str(),
+    };
+    format!("{}…", cut.trim_end())
+}
+
+/// O aviso do meio da janela depois de um "Salvar nota" gravado.
+fn bar_note_notice(private: bool, title: &str) -> String {
+    if private {
+        "Modo privado: a nota foi guardada".to_string()
+    } else {
+        format!("Nota salva: {title}")
+    }
+}
+
+/// O ultimo texto que o "Salvar nota" gravou, e quando: o mesmo texto outra
+/// vez antes de `BAR_NOTE_REPEAT` nao e outra nota.
+#[derive(Debug, Default)]
+struct BarNoteGuard {
+    last: Option<(String, Instant)>,
+}
+
+impl BarNoteGuard {
+    /// `true` e fica a ser o ultimo; um repetido nao conta como novo (nem
+    /// adia a vez seguinte).
+    fn admit(&mut self, selection: &str, now: Instant) -> bool {
+        if let Some((last, at)) = &self.last
+            && last == selection
+            && now.saturating_duration_since(*at) < BAR_NOTE_REPEAT
+        {
+            return false;
+        }
+        self.last = Some((selection.to_string(), now));
+        true
+    }
+}
+
+/// O que um "Salvar nota" faz com a resposta da pagina.
+#[derive(Debug, PartialEq)]
+enum BarNoteStep {
+    /// Gravar esta nota nova (`NotesCommand::Create`), e so isso.
+    Save(NoteDraft),
+    /// O mesmo texto ha menos de 2 s: nada.
+    Repeated,
+    Refused(NoteCaptureError),
+}
+
+/// A decisao do "Salvar nota", sem janela: da resposta da pagina so conta a
+/// selecao; o `url` e o `title` que ela devolveu ficam de fora. A fonte e
+/// `native_source`, o endereco que o nativo conhece da WebView lida
+/// (`note_capture_source`), e o titulo o inicio da selecao.
+fn bar_note_step(
+    guard: &mut BarNoteGuard,
+    raw: &str,
+    native_source: Option<&str>,
+    now: Instant,
+) -> BarNoteStep {
+    let selection = match note_capture_value(raw).and_then(|value| note_capture_selection(&value)) {
+        Ok(selection) => selection,
+        Err(error) => return BarNoteStep::Refused(error),
+    };
+    if !guard.admit(&selection, now) {
+        return BarNoteStep::Repeated;
+    }
+    BarNoteStep::Save(quoted_note(
+        &selection,
+        bar_note_title(&selection),
+        native_source.and_then(note_source),
+    ))
+}
+
+/// A fonte que acompanha a leitura da selecao. No Ctrl+Shift+Z, so a do
+/// Leitor e a do PDF (`note_page_source`); nas outras paginas vale o
+/// `location.href` que o script devolve. No "Salvar nota" da barra e sempre
+/// uma que o nativo conhece: essa, ou o endereco da propria WebView
+/// (`webview_url`, o `Source` do WebView2) -- nunca um que a pagina diga.
+fn note_capture_source(
+    via: NoteVia,
+    target: Option<PageTarget>,
+    surface: Surface,
+    page_source: Option<&str>,
+    webview_url: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let known = note_page_source(target, surface, page_source);
+    match via {
+        NoteVia::Shortcut => known,
+        NoteVia::Bar => known.or_else(webview_url),
+    }
+}
+
+/// De que WebView se le a selecao de um Ctrl+Shift+Z ou de um Salvar nota.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoteCapture {
     Read,
-    /// O Split privado: nada se le, nada se grava.
+    /// O Ctrl+Shift+Z no Split privado: nada se le, nada se grava.
     RefusePrivate,
     /// A WebView ja nao existe (o Split fechou entretanto).
     NoPage,
@@ -6139,31 +6300,38 @@ enum NoteCapture {
 
 /// Decide no momento de ler, nao no do pedido: entre o Ctrl+Shift+Z num
 /// Split normal e o evento chegar aqui, o Split pode ter sido trocado por um
-/// privado. `split_private` e o do Split que existe AGORA.
-fn note_capture_decision(target: Option<PageTarget>, split_private: Option<bool>) -> NoteCapture {
+/// privado. `split_private` e o do Split que existe AGORA. O "Salvar nota"
+/// da barra le tambem o Split privado: e um pedido explicito de quem le.
+fn note_capture_decision(
+    target: Option<PageTarget>,
+    via: NoteVia,
+    split_private: Option<bool>,
+) -> NoteCapture {
     match target {
         Some(PageTarget::Split) => match split_private {
-            Some(true) => NoteCapture::RefusePrivate,
-            Some(false) => NoteCapture::Read,
+            Some(true) if via == NoteVia::Shortcut => NoteCapture::RefusePrivate,
+            Some(_) => NoteCapture::Read,
             None => NoteCapture::NoPage,
         },
         Some(PageTarget::Column(_)) | None => NoteCapture::Read,
     }
 }
 
-/// A WebView de que um Ctrl+Shift+Z le a selecao, no momento de ler: a da
-/// coluna que o pediu (nunca a vizinha), a do Split que existe AGORA -- e
-/// nunca se ele for privado -- ou a WebView unica (Externo, Leitor, PDF).
-/// `columns` e `split` sao os do proprio comparador (`comp.views`,
-/// `comp.split`): o `private` e lido aqui, do Split, e nao passado a parte.
-/// Generica para o gate a correr sem WebViews.
+/// A WebView de que um Ctrl+Shift+Z (ou um Salvar nota) le a selecao, no
+/// momento de ler: a da coluna que o pediu (nunca a vizinha), a do Split que
+/// existe AGORA -- e, no Ctrl+Shift+Z, nunca se ele for privado -- ou a
+/// WebView unica (Externo, Leitor, PDF). `columns` e `split` sao os do
+/// proprio comparador (`comp.views`, `comp.split`): o `private` e lido aqui,
+/// do Split, e nao passado a parte. Generica para o gate a correr sem
+/// WebViews.
 fn note_read_view<'a, V>(
     target: Option<PageTarget>,
+    via: NoteVia,
     columns: &'a [ComparatorView<V>],
     split: Option<&'a SplitView<V>>,
     main: Option<&'a V>,
 ) -> Result<&'a V, NoteCapture> {
-    match note_capture_decision(target, split.map(|split| split.private)) {
+    match note_capture_decision(target, via, split.map(|split| split.private)) {
         NoteCapture::Read => {}
         refused => return Err(refused),
     }
@@ -7229,34 +7397,56 @@ fn save_gmail_setting(path: &std::path::Path, on: bool) -> std::io::Result<()> {
 /// ponteiro fino.
 type SearchCardSink = Box<dyn Fn(UserEvent)>;
 
-/// Os dois botoes do cartao "Pesquisar nas 3 IAs?".
+/// Os dois botoes do cartao: o de confirmar ("Mandar", "Traduzir") e o
+/// Cancelar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SearchCardButton {
-    Search,
+    Confirm,
     Cancel,
 }
 
 impl SearchCardButton {
     fn index(self) -> usize {
         match self {
-            Self::Search => 0,
+            Self::Confirm => 0,
             Self::Cancel => 1,
         }
     }
 
     fn from_index(index: usize) -> Option<Self> {
         match index {
-            0 => Some(Self::Search),
+            0 => Some(Self::Confirm),
             1 => Some(Self::Cancel),
             _ => None,
         }
     }
 
-    fn label(self) -> &'static str {
-        match self {
-            Self::Search => "Pesquisar",
-            Self::Cancel => "Cancelar",
+    /// O rotulo no cartao do botao da barra que o pediu.
+    fn label(self, intent: SearchIntent) -> &'static str {
+        match (self, intent) {
+            (Self::Confirm, SearchIntent::Ask) => "Mandar",
+            (Self::Confirm, SearchIntent::Translate) => "Traduzir",
+            (Self::Cancel, _) => "Cancelar",
         }
+    }
+}
+
+/// O titulo do cartao, pelo botao da barra que o pediu.
+fn search_card_title(intent: SearchIntent) -> &'static str {
+    match intent {
+        SearchIntent::Ask => "Mandar para as 3 IAs?",
+        SearchIntent::Translate => "Traduzir nas 3 IAs?",
+    }
+}
+
+/// O que as tres IAs recebem depois do clique em confirmar, a partir do que
+/// o cartao pintou (`seen`): a pergunta tal e qual, ou o pedido fixo de
+/// traducao, uma linha em branco e o texto. O pedido e sempre este, escrito
+/// aqui: a pagina so escolhe o botao.
+fn selection_prompt(intent: SearchIntent, seen: &str) -> String {
+    match intent {
+        SearchIntent::Ask => seen.to_string(),
+        SearchIntent::Translate => format!("{TRANSLATE_PROMPT}\n\n{seen}"),
     }
 }
 
@@ -7340,7 +7530,7 @@ fn search_card_hit(client: &RECT, scale: f64, x: i32, y: i32) -> Option<SearchCa
     let layout = search_card_layout(client, scale);
     let inside = |rect: &RECT| x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
     if inside(&layout.search) {
-        Some(SearchCardButton::Search)
+        Some(SearchCardButton::Confirm)
     } else if inside(&layout.cancel) {
         Some(SearchCardButton::Cancel)
     } else {
@@ -7349,8 +7539,8 @@ fn search_card_hit(client: &RECT, scale: f64, x: i32, y: i32) -> Option<SearchCa
 }
 
 /// O clique que o cartao aceita: o botao desceu E subiu no mesmo botao, com o
-/// cartao a segurar o rato desde que desceu. Arrastar de fora para cima de
-/// Pesquisar, ou premir e sair, nao responde nada.
+/// cartao a segurar o rato desde que desceu. Arrastar de fora para cima do
+/// confirmar, ou premir e sair, nao responde nada.
 fn search_card_release(
     pressed: Option<usize>,
     captured: bool,
@@ -7403,7 +7593,8 @@ fn invisible_in_card(c: char) -> bool {
     ) || (c as u32 & 0xFFFE) == 0xFFFE
 }
 
-/// A pergunta que o "Pesquisar" leva, tal como o cartao a mostra: sem os
+/// A pergunta que o "Mandar para IA" (ou o texto que o "Traduzir") leva, tal
+/// como o cartao a mostra: sem os
 /// caracteres invisiveis, com quebras de linha, tabs e outros espacos ou
 /// controlos reduzidos a um espaco, aparada. E ESTE texto -- nao o que a
 /// pagina mandou -- que o cartao pinta e que a confirmacao leva.
@@ -7428,7 +7619,7 @@ fn selection_question(text: &str) -> String {
 }
 
 /// Os primeiros `shown` caracteres de `text`, sem o espaco do fim: o que o
-/// cartao pintou e, portanto, tudo o que um clique em Pesquisar confirma.
+/// cartao pintou e, portanto, tudo o que um clique em confirmar leva.
 fn search_card_shown(text: &str, shown: usize) -> &str {
     let end = text
         .char_indices()
@@ -10001,8 +10192,12 @@ struct App {
     splash_board: SplashBoard,
     gmail_toast: Option<HWND>,
     gmail_toast_token: u64,
-    /// O pedido de pesquisa a espera do clique no cartao nativo.
+    /// O pedido da barra (Mandar para IA, Traduzir) a espera do clique no
+    /// cartao nativo.
     search_card: SearchCard,
+    /// O ultimo "Salvar nota" gravado: o mesmo texto em menos de 2 s nao e
+    /// outra nota.
+    bar_notes: BarNoteGuard,
     search_card_popup: Option<HWND>,
     search_card_sink: Box<SearchCardSink>,
     gmail_monitor: Option<WebView>,
@@ -10165,6 +10360,7 @@ impl App {
             gmail_toast: None,
             gmail_toast_token: 0,
             search_card: SearchCard::default(),
+            bar_notes: BarNoteGuard::default(),
             search_card_popup: None,
             search_card_sink,
             gmail_monitor: None,
@@ -10956,7 +11152,8 @@ impl App {
         self.open_external(url.as_str());
     }
 
-    /// O cartao "Pesquisar nas 3 IAs?": a decisao e a de `SearchCard::step`
+    /// O cartao "Mandar para as 3 IAs?" / "Traduzir nas 3 IAs?": a decisao e
+    /// a de `SearchCard::step`
     /// (pura, testada) e o efeito o de `apply_search_card`; aqui so se junta
     /// o relogio. O `compare` so corre para um `Confirmed`.
     fn search_card_event(&mut self, input: SearchCardInput) {
@@ -12165,10 +12362,12 @@ impl App {
             IpcAction::Hint { col, hint } if col == col_index => {
                 Some(UserEvent::ColumnHint { col, hint })
             }
-            // Ctrl+Shift+Z: a selecao e lida DESTA coluna, pelo lado nativo.
-            IpcAction::Note => Some(UserEvent::NoteRequested(Some(PageTarget::Column(
-                col_index,
-            )))),
+            // Ctrl+Shift+Z ou Salvar nota: a selecao e lida DESTA coluna,
+            // pelo lado nativo.
+            IpcAction::Note { via } => Some(UserEvent::NoteRequested {
+                target: Some(PageTarget::Column(col_index)),
+                via,
+            }),
             other => common_ipc_event(other),
         }
     }
@@ -12328,12 +12527,21 @@ impl App {
         action: IpcAction,
     ) -> Option<UserEvent> {
         match action {
-            // O Split privado nao faz notas: a pagina nem chega a ser lida.
-            IpcAction::Note if private => Some(UserEvent::NoteRefusedPrivate),
-            IpcAction::Note => Some(UserEvent::NoteRequested(Some(PageTarget::Split))),
+            // O Ctrl+Shift+Z no Split privado nao faz notas: a pagina nem
+            // chega a ser lida. O "Salvar nota" da barra e um pedido
+            // explicito de quem le, e grava (so nas notas; o aviso diz que
+            // foi no modo privado).
+            IpcAction::Note {
+                via: NoteVia::Shortcut,
+            } if private => Some(UserEvent::NoteRefusedPrivate),
+            IpcAction::Note { via } => Some(UserEvent::NoteRequested {
+                target: Some(PageTarget::Split),
+                via,
+            }),
             // Defesa em profundidade: a barra de um painel privado nem mostra
-            // o "Pesquisar", e mesmo que uma mensagem chegasse o texto nao
-            // pode sair para o comparador (historico e memoria).
+            // o "Mandar para IA" nem o "Traduzir", e mesmo que uma mensagem
+            // chegasse o texto nao pode sair para o comparador (historico e
+            // memoria).
             IpcAction::Search { .. } if private => None,
             IpcAction::SplitClose => Some(UserEvent::CloseSplit),
             IpcAction::SplitExpand | IpcAction::Fullscreen => {
@@ -15113,7 +15321,9 @@ impl App {
                 NotesOrigin::Panel => {
                     self.panel_run(notes_reply_script(&NotesReply::Failed(error)))
                 }
-                NotesOrigin::Selection | NotesOrigin::Closed => self.show_splash(error, 3),
+                NotesOrigin::Selection | NotesOrigin::Closed | NotesOrigin::Bar { .. } => {
+                    self.show_splash(error, 3)
+                }
             }
         }
     }
@@ -15134,6 +15344,17 @@ impl App {
                 NotesReply::Opened { .. } => {
                     self.show_notes_panel(vec![notes_reply_script(&reply)]);
                     self.show_splash("Nota criada".to_string(), 2);
+                }
+                NotesReply::Failed(error) => self.show_splash(error.clone(), 4),
+                NotesReply::Listed { .. }
+                | NotesReply::Deleted { .. }
+                | NotesReply::Missing { .. }
+                | NotesReply::Conflict { .. } => {}
+            },
+            // O "Salvar nota": so o aviso, sem abrir o painel.
+            NotesOrigin::Bar { private } => match &reply {
+                NotesReply::Opened { note, .. } => {
+                    self.show_splash(bar_note_notice(private, &note.title), 3);
                 }
                 NotesReply::Failed(error) => self.show_splash(error.clone(), 4),
                 NotesReply::Listed { .. }
@@ -15162,17 +15383,19 @@ impl App {
         }
     }
 
-    /// Ctrl+Shift+Z numa pagina: le a selecao da WebView `target` e cria a
-    /// nota. O Split privado nunca e lido.
-    fn request_note_from_page(&mut self, target: Option<PageTarget>) {
+    /// Ctrl+Shift+Z ou "Salvar nota" numa pagina: le a selecao da WebView
+    /// `target` e cria a nota. O Ctrl+Shift+Z nunca le o Split privado.
+    fn request_note_from_page(&mut self, target: Option<PageTarget>, via: NoteVia) {
         // Qual WebView e se o Split privado recusa: `note_read_view`, com as
         // colunas e o Split do proprio comparador (gate
         // `a_note_request_reads_its_own_webview_and_never_the_private_split`).
         let comp = self.comparator.as_ref();
+        let split = comp.and_then(|comp| comp.split.as_ref());
         let webview = match note_read_view(
             target,
+            via,
             comp.map_or(&[][..], |comp| comp.views.as_slice()),
-            comp.and_then(|comp| comp.split.as_ref()),
+            split,
             self.webview.as_ref(),
         ) {
             Ok(webview) => webview,
@@ -15182,12 +15405,23 @@ impl App {
             }
             Err(NoteCapture::Read | NoteCapture::NoPage) => return,
         };
-        let source = note_page_source(target, self.surface, self.page_source.as_deref());
+        // So o "Salvar nota" chega a ler o Split privado; o aviso di-lo-a.
+        let private =
+            matches!(target, Some(PageTarget::Split)) && split.is_some_and(|split| split.private);
+        let source = note_capture_source(
+            via,
+            target,
+            self.surface,
+            self.page_source.as_deref(),
+            || webview.url().ok(),
+        );
         let proxy = self.proxy.clone();
         let asked = webview.evaluate_script_with_callback(NOTE_CAPTURE_SCRIPT, move |raw| {
             let _ = proxy.send_event(UserEvent::NoteCaptured {
                 raw,
                 source: source.clone(),
+                via,
+                private,
             });
         });
         if asked.is_err() {
@@ -15198,8 +15432,23 @@ impl App {
         }
     }
 
-    fn note_captured(&mut self, raw: &str, source: Option<&str>) {
-        match note_draft_from_capture(raw, source) {
+    fn note_captured(&mut self, raw: &str, source: Option<&str>, via: NoteVia, private: bool) {
+        let draft = match via {
+            NoteVia::Shortcut => note_draft_from_capture(raw, source),
+            // O "Salvar nota": a fonte e a que o nativo leu da WebView, o
+            // mesmo texto em menos de 2 s nao e outra nota, e a resposta so
+            // aparece no aviso do meio (`NotesOrigin::Bar`). Nada disto passa
+            // pelo historico nem pela memoria.
+            NoteVia::Bar => match bar_note_step(&mut self.bar_notes, raw, source, Instant::now()) {
+                BarNoteStep::Save(draft) => {
+                    self.submit_notes(NotesCommand::Create(draft), NotesOrigin::Bar { private });
+                    return;
+                }
+                BarNoteStep::Repeated => return,
+                BarNoteStep::Refused(error) => Err(error),
+            },
+        };
+        match draft {
             Ok(draft) => self.submit_notes(NotesCommand::Create(draft), NotesOrigin::Selection),
             Err(NoteCaptureError::EmptySelection) => {
                 self.show_splash("Selecione um texto para criar a nota".to_string(), 3);
@@ -19170,11 +19419,16 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ThemeChosen(choice) => self.choose_theme(choice),
             UserEvent::Panel(post) => self.handle_panel_message(post),
             UserEvent::NotesReady { origin, reply } => self.notes_ready(origin, reply),
-            UserEvent::NoteRequested(target) => self.request_note_from_page(target),
+            UserEvent::NoteRequested { target, via } => self.request_note_from_page(target, via),
             UserEvent::NoteRefusedPrivate => {
                 self.show_splash(NOTE_PRIVATE_REFUSAL.to_string(), 3);
             }
-            UserEvent::NoteCaptured { raw, source } => self.note_captured(&raw, source.as_deref()),
+            UserEvent::NoteCaptured {
+                raw,
+                source,
+                via,
+                private,
+            } => self.note_captured(&raw, source.as_deref(), via, private),
             UserEvent::NewNote => self.new_note_in_panel(),
             UserEvent::Live(message) => self.handle_live_message(message),
             UserEvent::GmailAnswer(open) => self.answer_gmail(open),
@@ -19222,8 +19476,8 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::AskEverywhere { source_index, text } => {
                 self.ask_other_columns(source_index, text)
             }
-            UserEvent::SearchSelection(text) => {
-                self.search_card_event(SearchCardInput::Request(text))
+            UserEvent::SearchSelection { text, intent } => {
+                self.search_card_event(SearchCardInput::Request { text, intent })
             }
             UserEvent::SearchCardAnswer {
                 token,
@@ -19919,10 +20173,10 @@ fn common_ipc_event(action: IpcAction) -> Option<UserEvent> {
         IpcAction::NewTab { col } => UserEvent::NewTab(col.unwrap_or(0)),
         // A WebView unica (web externa, Leitor, PDF). As colunas e o Split
         // tratam o `note` antes de chegar aqui.
-        IpcAction::Note => UserEvent::NoteRequested(None),
+        IpcAction::Note { via } => UserEvent::NoteRequested { target: None, via },
         // Colunas, Split normal, Web externa, Reader e PDF. O Split privado
         // recusa antes de chegar aqui (`split_ipc_event_impl`).
-        IpcAction::Search { text } => UserEvent::SearchSelection(text),
+        IpcAction::Search { text, intent } => UserEvent::SearchSelection { text, intent },
         _ => return None,
     })
 }
@@ -19938,14 +20192,15 @@ fn external_ipc_event(action: IpcAction, agent_enabled: bool) -> Option<UserEven
     }
 }
 
-/// O que o "Pesquisar" da barra de selecao faz com o texto. Ha uma so
-/// saida: a comparacao normal das tres IAs com o texto como pergunta.
+/// O que o "Mandar para IA" e o "Traduzir" da barra de selecao fazem com o
+/// texto. Ha uma so saida: a comparacao normal das tres IAs com o texto como
+/// pergunta (no Traduzir, dentro do pedido fixo de traducao).
 #[derive(Debug, PartialEq)]
 enum SelectionSearch {
     Compare(String),
 }
 
-/// A decisao do "Pesquisar": o texto selecionado, limpo por
+/// A decisao do "Mandar para IA" / "Traduzir": o texto selecionado, limpo por
 /// `selection_question`, e mais nada. Nao passa pelo `route_input`, pelo
 /// `parse_intent` nem pela palette. Quem seleciona "agent:https://x",
 /// "tema:escuro" ou um endereco numa pagina quer saber o que aquilo e, nao
@@ -19957,11 +20212,12 @@ fn selection_search(text: &str) -> Option<SelectionSearch> {
         .then_some(SelectionSearch::Compare(question))
 }
 
-/// O que chega ao cartao "Pesquisar nas 3 IAs?".
+/// O que chega ao cartao de confirmacao.
 #[derive(Debug, PartialEq)]
 enum SearchCardInput {
-    /// `search` de uma barra de selecao (o Split privado ja o recusou).
-    Request(String),
+    /// `search` de uma barra de selecao (o Split privado ja o recusou), com
+    /// o botao que o pediu.
+    Request { text: String, intent: SearchIntent },
     /// Clique nativo num botao do cartao que tinha `token` pintado, com
     /// `shown` caracteres do texto a vista.
     Answer {
@@ -19976,25 +20232,28 @@ enum SearchCardInput {
 /// O que o cartao faz com uma entrada.
 #[derive(Debug, Clone, PartialEq)]
 enum SearchCardOutcome {
-    /// Mostrar o cartao com `text` (a pergunta ja limpa); `replaced`
-    /// quando troca um que ainda esperava.
+    /// Mostrar o cartao de `intent` com `text` (a pergunta ja limpa);
+    /// `replaced` quando troca um que ainda esperava.
     Show {
         token: u64,
+        intent: SearchIntent,
         text: String,
         replaced: bool,
     },
-    /// O clique em Pesquisar: a unica saida que leva texto as tres IAs -- e
-    /// so o que o cartao mostrou.
+    /// O clique em confirmar: a unica saida que leva texto as tres IAs -- e
+    /// so o que o cartao mostrou, ja com o pedido de traducao quando foi o
+    /// Traduzir (`selection_prompt`).
     Confirmed(String),
     Cancelled,
     Expired,
     /// Nada muda: pedido invalido, token de um cartao que ja nao esta la,
-    /// Pesquisar cedo demais.
+    /// confirmar cedo demais.
     Ignored,
 }
 
 struct PendingSearch {
     token: u64,
+    intent: SearchIntent,
     question: String,
     shown_at: Instant,
 }
@@ -20010,7 +20269,7 @@ struct SearchCard {
 impl SearchCard {
     fn step(&mut self, input: SearchCardInput, now: Instant) -> SearchCardOutcome {
         match input {
-            SearchCardInput::Request(text) => {
+            SearchCardInput::Request { text, intent } => {
                 let Some(SelectionSearch::Compare(question)) = selection_search(&text) else {
                     return SearchCardOutcome::Ignored;
                 };
@@ -20021,12 +20280,14 @@ impl SearchCard {
                     .pending
                     .replace(PendingSearch {
                         token,
+                        intent,
                         question,
                         shown_at: now,
                     })
                     .is_some();
                 SearchCardOutcome::Show {
                     token,
+                    intent,
                     text,
                     replaced,
                 }
@@ -20044,14 +20305,14 @@ impl SearchCard {
                 let seen = search_card_shown(&pending.question, shown);
                 match button {
                     SearchCardButton::Cancel => SearchCardOutcome::Cancelled,
-                    SearchCardButton::Search
+                    SearchCardButton::Confirm
                         if !seen.is_empty()
                             && now.saturating_duration_since(pending.shown_at)
                                 >= SEARCH_CARD_ARM =>
                     {
-                        SearchCardOutcome::Confirmed(seen.to_string())
+                        SearchCardOutcome::Confirmed(selection_prompt(pending.intent, seen))
                     }
-                    SearchCardButton::Search => {
+                    SearchCardButton::Confirm => {
                         // Cedo demais, ou nada a vista: o cartao fica, a
                         // espera de um clique a serio.
                         self.pending = Some(pending);
@@ -20076,7 +20337,7 @@ impl SearchCard {
 
 /// Quem executa o cartao: o App no produto, um registo nos gates.
 trait SearchCardHost {
-    fn show_search_card(&mut self, token: u64, text: &str);
+    fn show_search_card(&mut self, token: u64, intent: SearchIntent, text: &str);
     fn hide_search_card(&mut self);
     fn expire_search_card_after(&mut self, token: u64, delay: Duration);
     fn compare_selection(&mut self, question: String);
@@ -20084,8 +20345,13 @@ trait SearchCardHost {
 
 fn apply_search_card(host: &mut impl SearchCardHost, outcome: SearchCardOutcome) {
     match outcome {
-        SearchCardOutcome::Show { token, text, .. } => {
-            host.show_search_card(token, &text);
+        SearchCardOutcome::Show {
+            token,
+            intent,
+            text,
+            ..
+        } => {
+            host.show_search_card(token, intent, &text);
             host.expire_search_card_after(token, Duration::from_secs(SEARCH_CARD_SECONDS));
         }
         SearchCardOutcome::Confirmed(question) => {
@@ -20098,9 +20364,9 @@ fn apply_search_card(host: &mut impl SearchCardHost, outcome: SearchCardOutcome)
 }
 
 impl SearchCardHost for App {
-    fn show_search_card(&mut self, token: u64, text: &str) {
+    fn show_search_card(&mut self, token: u64, intent: SearchIntent, text: &str) {
         if let Ok(mut view) = SEARCH_CARD_VIEW.lock() {
-            *view = Some((token, text.to_string()));
+            *view = Some((token, intent, text.to_string()));
         }
         // Um clique a meio no cartao anterior nao passa para o novo.
         SEARCH_CARD_PRESSED.store(NATIVE_BUTTON_NONE, Ordering::Release);
@@ -20183,7 +20449,8 @@ impl SearchCardHost for App {
 
 /// O mapa de teclas (e a barra de selecao que vive nele) com a capability e
 /// o sinal de superficie privada postos. Um painel privado nao mostra o
-/// "Pesquisar": o texto dele nao pode ir parar ao historico nem a memoria.
+/// "Mandar para IA" nem o "Traduzir": o texto dele nao pode ir parar ao
+/// historico nem a memoria.
 fn bind_page_script(script: &str, capability: &str, private: bool) -> String {
     script.replace("__NEURALIA_CAP__", capability).replace(
         "__NEURALIA_PRIVATE__",
@@ -20273,7 +20540,8 @@ enum SplitOpenPlan {
 }
 
 /// Tudo o que o builder do Split recebe. O `private` do pedido entra UMA vez
-/// (em `split_open_plan`) e daqui saem o script injetado (sem o Pesquisar), o
+/// (em `split_open_plan`) e daqui saem o script injetado (sem o Mandar para
+/// IA nem o Traduzir), o
 /// mapa IPC (que recusa `search`) e o perfil anonimo do WebView2; o builder
 /// e o resto de `open_split_mode` so leem isto.
 struct SplitBuild {
@@ -22709,7 +22977,7 @@ mod tests {
                 (&*sink as *const SearchCardSink) as usize,
             );
             if let Ok(mut view) = SEARCH_CARD_VIEW.lock() {
-                *view = Some((77, "Texto & mais".to_string()));
+                *view = Some((77, SearchIntent::Ask, "Texto & mais".to_string()));
             }
             show_popup_without_activation(card);
             InvalidateRect(card, std::ptr::null(), 1);
@@ -22734,7 +23002,7 @@ mod tests {
             // O texto trocou mas ainda nao foi pintado: o clique responde ao
             // que o utilizador viu (77), nunca ao texto novo.
             if let Ok(mut view) = SEARCH_CARD_VIEW.lock() {
-                *view = Some((78, "Outro texto".to_string()));
+                *view = Some((78, SearchIntent::Translate, "Outro texto".to_string()));
             }
             click(on_search, on_search);
             let answered = answers.borrow().clone();
@@ -22760,9 +23028,9 @@ mod tests {
             assert_eq!(
                 answered,
                 vec![
-                    (77, SearchCardButton::Search, 12),
+                    (77, SearchCardButton::Confirm, 12),
                     (77, SearchCardButton::Cancel, 12),
-                    (77, SearchCardButton::Search, 12),
+                    (77, SearchCardButton::Confirm, 12),
                 ],
                 "o cartao respondeu a outra coisa que um clique nativo num botao"
             );
@@ -28954,6 +29222,12 @@ __drain();
     const SELECTION_DOM: &str = r##"
 var __log = [], __clipboard = [], __exec = [], __spoken = [], __shadows = [], __prevented = [], __leaks = [];
 var __cancels = 0, __clipboardFails = false, __voices = [], __covered = false;
+// O foco (so o que a barra lhe faz): `focus`/`blur` de HTMLElement, com o
+// elemento que o tem.
+var __focus = null;
+var HTMLElement = function HTMLElement() {};
+HTMLElement.prototype.focus = function () { __focus = this; };
+HTMLElement.prototype.blur = function () { if (__focus === this) __focus = null; };
 // As copias do teste: a "pagina" pode trocar JSON, String e String.prototype.
 const __json = JSON.stringify;
 const __S = String;
@@ -29320,8 +29594,16 @@ function __kids() {
   const bar = __bar();
   return bar ? bar.childNodes || [] : [];
 }
+// O menu do "⋯" (dentro da barra) e as entradas dele.
+function __menu() {
+  return __kids().find((n) => n.getAttribute && n.getAttribute('role') === 'menu') || null;
+}
+function __items() {
+  const menu = __menu();
+  return menu ? (menu.childNodes || []).filter((n) => n.tagName === 'BUTTON') : [];
+}
 function __button(action) {
-  return __kids().find((n) => n.tagName === 'BUTTON' && n.getAttribute('data-action') === action) || null;
+  return __kids().concat(__items()).find((n) => n.tagName === 'BUTTON' && n.getAttribute('data-action') === action) || null;
 }
 // Um clique num botao da barra: fora da shadow root o alvo e o host.
 function __press(action, extra) {
@@ -29333,6 +29615,12 @@ function __press(action, extra) {
   __on(window, 'mouseup', Object.assign({ target: host }, extra));
   __on(b, 'click', Object.assign({ target: b }, extra));
 }
+// Falar (ou Parar) como o utilizador: pelo "⋯", se o menu estiver fechado.
+function __falar(extra) {
+  const menu = __menu();
+  if (menu && menu.getAttribute('class') !== 'menu on') __press('more');
+  __press('speak', extra);
+}
 function __utterEnd() { __on(__spoken[__spoken.length - 1], 'end'); }
 function __voicesChanged() { __on(window.speechSynthesis, 'voiceschanged'); }
 function __state(tag) {
@@ -29342,6 +29630,9 @@ function __state(tag) {
   const kids = __kids();
   const buttons = kids.filter((n) => n.tagName === 'BUTTON');
   const note = kids.find((n) => n.getAttribute && n.getAttribute('role') === 'status');
+  const menu = __menu();
+  const items = __items();
+  const more = __button('more');
   __log.push(__json({
     tag: tag,
     shown: !!host && host.style.display === 'block' && host.isConnected,
@@ -29353,7 +29644,18 @@ function __state(tag) {
     top: host ? parseFloat(host.style.top) : null,
     left: host ? parseFloat(host.style.left) : null,
     buttons: buttons.map((n) => __textOf.call(n)),
-    tabindex: buttons.map((n) => n.getAttribute('tabindex')),
+    tabindex: buttons.concat(items).map((n) => n.getAttribute('tabindex')),
+    // O "⋯": rotulos acessiveis, estado, e o menu -- aberto?, as entradas
+    // (com o papel de cada uma) e a que tem o foco.
+    more: more ? {
+      label: more.getAttribute('aria-label'), title: more.getAttribute('title'),
+      popup: more.getAttribute('aria-haspopup'), expanded: more.getAttribute('aria-expanded')
+    } : null,
+    menuOpen: !!menu && menu.getAttribute('class') === 'menu on',
+    menuRole: menu ? menu.getAttribute('role') : null,
+    menu: items.map((n) => __textOf.call(n)),
+    itemRoles: items.map((n) => n.getAttribute('role')),
+    focus: __focus && __focus.getAttribute ? __focus.getAttribute('data-action') : null,
     note: note && note.getAttribute('class') === 'msg on' ? __textOf.call(note) : '',
     pending: __timers.filter((t) => !t.done).length,
     clipboard: __clipboard.slice(),
@@ -29440,14 +29742,30 @@ function __state(tag) {
         selection_posted(result)
             .into_iter()
             .filter_map(|action| match action {
-                IpcAction::Search { text } => Some(text),
+                IpcAction::Search { text, .. } => Some(text),
                 _ => None,
             })
             .collect()
     }
 
+    /// Os rotulos da barra por superficie: a normal com os quatro e o "⋯"; a
+    /// privada sem Mandar para IA nem Traduzir.
+    fn selection_bar_labels(private: bool) -> serde_json::Value {
+        if private {
+            serde_json::json!(["📝 Salvar nota", "📋 Copiar", "⋯"])
+        } else {
+            serde_json::json!([
+                "🤖 Mandar para IA",
+                "📝 Salvar nota",
+                "🌐 Traduzir",
+                "📋 Copiar",
+                "⋯"
+            ])
+        }
+    }
+
     #[test]
-    fn the_selection_toolbar_offers_three_actions_for_a_trusted_selection() {
+    fn the_selection_toolbar_offers_four_actions_and_a_menu_for_a_trusted_selection() {
         // O mapa de teclas QUE EMBARCA, com a capability e o sinal privado
         // postos pelo mesmo `bind_page_script` dos builders.
         let script = bind_page_script(NEURALIA_KEYMAP_SCRIPT, SELECTION_CAP, false);
@@ -29616,11 +29934,21 @@ __state('quadro');
         assert_eq!(visible["position"], "fixed");
         assert_eq!(visible["zIndex"], "2147483647");
         assert_eq!(visible["sheets"], 1, "a barra ficou sem estilo");
+        // Os quatro do pedido do dono, pela ordem, e o "⋯" com o resto.
         assert_eq!(
             visible["buttons"],
-            serde_json::json!(["🔎 Pesquisar", "📋 Copiar", "🔊 Falar"])
+            serde_json::json!([
+                "🤖 Mandar para IA",
+                "📝 Salvar nota",
+                "🌐 Traduzir",
+                "📋 Copiar",
+                "⋯"
+            ])
         );
-        assert_eq!(visible["tabindex"], serde_json::json!(["-1", "-1", "-1"]));
+        assert_eq!(visible["menu"], serde_json::json!(["🔊 Falar"]));
+        assert_eq!(visible["menuOpen"], false, "o menu abriu sozinho");
+        // Nada na ordem do Tab da pagina (o menu leva o foco quando abre).
+        assert_eq!(visible["tabindex"], serde_json::json!(vec!["-1"; 6]));
         // O primeiro Esc so fecha a barra; o segundo volta atras como sempre.
         assert!(!shown("esc"));
         assert_eq!(selection_posted(&results[0]), vec![IpcAction::Back]);
@@ -29737,21 +30065,198 @@ __state('quadro');
         );
     }
 
+    /// O "⋯" abre, na mesma shadow root fechada da barra, um menu com o que
+    /// nao cabe nela -- hoje so o Falar. Abre e fecha no clique, leva o foco
+    /// a primeira entrada (o teclado anda nele: setas, Home/End, Enter e
+    /// Espaco, Tab), o Esc fecha so o menu, e a leitura continua a ter o
+    /// Parar a mao. Sem vozes nao ha "⋯" (nada de botoes mortos).
+    #[test]
+    fn the_selection_menu_opens_closes_and_is_reachable_by_keyboard() {
+        let page = bind_page_script(NEURALIA_KEYMAP_SCRIPT, SELECTION_CAP, false);
+        let menu = r#"
+__voices = [__MARIA];
+__show('Texto do menu.');
+__state('fechado');
+__press('more');
+__state('aberto');
+const __m = __menu();
+const __speak = () => __items()[0];
+__on(__m, 'keydown', { key: 'ArrowDown', target: __speak() });
+__on(__m, 'keydown', { key: 'End', target: __speak() });
+__on(__m, 'keydown', { key: 'ArrowUp', target: __speak() });
+__on(__m, 'keydown', { key: 'Home', target: __speak() });
+__state('setas');
+__on(__m, 'keydown', { key: 'Enter', target: __speak(), isTrusted: false });
+__state('enter-sintetico');
+__on(__m, 'keydown', { key: 'Enter', target: __speak() });
+__state('enter');
+__on(__m, 'keydown', { key: ' ', target: __speak() });
+__state('espaco');
+__on(document, 'keydown', { key: 'Escape' });
+__state('esc');
+__on(document, 'keydown', { key: 'Escape' });
+__state('esc-2');
+__on(document, 'keydown', { key: 'Escape' });
+__state('esc-3');
+"#;
+        let toggles = r#"
+__voices = [__MARIA];
+__show('Texto do menu.');
+__press('more');
+__press('more');
+__state('fechou-no-botao');
+__press('more');
+__on(__menu(), 'keydown', { key: 'Tab', target: __items()[0] });
+__state('tab');
+__press('more');
+__on(window, 'mousedown', { target: document.body });
+__state('clique-fora');
+__show('Outro texto.');
+__state('selecao-nova');
+"#;
+        // A ler, sem selecao (clicou fora): so o "⋯", com o menu aberto no
+        // Parar -- um clique para calar, como antes -- sem tirar o foco a
+        // pagina.
+        let reading = r#"
+__voices = [__MARIA];
+__show('Paragrafo inteiro.');
+__falar();
+__press('more');
+__state('menu-fechado-a-ler');
+__on(window, 'mousedown', { target: document.body, clientX: 100, clientY: 510 });
+__unselect();
+__on(document, 'selectionchange');
+__on(window, 'mouseup', { target: document.body, clientX: 100, clientY: 510 });
+__drain();
+__state('solo');
+__press('speak');
+__state('parou');
+"#;
+        let mute = r#"
+__show('Texto do menu.');
+__state('fechado');
+"#;
+        let results = run_selection_cases(vec![
+            selection_case("menu", &page, "", &[menu]),
+            selection_case("alterna", &page, "", &[toggles]),
+            selection_case("a-ler", &page, "", &[reading]),
+            selection_case("sem-voz", &page, "window.speechSynthesis = null;", &[mute]),
+        ]);
+
+        let states = selection_states(&results[0]);
+        let closed = &states["fechado"];
+        assert_eq!(closed["menuOpen"], false);
+        assert_eq!(
+            closed["more"],
+            serde_json::json!({
+                "label": "Mais", "title": "Mais", "popup": "menu", "expanded": "false"
+            })
+        );
+        assert_eq!(
+            closed["focus"],
+            serde_json::Value::Null,
+            "o foco saiu da pagina"
+        );
+        let open = &states["aberto"];
+        assert_eq!(open["menuOpen"], true, "o ⋯ nao abriu o menu");
+        assert_eq!(open["more"]["expanded"], "true");
+        assert_eq!(open["menuRole"], "menu");
+        assert_eq!(open["menu"], serde_json::json!(["🔊 Falar"]));
+        assert_eq!(open["itemRoles"], serde_json::json!(["menuitem"]));
+        assert_eq!(open["focus"], "speak", "o teclado nao chega ao menu");
+        // Setas, Home e End ficam no menu (uma entrada: nao saem dela).
+        assert_eq!(states["setas"]["focus"], "speak");
+        assert_eq!(states["setas"]["menuOpen"], true);
+        // Enter e Espaco fazem a entrada com o foco; um Enter sintetico nao.
+        assert_eq!(states["enter-sintetico"]["spoken"], serde_json::json!([]));
+        assert_eq!(states["enter"]["menu"][0], "⏹ Parar");
+        assert_eq!(
+            states["enter"]["spoken"],
+            serde_json::json!([{ "text": "Texto do menu.", "voice": "Maria", "lang": "pt-BR" }])
+        );
+        assert_eq!(states["enter"]["menuOpen"], true, "o Parar saiu de vista");
+        assert_eq!(states["espaco"]["menu"][0], "🔊 Falar");
+        // O primeiro Esc fecha so o menu e devolve o foco; o segundo fecha a
+        // barra; so o terceiro volta atras.
+        let esc = &states["esc"];
+        assert_eq!(esc["menuOpen"], false, "o Esc nao fechou o menu");
+        assert_eq!(esc["shown"], true, "o Esc fechou a barra com o menu");
+        assert_eq!(
+            esc["focus"],
+            serde_json::Value::Null,
+            "o foco ficou no menu"
+        );
+        assert_eq!(esc["more"]["expanded"], "false");
+        assert_eq!(states["esc-2"]["shown"], false);
+        assert_eq!(states["esc-2"]["posted"], 0);
+        assert_eq!(selection_posted(&results[0]), vec![IpcAction::Back]);
+
+        let toggles = selection_states(&results[1]);
+        for tag in ["fechou-no-botao", "tab", "clique-fora", "selecao-nova"] {
+            assert_eq!(
+                toggles[tag]["menuOpen"], false,
+                "{tag}: o menu ficou aberto"
+            );
+            assert_eq!(toggles[tag]["focus"], serde_json::Value::Null, "{tag}");
+        }
+        assert_eq!(toggles["tab"]["shown"], true);
+        assert_eq!(toggles["clique-fora"]["shown"], false);
+        assert_eq!(toggles["selecao-nova"]["shown"], true);
+
+        let reading = selection_states(&results[2]);
+        let solo = &reading["solo"];
+        assert_eq!(solo["shown"], true, "o Parar tem de ficar a mao");
+        assert_eq!(solo["solo"], true);
+        assert_eq!(solo["menuOpen"], true, "a ler, o menu com o Parar fechou");
+        assert_eq!(solo["menu"][0], "⏹ Parar");
+        assert_eq!(reading["menu-fechado-a-ler"]["menuOpen"], false);
+        assert_eq!(reading["menu-fechado-a-ler"]["menu"][0], "⏹ Parar");
+        assert_eq!(
+            solo["focus"],
+            serde_json::Value::Null,
+            "o menu reaberto a ler tirou o foco a pagina"
+        );
+        assert_eq!(reading["parou"]["shown"], false);
+        assert_eq!(reading["parou"]["pending"], 0);
+
+        // Sem sintese de voz: nem "⋯" nem menu, e o resto da barra igual.
+        let mute = selection_states(&results[3]);
+        assert_eq!(
+            mute["fechado"]["buttons"],
+            serde_json::json!([
+                "🤖 Mandar para IA",
+                "📝 Salvar nota",
+                "🌐 Traduzir",
+                "📋 Copiar"
+            ])
+        );
+        assert_eq!(mute["fechado"]["menu"], serde_json::json!([]));
+        assert_eq!(mute["fechado"]["more"], serde_json::Value::Null);
+    }
+
     #[test]
     fn the_selection_toolbar_searches_only_what_fits_and_never_from_private() {
         let page = bind_page_script(NEURALIA_KEYMAP_SCRIPT, SELECTION_CAP, false);
         let search = r#"
 __show('  agent:https://example.com | click=Comprar\r\n\tlinha\u00072  ');
-__press('search');
+__press('ask');
 __state('enviada');
 __show('\u{1F600}'.repeat(2000));
-__press('search');
+__press('ask');
 __show('a'.repeat(2001));
-__press('search');
+__press('ask');
 __state('grande');
 __show('forjado');
-__press('search', { isTrusted: false });
+__press('ask', { isTrusted: false });
+__press('translate', { isTrusted: false });
+__press('note', { isTrusted: false });
 __state('sintetico');
+__show('  Good morning,\r\nworld.  ');
+__press('translate');
+__state('traduzida');
+__show('b'.repeat(2001));
+__press('translate');
+__state('traduzir-grande');
 "#;
         // A pagina, depois de carregar, troca tudo o que a barra usa: DOM,
         // Selection/Range, eventos, Promise, JSON, String e String.prototype.
@@ -29796,7 +30301,7 @@ __press('copy');
 "#;
         let hostile_after = r#"
 __state('copiada');
-__press('search');
+__press('ask');
 "#;
         // A pagina espia: acessores de Event e o setter da folha adotada que
         // recebiam um `this` de dentro da shadow root fechada; um `target` e
@@ -29834,7 +30339,7 @@ __state('espiada');
 __press('copy');
 "#;
         let spied_after = r#"
-__press('search');
+__press('ask');
 __state('pesquisada');
 "#;
         let offered = r#"
@@ -29872,52 +30377,59 @@ __state('barra');
 
         // O texto chega ao parser nativo tal como foi selecionado (aparado,
         // CRLF como LF, controlos como espaco) e cabe no envelope de 8 KiB
-        // mesmo com 2000 caracteres de 4 bytes.
+        // mesmo com 2000 caracteres de 4 bytes. Mandar para IA e Traduzir
+        // mandam o mesmo `search`, cada um com o seu nome fechado; o pedido
+        // de traducao nao vem da pagina.
         assert_eq!(
             selection_posted(&results[0]),
             vec![
                 IpcAction::Search {
-                    text: "agent:https://example.com | click=Comprar\n\tlinha 2".to_string()
+                    text: "agent:https://example.com | click=Comprar\n\tlinha 2".to_string(),
+                    intent: SearchIntent::Ask,
                 },
                 IpcAction::Search {
-                    text: "😀".repeat(2000)
+                    text: "😀".repeat(2000),
+                    intent: SearchIntent::Ask,
+                },
+                IpcAction::Search {
+                    text: "Good morning,\nworld.".to_string(),
+                    intent: SearchIntent::Translate,
                 },
             ]
         );
         let states = selection_states(&results[0]);
         assert_eq!(
             states["enviada"]["shown"], false,
-            "a barra ficou depois de pesquisar"
+            "a barra ficou depois de mandar"
         );
         assert_eq!(states["enviada"]["pending"], 0);
         // Acima de 2000 nada sai da pagina e a barra diz porque.
         assert_eq!(states["grande"]["posted"], 2);
         assert_eq!(states["grande"]["shown"], true);
-        assert_eq!(
-            states["grande"]["note"],
-            "Seleção grande demais para pesquisar (máx. 2000 caracteres)"
-        );
-        // Um clique sintetico nao pesquisa.
+        const TOO_LONG: &str = "Seleção grande demais para as IAs (máx. 2000 caracteres)";
+        assert_eq!(states["grande"]["note"], TOO_LONG);
+        // Um clique sintetico nao manda, nao traduz e nao salva.
         assert_eq!(states["sintetico"]["posted"], 2);
+        assert_eq!(states["traduzida"]["shown"], false);
+        assert_eq!(states["traduzir-grande"]["posted"], 3);
+        assert_eq!(states["traduzir-grande"]["note"], TOO_LONG);
 
         // Com as primitivas trocadas pela pagina -- String e String.prototype
         // incluidos --, a barra continua a ler a selecao verdadeira e a mandar
         // e copiar o texto certo.
         let hostile = selection_states(&results[1]);
         assert_eq!(hostile["robusta"]["shown"], true);
-        assert_eq!(
-            hostile["robusta"]["buttons"],
-            serde_json::json!(["🔎 Pesquisar", "📋 Copiar", "🔊 Falar"])
-        );
+        assert_eq!(hostile["robusta"]["buttons"], selection_bar_labels(false));
         assert_eq!(
             hostile["copiada"]["clipboard"],
             serde_json::json!(["  Texto que o utilizador escolheu  "])
         );
-        assert_eq!(hostile["copiada"]["buttons"][1], "✓ Copiado");
+        assert_eq!(hostile["copiada"]["buttons"][3], "✓ Copiado");
         assert_eq!(
             selection_posted(&results[1]),
             vec![IpcAction::Search {
-                text: "Texto que o utilizador escolheu".to_string()
+                text: "Texto que o utilizador escolheu".to_string(),
+                intent: SearchIntent::Ask,
             }]
         );
 
@@ -29934,27 +30446,25 @@ __state('barra');
         );
         assert_eq!(selection_searches(&results[2]), vec!["Texto espiado"]);
 
-        // Painel privado: sem Pesquisar. Painel normal: os tres.
+        // Painel privado: sem Mandar para IA nem Traduzir (o texto nao sai
+        // para as IAs); Salvar nota, Copiar e o "⋯" ficam. Painel normal:
+        // todos.
         let private = selection_states(&results[3]);
         assert_eq!(private["barra"]["shown"], true);
-        assert_eq!(
-            private["barra"]["buttons"],
-            serde_json::json!(["📋 Copiar", "🔊 Falar"])
-        );
+        assert_eq!(private["barra"]["buttons"], selection_bar_labels(true));
+        assert_eq!(private["barra"]["menu"], serde_json::json!(["🔊 Falar"]));
         assert!(selection_posted(&results[3]).is_empty());
         let normal = selection_states(&results[4]);
-        assert_eq!(
-            normal["barra"]["buttons"],
-            serde_json::json!(["🔎 Pesquisar", "📋 Copiar", "🔊 Falar"])
-        );
+        assert_eq!(normal["barra"]["buttons"], selection_bar_labels(false));
     }
 
     #[test]
     fn pesquisar_only_counts_a_click_on_a_bar_the_user_really_saw() {
-        // Pesquisar leva texto da pagina as tres IAs, a memoria e ao
-        // historico. So conta um clique numa barra que o utilizador viu: a
-        // vista ha 500 ms, onde foi posta, sem a pagina por cima nem a mexer
-        // no estilo dela; e so para uma selecao feita pelo gesto dele.
+        // Mandar para IA e Traduzir levam texto da pagina as tres IAs, a
+        // memoria e ao historico; Salvar nota grava-o nas notas. So conta um
+        // clique numa barra que o utilizador viu: a vista ha 500 ms, onde foi
+        // posta, sem a pagina por cima nem a mexer no estilo dela; e so para
+        // uma selecao feita pelo gesto dele.
         let page = bind_page_script(NEURALIA_KEYMAP_SCRIPT, SELECTION_CAP, false);
         let early = r#"
 __select('Pergunta do utilizador.');
@@ -29963,10 +30473,14 @@ __wait(200);
 __drain();
 __seen();
 __wait(100);
-__press('search');
+__press('ask');
 __state('cedo');
+__press('note');
+__state('nota-cedo');
+__press('translate');
+__state('traduzir-cedo');
 __wait(600);
-__press('search');
+__press('ask');
 __state('depois');
 "#;
         // O botao desceu antes dos 500 ms e so subiu depois: o clique conta
@@ -29978,7 +30492,7 @@ __wait(200);
 __drain();
 __seen();
 __wait(450);
-const __host = __root().host, __b = __button('search');
+const __host = __root().host, __b = __button('ask');
 __on(window, 'mousedown', { target: __host, where: 'window' });
 __on(__b, 'mousedown', { target: __b, where: 'botao' });
 __wait(100);
@@ -29995,11 +30509,14 @@ Object.defineProperty(IntersectionObserverEntry.prototype, 'isVisible', {
 __covered = true;
 __show('Pergunta coberta.');
 __wait(600);
-__press('search');
+__press('ask');
 __state('coberta');
+__press('note');
+__press('translate');
+__state('nota-coberta');
 __covered = false;
 __settle();
-__press('search');
+__press('ask');
 __state('descoberta');
 "#;
         // A pagina chega ao host (esta na arvore dela) e reescreve-lhe o
@@ -30073,14 +30590,22 @@ document.documentElement.appendChild(__veil);
 __veil.appendChild(__root().host);",
             ),
         ];
+        // Cada alteracao, feita de novo antes de cada um dos tres botoes que
+        // pedem algo ao nativo (o aviso da barra volta a po-la no sitio).
         let tamper_steps: Vec<String> = tampers
             .iter()
             .map(|(_, change)| {
                 format!(
                     "__show('Pergunta.');
-{change}
-__press('search');
+{{ {change} }}
+__press('ask');
 __state('alterada');
+{{ {change} }}
+__press('note');
+__state('nota-alterada');
+{{ {change} }}
+__press('translate');
+__state('traduzir-alterada');
 "
                 )
             })
@@ -30116,8 +30641,8 @@ __state('shift-clique');
             cases.push(selection_case(name, &page, "", &[step.as_str()]));
         }
         let results = run_selection_cases(cases);
-        const TOO_SOON: &str = "Clique de novo em Pesquisar";
-        const TAMPERED: &str = "A página cobriu ou alterou esta barra: a pesquisa não foi enviada";
+        const TOO_SOON: &str = "Clique de novo em Mandar para IA";
+        const TAMPERED: &str = "A página cobriu ou alterou esta barra: o pedido não foi enviado";
 
         let early = selection_states(&results[0]);
         assert_eq!(
@@ -30125,6 +30650,11 @@ __state('shift-clique');
             "clique 100 ms depois de aparecer"
         );
         assert_eq!(early["cedo"]["note"], TOO_SOON);
+        // Salvar nota e Traduzir tem o mesmo filtro, e dizem o nome deles.
+        assert_eq!(early["nota-cedo"]["posted"], 0, "nota 100 ms depois");
+        assert_eq!(early["nota-cedo"]["note"], "Clique de novo em Salvar nota");
+        assert_eq!(early["traduzir-cedo"]["posted"], 0);
+        assert_eq!(early["traduzir-cedo"]["note"], "Clique de novo em Traduzir");
         assert_eq!(early["depois"]["posted"], 1);
         assert_eq!(
             selection_searches(&results[0]),
@@ -30134,6 +30664,10 @@ __state('shift-clique');
         let covered = selection_states(&results[1]);
         assert_eq!(covered["coberta"]["posted"], 0, "barra coberta pela pagina");
         assert_eq!(covered["coberta"]["note"], TAMPERED);
+        assert_eq!(
+            covered["nota-coberta"]["posted"], 0,
+            "nota ou traducao numa barra coberta"
+        );
         assert_eq!(covered["descoberta"]["posted"], 1);
 
         let pressed = selection_states(&results[3]);
@@ -30143,10 +30677,16 @@ __state('shift-clique');
         assert_eq!(results.len(), 4 + tampers.len());
         for result in &results[4..] {
             let name = result["name"].as_str().expect("name");
-            let state = &selection_states(result)["alterada"];
-            assert_eq!(state["shown"], true, "{name}");
-            assert_eq!(state["note"], TAMPERED, "{name}");
-            assert!(selection_posted(result).is_empty(), "{name}: pesquisou");
+            let states = selection_states(result);
+            for tag in ["alterada", "nota-alterada", "traduzir-alterada"] {
+                assert_eq!(states[tag]["shown"], true, "{name} {tag}");
+                assert_eq!(states[tag]["note"], TAMPERED, "{name} {tag}");
+            }
+            assert!(
+                selection_posted(result).is_empty(),
+                "{name}: pediu ao nativo {:?}",
+                selection_posted(result)
+            );
         }
 
         let gestures = selection_states(&results[2]);
@@ -30175,7 +30715,7 @@ __state('volta');
         let speak = r#"
 __voices = [__NUVEM, __MARIA, __ZIRA, __HELENA];
 __show('Olá, mundo. Sr. Silva chegou! Tudo bem?\nFim.\n' + 'palavra '.repeat(50).trim() + '.');
-__press('speak');
+__falar();
 __state('falando');
 for (let i = 0; i < 20; i++) {
   const before = __spoken.length;
@@ -30183,13 +30723,13 @@ for (let i = 0; i < 20; i++) {
   if (__spoken.length === before) break;
 }
 __state('lida');
-__press('speak');
+__falar();
 __state('de-novo');
-__press('speak');
+__falar();
 __state('parada');
 __utterEnd();
 __state('sem-eco');
-__press('speak');
+__falar();
 __on(document, 'keydown', { key: 'Escape' });
 __state('esc');
 "#;
@@ -30198,7 +30738,7 @@ function __voz(tag, voices, lang) {
   __voices = voices;
   document.documentElement.lang = lang;
   __show('Uma frase.');
-  __press('speak');
+  __falar();
   __state(tag);
   __on(document, 'keydown', { key: 'Escape' });
 }
@@ -30210,7 +30750,7 @@ __voz('so-online', [__NUVEM], '');
 document.documentElement.lang = '';
 __voices = [];
 __show('Uma frase.');
-__press('speak');
+__falar();
 __state('tardia-espera');
 __voices = [__MARIA];
 __voicesChanged();
@@ -30218,7 +30758,7 @@ __state('tardia');
 __on(document, 'keydown', { key: 'Escape' });
 __voices = [];
 __show('Uma frase.');
-__press('speak');
+__falar();
 __drain();
 __state('sem-vozes');
 "#;
@@ -30255,17 +30795,17 @@ __state('sem-vozes');
             serde_json::json!(["Texto para copiar"])
         );
         assert_eq!(copy["premido"]["exec"], serde_json::json!([]));
-        assert_eq!(copy["copiado"]["buttons"][1], "✓ Copiado");
+        assert_eq!(copy["copiado"]["buttons"][3], "✓ Copiado");
         assert_eq!(copy["copiado"]["shown"], true);
-        assert_eq!(copy["volta"]["buttons"][1], "📋 Copiar");
+        assert_eq!(copy["volta"]["buttons"][3], "📋 Copiar");
         assert_eq!(copy["volta"]["pending"], 0);
         // Sem a API do clipboard, ou com ela a recusar, copia pela selecao.
         let fallback = selection_states(&results[1]);
         assert_eq!(fallback["premido"]["exec"], serde_json::json!(["copy"]));
-        assert_eq!(fallback["premido"]["buttons"][1], "✓ Copiado");
+        assert_eq!(fallback["premido"]["buttons"][3], "✓ Copiado");
         let refused = selection_states(&results[2]);
         assert_eq!(refused["copiado"]["exec"], serde_json::json!(["copy"]));
-        assert_eq!(refused["copiado"]["buttons"][1], "✓ Copiado");
+        assert_eq!(refused["copiado"]["buttons"][3], "✓ Copiado");
 
         let speech = selection_states(&results[3]);
         let spoken = |tag: &str| -> Vec<(String, String)> {
@@ -30281,7 +30821,7 @@ __state('sem-vozes');
                 })
                 .collect()
         };
-        assert_eq!(speech["falando"]["buttons"][2], "⏹ Parar");
+        assert_eq!(speech["falando"]["menu"][0], "⏹ Parar");
         assert_eq!(
             spoken("falando"),
             vec![("Olá, mundo.".to_string(), "Maria".to_string())]
@@ -30303,11 +30843,11 @@ __state('sem-vozes');
         );
         assert!(read.iter().all(|part| part.chars().count() <= 200));
         assert!(spoken("lida").iter().all(|(_, voice)| voice == "Maria"));
-        assert_eq!(speech["lida"]["buttons"][2], "🔊 Falar");
+        assert_eq!(speech["lida"]["menu"][0], "🔊 Falar");
         // Segundo clique cala; a fala cancelada nao puxa a frase seguinte.
-        assert_eq!(speech["de-novo"]["buttons"][2], "⏹ Parar");
+        assert_eq!(speech["de-novo"]["menu"][0], "⏹ Parar");
         let cancels = speech["de-novo"]["cancels"].as_u64().expect("cancels");
-        assert_eq!(speech["parada"]["buttons"][2], "🔊 Falar");
+        assert_eq!(speech["parada"]["menu"][0], "🔊 Falar");
         assert_eq!(speech["parada"]["cancels"], cancels + 1);
         assert_eq!(spoken("sem-eco").len(), spoken("de-novo").len());
         // Esc tambem cala, fecha a barra e nao volta atras.
@@ -30348,7 +30888,7 @@ __state('sem-vozes');
         assert_eq!(last_voice("tardia"), "Maria");
         assert_eq!(voices["tardia"]["pending"], 0);
         assert_eq!(voices["sem-vozes"]["note"], "Nenhuma voz local disponível");
-        assert_eq!(voices["sem-vozes"]["buttons"][2], "🔊 Falar");
+        assert_eq!(voices["sem-vozes"]["menu"][0], "🔊 Falar");
     }
 
     #[test]
@@ -30378,12 +30918,12 @@ window.speechSynthesis.getVoices = function () { return [__NUVEM]; };
 document.documentElement.lang = 'pt-BR';
 __voices = [__NUVEM, __MARIA];
 __show('Uma frase privada.');
-__press('speak');
+__falar();
 __state('disfarcada');
 __on(document, 'keydown', { key: 'Escape' });
 __voices = [__NUVEM];
 __show('Outra frase.');
-__press('speak');
+__falar();
 __state('so-a-online');
 "#;
         let results = run_selection_cases(vec![
@@ -30447,7 +30987,7 @@ Object.defineProperty({proto}, '0', {{
 document.documentElement.lang = 'pt-BR';
 __voices = [__NUVEM, __MARIA];
 __show('Uma frase privada. E outra.');
-__press('speak');
+__falar();
 __utterEnd();
 __state('indice');
 "#
@@ -30493,7 +31033,7 @@ __state('indice');
         let reselect = r#"
 __voices = [__MARIA];
 __show('Paragrafo A inteiro.');
-__press('speak');
+__falar();
 __state('lendo-A');
 __on(window, 'mousedown', { target: document.body, clientX: 100, clientY: 510 });
 __select('Frase B.', __para, { rects: [{ top: 500, bottom: 520, left: 100, right: 400, width: 300, height: 20 }] });
@@ -30507,13 +31047,13 @@ __press('copy');
 "#;
         let reselected = r#"
 __state('copiou-B');
-__press('search');
+__press('ask');
 __state('pesquisou-B');
 "#;
         let clicked_away = r#"
 __voices = [__MARIA];
 __show('Paragrafo A inteiro.');
-__press('speak');
+__falar();
 __on(window, 'mousedown', { target: document.body, clientX: 100, clientY: 510 });
 __unselect();
 __on(document, 'selectionchange');
@@ -30521,9 +31061,9 @@ __on(window, 'mouseup', { target: document.body, clientX: 100, clientY: 510 });
 __drain();
 __state('clicou-fora-a-ler');
 __press('copy');
-__press('search');
+__press('ask');
 __state('sem-texto-antigo');
-__press('speak');
+__falar();
 __state('parou');
 "#;
         let results = run_selection_cases(vec![
@@ -30532,12 +31072,12 @@ __state('parou');
         ]);
 
         let states = selection_states(&results[0]);
-        assert_eq!(states["lendo-A"]["buttons"][2], "⏹ Parar");
+        assert_eq!(states["lendo-A"]["menu"][0], "⏹ Parar");
         let b = &states["selecionou-B"];
         assert_eq!(b["shown"], true);
         assert_eq!(b["solo"], false);
         assert_eq!(b["top"], 450.0, "a barra ficou na posicao de A");
-        assert_eq!(b["buttons"][2], "⏹ Parar", "a leitura de A continua");
+        assert_eq!(b["menu"][0], "⏹ Parar", "a leitura de A continua");
         assert_eq!(
             states["copiou-B"]["clipboard"],
             serde_json::json!(["Frase B."])
@@ -30551,7 +31091,7 @@ __state('parou');
             solo["solo"], true,
             "Copiar/Pesquisar ficaram com o texto antigo"
         );
-        assert_eq!(solo["buttons"][2], "⏹ Parar");
+        assert_eq!(solo["menu"][0], "⏹ Parar");
         assert_eq!(away["sem-texto-antigo"]["clipboard"], serde_json::json!([]));
         assert!(selection_posted(&results[1]).is_empty());
         assert_eq!(away["parou"]["shown"], false);
@@ -30604,36 +31144,49 @@ __state('barra');
             ),
         ];
         let results = run_selection_cases(surfaces);
-        let all = serde_json::json!(["🔎 Pesquisar", "📋 Copiar", "🔊 Falar"]);
         for result in &results {
             let name = result["name"].as_str().expect("name");
             let bar = &selection_states(result)["barra"];
             assert_eq!(bar["shown"], true, "{name}: a barra nao apareceu");
-            let expected = if name == "split-privado" {
-                serde_json::json!(["📋 Copiar", "🔊 Falar"])
-            } else {
-                all.clone()
-            };
-            assert_eq!(bar["buttons"], expected, "{name}");
+            assert_eq!(
+                bar["buttons"],
+                selection_bar_labels(name == "split-privado"),
+                "{name}"
+            );
+            assert_eq!(bar["menu"], serde_json::json!(["🔊 Falar"]), "{name}");
         }
 
-        // O mesmo `private` decide o script e o IPC do Split.
-        let search = || IpcAction::Search {
+        // O mesmo `private` decide o script e o IPC do Split: o privado
+        // recusa Mandar para IA e Traduzir, e grava o Salvar nota.
+        let search = |intent: SearchIntent| IpcAction::Search {
             text: "texto".to_string(),
+            intent,
         };
         let private = split_page(1, "ChatGPT", SELECTION_CAP, true).ipc;
         assert!(private.private, "o painel privado perdeu o perfil anonimo");
-        assert!(private.event(search()).is_none());
+        for intent in [SearchIntent::Ask, SearchIntent::Translate] {
+            assert!(private.event(search(intent)).is_none(), "{intent:?}");
+        }
         assert!(matches!(
             private.event(IpcAction::SplitClose),
             Some(UserEvent::CloseSplit)
         ));
+        assert!(matches!(
+            private.event(IpcAction::Note { via: NoteVia::Bar }),
+            Some(UserEvent::NoteRequested {
+                target: Some(PageTarget::Split),
+                via: NoteVia::Bar
+            })
+        ));
         let normal = split_page(1, "ChatGPT", SELECTION_CAP, false).ipc;
         assert!(!normal.private);
-        assert!(matches!(
-            normal.event(search()),
-            Some(UserEvent::SearchSelection(ref text)) if text == "texto"
-        ));
+        for intent in [SearchIntent::Ask, SearchIntent::Translate] {
+            assert!(matches!(
+                normal.event(search(intent)),
+                Some(UserEvent::SearchSelection { ref text, intent: got })
+                    if text == "texto" && got == intent
+            ));
+        }
 
         // Os builders nao montam o script nem decidem a privacidade por conta
         // propria: usam as funcoes acima (asserção de ausencia, AGENTS.md
@@ -30832,18 +31385,40 @@ __state('barra');
             );
             seen.take()
         };
-        let search = r#"{"text":"Texto da pagina."}"#;
-        assert!(
-            deliver(&private, "search", search).is_empty(),
-            "o Split privado aceitou o search"
-        );
+        let search = r#"{"text":"Texto da pagina.","intent":"ask"}"#;
+        let translate = r#"{"text":"Texto da pagina.","intent":"translate"}"#;
+        for args in [search, translate] {
+            assert!(
+                deliver(&private, "search", args).is_empty(),
+                "o Split privado aceitou o search {args}"
+            );
+        }
         assert!(matches!(
             deliver(&private, "split-close", "{}").as_slice(),
             [UserEvent::CloseSplit]
         ));
         assert!(matches!(
             deliver(&normal, "search", search).as_slice(),
-            [UserEvent::SearchSelection(text)] if text == "Texto da pagina."
+            [UserEvent::SearchSelection { text, intent: SearchIntent::Ask }]
+                if text == "Texto da pagina."
+        ));
+        assert!(matches!(
+            deliver(&normal, "search", translate).as_slice(),
+            [UserEvent::SearchSelection { text, intent: SearchIntent::Translate }]
+                if text == "Texto da pagina."
+        ));
+        // O Salvar nota do Split privado chega (e explicito); o Ctrl+Shift+Z
+        // la continua recusado sem ler a pagina.
+        assert!(matches!(
+            deliver(&private, "note", r#"{"via":"bar"}"#).as_slice(),
+            [UserEvent::NoteRequested {
+                target: Some(PageTarget::Split),
+                via: NoteVia::Bar
+            }]
+        ));
+        assert!(matches!(
+            deliver(&private, "note", "{}").as_slice(),
+            [UserEvent::NoteRefusedPrivate]
         ));
         // Um envelope sem a capability deste painel nao chega a lado nenhum.
         let forged = SplitBuild {
@@ -30852,7 +31427,8 @@ __state('barra');
         };
         assert!(deliver(&forged, "search", search).is_empty());
 
-        // O script injetado: o privado nao tem o Pesquisar.
+        // O script injetado: o privado nao tem o Mandar para IA nem o
+        // Traduzir.
         let offered = r#"
 __show('Texto da pagina.');
 __state('barra');
@@ -30865,13 +31441,10 @@ __state('barra');
             |result: &serde_json::Value| selection_states(result)["barra"]["buttons"].clone();
         assert_eq!(
             buttons(&results[0]),
-            serde_json::json!(["📋 Copiar", "🔊 Falar"]),
-            "o Split privado mostra o Pesquisar"
+            selection_bar_labels(true),
+            "o Split privado mostra o Mandar para IA ou o Traduzir"
         );
-        assert_eq!(
-            buttons(&results[1]),
-            serde_json::json!(["🔎 Pesquisar", "📋 Copiar", "🔊 Falar"])
-        );
+        assert_eq!(buttons(&results[1]), selection_bar_labels(false));
 
         // Fora do comparador um pedido privado cai; um normal vai para a Web.
         assert!(matches!(
@@ -31015,28 +31588,41 @@ __state('duplo-clique-no-vazio');
     #[test]
     fn a_selected_search_reaches_the_comparator_from_every_surface_but_the_private_split() {
         let text = "agent:https://example.com | click=Comprar".to_string();
-        let search = || IpcAction::Search { text: text.clone() };
-        let carries = |event: Option<UserEvent>| matches!(event, Some(UserEvent::SearchSelection(ref got)) if *got == text);
-        // As tres colunas do comparador.
-        for col in 0..COMPARATOR_COLUMNS {
-            assert!(
-                carries(App::column_ipc_event_impl(col, search())),
-                "coluna {col}"
-            );
+        for intent in [SearchIntent::Ask, SearchIntent::Translate] {
+            let search = || IpcAction::Search {
+                text: text.clone(),
+                intent,
+            };
+            // O mesmo texto E o mesmo botao: um Traduzir nunca chega como
+            // Mandar (nem o contrario).
+            let carries = |event: Option<UserEvent>| {
+                matches!(
+                    event,
+                    Some(UserEvent::SearchSelection { text: ref got, intent: asked })
+                        if *got == text && asked == intent
+                )
+            };
+            // As tres colunas do comparador.
+            for col in 0..COMPARATOR_COLUMNS {
+                assert!(
+                    carries(App::column_ipc_event_impl(col, search())),
+                    "coluna {col} {intent:?}"
+                );
+            }
+            // Split normal; o privado recusa, mas continua a fechar-se.
+            let split = |private: bool| split_page(1, "ChatGPT", SELECTION_CAP, private).ipc;
+            assert!(carries(split(false).event(search())), "{intent:?}");
+            assert!(split(true).event(search()).is_none(), "{intent:?}");
+            assert!(matches!(
+                split(true).event(IpcAction::SplitClose),
+                Some(UserEvent::CloseSplit)
+            ));
+            // Web externa, com e sem agente.
+            assert!(carries(external_ipc_event(search(), false)));
+            assert!(carries(external_ipc_event(search(), true)));
+            // O Reader usa o mapa comum.
+            assert!(carries(common_ipc_event(search())));
         }
-        // Split normal; o privado recusa, mas continua a fechar-se.
-        let split = |private: bool| split_page(1, "ChatGPT", SELECTION_CAP, private).ipc;
-        assert!(carries(split(false).event(search())));
-        assert!(split(true).event(search()).is_none());
-        assert!(matches!(
-            split(true).event(IpcAction::SplitClose),
-            Some(UserEvent::CloseSplit)
-        ));
-        // Web externa, com e sem agente.
-        assert!(carries(external_ipc_event(search(), false)));
-        assert!(carries(external_ipc_event(search(), true)));
-        // O Reader usa o mapa comum.
-        assert!(carries(common_ipc_event(search())));
     }
 
     #[test]
@@ -31084,12 +31670,7 @@ __state('duplo-clique-no-vazio');
         let t0 = Instant::now();
         let mut card = SearchCard::default();
         let mut log = CardLog::default();
-        let shown = drive_card(
-            &mut card,
-            &mut log,
-            SearchCardInput::Request("  tema:escuro\n".to_string()),
-            t0,
-        );
+        let shown = drive_card(&mut card, &mut log, ask_request("  tema:escuro\n"), t0);
         assert!(matches!(shown, SearchCardOutcome::Show { token: 1, .. }));
         assert!(log.compared.is_empty(), "o pedido pesquisou sem o cartao");
         drive_card(
@@ -31097,7 +31678,7 @@ __state('duplo-clique-no-vazio');
             &mut log,
             SearchCardInput::Answer {
                 token: 1,
-                button: SearchCardButton::Search,
+                button: SearchCardButton::Confirm,
                 shown: usize::MAX,
             },
             t0 + SEARCH_CARD_ARM,
@@ -31119,12 +31700,12 @@ __state('duplo-clique-no-vazio');
                 .to_string()
         };
         let arm = between(
-            "UserEvent::SearchSelection(text) =>",
+            "UserEvent::SearchSelection { text, intent } =>",
             "UserEvent::SearchCardAnswer",
         );
         assert_eq!(
             squash(&arm),
-            "{ self.search_card_event(SearchCardInput::Request(text)) }",
+            "{ self.search_card_event(SearchCardInput::Request { text, intent }) }",
             "o SearchSelection nao passa pelo cartao"
         );
         for forbidden in [
@@ -31203,8 +31784,13 @@ __state('duplo-clique-no-vazio');
     }
 
     impl SearchCardHost for CardLog {
-        fn show_search_card(&mut self, token: u64, text: &str) {
-            self.steps.push(format!("mostra {token}: {text}"));
+        fn show_search_card(&mut self, token: u64, intent: SearchIntent, text: &str) {
+            let title = search_card_title(intent);
+            self.steps.push(match intent {
+                // O cartao do Mandar regista-se como antes.
+                SearchIntent::Ask => format!("mostra {token}: {text}"),
+                SearchIntent::Translate => format!("mostra {token} ({title}): {text}"),
+            });
         }
         fn hide_search_card(&mut self) {
             self.steps.push("esconde".to_string());
@@ -31216,6 +31802,14 @@ __state('duplo-clique-no-vazio');
         fn compare_selection(&mut self, question: String) {
             self.steps.push(format!("compara {question}"));
             self.compared.push(question);
+        }
+    }
+
+    /// Um "Mandar para IA" com `text`, tal como chega ao cartao.
+    fn ask_request(text: &str) -> SearchCardInput {
+        SearchCardInput::Request {
+            text: text.to_string(),
+            intent: SearchIntent::Ask,
         }
     }
 
@@ -31238,7 +31832,7 @@ __state('duplo-clique-no-vazio');
         // O texto todo a vista (o corte do que nao cabe tem gate proprio).
         let search = |token: u64| SearchCardInput::Answer {
             token,
-            button: SearchCardButton::Search,
+            button: SearchCardButton::Confirm,
             shown: usize::MAX,
         };
         let cancel = |token: u64| SearchCardInput::Answer {
@@ -31246,7 +31840,7 @@ __state('duplo-clique-no-vazio');
             button: SearchCardButton::Cancel,
             shown: usize::MAX,
         };
-        let request = |text: &str| SearchCardInput::Request(text.to_string());
+        let request = ask_request;
         let mut card = SearchCard::default();
         let mut log = CardLog::default();
 
@@ -31260,6 +31854,7 @@ __state('duplo-clique-no-vazio');
             ),
             SearchCardOutcome::Show {
                 token: 1,
+                intent: SearchIntent::Ask,
                 text: "agent:https://x.com | click=Comprar".to_string(),
                 replaced: false,
             }
@@ -31349,6 +31944,7 @@ __state('duplo-clique-no-vazio');
             drive_card(&mut card, &mut log, request("quinto"), t3 + ms(700)),
             SearchCardOutcome::Show {
                 token: 5,
+                intent: SearchIntent::Ask,
                 text: "quinto".to_string(),
                 replaced: true,
             }
@@ -31379,7 +31975,10 @@ __state('duplo-clique-no-vazio');
                 drive_card(
                     &mut card,
                     &mut log,
-                    SearchCardInput::Request(invalid),
+                    SearchCardInput::Request {
+                        text: invalid,
+                        intent: SearchIntent::Ask,
+                    },
                     t3 + ms(1_100)
                 ),
                 SearchCardOutcome::Ignored
@@ -31410,6 +32009,165 @@ __state('duplo-clique-no-vazio');
                 .filter(|step| step.starts_with("compara "))
                 .count(),
             2
+        );
+    }
+
+    /// Traduzir: o mesmo cartao nativo, com o titulo e o botao dele, e as
+    /// tres IAs so recebem -- depois do clique em Traduzir, e nunca antes --
+    /// o pedido fixo, uma linha em branco e o texto que o cartao pintou.
+    #[test]
+    fn traduzir_sends_the_fixed_prompt_only_after_the_native_confirm() {
+        let t0 = Instant::now();
+        let ms = |value: u64| Duration::from_millis(value);
+        let translate = |text: &str| SearchCardInput::Request {
+            text: text.to_string(),
+            intent: SearchIntent::Translate,
+        };
+        let answer = |token: u64, button: SearchCardButton, shown: usize| SearchCardInput::Answer {
+            token,
+            button,
+            shown,
+        };
+        let prompt = |text: &str| format!("{TRANSLATE_PROMPT}\n\n{text}");
+        assert_eq!(
+            TRANSLATE_PROMPT,
+            "Traduza para o português do Brasil (se o texto já estiver em português, traduza para o inglês):"
+        );
+        let mut card = SearchCard::default();
+        let mut log = CardLog::default();
+
+        // O pedido so mostra o cartao do Traduzir: nada chega as IAs.
+        assert_eq!(
+            drive_card(
+                &mut card,
+                &mut log,
+                translate("  Good morning,\n world  "),
+                t0
+            ),
+            SearchCardOutcome::Show {
+                token: 1,
+                intent: SearchIntent::Translate,
+                text: "Good morning, world".to_string(),
+                replaced: false,
+            }
+        );
+        assert_eq!(
+            log.steps,
+            vec![
+                "mostra 1 (Traduzir nas 3 IAs?): Good morning, world".to_string(),
+                format!("expira 1 em {SEARCH_CARD_SECONDS} s"),
+            ]
+        );
+        assert!(log.compared.is_empty(), "traduziu sem o cartao");
+        // Cedo demais, ou Cancelar: nada.
+        assert_eq!(
+            drive_card(
+                &mut card,
+                &mut log,
+                answer(1, SearchCardButton::Confirm, usize::MAX),
+                t0 + ms(100)
+            ),
+            SearchCardOutcome::Ignored
+        );
+        assert!(log.compared.is_empty(), "traduziu 100 ms depois do cartao");
+        // O clique em Traduzir: o pedido fixo e o texto -- uma vez.
+        assert_eq!(
+            drive_card(
+                &mut card,
+                &mut log,
+                answer(1, SearchCardButton::Confirm, usize::MAX),
+                t0 + SEARCH_CARD_ARM
+            ),
+            SearchCardOutcome::Confirmed(prompt("Good morning, world"))
+        );
+        assert_eq!(log.compared, vec![prompt("Good morning, world")]);
+        assert_eq!(
+            drive_card(
+                &mut card,
+                &mut log,
+                answer(1, SearchCardButton::Confirm, usize::MAX),
+                t0 + ms(900)
+            ),
+            SearchCardOutcome::Ignored
+        );
+
+        // So o que o cartao pintou vai dentro do pedido.
+        let t1 = t0 + ms(2_000);
+        drive_card(&mut card, &mut log, translate("abc def ghi"), t1);
+        assert_eq!(
+            drive_card(
+                &mut card,
+                &mut log,
+                answer(2, SearchCardButton::Confirm, 4),
+                t1 + SEARCH_CARD_ARM
+            ),
+            SearchCardOutcome::Confirmed(prompt("abc"))
+        );
+        // Cancelar e expirar nao traduzem nada.
+        let t2 = t0 + ms(4_000);
+        drive_card(&mut card, &mut log, translate("cancelado"), t2);
+        assert_eq!(
+            drive_card(
+                &mut card,
+                &mut log,
+                answer(3, SearchCardButton::Cancel, usize::MAX),
+                t2 + SEARCH_CARD_ARM
+            ),
+            SearchCardOutcome::Cancelled
+        );
+        drive_card(&mut card, &mut log, translate("expirado"), t2);
+        assert_eq!(
+            drive_card(
+                &mut card,
+                &mut log,
+                SearchCardInput::Expire(4),
+                t2 + ms(12_000)
+            ),
+            SearchCardOutcome::Expired
+        );
+        // Um Mandar que troca um Traduzir a espera leva a pergunta sem o
+        // pedido; o Traduzir trocado ja nao conta.
+        let t3 = t0 + ms(20_000);
+        drive_card(&mut card, &mut log, translate("primeiro"), t3);
+        drive_card(&mut card, &mut log, ask_request("segundo"), t3 + ms(10));
+        assert_eq!(
+            drive_card(
+                &mut card,
+                &mut log,
+                answer(5, SearchCardButton::Confirm, usize::MAX),
+                t3 + ms(10) + SEARCH_CARD_ARM
+            ),
+            SearchCardOutcome::Ignored,
+            "o Traduzir trocado foi confirmado"
+        );
+        assert_eq!(
+            drive_card(
+                &mut card,
+                &mut log,
+                answer(6, SearchCardButton::Confirm, usize::MAX),
+                t3 + ms(10) + SEARCH_CARD_ARM
+            ),
+            SearchCardOutcome::Confirmed("segundo".to_string())
+        );
+        assert_eq!(
+            log.compared,
+            vec![
+                prompt("Good morning, world"),
+                prompt("abc"),
+                "segundo".to_string()
+            ],
+            "o compare correu fora de um clique em confirmar"
+        );
+
+        // O cartao pinta o titulo e o botao do Traduzir: com o mesmo texto,
+        // outra imagem que a do Mandar -- e o mesmo texto a vista.
+        let (ask_pixels, ask_shown) = render_search_card(SearchIntent::Ask, "Bom dia", 1.0);
+        let (translate_pixels, translate_shown) =
+            render_search_card(SearchIntent::Translate, "Bom dia", 1.0);
+        assert_eq!(ask_shown, translate_shown);
+        assert_ne!(
+            ask_pixels, translate_pixels,
+            "o cartao do Traduzir pinta-se como o do Mandar"
         );
     }
 
@@ -31506,9 +32264,23 @@ __state('duplo-clique-no-vazio');
             0,
             "o GDI cortaria em silencio"
         );
-        assert_eq!(SEARCH_CARD_TITLE, "Pesquisar nas 3 IAs?");
-        assert_eq!(SearchCardButton::Search.label(), "Pesquisar");
-        assert_eq!(SearchCardButton::Cancel.label(), "Cancelar");
+        // O titulo e o botao de confirmar dizem o que o clique faz.
+        assert_eq!(
+            search_card_title(SearchIntent::Ask),
+            "Mandar para as 3 IAs?"
+        );
+        assert_eq!(
+            search_card_title(SearchIntent::Translate),
+            "Traduzir nas 3 IAs?"
+        );
+        assert_eq!(SearchCardButton::Confirm.label(SearchIntent::Ask), "Mandar");
+        assert_eq!(
+            SearchCardButton::Confirm.label(SearchIntent::Translate),
+            "Traduzir"
+        );
+        for intent in [SearchIntent::Ask, SearchIntent::Translate] {
+            assert_eq!(SearchCardButton::Cancel.label(intent), "Cancelar");
+        }
 
         // Geometria e clique, com o tamanho real do cartao em tres escalas.
         for scale in [1.0, 1.5, 2.0] {
@@ -31551,11 +32323,11 @@ __state('duplo-clique-no-vazio');
             let middle = |rect: &RECT| ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
             let (sx, sy) = middle(&layout.search);
             let (cx, cy) = middle(&layout.cancel);
-            assert_eq!(hit(sx, sy), Some(SearchCardButton::Search));
+            assert_eq!(hit(sx, sy), Some(SearchCardButton::Confirm));
             assert_eq!(hit(cx, cy), Some(SearchCardButton::Cancel));
             assert_eq!(
                 hit(layout.search.right - 1, sy),
-                Some(SearchCardButton::Search)
+                Some(SearchCardButton::Confirm)
             );
             assert_eq!(
                 hit(layout.search.right, sy),
@@ -31571,13 +32343,13 @@ __state('duplo-clique-no-vazio');
             assert_eq!(hit(hx, hy), None);
 
             // Premido e solto no mesmo botao, com o rato preso ao cartao.
-            let search = Some(SearchCardButton::Search.index());
+            let search = Some(SearchCardButton::Confirm.index());
             let cancel = Some(SearchCardButton::Cancel.index());
             let release =
                 |pressed, captured, x, y| search_card_release(pressed, captured, &client, x, y);
             assert_eq!(
                 release(search, true, sx, sy),
-                Some(SearchCardButton::Search)
+                Some(SearchCardButton::Confirm)
             );
             assert_eq!(
                 release(cancel, true, cx, cy),
@@ -31593,7 +32365,7 @@ __state('duplo-clique-no-vazio');
     /// O cartao pintado por `paint_search_card` (a funcao do produto) num
     /// bitmap em memoria do tamanho real a `scale`: (pixeis, caracteres que a
     /// pintura diz ter mostrado).
-    fn render_search_card(text: &str, scale: f64) -> (Vec<u8>, usize) {
+    fn render_search_card(intent: SearchIntent, text: &str, scale: f64) -> (Vec<u8>, usize) {
         use windows_sys::Win32::Graphics::Gdi::{GdiFlush, RGBQUAD};
         let width = (SEARCH_CARD_WIDTH * scale).round() as i32;
         let height = (SEARCH_CARD_HEIGHT * scale).round() as i32;
@@ -31642,7 +32414,7 @@ __state('duplo-clique-no-vazio');
                 right: width,
                 bottom: height,
             };
-            let shown = paint_search_card(memory, &client, text);
+            let shown = paint_search_card(memory, &client, intent, text);
             GdiFlush();
             let pixels =
                 std::slice::from_raw_parts(bits as *const u8, (width * height * 4) as usize)
@@ -31675,15 +32447,15 @@ __state('duplo-clique-no-vazio');
             let mut card = SearchCard::default();
             let SearchCardOutcome::Show {
                 token, text: view, ..
-            } = card.step(SearchCardInput::Request(text.to_string()), t0)
+            } = card.step(ask_request(text), t0)
             else {
                 panic!("o pedido nao mostrou o cartao: {text:?}");
             };
-            let (pixels, shown) = render_search_card(&view, scale);
+            let (pixels, shown) = render_search_card(SearchIntent::Ask, &view, scale);
             let question = match card.step(
                 SearchCardInput::Answer {
                     token,
-                    button: SearchCardButton::Search,
+                    button: SearchCardButton::Confirm,
                     shown,
                 },
                 t0 + SEARCH_CARD_ARM,
@@ -32448,7 +33220,7 @@ __state('duplo-clique-no-vazio');
             ("fn show_splash", "fn position_splash"),
             ("fn show_gmail_toast", "fn position_gmail_toast"),
             (
-                "fn show_search_card(&mut self, token: u64, text: &str) {",
+                "fn show_search_card(&mut self, token: u64, intent: SearchIntent, text: &str) {",
                 "fn hide_search_card",
             ),
             ("fn sync_exit_button", "fn position_exit_button"),
@@ -39284,7 +40056,9 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
             let message = sent[0].as_str().expect("string");
             assert_eq!(
                 parse_ipc_message(message, CAP, 3),
-                Some(IpcAction::Note),
+                Some(IpcAction::Note {
+                    via: NoteVia::Shortcut
+                }),
                 "{message}"
             );
             let value: serde_json::Value = serde_json::from_str(message).expect("json");
@@ -39295,40 +40069,60 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
             );
         }
 
-        /// Gate: o `note` vai para a WebView que o mandou -- a coluna dela, o
+        /// Gate: o `note` do Ctrl+Shift+Z vai para a WebView que o mandou -- a coluna dela, o
         /// Split, a WebView unica -- e o Split privado recusa sem ler. A
         /// decisao repete-se na hora de ler, com o Split que existe entao.
         #[test]
         fn a_note_request_reads_its_own_webview_and_never_the_private_split() {
             for col in 0..COMPARATOR_COLUMNS {
                 assert!(matches!(
-                    App::column_ipc_event_impl(col, IpcAction::Note),
-                    Some(UserEvent::NoteRequested(Some(PageTarget::Column(c)))) if c == col
+                    App::column_ipc_event_impl(col, IpcAction::Note { via: NoteVia::Shortcut }),
+                    Some(UserEvent::NoteRequested { target: Some(PageTarget::Column(c)), via: NoteVia::Shortcut }) if c == col
                 ));
             }
             assert!(matches!(
-                App::split_ipc_event_impl(1, false, IpcAction::Note),
-                Some(UserEvent::NoteRequested(Some(PageTarget::Split)))
+                App::split_ipc_event_impl(
+                    1,
+                    false,
+                    IpcAction::Note {
+                        via: NoteVia::Shortcut
+                    }
+                ),
+                Some(UserEvent::NoteRequested {
+                    target: Some(PageTarget::Split),
+                    via: NoteVia::Shortcut
+                })
             ));
             assert!(matches!(
-                App::split_ipc_event_impl(1, true, IpcAction::Note),
+                App::split_ipc_event_impl(
+                    1,
+                    true,
+                    IpcAction::Note {
+                        via: NoteVia::Shortcut
+                    }
+                ),
                 Some(UserEvent::NoteRefusedPrivate)
             ));
             assert!(matches!(
-                common_ipc_event(IpcAction::Note),
-                Some(UserEvent::NoteRequested(None))
+                common_ipc_event(IpcAction::Note {
+                    via: NoteVia::Shortcut
+                }),
+                Some(UserEvent::NoteRequested {
+                    target: None,
+                    via: NoteVia::Shortcut
+                })
             ));
             // Na hora de ler.
             assert_eq!(
-                note_capture_decision(Some(PageTarget::Split), Some(true)),
+                note_capture_decision(Some(PageTarget::Split), NoteVia::Shortcut, Some(true)),
                 NoteCapture::RefusePrivate
             );
             assert_eq!(
-                note_capture_decision(Some(PageTarget::Split), Some(false)),
+                note_capture_decision(Some(PageTarget::Split), NoteVia::Shortcut, Some(false)),
                 NoteCapture::Read
             );
             assert_eq!(
-                note_capture_decision(Some(PageTarget::Split), None),
+                note_capture_decision(Some(PageTarget::Split), NoteVia::Shortcut, None),
                 NoteCapture::NoPage
             );
             for target in [
@@ -39338,7 +40132,7 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
             ] {
                 for split in [None, Some(false), Some(true)] {
                     assert_eq!(
-                        note_capture_decision(target, split),
+                        note_capture_decision(target, NoteVia::Shortcut, split),
                         NoteCapture::Read,
                         "{target:?} com split {split:?}"
                     );
@@ -39367,6 +40161,7 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
                     assert_eq!(
                         note_read_view(
                             Some(PageTarget::Column(index)),
+                            NoteVia::Shortcut,
                             &columns,
                             split,
                             Some(&main)
@@ -39379,6 +40174,7 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
             assert_eq!(
                 note_read_view(
                     Some(PageTarget::Column(COMPARATOR_COLUMNS)),
+                    NoteVia::Shortcut,
                     &columns,
                     None,
                     Some(&main)
@@ -39388,6 +40184,7 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
             assert_eq!(
                 note_read_view(
                     Some(PageTarget::Split),
+                    NoteVia::Shortcut,
                     &columns,
                     Some(&normal),
                     Some(&main)
@@ -39397,6 +40194,7 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
             assert_eq!(
                 note_read_view(
                     Some(PageTarget::Split),
+                    NoteVia::Shortcut,
                     &columns,
                     Some(&private),
                     Some(&main)
@@ -39405,15 +40203,27 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
                 "o Split privado foi lido"
             );
             assert_eq!(
-                note_read_view(Some(PageTarget::Split), &columns, None, Some(&main)),
+                note_read_view(
+                    Some(PageTarget::Split),
+                    NoteVia::Shortcut,
+                    &columns,
+                    None,
+                    Some(&main)
+                ),
                 Err(NoteCapture::NoPage)
             );
             assert_eq!(
-                note_read_view(None, &columns, Some(&private), Some(&main)),
+                note_read_view(
+                    None,
+                    NoteVia::Shortcut,
+                    &columns,
+                    Some(&private),
+                    Some(&main)
+                ),
                 Ok(&main)
             );
             assert_eq!(
-                note_read_view::<u8>(None, &[], None, None),
+                note_read_view::<u8>(None, NoteVia::Shortcut, &[], None, None),
                 Err(NoteCapture::NoPage)
             );
         }
@@ -39568,6 +40378,325 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
                     );
                 }
                 other => panic!("criar devolveu {other:?}"),
+            }
+        }
+
+        /// Gate: o "Salvar nota" da barra que embarca pede a nota (`note`
+        /// com `via: bar`, sem dados da pagina) -- tambem no Split privado,
+        /// onde o Ctrl+Shift+Z continua recusado --, e o nativo grava UMA
+        /// nota com a fonte que ele conhece da WebView: o `url` e o `title`
+        /// que a pagina devolve nao entram. O mesmo texto antes de 2 s nao e
+        /// outra nota. Nada vai ao historico nem a memoria, e no privado o
+        /// aviso diz que a nota foi guardada.
+        #[test]
+        fn salvar_nota_saves_one_note_with_the_native_source_and_never_twice_in_two_seconds() {
+            // 1. A barra que embarca, normal e no Split privado.
+            let press = r#"
+__show('  Linha 1\r\nLinha 2  ');
+__press('note');
+__state('salva');
+"#;
+            let results = run_selection_cases(vec![
+                selection_case(
+                    "normal",
+                    &bind_page_script(NEURALIA_KEYMAP_SCRIPT, SELECTION_CAP, false),
+                    "",
+                    &[press],
+                ),
+                selection_case(
+                    "split-privado",
+                    &split_page(1, "ChatGPT", SELECTION_CAP, true).init_script,
+                    "",
+                    &[press],
+                ),
+            ]);
+            for result in &results {
+                let name = result["name"].as_str().expect("name");
+                assert_eq!(
+                    selection_posted(result),
+                    vec![IpcAction::Note { via: NoteVia::Bar }],
+                    "{name}"
+                );
+                let sent = result["posted"][0].as_str().expect("posted");
+                let value: serde_json::Value = serde_json::from_str(sent).expect("json");
+                assert_eq!(
+                    value["args"],
+                    serde_json::json!({"via":"bar"}),
+                    "{name}: a pagina mandou dados"
+                );
+                assert_eq!(
+                    selection_states(result)["salva"]["shown"],
+                    false,
+                    "{name}: a barra ficou"
+                );
+            }
+
+            // 2. O pedido chega da coluna, do Split (tambem o privado) e da
+            //    WebView unica; so o Ctrl+Shift+Z e recusado no privado.
+            let bar = IpcAction::Note { via: NoteVia::Bar };
+            for col in 0..COMPARATOR_COLUMNS {
+                assert!(matches!(
+                    App::column_ipc_event_impl(col, bar.clone()),
+                    Some(UserEvent::NoteRequested {
+                        target: Some(PageTarget::Column(c)),
+                        via: NoteVia::Bar
+                    }) if c == col
+                ));
+            }
+            for private in [false, true] {
+                assert!(
+                    matches!(
+                        App::split_ipc_event_impl(1, private, bar.clone()),
+                        Some(UserEvent::NoteRequested {
+                            target: Some(PageTarget::Split),
+                            via: NoteVia::Bar
+                        })
+                    ),
+                    "Split privado={private}"
+                );
+            }
+            assert!(matches!(
+                common_ipc_event(bar.clone()),
+                Some(UserEvent::NoteRequested {
+                    target: None,
+                    via: NoteVia::Bar
+                })
+            ));
+            assert_eq!(
+                note_capture_decision(Some(PageTarget::Split), NoteVia::Bar, Some(true)),
+                NoteCapture::Read,
+                "o Salvar nota do Split privado nao leu a pagina"
+            );
+            let columns: Vec<ComparatorView<u8>> = [(10u8, "a"), (11, "b"), (12, "c")]
+                .into_iter()
+                .map(|(webview, name)| ComparatorView { webview, name })
+                .collect();
+            let private_split = SplitView {
+                webview: 90u8,
+                source_index: 0,
+                context_id: None,
+                fullscreen: false,
+                private: true,
+            };
+            assert_eq!(
+                note_read_view(
+                    Some(PageTarget::Split),
+                    NoteVia::Bar,
+                    &columns,
+                    Some(&private_split),
+                    Some(&70)
+                ),
+                Ok(&90)
+            );
+
+            // 3. A fonte e a que o nativo conhece: o `Source` da WebView (ou o
+            //    artigo do Leitor, o PDF); o Ctrl+Shift+Z nem a pede.
+            let native = "https://example.com/artigo#parte";
+            let webview_url = || Some(native.to_string());
+            assert_eq!(
+                note_capture_source(
+                    NoteVia::Bar,
+                    Some(PageTarget::Column(0)),
+                    Surface::Comparator,
+                    None,
+                    webview_url
+                )
+                .as_deref(),
+                Some(native)
+            );
+            assert_eq!(
+                note_capture_source(NoteVia::Bar, None, Surface::External, None, webview_url)
+                    .as_deref(),
+                Some(native)
+            );
+            assert_eq!(
+                note_capture_source(
+                    NoteVia::Bar,
+                    None,
+                    Surface::Reader,
+                    Some("https://example.com/doc"),
+                    || Some("about:blank".to_string())
+                )
+                .as_deref(),
+                Some("https://example.com/doc"),
+                "no Leitor manda o artigo aberto"
+            );
+            assert_eq!(
+                note_capture_source(
+                    NoteVia::Shortcut,
+                    Some(PageTarget::Split),
+                    Surface::Comparator,
+                    None,
+                    || unreachable!("o Ctrl+Shift+Z nao le o Source")
+                ),
+                None
+            );
+
+            // 4. A resposta da pagina mente no endereco e no titulo: nenhum
+            //    dos dois entra na nota.
+            let capture = |text: &str| {
+                serde_json::json!({
+                    "text": text,
+                    "url": "https://evil.example/phish",
+                    "title": "Titulo falso da pagina"
+                })
+                .to_string()
+            };
+            let t0 = Instant::now();
+            let mut guard = BarNoteGuard::default();
+            let draft = match bar_note_step(
+                &mut guard,
+                &capture("  Linha 1\r\nLinha 2  "),
+                Some(native),
+                t0,
+            ) {
+                BarNoteStep::Save(draft) => draft,
+                other => panic!("o Salvar nota nao gravou: {other:?}"),
+            };
+            assert_eq!(
+                draft,
+                NoteDraft {
+                    title: "Linha 1 Linha 2".to_string(),
+                    body: format!("> Linha 1\n> Linha 2\n\nFonte: {native}\n"),
+                    tags: vec!["web".to_string()],
+                    source: Some(native.to_string()),
+                }
+            );
+            // Sem fonte nativa que sirva: sem fonte -- nunca a da pagina.
+            for unusable in [
+                None,
+                Some("about:blank"),
+                Some("file:///C:/Windows/win.ini"),
+            ] {
+                match bar_note_step(
+                    &mut BarNoteGuard::default(),
+                    &capture("texto"),
+                    unusable,
+                    t0,
+                ) {
+                    BarNoteStep::Save(draft) => {
+                        assert_eq!(draft.source, None, "{unusable:?}");
+                        assert_eq!(draft.body, "> texto\n", "{unusable:?}");
+                    }
+                    other => panic!("{unusable:?}: {other:?}"),
+                }
+            }
+            // O titulo e o inicio da selecao, com "…" se ela continua; o
+            // aviso diz-lo, ou diz que foi no modo privado.
+            let long = "palavra ".repeat(20);
+            assert_eq!(
+                bar_note_title(&long),
+                format!("{}…", "palavra ".repeat(7).trim_end())
+            );
+            assert_eq!(bar_note_title("  curta\n "), "curta");
+            assert_eq!(
+                bar_note_title(&"x".repeat(100)),
+                format!("{}…", "x".repeat(60))
+            );
+            assert_eq!(bar_note_title(&"y".repeat(60)), "y".repeat(60));
+            assert_eq!(
+                bar_note_notice(false, "Linha 1 Linha 2"),
+                "Nota salva: Linha 1 Linha 2"
+            );
+            assert_eq!(
+                bar_note_notice(true, "Linha 1 Linha 2"),
+                "Modo privado: a nota foi guardada"
+            );
+            // Nada selecionado, ou uma resposta que nao e a do script.
+            assert_eq!(
+                bar_note_step(
+                    &mut BarNoteGuard::default(),
+                    &capture("  \n "),
+                    Some(native),
+                    t0
+                ),
+                BarNoteStep::Refused(NoteCaptureError::EmptySelection)
+            );
+            assert_eq!(
+                bar_note_step(&mut BarNoteGuard::default(), "null", Some(native), t0),
+                BarNoteStep::Refused(NoteCaptureError::Unreadable)
+            );
+
+            // 5. Pela pasta, com o trabalho do worker: dois cliques no mesmo
+            //    texto em menos de 2 s sao UMA nota; outro texto conta; o
+            //    mesmo texto 2 s depois tambem.
+            let dir = NotesDir::new("bar");
+            let store = dir.store();
+            let mut guard = BarNoteGuard::default();
+            let ms = |value: u64| Duration::from_millis(value);
+            let mut saved = Vec::new();
+            for (text, at) in [
+                ("Linha 1\nLinha 2", ms(0)),
+                ("Linha 1\nLinha 2", ms(300)),
+                ("  Linha 1\r\nLinha 2 ", ms(1_900)),
+                ("Outro texto", ms(1_950)),
+                ("Linha 1\nLinha 2", ms(2_000)),
+            ] {
+                if let BarNoteStep::Save(draft) =
+                    bar_note_step(&mut guard, &capture(text), Some(native), t0 + at)
+                {
+                    match run_notes_command(&store, NotesCommand::Create(draft), T0) {
+                        NotesReply::Opened {
+                            cause: NoteOpened::Created,
+                            note,
+                            ..
+                        } => saved.push(note),
+                        other => panic!("criar devolveu {other:?}"),
+                    }
+                }
+            }
+            assert_eq!(
+                saved
+                    .iter()
+                    .map(|note| note.title.as_str())
+                    .collect::<Vec<_>>(),
+                ["Linha 1 Linha 2", "Outro texto", "Linha 1 Linha 2"],
+                "o mesmo texto em menos de 2 s virou outra nota"
+            );
+            let files: Vec<String> = std::fs::read_dir(&dir.0)
+                .expect("pasta")
+                .filter_map(|entry| {
+                    let path = entry.ok()?.path();
+                    (path.extension()? == "md")
+                        .then(|| std::fs::read_to_string(&path).expect("nota"))
+                })
+                .collect();
+            assert_eq!(files.len(), 3, "notas no disco: {files:?}");
+            for text in &files {
+                assert!(text.contains(&format!("source: {native}")), "{text}");
+                assert!(!text.contains("evil.example"), "{text}");
+                assert!(!text.contains("Titulo falso"), "{text}");
+            }
+
+            // 6. O caminho do App: o "Salvar nota" so manda criar a nota e so
+            //    mostra o aviso -- nem historico, nem memoria, nem o painel
+            //    (asserção de ausencia sobre o texto; ver AGENTS.md §4.3).
+            let source = shipped_source();
+            let arm = source
+                .split("NoteVia::Bar => match bar_note_step(")
+                .nth(1)
+                .and_then(|part| part.split("match draft {").next())
+                .expect("o ramo do Salvar nota em note_captured");
+            assert!(arm.contains("NotesCommand::Create(draft), NotesOrigin::Bar { private }"));
+            let reply = source
+                .split("NotesOrigin::Bar { private } => match &reply {")
+                .nth(1)
+                .and_then(|part| part.split("NotesOrigin::Closed =>").next())
+                .expect("a resposta do Salvar nota em notes_ready");
+            assert!(reply.contains("bar_note_notice(private, &note.title)"));
+            for forbidden in [
+                "record(",
+                "memory",
+                "history",
+                "compare(",
+                "show_notes_panel",
+                "current_research",
+            ] {
+                assert!(
+                    !arm.contains(forbidden),
+                    "o Salvar nota passa por {forbidden}"
+                );
+                assert!(!reply.contains(forbidden), "o aviso passa por {forbidden}");
             }
         }
 
@@ -40854,8 +41983,10 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
 
   // Barra de selecao (pedido do dono: "quando eu selecionar um texto, tem
   // que aparecer a pergunta mandar para pesquisa ? ou copiar ? ou falar ?
-  // 3 botoes"). Vive neste script porque e o que todas as paginas recebem.
-  // Se faltar uma primitiva, a barra fica desligada e os atalhos seguem.
+  // 3 botoes"; na 2.2.0: "mandar para ia ?, salva no zetelkast, traduzir ?,
+  // copiar ?" -- quatro botoes e um "⋯" com o resto). Vive neste script
+  // porque e o que todas as paginas recebem. Se faltar uma primitiva, a
+  // barra fica desligada e os atalhos seguem.
   let selectionBar = null;
   try { selectionBar = createSelectionBar(); } catch (err) { selectionBar = null; }
 
@@ -40951,6 +42082,13 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     const keyShift = getterOf(KeyboardEvent.prototype, 'shiftKey');
     const keyCtrl = getterOf(KeyboardEvent.prototype, 'ctrlKey');
     const keyMeta = getterOf(KeyboardEvent.prototype, 'metaKey');
+    // O foco do menu "⋯" (teclado): pelos metodos capturados. Sem eles o
+    // menu abre na mesma, so o teclado nao entra nele.
+    const Html = typeof HTMLElement === 'function' ? HTMLElement : null;
+    const focusOn = Html && typeof Html.prototype.focus === 'function'
+      ? uncurry(Html.prototype.focus) : null;
+    const blurOf = Html && typeof Html.prototype.blur === 'function'
+      ? uncurry(Html.prototype.blur) : null;
     const execCommand = typeof Document.prototype.execCommand === 'function'
       ? uncurry(Document.prototype.execCommand) : null;
     const clip = typeof navigator !== 'undefined' ? navigator.clipboard : null;
@@ -40994,16 +42132,19 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     const watchOn = Watch ? uncurry(Watch.prototype.observe) : null;
 
     // Painel privado: o texto nunca sai para o comparador (historico e
-    // memoria). O nativo tambem recusa o `search` destes WebViews.
+    // memoria) -- nem Mandar para IA nem Traduzir. O nativo tambem recusa o
+    // `search` destes WebViews. Salvar nota fica: e local e pedido por quem
+    // le.
     const searchAllowed = '__NEURALIA_PRIVATE__' === 'false';
     const SHOW_MAX = 5000;
     const SEARCH_MAX = 2000;
     const SHOW_DELAY_MS = 200;
-    // Pesquisar so PEDE a pesquisa: o nativo mostra o texto num cartao seu
-    // ("Pesquisar nas 3 IAs?") e so um clique nesse cartao a faz. A pagina
-    // pode encolher ou tornar transparente esta barra de formas que daqui nao
-    // se veem; o cartao ela nao alcanca. Antes de pedir, a barra ainda exige
-    // estar parada e a vista ha pelo menos isto.
+    // Mandar para IA e Traduzir so PEDEM: o nativo mostra o texto num cartao
+    // seu ("Mandar para as 3 IAs?", "Traduzir nas 3 IAs?") e so um clique
+    // nesse cartao o envia. A pagina pode encolher ou tornar transparente
+    // esta barra de formas que daqui nao se veem; o cartao ela nao alcanca.
+    // Antes de pedir -- e antes de Salvar nota -- a barra ainda exige estar
+    // parada e a vista ha pelo menos isto.
     const ARM_MS = 500;
     // Menos do que isto entre o mousedown e o mouseup e um clique, nao um
     // arrasto: nao escolhe texto.
@@ -41013,13 +42154,21 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     const SPEECH_CHUNK = 200;
     const SPEECH_ABBREVIATION = 5;
     const MARGIN = 8;
-    const TOO_LONG = 'Seleção grande demais para pesquisar (máx. 2000 caracteres)';
-    const TOO_SOON = 'Clique de novo em Pesquisar';
-    const TAMPERED = 'A página cobriu ou alterou esta barra: a pesquisa não foi enviada';
+    const TOO_LONG = 'Seleção grande demais para as IAs (máx. 2000 caracteres)';
+    // Clicado cedo demais: o nome do botao que foi.
+    const TOO_SOON = {
+      ask: 'Clique de novo em Mandar para IA',
+      note: 'Clique de novo em Salvar nota',
+      translate: 'Clique de novo em Traduzir'
+    };
+    const TAMPERED = 'A página cobriu ou alterou esta barra: o pedido não foi enviado';
     const LABELS = {
-      search: '\u{1F50E} Pesquisar',
+      ask: '\u{1F916} Mandar para IA',
+      note: '\u{1F4DD} Salvar nota',
+      translate: '\u{1F310} Traduzir',
       copy: '\u{1F4CB} Copiar',
       copied: '✓ Copiado',
+      more: '\u{22EF}',
       speak: '\u{1F50A} Falar',
       stop: '⏹ Parar'
     };
@@ -41027,28 +42176,55 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       '.bar{display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:4px;',
       'border-radius:22px;background:#ffffff;color:#111314;',
       'border:1px solid rgba(0,0,0,.14);box-shadow:0 8px 28px rgba(0,0,0,.22);',
-      'font:600 13px "Segoe UI",system-ui,sans-serif;max-width:420px;',
+      'font:600 13px "Segoe UI",system-ui,sans-serif;max-width:560px;',
       'user-select:none;-webkit-user-select:none;cursor:default}',
       'button{all:unset;box-sizing:border-box;display:inline-flex;align-items:center;',
-      'gap:6px;min-height:34px;padding:0 14px;border-radius:999px;cursor:pointer;',
+      'gap:6px;min-height:34px;padding:0 12px;border-radius:999px;cursor:pointer;',
       'color:inherit;font:inherit;white-space:nowrap}',
       'button:hover{background:rgba(0,0,0,.08)}',
+      'button:focus-visible{outline:2px solid #1a73e8;outline-offset:-2px}',
+      '.more{min-width:34px;justify-content:center;padding:0 10px}',
       '.solo .act{display:none}',
+      '.menu{display:none;flex-basis:100%;flex-direction:column;align-items:stretch;',
+      'gap:2px;padding:4px 0 0;border-top:1px solid rgba(0,0,0,.10)}',
+      '.menu.on{display:flex}',
+      '.menu button{border-radius:12px}',
       '.msg{display:none;flex-basis:100%;padding:6px 12px;font-weight:500;line-height:1.35}',
       '.msg.on{display:block}',
       '@media (prefers-color-scheme: dark){',
       '.bar{background:#1c1f22;color:#f1f3f4;border-color:rgba(255,255,255,.16);',
       'box-shadow:0 8px 28px rgba(0,0,0,.55)}',
-      'button:hover{background:rgba(255,255,255,.12)}}'
+      '.menu{border-top-color:rgba(255,255,255,.14)}',
+      'button:hover{background:rgba(255,255,255,.12)}',
+      'button:focus-visible{outline-color:#8ab4f8}}'
     ].join('');
+    // O menu "⋯": o que nao cabe na barra, pela ordem em que aparece. Lista
+    // fechada, e so com o que ja existe -- nunca um botao morto. O Explicar
+    // (uma frase de explicacao, pelo modelo local ou pelo fornecedor) e o
+    // Extrair (tabela da pagina, Web-to-Data) sao as proximas ondas da 2.2.0
+    // e entram AQUI, como entradas desta lista, quando o caminho deles
+    // existir. `ready` diz se a entrada tem o que precisa neste documento.
+    const MORE_MENU = [
+      { name: 'speak', label: LABELS.speak, run: toggleSpeech, ready: !!speakNow }
+    ];
 
     let host = null;
     let bar = null;
     let note = null;
     const buttons = Object.create(null);
+    // O "⋯", o menu que ele abre, as entradas (e o que cada uma faz, para o
+    // teclado) e a que tem o foco.
+    let moreButton = null;
+    let menu = null;
+    const menuItems = [];
+    const menuRuns = [];
+    let menuOpen = false;
+    let menuAt = 0;
+    let menuFocused = null;
     let visible = false;
-    // O texto de Copiar e Pesquisar: a selecao que a barra mostra agora.
-    // Vazio enquanto se le algo que ja nao esta selecionado.
+    // O texto de Mandar, Salvar nota, Traduzir e Copiar: a selecao que a
+    // barra mostra agora. Vazio enquanto se le algo que ja nao esta
+    // selecionado.
     let text = '';
     let shownAt = null;
     let placed = null;
@@ -41254,10 +42430,11 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       if (voiceTimer) { cancelLater(voiceTimer); voiceTimer = 0; }
     }
 
-    function button(name, label, run, kind) {
+    function button(parent, name, label, run, kind) {
       const b = makeElement(document, 'button');
       setAttr(b, 'type', 'button');
       // Fora da ordem do Tab e sem foco ao clicar: o foco fica na pagina.
+      // (O menu "⋯" da o foco as entradas dele ao abrir, para o teclado.)
       setAttr(b, 'tabindex', '-1');
       setAttr(b, 'data-action', name);
       if (kind) setAttr(b, 'class', kind);
@@ -41271,7 +42448,102 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
         run();
       }));
       buttons[name] = b;
-      appendTo(bar, b);
+      appendTo(parent, b);
+      return b;
+    }
+
+    // O "⋯" e o menu dele, na mesma shadow root fechada: so com as entradas
+    // de MORE_MENU que este documento tem como fazer. Sem nenhuma, nem o
+    // "⋯" aparece.
+    function buildMenu() {
+      const offered = [];
+      for (let i = 0; i < MORE_MENU.length; i++) {
+        if (MORE_MENU[i].ready) pushTo(offered, MORE_MENU[i]);
+      }
+      if (!offered.length) return;
+      moreButton = button(bar, 'more', LABELS.more, toggleMenu, 'more');
+      setAttr(moreButton, 'aria-label', 'Mais');
+      setAttr(moreButton, 'title', 'Mais');
+      setAttr(moreButton, 'aria-haspopup', 'menu');
+      setAttr(moreButton, 'aria-expanded', 'false');
+      menu = makeElement(document, 'div');
+      setAttr(menu, 'class', 'menu');
+      setAttr(menu, 'role', 'menu');
+      setAttr(menu, 'aria-label', 'Mais');
+      appendTo(bar, menu);
+      for (let i = 0; i < offered.length; i++) {
+        const item = button(menu, offered[i].name, offered[i].label, offered[i].run, 'item');
+        setAttr(item, 'role', 'menuitem');
+        pushTo(menuItems, item);
+        pushTo(menuRuns, offered[i].run);
+      }
+      // Setas, Home/End, Enter/Espaco e Tab dentro do menu. O Esc passa
+      // antes pelo mapa de teclas (`dismiss`), que fecha o menu.
+      listen(menu, 'keydown', guard(menuKey));
+    }
+
+    // A entrada `index` (em volta: da ultima volta-se a primeira) passa a
+    // ter o foco.
+    function focusItem(index) {
+      const count = menuItems.length;
+      if (!count) return;
+      menuAt = ((index % count) + count) % count;
+      menuFocused = menuItems[menuAt];
+      if (focusOn) { try { focusOn(menuFocused, { preventScroll: true }); } catch (err) {} }
+    }
+
+    // `focus`: o clique no "⋯" leva o foco a primeira entrada, e dai o
+    // teclado anda no menu. Aberto sozinho (a ler, sem selecao) nao tira o
+    // foco a pagina.
+    function openMenu(focus) {
+      if (!menu) return;
+      if (!menuOpen) {
+        menuOpen = true;
+        setAttr(menu, 'class', 'menu on');
+        setAttr(moreButton, 'aria-expanded', 'true');
+        if (visible && shownAt) place(shownAt);
+      }
+      if (focus) focusItem(0);
+    }
+
+    // Fecha o menu; o foco que estava nele volta a pagina.
+    function closeMenu() {
+      if (!menu || !menuOpen) return;
+      menuOpen = false;
+      setAttr(menu, 'class', 'menu');
+      setAttr(moreButton, 'aria-expanded', 'false');
+      const had = menuFocused;
+      menuFocused = null;
+      menuAt = 0;
+      if (had && blurOf) { try { blurOf(had); } catch (err) {} }
+      if (visible && shownAt) place(shownAt);
+    }
+
+    function toggleMenu() {
+      if (menuOpen) closeMenu(); else openMenu(true);
+    }
+
+    function menuKey(e) {
+      if (!e.isTrusted || !menuOpen) return;
+      const key = lower(toStr(keyOf(e) || ''));
+      if (key === 'arrowdown') {
+        prevent(e); focusItem(menuAt + 1);
+      } else if (key === 'arrowup') {
+        prevent(e); focusItem(menuAt - 1);
+      } else if (key === 'home') {
+        prevent(e); focusItem(0);
+      } else if (key === 'end') {
+        prevent(e); focusItem(menuItems.length - 1);
+      } else if (key === 'enter' || key === ' ') {
+        // O clique que o navegador faria a seguir nao chega: uma vez so.
+        prevent(e);
+        stopHere(e);
+        const run = menuRuns[menuAt];
+        if (run) run();
+      } else if (key === 'escape' || key === 'tab') {
+        if (key === 'escape') prevent(e);
+        closeMenu();
+      }
     }
 
     // Montada ja no document-created (fora da arvore ate a primeira vez):
@@ -41314,9 +42586,17 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       setAttr(bar, 'role', 'toolbar');
       setAttr(bar, 'aria-label', 'Texto selecionado');
       appendTo(root, bar);
-      if (searchAllowed) button('search', LABELS.search, search, 'act');
-      button('copy', LABELS.copy, copy, 'act');
-      if (speakNow) button('speak', LABELS.speak, toggleSpeech, '');
+      // Pela ordem do pedido do dono. No painel privado nem Mandar nem
+      // Traduzir existem: o texto dele nao sai para as IAs.
+      if (searchAllowed) {
+        button(bar, 'ask', LABELS.ask, function () { toAis('ask'); }, 'act');
+      }
+      button(bar, 'note', LABELS.note, saveNote, 'act');
+      if (searchAllowed) {
+        button(bar, 'translate', LABELS.translate, function () { toAis('translate'); }, 'act');
+      }
+      button(bar, 'copy', LABELS.copy, copy, 'act');
+      buildMenu();
       note = makeElement(document, 'div');
       setAttr(note, 'class', 'msg');
       setAttr(note, 'role', 'status');
@@ -41371,6 +42651,9 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       shownAt = snap;
       clearFeedback();
       setAttr(bar, 'class', 'bar');
+      // Uma selecao nova e uma barra nova; a ler, o menu fica como estava
+      // (com o Parar a mao).
+      if (!speaking) closeMenu();
       say('');
       pin();
       important(host, 'visibility', 'hidden');
@@ -41392,11 +42675,13 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       seenAt = 0;
       gestureText = null;
       pressReady = 'alterada';
+      closeMenu();
     }
 
     // A ler, a barra fica (o Parar tem de estar a mao), mas sem a selecao
-    // antiga: Copiar e Pesquisar nao agem sobre texto que ja nao esta
-    // selecionado.
+    // antiga: Mandar, Salvar nota, Traduzir e Copiar nao agem sobre texto
+    // que ja nao esta selecionado. Fica o "⋯" com o menu aberto no Parar,
+    // sem tirar o foco a pagina: um clique para calar, como antes.
     function retire() {
       if (showTimer) { cancelLater(showTimer); showTimer = 0; }
       clearFeedback();
@@ -41404,6 +42689,7 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       gestureText = null;
       setAttr(bar, 'class', 'bar solo');
       say('');
+      openMenu(false);
     }
 
     function drop() {
@@ -41428,9 +42714,14 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       showTimer = later(guard(check), SHOW_DELAY_MS);
     }
 
-    // Esc: fecha a barra (e cala a leitura) em vez de voltar atras. Sem
-    // barra a vista, o Esc segue para o 'back' de sempre.
+    // Esc: fecha a barra (e cala a leitura) em vez de voltar atras. Com o
+    // menu "⋯" aberto e nada a ler, fecha so o menu. Sem barra a vista, o
+    // Esc segue para o 'back' de sempre.
     function dismiss() {
+      if (menuOpen && visible && !speaking) {
+        closeMenu();
+        return true;
+      }
       const busy = visible || speaking;
       stopSpeech();
       hide();
@@ -41456,10 +42747,10 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
         && unset(style, 'content-visibility', 'visible'));
     }
 
-    // Pronta para um clique em Pesquisar: '' se sim; 'cedo' se ainda nao
-    // esta a vista ha ARM_MS; 'alterada' se a pagina a tapou, moveu, mudou
-    // de sitio na arvore ou lhe mexeu no estilo (a propria ou a raiz do
-    // documento).
+    // Pronta para um clique em Mandar, Salvar nota ou Traduzir: '' se sim;
+    // 'cedo' se ainda nao esta a vista ha ARM_MS; 'alterada' se a pagina a
+    // tapou, moveu, mudou de sitio na arvore ou lhe mexeu no estilo (a
+    // propria ou a raiz do documento).
     function readiness() {
       if (!visible || !placed) return 'alterada';
       const root = rootOf(document);
@@ -41477,23 +42768,46 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       return '';
     }
 
-    // A pergunta vai inteira ou nao vai: acima do tecto nada sai da pagina
-    // e a barra diz porque. O `search` abre o cartao nativo de confirmacao;
-    // nada e pesquisado sem o clique la.
-    function search() {
-      if (!text) return;
+    // O clique conta com o estado da barra quando o botao desceu e agora.
+    // Nao pronta: nada sai, e a barra diz porque (com o nome do botao).
+    function armed(action) {
       const ready = pressReady || readiness();
       pressReady = 'alterada';
-      if (ready) { say(ready === 'cedo' ? TOO_SOON : TAMPERED); return; }
+      if (ready) { say(ready === 'cedo' ? TOO_SOON[action] : TAMPERED); return false; }
+      return true;
+    }
+
+    // Mandar para IA ('ask') e Traduzir ('translate'). A pergunta vai
+    // inteira ou nao vai: acima do tecto nada sai da pagina e a barra diz
+    // porque. O `search` abre o cartao nativo de confirmacao; nada chega as
+    // IAs sem o clique la -- e o pedido de traducao e escrito pelo nativo,
+    // a pagina so diz qual dos dois botoes foi.
+    function toAis(intent) {
+      if (!text) return;
+      if (!armed(intent)) return;
       const question = searchable(text);
       if (!question) { hide(); return; }
       if (codePoints(question) > SEARCH_MAX) { say(TOO_LONG); return; }
       stopSpeech();
       // Envelope montado so com strings: o serializador nunca ve um objeto
-      // em que a pagina possa pendurar um toJSON.
+      // em que a pagina possa pendurar um toJSON. `intent` e um dos dois
+      // literais acima, nunca texto da pagina.
       post('{"v":1,"cap":"' + capability + '","action":"search","args":{"text":'
-        + stringify(question) + '}}');
+        + stringify(question) + ',"intent":"' + (intent === 'translate' ? 'translate' : 'ask')
+        + '"}}');
       hide();
+    }
+
+    // Salvar nota: local, sem cartao. So PEDE a nota (`note` com
+    // `via: bar`): o texto e lido pelo nativo na propria WebView, e a fonte
+    // que fica na nota e o endereco que o nativo conhece dela -- nunca um que
+    // a pagina diga. O mesmo filtro de clique que o Mandar.
+    function saveNote() {
+      if (!text) return;
+      if (!armed('note')) return;
+      if (!searchable(text)) { hide(); return; }
+      post('{"v":1,"cap":"' + capability + '","action":"note","args":{"via":"bar"}}');
+      drop();
     }
 
     function copied(ok) {
@@ -41732,8 +43046,8 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     listen(window, 'mousedown', guard(function (e) {
       if (ours(targetOf(e))) {
         prevent(e);
-        // O clique em Pesquisar conta com o estado da barra quando o botao
-        // desceu, e outra vez quando sobe.
+        // O clique em Mandar, Salvar nota ou Traduzir conta com o estado da
+        // barra quando o botao desceu, e outra vez quando sobe.
         pressReady = e.isTrusted ? readiness() : 'alterada';
         return;
       }
