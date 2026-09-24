@@ -81,8 +81,9 @@ Ctrl+Shift+Z from the private split is refused ("Modo privado: notas não são
 criadas") without reading the page, and the split's privacy is checked again
 when the read would happen. A Salvar nota from the private split is an
 explicit request from the reader and is saved; its notice then says "Modo
-privado: a nota foi guardada". Both the choice of WebView and that check live
-in `note_read_view`, which the shipped `request_note_from_page` calls. Gates:
+privado: a nota foi guardada". The choice of WebView, that check and whether
+the WebView read is the private split's (which picks that notice) all come
+from `note_read_view`, which the shipped `request_note_from_page` calls. Gates:
 `note_is_a_bare_request_and_carries_no_page_data` (`ipc.rs`),
 `ctrl_shift_z_on_a_page_posts_a_bare_note_request`,
 `a_note_request_reads_its_own_webview_and_never_the_private_split`,
