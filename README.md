@@ -195,7 +195,8 @@ Opening a document asks once per session whether to advance the page automatical
 (**Sim** / **Não**, bottom centre). With **Sim**, the page moves one screen every
 30 seconds and stops at the end. HTML and comparator surfaces advance by script;
 PDFs use NeuralIA's bundled offline PDF.js viewer and advance page-by-page. `F8` toggles
-it at any time. EPUB is not supported: WebView2 does not open it.
+it at any time. EPUB files do not open in WebView2; NeuralIA opens them in its own library and
+reader instead (`livros:` or a `.epub` path in the omnibox, `Ctrl+O` on Home).
 
 ## v1.0.1 hardening baseline
 

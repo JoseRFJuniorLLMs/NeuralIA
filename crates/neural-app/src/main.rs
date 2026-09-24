@@ -8,6 +8,10 @@
 // de `cfg(target_os = "windows")` por arrastamento, o que deixava a superfície
 // mais sensível do produto sem ser compilada nem testada fora do Windows.
 // Fora do Windows ninguém o chama ainda; daí o `allow(dead_code)`.
+// O leitor de EPUB (servidor da origem, parser do IPC, worker da biblioteca)
+// também é portátil: os gates correm no runner Linux do CI.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod epub_app;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod ipc;
 // Botoes da janela na Home, largura do painel lateral, roda do rato sobre ele
