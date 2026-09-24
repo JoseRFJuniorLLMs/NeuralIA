@@ -8,7 +8,7 @@ use std::{
     sync::{
         Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
-        mpsc::{SyncSender, sync_channel},
+        mpsc::{Sender, SyncSender, channel, sync_channel},
     },
     thread,
     time::{Duration, Instant},
@@ -2797,12 +2797,20 @@ fn take_note_draft_on_close(draft: &mut Option<NoteEdit>) -> Option<NotesCommand
 
 /// O painel do Ctrl+H e o texto de uma nota a meio, num bloco so.
 ///
-/// A WebView do painel so sai daqui por `SidePanel::dismiss`, e essa grava
-/// primeiro o que o editor tinha por salvar e so DEPOIS larga a vista. Os
-/// campos sao privados deste modulo: o `App` nao tem como largar o painel
-/// por outro caminho (um `take()` direto, como o que o `destroy_web_surfaces`
-/// fazia, ja nem compila). E os pedidos da pagina so chegam ao `App` por
-/// `SidePanel::receive`, que segue a copia do editor antes de os entregar.
+/// O caminho normal de saida e `SidePanel::dismiss` (o `App` chama-o por
+/// `close_side_panel`): grava primeiro o que o editor tinha por salvar, e so
+/// DEPOIS larga a vista e devolve o teclado. Os campos sao privados deste
+/// modulo, por isso um `take()` direto da vista (o que o
+/// `destroy_web_surfaces` fazia) nao compila. Largar o painel INTEIRO por
+/// outro caminho compila -- uma atribuicao por cima
+/// (`self.side_panel = SidePanel::closed(..)`), um `mem::replace`, um `drop`,
+/// o `App` a sair --, mas nao perde o texto: o painel leva consigo quem grava
+/// (`DraftRescue`) e o `Drop` dele manda o rascunho para a fila das notas
+/// antes de a vista sair, uma vez so (depois de `dismiss` ja nao ha
+/// rascunho). O que esse caminho nao faz e devolver o teclado. So um
+/// `mem::forget` do painel, ou o processo morto a meio, passa por cima. E os
+/// pedidos da pagina so chegam ao `App` por `SidePanel::receive`, que segue
+/// a copia do editor antes de os entregar.
 ///
 /// Fica uma janela de ate 200 ms: a pagina manda a copia (`note-draft`) no
 /// maximo 200 ms depois de uma tecla, mesmo a escrever sem parar, e o que se
@@ -2873,13 +2881,14 @@ mod side_panel {
         }
     }
 
-    /// Quem grava o rascunho: o worker das notas (`ZettelWorker`).
+    /// Quem grava o rascunho: o worker das notas (`ZettelWorker`). O painel
+    /// leva o seu, para o `Drop` ter por onde gravar.
     pub(super) trait DraftRescue {
-        /// Poe a gravacao na fila, sem esperar pelo disco e sem a deitar
-        /// fora com a fila cheia. `Err`: o aviso para o utilizador.
+        /// Poe a gravacao no fim da fila, sem esperar pelo disco e sem a
+        /// deitar fora com a fila cheia. `Err`: o aviso para o utilizador.
         fn rescue(&self, command: NotesCommand) -> Result<(), String>;
-        /// Espera, ate `limit`, que tudo o que ja esta na fila chegue ao
-        /// disco.
+        /// Espera, ate `limit`, que tudo o que ja esta na fila -- o que
+        /// `rescue` pos la antes incluido -- chegue ao disco.
         fn settle(&self, limit: Duration);
     }
 
@@ -2927,10 +2936,13 @@ mod side_panel {
     }
 
     /// O painel do Ctrl+H: a vista (a `WebView` no app, uma de mentira nos
-    /// gates), a copia do que o editor tem por salvar e os scripts que
-    /// esperam pelo "ready" da pagina.
-    pub(super) struct SidePanel<W> {
+    /// gates), a copia do que o editor tem por salvar, quem a grava e os
+    /// scripts que esperam pelo "ready" da pagina.
+    pub(super) struct SidePanel<W, N: DraftRescue> {
         view: Option<W>,
+        /// Quem grava o rascunho: o `dismiss`, o `receive` de uma pagina que
+        /// ja saiu e o `Drop`.
+        notes: N,
         /// A pagina viva.
         page: u64,
         /// O ultimo numero dado por `ticket`.
@@ -2944,10 +2956,12 @@ mod side_panel {
         pending: Vec<String>,
     }
 
-    impl<W: PanelView> SidePanel<W> {
-        pub(super) const fn closed() -> Self {
+    impl<W: PanelView, N: DraftRescue> SidePanel<W, N> {
+        /// Sem pagina, com `notes` para gravar o que as paginas deixarem.
+        pub(super) fn closed(notes: N) -> Self {
             Self {
                 view: None,
+                notes,
                 page: 0,
                 issued: 0,
                 draft: None,
@@ -2971,8 +2985,8 @@ mod side_panel {
         }
 
         /// A pagina nova, com o numero que o canal dela leva. Com um painel
-        /// ja aberto a vista nova volta para o chamador: a aberta so sai por
-        /// `dismiss`.
+        /// ja aberto a vista nova volta para o chamador: a aberta nao e
+        /// substituida aqui.
         pub(super) fn open(&mut self, ticket: PanelTicket, view: W) -> Result<(), W> {
             if self.view.is_some() {
                 return Err(view);
@@ -2988,7 +3002,7 @@ mod side_panel {
         /// pedido vai para o `App`. De uma que ja saiu: o texto que trazia vai
         /// ja para o disco -- nao fica a espera de um painel que nao volta, e
         /// nunca passa por copia do painel novo.
-        pub(super) fn receive(&mut self, post: PanelPost, notes: &impl DraftRescue) -> Received {
+        pub(super) fn receive(&mut self, post: PanelPost) -> Received {
             let PanelPost { page, message } = post;
             if self.view.is_some() && page == self.page {
                 track_note_draft(&mut self.draft, &message);
@@ -3007,7 +3021,7 @@ mod side_panel {
                 | PanelMessage::NoteSaveRefused
                 | PanelMessage::NoteDelete(_) => None,
             };
-            Received::Late(text.map(|edit| notes.rescue(NotesCommand::Save(edit))))
+            Received::Late(text.map(|edit| self.notes.rescue(NotesCommand::Save(edit))))
         }
 
         /// `Some(script)`: correr ja. Sem painel nao ha onde; antes do
@@ -3027,20 +3041,20 @@ mod side_panel {
             std::mem::take(&mut self.pending)
         }
 
-        /// A unica saida do painel. Primeiro o que o editor tinha por salvar
-        /// vai para a fila das notas (`take_note_draft_on_close`), e so
-        /// depois a vista sai (`release_panel`, que devolve o teclado).
-        /// `None`: nao havia painel.
+        /// A saida normal do painel. Primeiro o que o editor tinha por salvar
+        /// vai para a fila das notas (`take_note_draft_on_close`, que o
+        /// tira do painel: o `Drop` ja nao o grava outra vez), e so depois a
+        /// vista sai (`release_panel`, que devolve o teclado). `None`: nao
+        /// havia painel.
         pub(super) fn dismiss(
             &mut self,
             exit: PanelExit,
             surface: Surface,
-            notes: &impl DraftRescue,
             omnibox: Option<HWND>,
         ) -> Option<Dismissed> {
             let view = self.view.take()?;
             let saved = match take_note_draft_on_close(&mut self.draft) {
-                Some(command) => notes.rescue(command),
+                Some(command) => self.notes.rescue(command),
                 None => Ok(()),
             };
             self.ready = false;
@@ -3051,24 +3065,39 @@ mod side_panel {
 
         /// A janela fecha. O processo acaba com o event loop e levava a
         /// thread das notas a meio: o rascunho do painel aberto vai para a
-        /// fila como em qualquer fecho, e espera-se (ate `limit`) que a fila
-        /// -- com os rascunhos de fechos anteriores ainda por gravar --
+        /// fila como em qualquer fecho, e so DEPOIS a marca do `settle`, pela
+        /// mesma fila -- espera-se (ate `limit`) que tudo ate ela, o
+        /// rascunho e o que fechos anteriores ainda tinham por gravar,
         /// chegue ao disco.
-        pub(super) fn exit(
-            &mut self,
-            notes: &impl DraftRescue,
-            limit: Duration,
-        ) -> Result<(), String> {
+        pub(super) fn exit(&mut self, limit: Duration) -> Result<(), String> {
             let saved = self
-                .dismiss(PanelExit::AppExit, Surface::Home, notes, None)
+                .dismiss(PanelExit::AppExit, Surface::Home, None)
                 .map_or(Ok(()), |closed| closed.saved);
-            notes.settle(limit);
+            self.notes.settle(limit);
             saved
         }
 
         #[cfg(test)]
         pub(super) fn draft(&self) -> Option<&super::NoteEdit> {
             self.draft.as_ref()
+        }
+    }
+
+    /// Largar o painel sem `dismiss` -- uma atribuicao por cima, um
+    /// `mem::replace`, um `drop`, o `App` a sair -- nao perde o texto: o que
+    /// o editor tinha por salvar vai para a fila das notas, e so depois a
+    /// vista sai (os campos largam-se depois deste `drop`). Depois de um
+    /// `dismiss` ja nao ha rascunho e nada se grava outra vez. O teclado,
+    /// esse, so o `dismiss` devolve.
+    impl<W, N: DraftRescue> Drop for SidePanel<W, N> {
+        fn drop(&mut self) {
+            if let Some(command) = take_note_draft_on_close(&mut self.draft)
+                && let Err(error) = self.notes.rescue(command)
+            {
+                super::debug_log(format_args!(
+                    "side panel: largado sem dismiss e o rascunho nao foi gravado: {error}"
+                ));
+            }
         }
     }
 }
@@ -3595,16 +3624,31 @@ struct NotesJob {
 /// A thread das notas morreu: o que estava por salvar nao tem para onde ir.
 const NOTES_WORKER_GONE: &str = "Não foi possível salvar a nota: as notas deixaram de responder.";
 
+/// A resposta a um pedido que pode esperar pelo utilizador (listar, buscar,
+/// abrir, excluir, criar da selecao) com a fila cheia.
+const NOTES_BUSY: &str = "As notas estão ocupadas; tente de novo.";
+
+/// Quantos pedidos (na fila ou a correr) as notas aceitam antes de
+/// responder `NOTES_BUSY` a um pedido que se pode repetir. O texto do
+/// utilizador (`ZettelWorker::keep`) nao conta com este tecto.
+const NOTES_QUEUE_LIMIT: usize = 64;
+
 /// Quanto a saida da app espera pelas notas (um disco que nao responde nao
 /// prende o fecho da janela para sempre).
 const NOTES_EXIT_WAIT: Duration = Duration::from_secs(3);
 
-/// Uma thread para as notas, como o historico e a memoria: os pedidos
-/// correm por ordem (um salvar nunca passa a frente do abrir que o
-/// antecedeu) e o event loop nunca le a pasta.
+/// Uma thread para as notas, como o historico e a memoria, e UMA fila, por
+/// ordem de chegada: um salvar nunca passa a frente do abrir que o
+/// antecedeu, o rascunho de um fecho nunca passa a frente do salvar de
+/// antes, e a marca do `settle` so volta depois de tudo o que entrou antes
+/// dela -- o rascunho do fecho da janela incluido. O event loop nunca le a
+/// pasta nem espera pela fila.
 #[derive(Clone)]
 struct ZettelWorker {
-    tx: SyncSender<NotesJob>,
+    tx: Sender<NotesJob>,
+    /// Pedidos na fila ou a correr; a thread desconta cada um depois de o
+    /// acabar.
+    queued: Arc<AtomicUsize>,
 }
 
 impl ZettelWorker {
@@ -3620,7 +3664,9 @@ impl ZettelWorker {
         dir: std::path::PathBuf,
         reply: impl Fn(NotesOrigin, NotesReply) + Send + 'static,
     ) -> Self {
-        let (tx, rx) = sync_channel::<NotesJob>(64);
+        let (tx, rx) = channel::<NotesJob>();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let pending = Arc::clone(&queued);
         let _ = thread::Builder::new()
             .name("neural-zettel".into())
             .spawn(move || {
@@ -3643,56 +3689,67 @@ impl ZettelWorker {
                     if let Some(done) = job.done {
                         let _ = done.try_send(());
                     }
+                    pending.fetch_sub(1, Ordering::SeqCst);
                 }
             });
-        Self { tx }
+        Self { tx, queued }
     }
 
-    /// Nunca espera: com a fila cheia (ou sem worker) o erro volta ja, para
-    /// ser mostrado, em vez de congelar a interface.
+    /// Um pedido do painel ou de uma pagina. Nunca espera. Um salvar leva o
+    /// texto todo, e o lado nativo ja largou a copia dele
+    /// (`track_note_draft`): entra sempre (`keep`), mesmo com a fila cheia
+    /// -- o X do painel manda o salvar e logo a seguir o `close`, e a pagina
+    /// ja nao esta la para tentar outra vez. O resto, com a fila cheia,
+    /// volta ja com `NOTES_BUSY`, para quem pediu repetir.
     fn submit(&self, command: NotesCommand, origin: NotesOrigin) -> Result<(), String> {
-        self.tx
-            .try_send(NotesJob {
-                command: Some(command),
-                origin,
-                done: None,
+        let job = NotesJob {
+            command: Some(command),
+            origin,
+            done: None,
+        };
+        if matches!(job.command, Some(NotesCommand::Save(_))) {
+            return self.keep(job);
+        }
+        if self
+            .queued
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |queued| {
+                (queued < NOTES_QUEUE_LIMIT).then_some(queued + 1)
             })
-            .map_err(|_| "As notas estão ocupadas; tente de novo.".to_string())
+            .is_err()
+        {
+            return Err(NOTES_BUSY.to_string());
+        }
+        self.tx.send(job).map_err(|_| {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+            NOTES_WORKER_GONE.to_string()
+        })
     }
 
-    /// Poe `job` na fila sem prender o event loop e sem o deitar fora: com a
-    /// fila cheia (um disco que nao responde), uma thread a parte espera pela
-    /// vez dele. So a thread das notas morta o perde.
-    fn enqueue(&self, job: NotesJob) -> Result<(), String> {
-        match self.tx.try_send(job) {
-            Ok(()) => Ok(()),
-            Err(std::sync::mpsc::TrySendError::Full(job)) => {
-                let tx = self.tx.clone();
-                thread::Builder::new()
-                    .name("neural-zettel-wait".into())
-                    .spawn(move || {
-                        let _ = tx.send(job);
-                    })
-                    .map(drop)
-                    .map_err(|_| NOTES_WORKER_GONE.to_string())
-            }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                Err(NOTES_WORKER_GONE.to_string())
-            }
-        }
+    /// Poe `job` no fim da fila, sem tecto e sem esperar: nem o event loop
+    /// fica preso a um disco que nao responde, nem o texto e deitado fora,
+    /// nem passa a frente (ou fica atras) do que entrou antes dele. So a
+    /// thread das notas morta o perde -- e ai o erro diz.
+    fn keep(&self, job: NotesJob) -> Result<(), String> {
+        self.queued.fetch_add(1, Ordering::SeqCst);
+        self.tx.send(job).map_err(|_| {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+            NOTES_WORKER_GONE.to_string()
+        })
     }
 }
 
 /// O painel do Ctrl+H grava o que o editor tinha por salvar por aqui.
 impl side_panel::DraftRescue for ZettelWorker {
     fn rescue(&self, command: NotesCommand) -> Result<(), String> {
-        self.enqueue(NotesJob {
+        self.keep(NotesJob {
             command: Some(command),
             origin: NotesOrigin::Closed,
             done: None,
         })
     }
 
+    /// A marca vai pela MESMA fila que o `rescue` (`keep`): so volta depois
+    /// de tudo o que entrou antes dela estar no disco.
     fn settle(&self, limit: Duration) {
         let (done, finished) = sync_channel(1);
         let barrier = NotesJob {
@@ -3700,7 +3757,7 @@ impl side_panel::DraftRescue for ZettelWorker {
             origin: NotesOrigin::Closed,
             done: Some(done),
         };
-        if self.enqueue(barrier).is_ok() {
+        if self.keep(barrier).is_ok() {
             let _ = finished.recv_timeout(limit);
         }
     }
@@ -6939,10 +6996,11 @@ struct App {
     /// Janela com o foco do teclado (`WindowEvent::Focused`). Em segundo plano
     /// a animacao continua, mas devagar.
     home_focused: bool,
-    /// Painel lateral do historico inteligente e das notas (Ctrl+H). So sai
-    /// por `close_side_panel`, que grava primeiro o que o editor tinha por
-    /// salvar (`side_panel::SidePanel::dismiss`).
-    side_panel: side_panel::SidePanel<WebView>,
+    /// Painel lateral do historico inteligente e das notas (Ctrl+H). Sai por
+    /// `close_side_panel`, que grava primeiro o que o editor tinha por
+    /// salvar e devolve o teclado (`side_panel::SidePanel::dismiss`);
+    /// largado de outra forma, o `Drop` dele ainda grava o rascunho.
+    side_panel: side_panel::SidePanel<WebView, ZettelWorker>,
     /// A consulta de memoria que alimenta as sugestoes do painel.
     panel_suggestion_query: Option<String>,
     /// Servico aberto no painel lateral (WhatsApp, Meet, YouTube, Gmail e o
@@ -7052,7 +7110,7 @@ impl App {
             // A janela nasce visivel e com foco; os eventos corrigem se nao for.
             home_occluded: false,
             home_focused: true,
-            side_panel: side_panel::SidePanel::closed(),
+            side_panel: side_panel::SidePanel::closed(notes.clone()),
             panel_suggestion_query: None,
             service_panel: None,
             home_tool_hover: None,
@@ -11286,10 +11344,7 @@ impl App {
     /// tinha por salvar e so depois larga a WebView, devolvendo o teclado
     /// (gate `every_way_out_of_the_side_panel_saves_the_note_being_typed_once`).
     fn close_side_panel(&mut self, exit: PanelExit) {
-        let Some(closed) = self
-            .side_panel
-            .dismiss(exit, self.surface, &self.notes, self.omnibox)
-        else {
+        let Some(closed) = self.side_panel.dismiss(exit, self.surface, self.omnibox) else {
             return;
         };
         self.panel_suggestion_query = None;
@@ -11355,7 +11410,7 @@ impl App {
     /// fechos anteriores ainda tinham na fila -- chega ao disco antes de o
     /// processo acabar (`SidePanel::exit`).
     fn save_notes_draft_before_exit(&mut self) {
-        let _ = self.side_panel.exit(&self.notes, NOTES_EXIT_WAIT);
+        let _ = self.side_panel.exit(NOTES_EXIT_WAIT);
     }
 
     /// Resposta do worker das notas. A de uma selecao abre o painel na nota
@@ -11618,7 +11673,7 @@ impl App {
     fn handle_panel_message(&mut self, post: side_panel::PanelPost) {
         // `receive` segue a copia do editor; um pedido de uma pagina que ja
         // saiu nao chega aqui (o texto que trazia ja foi gravado).
-        let message = match self.side_panel.receive(post, &self.notes) {
+        let message = match self.side_panel.receive(post) {
             side_panel::Received::Current(message) => message,
             side_panel::Received::Late(saved) => {
                 if let Some(Err(error)) = saved {
@@ -23309,12 +23364,12 @@ Clique: pausar · botão direito: opções";
                 // O Ctrl+H, pela saida unica.
                 SetFocus(elsewhere);
                 let log = Rc::new(RefCell::new(Vec::new()));
-                let mut panel = side_panel::SidePanel::closed();
+                let mut panel = side_panel::SidePanel::closed(NoNotes);
                 let ticket = panel.ticket();
                 assert!(panel.open(ticket, FakePanel(Rc::clone(&log))).is_ok());
                 assert!(
                     panel
-                        .dismiss(PanelExit::CtrlH, surface, &NoNotes, Some(omnibox))
+                        .dismiss(PanelExit::CtrlH, surface, Some(omnibox))
                         .is_some()
                 );
                 let side = (log.borrow().clone(), GetFocus() == omnibox);
@@ -23324,15 +23379,10 @@ Clique: pausar · botão direito: opções";
             // teclado: ela propria trata dele.
             SetFocus(elsewhere);
             let log = Rc::new(RefCell::new(Vec::new()));
-            let mut panel = side_panel::SidePanel::closed();
+            let mut panel = side_panel::SidePanel::closed(NoNotes);
             let ticket = panel.ticket();
             assert!(panel.open(ticket, FakePanel(Rc::clone(&log))).is_ok());
-            let _ = panel.dismiss(
-                PanelExit::SurfaceChange,
-                Surface::Home,
-                &NoNotes,
-                Some(omnibox),
-            );
+            let _ = panel.dismiss(PanelExit::SurfaceChange, Surface::Home, Some(omnibox));
             let teardown = (log.borrow().clone(), GetFocus());
             // Sem painel, nada.
             let mut none: Option<(Service, FakePanel)> = None;
@@ -24396,6 +24446,7 @@ process.stdout.write(JSON.stringify({
 
         /// O worker das notas de verdade (a thread, a fila, o disco), com cada
         /// gravacao registada no diario ANTES de ir para a fila.
+        #[derive(Clone)]
         struct LoggedNotes {
             worker: ZettelWorker,
             log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
@@ -24432,18 +24483,21 @@ process.stdout.write(JSON.stringify({
 
         const SETTLE: Duration = Duration::from_secs(20);
 
-        /// Gate: o painel do Ctrl+H tem UMA saida, e ela grava o texto de uma
-        /// nota a meio -- uma vez -- antes de a pagina sair. Cada caminho do
-        /// `App` que tira o painel passa por `close_side_panel(exit)` ->
-        /// `SidePanel::dismiss` (e a saida da app por `SidePanel::exit`); o
-        /// painel nao tem outra forma de sair (os campos sao privados do
-        /// modulo `side_panel`: um `take()` direto nem compila). Aqui corre o
-        /// editor que embarca (as copias que ele manda), o parser do canal, o
-        /// `SidePanel` com uma vista de mentira e o `ZettelWorker` de verdade
-        /// sobre uma pasta temporaria: uma nota no disco com o texto, uma
-        /// resposta de fecho, a gravacao antes da vista sair, e nenhuma
-        /// segunda gravacao no fecho seguinte (o `show_home` fecha e depois
-        /// chama o `destroy_web_surfaces`) nem na saida da app.
+        /// Gate: cada saida do painel do Ctrl+H grava o texto de uma nota a
+        /// meio -- uma vez -- antes de a pagina sair. Cada caminho do `App`
+        /// que tira o painel passa por `close_side_panel(exit)` ->
+        /// `SidePanel::dismiss` (e a saida da app por `SidePanel::exit`); um
+        /// `take()` direto da vista nem compila (campos privados do modulo
+        /// `side_panel`), e largar o painel inteiro por outro caminho passa
+        /// pelo `Drop` dele (gate
+        /// `dropping_or_overwriting_an_open_side_panel_still_saves_the_note_once`).
+        /// Aqui corre o editor que embarca (as copias que ele manda), o parser
+        /// do canal, o `SidePanel` com uma vista de mentira e o `ZettelWorker`
+        /// de verdade sobre uma pasta temporaria: uma nota no disco com o
+        /// texto, uma resposta de fecho, a gravacao antes da vista sair, e
+        /// nenhuma segunda gravacao no fecho seguinte (o `show_home` fecha e
+        /// depois chama o `destroy_web_surfaces`), na saida da app nem quando
+        /// o painel e largado no fim.
         #[test]
         fn every_way_out_of_the_side_panel_saves_the_note_being_typed_once() {
             use side_panel::{PanelPost, Received, SidePanel};
@@ -24511,27 +24565,24 @@ process.stdout.write(JSON.stringify({
                     let dir = NotesDir::new("exit");
                     let (worker, replies) = notes_worker(&dir);
                     let log = Rc::new(RefCell::new(Vec::new()));
-                    let notes = LoggedNotes {
-                        worker,
+                    let mut panel = SidePanel::closed(LoggedNotes {
+                        worker: worker.clone(),
                         log: Rc::clone(&log),
-                    };
-                    let mut panel = SidePanel::closed();
+                    });
                     let ticket = panel.ticket();
                     assert!(panel.open(ticket, FakePanel(Rc::clone(&log))).is_ok());
                     for message in &sent {
                         let post = PanelPost::parse(ticket, message).expect("o parser aceitou");
                         assert!(
-                            matches!(panel.receive(post, &notes), Received::Current(_)),
+                            matches!(panel.receive(post), Received::Current(_)),
                             "{entry}"
                         );
                     }
 
                     let saved = if exit == PanelExit::AppExit {
-                        panel.exit(&notes, SETTLE)
+                        panel.exit(SETTLE)
                     } else {
-                        let closed = panel
-                            .dismiss(exit, surface, &notes, None)
-                            .expect("havia painel");
+                        let closed = panel.dismiss(exit, surface, None).expect("havia painel");
                         closed.saved
                     };
                     assert_eq!(saved, Ok(()), "{entry}");
@@ -24551,13 +24602,16 @@ process.stdout.write(JSON.stringify({
                         "{entry} em {surface:?}: o rascunho tem de ir antes de a pagina sair"
                     );
 
-                    // Uma vez so.
+                    // Uma vez so: nem no fecho seguinte, nem na saida da app,
+                    // nem quando o painel e largado.
                     assert!(
                         panel
-                            .dismiss(PanelExit::SurfaceChange, surface, &notes, None)
+                            .dismiss(PanelExit::SurfaceChange, surface, None)
                             .is_none()
                     );
-                    assert_eq!(panel.exit(&notes, SETTLE), Ok(()));
+                    assert_eq!(panel.exit(SETTLE), Ok(()));
+                    drop(panel);
+                    side_panel::DraftRescue::settle(&worker, SETTLE);
                     assert_eq!(
                         log.borrow()
                             .iter()
@@ -24614,10 +24668,10 @@ process.stdout.write(JSON.stringify({
                 .expect("nota");
             let (worker, _replies) = notes_worker(&dir);
             let log = Rc::new(RefCell::new(Vec::new()));
-            let notes = LoggedNotes {
+            let mut panel = SidePanel::closed(LoggedNotes {
                 worker,
                 log: Rc::clone(&log),
-            };
+            });
 
             // A pagina 1 com a Ideia no editor: duas copias, a segunda ainda
             // na fila quando o Ctrl+H a fecha.
@@ -24635,13 +24689,12 @@ process.stdout.write(JSON.stringify({
                 .collect();
             assert_eq!(drafts.len(), 2, "{drafts:?}");
 
-            let mut panel = SidePanel::closed();
             let page1 = panel.ticket();
             assert!(panel.open(page1, FakePanel(Rc::clone(&log))).is_ok());
             let post = PanelPost::parse(page1, &drafts[0]).expect("parser");
-            assert!(matches!(panel.receive(post, &notes), Received::Current(_)));
+            assert!(matches!(panel.receive(post), Received::Current(_)));
             let closed = panel
-                .dismiss(PanelExit::CtrlH, Surface::Comparator, &notes, None)
+                .dismiss(PanelExit::CtrlH, Surface::Comparator, None)
                 .expect("painel");
             assert_eq!(closed.saved, Ok(()));
 
@@ -24657,13 +24710,13 @@ process.stdout.write(JSON.stringify({
             ]);
             for message in posted(&second) {
                 let post = PanelPost::parse(page2, &message).expect("parser");
-                assert!(matches!(panel.receive(post, &notes), Received::Current(_)));
+                assert!(matches!(panel.receive(post), Received::Current(_)));
             }
 
             // Agora chega a segunda copia da pagina 1.
             let late = PanelPost::parse(page1, &drafts[1]).expect("parser");
             assert!(
-                matches!(panel.receive(late, &notes), Received::Late(Some(Ok(())))),
+                matches!(panel.receive(late), Received::Late(Some(Ok(())))),
                 "a copia atrasada nao foi gravada"
             );
             assert_eq!(
@@ -24673,11 +24726,11 @@ process.stdout.write(JSON.stringify({
             );
             // Um `close` atrasado da pagina 1 nao fecha a 2.
             let close = PanelPost::parse(page1, r#"{"action":"close"}"#).expect("parser");
-            assert!(matches!(panel.receive(close, &notes), Received::Late(None)));
+            assert!(matches!(panel.receive(close), Received::Late(None)));
             assert!(panel.is_open());
 
             // A pagina 2 fecha: grava a dela.
-            assert_eq!(panel.exit(&notes, SETTLE), Ok(()));
+            assert_eq!(panel.exit(SETTLE), Ok(()));
             assert_eq!(
                 log.borrow()
                     .iter()
@@ -24696,44 +24749,465 @@ process.stdout.write(JSON.stringify({
             );
         }
 
-        /// Gate: com a fila das notas cheia (um disco que nao responde), o
-        /// texto de um painel que fecha nao e deitado fora nem prende o event
-        /// loop: entra na fila quando houver lugar. So a thread das notas
-        /// morta o perde -- e ai o aviso diz.
+        /// Quantas gravacoes de fecho o diario de um `LoggedNotes` viu.
+        fn rescues(log: &std::cell::RefCell<Vec<String>>) -> usize {
+            log.borrow()
+                .iter()
+                .filter(|line| line.starts_with("salvar"))
+                .count()
+        }
+
+        /// O que o editor que embarca manda quando se escreve uma nota nova
+        /// ("Ideia") sem a salvar, e depois `then` (o fecho pela pagina).
+        fn typed_note(then: &[&str]) -> Vec<String> {
+            let mut steps: Vec<String> = vec![
+                "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+                "__click($('note-new'));".into(),
+                "__type($('note-title'), 'Ideia');".into(),
+                "__type($('note-body'), 'Escrita e nunca salva.');".into(),
+                "__drain();".into(),
+            ];
+            steps.extend(then.iter().map(|step| step.to_string()));
+            let sent = posted(&run_panel(&steps));
+            assert!(
+                sent.iter().any(|m| action_of(m) == "note-draft"),
+                "{sent:?}"
+            );
+            sent
+        }
+
+        /// A nota "Ideia" esta no disco, uma vez, com o texto todo.
+        fn assert_one_note_on_disk(dir: &NotesDir, what: &str) {
+            let store = dir.store();
+            let list = store.list().expect("lista");
+            assert_eq!(list.len(), 1, "{what}: {list:?}");
+            let note = store.get(&list[0].id).expect("ler").expect("existe");
+            assert_eq!(
+                (note.title.as_str(), note.body.as_str()),
+                ("Ideia", "Escrita e nunca salva."),
+                "{what}"
+            );
+        }
+
+        /// Um disco que nao responde: a thread das notas de verdade fica
+        /// presa na primeira resposta ate `release`.
+        #[derive(Clone)]
+        struct Held(Arc<(Mutex<bool>, Condvar)>);
+
+        impl Held {
+            fn release(&self) {
+                let (open, turn) = &*self.0;
+                *open
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                turn.notify_all();
+            }
+
+            fn wait(&self) {
+                let (open, turn) = &*self.0;
+                let mut guard = open
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*guard {
+                    guard = turn
+                        .wait(guard)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            }
+        }
+
+        /// Um worker das notas em `dir` preso (`Held`) ate ser solto, com as
+        /// respostas num canal. A resposta a uma gravacao de fecho chega ao
+        /// canal 100 ms depois de o disco a ter escrito: a margem que torna
+        /// visivel uma marca do `settle` que lhe passasse a frente.
+        fn held_notes_worker(
+            dir: &NotesDir,
+        ) -> (
+            ZettelWorker,
+            std::sync::mpsc::Receiver<(NotesOrigin, NotesReply)>,
+            Held,
+        ) {
+            let held = Held(Arc::new((Mutex::new(false), Condvar::new())));
+            let gate = held.clone();
+            let (reply_tx, replies) = std::sync::mpsc::channel();
+            let worker = ZettelWorker::spawn(dir.0.clone(), move |origin, reply| {
+                gate.wait();
+                if origin == NotesOrigin::Closed {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                let _ = reply_tx.send((origin, reply));
+            });
+            (worker, replies, held)
+        }
+
+        /// Enche a fila de `worker` com listagens ate ela responder
+        /// "ocupadas": sao `NOTES_QUEUE_LIMIT`.
+        fn fill_notes_queue(worker: &ZettelWorker) {
+            let mut accepted = 0;
+            let refused = loop {
+                match worker.submit(NotesCommand::List, NotesOrigin::Panel) {
+                    Ok(()) => accepted += 1,
+                    Err(error) => break error,
+                }
+                assert!(accepted <= NOTES_QUEUE_LIMIT, "a fila nao tem tecto");
+            };
+            assert_eq!(accepted, NOTES_QUEUE_LIMIT);
+            assert_eq!(refused, NOTES_BUSY);
+        }
+
+        /// Gate: largar um painel ABERTO com uma nota a meio sem `dismiss` --
+        /// uma atribuicao por cima (`self.side_panel = SidePanel::closed(..)`),
+        /// um `mem::replace`, um `drop` -- compila, e por isso nao pode perder
+        /// o texto: o `Drop` do `SidePanel` grava-o, uma vez, antes de a vista
+        /// sair. E depois de um `dismiss` (que ja gravou) largar o painel nao
+        /// grava outra vez. O editor que embarca, o parser do canal, o
+        /// `SidePanel` com uma vista de mentira e o `ZettelWorker` de verdade
+        /// sobre uma pasta temporaria.
+        #[test]
+        fn dropping_or_overwriting_an_open_side_panel_still_saves_the_note_once() {
+            use side_panel::{DraftRescue, PanelPost, Received, SidePanel};
+            use std::{cell::RefCell, rc::Rc};
+
+            let sent = typed_note(&[]);
+            let ways = [
+                "atribuicao por cima",
+                "mem::replace",
+                "drop",
+                "dismiss e depois drop",
+                "dismiss e depois atribuicao por cima",
+            ];
+            for way in ways {
+                let dir = NotesDir::new("drop");
+                let (worker, replies) = notes_worker(&dir);
+                let log = Rc::new(RefCell::new(Vec::new()));
+                let notes = LoggedNotes {
+                    worker: worker.clone(),
+                    log: Rc::clone(&log),
+                };
+                let mut panel = SidePanel::closed(notes.clone());
+                let ticket = panel.ticket();
+                assert!(panel.open(ticket, FakePanel(Rc::clone(&log))).is_ok());
+                for message in &sent {
+                    let post = PanelPost::parse(ticket, message).expect("o parser aceitou");
+                    assert!(matches!(panel.receive(post), Received::Current(_)));
+                }
+                assert!(panel.draft().is_some(), "{way}: sem copia do editor");
+
+                match way {
+                    "atribuicao por cima" => {
+                        panel = SidePanel::closed(notes.clone());
+                        assert!(!panel.is_open());
+                        drop(panel);
+                    }
+                    "mem::replace" => {
+                        let old = std::mem::replace(&mut panel, SidePanel::closed(notes.clone()));
+                        drop(old);
+                        drop(panel);
+                    }
+                    "drop" => drop(panel),
+                    "dismiss e depois drop" => {
+                        let closed = panel
+                            .dismiss(PanelExit::SurfaceChange, Surface::Comparator, None)
+                            .expect("painel");
+                        assert_eq!(closed.saved, Ok(()));
+                        drop(panel);
+                    }
+                    "dismiss e depois atribuicao por cima" => {
+                        let closed = panel
+                            .dismiss(PanelExit::SurfaceChange, Surface::Comparator, None)
+                            .expect("painel");
+                        assert_eq!(closed.saved, Ok(()));
+                        panel = SidePanel::closed(notes.clone());
+                        drop(panel);
+                    }
+                    other => unreachable!("{other}"),
+                }
+                worker.settle(SETTLE);
+
+                assert_eq!(
+                    *log.borrow(),
+                    ["salvar Ideia", "largada"],
+                    "{way}: o texto tem de ir uma vez, antes de a pagina sair"
+                );
+                assert_eq!(rescues(&log), 1, "{way}");
+                assert_one_note_on_disk(&dir, way);
+                let (origin, reply) = replies.recv_timeout(SETTLE).expect("resposta");
+                assert_eq!(origin, NotesOrigin::Closed, "{way}");
+                assert!(
+                    matches!(
+                        reply,
+                        NotesReply::Opened {
+                            cause: NoteOpened::Saved,
+                            ..
+                        }
+                    ),
+                    "{way}: {reply:?}"
+                );
+                assert!(replies.try_recv().is_err(), "{way}: duas gravacoes");
+            }
+        }
+
+        /// Gate: o X, o Esc e o botao Notas fecham o painel pela pagina -- ela
+        /// manda o `note-save` com o texto todo e logo a seguir o `close`, e o
+        /// lado nativo larga a copia dele (`track_note_draft`). Com a fila das
+        /// notas cheia (um disco que nao responde, 64 pedidos), esse salvar
+        /// nao pode ser recusado como uma listagem: a pagina sai no `close`
+        /// seguinte e nao ha quem tente outra vez. Corre o editor que embarca,
+        /// o parser do canal, o `SidePanel` e o que o `handle_panel_message`
+        /// faz com cada pedido (`notes_command_for` -> `ZettelWorker::submit`,
+        /// o `close` -> `dismiss`) sobre o `ZettelWorker` de verdade, preso:
+        /// nada espera pelo disco, e quando ele volta o texto esta la.
+        #[test]
+        fn closing_the_panel_by_its_x_saves_the_note_even_with_the_notes_queue_full() {
+            use side_panel::{DraftRescue, PanelPost, Received, SidePanel};
+            use std::{cell::RefCell, rc::Rc};
+
+            let closes = [
+                ("o X", "__click($('close'));".to_string()),
+                (
+                    "o Esc",
+                    "__fire(document, 'keydown', { key: 'Escape' });".to_string(),
+                ),
+                ("o botao Notas", PANEL_NOTES_BUTTON_SCRIPT.to_string()),
+            ];
+            for (entry, close) in closes {
+                let sent = typed_note(&[close.as_str()]);
+                let actions: Vec<String> = sent.iter().map(|m| action_of(m)).collect();
+                assert!(
+                    actions.ends_with(&["note-save".to_string(), "close".to_string()]),
+                    "{entry}: {actions:?}"
+                );
+
+                let dir = NotesDir::new("x-cheia");
+                let (worker, replies, held) = held_notes_worker(&dir);
+                // Se alguma coisa esperasse pelo disco, o teste nao ficava
+                // preso: o disco volta sozinho, e fica dito.
+                let waited = Arc::new(AtomicBool::new(false));
+                {
+                    let (held, waited) = (held.clone(), Arc::clone(&waited));
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_secs(20));
+                        waited.store(true, Ordering::SeqCst);
+                        held.release();
+                    });
+                }
+                fill_notes_queue(&worker);
+
+                let log = Rc::new(RefCell::new(Vec::new()));
+                let mut panel = SidePanel::closed(LoggedNotes {
+                    worker: worker.clone(),
+                    log: Rc::clone(&log),
+                });
+                let ticket = panel.ticket();
+                assert!(panel.open(ticket, FakePanel(Rc::clone(&log))).is_ok());
+                let mut submitted = Vec::new();
+                for message in &sent {
+                    let post = PanelPost::parse(ticket, message).expect("o parser aceitou");
+                    // O que o `handle_panel_message` faz com cada pedido.
+                    match panel.receive(post) {
+                        Received::Current(PanelMessage::Close) => {
+                            let closed = panel
+                                .dismiss(PanelExit::CloseButton, Surface::Comparator, None)
+                                .expect("painel");
+                            assert_eq!(closed.saved, Ok(()), "{entry}");
+                        }
+                        Received::Current(PanelMessage::NoteDraft(_)) => {}
+                        Received::Current(message) => {
+                            if let Some(command) = notes_command_for(message) {
+                                submitted.push(worker.submit(command, NotesOrigin::Panel));
+                            }
+                        }
+                        Received::Late(saved) => panic!("{entry}: pagina viva ({saved:?})"),
+                    }
+                }
+                assert!(
+                    !waited.load(Ordering::SeqCst),
+                    "{entry}: o fecho ficou a espera do disco"
+                );
+                assert!(!panel.is_open(), "{entry}");
+                assert_eq!(
+                    submitted,
+                    [Ok(())],
+                    "{entry}: o salvar da pagina foi recusado com a fila cheia"
+                );
+                // O salvar levou o texto; o fecho ja nao tinha copia a gravar.
+                assert_eq!(rescues(&log), 0, "{entry}");
+
+                held.release();
+                worker.settle(SETTLE);
+                assert_one_note_on_disk(&dir, entry);
+                let saved: Vec<NotesReply> = replies
+                    .try_iter()
+                    .filter(|(origin, _)| *origin == NotesOrigin::Panel)
+                    .map(|(_, reply)| reply)
+                    .filter(|reply| !matches!(reply, NotesReply::Listed { .. }))
+                    .collect();
+                assert!(
+                    matches!(
+                        saved.as_slice(),
+                        [NotesReply::Opened {
+                            cause: NoteOpened::Saved,
+                            ..
+                        }]
+                    ),
+                    "{entry}: {saved:?}"
+                );
+            }
+        }
+
+        /// Gate: a saida da app so larga a janela depois de o rascunho do
+        /// painel aberto estar no disco, mesmo com a fila cheia (64 pedidos a
+        /// espera de um disco lento). O rascunho e a marca do `settle` vao
+        /// pela MESMA fila, por esta ordem: primeiro, a ordem em que chegam a
+        /// fila (lida por quem a esvazia); depois, o `ZettelWorker` de verdade
+        /// -- quando o `exit` volta, a nota esta no disco e a resposta de
+        /// fecho ja chegou.
+        #[test]
+        fn closing_the_window_waits_for_the_rescued_note_behind_a_full_queue() {
+            use side_panel::{PanelPost, Received, SidePanel};
+            use std::{cell::RefCell, rc::Rc};
+
+            let sent = typed_note(&[]);
+
+            // A ordem na fila: a fila cheia, e quem a esvazia regista o que
+            // chega e responde a marca.
+            let (tx, rx) = channel::<NotesJob>();
+            let worker = ZettelWorker {
+                tx,
+                queued: Arc::new(AtomicUsize::new(NOTES_QUEUE_LIMIT)),
+            };
+            assert_eq!(
+                worker.submit(NotesCommand::List, NotesOrigin::Panel),
+                Err(NOTES_BUSY.to_string()),
+                "a fila tinha de estar cheia"
+            );
+            let drain = thread::spawn(move || {
+                let mut seen = Vec::new();
+                while seen.len() < 2 {
+                    let Ok(job) = rx.recv_timeout(SETTLE) else {
+                        break;
+                    };
+                    match (job.command, job.done) {
+                        (Some(NotesCommand::Save(edit)), None) => {
+                            seen.push(format!("salvar {}", edit.title));
+                        }
+                        (None, Some(done)) => {
+                            seen.push("marca".to_string());
+                            let _ = done.try_send(());
+                        }
+                        (other, _) => seen.push(format!("{other:?}")),
+                    }
+                }
+                seen
+            });
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut panel = SidePanel::closed(worker.clone());
+            let ticket = panel.ticket();
+            assert!(panel.open(ticket, FakePanel(Rc::clone(&log))).is_ok());
+            for message in &sent {
+                let post = PanelPost::parse(ticket, message).expect("o parser aceitou");
+                assert!(matches!(panel.receive(post), Received::Current(_)));
+            }
+            assert_eq!(panel.exit(SETTLE), Ok(()));
+            assert_eq!(
+                drain.join().expect("quem esvazia a fila"),
+                ["salvar Ideia", "marca"],
+                "a marca do settle passou a frente do rascunho"
+            );
+
+            // O worker de verdade, preso atras de 64 pedidos.
+            let dir = NotesDir::new("settle");
+            let (worker, replies, held) = held_notes_worker(&dir);
+            fill_notes_queue(&worker);
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut panel = SidePanel::closed(worker.clone());
+            let ticket = panel.ticket();
+            assert!(panel.open(ticket, FakePanel(Rc::clone(&log))).is_ok());
+            for message in &sent {
+                let post = PanelPost::parse(ticket, message).expect("o parser aceitou");
+                assert!(matches!(panel.receive(post), Received::Current(_)));
+            }
+            let disk = {
+                let held = held.clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(200));
+                    held.release();
+                })
+            };
+            assert_eq!(panel.exit(SETTLE), Ok(()));
+            // O que ja tinha chegado quando o `exit` voltou.
+            let arrived: Vec<(NotesOrigin, NotesReply)> = replies.try_iter().collect();
+            assert_one_note_on_disk(&dir, "saida da app");
+            disk.join().expect("disco");
+            let closed: Vec<&NotesReply> = arrived
+                .iter()
+                .filter(|(origin, _)| *origin == NotesOrigin::Closed)
+                .map(|(_, reply)| reply)
+                .collect();
+            assert!(
+                matches!(
+                    closed.as_slice(),
+                    [NotesReply::Opened {
+                        cause: NoteOpened::Saved,
+                        ..
+                    }]
+                ),
+                "a janela fechava antes de o rascunho estar gravado: {closed:?}"
+            );
+            assert_eq!(
+                arrived.len(),
+                NOTES_QUEUE_LIMIT + 1,
+                "o que estava na fila antes do rascunho tambem chegou"
+            );
+        }
+
+        /// Gate: com a fila das notas cheia, o texto de um painel que fecha
+        /// (o rascunho de um fecho nativo, `rescue`) e o salvar da pagina
+        /// entram na fila na mesma, pela ordem, sem esperar pelo disco; as
+        /// listagens e buscas, essas, respondem "ocupadas". So a thread das
+        /// notas morta perde o texto -- e ai o aviso diz.
         #[test]
         fn a_full_notes_queue_still_takes_the_note_of_a_closing_panel() {
             use side_panel::DraftRescue;
-            let (tx, rx) = sync_channel::<NotesJob>(1);
-            let worker = ZettelWorker { tx };
-            worker
-                .tx
-                .try_send(NotesJob {
-                    command: Some(NotesCommand::List),
-                    origin: NotesOrigin::Panel,
-                    done: None,
-                })
-                .expect("a primeira cabe");
-            let edit = NoteEdit {
+            let (tx, rx) = channel::<NotesJob>();
+            let worker = ZettelWorker {
+                tx,
+                queued: Arc::new(AtomicUsize::new(NOTES_QUEUE_LIMIT)),
+            };
+            let edit = |body: &str| NoteEdit {
                 id: None,
                 title: "Ideia".to_string(),
-                body: "texto".to_string(),
+                body: body.to_string(),
                 tags: Vec::new(),
                 rev: None,
             };
-            let started = Instant::now();
-            assert_eq!(worker.rescue(NotesCommand::Save(edit.clone())), Ok(()));
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "o fecho ficou a espera do disco"
+            assert_eq!(
+                worker.submit(NotesCommand::List, NotesOrigin::Panel),
+                Err(NOTES_BUSY.to_string())
             );
-            let first = rx.recv_timeout(SETTLE).expect("a primeira");
-            assert_eq!(first.command, Some(NotesCommand::List));
-            let second = rx.recv_timeout(SETTLE).expect("o rascunho perdeu-se");
-            assert_eq!(second.command, Some(NotesCommand::Save(edit.clone())));
-            assert_eq!(second.origin, NotesOrigin::Closed);
+            assert_eq!(
+                worker.submit(NotesCommand::Search("x".into()), NotesOrigin::Panel),
+                Err(NOTES_BUSY.to_string())
+            );
+            assert_eq!(worker.rescue(NotesCommand::Save(edit("fecho"))), Ok(()));
+            assert_eq!(
+                worker.submit(NotesCommand::Save(edit("salvar")), NotesOrigin::Panel),
+                Ok(())
+            );
+            let first = rx.recv_timeout(SETTLE).expect("o rascunho perdeu-se");
+            assert_eq!(first.command, Some(NotesCommand::Save(edit("fecho"))));
+            assert_eq!(first.origin, NotesOrigin::Closed);
+            let second = rx.recv_timeout(SETTLE).expect("o salvar perdeu-se");
+            assert_eq!(second.command, Some(NotesCommand::Save(edit("salvar"))));
+            assert_eq!(second.origin, NotesOrigin::Panel);
+            assert!(rx.try_recv().is_err(), "as listagens nao entraram");
             drop(rx);
             assert_eq!(
-                worker.rescue(NotesCommand::Save(edit)),
+                worker.rescue(NotesCommand::Save(edit("fecho"))),
+                Err(NOTES_WORKER_GONE.to_string())
+            );
+            assert_eq!(
+                worker.submit(NotesCommand::Save(edit("salvar")), NotesOrigin::Panel),
                 Err(NOTES_WORKER_GONE.to_string())
             );
         }
