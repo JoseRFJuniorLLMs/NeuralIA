@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     EpubArchive, EpubError, EpubResult,
-    book::{ManifestItem, SpineItem, load_dom},
+    book::{ManifestItem, SpineItem, load_dom, shown, warn},
     xml::{Dom, ROOT},
 };
 
@@ -21,6 +21,9 @@ pub const MAX_TOC_DEPTH: usize = 32;
 /// Entradas do sumário; o resto é ignorado (com aviso).
 pub const MAX_TOC_ENTRIES: usize = 10_000;
 const MAX_LABEL_CHARS: usize = 512;
+/// Um `href` do sumário maior do que isto não aponta para nada que exista
+/// (os nomes do ZIP têm no máximo 1 KiB): é ignorado, não copiado.
+const MAX_HREF_BYTES: usize = 4 * 1024;
 const NCX_MEDIA_TYPE: &str = "application/x-dtbncx+xml";
 
 /// Uma entrada do sumário.
@@ -61,10 +64,10 @@ pub(crate) fn read_toc(
                 if !flat.is_empty() {
                     return Ok(finish(flat, archive, path, spine, warnings));
                 }
-                warnings.push(format!("nav sem sumário: {path}"));
+                warn(warnings, || format!("nav sem sumário: {}", shown(path)));
             }
             Err(error @ EpubError::UnsafeXml { .. }) => return Err(error),
-            Err(error) => warnings.push(format!("nav ilegível: {error}")),
+            Err(error) => warn(warnings, || format!("nav ilegível: {error}")),
         }
     }
     let ncx = ncx_id
@@ -85,10 +88,10 @@ pub(crate) fn read_toc(
                 if !flat.is_empty() {
                     return Ok(finish(flat, archive, path, spine, warnings));
                 }
-                warnings.push(format!("NCX sem navPoint: {path}"));
+                warn(warnings, || format!("NCX sem navPoint: {}", shown(path)));
             }
             Err(error @ EpubError::UnsafeXml { .. }) => return Err(error),
-            Err(error) => warnings.push(format!("NCX ilegível: {error}")),
+            Err(error) => warn(warnings, || format!("NCX ilegível: {error}")),
         }
     }
     Ok(Vec::new())
@@ -114,10 +117,12 @@ fn nav_entries(dom: &Dom) -> Vec<FlatEntry> {
             .find(|&node| dom.is(node, "a") || dom.is(node, "span"));
         match link {
             Some(node) if dom.is(node, "a") => (
-                dom.text(node),
-                dom.attr(node, "href").map(|href| href.trim().to_string()),
+                dom.text_capped(node, MAX_LABEL_CHARS),
+                dom.attr(node, "href")
+                    .filter(|href| href.len() <= MAX_HREF_BYTES)
+                    .map(|href| href.trim().to_string()),
             ),
-            Some(node) => (dom.text(node), None),
+            Some(node) => (dom.text_capped(node, MAX_LABEL_CHARS), None),
             None => (dom.own_text(item), None),
         }
     })
@@ -132,13 +137,16 @@ fn ncx_entries(dom: &Dom) -> Vec<FlatEntry> {
         let label = dom
             .child(point, "navLabel")
             .map(|label| {
-                dom.child(label, "text")
-                    .map_or_else(|| dom.text(label), |text| dom.text(text))
+                dom.child(label, "text").map_or_else(
+                    || dom.text_capped(label, MAX_LABEL_CHARS),
+                    |text| dom.text_capped(text, MAX_LABEL_CHARS),
+                )
             })
             .unwrap_or_default();
         let href = dom
             .child(point, "content")
             .and_then(|content| dom.attr(content, "src"))
+            .filter(|src| src.len() <= MAX_HREF_BYTES)
             .map(|src| src.trim().to_string());
         (label, href)
     })
@@ -207,7 +215,9 @@ fn finish(
     warnings: &mut Vec<String>,
 ) -> Vec<TocEntry> {
     if flat.len() >= MAX_TOC_ENTRIES {
-        warnings.push(format!("sumário cortado em {MAX_TOC_ENTRIES} entradas"));
+        warn(warnings, || {
+            format!("sumário cortado em {MAX_TOC_ENTRIES} entradas")
+        });
     }
     let mut spine_index: HashMap<&str, usize> = HashMap::new();
     for (index, item) in spine.iter().enumerate() {
@@ -221,7 +231,9 @@ fn finish(
         if target.is_none()
             && let Some(href) = &entry.href
         {
-            warnings.push(format!("entrada do sumário aponta para o vazio: {href}"));
+            warn(warnings, || {
+                format!("entrada do sumário aponta para o vazio: {}", shown(href))
+            });
         }
         let (path, fragment) = match target {
             Some((path, fragment)) => (Some(path), fragment),

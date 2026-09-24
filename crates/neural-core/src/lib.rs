@@ -22,6 +22,15 @@ pub mod semantic_timeline;
 pub mod tissue;
 pub mod zettel;
 
+#[cfg(test)]
+mod test_alloc;
+
+// Os gates de memória (livro hostil que multiplica o que aloca) medem o pico
+// com este alocador; só nos testes do neural-core.
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOC: test_alloc::CountingAlloc = test_alloc::CountingAlloc;
+
 pub use config::CoreConfig;
 pub use epub::{
     Creator, EpubArchive, EpubBook, EpubError, EpubMetadata, LimitKind, ManifestItem,

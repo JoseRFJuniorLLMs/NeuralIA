@@ -390,17 +390,44 @@ impl Dom {
             .find(|&index| self.is(index, local))
     }
 
-    /// Todo o texto dentro do nó, com espaços colapsados.
-    pub(crate) fn text(&self, node: usize) -> String {
-        let mut raw = String::new();
+    /// O texto dentro do nó (descendentes incluídos), com espaços colapsados,
+    /// cortado em `max_chars` caracteres. O corte acontece DURANTE a
+    /// travessia: um `<meta>` dentro de outro dentro de outro (até
+    /// [`MAX_XML_DEPTH`] níveis) nunca copia o texto inteiro de todos os
+    /// descendentes uma vez por nível. O resultado é o mesmo que colapsar o
+    /// texto todo e depois cortar.
+    pub(crate) fn text_capped(&self, node: usize, max_chars: usize) -> String {
+        let mut out = String::new();
+        let mut count = 0usize;
+        let mut pending_space = false;
         let mut stack: Vec<&Child> = self.nodes[node].children.iter().rev().collect();
-        while let Some(child) = stack.pop() {
+        'walk: while let Some(child) = stack.pop() {
             match child {
-                Child::Text(text) => raw.push_str(text),
+                Child::Text(text) => {
+                    for ch in text.chars() {
+                        if ch.is_whitespace() {
+                            pending_space = !out.is_empty();
+                            continue;
+                        }
+                        if count >= max_chars {
+                            break 'walk;
+                        }
+                        if pending_space {
+                            out.push(' ');
+                            count += 1;
+                            pending_space = false;
+                            if count >= max_chars {
+                                break 'walk;
+                            }
+                        }
+                        out.push(ch);
+                        count += 1;
+                    }
+                }
                 Child::Element(index) => stack.extend(self.nodes[*index].children.iter().rev()),
             }
         }
-        collapse_whitespace(&raw)
+        out
     }
 
     /// Só o texto que é filho direto do nó (sem o dos elementos dentro dele).

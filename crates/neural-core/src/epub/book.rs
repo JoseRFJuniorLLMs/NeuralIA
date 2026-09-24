@@ -27,6 +27,18 @@ const OPF_MEDIA_TYPE: &str = "application/oebps-package+xml";
 const MAX_COVER_PAGE_BYTES: u64 = 1024 * 1024;
 const MAX_FIELD_CHARS: usize = 1024;
 const MAX_DESCRIPTION_CHARS: usize = 64 * 1024;
+/// `id`, `href`, `properties`, `fallback` de um item do manifest: acima disto
+/// o valor não é de um livro, é um ataque (cada `itemref` copiaria o valor
+/// de novo). Item com `id`/`href` maior é ignorado; o resto fica vazio.
+pub const MAX_ATTR_CHARS: usize = 4 * 1024;
+/// Um tipo MIME tem no máximo 127 + 1 + 127 caracteres (RFC 6838).
+pub const MAX_MEDIA_TYPE_CHARS: usize = 255;
+/// Documentos no spine; o resto é ignorado (com aviso).
+pub const MAX_SPINE_ITEMS: usize = 10_000;
+/// Avisos guardados por livro; cada um cita no máximo `MAX_SHOWN_CHARS`
+/// caracteres do que veio do livro.
+pub const MAX_WARNINGS: usize = 64;
+const MAX_SHOWN_CHARS: usize = 120;
 const FONT_EXTENSIONS: [&str; 5] = ["ttf", "otf", "woff", "woff2", "ttc"];
 const IMAGE_EXTENSIONS: [(&str, &str); 7] = [
     ("jpg", "image/jpeg"),
@@ -257,20 +269,24 @@ pub(crate) fn load_dom(archive: &EpubArchive, path: &str) -> EpubResult<Dom> {
 /// muitos EPUBs reais erram isso, por isso é só aviso.
 fn check_mimetype(archive: &EpubArchive, warnings: &mut Vec<String>) {
     let Some(entry) = archive.entry(MIMETYPE_PATH) else {
-        warnings.push("sem o arquivo mimetype".into());
+        warn(warnings, || "sem o arquivo mimetype".into());
         return;
     };
     if archive.entries().first().map(|first| first.name()) != Some(entry.name()) {
-        warnings.push("mimetype não é a primeira entrada do ZIP".into());
+        warn(warnings, || {
+            "mimetype não é a primeira entrada do ZIP".into()
+        });
     }
     match archive.read_capped(MIMETYPE_PATH, 1024) {
         Ok(bytes) => {
             let value = String::from_utf8_lossy(&bytes);
             if value.trim() != EPUB_MIMETYPE {
-                warnings.push(format!("mimetype inesperado: {:?}", value.trim()));
+                warn(warnings, || {
+                    format!("mimetype inesperado: {:?}", shown(value.trim()))
+                });
             }
         }
-        Err(error) => warnings.push(format!("mimetype ilegível: {error}")),
+        Err(error) => warn(warnings, || format!("mimetype ilegível: {error}")),
     }
 }
 
@@ -295,15 +311,17 @@ fn find_opf(archive: &EpubArchive, warnings: &mut Vec<String>) -> EpubResult<Str
         match preferred.and_then(|node| dom.attr(node, "full-path")) {
             Some(full_path) => match archive.locate("", full_path) {
                 Some((path, _)) => return Ok(path),
-                None => warnings.push(format!(
-                    "container.xml aponta para {:?}, que não existe",
-                    full_path.trim()
-                )),
+                None => warn(warnings, || {
+                    format!(
+                        "container.xml aponta para {:?}, que não existe",
+                        shown(full_path.trim())
+                    )
+                }),
             },
-            None => warnings.push("container.xml sem rootfile".into()),
+            None => warn(warnings, || "container.xml sem rootfile".into()),
         }
     } else {
-        warnings.push("sem META-INF/container.xml".into());
+        warn(warnings, || "sem META-INF/container.xml".into());
     }
     archive
         .entries()
@@ -321,8 +339,32 @@ fn clip(text: String, max_chars: usize) -> String {
     }
 }
 
+/// Um valor do livro citado num aviso: no máximo `MAX_SHOWN_CHARS`
+/// caracteres, sem copiar o resto.
+pub(crate) fn shown(value: &str) -> String {
+    match value.char_indices().nth(MAX_SHOWN_CHARS) {
+        Some((cut, _)) => format!("{}…", &value[..cut]),
+        None => value.to_string(),
+    }
+}
+
+/// Guarda um aviso, até [`MAX_WARNINGS`]. A mensagem só é montada se ainda
+/// houver lugar.
+pub(crate) fn warn(warnings: &mut Vec<String>, message: impl FnOnce() -> String) {
+    if warnings.len() < MAX_WARNINGS {
+        warnings.push(message());
+    }
+}
+
+/// Um atributo curto o bastante para ser guardado (e copiado), aparado.
+fn bounded_attr<'a>(dom: &'a Dom, node: usize, name: &str, max_chars: usize) -> Option<&'a str> {
+    let value = dom.attr(node, name)?.trim();
+    // Bytes >= caracteres: o teste barato primeiro.
+    (value.len() <= max_chars || value.chars().count() <= max_chars).then_some(value)
+}
+
 fn field(dom: &Dom, node: usize) -> Option<String> {
-    let text = clip(dom.text(node), MAX_FIELD_CHARS);
+    let text = dom.text_capped(node, MAX_FIELD_CHARS);
     (!text.is_empty()).then_some(text)
 }
 
@@ -346,20 +388,27 @@ fn parse_metadata(dom: &Dom, package: usize) -> EpubMetadata {
         if let (Some(target), Some(property)) =
             (dom.attr(node, "refines"), dom.attr(node, "property"))
         {
-            let target = target.trim().trim_start_matches('#').to_string();
-            refines
-                .entry(target)
-                .or_default()
-                .push((property.trim().to_string(), dom.text(node)));
+            // Cada valor com teto, e o texto cortado DURANTE a leitura: metas
+            // aninhados não copiam o texto dos descendentes uma vez por nível.
+            let target = clip(
+                target.trim().trim_start_matches('#').to_string(),
+                MAX_FIELD_CHARS,
+            );
+            refines.entry(target).or_default().push((
+                clip(property.trim().to_string(), MAX_FIELD_CHARS),
+                dom.text_capped(node, MAX_FIELD_CHARS),
+            ));
         } else if dom.attr(node, "property").map(str::trim) == Some("belongs-to-collection") {
-            let id = dom.attr(node, "id").map(|id| id.trim().to_string());
-            collections.push((id, dom.text(node)));
+            let id = dom
+                .attr(node, "id")
+                .map(|id| clip(id.trim().to_string(), MAX_FIELD_CHARS));
+            collections.push((id, dom.text_capped(node, MAX_FIELD_CHARS)));
         } else if let (Some(name), Some(content)) =
             (dom.attr(node, "name"), dom.attr(node, "content"))
         {
             named
-                .entry(name.trim().to_ascii_lowercase())
-                .or_insert_with(|| content.trim().to_string());
+                .entry(clip(name.trim().to_ascii_lowercase(), MAX_FIELD_CHARS))
+                .or_insert_with(|| clip(content.trim().to_string(), MAX_FIELD_CHARS));
         }
     }
     let refined = |id: Option<&str>, property: &str| -> Option<String> {
@@ -374,12 +423,12 @@ fn parse_metadata(dom: &Dom, package: usize) -> EpubMetadata {
         let id = dom.attr(node, "id");
         let role = dom
             .attr(node, "role")
-            .map(|role| role.trim().to_string())
+            .map(|role| clip(role.trim().to_string(), MAX_FIELD_CHARS))
             .filter(|role| !role.is_empty())
             .or_else(|| refined(id, "role"));
         let file_as = dom
             .attr(node, "file-as")
-            .map(|value| value.trim().to_string())
+            .map(|value| clip(value.trim().to_string(), MAX_FIELD_CHARS))
             .filter(|value| !value.is_empty())
             .or_else(|| refined(id, "file-as"));
         Some(Creator {
@@ -419,7 +468,7 @@ fn parse_metadata(dom: &Dom, package: usize) -> EpubMetadata {
             }
             "description" => {
                 if metadata.description.is_none() {
-                    let text = clip(dom.text(node), MAX_DESCRIPTION_CHARS);
+                    let text = dom.text_capped(node, MAX_DESCRIPTION_CHARS);
                     metadata.description = (!text.is_empty()).then_some(text);
                 }
             }
@@ -490,7 +539,7 @@ fn parse_manifest(
     warnings: &mut Vec<String>,
 ) -> Vec<ManifestItem> {
     let Some(section) = dom.child(package, "manifest") else {
-        warnings.push("OPF sem <manifest>".into());
+        warn(warnings, || "OPF sem <manifest>".into());
         return Vec::new();
     };
     let mut items: Vec<ManifestItem> = Vec::new();
@@ -499,39 +548,58 @@ fn parse_manifest(
         if !dom.is(node, "item") {
             continue;
         }
-        let id = dom.attr(node, "id").unwrap_or_default().trim().to_string();
-        let href = dom
-            .attr(node, "href")
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+        let (Some(id), Some(href)) = (
+            bounded_attr(dom, node, "id", MAX_ATTR_CHARS),
+            bounded_attr(dom, node, "href", MAX_ATTR_CHARS),
+        ) else {
+            warn(warnings, || {
+                "item do manifest com id ou href longo demais (ignorado)".to_string()
+            });
+            continue;
+        };
         if id.is_empty() || href.is_empty() {
-            warnings.push(format!("item do manifest sem id ou href: {id:?} {href:?}"));
+            warn(warnings, || {
+                format!(
+                    "item do manifest sem id ou href: {:?} {:?}",
+                    shown(id),
+                    shown(href)
+                )
+            });
             continue;
         }
-        if seen.contains_key(&id) {
-            warnings.push(format!("id repetido no manifest (vale o primeiro): {id}"));
+        if seen.contains_key(id) {
+            warn(warnings, || {
+                format!("id repetido no manifest (vale o primeiro): {}", shown(id))
+            });
             continue;
         }
-        let path = archive.locate(opf_path, &href).map(|(path, _)| path);
-        if path.is_none() && resolve_href(opf_path, &href).is_some() {
-            warnings.push(format!("item do manifest não existe no arquivo: {href}"));
+        let path = archive.locate(opf_path, href).map(|(path, _)| path);
+        if path.is_none() && resolve_href(opf_path, href).is_some() {
+            warn(warnings, || {
+                format!("item do manifest não existe no arquivo: {}", shown(href))
+            });
         }
-        seen.insert(id.clone(), items.len());
+        // Um tipo maior do que um tipo MIME pode ser fica vazio: o servidor
+        // cai para a extensão, como para um tipo que não conhece.
+        let media_type = match bounded_attr(dom, node, "media-type", MAX_MEDIA_TYPE_CHARS) {
+            Some(value) => value.to_ascii_lowercase(),
+            None => {
+                warn(warnings, || {
+                    format!("media-type longo demais em {}", shown(href))
+                });
+                String::new()
+            }
+        };
+        seen.insert(id.to_string(), items.len());
         items.push(ManifestItem {
-            id,
-            href,
+            id: id.to_string(),
+            href: href.to_string(),
             path,
-            media_type: dom
-                .attr(node, "media-type")
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase(),
-            properties: tokens(dom.attr(node, "properties")),
-            fallback: dom
-                .attr(node, "fallback")
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
+            media_type,
+            properties: tokens(bounded_attr(dom, node, "properties", MAX_ATTR_CHARS)),
+            fallback: bounded_attr(dom, node, "fallback", MAX_ATTR_CHARS)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
         });
     }
     items
@@ -552,7 +620,7 @@ fn parse_spine(
     warnings: &mut Vec<String>,
 ) -> (Vec<SpineItem>, PageProgression, Option<String>) {
     let Some(section) = dom.child(package, "spine") else {
-        warnings.push("OPF sem <spine>".into());
+        warn(warnings, || "OPF sem <spine>".into());
         return (Vec::new(), PageProgression::Default, None);
     };
     let progression = match dom
@@ -564,10 +632,9 @@ fn parse_spine(
         Some("ltr") => PageProgression::Ltr,
         _ => PageProgression::Default,
     };
-    let toc_id = dom
-        .attr(section, "toc")
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let toc_id = bounded_attr(dom, section, "toc", MAX_ATTR_CHARS)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let by_id: HashMap<&str, &ManifestItem> = manifest
         .iter()
         .rev()
@@ -578,23 +645,35 @@ fn parse_spine(
         if !dom.is(node, "itemref") {
             continue;
         }
+        if spine.len() >= MAX_SPINE_ITEMS {
+            warn(warnings, || {
+                format!("spine cortado em {MAX_SPINE_ITEMS} documentos")
+            });
+            break;
+        }
         let idref = dom.attr(node, "idref").unwrap_or_default().trim();
         let Some(item) = by_id.get(idref) else {
-            warnings.push(format!("itemref sem item no manifest: {idref:?}"));
+            warn(warnings, || {
+                format!("itemref sem item no manifest: {:?}", shown(idref))
+            });
             continue;
         };
         let Some(path) = &item.path else {
-            warnings.push(format!("itemref para arquivo ausente: {}", item.href));
+            warn(warnings, || {
+                format!("itemref para arquivo ausente: {}", shown(&item.href))
+            });
             continue;
         };
+        // Tudo o que se copia por itemref tem teto: o `id` e o tipo vêm do
+        // manifest (já limitados), o caminho é o nome de uma entrada do ZIP.
         spine.push(SpineItem {
-            idref: idref.to_string(),
+            idref: item.id.clone(),
             path: path.clone(),
             media_type: item.media_type.clone(),
             linear: dom
                 .attr(node, "linear")
                 .is_none_or(|value| !value.trim().eq_ignore_ascii_case("no")),
-            properties: tokens(dom.attr(node, "properties")),
+            properties: tokens(bounded_attr(dom, node, "properties", MAX_ATTR_CHARS)),
         });
     }
     (spine, progression, toc_id)
