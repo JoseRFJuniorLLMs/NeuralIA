@@ -7,6 +7,7 @@ pub mod agent_security;
 pub mod config;
 pub mod epub;
 pub mod error;
+pub mod file_risk;
 pub mod history;
 pub mod intent;
 pub mod library;
@@ -66,5 +67,9 @@ pub use research::{
 };
 
 pub use agent_protocol::{AgentAction, AgentElement, AgentRuntimeConfig, ObservedPage};
+pub use file_risk::{
+    DefaultAppTarget, RiskClass, SniffRisk, classify_download_name, default_app_target,
+    display_label, sniff_download,
+};
 pub use semantic_timeline::{SemanticAnchor, SemanticAnchorKind, semantic_anchors_html};
 pub use zettel::{Note, ZettelError, ZettelStore};
