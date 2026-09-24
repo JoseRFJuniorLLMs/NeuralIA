@@ -24,7 +24,8 @@ use crate::gemini_live::{
 };
 #[cfg(test)]
 use crate::ipc::constant_time_eq;
-use crate::ipc::{IpcAction, parse_ipc_message};
+use crate::ipc::{ColumnHint, IpcAction, parse_ipc_message};
+use crate::panel_chrome::{Area, CAPTION_HOT_MARGIN, CaptionReveal, RevealStep, caption_hot_zone};
 use crate::tab_session::{self, Loaded, SessionColumn, SessionGroup, SessionTab, TabSession};
 use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentRuntimeConfig,
@@ -195,6 +196,15 @@ enum UserEvent {
     ClosePalette(u64),
     ExpandComparator(usize),
     MinimizeComparator(usize),
+    /// Voltar a olhar para os botoes da janela na Home: o rato saiu deles,
+    /// ou chegou o prazo de os esconder.
+    CaptionReveal,
+    /// O rato entrou (ou saiu) do "−" ou do "⛶ <IA>" injetados na coluna:
+    /// a dica centrada do app, com o texto escolhido aqui.
+    ColumnHint {
+        col: usize,
+        hint: ColumnHint,
+    },
     /// Ha um arrasto de divisor por atender. O divisor e o x vem dos statics
     /// `RESIZE_*`, nao do evento: assim os movimentos que chegam enquanto
     /// este esta na fila substituem-se uns aos outros em vez de se somarem.
@@ -4411,6 +4421,16 @@ fn caption_buttons_wanted(surface: Surface, bar_visible: bool) -> bool {
     }
 }
 
+/// Se os botoes da janela se veem agora. No comparador fazem parte da barra e
+/// estao sempre la; na Home so com o rato perto (pedido do dono: "nao quero
+/// os botoes visiveis so quando mover o mouse na direcao deles").
+fn caption_buttons_visible(surface: Surface, revealed: bool) -> bool {
+    match surface {
+        Surface::Home => revealed,
+        _ => true,
+    }
+}
+
 /// A faixa de cima da Home, onde se agarra a janela sem moldura.
 fn home_drag_strip(y: f64, scale: f64) -> bool {
     y >= 0.0 && y <= TITLE_TAB_HEIGHT * scale.max(1.0)
@@ -4426,6 +4446,16 @@ fn caption_button_style(index: usize, hovered: bool, theme: &Theme) -> PillStyle
         (2, true) => PillStyle::new(CLOSE_HOVER_RED, CLOSE_HOVER_RED, (255, 255, 255)),
         (_, true) => PillStyle::new(theme.surface_line, theme.surface_line, theme.fg),
         _ => PillStyle::new(theme.surface, theme.surface_line, theme.fg),
+    }
+}
+
+/// O que a dica centrada diz sobre um controlo injetado numa coluna. Vazio
+/// quando o rato saiu dele: a dica some.
+fn column_hint_text(hint: ColumnHint, provider: &str) -> String {
+    match hint {
+        ColumnHint::Minimize => format!("Minimizar {provider}"),
+        ColumnHint::Expand => format!("Expandir {provider}"),
+        ColumnHint::None => String::new(),
     }
 }
 
@@ -5123,7 +5153,7 @@ unsafe extern "system" fn caption_buttons_subclass(
     wparam: WPARAM,
     lparam: LPARAM,
     _subclass_id: usize,
-    _reference_data: usize,
+    reference_data: usize,
 ) -> LRESULT {
     const WM_SYSCOMMAND_NATIVE: u32 = 0x0112;
     const SC_MINIMIZE_NATIVE: usize = 0xF020;
@@ -5242,6 +5272,13 @@ unsafe extern "system" fn caption_buttons_subclass(
             CAPTION_TOOLTIP_BUTTON.store(NATIVE_BUTTON_NONE, Ordering::Release);
             hover_tooltip(hwnd, "");
             InvalidateRect(hwnd, std::ptr::null(), 0);
+            // Saiu dos botoes -- talvez para fora da janela, onde a janela
+            // principal ja nao recebe movimento: o prazo de os esconder tem de
+            // comecar daqui.
+            if reference_data != 0 {
+                let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+                let _ = proxy.send_event(UserEvent::CaptionReveal);
+            }
             DefSubclassProc(hwnd, message, wparam, lparam)
         }
         WM_CAPTURECHANGED | WM_CANCELMODE => {
@@ -6329,6 +6366,8 @@ struct App {
     exit_button: Option<HWND>,
     home_button: Option<HWND>,
     caption_buttons: Option<HWND>,
+    /// Na Home os botoes da janela so se veem com o rato perto deles.
+    caption_reveal: CaptionReveal,
     splitters: [Option<HWND>; COMPARATOR_COLUMNS - 1],
     /// Partilhado com o menu do botao direito de cada coluna: o WebView2 monta
     /// esse menu num callback fora do `&mut App`, e o rotulo tem de dizer o
@@ -6448,6 +6487,7 @@ impl App {
             exit_button: None,
             home_button: None,
             caption_buttons: None,
+            caption_reveal: CaptionReveal::default(),
             splitters: [None; COMPARATOR_COLUMNS - 1],
             // Ligada por omissao: a aplicacao serve para ler.
             // Nada rola sem o utilizador dizer que sim.
@@ -6920,6 +6960,7 @@ impl App {
 
     fn show_home(&mut self) {
         debug_log(format_args!("show_home (surface era {:?})", self.surface));
+        self.caption_reveal.reset();
         self.close_side_panel();
         self.close_service_panel();
         self.close_live_panel();
@@ -8423,6 +8464,9 @@ impl App {
             }
             IpcAction::Expand { col } if col == col_index => {
                 Some(UserEvent::ExpandComparator(col_index))
+            }
+            IpcAction::Hint { col, hint } if col == col_index => {
+                Some(UserEvent::ColumnHint { col, hint })
             }
             other => common_ipc_event(other),
         }
@@ -10032,13 +10076,20 @@ impl App {
             self.caption_buttons = None;
         }
 
+        let visible = caption_buttons_visible(self.surface, self.caption_reveal.shown());
         if self.caption_buttons.is_none() {
             unsafe {
+                // Nasce escondida na Home: aparecer e desaparecer logo a
+                // seguir era um piscar no canto a cada regresso a Home.
                 let created = CreateWindowExW(
                     0,
                     windows_sys::w!("STATIC"),
                     windows_sys::w!("NeuralIA.CaptionControls"),
-                    WS_CHILD | WS_VISIBLE,
+                    if visible {
+                        WS_CHILD | WS_VISIBLE
+                    } else {
+                        WS_CHILD
+                    },
                     left.round() as i32,
                     0,
                     width.round() as i32,
@@ -10051,11 +10102,12 @@ impl App {
                 if created.is_null() {
                     return;
                 }
+                let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
                 if SetWindowSubclass(
                     created,
                     Some(caption_buttons_subclass),
                     CAPTION_BUTTONS_SUBCLASS_ID,
-                    0,
+                    proxy_ptr,
                 ) == 0
                 {
                     DestroyWindow(created);
@@ -10076,9 +10128,61 @@ impl App {
                     height.round() as i32,
                     SWP_NOACTIVATE,
                 );
-                ShowWindow(buttons, SW_SHOW);
+                // SW_SHOWNOACTIVATE: mostrar os botoes nunca rouba o foco a
+                // quem esta a escrever.
+                ShowWindow(buttons, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
                 InvalidateRect(buttons, std::ptr::null(), 1);
             }
+        }
+    }
+
+    /// Onde estao os tres botoes da janela na Home, em pixels do cliente.
+    fn home_caption_area(&self) -> Option<Area> {
+        let window = self.window.as_ref()?;
+        let layout = BarLayout::with_rows(
+            window.inner_size().width as f64,
+            window.scale_factor(),
+            true,
+            BarColumns::even(COMPARATOR_COLUMNS),
+            [TabRow::empty(); COMPARATOR_COLUMNS],
+        );
+        let left = layout.window_minimize.x;
+        let right = layout.window_close.x + layout.window_close.width;
+        Some(Area {
+            x: left,
+            y: 0.0,
+            width: (right - left).max(1.0),
+            height: layout.window_close.height.max(1.0),
+        })
+    }
+
+    /// Na Home: os botoes aparecem quando o rato entra na zona deles e
+    /// somem 300 ms depois de ele sair (CaptionReveal). A posicao do rato e
+    /// lida ao Windows, nao ao ultimo CursorMoved: por cima dos proprios
+    /// botoes (outra janela) ou fora da janela a janela principal nao ve
+    /// movimento nenhum.
+    fn refresh_caption_reveal(&mut self) {
+        if self.surface != Surface::Home {
+            return;
+        }
+        let (Some(window), Some(area)) = (&self.window, self.home_caption_area()) else {
+            return;
+        };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
+        let mut point = POINT { x: 0, y: 0 };
+        let inside =
+            unsafe { GetCursorPos(&mut point) != 0 && ScreenToClient(owner, &mut point) != 0 }
+                && caption_hot_zone(area, CAPTION_HOT_MARGIN * scale)
+                    .contains(point.x as f64, point.y as f64);
+        match self.caption_reveal.observe(inside, now_ms()) {
+            RevealStep::Show | RevealStep::Hide => self.sync_caption_buttons(),
+            RevealStep::ScheduleHide(delay) => self
+                .timers
+                .after(Duration::from_millis(delay), UserEvent::CaptionReveal),
+            RevealStep::Nothing => {}
         }
     }
 
@@ -10422,6 +10526,22 @@ impl App {
             CursorIcon::Default
         });
         self.request_redraw();
+    }
+
+    /// A dica centrada de um controlo injetado numa coluna. O texto e o nome
+    /// da IA saem daqui; a pagina so disse qual dos controlos tem o rato.
+    fn show_column_hint(&self, col: usize, hint: ColumnHint) {
+        let Some(owner) = self.window.as_ref().and_then(window_hwnd) else {
+            return;
+        };
+        let provider = self
+            .comparator
+            .as_ref()
+            .filter(|_| self.surface == Surface::Comparator)
+            .and_then(|comp| comp.views.get(col))
+            .map(|view| view.name);
+        let text = provider.map_or(String::new(), |name| column_hint_text(hint, name));
+        hover_tooltip(owner, &text);
     }
 
     fn update_bar_hover(&mut self) {
@@ -14420,6 +14540,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ViewSourceTarget(target) => self.view_source_target(target),
             UserEvent::AutoScrollTick(token) => self.auto_scroll_tick(token),
             UserEvent::HideSplash(token) => self.hide_splash(token),
+            UserEvent::CaptionReveal => self.refresh_caption_reveal(),
             UserEvent::GmailProbe(token) => {
                 if token == self.gmail_probe_token && self.gmail_monitor.is_none() {
                     self.maybe_start_gmail_monitor();
@@ -14555,6 +14676,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.minimize_comparator(idx);
                 }
             }
+            UserEvent::ColumnHint { col, hint } => self.show_column_hint(col, hint),
             UserEvent::ResizeComparator => {
                 // Limpar a marca ANTES de ler: um movimento que chegue durante
                 // o reposicionamento volta a enfileirar e nao se perde. Ao
@@ -14605,6 +14727,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     self.ensure_window_subclass();
                     self.sync_caption_buttons();
+                    self.refresh_caption_reveal();
                     self.needs_clear = true;
                     self.position_omnibox();
                     self.request_redraw();
@@ -14748,6 +14871,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.update_bar_hover();
                 }
                 self.update_home_go_hover();
+                self.refresh_caption_reveal();
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor = (-1.0, -1.0);
@@ -14755,6 +14879,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.update_bar_hover();
                 }
                 self.update_home_go_hover();
+                self.refresh_caption_reveal();
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Focused(focused) => self.on_focus_changed(focused),
@@ -20272,12 +20397,12 @@ process.stdout.write(JSON.stringify({ posts, state, submits: form.submits }));
 
         // Nenhum handler que dispare acao nativa aceita evento sintetico:
         // os 4 de sempre + os 4 da pergunta replicada (focusin, Enter,
-        // botao de enviar, submit).
+        // botao de enviar, submit) + os 2 da dica centrada (entrar e sair).
         assert_eq!(
             COMPARATOR_INJECT_SCRIPT
                 .matches("if (!event.isTrusted")
                 .count(),
-            8
+            10
         );
         assert!(!COMPARATOR_INJECT_SCRIPT.contains("expand.onclick"));
         assert!(!COMPARATOR_INJECT_SCRIPT.contains("minimize.onclick"));
@@ -21605,6 +21730,78 @@ __fire('keydown', { key: 'F8' });
             ],
             "erros: {}",
             results[0]["errors"]
+        );
+    }
+
+    /// O "−" e o "⛶ <IA>" que embarcam no COMPARATOR_INJECT_SCRIPT pedem a
+    /// dica centrada do app ao passar o rato, e so com eventos do utilizador.
+    /// Corre o script QUE EMBARCA no Node e leva o que ele publica pelo mesmo
+    /// caminho nativo: parser do canal -> evento da coluna -> texto da dica.
+    #[test]
+    fn column_controls_ask_for_the_centered_hint_on_trusted_hover() {
+        const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let drive = r#"
+document.readyState = 'interactive';
+__fire('DOMContentLoaded');
+__drain();
+function __on(id, type, extra) {
+  for (const l of __listeners.slice()) {
+    if (l.type !== type || !l.target || l.target.id !== id) continue;
+    try { l.handler.call(l.target, __event(type, extra)); }
+    catch (e) { __errors.push(type + ': ' + e.message); }
+  }
+}
+__on('neuralia-comp-minimize', 'mouseenter');
+__on('neuralia-comp-minimize', 'mouseleave');
+__on('neuralia-comp-expand', 'mouseenter', { isTrusted: false });
+__on('neuralia-comp-expand', 'mouseenter');
+__on('neuralia-comp-expand', 'mouseleave');
+"#;
+        let script = format!(
+            "window.__neuralia_col_index = 1; window.__neuralia_col_name = 'ChatGPT';\n{}",
+            COMPARATOR_INJECT_SCRIPT.replace("__NEURALIA_CAP__", CAP)
+        );
+        let cases = [serde_json::json!({
+            "name": "comparator",
+            "href": "https://chatgpt.com/",
+            "script": script,
+            "drive": drive,
+        })];
+        let program = format!(
+            "const INPUT = {};\n{}",
+            serde_json::json!({ "cases": cases }),
+            INJECTED_SCRIPT_HARNESS
+        );
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("harness json");
+        let errors = &results[0]["errors"];
+        assert_eq!(errors.as_array().map(Vec::len), Some(0), "erros: {errors}");
+        let texts: Vec<String> = results[0]["posted"]
+            .as_array()
+            .expect("posted")
+            .iter()
+            .filter_map(|message| parse_ipc_message(message.as_str()?, CAP, 3))
+            .map(|action| match App::column_ipc_event_impl(1, action) {
+                Some(UserEvent::ColumnHint { col: 1, hint }) => column_hint_text(hint, "ChatGPT"),
+                other => panic!("a coluna publicou outra coisa: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            ["Minimizar ChatGPT", "", "Expandir ChatGPT", ""],
+            "o mouseenter sintetico nao pode pedir dica"
+        );
+
+        // Uma coluna so pede dicas para si propria.
+        assert!(
+            App::column_ipc_event_impl(
+                0,
+                IpcAction::Hint {
+                    col: 1,
+                    hint: ColumnHint::Expand
+                }
+            )
+            .is_none()
         );
     }
 
@@ -28637,13 +28834,16 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
       listen(expand, 'click', (event) => {
         if (!event.isTrusted) return;
         event.preventDefault(); event.stopPropagation();
+        act('hint', { col:colIndex, id:'none' });
         act('expand', { col:colIndex });
       });
 
       const minimize = createElement('button');
       minimize.id = 'neuralia-comp-minimize';
       minimize.textContent = '−';
-      minimize.title = 'Minimizar ' + colName;
+      // A dica e a centrada do app (canal 'hint'), nao o title do browser:
+      // com os dois, apareciam duas dicas diferentes ao mesmo tempo.
+      minimize.ariaLabel = 'Minimizar ' + colName;
       assign(minimize.style, {
         position:'absolute', top:'10px', right:'112px',
         pointerEvents:'auto', width:'30px', height:'28px',
@@ -28656,8 +28856,25 @@ const COMPARATOR_INJECT_SCRIPT: &str = r#"
       listen(minimize, 'click', (event) => {
         if (!event.isTrusted) return;
         event.preventDefault(); event.stopPropagation();
+        act('hint', { col:colIndex, id:'none' });
         act('minimize', { col:colIndex });
       });
+
+      // Passar o rato pelo "−" e pelo "⛶ <IA>" mostra a dica centrada do
+      // app, a mesma da barra. So eventos do utilizador (isTrusted); a pagina
+      // escolhe apenas QUAL das dicas, o texto e o nome vem do nativo.
+      function hintOn(button, id) {
+        listen(button, 'mouseenter', (event) => {
+          if (!event.isTrusted) return;
+          act('hint', { col:colIndex, id:id });
+        });
+        listen(button, 'mouseleave', (event) => {
+          if (!event.isTrusted) return;
+          act('hint', { col:colIndex, id:'none' });
+        });
+      }
+      hintOn(minimize, 'minimize');
+      hintOn(expand, 'expand');
 
       const rail = createElement('div');
       rail.id = 'neuralia-response-rail';
