@@ -1433,6 +1433,10 @@ mod tests {
         )
         .expect("copiar um executavel");
         let mut running = std::process::Command::new(&uninstaller)
+            // Pasta de trabalho propria: sem ela, o filho herdava a do processo de
+            // testes, que outro teste pode ter posto DENTRO de uma pasta de
+            // instalacao -- e o Windows nao apaga a pasta de trabalho de um processo.
+            .current_dir(std::env::temp_dir())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

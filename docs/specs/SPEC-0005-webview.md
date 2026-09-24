@@ -110,13 +110,10 @@ Handlers on injected user controls MUST require `event.isTrusted`; synthesized
 pointer and keyboard events are ignored. Automatic observers such as Gmail,
 research-answer capture and the bounded agent observer are not user-event
 handlers, but their messages still require the private per-WebView capability.
-One top-frame handler acts on a message rather than on a user gesture: the
-keymap turns a ctrl+wheel forwarded by one of the page's own frames
-(`postMessage`, trusted `message` event, sender must be a frame whose `top` is
-this window) into `zoomin`/`zoomout`, and nothing else. The child-frame side
-holds no capability and posts nothing to the native side; since any frame of
-the page can send the same message, a page can step the zoom this way (SPEC-0009,
-gate `ctrl_wheel_over_a_frame_zooms_through_the_top_keymap`).
+No injected handler acts on a page message instead of a user gesture: a ctrl+wheel
+over a child frame does not zoom (the wheel does not cross the frame boundary),
+and page `postMessage` traffic never reaches `act` (gate
+`a_page_message_never_zooms_the_app_and_frames_forward_nothing`).
 
 The floating omnibox (palette) is a native Win32 control, not an `<input>`
 inside page DOM. A remote page can only request that it open through the

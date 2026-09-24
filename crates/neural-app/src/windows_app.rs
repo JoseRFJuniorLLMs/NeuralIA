@@ -23465,16 +23465,15 @@ __drain();
         assert!(!source.contains(&forbidden));
     }
 
-    /// Ctrl+roda e pinca por cima de um iframe (previa de artefacto do Claude,
-    /// canvas do Gemini, YouTube/Maps embutido) nao faziam nada: a roda nao
-    /// atravessa o frame e o mapa de teclas so vive no documento principal. O
-    /// mapa que embarca corre duas vezes no Node: no frame filho (so
-    /// reencaminha, sem token nem canal) e no principal, que recebe o que o
-    /// filho mandou e publica os mesmos zoomin/zoomout, lidos pelo parser
-    /// nativo.
+    /// A roda nao atravessa a fronteira de um iframe, e reencaminhar o ctrl+roda
+    /// por postMessage deixava QUALQUER frame da pagina (um anuncio, por
+    /// exemplo) mudar o zoom do app sem um gesto do utilizador. Por isso nao
+    /// ha reencaminhamento: o frame filho nao manda nada ao principal, e o
+    /// principal nao transforma mensagens da pagina em zoom.
     #[test]
-    fn ctrl_wheel_over_a_frame_zooms_through_the_top_keymap() {
+    fn a_page_message_never_zooms_the_app_and_frames_forward_nothing() {
         const CAP: &str = "0123456789abcdef0123456789abcdef";
+        let keymap = NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", CAP);
         let child_drive = r#"
 const __sent = [];
 window.top.postMessage = function (message, origin) { __sent.push([message, origin]); };
@@ -23482,106 +23481,66 @@ document.readyState = 'interactive';
 __fire('DOMContentLoaded');
 __drain();
 __fire('wheel', { ctrlKey: true, deltaY: -100, deltaMode: 0 });
-__fire('wheel', { ctrlKey: false, deltaY: -100, deltaMode: 0 });
-__fire('wheel', { ctrlKey: true, deltaY: -100, deltaMode: 0, isTrusted: false });
-__fire('wheel', { ctrlKey: true, deltaY: -100, deltaMode: 0, defaultPrevented: true });
 __fire('wheel', { ctrlKey: true, deltaY: 3, deltaMode: 1 });
 __drain();
-for (const [message, origin] of __sent) {
-  __created.push('fwd ' + origin + ' ' + JSON.stringify(message));
-}
+for (const [message] of __sent) __created.push('fwd ' + JSON.stringify(message));
 "#;
-        let keymap = NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", CAP);
-        let child = [serde_json::json!({
-            "name": "child frame",
-            "href": "https://claude.site/artifacts/1",
-            "child": true,
-            "script": keymap,
-            "drive": child_drive,
-        })];
-        let program = format!(
-            "const INPUT = {};\n{}",
-            serde_json::json!({ "cases": child }),
-            INJECTED_SCRIPT_HARNESS
-        );
-        let results: Vec<serde_json::Value> =
-            serde_json::from_str(&run_node_program(&program)).expect("harness json");
-        let errors = &results[0]["errors"];
-        assert_eq!(errors.as_array().map(Vec::len), Some(0), "erros: {errors}");
-        // O frame filho nunca fala com o nativo: nem token, nem canal.
-        assert_eq!(
-            results[0]["posted"].as_array().map(Vec::len),
-            Some(0),
-            "o frame filho publicou no canal: {}",
-            results[0]["posted"]
-        );
-        let forwarded: Vec<serde_json::Value> = results[0]["created"]
-            .as_array()
-            .expect("created")
-            .iter()
-            .filter_map(|line| line.as_str()?.strip_prefix("fwd * "))
-            .map(|json| serde_json::from_str(json).expect("mensagem reencaminhada"))
-            .collect();
-        // So os dois gestos do utilizador com Ctrl que a pagina do frame nao
-        // tratou: nada sem Ctrl, sintetico ou com preventDefault.
-        assert_eq!(
-            forwarded,
-            vec![
-                serde_json::json!({ "neuraliaWheelZoom": 1, "dy": -100, "mode": 0 }),
-                serde_json::json!({ "neuraliaWheelZoom": 1, "dy": 3, "mode": 1 }),
-            ]
-        );
-
-        // O documento principal recebe-os de um frame dele e publica o zoom;
-        // o mesmo dado vindo da propria janela, de outra janela ou torto cai.
-        let top_drive = format!(
-            r#"
+        let top_drive = r#"
 document.readyState = 'interactive';
 __fire('DOMContentLoaded');
 __drain();
-const frame = {{ top: window }};
-const DATA = {data};
-for (const data of DATA) __fire('message', {{ data, source: frame }});
-__fire('message', {{ data: DATA[0], source: window }});
-__fire('message', {{ data: DATA[0], source: {{ top: {{}} }} }});
-__fire('message', {{ data: DATA[0], source: null }});
-__fire('message', {{ data: DATA[0], source: frame, isTrusted: false }});
-__fire('message', {{ data: {{ neuraliaWheelZoom: 1, dy: 'x', mode: 0 }}, source: frame }});
-__fire('message', {{ data: 'neuraliaWheelZoom', source: frame }});
+const frame = { top: window };
+__fire('message', { data: { neuraliaWheelZoom: 1, dy: -100, mode: 0 }, source: frame });
+__fire('message', { data: { neuraliaWheelZoom: 1, dy: 3, mode: 1 }, source: frame });
+__fire('message', { data: 'zoomin', source: frame });
 __drain();
-"#,
-            data = serde_json::Value::Array(forwarded)
-        );
-        let top = [serde_json::json!({
-            "name": "top frame",
-            "href": "https://claude.ai/chat/1",
-            "script": keymap,
-            "drive": top_drive,
-        })];
+"#;
+        let cases = [
+            serde_json::json!({
+                "name": "child frame",
+                "href": "https://claude.site/artifacts/1",
+                "child": true,
+                "script": keymap,
+                "drive": child_drive,
+            }),
+            serde_json::json!({
+                "name": "top frame",
+                "href": "https://claude.ai/chat/1",
+                "script": keymap,
+                "drive": top_drive,
+            }),
+        ];
         let program = format!(
             "const INPUT = {};\n{}",
-            serde_json::json!({ "cases": top }),
+            serde_json::json!({ "cases": cases }),
             INJECTED_SCRIPT_HARNESS
         );
         let results: Vec<serde_json::Value> =
             serde_json::from_str(&run_node_program(&program)).expect("harness json");
-        let errors = &results[0]["errors"];
-        assert_eq!(errors.as_array().map(Vec::len), Some(0), "erros: {errors}");
-        let actions: Vec<IpcAction> = results[0]["posted"]
+        for result in &results {
+            let errors = &result["errors"];
+            assert_eq!(errors.as_array().map(Vec::len), Some(0), "erros: {errors}");
+        }
+        let forwarded = results[0]["created"]
             .as_array()
-            .expect("posted")
+            .expect("created")
             .iter()
-            .filter_map(|message| parse_ipc_message(message.as_str()?, CAP, 3))
-            .collect();
+            .filter(|line| line.as_str().is_some_and(|l| l.starts_with("fwd ")))
+            .count();
         assert_eq!(
-            actions,
-            vec![IpcAction::ZoomIn, IpcAction::ZoomOut],
-            "um entalhe para cima e uma linha para baixo, vindos do frame"
+            forwarded, 0,
+            "o frame filho reencaminhou a roda para o principal"
         );
         assert_eq!(
             results[0]["posted"].as_array().map(Vec::len),
-            Some(2),
-            "o principal so publica o zoom"
+            Some(0),
+            "o frame filho publicou no canal"
+        );
+        assert_eq!(
+            results[1]["posted"].as_array().map(Vec::len),
+            Some(0),
+            "uma mensagem da pagina virou acao no principal: {}",
+            results[1]["posted"]
         );
     }
 
@@ -29374,29 +29333,6 @@ const fn rgb3(color: Rgb) -> u32 {
 /// na fase de captura, que se apanham os atalhos antes de o site os consumir.
 const NEURALIA_KEYMAP_SCRIPT: &str = r#"
 (function () {
-  // Frames filhos (a previa de um artefacto do Claude, o canvas do Gemini, um
-  // YouTube ou um Maps embutido): a roda nao atravessa a fronteira do frame, e
-  // ctrl+roda ou a pinca por cima deles nao faziam nada. Aqui nao ha token nem
-  // canal -- so se passa ao documento principal, por postMessage, o giro de um
-  // ctrl+wheel do utilizador que a pagina do frame nao tratou. O principal so
-  // o transforma em zoomin/zoomout (os degraus do app), mais nada.
-  if (window.top === window) return;
-  if (window.__neuralia_wheel_forward) { return; }
-  window.__neuralia_wheel_forward = true;
-  const top = window.top;
-  const later = setTimeout;
-  window.addEventListener('wheel', function (e) {
-    if (!e.isTrusted || !e.ctrlKey) { return; }
-    const wheel = e;
-    later(function () {
-      if (wheel.defaultPrevented) { return; }
-      try {
-        top.postMessage({ neuraliaWheelZoom: 1, dy: Number(wheel.deltaY), mode: Number(wheel.deltaMode) }, '*');
-      } catch (err) {}
-    }, 0);
-  }, { passive: true });
-})();
-(function () {
   // WRY/WebView2 injeta initialization scripts em child frames no Windows.
   // Capability e controles nativos pertencem somente ao documento principal.
   if (window.top !== window) return;
@@ -29586,24 +29522,6 @@ const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       if (action) { act(action); }
     }, 0);
   }, { passive: true });
-  // O ctrl+wheel reencaminhado por um frame DESTA pagina (source.top e esta
-  // janela; a propria janela nao conta). Qualquer frame o pode forjar: por
-  // isso daqui so sai um degrau de zoom de cada vez, pelo mesmo acumulador.
-  window.addEventListener('message', function (e) {
-    if (!e.isTrusted) { return; }
-    const data = e.data;
-    if (!data || typeof data !== 'object' || data.neuraliaWheelZoom !== 1) { return; }
-    let fromFrame = false;
-    try { fromFrame = !!e.source && e.source !== window && e.source.top === window; } catch (err) {}
-    if (!fromFrame) { return; }
-    const mode = Number(data.mode);
-    const action = wheelZoomAction({
-      deltaY: Number(data.dy),
-      deltaMode: (mode === 1 || mode === 2) ? mode : 0,
-      timeStamp: e.timeStamp
-    });
-    if (action) { act(action); }
-  });
 })();
 "#;
 

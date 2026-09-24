@@ -38,15 +38,12 @@ only one channel is a bug, not a limitation.
   controls stay off, so nothing zooms twice. Gate:
   `ctrl_wheel_and_touchpad_pinch_zoom_through_the_app_steps` (runs the shipped
   keymap under Node). The pinch path was not exercised on touchpad hardware.
-- The same gesture over an iframe (an artifact preview, an embedded video or
-  map) zooms too: the wheel event does not cross the frame boundary, so the
-  keymap's child-frame part forwards a trusted, unhandled ctrl+wheel to the top
-  document with `postMessage` (no capability, no native message), and the top
-  keymap accepts it only from a frame of its own page, feeding the same
-  accumulator. Any frame of the page can send that message, so a page can step
-  the zoom this way; nothing but `zoomin`/`zoomout` comes out of it. Gate:
-  `ctrl_wheel_over_a_frame_zooms_through_the_top_keymap` (runs the shipped
-  keymap as a child frame and as the top frame under Node).
+- Over an iframe (an artifact preview, an embedded video or map) Ctrl+wheel
+  does not zoom: the gesture stays with the frame. Forwarding it to the top
+  document with `postMessage` was tried and removed before 2.1.8, because any
+  frame of the page could then step the app zoom without a user gesture. Gate:
+  `a_page_message_never_zooms_the_app_and_frames_forward_nothing` (runs the
+  shipped keymap as a child frame and as the top frame under Node).
 - F11 toggles fullscreen for the current comparator column; F8 toggles auto-scroll;
   1/2/3 expand a column and 0 restores.
 - Backspace and the digits are ignored while typing in a field.

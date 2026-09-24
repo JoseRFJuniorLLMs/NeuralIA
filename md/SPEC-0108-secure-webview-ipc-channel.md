@@ -101,13 +101,9 @@ function act(action, args) {
 Nenhum script usa `window.ipc` (global do wry, envenenável pela página antes
 de ser lido tarde) nem `location.href` para ações.
 
-Todos os handlers que chamam `act` continuam a exigir `event.isTrusted`. O
-único que não parte de um gesto na própria página é o do zoom reencaminhado:
-o `message` (confiável, vindo de um frame desta página) com um ctrl+roda que um
-iframe não tratou vira `zoomin`/`zoomout` e mais nada. O lado do frame filho
-não tem capability nem fala com o nativo; como qualquer frame da página pode
-mandar a mesma mensagem, uma página consegue mudar o zoom por aqui (SPEC-0009,
-gate `ctrl_wheel_over_a_frame_zooms_through_the_top_keymap`).
+Todos os handlers que chamam `act` continuam a exigir `event.isTrusted`. Nenhum
+reage a uma mensagem da página em vez de um gesto: o ctrl+roda por cima de um
+iframe não faz zoom (gate `a_page_message_never_zooms_the_app_and_frames_forward_nothing`).
 
 ### 3.3 Lado nativo
 
