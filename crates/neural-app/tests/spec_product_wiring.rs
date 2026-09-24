@@ -29,6 +29,8 @@ const ALL_SOURCES: &str = concat!(
     include_str!("../src/windows_app/tests.rs"),
     "\n",
     include_str!("../src/windows_app/theme.rs"),
+    "\n",
+    include_str!("../src/windows_app/icons.rs"),
 );
 const APP: &str = ALL_SOURCES;
 const IPC: &str = include_str!("../src/ipc.rs");

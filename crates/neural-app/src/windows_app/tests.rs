@@ -5833,7 +5833,15 @@ fn all_sources_lists_every_module() {
 /// windows-latest) o `include_str!` traz CRLF, e um `split("\n}\n")` nao
 /// encontrava nada: o gate corria sobre o resto do ficheiro.
 fn shipped_source() -> String {
-    all_sources()
+    let mut out = include_str!("../windows_app.rs").replace("\r\n", "\n");
+    for (name, content) in ALL_MODULES {
+        if *name != "tests.rs" {
+            out.push('\n');
+            out.push_str(&content.replace("\r\n", "\n"));
+        }
+    }
+    out.push_str("\n#[cfg(test)]\nmod tests {\n");
+    out
 }
 
 /// Corre `program` no Node (o mesmo motor de JS que os testes de CI dos
