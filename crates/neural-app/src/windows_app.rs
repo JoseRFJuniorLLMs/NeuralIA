@@ -6322,25 +6322,38 @@ fn note_capture_decision(
 /// existe AGORA -- e, no Ctrl+Shift+Z, nunca se ele for privado -- ou a
 /// WebView unica (Externo, Leitor, PDF). `columns` e `split` sao os do
 /// proprio comparador (`comp.views`, `comp.split`): o `private` e lido aqui,
-/// do Split, e nao passado a parte. Generica para o gate a correr sem
-/// WebViews.
+/// do Split, e nao passado a parte -- e volta com a WebView, para o aviso do
+/// "Salvar nota" dizer que foi no modo privado. Generica para o gate a correr
+/// sem WebViews.
 fn note_read_view<'a, V>(
     target: Option<PageTarget>,
     via: NoteVia,
     columns: &'a [ComparatorView<V>],
     split: Option<&'a SplitView<V>>,
     main: Option<&'a V>,
-) -> Result<&'a V, NoteCapture> {
+) -> Result<NoteRead<'a, V>, NoteCapture> {
     match note_capture_decision(target, via, split.map(|split| split.private)) {
         NoteCapture::Read => {}
         refused => return Err(refused),
     }
+    let read = |view: &'a V, private: bool| NoteRead { view, private };
     match target {
-        Some(PageTarget::Column(index)) => columns.get(index).map(|column| &column.webview),
-        Some(PageTarget::Split) => split.map(|split| &split.webview),
-        None => main,
+        Some(PageTarget::Column(index)) => columns
+            .get(index)
+            .map(|column| read(&column.webview, false)),
+        Some(PageTarget::Split) => split.map(|split| read(&split.webview, split.private)),
+        None => main.map(|view| read(view, false)),
     }
     .ok_or(NoteCapture::NoPage)
+}
+
+/// A WebView de que se le a selecao e se ela e a do Split privado (so o
+/// "Salvar nota" chega a le-la; o aviso diz que a nota foi guardada no modo
+/// privado).
+#[derive(Debug, PartialEq, Eq)]
+struct NoteRead<'a, V> {
+    view: &'a V,
+    private: bool,
 }
 
 /// O aviso do painel privado.
@@ -15390,24 +15403,25 @@ impl App {
         // colunas e o Split do proprio comparador (gate
         // `a_note_request_reads_its_own_webview_and_never_the_private_split`).
         let comp = self.comparator.as_ref();
-        let split = comp.and_then(|comp| comp.split.as_ref());
-        let webview = match note_read_view(
+        // So o "Salvar nota" chega a ler o Split privado; `private` vem da
+        // mesma decisao, e o aviso di-lo-a.
+        let NoteRead {
+            view: webview,
+            private,
+        } = match note_read_view(
             target,
             via,
             comp.map_or(&[][..], |comp| comp.views.as_slice()),
-            split,
+            comp.and_then(|comp| comp.split.as_ref()),
             self.webview.as_ref(),
         ) {
-            Ok(webview) => webview,
+            Ok(read) => read,
             Err(NoteCapture::RefusePrivate) => {
                 self.show_splash(NOTE_PRIVATE_REFUSAL.to_string(), 3);
                 return;
             }
             Err(NoteCapture::Read | NoteCapture::NoPage) => return,
         };
-        // So o "Salvar nota" chega a ler o Split privado; o aviso di-lo-a.
-        let private =
-            matches!(target, Some(PageTarget::Split)) && split.is_some_and(|split| split.private);
         let source = note_capture_source(
             via,
             target,
@@ -40166,7 +40180,10 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
                             split,
                             Some(&main)
                         ),
-                        Ok(&column.webview),
+                        Ok(NoteRead {
+                            view: &column.webview,
+                            private: false
+                        }),
                         "coluna {index}"
                     );
                 }
@@ -40189,7 +40206,10 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
                     Some(&normal),
                     Some(&main)
                 ),
-                Ok(&90)
+                Ok(NoteRead {
+                    view: &90,
+                    private: false
+                })
             );
             assert_eq!(
                 note_read_view(
@@ -40220,7 +40240,10 @@ __fire('keydown', { key: 'Z', ctrlKey: true, shiftKey: true });
                     Some(&private),
                     Some(&main)
                 ),
-                Ok(&main)
+                Ok(NoteRead {
+                    view: &main,
+                    private: false
+                })
             );
             assert_eq!(
                 note_read_view::<u8>(None, NoteVia::Shortcut, &[], None, None),
@@ -40478,6 +40501,8 @@ __state('salva');
                 fullscreen: false,
                 private: true,
             };
+            // Le o Split privado e sabe que e ele: o aviso diz "Modo
+            // privado". Nas colunas, no Split normal e na WebView unica, nao.
             assert_eq!(
                 note_read_view(
                     Some(PageTarget::Split),
@@ -40486,8 +40511,33 @@ __state('salva');
                     Some(&private_split),
                     Some(&70)
                 ),
-                Ok(&90)
+                Ok(NoteRead {
+                    view: &90,
+                    private: true
+                }),
+                "o Salvar nota do Split privado nao se sabe privado"
             );
+            let normal_split = SplitView {
+                webview: 91u8,
+                source_index: 0,
+                context_id: None,
+                fullscreen: false,
+                private: false,
+            };
+            for (target, split, expected) in [
+                (Some(PageTarget::Split), &normal_split, &91),
+                (Some(PageTarget::Column(1)), &private_split, &11),
+                (None, &private_split, &70),
+            ] {
+                assert_eq!(
+                    note_read_view(target, NoteVia::Bar, &columns, Some(split), Some(&70)),
+                    Ok(NoteRead {
+                        view: expected,
+                        private: false
+                    }),
+                    "{target:?}"
+                );
+            }
 
             // 3. A fonte e a que o nativo conhece: o `Source` da WebView (ou o
             //    artigo do Leitor, o PDF); o Ctrl+Shift+Z nem a pede.
