@@ -1,7 +1,7 @@
-/// Avanca uma pagina, parando no fim em vez de dar a volta. Usa a altura visivel
+﻿/// Avanca uma pagina, parando no fim em vez de dar a volta. Usa a altura visivel
 /// menos uma faixa de sobreposicao, para nao se perder a linha que se estava a
 /// ler. Corre no documento e tambem nos frames a que conseguimos chegar.
-pub(super) const AUTO_SCROLL_SCRIPT: &str = r#"
+pub(in crate::windows_app) const AUTO_SCROLL_SCRIPT: &str = r#"
 (function () {
   // O nosso visualizador de PDF sabe avancar uma pagina inteira.
   if (typeof window.__neuralia_next_page === 'function') {
@@ -72,24 +72,24 @@ pub(super) const AUTO_SCROLL_SCRIPT: &str = r#"
 
 /// Corre no painel do Ctrl+H quando ele foi aberto pelo botao Notas. A
 /// guarda deixa-o inofensivo enquanto o `PANEL_HTML` nao tiver a secao.
-pub(super) const PANEL_SHOW_NOTES_SCRIPT: &str =
+pub(in crate::windows_app) const PANEL_SHOW_NOTES_SCRIPT: &str =
     "window.neuraliaShowSection && window.neuraliaShowSection('notes')";
 
 /// O botao Notas com o painel ja aberto: nas Notas fecha (pelo mesmo
 /// caminho do X, que salva o editor antes), no Historico mostra as Notas.
-pub(super) const PANEL_NOTES_BUTTON_SCRIPT: &str =
+pub(in crate::windows_app) const PANEL_NOTES_BUTTON_SCRIPT: &str =
     "window.__neuraliaNotes && window.__neuraliaNotes.button()";
 
 /// Corre no painel quando o Ctrl+Shift+Z e dado na Home (omnibox) ou com o
 /// teclado na barra: uma nota nova, em branco, no editor. So chega ao disco
 /// quando se salva -- um atalho nao enche a pasta de ficheiros vazios.
-pub(super) const PANEL_NEW_NOTE_SCRIPT: &str =
+pub(in crate::windows_app) const PANEL_NEW_NOTE_SCRIPT: &str =
     "window.__neuraliaNotes && window.__neuraliaNotes.newNote()";
 
 /// Corre na WebView que pediu a nota -- nunca numa privada. O que devolve e
 /// dado da pagina (ela pode ter trocado o `getSelection`), nao uma ordem:
 /// `note_draft_from_capture` volta a cortar e a validar tudo.
-pub(super) const NOTE_CAPTURE_SCRIPT: &str = r#"(function () {
+pub(in crate::windows_app) const NOTE_CAPTURE_SCRIPT: &str = r#"(function () {
   var text = '';
   try { text = String(window.getSelection ? window.getSelection() : ''); } catch (e) {}
   return { text: text.slice(0, 20000), url: String(location.href), title: String(document.title || '') };
@@ -98,12 +98,12 @@ pub(super) const NOTE_CAPTURE_SCRIPT: &str = r#"(function () {
 /// Visualizador de PDF proprio: o do Edge corre noutro processo e nao aceita
 /// nem script nem teclado nosso; este e uma pagina nossa, com o PDF.js da
 /// Mozilla (Apache-2.0, assets/pdfjs/LICENSE) a desenhar as paginas em canvas.
-pub(super) const PDF_VIEWER_HTML: &[u8] = include_bytes!("../../../../assets/pdfjs/viewer.html");
+pub(in crate::windows_app) const PDF_VIEWER_HTML: &[u8] = include_bytes!("../../../../assets/pdfjs/viewer.html");
 
 /// Mapa de teclas injetado em TODAS as paginas. O teclado pertence ao WebView2,
 /// que e uma janela filha: a janela nativa nunca ve a tecla, por isso e aqui,
 /// na fase de captura, que se apanham os atalhos antes de o site os consumir.
-pub(super) const NEURALIA_KEYMAP_SCRIPT: &str = r#"
+pub(in crate::windows_app) const NEURALIA_KEYMAP_SCRIPT: &str = r#"
 (function () {
   // WRY/WebView2 injeta initialization scripts em child frames no Windows.
   // Capability e controles nativos pertencem somente ao documento principal.
@@ -1527,7 +1527,7 @@ pub(super) const NEURALIA_KEYMAP_SCRIPT: &str = r#"
 /// Fechado num IIFE: um `const` de topo seria um binding lexico global, e a
 /// pagina lia o token pelo nome. Tudo o que o botao usa depois do
 /// DOMContentLoaded e capturado aqui, antes de a pagina correr.
-pub(super) const EXTERNAL_RETURN_BUTTON: &str = r#"
+pub(in crate::windows_app) const EXTERNAL_RETURN_BUTTON: &str = r#"
 (function () {
   if (window.top !== window) return;
   const capability = '__NEURALIA_CAP__';
@@ -1569,7 +1569,7 @@ pub(super) const EXTERNAL_RETURN_BUTTON: &str = r#"
 })();
 "#;
 
-pub(super) const GMAIL_MONITOR_SCRIPT: &str = r#"
+pub(in crate::windows_app) const GMAIL_MONITOR_SCRIPT: &str = r#"
 (function () {
   if (window.top !== window) return;
   if (location.hostname !== 'mail.google.com' || window.__neuralia_gmail_monitor) return;
@@ -1678,7 +1678,7 @@ pub(super) const GMAIL_MONITOR_SCRIPT: &str = r#"
 ///
 /// Agora procura o editor que TEM texto, e se nenhum tiver escreve a pergunta
 /// ele proprio antes de enviar.
-pub(super) const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
+pub(in crate::windows_app) const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
 (function () {
   // So no frame de topo. Este script ESCREVE numa caixa de texto, e o WebView2
   // injeta os scripts de inicializacao tambem nos frames filhos: sem esta
@@ -1935,7 +1935,7 @@ pub(super) const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
 })();
 "#;
 
-pub(super) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
+pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
 (function () {
   // WRY/WebView2 injeta initialization scripts em child frames no Windows:
   // o rail e o CSS que esconde as barras so pertencem ao documento principal.
@@ -2204,7 +2204,7 @@ document.addEventListener('DOMContentLoaded', () => {
 /// pagina ja correu nessa altura e pode ter trocado qualquer global. Os
 /// botoes que levam o token ouvem por addEventListener, nao por `onclick`,
 /// para a pagina nao poder ler o handler do elemento e chama-lo a mao.
-pub(super) const COMPARATOR_INJECT_SCRIPT: &str = r#"
+pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
 (function () {
   if (window.top !== window) return;
   const colIndex = window.__neuralia_col_index ?? 0;

@@ -1,18 +1,18 @@
-use super::*;
+﻿use super::*;
 
-pub(super) const EM_SETSEL: u32 = 0x00B1;
-pub(super) const EM_SETLIMITTEXT: u32 = 0x00C5;
-pub(super) const EM_SETCUEBANNER: u32 = 0x1501;
-pub(super) const EM_SETMARGINS: u32 = 0x00D3;
-pub(super) const WM_CTLCOLOREDIT: u32 = 0x0133;
-pub(super) const WM_ERASEBKGND: u32 = 0x0014;
-pub(super) const WM_KILLFOCUS: u32 = 0x0008;
-pub(super) const WM_CHAR: u32 = 0x0102;
+pub(in crate::windows_app) const EM_SETSEL: u32 = 0x00B1;
+pub(in crate::windows_app) const EM_SETLIMITTEXT: u32 = 0x00C5;
+pub(in crate::windows_app) const EM_SETCUEBANNER: u32 = 0x1501;
+pub(in crate::windows_app) const EM_SETMARGINS: u32 = 0x00D3;
+pub(in crate::windows_app) const WM_CTLCOLOREDIT: u32 = 0x0133;
+pub(in crate::windows_app) const WM_ERASEBKGND: u32 = 0x0014;
+pub(in crate::windows_app) const WM_KILLFOCUS: u32 = 0x0008;
+pub(in crate::windows_app) const WM_CHAR: u32 = 0x0102;
 
 /// Instante de arranque, para termos milissegundos monotonos num AtomicU64.
-pub(super) static START: OnceLock<Instant> = OnceLock::new();
+pub(in crate::windows_app) static START: OnceLock<Instant> = OnceLock::new();
 
-pub(super) fn now_ms() -> u64 {
+pub(in crate::windows_app) fn now_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
@@ -22,84 +22,84 @@ pub(super) fn now_ms() -> u64 {
 /// ciclo -- por isso o ecra fica com os pixeis das janelas que acabamos de
 /// destruir. Este sinalizador deixa o `WM_ERASEBKGND` apagar o fundo mesmo
 /// nessas voltas, que e o unico ponto de pintura que ainda corre.
-pub(super) static ERASE_PENDING: AtomicBool = AtomicBool::new(false);
-pub(super) const WINDOW_SUBCLASS_ID: usize = 0x4E4A;
+pub(in crate::windows_app) static ERASE_PENDING: AtomicBool = AtomicBool::new(false);
+pub(in crate::windows_app) const WINDOW_SUBCLASS_ID: usize = 0x4E4A;
 /// Mensagens privadas usadas somente pelo gate de lifecycle. Usamos
 /// RegisterWindowMessageW em vez de IDs fixos em WM_APP para não colidir com
 /// mensagens privadas do winit/WRY/WebView2. O script registra os mesmos nomes,
 /// então Windows resolve os dois processos para os mesmos IDs de mensagem.
-pub(super) static LIFECYCLE_PROBE_HOME_MESSAGE: OnceLock<u32> = OnceLock::new();
-pub(super) static LIFECYCLE_PROBE_REOPEN_MESSAGE: OnceLock<u32> = OnceLock::new();
-pub(super) static LIFECYCLE_PROBE_READY_MESSAGE: OnceLock<u32> = OnceLock::new();
-pub(super) static LIFECYCLE_PROBE_HOME_READY_MESSAGE: OnceLock<u32> = OnceLock::new();
-pub(super) static LIFECYCLE_COMPARATOR_READY: AtomicBool = AtomicBool::new(false);
-pub(super) static LIFECYCLE_HOME_READY: AtomicBool = AtomicBool::new(false);
+pub(in crate::windows_app) static LIFECYCLE_PROBE_HOME_MESSAGE: OnceLock<u32> = OnceLock::new();
+pub(in crate::windows_app) static LIFECYCLE_PROBE_REOPEN_MESSAGE: OnceLock<u32> = OnceLock::new();
+pub(in crate::windows_app) static LIFECYCLE_PROBE_READY_MESSAGE: OnceLock<u32> = OnceLock::new();
+pub(in crate::windows_app) static LIFECYCLE_PROBE_HOME_READY_MESSAGE: OnceLock<u32> = OnceLock::new();
+pub(in crate::windows_app) static LIFECYCLE_COMPARATOR_READY: AtomicBool = AtomicBool::new(false);
+pub(in crate::windows_app) static LIFECYCLE_HOME_READY: AtomicBool = AtomicBool::new(false);
 /// O probe transmite comandos a todas as janelas do processo porque o HWND
 /// principal pode mudar com decorations. O nonce impede que o mesmo comando,
 /// recebido por um HWND antigo e pelo atual, gere eventos duplicados.
-pub(super) static LIFECYCLE_LAST_HOME_NONCE: AtomicUsize = AtomicUsize::new(0);
-pub(super) static LIFECYCLE_LAST_REOPEN_NONCE: AtomicUsize = AtomicUsize::new(0);
+pub(in crate::windows_app) static LIFECYCLE_LAST_HOME_NONCE: AtomicUsize = AtomicUsize::new(0);
+pub(in crate::windows_app) static LIFECYCLE_LAST_REOPEN_NONCE: AtomicUsize = AtomicUsize::new(0);
 
-pub(super) fn lifecycle_probe_home_message() -> u32 {
+pub(in crate::windows_app) fn lifecycle_probe_home_message() -> u32 {
     *LIFECYCLE_PROBE_HOME_MESSAGE.get_or_init(|| unsafe {
         RegisterWindowMessageW(windows_sys::w!("NeuralIA.LifecycleProbe.Home"))
     })
 }
 
-pub(super) fn lifecycle_probe_reopen_message() -> u32 {
+pub(in crate::windows_app) fn lifecycle_probe_reopen_message() -> u32 {
     *LIFECYCLE_PROBE_REOPEN_MESSAGE.get_or_init(|| unsafe {
         RegisterWindowMessageW(windows_sys::w!("NeuralIA.LifecycleProbe.Reopen"))
     })
 }
 
-pub(super) fn lifecycle_probe_ready_message() -> u32 {
+pub(in crate::windows_app) fn lifecycle_probe_ready_message() -> u32 {
     *LIFECYCLE_PROBE_READY_MESSAGE.get_or_init(|| unsafe {
         RegisterWindowMessageW(windows_sys::w!("NeuralIA.LifecycleProbe.Ready"))
     })
 }
 
-pub(super) fn lifecycle_probe_home_ready_message() -> u32 {
+pub(in crate::windows_app) fn lifecycle_probe_home_ready_message() -> u32 {
     *LIFECYCLE_PROBE_HOME_READY_MESSAGE.get_or_init(|| unsafe {
         RegisterWindowMessageW(windows_sys::w!("NeuralIA.LifecycleProbe.HomeReady"))
     })
 }
-pub(super) const EXIT_BUTTON_SUBCLASS_ID: usize = 0x4E4B;
-pub(super) const HOME_BUTTON_SUBCLASS_ID: usize = 0x4E4C;
-pub(super) const CAPTION_BUTTONS_SUBCLASS_ID: usize = 0x4E70;
-pub(super) const WM_PAINT: u32 = 0x000F;
-pub(super) const WM_LBUTTONUP: u32 = 0x0202;
-pub(super) const WM_NCHITTEST: u32 = 0x0084;
-pub(super) const HTCLIENT: u32 = 1;
-pub(super) const WM_MOUSEACTIVATE: u32 = 0x0021;
-pub(super) const MA_NOACTIVATE: u32 = 3;
+pub(in crate::windows_app) const EXIT_BUTTON_SUBCLASS_ID: usize = 0x4E4B;
+pub(in crate::windows_app) const HOME_BUTTON_SUBCLASS_ID: usize = 0x4E4C;
+pub(in crate::windows_app) const CAPTION_BUTTONS_SUBCLASS_ID: usize = 0x4E70;
+pub(in crate::windows_app) const WM_PAINT: u32 = 0x000F;
+pub(in crate::windows_app) const WM_LBUTTONUP: u32 = 0x0202;
+pub(in crate::windows_app) const WM_NCHITTEST: u32 = 0x0084;
+pub(in crate::windows_app) const HTCLIENT: u32 = 1;
+pub(in crate::windows_app) const WM_MOUSEACTIVATE: u32 = 0x0021;
+pub(in crate::windows_app) const MA_NOACTIVATE: u32 = 3;
 /// Botao flutuante de saida, em pixeis logicos. Fica centrado no topo: nos
 /// cantos chocava com a propria interface dos sites (o login do Google estava
 /// exatamente por baixo dele).
-pub(super) const EXIT_BUTTON_WIDTH: f64 = 196.0;
-pub(super) const EXIT_BUTTON_HEIGHT: f64 = 38.0;
-pub(super) const EC_LEFTMARGIN: usize = 0x0001;
-pub(super) const EC_RIGHTMARGIN: usize = 0x0002;
-pub(super) const WM_SETFONT: u32 = 0x0030;
-pub(super) const OMNIBOX_SUBCLASS_ID: usize = 0x4E49;
-pub(super) const TAB_MENU_OPEN: usize = 1;
-pub(super) const TAB_MENU_FULLSCREEN: usize = 2;
-pub(super) const TAB_MENU_CLOSE: usize = 3;
-pub(super) const TAB_MENU_CLOSE_OTHERS: usize = 4;
-pub(super) const TAB_MENU_CLOSE_ALL: usize = 5;
-pub(super) const TAB_MENU_NEW_GROUP: usize = 6;
-pub(super) const TAB_MENU_UNGROUP: usize = 7;
+pub(in crate::windows_app) const EXIT_BUTTON_WIDTH: f64 = 196.0;
+pub(in crate::windows_app) const EXIT_BUTTON_HEIGHT: f64 = 38.0;
+pub(in crate::windows_app) const EC_LEFTMARGIN: usize = 0x0001;
+pub(in crate::windows_app) const EC_RIGHTMARGIN: usize = 0x0002;
+pub(in crate::windows_app) const WM_SETFONT: u32 = 0x0030;
+pub(in crate::windows_app) const OMNIBOX_SUBCLASS_ID: usize = 0x4E49;
+pub(in crate::windows_app) const TAB_MENU_OPEN: usize = 1;
+pub(in crate::windows_app) const TAB_MENU_FULLSCREEN: usize = 2;
+pub(in crate::windows_app) const TAB_MENU_CLOSE: usize = 3;
+pub(in crate::windows_app) const TAB_MENU_CLOSE_OTHERS: usize = 4;
+pub(in crate::windows_app) const TAB_MENU_CLOSE_ALL: usize = 5;
+pub(in crate::windows_app) const TAB_MENU_NEW_GROUP: usize = 6;
+pub(in crate::windows_app) const TAB_MENU_UNGROUP: usize = 7;
 /// Os grupos ja existentes ocupam ids a partir daqui, um por grupo da coluna.
-pub(super) const TAB_MENU_GROUP_BASE: usize = 100;
-pub(super) const SPLITTER_SUBCLASS_BASE: usize = 0x4E60;
-pub(super) const PANEL_HANDLE_SUBCLASS_ID: usize = 0x4E74;
-pub(super) const WM_SETCURSOR: u32 = 0x0020;
+pub(in crate::windows_app) const TAB_MENU_GROUP_BASE: usize = 100;
+pub(in crate::windows_app) const SPLITTER_SUBCLASS_BASE: usize = 0x4E60;
+pub(in crate::windows_app) const PANEL_HANDLE_SUBCLASS_ID: usize = 0x4E74;
+pub(in crate::windows_app) const WM_SETCURSOR: u32 = 0x0020;
 
 /// Ultima posicao (x de ecra) pedida pelo arrasto da pega do painel, e se ha
 /// um pedido por atender -- o mesmo esquema do divisor das colunas.
-pub(super) static PANEL_RESIZE_X: AtomicI32 = AtomicI32::new(0);
-pub(super) static PANEL_RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
+pub(in crate::windows_app) static PANEL_RESIZE_X: AtomicI32 = AtomicI32::new(0);
+pub(in crate::windows_app) static PANEL_RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
 /// A pega ja agendou a sua dica nesta passagem do rato.
-pub(super) static PANEL_HANDLE_HINT: AtomicBool = AtomicBool::new(false);
+pub(in crate::windows_app) static PANEL_HANDLE_HINT: AtomicBool = AtomicBool::new(false);
 
 // A roda do rato sobre o painel da direita. O Windows entrega a roda da
 // janela ativa a janela com o FOCO do teclado: com uma coluna das IAs focada,
@@ -109,16 +109,16 @@ pub(super) static PANEL_HANDLE_HINT: AtomicBool = AtomicBool::new(false);
 // com o NeuralIA em primeiro plano e com o cursor dentro do painel
 // (`panel_chrome::wheel_route`), e entrega o giro a janela do painel debaixo
 // do cursor. Tudo o resto passa intocado.
-pub(super) static WHEEL_HOOK: AtomicUsize = AtomicUsize::new(0);
-pub(super) static WHEEL_APP_HWND: AtomicUsize = AtomicUsize::new(0);
-pub(super) static WHEEL_PANEL_HOST: AtomicUsize = AtomicUsize::new(0);
-pub(super) static WHEEL_PANEL_ACTIVE: AtomicBool = AtomicBool::new(false);
-pub(super) static WHEEL_PANEL_LEFT: AtomicI32 = AtomicI32::new(0);
-pub(super) static WHEEL_PANEL_TOP: AtomicI32 = AtomicI32::new(0);
-pub(super) static WHEEL_PANEL_RIGHT: AtomicI32 = AtomicI32::new(0);
-pub(super) static WHEEL_PANEL_BOTTOM: AtomicI32 = AtomicI32::new(0);
+pub(in crate::windows_app) static WHEEL_HOOK: AtomicUsize = AtomicUsize::new(0);
+pub(in crate::windows_app) static WHEEL_APP_HWND: AtomicUsize = AtomicUsize::new(0);
+pub(in crate::windows_app) static WHEEL_PANEL_HOST: AtomicUsize = AtomicUsize::new(0);
+pub(in crate::windows_app) static WHEEL_PANEL_ACTIVE: AtomicBool = AtomicBool::new(false);
+pub(in crate::windows_app) static WHEEL_PANEL_LEFT: AtomicI32 = AtomicI32::new(0);
+pub(in crate::windows_app) static WHEEL_PANEL_TOP: AtomicI32 = AtomicI32::new(0);
+pub(in crate::windows_app) static WHEEL_PANEL_RIGHT: AtomicI32 = AtomicI32::new(0);
+pub(in crate::windows_app) static WHEEL_PANEL_BOTTOM: AtomicI32 = AtomicI32::new(0);
 
-pub(super) fn wheel_panel_rect() -> Option<ScreenRect> {
+pub(in crate::windows_app) fn wheel_panel_rect() -> Option<ScreenRect> {
     WHEEL_PANEL_ACTIVE
         .load(Ordering::Acquire)
         .then(|| ScreenRect {
@@ -130,7 +130,7 @@ pub(super) fn wheel_panel_rect() -> Option<ScreenRect> {
 }
 
 /// Teclas e botoes em baixo, no formato MK_* da palavra baixa do wParam.
-pub(super) fn wheel_key_state() -> u16 {
+pub(in crate::windows_app) fn wheel_key_state() -> u16 {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
     };
@@ -151,7 +151,7 @@ pub(super) fn wheel_key_state() -> u16 {
 
 /// A janela visivel mais funda de `host` debaixo do ponto de ecra: a do
 /// WebView2 do painel (o Chrome_*), nao o contentor do wry.
-pub(super) fn panel_window_at(host: HWND, point: POINT) -> Option<HWND> {
+pub(in crate::windows_app) fn panel_window_at(host: HWND, point: POINT) -> Option<HWND> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CWP_SKIPDISABLED, CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, ChildWindowFromPointEx, IsWindow,
     };
@@ -183,12 +183,12 @@ pub(super) fn panel_window_at(host: HWND, point: POINT) -> Option<HWND> {
 /// painel ou uma descendente dele -- e nao uma janela por cima do painel: um
 /// popup do Chromium (lista de um <select>, menu de contexto), o seletor de
 /// emojis, o historico da area de transferencia, outra aplicacao.
-pub(super) fn wheel_hit_in_panel(host: HWND, hit: HWND) -> bool {
+pub(in crate::windows_app) fn wheel_hit_in_panel(host: HWND, hit: HWND) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::IsChild;
     !host.is_null() && !hit.is_null() && (hit == host || unsafe { IsChild(host, hit) } != 0)
 }
 
-pub(super) unsafe extern "system" fn wheel_hook(
+pub(in crate::windows_app) unsafe extern "system" fn wheel_hook(
     code: i32,
     wparam: WPARAM,
     lparam: LPARAM,
@@ -227,7 +227,7 @@ pub(super) unsafe extern "system" fn wheel_hook(
     CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
 }
 
-pub(super) fn install_wheel_hook() {
+pub(in crate::windows_app) fn install_wheel_hook() {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowsHookExW, WH_MOUSE_LL};
     if WHEEL_HOOK.load(Ordering::Acquire) != 0 {
@@ -246,7 +246,7 @@ pub(super) fn install_wheel_hook() {
     }
 }
 
-pub(super) fn uninstall_wheel_hook() {
+pub(in crate::windows_app) fn uninstall_wheel_hook() {
     use windows_sys::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx;
     let hook = WHEEL_HOOK.swap(0, Ordering::AcqRel);
     if hook != 0 {
@@ -259,7 +259,7 @@ pub(super) fn uninstall_wheel_hook() {
 /// A pega de arrastar a borda do painel da direita. Mesma mecanica do divisor
 /// das colunas: SetCapture no premir, posicao mais recente num static, um so
 /// pedido em fila; o largar grava.
-pub(super) unsafe extern "system" fn panel_handle_subclass(
+pub(in crate::windows_app) unsafe extern "system" fn panel_handle_subclass(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
@@ -349,8 +349,8 @@ pub(super) unsafe extern "system" fn panel_handle_subclass(
     }
     DefSubclassProc(hwnd, message, wparam, lparam)
 }
-pub(super) const SPLITTER_WIDTH: f64 = 7.0;
-pub(super) const MIN_PANEL_WIDTH: f64 = 180.0;
+pub(in crate::windows_app) const SPLITTER_WIDTH: f64 = 7.0;
+pub(in crate::windows_app) const MIN_PANEL_WIDTH: f64 = 180.0;
 
 /// Ultima posicao pedida pelo arrasto de um divisor, e se ja ha um pedido por
 /// atender. O rato manda WM_MOUSEMOVE a mais de 100 Hz e cada um reposiciona
@@ -359,18 +359,18 @@ pub(super) const MIN_PANEL_WIDTH: f64 = 180.0;
 /// disso a subclasse escreve SEMPRE aqui a posicao mais recente e so acorda o
 /// event loop quando nao ha nenhum pedido pendente -- o que chega ao handler
 /// e o estado de agora, nao o de ha dez eventos.
-pub(super) static RESIZE_DIVIDER: AtomicUsize = AtomicUsize::new(0);
-pub(super) static RESIZE_X: AtomicI32 = AtomicI32::new(0);
-pub(super) static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
-pub(super) const WM_LBUTTONDOWN: u32 = 0x0201;
-pub(super) const WM_MOUSEMOVE: u32 = 0x0200;
+pub(in crate::windows_app) static RESIZE_DIVIDER: AtomicUsize = AtomicUsize::new(0);
+pub(in crate::windows_app) static RESIZE_X: AtomicI32 = AtomicI32::new(0);
+pub(in crate::windows_app) static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
+pub(in crate::windows_app) const WM_LBUTTONDOWN: u32 = 0x0201;
+pub(in crate::windows_app) const WM_MOUSEMOVE: u32 = 0x0200;
 /// Chega depois de `track_mouse_leave`: o rato saiu de um botao nativo.
-pub(super) const WM_MOUSELEAVE: u32 = 0x02A3;
-pub(super) const WM_RBUTTONUP: u32 = 0x0205;
+pub(in crate::windows_app) const WM_MOUSELEAVE: u32 = 0x02A3;
+pub(in crate::windows_app) const WM_RBUTTONUP: u32 = 0x0205;
 
 /// Consulta opcional para automacao/benchmarks. Em producao a Home abre em
 /// repouso e nao envia texto a nenhum fornecedor sem acao do utilizador.
-pub(super) fn startup_input() -> String {
+pub(in crate::windows_app) fn startup_input() -> String {
     if std::env::var_os("NEURALIA_NO_STARTUP").is_some() {
         return String::new();
     }
@@ -380,13 +380,13 @@ pub(super) fn startup_input() -> String {
         .to_string()
 }
 
-pub(super) fn lifecycle_probe_enabled() -> bool {
+pub(in crate::windows_app) fn lifecycle_probe_enabled() -> bool {
     std::env::var_os("NEURALIA_LIFECYCLE_PROBE").is_some()
 }
 
 #[link(name = "comctl32")]
 unsafe extern "system" {
-    pub(super) fn SetWindowSubclass(
+    pub(in crate::windows_app) fn SetWindowSubclass(
         hwnd: HWND,
         callback: Option<
             unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT,
@@ -394,7 +394,7 @@ unsafe extern "system" {
         subclass_id: usize,
         reference_data: usize,
     ) -> i32;
-    pub(super) fn DefSubclassProc(
+    pub(in crate::windows_app) fn DefSubclassProc(
         hwnd: HWND,
         message: u32,
         wparam: WPARAM,
@@ -404,23 +404,23 @@ unsafe extern "system" {
 
 #[link(name = "user32")]
 unsafe extern "system" {
-    pub(super) fn GetCapture() -> HWND;
-    pub(super) fn SetCapture(hwnd: HWND) -> HWND;
-    pub(super) fn ReleaseCapture() -> i32;
-    pub(super) fn RegisterWindowMessageW(lp_string: *const u16) -> u32;
+    pub(in crate::windows_app) fn GetCapture() -> HWND;
+    pub(in crate::windows_app) fn SetCapture(hwnd: HWND) -> HWND;
+    pub(in crate::windows_app) fn ReleaseCapture() -> i32;
+    pub(in crate::windows_app) fn RegisterWindowMessageW(lp_string: *const u16) -> u32;
 }
 
 #[link(name = "advapi32")]
 unsafe extern "system" {
     #[link_name = "SystemFunction036"]
-    pub(super) fn rtl_gen_random(buffer: *mut core::ffi::c_void, length: u32) -> u8;
+    pub(in crate::windows_app) fn rtl_gen_random(buffer: *mut core::ffi::c_void, length: u32) -> u8;
 }
 
 /// Pincel de fundo da omnibox, um por cor. Criar um a cada WM_CTLCOLOREDIT
 /// vazaria objetos GDI a cada repintura.
-pub(super) static OMNIBOX_BRUSH: Mutex<Option<(Rgb, usize)>> = Mutex::new(None);
+pub(in crate::windows_app) static OMNIBOX_BRUSH: Mutex<Option<(Rgb, usize)>> = Mutex::new(None);
 
-pub(super) fn omnibox_brush(color: Rgb) -> *mut core::ffi::c_void {
+pub(in crate::windows_app) fn omnibox_brush(color: Rgb) -> *mut core::ffi::c_void {
     let mut slot = OMNIBOX_BRUSH.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((cached, handle)) = *slot
         && cached == color
@@ -439,7 +439,7 @@ pub(super) fn omnibox_brush(color: Rgb) -> *mut core::ffi::c_void {
 /// O EDIT nativo nao tem cantos redondos nem cor de fundo propria. Pintamos a
 /// pilula suavizada por tras dele e respondemos aqui com a mesma cor, para o
 /// retangulo do controlo desaparecer dentro dela.
-pub(super) unsafe extern "system" fn window_subclass(
+pub(in crate::windows_app) unsafe extern "system" fn window_subclass(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
@@ -536,7 +536,7 @@ pub(super) unsafe extern "system" fn window_subclass(
 /// ativa nada nem rouba o foco (e so o aviso que o Windows da a qualquer
 /// app); com o som desligado no Windows, e o que resta de um fim de fase
 /// com a janela minimizada.
-pub(super) fn flash_taskbar(owner: HWND) {
+pub(in crate::windows_app) fn flash_taskbar(owner: HWND) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx,
     };
@@ -552,7 +552,7 @@ pub(super) fn flash_taskbar(owner: HWND) {
     }
 }
 
-pub(super) fn window_hwnd(window: &Window) -> Option<HWND> {
+pub(in crate::windows_app) fn window_hwnd(window: &Window) -> Option<HWND> {
     let handle = window.window_handle().ok()?;
     let RawWindowHandle::Win32(handle) = handle.as_raw() else {
         return None;

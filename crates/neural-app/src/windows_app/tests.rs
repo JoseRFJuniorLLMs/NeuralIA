@@ -5351,7 +5351,8 @@ fn palette_routes_private_input_away_from_the_normal_column() {
 fn private_palette_paths_never_touch_history_or_context_tabs() {
     let wap = include_str!("../windows_app.rs");
     let nav = include_str!("../windows_app/app/navigation.rs");
-    let source = format!("{wap}\n{nav}").replace("pub(in crate::windows_app) fn ", "fn ");
+    let spl = include_str!("../windows_app/app/split.rs");
+    let source = format!("{wap}\n{nav}\n{spl}").replace("pub(in crate::windows_app) fn ", "fn ");
     let submit = source
         .split("fn submit_palette")
         .nth(1)
@@ -5397,7 +5398,9 @@ fn private_palette_paths_never_touch_history_or_context_tabs() {
 /// perfeito que "Apagar historico" deixasse de chamar nao apagava nada.
 #[test]
 fn the_shipped_paths_are_wired_to_the_tab_session() {
-    let source = include_str!("../windows_app.rs");
+    let wap = include_str!("../windows_app.rs");
+    let spl = include_str!("../windows_app/app/split.rs");
+    let source = format!("{wap}\n{spl}");
     let body = |from: &str, to: &str| -> String {
         source
             .split(from)
@@ -5614,8 +5617,9 @@ fn split_controls_are_native_bar_hits() {
 
 #[test]
 fn splitter_topology_is_resynced_after_layout_transitions() {
-    let source_raw = include_str!("../windows_app.rs");
-    let source = source_raw.replace("pub(in crate::windows_app) fn ", "fn ");
+    let wap = include_str!("../windows_app.rs");
+    let spl = include_str!("../windows_app/app/split.rs");
+    let source = format!("{wap}\n{spl}").replace("pub(in crate::windows_app) fn ", "fn ");
     let minimize = source
         .split("fn minimize_comparator")
         .nth(1)
@@ -5640,7 +5644,9 @@ fn comparator_resize_uses_persistent_weights_and_native_splitters() {
     // O arrasto e coalescido: a subclasse publica a ultima posicao e so
     // acorda o event loop quando nao ha pedido pendente. Sem isto cada
     // WM_MOUSEMOVE reposicionava tres WebView2 a mais de 100 Hz.
-    let source = include_str!("../windows_app.rs");
+    let wap = include_str!("../windows_app.rs");
+    let spl = include_str!("../windows_app/app/split.rs");
+    let source = format!("{spl}\n{wap}");
     let subclass = source
         .split("fn comparator_splitter_subclass")
         .nth(1)
@@ -5766,7 +5772,8 @@ fn spec_0108_remote_scripts_use_message_transport_without_capability_urls() {
 fn spec_0108_remote_navigation_handlers_reject_neuralia_scheme() {
     let wap = include_str!("../windows_app.rs");
     let gm = include_str!("../windows_app/app/gmail.rs");
-    let source = format!("{wap}\n{gm}");
+    let spl = include_str!("../windows_app/app/split.rs");
+    let source = format!("{wap}\n{gm}\n{spl}");
     for builder in [
         "fn pdf_webview_builder",
         "fn external_webview_builder",
@@ -5851,6 +5858,7 @@ fn shipped_source() -> String {
         include_str!("../windows_app/app/panels.rs"),
         include_str!("../windows_app/app/gmail.rs"),
         include_str!("../windows_app/app/tools.rs"),
+        include_str!("../windows_app/app/split.rs"),
     ] {
         out.push('\n');
         out.push_str(
@@ -8952,7 +8960,9 @@ __state('barra');
     // Os builders nao montam o script nem decidem a privacidade por conta
     // propria: usam as funcoes acima (asserção de ausencia, AGENTS.md
     // §4.3).
-    let source = include_str!("../windows_app.rs");
+    let wap = include_str!("../windows_app.rs");
+    let spl = include_str!("../windows_app/app/split.rs");
+    let source = format!("{wap}\n{spl}");
     let body = |builder: &str| {
         source
             .split(builder)
@@ -11380,9 +11390,10 @@ fn owned_popups_are_not_topmost() {
     let wap = include_str!("../windows_app.rs");
     let sc = include_str!("../windows_app/search_card.rs");
     let gm = include_str!("../windows_app/app/gmail.rs");
-    // show_search_card foi movido para search_card.rs e show_gmail_toast para gmail.rs;
+    let spl = include_str!("../windows_app/app/split.rs");
+    // show_search_card foi movido para search_card.rs, show_gmail_toast para gmail.rs e divisores para split.rs;
     // concatena para a pesquisa ser uniforme.
-    let source_combined = format!("{wap}\n{sc}\n{gm}");
+    let source_combined = format!("{wap}\n{sc}\n{gm}\n{spl}");
     let body = |source: &str, from: &str, to: &str| {
         source
             .split(from)

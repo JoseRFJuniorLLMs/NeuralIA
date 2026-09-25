@@ -1,9 +1,9 @@
-use super::*;
+﻿use super::*;
 
 /// Cor do tempo e do contorno do botao do Pomodoro: a da fase
 /// (`phase_color`: tomate no foco, verde nas pausas) acertada ao fundo do
 /// botao para ler bem nos dois temas; sem sessao, a letra de sempre.
-pub(super) fn tool_label_color(phase: Option<Phase>, fill: Rgb, theme: &Theme) -> Rgb {
+pub(in crate::windows_app) fn tool_label_color(phase: Option<Phase>, fill: Rgb, theme: &Theme) -> Rgb {
     match phase {
         Some(phase) => readable(phase_color(phase), fill, 4.5),
         None => theme.fg,
@@ -12,14 +12,14 @@ pub(super) fn tool_label_color(phase: Option<Phase>, fill: Rgb, theme: &Theme) -
 
 /// Botao do rato que carregou numa ferramenta.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ToolClick {
+pub(in crate::windows_app) enum ToolClick {
     Left,
     Right,
 }
 
 /// O que um clique numa ferramenta faz -- na barra ou na Home, e o mesmo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ToolAction {
+pub(in crate::windows_app) enum ToolAction {
     /// Inicia, pausa ou retoma o Pomodoro (`App::pomodoro_click`).
     PomodoroClick,
     /// Menu de opcoes do Pomodoro (`App::pomodoro_menu`).
@@ -33,7 +33,7 @@ pub(super) enum ToolAction {
 /// A unica tabela clique -> accao das ferramentas. O botao direito so faz
 /// alguma coisa no Pomodoro: nas outras duas nao ha menu, e um clique direito
 /// perdido nao pode abrir nem fechar paineis.
-pub(super) fn tool_action(tool: Tool, click: ToolClick) -> Option<ToolAction> {
+pub(in crate::windows_app) fn tool_action(tool: Tool, click: ToolClick) -> Option<ToolAction> {
     match (tool, click) {
         (Tool::Pomodoro, ToolClick::Left) => Some(ToolAction::PomodoroClick),
         (Tool::Pomodoro, ToolClick::Right) => Some(ToolAction::PomodoroMenu),
@@ -45,7 +45,7 @@ pub(super) fn tool_action(tool: Tool, click: ToolClick) -> Option<ToolAction> {
 
 /// Clique na barra do comparador: so os botoes das ferramentas dao uma
 /// `ToolAction`; o resto da barra segue o caminho que ja tinha.
-pub(super) fn bar_tool_action(hit: Option<BarHit>, click: ToolClick) -> Option<ToolAction> {
+pub(in crate::windows_app) fn bar_tool_action(hit: Option<BarHit>, click: ToolClick) -> Option<ToolAction> {
     match hit {
         Some(BarHit::Tool(tool)) => tool_action(tool, click),
         _ => None,
@@ -57,23 +57,23 @@ pub(super) fn bar_tool_action(hit: Option<BarHit>, click: ToolClick) -> Option<T
 /// a MESMA etiqueta, e por isso a mesma largura. Leva tambem a fase da
 /// sessao, que so o desenho usa (a cor do tempo); a largura nao depende dela.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) struct BarLabel {
-    pub(super) bytes: [u8; BAR_LABEL_MAX_BYTES],
-    pub(super) len: u8,
-    pub(super) phase: Option<Phase>,
+pub(in crate::windows_app) struct BarLabel {
+    pub(in crate::windows_app) bytes: [u8; BAR_LABEL_MAX_BYTES],
+    pub(in crate::windows_app) len: u8,
+    pub(in crate::windows_app) phase: Option<Phase>,
 }
 
-pub(super) const BAR_LABEL_MAX_BYTES: usize = 16;
+pub(in crate::windows_app) const BAR_LABEL_MAX_BYTES: usize = 16;
 /// Largura reservada por caractere e margem da etiqueta, em pixeis logicos a
 /// letra de 13 px da barra. Reserva-se por caractere e nao pelo texto medido:
 /// "11:11" e "00:00" ocupam o mesmo, e a barra nao treme a cada segundo.
-pub(super) const BAR_LABEL_CHAR_WIDTH: f64 = 7.5;
-pub(super) const BAR_LABEL_PADDING: f64 = 8.0;
+pub(in crate::windows_app) const BAR_LABEL_CHAR_WIDTH: f64 = 7.5;
+pub(in crate::windows_app) const BAR_LABEL_PADDING: f64 = 8.0;
 
 impl BarLabel {
     /// `None` para texto vazio. Texto comprido e cortado numa fronteira de
     /// caractere, nunca a meio de um.
-    pub(super) fn new(text: &str) -> Option<Self> {
+    pub(in crate::windows_app) fn new(text: &str) -> Option<Self> {
         let text = text.trim();
         if text.is_empty() {
             return None;
@@ -92,16 +92,16 @@ impl BarLabel {
     }
 
     /// A mesma etiqueta, pintada na cor de `phase` (`tool_label_color`).
-    pub(super) fn with_phase(self, phase: Option<Phase>) -> Self {
+    pub(in crate::windows_app) fn with_phase(self, phase: Option<Phase>) -> Self {
         Self { phase, ..self }
     }
 
-    pub(super) fn as_str(&self) -> &str {
+    pub(in crate::windows_app) fn as_str(&self) -> &str {
         std::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("")
     }
 
     /// Quanto o botao alarga para a etiqueta, em pixeis logicos.
-    pub(super) fn width(&self) -> f64 {
+    pub(in crate::windows_app) fn width(&self) -> f64 {
         self.as_str().chars().count() as f64 * BAR_LABEL_CHAR_WIDTH + BAR_LABEL_PADDING
     }
 }
@@ -115,7 +115,7 @@ impl std::fmt::Debug for BarLabel {
 /// Os tres botoes das ferramentas, encostados a `right`: Respiracao na ponta,
 /// Notas antes e o Pomodoro por ultimo -- e so ele alarga para a esquerda
 /// com a etiqueta, para os outros dois nao saltarem quando ela aparece.
-pub(super) fn tool_button_row(
+pub(in crate::windows_app) fn tool_button_row(
     right: f64,
     y: f64,
     size: f64,
@@ -145,23 +145,23 @@ pub(super) fn tool_button_row(
 /// agrupa-lo evita que a barra receba uma parte e esqueca a outra, que era
 /// exactamente como os rotulos deixavam de estar sobre as colunas.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct BarColumns {
-    pub(super) count: usize,
-    pub(super) weights: [f64; COMPARATOR_COLUMNS],
-    pub(super) minimized: [bool; COMPARATOR_COLUMNS],
+pub(in crate::windows_app) struct BarColumns {
+    pub(in crate::windows_app) count: usize,
+    pub(in crate::windows_app) weights: [f64; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) minimized: [bool; COMPARATOR_COLUMNS],
     /// Ha uma gaveta aberta: os botoes do Split ocupam o canto direito e os
     /// chips tem de parar antes deles.
-    pub(super) split_active: bool,
+    pub(in crate::windows_app) split_active: bool,
     /// Largura logica do painel lateral a direita; as colunas ficam antes dele.
-    pub(super) panel_width: f64,
+    pub(in crate::windows_app) panel_width: f64,
     /// Tempo que falta no Pomodoro, ao lado do icone dele; alarga o botao.
-    pub(super) pomodoro_label: Option<BarLabel>,
+    pub(in crate::windows_app) pomodoro_label: Option<BarLabel>,
 }
 
 impl BarColumns {
     /// Colunas iguais, nenhuma minimizada -- o estado de partida, e o que os
     /// testes de geometria usam quando os pesos nao sao o assunto.
-    pub(super) fn even(count: usize) -> Self {
+    pub(in crate::windows_app) fn even(count: usize) -> Self {
         Self {
             count,
             weights: [1.0; COMPARATOR_COLUMNS],
@@ -176,53 +176,53 @@ impl BarColumns {
 /// Geometria em duas linhas. As fontes ficam na title bar; os provedores ficam
 /// numa segunda linha, sem disputar espaco com as abas.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct BarLayout {
-    pub(super) visible: bool,
-    pub(super) height: f64,
-    pub(super) home: UiRect,
-    pub(super) back: UiRect,
-    pub(super) forward: UiRect,
-    pub(super) column_back: [UiRect; COMPARATOR_COLUMNS],
-    pub(super) column_forward: [UiRect; COMPARATOR_COLUMNS],
+pub(in crate::windows_app) struct BarLayout {
+    pub(in crate::windows_app) visible: bool,
+    pub(in crate::windows_app) height: f64,
+    pub(in crate::windows_app) home: UiRect,
+    pub(in crate::windows_app) back: UiRect,
+    pub(in crate::windows_app) forward: UiRect,
+    pub(in crate::windows_app) column_back: [UiRect; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) column_forward: [UiRect; COMPARATOR_COLUMNS],
     /// Por coluna: a pilula do provedor sobre a sua faixa, ou -- se estiver
     /// minimizada -- o chip compacto encostado aos controlos da direita.
-    pub(super) columns: [UiRect; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) columns: [UiRect; COMPARATOR_COLUMNS],
     /// Quais das `columns` sao chips. O desenho precisa de saber porque o
     /// chip e apagado e nao leva o botao "+".
-    pub(super) minimized: [bool; COMPARATOR_COLUMNS],
-    pub(super) add_tabs: [UiRect; COMPARATOR_COLUMNS],
-    pub(super) context_tabs: [[UiRect; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
-    pub(super) context_indices: [[usize; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
-    pub(super) context_tab_counts: [usize; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) minimized: [bool; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) add_tabs: [UiRect; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) context_tabs: [[UiRect; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) context_indices: [[usize; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) context_tab_counts: [usize; COMPARATOR_COLUMNS],
     /// O x de fechar de cada aba visivel; sem largura quando a aba e estreita
     /// de mais para o ter sem esconder o titulo.
-    pub(super) tab_closes: [[UiRect; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) tab_closes: [[UiRect; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
     /// O grupo (indice na coluna) de cada aba visivel.
-    pub(super) tab_owners: [[Option<usize>; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) tab_owners: [[Option<usize>; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
     /// Pilulas dos grupos, intercaladas com as abas na mesma fila.
-    pub(super) group_pills: [[UiRect; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS],
-    pub(super) group_pill_indices: [[usize; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS],
-    pub(super) group_pill_counts: [usize; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) group_pills: [[UiRect; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) group_pill_indices: [[usize; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) group_pill_counts: [usize; COMPARATOR_COLUMNS],
     /// O sublinhado de cada pilula, na cor do grupo: vai da pilula ao fim da
     /// ultima aba do grupo que esta a vista. Sem largura quando o grupo esta
     /// recolhido e nenhuma aba dele aparece.
-    pub(super) group_lines: [[UiRect; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) group_lines: [[UiRect; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS],
     /// O "‹N" de cada coluna: abre a lista de todas as abas dela. So existe
     /// quando ha abas que a barra nao mostra (nem guarda atras de uma pilula
     /// recolhida) -- as antigas que o corte deixou de fora, ou as que a
     /// largura da janela nao deixou desenhar.
-    pub(super) tab_overflow: [UiRect; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) tab_overflow: [UiRect; COMPARATOR_COLUMNS],
     /// Quantas abas o "‹N" de cada coluna esconde (0: nao ha botao).
-    pub(super) tab_overflow_counts: [usize; COMPARATOR_COLUMNS],
-    pub(super) columns_len: usize,
-    pub(super) window_minimize: UiRect,
-    pub(super) window_maximize: UiRect,
-    pub(super) window_close: UiRect,
+    pub(in crate::windows_app) tab_overflow_counts: [usize; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) columns_len: usize,
+    pub(in crate::windows_app) window_minimize: UiRect,
+    pub(in crate::windows_app) window_maximize: UiRect,
+    pub(in crate::windows_app) window_close: UiRect,
 }
 
 impl BarLayout {
     #[cfg(test)]
-    pub(super) fn new(client_width: f64, scale: f64, visible: bool, columns: usize) -> Self {
+    pub(in crate::windows_app) fn new(client_width: f64, scale: f64, visible: bool, columns: usize) -> Self {
         Self::with_contexts(
             client_width,
             scale,
@@ -235,7 +235,7 @@ impl BarLayout {
     /// Atalho para quem so sabe quantas abas tem cada coluna: nenhuma delas
     /// esta agrupada.
     #[cfg(test)]
-    pub(super) fn with_contexts(
+    pub(in crate::windows_app) fn with_contexts(
         client_width: f64,
         scale: f64,
         visible: bool,
@@ -251,7 +251,7 @@ impl BarLayout {
         )
     }
 
-    pub(super) fn with_rows(
+    pub(in crate::windows_app) fn with_rows(
         client_width: f64,
         scale: f64,
         visible: bool,
@@ -586,7 +586,7 @@ impl BarLayout {
         }
     }
 
-    pub(super) fn hit(&self, x: f64, y: f64) -> Option<BarHit> {
+    pub(in crate::windows_app) fn hit(&self, x: f64, y: f64) -> Option<BarHit> {
         if !self.visible || y > self.height {
             return None;
         }
@@ -656,7 +656,7 @@ impl BarLayout {
     }
 
     /// Alguma aba do grupo `group_index` da coluna esta desenhada?
-    pub(super) fn group_members_drawn(&self, column: usize, group_index: usize) -> bool {
+    pub(in crate::windows_app) fn group_members_drawn(&self, column: usize, group_index: usize) -> bool {
         column < self.columns_len
             && (0..self.context_tab_counts[column])
                 .any(|visual| self.tab_owners[column][visual] == Some(group_index))
@@ -664,7 +664,7 @@ impl BarLayout {
 
     /// A fila de uma coluna -- pilulas e abas -- da esquerda para a direita,
     /// tal como esta desenhada. E o que o arrasto usa para saber onde larga.
-    pub(super) fn row_items(&self, column: usize) -> Vec<RowItem> {
+    pub(in crate::windows_app) fn row_items(&self, column: usize) -> Vec<RowItem> {
         if column >= self.columns_len {
             return Vec::new();
         }
@@ -687,13 +687,13 @@ impl BarLayout {
 }
 
 /// Lado do x de fechar de cada aba e do seu alvo, em pixeis logicos.
-pub(super) const TAB_CLOSE_SIZE: f64 = 16.0;
+pub(in crate::windows_app) const TAB_CLOSE_SIZE: f64 = 16.0;
 /// Espessura do sublinhado de um grupo.
-pub(super) const GROUP_LINE_HEIGHT: f64 = 2.0;
+pub(in crate::windows_app) const GROUP_LINE_HEIGHT: f64 = 2.0;
 
 /// O x de fechar, encostado a direita da aba e centrado na altura. Uma aba
 /// estreita de mais nao o leva (como no Chrome): so sobraria o x.
-pub(super) fn tab_close_rect(tab: UiRect, scale: f64, size: f64) -> UiRect {
+pub(in crate::windows_app) fn tab_close_rect(tab: UiRect, scale: f64, size: f64) -> UiRect {
     if tab.width < 48.0 * scale {
         return UiRect {
             x: 0.0,
@@ -715,7 +715,7 @@ pub(super) fn tab_close_rect(tab: UiRect, scale: f64, size: f64) -> UiRect {
 /// do texto apagado; sob o proprio rato fica vermelho com a cruz branca -- o
 /// mesmo vermelho do fechar da janela. Antes so aparecia com o rato na aba:
 /// parada, a barra nao mostrava x nenhum.
-pub(super) fn tab_close_style(close_hovered: bool, tab_fill: Rgb, theme: &Theme) -> PillStyle {
+pub(in crate::windows_app) fn tab_close_style(close_hovered: bool, tab_fill: Rgb, theme: &Theme) -> PillStyle {
     if close_hovered {
         return caption_button_style(2, true, theme);
     }
@@ -724,23 +724,23 @@ pub(super) fn tab_close_style(close_hovered: bool, tab_fill: Rgb, theme: &Theme)
 
 /// A largura mais estreita a que uma aba desce antes de sair da barra: fica
 /// so o comeco do titulo (o x de fechar some abaixo de 48 px, como no Chrome).
-pub(super) const TAB_MIN_WIDTH: f64 = 36.0;
-pub(super) const TAB_MAX_WIDTH: f64 = 156.0;
+pub(in crate::windows_app) const TAB_MIN_WIDTH: f64 = 36.0;
+pub(in crate::windows_app) const TAB_MAX_WIDTH: f64 = 156.0;
 /// A pilula de um grupo e um rotulo, nao um titulo de pagina: largura fixa,
 /// que so encolhe quando as abas ja nao podem.
-pub(super) const GROUP_CHIP_WIDTH: f64 = 74.0;
-pub(super) const GROUP_CHIP_MIN_WIDTH: f64 = 44.0;
+pub(in crate::windows_app) const GROUP_CHIP_WIDTH: f64 = 74.0;
+pub(in crate::windows_app) const GROUP_CHIP_MIN_WIDTH: f64 = 44.0;
 /// O "‹N" de uma coluna com abas fora da vista.
-pub(super) const TAB_OVERFLOW_WIDTH: f64 = 30.0;
+pub(in crate::windows_app) const TAB_OVERFLOW_WIDTH: f64 = 30.0;
 
 /// Larguras da fila de abas da barra de titulo, e o corte de cada coluna
 /// quando nem assim cabe tudo.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct TitleRowMetrics {
-    pub(super) gap: f64,
-    pub(super) chip: f64,
-    pub(super) tab: f64,
-    pub(super) overflow: f64,
+pub(in crate::windows_app) struct TitleRowMetrics {
+    pub(in crate::windows_app) gap: f64,
+    pub(in crate::windows_app) chip: f64,
+    pub(in crate::windows_app) tab: f64,
+    pub(in crate::windows_app) overflow: f64,
 }
 
 impl TitleRowMetrics {
@@ -749,7 +749,7 @@ impl TitleRowMetrics {
     /// `fit_row`. Antes, abaixo dos 56 px, os lugares do fim ficavam de fora
     /// -- a terceira coluna inteira a 800 px -- e uma pilula entrava espremida
     /// sem nenhuma das suas abas, com cara de recolhida.
-    pub(super) fn fit(rows: &[TabRow], area: f64, scale: f64) -> Self {
+    pub(in crate::windows_app) fn fit(rows: &[TabRow], area: f64, scale: f64) -> Self {
         let gap = 3.0 * scale;
         let overflow = TAB_OVERFLOW_WIDTH * scale;
         let (mut tabs, mut chips, mut buttons) = (0usize, 0usize, 0usize);
@@ -785,7 +785,7 @@ impl TitleRowMetrics {
         }
     }
 
-    pub(super) fn width(&self, slot: TabSlot) -> f64 {
+    pub(in crate::windows_app) fn width(&self, slot: TabSlot) -> f64 {
         match slot {
             TabSlot::Group(_) => self.chip,
             TabSlot::Tab(_) => self.tab,
@@ -794,7 +794,7 @@ impl TitleRowMetrics {
 
     /// Quanto ocupa a fila com os lugares `kept` (e o "‹N", se `button`),
     /// cada coisa com o seu espaco a direita.
-    pub(super) fn need(&self, row: &TabRow, kept: &[bool], button: bool) -> f64 {
+    pub(in crate::windows_app) fn need(&self, row: &TabRow, kept: &[bool], button: bool) -> f64 {
         let slots: f64 = row
             .visible()
             .iter()
@@ -814,7 +814,7 @@ impl TitleRowMetrics {
     /// pede; senao reparte-se por igual, e o que uma coluna curta nao usa
     /// passa as outras -- a ultima IA nunca fica sem abas por a primeira ter
     /// muitas.
-    pub(super) fn budgets(&self, rows: &[TabRow], area: f64) -> [f64; COMPARATOR_COLUMNS] {
+    pub(in crate::windows_app) fn budgets(&self, rows: &[TabRow], area: f64) -> [f64; COMPARATOR_COLUMNS] {
         let count = rows.len().min(COMPARATOR_COLUMNS);
         let all = [true; MAX_VISIBLE_TAB_SLOTS];
         let mut demand = [0.0; COMPARATOR_COLUMNS];
@@ -838,7 +838,7 @@ impl TitleRowMetrics {
 
     /// Que lugares da fila cabem em `budget`, e quantas abas ficam fora da
     /// vista -- o numero do "‹N", cujo botao tambem conta na largura.
-    pub(super) fn fit_row(
+    pub(in crate::windows_app) fn fit_row(
         &self,
         row: &TabRow,
         budget: f64,
@@ -870,7 +870,7 @@ impl TitleRowMetrics {
 /// ultima delas: uma pilula aberta sozinha parecia recolhida e o clique
 /// nela recolhia sem se ver nada (so a pilula de um grupo que ja estava
 /// inteiro fora do corte fica sozinha -- e o clique nela mostra-o).
-pub(super) fn cut_victims(row: &TabRow, kept: &[bool]) -> Vec<usize> {
+pub(in crate::windows_app) fn cut_victims(row: &TabRow, kept: &[bool]) -> Vec<usize> {
     let alive = |position: usize| kept.get(position).copied().unwrap_or(false);
     let is_tab = |position: usize| matches!(row.slots[position], TabSlot::Tab(_));
     let chip_of =
@@ -909,14 +909,14 @@ pub(super) fn cut_victims(row: &TabRow, kept: &[bool]) -> Vec<usize> {
     victims
 }
 
-pub(super) fn surface_accepts_omnibox_submit(surface: Surface) -> bool {
+pub(in crate::windows_app) fn surface_accepts_omnibox_submit(surface: Surface) -> bool {
     matches!(surface, Surface::Home)
 }
 
 /// Mantem o HWND da omnibox vivo entre trocas de decoracao, mas remove a sua
 /// autoridade de teclado fora da Home. Esta e a unica funcao que decide a
 /// interatividade do EDIT nativo; producao e gate exercitam o mesmo caminho.
-pub(super) unsafe fn apply_omnibox_interactivity(edit: HWND, surface: Surface) {
+pub(in crate::windows_app) unsafe fn apply_omnibox_interactivity(edit: HWND, surface: Surface) {
     let interactive = surface_accepts_omnibox_submit(surface);
     EnableWindow(edit, if interactive { 1 } else { 0 });
     if !interactive && GetFocus() == edit {
@@ -929,35 +929,35 @@ pub(super) unsafe fn apply_omnibox_interactivity(edit: HWND, surface: Surface) {
 
 /// Os controlos do canto direito da segunda linha.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct RightControls {
-    pub(super) private: UiRect,
+pub(in crate::windows_app) struct RightControls {
+    pub(in crate::windows_app) private: UiRect,
     /// Videochamada, WhatsApp, YouTube e Gmail, a esquerda do Privado.
-    pub(super) services: [UiRect; 4],
+    pub(in crate::windows_app) services: [UiRect; 4],
     /// Gemini Live, logo a esquerda dos servicos: o inicio do canto.
-    pub(super) live: UiRect,
+    pub(in crate::windows_app) live: UiRect,
     /// Pomodoro, Notas e Respiracao (ordem de `Tool::ALL`) na linha de CIMA,
     /// antes dos botoes da janela -- o mesmo sitio da Home
     /// (`home_tool_buttons`). Na segunda linha tiravam a largura toda a
     /// ultima coluna: a 1280 px a terceira IA ficava sem pilula, sem ‹ › e,
     /// com o Pomodoro a correr, sem "+". O do Pomodoro alarga com o tempo.
-    pub(super) tools: [UiRect; 3],
+    pub(in crate::windows_app) tools: [UiRect; 3],
     /// Rotulo, expandir e fechar da gaveta; `None` quando nao ha gaveta.
-    pub(super) split: Option<(UiRect, UiRect, UiRect)>,
+    pub(in crate::windows_app) split: Option<(UiRect, UiRect, UiRect)>,
     /// ‹ e › da fonte da gaveta, a esquerda do rotulo.
-    pub(super) split_nav: Option<(UiRect, UiRect)>,
+    pub(in crate::windows_app) split_nav: Option<(UiRect, UiRect)>,
 }
 
 /// Onde acaba o botao Home da segunda linha (7 + 72 px) mais a folga de 8:
 /// os controlos da direita nunca descem daqui.
-pub(super) const RIGHT_CONTROLS_MIN_LEFT: f64 = 87.0;
+pub(in crate::windows_app) const RIGHT_CONTROLS_MIN_LEFT: f64 = 87.0;
 /// Rotulo da gaveta ("Fonte · ChatGPT") inteiro, e o minimo que ainda se le.
-pub(super) const SPLIT_LABEL_WIDTH: f64 = 150.0;
-pub(super) const SPLIT_LABEL_MIN_WIDTH: f64 = 60.0;
+pub(in crate::windows_app) const SPLIT_LABEL_WIDTH: f64 = 150.0;
+pub(in crate::windows_app) const SPLIT_LABEL_MIN_WIDTH: f64 = 60.0;
 
 /// Quanto cede, numa janela estreita, o rotulo da gaveta (so informa):
 /// encolhe ate desaparecer abaixo do minimo. Em pixeis logicos; `room` e o
 /// que sobra depois dos botoes.
-pub(super) fn split_label_width(room: f64, split_active: bool) -> f64 {
+pub(in crate::windows_app) fn split_label_width(room: f64, split_active: bool) -> f64 {
     if !split_active {
         return 0.0;
     }
@@ -972,11 +972,11 @@ pub(super) fn split_label_width(room: f64, split_active: bool) -> f64 {
 /// A etiqueta mais larga que o Pomodoro mostra ("⏸ mm:ss"). As abas da
 /// linha de cima param antes dela sempre, com ou sem sessao: arrancar ou
 /// pausar um Pomodoro nao mexe em nenhuma aba.
-pub(super) const POMODORO_LABEL_RESERVE: &str = "⏸ 00:00";
+pub(in crate::windows_app) const POMODORO_LABEL_RESERVE: &str = "⏸ 00:00";
 
 /// Onde comecam as ferramentas na linha de cima, com a etiqueta do Pomodoro
 /// ja reservada: as abas acabam antes disto.
-pub(super) fn title_tools_left(
+pub(in crate::windows_app) fn title_tools_left(
     client_width: f64,
     scale: f64,
     pomodoro_label: Option<BarLabel>,
@@ -989,7 +989,7 @@ pub(super) fn title_tools_left(
 /// Geometria dos controlos encostados a direita. A mesma conta estava escrita
 /// tres vezes -- no desenho, no hit-testing e agora nos chips -- e as copias
 /// ja tinham comecado a divergir; aqui ela e uma so.
-pub(super) fn right_controls(
+pub(in crate::windows_app) fn right_controls(
     client_width: f64,
     scale: f64,
     split_active: bool,
@@ -1091,13 +1091,13 @@ pub(super) fn right_controls(
 impl RightControls {
     /// Onde comecam os controlos da direita na segunda linha: as colunas
     /// acabam aqui. As ferramentas, na linha de cima, nao contam.
-    pub(super) fn leftmost(&self) -> f64 {
+    pub(in crate::windows_app) fn leftmost(&self) -> f64 {
         self.live.x
     }
 }
 
 /// O que cada icone do canto direito faz, na ordem de `RightControls::services`.
-pub(super) const SERVICE_BUTTON_HITS: [BarHit; 4] = [
+pub(in crate::windows_app) const SERVICE_BUTTON_HITS: [BarHit; 4] = [
     BarHit::Service(Service::Meet),
     BarHit::Service(Service::WhatsApp),
     BarHit::Service(Service::YouTube),
@@ -1107,7 +1107,7 @@ pub(super) const SERVICE_BUTTON_HITS: [BarHit; 4] = [
 /// O botao da barra que abre `service`: um dos icones dos servicos ou, para
 /// a Respiracao (uma ferramenta), o botao dela na linha do titulo. E nele que
 /// o painel minimizado poe o ponto (`draw_service_chrome`).
-pub(super) fn service_icon_rect(controls: RightControls, service: Service) -> Option<UiRect> {
+pub(in crate::windows_app) fn service_icon_rect(controls: RightControls, service: Service) -> Option<UiRect> {
     if service == Service::Breath {
         return Tool::ALL
             .iter()
@@ -1123,7 +1123,7 @@ pub(super) fn service_icon_rect(controls: RightControls, service: Service) -> Op
         .map(|(rect, _)| *rect)
 }
 
-pub(super) fn right_controls_hit(controls: RightControls, x: f64, y: f64) -> Option<BarHit> {
+pub(in crate::windows_app) fn right_controls_hit(controls: RightControls, x: f64, y: f64) -> Option<BarHit> {
     for (rect, tool) in controls.tools.iter().zip(Tool::ALL) {
         if rect.contains(x, y) {
             return Some(BarHit::Tool(tool));
@@ -1154,7 +1154,7 @@ pub(super) fn right_controls_hit(controls: RightControls, x: f64, y: f64) -> Opt
 /// O alvo da barra num ponto: os controlos da direita primeiro, depois o
 /// resto. E o que `App::comparator_bar_hit` usa para o clique esquerdo, o
 /// direito e a dica -- os tres veem o mesmo botao.
-pub(super) fn bar_hit_at(
+pub(in crate::windows_app) fn bar_hit_at(
     controls: Option<RightControls>,
     layout: Option<BarLayout>,
     x: f64,

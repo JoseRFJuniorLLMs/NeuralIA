@@ -1,10 +1,10 @@
-use super::*;
+﻿use super::*;
 
 /// As cores que um grupo de abas pode ter: as nove do Chrome, com os nomes
 /// dele. Poucas e nomeadas: uma paleta aberta obrigaria a um seletor, e o que
 /// se quer e distinguir grupos de relance, nao escolher tons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum GroupColor {
+pub(in crate::windows_app) enum GroupColor {
     Blue,
     Green,
     Amber,
@@ -18,7 +18,7 @@ pub(super) enum GroupColor {
 
 impl GroupColor {
     /// Pela ordem do seletor do Chrome.
-    pub(super) const ALL: [Self; 9] = [
+    pub(in crate::windows_app) const ALL: [Self; 9] = [
         Self::Slate,
         Self::Blue,
         Self::Red,
@@ -30,7 +30,7 @@ impl GroupColor {
         Self::Orange,
     ];
 
-    pub(super) fn rgb(self) -> Rgb {
+    pub(in crate::windows_app) fn rgb(self) -> Rgb {
         match self {
             Self::Blue => (66, 133, 244),
             Self::Green => (52, 168, 83),
@@ -46,7 +46,7 @@ impl GroupColor {
 
     /// A proxima cor por usar numa coluna, para dois grupos seguidos nao
     /// nascerem iguais. O azul primeiro, o cinza por ultimo.
-    pub(super) fn next(used: &[Self]) -> Self {
+    pub(in crate::windows_app) fn next(used: &[Self]) -> Self {
         [
             Self::Blue,
             Self::Red,
@@ -66,27 +66,27 @@ impl GroupColor {
 
 /// Um grupo de abas na barra de titulo: nome, cor e se esta fechado.
 #[derive(Debug, Clone)]
-pub(super) struct ContextGroup {
-    pub(super) id: u64,
-    pub(super) name: String,
-    pub(super) color: GroupColor,
-    pub(super) collapsed: bool,
+pub(in crate::windows_app) struct ContextGroup {
+    pub(in crate::windows_app) id: u64,
+    pub(in crate::windows_app) name: String,
+    pub(in crate::windows_app) color: GroupColor,
+    pub(in crate::windows_app) collapsed: bool,
 }
 
 /// Uma aba de contexto. O `group` e o id do grupo, nao um indice: fechar um
 /// grupo no meio nao pode renumerar as abas dos outros.
 #[derive(Debug, Clone)]
-pub(super) struct ContextTab {
+pub(in crate::windows_app) struct ContextTab {
     /// Identidade estavel. A URL pode repetir em grupos diferentes e por isso
     /// nunca serve para decidir qual aba esta aberta ou deve ser fechada.
-    pub(super) id: u64,
-    pub(super) url: String,
-    pub(super) group: Option<u64>,
+    pub(in crate::windows_app) id: u64,
+    pub(in crate::windows_app) url: String,
+    pub(in crate::windows_app) group: Option<u64>,
 }
 
 /// Um lugar na fila de abas de uma coluna: ou a pilula de um grupo, ou uma aba.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TabSlot {
+pub(in crate::windows_app) enum TabSlot {
     /// Indice do grupo dentro de `groups` daquela coluna.
     Group(usize),
     /// Indice da aba dentro de `contexts` daquela coluna.
@@ -95,27 +95,27 @@ pub(super) enum TabSlot {
 
 /// A fila visivel de uma coluna, ja cortada ao que cabe na barra.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct TabRow {
-    pub(super) slots: [TabSlot; MAX_VISIBLE_TAB_SLOTS],
+pub(in crate::windows_app) struct TabRow {
+    pub(in crate::windows_app) slots: [TabSlot; MAX_VISIBLE_TAB_SLOTS],
     /// Para cada `TabSlot::Tab`, o indice do grupo a que a aba pertence. A
     /// barra precisa disto para saber ate onde vai o sublinhado do grupo.
-    pub(super) owners: [Option<usize>; MAX_VISIBLE_TAB_SLOTS],
+    pub(in crate::windows_app) owners: [Option<usize>; MAX_VISIBLE_TAB_SLOTS],
     /// Para cada pilula, quantas abas do grupo nao estao na fila (recolhidas
     /// ou cortadas).
-    pub(super) behind: [usize; MAX_VISIBLE_TAB_SLOTS],
+    pub(in crate::windows_app) behind: [usize; MAX_VISIBLE_TAB_SLOTS],
     /// Para cada pilula, se o grupo esta recolhido: as abas dele que nao
     /// estao na fila estao escondidas de proposito, nao cortadas.
-    pub(super) collapsed: [bool; MAX_VISIBLE_TAB_SLOTS],
+    pub(in crate::windows_app) collapsed: [bool; MAX_VISIBLE_TAB_SLOTS],
     /// A aba aberta ao lado e a aba em que o dono acabou de mexer: a barra
     /// estreita corta tudo o resto antes delas.
-    pub(super) pinned: [bool; MAX_VISIBLE_TAB_SLOTS],
+    pub(in crate::windows_app) pinned: [bool; MAX_VISIBLE_TAB_SLOTS],
     /// Quantas abas a coluna tem ao todo.
-    pub(super) total_tabs: usize,
-    pub(super) len: usize,
+    pub(in crate::windows_app) total_tabs: usize,
+    pub(in crate::windows_app) len: usize,
 }
 
 impl TabRow {
-    pub(super) fn empty() -> Self {
+    pub(in crate::windows_app) fn empty() -> Self {
         Self {
             slots: [TabSlot::Tab(0); MAX_VISIBLE_TAB_SLOTS],
             owners: [None; MAX_VISIBLE_TAB_SLOTS],
@@ -130,7 +130,7 @@ impl TabRow {
     /// Quantas abas da coluna ficam fora da vista se a barra desenhar so os
     /// lugares `drawn` da fila: nem desenhadas, nem atras de uma pilula
     /// recolhida desenhada. Sao as que o "‹N" conta.
-    pub(super) fn hidden_tabs(&self, drawn: &[bool]) -> usize {
+    pub(in crate::windows_app) fn hidden_tabs(&self, drawn: &[bool]) -> usize {
         let mut seen = 0usize;
         for position in 0..self.len {
             if !drawn.get(position).copied().unwrap_or(false) {
@@ -145,27 +145,27 @@ impl TabRow {
         self.total_tabs.saturating_sub(seen)
     }
 
-    pub(super) fn push(&mut self, slot: TabSlot) {
+    pub(in crate::windows_app) fn push(&mut self, slot: TabSlot) {
         if self.len < MAX_VISIBLE_TAB_SLOTS {
             self.slots[self.len] = slot;
             self.len += 1;
         }
     }
 
-    pub(super) fn visible(&self) -> &[TabSlot] {
+    pub(in crate::windows_app) fn visible(&self) -> &[TabSlot] {
         &self.slots[..self.len]
     }
 
     /// O grupo da aba no lugar `position` da fila (`None` para pilulas e
     /// abas soltas).
-    pub(super) fn owner(&self, position: usize) -> Option<usize> {
+    pub(in crate::windows_app) fn owner(&self, position: usize) -> Option<usize> {
         self.owners.get(position).copied().flatten()
     }
 
     /// Uma coluna sem grupo nenhum: as ultimas abas, como era antes de existirem
     /// grupos. Serve os chamadores que so sabem contar abas.
     #[cfg(test)]
-    pub(super) fn plain(count: usize) -> Self {
+    pub(in crate::windows_app) fn plain(count: usize) -> Self {
         let mut row = Self::empty();
         let shown = count.min(MAX_VISIBLE_CONTEXT_TABS);
         for offset in 0..shown {
@@ -178,13 +178,13 @@ impl TabRow {
 
 /// Atalho dos testes antigos: nenhuma aba aberta ao lado nesta coluna.
 #[cfg(test)]
-pub(super) fn plan_tab_row(tabs: &[ContextTab], groups: &[ContextGroup]) -> TabRow {
+pub(in crate::windows_app) fn plan_tab_row(tabs: &[ContextTab], groups: &[ContextGroup]) -> TabRow {
     plan_tab_row_with_active(tabs, groups, None)
 }
 
 /// A fila de uma coluna sem aba nenhuma acabada de mexer.
 #[cfg(test)]
-pub(super) fn plan_tab_row_with_active(
+pub(in crate::windows_app) fn plan_tab_row_with_active(
     tabs: &[ContextTab],
     groups: &[ContextGroup],
     active: Option<u64>,
@@ -213,7 +213,7 @@ pub(super) fn plan_tab_row_with_active(
 /// recolhido -- a aberta ao lado fica sozinha depois da pilula; a outra e
 /// alcancada pela pilula --, nem quando o corte pelo fim a deixaria de fora.
 /// Se as duas nao couberem juntas, ganha `focus`: e para ela que se olha.
-pub(super) fn plan_tab_row_focused(
+pub(in crate::windows_app) fn plan_tab_row_focused(
     tabs: &[ContextTab],
     groups: &[ContextGroup],
     active: Option<u64>,
@@ -341,7 +341,7 @@ pub(super) fn plan_tab_row_focused(
 
 /// O troco comeca a meio de um grupo (numa aba agrupada): a pilula dele fica
 /// antes do troco e tem de vir para a frente.
-pub(super) fn window_needs_chip(
+pub(in crate::windows_app) fn window_needs_chip(
     full: &[TabSlot],
     group_of: &dyn Fn(usize) -> Option<usize>,
     start: usize,
@@ -357,7 +357,7 @@ pub(super) fn window_needs_chip(
 /// `MAX_VISIBLE_TAB_SLOTS` lugares, contando a pilula que venha para a frente.
 /// Cresce primeiro para a direita (as abas mais recentes), depois para a
 /// esquerda. `None`: as posicoes nao cabem juntas.
-pub(super) fn row_window(
+pub(in crate::windows_app) fn row_window(
     full: &[TabSlot],
     group_of: &dyn Fn(usize) -> Option<usize>,
     low: usize,
@@ -386,7 +386,7 @@ pub(super) fn row_window(
 
 /// Cria um grupo com a aba indicada e devolve o indice do grupo novo. O nome
 /// sai do host da aba -- um grupo sem nome nao diz nada a ninguem.
-pub(super) fn create_context_group(
+pub(in crate::windows_app) fn create_context_group(
     tabs: &mut [ContextTab],
     groups: &mut Vec<ContextGroup>,
     next_id: &mut u64,
@@ -409,7 +409,7 @@ pub(super) fn create_context_group(
 /// Poe a aba no grupo e encosta-a ao ultimo membro: os membros de um grupo tem
 /// de ficar juntos na barra, senao a pilula fica a rotular abas que nao sao
 /// dela.
-pub(super) fn join_context_group(tabs: &mut Vec<ContextTab>, group_id: u64, tab_index: usize) {
+pub(in crate::windows_app) fn join_context_group(tabs: &mut Vec<ContextTab>, group_id: u64, tab_index: usize) {
     if tab_index >= tabs.len() {
         return;
     }
@@ -429,7 +429,7 @@ pub(super) fn join_context_group(tabs: &mut Vec<ContextTab>, group_id: u64, tab_
 /// A aba sai para logo a seguir ao ultimo membro, como no Chrome. Solta-la no
 /// sitio onde estava partia o grupo em dois quando ela estava no meio: a
 /// pilula ficava a rotular metade e a outra metade parecia de ninguem.
-pub(super) fn leave_context_group(
+pub(in crate::windows_app) fn leave_context_group(
     tabs: &mut Vec<ContextTab>,
     groups: &mut Vec<ContextGroup>,
     tab_index: usize,
@@ -440,7 +440,7 @@ pub(super) fn leave_context_group(
 
 /// Solta a aba do seu grupo e poe-na logo depois do ultimo membro que fica.
 /// Devolve onde a aba ficou. Uma aba solta fica onde esta.
-pub(super) fn detach_from_group(tabs: &mut Vec<ContextTab>, tab_index: usize) -> usize {
+pub(in crate::windows_app) fn detach_from_group(tabs: &mut Vec<ContextTab>, tab_index: usize) -> usize {
     let Some(group) = tabs.get(tab_index).and_then(|tab| tab.group) else {
         return tab_index;
     };
@@ -458,7 +458,7 @@ pub(super) fn detach_from_group(tabs: &mut Vec<ContextTab>, tab_index: usize) ->
 /// assume para desenhar a pilula e o sublinhado; todas as operacoes sobre as
 /// abas a mantem, e os testes confirmam-no depois de cada uma.
 #[cfg(test)]
-pub(super) fn group_runs_are_contiguous(tabs: &[ContextTab]) -> bool {
+pub(in crate::windows_app) fn group_runs_are_contiguous(tabs: &[ContextTab]) -> bool {
     let mut closed: Vec<u64> = Vec::new();
     let mut current: Option<u64> = None;
     for tab in tabs {
@@ -476,7 +476,7 @@ pub(super) fn group_runs_are_contiguous(tabs: &[ContextTab]) -> bool {
 }
 
 /// Onde comeca e onde acaba (exclusivo) o troco do grupo na fila.
-pub(super) fn group_run(tabs: &[ContextTab], group_id: u64) -> Option<(usize, usize)> {
+pub(in crate::windows_app) fn group_run(tabs: &[ContextTab], group_id: u64) -> Option<(usize, usize)> {
     let start = tabs.iter().position(|tab| tab.group == Some(group_id))?;
     let end = tabs
         .iter()
@@ -489,7 +489,7 @@ pub(super) fn group_run(tabs: &[ContextTab], group_id: u64) -> Option<(usize, us
 /// `group`, para nao partir o troco de grupo nenhum: longe dos outros membros,
 /// vai para o fim do troco do seu grupo; solta no meio de outro grupo, vai
 /// para logo depois dele.
-pub(super) fn contiguous_slot(tabs: &[ContextTab], at: usize, group: Option<u64>) -> usize {
+pub(in crate::windows_app) fn contiguous_slot(tabs: &[ContextTab], at: usize, group: Option<u64>) -> usize {
     let at = at.min(tabs.len());
     let before = at
         .checked_sub(1)
@@ -515,7 +515,7 @@ pub(super) fn contiguous_slot(tabs: &[ContextTab], at: usize, group: Option<u64>
 /// Muda uma aba de lugar (e de grupo) na fila da sua coluna. `drop.before` e
 /// o indice, na fila de ANTES da mudanca, da aba que fica a seguir a ela
 /// (`None`: no fim). Um grupo que ja nao existe conta como "sem grupo".
-pub(super) fn move_context_tab(
+pub(in crate::windows_app) fn move_context_tab(
     tabs: &mut Vec<ContextTab>,
     groups: &mut Vec<ContextGroup>,
     from: usize,
@@ -544,7 +544,7 @@ pub(super) fn move_context_tab(
 /// Muda um grupo inteiro de lugar: o troco sai junto e entra antes da aba
 /// `before` (indice na fila de antes; `None`: no fim), nunca no meio de outro
 /// grupo.
-pub(super) fn move_context_group(
+pub(in crate::windows_app) fn move_context_group(
     tabs: &mut Vec<ContextTab>,
     group_id: u64,
     before: Option<usize>,
@@ -567,7 +567,7 @@ pub(super) fn move_context_group(
     true
 }
 
-pub(super) fn prune_empty_groups(tabs: &[ContextTab], groups: &mut Vec<ContextGroup>) {
+pub(in crate::windows_app) fn prune_empty_groups(tabs: &[ContextTab], groups: &mut Vec<ContextGroup>) {
     groups.retain(|group| tabs.iter().any(|tab| tab.group == Some(group.id)));
 }
 
@@ -579,7 +579,7 @@ pub(super) fn prune_empty_groups(tabs: &[ContextTab], groups: &mut Vec<ContextGr
 /// `opener` e a aba de onde o link saiu. Se ela estiver num grupo, a aba nova
 /// nasce nesse grupo, no fim do seu troco -- como no Chrome, onde o que se
 /// abre a partir de uma aba agrupada fica no grupo dela.
-pub(super) fn remember_context_tab(
+pub(in crate::windows_app) fn remember_context_tab(
     tabs: &mut Vec<ContextTab>,
     groups: &mut Vec<ContextGroup>,
     next_id: &mut u64,
@@ -621,7 +621,7 @@ pub(super) fn remember_context_tab(
 /// acabou de nascer, a aberta ao lado). Antes saia a primeira da esquerda: la
 /// ficam os grupos que o dono fez primeiro, e com as abas a sobreviver a
 /// pesquisas e reinicios o limite passou a apaga-los sem aviso.
-pub(super) fn prune_context_tabs(
+pub(in crate::windows_app) fn prune_context_tabs(
     tabs: &mut Vec<ContextTab>,
     groups: &mut Vec<ContextGroup>,
     protected: &[u64],
@@ -649,7 +649,7 @@ pub(super) fn prune_context_tabs(
 }
 
 /// O aviso quando o tecto de abas tirou abas agrupadas (nunca em silencio).
-pub(super) fn lost_grouped_notice(lost: usize) -> Option<String> {
+pub(in crate::windows_app) fn lost_grouped_notice(lost: usize) -> Option<String> {
     match lost {
         0 => None,
         1 => Some(format!(
@@ -664,7 +664,7 @@ pub(super) fn lost_grouped_notice(lost: usize) -> Option<String> {
 }
 
 /// As identidades das abas agrupadas de uma coluna.
-pub(super) fn grouped_tab_ids(tabs: &[ContextTab]) -> Vec<u64> {
+pub(in crate::windows_app) fn grouped_tab_ids(tabs: &[ContextTab]) -> Vec<u64> {
     tabs.iter()
         .filter(|tab| tab.group.is_some())
         .map(|tab| tab.id)
@@ -673,7 +673,7 @@ pub(super) fn grouped_tab_ids(tabs: &[ContextTab]) -> Vec<u64> {
 
 /// Quantas das abas agrupadas `before` ja nao estao na coluna. So o tecto
 /// de abas tira uma agrupada, e isso o dono tem de saber.
-pub(super) fn lost_grouped_tabs(before: &[u64], tabs: &[ContextTab]) -> usize {
+pub(in crate::windows_app) fn lost_grouped_tabs(before: &[u64], tabs: &[ContextTab]) -> usize {
     before
         .iter()
         .filter(|id| !tabs.iter().any(|tab| tab.id == **id))
@@ -683,7 +683,7 @@ pub(super) fn lost_grouped_tabs(before: &[u64], tabs: &[ContextTab]) -> usize {
 /// Decide se uma coluna ainda pode ser minimizada sem esconder todas as IAs.
 /// Esta decisao acontece ANTES de fechar um Split ativo: um clique rejeitado
 /// nao pode destruir estado que o utilizador tinha aberto.
-pub(super) fn can_minimize_column(
+pub(in crate::windows_app) fn can_minimize_column(
     minimized: &[bool; COMPARATOR_COLUMNS],
     columns: usize,
     index: usize,
@@ -699,7 +699,7 @@ pub(super) fn can_minimize_column(
 /// Fecha as outras abas do MESMO escopo da aba selecionada. Um grupo real
 /// usa o seu id; abas soltas partilham o escopo `None`. Abas de outros grupos
 /// nunca sao tocadas.
-pub(super) fn active_context_removed_by_scope(
+pub(in crate::windows_app) fn active_context_removed_by_scope(
     tabs: &[ContextTab],
     context_index: usize,
     active_id: Option<u64>,
@@ -718,7 +718,7 @@ pub(super) fn active_context_removed_by_scope(
     })
 }
 
-pub(super) fn close_other_context_tabs_in_scope(
+pub(in crate::windows_app) fn close_other_context_tabs_in_scope(
     tabs: &mut Vec<ContextTab>,
     groups: &mut Vec<ContextGroup>,
     context_index: usize,
@@ -738,7 +738,7 @@ pub(super) fn close_other_context_tabs_in_scope(
 
 /// Fecha todas as abas do escopo selecionado e preserva integralmente os
 /// demais grupos da coluna.
-pub(super) fn close_context_tab_scope(
+pub(in crate::windows_app) fn close_context_tab_scope(
     tabs: &mut Vec<ContextTab>,
     groups: &mut Vec<ContextGroup>,
     context_index: usize,
@@ -757,7 +757,7 @@ pub(super) fn close_context_tab_scope(
 ///
 /// Uma aba do meio de um grupo sai primeiro para depois do ultimo membro:
 /// criar o grupo novo no sitio dela partia o antigo em dois.
-pub(super) fn regroup_context_tab(
+pub(in crate::windows_app) fn regroup_context_tab(
     tabs: &mut Vec<ContextTab>,
     groups: &mut Vec<ContextGroup>,
     next_id: &mut u64,
@@ -775,7 +775,7 @@ pub(super) fn regroup_context_tab(
 
 /// O que o menu do botao direito sobre a pilula de um grupo faz.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum GroupMenuCommand {
+pub(in crate::windows_app) enum GroupMenuCommand {
     Color(GroupColor),
     ToggleCollapsed,
     Ungroup,
@@ -783,14 +783,14 @@ pub(super) enum GroupMenuCommand {
 }
 
 /// As cores ocupam `GROUP_MENU_COLOR_BASE + indice em GroupColor::ALL`.
-pub(super) const GROUP_MENU_COLOR_BASE: usize = 200;
-pub(super) const GROUP_MENU_TOGGLE: usize = 220;
-pub(super) const GROUP_MENU_UNGROUP: usize = 221;
-pub(super) const GROUP_MENU_CLOSE: usize = 222;
+pub(in crate::windows_app) const GROUP_MENU_COLOR_BASE: usize = 200;
+pub(in crate::windows_app) const GROUP_MENU_TOGGLE: usize = 220;
+pub(in crate::windows_app) const GROUP_MENU_UNGROUP: usize = 221;
+pub(in crate::windows_app) const GROUP_MENU_CLOSE: usize = 222;
 
 /// Id devolvido pelo `TrackPopupMenu` do grupo -> operacao. Zero (menu
 /// fechado sem escolha) e ids fora da lista nao fazem nada.
-pub(super) fn group_menu_command(id: usize) -> Option<GroupMenuCommand> {
+pub(in crate::windows_app) fn group_menu_command(id: usize) -> Option<GroupMenuCommand> {
     match id {
         GROUP_MENU_TOGGLE => Some(GroupMenuCommand::ToggleCollapsed),
         GROUP_MENU_UNGROUP => Some(GroupMenuCommand::Ungroup),
@@ -806,7 +806,7 @@ pub(super) fn group_menu_command(id: usize) -> Option<GroupMenuCommand> {
 /// Aplica o comando ao grupo `group_id` da coluna e devolve as identidades
 /// das abas que fecharam: se a que esta aberta ao lado estiver entre elas, o
 /// App fecha o Split.
-pub(super) fn apply_group_command(
+pub(in crate::windows_app) fn apply_group_command(
     tabs: &mut Vec<ContextTab>,
     groups: &mut Vec<ContextGroup>,
     group_id: u64,
@@ -847,7 +847,7 @@ pub(super) fn apply_group_command(
 
 /// O que o clique (botao esquerdo) na pilula de um grupo faz.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ChipClick {
+pub(in crate::windows_app) enum ChipClick {
     /// Recolhido: abre, e as abas dele passam a estar a vista.
     Expand,
     /// Aberto, mas nenhuma aba dele esta a vista (ficaram fora do corte e a
@@ -857,7 +857,7 @@ pub(super) enum ChipClick {
     Collapse,
 }
 
-pub(super) fn chip_click(collapsed: bool, members_drawn: bool) -> ChipClick {
+pub(in crate::windows_app) fn chip_click(collapsed: bool, members_drawn: bool) -> ChipClick {
     match (collapsed, members_drawn) {
         (true, _) => ChipClick::Expand,
         (false, false) => ChipClick::Reveal,
@@ -868,7 +868,7 @@ pub(super) fn chip_click(collapsed: bool, members_drawn: bool) -> ChipClick {
 /// Aplica o clique na pilula `group_index`. Mostrar as abas e pôr a primeira
 /// do grupo como ancora da coluna (`focus`): a barra corta a fila a volta
 /// dela, pilula incluida.
-pub(super) fn apply_chip_click(
+pub(in crate::windows_app) fn apply_chip_click(
     tabs: &[ContextTab],
     groups: &mut [ContextGroup],
     focus: &mut Option<u64>,
@@ -894,7 +894,7 @@ pub(super) fn apply_chip_click(
 
 /// Uma linha da lista de todas as abas de uma coluna (o "‹N").
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum TabListEntry {
+pub(in crate::windows_app) enum TabListEntry {
     /// Uma aba solta: indice na coluna e rotulo.
     Tab { index: usize, label: String },
     /// Um grupo, com as suas abas (indice na coluna e rotulo).
@@ -908,7 +908,7 @@ pub(super) enum TabListEntry {
 /// Todas as abas da coluna pela ordem da barra, cada grupo com as suas --
 /// recolhidos e cortados incluidos. E por aqui que qualquer aba guardada no
 /// `tabs.json` volta a estar ao alcance, por mais antiga que seja.
-pub(super) fn tab_list_entries(tabs: &[ContextTab], groups: &[ContextGroup]) -> Vec<TabListEntry> {
+pub(in crate::windows_app) fn tab_list_entries(tabs: &[ContextTab], groups: &[ContextGroup]) -> Vec<TabListEntry> {
     let mut entries: Vec<TabListEntry> = Vec::new();
     for (index, tab) in tabs.iter().enumerate() {
         let label = context_tab_label(&tab.url);
@@ -939,15 +939,15 @@ pub(super) fn tab_list_entries(tabs: &[ContextTab], groups: &[ContextGroup]) -> 
 
 /// Ids da lista de abas: `TAB_LIST_BASE + indice da aba na coluna`. Zero e o
 /// "fechou sem escolher".
-pub(super) const TAB_LIST_BASE: usize = 1;
+pub(in crate::windows_app) const TAB_LIST_BASE: usize = 1;
 
-pub(super) fn tab_list_command(id: usize, tabs: usize) -> Option<usize> {
+pub(in crate::windows_app) fn tab_list_command(id: usize, tabs: usize) -> Option<usize> {
     id.checked_sub(TAB_LIST_BASE).filter(|index| *index < tabs)
 }
 
 /// O que o menu do botao direito sobre uma aba faz.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TabMenuCommand {
+pub(in crate::windows_app) enum TabMenuCommand {
     Open,
     Fullscreen,
     Close,
@@ -965,7 +965,7 @@ pub(super) enum TabMenuCommand {
 /// Id devolvido pelo `TrackPopupMenu` da aba -> operacao. As entradas do
 /// submenu "Mover para o grupo" sao `TAB_MENU_GROUP_BASE + posicao` em
 /// `joinable`, a mesma lista com que o menu foi montado.
-pub(super) fn tab_menu_command(id: usize, joinable: &[(usize, String)]) -> Option<TabMenuCommand> {
+pub(in crate::windows_app) fn tab_menu_command(id: usize, joinable: &[(usize, String)]) -> Option<TabMenuCommand> {
     Some(match id {
         TAB_MENU_OPEN => TabMenuCommand::Open,
         TAB_MENU_FULLSCREEN => TabMenuCommand::Fullscreen,
@@ -985,7 +985,7 @@ pub(super) fn tab_menu_command(id: usize, joinable: &[(usize, String)]) -> Optio
 }
 
 /// O nome de cada cor no menu do grupo, como o Chrome em portugues.
-pub(super) fn group_color_label(color: GroupColor) -> &'static str {
+pub(in crate::windows_app) fn group_color_label(color: GroupColor) -> &'static str {
     match color {
         GroupColor::Blue => "Azul",
         GroupColor::Green => "Verde",
@@ -1002,22 +1002,22 @@ pub(super) fn group_color_label(color: GroupColor) -> &'static str {
 /// Onde fica uma aba largada: antes de que aba da fila (indice de ANTES da
 /// mudanca; `None` = no fim) e em que grupo (`None` = solta).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct TabDrop {
-    pub(super) before: Option<usize>,
-    pub(super) group: Option<u64>,
+pub(in crate::windows_app) struct TabDrop {
+    pub(in crate::windows_app) before: Option<usize>,
+    pub(in crate::windows_app) group: Option<u64>,
 }
 
 /// O que se arrasta na barra, pela identidade estavel: os indices podem mudar
 /// a meio do gesto se chegar uma aba nova.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DragItem {
+pub(in crate::windows_app) enum DragItem {
     Tab(u64),
     Group(u64),
 }
 
 /// Onde o que se arrasta vai cair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DropSpot {
+pub(in crate::windows_app) enum DropSpot {
     Tab(TabDrop),
     /// O troco inteiro entra antes da aba `before` (indice de antes).
     Group {
@@ -1027,13 +1027,13 @@ pub(super) enum DropSpot {
 
 /// Um lugar da fila de uma coluna tal como esta desenhado.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct RowItem {
-    pub(super) kind: RowKind,
-    pub(super) rect: UiRect,
+pub(in crate::windows_app) struct RowItem {
+    pub(in crate::windows_app) kind: RowKind,
+    pub(in crate::windows_app) rect: UiRect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RowKind {
+pub(in crate::windows_app) enum RowKind {
     /// A pilula do grupo com este indice na coluna.
     Chip(usize),
     /// A aba com este indice na coluna, e o indice do grupo dela.
@@ -1046,18 +1046,18 @@ pub(super) enum RowKind {
 /// Quanto o rato tem de andar com o botao em baixo, PARA ALEM disto, antes de
 /// o gesto deixar de ser um clique e passar a ser um arrasto (pixeis
 /// logicos). Ate 4 px e a mao a tremer num clique.
-pub(super) const DRAG_THRESHOLD: f64 = 4.0;
+pub(in crate::windows_app) const DRAG_THRESHOLD: f64 = 4.0;
 /// Folga, alem das pontas da fila da coluna, onde ainda se pode largar.
-pub(super) const DROP_MARGIN: f64 = 24.0;
+pub(in crate::windows_app) const DROP_MARGIN: f64 = 24.0;
 
-pub(super) fn drag_started(origin: (f64, f64), now: (f64, f64), scale: f64) -> bool {
+pub(in crate::windows_app) fn drag_started(origin: (f64, f64), now: (f64, f64), scale: f64) -> bool {
     let limit = DRAG_THRESHOLD * scale.max(1.0);
     (now.0 - origin.0).abs() > limit || (now.1 - origin.1).abs() > limit
 }
 
 /// Se o lugar `kind` da fila e o que se arrasta: a propria aba, ou a pilula e
 /// os membros do grupo arrastado.
-pub(super) fn row_item_is_dragged(
+pub(in crate::windows_app) fn row_item_is_dragged(
     kind: RowKind,
     item: DragItem,
     tabs: &[ContextTab],
@@ -1083,7 +1083,7 @@ pub(super) fn row_item_is_dragged(
 /// uma folga nas pontas e por baixo das abas. A folga nunca invade a fila de
 /// outra IA -- as abas sao da IA desta coluna e nao mudam de IA. Fora daqui,
 /// largar cancela o arrasto.
-pub(super) fn in_drop_zone(
+pub(in crate::windows_app) fn in_drop_zone(
     layout: &BarLayout,
     column: usize,
     cursor: (f64, f64),
@@ -1123,7 +1123,7 @@ pub(super) fn in_drop_zone(
 /// uma pilula, depois do ultimo membro ou sobre uma aba solta, fica solta --
 /// e uma aba de um grupo levada para fora do troco sai dele. Um grupo nunca
 /// cai no meio de outro: encosta-se ao lado mais proximo.
-pub(super) fn plan_drop(
+pub(in crate::windows_app) fn plan_drop(
     layout: &BarLayout,
     column: usize,
     tabs: &[ContextTab],
@@ -1230,7 +1230,7 @@ pub(super) fn plan_drop(
 
 /// Aplica a largada ao modelo da coluna. Devolve `false` se nada mudou de
 /// sitio (o item ja nao existe, ou o sitio e de outro tipo de item).
-pub(super) fn apply_drop(
+pub(in crate::windows_app) fn apply_drop(
     tabs: &mut Vec<ContextTab>,
     groups: &mut Vec<ContextGroup>,
     item: DragItem,
@@ -1252,7 +1252,7 @@ pub(super) fn apply_drop(
 /// Trabalha numa copia: o modelo so muda ao largar, e por isso o Esc, a
 /// captura perdida e o largar fora da fila deixam tudo como estava sem ter
 /// de desfazer nada.
-pub(super) fn drag_preview(
+pub(in crate::windows_app) fn drag_preview(
     tabs: &[ContextTab],
     groups: &[ContextGroup],
     item: DragItem,
@@ -1271,7 +1271,7 @@ pub(super) fn drag_preview(
 /// como ancora dela -- fica sempre na fila, mesmo quando cai longe das abas
 /// mais recentes (como no Chrome), em vez de sumir da pre-visualizacao.
 #[allow(clippy::type_complexity)]
-pub(super) fn drag_preview_model(
+pub(in crate::windows_app) fn drag_preview_model(
     contexts: &[Vec<ContextTab>; COMPARATOR_COLUMNS],
     groups: &[Vec<ContextGroup>; COMPARATOR_COLUMNS],
     focus: [Option<u64>; COMPARATOR_COLUMNS],
@@ -1299,7 +1299,7 @@ pub(super) fn drag_preview_model(
 /// Quanto o que se arrasta sai do seu lugar na fila desenhada (`layout` ja e
 /// a pre-visualizacao) para a borda esquerda ficar em `float_left` -- o rato
 /// menos o ponto por onde foi agarrado --, sem sair da fila da sua coluna.
-pub(super) fn drag_float_offset(
+pub(in crate::windows_app) fn drag_float_offset(
     layout: &BarLayout,
     column: usize,
     tabs: &[ContextTab],
@@ -1330,7 +1330,7 @@ pub(super) fn drag_float_offset(
 /// grupo que fique vazio. Devolve a identidade da aba fechada, para o App
 /// saber se era a que estava aberta ao lado. A coluna nunca fica sem nada: a
 /// IA dela continua la, as abas sao so o que se abriu a partir dela.
-pub(super) fn remove_context_tab(
+pub(in crate::windows_app) fn remove_context_tab(
     tabs: &mut Vec<ContextTab>,
     groups: &mut Vec<ContextGroup>,
     index: usize,
@@ -1346,29 +1346,29 @@ pub(super) fn remove_context_tab(
 /// Botao esquerdo em baixo sobre um alvo da fila de abas (aba, x ou pilula).
 /// O clique so se decide ao largar: ate la o gesto pode virar arrasto.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct TabPress {
+pub(in crate::windows_app) struct TabPress {
     /// Onde o botao desceu, em pixeis do cliente.
-    pub(super) origin: (f64, f64),
+    pub(in crate::windows_app) origin: (f64, f64),
     /// O alvo sob o rato quando o botao desceu.
-    pub(super) hit: BarHit,
+    pub(in crate::windows_app) hit: BarHit,
     /// A coluna e o que se arrasta se o rato andar; `None` no x, que nao se
     /// arrasta (como no Chrome).
-    pub(super) drag: Option<(usize, DragItem)>,
+    pub(in crate::windows_app) drag: Option<(usize, DragItem)>,
     /// Distancia do rato a borda esquerda do que foi premido (a aba, ou a
     /// pilula do grupo): o arrastado segue o rato agarrado por este ponto.
-    pub(super) anchor: f64,
+    pub(in crate::windows_app) anchor: f64,
     /// Numero deste gesto (nunca 0). O subclass da janela so ve estaticos; e
     /// por este numero que um WM_CAPTURECHANGED que chega atrasado se
     /// reconhece como de um gesto que ja acabou.
-    pub(super) gesture: u64,
+    pub(in crate::windows_app) gesture: u64,
     /// Ja passou o limiar: e um arrasto, ja nao e um clique.
-    pub(super) dragging: bool,
+    pub(in crate::windows_app) dragging: bool,
 }
 
 /// O premir do botao esquerdo em `origin`, sobre `hit` da barra `layout`.
 /// So abas, o x delas e as pilulas esperam pelo largar; o resto nao e um
 /// gesto da fila e responde logo.
-pub(super) fn tab_press(
+pub(in crate::windows_app) fn tab_press(
     layout: &BarLayout,
     contexts: &[Vec<ContextTab>; COMPARATOR_COLUMNS],
     groups: &[Vec<ContextGroup>; COMPARATOR_COLUMNS],
@@ -1413,7 +1413,7 @@ pub(super) fn tab_press(
 
 /// O que o largar do botao esquerdo faz depois de um `TabPress`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TabRelease {
+pub(in crate::windows_app) enum TabRelease {
     /// Premido e largado no mesmo alvo: e um clique nele.
     Click(BarHit),
     /// Fim de um arrasto: o item cai onde o rato esta.
@@ -1423,7 +1423,7 @@ pub(super) enum TabRelease {
     Nothing,
 }
 
-pub(super) fn tab_release(press: TabPress, released: Option<BarHit>) -> TabRelease {
+pub(in crate::windows_app) fn tab_release(press: TabPress, released: Option<BarHit>) -> TabRelease {
     if press.dragging {
         return press
             .drag
@@ -1440,15 +1440,15 @@ pub(super) fn tab_release(press: TabPress, released: Option<BarHit>) -> TabRelea
 
 /// A fila de abas tal como o gesto a ve: a barra desenhada e o modelo das
 /// colunas de onde ela saiu.
-pub(super) struct TabRowView<'a> {
-    pub(super) layout: &'a BarLayout,
-    pub(super) contexts: &'a [Vec<ContextTab>; COMPARATOR_COLUMNS],
-    pub(super) groups: &'a [Vec<ContextGroup>; COMPARATOR_COLUMNS],
-    pub(super) scale: f64,
+pub(in crate::windows_app) struct TabRowView<'a> {
+    pub(in crate::windows_app) layout: &'a BarLayout,
+    pub(in crate::windows_app) contexts: &'a [Vec<ContextTab>; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) groups: &'a [Vec<ContextGroup>; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) scale: f64,
 }
 
 impl TabRowView<'_> {
-    pub(super) fn plan(
+    pub(in crate::windows_app) fn plan(
         &self,
         column: usize,
         item: DragItem,
@@ -1468,7 +1468,7 @@ impl TabRowView<'_> {
 
 /// O que chega ao gesto sobre a fila de abas.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum TabGestureInput {
+pub(in crate::windows_app) enum TabGestureInput {
     /// O rato andou; `button_down` e o botao esquerdo tal como a fila de
     /// mensagens o ve.
     Move {
@@ -1490,7 +1490,7 @@ pub(super) enum TabGestureInput {
 
 /// O que o App faz depois de um passo do gesto.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TabGestureEffect {
+pub(in crate::windows_app) enum TabGestureEffect {
     /// Nao ha gesto, ou isto nao e com ele: o Esc volta a ser o "voltar".
     Ignored,
     /// Botao em baixo, ainda dentro do limiar: pode ser um clique.
@@ -1519,7 +1519,7 @@ pub(super) enum TabGestureEffect {
 /// modelo, devolve o que o App faz --, e e por aqui que o App passa em cada
 /// evento. O largar TIRA o gesto antes de mais nada: o ReleaseCapture que se
 /// lhe segue manda um WM_CAPTURECHANGED, e esse ja nao encontra nada.
-pub(super) fn tab_gesture_step(
+pub(in crate::windows_app) fn tab_gesture_step(
     press: &mut Option<TabPress>,
     input: TabGestureInput,
     row: &TabRowView,
@@ -1594,7 +1594,7 @@ pub(super) fn tab_gesture_step(
 /// fila o muda. Devolve se alguma aba mudou de sitio ou de grupo. O que foi
 /// largado passa a ser a ancora da coluna (`focus`): fica na barra onde o
 /// dono o pos, mesmo longe das abas mais recentes.
-pub(super) fn apply_tab_gesture(
+pub(in crate::windows_app) fn apply_tab_gesture(
     contexts: &mut [Vec<ContextTab>; COMPARATOR_COLUMNS],
     groups: &mut [Vec<ContextGroup>; COMPARATOR_COLUMNS],
     focus: &mut [Option<u64>; COMPARATOR_COLUMNS],
@@ -1626,14 +1626,14 @@ pub(super) fn apply_tab_gesture(
 /// dela. Fora da faixa onde se larga (`float_left` a `None`) o item volta ao
 /// seu lugar, esbatido: largar ali cancela.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct DragPaint {
-    pub(super) source_index: usize,
-    pub(super) item: DragItem,
-    pub(super) spot: Option<DropSpot>,
-    pub(super) float_left: Option<f64>,
+pub(in crate::windows_app) struct DragPaint {
+    pub(in crate::windows_app) source_index: usize,
+    pub(in crate::windows_app) item: DragItem,
+    pub(in crate::windows_app) spot: Option<DropSpot>,
+    pub(in crate::windows_app) float_left: Option<f64>,
 }
 
-pub(super) fn tab_drag_paint(
+pub(in crate::windows_app) fn tab_drag_paint(
     press: TabPress,
     row: &TabRowView,
     cursor: (f64, f64),
@@ -1653,13 +1653,13 @@ pub(super) fn tab_drag_paint(
 
 /// O gesto da fila de abas que tem o rato preso (0: nenhum). O App publica-o
 /// a cada passo; o subclass da janela le-o no WM_CAPTURECHANGED.
-pub(super) static TAB_GESTURE_LIVE: AtomicU64 = AtomicU64::new(0);
+pub(in crate::windows_app) static TAB_GESTURE_LIVE: AtomicU64 = AtomicU64::new(0);
 
 /// WM_CAPTURECHANGED em `hwnd`: `new_owner` (nulo quando ninguem) ficou com o
 /// rato. Havendo um gesto vivo, devolve o numero dele -- o App cancela-o se
 /// ainda for o mesmo quando o aviso chegar. O SetCapture sobre quem ja tinha
 /// o rato tambem manda esta mensagem, e ai nada se perdeu.
-pub(super) fn tab_gesture_capture_lost(
+pub(in crate::windows_app) fn tab_gesture_capture_lost(
     live: &AtomicU64,
     hwnd: HWND,
     new_owner: HWND,

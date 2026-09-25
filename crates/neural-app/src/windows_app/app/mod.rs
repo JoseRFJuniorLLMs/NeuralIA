@@ -13,3 +13,8 @@ pub(super) use navigation::*;
 pub(super) mod panels;
 #[allow(unused_imports)]
 pub(super) use panels::*;
+
+pub(super) mod split;
+#[allow(unused_imports)]
+pub(super) use split::*;
+

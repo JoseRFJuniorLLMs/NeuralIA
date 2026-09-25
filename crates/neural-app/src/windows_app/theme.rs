@@ -1,11 +1,11 @@
-use super::*;
+﻿use super::*;
 
 // ===================== tema do sistema (cor de destaque + claro/escuro) =====================
 
-pub(super) type Rgb = (u8, u8, u8);
+pub(in crate::windows_app) type Rgb = (u8, u8, u8);
 
 /// Le um DWORD do HKEY_CURRENT_USER; None se a chave nao existir.
-pub(super) fn registry_dword(subkey: &str, value: &str) -> Option<u32> {
+pub(in crate::windows_app) fn registry_dword(subkey: &str, value: &str) -> Option<u32> {
     let subkey = wide_null(subkey);
     let value = wide_null(value);
     let mut data: u32 = 0;
@@ -26,7 +26,7 @@ pub(super) fn registry_dword(subkey: &str, value: &str) -> Option<u32> {
 
 /// Cor de destaque escolhida em Definicoes > Personalizacao > Cores.
 /// O Windows guarda-a como 0xAABBGGRR.
-pub(super) fn system_accent() -> Rgb {
+pub(in crate::windows_app) fn system_accent() -> Rgb {
     match registry_dword("Software\\Microsoft\\Windows\\DWM", "AccentColor") {
         Some(value) => (
             (value & 0xFF) as u8,
@@ -40,19 +40,19 @@ pub(super) fn system_accent() -> Rgb {
 /// O tema que o utilizador escolheu: acompanhar o Windows (o padrao) ou
 /// forcar claro ou escuro. Guarda-se em `<data_dir>/theme`, uma palavra.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ThemeChoice {
+pub(in crate::windows_app) enum ThemeChoice {
     System,
     Light,
     Dark,
 }
 
 /// Indice em `ThemeChoice::ALL` da escolha em vigor.
-pub(super) static THEME_CHOICE: AtomicUsize = AtomicUsize::new(0);
+pub(in crate::windows_app) static THEME_CHOICE: AtomicUsize = AtomicUsize::new(0);
 
 impl ThemeChoice {
-    pub(super) const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+    pub(in crate::windows_app) const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
 
-    pub(super) fn label(self) -> &'static str {
+    pub(in crate::windows_app) fn label(self) -> &'static str {
         match self {
             Self::System => "Tema do sistema",
             Self::Light => "Tema claro",
@@ -60,7 +60,7 @@ impl ThemeChoice {
         }
     }
 
-    pub(super) fn word(self) -> &'static str {
+    pub(in crate::windows_app) fn word(self) -> &'static str {
         match self {
             Self::System => "sistema",
             Self::Light => "claro",
@@ -68,7 +68,7 @@ impl ThemeChoice {
         }
     }
 
-    pub(super) fn parse(text: &str) -> Option<Self> {
+    pub(in crate::windows_app) fn parse(text: &str) -> Option<Self> {
         match text.trim().to_lowercase().as_str() {
             "sistema" | "system" | "auto" => Some(Self::System),
             "claro" | "light" => Some(Self::Light),
@@ -77,7 +77,7 @@ impl ThemeChoice {
         }
     }
 
-    pub(super) fn current() -> Self {
+    pub(in crate::windows_app) fn current() -> Self {
         Self::ALL
             .get(THEME_CHOICE.load(Ordering::Acquire))
             .copied()
@@ -85,7 +85,7 @@ impl ThemeChoice {
     }
 
     /// Escuro ou claro, dado o que o Windows diz agora.
-    pub(super) fn is_dark(self, system_dark: bool) -> bool {
+    pub(in crate::windows_app) fn is_dark(self, system_dark: bool) -> bool {
         match self {
             Self::System => system_dark,
             Self::Light => false,
@@ -94,7 +94,7 @@ impl ThemeChoice {
     }
 
     /// O `prefers-color-scheme` das paginas no WebView2.
-    pub(super) fn webview_theme(self) -> wry::Theme {
+    pub(in crate::windows_app) fn webview_theme(self) -> wry::Theme {
         match self {
             Self::System => wry::Theme::Auto,
             Self::Light => wry::Theme::Light,
@@ -103,7 +103,7 @@ impl ThemeChoice {
     }
 
     /// Sem ficheiro, ou com lixo dentro, vale o padrao: acompanhar o Windows.
-    pub(super) fn load(path: &std::path::Path) -> Self {
+    pub(in crate::windows_app) fn load(path: &std::path::Path) -> Self {
         std::fs::read_to_string(path)
             .ok()
             .and_then(|text| Self::parse(&text))
@@ -112,7 +112,7 @@ impl ThemeChoice {
 
     /// Escreve num temporario ao lado e renomeia: um arranque a meio de uma
     /// escrita nunca le meia palavra.
-    pub(super) fn save(self, path: &std::path::Path) -> std::io::Result<()> {
+    pub(in crate::windows_app) fn save(self, path: &std::path::Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -122,7 +122,7 @@ impl ThemeChoice {
     }
 
     /// Passa a valer ja: a proxima leitura do tema usa esta escolha.
-    pub(super) fn apply(self) {
+    pub(in crate::windows_app) fn apply(self) {
         let index = Self::ALL
             .iter()
             .position(|choice| *choice == self)
@@ -133,12 +133,12 @@ impl ThemeChoice {
 }
 
 /// Um WebViewBuilder que ja nasce com o tema escolhido nas paginas.
-pub(super) fn themed_webview_builder<'a>() -> WebViewBuilder<'a> {
+pub(in crate::windows_app) fn themed_webview_builder<'a>() -> WebViewBuilder<'a> {
     use wry::WebViewBuilderExtWindows;
     WebViewBuilder::new().with_theme(ThemeChoice::current().webview_theme())
 }
 
-pub(super) fn system_dark_mode() -> bool {
+pub(in crate::windows_app) fn system_dark_mode() -> bool {
     registry_dword(
         "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
         "AppsUseLightTheme",
@@ -147,7 +147,7 @@ pub(super) fn system_dark_mode() -> bool {
     .unwrap_or(false)
 }
 
-pub(super) fn mix(base: Rgb, tint: Rgb, amount: f32) -> Rgb {
+pub(in crate::windows_app) fn mix(base: Rgb, tint: Rgb, amount: f32) -> Rgb {
     let amount = amount.clamp(0.0, 1.0);
     let blend = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * amount).round() as u8;
     (
@@ -157,7 +157,7 @@ pub(super) fn mix(base: Rgb, tint: Rgb, amount: f32) -> Rgb {
     )
 }
 
-pub(super) fn channel_luminance(channel: u8) -> f32 {
+pub(in crate::windows_app) fn channel_luminance(channel: u8) -> f32 {
     let c = channel as f32 / 255.0;
     if c <= 0.04045 {
         c / 12.92
@@ -166,20 +166,20 @@ pub(super) fn channel_luminance(channel: u8) -> f32 {
     }
 }
 
-pub(super) fn luminance(color: Rgb) -> f32 {
+pub(in crate::windows_app) fn luminance(color: Rgb) -> f32 {
     0.2126 * channel_luminance(color.0)
         + 0.7152 * channel_luminance(color.1)
         + 0.0722 * channel_luminance(color.2)
 }
 
-pub(super) fn contrast(a: Rgb, b: Rgb) -> f32 {
+pub(in crate::windows_app) fn contrast(a: Rgb, b: Rgb) -> f32 {
     let (la, lb) = (luminance(a), luminance(b));
     let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
     (hi + 0.05) / (lo + 0.05)
 }
 
 /// Preto ou branco — o que for legivel por cima de `background`.
-pub(super) fn on_color(background: Rgb) -> Rgb {
+pub(in crate::windows_app) fn on_color(background: Rgb) -> Rgb {
     if contrast((255, 255, 255), background) >= contrast((17, 19, 20), background) {
         (255, 255, 255)
     } else {
@@ -189,7 +189,7 @@ pub(super) fn on_color(background: Rgb) -> Rgb {
 
 /// Clareia/escurece `color` ate ter contraste suficiente com o fundo: a cor de
 /// destaque do utilizador pode ser preta num tema escuro.
-pub(super) fn readable(color: Rgb, background: Rgb, minimum: f32) -> Rgb {
+pub(in crate::windows_app) fn readable(color: Rgb, background: Rgb, minimum: f32) -> Rgb {
     let target = if luminance(background) > 0.35 {
         (0, 0, 0)
     } else {
@@ -206,14 +206,14 @@ pub(super) fn readable(color: Rgb, background: Rgb, minimum: f32) -> Rgb {
 
 /// Cores de marca das tres IAs comparadas.
 /// Os degraus de zoom do Chrome, para o gesto ser o que a pessoa ja conhece.
-pub(super) const ZOOM_STEPS: [f64; 16] = [
+pub(in crate::windows_app) const ZOOM_STEPS: [f64; 16] = [
     0.25, 0.33, 0.50, 0.67, 0.75, 0.80, 0.90, 1.00, 1.10, 1.25, 1.50, 1.75, 2.00, 2.50, 3.00, 4.00,
 ];
 
 /// altura / largura da arte da marca (assets/neuralia-home.png, 1200x868).
-pub(super) const BRAND_ASPECT: f64 = 868.0 / 1200.0;
+pub(in crate::windows_app) const BRAND_ASPECT: f64 = 868.0 / 1200.0;
 
-pub(super) const BRAND_COLORS: [Rgb; COMPARATOR_COLUMNS] =
+pub(in crate::windows_app) const BRAND_COLORS: [Rgb; COMPARATOR_COLUMNS] =
     [(66, 133, 244), (16, 163, 127), (217, 119, 87)];
 
 /// Quanto tempo um tema lido do registo continua a valer. `Theme::system()` e
@@ -221,26 +221,26 @@ pub(super) const BRAND_COLORS: [Rgb; COMPARATOR_COLUMNS] =
 /// frame da Home (15 FPS) — e cada chamada fazia DUAS leituras de registo. Com
 /// 1 s de validade o registo passa a ser lido uma vez por segundo, e a mudanca
 /// de tema nao fica por notar porque `ThemeChanged` invalida isto de imediato.
-pub(super) const THEME_CACHE_TTL: Duration = Duration::from_secs(1);
-pub(super) static THEME_CACHE: Mutex<Option<(Instant, Theme)>> = Mutex::new(None);
+pub(in crate::windows_app) const THEME_CACHE_TTL: Duration = Duration::from_secs(1);
+pub(in crate::windows_app) static THEME_CACHE: Mutex<Option<(Instant, Theme)>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Theme {
-    pub(super) accent: Rgb,
-    pub(super) page_bg: Rgb,
-    pub(super) bar_bg: Rgb,
-    pub(super) bar_line: Rgb,
-    pub(super) surface: Rgb,
-    pub(super) surface_line: Rgb,
-    pub(super) fg: Rgb,
-    pub(super) fg_muted: Rgb,
+pub(in crate::windows_app) struct Theme {
+    pub(in crate::windows_app) accent: Rgb,
+    pub(in crate::windows_app) page_bg: Rgb,
+    pub(in crate::windows_app) bar_bg: Rgb,
+    pub(in crate::windows_app) bar_line: Rgb,
+    pub(in crate::windows_app) surface: Rgb,
+    pub(in crate::windows_app) surface_line: Rgb,
+    pub(in crate::windows_app) fg: Rgb,
+    pub(in crate::windows_app) fg_muted: Rgb,
     /// Guardado com o resto do tema para quem desenha nao voltar ao registo so
     /// para saber se esta escuro (o fundo neural fazia-o duas vezes por frame).
-    pub(super) dark: bool,
+    pub(in crate::windows_app) dark: bool,
 }
 
 impl Theme {
-    pub(super) fn system() -> Self {
+    pub(in crate::windows_app) fn system() -> Self {
         let mut cache = THEME_CACHE.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((stamp, theme)) = *cache
             && stamp.elapsed() < THEME_CACHE_TTL
@@ -254,13 +254,13 @@ impl Theme {
 
     /// A leitura verdadeira do registo; quem decide quando ela acontece e o
     /// cache acima.
-    pub(super) fn read_system() -> Self {
+    pub(in crate::windows_app) fn read_system() -> Self {
         Self::read_for(ThemeChoice::current())
     }
 
     /// O tema que `choice` da agora: a escolha manda, o Windows so desempata
     /// em `ThemeChoice::System`.
-    pub(super) fn read_for(choice: ThemeChoice) -> Self {
+    pub(in crate::windows_app) fn read_for(choice: ThemeChoice) -> Self {
         let accent = system_accent();
         if choice.is_dark(system_dark_mode()) {
             Self::dark(accent)
@@ -271,11 +271,11 @@ impl Theme {
 
     /// Obriga a proxima `system()` a reler o registo. Chamada quando o Windows
     /// avisa que o tema mudou: esperar ate 1 s daria um piscar de cores velhas.
-    pub(super) fn invalidate() {
+    pub(in crate::windows_app) fn invalidate() {
         *THEME_CACHE.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
-    pub(super) fn dark(accent: Rgb) -> Self {
+    pub(in crate::windows_app) fn dark(accent: Rgb) -> Self {
         let bar_bg = (27, 30, 32);
         Self {
             accent: readable(accent, bar_bg, 3.2),
@@ -290,7 +290,7 @@ impl Theme {
         }
     }
 
-    pub(super) fn light(accent: Rgb) -> Self {
+    pub(in crate::windows_app) fn light(accent: Rgb) -> Self {
         let bar_bg = (255, 255, 255);
         Self {
             accent: readable(accent, bar_bg, 3.2),
@@ -305,7 +305,7 @@ impl Theme {
         }
     }
 
-    pub(super) fn brand(&self, index: usize) -> Rgb {
+    pub(in crate::windows_app) fn brand(&self, index: usize) -> Rgb {
         BRAND_COLORS[index.min(COMPARATOR_COLUMNS - 1)]
     }
 }

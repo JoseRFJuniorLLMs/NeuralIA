@@ -1,11 +1,11 @@
-use super::*;
+﻿use super::*;
 
 // Servicos no painel lateral (caminho A do WebRTC, aprovado pelo dono): o
 // servico corre como uma pagina da internet comum -- contatos e chamadas sao
 // os dele; o NeuralIA so libera camera e microfone pelo aviso do WebView2.
 // Sem scripts injetados e sem o canal IPC do painel do historico.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Service {
+pub(in crate::windows_app) enum Service {
     /// Videochamada: o Google Meet.
     Meet,
     WhatsApp,
@@ -17,10 +17,10 @@ pub(super) enum Service {
 }
 
 /// O video de respiracao que o dono escolheu.
-pub(super) const BREATH_VIDEO_URL: &str = "https://www.youtube.com/watch?v=UJBknAsxfrA";
+pub(in crate::windows_app) const BREATH_VIDEO_URL: &str = "https://www.youtube.com/watch?v=UJBknAsxfrA";
 
 impl Service {
-    pub(super) fn url(self) -> &'static str {
+    pub(in crate::windows_app) fn url(self) -> &'static str {
         match self {
             Self::Meet => "https://meet.google.com/",
             Self::WhatsApp => "https://web.whatsapp.com/",
@@ -30,7 +30,7 @@ impl Service {
         }
     }
 
-    pub(super) fn label(self) -> &'static str {
+    pub(in crate::windows_app) fn label(self) -> &'static str {
         match self {
             Self::Meet => "Videochamada (Google Meet)",
             Self::WhatsApp => "WhatsApp",
@@ -44,7 +44,7 @@ impl Service {
     /// cache, historico do WebView), camera e microfone recusados, e a pagina
     /// presa ao que a abriu. Os outros servicos precisam da conta do
     /// utilizador e por isso nao podem ser privados.
-    pub(super) fn private(self) -> bool {
+    pub(in crate::windows_app) fn private(self) -> bool {
         match self {
             Self::Breath => true,
             Self::Meet | Self::WhatsApp | Self::YouTube | Self::Gmail => false,
@@ -54,14 +54,14 @@ impl Service {
 
 /// Para onde vai o teclado quando um painel ao lado fecha.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PanelCloseFocus {
+pub(in crate::windows_app) enum PanelCloseFocus {
     /// Na Home: a omnibox, para continuar a escrever.
     Omnibox,
     /// No resto: a janela (os atalhos da barra continuam a funcionar).
     Window,
 }
 
-pub(super) fn focus_after_panel_close(surface: Surface) -> PanelCloseFocus {
+pub(in crate::windows_app) fn focus_after_panel_close(surface: Surface) -> PanelCloseFocus {
     match surface {
         Surface::Home => PanelCloseFocus::Omnibox,
         Surface::Reader
@@ -74,7 +74,7 @@ pub(super) fn focus_after_panel_close(surface: Surface) -> PanelCloseFocus {
 
 /// O que fechar um painel da direita faz a vista dele antes de a largar.
 /// Generico para os gates correrem sem WebView; no app e a `WebView`.
-pub(super) trait PanelView {
+pub(in crate::windows_app) trait PanelView {
     /// A janela principal fica com o teclado (`WebView::focus_parent`).
     fn give_keyboard_to_window(&self);
 }
@@ -93,7 +93,7 @@ impl PanelView for WebView {
 /// vista sair; na Home o EDIT da omnibox (`omnibox`), DEPOIS -- direto, sem
 /// `focus_omnibox`, que passa pelo `show_home`. `focus: None` (uma troca de
 /// superficie, que trata do teclado ela propria, ou a saida da app): so larga.
-pub(super) fn release_panel<V: PanelView>(
+pub(in crate::windows_app) fn release_panel<V: PanelView>(
     view: V,
     focus: Option<PanelCloseFocus>,
     omnibox: Option<HWND>,
@@ -114,7 +114,7 @@ pub(super) fn release_panel<V: PanelView>(
 /// Fecha o painel de servico que houver, com o teclado devolvido por
 /// `release_panel`. `false`: nao havia nenhum. No app a vista e o
 /// `ServicePanel` inteiro (a WebView dele); nos gates, uma de mentira.
-pub(super) fn close_service_panel_in<V: PanelView>(
+pub(in crate::windows_app) fn close_service_panel_in<V: PanelView>(
     slot: &mut Option<V>,
     surface: Surface,
     omnibox: Option<HWND>,
@@ -127,15 +127,15 @@ pub(super) fn close_service_panel_in<V: PanelView>(
 }
 
 /// O servico aberto no painel da direita e o modo em que esta.
-pub(super) struct ServicePanel {
-    pub(super) service: Service,
-    pub(super) webview: WebView,
+pub(in crate::windows_app) struct ServicePanel {
+    pub(in crate::windows_app) service: Service,
+    pub(in crate::windows_app) webview: WebView,
     /// Encostado, minimizado (a tocar, escondido) ou em tela cheia.
-    pub(super) state: ServicePanelState,
+    pub(in crate::windows_app) state: ServicePanelState,
     /// A pagina esta a tocar som (IsDocumentPlayingAudio do WebView2).
-    pub(super) audio: bool,
+    pub(in crate::windows_app) audio: bool,
     /// Numero deste painel; os avisos do WebView2 trazem-no.
-    pub(super) generation: u64,
+    pub(in crate::windows_app) generation: u64,
 }
 
 /// Fechar o painel de servicos devolve o teclado pela WebView dele
@@ -148,13 +148,13 @@ impl PanelView for ServicePanel {
 
 /// Um aviso do WebView2 do painel `event` so vale se esse painel ainda for
 /// o aberto: fechar e abrir outro deixa avisos atrasados do anterior na fila.
-pub(super) fn service_event_is_current(open: Option<u64>, event: u64) -> bool {
+pub(in crate::windows_app) fn service_event_is_current(open: Option<u64>, event: u64) -> bool {
     open == Some(event)
 }
 
 /// A tecla que o WebView2 do painel de servicos viu: so o Esc em baixo vira
 /// evento; se e dele ou da pagina decide o modo do painel.
-pub(super) fn service_key_event(
+pub(in crate::windows_app) fn service_key_event(
     generation: u64,
     virtual_key: u32,
     key_down: bool,
@@ -164,7 +164,7 @@ pub(super) fn service_key_event(
 
 /// A largura que as colunas cedem ao painel da direita aberto. O de servicos
 /// minimizado nao cede nada: as colunas voltam a ocupar a janela toda.
-pub(super) fn reserved_panel_width(
+pub(in crate::windows_app) fn reserved_panel_width(
     service: Option<ServicePanelState>,
     live_open: bool,
     side_open: bool,
@@ -181,7 +181,7 @@ pub(super) fn reserved_panel_width(
     }
 }
 
-pub(super) fn logical_rect(area: Area) -> wry::Rect {
+pub(in crate::windows_app) fn logical_rect(area: Area) -> wry::Rect {
     wry::Rect {
         position: LogicalPosition::new(area.x, area.y).into(),
         size: LogicalSize::new(area.width.max(1.0), area.height.max(1.0)).into(),
@@ -190,7 +190,7 @@ pub(super) fn logical_rect(area: Area) -> wry::Rect {
 
 /// Poe o contentor da WebView por cima de todos os irmaos (as colunas, os
 /// botoes nativos), sem o ativar.
-pub(super) fn raise_webview_host(webview: &WebView) {
+pub(in crate::windows_app) fn raise_webview_host(webview: &WebView) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_TOP, SWP_NOMOVE, SWP_NOSIZE};
     use wry::WebViewExtWindows;
     let host = webview.hwnd().0 as HWND;
@@ -215,7 +215,7 @@ pub(super) fn raise_webview_host(webview: &WebView) {
 /// (IsDocumentPlayingAudioChanged) e o Esc (AcceleratorKeyPressed, que o
 /// WebView2 levanta para o Esc mesmo com o foco na pagina). Cada closure so
 /// le o que o WebView2 diz e manda um evento com o numero do painel.
-pub(super) fn register_service_panel_events(
+pub(in crate::windows_app) fn register_service_panel_events(
     webview: &WebView,
     generation: u64,
     proxy: EventLoopProxy<UserEvent>,
@@ -296,7 +296,7 @@ pub(super) fn register_service_panel_events(
 
 /// So paginas da internet: um servico nunca abre file:, javascript: nem os
 /// esquemas internos do NeuralIA.
-pub(super) fn service_panel_allows_navigation(target: &str) -> bool {
+pub(in crate::windows_app) fn service_panel_allows_navigation(target: &str) -> bool {
     let lower = target.trim().to_ascii_lowercase();
     lower == "about:blank" || lower.starts_with("https://") || lower.starts_with("http://")
 }
@@ -306,7 +306,7 @@ pub(super) fn service_panel_allows_navigation(target: &str) -> bool {
 /// cookies, como e sempre a InPrivate), so em https -- para nao virar um
 /// navegador anonimo sem as protecoes do painel Privado. Nem o login da
 /// Google: entrar numa conta no painel "anonimo" contradiz o pedido.
-pub(super) fn breath_panel_allows_navigation(target: &str) -> bool {
+pub(in crate::windows_app) fn breath_panel_allows_navigation(target: &str) -> bool {
     let target = target.trim();
     if target.eq_ignore_ascii_case("about:blank") {
         return true;
@@ -327,7 +327,7 @@ pub(super) fn breath_panel_allows_navigation(target: &str) -> bool {
 }
 
 /// A politica de navegacao de cada servico, num so sitio.
-pub(super) fn service_panel_navigation(service: Service, target: &str) -> bool {
+pub(in crate::windows_app) fn service_panel_navigation(service: Service, target: &str) -> bool {
     match service {
         Service::Breath => breath_panel_allows_navigation(target),
         Service::Meet | Service::WhatsApp | Service::YouTube | Service::Gmail => {
@@ -338,7 +338,7 @@ pub(super) fn service_panel_navigation(service: Service, target: &str) -> bool {
 
 /// Camera e microfone: pelo aviso do WebView2 nos servicos da conta do
 /// utilizador; recusados, sem perguntar, no painel privado.
-pub(super) fn service_panel_permission(
+pub(in crate::windows_app) fn service_panel_permission(
     service: Service,
     kind: PermissionKind,
 ) -> PermissionResponse {
@@ -355,7 +355,7 @@ pub(super) fn service_panel_permission(
 /// largura dos servicos. As larguras sao as escolhidas pela borda
 /// (`panel-width.json`), e o de servicos minimizado nao cede nada
 /// (`reserved_panel_width`).
-pub(super) fn open_panel_width_for(
+pub(in crate::windows_app) fn open_panel_width_for(
     surface: Surface,
     service: Option<ServicePanelState>,
     live_panel: bool,
@@ -385,7 +385,7 @@ pub(super) fn open_panel_width_for(
 
 /// Mais largo do que o do historico: o WhatsApp e o Meet precisam de espaco.
 #[cfg(test)]
-pub(super) fn service_panel_bounds(
+pub(in crate::windows_app) fn service_panel_bounds(
     logical_w: f64,
     logical_h: f64,
     top: f64,
@@ -395,7 +395,7 @@ pub(super) fn service_panel_bounds(
 
 /// Botao redondo so com icone (servicos, Gmail, Privado). O icone branco e
 /// pintado com `tint`; os coloridos (WhatsApp, YouTube) vao com `None`.
-pub(super) unsafe fn draw_icon_button(
+pub(in crate::windows_app) unsafe fn draw_icon_button(
     hdc: *mut core::ffi::c_void,
     rect: UiRect,
     slot: usize,
@@ -432,7 +432,7 @@ pub(super) unsafe fn draw_icon_button(
 /// Com `phase` (uma sessao do Pomodoro em curso) o tempo e o contorno vao na
 /// cor da fase.
 #[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn draw_tool_button(
+pub(in crate::windows_app) unsafe fn draw_tool_button(
     hdc: *mut core::ffi::c_void,
     rect: UiRect,
     tool: Tool,
@@ -503,16 +503,16 @@ pub(super) unsafe fn draw_tool_button(
 }
 
 /// A dica do olho. O estado ve-se na cor do botao.
-pub(super) const LIVE_TOOLTIP: &str = "Gemini Live: ver a tela, câmera e microfone (liga/desliga)";
+pub(in crate::windows_app) const LIVE_TOOLTIP: &str = "Gemini Live: ver a tela, câmera e microfone (liga/desliga)";
 
 /// Vermelho de "a gravar": com o Gemini Live ligado o botao fica cheio desta
 /// cor, para ninguem esquecer que a tela, a camera e o microfone estao a sair.
-pub(super) const LIVE_ON_RED: Rgb = (217, 48, 37);
+pub(in crate::windows_app) const LIVE_ON_RED: Rgb = (217, 48, 37);
 
 /// Fundo, borda e cor do olho no botao do Gemini Live. Cheio de vermelho so
 /// quando algo pode estar a sair; com o painel aberto e nada a sair (a pedir
 /// a chave, ou a sessao caiu) o olho e a borda ficam vermelhos, o fundo nao.
-pub(super) fn live_button_colors(
+pub(in crate::windows_app) fn live_button_colors(
     indicator: LiveIndicator,
     hovered: bool,
     theme: &Theme,
@@ -530,7 +530,7 @@ pub(super) fn live_button_colors(
     }
 }
 
-pub(super) unsafe fn draw_live_button(
+pub(in crate::windows_app) unsafe fn draw_live_button(
     hdc: *mut core::ffi::c_void,
     rect: UiRect,
     indicator: LiveIndicator,
@@ -558,15 +558,15 @@ pub(super) unsafe fn draw_live_button(
 
 /// Avisos do Gmail ligados (o botao do envelope). Guardado em
 /// `<data_dir>/gmail` como "ligado"/"desligado"; sem ficheiro, ligado.
-pub(super) static GMAIL_NOTIFICATIONS: AtomicBool = AtomicBool::new(true);
+pub(in crate::windows_app) static GMAIL_NOTIFICATIONS: AtomicBool = AtomicBool::new(true);
 
-pub(super) fn load_gmail_setting(path: &std::path::Path) -> bool {
+pub(in crate::windows_app) fn load_gmail_setting(path: &std::path::Path) -> bool {
     std::fs::read_to_string(path)
         .map(|text| !text.trim().eq_ignore_ascii_case("desligado"))
         .unwrap_or(true)
 }
 
-pub(super) fn save_gmail_setting(path: &std::path::Path, on: bool) -> std::io::Result<()> {
+pub(in crate::windows_app) fn save_gmail_setting(path: &std::path::Path, on: bool) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -578,7 +578,7 @@ pub(super) fn save_gmail_setting(path: &std::path::Path, on: bool) -> std::io::R
 /// O que o painel de servicos acrescenta ao chrome nativo: o ponto no icone
 /// do servico minimizado (vermelho a tocar, na cor de destaque em silencio) e
 /// a faixa [— Minimizar] [⛶ Tela cheia] [× Fechar] por cima do painel.
-pub(super) fn draw_service_chrome(
+pub(in crate::windows_app) fn draw_service_chrome(
     window: &Window,
     split_active: bool,
     service: Service,
@@ -700,7 +700,7 @@ pub(super) fn draw_service_chrome(
 /// fronteira de char e nao de byte: `String::truncate` a meio de um UTF-8
 /// entra em panico, e um remetente com acentos e o caso normal. O que ja
 /// cabe volta intacto, sem alocar.
-pub(super) fn gmail_field(mut value: String) -> String {
+pub(in crate::windows_app) fn gmail_field(mut value: String) -> String {
     if value.len() <= GMAIL_FIELD_MAX_CHARS {
         return value;
     }
@@ -710,7 +710,7 @@ pub(super) fn gmail_field(mut value: String) -> String {
     value
 }
 
-pub(super) fn gmail_is_new_mail(
+pub(in crate::windows_app) fn gmail_is_new_mail(
     previous_unread: Option<u32>,
     previous_key: Option<&str>,
     unread: u32,

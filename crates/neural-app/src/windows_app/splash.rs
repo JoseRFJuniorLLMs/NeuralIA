@@ -1,18 +1,18 @@
-use super::*;
+﻿use super::*;
 
-pub(super) const SPLASH_SUBCLASS_ID: usize = 0x4E4C;
-pub(super) const SPLASH_WIDTH: f64 = 470.0;
-pub(super) const SPLASH_HEIGHT: f64 = 46.0;
+pub(in crate::windows_app) const SPLASH_SUBCLASS_ID: usize = 0x4E4C;
+pub(in crate::windows_app) const SPLASH_WIDTH: f64 = 470.0;
+pub(in crate::windows_app) const SPLASH_HEIGHT: f64 = 46.0;
 
 /// Texto do aviso flutuante. Vive fora do App porque quem o pinta e o
 /// procedimento de janela, que nao tem acesso ao estado da aplicacao.
-pub(super) static SPLASH_TEXT: Mutex<String> = Mutex::new(String::new());
+pub(in crate::windows_app) static SPLASH_TEXT: Mutex<String> = Mutex::new(String::new());
 /// Verdadeiro enquanto a janela esta a fazer uma pergunta com Sim/Nao.
-pub(super) static SPLASH_ASKS: AtomicBool = AtomicBool::new(false);
+pub(in crate::windows_app) static SPLASH_ASKS: AtomicBool = AtomicBool::new(false);
 
 /// Os dois botoes ocupam o terco direito da janela. Uma so funcao para o
 /// desenho e o clique concordarem sempre.
-pub(super) fn splash_buttons(client: &RECT) -> (RECT, RECT) {
+pub(in crate::windows_app) fn splash_buttons(client: &RECT) -> (RECT, RECT) {
     let width = client.right - client.left;
     let button = width / 5;
     let margin = width / 40;
@@ -34,7 +34,7 @@ pub(super) fn splash_buttons(client: &RECT) -> (RECT, RECT) {
 /// Aviso flutuante no fundo do ecra. Tem de ser nativo e nao injetado na
 /// pagina: por cima de um PDF nao ha pagina nossa onde escrever -- o
 /// visualizador do Edge e outro documento, noutra origem e noutro processo.
-pub(super) unsafe extern "system" fn splash_subclass(
+pub(in crate::windows_app) unsafe extern "system" fn splash_subclass(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
@@ -144,7 +144,7 @@ pub(super) unsafe extern "system" fn splash_subclass(
 /// cliente: centrado nos dois eixos. Ficava a 48 px do fundo, e ao arrancar
 /// lia-se como um rodape perdido por baixo das colunas. Nunca sai pelo topo
 /// nem pela esquerda numa janela mais pequena do que ele.
-pub(super) fn splash_origin(client_w: i32, client_h: i32, width: i32, height: i32) -> (i32, i32) {
+pub(in crate::windows_app) fn splash_origin(client_w: i32, client_h: i32, width: i32, height: i32) -> (i32, i32) {
     (
         ((client_w - width) / 2).max(0),
         ((client_h - height) / 2).max(0),
@@ -153,7 +153,7 @@ pub(super) fn splash_origin(client_w: i32, client_h: i32, width: i32, height: i3
 
 /// Quem pede o popup do meio da janela.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SplashKind {
+pub(in crate::windows_app) enum SplashKind {
     /// Resposta a um gesto (zoom, "Nota criada", "Pomodoro iniciado"...):
     /// aparece ja. Com a pergunta da rolagem a vista, tira-a SEM lhe
     /// responder -- ela volta a ser feita na proxima leitura.
@@ -167,18 +167,18 @@ pub(super) enum SplashKind {
 
 /// O que o popup passa a mostrar.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SplashFrame {
-    pub(super) text: String,
+pub(in crate::windows_app) struct SplashFrame {
+    pub(in crate::windows_app) text: String,
     /// Com os botoes Sim e Nao (`SPLASH_ASKS`).
-    pub(super) asks: bool,
-    pub(super) seconds: u64,
+    pub(in crate::windows_app) asks: bool,
+    pub(in crate::windows_app) seconds: u64,
     /// O `HideSplash` deste quadro.
-    pub(super) token: u64,
+    pub(in crate::windows_app) token: u64,
 }
 
 /// O fim de um quadro.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum SplashHide {
+pub(in crate::windows_app) enum SplashHide {
     /// Temporizador de um quadro que ja foi substituido.
     Stale,
     Hide {
@@ -196,17 +196,17 @@ pub(super) enum SplashHide {
 /// tivesse sido respondida "nao" para o resto da sessao. Aqui so a pergunta
 /// tem botoes, e so o fim do quadro dela conta como resposta.
 #[derive(Debug, Default)]
-pub(super) struct SplashBoard {
-    pub(super) token: u64,
+pub(in crate::windows_app) struct SplashBoard {
+    pub(in crate::windows_app) token: u64,
     /// Token da pergunta, enquanto e ela que esta a vista.
-    pub(super) question: Option<u64>,
+    pub(in crate::windows_app) question: Option<u64>,
     /// Um aviso de fundo que chegou com a pergunta a vista (so o ultimo).
-    pub(super) waiting: Option<(String, u64)>,
+    pub(in crate::windows_app) waiting: Option<(String, u64)>,
 }
 
 impl SplashBoard {
     /// `None`: fica a espera da pergunta (`SplashKind::Background`).
-    pub(super) fn show(
+    pub(in crate::windows_app) fn show(
         &mut self,
         text: String,
         seconds: u64,
@@ -219,7 +219,7 @@ impl SplashBoard {
         Some(self.frame(text, seconds, kind == SplashKind::Question))
     }
 
-    pub(super) fn frame(&mut self, text: String, seconds: u64, asks: bool) -> SplashFrame {
+    pub(in crate::windows_app) fn frame(&mut self, text: String, seconds: u64, asks: bool) -> SplashFrame {
         self.token = self.token.wrapping_add(1);
         self.question = asks.then_some(self.token);
         SplashFrame {
@@ -231,7 +231,7 @@ impl SplashBoard {
     }
 
     /// O `HideSplash(token)` chegou.
-    pub(super) fn hide(&mut self, token: u64) -> SplashHide {
+    pub(in crate::windows_app) fn hide(&mut self, token: u64) -> SplashHide {
         if token != self.token {
             return SplashHide::Stale;
         }
@@ -248,12 +248,12 @@ impl SplashBoard {
 
     /// A pergunta foi respondida (Sim, Nao ou F8): deixa de ser a pergunta.
     /// O quadro fica ate `hide` ou ate outro o substituir.
-    pub(super) fn answered(&mut self) {
+    pub(in crate::windows_app) fn answered(&mut self) {
         self.question = None;
     }
 
     /// O quadro a vista, para o esconder ja.
-    pub(super) fn current(&self) -> u64 {
+    pub(in crate::windows_app) fn current(&self) -> u64 {
         self.token
     }
 }
