@@ -16,11 +16,11 @@ use winit::event_loop::EventLoopProxy;
 use crate::pomodoro_ui::{POMODORO_COMMAND_HELP, PomodoroCommand, parse_pomodoro_command};
 use crate::windows_app::{
     App, COMPARATOR_COLUMNS, HistoryEntry, HistoryKind, Intent, LIFECYCLE_LAST_HOME_NONCE, Surface,
-    THEME_COMMAND_HELP, UserEvent, debug_log, get_window_text,
+    THEME_COMMAND_HELP, UserEvent, debug_log,
     native::{DefSubclassProc, EM_SETSEL, lifecycle_probe_enabled, lifecycle_probe_home_message},
     search_card::{CompareRequest, TRANSLATE_COMMAND},
     theme::ThemeChoice,
-    wide_null, window_hwnd,
+    wide_null, window_hwnd, window_text,
 };
 use neural_core::parse_intent;
 
@@ -276,7 +276,7 @@ pub(in crate::windows_app) unsafe extern "system" fn omnibox_subclass(
 
         match wparam as u32 {
             13 => {
-                let text = get_window_text(hwnd);
+                let text = window_text(hwnd);
                 debug_log(format_args!(
                     "omnibox: Enter ({} chars)",
                     text.chars().count()
@@ -372,7 +372,7 @@ impl App {
 
     pub(in crate::windows_app) fn omnibox_text(&self) -> String {
         self.omnibox
-            .map(|edit| unsafe { get_window_text(edit) })
+            .map(|edit| unsafe { window_text(edit) })
             .unwrap_or_default()
             .trim()
             .to_string()

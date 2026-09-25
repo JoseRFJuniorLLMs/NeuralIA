@@ -35,11 +35,12 @@ use crate::pomodoro_ui::{PomodoroController, TickSchedule, TickScheduler, phase_
 use crate::read_aloud::READ_ALOUD_SCRIPT;
 use crate::tab_session::{self, Loaded, SessionColumn, SessionGroup, SessionTab, TabSession};
 use neural_core::{
-    CoreConfig, HistoryEntry, HistoryKind, HistoryStore, Intent, MemoryDocument, MemoryHit,
-    MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore, Note, ObservedPage, Phase,
-    ReaderArticle, ReaderClient, ResearchItemKind, ResearchSession, ZettelError, ZettelStore,
-    chatgpt_search_url, claude_search_url, google_ai_url, is_local_network_target, is_pdf_url,
-    tissue,
+    ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentRuntimeConfig,
+    AgentSecurityAction, CoreConfig, FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent,
+    MemoryDocument, MemoryHit, MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore, Note,
+    ObservedPage, Phase, ReaderArticle, ReaderClient, ResearchItemKind, ResearchSession,
+    ZettelError, ZettelStore, chatgpt_search_url, claude_search_url, google_ai_url,
+    is_local_network_target, is_pdf_url, redact_sensitive_text, tissue,
     zettel::{self, is_valid_note_id},
 };
 use url::Url;
@@ -67,11 +68,12 @@ use windows_sys::Win32::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
             ES_AUTOHSCROLL, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
             GetForegroundWindow, GetParent, GetWindowTextLengthW, GetWindowTextW,
-            GetWindowThreadProcessId, IsZoomed, MB_ICONINFORMATION, MB_OK, MF_SEPARATOR, MF_STRING,
-            MessageBoxW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER,
-            SendMessageW, SetParent, SetWindowPos, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-            TrackPopupMenu, WM_CANCELMODE, WM_CAPTURECHANGED, WM_KEYDOWN, WS_CHILD,
-            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+            GetWindowThreadProcessId, IDYES, IsZoomed, MB_ICONINFORMATION, MB_OK, MB_YESNO,
+            MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
+            SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetParent, SetWindowPos, ShowWindow,
+            TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_CANCELMODE, WM_CAPTURECHANGED,
+            WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP,
+            WS_VISIBLE,
         },
     },
 };
@@ -2320,10 +2322,6 @@ unsafe fn window_text(hwnd: HWND) -> String {
     }
 }
 
-pub(in crate::windows_app) unsafe fn get_window_text(hwnd: HWND) -> String {
-    window_text(hwnd)
-}
-
 struct ReaderJob {
     generation: u64,
     input: String,
@@ -2953,6 +2951,71 @@ impl HomeLayout {
 
         Self { input, go }
     }
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::windows_app) enum BrowserAgentCommand {
+    Search(String),
+    Click(String),
+    Select { label: String, value: String },
+    Extract,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) enum AgentTermination {
+    Completed,
+    UserStopped,
+    Limit,
+    ElementMissing,
+    RestrictedAction,
+    UserRejected,
+    ExecutionError,
+}
+
+impl AgentTermination {
+    pub(in crate::windows_app) fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::UserStopped => "user-stopped",
+            Self::Limit => "limit",
+            Self::ElementMissing => "element-missing",
+            Self::RestrictedAction => "restricted-action",
+            Self::UserRejected => "user-rejected",
+            Self::ExecutionError => "execution-error",
+        }
+    }
+}
+
+/// O aviso que o utilizador vê quando o agente pára, e por quantos segundos.
+/// Ficam ao lado da razão para não se dizer uma coisa no trace e outra no ecrã.
+pub(in crate::windows_app) fn agent_stop_message(reason: AgentTermination) -> &'static str {
+    match reason {
+        AgentTermination::Completed => "Agente concluiu a sequência.",
+        AgentTermination::UserStopped => "Agente interrompido.",
+        AgentTermination::Limit => "Agente interrompido pelo limite de execução.",
+        AgentTermination::ElementMissing => "Agente não encontrou o elemento solicitado.",
+        AgentTermination::RestrictedAction => "Ação restrita: controle devolvido ao usuário.",
+        AgentTermination::UserRejected => "Ação do agente cancelada.",
+        AgentTermination::ExecutionError => "Agente parou por erro de execução.",
+    }
+}
+
+pub(in crate::windows_app) fn agent_stop_seconds(reason: AgentTermination) -> u64 {
+    match reason {
+        AgentTermination::Completed | AgentTermination::UserRejected => 3,
+        AgentTermination::RestrictedAction => 5,
+        _ => 4,
+    }
+}
+
+pub(in crate::windows_app) struct BrowserAgentState {
+    pub(in crate::windows_app) goal: String,
+    pub(in crate::windows_app) commands: Vec<BrowserAgentCommand>,
+    pub(in crate::windows_app) next_command: usize,
+    pub(in crate::windows_app) steps: usize,
+    pub(in crate::windows_app) started: Instant,
+    pub(in crate::windows_app) policy: AgentPermissionPolicy,
+    pub(in crate::windows_app) trace: Vec<String>,
 }
 
 pub(in crate::windows_app) struct App {
@@ -7362,6 +7425,251 @@ impl App {
     }
 }
 
+/// Ligacao do agente (AGENTS.md §7). Fica na raiz ate o dono aprovar
+/// `app/agent.rs` (OQ2); os metodos seguem contiguos para os anchors.
+impl App {
+    pub(in crate::windows_app) fn start_browser_agent(&mut self, spec: &str) {
+        let (url, commands) = match parse_browser_agent_plan(spec) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.show_native_error(error);
+                return;
+            }
+        };
+        let Ok(valid) = neural_core::validate_web_url(&url) else {
+            self.show_native_error("Agent: URL inválida.");
+            return;
+        };
+        if neural_core::is_local_network_target(&valid) {
+            self.show_native_error("Agent: destinos locais/privados não são permitidos.");
+            return;
+        }
+
+        self.destroy_web_surfaces();
+        self.show_omnibox(false);
+        let origin = valid.origin().ascii_serialization();
+        let mut policy = AgentPermissionPolicy::new(Some(origin));
+        policy.grant_reversible_session_actions(true);
+        self.active_agent = Some(BrowserAgentState {
+            goal: spec.to_string(),
+            commands,
+            next_command: 0,
+            steps: 0,
+            started: Instant::now(),
+            policy,
+            trace: vec![format!("navigate {}", valid)],
+        });
+
+        let result = if let Some(window) = &self.window {
+            self.external_webview_builder(None, true)
+                .with_url(valid.as_str())
+                .build(window)
+        } else {
+            self.active_agent = None;
+            return;
+        };
+
+        match result {
+            Ok(webview) => {
+                let _ = webview.zoom(self.zoom);
+                self.webview = Some(webview);
+                self.surface = Surface::External;
+                self.record(
+                    HistoryKind::Web,
+                    format!("agent:{}", spec),
+                    valid.to_string(),
+                );
+                self.show_splash(
+                    "Agente iniciado. Esc/Home interrompe imediatamente.".to_string(),
+                    4,
+                );
+            }
+            Err(error) => {
+                self.active_agent = None;
+                self.show_native_error(format!("Agent WebView: {error}"));
+            }
+        }
+    }
+
+    pub(in crate::windows_app) fn handle_agent_observation(&mut self, page: ObservedPage) {
+        let Some(agent) = self.active_agent.as_ref() else {
+            return;
+        };
+        let (commands, next_command, steps, elapsed) = (
+            agent.commands.clone(),
+            agent.next_command,
+            agent.steps,
+            agent.started.elapsed(),
+        );
+
+        let decision = {
+            let Some(agent) = self.active_agent.as_mut() else {
+                return;
+            };
+            decide_agent_step(
+                &commands,
+                next_command,
+                steps,
+                elapsed,
+                &page,
+                &mut agent.policy,
+            )
+        };
+
+        match decision {
+            AgentStepDecision::Stop(reason) => {
+                self.show_splash(
+                    agent_stop_message(reason).to_string(),
+                    agent_stop_seconds(reason),
+                );
+                self.finish_agent(reason);
+            }
+            AgentStepDecision::Extract => self.extract_agent_observation(&page),
+            AgentStepDecision::ConfirmExtract { security, reason } => {
+                let action = AgentAction::Extract {
+                    target: None,
+                    schema: "page-text".into(),
+                };
+                let approved =
+                    self.confirm_agent_action(&format!("{reason}: {}", page.url), &action);
+                if let Some(agent) = self.active_agent.as_mut() {
+                    agent.policy.record_user_confirmation(&security, approved);
+                }
+                if !approved {
+                    self.show_splash("Ação do agente cancelada.".to_string(), 3);
+                    self.finish_agent(AgentTermination::UserRejected);
+                    return;
+                }
+                self.extract_agent_observation(&page);
+            }
+            AgentStepDecision::Act(act) => {
+                let AgentAct {
+                    action,
+                    security,
+                    confirmation,
+                } = *act;
+                if let Some(reason) = confirmation {
+                    let approved = self.confirm_agent_action(&reason, &action);
+                    if let Some(agent) = self.active_agent.as_mut() {
+                        agent.policy.record_user_confirmation(&security, approved);
+                    }
+                    if !approved {
+                        self.show_splash("Ação do agente cancelada.".to_string(), 3);
+                        self.finish_agent(AgentTermination::UserRejected);
+                        return;
+                    }
+                }
+
+                match self.execute_agent_action(&action) {
+                    Ok(()) => {
+                        if let Some(agent) = self.active_agent.as_mut() {
+                            agent.trace.push(agent_trace_action(&action));
+                            agent.next_command += 1;
+                            agent.steps += 1;
+                        }
+                    }
+                    Err(error) => {
+                        self.show_splash(format!("Agent: {error}"), 4);
+                        self.finish_agent(AgentTermination::ExecutionError);
+                    }
+                }
+            }
+        }
+    }
+
+    /// O comando `extract`: o texto observado vai para a memória semântica, já
+    /// redigido, e o agente termina.
+    pub(in crate::windows_app) fn extract_agent_observation(&mut self, page: &ObservedPage) {
+        let clean = redact_sensitive_text(&page.text_excerpt);
+        let mut document = MemoryDocument::new(
+            MemoryKind::ResearchResult,
+            MemorySourceKind::Web,
+            if page.title.is_empty() {
+                "Extração do agente".to_string()
+            } else {
+                page.title.clone()
+            },
+            Some(page.url.clone()),
+            clean.clone(),
+        );
+        if let Some(session) = &self.current_research {
+            document = document.session(session.id.clone());
+        }
+        self.memory.capture(document);
+        if let Some(agent) = &mut self.active_agent {
+            agent.trace.push(format!(
+                "extract {} chars from {}",
+                clean.chars().count(),
+                page.url
+            ));
+            agent.next_command += 1;
+            agent.steps += 1;
+        }
+        self.show_native_text("NeuralIA Agent — Extração", &clean);
+        self.finish_agent(AgentTermination::Completed);
+    }
+
+    pub(in crate::windows_app) fn execute_agent_action(
+        &self,
+        action: &AgentAction,
+    ) -> Result<(), String> {
+        let Some(webview) = &self.webview else {
+            return Err("nenhuma página ativa".into());
+        };
+        let script = agent_action_script(action)?;
+        webview
+            .evaluate_script(&script)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(in crate::windows_app) fn confirm_agent_action(
+        &self,
+        reason: &str,
+        action: &AgentAction,
+    ) -> bool {
+        let (Some(window), Some(hwnd)) = (&self.window, self.window.as_ref().and_then(window_hwnd))
+        else {
+            return false;
+        };
+        let _ = window;
+        let body = wide_null(&format!(
+            "O agente quer executar uma ação sensível.\n\n{reason}\n\n{action:?}\n\nAutorizar uma única vez?"
+        ));
+        let title = wide_null("NeuralIA — Confirmação do agente");
+        unsafe {
+            MessageBoxW(
+                hwnd,
+                body.as_ptr(),
+                title.as_ptr(),
+                MB_YESNO | MB_ICONINFORMATION,
+            ) == IDYES
+        }
+    }
+
+    pub(in crate::windows_app) fn finish_agent(&mut self, reason: AgentTermination) {
+        let Some(agent) = self.active_agent.take() else {
+            return;
+        };
+
+        let root = self.config.data_dir.join("agent");
+        let _ = std::fs::create_dir_all(&root);
+        let stamp = now_ms();
+        let _ = std::fs::write(
+            root.join(format!("trace-{stamp}.log")),
+            format!(
+                "termination: {}\ngoal: {}\nsteps: {}\n{}\n",
+                reason.as_str(),
+                redact_sensitive_text(&agent.goal),
+                agent.steps,
+                agent.trace.join("\n")
+            ),
+        );
+        let _ = agent
+            .policy
+            .write_audit_log(root.join(format!("audit-{stamp}.json")));
+    }
+}
+
 /// Atalhos com Ctrl quando o teclado esta na propria janela (depois de um
 /// clique na barra): os mesmos que o mapa de teclas das paginas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7397,6 +7705,511 @@ fn main_window_shortcut(
         ("z", true) => Some(MainShortcut::NewNote),
         _ => None,
     }
+}
+
+pub(in crate::windows_app) fn parse_browser_agent_plan(
+    spec: &str,
+) -> Result<(String, Vec<BrowserAgentCommand>), String> {
+    let parts = spec
+        .split('|')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let Some(url) = parts.first() else {
+        return Err(
+            "Use agent:https://site | search=texto | click=botão | select=filtro:valor | extract"
+                .into(),
+        );
+    };
+    neural_core::validate_web_url(url).map_err(|error| error.to_string())?;
+
+    let mut commands = Vec::new();
+    for raw in parts.iter().skip(1) {
+        // Um valor vazio era descartado em silêncio. O plano seguia sem o
+        // comando que o utilizador escreveu e, se fosse o único, o
+        // `commands.is_empty()` lá em baixo punha um `extract` no lugar: um
+        // `click=` mal escrito acabava a guardar a página na memória em vez de
+        // clicar. Um comando que não dá para cumprir é um erro, não um salto.
+        if let Some(value) = raw
+            .strip_prefix("search=")
+            .or_else(|| raw.strip_prefix("pesquisar="))
+        {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err("search precisa do texto a procurar: search=termo".into());
+            }
+            commands.push(BrowserAgentCommand::Search(value.to_string()));
+        } else if let Some(value) = raw
+            .strip_prefix("click=")
+            .or_else(|| raw.strip_prefix("clique="))
+        {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err("click precisa do rótulo do elemento: click=Buscar".into());
+            }
+            commands.push(BrowserAgentCommand::Click(value.to_string()));
+        } else if let Some(value) = raw
+            .strip_prefix("select=")
+            .or_else(|| raw.strip_prefix("selecionar="))
+        {
+            let Some((label, selected)) = value.split_once(':') else {
+                return Err("select usa select=campo:valor".into());
+            };
+            let (label, selected) = (label.trim(), selected.trim());
+            // Um rótulo vazio não é "qualquer campo": era o primeiro
+            // `select`/`combobox` da página, escolhido por ordem do DOM.
+            if label.is_empty() || selected.is_empty() {
+                return Err("select usa select=campo:valor, com os dois preenchidos".into());
+            }
+            commands.push(BrowserAgentCommand::Select {
+                label: label.to_string(),
+                value: selected.to_string(),
+            });
+        } else if raw.eq_ignore_ascii_case("extract") || raw.eq_ignore_ascii_case("extrair") {
+            commands.push(BrowserAgentCommand::Extract);
+        } else {
+            return Err(format!("comando de agente desconhecido: {raw}"));
+        }
+    }
+    if commands.is_empty() {
+        commands.push(BrowserAgentCommand::Extract);
+    }
+    Ok(((*url).to_string(), commands))
+}
+
+pub(in crate::windows_app) fn parse_agent_observation(data: &str) -> Option<ObservedPage> {
+    let mut lines = data.lines();
+    let generation = lines.next()?.parse::<u64>().ok()?;
+    let url = lines.next()?.trim().to_string();
+    let title = lines.next()?.trim().to_string();
+    let text_excerpt = lines.next().unwrap_or_default().to_string();
+    let origin = Url::parse(&url)
+        .ok()
+        .map(|parsed| parsed.origin().ascii_serialization())
+        .unwrap_or_else(|| url.clone());
+
+    let mut elements = Vec::new();
+    for line in lines.take(40) {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() < 5 {
+            continue;
+        }
+        elements.push(AgentElement {
+            id: fields[0].to_string(),
+            generation,
+            role: fields[1].to_string(),
+            name: fields[2].to_string(),
+            text: fields[2].to_string(),
+            origin: origin.clone(),
+            frame: "top".into(),
+            visible: true,
+            interactable: fields[4] == "1",
+        });
+    }
+
+    Some(ObservedPage {
+        generation,
+        url,
+        title,
+        text_excerpt,
+        elements,
+    })
+}
+
+pub(in crate::windows_app) fn agent_field_kind(element: &AgentElement) -> FieldKind {
+    let role = element.role.to_ascii_lowercase();
+    if role.contains("password") {
+        FieldKind::Password
+    } else if role.contains("otp") {
+        FieldKind::Otp
+    } else if role.contains("card") || role.contains("payment") {
+        FieldKind::PaymentCard
+    } else if role.contains("email") {
+        FieldKind::Email
+    } else if role.contains("search") {
+        FieldKind::Search
+    } else if role.contains("input") || role.contains("textbox") || role.contains("textarea") {
+        FieldKind::Text
+    } else {
+        FieldKind::Unknown
+    }
+}
+
+pub(in crate::windows_app) fn find_agent_element<'a>(
+    page: &'a ObservedPage,
+    label: &str,
+    select_only: bool,
+) -> Option<&'a AgentElement> {
+    let needle = label.to_lowercase();
+    page.elements.iter().find(|element| {
+        element.interactable
+            && (!select_only
+                || element.role.to_ascii_lowercase().contains("select")
+                || element.role.to_ascii_lowercase().contains("combobox"))
+            && (needle.is_empty()
+                || element.name.to_lowercase().contains(&needle)
+                || element.text.to_lowercase().contains(&needle))
+    })
+}
+
+/// O que fazer com uma observação da página. Decidido sem tocar na UI, no
+/// WebView nem na memória: os limites, a escolha do elemento e o gate da
+/// política vivem aqui, e `handle_agent_observation` fica só com a execução do
+/// que isto decidir.
+///
+/// A separação é o que torna a SPEC-0105 testável no código que embarca. O
+/// `AgentRuntime` do `neural-core` -- sobre o qual corre
+/// `spec_0105_agent_runtime_is_bounded_structured_and_human_gated` -- não é
+/// usado por esta aplicação: o agente do produto é este. Enquanto a decisão
+/// estivesse entalada entre `show_splash` e `evaluate_script`, nenhum teste
+/// conseguia ficar vermelho quando o produto regredisse.
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::windows_app) enum AgentStepDecision {
+    /// Terminar, com a razão que vai para o trace e para o utilizador.
+    Stop(AgentTermination),
+    /// O comando `extract`: guardar o texto observado e terminar.
+    Extract,
+    /// O `extract` que a política só deixa seguir com um sim humano (a
+    /// página está numa origem que a sessão não aprovou).
+    ConfirmExtract {
+        security: AgentSecurityAction,
+        reason: String,
+    },
+    /// Executar a ação (em `Box` porque é muitas vezes maior do que as outras
+    /// duas variantes).
+    Act(Box<AgentAct>),
+}
+
+/// A ação aprovada pelo gate, com a razão da confirmação quando a política
+/// exige um sim humano antes de ela acontecer.
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::windows_app) struct AgentAct {
+    pub(in crate::windows_app) action: AgentAction,
+    pub(in crate::windows_app) security: AgentSecurityAction,
+    pub(in crate::windows_app) confirmation: Option<String>,
+}
+
+/// O orçamento do agente vem do `AgentRuntimeConfig::default()` da SPEC-0105 em
+/// vez de números escritos à mão aqui: dois sítios com os mesmos limites
+/// divergem sem nada os apanhar.
+pub(in crate::windows_app) fn decide_agent_step(
+    commands: &[BrowserAgentCommand],
+    next_command: usize,
+    steps: usize,
+    elapsed: Duration,
+    page: &ObservedPage,
+    policy: &mut AgentPermissionPolicy,
+) -> AgentStepDecision {
+    let budget = AgentRuntimeConfig::default();
+    if steps >= budget.max_steps || elapsed >= budget.max_wall_time {
+        return AgentStepDecision::Stop(AgentTermination::Limit);
+    }
+
+    let Some(command) = commands.get(next_command) else {
+        return AgentStepDecision::Stop(AgentTermination::Completed);
+    };
+
+    let action = match command {
+        // O `extract` escreve a página na memória semântica: passa pelo gate
+        // como os outros. Saltava-o, e depois de um clique que levasse a outra
+        // origem a página dessa origem entrava na memória sem diálogo e sem
+        // entrada na auditoria (SPEC-0105 §4).
+        BrowserAgentCommand::Extract => {
+            let security = app_agent_security_action(
+                &AgentAction::Extract {
+                    target: None,
+                    schema: "page-text".into(),
+                },
+                page,
+            );
+            let decision = policy.evaluate(&security);
+            if decision.allowed {
+                return AgentStepDecision::Extract;
+            }
+            if decision.risk == ActionRisk::Restricted {
+                return AgentStepDecision::Stop(AgentTermination::RestrictedAction);
+            }
+            if !decision.requires_confirmation {
+                policy.record_user_confirmation(&security, false);
+                return AgentStepDecision::Stop(AgentTermination::UserRejected);
+            }
+            return AgentStepDecision::ConfirmExtract {
+                security,
+                reason: decision.reason,
+            };
+        }
+        BrowserAgentCommand::Search(value) => page
+            .elements
+            .iter()
+            .find(|element| {
+                element.interactable
+                    && matches!(
+                        agent_field_kind(element),
+                        FieldKind::Search | FieldKind::Text
+                    )
+            })
+            .cloned()
+            .map(|target| AgentAction::TypeText {
+                target,
+                text: value.clone(),
+                field: FieldKind::Search,
+            }),
+        BrowserAgentCommand::Click(label) => find_agent_element(page, label, false)
+            .cloned()
+            .map(|target| AgentAction::Click { target }),
+        BrowserAgentCommand::Select { label, value } => find_agent_element(page, label, true)
+            .cloned()
+            .map(|target| AgentAction::Select {
+                target,
+                value: value.clone(),
+            }),
+    };
+
+    let Some(action) = action else {
+        return AgentStepDecision::Stop(AgentTermination::ElementMissing);
+    };
+
+    let security = app_agent_security_action(&action, page);
+    let decision = policy.evaluate(&security);
+    if decision.allowed {
+        return AgentStepDecision::Act(Box::new(AgentAct {
+            action,
+            security,
+            confirmation: None,
+        }));
+    }
+    if decision.risk == ActionRisk::Restricted {
+        return AgentStepDecision::Stop(AgentTermination::RestrictedAction);
+    }
+    if !decision.requires_confirmation {
+        // Negada sem caminho de confirmação: fica no log de auditoria como
+        // recusa, tal como a recusa explícita do utilizador.
+        policy.record_user_confirmation(&security, false);
+        return AgentStepDecision::Stop(AgentTermination::UserRejected);
+    }
+    AgentStepDecision::Act(Box::new(AgentAct {
+        action,
+        security,
+        confirmation: Some(decision.reason),
+    }))
+}
+
+pub(in crate::windows_app) fn app_agent_security_action(
+    action: &AgentAction,
+    page: &ObservedPage,
+) -> AgentSecurityAction {
+    let origin = Url::parse(&page.url)
+        .ok()
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|| page.url.clone());
+
+    match action {
+        AgentAction::Click { target } => {
+            let label = target.name.to_lowercase();
+            let role = target.role.to_lowercase();
+            let material = format!("{role} {label}");
+            if ["delete", "remove", "excluir", "apagar", "cancel account"]
+                .iter()
+                .any(|word| material.contains(word))
+            {
+                AgentSecurityAction::DeleteRemote {
+                    origin,
+                    description: target.name.clone(),
+                }
+            } else if [
+                "buy",
+                "purchase",
+                "pay",
+                "comprar",
+                "pagar",
+                "checkout",
+                "transfer",
+                "transferir",
+                "subscribe",
+                "assinar plano",
+            ]
+            .iter()
+            .any(|word| material.contains(word))
+            {
+                AgentSecurityAction::Payment {
+                    origin,
+                    description: target.name.clone(),
+                }
+            } else if role.contains("submit")
+                || [
+                    "send",
+                    "submit",
+                    "confirm",
+                    "enviar",
+                    "confirmar",
+                    "post",
+                    "publish",
+                    "publicar",
+                    "save changes",
+                    "salvar alterações",
+                    "salvar alteracoes",
+                    "create account",
+                    "criar conta",
+                    "authorize",
+                    "autorizar",
+                    "accept terms",
+                    "aceitar termos",
+                    "sign agreement",
+                    "assinar acordo",
+                    "finalize",
+                    "finalizar",
+                ]
+                .iter()
+                .any(|word| material.contains(word))
+            {
+                AgentSecurityAction::Submit {
+                    origin,
+                    description: target.name.clone(),
+                }
+            } else {
+                AgentSecurityAction::Click {
+                    origin,
+                    label: target.name.clone(),
+                }
+            }
+        }
+        AgentAction::TypeText { field, text, .. } => AgentSecurityAction::TypeText {
+            origin,
+            field: *field,
+            value_summary: format!("{} chars", text.chars().count()),
+        },
+        AgentAction::Select { target, value } => AgentSecurityAction::Click {
+            origin,
+            label: format!("select {} = {}", target.name, value),
+        },
+        AgentAction::Extract { .. } => AgentSecurityAction::Extract { origin },
+        _ => AgentSecurityAction::Read { origin },
+    }
+}
+
+pub(in crate::windows_app) fn agent_trace_action(action: &AgentAction) -> String {
+    match action {
+        AgentAction::TypeText {
+            target,
+            text,
+            field,
+        } => format!(
+            "type target={} field={field:?} chars={}",
+            target.id,
+            text.chars().count()
+        ),
+        AgentAction::Select { target, value } => {
+            format!(
+                "select target={} chars={}",
+                target.id,
+                value.chars().count()
+            )
+        }
+        AgentAction::Click { target } => format!(
+            "click target={} label={}",
+            target.id,
+            redact_sensitive_text(&target.name)
+        ),
+        AgentAction::Extract { .. } => "extract".to_string(),
+        AgentAction::Scroll { amount } => format!("scroll {amount}"),
+        AgentAction::Submit { description, .. } => {
+            format!("submit {}", redact_sensitive_text(description))
+        }
+        AgentAction::Navigate { url } => format!("navigate {}", redact_sensitive_text(url)),
+        AgentAction::Wait { millis } => format!("wait {millis}ms"),
+        AgentAction::AskUser { reason } => {
+            format!("ask-user {}", redact_sensitive_text(reason))
+        }
+        AgentAction::Finish { summary } => {
+            format!("finish {}", redact_sensitive_text(summary))
+        }
+    }
+}
+
+/// Como o agente dá papel e nome a um elemento, num só texto que entra no
+/// `AGENT_OBSERVER_SCRIPT` e no guard do `agent_action_script`.
+///
+/// Eram duas fórmulas: o observador dizia `textbox`/`button`/`select` e o
+/// guard recalculava `el.type` (`text`, `submit`, `select-one`), sem o
+/// placeholder no nome. Nos controlos mais comuns o guard desistia em silêncio
+/// e o passo ficava no trace como feito. Com uma só definição não há o que
+/// divergir.
+macro_rules! agent_element_identity_js {
+    () => {
+        r#"
+  // `slice` conta unidades UTF-16 e pode partir um emoji: o surrogate que
+  // fica sozinho vira `\udXXX` no JSON, que o serde_json recusa, e a
+  // observacao inteira sumia. Qualquer surrogate sem par sai.
+  function clean(value, limit) {
+    return String(value || '').replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit)
+      .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
+  }
+
+  function fieldRole(el) {
+    const tag = (el.tagName || '').toLowerCase();
+    const type = (el.type || '').toLowerCase();
+    const autocomplete = (el.autocomplete || '').toLowerCase();
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    const name = (el.name || '').toLowerCase();
+    // Antes de tudo: o que o clique FAZ. Um submit de formulario e `submit`
+    // seja qual for o role ou o nome que a pagina lhe der; e o unico papel
+    // que faz o `app_agent_security_action` pedir confirmacao sem depender de
+    // o rotulo estar na lista de palavras.
+    if ((tag === 'button' && type === 'submit' && el.form) ||
+        (tag === 'input' && (type === 'submit' || type === 'image'))) return 'submit';
+    const combined = [type, autocomplete, role, name].join(' ');
+    if (combined.includes('password')) return 'password';
+    if (combined.includes('one-time') || combined.includes('otp')) return 'otp';
+    if (combined.includes('cc-') || combined.includes('card') || combined.includes('payment')) return 'payment-card';
+    if (combined.includes('email')) return 'email';
+    if (combined.includes('search')) return 'search';
+    if (tag === 'select') return 'select';
+    if (tag === 'input' || tag === 'textarea') return 'textbox';
+    return role || tag || 'element';
+  }
+
+  function elementName(el) {
+    return clean(el.getAttribute('aria-label') || el.name || el.innerText || el.textContent || el.placeholder, 96);
+  }
+"#
+    };
+}
+
+pub(in crate::windows_app) fn agent_action_script(action: &AgentAction) -> Result<String, String> {
+    fn guard(target: &AgentElement) -> String {
+        let id = js_percent(&target.id);
+        let name = js_percent(&target.name);
+        let role = js_percent(&target.role);
+        format!(
+            "{identity}const id=decodeURIComponent('{id}');const expectedName=decodeURIComponent('{name}');             const expectedRole=decodeURIComponent('{role}');             const el=document.querySelector('[data-neuralia-agent-id=\"'+id+'\"]');             if(!el)return;             if(expectedName && elementName(el)!==expectedName)return;             if(expectedRole && fieldRole(el)!==expectedRole)return;",
+            identity = agent_element_identity_js!()
+        )
+    }
+
+    let body = match action {
+        AgentAction::TypeText { target, text, .. } => {
+            let value = js_percent(text);
+            format!(
+                "{}const value=decodeURIComponent('{}');el.focus();                 const proto=Object.getPrototypeOf(el);const descriptor=Object.getOwnPropertyDescriptor(proto,'value');                 if(descriptor&&descriptor.set)descriptor.set.call(el,value);else el.value=value;                 el.dispatchEvent(new Event('input',{{bubbles:true}}));                 el.dispatchEvent(new Event('change',{{bubbles:true}}));",
+                guard(target),
+                value
+            )
+        }
+        AgentAction::Click { target } => format!("{}el.click();", guard(target)),
+        AgentAction::Select { target, value } => {
+            let value = js_percent(value);
+            format!(
+                "{}el.value=decodeURIComponent('{}');                 el.dispatchEvent(new Event('input',{{bubbles:true}}));                 el.dispatchEvent(new Event('change',{{bubbles:true}}));",
+                guard(target),
+                value
+            )
+        }
+        _ => return Err("ação ainda não executável pela bridge do navegador".into()),
+    };
+
+    Ok(format!(
+        "(function(){{{body}window.dispatchEvent(new Event('neuralia-agent-rescan'));}})();"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -10975,14 +11788,9 @@ pub(super) use neural_core::parse_intent;
 // Nomes que so os testes usam por `use super::*` desde que o codigo que os
 // usava saiu da raiz (split-c): no binario ficavam como import nao usado.
 #[cfg(test)]
-pub(super) use neural_core::{
-    AgentAction, AgentElement, AgentPermissionPolicy, AgentRuntimeConfig, AgentSecurityAction,
-    FieldKind, ReaderBlock,
-};
+pub(super) use neural_core::ReaderBlock;
 #[cfg(test)]
 pub(super) use std::borrow::Cow;
-#[cfg(test)]
-pub(super) use windows_sys::Win32::UI::WindowsAndMessaging::IDYES;
 #[cfg(test)]
 pub(super) use wry::http::{Request, Response as HttpResponse};
 
@@ -11579,3 +12387,133 @@ unsafe fn draw_go_gradient(
 /// por isso este botao tem de anunciar a saida.
 const COMPARATOR_BUTTON_EXPANDED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='none';}var m=document.querySelector('#neuralia-comp-minimize');if(m){m.style.display='none';}})();";
 const COMPARATOR_BUTTON_COLLAPSED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='block';b.textContent='\u{26F6} ' + (window.__neuralia_col_name || 'IA');}var m=document.querySelector('#neuralia-comp-minimize');if(m){m.style.display='block';}})();";
+
+pub(in crate::windows_app) const AGENT_OBSERVER_SCRIPT: &str = concat!(
+    r#"
+(function () {
+  if (window.top !== window) return;
+  const capability = '__NEURALIA_CAP__';
+  const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
+  const stringify = JSON.stringify;
+  // O envelope com o token e montado com primitivas. Serializar um objeto
+  // que contem o token faz o serializador consultar toJSON pela cadeia de
+  // prototipos, que a pagina controla: um getter dela recebia o envelope
+  // como `this` e lia `cap`. Strings nao passam por toJSON.
+  function envelope(action, args) {
+    return '{"v":1,"cap":"' + capability + '","action":' + stringify(action)
+      + ',"args":' + stringify(args || {}) + '}';
+  }
+  const listen = Function.prototype.call.bind(EventTarget.prototype.addEventListener);
+  const defer = setTimeout;
+  let generation = 0;
+  let lastMaterial = '';
+  let timer = 0;
+  // Um id por ELEMENTO, dado uma vez e nunca renomeado. Os ids por geracao
+  // mudavam a cada observacao: o proprio setAttribute disparava o
+  // MutationObserver, a observacao seguinte trazia ids novos e o material
+  // nunca repetia, por isso os ids mudavam a cada ~700 ms. Um clique aprovado
+  // depois de o utilizador ler o dialogo procurava um id que ja nao existia e
+  // nao fazia nada. Um clone copia o atributo mas nao a entrada do mapa, e
+  // recebe um id seu.
+  const agentIds = new WeakMap();
+  let nextAgentId = 0;
+"#,
+    agent_element_identity_js!(),
+    r#"
+  // Bytes UTF-8 que uma unidade UTF-16 ocupa depois de serializada em JSON, no
+  // pior caso: controlo e surrogate viram \uXXXX (6), aspas e barra levam
+  // escape (2).
+  function unitCost(code) {
+    if (code < 0x20 || (code >= 0xd800 && code <= 0xdfff)) return 6;
+    if (code === 0x22 || code === 0x5c) return 2;
+    if (code < 0x80) return 1;
+    return code < 0x800 ? 2 : 3;
+  }
+
+  function jsonCost(value) {
+    let total = 0;
+    for (let i = 0; i < value.length; i++) total += unitCost(value.charCodeAt(i));
+    return total;
+  }
+
+  // O prefixo mais longo que cabe em `budget`, sem deixar um surrogate alto
+  // sozinho no fim.
+  function fitJson(value, budget) {
+    let total = 0;
+    let end = 0;
+    for (; end < value.length; end++) {
+      const cost = unitCost(value.charCodeAt(end));
+      if (total + cost > budget) break;
+      total += cost;
+    }
+    const code = end > 0 ? value.charCodeAt(end - 1) : 0;
+    return value.slice(0, code >= 0xd800 && code <= 0xdbff ? end - 1 : end);
+  }
+
+  function observe() {
+    timer = 0;
+    const root = document.querySelector('main,[role="main"]') || document.body || document.documentElement;
+    const pageText = clean(root ? (root.innerText || root.textContent) : '', 1600);
+    const candidates = document.querySelectorAll(
+      'input,textarea,select,button,a[href],[role="button"],[role="textbox"],[role="combobox"]'
+    );
+    const rows = [];
+    for (const el of candidates) {
+      if (rows.length >= 32) break;
+      const rect = el.getBoundingClientRect();
+      const css = getComputedStyle(el);
+      if (rect.width <= 0 || rect.height <= 0 || css.display === 'none' || css.visibility === 'hidden') continue;
+      let id = agentIds.get(el);
+      if (!id) {
+        nextAgentId += 1;
+        id = 'n' + nextAgentId;
+        agentIds.set(el, id);
+      }
+      if (el.getAttribute('data-neuralia-agent-id') !== id) el.setAttribute('data-neuralia-agent-id', id);
+      rows.push([id, fieldRole(el), elementName(el), clean(el.tagName, 20), el.disabled ? '0' : '1'].join('\t'));
+    }
+
+    const material = [location.href, document.title || '', pageText, rows.join('\n')].join('\n');
+    if (material === lastMaterial) return;
+    lastMaterial = material;
+    generation += 1;
+
+    // O envelope nativo aceita no maximo 8 KiB. Antes cortava-se a string
+    // inteira a 1200 unidades, e as linhas de elementos vinham no fim: numa
+    // pagina com mais de ~1.1K caracteres de texto o agente deixava de ver
+    // qualquer controlo, e um URL longo levava ate a linha do titulo. Agora
+    // cada parte paga o seu custo em bytes do JSON no pior caso: o cabecalho
+    // vai inteiro, as linhas entram antes do texto (com uma reserva para ele)
+    // e o texto fica com o que sobra. 7000 bytes deixam >1 KiB para
+    // cap/action/args.
+    const head = [String(generation), clean(location.href, 1200), clean(document.title, 256)].join('\n');
+    let left = 7000 - jsonCost(head) - jsonCost('\n');
+    const textReserve = Math.min(jsonCost(pageText), 1500);
+    const kept = [];
+    for (const row of rows) {
+      const rowCost = jsonCost('\n' + row);
+      if (rowCost > left - textReserve) break;
+      kept.push(row);
+      left -= rowCost;
+    }
+    const payload = [head, fitJson(pageText, left)].concat(kept).join('\n');
+    post(envelope('agent-observation', { data:payload }));
+  }
+
+  function schedule() {
+    clearTimeout(timer);
+    timer = defer(observe, 700);
+  }
+
+  if (document.readyState === 'loading') {
+    listen(document, 'DOMContentLoaded', schedule, { once:true });
+  } else {
+    schedule();
+  }
+  listen(window, 'neuralia-agent-rescan', schedule);
+  new MutationObserver(schedule).observe(document.documentElement, {
+    childList:true, subtree:true, attributes:true
+  });
+})();
+"#
+);
