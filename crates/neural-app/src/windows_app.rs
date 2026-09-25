@@ -42,9 +42,8 @@ use crate::panel_chrome::{
     wheel_message_params, wheel_route,
 };
 use crate::pomodoro_ui::{
-    POMODORO_COMMAND_HELP, PomodoroCommand, PomodoroController, PomodoroHost, PomodoroMenuItem,
-    TickSchedule, TickScheduler, WindowAttention, parse_pomodoro_command, phase_color,
-    pomodoro_menu_command,
+    POMODORO_COMMAND_HELP, PomodoroCommand, PomodoroController, TickSchedule, TickScheduler,
+    parse_pomodoro_command, phase_color,
 };
 use crate::read_aloud::READ_ALOUD_SCRIPT;
 use crate::tab_session::{self, Loaded, SessionColumn, SessionGroup, SessionTab, TabSession};
@@ -394,10 +393,6 @@ const PALETTE_EDIT_HEIGHT: f64 = 30.0;
 const PALETTE_HINT_TOP: f64 = 48.0;
 /// Fraccao da altura util (abaixo da barra) a que a palette pousa.
 const PALETTE_TOP_RATIO: f64 = 0.18;
-/// Quanto ficam no ecra os avisos do Pomodoro: os dos comandos, e os do fim
-/// de uma fase (mais tempo: quem estava concentrado pode nao estar a olhar).
-const POMODORO_NOTICE_SECONDS: u64 = 3;
-const POMODORO_PHASE_END_SECONDS: u64 = 8;
 /// A ajuda do `tema:` com uma palavra desconhecida (omnibox e palette).
 const THEME_COMMAND_HELP: &str = "Use tema:sistema, tema:claro ou tema:escuro.";
 const SEARCH_CARD_SUBCLASS_ID: usize = 0x4E71;
@@ -432,7 +427,7 @@ static PALETTE_HINT: Mutex<String> = Mutex::new(String::new());
 
 /// O que esta debaixo do rato no chrome nativo do comparador.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BarHit {
+pub(in crate::windows_app) enum BarHit {
     Home,
     /// ‹ e › da fonte aberta ao lado de uma coluna, junto do rotulo dela.
     Back,
@@ -517,88 +512,6 @@ fn bar_menu_for(hit: Option<BarHit>) -> Option<BarMenu> {
         BarHit::Column(col_index) => Some(BarMenu::Column(col_index)),
         _ => None,
     }
-}
-
-/// As ferramentas da barra e da Home, na ordem em que aparecem (da esquerda
-/// para a direita): pedidas pelo dono como botoes, ao lado dos servicos.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tool {
-    Pomodoro,
-    /// Zettelkasten: as notas vivem no painel do Ctrl+H.
-    Notes,
-    /// Respiracao guiada (metodo Wim Hof): o video no painel anonimo.
-    Breath,
-}
-
-impl Tool {
-    const ALL: [Tool; 3] = [Tool::Pomodoro, Tool::Notes, Tool::Breath];
-
-    fn icon_slot(self) -> usize {
-        match self {
-            Self::Pomodoro => ICON_SLOT_POMODORO,
-            Self::Notes => ICON_SLOT_NOTES,
-            Self::Breath => ICON_SLOT_BREATH,
-        }
-    }
-
-    /// O tomate tem cor propria; as outras duas marcas sao brancas e seguem
-    /// o tema, como a videochamada e o envelope.
-    fn icon_tint(self, theme: &Theme) -> Option<Rgb> {
-        match self {
-            Self::Pomodoro => None,
-            Self::Notes | Self::Breath => Some(theme.fg),
-        }
-    }
-
-    /// A dica: o que o clique FAZ, como as outras dicas da barra.
-    fn tooltip(self) -> &'static str {
-        match self {
-            Self::Pomodoro => {
-                "Pomodoro: foco e pausas (clique inicia/pausa; botão direito: opções)"
-            }
-            Self::Notes => "Notas (Zettelkasten) — Ctrl+Shift+Z cria nota da seleção",
-            Self::Breath => "Respiração guiada — método Wim Hof (vídeo em modo anônimo)",
-        }
-    }
-}
-
-/// A dica de uma ferramenta, na barra e na Home. A do Pomodoro, com uma
-/// sessao em curso, diz a fase, o que falta e os focos feitos
-/// (`PomodoroController::hint`); parado, e nas outras duas, a fixa.
-fn tool_hint(tool: Tool, pomodoro: Option<&str>) -> String {
-    match (tool, pomodoro) {
-        (Tool::Pomodoro, Some(session)) => session.to_string(),
-        _ => tool.tooltip().to_string(),
-    }
-}
-
-/// A dica de uma ferramenta em `now`, com o Pomodoro da app: e o que a Home
-/// (`update_home_tool_hover`), a barra (`bar_hint`) e o refresco de cada
-/// segundo (`pomodoro_changed`) mostram.
-fn tool_hint_at(tool: Tool, pomodoro: &PomodoroController, now: Instant) -> String {
-    let session = match tool {
-        Tool::Pomodoro => pomodoro.hint(now),
-        Tool::Notes | Tool::Breath => None,
-    };
-    tool_hint(tool, session.as_deref())
-}
-
-/// A dica de um alvo da barra, como `App::bar_tooltip_text` a mostra: as
-/// ferramentas pela `tool_hint_at` (a do Pomodoro diz a sessao), o resto
-/// pela `bar_tooltip_label`.
-fn bar_hint(
-    hit: BarHit,
-    pomodoro: &PomodoroController,
-    now: Instant,
-    provider: &str,
-    maximized: bool,
-    tab_url: Option<&str>,
-    group: Option<(&str, bool)>,
-) -> Option<String> {
-    if let BarHit::Tool(tool) = hit {
-        return Some(tool_hint_at(tool, pomodoro, now));
-    }
-    bar_tooltip_label(hit, provider, maximized, tab_url, group)
 }
 
 /// Uma coluna do comparador. Generica na vista para os gates correrem sem
@@ -1131,7 +1044,7 @@ fn service_panel_hint(
 
 /// O que o clique em cada alvo da barra FAZ -- o mesmo match que trata o
 /// clique --, nao so o nome do botao.
-fn bar_tooltip_label(
+pub(in crate::windows_app) fn bar_tooltip_label(
     hit: BarHit,
     provider: &str,
     maximized: bool,
@@ -1470,7 +1383,7 @@ fn latest_tooltip_request() -> u64 {
 /// O rato entrou num alvo com dica `text`, ou saiu de todos (""). Esconde a
 /// dica que estiver a vista e, se houver texto, agenda a nova. Devolve o
 /// numero deste pedido.
-fn hover_tooltip(window: HWND, text: &str) -> u64 {
+pub(in crate::windows_app) fn hover_tooltip(window: HWND, text: &str) -> u64 {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, KillTimer, SetTimer};
     let request = TOOLTIP_REQUESTS.fetch_add(1, Ordering::AcqRel) + 1;
     hide_tooltip();
@@ -1811,7 +1724,7 @@ fn hide_tooltip() {
 /// A dica a vista -- ou a espera do atraso -- passa a dizer `text`, sem se
 /// esconder nem voltar a esperar: o tempo do Pomodoro muda a cada segundo
 /// com o rato parado em cima do botao. Escondida, fica escondida.
-fn refresh_hint_text(text: &str) {
+pub(in crate::windows_app) fn refresh_hint_text(text: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GW_OWNER, GetWindow, IsWindowVisible};
     {
         let mut pending = TOOLTIP_PENDING
@@ -1840,16 +1753,6 @@ fn refresh_hint_text(text: &str) {
     // Volta a centrar e a dimensionar pelo texto novo; `show_popup_without_activation`
     // la dentro, como sempre: a dica nunca rouba o foco.
     show_pending_tooltip();
-}
-
-/// Som curto do sistema no fim de uma fase do Pomodoro (o "Asterisco" do
-/// esquema de sons do Windows; sem som configurado, nada).
-fn pomodoro_sound() {
-    use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
-    use windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK;
-    unsafe {
-        MessageBeep(MB_ICONASTERISK);
-    }
 }
 
 /// Menu de tema no cursor, com a escolha em vigor marcada. Devolve a opcao
@@ -2047,61 +1950,6 @@ unsafe fn append_swatch_submenu(
 fn left_button_down() -> bool {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_LBUTTON};
     unsafe { GetKeyState(VK_LBUTTON as i32) < 0 }
-}
-
-/// Menu do botao direito do Pomodoro no cursor, feito das linhas de
-/// `PomodoroController::menu_items` (o modelo e o `pick_theme_from_menu`).
-/// Devolve o id escolhido; 0 se o menu fechou sem escolha.
-fn pick_pomodoro_from_menu(hwnd: HWND, items: &[PomodoroMenuItem]) -> usize {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GA_ROOT, GetAncestor, MF_CHECKED, MF_GRAYED, SetForegroundWindow,
-    };
-    unsafe {
-        let menu = CreatePopupMenu();
-        if menu.is_null() {
-            return 0;
-        }
-        for item in items {
-            match *item {
-                PomodoroMenuItem::Separator => {
-                    AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-                }
-                PomodoroMenuItem::Command {
-                    id,
-                    label,
-                    enabled,
-                    checked,
-                    ..
-                } => {
-                    let mut flags = MF_STRING;
-                    if checked {
-                        flags |= MF_CHECKED;
-                    }
-                    if !enabled {
-                        flags |= MF_GRAYED;
-                    }
-                    let text: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
-                    AppendMenuW(menu, flags, id, text.as_ptr());
-                }
-            }
-        }
-        let mut cursor = POINT { x: 0, y: 0 };
-        GetCursorPos(&mut cursor);
-        // Sem o dono em primeiro plano, o menu nao fecha ao clicar fora.
-        let root = GetAncestor(hwnd, GA_ROOT);
-        SetForegroundWindow(root);
-        let picked = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON,
-            cursor.x,
-            cursor.y,
-            0,
-            root,
-            std::ptr::null(),
-        );
-        DestroyMenu(menu);
-        usize::try_from(picked).unwrap_or(0)
-    }
 }
 
 /// Pede o WM_MOUSELEAVE a um botao nativo: sem ele a dica ficava a vista
@@ -3017,7 +2865,7 @@ impl<E> TimerQueue<E> {
 /// exactamente ate ao prazo mais proximo e entrega o evento ao event loop. Os
 /// tokens de invalidacao continuam do lado de quem agenda: um evento que chega
 /// tarde e ignorado por quem o recebe, como sempre foi.
-struct Timers {
+pub(in crate::windows_app) struct Timers {
     shared: Arc<(Mutex<TimerQueue<UserEvent>>, Condvar)>,
     /// So para o fallback: a thread de servico tem a sua propria copia.
     proxy: EventLoopProxy<UserEvent>,
@@ -3838,14 +3686,6 @@ impl App {
             // WebView e o `Focused` da janela nunca chegar.
             self.show_unseen_phase_end();
             self.resume_home_animation();
-        }
-    }
-
-    /// Um fim de fase do Pomodoro que a janela nao viu (estava minimizada ou
-    /// atras de outra) aparece quando ela volta -- uma vez.
-    fn show_unseen_phase_end(&mut self) {
-        if let Some(message) = self.pomodoro.window_back() {
-            self.show_background_splash(message, POMODORO_PHASE_END_SECONDS);
         }
     }
 
@@ -6629,7 +6469,7 @@ impl App {
 
     /// Aviso que chega sozinho, sem gesto nenhum (o fim de uma fase do
     /// Pomodoro): com a pergunta da rolagem a vista, espera por ela.
-    fn show_background_splash(&mut self, text: String, seconds: u64) {
+    pub(in crate::windows_app) fn show_background_splash(&mut self, text: String, seconds: u64) {
         if let Some(frame) = self
             .splash_board
             .show(text, seconds, SplashKind::Background)
@@ -8558,7 +8398,7 @@ impl App {
 
     /// Corre `script` no painel, ou guarda-o para o "ready" se a pagina
     /// ainda nao correu o script dela. Sem painel, nao faz nada.
-    fn panel_run(&mut self, script: String) {
+    pub(in crate::windows_app) fn panel_run(&mut self, script: String) {
         if let Some(script) = self.side_panel.run(script) {
             self.panel_eval(&script);
         }
@@ -8566,7 +8406,7 @@ impl App {
 
     /// Abre (se preciso -- nunca fecha) o painel ja nas Notas e corre la os
     /// `scripts`, pela ordem.
-    fn show_notes_panel(&mut self, scripts: Vec<String>) {
+    pub(in crate::windows_app) fn show_notes_panel(&mut self, scripts: Vec<String>) {
         if !self.side_panel.is_open() {
             self.open_side_panel();
         }
@@ -8747,139 +8587,6 @@ impl App {
     /// nova em branco no editor.
     fn new_note_in_panel(&mut self) {
         self.show_notes_panel(vec![PANEL_NEW_NOTE_SCRIPT.to_string()]);
-    }
-
-    /// Botao Notas (Zettelkasten): abre o painel do Ctrl+H ja na secao das
-    /// notas. Com o painel aberto quem decide e a pagina
-    /// (`PANEL_NOTES_BUTTON_SCRIPT`): nas Notas fecha -- salvando antes o
-    /// que o editor tinha, como o X --, no Historico passa para as Notas.
-    ///
-    /// A pagina do painel acabou de nascer e ainda nao correu o script dela:
-    /// um `evaluate_script` agora corria no documento vazio e perdia-se. Por
-    /// isso `show_notes_panel` guarda o `PANEL_SHOW_NOTES_SCRIPT` em
-    /// `panel_pending`, e o `PanelMessage::Ready` (o "pronto" que a pagina
-    /// manda no fim do script) corre-o.
-    fn open_notes(&mut self) {
-        if self.side_panel.is_open() {
-            self.panel_run(PANEL_NOTES_BUTTON_SCRIPT.to_string());
-            return;
-        }
-        self.show_notes_panel(Vec::new());
-    }
-
-    /// Clique no botao do Pomodoro (barra ou Home): parado inicia, a correr
-    /// pausa, pausado retoma.
-    fn pomodoro_click(&mut self) {
-        self.pomodoro_command(PomodoroCommand::Click);
-    }
-
-    /// Botao direito no Pomodoro: o menu nativo do estado de agora (so a
-    /// accao que se aplica, Pular fase, Parar e os presets com a marca no
-    /// que esta em uso).
-    fn pomodoro_menu(&mut self) {
-        let Some(owner) = self.window.as_ref().and_then(window_hwnd) else {
-            return;
-        };
-        let items = self.pomodoro.menu_items();
-        let picked = pick_pomodoro_from_menu(owner, &items);
-        if let Some(command) = pomodoro_menu_command(&items, picked) {
-            self.pomodoro_command(command);
-        }
-    }
-
-    /// Clique, menu e `pomodoro:` passam todos por aqui. A decisao e do
-    /// `PomodoroController`; aqui so se faz o que ele devolve.
-    fn pomodoro_command(&mut self, command: PomodoroCommand) {
-        // `run_command` agenda a cadeia nova em `self.timers` (gate:
-        // `only_one_tick_chain_is_ever_alive`).
-        let outcome = self
-            .pomodoro
-            .run_command(command, Instant::now(), &self.timers);
-        let saved = outcome.save.map(|settings| {
-            crate::pomodoro_ui::save_settings(&self.config.data_dir.join("pomodoro"), settings)
-        });
-        let notice = match saved {
-            Some(Err(error)) => Some(format!(
-                "Não foi possível gravar as opções do Pomodoro: {error}"
-            )),
-            _ => outcome.notice,
-        };
-        if let Some(notice) = notice {
-            self.show_splash(notice, POMODORO_NOTICE_SECONDS);
-        }
-        self.pomodoro_changed();
-    }
-
-    /// Um tique: o caminho inteiro e `pomodoro_ui::pomodoro_tick` (gate
-    /// `the_app_tick_announces_a_phase_end_as_the_window_can_see_it`): so o
-    /// da cadeia viva mexe no motor, o seguinte fica agendado e o fim de uma
-    /// fase toca o som, pisca a barra de tarefas e mostra o aviso conforme a
-    /// janela. O `App` so da as pecas (`impl PomodoroHost for App`).
-    fn pomodoro_tick(&mut self, token: u64) {
-        crate::pomodoro_ui::pomodoro_tick(self, token, Instant::now());
-    }
-
-    /// Minimizada e a da frente, para o fim de uma fase do Pomodoro.
-    fn window_attention(&self) -> WindowAttention {
-        use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-        let Some(window) = &self.window else {
-            return WindowAttention {
-                minimized: true,
-                foreground: false,
-            };
-        };
-        let foreground =
-            window_hwnd(window).is_some_and(|owner| unsafe { GetForegroundWindow() } == owner);
-        WindowAttention {
-            minimized: window.is_minimized().unwrap_or(false),
-            foreground,
-        }
-    }
-
-    /// O tempo mudou: repinta o botao (a barra, ou a Home) e, se a dica do
-    /// Pomodoro estiver a vista, poe-lhe o tempo novo sem a esconder.
-    fn pomodoro_changed(&mut self) {
-        let hovered = match self.surface {
-            Surface::Comparator => self.bar_hover == Some(BarHit::Tool(Tool::Pomodoro)),
-            Surface::Home => self.home_tool_hover == Some(Tool::Pomodoro),
-            _ => false,
-        };
-        if hovered {
-            refresh_hint_text(&tool_hint_at(
-                Tool::Pomodoro,
-                &self.pomodoro,
-                Instant::now(),
-            ));
-        }
-        if matches!(self.surface, Surface::Comparator | Surface::Home) {
-            self.request_redraw();
-        }
-    }
-
-    /// O tempo que falta no Pomodoro ("mm:ss", "⏸ mm:ss" pausado) para ir ao
-    /// lado do icone, ou `None` parado (o botao so com o icone).
-    fn pomodoro_label(&self) -> Option<String> {
-        self.pomodoro.label(Instant::now())
-    }
-
-    /// A etiqueta ja no formato que a barra e a Home desenham e medem, com a
-    /// fase para a cor.
-    fn pomodoro_bar_label(&self) -> Option<BarLabel> {
-        self.pomodoro_label()
-            .as_deref()
-            .and_then(BarLabel::new)
-            .map(|label| label.with_phase(self.pomodoro.active_phase()))
-    }
-
-    fn run_tool_action(&mut self, action: ToolAction) {
-        // O clique pode abrir um painel por cima do botao: a dica nao fica.
-        hover_tooltip(std::ptr::null_mut(), "");
-        match action {
-            ToolAction::PomodoroClick => self.pomodoro_click(),
-            ToolAction::PomodoroMenu => self.pomodoro_menu(),
-            ToolAction::ToggleNotes => self.open_notes(),
-            ToolAction::ToggleBreath => self.open_service_panel(Service::Breath),
-        }
     }
 
     /// Botao direito no comparador: nas ferramentas vai para elas (so o
@@ -12542,37 +12249,6 @@ fn reader_article_memory_text(article: &ReaderArticle) -> String {
         output.truncate(cut);
     }
     output
-}
-
-/// As pecas do `App` que o tique do Pomodoro usa (`pomodoro_ui::pomodoro_tick`).
-impl PomodoroHost for App {
-    type Timers = Timers;
-
-    fn pomodoro_parts(&mut self) -> (&mut PomodoroController, &Timers) {
-        (&mut self.pomodoro, &self.timers)
-    }
-
-    fn attention(&self) -> WindowAttention {
-        self.window_attention()
-    }
-
-    fn chime(&mut self) {
-        pomodoro_sound();
-    }
-
-    fn flash_taskbar(&mut self) {
-        if let Some(owner) = self.window.as_ref().and_then(window_hwnd) {
-            flash_taskbar(owner);
-        }
-    }
-
-    fn notice(&mut self, message: String) {
-        self.show_background_splash(message, POMODORO_PHASE_END_SECONDS);
-    }
-
-    fn repaint(&mut self) {
-        self.pomodoro_changed();
-    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
