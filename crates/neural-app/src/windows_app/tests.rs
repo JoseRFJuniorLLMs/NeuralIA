@@ -1,6 +1,8 @@
 use super::*;
 use std::ffi::OsString;
 use windows_sys::Win32::Graphics::Gdi::GetDIBits;
+use crate::gemini_live::{LiveAction, live_page_url, live_panel_navigation};
+use crate::panel_chrome::panel_width_from_drag;
 /// O fundo da Home acompanha a marca, nao disputa com ela.
 ///
 /// A versao anterior lancava particulas das margens e fazia-as convergir
@@ -5846,6 +5848,7 @@ fn shipped_source() -> String {
         .replace("pub(in crate::windows_app) fn ", "fn ");
     for app_content in [
         include_str!("../windows_app/app/navigation.rs"),
+        include_str!("../windows_app/app/panels.rs"),
         include_str!("../windows_app/app/gmail.rs"),
         include_str!("../windows_app/app/tools.rs"),
     ] {
@@ -15704,7 +15707,9 @@ fn breath_panel_is_private_denies_media_and_stays_on_youtube() {
 /// do que la corre chega ao NeuralIA.
 #[test]
 fn service_panels_never_reach_history_or_memory() {
-    let source = include_str!("../windows_app.rs");
+    let wap = include_str!("../windows_app.rs");
+    let pan = include_str!("../windows_app/app/panels.rs");
+    let source = format!("{wap}\n{pan}").replace("pub(in crate::windows_app) fn ", "fn ");
     let body = source
         .split("fn open_service_panel(&mut self")
         .nth(1)
