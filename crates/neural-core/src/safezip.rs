@@ -953,7 +953,7 @@ fn le64(bytes: &[u8], at: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::epub::test_support::ZipBuilder;
+    use crate::epub::test_support::{RawEntry, ZipBuilder};
 
     #[test]
     fn epub_policy_is_unchanged_by_the_safezip_move() {
@@ -975,28 +975,152 @@ mod tests {
         assert_eq!(MAX_COMMENT_LEN, ZipPolicy::EPUB.max_comment_len);
     }
 
-    #[test]
-    fn central_directory_truncations_and_bit_flips_never_panic() {
-        let seed = ZipBuilder::new()
+    /// Um EPUB pequeno cujas entradas têm nome, campo extra e comentário, para
+    /// os cortes caírem dentro de cada parte de um registro central.
+    fn mutation_seed(zip64: bool) -> Vec<u8> {
+        let mut noted = RawEntry::deflated("OEBPS/chapter.xhtml", b"<p>Texto de teste</p>");
+        // Um campo extra desconhecido (id 0xFECA) antes do ZIP64, e um comentário.
+        noted.extra = vec![0xCA, 0xFE, 4, 0, 1, 2, 3, 4];
+        noted.comment = b"comentario".to_vec();
+        let builder = ZipBuilder::new()
             .stored("mimetype", b"application/epub+zip")
-            .deflated("chapter.xhtml", b"<p>Texto de teste</p>")
-            .build();
+            .entry(noted)
+            .stored("OEBPS/b.xhtml", b"<p>b</p>");
+        if zip64 { builder.zip64() } else { builder }.build()
+    }
+
+    /// Onde está o diretório central de um ZIP do `ZipBuilder` (sem comentário
+    /// no fim): `(entradas, offset, tamanho)`.
+    fn directory_of(seed: &[u8], zip64: bool) -> (u64, usize, usize) {
+        let eocd = seed.len() - EOCD_LEN;
+        assert_eq!(le32(seed, eocd), EOCD_SIG);
+        if zip64 {
+            let record = eocd - ZIP64_LOCATOR_LEN - ZIP64_EOCD_LEN;
+            assert_eq!(le32(seed, record), ZIP64_EOCD_SIG);
+            (
+                le64(seed, record + 32),
+                le64(seed, record + 48) as usize,
+                le64(seed, record + 40) as usize,
+            )
+        } else {
+            (
+                u64::from(le16(seed, eocd + 10)),
+                le32(seed, eocd + 16) as usize,
+                le32(seed, eocd + 12) as usize,
+            )
+        }
+    }
+
+    /// O `seed` com o diretório central cortado em `keep` bytes e um fim novo
+    /// que declara exatamente esse tamanho (e as mesmas entradas): a busca do
+    /// fim e a conferência de que o diretório cabe no arquivo passam, e o
+    /// corte chega ao parser do diretório central.
+    fn with_directory_cut(seed: &[u8], zip64: bool, keep: usize) -> Vec<u8> {
+        let (entries, offset, _) = directory_of(seed, zip64);
+        let mut out = seed[..offset + keep].to_vec();
+        if zip64 {
+            let record = out.len() as u64;
+            out.extend_from_slice(&ZIP64_EOCD_SIG.to_le_bytes());
+            out.extend_from_slice(&44u64.to_le_bytes());
+            out.extend_from_slice(&45u16.to_le_bytes());
+            out.extend_from_slice(&45u16.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&entries.to_le_bytes());
+            out.extend_from_slice(&entries.to_le_bytes());
+            out.extend_from_slice(&(keep as u64).to_le_bytes());
+            out.extend_from_slice(&(offset as u64).to_le_bytes());
+            out.extend_from_slice(&ZIP64_LOCATOR_SIG.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&record.to_le_bytes());
+            out.extend_from_slice(&1u32.to_le_bytes());
+        }
+        let (count, size, start) = if zip64 {
+            (u16::MAX, u32::MAX, u32::MAX)
+        } else {
+            (entries as u16, keep as u32, offset as u32)
+        };
+        out.extend_from_slice(&EOCD_SIG.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&start.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    fn parse_without_panic(bytes: Vec<u8>, what: &str) -> EpubResult<EpubArchive> {
+        std::panic::catch_unwind(|| EpubArchive::from_bytes(bytes))
+            .unwrap_or_else(|_| panic!("o parser panicou: {what}"))
+    }
+
+    /// Cada corte do diretório central (clássico e ZIP64), com um fim que o
+    /// declara do tamanho cortado, chega ao parser do diretório central e sai
+    /// dele com o erro de truncagem, sem pânico. Sem este fim fabricado os
+    /// cortes paravam todos na busca do fim do diretório (ver o teste seguinte)
+    /// e o parser nunca era exercido por eles.
+    #[test]
+    fn central_directory_cuts_reach_the_directory_parser_and_never_panic() {
+        for zip64 in [false, true] {
+            let seed = mutation_seed(zip64);
+            let (entries, _, size) = directory_of(&seed, zip64);
+            assert_eq!(entries, 3);
+            assert!(size <= 4096, "o diretório central da semente cabe em 4 KiB");
+            // Sem corte, o fim fabricado abre o mesmo ZIP: a fabricação está certa.
+            let whole = parse_without_panic(with_directory_cut(&seed, zip64, size), "sem corte")
+                .expect("o diretório inteiro com o fim fabricado abre");
+            assert_eq!(whole.len(), 3);
+            for keep in 0..size {
+                let cut = with_directory_cut(&seed, zip64, keep);
+                let what = format!("zip64={zip64}, diretório cortado em {keep} de {size}");
+                match parse_without_panic(cut, &what) {
+                    Err(EpubError::NotZip(reason)) if reason == "diretório central truncado" => {}
+                    other => {
+                        panic!("{what}: esperado o erro do parser do diretório, veio {other:?}")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cortes no fim do arquivo param na busca do fim do diretório central
+    /// (o registro de fim fica sem os seus 22 bytes): recusados, sem pânico.
+    #[test]
+    fn tail_cuts_stop_at_the_end_record_search_and_never_panic() {
+        let seed = mutation_seed(false);
         assert!(EpubArchive::from_bytes(seed.clone()).is_ok());
         for len in 0..seed.len().min(4096) {
-            let bytes = seed[..len].to_vec();
-            assert!(
-                std::panic::catch_unwind(|| EpubArchive::from_bytes(bytes)).is_ok(),
-                "parser panicou após corte em {len}"
-            );
+            let what = format!("arquivo cortado em {len}");
+            match parse_without_panic(seed[..len].to_vec(), &what) {
+                Err(EpubError::NotZip(reason))
+                    if reason == "arquivo pequeno demais"
+                        || reason == "fim do diretório central não encontrado" => {}
+                other => panic!("{what}: veio {other:?}"),
+            }
         }
-        for flip in 0..257usize {
-            let mut bytes = seed.clone();
-            let offset = flip.wrapping_mul(97) % bytes.len();
-            bytes[offset] ^= 1 << (flip % 8);
-            assert!(
-                std::panic::catch_unwind(|| EpubArchive::from_bytes(bytes)).is_ok(),
-                "parser panicou após bit flip {flip}"
-            );
+    }
+
+    /// 257 bit flips no arquivo inteiro e 257 dentro do diretório central, nas
+    /// duas formas (clássica e ZIP64): nenhum pânico.
+    #[test]
+    fn central_directory_bit_flips_never_panic() {
+        for zip64 in [false, true] {
+            let seed = mutation_seed(zip64);
+            assert!(EpubArchive::from_bytes(seed.clone()).is_ok());
+            let (_, offset, size) = directory_of(&seed, zip64);
+            for flip in 0..257usize {
+                for (region, at) in [
+                    ("arquivo", flip.wrapping_mul(97) % seed.len()),
+                    ("diretório", offset + flip.wrapping_mul(31) % size),
+                ] {
+                    let mut bytes = seed.clone();
+                    bytes[at] ^= 1 << (flip % 8);
+                    let what = format!("zip64={zip64}, bit flip {flip} no {region} (byte {at})");
+                    let _ = parse_without_panic(bytes, &what);
+                }
+            }
         }
     }
 }
