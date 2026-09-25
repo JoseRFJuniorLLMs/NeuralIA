@@ -93,7 +93,7 @@ de prompt desligada. O código sabotado nunca sai da máquina.
 
 ### 4.3 Testar o que embarca, não uma biblioteca paralela
 
-Um teste que exercita uma biblioteca que o produto não usa não prova nada sobre o produto. `neural-app` é um binário, mas isso **não** é impedimento: o bloco `#[cfg(test)] mod tests` dentro do próprio `windows_app.rs` alcança as funções privadas. É lá que os gates do produto vivem.
+Um teste que exercita uma biblioteca que o produto não usa não prova nada sobre o produto. `neural-app` é um binário, mas isso **não** é impedimento: o módulo `windows_app/tests.rs` (o `#[cfg(test)] mod tests` do `windows_app.rs`) alcança as funções privadas de toda a árvore `windows_app/`. É lá que os gates do produto vivem.
 
 Quando a decisão está entalada dentro de um método `&mut self` cheio de UI, extrai-se a decisão para uma função que não toca em janelas (`decide_agent_step` é o modelo) e testa-se essa. Asserções sobre o **texto do ficheiro-fonte** não são gates de comportamento: falham com um `rustfmt` e passam com o código desligado. Servem só para proibir a *presença* de algo, nunca para afirmar que algo funciona.
 

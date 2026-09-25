@@ -102,7 +102,7 @@ which the shipped `request_note_from_page` calls. Gates:
 `salvar_nota_saves_one_note_with_the_native_source_and_never_twice_in_two_seconds`,
 `salvar_nota_saves_the_readers_text_even_when_the_page_swaps_get_selection` and
 `salvar_nota_sends_only_what_fits_in_the_channel`
-(`crates/neural-app/src/windows_app.rs`).
+(`crates/neural-app/src/windows_app/tests.rs`).
 
 `link` reports a click on a link inside a comparator column. Its arguments are
 exactly `col`, `url` and `aside` (boolean); `url` goes through the same
@@ -111,7 +111,7 @@ opens in the Split panel beside the emitting column. With `aside=false` it
 navigates all three comparator columns to that URL. It is the one action whose
 effect reaches columns other than the one that emitted it (gate:
 `a_plain_click_opens_in_all_three_panels_and_ctrl_click_opens_beside` in
-`crates/neural-app/src/windows_app.rs`; argument policy:
+`crates/neural-app/src/windows_app/tests.rs`; argument policy:
 `a_link_click_obeys_the_same_policy_as_the_split` in `ipc.rs`).
 
 `hint` reports that the pointer entered (or left) one of the controls the
@@ -123,7 +123,7 @@ itself, and the native side picks the text ("Minimizar <AI>", "Expandir <AI>")
 and shows it in the app's centered hint. Gates:
 `hint_names_one_of_three_closed_hints_for_its_own_column` (`ipc.rs`) and
 `column_controls_ask_for_the_centered_hint_on_trusted_hover`
-(`windows_app.rs`, runs the shipped script under Node).
+(`windows_app/tests.rs`, runs the shipped script under Node).
 
 `ask` reports a question the user typed and sent in a comparator column (Enter
 or the send button, trusted events only, on the column's own AI page). Its
@@ -131,7 +131,7 @@ arguments are exactly `col` and `text` (1..=2000 characters after trimming,
 no control characters except newline and tab). The OTHER columns load the same
 question in their own provider; the emitting column is not touched. Gates:
 `ask_carries_the_typed_question_within_bounds` (`ipc.rs`) and
-`a_question_typed_in_one_column_goes_to_the_others` (`windows_app.rs`).
+`a_question_typed_in_one_column_goes_to_the_others` (`windows_app/tests.rs`).
 
 `search` reports the "🤖 Mandar para IA" and "🌐 Traduzir" buttons of the
 selection toolbar. The toolbar is part of the keyboard-shortcut script and is offered in the comparator
@@ -270,7 +270,7 @@ as a tab in the group of the tab it came from) are all set by
 `double_clicking_a_word_in_a_column_selects_it_instead_of_expanding`,
 `a_selected_search_reaches_the_comparator_from_every_surface_but_the_private_split`
 and `a_selected_search_is_a_question_never_an_omnibox_command`
-(`windows_app.rs`).
+(`windows_app/tests.rs`).
 
 Every accepted message MUST carry the per-WebView capability token. The token:
 
