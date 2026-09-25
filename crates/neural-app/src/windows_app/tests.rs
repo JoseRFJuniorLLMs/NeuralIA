@@ -5414,7 +5414,7 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
     // O comportamento destes caminhos esta em
     // the_app_path_saves_restores_and_forgets_the_real_tabs_json (sobre o
     // `TabPersistence`); aqui so se prende que o App os chama.
-    let forget_body = body("fn forget_tab_session", "fn activate_comparator");
+    let forget_body = body("fn forget_tab_session", "fn context_tab_identity");
     assert!(forget_body.contains(".forget(&mut comp.contexts, &mut comp.groups, split)"));
 
     // Sair do comparador (Home, Reader, Web) grava antes de o destruir, e

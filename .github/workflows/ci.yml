@@ -166,6 +166,7 @@ jobs:
             @{
               Label = "join-current-group"
               Test = "current_group_is_not_offered_as_a_join_target"
+              SourcePath = "crates/neural-app/src/windows_app/app/tabs.rs"
               Old = @'
                   .filter(|(_, group)| Some(group.id) != current_group)
           '@
