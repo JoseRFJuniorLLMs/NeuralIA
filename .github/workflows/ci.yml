@@ -274,6 +274,19 @@ jobs:
               New = @'
               if body.len() > PANEL_MESSAGE_ABSOLUTE_MAX_BYTES {
           '@
+            },
+            @{
+              Label = "clear-history-skips-a-registered-target"
+              Test = "clear_history_runs_every_registered_target"
+              SourcePath = "crates/neural-app/src/windows_app/clear_history.rs"
+              Old = @'
+                  sink.clear(*target);
+          '@
+              New = @'
+                  if *target != ClearTarget::Memory {
+                      sink.clear(*target);
+                  }
+          '@
             }
           )
 

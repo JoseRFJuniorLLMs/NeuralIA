@@ -6930,6 +6930,10 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ),
     ("notes.rs", include_str!("windows_app/notes.rs")),
     ("side_panel.rs", include_str!("windows_app/side_panel.rs")),
+    (
+        "clear_history.rs",
+        include_str!("windows_app/clear_history.rs"),
+    ),
     ("services.rs", include_str!("windows_app/services.rs")),
     ("search_card.rs", include_str!("windows_app/search_card.rs")),
     ("tests.rs", include_str!("windows_app/tests.rs")),
@@ -6988,6 +6992,9 @@ pub(in crate::windows_app) use notes::*;
 
 pub(in crate::windows_app) mod side_panel;
 pub(in crate::windows_app) use side_panel::*;
+pub(in crate::windows_app) mod clear_history;
+#[allow(unused_imports)]
+pub(in crate::windows_app) use clear_history::*;
 pub(in crate::windows_app) mod services;
 pub(in crate::windows_app) use services::*;
 pub(in crate::windows_app) mod search_card;

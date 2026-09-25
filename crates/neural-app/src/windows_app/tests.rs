@@ -5584,6 +5584,47 @@ fn private_palette_paths_never_touch_history_or_context_tabs() {
 /// `tab_session_gates`. Isto so prende que os caminhos que embarcam
 /// chamam as funcoes que esses gates provam -- um `TabPersistence::forget`
 /// perfeito que "Apagar historico" deixasse de chamar nao apagava nada.
+/// Gate (critico: apaga dados do utilizador): o percurso do "Apagar
+/// historico" que embarca (`clear_history_targets`, o mesmo que o `App`
+/// corre depois do Sim) chega a CADA alvo registado, pela ordem da tabela,
+/// uma vez so; e a tabela cobre todos os alvos que existem -- esquecer um
+/// (tabs, memoria, livros, historico) fica vermelho aqui.
+#[test]
+fn clear_history_runs_every_registered_target() {
+    struct Recorder(Vec<ClearTarget>);
+    impl ClearHistorySink for Recorder {
+        fn clear(&mut self, target: ClearTarget) {
+            self.0.push(target);
+        }
+    }
+    let mut recorder = Recorder(Vec::new());
+    clear_history_targets(&mut recorder);
+    assert_eq!(
+        recorder.0,
+        ClearTarget::ALL.to_vec(),
+        "cada alvo registado, uma vez, pela ordem"
+    );
+    // Tudo o que existe esta registado, e o historico -- que muda de ecra
+    // e escreve o estado -- vai por ultimo.
+    for target in [
+        ClearTarget::Tabs,
+        ClearTarget::Memory,
+        ClearTarget::EpubLibrary,
+        ClearTarget::History,
+    ] {
+        assert_eq!(
+            CLEAR_HISTORY_TARGETS
+                .iter()
+                .filter(|registered| **registered == target)
+                .count(),
+            1,
+            "{target:?} tem de estar registado uma vez"
+        );
+    }
+    assert_eq!(CLEAR_HISTORY_TARGETS.last(), Some(&ClearTarget::History));
+    assert_eq!(CLEAR_HISTORY_TARGETS.len(), 4);
+}
+
 #[test]
 fn the_shipped_paths_are_wired_to_the_tab_session() {
     let source = shipped_source();
@@ -5596,19 +5637,32 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
             .to_string()
     };
 
-    let clear = body(
-        "UserEvent::ClearHistory => {",
+    // O braco do event loop e uma linha: pergunta e percorre a tabela dos
+    // alvos (`clear_history.rs`); o gate de comportamento e
+    // clear_history_runs_every_registered_target.
+    let arm = body(
+        "UserEvent::ClearHistory => ",
         "UserEvent::HistoryCleared(result)",
+    );
+    assert!(
+        arm.contains("self.clear_history()"),
+        "o braco ClearHistory chama App::clear_history"
+    );
+    let clear = body(
+        "fn clear_history(&mut self)",
+        "clear_history_targets(self);",
     );
     let confirm = clear
         .find("self.confirm_clear_history()")
         .expect("clearing history asks first");
-    let forget = clear
-        .find("self.forget_tab_session();")
-        .expect("\"Apagar histórico\" must also forget tabs.json");
     assert!(
-        confirm < forget,
-        "tabs.json is wiped only after the owner confirms"
+        clear[confirm..].contains("return;"),
+        "sem o Sim nao se percorre a tabela"
+    );
+    let sink = body("impl ClearHistorySink for App", "impl App {");
+    assert!(
+        sink.contains("ClearTarget::Tabs => self.forget_tab_session(),"),
+        "\"Apagar histórico\" must also forget tabs.json"
     );
     // O comportamento destes caminhos esta em
     // the_app_path_saves_restores_and_forgets_the_real_tabs_json (sobre o
@@ -6040,15 +6094,16 @@ fn epub_pages_reach_native_code_only_through_their_own_channel() {
         );
     }
 
-    // "Apagar historico" apaga tambem a leitura dos livros.
-    let clear = body(
-        &source,
-        "UserEvent::ClearHistory => {",
-        "UserEvent::HistoryCleared(result)",
-    );
+    // "Apagar historico" apaga tambem a leitura dos livros: o alvo
+    // EpubLibrary da tabela (`clear_history.rs`) manda o trabalho ao worker.
+    let clear = body(&source, "impl ClearHistorySink for App", "impl App {");
     assert!(
         clear.contains("self.submit_epub_job(EpubJob::ClearReadingHistory)"),
         "ClearHistory tem de mandar EpubJob::ClearReadingHistory"
+    );
+    assert!(
+        clear.contains("ClearTarget::EpubLibrary => {"),
+        "o alvo dos livros tem de estar registado"
     );
 
     // Ficheiros largados: um evento por ficheiro, o lote inteiro no

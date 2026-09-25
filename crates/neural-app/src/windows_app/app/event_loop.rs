@@ -188,33 +188,9 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::NewNote => self.new_note_in_panel(),
             UserEvent::Live(message) => self.handle_live_message(message),
             UserEvent::GmailAnswer(open) => self.answer_gmail(open),
-            UserEvent::ClearHistory => {
-                if !self.confirm_clear_history() {
-                    return;
-                }
-                self.forget_tab_session();
-                self.memory.clear(&mut self.current_research);
-                // Na biblioteca de livros, some quando cada livro foi aberto
-                // ("Continuar lendo", recentes); posições e marcadores ficam.
-                if self.epub.is_some()
-                    || self
-                        .config
-                        .data_dir
-                        .join("library")
-                        .join(neural_core::library::INDEX_FILE)
-                        .exists()
-                {
-                    self.submit_epub_job(EpubJob::ClearReadingHistory);
-                }
-                match self.history.clear() {
-                    None => {
-                        self.show_home();
-                        self.status = Some("A apagar o histórico local…".to_string());
-                        self.request_redraw();
-                    }
-                    Some(result) => self.report_history_cleared(result),
-                }
-            }
+            // Pergunta e depois percorre a tabela dos alvos
+            // (`clear_history::CLEAR_HISTORY_TARGETS`), um braco so.
+            UserEvent::ClearHistory => self.clear_history(),
             UserEvent::HistoryCleared(result) => self.report_history_cleared(result),
             UserEvent::HistoryLoaded(result) => {
                 if self.side_panel.is_open() {
