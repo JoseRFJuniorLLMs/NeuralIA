@@ -33,3 +33,7 @@ pub(super) use compare::*;
 pub(super) mod tabs;
 #[allow(unused_imports)]
 pub(super) use tabs::*;
+
+pub(super) mod event_loop;
+#[allow(unused_imports)]
+pub(super) use event_loop::*;
