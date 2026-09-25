@@ -88,7 +88,8 @@ impl SpikeHost {
     }
 
     /// Os hospedeiros que carregam a pagina de fixture de 127.0.0.1: o
-    /// `open` deles exige o endereco.
+    /// `open` deles exige o endereco. A coluna aceita-o sem o exigir (sem
+    /// ele fica na pagina ao vivo; ver `column_fixture_navigation`).
     pub(crate) fn loads_fixture(self) -> bool {
         matches!(
             self,
@@ -257,6 +258,30 @@ pub(crate) fn is_loopback_fixture(url: &str) -> bool {
         && parsed.port().is_some()
         && parsed.username().is_empty()
         && parsed.password().is_none()
+}
+
+/// A origem (`http://127.0.0.1:<porta>`) de uma URL da fixture; `None` para
+/// qualquer outra URL.
+pub(crate) fn fixture_origin(url: &str) -> Option<String> {
+    if !is_loopback_fixture(url) {
+        return None;
+    }
+    Url::parse(url)
+        .ok()
+        .map(|parsed| parsed.origin().ascii_serialization())
+}
+
+/// A excecao de navegacao da coluna, so no exe do spike: a coluna pode ir
+/// para `target` quando o condutor ja pediu a fixture nela (`open Column
+/// <url>`, que guarda a origem em `fixture`) e `target` e exatamente dessa
+/// origem -- http, 127.0.0.1 e a porta da fixture. Tudo o resto fica com o
+/// gate que embarca (`comparator_webview_builder`), que este codigo nao
+/// toca; sem o pedido do condutor nem a fixture passa.
+pub(crate) fn column_fixture_navigation(target: &str, fixture: Option<&str>) -> bool {
+    match (fixture, fixture_origin(target)) {
+        (Some(allowed), Some(origin)) => origin == allowed,
+        _ => false,
+    }
 }
 
 /// `<seq> <verbo> <Hospedeiro> [argumento]`, uma linha.
@@ -683,6 +708,19 @@ mod tests {
             parse_spike_command("12 focus Service").map(|command| command.verb),
             Ok(SpikeVerb::Focus)
         );
+        // A coluna aceita a fixture (a pagina do brief, sem rede) ou nada (a
+        // pagina ao vivo que o NEURALIA_STARTUP_INPUT abriu).
+        assert_eq!(
+            parse_spike_command("13 open Column http://127.0.0.1:5123/fixture.html")
+                .map(|command| command.verb),
+            Ok(SpikeVerb::Open(Some(
+                "http://127.0.0.1:5123/fixture.html".to_string()
+            )))
+        );
+        assert_eq!(
+            parse_spike_command("14 open Column").map(|command| command.verb),
+            Ok(SpikeVerb::Open(None))
+        );
 
         for refused in [
             "",
@@ -703,6 +741,49 @@ mod tests {
             "1 close Column",
         ] {
             assert!(parse_spike_command(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn the_column_fixture_exception_is_the_exact_fixture_origin_only() {
+        let origin = fixture_origin("http://127.0.0.1:5123/fixture.html");
+        assert_eq!(origin.as_deref(), Some("http://127.0.0.1:5123"));
+        let allowed = origin.as_deref();
+        assert!(column_fixture_navigation(
+            "http://127.0.0.1:5123/fixture.html",
+            allowed
+        ));
+        assert!(column_fixture_navigation(
+            "http://127.0.0.1:5123/fixture.html?x=1#y",
+            allowed
+        ));
+        for refused in [
+            "http://127.0.0.1:5124/fixture.html",
+            "https://127.0.0.1:5123/fixture.html",
+            "http://localhost:5123/fixture.html",
+            "http://127.0.0.2:5123/fixture.html",
+            "http://[::1]:5123/fixture.html",
+            "http://user@127.0.0.1:5123/fixture.html",
+            "http://127.0.0.1/fixture.html",
+            "http://192.168.0.1:5123/fixture.html",
+            "https://www.google.com/search?q=x",
+            "about:blank",
+            "neuralia:home",
+            "",
+        ] {
+            assert!(!column_fixture_navigation(refused, allowed), "{refused:?}");
+        }
+        // Sem o `open Column <url>` do condutor, nem a propria fixture passa.
+        assert!(!column_fixture_navigation(
+            "http://127.0.0.1:5123/fixture.html",
+            None
+        ));
+        for refused in [
+            "https://www.google.com/",
+            "http://localhost:5123/",
+            "http://127.0.0.1/",
+        ] {
+            assert_eq!(fixture_origin(refused), None, "{refused:?}");
         }
     }
 

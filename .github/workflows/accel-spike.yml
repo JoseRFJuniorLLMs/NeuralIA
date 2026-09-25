@@ -22,14 +22,19 @@ jobs:
   accel-spike:
     # A release exe WITH the CI-only cargo feature `accel-spike`: an
     # AcceleratorKeyPressed with Handled=TRUE on every WebView kind, driven by
-    # scripts/test-accel-spike.ps1, which prints the per-host table and fails
-    # if any default native chord fails the pass rule (page keydown never sees
-    # it, no NEURALIA_KEYMAP_SCRIPT act() fires, the native side fires exactly
-    # once, auto-repeat included) or if the run is invalid (no key reached any
-    # AcceleratorKeyPressed). This exe never leaves the job: no
-    # upload-artifact, and no job needs it. The published exe is the `windows`
-    # job of ci.yml, built without the feature (test-accel-spike-marker.ps1
-    # -Expect Absent there).
+    # scripts/test-accel-spike.ps1, which prints the per-host table (log and
+    # step summary) of the pass rule (page keydown never sees the chord, no
+    # NEURALIA_KEYMAP_SCRIPT act() fires, the native side fires exactly once,
+    # auto-repeat included). Exit policy (lead decision, see the script
+    # header): the deliverable is the table, so the E2E step exits 0 when the
+    # table is complete and the run is valid EVEN IF chords fail the rule
+    # (they are for the owner's section-7 decision), and fails only on a
+    # harness error or an INVALID run (no key reached any
+    # AcceleratorKeyPressed). A host that cannot be opened, focused or stops
+    # answering is recorded "invalido" with the reason and the run goes on.
+    # This exe never leaves the job: no upload-artifact, and no job needs it.
+    # The published exe is the `windows` job of ci.yml, built without the
+    # feature (test-accel-spike-marker.ps1 -Expect Absent there).
     runs-on: windows-latest
     timeout-minutes: 50
     steps:
@@ -52,8 +57,9 @@ jobs:
         shell: pwsh
         run: ./scripts/test-accel-spike.ps1 -ExePath target/release/NeuralIA.exe -TablePath accel-spike-table.md
       # Proves the probe (AGENTS.md 4.2): with Handled=false the same E2E must
-      # report that the page saw the key. Runs even when the table failed, so
-      # a red table always comes with the proof that the probe can see a leak.
+      # report that the page saw the key -- its own rule: this step fails if
+      # no leak is seen. Runs even when the E2E step failed, so a harness
+      # error there still comes with the proof that the probe can see a leak.
       - name: Sabotage Handled=false must make the E2E report that the page saw the key
         if: ${{ !cancelled() }}
         shell: pwsh
