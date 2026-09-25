@@ -47,7 +47,7 @@ wry = { version = "0.57", features = ["devtools"] }
 # ContextMenuRequested (ICoreWebView2_11); sem estes nomes o item "rolagem
 # automatica" do botao direito das colunas nao se consegue registar.
 webview2-com = "0.39.1"
-windows-core = "0.62.2"
+windows-core = "0.100.0"
 
 [target.'cfg(windows)'.dev-dependencies]
 # So para os testes lerem o recurso de icone do NeuralIA.exe compilado
