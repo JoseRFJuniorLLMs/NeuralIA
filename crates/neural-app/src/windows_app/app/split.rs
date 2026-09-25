@@ -671,6 +671,9 @@ impl App {
     }
 }
 
+/// O que uma fonte aberta em Split View deixa na memória semântica: o título e
+/// o documento, ou **nada** quando o painel é privado.
+///
 /// "Private/incognito navigation never enters semantic memory" está na lista de
 /// restrições inegociáveis do `md/README.md`. É aqui que isso se decide para
 /// este caminho, fora de qualquer janela, para um teste poder ficar vermelho se

@@ -2254,18 +2254,25 @@ fn leaving_a_web_surface_turns_gemini_live_off() {
     );
 
     // Cada metodo que poe outra superficie passa pela saida unica (ou,
-    // como a Home, fecha o Gemini Live ele proprio).
+    // como a Home, fecha o Gemini Live ele proprio). As superficies vem
+    // do proprio `enum Surface`: uma variante nova entra no gate sem
+    // ninguem se lembrar de a acrescentar aqui. Com a lista escrita a mao
+    // o Epub ficou de fora e open_epub_page podia deixar a captura a
+    // correr num painel escondido sem este gate dar por isso.
+    let surfaces: Vec<String> = body("enum Surface {", "\n}\n")
+        .lines()
+        .map(|line| line.trim().trim_end_matches(','))
+        .filter(|name| !name.is_empty() && !name.starts_with("///") && *name != "Comparator")
+        .map(|name| format!("self.surface = Surface::{name};"))
+        .collect();
+    assert!(
+        surfaces.len() >= 5 && surfaces.iter().any(|s| s.ends_with("Surface::Epub;")),
+        "enum Surface mal lido: {surfaces:?}"
+    );
     let mut checked = 0;
     for method in source.split("\n    fn ").skip(1) {
         let name = method.split('(').next().unwrap_or_default();
-        let leaves = [
-            "Surface::Home;",
-            "Surface::External;",
-            "Surface::Reader;",
-            "Surface::Pdf;",
-        ]
-        .iter()
-        .any(|surface| method.contains(&format!("self.surface = {surface}")));
+        let leaves = surfaces.iter().any(|surface| method.contains(surface));
         if !leaves {
             continue;
         }
@@ -2276,7 +2283,7 @@ fn leaving_a_web_surface_turns_gemini_live_off() {
             "{name} troca de superficie sem desligar o Gemini Live"
         );
     }
-    assert!(checked >= 8, "so {checked} metodos trocam de superficie?");
+    assert!(checked >= 9, "so {checked} metodos trocam de superficie?");
 }
 
 /// O painel pinta ja com as cores do tema do app (claro e escuro), antes
@@ -5442,7 +5449,16 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
     assert!(observe.contains(".observe(&comp.contexts, &comp.groups, comparator_split_key(comp))"));
 
     // As duas entradas do comparador passam pelo mesmo modelo.
-    let open = body("fn open_comparator", "fn observe_tab_session");
+    // open_comparator vive em app/compare.rs e activate_comparator e o
+    // metodo que se lhe segue. O observe_tab_session que fechava a regiao
+    // no ficheiro unico esta em app/tabs.rs: com ele a regiao atravessava
+    // o resto de compare.rs e um `self.tab_session.restore()` em qualquer
+    // desses metodos (ou num comentario) mantinha o gate verde.
+    let open = body("fn open_comparator", "fn activate_comparator");
+    assert!(
+        !open.contains("\n    fn "),
+        "a regiao de open_comparator apanha mais do que um metodo"
+    );
     let (reuse, fresh) = open
         .split_once("let size = window.inner_size();")
         .expect("reuse and fresh paths");
@@ -5912,6 +5928,20 @@ fn all_sources_lists_every_module() {
         registered, dir_files,
         "ALL_MODULES must list every file under src/windows_app (app/ included) without escaping"
     );
+
+    // O nome sozinho nao prova o conteudo: uma entrada que apontasse o
+    // include_str! a outro ficheiro escondia o ficheiro certo de todos os
+    // gates que leem shipped_source/all_sources, com a lista de nomes
+    // ainda igual ao disco.
+    for (name, content) in ALL_MODULES {
+        let on_disk = std::fs::read_to_string(dir.join(name))
+            .unwrap_or_else(|error| panic!("read src/windows_app/{name}: {error}"))
+            .replace("\r\n", "\n");
+        assert!(
+            content.replace("\r\n", "\n") == on_disk,
+            "ALL_MODULES entry {name} does not hold the text of that file"
+        );
+    }
 }
 
 /// Este ficheiro com fins de linha LF. Num checkout Windows com

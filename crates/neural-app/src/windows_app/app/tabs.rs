@@ -716,12 +716,7 @@ impl App {
     /// recolher/expandir, desagrupar e fechar -- o menu do grupo do Chrome.
     /// `at_chip`: abre por baixo da pilula (o grupo acabou de nascer), nao no
     /// rato.
-    pub(in crate::windows_app) fn show_group_menu(
-        &mut self,
-        source_index: usize,
-        group_index: usize,
-        at_chip: bool,
-    ) {
+    fn show_group_menu(&mut self, source_index: usize, group_index: usize, at_chip: bool) {
         use windows_sys::Win32::UI::WindowsAndMessaging::{MF_DISABLED, MF_GRAYED};
         let Some(hwnd) = self.window.as_ref().and_then(window_hwnd) else {
             return;

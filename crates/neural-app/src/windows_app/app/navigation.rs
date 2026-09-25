@@ -25,12 +25,8 @@ use crate::windows_app::{
 };
 use neural_core::parse_intent;
 
-/// Quantas entradas recentes o menu e a ajuda mostram.
+/// Quantas entradas do historico a caixa "history:" mostra.
 pub(in crate::windows_app) const HISTORY_RECENT_LIMIT: usize = 20;
-
-/// A ajuda de um `traduzir:` sem texto.
-pub(in crate::windows_app) const TRANSLATE_COMMAND_HELP: &str =
-    "Escreva o texto depois de traduzir:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::windows_app) enum HistoryStep {
@@ -72,6 +68,9 @@ pub(in crate::windows_app) fn clear_history_confirmed(answer: i32) -> bool {
     answer == IDYES
 }
 
+/// Para onde vai o texto que o utilizador submeteu, decidido sem tocar na
+/// janela, na memória, na rede nem no agente. É a SPEC-0106 -- a composição do
+/// produto -- num sítio onde um teste lhe consegue chegar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::windows_app) enum InputRoute {
     Agent(String),
@@ -98,6 +97,10 @@ pub(in crate::windows_app) enum InputRoute {
     /// Sem comando próprio: segue para o `parse_intent`.
     Intent,
 }
+
+/// A ajuda de um `traduzir:` sem texto.
+pub(in crate::windows_app) const TRANSLATE_COMMAND_HELP: &str =
+    "Escreva o texto depois de traduzir:";
 
 /// `text` sem `prefix` a frente, se comecar por ele (maiusculas ou nao).
 pub(in crate::windows_app) fn strip_prefix_ignore_ascii_case<'a>(
@@ -243,6 +246,11 @@ pub(in crate::windows_app) fn route_palette(
     }
 }
 
+/// Ctrl+O na omnibox da Home: o diálogo "Adicionar livros EPUB". Só nativo
+/// (a janela principal responde o mesmo em `main_window_shortcut`); o mapa de
+/// teclas das páginas (`NEURALIA_KEYMAP_SCRIPT`) não o conhece, para não
+/// nascer uma ação IPC nova no canal das páginas remotas. Nas páginas de
+/// livros quem o trata é a própria página, pelo IPC fechado delas.
 pub(in crate::windows_app) fn omnibox_opens_epub_dialog(
     virtual_key: u32,
     ctrl: bool,
@@ -598,27 +606,6 @@ impl App {
         }
     }
 
-    /// Ctrl+Shift+Delete apagava historico e memoria local de uma vez, sem
-    /// perguntar e sem volta. Agora pergunta, com o "Nao" por omissao.
-    pub(in crate::windows_app) fn confirm_clear_history(&self) -> bool {
-        let Some(hwnd) = self.window.as_ref().and_then(window_hwnd) else {
-            return false;
-        };
-        let body = wide_null(
-            "Apagar TODO o histórico e a memória local da NeuralIA?\n\nNos livros, some o registro de quando cada um foi aberto; a posição de leitura e os marcadores ficam.\n\nIsto não pode ser desfeito.",
-        );
-        let title = wide_null("NeuralIA — Apagar histórico");
-        let answer = unsafe {
-            MessageBoxW(
-                hwnd,
-                body.as_ptr(),
-                title.as_ptr(),
-                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
-            )
-        };
-        clear_history_confirmed(answer)
-    }
-
     /// Pede a lista ao worker; a caixa aparece quando `HistoryLoaded` voltar.
     /// A leitura (lock + ficheiro inteiro) nunca corre no event loop.
     pub(in crate::windows_app) fn show_recent_history(&self) {
@@ -648,6 +635,27 @@ impl App {
             Err(error) => format!("Não foi possível ler o histórico: {error}"),
         };
         self.show_native_text("NeuralIA — Histórico cronológico", &text);
+    }
+
+    /// Ctrl+Shift+Delete apagava historico e memoria local de uma vez, sem
+    /// perguntar e sem volta. Agora pergunta, com o "Nao" por omissao.
+    pub(in crate::windows_app) fn confirm_clear_history(&self) -> bool {
+        let Some(hwnd) = self.window.as_ref().and_then(window_hwnd) else {
+            return false;
+        };
+        let body = wide_null(
+            "Apagar TODO o histórico e a memória local da NeuralIA?\n\nNos livros, some o registro de quando cada um foi aberto; a posição de leitura e os marcadores ficam.\n\nIsto não pode ser desfeito.",
+        );
+        let title = wide_null("NeuralIA — Apagar histórico");
+        let answer = unsafe {
+            MessageBoxW(
+                hwnd,
+                body.as_ptr(),
+                title.as_ptr(),
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+            )
+        };
+        clear_history_confirmed(answer)
     }
 
     /// Liga/desliga a rolagem de leitura. O temporizador e nativo e nao vive na

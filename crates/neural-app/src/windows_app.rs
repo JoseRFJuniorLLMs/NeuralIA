@@ -2954,7 +2954,7 @@ impl HomeLayout {
 }
 
 #[derive(Debug, Clone)]
-pub(in crate::windows_app) enum BrowserAgentCommand {
+enum BrowserAgentCommand {
     Search(String),
     Click(String),
     Select { label: String, value: String },
@@ -2962,7 +2962,7 @@ pub(in crate::windows_app) enum BrowserAgentCommand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::windows_app) enum AgentTermination {
+enum AgentTermination {
     Completed,
     UserStopped,
     Limit,
@@ -2973,7 +2973,7 @@ pub(in crate::windows_app) enum AgentTermination {
 }
 
 impl AgentTermination {
-    pub(in crate::windows_app) fn as_str(self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             Self::Completed => "completed",
             Self::UserStopped => "user-stopped",
@@ -2988,7 +2988,7 @@ impl AgentTermination {
 
 /// O aviso que o utilizador vê quando o agente pára, e por quantos segundos.
 /// Ficam ao lado da razão para não se dizer uma coisa no trace e outra no ecrã.
-pub(in crate::windows_app) fn agent_stop_message(reason: AgentTermination) -> &'static str {
+fn agent_stop_message(reason: AgentTermination) -> &'static str {
     match reason {
         AgentTermination::Completed => "Agente concluiu a sequência.",
         AgentTermination::UserStopped => "Agente interrompido.",
@@ -3000,7 +3000,7 @@ pub(in crate::windows_app) fn agent_stop_message(reason: AgentTermination) -> &'
     }
 }
 
-pub(in crate::windows_app) fn agent_stop_seconds(reason: AgentTermination) -> u64 {
+fn agent_stop_seconds(reason: AgentTermination) -> u64 {
     match reason {
         AgentTermination::Completed | AgentTermination::UserRejected => 3,
         AgentTermination::RestrictedAction => 5,
@@ -3008,14 +3008,14 @@ pub(in crate::windows_app) fn agent_stop_seconds(reason: AgentTermination) -> u6
     }
 }
 
-pub(in crate::windows_app) struct BrowserAgentState {
-    pub(in crate::windows_app) goal: String,
-    pub(in crate::windows_app) commands: Vec<BrowserAgentCommand>,
-    pub(in crate::windows_app) next_command: usize,
-    pub(in crate::windows_app) steps: usize,
-    pub(in crate::windows_app) started: Instant,
-    pub(in crate::windows_app) policy: AgentPermissionPolicy,
-    pub(in crate::windows_app) trace: Vec<String>,
+struct BrowserAgentState {
+    goal: String,
+    commands: Vec<BrowserAgentCommand>,
+    next_command: usize,
+    steps: usize,
+    started: Instant,
+    policy: AgentPermissionPolicy,
+    trace: Vec<String>,
 }
 
 pub(in crate::windows_app) struct App {
@@ -3281,7 +3281,7 @@ impl App {
 /// Ligacao do agente (AGENTS.md §7). Fica na raiz ate o dono aprovar
 /// `app/agent.rs` (OQ2); os metodos seguem contiguos para os anchors.
 impl App {
-    pub(in crate::windows_app) fn start_browser_agent(&mut self, spec: &str) {
+    fn start_browser_agent(&mut self, spec: &str) {
         let (url, commands) = match parse_browser_agent_plan(spec) {
             Ok(plan) => plan,
             Err(error) => {
@@ -3344,7 +3344,7 @@ impl App {
         }
     }
 
-    pub(in crate::windows_app) fn handle_agent_observation(&mut self, page: ObservedPage) {
+    fn handle_agent_observation(&mut self, page: ObservedPage) {
         let Some(agent) = self.active_agent.as_ref() else {
             return;
         };
@@ -3432,7 +3432,7 @@ impl App {
 
     /// O comando `extract`: o texto observado vai para a memória semântica, já
     /// redigido, e o agente termina.
-    pub(in crate::windows_app) fn extract_agent_observation(&mut self, page: &ObservedPage) {
+    fn extract_agent_observation(&mut self, page: &ObservedPage) {
         let clean = redact_sensitive_text(&page.text_excerpt);
         let mut document = MemoryDocument::new(
             MemoryKind::ResearchResult,
@@ -3462,10 +3462,7 @@ impl App {
         self.finish_agent(AgentTermination::Completed);
     }
 
-    pub(in crate::windows_app) fn execute_agent_action(
-        &self,
-        action: &AgentAction,
-    ) -> Result<(), String> {
+    fn execute_agent_action(&self, action: &AgentAction) -> Result<(), String> {
         let Some(webview) = &self.webview else {
             return Err("nenhuma página ativa".into());
         };
@@ -3475,11 +3472,7 @@ impl App {
             .map_err(|error| error.to_string())
     }
 
-    pub(in crate::windows_app) fn confirm_agent_action(
-        &self,
-        reason: &str,
-        action: &AgentAction,
-    ) -> bool {
+    fn confirm_agent_action(&self, reason: &str, action: &AgentAction) -> bool {
         let (Some(window), Some(hwnd)) = (&self.window, self.window.as_ref().and_then(window_hwnd))
         else {
             return false;
@@ -3499,7 +3492,7 @@ impl App {
         }
     }
 
-    pub(in crate::windows_app) fn finish_agent(&mut self, reason: AgentTermination) {
+    fn finish_agent(&mut self, reason: AgentTermination) {
         let Some(agent) = self.active_agent.take() else {
             return;
         };
@@ -3560,9 +3553,7 @@ fn main_window_shortcut(
     }
 }
 
-pub(in crate::windows_app) fn parse_browser_agent_plan(
-    spec: &str,
-) -> Result<(String, Vec<BrowserAgentCommand>), String> {
+fn parse_browser_agent_plan(spec: &str) -> Result<(String, Vec<BrowserAgentCommand>), String> {
     let parts = spec
         .split('|')
         .map(str::trim)
@@ -3630,7 +3621,7 @@ pub(in crate::windows_app) fn parse_browser_agent_plan(
     Ok(((*url).to_string(), commands))
 }
 
-pub(in crate::windows_app) fn parse_agent_observation(data: &str) -> Option<ObservedPage> {
+fn parse_agent_observation(data: &str) -> Option<ObservedPage> {
     let mut lines = data.lines();
     let generation = lines.next()?.parse::<u64>().ok()?;
     let url = lines.next()?.trim().to_string();
@@ -3669,7 +3660,7 @@ pub(in crate::windows_app) fn parse_agent_observation(data: &str) -> Option<Obse
     })
 }
 
-pub(in crate::windows_app) fn agent_field_kind(element: &AgentElement) -> FieldKind {
+fn agent_field_kind(element: &AgentElement) -> FieldKind {
     let role = element.role.to_ascii_lowercase();
     if role.contains("password") {
         FieldKind::Password
@@ -3688,7 +3679,7 @@ pub(in crate::windows_app) fn agent_field_kind(element: &AgentElement) -> FieldK
     }
 }
 
-pub(in crate::windows_app) fn find_agent_element<'a>(
+fn find_agent_element<'a>(
     page: &'a ObservedPage,
     label: &str,
     select_only: bool,
@@ -3717,7 +3708,7 @@ pub(in crate::windows_app) fn find_agent_element<'a>(
 /// estivesse entalada entre `show_splash` e `evaluate_script`, nenhum teste
 /// conseguia ficar vermelho quando o produto regredisse.
 #[derive(Debug, Clone, PartialEq)]
-pub(in crate::windows_app) enum AgentStepDecision {
+enum AgentStepDecision {
     /// Terminar, com a razão que vai para o trace e para o utilizador.
     Stop(AgentTermination),
     /// O comando `extract`: guardar o texto observado e terminar.
@@ -3736,16 +3727,16 @@ pub(in crate::windows_app) enum AgentStepDecision {
 /// A ação aprovada pelo gate, com a razão da confirmação quando a política
 /// exige um sim humano antes de ela acontecer.
 #[derive(Debug, Clone, PartialEq)]
-pub(in crate::windows_app) struct AgentAct {
-    pub(in crate::windows_app) action: AgentAction,
-    pub(in crate::windows_app) security: AgentSecurityAction,
-    pub(in crate::windows_app) confirmation: Option<String>,
+struct AgentAct {
+    action: AgentAction,
+    security: AgentSecurityAction,
+    confirmation: Option<String>,
 }
 
 /// O orçamento do agente vem do `AgentRuntimeConfig::default()` da SPEC-0105 em
 /// vez de números escritos à mão aqui: dois sítios com os mesmos limites
 /// divergem sem nada os apanhar.
-pub(in crate::windows_app) fn decide_agent_step(
+fn decide_agent_step(
     commands: &[BrowserAgentCommand],
     next_command: usize,
     steps: usize,
@@ -3847,10 +3838,7 @@ pub(in crate::windows_app) fn decide_agent_step(
     }))
 }
 
-pub(in crate::windows_app) fn app_agent_security_action(
-    action: &AgentAction,
-    page: &ObservedPage,
-) -> AgentSecurityAction {
+fn app_agent_security_action(action: &AgentAction, page: &ObservedPage) -> AgentSecurityAction {
     let origin = Url::parse(&page.url)
         .ok()
         .map(|url| url.origin().ascii_serialization())
@@ -3940,7 +3928,7 @@ pub(in crate::windows_app) fn app_agent_security_action(
     }
 }
 
-pub(in crate::windows_app) fn agent_trace_action(action: &AgentAction) -> String {
+fn agent_trace_action(action: &AgentAction) -> String {
     match action {
         AgentAction::TypeText {
             target,
@@ -4028,7 +4016,7 @@ macro_rules! agent_element_identity_js {
     };
 }
 
-pub(in crate::windows_app) fn agent_action_script(action: &AgentAction) -> Result<String, String> {
+fn agent_action_script(action: &AgentAction) -> Result<String, String> {
     fn guard(target: &AgentElement) -> String {
         let id = js_percent(&target.id);
         let name = js_percent(&target.name);
@@ -7615,7 +7603,7 @@ unsafe fn draw_go_gradient(
 const COMPARATOR_BUTTON_EXPANDED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='none';}var m=document.querySelector('#neuralia-comp-minimize');if(m){m.style.display='none';}})();";
 const COMPARATOR_BUTTON_COLLAPSED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='block';b.textContent='\u{26F6} ' + (window.__neuralia_col_name || 'IA');}var m=document.querySelector('#neuralia-comp-minimize');if(m){m.style.display='block';}})();";
 
-pub(in crate::windows_app) const AGENT_OBSERVER_SCRIPT: &str = concat!(
+const AGENT_OBSERVER_SCRIPT: &str = concat!(
     r#"
 (function () {
   if (window.top !== window) return;
