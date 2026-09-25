@@ -309,3 +309,95 @@ impl Theme {
         BRAND_COLORS[index.min(COMPARATOR_COLUMNS - 1)]
     }
 }
+
+// ===================== o tema como modulo de feature (o padrao) =====================
+//
+// Um recurso vive no seu `windows_app/<feature>.rs`: os tipos e as decisoes
+// puras em funcoes livres (`ThemeChoice::parse`, `Theme::read_for`), a
+// logica de janela num bloco `impl App` (`choose_theme`) e o que lhe chega
+// pelo event loop num enum proprio (`ThemeEvent`). A raiz so o conhece por
+// uma linha em cada costura: a variante `UserEvent::Theme(ThemeEvent)`, o
+// campo de estado no `App` (o tema nao precisa: a escolha vive em
+// `THEME_CHOICE`) e o braco `UserEvent::Theme(event) => self.theme_event(event)`
+// em `app/event_loop.rs`. E assim que duas branches em paralelo tocam a
+// raiz sem se pisarem: cada uma acrescenta a sua linha, nunca edita a da
+// outra.
+
+/// O que o tema recebe pelo event loop. Lista fechada deste modulo: um
+/// pedido novo do tema e uma variante aqui, nao mais uma em `UserEvent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) enum ThemeEvent {
+    /// Escolha de tema feita no menu do botao Home.
+    Chosen(ThemeChoice),
+}
+
+/// A ajuda do `tema:` com uma palavra desconhecida (omnibox e palette).
+pub(in crate::windows_app) const THEME_COMMAND_HELP: &str =
+    "Use tema:sistema, tema:claro ou tema:escuro.";
+
+/// Menu de tema no cursor, com a escolha em vigor marcada. Devolve a opcao
+/// clicada, ou None se o menu foi fechado sem escolha.
+pub(in crate::windows_app) fn pick_theme_from_menu(hwnd: HWND) -> Option<ThemeChoice> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, GA_ROOT, GetAncestor, MF_CHECKED, MF_STRING,
+        SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    };
+    let current = ThemeChoice::current();
+    unsafe {
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return None;
+        }
+        for (index, choice) in ThemeChoice::ALL.iter().enumerate() {
+            let flags = if *choice == current {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            };
+            let label: Vec<u16> = choice
+                .label()
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            AppendMenuW(menu, flags, index + 1, label.as_ptr());
+        }
+        let mut cursor = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut cursor);
+        // Sem o dono em primeiro plano, o menu nao fecha ao clicar fora.
+        let root = GetAncestor(hwnd, GA_ROOT);
+        SetForegroundWindow(root);
+        let picked = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            cursor.x,
+            cursor.y,
+            0,
+            root,
+            std::ptr::null(),
+        );
+        DestroyMenu(menu);
+        usize::try_from(picked)
+            .ok()
+            .and_then(|id| id.checked_sub(1))
+            .and_then(|index| ThemeChoice::ALL.get(index).copied())
+    }
+}
+
+impl App {
+    /// O unico braco do tema no `user_event`: tudo o que o tema recebe
+    /// passa por aqui.
+    pub(in crate::windows_app) fn theme_event(&mut self, event: ThemeEvent) {
+        match event {
+            ThemeEvent::Chosen(choice) => self.choose_theme(choice),
+        }
+    }
+
+    pub(in crate::windows_app) fn choose_theme(&mut self, choice: ThemeChoice) {
+        choice.apply();
+        if let Err(error) = choice.save(&self.config.data_dir.join("theme")) {
+            self.show_native_error(format!("Não foi possível guardar o tema: {error}"));
+        }
+        self.refresh_theme();
+        self.show_splash(format!("{} ativado.", choice.label()), 2);
+    }
+}

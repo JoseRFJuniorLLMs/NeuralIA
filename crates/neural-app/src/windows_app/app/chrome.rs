@@ -1255,15 +1255,6 @@ impl App {
         }
     }
 
-    pub(in crate::windows_app) fn choose_theme(&mut self, choice: ThemeChoice) {
-        choice.apply();
-        if let Err(error) = choice.save(&self.config.data_dir.join("theme")) {
-            self.show_native_error(format!("Não foi possível guardar o tema: {error}"));
-        }
-        self.refresh_theme();
-        self.show_splash(format!("{} ativado.", choice.label()), 2);
-    }
-
     /// A dica do alvo `hit`, com o nome da IA, o endereco da aba ou o estado
     /// do grupo que o clique vai usar.
     fn bar_tooltip_text(&self, hit: BarHit, owner: HWND) -> Option<String> {
@@ -1321,15 +1312,33 @@ impl App {
             }
             _ => None,
         };
-        let maximized = unsafe { IsZoomed(owner) != 0 };
+        // O "maximizada" da dica e o da janela dona dela, como sempre.
+        let state = BarState {
+            maximized: unsafe { IsZoomed(owner) != 0 },
+            ..self.bar_state()
+        };
         bar_hint(
             hit,
             &self.pomodoro,
             Instant::now(),
+            &state,
             provider,
-            maximized,
             tab_url,
             group,
         )
+    }
+
+    /// O estado da barra agora (`BarState`): o que a pintura
+    /// (`draw_comparator_bar`) e a dica (`bar_tooltip_text`) leem alem da
+    /// geometria. Uma feature nova preenche aqui o campo que acrescentou.
+    pub(in crate::windows_app) fn bar_state(&self) -> BarState {
+        BarState {
+            hover: self.bar_hover,
+            visible: self.bar_visible(),
+            auto_scroll: self.auto_scroll.get(),
+            drag: self.drag_paint(),
+            pomodoro_label: self.pomodoro_bar_label(),
+            maximized: self.window.as_ref().is_some_and(Window::is_maximized),
+        }
     }
 }

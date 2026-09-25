@@ -875,7 +875,13 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
         BarHit::WindowMaximize,
         BarHit::WindowClose,
     ] {
-        let label = bar_tooltip_label(hit, "ChatGPT", false, Some(url), Some(("Pesquisa", true)));
+        let label = bar_tooltip_label(
+            hit,
+            &BarState::default(),
+            "ChatGPT",
+            Some(url),
+            Some(("Pesquisa", true)),
+        );
         assert!(
             label.as_deref().is_some_and(|text| !text.trim().is_empty()),
             "{hit:?} ficou sem dica"
@@ -884,8 +890,11 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
     let label = |hit, maximized| {
         bar_tooltip_label(
             hit,
+            &BarState {
+                maximized,
+                ..BarState::default()
+            },
             "ChatGPT",
-            maximized,
             Some(url),
             Some(("Pesquisa", true)),
         )
@@ -1112,6 +1121,264 @@ fn side_panel_messages_are_a_closed_list_with_limits() {
     assert_eq!(parse_panel_message(&huge), None, "mensagem acima de 4 KiB");
 }
 
+/// Gate (critico: mensagens de uma pagina): o delegador do canal do painel
+/// entrega cada acao a secao do prefixo dela, e so a ela; um prefixo que
+/// nenhuma secao reclamou, um campo a mais nos `args` e um corpo acima do
+/// tecto da secao morrem no delegador, sem chegar a parser nenhum.
+#[test]
+fn panel_messages_delegate_by_prefix_and_keep_caps() {
+    // Cada prefixo tem UMA secao, e as secoes nao repetem prefixos entre si.
+    let mut prefixes: Vec<&str> = PANEL_SECTIONS
+        .iter()
+        .flat_map(|section| section.prefixes.iter().copied())
+        .collect();
+    let total = prefixes.len();
+    prefixes.sort_unstable();
+    prefixes.dedup();
+    assert_eq!(prefixes.len(), total, "prefixo repetido entre secoes");
+    assert!(
+        PANEL_SECTIONS
+            .iter()
+            .all(|section| !section.prefixes.is_empty())
+    );
+    assert!(PANEL_CORE.prefixes.is_empty());
+    let notes = panel_section_of("note-save").expect("secao das notas");
+    assert_eq!(notes.prefixes, &["note", "notes"]);
+    assert!(std::ptr::eq(panel_section_of("notes-list").unwrap(), notes));
+    assert!(std::ptr::eq(
+        panel_section_of("search").unwrap(),
+        &PANEL_CORE
+    ));
+    assert!(std::ptr::eq(
+        panel_section_of("ready").unwrap(),
+        &PANEL_CORE
+    ));
+
+    // Prefixo que nenhuma secao reclamou: morre no delegador, mesmo com o
+    // corpo perfeito. Sem `-` a acao e do nucleo, que tambem a recusa.
+    for (action, body) in [
+        ("data-pick", r#"{"action":"data-pick","args":{}}"#),
+        ("pomodoro-start", r#"{"action":"pomodoro-start","args":{}}"#),
+        ("-search", r#"{"action":"-search","args":{"query":"x"}}"#),
+    ] {
+        assert!(panel_section_of(action).is_none(), "{action} tem secao?");
+        assert_eq!(parse_panel_message(body), None, "{body}");
+    }
+    assert_eq!(
+        parse_panel_message(r#"{"action":"note","args":{"id":"202609231212"}}"#),
+        None,
+        "sem prefixo, 'note' e do nucleo, que nao o conhece"
+    );
+
+    // Uma chave a mais nos args -- em qualquer secao -- recusa o pedido; o
+    // mesmo pedido sem ela passa (a recusa e so da chave).
+    for (with_extra, clean) in [
+        (
+            r#"{"action":"search","args":{"query":"x","junk":1}}"#,
+            r#"{"action":"search","args":{"query":"x"}}"#,
+        ),
+        (
+            r#"{"action":"open","args":{"input":"https://exemplo.pt","junk":1}}"#,
+            r#"{"action":"open","args":{"input":"https://exemplo.pt"}}"#,
+        ),
+        (
+            r#"{"action":"ready","args":{"junk":1}}"#,
+            r#"{"action":"ready","args":{}}"#,
+        ),
+        (
+            r#"{"action":"notes-search","args":{"query":"x","junk":1}}"#,
+            r#"{"action":"notes-search","args":{"query":"x"}}"#,
+        ),
+        (
+            r#"{"action":"note-open","args":{"id":"202609231212","junk":1}}"#,
+            r#"{"action":"note-open","args":{"id":"202609231212"}}"#,
+        ),
+        (
+            r#"{"action":"notes-list","args":{"junk":1}}"#,
+            r#"{"action":"notes-list","args":{}}"#,
+        ),
+    ] {
+        assert_eq!(parse_panel_message(with_extra), None, "{with_extra}");
+        assert!(parse_panel_message(clean).is_some(), "{clean}");
+    }
+    // Os args que faltam so passam a quem nao pede chave nenhuma.
+    assert_eq!(
+        parse_panel_message(r#"{"action":"ready"}"#),
+        Some(PanelMessage::Ready)
+    );
+    assert_eq!(parse_panel_message(r#"{"action":"search"}"#), None);
+    assert_eq!(parse_panel_message(r#"{"action":"note-open"}"#), None);
+    // Um `args` presente que nao e objecto (`null`, texto, numero) recusa
+    // ate quem nao pede chave nenhuma: so a AUSENCIA vale como vazio. (Ate
+    // e930dac o `ready` e o `close` ignoravam os args; a pagina que embarca
+    // manda sempre um objecto -- `args || {}` em `core.js`.)
+    for body in [
+        r#"{"action":"ready","args":null}"#,
+        r#"{"action":"close","args":"x"}"#,
+        r#"{"action":"notes-list","args":1}"#,
+        r#"{"action":"search","args":null}"#,
+    ] {
+        assert_eq!(parse_panel_message(body), None, "{body}");
+    }
+
+    // O tecto: 4 KiB para tudo, salvo o note-save e o note-draft, que levam
+    // o corpo de uma nota e param em NOTE_SAVE_MESSAGE_MAX_BYTES -- o
+    // delegador prende ambos ANTES de entregar a secao.
+    let pad = "x".repeat(PANEL_MESSAGE_MAX_BYTES);
+    let over_4k = |action: &str, args: &str| {
+        format!(r#"{{"action":"{action}","args":{args},"pad":"{pad}"}}"#)
+    };
+    let search = over_4k("search", r#"{"query":"x"}"#);
+    let notes_list = over_4k("notes-list", "{}");
+    assert!(search.len() > PANEL_MESSAGE_MAX_BYTES && notes_list.len() > PANEL_MESSAGE_MAX_BYTES);
+    assert_eq!(parse_panel_message(&search), None, "search acima de 4 KiB");
+    assert_eq!(
+        parse_panel_message(&notes_list),
+        None,
+        "notes-list acima de 4 KiB"
+    );
+    assert_eq!(
+        (PANEL_CORE.max_bytes)("search"),
+        PANEL_MESSAGE_MAX_BYTES,
+        "o nucleo fica nos 4 KiB"
+    );
+    assert_eq!((notes.max_bytes)("notes-list"), PANEL_MESSAGE_MAX_BYTES);
+    assert_eq!((notes.max_bytes)("note-save"), NOTE_SAVE_MESSAGE_MAX_BYTES);
+    assert_eq!((notes.max_bytes)("note-draft"), NOTE_SAVE_MESSAGE_MAX_BYTES);
+    assert_eq!(
+        PANEL_MESSAGE_ABSOLUTE_MAX_BYTES,
+        PANEL_SECTIONS
+            .iter()
+            .chain(std::iter::once(&PANEL_CORE))
+            .flat_map(|section| {
+                ["note-save", "note-draft", "notes-list", "search"]
+                    .map(|action| (section.max_bytes)(action))
+            })
+            .max()
+            .unwrap(),
+        "o tecto absoluto e o maior de todas as secoes"
+    );
+    let save = over_4k(
+        "note-save",
+        r#"{"id":null,"title":"t","body":"b","tags":[]}"#,
+    );
+    assert!(
+        matches!(parse_panel_message(&save), Some(PanelMessage::NoteSave(_))),
+        "um note-save acima dos 4 KiB e aceite (o envelope pode ter mais chaves)"
+    );
+    let too_big = format!(
+        r#"{{"action":"note-save","args":{{"id":null,"title":"t","body":"{}","tags":[]}}}}"#,
+        "b".repeat(NOTE_SAVE_MESSAGE_MAX_BYTES)
+    );
+    assert_eq!(
+        parse_panel_message(&too_big),
+        None,
+        "acima do tecto absoluto"
+    );
+}
+
+/// Gate (critico: mensagens de uma pagina): um corpo acima do tecto
+/// absoluto volta `None` ANTES de se ler como JSON -- o `serde_json` nunca
+/// ve um corpo desse tamanho. O tecto da secao do `note-save` e o mesmo
+/// numero e corre DEPOIS do JSON, por isso o `None` sozinho nao chega:
+/// sem a verificacao do delegador a secao dava o mesmo `None`. Conta-se a
+/// leitura (`PANEL_JSON_READS`, so nos testes), e conta-se tambem que o
+/// contador esta vivo -- no tecto le-se, um byte acima nao.
+#[test]
+fn panel_bodies_above_the_absolute_cap_are_never_read_as_json() {
+    let reads = || PANEL_JSON_READS.with(|count| count.get());
+    let envelope = |pad: usize| {
+        format!(
+            r#"{{"action":"note-save","args":{{"id":null,"title":"t","body":"b","tags":[]}},"pad":"{}"}}"#,
+            "x".repeat(pad)
+        )
+    };
+    let frame = envelope(0).len();
+
+    // Exactamente no tecto: le-se, e o note-save passa.
+    let at_cap = envelope(PANEL_MESSAGE_ABSOLUTE_MAX_BYTES - frame);
+    assert_eq!(at_cap.len(), PANEL_MESSAGE_ABSOLUTE_MAX_BYTES);
+    let before = reads();
+    assert!(matches!(
+        parse_panel_message(&at_cap),
+        Some(PanelMessage::NoteSave(_))
+    ));
+    assert_eq!(
+        reads(),
+        before + 1,
+        "no tecto le-se o JSON (o contador conta)"
+    );
+
+    // Lixo dentro do tecto: le-se (e morre no JSON), para o contador nao
+    // ser o que passa o teste.
+    let garbage_at_cap = "x".repeat(PANEL_MESSAGE_ABSOLUTE_MAX_BYTES);
+    let before = reads();
+    assert_eq!(parse_panel_message(&garbage_at_cap), None);
+    assert_eq!(reads(), before + 1, "lixo no tecto ainda se le");
+
+    // Um byte a mais: None SEM leitura -- JSON perfeito ou lixo, tanto faz.
+    let over_cap = envelope(PANEL_MESSAGE_ABSOLUTE_MAX_BYTES - frame + 1);
+    assert_eq!(over_cap.len(), PANEL_MESSAGE_ABSOLUTE_MAX_BYTES + 1);
+    let garbage_over_cap = "x".repeat(PANEL_MESSAGE_ABSOLUTE_MAX_BYTES + 1);
+    let before = reads();
+    for body in [&over_cap, &garbage_over_cap] {
+        assert_eq!(parse_panel_message(body), None, "{} bytes", body.len());
+    }
+    assert_eq!(
+        reads(),
+        before,
+        "acima do tecto absoluto o corpo nunca se le como JSON"
+    );
+}
+
+/// O `PANEL_HTML` que embarca e montado dos assets de `assets/panel/`, e e
+/// a pagina de sempre: LF do principio ao fim, com cada asset la dentro
+/// uma vez, pela ordem, e os marcadores que o harness do painel corta.
+#[test]
+fn panel_html_is_assembled_from_its_section_assets() {
+    assert!(
+        !PANEL_HTML.contains('\r'),
+        "CRLF no painel: o .gitattributes falhou"
+    );
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/panel");
+    let mut cursor = 0;
+    for name in [
+        "panel.css",
+        "history.html",
+        "notes.html",
+        "core.js",
+        "history.js",
+        "notes.js",
+        "tabs.js",
+    ] {
+        let asset = std::fs::read_to_string(root.join(name))
+            .unwrap_or_else(|error| panic!("assets/panel/{name}: {error}"));
+        assert!(!asset.contains('\r'), "assets/panel/{name} tem CRLF");
+        assert!(asset.ends_with('\n'), "assets/panel/{name} sem LF final");
+        let at = PANEL_HTML[cursor..]
+            .find(&asset)
+            .unwrap_or_else(|| panic!("assets/panel/{name} fora de ordem ou ausente"));
+        cursor += at + asset.len();
+    }
+    let style = PANEL_HTML.find("<style>\n").expect("<style>");
+    let style_end = PANEL_HTML
+        .find("</style></head><body>\n")
+        .expect("</style>");
+    let script = PANEL_HTML.find("<script>\n").expect("<script>");
+    assert!(style < style_end && style_end < script);
+    assert!(PANEL_HTML.ends_with("</script></body></html>"));
+    assert_eq!(PANEL_HTML.matches("<script>").count(), 1);
+    // O script e uma IIFE so, aberta logo a seguir ao `<script>` (core.js)
+    // e fechada no fim de tabs.js -- o `return` do frame guard tem de
+    // valer para os quatro pedacos.
+    assert!(
+        PANEL_HTML[script..]
+            .starts_with("<script>\n(() => {\n  if (window.top !== window) return;\n")
+    );
+    assert!(PANEL_HTML.ends_with("\n})();\n</script></body></html>"));
+    assert!(PANEL_HTML.starts_with("<!doctype html>\n"));
+}
+
 #[test]
 fn side_panel_only_ever_shows_its_local_page() {
     assert!(panel_allows_navigation("about:blank"));
@@ -1236,8 +1503,8 @@ fn every_ai_column_has_its_own_back_and_forward_after_its_plus() {
     for index in 0..3 {
         let (plus, back, forward) = (
             layout.add_tabs[index],
-            layout.column_back[index],
-            layout.column_forward[index],
+            layout.column_button(index, ColumnButton::Back),
+            layout.column_button(index, ColumnButton::Forward),
         );
         assert!(
             back.width > 0.0 && forward.width > 0.0,
@@ -1273,7 +1540,7 @@ fn every_ai_column_has_its_own_back_and_forward_after_its_plus() {
         let narrow =
             BarLayout::with_contexts(width as f64, 1.0, true, BarColumns::even(3), [0, 0, 0]);
         for index in 0..2 {
-            let forward = narrow.column_forward[index];
+            let forward = narrow.column_button(index, ColumnButton::Forward);
             assert!(
                 forward.width == 0.0 || forward.x + forward.width <= narrow.columns[index + 1].x,
                 "a {width}px os ‹ › da coluna {index} invadem a coluna seguinte"
@@ -1293,6 +1560,153 @@ fn every_ai_column_has_its_own_back_and_forward_after_its_plus() {
         drawer.private.x + drawer.private.width <= back.x,
         "Privado antes do par"
     );
+}
+
+/// Gate do registo `ColumnButton` (720..2560 px, escalas 1, 1.5 e 2, com
+/// e sem gaveta): cada botao de coluna ou cabe na faixa da sua coluna --
+/// depois do "+", sem se sobrepor ao vizinho nem entrar na coluna seguinte
+/// ou no canto direito, e o clique no centro dele volta a ser ELE -- ou
+/// nao existe (largura 0, e nada o encontra). O grupo e tudo ou nada: numa
+/// coluna, ou todos os botoes existem ou nenhum.
+#[test]
+fn column_buttons_fit_or_vanish() {
+    assert_eq!(COLUMN_BUTTONS, ColumnButton::ALL.len());
+    let center = |rect: UiRect| (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+    let mut existed = 0usize;
+    let mut vanished = 0usize;
+    for scale in [1.0, 1.5, 2.0] {
+        for width in (720..=2560).step_by(40) {
+            for split_active in [false, true] {
+                let columns = BarColumns {
+                    split_active,
+                    ..BarColumns::even(3)
+                };
+                let layout =
+                    BarLayout::with_contexts(width as f64, scale, true, columns, [0, 0, 0]);
+                let controls = right_controls(width as f64, scale, split_active, None);
+                let at = format!("{width}px x{scale} gaveta={split_active}");
+                for index in 0..3 {
+                    let rects: Vec<UiRect> = ColumnButton::ALL
+                        .iter()
+                        .map(|button| layout.column_button(index, *button))
+                        .collect();
+                    let shown = rects.iter().filter(|rect| rect.width > 0.0).count();
+                    assert!(
+                        shown == 0 || shown == rects.len(),
+                        "{at}: coluna {index} com {shown} de {} botoes",
+                        rects.len()
+                    );
+                    if shown == 0 {
+                        vanished += 1;
+                        for (button, rect) in ColumnButton::ALL.iter().zip(&rects) {
+                            assert_ne!(
+                                layout.hit(rect.x, rect.y + rect.height / 2.0),
+                                Some(button.hit(index)),
+                                "{at}: um botao sem largura nao pode ser clicado"
+                            );
+                        }
+                        continue;
+                    }
+                    existed += 1;
+                    let plus = layout.add_tabs[index];
+                    assert!(
+                        plus.width > 0.0,
+                        "{at}: botoes sem o \"+\" na coluna {index}"
+                    );
+                    let lane_end = if index + 1 < 3 {
+                        layout.columns[index + 1].x
+                    } else {
+                        controls.leftmost()
+                    };
+                    let mut previous_right = plus.x + plus.width;
+                    for (button, rect) in ColumnButton::ALL.iter().zip(&rects) {
+                        assert!(
+                            rect.x >= previous_right,
+                            "{at}: {} da coluna {index} sobrepoe o anterior",
+                            button.glyph()
+                        );
+                        assert!(
+                            rect.x + rect.width <= lane_end,
+                            "{at}: {} da coluna {index} sai da faixa",
+                            button.glyph()
+                        );
+                        let (cx, cy) = center(*rect);
+                        assert_eq!(
+                            layout.hit(cx, cy),
+                            Some(button.hit(index)),
+                            "{at}: o clique no {} da coluna {index} nao volta a ele",
+                            button.glyph()
+                        );
+                        assert_eq!(
+                            bar_hit_at(Some(controls), Some(layout), cx, cy),
+                            Some(button.hit(index)),
+                            "{at}: o canto direito rouba o {} da coluna {index}",
+                            button.glyph()
+                        );
+                        previous_right = rect.x + rect.width;
+                    }
+                }
+            }
+        }
+    }
+    // A varredura viu os dois lados da regra: botoes que existem (janelas
+    // largas) e botoes que sumiram (janelas estreitas a escala 2).
+    assert!(
+        existed > 0 && vanished > 0,
+        "{existed} com botoes, {vanished} sem"
+    );
+}
+
+/// Gate do registo do canto direito (`RIGHT_CLUSTER`): pela ordem, sem
+/// sobreposicao, cada lugar volta a ser ele proprio no hit-testing, e a
+/// lista traz os servicos pela ordem de `RightControls::services`.
+#[test]
+fn right_cluster_slots_never_overlap_and_hit_back() {
+    let service_hits: Vec<BarHit> = RIGHT_CLUSTER[1..5].iter().map(|slot| slot.hit).collect();
+    assert_eq!(
+        service_hits,
+        [
+            BarHit::Service(Service::Meet),
+            BarHit::Service(Service::WhatsApp),
+            BarHit::Service(Service::YouTube),
+            BarHit::GmailToggle,
+        ]
+    );
+    assert_eq!(RIGHT_CLUSTER[0].hit, BarHit::GeminiLive);
+    assert_eq!(RIGHT_CLUSTER[5].hit, BarHit::Private);
+    let mut icons: Vec<usize> = RIGHT_CLUSTER.iter().map(|slot| slot.icon).collect();
+    icons.sort_unstable();
+    icons.dedup();
+    assert_eq!(icons.len(), RIGHT_CLUSTER.len(), "icone repetido no canto");
+    for scale in [1.0, 1.5, 2.0] {
+        for width in (720..=2560).step_by(40) {
+            for split_active in [false, true] {
+                let controls = right_controls(width as f64, scale, split_active, None);
+                let at = format!("{width}px x{scale} gaveta={split_active}");
+                let mut previous_right = 0.0f64;
+                for (slot, rect) in RIGHT_CLUSTER.iter().zip(controls.cluster()) {
+                    assert!(
+                        rect.width > 0.0 && rect.height > 0.0,
+                        "{at}: {:?} sem tamanho",
+                        slot.hit
+                    );
+                    assert!(
+                        rect.x >= previous_right,
+                        "{at}: {:?} sobrepoe o lugar anterior",
+                        slot.hit
+                    );
+                    let (cx, cy) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+                    assert_eq!(
+                        right_controls_hit(controls, cx, cy),
+                        Some(slot.hit),
+                        "{at}: o clique em {:?} nao volta a ele",
+                        slot.hit
+                    );
+                    previous_right = rect.x + rect.width;
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -1822,7 +2236,7 @@ fn the_gemini_live_eye_toggles_live_and_says_what_it_sends() {
             for rect in [
                 layout.columns[index],
                 layout.add_tabs[index],
-                layout.column_forward[index],
+                layout.column_button(index, ColumnButton::Forward),
             ] {
                 assert!(
                     rect.width == 0.0 || rect.x + rect.width <= live.x,
@@ -1832,7 +2246,7 @@ fn the_gemini_live_eye_toggles_live_and_says_what_it_sends() {
         }
     }
     assert_eq!(
-        bar_tooltip_label(BarHit::GeminiLive, "IA", false, None, None).as_deref(),
+        bar_tooltip_label(BarHit::GeminiLive, &BarState::default(), "IA", None, None).as_deref(),
         Some("Gemini Live: ver a tela, câmera e microfone (liga/desliga)")
     );
 }
@@ -1973,9 +2387,12 @@ fn painted_bar_with_live(width: i32, live: &LivePanel<u8>, theme: &Theme) -> Vec
             width,
             1.0,
             &["Google Gemini", "ChatGPT", "Claude"],
-            true,
-            None,
-            false,
+            BarState {
+                visible: true,
+                hover: None,
+                auto_scroll: false,
+                ..BarState::default()
+            },
             live,
             theme,
         );
@@ -2664,9 +3081,12 @@ fn render_comparator_bar_preview() {
                 width,
                 1.0,
                 &["Google Gemini", "ChatGPT", "Claude"],
-                visible,
-                hover,
-                true,
+                BarState {
+                    visible,
+                    hover,
+                    auto_scroll: true,
+                    ..BarState::default()
+                },
                 &LivePanel::<()>::off(),
                 &theme,
             );
@@ -5388,10 +5808,56 @@ fn private_palette_paths_never_touch_history_or_context_tabs() {
     assert!(private_split.contains("open_split_mode(source_index, url, false, true, None)"));
 }
 
+/// Gate (critico: apaga dados do utilizador): o percurso do "Apagar
+/// historico" que embarca (`clear_history_targets`, o mesmo que o `App`
+/// corre depois do Sim) chega a CADA alvo registado, pela ordem da tabela,
+/// uma vez so, e a tabela cobre os quatro alvos que existem -- um alvo que
+/// o percurso salte, ou que saia da tabela, fica vermelho aqui. O que o
+/// `App` faz em cada alvo (esquecer a memoria, apagar o historico) NAO se
+/// prova aqui: o braco de cada um esta preso por texto em
+/// `the_shipped_paths_are_wired_to_the_tab_session`.
+#[test]
+fn clear_history_runs_every_registered_target() {
+    struct Recorder(Vec<ClearTarget>);
+    impl ClearHistorySink for Recorder {
+        fn clear(&mut self, target: ClearTarget) {
+            self.0.push(target);
+        }
+    }
+    let mut recorder = Recorder(Vec::new());
+    clear_history_targets(&mut recorder);
+    assert_eq!(
+        recorder.0,
+        ClearTarget::ALL.to_vec(),
+        "cada alvo registado, uma vez, pela ordem"
+    );
+    // Tudo o que existe esta registado, e o historico -- que muda de ecra
+    // e escreve o estado -- vai por ultimo.
+    for target in [
+        ClearTarget::Tabs,
+        ClearTarget::Memory,
+        ClearTarget::EpubLibrary,
+        ClearTarget::History,
+    ] {
+        assert_eq!(
+            CLEAR_HISTORY_TARGETS
+                .iter()
+                .filter(|registered| **registered == target)
+                .count(),
+            1,
+            "{target:?} tem de estar registado uma vez"
+        );
+    }
+    assert_eq!(CLEAR_HISTORY_TARGETS.last(), Some(&ClearTarget::History));
+    assert_eq!(CLEAR_HISTORY_TARGETS.len(), 4);
+}
+
 /// Ligacao, nao comportamento: o comportamento esta nos gates de
 /// `tab_session_gates`. Isto so prende que os caminhos que embarcam
 /// chamam as funcoes que esses gates provam -- um `TabPersistence::forget`
 /// perfeito que "Apagar historico" deixasse de chamar nao apagava nada.
+/// O mesmo para os bracos da memoria e do historico do `ClearHistorySink`
+/// do `App`: presenca por texto, nao comportamento (§4.3).
 #[test]
 fn the_shipped_paths_are_wired_to_the_tab_session() {
     let source = shipped_source();
@@ -5404,19 +5870,40 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
             .to_string()
     };
 
-    let clear = body(
-        "UserEvent::ClearHistory => {",
+    // O braco do event loop e uma linha: pergunta e percorre a tabela dos
+    // alvos (`clear_history.rs`); o gate de comportamento e
+    // clear_history_runs_every_registered_target.
+    let arm = body(
+        "UserEvent::ClearHistory => ",
         "UserEvent::HistoryCleared(result)",
+    );
+    assert!(
+        arm.contains("self.clear_history()"),
+        "o braco ClearHistory chama App::clear_history"
+    );
+    let clear = body(
+        "fn clear_history(&mut self)",
+        "clear_history_targets(self);",
     );
     let confirm = clear
         .find("self.confirm_clear_history()")
         .expect("clearing history asks first");
-    let forget = clear
-        .find("self.forget_tab_session();")
-        .expect("\"Apagar histórico\" must also forget tabs.json");
     assert!(
-        confirm < forget,
-        "tabs.json is wiped only after the owner confirms"
+        clear[confirm..].contains("return;"),
+        "sem o Sim nao se percorre a tabela"
+    );
+    let sink = body("impl ClearHistorySink for App", "impl App {");
+    assert!(
+        sink.contains("ClearTarget::Tabs => self.forget_tab_session(),"),
+        "\"Apagar histórico\" must also forget tabs.json"
+    );
+    assert!(
+        sink.contains("ClearTarget::Memory => self.memory.clear(&mut self.current_research),"),
+        "\"Apagar histórico\" must also clear the semantic memory"
+    );
+    assert!(
+        sink.contains("ClearTarget::History => match self.history.clear() {"),
+        "\"Apagar histórico\" must also clear history.jsonl"
     );
     // O comportamento destes caminhos esta em
     // the_app_path_saves_restores_and_forgets_the_real_tabs_json (sobre o
@@ -5848,15 +6335,16 @@ fn epub_pages_reach_native_code_only_through_their_own_channel() {
         );
     }
 
-    // "Apagar historico" apaga tambem a leitura dos livros.
-    let clear = body(
-        &source,
-        "UserEvent::ClearHistory => {",
-        "UserEvent::HistoryCleared(result)",
-    );
+    // "Apagar historico" apaga tambem a leitura dos livros: o alvo
+    // EpubLibrary da tabela (`clear_history.rs`) manda o trabalho ao worker.
+    let clear = body(&source, "impl ClearHistorySink for App", "impl App {");
     assert!(
         clear.contains("self.submit_epub_job(EpubJob::ClearReadingHistory)"),
         "ClearHistory tem de mandar EpubJob::ClearReadingHistory"
+    );
+    assert!(
+        clear.contains("ClearTarget::EpubLibrary => {"),
+        "o alvo dos livros tem de estar registado"
     );
 
     // Ficheiros largados: um evento por ficheiro, o lote inteiro no
@@ -12852,10 +13340,12 @@ fn group_chip_underline_and_hovered_close_are_painted_like_chrome() {
             &all_groups,
             active.map(|id| (0, Some(id), false, false)),
             [None; COMPARATOR_COLUMNS],
-            true,
-            hover,
-            true,
-            None,
+            BarState {
+                visible: true,
+                hover,
+                auto_scroll: true,
+                ..BarState::default()
+            },
             &LivePanel::<()>::off(),
             &theme,
         );
@@ -14115,10 +14605,13 @@ fn the_row_reorders_live_under_the_dragged_tab() {
             &rig.groups,
             None,
             [None; COMPARATOR_COLUMNS],
-            true,
-            None,
-            true,
-            drag,
+            BarState {
+                visible: true,
+                hover: None,
+                auto_scroll: true,
+                drag,
+                ..BarState::default()
+            },
             &LivePanel::<()>::off(),
             &theme,
         );
@@ -15145,8 +15638,7 @@ fn tool_buttons_never_overlap_the_bar_at_any_width() {
                     for index in 0..COMPARATOR_COLUMNS {
                         bar.push(layout.columns[index]);
                         bar.push(layout.add_tabs[index]);
-                        bar.push(layout.column_back[index]);
-                        bar.push(layout.column_forward[index]);
+                        bar.extend(layout.column_buttons[index]);
                         bar.extend(layout.context_tabs[index]);
                         bar.extend(layout.group_pills[index]);
                     }
@@ -15187,15 +15679,11 @@ fn tool_buttons_never_overlap_the_bar_at_any_width() {
 fn provider_row(layout: &BarLayout) -> Vec<[f64; 4]> {
     let mut rects = Vec::new();
     for index in 0..COMPARATOR_COLUMNS {
-        for rect in [
-            layout.columns[index],
-            layout.add_tabs[index],
-            layout.column_back[index],
-            layout.column_forward[index],
-        ]
-        .into_iter()
-        .chain(layout.context_tabs[index])
-        .chain(layout.group_pills[index])
+        for rect in [layout.columns[index], layout.add_tabs[index]]
+            .into_iter()
+            .chain(layout.column_buttons[index])
+            .chain(layout.context_tabs[index])
+            .chain(layout.group_pills[index])
         {
             rects.push([rect.x, rect.y, rect.width, rect.height]);
         }
@@ -15293,8 +15781,13 @@ fn the_tools_never_take_room_from_the_ai_columns() {
                             assert!(pill >= 60.0, "pilula de {pill:.1} px: {at}");
                         }
                         assert!(layout.add_tabs[index].width > 0.0, "sem \"+\": {at}");
-                        assert!(layout.column_back[index].width > 0.0, "sem ‹: {at}");
-                        assert!(layout.column_forward[index].width > 0.0, "sem ›: {at}");
+                        for button in ColumnButton::ALL {
+                            assert!(
+                                layout.column_button(index, button).width > 0.0,
+                                "sem {}: {at}",
+                                button.glyph()
+                            );
+                        }
                     }
                 }
             }
@@ -15436,7 +15929,8 @@ fn tool_hints_say_what_the_click_does() {
     ];
     for (tool, text) in expected {
         assert_eq!(
-            bar_tooltip_label(BarHit::Tool(tool), "IA", false, None, None).as_deref(),
+            bar_tooltip_label(BarHit::Tool(tool), &BarState::default(), "IA", None, None)
+                .as_deref(),
             Some(text)
         );
     }
@@ -15450,7 +15944,7 @@ fn pomodoro_hint_follows_the_session_in_the_bar_and_on_home() {
     // O que a barra mostra (`bar_hint`, pelo `App::bar_tooltip_text`) e
     // o que a Home e o refresco de cada segundo mostram (`tool_hint_at`).
     let bar = |hit: BarHit, pomodoro: &PomodoroController, now: Instant| {
-        bar_hint(hit, pomodoro, now, "IA", false, None, None)
+        bar_hint(hit, pomodoro, now, &BarState::default(), "IA", None, None)
     };
     let mut pomodoro =
         PomodoroController::new(crate::pomodoro_ui::PomodoroPreset::Classic.settings());
@@ -15491,7 +15985,7 @@ Clique: pausar · botão direito: opções";
     // O resto da barra continua com a sua dica.
     assert_eq!(
         bar(BarHit::Home, &pomodoro, at),
-        bar_tooltip_label(BarHit::Home, "IA", false, None, None)
+        bar_tooltip_label(BarHit::Home, &BarState::default(), "IA", None, None)
     );
     // Parado outra vez: a fixa.
     pomodoro.command(PomodoroCommand::Stop, at);
