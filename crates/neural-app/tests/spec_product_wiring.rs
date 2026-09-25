@@ -48,6 +48,8 @@ const ALL_SOURCES: &str = concat!(
     "\n",
     include_str!("../src/windows_app/search_card.rs"),
     "\n",
+    include_str!("../src/windows_app/app/mod.rs"),
+    "\n",
     include_str!("../src/windows_app/app/gmail.rs"),
     "\n",
     include_str!("../src/windows_app/app/tools.rs"),
@@ -228,4 +230,48 @@ fn spec_0106_roadmap_product_composition_is_wired_not_just_constructible() {
     assert!(APP.contains("function semanticAnchors()"));
     assert!(APP.contains("parse_ipc_message(request.body()"));
     assert!(IPC.contains("pub fn parse_ipc_message("));
+}
+
+/// `ALL_SOURCES` e uma lista a mao, e os gates de ausencia deste ficheiro
+/// (SPEC-0102, SPEC-0105) so valem sobre o que ela contem: um modulo que
+/// ficasse de fora podia trazer o `ModelPackManager` ou o `AgentRuntime` sem
+/// que nada aqui ficasse vermelho. Este gate le a arvore `src/windows_app`
+/// no disco e exige o texto de cada ficheiro, e o da raiz, dentro de
+/// `ALL_SOURCES`.
+#[test]
+fn all_sources_holds_every_file_of_the_windows_app_tree() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read src/windows_app") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = vec![manifest.join("src/windows_app.rs")];
+    walk(&manifest.join("src/windows_app"), &mut files);
+    files.sort();
+    assert!(
+        files.len() >= 20,
+        "so {} ficheiros em src/windows_app?",
+        files.len()
+    );
+
+    let all = ALL_SOURCES.replace("\r\n", "\n");
+    let mut missing = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file)
+            .expect("read module")
+            .replace("\r\n", "\n");
+        if !all.contains(text.trim_end()) {
+            missing.push(file.display().to_string());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "ficheiros de src/windows_app fora de ALL_SOURCES: {missing:?}"
+    );
 }

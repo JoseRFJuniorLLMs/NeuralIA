@@ -11741,9 +11741,22 @@ fn render_brand_pixels(width: i32, height: i32) -> Vec<u8> {
     pixels
 }
 
+/// Cada ficheiro de `src/windows_app/` com o seu texto, para os gates que
+/// leem o codigo-fonte (`all_sources`, `shipped_source` em `tests.rs`):
+/// primeiro os `impl App` de `app/`, depois os modulos-folha, por fim os
+/// testes. `all_sources_lists_every_module` compara a lista com o disco.
 #[cfg(test)]
 pub(super) const ALL_MODULES: &[(&str, &str)] = &[
-    ("tests.rs", include_str!("windows_app/tests.rs")),
+    ("app/mod.rs", include_str!("windows_app/app/mod.rs")),
+    (
+        "app/navigation.rs",
+        include_str!("windows_app/app/navigation.rs"),
+    ),
+    ("app/panels.rs", include_str!("windows_app/app/panels.rs")),
+    ("app/gmail.rs", include_str!("windows_app/app/gmail.rs")),
+    ("app/tools.rs", include_str!("windows_app/app/tools.rs")),
+    ("app/split.rs", include_str!("windows_app/app/split.rs")),
+    ("app/pages.rs", include_str!("windows_app/app/pages.rs")),
     ("theme.rs", include_str!("windows_app/theme.rs")),
     ("icons.rs", include_str!("windows_app/icons.rs")),
     ("bar_layout.rs", include_str!("windows_app/bar_layout.rs")),
@@ -11758,22 +11771,13 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ("side_panel.rs", include_str!("windows_app/side_panel.rs")),
     ("services.rs", include_str!("windows_app/services.rs")),
     ("search_card.rs", include_str!("windows_app/search_card.rs")),
+    ("tests.rs", include_str!("windows_app/tests.rs")),
 ];
 
+/// A raiz e todos os modulos de `ALL_MODULES` (com `tests.rs`), LF.
 #[cfg(test)]
 pub(super) fn all_sources() -> String {
     let mut out = include_str!("windows_app.rs").replace("\r\n", "\n");
-    for app_content in [
-        include_str!("windows_app/app/navigation.rs"),
-        include_str!("windows_app/app/panels.rs"),
-        include_str!("windows_app/app/gmail.rs"),
-        include_str!("windows_app/app/tools.rs"),
-        include_str!("windows_app/app/split.rs"),
-        include_str!("windows_app/app/pages.rs"),
-    ] {
-        out.push('\n');
-        out.push_str(&app_content.replace("\r\n", "\n"));
-    }
     for (_, content) in ALL_MODULES {
         out.push('\n');
         out.push_str(&content.replace("\r\n", "\n"));

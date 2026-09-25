@@ -145,6 +145,7 @@ jobs:
             @{
               Label = "stale-split-generation"
               Test = "stale_split_builds_are_discarded_after_navigation_changes"
+              SourcePath = "crates/neural-app/src/windows_app/app/split.rs"
               Old = @'
               start_generation == current_generation && surface == Surface::Comparator
           '@
@@ -189,6 +190,7 @@ jobs:
             @{
               Label = "split-transaction"
               Test = "failed_split_build_preserves_the_previous_split_and_expansion"
+              SourcePath = "crates/neural-app/src/windows_app/app/split.rs"
               Old = @'
                   Err(error) => Err(error),
           '@

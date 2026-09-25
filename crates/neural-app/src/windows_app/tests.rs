@@ -380,7 +380,7 @@ mod bar_geometry {
 
 #[test]
 fn home_button_is_text_only_without_an_invented_icon() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let native = source
         .split("fn home_button_subclass")
         .nth(1)
@@ -444,7 +444,7 @@ fn native_caption_buttons_accept_the_mouse() {
 
 #[test]
 fn native_home_button_has_a_stable_window_identity_for_the_shipping_gate() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let body = source
         .split("fn sync_home_button")
         .nth(1)
@@ -2226,12 +2226,7 @@ fn the_live_panel_handlers_are_the_gatekeepers_it_ships_with() {
 /// painel escondido, sem olho e sem Desligar.
 #[test]
 fn leaving_a_web_surface_turns_gemini_live_off() {
-    let wap = include_str!("../windows_app.rs");
-    let pag = include_str!("../windows_app/app/pages.rs");
-    let source_raw = format!("{wap}\n{pag}");
-    let source = source_raw
-        .replace("\r\n", "\n")
-        .replace("pub(in crate::windows_app) fn ", "fn ");
+    let source = shipped_source();
     let body = |start: &str, end: &str| {
         source
             .split(start)
@@ -5083,7 +5078,7 @@ fn a_plain_click_opens_in_all_three_panels_and_ctrl_click_opens_beside() {
 
 #[test]
 fn comparator_popup_failure_never_falls_back_to_destroying_all_panels() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let body = source
         .split("fn open_in_column")
         .nth(1)
@@ -5115,7 +5110,7 @@ fn lifecycle_probe_commands_are_deduplicated_by_nonce() {
 
 #[test]
 fn lifecycle_ready_is_published_only_after_returning_to_the_event_loop() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let activate = source
         .split("fn activate_comparator")
         .nth(1)
@@ -5150,8 +5145,7 @@ fn lifecycle_ready_is_published_only_after_returning_to_the_event_loop() {
 
 #[test]
 fn webview_teardown_does_not_schedule_home_chrome_while_opening_comparator() {
-    let source_raw = include_str!("../windows_app.rs");
-    let source = source_raw.replace("pub(in crate::windows_app) fn ", "fn ");
+    let source = shipped_source();
     let destroy = source
         .split("fn destroy_web_surfaces")
         .nth(1)
@@ -5347,10 +5341,7 @@ fn palette_routes_private_input_away_from_the_normal_column() {
 
 #[test]
 fn private_palette_paths_never_touch_history_or_context_tabs() {
-    let wap = include_str!("../windows_app.rs");
-    let nav = include_str!("../windows_app/app/navigation.rs");
-    let spl = include_str!("../windows_app/app/split.rs");
-    let source = format!("{wap}\n{nav}\n{spl}").replace("pub(in crate::windows_app) fn ", "fn ");
+    let source = shipped_source();
     let submit = source
         .split("fn submit_palette")
         .nth(1)
@@ -5396,9 +5387,7 @@ fn private_palette_paths_never_touch_history_or_context_tabs() {
 /// perfeito que "Apagar historico" deixasse de chamar nao apagava nada.
 #[test]
 fn the_shipped_paths_are_wired_to_the_tab_session() {
-    let wap = include_str!("../windows_app.rs");
-    let spl = include_str!("../windows_app/app/split.rs");
-    let source = format!("{wap}\n{spl}");
+    let source = shipped_source();
     let body = |from: &str, to: &str| -> String {
         source
             .split(from)
@@ -5615,9 +5604,7 @@ fn split_controls_are_native_bar_hits() {
 
 #[test]
 fn splitter_topology_is_resynced_after_layout_transitions() {
-    let wap = include_str!("../windows_app.rs");
-    let spl = include_str!("../windows_app/app/split.rs");
-    let source = format!("{wap}\n{spl}").replace("pub(in crate::windows_app) fn ", "fn ");
+    let source = shipped_source();
     let minimize = source
         .split("fn minimize_comparator")
         .nth(1)
@@ -5642,13 +5629,11 @@ fn comparator_resize_uses_persistent_weights_and_native_splitters() {
     // O arrasto e coalescido: a subclasse publica a ultima posicao e so
     // acorda o event loop quando nao ha pedido pendente. Sem isto cada
     // WM_MOUSEMOVE reposicionava tres WebView2 a mais de 100 Hz.
-    let wap = include_str!("../windows_app.rs");
-    let spl = include_str!("../windows_app/app/split.rs");
-    let source = format!("{spl}\n{wap}");
+    let source = shipped_source();
     let subclass = source
         .split("fn comparator_splitter_subclass")
         .nth(1)
-        .and_then(|part| part.split("fn exit_button_subclass").next())
+        .and_then(|part| part.split("fn split_ipc_event_impl").next())
         .expect("subclass body");
     assert!(subclass.contains("RESIZE_X.store("));
     assert!(subclass.contains("RESIZE_PENDING.swap(true"));
@@ -5716,7 +5701,7 @@ fn split_view_uses_neuralia_scroll_rail_and_auto_scroll() {
 
 #[test]
 fn reader_uses_semantic_timeline_script() {
-    let source = include_str!("../windows_app/app/pages.rs");
+    let source = shipped_source();
     let reader = source
         .split("fn reader_webview_builder")
         .nth(1)
@@ -5768,13 +5753,7 @@ fn spec_0108_remote_scripts_use_message_transport_without_capability_urls() {
 
 #[test]
 fn spec_0108_remote_navigation_handlers_reject_neuralia_scheme() {
-    let wap = include_str!("../windows_app.rs");
-    let gm = include_str!("../windows_app/app/gmail.rs");
-    let spl = include_str!("../windows_app/app/split.rs");
-    let pag = include_str!("../windows_app/app/pages.rs");
-    let source = format!("{wap}\n{gm}\n{spl}\n{pag}")
-        .replace("\r\n", "\n")
-        .replace("pub(in crate::windows_app) fn ", "fn ");
+    let source = shipped_source();
     for builder in [
         "fn pdf_webview_builder",
         "fn external_webview_builder",
@@ -5820,18 +5799,21 @@ fn spec_0108_capability_scripts_are_top_frame_only() {
 
 #[test]
 fn all_sources_lists_every_module() {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let dir = std::path::Path::new(manifest_dir).join("src/windows_app");
-    let mut dir_files: Vec<String> = Vec::new();
-    if dir.is_dir() {
-        for entry in std::fs::read_dir(&dir).expect("read src/windows_app") {
-            let entry = entry.expect("dir entry");
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("rs") {
-                dir_files.push(path.file_name().unwrap().to_str().unwrap().to_string());
+    fn walk(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read src/windows_app") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(base, &path, out);
+            } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                let rel = path.strip_prefix(base).expect("under src/windows_app");
+                out.push(rel.to_str().unwrap().replace('\\', "/"));
             }
         }
     }
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = std::path::Path::new(manifest_dir).join("src/windows_app");
+    let mut dir_files: Vec<String> = Vec::new();
+    walk(&dir, &dir, &mut dir_files);
     dir_files.sort();
 
     let mut registered: Vec<String> = ALL_MODULES
@@ -5842,7 +5824,7 @@ fn all_sources_lists_every_module() {
 
     assert_eq!(
         registered, dir_files,
-        "ALL_SOURCES must list every module in src/windows_app without escaping"
+        "ALL_MODULES must list every file under src/windows_app (app/ included) without escaping"
     );
 }
 
@@ -5854,21 +5836,6 @@ fn shipped_source() -> String {
     let mut out = include_str!("../windows_app.rs")
         .replace("\r\n", "\n")
         .replace("pub(in crate::windows_app) fn ", "fn ");
-    for app_content in [
-        include_str!("../windows_app/app/navigation.rs"),
-        include_str!("../windows_app/app/panels.rs"),
-        include_str!("../windows_app/app/gmail.rs"),
-        include_str!("../windows_app/app/tools.rs"),
-        include_str!("../windows_app/app/split.rs"),
-        include_str!("../windows_app/app/pages.rs"),
-    ] {
-        out.push('\n');
-        out.push_str(
-            &app_content
-                .replace("\r\n", "\n")
-                .replace("pub(in crate::windows_app) fn ", "fn "),
-        );
-    }
     for (name, content) in ALL_MODULES {
         if *name != "tests.rs" {
             out.push('\n');
@@ -8962,12 +8929,7 @@ __state('barra');
     // Os builders nao montam o script nem decidem a privacidade por conta
     // propria: usam as funcoes acima (asserção de ausencia, AGENTS.md
     // §4.3).
-    let wap = include_str!("../windows_app.rs");
-    let spl = include_str!("../windows_app/app/split.rs");
-    let pag = include_str!("../windows_app/app/pages.rs");
-    let source = format!("{wap}\n{spl}\n{pag}")
-        .replace("\r\n", "\n")
-        .replace("pub(in crate::windows_app) fn ", "fn ");
+    let source = shipped_source();
     let body = |builder: &str| {
         source
             .split(builder)
@@ -11394,13 +11356,7 @@ fn resized_weights_keep_the_total_and_the_minimum() {
 /// flutuavam sobre outras aplicacoes depois de um Alt+Tab.
 #[test]
 fn owned_popups_are_not_topmost() {
-    let wap = include_str!("../windows_app.rs");
-    let sc = include_str!("../windows_app/search_card.rs");
-    let gm = include_str!("../windows_app/app/gmail.rs");
-    let spl = include_str!("../windows_app/app/split.rs");
-    // show_search_card foi movido para search_card.rs, show_gmail_toast para gmail.rs e divisores para split.rs;
-    // concatena para a pesquisa ser uniforme.
-    let source_combined = format!("{wap}\n{sc}\n{gm}\n{spl}");
+    let source_combined = shipped_source();
     let body = |source: &str, from: &str, to: &str| {
         source
             .split(from)
@@ -11443,7 +11399,7 @@ fn owned_popups_are_not_topmost() {
 
 #[test]
 fn native_controls_follow_the_effective_hwnd_after_decoration_changes() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let body = source
         .split("fn ensure_window_subclass")
         .nth(1)
@@ -11457,7 +11413,7 @@ fn native_controls_follow_the_effective_hwnd_after_decoration_changes() {
 
 #[test]
 fn expanded_column_keeps_window_chrome_and_content_offset() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let expand = source
         .split("fn expand_comparator")
         .nth(1)
@@ -15725,9 +15681,7 @@ fn breath_panel_is_private_denies_media_and_stays_on_youtube() {
 /// do que la corre chega ao NeuralIA.
 #[test]
 fn service_panels_never_reach_history_or_memory() {
-    let wap = include_str!("../windows_app.rs");
-    let pan = include_str!("../windows_app/app/panels.rs");
-    let source = format!("{wap}\n{pan}").replace("pub(in crate::windows_app) fn ", "fn ");
+    let source = shipped_source();
     let body = source
         .split("fn open_service_panel(&mut self")
         .nth(1)
