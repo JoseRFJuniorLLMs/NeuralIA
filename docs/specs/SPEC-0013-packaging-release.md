@@ -6,6 +6,8 @@ The stable v1 artifact is a Windows x64 executable from the Rust workspace.
 
 A stable release MUST originate from a successful `main` CI run for the exact source SHA that is tagged. The release workflow creates a new `v<workspace-version>` tag only when that version tag does not already exist.
 
+Here "stable release" means a published, tagged release, as opposed to CI artifacts. Its GitHub channel follows the version (AGENTS.md 2.1). A tag matching `^v[0-9]+\.0\.[0-9]+$` is an LTS release, published with `--latest`. Every other tag is a preview, published with `--prerelease`, which leaves the current Latest unchanged. `scripts/test-release-contract.mjs` pins that pattern, runs it over a table of tags, and checks that the flag it picks is the only one `gh release create` receives.
+
 Release jobs are separated by authority:
 - CI builds `NeuralIA.exe`, runs the Windows tests plus Home/lifecycle gates against that exact file, records its SHA-256 and uploads it as a short-lived artifact named for the tested commit SHA;
 - after the Windows gate, a separate main-only CI job downloads that immutable artifact and creates the GitHub build-provenance attestation for the exact executable that was measured;

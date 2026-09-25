@@ -42,11 +42,11 @@ Compilar e verificar tudo em cada tarefa custava horas e esgotava os limites dos
   - revisão adversarial por área;
   - verificador independente;
   - sabotagem em todos os gates críticos tocados;
-  - `measure-home`/`measure-cycles` (§4.1);
+  - análise das medições do §4.1 contra a LTS anterior (o CI já as corre em cada PR);
   - auditoria das afirmações da documentação (§3).
 - **Prévia**: qualquer outra versão (2.2.0, 3.1.0, 3.2.1…). Publicada como **pre-release** do GitHub, nunca como Latest. Em cada tarefa:
   - um agente constrói e corre localmente só o que alterou (`cargo check`, `cargo test -p <crate>` ou o filtro dos testes tocados);
-  - o gate completo do §4.1, sem as medições, é o CI do PR;
+  - o gate completo do §4.1, medições incluídas, é o CI do PR;
   - revisão independente só quando a tarefa toca num gate crítico do §4.2 (segurança, dados do utilizador, entrada não confiável, release): um revisor, sem verificador separado.
 - O `release.yml` escolhe o canal pela versão, e `scripts/test-release-contract.mjs` guarda essa regra.
 - Nos dois ritmos continuam em vigor:
@@ -74,7 +74,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-mais, para releases LTS (§2.1):
+mais, para releases:
 
 ```powershell
 ./scripts/measure-home.ps1   -ExePath target/release/NeuralIA.exe

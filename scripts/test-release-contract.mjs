@@ -40,6 +40,13 @@ const channelRule = workflow.match(
   /if \[\[ "\$RELEASE_TAG" =~ (\S+) \]\]; then\s+channel_flag="--latest"\s+else\s+channel_flag="--prerelease"\s+fi/
 );
 assert.ok(channelRule, 'publish must pick --latest or --prerelease from the release tag');
+// The table below runs the pattern with JavaScript's engine, so pin the exact
+// bash text too: an edit both engines read differently (\d, classes) must fail
+// here, and nothing may change the flag after the if/else picks it.
+assert.equal(channelRule[1], '^v[0-9]+\\.0\\.[0-9]+$', 'the LTS pattern is exactly ^v[0-9]+\\.0\\.[0-9]+$');
+assert.equal((workflow.match(/channel_flag=/g) || []).length, 2, 'channel_flag is set only by the if/else');
+assert.equal((workflow.match(/--latest\b/g) || []).length, 1, '--latest appears only in the LTS branch');
+assert.equal((workflow.match(/--prerelease\b/g) || []).length, 1, '--prerelease appears only in the preview branch');
 const ltsTag = new RegExp(channelRule[1]);
 for (const [tag, lts] of [
   ['v3.0.0', true],
