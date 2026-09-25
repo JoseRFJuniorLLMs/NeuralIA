@@ -182,6 +182,13 @@ before the site sees the key. They work on every surface unless noted.
 
 `Backspace` and the digits are ignored while typing in a field; `Ctrl` combinations are not.
 
+**Exception: Livros (EPUB).** The book library and the EPUB reader do not receive
+this keymap, so NeuralIA's own shortcuts (for example `Ctrl+H`, `Ctrl+Shift+Z`,
+`Ctrl+Shift+Delete`, `Ctrl+L`, `Ctrl+T` · `Ctrl+W` and `F8`) do nothing there.
+Inside Livros, `Ctrl+O` adds books, `Ctrl+F` searches (the library, or the open
+book) and `Esc` goes back (reader → library → Home); leave with `Esc` to reach the
+other tools.
+
 ## Comparator timelines
 
 Each AI panel owns its own vertical response timeline. The compact rail on the
@@ -196,7 +203,7 @@ Opening a document asks once per session whether to advance the page automatical
 30 seconds and stops at the end. HTML and comparator surfaces advance by script;
 PDFs use NeuralIA's bundled offline PDF.js viewer and advance page-by-page. `F8` toggles
 it at any time. EPUB files do not open in WebView2; NeuralIA opens them in its own library and
-reader instead (`livros:` or a `.epub` path in the omnibox, `Ctrl+O` on Home).
+reader instead (`livros:` or `epub:<path>` in the omnibox, `Ctrl+O` on Home).
 
 ## v1.0.1 hardening baseline
 
