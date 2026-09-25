@@ -52,7 +52,10 @@ jobs:
 
   windows:
     runs-on: windows-latest
-    timeout-minutes: 20
+    # 2.2.0 green runs already take 17-20 minutes (run 36163974196: 19m56s);
+    # a run cut at the 20-minute mark after every step passed is a timeout,
+    # not a gate result.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
