@@ -369,6 +369,15 @@ jobs:
           Copy-Item perf-cycles.json ci-tested/perf-cycles.json
           $hash = (Get-FileHash ci-tested/NeuralIA.exe -Algorithm SHA256).Hash.ToLower()
           "$hash  NeuralIA.exe" | Out-File -Encoding ascii ci-tested/NeuralIA.exe.sha256
+      # Release contract of the CI-only accelerator spike (infra-accel-spike):
+      # the exact bytes that release.yml packages were built without the spike
+      # feature, so the spike marker is not in them. The spike itself runs in
+      # its own workflow (accel-spike.yml), never in this one: release.yml
+      # waits for this workflow, and a failing chord is an expected spike
+      # result, not a release gate.
+      - name: Published exe has the accel-spike feature off
+        shell: pwsh
+        run: ./scripts/test-accel-spike-marker.ps1 -ExePath ci-tested/NeuralIA.exe -Expect Absent
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: neuralia-windows-tested-${{ github.sha }}

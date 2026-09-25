@@ -108,6 +108,8 @@ impl App {
         match result {
             Ok(webview) => {
                 let _ = webview.zoom(self.zoom);
+                #[cfg(feature = "accel-spike")]
+                self.accel_spike_hook(&webview, crate::accel_spike::SpikeHost::Pdf);
                 self.webview = Some(webview);
                 self.surface = Surface::Pdf;
                 self.page_source = Some(url.to_string());
@@ -248,6 +250,8 @@ impl App {
             Ok(webview) => {
                 let _ = webview.zoom(self.zoom);
                 let _ = webview.focus();
+                #[cfg(feature = "accel-spike")]
+                self.accel_spike_hook(&webview, crate::accel_spike::SpikeHost::Epub);
                 self.webview = Some(webview);
                 self.surface = Surface::Epub;
             }
@@ -504,6 +508,8 @@ impl App {
         match result {
             Ok(webview) => {
                 let _ = webview.zoom(self.zoom);
+                #[cfg(feature = "accel-spike")]
+                self.accel_spike_hook(&webview, crate::accel_spike::SpikeHost::External);
                 self.webview = Some(webview);
                 self.surface = Surface::External;
                 if !allow_local {
@@ -546,6 +552,8 @@ impl App {
         match result {
             Ok(webview) => {
                 let _ = webview.zoom(self.zoom);
+                #[cfg(feature = "accel-spike")]
+                self.accel_spike_hook(&webview, crate::accel_spike::SpikeHost::Reader);
                 self.webview = Some(webview);
                 self.surface = Surface::Reader;
                 self.page_source = Some(article.source_url.clone());

@@ -293,6 +293,8 @@ impl App {
                 Ok(wv) => {
                     let _ = wv.zoom(self.zoom);
                     self.install_context_menu(&wv, WebViewHost::Column(i));
+                    #[cfg(feature = "accel-spike")]
+                    self.accel_spike_hook(&wv, crate::accel_spike::SpikeHost::Column);
                     views.push(ComparatorView { webview: wv, name });
                 }
                 Err(error) => {

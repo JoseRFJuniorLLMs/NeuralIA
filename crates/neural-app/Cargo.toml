@@ -18,6 +18,19 @@ path = "src/main.rs"
 name = "brand-assets"
 path = "../../scripts/brand-assets/main.rs"
 
+[features]
+# Nenhuma feature por omissao: o exe publicado e este.
+default = []
+# So CI (infra-accel-spike, plano 2.3): o spike do AcceleratorKeyPressed em
+# cada WebView, conduzido por scripts/test-accel-spike.ps1 no workflow
+# proprio .github/workflows/accel-spike.yml (PRs e a mao), fora do workflow
+# CI de que o release.yml depende. O exe publicado e compilado SEM ela: o job
+# `windows` do ci.yml prova que o marcador do spike nao esta no
+# ci-tested/NeuralIA.exe (scripts/test-accel-spike-marker.ps1) e
+# scripts/test-release-contract.mjs prende isso aos workflows. Nao puxa crate
+# nenhuma.
+accel-spike = []
+
 [dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 neural-core = { path = "../neural-core" }

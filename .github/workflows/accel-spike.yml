@@ -1,0 +1,83 @@
+name: Accelerator spike
+
+# infra-accel-spike (2.3 plan, CI only). Its own workflow on purpose, never a
+# job of ci.yml: release.yml publishes after the CI workflow run of a push to
+# main concludes with success, and a failing chord is an outcome this spike
+# expects (fallback 1/2 of the brief) or an invalid run (no input, no focus).
+# Neither may decide whether a release is published. It runs on every pull
+# request and by hand (workflow_dispatch); scripts/test-release-contract.mjs
+# keeps it out of the workflows release.yml waits for.
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: accel-spike-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  accel-spike:
+    # A release exe WITH the CI-only cargo feature `accel-spike`: an
+    # AcceleratorKeyPressed with Handled=TRUE on every WebView kind, driven by
+    # scripts/test-accel-spike.ps1, which prints the per-host table (log and
+    # step summary) of the pass rule (page keydown never sees the chord, no
+    # NEURALIA_KEYMAP_SCRIPT act() fires, the native side fires exactly once,
+    # auto-repeat included). Exit policy (lead decision, see the script
+    # header): the deliverable is the table, so the E2E step exits 0 when the
+    # table is complete and the run is valid EVEN IF chords fail the rule
+    # (they are for the owner's section-7 decision), and fails only on a
+    # harness error or an INVALID run (no key reached any
+    # AcceleratorKeyPressed). A host that cannot be opened, focused or stops
+    # answering is recorded "invalido" with the reason and the run goes on.
+    # This exe never leaves the job: no upload-artifact, and no job needs it.
+    # The published exe is the `windows` job of ci.yml, built without the
+    # feature (test-accel-spike-marker.ps1 -Expect Absent there).
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+        with:
+          components: clippy
+      - run: cargo clippy --locked -p neural-app --all-targets --features accel-spike -- -D warnings
+      - run: cargo test --locked -p neural-app --features accel-spike accel_spike
+      - name: Spike evaluator self-test (pass rule on synthetic trials)
+        shell: pwsh
+        run: ./scripts/test-accel-spike.ps1 -SelfTest
+      - run: cargo build --locked -p neural-app --bin NeuralIA --release --features accel-spike
+      - name: The spike exe carries the marker the release gate looks for
+        shell: pwsh
+        run: ./scripts/test-accel-spike-marker.ps1 -ExePath target/release/NeuralIA.exe -Expect Present
+      - name: Accelerator spike E2E on the release exe (per-host table)
+        shell: pwsh
+        run: ./scripts/test-accel-spike.ps1 -ExePath target/release/NeuralIA.exe -TablePath accel-spike-table.md
+      # Proves the probe (AGENTS.md 4.2): with Handled=false the same E2E must
+      # report that the page saw the key -- its own rule: this step fails if
+      # no leak is seen. Runs even when the E2E step failed, so a harness
+      # error there still comes with the proof that the probe can see a leak.
+      - name: Sabotage Handled=false must make the E2E report that the page saw the key
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $utf8 = [Text.UTF8Encoding]::new($false)
+          $resolved = (Resolve-Path -LiteralPath "crates/neural-app/src/accel_spike_app.rs").Path
+          $original = [IO.File]::ReadAllText($resolved, $utf8)
+          $old = 'unsafe { args.SetHandled(verdict.handled)? };'
+          $count = ([regex]::Matches($original, [regex]::Escape($old))).Count
+          if ($count -ne 1) { throw "Sabotage target expected once, found $count." }
+          try {
+            [IO.File]::WriteAllText($resolved, $original.Replace($old, 'unsafe { args.SetHandled(false)? };'), $utf8)
+            cargo build --locked -p neural-app --bin NeuralIA --release --features accel-spike
+            if ($LASTEXITCODE -ne 0) { throw "The sabotaged spike build failed." }
+            ./scripts/test-accel-spike.ps1 -ExePath target/release/NeuralIA.exe -ExpectLeak -Hosts External,Reader -TablePath accel-spike-sabotage.md
+          }
+          finally {
+            git checkout -- crates/neural-app/src
+          }
+          git diff --exit-code -- crates/neural-app/src

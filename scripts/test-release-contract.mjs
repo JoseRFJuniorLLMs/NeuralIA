@@ -165,4 +165,190 @@ assert.ok(
   'the ungated packaging/build-installer.ps1 must not come back'
 );
 
+// The accelerator spike (infra-accel-spike, 2.3 plan) is CI-only: its code
+// compiles only with the neural-app feature `accel-spike`, and the exe that
+// release.yml packages must be built without it. Behaviour: the `windows` job
+// of ci.yml proves the spike marker is absent from the exact
+// ci-tested/NeuralIA.exe bytes, and the accel-spike.yml workflow proves the
+// same check sees the marker in a spike build. These assertions keep that
+// wiring from being edited away, and the spike out of the workflow that
+// release.yml waits for.
+const appManifest = fs.readFileSync('crates/neural-app/Cargo.toml', 'utf8');
+const features = appManifest.match(/\n\[features\]\n([\s\S]*?)(?=\n\[)/);
+assert.ok(features, 'neural-app declares its [features] table');
+assert.match(features[1], /^default = \[\]$/m, 'neural-app has no default features');
+assert.match(features[1], /^accel-spike = \[\]$/m, 'accel-spike exists and pulls no crate');
+assert.doesNotMatch(
+  features[1].replace(/^#.*$/gm, ''),
+  /default\s*=\s*\[[^\]]*accel-spike/,
+  'accel-spike is never a default feature'
+);
+
+const mainRs = fs.readFileSync('crates/neural-app/src/main.rs', 'utf8');
+assert.match(
+  mainRs,
+  /#\[cfg\(any\(test, feature = "accel-spike"\)\)\]\nmod accel_spike;/,
+  'the spike module compiles only in tests and in the accel-spike build'
+);
+assert.equal((mainRs.match(/\bmod accel_spike\b/g) || []).length, 1, 'accel_spike is declared once');
+const windowsAppRs = fs.readFileSync('crates/neural-app/src/windows_app.rs', 'utf8');
+assert.match(
+  windowsAppRs,
+  /#\[cfg\(feature = "accel-spike"\)\]\n#\[path = "accel_spike_app\.rs"\]\npub\(in crate::windows_app\) mod accel_spike_app;/,
+  'the spike glue compiles only in the accel-spike build'
+);
+assert.equal(
+  (windowsAppRs.match(/\bmod accel_spike_app\b/g) || []).length,
+  1,
+  'accel_spike_app is declared once'
+);
+
+const markerRust = fs
+  .readFileSync('crates/neural-app/src/accel_spike.rs', 'utf8')
+  .match(/pub\(crate\) const SPIKE_BUILD_MARKER: &str = "([^"]+)";/);
+const markerScript = fs
+  .readFileSync('scripts/test-accel-spike-marker.ps1', 'utf8')
+  .match(/^\$marker = "([^"]+)"$/m);
+assert.ok(markerRust && markerScript, 'the spike marker is declared in the module and in the gate');
+assert.equal(markerScript[1], markerRust[1], 'the release gate looks for the marker the spike writes');
+
+// Which workflow runs can hold a release back: release.yml packages only after
+// a workflow_run of the workflows it lists concludes with success. The spike
+// must never be one of them: a failing chord is an outcome the spike expects
+// (fallback 1/2 of the brief), and an invalid run (no input or no focus on the
+// runner) says nothing about the product. Neither may skip a release.
+const unquote = (text) => text.trim().replace(/^(["'])(.*)\1$/, '$2');
+const watched = workflow.match(/\non:\n {2}workflow_run:\n {4}workflows: \[([^\]\n]*)\]\n/);
+assert.ok(watched, 'release.yml is triggered by workflow_run on a listed set of workflows');
+const watchedNames = watched[1].split(',').map(unquote);
+assert.deepEqual(watchedNames, ['CI'], 'release.yml waits only for the CI workflow');
+const workflowDir = '.github/workflows';
+const workflows = new Map(
+  fs
+    .readdirSync(workflowDir)
+    .filter((file) => /\.ya?ml$/.test(file))
+    .map((file) => [file, fs.readFileSync(`${workflowDir}/${file}`, 'utf8')])
+);
+const nameOf = (text) => {
+  const name = text.match(/^name:\s*(.+?)\s*$/m);
+  return name ? unquote(name[1]) : undefined;
+};
+assert.deepEqual(
+  [...workflows].filter(([, text]) => watchedNames.includes(nameOf(text))).map(([file]) => file),
+  ['ci.yml'],
+  'the CI workflow that release.yml waits for is ci.yml'
+);
+const noComments = (text) => text.replace(/^[ \t]*#.*\n/gm, '');
+
+// The marker step is exactly name/shell/run and the upload follows it at once:
+// no `if:` can skip it and no `continue-on-error:` can turn its red into green.
+const markerStep =
+  '      - name: Published exe has the accel-spike feature off\n' +
+  '        shell: pwsh\n' +
+  '        run: ./scripts/test-accel-spike-marker.ps1 -ExePath ci-tested/NeuralIA.exe -Expect Absent\n';
+const windowsJob = ci.slice(ci.indexOf('\n  windows:'), ci.indexOf('\n  installer-smoke:'));
+assert.ok(windowsJob.length > 0, 'ci.yml keeps the windows job');
+assert.match(
+  windowsJob,
+  /- run: cargo build --locked -p neural-app --bin NeuralIA --release\n/,
+  'the published exe is built by the windows job'
+);
+assert.equal(windowsJob.split(markerStep).length - 1, 1, 'the windows job checks the spike marker once');
+const stageAt = windowsJob.indexOf('Copy-Item target/release/NeuralIA.exe ci-tested/NeuralIA.exe');
+const markerAt = windowsJob.indexOf(markerStep);
+assert.ok(stageAt > 0 && markerAt > stageAt, 'the spike marker is checked on the staged ci-tested bytes');
+assert.ok(
+  windowsJob.includes(markerStep + '      - uses: actions/upload-artifact@'),
+  'the tested exe is uploaded right after the marker check, which has no if and no continue-on-error'
+);
+assert.doesNotMatch(windowsJob, /continue-on-error/, 'no step of the windows job can fail without failing CI');
+const windowsBuild = noComments(windowsJob).replace(markerStep, '');
+assert.doesNotMatch(
+  windowsBuild,
+  /(^|\s)-F(\s|$)|--features|--all-features/m,
+  'the windows job never builds with extra features (-F, --features, --all-features)'
+);
+for (const line of windowsBuild.split('\n').filter((text) => /\bcargo\s/.test(text))) {
+  assert.doesNotMatch(line, /(^|\s)-F/, `the windows job never passes -F to cargo: ${line.trim()}`);
+}
+
+// The spike runs only in its own workflow, on pull requests and by hand.
+const spikeFile = 'accel-spike.yml';
+const spike = workflows.get(spikeFile);
+assert.ok(spike, 'the spike runs in its own workflow, .github/workflows/accel-spike.yml');
+assert.ok(!watchedNames.includes(nameOf(spike)), 'release.yml never waits for the spike workflow');
+const triggers = spike.match(/\non:\n((?: {2}.*\n)+)/);
+assert.ok(triggers, 'the spike workflow lists its triggers as a block');
+assert.deepEqual(
+  [...triggers[1].matchAll(/^ {2}([a-z_]+):/gm)].map((trigger) => trigger[1]).sort(),
+  ['pull_request', 'workflow_dispatch'],
+  'the spike runs on pull requests and by hand, never on the push to main that publishes'
+);
+assert.match(spike, /\npermissions:\n {2}contents: read\n/, 'the spike workflow only reads the repository');
+assert.doesNotMatch(spike, /:\s*write\b/, 'the spike workflow is granted no write permission');
+assert.match(
+  spike,
+  /cargo build --locked -p neural-app --bin NeuralIA --release --features accel-spike/,
+  'the spike workflow builds the release exe with the spike feature'
+);
+assert.match(
+  spike,
+  /test-accel-spike-marker\.ps1 -ExePath target\/release\/NeuralIA\.exe -Expect Present/,
+  'the spike workflow proves the marker check sees a spike build'
+);
+assert.match(
+  spike,
+  /\.\/scripts\/test-accel-spike\.ps1 -ExePath target\/release\/NeuralIA\.exe -TablePath /,
+  'the spike workflow runs the E2E'
+);
+assert.doesNotMatch(spike, /actions\/upload-artifact/, 'the spike exe never leaves its workflow');
+for (const [file, text] of workflows) {
+  if (file === spikeFile) continue;
+  assert.doesNotMatch(
+    noComments(text).replace(markerStep, ''),
+    /accel.spike|accel_spike/i,
+    `${file} never builds or runs the spike (only ${spikeFile} does; ci.yml only checks the marker is absent)`
+  );
+}
+
+// No job consumes the spike job, in any form YAML allows for `needs:`.
+function needsOf(text) {
+  const out = [];
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const key = lines[i].match(/^\s*needs:\s*(.*)$/);
+    if (!key) continue;
+    let rest = key[1].replace(/\s+#.*$/, '').trim();
+    if (rest.startsWith('[')) {
+      while (!rest.includes(']') && i + 1 < lines.length) {
+        rest += ' ' + lines[++i].replace(/\s+#.*$/, '').trim();
+      }
+      out.push(...rest.replace(/^\[/, '').replace(/\].*$/, '').split(',').map(unquote).filter(Boolean));
+    } else if (rest) {
+      out.push(unquote(rest));
+    } else {
+      while (i + 1 < lines.length && /^\s*(-\s|#|$)/.test(lines[i + 1])) {
+        const item = lines[++i].match(/^\s*-\s+(.*?)(\s+#.*)?$/);
+        if (item) out.push(unquote(item[1]));
+      }
+    }
+  }
+  return out;
+}
+assert.deepEqual(needsOf('    needs: a\n'), ['a'], 'needs parser: scalar');
+assert.deepEqual(needsOf('    needs: [a, "b"]\n'), ['a', 'b'], 'needs parser: flow list');
+assert.deepEqual(needsOf('    needs: [a,\n      b] # why\n'), ['a', 'b'], 'needs parser: flow list over two lines');
+assert.deepEqual(
+  needsOf("    needs:\n      - a\n\n      # c\n      - 'b' # why\n    runs-on: x\n      - c\n"),
+  ['a', 'b'],
+  'needs parser: block list'
+);
+for (const [file, text] of workflows) {
+  assert.ok(!needsOf(text).includes('accel-spike'), `no job in ${file} consumes the spike job`);
+}
+assert.doesNotMatch(workflow, /accel-spike|accel_spike|--features|--all-features/, 'release.yml never builds the spike');
+assert.doesNotMatch(buildScript, /accel-spike|--features|--all-features/, 'the installer build never enables features');
+
 console.log('release contract: single public installer asset (neural-setup around the CI-tested binary)');
+console.log('release contract: the published exe is built without the accel-spike feature');
+console.log('release contract: the accelerator spike runs outside the CI workflow that release.yml waits for');

@@ -28,6 +28,11 @@ mod tab_session;
 // Windows: correm tambem no CI Linux.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod read_aloud;
+// Spike do AcceleratorKeyPressed (infra-accel-spike, plano 2.3): so nos
+// testes e no build de CI com `--features accel-spike`. O exe publicado e
+// compilado sem a feature e nao o tem (scripts/test-accel-spike-marker.ps1).
+#[cfg(any(test, feature = "accel-spike"))]
+mod accel_spike;
 // Gemini Live: origem propria, canal fechado e chave com DPAPI (Windows).
 #[cfg(target_os = "windows")]
 mod gemini_live;
