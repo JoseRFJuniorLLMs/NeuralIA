@@ -17,6 +17,7 @@ pub mod pomodoro;
 pub mod reader;
 pub mod render;
 pub mod research;
+pub mod safezip;
 pub mod search;
 pub mod security;
 pub mod semantic_timeline;

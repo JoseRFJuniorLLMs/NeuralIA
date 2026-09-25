@@ -1,4 +1,4 @@
-//! Leitor de ZIP só para EPUB: diretório central, entradas *stored* e
+//! Leitor de ZIP com política EPUB: diretório central, entradas *stored* e
 //! *deflate*, ZIP64 quando os campos de 32 bits saturam.
 //!
 //! O arquivo é tratado como hostil. Tudo o que um EPUB legítimo nunca tem é
@@ -34,24 +34,52 @@ use std::{
 
 use flate2::{Crc, read::DeflateDecoder};
 
-use super::{EpubError, EpubResult, LimitKind};
+use crate::epub::{EpubError, EpubResult, LimitKind};
+
+/// Limites de leitura para um tipo de arquivo ZIP. Novas políticas entram
+/// junto com o primeiro consumidor; por enquanto só EPUB está habilitado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZipPolicy {
+    pub max_entries: u64,
+    pub max_entry_size: u64,
+    pub max_total_size: u64,
+    pub max_compression_ratio: u64,
+    pub ratio_check_min_size: u64,
+    pub max_name_len: usize,
+    pub max_extra_len: usize,
+    pub max_comment_len: usize,
+}
+
+impl ZipPolicy {
+    /// Os mesmos limites que o leitor EPUB usava antes da mudança de módulo.
+    pub const EPUB: Self = Self {
+        max_entries: 20_000,
+        max_entry_size: 64 * 1024 * 1024,
+        max_total_size: 1024 * 1024 * 1024,
+        max_compression_ratio: 200,
+        ratio_check_min_size: 64 * 1024,
+        max_name_len: 1024,
+        max_extra_len: 4096,
+        max_comment_len: 4096,
+    };
+}
 
 /// Entradas no diretório central.
-pub const MAX_ENTRIES: u64 = 20_000;
+pub const MAX_ENTRIES: u64 = ZipPolicy::EPUB.max_entries;
 /// Tamanho descompactado de uma entrada.
-pub const MAX_ENTRY_SIZE: u64 = 64 * 1024 * 1024;
+pub const MAX_ENTRY_SIZE: u64 = ZipPolicy::EPUB.max_entry_size;
 /// Soma dos tamanhos descompactados de todas as entradas.
-pub const MAX_TOTAL_SIZE: u64 = 1024 * 1024 * 1024;
+pub const MAX_TOTAL_SIZE: u64 = ZipPolicy::EPUB.max_total_size;
 /// Razão máxima entre tamanho descompactado e comprimido.
-pub const MAX_COMPRESSION_RATIO: u64 = 200;
+pub const MAX_COMPRESSION_RATIO: u64 = ZipPolicy::EPUB.max_compression_ratio;
 /// Entradas até este tamanho não têm a razão medida.
-pub const RATIO_CHECK_MIN_SIZE: u64 = 64 * 1024;
+pub const RATIO_CHECK_MIN_SIZE: u64 = ZipPolicy::EPUB.ratio_check_min_size;
 /// Bytes do nome de uma entrada.
-pub const MAX_NAME_LEN: usize = 1024;
+pub const MAX_NAME_LEN: usize = ZipPolicy::EPUB.max_name_len;
 /// Bytes do campo extra de uma entrada.
-pub const MAX_EXTRA_LEN: usize = 4096;
+pub const MAX_EXTRA_LEN: usize = ZipPolicy::EPUB.max_extra_len;
 /// Bytes do comentário de uma entrada.
-pub const MAX_COMMENT_LEN: usize = 4096;
+pub const MAX_COMMENT_LEN: usize = ZipPolicy::EPUB.max_comment_len;
 
 const EOCD_SIG: u32 = 0x0605_4b50;
 const EOCD_LEN: usize = 22;
@@ -920,4 +948,55 @@ fn le64(bytes: &[u8], at: usize) -> u64 {
     let mut word = [0u8; 8];
     word.copy_from_slice(&bytes[at..at + 8]);
     u64::from_le_bytes(word)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::epub::test_support::ZipBuilder;
+
+    #[test]
+    fn epub_policy_is_unchanged_by_the_safezip_move() {
+        assert_eq!(ZipPolicy::EPUB.max_entries, 20_000);
+        assert_eq!(ZipPolicy::EPUB.max_entry_size, 64 * 1024 * 1024);
+        assert_eq!(ZipPolicy::EPUB.max_total_size, 1024 * 1024 * 1024);
+        assert_eq!(ZipPolicy::EPUB.max_compression_ratio, 200);
+        assert_eq!(ZipPolicy::EPUB.ratio_check_min_size, 64 * 1024);
+        assert_eq!(ZipPolicy::EPUB.max_name_len, 1024);
+        assert_eq!(ZipPolicy::EPUB.max_extra_len, 4096);
+        assert_eq!(ZipPolicy::EPUB.max_comment_len, 4096);
+        assert_eq!(MAX_ENTRIES, ZipPolicy::EPUB.max_entries);
+        assert_eq!(MAX_ENTRY_SIZE, ZipPolicy::EPUB.max_entry_size);
+        assert_eq!(MAX_TOTAL_SIZE, ZipPolicy::EPUB.max_total_size);
+        assert_eq!(MAX_COMPRESSION_RATIO, ZipPolicy::EPUB.max_compression_ratio);
+        assert_eq!(RATIO_CHECK_MIN_SIZE, ZipPolicy::EPUB.ratio_check_min_size);
+        assert_eq!(MAX_NAME_LEN, ZipPolicy::EPUB.max_name_len);
+        assert_eq!(MAX_EXTRA_LEN, ZipPolicy::EPUB.max_extra_len);
+        assert_eq!(MAX_COMMENT_LEN, ZipPolicy::EPUB.max_comment_len);
+    }
+
+    #[test]
+    fn central_directory_truncations_and_bit_flips_never_panic() {
+        let seed = ZipBuilder::new()
+            .stored("mimetype", b"application/epub+zip")
+            .deflated("chapter.xhtml", b"<p>Texto de teste</p>")
+            .build();
+        assert!(EpubArchive::from_bytes(seed.clone()).is_ok());
+        for len in 0..seed.len().min(4096) {
+            let bytes = seed[..len].to_vec();
+            assert!(
+                std::panic::catch_unwind(|| EpubArchive::from_bytes(bytes)).is_ok(),
+                "parser panicou após corte em {len}"
+            );
+        }
+        for flip in 0..257usize {
+            let mut bytes = seed.clone();
+            let offset = flip.wrapping_mul(97) % bytes.len();
+            bytes[offset] ^= 1 << (flip % 8);
+            assert!(
+                std::panic::catch_unwind(|| EpubArchive::from_bytes(bytes)).is_ok(),
+                "parser panicou após bit flip {flip}"
+            );
+        }
+    }
 }

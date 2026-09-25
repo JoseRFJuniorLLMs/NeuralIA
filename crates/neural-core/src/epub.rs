@@ -18,10 +18,10 @@
 //! Nada aqui escreve no disco nem acessa a rede; a biblioteca em
 //! [`crate::library`] é quem copia livros e capas para a pasta do usuário.
 
-mod archive;
+use crate::safezip as archive;
 mod book;
 mod toc;
-mod xml;
+pub(crate) mod xml;
 
 #[cfg(test)]
 pub(crate) mod test_support;
