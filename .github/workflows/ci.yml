@@ -73,6 +73,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $defaultSourcePath = "crates/neural-app/src/windows_app.rs"
+          $comparatorInjectPath = "crates/neural-app/src/windows_app/page_scripts.rs"
           $utf8 = [Text.UTF8Encoding]::new($false)
 
           function Write-Exact([string]$path, [string]$text) {
