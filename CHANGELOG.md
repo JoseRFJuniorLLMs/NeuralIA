@@ -4,6 +4,9 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+### Testing
+- **infra-accel-spike (693bf7f):** job novo `accel-spike` no CI (windows-latest). O exe de release compilado com a feature de CI `accel-spike` instala um `AcceleratorKeyPressed` que marca `Handled` só nos dez atalhos nativos por omissão do plano da 2.3 (Ctrl+D, Ctrl+J, Ctrl+Shift+E/A/N/P/S/F, F1, Ctrl+O) nas WebViews da coluna, do Split, do Split privado, da Web externa, do Leitor, do PDF, dos livros (EPUB), do painel do Ctrl+H e do painel de serviços; `scripts/test-accel-spike.ps1` carrega em cada atalho em cada uma (uma vez e com a tecla presa), com uma fixture em 127.0.0.1 e o `NEURALIA_KEYMAP_SCRIPT` real, imprime a tabela por hospedeiro e falha se a página vir o keydown, se um `act()` do mapa de teclas disparar ou se o lado nativo não disparar exatamente uma vez. O mesmo job sabota `Handled=false` e exige que a tabela mostre a página a ver a tecla. Nada disto chega ao utilizador: o exe publicado é compilado sem a feature — o job `windows` prova que o marcador do spike não está no `ci-tested/NeuralIA.exe` (`scripts/test-accel-spike-marker.ps1`) e `scripts/test-release-contract.mjs` prende isso ao `ci.yml`, com cinco sabotagens vermelhas (a feature por omissão, o build do `windows` com a feature, o marcador pedido presente, o módulo sem `cfg`, um upload no job do spike). A tabela e a decisão que ela pede ao dono (despacho nativo, guarda de uma linha no mapa de teclas ou número IPC reservado) saem da primeira corrida deste job.
+
 ## [2.2.0] - 2026-09-25
 
 ### Added
