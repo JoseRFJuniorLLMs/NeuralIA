@@ -21,3 +21,7 @@ pub(super) use split::*;
 pub(super) mod pages;
 #[allow(unused_imports)]
 pub(super) use pages::*;
+
+pub(super) mod chrome;
+#[allow(unused_imports)]
+pub(super) use chrome::*;
