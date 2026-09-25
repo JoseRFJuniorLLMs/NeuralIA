@@ -23,7 +23,56 @@
 //! (`decide_agent_step` e `route_input` são os modelos). Aqui fica só o que o
 //! texto consegue provar: presença e, sobretudo, **ausência**.
 
-const APP: &str = include_str!("../src/windows_app.rs");
+const ALL_SOURCES: &str = concat!(
+    include_str!("../src/windows_app.rs"),
+    "\n",
+    include_str!("../src/windows_app/theme.rs"),
+    "\n",
+    include_str!("../src/windows_app/icons.rs"),
+    "\n",
+    include_str!("../src/windows_app/bar_layout.rs"),
+    "\n",
+    include_str!("../src/windows_app/tab_row.rs"),
+    "\n",
+    include_str!("../src/windows_app/native.rs"),
+    "\n",
+    include_str!("../src/windows_app/splash.rs"),
+    "\n",
+    include_str!("../src/windows_app/page_scripts.rs"),
+    "\n",
+    include_str!("../src/windows_app/notes.rs"),
+    "\n",
+    include_str!("../src/windows_app/side_panel.rs"),
+    "\n",
+    include_str!("../src/windows_app/services.rs"),
+    "\n",
+    include_str!("../src/windows_app/search_card.rs"),
+    "\n",
+    include_str!("../src/windows_app/app/mod.rs"),
+    "\n",
+    include_str!("../src/windows_app/app/gmail.rs"),
+    "\n",
+    include_str!("../src/windows_app/app/tools.rs"),
+    "\n",
+    include_str!("../src/windows_app/app/navigation.rs"),
+    "\n",
+    include_str!("../src/windows_app/app/panels.rs"),
+    "\n",
+    include_str!("../src/windows_app/app/split.rs"),
+    "\n",
+    include_str!("../src/windows_app/app/pages.rs"),
+    "\n",
+    include_str!("../src/windows_app/app/chrome.rs"),
+    "\n",
+    include_str!("../src/windows_app/app/compare.rs"),
+    "\n",
+    include_str!("../src/windows_app/app/tabs.rs"),
+    "\n",
+    include_str!("../src/windows_app/app/event_loop.rs"),
+    "\n",
+    include_str!("../src/windows_app/tests.rs"),
+);
+const APP: &str = ALL_SOURCES;
 const IPC: &str = include_str!("../src/ipc.rs");
 const CORE_MEMORY: &str = include_str!("../../neural-core/src/memory.rs");
 const LOCAL_INTELLIGENCE: &str = include_str!("../../neural-core/src/local_intelligence.rs");
@@ -69,7 +118,12 @@ fn spec_0100_product_memory_is_worker_backed_reader_wired_and_private_safe() {
 
 #[test]
 fn spec_0101_product_research_session_wires_capture_compare_synthesis_and_export() {
-    assert!(APP.contains("let session = ResearchSession::new(query.clone());"));
+    // A sessao e a memoria de uma comparacao saem de `compare_records` (o
+    // Traduzir leva o nome do texto, nao o do pedido fixo), testado pelo
+    // comportamento em
+    // `windows_app::tests::each_translation_is_named_by_its_text_and_reopens_from_history`.
+    assert!(APP.contains("ResearchSession::new(request.prompt.clone()).titled(&request.label)"));
+    assert!(APP.contains("let (session, question_memory, reopen) = compare_records(&request);"));
     assert!(APP.contains("self.memory.capture(question_memory);"));
     assert!(APP.contains("self.memory.save_session(session.clone());"));
     assert!(APP.contains("let facts = session.comparison(&ids);"));
@@ -178,10 +232,54 @@ fn spec_0106_roadmap_product_composition_is_wired_not_just_constructible() {
     assert!(APP.contains("fn route_input("));
     assert!(APP.contains("match route_input(&input)"));
 
-    assert!(APP.contains("ResearchSession::new(query.clone())"));
+    assert!(APP.contains("ResearchSession::new(request.prompt.clone())"));
     assert!(APP.contains("self.memory.capture(question_memory);"));
     assert!(APP.contains("decide_agent_step("));
     assert!(APP.contains("function semanticAnchors()"));
     assert!(APP.contains("parse_ipc_message(request.body()"));
     assert!(IPC.contains("pub fn parse_ipc_message("));
+}
+
+/// `ALL_SOURCES` e uma lista a mao, e os gates de ausencia deste ficheiro
+/// (SPEC-0102, SPEC-0105) so valem sobre o que ela contem: um modulo que
+/// ficasse de fora podia trazer o `ModelPackManager` ou o `AgentRuntime` sem
+/// que nada aqui ficasse vermelho. Este gate le a arvore `src/windows_app`
+/// no disco e exige o texto de cada ficheiro, e o da raiz, dentro de
+/// `ALL_SOURCES`.
+#[test]
+fn all_sources_holds_every_file_of_the_windows_app_tree() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read src/windows_app") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = vec![manifest.join("src/windows_app.rs")];
+    walk(&manifest.join("src/windows_app"), &mut files);
+    files.sort();
+    assert!(
+        files.len() >= 20,
+        "so {} ficheiros em src/windows_app?",
+        files.len()
+    );
+
+    let all = ALL_SOURCES.replace("\r\n", "\n");
+    let mut missing = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file)
+            .expect("read module")
+            .replace("\r\n", "\n");
+        if !all.contains(text.trim_end()) {
+            missing.push(file.display().to_string());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "ficheiros de src/windows_app fora de ALL_SOURCES: {missing:?}"
+    );
 }

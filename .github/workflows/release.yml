@@ -244,4 +244,12 @@ jobs:
           git tag -a "$RELEASE_TAG" "$TESTED_SHA" -m "NeuralIA $RELEASE_TAG"
           git push origin "refs/tags/$RELEASE_TAG"
 
-          gh release create "$RELEASE_TAG" dist/NeuralIA-Setup-*-x64.exe             --repo "$GITHUB_REPOSITORY"             --verify-tag             --title "NeuralIA $RELEASE_TAG"             --generate-notes
+          # Two release rhythms (AGENTS.md 2.1): an X.0.Z version is an LTS line
+          # and becomes Latest; every other version is a preview (pre-release).
+          if [[ "$RELEASE_TAG" =~ ^v[0-9]+\.0\.[0-9]+$ ]]; then
+            channel_flag="--latest"
+          else
+            channel_flag="--prerelease"
+          fi
+
+          gh release create "$RELEASE_TAG" dist/NeuralIA-Setup-*-x64.exe             --repo "$GITHUB_REPOSITORY"             --verify-tag             --title "NeuralIA $RELEASE_TAG"             --generate-notes             "$channel_flag"

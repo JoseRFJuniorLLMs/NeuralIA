@@ -1620,8 +1620,9 @@ dependencies = [
 
 [[package]]
 name = "neural-app"
-version = "2.1.8"
+version = "2.2.0"
 dependencies = [
+ "flate2",
  "image",
  "neural-core",
  "serde_json",
@@ -1636,8 +1637,10 @@ dependencies = [
 
 [[package]]
 name = "neural-core"
-version = "2.1.8"
+version = "2.2.0"
 dependencies = [
+ "flate2",
+ "quick-xml",
  "rusqlite",
  "scraper",
  "serde",
@@ -1650,7 +1653,7 @@ dependencies = [
 
 [[package]]
 name = "neural-setup"
-version = "2.1.8"
+version = "2.2.0"
 dependencies = [
  "image",
  "neural-core",

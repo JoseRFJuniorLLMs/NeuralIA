@@ -69,15 +69,22 @@ Uma string JSON, sempre com estes quatro campos e nenhum outro:
 - `action` — um nome da lista fechada de SPEC-0005 (`home`, `back`, `restore`,
   `autoscroll`, `zoomin`, `zoomout`, `zoomreset`, `reload`, `print`, `omnibox`,
   `history`, `clearhistory`, `fullscreen`, `devtools`, `viewsource`, `newtab`,
-  `expand`, `shortcut-expand`, `minimize`, `split`, `link`, `split-close`, `split-expand`, `palette`,
-  `gmail-state`, `research-answer`, `agent-observation`). Nome fora da lista →
+  `expand`, `shortcut-expand`, `minimize`, `split`, `link`, `ask`, `search`, `split-close`, `split-expand`, `palette`,
+  `gmail-state`, `research-answer`, `agent-observation`, `hint`, `note`). Nome fora da lista →
   ignorado.
 - `args` — objeto com os parâmetros exatos da ação (`col`, `url`, `aside`, `count`,
-  `sender`, `subject`, `key`, `text`, `data`). Campos extras ou tipos errados
-  são rejeitados; índices são validados contra `COMPARATOR_COLUMNS`; `url`
+  `sender`, `subject`, `key`, `text`, `data`, `id`, `intent`, `via`). Campos extras ou tipos errados
+  são rejeitados; os nomes fechados também: `search` leva `text` e `intent`, que é
+  exatamente `ask` (Mandar para IA) ou `translate` (Traduzir) — sem `intent`, ou com
+  outro nome, maiúsculas ou outro tipo, é recusado, nunca lido como `ask`; `note` vai
+  sem argumentos (Ctrl+Shift+Z) ou com exatamente `via` igual a `bar` e `text` (o Salvar
+  nota da barra de seleção, com o texto que a barra mostra), e nunca um endereço ou
+  título da página; índices são validados contra `COMPARATOR_COLUMNS`; `url`
   passa por `validate_web_url` e rejeita alvos locais/privados/special óbvios
   antes de DNS; a camada IPC não afirma filtragem DNS pré-conexão do WebView2; strings são
-  recusadas acima dos limites definidos (180/2048 chars e payload do observer
+  recusadas acima dos limites definidos (180/2048 chars, 2000 chars no `text` de `ask` e
+  `search`, 5000 chars no `text` de `note`, sem caracteres de controle além de `\n` e
+  `\t` nos dois da barra, e payload do observer
   limitado antes da serialização).
 
 Tamanho máximo da mensagem: 8 KiB. Acima disso é descartada sem parse.
@@ -149,8 +156,9 @@ A SPEC-0108 só passa a "Implementada" quando, no CI:
 
 1. Teste unitário do parser de mensagens: rejeita corpo > 8 KiB, `v != 1`,
    `cap` ausente/errado/com comprimento diferente, `action` fora da lista,
-   `args` com tipos errados; aceita cada uma das 29 ações com `args` válidos e o conjunto aceite é
-   exatamente o publicado na SPEC-0005 (`protocol_accepts_exactly_the_twenty_nine_published_actions`).
+   `args` com tipos errados; aceita cada uma das 31 ações com `args` válidos e o conjunto aceite é
+   exatamente o publicado na SPEC-0005 e nesta lista (`protocol_accepts_exactly_the_published_actions`,
+   com a contagem na constante `PUBLISHED_ACTION_COUNT`).
 2. Teste: nenhuma constante de script injetado contém `location.href = 'neuralia:`
    nem `neuralia:` + `?cap=` — exceto no HTML do Reader (`render.rs`), que não
    pode conter `cap` de todo.

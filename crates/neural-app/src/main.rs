@@ -8,6 +8,10 @@
 // de `cfg(target_os = "windows")` por arrastamento, o que deixava a superfície
 // mais sensível do produto sem ser compilada nem testada fora do Windows.
 // Fora do Windows ninguém o chama ainda; daí o `allow(dead_code)`.
+// O leitor de EPUB (servidor da origem, parser do IPC, worker da biblioteca)
+// também é portátil: os gates correm no runner Linux do CI.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod epub_app;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod ipc;
 // Botoes da janela na Home, largura do painel lateral, roda do rato sobre ele
@@ -20,11 +24,20 @@ mod pdf_assets;
 // tambem no runner Linux. So o Windows o chama.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod tab_session;
+// O script da leitura em voz alta e os seus gates (node:vm) nao dependem do
+// Windows: correm tambem no CI Linux.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod read_aloud;
 // Gemini Live: origem propria, canal fechado e chave com DPAPI (Windows).
 #[cfg(target_os = "windows")]
 mod gemini_live;
 #[cfg(target_os = "windows")]
 mod windows_app;
+
+// Pomodoro da barra: so decisoes (clique, menu, `pomodoro:`, tique, opcoes em
+// disco), sem Win32 -- testavel em qualquer plataforma.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod pomodoro_ui;
 
 #[cfg(target_os = "windows")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {

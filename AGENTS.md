@@ -34,6 +34,27 @@ Os dois checkouts (`D:\DEV\NeuralIA` e `D:\DEV\NeuralIA-audit`) continuam a ser 
 - O bump **exige o sim explícito do dono** mesmo com dois agentes ativos. Não é uma formalidade: é o último ponto em que um humano vê o que vai sair para os utilizadores antes de o pacote existir. Nenhum agente faz `release:` por iniciativa própria, mesmo com o gate verde.
 - Uma versão só sobe depois de o `CHANGELOG` ter uma secção `## [Unreleased]` completa e verdadeira (§3). O commit de release converte `[Unreleased]` em `[x.y.z]`.
 
+### 2.1 Dois ritmos de release (decisão do dono, 25/09/2026)
+
+Compilar e verificar tudo em cada tarefa custava horas e esgotava os limites dos agentes. Desde 25/09/2026 há dois ritmos:
+
+- **LTS**: versões `X.0.Z` (3.0.0, 3.0.1, 4.0.0, 5.0.0…). Publicadas como **Latest**. Antes do bump de uma LTS passa-se o processo completo sobre tudo o que entrou desde a LTS anterior:
+  - revisão adversarial por área;
+  - verificador independente;
+  - sabotagem em todos os gates críticos tocados;
+  - análise das medições do §4.1 contra a LTS anterior (o CI já as corre em cada PR);
+  - auditoria das afirmações da documentação (§3).
+- **Prévia**: qualquer outra versão (2.2.0, 3.1.0, 3.2.1…). Publicada como **pre-release** do GitHub, nunca como Latest. Em cada tarefa:
+  - um agente constrói e corre localmente só o que alterou (`cargo check`, `cargo test -p <crate>` ou o filtro dos testes tocados);
+  - o gate completo do §4.1, medições incluídas, é o CI do PR;
+  - revisão independente só quando a tarefa toca num gate crítico do §4.2 (segurança, dados do utilizador, entrada não confiável, release): um revisor, sem verificador separado.
+- O `release.yml` escolhe o canal pela versão, e `scripts/test-release-contract.mjs` guarda essa regra.
+- Nos dois ritmos continuam em vigor:
+  - o sim do dono para o bump (acima);
+  - o §3: docs descrevem código;
+  - a sabotagem nos gates críticos (§4.2);
+  - as áreas sensíveis do §7.
+
 ## 3. Docs descrevem código, nunca planos
 
 - Uma frase entra em `SECURITY.md`, `README.md`, `docs/specs/*.md`, `md/*.md` ou `CHANGELOG.md` **só quando o código existe e há um teste que a exercita**. Se o teste não existe, a frase não existe.
@@ -93,7 +114,7 @@ de prompt desligada. O código sabotado nunca sai da máquina.
 
 ### 4.3 Testar o que embarca, não uma biblioteca paralela
 
-Um teste que exercita uma biblioteca que o produto não usa não prova nada sobre o produto. `neural-app` é um binário, mas isso **não** é impedimento: o bloco `#[cfg(test)] mod tests` dentro do próprio `windows_app.rs` alcança as funções privadas. É lá que os gates do produto vivem.
+Um teste que exercita uma biblioteca que o produto não usa não prova nada sobre o produto. `neural-app` é um binário, mas isso **não** é impedimento: o módulo `windows_app/tests.rs` (o `#[cfg(test)] mod tests` do `windows_app.rs`) alcança os itens privados da raiz `windows_app.rs` e, nos módulos filhos da árvore `windows_app/`, tudo o que está marcado `pub(in crate::windows_app)` -- um item privado de `app/tabs.rs` não lhe chega. É lá que os gates do produto vivem.
 
 Quando a decisão está entalada dentro de um método `&mut self` cheio de UI, extrai-se a decisão para uma função que não toca em janelas (`decide_agent_step` é o modelo) e testa-se essa. Asserções sobre o **texto do ficheiro-fonte** não são gates de comportamento: falham com um `rustfmt` e passam com o código desligado. Servem só para proibir a *presença* de algo, nunca para afirmar que algo funciona.
 

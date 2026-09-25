@@ -11,6 +11,10 @@ repository.workspace = true
 sha2 = "0.10.9"
 
 [dependencies]
+# EPUB: inflate das entradas do ZIP e parser do OPF/NCX/nav. Os dois já
+# estavam no Cargo.lock como transitivos; nenhum crate novo entra.
+flate2 = "1.1.10"
+quick-xml = { version = "0.41.0", default-features = false }
 scraper = "0.27"
 serde.workspace = true
 serde_json.workspace = true

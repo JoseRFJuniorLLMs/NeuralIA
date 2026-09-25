@@ -6,7 +6,7 @@
 
 ## What NeuralIA is
 
-NeuralIA **v2.1.8** is an AI-first, reader-first, system-WebView information client written in Rust.
+NeuralIA **v2.2.0** is an AI-first, reader-first, system-WebView information client written in Rust.
 
 It deliberately refuses the usual browser arms race. It does not ship Chromium, does not implement its own JavaScript engine, does not carry a local LLM, and does not recreate a full browser tab strip just to prove that rectangles can multiply.
 
@@ -124,6 +124,7 @@ NeuralIA/
 | `como funciona Raft?` | Comparador: Gemini + ChatGPT + Claude |
 | `? MVCC vs OCC` | Google AI Mode |
 | `compare: MVCC vs OCC` | Comparador explícito: Gemini + ChatGPT + Claude |
+| `traduzir: Good morning` | Tradução nas 3 IAs (para o português do Brasil; um texto já em português vai para o inglês) — é o que o Histórico guarda de um Traduzir da barra de seleção |
 | `https://example.com/paper.pdf` | Visualizador de PDF embutido (o Reader só lê HTML) |
 | `https://example.com/article` | Reader |
 | `reader:https://example.com` | Reader |
@@ -171,6 +172,7 @@ before the site sees the key. They work on every surface unless noted.
 | `Ctrl+F` | in-page find bar (Enter / Shift+Enter / Esc) |
 | `Ctrl+P` | print the page you are looking at |
 | `Ctrl+H` | semantic local memory search (`memory:`) |
+| `Ctrl+Shift+Z` | note from the selected text, with the page as its source, opened in the Notes tab of the side panel (inside a text field it stays redo; refused in the private split); on Home, a new blank note |
 | `Ctrl+Shift+Delete` | clear local history (the WebView2 profile is untouched) |
 | `F12` · `Ctrl+Shift+I/J/C` | Chromium DevTools |
 | `Ctrl+U` | view page source |
@@ -179,6 +181,13 @@ before the site sees the key. They work on every surface unless noted.
 | `1` `2` `3` · `0` | expand a comparator column · restore three columns |
 
 `Backspace` and the digits are ignored while typing in a field; `Ctrl` combinations are not.
+
+**Exception: Livros (EPUB).** The book library and the EPUB reader do not receive
+this keymap, so NeuralIA's own shortcuts (for example `Ctrl+H`, `Ctrl+Shift+Z`,
+`Ctrl+Shift+Delete`, `Ctrl+L`, `Ctrl+T` · `Ctrl+W` and `F8`) do nothing there.
+Inside Livros, `Ctrl+O` adds books, `Ctrl+F` searches (the library, or the open
+book) and `Esc` goes back (reader → library → Home); leave with `Esc` to reach the
+other tools.
 
 ## Comparator timelines
 
@@ -193,7 +202,8 @@ Opening a document asks once per session whether to advance the page automatical
 (**Sim** / **Não**, bottom centre). With **Sim**, the page moves one screen every
 30 seconds and stops at the end. HTML and comparator surfaces advance by script;
 PDFs use NeuralIA's bundled offline PDF.js viewer and advance page-by-page. `F8` toggles
-it at any time. EPUB is not supported: WebView2 does not open it.
+it at any time. EPUB files do not open in WebView2; NeuralIA opens them in its own library and
+reader instead (`livros:` or `epub:<path>` in the omnibox, `Ctrl+O` on Home).
 
 ## v1.0.1 hardening baseline
 

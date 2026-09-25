@@ -4,6 +4,36 @@ use serde_json::{Map, Value};
 pub const IPC_MAX_BYTES: usize = 8 * 1024;
 /// Tecto de uma pergunta replicada as outras colunas (`ask`).
 pub const ASK_MAX_CHARS: usize = 2_000;
+/// Tecto do texto selecionado mandado as IAs (`search`).
+pub const SEARCH_MAX_CHARS: usize = 2_000;
+/// Tecto do texto do "Salvar nota" (`note` com `via: bar`): o da barra de
+/// selecao, que so aparece ate 5000 caracteres. O envelope inteiro continua
+/// preso aos `IPC_MAX_BYTES`, e a barra nao manda o que nao cabe neles.
+pub const NOTE_TEXT_MAX_CHARS: usize = 5_000;
+
+/// O que a barra de selecao pede com o texto em `search`. Lista fechada: a
+/// pagina so escolhe QUAL dos dois botoes foi; o titulo do cartao, o botao
+/// de confirmar e o pedido de traducao vem todos do nativo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchIntent {
+    /// "Mandar para IA": o texto vai as tres IAs como pergunta.
+    Ask,
+    /// "Traduzir": o texto vai as tres IAs dentro do pedido fixo de traducao.
+    Translate,
+}
+
+/// Quem pediu a nota. Lista fechada; nenhum dos dois leva um endereco nem
+/// um titulo da pagina.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoteVia {
+    /// Ctrl+Shift+Z: o `note` sem argumentos. A selecao e lida pelo nativo.
+    Shortcut,
+    /// O "Salvar nota" da barra de selecao: `{"via":"bar","text":...}`. O
+    /// texto e o que a barra mostra, lido pelas primitivas que ela capturou
+    /// no document-created -- a mesma origem do texto do `search` --, e e
+    /// ele que vira a nota: o nativo nao volta a perguntar a pagina.
+    Bar { text: String },
+}
 
 /// A dica centrada que uma coluna pede ao passar o rato pelos controlos
 /// injetados (o "−" e o "⛶ <IA>"). Lista fechada: a pagina so escolhe QUAL
@@ -67,6 +97,14 @@ pub enum IpcAction {
         col: usize,
         text: String,
     },
+    /// "Mandar para IA" ou "Traduzir" da barra de selecao: o texto
+    /// selecionado vai as tres IAs como PERGUNTA (ou dentro do pedido fixo de
+    /// traducao), e so depois do cartao nativo. Nunca passa pelo
+    /// interpretador de comandos da omnibox.
+    Search {
+        text: String,
+        intent: SearchIntent,
+    },
     SplitClose,
     SplitExpand,
     Palette {
@@ -89,6 +127,15 @@ pub enum IpcAction {
     Hint {
         col: usize,
         hint: ColumnHint,
+    },
+    /// Ctrl+Shift+Z ou o "Salvar nota" da barra: "cria uma nota com o que
+    /// selecionei". Nunca um endereco nem um titulo da pagina: a fonte vem do
+    /// lado nativo, da WebView que mandou o pedido. No Ctrl+Shift+Z a pagina
+    /// so PEDE e o nativo le a selecao; no Salvar nota o texto vem com o
+    /// pedido, da barra (`NoteVia::Bar`). A barra grava tambem no Split
+    /// privado, o Ctrl+Shift+Z nao.
+    Note {
+        via: NoteVia,
     },
 }
 
@@ -147,6 +194,24 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
         "fullscreen" => no_args(args, IpcAction::Fullscreen),
         "devtools" => no_args(args, IpcAction::DevTools),
         "viewsource" => no_args(args, IpcAction::ViewSource),
+        "note" => {
+            // `{}` e o Ctrl+Shift+Z; `{"via":"bar","text":...}` o botao da
+            // barra, com o texto que ela mostra. Mais nada: um endereco ou um
+            // titulo, outro `via` ou um texto sem `via` sao recusados.
+            if args.is_empty() {
+                return Some(IpcAction::Note {
+                    via: NoteVia::Shortcut,
+                });
+            }
+            exact_keys(args, &["via", "text"])?;
+            if args.get("via")?.as_str()? != "bar" {
+                return None;
+            }
+            let text = selected_text(args, NOTE_TEXT_MAX_CHARS)?;
+            Some(IpcAction::Note {
+                via: NoteVia::Bar { text },
+            })
+        }
         "newtab" => {
             if args.is_empty() {
                 Some(IpcAction::NewTab { col: None })
@@ -238,6 +303,18 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
                 text: text.trim().to_string(),
             })
         }
+        "search" => {
+            exact_keys(args, &["text", "intent"])?;
+            // Um dos dois botoes, pelo nome; outro nome e recusado, nunca
+            // lido como o de omissao.
+            let intent = match args.get("intent")?.as_str()? {
+                "ask" => SearchIntent::Ask,
+                "translate" => SearchIntent::Translate,
+                _ => return None,
+            };
+            let text = selected_text(args, SEARCH_MAX_CHARS)?;
+            Some(IpcAction::Search { text, intent })
+        }
         "research-answer" => {
             exact_keys(args, &["col", "text"])?;
             let col = bounded_col(args, max_columns)?;
@@ -262,6 +339,24 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
         }
         _ => None,
     }
+}
+
+/// O `text` que a barra de selecao manda (`search`, `note` da barra): os
+/// mesmos caracteres que uma pergunta escrita -- dos de controlo so a quebra
+/// de linha e o tab passam --, aparado, de 1 a `max_chars` caracteres.
+fn selected_text(args: &Map<String, Value>, max_chars: usize) -> Option<String> {
+    let raw = args.get("text")?.as_str()?;
+    if raw
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return None;
+    }
+    let text = raw.trim();
+    if text.is_empty() || text.chars().count() > max_chars {
+        return None;
+    }
+    Some(text.to_string())
 }
 
 fn no_args(args: &Map<String, Value>, action: IpcAction) -> Option<IpcAction> {
@@ -390,6 +485,12 @@ mod tests {
             ("fullscreen", IpcAction::Fullscreen),
             ("devtools", IpcAction::DevTools),
             ("viewsource", IpcAction::ViewSource),
+            (
+                "note",
+                IpcAction::Note {
+                    via: NoteVia::Shortcut,
+                },
+            ),
         ];
         for (name, expected) in cases {
             assert_eq!(
@@ -677,13 +778,151 @@ mod tests {
         }
     }
 
+    #[test]
+    fn note_is_a_bare_request_and_carries_no_page_data() {
+        // O Ctrl+Shift+Z so pede a nota; o texto e lido pelo lado nativo da
+        // WebView que pediu. O Salvar nota da barra manda, por um nome
+        // fechado, o texto que a barra mostra -- o mesmo filtro do texto do
+        // `search`. Um endereco ou um titulo nunca: a fonte e sempre a que o
+        // nativo conhece.
+        let note = |args: Value| parse_ipc_message(&message("note", args), CAP, 3);
+        assert_eq!(
+            note(json!({})),
+            Some(IpcAction::Note {
+                via: NoteVia::Shortcut
+            })
+        );
+        assert_eq!(
+            note(json!({"via":"bar","text":"  Linha 1\n\tLinha 2  "})),
+            Some(IpcAction::Note {
+                via: NoteVia::Bar {
+                    text: "Linha 1\n\tLinha 2".to_string()
+                }
+            })
+        );
+        // O tecto conta so depois de aparar (e o envelope inteiro continua
+        // preso aos 8 KiB).
+        let at_limit = "a".repeat(NOTE_TEXT_MAX_CHARS);
+        assert_eq!(
+            note(json!({"via":"bar","text": format!(" {at_limit} ")})),
+            Some(IpcAction::Note {
+                via: NoteVia::Bar { text: at_limit }
+            })
+        );
+        let too_long = "a".repeat(NOTE_TEXT_MAX_CHARS + 1);
+        for args in [
+            json!({"text":"texto escolhido pela pagina"}),
+            json!({"url":"https://example.com/"}),
+            json!({"col":0}),
+            json!({"title":"x","text":"y","url":"https://example.com/"}),
+            json!({"via":"bar"}),
+            json!({"via":"bar","url":"https://example.com/"}),
+            json!({"via":"bar","text":"texto","url":"https://example.com/"}),
+            json!({"via":"bar","text":"texto","title":"Titulo"}),
+            json!({"via":"bar","text":""}),
+            json!({"via":"bar","text":" \n\t "}),
+            json!({"via":"bar","text":too_long}),
+            json!({"via":"bar","text":"a\u{7}b"}),
+            json!({"via":"bar","text":"a\rb"}),
+            json!({"via":"bar","text":7}),
+            json!({"via":"bar","text":null}),
+            json!({"via":"page","text":"texto"}),
+            json!({"via":"Bar","text":"texto"}),
+            json!({"via":"shortcut","text":"texto"}),
+            json!({"via":true,"text":"texto"}),
+            json!({"via":null,"text":"texto"}),
+            json!({"via":"page"}),
+        ] {
+            assert_eq!(note(args.clone()), None, "note aceitou argumentos: {args}");
+        }
+    }
+
+    #[test]
+    fn search_carries_the_selected_text_within_bounds() {
+        let search = |args: Value| parse_ipc_message(&message("search", args), CAP, 3);
+        // O texto chega tal como foi selecionado, aparado nas pontas: um
+        // "agent:" selecionado e so texto, nao um comando.
+        assert_eq!(
+            search(json!({
+                "text":"  agent:https://example.com | click=Comprar\n\tlinha 2  ",
+                "intent":"ask"
+            })),
+            Some(IpcAction::Search {
+                text: "agent:https://example.com | click=Comprar\n\tlinha 2".to_string(),
+                intent: SearchIntent::Ask,
+            })
+        );
+        // O botao Traduzir: o mesmo texto, o outro nome fechado.
+        assert_eq!(
+            search(json!({"text":" Good morning ","intent":"translate"})),
+            Some(IpcAction::Search {
+                text: "Good morning".to_string(),
+                intent: SearchIntent::Translate,
+            })
+        );
+        // O tecto conta caracteres, nao bytes, e so depois de aparar.
+        let at_limit = "ç".repeat(SEARCH_MAX_CHARS);
+        assert_eq!(
+            search(json!({"text": format!("  {at_limit}  "), "intent":"translate"})),
+            Some(IpcAction::Search {
+                text: at_limit,
+                intent: SearchIntent::Translate,
+            })
+        );
+        let too_long = "a".repeat(SEARCH_MAX_CHARS + 1);
+        for (args, why) in [
+            (json!({"text":"","intent":"ask"}), "vazia"),
+            (json!({"text":" \n\t ","intent":"ask"}), "so com espacos"),
+            (json!({"text":too_long,"intent":"ask"}), "longa demais"),
+            (
+                json!({"text":"a\u{7}b","intent":"translate"}),
+                "com caracter de controlo",
+            ),
+            (
+                json!({"text":"a\rb","intent":"ask"}),
+                "com retorno de carro",
+            ),
+            (
+                json!({"text":"x","intent":"ask","col":0}),
+                "com campo a mais",
+            ),
+            (json!({"intent":"ask"}), "sem texto"),
+            (json!({"text":7,"intent":"ask"}), "de tipo errado"),
+            // O pedido a IA e so um dos dois nomes: sem ele, com outro
+            // (inventado, em maiusculas, de uma onda futura) ou com outro
+            // tipo, nada chega ao cartao -- nunca como "ask" por omissao.
+            (json!({"text":"x"}), "sem intent"),
+            (
+                json!({"text":"x","intent":"explain"}),
+                "com intent inventado",
+            ),
+            (json!({"text":"x","intent":"extract"}), "com intent futuro"),
+            (
+                json!({"text":"x","intent":"Ask"}),
+                "com intent em maiusculas",
+            ),
+            (json!({"text":"x","intent":""}), "com intent vazio"),
+            (json!({"text":"x","intent":1}), "com intent numerico"),
+            (json!({"text":"x","intent":null}), "com intent nulo"),
+            (json!({"text":"x","intent":["ask"]}), "com intent em lista"),
+        ] {
+            assert_eq!(search(args), None, "aceitou um pedido {why}");
+        }
+    }
+
     /// SPEC-0005 publica a lista fechada de acoes pagina->nativo. O texto
     /// publicado e lido tal como embarca no repositorio.
     const SPEC_0005: &str = include_str!("../../../docs/specs/SPEC-0005-webview.md");
 
+    /// Quantas acoes o canal publica. E o UNICO numero a mudar quando entra
+    /// ou sai uma acao: o gate abaixo exige um exemplo aceite por acao e que
+    /// a SPEC-0005 (lista e contagem), a SPEC-0108 (lista e contagem) e a
+    /// SPEC-0015 (contagem) digam exatamente isto.
+    const PUBLISHED_ACTION_COUNT: usize = 31;
+
     /// Nome de fio de cada variante. O `match` e exaustivo de proposito: uma
     /// variante nova nao compila sem passar por aqui, e o teste abaixo exige
-    /// entao um exemplo aceite pelo parser e o nome na SPEC-0005.
+    /// entao um exemplo aceite pelo parser e o nome nas specs publicadas.
     fn wire_name(action: &IpcAction) -> &'static str {
         match action {
             IpcAction::Home => "home",
@@ -708,6 +947,7 @@ mod tests {
             IpcAction::Split { .. } => "split",
             IpcAction::Link { .. } => "link",
             IpcAction::Ask { .. } => "ask",
+            IpcAction::Search { .. } => "search",
             IpcAction::SplitClose => "split-close",
             IpcAction::SplitExpand => "split-expand",
             IpcAction::Palette { .. } => "palette",
@@ -715,37 +955,52 @@ mod tests {
             IpcAction::ResearchAnswer { .. } => "research-answer",
             IpcAction::AgentObservation { .. } => "agent-observation",
             IpcAction::Hint { .. } => "hint",
+            IpcAction::Note { .. } => "note",
         }
     }
 
-    /// Le "The closed action set has N names: `a`, `b` ... Unknown actions"
-    /// da SPEC-0005 e devolve (N, nomes entre crases).
-    fn published_action_set() -> (usize, Vec<String>) {
-        let marker = "The closed action set has ";
-        let start = SPEC_0005
-            .find(marker)
-            .expect("SPEC-0005 publica a lista fechada")
-            + marker.len();
-        let rest = &SPEC_0005[start..];
-        let count: usize = rest
-            .split_whitespace()
-            .next()
-            .and_then(|word| word.parse().ok())
-            .expect("SPEC-0005 publica a contagem em algarismos");
-        let list = &rest[..rest
-            .find("Unknown actions")
-            .expect("fim da lista na SPEC-0005")];
-        let names = list
-            .split('`')
+    /// SPEC-0108 repete a lista (secao do envelope) e a contagem (criterio de
+    /// aceitacao 1); SPEC-0015 repete a contagem no modelo de ameacas.
+    const SPEC_0108: &str = include_str!("../../../md/SPEC-0108-secure-webview-ipc-channel.md");
+    const SPEC_0015: &str = include_str!("../../../docs/specs/SPEC-0015-threat-model.md");
+
+    /// O texto entre `start` e o primeiro `end` que se lhe segue.
+    fn between<'a>(text: &'a str, start: &str, end: &str, what: &str) -> &'a str {
+        let from = text
+            .find(start)
+            .unwrap_or_else(|| panic!("{what}: marcador {start:?} ausente"))
+            + start.len();
+        let rest = &text[from..];
+        &rest[..rest
+            .find(end)
+            .unwrap_or_else(|| panic!("{what}: fim {end:?} ausente"))]
+    }
+
+    /// Os nomes entre crases de um trecho publicado, pela ordem.
+    fn backticked(list: &str) -> Vec<String> {
+        list.split('`')
             .skip(1)
             .step_by(2)
             .map(str::to_string)
-            .collect();
-        (count, names)
+            .collect()
+    }
+
+    /// A contagem em algarismos logo apos `marker` ("29 names", "29-action").
+    fn published_count(text: &str, marker: &str, what: &str) -> usize {
+        let from = text
+            .find(marker)
+            .unwrap_or_else(|| panic!("{what}: marcador {marker:?} ausente"))
+            + marker.len();
+        text[from..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .unwrap_or_else(|_| panic!("{what}: contagem em algarismos apos {marker:?}"))
     }
 
     #[test]
-    fn protocol_accepts_exactly_the_twenty_nine_published_actions() {
+    fn protocol_accepts_exactly_the_published_actions() {
         let examples = [
             message("home", json!({})),
             message("back", json!({})),
@@ -771,6 +1026,7 @@ mod tests {
                 json!({"col":0,"url":"https://example.com/","aside":false}),
             ),
             message("ask", json!({"col":1,"text":"capital da França"})),
+            message("search", json!({"text":"texto selecionado","intent":"ask"})),
             message("shortcut-expand", json!({"col":1})),
             message("split-close", json!({})),
             message("split-expand", json!({})),
@@ -788,6 +1044,7 @@ mod tests {
                 json!({"data":"1\nhttps://example.com"}),
             ),
             message("hint", json!({"col":2,"id":"expand"})),
+            message("note", json!({})),
         ];
 
         // O que o parser que embarca aceita, pelo nome da variante devolvida.
@@ -803,18 +1060,63 @@ mod tests {
             })
             .collect();
 
-        let (published_count, published_names) = published_action_set();
-        let published: std::collections::BTreeSet<&str> =
-            published_names.iter().map(String::as_str).collect();
+        // Um exemplo por acao, nem mais nem menos.
         assert_eq!(
-            published_count,
-            published_names.len(),
-            "a contagem publicada na SPEC-0005 nao bate com a lista publicada"
+            examples.len(),
+            PUBLISHED_ACTION_COUNT,
+            "exemplos a mais ou a menos para PUBLISHED_ACTION_COUNT"
         );
         assert_eq!(
-            accepted, published,
-            "a SPEC-0005 publica um conjunto diferente do que o parser aceita"
+            accepted.len(),
+            PUBLISHED_ACTION_COUNT,
+            "o parser aceita um numero de acoes diferente de PUBLISHED_ACTION_COUNT"
         );
-        assert_eq!(accepted.len(), 29);
+
+        // Cada lista publicada e o conjunto aceite, sem repetidos.
+        for (what, names) in [
+            (
+                "SPEC-0005",
+                backticked(between(
+                    SPEC_0005,
+                    "The closed action set has ",
+                    "Unknown actions",
+                    "SPEC-0005",
+                )),
+            ),
+            (
+                "SPEC-0108",
+                backticked(between(
+                    SPEC_0108,
+                    "um nome da lista fechada de SPEC-0005 (",
+                    "Nome fora da lista",
+                    "SPEC-0108",
+                )),
+            ),
+        ] {
+            let published: std::collections::BTreeSet<&str> =
+                names.iter().map(String::as_str).collect();
+            assert_eq!(
+                published.len(),
+                names.len(),
+                "{what} repete um nome na lista publicada"
+            );
+            assert_eq!(
+                accepted, published,
+                "{what} publica um conjunto diferente do que o parser aceita"
+            );
+        }
+
+        // Cada contagem publicada e PUBLISHED_ACTION_COUNT.
+        for (what, text, marker) in [
+            ("SPEC-0005", SPEC_0005, "The closed action set has "),
+            ("SPEC-0108", SPEC_0108, "aceita cada uma das "),
+            ("SPEC-0015", SPEC_0015, "a closed "),
+        ] {
+            assert_eq!(
+                published_count(text, marker, what),
+                PUBLISHED_ACTION_COUNT,
+                "{what} publica outra contagem de acoes"
+            );
+        }
     }
 }

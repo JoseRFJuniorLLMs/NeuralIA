@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="pt-BR" data-page="library">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Livros — NeuralIA</title>
+<link rel="stylesheet" href="/epub.css">
+<script src="/common.js" defer></script>
+<script src="/library.js" defer></script>
+</head>
+<body class="library-page">
+<header class="lib-bar">
+  <button id="home" class="icon-button" type="button" title="Voltar à Home (Esc)" aria-label="Voltar à Home">⟵</button>
+  <h1 class="lib-title">Livros</h1>
+  <input id="search" class="lib-search" type="search" placeholder="Buscar por título ou autor" aria-label="Buscar por título ou autor" autocomplete="off" spellcheck="false">
+  <label class="lib-sort-label" for="sort">Ordenar</label>
+  <select id="sort" class="lib-sort" aria-label="Ordenar livros">
+    <option value="recent">Recentes</option>
+    <option value="title">Título</option>
+    <option value="author">Autor</option>
+  </select>
+  <button id="add" class="primary-button" type="button" title="Adicionar livros EPUB (Ctrl+O)">Adicionar livros</button>
+</header>
+<div id="banner" class="banner" role="status" hidden>
+  <span id="banner-text"></span>
+  <button id="banner-close" class="icon-button small" type="button" aria-label="Fechar aviso">×</button>
+</div>
+<main class="lib-main">
+  <section id="continue" class="continue" hidden>
+    <h2 class="section-title">Continuar lendo</h2>
+    <div id="continue-card" class="continue-card"></div>
+  </section>
+  <section class="shelf">
+    <h2 id="shelf-title" class="section-title">Biblioteca</h2>
+    <div id="grid" class="grid" role="list"></div>
+    <div id="empty" class="empty" hidden>
+      <p class="empty-title">Sua biblioteca está vazia.</p>
+      <p>Use “Adicionar livros” (Ctrl+O) ou arraste arquivos <strong>.epub</strong> para esta janela.</p>
+      <p class="muted">EPUB 2 e 3, sem DRM.</p>
+    </div>
+    <div id="no-match" class="empty" hidden>
+      <p>Nenhum livro corresponde à busca.</p>
+    </div>
+  </section>
+</main>
+<div id="confirm" class="modal" role="dialog" aria-modal="true" aria-labelledby="confirm-text" hidden>
+  <div class="modal-box">
+    <p id="confirm-text"></p>
+    <p class="muted">O arquivo vai para a lixeira da biblioteca. Se você adicionar o mesmo livro de novo, a posição de leitura e os marcadores voltam.</p>
+    <div class="modal-actions">
+      <button id="confirm-cancel" type="button">Cancelar</button>
+      <button id="confirm-ok" class="danger-button" type="button">Remover</button>
+    </div>
+  </div>
+</div>
+</body>
+</html>
