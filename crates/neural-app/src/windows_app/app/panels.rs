@@ -176,6 +176,8 @@ impl App {
             Ok(panel) => {
                 let _ = panel.focus();
                 self.install_context_menu(&panel, WebViewHost::Service);
+                #[cfg(feature = "accel-spike")]
+                self.accel_spike_hook(&panel, crate::accel_spike::SpikeHost::Service);
                 self.service_generation = self.service_generation.wrapping_add(1);
                 let generation = self.service_generation;
                 // Sem estes avisos o painel abre na mesma; so a tela cheia da
@@ -789,6 +791,8 @@ impl App {
             Ok(panel) => {
                 let _ = panel.focus();
                 self.install_context_menu(&panel, WebViewHost::SidePanel);
+                #[cfg(feature = "accel-spike")]
+                self.accel_spike_hook(&panel, crate::accel_spike::SpikeHost::SidePanel);
                 // So com o painel fechado se chega aqui; um aberto nunca e
                 // largado sem `close_side_panel`.
                 if let Err(extra) = self.side_panel.open(ticket, panel) {

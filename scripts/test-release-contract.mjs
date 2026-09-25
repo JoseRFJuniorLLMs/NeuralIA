@@ -165,4 +165,93 @@ assert.ok(
   'the ungated packaging/build-installer.ps1 must not come back'
 );
 
+// The accelerator spike (infra-accel-spike, 2.3 plan) is CI-only: its code
+// compiles only with the neural-app feature `accel-spike`, and the exe that
+// release.yml packages must be built without it. Behaviour: the `windows` job
+// proves the spike marker is absent from the exact ci-tested/NeuralIA.exe
+// bytes, and the `accel-spike` job proves the same check sees the marker in a
+// spike build. These assertions keep that wiring from being edited away.
+const appManifest = fs.readFileSync('crates/neural-app/Cargo.toml', 'utf8');
+const features = appManifest.match(/\n\[features\]\n([\s\S]*?)(?=\n\[)/);
+assert.ok(features, 'neural-app declares its [features] table');
+assert.match(features[1], /^default = \[\]$/m, 'neural-app has no default features');
+assert.match(features[1], /^accel-spike = \[\]$/m, 'accel-spike exists and pulls no crate');
+assert.doesNotMatch(
+  features[1].replace(/^#.*$/gm, ''),
+  /default\s*=\s*\[[^\]]*accel-spike/,
+  'accel-spike is never a default feature'
+);
+
+const mainRs = fs.readFileSync('crates/neural-app/src/main.rs', 'utf8');
+assert.match(
+  mainRs,
+  /#\[cfg\(any\(test, feature = "accel-spike"\)\)\]\nmod accel_spike;/,
+  'the spike module compiles only in tests and in the accel-spike build'
+);
+assert.equal((mainRs.match(/\bmod accel_spike\b/g) || []).length, 1, 'accel_spike is declared once');
+const windowsAppRs = fs.readFileSync('crates/neural-app/src/windows_app.rs', 'utf8');
+assert.match(
+  windowsAppRs,
+  /#\[cfg\(feature = "accel-spike"\)\]\n#\[path = "accel_spike_app\.rs"\]\npub\(in crate::windows_app\) mod accel_spike_app;/,
+  'the spike glue compiles only in the accel-spike build'
+);
+assert.equal(
+  (windowsAppRs.match(/\bmod accel_spike_app\b/g) || []).length,
+  1,
+  'accel_spike_app is declared once'
+);
+
+const markerRust = fs
+  .readFileSync('crates/neural-app/src/accel_spike.rs', 'utf8')
+  .match(/pub\(crate\) const SPIKE_BUILD_MARKER: &str = "([^"]+)";/);
+const markerScript = fs
+  .readFileSync('scripts/test-accel-spike-marker.ps1', 'utf8')
+  .match(/^\$marker = "([^"]+)"$/m);
+assert.ok(markerRust && markerScript, 'the spike marker is declared in the module and in the gate');
+assert.equal(markerScript[1], markerRust[1], 'the release gate looks for the marker the spike writes');
+
+const windowsJob = ci.slice(ci.indexOf('\n  windows:'), ci.indexOf('\n  installer-smoke:'));
+assert.ok(windowsJob.length > 0, 'ci.yml keeps the windows job');
+assert.match(
+  windowsJob,
+  /- run: cargo build --locked -p neural-app --bin NeuralIA --release\n/,
+  'the published exe is built by the windows job'
+);
+assert.doesNotMatch(windowsJob, /--features|--all-features/, 'the windows job never builds with extra features');
+const stageAt = windowsJob.indexOf('Copy-Item target/release/NeuralIA.exe ci-tested/NeuralIA.exe');
+const markerAt = windowsJob.indexOf(
+  './scripts/test-accel-spike-marker.ps1 -ExePath ci-tested/NeuralIA.exe -Expect Absent'
+);
+const uploadAt = windowsJob.indexOf('actions/upload-artifact@');
+assert.ok(stageAt > 0 && markerAt > stageAt, 'the spike marker is checked on the staged ci-tested bytes');
+assert.ok(uploadAt > markerAt, 'the spike marker is checked before the tested exe is uploaded');
+
+const spikeJob = ci.slice(ci.indexOf('\n  accel-spike:'));
+assert.ok(ci.includes('\n  accel-spike:'), 'ci.yml keeps the accel-spike job');
+assert.equal(
+  (spikeJob.slice(1).match(/\n {2}[a-z][a-z0-9-]*:\n/g) || []).length,
+  0,
+  'the accel-spike job is the last job in ci.yml'
+);
+assert.match(
+  spikeJob,
+  /cargo build --locked -p neural-app --bin NeuralIA --release --features accel-spike/,
+  'the spike job builds the release exe with the spike feature'
+);
+assert.match(
+  spikeJob,
+  /test-accel-spike-marker\.ps1 -ExePath target\/release\/NeuralIA\.exe -Expect Present/,
+  'the spike job proves the marker check sees a spike build'
+);
+assert.doesNotMatch(spikeJob, /uses:\s*actions\/upload-artifact/, 'the spike exe never leaves its job');
+assert.doesNotMatch(ci, /needs:[^\n]*accel-spike/, 'no job consumes the spike job');
+assert.equal(
+  (ci.match(/--features accel-spike/g) || []).length,
+  (spikeJob.match(/--features accel-spike/g) || []).length,
+  'only the accel-spike job builds with the spike feature'
+);
+assert.doesNotMatch(workflow, /accel-spike|accel_spike|--features|--all-features/, 'release.yml never builds the spike');
+assert.doesNotMatch(buildScript, /accel-spike|--features|--all-features/, 'the installer build never enables features');
+
 console.log('release contract: single public installer asset (neural-setup around the CI-tested binary)');
+console.log('release contract: the published exe is built without the accel-spike feature');

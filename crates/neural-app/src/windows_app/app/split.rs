@@ -376,6 +376,15 @@ impl App {
 
                 let _ = webview.zoom(self.zoom);
                 self.install_context_menu(&webview, WebViewHost::Split(source_index));
+                #[cfg(feature = "accel-spike")]
+                self.accel_spike_hook(
+                    &webview,
+                    if private {
+                        crate::accel_spike::SpikeHost::PrivateSplit
+                    } else {
+                        crate::accel_spike::SpikeHost::Split
+                    },
+                );
                 let mut lost_grouped = 0usize;
                 if let Some(comp) = &mut self.comparator {
                     let ComparatorState {

@@ -314,6 +314,10 @@ pub(in crate::windows_app) enum UserEvent {
     EpubDropped(Vec<PathBuf>),
     /// Ctrl+O na omnibox da Home: o dialogo de livros.
     OpenEpubDialog,
+    /// Uma linha do condutor do spike de aceleradores (so no build de CI
+    /// com `--features accel-spike`; ver `accel_spike_app.rs`).
+    #[cfg(feature = "accel-spike")]
+    AccelSpike(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7046,6 +7050,14 @@ pub(in crate::windows_app) use search_card::*;
 pub(in crate::windows_app) mod app;
 #[allow(unused_imports)]
 pub(in crate::windows_app) use app::*;
+
+// Spike do AcceleratorKeyPressed (infra-accel-spike, plano 2.3), so no build
+// de CI com `--features accel-spike`. Fora de `src/windows_app/` de
+// proposito: nao embarca (o exe publicado e compilado sem a feature), por
+// isso nao e `ALL_MODULES` nem `shipped_source()`.
+#[cfg(feature = "accel-spike")]
+#[path = "accel_spike_app.rs"]
+pub(in crate::windows_app) mod accel_spike_app;
 
 // ===================== desenho com anti-aliasing =====================
 

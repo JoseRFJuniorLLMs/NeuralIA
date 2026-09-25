@@ -15,6 +15,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.create_omnibox();
                 self.sync_caption_buttons();
                 self.request_redraw();
+                // Spike de aceleradores (so no build de CI com a feature):
+                // antes do SubmitText, para a pergunta da rolagem ja estar
+                // respondida quando o comparador abrir.
+                #[cfg(feature = "accel-spike")]
+                self.accel_spike_start();
 
                 // Abertura: a consulta padrao ja entra na omnibox e vai direto
                 // para a tela de resultados, sem esperar Enter do utilizador.
@@ -102,6 +107,10 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        #[cfg(feature = "accel-spike")]
+        let Some(event) = self.accel_spike_filter(event) else {
+            return;
+        };
         match event {
             UserEvent::ExitRequested => {
                 self.save_notes_draft_before_exit();
@@ -433,6 +442,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::OpenEpubDialog => self.open_epub_dialog(true),
+            // `accel_spike_filter` ja a consumiu.
+            #[cfg(feature = "accel-spike")]
+            UserEvent::AccelSpike(_) => {}
         }
     }
 
