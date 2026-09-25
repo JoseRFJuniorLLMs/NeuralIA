@@ -1,5 +1,6 @@
 use crate::{NeuralError, Result};
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use url::Url;
 
 /// Identificador único para cada provedor de IA suportado pelo NeuralIA.
@@ -16,6 +17,80 @@ pub enum ProviderId {
     Mistral,
 }
 
+/// Um host de um provedor, como o registro o reconhece.
+///
+/// `host` vale sempre por inteiro; com `subdomains`, também qualquer
+/// `<algo>.host` (o ponto faz parte da regra: `evilchatgpt.com` não é
+/// subdomínio de `chatgpt.com`). Com `require_udm50`, o endereço só conta se
+/// o PRIMEIRO `udm` da query for `50` (o Modo IA do Google), tal como o
+/// `searchParams.get('udm')` do script das colunas lê.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostRule {
+    pub host: &'static str,
+    pub subdomains: bool,
+    pub require_udm50: bool,
+}
+
+impl HostRule {
+    /// Só este host.
+    pub const fn exact(host: &'static str) -> Self {
+        Self {
+            host,
+            subdomains: false,
+            require_udm50: false,
+        }
+    }
+
+    /// Este host e os seus subdomínios.
+    pub const fn with_subdomains(host: &'static str) -> Self {
+        Self {
+            host,
+            subdomains: true,
+            require_udm50: false,
+        }
+    }
+
+    /// Só este host, e só com o primeiro `udm` igual a `50`.
+    pub const fn udm50(host: &'static str) -> Self {
+        Self {
+            host,
+            subdomains: false,
+            require_udm50: true,
+        }
+    }
+
+    /// O nome de host (já em minúsculas) é este, ou um subdomínio dele quando
+    /// a regra os aceita.
+    pub fn matches_host(&self, host: &str) -> bool {
+        host == self.host
+            || (self.subdomains
+                && host
+                    .strip_suffix(self.host)
+                    .and_then(|label| label.strip_suffix('.'))
+                    .is_some_and(|label| !label.is_empty()))
+    }
+
+    /// O URL é http(s), o host bate e, se a regra pede, o primeiro `udm` é 50.
+    pub fn matches(&self, url: &Url) -> bool {
+        if !matches!(url.scheme(), "http" | "https") {
+            return false;
+        }
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        self.matches_host(&host.to_ascii_lowercase())
+            && (!self.require_udm50 || first_query_value(url, "udm").as_deref() == Some("50"))
+    }
+}
+
+/// O primeiro valor de `name` na query, como o `URLSearchParams.get` do
+/// navegador (um `udm=14&udm=50` é 14).
+fn first_query_value(url: &Url, name: &str) -> Option<String> {
+    url.query_pairs()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+}
+
 /// Metadados estáticos de um provedor de IA.
 #[derive(Debug, Clone, Copy)]
 pub struct ProviderInfo {
@@ -24,11 +99,26 @@ pub struct ProviderInfo {
     pub display_name: &'static str,
     pub is_selectable: bool,
     pub default_slot: Option<usize>,
-    pub hosts: &'static [&'static str],
+    /// A fonte única dos hosts: `from_url`, `is_ai_provider_host` e os gates
+    /// leem daqui.
+    pub hosts: &'static [HostRule],
+    /// A fonte única dos nomes próprios: `all_self_names` junta-os daqui.
     pub self_names: &'static [&'static str],
     pub answer_selector: Option<&'static str>,
 }
 
+/// O registro. Só os 3 slots padrão são selecionáveis até ao item
+/// `providers` (Wave 5), que torna cada um dos outros selecionável depois do
+/// seu smoke test; até lá, as outras linhas servem para reconhecer os hosts e
+/// os nomes (adblock, anti-distração, anonimizador do juiz).
+///
+/// Hosts (brief `infra-provider-registry`): `chatgpt.com` e subdomínios,
+/// `chat.openai.com`, `claude.ai`, `gemini.google.com`, `google.com` e
+/// `www.google.com` só com `udm=50`, `perplexity.ai`, `chat.deepseek.com`,
+/// `copilot.microsoft.com`, `grok.com`, `chat.mistral.ai`. Duas extensões,
+/// ambas o que o script das colunas que embarca já aceita hoje:
+/// `*.claude.ai` (o `onProviderPage` aceita-o) e `www.perplexity.ai` (o
+/// endereço que `perplexity_search_url` abre).
 static PROVIDERS: &[ProviderInfo] = &[
     ProviderInfo {
         id: ProviderId::GoogleAi,
@@ -36,7 +126,10 @@ static PROVIDERS: &[ProviderInfo] = &[
         display_name: "Google IA",
         is_selectable: true,
         default_slot: Some(0),
-        hosts: &["google.com", "www.google.com"],
+        hosts: &[
+            HostRule::udm50("google.com"),
+            HostRule::udm50("www.google.com"),
+        ],
         self_names: &["Google IA", "AI Mode", "Modo IA"],
         answer_selector: Some(r#"main, [data-message-author-role="assistant"], [role="article"]"#),
     },
@@ -46,7 +139,10 @@ static PROVIDERS: &[ProviderInfo] = &[
         display_name: "ChatGPT",
         is_selectable: true,
         default_slot: Some(1),
-        hosts: &["chatgpt.com", "chat.openai.com"],
+        hosts: &[
+            HostRule::with_subdomains("chatgpt.com"),
+            HostRule::exact("chat.openai.com"),
+        ],
         self_names: &[
             "ChatGPT", "OpenAI", "GPT-4", "GPT-3", "GPT-5", "GPT-o1", "GPT-4o", "GPT-n", "GPT",
         ],
@@ -58,7 +154,7 @@ static PROVIDERS: &[ProviderInfo] = &[
         display_name: "Claude",
         is_selectable: true,
         default_slot: Some(2),
-        hosts: &["claude.ai"],
+        hosts: &[HostRule::with_subdomains("claude.ai")],
         self_names: &["Claude", "Anthropic"],
         answer_selector: Some(r#"[data-message-author-role="assistant"]"#),
     },
@@ -66,9 +162,12 @@ static PROVIDERS: &[ProviderInfo] = &[
         id: ProviderId::Perplexity,
         key: "perplexity",
         display_name: "Perplexity",
-        is_selectable: true,
+        is_selectable: false,
         default_slot: None,
-        hosts: &["perplexity.ai", "www.perplexity.ai"],
+        hosts: &[
+            HostRule::exact("perplexity.ai"),
+            HostRule::exact("www.perplexity.ai"),
+        ],
         self_names: &["Perplexity"],
         answer_selector: None,
     },
@@ -76,9 +175,9 @@ static PROVIDERS: &[ProviderInfo] = &[
         id: ProviderId::Gemini,
         key: "gemini",
         display_name: "Gemini",
-        is_selectable: true,
+        is_selectable: false,
         default_slot: None,
-        hosts: &["gemini.google.com"],
+        hosts: &[HostRule::exact("gemini.google.com")],
         self_names: &["Gemini", "Bard"],
         answer_selector: None,
     },
@@ -86,9 +185,9 @@ static PROVIDERS: &[ProviderInfo] = &[
         id: ProviderId::DeepSeek,
         key: "deepseek",
         display_name: "DeepSeek",
-        is_selectable: true,
+        is_selectable: false,
         default_slot: None,
-        hosts: &["chat.deepseek.com", "deepseek.com"],
+        hosts: &[HostRule::exact("chat.deepseek.com")],
         self_names: &["DeepSeek"],
         answer_selector: None,
     },
@@ -96,9 +195,9 @@ static PROVIDERS: &[ProviderInfo] = &[
         id: ProviderId::Copilot,
         key: "copilot",
         display_name: "Copilot",
-        is_selectable: true,
+        is_selectable: false,
         default_slot: None,
-        hosts: &["copilot.microsoft.com"],
+        hosts: &[HostRule::exact("copilot.microsoft.com")],
         self_names: &["Copilot", "Microsoft Copilot", "Microsoft"],
         answer_selector: None,
     },
@@ -106,9 +205,9 @@ static PROVIDERS: &[ProviderInfo] = &[
         id: ProviderId::Grok,
         key: "grok",
         display_name: "Grok",
-        is_selectable: true,
+        is_selectable: false,
         default_slot: None,
-        hosts: &["grok.com", "x.ai"],
+        hosts: &[HostRule::exact("grok.com")],
         self_names: &["Grok", "xAI"],
         answer_selector: None,
     },
@@ -118,7 +217,7 @@ static PROVIDERS: &[ProviderInfo] = &[
         display_name: "Mistral",
         is_selectable: false,
         default_slot: None,
-        hosts: &["chat.mistral.ai", "mistral.ai"],
+        hosts: &[HostRule::exact("chat.mistral.ai")],
         self_names: &["Mistral", "Le Chat"],
         answer_selector: None,
     },
@@ -134,7 +233,8 @@ static LOGIN_HOSTS: &[&str] = &[
 ];
 
 impl ProviderId {
-    /// Todos os provedores cadastrados no registro (8 selecionáveis + Mistral).
+    /// Todos os provedores cadastrados no registro: os 8 do design v1 de
+    /// provedores e o Mistral, que nunca é um slot.
     pub const fn all() -> &'static [ProviderId] {
         &[
             ProviderId::GoogleAi,
@@ -149,17 +249,15 @@ impl ProviderId {
         ]
     }
 
-    /// Os 8 provedores selecionáveis do design v1.
+    /// Os provedores que se podem escolher hoje: só os 3 slots padrão. Os
+    /// outros 5 do design v1 (Perplexity, Gemini, DeepSeek, Copilot e Grok)
+    /// ficam no registro para serem reconhecidos e passam a selecionáveis no
+    /// item `providers` (Wave 5), cada um depois do seu smoke test.
     pub const fn selectable() -> &'static [ProviderId] {
         &[
             ProviderId::GoogleAi,
             ProviderId::ChatGpt,
             ProviderId::Claude,
-            ProviderId::Perplexity,
-            ProviderId::Gemini,
-            ProviderId::DeepSeek,
-            ProviderId::Copilot,
-            ProviderId::Grok,
         ]
     }
 
@@ -196,7 +294,8 @@ impl ProviderId {
         self.info().default_slot
     }
 
-    pub fn hosts(self) -> &'static [&'static str] {
+    /// As regras de host da linha deste provedor no registro.
+    pub fn hosts(self) -> &'static [HostRule] {
         self.info().hosts
     }
 
@@ -216,51 +315,16 @@ impl ProviderId {
         PROVIDERS.iter().find(|p| p.key == key).map(|p| p.id)
     }
 
-    /// Identifica o provedor de IA a partir de um URL.
+    /// Identifica o provedor de IA a partir de um URL, pelas regras de host
+    /// do registro: só http(s), host exato ou subdomínio quando a regra os
+    /// aceita, e o Google só com o primeiro `udm` igual a `50`. Nenhum host
+    /// está em duas linhas (gate `registry_is_unique`), por isso a ordem das
+    /// linhas não decide nada.
     pub fn from_url(url: &Url) -> Option<ProviderId> {
-        let host = url.host_str()?.to_ascii_lowercase();
-
-        if host == "gemini.google.com" || host.ends_with(".gemini.google.com") {
-            return Some(ProviderId::Gemini);
-        }
-
-        // Google: requer parâmetro udm=50 (Modo IA)
-        if (host == "google.com" || host.ends_with(".google.com"))
-            && url.query_pairs().any(|(k, v)| k == "udm" && v == "50")
-        {
-            return Some(ProviderId::GoogleAi);
-        }
-        if host == "chatgpt.com"
-            || host.ends_with(".chatgpt.com")
-            || host == "chat.openai.com"
-            || host.ends_with(".chat.openai.com")
-        {
-            return Some(ProviderId::ChatGpt);
-        }
-        if host == "claude.ai" || host.ends_with(".claude.ai") {
-            return Some(ProviderId::Claude);
-        }
-        if host == "perplexity.ai" || host.ends_with(".perplexity.ai") {
-            return Some(ProviderId::Perplexity);
-        }
-        if host == "deepseek.com" || host.ends_with(".deepseek.com") {
-            return Some(ProviderId::DeepSeek);
-        }
-        if host == "copilot.microsoft.com" || host.ends_with(".copilot.microsoft.com") {
-            return Some(ProviderId::Copilot);
-        }
-        if host == "grok.com"
-            || host.ends_with(".grok.com")
-            || host == "x.ai"
-            || host.ends_with(".x.ai")
-        {
-            return Some(ProviderId::Grok);
-        }
-        if host == "mistral.ai" || host.ends_with(".mistral.ai") {
-            return Some(ProviderId::Mistral);
-        }
-
-        None
+        PROVIDERS
+            .iter()
+            .find(|provider| provider.hosts.iter().any(|rule| rule.matches(url)))
+            .map(|provider| provider.id)
     }
 
     /// Sugestões a priori do roteador inteligente para uma categoria de pergunta.
@@ -298,35 +362,20 @@ impl ProviderId {
     }
 }
 
-/// Todos os nomes próprios de provedores para uso pelo anonimizador do juiz.
+/// Todos os nomes próprios de provedores para uso pelo anonimizador do juiz,
+/// juntados das linhas do registro (a ordem das linhas; um nome repetido
+/// entra uma vez).
 pub fn all_self_names() -> &'static [&'static str] {
-    &[
-        "ChatGPT",
-        "OpenAI",
-        "GPT-4",
-        "GPT-3",
-        "GPT-5",
-        "GPT-o1",
-        "GPT-4o",
-        "GPT-n",
-        "GPT",
-        "Claude",
-        "Anthropic",
-        "Gemini",
-        "Bard",
-        "Google IA",
-        "AI Mode",
-        "Modo IA",
-        "Perplexity",
-        "DeepSeek",
-        "Copilot",
-        "Microsoft Copilot",
-        "Microsoft",
-        "Grok",
-        "xAI",
-        "Mistral",
-        "Le Chat",
-    ]
+    static NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut names: Vec<&'static str> = Vec::new();
+        for name in PROVIDERS.iter().flat_map(|provider| provider.self_names) {
+            if !names.contains(name) {
+                names.push(name);
+            }
+        }
+        names
+    })
 }
 
 /// Verifica se um URL pertence a um host oficial de IA provedora cadastrado.
@@ -456,11 +505,26 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    fn url(raw: &str) -> Url {
+        Url::parse(raw).expect(raw)
+    }
+
+    /// O endereço de uma regra, com `udm=50` quando ela o pede.
+    fn rule_url(scheme: &str, host: &str, rule: &HostRule) -> Url {
+        let query = if rule.require_udm50 {
+            "search?q=x&udm=50"
+        } else {
+            ""
+        };
+        url(&format!("{scheme}://{host}/{query}"))
+    }
+
     #[test]
     fn ai_mode_url() {
         let u = google_ai_url("raft consensus", "pt-BR").unwrap();
         assert_eq!(u.host_str(), Some("www.google.com"));
         assert!(u.as_str().contains("udm=50"));
+        assert_eq!(ProviderId::from_url(&u), Some(ProviderId::GoogleAi));
     }
 
     #[test]
@@ -486,44 +550,110 @@ mod tests {
     }
 
     #[test]
+    fn every_search_url_is_recognised_as_its_own_provider() {
+        for &pid in ProviderId::all() {
+            let u = pid.search_url("raft", "pt-BR").unwrap();
+            assert_eq!(ProviderId::from_url(&u), Some(pid), "{u}");
+        }
+    }
+
+    #[test]
     fn registry_is_unique() {
+        assert_eq!(PROVIDERS.len(), ProviderId::all().len());
+        let mut keys = HashSet::new();
         let mut seen = HashSet::new();
         for &pid in ProviderId::all() {
-            let info = pid.info();
-            for &host in info.hosts {
+            assert!(keys.insert(pid.key()), "chave repetida: {}", pid.key());
+            assert_eq!(ProviderId::from_key(pid.key()), Some(pid));
+            assert!(!pid.hosts().is_empty(), "{pid:?} sem host");
+            for rule in pid.hosts() {
                 assert!(
-                    seen.insert(host),
-                    "Host '{host}' cadastrado em mais de um provedor!"
+                    seen.insert(rule.host),
+                    "Host '{}' cadastrado em mais de um provedor!",
+                    rule.host
+                );
+                assert_eq!(rule.host, rule.host.to_ascii_lowercase());
+                assert!(!rule.host.starts_with('.') && !rule.host.ends_with('.'));
+                // O host da própria regra é reconhecido como deste provedor.
+                assert_eq!(
+                    ProviderId::from_url(&rule_url("https", rule.host, rule)),
+                    Some(pid),
+                    "{}",
+                    rule.host
                 );
             }
+        }
+        // Nenhum host de uma linha cai na regra de subdomínios de outra: a
+        // ordem das linhas em `from_url` não decide nada.
+        for &a in ProviderId::all() {
+            for &b in ProviderId::all() {
+                if a == b {
+                    continue;
+                }
+                for ra in a.hosts() {
+                    for rb in b.hosts() {
+                        assert!(
+                            !rb.matches_host(ra.host),
+                            "{} ({a:?}) cai na regra {} de {b:?}",
+                            ra.host,
+                            rb.host
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_default_slots_are_selectable_until_the_providers_item() {
+        let defaults = ProviderId::default_slots();
+        assert_eq!(ProviderId::selectable(), defaults.as_slice());
+        for &pid in ProviderId::all() {
+            assert_eq!(
+                pid.is_selectable(),
+                ProviderId::selectable().contains(&pid),
+                "{pid:?}: a linha do registro e selectable() discordam"
+            );
+            let slot = defaults.iter().position(|&default| default == pid);
+            assert_eq!(pid.default_slot(), slot, "{pid:?}");
         }
     }
 
     #[test]
     fn is_ai_provider_host_table() {
         let allowed = [
-            "https://chatgpt.com/",
-            "https://sub.chatgpt.com/c/123",
-            "https://chat.openai.com/",
-            "https://claude.ai/new",
-            "https://sub.claude.ai/",
-            "https://gemini.google.com/",
-            "https://gemini.google.com/app",
-            "https://www.google.com/search?q=foo&udm=50",
-            "https://google.com/search?udm=50",
-            "https://perplexity.ai/",
-            "https://www.perplexity.ai/search?q=test",
-            "https://chat.deepseek.com/",
-            "https://deepseek.com/",
-            "https://copilot.microsoft.com/",
-            "https://grok.com/",
-            "https://x.ai/",
-            "https://chat.mistral.ai/",
-            "https://mistral.ai/",
+            ("https://chatgpt.com/", ProviderId::ChatGpt),
+            ("http://chatgpt.com/", ProviderId::ChatGpt),
+            ("https://CHATGPT.COM:443/c/1", ProviderId::ChatGpt),
+            ("https://sub.chatgpt.com/c/123", ProviderId::ChatGpt),
+            ("https://chat.openai.com/", ProviderId::ChatGpt),
+            ("https://claude.ai/new", ProviderId::Claude),
+            ("https://sub.claude.ai/", ProviderId::Claude),
+            ("https://gemini.google.com/", ProviderId::Gemini),
+            ("https://gemini.google.com/app", ProviderId::Gemini),
+            (
+                "https://www.google.com/search?q=foo&udm=50",
+                ProviderId::GoogleAi,
+            ),
+            ("https://google.com/search?udm=50", ProviderId::GoogleAi),
+            (
+                "https://www.google.com/search?udm=50&udm=14",
+                ProviderId::GoogleAi,
+            ),
+            ("https://perplexity.ai/", ProviderId::Perplexity),
+            (
+                "https://www.perplexity.ai/search?q=test",
+                ProviderId::Perplexity,
+            ),
+            ("https://chat.deepseek.com/", ProviderId::DeepSeek),
+            ("https://copilot.microsoft.com/", ProviderId::Copilot),
+            ("https://grok.com/", ProviderId::Grok),
+            ("https://chat.mistral.ai/", ProviderId::Mistral),
         ];
 
-        for raw in allowed {
-            let u = Url::parse(raw).expect(raw);
+        for (raw, provider) in allowed {
+            let u = url(raw);
+            assert_eq!(ProviderId::from_url(&u), Some(provider), "{raw}");
             assert!(
                 is_ai_provider_host(&u),
                 "Deveria aceitar como host de IA: {raw}"
@@ -531,26 +661,54 @@ mod tests {
         }
 
         let refused = [
+            // Google só em google.com e www.google.com, e só com o PRIMEIRO
+            // udm igual a 50 (o `searchParams.get` do script).
             "https://www.google.com/search?q=sem+udm",
             "https://google.com/",
             "https://google.com/search?udm=14",
+            "https://www.google.com/search?q=x&udm=14&udm=50",
+            "https://sites.google.com/view/evil?udm=50",
+            "https://mail.google.com/?udm=50",
+            "https://notgemini.google.com/",
+            "https://notgemini.google.com/?udm=50",
+            "https://sub.gemini.google.com/",
+            "https://google.com.attacker.com?udm=50",
+            // Hosts fora do brief.
+            "https://sub.chat.openai.com/",
+            "https://openai.com/",
+            "https://deepseek.com/",
+            "https://platform.deepseek.com/",
+            "https://docs.perplexity.ai/",
+            "https://x.ai/",
+            "https://mistral.ai/",
+            "https://docs.mistral.ai/",
+            "https://microsoft.com/",
+            // Lookalikes.
             "https://chatgpt.com.evil.io/",
             "https://chatgpt.com.evil.io/login",
+            "https://evilchatgpt.com/",
             "https://evilclaude.ai/",
             "https://evilclaude.ai/new",
-            "https://notgemini.google.com/",
-            "https://google.com.attacker.com?udm=50",
             "https://perplexity.ai.fake/",
             "https://deepseek.com.phish.org/",
             "https://copilot.microsoft.com.hack/",
             "https://grok.com.attacker.com/",
             "https://mistral.ai.scam.net/",
+            "https://chatgpt.com@evil.io/",
+            "https://evil.io/chatgpt.com/",
+            "https://evil.io/?next=https://chatgpt.com/",
+            // Só http(s).
+            "javascript://claude.ai/%0Aalert(1)",
+            "file://chatgpt.com/share/x",
+            "ftp://chatgpt.com/",
+            "ws://chatgpt.com/",
+            "data:text/html,chatgpt.com",
             "https://example.com/",
             "http://localhost:8080/",
         ];
 
         for raw in refused {
-            let u = Url::parse(raw).expect(raw);
+            let u = url(raw);
             assert!(
                 !is_ai_provider_host(&u),
                 "Deveria RECUSAR como host de IA: {raw}"
@@ -558,54 +716,134 @@ mod tests {
         }
     }
 
+    /// Para cada regra do registro, gerado a partir das próprias linhas: o
+    /// host aceito em http e https, os lookalikes recusados (o sufixo sem o
+    /// ponto, o host como prefixo de outro domínio), só os subdomínios que a
+    /// regra aceita, e o `udm=50` exigido quando a regra o pede.
     #[test]
-    fn script_hosts_subset_of_registry() {
-        // Os hosts conferidos por onProviderPage() em COMPARATOR_INJECT_SCRIPT:
-        let script_urls = [
-            "https://chatgpt.com/",
-            "https://chat.openai.com/",
-            "https://claude.ai/",
-            "https://gemini.google.com/",
-            "https://google.com/search?udm=50",
-            "https://www.google.com/search?udm=50",
-        ];
-
-        for raw in script_urls {
-            let u = Url::parse(raw).expect(raw);
-            assert!(
-                is_ai_provider_host(&u),
-                "Host do script não reconhecido pelo registro: {raw}"
-            );
+    fn every_registry_host_refuses_its_lookalikes() {
+        for &pid in ProviderId::all() {
+            for rule in pid.hosts() {
+                let host = rule.host;
+                let query = if rule.require_udm50 { "?udm=50" } else { "" };
+                for scheme in ["https", "http"] {
+                    let own = url(&format!("{scheme}://{host}/{query}"));
+                    assert_eq!(ProviderId::from_url(&own), Some(pid), "{own}");
+                }
+                for lookalike in [
+                    format!("https://evil{host}/{query}"),
+                    format!("https://{host}.evil.io/{query}"),
+                    format!("https://{host}-evil.io/{query}"),
+                    format!("https://evil.io/{host}/{query}"),
+                    format!("ftp://{host}/{query}"),
+                    format!("file://{host}/x{query}"),
+                    format!("javascript://{host}/%0Aalert(1){query}"),
+                ] {
+                    assert!(
+                        !is_ai_provider_host(&url(&lookalike)),
+                        "lookalike de {host} aceito: {lookalike}"
+                    );
+                }
+                let sub = url(&format!("https://sub.{host}/{query}"));
+                let deep = url(&format!("https://a.b.{host}/{query}"));
+                if rule.subdomains {
+                    assert_eq!(ProviderId::from_url(&sub), Some(pid), "{sub}");
+                    assert_eq!(ProviderId::from_url(&deep), Some(pid), "{deep}");
+                } else {
+                    assert!(!is_ai_provider_host(&sub), "subdomínio aceito: {sub}");
+                    assert!(!is_ai_provider_host(&deep), "subdomínio aceito: {deep}");
+                }
+                if rule.require_udm50 {
+                    for without in [
+                        format!("https://{host}/"),
+                        format!("https://{host}/search?q=x"),
+                        format!("https://{host}/search?udm=14"),
+                        format!("https://{host}/search?udm=14&udm=50"),
+                        format!("https://{host}/search?udm=500"),
+                    ] {
+                        assert!(
+                            !is_ai_provider_host(&url(&without)),
+                            "Google sem o primeiro udm=50 aceito: {without}"
+                        );
+                    }
+                }
+            }
         }
     }
+
+    /// Fixtures mínimas com a forma de uma conversa: a pergunta de quem
+    /// escreve (PERGUNTA) e a resposta (RESPOSTA). São sintéticas (sem uma
+    /// sessão com login não há captura do DOM real), por isso provam que o
+    /// seletor é CSS válido e escolhe a resposta e nunca a pergunta, não que
+    /// o site ao vivo não mudou de estrutura.
+    const ANSWER_FIXTURES: &[(ProviderId, &str)] = &[
+        (
+            ProviderId::GoogleAi,
+            r#"<html><body>
+                <form role="search"><textarea name="q">PERGUNTA sobre Raft</textarea></form>
+                <div id="rhs"><a href="/">Fontes</a></div>
+                <main><div><p>RESPOSTA do Modo IA sobre Raft</p></div></main>
+            </body></html>"#,
+        ),
+        (
+            ProviderId::ChatGpt,
+            r#"<html><body><main>
+                <div data-message-author-role="user"><p>PERGUNTA sobre Raft</p></div>
+                <div data-message-author-role="assistant"><div class="markdown"><p>RESPOSTA do ChatGPT</p></div></div>
+                <form><textarea>PERGUNTA seguinte</textarea></form>
+            </main></body></html>"#,
+        ),
+        (
+            ProviderId::Claude,
+            r#"<html><body><main>
+                <div data-message-author-role="user"><p>PERGUNTA sobre Raft</p></div>
+                <div data-message-author-role="assistant"><p>RESPOSTA do Claude</p></div>
+                <fieldset><div contenteditable="true">PERGUNTA seguinte</div></fieldset>
+            </main></body></html>"#,
+        ),
+    ];
 
     #[test]
     fn every_provider_has_answer_fixture_or_is_marked_unreadable() {
         for &pid in ProviderId::all() {
-            match pid {
-                ProviderId::GoogleAi | ProviderId::ChatGpt | ProviderId::Claude => {
+            let fixture = ANSWER_FIXTURES.iter().find(|(id, _)| *id == pid);
+            match (pid.answer_selector(), fixture) {
+                (Some(raw), Some((_, html))) => {
+                    let selector = scraper::Selector::parse(raw)
+                        .unwrap_or_else(|error| panic!("{pid:?}: seletor inválido: {error:?}"));
+                    let document = scraper::Html::parse_document(html);
+                    let text: String = document
+                        .select(&selector)
+                        .flat_map(|element| element.text())
+                        .collect();
                     assert!(
-                        pid.answer_selector().is_some(),
-                        "{:?} deve ter selector de resposta",
-                        pid
+                        text.contains("RESPOSTA"),
+                        "{pid:?}: o seletor {raw:?} não chega à resposta da fixture"
+                    );
+                    assert!(
+                        !text.contains("PERGUNTA"),
+                        "{pid:?}: o seletor {raw:?} também lê a pergunta"
                     );
                     assert!(!pid.is_unreadable());
                 }
-                ProviderId::Perplexity
-                | ProviderId::Gemini
-                | ProviderId::DeepSeek
-                | ProviderId::Copilot
-                | ProviderId::Grok
-                | ProviderId::Mistral => {
-                    assert!(
-                        pid.answer_selector().is_none(),
-                        "{:?} deve ser unreadable (não lida)",
-                        pid
-                    );
-                    assert!(pid.is_unreadable());
-                }
+                (None, None) => assert!(pid.is_unreadable()),
+                (Some(_), None) => panic!("{pid:?} lê respostas sem fixture"),
+                (None, Some(_)) => panic!("{pid:?} tem fixture mas está marcado como não lido"),
             }
         }
+        let readable: Vec<ProviderId> = ProviderId::all()
+            .iter()
+            .copied()
+            .filter(|pid| !pid.is_unreadable())
+            .collect();
+        assert_eq!(
+            readable,
+            [
+                ProviderId::GoogleAi,
+                ProviderId::ChatGpt,
+                ProviderId::Claude
+            ]
+        );
     }
 
     #[test]
@@ -668,6 +906,14 @@ mod tests {
                 "Nome '{exp}' ausente de all_self_names"
             );
         }
+        // Exatamente os nomes das linhas do registro, cada um uma vez.
+        let rows: HashSet<&str> = ProviderId::all()
+            .iter()
+            .flat_map(|pid| pid.self_names().iter().copied())
+            .collect();
+        let listed: HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(listed, rows);
+        assert_eq!(listed.len(), names.len(), "nome repetido em all_self_names");
     }
 
     #[test]
