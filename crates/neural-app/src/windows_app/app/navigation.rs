@@ -700,9 +700,18 @@ impl App {
         if let Some(frame) = self.splash_board.show(
             format!("Rolar a página sozinho a cada {AUTO_SCROLL_SECONDS}s?"),
             AUTO_SCROLL_PROMPT_SECONDS,
-            SplashKind::Question,
+            SplashKind::Question(AUTO_SCROLL_QUESTION),
         ) {
             self.present_splash(frame);
+        }
+    }
+
+    /// A resposta a uma pergunta do meio da janela: o botao `index` da
+    /// pergunta de `asker`.
+    pub(in crate::windows_app) fn answer_splash(&mut self, asker: SplashAsker, index: usize) {
+        match asker {
+            // Sim e o primeiro botao de `AUTO_SCROLL_QUESTION`.
+            SplashAsker::AutoScroll => self.answer_auto_scroll(index == 0),
         }
     }
 

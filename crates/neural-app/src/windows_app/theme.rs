@@ -335,52 +335,33 @@ pub(in crate::windows_app) enum ThemeEvent {
 pub(in crate::windows_app) const THEME_COMMAND_HELP: &str =
     "Use tema:sistema, tema:claro ou tema:escuro.";
 
-/// Menu de tema no cursor, com a escolha em vigor marcada. Devolve a opcao
-/// clicada, ou None se o menu foi fechado sem escolha.
-pub(in crate::windows_app) fn pick_theme_from_menu(hwnd: HWND) -> Option<ThemeChoice> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, GA_ROOT, GetAncestor, MF_CHECKED, MF_STRING,
-        SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    };
+/// O menu do tema, com a escolha em vigor marcada. Os ids sao o indice em
+/// `ThemeChoice::ALL` mais um (0 e "fechado sem escolha").
+pub(in crate::windows_app) fn theme_menu() -> PopupMenu {
     let current = ThemeChoice::current();
-    unsafe {
-        let menu = CreatePopupMenu();
-        if menu.is_null() {
-            return None;
-        }
-        for (index, choice) in ThemeChoice::ALL.iter().enumerate() {
-            let flags = if *choice == current {
-                MF_STRING | MF_CHECKED
-            } else {
-                MF_STRING
-            };
-            let label: Vec<u16> = choice
-                .label()
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-            AppendMenuW(menu, flags, index + 1, label.as_ptr());
-        }
-        let mut cursor = POINT { x: 0, y: 0 };
-        GetCursorPos(&mut cursor);
-        // Sem o dono em primeiro plano, o menu nao fecha ao clicar fora.
-        let root = GetAncestor(hwnd, GA_ROOT);
-        SetForegroundWindow(root);
-        let picked = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON,
-            cursor.x,
-            cursor.y,
-            0,
-            root,
-            std::ptr::null(),
-        );
-        DestroyMenu(menu);
-        usize::try_from(picked)
-            .ok()
-            .and_then(|id| id.checked_sub(1))
-            .and_then(|index| ThemeChoice::ALL.get(index).copied())
+    let mut menu = PopupMenu::default();
+    for (index, choice) in ThemeChoice::ALL.iter().enumerate() {
+        menu.push(MenuCommand::new(index + 1, choice.label()).checked(*choice == current));
     }
+    menu
+}
+
+/// Menu de tema no cursor, com a escolha em vigor marcada. Devolve a opcao
+/// clicada, ou None se o menu foi fechado sem escolha. Abre num
+/// procedimento de janela (o botao Home), sem acesso as WebViews: o teclado
+/// volta a origem se ela for uma janela nossa (a omnibox da Home).
+pub(in crate::windows_app) fn pick_theme_from_menu(hwnd: HWND) -> Option<ThemeChoice> {
+    let picked = track_popup_menu(
+        &theme_menu(),
+        hwnd,
+        cursor_point(),
+        MenuButton::Right,
+        1.0,
+        &[],
+    );
+    picked
+        .checked_sub(1)
+        .and_then(|index| ThemeChoice::ALL.get(index).copied())
 }
 
 impl App {
