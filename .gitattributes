@@ -12,3 +12,7 @@ assets/pdfjs/icc/** -text
 assets/pdfjs/licenses/** -text
 assets/pdfjs/standard_fonts/** -text
 assets/pdfjs/wasm/** -text
+
+# The side panel page (PANEL_HTML) is assembled with include_str! from these
+# files and must be byte-identical on every checkout: LF, never CRLF.
+assets/panel/** text eol=lf

@@ -1112,6 +1112,198 @@ fn side_panel_messages_are_a_closed_list_with_limits() {
     assert_eq!(parse_panel_message(&huge), None, "mensagem acima de 4 KiB");
 }
 
+/// Gate (critico: mensagens de uma pagina): o delegador do canal do painel
+/// entrega cada acao a secao do prefixo dela, e so a ela; um prefixo que
+/// nenhuma secao reclamou, um campo a mais nos `args` e um corpo acima do
+/// tecto da secao morrem no delegador, sem chegar a parser nenhum.
+#[test]
+fn panel_messages_delegate_by_prefix_and_keep_caps() {
+    // Cada prefixo tem UMA secao, e as secoes nao repetem prefixos entre si.
+    let mut prefixes: Vec<&str> = PANEL_SECTIONS
+        .iter()
+        .flat_map(|section| section.prefixes.iter().copied())
+        .collect();
+    let total = prefixes.len();
+    prefixes.sort_unstable();
+    prefixes.dedup();
+    assert_eq!(prefixes.len(), total, "prefixo repetido entre secoes");
+    assert!(
+        PANEL_SECTIONS
+            .iter()
+            .all(|section| !section.prefixes.is_empty())
+    );
+    assert!(PANEL_CORE.prefixes.is_empty());
+    let notes = panel_section_of("note-save").expect("secao das notas");
+    assert_eq!(notes.prefixes, &["note", "notes"]);
+    assert!(std::ptr::eq(panel_section_of("notes-list").unwrap(), notes));
+    assert!(std::ptr::eq(
+        panel_section_of("search").unwrap(),
+        &PANEL_CORE
+    ));
+    assert!(std::ptr::eq(
+        panel_section_of("ready").unwrap(),
+        &PANEL_CORE
+    ));
+
+    // Prefixo que nenhuma secao reclamou: morre no delegador, mesmo com o
+    // corpo perfeito. Sem `-` a acao e do nucleo, que tambem a recusa.
+    for (action, body) in [
+        ("data-pick", r#"{"action":"data-pick","args":{}}"#),
+        ("pomodoro-start", r#"{"action":"pomodoro-start","args":{}}"#),
+        ("-search", r#"{"action":"-search","args":{"query":"x"}}"#),
+    ] {
+        assert!(panel_section_of(action).is_none(), "{action} tem secao?");
+        assert_eq!(parse_panel_message(body), None, "{body}");
+    }
+    assert_eq!(
+        parse_panel_message(r#"{"action":"note","args":{"id":"202609231212"}}"#),
+        None,
+        "sem prefixo, 'note' e do nucleo, que nao o conhece"
+    );
+
+    // Uma chave a mais nos args -- em qualquer secao -- recusa o pedido; o
+    // mesmo pedido sem ela passa (a recusa e so da chave).
+    for (with_extra, clean) in [
+        (
+            r#"{"action":"search","args":{"query":"x","junk":1}}"#,
+            r#"{"action":"search","args":{"query":"x"}}"#,
+        ),
+        (
+            r#"{"action":"open","args":{"input":"https://exemplo.pt","junk":1}}"#,
+            r#"{"action":"open","args":{"input":"https://exemplo.pt"}}"#,
+        ),
+        (
+            r#"{"action":"ready","args":{"junk":1}}"#,
+            r#"{"action":"ready","args":{}}"#,
+        ),
+        (
+            r#"{"action":"notes-search","args":{"query":"x","junk":1}}"#,
+            r#"{"action":"notes-search","args":{"query":"x"}}"#,
+        ),
+        (
+            r#"{"action":"note-open","args":{"id":"202609231212","junk":1}}"#,
+            r#"{"action":"note-open","args":{"id":"202609231212"}}"#,
+        ),
+        (
+            r#"{"action":"notes-list","args":{"junk":1}}"#,
+            r#"{"action":"notes-list","args":{}}"#,
+        ),
+    ] {
+        assert_eq!(parse_panel_message(with_extra), None, "{with_extra}");
+        assert!(parse_panel_message(clean).is_some(), "{clean}");
+    }
+    // Os args que faltam so passam a quem nao pede chave nenhuma.
+    assert_eq!(
+        parse_panel_message(r#"{"action":"ready"}"#),
+        Some(PanelMessage::Ready)
+    );
+    assert_eq!(parse_panel_message(r#"{"action":"search"}"#), None);
+    assert_eq!(parse_panel_message(r#"{"action":"note-open"}"#), None);
+
+    // O tecto: 4 KiB para tudo, salvo o note-save e o note-draft, que levam
+    // o corpo de uma nota e param em NOTE_SAVE_MESSAGE_MAX_BYTES -- o
+    // delegador prende ambos ANTES de entregar a secao.
+    let pad = "x".repeat(PANEL_MESSAGE_MAX_BYTES);
+    let over_4k = |action: &str, args: &str| {
+        format!(r#"{{"action":"{action}","args":{args},"pad":"{pad}"}}"#)
+    };
+    let search = over_4k("search", r#"{"query":"x"}"#);
+    let notes_list = over_4k("notes-list", "{}");
+    assert!(search.len() > PANEL_MESSAGE_MAX_BYTES && notes_list.len() > PANEL_MESSAGE_MAX_BYTES);
+    assert_eq!(parse_panel_message(&search), None, "search acima de 4 KiB");
+    assert_eq!(
+        parse_panel_message(&notes_list),
+        None,
+        "notes-list acima de 4 KiB"
+    );
+    assert_eq!(
+        (PANEL_CORE.max_bytes)("search"),
+        PANEL_MESSAGE_MAX_BYTES,
+        "o nucleo fica nos 4 KiB"
+    );
+    assert_eq!((notes.max_bytes)("notes-list"), PANEL_MESSAGE_MAX_BYTES);
+    assert_eq!((notes.max_bytes)("note-save"), NOTE_SAVE_MESSAGE_MAX_BYTES);
+    assert_eq!((notes.max_bytes)("note-draft"), NOTE_SAVE_MESSAGE_MAX_BYTES);
+    assert_eq!(
+        PANEL_MESSAGE_ABSOLUTE_MAX_BYTES,
+        PANEL_SECTIONS
+            .iter()
+            .chain(std::iter::once(&PANEL_CORE))
+            .flat_map(|section| {
+                ["note-save", "note-draft", "notes-list", "search"]
+                    .map(|action| (section.max_bytes)(action))
+            })
+            .max()
+            .unwrap(),
+        "o tecto absoluto e o maior de todas as secoes"
+    );
+    let save = over_4k(
+        "note-save",
+        r#"{"id":null,"title":"t","body":"b","tags":[]}"#,
+    );
+    assert!(
+        matches!(parse_panel_message(&save), Some(PanelMessage::NoteSave(_))),
+        "um note-save acima dos 4 KiB e aceite (o envelope pode ter mais chaves)"
+    );
+    let too_big = format!(
+        r#"{{"action":"note-save","args":{{"id":null,"title":"t","body":"{}","tags":[]}}}}"#,
+        "b".repeat(NOTE_SAVE_MESSAGE_MAX_BYTES)
+    );
+    assert_eq!(
+        parse_panel_message(&too_big),
+        None,
+        "acima do tecto absoluto"
+    );
+}
+
+/// O `PANEL_HTML` que embarca e montado dos assets de `assets/panel/`, e e
+/// a pagina de sempre: LF do principio ao fim, com cada asset la dentro
+/// uma vez, pela ordem, e os marcadores que o harness do painel corta.
+#[test]
+fn panel_html_is_assembled_from_its_section_assets() {
+    assert!(
+        !PANEL_HTML.contains('\r'),
+        "CRLF no painel: o .gitattributes falhou"
+    );
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/panel");
+    let mut cursor = 0;
+    for name in [
+        "panel.css",
+        "history.html",
+        "notes.html",
+        "core.js",
+        "history.js",
+        "notes.js",
+        "tabs.js",
+    ] {
+        let asset = std::fs::read_to_string(root.join(name))
+            .unwrap_or_else(|error| panic!("assets/panel/{name}: {error}"));
+        assert!(!asset.contains('\r'), "assets/panel/{name} tem CRLF");
+        assert!(asset.ends_with('\n'), "assets/panel/{name} sem LF final");
+        let at = PANEL_HTML[cursor..]
+            .find(&asset)
+            .unwrap_or_else(|| panic!("assets/panel/{name} fora de ordem ou ausente"));
+        cursor += at + asset.len();
+    }
+    let style = PANEL_HTML.find("<style>\n").expect("<style>");
+    let style_end = PANEL_HTML
+        .find("</style></head><body>\n")
+        .expect("</style>");
+    let script = PANEL_HTML.find("<script>\n").expect("<script>");
+    assert!(style < style_end && style_end < script);
+    assert!(PANEL_HTML.ends_with("</script></body></html>"));
+    assert_eq!(PANEL_HTML.matches("<script>").count(), 1);
+    // O script e uma IIFE so, aberta logo a seguir ao `<script>` (core.js)
+    // e fechada no fim de tabs.js -- o `return` do frame guard tem de
+    // valer para os quatro pedacos.
+    assert!(
+        PANEL_HTML[script..]
+            .starts_with("<script>\n(() => {\n  if (window.top !== window) return;\n")
+    );
+    assert!(PANEL_HTML.ends_with("\n})();\n</script></body></html>"));
+    assert!(PANEL_HTML.starts_with("<!doctype html>\n"));
+}
+
 #[test]
 fn side_panel_only_ever_shows_its_local_page() {
     assert!(panel_allows_navigation("about:blank"));

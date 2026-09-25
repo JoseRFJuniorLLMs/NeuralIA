@@ -263,6 +263,17 @@ jobs:
                   col_index,
                   label: frozen,
           '@
+            },
+            @{
+              Label = "panel-delegator-byte-cap"
+              Test = "panel_messages_delegate_by_prefix_and_keep_caps"
+              SourcePath = "crates/neural-app/src/windows_app/side_panel.rs"
+              Old = @'
+              if body.len() > (section.max_bytes)(action) {
+          '@
+              New = @'
+              if body.len() > PANEL_MESSAGE_ABSOLUTE_MAX_BYTES {
+          '@
             }
           )
 
