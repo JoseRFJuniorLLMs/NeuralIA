@@ -8,7 +8,7 @@ use super::*;
 
 /// O que a pagina do painel pode pedir. Lista fechada.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum PanelMessage {
+pub(in crate::windows_app) enum PanelMessage {
     Ready,
     Search(String),
     Open(String),
@@ -34,13 +34,13 @@ pub(super) enum PanelMessage {
     NoteDelete(String),
 }
 
-pub(super) const PANEL_MESSAGE_MAX_BYTES: usize = 4 * 1024;
-pub(super) const PANEL_QUERY_MAX_CHARS: usize = 500;
-pub(super) const PANEL_INPUT_MAX_CHARS: usize = 2048;
+pub(in crate::windows_app) const PANEL_MESSAGE_MAX_BYTES: usize = 4 * 1024;
+pub(in crate::windows_app) const PANEL_QUERY_MAX_CHARS: usize = 500;
+pub(in crate::windows_app) const PANEL_INPUT_MAX_CHARS: usize = 2048;
 /// Quantos recentes e quantas sugestoes o painel mostra.
-pub(super) const PANEL_RECENT_LIMIT: usize = 30;
-pub(super) const PANEL_SUGGESTION_LIMIT: usize = 6;
-pub(super) fn parse_panel_message(body: &str) -> Option<PanelMessage> {
+pub(in crate::windows_app) const PANEL_RECENT_LIMIT: usize = 30;
+pub(in crate::windows_app) const PANEL_SUGGESTION_LIMIT: usize = 6;
+pub(in crate::windows_app) fn parse_panel_message(body: &str) -> Option<PanelMessage> {
     if body.len() > NOTE_SAVE_MESSAGE_MAX_BYTES {
         return None;
     }
@@ -119,7 +119,7 @@ pub(super) fn parse_panel_message(body: &str) -> Option<PanelMessage> {
 /// Por onde o painel sai. Todas gravam primeiro o que o editor tinha por
 /// salvar; muda so para onde vai o teclado depois.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PanelExit {
+pub(in crate::windows_app) enum PanelExit {
     /// O X ou o Esc da pagina, e o botao Notas com as Notas a vista (a
     /// pagina salva e manda `close`).
     CloseButton,
@@ -144,7 +144,7 @@ pub(super) enum PanelExit {
 
 impl PanelExit {
     #[cfg(test)]
-    pub(super) const ALL: [Self; 8] = [
+    pub(in crate::windows_app) const ALL: [Self; 8] = [
         Self::CloseButton,
         Self::CtrlH,
         Self::OpenItem,
@@ -172,7 +172,7 @@ impl PanelExit {
 
 /// Quem grava o rascunho: o worker das notas (`ZettelWorker`). O painel
 /// leva o seu, para o `Drop` ter por onde gravar.
-pub(super) trait DraftRescue {
+pub(in crate::windows_app) trait DraftRescue {
     /// Poe a gravacao no fim da fila, sem esperar pelo disco e sem a
     /// deitar fora com a fila cheia. `Err`: o aviso para o utilizador.
     fn rescue(&self, command: NotesCommand) -> Result<(), String>;
@@ -184,20 +184,20 @@ pub(super) trait DraftRescue {
 /// O numero de uma pagina do painel: vai no canal dela
 /// (`PanelPost::parse`) e distingue-a das que ja sairam.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct PanelTicket(pub(super) u64);
+pub(in crate::windows_app) struct PanelTicket(u64);
 
 /// Um pedido da pagina do painel, ja pelo parser do canal e com o numero
 /// da pagina que o mandou.
 #[derive(Debug)]
-pub(super) struct PanelPost {
-    pub(super) page: u64,
-    pub(super) message: PanelMessage,
+pub(in crate::windows_app) struct PanelPost {
+    page: u64,
+    message: PanelMessage,
 }
 
 impl PanelPost {
     /// O unico caminho de um pedido da pagina ate ao `App`:
     /// `parse_panel_message`, carimbado com a pagina.
-    pub(super) fn parse(ticket: PanelTicket, body: &str) -> Option<Self> {
+    pub(in crate::windows_app) fn parse(ticket: PanelTicket, body: &str) -> Option<Self> {
         parse_panel_message(body).map(|message| Self {
             page: ticket.0,
             message,
@@ -207,7 +207,7 @@ impl PanelPost {
 
 /// O que `receive` entrega ao `App`.
 #[derive(Debug)]
-pub(super) enum Received {
+pub(in crate::windows_app) enum Received {
     /// Da pagina viva: o `App` trata.
     Current(PanelMessage),
     /// De uma pagina que ja saiu (o pedido estava na fila do event loop
@@ -220,14 +220,14 @@ pub(super) enum Received {
 /// O painel acabou de sair. `saved`: o que o editor tinha por salvar foi
 /// para a fila das notas (ou nao havia nada), ou o aviso do erro.
 #[derive(Debug)]
-pub(super) struct Dismissed {
-    pub(super) saved: Result<(), String>,
+pub(in crate::windows_app) struct Dismissed {
+    pub(in crate::windows_app) saved: Result<(), String>,
 }
 
 /// O painel do Ctrl+H: a vista (a `WebView` no app, uma de mentira nos
 /// gates), a copia do que o editor tem por salvar, quem a grava e os
 /// scripts que esperam pelo "ready" da pagina.
-pub(super) struct SidePanel<W, N: DraftRescue> {
+pub(in crate::windows_app) struct SidePanel<W, N: DraftRescue> {
     view: Option<W>,
     /// Quem grava o rascunho: o `dismiss`, o `receive` de uma pagina que
     /// ja saiu e o `Drop`.
@@ -247,7 +247,7 @@ pub(super) struct SidePanel<W, N: DraftRescue> {
 
 impl<W: PanelView, N: DraftRescue> SidePanel<W, N> {
     /// Sem pagina, com `notes` para gravar o que as paginas deixarem.
-    pub(super) fn closed(notes: N) -> Self {
+    pub(in crate::windows_app) fn closed(notes: N) -> Self {
         Self {
             view: None,
             notes,
@@ -259,16 +259,16 @@ impl<W: PanelView, N: DraftRescue> SidePanel<W, N> {
         }
     }
 
-    pub(super) fn is_open(&self) -> bool {
+    pub(in crate::windows_app) fn is_open(&self) -> bool {
         self.view.is_some()
     }
 
-    pub(super) fn view(&self) -> Option<&W> {
+    pub(in crate::windows_app) fn view(&self) -> Option<&W> {
         self.view.as_ref()
     }
 
     /// O numero da proxima pagina, para o canal dela, antes de a criar.
-    pub(super) fn ticket(&mut self) -> PanelTicket {
+    pub(in crate::windows_app) fn ticket(&mut self) -> PanelTicket {
         self.issued += 1;
         PanelTicket(self.issued)
     }
@@ -276,7 +276,7 @@ impl<W: PanelView, N: DraftRescue> SidePanel<W, N> {
     /// A pagina nova, com o numero que o canal dela leva. Com um painel
     /// ja aberto a vista nova volta para o chamador: a aberta nao e
     /// substituida aqui.
-    pub(super) fn open(&mut self, ticket: PanelTicket, view: W) -> Result<(), W> {
+    pub(in crate::windows_app) fn open(&mut self, ticket: PanelTicket, view: W) -> Result<(), W> {
         if self.view.is_some() {
             return Err(view);
         }
@@ -291,7 +291,7 @@ impl<W: PanelView, N: DraftRescue> SidePanel<W, N> {
     /// pedido vai para o `App`. De uma que ja saiu: o texto que trazia vai
     /// ja para o disco -- nao fica a espera de um painel que nao volta, e
     /// nunca passa por copia do painel novo.
-    pub(super) fn receive(&mut self, post: PanelPost) -> Received {
+    pub(in crate::windows_app) fn receive(&mut self, post: PanelPost) -> Received {
         let PanelPost { page, message } = post;
         if self.view.is_some() && page == self.page {
             track_note_draft(&mut self.draft, &message);
@@ -315,7 +315,7 @@ impl<W: PanelView, N: DraftRescue> SidePanel<W, N> {
 
     /// `Some(script)`: correr ja. Sem painel nao ha onde; antes do
     /// "ready" fica a espera dele.
-    pub(super) fn run(&mut self, script: String) -> Option<String> {
+    pub(in crate::windows_app) fn run(&mut self, script: String) -> Option<String> {
         self.view.as_ref()?;
         if self.ready {
             return Some(script);
@@ -325,7 +325,7 @@ impl<W: PanelView, N: DraftRescue> SidePanel<W, N> {
     }
 
     /// A pagina correu o script dela: o que esperava, pela ordem.
-    pub(super) fn mark_ready(&mut self) -> Vec<String> {
+    pub(in crate::windows_app) fn mark_ready(&mut self) -> Vec<String> {
         self.ready = true;
         std::mem::take(&mut self.pending)
     }
@@ -335,7 +335,7 @@ impl<W: PanelView, N: DraftRescue> SidePanel<W, N> {
     /// tira do painel: o `Drop` ja nao o grava outra vez), e so depois a
     /// vista sai (`release_panel`, que devolve o teclado). `None`: nao
     /// havia painel.
-    pub(super) fn dismiss(
+    pub(in crate::windows_app) fn dismiss(
         &mut self,
         exit: PanelExit,
         surface: Surface,
@@ -358,7 +358,7 @@ impl<W: PanelView, N: DraftRescue> SidePanel<W, N> {
     /// mesma fila -- espera-se (ate `limit`) que tudo ate ela, o
     /// rascunho e o que fechos anteriores ainda tinham por gravar,
     /// chegue ao disco.
-    pub(super) fn exit(&mut self, limit: Duration) -> Result<(), String> {
+    pub(in crate::windows_app) fn exit(&mut self, limit: Duration) -> Result<(), String> {
         let saved = self
             .dismiss(PanelExit::AppExit, Surface::Home, None)
             .map_or(Ok(()), |closed| closed.saved);
@@ -367,7 +367,7 @@ impl<W: PanelView, N: DraftRescue> SidePanel<W, N> {
     }
 
     #[cfg(test)]
-    pub(super) fn draft(&self) -> Option<&NoteEdit> {
+    pub(in crate::windows_app) fn draft(&self) -> Option<&NoteEdit> {
         self.draft.as_ref()
     }
 }
@@ -392,7 +392,7 @@ impl<W, N: DraftRescue> Drop for SidePanel<W, N> {
 
 /// So o proprio HTML local (NavigateToString chega como about:blank ou
 /// data:). Um link, um redirect, um file: ou um javascript: nao passam.
-pub(super) fn panel_allows_navigation(target: &str) -> bool {
+pub(in crate::windows_app) fn panel_allows_navigation(target: &str) -> bool {
     let lower = target.trim().to_ascii_lowercase();
     lower == "about:blank" || lower.starts_with("data:text/html")
 }
@@ -400,14 +400,18 @@ pub(super) fn panel_allows_navigation(target: &str) -> bool {
 /// Encostado a direita, abaixo da barra do comparador (ou do topo, fora
 /// dele): 34% da largura, entre 320 e 440 px logicos, nunca mais que a janela.
 #[cfg(test)]
-pub(super) fn side_panel_bounds(logical_w: f64, logical_h: f64, top: f64) -> (f64, f64, f64, f64) {
+pub(in crate::windows_app) fn side_panel_bounds(
+    logical_w: f64,
+    logical_h: f64,
+    top: f64,
+) -> (f64, f64, f64, f64) {
     panel_bounds(PanelKind::History, None, logical_w, logical_h, top)
 }
 
 /// Um painel da direita com a largura `chosen` (arrastada pela borda e
 /// gravada) ou, sem escolha, a de sempre -- presa sempre a [300 px, 60% da
 /// janela] (`panel_chrome::panel_width`).
-pub(super) fn panel_bounds(
+pub(in crate::windows_app) fn panel_bounds(
     kind: PanelKind,
     chosen: Option<f64>,
     logical_w: f64,
@@ -427,19 +431,22 @@ pub(super) fn panel_bounds(
 /// Layout, divisores e o arrasto dos divisores usam TODOS esta conta; o
 /// arrasto usava a janela inteira e o divisor fugia do rato com o painel
 /// aberto.
-pub(super) fn comparator_logical_width(window_logical_w: f64, panel_width: f64) -> f64 {
+pub(in crate::windows_app) fn comparator_logical_width(
+    window_logical_w: f64,
+    panel_width: f64,
+) -> f64 {
     (window_logical_w - panel_width.max(0.0)).max(1.0)
 }
 
 /// Um item do painel: o que se le e o que o clique volta a abrir.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct PanelItem {
-    pub(super) title: String,
-    pub(super) detail: String,
-    pub(super) input: String,
+pub(in crate::windows_app) struct PanelItem {
+    pub(in crate::windows_app) title: String,
+    pub(in crate::windows_app) detail: String,
+    pub(in crate::windows_app) input: String,
 }
 
-pub(super) fn history_panel_items(entries: &[HistoryEntry]) -> Vec<PanelItem> {
+pub(in crate::windows_app) fn history_panel_items(entries: &[HistoryEntry]) -> Vec<PanelItem> {
     entries
         .iter()
         .filter(|entry| !entry.input.trim().is_empty())
@@ -463,7 +470,7 @@ pub(super) fn history_panel_items(entries: &[HistoryEntry]) -> Vec<PanelItem> {
         .collect()
 }
 
-pub(super) fn memory_panel_items(hits: &[MemoryHit]) -> Vec<PanelItem> {
+pub(in crate::windows_app) fn memory_panel_items(hits: &[MemoryHit]) -> Vec<PanelItem> {
     hits.iter()
         .map(|hit| {
             let source = hit
@@ -487,7 +494,10 @@ pub(super) fn memory_panel_items(hits: &[MemoryHit]) -> Vec<PanelItem> {
 
 /// Sugestoes de sites: os resultados da memoria que tem endereco web, um por
 /// dominio, na ordem de relevancia.
-pub(super) fn suggestion_panel_items(hits: &[MemoryHit], limit: usize) -> Vec<PanelItem> {
+pub(in crate::windows_app) fn suggestion_panel_items(
+    hits: &[MemoryHit],
+    limit: usize,
+) -> Vec<PanelItem> {
     let mut seen = std::collections::HashSet::new();
     let mut items = Vec::new();
     for hit in hits {
@@ -525,7 +535,7 @@ pub(super) fn suggestion_panel_items(hits: &[MemoryHit], limit: usize) -> Vec<Pa
 
 /// O JS que preenche uma secao. Os dados vao como JSON (literal JS valido) e a
 /// pagina so os usa com `textContent`.
-pub(super) fn panel_render_script(
+pub(in crate::windows_app) fn panel_render_script(
     section: &str,
     title: &str,
     empty: &str,
@@ -550,12 +560,12 @@ pub(super) fn panel_render_script(
     format!("window.__neuraliaPanel && window.__neuraliaPanel.render({data});")
 }
 
-pub(super) fn css_color(color: Rgb) -> String {
+pub(in crate::windows_app) fn css_color(color: Rgb) -> String {
     format!("#{:02x}{:02x}{:02x}", color.0, color.1, color.2)
 }
 
 /// As cores do tema em vigor, como variaveis CSS do painel.
-pub(super) fn panel_theme_vars(theme: &Theme) -> serde_json::Value {
+pub(in crate::windows_app) fn panel_theme_vars(theme: &Theme) -> serde_json::Value {
     serde_json::json!({
         "--bg": css_color(theme.page_bg),
         "--surface": css_color(theme.surface),
@@ -566,11 +576,11 @@ pub(super) fn panel_theme_vars(theme: &Theme) -> serde_json::Value {
     })
 }
 
-pub(super) fn panel_html(theme: &Theme) -> String {
+pub(in crate::windows_app) fn panel_html(theme: &Theme) -> String {
     PANEL_HTML.replace("__THEME__", &panel_theme_vars(theme).to_string())
 }
 
-pub(super) const PANEL_HTML: &str = r#"<!doctype html>
+pub(in crate::windows_app) const PANEL_HTML: &str = r#"<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8"><title>Histórico e notas</title>
 <style>
 *{box-sizing:border-box}

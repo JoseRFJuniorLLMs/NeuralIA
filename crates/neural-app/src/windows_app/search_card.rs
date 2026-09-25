@@ -3,25 +3,25 @@ use super::*;
 /// Para onde o cartao manda a resposta: o proxy do event loop no app, um
 /// registo nos gates. Em caixa dupla: o `reference_data` da subclasse e um
 /// ponteiro fino.
-pub(super) type SearchCardSink = Box<dyn Fn(UserEvent)>;
+pub(in crate::windows_app) type SearchCardSink = Box<dyn Fn(UserEvent)>;
 
 /// Os dois botoes do cartao: o de confirmar ("Mandar", "Traduzir") e o
 /// Cancelar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SearchCardButton {
+pub(in crate::windows_app) enum SearchCardButton {
     Confirm,
     Cancel,
 }
 
 impl SearchCardButton {
-    pub(super) fn index(self) -> usize {
+    pub(in crate::windows_app) fn index(self) -> usize {
         match self {
             Self::Confirm => 0,
             Self::Cancel => 1,
         }
     }
 
-    pub(super) fn from_index(index: usize) -> Option<Self> {
+    pub(in crate::windows_app) fn from_index(index: usize) -> Option<Self> {
         match index {
             0 => Some(Self::Confirm),
             1 => Some(Self::Cancel),
@@ -30,7 +30,7 @@ impl SearchCardButton {
     }
 
     /// O rotulo no cartao do botao da barra que o pediu.
-    pub(super) fn label(self, intent: SearchIntent) -> &'static str {
+    pub(in crate::windows_app) fn label(self, intent: SearchIntent) -> &'static str {
         match (self, intent) {
             (Self::Confirm, SearchIntent::Ask) => "Mandar",
             (Self::Confirm, SearchIntent::Translate) => "Traduzir",
@@ -40,7 +40,7 @@ impl SearchCardButton {
 }
 
 /// O titulo do cartao, pelo botao da barra que o pediu.
-pub(super) fn search_card_title(intent: SearchIntent) -> &'static str {
+pub(in crate::windows_app) fn search_card_title(intent: SearchIntent) -> &'static str {
     match intent {
         SearchIntent::Ask => "Mandar para as 3 IAs?",
         SearchIntent::Translate => "Traduzir nas 3 IAs?",
@@ -51,7 +51,7 @@ pub(super) fn search_card_title(intent: SearchIntent) -> &'static str {
 /// o cartao pintou (`seen`): a pergunta tal e qual, ou o pedido fixo de
 /// traducao, uma linha em branco e o texto. O pedido e sempre este, escrito
 /// aqui: a pagina so escolhe o botao.
-pub(super) fn selection_prompt(intent: SearchIntent, seen: &str) -> String {
+pub(in crate::windows_app) fn selection_prompt(intent: SearchIntent, seen: &str) -> String {
     match intent {
         SearchIntent::Ask => seen.to_string(),
         SearchIntent::Translate => format!("{TRANSLATE_PROMPT}\n\n{seen}"),
@@ -60,7 +60,7 @@ pub(super) fn selection_prompt(intent: SearchIntent, seen: &str) -> String {
 
 /// O comando da omnibox que traduz nas tres IAs: e o que o Historico guarda
 /// de um Traduzir, e o clique la refaz o pedido (`route_input`).
-pub(super) const TRANSLATE_COMMAND: &str = "traduzir:";
+pub(in crate::windows_app) const TRANSLATE_COMMAND: &str = "traduzir:";
 
 /// Uma comparacao nas tres IAs: o que elas recebem (`prompt`) e como fica no
 /// Historico, na memoria e na sessao de pesquisa. Numa pergunta e tudo o
@@ -70,18 +70,18 @@ pub(super) const TRANSLATE_COMMAND: &str = "traduzir:";
 /// `traduzir:<texto>`, que reabre refazendo o pedido (com o pedido inteiro,
 /// um texto longo passava do tecto do painel e ja nao reabria).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct CompareRequest {
+pub(in crate::windows_app) struct CompareRequest {
     /// O que as tres IAs recebem.
-    pub(super) prompt: String,
+    pub(in crate::windows_app) prompt: String,
     /// O nome da sessao de pesquisa e da memoria.
-    pub(super) label: String,
+    pub(in crate::windows_app) label: String,
     /// O que o Historico guarda e o clique la volta a abrir (`handle_input`).
-    pub(super) reopen: String,
+    pub(in crate::windows_app) reopen: String,
 }
 
 impl CompareRequest {
     /// Uma pergunta: o mesmo texto para as IAs, o nome e o Historico.
-    pub(super) fn ask(query: String) -> Self {
+    pub(in crate::windows_app) fn ask(query: String) -> Self {
         Self {
             label: query.clone(),
             reopen: format!("compare:{query}"),
@@ -90,7 +90,7 @@ impl CompareRequest {
     }
 
     /// O Traduzir de `text` (`selection_prompt`).
-    pub(super) fn translate(text: &str) -> Self {
+    pub(in crate::windows_app) fn translate(text: &str) -> Self {
         Self {
             prompt: selection_prompt(SearchIntent::Translate, text),
             label: format!("Traduzir: {text}"),
@@ -100,7 +100,7 @@ impl CompareRequest {
 
     /// O que o clique em confirmar no cartao manda: o texto que ele pintou,
     /// pelo botao da barra que o pediu.
-    pub(super) fn selection(intent: SearchIntent, seen: &str) -> Self {
+    pub(in crate::windows_app) fn selection(intent: SearchIntent, seen: &str) -> Self {
         match intent {
             SearchIntent::Ask => Self::ask(seen.to_string()),
             SearchIntent::Translate => Self::translate(seen),
@@ -110,7 +110,7 @@ impl CompareRequest {
 
 /// O que um `compare` deixa, sem janela: a sessao de pesquisa (com o nome
 /// de `label`), a memoria da pergunta e a entrada do Historico.
-pub(super) fn compare_records(
+pub(in crate::windows_app) fn compare_records(
     request: &CompareRequest,
 ) -> (ResearchSession, MemoryDocument, String) {
     let session = ResearchSession::new(request.prompt.clone()).titled(&request.label);
@@ -129,26 +129,27 @@ pub(super) fn compare_records(
 /// pagina e um "&", nao um sublinhado), quebra por palavras e, numa palavra
 /// maior que a linha, por caracteres. Sem DT_END_ELLIPSIS: o corte e o de
 /// `search_card_fit`, medido, nunca um que o GDI faca em silencio.
-pub(super) const SEARCH_CARD_TEXT_FORMAT: u32 = DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX;
+pub(in crate::windows_app) const SEARCH_CARD_TEXT_FORMAT: u32 =
+    DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX;
 
 /// Onde fica cada coisa no cartao, em pixeis do cliente. Uma so funcao para o
 /// desenho e o clique concordarem sempre.
-pub(super) struct SearchCardLayout {
-    pub(super) title: RECT,
+pub(in crate::windows_app) struct SearchCardLayout {
+    pub(in crate::windows_app) title: RECT,
     /// A caixa do texto e, dentro dela, o texto.
-    pub(super) quote: RECT,
-    pub(super) text: RECT,
+    pub(in crate::windows_app) quote: RECT,
+    pub(in crate::windows_app) text: RECT,
     /// A conta do que ficou de fora, a esquerda dos botoes.
-    pub(super) note: RECT,
-    pub(super) search: RECT,
-    pub(super) cancel: RECT,
+    pub(in crate::windows_app) note: RECT,
+    pub(in crate::windows_app) search: RECT,
+    pub(in crate::windows_app) cancel: RECT,
 }
 
-pub(super) fn search_card_scale(client: &RECT) -> f64 {
+pub(in crate::windows_app) fn search_card_scale(client: &RECT) -> f64 {
     ((client.bottom - client.top) as f64 / SEARCH_CARD_HEIGHT).max(1.0)
 }
 
-pub(super) fn search_card_layout(client: &RECT, scale: f64) -> SearchCardLayout {
+pub(in crate::windows_app) fn search_card_layout(client: &RECT, scale: f64) -> SearchCardLayout {
     let px = |value: f64| (value * scale).round() as i32;
     let pad = px(24.0);
     let right = client.right - pad;
@@ -201,7 +202,7 @@ pub(super) fn search_card_layout(client: &RECT, scale: f64) -> SearchCardLayout 
 }
 
 /// O botao do cartao debaixo de (x, y); bordas semiabertas, como o resto da UI.
-pub(super) fn search_card_hit(
+pub(in crate::windows_app) fn search_card_hit(
     client: &RECT,
     scale: f64,
     x: i32,
@@ -221,7 +222,7 @@ pub(super) fn search_card_hit(
 /// O clique que o cartao aceita: o botao desceu E subiu no mesmo botao, com o
 /// cartao a segurar o rato desde que desceu. Arrastar de fora para cima do
 /// confirmar, ou premir e sair, nao responde nada.
-pub(super) fn search_card_release(
+pub(in crate::windows_app) fn search_card_release(
     pressed: Option<usize>,
     captured: bool,
     client: &RECT,
@@ -243,7 +244,7 @@ pub(super) fn search_card_release(
 /// Hangul --, o braille vazio, as ancoras de anotacao e o U+FFFC, a area
 /// privada e os nao-caracteres. A pagina escolhe o texto; nao escolhe mandar
 /// as IAs uma coisa que o cartao nao mostra.
-pub(super) fn invisible_in_card(c: char) -> bool {
+pub(in crate::windows_app) fn invisible_in_card(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'
@@ -278,7 +279,7 @@ pub(super) fn invisible_in_card(c: char) -> bool {
 /// caracteres invisiveis, com quebras de linha, tabs e outros espacos ou
 /// controlos reduzidos a um espaco, aparada. E ESTE texto -- nao o que a
 /// pagina mandou -- que o cartao pinta e que a confirmacao leva.
-pub(super) fn selection_question(text: &str) -> String {
+pub(in crate::windows_app) fn selection_question(text: &str) -> String {
     let mut question = String::with_capacity(text.len());
     let mut gap = false;
     for c in text.chars() {
@@ -300,7 +301,7 @@ pub(super) fn selection_question(text: &str) -> String {
 
 /// Os primeiros `shown` caracteres de `text`, sem o espaco do fim: o que o
 /// cartao pintou e, portanto, tudo o que um clique em confirmar leva.
-pub(super) fn search_card_shown(text: &str, shown: usize) -> &str {
+pub(in crate::windows_app) fn search_card_shown(text: &str, shown: usize) -> &str {
     let end = text
         .char_indices()
         .nth(shown)
@@ -309,7 +310,7 @@ pub(super) fn search_card_shown(text: &str, shown: usize) -> &str {
 }
 
 /// O que se pinta na caixa: o texto inteiro, ou o inicio que coube e "…".
-pub(super) fn search_card_body(text: &str, shown: usize) -> String {
+pub(in crate::windows_app) fn search_card_body(text: &str, shown: usize) -> String {
     let part = search_card_shown(text, shown);
     if part == text.trim_end() {
         part.to_string()
@@ -319,7 +320,7 @@ pub(super) fn search_card_body(text: &str, shown: usize) -> String {
 }
 
 /// A conta, debaixo da caixa, do que nao coube (e por isso nao vai).
-pub(super) fn search_card_left_out(chars: usize) -> String {
+pub(in crate::windows_app) fn search_card_left_out(chars: usize) -> String {
     if chars == 1 {
         "+1 caractere fica de fora".to_string()
     } else {
@@ -332,7 +333,7 @@ pub(super) fn search_card_left_out(chars: usize) -> String {
 /// formato do desenho: todos, se cabem; senao o maior inicio que cabe com o
 /// "…" (cortado no ultimo espaco, se estiver perto). Uma linha mais larga que
 /// a caixa (uma palavra que o GDI nao partisse) conta como nao caber.
-pub(super) unsafe fn search_card_fit(
+pub(in crate::windows_app) unsafe fn search_card_fit(
     hdc: *mut core::ffi::c_void,
     text: &str,
     width: i32,
@@ -387,7 +388,7 @@ pub(super) unsafe fn search_card_fit(
 }
 
 /// "Abrir" e "Nao" no canto direito do aviso do Gmail, em pixeis do cliente.
-pub(super) fn gmail_toast_buttons(client: &RECT, scale: f64) -> (RECT, RECT) {
+pub(in crate::windows_app) fn gmail_toast_buttons(client: &RECT, scale: f64) -> (RECT, RECT) {
     let height = (26.0 * scale).round() as i32;
     let top = (client.bottom - height) / 2;
     let gap = (6.0 * scale).round() as i32;
@@ -413,7 +414,7 @@ pub(super) fn gmail_toast_buttons(client: &RECT, scale: f64) -> (RECT, RECT) {
 /// intermitentes. Desligado por padrao; `NEURALIA_DEBUG_LOG=<ficheiro>` liga.
 /// Cada linha: milissegundos desde o arranque e o evento. Nunca leva URLs,
 /// texto de paginas nem nada da memoria -- so transicoes da janela.
-pub(super) fn debug_log(event: std::fmt::Arguments<'_>) {
+pub(in crate::windows_app) fn debug_log(event: std::fmt::Arguments<'_>) {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let Some(path) = std::env::var_os("NEURALIA_DEBUG_LOG") else {
         return;
@@ -423,7 +424,7 @@ pub(super) fn debug_log(event: std::fmt::Arguments<'_>) {
 }
 
 /// Acrescenta uma linha ao log; um log que nao abre nunca derruba o app.
-pub(super) fn append_debug_line(
+pub(in crate::windows_app) fn append_debug_line(
     path: &std::path::Path,
     elapsed_ms: u128,
     event: std::fmt::Arguments<'_>,
@@ -441,7 +442,7 @@ pub(super) fn append_debug_line(
     }
 }
 
-pub(super) fn show_popup_without_activation(hwnd: HWND) {
+pub(in crate::windows_app) fn show_popup_without_activation(hwnd: HWND) {
     unsafe {
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
@@ -450,13 +451,17 @@ pub(super) fn show_popup_without_activation(hwnd: HWND) {
 /// Um cartao de cada vez: pendente -> confirmado, cancelado, expirado ou
 /// trocado por um pedido novo.
 #[derive(Default)]
-pub(super) struct SearchCard {
-    pub(super) pending: Option<PendingSearch>,
-    pub(super) last_token: u64,
+pub(in crate::windows_app) struct SearchCard {
+    pub(in crate::windows_app) pending: Option<PendingSearch>,
+    pub(in crate::windows_app) last_token: u64,
 }
 
 impl SearchCard {
-    pub(super) fn step(&mut self, input: SearchCardInput, now: Instant) -> SearchCardOutcome {
+    pub(in crate::windows_app) fn step(
+        &mut self,
+        input: SearchCardInput,
+        now: Instant,
+    ) -> SearchCardOutcome {
         match input {
             SearchCardInput::Request { text, intent } => {
                 let Some(SelectionSearch::Compare(question)) = selection_search(&text) else {
@@ -528,14 +533,17 @@ impl SearchCard {
 }
 
 /// Quem executa o cartao: o App no produto, um registo nos gates.
-pub(super) trait SearchCardHost {
+pub(in crate::windows_app) trait SearchCardHost {
     fn show_search_card(&mut self, token: u64, intent: SearchIntent, text: &str);
     fn hide_search_card(&mut self);
     fn expire_search_card_after(&mut self, token: u64, delay: Duration);
     fn compare_selection(&mut self, request: CompareRequest);
 }
 
-pub(super) fn apply_search_card(host: &mut impl SearchCardHost, outcome: SearchCardOutcome) {
+pub(in crate::windows_app) fn apply_search_card(
+    host: &mut impl SearchCardHost,
+    outcome: SearchCardOutcome,
+) {
     match outcome {
         SearchCardOutcome::Show {
             token,

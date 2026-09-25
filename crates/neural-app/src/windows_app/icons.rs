@@ -1,40 +1,45 @@
 use super::*;
 
 /// Slot 0..2 = icones das IAs, slot 3 = glifo da casa (pintado com a cor do tema).
-pub(super) const ICON_SLOT_HOME: usize = COMPARATOR_COLUMNS;
+pub(in crate::windows_app) const ICON_SLOT_HOME: usize = COMPARATOR_COLUMNS;
 /// Icones dos botoes do canto direito (gerados por scripts/gen-ai-icons.py).
-pub(super) const ICON_SLOT_VIDEO: usize = COMPARATOR_COLUMNS + 1;
-pub(super) const ICON_SLOT_WHATSAPP: usize = COMPARATOR_COLUMNS + 2;
-pub(super) const ICON_SLOT_YOUTUBE: usize = COMPARATOR_COLUMNS + 3;
-pub(super) const ICON_SLOT_MAIL: usize = COMPARATOR_COLUMNS + 4;
-pub(super) const ICON_SLOT_INCOGNITO: usize = COMPARATOR_COLUMNS + 5;
+pub(in crate::windows_app) const ICON_SLOT_VIDEO: usize = COMPARATOR_COLUMNS + 1;
+pub(in crate::windows_app) const ICON_SLOT_WHATSAPP: usize = COMPARATOR_COLUMNS + 2;
+pub(in crate::windows_app) const ICON_SLOT_YOUTUBE: usize = COMPARATOR_COLUMNS + 3;
+pub(in crate::windows_app) const ICON_SLOT_MAIL: usize = COMPARATOR_COLUMNS + 4;
+pub(in crate::windows_app) const ICON_SLOT_INCOGNITO: usize = COMPARATOR_COLUMNS + 5;
 /// Ferramentas: Pomodoro, Notas e Respiracao.
-pub(super) const ICON_SLOT_POMODORO: usize = COMPARATOR_COLUMNS + 6;
-pub(super) const ICON_SLOT_NOTES: usize = COMPARATOR_COLUMNS + 7;
-pub(super) const ICON_SLOT_BREATH: usize = COMPARATOR_COLUMNS + 8;
+pub(in crate::windows_app) const ICON_SLOT_POMODORO: usize = COMPARATOR_COLUMNS + 6;
+pub(in crate::windows_app) const ICON_SLOT_NOTES: usize = COMPARATOR_COLUMNS + 7;
+pub(in crate::windows_app) const ICON_SLOT_BREATH: usize = COMPARATOR_COLUMNS + 8;
 /// O olho do Gemini Live.
-pub(super) const ICON_SLOT_LIVE: usize = COMPARATOR_COLUMNS + 9;
-pub(super) static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 9] = [const { OnceLock::new() }; 9];
+pub(in crate::windows_app) const ICON_SLOT_LIVE: usize = COMPARATOR_COLUMNS + 9;
+pub(in crate::windows_app) static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 9] =
+    [const { OnceLock::new() }; 9];
 
-pub(super) static AI_ICON_IMAGES: [OnceLock<RgbaImage>; COMPARATOR_COLUMNS] =
+pub(in crate::windows_app) static AI_ICON_IMAGES: [OnceLock<RgbaImage>; COMPARATOR_COLUMNS] =
     [OnceLock::new(), OnceLock::new(), OnceLock::new()];
-pub(super) static HOME_ICON_IMAGE: OnceLock<RgbaImage> = OnceLock::new();
+pub(in crate::windows_app) static HOME_ICON_IMAGE: OnceLock<RgbaImage> = OnceLock::new();
 /// Tecto do cache de icones redimensionados. Ha 4 slots, mas o tamanho vem da
 /// escala da janela: arrastar a borda gera um tamanho novo por pixel percorrido
 /// e o cache antigo, sem limite, guardava um bitmap por cada um deles para
 /// sempre. 24 entradas chegam para os tamanhos que a barra usa de facto.
-pub(super) const ICON_CACHE_CAPACITY: usize = 24;
+pub(in crate::windows_app) const ICON_CACHE_CAPACITY: usize = 24;
 /// (slot, lado em pixeis) -> bitmap ja redimensionado, partilhado por `Arc`
 /// para o desenho nao copiar a imagem a cada WM_PAINT.
-pub(super) type IconCacheEntry = ((usize, u32), Arc<RgbaImage>);
-pub(super) static ICON_SCALE_CACHE: Mutex<Vec<IconCacheEntry>> = Mutex::new(Vec::new());
+pub(in crate::windows_app) type IconCacheEntry = ((usize, u32), Arc<RgbaImage>);
+pub(in crate::windows_app) static ICON_SCALE_CACHE: Mutex<Vec<IconCacheEntry>> =
+    Mutex::new(Vec::new());
 
 /// LRU minimo sobre um vector: o fim e o mais recentemente usado, o inicio e o
 /// candidato a sair. Estao separadas do cache de icones de proposito — assim a
 /// politica de eviccao testa-se sem GDI, sem PNGs e sem estado global.
 ///
 /// Devolve o valor se a chave existir, promovendo a entrada a mais recente.
-pub(super) fn lru_promote<K: PartialEq, V: Clone>(entries: &mut Vec<(K, V)>, key: &K) -> Option<V> {
+pub(in crate::windows_app) fn lru_promote<K: PartialEq, V: Clone>(
+    entries: &mut Vec<(K, V)>,
+    key: &K,
+) -> Option<V> {
     let index = entries.iter().position(|(cached, _)| cached == key)?;
     let entry = entries.remove(index);
     let value = entry.1.clone();
@@ -44,7 +49,7 @@ pub(super) fn lru_promote<K: PartialEq, V: Clone>(entries: &mut Vec<(K, V)>, key
 
 /// Insere como mais recente, deitando fora as mais antigas ate caber em
 /// `capacity`. Uma chave repetida substitui a entrada antiga em vez de crescer.
-pub(super) fn lru_insert<K: PartialEq, V>(
+pub(in crate::windows_app) fn lru_insert<K: PartialEq, V>(
     entries: &mut Vec<(K, V)>,
     key: K,
     value: V,
@@ -63,7 +68,7 @@ pub(super) fn lru_insert<K: PartialEq, V>(
     entries.push((key, value));
 }
 
-pub(super) fn ai_icon(index: usize) -> &'static RgbaImage {
+pub(in crate::windows_app) fn ai_icon(index: usize) -> &'static RgbaImage {
     AI_ICON_IMAGES[index.min(COMPARATOR_COLUMNS - 1)].get_or_init(|| {
         let raw: &[u8] = match index {
             0 => include_bytes!("../../../../assets/ai/gemini.png"),
@@ -78,7 +83,7 @@ pub(super) fn ai_icon(index: usize) -> &'static RgbaImage {
 
 /// Redimensiona uma vez por (icone, tamanho): o Lanczos3 e caro de mais para
 /// correr a cada WM_PAINT, e a barra redesenha-se a cada movimento do rato.
-pub(super) fn home_icon() -> &'static RgbaImage {
+pub(in crate::windows_app) fn home_icon() -> &'static RgbaImage {
     HOME_ICON_IMAGE.get_or_init(|| {
         image::load_from_memory(include_bytes!("../../../../assets/ai/home.png"))
             .expect("assets/ai/home.png must be valid PNG")
@@ -86,7 +91,7 @@ pub(super) fn home_icon() -> &'static RgbaImage {
     })
 }
 
-pub(super) fn extra_icon(slot: usize) -> &'static RgbaImage {
+pub(in crate::windows_app) fn extra_icon(slot: usize) -> &'static RgbaImage {
     let index = slot
         .saturating_sub(ICON_SLOT_VIDEO)
         .min(EXTRA_ICON_IMAGES.len() - 1);
@@ -108,7 +113,7 @@ pub(super) fn extra_icon(slot: usize) -> &'static RgbaImage {
     })
 }
 
-pub(super) fn icon_scaled(slot: usize, size: u32) -> Arc<RgbaImage> {
+pub(in crate::windows_app) fn icon_scaled(slot: usize, size: u32) -> Arc<RgbaImage> {
     let key = (slot, size);
     let mut guard = ICON_SCALE_CACHE.lock().unwrap_or_else(|p| p.into_inner());
     let entries = &mut *guard;
@@ -135,7 +140,7 @@ pub(super) fn icon_scaled(slot: usize, size: u32) -> Arc<RgbaImage> {
 
 /// `tint` substitui a cor do icone mantendo o alfa — e assim que o glifo da
 /// casa segue o tema sem existirem dois PNGs.
-pub(super) unsafe fn draw_icon(
+pub(in crate::windows_app) unsafe fn draw_icon(
     hdc: *mut core::ffi::c_void,
     slot: usize,
     x: i32,
@@ -170,16 +175,16 @@ pub(super) unsafe fn draw_icon(
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct PillStyle {
-    pub(super) fill: Rgb,
-    pub(super) border: Rgb,
-    pub(super) text: Rgb,
-    pub(super) icon: Option<usize>,
-    pub(super) icon_tint: Option<Rgb>,
+pub(in crate::windows_app) struct PillStyle {
+    pub(in crate::windows_app) fill: Rgb,
+    pub(in crate::windows_app) border: Rgb,
+    pub(in crate::windows_app) text: Rgb,
+    pub(in crate::windows_app) icon: Option<usize>,
+    pub(in crate::windows_app) icon_tint: Option<Rgb>,
 }
 
 impl PillStyle {
-    pub(super) fn new(fill: Rgb, border: Rgb, text: Rgb) -> Self {
+    pub(in crate::windows_app) fn new(fill: Rgb, border: Rgb, text: Rgb) -> Self {
         Self {
             fill,
             border,
@@ -189,7 +194,7 @@ impl PillStyle {
         }
     }
 
-    pub(super) fn with_icon(mut self, slot: usize, tint: Option<Rgb>) -> Self {
+    pub(in crate::windows_app) fn with_icon(mut self, slot: usize, tint: Option<Rgb>) -> Self {
         self.icon = Some(slot);
         self.icon_tint = tint;
         self
@@ -200,12 +205,12 @@ impl PillStyle {
 /// O icone de 18 px da pilula so entra com as margens dos dois lados; numa
 /// pilula mais estreita (a coluna espremida) ele saia pela borda e caia na
 /// folga ou debaixo do "+".
-pub(super) fn pill_fits_icon(width: f64, scale: f64) -> bool {
+pub(in crate::windows_app) fn pill_fits_icon(width: f64, scale: f64) -> bool {
     let padding = 11.0 * scale;
     width >= padding + (18.0 * scale).round() + padding * 0.6
 }
 
-pub(super) unsafe fn draw_pill(
+pub(in crate::windows_app) unsafe fn draw_pill(
     hdc: *mut core::ffi::c_void,
     rect: UiRect,
     label: &str,
@@ -275,7 +280,7 @@ pub(super) unsafe fn draw_pill(
     draw_text(hdc, label, &mut text_rect, format);
 }
 
-pub(super) unsafe fn draw_button(
+pub(in crate::windows_app) unsafe fn draw_button(
     hdc: *mut core::ffi::c_void,
     rect: UiRect,
     label: &str,
@@ -292,7 +297,7 @@ pub(super) unsafe fn draw_button(
     draw_pill(hdc, rect, label, style, scale, font, theme.page_bg);
 }
 
-pub(super) unsafe fn draw_text(
+pub(in crate::windows_app) unsafe fn draw_text(
     hdc: *mut core::ffi::c_void,
     text: &str,
     rect: &mut RECT,
@@ -304,10 +309,10 @@ pub(super) unsafe fn draw_text(
     }
 }
 
-pub(super) const fn rgb(r: u8, g: u8, b: u8) -> u32 {
+pub(in crate::windows_app) const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
 }
 
-pub(super) const fn rgb3(color: Rgb) -> u32 {
+pub(in crate::windows_app) const fn rgb3(color: Rgb) -> u32 {
     rgb(color.0, color.1, color.2)
 }

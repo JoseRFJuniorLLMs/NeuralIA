@@ -102,7 +102,7 @@ Acceptance is deliberately composite instead of pretending that the Rust
 reference parser is the product. The `Semantic timeline gates` workflow:
 
 - executes the **exact two `semanticAnchors()` functions extracted from
-  `windows_app.rs`** against ChatGPT, Gemini and Claude fixtures;
+  `windows_app/page_scripts.rs`** against ChatGPT, Gemini and Claude fixtures;
 - ratio-gates those shipped functions with paired 16 -> 64 node measurements;
 - runs `timeline_acceptance.rs` against the Rust parser/reference with the
   same provider vocabulary and a paired 256 -> 1024 section ratio;

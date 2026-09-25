@@ -148,6 +148,7 @@ jobs:
             @{
               Label = "stale-split-generation"
               Test = "stale_split_builds_are_discarded_after_navigation_changes"
+              SourcePath = "crates/neural-app/src/windows_app/app/split.rs"
               Old = @'
               start_generation == current_generation && surface == Surface::Comparator
           '@
@@ -168,6 +169,7 @@ jobs:
             @{
               Label = "join-current-group"
               Test = "current_group_is_not_offered_as_a_join_target"
+              SourcePath = "crates/neural-app/src/windows_app/app/tabs.rs"
               Old = @'
                   .filter(|(_, group)| Some(group.id) != current_group)
           '@
@@ -178,6 +180,7 @@ jobs:
             @{
               Label = "global-digit-shortcut"
               Test = "keyboard_shortcuts_keep_page_identity_and_global_digit_targets"
+              SourcePath = "crates/neural-app/src/windows_app/app/compare.rs"
               Old = @'
                       IpcAction::Fullscreen => Some(UserEvent::ExpandComparator(col_index)),
                       IpcAction::ShortcutExpand { col } => Some(UserEvent::ExpandComparator(col)),
@@ -192,6 +195,7 @@ jobs:
             @{
               Label = "split-transaction"
               Test = "failed_split_build_preserves_the_previous_split_and_expansion"
+              SourcePath = "crates/neural-app/src/windows_app/app/split.rs"
               Old = @'
                   Err(error) => Err(error),
           '@

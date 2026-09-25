@@ -1,4 +1,7 @@
 use super::*;
+use crate::gemini_live::{LiveAction, live_page_url, live_panel_navigation};
+use crate::panel_chrome::panel_width_from_drag;
+use std::ffi::OsString;
 use windows_sys::Win32::Graphics::Gdi::GetDIBits;
 /// O fundo da Home acompanha a marca, nao disputa com ela.
 ///
@@ -377,7 +380,7 @@ mod bar_geometry {
 
 #[test]
 fn home_button_is_text_only_without_an_invented_icon() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let native = source
         .split("fn home_button_subclass")
         .nth(1)
@@ -441,7 +444,7 @@ fn native_caption_buttons_accept_the_mouse() {
 
 #[test]
 fn native_home_button_has_a_stable_window_identity_for_the_shipping_gate() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let body = source
         .split("fn sync_home_button")
         .nth(1)
@@ -2223,7 +2226,7 @@ fn the_live_panel_handlers_are_the_gatekeepers_it_ships_with() {
 /// painel escondido, sem olho e sem Desligar.
 #[test]
 fn leaving_a_web_surface_turns_gemini_live_off() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let body = |start: &str, end: &str| {
         source
             .split(start)
@@ -2251,24 +2254,25 @@ fn leaving_a_web_surface_turns_gemini_live_off() {
     );
 
     // Cada metodo que poe outra superficie passa pela saida unica (ou,
-    // como a Home, fecha o Gemini Live ele proprio).
+    // como a Home, fecha o Gemini Live ele proprio). As superficies vem
+    // do proprio `enum Surface`: uma variante nova entra no gate sem
+    // ninguem se lembrar de a acrescentar aqui. Com a lista escrita a mao
+    // o Epub ficou de fora e open_epub_page podia deixar a captura a
+    // correr num painel escondido sem este gate dar por isso.
+    let surfaces: Vec<String> = body("enum Surface {", "\n}\n")
+        .lines()
+        .map(|line| line.trim().trim_end_matches(','))
+        .filter(|name| !name.is_empty() && !name.starts_with("///") && *name != "Comparator")
+        .map(|name| format!("self.surface = Surface::{name};"))
+        .collect();
+    assert!(
+        surfaces.len() >= 5 && surfaces.iter().any(|s| s.ends_with("Surface::Epub;")),
+        "enum Surface mal lido: {surfaces:?}"
+    );
     let mut checked = 0;
-    for method in source
-        .split(
-            "
-    fn ",
-        )
-        .skip(1)
-    {
+    for method in source.split("\n    fn ").skip(1) {
         let name = method.split('(').next().unwrap_or_default();
-        let leaves = [
-            "Surface::Home;",
-            "Surface::External;",
-            "Surface::Reader;",
-            "Surface::Pdf;",
-        ]
-        .iter()
-        .any(|surface| method.contains(&format!("self.surface = {surface}")));
+        let leaves = surfaces.iter().any(|surface| method.contains(surface));
         if !leaves {
             continue;
         }
@@ -2279,7 +2283,7 @@ fn leaving_a_web_surface_turns_gemini_live_off() {
             "{name} troca de superficie sem desligar o Gemini Live"
         );
     }
-    assert!(checked >= 8, "so {checked} metodos trocam de superficie?");
+    assert!(checked >= 9, "so {checked} metodos trocam de superficie?");
 }
 
 /// O painel pinta ja com as cores do tema do app (claro e escuro), antes
@@ -5081,7 +5085,7 @@ fn a_plain_click_opens_in_all_three_panels_and_ctrl_click_opens_beside() {
 
 #[test]
 fn comparator_popup_failure_never_falls_back_to_destroying_all_panels() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let body = source
         .split("fn open_in_column")
         .nth(1)
@@ -5113,7 +5117,7 @@ fn lifecycle_probe_commands_are_deduplicated_by_nonce() {
 
 #[test]
 fn lifecycle_ready_is_published_only_after_returning_to_the_event_loop() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let activate = source
         .split("fn activate_comparator")
         .nth(1)
@@ -5148,7 +5152,7 @@ fn lifecycle_ready_is_published_only_after_returning_to_the_event_loop() {
 
 #[test]
 fn webview_teardown_does_not_schedule_home_chrome_while_opening_comparator() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let destroy = source
         .split("fn destroy_web_surfaces")
         .nth(1)
@@ -5344,7 +5348,7 @@ fn palette_routes_private_input_away_from_the_normal_column() {
 
 #[test]
 fn private_palette_paths_never_touch_history_or_context_tabs() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let submit = source
         .split("fn submit_palette")
         .nth(1)
@@ -5390,7 +5394,7 @@ fn private_palette_paths_never_touch_history_or_context_tabs() {
 /// perfeito que "Apagar historico" deixasse de chamar nao apagava nada.
 #[test]
 fn the_shipped_paths_are_wired_to_the_tab_session() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let body = |from: &str, to: &str| -> String {
         source
             .split(from)
@@ -5417,7 +5421,7 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
     // O comportamento destes caminhos esta em
     // the_app_path_saves_restores_and_forgets_the_real_tabs_json (sobre o
     // `TabPersistence`); aqui so se prende que o App os chama.
-    let forget_body = body("fn forget_tab_session", "fn activate_comparator");
+    let forget_body = body("fn forget_tab_session", "fn context_tab_identity");
     assert!(forget_body.contains(".forget(&mut comp.contexts, &mut comp.groups, split)"));
 
     // Sair do comparador (Home, Reader, Web) grava antes de o destruir, e
@@ -5445,7 +5449,16 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
     assert!(observe.contains(".observe(&comp.contexts, &comp.groups, comparator_split_key(comp))"));
 
     // As duas entradas do comparador passam pelo mesmo modelo.
-    let open = body("fn open_comparator", "fn observe_tab_session");
+    // open_comparator vive em app/compare.rs e activate_comparator e o
+    // metodo que se lhe segue. O observe_tab_session que fechava a regiao
+    // no ficheiro unico esta em app/tabs.rs: com ele a regiao atravessava
+    // o resto de compare.rs e um `self.tab_session.restore()` em qualquer
+    // desses metodos (ou num comentario) mantinha o gate verde.
+    let open = body("fn open_comparator", "fn activate_comparator");
+    assert!(
+        !open.contains("\n    fn "),
+        "a regiao de open_comparator apanha mais do que um metodo"
+    );
     let (reuse, fresh) = open
         .split_once("let size = window.inner_size();")
         .expect("reuse and fresh paths");
@@ -5607,7 +5620,7 @@ fn split_controls_are_native_bar_hits() {
 
 #[test]
 fn splitter_topology_is_resynced_after_layout_transitions() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let minimize = source
         .split("fn minimize_comparator")
         .nth(1)
@@ -5632,11 +5645,11 @@ fn comparator_resize_uses_persistent_weights_and_native_splitters() {
     // O arrasto e coalescido: a subclasse publica a ultima posicao e so
     // acorda o event loop quando nao ha pedido pendente. Sem isto cada
     // WM_MOUSEMOVE reposicionava tres WebView2 a mais de 100 Hz.
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let subclass = source
         .split("fn comparator_splitter_subclass")
         .nth(1)
-        .and_then(|part| part.split("fn exit_button_subclass").next())
+        .and_then(|part| part.split("fn split_ipc_event_impl").next())
         .expect("subclass body");
     assert!(subclass.contains("RESIZE_X.store("));
     assert!(subclass.contains("RESIZE_PENDING.swap(true"));
@@ -5704,7 +5717,7 @@ fn split_view_uses_neuralia_scroll_rail_and_auto_scroll() {
 
 #[test]
 fn reader_uses_semantic_timeline_script() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let reader = source
         .split("fn reader_webview_builder")
         .nth(1)
@@ -5756,7 +5769,7 @@ fn spec_0108_remote_scripts_use_message_transport_without_capability_urls() {
 
 #[test]
 fn spec_0108_remote_navigation_handlers_reject_neuralia_scheme() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     for builder in [
         "fn pdf_webview_builder",
         "fn external_webview_builder",
@@ -5776,6 +5789,92 @@ fn spec_0108_remote_navigation_handlers_reject_neuralia_scheme() {
         );
         assert!(!body.contains("remote_neuralia_action"), "{builder}");
     }
+}
+
+/// SECURITY.md: as paginas EPUB (biblioteca e leitor) so chegam ao nativo
+/// pelo canal delas, nunca pelo `ipc.rs` das paginas remotas, e a navegacao
+/// de topo fica presa as duas paginas. Ligacao no caminho que embarca, nao
+/// comportamento (AGENTS.md §4.3): o que `handle_epub_ipc`,
+/// `epub_navigation_allowed` e `epub_drop_job` decidem esta provado em
+/// `epub_app::tests`; aqui prende-se que o builder que embarca e so esse, e
+/// que "Apagar historico" e o drop de ficheiros chegam ao `EpubJob`.
+#[test]
+fn epub_pages_reach_native_code_only_through_their_own_channel() {
+    let source = shipped_source();
+    let body = |text: &str, from: &str, to: &str| -> String {
+        text.split(from)
+            .nth(1)
+            .and_then(|part| part.split(to).next())
+            .unwrap_or_else(|| panic!("{from} body"))
+            .to_string()
+    };
+
+    // O builder: IPC fechado, trava de navegacao, sem popups, downloads nem
+    // permissoes -- e nada do canal remoto (script, capability, parser).
+    let builder = body(&source, "fn epub_webview_builder", "fn handle_epub_notice");
+    let handlers = body(
+        &builder,
+        "themed_webview_builder()",
+        ".with_permission_handler",
+    );
+    for required in [
+        "handle_epub_ipc(&source, request.body(), &worker)",
+        ".with_navigation_handler(|target| epub_navigation_allowed(&target))",
+        ".with_new_window_req_handler(|_, _| NewWindowResponse::Deny)",
+        ".with_download_started_handler(|_, _| false)",
+        "UserEvent::EpubDropped(paths)",
+    ] {
+        assert!(
+            handlers.contains(required),
+            "epub_webview_builder perdeu {required}"
+        );
+    }
+    assert!(
+        builder.contains(".with_permission_handler(|_| PermissionResponse::Deny)"),
+        "epub_webview_builder tem de negar todas as permissoes"
+    );
+    for forbidden in [
+        "with_initialization_script",
+        "bind_page_script(",
+        "NEURALIA_KEYMAP_SCRIPT",
+        "parse_ipc_message",
+        "common_ipc_event",
+        "neuralia_action",
+        "remote_capability",
+    ] {
+        assert!(
+            !builder.contains(forbidden),
+            "epub_webview_builder nao pode ter {forbidden}"
+        );
+    }
+
+    // "Apagar historico" apaga tambem a leitura dos livros.
+    let clear = body(
+        &source,
+        "UserEvent::ClearHistory => {",
+        "UserEvent::HistoryCleared(result)",
+    );
+    assert!(
+        clear.contains("self.submit_epub_job(EpubJob::ClearReadingHistory)"),
+        "ClearHistory tem de mandar EpubJob::ClearReadingHistory"
+    );
+
+    // Ficheiros largados: um evento por ficheiro, o lote inteiro no
+    // `about_to_wait`, e so os `.epub` viram trabalho (`epub_drop_job`).
+    let drop_arm = body(
+        &source,
+        "WindowEvent::DroppedFile(path) =>",
+        "WindowEvent::ModifiersChanged",
+    );
+    assert!(drop_arm.contains("self.pending_drops.push(path)"));
+    let idle = body(&source, "fn about_to_wait", "fn exiting");
+    assert!(idle.contains("std::mem::take(&mut self.pending_drops)"));
+    assert!(idle.contains("self.route_dropped_files(dropped)"));
+    let route = body(&source, "fn route_dropped_files", "fn open_epub_dialog");
+    assert!(route.contains("epub_drop_job(paths)"));
+    assert!(route.contains("self.submit_epub_job(job)"));
+    let dropped = body(&source, "UserEvent::EpubDropped(paths) =>", "UserEvent::");
+    assert!(dropped.contains("self.route_dropped_files(paths)"));
 }
 
 #[test]
@@ -5802,18 +5901,21 @@ fn spec_0108_capability_scripts_are_top_frame_only() {
 
 #[test]
 fn all_sources_lists_every_module() {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let dir = std::path::Path::new(manifest_dir).join("src/windows_app");
-    let mut dir_files: Vec<String> = Vec::new();
-    if dir.is_dir() {
-        for entry in std::fs::read_dir(&dir).expect("read src/windows_app") {
-            let entry = entry.expect("dir entry");
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("rs") {
-                dir_files.push(path.file_name().unwrap().to_str().unwrap().to_string());
+    fn walk(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read src/windows_app") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(base, &path, out);
+            } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                let rel = path.strip_prefix(base).expect("under src/windows_app");
+                out.push(rel.to_str().unwrap().replace('\\', "/"));
             }
         }
     }
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dir = std::path::Path::new(manifest_dir).join("src/windows_app");
+    let mut dir_files: Vec<String> = Vec::new();
+    walk(&dir, &dir, &mut dir_files);
     dir_files.sort();
 
     let mut registered: Vec<String> = ALL_MODULES
@@ -5824,8 +5926,22 @@ fn all_sources_lists_every_module() {
 
     assert_eq!(
         registered, dir_files,
-        "ALL_SOURCES must list every module in src/windows_app without escaping"
+        "ALL_MODULES must list every file under src/windows_app (app/ included) without escaping"
     );
+
+    // O nome sozinho nao prova o conteudo: uma entrada que apontasse o
+    // include_str! a outro ficheiro escondia o ficheiro certo de todos os
+    // gates que leem shipped_source/all_sources, com a lista de nomes
+    // ainda igual ao disco.
+    for (name, content) in ALL_MODULES {
+        let on_disk = std::fs::read_to_string(dir.join(name))
+            .unwrap_or_else(|error| panic!("read src/windows_app/{name}: {error}"))
+            .replace("\r\n", "\n");
+        assert!(
+            content.replace("\r\n", "\n") == on_disk,
+            "ALL_MODULES entry {name} does not hold the text of that file"
+        );
+    }
 }
 
 /// Este ficheiro com fins de linha LF. Num checkout Windows com
@@ -5833,11 +5949,17 @@ fn all_sources_lists_every_module() {
 /// windows-latest) o `include_str!` traz CRLF, e um `split("\n}\n")` nao
 /// encontrava nada: o gate corria sobre o resto do ficheiro.
 fn shipped_source() -> String {
-    let mut out = include_str!("../windows_app.rs").replace("\r\n", "\n");
+    let mut out = include_str!("../windows_app.rs")
+        .replace("\r\n", "\n")
+        .replace("pub(in crate::windows_app) fn ", "fn ");
     for (name, content) in ALL_MODULES {
         if *name != "tests.rs" {
             out.push('\n');
-            out.push_str(&content.replace("\r\n", "\n"));
+            out.push_str(
+                &content
+                    .replace("\r\n", "\n")
+                    .replace("pub(in crate::windows_app) fn ", "fn "),
+            );
         }
     }
     out.push_str("\n#[cfg(test)]\nmod tests {\n");
@@ -8923,7 +9045,7 @@ __state('barra');
     // Os builders nao montam o script nem decidem a privacidade por conta
     // propria: usam as funcoes acima (asserção de ausencia, AGENTS.md
     // §4.3).
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let body = |builder: &str| {
         source
             .split(builder)
@@ -9242,7 +9364,9 @@ __state('barra');
     // `configure_split_webview`: nada depois dele troca o perfil, o
     // script ou os handlers que o gate acima chamou.
     let wrapper = source
-        .split("fn split_webview_builder(&self, build: &SplitBuild) -> WebViewBuilder<'static> {")
+        .split(
+            "fn split_webview_builder(\n        &self,\n        build: &SplitBuild,\n    ) -> WebViewBuilder<'static> {",
+        )
         .nth(1)
         .and_then(|part| part.split("\n    }\n").next())
         .expect("split_webview_builder");
@@ -11348,11 +11472,7 @@ fn resized_weights_keep_the_total_and_the_minimum() {
 /// flutuavam sobre outras aplicacoes depois de um Alt+Tab.
 #[test]
 fn owned_popups_are_not_topmost() {
-    let wap = include_str!("../windows_app.rs");
-    let sc = include_str!("../windows_app/search_card.rs");
-    // show_search_card foi movido para search_card.rs; os outros ainda estao
-    // em windows_app.rs. Concatena os dois para a pesquisa ser uniforme.
-    let source_combined = format!("{wap}\n{sc}");
+    let source_combined = shipped_source();
     let body = |source: &str, from: &str, to: &str| {
         source
             .split(from)
@@ -11367,7 +11487,7 @@ fn owned_popups_are_not_topmost() {
         ("fn sync_exit_button", "fn position_exit_button"),
         ("fn sync_comparator_splitters", "fn resize_comparator"),
     ] {
-        let text = body(wap, from, to);
+        let text = body(&source_combined, from, to);
         assert!(
             text.contains("CreateWindowExW"),
             "{from} devia criar a janela"
@@ -11395,7 +11515,7 @@ fn owned_popups_are_not_topmost() {
 
 #[test]
 fn native_controls_follow_the_effective_hwnd_after_decoration_changes() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let body = source
         .split("fn ensure_window_subclass")
         .nth(1)
@@ -11409,7 +11529,7 @@ fn native_controls_follow_the_effective_hwnd_after_decoration_changes() {
 
 #[test]
 fn expanded_column_keeps_window_chrome_and_content_offset() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let expand = source
         .split("fn expand_comparator")
         .nth(1)
@@ -15677,7 +15797,7 @@ fn breath_panel_is_private_denies_media_and_stays_on_youtube() {
 /// do que la corre chega ao NeuralIA.
 #[test]
 fn service_panels_never_reach_history_or_memory() {
-    let source = include_str!("../windows_app.rs");
+    let source = shipped_source();
     let body = source
         .split("fn open_service_panel(&mut self")
         .nth(1)
