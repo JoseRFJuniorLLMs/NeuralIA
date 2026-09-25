@@ -175,7 +175,7 @@ fn tokenize(body: &str) -> Result<Vec<Token>, String> {
             tokens.push(Token::Str(literal.to_string()));
             rest = &rest[len + 2..];
         } else if let Some(punct) = PUNCTS.iter().find(|punct| rest.starts_with(**punct)) {
-            tokens.push(Token::Punct(*punct));
+            tokens.push(Token::Punct(punct));
             rest = &rest[punct.len()..];
         } else {
             let near: String = rest.chars().take(24).collect();
