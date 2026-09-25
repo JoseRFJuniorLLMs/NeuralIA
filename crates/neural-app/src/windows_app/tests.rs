@@ -2226,8 +2226,12 @@ fn the_live_panel_handlers_are_the_gatekeepers_it_ships_with() {
 /// painel escondido, sem olho e sem Desligar.
 #[test]
 fn leaving_a_web_surface_turns_gemini_live_off() {
-    let source_raw = include_str!("../windows_app.rs");
-    let source = source_raw.replace("pub(in crate::windows_app) fn ", "fn ");
+    let wap = include_str!("../windows_app.rs");
+    let pag = include_str!("../windows_app/app/pages.rs");
+    let source_raw = format!("{wap}\n{pag}");
+    let source = source_raw
+        .replace("\r\n", "\n")
+        .replace("pub(in crate::windows_app) fn ", "fn ");
     let body = |start: &str, end: &str| {
         source
             .split(start)
@@ -2257,13 +2261,7 @@ fn leaving_a_web_surface_turns_gemini_live_off() {
     // Cada metodo que poe outra superficie passa pela saida unica (ou,
     // como a Home, fecha o Gemini Live ele proprio).
     let mut checked = 0;
-    for method in source
-        .split(
-            "
-    fn ",
-        )
-        .skip(1)
-    {
+    for method in source.split("\n    fn ").skip(1) {
         let name = method.split('(').next().unwrap_or_default();
         let leaves = [
             "Surface::Home;",
@@ -5718,7 +5716,7 @@ fn split_view_uses_neuralia_scroll_rail_and_auto_scroll() {
 
 #[test]
 fn reader_uses_semantic_timeline_script() {
-    let source = include_str!("../windows_app.rs");
+    let source = include_str!("../windows_app/app/pages.rs");
     let reader = source
         .split("fn reader_webview_builder")
         .nth(1)
@@ -5773,7 +5771,10 @@ fn spec_0108_remote_navigation_handlers_reject_neuralia_scheme() {
     let wap = include_str!("../windows_app.rs");
     let gm = include_str!("../windows_app/app/gmail.rs");
     let spl = include_str!("../windows_app/app/split.rs");
-    let source = format!("{wap}\n{gm}\n{spl}");
+    let pag = include_str!("../windows_app/app/pages.rs");
+    let source = format!("{wap}\n{gm}\n{spl}\n{pag}")
+        .replace("\r\n", "\n")
+        .replace("pub(in crate::windows_app) fn ", "fn ");
     for builder in [
         "fn pdf_webview_builder",
         "fn external_webview_builder",
@@ -5859,6 +5860,7 @@ fn shipped_source() -> String {
         include_str!("../windows_app/app/gmail.rs"),
         include_str!("../windows_app/app/tools.rs"),
         include_str!("../windows_app/app/split.rs"),
+        include_str!("../windows_app/app/pages.rs"),
     ] {
         out.push('\n');
         out.push_str(
@@ -8962,7 +8964,10 @@ __state('barra');
     // §4.3).
     let wap = include_str!("../windows_app.rs");
     let spl = include_str!("../windows_app/app/split.rs");
-    let source = format!("{wap}\n{spl}");
+    let pag = include_str!("../windows_app/app/pages.rs");
+    let source = format!("{wap}\n{spl}\n{pag}")
+        .replace("\r\n", "\n")
+        .replace("pub(in crate::windows_app) fn ", "fn ");
     let body = |builder: &str| {
         source
             .split(builder)

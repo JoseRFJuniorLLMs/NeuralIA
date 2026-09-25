@@ -18,3 +18,7 @@ pub(super) mod split;
 #[allow(unused_imports)]
 pub(super) use split::*;
 
+pub(super) mod pages;
+#[allow(unused_imports)]
+pub(super) use pages::*;
+

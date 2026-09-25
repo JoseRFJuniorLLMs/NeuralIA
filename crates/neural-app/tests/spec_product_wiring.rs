@@ -58,6 +58,8 @@ const ALL_SOURCES: &str = concat!(
     "\n",
     include_str!("../src/windows_app/app/split.rs"),
     "\n",
+    include_str!("../src/windows_app/app/pages.rs"),
+    "\n",
     include_str!("../src/windows_app/tests.rs"),
 );
 const APP: &str = ALL_SOURCES;
