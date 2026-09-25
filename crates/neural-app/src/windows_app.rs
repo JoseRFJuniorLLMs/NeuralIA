@@ -6526,12 +6526,13 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
         (layout.forward, "›", BarHit::Forward),
     ];
     for index in 0..layout.columns_len {
-        pairs.push((layout.column_back[index], "‹", BarHit::ColumnBack(index)));
-        pairs.push((
-            layout.column_forward[index],
-            "›",
-            BarHit::ColumnForward(index),
-        ));
+        for button in ColumnButton::ALL {
+            pairs.push((
+                layout.column_button(index, button),
+                button.glyph(),
+                button.hit(index),
+            ));
+        }
     }
     for (rect, label, hit) in pairs {
         if rect.width > 0.0 {
@@ -6563,39 +6564,33 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
             theme.bar_bg,
         );
     }
+    // O canto direito pela ordem do registo (`RIGHT_CLUSTER`): o olho do
+    // Gemini Live pinta-se do estado do painel; os outros sao icones, com
+    // a cor de cada um -- o envelope do Gmail apaga-se com os avisos
+    // desligados; o Privado e o chapeu e os oculos, sem nome (pedido do
+    // dono). Os lugares nao se tocam, por isso a ordem de pintura e a do
+    // registo.
     let gmail_tint = if GMAIL_NOTIFICATIONS.load(Ordering::Acquire) {
         theme.fg
     } else {
         theme.fg_muted
     };
-    let icons = [
-        (ICON_SLOT_VIDEO, Some(theme.fg)),
-        (ICON_SLOT_WHATSAPP, None),
-        (ICON_SLOT_YOUTUBE, None),
-        (ICON_SLOT_MAIL, Some(gmail_tint)),
-    ];
-    for ((rect, hit), (slot, tint)) in controls.services.iter().zip(SERVICE_BUTTON_HITS).zip(icons)
-    {
-        draw_icon_button(target, *rect, slot, tint, hover == Some(hit), scale, theme);
+    for (slot, rect) in RIGHT_CLUSTER.iter().zip(controls.cluster()) {
+        let hovered = hover == Some(slot.hit);
+        match slot.hit {
+            BarHit::GeminiLive => {
+                draw_live_button(target, rect, live.indicator(), hovered, scale, theme);
+            }
+            hit => {
+                let tint = match hit {
+                    BarHit::Service(Service::Meet) | BarHit::Private => Some(theme.fg),
+                    BarHit::GmailToggle => Some(gmail_tint),
+                    _ => None,
+                };
+                draw_icon_button(target, rect, slot.icon, tint, hovered, scale, theme);
+            }
+        }
     }
-    draw_live_button(
-        target,
-        controls.live,
-        live.indicator(),
-        hover == Some(BarHit::GeminiLive),
-        scale,
-        theme,
-    );
-    // Privado: o chapeu e os oculos, sem nome (pedido do dono).
-    draw_icon_button(
-        target,
-        controls.private,
-        ICON_SLOT_INCOGNITO,
-        Some(theme.fg),
-        hover == Some(BarHit::Private),
-        scale,
-        theme,
-    );
 
     if let (Some((source_index, _url, fullscreen, private_split)), Some((label, expand, close))) =
         (active_context, controls.split)

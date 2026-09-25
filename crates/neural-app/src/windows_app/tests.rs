@@ -1437,8 +1437,8 @@ fn every_ai_column_has_its_own_back_and_forward_after_its_plus() {
     for index in 0..3 {
         let (plus, back, forward) = (
             layout.add_tabs[index],
-            layout.column_back[index],
-            layout.column_forward[index],
+            layout.column_button(index, ColumnButton::Back),
+            layout.column_button(index, ColumnButton::Forward),
         );
         assert!(
             back.width > 0.0 && forward.width > 0.0,
@@ -1474,7 +1474,7 @@ fn every_ai_column_has_its_own_back_and_forward_after_its_plus() {
         let narrow =
             BarLayout::with_contexts(width as f64, 1.0, true, BarColumns::even(3), [0, 0, 0]);
         for index in 0..2 {
-            let forward = narrow.column_forward[index];
+            let forward = narrow.column_button(index, ColumnButton::Forward);
             assert!(
                 forward.width == 0.0 || forward.x + forward.width <= narrow.columns[index + 1].x,
                 "a {width}px os ‹ › da coluna {index} invadem a coluna seguinte"
@@ -1494,6 +1494,153 @@ fn every_ai_column_has_its_own_back_and_forward_after_its_plus() {
         drawer.private.x + drawer.private.width <= back.x,
         "Privado antes do par"
     );
+}
+
+/// Gate do registo `ColumnButton` (720..2560 px, escalas 1, 1.5 e 2, com
+/// e sem gaveta): cada botao de coluna ou cabe na faixa da sua coluna --
+/// depois do "+", sem se sobrepor ao vizinho nem entrar na coluna seguinte
+/// ou no canto direito, e o clique no centro dele volta a ser ELE -- ou
+/// nao existe (largura 0, e nada o encontra). O grupo e tudo ou nada: numa
+/// coluna, ou todos os botoes existem ou nenhum.
+#[test]
+fn column_buttons_fit_or_vanish() {
+    assert_eq!(COLUMN_BUTTONS, ColumnButton::ALL.len());
+    let center = |rect: UiRect| (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+    let mut existed = 0usize;
+    let mut vanished = 0usize;
+    for scale in [1.0, 1.5, 2.0] {
+        for width in (720..=2560).step_by(40) {
+            for split_active in [false, true] {
+                let columns = BarColumns {
+                    split_active,
+                    ..BarColumns::even(3)
+                };
+                let layout =
+                    BarLayout::with_contexts(width as f64, scale, true, columns, [0, 0, 0]);
+                let controls = right_controls(width as f64, scale, split_active, None);
+                let at = format!("{width}px x{scale} gaveta={split_active}");
+                for index in 0..3 {
+                    let rects: Vec<UiRect> = ColumnButton::ALL
+                        .iter()
+                        .map(|button| layout.column_button(index, *button))
+                        .collect();
+                    let shown = rects.iter().filter(|rect| rect.width > 0.0).count();
+                    assert!(
+                        shown == 0 || shown == rects.len(),
+                        "{at}: coluna {index} com {shown} de {} botoes",
+                        rects.len()
+                    );
+                    if shown == 0 {
+                        vanished += 1;
+                        for (button, rect) in ColumnButton::ALL.iter().zip(&rects) {
+                            assert_ne!(
+                                layout.hit(rect.x, rect.y + rect.height / 2.0),
+                                Some(button.hit(index)),
+                                "{at}: um botao sem largura nao pode ser clicado"
+                            );
+                        }
+                        continue;
+                    }
+                    existed += 1;
+                    let plus = layout.add_tabs[index];
+                    assert!(
+                        plus.width > 0.0,
+                        "{at}: botoes sem o \"+\" na coluna {index}"
+                    );
+                    let lane_end = if index + 1 < 3 {
+                        layout.columns[index + 1].x
+                    } else {
+                        controls.leftmost()
+                    };
+                    let mut previous_right = plus.x + plus.width;
+                    for (button, rect) in ColumnButton::ALL.iter().zip(&rects) {
+                        assert!(
+                            rect.x >= previous_right,
+                            "{at}: {} da coluna {index} sobrepoe o anterior",
+                            button.glyph()
+                        );
+                        assert!(
+                            rect.x + rect.width <= lane_end,
+                            "{at}: {} da coluna {index} sai da faixa",
+                            button.glyph()
+                        );
+                        let (cx, cy) = center(*rect);
+                        assert_eq!(
+                            layout.hit(cx, cy),
+                            Some(button.hit(index)),
+                            "{at}: o clique no {} da coluna {index} nao volta a ele",
+                            button.glyph()
+                        );
+                        assert_eq!(
+                            bar_hit_at(Some(controls), Some(layout), cx, cy),
+                            Some(button.hit(index)),
+                            "{at}: o canto direito rouba o {} da coluna {index}",
+                            button.glyph()
+                        );
+                        previous_right = rect.x + rect.width;
+                    }
+                }
+            }
+        }
+    }
+    // A varredura viu os dois lados da regra: botoes que existem (janelas
+    // largas) e botoes que sumiram (janelas estreitas a escala 2).
+    assert!(
+        existed > 0 && vanished > 0,
+        "{existed} com botoes, {vanished} sem"
+    );
+}
+
+/// Gate do registo do canto direito (`RIGHT_CLUSTER`): pela ordem, sem
+/// sobreposicao, cada lugar volta a ser ele proprio no hit-testing, e a
+/// lista traz os servicos pela ordem de `RightControls::services`.
+#[test]
+fn right_cluster_slots_never_overlap_and_hit_back() {
+    let service_hits: Vec<BarHit> = RIGHT_CLUSTER[1..5].iter().map(|slot| slot.hit).collect();
+    assert_eq!(
+        service_hits,
+        [
+            BarHit::Service(Service::Meet),
+            BarHit::Service(Service::WhatsApp),
+            BarHit::Service(Service::YouTube),
+            BarHit::GmailToggle,
+        ]
+    );
+    assert_eq!(RIGHT_CLUSTER[0].hit, BarHit::GeminiLive);
+    assert_eq!(RIGHT_CLUSTER[5].hit, BarHit::Private);
+    let mut icons: Vec<usize> = RIGHT_CLUSTER.iter().map(|slot| slot.icon).collect();
+    icons.sort_unstable();
+    icons.dedup();
+    assert_eq!(icons.len(), RIGHT_CLUSTER.len(), "icone repetido no canto");
+    for scale in [1.0, 1.5, 2.0] {
+        for width in (720..=2560).step_by(40) {
+            for split_active in [false, true] {
+                let controls = right_controls(width as f64, scale, split_active, None);
+                let at = format!("{width}px x{scale} gaveta={split_active}");
+                let mut previous_right = 0.0f64;
+                for (slot, rect) in RIGHT_CLUSTER.iter().zip(controls.cluster()) {
+                    assert!(
+                        rect.width > 0.0 && rect.height > 0.0,
+                        "{at}: {:?} sem tamanho",
+                        slot.hit
+                    );
+                    assert!(
+                        rect.x >= previous_right,
+                        "{at}: {:?} sobrepoe o lugar anterior",
+                        slot.hit
+                    );
+                    let (cx, cy) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+                    assert_eq!(
+                        right_controls_hit(controls, cx, cy),
+                        Some(slot.hit),
+                        "{at}: o clique em {:?} nao volta a ele",
+                        slot.hit
+                    );
+                    previous_right = rect.x + rect.width;
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -2023,7 +2170,7 @@ fn the_gemini_live_eye_toggles_live_and_says_what_it_sends() {
             for rect in [
                 layout.columns[index],
                 layout.add_tabs[index],
-                layout.column_forward[index],
+                layout.column_button(index, ColumnButton::Forward),
             ] {
                 assert!(
                     rect.width == 0.0 || rect.x + rect.width <= live.x,
@@ -15412,8 +15559,7 @@ fn tool_buttons_never_overlap_the_bar_at_any_width() {
                     for index in 0..COMPARATOR_COLUMNS {
                         bar.push(layout.columns[index]);
                         bar.push(layout.add_tabs[index]);
-                        bar.push(layout.column_back[index]);
-                        bar.push(layout.column_forward[index]);
+                        bar.extend(layout.column_buttons[index]);
                         bar.extend(layout.context_tabs[index]);
                         bar.extend(layout.group_pills[index]);
                     }
@@ -15454,15 +15600,11 @@ fn tool_buttons_never_overlap_the_bar_at_any_width() {
 fn provider_row(layout: &BarLayout) -> Vec<[f64; 4]> {
     let mut rects = Vec::new();
     for index in 0..COMPARATOR_COLUMNS {
-        for rect in [
-            layout.columns[index],
-            layout.add_tabs[index],
-            layout.column_back[index],
-            layout.column_forward[index],
-        ]
-        .into_iter()
-        .chain(layout.context_tabs[index])
-        .chain(layout.group_pills[index])
+        for rect in [layout.columns[index], layout.add_tabs[index]]
+            .into_iter()
+            .chain(layout.column_buttons[index])
+            .chain(layout.context_tabs[index])
+            .chain(layout.group_pills[index])
         {
             rects.push([rect.x, rect.y, rect.width, rect.height]);
         }
@@ -15560,8 +15702,13 @@ fn the_tools_never_take_room_from_the_ai_columns() {
                             assert!(pill >= 60.0, "pilula de {pill:.1} px: {at}");
                         }
                         assert!(layout.add_tabs[index].width > 0.0, "sem \"+\": {at}");
-                        assert!(layout.column_back[index].width > 0.0, "sem ‹: {at}");
-                        assert!(layout.column_forward[index].width > 0.0, "sem ›: {at}");
+                        for button in ColumnButton::ALL {
+                            assert!(
+                                layout.column_button(index, button).width > 0.0,
+                                "sem {}: {at}",
+                                button.glyph()
+                            );
+                        }
                     }
                 }
             }

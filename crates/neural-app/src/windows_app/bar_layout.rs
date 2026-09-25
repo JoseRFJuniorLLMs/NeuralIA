@@ -180,6 +180,45 @@ impl BarColumns {
     }
 }
 
+/// Os botoes de cada coluna a seguir ao "+", pela ordem em que se desenham
+/// da esquerda para a direita. E o registo: uma feature que traga um botao
+/// por coluna (a estrela dos favoritos, o Traduzir pagina, a nota)
+/// acrescenta aqui a variante, o glifo e o alvo, e nada mais -- a
+/// geometria (`BarLayout::with_rows`), a pintura e o hit-testing percorrem
+/// `ALL`. Regra: o grupo inteiro ou cabe na faixa da coluna ou nao existe
+/// (largura 0), como o "+": nunca um botao invisivel mas clicavel por cima
+/// da IA seguinte (gate `column_buttons_fit_or_vanish`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) enum ColumnButton {
+    Back,
+    Forward,
+}
+
+/// Quantos botoes tem cada coluna: o tamanho das filas de `BarLayout`.
+pub(in crate::windows_app) const COLUMN_BUTTONS: usize = ColumnButton::ALL.len();
+
+impl ColumnButton {
+    pub(in crate::windows_app) const ALL: [Self; 2] = [Self::Back, Self::Forward];
+    /// Largura logica de cada botao (a mesma do "+") e a folga entre eles.
+    pub(in crate::windows_app) const WIDTH: f64 = 26.0;
+    pub(in crate::windows_app) const GAP: f64 = 4.0;
+
+    pub(in crate::windows_app) fn glyph(self) -> &'static str {
+        match self {
+            Self::Back => "‹",
+            Self::Forward => "›",
+        }
+    }
+
+    /// O alvo da barra que este botao e, na coluna `column`.
+    pub(in crate::windows_app) fn hit(self, column: usize) -> BarHit {
+        match self {
+            Self::Back => BarHit::ColumnBack(column),
+            Self::Forward => BarHit::ColumnForward(column),
+        }
+    }
+}
+
 /// O estado da barra num instante -- o que a pintura e a dica leem alem da
 /// geometria (`BarLayout`) e das abas: o alvo debaixo do rato, se a barra
 /// esta a vista, a rolagem automatica, o arrasto em curso, a etiqueta do
@@ -210,8 +249,10 @@ pub(in crate::windows_app) struct BarLayout {
     pub(in crate::windows_app) home: UiRect,
     pub(in crate::windows_app) back: UiRect,
     pub(in crate::windows_app) forward: UiRect,
-    pub(in crate::windows_app) column_back: [UiRect; COMPARATOR_COLUMNS],
-    pub(in crate::windows_app) column_forward: [UiRect; COMPARATOR_COLUMNS],
+    /// Por coluna, os botoes a seguir ao "+", na ordem de `ColumnButton::ALL`
+    /// (‹ e ›); `column_button` le-os pelo nome. Ou o grupo inteiro cabe na
+    /// faixa da coluna ou nenhum existe (largura 0).
+    pub(in crate::windows_app) column_buttons: [[UiRect; COLUMN_BUTTONS]; COMPARATOR_COLUMNS],
     /// Por coluna: a pilula do provedor sobre a sua faixa, ou -- se estiver
     /// minimizada -- o chip compacto encostado aos controlos da direita.
     pub(in crate::windows_app) columns: [UiRect; COMPARATOR_COLUMNS],
@@ -309,8 +350,7 @@ impl BarLayout {
                 home: empty,
                 back: empty,
                 forward: empty,
-                column_back: [empty; COMPARATOR_COLUMNS],
-                column_forward: [empty; COMPARATOR_COLUMNS],
+                column_buttons: [[empty; COLUMN_BUTTONS]; COMPARATOR_COLUMNS],
                 columns: [empty; COMPARATOR_COLUMNS],
                 minimized: [false; COMPARATOR_COLUMNS],
                 add_tabs: [empty; COMPARATOR_COLUMNS],
@@ -366,8 +406,7 @@ impl BarLayout {
 
         let mut columns_rect = [empty; COMPARATOR_COLUMNS];
         let mut plus_rect = [empty; COMPARATOR_COLUMNS];
-        let mut column_back = [empty; COMPARATOR_COLUMNS];
-        let mut column_forward = [empty; COMPARATOR_COLUMNS];
+        let mut column_buttons = [[empty; COLUMN_BUTTONS]; COMPARATOR_COLUMNS];
         let mut tabs = [[empty; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS];
         let mut tab_indices = [[0usize; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS];
         let mut tab_counts = [0usize; COMPARATOR_COLUMNS];
@@ -433,10 +472,12 @@ impl BarLayout {
             // `available >= provider_width + plus_width + gap`, o que tornava o
             // `.min()` de baixo matematicamente morto e a pilula nunca encolhia.
             let available = (right - left).max(0.0);
-            // "+", ‹ e › depois da pilula: ela encolhe primeiro.
-            let nav_width = plus_width;
-            let nav_gap = 4.0 * scale;
-            let reserved_after = plus_width + gap + 2.0 * (nav_width + nav_gap);
+            // "+" e os botoes da coluna (`ColumnButton::ALL`: ‹ e ›) depois
+            // da pilula: ela encolhe primeiro.
+            let button_width = ColumnButton::WIDTH * scale;
+            let button_gap = ColumnButton::GAP * scale;
+            let reserved_after =
+                plus_width + gap + COLUMN_BUTTONS as f64 * (button_width + button_gap);
             let pill = provider_width.min((available - reserved_after).max(0.0));
             columns_rect[span.index] = UiRect {
                 x: left,
@@ -458,21 +499,29 @@ impl BarLayout {
                 },
                 height: row_h - 4.0 * scale,
             };
-            // ‹ e › desta IA. Tal como o "+", ou cabem na faixa ou nao existem.
-            let back_x = plus_x + plus_width + nav_gap;
-            let forward_x = back_x + nav_width + nav_gap;
-            let fits = forward_x + nav_width <= right;
-            column_back[span.index] = UiRect {
-                x: back_x,
-                y: row_y + 2.0 * scale,
-                width: if fits { nav_width } else { 0.0 },
-                height: row_h - 4.0 * scale,
-            };
-            column_forward[span.index] = UiRect {
-                x: forward_x,
-                width: if fits { nav_width } else { 0.0 },
-                ..column_back[span.index]
-            };
+            // Os botoes desta IA (‹ e ›), um a seguir ao outro depois do "+",
+            // pela ordem do registo. Tal como o "+", ou o grupo cabe na
+            // faixa ou nao existe: nunca um botao invisivel mas clicavel por
+            // cima da IA seguinte.
+            let mut x = plus_x + plus_width;
+            let mut buttons = [empty; COLUMN_BUTTONS];
+            for rect in &mut buttons {
+                x += button_gap;
+                *rect = UiRect {
+                    x,
+                    y: row_y + 2.0 * scale,
+                    width: button_width,
+                    height: row_h - 4.0 * scale,
+                };
+                x += button_width;
+            }
+            let fits = x <= right;
+            if !fits {
+                for rect in &mut buttons {
+                    rect.width = 0.0;
+                }
+            }
+            column_buttons[span.index] = buttons;
         }
 
         // Colunas minimizadas: nao tem faixa, mas nao podem desaparecer da
@@ -600,8 +649,7 @@ impl BarLayout {
             home,
             back,
             forward,
-            column_back,
-            column_forward,
+            column_buttons,
             columns: columns_rect,
             minimized: columns.minimized,
             add_tabs: plus_rect,
@@ -621,6 +669,16 @@ impl BarLayout {
             window_maximize,
             window_close,
         }
+    }
+
+    /// O rectangulo do botao `button` da coluna `column` (largura 0: nao
+    /// existe nesta largura de janela).
+    pub(in crate::windows_app) fn column_button(
+        &self,
+        column: usize,
+        button: ColumnButton,
+    ) -> UiRect {
+        self.column_buttons[column][button as usize]
     }
 
     pub(in crate::windows_app) fn hit(&self, x: f64, y: f64) -> Option<BarHit> {
@@ -674,11 +732,10 @@ impl BarLayout {
             return Some(BarHit::Forward);
         }
         for index in 0..self.columns_len {
-            if self.column_back[index].contains(x, y) {
-                return Some(BarHit::ColumnBack(index));
-            }
-            if self.column_forward[index].contains(x, y) {
-                return Some(BarHit::ColumnForward(index));
+            for button in ColumnButton::ALL {
+                if self.column_button(index, button).contains(x, y) {
+                    return Some(button.hit(index));
+                }
             }
         }
         for index in 0..self.columns_len {
@@ -1137,21 +1194,68 @@ pub(in crate::windows_app) fn right_controls(
     }
 }
 
+/// Um icone do canto direito da segunda linha: o alvo que e e o icone
+/// (`ICON_SLOT_*`) que mostra.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) struct ClusterSlot {
+    pub(in crate::windows_app) hit: BarHit,
+    pub(in crate::windows_app) icon: usize,
+}
+
+/// O canto direito da segunda linha, da esquerda para a direita: o Gemini
+/// Live, os quatro servicos e o Privado. E o registo do grupo: a pintura e
+/// o hit-testing percorrem esta lista com `RightControls::cluster`, e
+/// `right_controls` da a cada lugar a sua posicao. Uma feature com um icone
+/// no canto (⚖ consenso, ⬇ downloads, escudo) e uma linha aqui, um
+/// `ICON_SLOT_*` em `icons.rs` e o seu lugar em `right_controls` -- sob a
+/// mesma regra dos botoes de coluna: cabe, ou nao existe (gate
+/// `right_cluster_slots_never_overlap_and_hit_back`).
+pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 6] = [
+    ClusterSlot {
+        hit: BarHit::GeminiLive,
+        icon: ICON_SLOT_LIVE,
+    },
+    ClusterSlot {
+        hit: BarHit::Service(Service::Meet),
+        icon: ICON_SLOT_VIDEO,
+    },
+    ClusterSlot {
+        hit: BarHit::Service(Service::WhatsApp),
+        icon: ICON_SLOT_WHATSAPP,
+    },
+    ClusterSlot {
+        hit: BarHit::Service(Service::YouTube),
+        icon: ICON_SLOT_YOUTUBE,
+    },
+    ClusterSlot {
+        hit: BarHit::GmailToggle,
+        icon: ICON_SLOT_MAIL,
+    },
+    ClusterSlot {
+        hit: BarHit::Private,
+        icon: ICON_SLOT_INCOGNITO,
+    },
+];
+
 impl RightControls {
     /// Onde comecam os controlos da direita na segunda linha: as colunas
     /// acabam aqui. As ferramentas, na linha de cima, nao contam.
     pub(in crate::windows_app) fn leftmost(&self) -> f64 {
         self.live.x
     }
-}
 
-/// O que cada icone do canto direito faz, na ordem de `RightControls::services`.
-pub(in crate::windows_app) const SERVICE_BUTTON_HITS: [BarHit; 4] = [
-    BarHit::Service(Service::Meet),
-    BarHit::Service(Service::WhatsApp),
-    BarHit::Service(Service::YouTube),
-    BarHit::GmailToggle,
-];
+    /// Os rectangulos do canto, na ordem de `RIGHT_CLUSTER`.
+    pub(in crate::windows_app) fn cluster(&self) -> [UiRect; RIGHT_CLUSTER.len()] {
+        [
+            self.live,
+            self.services[0],
+            self.services[1],
+            self.services[2],
+            self.services[3],
+            self.private,
+        ]
+    }
+}
 
 /// O botao da barra que abre `service`: um dos icones dos servicos ou, para
 /// a Respiracao (uma ferramenta), o botao dela na linha do titulo. E nele que
@@ -1167,12 +1271,11 @@ pub(in crate::windows_app) fn service_icon_rect(
             .find(|(tool, _)| **tool == Tool::Breath)
             .map(|(_, rect)| rect);
     }
-    controls
-        .services
+    RIGHT_CLUSTER
         .iter()
-        .zip(SERVICE_BUTTON_HITS)
-        .find(|(_, hit)| *hit == BarHit::Service(service))
-        .map(|(rect, _)| *rect)
+        .zip(controls.cluster())
+        .find(|(slot, _)| slot.hit == BarHit::Service(service))
+        .map(|(_, rect)| rect)
 }
 
 pub(in crate::windows_app) fn right_controls_hit(
@@ -1185,16 +1288,11 @@ pub(in crate::windows_app) fn right_controls_hit(
             return Some(BarHit::Tool(tool));
         }
     }
-    if controls.live.contains(x, y) {
-        return Some(BarHit::GeminiLive);
-    }
-    for (rect, hit) in controls.services.iter().zip(SERVICE_BUTTON_HITS) {
+    // O canto, pela ordem do registo: Gemini Live, os servicos, o Privado.
+    for (slot, rect) in RIGHT_CLUSTER.iter().zip(controls.cluster()) {
         if rect.contains(x, y) {
-            return Some(hit);
+            return Some(slot.hit);
         }
-    }
-    if controls.private.contains(x, y) {
-        return Some(BarHit::Private);
     }
     if let Some((_label, expand, close)) = controls.split {
         if close.contains(x, y) {
