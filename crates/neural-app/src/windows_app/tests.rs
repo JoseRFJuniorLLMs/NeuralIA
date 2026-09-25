@@ -5150,7 +5150,8 @@ fn lifecycle_ready_is_published_only_after_returning_to_the_event_loop() {
 
 #[test]
 fn webview_teardown_does_not_schedule_home_chrome_while_opening_comparator() {
-    let source = include_str!("../windows_app.rs");
+    let source_raw = include_str!("../windows_app.rs");
+    let source = source_raw.replace("pub(in crate::windows_app) fn ", "fn ");
     let destroy = source
         .split("fn destroy_web_surfaces")
         .nth(1)
@@ -5346,7 +5347,9 @@ fn palette_routes_private_input_away_from_the_normal_column() {
 
 #[test]
 fn private_palette_paths_never_touch_history_or_context_tabs() {
-    let source = include_str!("../windows_app.rs");
+    let wap = include_str!("../windows_app.rs");
+    let nav = include_str!("../windows_app/app/navigation.rs");
+    let source = format!("{wap}\n{nav}").replace("pub(in crate::windows_app) fn ", "fn ");
     let submit = source
         .split("fn submit_palette")
         .nth(1)
@@ -5609,7 +5612,8 @@ fn split_controls_are_native_bar_hits() {
 
 #[test]
 fn splitter_topology_is_resynced_after_layout_transitions() {
-    let source = include_str!("../windows_app.rs");
+    let source_raw = include_str!("../windows_app.rs");
+    let source = source_raw.replace("pub(in crate::windows_app) fn ", "fn ");
     let minimize = source
         .split("fn minimize_comparator")
         .nth(1)
@@ -5837,11 +5841,29 @@ fn all_sources_lists_every_module() {
 /// windows-latest) o `include_str!` traz CRLF, e um `split("\n}\n")` nao
 /// encontrava nada: o gate corria sobre o resto do ficheiro.
 fn shipped_source() -> String {
-    let mut out = include_str!("../windows_app.rs").replace("\r\n", "\n");
+    let mut out = include_str!("../windows_app.rs")
+        .replace("\r\n", "\n")
+        .replace("pub(in crate::windows_app) fn ", "fn ");
+    for app_content in [
+        include_str!("../windows_app/app/navigation.rs"),
+        include_str!("../windows_app/app/gmail.rs"),
+        include_str!("../windows_app/app/tools.rs"),
+    ] {
+        out.push('\n');
+        out.push_str(
+            &app_content
+                .replace("\r\n", "\n")
+                .replace("pub(in crate::windows_app) fn ", "fn "),
+        );
+    }
     for (name, content) in ALL_MODULES {
         if *name != "tests.rs" {
             out.push('\n');
-            out.push_str(&content.replace("\r\n", "\n"));
+            out.push_str(
+                &content
+                    .replace("\r\n", "\n")
+                    .replace("pub(in crate::windows_app) fn ", "fn "),
+            );
         }
     }
     out.push_str("\n#[cfg(test)]\nmod tests {\n");

@@ -5,3 +5,7 @@ pub(super) use gmail::*;
 pub(super) mod tools;
 #[allow(unused_imports)]
 pub(super) use tools::*;
+
+pub(super) mod navigation;
+#[allow(unused_imports)]
+pub(super) use navigation::*;

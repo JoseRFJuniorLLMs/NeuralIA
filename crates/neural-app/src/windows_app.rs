@@ -41,10 +41,7 @@ use crate::panel_chrome::{
     panel_handle_area, panel_width, panel_width_from_drag, strip_buttons, strip_hit,
     wheel_message_params, wheel_route,
 };
-use crate::pomodoro_ui::{
-    POMODORO_COMMAND_HELP, PomodoroCommand, PomodoroController, TickSchedule, TickScheduler,
-    parse_pomodoro_command, phase_color,
-};
+use crate::pomodoro_ui::{PomodoroController, TickSchedule, TickScheduler, phase_color};
 use crate::read_aloud::READ_ALOUD_SCRIPT;
 use crate::tab_session::{self, Loaded, SessionColumn, SessionGroup, SessionTab, TabSession};
 use neural_core::{
@@ -53,8 +50,8 @@ use neural_core::{
     MemoryDocument, MemoryHit, MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore, Note,
     ObservedPage, Phase, ReaderArticle, ReaderBlock, ReaderClient, ResearchItemKind,
     ResearchSession, ZettelError, ZettelStore, chatgpt_search_url, claude_search_url,
-    google_ai_url, is_local_network_target, is_pdf_url, parse_intent, reader_html,
-    redact_sensitive_text, tissue,
+    google_ai_url, is_local_network_target, is_pdf_url, reader_html, redact_sensitive_text,
+    tissue,
     zettel::{self, is_valid_note_id},
 };
 use url::Url;
@@ -82,12 +79,12 @@ use windows_sys::Win32::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
             ES_AUTOHSCROLL, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
             GetForegroundWindow, GetParent, GetWindowTextLengthW, GetWindowTextW,
-            GetWindowThreadProcessId, IDYES, IsZoomed, MB_DEFBUTTON2, MB_ICONINFORMATION,
-            MB_ICONWARNING, MB_OK, MB_YESNO, MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE,
-            SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetParent,
-            SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-            TrackPopupMenu, WM_CANCELMODE, WM_CAPTURECHANGED, WM_KEYDOWN, WS_CHILD,
-            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+            GetWindowThreadProcessId, IDYES, IsZoomed, MB_ICONINFORMATION, MB_OK, MB_YESNO,
+            MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
+            SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetParent, SetWindowPos, ShowWindow,
+            TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_CANCELMODE, WM_CAPTURECHANGED,
+            WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP,
+            WS_VISIBLE,
         },
     },
 };
@@ -372,8 +369,6 @@ const AUTO_SCROLL_PROMPT_SECONDS: u64 = 20;
 /// set_decorations(false). Fazemos dois relayouts baratos para nao deixar
 /// WebViews presos na geometria anterior ate o primeiro movimento do rato.
 const COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS: [u64; 2] = [40, 220];
-/// Quantas entradas do historico a caixa "history:" mostra.
-const HISTORY_RECENT_LIMIT: usize = 20;
 /// Tecto, em chars, de cada campo que o monitor do Gmail nos envia. O script
 /// ja corta a 180, mas o script corre numa pagina remota: o lado nativo nao
 /// pode confiar nesse corte e repete-o antes de guardar ou pintar.
@@ -394,7 +389,8 @@ const PALETTE_HINT_TOP: f64 = 48.0;
 /// Fraccao da altura util (abaixo da barra) a que a palette pousa.
 const PALETTE_TOP_RATIO: f64 = 0.18;
 /// A ajuda do `tema:` com uma palavra desconhecida (omnibox e palette).
-const THEME_COMMAND_HELP: &str = "Use tema:sistema, tema:claro ou tema:escuro.";
+pub(in crate::windows_app) const THEME_COMMAND_HELP: &str =
+    "Use tema:sistema, tema:claro ou tema:escuro.";
 const SEARCH_CARD_SUBCLASS_ID: usize = 0x4E71;
 /// Cartao de confirmacao da barra de selecao ("Mandar para as 3 IAs?",
 /// "Traduzir nas 3 IAs?"), em pixeis logicos, centrado na janela. A caixa do
@@ -1095,40 +1091,6 @@ pub(in crate::windows_app) fn bar_tooltip_label(
         BarHit::WindowMaximize => caption_tooltip_label(1, maximized).to_string(),
         BarHit::WindowClose => caption_tooltip_label(2, maximized).to_string(),
     })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HistoryStep {
-    Back,
-    Forward,
-}
-
-/// Qual pagina o ‹ › move.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HistoryNav {
-    /// A fonte aberta ao lado de uma coluna (onde se seguem links).
-    Split,
-    /// A coluna expandida.
-    Column(usize),
-    /// A pagina cheia (Web ou Leitor).
-    Page,
-    /// Sem uma pagina so: voltar e o do app.
-    App,
-}
-
-fn history_nav_target(
-    surface: Surface,
-    split_open: bool,
-    expanded: Option<usize>,
-    has_page: bool,
-) -> HistoryNav {
-    match surface {
-        Surface::Comparator if split_open => HistoryNav::Split,
-        Surface::Comparator => expanded.map_or(HistoryNav::App, HistoryNav::Column),
-        Surface::Home => HistoryNav::App,
-        _ if has_page => HistoryNav::Page,
-        _ => HistoryNav::App,
-    }
 }
 
 /// Os botoes da janela do proprio app aparecem sempre que a moldura do Windows
@@ -2392,102 +2354,6 @@ unsafe extern "system" fn exit_button_subclass(
     }
 }
 
-/// Ctrl+O na omnibox da Home: o diálogo "Adicionar livros EPUB". Só nativo
-/// (a janela principal responde o mesmo em `main_window_shortcut`); o mapa de
-/// teclas das páginas (`NEURALIA_KEYMAP_SCRIPT`) não o conhece, para não
-/// nascer uma ação IPC nova no canal das páginas remotas. Nas páginas de
-/// livros quem o trata é a própria página, pelo IPC fechado delas.
-fn omnibox_opens_epub_dialog(virtual_key: u32, ctrl: bool, shift: bool) -> bool {
-    virtual_key == u32::from(b'O') && ctrl && !shift
-}
-
-unsafe extern "system" fn omnibox_subclass(
-    hwnd: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    _subclass_id: usize,
-    reference_data: usize,
-) -> LRESULT {
-    if message == lifecycle_probe_home_message() && lifecycle_probe_enabled() && reference_data != 0
-    {
-        let nonce = wparam;
-        if nonce == 0 || LIFECYCLE_LAST_HOME_NONCE.swap(nonce, Ordering::AcqRel) != nonce {
-            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
-            SetWindowTextW(hwnd, windows_sys::w!(""));
-            let _ = proxy.send_event(UserEvent::HomeRequested);
-        }
-        return 0;
-    }
-
-    if message == WM_KEYDOWN {
-        let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
-        let ctrl = (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;
-        let shift = (GetAsyncKeyState(VK_SHIFT as i32) as u16 & 0x8000) != 0;
-
-        match wparam as u32 {
-            13 => {
-                let text = window_text(hwnd);
-                debug_log(format_args!(
-                    "omnibox: Enter ({} chars)",
-                    text.chars().count()
-                ));
-                let _ = proxy.send_event(UserEvent::SubmitText(text));
-                return 0;
-            }
-            27 => {
-                SetWindowTextW(hwnd, windows_sys::w!(""));
-                let _ = proxy.send_event(UserEvent::HomeRequested);
-                return 0;
-            }
-            // Um EDIT de uma linha nao trata Ctrl+A sozinho -- e uma velha
-            // manha do Win32. Ctrl+L faz o mesmo, por ser o habito do Chrome.
-            0x41 | 0x4C if ctrl => {
-                SendMessageW(hwnd, EM_SETSEL, 0, -1);
-                return 0;
-            }
-            0x48 if ctrl => {
-                let _ = proxy.send_event(UserEvent::ShowHistory);
-                return 0;
-            }
-            0x4E if ctrl => {
-                let _ = proxy.send_event(UserEvent::NewTab(0));
-                return 0;
-            }
-            // Ctrl+O: adicionar e abrir livros EPUB.
-            key if omnibox_opens_epub_dialog(key, ctrl, shift) => {
-                let _ = proxy.send_event(UserEvent::OpenEpubDialog);
-                return 0;
-            }
-            0x52 if ctrl && !shift => {
-                let _ = proxy.send_event(UserEvent::ToggleAutoScroll);
-                return 0;
-            }
-            0x2E if ctrl && shift => {
-                let _ = proxy.send_event(UserEvent::ClearHistory);
-                return 0;
-            }
-            // Ctrl+Shift+Z (Z = 0x5A): nota nova no painel. Na omnibox nao
-            // ha pagina com selecao; o Ctrl+Z sozinho continua a desfazer.
-            0x5A if ctrl && shift => {
-                let _ = proxy.send_event(UserEvent::NewNote);
-                return 0;
-            }
-            _ => {}
-        }
-    }
-    // O Ctrl+Shift+Z acima ja foi tratado: o carater 0x1A que o
-    // TranslateMessage gera a seguir seria o "desfazer" do EDIT.
-    if message == WM_CHAR
-        && wparam == 0x1A
-        && (GetAsyncKeyState(VK_SHIFT as i32) as u16 & 0x8000) != 0
-    {
-        return 0;
-    }
-
-    DefSubclassProc(hwnd, message, wparam, lparam)
-}
-
 /// Popup da palette. Pinta a caixa e a legenda e da ao EDIT filho as cores
 /// da omnibox. E uma janela de topo propria pela mesma razao que o botao
 /// de sair: nada pintado pela janela principal aparece por cima do WebView2.
@@ -2637,6 +2503,10 @@ unsafe fn window_text(hwnd: HWND) -> String {
     } else {
         String::from_utf16_lossy(&buffer[..copied as usize])
     }
+}
+
+pub(in crate::windows_app) unsafe fn get_window_text(hwnd: HWND) -> String {
+    window_text(hwnd)
 }
 
 struct ReaderJob {
@@ -3869,46 +3739,6 @@ impl App {
         }
     }
 
-    fn set_omnibox_text(&self, text: &str) {
-        let Some(edit) = self.omnibox else {
-            return;
-        };
-        let value = wide_null(text);
-        unsafe {
-            SetWindowTextW(edit, value.as_ptr());
-            SendMessageW(edit, EM_SETSEL, 0, -1);
-        }
-    }
-
-    fn set_omnibox_visibility(&self, visible: bool, focus: bool) {
-        let Some(edit) = self.omnibox else {
-            return;
-        };
-        unsafe {
-            ShowWindow(edit, if visible { SW_SHOW } else { SW_HIDE });
-            if visible && focus {
-                EnableWindow(edit, 1);
-                SetFocus(edit);
-            }
-        }
-    }
-
-    fn show_omnibox(&self, visible: bool) {
-        self.set_omnibox_visibility(visible, visible);
-    }
-
-    fn show_omnibox_passive(&self, visible: bool) {
-        self.set_omnibox_visibility(visible, false);
-    }
-
-    fn omnibox_text(&self) -> String {
-        self.omnibox
-            .map(|edit| unsafe { window_text(edit) })
-            .unwrap_or_default()
-            .trim()
-            .to_string()
-    }
-
     /// Unica saida de qualquer superficie web. Leva o comparador junto: era
     /// aqui que os tres WebViews sobreviviam ao regresso a Home e o contador
     /// podia chegar a quatro somando o Full Web.
@@ -4027,7 +3857,7 @@ impl App {
             .after(Duration::from_millis(40), UserEvent::RestoreHomeDecorations);
     }
 
-    fn show_home(&mut self) {
+    pub(in crate::windows_app) fn show_home(&mut self) {
         debug_log(format_args!("show_home (surface era {:?})", self.surface));
         self.caption_reveal.reset();
         self.close_side_panel(PanelExit::Home);
@@ -4074,56 +3904,7 @@ impl App {
         self.request_redraw();
     }
 
-    /// Pede a lista ao worker; a caixa aparece quando `HistoryLoaded` voltar.
-    /// A leitura (lock + ficheiro inteiro) nunca corre no event loop.
-    fn show_recent_history(&self) {
-        if let Some(result) = self.history.recent(HISTORY_RECENT_LIMIT) {
-            self.show_history_entries(result);
-        }
-    }
-
-    fn show_history_entries(&self, result: Result<Vec<HistoryEntry>, String>) {
-        let text = match result {
-            Ok(entries) if entries.is_empty() => "Histórico local vazio.".to_string(),
-            Ok(entries) => entries
-                .into_iter()
-                .map(|entry| {
-                    let kind = match entry.kind {
-                        HistoryKind::Ask => "IA",
-                        HistoryKind::Read => "Reader",
-                        HistoryKind::Web => "Web",
-                    };
-                    format!("[{kind}] {}", entry.input)
-                })
-                .collect::<Vec<_>>()
-                .join("\r\n"),
-            Err(error) => format!("Não foi possível ler o histórico: {error}"),
-        };
-        self.show_native_text("NeuralIA — Histórico cronológico", &text);
-    }
-
-    /// Ctrl+Shift+Delete apagava historico e memoria local de uma vez, sem
-    /// perguntar e sem volta. Agora pergunta, com o "Nao" por omissao.
-    fn confirm_clear_history(&self) -> bool {
-        let Some(hwnd) = self.window.as_ref().and_then(window_hwnd) else {
-            return false;
-        };
-        let body = wide_null(
-            "Apagar TODO o histórico e a memória local da NeuralIA?\n\nNos livros, some o registro de quando cada um foi aberto; a posição de leitura e os marcadores ficam.\n\nIsto não pode ser desfeito.",
-        );
-        let title = wide_null("NeuralIA — Apagar histórico");
-        let answer = unsafe {
-            MessageBoxW(
-                hwnd,
-                body.as_ptr(),
-                title.as_ptr(),
-                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
-            )
-        };
-        clear_history_confirmed(answer)
-    }
-
-    fn show_native_text(&self, title: &str, text: &str) {
+    pub(in crate::windows_app) fn show_native_text(&self, title: &str, text: &str) {
         let Some(window) = &self.window else {
             return;
         };
@@ -4181,57 +3962,6 @@ impl App {
         self.show_native_text("NeuralIA — Memória semântica", &text);
     }
 
-    fn handle_input(&mut self, input: String) {
-        debug_log(format_args!(
-            "handle_input ({} chars) surface={:?}",
-            input.chars().count(),
-            self.surface
-        ));
-        match route_input(&input) {
-            InputRoute::Agent(spec) => self.start_browser_agent(&spec),
-            InputRoute::MemoryQuery(query) => {
-                self.memory.query(query);
-                self.show_splash("Buscando na memória local…".to_string(), 2);
-            }
-            InputRoute::MemoryRebuild => {
-                self.memory.rebuild();
-                self.show_splash("Reconstrução da memória agendada.".to_string(), 3);
-            }
-            InputRoute::History => self.show_recent_history(),
-            InputRoute::Theme(Some(choice)) => self.choose_theme(choice),
-            InputRoute::Theme(None) => self.show_splash(THEME_COMMAND_HELP.to_string(), 3),
-            InputRoute::Pomodoro(Some(command)) => self.pomodoro_command(command),
-            InputRoute::Pomodoro(None) => {
-                self.show_splash(POMODORO_COMMAND_HELP.to_string(), 4);
-            }
-            InputRoute::ResearchCompare => self.compare_current_research(),
-            InputRoute::ResearchSynthesize => self.synthesize_current_research(),
-            InputRoute::ResearchExport => self.export_current_research(),
-            InputRoute::Translate(Some(text)) => self.compare(CompareRequest::translate(&text)),
-            InputRoute::Translate(None) => {
-                self.show_splash(TRANSLATE_COMMAND_HELP.to_string(), 3);
-            }
-            InputRoute::Library => self.open_library(),
-            InputRoute::OpenEpub(None) => self.open_epub_dialog(true),
-            InputRoute::OpenEpub(Some(path)) => self.open_epub(path),
-            InputRoute::Intent => match parse_intent(&input) {
-                Ok(Intent::Home) => self.show_home(),
-                Ok(Intent::Ask(query)) => self.ask(query),
-                Ok(Intent::Compare(query)) => self.compare(CompareRequest::ask(query)),
-                Ok(Intent::Read(url)) => self.read(url.to_string()),
-                Ok(Intent::Web(url)) => self.web(url.to_string()),
-                Err(error) => self.show_native_error(error.to_string()),
-            },
-        }
-    }
-
-    fn submit_current(&mut self) {
-        let input = self.omnibox_text();
-        if !input.is_empty() {
-            self.handle_input(input);
-        }
-    }
-
     fn current_research_item_ids(&self) -> Vec<String> {
         self.current_research
             .as_ref()
@@ -4251,7 +3981,7 @@ impl App {
             .unwrap_or_default()
     }
 
-    fn compare_current_research(&self) {
+    pub(in crate::windows_app) fn compare_current_research(&self) {
         let Some(session) = &self.current_research else {
             self.show_native_text(
                 "NeuralIA — Research Session",
@@ -4281,7 +4011,7 @@ impl App {
         self.show_native_text("NeuralIA — Comparação da pesquisa", &text);
     }
 
-    fn synthesize_current_research(&mut self) {
+    pub(in crate::windows_app) fn synthesize_current_research(&mut self) {
         let ids = self.current_research_item_ids();
         let Some(session) = &mut self.current_research else {
             self.show_native_text(
@@ -4302,7 +4032,7 @@ impl App {
         self.show_native_text("NeuralIA — Síntese com proveniência", &snapshot.output);
     }
 
-    fn export_current_research(&mut self) {
+    pub(in crate::windows_app) fn export_current_research(&mut self) {
         let Some(session) = &self.current_research else {
             self.show_native_text(
                 "NeuralIA — Research Session",
@@ -4327,7 +4057,7 @@ impl App {
 
     /// Um unico fornecedor: o Google AI Mode, num so WebView. E a saida para
     /// quem nao quer a pergunta em tres sitios ao mesmo tempo (`ask:` ou `?`).
-    fn ask(&mut self, query: String) {
+    pub(in crate::windows_app) fn ask(&mut self, query: String) {
         let url = match google_ai_url(&query, &self.config.language) {
             Ok(url) => url,
             Err(error) => {
@@ -4352,7 +4082,7 @@ impl App {
     /// Destino normal de uma pergunta: a mesma consulta segue em simultaneo
     /// para o Google AI Mode, o ChatGPT e o Claude, lado a lado. O nome e a
     /// entrada do Historico sao os de `compare_records`.
-    fn compare(&mut self, request: CompareRequest) {
+    pub(in crate::windows_app) fn compare(&mut self, request: CompareRequest) {
         self.next_generation();
 
         let (session, question_memory, reopen) = compare_records(&request);
@@ -4364,7 +4094,7 @@ impl App {
         self.open_comparator(&request.prompt);
     }
 
-    fn read(&mut self, url: String) {
+    pub(in crate::windows_app) fn read(&mut self, url: String) {
         let generation = self.next_generation();
         self.destroy_web_surfaces();
         self.surface = Surface::Home;
@@ -4381,7 +4111,7 @@ impl App {
         }
     }
 
-    fn web(&mut self, url: String) {
+    pub(in crate::windows_app) fn web(&mut self, url: String) {
         match neural_core::validate_web_url(&url) {
             Ok(valid) if is_pdf_url(&valid) => self.read_pdf(valid),
             Ok(valid) => {
@@ -4525,13 +4255,13 @@ impl App {
 
     /// A biblioteca de livros (estilo Calibre). `livros:` na omnibox; o
     /// botão da Home vem depois, pela mão de quem integra.
-    fn open_library(&mut self) {
+    pub(in crate::windows_app) fn open_library(&mut self) {
         self.open_epub_page(library_url());
     }
 
     /// Acrescenta o EPUB à biblioteca (numa thread própria: um livro grande
     /// pode demorar) e abre-o no leitor quando estiver lá.
-    fn open_epub(&mut self, path: PathBuf) {
+    pub(in crate::windows_app) fn open_epub(&mut self, path: PathBuf) {
         self.submit_epub_job(EpubJob::Add {
             paths: vec![path],
             open: true,
@@ -4569,7 +4299,7 @@ impl App {
     }
 
     /// Ctrl+O e `epub:`: o diálogo "Abrir" do Windows, só `*.epub`.
-    fn open_epub_dialog(&mut self, open: bool) {
+    pub(in crate::windows_app) fn open_epub_dialog(&mut self, open: bool) {
         let Some(owner) = self.window.as_ref().and_then(window_hwnd) else {
             return;
         };
@@ -4703,7 +4433,7 @@ impl App {
         }
     }
 
-    fn record(&self, kind: HistoryKind, input: String, target: String) {
+    pub(in crate::windows_app) fn record(&self, kind: HistoryKind, input: String, target: String) {
         self.history.append(HistoryEntry::now(kind, input, target));
     }
 
@@ -4845,7 +4575,7 @@ impl App {
             .with_focused(true)
     }
 
-    fn start_browser_agent(&mut self, spec: &str) {
+    pub(in crate::windows_app) fn start_browser_agent(&mut self, spec: &str) {
         let (url, commands) = match parse_browser_agent_plan(spec) {
             Ok(plan) => plan,
             Err(error) => {
@@ -5562,7 +5292,7 @@ impl App {
         self.request_redraw();
     }
 
-    fn restore_comparator(&mut self) {
+    pub(in crate::windows_app) fn restore_comparator(&mut self) {
         if let Some(comp) = &mut self.comparator {
             comp.expanded = None;
         }
@@ -5972,7 +5702,7 @@ impl App {
         }
     }
 
-    fn open_split_mode(
+    pub(in crate::windows_app) fn open_split_mode(
         &mut self,
         source_index: usize,
         url: String,
@@ -6211,7 +5941,7 @@ impl App {
         }
     }
 
-    fn close_split(&mut self) {
+    pub(in crate::windows_app) fn close_split(&mut self) {
         let was_fullscreen = self
             .comparator
             .as_ref()
@@ -6230,7 +5960,7 @@ impl App {
         self.request_redraw();
     }
 
-    fn toggle_split_fullscreen(&mut self) {
+    pub(in crate::windows_app) fn toggle_split_fullscreen(&mut self) {
         let Some(fullscreen) = self
             .comparator
             .as_mut()
@@ -6294,149 +6024,11 @@ impl App {
         }
     }
 
-    fn provider_query_url(&self, source_index: usize, query: &str) -> neural_core::Result<Url> {
+    pub(in crate::windows_app) fn provider_query_url(&self, source_index: usize, query: &str) -> neural_core::Result<Url> {
         match source_index {
             0 => google_ai_url(query, &self.config.language),
             1 => chatgpt_search_url(query),
             _ => claude_search_url(query),
-        }
-    }
-
-    /// Entrada da palette nativa. `source_index` e `private` vem do estado
-    /// nativo escrito ao abrir a palette, nunca da pagina; a decisao de rota
-    /// e pura (`route_palette`) e testada sem janela.
-    fn submit_palette(&mut self, source_index: usize, input: String, private: bool) {
-        match route_palette(&input, source_index, private) {
-            PaletteRoute::Invalid(message) => {
-                if let Some(message) = message {
-                    self.show_splash(message, 3);
-                }
-            }
-            PaletteRoute::Home => self.show_home(),
-            PaletteRoute::Pomodoro(Some(command)) => self.pomodoro_command(command),
-            PaletteRoute::Pomodoro(None) => {
-                self.show_splash(POMODORO_COMMAND_HELP.to_string(), 4);
-            }
-            PaletteRoute::Theme(Some(choice)) => self.choose_theme(choice),
-            PaletteRoute::Theme(None) => self.show_splash(THEME_COMMAND_HELP.to_string(), 3),
-            // allow_local: a URL foi digitada num controlo nativo, e entrada
-            // do utilizador e nao da pagina (SPEC-0015). Em privado a fonte
-            // abre privada: open_split_mode(private) nao grava memoria nem
-            // abas.
-            PaletteRoute::OpenSplit { url, private } => {
-                let _ = self.open_split_mode(source_index, url.to_string(), true, private, None);
-            }
-            // Painel privado: a pergunta abre como fonte privada, nunca na
-            // coluna normal (cookies normais) e nunca no historico.
-            PaletteRoute::OpenPrivateProvider { query } => {
-                match self.provider_query_url(source_index, &query) {
-                    Ok(url) => {
-                        let _ =
-                            self.open_split_mode(source_index, url.to_string(), false, true, None);
-                    }
-                    Err(error) => self.show_splash(error.to_string(), 3),
-                }
-            }
-            PaletteRoute::LoadProvider { query } => {
-                match self.provider_query_url(source_index, &query) {
-                    Ok(url) => {
-                        if let Some(view) = self
-                            .comparator
-                            .as_ref()
-                            .and_then(|comp| comp.views.get(source_index))
-                        {
-                            let _ = view.webview.load_url(url.as_str());
-                            self.record(HistoryKind::Ask, query, url.to_string());
-                        }
-                    }
-                    Err(error) => self.show_splash(error.to_string(), 3),
-                }
-            }
-        }
-    }
-
-    /// Um nivel para tras. O Escape da janela nativa e o Escape apanhado dentro
-    /// das paginas acabam os dois aqui.
-    fn go_back(&mut self) {
-        if self.surface == Surface::Comparator {
-            if self
-                .comparator
-                .as_ref()
-                .and_then(|comp| comp.split.as_ref())
-                .is_some_and(|split| split.fullscreen)
-            {
-                self.toggle_split_fullscreen();
-                return;
-            }
-            if self
-                .comparator
-                .as_ref()
-                .is_some_and(|comp| comp.split.is_some())
-            {
-                self.close_split();
-                return;
-            }
-            if let Some(comp) = &self.comparator
-                && comp.expanded.is_some()
-            {
-                self.restore_comparator();
-                return;
-            }
-        }
-        self.show_home();
-    }
-
-    /// ‹ e › da barra: o historico da PAGINA, como no Chrome -- na fonte aberta
-    /// ao lado, na coluna expandida ou na pagina cheia. Com as tres colunas
-    /// lado a lado nao ha uma pagina so: o ‹ faz o voltar do app.
-    fn navigate_history(&mut self, step: HistoryStep) {
-        let target = history_nav_target(
-            self.surface,
-            self.comparator
-                .as_ref()
-                .is_some_and(|comp| comp.split.is_some()),
-            self.comparator.as_ref().and_then(|comp| comp.expanded),
-            self.webview.is_some(),
-        );
-        let script = match step {
-            HistoryStep::Back => "window.history.back();",
-            HistoryStep::Forward => "window.history.forward();",
-        };
-        let webview = match target {
-            HistoryNav::Split => self
-                .comparator
-                .as_ref()
-                .and_then(|comp| comp.split.as_ref())
-                .map(|split| &split.webview),
-            HistoryNav::Column(index) => self
-                .comparator
-                .as_ref()
-                .and_then(|comp| comp.views.get(index))
-                .map(|view| &view.webview),
-            HistoryNav::Page => self.webview.as_ref(),
-            HistoryNav::App => None,
-        };
-        match (webview, step) {
-            (Some(webview), _) => {
-                let _ = webview.evaluate_script(script);
-            }
-            (None, HistoryStep::Back) => self.go_back(),
-            (None, HistoryStep::Forward) => {}
-        }
-    }
-
-    /// ‹ › de uma IA: o historico da pagina daquela coluna, so dela.
-    fn navigate_column(&mut self, index: usize, step: HistoryStep) {
-        let script = match step {
-            HistoryStep::Back => "window.history.back();",
-            HistoryStep::Forward => "window.history.forward();",
-        };
-        if let Some(view) = self
-            .comparator
-            .as_ref()
-            .and_then(|comp| comp.views.get(index))
-        {
-            let _ = view.webview.evaluate_script(script);
         }
     }
 
@@ -6814,31 +6406,6 @@ impl App {
         };
         if !printed {
             self.show_splash("Não há nada para imprimir aqui.".to_string(), 3);
-        }
-    }
-
-    /// O equivalente ao Ctrl+L do Chrome. Na Home foca a caixa principal;
-    /// no comparador abre a palette flutuante da coluna ativa.
-    fn focus_omnibox(&mut self) {
-        if self.surface == Surface::Comparator {
-            let index = self
-                .comparator
-                .as_ref()
-                .and_then(|comp| {
-                    comp.expanded
-                        .or_else(|| (0..comp.views.len()).find(|index| !comp.minimized[*index]))
-                })
-                .unwrap_or(0);
-            self.open_ai_palette(index);
-            return;
-        }
-
-        self.show_home();
-        if let Some(edit) = self.omnibox {
-            unsafe {
-                SetFocus(edit);
-                SendMessageW(edit, EM_SETSEL, 0, -1);
-            }
         }
     }
 
@@ -8774,7 +8341,7 @@ impl App {
         }
     }
 
-    fn choose_theme(&mut self, choice: ThemeChoice) {
+    pub(in crate::windows_app) fn choose_theme(&mut self, choice: ThemeChoice) {
         choice.apply();
         if let Err(error) = choice.save(&self.config.data_dir.join("theme")) {
             self.show_native_error(format!("Não foi possível guardar o tema: {error}"));
@@ -8855,7 +8422,7 @@ impl App {
     /// Abre a palette nativa sobre a coluna `source_index`. E um popup Win32,
     /// nao um <input> no DOM: a pagina remota nem ve o que se escreve nem
     /// consegue submeter nada por ela.
-    fn open_ai_palette(&mut self, source_index: usize) {
+    pub(in crate::windows_app) fn open_ai_palette(&mut self, source_index: usize) {
         if source_index >= COMPARATOR_COLUMNS || self.comparator.is_none() {
             return;
         }
@@ -11879,116 +11446,6 @@ fn split_source_memory(
     Some((title, document))
 }
 
-/// Para onde vai o texto que o utilizador submeteu, decidido sem tocar na
-/// janela, na memória, na rede nem no agente. É a SPEC-0106 -- a composição do
-/// produto -- num sítio onde um teste lhe consegue chegar.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum InputRoute {
-    Agent(String),
-    MemoryQuery(String),
-    MemoryRebuild,
-    History,
-    /// `tema:claro`, `tema:escuro`, `tema:sistema` (None: palavra desconhecida).
-    Theme(Option<ThemeChoice>),
-    /// `pomodoro:`, `pomodoro:pausar`, `pomodoro:50`... (None: palavra
-    /// desconhecida -> a ajuda).
-    Pomodoro(Option<PomodoroCommand>),
-    ResearchCompare,
-    ResearchSynthesize,
-    ResearchExport,
-    /// `traduzir:<texto>`: o texto nas tres IAs com o pedido fixo de
-    /// traducao (`CompareRequest::translate`) -- e o que o Historico guarda de
-    /// um Traduzir da barra. None: sem texto -> a ajuda.
-    Translate(Option<String>),
-    /// `livros:` (e `biblioteca:`, `books:`, `library:`): a biblioteca.
-    Library,
-    /// `epub:` sozinho abre o diálogo de arquivos; `epub:<caminho>` abre esse
-    /// arquivo.
-    OpenEpub(Option<PathBuf>),
-    /// Sem comando próprio: segue para o `parse_intent`.
-    Intent,
-}
-
-/// A ajuda de um `traduzir:` sem texto.
-const TRANSLATE_COMMAND_HELP: &str = "Escreva o texto depois de traduzir:";
-
-/// `text` sem `prefix` a frente, se comecar por ele (maiusculas ou nao).
-fn strip_prefix_ignore_ascii_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
-    let head = text.get(..prefix.len())?;
-    head.eq_ignore_ascii_case(prefix)
-        .then(|| &text[prefix.len()..])
-}
-
-fn route_input(input: &str) -> InputRoute {
-    // Os comandos exactos vêm ANTES dos prefixos. `memory:rebuild` começa por
-    // `memory:`, por isso enquanto o prefixo foi testado primeiro o rebuild
-    // nunca aconteceu: procurava-se a palavra "rebuild" na memória e
-    // anunciava-se "Buscando na memória local…".
-    let trimmed = input.trim();
-    for (command, route) in [
-        ("history:", InputRoute::History),
-        ("research:compare", InputRoute::ResearchCompare),
-        ("research:synthesize", InputRoute::ResearchSynthesize),
-        ("research:export", InputRoute::ResearchExport),
-        ("memory:rebuild", InputRoute::MemoryRebuild),
-        ("mem:rebuild", InputRoute::MemoryRebuild),
-        ("livros:", InputRoute::Library),
-        ("biblioteca:", InputRoute::Library),
-        ("books:", InputRoute::Library),
-        ("library:", InputRoute::Library),
-        ("!livros", InputRoute::Library),
-        ("!books", InputRoute::Library),
-    ] {
-        if trimmed.eq_ignore_ascii_case(command) {
-            return route;
-        }
-    }
-
-    // `epub:` (ou `!epub`) sozinho abre o diálogo; com um caminho à frente
-    // (aspas do "Copiar como caminho" do Explorer aceites) abre esse arquivo.
-    for prefix in ["epub:", "!epub"] {
-        let Some(rest) = trimmed
-            .get(..prefix.len())
-            .filter(|head| head.eq_ignore_ascii_case(prefix))
-            .map(|_| &trimmed[prefix.len()..])
-        else {
-            continue;
-        };
-        if prefix.starts_with('!') && !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
-            continue;
-        }
-        let path = rest.trim().trim_matches('"').trim();
-        return InputRoute::OpenEpub((!path.is_empty()).then(|| PathBuf::from(path)));
-    }
-
-    if let Some(word) = trimmed
-        .strip_prefix("tema:")
-        .or_else(|| trimmed.strip_prefix("theme:"))
-    {
-        return InputRoute::Theme(ThemeChoice::parse(word));
-    }
-    // Sem distinguir maiusculas, como os `research:`. Os dois pontos sao
-    // obrigatorios, como no `tema:`: "pomodoro tecnica" continua a ser uma
-    // pesquisa sobre o metodo.
-    if let Some(word) = strip_prefix_ignore_ascii_case(trimmed, "pomodoro:") {
-        return InputRoute::Pomodoro(parse_pomodoro_command(word));
-    }
-    if let Some(text) = strip_prefix_ignore_ascii_case(trimmed, TRANSLATE_COMMAND) {
-        let text = text.trim();
-        return InputRoute::Translate((!text.is_empty()).then(|| text.to_string()));
-    }
-    if let Some(spec) = input.strip_prefix("agent:") {
-        return InputRoute::Agent(spec.trim().to_string());
-    }
-    if let Some(query) = input
-        .strip_prefix("memory:")
-        .or_else(|| input.strip_prefix("mem:"))
-    {
-        return InputRoute::MemoryQuery(query.trim().to_string());
-    }
-    InputRoute::Intent
-}
-
 fn app_agent_security_action(action: &AgentAction, page: &ObservedPage) -> AgentSecurityAction {
     let origin = Url::parse(&page.url)
         .ok()
@@ -13701,66 +13158,6 @@ where
         .with_focused(true)
 }
 
-/// Para onde vai o que o utilizador escreveu na palette. Puro, para se poder
-/// testar sem janela: e aqui que se decide que um painel privado nunca
-/// carrega nada na coluna normal nem passa pelo historico.
-#[derive(Debug, PartialEq)]
-enum PaletteRoute {
-    /// Nada a fazer; a mensagem, quando ha, e para mostrar ao utilizador.
-    Invalid(Option<String>),
-    Home,
-    /// URL: abre ao lado da coluna, privada se a palette veio de um painel
-    /// privado. A rede local e permitida porque a URL foi digitada.
-    OpenSplit {
-        url: Url,
-        private: bool,
-    },
-    /// Texto numa coluna normal: a pergunta vai para o fornecedor da coluna
-    /// e fica no historico.
-    LoadProvider {
-        query: String,
-    },
-    /// Texto num painel privado: a pergunta abre como fonte privada.
-    OpenPrivateProvider {
-        query: String,
-    },
-    /// `pomodoro:` -- o botao do Pomodoro vive na barra do comparador, e e
-    /// aqui (a palette) que o teclado escreve comandos: sem esta rota,
-    /// "pomodoro:pausar" dava "esquema nao permitido" e "pomodoro: 50" ia
-    /// perguntar a IA e ficava no historico. `None`: palavra desconhecida
-    /// (a ajuda).
-    Pomodoro(Option<PomodoroCommand>),
-    /// `tema:` -- o mesmo comando da omnibox da Home.
-    Theme(Option<ThemeChoice>),
-}
-
-fn route_palette(input: &str, source_index: usize, private: bool) -> PaletteRoute {
-    let input = input.trim();
-    if input.is_empty() || source_index >= COMPARATOR_COLUMNS {
-        return PaletteRoute::Invalid(None);
-    }
-    // Os comandos locais da omnibox que fazem sentido sem sair do
-    // comparador, pela MESMA `route_input` da Home. Nada disto sai do
-    // computador, nem num painel privado.
-    match route_input(input) {
-        InputRoute::Pomodoro(command) => return PaletteRoute::Pomodoro(command),
-        InputRoute::Theme(choice) => return PaletteRoute::Theme(choice),
-        _ => {}
-    }
-    match parse_intent(input) {
-        Ok(Intent::Read(url)) | Ok(Intent::Web(url)) => PaletteRoute::OpenSplit { url, private },
-        Ok(Intent::Home) => PaletteRoute::Home,
-        Ok(Intent::Ask(query)) | Ok(Intent::Compare(query)) => {
-            if private {
-                PaletteRoute::OpenPrivateProvider { query }
-            } else {
-                PaletteRoute::LoadProvider { query }
-            }
-        }
-        Err(error) => PaletteRoute::Invalid(Some(error.to_string())),
-    }
-}
-
 /// Token que so os scripts injetados conhecem: 128 bits de CSPRNG do Windows.
 /// O caminho principal usa BCryptGenRandom. Se essa API falhar, tentamos a
 /// segunda interface criptografica do proprio Windows (RtlGenRandom) antes de
@@ -13909,7 +13306,7 @@ fn is_pdf_internal_target(target: &str) -> bool {
     })
 }
 
-fn wide_null(value: &str) -> Vec<u16> {
+pub(in crate::windows_app) fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
@@ -15201,6 +14598,11 @@ pub(super) fn all_sources() -> String {
 }
 
 #[cfg(test)]
+pub(super) use crate::pomodoro_ui::{PomodoroCommand, POMODORO_COMMAND_HELP};
+#[cfg(test)]
+pub(super) use neural_core::parse_intent;
+
+#[cfg(test)]
 mod tests;
 
 mod theme;
@@ -15721,12 +15123,6 @@ fn register_column_context_menu(
     let mut token = 0i64;
     unsafe { core.add_ContextMenuRequested(&handler, &mut token) }
         .map_err(|error| format!("add_ContextMenuRequested falhou: {error}"))
-}
-
-/// Apagar TUDO so com um "Sim" explicito. Fechar a caixa, "Nao" ou uma caixa
-/// que nem abriu (0) deixam o historico como estava.
-fn clear_history_confirmed(answer: i32) -> bool {
-    answer == IDYES
 }
 
 /// Uma volta completa do degradê a deslizar.

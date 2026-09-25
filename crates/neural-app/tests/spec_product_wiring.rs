@@ -53,6 +53,8 @@ const ALL_SOURCES: &str = concat!(
     include_str!("../src/windows_app/app/gmail.rs"),
     "\n",
     include_str!("../src/windows_app/app/tools.rs"),
+    "\n",
+    include_str!("../src/windows_app/app/navigation.rs"),
 );
 const APP: &str = ALL_SOURCES;
 const IPC: &str = include_str!("../src/ipc.rs");
