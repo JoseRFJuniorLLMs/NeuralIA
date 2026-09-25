@@ -1255,15 +1255,6 @@ impl App {
         }
     }
 
-    pub(in crate::windows_app) fn choose_theme(&mut self, choice: ThemeChoice) {
-        choice.apply();
-        if let Err(error) = choice.save(&self.config.data_dir.join("theme")) {
-            self.show_native_error(format!("Não foi possível guardar o tema: {error}"));
-        }
-        self.refresh_theme();
-        self.show_splash(format!("{} ativado.", choice.label()), 2);
-    }
-
     /// A dica do alvo `hit`, com o nome da IA, o endereco da aba ou o estado
     /// do grupo que o clique vai usar.
     fn bar_tooltip_text(&self, hit: BarHit, owner: HWND) -> Option<String> {

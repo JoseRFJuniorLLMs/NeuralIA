@@ -175,7 +175,7 @@ impl ApplicationHandler<UserEvent> for App {
             } => self.handle_gmail_state(unread, sender, subject, key),
             UserEvent::HideGmailToast(token) => self.hide_gmail_toast(token),
             UserEvent::ShowHistory => self.toggle_side_panel(),
-            UserEvent::ThemeChosen(choice) => self.choose_theme(choice),
+            UserEvent::Theme(event) => self.theme_event(event),
             UserEvent::Panel(post) => self.handle_panel_message(post),
             UserEvent::NotesReady { origin, reply } => self.notes_ready(origin, reply),
             UserEvent::NoteRequested { target, via } => self.request_note_from_page(target, via),

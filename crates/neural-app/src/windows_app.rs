@@ -98,8 +98,9 @@ pub(in crate::windows_app) enum PageTarget {
 
 #[derive(Debug)]
 pub(in crate::windows_app) enum UserEvent {
-    /// Escolha de tema feita no menu do botao Home.
-    ThemeChosen(ThemeChoice),
+    /// O tema (`theme.rs`): a unica variante do modulo, com o enum dele
+    /// dentro. E o padrao de cada feature: uma variante aqui, o resto la.
+    Theme(ThemeEvent),
     /// Pedido da pagina local do painel lateral (canal proprio), com o
     /// numero da pagina que o mandou.
     Panel(side_panel::PanelPost),
@@ -366,9 +367,6 @@ const PALETTE_EDIT_HEIGHT: f64 = 30.0;
 const PALETTE_HINT_TOP: f64 = 48.0;
 /// Fraccao da altura util (abaixo da barra) a que a palette pousa.
 const PALETTE_TOP_RATIO: f64 = 0.18;
-/// A ajuda do `tema:` com uma palavra desconhecida (omnibox e palette).
-pub(in crate::windows_app) const THEME_COMMAND_HELP: &str =
-    "Use tema:sistema, tema:claro ou tema:escuro.";
 const SEARCH_CARD_SUBCLASS_ID: usize = 0x4E71;
 /// Cartao de confirmacao da barra de selecao ("Mandar para as 3 IAs?",
 /// "Traduzir nas 3 IAs?"), em pixeis logicos, centrado na janela. A caixa do
@@ -1610,54 +1608,6 @@ pub(in crate::windows_app) fn refresh_hint_text(text: &str) {
     show_pending_tooltip();
 }
 
-/// Menu de tema no cursor, com a escolha em vigor marcada. Devolve a opcao
-/// clicada, ou None se o menu foi fechado sem escolha.
-fn pick_theme_from_menu(hwnd: HWND) -> Option<ThemeChoice> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, GA_ROOT, GetAncestor, MF_CHECKED, MF_STRING,
-        SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    };
-    let current = ThemeChoice::current();
-    unsafe {
-        let menu = CreatePopupMenu();
-        if menu.is_null() {
-            return None;
-        }
-        for (index, choice) in ThemeChoice::ALL.iter().enumerate() {
-            let flags = if *choice == current {
-                MF_STRING | MF_CHECKED
-            } else {
-                MF_STRING
-            };
-            let label: Vec<u16> = choice
-                .label()
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-            AppendMenuW(menu, flags, index + 1, label.as_ptr());
-        }
-        let mut cursor = POINT { x: 0, y: 0 };
-        GetCursorPos(&mut cursor);
-        // Sem o dono em primeiro plano, o menu nao fecha ao clicar fora.
-        let root = GetAncestor(hwnd, GA_ROOT);
-        SetForegroundWindow(root);
-        let picked = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON,
-            cursor.x,
-            cursor.y,
-            0,
-            root,
-            std::ptr::null(),
-        );
-        DestroyMenu(menu);
-        usize::try_from(picked)
-            .ok()
-            .and_then(|id| id.checked_sub(1))
-            .and_then(|index| ThemeChoice::ALL.get(index).copied())
-    }
-}
-
 /// Pixeis BGRA de um disco da cor `color` com a borda suave, com o alfa ja
 /// multiplicado nos canais -- o que o menu espera de um bitmap de 32 bits.
 fn swatch_pixels(color: Rgb, size: i32) -> Vec<u8> {
@@ -2081,7 +2031,7 @@ unsafe extern "system" fn home_button_subclass(
                 && reference_data != 0
             {
                 let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
-                let _ = proxy.send_event(UserEvent::ThemeChosen(choice));
+                let _ = proxy.send_event(UserEvent::Theme(ThemeEvent::Chosen(choice)));
             }
             0
         }
