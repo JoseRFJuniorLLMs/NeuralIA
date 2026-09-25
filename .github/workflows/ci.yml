@@ -110,13 +110,16 @@ jobs:
 
           # Each sabotage is applied alone and only its gate runs, so every gate has
           # to turn red by itself. A build error or another failing test does not count.
-          function Assert-GateRed([string]$label, [string]$test, [string]$targetPath, [string]$old, [string]$new) {
+          # An `Ignored` gate (focus-affecting, `#[ignore]` in the local suite) runs
+          # here with --ignored: this runner has the desktop session it needs.
+          function Assert-GateRed([string]$label, [string]$test, [string]$targetPath, [string]$old, [string]$new, [bool]$ignored) {
             $resolved = (Resolve-Path -LiteralPath $targetPath).Path
             $original = [IO.File]::ReadAllText($resolved, $utf8)
             $broken = Replace-Exact $original $old $new $label
             Write-Exact $resolved $broken
             try {
-              $run = Invoke-GateTest @($test)
+              $filter = if ($ignored) { @($test, '--', '--ignored') } else { @($test) }
+              $run = Invoke-GateTest $filter
             }
             finally {
               Write-Exact $resolved $original
@@ -298,13 +301,51 @@ jobs:
                       sink.clear(*target);
                   }
           '@
+            },
+            @{
+              Label = "secret-prompt-destroyed-with-the-key"
+              Test = "the_secret_prompt_takes_typing_sends_the_key_and_clears_the_edit"
+              SourcePath = "crates/neural-app/src/windows_app/secret_prompt.rs"
+              Ignored = $true
+              Old = @'
+              clear_secret_edit(prompt.edit);
+              DestroyWindow(prompt.popup);
+          '@
+              New = @'
+              DestroyWindow(prompt.popup);
+          '@
+            },
+            @{
+              Label = "secret-prompt-enter-keeps-the-key"
+              Test = "the_secret_prompt_takes_typing_sends_the_key_and_clears_the_edit"
+              SourcePath = "crates/neural-app/src/windows_app/secret_prompt.rs"
+              Ignored = $true
+              Old = @'
+                      clear_secret_edit(edit);
+                      host.invalid.set(false);
+          '@
+              New = @'
+                      host.invalid.set(false);
+          '@
+            },
+            @{
+              Label = "secret-prompt-topmost"
+              Test = "the_secret_prompt_takes_typing_sends_the_key_and_clears_the_edit"
+              SourcePath = "crates/neural-app/src/windows_app/secret_prompt.rs"
+              Ignored = $true
+              Old = @'
+          pub(in crate::windows_app) const SECRET_PROMPT_EX_STYLE: u32 = WS_EX_TOOLWINDOW;
+          '@
+              New = @'
+          pub(in crate::windows_app) const SECRET_PROMPT_EX_STYLE: u32 = WS_EX_TOOLWINDOW | 0x0000_0008;
+          '@
             }
           )
 
           try {
             foreach ($sabotage in $sabotages) {
               $target = if ($sabotage.SourcePath) { $sabotage.SourcePath } else { $defaultSourcePath }
-              Assert-GateRed $sabotage.Label $sabotage.Test $target $sabotage.Old $sabotage.New
+              Assert-GateRed $sabotage.Label $sabotage.Test $target $sabotage.Old $sabotage.New ([bool]$sabotage.Ignored)
             }
             Write-Host "Sabotage proof: each of the $($sabotages.Count) Rust UI sabotages turned its own shipped-path gate red."
 
@@ -338,19 +379,82 @@ jobs:
           if ($restored.Code -ne 0) {
             throw "neural-app tests are not green on the restored source."
           }
-          foreach ($test in ($sabotages | ForEach-Object { $_.Test } | Sort-Object -Unique)) {
+          foreach ($test in ($sabotages | Where-Object { -not $_.Ignored } | ForEach-Object { $_.Test } | Sort-Object -Unique)) {
             if (-not (Test-ResultLine $restored.Log $test 'ok')) {
               throw "Gate did not run and pass on the restored source: $test"
             }
           }
+          $ignoredGates = @($sabotages | Where-Object { $_.Ignored } | ForEach-Object { $_.Test } | Sort-Object -Unique)
+          if ($ignoredGates.Count -gt 0) {
+            $restoredIgnored = Invoke-GateTest (@('--bin', 'NeuralIA', '--', '--ignored', '--exact') + ($ignoredGates | ForEach-Object { "windows_app::tests::$_" }))
+            if ($restoredIgnored.Code -ne 0) {
+              throw "Focus-affecting gates are not green on the restored source."
+            }
+            foreach ($test in $ignoredGates) {
+              if (-not (Test-ResultLine $restoredIgnored.Log $test 'ok')) {
+                throw "Focus-affecting gate did not run and pass on the restored source: $test"
+              }
+            }
+          }
           node scripts/test-link-routing.mjs
           git diff --exit-code -- crates/neural-app/src
+      # Window gates that take the foreground or the keyboard focus (the
+      # activatable SecretPrompt of infra-settings-keys) never run in the local
+      # suite: they are `#[ignore = "needs a desktop session: runs in CI"]` and
+      # this runner has the desktop session. Every named gate must run and pass:
+      # a filter that matched nothing would also exit 0.
+      - name: Focus-affecting window gates (desktop session)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tests = @(
+            "windows_app::tests::the_secret_prompt_takes_typing_sends_the_key_and_clears_the_edit"
+          )
+          $ErrorActionPreference = "Continue"
+          cargo test --locked -p neural-app --bin NeuralIA -- --ignored --exact @tests 2>&1 |
+            ForEach-Object { "$_" } |
+            Tee-Object -Variable lines |
+            Write-Host
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = "Stop"
+          if ($code -ne 0) {
+            throw "Focus-affecting window gates failed (exit $code)."
+          }
+          $log = $lines -join "`n"
+          foreach ($test in $tests) {
+            $pattern = '(?m)^test ' + [regex]::Escape($test) + ' \.\.\. ok\s*$'
+            if ($log -notmatch $pattern) {
+              throw "Focus-affecting gate did not run and pass: $test"
+            }
+          }
+          Write-Host "Focus-affecting window gates: $($tests.Count) ran and passed."
       - name: Exercise ChatGPT/Claude auto-submit runtime
         run: node scripts/test-ai-auto-submit.mjs
       - name: Exercise shipped provider link routing
         run: node scripts/test-link-routing.mjs
       - run: cargo clippy --locked -p neural-app --all-targets -- -D warnings
       - run: cargo build --locked -p neural-app --bin NeuralIA --release
+      # Release contract of the CI-only feature test-stores (infra-settings-keys):
+      # neural-core's StoreRegistry::mint_for_test exists only with it, and only
+      # neural-app's [dev-dependencies] enable it. Cargo's resolver 2 keeps
+      # dev-dependency features out of the normal build graph, which is the one
+      # the release build above uses: this proves it on the real graph, and that
+      # the same query does see the feature once dev-dependencies are in.
+      - name: Published exe has the test-stores feature off
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $normal = (cargo tree --locked -p neural-app --target x86_64-pc-windows-msvc -e features,no-dev -i neural-core) -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw "cargo tree failed on the normal build graph." }
+          if ($normal -match 'test-stores') {
+            throw "The build graph of the published exe enables neural-core/test-stores:`n$normal"
+          }
+          $tests = (cargo tree --locked -p neural-app --target x86_64-pc-windows-msvc -e features -i neural-core) -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw "cargo tree failed on the test build graph." }
+          if ($tests -notmatch 'neural-core feature "test-stores"') {
+            throw "The check cannot see test-stores even with dev-dependencies:`n$tests"
+          }
+          Write-Host "test-stores: off in the build graph of the published exe, on only for tests."
       - name: First comparator paint without mouse or keyboard
         shell: pwsh
         run: ./scripts/test-comparator-first-paint.ps1 -ExePath target/release/NeuralIA.exe

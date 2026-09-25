@@ -6,6 +6,17 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Nenhuma feature por omissao: o exe publicado usa o neural-core assim.
+default = []
+# So CI e testes (infra-settings-keys, plano 2.3): expoe
+# `json_store::StoreRegistry::mint_for_test`, o registo das lojas sobre uma
+# pasta de teste sem gastar a cunhagem unica do processo. Ligada apenas nas
+# `[dev-dependencies]` do neural-app; o exe publicado e compilado sem ela
+# (passo "Published exe has the test-stores feature off" do ci.yml e
+# scripts/test-release-contract.mjs). Nao puxa crate nenhuma.
+test-stores = []
+
 [dev-dependencies]
 # O teste de proveniência confere o SHA-256 dos ficheiros vendorizados.
 sha2 = "0.10.9"

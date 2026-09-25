@@ -36,6 +36,17 @@ mod accel_spike;
 // Gemini Live: origem propria, canal fechado e chave com DPAPI (Windows).
 #[cfg(target_os = "windows")]
 mod gemini_live;
+// O cofre das chaves (infra-settings-keys, plano 2.3): a DPAPI com entropia
+// por uso, os slots, a `ApiKey` e a redacao do log (Windows). Os
+// consumidores (traducao, juiz, BYOM, conectores) chegam nas ondas
+// seguintes; ate la parte dele so corre nos testes.
+#[cfg(target_os = "windows")]
+#[cfg_attr(not(test), allow(dead_code))]
+mod secrets;
+// As lojas da pasta de dados e o tipo de cada uma: portatil, testado tambem
+// no runner Linux.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod stores;
 #[cfg(target_os = "windows")]
 mod windows_app;
 

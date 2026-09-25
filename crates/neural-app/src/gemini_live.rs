@@ -10,20 +10,24 @@
 //! - a lista fechada do canal do painel (`parse_live_message`), com tecto de
 //!   tamanho, e a validacao da chave;
 //! - a chave, cifrada com DPAPI para o utilizador atual em
-//!   `<data_dir>/gemini-live.key`, escrita de forma atomica;
+//!   `<data_dir>/gemini-live.key`, escrita de forma atomica (a DPAPI e o
+//!   ficheiro vivem em `secrets.rs`; aqui ficam o nome, o cabecalho e a
+//!   entropia do Live, os de sempre);
 //! - os scripts que o nativo corre na pagina. A chave so entra na pagina
 //!   quando a sessao arranca, como literal JSON, nunca no URL;
-//! - o estado do painel e do olho da barra numa peca so (`LivePanel`);
-//! - a redacao do log de depuracao: a chave nunca chega ao disco em claro.
+//! - o estado do painel e do olho da barra numa peca so (`LivePanel`).
 //!
-//! A ligacao a janela (botao, painel, eventos) esta em `windows_app.rs`.
+//! A redacao do log de depuracao (`secrets::redact_debug_secrets`) garante
+//! que a chave nunca chega ao disco em claro. A ligacao a janela (botao,
+//! painel, eventos) esta em `windows_app.rs`.
 
 use std::borrow::Cow;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use url::Url;
 use wry::http::{Method, Request, Response as HttpResponse, StatusCode};
+
+use crate::secrets::{SecretFile, wipe};
 
 /// Nome do esquema registado no wry.
 pub(crate) const LIVE_PROTOCOL: &str = "neuralia-live";
@@ -168,26 +172,17 @@ impl PartialEq for LiveKey {
 
 impl Eq for LiveKey {}
 
+/// Zerada ao sair de cena (`secrets::wipe`). E so higiene, nao uma garantia:
+/// a chave passa por copias que ninguem zera -- o corpo da mensagem que o
+/// wry entrega ao handler, o `serde_json::Value` de `parse_live_message`, o
+/// script de arranque e o HSTRING em que o wry o converte, e a propria
+/// pagina no processo do WebView2. Um despejo de memoria do processo pode ter
+/// a chave. O que a protege de verdade e a DPAPI no disco e ela nunca ir para
+/// o log (`redact_debug_secrets`).
 impl Drop for LiveKey {
     fn drop(&mut self) {
         wipe(unsafe { self.0.as_mut_vec() });
     }
-}
-
-/// Zera um buffer do proprio NeuralIA antes de o devolver ao alocador. Zeros
-/// sao UTF-8 valido, por isso servem tambem para o `String` da `LiveKey`.
-///
-/// E so higiene, nao uma garantia: a chave passa por copias que ninguem zera
-/// -- o corpo da mensagem que o wry entrega ao handler, o `serde_json::Value`
-/// de `parse_live_message`, o script de arranque e o HSTRING em que o wry o
-/// converte, e a propria pagina no processo do WebView2. Um despejo de memoria
-/// do processo pode ter a chave. O que a protege de verdade e a DPAPI no disco
-/// e ela nunca ir para o log (`redact_debug_secrets`).
-fn wipe(bytes: &mut [u8]) {
-    for byte in bytes.iter_mut() {
-        unsafe { std::ptr::write_volatile(byte, 0) };
-    }
-    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 const LIVE_KEY_MIN_CHARS: usize = 20;
@@ -249,149 +244,57 @@ pub(crate) fn parse_live_message(body: &str) -> Option<LiveMessage> {
     }
 }
 
-const LIVE_KEY_FILE: &str = "gemini-live.key";
+/// O nome do ficheiro, o cabecalho e a entropia da chave do Live. Os tres
+/// sao o formato em disco: um `gemini-live.key` gravado por qualquer versao
+/// anterior tem de continuar a abrir (gate
+/// `a_live_key_file_from_before_the_refactor_still_loads` em `secrets.rs`).
+pub(crate) const LIVE_KEY_FILE: &str = "gemini-live.key";
 /// Cabecalho do ficheiro: identifica o formato antes do blob da DPAPI.
-const LIVE_KEY_MAGIC: &[u8; 4] = b"NLK1";
+pub(crate) const LIVE_KEY_MAGIC: &[u8; 4] = b"NLK1";
 /// Entropia extra da DPAPI: outro programa do mesmo utilizador que chame
 /// `CryptUnprotectData` sobre o ficheiro sem ela nao o abre.
-const LIVE_KEY_ENTROPY: &[u8] = b"NeuralIA/gemini-live/v1";
+pub(crate) const LIVE_KEY_ENTROPY: &[u8] = b"NeuralIA/gemini-live/v1";
 
-/// A chave guardada em disco, cifrada com a DPAPI do utilizador atual.
+/// A chave guardada em disco, cifrada com a DPAPI do utilizador atual (o
+/// `SecretFile` de `secrets.rs`, com o cabecalho e a entropia do Live).
 pub(crate) struct LiveKeyStore {
-    path: PathBuf,
+    file: SecretFile,
 }
 
 impl LiveKeyStore {
     pub(crate) fn in_dir(data_dir: &Path) -> Self {
+        Self::at(data_dir.join(LIVE_KEY_FILE))
+    }
+
+    /// No caminho que o grant do cofre deu (`stores::LIVE_KEY_STORE`).
+    pub(crate) fn at(path: PathBuf) -> Self {
         Self {
-            path: data_dir.join(LIVE_KEY_FILE),
+            file: SecretFile::new(path, *LIVE_KEY_MAGIC, LIVE_KEY_ENTROPY),
         }
+    }
+
+    pub(crate) fn secret_file(&self) -> &SecretFile {
+        &self.file
     }
 
     /// A chave, ou `None` se nao houver ficheiro ou ele nao abrir -- um
     /// ficheiro estragado vale como "sem chave" (volta-se a pedir), nunca
     /// derruba o app.
     pub(crate) fn load(&self) -> Option<LiveKey> {
-        let bytes = std::fs::read(&self.path).ok()?;
-        let blob = bytes.strip_prefix(LIVE_KEY_MAGIC.as_slice())?;
-        let plain = dpapi_unprotect(blob)?;
-        validate_live_key(std::str::from_utf8(&plain.0).ok()?)
+        let plain = self.file.load()?;
+        validate_live_key(std::str::from_utf8(plain.bytes()).ok()?)
     }
 
     /// Escreve num temporario e troca: um corte a meio deixa a chave antiga
     /// ou a nova, nunca meio ficheiro.
     pub(crate) fn save(&self, key: &LiveKey) -> std::io::Result<()> {
-        let blob = dpapi_protect(key.expose().as_bytes())?;
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let temp = self.path.with_extension("key.tmp");
-        let written = (|| {
-            let mut file = std::fs::File::create(&temp)?;
-            file.write_all(LIVE_KEY_MAGIC)?;
-            file.write_all(&blob)?;
-            file.sync_all()
-        })()
-        .and_then(|()| std::fs::rename(&temp, &self.path));
-        if written.is_err() {
-            let _ = std::fs::remove_file(&temp);
-        }
-        written
+        self.file.save(key.expose().as_bytes())
     }
 
     /// "Trocar chave": apaga o ficheiro. Sem ficheiro ja esta esquecida.
     pub(crate) fn forget(&self) -> std::io::Result<()> {
-        match std::fs::remove_file(&self.path) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-            _ => Ok(()),
-        }
+        self.file.forget()
     }
-}
-
-/// Texto decifrado, apagado da memoria quando sai de cena.
-struct Plain(Vec<u8>);
-
-impl Drop for Plain {
-    fn drop(&mut self) {
-        wipe(&mut self.0);
-    }
-}
-
-fn blob(
-    bytes: &[u8],
-) -> std::io::Result<windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB> {
-    Ok(
-        windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB {
-            cbData: u32::try_from(bytes.len())
-                .map_err(|_| std::io::Error::other("dados demasiado grandes para a DPAPI"))?,
-            // A DPAPI so le a entrada; o `*mut` e a assinatura do Win32.
-            pbData: bytes.as_ptr() as *mut u8,
-        },
-    )
-}
-
-/// Copia a saida da DPAPI (LocalAlloc) e liberta-a, apagando-a antes.
-unsafe fn take_dpapi_output(
-    output: &windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
-) -> Vec<u8> {
-    if output.pbData.is_null() {
-        return Vec::new();
-    }
-    let len = output.cbData as usize;
-    let copy = unsafe { std::slice::from_raw_parts(output.pbData, len) }.to_vec();
-    wipe(unsafe { std::slice::from_raw_parts_mut(output.pbData, len) });
-    unsafe {
-        windows_sys::Win32::Foundation::LocalFree(output.pbData as _);
-    }
-    copy
-}
-
-fn dpapi_protect(plain: &[u8]) -> std::io::Result<Vec<u8>> {
-    use windows_sys::Win32::Security::Cryptography::{
-        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData,
-    };
-    let input = blob(plain)?;
-    let entropy = blob(LIVE_KEY_ENTROPY)?;
-    let mut output = CRYPT_INTEGER_BLOB::default();
-    let ok = unsafe {
-        CryptProtectData(
-            &input,
-            std::ptr::null(),
-            &entropy,
-            std::ptr::null(),
-            std::ptr::null(),
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &mut output,
-        )
-    };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { take_dpapi_output(&output) })
-}
-
-fn dpapi_unprotect(protected: &[u8]) -> Option<Plain> {
-    use windows_sys::Win32::Security::Cryptography::{
-        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
-    };
-    if protected.is_empty() {
-        return None;
-    }
-    let input = blob(protected).ok()?;
-    let entropy = blob(LIVE_KEY_ENTROPY).ok()?;
-    let mut output = CRYPT_INTEGER_BLOB::default();
-    let ok = unsafe {
-        CryptUnprotectData(
-            &input,
-            std::ptr::null_mut(),
-            &entropy,
-            std::ptr::null(),
-            std::ptr::null(),
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &mut output,
-        )
-    };
-    (ok != 0).then(|| Plain(unsafe { take_dpapi_output(&output) }))
 }
 
 /// O que o nativo corre na pagina do painel. Os dados vao como literal JSON.
@@ -576,56 +479,12 @@ impl<W> LivePanel<W> {
     }
 }
 
-/// Rede de seguranca do log de depuracao: nenhum codigo escreve a chave la,
-/// mas uma linha que a leve (o URL do WebSocket, o script de arranque, a
-/// chave solta) sai com ela trocada por um marcador. Apanha `key=<valor>`,
-/// `"key":"<valor>"` e o formato das chaves da AI Studio (`AIza...`).
-pub(crate) fn redact_debug_secrets(line: &str) -> Cow<'_, str> {
-    const MARK: &str = "[chave omitida]";
-    let bytes = line.as_bytes();
-    let secret_byte =
-        |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'%');
-    let mut out = String::new();
-    let mut copied = 0;
-    let mut index = 0;
-    while index < bytes.len() {
-        let rest = &bytes[index..];
-        let (start, minimum) = if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case(b"key=") {
-            (index + 4, 8)
-        } else if rest.starts_with(b"\"key\":\"") {
-            (index + 7, 8)
-        } else if rest.starts_with(b"AIza") {
-            (index, 20)
-        } else {
-            index += 1;
-            continue;
-        };
-        let end = start
-            + bytes[start..]
-                .iter()
-                .take_while(|byte| secret_byte(**byte))
-                .count();
-        if end - start >= minimum {
-            // Os limites caem sempre em bytes ASCII: fronteiras de char.
-            out.push_str(&line[copied..start]);
-            out.push_str(MARK);
-            copied = end;
-            index = end;
-        } else {
-            index += 1;
-        }
-    }
-    if copied == 0 {
-        Cow::Borrowed(line)
-    } else {
-        out.push_str(&line[copied..]);
-        Cow::Owned(out)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::{
+        blob, dpapi_protect, dpapi_unprotect, redact_debug_secrets, take_dpapi_output,
+    };
     use serde_json::{Value, json};
     use std::process::{Command, Stdio};
 
@@ -771,7 +630,7 @@ return calls;
 
         // Um blob que abre mas nao tem forma de chave tambem vale "sem chave".
         let mut not_a_key = LIVE_KEY_MAGIC.to_vec();
-        not_a_key.extend(dpapi_protect(b"tem espacos e <html>").expect("cifrar"));
+        not_a_key.extend(dpapi_protect(b"tem espacos e <html>", LIVE_KEY_ENTROPY).expect("cifrar"));
         std::fs::write(&path, &not_a_key).expect("escrever");
         assert!(store.load().is_none());
 
@@ -790,7 +649,7 @@ return calls;
         use windows_sys::Win32::Security::Cryptography::{
             CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
         };
-        let protected = dpapi_protect(TEST_KEY.as_bytes()).expect("cifrar");
+        let protected = dpapi_protect(TEST_KEY.as_bytes(), LIVE_KEY_ENTROPY).expect("cifrar");
         let input = blob(&protected).expect("blob");
         let mut output = CRYPT_INTEGER_BLOB::default();
         let ok = unsafe {
@@ -809,7 +668,7 @@ return calls;
         }
         assert_eq!(ok, 0, "sem a entropia a DPAPI nao pode devolver a chave");
         assert_eq!(
-            dpapi_unprotect(&protected).map(|plain| plain.0.clone()),
+            dpapi_unprotect(&protected, LIVE_KEY_ENTROPY).map(|plain| plain.bytes().to_vec()),
             Some(TEST_KEY.as_bytes().to_vec())
         );
     }

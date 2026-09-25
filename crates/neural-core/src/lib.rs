@@ -10,6 +10,7 @@ pub mod error;
 pub mod file_risk;
 pub mod history;
 pub mod intent;
+pub mod json_store;
 pub mod library;
 pub mod local_intelligence;
 pub mod memory;

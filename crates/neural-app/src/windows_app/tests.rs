@@ -19766,3 +19766,507 @@ console.log(JSON.stringify({{ calls, quiet: quiet === undefined }}));
         );
     }
 }
+
+// ===================== infra-settings-keys: lojas, chaves, pedido de chave =====================
+
+/// O codigo de um ficheiro-fonte sem o seu `mod tests` (LF).
+fn code_without_tests(source: &str) -> String {
+    let source = source.replace("\r\n", "\n");
+    source
+        .split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// O mesmo codigo sem as linhas de comentario: os gates de ausencia olham
+/// para o que compila, nao para a doc que o explica.
+fn without_comment_lines(code: &str) -> String {
+    code.lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Os ficheiros de `src/` fora de `windows_app/` que embarcam e podem tocar
+/// na pasta de dados.
+fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "tab_session.rs",
+            code_without_tests(include_str!("../tab_session.rs")),
+        ),
+        (
+            "gemini_live.rs",
+            code_without_tests(include_str!("../gemini_live.rs")),
+        ),
+        (
+            "secrets.rs",
+            code_without_tests(include_str!("../secrets.rs")),
+        ),
+        (
+            "stores.rs",
+            code_without_tests(include_str!("../stores.rs")),
+        ),
+        (
+            "epub_app.rs",
+            code_without_tests(include_str!("../epub_app.rs")),
+        ),
+        (
+            "pomodoro_ui.rs",
+            code_without_tests(include_str!("../pomodoro_ui.rs")),
+        ),
+        (
+            "panel_chrome.rs",
+            code_without_tests(include_str!("../panel_chrome.rs")),
+        ),
+    ]
+}
+
+/// A tabela das lojas que o produto tem hoje, com o tipo de cada uma. Mudar
+/// um tipo aqui e uma decisao (a regra do tipo esta em
+/// `neural_core::json_store`), nao um acidente; e uma loja nova no codigo que
+/// embarca sem linha em `stores::APP_STORES` fica vermelha.
+#[test]
+fn existing_stores_have_a_declared_kind() {
+    use crate::stores::{APP_STORES, KEYS_STORE, LIVE_KEY_STORE};
+    use neural_core::json_store::StoreKind::{Automatic, Explicit, Setting};
+    use neural_core::json_store::StoreShape::{Dir, File};
+    let mut expected = vec![
+        ("history.jsonl", Automatic, File),
+        ("memory", Automatic, Dir),
+        ("tabs.json", Automatic, File),
+        ("tabs.lock", Automatic, File),
+        ("tabs.cleared", Automatic, File),
+        ("panel-width.json", Automatic, File),
+        ("agent", Automatic, Dir),
+        ("WebView2", Automatic, Dir),
+        ("theme", Setting, File),
+        ("gmail", Setting, File),
+        ("pomodoro", Setting, File),
+        ("zettel", Explicit, Dir),
+        ("library", Explicit, Dir),
+        ("research-exports", Explicit, Dir),
+        ("gemini-live.key", Explicit, File),
+        ("keys", Explicit, Dir),
+    ];
+    expected.sort_by_key(|row| row.0);
+    let mut table: Vec<_> = APP_STORES
+        .iter()
+        .map(|spec| (spec.name, spec.kind, spec.shape))
+        .collect();
+    table.sort_by_key(|row| row.0);
+    assert_eq!(table, expected, "a tabela das lojas mudou");
+
+    // Tudo o que o codigo que embarca junta a `data_dir` esta na tabela, e
+    // tudo o que o registo concede tambem.
+    let mut code = shipped_source();
+    for (_, source) in shipped_top_level_sources() {
+        code.push('\n');
+        code.push_str(&source);
+    }
+    let compact: String = without_comment_lines(&code).split_whitespace().collect();
+    let named = [
+        ("PANEL_WIDTHS_FILE", PANEL_WIDTHS_FILE),
+        ("FILE_NAME", tab_session::FILE_NAME),
+        ("LOCK_NAME", tab_session::LOCK_NAME),
+        ("CLEARED_NAME", tab_session::CLEARED_NAME),
+        ("LIVE_KEY_FILE", crate::gemini_live::LIVE_KEY_FILE),
+    ];
+    let mut touched = std::collections::BTreeSet::new();
+    for part in compact.split("data_dir.join(").skip(1) {
+        let argument = part.split(')').next().unwrap_or_default();
+        let name = match argument.strip_prefix('"') {
+            Some(literal) => literal.split('"').next().unwrap_or_default(),
+            None => named
+                .iter()
+                .find(|(ident, _)| argument.trim_start_matches('&') == *ident)
+                .map(|(_, value)| *value)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "data_dir.join({argument}): nome desconhecido; declare a loja em stores::APP_STORES"
+                    )
+                }),
+        };
+        touched.insert(name);
+    }
+    let specs = [
+        ("KEYS_STORE", KEYS_STORE.name),
+        ("LIVE_KEY_STORE", LIVE_KEY_STORE.name),
+    ];
+    for part in compact.split(".grant(").skip(1) {
+        let argument = part.split(')').next().unwrap_or_default();
+        let name = specs
+            .iter()
+            .find(|(ident, _)| argument == *ident)
+            .map(|(_, value)| *value)
+            .unwrap_or_else(|| {
+                panic!("grant({argument}): spec desconhecida no codigo que embarca")
+            });
+        touched.insert(name);
+    }
+    for name in &touched {
+        assert!(
+            APP_STORES.iter().any(|spec| spec.name == *name),
+            "{name} e escrita pelo produto mas nao tem tipo em stores::APP_STORES"
+        );
+    }
+    for spec in APP_STORES {
+        assert!(
+            touched.contains(spec.name),
+            "{} esta na tabela mas nenhum codigo a usa",
+            spec.name
+        );
+    }
+}
+
+/// A unica cunhagem do registo das lojas no produto e a do `App::new`.
+#[test]
+fn the_store_registry_is_minted_once_in_app_new() {
+    let source = shipped_source();
+    assert_eq!(
+        source.matches("StoreRegistry::mint(").count(),
+        1,
+        "o produto cunha o registo uma vez so"
+    );
+    let app_new = source
+        .split("impl App {\n    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("App::new");
+    assert!(app_new.contains("let stores = StoreRegistry::mint(&config.data_dir).ok();"));
+    for (name, source) in shipped_top_level_sources() {
+        assert!(
+            !source.contains("StoreRegistry::mint("),
+            "{name} cunha o registo"
+        );
+    }
+}
+
+/// As chaves sao credenciais: o Ctrl+Shift+Delete nunca as apaga. Nenhum
+/// alvo da tabela e de chaves, e o modulo do "Apagar historico" nem conhece
+/// o cofre.
+#[test]
+fn keys_survive_clear_history() {
+    for target in CLEAR_HISTORY_TARGETS {
+        assert!(!format!("{target:?}").contains("Key"), "{target:?}");
+    }
+    let clear = code_without_tests(include_str!("clear_history.rs"));
+    for forbidden in [
+        "KeyVault",
+        "LiveKeyStore",
+        "KeySlot",
+        "KEYS_STORE",
+        "LIVE_KEY_STORE",
+        "gemini-live.key",
+        "secrets::",
+        "keys_event",
+    ] {
+        assert!(
+            !clear.contains(forbidden),
+            "o Apagar historico chega a {forbidden}"
+        );
+    }
+}
+
+/// Os nomes de funcao e a lista de parametros de cada `fn` de um codigo.
+fn fn_signatures(code: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (at, _) in code.match_indices("fn ") {
+        if at > 0 && !code.as_bytes()[at - 1].is_ascii_whitespace() {
+            continue;
+        }
+        let rest = &code[at + 3..];
+        let name: String = rest
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect();
+        if name.is_empty() {
+            continue;
+        }
+        let Some(open) = rest.find('(') else {
+            continue;
+        };
+        let mut depth = 0usize;
+        let mut close = None;
+        for (index, ch) in rest[open..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(close) = close {
+            out.push((name, rest[open + 1..close].to_string()));
+        }
+    }
+    out
+}
+
+/// Uma chave do cofre nunca entra numa WebView: nenhuma funcao que monte o
+/// que vai para uma pagina (scripts, JSON, HTML, o painel) recebe uma
+/// `ApiKey` ou o cofre, e o pedido de chave nao fala com WebView nenhuma
+/// (AGENTS.md §4.3: gate de ausencia). A chave do Live continua a ser a
+/// excecao de sempre, documentada no SECURITY.md: `live_start_script` leva a
+/// `LiveKey` a pagina do Live quando a sessao arranca.
+#[test]
+fn no_panel_payload_builder_takes_a_key() {
+    let mut sources = vec![("windows_app".to_string(), shipped_source())];
+    for (name, source) in shipped_top_level_sources() {
+        sources.push((name.to_string(), source));
+    }
+    let mut builders = 0;
+    for (file, code) in &sources {
+        for (name, params) in fn_signatures(code) {
+            let builder = name.ends_with("_script")
+                || name.ends_with("_json")
+                || name.ends_with("_html")
+                || name.ends_with("_payload")
+                || name.starts_with("panel_")
+                || name.contains("render");
+            if !builder {
+                continue;
+            }
+            builders += 1;
+            for secret in ["ApiKey", "KeyVault", "SecretFile", "Plain", "KeySlot"] {
+                assert!(
+                    !params.contains(secret),
+                    "{file}: {name}({params}) monta o que vai para uma pagina e recebe {secret}"
+                );
+            }
+        }
+    }
+    assert!(
+        builders > 20,
+        "o gate tem de ver os construtores de payload ({builders})"
+    );
+    let prompt = without_comment_lines(&code_without_tests(include_str!("secret_prompt.rs")));
+    let vault = without_comment_lines(&code_without_tests(include_str!("../secrets.rs")));
+    for (file, code) in [("secret_prompt.rs", &prompt), ("secrets.rs", &vault)] {
+        for forbidden in [
+            "WebView",
+            "webview",
+            "evaluate_script",
+            "panel_eval",
+            "panel_run",
+            "live_call",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "{file} fala com uma pagina ({forbidden})"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_secret_prompt_speaks_pt_br_and_only_a_well_shaped_key_leaves_it() {
+    use crate::secrets::{API_KEY_MAX_CHARS, KeySlot};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ES_PASSWORD, WS_EX_TOPMOST};
+    const OPENAI: &str = concat!("sk-", "proj-", "TESTONLY_not_a_real_key_0123456789");
+    const ANTHROPIC: &str = concat!("sk-", "ant-", "api03-TESTONLY-not-a-real-key-0123");
+    assert_eq!(
+        secret_prompt_title(&KeySlot::OpenAi),
+        "Cole a chave da OpenAI (começa por sk-)"
+    );
+    assert_eq!(
+        SECRET_PROMPT_NOTE,
+        "Fica cifrada neste Windows e só serve para o NeuralIA."
+    );
+    assert_eq!(SECRET_PROMPT_SAVE, "Salvar e verificar");
+    assert_eq!(SECRET_PROMPT_CANCEL, "Cancelar");
+    assert_eq!(SECRET_PROMPT_FORGET, "Esquecer chave");
+
+    // O Enter so deixa sair uma chave com a forma do slot, sem espacos.
+    assert!(secret_prompt_submit(&KeySlot::OpenAi, ANTHROPIC).is_none());
+    assert!(secret_prompt_submit(&KeySlot::OpenAi, "").is_none());
+    assert!(secret_prompt_submit(&KeySlot::Anthropic, OPENAI).is_none());
+    let Some(KeyEvent::Entered { slot, key }) =
+        secret_prompt_submit(&KeySlot::OpenAi, &format!("{OPENAI}\r\n"))
+    else {
+        panic!("uma chave da OpenAI tem de sair do pedido");
+    };
+    assert_eq!(slot, KeySlot::OpenAi);
+    assert_eq!(key.expose(), OPENAI);
+    // O evento nunca imprime a chave (o `UserEvent` deriva Debug).
+    let printed = format!("{:?}", UserEvent::Keys(KeyEvent::Entered { slot, key }));
+    assert!(!printed.contains(&OPENAI[3..20]), "{printed}");
+
+    // Uma colagem longa demais chega inteira a validacao e e recusada: o
+    // EDIT nao a corta ao tecto de uma chave valida (o tecto do EDIT e
+    // maior: `const` em `secret_prompt.rs`).
+    let long = format!("sk-{}", "a".repeat(API_KEY_MAX_CHARS));
+    assert!(secret_prompt_submit(&KeySlot::OpenAi, &long).is_none());
+
+    // Ativavel (recebe teclado), nunca TOPMOST, e o EDIT e de palavra-passe.
+    assert_eq!(
+        SECRET_PROMPT_EX_STYLE & (WS_EX_NOACTIVATE | WS_EX_TOPMOST),
+        0
+    );
+    assert_ne!(SECRET_PROMPT_EDIT_STYLE & ES_PASSWORD as u32, 0);
+}
+
+/// O pedido de chave como o produto o cria (`create_secret_prompt`,
+/// `show_secret_prompt`, `destroy_secret_prompt`), numa janela dona real:
+/// owned, ativavel e sem TOPMOST, fica com o teclado, o EDIT e de
+/// palavra-passe, o Enter so manda uma chave com a forma do slot e limpa o
+/// EDIT, Esc e os botoes mandam os seus eventos, e o EDIT esta vazio quando
+/// o popup e destruido. Muda o foco: corre so no CI (passo "Focus-affecting
+/// window gates" do ci.yml), nunca na suite local.
+#[test]
+#[ignore = "needs a desktop session: runs in CI"]
+fn the_secret_prompt_takes_typing_sends_the_key_and_clears_the_edit() {
+    use crate::secrets::KeySlot;
+    use std::cell::RefCell;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        BN_CLICKED, ES_PASSWORD, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetDlgItem, GetWindow,
+        GetWindowLongPtrW, IsWindowVisible, SetWindowTextW, WM_COMMAND, WM_DESTROY, WS_EX_TOPMOST,
+        WS_OVERLAPPEDWINDOW,
+    };
+    const OPENAI: &str = concat!("sk-", "proj-", "TESTONLY_not_a_real_key_0123456789");
+    const ANTHROPIC: &str = concat!("sk-", "ant-", "api03-TESTONLY-not-a-real-key-0123");
+    static TEXT_AT_DESTROY: AtomicI32 = AtomicI32::new(-1);
+    unsafe extern "system" fn probe(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _subclass_id: usize,
+        _reference_data: usize,
+    ) -> LRESULT {
+        if message == WM_DESTROY {
+            TEXT_AT_DESTROY.store(GetWindowTextLengthW(hwnd), Ordering::SeqCst);
+        }
+        DefSubclassProc(hwnd, message, wparam, lparam)
+    }
+    let events: Rc<RefCell<Vec<UserEvent>>> = Rc::default();
+    let sink = Rc::clone(&events);
+    let host = Box::new(SecretPromptHost::new(Box::new(move |event| {
+        sink.borrow_mut().push(event)
+    })));
+    host.open_for(KeySlot::OpenAi);
+    let describe = |events: &RefCell<Vec<UserEvent>>| -> Vec<String> {
+        events
+            .borrow()
+            .iter()
+            .map(|event| match event {
+                UserEvent::Keys(KeyEvent::Entered { slot, key }) => {
+                    format!("entered {slot:?} {}", key.expose())
+                }
+                UserEvent::Keys(KeyEvent::Forget(slot)) => format!("forget {slot:?}"),
+                UserEvent::Keys(KeyEvent::Cancelled) => "cancelled".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    };
+    unsafe {
+        let owner = CreateWindowExW(
+            0,
+            windows_sys::w!("STATIC"),
+            windows_sys::w!("NeuralIA dono"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            0,
+            0,
+            640,
+            480,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        assert!(!owner.is_null(), "a janela dona tem de nascer");
+        let prompt = create_secret_prompt(owner, &host, 1.0).expect("o pedido tem de nascer");
+        let (popup, edit) = (prompt.popup, prompt.edit);
+        let ex_style = GetWindowLongPtrW(popup, GWL_EXSTYLE) as u32;
+        let edit_style = GetWindowLongPtrW(edit, GWL_STYLE) as u32;
+        let owned_by = GetWindow(popup, GW_OWNER);
+        show_secret_prompt(owner, &prompt);
+        let visible = IsWindowVisible(popup) != 0;
+        let focused = GetFocus();
+
+        let type_in = |text: &str| {
+            let wide = wide_null(text);
+            SetWindowTextW(edit, wide.as_ptr());
+        };
+        let click = |id: u16| {
+            let button = GetDlgItem(popup, i32::from(id));
+            SendMessageW(
+                popup,
+                WM_COMMAND,
+                ((BN_CLICKED as usize) << 16) | usize::from(id),
+                button as isize,
+            );
+        };
+        // Uma chave da Anthropic no pedido da OpenAI: nada sai, o aviso
+        // aparece e o texto fica para o utilizador corrigir.
+        type_in(ANTHROPIC);
+        SendMessageW(edit, WM_KEYDOWN, VK_RETURN as usize, 0);
+        let after_invalid = (
+            describe(&events),
+            host.is_invalid(),
+            GetWindowTextLengthW(edit),
+        );
+        // A chave certa: sai no evento e o EDIT fica vazio.
+        type_in(OPENAI);
+        SendMessageW(edit, WM_KEYDOWN, VK_RETURN as usize, 0);
+        let after_enter = (host.is_invalid(), GetWindowTextLengthW(edit));
+        SendMessageW(edit, WM_KEYDOWN, VK_ESCAPE as usize, 0);
+        click(SECRET_PROMPT_FORGET_ID);
+        click(SECRET_PROMPT_CANCEL_ID);
+        type_in(OPENAI);
+        click(SECRET_PROMPT_SAVE_ID);
+        let after_save = GetWindowTextLengthW(edit);
+        // Fechar com texto no EDIT: a sonda (instalada por ultimo, corre
+        // primeiro) ve o EDIT no WM_DESTROY.
+        type_in(OPENAI);
+        let probed = SetWindowSubclass(edit, Some(probe), 0x7E57, 0);
+        destroy_secret_prompt(prompt);
+        let text_at_destroy = TEXT_AT_DESTROY.load(Ordering::SeqCst);
+        DestroyWindow(owner);
+
+        assert_eq!(owned_by, owner, "o pedido e owned pela janela principal");
+        assert_eq!(ex_style & WS_EX_TOPMOST, 0, "o pedido nunca e TOPMOST");
+        assert_eq!(ex_style & WS_EX_NOACTIVATE, 0, "o pedido recebe teclado");
+        assert_ne!(
+            edit_style & ES_PASSWORD as u32,
+            0,
+            "o EDIT e de palavra-passe"
+        );
+        assert!(visible, "o pedido fica visivel");
+        assert_eq!(focused, edit, "o teclado vai para o EDIT do pedido");
+        assert_eq!(
+            after_invalid.0,
+            Vec::<String>::new(),
+            "uma chave de outro slot saiu"
+        );
+        assert!(after_invalid.1, "o aviso de forma errada tem de aparecer");
+        assert!(after_invalid.2 > 0, "o texto errado fica para corrigir");
+        assert_eq!(
+            after_enter,
+            (false, 0),
+            "o EDIT fica vazio quando a chave sai"
+        );
+        assert_eq!(after_save, 0, "o Salvar tambem limpa o EDIT");
+        assert_eq!(
+            describe(&events),
+            vec![
+                format!("entered OpenAi {OPENAI}"),
+                "cancelled".to_string(),
+                "forget OpenAi".to_string(),
+                "cancelled".to_string(),
+                format!("entered OpenAi {OPENAI}"),
+            ]
+        );
+        assert_ne!(probed, 0, "a sonda do WM_DESTROY tem de ficar instalada");
+        assert_eq!(
+            text_at_destroy, 0,
+            "o EDIT tinha a chave quando foi destruido"
+        );
+    }
+}

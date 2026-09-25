@@ -50,6 +50,8 @@ const ALL_SOURCES: &str = concat!(
     "\n",
     include_str!("../src/windows_app/search_card.rs"),
     "\n",
+    include_str!("../src/windows_app/secret_prompt.rs"),
+    "\n",
     include_str!("../src/windows_app/app/mod.rs"),
     "\n",
     include_str!("../src/windows_app/app/gmail.rs"),
