@@ -1,4 +1,5 @@
 use super::*;
+use std::ffi::OsString;
 use windows_sys::Win32::Graphics::Gdi::GetDIBits;
 /// O fundo da Home acompanha a marca, nao disputa com ela.
 ///
@@ -2223,7 +2224,8 @@ fn the_live_panel_handlers_are_the_gatekeepers_it_ships_with() {
 /// painel escondido, sem olho e sem Desligar.
 #[test]
 fn leaving_a_web_surface_turns_gemini_live_off() {
-    let source = include_str!("../windows_app.rs");
+    let source_raw = include_str!("../windows_app.rs");
+    let source = source_raw.replace("pub(in crate::windows_app) fn ", "fn ");
     let body = |start: &str, end: &str| {
         source
             .split(start)
@@ -5756,7 +5758,9 @@ fn spec_0108_remote_scripts_use_message_transport_without_capability_urls() {
 
 #[test]
 fn spec_0108_remote_navigation_handlers_reject_neuralia_scheme() {
-    let source = include_str!("../windows_app.rs");
+    let wap = include_str!("../windows_app.rs");
+    let gm = include_str!("../windows_app/app/gmail.rs");
+    let source = format!("{wap}\n{gm}");
     for builder in [
         "fn pdf_webview_builder",
         "fn external_webview_builder",
@@ -11350,9 +11354,10 @@ fn resized_weights_keep_the_total_and_the_minimum() {
 fn owned_popups_are_not_topmost() {
     let wap = include_str!("../windows_app.rs");
     let sc = include_str!("../windows_app/search_card.rs");
-    // show_search_card foi movido para search_card.rs; os outros ainda estao
-    // em windows_app.rs. Concatena os dois para a pesquisa ser uniforme.
-    let source_combined = format!("{wap}\n{sc}");
+    let gm = include_str!("../windows_app/app/gmail.rs");
+    // show_search_card foi movido para search_card.rs e show_gmail_toast para gmail.rs;
+    // concatena para a pesquisa ser uniforme.
+    let source_combined = format!("{wap}\n{sc}\n{gm}");
     let body = |source: &str, from: &str, to: &str| {
         source
             .split(from)
@@ -11367,7 +11372,7 @@ fn owned_popups_are_not_topmost() {
         ("fn sync_exit_button", "fn position_exit_button"),
         ("fn sync_comparator_splitters", "fn resize_comparator"),
     ] {
-        let text = body(wap, from, to);
+        let text = body(&source_combined, from, to);
         assert!(
             text.contains("CreateWindowExW"),
             "{from} devia criar a janela"

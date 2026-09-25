@@ -4,7 +4,6 @@ use std::{
     borrow::Cow,
     cell::Cell,
     collections::BinaryHeap,
-    ffi::OsString,
     path::PathBuf,
     rc::Rc,
     sync::{
@@ -116,7 +115,7 @@ enum PageTarget {
 }
 
 #[derive(Debug)]
-enum UserEvent {
+pub(in crate::windows_app) enum UserEvent {
     /// Escolha de tema feita no menu do botao Home.
     ThemeChosen(ThemeChoice),
     /// Pedido da pagina local do painel lateral (canal proprio), com o
@@ -374,9 +373,6 @@ const AUTO_SCROLL_PROMPT_SECONDS: u64 = 20;
 /// set_decorations(false). Fazemos dois relayouts baratos para nao deixar
 /// WebViews presos na geometria anterior ate o primeiro movimento do rato.
 const COMPARATOR_INITIAL_RELAYOUT_DELAYS_MS: [u64; 2] = [40, 220];
-/// Quanto tempo o aviso de correio novo fica no canto.
-/// Com a pergunta "Abrir?" o aviso fica mais tempo a vista.
-const GMAIL_TOAST_SECONDS: u64 = 12;
 /// Quantas entradas do historico a caixa "history:" mostra.
 const HISTORY_RECENT_LIMIT: usize = 20;
 /// Tecto, em chars, de cada campo que o monitor do Gmail nos envia. O script
@@ -384,7 +380,6 @@ const HISTORY_RECENT_LIMIT: usize = 20;
 /// pode confiar nesse corte e repete-o antes de guardar ou pintar.
 const GMAIL_FIELD_MAX_CHARS: usize = 180;
 
-const GMAIL_TOAST_SUBCLASS_ID: usize = 0x4E4D;
 const PALETTE_SUBCLASS_ID: usize = 0x4E4E;
 const PALETTE_EDIT_SUBCLASS_ID: usize = 0x4E4F;
 /// Palette nativa, em pixeis logicos: nunca mais larga que isto nem que a
@@ -405,8 +400,6 @@ const POMODORO_NOTICE_SECONDS: u64 = 3;
 const POMODORO_PHASE_END_SECONDS: u64 = 8;
 /// A ajuda do `tema:` com uma palavra desconhecida (omnibox e palette).
 const THEME_COMMAND_HELP: &str = "Use tema:sistema, tema:claro ou tema:escuro.";
-const GMAIL_TOAST_WIDTH: f64 = 390.0;
-const GMAIL_TOAST_HEIGHT: f64 = 68.0;
 const SEARCH_CARD_SUBCLASS_ID: usize = 0x4E71;
 /// Cartao de confirmacao da barra de selecao ("Mandar para as 3 IAs?",
 /// "Traduzir nas 3 IAs?"), em pixeis logicos, centrado na janela. A caixa do
@@ -423,7 +416,6 @@ const SEARCH_CARD_ARM: Duration = Duration::from_millis(600);
 /// uma linha em branco e o texto que o cartao pintou.
 const TRANSLATE_PROMPT: &str = "Traduza para o português do Brasil (se o texto já estiver em português, traduza para o inglês):";
 
-static GMAIL_TOAST_TEXT: Mutex<String> = Mutex::new(String::new());
 /// O cartao a mostrar: (token, o botao da barra que o pediu -- que da o
 /// titulo e o botao de confirmar --, a pergunta ja limpa por
 /// `selection_question`).
@@ -890,116 +882,6 @@ fn palette_hint(source_name: &str, private: bool) -> String {
     }
 }
 
-unsafe extern "system" fn gmail_toast_subclass(
-    hwnd: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    _subclass_id: usize,
-    reference_data: usize,
-) -> LRESULT {
-    // A pergunta recebe cliques: um STATIC devolve HTTRANSPARENT.
-    if message == WM_NCHITTEST {
-        return HTCLIENT as LRESULT;
-    }
-    if message == WM_LBUTTONUP && reference_data != 0 {
-        let mut client = RECT::default();
-        if GetClientRect(hwnd, &mut client) != 0 {
-            let scale = ((client.bottom - client.top) as f64 / GMAIL_TOAST_HEIGHT).max(1.0);
-            let (open, no) = gmail_toast_buttons(&client, scale);
-            let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
-            let y = ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32;
-            let inside =
-                |rect: &RECT| x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
-            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
-            if inside(&open) {
-                let _ = proxy.send_event(UserEvent::GmailAnswer(true));
-            } else if inside(&no) {
-                let _ = proxy.send_event(UserEvent::GmailAnswer(false));
-            }
-        }
-        return 0;
-    }
-    if message == WM_PAINT {
-        let mut paint = PAINTSTRUCT::default();
-        let hdc = BeginPaint(hwnd, &mut paint);
-        if !hdc.is_null() {
-            let mut client = RECT::default();
-            if GetClientRect(hwnd, &mut client) != 0 {
-                let theme = Theme::system();
-                let background = CreateSolidBrush(rgb3(theme.surface));
-                FillRect(hdc, &client, background);
-                DeleteObject(background as _);
-
-                let scale = ((client.bottom - client.top) as f64 / GMAIL_TOAST_HEIGHT).max(1.0);
-                let title_font = create_font((-13.0 * scale) as i32, FW_BOLD as i32);
-                let body_font = create_font((-12.0 * scale) as i32, FW_NORMAL as i32);
-                let (open_button, no_button) = gmail_toast_buttons(&client, scale);
-                let buttons_left = open_button.left - (8.0 * scale) as i32;
-                let old_font = SelectObject(hdc, title_font as _);
-                SetBkMode(hdc, TRANSPARENT as i32);
-
-                SetTextColor(hdc, rgb3(theme.accent));
-                let mut title = RECT {
-                    left: (16.0 * scale) as i32,
-                    top: (7.0 * scale) as i32,
-                    right: buttons_left,
-                    bottom: (28.0 * scale) as i32,
-                };
-                draw_text(
-                    hdc,
-                    "Gmail · novo e-mail — abrir?",
-                    &mut title,
-                    DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-                );
-
-                SelectObject(hdc, body_font as _);
-                SetTextColor(hdc, rgb3(theme.fg));
-                let text = GMAIL_TOAST_TEXT
-                    .lock()
-                    .map(|value| value.clone())
-                    .unwrap_or_default();
-                let mut body = RECT {
-                    left: (16.0 * scale) as i32,
-                    top: (28.0 * scale) as i32,
-                    right: buttons_left,
-                    bottom: client.bottom - (7.0 * scale) as i32,
-                };
-                draw_text(
-                    hdc,
-                    &text,
-                    &mut body,
-                    DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
-                );
-
-                for (rect, label, primary) in
-                    [(open_button, "Abrir", true), (no_button, "Não", false)]
-                {
-                    let pill = UiRect {
-                        x: rect.left as f64,
-                        y: rect.top as f64,
-                        width: (rect.right - rect.left) as f64,
-                        height: (rect.bottom - rect.top) as f64,
-                    };
-                    let style = if primary {
-                        PillStyle::new(theme.accent, theme.accent, on_color(theme.accent))
-                    } else {
-                        PillStyle::new(theme.surface_line, theme.surface_line, theme.fg)
-                    };
-                    draw_pill(hdc, pill, label, style, scale, body_font, theme.surface);
-                }
-
-                SelectObject(hdc, old_font);
-                DeleteObject(title_font as _);
-                DeleteObject(body_font as _);
-            }
-            EndPaint(hwnd, &paint);
-        }
-        return 0;
-    }
-    DefSubclassProc(hwnd, message, wparam, lparam)
-}
-
 /// O cartao "Mandar para as 3 IAs?" / "Traduzir nas 3 IAs?". Nativo e owned
 /// pela janela principal: a pagina que escolheu o texto nao o tapa, nao o
 /// move, nao o pinta e nao lhe manda cliques. Nao se ativa (como o aviso do Gmail): o foco fica onde
@@ -1186,8 +1068,8 @@ unsafe fn paint_search_card(
 // Popups auxiliares owned pela janela principal -- divisores do comparador,
 // botao de saida, splash e aviso do Gmail. Nascem invisiveis: WS_VISIBLE no
 // CreateWindowExW mostra-os com SW_SHOW, que os ativa.
-const AUX_POPUP_EX_STYLE: u32 = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
-const AUX_POPUP_STYLE: u32 = WS_POPUP;
+pub(in crate::windows_app) const AUX_POPUP_EX_STYLE: u32 = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+pub(in crate::windows_app) const AUX_POPUP_STYLE: u32 = WS_POPUP;
 
 // Dicas. A barra e os botoes nativos sao desenhados a mao, por isso o Windows
 // nao tem texto nenhum para mostrar sozinho. A dica e uma MENSAGEM no centro da
@@ -3477,11 +3359,11 @@ impl MemoryWorker {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct UiRect {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
+pub(in crate::windows_app) struct UiRect {
+    pub(in crate::windows_app) x: f64,
+    pub(in crate::windows_app) y: f64,
+    pub(in crate::windows_app) width: f64,
+    pub(in crate::windows_app) height: f64,
 }
 
 impl UiRect {
@@ -3605,141 +3487,141 @@ struct BrowserAgentState {
     trace: Vec<String>,
 }
 
-struct App {
-    proxy: EventLoopProxy<UserEvent>,
-    window: Option<Window>,
-    webview: Option<WebView>,
-    comparator: Option<ComparatorState>,
-    omnibox: Option<HWND>,
-    bar_hover: Option<BarHit>,
+pub(in crate::windows_app) struct App {
+    pub(in crate::windows_app) proxy: EventLoopProxy<UserEvent>,
+    pub(in crate::windows_app) window: Option<Window>,
+    pub(in crate::windows_app) webview: Option<WebView>,
+    pub(in crate::windows_app) comparator: Option<ComparatorState>,
+    pub(in crate::windows_app) omnibox: Option<HWND>,
+    pub(in crate::windows_app) bar_hover: Option<BarHit>,
     /// Botao esquerdo em baixo sobre uma aba, o x dela ou a pilula de um
     /// grupo: o que acontece so se decide ao largar (ou ao arrastar).
-    tab_press: Option<TabPress>,
+    pub(in crate::windows_app) tab_press: Option<TabPress>,
     /// Numero do ultimo gesto na fila de abas; o proximo e este mais um.
-    tab_gesture_count: u64,
+    pub(in crate::windows_app) tab_gesture_count: u64,
     /// Ctrl/Shift/Alt no teclado da janela principal (a barra com o foco).
-    modifiers: winit::keyboard::ModifiersState,
+    pub(in crate::windows_app) modifiers: winit::keyboard::ModifiersState,
     /// O rato esta em cima do "Ir" da Home: pinta-se em degradê.
-    home_go_hover: bool,
-    exit_button: Option<HWND>,
-    home_button: Option<HWND>,
-    caption_buttons: Option<HWND>,
+    pub(in crate::windows_app) home_go_hover: bool,
+    pub(in crate::windows_app) exit_button: Option<HWND>,
+    pub(in crate::windows_app) home_button: Option<HWND>,
+    pub(in crate::windows_app) caption_buttons: Option<HWND>,
     /// Na Home os botoes da janela so se veem com o rato perto deles.
-    caption_reveal: CaptionReveal,
-    splitters: [Option<HWND>; COMPARATOR_COLUMNS - 1],
+    pub(in crate::windows_app) caption_reveal: CaptionReveal,
+    pub(in crate::windows_app) splitters: [Option<HWND>; COMPARATOR_COLUMNS - 1],
     /// Partilhado com o menu do botao direito de cada coluna: o WebView2 monta
     /// esse menu num callback fora do `&mut App`, e o rotulo tem de dizer o
     /// estado de AGORA, mudado pelo Ctrl+R, pela pergunta ou pelo proprio menu.
-    auto_scroll: SharedFlag,
-    auto_scroll_answered: bool,
-    auto_scroll_token: u64,
-    zoom: f64,
+    pub(in crate::windows_app) auto_scroll: SharedFlag,
+    pub(in crate::windows_app) auto_scroll_answered: bool,
+    pub(in crate::windows_app) auto_scroll_token: u64,
+    pub(in crate::windows_app) zoom: f64,
     /// O visualizador de PDF nao aceita script do host: rola-se por tecla.
-    reading_pdf: bool,
-    splash: Option<HWND>,
-    splash_board: SplashBoard,
-    gmail_toast: Option<HWND>,
-    gmail_toast_token: u64,
+    pub(in crate::windows_app) reading_pdf: bool,
+    pub(in crate::windows_app) splash: Option<HWND>,
+    pub(in crate::windows_app) splash_board: SplashBoard,
+    pub(in crate::windows_app) gmail_toast: Option<HWND>,
+    pub(in crate::windows_app) gmail_toast_token: u64,
     /// O pedido da barra (Mandar para IA, Traduzir) a espera do clique no
     /// cartao nativo.
-    search_card: SearchCard,
+    pub(in crate::windows_app) search_card: SearchCard,
     /// Os "Salvar nota" gravados ha menos de 2 s: o mesmo texto nao e outra
     /// nota.
-    bar_notes: BarNoteGuard,
+    pub(in crate::windows_app) bar_notes: BarNoteGuard,
     /// O mesmo para o Ctrl+Shift+Z (a tecla presa repete o keydown).
-    shortcut_notes: BarNoteGuard,
-    search_card_popup: Option<HWND>,
-    search_card_sink: Box<SearchCardSink>,
-    gmail_monitor: Option<WebView>,
-    gmail_probe_token: u64,
-    gmail_last_unread: Option<u32>,
-    gmail_last_key: Option<String>,
+    pub(in crate::windows_app) shortcut_notes: BarNoteGuard,
+    pub(in crate::windows_app) search_card_popup: Option<HWND>,
+    pub(in crate::windows_app) search_card_sink: Box<SearchCardSink>,
+    pub(in crate::windows_app) gmail_monitor: Option<WebView>,
+    pub(in crate::windows_app) gmail_probe_token: u64,
+    pub(in crate::windows_app) gmail_last_unread: Option<u32>,
+    pub(in crate::windows_app) gmail_last_key: Option<String>,
     /// O Win32 nao apaga o fundo por nos e uma janela filha destruida deixa os
     /// ultimos pixeis onde estava. Sem isto viam-se barras e texto fantasma.
-    needs_clear: bool,
-    omnibox_font: Option<*mut core::ffi::c_void>,
-    omnibox_font_height: i32,
-    omnibox_proxy: Box<EventLoopProxy<UserEvent>>,
+    pub(in crate::windows_app) needs_clear: bool,
+    pub(in crate::windows_app) omnibox_font: Option<*mut core::ffi::c_void>,
+    pub(in crate::windows_app) omnibox_font_height: i32,
+    pub(in crate::windows_app) omnibox_proxy: Box<EventLoopProxy<UserEvent>>,
     /// Popup nativo da palette (Ctrl+K/T ou +), so enquanto esta aberta.
-    palette: Option<PaletteWindow>,
+    pub(in crate::windows_app) palette: Option<PaletteWindow>,
     /// Estado nativo lido pela subclasse do EDIT da palette.
-    palette_host: Box<PaletteHost>,
-    config: CoreConfig,
-    history: HistoryWriter,
-    memory: MemoryWorker,
+    pub(in crate::windows_app) palette_host: Box<PaletteHost>,
+    pub(in crate::windows_app) config: CoreConfig,
+    pub(in crate::windows_app) history: HistoryWriter,
+    pub(in crate::windows_app) memory: MemoryWorker,
     /// Todos os prazos da interface (avisos, sondas, rolagem, barra) passam
     /// por aqui: uma thread para a aplicacao inteira.
-    timers: Timers,
-    current_research: Option<ResearchSession>,
-    active_agent: Option<BrowserAgentState>,
-    reader: ReaderWorker,
+    pub(in crate::windows_app) timers: Timers,
+    pub(in crate::windows_app) current_research: Option<ResearchSession>,
+    pub(in crate::windows_app) active_agent: Option<BrowserAgentState>,
+    pub(in crate::windows_app) reader: ReaderWorker,
     /// Worker unico para documentos binarios. Um pedido novo substitui o
     /// pendente, evitando uma thread/socket de 90 s por clique em PDF.
-    document: DocumentWorker,
+    pub(in crate::windows_app) document: DocumentWorker,
     /// Os bytes do PDF aberto, servidos ao visualizador pela origem propria.
-    pdf_bytes: Arc<Mutex<Vec<u8>>>,
-    surface: Surface,
-    navigation_generation: Arc<AtomicU64>,
-    status: Option<String>,
-    cursor: (f64, f64),
+    pub(in crate::windows_app) pdf_bytes: Arc<Mutex<Vec<u8>>>,
+    pub(in crate::windows_app) surface: Surface,
+    pub(in crate::windows_app) navigation_generation: Arc<AtomicU64>,
+    pub(in crate::windows_app) status: Option<String>,
+    pub(in crate::windows_app) cursor: (f64, f64),
     /// Proximo frame da rede neural nativa da Home. Nao existe WebView nem
     /// rede por tras do efeito: e apenas GDI, limitado a ~15 FPS.
-    next_home_frame: Instant,
+    pub(in crate::windows_app) next_home_frame: Instant,
     /// Janela inteiramente tapada por outra (ou minimizada), segundo o
     /// `WindowEvent::Occluded`. Animar nesse estado e gastar bateria a pintar
     /// pixeis que ninguem chega a ver.
-    home_occluded: bool,
+    pub(in crate::windows_app) home_occluded: bool,
     /// Janela com o foco do teclado (`WindowEvent::Focused`). Em segundo plano
     /// a animacao continua, mas devagar.
-    home_focused: bool,
+    pub(in crate::windows_app) home_focused: bool,
     /// Painel lateral do historico inteligente e das notas (Ctrl+H). Sai por
     /// `close_side_panel`, que grava primeiro o que o editor tinha por
     /// salvar e devolve o teclado (`side_panel::SidePanel::dismiss`);
     /// largado de outra forma, o `Drop` dele ainda grava o rascunho.
-    side_panel: side_panel::SidePanel<WebView, ZettelWorker>,
+    pub(in crate::windows_app) side_panel: side_panel::SidePanel<WebView, ZettelWorker>,
     /// A consulta de memoria que alimenta as sugestoes do painel.
-    panel_suggestion_query: Option<String>,
+    pub(in crate::windows_app) panel_suggestion_query: Option<String>,
     /// Servico aberto no painel lateral (WhatsApp, Meet, YouTube, Gmail e o
     /// video da respiracao, este em InPrivate).
-    service_panel: Option<ServicePanel>,
+    pub(in crate::windows_app) service_panel: Option<ServicePanel>,
     /// Numero do ultimo painel de servicos aberto: os avisos do WebView2 de
     /// um painel ja fechado chegam com o numero dele e caem.
-    service_generation: u64,
+    pub(in crate::windows_app) service_generation: u64,
     /// A tela cheia da janela pedida pelo painel de servicos, e se foi ele
     /// que a pos (so entao a devolve ao sair).
-    panel_window_fullscreen: PanelWindowFullscreen,
+    pub(in crate::windows_app) panel_window_fullscreen: PanelWindowFullscreen,
     /// De que coluna e a dica centrada pedida por um controlo injetado (o
     /// "none" atrasado de uma coluna so apaga a dica dela).
-    column_hint: Option<ColumnHintOwner>,
+    pub(in crate::windows_app) column_hint: Option<ColumnHintOwner>,
     /// Larguras escolhidas para os paineis da direita, gravadas em
     /// `<data_dir>/panel-width.json`.
-    panel_widths: PanelWidths,
+    pub(in crate::windows_app) panel_widths: PanelWidths,
     /// A pega de arrastar a borda esquerda do painel aberto.
-    panel_handle: Option<HWND>,
+    pub(in crate::windows_app) panel_handle: Option<HWND>,
     /// Gravacao das abas e grupos do comparador em `tabs.json`. Aberta no
     /// arranque: a primeira janela do NeuralIA fica com o `tabs.lock`.
-    tab_session: TabPersistence,
+    pub(in crate::windows_app) tab_session: TabPersistence,
     /// Ferramentas: o botao da Home sob o rato (a barra usa `bar_hover`).
-    home_tool_hover: Option<Tool>,
+    pub(in crate::windows_app) home_tool_hover: Option<Tool>,
     /// Notas (Zettelkasten) em `<data_dir>/zettel`, lidas e gravadas fora do
     /// event loop.
-    notes: ZettelWorker,
+    pub(in crate::windows_app) notes: ZettelWorker,
     /// O endereco verdadeiro da pagina da WebView unica quando o dela nao o
     /// e: o artigo do Leitor (o HTML e local) e o PDF (o visualizador e
     /// nosso). E a fonte das notas feitas ali.
-    page_source: Option<String>,
+    pub(in crate::windows_app) page_source: Option<String>,
     /// O Pomodoro do botao da barra e da Home, com a cadeia de tiques viva.
     /// As duracoes vivem em `<data_dir>/pomodoro`.
-    pomodoro: PomodoroController,
+    pub(in crate::windows_app) pomodoro: PomodoroController,
     /// Biblioteca de livros (worker) e servidor da origem `neuralia-epub`.
     /// Nascem na primeira vez que se abre um livro e vivem com a app.
-    epub: Option<EpubRuntime>,
+    pub(in crate::windows_app) epub: Option<EpubRuntime>,
     /// Arquivos largados na janela neste lote de eventos. O winit entrega um
     /// `DroppedFile` por arquivo; o lote segue inteiro no `about_to_wait`.
-    pending_drops: Vec<PathBuf>,
+    pub(in crate::windows_app) pending_drops: Vec<PathBuf>,
     /// Painel do Gemini Live, com o estado do olho da barra. Existir e estar
     /// ligado: fecha-lo desliga tudo.
-    live_panel: LivePanel<WebView>,
+    pub(in crate::windows_app) live_panel: LivePanel<WebView>,
 }
 
 impl App {
@@ -3907,7 +3789,7 @@ impl App {
         }
     }
 
-    fn request_redraw(&self) {
+    pub(in crate::windows_app) fn request_redraw(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -4330,7 +4212,7 @@ impl App {
         self.request_redraw();
     }
 
-    fn show_native_error(&mut self, message: impl Into<String>) {
+    pub(in crate::windows_app) fn show_native_error(&mut self, message: impl Into<String>) {
         self.next_generation();
         self.destroy_web_surfaces();
         self.surface = Surface::Home;
@@ -6739,7 +6621,7 @@ impl App {
 
     /// Aviso flutuante, centrado na janela, que se apaga sozinho: a resposta
     /// a um gesto do utilizador (`SplashKind::Notice`).
-    fn show_splash(&mut self, text: String, seconds: u64) {
+    pub(in crate::windows_app) fn show_splash(&mut self, text: String, seconds: u64) {
         if let Some(frame) = self.splash_board.show(text, seconds, SplashKind::Notice) {
             self.present_splash(frame);
         }
@@ -6894,123 +6776,6 @@ impl App {
         }
     }
 
-    fn show_gmail_toast(&mut self, sender: &str, subject: &str) {
-        let Some(window) = &self.window else {
-            return;
-        };
-        let Some(owner) = window_hwnd(window) else {
-            return;
-        };
-        let scale = window.scale_factor().max(1.0);
-        let width = (GMAIL_TOAST_WIDTH * scale).round() as i32;
-        let height = (GMAIL_TOAST_HEIGHT * scale).round() as i32;
-
-        let body = match (sender.trim(), subject.trim()) {
-            ("", "") => "Nova mensagem na sua caixa de entrada".to_string(),
-            ("", subject) => subject.to_string(),
-            (sender, "") => sender.to_string(),
-            (sender, subject) => format!("{sender} · {subject}"),
-        };
-        if let Ok(mut slot) = GMAIL_TOAST_TEXT.lock() {
-            *slot = body;
-        }
-
-        if self.gmail_toast.is_none() {
-            unsafe {
-                // Owned pela janela principal, como o splash: sobe acima do
-                // WebView2 por ser owned, e nao acima do resto do ambiente de
-                // trabalho -- um aviso de email nosso nao tem nada que tapar a
-                // aplicacao de outra pessoa.
-                let created = CreateWindowExW(
-                    AUX_POPUP_EX_STYLE,
-                    windows_sys::w!("STATIC"),
-                    windows_sys::w!(""),
-                    AUX_POPUP_STYLE,
-                    0,
-                    0,
-                    width,
-                    height,
-                    owner,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                );
-                if created.is_null() {
-                    return;
-                }
-                if SetWindowSubclass(
-                    created,
-                    Some(gmail_toast_subclass),
-                    GMAIL_TOAST_SUBCLASS_ID,
-                    (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize,
-                ) == 0
-                {
-                    DestroyWindow(created);
-                    return;
-                }
-                let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 18, 18);
-                if !region.is_null() {
-                    SetWindowRgn(created, region, 1);
-                }
-                self.gmail_toast = Some(created);
-            }
-        }
-
-        self.position_gmail_toast();
-
-        self.gmail_toast_token = self.gmail_toast_token.wrapping_add(1);
-        self.timers.after(
-            Duration::from_secs(GMAIL_TOAST_SECONDS),
-            UserEvent::HideGmailToast(self.gmail_toast_token),
-        );
-    }
-
-    /// Encosta o aviso ao canto inferior direito da janela. Como o splash,
-    /// tem de ser refeito sempre que a janela se mexe.
-    fn position_gmail_toast(&self) {
-        let (Some(window), Some(toast)) = (&self.window, self.gmail_toast) else {
-            return;
-        };
-        let Some(owner) = window_hwnd(window) else {
-            return;
-        };
-        let scale = window.scale_factor().max(1.0);
-        let width = (GMAIL_TOAST_WIDTH * scale).round() as i32;
-        let height = (GMAIL_TOAST_HEIGHT * scale).round() as i32;
-
-        let mut client = RECT::default();
-        unsafe {
-            if GetClientRect(owner, &mut client) == 0 {
-                return;
-            }
-            let mut origin = POINT { x: 0, y: 0 };
-            ClientToScreen(owner, &mut origin);
-            let margin = (18.0 * scale) as i32;
-            SetWindowPos(
-                toast,
-                std::ptr::null_mut(),
-                origin.x + client.right - width - margin,
-                origin.y + client.bottom - height - margin,
-                width,
-                height,
-                SWP_NOACTIVATE,
-            );
-            show_popup_without_activation(toast);
-            InvalidateRect(toast, std::ptr::null(), 1);
-        }
-    }
-
-    fn hide_gmail_toast(&mut self, token: u64) {
-        if token != self.gmail_toast_token {
-            return;
-        }
-        if let Some(toast) = self.gmail_toast.take() {
-            unsafe {
-                DestroyWindow(toast);
-            }
-        }
-    }
-
     /// Centra o cartao de pesquisa na janela. Em coordenadas de ECRA, como o
     /// splash: refaz-se quando a janela se mexe.
     fn position_search_card(&self) {
@@ -7042,126 +6807,6 @@ impl App {
             );
             show_popup_without_activation(card);
             InvalidateRect(card, std::ptr::null(), 1);
-        }
-    }
-
-    fn google_session_available(&self) -> bool {
-        let source = self
-            .comparator
-            .as_ref()
-            .and_then(|comp| comp.views.first().map(|view| &view.webview))
-            .or(self.webview.as_ref());
-        let Some(source) = source else {
-            return false;
-        };
-
-        source
-            .cookies_for_url("https://mail.google.com/")
-            .ok()
-            .is_some_and(|cookies| {
-                cookies.iter().any(|cookie| {
-                    matches!(
-                        cookie.name(),
-                        "SID" | "HSID" | "SSID" | "SAPISID" | "__Secure-1PSID" | "__Secure-3PSID"
-                    )
-                })
-            })
-    }
-
-    fn schedule_gmail_probe(&mut self, seconds: u64) {
-        // Desligado por NEURALIA_NO_GMAIL nem se sonda: a sonda le cookies e
-        // acabaria por criar o WebView que a variavel promete nao existir.
-        if self.gmail_monitor.is_some() || !gmail_monitor_enabled() {
-            return;
-        }
-        self.gmail_probe_token = self.gmail_probe_token.wrapping_add(1);
-        self.timers.after(
-            Duration::from_secs(seconds),
-            UserEvent::GmailProbe(self.gmail_probe_token),
-        );
-    }
-
-    fn maybe_start_gmail_monitor(&mut self) {
-        if self.gmail_monitor.is_some()
-            || !gmail_monitor_enabled()
-            || !self.google_session_available()
-        {
-            return;
-        }
-        let Some(window) = &self.window else {
-            return;
-        };
-
-        let capability = remote_capability();
-        let ipc_capability = capability.clone();
-        let proxy = self.proxy.clone();
-        let init_script = GMAIL_MONITOR_SCRIPT.replace("__NEURALIA_CAP__", &capability);
-        let bounds = wry::Rect {
-            position: LogicalPosition::new(-10_000.0, -10_000.0).into(),
-            size: LogicalSize::new(1.0, 1.0).into(),
-        };
-
-        let result = themed_webview_builder()
-            .with_initialization_script(init_script)
-            .with_ipc_handler(move |request| {
-                let Some(IpcAction::GmailState {
-                    unread,
-                    sender,
-                    subject,
-                    key,
-                }) = parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
-                else {
-                    return;
-                };
-                let _ = proxy.send_event(UserEvent::GmailInboxState {
-                    unread,
-                    sender,
-                    subject,
-                    key,
-                });
-            })
-            .with_navigation_handler(move |target| {
-                if target
-                    .get(..9)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
-                {
-                    return false;
-                }
-                Url::parse(&target).ok().is_some_and(|url| {
-                    url.scheme() == "https"
-                        && matches!(
-                            url.host_str(),
-                            Some("mail.google.com") | Some("accounts.google.com")
-                        )
-                })
-            })
-            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
-            .with_permission_handler(|_| PermissionResponse::Deny)
-            .with_focused(false)
-            .with_bounds(bounds)
-            .with_url("https://mail.google.com/mail/u/0/#inbox")
-            .build_as_child(window);
-
-        if let Ok(webview) = result {
-            self.gmail_monitor = Some(webview);
-        }
-    }
-
-    fn handle_gmail_state(&mut self, unread: u32, sender: String, subject: String, key: String) {
-        // O corte do script nao conta: ele corre em mail.google.com.
-        let sender = gmail_field(sender);
-        let subject = gmail_field(subject);
-        let key = gmail_field(key);
-        let notify = gmail_is_new_mail(
-            self.gmail_last_unread,
-            self.gmail_last_key.as_deref(),
-            unread,
-            &key,
-        );
-        self.gmail_last_unread = Some(unread);
-        self.gmail_last_key = Some(key);
-        if notify {
-            self.show_gmail_toast(&sender, &subject);
         }
     }
 
@@ -8206,7 +7851,7 @@ impl App {
 
     /// Os icones da barra: o servico abre no painel ao lado; de novo, fecha
     /// -- ou, minimizado, volta (`ServicePanelState`).
-    fn open_service_panel(&mut self, service: Service) {
+    pub(in crate::windows_app) fn open_service_panel(&mut self, service: Service) {
         if let Some(panel) = self
             .service_panel
             .as_ref()
@@ -8765,47 +8410,6 @@ impl App {
             LiveAction::Nothing => {}
         }
         self.request_redraw();
-    }
-
-    /// O envelope da barra: liga e desliga os avisos do Gmail, e guarda.
-    fn toggle_gmail_notifications(&mut self) {
-        let on = !GMAIL_NOTIFICATIONS.load(Ordering::Acquire);
-        GMAIL_NOTIFICATIONS.store(on, Ordering::Release);
-        if let Err(error) = save_gmail_setting(&self.config.data_dir.join("gmail"), on) {
-            self.show_native_error(format!("Não foi possível guardar a escolha: {error}"));
-        }
-        if on {
-            self.schedule_gmail_probe(1);
-        } else {
-            // Desligar e mesmo desligar: sem WebView escondida a ler o Gmail.
-            self.gmail_monitor = None;
-            if let Some(toast) = self.gmail_toast {
-                unsafe {
-                    ShowWindow(toast, SW_HIDE);
-                }
-            }
-        }
-        self.show_splash(
-            if on {
-                "Avisos do Gmail ligados.".to_string()
-            } else {
-                "Avisos do Gmail desligados.".to_string()
-            },
-            2,
-        );
-        self.request_redraw();
-    }
-
-    /// Resposta ao "Abrir?" do aviso do Gmail.
-    fn answer_gmail(&mut self, open: bool) {
-        if let Some(toast) = self.gmail_toast {
-            unsafe {
-                ShowWindow(toast, SW_HIDE);
-            }
-        }
-        if open {
-            self.open_service_panel(Service::Gmail);
-        }
     }
 
     /// Largura que o painel aberto ocupa a direita do comparador (0 sem painel).
@@ -14517,7 +14121,7 @@ where
     capability_from_rng(0, secondary)
 }
 
-fn remote_capability() -> String {
+pub(in crate::windows_app) fn remote_capability() -> String {
     let mut bytes = [0u8; 16];
     // SAFETY: buffer valido com o tamanho declarado; sem handle de algoritmo,
     // a flag manda usar o RNG preferido do sistema.
@@ -14677,22 +14281,6 @@ fn home_frame_interval(minimized: bool, occluded: bool, focused: bool) -> Option
     // Em segundo plano a animacao nao para (a janela continua a ser vista),
     // mas 4 FPS chegam para nao parecer congelada.
     Some(Duration::from_millis(if focused { 66 } else { 250 }))
-}
-
-/// `NEURALIA_NO_GMAIL` desliga o monitor do Gmail por completo (SPEC-0005,
-/// SECURITY.md): sem sonda, sem leitura de cookies, sem WebView escondido. O
-/// gate de ciclo de vida define-a porque conta processos e nao distingue a
-/// excepcao intencional de um vazamento.
-fn gmail_monitor_enabled() -> bool {
-    gmail_monitor_enabled_for(std::env::var_os("NEURALIA_NO_GMAIL"))
-        && GMAIL_NOTIFICATIONS.load(Ordering::Acquire)
-}
-
-/// Basta a variavel EXISTIR, como em NEURALIA_REDUCE_MOTION: `=0` ou vazia
-/// tambem desligam. Um interruptor de privacidade que dependesse do valor
-/// deixava passar quem o definiu mal.
-fn gmail_monitor_enabled_for(no_gmail: Option<OsString>) -> bool {
-    no_gmail.is_none()
 }
 
 /// A tela do fundo da Home, com a zona limpa a volta da marca.
@@ -15751,7 +15339,7 @@ fn context_tab_label(value: &str) -> String {
     label
 }
 
-unsafe fn create_font(height: i32, weight: i32) -> *mut core::ffi::c_void {
+pub(in crate::windows_app) unsafe fn create_font(height: i32, weight: i32) -> *mut core::ffi::c_void {
     CreateFontW(
         height,
         0,
@@ -15969,6 +15557,10 @@ mod services;
 use services::*;
 mod search_card;
 use search_card::*;
+
+mod app;
+#[allow(unused_imports)]
+use app::*;
 
 // ===================== desenho com anti-aliasing =====================
 
