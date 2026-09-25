@@ -1208,6 +1208,18 @@ fn panel_messages_delegate_by_prefix_and_keep_caps() {
     );
     assert_eq!(parse_panel_message(r#"{"action":"search"}"#), None);
     assert_eq!(parse_panel_message(r#"{"action":"note-open"}"#), None);
+    // Um `args` presente que nao e objecto (`null`, texto, numero) recusa
+    // ate quem nao pede chave nenhuma: so a AUSENCIA vale como vazio. (Ate
+    // e930dac o `ready` e o `close` ignoravam os args; a pagina que embarca
+    // manda sempre um objecto -- `args || {}` em `core.js`.)
+    for body in [
+        r#"{"action":"ready","args":null}"#,
+        r#"{"action":"close","args":"x"}"#,
+        r#"{"action":"notes-list","args":1}"#,
+        r#"{"action":"search","args":null}"#,
+    ] {
+        assert_eq!(parse_panel_message(body), None, "{body}");
+    }
 
     // O tecto: 4 KiB para tudo, salvo o note-save e o note-draft, que levam
     // o corpo de uma nota e param em NOTE_SAVE_MESSAGE_MAX_BYTES -- o
@@ -1262,6 +1274,60 @@ fn panel_messages_delegate_by_prefix_and_keep_caps() {
         parse_panel_message(&too_big),
         None,
         "acima do tecto absoluto"
+    );
+}
+
+/// Gate (critico: mensagens de uma pagina): um corpo acima do tecto
+/// absoluto volta `None` ANTES de se ler como JSON -- o `serde_json` nunca
+/// ve um corpo desse tamanho. O tecto da secao do `note-save` e o mesmo
+/// numero e corre DEPOIS do JSON, por isso o `None` sozinho nao chega:
+/// sem a verificacao do delegador a secao dava o mesmo `None`. Conta-se a
+/// leitura (`PANEL_JSON_READS`, so nos testes), e conta-se tambem que o
+/// contador esta vivo -- no tecto le-se, um byte acima nao.
+#[test]
+fn panel_bodies_above_the_absolute_cap_are_never_read_as_json() {
+    let reads = || PANEL_JSON_READS.with(|count| count.get());
+    let envelope = |pad: usize| {
+        format!(
+            r#"{{"action":"note-save","args":{{"id":null,"title":"t","body":"b","tags":[]}},"pad":"{}"}}"#,
+            "x".repeat(pad)
+        )
+    };
+    let frame = envelope(0).len();
+
+    // Exactamente no tecto: le-se, e o note-save passa.
+    let at_cap = envelope(PANEL_MESSAGE_ABSOLUTE_MAX_BYTES - frame);
+    assert_eq!(at_cap.len(), PANEL_MESSAGE_ABSOLUTE_MAX_BYTES);
+    let before = reads();
+    assert!(matches!(
+        parse_panel_message(&at_cap),
+        Some(PanelMessage::NoteSave(_))
+    ));
+    assert_eq!(
+        reads(),
+        before + 1,
+        "no tecto le-se o JSON (o contador conta)"
+    );
+
+    // Lixo dentro do tecto: le-se (e morre no JSON), para o contador nao
+    // ser o que passa o teste.
+    let garbage_at_cap = "x".repeat(PANEL_MESSAGE_ABSOLUTE_MAX_BYTES);
+    let before = reads();
+    assert_eq!(parse_panel_message(&garbage_at_cap), None);
+    assert_eq!(reads(), before + 1, "lixo no tecto ainda se le");
+
+    // Um byte a mais: None SEM leitura -- JSON perfeito ou lixo, tanto faz.
+    let over_cap = envelope(PANEL_MESSAGE_ABSOLUTE_MAX_BYTES - frame + 1);
+    assert_eq!(over_cap.len(), PANEL_MESSAGE_ABSOLUTE_MAX_BYTES + 1);
+    let garbage_over_cap = "x".repeat(PANEL_MESSAGE_ABSOLUTE_MAX_BYTES + 1);
+    let before = reads();
+    for body in [&over_cap, &garbage_over_cap] {
+        assert_eq!(parse_panel_message(body), None, "{} bytes", body.len());
+    }
+    assert_eq!(
+        reads(),
+        before,
+        "acima do tecto absoluto o corpo nunca se le como JSON"
     );
 }
 
@@ -5742,15 +5808,14 @@ fn private_palette_paths_never_touch_history_or_context_tabs() {
     assert!(private_split.contains("open_split_mode(source_index, url, false, true, None)"));
 }
 
-/// Ligacao, nao comportamento: o comportamento esta nos gates de
-/// `tab_session_gates`. Isto so prende que os caminhos que embarcam
-/// chamam as funcoes que esses gates provam -- um `TabPersistence::forget`
-/// perfeito que "Apagar historico" deixasse de chamar nao apagava nada.
 /// Gate (critico: apaga dados do utilizador): o percurso do "Apagar
 /// historico" que embarca (`clear_history_targets`, o mesmo que o `App`
 /// corre depois do Sim) chega a CADA alvo registado, pela ordem da tabela,
-/// uma vez so; e a tabela cobre todos os alvos que existem -- esquecer um
-/// (tabs, memoria, livros, historico) fica vermelho aqui.
+/// uma vez so, e a tabela cobre os quatro alvos que existem -- um alvo que
+/// o percurso salte, ou que saia da tabela, fica vermelho aqui. O que o
+/// `App` faz em cada alvo (esquecer a memoria, apagar o historico) NAO se
+/// prova aqui: o braco de cada um esta preso por texto em
+/// `the_shipped_paths_are_wired_to_the_tab_session`.
 #[test]
 fn clear_history_runs_every_registered_target() {
     struct Recorder(Vec<ClearTarget>);
@@ -5787,6 +5852,12 @@ fn clear_history_runs_every_registered_target() {
     assert_eq!(CLEAR_HISTORY_TARGETS.len(), 4);
 }
 
+/// Ligacao, nao comportamento: o comportamento esta nos gates de
+/// `tab_session_gates`. Isto so prende que os caminhos que embarcam
+/// chamam as funcoes que esses gates provam -- um `TabPersistence::forget`
+/// perfeito que "Apagar historico" deixasse de chamar nao apagava nada.
+/// O mesmo para os bracos da memoria e do historico do `ClearHistorySink`
+/// do `App`: presenca por texto, nao comportamento (§4.3).
 #[test]
 fn the_shipped_paths_are_wired_to_the_tab_session() {
     let source = shipped_source();
@@ -5825,6 +5896,14 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
     assert!(
         sink.contains("ClearTarget::Tabs => self.forget_tab_session(),"),
         "\"Apagar histórico\" must also forget tabs.json"
+    );
+    assert!(
+        sink.contains("ClearTarget::Memory => self.memory.clear(&mut self.current_research),"),
+        "\"Apagar histórico\" must also clear the semantic memory"
+    );
+    assert!(
+        sink.contains("ClearTarget::History => match self.history.clear() {"),
+        "\"Apagar histórico\" must also clear history.jsonl"
     );
     // O comportamento destes caminhos esta em
     // the_app_path_saves_restores_and_forgets_the_real_tabs_json (sobre o

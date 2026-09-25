@@ -91,8 +91,21 @@ pub(in crate::windows_app) fn panel_section_of(action: &str) -> Option<&'static 
 pub(in crate::windows_app) const PANEL_MESSAGE_ABSOLUTE_MAX_BYTES: usize =
     NOTE_SAVE_MESSAGE_MAX_BYTES;
 
+#[cfg(test)]
+thread_local! {
+    /// So nos testes: quantas vezes o delegador chegou a ler um corpo como
+    /// JSON. E o que prova o tecto absoluto: o tecto da secao do
+    /// `note-save` e o mesmo numero e corre DEPOIS do JSON, por isso o
+    /// `None` sozinho nao distingue os dois (gate
+    /// `panel_bodies_above_the_absolute_cap_are_never_read_as_json`).
+    pub(in crate::windows_app) static PANEL_JSON_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// `args` e um objecto com EXACTAMENTE estas chaves -- nem uma a mais, nem
-/// uma a menos -- ou nada. Sem `args` so passa quem nao pede chave nenhuma.
+/// uma a menos -- ou nada. Sem `args` so passa quem nao pede chave nenhuma;
+/// um `args` presente que nao e objecto (`null`, texto, numero) recusa
+/// sempre, ate quem nao pede chave nenhuma: so a AUSENCIA vale como vazio.
 /// E a mesma regra do canal IPC (`ipc::exact_keys`) e dos livros: um campo
 /// a mais nunca e ignorado em silencio.
 pub(in crate::windows_app) fn exact_keys<'a>(
@@ -129,6 +142,8 @@ pub(in crate::windows_app) fn parse_panel_message(body: &str) -> Option<PanelMes
     if body.len() > PANEL_MESSAGE_ABSOLUTE_MAX_BYTES {
         return None;
     }
+    #[cfg(test)]
+    PANEL_JSON_READS.with(|reads| reads.set(reads.get() + 1));
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let action = value.get("action")?.as_str()?;
     let section = panel_section_of(action)?;

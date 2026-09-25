@@ -1207,9 +1207,12 @@ pub(in crate::windows_app) struct ClusterSlot {
 /// o hit-testing percorrem esta lista com `RightControls::cluster`, e
 /// `right_controls` da a cada lugar a sua posicao. Uma feature com um icone
 /// no canto (⚖ consenso, ⬇ downloads, escudo) e uma linha aqui, um
-/// `ICON_SLOT_*` em `icons.rs` e o seu lugar em `right_controls` -- sob a
-/// mesma regra dos botoes de coluna: cabe, ou nao existe (gate
-/// `right_cluster_slots_never_overlap_and_hit_back`).
+/// `ICON_SLOT_*` em `icons.rs` e o seu lugar em `right_controls`. O canto
+/// NAO tem a regra "cabe ou nao existe" dos botoes de coluna (registado em
+/// 3211b0c, nao alterado): cada lugar existe sempre, e o gate
+/// `right_cluster_slots_never_overlap_and_hit_back` prova so a ordem, que
+/// os lugares nao se sobrepoem e que cada um volta a si no hit-testing. Um
+/// item que queira a regra aqui acrescenta-a e prende-a num gate.
 pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 6] = [
     ClusterSlot {
         hit: BarHit::GeminiLive,
