@@ -570,23 +570,46 @@ impl Library {
 
     /// Esquece quando cada livro foi aberto (o "Continuar lendo" e a ordem
     /// dos recentes). Posições e marcadores ficam: são do leitor, como no
-    /// Calibre. Devolve quantos livros mudaram.
+    /// Calibre. Devolve quantos livros da biblioteca mudaram.
+    ///
+    /// Sob o lock, vale para todos os livros do índice como está no disco
+    /// (outra janela pode ter acrescentado um que esta ainda não releu) e
+    /// para os registros da lixeira (`.trash/<sha256>.json`): um livro
+    /// removido guarda lá o estado de leitura, e adicioná-lo de novo o
+    /// traria de volta.
     pub fn clear_last_opened(&mut self) -> LibraryResult<usize> {
         let _lock = lock_dir(&self.dir)?;
+        let books = self.reread_index()?;
         let mut changed = 0;
-        for index in 0..self.books.len() {
-            let id = self.books[index].id.clone();
-            let mut state = match read_state(&self.dir, &id)? {
-                Some(state) => state,
-                None => ReadingState::of(&self.books[index]),
+        let mut failure = None;
+        for book in &books {
+            let state = match read_state(&self.dir, &book.id) {
+                Ok(Some(state)) => Some(state),
+                Ok(None) => self.get(&book.id).map(ReadingState::of),
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            };
+            let Some(mut state) = state else {
+                continue;
             };
             if state.last_opened_unix.take().is_none() {
                 continue;
             }
-            write_state(&self.dir, &id, &state)?;
-            state.apply_to(&mut self.books[index]);
+            if let Err(error) = write_state(&self.dir, &book.id, &state) {
+                failure = Some(error);
+                break;
+            }
             changed += 1;
         }
+        // O que já foi gravado vale, mesmo que um livro a meio falhe.
+        self.stamp = index_stamp(&self.dir);
+        self.books = with_states(&self.dir, books);
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        clear_trashed_last_opened(&self.dir)?;
         Ok(changed)
     }
 
@@ -1136,6 +1159,53 @@ fn trashed_state(dir: &Path, sha256: &str, spine_len: usize) -> Option<(PathBuf,
     }
     state.bookmarks.retain(|mark| fits(mark.spine_index));
     Some((path, state))
+}
+
+/// Tira `last_opened_unix` de cada registro da lixeira (`<sha256>.json`),
+/// regravando-o inteiro (temporário + `rename`); o resto do registro fica.
+/// Um registro que `trashed_state` não leria (grande demais, JSON estragado)
+/// nunca é restaurado e fica como está. Devolve quantos mudaram.
+fn clear_trashed_last_opened(dir: &Path) -> LibraryResult<usize> {
+    let trash = dir.join(TRASH_DIR);
+    let entries = match fs::read_dir(&trash) {
+        Ok(entries) => entries,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(0);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut changed = 0;
+    for item in entries {
+        let item = item?;
+        let name = item.file_name().to_string_lossy().into_owned();
+        let Some(sha256) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if sha256.len() != SHA256_HEX_LEN || !is_lower_hex(sha256) {
+            continue;
+        }
+        let path = item.path();
+        let readable =
+            fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_STATE_BYTES);
+        if !readable {
+            continue;
+        }
+        let Ok(mut record) = serde_json::from_slice::<TrashRecord>(&fs::read(&path)?) else {
+            continue;
+        };
+        if record.state.last_opened_unix.take().is_none() {
+            continue;
+        }
+        let json = serde_json::to_vec(&record)?;
+        write_atomically(&trash, &path, &json).map_err(LibraryError::Write)?;
+        changed += 1;
+    }
+    Ok(changed)
 }
 
 /// Livros em `books/<id>.epub` que o índice não conhece (índice estragado,
@@ -2104,6 +2174,78 @@ mod tests {
         assert_eq!(book.last_opened_unix, None);
         assert_eq!(book.position, Some(at(1, 0.5, T0 + 2)));
         assert_eq!(book.bookmarks.len(), 1);
+    }
+
+    /// "Apagar histórico" promete que nos Livros o registro de quando cada
+    /// livro foi aberto desaparece. Um livro removido guarda o estado na
+    /// lixeira, e adicioná-lo de novo o restaurava (auditoria 2.2.0,
+    /// `epubmerge-clear-history-trash`).
+    #[test]
+    fn clearing_the_history_also_forgets_removed_books_in_the_trash() {
+        let temp = TempDir::new("clear-history-trash");
+        let bytes = epub3_sample();
+        let mut library = temp.library();
+        let id = library
+            .add_at(temp.source("a.epub", &bytes), T0)
+            .unwrap()
+            .id;
+        library.set_last_opened(&id, T0 + 1).unwrap();
+        library.set_position(&id, at(2, 0.75, T0 + 2)).unwrap();
+        library.add_bookmark(&id, 1, 0.3, "fica", T0 + 3).unwrap();
+        let removed = library.remove(&id).unwrap();
+        let record = temp
+            .lib_dir()
+            .join(TRASH_DIR)
+            .join(format!("{}.json", removed.sha256));
+        let read_record = || -> serde_json::Value {
+            serde_json::from_slice(&fs::read(&record).unwrap()).unwrap()
+        };
+        assert_eq!(read_record()["state"]["last_opened_unix"], T0 + 1);
+
+        assert_eq!(
+            library.clear_last_opened().unwrap(),
+            0,
+            "nenhum na biblioteca"
+        );
+
+        // Nada no disco guarda quando o livro removido foi aberto...
+        let after = read_record();
+        assert!(after["state"]["last_opened_unix"].is_null(), "{after}");
+        let text = String::from_utf8(fs::read(&record).unwrap()).unwrap();
+        assert!(!text.contains(&(T0 + 1).to_string()), "{text}");
+        // ... e o resto do registro fica.
+        assert_eq!(after["entry"]["sha256"], removed.sha256.as_str());
+        assert_eq!(after["state"]["bookmarks"][0]["label"], "fica");
+
+        // Adicionado de novo, volta com a posição e os marcadores, sem a
+        // última abertura.
+        let back = library
+            .add_at(temp.source("a.epub", &bytes), T0 + 4)
+            .unwrap();
+        assert_eq!(back.last_opened_unix, None);
+        assert_eq!(back.position, Some(at(2, 0.75, T0 + 2)));
+        assert_eq!(back.bookmarks.len(), 1);
+        assert_eq!(temp.library().get(&id).unwrap().last_opened_unix, None);
+    }
+
+    /// Duas janelas na mesma pasta: o "Apagar histórico" de uma vale também
+    /// para o livro que a outra acrescentou e abriu depois de a primeira ter
+    /// lido o índice.
+    #[test]
+    fn clearing_the_history_reaches_books_another_window_added() {
+        let temp = TempDir::new("clear-history-two-windows");
+        let mut first = temp.library();
+        let mut second = temp.library();
+        let two = second
+            .add_at(temp.source("b.epub", &epub2_sample()), T0)
+            .unwrap();
+        second.set_last_opened(&two.id, T0 + 1).unwrap();
+        assert!(first.get(&two.id).is_none(), "a primeira ainda não releu");
+
+        assert_eq!(first.clear_last_opened().unwrap(), 1);
+
+        assert_eq!(first.get(&two.id).unwrap().last_opened_unix, None);
+        assert_eq!(temp.library().get(&two.id).unwrap().last_opened_unix, None);
     }
 
     #[test]
