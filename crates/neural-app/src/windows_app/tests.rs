@@ -875,7 +875,13 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
         BarHit::WindowMaximize,
         BarHit::WindowClose,
     ] {
-        let label = bar_tooltip_label(hit, "ChatGPT", false, Some(url), Some(("Pesquisa", true)));
+        let label = bar_tooltip_label(
+            hit,
+            &BarState::default(),
+            "ChatGPT",
+            Some(url),
+            Some(("Pesquisa", true)),
+        );
         assert!(
             label.as_deref().is_some_and(|text| !text.trim().is_empty()),
             "{hit:?} ficou sem dica"
@@ -884,8 +890,11 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
     let label = |hit, maximized| {
         bar_tooltip_label(
             hit,
+            &BarState {
+                maximized,
+                ..BarState::default()
+            },
             "ChatGPT",
-            maximized,
             Some(url),
             Some(("Pesquisa", true)),
         )
@@ -2024,7 +2033,7 @@ fn the_gemini_live_eye_toggles_live_and_says_what_it_sends() {
         }
     }
     assert_eq!(
-        bar_tooltip_label(BarHit::GeminiLive, "IA", false, None, None).as_deref(),
+        bar_tooltip_label(BarHit::GeminiLive, &BarState::default(), "IA", None, None).as_deref(),
         Some("Gemini Live: ver a tela, câmera e microfone (liga/desliga)")
     );
 }
@@ -2165,9 +2174,12 @@ fn painted_bar_with_live(width: i32, live: &LivePanel<u8>, theme: &Theme) -> Vec
             width,
             1.0,
             &["Google Gemini", "ChatGPT", "Claude"],
-            true,
-            None,
-            false,
+            BarState {
+                visible: true,
+                hover: None,
+                auto_scroll: false,
+                ..BarState::default()
+            },
             live,
             theme,
         );
@@ -2856,9 +2868,12 @@ fn render_comparator_bar_preview() {
                 width,
                 1.0,
                 &["Google Gemini", "ChatGPT", "Claude"],
-                visible,
-                hover,
-                true,
+                BarState {
+                    visible,
+                    hover,
+                    auto_scroll: true,
+                    ..BarState::default()
+                },
                 &LivePanel::<()>::off(),
                 &theme,
             );
@@ -13099,10 +13114,12 @@ fn group_chip_underline_and_hovered_close_are_painted_like_chrome() {
             &all_groups,
             active.map(|id| (0, Some(id), false, false)),
             [None; COMPARATOR_COLUMNS],
-            true,
-            hover,
-            true,
-            None,
+            BarState {
+                visible: true,
+                hover,
+                auto_scroll: true,
+                ..BarState::default()
+            },
             &LivePanel::<()>::off(),
             &theme,
         );
@@ -14362,10 +14379,13 @@ fn the_row_reorders_live_under_the_dragged_tab() {
             &rig.groups,
             None,
             [None; COMPARATOR_COLUMNS],
-            true,
-            None,
-            true,
-            drag,
+            BarState {
+                visible: true,
+                hover: None,
+                auto_scroll: true,
+                drag,
+                ..BarState::default()
+            },
             &LivePanel::<()>::off(),
             &theme,
         );
@@ -15683,7 +15703,8 @@ fn tool_hints_say_what_the_click_does() {
     ];
     for (tool, text) in expected {
         assert_eq!(
-            bar_tooltip_label(BarHit::Tool(tool), "IA", false, None, None).as_deref(),
+            bar_tooltip_label(BarHit::Tool(tool), &BarState::default(), "IA", None, None)
+                .as_deref(),
             Some(text)
         );
     }
@@ -15697,7 +15718,7 @@ fn pomodoro_hint_follows_the_session_in_the_bar_and_on_home() {
     // O que a barra mostra (`bar_hint`, pelo `App::bar_tooltip_text`) e
     // o que a Home e o refresco de cada segundo mostram (`tool_hint_at`).
     let bar = |hit: BarHit, pomodoro: &PomodoroController, now: Instant| {
-        bar_hint(hit, pomodoro, now, "IA", false, None, None)
+        bar_hint(hit, pomodoro, now, &BarState::default(), "IA", None, None)
     };
     let mut pomodoro =
         PomodoroController::new(crate::pomodoro_ui::PomodoroPreset::Classic.settings());
@@ -15738,7 +15759,7 @@ Clique: pausar · botão direito: opções";
     // O resto da barra continua com a sua dica.
     assert_eq!(
         bar(BarHit::Home, &pomodoro, at),
-        bar_tooltip_label(BarHit::Home, "IA", false, None, None)
+        bar_tooltip_label(BarHit::Home, &BarState::default(), "IA", None, None)
     );
     // Parado outra vez: a fixa.
     pomodoro.command(PomodoroCommand::Stop, at);

@@ -441,7 +441,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     Surface::Comparator => {
-                        let drag = self.drag_paint();
+                        let state = self.bar_state();
                         if let Some(window) = &self.window
                             && let Some(comp) = &self.comparator
                         {
@@ -452,16 +452,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.service_strip_physical(),
                                 )
                             });
-                            draw_comparator_bar(
-                                window,
-                                comp,
-                                self.bar_hover,
-                                self.bar_visible(),
-                                self.auto_scroll.get(),
-                                drag,
-                                self.pomodoro_bar_label(),
-                                &self.live_panel,
-                            );
+                            draw_comparator_bar(window, comp, state, &self.live_panel);
                             if let Some((service, badge, strip)) = service {
                                 draw_service_chrome(
                                     window,

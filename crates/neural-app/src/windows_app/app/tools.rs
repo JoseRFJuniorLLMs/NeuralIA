@@ -99,15 +99,15 @@ pub(in crate::windows_app) fn bar_hint(
     hit: BarHit,
     pomodoro: &PomodoroController,
     now: Instant,
+    state: &BarState,
     provider: &str,
-    maximized: bool,
     tab_url: Option<&str>,
     group: Option<(&str, bool)>,
 ) -> Option<String> {
     if let BarHit::Tool(tool) = hit {
         return Some(tool_hint_at(tool, pomodoro, now));
     }
-    bar_tooltip_label(hit, provider, maximized, tab_url, group)
+    bar_tooltip_label(hit, state, provider, tab_url, group)
 }
 
 /// Som curto do sistema no fim de uma fase do Pomodoro (o "Asterisco" do

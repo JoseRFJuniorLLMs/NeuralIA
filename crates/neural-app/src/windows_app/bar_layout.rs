@@ -180,6 +180,27 @@ impl BarColumns {
     }
 }
 
+/// O estado da barra num instante -- o que a pintura e a dica leem alem da
+/// geometria (`BarLayout`) e das abas: o alvo debaixo do rato, se a barra
+/// esta a vista, a rolagem automatica, o arrasto em curso, a etiqueta do
+/// Pomodoro e se a janela esta maximizada. E a costura de quem pinta ou
+/// explica um botao novo (a estrela dos favoritos, o escudo, um download):
+/// acrescenta-se um campo aqui, com nome, em vez de mais um parametro
+/// posicional em `draw_comparator_bar`, em `paint_comparator_bar_with_contexts`,
+/// em `bar_tooltip_label` e em cada chamada dos testes. O `App` monta-o em
+/// `App::bar_state`; os testes montam-no a mao com `..BarState::default()`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(in crate::windows_app) struct BarState {
+    pub(in crate::windows_app) hover: Option<BarHit>,
+    pub(in crate::windows_app) visible: bool,
+    pub(in crate::windows_app) auto_scroll: bool,
+    pub(in crate::windows_app) drag: Option<DragPaint>,
+    pub(in crate::windows_app) pomodoro_label: Option<BarLabel>,
+    /// So a dica o le (Maximizar/Restaurar); a pintura dos botoes da janela
+    /// nao depende dele.
+    pub(in crate::windows_app) maximized: bool,
+}
+
 /// Geometria em duas linhas. As fontes ficam na title bar; os provedores ficam
 /// numa segunda linha, sem disputar espaco com as abas.
 #[derive(Debug, Clone, Copy)]

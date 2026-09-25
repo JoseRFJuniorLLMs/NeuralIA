@@ -946,11 +946,12 @@ const HINT_MAX_WIDTH_PX: f64 = 640.0;
 /// clique --, nao so o nome do botao.
 pub(in crate::windows_app) fn bar_tooltip_label(
     hit: BarHit,
+    state: &BarState,
     provider: &str,
-    maximized: bool,
     tab_url: Option<&str>,
     group: Option<(&str, bool)>,
 ) -> Option<String> {
+    let maximized = state.maximized;
     Some(match hit {
         BarHit::Home => "Voltar à Home".to_string(),
         BarHit::Back => "Voltar na fonte aberta ao lado".to_string(),
@@ -6048,16 +6049,12 @@ fn draw_home(
     }
 }
 
-// O arrasto das abas (2.1.7) e a etiqueta do Pomodoro chegam ambos da `App`.
-#[allow(clippy::too_many_arguments)]
+// O arrasto das abas (2.1.7), a etiqueta do Pomodoro e o resto do estado
+// chegam da `App` num `BarState` so (`App::bar_state`).
 fn draw_comparator_bar<W>(
     window: &Window,
     comp: &ComparatorState,
-    hover: Option<BarHit>,
-    visible: bool,
-    auto_scroll: bool,
-    drag: Option<DragPaint>,
-    pomodoro_label: Option<BarLabel>,
+    state: BarState,
     live: &LivePanel<W>,
 ) {
     let Ok(handle) = window.window_handle() else {
@@ -6107,7 +6104,7 @@ fn draw_comparator_bar<W>(
             width,
             scale,
             &names,
-            bar_columns(comp, pomodoro_label),
+            bar_columns(comp, state.pomodoro_label),
             &comp.contexts,
             &comp.groups,
             comp.split.as_ref().map(|split| {
@@ -6119,10 +6116,7 @@ fn draw_comparator_bar<W>(
                 )
             }),
             comp.bar_focus,
-            visible,
-            hover,
-            auto_scroll,
-            drag,
+            state,
             live,
             &Theme::system(),
         );
@@ -6142,16 +6136,13 @@ fn draw_comparator_bar<W>(
 
 /// Todo o desenho da barra de topo, num DC qualquer — o ecra em producao, um
 /// bitmap em memoria nos testes, que e como este visual se inspeciona sem ecra.
-#[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 unsafe fn paint_comparator_bar<W>(
     target: *mut core::ffi::c_void,
     width: i32,
     scale: f64,
     names: &[&str],
-    visible: bool,
-    hover: Option<BarHit>,
-    auto_scroll: bool,
+    state: BarState,
     live: &LivePanel<W>,
     theme: &Theme,
 ) {
@@ -6167,10 +6158,7 @@ unsafe fn paint_comparator_bar<W>(
         &no_groups,
         None,
         [None; COMPARATOR_COLUMNS],
-        visible,
-        hover,
-        auto_scroll,
-        None,
+        state,
         live,
         theme,
     );
@@ -6189,13 +6177,17 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
     groups: &[Vec<ContextGroup>; COMPARATOR_COLUMNS],
     active_context: Option<(usize, Option<u64>, bool, bool)>,
     focus: [Option<u64>; COMPARATOR_COLUMNS],
-    visible: bool,
-    hover: Option<BarHit>,
-    auto_scroll: bool,
-    drag: Option<DragPaint>,
+    state: BarState,
     live: &LivePanel<W>,
     theme: &Theme,
 ) {
+    let BarState {
+        hover,
+        visible,
+        auto_scroll,
+        drag,
+        ..
+    } = state;
     // A meio de um arrasto a fila da coluna desenha-se ja como ficara se o
     // botao subir agora: as outras abas abrem lugar ao que se arrasta -- e o
     // que se arrasta fica sempre na fila (e a ancora da coluna), como no
