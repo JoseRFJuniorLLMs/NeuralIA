@@ -14,14 +14,15 @@ use crate::epub_app::{
     handle_epub_ipc, is_epub_path, library_url, notice_script, parse_dialog_selection, reader_url,
 };
 use neural_core::{
-    MemoryDocument, MemoryKind, MemorySourceKind, ReaderArticle, ReaderBlock, reader_html,
+    HistoryEntry, MemoryDocument, MemoryKind, MemorySourceKind, ReaderArticle, ReaderBlock,
+    is_pdf_url, reader_html,
 };
 
 use crate::windows_app::{
     AGENT_OBSERVER_SCRIPT, App, COMPARATOR_COLUMNS, DocumentJob, EPUB_SCHEME,
     EXTERNAL_RETURN_BUTTON, HistoryKind, IpcAction, NEURALIA_KEYMAP_SCRIPT, PDF_ORIGIN,
     PDF_VIEWER_CSP, PDF_VIEWER_HTML, PDF_VIEWER_JS, PDFJS_CORE, PDFJS_WORKER, PanelExit,
-    READ_ALOUD_SCRIPT, SPLIT_SCROLL_RAIL_SCRIPT, Surface, UserEvent, bind_page_script,
+    READ_ALOUD_SCRIPT, ReaderJob, SPLIT_SCROLL_RAIL_SCRIPT, Surface, UserEvent, bind_page_script,
     common_ipc_event, is_view_source_target, local_origin_of, neuralia_action,
     parse_agent_observation, parse_ipc_message, remote_capability, remote_web_target,
     themed_webview_builder, web_media_permission, wide_null, window_hwnd,
@@ -554,6 +555,39 @@ impl App {
                 self.show_native_error(format!("WebView2 não pôde exibir o Reader: {error}"));
             }
         }
+    }
+
+    pub(in crate::windows_app) fn read(&mut self, url: String) {
+        let generation = self.next_generation();
+        self.destroy_web_surfaces();
+        self.surface = Surface::Home;
+        self.schedule_home_restoration();
+        self.status = Some(format!("Lendo {url} …"));
+        self.request_redraw();
+
+        if let Err(error) = self.reader.submit(ReaderJob {
+            generation,
+            input: url.clone(),
+            url,
+        }) {
+            self.show_native_error(format!("Reader indisponível: {error}"));
+        }
+    }
+
+    pub(in crate::windows_app) fn web(&mut self, url: String) {
+        match neural_core::validate_web_url(&url) {
+            Ok(valid) if is_pdf_url(&valid) => self.read_pdf(valid),
+            Ok(valid) => {
+                self.next_generation();
+                self.record(HistoryKind::Web, valid.to_string(), valid.to_string());
+                self.open_external(valid.as_str());
+            }
+            Err(error) => self.show_native_error(error.to_string()),
+        }
+    }
+
+    pub(in crate::windows_app) fn record(&self, kind: HistoryKind, input: String, target: String) {
+        self.history.append(HistoryEntry::now(kind, input, target));
     }
 }
 

@@ -3277,39 +3277,6 @@ impl App {
         }
     }
 
-    pub(in crate::windows_app) fn read(&mut self, url: String) {
-        let generation = self.next_generation();
-        self.destroy_web_surfaces();
-        self.surface = Surface::Home;
-        self.schedule_home_restoration();
-        self.status = Some(format!("Lendo {url} …"));
-        self.request_redraw();
-
-        if let Err(error) = self.reader.submit(ReaderJob {
-            generation,
-            input: url.clone(),
-            url,
-        }) {
-            self.show_native_error(format!("Reader indisponível: {error}"));
-        }
-    }
-
-    pub(in crate::windows_app) fn web(&mut self, url: String) {
-        match neural_core::validate_web_url(&url) {
-            Ok(valid) if is_pdf_url(&valid) => self.read_pdf(valid),
-            Ok(valid) => {
-                self.next_generation();
-                self.record(HistoryKind::Web, valid.to_string(), valid.to_string());
-                self.open_external(valid.as_str());
-            }
-            Err(error) => self.show_native_error(error.to_string()),
-        }
-    }
-
-    pub(in crate::windows_app) fn record(&self, kind: HistoryKind, input: String, target: String) {
-        self.history.append(HistoryEntry::now(kind, input, target));
-    }
-
     pub(in crate::windows_app) fn submit_notes(
         &mut self,
         command: NotesCommand,
