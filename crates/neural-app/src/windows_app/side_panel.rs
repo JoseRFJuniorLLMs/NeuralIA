@@ -184,14 +184,14 @@ pub(in crate::windows_app) trait DraftRescue {
 /// O numero de uma pagina do painel: vai no canal dela
 /// (`PanelPost::parse`) e distingue-a das que ja sairam.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::windows_app) struct PanelTicket(pub(in crate::windows_app) u64);
+pub(in crate::windows_app) struct PanelTicket(u64);
 
 /// Um pedido da pagina do painel, ja pelo parser do canal e com o numero
 /// da pagina que o mandou.
 #[derive(Debug)]
 pub(in crate::windows_app) struct PanelPost {
-    pub(in crate::windows_app) page: u64,
-    pub(in crate::windows_app) message: PanelMessage,
+    page: u64,
+    message: PanelMessage,
 }
 
 impl PanelPost {
