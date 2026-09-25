@@ -1,7 +1,7 @@
 //! A cola do spike do `AcceleratorKeyPressed` com o `App` e o COM do
 //! WebView2 (item infra-accel-spike do plano 2.3). So compila com
-//! `--features accel-spike`, a feature do job `accel-spike` do CI; o exe
-//! publicado e compilado sem ela.
+//! `--features accel-spike`, a feature do job `accel-spike`
+//! (`.github/workflows/accel-spike.yml`); o exe publicado e compilado sem ela.
 //!
 //! Vive fora de `src/windows_app/` de proposito: e um modulo filho de
 //! `windows_app` (declarado la com `#[path]`, para chegar aos itens

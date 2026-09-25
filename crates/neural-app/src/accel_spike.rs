@@ -5,7 +5,9 @@
 //! `SPIKE_CHORDS`) deixa de chegar ao `keydown` da pagina e ao `act()` do
 //! `NEURALIA_KEYMAP_SCRIPT`, e o lado nativo dispara uma so vez -- tambem com
 //! a tecla presa (auto-repeat)? A resposta e a tabela por hospedeiro que o
-//! job `accel-spike` do CI imprime (`scripts/test-accel-spike.ps1`).
+//! job `accel-spike` imprime (`scripts/test-accel-spike.ps1`), no workflow
+//! proprio `.github/workflows/accel-spike.yml`, fora do CI de que o release
+//! depende.
 //!
 //! Este modulo so existe nos testes e no build de CI com
 //! `--features accel-spike`. O exe publicado e compilado sem a feature: o

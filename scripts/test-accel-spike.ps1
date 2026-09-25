@@ -28,6 +28,9 @@ param(
 #     exatamente uma vez -- e, na tecla presa, as repeticoes chegam tratadas.
 # Uma tentativa sem sonda, com a sonda de outro documento (a pagina navegou a meio)
 # ou sem foco nunca passa.
+# Uma tentativa cujo SendInput falhou, ou uma corrida em que nenhuma tecla
+# chegou a um AcceleratorKeyPressed (linha EXECUCAO INVALIDA na tabela), e
+# invalida: nao sugere fallback nenhum.
 #
 # Imprime a tabela por hospedeiro (tambem no resumo do job) e falha se algum
 # atalho falhar. A decisao (nativo / guarda de uma linha no mapa de teclas /
@@ -80,12 +83,18 @@ function Get-TrialVerdict {
         $Page,
         $Native,
         $Acts,
-        [bool]$Hooked
+        [bool]$Hooked,
+        # O SendInput desta tentativa lancou: a tecla pode nao ter saido.
+        [string]$InputError = "",
+        # A corrida inteira nao mediu nada (Get-RunInvalidReason).
+        [string]$RunInvalid = ""
     )
     $reasons = New-Object System.Collections.Generic.List[string]
     $pageDown = 0
     $pagePress = 0
     $find = $false
+    if ($RunInvalid) { $reasons.Add("execucao invalida: $RunInvalid") }
+    if ($InputError) { $reasons.Add("SendInput falhou: $InputError") }
     if (-not $Hooked) { $reasons.Add("handler nativo nao instalado neste hospedeiro") }
     if ($null -eq $Page) {
         $reasons.Add("sem leitura da pagina")
@@ -139,11 +148,15 @@ function Get-TrialVerdict {
 }
 
 # O que uma falha sugere, pelas regras do brief. So uma sugestao: a decisao
-# fica PENDENTE para o dono sobre a tabela.
+# fica PENDENTE para o dono sobre a tabela. Uma tentativa em que a tecla pode
+# nao ter chegado (SendInput falhou, corrida sem input) e invalida, nunca
+# fallback-2: senao a tabela pedia um numero IPC para um atalho que o WebView2
+# nunca recebeu.
 function Get-FailureClass($verdict) {
     if ($verdict.Pass) { return "ok" }
     $invalid = @($verdict.Reasons | Where-Object {
-            $_ -like "sonda*" -or $_ -like "sem leitura*" -or $_ -like "documento de topo sem foco*" -or $_ -like "handler nativo*"
+            $_ -like "sonda*" -or $_ -like "sem leitura*" -or $_ -like "documento de topo sem foco*" -or $_ -like "handler nativo*" -or
+            $_ -like "SendInput*" -or $_ -like "execucao invalida*"
         })
     if ($invalid.Count -gt 0) { return "invalido" }
     if ($verdict.Fired -ne 1) { return "fallback-2" }
@@ -151,10 +164,24 @@ function Get-FailureClass($verdict) {
     return "falha"
 }
 
-function Format-SpikeTable([object[]]$verdicts, [string[]]$hostOrder) {
+# Uma corrida em que nenhuma tecla da tabela chegou a um AcceleratorKeyPressed
+# nao mediu o WebView2: o runner nao entregou o input ou a janela nao estava em
+# primeiro plano. Devolve o motivo (todas as tentativas ficam invalidas) ou "".
+function Get-RunInvalidReason([int]$NativeSeen, [int]$Trials) {
+    if ($Trials -gt 0 -and $NativeSeen -eq 0) {
+        return "nenhuma tecla da tabela chegou a um AcceleratorKeyPressed em $Trials tentativa(s) (o runner nao entregou o input ou a janela nao estava em primeiro plano); a tabela nao mede o WebView2"
+    }
+    return ""
+}
+
+function Format-SpikeTable([object[]]$verdicts, [string[]]$hostOrder, [string]$RunInvalid = "") {
     $out = New-Object System.Collections.Generic.List[string]
     $out.Add("## Spike do AcceleratorKeyPressed (infra-accel-spike)")
     $out.Add("")
+    if ($RunInvalid) {
+        $out.Add("**EXECUCAO INVALIDA (INVALID RUN):** $RunInvalid. Todas as tentativas contam como invalido; nada nesta tabela sugere fallback.")
+        $out.Add("")
+    }
     $out.Add("Passa = o keydown da pagina nunca ve o atalho, nenhum act() do NEURALIA_KEYMAP_SCRIPT dispara e o nativo dispara exatamente uma vez (tambem com a tecla presa).")
     $out.Add("")
     $header = "| Atalho | " + ($hostOrder -join " | ") + " |"
@@ -204,7 +231,7 @@ function Format-SpikeTable([object[]]$verdicts, [string[]]$hostOrder) {
             switch ($group.Name) {
                 "fallback-1" { "a pagina/o mapa de teclas ainda a ve em $hostsHit -> fallback 1 (guarda de uma linha no NEURALIA_KEYMAP_SCRIPT, sim do dono)" }
                 "fallback-2" { "o nativo nao a trata uma vez em $hostsHit -> fallback 2 (numero IPC reservado so para este atalho)" }
-                "invalido" { "medicao invalida em $hostsHit (sonda/foco/handler) -> repetir antes de decidir" }
+                "invalido" { "medicao invalida em $hostsHit (sonda/foco/handler/input) -> repetir antes de decidir" }
                 default { "falha em $hostsHit" }
             }
         }
@@ -256,12 +283,16 @@ function Invoke-SelfTest {
         @{ Name = "sem sonda"; Repeat = $false; Page = $noProbe; Native = $native; Acts = @(); Hooked = $true; Pass = $false; Class = "invalido" },
         @{ Name = "sem foco"; Repeat = $false; Page = $noFocus; Native = $native; Acts = @(); Hooked = $true; Pass = $false; Class = "invalido" },
         @{ Name = "sem leitura"; Repeat = $false; Page = $null; Native = $native; Acts = @(); Hooked = $true; Pass = $false; Class = "invalido" },
-        @{ Name = "sem handler"; Repeat = $false; Page = $clean; Native = $native; Acts = @(); Hooked = $false; Pass = $false; Class = "invalido" }
+        @{ Name = "sem handler"; Repeat = $false; Page = $clean; Native = $native; Acts = @(); Hooked = $false; Pass = $false; Class = "invalido" },
+        # A tecla pode nao ter saido: igual a "sem nativo" na pagina e no
+        # registo, mas invalido, nunca fallback-2.
+        @{ Name = "SendInput falhou"; Repeat = $false; Page = $clean; Native = @(); Acts = @(); Hooked = $true; InputError = "SendInput recusou a tecla 78 (erro 5)"; Pass = $false; Class = "invalido" },
+        @{ Name = "corrida sem input"; Repeat = $true; Page = $clean; Native = @(); Acts = @(); Hooked = $true; RunInvalid = (Get-RunInvalidReason -NativeSeen 0 -Trials 2); Pass = $false; Class = "invalido" }
     )
     $failures = 0
     $verdicts = @()
     foreach ($case in $cases) {
-        $verdict = Get-TrialVerdict -Chord $chord -HostName "Split" -Repeat $case.Repeat -ArmToken "t1" -Page $case.Page -Native $case.Native -Acts $case.Acts -Hooked $case.Hooked
+        $verdict = Get-TrialVerdict -Chord $chord -HostName "Split" -Repeat $case.Repeat -ArmToken "t1" -Page $case.Page -Native $case.Native -Acts $case.Acts -Hooked $case.Hooked -InputError ([string]$case.InputError) -RunInvalid ([string]$case.RunInvalid)
         $class = Get-FailureClass $verdict
         $ok = ($verdict.Pass -eq $case.Pass) -and ($class -eq $case.Class)
         if (-not $ok) { $failures++ }
@@ -271,8 +302,27 @@ function Invoke-SelfTest {
     $table = Format-SpikeTable $verdicts @("Split")
     $table | ForEach-Object { Write-Host $_ }
     if (-not ($table -match "FALHA")) { $failures++; Write-Host "self-test: a tabela nao mostrou a falha" }
+    if ($table -cmatch "INVALID RUN") { $failures++; Write-Host "self-test: uma corrida com nativo saiu como execucao invalida" }
+
+    # A corrida inteira sem nenhum AcceleratorKeyPressed: todas as tentativas
+    # invalidas, a linha EXECUCAO INVALIDA na tabela (e no resumo do job, que e
+    # esta tabela) e nenhuma sugestao de fallback.
+    $runChecks = 0
+    $runReason = Get-RunInvalidReason -NativeSeen 0 -Trials 2
+    if (-not $runReason) { $failures++; Write-Host "self-test: corrida sem nativo nao ficou invalida" }
+    if (Get-RunInvalidReason -NativeSeen 3 -Trials 2) { $failures++; Write-Host "self-test: corrida com nativo ficou invalida" }
+    $runVerdicts = @(foreach ($repeat in @($false, $true)) {
+            Get-TrialVerdict -Chord $chord -HostName "Split" -Repeat $repeat -ArmToken "t1" -Page $clean -Native @() -Acts @() -Hooked $true -RunInvalid $runReason
+        })
+    $runClasses = @($runVerdicts | ForEach-Object { Get-FailureClass $_ }) | Sort-Object -Unique
+    $runTable = @(Format-SpikeTable $runVerdicts @("Split") $runReason)
+    $runOk = (($runClasses -join ",") -eq "invalido") -and (@($runTable -cmatch "INVALID RUN").Count -eq 1) -and (@($runTable -match "-> fallback [12]").Count -eq 0)
+    $runChecks++
+    Write-Host ("self-test {0,-20} classes={1,-10} {2}" -f "tabela sem input", ($runClasses -join ","), $(if ($runOk) { "ok" } else { "ERRADO" }))
+    if (-not $runOk) { $failures++; $runTable | ForEach-Object { Write-Host $_ } }
+
     if ($failures -gt 0) { throw "self-test do avaliador: $failures caso(s) errado(s)." }
-    Write-Host "self-test do avaliador: $($cases.Count) casos certos."
+    Write-Host "self-test do avaliador: $($cases.Count + $runChecks) casos certos."
 }
 
 if ($SelfTest) {
@@ -546,7 +596,7 @@ try {
         foreach ($chord in $Chords) {
             foreach ($repeat in @($false, $true)) {
                 $trial++
-                $trialInfo[$trial] = [pscustomobject]@{ Host = $hostName; Chord = $chord; Repeat = $repeat; Token = ""; Page = $null }
+                $trialInfo[$trial] = [pscustomobject]@{ Host = $hostName; Chord = $chord; Repeat = $repeat; Token = ""; Page = $null; InputError = "" }
                 if (-not $opened.ok) { continue }
                 # O begin volta a armar a sonda (se a pagina navegou entre
                 # tentativas) e zera-a; o token dele e o que o pull tem de ver.
@@ -558,6 +608,9 @@ try {
                     [AccelSpikeInput]::Chord([uint16]$chord.Vk, $chord.Ctrl, $chord.Shift, $downs, 40)
                 }
                 catch {
+                    # A tecla pode nao ter saido: a tentativa fica invalida
+                    # (nunca fallback-2 por um nativo que nao a recebeu).
+                    $trialInfo[$trial].InputError = $_.Exception.Message
                     Write-Host "  SendInput: $($_.Exception.Message)"
                 }
                 Start-Sleep -Milliseconds $SettleMs
@@ -587,14 +640,20 @@ $hooked = @($script:Records | Where-Object { $_.t -eq "hooked" -and $_.ok } | Fo
 $hookFailures = @($script:Records | Where-Object { $_.t -eq "hooked" -and -not $_.ok })
 foreach ($failure in $hookFailures) { Write-Host "handler nao instalado em $($failure.host): $($failure.error)" }
 
+# Antes dos vereditos: uma corrida em que nenhuma tecla chegou ao nativo marca
+# todas as tentativas como invalidas, e a tabela (e o resumo do job) di-lo.
+$nativeSeen = @($script:Records | Where-Object { $_.t -eq "native" }).Count
+$runInvalid = Get-RunInvalidReason -NativeSeen $nativeSeen -Trials $trialInfo.Count
+if ($runInvalid) { Write-Host "EXECUCAO INVALIDA: $runInvalid" }
+
 foreach ($key in ($trialInfo.Keys | Sort-Object)) {
     $info = $trialInfo[$key]
     $native = @($script:Records | Where-Object { $_.t -eq "native" -and [int]$_.trial -eq $key })
     $acts = @($script:Records | Where-Object { $_.t -eq "act" -and [int]$_.trial -eq $key })
-    $verdicts.Add((Get-TrialVerdict -Chord $info.Chord -HostName $info.Host -Repeat $info.Repeat -ArmToken $info.Token -Page $info.Page -Native $native -Acts $acts -Hooked ($hooked -contains $info.Host)))
+    $verdicts.Add((Get-TrialVerdict -Chord $info.Chord -HostName $info.Host -Repeat $info.Repeat -ArmToken $info.Token -Page $info.Page -Native $native -Acts $acts -Hooked ($hooked -contains $info.Host) -InputError $info.InputError -RunInvalid $runInvalid))
 }
 
-$table = Format-SpikeTable @($verdicts) $Hosts
+$table = Format-SpikeTable @($verdicts) $Hosts $runInvalid
 $table | ForEach-Object { Write-Host $_ }
 [IO.File]::WriteAllLines((Join-Path (Get-Location) $TablePath), [string[]]$table, [Text.UTF8Encoding]::new($false))
 if ($env:GITHUB_STEP_SUMMARY) {
@@ -602,10 +661,6 @@ if ($env:GITHUB_STEP_SUMMARY) {
     Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value (@("# accel-spike $title") + $table) -Encoding utf8
 }
 
-$nativeSeen = @($script:Records | Where-Object { $_.t -eq "native" }).Count
-if ($nativeSeen -eq 0) {
-    Write-Host "Nenhuma tecla da tabela chegou a um AcceleratorKeyPressed: o runner nao entregou o input (SendInput) ou a janela nao estava em primeiro plano. A tabela nao mede o WebView2."
-}
 $failed = @($verdicts | Where-Object { -not $_.Pass })
 $leaks = @($verdicts | Where-Object { $_.PageDown -gt 0 })
 
@@ -624,6 +679,7 @@ if ($ExpectLeak) {
     return
 }
 if ($failedHard) { throw "O spike nao correu ate ao fim: $failedHard" }
+if ($runInvalid) { throw "Execucao invalida (nada a decidir sobre esta tabela): $runInvalid" }
 if ($verdicts.Count -ne $Hosts.Count * $Chords.Count * 2) {
     throw "Tentativas: $($verdicts.Count), esperadas $($Hosts.Count * $Chords.Count * 2)."
 }
