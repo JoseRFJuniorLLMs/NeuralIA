@@ -1,4 +1,4 @@
-﻿use super::*;
+use super::*;
 
 pub(in crate::windows_app) const SPLASH_SUBCLASS_ID: usize = 0x4E4C;
 pub(in crate::windows_app) const SPLASH_WIDTH: f64 = 470.0;
@@ -144,7 +144,12 @@ pub(in crate::windows_app) unsafe extern "system" fn splash_subclass(
 /// cliente: centrado nos dois eixos. Ficava a 48 px do fundo, e ao arrancar
 /// lia-se como um rodape perdido por baixo das colunas. Nunca sai pelo topo
 /// nem pela esquerda numa janela mais pequena do que ele.
-pub(in crate::windows_app) fn splash_origin(client_w: i32, client_h: i32, width: i32, height: i32) -> (i32, i32) {
+pub(in crate::windows_app) fn splash_origin(
+    client_w: i32,
+    client_h: i32,
+    width: i32,
+    height: i32,
+) -> (i32, i32) {
     (
         ((client_w - width) / 2).max(0),
         ((client_h - height) / 2).max(0),
@@ -219,7 +224,12 @@ impl SplashBoard {
         Some(self.frame(text, seconds, kind == SplashKind::Question))
     }
 
-    pub(in crate::windows_app) fn frame(&mut self, text: String, seconds: u64, asks: bool) -> SplashFrame {
+    pub(in crate::windows_app) fn frame(
+        &mut self,
+        text: String,
+        seconds: u64,
+        asks: bool,
+    ) -> SplashFrame {
         self.token = self.token.wrapping_add(1);
         self.question = asks.then_some(self.token);
         SplashFrame {

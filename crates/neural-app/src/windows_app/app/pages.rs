@@ -7,32 +7,29 @@ use std::time::{Duration, Instant};
 use url::Url;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    MessageBoxW, IDYES, MB_ICONINFORMATION, MB_YESNO,
+    IDYES, MB_ICONINFORMATION, MB_YESNO, MessageBoxW,
 };
 use wry::http::{Request, Response as HttpResponse};
 use wry::{NewWindowResponse, PermissionResponse, WebViewBuilder};
 
-use neural_core::{
-    redact_sensitive_text, ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy,
-    AgentRuntimeConfig, AgentSecurityAction, FieldKind,
-    ObservedPage, ReaderArticle, ReaderBlock, reader_html,
-    MemoryDocument, MemoryKind, MemorySourceKind,
-};
 use crate::epub_app::{
-    dispatch_epub_request, epub_dialog_filter, epub_drop_job, epub_navigation_allowed,
-    epub_request_target, handle_epub_ipc, is_epub_path, library_url, notice_script,
-    parse_dialog_selection, reader_url, EpubJob, EpubNotice, EpubResponse, EpubRuntime,
-    EpubUiRequest, ServeJob,
+    EpubJob, EpubNotice, EpubResponse, EpubRuntime, EpubUiRequest, ServeJob, dispatch_epub_request,
+    epub_dialog_filter, epub_drop_job, epub_navigation_allowed, epub_request_target,
+    handle_epub_ipc, is_epub_path, library_url, notice_script, parse_dialog_selection, reader_url,
+};
+use neural_core::{
+    ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentRuntimeConfig,
+    AgentSecurityAction, FieldKind, MemoryDocument, MemoryKind, MemorySourceKind, ObservedPage,
+    ReaderArticle, ReaderBlock, reader_html, redact_sensitive_text,
 };
 
 use crate::windows_app::{
-    bind_page_script, common_ipc_event, is_view_source_target, local_origin_of, neuralia_action,
-    now_ms, parse_ipc_message, remote_capability, remote_web_target, themed_webview_builder,
-    web_media_permission, wide_null, window_hwnd, App, HistoryKind,
-    IpcAction, PanelExit, Surface, UserEvent, COMPARATOR_COLUMNS,
-    EPUB_SCHEME, NEURALIA_KEYMAP_SCRIPT, PDFJS_CORE, PDFJS_WORKER, PDF_ORIGIN, PDF_VIEWER_CSP,
-    PDF_VIEWER_HTML, PDF_VIEWER_JS, READ_ALOUD_SCRIPT, SPLIT_SCROLL_RAIL_SCRIPT,
-    EXTERNAL_RETURN_BUTTON, DocumentJob,
+    App, COMPARATOR_COLUMNS, DocumentJob, EPUB_SCHEME, EXTERNAL_RETURN_BUTTON, HistoryKind,
+    IpcAction, NEURALIA_KEYMAP_SCRIPT, PDF_ORIGIN, PDF_VIEWER_CSP, PDF_VIEWER_HTML, PDF_VIEWER_JS,
+    PDFJS_CORE, PDFJS_WORKER, PanelExit, READ_ALOUD_SCRIPT, SPLIT_SCROLL_RAIL_SCRIPT, Surface,
+    UserEvent, bind_page_script, common_ipc_event, is_view_source_target, local_origin_of,
+    neuralia_action, now_ms, parse_ipc_message, remote_capability, remote_web_target,
+    themed_webview_builder, web_media_permission, wide_null, window_hwnd,
 };
 
 #[derive(Debug, Clone)]
@@ -311,7 +308,10 @@ impl App {
     /// fora da thread da interface, o IPC fechado das páginas EPUB (nunca o
     /// `ipc.rs` nem a capability das páginas remotas), navegação de topo só
     /// para as duas páginas, sem popups, downloads nem permissões.
-    pub(in crate::windows_app) fn epub_webview_builder(&self, runtime: &EpubRuntime) -> WebViewBuilder<'static> {
+    pub(in crate::windows_app) fn epub_webview_builder(
+        &self,
+        runtime: &EpubRuntime,
+    ) -> WebViewBuilder<'static> {
         let server = runtime.server.clone();
         let worker = runtime.worker.clone();
         let ipc_proxy = self.proxy.clone();
@@ -708,7 +708,10 @@ impl App {
         self.finish_agent(AgentTermination::Completed);
     }
 
-    pub(in crate::windows_app) fn execute_agent_action(&self, action: &AgentAction) -> Result<(), String> {
+    pub(in crate::windows_app) fn execute_agent_action(
+        &self,
+        action: &AgentAction,
+    ) -> Result<(), String> {
         let Some(webview) = &self.webview else {
             return Err("nenhuma página ativa".into());
         };
@@ -718,7 +721,11 @@ impl App {
             .map_err(|error| error.to_string())
     }
 
-    pub(in crate::windows_app) fn confirm_agent_action(&self, reason: &str, action: &AgentAction) -> bool {
+    pub(in crate::windows_app) fn confirm_agent_action(
+        &self,
+        reason: &str,
+        action: &AgentAction,
+    ) -> bool {
         let (Some(window), Some(hwnd)) = (&self.window, self.window.as_ref().and_then(window_hwnd))
         else {
             return false;
@@ -839,7 +846,9 @@ impl App {
     }
 }
 
-pub(in crate::windows_app) fn parse_browser_agent_plan(spec: &str) -> Result<(String, Vec<BrowserAgentCommand>), String> {
+pub(in crate::windows_app) fn parse_browser_agent_plan(
+    spec: &str,
+) -> Result<(String, Vec<BrowserAgentCommand>), String> {
     let parts = spec
         .split('|')
         .map(str::trim)
@@ -1124,7 +1133,10 @@ pub(in crate::windows_app) fn decide_agent_step(
     }))
 }
 
-pub(in crate::windows_app) fn app_agent_security_action(action: &AgentAction, page: &ObservedPage) -> AgentSecurityAction {
+pub(in crate::windows_app) fn app_agent_security_action(
+    action: &AgentAction,
+    page: &ObservedPage,
+) -> AgentSecurityAction {
     let origin = Url::parse(&page.url)
         .ok()
         .map(|url| url.origin().ascii_serialization())
@@ -1406,7 +1418,10 @@ pub(in crate::windows_app) enum EpubNoticePlan {
     Nothing,
 }
 
-pub(in crate::windows_app) fn plan_epub_notice(notice: &EpubNotice, surface: Surface) -> EpubNoticePlan {
+pub(in crate::windows_app) fn plan_epub_notice(
+    notice: &EpubNotice,
+    surface: Surface,
+) -> EpubNoticePlan {
     let on_epub = surface == Surface::Epub;
     // Abrir o leitor ou a biblioteca destrói a superfície atual. Só por cima
     // da Home ou das páginas de livros: uma importação lenta (livro grande,
@@ -1474,7 +1489,9 @@ pub(in crate::windows_app) fn epub_serve_job(
 /// A resposta da origem `neuralia-epub` no tipo HTTP do wry, com TODOS os
 /// cabeçalhos do servidor (a CSP dos livros é o que impede um livro de
 /// carregar imagens ou fontes da rede).
-pub(in crate::windows_app) fn epub_http_response(response: EpubResponse) -> HttpResponse<Cow<'static, [u8]>> {
+pub(in crate::windows_app) fn epub_http_response(
+    response: EpubResponse,
+) -> HttpResponse<Cow<'static, [u8]>> {
     let mut builder = HttpResponse::builder().status(response.status);
     for (name, value) in response.headers() {
         builder = builder.header(name, value);
@@ -1754,7 +1771,10 @@ pub(in crate::windows_app) fn parse_range_pos(text: &str) -> Option<u64> {
 
 /// O que um WebView de Web externa pode pedir. Fora do closure do builder
 /// para se poder exercitar sem janela.
-pub(in crate::windows_app) fn external_ipc_event(action: IpcAction, agent_enabled: bool) -> Option<UserEvent> {
+pub(in crate::windows_app) fn external_ipc_event(
+    action: IpcAction,
+    agent_enabled: bool,
+) -> Option<UserEvent> {
     match action {
         IpcAction::AgentObservation { data } if agent_enabled => {
             parse_agent_observation(&data).map(UserEvent::AgentObservation)
@@ -1764,7 +1784,10 @@ pub(in crate::windows_app) fn external_ipc_event(action: IpcAction, agent_enable
 }
 
 /// O script da Web externa, tal como `external_webview_builder` o injeta.
-pub(in crate::windows_app) fn external_init_script(capability: &str, agent_enabled: bool) -> String {
+pub(in crate::windows_app) fn external_init_script(
+    capability: &str,
+    agent_enabled: bool,
+) -> String {
     let agent_script = if agent_enabled {
         AGENT_OBSERVER_SCRIPT
     } else {
@@ -1781,7 +1804,10 @@ pub(in crate::windows_app) fn external_init_script(capability: &str, agent_enabl
 /// '_blank')` chega como `about:blank`: aceite pelo `remote_web_target` (para
 /// a navegacao), mas como destino de OpenExternal falha no validate_web_url e
 /// o erro destruia a pagina do utilizador e voltava ao Home.
-pub(in crate::windows_app) fn external_new_window_event(target: String, local_origin: Option<&str>) -> Option<UserEvent> {
+pub(in crate::windows_app) fn external_new_window_event(
+    target: String,
+    local_origin: Option<&str>,
+) -> Option<UserEvent> {
     (!target.eq_ignore_ascii_case("about:blank") && remote_web_target(&target, local_origin))
         .then_some(UserEvent::OpenExternal(target))
 }

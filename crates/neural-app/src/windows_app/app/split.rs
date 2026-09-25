@@ -1,20 +1,19 @@
 use std::sync::atomic::Ordering;
 use url::Url;
-use wry::dpi::{LogicalPosition, LogicalSize};
-use wry::http::Request;
-use wry::{NewWindowResponse, PermissionKind, PermissionResponse, WebView, WebViewBuilder};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
-    InvalidateRect, PAINTSTRUCT, ScreenToClient,
+    BeginPaint, ClientToScreen, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect,
+    PAINTSTRUCT, ScreenToClient,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetClientRect, GetCursorPos, SetWindowPos, ShowWindow,
-    HTCLIENT, SWP_NOACTIVATE, SW_HIDE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_NCHITTEST, WM_PAINT,
+    CreateWindowExW, DestroyWindow, GetClientRect, GetCursorPos, HTCLIENT, SW_HIDE, SWP_NOACTIVATE,
+    SetWindowPos, ShowWindow, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT,
 };
 use winit::event_loop::EventLoopProxy;
 use winit::window::Fullscreen;
+use wry::dpi::{LogicalPosition, LogicalSize};
+use wry::http::Request;
+use wry::{NewWindowResponse, PermissionKind, PermissionResponse, WebView, WebViewBuilder};
 
 use neural_core::{MemoryDocument, MemoryKind, MemorySourceKind};
 
@@ -185,14 +184,22 @@ impl App {
     /// O WebView do Split: o `WebViewBuilder` do tema, configurado por
     /// `configure_split_webview` com o `SplitBuild` que `split_open_plan`
     /// decidiu. Nada mais se lhe acrescenta aqui.
-    pub(in crate::windows_app) fn split_webview_builder(&self, build: &SplitBuild) -> WebViewBuilder<'static> {
+    pub(in crate::windows_app) fn split_webview_builder(
+        &self,
+        build: &SplitBuild,
+    ) -> WebViewBuilder<'static> {
         let proxy = self.proxy.clone();
         configure_split_webview(themed_webview_builder(), build, move |event| {
             let _ = proxy.send_event(event);
         })
     }
 
-    pub(in crate::windows_app) fn open_split(&mut self, source_index: usize, url: String, allow_local: bool) -> bool {
+    pub(in crate::windows_app) fn open_split(
+        &mut self,
+        source_index: usize,
+        url: String,
+        allow_local: bool,
+    ) -> bool {
         self.open_split_mode(source_index, url, allow_local, false, None)
     }
 
@@ -200,7 +207,10 @@ impl App {
     /// popup da pagina ficou na fila atras do Home) ainda pode abrir como Web
     /// normal. Um pedido PRIVADO nao: web() grava historico, captura memoria
     /// e usa o perfil com cookies normais.
-    pub(in crate::windows_app) fn split_request_fallback(surface: Surface, private: bool) -> SplitFallback {
+    pub(in crate::windows_app) fn split_request_fallback(
+        surface: Surface,
+        private: bool,
+    ) -> SplitFallback {
         if surface == Surface::Comparator {
             SplitFallback::OpenSplit
         } else if private {
@@ -230,7 +240,11 @@ impl App {
 
     /// Um link que a fonte aberta ao lado mandou abrir noutra aba: a aba nova
     /// nasce no grupo da aba de onde saiu, como no Chrome.
-    pub(in crate::windows_app) fn open_split_from_split(&mut self, source_index: usize, url: String) {
+    pub(in crate::windows_app) fn open_split_from_split(
+        &mut self,
+        source_index: usize,
+        url: String,
+    ) {
         let opener = self
             .comparator
             .as_ref()
@@ -664,7 +678,10 @@ impl App {
 /// Reabrir uma aba de contexto ja gravada nao e uma fonte nova: a fonte
 /// entrou na sessao e na memoria quando a aba nasceu. Sem isto, cada clique
 /// A, B, A, B acrescentava outra copia a sessao persistida.
-pub(in crate::windows_app) fn split_open_records_source(existing_context_id: Option<u64>, private: bool) -> bool {
+pub(in crate::windows_app) fn split_open_records_source(
+    existing_context_id: Option<u64>,
+    private: bool,
+) -> bool {
     existing_context_id.is_none() && !private
 }
 
@@ -679,7 +696,9 @@ pub(in crate::windows_app) fn context_tab_click_is_noop(
     active == Some((source_index, Some(context_id)))
 }
 
-pub(in crate::windows_app) fn comparator_split_key(comp: &ComparatorState) -> Option<(usize, Option<u64>, bool)> {
+pub(in crate::windows_app) fn comparator_split_key(
+    comp: &ComparatorState,
+) -> Option<(usize, Option<u64>, bool)> {
     comp.split
         .as_ref()
         .map(|split| (split.source_index, split.context_id, split.private))
@@ -932,7 +951,11 @@ impl SplitWebViewTarget for WebViewBuilder<'static> {
 /// Monta o WebView do Split a partir do `SplitBuild` que `split_open_plan`
 /// decidiu: nao volta a decidir script, IPC nem perfil. `send` e o proxy do
 /// event loop no produto e um registo no gate.
-pub(in crate::windows_app) fn configure_split_webview<B, S>(builder: B, build: &SplitBuild, send: S) -> B
+pub(in crate::windows_app) fn configure_split_webview<B, S>(
+    builder: B,
+    build: &SplitBuild,
+    send: S,
+) -> B
 where
     B: SplitWebViewTarget,
     S: Fn(UserEvent) + Clone + 'static,

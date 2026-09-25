@@ -1,4 +1,4 @@
-﻿use super::*;
+use super::*;
 
 pub(in crate::windows_app) const EM_SETSEL: u32 = 0x00B1;
 pub(in crate::windows_app) const EM_SETLIMITTEXT: u32 = 0x00C5;
@@ -31,7 +31,8 @@ pub(in crate::windows_app) const WINDOW_SUBCLASS_ID: usize = 0x4E4A;
 pub(in crate::windows_app) static LIFECYCLE_PROBE_HOME_MESSAGE: OnceLock<u32> = OnceLock::new();
 pub(in crate::windows_app) static LIFECYCLE_PROBE_REOPEN_MESSAGE: OnceLock<u32> = OnceLock::new();
 pub(in crate::windows_app) static LIFECYCLE_PROBE_READY_MESSAGE: OnceLock<u32> = OnceLock::new();
-pub(in crate::windows_app) static LIFECYCLE_PROBE_HOME_READY_MESSAGE: OnceLock<u32> = OnceLock::new();
+pub(in crate::windows_app) static LIFECYCLE_PROBE_HOME_READY_MESSAGE: OnceLock<u32> =
+    OnceLock::new();
 pub(in crate::windows_app) static LIFECYCLE_COMPARATOR_READY: AtomicBool = AtomicBool::new(false);
 pub(in crate::windows_app) static LIFECYCLE_HOME_READY: AtomicBool = AtomicBool::new(false);
 /// O probe transmite comandos a todas as janelas do processo porque o HWND
@@ -413,7 +414,8 @@ unsafe extern "system" {
 #[link(name = "advapi32")]
 unsafe extern "system" {
     #[link_name = "SystemFunction036"]
-    pub(in crate::windows_app) fn rtl_gen_random(buffer: *mut core::ffi::c_void, length: u32) -> u8;
+    pub(in crate::windows_app) fn rtl_gen_random(buffer: *mut core::ffi::c_void, length: u32)
+    -> u8;
 }
 
 /// Pincel de fundo da omnibox, um por cor. Criar um a cada WM_CTLCOLOREDIT

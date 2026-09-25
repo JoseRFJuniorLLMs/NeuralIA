@@ -1,4 +1,4 @@
-﻿use super::*;
+use super::*;
 
 // ===================== tema do sistema (cor de destaque + claro/escuro) =====================
 

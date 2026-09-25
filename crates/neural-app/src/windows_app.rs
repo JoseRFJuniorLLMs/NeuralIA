@@ -1,7 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use std::{
-    borrow::Cow,
     cell::Cell,
     collections::BinaryHeap,
     path::PathBuf,
@@ -17,9 +16,7 @@ use std::{
 
 use image::RgbaImage;
 
-use crate::epub_app::{
-    EPUB_SCHEME, EpubJob, EpubNotice, EpubRuntime, EpubUiRequest,
-};
+use crate::epub_app::{EPUB_SCHEME, EpubJob, EpubNotice, EpubRuntime, EpubUiRequest};
 use crate::gemini_live::{
     LiveIndicator, LiveMessage, LivePanel, live_theme_script, redact_debug_secrets,
 };
@@ -38,12 +35,10 @@ use crate::pomodoro_ui::{PomodoroController, TickSchedule, TickScheduler, phase_
 use crate::read_aloud::READ_ALOUD_SCRIPT;
 use crate::tab_session::{self, Loaded, SessionColumn, SessionGroup, SessionTab, TabSession};
 use neural_core::{
-    AgentAction, AgentElement, AgentPermissionPolicy, AgentRuntimeConfig,
-    AgentSecurityAction, CoreConfig, FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent,
-    MemoryDocument, MemoryHit, MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore, Note,
-    ObservedPage, Phase, ReaderArticle, ReaderBlock, ReaderClient, ResearchItemKind,
-    ResearchSession, ZettelError, ZettelStore, chatgpt_search_url, claude_search_url,
-    google_ai_url, is_local_network_target, is_pdf_url,
+    CoreConfig, HistoryEntry, HistoryKind, HistoryStore, Intent, MemoryDocument, MemoryHit,
+    MemoryKind, MemoryQuery, MemorySourceKind, MemoryStore, Note, ObservedPage, Phase,
+    ReaderArticle, ReaderClient, ResearchItemKind, ResearchSession, ZettelError, ZettelStore,
+    chatgpt_search_url, claude_search_url, google_ai_url, is_local_network_target, is_pdf_url,
     tissue,
     zettel::{self, is_valid_note_id},
 };
@@ -72,12 +67,11 @@ use windows_sys::Win32::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
             ES_AUTOHSCROLL, EnumChildWindows, GetClassNameW, GetClientRect, GetCursorPos,
             GetForegroundWindow, GetParent, GetWindowTextLengthW, GetWindowTextW,
-            GetWindowThreadProcessId, IDYES, IsZoomed, MB_ICONINFORMATION, MB_OK,
-            MF_SEPARATOR, MF_STRING, MessageBoxW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
-            SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetParent, SetWindowPos, ShowWindow,
-            TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_CANCELMODE, WM_CAPTURECHANGED,
-            WM_KEYDOWN, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP,
-            WS_VISIBLE,
+            GetWindowThreadProcessId, IsZoomed, MB_ICONINFORMATION, MB_OK, MF_SEPARATOR, MF_STRING,
+            MessageBoxW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER,
+            SendMessageW, SetParent, SetWindowPos, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+            TrackPopupMenu, WM_CANCELMODE, WM_CAPTURECHANGED, WM_KEYDOWN, WS_CHILD,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
         },
     },
 };
@@ -90,10 +84,7 @@ use winit::{
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
     window::{CursorIcon, Icon, Window, WindowId},
 };
-use wry::{
-    NewWindowResponse, PermissionKind, PermissionResponse, WebView, WebViewBuilder,
-    http::{Request, Response as HttpResponse},
-};
+use wry::{NewWindowResponse, PermissionKind, PermissionResponse, WebView, WebViewBuilder};
 
 use side_panel::PanelExit;
 
@@ -323,7 +314,6 @@ pub(in crate::windows_app) enum UserEvent {
     OpenEpubDialog,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Surface {
     Home,
@@ -502,7 +492,6 @@ pub(in crate::windows_app) struct ComparatorView<V = WebView> {
     pub(in crate::windows_app) webview: V,
     pub(in crate::windows_app) name: &'static str,
 }
-
 
 pub(in crate::windows_app) struct ComparatorState {
     pub(in crate::windows_app) views: Vec<ComparatorView>,
@@ -1832,7 +1821,6 @@ fn track_mouse_leave(hwnd: HWND) {
         TrackMouseEvent(&mut track);
     }
 }
-
 
 const NATIVE_BUTTON_NONE: usize = usize::MAX;
 static CAPTION_PRESSED_BUTTON: AtomicUsize = AtomicUsize::new(NATIVE_BUTTON_NONE);
@@ -4549,7 +4537,11 @@ impl App {
     /// uma que o comparador constroi passa aqui com o que e, e so as colunas
     /// das IAs ganham o item de rolagem. Um runtime WebView2 sem o evento
     /// ContextMenuRequested deixa a coluna com o menu nativo e fica no log.
-    pub(in crate::windows_app) fn install_context_menu(&self, webview: &WebView, host: WebViewHost) {
+    pub(in crate::windows_app) fn install_context_menu(
+        &self,
+        webview: &WebView,
+        host: WebViewHost,
+    ) {
         let missing = install_column_menu(host, |col_index| {
             register_column_context_menu(
                 webview,
@@ -4635,7 +4627,6 @@ impl App {
         self.request_redraw();
     }
 
-
     fn new_tab(&mut self, source_index: usize) {
         if self.surface == Surface::Comparator {
             self.open_ai_palette(source_index.min(COMPARATOR_COLUMNS - 1));
@@ -4643,7 +4634,6 @@ impl App {
             self.focus_omnibox();
         }
     }
-
 
     /// URL de pergunta do fornecedor da coluna.
     /// Pergunta escrita e enviada numa coluna: segue tambem para as outras,
@@ -4684,7 +4674,11 @@ impl App {
         }
     }
 
-    pub(in crate::windows_app) fn provider_query_url(&self, source_index: usize, query: &str) -> neural_core::Result<Url> {
+    pub(in crate::windows_app) fn provider_query_url(
+        &self,
+        source_index: usize,
+        query: &str,
+    ) -> neural_core::Result<Url> {
         match source_index {
             0 => google_ai_url(query, &self.config.language),
             1 => chatgpt_search_url(query),
@@ -5601,7 +5595,6 @@ impl App {
         }
     }
 
-
     /// Controlos da direita tal como estao desenhados AGORA, ou `None` se a
     /// barra nao estiver a ser mostrada. A geometria vem toda de
     /// `right_controls`: nao ha uma segunda copia da conta por aqui.
@@ -5746,7 +5739,11 @@ impl App {
         }
     }
 
-    pub(in crate::windows_app) fn submit_notes(&mut self, command: NotesCommand, origin: NotesOrigin) {
+    pub(in crate::windows_app) fn submit_notes(
+        &mut self,
+        command: NotesCommand,
+        origin: NotesOrigin,
+    ) {
         if let Err(error) = self.notes.submit(command, origin) {
             match origin {
                 NotesOrigin::Panel => {
@@ -5943,7 +5940,6 @@ impl App {
             self.run_tool_action(action);
         }
     }
-
 
     /// Tema novo (mudou no Windows ou foi escolhido): barra, botoes nativos,
     /// popups auxiliares e paginas. Antes, na mudanca do Windows, so a barra
@@ -7403,8 +7399,6 @@ fn main_window_shortcut(
     }
 }
 
-
-
 // ---------------------------------------------------------------------------
 // Abas e grupos entre sessoes (`<data_dir>/tabs.json`). O formato, a leitura
 // tolerante e a escrita atomica vivem em `tab_session.rs`, portatil; aqui fica
@@ -7663,7 +7657,6 @@ fn persisted_active(split: Option<(usize, Option<u64>, bool)>) -> Option<(usize,
     }
     context_id.map(|id| (column, id))
 }
-
 
 /// O modelo da barra como vai para o disco. So abas da lista -- onde uma
 /// fonte privada nunca entra -- e a aba aberta ao lado so quando nao e
@@ -8728,7 +8721,6 @@ mod tab_session_gates {
     }
 }
 
-
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -9462,7 +9454,6 @@ pub(in crate::windows_app) fn common_ipc_event(action: IpcAction) -> Option<User
     })
 }
 
-
 /// O que o "Mandar para IA" e o "Traduzir" da barra de selecao fazem com o
 /// texto. Ha uma so saida: a comparacao normal das tres IAs com o texto como
 /// pergunta (no Traduzir, dentro do pedido fixo de traducao).
@@ -9533,7 +9524,11 @@ struct PendingSearch {
 /// o sinal de superficie privada postos. Um painel privado nao mostra o
 /// "Mandar para IA" nem o "Traduzir": o texto dele nao pode ir parar ao
 /// historico nem a memoria.
-pub(in crate::windows_app) fn bind_page_script(script: &str, capability: &str, private: bool) -> String {
+pub(in crate::windows_app) fn bind_page_script(
+    script: &str,
+    capability: &str,
+    private: bool,
+) -> String {
     script.replace("__NEURALIA_CAP__", capability).replace(
         "__NEURALIA_PRIVATE__",
         if private { "true" } else { "false" },
@@ -9552,8 +9547,6 @@ fn comparator_init_scripts(col_index: usize, col_name: &str, capability: &str) -
         COMPARATOR_INJECT_SCRIPT.replace("__NEURALIA_CAP__", capability),
     ]
 }
-
-
 
 /// Token que so os scripts injetados conhecem: 128 bits de CSPRNG do Windows.
 /// O caminho principal usa BCryptGenRandom. Se essa API falhar, tentamos a
@@ -9624,8 +9617,10 @@ pub(in crate::windows_app) fn local_origin_of(url: &Url) -> Option<String> {
     is_local_network_target(url).then(|| url.origin().ascii_serialization())
 }
 
-
-pub(in crate::windows_app) fn web_media_permission(kind: PermissionKind, user_visible: bool) -> PermissionResponse {
+pub(in crate::windows_app) fn web_media_permission(
+    kind: PermissionKind,
+    user_visible: bool,
+) -> PermissionResponse {
     if !user_visible {
         return PermissionResponse::Deny;
     }
@@ -9638,7 +9633,6 @@ pub(in crate::windows_app) fn web_media_permission(kind: PermissionKind, user_vi
         _ => PermissionResponse::Deny,
     }
 }
-
 
 pub(in crate::windows_app) fn remote_web_target(target: &str, local_origin: Option<&str>) -> bool {
     if target.eq_ignore_ascii_case("about:blank") {
@@ -9653,7 +9647,10 @@ pub(in crate::windows_app) fn remote_web_target(target: &str, local_origin: Opti
 /// `view-source:` so e aceite sobre uma URL web que a propria superficie ja
 /// deixaria abrir: a mesma politica de rede local, sem `about:` nem esquemas
 /// aninhados.
-pub(in crate::windows_app) fn is_view_source_target(target: &str, local_origin: Option<&str>) -> bool {
+pub(in crate::windows_app) fn is_view_source_target(
+    target: &str,
+    local_origin: Option<&str>,
+) -> bool {
     let Some(rest) = target.strip_prefix("view-source:") else {
         return false;
     };
@@ -9662,7 +9659,6 @@ pub(in crate::windows_app) fn is_view_source_target(target: &str, local_origin: 
             || local_origin.is_some_and(|allowed| url.origin().ascii_serialization() == allowed)
     })
 }
-
 
 pub(in crate::windows_app) fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
@@ -10770,7 +10766,10 @@ fn context_tab_label(value: &str) -> String {
     label
 }
 
-pub(in crate::windows_app) unsafe fn create_font(height: i32, weight: i32) -> *mut core::ffi::c_void {
+pub(in crate::windows_app) unsafe fn create_font(
+    height: i32,
+    weight: i32,
+) -> *mut core::ffi::c_void {
     CreateFontW(
         height,
         0,
@@ -10794,9 +10793,12 @@ pub(in crate::windows_app) unsafe fn create_font(height: i32, weight: i32) -> *m
 /// ali custa uma copia de largura*altura*4 bytes por frame, so para o blit ler.
 type SplashCache = Option<(i32, i32, Arc<Vec<u8>>)>;
 
-pub(in crate::windows_app) const PDF_VIEWER_JS: &[u8] = include_bytes!("../../../assets/pdfjs/viewer.mjs");
-pub(in crate::windows_app) const PDFJS_CORE: &[u8] = include_bytes!("../../../assets/pdfjs/pdf.mjs");
-pub(in crate::windows_app) const PDFJS_WORKER: &[u8] = include_bytes!("../../../assets/pdfjs/pdf.worker.mjs");
+pub(in crate::windows_app) const PDF_VIEWER_JS: &[u8] =
+    include_bytes!("../../../assets/pdfjs/viewer.mjs");
+pub(in crate::windows_app) const PDFJS_CORE: &[u8] =
+    include_bytes!("../../../assets/pdfjs/pdf.mjs");
+pub(in crate::windows_app) const PDFJS_WORKER: &[u8] =
+    include_bytes!("../../../assets/pdfjs/pdf.worker.mjs");
 /// No Windows um esquema personalizado `neuralia-pdf` aparece a pagina como
 /// `http://neuralia-pdf.<host>`; o wry intercepta tudo o que comece assim.
 pub(in crate::windows_app) const PDF_ORIGIN: &str = "http://neuralia-pdf.localhost";
@@ -10967,9 +10969,22 @@ pub(super) fn all_sources() -> String {
 }
 
 #[cfg(test)]
-pub(super) use crate::pomodoro_ui::{PomodoroCommand, POMODORO_COMMAND_HELP};
+pub(super) use crate::pomodoro_ui::{POMODORO_COMMAND_HELP, PomodoroCommand};
 #[cfg(test)]
 pub(super) use neural_core::parse_intent;
+// Nomes que so os testes usam por `use super::*` desde que o codigo que os
+// usava saiu da raiz (split-c): no binario ficavam como import nao usado.
+#[cfg(test)]
+pub(super) use neural_core::{
+    AgentAction, AgentElement, AgentPermissionPolicy, AgentRuntimeConfig, AgentSecurityAction,
+    FieldKind, ReaderBlock,
+};
+#[cfg(test)]
+pub(super) use std::borrow::Cow;
+#[cfg(test)]
+pub(super) use windows_sys::Win32::UI::WindowsAndMessaging::IDYES;
+#[cfg(test)]
+pub(super) use wry::http::{Request, Response as HttpResponse};
 
 #[cfg(test)]
 mod tests;
@@ -11564,4 +11579,3 @@ unsafe fn draw_go_gradient(
 /// por isso este botao tem de anunciar a saida.
 const COMPARATOR_BUTTON_EXPANDED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='none';}var m=document.querySelector('#neuralia-comp-minimize');if(m){m.style.display='none';}})();";
 const COMPARATOR_BUTTON_COLLAPSED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='block';b.textContent='\u{26F6} ' + (window.__neuralia_col_name || 'IA');}var m=document.querySelector('#neuralia-comp-minimize');if(m){m.style.display='block';}})();";
-

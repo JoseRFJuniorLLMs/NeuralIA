@@ -1,9 +1,13 @@
-﻿use super::*;
+use super::*;
 
 /// Cor do tempo e do contorno do botao do Pomodoro: a da fase
 /// (`phase_color`: tomate no foco, verde nas pausas) acertada ao fundo do
 /// botao para ler bem nos dois temas; sem sessao, a letra de sempre.
-pub(in crate::windows_app) fn tool_label_color(phase: Option<Phase>, fill: Rgb, theme: &Theme) -> Rgb {
+pub(in crate::windows_app) fn tool_label_color(
+    phase: Option<Phase>,
+    fill: Rgb,
+    theme: &Theme,
+) -> Rgb {
     match phase {
         Some(phase) => readable(phase_color(phase), fill, 4.5),
         None => theme.fg,
@@ -45,7 +49,10 @@ pub(in crate::windows_app) fn tool_action(tool: Tool, click: ToolClick) -> Optio
 
 /// Clique na barra do comparador: so os botoes das ferramentas dao uma
 /// `ToolAction`; o resto da barra segue o caminho que ja tinha.
-pub(in crate::windows_app) fn bar_tool_action(hit: Option<BarHit>, click: ToolClick) -> Option<ToolAction> {
+pub(in crate::windows_app) fn bar_tool_action(
+    hit: Option<BarHit>,
+    click: ToolClick,
+) -> Option<ToolAction> {
     match hit {
         Some(BarHit::Tool(tool)) => tool_action(tool, click),
         _ => None,
@@ -191,17 +198,21 @@ pub(in crate::windows_app) struct BarLayout {
     /// chip e apagado e nao leva o botao "+".
     pub(in crate::windows_app) minimized: [bool; COMPARATOR_COLUMNS],
     pub(in crate::windows_app) add_tabs: [UiRect; COMPARATOR_COLUMNS],
-    pub(in crate::windows_app) context_tabs: [[UiRect; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
-    pub(in crate::windows_app) context_indices: [[usize; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) context_tabs:
+        [[UiRect; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) context_indices:
+        [[usize; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
     pub(in crate::windows_app) context_tab_counts: [usize; COMPARATOR_COLUMNS],
     /// O x de fechar de cada aba visivel; sem largura quando a aba e estreita
     /// de mais para o ter sem esconder o titulo.
     pub(in crate::windows_app) tab_closes: [[UiRect; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
     /// O grupo (indice na coluna) de cada aba visivel.
-    pub(in crate::windows_app) tab_owners: [[Option<usize>; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) tab_owners:
+        [[Option<usize>; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
     /// Pilulas dos grupos, intercaladas com as abas na mesma fila.
     pub(in crate::windows_app) group_pills: [[UiRect; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS],
-    pub(in crate::windows_app) group_pill_indices: [[usize; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS],
+    pub(in crate::windows_app) group_pill_indices:
+        [[usize; MAX_VISIBLE_TAB_SLOTS]; COMPARATOR_COLUMNS],
     pub(in crate::windows_app) group_pill_counts: [usize; COMPARATOR_COLUMNS],
     /// O sublinhado de cada pilula, na cor do grupo: vai da pilula ao fim da
     /// ultima aba do grupo que esta a vista. Sem largura quando o grupo esta
@@ -222,7 +233,12 @@ pub(in crate::windows_app) struct BarLayout {
 
 impl BarLayout {
     #[cfg(test)]
-    pub(in crate::windows_app) fn new(client_width: f64, scale: f64, visible: bool, columns: usize) -> Self {
+    pub(in crate::windows_app) fn new(
+        client_width: f64,
+        scale: f64,
+        visible: bool,
+        columns: usize,
+    ) -> Self {
         Self::with_contexts(
             client_width,
             scale,
@@ -656,7 +672,11 @@ impl BarLayout {
     }
 
     /// Alguma aba do grupo `group_index` da coluna esta desenhada?
-    pub(in crate::windows_app) fn group_members_drawn(&self, column: usize, group_index: usize) -> bool {
+    pub(in crate::windows_app) fn group_members_drawn(
+        &self,
+        column: usize,
+        group_index: usize,
+    ) -> bool {
         column < self.columns_len
             && (0..self.context_tab_counts[column])
                 .any(|visual| self.tab_owners[column][visual] == Some(group_index))
@@ -715,7 +735,11 @@ pub(in crate::windows_app) fn tab_close_rect(tab: UiRect, scale: f64, size: f64)
 /// do texto apagado; sob o proprio rato fica vermelho com a cruz branca -- o
 /// mesmo vermelho do fechar da janela. Antes so aparecia com o rato na aba:
 /// parada, a barra nao mostrava x nenhum.
-pub(in crate::windows_app) fn tab_close_style(close_hovered: bool, tab_fill: Rgb, theme: &Theme) -> PillStyle {
+pub(in crate::windows_app) fn tab_close_style(
+    close_hovered: bool,
+    tab_fill: Rgb,
+    theme: &Theme,
+) -> PillStyle {
     if close_hovered {
         return caption_button_style(2, true, theme);
     }
@@ -814,7 +838,11 @@ impl TitleRowMetrics {
     /// pede; senao reparte-se por igual, e o que uma coluna curta nao usa
     /// passa as outras -- a ultima IA nunca fica sem abas por a primeira ter
     /// muitas.
-    pub(in crate::windows_app) fn budgets(&self, rows: &[TabRow], area: f64) -> [f64; COMPARATOR_COLUMNS] {
+    pub(in crate::windows_app) fn budgets(
+        &self,
+        rows: &[TabRow],
+        area: f64,
+    ) -> [f64; COMPARATOR_COLUMNS] {
         let count = rows.len().min(COMPARATOR_COLUMNS);
         let all = [true; MAX_VISIBLE_TAB_SLOTS];
         let mut demand = [0.0; COMPARATOR_COLUMNS];
@@ -1107,7 +1135,10 @@ pub(in crate::windows_app) const SERVICE_BUTTON_HITS: [BarHit; 4] = [
 /// O botao da barra que abre `service`: um dos icones dos servicos ou, para
 /// a Respiracao (uma ferramenta), o botao dela na linha do titulo. E nele que
 /// o painel minimizado poe o ponto (`draw_service_chrome`).
-pub(in crate::windows_app) fn service_icon_rect(controls: RightControls, service: Service) -> Option<UiRect> {
+pub(in crate::windows_app) fn service_icon_rect(
+    controls: RightControls,
+    service: Service,
+) -> Option<UiRect> {
     if service == Service::Breath {
         return Tool::ALL
             .iter()
@@ -1123,7 +1154,11 @@ pub(in crate::windows_app) fn service_icon_rect(controls: RightControls, service
         .map(|(rect, _)| *rect)
 }
 
-pub(in crate::windows_app) fn right_controls_hit(controls: RightControls, x: f64, y: f64) -> Option<BarHit> {
+pub(in crate::windows_app) fn right_controls_hit(
+    controls: RightControls,
+    x: f64,
+    y: f64,
+) -> Option<BarHit> {
     for (rect, tool) in controls.tools.iter().zip(Tool::ALL) {
         if rect.contains(x, y) {
             return Some(BarHit::Tool(tool));

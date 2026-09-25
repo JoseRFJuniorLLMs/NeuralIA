@@ -3,10 +3,11 @@ use std::time::Instant;
 use windows_sys::Win32::Foundation::{HWND, POINT};
 
 use crate::pomodoro_ui::{
-    pomodoro_menu_command, PomodoroCommand, PomodoroController, PomodoroHost, PomodoroMenuItem,
-    WindowAttention,
+    PomodoroCommand, PomodoroController, PomodoroHost, PomodoroMenuItem, WindowAttention,
+    pomodoro_menu_command,
 };
 use crate::windows_app::{
+    App, BarHit, Surface, Timers,
     bar_layout::{BarLabel, ToolAction},
     bar_tooltip_label, hover_tooltip,
     icons::{ICON_SLOT_BREATH, ICON_SLOT_NOTES, ICON_SLOT_POMODORO},
@@ -15,7 +16,6 @@ use crate::windows_app::{
     refresh_hint_text,
     services::Service,
     theme::{Rgb, Theme},
-    App, BarHit, Surface, Timers,
 };
 
 /// Quanto ficam no ecra os avisos do Pomodoro: os dos comandos, e os do fim

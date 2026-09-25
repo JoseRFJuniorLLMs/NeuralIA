@@ -4,7 +4,7 @@ use windows_sys::Win32::{
     Foundation::{HWND, POINT},
     Graphics::Gdi::{ClientToScreen, InvalidateRect, ScreenToClient},
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, SetWindowPos, ShowWindow, SW_HIDE, SWP_NOACTIVATE,
+        CreateWindowExW, DestroyWindow, SW_HIDE, SWP_NOACTIVATE, SetWindowPos, ShowWindow,
     },
 };
 use winit::{
@@ -17,38 +17,37 @@ use wry::{NewWindowResponse, PermissionKind, PermissionResponse, WebViewExtWindo
 use neural_core::{HistoryEntry, MemoryHit};
 
 use crate::gemini_live::{
-    live_ipc_message, live_page_url, live_panel_navigation, live_step, serve_live_asset,
-    LiveAction, LiveKeyStore, LiveMessage, LIVE_PROTOCOL,
+    LIVE_PROTOCOL, LiveAction, LiveKeyStore, LiveMessage, live_ipc_message, live_page_url,
+    live_panel_navigation, live_step, serve_live_asset,
 };
 use crate::panel_chrome::{
-    panel_area, panel_handle_area, panel_width, panel_width_from_drag, Area, PanelKind,
-    ScreenRect, ServiceBadge, ServiceEffect, ServiceFrame, ServiceInput, ServicePanelState,
-    EXIT_PAGE_FULLSCREEN_SCRIPT, PANEL_HANDLE_WIDTH, PANEL_WIDTHS_FILE, SERVICE_STRIP_HEIGHT,
+    Area, EXIT_PAGE_FULLSCREEN_SCRIPT, PANEL_HANDLE_WIDTH, PANEL_WIDTHS_FILE, PanelKind,
+    SERVICE_STRIP_HEIGHT, ScreenRect, ServiceBadge, ServiceEffect, ServiceFrame, ServiceInput,
+    ServicePanelState, panel_area, panel_handle_area, panel_width, panel_width_from_drag,
 };
 use crate::windows_app::{
-    debug_log, install_wheel_hook,
+    AUX_POPUP_EX_STYLE, AUX_POPUP_STYLE, App, BarHit, COMPARATOR_CHROME_HEIGHT, Surface,
+    TITLE_TAB_HEIGHT, Tool, WebViewHost, debug_log, install_wheel_hook,
     native::{
-        panel_handle_subclass, uninstall_wheel_hook, SetWindowSubclass,
-        PANEL_HANDLE_SUBCLASS_ID, PANEL_RESIZE_PENDING, PANEL_RESIZE_X, WHEEL_APP_HWND,
-        WHEEL_PANEL_ACTIVE, WHEEL_PANEL_BOTTOM, WHEEL_PANEL_HOST, WHEEL_PANEL_LEFT,
-        WHEEL_PANEL_RIGHT, WHEEL_PANEL_TOP,
+        PANEL_HANDLE_SUBCLASS_ID, PANEL_RESIZE_PENDING, PANEL_RESIZE_X, SetWindowSubclass,
+        WHEEL_APP_HWND, WHEEL_PANEL_ACTIVE, WHEEL_PANEL_BOTTOM, WHEEL_PANEL_HOST, WHEEL_PANEL_LEFT,
+        WHEEL_PANEL_RIGHT, WHEEL_PANEL_TOP, panel_handle_subclass, uninstall_wheel_hook,
     },
-    notes::{notes_command_for, notes_reply_script, NotesOrigin, NotesReply, NOTE_SAVE_REFUSED},
+    notes::{NOTE_SAVE_REFUSED, NotesOrigin, NotesReply, notes_command_for, notes_reply_script},
     page_scripts::{PANEL_NEW_NOTE_SCRIPT, PANEL_SHOW_NOTES_SCRIPT},
     services::{
-        close_service_panel_in, logical_rect, open_panel_width_for, raise_webview_host,
-        register_service_panel_events, service_event_is_current, service_panel_navigation,
-        service_panel_permission, Service, ServicePanel,
+        Service, ServicePanel, close_service_panel_in, logical_rect, open_panel_width_for,
+        raise_webview_host, register_service_panel_events, service_event_is_current,
+        service_panel_navigation, service_panel_permission,
     },
     show_popup_without_activation,
     side_panel::{
-        self, history_panel_items, memory_panel_items, panel_allows_navigation, panel_bounds,
-        panel_html, panel_render_script, panel_theme_vars, suggestion_panel_items, PanelExit,
-        PanelMessage, PANEL_RECENT_LIMIT, PANEL_SUGGESTION_LIMIT,
+        self, PANEL_RECENT_LIMIT, PANEL_SUGGESTION_LIMIT, PanelExit, PanelMessage,
+        history_panel_items, memory_panel_items, panel_allows_navigation, panel_bounds, panel_html,
+        panel_render_script, panel_theme_vars, suggestion_panel_items,
     },
-    theme::{themed_webview_builder, Theme},
-    web_media_permission, window_hwnd, App, BarHit, Surface, Tool, WebViewHost,
-    AUX_POPUP_EX_STYLE, AUX_POPUP_STYLE, COMPARATOR_CHROME_HEIGHT, TITLE_TAB_HEIGHT,
+    theme::{Theme, themed_webview_builder},
+    web_media_permission, window_hwnd,
 };
 
 /// A dica do icone do servico aberto: minimizado, diz que volta ao clique (e
@@ -505,7 +504,9 @@ impl App {
                 if created.is_null() {
                     return;
                 }
-                let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<crate::windows_app::UserEvent>) as usize;
+                let proxy_ptr = (&*self.omnibox_proxy
+                    as *const EventLoopProxy<crate::windows_app::UserEvent>)
+                    as usize;
                 if SetWindowSubclass(
                     created,
                     Some(panel_handle_subclass),

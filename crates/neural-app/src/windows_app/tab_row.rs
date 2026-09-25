@@ -1,4 +1,4 @@
-﻿use super::*;
+use super::*;
 
 /// As cores que um grupo de abas pode ter: as nove do Chrome, com os nomes
 /// dele. Poucas e nomeadas: uma paleta aberta obrigaria a um seletor, e o que
@@ -409,7 +409,11 @@ pub(in crate::windows_app) fn create_context_group(
 /// Poe a aba no grupo e encosta-a ao ultimo membro: os membros de um grupo tem
 /// de ficar juntos na barra, senao a pilula fica a rotular abas que nao sao
 /// dela.
-pub(in crate::windows_app) fn join_context_group(tabs: &mut Vec<ContextTab>, group_id: u64, tab_index: usize) {
+pub(in crate::windows_app) fn join_context_group(
+    tabs: &mut Vec<ContextTab>,
+    group_id: u64,
+    tab_index: usize,
+) {
     if tab_index >= tabs.len() {
         return;
     }
@@ -440,7 +444,10 @@ pub(in crate::windows_app) fn leave_context_group(
 
 /// Solta a aba do seu grupo e poe-na logo depois do ultimo membro que fica.
 /// Devolve onde a aba ficou. Uma aba solta fica onde esta.
-pub(in crate::windows_app) fn detach_from_group(tabs: &mut Vec<ContextTab>, tab_index: usize) -> usize {
+pub(in crate::windows_app) fn detach_from_group(
+    tabs: &mut Vec<ContextTab>,
+    tab_index: usize,
+) -> usize {
     let Some(group) = tabs.get(tab_index).and_then(|tab| tab.group) else {
         return tab_index;
     };
@@ -476,7 +483,10 @@ pub(in crate::windows_app) fn group_runs_are_contiguous(tabs: &[ContextTab]) -> 
 }
 
 /// Onde comeca e onde acaba (exclusivo) o troco do grupo na fila.
-pub(in crate::windows_app) fn group_run(tabs: &[ContextTab], group_id: u64) -> Option<(usize, usize)> {
+pub(in crate::windows_app) fn group_run(
+    tabs: &[ContextTab],
+    group_id: u64,
+) -> Option<(usize, usize)> {
     let start = tabs.iter().position(|tab| tab.group == Some(group_id))?;
     let end = tabs
         .iter()
@@ -489,7 +499,11 @@ pub(in crate::windows_app) fn group_run(tabs: &[ContextTab], group_id: u64) -> O
 /// `group`, para nao partir o troco de grupo nenhum: longe dos outros membros,
 /// vai para o fim do troco do seu grupo; solta no meio de outro grupo, vai
 /// para logo depois dele.
-pub(in crate::windows_app) fn contiguous_slot(tabs: &[ContextTab], at: usize, group: Option<u64>) -> usize {
+pub(in crate::windows_app) fn contiguous_slot(
+    tabs: &[ContextTab],
+    at: usize,
+    group: Option<u64>,
+) -> usize {
     let at = at.min(tabs.len());
     let before = at
         .checked_sub(1)
@@ -567,7 +581,10 @@ pub(in crate::windows_app) fn move_context_group(
     true
 }
 
-pub(in crate::windows_app) fn prune_empty_groups(tabs: &[ContextTab], groups: &mut Vec<ContextGroup>) {
+pub(in crate::windows_app) fn prune_empty_groups(
+    tabs: &[ContextTab],
+    groups: &mut Vec<ContextGroup>,
+) {
     groups.retain(|group| tabs.iter().any(|tab| tab.group == Some(group.id)));
 }
 
@@ -908,7 +925,10 @@ pub(in crate::windows_app) enum TabListEntry {
 /// Todas as abas da coluna pela ordem da barra, cada grupo com as suas --
 /// recolhidos e cortados incluidos. E por aqui que qualquer aba guardada no
 /// `tabs.json` volta a estar ao alcance, por mais antiga que seja.
-pub(in crate::windows_app) fn tab_list_entries(tabs: &[ContextTab], groups: &[ContextGroup]) -> Vec<TabListEntry> {
+pub(in crate::windows_app) fn tab_list_entries(
+    tabs: &[ContextTab],
+    groups: &[ContextGroup],
+) -> Vec<TabListEntry> {
     let mut entries: Vec<TabListEntry> = Vec::new();
     for (index, tab) in tabs.iter().enumerate() {
         let label = context_tab_label(&tab.url);
@@ -965,7 +985,10 @@ pub(in crate::windows_app) enum TabMenuCommand {
 /// Id devolvido pelo `TrackPopupMenu` da aba -> operacao. As entradas do
 /// submenu "Mover para o grupo" sao `TAB_MENU_GROUP_BASE + posicao` em
 /// `joinable`, a mesma lista com que o menu foi montado.
-pub(in crate::windows_app) fn tab_menu_command(id: usize, joinable: &[(usize, String)]) -> Option<TabMenuCommand> {
+pub(in crate::windows_app) fn tab_menu_command(
+    id: usize,
+    joinable: &[(usize, String)],
+) -> Option<TabMenuCommand> {
     Some(match id {
         TAB_MENU_OPEN => TabMenuCommand::Open,
         TAB_MENU_FULLSCREEN => TabMenuCommand::Fullscreen,
@@ -1050,7 +1073,11 @@ pub(in crate::windows_app) const DRAG_THRESHOLD: f64 = 4.0;
 /// Folga, alem das pontas da fila da coluna, onde ainda se pode largar.
 pub(in crate::windows_app) const DROP_MARGIN: f64 = 24.0;
 
-pub(in crate::windows_app) fn drag_started(origin: (f64, f64), now: (f64, f64), scale: f64) -> bool {
+pub(in crate::windows_app) fn drag_started(
+    origin: (f64, f64),
+    now: (f64, f64),
+    scale: f64,
+) -> bool {
     let limit = DRAG_THRESHOLD * scale.max(1.0);
     (now.0 - origin.0).abs() > limit || (now.1 - origin.1).abs() > limit
 }

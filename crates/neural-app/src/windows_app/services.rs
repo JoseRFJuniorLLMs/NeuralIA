@@ -1,4 +1,4 @@
-﻿use super::*;
+use super::*;
 
 // Servicos no painel lateral (caminho A do WebRTC, aprovado pelo dono): o
 // servico corre como uma pagina da internet comum -- contatos e chamadas sao
@@ -17,7 +17,8 @@ pub(in crate::windows_app) enum Service {
 }
 
 /// O video de respiracao que o dono escolheu.
-pub(in crate::windows_app) const BREATH_VIDEO_URL: &str = "https://www.youtube.com/watch?v=UJBknAsxfrA";
+pub(in crate::windows_app) const BREATH_VIDEO_URL: &str =
+    "https://www.youtube.com/watch?v=UJBknAsxfrA";
 
 impl Service {
     pub(in crate::windows_app) fn url(self) -> &'static str {
@@ -503,7 +504,8 @@ pub(in crate::windows_app) unsafe fn draw_tool_button(
 }
 
 /// A dica do olho. O estado ve-se na cor do botao.
-pub(in crate::windows_app) const LIVE_TOOLTIP: &str = "Gemini Live: ver a tela, câmera e microfone (liga/desliga)";
+pub(in crate::windows_app) const LIVE_TOOLTIP: &str =
+    "Gemini Live: ver a tela, câmera e microfone (liga/desliga)";
 
 /// Vermelho de "a gravar": com o Gemini Live ligado o botao fica cheio desta
 /// cor, para ninguem esquecer que a tela, a camera e o microfone estao a sair.
@@ -566,7 +568,10 @@ pub(in crate::windows_app) fn load_gmail_setting(path: &std::path::Path) -> bool
         .unwrap_or(true)
 }
 
-pub(in crate::windows_app) fn save_gmail_setting(path: &std::path::Path, on: bool) -> std::io::Result<()> {
+pub(in crate::windows_app) fn save_gmail_setting(
+    path: &std::path::Path,
+    on: bool,
+) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }

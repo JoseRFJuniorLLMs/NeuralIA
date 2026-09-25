@@ -4,25 +4,23 @@ use url::Url;
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     UI::{
-        Input::KeyboardAndMouse::{
-            EnableWindow, GetAsyncKeyState, SetFocus, VK_CONTROL, VK_SHIFT,
-        },
+        Input::KeyboardAndMouse::{EnableWindow, GetAsyncKeyState, SetFocus, VK_CONTROL, VK_SHIFT},
         WindowsAndMessaging::{
-            MessageBoxW, SendMessageW, SetWindowTextW, ShowWindow, IDYES, MB_DEFBUTTON2,
-            MB_ICONWARNING, MB_YESNO, SW_HIDE, SW_SHOW, WM_CHAR, WM_KEYDOWN,
+            IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, MessageBoxW, SW_HIDE, SW_SHOW,
+            SendMessageW, SetWindowTextW, ShowWindow, WM_CHAR, WM_KEYDOWN,
         },
     },
 };
 use winit::event_loop::EventLoopProxy;
 
-use crate::pomodoro_ui::{parse_pomodoro_command, POMODORO_COMMAND_HELP, PomodoroCommand};
+use crate::pomodoro_ui::{POMODORO_COMMAND_HELP, PomodoroCommand, parse_pomodoro_command};
 use crate::windows_app::{
-    debug_log, get_window_text,
-    native::{lifecycle_probe_enabled, lifecycle_probe_home_message, DefSubclassProc, EM_SETSEL},
+    App, COMPARATOR_COLUMNS, HistoryEntry, HistoryKind, Intent, LIFECYCLE_LAST_HOME_NONCE, Surface,
+    THEME_COMMAND_HELP, UserEvent, debug_log, get_window_text,
+    native::{DefSubclassProc, EM_SETSEL, lifecycle_probe_enabled, lifecycle_probe_home_message},
     search_card::{CompareRequest, TRANSLATE_COMMAND},
     theme::ThemeChoice,
-    wide_null, window_hwnd, App, HistoryEntry, HistoryKind, Intent, LIFECYCLE_LAST_HOME_NONCE,
-    Surface, UserEvent, COMPARATOR_COLUMNS, THEME_COMMAND_HELP,
+    wide_null, window_hwnd,
 };
 use neural_core::parse_intent;
 
@@ -190,12 +188,19 @@ pub(in crate::windows_app) enum PaletteRoute {
     Home,
     /// URL: abre ao lado da coluna, privada se a palette veio de um painel
     /// privado. A rede local e permitida porque a URL foi digitada.
-    OpenSplit { url: Url, private: bool },
+    OpenSplit {
+        url: Url,
+        private: bool,
+    },
     /// Texto numa coluna normal: a pergunta vai para o fornecedor da coluna
     /// e fica no historico.
-    LoadProvider { query: String },
+    LoadProvider {
+        query: String,
+    },
     /// Texto num painel privado: a pergunta abre como fonte privada.
-    OpenPrivateProvider { query: String },
+    OpenPrivateProvider {
+        query: String,
+    },
     /// `pomodoro:` -- o botao do Pomodoro vive na barra do comparador, e e
     /// aqui (a palette) que o teclado escreve comandos: sem esta rota,
     /// "pomodoro:pausar" dava "esquema nao permitido" e "pomodoro: 50" ia
@@ -253,9 +258,7 @@ pub(in crate::windows_app) unsafe extern "system" fn omnibox_subclass(
     _subclass_id: usize,
     reference_data: usize,
 ) -> LRESULT {
-    if message == lifecycle_probe_home_message()
-        && lifecycle_probe_enabled()
-        && reference_data != 0
+    if message == lifecycle_probe_home_message() && lifecycle_probe_enabled() && reference_data != 0
     {
         let nonce = wparam;
         if nonce == 0 || LIFECYCLE_LAST_HOME_NONCE.swap(nonce, Ordering::AcqRel) != nonce {

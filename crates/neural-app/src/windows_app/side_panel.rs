@@ -1,4 +1,4 @@
-﻿use super::*;
+use super::*;
 
 // Painel lateral (Ctrl+H): historico inteligente -- busca semantica, sugestoes
 // de sites e os recentes. E uma WebView LOCAL com canal IPC proprio: so esta
@@ -400,7 +400,11 @@ pub(in crate::windows_app) fn panel_allows_navigation(target: &str) -> bool {
 /// Encostado a direita, abaixo da barra do comparador (ou do topo, fora
 /// dele): 34% da largura, entre 320 e 440 px logicos, nunca mais que a janela.
 #[cfg(test)]
-pub(in crate::windows_app) fn side_panel_bounds(logical_w: f64, logical_h: f64, top: f64) -> (f64, f64, f64, f64) {
+pub(in crate::windows_app) fn side_panel_bounds(
+    logical_w: f64,
+    logical_h: f64,
+    top: f64,
+) -> (f64, f64, f64, f64) {
     panel_bounds(PanelKind::History, None, logical_w, logical_h, top)
 }
 
@@ -427,7 +431,10 @@ pub(in crate::windows_app) fn panel_bounds(
 /// Layout, divisores e o arrasto dos divisores usam TODOS esta conta; o
 /// arrasto usava a janela inteira e o divisor fugia do rato com o painel
 /// aberto.
-pub(in crate::windows_app) fn comparator_logical_width(window_logical_w: f64, panel_width: f64) -> f64 {
+pub(in crate::windows_app) fn comparator_logical_width(
+    window_logical_w: f64,
+    panel_width: f64,
+) -> f64 {
     (window_logical_w - panel_width.max(0.0)).max(1.0)
 }
 
@@ -487,7 +494,10 @@ pub(in crate::windows_app) fn memory_panel_items(hits: &[MemoryHit]) -> Vec<Pane
 
 /// Sugestoes de sites: os resultados da memoria que tem endereco web, um por
 /// dominio, na ordem de relevancia.
-pub(in crate::windows_app) fn suggestion_panel_items(hits: &[MemoryHit], limit: usize) -> Vec<PanelItem> {
+pub(in crate::windows_app) fn suggestion_panel_items(
+    hits: &[MemoryHit],
+    limit: usize,
+) -> Vec<PanelItem> {
     let mut seen = std::collections::HashSet::new();
     let mut items = Vec::new();
     for hit in hits {

@@ -1,4 +1,4 @@
-﻿/// Avanca uma pagina, parando no fim em vez de dar a volta. Usa a altura visivel
+/// Avanca uma pagina, parando no fim em vez de dar a volta. Usa a altura visivel
 /// menos uma faixa de sobreposicao, para nao se perder a linha que se estava a
 /// ler. Corre no documento e tambem nos frames a que conseguimos chegar.
 pub(in crate::windows_app) const AUTO_SCROLL_SCRIPT: &str = r#"
@@ -98,7 +98,8 @@ pub(in crate::windows_app) const NOTE_CAPTURE_SCRIPT: &str = r#"(function () {
 /// Visualizador de PDF proprio: o do Edge corre noutro processo e nao aceita
 /// nem script nem teclado nosso; este e uma pagina nossa, com o PDF.js da
 /// Mozilla (Apache-2.0, assets/pdfjs/LICENSE) a desenhar as paginas em canvas.
-pub(in crate::windows_app) const PDF_VIEWER_HTML: &[u8] = include_bytes!("../../../../assets/pdfjs/viewer.html");
+pub(in crate::windows_app) const PDF_VIEWER_HTML: &[u8] =
+    include_bytes!("../../../../assets/pdfjs/viewer.html");
 
 /// Mapa de teclas injetado em TODAS as paginas. O teclado pertence ao WebView2,
 /// que e uma janela filha: a janela nativa nunca ve a tecla, por isso e aqui,

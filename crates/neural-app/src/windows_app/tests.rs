@@ -1,8 +1,8 @@
 use super::*;
-use std::ffi::OsString;
-use windows_sys::Win32::Graphics::Gdi::GetDIBits;
 use crate::gemini_live::{LiveAction, live_page_url, live_panel_navigation};
 use crate::panel_chrome::panel_width_from_drag;
+use std::ffi::OsString;
+use windows_sys::Win32::Graphics::Gdi::GetDIBits;
 /// O fundo da Home acompanha a marca, nao disputa com ela.
 ///
 /// A versao anterior lancava particulas das margens e fazia-as convergir
@@ -9286,7 +9286,9 @@ __state('barra');
     // `configure_split_webview`: nada depois dele troca o perfil, o
     // script ou os handlers que o gate acima chamou.
     let wrapper = source
-        .split("fn split_webview_builder(&self, build: &SplitBuild) -> WebViewBuilder<'static> {")
+        .split(
+            "fn split_webview_builder(\n        &self,\n        build: &SplitBuild,\n    ) -> WebViewBuilder<'static> {",
+        )
         .nth(1)
         .and_then(|part| part.split("\n    }\n").next())
         .expect("split_webview_builder");

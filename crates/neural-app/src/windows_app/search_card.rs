@@ -1,4 +1,4 @@
-﻿use super::*;
+use super::*;
 
 /// Para onde o cartao manda a resposta: o proxy do event loop no app, um
 /// registo nos gates. Em caixa dupla: o `reference_data` da subclasse e um
@@ -129,7 +129,8 @@ pub(in crate::windows_app) fn compare_records(
 /// pagina e um "&", nao um sublinhado), quebra por palavras e, numa palavra
 /// maior que a linha, por caracteres. Sem DT_END_ELLIPSIS: o corte e o de
 /// `search_card_fit`, medido, nunca um que o GDI faca em silencio.
-pub(in crate::windows_app) const SEARCH_CARD_TEXT_FORMAT: u32 = DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX;
+pub(in crate::windows_app) const SEARCH_CARD_TEXT_FORMAT: u32 =
+    DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX;
 
 /// Onde fica cada coisa no cartao, em pixeis do cliente. Uma so funcao para o
 /// desenho e o clique concordarem sempre.
@@ -456,7 +457,11 @@ pub(in crate::windows_app) struct SearchCard {
 }
 
 impl SearchCard {
-    pub(in crate::windows_app) fn step(&mut self, input: SearchCardInput, now: Instant) -> SearchCardOutcome {
+    pub(in crate::windows_app) fn step(
+        &mut self,
+        input: SearchCardInput,
+        now: Instant,
+    ) -> SearchCardOutcome {
         match input {
             SearchCardInput::Request { text, intent } => {
                 let Some(SelectionSearch::Compare(question)) = selection_search(&text) else {
@@ -535,7 +540,10 @@ pub(in crate::windows_app) trait SearchCardHost {
     fn compare_selection(&mut self, request: CompareRequest);
 }
 
-pub(in crate::windows_app) fn apply_search_card(host: &mut impl SearchCardHost, outcome: SearchCardOutcome) {
+pub(in crate::windows_app) fn apply_search_card(
+    host: &mut impl SearchCardHost,
+    outcome: SearchCardOutcome,
+) {
     match outcome {
         SearchCardOutcome::Show {
             token,

@@ -1,6 +1,6 @@
 use std::{
     ffi::OsString,
-    sync::{atomic::Ordering, Mutex},
+    sync::{Mutex, atomic::Ordering},
     time::Duration,
 };
 
@@ -8,14 +8,14 @@ use url::Url;
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::Gdi::{
-        BeginPaint, ClientToScreen, CreateRoundRectRgn, CreateSolidBrush, DeleteObject,
-        DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, EndPaint, FillRect,
-        FW_BOLD, FW_NORMAL, InvalidateRect, PAINTSTRUCT, SelectObject, SetBkMode,
-        SetTextColor, SetWindowRgn, TRANSPARENT,
+        BeginPaint, ClientToScreen, CreateRoundRectRgn, CreateSolidBrush, DT_END_ELLIPSIS,
+        DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, EndPaint, FW_BOLD, FW_NORMAL,
+        FillRect, InvalidateRect, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, SetWindowRgn,
+        TRANSPARENT,
     },
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, GetClientRect, SetWindowPos, ShowWindow, HTCLIENT, SW_HIDE,
-        SWP_NOACTIVATE, WM_LBUTTONUP, WM_NCHITTEST, WM_PAINT,
+        CreateWindowExW, DestroyWindow, GetClientRect, HTCLIENT, SW_HIDE, SWP_NOACTIVATE,
+        SetWindowPos, ShowWindow, WM_LBUTTONUP, WM_NCHITTEST, WM_PAINT,
     },
 };
 use winit::{
@@ -24,19 +24,16 @@ use winit::{
 };
 use wry::{NewWindowResponse, PermissionResponse};
 
-use crate::ipc::{parse_ipc_message, IpcAction};
+use crate::ipc::{IpcAction, parse_ipc_message};
 use crate::windows_app::{
-    create_font,
-    icons::{draw_pill, draw_text, rgb3, PillStyle},
-    native::{window_hwnd, DefSubclassProc, SetWindowSubclass},
+    AUX_POPUP_EX_STYLE, AUX_POPUP_STYLE, App, COMPARATOR_COLUMNS, UiRect, UserEvent, create_font,
+    icons::{PillStyle, draw_pill, draw_text, rgb3},
+    native::{DefSubclassProc, SetWindowSubclass, window_hwnd},
     page_scripts::GMAIL_MONITOR_SCRIPT,
     remote_capability,
     search_card::{gmail_toast_buttons, show_popup_without_activation},
-    services::{
-        gmail_field, gmail_is_new_mail, save_gmail_setting, Service, GMAIL_NOTIFICATIONS,
-    },
-    theme::{on_color, themed_webview_builder, Theme},
-    App, UiRect, UserEvent, AUX_POPUP_EX_STYLE, AUX_POPUP_STYLE, COMPARATOR_COLUMNS,
+    services::{GMAIL_NOTIFICATIONS, Service, gmail_field, gmail_is_new_mail, save_gmail_setting},
+    theme::{Theme, on_color, themed_webview_builder},
 };
 
 /// Quanto tempo o aviso de correio novo fica no canto.

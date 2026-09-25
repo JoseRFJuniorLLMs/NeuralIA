@@ -1,4 +1,4 @@
-﻿use super::*;
+use super::*;
 
 /// Slot 0..2 = icones das IAs, slot 3 = glifo da casa (pintado com a cor do tema).
 pub(in crate::windows_app) const ICON_SLOT_HOME: usize = COMPARATOR_COLUMNS;
@@ -14,7 +14,8 @@ pub(in crate::windows_app) const ICON_SLOT_NOTES: usize = COMPARATOR_COLUMNS + 7
 pub(in crate::windows_app) const ICON_SLOT_BREATH: usize = COMPARATOR_COLUMNS + 8;
 /// O olho do Gemini Live.
 pub(in crate::windows_app) const ICON_SLOT_LIVE: usize = COMPARATOR_COLUMNS + 9;
-pub(in crate::windows_app) static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 9] = [const { OnceLock::new() }; 9];
+pub(in crate::windows_app) static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 9] =
+    [const { OnceLock::new() }; 9];
 
 pub(in crate::windows_app) static AI_ICON_IMAGES: [OnceLock<RgbaImage>; COMPARATOR_COLUMNS] =
     [OnceLock::new(), OnceLock::new(), OnceLock::new()];
@@ -27,14 +28,18 @@ pub(in crate::windows_app) const ICON_CACHE_CAPACITY: usize = 24;
 /// (slot, lado em pixeis) -> bitmap ja redimensionado, partilhado por `Arc`
 /// para o desenho nao copiar a imagem a cada WM_PAINT.
 pub(in crate::windows_app) type IconCacheEntry = ((usize, u32), Arc<RgbaImage>);
-pub(in crate::windows_app) static ICON_SCALE_CACHE: Mutex<Vec<IconCacheEntry>> = Mutex::new(Vec::new());
+pub(in crate::windows_app) static ICON_SCALE_CACHE: Mutex<Vec<IconCacheEntry>> =
+    Mutex::new(Vec::new());
 
 /// LRU minimo sobre um vector: o fim e o mais recentemente usado, o inicio e o
 /// candidato a sair. Estao separadas do cache de icones de proposito — assim a
 /// politica de eviccao testa-se sem GDI, sem PNGs e sem estado global.
 ///
 /// Devolve o valor se a chave existir, promovendo a entrada a mais recente.
-pub(in crate::windows_app) fn lru_promote<K: PartialEq, V: Clone>(entries: &mut Vec<(K, V)>, key: &K) -> Option<V> {
+pub(in crate::windows_app) fn lru_promote<K: PartialEq, V: Clone>(
+    entries: &mut Vec<(K, V)>,
+    key: &K,
+) -> Option<V> {
     let index = entries.iter().position(|(cached, _)| cached == key)?;
     let entry = entries.remove(index);
     let value = entry.1.clone();
