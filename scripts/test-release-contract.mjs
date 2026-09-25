@@ -33,6 +33,33 @@ assert.doesNotMatch(
   /gh release create[^\n]*dist\/\*/,
   'stable release must not upload every internal CI artifact'
 );
+// Two release rhythms (AGENTS.md 2.1): X.0.Z is LTS (Latest), everything else
+// is a preview published as a pre-release. Run the shipped bash pattern on a
+// table of tags instead of trusting its text.
+const channelRule = workflow.match(
+  /if \[\[ "\$RELEASE_TAG" =~ (\S+) \]\]; then\s+channel_flag="--latest"\s+else\s+channel_flag="--prerelease"\s+fi/
+);
+assert.ok(channelRule, 'publish must pick --latest or --prerelease from the release tag');
+const ltsTag = new RegExp(channelRule[1]);
+for (const [tag, lts] of [
+  ['v3.0.0', true],
+  ['v3.0.7', true],
+  ['v4.0.0', true],
+  ['v10.0.12', true],
+  ['v2.2.0', false],
+  ['v2.1.8', false],
+  ['v3.1.0', false],
+  ['v3.10.0', false],
+  ['v30.1.0', false],
+  ['v3.0.0-rc1', false],
+]) {
+  assert.equal(ltsTag.test(tag), lts, `${tag} must be ${lts ? 'LTS (Latest)' : 'a preview (pre-release)'}`);
+}
+assert.match(
+  workflow,
+  /gh release create "\$RELEASE_TAG"[^\n]*--generate-notes\s+"\$channel_flag"/,
+  'the release is created with the channel the tag picked'
+);
 assert.doesNotMatch(
   workflow,
   /\$portableName/,

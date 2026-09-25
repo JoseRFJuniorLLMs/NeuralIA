@@ -15,6 +15,7 @@ All notable changes to NeuralIA are documented here.
 - **feat/epub — leitor e biblioteca de livros EPUB (26a9ccf):** suporte a livros `.epub` em biblioteca local (`livros:`, `biblioteca:`, `books:`, `library:`, ou arrastar arquivo para a janela, ou `Ctrl+O` na Home); leitor com navegação por capítulos, paginação, índice, progresso de leitura, busca no livro, modo escuro/claro e leitura em voz alta com síntese de voz local. Parsing seguro com limites rígidos de metadados, recusa de entidades XML e DRM, e renderização em iframe isolado sob a origem `http://neuralia-epub.localhost` com CSP restritivo (`script-src 'none'`). Canal IPC dedicado e isolado (`parse_epub_ipc`) com lista fechada de 8 mensagens sem alterar a contagem de 31 ações de `ipc.rs`.
 
 ### Changed
+- **Releases em dois ritmos (docs/two-speed-releases; AGENTS.md §2.1):** as versões `X.0.Z` (3.0.0, 4.0.0…) são LTS e aparecem como a versão mais recente (Latest) no GitHub. As outras versões (2.2.0, 3.1.0…) saem mais depressa como prévia (pre-release): continuam disponíveis para descarregar, mas não substituem a Latest. O `scripts/test-release-contract.mjs` testa a regra do canal sobre uma tabela de versões.
 - **feat/selection-toolbar — duplo clique nas colunas:** um duplo clique numa palavra seleciona-a e mostra a barra de seleção em vez de expandir a coluna; um duplo clique que não deixa texto selecionado continua a expandir.
 
 ### Fixed
