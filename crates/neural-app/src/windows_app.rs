@@ -98,8 +98,9 @@ pub(in crate::windows_app) enum PageTarget {
 
 #[derive(Debug)]
 pub(in crate::windows_app) enum UserEvent {
-    /// Escolha de tema feita no menu do botao Home.
-    ThemeChosen(ThemeChoice),
+    /// O tema (`theme.rs`): a unica variante do modulo, com o enum dele
+    /// dentro. E o padrao de cada feature: uma variante aqui, o resto la.
+    Theme(ThemeEvent),
     /// Pedido da pagina local do painel lateral (canal proprio), com o
     /// numero da pagina que o mandou.
     Panel(side_panel::PanelPost),
@@ -370,9 +371,6 @@ const PALETTE_EDIT_HEIGHT: f64 = 30.0;
 const PALETTE_HINT_TOP: f64 = 48.0;
 /// Fraccao da altura util (abaixo da barra) a que a palette pousa.
 const PALETTE_TOP_RATIO: f64 = 0.18;
-/// A ajuda do `tema:` com uma palavra desconhecida (omnibox e palette).
-pub(in crate::windows_app) const THEME_COMMAND_HELP: &str =
-    "Use tema:sistema, tema:claro ou tema:escuro.";
 const SEARCH_CARD_SUBCLASS_ID: usize = 0x4E71;
 /// Cartao de confirmacao da barra de selecao ("Mandar para as 3 IAs?",
 /// "Traduzir nas 3 IAs?"), em pixeis logicos, centrado na janela. A caixa do
@@ -952,11 +950,12 @@ const HINT_MAX_WIDTH_PX: f64 = 640.0;
 /// clique --, nao so o nome do botao.
 pub(in crate::windows_app) fn bar_tooltip_label(
     hit: BarHit,
+    state: &BarState,
     provider: &str,
-    maximized: bool,
     tab_url: Option<&str>,
     group: Option<(&str, bool)>,
 ) -> Option<String> {
+    let maximized = state.maximized;
     Some(match hit {
         BarHit::Home => "Voltar à Home".to_string(),
         BarHit::Back => "Voltar na fonte aberta ao lado".to_string(),
@@ -1614,54 +1613,6 @@ pub(in crate::windows_app) fn refresh_hint_text(text: &str) {
     show_pending_tooltip();
 }
 
-/// Menu de tema no cursor, com a escolha em vigor marcada. Devolve a opcao
-/// clicada, ou None se o menu foi fechado sem escolha.
-fn pick_theme_from_menu(hwnd: HWND) -> Option<ThemeChoice> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, GA_ROOT, GetAncestor, MF_CHECKED, MF_STRING,
-        SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    };
-    let current = ThemeChoice::current();
-    unsafe {
-        let menu = CreatePopupMenu();
-        if menu.is_null() {
-            return None;
-        }
-        for (index, choice) in ThemeChoice::ALL.iter().enumerate() {
-            let flags = if *choice == current {
-                MF_STRING | MF_CHECKED
-            } else {
-                MF_STRING
-            };
-            let label: Vec<u16> = choice
-                .label()
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-            AppendMenuW(menu, flags, index + 1, label.as_ptr());
-        }
-        let mut cursor = POINT { x: 0, y: 0 };
-        GetCursorPos(&mut cursor);
-        // Sem o dono em primeiro plano, o menu nao fecha ao clicar fora.
-        let root = GetAncestor(hwnd, GA_ROOT);
-        SetForegroundWindow(root);
-        let picked = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON,
-            cursor.x,
-            cursor.y,
-            0,
-            root,
-            std::ptr::null(),
-        );
-        DestroyMenu(menu);
-        usize::try_from(picked)
-            .ok()
-            .and_then(|id| id.checked_sub(1))
-            .and_then(|index| ThemeChoice::ALL.get(index).copied())
-    }
-}
-
 /// Pixeis BGRA de um disco da cor `color` com a borda suave, com o alfa ja
 /// multiplicado nos canais -- o que o menu espera de um bitmap de 32 bits.
 fn swatch_pixels(color: Rgb, size: i32) -> Vec<u8> {
@@ -2085,7 +2036,7 @@ unsafe extern "system" fn home_button_subclass(
                 && reference_data != 0
             {
                 let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
-                let _ = proxy.send_event(UserEvent::ThemeChosen(choice));
+                let _ = proxy.send_event(UserEvent::Theme(ThemeEvent::Chosen(choice)));
             }
             0
         }
@@ -6102,16 +6053,12 @@ fn draw_home(
     }
 }
 
-// O arrasto das abas (2.1.7) e a etiqueta do Pomodoro chegam ambos da `App`.
-#[allow(clippy::too_many_arguments)]
+// O arrasto das abas (2.1.7), a etiqueta do Pomodoro e o resto do estado
+// chegam da `App` num `BarState` so (`App::bar_state`).
 fn draw_comparator_bar<W>(
     window: &Window,
     comp: &ComparatorState,
-    hover: Option<BarHit>,
-    visible: bool,
-    auto_scroll: bool,
-    drag: Option<DragPaint>,
-    pomodoro_label: Option<BarLabel>,
+    state: BarState,
     live: &LivePanel<W>,
 ) {
     let Ok(handle) = window.window_handle() else {
@@ -6161,7 +6108,7 @@ fn draw_comparator_bar<W>(
             width,
             scale,
             &names,
-            bar_columns(comp, pomodoro_label),
+            bar_columns(comp, state.pomodoro_label),
             &comp.contexts,
             &comp.groups,
             comp.split.as_ref().map(|split| {
@@ -6173,10 +6120,7 @@ fn draw_comparator_bar<W>(
                 )
             }),
             comp.bar_focus,
-            visible,
-            hover,
-            auto_scroll,
-            drag,
+            state,
             live,
             &Theme::system(),
         );
@@ -6196,16 +6140,13 @@ fn draw_comparator_bar<W>(
 
 /// Todo o desenho da barra de topo, num DC qualquer — o ecra em producao, um
 /// bitmap em memoria nos testes, que e como este visual se inspeciona sem ecra.
-#[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 unsafe fn paint_comparator_bar<W>(
     target: *mut core::ffi::c_void,
     width: i32,
     scale: f64,
     names: &[&str],
-    visible: bool,
-    hover: Option<BarHit>,
-    auto_scroll: bool,
+    state: BarState,
     live: &LivePanel<W>,
     theme: &Theme,
 ) {
@@ -6221,10 +6162,7 @@ unsafe fn paint_comparator_bar<W>(
         &no_groups,
         None,
         [None; COMPARATOR_COLUMNS],
-        visible,
-        hover,
-        auto_scroll,
-        None,
+        state,
         live,
         theme,
     );
@@ -6243,13 +6181,17 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
     groups: &[Vec<ContextGroup>; COMPARATOR_COLUMNS],
     active_context: Option<(usize, Option<u64>, bool, bool)>,
     focus: [Option<u64>; COMPARATOR_COLUMNS],
-    visible: bool,
-    hover: Option<BarHit>,
-    auto_scroll: bool,
-    drag: Option<DragPaint>,
+    state: BarState,
     live: &LivePanel<W>,
     theme: &Theme,
 ) {
+    let BarState {
+        hover,
+        visible,
+        auto_scroll,
+        drag,
+        ..
+    } = state;
     // A meio de um arrasto a fila da coluna desenha-se ja como ficara se o
     // botao subir agora: as outras abas abrem lugar ao que se arrasta -- e o
     // que se arrasta fica sempre na fila (e a ancora da coluna), como no
@@ -6588,12 +6530,13 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
         (layout.forward, "›", BarHit::Forward),
     ];
     for index in 0..layout.columns_len {
-        pairs.push((layout.column_back[index], "‹", BarHit::ColumnBack(index)));
-        pairs.push((
-            layout.column_forward[index],
-            "›",
-            BarHit::ColumnForward(index),
-        ));
+        for button in ColumnButton::ALL {
+            pairs.push((
+                layout.column_button(index, button),
+                button.glyph(),
+                button.hit(index),
+            ));
+        }
     }
     for (rect, label, hit) in pairs {
         if rect.width > 0.0 {
@@ -6625,39 +6568,33 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
             theme.bar_bg,
         );
     }
+    // O canto direito pela ordem do registo (`RIGHT_CLUSTER`): o olho do
+    // Gemini Live pinta-se do estado do painel; os outros sao icones, com
+    // a cor de cada um -- o envelope do Gmail apaga-se com os avisos
+    // desligados; o Privado e o chapeu e os oculos, sem nome (pedido do
+    // dono). Os lugares nao se tocam, por isso a ordem de pintura e a do
+    // registo.
     let gmail_tint = if GMAIL_NOTIFICATIONS.load(Ordering::Acquire) {
         theme.fg
     } else {
         theme.fg_muted
     };
-    let icons = [
-        (ICON_SLOT_VIDEO, Some(theme.fg)),
-        (ICON_SLOT_WHATSAPP, None),
-        (ICON_SLOT_YOUTUBE, None),
-        (ICON_SLOT_MAIL, Some(gmail_tint)),
-    ];
-    for ((rect, hit), (slot, tint)) in controls.services.iter().zip(SERVICE_BUTTON_HITS).zip(icons)
-    {
-        draw_icon_button(target, *rect, slot, tint, hover == Some(hit), scale, theme);
+    for (slot, rect) in RIGHT_CLUSTER.iter().zip(controls.cluster()) {
+        let hovered = hover == Some(slot.hit);
+        match slot.hit {
+            BarHit::GeminiLive => {
+                draw_live_button(target, rect, live.indicator(), hovered, scale, theme);
+            }
+            hit => {
+                let tint = match hit {
+                    BarHit::Service(Service::Meet) | BarHit::Private => Some(theme.fg),
+                    BarHit::GmailToggle => Some(gmail_tint),
+                    _ => None,
+                };
+                draw_icon_button(target, rect, slot.icon, tint, hovered, scale, theme);
+            }
+        }
     }
-    draw_live_button(
-        target,
-        controls.live,
-        live.indicator(),
-        hover == Some(BarHit::GeminiLive),
-        scale,
-        theme,
-    );
-    // Privado: o chapeu e os oculos, sem nome (pedido do dono).
-    draw_icon_button(
-        target,
-        controls.private,
-        ICON_SLOT_INCOGNITO,
-        Some(theme.fg),
-        hover == Some(BarHit::Private),
-        scale,
-        theme,
-    );
 
     if let (Some((source_index, _url, fullscreen, private_split)), Some((label, expand, close))) =
         (active_context, controls.split)
@@ -6984,6 +6921,10 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ),
     ("notes.rs", include_str!("windows_app/notes.rs")),
     ("side_panel.rs", include_str!("windows_app/side_panel.rs")),
+    (
+        "clear_history.rs",
+        include_str!("windows_app/clear_history.rs"),
+    ),
     ("services.rs", include_str!("windows_app/services.rs")),
     ("search_card.rs", include_str!("windows_app/search_card.rs")),
     ("tests.rs", include_str!("windows_app/tests.rs")),
@@ -7042,6 +6983,9 @@ pub(in crate::windows_app) use notes::*;
 
 pub(in crate::windows_app) mod side_panel;
 pub(in crate::windows_app) use side_panel::*;
+pub(in crate::windows_app) mod clear_history;
+#[allow(unused_imports)]
+pub(in crate::windows_app) use clear_history::*;
 pub(in crate::windows_app) mod services;
 pub(in crate::windows_app) use services::*;
 pub(in crate::windows_app) mod search_card;

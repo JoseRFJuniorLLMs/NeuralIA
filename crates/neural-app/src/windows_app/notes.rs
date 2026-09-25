@@ -254,6 +254,54 @@ pub(super) enum NotesOrigin {
     Closed,
 }
 
+/// O tecto de bytes de cada acao das notas: so o `note-save` e o
+/// `note-draft` levam o corpo de uma nota; o resto fica nos 4 KiB do painel.
+pub(super) fn notes_message_max_bytes(action: &str) -> usize {
+    if matches!(action, "note-save" | "note-draft") {
+        NOTE_SAVE_MESSAGE_MAX_BYTES
+    } else {
+        PANEL_MESSAGE_MAX_BYTES
+    }
+}
+
+/// O parser da secao Notas do painel (`PANEL_SECTIONS`): as acoes `note-*`
+/// e `notes-*`, com o envelope ja lido e o tamanho ja preso pelo delegador
+/// (`parse_panel_message`).
+pub(super) fn parse_notes_action(
+    action: &str,
+    args: Option<&serde_json::Value>,
+) -> Option<PanelMessage> {
+    // `{"id": "<id valido>"}` e mais nada: um `../x` ou `C:\x` nunca chega ao
+    // disco, nem sequer ao worker das notas.
+    let note_id = || -> Option<String> {
+        let id = exact_keys(args, &["id"])?.get("id")?.as_str()?;
+        is_valid_note_id(id).then(|| id.to_string())
+    };
+    match action {
+        "notes-list" => exact_keys(args, &[]).map(|_| PanelMessage::NotesList),
+        "notes-search" => {
+            panel_text(args, "query", PANEL_QUERY_MAX_CHARS).map(PanelMessage::NotesSearch)
+        }
+        "note-open" => note_id().map(PanelMessage::NoteOpen),
+        "note-delete" => note_id().map(PanelMessage::NoteDelete),
+        // Um note-save recusado responde "failed" (`NoteSaveRefused`); o
+        // resto do que o parser recusa continua a morrer aqui.
+        "note-save" => Some(
+            args.and_then(parse_note_edit)
+                .map_or(PanelMessage::NoteSaveRefused, PanelMessage::NoteSave),
+        ),
+        "note-draft" => {
+            let args = args?;
+            if args.as_object()?.is_empty() {
+                Some(PanelMessage::NoteDraft(None))
+            } else {
+                parse_note_edit(args).map(|edit| PanelMessage::NoteDraft(Some(edit)))
+            }
+        }
+        _ => None,
+    }
+}
+
 /// O pedido do painel que e das notas. Exaustivo de proposito: uma mensagem
 /// nova do painel tem de dizer aqui se e ou nao das notas.
 pub(super) fn notes_command_for(message: PanelMessage) -> Option<NotesCommand> {

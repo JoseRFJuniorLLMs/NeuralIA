@@ -44,6 +44,8 @@ const ALL_SOURCES: &str = concat!(
     "\n",
     include_str!("../src/windows_app/side_panel.rs"),
     "\n",
+    include_str!("../src/windows_app/clear_history.rs"),
+    "\n",
     include_str!("../src/windows_app/services.rs"),
     "\n",
     include_str!("../src/windows_app/search_card.rs"),

@@ -263,6 +263,41 @@ jobs:
                   col_index,
                   label: frozen,
           '@
+            },
+            @{
+              Label = "panel-delegator-byte-cap"
+              Test = "panel_messages_delegate_by_prefix_and_keep_caps"
+              SourcePath = "crates/neural-app/src/windows_app/side_panel.rs"
+              Old = @'
+              if body.len() > (section.max_bytes)(action) {
+          '@
+              New = @'
+              if body.len() > PANEL_MESSAGE_ABSOLUTE_MAX_BYTES {
+          '@
+            },
+            @{
+              Label = "panel-absolute-cap-before-json"
+              Test = "panel_bodies_above_the_absolute_cap_are_never_read_as_json"
+              SourcePath = "crates/neural-app/src/windows_app/side_panel.rs"
+              Old = @'
+              if body.len() > PANEL_MESSAGE_ABSOLUTE_MAX_BYTES {
+          '@
+              New = @'
+              if false {
+          '@
+            },
+            @{
+              Label = "clear-history-skips-a-registered-target"
+              Test = "clear_history_runs_every_registered_target"
+              SourcePath = "crates/neural-app/src/windows_app/clear_history.rs"
+              Old = @'
+                  sink.clear(*target);
+          '@
+              New = @'
+                  if *target != ClearTarget::Memory {
+                      sink.clear(*target);
+                  }
+          '@
             }
           )
 

@@ -40,55 +40,127 @@ pub(in crate::windows_app) const PANEL_INPUT_MAX_CHARS: usize = 2048;
 /// Quantos recentes e quantas sugestoes o painel mostra.
 pub(in crate::windows_app) const PANEL_RECENT_LIMIT: usize = 30;
 pub(in crate::windows_app) const PANEL_SUGGESTION_LIMIT: usize = 6;
+/// O parser de uma secao do painel: recebe a acao ja lida do envelope e os
+/// `args` (ou a sua ausencia) e devolve o pedido, ou `None` para o recusar.
+pub(in crate::windows_app) type PanelSectionParser =
+    fn(&str, Option<&serde_json::Value>) -> Option<PanelMessage>;
+
+/// Uma secao do painel lateral, dona das acoes cujo prefixo (o texto antes
+/// do primeiro `-`) e um dos seus. `parse_panel_message` entrega-lhe a
+/// acao inteira; a secao diz o tecto de bytes de cada acao e faz o resto
+/// do parse. Uma secao nova e uma linha em `PANEL_SECTIONS` e um parser no
+/// modulo dela -- o delegador nao muda.
+pub(in crate::windows_app) struct PanelSection {
+    pub(in crate::windows_app) prefixes: &'static [&'static str],
+    /// O tecto de bytes de cada acao desta secao. So o `note-save` e o
+    /// `note-draft` passam dos 4 KiB: o resto fica em
+    /// `PANEL_MESSAGE_MAX_BYTES`, e o delegador prende-o antes de entregar.
+    pub(in crate::windows_app) max_bytes: fn(&str) -> usize,
+    pub(in crate::windows_app) parse: PanelSectionParser,
+}
+
+/// As secoes com prefixo. As acoes sem `-` (`ready`, `close`, `search`,
+/// `open`) sao do proprio painel e do Historico (`PANEL_CORE`).
+pub(in crate::windows_app) const PANEL_SECTIONS: &[PanelSection] = &[PanelSection {
+    prefixes: &["note", "notes"],
+    max_bytes: notes_message_max_bytes,
+    parse: parse_notes_action,
+}];
+
+/// O painel em si e o Historico: as acoes sem prefixo.
+pub(in crate::windows_app) static PANEL_CORE: PanelSection = PanelSection {
+    prefixes: &[],
+    max_bytes: |_| PANEL_MESSAGE_MAX_BYTES,
+    parse: parse_core_action,
+};
+
+/// A secao dona de `action`: a do prefixo (o texto antes do primeiro `-`),
+/// ou o nucleo quando nao ha `-`. Um prefixo que nenhuma secao reclamou e
+/// `None`: o pedido morre no delegador, sem chegar a parser nenhum.
+pub(in crate::windows_app) fn panel_section_of(action: &str) -> Option<&'static PanelSection> {
+    match action.split_once('-') {
+        None => Some(&PANEL_CORE),
+        Some((prefix, _)) => PANEL_SECTIONS
+            .iter()
+            .find(|section| section.prefixes.contains(&prefix)),
+    }
+}
+
+/// O maior tecto de todas as secoes: acima disto o corpo nem se le como
+/// JSON. E o do `note-save`, o unico pedido com o corpo de uma nota dentro.
+pub(in crate::windows_app) const PANEL_MESSAGE_ABSOLUTE_MAX_BYTES: usize =
+    NOTE_SAVE_MESSAGE_MAX_BYTES;
+
+#[cfg(test)]
+thread_local! {
+    /// So nos testes: quantas vezes o delegador chegou a ler um corpo como
+    /// JSON. E o que prova o tecto absoluto: o tecto da secao do
+    /// `note-save` e o mesmo numero e corre DEPOIS do JSON, por isso o
+    /// `None` sozinho nao distingue os dois (gate
+    /// `panel_bodies_above_the_absolute_cap_are_never_read_as_json`).
+    pub(in crate::windows_app) static PANEL_JSON_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// `args` e um objecto com EXACTAMENTE estas chaves -- nem uma a mais, nem
+/// uma a menos -- ou nada. Sem `args` so passa quem nao pede chave nenhuma;
+/// um `args` presente que nao e objecto (`null`, texto, numero) recusa
+/// sempre, ate quem nao pede chave nenhuma: so a AUSENCIA vale como vazio.
+/// E a mesma regra do canal IPC (`ipc::exact_keys`) e dos livros: um campo
+/// a mais nunca e ignorado em silencio.
+pub(in crate::windows_app) fn exact_keys<'a>(
+    args: Option<&'a serde_json::Value>,
+    keys: &[&str],
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    static EMPTY: std::sync::OnceLock<serde_json::Map<String, serde_json::Value>> =
+        std::sync::OnceLock::new();
+    let Some(args) = args else {
+        return keys
+            .is_empty()
+            .then(|| EMPTY.get_or_init(serde_json::Map::new));
+    };
+    let map = args.as_object()?;
+    (map.len() == keys.len() && keys.iter().all(|key| map.contains_key(*key))).then_some(map)
+}
+
+/// Um texto de `args[key]`, sem espacos a volta, com pelo menos um char e
+/// no maximo `max`. `args` tem de ter SO essa chave.
+pub(in crate::windows_app) fn panel_text(
+    args: Option<&serde_json::Value>,
+    key: &str,
+    max: usize,
+) -> Option<String> {
+    let text = exact_keys(args, &[key])?.get(key)?.as_str()?.trim();
+    (!text.is_empty() && text.chars().count() <= max).then(|| text.to_string())
+}
+
+/// O delegador do canal do painel. Le o envelope (`{"action", "args"}`),
+/// prende o tamanho -- o tecto absoluto antes do JSON, o da secao depois de
+/// saber a acao -- e entrega a acao a secao do prefixo dela. Tudo o que
+/// nenhuma secao reclama morre aqui.
 pub(in crate::windows_app) fn parse_panel_message(body: &str) -> Option<PanelMessage> {
-    if body.len() > NOTE_SAVE_MESSAGE_MAX_BYTES {
+    if body.len() > PANEL_MESSAGE_ABSOLUTE_MAX_BYTES {
         return None;
     }
+    #[cfg(test)]
+    PANEL_JSON_READS.with(|reads| reads.set(reads.get() + 1));
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let action = value.get("action")?.as_str()?;
+    let section = panel_section_of(action)?;
     // Todos os outros pedidos continuam presos aos 4 KiB.
-    if body.len() > PANEL_MESSAGE_MAX_BYTES && !matches!(action, "note-save" | "note-draft") {
+    if body.len() > (section.max_bytes)(action) {
         return None;
     }
-    let text = |key: &str, max: usize| -> Option<String> {
-        let text = value.get("args")?.get(key)?.as_str()?.trim();
-        (!text.is_empty() && text.chars().count() <= max).then(|| text.to_string())
-    };
-    // `{"id": "<id valido>"}` e mais nada: um `../x` ou `C:\x` nunca chega ao
-    // disco, nem sequer ao worker das notas.
-    let note_id = || -> Option<String> {
-        let args = value.get("args")?.as_object()?;
-        if args.len() != 1 {
-            return None;
-        }
-        let id = args.get("id")?.as_str()?;
-        is_valid_note_id(id).then(|| id.to_string())
-    };
+    (section.parse)(action, value.get("args"))
+}
+
+/// As acoes do painel em si e do Historico.
+fn parse_core_action(action: &str, args: Option<&serde_json::Value>) -> Option<PanelMessage> {
     match action {
-        "ready" => Some(PanelMessage::Ready),
-        "close" => Some(PanelMessage::Close),
-        "search" => text("query", PANEL_QUERY_MAX_CHARS).map(PanelMessage::Search),
-        "open" => text("input", PANEL_INPUT_MAX_CHARS).map(PanelMessage::Open),
-        "notes-list" => Some(PanelMessage::NotesList),
-        "notes-search" => text("query", PANEL_QUERY_MAX_CHARS).map(PanelMessage::NotesSearch),
-        "note-open" => note_id().map(PanelMessage::NoteOpen),
-        "note-delete" => note_id().map(PanelMessage::NoteDelete),
-        // Um note-save recusado responde "failed" (`NoteSaveRefused`); o
-        // resto do que o parser recusa continua a morrer aqui.
-        "note-save" => Some(
-            value
-                .get("args")
-                .and_then(parse_note_edit)
-                .map_or(PanelMessage::NoteSaveRefused, PanelMessage::NoteSave),
-        ),
-        "note-draft" => {
-            let args = value.get("args")?;
-            if args.as_object()?.is_empty() {
-                Some(PanelMessage::NoteDraft(None))
-            } else {
-                parse_note_edit(args).map(|edit| PanelMessage::NoteDraft(Some(edit)))
-            }
-        }
+        "ready" => exact_keys(args, &[]).map(|_| PanelMessage::Ready),
+        "close" => exact_keys(args, &[]).map(|_| PanelMessage::Close),
+        "search" => panel_text(args, "query", PANEL_QUERY_MAX_CHARS).map(PanelMessage::Search),
+        "open" => panel_text(args, "input", PANEL_INPUT_MAX_CHARS).map(PanelMessage::Open),
         _ => None,
     }
 }
@@ -580,480 +652,31 @@ pub(in crate::windows_app) fn panel_html(theme: &Theme) -> String {
     PANEL_HTML.replace("__THEME__", &panel_theme_vars(theme).to_string())
 }
 
-pub(in crate::windows_app) const PANEL_HTML: &str = r#"<!doctype html>
+/// A pagina do painel, montada em tempo de compilacao a partir de
+/// `assets/panel/`: a folha (`panel.css`), a marcacao de cada secao
+/// (`history.html`, `notes.html`) e o script -- uma IIFE so, em pedacos
+/// pela ordem: `core.js` (o `post`, o `byId`, o `make`, a caixa de busca e o
+/// `theme`), `history.js` (o `render` do Historico), `notes.js` (a secao
+/// Notas) e `tabs.js` (as abas, o fechar e o `ready` final, que fecha a
+/// IIFE). Uma secao nova traz o seu `<secao>.html` e `<secao>.js` e uma
+/// linha em cada `include_str!` -- o resto da pagina nao muda. Os bytes sao
+/// os da pagina de sempre (os assets sao LF por `.gitattributes`; o gate
+/// `panel_html_is_assembled_from_its_section_assets` prende-o).
+pub(in crate::windows_app) const PANEL_HTML: &str = concat!(
+    r#"<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8"><title>Histórico e notas</title>
 <style>
-*{box-sizing:border-box}
-html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:15px "Segoe UI",system-ui,sans-serif}
-body{display:flex;flex-direction:column;border-left:1px solid var(--line)}
-header{display:flex;align-items:center;justify-content:space-between;padding:10px 12px 8px 12px}
-.tabs{display:flex;gap:4px}
-.tab{background:none;border:0;color:var(--muted);font:inherit;font-weight:600;padding:7px 16px;border-radius:999px;cursor:pointer}
-.tab:hover{background:var(--surface)}
-.tab[aria-selected="true"]{background:var(--surface);color:var(--fg);box-shadow:inset 0 0 0 1px var(--line)}
-#close{background:none;border:0;color:var(--muted);font-size:18px;cursor:pointer;border-radius:8px;width:32px;height:32px}
-#close:hover{background:#e81123;color:#fff}
-.view{display:flex;flex-direction:column;flex:1;min-height:0}
-.view[hidden]{display:none}
-.search{padding:4px 16px 10px}
-.field{width:100%;padding:10px 14px;border-radius:12px;border:1px solid var(--line);background:var(--surface);color:var(--fg);font:inherit;outline:none}
-.field:focus{border-color:var(--accent)}
-#q,#nq{border-radius:999px}
-main{overflow:auto;flex:1;padding:0 8px 16px}
-::-webkit-scrollbar{width:10px;height:10px}
-::-webkit-scrollbar-track,::-webkit-scrollbar-corner{background:transparent}
-::-webkit-scrollbar-thumb{background-color:var(--line);border:3px solid transparent;border-radius:999px;background-clip:padding-box}
-::-webkit-scrollbar-thumb:hover{background-color:var(--muted)}
-::-webkit-scrollbar-button{display:none;width:0;height:0}
-section[hidden]{display:none}
-h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:14px 10px 6px;font-weight:600}
-.item{display:block;width:100%;text-align:left;background:none;border:0;color:inherit;font:inherit;padding:8px 10px;border-radius:10px;cursor:pointer}
-.item:hover,.item:focus{background:var(--surface);outline:none}
-.title,.detail{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.detail{font-size:12px;color:var(--muted);margin-top:2px}
-.empty{color:var(--muted);font-size:13px;padding:6px 10px}
-.row{display:flex;gap:8px;align-items:center;padding:4px 16px 10px}
-.btn{flex:none;background:var(--surface);border:1px solid var(--line);color:var(--fg);font:inherit;font-size:13px;padding:8px 14px;border-radius:999px;cursor:pointer}
-.btn:hover{border-color:var(--accent)}
-.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-.btn.danger:hover{background:#e81123;border-color:#e81123;color:#fff}
-#notes-msg{font-size:12px;color:var(--muted);min-height:18px;padding:0 18px 4px}
-#note-editor{display:flex;flex-direction:column;gap:8px;overflow:auto;flex:1;padding:0 16px 16px}
-#note-editor h2{margin:10px 2px 0}
-#note-title{font-weight:600}
-#note-body{min-height:200px;resize:vertical;font:14px/1.45 "Segoe UI",system-ui,sans-serif}
-.meta{font-size:12px;color:var(--muted);word-break:break-all}
-.link{background:none;border:0;padding:0;color:var(--accent);font:inherit;cursor:pointer;text-decoration:underline;text-align:left}
-#note-preview{white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5;max-height:30vh;overflow:auto;padding:8px 10px;border-radius:10px;background:var(--surface)}
-.confirm{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px;border-radius:12px;border:1px solid #e81123;font-size:13px}
-.confirm[hidden]{display:none}
-</style></head><body>
+"#,
+    include_str!("../../../../assets/panel/panel.css"),
+    r#"</style></head><body>
 <header><nav class="tabs" role="tablist"><button class="tab" id="tab-history" role="tab" aria-selected="true">Histórico</button><button class="tab" id="tab-notes" role="tab" aria-selected="false">Notas</button></nav><button id="close" title="Fechar (Esc)">✕</button></header>
-<div class="view" id="view-history">
-<div class="search"><input id="q" class="field" placeholder="Descreva o que quer reencontrar e tecle Enter" autocomplete="off" spellcheck="false"></div>
-<main>
-<section id="busca" hidden><h2></h2><div></div></section>
-<section id="sugestoes" hidden><h2></h2><div></div></section>
-<section id="recentes" hidden><h2></h2><div></div></section>
-</main>
-</div>
-<div class="view" id="view-notes" hidden>
-<div id="notes-msg" role="status"></div>
-<div class="view" id="notes-browse">
-<div class="row"><input id="nq" class="field" placeholder="Buscar nas notas" autocomplete="off" spellcheck="false"><button id="note-new" class="btn primary">Nova nota</button></div>
-<main><div id="notes-list"></div></main>
-</div>
-<div class="view" id="notes-edit" hidden>
-<div class="row"><button id="note-back" class="btn" title="Voltar à lista">← Notas</button><button id="note-save" class="btn primary" title="Salvar (Ctrl+S)">Salvar</button><button id="note-delete" class="btn danger">Excluir</button></div>
-<div id="note-editor">
-<div id="note-confirm" class="confirm" hidden><span>Excluir esta nota? Ela vai para a lixeira (.trash) da pasta das notas.</span><button id="note-confirm-yes" class="btn danger">Excluir</button><button id="note-confirm-no" class="btn">Cancelar</button></div>
-<input id="note-title" class="field" placeholder="Título" autocomplete="off">
-<textarea id="note-body" class="field" placeholder="Escreva em Markdown. Ligue outra nota com [[id]] ou [[id|nome]]."></textarea>
-<input id="note-tags" class="field" placeholder="Tags, separadas por vírgula" autocomplete="off" spellcheck="false">
-<div id="note-source-row" class="meta" hidden><span>Fonte: </span><button id="note-source" class="link"></button></div>
-<div id="note-meta" class="meta"></div>
-<section id="note-preview-box" hidden><h2>Pré-visualização</h2><div id="note-preview"></div></section>
-<section id="note-backlinks-box" hidden><h2>Notas que ligam para esta</h2><div id="note-backlinks"></div></section>
-</div>
-</div>
-</div>
-<script>
-(() => {
-  if (window.top !== window) return;
-  const post = (action, args) => window.ipc.postMessage(JSON.stringify({ action, args: args || {} }));
-  const byId = (id) => document.getElementById(id);
-  const make = (tag, className, text) => {
-    const node = document.createElement(tag);
-    if (className) node.className = className;
-    if (text !== undefined) node.textContent = text;
-    return node;
-  };
-  const q = byId('q');
-  q.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && q.value.trim()) { e.preventDefault(); post('search', { query: q.value.trim() }); }
-  });
-  const theme = (vars) => { for (const k of Object.keys(vars)) document.documentElement.style.setProperty(k, vars[k]); };
-  window.__neuraliaPanel = {
-    theme,
-    render(data) {
-      const section = byId(data.id);
-      if (!section) return;
-      section.hidden = false;
-      section.querySelector('h2').textContent = data.title;
-      const box = section.querySelector('div');
-      box.textContent = '';
-      if (!data.items.length) {
-        box.appendChild(make('div', 'empty', data.empty));
-        return;
-      }
-      for (const item of data.items) {
-        const button = make('button', 'item');
-        button.append(make('span', 'title', item.title), make('span', 'detail', item.detail));
-        button.addEventListener('click', () => post('open', { input: item.input }));
-        box.appendChild(button);
-      }
-    }
-  };
-
-  // Notas (Zettelkasten). Tudo o que vem de uma nota -- e o corpo pode ser
-  // texto copiado de qualquer pagina -- entra como texto: textContent,
-  // value e createTextNode. Nunca como HTML.
-  const notes = (() => {
-    const ID = /^[0-9][0-9-]{0,63}$/;
-    const WIKI = /\[\[([^\[\]|\n]+)(?:\|([^\[\]\n]*))?\]\]/g;
-    const BODY_MAX_BYTES = 200 * 1024;
-    const TITLE_MAX = 300;
-    const TAGS_MAX = 20;
-    const TAG_MAX = 60;
-    const QUERY_MAX = 500;
-    const SOURCE_MAX = 2048;
-    const nq = byId('nq'), list = byId('notes-list'), msg = byId('notes-msg');
-    const browse = byId('notes-browse'), edit = byId('notes-edit');
-    const title = byId('note-title'), body = byId('note-body'), tags = byId('note-tags');
-    const sourceRow = byId('note-source-row'), source = byId('note-source'), meta = byId('note-meta');
-    const previewBox = byId('note-preview-box'), preview = byId('note-preview');
-    const backBox = byId('note-backlinks-box'), backlinks = byId('note-backlinks');
-    const confirmBox = byId('note-confirm');
-    // Nota no editor: o id dela, ou null para uma nota nova ainda por salvar.
-    let openId = null;
-    // A revisao da nota que o editor mostra (do disco, ou do nosso ultimo
-    // salvar): o salvar leva-a, e o worker nao esmaga uma nota que mudou fora
-    // daqui desde entao.
-    let openRev = null;
-    let openSource = '';
-    let dirty = false;
-    let savingNew = false;
-    // Um note-save a caminho (o id da nota): se voltar "failed", o texto
-    // volta a estar por salvar em vez de se perder ao sair do editor.
-    let saving = undefined;
-    // O lado nativo guarda uma copia do que esta por salvar (note-draft) e
-    // grava-a quando o painel fecha por fora -- botao Notas, Ctrl+H, outro
-    // painel, Home, fechar a janela --, porque ai esta pagina ja nao corre.
-    let draftPosted = false;
-    let draftTimer = 0;
-    let searchTimer = 0;
-    let previewTimer = 0;
-
-    const say = (text) => { msg.textContent = text || ''; };
-    const when = (unix) => {
-      if (!unix) return '';
-      try { return new Date(unix * 1000).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' }); } catch (e) { return ''; }
-    };
-    const query = () => nq.value.trim().slice(0, QUERY_MAX);
-    const refresh = () => {
-      const text = query();
-      if (text) post('notes-search', { query: text }); else post('notes-list');
-    };
-    const open = (id) => { if (ID.test(id) && leave()) post('note-open', { id }); };
-    // Texto que o JSON leva inteiro (sem metades de um par UTF-16, que o
-    // parser do lado nativo recusava) e titulo e tags numa linha: o TAB de
-    // uma tabela colada ou do titulo de uma nota do Obsidian vira espaco.
-    const whole = (text) => (typeof text.toWellFormed === 'function' ? text.toWellFormed() : text);
-    const line = (text) => whole(String(text)).replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').trim();
-    const edited = () => ({
-      id: openId,
-      rev: openId === null ? null : openRev,
-      title: line(title.value),
-      body: whole(body.value),
-      tags: tags.value.split(',').map(line).filter(Boolean),
-    });
-    // Manda (ou limpa) a copia do lado nativo.
-    function postDraft() {
-      clearTimeout(draftTimer);
-      draftTimer = 0;
-      const note = edited();
-      if (dirty && !edit.hidden && (note.title || note.body.trim())) {
-        post('note-draft', note);
-        draftPosted = true;
-      } else if (draftPosted) {
-        post('note-draft', {});
-        draftPosted = false;
-      }
-    }
-    const showList = () => { confirmBox.hidden = true; edit.hidden = true; browse.hidden = false; };
-    const showEditor = () => { browse.hidden = true; edit.hidden = false; };
-
-    function renderList(data) {
-      // Resposta a uma busca que ja nao e a da caixa: a seguinte vem a caminho.
-      if ((data.query || '') !== query()) return;
-      list.textContent = '';
-      if (!data.notes.length) {
-        list.appendChild(make('div', 'empty', data.query
-          ? 'Nenhuma nota encontrada.'
-          : 'Nenhuma nota ainda. Crie uma em Nova nota, ou selecione um texto numa página e tecle Ctrl+Shift+Z.'));
-        return;
-      }
-      if (data.total > data.notes.length) {
-        list.appendChild(make('div', 'empty', 'Mostrando ' + data.notes.length + ' de ' + data.total + ' notas. Refine a busca.'));
-      }
-      for (const note of data.notes) {
-        const button = make('button', 'item');
-        const detail = [when(note.updated), note.tags.map((tag) => '#' + tag).join(' ')].filter(Boolean).join(' · ');
-        button.append(make('span', 'title', note.title), make('span', 'detail', detail));
-        button.addEventListener('click', () => open(note.id));
-        list.appendChild(button);
-      }
-    }
-
-    // O corpo com os [[id]] e [[id|nome]] clicaveis; o resto e texto.
-    function renderPreview() {
-      preview.textContent = '';
-      const text = body.value;
-      let last = 0;
-      let match;
-      WIKI.lastIndex = 0;
-      while ((match = WIKI.exec(text)) !== null) {
-        const id = match[1].trim();
-        if (!ID.test(id)) continue;
-        if (match.index > last) preview.appendChild(document.createTextNode(text.slice(last, match.index)));
-        const link = make('button', 'link', (match[2] || '').trim() || id);
-        link.title = 'Abrir a nota ' + id;
-        link.addEventListener('click', () => open(id));
-        preview.appendChild(link);
-        last = match.index + match[0].length;
-      }
-      if (last < text.length) preview.appendChild(document.createTextNode(text.slice(last)));
-      previewBox.hidden = !text.trim();
-    }
-
-    // Fonte, datas e backlinks: o que o editor mostra da nota sem ser editavel.
-    function describe(note, links) {
-      openSource = note && note.source ? note.source : '';
-      source.textContent = openSource;
-      source.disabled = !/^https?:\/\//i.test(openSource) || openSource.length > SOURCE_MAX;
-      sourceRow.hidden = !openSource;
-      meta.textContent = note
-        ? ['Criada ' + when(note.created), 'atualizada ' + when(note.updated), 'id ' + note.id].join(' · ')
-        : 'Nota nova: ainda não foi salva.';
-      backlinks.textContent = '';
-      for (const other of links || []) {
-        const button = make('button', 'item', other.title);
-        button.addEventListener('click', () => open(other.id));
-        backlinks.appendChild(button);
-      }
-      backBox.hidden = !(links && links.length);
-    }
-
-    function fill(note, links) {
-      openId = note ? note.id : null;
-      openRev = note && note.rev ? note.rev : null;
-      // Outra nota no editor: a resposta ao salvar de uma nota nova que
-      // ainda venha a caminho ja nao e desta.
-      savingNew = false;
-      title.value = note ? note.title : '';
-      body.value = note ? note.body : '';
-      tags.value = note ? note.tags.join(', ') : '';
-      describe(note, links);
-      confirmBox.hidden = true;
-      dirty = false;
-      saving = undefined;
-      postDraft();
-      renderPreview();
-    }
-
-    function save() {
-      const note = edited();
-      if (note.tags.length > TAGS_MAX || note.tags.some((tag) => tag.length > TAG_MAX)) {
-        say('Até ' + TAGS_MAX + ' tags, cada uma com até ' + TAG_MAX + ' caracteres.');
-        return false;
-      }
-      if (note.title.length > TITLE_MAX) { say('O título passa de ' + TITLE_MAX + ' caracteres.'); return false; }
-      if (new TextEncoder().encode(note.body).length > BODY_MAX_BYTES) {
-        say('A nota passa de 200 KiB. Divida-a em duas.');
-        return false;
-      }
-      // Uma nota nova ainda sem id: um segundo pedido criava outra nota. O
-      // que se escrever entretanto fica por salvar ate o id chegar.
-      if (openId === null && savingNew) { say('A salvar…'); return false; }
-      clearTimeout(draftTimer);
-      draftTimer = 0;
-      post('note-save', note);
-      savingNew = openId === null;
-      saving = openId;
-      dirty = false;
-      // O note-save leva o texto todo: o lado nativo larga a copia.
-      draftPosted = false;
-      say('A salvar…');
-      return true;
-    }
-
-    // Sair do editor nao deita fora o que se escreveu. `false`: nao da para
-    // salvar agora (acima dos tectos, ou a nota nova ainda sem id) -- quem
-    // ia sair fica, com o aviso a vista.
-    function leave() {
-      if (!dirty || edit.hidden) return true;
-      const note = edited();
-      if (!note.title && !note.body.trim()) return true;
-      return save();
-    }
-
-    function newNote() {
-      if (!leave()) return;
-      fill(null, []);
-      showEditor();
-      say('');
-      title.focus();
-    }
-
-    function receive(data) {
-      switch (data.kind) {
-        case 'listed':
-          renderList(data);
-          break;
-        case 'opened': {
-          const note = data.note;
-          if (data.cause === 'saved') {
-            // So mexe no editor se ele ainda mostra esta nota (ou a nova que
-            // acabou de ganhar id); senao o utilizador ja seguiu em frente.
-            // O texto nao e reescrito: o cursor ficava no fim a cada Ctrl+S.
-            const same = openId === note.id || (openId === null && savingNew);
-            savingNew = false;
-            if (same) {
-              saving = undefined;
-              openId = note.id;
-              openRev = note.rev || null;
-              if (!title.value.trim()) title.value = note.title;
-              describe(note, data.backlinks);
-              // O que se escreveu enquanto a nota nova esperava pelo id: a
-              // copia do lado nativo passa a ser a desta nota.
-              if (dirty) postDraft();
-            }
-            say('Nota salva.');
-            refresh();
-          } else if (openId !== note.id && !leave()) {
-            // Uma nota que chega de fora (Ctrl+Shift+Z) com o editor por
-            // salvar e que nao da para salvar agora: o editor fica como esta
-            // e a nota nova aparece na lista.
-            say(data.cause === 'created' ? 'Nota criada a partir da seleção; está na lista.' : '');
-            if (data.cause === 'created') refresh();
-          } else {
-            // Uma nota que chega de fora (Ctrl+Shift+Z) nao deita fora o que
-            // estava por salvar no editor: o `leave` acima ja o salvou.
-            fill(note, data.backlinks);
-            showEditor();
-            say(data.cause === 'created' ? 'Nota criada a partir da seleção.' : '');
-            if (data.cause === 'created') refresh();
-          }
-          break;
-        }
-        case 'deleted':
-          if (openId === data.id) { fill(null, []); showList(); }
-          say('Nota movida para a lixeira (.trash).');
-          refresh();
-          break;
-        case 'missing':
-          say('Essa nota já não existe.');
-          refresh();
-          break;
-        case 'conflict': {
-          // A nota mudou fora deste editor (outra janela, o Obsidian): o
-          // texto dele ficou numa copia, e o editor passa a mostra-la.
-          const note = data.note;
-          if (openId === data.original) {
-            saving = undefined;
-            openId = note.id;
-            openRev = note.rev || null;
-            title.value = note.title;
-            describe(note, []);
-          }
-          say('Esta nota mudou fora deste editor (outra janela ou o Obsidian). O seu texto ficou numa cópia: ' + note.title);
-          refresh();
-          break;
-        }
-        case 'failed':
-          savingNew = false;
-          // Um salvar que falhou (pasta ocupada, disco cheio, ficheiro preso
-          // por outro programa, pedido recusado): o texto continua por salvar
-          // -- sair do editor tenta outra vez -- e o lado nativo volta a ter
-          // a copia.
-          if (saving !== undefined && saving === openId && !edit.hidden) {
-            dirty = true;
-            postDraft();
-          }
-          saving = undefined;
-          say(data.message);
-          break;
-      }
-    }
-
-    nq.addEventListener('input', () => {
-      clearTimeout(searchTimer);
-      searchTimer = setTimeout(refresh, 250);
-    });
-    nq.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); clearTimeout(searchTimer); refresh(); }
-    });
-    byId('note-new').addEventListener('click', newNote);
-    byId('note-back').addEventListener('click', () => { if (leave()) { showList(); refresh(); } });
-    byId('note-save').addEventListener('click', save);
-    byId('note-delete').addEventListener('click', () => { confirmBox.hidden = false; });
-    byId('note-confirm-no').addEventListener('click', () => { confirmBox.hidden = true; });
-    byId('note-confirm-yes').addEventListener('click', () => {
-      confirmBox.hidden = true;
-      if (openId === null) { fill(null, []); showList(); return; }
-      post('note-delete', { id: openId });
-    });
-    // A fonte abre fora do painel, que fecha: salva antes, como o X.
-    source.addEventListener('click', () => {
-      if (!source.disabled && openSource && leave()) post('open', { input: openSource });
-    });
-    for (const field of [title, body, tags]) {
-      field.addEventListener('input', () => {
-        dirty = true;
-        say('Alterações por salvar.');
-        // A copia do lado nativo nunca fica mais de 200 ms atras, mesmo a
-        // escrever sem parar: um temporizador que ja corre nao recomeca
-        // (recomecar a cada tecla deixava uma rajada inteira sem copia).
-        if (!draftTimer) draftTimer = setTimeout(postDraft, 200);
-      });
-    }
-    body.addEventListener('input', () => {
-      clearTimeout(previewTimer);
-      previewTimer = setTimeout(renderPreview, 200);
-    });
-    edit.addEventListener('keydown', (e) => {
-      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (e.key || '').toLowerCase() === 's') {
-        e.preventDefault();
-        save();
-      }
-    });
-    return { refresh, receive, newNote, leave, focus: () => (edit.hidden ? nq : title).focus() };
-  })();
-
-  // Abas: Historico e Notas.
-  const tabs = { history: byId('tab-history'), notes: byId('tab-notes') };
-  const views = { history: byId('view-history'), notes: byId('view-notes') };
-  function showSection(name) {
-    const key = name === 'notes' || name === 'notas' ? 'notes'
-      : name === 'history' || name === 'historico' ? 'history' : '';
-    if (!key) return false;
-    // Sair das Notas salva o editor; se nao der agora, fica-se nas Notas.
-    if (key === 'history' && !views.notes.hidden && !notes.leave()) return false;
-    for (const other of Object.keys(views)) {
-      views[other].hidden = other !== key;
-      tabs[other].setAttribute('aria-selected', other === key ? 'true' : 'false');
-    }
-    if (key === 'notes') { notes.refresh(); notes.focus(); } else { q.focus(); }
-    return true;
-  }
-  const close = () => { if (notes.leave()) post('close'); };
-  window.neuraliaShowSection = showSection;
-  window.__neuraliaNotes = {
-    receive: notes.receive,
-    newNote() { if (showSection('notes')) notes.newNote(); },
-    // O botao Notas da barra/Home com o painel aberto: nas Notas fecha
-    // (como o X, salvando antes), no Historico mostra as Notas.
-    button() { if (views.notes.hidden) showSection('notes'); else close(); }
-  };
-  tabs.history.addEventListener('click', () => showSection('history'));
-  tabs.notes.addEventListener('click', () => showSection('notes'));
-  byId('close').addEventListener('click', close);
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { e.preventDefault(); close(); }
-  });
-
-  theme(__THEME__);
-  q.focus();
-  post('ready');
-})();
-</script></body></html>"#;
+"#,
+    include_str!("../../../../assets/panel/history.html"),
+    include_str!("../../../../assets/panel/notes.html"),
+    "<script>\n",
+    include_str!("../../../../assets/panel/core.js"),
+    include_str!("../../../../assets/panel/history.js"),
+    include_str!("../../../../assets/panel/notes.js"),
+    include_str!("../../../../assets/panel/tabs.js"),
+    "</script></body></html>"
+);
