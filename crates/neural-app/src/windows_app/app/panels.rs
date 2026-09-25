@@ -25,6 +25,7 @@ use crate::panel_chrome::{
     SERVICE_STRIP_HEIGHT, ScreenRect, ServiceBadge, ServiceEffect, ServiceFrame, ServiceInput,
     ServicePanelState, panel_area, panel_handle_area, panel_width, panel_width_from_drag,
 };
+use crate::windows_app::*;
 use crate::windows_app::{
     AUX_POPUP_EX_STYLE, AUX_POPUP_STYLE, App, BarHit, COMPARATOR_CHROME_HEIGHT, Surface,
     TITLE_TAB_HEIGHT, Tool, WebViewHost, debug_log, install_wheel_hook,
@@ -979,5 +980,173 @@ impl App {
             ),
         };
         self.panel_eval(&script);
+    }
+
+    fn submit_notes(&mut self, command: NotesCommand, origin: NotesOrigin) {
+        if let Err(error) = self.notes.submit(command, origin) {
+            match origin {
+                NotesOrigin::Panel => {
+                    self.panel_run(notes_reply_script(&NotesReply::Failed(error)))
+                }
+                NotesOrigin::Selection | NotesOrigin::Closed | NotesOrigin::Bar { .. } => {
+                    self.show_splash(error, 3)
+                }
+            }
+        }
+    }
+
+    /// A app vai sair: o que o editor do painel tinha por salvar -- e o que
+    /// fechos anteriores ainda tinham na fila -- chega ao disco antes de o
+    /// processo acabar (`SidePanel::exit`).
+    pub(in crate::windows_app) fn save_notes_draft_before_exit(&mut self) {
+        let _ = self.side_panel.exit(NOTES_EXIT_WAIT);
+    }
+
+    /// Resposta do worker das notas. A de uma selecao abre o painel na nota
+    /// criada; a do painel so vai para o painel que ainda estiver aberto.
+    pub(in crate::windows_app) fn notes_ready(&mut self, origin: NotesOrigin, reply: NotesReply) {
+        match origin {
+            NotesOrigin::Panel => self.panel_run(notes_reply_script(&reply)),
+            NotesOrigin::Selection => match &reply {
+                NotesReply::Opened { .. } => {
+                    self.show_notes_panel(vec![notes_reply_script(&reply)]);
+                    self.show_splash("Nota criada".to_string(), 2);
+                }
+                NotesReply::Failed(error) => self.show_splash(error.clone(), 4),
+                NotesReply::Listed { .. }
+                | NotesReply::Deleted { .. }
+                | NotesReply::Missing { .. }
+                | NotesReply::Conflict { .. } => {}
+            },
+            // O "Salvar nota": so o aviso, sem abrir o painel.
+            NotesOrigin::Bar { private } => match &reply {
+                NotesReply::Opened { note, .. } => {
+                    self.show_splash(bar_note_notice(private, &note.title), 3);
+                }
+                NotesReply::Failed(error) => self.show_splash(error.clone(), 4),
+                NotesReply::Listed { .. }
+                | NotesReply::Deleted { .. }
+                | NotesReply::Missing { .. }
+                | NotesReply::Conflict { .. } => {}
+            },
+            NotesOrigin::Closed => match &reply {
+                NotesReply::Opened { note, .. } => {
+                    self.show_splash(format!("Nota salva: {}", note.title), 3);
+                }
+                NotesReply::Conflict { note, .. } => {
+                    self.show_splash(
+                        format!(
+                            "A nota mudou fora do NeuralIA; o texto ficou em: {}",
+                            note.title
+                        ),
+                        6,
+                    );
+                }
+                NotesReply::Failed(error) => self.show_splash(error.clone(), 6),
+                NotesReply::Listed { .. }
+                | NotesReply::Deleted { .. }
+                | NotesReply::Missing { .. } => {}
+            },
+        }
+    }
+
+    /// Ctrl+Shift+Z ou "Salvar nota" numa pagina: a nota da WebView
+    /// `target`. O Ctrl+Shift+Z le a selecao dela e nunca le o Split privado;
+    /// o Salvar nota traz o texto no pedido e so tira dela a fonte.
+    pub(in crate::windows_app) fn request_note_from_page(
+        &mut self,
+        target: Option<PageTarget>,
+        via: NoteVia,
+    ) {
+        // Qual WebView e se o Split privado recusa: `note_read_view`, com as
+        // colunas e o Split do proprio comparador (gate
+        // `a_note_request_reads_its_own_webview_and_never_the_private_split`).
+        let comp = self.comparator.as_ref();
+        // So o "Salvar nota" chega ao Split privado; `private` vem da mesma
+        // decisao, e o aviso di-lo-a.
+        let NoteRead {
+            view: webview,
+            private,
+        } = match note_read_view(
+            target,
+            &via,
+            comp.map_or(&[][..], |comp| comp.views.as_slice()),
+            comp.and_then(|comp| comp.split.as_ref()),
+            self.webview.as_ref(),
+        ) {
+            Ok(read) => read,
+            Err(NoteCapture::RefusePrivate) => {
+                self.show_splash(NOTE_PRIVATE_REFUSAL.to_string(), 3);
+                return;
+            }
+            Err(NoteCapture::Read | NoteCapture::NoPage) => return,
+        };
+        let source = note_capture_source(
+            &via,
+            target,
+            self.surface,
+            self.page_source.as_deref(),
+            || webview.url().ok(),
+        );
+        match via {
+            // O texto e o que a barra mostrava, e veio no pedido: nada se
+            // volta a ler da pagina (que podia ter trocado o getSelection).
+            NoteVia::Bar { text } => self.save_bar_note(&text, source.as_deref(), private),
+            NoteVia::Shortcut => {
+                let proxy = self.proxy.clone();
+                let asked =
+                    webview.evaluate_script_with_callback(NOTE_CAPTURE_SCRIPT, move |raw| {
+                        let _ = proxy.send_event(UserEvent::NoteCaptured {
+                            raw,
+                            source: source.clone(),
+                        });
+                    });
+                if asked.is_err() {
+                    self.show_splash(
+                        "Não foi possível ler a seleção desta página.".to_string(),
+                        3,
+                    );
+                }
+            }
+        }
+    }
+
+    /// O "Salvar nota": a fonte e a que o nativo conhece da WebView, o mesmo
+    /// texto em menos de 2 s nao e outra nota, e a resposta so aparece no
+    /// aviso do meio (`NotesOrigin::Bar`). Nada disto passa pelo historico
+    /// nem pela memoria.
+    fn save_bar_note(&mut self, text: &str, source: Option<&str>, private: bool) {
+        match bar_note_step(&mut self.bar_notes, text, source, Instant::now()) {
+            BarNoteStep::Save(draft) => {
+                self.submit_notes(NotesCommand::Create(draft), NotesOrigin::Bar { private });
+            }
+            BarNoteStep::Repeated => {}
+            BarNoteStep::Refused(error) => self.note_refused(error),
+        }
+    }
+
+    /// A resposta da pagina a um Ctrl+Shift+Z.
+    pub(in crate::windows_app) fn note_captured(&mut self, raw: &str, source: Option<&str>) {
+        match shortcut_note_step(&mut self.shortcut_notes, raw, source, Instant::now()) {
+            BarNoteStep::Save(draft) => {
+                self.submit_notes(NotesCommand::Create(draft), NotesOrigin::Selection);
+            }
+            BarNoteStep::Repeated => {}
+            BarNoteStep::Refused(error) => self.note_refused(error),
+        }
+    }
+
+    fn note_refused(&mut self, error: NoteCaptureError) {
+        match error {
+            NoteCaptureError::EmptySelection => {
+                self.show_splash("Selecione um texto para criar a nota".to_string(), 3);
+            }
+            NoteCaptureError::Unreadable => {
+                self.show_splash(
+                    "Não foi possível ler a seleção desta página.".to_string(),
+                    3,
+                );
+            }
+        }
     }
 }
