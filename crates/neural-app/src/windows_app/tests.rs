@@ -5775,6 +5775,92 @@ fn spec_0108_remote_navigation_handlers_reject_neuralia_scheme() {
     }
 }
 
+/// SECURITY.md: as paginas EPUB (biblioteca e leitor) so chegam ao nativo
+/// pelo canal delas, nunca pelo `ipc.rs` das paginas remotas, e a navegacao
+/// de topo fica presa as duas paginas. Ligacao no caminho que embarca, nao
+/// comportamento (AGENTS.md §4.3): o que `handle_epub_ipc`,
+/// `epub_navigation_allowed` e `epub_drop_job` decidem esta provado em
+/// `epub_app::tests`; aqui prende-se que o builder que embarca e so esse, e
+/// que "Apagar historico" e o drop de ficheiros chegam ao `EpubJob`.
+#[test]
+fn epub_pages_reach_native_code_only_through_their_own_channel() {
+    let source = shipped_source();
+    let body = |text: &str, from: &str, to: &str| -> String {
+        text.split(from)
+            .nth(1)
+            .and_then(|part| part.split(to).next())
+            .unwrap_or_else(|| panic!("{from} body"))
+            .to_string()
+    };
+
+    // O builder: IPC fechado, trava de navegacao, sem popups, downloads nem
+    // permissoes -- e nada do canal remoto (script, capability, parser).
+    let builder = body(&source, "fn epub_webview_builder", "fn handle_epub_notice");
+    let handlers = body(
+        &builder,
+        "themed_webview_builder()",
+        ".with_permission_handler",
+    );
+    for required in [
+        "handle_epub_ipc(&source, request.body(), &worker)",
+        ".with_navigation_handler(|target| epub_navigation_allowed(&target))",
+        ".with_new_window_req_handler(|_, _| NewWindowResponse::Deny)",
+        ".with_download_started_handler(|_, _| false)",
+        "UserEvent::EpubDropped(paths)",
+    ] {
+        assert!(
+            handlers.contains(required),
+            "epub_webview_builder perdeu {required}"
+        );
+    }
+    assert!(
+        builder.contains(".with_permission_handler(|_| PermissionResponse::Deny)"),
+        "epub_webview_builder tem de negar todas as permissoes"
+    );
+    for forbidden in [
+        "with_initialization_script",
+        "bind_page_script(",
+        "NEURALIA_KEYMAP_SCRIPT",
+        "parse_ipc_message",
+        "common_ipc_event",
+        "neuralia_action",
+        "remote_capability",
+    ] {
+        assert!(
+            !builder.contains(forbidden),
+            "epub_webview_builder nao pode ter {forbidden}"
+        );
+    }
+
+    // "Apagar historico" apaga tambem a leitura dos livros.
+    let clear = body(
+        &source,
+        "UserEvent::ClearHistory => {",
+        "UserEvent::HistoryCleared(result)",
+    );
+    assert!(
+        clear.contains("self.submit_epub_job(EpubJob::ClearReadingHistory)"),
+        "ClearHistory tem de mandar EpubJob::ClearReadingHistory"
+    );
+
+    // Ficheiros largados: um evento por ficheiro, o lote inteiro no
+    // `about_to_wait`, e so os `.epub` viram trabalho (`epub_drop_job`).
+    let drop_arm = body(
+        &source,
+        "WindowEvent::DroppedFile(path) =>",
+        "WindowEvent::ModifiersChanged",
+    );
+    assert!(drop_arm.contains("self.pending_drops.push(path)"));
+    let idle = body(&source, "fn about_to_wait", "fn exiting");
+    assert!(idle.contains("std::mem::take(&mut self.pending_drops)"));
+    assert!(idle.contains("self.route_dropped_files(dropped)"));
+    let route = body(&source, "fn route_dropped_files", "fn open_epub_dialog");
+    assert!(route.contains("epub_drop_job(paths)"));
+    assert!(route.contains("self.submit_epub_job(job)"));
+    let dropped = body(&source, "UserEvent::EpubDropped(paths) =>", "UserEvent::");
+    assert!(dropped.contains("self.route_dropped_files(paths)"));
+}
+
 #[test]
 fn spec_0108_capability_scripts_are_top_frame_only() {
     for (name, script) in [
