@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dev-dependencies]
 # O teste de proveniência confere o SHA-256 dos ficheiros vendorizados.
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 
 [dependencies]
 # EPUB: inflate das entradas do ZIP e parser do OPF/NCX/nav. Os dois já
@@ -19,7 +19,7 @@ scraper = "0.27"
 serde.workspace = true
 serde_json.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 thiserror.workspace = true
 ureq = { version = "3.4", features = ["charset", "brotli", "platform-verifier"] }
 url.workspace = true
