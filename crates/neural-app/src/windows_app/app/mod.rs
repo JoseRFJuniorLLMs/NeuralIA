@@ -25,3 +25,7 @@ pub(super) use pages::*;
 pub(super) mod chrome;
 #[allow(unused_imports)]
 pub(super) use chrome::*;
+
+pub(super) mod compare;
+#[allow(unused_imports)]
+pub(super) use compare::*;

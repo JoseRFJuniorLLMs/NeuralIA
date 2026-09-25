@@ -176,6 +176,7 @@ jobs:
             @{
               Label = "global-digit-shortcut"
               Test = "keyboard_shortcuts_keep_page_identity_and_global_digit_targets"
+              SourcePath = "crates/neural-app/src/windows_app/app/compare.rs"
               Old = @'
                       IpcAction::Fullscreen => Some(UserEvent::ExpandComparator(col_index)),
                       IpcAction::ShortcutExpand { col } => Some(UserEvent::ExpandComparator(col)),
