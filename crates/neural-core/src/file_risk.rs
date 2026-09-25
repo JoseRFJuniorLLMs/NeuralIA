@@ -2,7 +2,7 @@
 //!
 //! Usado pelo subsistema de downloads e pelo explorador de arquivos para impedir
 //! execução acidental de programas, scripts, imagens de disco, atalhos do Windows
-//! e arquivos mascarados com extensões falsas ou caracteres bidi.
+//! e arquivos mascarados com extensões falsas, caracteres bidi ou invisíveis.
 
 use std::{
     fs::File,
@@ -113,22 +113,39 @@ pub const DATABASE_APP_EXTENSIONS: &[&str] = &["mda", "mdb", "mde", "accde", "ad
 /// Extensões de documentos com macros habilitadas (Office/Office-like). Sozinhas
 /// são um aviso; depois de uma extensão de fachada (`fatura.pdf.docm`) são um
 /// disfarce e bloqueiam.
+///
+/// Os 10 tipos OOXML com macros habilitadas (`.ppsm` abre direto no modo de
+/// exibição) e os binários antigos que também as levam: `.xlsb` (pasta
+/// binária), `.xlm` (folha de macros do Excel 4), `.xla` e `.ppa`
+/// (suplementos: só existem para levar código) e `.pps` (apresentação antiga
+/// que abre direto no modo de exibição).
 pub const MACRO_EXTENSIONS: &[&str] = &[
-    "docm", "dotm", "xlsm", "xltm", "xlam", "pptm", "potm", "ppam", "sldm",
+    "docm", "dotm", "xlsm", "xltm", "xlam", "pptm", "potm", "ppam", "ppsm", "sldm", "xlsb", "xlm",
+    "xla", "ppa", "pps",
 ];
 
-/// Extensões conhecidas de documentos, imagens e mídias seguros comuns
-/// para detecção de extensão dupla (masquerading).
+/// Extensões conhecidas de documentos e texto, páginas, imagens, áudio e
+/// vídeo e arquivos compactados comuns (nesta ordem) para detecção de
+/// extensão dupla (masquerading). Contém cada tipo do
+/// [`DEFAULT_APP_ALLOWLIST`] (gate `every_default_app_type_is_a_decoy`):
+/// `livro.epub.docm` finge ser um livro que a própria NeuralIA abre.
 pub const SAFE_DECOY_EXTENSIONS: &[&str] = &[
-    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "rtf", "odt", "ods", "odp", "png",
-    "jpg", "jpeg", "gif", "webp", "bmp", "svg", "mp3", "mp4", "wav", "zip", "csv", "json",
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "rtf", "odt", "ods", "odp", "odg",
+    "csv", "json", "xml", "md", "log", "epub", "eml", "msg", "ics", "vcf", "html", "htm", "xhtml",
+    "mht", "mhtml", "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "heic", "heif", "avif",
+    "tif", "tiff", "ico", "mp3", "m4a", "wav", "flac", "ogg", "opus", "aac", "mp4", "m4v", "webm",
+    "mov", "avi", "mkv", "wmv", "zip", "7z", "rar", "gz", "tar",
 ];
 
 /// Allowlist estrita de extensões permitidas no `DefaultAppTarget`.
+///
+/// Sem `.svg`: no Windows abre no navegador, que corre o `<script>` do
+/// arquivo a partir de `file://` (SVG smuggling), como um `.html`. Esses
+/// ficam com "Mostrar na pasta".
 pub const DEFAULT_APP_ALLOWLIST: &[&str] = &[
     "txt", "md", "csv", "json", "log", "pdf", "epub", "docx", "xlsx", "pptx", "odt", "ods", "odp",
-    "rtf", "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "mp3", "m4a", "wav", "flac", "ogg",
-    "opus", "webm", "mp4", "mov",
+    "rtf", "png", "jpg", "jpeg", "gif", "webp", "bmp", "mp3", "m4a", "wav", "flac", "ogg", "opus",
+    "webm", "mp4", "mov",
 ];
 
 /// Lista de nomes reservados de dispositivos do DOS/Windows (ex.: CON, PRN, AUX, NUL, COM1..9, LPT1..9).
@@ -147,6 +164,90 @@ pub fn is_bidi_or_control(c: char) -> bool {
     ) || c.is_control()
 }
 
+/// Caractere de formato que não se vê: os Default_Ignorable_Code_Point do
+/// Unicode (soft hyphen, ZWSP, word joiner, BOM, preenchimentos Hangul,
+/// operadores invisíveis, caracteres tag, marcas bidi...) e o braille vazio
+/// U+2800, que pinta um espaço sem ser espaço. Num nome de arquivo escondem
+/// uma fachada (`fatura.pdf<ZWSP>.docm` lê-se `fatura.pdf.docm`) e bloqueiam,
+/// como os bidi. Ficam de fora os [`is_text_joiner`], que o texto legítimo
+/// usa.
+fn is_hidden_format(c: char) -> bool {
+    !is_text_joiner(c)
+        && matches!(
+            c,
+            '\u{00AD}'
+                | '\u{034F}'
+                | '\u{061C}'
+                | '\u{115F}'..='\u{1160}'
+                | '\u{17B4}'..='\u{17B5}'
+                | '\u{180B}'..='\u{180F}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{2800}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FEFF}'
+                | '\u{FFA0}'
+                | '\u{FFF0}'..='\u{FFF8}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0000}'..='\u{E0FFF}'
+        )
+}
+
+/// ZWNJ e ZWJ (persa, línguas índicas, sequências de emoji) e os seletores de
+/// variação (o `❤️` é `U+2764 U+FE0F`): Default_Ignorable, mas parte de texto
+/// legítimo. Não bloqueiam; a análise da extensão corre sem eles, para não
+/// separarem uma fachada nem partirem uma extensão.
+fn is_text_joiner(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200C}' | '\u{200D}' | '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}'
+    )
+}
+
+/// Pontos que se leem como o `.` sem o ser (confusables do Unicode, os pontos
+/// finais ideográficos e os pontos a meia altura). O Windows não os vê como
+/// separador de extensão, mas quem lê `fatura．pdf.docm` vê uma fachada.
+fn is_dot_lookalike(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00B7}'
+            | '\u{0660}'
+            | '\u{06D4}'
+            | '\u{06F0}'
+            | '\u{0701}'
+            | '\u{0702}'
+            | '\u{2024}'
+            | '\u{2027}'
+            | '\u{2E31}'
+            | '\u{3002}'
+            | '\u{A4F8}'
+            | '\u{A60E}'
+            | '\u{FE52}'
+            | '\u{FF0E}'
+            | '\u{FF61}'
+            | '\u{10A50}'
+            | '\u{1D16D}'
+    )
+}
+
+/// O que vem antes da extensão (`stem`, sem o último `.`) termina numa
+/// extensão de fachada: o último segmento não vazio depois do nome, com os
+/// segmentos separados pelo `.` e pelos seus sósias. `fatura.pdf. ` e
+/// `fatura．pdf` terminam em `pdf`; `pdf` sozinho é o nome, não uma fachada.
+fn ends_in_decoy(stem: &str) -> bool {
+    stem.split(|c| c == '.' || is_dot_lookalike(c))
+        .skip(1)
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .last()
+        .is_some_and(|segment| {
+            SAFE_DECOY_EXTENSIONS.contains(&segment.to_ascii_lowercase().as_str())
+        })
+}
+
 /// Normaliza um nome de arquivo segundo as regras fundamentais do subsistema Win32:
 /// corta espaços e pontos finais à direita, e corta em ':' (Alternate Data Streams).
 pub fn normalize_windows_name(name: &str) -> String {
@@ -157,7 +258,10 @@ pub fn normalize_windows_name(name: &str) -> String {
     before_ads.trim_end_matches([' ', '.']).to_lowercase()
 }
 
-/// Substitui caracteres bidi ou controles em rótulos visuais por marcas explícitas legíveis.
+/// Substitui caracteres bidi, controles e caracteres de formato invisíveis
+/// (ZWSP, word joiner, soft hyphen...) em rótulos visuais por marcas
+/// explícitas legíveis. Os joiners dos emoji e das escritas que os usam
+/// ficam como estão.
 pub fn display_label(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
@@ -173,7 +277,7 @@ pub fn display_label(name: &str) -> String {
             '\u{2069}' => out.push_str("‹PDI›"),
             '\u{200E}' => out.push_str("‹LRM›"),
             '\u{200F}' => out.push_str("‹RLM›"),
-            _ if c.is_control() => {
+            _ if c.is_control() || is_hidden_format(c) => {
                 out.push_str(&format!("‹U+{:04X}›", c as u32));
             }
             _ => out.push(c),
@@ -184,23 +288,36 @@ pub fn display_label(name: &str) -> String {
 
 /// Classifica o risco de um nome de arquivo para download ou abertura.
 ///
-/// Refusa nomes com controles bidi, caracteres de controle C0/C1 ou dois-pontos (ADS).
+/// Refusa nomes com controles bidi, caracteres de controle C0/C1, caracteres
+/// de formato invisíveis (Default_Ignorable) ou dois-pontos (ADS).
 /// Trata espaços e pontos ao final como Win32 trata.
 /// Bloqueia executáveis, scripts, imagens de disco e mascaramentos com extensão dupla
-/// (também um documento com macro depois de uma extensão de fachada).
+/// (também um documento com macro depois de uma extensão de fachada, mesmo
+/// separada por segmentos em branco ou por um sósia do ponto).
 /// Emite aviso para documentos com macro.
 pub fn classify_download_name(name: &str) -> RiskClass {
     if name.is_empty() {
         return RiskClass::Block;
     }
 
-    // Refusa ':' (Alternate Data Streams) e caracteres de controle ou bidi
-    if name.contains(':') || name.chars().any(is_bidi_or_control) {
+    // Refusa ':' (Alternate Data Streams), caracteres de controle ou bidi e
+    // os de formato que não se veem.
+    if name.contains(':')
+        || name
+            .chars()
+            .any(|c| is_bidi_or_control(c) || is_hidden_format(c))
+    {
         return RiskClass::Block;
     }
 
+    // Os joiners não pintam nada: a análise corre sem eles, para não
+    // separarem uma fachada (`fatura.pdf<ZWJ>.docm`) nem partirem uma
+    // extensão. Tirá-los só junta o que o Windows vê separado: uma extensão
+    // real perigosa continua perigosa aqui.
+    let visible: String = name.chars().filter(|&c| !is_text_joiner(c)).collect();
+
     // Regra do Windows: remove espaços e pontos no final
-    let clean = name.trim_end_matches([' ', '.']);
+    let clean = visible.trim_end_matches([' ', '.']);
     if clean.is_empty() {
         return RiskClass::Block;
     }
@@ -216,14 +333,11 @@ pub fn classify_download_name(name: &str) -> RiskClass {
         return RiskClass::Block;
     }
 
-    // Decomposição de extensões
-    let parts: Vec<&str> = clean.split('.').collect();
-    if parts.len() < 2 {
+    // Decomposição de extensões: `stem` é tudo antes do último ponto.
+    let Some((stem, last_raw)) = clean.rsplit_once('.') else {
         // Sem extensão
         return RiskClass::Safe;
-    }
-
-    let last_raw = parts.last().unwrap();
+    };
     let final_ext = last_raw.trim().to_ascii_lowercase();
 
     // Verificação de executáveis, scripts e imagens de disco -> Block
@@ -236,15 +350,11 @@ pub fn classify_download_name(name: &str) -> RiskClass {
 
     // Detecção de Masquerade (disfarce com extensão dupla ou espaçamento):
     // Exemplo: `fatura.pdf.exe`, `foto.jpg     .scr`, `documento.docx.vbs`.
-    // Um documento com macro disfarçado (`fatura.pdf.docm`) também bloqueia:
-    // disfarce não tem exceção.
-    if parts.len() >= 3 {
-        let penult_ext = parts[parts.len() - 2].trim().to_ascii_lowercase();
-        if SAFE_DECOY_EXTENSIONS.contains(&penult_ext.as_str())
-            && (is_dangerous_ext || is_macro_ext)
-        {
-            return RiskClass::Block;
-        }
+    // Um documento com macro disfarçado (`fatura.pdf.docm`, `fatura.pdf. .docm`,
+    // `fatura．pdf.docm`, `livro.epub.docm`) também bloqueia: disfarce não
+    // tem exceção.
+    if (is_dangerous_ext || is_macro_ext) && ends_in_decoy(stem) {
+        return RiskClass::Block;
     }
 
     // Espaçamento disfarçado antes da extensão perigosa (ex.: "arquivo.pdf   .exe")
@@ -324,17 +434,33 @@ pub fn sniff_download(bytes: &[u8]) -> SniffRisk {
 }
 
 /// `@echo off` no início, como o `cmd.exe` o lê: sem distinguir maiúsculas
-/// (`@Echo Off`), depois de um BOM UTF-8 e de espaços, com um ou mais espaços
-/// ou tabs entre `@echo` e `off`.
+/// (`@Echo Off`), depois de um BOM UTF-8 e de espaços, com um ou mais `@`
+/// seguidos ou não de espaços (`@ echo off`, `@@echo off`: o `cmd /c` corre-os
+/// como `@echo off`) e com um ou mais espaços ou tabs entre `echo` e `off`.
 fn starts_like_batch(bytes: &[u8]) -> bool {
     let text = bytes
         .strip_prefix(b"\xEF\xBB\xBF")
         .unwrap_or(bytes)
         .trim_ascii_start();
-    let Some(rest) = text
-        .get(..5)
-        .filter(|head| head.eq_ignore_ascii_case(b"@echo"))
-        .map(|_| &text[5..])
+    // Espaços e tabs da mesma linha.
+    fn blanks(line: &[u8]) -> &[u8] {
+        let gap = line
+            .iter()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .count();
+        &line[gap..]
+    }
+    let Some(mut command) = text.strip_prefix(b"@") else {
+        return false;
+    };
+    while let Some(next) = blanks(command).strip_prefix(b"@") {
+        command = next;
+    }
+    let command = blanks(command);
+    let Some(rest) = command
+        .get(..4)
+        .filter(|head| head.eq_ignore_ascii_case(b"echo"))
+        .map(|_| &command[4..])
     else {
         return false;
     };
@@ -673,6 +799,156 @@ mod tests {
         }
     }
 
+    /// Os 10 tipos OOXML com macros habilitadas (a lista do Office, escrita
+    /// aqui e não lida de `MACRO_EXTENSIONS`: um tipo que falte na lista do
+    /// produto fica vermelho) e os binários antigos que também levam macros.
+    #[test]
+    fn every_macro_enabled_office_type_warns_alone_and_blocks_behind_a_decoy() {
+        let ooxml_macro_enabled = [
+            "docm", "dotm", "xlsm", "xltm", "xlam", "pptm", "potm", "ppam", "ppsm", "sldm",
+        ];
+        // `.xlsb` (pasta binária, com VBA), `.xlm` (folha de macros do Excel
+        // 4), `.xla`/`.ppa` (suplementos antigos: só existem para levar
+        // código) e `.pps` (apresentação antiga que abre direto no modo de
+        // exibição).
+        let legacy_macro_carriers = ["xlsb", "xlm", "xla", "ppa", "pps"];
+        for ext in ooxml_macro_enabled.iter().chain(&legacy_macro_carriers) {
+            for (name, expected) in [
+                (format!("arquivo.{ext}"), RiskClass::Warn),
+                (format!("ARQUIVO.{}", ext.to_uppercase()), RiskClass::Warn),
+                (format!("fatura.pdf.{ext}"), RiskClass::Block),
+                (format!("foto.jpg   .{ext}"), RiskClass::Block),
+            ] {
+                assert_eq!(classify_download_name(&name), expected, "{name}");
+            }
+        }
+        assert_eq!(classify_download_name("apresentacao.ppsm"), RiskClass::Warn);
+        assert_eq!(classify_download_name("fatura.pdf.ppsm"), RiskClass::Block);
+    }
+
+    /// Um documento com macro atrás de uma fachada bloqueia também quando a
+    /// fachada está separada por um segmento em branco, por caracteres que
+    /// não se veem, por um ponto que não é o ASCII, ou é um tipo que a
+    /// própria NeuralIA abre (`.epub`, `.md`) ou uma página (`.html`).
+    #[test]
+    fn a_macro_behind_a_decoy_blocks_through_blanks_invisibles_and_lookalike_dots() {
+        for name in [
+            "fatura.pdf. .docm",
+            "fatura.pdf..docm",
+            "fatura.pdf . . .docm",
+            "fatura.pdf\u{200B}.docm",
+            "fatura.pdf\u{2060}.docm",
+            "fatura.pdf\u{00AD}.docm",
+            "fatura.pdf\u{FEFF}.docm",
+            "fatura.pdf\u{3164}\u{3164}.docm",
+            "fatura.pdf\u{2800}\u{2800}.docm",
+            "fatura.pdf\u{200D}.docm",
+            "fatura.p\u{200C}df.docm",
+            "fatura.pdf\u{FE0F}.docm",
+            "fatura\u{FF0E}pdf.docm",
+            "fatura\u{2024}pdf.xlsm",
+            "fatura\u{FE52}pdf.pptm",
+            "fatura\u{0660}pdf.docm",
+            "fatura.pdf\u{3000}\u{3000}.docm",
+            "livro.epub.docm",
+            "nota.md.xlsm",
+            "foto.heic.docm",
+            "fatura.html.docm",
+            "pagina.htm.xlsm",
+            "digitalizacao.tif.docm",
+            ".pdf.docm",
+        ] {
+            assert_eq!(classify_download_name(name), RiskClass::Block, "{name:?}");
+        }
+        // Sem fachada, um documento com macro continua a ser só um aviso.
+        for name in [
+            "orcamento.2024.xlsm",
+            "relatorio.final.docm",
+            "ata..docm",
+            "pdf.docm",
+            "ata\u{200D}.docm",
+        ] {
+            assert_eq!(classify_download_name(name), RiskClass::Warn, "{name:?}");
+        }
+    }
+
+    /// Caracteres de formato que não se veem (Default_Ignorable_Code_Point,
+    /// como os bidi) bloqueiam o nome; os que o texto legítimo usa (ZWJ e
+    /// ZWNJ, seletores de variação dos emoji) não, mas também não separam
+    /// nada: a análise corre sem eles.
+    #[test]
+    fn invisible_format_characters_block_and_text_joiners_do_not() {
+        for name in [
+            "foto\u{200B}.png",
+            "foto.png\u{2060}",
+            "rel\u{00AD}atorio.pdf",
+            "\u{FEFF}notas.txt",
+            "a\u{061C}b.pdf",
+            "tag\u{E0041}.pdf",
+            "x\u{180E}.pdf",
+            "x\u{1BCA0}.pdf",
+            "x\u{2800}.pdf",
+        ] {
+            assert_eq!(classify_download_name(name), RiskClass::Block, "{name:?}");
+        }
+        for name in [
+            "familia \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}.jpg",
+            "coracao \u{2764}\u{FE0F}.png",
+            "\u{645}\u{6CC}\u{200C}\u{62E}\u{648}\u{627}\u{647}\u{645}.pdf",
+        ] {
+            assert_eq!(classify_download_name(name), RiskClass::Safe, "{name:?}");
+        }
+        // Um joiner não disfarça um executável nem quebra a extensão.
+        assert_eq!(
+            classify_download_name("fatura.pdf.e\u{200D}xe"),
+            RiskClass::Block
+        );
+        assert_eq!(classify_download_name("con\u{200D}.txt"), RiskClass::Block);
+    }
+
+    /// Cada tipo que o `DefaultAppTarget` abre é também uma fachada: um
+    /// `livro.epub.docm` finge ser um livro que a NeuralIA abriria.
+    #[test]
+    fn every_default_app_type_is_a_decoy() {
+        for ext in DEFAULT_APP_ALLOWLIST {
+            assert!(SAFE_DECOY_EXTENSIONS.contains(ext), "{ext}");
+            let name = format!("arquivo.{ext}.docm");
+            assert_eq!(classify_download_name(&name), RiskClass::Block, "{name}");
+        }
+    }
+
+    /// No Windows o `.svg` abre no navegador, que corre o `<script>` dele a
+    /// partir de `file://` (SVG smuggling): só "Mostrar na pasta".
+    #[test]
+    fn an_svg_never_reaches_the_default_app() {
+        let temp = TempDir::new("svg");
+        let svg = temp.file(
+            "imagem.svg",
+            br#"<svg xmlns="http://www.w3.org/2000/svg"><script>alert(document.domain)</script></svg>"#,
+        );
+        assert!(default_app_target(&svg).is_none());
+        let plain = temp.file(
+            "desenho.svg",
+            br#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>"#,
+        );
+        assert!(default_app_target(&plain).is_none());
+        assert!(!DEFAULT_APP_ALLOWLIST.contains(&"svg"));
+    }
+
+    #[test]
+    fn display_label_marks_invisible_format_characters() {
+        assert_eq!(
+            display_label("fatura.pdf\u{200B}.docm"),
+            "fatura.pdf‹U+200B›.docm"
+        );
+        assert_eq!(display_label("a\u{2060}b\u{00AD}c"), "a‹U+2060›b‹U+00AD›c");
+        // Os joiners dos emoji ficam como estão.
+        assert_eq!(
+            display_label("\u{2764}\u{FE0F}.png"),
+            "\u{2764}\u{FE0F}.png"
+        );
+    }
+
     #[test]
     fn sniff_download_identifies_binary_and_script_signatures() {
         // MZ + PE
@@ -710,6 +986,14 @@ mod tests {
             b"\xEF\xBB\xBF  @Echo Off\r\ndir",
             b"\r\n@echo\toff\r\n",
             b"@echo   off",
+            // O `cmd.exe` aceita espaços depois do `@` e mais de um `@`
+            // (conferido com `cmd /c`: nenhum destes ecoa a linha seguinte).
+            b"@ echo off\r\ndir",
+            b"@\techo off",
+            b" @ Echo  Off\r\n",
+            b"@@echo off",
+            b"@ @ echo off",
+            b"\xEF\xBB\xBF@ echo off",
         ] {
             assert_eq!(sniff_download(batch), SniffRisk::Warn, "{batch:?}");
         }
@@ -719,6 +1003,10 @@ mod tests {
             b"@echooff",
             b"echo off",
             b"\xEF\xBB\xBFHello",
+            b"@ echoes",
+            b"@ ",
+            b"@@",
+            b"@ e-mail: echo off",
         ] {
             assert_eq!(sniff_download(plain), SniffRisk::Safe, "{plain:?}");
         }
