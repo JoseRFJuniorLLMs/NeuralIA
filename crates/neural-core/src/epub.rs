@@ -63,6 +63,9 @@ pub enum LimitKind {
     ExtraLength,
     /// Comentário de entrada com mais de [`MAX_COMMENT_LEN`] bytes.
     CommentLength,
+    /// Diretório central maior do que o teto da política (só a
+    /// `ZipPolicy::BROWSE_LITE` dos downloads tem um).
+    DirectorySize,
     /// Documento XML com mais de [`MAX_XML_BYTES`] bytes.
     XmlSize,
     /// Documento XML com mais de [`MAX_XML_NODES`] elementos.
@@ -79,6 +82,7 @@ impl fmt::Display for LimitKind {
             LimitKind::NameLength => "tamanho do nome",
             LimitKind::ExtraLength => "tamanho do campo extra",
             LimitKind::CommentLength => "tamanho do comentário",
+            LimitKind::DirectorySize => "tamanho do diretório central",
             LimitKind::XmlSize => "tamanho do XML",
             LimitKind::XmlNodes => "elementos no XML",
         })

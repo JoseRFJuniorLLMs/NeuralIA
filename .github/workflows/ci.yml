@@ -589,6 +589,17 @@ jobs:
                       UserEvent::RunCommandKey { key, .. } => {
                           if let Some(event) = resolve_command(key, CommandOrigin::Host(WebViewHost::External)) {
           '@
+            },
+            @{
+              Label = "zip-not-inspected-shown-as-done"
+              Test = "a_zip_download_is_inspected_and_not_inspected_is_shown"
+              SourcePath = "crates/neural-app/src/windows_app/downloads_ui.rs"
+              Old = @'
+                  Inspection::NotInspected => Some(NOT_INSPECTED),
+          '@
+              New = @'
+                  Inspection::NotInspected => None,
+          '@
             }
           )
 

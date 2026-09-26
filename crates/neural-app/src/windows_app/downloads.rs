@@ -31,7 +31,9 @@ use crate::stores::{DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE};
 // - `BytesReceivedChanged`: filtrado a 250 ms (`ProgressThrottle`) antes de
 //   sair do handler. `StateChanged`: o fim (acabado, cancelado,
 //   interrompido), que larga a operacao e, se acabou, corre o
-//   `finalize_download` (sniff, depois a marca da Web ou apagar).
+//   `finalize_download` (sniff e, num `.zip`, o diretorio central -- com
+//   «Permitir baixar programas» de quando acabou --, depois a marca da Web
+//   ou apagar).
 // - A WebView destruida: o handler do `DownloadStarting` guarda um
 //   `WebViewLife`; quando o WebView2 o larga, o gestor recebe `WebViewGone`
 //   e cancela e larga as operacoes dessa WebView.
@@ -748,8 +750,9 @@ pub(in crate::windows_app) fn download_app_step(
             id,
             path,
             confirmed_program,
+            allow_programs,
         } => {
-            let outcome = finalize_download(&path, confirmed_program);
+            let outcome = finalize_download(&path, confirmed_program, allow_programs);
             debug_log(format_args!("downloads: {} acabou ({outcome:?})", id.0));
             Some(DownloadEvent::Finalized { id, outcome })
         }

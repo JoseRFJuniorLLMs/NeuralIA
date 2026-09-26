@@ -22,6 +22,12 @@
 //!
 //! A busca por nome tenta o nome exato e depois o mesmo nome sem distinguir
 //! maiúsculas (EPUBs feitos no Windows costumam errar a caixa nos `href`).
+//!
+//! A segunda política, [`ZipPolicy::BROWSE_LITE`], é a da inspeção de um ZIP
+//! baixado (downloads-zip-inspect, [`list_central_directory`]): só o
+//! diretório central, com um teto de entradas e de bytes do diretório, sem
+//! os tetos de tamanho do EPUB (um ZIP legítimo de 2 GiB é inspecionado) e
+//! sem ler um byte dos dados das entradas.
 
 use std::{
     collections::HashMap,
@@ -37,7 +43,8 @@ use flate2::{Crc, read::DeflateDecoder};
 use crate::epub::{EpubError, EpubResult, LimitKind};
 
 /// Limites de leitura para um tipo de arquivo ZIP. Novas políticas entram
-/// junto com o primeiro consumidor; por enquanto só EPUB está habilitado.
+/// junto com o primeiro consumidor: EPUB (o leitor de livros) e
+/// BROWSE_LITE (a inspeção dos downloads).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZipPolicy {
     pub max_entries: u64,
@@ -48,6 +55,9 @@ pub struct ZipPolicy {
     pub max_name_len: usize,
     pub max_extra_len: usize,
     pub max_comment_len: usize,
+    /// Bytes do diretório central (o que a listagem lê). `u64::MAX`: sem
+    /// teto próprio (o EPUB já o limita pelas entradas e pelos campos).
+    pub max_directory_size: u64,
 }
 
 impl ZipPolicy {
@@ -61,6 +71,26 @@ impl ZipPolicy {
         max_name_len: 1024,
         max_extra_len: 4096,
         max_comment_len: 4096,
+        max_directory_size: u64::MAX,
+    };
+
+    /// A inspeção de um ZIP baixado (downloads-zip-inspect): só o diretório
+    /// central, sem os tetos de tamanho do EPUB -- os dados das entradas
+    /// nunca são lidos, por isso o tamanho deles não custa nada. Os campos
+    /// de 16 bits (nome, extra, comentário) ficam no máximo do formato. O que
+    /// limita o trabalho, que corre na thread da interface, é o número de
+    /// entradas e os bytes do diretório: acima deles, a inspeção falha e o
+    /// arquivo fica «não inspecionado», nunca «seguro».
+    pub const BROWSE_LITE: Self = Self {
+        max_entries: 100_000,
+        max_entry_size: u64::MAX,
+        max_total_size: u64::MAX,
+        max_compression_ratio: u64::MAX,
+        ratio_check_min_size: u64::MAX,
+        max_name_len: 0xFFFF,
+        max_extra_len: 0xFFFF,
+        max_comment_len: 0xFFFF,
+        max_directory_size: 32 * 1024 * 1024,
     };
 }
 
@@ -141,18 +171,36 @@ impl ZipEntry {
     }
 }
 
-/// De onde vêm os bytes: memória ou um arquivo aberto (lido por partes, sem
-/// carregar o livro inteiro).
+/// Um fluxo com posição que a [`Source`] pode guardar (o arquivo aberto, ou
+/// nos testes um leitor que conta o que lê).
+trait ReadSeek: Read + Seek + Send {}
+
+impl<T: Read + Seek + Send> ReadSeek for T {}
+
+/// De onde vêm os bytes: memória ou um fluxo com posição (o arquivo aberto,
+/// lido por partes, sem carregar o livro inteiro).
 enum Source {
     Memory(Vec<u8>),
-    File { file: Mutex<File>, len: u64 },
+    Stream {
+        stream: Mutex<Box<dyn ReadSeek>>,
+        len: u64,
+    },
 }
 
 impl Source {
+    /// Um fluxo, com o tamanho dado pelo fim dele.
+    fn stream(mut stream: impl Read + Seek + Send + 'static) -> io::Result<Self> {
+        let len = stream.seek(SeekFrom::End(0))?;
+        Ok(Source::Stream {
+            stream: Mutex::new(Box::new(stream)),
+            len,
+        })
+    }
+
     fn len(&self) -> u64 {
         match self {
             Source::Memory(bytes) => bytes.len() as u64,
-            Source::File { len, .. } => *len,
+            Source::Stream { len, .. } => *len,
         }
     }
 
@@ -172,10 +220,10 @@ impl Source {
                 buf.copy_from_slice(&bytes[offset as usize..end as usize]);
                 Ok(())
             }
-            Source::File { file, .. } => {
-                let mut file = file.lock().unwrap_or_else(|poison| poison.into_inner());
-                file.seek(SeekFrom::Start(offset))?;
-                file.read_exact(buf)
+            Source::Stream { stream, .. } => {
+                let mut stream = stream.lock().unwrap_or_else(|poison| poison.into_inner());
+                stream.seek(SeekFrom::Start(offset))?;
+                stream.read_exact(buf)
             }
         }
     }
@@ -223,12 +271,7 @@ impl EpubArchive {
     /// Abre o arquivo e valida o diretório central inteiro. Os dados das
     /// entradas só são lidos quando pedidos.
     pub fn open(path: impl AsRef<Path>) -> EpubResult<Self> {
-        let file = File::open(path)?;
-        let len = file.metadata()?.len();
-        Self::from_source(Source::File {
-            file: Mutex::new(file),
-            len,
-        })
+        Self::from_source(Source::stream(File::open(path)?)?)
     }
 
     /// Como [`EpubArchive::open`], sobre bytes em memória.
@@ -338,8 +381,9 @@ impl EpubArchive {
     }
 
     fn from_source(source: Source) -> EpubResult<Self> {
-        let directory = find_directory(&source)?;
-        let mut records = read_central_directory(&source, &directory)?;
+        let policy = &ZipPolicy::EPUB;
+        let directory = find_directory(&source, policy)?;
+        let mut records = read_central_directory(&source, &directory, policy)?;
         check_local_headers(&source, &directory, &mut records)?;
 
         let mut entries = Vec::with_capacity(records.len());
@@ -451,7 +495,7 @@ struct Directory {
     limit: u64,
 }
 
-fn find_directory(source: &Source) -> EpubResult<Directory> {
+fn find_directory(source: &Source, policy: &ZipPolicy) -> EpubResult<Directory> {
     let len = source.len();
     if len < EOCD_LEN as u64 {
         return Err(EpubError::NotZip("arquivo pequeno demais".into()));
@@ -513,11 +557,18 @@ fn find_directory(source: &Source) -> EpubResult<Directory> {
             }
         }
     };
-    if directory.entries > MAX_ENTRIES {
+    if directory.entries > policy.max_entries {
         return Err(EpubError::Limit {
             kind: LimitKind::Entries,
             value: directory.entries,
-            limit: MAX_ENTRIES,
+            limit: policy.max_entries,
+        });
+    }
+    if directory.size > policy.max_directory_size {
+        return Err(EpubError::Limit {
+            kind: LimitKind::DirectorySize,
+            value: directory.size,
+            limit: policy.max_directory_size,
         });
     }
     let fits = directory
@@ -587,10 +638,30 @@ struct CentralRecord {
     data_offset: u64,
 }
 
-fn read_central_directory(
+/// Um registro do diretório central com os campos ZIP64 já preenchidos,
+/// antes das regras de cada política (nome, criptografia, método,
+/// tamanhos).
+struct RawRecord {
+    raw_name: Vec<u8>,
+    flags: u16,
+    method: u16,
+    crc32: u32,
+    size: u64,
+    compressed_size: u64,
+    header_offset: u64,
+}
+
+/// Percorre as `directory.entries` entradas do diretório central, lendo só
+/// os bytes dele, e entrega cada uma a `visit`, pela ordem. Nome, extra e
+/// comentário passam pelos tetos de `policy`; os campos saturados vêm do
+/// extra ZIP64; uma entrada noutro volume é recusada. Devolve se sobraram
+/// bytes no diretório depois da última entrada.
+fn walk_central_directory(
     source: &Source,
     directory: &Directory,
-) -> EpubResult<Vec<CentralRecord>> {
+    policy: &ZipPolicy,
+    mut visit: impl FnMut(RawRecord) -> EpubResult<()>,
+) -> EpubResult<bool> {
     let section = Section {
         source,
         pos: directory.offset,
@@ -601,9 +672,6 @@ fn read_central_directory(
         io::ErrorKind::UnexpectedEof => EpubError::NotZip("diretório central truncado".into()),
         _ => EpubError::Io(error),
     };
-    // `entries <= MAX_ENTRIES`: a reserva é limitada.
-    let mut records = Vec::with_capacity(directory.entries as usize);
-    let mut total: u64 = 0;
     for _ in 0..directory.entries {
         let mut fixed = [0u8; CENTRAL_LEN];
         reader.read_exact(&mut fixed).map_err(truncated)?;
@@ -624,9 +692,13 @@ fn read_central_directory(
         let mut header_offset = u64::from(le32(&fixed, 42));
 
         for (kind, value, limit) in [
-            (LimitKind::NameLength, name_len, MAX_NAME_LEN),
-            (LimitKind::ExtraLength, extra_len, MAX_EXTRA_LEN),
-            (LimitKind::CommentLength, comment_len, MAX_COMMENT_LEN),
+            (LimitKind::NameLength, name_len, policy.max_name_len),
+            (LimitKind::ExtraLength, extra_len, policy.max_extra_len),
+            (
+                LimitKind::CommentLength,
+                comment_len,
+                policy.max_comment_len,
+            ),
         ] {
             if value > limit {
                 return Err(EpubError::Limit {
@@ -643,7 +715,6 @@ fn read_central_directory(
         let mut comment = vec![0u8; comment_len];
         reader.read_exact(&mut comment).map_err(truncated)?;
 
-        let display = String::from_utf8_lossy(&raw_name).into_owned();
         if size == SATURATED_32
             || compressed_size == SATURATED_32
             || header_offset == SATURATED_32
@@ -656,6 +727,7 @@ fn read_central_directory(
                 disk_start: (disk_start == SATURATED_16).then_some(&mut disk_start),
             };
             if !values.fill_from(&extra) {
+                let display = String::from_utf8_lossy(&raw_name);
                 return Err(EpubError::NotZip(format!(
                     "campo ZIP64 incompleto em {display:?}"
                 )));
@@ -664,7 +736,42 @@ fn read_central_directory(
         if disk_start != 0 {
             return Err(EpubError::Unsupported("ZIP dividido em volumes".into()));
         }
+        visit(RawRecord {
+            raw_name,
+            flags,
+            method,
+            crc32,
+            size,
+            compressed_size,
+            header_offset,
+        })?;
+    }
+    let mut probe = [0u8; 1];
+    Ok(reader.read(&mut probe).map_err(truncated)? != 0)
+}
 
+/// O diretório central pelas regras do EPUB: nomes normalizados, nada de
+/// criptografia nem de métodos além de 0/8, e os tetos de tamanho e de
+/// razão de `policy`.
+fn read_central_directory(
+    source: &Source,
+    directory: &Directory,
+    policy: &ZipPolicy,
+) -> EpubResult<Vec<CentralRecord>> {
+    // `entries <= policy.max_entries`: a reserva é limitada.
+    let mut records = Vec::with_capacity(directory.entries as usize);
+    let mut total: u64 = 0;
+    walk_central_directory(source, directory, policy, |raw| {
+        let RawRecord {
+            raw_name,
+            flags,
+            method,
+            crc32,
+            size,
+            compressed_size,
+            header_offset,
+        } = raw;
+        let display = String::from_utf8_lossy(&raw_name).into_owned();
         let name =
             normalize_entry_name(&display).ok_or_else(|| EpubError::UnsafeName(display.clone()))?;
         let is_dir = raw_name.last() == Some(&b'/');
@@ -683,28 +790,28 @@ fn read_central_directory(
                 });
             }
         };
-        if size > MAX_ENTRY_SIZE {
+        if size > policy.max_entry_size {
             return Err(EpubError::Limit {
                 kind: LimitKind::EntrySize,
                 value: size,
-                limit: MAX_ENTRY_SIZE,
+                limit: policy.max_entry_size,
             });
         }
         total = total.saturating_add(size);
-        if total > MAX_TOTAL_SIZE {
+        if total > policy.max_total_size {
             return Err(EpubError::Limit {
                 kind: LimitKind::TotalSize,
                 value: total,
-                limit: MAX_TOTAL_SIZE,
+                limit: policy.max_total_size,
             });
         }
-        if size > RATIO_CHECK_MIN_SIZE
-            && size > compressed_size.saturating_mul(MAX_COMPRESSION_RATIO)
+        if size > policy.ratio_check_min_size
+            && size > compressed_size.saturating_mul(policy.max_compression_ratio)
         {
             return Err(EpubError::Limit {
                 kind: LimitKind::CompressionRatio,
                 value: size / compressed_size.max(1),
-                limit: MAX_COMPRESSION_RATIO,
+                limit: policy.max_compression_ratio,
             });
         }
         if compression == Compression::Stored && compressed_size != size {
@@ -725,8 +832,64 @@ fn read_central_directory(
             header_offset,
             data_offset: 0,
         });
-    }
+        Ok(())
+    })?;
     Ok(records)
+}
+
+/// Lista o diretório central de um ZIP sem ler os dados das entradas
+/// (downloads-zip-inspect, política [`ZipPolicy::BROWSE_LITE`]): lê o fim
+/// do arquivo (o registro de fim, até 64 KiB de comentário, e o ZIP64) e os
+/// bytes do diretório central, e mais nada -- nem os cabeçalhos locais, nem
+/// os dados. `visit` recebe o nome cru de cada entrada (pastas incluídas),
+/// em UTF-8 com perdas e sem normalizar, pela ordem do diretório, à medida
+/// que é lido: quem inspeciona fica com o que viu mesmo quando a listagem
+/// falha depois.
+///
+/// Falha (e o arquivo não conta como listado) com um diretório truncado, com
+/// assinaturas erradas, fora do arquivo, com bytes a mais no fim, acima dos
+/// tetos da política, noutro volume, com ZIP64 incompleto, ou com entradas
+/// que se sobrepõem ou invadem o diretório central -- medidas pelo mínimo
+/// que cada uma ocupa (cabeçalho local de 30 bytes, o nome e os dados
+/// comprimidos), sem ler o cabeçalho local. Devolve o número de entradas.
+pub fn list_central_directory(
+    reader: impl Read + Seek + Send + 'static,
+    policy: &ZipPolicy,
+    mut visit: impl FnMut(&str),
+) -> EpubResult<u64> {
+    let source = Source::stream(reader)?;
+    let directory = find_directory(&source, policy)?;
+    // `entries <= policy.max_entries`: a reserva é limitada.
+    let mut spans: Vec<(u64, u64)> = Vec::with_capacity(directory.entries as usize);
+    let trailing = walk_central_directory(&source, &directory, policy, |raw| {
+        visit(&String::from_utf8_lossy(&raw.raw_name));
+        let end = raw
+            .header_offset
+            .checked_add((LOCAL_LEN + raw.raw_name.len()) as u64)
+            .and_then(|end| end.checked_add(raw.compressed_size))
+            .ok_or_else(|| EpubError::NotZip("entrada fora do arquivo".into()))?;
+        spans.push((raw.header_offset, end));
+        Ok(())
+    })?;
+    if trailing {
+        return Err(EpubError::NotZip(
+            "bytes a mais no fim do diretório central".into(),
+        ));
+    }
+    spans.sort_unstable();
+    let mut previous_end = 0u64;
+    for (start, end) in spans {
+        if start < previous_end {
+            return Err(EpubError::NotZip("entradas sobrepostas no ZIP".into()));
+        }
+        if end > directory.offset {
+            return Err(EpubError::NotZip(
+                "dados da entrada invadem o diretório central".into(),
+            ));
+        }
+        previous_end = end;
+    }
+    Ok(directory.entries)
 }
 
 /// Os campos saturados de uma entrada, preenchidos pelo extra ZIP64 na ordem
@@ -965,6 +1128,8 @@ mod tests {
         assert_eq!(ZipPolicy::EPUB.max_name_len, 1024);
         assert_eq!(ZipPolicy::EPUB.max_extra_len, 4096);
         assert_eq!(ZipPolicy::EPUB.max_comment_len, 4096);
+        // Sem teto próprio do diretório central, como antes da BROWSE_LITE.
+        assert_eq!(ZipPolicy::EPUB.max_directory_size, u64::MAX);
         assert_eq!(MAX_ENTRIES, ZipPolicy::EPUB.max_entries);
         assert_eq!(MAX_ENTRY_SIZE, ZipPolicy::EPUB.max_entry_size);
         assert_eq!(MAX_TOTAL_SIZE, ZipPolicy::EPUB.max_total_size);
@@ -1100,6 +1265,121 @@ mod tests {
                 other => panic!("{what}: veio {other:?}"),
             }
         }
+    }
+
+    /// A listagem da BROWSE_LITE (downloads-zip-inspect) recusa pelo motivo
+    /// certo: cada falha abaixo é a regra que a nomeia, não outra que
+    /// calhou antes. E aceita o que o EPUB recusa (uma entrada cifrada, um
+    /// método que não é 0/8, um nome com `..`, tamanhos acima dos tetos do
+    /// EPUB), porque não lê dados nem extrai nada.
+    #[test]
+    fn browse_lite_listing_fails_for_the_named_reason() {
+        let list = |bytes: Vec<u8>| {
+            let mut names = Vec::new();
+            let listed =
+                list_central_directory(io::Cursor::new(bytes), &ZipPolicy::BROWSE_LITE, |name| {
+                    names.push(name.to_string())
+                });
+            (listed, names)
+        };
+        let not_zip = |result: EpubResult<u64>| match result {
+            Err(EpubError::NotZip(reason)) => reason,
+            other => panic!("esperado NotZip, veio {other:?}"),
+        };
+
+        // O que o EPUB recusa e a listagem lê.
+        let mut cipher = RawEntry::stored("secreto.txt", b"xx");
+        cipher.flags = 1;
+        let mut lzma = RawEntry::stored("lzma.bin", b"xx");
+        lzma.method = 14;
+        lzma.local_method = Some(14);
+        let mut huge = RawEntry::stored("grande.bin", b"");
+        huge.size = MAX_ENTRY_SIZE + 1;
+        huge.compressed = 0;
+        let odd = ZipBuilder::new()
+            .entry(cipher)
+            .entry(lzma)
+            .stored("../fora.txt", b"x")
+            .entry(huge)
+            .build();
+        assert!(EpubArchive::from_bytes(odd.clone()).is_err());
+        let (listed, names) = list(odd);
+        assert_eq!(listed.expect("listado"), 4);
+        assert_eq!(
+            names,
+            ["secreto.txt", "lzma.bin", "../fora.txt", "grande.bin"]
+        );
+
+        // Sobrepostas: duas entradas no mesmo cabeçalho local. Os nomes
+        // chegam a quem inspeciona antes da falha.
+        let mut same = RawEntry::stored("b.txt", b"b");
+        same.offset = Some(0);
+        same.central_only = true;
+        let (listed, names) = list(ZipBuilder::new().stored("a.txt", b"a").entry(same).build());
+        assert_eq!(not_zip(listed), "entradas sobrepostas no ZIP");
+        assert_eq!(names, ["a.txt", "b.txt"]);
+        // Dados que invadem o diretório central.
+        let mut invades = RawEntry::stored("a.txt", b"a");
+        invades.compressed = 4096;
+        let (listed, _) = list(ZipBuilder::new().entry(invades).build());
+        assert_eq!(
+            not_zip(listed),
+            "dados da entrada invadem o diretório central"
+        );
+        // Bytes a mais no fim do diretório: o fim declara uma entrada a
+        // menos do que o diretório tem.
+        let mut short = ZipBuilder::new()
+            .stored("a.txt", b"a")
+            .stored("b.txt", b"b")
+            .build();
+        let eocd = short.len() - EOCD_LEN;
+        short[eocd + 8] = 1;
+        short[eocd + 10] = 1;
+        let (listed, names) = list(short);
+        assert_eq!(not_zip(listed), "bytes a mais no fim do diretório central");
+        assert_eq!(names, ["a.txt"]);
+
+        // Os tetos da política, antes de ler o diretório.
+        let seed = ZipBuilder::new().stored("a.txt", b"a").zip64().build();
+        let record = seed.len() - EOCD_LEN - ZIP64_LOCATOR_LEN - ZIP64_EOCD_LEN;
+        let mut many = seed.clone();
+        let over = ZipPolicy::BROWSE_LITE.max_entries + 1;
+        many[record + 24..record + 32].copy_from_slice(&over.to_le_bytes());
+        many[record + 32..record + 40].copy_from_slice(&over.to_le_bytes());
+        let (listed, names) = list(many);
+        assert!(
+            matches!(
+                listed,
+                Err(EpubError::Limit {
+                    kind: LimitKind::Entries,
+                    ..
+                })
+            ),
+            "{listed:?}"
+        );
+        assert!(names.is_empty());
+        let mut big = seed.clone();
+        let size = ZipPolicy::BROWSE_LITE.max_directory_size + 1;
+        big[record + 40..record + 48].copy_from_slice(&size.to_le_bytes());
+        let (listed, _) = list(big);
+        assert!(
+            matches!(
+                listed,
+                Err(EpubError::Limit {
+                    kind: LimitKind::DirectorySize,
+                    ..
+                })
+            ),
+            "{listed:?}"
+        );
+        // O EPUB não tem teto próprio do diretório: o mesmo diretório
+        // declarado passa dos tetos e cai na conferência de que cabe.
+        let mut declared = seed;
+        declared[record + 40..record + 48].copy_from_slice(&size.to_le_bytes());
+        assert!(matches!(
+            EpubArchive::from_bytes(declared),
+            Err(EpubError::NotZip(_))
+        ));
     }
 
     /// 257 bit flips no arquivo inteiro e 257 dentro do diretório central, nas

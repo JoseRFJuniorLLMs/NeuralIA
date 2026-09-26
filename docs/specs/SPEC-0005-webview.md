@@ -479,6 +479,28 @@ whose effects the app applies:
   `ZoneId=3` with no `HostUrl`; a mark WebView2 already wrote is left as it
   is, and that one may carry the `HostUrl`. The E2E below reports who wrote
   the mark and whether it carries a `HostUrl`;
+- a finished `.zip` (the final extension as Windows sees it) has its entries
+  listed from the central directory only (`file_risk::inspect_zip` over
+  `safezip::list_central_directory` with `ZipPolicy::BROWSE_LITE`): the end
+  record search, the ZIP64 records and the directory bytes are read, never
+  a local header nor a byte of an entry's data, with no EPUB size caps (a
+  2 GiB ZIP is inspected) but at most 100 000 entries and a 32 MiB
+  directory. Each entry is classified by the last segment of its path (`/`
+  or `\`, at any depth) with the name rules above: a program, script,
+  shortcut, disk image, Access database or another archive
+  (`ARCHIVE_EXTENSIONS`: zip, 7z, rar, cab, tar, gz...) inside deletes the
+  ZIP unless "Permitir baixar programas" is on (then it is kept and its row
+  says «tem programas ou scripts dentro», or «não inspecionado» for an
+  archive inside); a masquerade (`foto.jpg.exe`) or a name with bidi,
+  invisible or control characters or `:` inside deletes it always. DOS
+  device names (`aux.c`) and folders do not count. A ZIP whose listing
+  fails before a dangerous entry is seen (not a ZIP, truncated, bad
+  signatures, trailing bytes in the directory, incomplete or split ZIP64,
+  over a cap, overlapping entries or data running into the directory, a
+  read error) is kept as not inspected, like a 7z or RAR sniffed at the
+  start: its row and its toast say «não inspecionado» with the warning
+  tone, never plain «Concluído» (`Inspection::NotInspected`, recorded as
+  `inspection` in `downloads.json`);
 - a destroyed WebView: a guard inside the `DownloadStarting` handler sends
   `WebViewGone` when WebView2 releases the handler, and the manager cancels
   and forgets that WebView's running downloads. Whether destroying a WebView
@@ -501,16 +523,28 @@ when the store is read-only (a future-version or corrupt file), and leaves
 the downloaded files. Gates: `the_start_decision_table`,
 `the_finalize_decision_table`, `motw_is_written_and_read_back_through_the_ads`,
 `private_downloads_are_never_recorded`,
-`nothing_made_in_private_mode_is_ever_recorded` (neural-core) and
+`nothing_made_in_private_mode_is_ever_recorded`,
+`a_downloaded_zip_is_inspected_on_disk`, `zip_entry_classification_table`,
+`a_big_zip_is_inspected_without_reading_entry_bodies` (a sparse ZIP of more
+than 2 GiB, and a ZIP64 of 12 GiB, through a counting reader: every read
+falls in the end window or the directory, and 1 MiB or GiB per entry cost
+the same reads), `corrupt_zip64_and_overlap_zips_are_not_inspected`,
+`zip_mutation_harness_never_panics_and_never_comes_out_clean`,
+`browse_lite_listing_fails_for_the_named_reason` (neural-core) and
 `downloads_are_denied_on_every_local_host_and_managed_on_the_web`,
 `download_ops_follow_the_manager_and_are_cleared_on_finish_and_destroy`,
+`a_zip_download_is_inspected_and_not_inspected_is_shown`,
 `private_downloads_never_reach_downloads_json`,
 `clearing_history_takes_downloads_json_off_the_disk`, with
 `every_webview_gets_the_hooks` requiring the manager on every `Managed` host
 and on no `Deny` host. The CI-only `scripts/test-downloads.ps1` runs the
 tested exe against a 127.0.0.1 fixture: a `setup.exe` is refused; a PDF
 lands in the chosen folder with the mark of the web, NeuralIA's finalize
-ran, and a mark NeuralIA wrote is `ZoneId=3` with no `HostUrl`.
+ran, and a mark NeuralIA wrote is `ZoneId=3` with no `HostUrl`; a
+`pacote.zip` holding `setup.exe` and `run.bat` is deleted after it finishes
+and recorded as deleted for a program inside; a `sobreposto.zip` whose two
+entries share one local header stays in the folder, recorded as not
+inspected.
 
 ### Downloads UI
 
@@ -545,7 +579,10 @@ the manager shows:
   which runs nothing;
 - the notices (blocked, deleted, not deleted, completed) are `Download`
   notices of the notification centre (`crate::notify`, the corner toast),
-  with the file name in the body only;
+  with the file name in the body only; a ZIP deleted for what it held says
+  what that was («pacote.zip tinha um programa dentro...»), and a kept
+  archive that was not inspected says «não inspecionado» in its toast and
+  its row (tone `warn`);
 - two native cards (`NativeCard`: token, 600 ms arm, expiry, only what was
   painted; never activated): "Baixar programa?" and, when Home or closing
   the window would end running downloads, `leave_decision`'s "N download(s)
