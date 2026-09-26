@@ -18,8 +18,14 @@
 //!   `HostUrl`) -- escrita so quando o ficheiro ainda nao a tem.
 //! - **Guardar** ([`DownloadLog`], `downloads.json`, no maximo
 //!   [`MAX_LOG_ENTRIES`]): so os downloads acabados que nao vieram de uma
-//!   pagina privada (o Split privado, um servico InPrivate). A loja e
-//!   `StoreKind::Automatic`: no Modo privado nao se escreve por construcao.
+//!   pagina privada (o Split privado, um servico InPrivate) nem comecaram ou
+//!   acabaram no Modo privado ([`DownloadManager::set_private_mode`]): um
+//!   destes nunca entra no registo em memoria, e por isso nao chega ao
+//!   ficheiro quando o modo volta ao normal. A loja e `StoreKind::Automatic`:
+//!   no Modo privado tambem nao se escreve.
+//! - **Apagar** ([`DownloadEvent::ClearLog`], Ctrl+Shift+Delete): o registo
+//!   esvazia e o efeito [`DownloadEffect::EraseLog`] manda tirar o ficheiro
+//!   do disco, em qualquer modo.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File};
@@ -80,8 +86,8 @@ pub struct WebViewKey(pub u64);
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DownloadSettings {
-    /// A pasta onde os downloads caem (`None`: a do WebView2, a pasta
-    /// Transferencias do utilizador). Vale tambem para o perfil InPrivate.
+    /// A pasta onde os downloads caem (`None`: a pasta Transferencias do
+    /// utilizador, que o `neural-app` repoe no perfil de cada WebView).
     pub folder: Option<PathBuf>,
     /// «Permitir baixar programas»: com ela, um programa pede confirmacao
     /// em vez de ser recusado. Um disfarce continua recusado.
@@ -536,7 +542,8 @@ pub enum DownloadEvent {
         webview: WebViewKey,
     },
     SettingsChanged(DownloadSettings),
-    /// Ctrl+Shift+Delete: o registo e os downloads acabados da lista.
+    /// Ctrl+Shift+Delete: o registo e os downloads acabados da lista. Da
+    /// [`DownloadEffect::EraseLog`], nunca um `Persist`.
     ClearLog,
 }
 
@@ -588,6 +595,11 @@ pub enum DownloadEffect {
     },
     /// O registo mudou: gravar [`DownloadManager::log`].
     Persist,
+    /// O registo foi esvaziado (Ctrl+Shift+Delete): tirar o `downloads.json`
+    /// e as copias dele do disco, em qualquer modo e mesmo com a loja so de
+    /// leitura -- uma gravacao nao serve (no Modo privado ou com um ficheiro
+    /// de uma versao futura nao escreve nada).
+    EraseLog,
     /// A linha deste download mudou.
     Changed(DownloadId),
     Notice(DownloadNotice),
@@ -640,6 +652,9 @@ pub struct DownloadManager {
     settings: DownloadSettings,
     entries: BTreeMap<DownloadId, DownloadEntry>,
     log: VecDeque<DownloadRecord>,
+    /// O Modo privado do registo das lojas, posto por quem conduz o gestor
+    /// antes de cada evento.
+    private_mode: bool,
 }
 
 impl DownloadManager {
@@ -655,7 +670,22 @@ impl DownloadManager {
                 .take(MAX_LOG_ENTRIES)
                 .map(DownloadRecord::bounded)
                 .collect(),
+            private_mode: false,
         }
+    }
+
+    /// O Modo privado (o do registo das lojas, `StoreMode::Private`). Com
+    /// ele ligado, nada entra no registo: um download que comeca fica
+    /// privado ate ao fim (como um do Split privado), e um que acaba nao e
+    /// registado. O registo em memoria e o que a proxima gravacao escreve
+    /// quando o modo volta ao normal: nao escrever no Modo privado nao
+    /// chegava.
+    pub fn set_private_mode(&mut self, private: bool) {
+        self.private_mode = private;
+    }
+
+    pub fn private_mode(&self) -> bool {
+        self.private_mode
     }
 
     pub fn settings(&self) -> &DownloadSettings {
@@ -715,7 +745,7 @@ impl DownloadManager {
             DownloadEvent::ClearLog => {
                 self.log.clear();
                 self.entries.retain(|_, entry| entry.is_active());
-                vec![DownloadEffect::Persist]
+                vec![DownloadEffect::EraseLog]
             }
         }
     }
@@ -737,7 +767,9 @@ impl DownloadManager {
         let mut entry = DownloadEntry {
             id,
             webview: start.webview,
-            private: start.private,
+            // Comecado no Modo privado: privado ate ao fim, mesmo que o modo
+            // volte ao normal antes de ele acabar.
+            private: start.private || self.private_mode,
             name: if name.is_empty() {
                 start.proposed.to_string_lossy().into_owned()
             } else {
@@ -924,10 +956,11 @@ impl DownloadManager {
     }
 
     /// Um download acabado entra no registo -- so se nao veio de uma pagina
-    /// privada. E a unica porta do registo.
+    /// privada nem comecou ou acabou no Modo privado. E a unica porta do
+    /// registo.
     fn record(&mut self, id: DownloadId) -> Option<DownloadEffect> {
         let entry = self.entries.get(&id)?;
-        if entry.private {
+        if entry.private || self.private_mode {
             return None;
         }
         let DownloadState::Done(outcome) = entry.state else {
@@ -1358,6 +1391,57 @@ mod tests {
         assert_eq!(log.entries[1].host.as_deref(), Some("example.com"));
     }
 
+    /// Gate critico (DM-1 da revisao): nada feito no Modo privado entra no
+    /// registo -- nem o que comeca nele e acaba depois, nem o que comeca
+    /// antes e acaba nele --, e por isso nada disso chega ao ficheiro quando
+    /// o modo volta ao normal e a gravacao seguinte escreve o registo todo.
+    #[test]
+    fn nothing_made_in_private_mode_is_ever_recorded() {
+        let finish = |m: &mut DownloadManager, id: u64, name: &str| {
+            let mut effects = m.on_event(DownloadEvent::Ended {
+                id: DownloadId(id),
+                end: DownloadEnd::Completed {
+                    path: PathBuf::from(r"C:\d").join(name),
+                },
+            });
+            effects.extend(m.on_event(DownloadEvent::Finalized {
+                id: DownloadId(id),
+                outcome: FinalizeOutcome::Kept(MotwOutcome::Written),
+            }));
+            effects
+        };
+        let mut m = manager(false);
+        // Comeca no normal e acaba no privado.
+        m.on_event(start(1, "antes.pdf", false));
+        m.set_private_mode(true);
+        assert!(m.private_mode());
+        let mut effects = finish(&mut m, 1, "antes.pdf");
+        // Comeca e acaba no privado; recusado no privado; comeca no privado
+        // e acaba ja no normal.
+        effects.extend(m.on_event(start(2, "segredo-modo-privado.pdf", false)));
+        effects.extend(finish(&mut m, 2, "segredo-modo-privado.pdf"));
+        effects.extend(m.on_event(start(3, "setup.exe", false)));
+        effects.extend(m.on_event(start(4, "depois.zip", false)));
+        assert!(m.entry(DownloadId(4)).expect("entrada").private);
+        m.set_private_mode(false);
+        effects.extend(finish(&mut m, 4, "depois.zip"));
+        assert!(
+            !effects.contains(&DownloadEffect::Persist),
+            "o Modo privado pediu gravacao: {effects:?}"
+        );
+        assert!(m.log().entries.is_empty(), "{:?}", m.log());
+        // A lista da sessao mostra-os; o registo nao.
+        assert_eq!(m.entries().count(), 4);
+
+        // De volta ao normal, um download novo grava -- e o registo que vai
+        // para o ficheiro so tem esse.
+        m.on_event(start(5, "normal.pdf", false));
+        let done = finish(&mut m, 5, "normal.pdf");
+        assert!(done.contains(&DownloadEffect::Persist), "{done:?}");
+        let names: Vec<String> = m.log().entries.into_iter().map(|r| r.name).collect();
+        assert_eq!(names, vec!["normal.pdf".to_string()]);
+    }
+
     /// O ciclo de um download e as operacoes do WebView2: largadas quando
     /// acaba e quando a WebView dele e destruida.
     #[test]
@@ -1507,11 +1591,12 @@ mod tests {
             "{} bytes passam o tecto",
             bytes.len()
         );
-        // Ctrl+Shift+Delete: o registo e os acabados saem, o que corre fica.
+        // Ctrl+Shift+Delete: o registo e os acabados saem, o que corre fica;
+        // o ficheiro sai do disco (`EraseLog`), nunca e regravado.
         m.on_event(start(2, "a-correr.zip", false));
         assert_eq!(
             m.on_event(DownloadEvent::ClearLog),
-            vec![DownloadEffect::Persist]
+            vec![DownloadEffect::EraseLog]
         );
         assert!(m.log().entries.is_empty());
         assert_eq!(m.entries().count(), 1);

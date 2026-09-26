@@ -11,7 +11,7 @@ use neural_core::downloads::{
     unique_path,
 };
 use neural_core::file_risk::{BlockReason, display_label};
-use neural_core::json_store::{SaveOutcome, VersionedJsonStore};
+use neural_core::json_store::{SaveOutcome, StoreMode, VersionedJsonStore};
 
 use crate::stores::{DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE};
 
@@ -37,11 +37,17 @@ use crate::stores::{DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE};
 // - A WebView destruida: o handler do `DownloadStarting` guarda um
 //   `WebViewLife`; quando o WebView2 o larga, o gestor recebe `WebViewGone`
 //   e cancela e larga as operacoes dessa WebView.
-// - A pasta escolhida (`downloads-settings.json`) vai para o perfil de cada
-//   WebView com o `SetDefaultDownloadFolderPath` -- o InPrivate incluido.
+// - A pasta (`downloads-settings.json`, ou a Transferencias do utilizador
+//   quando nao ha escolha) vai para o perfil de cada WebView gerida com o
+//   `SetDefaultDownloadFolderPath`: o WebView2 guarda-a no perfil de uma
+//   sessao para a outra, por isso a do sistema e reposta quando a escolha
+//   sai (`profile_download_folder`).
 // - O registo (`downloads.json`, `StoreKind::Automatic`) nunca guarda um
-//   download do Split privado nem de um servico InPrivate (o gestor), e no
-//   Modo privado nao se escreve (a loja).
+//   download do Split privado nem de um servico InPrivate, nem um que
+//   comecou ou acabou no Modo privado (o gestor, com o modo do registo das
+//   lojas posto antes de cada evento: `downloads_private_mode`); no Modo
+//   privado a loja tambem nao escreve. O Ctrl+Shift+Delete tira o ficheiro
+//   e as copias do disco (`erase_download_log`) em qualquer modo.
 
 /// Um download desta WebView nunca vai para o registo: o Split privado e os
 /// servicos InPrivate (a Respiracao).
@@ -224,7 +230,9 @@ pub(in crate::windows_app) struct DownloadsShared {
     pub(in crate::windows_app) ops: Rc<RefCell<DownloadOps<ComDownload>>>,
     next_id: Rc<Cell<u64>>,
     next_webview: Rc<Cell<u64>>,
-    /// A pasta escolhida, ja conferida no disco.
+    /// A pasta que vai para o perfil de cada WebView
+    /// (`profile_download_folder`): a escolhida, ja conferida no disco, ou a
+    /// Transferencias do utilizador.
     pub(in crate::windows_app) folder: Rc<RefCell<Option<PathBuf>>>,
 }
 
@@ -297,8 +305,10 @@ pub(in crate::windows_app) fn register_download_manager(
         .cast::<ICoreWebView2_4>()
         .map_err(|error| format!("ICoreWebView2_4 indisponível: {error}"))?;
     if let Some(folder) = shared.folder.borrow().clone() {
-        // Sem ICoreWebView2_13 a pasta chega pelo `SetResultFilePath` de
-        // cada download (`target_path`).
+        // Sempre, com a escolha ou sem ela (`profile_download_folder`): o
+        // perfil guarda a pasta de uma sessao para a outra. Sem
+        // ICoreWebView2_13 (sem perfil para guardar), a escolhida chega pelo
+        // `SetResultFilePath` de cada download (`target_path`).
         let set = core
             .cast::<ICoreWebView2_13>()
             .and_then(|core13| unsafe { core13.Profile() })
@@ -307,7 +317,7 @@ pub(in crate::windows_app) fn register_download_manager(
             });
         if let Err(error) = set {
             debug_log(format_args!(
-                "downloads: {} sem a pasta escolhida no perfil ({error})",
+                "downloads: {} sem a pasta dos downloads no perfil ({error})",
                 host.describe()
             ));
         }
@@ -509,6 +519,54 @@ pub(in crate::windows_app) fn checked_download_settings(
     settings
 }
 
+/// A pasta que vai para o perfil de cada WebView: a escolhida (ja
+/// conferida), senao a do sistema (`user_downloads_folder`). O WebView2
+/// guarda o `SetDefaultDownloadFolderPath` no perfil de uma sessao para a
+/// outra (e volta a criar a pasta, se faltar, no download seguinte): so
+/// pondo-a quando ha escolha, a antiga ficava depois de a escolha sair ou
+/// de a pasta deixar de existir.
+pub(in crate::windows_app) fn profile_download_folder(
+    chosen: Option<PathBuf>,
+    system: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    chosen.or_else(system)
+}
+
+/// A pasta Transferencias do utilizador (`FOLDERID_Downloads`), `None` se o
+/// Windows nao a da (nao existe, ou o perfil nao a tem).
+pub(in crate::windows_app) fn user_downloads_folder() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_Downloads, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+    };
+
+    let mut raw: *mut u16 = std::ptr::null_mut();
+    let hr = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_Downloads,
+            KF_FLAG_DEFAULT as u32,
+            std::ptr::null_mut(),
+            &mut raw,
+        )
+    };
+    if raw.is_null() {
+        return None;
+    }
+    let path = (hr >= 0).then(|| {
+        let mut len = 0usize;
+        // SAFETY: o SHGetKnownFolderPath devolve um texto terminado em 0.
+        while unsafe { *raw.add(len) } != 0 {
+            len += 1;
+        }
+        let wide = unsafe { std::slice::from_raw_parts(raw, len) };
+        PathBuf::from(std::ffi::OsString::from_wide(wide))
+    });
+    // O texto e do chamador mesmo quando a chamada falha.
+    unsafe { CoTaskMemFree(raw as *const std::ffi::c_void) };
+    path.filter(|path| path.is_absolute())
+}
+
 /// Grava o registo do gestor. A loja e `Automatic`: com o modo em `Private`
 /// nao escreve nada (`SkippedPrivate`).
 pub(in crate::windows_app) fn persist_download_log(
@@ -518,6 +576,59 @@ pub(in crate::windows_app) fn persist_download_log(
     store
         .save(&manager.log())
         .map_err(|error| error.to_string())
+}
+
+/// Ctrl+Shift+Delete: tira do disco o `downloads.json`, a copia `.bak` que
+/// a loja faz de um ficheiro que recusou (estragado ou de uma versao futura)
+/// e o temporario de uma gravacao interrompida -- todos guardam nomes e
+/// anfitrioes. Apaga direto, nunca pela loja: uma gravacao do registo vazio
+/// nao escreve nada no Modo privado nem com a loja so de leitura. Depois a
+/// loja rele o disco (sem ficheiro, volta a gravar).
+pub(in crate::windows_app) fn erase_download_log(
+    store: &mut VersionedJsonStore<DownloadLog>,
+) -> std::io::Result<()> {
+    let path = store.path().to_path_buf();
+    let mut first_error = None;
+    let mut remove = |target: &Path| {
+        if let Err(error) = std::fs::remove_file(target)
+            && error.kind() != std::io::ErrorKind::NotFound
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    };
+    remove(&path);
+    let name = neural_core::downloads::file_name_of(&path).to_string();
+    remove(&path.with_file_name(format!("{name}.bak")));
+    // O temporario da gravacao atomica: `.<nome>.<pid>-<n>.tmp`.
+    if let Some(dir) = path.parent()
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        let prefix = format!(".{name}.");
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|file| file.starts_with(&prefix) && file.ends_with(".tmp"))
+            {
+                remove(&entry.path());
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => {
+            // Sem ficheiro, a loja deixa de estar so de leitura; nao escreve.
+            store.load();
+            Ok(())
+        }
+    }
+}
+
+/// O modo do registo das lojas, como o gestor o precisa: `true` no Modo
+/// privado. Sem registo (nunca no produto) nada se grava de qualquer forma.
+pub(in crate::windows_app) fn downloads_private_mode(stores: Option<&StoreRegistry>) -> bool {
+    stores.is_some_and(|stores| stores.mode() == StoreMode::Private)
 }
 
 /// O estado da feature no `App`.
@@ -554,10 +665,30 @@ impl DownloadsState {
             .map(|store| store.load().into_value())
             .unwrap_or_default();
         Self {
-            shared: DownloadsShared::new(settings.folder.clone()),
+            shared: DownloadsShared::new(profile_download_folder(
+                settings.folder.clone(),
+                user_downloads_folder,
+            )),
             manager: DownloadManager::new(settings, log),
             log_store,
         }
+    }
+
+    /// O braco `UserEvent::Download` do `App` inteiro menos os avisos: o
+    /// gestor com o modo do registo das lojas, as operacoes do WebView2 e o
+    /// disco (`run_download_event`).
+    pub(in crate::windows_app) fn run(
+        &mut self,
+        private_mode: bool,
+        event: DownloadEvent,
+    ) -> DownloadRun {
+        run_download_event(
+            &mut self.manager,
+            &self.shared.ops,
+            self.log_store.as_mut(),
+            private_mode,
+            event,
+        )
     }
 }
 
@@ -670,7 +801,7 @@ pub(in crate::windows_app) fn download_app_step(
             debug_log(format_args!("downloads: {} acabou ({outcome:?})", id.0));
             Some(DownloadEvent::Finalized { id, outcome })
         }
-        DownloadEffect::Persist | DownloadEffect::Notice(_) => {
+        DownloadEffect::Persist | DownloadEffect::EraseLog | DownloadEffect::Notice(_) => {
             later.push(effect);
             None
         }
@@ -684,38 +815,74 @@ pub(in crate::windows_app) fn download_app_step(
     }
 }
 
-impl App {
-    /// O braco `UserEvent::Download`: o gestor decide, e cada efeito vai
-    /// para as operacoes do WebView2 ou para o `App`.
-    pub(in crate::windows_app) fn download_event(&mut self, event: DownloadEvent) {
-        let mut later = Vec::new();
-        drive_downloads(
-            &mut self.downloads.manager,
-            &self.downloads.shared.ops,
-            event,
-            |effect| download_app_step(effect, &mut later),
-        );
-        for effect in later {
-            match effect {
-                DownloadEffect::Persist => self.persist_downloads(),
-                DownloadEffect::Notice(notice) => {
-                    self.show_background_splash(download_notice_text(&notice), 6);
+/// O que uma volta do gestor deixou para o `App`.
+#[derive(Debug, Default)]
+pub(in crate::windows_app) struct DownloadRun {
+    /// Os efeitos que ficaram para o fim, pela ordem: gravar e apagar (ja
+    /// aplicados ao disco) e os avisos (o `App` mostra-os).
+    pub(in crate::windows_app) later: Vec<DownloadEffect>,
+    /// O Ctrl+Shift+Delete nao conseguiu tirar o `downloads.json` do disco.
+    pub(in crate::windows_app) erase_error: Option<String>,
+}
+
+/// Uma volta inteira do gestor, como o `App` a corre: o modo do registo das
+/// lojas posto no gestor, o ciclo (`drive_downloads` com
+/// `download_app_step`), e depois o registo gravado (`Persist`) ou tirado
+/// do disco (`EraseLog`). Sem loja (nunca no produto), nada toca no disco.
+pub(in crate::windows_app) fn run_download_event<H: DownloadHandle>(
+    manager: &mut DownloadManager,
+    ops: &RefCell<DownloadOps<H>>,
+    mut log_store: Option<&mut VersionedJsonStore<DownloadLog>>,
+    private_mode: bool,
+    event: DownloadEvent,
+) -> DownloadRun {
+    manager.set_private_mode(private_mode);
+    let mut run = DownloadRun::default();
+    drive_downloads(manager, ops, event, |effect| {
+        download_app_step(effect, &mut run.later)
+    });
+    for effect in &run.later {
+        let Some(store) = log_store.as_deref_mut() else {
+            break;
+        };
+        match effect {
+            DownloadEffect::Persist => match persist_download_log(store, manager) {
+                Ok(SaveOutcome::Written) => {}
+                Ok(SaveOutcome::SkippedPrivate) => {
+                    debug_log(format_args!("downloads: modo privado, registo nao gravado"));
                 }
-                _ => {}
+                Err(error) => {
+                    debug_log(format_args!("downloads: registo nao gravado ({error})"));
+                }
+            },
+            DownloadEffect::EraseLog => {
+                if let Err(error) = erase_download_log(store) {
+                    debug_log(format_args!("downloads: registo nao apagado ({error})"));
+                    run.erase_error = Some(error.to_string());
+                }
             }
+            _ => {}
         }
     }
+    run
+}
 
-    fn persist_downloads(&mut self) {
-        let Some(store) = self.downloads.log_store.as_mut() else {
-            return;
-        };
-        match persist_download_log(store, &self.downloads.manager) {
-            Ok(SaveOutcome::Written) => {}
-            Ok(SaveOutcome::SkippedPrivate) => {
-                debug_log(format_args!("downloads: modo privado, registo nao gravado"));
+impl App {
+    /// O braco `UserEvent::Download`: o gestor decide, e cada efeito vai
+    /// para as operacoes do WebView2, para o disco ou para o ecra.
+    pub(in crate::windows_app) fn download_event(&mut self, event: DownloadEvent) {
+        let private_mode = downloads_private_mode(self.stores.as_ref());
+        let run = self.downloads.run(private_mode, event);
+        for effect in run.later {
+            if let DownloadEffect::Notice(notice) = effect {
+                self.show_background_splash(download_notice_text(&notice), 6);
             }
-            Err(error) => debug_log(format_args!("downloads: registo nao gravado ({error})")),
+        }
+        if let Some(error) = run.erase_error {
+            self.show_splash(
+                format!("Não foi possível apagar a lista de downloads: {error}"),
+                4,
+            );
         }
     }
 }

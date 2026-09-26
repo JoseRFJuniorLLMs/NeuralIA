@@ -12,9 +12,11 @@ automatico de uma pagina):
 1. /files/setup.exe -- GATE: recusado no DownloadStarting; nenhum ficheiro na
    pasta; o downloads.json regista-o como bloqueado (programa).
 2. /files/relatorio (relatorio.pdf) -- GATE: chega a pasta com a marca da Web
-   (Zone.Identifier com ZoneId); o downloads.json regista-o como acabado. O
-   log de depuracao diz quem escreveu a marca (o NeuralIA, Kept(Written), ou
-   ja estava, Kept(AlreadyPresent)).
+   (Zone.Identifier com ZoneId); o downloads.json regista-o como acabado; o
+   fim do NeuralIA correu (o log de depuracao diz quem escreveu a marca: o
+   NeuralIA, Kept(Written), ou ja estava, Kept(AlreadyPresent)); e, se foi o
+   NeuralIA, a marca e ZoneId=3 sem HostUrl. O relatorio diz sempre se a
+   marca que ficou leva o HostUrl (a do WebView2 pode leva-lo).
 3. /files/lento -- SPIKE, so relata (nunca falha o passo): com o download a
    correr, a Home (a mensagem do NEURALIA_LIFECYCLE_PROBE) destroi a WebView;
    o relatorio diz se o download acabou, quem o acabou (o WebView2 sozinho,
@@ -93,7 +95,57 @@ function Get-SpikeVerdict([string[]]$LogLines, [object[]]$Events, [int]$HomeLine
     }
 }
 
+# A marca da Web do PDF: o ZoneId, se leva o endereco (HostUrl) e quem a
+# escreveu, pelo log de depuracao (a linha `acabou (Kept(...))` do
+# finalize_download). O WebView2 pode ter escrito a dele antes do fim
+# (Kept(AlreadyPresent)): o NeuralIA deixa-a como esta, e o relatorio diz se
+# leva o HostUrl. Falha quando nao ha marca, quando o fim do NeuralIA nao
+# correu, ou quando a marca que o NeuralIA escreveu nao e a dele (ZoneId=3,
+# sem HostUrl).
+function Get-MotwVerdict([string]$Zone, [string]$LogText) {
+    $failures = @()
+    $zoneId = if ($Zone -and $Zone -match '(?m)^\s*ZoneId\s*=\s*(\d+)') { $Matches[1] } else { 'nenhum' }
+    $hostUrl = [bool]($Zone -and $Zone -match '(?mi)^\s*HostUrl\s*=')
+    if ($zoneId -eq 'nenhum') { $failures += "sem Zone.Identifier (a marca da Web)" }
+    $writer = if ($LogText -match 'acabou \(Kept\(Written\)\)') {
+        'o NeuralIA'
+    } elseif ($LogText -match 'acabou \(Kept\(AlreadyPresent\)\)') {
+        'o WebView2 (o NeuralIA nao a reescreveu)'
+    } else {
+        'desconhecido'
+    }
+    if ($writer -eq 'desconhecido') {
+        $failures += "o log nao tem o fim do NeuralIA (acabou (Kept(...)))"
+    } elseif ($writer -eq 'o NeuralIA' -and ($zoneId -ne '3' -or $hostUrl)) {
+        $failures += "a marca que o NeuralIA escreveu nao e ZoneId=3 sem HostUrl ($($Zone -replace "`r?`n", ' | '))"
+    }
+    return [pscustomobject]@{
+        ZoneId = $zoneId
+        HostUrl = if ($hostUrl) { 'sim' } else { 'nao' }
+        Writer = $writer
+        Failures = $failures
+    }
+}
+
 if ($SelfTest) {
+    $ours = "[ZoneTransfer]`r`nZoneId=3`r`n"
+    $theirs = "[ZoneTransfer]`r`nZoneId=3`r`nReferrerUrl=http://127.0.0.1:1/`r`nHostUrl=http://127.0.0.1:1/files/relatorio`r`n"
+    $written = "  12 ms  downloads: 2 acabou (Kept(Written))"
+    $present = "  12 ms  downloads: 2 acabou (Kept(AlreadyPresent))"
+    $motwCases = @(
+        @{ Zone = $ours; Log = $written; Writer = 'o NeuralIA'; HostUrl = 'nao'; Fails = 0 },
+        @{ Zone = $theirs; Log = $present; Writer = 'o WebView2 (o NeuralIA nao a reescreveu)'; HostUrl = 'sim'; Fails = 0 },
+        @{ Zone = $theirs; Log = $written; Writer = 'o NeuralIA'; HostUrl = 'sim'; Fails = 1 },
+        @{ Zone = "[ZoneTransfer]`r`nZoneId=1`r`n"; Log = $written; Writer = 'o NeuralIA'; HostUrl = 'nao'; Fails = 1 },
+        @{ Zone = $null; Log = $written; Writer = 'o NeuralIA'; HostUrl = 'nao'; Fails = 2 },
+        @{ Zone = $ours; Log = "  12 ms  downloads: 2 comecou"; Writer = 'desconhecido'; HostUrl = 'nao'; Fails = 1 }
+    )
+    foreach ($case in $motwCases) {
+        $motw = Get-MotwVerdict $case.Zone $case.Log
+        if ($motw.Writer -ne $case.Writer -or $motw.HostUrl -ne $case.HostUrl -or @($motw.Failures).Count -ne $case.Fails) {
+            throw "SelfTest (marca): '$($case.Zone)' + '$($case.Log)' deu $($motw | ConvertTo-Json -Compress)."
+        }
+    }
     $lento = { param($kind) [pscustomobject]@{ kind = $kind; path = '/files/lento'; sent = 65536 } }
     $cases = @(
         @{ Log = @('a', 'downloads: 1 interrompido (motivo 27)', 'downloads: webview 1 destruida'); Events = @(& $lento 'aborted'); Want = 'SIM, pelo WebView2' },
@@ -112,7 +164,7 @@ if ($SelfTest) {
     # Linhas de antes da Home nao contam.
     $old = Get-SpikeVerdict @('downloads: 1 interrompido (motivo 27)', 'b') @() 1
     if ($old.Answer -ne 'NAO') { throw "SelfTest: uma linha de antes da Home contou ($($old.Answer))." }
-    Write-Host "test-downloads SelfTest: $($cases.Count + 1) casos do spike ok."
+    Write-Host "test-downloads SelfTest: $($cases.Count + 1) casos do spike e $($motwCases.Count) da marca da Web ok."
     exit 0
 }
 
@@ -315,17 +367,10 @@ try {
             $failures.Add("relatorio.pdf: nao esta na pasta escolhida ($($run.Dl))")
         } else {
             $zone = Get-Content -LiteralPath $file -Stream Zone.Identifier -Raw -ErrorAction SilentlyContinue
-            if (-not $zone -or $zone -notmatch '(?m)^\s*ZoneId\s*=\s*(\d+)') {
-                $failures.Add("relatorio.pdf: sem Zone.Identifier (a marca da Web)")
-            }
         }
-        $zoneId = if ($zone -and $zone -match '(?m)^\s*ZoneId\s*=\s*(\d+)') { $Matches[1] } else { 'nenhum' }
-        $writer = switch -Regex ((Get-LogLines $run) -join "`n") {
-            'acabou \(Kept\(Written\)\)' { 'o NeuralIA'; break }
-            'acabou \(Kept\(AlreadyPresent\)\)' { 'o WebView2 (o NeuralIA nao a reescreveu)'; break }
-            default { 'desconhecido' }
-        }
-        $summary.Add("relatorio.pdf: $(if ($record) { $record.outcome.kind } else { 'sem registo' }), ZoneId=$zoneId, marca escrita por $writer")
+        $motw = Get-MotwVerdict $zone ((Get-LogLines $run) -join "`n")
+        foreach ($problem in $motw.Failures) { $failures.Add("relatorio.pdf: $problem") }
+        $summary.Add("relatorio.pdf: $(if ($record) { $record.outcome.kind } else { 'sem registo' }), ZoneId=$($motw.ZoneId), HostUrl na marca: $($motw.HostUrl), marca escrita por $($motw.Writer)")
         if ($failures.Count -gt $before) { Show-Diagnostics $run }
     } finally {
         Stop-Run $run
