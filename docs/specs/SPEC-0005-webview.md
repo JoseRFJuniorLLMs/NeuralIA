@@ -331,11 +331,13 @@ go through one module, `crates/neural-app/src/windows_app/webview_hooks.rs`:
   of wry's `build` / `build_as_child` in the product (the gate holds them to
   the module), and after the build they register through WebView2 COM, for
   the same host, the NeuralIA items of the right-click menu
-  (`WEBVIEW_MENU_ITEMS`: today only the auto-scroll item, on the columns and
-  on the split, private included), an `AcceleratorKeyPressed` handler that
-  consults `accelerator_lookup` and, on every `Managed` host, the download
-  manager (`install_webview_hooks`, private to the module; see "Downloads"
-  below).
+  (`WEBVIEW_MENU_ITEMS`: the auto-scroll item, on the columns and on the
+  split, private included; and the two ad-blocking items, on the columns, the
+  non-private split and the full Web), an `AcceleratorKeyPressed` handler that
+  consults `accelerator_lookup`, on every `Managed` host the download manager
+  (see "Downloads" below), and on the hosts whose `resource_gate` is
+  `Adblock` the `WebResourceRequested` handler of the resource dispatcher
+  (`install_webview_hooks`, private to the module).
 
 The host a birth site passes to `hooked_builder` is therefore the only host
 that WebView has, in both halves: a site cannot build without the chain, nor
@@ -414,11 +416,26 @@ keydown and keypress; the shipped decision leaves key-up unhandled, so the page
 also receives the keyup of a bound chord, which the spike did not measure. A
 page that reacts to keypress or keyup sees the press; none of them can run the
 command, which is born on the native side.
-The resource dispatcher `resource_gate_answers` is a stub
-the product does not yet wire to `WebResourceRequested`; the gate
-`custom_schemes_are_never_answered_by_the_resource_gate` already holds it to
-never answering a request on `neuralia-pdf`, `neuralia-epub` or
-`neuralia-live` (those are served by their wry custom protocols).
+The resource dispatcher `resource_gate_answers(host, uri, page, rules)` is
+wired to `WebResourceRequested` on the hosts whose `resource_gate` is
+`Adblock` -- the comparator columns, the source page beside a column (not the
+private one) and the full Web -- and on no other host (gate
+`the_adblock_gate_is_installed_on_columns_split_and_external_only`; CI
+sabotage `adblock-split-without-resource-gate`). The handler
+(`register_resource_gate`) reads the request URI, its `ResourceContext` and the
+top page from the event's `sender`, never from a captured WebView (gate
+`the_resource_handler_reads_the_sender_never_a_captured_webview`), asks the
+dispatcher with the ad blocker's rules in force, and on a block answers 403
+through the `CreateWebResourceResponse` of the sender's environment. The `*`
+filter (with `ICoreWebView2_22` and all request source kinds when the runtime
+has it) is only present while ad blocking is on: new WebViews get it at
+registration and the open ones when the user turns blocking on or off. The
+dispatcher never answers a request on `neuralia-pdf`, `neuralia-epub` or
+`neuralia-live` (those are served by their wry custom protocols; gate
+`custom_schemes_are_never_answered_by_the_resource_gate`, CI sabotage
+`resource-gate-answers-neuralia-pdf`), never a document, and nothing on a page
+of an AI provider or a sign-in host of the provider registry (gate
+`the_shipped_gate_blocks_ads_but_never_documents_or_ai_pages`).
 
 ### Downloads
 

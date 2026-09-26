@@ -8233,7 +8233,7 @@ fn ai_columns_and_the_split_get_the_auto_scroll_menu_item() {
                 .into_iter()
                 .map(|item| item.id)
                 .collect();
-            assert_eq!(ids, [COLUMN_MENU_AUTO_SCROLL], "{host:?}");
+            assert_eq!(ids[0], COLUMN_MENU_AUTO_SCROLL, "{host:?}");
             assert_eq!(webview_hooks(host).menu, ids, "{host:?}: a tabela diverge");
         }
     }
@@ -8248,10 +8248,15 @@ fn ai_columns_and_the_split_get_the_auto_scroll_menu_item() {
     {
         assert_eq!(context_menu_column(host), None, "{host:?}");
         assert!(
-            webview_menu_items(host).is_empty(),
-            "{host:?} ganhou itens de menu"
+            !webview_menu_items(host)
+                .iter()
+                .any(|item| item.id == COLUMN_MENU_AUTO_SCROLL),
+            "{host:?} ganhou o item de rolagem"
         );
-        assert!(webview_hooks(host).menu.is_empty(), "{host:?}");
+        assert!(
+            !webview_hooks(host).menu.contains(&COLUMN_MENU_AUTO_SCROLL),
+            "{host:?}"
+        );
     }
     assert_eq!(
         WebViewHost::ALL
@@ -8277,9 +8282,9 @@ fn each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r() {
             WebViewHost::PrivateSplit(col),
         ] {
             let flag = SharedFlag::default();
-            let respond = webview_menu_responder(host, flag.clone());
+            let respond = webview_menu_responder(host, flag.clone(), None);
 
-            let first = respond(7);
+            let first = respond(7, None);
             assert_eq!(first.separator_at, Some(7), "{host:?}");
             assert_eq!(first.items.len(), 1, "{host:?}");
             assert_eq!(first.items[0].label, LABEL_TURN_ON, "{host:?}");
@@ -8297,7 +8302,7 @@ fn each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r() {
             // Ctrl+R liga a rolagem entre dois botoes direitos: o MESMO
             // responder, sem novo registo, ja oferece desativar.
             assert!(flag.toggle());
-            let second = respond(0);
+            let second = respond(0, None);
             assert_eq!(
                 second.items[0].label, LABEL_TURN_OFF,
                 "{host:?}: rotulo preso"
@@ -8312,7 +8317,7 @@ fn each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r() {
             // A pilula usa o mesmo responder, sem itens nativos: o id que o
             // TrackPopupMenu devolve e o do comando, e so esse faz algo.
             flag.set(false);
-            let pill = webview_menu_responder(host, flag.clone())(0);
+            let pill = webview_menu_responder(host, flag.clone(), None)(0, None);
             let item = pill
                 .item(COLUMN_MENU_AUTO_SCROLL)
                 .expect("o item da pilula");
@@ -8324,9 +8329,9 @@ fn each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r() {
     // Um hospedeiro que nao rola: nem separador nem itens, com nativos ou
     // sem eles -- o menu do WebView2 fica como veio.
     for host in [WebViewHost::SidePanel, WebViewHost::Reader] {
-        let respond = webview_menu_responder(host, SharedFlag::default());
+        let respond = webview_menu_responder(host, SharedFlag::default(), None);
         for native in [0, 7] {
-            let request = respond(native);
+            let request = respond(native, None);
             assert_eq!(request.separator_at, None, "{host:?} {native}");
             assert!(request.items.is_empty(), "{host:?} {native}");
         }
@@ -8364,9 +8369,11 @@ struct RecordingRegistrar {
     menus: Vec<(WebViewHost, Vec<usize>)>,
     accelerators: Vec<WebViewHost>,
     downloads: Vec<WebViewHost>,
+    gates: Vec<WebViewHost>,
     fail_menu: bool,
     fail_accelerators: bool,
     fail_downloads: bool,
+    fail_gate: bool,
 }
 
 impl HookRegistrar for RecordingRegistrar {
@@ -8389,6 +8396,13 @@ impl HookRegistrar for RecordingRegistrar {
             return Err("ICoreWebView2_4 indisponível: E_NOINTERFACE".to_string());
         }
         self.downloads.push(host);
+        Ok(())
+    }
+    fn resource_gate(&mut self, host: WebViewHost) -> Result<(), String> {
+        if self.fail_gate {
+            return Err("add_WebResourceRequested falhou: E_FAIL".to_string());
+        }
+        self.gates.push(host);
         Ok(())
     }
 }
@@ -8434,42 +8448,54 @@ impl HookedWebViewBuilder for RecordedHookedBuilder {
 /// lado, a Web completa e os servicos ficam com os downloads do WebView2
 /// (o gestor da 2.3 entra por ai); cada pagina local nossa e o monitor do
 /// Gmail recusam-nos. Cada hospedeiro tem a sua cadeia de navegacao, todos
-/// recebem o AcceleratorKeyPressed, nenhum responde a pedidos de recursos
-/// e o slot das distracoes esta vazio.
+/// recebem o AcceleratorKeyPressed, o despachante de recursos e o do
+/// bloqueio de anuncios so nas colunas, na fonte ao lado (nao a privada) e
+/// na Web completa, e o slot das distracoes esta vazio.
 #[test]
 fn the_webview_hooks_table() {
-    let row = |menu: &[usize], downloads: DownloadPolicy, nav_gate: NavGate| WebViewHooks {
-        menu: menu.to_vec(),
-        downloads,
-        resource_gate: ResourceGatePolicy::Open,
-        nav_gate,
-        accelerators: true,
-        distraction: None,
-    };
     use DownloadPolicy::{Deny, Managed};
-    let scroll = [COLUMN_MENU_AUTO_SCROLL];
+    use ResourceGatePolicy::{Adblock, Open};
+    let gated =
+        |menu: &[usize], downloads: DownloadPolicy, gate: ResourceGatePolicy| WebViewHooks {
+            menu: menu.to_vec(),
+            downloads,
+            resource_gate: gate,
+            nav_gate: NavGate::Web,
+            accelerators: true,
+            distraction: None,
+        };
+    let scroll_and_adblock = [COLUMN_MENU_AUTO_SCROLL, ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF];
+    let adblock = [ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF];
     for col in 0..COMPARATOR_COLUMNS {
         assert_eq!(
             webview_hooks(WebViewHost::Column(col)),
-            row(&scroll, Managed, NavGate::Web)
+            gated(&scroll_and_adblock, Managed, Adblock)
         );
         assert_eq!(
             webview_hooks(WebViewHost::Split(col)),
-            row(&scroll, Managed, NavGate::Web)
+            gated(&scroll_and_adblock, Managed, Adblock)
         );
         assert_eq!(
             webview_hooks(WebViewHost::PrivateSplit(col)),
-            row(&scroll, Managed, NavGate::Web)
+            gated(&[COLUMN_MENU_AUTO_SCROLL], Managed, Open)
         );
     }
     assert_eq!(
         webview_hooks(WebViewHost::Column(COMPARATOR_COLUMNS)),
-        row(&[], Managed, NavGate::Web)
+        gated(&adblock, Managed, Adblock)
     );
     assert_eq!(
         webview_hooks(WebViewHost::External),
-        row(&[], Managed, NavGate::Web)
+        gated(&adblock, Managed, Adblock)
     );
+    let row = |menu: &[usize], downloads: DownloadPolicy, nav_gate: NavGate| WebViewHooks {
+        menu: menu.to_vec(),
+        downloads,
+        resource_gate: Open,
+        nav_gate,
+        accelerators: true,
+        distraction: None,
+    };
     assert_eq!(
         webview_hooks(WebViewHost::Reader),
         row(&[], Deny, NavGate::Reader)
@@ -8533,18 +8559,21 @@ fn every_webview_gets_the_hooks() {
             vec![host],
             "{host:?} sem AcceleratorKeyPressed"
         );
+        let mut expected = Vec::new();
         if context_menu_column(host).is_some() {
-            assert_eq!(
-                registrar.menus,
-                vec![(host, vec![COLUMN_MENU_AUTO_SCROLL])],
-                "{host:?}"
-            );
-        } else {
+            expected.push(COLUMN_MENU_AUTO_SCROLL);
+        }
+        if adblock_host(host) {
+            expected.extend([ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF]);
+        }
+        if expected.is_empty() {
             assert!(
                 registrar.menus.is_empty(),
                 "{host:?} ganhou itens de menu: {:?}",
                 registrar.menus
             );
+        } else {
+            assert_eq!(registrar.menus, vec![(host, expected)], "{host:?}");
         }
         // O gestor de downloads: em cada hospedeiro que os aceita, e so
         // nesses (uma pagina local recusa-os no builder, parte (b)).
@@ -8559,6 +8588,16 @@ fn every_webview_gets_the_hooks() {
                 "{host:?} recusa downloads mas ganhou o gestor"
             ),
         }
+        // O despachante de recursos: so onde o bloqueio vale.
+        let gated = matches!(
+            host,
+            WebViewHost::Column(_) | WebViewHost::Split(_) | WebViewHost::External
+        );
+        assert_eq!(
+            registrar.gates,
+            if gated { vec![host] } else { vec![] },
+            "{host:?}: WebResourceRequested"
+        );
     }
     // Todos os indices das colunas e cada servico, nao so o representante
     // de cada tipo: a fonte ao lado de uma coluna qualquer tambem passa pelo
@@ -8607,11 +8646,17 @@ fn every_webview_gets_the_hooks() {
     let mut registrar = RecordingRegistrar {
         fail_menu: true,
         fail_accelerators: true,
+        fail_gate: true,
         ..Default::default()
     };
     let host = WebViewHost::Column(2);
     let missing = install_hooks_with(host, &webview_hooks(host), &mut registrar);
-    assert_eq!(missing.len(), 2, "{missing:?}");
+    assert_eq!(missing.len(), 3, "{missing:?}");
+    assert!(
+        missing[2].contains("coluna 2") && missing[2].contains("WebResourceRequested"),
+        "{}",
+        missing[2]
+    );
     assert!(
         missing[0].contains("coluna 2") && missing[0].contains("E_NOINTERFACE"),
         "{}",
@@ -9141,17 +9186,430 @@ fn custom_schemes_are_never_answered_by_the_resource_gate() {
     for uri in other {
         assert!(!is_custom_scheme_request(uri), "{uri}");
     }
+    // Mesmo com uma lista que nomeia tudo e numa pagina da internet, um
+    // esquema proprio nunca e respondido; sem regras, nada e respondido.
+    let everything = adblock_test_rules(&[
+        "neuralia-pdf.localhost",
+        "neuralia-epub.localhost",
+        "neuralia-live.localhost",
+        "localhost",
+        "example.com",
+        "evil.com",
+    ]);
+    let page = ResourcePage {
+        top: "https://news.site.test/",
+        kind: neural_core::adblock::ResourceKind::Script,
+    };
     for host in WebViewHost::ALL {
+        for uri in custom {
+            assert!(
+                !resource_gate_answers(host, uri, page, Some(&everything)),
+                "{host:?} respondeu a {uri}"
+            );
+        }
         for uri in custom.iter().chain(other.iter()) {
             assert!(
-                !resource_gate_answers(host, uri),
-                "{host:?} respondeu a {uri}"
+                !resource_gate_answers(host, uri, page, None),
+                "{host:?} respondeu a {uri} sem regras"
             );
         }
     }
     assert_eq!(
         CUSTOM_SCHEMES,
         ["neuralia-pdf", "neuralia-epub", "neuralia-live"]
+    );
+}
+
+// ===================== o bloqueio de anuncios (adblock) =====================
+
+/// Regras do bloqueio com estes dominios e nenhum site permitido.
+fn adblock_test_rules(domains: &[&str]) -> neural_core::adblock::AdblockRules {
+    let mut set = neural_core::adblock::DomainSet::new();
+    for domain in domains {
+        set.insert(domain);
+    }
+    neural_core::adblock::AdblockRules::new(Arc::new(set), Default::default())
+}
+
+fn webview2_context(name: &str) -> i32 {
+    use webview2_com::Microsoft::Web::WebView2::Win32::*;
+    match name {
+        "document" => COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT.0,
+        "script" => COREWEBVIEW2_WEB_RESOURCE_CONTEXT_SCRIPT.0,
+        "image" => COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE.0,
+        "xhr" => COREWEBVIEW2_WEB_RESOURCE_CONTEXT_XML_HTTP_REQUEST.0,
+        "fetch" => COREWEBVIEW2_WEB_RESOURCE_CONTEXT_FETCH.0,
+        "ping" => COREWEBVIEW2_WEB_RESOURCE_CONTEXT_PING.0,
+        "other" => COREWEBVIEW2_WEB_RESOURCE_CONTEXT_OTHER.0,
+        _ => panic!("{name}"),
+    }
+}
+
+/// Gate (critico, sabotagem obrigatoria: "a fonte ao lado sem o gancho"):
+/// o `WebResourceRequested` do bloqueio e registado nas tres colunas, na
+/// fonte ao lado de cada uma e na Web completa -- e so ai. A fonte privada,
+/// as paginas locais, o painel, o Live, o monitor do Gmail e os servicos
+/// nunca o recebem, e o despachante nunca responde nelas.
+#[test]
+fn the_adblock_gate_is_installed_on_columns_split_and_external_only() {
+    let rules = adblock_test_rules(&["doubleclick.net"]);
+    let ad = "https://ad.doubleclick.net/pixel.js";
+    let page = ResourcePage {
+        top: "https://news.site.test/article",
+        kind: neural_core::adblock::ResourceKind::Script,
+    };
+    let mut hosts: Vec<WebViewHost> = WebViewHost::ALL.to_vec();
+    for col in 0..COMPARATOR_COLUMNS {
+        hosts.extend([
+            WebViewHost::Column(col),
+            WebViewHost::Split(col),
+            WebViewHost::PrivateSplit(col),
+        ]);
+    }
+    for service in [
+        Service::Meet,
+        Service::WhatsApp,
+        Service::YouTube,
+        Service::Gmail,
+        Service::Breath,
+    ] {
+        hosts.push(WebViewHost::Service(service));
+    }
+    let mut installed = Vec::new();
+    for host in hosts {
+        let mut registrar = RecordingRegistrar::default();
+        let missing = install_hooks_with(host, &webview_hooks(host), &mut registrar);
+        assert!(missing.is_empty(), "{host:?}: {missing:?}");
+        let expected = matches!(
+            host,
+            WebViewHost::Column(_) | WebViewHost::Split(_) | WebViewHost::External
+        );
+        assert_eq!(
+            registrar.gates,
+            if expected { vec![host] } else { vec![] },
+            "{host:?}"
+        );
+        assert_eq!(
+            resource_gate_answers(host, ad, page, Some(&rules)),
+            expected,
+            "{host:?}: o despachante"
+        );
+        if expected {
+            installed.push(host);
+        }
+    }
+    for col in 0..COMPARATOR_COLUMNS {
+        assert!(installed.contains(&WebViewHost::Split(col)), "fonte {col}");
+        assert!(
+            installed.contains(&WebViewHost::Column(col)),
+            "coluna {col}"
+        );
+        assert!(
+            !installed.contains(&WebViewHost::PrivateSplit(col)),
+            "privada {col}"
+        );
+    }
+    assert!(installed.contains(&WebViewHost::External));
+}
+
+/// Gate (critico): o caminho que embarca -- o `ResourceContext` do WebView2
+/// lido por `resource_kind_of`, o `Source` do sender como topo e o
+/// despachante -- bloqueia o anuncio e nunca o proprio documento, nem nada
+/// numa pagina de IA ou de login, nem com o bloqueio sem lista.
+#[test]
+fn the_shipped_gate_blocks_ads_but_never_documents_or_ai_pages() {
+    use neural_core::adblock::ResourceKind;
+    assert_eq!(
+        resource_kind_of(webview2_context("document")),
+        ResourceKind::Document
+    );
+    for other in ["script", "image", "xhr", "fetch", "ping", "other"] {
+        assert_ne!(
+            resource_kind_of(webview2_context(other)),
+            ResourceKind::Document,
+            "{other}"
+        );
+    }
+    assert_eq!(
+        resource_kind_of(webview2_context("script")),
+        ResourceKind::Script
+    );
+    assert_eq!(resource_kind_of(-1), ResourceKind::Other);
+
+    let rules = adblock_test_rules(&["doubleclick.net", "ads.example.io"]);
+    let ad = "https://ad.doubleclick.net/pixel.js";
+    for host in [
+        WebViewHost::Column(0),
+        WebViewHost::Split(1),
+        WebViewHost::External,
+    ] {
+        let at = |top: &str, context: &str| {
+            resource_gate_answers(
+                host,
+                ad,
+                ResourcePage {
+                    top,
+                    kind: resource_kind_of(webview2_context(context)),
+                },
+                Some(&rules),
+            )
+        };
+        for context in ["script", "image", "xhr", "fetch", "ping", "other"] {
+            assert!(at("https://news.site.test/", context), "{host:?} {context}");
+        }
+        assert!(
+            !at("https://news.site.test/", "document"),
+            "{host:?}: documento"
+        );
+        for ai in [
+            "https://chatgpt.com/c/1",
+            "https://claude.ai/new",
+            "https://www.google.com/search?udm=50&q=x",
+            "https://gemini.google.com/app",
+            "https://accounts.google.com/signin",
+            "https://login.microsoftonline.com/",
+        ] {
+            assert!(!at(ai, "script"), "{host:?}: {ai}");
+        }
+        // A pesquisa normal do Google nao e uma IA.
+        assert!(
+            at("https://www.google.com/search?q=x", "script"),
+            "{host:?}"
+        );
+        // Topo que nao e web (about:blank): a lista vale.
+        assert!(at("about:blank", "script"), "{host:?}");
+        // Sem regras, e um endereco que nao se le: nada.
+        assert!(!resource_gate_answers(
+            host,
+            ad,
+            ResourcePage {
+                top: "https://news.site.test/",
+                kind: ResourceKind::Script
+            },
+            None
+        ));
+        assert!(!resource_gate_answers(
+            host,
+            "not a url",
+            ResourcePage {
+                top: "https://news.site.test/",
+                kind: ResourceKind::Script
+            },
+            Some(&rules)
+        ));
+    }
+}
+
+/// O menu do bloqueio de anuncios, pelo mesmo responder que o registo no
+/// WebView2 usa: "Ativar" com o bloqueio desligado; a caixa do site com a
+/// contagem da pagina a vista; cinzento nas IAs; nada fora da web.
+#[test]
+fn the_adblock_menu_follows_the_page_and_the_state() {
+    let shared = Arc::new(AdblockShared::default());
+    let blocked = Arc::new(PageBlocked::default());
+    let source = AdblockMenuSource {
+        shared: Arc::clone(&shared),
+        blocked: Arc::clone(&blocked),
+    };
+    let host = WebViewHost::Column(1);
+    let respond = webview_menu_responder(host, SharedFlag::default(), Some(source));
+    let labels = |request: &MenuRequest| -> Vec<String> {
+        request
+            .items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect()
+    };
+
+    // Desligado: "Ativar" numa pagina web, nada fora dela.
+    let request = respond(4, Some("https://news.site.test/a"));
+    assert_eq!(labels(&request), [LABEL_TURN_ON, LABEL_ADBLOCK_ACTIVATE]);
+    assert_eq!(request.items[1].at, 6);
+    assert_eq!(request.items[1].id, ADBLOCK_MENU_SITE);
+    assert!(matches!(
+        request.items[1].selected(),
+        Some(UserEvent::Adblock(AdblockEvent::Activate))
+    ));
+    for page in [
+        None,
+        Some("about:blank"),
+        Some("data:text/html,x"),
+        Some("nao e url"),
+    ] {
+        assert_eq!(labels(&respond(0, page)), [LABEL_TURN_ON], "{page:?}");
+    }
+
+    // A preparar a lista: cinzento, sem accao; "Desativar" ao lado.
+    shared_set(&shared, AdblockView::Preparing);
+    let request = respond(0, Some("https://news.site.test/a"));
+    assert_eq!(
+        labels(&request),
+        [
+            LABEL_TURN_ON,
+            LABEL_ADBLOCK_PREPARING,
+            LABEL_ADBLOCK_DEACTIVATE
+        ]
+    );
+    assert!(!request.items[1].enabled);
+    assert!(request.items[1].selected().is_none());
+
+    // Ativo: a caixa do site (sem www), marcada, com a contagem DESTA pagina.
+    let rules = adblock_test_rules(&["doubleclick.net"]);
+    shared_set(&shared, AdblockView::Active(Arc::new(rules)));
+    blocked.record("https://www.news.site.test/a#top");
+    for _ in 0..11 {
+        blocked.record("https://www.news.site.test/a");
+    }
+    let request = respond(0, Some("https://www.news.site.test/a"));
+    let site = &request.items[1];
+    assert_eq!(
+        site.label,
+        "Bloquear anúncios em news.site.test (12 bloqueados)"
+    );
+    assert_eq!(site.checked, Some(true));
+    assert!(site.enabled);
+    assert!(matches!(
+        site.selected(),
+        Some(UserEvent::Adblock(AdblockEvent::SetSite { ref site, block: false })) if site == "news.site.test"
+    ));
+    assert_eq!(request.items[2].label, LABEL_ADBLOCK_DEACTIVATE);
+    assert!(matches!(
+        request.items[2].selected(),
+        Some(UserEvent::Adblock(AdblockEvent::Deactivate))
+    ));
+    // Outra pagina recomeca do zero.
+    let other = respond(0, Some("https://other.test/"));
+    assert_eq!(
+        other.items[1].label,
+        "Bloquear anúncios em other.test (0 bloqueados)"
+    );
+    blocked.record("https://other.test/");
+    assert_eq!(blocked.count("https://www.news.site.test/a"), 0);
+    assert_eq!(blocked.count("https://other.test/#x"), 1);
+
+    // Um site permitido: a caixa desmarcada, sem contagem; escolhe-la volta a bloquear.
+    let mut allowed = std::collections::BTreeSet::new();
+    allowed.insert("news.site.test".to_string());
+    let mut set = neural_core::adblock::DomainSet::new();
+    set.insert("doubleclick.net");
+    shared_set(
+        &shared,
+        AdblockView::Active(Arc::new(neural_core::adblock::AdblockRules::new(
+            Arc::new(set),
+            allowed,
+        ))),
+    );
+    let request = respond(0, Some("https://news.site.test/a"));
+    assert_eq!(
+        request.items[1].label,
+        "Bloquear anúncios em news.site.test"
+    );
+    assert_eq!(request.items[1].checked, Some(false));
+    assert!(matches!(
+        request.items[1].selected(),
+        Some(UserEvent::Adblock(AdblockEvent::SetSite {
+            block: true,
+            ..
+        }))
+    ));
+
+    // Um IP ou localhost: a escolha nao se guardaria, nada do bloqueio.
+    for local in ["http://127.0.0.1:8080/", "http://localhost:3000/"] {
+        assert_eq!(labels(&respond(0, Some(local))), [LABEL_TURN_ON], "{local}");
+    }
+
+    // Uma IA ou um login: cinzento, marcado como desligado, sem accao.
+    for ai in ["https://chatgpt.com/c/1", "https://accounts.google.com/"] {
+        let request = respond(0, Some(ai));
+        let item = &request.items[1];
+        assert_eq!(item.label, LABEL_ADBLOCK_ALWAYS_OFF, "{ai}");
+        assert!(item.label.contains("Sempre desligado nas páginas das IAs"));
+        assert_eq!(item.checked, Some(false));
+        assert!(!item.enabled);
+        assert!(item.selected().is_none(), "{ai}");
+    }
+
+    // A fonte privada e os outros hospedeiros nao tem o bloqueio no menu.
+    let private = webview_menu_responder(WebViewHost::PrivateSplit(1), SharedFlag::default(), None);
+    assert_eq!(
+        labels(&private(0, Some("https://news.site.test/a"))),
+        [LABEL_TURN_ON]
+    );
+    assert_eq!(group_thousands(4512), "4 512");
+    assert_eq!(group_thousands(512), "512");
+    assert_eq!(group_thousands(1_234_567), "1 234 567");
+}
+
+fn shared_set(shared: &AdblockShared, view: AdblockView) {
+    shared.set_view(view);
+}
+
+/// Gate (amostrado): a renovacao da lista nunca fica devida na Home -- nem
+/// no Leitor, no PDF ou nos livros; so no comparador e na Web completa.
+#[test]
+fn adblock_refresh_is_never_due_on_home() {
+    use neural_core::adblock::{REFRESH_EVERY_MS, RefreshState, refresh_due};
+    let now = 1_000 * REFRESH_EVERY_MS;
+    let stale = RefreshState {
+        enabled: true,
+        fetched_ms: Some(now - 2 * REFRESH_EVERY_MS),
+        in_flight: false,
+        last_failure_ms: None,
+        private: false,
+    };
+    for (surface, due) in [
+        (Surface::Home, false),
+        (Surface::Reader, false),
+        (Surface::Pdf, false),
+        (Surface::Epub, false),
+        (Surface::Comparator, true),
+        (Surface::External, true),
+    ] {
+        assert_eq!(
+            refresh_due(now, adblock_refresh_surface(surface), &stale),
+            due,
+            "{surface:?}"
+        );
+    }
+    // O gancho so pergunta nas paginas web.
+    for host in WebViewHost::ALL {
+        assert_eq!(
+            adblock_host(host),
+            matches!(
+                host,
+                WebViewHost::Column(_) | WebViewHost::Split(_) | WebViewHost::External
+            ),
+            "{host:?}"
+        );
+    }
+}
+
+/// Gate (presenca proibida, §4.3): o handler do `WebResourceRequested` le a
+/// pagina e o ambiente do `sender` do evento, nunca de uma WebView
+/// capturada (uma WebView capturada responderia pela pagina errada depois
+/// de uma navegacao ou de a WebView morrer).
+#[test]
+fn the_resource_handler_reads_the_sender_never_a_captured_webview() {
+    let source = shipped_source();
+    let start = source
+        .find("WebResourceRequestedEventHandler::create(Box::new(move |sender, args| {")
+        .expect("o handler do WebResourceRequested");
+    let end = start
+        + source[start..]
+            .find("\n    }));\n")
+            .expect("o fim do handler");
+    let handler = &source[start..end];
+    assert!(handler.contains("sender.Source(&mut top)"), "{handler}");
+    assert!(handler.contains("sender.cast::<ICoreWebView2_2>()?.Environment()"));
+    assert!(handler.contains("CreateWebResourceResponse("));
+    assert!(handler.contains("resource_gate_answers(host, &uri, page, Some(&rules))"));
+    assert!(!handler.contains("webview"), "o handler nomeia uma WebView");
+    assert_eq!(
+        source
+            .matches("WebResourceRequestedEventHandler::create(")
+            .count(),
+        1,
+        "um so handler de recursos no produto"
     );
 }
 
@@ -23269,8 +23727,8 @@ fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
 #[test]
 fn existing_stores_have_a_declared_kind() {
     use crate::stores::{
-        AI_SETTINGS_STORE, AI_USAGE_STORE, APP_STORES, DOWNLOADS_LOG_STORE,
-        DOWNLOADS_SETTINGS_STORE, KEYS_STORE, LIVE_KEY_STORE,
+        ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AI_SETTINGS_STORE, AI_USAGE_STORE, APP_STORES,
+        DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE, KEYS_STORE, LIVE_KEY_STORE,
     };
     use neural_core::json_store::StoreKind::{Automatic, Explicit, Setting};
     use neural_core::json_store::StoreShape::{Dir, File};
@@ -23293,6 +23751,8 @@ fn existing_stores_have_a_declared_kind() {
         ("research-exports", Explicit, Dir),
         ("gemini-live.key", Explicit, File),
         ("keys", Explicit, Dir),
+        ("adblock-settings.json", Setting, File),
+        ("adblock-list.json", Automatic, File),
         ("ai/settings.json", Setting, File),
         ("ai/usage.json", Setting, File),
     ];
@@ -23339,6 +23799,8 @@ fn existing_stores_have_a_declared_kind() {
     let specs = [
         ("KEYS_STORE", KEYS_STORE.name),
         ("LIVE_KEY_STORE", LIVE_KEY_STORE.name),
+        ("ADBLOCK_SETTINGS_STORE", ADBLOCK_SETTINGS_STORE.name),
+        ("ADBLOCK_LIST_STORE", ADBLOCK_LIST_STORE.name),
         ("AI_SETTINGS_STORE", AI_SETTINGS_STORE.name),
         ("AI_USAGE_STORE", AI_USAGE_STORE.name),
         ("DOWNLOADS_LOG_STORE", DOWNLOADS_LOG_STORE.name),

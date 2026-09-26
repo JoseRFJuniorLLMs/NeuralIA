@@ -3,10 +3,14 @@
 //! segue redirects, recebe o estado HTTP para o classificar, so fala HTTPS com
 //! o host fixado e usa os certificados do sistema.
 //!
+//! O cliente da lista do bloqueio de anuncios (`adblock::ListClient`) nasce
+//! do mesmo agente e fica preso as mesmas asserções.
+//!
 //! Binario proprio com um unico teste: o ureq 3 le `ALL_PROXY`/`HTTPS_PROXY`/
 //! `HTTP_PROXY` quando se cria o agente, e so num processo sem outras threads
 //! se pode mudar o ambiente sem corrida. Nenhum pedido sai daqui.
 
+use neural_core::adblock::{ListClient, ListEndpoint};
 use neural_core::llm::{ApiClient, Endpoint, Provider};
 use ureq::config::AutoHeaderValue;
 use ureq::tls::RootCerts;
@@ -26,7 +30,13 @@ fn the_ai_client_ignores_proxy_variables_and_keeps_its_policy() {
     );
 
     let client = ApiClient::new(Endpoint::pinned(Provider::Gemini));
-    let config = client.agent_config();
+    let list = ListClient::new(ListEndpoint::pinned());
+    for config in [client.agent_config(), list.agent_config()] {
+        assert_policy(config);
+    }
+}
+
+fn assert_policy(config: &ureq::config::Config) {
     assert!(
         config.proxy().is_none(),
         "the AI client never goes through a proxy from the environment"

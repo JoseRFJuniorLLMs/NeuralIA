@@ -212,20 +212,8 @@ impl ApiClient {
     }
 
     pub fn with_body_cap(endpoint: Endpoint, max_body: usize) -> Self {
-        let config = Agent::config_builder()
-            .proxy(None)
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .https_only(endpoint.provider.is_some())
-            .user_agent(user_agent())
-            .tls_config(
-                TlsConfig::builder()
-                    .root_certs(RootCerts::PlatformVerifier)
-                    .build(),
-            )
-            .build();
         Self {
-            agent: agent_for(config, endpoint.locality),
+            agent: policy_agent(endpoint.provider.is_some(), endpoint.locality),
             endpoint,
             max_body,
         }
@@ -332,6 +320,28 @@ impl ApiClient {
     }
 }
 
+/// O agente com a politica do transporte: sem proxy do ambiente, sem
+/// redirects, o estado HTTP entregue ao classificador, HTTPS so num host
+/// fixado, os certificados do sistema, o User-Agent do NeuralIA e o
+/// resolvedor da localidade. O `ApiClient` e o cliente da lista do bloqueio
+/// de anuncios (`crate::adblock::ListClient`) nascem os dois daqui: a lista
+/// anda com a mesma politica que uma chamada de IA.
+pub(crate) fn policy_agent(https_only: bool, locality: Locality) -> Agent {
+    let config = Agent::config_builder()
+        .proxy(None)
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .https_only(https_only)
+        .user_agent(user_agent())
+        .tls_config(
+            TlsConfig::builder()
+                .root_certs(RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .build();
+    agent_for(config, locality)
+}
+
 /// O agente da localidade: o conector do sistema e o resolvedor que so
 /// deixa ligar a enderecos dela.
 fn agent_for(config: Config, locality: Locality) -> Agent {
@@ -346,7 +356,7 @@ fn agent_for(config: Config, locality: Locality) -> Agent {
     }
 }
 
-fn header<'a>(response: &'a Response<Body>, name: &str) -> Option<&'a str> {
+pub(crate) fn header<'a>(response: &'a Response<Body>, name: &str) -> Option<&'a str> {
     response
         .headers()
         .get(name)
@@ -355,7 +365,7 @@ fn header<'a>(response: &'a Response<Body>, name: &str) -> Option<&'a str> {
 
 /// Os erros do ureq viram `ApiError` sem levar nada deles: o texto de um
 /// erro do ureq pode citar o URL ou um cabecalho.
-fn map_transport_error(error: ureq::Error) -> ApiError {
+pub(crate) fn map_transport_error(error: ureq::Error) -> ApiError {
     match error {
         ureq::Error::Timeout(_) => ApiError::Timeout,
         ureq::Error::Io(ref io) if io.kind() == std::io::ErrorKind::TimedOut => ApiError::Timeout,
@@ -366,7 +376,7 @@ fn map_transport_error(error: ureq::Error) -> ApiError {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Overflow {
+pub(crate) enum Overflow {
     /// Corpo de sucesso: passar do tecto e `TooLarge`.
     Fail,
     /// Corpo de erro: guarda-se o inicio, o resto nao interessa.
@@ -374,7 +384,7 @@ enum Overflow {
 }
 
 /// Le o corpo em blocos, para haver onde desistir e onde ver o prazo.
-fn read_body(
+pub(crate) fn read_body(
     response: &mut Response<Body>,
     cap: usize,
     deadline: Instant,
