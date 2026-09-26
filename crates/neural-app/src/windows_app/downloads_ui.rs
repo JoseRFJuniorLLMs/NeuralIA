@@ -5,11 +5,11 @@ use std::path::Path;
 
 use neural_core::downloads::{
     DeleteReason, DownloadEntry, DownloadEvent, DownloadId, DownloadManager, DownloadNotice,
-    DownloadState, RecordOutcome, file_name_of,
+    DownloadState, Inspection, RecordOutcome, file_name_of,
 };
 use neural_core::file_risk::{
-    BlockReason, MACRO_EXTENSIONS, block_reason, default_app_name_allowed, default_app_target,
-    display_label,
+    BlockReason, MACRO_EXTENSIONS, ZipEntryRisk, block_reason, default_app_name_allowed,
+    default_app_target, display_label,
 };
 
 use crate::notify::{Notice, NoticeAction, NoticeKind, NoticeReply};
@@ -88,6 +88,32 @@ fn what_it_is(reason: BlockReason) -> &'static str {
     }
 }
 
+/// O que um `.zip` apagado levava dentro (downloads-zip-inspect), pela
+/// entrada mais grave.
+fn what_it_held(risk: ZipEntryRisk) -> &'static str {
+    match risk {
+        ZipEntryRisk::Blocked(BlockReason::Masquerade) => "um programa disfarçado",
+        ZipEntryRisk::Blocked(BlockReason::BadName) => "um arquivo com nome inseguro",
+        ZipEntryRisk::Blocked(reason) => what_it_is(reason),
+        ZipEntryRisk::NestedArchive => "outro arquivo compactado",
+    }
+}
+
+/// A nota da lista sobre o que o fim inspecionou (downloads-zip-inspect):
+/// um arquivo compactado que não se inspecionou diz-se sempre -- nunca
+/// passa por um «Concluído» sem mais nada, que se leria como seguro.
+fn inspection_note(inspection: Inspection) -> Option<&'static str> {
+    match inspection {
+        Inspection::Checked => None,
+        Inspection::NotInspected => Some(NOT_INSPECTED),
+        Inspection::HoldsPrograms => Some("tem programas ou scripts dentro"),
+    }
+}
+
+/// O que a lista e o toast dizem de um arquivo compactado que não se
+/// inspecionou.
+const NOT_INSPECTED: &str = "não inspecionado";
+
 /// O tipo de fachada de um disfarce (`fatura.pdf.exe` -> `PDF`).
 fn decoy_label(name: &str) -> Option<String> {
     let clean = name.trim_end_matches([' ', '.']);
@@ -153,6 +179,16 @@ pub(in crate::windows_app) fn download_notice_lines(
                 DeleteReason::DangerousContent | DeleteReason::BlockedName(_) => {
                     format!("{label} era um programa disfarçado.")
                 }
+                DeleteReason::ArchiveEntry(ZipEntryRisk::NestedArchive) => format!(
+                    "{label} tinha outro arquivo compactado dentro, que o NeuralIA não inspeciona (ajuste em Downloads)."
+                ),
+                DeleteReason::ArchiveEntry(risk) if risk.allows_confirmation() => format!(
+                    "{label} tinha {} dentro. O NeuralIA não baixa programas nem scripts (ajuste em Downloads).",
+                    what_it_held(*risk)
+                ),
+                DeleteReason::ArchiveEntry(risk) => {
+                    format!("{label} tinha {} dentro.", what_it_held(*risk))
+                }
             };
             ("Download apagado", body)
         }
@@ -196,16 +232,29 @@ pub(in crate::windows_app) const DOWNLOAD_TOAST_SHOW: NoticeAction = NoticeActio
     reply: NoticeReply::Open,
 };
 
-/// O toast de um download que acabou e ficou no disco.
+/// O toast de um download que acabou e ficou no disco. Um arquivo
+/// compactado que não se inspecionou, ou um `.zip` com programas que ficou
+/// pela definição, diz-o (downloads-zip-inspect).
 pub(in crate::windows_app) fn completed_toast(entry: &DownloadEntry) -> Notice {
     let label = display_label(&entry.name);
+    let inspection = match entry.state {
+        DownloadState::Done(RecordOutcome::Completed { inspection, .. }) => inspection,
+        _ => Inspection::Checked,
+    };
     Notice {
         kind: NoticeKind::Download,
         title: "Download concluído".to_string(),
-        body: if entry.warn {
-            format!("{label} · tem macros: o Office abre-o no Modo de Exibição Protegido")
-        } else {
-            label
+        body: match inspection {
+            Inspection::NotInspected => format!(
+                "{label} · {NOT_INSPECTED}: o NeuralIA não conseguiu ver o que ele tem dentro"
+            ),
+            Inspection::HoldsPrograms => {
+                format!("{label} · tem programas ou scripts dentro (permitido em Downloads)")
+            }
+            Inspection::Checked if entry.warn => {
+                format!("{label} · tem macros: o Office abre-o no Modo de Exibição Protegido")
+            }
+            Inspection::Checked => label,
         },
         actions: vec![DOWNLOAD_TOAST_SHOW],
         ttl: DOWNLOAD_TOAST_TTL,
@@ -995,7 +1044,7 @@ pub(in crate::windows_app) struct DownloadRows {
 fn outcome_status(outcome: RecordOutcome, bytes: Option<u64>, host: Option<&str>) -> String {
     let mut parts: Vec<String> = Vec::new();
     match outcome {
-        RecordOutcome::Completed { warn } => {
+        RecordOutcome::Completed { warn, inspection } => {
             parts.push("Concluído".to_string());
             if let Some(bytes) = bytes {
                 parts.push(format_size(bytes));
@@ -1006,6 +1055,9 @@ fn outcome_status(outcome: RecordOutcome, bytes: Option<u64>, host: Option<&str>
             if warn {
                 parts.push("documento com macros".to_string());
             }
+            if let Some(note) = inspection_note(inspection) {
+                parts.push(note.to_string());
+            }
             return parts.join(" · ");
         }
         RecordOutcome::Blocked { reason } => {
@@ -1015,6 +1067,9 @@ fn outcome_status(outcome: RecordOutcome, bytes: Option<u64>, host: Option<&str>
             DeleteReason::Unreadable => "Apagado — não deu para verificar".to_string(),
             DeleteReason::DangerousContent | DeleteReason::BlockedName(_) => {
                 "Apagado — era um programa disfarçado".to_string()
+            }
+            DeleteReason::ArchiveEntry(risk) => {
+                format!("Apagado — tinha {} dentro", what_it_held(risk))
             }
         }),
         RecordOutcome::NotDeleted { .. } => {
@@ -1031,8 +1086,11 @@ fn outcome_status(outcome: RecordOutcome, bytes: Option<u64>, host: Option<&str>
 
 fn outcome_tone(outcome: RecordOutcome) -> &'static str {
     match outcome {
-        RecordOutcome::Completed { warn: false } => "done",
-        RecordOutcome::Completed { warn: true } | RecordOutcome::NotDeleted { .. } => "warn",
+        RecordOutcome::Completed {
+            warn: false,
+            inspection: Inspection::Checked,
+        } => "done",
+        RecordOutcome::Completed { .. } | RecordOutcome::NotDeleted { .. } => "warn",
         RecordOutcome::Blocked { .. } | RecordOutcome::Deleted { .. } => "blocked",
         RecordOutcome::Cancelled | RecordOutcome::Interrupted => "done",
     }

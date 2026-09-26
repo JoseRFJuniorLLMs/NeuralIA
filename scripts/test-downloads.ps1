@@ -17,15 +17,24 @@ automatico de uma pagina):
    NeuralIA, Kept(Written), ou ja estava, Kept(AlreadyPresent)); e, se foi o
    NeuralIA, a marca e ZoneId=3 sem HostUrl. O relatorio diz sempre se a
    marca que ficou leva o HostUrl (a do WebView2 pode leva-lo).
-3. /files/lento -- SPIKE, so relata (nunca falha o passo): com o download a
+3. /files/pacote (pacote.zip, com setup.exe e run.bat) -- GATE
+   (downloads-zip-inspect): acaba, a inspecao do diretorio central ve o
+   programa e, sem "Permitir baixar programas", apaga-o; nada fica na pasta;
+   o downloads.json regista-o como apagado por um programa dentro
+   (archive-entry / blocked / program).
+4. /files/sobreposto (sobreposto.zip, duas fotos no mesmo cabecalho local)
+   -- GATE: a inspecao recusa listar a sobreposicao; o arquivo fica na
+   pasta e o downloads.json regista-o como acabado e "nao inspecionado"
+   (inspection = not-inspected), nunca como lido.
+5. /files/lento -- SPIKE, so relata (nunca falha o passo): com o download a
    correr, a Home (a mensagem do NEURALIA_LIFECYCLE_PROBE, que no exe e o
    LifecycleProbeHome: a Home sem o cartao da saida) destroi a WebView; o
    relatorio diz se o download acabou, quem o acabou (o WebView2 sozinho, ou
    o gestor ao receber o WebViewGone) e com que motivo -- ou "sem resposta"
    quando a Home nao correu (nenhum show_home no log depois do pedido).
 
--SelfTest confere so a leitura do spike sobre registos inventados, sem abrir
-nada (corre em qualquer maquina).
+-SelfTest confere so a leitura do spike, da marca da Web e dos registos dos
+ZIPs sobre registos inventados, sem abrir nada (corre em qualquer maquina).
 #>
 param(
     [string]$ExePath,
@@ -109,7 +118,8 @@ function Get-SpikeVerdict([string[]]$LogLines, [object[]]$Events, [int]$HomeLine
 
 # A marca da Web do PDF: o ZoneId, se leva o endereco (HostUrl) e quem a
 # escreveu, pelo log de depuracao (a linha `acabou (Kept(...))` do
-# finalize_download). O WebView2 pode ter escrito a dele antes do fim
+# finalize_download; desde a 2.4 com a inspecao a seguir, `Kept(Written,
+# Checked)`). O WebView2 pode ter escrito a dele antes do fim
 # (Kept(AlreadyPresent)): o NeuralIA deixa-a como esta, e o relatorio diz se
 # leva o HostUrl. Falha quando nao ha marca, quando o fim do NeuralIA nao
 # correu, ou quando a marca que o NeuralIA escreveu nao e a dele (ZoneId=3,
@@ -119,9 +129,9 @@ function Get-MotwVerdict([string]$Zone, [string]$LogText) {
     $zoneId = if ($Zone -and $Zone -match '(?m)^\s*ZoneId\s*=\s*(\d+)') { $Matches[1] } else { 'nenhum' }
     $hostUrl = [bool]($Zone -and $Zone -match '(?mi)^\s*HostUrl\s*=')
     if ($zoneId -eq 'nenhum') { $failures += "sem Zone.Identifier (a marca da Web)" }
-    $writer = if ($LogText -match 'acabou \(Kept\(Written\)\)') {
+    $writer = if ($LogText -match 'acabou \(Kept\(Written(, \w+)?\)\)') {
         'o NeuralIA'
-    } elseif ($LogText -match 'acabou \(Kept\(AlreadyPresent\)\)') {
+    } elseif ($LogText -match 'acabou \(Kept\(AlreadyPresent(, \w+)?\)\)') {
         'o WebView2 (o NeuralIA nao a reescreveu)'
     } else {
         'desconhecido'
@@ -139,14 +149,49 @@ function Get-MotwVerdict([string]$Zone, [string]$LogText) {
     }
 }
 
+# O que o downloads.json e a pasta dizem de um ZIP (downloads-zip-inspect).
+# `$Want`: 'deleted-program' (o pacote.zip: apagado por um programa dentro, e
+# fora da pasta) ou 'not-inspected' (o sobreposto.zip: acabado, na pasta, e
+# nunca como lido). Devolve as falhas.
+function Get-ZipRecordFailures($Record, [bool]$OnDisk, [string]$Want) {
+    $failures = @()
+    if ($null -eq $Record) { return @("sem registo no downloads.json") }
+    $outcome = $Record.outcome
+    $shown = $outcome | ConvertTo-Json -Compress -Depth 6
+    switch ($Want) {
+        'deleted-program' {
+            $inside = $null
+            if ($outcome.kind -eq 'deleted' -and $outcome.reason -and $outcome.reason.PSObject.Properties['archive-entry']) {
+                $inside = $outcome.reason.'archive-entry'.blocked
+            }
+            if ($outcome.kind -ne 'deleted' -or $inside -ne 'program') {
+                $failures += "registado como $shown, esperado deleted por archive-entry/blocked/program"
+            }
+            if ($OnDisk) { $failures += "o arquivo ficou na pasta" }
+        }
+        'not-inspected' {
+            if ($outcome.kind -ne 'completed' -or $outcome.inspection -ne 'not-inspected') {
+                $failures += "registado como $shown, esperado completed com inspection=not-inspected"
+            }
+            if (-not $OnDisk) { $failures += "o arquivo nao esta na pasta" }
+        }
+        default { throw "Get-ZipRecordFailures: '$Want' nao existe." }
+    }
+    return $failures
+}
+
 if ($SelfTest) {
     $ours = "[ZoneTransfer]`r`nZoneId=3`r`n"
     $theirs = "[ZoneTransfer]`r`nZoneId=3`r`nReferrerUrl=http://127.0.0.1:1/`r`nHostUrl=http://127.0.0.1:1/files/relatorio`r`n"
-    $written = "  12 ms  downloads: 2 acabou (Kept(Written))"
-    $present = "  12 ms  downloads: 2 acabou (Kept(AlreadyPresent))"
+    $written = "  12 ms  downloads: 2 acabou (Kept(Written, Checked))"
+    $present = "  12 ms  downloads: 2 acabou (Kept(AlreadyPresent, Checked))"
     $motwCases = @(
         @{ Zone = $ours; Log = $written; Writer = 'o NeuralIA'; HostUrl = 'nao'; Fails = 0 },
         @{ Zone = $theirs; Log = $present; Writer = 'o WebView2 (o NeuralIA nao a reescreveu)'; HostUrl = 'sim'; Fails = 0 },
+        # O formato de antes da 2.4 (sem a inspecao) ainda se le.
+        @{ Zone = $ours; Log = "  12 ms  downloads: 2 acabou (Kept(Written))"; Writer = 'o NeuralIA'; HostUrl = 'nao'; Fails = 0 },
+        @{ Zone = $theirs; Log = "  12 ms  downloads: 2 acabou (Kept(AlreadyPresent))"; Writer = 'o WebView2 (o NeuralIA nao a reescreveu)'; HostUrl = 'sim'; Fails = 0 },
+        @{ Zone = $ours; Log = "  12 ms  downloads: 2 acabou (KeptWithoutMotw(Other, Checked))"; Writer = 'desconhecido'; HostUrl = 'nao'; Fails = 1 },
         @{ Zone = $theirs; Log = $written; Writer = 'o NeuralIA'; HostUrl = 'sim'; Fails = 1 },
         @{ Zone = "[ZoneTransfer]`r`nZoneId=1`r`n"; Log = $written; Writer = 'o NeuralIA'; HostUrl = 'nao'; Fails = 1 },
         @{ Zone = $null; Log = $written; Writer = 'o NeuralIA'; HostUrl = 'nao'; Fails = 2 },
@@ -185,7 +230,28 @@ if ($SelfTest) {
     if ($old.Answer -ne 'NAO') { throw "SelfTest: uma linha de antes da Home contou ($($old.Answer))." }
     $early = Get-SpikeVerdict @('  1 ms  show_home (surface era Home)', 'b') @() 1
     if ($early.Answer -ne 'sem resposta') { throw "SelfTest: um show_home de antes da Home contou ($($early.Answer))." }
-    Write-Host "test-downloads SelfTest: $($cases.Count + 2) casos do spike e $($motwCases.Count) da marca da Web ok."
+    # Os registos dos ZIPs, como o gestor os grava (o JSON do RecordOutcome).
+    $record = { param($json) [pscustomobject]@{ name = 'x.zip'; outcome = ($json | ConvertFrom-Json) } }
+    $zipCases = @(
+        @{ Record = (& $record '{"kind":"deleted","reason":{"archive-entry":{"blocked":"program"}}}'); OnDisk = $false; Want = 'deleted-program'; Fails = 0 },
+        @{ Record = (& $record '{"kind":"deleted","reason":{"archive-entry":{"blocked":"program"}}}'); OnDisk = $true; Want = 'deleted-program'; Fails = 1 },
+        @{ Record = (& $record '{"kind":"deleted","reason":{"archive-entry":{"blocked":"script"}}}'); OnDisk = $false; Want = 'deleted-program'; Fails = 1 },
+        @{ Record = (& $record '{"kind":"deleted","reason":"dangerous-content"}'); OnDisk = $false; Want = 'deleted-program'; Fails = 1 },
+        @{ Record = (& $record '{"kind":"completed","warn":false}'); OnDisk = $true; Want = 'deleted-program'; Fails = 2 },
+        @{ Record = $null; OnDisk = $false; Want = 'deleted-program'; Fails = 1 },
+        @{ Record = (& $record '{"kind":"completed","warn":false,"inspection":"not-inspected"}'); OnDisk = $true; Want = 'not-inspected'; Fails = 0 },
+        # Um ZIP nao inspecionado gravado como lido (sem `inspection`) falha.
+        @{ Record = (& $record '{"kind":"completed","warn":false}'); OnDisk = $true; Want = 'not-inspected'; Fails = 1 },
+        @{ Record = (& $record '{"kind":"completed","warn":false,"inspection":"holds-programs"}'); OnDisk = $true; Want = 'not-inspected'; Fails = 1 },
+        @{ Record = (& $record '{"kind":"completed","warn":false,"inspection":"not-inspected"}'); OnDisk = $false; Want = 'not-inspected'; Fails = 1 }
+    )
+    foreach ($case in $zipCases) {
+        $found = @(Get-ZipRecordFailures $case.Record $case.OnDisk $case.Want)
+        if ($found.Count -ne $case.Fails) {
+            throw "SelfTest (ZIP): $($case.Want) sobre $($case.Record | ConvertTo-Json -Compress -Depth 6) deu $($found.Count) falha(s): $($found -join '; ')"
+        }
+    }
+    Write-Host "test-downloads SelfTest: $($cases.Count + 2) casos do spike, $($motwCases.Count) da marca da Web e $($zipCases.Count) dos ZIPs ok."
     exit 0
 }
 
@@ -397,7 +463,33 @@ try {
         Stop-Run $run
     }
 
-    # 3. SPIKE: destruir a WebView cancela o download dela? So relata.
+    # 3 e 4. GATES (downloads-zip-inspect): o pacote.zip apagado pelo que
+    # leva dentro; o sobreposto.zip na pasta, "nao inspecionado".
+    foreach ($zip in @(
+            @{ Run = 'pacote'; Path = '/files/pacote'; Name = 'pacote.zip'; Want = 'deleted-program' },
+            @{ Run = 'sobreposto'; Path = '/files/sobreposto'; Name = 'sobreposto.zip'; Want = 'not-inspected' }
+        )) {
+        $before = $failures.Count
+        $run = Start-Run $zip.Run "$base$($zip.Path)"
+        try {
+            Assert-Requested $zip.Path $run
+            $record = Wait-Until { Get-Record $run $zip.Name } 60
+            # O registo so se grava depois do fim (o arquivo ja foi apagado ou
+            # marcado); um segundo de folga antes de olhar para a pasta.
+            Start-Sleep -Seconds 1
+            $onDisk = Test-Path -LiteralPath (Join-Path $run.Dl $zip.Name)
+            foreach ($problem in (Get-ZipRecordFailures $record $onDisk $zip.Want)) {
+                $failures.Add("$($zip.Name): $problem")
+            }
+            $seen = if ($record) { $record.outcome | ConvertTo-Json -Compress -Depth 6 } else { 'sem registo' }
+            $summary.Add("$($zip.Name): $seen, na pasta: $(if ($onDisk) { 'sim' } else { 'nao' })")
+            if ($failures.Count -gt $before) { Show-Diagnostics $run }
+        } finally {
+            Stop-Run $run
+        }
+    }
+
+    # 5. SPIKE: destruir a WebView cancela o download dela? So relata.
     $run = Start-Run "spike" "$base/files/lento" -Probe
     try {
         Assert-Requested "/files/lento" $run
@@ -441,4 +533,4 @@ if ($env:GITHUB_STEP_SUMMARY) {
 if ($failures.Count -gt 0) {
     throw "Downloads E2E: $($failures.Count) gate(s) falharam:`n$($failures -join "`n")"
 }
-Write-Host "Downloads E2E: setup.exe recusado e PDF com a marca da Web no exe testado."
+Write-Host "Downloads E2E: setup.exe recusado, PDF com a marca da Web, pacote.zip apagado pelo programa dentro e sobreposto.zip nao inspecionado no exe testado."

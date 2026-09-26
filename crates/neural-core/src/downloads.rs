@@ -15,7 +15,14 @@
 //!   acabado e lido (os primeiros 4 KiB, `sniff_download`); um executavel,
 //!   um atalho ou um gabinete que ninguem confirmou e apagado, o resto fica
 //!   com a marca da Web (MOTW, `Zone.Identifier` com `ZoneId=3`, sem
-//!   `HostUrl`) -- escrita so quando o ficheiro ainda nao a tem.
+//!   `HostUrl`) -- escrita so quando o ficheiro ainda nao a tem. Um `.zip`
+//!   tem as entradas listadas pelo diretorio central (`file_risk::inspect_zip`,
+//!   downloads-zip-inspect, sem ler os dados de nenhuma): com um programa,
+//!   um script, um atalho, uma imagem de disco, uma base do Access ou outro
+//!   arquivo compactado dentro e apagado, a menos que «Permitir baixar
+//!   programas» esteja ligada; com um disfarce ou um nome inseguro dentro,
+//!   sempre. Um que nao se deixa listar fica, como um 7z ou um RAR,
+//!   [`Inspection::NotInspected`] -- nunca «seguro».
 //! - **Guardar** ([`DownloadLog`], `downloads.json`, no maximo
 //!   [`MAX_LOG_ENTRIES`]): so os downloads acabados que nao vieram de uma
 //!   pagina privada (o Split privado, um servico InPrivate) nem comecaram ou
@@ -36,7 +43,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::file_risk::{
-    self, BlockReason, RiskClass, SNIFF_HEAD_BYTES, SniffRisk, classify_download_name,
+    self, BlockReason, RiskClass, SNIFF_HEAD_BYTES, SniffRisk, ZipEntryRisk, ZipVerdict,
+    classify_download_name, inspect_zip_file, is_zip_name,
 };
 
 /// O intervalo minimo entre dois avisos de progresso de um download: o
@@ -212,22 +220,54 @@ pub enum DeleteReason {
     BlockedName(BlockReason),
     /// O inicio do ficheiro nao se leu: sem sniff, nao fica.
     Unreadable,
+    /// Um `.zip` com esta entrada dentro (downloads-zip-inspect): um
+    /// programa, um script... ou outro arquivo compactado sem «Permitir
+    /// baixar programas»; um disfarce ou um nome inseguro sempre.
+    ArchiveEntry(ZipEntryRisk),
+}
+
+/// O que o fim diz de um ficheiro que ficou no disco (downloads-zip-inspect).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Inspection {
+    /// Lido: o sniff e, num `.zip`, o diretorio central inteiro, sem nada
+    /// que o apague.
+    #[default]
+    Checked,
+    /// Um arquivo compactado cujo conteudo nao se viu: um 7z ou um RAR, um
+    /// `.zip` que nao se deixou listar, ou um que leva outro arquivo
+    /// compactado (com «Permitir baixar programas»). A lista mostra-o como
+    /// tal, nunca como «seguro».
+    NotInspected,
+    /// Um `.zip` com programas ou scripts dentro, que ficou porque
+    /// «Permitir baixar programas» esta ligada.
+    HoldsPrograms,
+}
+
+impl Inspection {
+    /// O valor por omissao, que o `downloads.json` nao escreve.
+    pub fn is_checked(&self) -> bool {
+        *self == Self::Checked
+    }
 }
 
 /// O que se faz a um ficheiro acabado.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinalizeAction {
-    /// Fica, com a marca da Web.
-    Keep,
+    /// Fica, com a marca da Web, e com o que a inspecao disse dele.
+    Keep(Inspection),
     Delete(DeleteReason),
 }
 
 /// A tabela do fim: o nome final, o sniff dos primeiros 4 KiB (`None`: nao
-/// se leu) e se o utilizador confirmou este programa.
+/// se leu), a inspecao do `.zip` (`None`: o nome nao e um `.zip`), se o
+/// utilizador confirmou este programa e «Permitir baixar programas».
 pub fn decide_finalize(
     name: NameRisk,
     sniff: Option<SniffRisk>,
+    archive: Option<&ZipVerdict>,
     confirmed_program: bool,
+    allow_programs: bool,
 ) -> FinalizeAction {
     let Some(sniff) = sniff else {
         return FinalizeAction::Delete(DeleteReason::Unreadable);
@@ -240,7 +280,24 @@ pub fn decide_finalize(
     if sniff == SniffRisk::Dangerous && !confirmed_program {
         return FinalizeAction::Delete(DeleteReason::DangerousContent);
     }
-    FinalizeAction::Keep
+    match archive {
+        // O que se permite so com a definicao (como o «Baixar programa?» do
+        // comeco, que um `.zip` nunca pergunta); o disfarce e o nome
+        // inseguro nunca.
+        Some(ZipVerdict::Holds { risk, .. }) if !(allow_programs && risk.allows_confirmation()) => {
+            FinalizeAction::Delete(DeleteReason::ArchiveEntry(*risk))
+        }
+        Some(ZipVerdict::Holds {
+            risk: ZipEntryRisk::NestedArchive,
+            ..
+        })
+        | Some(ZipVerdict::NotInspected) => FinalizeAction::Keep(Inspection::NotInspected),
+        Some(ZipVerdict::Holds { .. }) => FinalizeAction::Keep(Inspection::HoldsPrograms),
+        Some(ZipVerdict::Clean { .. }) | None if sniff == SniffRisk::NotInspected => {
+            FinalizeAction::Keep(Inspection::NotInspected)
+        }
+        Some(ZipVerdict::Clean { .. }) | None => FinalizeAction::Keep(Inspection::Checked),
+    }
 }
 
 /// O que [`write_motw_if_absent`] encontrou.
@@ -257,10 +314,10 @@ pub enum MotwOutcome {
 /// O que aconteceu a um ficheiro acabado.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinalizeOutcome {
-    Kept(MotwOutcome),
+    Kept(MotwOutcome, Inspection),
     /// Ficou, mas a marca nao se escreveu (um disco sem fluxos alternativos,
     /// FAT32 ou exFAT).
-    KeptWithoutMotw(io::ErrorKind),
+    KeptWithoutMotw(io::ErrorKind, Inspection),
     Deleted(DeleteReason),
     /// Devia ter sido apagado e o `remove_file` falhou: continua no disco.
     DeleteFailed(DeleteReason, io::ErrorKind),
@@ -277,16 +334,29 @@ fn read_head(path: &Path) -> Option<Vec<u8>> {
     Some(head)
 }
 
-/// Acaba um download: le o inicio do ficheiro, decide pela tabela e escreve
-/// a marca da Web ou apaga-o. Um ficheiro que ja nao existe conta como
+/// Acaba um download: le o inicio do ficheiro (e, num `.zip`, o diretorio
+/// central, nunca os dados das entradas), decide pela tabela e escreve a
+/// marca da Web ou apaga-o. Um ficheiro que ja nao existe conta como
 /// apagado.
-pub fn finalize_download(path: &Path, confirmed_program: bool) -> FinalizeOutcome {
-    let risk = name_risk(file_name_of(path));
+pub fn finalize_download(
+    path: &Path,
+    confirmed_program: bool,
+    allow_programs: bool,
+) -> FinalizeOutcome {
+    let name = file_name_of(path);
+    let risk = name_risk(name);
     let sniff = read_head(path).map(|head| file_risk::sniff_download(&head));
-    match decide_finalize(risk, sniff, confirmed_program) {
-        FinalizeAction::Keep => match write_motw_if_absent(path) {
-            Ok(motw) => FinalizeOutcome::Kept(motw),
-            Err(error) => FinalizeOutcome::KeptWithoutMotw(error.kind()),
+    let archive = (sniff.is_some() && is_zip_name(name)).then(|| inspect_zip_file(path));
+    match decide_finalize(
+        risk,
+        sniff,
+        archive.as_ref(),
+        confirmed_program,
+        allow_programs,
+    ) {
+        FinalizeAction::Keep(inspection) => match write_motw_if_absent(path) {
+            Ok(motw) => FinalizeOutcome::Kept(motw, inspection),
+            Err(error) => FinalizeOutcome::KeptWithoutMotw(error.kind(), inspection),
         },
         FinalizeAction::Delete(reason) => match fs::remove_file(path) {
             Ok(()) => FinalizeOutcome::Deleted(reason),
@@ -411,9 +481,14 @@ impl ProgressThrottle {
 #[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum RecordOutcome {
     /// No disco, com a marca da Web. `warn`: um documento com macros ou um
-    /// ficheiro sem extensao que comeca como um script.
+    /// ficheiro sem extensao que comeca como um script. `inspection`: o que
+    /// o fim disse dele (um arquivo compactado nao inspecionado, um `.zip`
+    /// com programas que ficou pela definicao); omitido quando nada ha a
+    /// dizer, e assim lido de um registo de antes da 2.4.
     Completed {
         warn: bool,
+        #[serde(default, skip_serializing_if = "Inspection::is_checked")]
+        inspection: Inspection,
     },
     /// Recusado antes de comecar.
     Blocked {
@@ -592,6 +667,9 @@ pub enum DownloadEffect {
         id: DownloadId,
         path: PathBuf,
         confirmed_program: bool,
+        /// «Permitir baixar programas» quando o download acabou: decide um
+        /// `.zip` com programas dentro.
+        allow_programs: bool,
     },
     /// O registo mudou: gravar [`DownloadManager::log`].
     Persist,
@@ -836,6 +914,7 @@ impl DownloadManager {
     }
 
     fn ended(&mut self, id: DownloadId, end: DownloadEnd) -> Vec<DownloadEffect> {
+        let allow_programs = self.settings.allow_programs;
         let Some(entry) = self.entries.get_mut(&id) else {
             return vec![DownloadEffect::ForgetOp(id)];
         };
@@ -865,6 +944,7 @@ impl DownloadManager {
                     id,
                     path,
                     confirmed_program: entry.confirmed_program,
+                    allow_programs,
                 });
                 effects.push(DownloadEffect::Changed(id));
             }
@@ -896,9 +976,11 @@ impl DownloadManager {
         }
         let mut effects = Vec::new();
         let recorded = match outcome {
-            FinalizeOutcome::Kept(_) | FinalizeOutcome::KeptWithoutMotw(_) => {
-                RecordOutcome::Completed { warn: entry.warn }
-            }
+            FinalizeOutcome::Kept(_, inspection)
+            | FinalizeOutcome::KeptWithoutMotw(_, inspection) => RecordOutcome::Completed {
+                warn: entry.warn,
+                inspection,
+            },
             FinalizeOutcome::Deleted(reason) => {
                 effects.push(DownloadEffect::Notice(DownloadNotice::Deleted {
                     id,
@@ -1152,74 +1234,242 @@ mod tests {
         );
     }
 
-    /// Gate critico: a tabela do fim.
+    /// Gate critico: a tabela do fim -- o nome, o sniff, a inspecao de um
+    /// `.zip` (downloads-zip-inspect), a confirmacao e «Permitir baixar
+    /// programas». Sabotado: um arquivo nao inspecionado dado como lido
+    /// (`Keep(Checked)`) fica vermelho aqui e no gate do ZIP no disco.
     #[test]
     fn the_finalize_decision_table() {
         use BlockReason::*;
         use DeleteReason::*;
         use FinalizeAction::*;
+        use Inspection::{Checked, HoldsPrograms, NotInspected};
         let safe = NameRisk::Safe;
         let macro_doc = NameRisk::Macro;
         let program = NameRisk::Blocked(Program);
         let masquerade = NameRisk::Blocked(Masquerade);
         let bad = NameRisk::Blocked(BadName);
-        let rows: &[(NameRisk, Option<SniffRisk>, bool, FinalizeAction)] = &[
-            (safe, Some(SniffRisk::Safe), false, Keep),
-            (safe, Some(SniffRisk::NotInspected), false, Keep),
-            (safe, Some(SniffRisk::Warn), false, Keep),
-            (macro_doc, Some(SniffRisk::Safe), false, Keep),
+        let holds = |risk| {
+            Some(ZipVerdict::Holds {
+                risk,
+                entry: "x".to_string(),
+            })
+        };
+        let clean = Some(ZipVerdict::Clean { entries: 2 });
+        let unread = Some(ZipVerdict::NotInspected);
+        let zip_program = holds(ZipEntryRisk::Blocked(Program));
+        let zip_script = holds(ZipEntryRisk::Blocked(Script));
+        let zip_masquerade = holds(ZipEntryRisk::Blocked(Masquerade));
+        let zip_bad = holds(ZipEntryRisk::Blocked(BadName));
+        let zip_nested = holds(ZipEntryRisk::NestedArchive);
+        let safe_sniff = Some(SniffRisk::Safe);
+        // nome, sniff, zip, confirmado, definicao, esperado
+        type Row = (
+            NameRisk,
+            Option<SniffRisk>,
+            Option<ZipVerdict>,
+            bool,
+            bool,
+            FinalizeAction,
+        );
+        let rows: Vec<Row> = vec![
+            (safe, safe_sniff, None, false, false, Keep(Checked)),
+            (
+                safe,
+                Some(SniffRisk::NotInspected),
+                None,
+                false,
+                false,
+                Keep(NotInspected),
+            ),
+            (
+                safe,
+                Some(SniffRisk::Warn),
+                None,
+                false,
+                false,
+                Keep(Checked),
+            ),
+            (macro_doc, safe_sniff, None, false, false, Keep(Checked)),
             (
                 safe,
                 Some(SniffRisk::Dangerous),
+                None,
+                false,
                 false,
                 Delete(DangerousContent),
             ),
             (
                 macro_doc,
                 Some(SniffRisk::Dangerous),
+                None,
+                false,
                 false,
                 Delete(DangerousContent),
             ),
-            (safe, None, false, Delete(Unreadable)),
-            (safe, None, true, Delete(Unreadable)),
+            (safe, None, None, false, false, Delete(Unreadable)),
+            (safe, None, None, true, true, Delete(Unreadable)),
             (
                 program,
                 Some(SniffRisk::Dangerous),
+                None,
+                false,
+                true,
+                Delete(BlockedName(Program)),
+            ),
+            (
+                program,
+                safe_sniff,
+                None,
+                false,
                 false,
                 Delete(BlockedName(Program)),
             ),
             (
                 program,
-                Some(SniffRisk::Safe),
-                false,
-                Delete(BlockedName(Program)),
+                Some(SniffRisk::Dangerous),
+                None,
+                true,
+                true,
+                Keep(Checked),
             ),
-            (program, Some(SniffRisk::Dangerous), true, Keep),
-            (safe, Some(SniffRisk::Dangerous), true, Keep),
+            (
+                safe,
+                Some(SniffRisk::Dangerous),
+                None,
+                true,
+                false,
+                Keep(Checked),
+            ),
             (
                 masquerade,
                 Some(SniffRisk::Dangerous),
+                None,
+                true,
                 true,
                 Delete(BlockedName(Masquerade)),
             ),
             (
                 masquerade,
-                Some(SniffRisk::Safe),
+                safe_sniff,
+                None,
+                false,
                 false,
                 Delete(BlockedName(Masquerade)),
             ),
             (
                 bad,
-                Some(SniffRisk::Safe),
+                safe_sniff,
+                None,
+                true,
                 true,
                 Delete(BlockedName(BadName)),
             ),
+            // Um `.zip` lido inteiro sem nada perigoso; um que nao se leu
+            // fica, mas nunca como lido -- com ou sem a definicao.
+            (safe, safe_sniff, clean.clone(), false, false, Keep(Checked)),
+            (safe, safe_sniff, clean.clone(), false, true, Keep(Checked)),
+            (
+                safe,
+                safe_sniff,
+                unread.clone(),
+                false,
+                false,
+                Keep(NotInspected),
+            ),
+            (
+                safe,
+                safe_sniff,
+                unread.clone(),
+                false,
+                true,
+                Keep(NotInspected),
+            ),
+            // Programas ou scripts dentro: apagado sem a definicao, fica
+            // com ela (e a lista diz o que leva).
+            (
+                safe,
+                safe_sniff,
+                zip_program.clone(),
+                false,
+                false,
+                Delete(ArchiveEntry(ZipEntryRisk::Blocked(Program))),
+            ),
+            (
+                safe,
+                safe_sniff,
+                zip_program.clone(),
+                false,
+                true,
+                Keep(HoldsPrograms),
+            ),
+            (
+                safe,
+                safe_sniff,
+                zip_script.clone(),
+                false,
+                false,
+                Delete(ArchiveEntry(ZipEntryRisk::Blocked(Script))),
+            ),
+            (
+                safe,
+                safe_sniff,
+                zip_script.clone(),
+                false,
+                true,
+                Keep(HoldsPrograms),
+            ),
+            // Outro arquivo compactado dentro: apagado sem a definicao; com
+            // ela fica, e fica nao inspecionado.
+            (
+                safe,
+                safe_sniff,
+                zip_nested.clone(),
+                false,
+                false,
+                Delete(ArchiveEntry(ZipEntryRisk::NestedArchive)),
+            ),
+            (
+                safe,
+                safe_sniff,
+                zip_nested.clone(),
+                false,
+                true,
+                Keep(NotInspected),
+            ),
+            // Um disfarce ou um nome inseguro dentro: nunca fica.
+            (
+                safe,
+                safe_sniff,
+                zip_masquerade.clone(),
+                false,
+                true,
+                Delete(ArchiveEntry(ZipEntryRisk::Blocked(Masquerade))),
+            ),
+            (
+                safe,
+                safe_sniff,
+                zip_bad.clone(),
+                true,
+                true,
+                Delete(ArchiveEntry(ZipEntryRisk::Blocked(BadName))),
+            ),
+            // O sniff decide antes do ZIP: um executavel com nome de `.zip`
+            // e apagado pelo conteudo.
+            (
+                safe,
+                Some(SniffRisk::Dangerous),
+                unread.clone(),
+                false,
+                true,
+                Delete(DangerousContent),
+            ),
         ];
-        for &(name, sniff, confirmed, expected) in rows {
+        for (name, sniff, archive, confirmed, allow, expected) in &rows {
             assert_eq!(
-                decide_finalize(name, sniff, confirmed),
-                expected,
-                "{name:?} {sniff:?} confirmado={confirmed}"
+                decide_finalize(*name, *sniff, archive.as_ref(), *confirmed, *allow),
+                *expected,
+                "{name:?} {sniff:?} {archive:?} confirmado={confirmed} definicao={allow}"
             );
         }
 
@@ -1228,30 +1478,267 @@ mod tests {
         // existe conta como apagado.
         let dir = TempDir::new("finalize");
         let pdf = dir.file("relatorio.pdf", PDF);
-        let kept = finalize_download(&pdf, false);
-        assert!(matches!(kept, FinalizeOutcome::Kept(_)), "{kept:?}");
+        let kept = finalize_download(&pdf, false, false);
+        assert!(
+            matches!(kept, FinalizeOutcome::Kept(_, Inspection::Checked)),
+            "{kept:?}"
+        );
         assert!(pdf.exists());
         let disguised = dir.file("relatorio2.pdf", &pe_bytes());
         assert_eq!(
-            finalize_download(&disguised, false),
+            finalize_download(&disguised, false, false),
             FinalizeOutcome::Deleted(DangerousContent)
         );
         assert!(!disguised.exists());
         let setup = dir.file("setup.exe", &pe_bytes());
         assert!(matches!(
-            finalize_download(&setup, true),
-            FinalizeOutcome::Kept(_)
+            finalize_download(&setup, true, false),
+            FinalizeOutcome::Kept(_, Inspection::Checked)
         ));
         assert!(setup.exists());
         let unconfirmed = dir.file("outro.exe", &pe_bytes());
         assert_eq!(
-            finalize_download(&unconfirmed, false),
+            finalize_download(&unconfirmed, false, false),
             FinalizeOutcome::Deleted(BlockedName(Program))
         );
         assert!(!unconfirmed.exists());
         assert_eq!(
-            finalize_download(&dir.0.join("sumiu.pdf"), false),
+            finalize_download(&dir.0.join("sumiu.pdf"), false, false),
             FinalizeOutcome::Deleted(Unreadable)
+        );
+    }
+
+    /// Gate critico (downloads-zip-inspect), no disco, pelo
+    /// `finalize_download` que o `neural-app` corre: o `pacote.zip` do E2E
+    /// (setup.exe e run.bat) e apagado sem «Permitir baixar programas» e
+    /// fica com ela; um `aux.exe`, um `setup.exe` no Unicode Path (0x7075)
+    /// ou no cabecalho local apagam-no; um `a/../setup.exe` ou um segmento
+    /// de 62 000 bytes apagam-no mesmo com ela; `setup.exe/.`,
+    /// `setup.exe\.` e `setup.exe/ .` contam como o programa; um ZIP do
+    /// bsdtar (`./LEIAME.txt`, `./docs/`) e um ZIP limpo ficam lidos; um
+    /// sobreposto, um com dois diretorios possiveis, um estragado e um 7z
+    /// ficam nao inspecionados; so um `.zip` e inspecionado.
+    #[test]
+    fn a_downloaded_zip_is_inspected_on_disk() {
+        use crate::epub::test_support::{
+            RawEntry, ZipBuilder, directory_gap_zip, two_end_records_zip, unicode_path_extra,
+        };
+        let dir = TempDir::new("zip");
+        let pacote = ZipBuilder::new()
+            .stored("setup.exe", &pe_bytes())
+            .stored("run.bat", b"@echo off\r\necho oi\r\n")
+            .build();
+        let deleted = dir.file("pacote.zip", &pacote);
+        assert_eq!(
+            finalize_download(&deleted, false, false),
+            FinalizeOutcome::Deleted(DeleteReason::ArchiveEntry(ZipEntryRisk::Blocked(
+                BlockReason::Program
+            )))
+        );
+        assert!(!deleted.exists(), "o pacote.zip ficou no disco");
+        let allowed = dir.file("pacote.zip", &pacote);
+        assert!(
+            matches!(
+                finalize_download(&allowed, false, true),
+                FinalizeOutcome::Kept(_, Inspection::HoldsPrograms)
+            ),
+            "com a definicao, o pacote.zip fica e diz o que leva"
+        );
+        assert!(allowed.exists());
+
+        // O que outro extrator tira do mesmo ZIP: um `aux.exe` (o Windows 11
+        // grava-o), o nome do Unicode Path (0x7075) e o do cabecalho local.
+        let mut unicode = RawEntry::stored("foto.jpg", &pe_bytes());
+        unicode.extra = unicode_path_extra(b"foto.jpg", "setup.exe");
+        let mut local = RawEntry::stored("foto.jpg", &pe_bytes());
+        local.local_name = Some(b"setup.exe".to_vec());
+        for (name, zip) in [
+            (
+                "dispositivo.zip",
+                ZipBuilder::new()
+                    .stored("LEIAME.txt", b"ola")
+                    .stored("aux.exe", &pe_bytes())
+                    .build(),
+            ),
+            (
+                "unicode.zip",
+                ZipBuilder::new()
+                    .stored("LEIAME.txt", b"ola")
+                    .entry(unicode)
+                    .build(),
+            ),
+            (
+                "local.zip",
+                ZipBuilder::new()
+                    .stored("LEIAME.txt", b"ola")
+                    .entry(local)
+                    .build(),
+            ),
+        ] {
+            let path = dir.file(name, &zip);
+            assert_eq!(
+                finalize_download(&path, false, false),
+                FinalizeOutcome::Deleted(DeleteReason::ArchiveEntry(ZipEntryRisk::Blocked(
+                    BlockReason::Program
+                ))),
+                "{name}"
+            );
+            assert!(!path.exists(), "{name} ficou no disco");
+        }
+
+        // Um `..` no caminho (sobe de pasta) e um segmento de 62 000 bytes
+        // (nenhum disco o grava) sao nomes estragados: apagam o ZIP mesmo
+        // com a definicao ligada (ZI-5, ZI-6).
+        let huge = format!("{}.txt", "a".repeat(61_996));
+        for (name, entry) in [
+            ("subida.zip", "a/../setup.exe"),
+            ("enorme.zip", huge.as_str()),
+        ] {
+            let zip = ZipBuilder::new()
+                .stored("LEIAME.txt", b"ola")
+                .stored(entry, &pe_bytes())
+                .build();
+            for allow_programs in [false, true] {
+                let path = dir.file(name, &zip);
+                assert_eq!(
+                    finalize_download(&path, false, allow_programs),
+                    FinalizeOutcome::Deleted(DeleteReason::ArchiveEntry(ZipEntryRisk::Blocked(
+                        BlockReason::BadName
+                    ))),
+                    "{name}, allow_programs={allow_programs}"
+                );
+                assert!(!path.exists(), "{name} ficou no disco");
+            }
+        }
+        // Os segmentos do fim so de pontos e espacos caem: `setup.exe/.`
+        // (o tar.exe grava o programa `setup.exe`), `setup.exe\.` e
+        // `setup.exe/ .` sao o programa `setup.exe` (ZI-5).
+        for (name, entry) in [
+            ("ponto.zip", "setup.exe/."),
+            ("contrabarra.zip", "setup.exe\\."),
+            ("espaco.zip", "setup.exe/ ."),
+        ] {
+            let trailing = ZipBuilder::new()
+                .stored("LEIAME.txt", b"ola")
+                .stored(entry, &pe_bytes())
+                .build();
+            let path = dir.file(name, &trailing);
+            assert_eq!(
+                finalize_download(&path, false, false),
+                FinalizeOutcome::Deleted(DeleteReason::ArchiveEntry(ZipEntryRisk::Blocked(
+                    BlockReason::Program
+                ))),
+                "{name}"
+            );
+            assert!(!path.exists(), "o {name} ficou no disco");
+            let path = dir.file(name, &trailing);
+            assert!(
+                matches!(
+                    finalize_download(&path, false, true),
+                    FinalizeOutcome::Kept(_, Inspection::HoldsPrograms)
+                ),
+                "{name}"
+            );
+        }
+        // Um ZIP do bsdtar (`tar -a -cf x.zip .`): cada entrada comeca por
+        // `./`, que nao muda o caminho. E um ZIP limpo, lido e guardado.
+        let bsdtar = ZipBuilder::new()
+            .stored("./docs/", b"")
+            .stored("./docs/LEIAME.txt", b"ola")
+            .stored("./fotos/praia.jpg", b"\xFF\xD8\xFF\xE0")
+            .build();
+        let path = dir.file("bsdtar.zip", &bsdtar);
+        assert!(matches!(
+            finalize_download(&path, false, false),
+            FinalizeOutcome::Kept(_, Inspection::Checked)
+        ));
+
+        let fotos = ZipBuilder::new()
+            .stored("fotos/praia.jpg", b"\xFF\xD8\xFF\xE0")
+            .deflated("LEIAME.txt", b"ferias")
+            .build();
+        let clean = dir.file("fotos.zip", &fotos);
+        assert!(matches!(
+            finalize_download(&clean, false, false),
+            FinalizeOutcome::Kept(_, Inspection::Checked)
+        ));
+        // As duas entradas no mesmo cabecalho local: a bomba de sobreposicao.
+        let mut second = RawEntry::stored("fotos/b.jpg", b"\xFF\xD8\xFF\xE0");
+        second.offset = Some(0);
+        second.central_only = true;
+        let overlap = ZipBuilder::new()
+            .stored("fotos/a.jpg", b"\xFF\xD8\xFF\xE0")
+            .entry(second)
+            .build();
+        for (name, bytes) in [
+            ("sobreposto.zip", overlap),
+            ("dois-fins.zip", two_end_records_zip()),
+            ("folga.zip", directory_gap_zip()),
+            ("estragado.zip", pacote[..pacote.len() - 30].to_vec()),
+            ("pagina.zip", b"<html>nao e um zip</html>".to_vec()),
+            ("arquivo.7z", vec![0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0, 4]),
+        ] {
+            let path = dir.file(name, &bytes);
+            assert!(
+                matches!(
+                    finalize_download(&path, false, false),
+                    FinalizeOutcome::Kept(_, Inspection::NotInspected)
+                ),
+                "{name}"
+            );
+            assert!(path.exists(), "{name}");
+        }
+        // So o `.zip` e inspecionado: o mesmo pacote com outro nome e um
+        // arquivo que o Explorador nao abre como pasta.
+        let other = dir.file("pacote.bin", &pacote);
+        assert!(matches!(
+            finalize_download(&other, false, false),
+            FinalizeOutcome::Kept(_, Inspection::Checked)
+        ));
+        // O Windows tira o ponto do fim: `pacote.ZIP.` e um `.zip`.
+        assert!(is_zip_name("pacote.ZIP."));
+        assert!(!is_zip_name("pacote.zipx"));
+    }
+
+    /// O `inspection` de um `Completed` vai para o `downloads.json` so
+    /// quando diz alguma coisa, e um registo de antes (sem ele) le-se como
+    /// lido.
+    #[test]
+    fn the_inspection_round_trips_through_downloads_json() {
+        let old: RecordOutcome =
+            serde_json::from_str(r#"{"kind":"completed","warn":false}"#).expect("json");
+        assert_eq!(
+            old,
+            RecordOutcome::Completed {
+                warn: false,
+                inspection: Inspection::Checked
+            }
+        );
+        let checked = serde_json::to_string(&old).expect("json");
+        assert!(!checked.contains("inspection"), "{checked}");
+        for inspection in [Inspection::NotInspected, Inspection::HoldsPrograms] {
+            let outcome = RecordOutcome::Completed {
+                warn: true,
+                inspection,
+            };
+            let text = serde_json::to_string(&outcome).expect("json");
+            assert!(text.contains("inspection"), "{text}");
+            assert_eq!(
+                serde_json::from_str::<RecordOutcome>(&text).expect("json"),
+                outcome
+            );
+        }
+        let deleted = RecordOutcome::Deleted {
+            reason: DeleteReason::ArchiveEntry(ZipEntryRisk::Blocked(BlockReason::Program)),
+        };
+        let text = serde_json::to_string(&deleted).expect("json");
+        assert_eq!(
+            text,
+            r#"{"kind":"deleted","reason":{"archive-entry":{"blocked":"program"}}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<RecordOutcome>(&text).expect("json"),
+            deleted
         );
     }
 
@@ -1285,8 +1772,8 @@ mod tests {
         // O fim de um download escreve-a.
         let done = dir.file("acabado.pdf", PDF);
         assert_eq!(
-            finalize_download(&done, false),
-            FinalizeOutcome::Kept(MotwOutcome::Written)
+            finalize_download(&done, false, false),
+            FinalizeOutcome::Kept(MotwOutcome::Written, Inspection::Checked)
         );
         assert_eq!(
             read_motw(&done)
@@ -1326,7 +1813,7 @@ mod tests {
         }));
         effects.extend(m.on_event(DownloadEvent::Finalized {
             id: DownloadId(1),
-            outcome: FinalizeOutcome::Kept(MotwOutcome::Written),
+            outcome: FinalizeOutcome::Kept(MotwOutcome::Written, Inspection::Checked),
         }));
         effects.extend(m.on_event(start(2, "setup.exe", true)));
         effects.extend(m.on_event(start(3, "video.mp4", true)));
@@ -1368,7 +1855,7 @@ mod tests {
         });
         let done = m.on_event(DownloadEvent::Finalized {
             id: DownloadId(1),
-            outcome: FinalizeOutcome::Kept(MotwOutcome::Written),
+            outcome: FinalizeOutcome::Kept(MotwOutcome::Written, Inspection::Checked),
         });
         assert!(done.contains(&DownloadEffect::Persist), "{done:?}");
         let blocked = m.on_event(start(2, "setup.exe", false));
@@ -1406,7 +1893,7 @@ mod tests {
             });
             effects.extend(m.on_event(DownloadEvent::Finalized {
                 id: DownloadId(id),
-                outcome: FinalizeOutcome::Kept(MotwOutcome::Written),
+                outcome: FinalizeOutcome::Kept(MotwOutcome::Written, Inspection::Checked),
             }));
             effects
         };
@@ -1468,6 +1955,8 @@ mod tests {
                 id: DownloadId(1),
                 path: PathBuf::from(r"C:\d").join("relatorio (1).pdf"),
                 confirmed_program: false,
+                // O gestor deste teste tem «Permitir baixar programas».
+                allow_programs: true,
             }
         );
         // Um StateChanged repetido nao finaliza duas vezes.
@@ -1562,7 +2051,7 @@ mod tests {
         });
         m.on_event(DownloadEvent::Finalized {
             id: DownloadId(1),
-            outcome: FinalizeOutcome::Kept(MotwOutcome::Written),
+            outcome: FinalizeOutcome::Kept(MotwOutcome::Written, Inspection::Checked),
         });
         let log = m.log();
         assert_eq!(log.entries.len(), MAX_LOG_ENTRIES);

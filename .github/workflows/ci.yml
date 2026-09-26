@@ -591,6 +591,17 @@ jobs:
           '@
             },
             @{
+              Label = "zip-not-inspected-shown-as-done"
+              Test = "a_zip_download_is_inspected_and_not_inspected_is_shown"
+              SourcePath = "crates/neural-app/src/windows_app/downloads_ui.rs"
+              Old = @'
+                  Inspection::NotInspected => Some(NOT_INSPECTED),
+          '@
+              New = @'
+                  Inspection::NotInspected => None,
+          '@
+            },
+            @{
               Label = "distraction-clicks-a-reject-that-accepts"
               Test = "distraction_never_clicks_accept"
               SourcePath = "crates/neural-app/src/windows_app/distraction.rs"
