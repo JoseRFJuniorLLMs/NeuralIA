@@ -419,7 +419,8 @@ fn watch_download(
         BytesReceivedChangedEventHandler,
         Microsoft::Web::WebView2::Win32::{
             COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON,
-            COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_CANCELED, COREWEBVIEW2_DOWNLOAD_STATE,
+            COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_CANCELED,
+            COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_PAUSED, COREWEBVIEW2_DOWNLOAD_STATE,
             COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED, COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED,
         },
         StateChangedEventHandler, take_pwstr,
@@ -468,6 +469,11 @@ fn watch_download(
                 "downloads: {} interrompido (motivo {})",
                 id.0, reason.0
             ));
+            // Pausado (no painel de downloads do WebView2) nao acabou: a
+            // operacao fica viva para o retomar e para o fim dele.
+            if reason == COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_PAUSED {
+                return Ok(());
+            }
             if reason == COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_CANCELED {
                 DownloadEnd::Cancelled
             } else {
