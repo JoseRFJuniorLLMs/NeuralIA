@@ -330,6 +330,8 @@ impl App {
     }
 
     fn activate_comparator(&mut self, sync_remote_buttons: bool) {
+        // `scripts/test-comparator-first-paint.ps1` espera por esta linha (e
+        // pelas dos dois relayouts) antes de contar as superficies visiveis.
         debug_log(format_args!(
             "activate_comparator: {} coluna(s)",
             self.comparator.as_ref().map_or(0, |comp| comp.views.len())

@@ -131,6 +131,7 @@ $process = Start-Process -FilePath $resolved -PassThru
 $spawnMs = $clock.ElapsedMilliseconds
 $timeline = New-Object System.Collections.Generic.List[string]
 $verdict = $null
+$problem = $null
 $rects = @()
 $windowMs = $null
 $activatedMs = $null
@@ -140,7 +141,7 @@ try {
     while ($clock.Elapsed.TotalSeconds -lt $HangTimeoutSec -and $process.MainWindowHandle -eq 0) {
         Start-Sleep -Milliseconds 50
         $process.Refresh()
-        if ($process.HasExited) { throw "NeuralIA saiu antes de criar a janela." }
+        if ($process.HasExited) { throw "NeuralIA saiu antes de criar a janela (codigo $($process.ExitCode))." }
     }
     if ($process.MainWindowHandle -eq 0) { throw "Janela principal nao apareceu em $HangTimeoutSec s." }
     $windowMs = $clock.ElapsedMilliseconds
@@ -179,7 +180,7 @@ try {
         # A amostra e tirada DEPOIS de ler o log: se o log ja dizia que os
         # relayouts correram, o estado das janelas que se le agora e o que o
         # utilizador tem sem tocar em nada.
-        $rects = Get-VisibleRects $process
+        $rects = @(Get-VisibleRects $process)
         if ($rects.Count -ne $lastCount) {
             $timeline.Add(("{0,7} ms  {1} superficie(s) visivel(is): {2}" -f $clock.ElapsedMilliseconds, $rects.Count, ($rects -join " ")))
             $lastCount = $rects.Count
@@ -197,6 +198,12 @@ try {
         Start-Sleep -Milliseconds 100
     }
 }
+catch {
+    # Sem janela ou processo morto: o veredito sai na mesma com a linha do
+    # tempo e o log do app, que e o que diz onde parou.
+    $verdict = "error"
+    $problem = $_.Exception.Message
+}
 finally {
     $env:NEURALIA_STARTUP_INPUT = $null
     $env:NEURALIA_NO_GMAIL = $null
@@ -212,6 +219,7 @@ $appLog = Read-DebugLog $debugLog
 Remove-Item $debugLog -ErrorAction SilentlyContinue
 $result = [ordered]@{
     verdict = $verdict
+    problem = $problem
     distinct_visible_wry_webview_rects = $rects.Count
     rects = $rects
     mouse_or_keyboard_injected = $false
@@ -234,6 +242,9 @@ switch ($verdict) {
     }
     "column-failed" {
         throw "Primeira pesquisa: o WebView2 recusou uma coluna (ver app_log)."
+    }
+    "error" {
+        throw "Primeira pesquisa: $problem"
     }
     default {
         throw "Primeira pesquisa: o comparador nao ficou pronto em $HangTimeoutSec s (ver timeline e app_log: qual coluna ficou por construir)."
