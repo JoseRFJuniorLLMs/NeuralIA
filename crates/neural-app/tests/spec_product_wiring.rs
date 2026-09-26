@@ -137,7 +137,8 @@ fn spec_0100_product_memory_is_worker_backed_reader_wired_and_private_safe() {
     // Pelo portao da persistencia (infra-privacy-guard): e ele que decide,
     // pelo modo, se a captura chega ao worker.
     assert!(reader.contains("self.privacy.capture(document)"));
-    let guard = between(APP, "impl PrivacyGuard {", "\n}\n");
+    // "\n}" e nao "\n}\n": o checkout do CI em Windows tem CRLF.
+    let guard = between(APP, "impl PrivacyGuard {", "\n}");
     assert!(guard.contains("self.memory.capture(document)"));
 
     // A regra "navegação privada nunca entra na memória semântica" deixou de
