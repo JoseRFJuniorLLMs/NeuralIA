@@ -44,11 +44,12 @@ Compilar e verificar tudo em cada tarefa custava horas e esgotava os limites dos
   - sabotagem em todos os gates críticos tocados;
   - análise das medições do §4.1 contra a LTS anterior (o CI já as corre em cada PR);
   - auditoria das afirmações da documentação (§3).
-- **Prévia**: qualquer outra versão (2.2.0, 3.1.0, 3.2.1…). Publicada como **pre-release** do GitHub, nunca como Latest. Em cada tarefa:
+- **Prévia**: qualquer outra versão (2.2.0, 3.1.0, 3.2.1…). Publicada também como **Latest** (ver abaixo). Em cada tarefa:
   - um agente constrói e corre localmente só o que alterou (`cargo check`, `cargo test -p <crate>` ou o filtro dos testes tocados);
   - o gate completo do §4.1, medições incluídas, é o CI do PR;
   - revisão independente só quando a tarefa toca num gate crítico do §4.2 (segurança, dados do utilizador, entrada não confiável, release): um revisor, sem verificador separado.
-- O `release.yml` escolhe o canal pela versão, e `scripts/test-release-contract.mjs` guarda essa regra.
+- **A Latest é sempre a versão mais recente publicada** (decisão do dono, 26/09/2026). Os dois ritmos diferem no que se verifica antes do bump, não no canal: quem abre a página do GitHub ou `/releases/latest` recebe a versão mais nova, com as ferramentas novas. O `release.yml` publica cada versão com `--latest`, e `scripts/test-release-contract.mjs` guarda essa regra.
+  - Nenhum agente muda a marcação Latest ou pre-release de uma release já publicada sem o sim do dono. Em 26/09/2026 a v2.2.0 (Latest por exceção do dono) foi revertida para pre-release por um agente que seguiu a regra antiga, e a página voltou a mostrar a v2.1.8, sem o Pomodoro, as Notas e a Respiração; o dono pôs então a v2.3.0 como Latest.
 - Nos dois ritmos continuam em vigor:
   - o sim do dono para o bump (acima);
   - o §3: docs descrevem código;
