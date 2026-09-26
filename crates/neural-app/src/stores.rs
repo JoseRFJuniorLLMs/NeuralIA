@@ -20,6 +20,17 @@ use neural_core::json_store::StoreSpec;
 pub(crate) const KEYS_STORE: StoreSpec = StoreSpec::new("keys", Explicit, Dir);
 /// A chave do Gemini Live, a do slot `KeySlot::Gemini` do cofre.
 pub(crate) const LIVE_KEY_STORE: StoreSpec = StoreSpec::new("gemini-live.key", Explicit, File);
+/// `<data_dir>/downloads.json`: o registo dos downloads acabados
+/// (`neural_core::downloads::DownloadLog`), escrito ao fim de cada um --
+/// efeito lateral do uso. Nunca leva um download do Split privado nem de
+/// um servico InPrivate, e no Modo privado nao se escreve. Sai no
+/// Ctrl+Shift+Delete.
+pub(crate) const DOWNLOADS_LOG_STORE: StoreSpec = StoreSpec::new("downloads.json", Automatic, File);
+/// `<data_dir>/downloads-settings.json`: a pasta dos downloads e
+/// «Permitir baixar programas». Hoje o produto so o le; quem o escreve e a
+/// seccao Downloads do downloads-ui.
+pub(crate) const DOWNLOADS_SETTINGS_STORE: StoreSpec =
+    StoreSpec::new("downloads-settings.json", Setting, File);
 
 /// Tudo o que o produto guarda em `<data_dir>`, com o tipo. Um ficheiro, um
 /// tipo; a regra: `Setting` = escolha num menu ou definicao; `Explicit` =
@@ -56,6 +67,8 @@ pub(crate) const APP_STORES: &[StoreSpec] = &[
     StoreSpec::new("library", Explicit, Dir),
     // "Exportar pesquisa": um Markdown pedido pelo utilizador.
     StoreSpec::new("research-exports", Explicit, Dir),
+    DOWNLOADS_LOG_STORE,
+    DOWNLOADS_SETTINGS_STORE,
     LIVE_KEY_STORE,
     KEYS_STORE,
 ];

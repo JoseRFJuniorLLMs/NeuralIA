@@ -6775,6 +6775,7 @@ fn clear_history_runs_every_registered_target() {
         ClearTarget::Tabs,
         ClearTarget::Memory,
         ClearTarget::EpubLibrary,
+        ClearTarget::Downloads,
         ClearTarget::History,
     ] {
         assert_eq!(
@@ -6787,7 +6788,7 @@ fn clear_history_runs_every_registered_target() {
         );
     }
     assert_eq!(CLEAR_HISTORY_TARGETS.last(), Some(&ClearTarget::History));
-    assert_eq!(CLEAR_HISTORY_TARGETS.len(), 4);
+    assert_eq!(CLEAR_HISTORY_TARGETS.len(), 5);
 }
 
 /// Ligacao, nao comportamento: o comportamento esta nos gates de
@@ -8296,8 +8297,10 @@ fn column_menu_item_goes_after_every_native_item() {
 struct RecordingRegistrar {
     menus: Vec<(WebViewHost, Vec<usize>)>,
     accelerators: Vec<WebViewHost>,
+    downloads: Vec<WebViewHost>,
     fail_menu: bool,
     fail_accelerators: bool,
+    fail_downloads: bool,
 }
 
 impl HookRegistrar for RecordingRegistrar {
@@ -8313,6 +8316,13 @@ impl HookRegistrar for RecordingRegistrar {
             return Err("add_AcceleratorKeyPressed falhou: E_FAIL".to_string());
         }
         self.accelerators.push(host);
+        Ok(())
+    }
+    fn downloads(&mut self, host: WebViewHost) -> Result<(), String> {
+        if self.fail_downloads {
+            return Err("ICoreWebView2_4 indisponível: E_NOINTERFACE".to_string());
+        }
+        self.downloads.push(host);
         Ok(())
     }
 }
@@ -8470,7 +8480,61 @@ fn every_webview_gets_the_hooks() {
                 registrar.menus
             );
         }
+        // O gestor de downloads: em cada hospedeiro que os aceita, e so
+        // nesses (uma pagina local recusa-os no builder, parte (b)).
+        match webview_hooks(host).downloads {
+            DownloadPolicy::Managed => assert_eq!(
+                registrar.downloads,
+                vec![host],
+                "{host:?} aceita downloads sem o gestor"
+            ),
+            DownloadPolicy::Deny => assert!(
+                registrar.downloads.is_empty(),
+                "{host:?} recusa downloads mas ganhou o gestor"
+            ),
+        }
     }
+    // Todos os indices das colunas e cada servico, nao so o representante
+    // de cada tipo: a fonte ao lado de uma coluna qualquer tambem passa pelo
+    // gestor.
+    let mut managed = Vec::new();
+    for col in 0..=COMPARATOR_COLUMNS {
+        managed.extend([
+            WebViewHost::Column(col),
+            WebViewHost::Split(col),
+            WebViewHost::PrivateSplit(col),
+        ]);
+    }
+    managed.push(WebViewHost::External);
+    for service in [
+        Service::Meet,
+        Service::WhatsApp,
+        Service::YouTube,
+        Service::Gmail,
+        Service::Breath,
+    ] {
+        managed.push(WebViewHost::Service(service));
+    }
+    for host in managed {
+        let mut registrar = RecordingRegistrar::default();
+        install_hooks_with(host, &webview_hooks(host), &mut registrar);
+        assert_eq!(registrar.downloads, vec![host], "{host:?} sem o gestor");
+    }
+    let mut registrar = RecordingRegistrar {
+        fail_downloads: true,
+        ..Default::default()
+    };
+    let missing = install_hooks_with(
+        WebViewHost::External,
+        &webview_hooks(WebViewHost::External),
+        &mut registrar,
+    );
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert!(
+        missing[0].contains("web") && missing[0].contains("gestor de downloads"),
+        "{}",
+        missing[0]
+    );
     // Um runtime sem os eventos: nada sobe nem para, cada falha vira uma
     // linha de log que diz o hospedeiro e porque, e as outras metades
     // seguem.
@@ -22910,11 +22974,15 @@ fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
 /// embarca sem linha em `stores::APP_STORES` fica vermelha.
 #[test]
 fn existing_stores_have_a_declared_kind() {
-    use crate::stores::{APP_STORES, KEYS_STORE, LIVE_KEY_STORE};
+    use crate::stores::{
+        APP_STORES, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE, KEYS_STORE, LIVE_KEY_STORE,
+    };
     use neural_core::json_store::StoreKind::{Automatic, Explicit, Setting};
     use neural_core::json_store::StoreShape::{Dir, File};
     let mut expected = vec![
         ("history.jsonl", Automatic, File),
+        ("downloads.json", Automatic, File),
+        ("downloads-settings.json", Setting, File),
         ("memory", Automatic, Dir),
         ("tabs.json", Automatic, File),
         ("tabs.lock", Automatic, File),
@@ -22974,6 +23042,8 @@ fn existing_stores_have_a_declared_kind() {
     let specs = [
         ("KEYS_STORE", KEYS_STORE.name),
         ("LIVE_KEY_STORE", LIVE_KEY_STORE.name),
+        ("DOWNLOADS_LOG_STORE", DOWNLOADS_LOG_STORE.name),
+        ("DOWNLOADS_SETTINGS_STORE", DOWNLOADS_SETTINGS_STORE.name),
     ];
     for part in compact.split(".grant(").skip(1) {
         let argument = part.split(')').next().unwrap_or_default();
@@ -23348,6 +23418,631 @@ fn the_secret_prompt_takes_typing_sends_the_key_and_clears_the_edit() {
         assert_eq!(
             text_at_destroy, 0,
             "o EDIT tinha a chave quando foi destruido"
+        );
+    }
+}
+
+// ===================== o gestor de downloads (downloads-manager) =====================
+
+mod downloads_gates {
+    use super::*;
+    use neural_core::downloads::{
+        DeleteReason, DownloadEffect, DownloadEnd, DownloadEvent, DownloadId, DownloadLog,
+        DownloadManager, DownloadNotice, DownloadSettings, DownloadStart, DownloadState,
+        LOG_MAX_BYTES, LOG_VERSION, RecordOutcome, SETTINGS_VERSION, WebViewKey, motw_zone_id,
+        read_motw,
+    };
+    use neural_core::file_risk::BlockReason;
+    use neural_core::json_store::{StoreKind, StoreMode, VersionedJsonStore};
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    use crate::stores::{DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE};
+
+    /// Uma pasta temporaria com ficheiros reais (o fim le o disco).
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            static NONCE: AtomicU64 = AtomicU64::new(1);
+            let path = std::env::temp_dir().join(format!(
+                "neuralia-dl-gates-{name}-{}-{}",
+                std::process::id(),
+                NONCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("pasta temporaria");
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// O que as operacoes falsas ouviram, por ordem.
+    #[derive(Clone, Default)]
+    struct Journal(Rc<RefCell<Vec<String>>>);
+
+    impl Journal {
+        fn push(&self, line: String) {
+            self.0.borrow_mut().push(line);
+        }
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.0.borrow_mut())
+        }
+    }
+
+    /// Uma operacao do WebView2 sem WebView2: anota o que o gestor lhe pede.
+    struct FakeDownload {
+        id: u64,
+        pending: bool,
+        journal: Journal,
+    }
+
+    impl DownloadHandle for FakeDownload {
+        fn complete_start(&mut self, path: Option<&Path>) -> Result<(), String> {
+            if !std::mem::take(&mut self.pending) {
+                return Ok(());
+            }
+            self.journal.push(match path {
+                Some(path) => format!("{} segue {}", self.id, path.display()),
+                None => format!("{} recusado", self.id),
+            });
+            Ok(())
+        }
+        fn cancel(&mut self) -> Result<(), String> {
+            if self.pending {
+                return self.complete_start(None);
+            }
+            self.journal.push(format!("{} cancelado", self.id));
+            Ok(())
+        }
+    }
+
+    /// O ciclo como o `App` o corre (`run_download_event`), sobre operacoes
+    /// falsas; com `with_disk`, tambem o registo das lojas e o
+    /// `downloads.json` reais.
+    struct Rig {
+        manager: DownloadManager,
+        ops: RefCell<DownloadOps<FakeDownload>>,
+        journal: Journal,
+        later: Vec<DownloadEffect>,
+        stores: Option<StoreRegistry>,
+        store: Option<VersionedJsonStore<DownloadLog>>,
+    }
+
+    impl Rig {
+        fn new(manager: DownloadManager) -> Self {
+            Self {
+                manager,
+                ops: RefCell::new(DownloadOps::default()),
+                journal: Journal::default(),
+                later: Vec::new(),
+                stores: None,
+                store: None,
+            }
+        }
+
+        /// Com o registo das lojas sobre `dir` e o `downloads.json` aberto
+        /// pelo grant dele, como no `DownloadsState::open`.
+        fn with_disk(manager: DownloadManager, dir: &Path) -> Self {
+            let stores = StoreRegistry::mint_for_test(dir);
+            let grant = stores.grant(DOWNLOADS_LOG_STORE).expect("grant");
+            assert_eq!(grant.kind(), StoreKind::Automatic);
+            let store = VersionedJsonStore::<DownloadLog>::open(grant, LOG_VERSION, LOG_MAX_BYTES)
+                .expect("loja");
+            Self {
+                stores: Some(stores),
+                store: Some(store),
+                ..Self::new(manager)
+            }
+        }
+
+        fn set_mode(&self, mode: StoreMode) {
+            self.stores.as_ref().expect("registo").set_mode(mode);
+        }
+
+        fn drive(&mut self, event: DownloadEvent) {
+            let run = run_download_event(
+                &mut self.manager,
+                &self.ops,
+                self.store.as_mut(),
+                downloads_private_mode(self.stores.as_ref()),
+                event,
+            );
+            assert_eq!(run.erase_error, None);
+            self.later.extend(run.later);
+        }
+
+        /// O que o `DownloadStarting` faz antes do gestor: a operacao entra
+        /// nas vivas e o `Starting` segue. `host` da a privacidade pela
+        /// mesma funcao que o COM usa.
+        fn begin(&mut self, id: u64, webview: u64, host: WebViewHost, proposed: PathBuf) {
+            self.ops.borrow_mut().insert(
+                DownloadId(id),
+                WebViewKey(webview),
+                FakeDownload {
+                    id,
+                    pending: true,
+                    journal: self.journal.clone(),
+                },
+            );
+            self.drive(DownloadEvent::Starting(DownloadStart {
+                id: DownloadId(id),
+                webview: WebViewKey(webview),
+                private: download_host_is_private(host),
+                proposed,
+                host: Some("example.com".to_string()),
+                total: Some(64),
+                at: 1_790_000_000,
+            }));
+        }
+
+        fn complete(&mut self, id: u64, path: &Path) {
+            self.drive(DownloadEvent::Ended {
+                id: DownloadId(id),
+                end: DownloadEnd::Completed {
+                    path: path.to_path_buf(),
+                },
+            });
+        }
+    }
+
+    const PDF: &[u8] = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n%%EOF\n";
+
+    fn pe_bytes() -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x100];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+        bytes
+    }
+
+    /// Gate critico (ganchos): cada pagina local recusa downloads no
+    /// builder e nunca recebe o gestor; cada pagina da internet recebe o
+    /// gestor. A lista das locais esta escrita aqui, nao lida da tabela.
+    #[test]
+    fn downloads_are_denied_on_every_local_host_and_managed_on_the_web() {
+        let local = [
+            WebViewHost::Reader,
+            WebViewHost::Pdf,
+            WebViewHost::Epub,
+            WebViewHost::Live,
+            WebViewHost::GmailMonitor,
+            WebViewHost::SidePanel,
+        ];
+        for host in WebViewHost::ALL {
+            let expected = if local.contains(&host) {
+                DownloadPolicy::Deny
+            } else {
+                DownloadPolicy::Managed
+            };
+            assert_eq!(webview_hooks(host).downloads, expected, "{host:?}");
+            let mut registrar = RecordingRegistrar::default();
+            install_hooks_with(host, &webview_hooks(host), &mut registrar);
+            assert_eq!(
+                registrar.downloads.is_empty(),
+                local.contains(&host),
+                "{host:?}: gestor {:?}",
+                registrar.downloads
+            );
+        }
+    }
+
+    /// Quem nunca vai para o registo: o Split privado e o servico InPrivate.
+    #[test]
+    fn private_download_hosts() {
+        for host in WebViewHost::ALL {
+            let private = matches!(host, WebViewHost::PrivateSplit(_));
+            assert_eq!(download_host_is_private(host), private, "{host:?}");
+        }
+        for service in [
+            Service::Meet,
+            Service::WhatsApp,
+            Service::YouTube,
+            Service::Gmail,
+            Service::Breath,
+        ] {
+            assert_eq!(
+                download_host_is_private(WebViewHost::Service(service)),
+                service.private(),
+                "{service:?}"
+            );
+        }
+        assert!(download_host_is_private(WebViewHost::Service(
+            Service::Breath
+        )));
+        for col in 0..COMPARATOR_COLUMNS {
+            assert!(download_host_is_private(WebViewHost::PrivateSplit(col)));
+            assert!(!download_host_is_private(WebViewHost::Split(col)));
+        }
+    }
+
+    /// As operacoes do WebView2 seguem o gestor que embarca: recusar,
+    /// seguir, largar quando acabam e quando a WebView delas e destruida;
+    /// o fim corre o `finalize_download` (a marca da Web, ou apagar).
+    #[test]
+    fn download_ops_follow_the_manager_and_are_cleared_on_finish_and_destroy() {
+        let dir = Scratch::new("ops");
+        let mut rig = Rig::new(DownloadManager::new(
+            DownloadSettings {
+                folder: None,
+                allow_programs: true,
+            },
+            DownloadLog::default(),
+        ));
+
+        // Um PDF: segue para o caminho proposto; acaba; a operacao sai e o
+        // ficheiro fica com a marca.
+        let pdf = dir.0.join("relatorio.pdf");
+        rig.begin(1, 1, WebViewHost::Column(0), pdf.clone());
+        assert_eq!(
+            rig.journal.take(),
+            vec![format!("1 segue {}", pdf.display())]
+        );
+        assert_eq!(rig.ops.borrow().len(), 1);
+        std::fs::write(&pdf, PDF).expect("pdf");
+        rig.complete(1, &pdf);
+        assert_eq!(rig.ops.borrow().len(), 0, "a operacao acabada ficou viva");
+        assert_eq!(
+            rig.manager.entry(DownloadId(1)).expect("entrada").state,
+            DownloadState::Done(RecordOutcome::Completed { warn: false })
+        );
+        let motw = read_motw(&pdf).expect("ler").expect("a marca da Web");
+        assert_eq!(motw_zone_id(&motw), Some(3));
+        assert!(rig.later.contains(&DownloadEffect::Persist));
+        rig.later.clear();
+
+        // Um executavel com nome de PDF: acaba e e apagado, com aviso.
+        let fake = dir.0.join("fatura.pdf");
+        rig.begin(2, 1, WebViewHost::External, fake.clone());
+        std::fs::write(&fake, pe_bytes()).expect("exe");
+        rig.complete(2, &fake);
+        assert!(!fake.exists(), "o executavel disfarcado ficou no disco");
+        assert!(rig.later.iter().any(|effect| matches!(
+            effect,
+            DownloadEffect::Notice(DownloadNotice::Deleted { .. })
+        )));
+        rig.journal.take();
+        rig.later.clear();
+
+        // Um programa com «Permitir baixar programas»: a pergunta (sem o
+        // cartao do downloads-ui, «nao») recusa e larga a operacao.
+        rig.begin(3, 1, WebViewHost::Column(1), dir.0.join("setup.exe"));
+        assert_eq!(rig.journal.take(), vec!["3 recusado".to_string()]);
+        assert_eq!(rig.ops.borrow().len(), 0);
+
+        // A WebView 1 e destruida com dois downloads a correr; o da WebView
+        // 2 continua.
+        for (id, webview) in [(4, 1), (5, 1), (6, 2)] {
+            rig.begin(
+                id,
+                webview,
+                WebViewHost::Split(0),
+                dir.0.join(format!("grande-{id}.zip")),
+            );
+        }
+        rig.journal.take();
+        assert_eq!(rig.ops.borrow().len(), 3);
+        rig.drive(DownloadEvent::WebViewGone {
+            webview: WebViewKey(1),
+        });
+        assert_eq!(
+            rig.journal.take(),
+            vec!["4 cancelado".to_string(), "5 cancelado".to_string()]
+        );
+        assert!(rig.ops.borrow().of_webview(WebViewKey(1)).is_empty());
+        assert_eq!(
+            rig.ops.borrow().of_webview(WebViewKey(2)),
+            vec![DownloadId(6)]
+        );
+        assert_eq!(rig.manager.active(), 1);
+    }
+
+    /// Gate critico: nada de uma pagina privada nem do Modo privado chega
+    /// ao `downloads.json` -- pela volta inteira do `App`
+    /// (`run_download_event`, com o modo do registo das lojas e a loja
+    /// real). DM-1 da revisao: um download feito no Modo privado entrava no
+    /// registo em memoria, e a gravacao seguinte, ja no modo normal,
+    /// levava-o para o ficheiro.
+    #[test]
+    fn private_downloads_never_reach_downloads_json() {
+        let dir = Scratch::new("private");
+        let mut rig = Rig::with_disk(DownloadManager::default(), &dir.0);
+        let file = rig.store.as_ref().expect("loja").path().to_path_buf();
+
+        // (a) Do Split privado e da Respiracao: recusado, acabado ou com a
+        // WebView destruida, nunca pede gravacao.
+        let private_hosts = [
+            WebViewHost::PrivateSplit(0),
+            WebViewHost::PrivateSplit(2),
+            WebViewHost::Service(Service::Breath),
+        ];
+        for (n, host) in private_hosts.into_iter().enumerate() {
+            let base = 10 * (n as u64 + 1);
+            rig.begin(base, base, host, dir.0.join("setup.exe"));
+            let pdf = dir.0.join(format!("privado-{n}.pdf"));
+            rig.begin(base + 1, base, host, pdf.clone());
+            std::fs::write(&pdf, PDF).expect("pdf");
+            rig.complete(base + 1, &pdf);
+            rig.begin(base + 2, base, host, dir.0.join("grande.zip"));
+            rig.drive(DownloadEvent::WebViewGone {
+                webview: WebViewKey(base),
+            });
+        }
+        assert_eq!(rig.manager.entries().count(), 9);
+        assert!(
+            !rig.later.contains(&DownloadEffect::Persist),
+            "um download privado pediu gravacao: {:?}",
+            rig.later
+        );
+        assert!(
+            rig.manager.log().entries.is_empty(),
+            "{:?}",
+            rig.manager.log()
+        );
+        assert!(
+            !file.exists(),
+            "downloads.json nasceu de downloads privados"
+        );
+
+        // (b) Modo privado, de paginas que nao sao privadas: um PDF que
+        // comecou antes e acaba nele, um que comeca e acaba nele, um
+        // programa recusado nele e um que comeca nele e acaba ja fora.
+        // Nenhum pede gravacao.
+        let before = dir.0.join("comecou-antes.pdf");
+        rig.begin(80, 80, WebViewHost::Column(0), before.clone());
+        rig.set_mode(StoreMode::Private);
+        std::fs::write(&before, PDF).expect("pdf");
+        rig.complete(80, &before);
+        let secret = dir.0.join("segredo-modo-privado.pdf");
+        rig.begin(81, 80, WebViewHost::External, secret.clone());
+        std::fs::write(&secret, PDF).expect("pdf");
+        rig.complete(81, &secret);
+        rig.begin(82, 80, WebViewHost::Column(1), dir.0.join("programa.exe"));
+        let late = dir.0.join("acaba-depois.pdf");
+        rig.begin(83, 80, WebViewHost::Split(0), late.clone());
+        assert!(
+            !rig.later.contains(&DownloadEffect::Persist),
+            "o Modo privado pediu gravacao: {:?}",
+            rig.later
+        );
+        assert!(!file.exists(), "o Modo privado escreveu o downloads.json");
+
+        // (c) De volta ao normal: o que comecou no privado acaba sem
+        // registo; um download novo grava -- e o ficheiro so o tem a ele.
+        rig.set_mode(StoreMode::Normal);
+        std::fs::write(&late, PDF).expect("pdf");
+        rig.complete(83, &late);
+        assert!(
+            !rig.later.contains(&DownloadEffect::Persist),
+            "o que comecou no Modo privado foi registado ao acabar: {:?}",
+            rig.later
+        );
+        rig.begin(90, 90, WebViewHost::External, dir.0.join("normal.exe"));
+        assert!(rig.later.contains(&DownloadEffect::Persist));
+        let text = std::fs::read_to_string(&file).expect("downloads.json");
+        assert!(text.contains("normal.exe"), "{text}");
+        for leaked in [
+            "privado-0",
+            "privado-1",
+            "privado-2",
+            "comecou-antes",
+            "segredo-modo-privado",
+            "programa.exe",
+            "acaba-depois",
+        ] {
+            assert!(!text.contains(leaked), "{leaked} no ficheiro: {text}");
+        }
+        let loaded = rig.store.as_mut().expect("loja").load().into_value();
+        assert_eq!(loaded.entries.len(), 1, "{loaded:?}");
+        assert_eq!(
+            loaded.entries[0].outcome,
+            RecordOutcome::Blocked {
+                reason: BlockReason::Program
+            }
+        );
+    }
+
+    /// Gate critico (DM-2 da revisao): o Ctrl+Shift+Delete tira o
+    /// `downloads.json` do disco -- e a copia `.bak` e o temporario de uma
+    /// gravacao interrompida -- no modo normal, no Modo privado e com a loja
+    /// so de leitura (um ficheiro de uma versao futura). Pelo braco do
+    /// `App` (`DownloadsState::run`, o que o `ClearTarget::Downloads` corre
+    /// com `DownloadEvent::ClearLog`). Antes, o apagar era uma gravacao do
+    /// registo vazio: `SkippedPrivate` no Modo privado, `ReadOnly` com o
+    /// ficheiro degradado, e o ficheiro ficava.
+    #[test]
+    fn clearing_history_takes_downloads_json_off_the_disk() {
+        let record = |name: &str| {
+            serde_json::json!({
+                "name": name,
+                "host": "example.com",
+                "outcome": { "kind": "cancelled" },
+                "at": 1_790_000_000u64
+            })
+        };
+        let file_with = |dir: &Path, version: u32, name: &str| {
+            let body = serde_json::json!({
+                "version": version,
+                "data": { "entries": [record(name)] }
+            });
+            let path = dir.join(DOWNLOADS_LOG_STORE.name);
+            std::fs::write(&path, serde_json::to_vec(&body).expect("json")).expect("registo");
+            path
+        };
+        let clear = |state: &mut DownloadsState, stores: &StoreRegistry| {
+            let run = state.run(
+                downloads_private_mode(Some(stores)),
+                DownloadEvent::ClearLog,
+            );
+            assert_eq!(run.erase_error, None);
+            assert_eq!(run.later, vec![DownloadEffect::EraseLog]);
+        };
+
+        for mode in [StoreMode::Normal, StoreMode::Private] {
+            // (a) Um ficheiro valido, com o modo normal ou privado.
+            let dir = Scratch::new("clear");
+            let file = file_with(&dir.0, LOG_VERSION, "segredo.pdf");
+            let stores = StoreRegistry::mint_for_test(&dir.0);
+            let mut state = DownloadsState::open(Some(&stores));
+            assert_eq!(state.manager.log().entries.len(), 1);
+            stores.set_mode(mode);
+            clear(&mut state, &stores);
+            assert!(!file.exists(), "{mode:?}: o downloads.json ficou");
+            assert!(state.manager.log().entries.is_empty());
+        }
+
+        // (b) Um ficheiro de uma versao futura: a loja fica so de leitura e
+        // guarda uma copia `.bak`; uma gravacao interrompida deixou um
+        // temporario. Tudo sai.
+        let dir = Scratch::new("clear-future");
+        let file = file_with(&dir.0, LOG_VERSION + 1, "segredo.pdf");
+        let backup = dir.0.join(format!("{}.bak", DOWNLOADS_LOG_STORE.name));
+        let temp = dir
+            .0
+            .join(format!(".{}.4242-7.tmp", DOWNLOADS_LOG_STORE.name));
+        std::fs::write(
+            &temp,
+            br#"{"version":1,"data":{"entries":[{"name":"segredo.pdf"}]}}"#,
+        )
+        .expect("temporario");
+        let other = dir.0.join("tabs.json");
+        std::fs::write(&other, b"{}").expect("outro");
+        let stores = StoreRegistry::mint_for_test(&dir.0);
+        let mut state = DownloadsState::open(Some(&stores));
+        assert!(
+            state
+                .log_store
+                .as_ref()
+                .expect("loja")
+                .read_only()
+                .is_some(),
+            "a versao futura nao ficou so de leitura"
+        );
+        assert!(backup.exists(), "a loja nao fez a copia .bak");
+        clear(&mut state, &stores);
+        for left in [&file, &backup, &temp] {
+            assert!(!left.exists(), "{} ficou no disco", left.display());
+        }
+        assert!(other.exists(), "o apagar levou um ficheiro que nao e dele");
+        // Sem ficheiro, a loja volta a gravar: o download seguinte fica.
+        state.run(
+            downloads_private_mode(Some(&stores)),
+            DownloadEvent::Starting(DownloadStart {
+                id: DownloadId(1),
+                webview: WebViewKey(1),
+                private: false,
+                proposed: dir.0.join("setup.exe"),
+                host: None,
+                total: None,
+                at: 0,
+            }),
+        );
+        let text = std::fs::read_to_string(&file).expect("downloads.json");
+        assert!(text.contains("setup.exe"), "{text}");
+        assert!(!text.contains("segredo"), "{text}");
+    }
+
+    /// As definicoes e o registo abrem pelos grants; uma pasta que nao
+    /// existe volta a Transferencias do utilizador -- que vai para o perfil
+    /// do WebView2 em vez de nada (DM-3 da revisao: o perfil guarda a pasta
+    /// de uma sessao para a outra, e so a pondo quando havia escolha a
+    /// antiga ficava).
+    #[test]
+    fn downloads_state_opens_through_grants_and_checks_the_folder() {
+        assert_eq!(DOWNLOADS_SETTINGS_STORE.kind, StoreKind::Setting);
+        assert_eq!(DOWNLOADS_LOG_STORE.kind, StoreKind::Automatic);
+        let system = user_downloads_folder().expect("a pasta Transferencias do utilizador");
+        assert!(system.is_absolute(), "{}", system.display());
+        let dir = Scratch::new("state");
+        let chosen = dir.0.join("baixados");
+        std::fs::create_dir_all(&chosen).expect("pasta");
+        assert_ne!(system, chosen);
+        let write_settings = |folder: &Path, allow: bool| {
+            let body = serde_json::json!({
+                "version": SETTINGS_VERSION,
+                "data": { "folder": folder, "allow_programs": allow }
+            });
+            std::fs::write(
+                dir.0.join("downloads-settings.json"),
+                serde_json::to_vec(&body).expect("json"),
+            )
+            .expect("definicoes");
+        };
+        write_settings(&chosen, true);
+        let state = DownloadsState::open(Some(&StoreRegistry::mint_for_test(&dir.0)));
+        assert_eq!(
+            state.manager.settings().folder.as_deref(),
+            Some(chosen.as_path())
+        );
+        assert!(state.manager.settings().allow_programs);
+        assert_eq!(
+            state.shared.folder.borrow().as_deref(),
+            Some(chosen.as_path())
+        );
+
+        write_settings(&dir.0.join("nao-existe"), false);
+        let state = DownloadsState::open(Some(&StoreRegistry::mint_for_test(&dir.0)));
+        assert_eq!(state.manager.settings().folder, None);
+        assert_eq!(
+            state.shared.folder.borrow().as_deref(),
+            Some(system.as_path()),
+            "sem escolha, o perfil ficava com a pasta antiga"
+        );
+
+        // Sem registo: tudo por omissao, nada gravado, a pasta do sistema.
+        let state = DownloadsState::open(None);
+        assert_eq!(state.manager.settings(), &DownloadSettings::default());
+        assert!(state.log_store.is_none());
+        assert_eq!(
+            state.shared.folder.borrow().as_deref(),
+            Some(system.as_path())
+        );
+        // Sem a pasta do sistema (o Windows nao a deu), nada se poe.
+        assert_eq!(profile_download_folder(None, || None), None);
+        assert_eq!(
+            profile_download_folder(Some(chosen.clone()), || Some(system.clone())),
+            Some(chosen)
+        );
+    }
+
+    /// Amostra (textos): o aviso provisorio de cada razao, com o nome
+    /// marcado quando esconde bidi.
+    #[test]
+    fn download_notice_texts() {
+        let blocked = |name: &str, reason| {
+            download_notice_text(&DownloadNotice::Blocked {
+                id: DownloadId(1),
+                name: name.to_string(),
+                reason,
+            })
+        };
+        assert_eq!(
+            blocked("setup.exe", BlockReason::Program),
+            "Download bloqueado — setup.exe é um programa."
+        );
+        assert_eq!(
+            blocked("fatura.pdf.exe", BlockReason::Masquerade),
+            "Download bloqueado — fatura.pdf.exe finge ser um PDF."
+        );
+        assert_eq!(
+            blocked("foto.jpg   .scr", BlockReason::Masquerade),
+            "Download bloqueado — foto.jpg   .scr finge ser um JPG."
+        );
+        let bidi = blocked("fatura\u{202E}fdp.exe", BlockReason::BadName);
+        assert!(bidi.contains("\u{2039}RLO\u{203A}"), "{bidi}");
+        assert!(!bidi.contains('\u{202E}'), "{bidi}");
+        assert_eq!(
+            download_notice_text(&DownloadNotice::Deleted {
+                id: DownloadId(2),
+                name: "relatorio.pdf".to_string(),
+                reason: DeleteReason::DangerousContent,
+            }),
+            "Download apagado — relatorio.pdf era um programa disfarçado."
         );
     }
 }

@@ -332,9 +332,10 @@ go through one module, `crates/neural-app/src/windows_app/webview_hooks.rs`:
   the module), and after the build they register through WebView2 COM, for
   the same host, the NeuralIA items of the right-click menu
   (`WEBVIEW_MENU_ITEMS`: today only the auto-scroll item, on the columns and
-  on the split, private included) and an `AcceleratorKeyPressed` handler that
-  consults `accelerator_lookup` (`install_webview_hooks`, private to the
-  module).
+  on the split, private included), an `AcceleratorKeyPressed` handler that
+  consults `accelerator_lookup` and, on every `Managed` host, the download
+  manager (`install_webview_hooks`, private to the module; see "Downloads"
+  below).
 
 The host a birth site passes to `hooked_builder` is therefore the only host
 that WebView has, in both halves: a site cannot build without the chain, nor
@@ -418,3 +419,70 @@ the product does not yet wire to `WebResourceRequested`; the gate
 `custom_schemes_are_never_answered_by_the_resource_gate` already holds it to
 never answering a request on `neuralia-pdf`, `neuralia-epub` or
 `neuralia-live` (those are served by their wry custom protocols).
+
+### Downloads
+
+On every `Managed` host `register_download_manager`
+(`crates/neural-app/src/windows_app/downloads.rs`) adds a WebView2
+`DownloadStarting` handler and sets the profile's default download folder
+(`SetDefaultDownloadFolderPath`) to `profile_download_folder`: the folder
+`downloads-settings.json` names when it is an existing absolute folder,
+otherwise the user's Downloads folder (`FOLDERID_Downloads`). WebView2 keeps
+that setting in the profile across sessions, so it is reset whenever no
+folder is chosen. The gate `downloads_state_opens_through_grants_and_checks_the_folder`
+holds the choice of folder; the COM call itself is only exercised by the
+CI-only E2E below, with a chosen folder, on the full Web. The manager also
+asks for the chosen folder on every download (`target_path`, unit-tested
+for a private download too). The handler always takes the deferral and
+hands the download to the pure `neural_core::downloads::DownloadManager`,
+whose effects the app applies:
+
+- start (`decide_start`): a program, script, Windows shortcut, disk image or
+  Access database name is refused with `SetCancel` before any file exists;
+  a masquerade (`fatura.pdf.exe`, a padded extension) or a name with bidi,
+  invisible characters, `:` or a DOS device name is refused with no
+  exception; everything else proceeds. With "Permitir baixar programas" on,
+  a refusable program would wait for a confirmation instead; until that card
+  exists the app answers no, so programs are still refused;
+- progress: `BytesReceivedChanged`, throttled to one event every 250 ms per
+  download before it leaves the handler;
+- end: `StateChanged` forgets the WebView2 operation; a completed file is
+  finalized (`finalize_download`): the first 4 KiB are sniffed, an
+  unconfirmed executable, shortcut or cabinet (or an unreadable file) is
+  deleted, and anything kept gets the mark of the web (`Zone.Identifier`
+  alternate data stream): when the file has none, NeuralIA writes
+  `ZoneId=3` with no `HostUrl`; a mark WebView2 already wrote is left as it
+  is, and that one may carry the `HostUrl`. The E2E below reports who wrote
+  the mark and whether it carries a `HostUrl`;
+- a destroyed WebView: a guard inside the `DownloadStarting` handler sends
+  `WebViewGone` when WebView2 releases the handler, and the manager cancels
+  and forgets that WebView's running downloads. Whether destroying a WebView
+  cancels its download by itself, and when WebView2 releases the handler, is
+  the question of the spike in `scripts/test-downloads.ps1`, which only
+  reports it (in the CI log and the step summary).
+
+Finished downloads are recorded in `downloads.json` (at most 200, name,
+folder, host, size and outcome, never the full URL), an `Automatic` store:
+nothing from the private split or an InPrivate service panel is recorded,
+and nothing that starts or finishes while the store registry is in private
+mode (`StoreMode::Private`, which no product command turns on yet) is
+recorded either, so it never reaches the file once the mode is back to
+normal; in that mode the store writes nothing. `run_download_event`, the
+app's whole `UserEvent::Download` arm, sets the manager's private mode from
+the registry before every event. Ctrl+Shift+Delete (`DownloadEvent::ClearLog`,
+effect `EraseLog`) removes `downloads.json`, its `.bak` copy and an
+interrupted write's temporary file from disk directly, in any mode and even
+when the store is read-only (a future-version or corrupt file), and leaves
+the downloaded files. Gates: `the_start_decision_table`,
+`the_finalize_decision_table`, `motw_is_written_and_read_back_through_the_ads`,
+`private_downloads_are_never_recorded`,
+`nothing_made_in_private_mode_is_ever_recorded` (neural-core) and
+`downloads_are_denied_on_every_local_host_and_managed_on_the_web`,
+`download_ops_follow_the_manager_and_are_cleared_on_finish_and_destroy`,
+`private_downloads_never_reach_downloads_json`,
+`clearing_history_takes_downloads_json_off_the_disk`, with
+`every_webview_gets_the_hooks` requiring the manager on every `Managed` host
+and on no `Deny` host. The CI-only `scripts/test-downloads.ps1` runs the
+tested exe against a 127.0.0.1 fixture: a `setup.exe` is refused; a PDF
+lands in the chosen folder with the mark of the web, NeuralIA's finalize
+ran, and a mark NeuralIA wrote is `ZoneId=3` with no `HostUrl`.
