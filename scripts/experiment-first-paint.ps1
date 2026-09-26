@@ -9,7 +9,12 @@ param(
     [int]$QuietRounds = 2,
     # The first launch on the VM is the only one with a cold WebView2 runtime.
     [string]$FirstGate = "new",
-    [switch]$FirstStress
+    [switch]$FirstStress,
+    # Launches (old then new, each on a fresh profile) with every msedgewebview2
+    # suspended for HoldSec seconds: a WebView2 start slower than 12 s.
+    [int]$HeldRounds = 0,
+    [int]$HoldSec = 15,
+    [switch]$SkipFirst
 )
 $ErrorActionPreference = "Stop"
 New-Item -ItemType Directory -Force $OutDir | Out-Null
@@ -37,7 +42,7 @@ function Stop-Stress($procs) {
     foreach ($p in $procs) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
 }
 
-function Invoke-Launch([string]$Label, [string]$Gate, [bool]$FreshProfile, [bool]$Stress) {
+function Invoke-Launch([string]$Label, [string]$Gate, [bool]$FreshProfile, [bool]$Stress, [bool]$Hold = $false) {
     $profileDir = ""
     if ($FreshProfile) {
         $profileDir = Join-Path $env:RUNNER_TEMP ("wv2-" + [Guid]::NewGuid().ToString("N"))
@@ -47,6 +52,18 @@ function Invoke-Launch([string]$Label, [string]$Gate, [bool]$FreshProfile, [bool
     $json = Join-Path $OutDir "$Label.json"
     $log = Join-Path $OutDir "$Label.applog.txt"
     $console = Join-Path $OutDir "$Label.console.txt"
+    $holdReport = Join-Path $OutDir "$Label.hold.txt"
+    $holder = $null
+    if ($Hold) {
+        $ready = Join-Path $env:RUNNER_TEMP ("hold-ready-" + [Guid]::NewGuid().ToString("N"))
+        $holder = Start-Process pwsh -PassThru -WindowStyle Hidden -ArgumentList @(
+            "-NoProfile", "-File", (Resolve-Path ./scripts/experiment-hold-webview2.ps1).Path,
+            "-HoldSec", "$HoldSec", "-ReadyFile", $ready, "-ReportFile", $holdReport
+        )
+        $w = [Diagnostics.Stopwatch]::StartNew()
+        while (-not (Test-Path $ready) -and $w.Elapsed.TotalSeconds -lt 60) { Start-Sleep -Milliseconds 100 }
+        if (-not (Test-Path $ready)) { throw "hold fixture did not start" }
+    }
     $passed = $false
     $watch = [Diagnostics.Stopwatch]::StartNew()
     try {
@@ -71,6 +88,10 @@ function Invoke-Launch([string]$Label, [string]$Gate, [bool]$FreshProfile, [bool
         $env:WEBVIEW2_USER_DATA_FOLDER = $null
         $env:NEURALIA_DEBUG_LOG = $null
         Stop-Stress $stressProcs
+        if ($holder) {
+            $holder.WaitForExit(($HoldSec + 30) * 1000) | Out-Null
+            Stop-Process -Id $holder.Id -Force -ErrorAction SilentlyContinue
+        }
         Get-Process msedgewebview2 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
         Get-Process NeuralIA -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 1
@@ -94,7 +115,13 @@ function Invoke-Launch([string]$Label, [string]$Gate, [bool]$FreshProfile, [bool
     } else {
         $appLines = if (Test-Path $log) { @(Get-Content $log) } else { @() }
         $row.verdict = if ($passed) { "old-ok" } else { "old-fail" }
+        if (Test-Path $console) {
+            $text = Get-Content $console -Raw
+            $m = [regex]::Match($text, '"distinct_visible_wry_webview_rects":\s*(\d+)')
+            if ($m.Success) { $row.verdict += " (" + $m.Groups[1].Value + " surf: " + (([regex]::Matches($text, '\d+,\d+,\d+,\d+') | ForEach-Object Value) -join " ") + ")" }
+        }
     }
+    if (Test-Path $holdReport) { $row.verdict += " [" + (Get-Content $holdReport -Raw).Trim() + "]" }
     # Column build durations from the app log (ms since the first log line).
     $starts = @{}; $parts = @()
     foreach ($line in $appLines) {
@@ -111,8 +138,15 @@ function Invoke-Launch([string]$Label, [string]$Gate, [bool]$FreshProfile, [bool
 }
 
 # 1. Exactly the CI condition: first WebView2 launch on this VM, product profile.
-$firstLabel = "00-natural-" + $(if ($FirstStress) { "stress-" } else { "" }) + $FirstGate
-Invoke-Launch $firstLabel $FirstGate $false ([bool]$FirstStress)
+if (-not $SkipFirst) {
+    $firstLabel = "00-natural-" + $(if ($FirstStress) { "stress-" } else { "" }) + $FirstGate
+    Invoke-Launch $firstLabel $FirstGate $false ([bool]$FirstStress)
+}
+# WebView2 held for HoldSec: old and new alternately, fresh profile each.
+for ($k = 1; $k -le $HeldRounds; $k++) {
+    Invoke-Launch ("{0:D2}-held-old" -f (20 + $k)) "old" $true $false $true
+    Invoke-Launch ("{0:D2}-held-new" -f (20 + $k)) "new" $true $false $true
+}
 # 2. Old and new alternately on a fresh WebView2 profile, under load and quiet.
 for ($k = 1; $k -le $StressRounds; $k++) {
     Invoke-Launch ("{0:D2}-stress-old" -f $k) "old" $true $true
