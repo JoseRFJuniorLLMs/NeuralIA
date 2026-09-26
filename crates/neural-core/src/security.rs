@@ -1,8 +1,45 @@
 use std::net::IpAddr;
 
+use ureq::{
+    config::Config,
+    http::Uri,
+    unversioned::{
+        resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver},
+        transport::NextTimeout,
+    },
+};
 use url::{Host, Url};
 
 use crate::{NeuralError, Result};
+
+#[derive(Debug, Default)]
+pub(crate) struct PublicResolver {
+    inner: DefaultResolver,
+}
+
+impl Resolver for PublicResolver {
+    fn resolve(
+        &self,
+        uri: &Uri,
+        config: &Config,
+        timeout: NextTimeout,
+    ) -> std::result::Result<ResolvedSocketAddrs, ureq::Error> {
+        let resolved = self.inner.resolve(uri, config, timeout)?;
+        let mut safe = self.inner.empty();
+
+        for address in &resolved {
+            if !is_forbidden_ip(address.ip()) {
+                safe.push(*address);
+            }
+        }
+
+        if safe.is_empty() {
+            Err(ureq::Error::HostNotFound)
+        } else {
+            Ok(safe)
+        }
+    }
+}
 
 pub fn validate_web_url(input: &str) -> Result<Url> {
     let url = Url::parse(input).map_err(|_| NeuralError::InvalidUrl(input.to_string()))?;
