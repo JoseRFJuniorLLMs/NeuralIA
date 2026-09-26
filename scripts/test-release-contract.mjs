@@ -272,6 +272,81 @@ for (const line of windowsBuild.split('\n').filter((text) => /\bcargo\s/.test(te
   assert.doesNotMatch(line, /(^|\s)-F/, `the windows job never passes -F to cargo: ${line.trim()}`);
 }
 
+// The CI-only feature `test-stores` (infra-settings-keys, 2.3 plan): neural-core's
+// `StoreRegistry::mint_for_test` (a store registry that does not spend the
+// once-per-process mint) compiles only in neural-core's own tests and with this
+// feature, and only neural-app's [dev-dependencies] enable it. Behaviour: the
+// windows job asks `cargo tree` for the normal build graph (the one the release
+// build uses) and fails if it enables the feature. These assertions keep that
+// wiring from being edited away.
+const manifests = [
+  'Cargo.toml',
+  'crates/neural-core/Cargo.toml',
+  'crates/neural-app/Cargo.toml',
+  'crates/neural-setup/Cargo.toml',
+];
+const testStoresUses = [];
+for (const file of manifests) {
+  let section = '';
+  for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const header = line.match(/^\[(.+)\]\s*$/);
+    if (header) {
+      section = header[1];
+    } else if (!/^\s*#/.test(line) && /test-stores/.test(line)) {
+      testStoresUses.push(`${file} [${section}] ${line.trim()}`);
+    }
+  }
+}
+assert.deepEqual(
+  testStoresUses,
+  [
+    'crates/neural-core/Cargo.toml [features] test-stores = []',
+    'crates/neural-app/Cargo.toml [dev-dependencies] neural-core = { path = "../neural-core", features = ["test-stores"] }',
+  ],
+  'test-stores is declared by neural-core, pulls no crate, and only neural-app [dev-dependencies] enable it'
+);
+const coreFeatures = fs
+  .readFileSync('crates/neural-core/Cargo.toml', 'utf8')
+  .match(/\n\[features\]\n([\s\S]*?)(?=\n\[)/);
+assert.ok(coreFeatures, 'neural-core declares its [features] table');
+assert.match(coreFeatures[1], /^default = \[\]$/m, 'neural-core has no default features');
+const jsonStore = fs.readFileSync('crates/neural-core/src/json_store.rs', 'utf8').replace(/\r\n/g, '\n');
+assert.match(
+  jsonStore,
+  /#\[cfg\(any\(test, feature = "test-stores"\)\)\]\n {4}pub fn mint_for_test\(/,
+  'mint_for_test compiles only in tests and with test-stores'
+);
+assert.equal(
+  (jsonStore.match(/^\s*pub fn mint_for_test\(/gm) || []).length,
+  1,
+  'mint_for_test is declared once'
+);
+const testStoresStepName = '      - name: Published exe has the test-stores feature off\n';
+assert.equal(
+  windowsJob.split(testStoresStepName).length - 1,
+  1,
+  'the windows job checks the test-stores feature once'
+);
+const testStoresStep = windowsJob
+  .slice(windowsJob.indexOf(testStoresStepName) + testStoresStepName.length)
+  .split('\n      - ')[0];
+assert.doesNotMatch(testStoresStep, /^\s+if:/m, 'the test-stores check has no if');
+assert.match(
+  testStoresStep,
+  /cargo tree --locked -p neural-app --target x86_64-pc-windows-msvc -e features,no-dev -i neural-core/,
+  'the test-stores check reads the normal build graph'
+);
+assert.match(
+  testStoresStep,
+  /if \(\$normal -match 'test-stores'\) \{\n\s+throw /,
+  'the test-stores check fails when the normal build graph enables the feature'
+);
+assert.ok(
+  windowsJob.indexOf(testStoresStepName) >
+    windowsJob.indexOf('- run: cargo build --locked -p neural-app --bin NeuralIA --release\n'),
+  'the test-stores check follows the release build of the windows job'
+);
+
 // The spike runs only in its own workflow, on pull requests and by hand.
 const spikeFile = 'accel-spike.yml';
 const spike = workflows.get(spikeFile);
@@ -351,4 +426,5 @@ assert.doesNotMatch(buildScript, /accel-spike|--features|--all-features/, 'the i
 
 console.log('release contract: single public installer asset (neural-setup around the CI-tested binary)');
 console.log('release contract: the published exe is built without the accel-spike feature');
+console.log('release contract: the published exe is built without the test-stores feature');
 console.log('release contract: the accelerator spike runs outside the CI workflow that release.yml waits for');

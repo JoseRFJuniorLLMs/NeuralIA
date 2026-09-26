@@ -75,6 +75,11 @@ windows-sys = { version = "0.61.2", features = [
 # Os testes do leitor de EPUB montam livros num ZIP escrito à mão (stored e
 # deflate). O flate2 já está no Cargo.lock (via neural-core); nenhum crate novo.
 flate2 = "1.1.10"
+# So nos testes: o neural-core com a feature de CI `test-stores`
+# (`StoreRegistry::mint_for_test`). O resolver 2 nao a leva ao build normal:
+# o exe publicado tem-na desligada (passo "Published exe has the test-stores
+# feature off" do ci.yml, preso em scripts/test-release-contract.mjs).
+neural-core = { path = "../neural-core", features = ["test-stores"] }
 
 [build-dependencies]
 winres = "0.1.12"

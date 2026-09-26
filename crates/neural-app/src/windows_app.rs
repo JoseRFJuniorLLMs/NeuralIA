@@ -17,9 +17,7 @@ use std::{
 use image::RgbaImage;
 
 use crate::epub_app::{EPUB_SCHEME, EpubJob, EpubNotice, EpubRuntime, EpubUiRequest};
-use crate::gemini_live::{
-    LiveIndicator, LiveMessage, LivePanel, live_theme_script, redact_debug_secrets,
-};
+use crate::gemini_live::{LiveIndicator, LiveMessage, LivePanel, live_theme_script};
 #[cfg(test)]
 use crate::ipc::constant_time_eq;
 use crate::ipc::{
@@ -33,7 +31,9 @@ use crate::panel_chrome::{
 };
 use crate::pomodoro_ui::{PomodoroController, TickSchedule, TickScheduler, phase_color};
 use crate::read_aloud::READ_ALOUD_SCRIPT;
+use crate::secrets::redact_debug_secrets;
 use crate::tab_session::{self, Loaded, SessionColumn, SessionGroup, SessionTab, TabSession};
+use neural_core::json_store::StoreRegistry;
 use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentRuntimeConfig,
     AgentSecurityAction, CoreConfig, FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent,
@@ -101,6 +101,9 @@ pub(in crate::windows_app) enum UserEvent {
     /// O tema (`theme.rs`): a unica variante do modulo, com o enum dele
     /// dentro. E o padrao de cada feature: uma variante aqui, o resto la.
     Theme(ThemeEvent),
+    /// O pedido de chave nativo (`secret_prompt.rs`): Enter com uma chave
+    /// com a forma do slot, "Esquecer chave" ou cancelar.
+    Keys(KeyEvent),
     /// Pedido da pagina local do painel lateral (canal proprio), com o
     /// numero da pagina que o mandou.
     Panel(side_panel::PanelPost),
@@ -3130,6 +3133,14 @@ pub(in crate::windows_app) struct App {
     /// Painel do Gemini Live, com o estado do olho da barra. Existir e estar
     /// ligado: fecha-lo desliga tudo.
     pub(in crate::windows_app) live_panel: LivePanel<WebView>,
+    /// O registo das lojas (`neural_core::json_store`), cunhado aqui -- a
+    /// unica cunhagem do produto. So ele passa os grants que abrem as lojas;
+    /// o infra-privacy-guard muda-o para o `PrivacyGuard`. `None` so se o
+    /// processo ja o tivesse cunhado, o que nao acontece: ha um `App` por
+    /// processo.
+    pub(in crate::windows_app) stores: Option<StoreRegistry>,
+    /// O pedido de chave nativo e o cofre das chaves (`secret_prompt.rs`).
+    pub(in crate::windows_app) keys: KeysState,
 }
 
 impl App {
@@ -3176,6 +3187,10 @@ impl App {
             Arc::clone(&navigation_generation),
         );
         let tab_session = TabPersistence::open(&config.data_dir);
+        // A unica cunhagem do registo das lojas no produto. Nao toca no
+        // disco: so os grants, pedidos depois, dizem onde cada loja vive.
+        let stores = StoreRegistry::mint(&config.data_dir).ok();
+        let keys = KeysState::new(proxy.clone());
         Self {
             document,
             pdf_bytes: Arc::new(Mutex::new(Vec::new())),
@@ -3251,6 +3266,8 @@ impl App {
             epub: None,
             pending_drops: Vec::new(),
             live_panel: LivePanel::off(),
+            stores,
+            keys,
         }
     }
 }
@@ -6949,6 +6966,10 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ),
     ("services.rs", include_str!("windows_app/services.rs")),
     ("search_card.rs", include_str!("windows_app/search_card.rs")),
+    (
+        "secret_prompt.rs",
+        include_str!("windows_app/secret_prompt.rs"),
+    ),
     ("toast.rs", include_str!("windows_app/toast.rs")),
     ("popup_menu.rs", include_str!("windows_app/popup_menu.rs")),
     ("native_card.rs", include_str!("windows_app/native_card.rs")),
@@ -7015,6 +7036,8 @@ pub(in crate::windows_app) mod services;
 pub(in crate::windows_app) use services::*;
 pub(in crate::windows_app) mod search_card;
 pub(in crate::windows_app) use search_card::*;
+pub(in crate::windows_app) mod secret_prompt;
+pub(in crate::windows_app) use secret_prompt::*;
 pub(in crate::windows_app) mod toast;
 pub(in crate::windows_app) use toast::*;
 pub(in crate::windows_app) mod popup_menu;
