@@ -55,6 +55,19 @@ mod windows_app;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod pomodoro_ui;
 
+// A saida da IA (infra-egress, plano 2.3): o portao que decide se um dado
+// sai para um modelo (consentimento, segundo plano, modo privado, limite
+// mensal), as definicoes e o consumo em `ai/`, e o worker que so nasce no
+// primeiro trabalho. Portateis, testados tambem no Linux. A Traducao (G13) e
+// a primeira feature a pedir o portao (`App::egress_gate`); ate la o
+// dead_code so e exigido nos testes do Windows, que os usam todos.
+#[cfg_attr(not(all(test, target_os = "windows")), allow(dead_code))]
+mod ai_settings;
+#[cfg_attr(not(all(test, target_os = "windows")), allow(dead_code))]
+mod egress;
+#[cfg_attr(not(all(test, target_os = "windows")), allow(dead_code))]
+mod lazy_worker;
+
 // Centro de avisos (infra-notify-popups): a fila, a entrega pelo Foco e pela
 // privacidade e o unico aviso do canto, sem Win32 -- testado tambem no Linux.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]

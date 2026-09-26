@@ -42,3 +42,17 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
 #note-preview{white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5;max-height:30vh;overflow:auto;padding:8px 10px;border-radius:10px;background:var(--surface)}
 .confirm{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px;border-radius:12px;border:1px solid #e81123;font-size:13px}
 .confirm[hidden]{display:none}
+.toggle{display:flex;gap:10px;align-items:center;font-size:14px;cursor:pointer}
+.toggle input{width:18px;height:18px;accent-color:var(--accent);margin:0}
+.dl-hint{padding:0 18px 8px}
+.dl{padding:9px 10px;border-radius:10px}
+.dl:hover{background:var(--surface)}
+.dl[data-tone="blocked"] .title{color:var(--muted);text-decoration:line-through}
+.dl[data-tone="warn"] .detail{color:#c27c0e}
+.dl-bar{height:4px;border-radius:999px;background:var(--line);margin:7px 0 2px;overflow:hidden}
+.dl-bar[hidden]{display:none}
+.dl-fill{height:100%;background:var(--accent);border-radius:999px}
+.dl-bar.busy .dl-fill{opacity:.45}
+.dl-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
+.dl-actions[hidden],.dl-actions .btn[hidden]{display:none}
+.dl-actions .btn{padding:5px 12px;font-size:12px}

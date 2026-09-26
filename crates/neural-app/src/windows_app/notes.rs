@@ -119,7 +119,8 @@ pub(super) fn track_note_draft(draft: &mut Option<NoteEdit>, message: &PanelMess
         | PanelMessage::NotesSearch(_)
         | PanelMessage::NoteOpen(_)
         | PanelMessage::NoteSaveRefused
-        | PanelMessage::NoteDelete(_) => {}
+        | PanelMessage::NoteDelete(_)
+        | PanelMessage::Downloads(_) => {}
     }
 }
 
@@ -317,7 +318,8 @@ pub(super) fn notes_command_for(message: PanelMessage) -> Option<NotesCommand> {
         PanelMessage::Ready
         | PanelMessage::Search(_)
         | PanelMessage::Open(_)
-        | PanelMessage::Close => {
+        | PanelMessage::Close
+        | PanelMessage::Downloads(_) => {
             return None;
         }
     })

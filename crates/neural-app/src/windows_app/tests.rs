@@ -1346,9 +1346,11 @@ fn panel_html_is_assembled_from_its_section_assets() {
         "panel.css",
         "history.html",
         "notes.html",
+        "downloads.html",
         "core.js",
         "history.js",
         "notes.js",
+        "downloads.js",
         "tabs.js",
     ] {
         let asset = std::fs::read_to_string(root.join(name))
@@ -1659,7 +1661,8 @@ fn column_buttons_fit_or_vanish() {
 
 /// Gate do registo do canto direito (`RIGHT_CLUSTER`): pela ordem, sem
 /// sobreposicao, cada lugar volta a ser ele proprio no hit-testing, e a
-/// lista traz os servicos pela ordem de `RightControls::services`.
+/// lista traz os servicos pela ordem de `RightControls::services` e a seta
+/// dos downloads (downloads-ui) logo antes do Privado.
 #[test]
 fn right_cluster_slots_never_overlap_and_hit_back() {
     let service_hits: Vec<BarHit> = RIGHT_CLUSTER[1..5].iter().map(|slot| slot.hit).collect();
@@ -1673,7 +1676,9 @@ fn right_cluster_slots_never_overlap_and_hit_back() {
         ]
     );
     assert_eq!(RIGHT_CLUSTER[0].hit, BarHit::GeminiLive);
-    assert_eq!(RIGHT_CLUSTER[5].hit, BarHit::Private);
+    assert_eq!(RIGHT_CLUSTER[5].hit, BarHit::Downloads);
+    assert_eq!(RIGHT_CLUSTER[5].icon, ICON_SLOT_DOWNLOADS);
+    assert_eq!(RIGHT_CLUSTER[6].hit, BarHit::Private);
     let mut icons: Vec<usize> = RIGHT_CLUSTER.iter().map(|slot| slot.icon).collect();
     icons.sort_unstable();
     icons.dedup();
@@ -1685,6 +1690,11 @@ fn right_cluster_slots_never_overlap_and_hit_back() {
                 let at = format!("{width}px x{scale} gaveta={split_active}");
                 let mut previous_right = 0.0f64;
                 for (slot, rect) in RIGHT_CLUSTER.iter().zip(controls.cluster()) {
+                    // A seta dos downloads cabe ou nao existe.
+                    if slot.hit == BarHit::Downloads && !downloads_slot_fits(width as f64, scale) {
+                        assert_eq!(rect.width, 0.0, "{at}: a seta existe sem caber");
+                        continue;
+                    }
                     assert!(
                         rect.width > 0.0 && rect.height > 0.0,
                         "{at}: {:?} sem tamanho",
@@ -1707,6 +1717,58 @@ fn right_cluster_slots_never_overlap_and_hit_back() {
             }
         }
     }
+}
+
+/// Gate (a seta dos downloads cabe ou nao existe, downloads-ui): de 720 a
+/// 2560 px, a 1x, 1,5x e 2x, com e sem gaveta, a seta existe se e so se a
+/// janela tem `DOWNLOADS_SLOT_MIN_WIDTH` px logicos; sem ela, nenhum ponto
+/// da linha a acerta e o resto do canto fica onde estava sem ela (o Gemini
+/// Live nao anda). Com ela, as tres IAs mantem a pilula, o "+" e os ‹ ›
+/// (`the_tools_never_take_room_from_the_ai_columns`, que corre sobre a
+/// mesma `right_controls`).
+#[test]
+fn downloads_slot_fits_or_vanishes() {
+    let mut present = 0usize;
+    let mut absent = 0usize;
+    for scale in [1.0, 1.5, 2.0] {
+        for width in (720..=2560).step_by(10) {
+            let width = width as f64;
+            for split_active in [false, true] {
+                let controls = right_controls(width, scale, split_active, None);
+                let at = format!("{width}px x{scale} gaveta={split_active}");
+                let fits = width / scale >= DOWNLOADS_SLOT_MIN_WIDTH;
+                assert_eq!(downloads_slot_fits(width, scale), fits, "{at}");
+                let rect = controls.downloads;
+                let row_y = rect.y + rect.height / 2.0;
+                let hits_it = (0..(width as i32)).any(|x| {
+                    right_controls_hit(controls, x as f64 + 0.5, row_y) == Some(BarHit::Downloads)
+                });
+                if fits {
+                    present += 1;
+                    assert!(rect.width > 0.0, "{at}: a seta cabia e sumiu");
+                    assert_eq!(rect.width, controls.private.width, "{at}");
+                    assert!(hits_it, "{at}: a seta nao se clica");
+                    assert!(rect.x + rect.width <= controls.private.x, "{at}");
+                    assert!(
+                        controls.services[3].x + controls.services[3].width <= rect.x,
+                        "{at}"
+                    );
+                } else {
+                    absent += 1;
+                    assert_eq!(rect.width, 0.0, "{at}: a seta existe sem caber");
+                    assert!(!hits_it, "{at}: um clique acerta a seta que nao existe");
+                    // O Gmail encosta ao Privado, como antes da seta.
+                    let gap =
+                        controls.private.x - (controls.services[3].x + controls.services[3].width);
+                    assert!((gap - 4.0 * scale).abs() < 1e-6, "{at}: {gap}");
+                }
+            }
+        }
+    }
+    assert!(
+        present > 0 && absent > 0,
+        "{present} com seta, {absent} sem"
+    );
 }
 
 #[test]
@@ -2890,6 +2952,10 @@ impl ToastHost for ToastLog {
     fn hide_toast_after(&mut self, token: u64, delay: Duration) {
         self.log
             .push(format!("some {token} em {} ms", delay.as_millis()));
+    }
+
+    fn open_downloads(&mut self) {
+        self.log.push("abre downloads".to_string());
     }
 
     fn open_service(&mut self, service: Service) {
@@ -9663,12 +9729,14 @@ fn origin_kind(origin: CommandOrigin) -> OriginKind {
 
 /// O `AcceleratorKeyPressed` de cada WebView consulta `accelerator_lookup`
 /// e so marca `Handled` quando ela prende a tecla. Com o mapa do produto
-/// ela hoje nao prende nenhuma, em nenhum hospedeiro: nem os dez atalhos
-/// nativos do plano da 2.3 (cada um entra no PR do seu comando), nem os da
-/// janela e da omnibox (nas paginas continuam a ser do
-/// `NEURALIA_KEYMAP_SCRIPT`), nem com a tecla presa, nem na subida.
+/// ela hoje prende so o Ctrl+J dos Downloads (downloads-ui, `Global`), em
+/// cada hospedeiro menos o monitor do Gmail -- a descida e a repeticao,
+/// nunca a subida, e o comando so na primeira descida. Nenhum outro dos
+/// dez atalhos nativos do plano da 2.3 (cada um entra no PR do seu
+/// comando), nem os da janela e da omnibox (nas paginas continuam a ser do
+/// `NEURALIA_KEYMAP_SCRIPT`).
 #[test]
-fn accelerator_lookup_binds_no_webview_chord_today() {
+fn accelerator_lookup_binds_only_the_downloads_chord_on_webviews() {
     let mut chords = vec![
         Chord::ctrl(b'D'),
         Chord::ctrl(b'J'),
@@ -9686,29 +9754,61 @@ fn accelerator_lookup_binds_no_webview_chord_today() {
     for row in COMMANDS {
         chords.extend(row.chords.iter().map(|spec| spec.chord));
     }
+    let ctrl_j = Chord::ctrl(b'J');
     let hosts = every_host();
     let mut consulted = 0usize;
+    let mut bound = 0usize;
     for &host in &hosts {
         for &chord in &chords {
-            for input in [
-                press(chord),
-                AcceleratorInput {
-                    repeat: true,
-                    ..press(chord)
-                },
-                AcceleratorInput {
-                    down: false,
-                    ..press(chord)
-                },
-            ] {
-                let decision = accelerator_lookup(product_keymap(), host, input);
-                assert!(!decision.handled, "{host:?} {chord:?} {input:?}");
-                assert!(decision.event.is_none(), "{host:?} {chord:?} {input:?}");
-                consulted += 1;
+            let held = |input: AcceleratorInput| AcceleratorInput {
+                repeat: true,
+                ..input
+            };
+            let up = |input: AcceleratorInput| AcceleratorInput {
+                down: false,
+                ..input
+            };
+            let decision = accelerator_lookup(product_keymap(), host, press(chord));
+            let repeat = accelerator_lookup(product_keymap(), host, held(press(chord)));
+            let release = accelerator_lookup(product_keymap(), host, up(press(chord)));
+            consulted += 3;
+            assert!(
+                !release.handled && release.event.is_none(),
+                "{host:?} {chord:?}: a subida foi tratada"
+            );
+            if chord == ctrl_j && host != WebViewHost::GmailMonitor {
+                assert!(decision.handled, "{host:?}: o Ctrl+J chegou a pagina");
+                assert!(
+                    matches!(
+                        decision.event,
+                        Some(UserEvent::RunCommandKey {
+                            key: CommandId::Downloads,
+                            origin: CommandOrigin::Host(from),
+                        }) if from == host
+                    ),
+                    "{host:?}: {:?}",
+                    decision.event
+                );
+                assert!(repeat.handled && repeat.event.is_none(), "{host:?}");
+                bound += 1;
+            } else {
+                assert!(!decision.handled, "{host:?} {chord:?}");
+                assert!(decision.event.is_none(), "{host:?} {chord:?}");
+                assert!(
+                    !repeat.handled && repeat.event.is_none(),
+                    "{host:?} {chord:?}"
+                );
             }
         }
     }
     assert_eq!(consulted, hosts.len() * chords.len() * 3);
+    // Cada hospedeiro com teclado, uma vez por cada Ctrl+J da lista.
+    let with_keyboard = hosts
+        .iter()
+        .filter(|host| **host != WebViewHost::GmailMonitor)
+        .count();
+    let listed = chords.iter().filter(|chord| **chord == ctrl_j).count();
+    assert_eq!(bound, with_keyboard * listed);
 }
 
 /// Gate (critico: uma pagina nao sintetiza comandos): a tabela da decisao.
@@ -9870,14 +9970,16 @@ fn accelerator_decision_table() {
             }
         }
     }
-    assert_eq!(window_chords, 2 * 7);
+    // Os sete da 2.2.0 e o Ctrl+J `Global` dos Downloads.
+    assert_eq!(window_chords, 2 * 8);
 }
 
 /// Gate (critico): um atalho por ambito. Dois comandos com a mesma tecla no
 /// mesmo ambito recusam a tabela inteira -- nunca "ganha o ultimo" --, e a
 /// mesma tecla em ambitos diferentes e de cada um. O registo do produto
-/// vira mapa, cada comando tem uma linha e so o ambito da janela tem
-/// atalhos: os da 2.2.0, nenhum novo (regra C13).
+/// vira mapa, cada comando tem uma linha, e os atalhos sao os da 2.2.0 (no
+/// ambito da janela) mais os que cada feature da 2.3 trouxe com o seu
+/// comando (regra C13): o Ctrl+J `Global` dos Downloads.
 #[test]
 fn keymap_chords_are_unique_per_scope() {
     use CommandId::{History, Home};
@@ -9919,24 +10021,33 @@ fn keymap_chords_are_unique_per_scope() {
         );
         assert_eq!(row.id.key(), row.key);
     }
-    // So a janela e a omnibox tem atalhos, e sao os da 2.2.0.
-    let mut window = Vec::new();
+    // Os da 2.2.0 na janela e na omnibox, e os que a 2.3 trouxe com o seu
+    // comando -- nenhum outro.
+    let mut registered = Vec::new();
     for row in COMMANDS {
         for spec in row.chords {
-            assert_eq!(spec.scope, KeyScope::Window, "{:?}: atalho novo", row.id);
-            window.push((row.id, spec.chord));
+            registered.push((row.id, spec.scope, spec.chord));
         }
     }
     assert_eq!(
-        window,
+        registered,
         [
-            (CommandId::AutoScroll, Chord::ctrl(b'R')),
-            (CommandId::Reload, Chord::ctrl_shift(b'R')),
-            (CommandId::History, Chord::ctrl(b'H')),
-            (CommandId::NewTab, Chord::ctrl(b'N')),
-            (CommandId::OpenEpub, Chord::ctrl(b'O')),
-            (CommandId::NewNote, Chord::ctrl_shift(b'Z')),
-            (CommandId::ClearHistory, Chord::ctrl_shift(0x2E)),
+            (CommandId::AutoScroll, KeyScope::Window, Chord::ctrl(b'R')),
+            (CommandId::Reload, KeyScope::Window, Chord::ctrl_shift(b'R')),
+            (CommandId::History, KeyScope::Window, Chord::ctrl(b'H')),
+            (CommandId::NewTab, KeyScope::Window, Chord::ctrl(b'N')),
+            (CommandId::OpenEpub, KeyScope::Window, Chord::ctrl(b'O')),
+            (
+                CommandId::NewNote,
+                KeyScope::Window,
+                Chord::ctrl_shift(b'Z')
+            ),
+            (
+                CommandId::ClearHistory,
+                KeyScope::Window,
+                Chord::ctrl_shift(0x2E)
+            ),
+            (CommandId::Downloads, KeyScope::Global, Chord::ctrl(b'J')),
         ]
     );
 
@@ -10442,6 +10553,10 @@ fn resolve_command_runs_against_its_origin() {
         (CommandId::CloseSplit, UserEvent::CloseSplit),
         (CommandId::SplitFullscreen, UserEvent::ToggleSplitFullscreen),
         (CommandId::Exit, UserEvent::ExitRequested),
+        (
+            CommandId::Downloads,
+            UserEvent::DownloadsUi(DownloadsUiEvent::Show),
+        ),
     ];
     assert_eq!(chrome.len(), CommandId::ALL.len());
     for (id, event) in chrome {
@@ -10633,7 +10748,7 @@ fn every_command_row_names_itself_for_the_palette() {
 /// clique faz.
 #[test]
 fn bar_hit_command_is_exhaustive() {
-    use CommandId::{CloseSplit, Exit, Home, SplitFullscreen};
+    use CommandId::{CloseSplit, Downloads, Exit, Home, SplitFullscreen};
     let hits = [
         (BarHit::Home, Some(Home)),
         (BarHit::Back, None),
@@ -10672,6 +10787,7 @@ fn bar_hit_command_is_exhaustive() {
         (BarHit::GmailToggle, None),
         (BarHit::Tool(Tool::Pomodoro), None),
         (BarHit::GeminiLive, None),
+        (BarHit::Downloads, Some(Downloads)),
         (BarHit::WindowMinimize, None),
         (BarHit::WindowMaximize, None),
         (BarHit::WindowClose, Some(Exit)),
@@ -10684,6 +10800,10 @@ fn bar_hit_command_is_exhaustive() {
         (BarHit::SplitClose, UserEvent::CloseSplit),
         (BarHit::SplitExpand, UserEvent::ToggleSplitFullscreen),
         (BarHit::WindowClose, UserEvent::ExitRequested),
+        (
+            BarHit::Downloads,
+            UserEvent::DownloadsUi(DownloadsUiEvent::Show),
+        ),
     ] {
         let command = bar_hit_command(hit).expect("comando");
         assert_eq!(
@@ -10788,7 +10908,8 @@ fn the_window_and_the_omnibox_share_one_keymap() {
         assert_eq!(command(&window), command(&omnibox), "{chord:?}");
         bound += usize::from(window.handled);
     }
-    assert_eq!(bound, 7);
+    // Os sete da 2.2.0 e o Ctrl+J dos Downloads (o do registo e o da lista).
+    assert_eq!(bound, 9);
     // Os dois caminhos passam pelo mapa (presenca); a lista antiga saiu.
     let source = shipped_source();
     assert!(source.contains("let decision = keymap_decision(input, CommandOrigin::Window);"));
@@ -20630,7 +20751,7 @@ process.stdout.write(JSON.stringify({
 
     /// Corre o `PANEL_HTML` que embarca (com o tema posto por
     /// `panel_html`) e depois cada passo, pela ordem, no mesmo contexto.
-    fn run_panel(steps: &[String]) -> serde_json::Value {
+    pub(super) fn run_panel(steps: &[String]) -> serde_json::Value {
         let input = serde_json::json!({
             "html": panel_html(&Theme::dark((0, 120, 215))),
             "steps": steps,
@@ -20647,7 +20768,7 @@ process.stdout.write(JSON.stringify({
         result
     }
 
-    fn posted(result: &serde_json::Value) -> Vec<String> {
+    pub(super) fn posted(result: &serde_json::Value) -> Vec<String> {
         result["posted"]
             .as_array()
             .expect("posted")
@@ -23391,6 +23512,171 @@ fn without_comment_lines(code: &str) -> String {
         .join("\n")
 }
 
+/// O codigo Rust de `source` com os comentarios (de linha, de bloco,
+/// aninhados) e os literais (strings, raw strings, bytes, chars) trocados
+/// por espacos; as quebras de linha ficam. Os gates de "quem chama X" olham
+/// so para o que compila, com qualquer formatacao: um `show_home` num
+/// comentario ou numa linha do log nao conta; um `Self::show_home` passado
+/// como funcao conta.
+fn rust_code_only(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    // Um `r` que abre uma raw string: nada de identificador antes, ou so o
+    // prefixo `b`/`c` (`br#"..."#`). Um `"` ou um `'` fora de literais abre
+    // sempre um (o prefixo `b` de `b"..."`/`b'x'` fica como codigo).
+    let starts_raw = |at: usize| {
+        at == 0
+            || !ident(chars[at - 1])
+            || (matches!(chars[at - 1], 'b' | 'c') && (at < 2 || !ident(chars[at - 2])))
+    };
+    let mut out = String::with_capacity(source.len());
+    let blank = |out: &mut String, from: usize, to: usize| {
+        for ch in &chars[from..to.min(chars.len())] {
+            out.push(if *ch == '\n' { '\n' } else { ' ' });
+        }
+    };
+    let mut at = 0;
+    while at < chars.len() {
+        let ch = chars[at];
+        let next = chars.get(at + 1).copied();
+        if ch == '/' && next == Some('/') {
+            let end = (at..chars.len())
+                .find(|index| chars[*index] == '\n')
+                .unwrap_or(chars.len());
+            blank(&mut out, at, end);
+            at = end;
+            continue;
+        }
+        if ch == '/' && next == Some('*') {
+            let mut depth = 0usize;
+            let mut end = at;
+            while end < chars.len() {
+                if chars[end] == '/' && chars.get(end + 1) == Some(&'*') {
+                    depth += 1;
+                    end += 2;
+                } else if chars[end] == '*' && chars.get(end + 1) == Some(&'/') {
+                    depth -= 1;
+                    end += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    end += 1;
+                }
+            }
+            blank(&mut out, at, end);
+            at = end;
+            continue;
+        }
+        if ch == 'r' && starts_raw(at) {
+            let mut quote = at + 1;
+            while chars.get(quote) == Some(&'#') {
+                quote += 1;
+            }
+            if chars.get(quote) == Some(&'"') {
+                let hashes = quote - at - 1;
+                let mut end = quote + 1;
+                while end < chars.len() {
+                    if chars[end] == '"'
+                        && (1..=hashes).all(|offset| chars.get(end + offset) == Some(&'#'))
+                    {
+                        end += 1 + hashes;
+                        break;
+                    }
+                    end += 1;
+                }
+                blank(&mut out, at, end);
+                at = end;
+                continue;
+            }
+        }
+        if ch == '"' {
+            let mut end = at + 1;
+            while end < chars.len() {
+                match chars[end] {
+                    '\\' => end += 2,
+                    '"' => {
+                        end += 1;
+                        break;
+                    }
+                    _ => end += 1,
+                }
+            }
+            blank(&mut out, at, end);
+            at = end;
+            continue;
+        }
+        if ch == '\'' {
+            // Um char (`'x'`, `'"'`, `'\''`, `'\u{..}'`); senao e um
+            // lifetime ou uma etiqueta (`'a`, `'static`), que ficam.
+            let end = if next == Some('\\') {
+                (at + 3..chars.len())
+                    .find(|index| chars[*index] == '\'')
+                    .map(|index| index + 1)
+            } else if chars.get(at + 2) == Some(&'\'') {
+                Some(at + 3)
+            } else {
+                None
+            };
+            if let Some(end) = end {
+                blank(&mut out, at, end);
+                at = end;
+                continue;
+            }
+        }
+        out.push(ch);
+        at += 1;
+    }
+    out
+}
+
+/// Em `code` (de `rust_code_only`): quantas vezes cada funcao chega ao
+/// metodo `name` -- `x.name(...)`, `Self::name`, `Tipo::name` passado como
+/// funcao; um metodo so se alcanca por `.` ou `::` --, pela `fn` que a
+/// contem. A declaracao `fn name` e uma variavel ou parametro com o mesmo
+/// nome nao contam; um uso fora de qualquer `fn` conta como "(fora de fn)".
+fn ident_callers(code: &str, name: &str) -> std::collections::BTreeMap<String, usize> {
+    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let whole = |at: usize, len: usize| {
+        !code[..at].chars().next_back().is_some_and(ident)
+            && !code[at + len..].chars().next().is_some_and(ident)
+    };
+    // Cada `fn nome`, pelo sitio onde comeca.
+    let mut functions = Vec::new();
+    for (at, _) in code.match_indices("fn") {
+        if !whole(at, 2) {
+            continue;
+        }
+        let rest = &code[at + 2..];
+        let gap = rest.len() - rest.trim_start().len();
+        if gap == 0 {
+            continue;
+        }
+        let function: String = rest[gap..].chars().take_while(|ch| ident(*ch)).collect();
+        if !function.is_empty() {
+            functions.push((at, function));
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for (at, _) in code.match_indices(name) {
+        let before = code[..at].trim_end();
+        let member = before.ends_with('.') || before.ends_with("::");
+        if !whole(at, name.len()) || !member {
+            continue;
+        }
+        let owner = functions
+            .iter()
+            .rev()
+            .find(|(start, _)| *start < at)
+            .map_or_else(
+                || "(fora de fn)".to_string(),
+                |(_, function)| function.clone(),
+            );
+        *out.entry(owner).or_insert(0) += 1;
+    }
+    out
+}
+
 /// Os ficheiros de `src/` fora de `windows_app/` que embarcam e podem tocar
 /// na pasta de dados.
 fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
@@ -23423,6 +23709,14 @@ fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
             "panel_chrome.rs",
             code_without_tests(include_str!("../panel_chrome.rs")),
         ),
+        (
+            "egress.rs",
+            code_without_tests(include_str!("../egress.rs")),
+        ),
+        (
+            "ai_settings.rs",
+            code_without_tests(include_str!("../ai_settings.rs")),
+        ),
     ]
 }
 
@@ -23433,8 +23727,8 @@ fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
 #[test]
 fn existing_stores_have_a_declared_kind() {
     use crate::stores::{
-        ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, APP_STORES, DOWNLOADS_LOG_STORE,
-        DOWNLOADS_SETTINGS_STORE, KEYS_STORE, LIVE_KEY_STORE,
+        ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AI_SETTINGS_STORE, AI_USAGE_STORE, APP_STORES,
+        DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE, KEYS_STORE, LIVE_KEY_STORE,
     };
     use neural_core::json_store::StoreKind::{Automatic, Explicit, Setting};
     use neural_core::json_store::StoreShape::{Dir, File};
@@ -23459,6 +23753,8 @@ fn existing_stores_have_a_declared_kind() {
         ("keys", Explicit, Dir),
         ("adblock-settings.json", Setting, File),
         ("adblock-list.json", Automatic, File),
+        ("ai/settings.json", Setting, File),
+        ("ai/usage.json", Setting, File),
     ];
     expected.sort_by_key(|row| row.0);
     let mut table: Vec<_> = APP_STORES
@@ -23505,6 +23801,8 @@ fn existing_stores_have_a_declared_kind() {
         ("LIVE_KEY_STORE", LIVE_KEY_STORE.name),
         ("ADBLOCK_SETTINGS_STORE", ADBLOCK_SETTINGS_STORE.name),
         ("ADBLOCK_LIST_STORE", ADBLOCK_LIST_STORE.name),
+        ("AI_SETTINGS_STORE", AI_SETTINGS_STORE.name),
+        ("AI_USAGE_STORE", AI_USAGE_STORE.name),
         ("DOWNLOADS_LOG_STORE", DOWNLOADS_LOG_STORE.name),
         ("DOWNLOADS_SETTINGS_STORE", DOWNLOADS_SETTINGS_STORE.name),
     ];
@@ -23555,6 +23853,47 @@ fn the_store_registry_is_minted_once_in_app_new() {
             "{name} cunha o registo"
         );
     }
+}
+
+// ===================== infra-egress: o portao de saida da IA =====================
+
+/// Gate (critico, infra-egress): o `App::new` nao arranca worker preguicoso
+/// nenhum e nao toca em `ai/`. O portao so nasce no primeiro pedido
+/// (`App::egress_gate`), e o construtor que ele usa -- o mesmo, aqui -- nao
+/// cria thread nem ficheiro: a thread `neural-usage` so aparece na primeira
+/// chamada paga (`egress::tests::the_usage_writer_starts_on_the_first_paid_call`).
+/// A Home fica com as threads e a RAM de sempre (measure-home).
+#[test]
+fn app_new_starts_no_lazy_worker() {
+    let dir = std::env::temp_dir().join(format!("neuralia-egress-app-new-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let registry = StoreRegistry::mint_for_test(&dir);
+    let gate = crate::egress::EgressGate::for_app(Some(&registry));
+    assert_eq!(
+        gate.worker_threads_spawned(),
+        0,
+        "o portao nasceu com uma thread"
+    );
+    assert!(!dir.exists(), "criar o portao escreveu na pasta de dados");
+    let without_stores = crate::egress::EgressGate::for_app(None);
+    assert_eq!(without_stores.worker_threads_spawned(), 0);
+
+    // O `App::new` deixa o portao por nascer e nao pede trabalho a worker
+    // preguicoso nenhum (gate de ausencia, AGENTS.md §4.3).
+    let source = shipped_source();
+    let app_new = source
+        .split("impl App {\n    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("App::new");
+    assert_eq!(app_new.matches("egress: None,").count(), 1);
+    for forbidden in ["EgressGate", "egress_gate", "LazyWorker", ".submit("] {
+        assert!(
+            !app_new.contains(forbidden),
+            "o App::new chama {forbidden}: o worker ja nao e preguicoso"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// As chaves sao credenciais: o Ctrl+Shift+Delete nunca as apaga. Nenhum
@@ -23898,6 +24237,7 @@ mod downloads_gates {
     use neural_core::file_risk::BlockReason;
     use neural_core::json_store::{StoreKind, StoreMode, VersionedJsonStore};
     use std::cell::RefCell;
+    use std::collections::BTreeMap;
     use std::path::Path;
 
     use crate::stores::{DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE};
@@ -24172,9 +24512,20 @@ mod downloads_gates {
         rig.journal.take();
         rig.later.clear();
 
-        // Um programa com «Permitir baixar programas»: a pergunta (sem o
-        // cartao do downloads-ui, «nao») recusa e larga a operacao.
+        // Um programa com «Permitir baixar programas»: a pergunta vai para
+        // o cartao do downloads-ui e o deferral fica preso ate a resposta;
+        // o «nao» recusa e larga a operacao.
         rig.begin(3, 1, WebViewHost::Column(1), dir.0.join("setup.exe"));
+        assert_eq!(rig.journal.take(), Vec::<String>::new());
+        assert!(rig.later.contains(&DownloadEffect::Ask {
+            id: DownloadId(3),
+            reason: BlockReason::Program
+        }));
+        assert_eq!(rig.ops.borrow().len(), 1);
+        rig.drive(DownloadEvent::Answered {
+            id: DownloadId(3),
+            allow: false,
+        });
         assert_eq!(rig.journal.take(), vec!["3 recusado".to_string()]);
         assert_eq!(rig.ops.borrow().len(), 0);
 
@@ -24473,8 +24824,9 @@ mod downloads_gates {
         );
     }
 
-    /// Amostra (textos): o aviso provisorio de cada razao, com o nome
-    /// marcado quando esconde bidi.
+    /// Amostra (textos, sabotada): o toast de cada aviso -- titulo escrito
+    /// pelo nativo, o nome no corpo (marcado quando esconde bidi) -- com as
+    /// frases do plano, numa linha como `download_notice_text` as junta.
     #[test]
     fn download_notice_texts() {
         let blocked = |name: &str, reason| {
@@ -24486,15 +24838,23 @@ mod downloads_gates {
         };
         assert_eq!(
             blocked("setup.exe", BlockReason::Program),
-            "Download bloqueado — setup.exe é um programa."
+            "Download bloqueado — setup.exe é um programa. O NeuralIA não baixa programas nem scripts (ajuste em Downloads)."
+        );
+        assert_eq!(
+            blocked("instalar.ps1", BlockReason::Script),
+            "Download bloqueado — instalar.ps1 é um script. O NeuralIA não baixa programas nem scripts (ajuste em Downloads)."
         );
         assert_eq!(
             blocked("fatura.pdf.exe", BlockReason::Masquerade),
-            "Download bloqueado — fatura.pdf.exe finge ser um PDF."
+            "Download bloqueado — fatura.pdf.exe finge ser um PDF, mas é um programa."
         );
         assert_eq!(
-            blocked("foto.jpg   .scr", BlockReason::Masquerade),
-            "Download bloqueado — foto.jpg   .scr finge ser um JPG."
+            blocked("foto.jpg   .vbs", BlockReason::Masquerade),
+            "Download bloqueado — foto.jpg   .vbs finge ser um JPG, mas é um script."
+        );
+        assert_eq!(
+            blocked("contrato.docx.docm", BlockReason::Masquerade),
+            "Download bloqueado — contrato.docx.docm finge ser um DOCX, mas é um documento com macros."
         );
         let bidi = blocked("fatura\u{202E}fdp.exe", BlockReason::BadName);
         assert!(bidi.contains("\u{2039}RLO\u{203A}"), "{bidi}");
@@ -24507,6 +24867,1503 @@ mod downloads_gates {
             }),
             "Download apagado — relatorio.pdf era um programa disfarçado."
         );
+        assert_eq!(
+            download_notice_text(&DownloadNotice::NotDeleted {
+                id: DownloadId(3),
+                name: "x.pdf".to_string(),
+                reason: DeleteReason::DangerousContent,
+            }),
+            "Download perigoso — x.pdf é perigoso e não deu para apagar. Não o abra."
+        );
+
+        // O toast: tipo Download, o titulo sem conteudo, o nome no corpo
+        // (o modo privado neutraliza-o), sem botoes.
+        let toast = download_toast(&DownloadNotice::Blocked {
+            id: DownloadId(1),
+            name: "setup.exe".to_string(),
+            reason: BlockReason::Program,
+        });
+        // O corpo de um aviso dos downloads parte-se em ate duas linhas; o
+        // do Gmail fica na linha de sempre.
+        let view = |notice: &crate::notify::Notice| {
+            ToastView::of(&crate::notify::ToastFrame {
+                token: 1,
+                notice: notice.clone(),
+            })
+        };
+        assert!(view(&toast).wrap);
+        let mut gmail = toast.clone();
+        gmail.kind = crate::notify::NoticeKind::Gmail;
+        assert!(!view(&gmail).wrap);
+        assert_eq!(toast.kind, crate::notify::NoticeKind::Download);
+        assert_eq!(toast.title, "Download bloqueado");
+        assert!(toast.body.starts_with("setup.exe é um programa."));
+        assert!(toast.content_bearing);
+        assert!(toast.actions.is_empty());
+        assert_eq!(
+            toast
+                .clone()
+                .for_privacy(crate::notify::Privacy::Private)
+                .body,
+            crate::notify::PRIVATE_NEUTRAL_BODY
+        );
+        // Um acabado: «Ver» abre a seccao Downloads.
+        let manager = {
+            let mut manager = DownloadManager::default();
+            manager.on_event(DownloadEvent::Starting(DownloadStart {
+                id: DownloadId(9),
+                webview: WebViewKey(1),
+                private: false,
+                proposed: PathBuf::from(r"C:\Baixados\relatorio.pdf"),
+                host: None,
+                total: None,
+                at: 0,
+            }));
+            manager
+        };
+        let done = completed_toast(manager.entry(DownloadId(9)).expect("entrada"));
+        assert_eq!(done.title, "Download concluído");
+        assert_eq!(done.body, "relatorio.pdf");
+        assert_eq!(done.actions, vec![DOWNLOAD_TOAST_SHOW]);
+        assert_eq!(
+            notice_target(
+                crate::notify::NoticeKind::Download,
+                crate::notify::NoticeReply::Open
+            ),
+            Some(NoticeTarget::Downloads)
+        );
+        assert_eq!(
+            notice_target(
+                crate::notify::NoticeKind::Gmail,
+                crate::notify::NoticeReply::Open
+            ),
+            Some(NoticeTarget::Service(Service::Gmail))
+        );
+        // Pelo caminho do toast (`apply_notify`): o bloqueado com o corpo em
+        // ate duas linhas, e o «Ver» do acabado abre a seccao Downloads.
+        let mut host = super::ToastLog::default();
+        apply_notify(&mut host, NotifyInput::Post(toast));
+        apply_notify(&mut host, NotifyInput::Post(done));
+        assert_eq!(
+            host.centre.current_kind(),
+            Some(crate::notify::NoticeKind::Download)
+        );
+        // O acabado substituiu o bloqueado (o mesmo tipo): e o segundo.
+        let token = 2;
+        apply_notify(
+            &mut host,
+            NotifyInput::Event(NotifyEvent::Answer { token, index: 0 }),
+        );
+        assert_eq!(
+            host.log.last().map(String::as_str),
+            Some("abre downloads"),
+            "{:?}",
+            host.log
+        );
+        assert!(
+            host.log[0].starts_with("mostra 1 «Download bloqueado» «setup.exe é um programa."),
+            "{:?}",
+            host.log
+        );
+    }
+
+    /// «Permitir baixar programas» da seccao Downloads: grava so a escolha
+    /// no `downloads-settings.json` (a pasta que la estava fica) e o gestor
+    /// passa a perguntar em vez de recusar -- e desligada, volta a recusar.
+    #[test]
+    fn the_allow_programs_switch_is_saved_and_used() {
+        let dir = Scratch::new("allow");
+        let chosen = dir.0.join("baixados");
+        std::fs::create_dir_all(&chosen).expect("pasta");
+        let body = serde_json::json!({
+            "version": SETTINGS_VERSION,
+            "data": { "folder": chosen, "allow_programs": false }
+        });
+        let file = dir.0.join(DOWNLOADS_SETTINGS_STORE.name);
+        std::fs::write(&file, serde_json::to_vec(&body).expect("json")).expect("definicoes");
+        let stores = StoreRegistry::mint_for_test(&dir.0);
+        let mut state = DownloadsState::open(Some(&stores));
+        let start = |state: &mut DownloadsState, id: u64| {
+            state
+                .run(
+                    false,
+                    DownloadEvent::Starting(DownloadStart {
+                        id: DownloadId(id),
+                        webview: WebViewKey(1),
+                        private: false,
+                        proposed: chosen.join("setup.exe"),
+                        host: None,
+                        total: None,
+                        at: id,
+                    }),
+                )
+                .later
+        };
+        assert!(
+            !start(&mut state, 1)
+                .iter()
+                .any(|effect| matches!(effect, DownloadEffect::Ask { .. })),
+            "desligada, um programa ja perguntava"
+        );
+        state.set_allow_programs(true).expect("gravada");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).expect("ficheiro")).expect("json");
+        assert_eq!(saved["data"]["allow_programs"], true);
+        assert_eq!(
+            saved["data"]["folder"].as_str().map(PathBuf::from),
+            Some(chosen.clone()),
+            "a pasta que estava no ficheiro perdeu-se"
+        );
+        assert!(state.manager.settings().allow_programs);
+        assert!(start(&mut state, 2).contains(&DownloadEffect::Ask {
+            id: DownloadId(2),
+            reason: BlockReason::Program
+        }));
+        state.set_allow_programs(false).expect("gravada");
+        assert!(!state.manager.settings().allow_programs);
+        assert!(
+            !start(&mut state, 3)
+                .iter()
+                .any(|effect| matches!(effect, DownloadEffect::Ask { .. }))
+        );
+        // Sem loja (nunca no produto): nada muda.
+        let mut none = DownloadsState::open(None);
+        assert!(none.set_allow_programs(true).is_err());
+        assert!(!none.manager.settings().allow_programs);
+    }
+
+    /// O progresso do plano, os tamanhos e a previsao.
+    #[test]
+    fn progress_text_sizes_and_eta() {
+        const MB: u64 = 1024 * 1024;
+        assert_eq!(
+            progress_text(
+                "relatorio.pdf",
+                3_355_443,
+                Some(12 * MB),
+                Some(Duration::from_secs(60))
+            ),
+            "Baixando relatorio.pdf · 3,2 de 12 MB · 1 min"
+        );
+        assert_eq!(
+            progress_text("video.mp4", 5 * MB / 2, None, None),
+            "Baixando video.mp4 · 2,5 MB"
+        );
+        assert_eq!(
+            progress_text("a.txt", 300, Some(900), Some(Duration::from_secs(4))),
+            "Baixando a.txt · 300 de 900 B · 4 s"
+        );
+        for (bytes, text) in [
+            (0, "0 B"),
+            (850, "850 B"),
+            (1024, "1 KB"),
+            (3_277, "3,2 KB"),
+            (12 * MB, "12 MB"),
+            (MB * 99 / 10, "9,9 MB"),
+            (3 * MB, "3 MB"),
+            (1536 * MB, "1,5 GB"),
+        ] {
+            assert_eq!(format_size(bytes), text, "{bytes}");
+        }
+        for (secs, text) in [
+            (0, "1 s"),
+            (40, "40 s"),
+            (60, "1 min"),
+            (89, "1 min"),
+            (90, "2 min"),
+            (3_600, "1 h"),
+            (3_900, "1 h 5 min"),
+        ] {
+            assert_eq!(format_eta(Duration::from_secs(secs)), text, "{secs}");
+        }
+        assert_eq!(download_percent(43, Some(100)), Some(43));
+        assert_eq!(download_percent(500, Some(100)), Some(100));
+        assert_eq!(download_percent(5, None), None);
+        assert_eq!(download_percent(5, Some(0)), None);
+
+        // A velocidade: 1 MB/s durante dois segundos, 10 MB por baixar.
+        let start = Instant::now();
+        let mut meter = RateMeter::default();
+        assert_eq!(meter.eta(0, Some(10 * MB)), None, "sem medida");
+        meter.observe(start, 0);
+        meter.observe(start + Duration::from_millis(100), MB / 10);
+        assert_eq!(meter.eta(0, Some(10 * MB)), None, "amostra curta demais");
+        meter.observe(start + Duration::from_secs(1), MB);
+        meter.observe(start + Duration::from_secs(2), 2 * MB);
+        let eta = meter.eta(2 * MB, Some(10 * MB)).expect("previsao");
+        assert!((7..=9).contains(&eta.as_secs()), "{eta:?}");
+        assert_eq!(meter.eta(2 * MB, None), None, "sem total");
+    }
+
+    /// Gate critico (a saida que protege quem usa): a tabela do
+    /// `leave_decision` -- a Home e o fechar, sem downloads, com um a correr
+    /// (com e sem total), um a espera do «Baixar programa?», varios e so
+    /// acabados -- e o cartao dela: «Continuar baixando» fica ja,
+    /// «Cancelar e sair» so depois do armar cancela cada um e sai.
+    #[test]
+    fn leave_decision_table() {
+        let start = |manager: &mut DownloadManager, id: u64, name: &str, total| {
+            manager.on_event(DownloadEvent::Starting(DownloadStart {
+                id: DownloadId(id),
+                webview: WebViewKey(1),
+                private: false,
+                proposed: PathBuf::from(format!(r"C:\Baixados\{name}")),
+                host: None,
+                total,
+                at: 0,
+            }));
+        };
+        let progress = |manager: &mut DownloadManager, id: u64, received: u64| {
+            manager.on_event(DownloadEvent::Progress {
+                id: DownloadId(id),
+                received,
+                total: None,
+            });
+        };
+        for kind in [LeaveKind::Home, LeaveKind::Close] {
+            let body_one = match kind {
+                LeaveKind::Home => "Voltar à Home cancela o download.",
+                LeaveKind::Close => "Fechar a NeuralIA cancela o download.",
+            };
+            let body_many = match kind {
+                LeaveKind::Home => "Voltar à Home cancela os downloads.",
+                LeaveKind::Close => "Fechar a NeuralIA cancela os downloads.",
+            };
+            let ask = |title: &str, body: &str, cancel: &[u64]| {
+                LeaveDecision::Ask(LeavePrompt {
+                    kind,
+                    title: title.to_string(),
+                    body: body.to_string(),
+                    cancel: cancel.iter().map(|id| DownloadId(*id)).collect(),
+                })
+            };
+
+            // Nada a correr: sai ja.
+            let mut manager = DownloadManager::default();
+            assert_eq!(leave_decision(kind, &manager), LeaveDecision::Leave);
+            // So acabados (cancelado, recusado): sai ja.
+            start(&mut manager, 1, "setup.exe", None);
+            start(&mut manager, 2, "velho.zip", Some(100));
+            manager.on_event(DownloadEvent::Ended {
+                id: DownloadId(2),
+                end: DownloadEnd::Cancelled,
+            });
+            assert_eq!(leave_decision(kind, &manager), LeaveDecision::Leave);
+
+            // Um a correr, com total: o nome e a percentagem.
+            start(&mut manager, 3, "x.zip", Some(1000));
+            progress(&mut manager, 3, 430);
+            assert_eq!(
+                leave_decision(kind, &manager),
+                ask("1 download em andamento (x.zip, 43%).", body_one, &[3])
+            );
+            // Sem total: so o nome.
+            let mut manager = DownloadManager::default();
+            start(&mut manager, 7, "stream.bin", None);
+            progress(&mut manager, 7, 12_345);
+            assert_eq!(
+                leave_decision(kind, &manager),
+                ask("1 download em andamento (stream.bin).", body_one, &[7])
+            );
+            // A espera do «Baixar programa?»: conta, sem percentagem.
+            let mut manager = DownloadManager::new(
+                DownloadSettings {
+                    folder: None,
+                    allow_programs: true,
+                },
+                DownloadLog::default(),
+            );
+            start(&mut manager, 4, "setup.exe", Some(100));
+            assert!(matches!(
+                manager.entry(DownloadId(4)).expect("entrada").state,
+                DownloadState::Asking(_)
+            ));
+            assert_eq!(
+                leave_decision(kind, &manager),
+                ask("1 download em andamento (setup.exe).", body_one, &[4])
+            );
+            // Varios: o mais antigo e a conta dos outros.
+            start(&mut manager, 5, "x.zip", Some(1000));
+            progress(&mut manager, 5, 430);
+            start(&mut manager, 6, "y.zip", None);
+            assert_eq!(
+                leave_decision(kind, &manager),
+                ask(
+                    "3 downloads em andamento (setup.exe e mais 2).",
+                    body_many,
+                    &[4, 5, 6]
+                )
+            );
+            // Um nome com bidi aparece marcado, nunca a trocar o texto.
+            let mut manager = DownloadManager::default();
+            start(&mut manager, 8, "fotoexe.png", Some(10));
+            let LeaveDecision::Ask(prompt) = leave_decision(kind, &manager) else {
+                panic!("devia perguntar");
+            };
+            assert!(prompt.title.contains("fotoexe.png"), "{prompt:?}");
+
+            // O cartao da saida: o seguro e ja, o que sai so armado.
+            let LeaveDecision::Ask(prompt) = leave_decision(kind, &{
+                let mut manager = DownloadManager::default();
+                start(&mut manager, 3, "x.zip", Some(1000));
+                start(&mut manager, 5, "y.zip", Some(1000));
+                manager
+            }) else {
+                panic!("devia perguntar");
+            };
+            let now = Instant::now();
+            let mut card = NativeCard::default();
+            let step = download_card_step(
+                &mut card,
+                DownloadCardInput::Request(DownloadPrompt::Leave(prompt.clone())),
+                now,
+            );
+            let (view, expiry) = step.show.expect("o cartao aparece");
+            assert_eq!(expiry, Duration::from_secs(LEAVE_CARD_SECONDS));
+            assert_eq!(view.title, prompt.title);
+            assert_eq!(
+                view.buttons
+                    .map(|button| (button.label, button.role, button.primary)),
+                [
+                    ("Continuar baixando", DownloadCardButton::Dismiss, true),
+                    ("Cancelar e sair", DownloadCardButton::Confirm, false),
+                ]
+            );
+            // Cedo demais: nada, e o cartao continua a espera.
+            let early = download_card_step(
+                &mut card,
+                DownloadCardInput::Answer {
+                    token: view.token,
+                    button: DownloadCardButton::Confirm,
+                },
+                now + Duration::from_millis(100),
+            );
+            assert_eq!(early, CardStep::default());
+            // Armado: cancela cada um e sai por `kind`.
+            let confirmed = download_card_step(
+                &mut card,
+                DownloadCardInput::Answer {
+                    token: view.token,
+                    button: DownloadCardButton::Confirm,
+                },
+                now + NATIVE_CARD_ARM,
+            );
+            assert_eq!(
+                confirmed,
+                CardStep {
+                    show: None,
+                    hide: true,
+                    events: vec![
+                        DownloadEvent::CancelRequested { id: DownloadId(3) },
+                        DownloadEvent::CancelRequested { id: DownloadId(5) },
+                    ],
+                    leave: Some(kind),
+                }
+            );
+            // «Continuar baixando»: ja, sem cancelar nada nem sair.
+            let step = download_card_step(
+                &mut card,
+                DownloadCardInput::Request(DownloadPrompt::Leave(prompt.clone())),
+                now,
+            );
+            let token = step.show.expect("de novo").0.token;
+            let stay = download_card_step(
+                &mut card,
+                DownloadCardInput::Answer {
+                    token,
+                    button: DownloadCardButton::Dismiss,
+                },
+                now,
+            );
+            assert_eq!(
+                stay,
+                CardStep {
+                    hide: true,
+                    ..CardStep::default()
+                }
+            );
+            // Sem resposta: fica.
+            let step = download_card_step(
+                &mut card,
+                DownloadCardInput::Request(DownloadPrompt::Leave(prompt)),
+                now,
+            );
+            let token = step.show.expect("de novo").0.token;
+            assert_eq!(
+                download_card_step(&mut card, DownloadCardInput::Expire(token), now),
+                CardStep {
+                    hide: true,
+                    ..CardStep::default()
+                }
+            );
+        }
+        // Que nenhum caminho salta a pergunta ate ao `show_home` ou ao `exit`
+        // prova-o `home_and_exit_callers_are_a_named_allowlist`.
+    }
+
+    /// Gate critico (a saida que protege quem usa; DLUI-2, DLUI-3): quem
+    /// chama o `show_home` (destroi a Web completa, as colunas, a fonte e os
+    /// paineis -- e os downloads deles) e o `exit` da janela e uma lista com
+    /// nome, contada por ficheiro e por funcao sobre o codigo que compila
+    /// (comentarios e literais fora, `rust_code_only`), nao sobre o texto de
+    /// uma linha: um caller novo ou reescrito -- `{ self.show_home(); }` no
+    /// braco do `HomeRequested`, o Ctrl+L de volta ao `show_home`, um
+    /// `Self::show_home` passado como funcao -- muda a conta e fica vermelho,
+    /// com qualquer formatacao.
+    #[test]
+    fn home_and_exit_callers_are_a_named_allowlist() {
+        // O scanner consegue falhar: o que esta em comentarios, strings, raw
+        // strings e chars nao conta, nem um parametro com o mesmo nome; a
+        // chamada e a funcao passada contam.
+        let sample = r##"
+fn a(&mut self) {
+    // self.show_home()
+    /* self.show_home() /* aninhado */ self.show_home() */
+    debug_log("show_home (surface era {:?})");
+    let raw = r#"self.show_home() "aspas" "#;
+    let quote = '"';
+    let bytes = b'"';
+    self.show_home();
+}
+fn show_home(&mut self) {}
+fn b<'a>(&'a mut self, show_home: bool) -> &'a str {
+    let go = Self::show_home;
+    "}"
+}
+"##;
+        assert_eq!(
+            ident_callers(&rust_code_only(sample), "show_home"),
+            BTreeMap::from([("a".to_string(), 1), ("b".to_string(), 1)])
+        );
+
+        // Os ficheiros que embarcam na arvore `windows_app/` (sem os testes).
+        let mut files = vec![(
+            "windows_app.rs",
+            rust_code_only(&code_without_tests(include_str!("../windows_app.rs"))),
+        )];
+        for (name, content) in ALL_MODULES {
+            if *name != "tests.rs" {
+                files.push((name, rust_code_only(&code_without_tests(content))));
+            }
+        }
+        // O lexer nao se perdeu em nenhum literal: as chavetas e os
+        // parenteses do que sobra fecham, ficheiro a ficheiro.
+        for (name, code) in &files {
+            for (open, close) in [('{', '}'), ('(', ')')] {
+                assert_eq!(
+                    code.matches(open).count(),
+                    code.matches(close).count(),
+                    "{name}: `rust_code_only` perdeu-se num literal ({open}{close})"
+                );
+            }
+        }
+
+        // (ficheiro, funcao, quantas vezes, porque).
+        type Site = (&'static str, &'static str, usize, &'static str);
+        let allow: [(&str, &[Site]); 5] = [
+            (
+                "show_home",
+                &[
+                    (
+                        "downloads_ui.rs",
+                        "request_home",
+                        1,
+                        "a Home de quem usa, depois do leave_guard",
+                    ),
+                    (
+                        "downloads_ui.rs",
+                        "leave_confirmed",
+                        1,
+                        "o «Cancelar e sair» armado, com os downloads ja cancelados",
+                    ),
+                    (
+                        "downloads_ui.rs",
+                        "lifecycle_probe_home",
+                        1,
+                        "a sonda do CI, so com NEURALIA_LIFECYCLE_PROBE",
+                    ),
+                    (
+                        "clear_history.rs",
+                        "clear",
+                        1,
+                        "o «Apagar histórico» confirmado (limite conhecido, CHANGELOG)",
+                    ),
+                    (
+                        "app/chrome.rs",
+                        "report_history_cleared",
+                        1,
+                        "o fim do «Apagar histórico» (idem)",
+                    ),
+                ],
+            ),
+            (
+                "exit",
+                &[
+                    ("downloads_ui.rs", "exit_now", 1, "a unica saida da janela"),
+                    (
+                        "app/event_loop.rs",
+                        "resumed",
+                        1,
+                        "a janela nem chegou a existir: nada corre",
+                    ),
+                    (
+                        "app/panels.rs",
+                        "save_notes_draft_before_exit",
+                        1,
+                        "o SidePanel::exit (o rascunho das notas), nao a janela",
+                    ),
+                ],
+            ),
+            (
+                "exit_now",
+                &[
+                    (
+                        "downloads_ui.rs",
+                        "request_close",
+                        1,
+                        "depois do leave_guard",
+                    ),
+                    (
+                        "downloads_ui.rs",
+                        "leave_confirmed",
+                        1,
+                        "o «Cancelar e sair» armado",
+                    ),
+                ],
+            ),
+            (
+                "leave_confirmed",
+                &[(
+                    "downloads_ui.rs",
+                    "downloads_ui_event",
+                    1,
+                    "so a resposta do cartao pintado",
+                )],
+            ),
+            (
+                "lifecycle_probe_home",
+                &[(
+                    "app/event_loop.rs",
+                    "user_event",
+                    1,
+                    "o braco UserEvent::LifecycleProbeHome",
+                )],
+            ),
+        ];
+        for (ident, sites) in allow {
+            let mut found = BTreeMap::new();
+            for (name, code) in &files {
+                for (function, count) in ident_callers(code, ident) {
+                    found.insert((name.to_string(), function), count);
+                }
+            }
+            let expected: BTreeMap<(String, String), usize> = sites
+                .iter()
+                .map(|(file, function, count, _why)| {
+                    ((file.to_string(), function.to_string()), *count)
+                })
+                .collect();
+            assert_eq!(
+                found, expected,
+                "quem chama `{ident}` mudou: um caller novo passa pelo `request_home`/`request_close` ou entra na lista com o porque (e no CHANGELOG, se salta a pergunta)"
+            );
+        }
+    }
+
+    /// Gate critico (confirmacao que protege quem usa): o «Baixar
+    /// programa?» com «Permitir baixar programas» ligada. O gestor deixa o
+    /// deferral preso (a pergunta vai para o cartao, nada segue); so o
+    /// «Baixar mesmo assim» armado e do cartao pintado o deixa seguir;
+    /// Cancelar, o prazo, um clique de um cartao ja trocado e um pedido
+    /// novo que troca o pendente recusam -- nunca fica um deferral preso.
+    #[test]
+    fn program_card_answers_the_deferral() {
+        let dir = Scratch::new("program-card");
+        let allow = DownloadSettings {
+            folder: None,
+            allow_programs: true,
+        };
+        let mut rig = Rig::new(DownloadManager::new(allow, DownloadLog::default()));
+        let setup = dir.0.join("setup.exe");
+        rig.begin(1, 1, WebViewHost::Column(0), setup.clone());
+        assert_eq!(
+            rig.journal.take(),
+            Vec::<String>::new(),
+            "o deferral nao ficou preso"
+        );
+        assert_eq!(rig.ops.borrow().len(), 1);
+        assert_eq!(
+            rig.later
+                .iter()
+                .filter(|effect| matches!(effect, DownloadEffect::Ask { .. }))
+                .collect::<Vec<_>>(),
+            vec![&DownloadEffect::Ask {
+                id: DownloadId(1),
+                reason: BlockReason::Program
+            }]
+        );
+        let ask = |id: u64| DownloadPrompt::Program {
+            id: DownloadId(id),
+            name: "setup.exe".to_string(),
+            reason: BlockReason::Program,
+        };
+
+        // O cartao: titulo, texto e botoes (o seguro cheio).
+        let now = Instant::now();
+        let mut card = NativeCard::default();
+        let shown = download_card_step(&mut card, DownloadCardInput::Request(ask(1)), now);
+        let (view, expiry) = shown.show.clone().expect("o cartao aparece");
+        assert_eq!(expiry, Duration::from_secs(PROGRAM_CARD_SECONDS));
+        assert_eq!(view.title, "Baixar programa?");
+        assert!(
+            view.body.starts_with("setup.exe é um programa."),
+            "{}",
+            view.body
+        );
+        assert_eq!(
+            view.buttons
+                .map(|button| (button.label, button.role, button.primary)),
+            [
+                ("Baixar mesmo assim", DownloadCardButton::Confirm, false),
+                ("Cancelar", DownloadCardButton::Dismiss, true),
+            ]
+        );
+        let answer = |card: &mut NativeCard<DownloadPrompt>, token, button, at| {
+            download_card_step(card, DownloadCardInput::Answer { token, button }, at)
+        };
+        // Um clique de outro cartao, ou cedo demais: nada.
+        assert_eq!(
+            answer(
+                &mut card,
+                view.token + 1,
+                DownloadCardButton::Confirm,
+                now + NATIVE_CARD_ARM
+            ),
+            CardStep::default()
+        );
+        assert_eq!(
+            answer(&mut card, view.token, DownloadCardButton::Confirm, now),
+            CardStep::default()
+        );
+        // Armado: segue.
+        let yes = answer(
+            &mut card,
+            view.token,
+            DownloadCardButton::Confirm,
+            now + NATIVE_CARD_ARM,
+        );
+        assert_eq!(
+            yes.events,
+            vec![DownloadEvent::Answered {
+                id: DownloadId(1),
+                allow: true
+            }]
+        );
+        assert!(yes.hide && yes.leave.is_none());
+        for event in yes.events {
+            rig.drive(event);
+        }
+        assert_eq!(
+            rig.journal.take(),
+            vec![format!("1 segue {}", setup.display())]
+        );
+        assert!(
+            rig.manager
+                .entry(DownloadId(1))
+                .expect("entrada")
+                .confirmed_program
+        );
+
+        // Cancelar: recusa, ja (sem armar).
+        rig.begin(2, 1, WebViewHost::External, dir.0.join("outro.exe"));
+        let token = download_card_step(&mut card, DownloadCardInput::Request(ask(2)), now)
+            .show
+            .expect("cartao")
+            .0
+            .token;
+        let no = answer(&mut card, token, DownloadCardButton::Dismiss, now);
+        assert_eq!(
+            no.events,
+            vec![DownloadEvent::Answered {
+                id: DownloadId(2),
+                allow: false
+            }]
+        );
+        for event in no.events {
+            rig.drive(event);
+        }
+        assert_eq!(rig.journal.take(), vec!["2 recusado".to_string()]);
+
+        // O prazo: recusa.
+        rig.begin(3, 1, WebViewHost::External, dir.0.join("terceiro.exe"));
+        let token = download_card_step(&mut card, DownloadCardInput::Request(ask(3)), now)
+            .show
+            .expect("cartao")
+            .0
+            .token;
+        let expired = download_card_step(&mut card, DownloadCardInput::Expire(token), now);
+        assert!(expired.hide);
+        for event in expired.events {
+            rig.drive(event);
+        }
+        assert_eq!(rig.journal.take(), vec!["3 recusado".to_string()]);
+
+        // Um pedido novo troca o pendente: o trocado e recusado ja.
+        rig.begin(4, 1, WebViewHost::External, dir.0.join("quarto.exe"));
+        rig.begin(5, 1, WebViewHost::External, dir.0.join("quinto.exe"));
+        download_card_step(&mut card, DownloadCardInput::Request(ask(4)), now);
+        let replaced = download_card_step(&mut card, DownloadCardInput::Request(ask(5)), now);
+        assert!(replaced.show.is_some());
+        assert_eq!(
+            replaced.events,
+            vec![DownloadEvent::Answered {
+                id: DownloadId(4),
+                allow: false
+            }]
+        );
+        for event in replaced.events {
+            rig.drive(event);
+        }
+        assert_eq!(rig.journal.take(), vec!["4 recusado".to_string()]);
+        assert_eq!(
+            rig.manager.entry(DownloadId(5)).expect("entrada").state,
+            DownloadState::Asking(BlockReason::Program),
+            "o novo continua a espera"
+        );
+    }
+
+    /// Um shell que so anota: o `ShellExecuteW` e o «Mostrar na pasta».
+    #[derive(Default)]
+    struct RecordingShell {
+        executed: Vec<(&'static str, PathBuf)>,
+        revealed: Vec<PathBuf>,
+    }
+
+    impl ShellHost for RecordingShell {
+        fn shell_execute(&mut self, verb: &'static str, file: &Path) -> Result<(), String> {
+            self.executed.push((verb, file.to_path_buf()));
+            Ok(())
+        }
+        fn reveal_in_folder(&mut self, file: &Path) -> Result<(), String> {
+            self.revealed.push(file.to_path_buf());
+            Ok(())
+        }
+    }
+
+    /// Gate critico (correr arquivos; sabotado: deixar o «Abrir» chegar ao
+    /// `ShellExecuteW` com um `.docm`): o «Abrir» so passa pelo
+    /// `shell_open_checked`, que exige o `DefaultAppTarget` -- a lista de
+    /// recusas do `file_risk` (programa, script, documento com macros,
+    /// disfarce, `.url`, `.lnk`, `.library-ms`, `.search-ms`, `.chm`,
+    /// `.hta`), o que nao esta na lista dos tipos que abrem e o conteudo
+    /// relido no disco -- e abre com "open" o caminho validado. Pela
+    /// linha do painel (`open_download_row`), da sessao e do registo: um
+    /// tipo recusado nao mostra «Abrir», so «Mostrar na pasta», e mesmo
+    /// pedido nunca chega ao shell.
+    #[test]
+    fn abrir_goes_only_through_default_app_target() {
+        let dir = Scratch::new("abrir");
+        let file = |name: &str, bytes: &[u8]| {
+            let path = dir.0.join(name);
+            std::fs::write(&path, bytes).expect("arquivo");
+            path
+        };
+        // Recusados, mesmo com um conteudo inofensivo no disco.
+        let refused = [
+            file("macro.docm", b"PK\x03\x04"),
+            file("planilha.xlsm", b"PK\x03\x04"),
+            file("setup.exe", b"texto"),
+            file("instalar.ps1", b"texto"),
+            file("fatura.pdf.exe", b"texto"),
+            file("app.hta", b"<script></script>"),
+            file("link.url", b"[InternetShortcut]"),
+            file("atalho.lnk", b"texto"),
+            file("busca.search-ms", b"texto"),
+            file("pasta.library-ms", b"texto"),
+            file("ajuda.chm", b"texto"),
+            file("pagina.html", b"<script></script>"),
+            file("imagem.svg", b"<svg><script/></svg>"),
+            file("pacote.zip", b"PK\x03\x04"),
+            file("LEIAME", b"texto"),
+            // Nome de documento, conteudo de programa: o sniff recusa.
+            file("falso.pdf", &pe_bytes()),
+        ];
+        let allowed = [
+            file("relatorio.pdf", PDF),
+            file("foto.png", b"\x89PNG\r\n\x1a\n"),
+            file("notas.txt", b"ola"),
+            file("musica.mp3", b"ID3"),
+        ];
+        let mut shell = RecordingShell::default();
+        for path in &refused {
+            assert_eq!(
+                shell_open_checked(path, &mut shell),
+                OpenOutcome::Refused,
+                "{}",
+                path.display()
+            );
+        }
+        assert!(shell.executed.is_empty(), "{:?}", shell.executed);
+        for path in &allowed {
+            assert_eq!(shell_open_checked(path, &mut shell), OpenOutcome::Opened);
+        }
+        assert_eq!(
+            shell.executed,
+            allowed
+                .iter()
+                .map(|path| (SHELL_OPEN_VERB, path.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(SHELL_OPEN_VERB, "open");
+
+        // Pela linha do painel: um PDF, um .docm (acaba com a marca: e um
+        // aviso, nao um bloqueio) e um programa confirmado.
+        let mut manager = DownloadManager::new(
+            DownloadSettings {
+                folder: None,
+                allow_programs: true,
+            },
+            DownloadLog::default(),
+        );
+        let finish = |manager: &mut DownloadManager, id: u64, path: &Path| {
+            manager.on_event(DownloadEvent::Starting(DownloadStart {
+                id: DownloadId(id),
+                webview: WebViewKey(1),
+                private: false,
+                proposed: path.to_path_buf(),
+                host: Some("example.com".to_string()),
+                total: None,
+                at: id,
+            }));
+            manager.on_event(DownloadEvent::Answered {
+                id: DownloadId(id),
+                allow: true,
+            });
+            manager.on_event(DownloadEvent::Ended {
+                id: DownloadId(id),
+                end: DownloadEnd::Completed {
+                    path: path.to_path_buf(),
+                },
+            });
+            manager.on_event(DownloadEvent::Finalized {
+                id: DownloadId(id),
+                outcome: neural_core::downloads::FinalizeOutcome::Kept(
+                    neural_core::downloads::MotwOutcome::Written,
+                ),
+            });
+        };
+        let pdf = allowed[0].clone();
+        let docm = refused[0].clone();
+        let exe = refused[2].clone();
+        finish(&mut manager, 1, &pdf);
+        finish(&mut manager, 2, &docm);
+        finish(&mut manager, 3, &exe);
+        let mut rows = DownloadRows::default();
+        let built = rows.list(&manager, &BTreeMap::new());
+        let row = |name: &str| {
+            built
+                .iter()
+                .find(|row| row.name == name)
+                .unwrap_or_else(|| panic!("{name}: {built:?}"))
+                .clone()
+        };
+        let (pdf_row, docm_row, exe_row) =
+            (row("relatorio.pdf"), row("macro.docm"), row("setup.exe"));
+        assert!(pdf_row.open && pdf_row.show, "{pdf_row:?}");
+        assert!(!docm_row.open && docm_row.show, "{docm_row:?}");
+        assert!(!exe_row.open && exe_row.show, "{exe_row:?}");
+        let mut shell = RecordingShell::default();
+        for id in [docm_row.id, exe_row.id] {
+            assert_eq!(
+                open_download_row(&manager, &rows, id, &mut shell),
+                OpenOutcome::Refused
+            );
+        }
+        assert!(shell.executed.is_empty(), "{:?}", shell.executed);
+        assert_eq!(
+            open_download_row(&manager, &rows, pdf_row.id, &mut shell),
+            OpenOutcome::Opened
+        );
+        assert_eq!(shell.executed, vec![(SHELL_OPEN_VERB, pdf.clone())]);
+        // «Mostrar na pasta» nao corre nada: so o Explorador na pasta.
+        assert_eq!(
+            show_download_row(&manager, &rows, docm_row.id, &mut shell),
+            OpenOutcome::Opened
+        );
+        assert_eq!(shell.revealed, vec![docm.clone()]);
+        assert_eq!(shell.executed.len(), 1);
+        // Um numero que nao esta na lista nao abre nada.
+        assert_eq!(
+            open_download_row(&manager, &rows, 999, &mut shell),
+            OpenOutcome::NoFile
+        );
+
+        // O mesmo pelo registo de antes (o `downloads.json` lido no arranque).
+        let log = manager.log();
+        let old = DownloadManager::new(DownloadSettings::default(), log);
+        let mut rows = DownloadRows::default();
+        let built = rows.list(&old, &BTreeMap::new());
+        assert_eq!(built.len(), 3, "{built:?}");
+        let mut shell = RecordingShell::default();
+        for row in &built {
+            let outcome = open_download_row(&old, &rows, row.id, &mut shell);
+            assert_eq!(
+                row.open,
+                outcome == OpenOutcome::Opened,
+                "{row:?} {outcome:?}"
+            );
+        }
+        assert_eq!(shell.executed, vec![(SHELL_OPEN_VERB, pdf)]);
+
+        // O conteudo e relido no clique: o PDF trocado por um programa
+        // depois de a lista ser pintada nao abre.
+        std::fs::write(&allowed[0], pe_bytes()).expect("troca");
+        let mut shell = RecordingShell::default();
+        let pdf_again = built
+            .iter()
+            .find(|row| row.name == "relatorio.pdf")
+            .expect("linha");
+        assert_eq!(
+            open_download_row(&old, &rows, pdf_again.id, &mut shell),
+            OpenOutcome::Refused
+        );
+        assert!(shell.executed.is_empty());
+        // Apagado depois de acabar: nao ha arquivo (e nada chega ao shell).
+        std::fs::remove_file(&allowed[0]).expect("apagar");
+        assert_eq!(
+            open_download_row(&old, &rows, pdf_again.id, &mut shell),
+            OpenOutcome::NoFile
+        );
+        assert!(shell.executed.is_empty());
+
+        // Ausencia: um so `ShellExecuteW(` no que embarca (o do
+        // `WindowsShell`), nenhum "runas", e o `shell_execute` so e chamado
+        // por `shell_open_checked`.
+        let source = shipped_source();
+        assert_eq!(source.matches("ShellExecuteW(").count(), 1);
+        assert!(!source.to_ascii_lowercase().contains("runas"));
+        assert_eq!(source.matches(".shell_execute(").count(), 1);
+    }
+
+    /// Gate critico (canal do painel; so numeros): a seccao Downloads so
+    /// aceita a lista, o numero de uma linha (um inteiro de 1 a 2^53-1, sem
+    /// mais nada nos `args`) e o interruptor; um caminho, um endereco, um
+    /// texto, um numero com casas, zero, negativo ou grande demais morrem no
+    /// parser. O que a pagina recebe tambem nunca leva um caminho; e a
+    /// pagina que embarca, a correr, so manda numeros.
+    #[test]
+    fn panel_downloads_messages_carry_ids_only() {
+        let parse = |action: &str, args: serde_json::Value| {
+            parse_panel_message(&serde_json::json!({ "action": action, "args": args }).to_string())
+        };
+        use DownloadsPanelRequest::*;
+        assert_eq!(
+            parse("downloads-list", serde_json::json!({})),
+            Some(PanelMessage::Downloads(List))
+        );
+        assert_eq!(
+            parse_panel_message(r#"{"action":"downloads-list"}"#),
+            Some(PanelMessage::Downloads(List))
+        );
+        for (action, make) in [
+            ("downloads-open", Open as fn(u64) -> DownloadsPanelRequest),
+            ("downloads-show", Show),
+            ("downloads-cancel", Cancel),
+        ] {
+            for id in [1u64, 7, PANEL_ROW_ID_MAX] {
+                assert_eq!(
+                    parse(action, serde_json::json!({ "id": id })),
+                    Some(PanelMessage::Downloads(make(id))),
+                    "{action} {id}"
+                );
+            }
+            for bad in [
+                serde_json::json!({ "id": "7" }),
+                serde_json::json!({ "id": r"C:\Users\ana\Downloads\setup.exe" }),
+                serde_json::json!({ "id": "https://exemplo.com/setup.exe" }),
+                serde_json::json!({ "id": 7.5 }),
+                serde_json::json!({ "id": 0 }),
+                serde_json::json!({ "id": -1 }),
+                serde_json::json!({ "id": PANEL_ROW_ID_MAX + 1 }),
+                serde_json::json!({ "id": [7] }),
+                serde_json::json!({ "id": { "path": "C:\\" } }),
+                serde_json::json!({ "id": 7, "path": r"C:\Windows\notepad.exe" }),
+                serde_json::json!({ "path": r"C:\Windows\notepad.exe" }),
+                serde_json::json!({}),
+                serde_json::Value::Null,
+                serde_json::json!("7"),
+            ] {
+                assert_eq!(parse(action, bad.clone()), None, "{action} {bad}");
+            }
+            assert_eq!(
+                parse_panel_message(&format!(r#"{{"action":"{action}"}}"#)),
+                None,
+                "{action} sem args"
+            );
+        }
+        assert_eq!(
+            parse(
+                "downloads-allow-programs",
+                serde_json::json!({ "on": true })
+            ),
+            Some(PanelMessage::Downloads(AllowPrograms(true)))
+        );
+        assert_eq!(
+            parse(
+                "downloads-allow-programs",
+                serde_json::json!({ "on": false })
+            ),
+            Some(PanelMessage::Downloads(AllowPrograms(false)))
+        );
+        for bad in [
+            serde_json::json!({ "on": "true" }),
+            serde_json::json!({ "on": 1 }),
+            serde_json::json!({ "on": true, "id": 1 }),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(
+                parse("downloads-allow-programs", bad.clone()),
+                None,
+                "{bad}"
+            );
+        }
+        for action in [
+            "downloads-run",
+            "downloads-open-path",
+            "downloads-execute",
+            "downloads",
+            "download-open",
+        ] {
+            assert_eq!(
+                parse(action, serde_json::json!({ "id": 1 })),
+                None,
+                "{action}"
+            );
+        }
+        // O tecto de 4 KiB do painel vale tambem aqui.
+        let padded = format!(
+            r#"{{"action":"downloads-list","args":{{}},"pad":"{}"}}"#,
+            "x".repeat(PANEL_MESSAGE_MAX_BYTES)
+        );
+        assert_eq!(parse_panel_message(&padded), None);
+
+        // O que a pagina recebe: nomes, estados e numeros -- nunca o
+        // caminho de um arquivo nem o endereco de onde veio.
+        let dir = Scratch::new("panel-rows");
+        let secret_dir = dir.0.join("pasta-secreta");
+        std::fs::create_dir_all(&secret_dir).expect("pasta");
+        let mut manager = DownloadManager::default();
+        for (id, name) in [(1u64, "relatorio.pdf"), (2, "grande.zip")] {
+            manager.on_event(DownloadEvent::Starting(DownloadStart {
+                id: DownloadId(id),
+                webview: WebViewKey(1),
+                private: false,
+                proposed: secret_dir.join(name),
+                host: Some("cdn.exemplo.com".to_string()),
+                total: Some(1000),
+                at: id,
+            }));
+        }
+        let path = secret_dir.join("relatorio.pdf");
+        std::fs::write(&path, PDF).expect("pdf");
+        manager.on_event(DownloadEvent::Ended {
+            id: DownloadId(1),
+            end: DownloadEnd::Completed { path },
+        });
+        manager.on_event(DownloadEvent::Finalized {
+            id: DownloadId(1),
+            outcome: neural_core::downloads::FinalizeOutcome::Kept(
+                neural_core::downloads::MotwOutcome::Written,
+            ),
+        });
+        let mut rows = DownloadRows::default();
+        let built = rows.list(&manager, &BTreeMap::new());
+        let script = downloads_render_script(&built, false);
+        assert!(!script.contains("pasta-secreta"), "{script}");
+        assert!(
+            !script.contains(&dir.0.to_string_lossy().to_string()),
+            "{script}"
+        );
+        assert!(!script.contains("https://"), "{script}");
+        assert!(script.contains("relatorio.pdf") && script.contains("cdn.exemplo.com"));
+
+        // A pagina que embarca, a correr: a lista entra como texto, e cada
+        // botao manda so `{ id }` -- o interruptor so `{ on }`.
+        let data = serde_json::json!({
+            "allowPrograms": false,
+            "rows": [
+                { "id": 11, "name": "<img src=x onerror=__pwned=1>.pdf", "status": "Concluído", "percent": null,
+                  "open": true, "show": true, "cancel": false, "tone": "done" },
+                { "id": 12, "name": "grande.zip", "status": "Baixando grande.zip · 1 de 2 MB", "percent": 50,
+                  "open": false, "show": false, "cancel": true, "tone": "running" }
+            ]
+        });
+        let result = super::notes_gates::run_panel(&[
+            "__click($('tab-downloads'));".to_string(),
+            format!("window.__neuraliaDownloads.render({data});"),
+            "const __rows = $('dl-list').children;\
+             __out.count = __rows.length;\
+             __out.first = __rows[0].textContent;\
+             const __dlButtons = [];\
+             const __walk = (n) => { for (const c of n.children) { if (c.tagName === 'BUTTON' && !c.hidden) __dlButtons.push(c); __walk(c); } };\
+             __walk($('dl-list'));\
+             __out.labels = __dlButtons.map((b) => b.textContent);\
+             for (const b of __dlButtons) __click(b);\
+             $('dl-allow').checked = true; __fire($('dl-allow'), 'change');\
+             __out.empty = $('dl-empty').hidden;"
+                .to_string(),
+            // A seta ou o Ctrl+J com o painel aberto: noutra seccao mostra
+            // os Downloads (e pede a lista); nos Downloads fecha.
+            "__click($('tab-history'));\
+             window.__neuraliaDownloads.button();\
+             __out.afterButton = __visible($('view-downloads')) && !__visible($('view-history'));"
+                .to_string(),
+            "window.__neuraliaDownloads.button();".to_string(),
+        ]);
+        assert_eq!(
+            result["pwned"],
+            serde_json::Value::Null,
+            "a pagina correu o nome"
+        );
+        assert_eq!(result["html"], serde_json::json!([]), "HTML interpretado");
+        assert_eq!(result["out"]["count"], 2);
+        assert_eq!(result["out"]["empty"], true);
+        assert!(
+            result["out"]["first"]
+                .as_str()
+                .is_some_and(|text| text.contains("<img src=x")),
+            "{}",
+            result["out"]["first"]
+        );
+        assert_eq!(
+            result["out"]["labels"],
+            serde_json::json!(["Abrir", "Mostrar na pasta", "Cancelar"])
+        );
+        let posted = super::notes_gates::posted(&result);
+        let downloads: Vec<serde_json::Value> = posted
+            .iter()
+            .map(|message| serde_json::from_str::<serde_json::Value>(message).expect("json"))
+            .filter(|message| {
+                message["action"]
+                    .as_str()
+                    .is_some_and(|action| action.starts_with("downloads-"))
+            })
+            .collect();
+        assert_eq!(
+            downloads,
+            vec![
+                serde_json::json!({ "action": "downloads-list", "args": {} }),
+                serde_json::json!({ "action": "downloads-open", "args": { "id": 11 } }),
+                serde_json::json!({ "action": "downloads-show", "args": { "id": 11 } }),
+                serde_json::json!({ "action": "downloads-cancel", "args": { "id": 12 } }),
+                serde_json::json!({ "action": "downloads-allow-programs", "args": { "on": true } }),
+                serde_json::json!({ "action": "downloads-list", "args": {} }),
+            ]
+        );
+        assert_eq!(result["out"]["afterButton"], true);
+        assert_eq!(
+            posted.last().map(|message| action_of_message(message)),
+            Some("close".to_string()),
+            "{posted:?}"
+        );
+        // E cada um passa no parser que embarca.
+        for message in &posted {
+            if action_is_downloads(message) {
+                assert!(parse_panel_message(message).is_some(), "{message}");
+            }
+        }
+    }
+
+    fn action_of_message(message: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(message)
+            .ok()
+            .and_then(|value| value["action"].as_str().map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    fn action_is_downloads(message: &str) -> bool {
+        serde_json::from_str::<serde_json::Value>(message)
+            .ok()
+            .and_then(|value| {
+                value["action"]
+                    .as_str()
+                    .map(|a| a.starts_with("downloads-"))
+            })
+            .unwrap_or(false)
+    }
+
+    /// As linhas: os numeros ficam de uma lista para a outra (um clique
+    /// numa lista ja trocada ainda cai na linha certa), um download da
+    /// sessao nao aparece duas vezes (o registo ja o tem), e um registo que
+    /// o Ctrl+Shift+Delete apagou deixa de ter numero.
+    #[test]
+    fn download_rows_keep_their_ids_and_resolve_only_what_is_shown() {
+        let record = |name: &str, at: u64| neural_core::downloads::DownloadRecord {
+            name: name.to_string(),
+            path: None,
+            host: None,
+            bytes: None,
+            outcome: RecordOutcome::Cancelled,
+            at,
+        };
+        let mut manager = DownloadManager::new(
+            DownloadSettings::default(),
+            DownloadLog {
+                entries: vec![record("antigo.zip", 5), record("mais-antigo.zip", 1)],
+            },
+        );
+        manager.on_event(DownloadEvent::Starting(DownloadStart {
+            id: DownloadId(1),
+            webview: WebViewKey(1),
+            private: false,
+            proposed: PathBuf::from(r"C:\Baixados\setup.exe"),
+            host: None,
+            total: None,
+            at: 10,
+        }));
+        let mut rows = DownloadRows::default();
+        let first = rows.list(&manager, &BTreeMap::new());
+        let names: Vec<&str> = first.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["setup.exe", "antigo.zip", "mais-antigo.zip"]);
+        assert_eq!(
+            manager.log().entries.len(),
+            3,
+            "o recusado entrou no registo"
+        );
+        let ids: Vec<u64> = first.iter().map(|row| row.id).collect();
+        let again: Vec<u64> = rows
+            .list(&manager, &BTreeMap::new())
+            .iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(ids, again, "os numeros mudaram");
+        assert_eq!(
+            rows.target(ids[0]),
+            Some(&RowTarget::Session(DownloadId(1)))
+        );
+        assert!(matches!(rows.target(ids[1]), Some(RowTarget::Record(_))));
+        // Ctrl+Shift+Delete: os registos saem; o numero deles nao resolve.
+        manager.on_event(DownloadEvent::ClearLog);
+        let cleared = rows.list(&manager, &BTreeMap::new());
+        assert!(cleared.is_empty(), "{cleared:?}");
+        for id in ids {
+            assert_eq!(rows.target(id), None);
+        }
+    }
+
+    /// A seta do canto: quantos correm e a percentagem de todos com total.
+    #[test]
+    fn downloads_badge_and_tooltip() {
+        let mut manager = DownloadManager::default();
+        assert_eq!(downloads_badge(&manager), DownloadsBadge::default());
+        assert_eq!(
+            downloads_tooltip(DownloadsBadge::default()),
+            "Downloads (Ctrl+J)"
+        );
+        for (id, total) in [(1u64, Some(1000u64)), (2, Some(3000)), (3, None)] {
+            manager.on_event(DownloadEvent::Starting(DownloadStart {
+                id: DownloadId(id),
+                webview: WebViewKey(1),
+                private: false,
+                proposed: PathBuf::from(format!(r"C:\Baixados\a{id}.zip")),
+                host: None,
+                total,
+                at: 0,
+            }));
+        }
+        manager.on_event(DownloadEvent::Progress {
+            id: DownloadId(1),
+            received: 1000,
+            total: None,
+        });
+        manager.on_event(DownloadEvent::Progress {
+            id: DownloadId(2),
+            received: 1000,
+            total: None,
+        });
+        let badge = downloads_badge(&manager);
+        assert_eq!(
+            badge,
+            DownloadsBadge {
+                active: 3,
+                percent: Some(50)
+            }
+        );
+        assert_eq!(
+            downloads_tooltip(badge),
+            "Downloads (Ctrl+J) · 3 em andamento, 50%"
+        );
+        assert_eq!(
+            bar_tooltip_label(
+                BarHit::Downloads,
+                &BarState {
+                    downloads: badge,
+                    ..BarState::default()
+                },
+                "",
+                None,
+                None
+            ),
+            Some("Downloads (Ctrl+J) · 3 em andamento, 50%".to_string())
+        );
+    }
+
+    /// Gate (atalho unico): o Ctrl+J e o comando Downloads da janela, da
+    /// omnibox e de cada WebView menos o monitor do Gmail -- o mesmo evento
+    /// da seta da barra --, e nenhuma outra linha do registo o declara em
+    /// ambito nenhum; nem a lista do ChatGPT nem a tabela dos arquivos o
+    /// tiram as paginas.
+    #[test]
+    fn ctrl_j_is_the_downloads_command_and_nothing_else() {
+        let ctrl_j = Chord::ctrl(b'J');
+        let owners: Vec<(CommandId, KeyScope)> = COMMANDS
+            .iter()
+            .flat_map(|row| {
+                row.chords
+                    .iter()
+                    .filter(|spec| spec.chord == ctrl_j)
+                    .map(move |spec| (row.id, spec.scope))
+            })
+            .collect();
+        assert_eq!(owners, vec![(CommandId::Downloads, KeyScope::Global)]);
+        assert!(!PROVIDER_DENYLIST.contains(&ctrl_j));
+        assert!(!FILES_OVERRIDES.contains(&ctrl_j));
+        let show = Some(format!(
+            "{:?}",
+            UserEvent::DownloadsUi(DownloadsUiEvent::Show)
+        ));
+        for origin in [CommandOrigin::Window, CommandOrigin::Omnibox] {
+            assert_eq!(
+                chord_command_event(&keymap_decision(press(ctrl_j), origin)),
+                show,
+                "{origin:?}"
+            );
+        }
+        for host in every_host() {
+            let got =
+                chord_command_event(&accelerator_lookup(product_keymap(), host, press(ctrl_j)));
+            if host == WebViewHost::GmailMonitor {
+                assert_eq!(got, None);
+            } else {
+                assert_eq!(
+                    got,
+                    Some(format!(
+                        "{:?}",
+                        UserEvent::DownloadsUi(DownloadsUiEvent::Show)
+                    )),
+                    "{host:?}"
+                );
+            }
+        }
+        assert_eq!(
+            bar_hit_command(BarHit::Downloads)
+                .and_then(|id| resolve_command(id, CommandOrigin::Window))
+                .map(|event| format!("{event:?}")),
+            Some(format!(
+                "{:?}",
+                UserEvent::DownloadsUi(DownloadsUiEvent::Show)
+            ))
+        );
+    }
+
+    /// Gate real Win32 (so CI): o cartao dos downloads nasce, aparece e e
+    /// clicado sem nunca tirar a ativacao a janela dona; e owned por ela,
+    /// sem ativacao e nunca TOPMOST -- pela mesma receita
+    /// (`create_native_card`) e o procedimento dele.
+    #[test]
+    #[ignore = "needs a desktop session: runs in CI"]
+    fn download_card_never_activates() {
+        use windows_sys::Win32::Graphics::Gdi::UpdateWindow;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, SetActiveWindow};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GW_OWNER, GWL_EXSTYLE, GetWindow, GetWindowLongW, IsWindowVisible, WS_EX_TOPMOST,
+            WS_OVERLAPPEDWINDOW,
+        };
+        let sink: Box<DownloadCardSink> = Box::new(Box::new(|_| {}));
+        let width = DOWNLOAD_CARD_WIDTH.round() as i32;
+        let height = DOWNLOAD_CARD_HEIGHT.round() as i32;
+        unsafe {
+            let owner = CreateWindowExW(
+                0,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!("NeuralIA dono"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                0,
+                0,
+                800,
+                500,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!owner.is_null(), "a janela dona tem de nascer");
+            SetActiveWindow(owner);
+            assert_eq!(
+                GetActiveWindow(),
+                owner,
+                "pre-condicao: o dono e a janela ativa"
+            );
+            if let Ok(mut view) = DOWNLOAD_CARD_VIEW.lock() {
+                *view = Some(
+                    DownloadPrompt::Program {
+                        id: DownloadId(1),
+                        name: "setup.exe".to_string(),
+                        reason: BlockReason::Program,
+                    }
+                    .view(5),
+                );
+            }
+            let card = create_native_card(
+                owner,
+                width,
+                height,
+                download_card_subclass,
+                DOWNLOAD_CARD_SUBCLASS_ID,
+                (&*sink as *const DownloadCardSink) as usize,
+                18,
+            )
+            .expect("o cartao tem de nascer");
+            let after_create = GetActiveWindow();
+            let mut stolen_on_show = None;
+            for cycle in 0..3 {
+                show_popup_without_activation(card);
+                if GetActiveWindow() != owner && stolen_on_show.is_none() {
+                    stolen_on_show = Some(cycle);
+                }
+            }
+            UpdateWindow(card);
+            let painted = DOWNLOAD_CARD_PAINTED.load(Ordering::Acquire);
+            let activate = SendMessageW(card, WM_MOUSEACTIVATE, owner as WPARAM, 0);
+            let hit = SendMessageW(card, WM_NCHITTEST, 0, 0);
+            let ex_style = GetWindowLongW(card, GWL_EXSTYLE) as u32;
+            let card_owner = GetWindow(card, GW_OWNER);
+            let visible = IsWindowVisible(card) != 0;
+            let after_all = GetActiveWindow();
+            DestroyWindow(card);
+            DestroyWindow(owner);
+            if let Ok(mut view) = DOWNLOAD_CARD_VIEW.lock() {
+                *view = None;
+            }
+            DOWNLOAD_CARD_PAINTED.store(0, Ordering::Release);
+
+            assert_eq!(after_create, owner, "criar o cartao roubou a ativacao");
+            assert_eq!(
+                stolen_on_show, None,
+                "mostrar o cartao roubou a ativacao ao dono no ciclo {stolen_on_show:?}"
+            );
+            assert_eq!(
+                activate, MA_NOACTIVATE as LRESULT,
+                "o clique ativava o cartao"
+            );
+            assert_eq!(after_all, owner, "o cartao ficou com a ativacao");
+            assert!(visible, "o cartao tem de ficar visivel depois de mostrado");
+            assert_eq!(hit, HTCLIENT as LRESULT, "o cartao deixava o clique passar");
+            assert_eq!(painted, 5, "a pintura nao registou o cartao pintado");
+            assert_eq!(card_owner, owner, "o cartao tem de ser owned pela janela");
+            assert_eq!(ex_style & WS_EX_TOPMOST, 0, "o cartao nunca e TOPMOST");
+            assert_ne!(ex_style & WS_EX_NOACTIVATE, 0, "sem WS_EX_NOACTIVATE");
+        }
     }
 }
 

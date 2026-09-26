@@ -34,6 +34,10 @@ accel-spike = []
 [dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 neural-core = { path = "../neural-core" }
+# As lojas da IA (ai_settings.rs, egress.rs) derivam Serialize/Deserialize
+# para o `VersionedJsonStore`. O serde ja esta no Cargo.lock (o neural-core usa
+# o mesmo do workspace): nenhum crate novo.
+serde.workspace = true
 # O parser do canal IPC (src/ipc.rs) é portátil e é compilado em todas as
 # plataformas; por isso o serde_json não pode ficar só no lado Windows.
 serde_json.workspace = true
@@ -52,6 +56,9 @@ windows-sys = { version = "0.61.2", features = [
     # Transferencias que o gestor de downloads repoe no perfil do WebView2.
     "Win32_System_Com",
     "Win32_UI_Shell",
+    # ILCreateFromPathW + SHOpenFolderAndSelectItems: o «Mostrar na pasta»
+    # da seccao Downloads (downloads-ui).
+    "Win32_UI_Shell_Common",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

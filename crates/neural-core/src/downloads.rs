@@ -202,7 +202,7 @@ pub fn unique_path(dir: &Path, name: &str, exists: impl Fn(&Path) -> bool) -> Pa
 // ===================== a tabela do fim =====================
 
 /// Porque um download acabado foi apagado.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeleteReason {
     /// O conteudo e um executavel (MZ/PE), um atalho (LNK) ou um gabinete
@@ -407,7 +407,7 @@ impl ProgressThrottle {
 // ===================== o registo (downloads.json) =====================
 
 /// Como um download acabou, no registo.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum RecordOutcome {
     /// No disco, com a marca da Web. `warn`: um documento com macros ou um
