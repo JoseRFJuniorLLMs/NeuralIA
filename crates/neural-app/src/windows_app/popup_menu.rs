@@ -231,7 +231,7 @@ fn restore_focus(restore: FocusRestore, hosts: &[&dyn FocusHost]) {
 
 /// Acrescenta os itens a `menu`. Os textos e as amostras ficam vivos ate o
 /// menu fechar: o menu nao e dono dos bitmaps dos seus itens.
-unsafe fn append_entries(
+pub(in crate::windows_app) unsafe fn append_entries(
     menu: *mut core::ffi::c_void,
     entries: &[MenuEntry],
     icon_size: i32,
@@ -258,7 +258,14 @@ unsafe fn append_entries(
                 let text = texts.last().map_or(&[0u16][..], |text| text.as_slice());
                 if command.icon.is_some() {
                     let swatch = icon_bitmap(command.icon, bitmaps);
-                    append_swatch_item(menu, command.id, text, swatch, command.checked);
+                    append_swatch_item(
+                        menu,
+                        command.id,
+                        text,
+                        swatch,
+                        command.checked,
+                        command.disabled.is_some(),
+                    );
                 } else {
                     let mut flags = MF_STRING;
                     if command.checked {

@@ -223,7 +223,17 @@ impl NoticeQueue {
 
     /// O proximo a sair, pela ordem de chegada do tipo.
     pub(crate) fn pop(&mut self) -> Option<Notice> {
-        (!self.entries.is_empty()).then(|| self.entries.remove(0).delivered())
+        self.pop_first(|_| true)
+    }
+
+    /// O primeiro, pela ordem de chegada do tipo, entre os tipos que
+    /// `allowed` deixa sair; os outros ficam no lugar deles.
+    fn pop_first(&mut self, allowed: impl Fn(NoticeKind) -> bool) -> Option<Notice> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| allowed(entry.notice.kind))?;
+        Some(self.entries.remove(index).delivered())
     }
 
     #[cfg(test)]
@@ -244,7 +254,8 @@ pub(crate) struct ToastFrame {
 pub(crate) enum ToastHide {
     /// Temporizador de um aviso que ja foi substituido.
     Stale,
-    /// Sai; `next` e o que esperava na fila (fora do Foco).
+    /// Sai; `next` e o que esperava na fila (durante o Foco, so um tipo que
+    /// passa o Foco: o Pomodoro que esperava por um aviso de outro tipo).
     Hide { next: Option<ToastFrame> },
 }
 
@@ -290,17 +301,19 @@ impl NotifyCentre {
         }
     }
 
-    /// O prazo do aviso `token` passou.
+    /// O prazo do aviso `token` passou. Sai o proximo da fila; durante o
+    /// Foco so sai um tipo que o passa (um Pomodoro que chegou com um aviso
+    /// de outro tipo a vista), e o resto espera o fim do Foco.
     pub(crate) fn hidden(&mut self, token: u64) -> ToastHide {
         if token != self.token {
             return ToastHide::Stale;
         }
         self.current = None;
-        let next = if self.focus_shield {
-            None
-        } else {
-            self.queue.pop().map(|notice| self.frame(notice))
-        };
+        let shield = self.focus_shield;
+        let next = self
+            .queue
+            .pop_first(|kind| !shield || kind.passes_focus())
+            .map(|notice| self.frame(notice));
         ToastHide::Hide { next }
     }
 
@@ -448,7 +461,9 @@ mod tests {
     /// Gate: a fila sai pela ordem da primeira chegada de cada tipo, com um
     /// lugar por tipo (o mais recente e a conta); varios do mesmo tipo
     /// durante o Foco saem num resumo, e um aviso de outro tipo espera pelo
-    /// que esta a vista em vez de o tapar.
+    /// que esta a vista em vez de o tapar. Durante o Foco, o fim de um aviso
+    /// solta so o Pomodoro que esperava por ele (nunca o prende ate ao fim
+    /// do Foco); os outros esperam o Foco acabar.
     #[test]
     fn queue_order_and_dedupe() {
         // A fila sozinha: ordem de chegada, dedupe por tipo.
@@ -519,6 +534,40 @@ mod tests {
         assert_eq!(tabs.notice.kind, NoticeKind::Tabs);
         assert_eq!(tabs.notice.body, "t", "um so sai como chegou");
         assert_eq!(centre.hidden(tabs.token), ToastHide::Hide { next: None });
+
+        // Um aviso de outro tipo a vista quando o Foco liga nao prende o
+        // Pomodoro ate ao fim do Foco: no fim desse aviso sai o Pomodoro,
+        // mesmo atras de um que chegou antes e espera o Foco.
+        let mut centre = NotifyCentre::default();
+        let gmail = centre
+            .post(notice(NoticeKind::Gmail, "antes do foco"))
+            .expect("ja");
+        assert_eq!(centre.set_focus_shield(true), None);
+        assert_eq!(centre.post(notice(NoticeKind::Download, "d")), None);
+        assert_eq!(
+            centre.post(notice(NoticeKind::Pomodoro, "fim da pausa")),
+            None,
+            "um de cada vez: o Pomodoro espera pelo Gmail a vista"
+        );
+        let hide = centre.hidden(gmail.token);
+        let ToastHide::Hide {
+            next: Some(pomodoro),
+        } = hide
+        else {
+            panic!("o Pomodoro ficou na fila durante o foco: {hide:?}");
+        };
+        assert_eq!(pomodoro.notice.kind, NoticeKind::Pomodoro);
+        assert_eq!(pomodoro.notice.body, "fim da pausa");
+        assert_eq!(
+            centre.hidden(pomodoro.token),
+            ToastHide::Hide { next: None },
+            "o download espera o fim do foco"
+        );
+        let download = centre
+            .set_focus_shield(false)
+            .expect("o fim do foco solta a fila");
+        assert_eq!(download.notice.kind, NoticeKind::Download);
+        assert!(centre.queue().entries().is_empty());
 
         // Fora do Foco: o mesmo tipo substitui ja; outro tipo espera.
         let mut centre = NotifyCentre::default();

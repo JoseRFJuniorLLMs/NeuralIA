@@ -3155,7 +3155,9 @@ fn toast_never_activates() {
 /// pela origem. A origem e a vista (ou a janela) onde estava o foco; o
 /// teclado volta la depois do menu, com ou sem escolha, salvo se o comando
 /// escolhido o muda de proposito. Os menus migrados guardam os itens, os
-/// ids, as marcas e os cinzentos de antes.
+/// ids, as marcas e os cinzentos de antes, e o HMENU montado pelo
+/// `append_entries` (o do `run_menu`) deixa um cinzento sem clique e um
+/// marcado marcado, com e sem amostra de cor.
 #[test]
 fn popup_menus_keep_their_items_and_decide_the_focus_by_origin() {
     let hwnd = |value: usize| value as HWND;
@@ -3297,6 +3299,62 @@ fn popup_menus_keep_their_items_and_decide_the_focus_by_origin() {
     );
     assert!(nested.command(TAB_MENU_OPEN).is_some_and(|c| c.moves_focus));
     assert_eq!(nested.command(9999), None);
+
+    // O HMENU que o `run_menu` monta (sem janela: so o menu e as amostras
+    // do GDI): um cinzento fica cinzento e sem clique tambem com icone, e o
+    // marcado fica marcado, com e sem icone.
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetMenuItemCount, GetMenuState, MF_BYCOMMAND, MF_CHECKED, MF_DISABLED, MF_GRAYED,
+        };
+        let mut real = PopupMenu::default();
+        real.push(MenuCommand::new(1, "Liso").checked(true));
+        real.push(MenuCommand::new(2, "Liso cinzento").disabled("sem abas"));
+        real.push(
+            MenuCommand::new(3, "Cor")
+                .icon(MenuIcon::Swatch(GroupColor::ALL[0].rgb()))
+                .checked(true),
+        );
+        real.push(
+            MenuCommand::new(4, "Cor cinzenta")
+                .icon(MenuIcon::Swatch(GroupColor::ALL[1].rgb()))
+                .disabled("só a correr"),
+        );
+        real.push(
+            MenuCommand::new(5, "Cor livre").icon(MenuIcon::Swatch(GroupColor::ALL[2].rgb())),
+        );
+        let (count, states) = unsafe {
+            let handle = CreatePopupMenu();
+            assert!(!handle.is_null(), "CreatePopupMenu recusou");
+            let mut texts = Vec::new();
+            let mut bitmaps = Vec::new();
+            append_entries(handle, &real.entries, 16, &mut texts, &mut bitmaps);
+            let count = GetMenuItemCount(handle);
+            let states: Vec<u32> = (1..=5u32)
+                .map(|id| GetMenuState(handle, id, MF_BYCOMMAND))
+                .collect();
+            DestroyMenu(handle);
+            for bitmap in bitmaps {
+                DeleteObject(bitmap as _);
+            }
+            (count, states)
+        };
+        assert_eq!(count, 5);
+        assert!(
+            !states.contains(&u32::MAX),
+            "um item nao chegou ao menu: {states:x?}"
+        );
+        let grey = MF_GRAYED | MF_DISABLED;
+        let seen: Vec<u32> = states
+            .iter()
+            .map(|state| state & (grey | MF_CHECKED))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![MF_CHECKED, grey, MF_CHECKED, grey, 0],
+            "liso marcado, liso cinzento, cor marcada, cor cinzenta, cor livre"
+        );
+    }
 
     // So o `PopupMenu` chama o TrackPopupMenu: um menu solto nao devolvia
     // o teclado a ninguem.

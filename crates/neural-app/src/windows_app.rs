@@ -1700,18 +1700,28 @@ unsafe fn color_swatch_bitmap(color: Rgb, size: i32) -> *mut core::ffi::c_void {
 }
 
 /// Acrescenta ao menu um item com texto e, a esquerda, a amostra `swatch`
-/// (pode ser nula). `checked` marca-o como a escolha em vigor.
+/// (pode ser nula). `checked` marca-o como a escolha em vigor; `disabled`
+/// deixa-o cinzento e sem clique, como o `MF_GRAYED` de um item sem icone.
 unsafe fn append_swatch_item(
     menu: *mut core::ffi::c_void,
     id: usize,
     label: &[u16],
     swatch: *mut core::ffi::c_void,
     checked: bool,
+    disabled: bool,
 ) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetMenuItemCount, InsertMenuItemW, MENUITEMINFOW, MFS_CHECKED, MFT_RADIOCHECK, MFT_STRING,
-        MIIM_BITMAP, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING,
+        GetMenuItemCount, InsertMenuItemW, MENUITEMINFOW, MFS_CHECKED, MFS_DISABLED,
+        MFT_RADIOCHECK, MFT_STRING, MIIM_BITMAP, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING,
     };
+    let mut state = 0;
+    if checked {
+        state |= MFS_CHECKED;
+    }
+    if disabled {
+        // MFS_DISABLED e MFS_GRAYED sao o mesmo valor: cinzento e sem clique.
+        state |= MFS_DISABLED;
+    }
     let info = MENUITEMINFOW {
         cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
         fMask: MIIM_ID
@@ -1720,7 +1730,7 @@ unsafe fn append_swatch_item(
             | MIIM_STATE
             | if swatch.is_null() { 0 } else { MIIM_BITMAP },
         fType: MFT_STRING | if checked { MFT_RADIOCHECK } else { 0 },
-        fState: if checked { MFS_CHECKED } else { 0 },
+        fState: state,
         wID: id as u32,
         hSubMenu: std::ptr::null_mut(),
         hbmpChecked: std::ptr::null_mut(),
