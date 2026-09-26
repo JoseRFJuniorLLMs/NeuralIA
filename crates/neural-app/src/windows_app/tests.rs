@@ -24862,7 +24862,10 @@ mod downloads_gates {
         assert_eq!(rig.ops.borrow().len(), 0, "a operacao acabada ficou viva");
         assert_eq!(
             rig.manager.entry(DownloadId(1)).expect("entrada").state,
-            DownloadState::Done(RecordOutcome::Completed { warn: false })
+            DownloadState::Done(RecordOutcome::Completed {
+                warn: false,
+                inspection: neural_core::downloads::Inspection::Checked,
+            })
         );
         let motw = read_motw(&pdf).expect("ler").expect("a marca da Web");
         assert_eq!(motw_zone_id(&motw), Some(3));
@@ -24924,6 +24927,220 @@ mod downloads_gates {
             vec![DownloadId(6)]
         );
         assert_eq!(rig.manager.active(), 1);
+    }
+
+    /// Um ZIP de entradas *stored* (o bastante para o diretorio central que
+    /// a inspecao le). `shared`: a segunda entrada aponta para o cabecalho
+    /// local da primeira -- a bomba de sobreposicao.
+    fn stored_zip(entries: &[(&str, &[u8])], shared: bool) -> Vec<u8> {
+        let push16 = |out: &mut Vec<u8>, value: u16| out.extend_from_slice(&value.to_le_bytes());
+        let push32 = |out: &mut Vec<u8>, value: u32| out.extend_from_slice(&value.to_le_bytes());
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (index, (name, data)) in entries.iter().enumerate() {
+            let mut crc = flate2::Crc::new();
+            crc.update(data);
+            let crc = crc.sum();
+            let offset = if shared && index > 0 {
+                0
+            } else {
+                out.len() as u32
+            };
+            if !(shared && index > 0) {
+                push32(&mut out, 0x0403_4b50);
+                for value in [20, 0, 0, 0, 0x21] {
+                    push16(&mut out, value);
+                }
+                push32(&mut out, crc);
+                push32(&mut out, data.len() as u32);
+                push32(&mut out, data.len() as u32);
+                push16(&mut out, name.len() as u16);
+                push16(&mut out, 0);
+                out.extend_from_slice(name.as_bytes());
+                out.extend_from_slice(data);
+            }
+            push32(&mut central, 0x0201_4b50);
+            for value in [0x031E, 20, 0, 0, 0, 0x21] {
+                push16(&mut central, value);
+            }
+            push32(&mut central, crc);
+            push32(&mut central, data.len() as u32);
+            push32(&mut central, data.len() as u32);
+            for value in [name.len() as u16, 0, 0, 0, 0] {
+                push16(&mut central, value);
+            }
+            push32(&mut central, 0);
+            push32(&mut central, offset);
+            central.extend_from_slice(name.as_bytes());
+        }
+        let directory_offset = out.len() as u32;
+        out.extend_from_slice(&central);
+        push32(&mut out, 0x0605_4b50);
+        for value in [0, 0, entries.len() as u16, entries.len() as u16] {
+            push16(&mut out, value);
+        }
+        push32(&mut out, central.len() as u32);
+        push32(&mut out, directory_offset);
+        push16(&mut out, 0);
+        out
+    }
+
+    /// Gate critico (downloads-zip-inspect; sabotado: um arquivo nao
+    /// inspecionado mostrado como concluido sem mais nada), pela volta
+    /// inteira do `App` (`run_download_event`, com o `finalize_download` no
+    /// disco): o `pacote.zip` do E2E (setup.exe e run.bat) e apagado sem
+    /// «Permitir baixar programas», com o aviso e a linha a dizer porque, e
+    /// fica com ela, a dizer o que leva; um ZIP sobreposto e um 7z ficam
+    /// «nao inspecionado» (tom de aviso) na linha da sessao, na do
+    /// `downloads.json` e no toast; um ZIP limpo fica concluido.
+    #[test]
+    fn a_zip_download_is_inspected_and_not_inspected_is_shown() {
+        use neural_core::downloads::{FinalizeOutcome, Inspection};
+        use neural_core::file_risk::ZipEntryRisk;
+        let dir = Scratch::new("zip");
+        let pacote = stored_zip(
+            &[
+                ("setup.exe", &pe_bytes()),
+                ("run.bat", b"@echo off\r\necho oi\r\n"),
+            ],
+            false,
+        );
+        let finish = |rig: &mut Rig, id: u64, name: &str, bytes: &[u8]| {
+            let path = dir.0.join(name);
+            rig.begin(id, 1, WebViewHost::External, path.clone());
+            std::fs::write(&path, bytes).expect("download");
+            rig.complete(id, &path);
+            path
+        };
+        let rows =
+            |manager: &DownloadManager| DownloadRows::default().list(manager, &BTreeMap::new());
+        let row = |built: &[PanelRow], name: &str| {
+            built
+                .iter()
+                .find(|row| row.name == name)
+                .unwrap_or_else(|| panic!("{name}: {built:?}"))
+                .clone()
+        };
+
+        // Sem a definicao: apagado, com o aviso e a linha.
+        let mut rig = Rig::new(DownloadManager::default());
+        let path = finish(&mut rig, 1, "pacote.zip", &pacote);
+        assert!(!path.exists(), "o pacote.zip ficou no disco");
+        let reason = DeleteReason::ArchiveEntry(ZipEntryRisk::Blocked(BlockReason::Program));
+        let notice = DownloadNotice::Deleted {
+            id: DownloadId(1),
+            name: "pacote.zip".to_string(),
+            reason,
+        };
+        assert!(
+            rig.later.contains(&DownloadEffect::Notice(notice.clone())),
+            "{:?}",
+            rig.later
+        );
+        assert_eq!(
+            download_notice_text(&notice),
+            "Download apagado — pacote.zip tinha um programa dentro. O NeuralIA não baixa programas nem scripts (ajuste em Downloads)."
+        );
+        let deleted = row(&rows(&rig.manager), "pacote.zip");
+        assert_eq!(
+            deleted.status,
+            "Apagado — tinha um programa dentro · example.com"
+        );
+        assert_eq!(deleted.tone, "blocked");
+        assert!(!deleted.open && !deleted.show, "{deleted:?}");
+        // Outro arquivo compactado dentro, um disfarce dentro: os avisos.
+        for (risk, text) in [
+            (
+                ZipEntryRisk::NestedArchive,
+                "Download apagado — pacote.zip tinha outro arquivo compactado dentro, que o NeuralIA não inspeciona (ajuste em Downloads).",
+            ),
+            (
+                ZipEntryRisk::Blocked(BlockReason::Masquerade),
+                "Download apagado — pacote.zip tinha um programa disfarçado dentro.",
+            ),
+        ] {
+            assert_eq!(
+                download_notice_text(&DownloadNotice::Deleted {
+                    id: DownloadId(1),
+                    name: "pacote.zip".to_string(),
+                    reason: DeleteReason::ArchiveEntry(risk),
+                }),
+                text
+            );
+        }
+
+        // Com a definicao: fica, e a linha e o toast dizem o que leva.
+        let mut rig = Rig::new(DownloadManager::new(
+            DownloadSettings {
+                folder: None,
+                allow_programs: true,
+            },
+            DownloadLog::default(),
+        ));
+        let path = finish(&mut rig, 1, "pacote.zip", &pacote);
+        assert!(path.exists(), "com a definicao, o pacote.zip foi apagado");
+        let kept = row(&rows(&rig.manager), "pacote.zip");
+        assert_eq!(
+            kept.status,
+            "Concluído · 64 B · example.com · tem programas ou scripts dentro"
+        );
+        assert_eq!(kept.tone, "warn");
+        assert!(!kept.open && kept.show, "{kept:?}");
+
+        // Nao inspecionados: um ZIP sobreposto, um estragado e um 7z; e um
+        // limpo, lido.
+        let mut rig = Rig::new(DownloadManager::default());
+        let photos = [
+            ("fotos/a.jpg", &b"\xFF\xD8\xFF\xE0"[..]),
+            ("fotos/b.jpg", b"\xFF\xD8\xFF\xE0"),
+        ];
+        let overlap = finish(&mut rig, 2, "sobreposto.zip", &stored_zip(&photos, true));
+        let broken = finish(&mut rig, 3, "estragado.zip", &pacote[..pacote.len() - 30]);
+        let seven = finish(
+            &mut rig,
+            4,
+            "arquivo.7z",
+            &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0, 4],
+        );
+        let clean = finish(&mut rig, 5, "fotos.zip", &stored_zip(&photos, false));
+        for path in [&overlap, &broken, &seven, &clean] {
+            assert!(path.exists(), "{}", path.display());
+        }
+        let built = rows(&rig.manager);
+        for name in ["sobreposto.zip", "estragado.zip", "arquivo.7z"] {
+            let shown = row(&built, name);
+            assert_eq!(
+                shown.status, "Concluído · 64 B · example.com · não inspecionado",
+                "{name}"
+            );
+            assert_eq!(shown.tone, "warn", "{name}");
+        }
+        let fine = row(&built, "fotos.zip");
+        assert_eq!(fine.status, "Concluído · 64 B · example.com");
+        assert_eq!(fine.tone, "done");
+        // O toast do acabado diz o mesmo.
+        let toast = completed_toast(rig.manager.entry(DownloadId(2)).expect("entrada"));
+        assert_eq!(
+            toast.body,
+            "sobreposto.zip · não inspecionado: o NeuralIA não conseguiu ver o que ele tem dentro"
+        );
+        assert_eq!(
+            completed_toast(rig.manager.entry(DownloadId(5)).expect("entrada")).body,
+            "fotos.zip"
+        );
+        // A linha do `downloads.json` de antes (outra sessao) tambem.
+        let reopened = DownloadManager::new(DownloadSettings::default(), rig.manager.log());
+        let record = row(&rows(&reopened), "sobreposto.zip");
+        assert_eq!(
+            record.status,
+            "Concluído · 64 B · example.com · não inspecionado"
+        );
+        assert_eq!(record.tone, "warn");
+        // E o `finalize_download` que o `App` corre devolve o mesmo.
+        assert!(matches!(
+            neural_core::downloads::finalize_download(&overlap, false, false),
+            FinalizeOutcome::Kept(_, Inspection::NotInspected)
+        ));
     }
 
     /// Gate critico: nada de uma pagina privada nem do Modo privado chega
@@ -26119,6 +26336,7 @@ fn b<'a>(&'a mut self, show_home: bool) -> &'a str {
                 id: DownloadId(id),
                 outcome: neural_core::downloads::FinalizeOutcome::Kept(
                     neural_core::downloads::MotwOutcome::Written,
+                    neural_core::downloads::Inspection::Checked,
                 ),
             });
         };
@@ -26344,6 +26562,7 @@ fn b<'a>(&'a mut self, show_home: bool) -> &'a str {
             id: DownloadId(1),
             outcome: neural_core::downloads::FinalizeOutcome::Kept(
                 neural_core::downloads::MotwOutcome::Written,
+                neural_core::downloads::Inspection::Checked,
             ),
         });
         let mut rows = DownloadRows::default();
