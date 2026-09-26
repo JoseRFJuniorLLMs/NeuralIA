@@ -25,6 +25,7 @@ pub mod search;
 pub mod security;
 pub mod semantic_timeline;
 pub mod tissue;
+pub mod untrusted;
 pub mod zettel;
 
 #[cfg(test)]
@@ -53,7 +54,7 @@ pub use search::{
     is_ai_provider_host, is_login_host, login_hosts, mistral_search_url, perplexity_search_url,
 };
 pub use security::{
-    is_forbidden_ip, is_local_network_target, validate_redirect_target, validate_web_url,
+    Locality, is_forbidden_ip, is_local_network_target, validate_redirect_target, validate_web_url,
 };
 
 pub use agent_security::{

@@ -5,7 +5,9 @@
 //! - `transport`: o `ApiClient` sobre o ureq 3.4.2 -- sem proxy, sem
 //!   redirects, verificador de certificados do sistema, prazo por chamada,
 //!   tecto do corpo DESCODIFICADO e desistencia cooperativa. So fala com os
-//!   hosts fixados (`Endpoint::pinned`); o loopback so existe nos testes.
+//!   hosts fixados (`Endpoint::pinned`), resolvidos so para enderecos
+//!   publicos (`security::Locality::Public`, o `PublicResolver` do Reader);
+//!   o loopback so existe nos testes.
 //! - `errors`: `ApiError`, com a mensagem pt-BR que o utilizador ve. Nunca
 //!   leva a chave nem o corpo da resposta.
 //! - `models`: listar, filtrar e escolher o modelo por finalidade (forma
@@ -16,9 +18,10 @@
 //!
 //! A chave vem do cofre do app (`ApiKey` em `neural-app/src/secrets.rs`,
 //! que implementa `ApiCredential`) e so viaja no cabecalho de autenticacao.
-//! Nenhuma feature do produto chama este modulo ainda: a Traducao e a
-//! primeira, depois da parte 2 (`infra-llm-untrusted`, que traz a cerca do
-//! texto nao confiavel e os resolvedores de rede).
+//! O texto de uma pagina so entra num pedido pelo `untrusted::PromptBuilder`
+//! (parte 2, `infra-llm-untrusted`): instrucoes no `system`, o pedido do
+//! utilizador e os dados cercados no `user`. Nenhuma feature do produto
+//! chama este modulo ainda: a Traducao e a primeira.
 
 pub mod errors;
 pub mod gemini;
