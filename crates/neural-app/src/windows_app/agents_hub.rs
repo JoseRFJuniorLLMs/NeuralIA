@@ -40,23 +40,32 @@ pub(in crate::windows_app) struct AgentsHubState {
     hub: Option<AgentHub>,
 }
 
+/// O hub do produto, sem janela: pede o grant da loja `agents` ao registo
+/// das lojas do `App` e cria o hub sobre ela -- e por isso o hub obedece ao
+/// modo do registo (numa sessao privada nada vai ao disco). Sem registo nao
+/// ha hub. O `AgentsHubState::open` chama isto e depois abre o canal; o gate
+/// e `the_shipped_hub_lives_in_the_registry_agents_store_and_obeys_private_mode`.
+fn open_agents_hub(
+    stores: Option<&StoreRegistry>,
+    notify: impl Fn(AgentEvent) + Send + Sync + 'static,
+) -> Option<AgentHub> {
+    let grant = stores?.grant(AGENTS_STORE).ok()?;
+    let store = ConversationStore::open(grant).ok()?;
+    Some(AgentHub::new(store, notify))
+}
+
 impl AgentsHubState {
-    /// Pede o grant da loja `agents` ao registo, cria o hub sobre ela e abre
-    /// o canal fora desta thread (`agents::pipe::start`: le as conversas e
-    /// faz o bind do named pipe).
+    /// Pede o grant da loja `agents` ao registo, cria o hub sobre ela
+    /// (`open_agents_hub`) e abre o canal fora desta thread
+    /// (`agents::pipe::start`: le as conversas e faz o bind do named pipe).
     pub(in crate::windows_app) fn open(
         stores: Option<&StoreRegistry>,
         proxy: &EventLoopProxy<UserEvent>,
     ) -> Self {
-        let hub = stores
-            .and_then(|stores| stores.grant(AGENTS_STORE).ok())
-            .and_then(|grant| ConversationStore::open(grant).ok())
-            .map(|store| {
-                let proxy = proxy.clone();
-                AgentHub::new(store, move |event| {
-                    let _ = proxy.send_event(UserEvent::AgentsHub(AgentsHubEvent::Hub(event)));
-                })
-            });
+        let proxy = proxy.clone();
+        let hub = open_agents_hub(stores, move |event| {
+            let _ = proxy.send_event(UserEvent::AgentsHub(AgentsHubEvent::Hub(event)));
+        });
         if let Some(hub) = &hub {
             agents::pipe::start(hub.clone());
         }
@@ -146,6 +155,82 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gate (critico: modo privado, dados do utilizador), no caminho que
+    /// embarca: o hub que o `App` abre (`open_agents_hub`, chamado pelo
+    /// `AgentsHubState::open`) vive na loja `agents` do registo das lojas e
+    /// obedece ao modo dele. Com o registo em `Private` o ecra recebe a
+    /// mensagem do agente e o agente le o que o utilizador lhe escreveu, mas
+    /// a pasta fica byte a byte igual. Sem registo nao ha hub. Os gates de
+    /// `agents::store`/`agents::hub` provam o comportamento sobre um grant
+    /// de teste; este prova que o produto o recebe do registo.
+    #[test]
+    fn the_shipped_hub_lives_in_the_registry_agents_store_and_obeys_private_mode() {
+        use crate::agents::store::tests::TempDir;
+        use crate::agents::tools::ToolCall;
+        use neural_core::json_store::StoreMode;
+
+        assert!(open_agents_hub(None, |_| {}).is_none());
+
+        let root = TempDir::new("shipped-hub");
+        let registry = StoreRegistry::mint_for_test(&root.0);
+        let seen: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let hub = open_agents_hub(Some(&registry), move |event| {
+            sink.lock().unwrap().push(event);
+        })
+        .expect("o hub do produto");
+        let dir = root.0.join("agents");
+        assert_eq!(hub.dir(), dir);
+        hub.load();
+        let claude = hub.connect("claude").unwrap();
+        let say = |text: &str| {
+            hub.call(
+                claude,
+                ToolCall::SendMessage {
+                    text: text.into(),
+                    title: None,
+                },
+            )
+            .unwrap();
+        };
+        say("antes");
+        hub.mark_read("claude");
+        let snapshot = || -> Vec<(String, Vec<u8>)> {
+            let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .map(|path| {
+                    (
+                        path.file_name().unwrap().to_string_lossy().into_owned(),
+                        std::fs::read(&path).unwrap(),
+                    )
+                })
+                .collect();
+            files.sort();
+            files
+        };
+        let before = snapshot();
+        assert_eq!(before.len(), 2, "claude.jsonl + state.json: {before:?}");
+
+        registry.set_mode(StoreMode::Private);
+        say("privado");
+        hub.user_message("claude", "segredo").unwrap();
+        hub.mark_read("claude");
+        // Entregue: o ecra viu a mensagem, o agente le o que lhe escreveram.
+        assert!(seen.lock().unwrap().iter().any(|event| matches!(
+            event,
+            AgentEvent::Message { record, .. }
+                if matches!(&record.body, RecordBody::AgentMessage { text, .. } if text == "privado")
+        )));
+        let page = hub
+            .call(claude, ToolCall::GetUserMessages { since_id: None })
+            .unwrap();
+        assert!(page.to_string().contains("segredo"), "{page}");
+        assert_eq!(hub.conversation("claude").len(), 3);
+        // Gravado: nada.
+        assert_eq!(snapshot(), before);
+    }
 
     #[test]
     fn agent_toasts_are_one_capped_line_and_only_for_messages_and_questions() {

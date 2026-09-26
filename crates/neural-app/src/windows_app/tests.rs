@@ -7002,6 +7002,25 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
         agents_clear.contains("AgentHub::clear_conversations"),
         "clear_agent_conversations reaches AgentHub::clear_conversations"
     );
+    // O hub do App nasce no registo das lojas do App, pelo `open_agents_hub`
+    // (comportamento: the_shipped_hub_lives_in_the_registry_agents_store_and_obeys_private_mode).
+    let app_new = body(
+        "impl App {\n    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {",
+        "\n}\n",
+    );
+    assert!(
+        app_new.contains("let agents = AgentsHubState::open(stores.as_ref(), &proxy);"),
+        "App::new opens the agents hub on its own store registry"
+    );
+    let agents_open = body("impl AgentsHubState {", "fn hub(&self)");
+    assert!(
+        agents_open.contains("let hub = open_agents_hub(stores, move |event| {"),
+        "AgentsHubState::open builds the hub only through open_agents_hub"
+    );
+    assert!(
+        !agents_open.contains(".grant(") && !agents_open.contains("AgentHub::new("),
+        "AgentsHubState::open has no second way to a hub"
+    );
     assert!(
         sink.contains("ClearTarget::History => match self.history.clear() {"),
         "\"Apagar histórico\" must also clear history.jsonl"

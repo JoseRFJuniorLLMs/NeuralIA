@@ -15,7 +15,10 @@
 //! `App`. Enquanto o registo disser `StoreMode::Private`, nada daqui escreve:
 //! as conversas ficam no ecra e na memoria (`Conversation::unsaved`), o
 //! agente le-as pelo `get_user_messages`, e nem uma reescrita posterior do
-//! ficheiro as leva ao disco. Apagar (`clear`) vale sempre.
+//! ficheiro as leva ao disco. Uma reescrita que o modo privado vedou (a do
+//! arranque, que limpa uma linha cortada, ou a do tecto) fica por fazer, nao
+//! perdida: e a primeira escrita permitida que a faz. Apagar (`clear`) vale
+//! sempre.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -438,6 +441,11 @@ pub(crate) struct Conversation {
     /// privado): ficam no ecra e na memoria e nunca entram numa reescrita do
     /// ficheiro, mesmo depois de o modo voltar a normal.
     unsaved: BTreeSet<u64>,
+    /// O ficheiro esta atras da memoria: uma reescrita ficou por fazer (o
+    /// modo privado vedou-a -- a do arranque, que limpa uma linha cortada,
+    /// ou a do tecto). A escrita permitida seguinte reescreve o ficheiro
+    /// inteiro em vez de lhe acrescentar uma linha.
+    stale: bool,
 }
 
 impl Conversation {
@@ -456,6 +464,7 @@ impl Conversation {
             records: records.into(),
             bytes,
             unsaved: BTreeSet::new(),
+            stale: false,
         }
     }
 
@@ -612,14 +621,17 @@ impl ConversationStore {
             needs_rewrite = true;
         }
         if needs_rewrite {
-            self.rewrite(agent, &conversation)?;
+            self.rewrite(agent, &mut conversation)?;
         }
         Ok(conversation)
     }
 
     /// Acrescenta `record` a conversa e ao ficheiro; passando do tecto,
     /// reescreve o ficheiro so com os registos mais recentes. Com as
-    /// escritas vedadas (modo privado) o registo fica so na memoria.
+    /// escritas vedadas (modo privado) o registo fica so na memoria. Se uma
+    /// reescrita ficou por fazer (`Conversation::stale`), e ela que leva o
+    /// registo ao disco: acrescentar a um ficheiro com uma linha cortada
+    /// colava-o a ela, e o arranque seguinte descartava os dois.
     pub(crate) fn append(
         &self,
         agent: &str,
@@ -631,6 +643,8 @@ impl ConversationStore {
             conversation.records.push_back(record);
             if conversation.over_cap() {
                 conversation.trim_to_keep();
+                // Vedada: fica marcada para a primeira escrita permitida.
+                return self.rewrite(agent, conversation);
             }
             return Ok(());
         }
@@ -639,6 +653,9 @@ impl ConversationStore {
         conversation.records.push_back(record);
         if conversation.over_cap() {
             conversation.trim_to_keep();
+            return self.rewrite(agent, conversation);
+        }
+        if conversation.stale {
             return self.rewrite(agent, conversation);
         }
         fs::create_dir_all(self.dir())?;
@@ -652,8 +669,10 @@ impl ConversationStore {
     }
 
     /// Reescreve o ficheiro com os registos que podem estar no disco: os de
-    /// uma sessao privada (`unsaved`) nunca entram.
-    fn rewrite(&self, agent: &str, conversation: &Conversation) -> io::Result<()> {
+    /// uma sessao privada (`unsaved`) nunca entram. Vedada (modo privado) ou
+    /// falhada, fica marcada (`stale`) para a escrita permitida seguinte.
+    fn rewrite(&self, agent: &str, conversation: &mut Conversation) -> io::Result<()> {
+        conversation.stale = true;
         if !self.writes_allowed() {
             return Ok(());
         }
@@ -664,7 +683,9 @@ impl ConversationStore {
             }
             body.push_str(&record.line());
         }
-        write_atomic(&self.conversation_path(agent), body.as_bytes())
+        write_atomic(&self.conversation_path(agent), body.as_bytes())?;
+        conversation.stale = false;
+        Ok(())
     }
 
     fn load_marks(&self) -> BTreeMap<String, AgentMarks> {
@@ -895,6 +916,74 @@ pub(crate) mod tests {
         registry.set_mode(StoreMode::Private);
         store.clear().unwrap();
         assert!(!path.exists());
+    }
+
+    /// Gate (critico: dados do utilizador, modo privado). Uma reescrita que
+    /// o modo privado vedou -- aqui a do arranque, que limpa uma linha
+    /// cortada -- fica por fazer, nao perdida: enquanto o modo for privado a
+    /// pasta fica byte a byte igual, e a primeira escrita permitida reescreve
+    /// o ficheiro inteiro (sem os registos privados) em vez de colar o
+    /// registo novo a linha cortada, que o arranque seguinte descartaria com
+    /// ele.
+    #[test]
+    fn a_rewrite_vetoed_in_a_private_session_is_done_by_the_next_allowed_write() {
+        let dir = TempDir::new("stale");
+        let (registry, store) = open_store(&dir.0);
+        let mut conversation = Conversation::default();
+        store
+            .append("claude", &mut conversation, message(1, "um"))
+            .unwrap();
+        store
+            .append("claude", &mut conversation, message(2, "dois"))
+            .unwrap();
+        let path = store.conversation_path("claude");
+        // O processo morreu a meio da terceira linha.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(br#"{"id":3,"ts":1,"kind":"mess"#).unwrap();
+        drop(file);
+        let torn = fs::read(&path).unwrap();
+
+        // O arranque numa sessao privada le o que se aproveita e nao escreve.
+        registry.set_mode(StoreMode::Private);
+        let mut conversation = store.load().conversations.remove("claude").unwrap();
+        assert_eq!(conversation.last_id(), 2);
+        store
+            .append("claude", &mut conversation, message(3, "privado"))
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), torn);
+        let names: Vec<String> = fs::read_dir(store.dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["claude.jsonl".to_string()]);
+
+        // De volta ao normal: o registo seguinte entra num ficheiro limpo.
+        registry.set_mode(StoreMode::Normal);
+        store
+            .append("claude", &mut conversation, message(4, "quatro"))
+            .unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.lines()
+                .all(|line| serde_json::from_str::<Value>(line).is_ok()),
+            "{text}"
+        );
+        assert!(!text.contains("privado"), "{text}");
+        assert_eq!(conversation.bytes(), fs::metadata(&path).unwrap().len());
+        let ids = |store: &ConversationStore| -> Vec<u64> {
+            store.load().conversations["claude"]
+                .records
+                .iter()
+                .map(|r| r.id)
+                .collect()
+        };
+        assert_eq!(ids(&store), vec![1, 2, 4]);
+        // Feita a reescrita, volta a acrescentar.
+        store
+            .append("claude", &mut conversation, message(5, "cinco"))
+            .unwrap();
+        assert_eq!(conversation.bytes(), fs::metadata(&path).unwrap().len());
+        assert_eq!(ids(&store), vec![1, 2, 4, 5]);
     }
 
     #[test]
