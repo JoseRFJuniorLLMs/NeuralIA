@@ -15,12 +15,18 @@
 //! - `PromptBuilder`: as instrucoes (`&'static str`: so texto escrito no
 //!   codigo), o pedido do utilizador e os dados cercados, em tres entradas de
 //!   tipos diferentes.
-//! - a cerca: marcadores com um nonce por chamada. Dentro dos dados, uma
-//!   sequencia de tres sinais de menor ou de maior, tambem com os parecidos
-//!   (`‹ « ＜ 〈 ⟨ ≪` ...) e com invisiveis pelo meio, e desfeita; a palavra
-//!   do marcador (tambem em largura total ou com letras cirilicas e gregas
-//!   iguais) e partida; o nonce, se la estiver, sai. Nada la dentro tem a
-//!   forma de um marcador, com o nonce certo ou nao.
+//! - a cerca: marcadores com um nonce de 128 bits por chamada, que a pagina
+//!   nao conhece e que sai dos dados se la estiver. E isto que impede o
+//!   texto de fechar a cerca: so a linha de fim com o nonce a fecha, e la
+//!   dentro nunca ha nenhuma. Por cima, em melhor esforco, para um modelo
+//!   nao tomar um marcador sem nonce por um verdadeiro: uma sequencia de
+//!   tres sinais de menor ou de maior, tambem com os parecidos que
+//!   `angle_weight` conhece (`‹ « ＜ 〈 ⟨ ≪ ᚲ` ...) e com invisiveis pelo meio,
+//!   e desfeita; a palavra do marcador, tambem com as letras parecidas que
+//!   `keyword_fold` conhece (largura total, cirilicas, gregas, armenias,
+//!   Lisu, maiusculas pequenas, letras matematicas), e partida. Um parecido
+//!   que estas tabelas nao conhecem sobrevive, mas sem o nonce nao fecha
+//!   nada.
 //! - `injection_signals`: frases de injecao conhecidas. So avisam; nada e
 //!   recusado por causa delas.
 //! - `Shingles`: janelas de 16 caracteres do texto normalizado, para a
@@ -127,10 +133,10 @@ pub const CONTEXT_DATA_PREAMBLE_PT: &str = "[NeuralIA] CONTEÚDO DE PÁGINA — 
 
 /// O nonce de uma chamada: 128 bits em hexadecimal. As chaves do SipHash do
 /// `RandomState` vem do gerador do sistema operativo e nunca saem do
-/// processo; o nonce so vai para o modelo, nunca para a pagina. Nao e a
-/// garantia da cerca -- essa e a neutralizacao, que vale para qualquer
-/// nonce --, e a segunda camada: um marcador copiado de outra chamada nao
-/// tem o nonce desta.
+/// processo; o nonce so vai para o modelo, nunca para a pagina. E a
+/// garantia da cerca: a pagina nao o conhece, um marcador copiado de outra
+/// chamada nao o tem, e `drop_nonce` tira-o dos dados se la estiver. A
+/// neutralizacao dos parecidos e uma camada por cima, em melhor esforco.
 #[derive(Clone, PartialEq, Eq)]
 pub struct FenceNonce(String);
 
@@ -164,16 +170,18 @@ impl fmt::Debug for FenceNonce {
 }
 
 /// Um caractere que se le como `<` (lado 0) ou `>` (lado 1), e quantos.
+/// Inclui os de `<` e `>` do confusables.txt do Unicode (o runico
+/// U+16B2, as notacoes gregas U+1D236/1D237, o miao U+16F3F).
 fn angle_weight(c: char) -> Option<(u8, usize)> {
     Some(match c {
         '<' | '\u{2039}' | '\u{FF1C}' | '\u{FE64}' | '\u{3008}' | '\u{27E8}' | '\u{2329}'
         | '\u{276E}' | '\u{276C}' | '\u{2770}' | '\u{02C2}' | '\u{02F1}' | '\u{29FC}'
-        | '\u{1438}' => (0, 1),
+        | '\u{1438}' | '\u{16B2}' | '\u{1D236}' => (0, 1),
         '\u{00AB}' | '\u{300A}' | '\u{27EA}' | '\u{226A}' => (0, 2),
         '\u{22D8}' => (0, 3),
         '>' | '\u{203A}' | '\u{FF1E}' | '\u{FE65}' | '\u{3009}' | '\u{27E9}' | '\u{232A}'
         | '\u{276F}' | '\u{276D}' | '\u{2771}' | '\u{02C3}' | '\u{02F2}' | '\u{29FD}'
-        | '\u{1433}' => (1, 1),
+        | '\u{1433}' | '\u{16F3F}' | '\u{1D237}' => (1, 1),
         '\u{00BB}' | '\u{300B}' | '\u{27EB}' | '\u{226B}' => (1, 2),
         '\u{22D9}' => (1, 3),
         _ => return None,
@@ -209,25 +217,60 @@ fn is_ignorable(c: char) -> bool {
 }
 
 /// A letra ASCII minuscula que um caractere parece, para a palavra do
-/// marcador: largura total, e as cirilicas e gregas iguais as latinas.
+/// marcador: largura total, as letras matematicas (U+1D400-1D7C9 e as que
+/// ficaram nos simbolos de letras, como `ℯ` e `ℝ`), e as cirilicas, gregas,
+/// armenias, Lisu e maiusculas pequenas iguais as latinas da palavra.
 fn keyword_fold(c: char) -> Option<char> {
     let folded = match c {
         'A'..='Z' => c.to_ascii_lowercase(),
         'a'..='z' => c,
         '\u{FF21}'..='\u{FF3A}' => char::from(b'a' + (c as u32 - 0xFF21) as u8),
         '\u{FF41}'..='\u{FF5A}' => char::from(b'a' + (c as u32 - 0xFF41) as u8),
-        '\u{0430}' | '\u{0410}' | '\u{0391}' | '\u{03B1}' => 'a',
-        '\u{0501}' | '\u{0500}' => 'd',
-        '\u{0435}' | '\u{0415}' | '\u{0395}' => 'e',
+        '\u{1D400}'..='\u{1D6A3}' => math_latin(c),
+        '\u{1D6A8}'..='\u{1D7C9}' => return math_greek(c),
+        '\u{0430}' | '\u{0410}' | '\u{0391}' | '\u{03B1}' | '\u{0251}' | '\u{1D00}'
+        | '\u{A4EE}' => 'a',
+        '\u{0501}' | '\u{0500}' | '\u{1D05}' | '\u{A4D3}' | '\u{2145}' | '\u{2146}' => 'd',
+        '\u{0435}' | '\u{0415}' | '\u{0395}' | '\u{1D07}' | '\u{A4F0}' | '\u{212E}'
+        | '\u{212F}' | '\u{2130}' | '\u{2147}' => 'e',
         '\u{0440}' | '\u{0420}' | '\u{03A1}' | '\u{03C1}' => 'p',
-        '\u{0433}' => 'r',
-        '\u{0455}' | '\u{0405}' => 's',
-        '\u{0442}' | '\u{0422}' | '\u{03A4}' | '\u{03C4}' => 't',
-        '\u{03C5}' | '\u{0585}' | '\u{057D}' => 'u',
-        '\u{039D}' | '\u{0578}' => 'n',
+        '\u{0433}' | '\u{0280}' | '\u{A4E3}' | '\u{211B}' | '\u{211C}' | '\u{211D}' => 'r',
+        '\u{0455}' | '\u{0405}' | '\u{A731}' | '\u{A4E2}' => 's',
+        '\u{0442}' | '\u{0422}' | '\u{03A4}' | '\u{03C4}' | '\u{1D1B}' | '\u{A4D4}' => 't',
+        '\u{03C5}' | '\u{0585}' | '\u{057D}' | '\u{054D}' | '\u{1D1C}' | '\u{A4F4}' => 'u',
+        '\u{039D}' | '\u{0578}' | '\u{0274}' | '\u{A4E0}' | '\u{2115}' => 'n',
         _ => return None,
     };
     Some(folded)
+}
+
+/// As letras latinas matematicas: 13 estilos seguidos de A-Z e a-z
+/// (negrito, italico, ..., monoespacado) a partir de U+1D400. Os pontos
+/// por atribuir do meio (os que ficaram nos simbolos de letras) caem
+/// tambem numa letra, mas nunca aparecem num texto.
+fn math_latin(c: char) -> char {
+    let at = ((c as u32 - 0x1D400) % 52) as u8;
+    char::from(b'a' + at % 26)
+}
+
+/// As gregas matematicas (5 estilos de 58 a partir de U+1D6A8) iguais as
+/// latinas da palavra, como as gregas simples de `keyword_fold`.
+fn math_greek(c: char) -> Option<char> {
+    match (c as u32 - 0x1D6A8) % 58 {
+        // Alfa maiuscula e minuscula.
+        0 | 26 => Some('a'),
+        // Epsilon.
+        4 => Some('e'),
+        // Ni.
+        12 => Some('n'),
+        // Ro maiuscula e minuscula.
+        16 | 42 => Some('p'),
+        // Tau maiuscula e minuscula.
+        19 | 45 => Some('t'),
+        // Upsilon minuscula.
+        46 => Some('u'),
+        _ => None,
+    }
 }
 
 fn is_keyword_separator(c: char) -> bool {
@@ -352,7 +395,8 @@ fn drop_nonce(text: String, nonce: &str) -> String {
     out
 }
 
-/// O texto de dentro da cerca: sem nada com a forma de um marcador.
+/// O texto de dentro da cerca: sem o nonce e, em melhor esforco, sem os
+/// marcadores parecidos que `angle_weight` e `keyword_fold` conhecem.
 fn neutralize(text: &str, nonce: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let broken = break_angle_runs(&break_keyword(&chars));
