@@ -23,6 +23,9 @@ pub(in crate::windows_app) enum ClearTarget {
     /// Na biblioteca de livros, quando cada livro foi aberto ("Continuar
     /// lendo", recentes); posicoes e marcadores ficam.
     EpubLibrary,
+    /// `downloads.json`: o registo dos downloads acabados (os ficheiros
+    /// baixados ficam onde estao) e os acabados da lista da sessao.
+    Downloads,
     /// `history.jsonl`: o historico cronologico.
     History,
 }
@@ -30,8 +33,13 @@ pub(in crate::windows_app) enum ClearTarget {
 impl ClearTarget {
     /// Todos os alvos, na ordem em que o event loop os apaga. E a lista que
     /// `CLEAR_HISTORY_TARGETS` tem de cobrir inteira.
-    pub(in crate::windows_app) const ALL: [Self; 4] =
-        [Self::Tabs, Self::Memory, Self::EpubLibrary, Self::History];
+    pub(in crate::windows_app) const ALL: [Self; 5] = [
+        Self::Tabs,
+        Self::Memory,
+        Self::EpubLibrary,
+        Self::Downloads,
+        Self::History,
+    ];
 }
 
 /// A tabela: o que um Ctrl+Shift+Delete confirmado apaga, pela ordem.
@@ -69,6 +77,9 @@ impl ClearHistorySink for App {
                 {
                     self.submit_epub_job(EpubJob::ClearReadingHistory);
                 }
+            }
+            ClearTarget::Downloads => {
+                self.download_event(neural_core::downloads::DownloadEvent::ClearLog)
             }
             ClearTarget::History => match self.history.clear() {
                 None => {

@@ -107,6 +107,9 @@ pub(in crate::windows_app) enum UserEvent {
     /// Os ganchos das WebViews (`webview_hooks.rs`): o que cada WebView
     /// avisa, com o hospedeiro de onde veio.
     WebView(WebViewEvent),
+    /// O gestor de downloads (`downloads.rs`): o que o WebView2 avisa de cada
+    /// download e o fim de cada um, com o evento do `neural_core::downloads`.
+    Download(neural_core::downloads::DownloadEvent),
     /// Pedido da pagina local do painel lateral (canal proprio), com o
     /// numero da pagina que o mandou.
     Panel(side_panel::PanelPost),
@@ -3144,6 +3147,9 @@ pub(in crate::windows_app) struct App {
     pub(in crate::windows_app) stores: Option<StoreRegistry>,
     /// O pedido de chave nativo e o cofre das chaves (`secret_prompt.rs`).
     pub(in crate::windows_app) keys: KeysState,
+    /// O gestor de downloads (`downloads.rs`): o `DownloadManager`, as
+    /// operacoes vivas do WebView2 e o `downloads.json`.
+    pub(in crate::windows_app) downloads: DownloadsState,
 }
 
 impl App {
@@ -3194,6 +3200,7 @@ impl App {
         // disco: so os grants, pedidos depois, dizem onde cada loja vive.
         let stores = StoreRegistry::mint(&config.data_dir).ok();
         let keys = KeysState::new(proxy.clone());
+        let downloads = DownloadsState::open(stores.as_ref());
         Self {
             document,
             pdf_bytes: Arc::new(Mutex::new(Vec::new())),
@@ -3271,6 +3278,7 @@ impl App {
             live_panel: LivePanel::off(),
             stores,
             keys,
+            downloads,
         }
     }
 }
@@ -6981,6 +6989,7 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
         "webview_hooks.rs",
         include_str!("windows_app/webview_hooks.rs"),
     ),
+    ("downloads.rs", include_str!("windows_app/downloads.rs")),
     ("tests.rs", include_str!("windows_app/tests.rs")),
 ];
 
@@ -7054,6 +7063,8 @@ pub(in crate::windows_app) mod native_card;
 pub(in crate::windows_app) use native_card::*;
 pub(in crate::windows_app) mod webview_hooks;
 pub(in crate::windows_app) use webview_hooks::*;
+pub(in crate::windows_app) mod downloads;
+pub(in crate::windows_app) use downloads::*;
 
 pub(in crate::windows_app) mod app;
 #[allow(unused_imports)]

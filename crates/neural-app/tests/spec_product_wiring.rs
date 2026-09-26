@@ -60,6 +60,8 @@ const ALL_SOURCES: &str = concat!(
     "\n",
     include_str!("../src/windows_app/webview_hooks.rs"),
     "\n",
+    include_str!("../src/windows_app/downloads.rs"),
+    "\n",
     include_str!("../src/windows_app/app/mod.rs"),
     "\n",
     include_str!("../src/windows_app/app/gmail.rs"),

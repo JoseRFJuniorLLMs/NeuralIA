@@ -599,6 +599,21 @@ jobs:
       - name: Published exe has no LLM endpoint override
         shell: pwsh
         run: ./scripts/test-exe-no-endpoint-override.ps1 -ExePath ci-tested/NeuralIA.exe
+      # E2E of the download manager (downloads-manager) on the exact bytes
+      # that release.yml packages. It opens the exe (windows that can take the
+      # focus), so it never runs in the local suite. The fixture
+      # (scripts/downloads-fixture.mjs) listens on 127.0.0.1 only: no request
+      # leaves the runner. Gates: a fixture setup.exe is refused before it
+      # starts (nothing on disk, recorded as blocked) and a PDF lands with the
+      # mark of the web (Zone.Identifier). The spike (does destroying a WebView
+      # cancel its download?) only reports, in the log and the step summary;
+      # it never fails the step.
+      - name: Downloads E2E on the tested exe (setup.exe refused, PDF with MOTW)
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          ./scripts/test-downloads.ps1 -SelfTest
+          ./scripts/test-downloads.ps1 -ExePath ci-tested/NeuralIA.exe
       # Release contract of the CI-only accelerator spike (infra-accel-spike):
       # the exact bytes that release.yml packages were built without the spike
       # feature, so the spike marker is not in them. The spike itself runs in

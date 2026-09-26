@@ -5,6 +5,7 @@
 pub mod agent_protocol;
 pub mod agent_security;
 pub mod config;
+pub mod downloads;
 pub mod epub;
 pub mod error;
 pub mod file_risk;

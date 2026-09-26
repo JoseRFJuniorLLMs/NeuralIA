@@ -13,8 +13,8 @@ use wry::PageLoadEvent;
 //   pagina carregada (`WebViewEvent::PageLoaded`);
 // - `App::install_webview_hooks` (depois do `build`, privada ao modulo): a
 //   metade que so o COM do WebView2 da -- os itens do NeuralIA no menu do
-//   botao direito (`WEBVIEW_MENU_ITEMS`) e o `AcceleratorKeyPressed` de cada
-//   WebView.
+//   botao direito (`WEBVIEW_MENU_ITEMS`), o `AcceleratorKeyPressed` de cada
+//   WebView e o gestor de downloads (`downloads.rs`) nas paginas da internet.
 //
 // As duas metades sao uma so chamada para quem constroi: `hooked_builder`
 // devolve um `HookedBuilder` com o hospedeiro que recebeu, e o `build` do
@@ -137,8 +137,8 @@ impl WebViewHost {
 /// O que o WebView faz com um download que a pagina comeca.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::windows_app) enum DownloadPolicy {
-    /// O WebView2 trata-o como sempre (o gestor de downloads da 2.3 entra
-    /// por aqui, nas paginas da internet).
+    /// O gestor de downloads (`downloads.rs`) decide cada um: recusa
+    /// programas e disfarces e marca o ficheiro acabado com a marca da Web.
     Managed,
     /// Recusado antes de comecar: uma pagina local nossa nao descarrega
     /// nada, e o monitor do Gmail, que ninguem ve, tambem nao.
@@ -865,6 +865,9 @@ pub(in crate::windows_app) trait HookRegistrar {
     fn context_menu(&mut self, host: WebViewHost, items: &[usize]) -> Result<(), String>;
     /// O `AcceleratorKeyPressed` de `accelerator_lookup` neste hospedeiro.
     fn accelerators(&mut self, host: WebViewHost) -> Result<(), String>;
+    /// O gestor de downloads (`downloads.rs`): o `DownloadStarting` e a
+    /// pasta escolhida, nos hospedeiros com `DownloadPolicy::Managed`.
+    fn downloads(&mut self, host: WebViewHost) -> Result<(), String>;
 }
 
 /// O que `install_webview_hooks` faz com uma WebView acabada de construir:
@@ -894,6 +897,17 @@ pub(in crate::windows_app) fn install_hooks_with(
             host.describe()
         ));
     }
+    // Sem o gestor, o WebView2 grava cada ficheiro como sempre gravou. So
+    // falha num runtime sem ICoreWebView2_4 (o `DownloadStarting`), onde
+    // nem o wry consegue recusar: fica no log.
+    if hooks.downloads == DownloadPolicy::Managed
+        && let Err(error) = registrar.downloads(host)
+    {
+        missing.push(format!(
+            "downloads: {} sem o gestor de downloads ({error})",
+            host.describe()
+        ));
+    }
     missing
 }
 
@@ -901,6 +915,7 @@ pub(in crate::windows_app) fn install_hooks_with(
 struct ComHookRegistrar<'a> {
     webview: &'a WebView,
     auto_scroll: SharedFlag,
+    downloads: &'a DownloadsShared,
     proxy: EventLoopProxy<UserEvent>,
 }
 
@@ -916,6 +931,10 @@ impl HookRegistrar for ComHookRegistrar<'_> {
 
     fn accelerators(&mut self, host: WebViewHost) -> Result<(), String> {
         register_webview_accelerators(self.webview, host, self.proxy.clone())
+    }
+
+    fn downloads(&mut self, host: WebViewHost) -> Result<(), String> {
+        register_download_manager(self.webview, host, self.downloads, self.proxy.clone())
     }
 }
 
@@ -997,13 +1016,15 @@ impl App {
     /// `HookedBuilder` traz aqui cada uma que constroi, com o hospedeiro
     /// que recebeu, e ela recebe o que a tabela manda -- os itens do menu
     /// do botao direito nas paginas que rolam, o `AcceleratorKeyPressed`
-    /// em todas. Privado ao modulo: nenhum sitio regista por conta propria.
+    /// em todas, o gestor de downloads nas que tem `DownloadPolicy::Managed`.
+    /// Privado ao modulo: nenhum sitio regista por conta propria.
     /// Um runtime WebView2 sem um dos eventos deixa a WebView sem esse
     /// gancho e fica no log.
     fn install_webview_hooks(&self, webview: &WebView, host: WebViewHost) {
         let mut registrar = ComHookRegistrar {
             webview,
             auto_scroll: self.auto_scroll.clone(),
+            downloads: &self.downloads.shared,
             proxy: self.proxy.clone(),
         };
         for line in install_hooks_with(host, &webview_hooks(host), &mut registrar) {
