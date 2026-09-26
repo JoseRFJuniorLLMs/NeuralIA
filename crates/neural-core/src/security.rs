@@ -1,8 +1,166 @@
 use std::net::IpAddr;
 
+use ureq::{
+    config::Config,
+    http::Uri,
+    unversioned::{
+        resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver},
+        transport::NextTimeout,
+    },
+};
 use url::{Host, Url};
 
 use crate::{NeuralError, Result};
+
+#[derive(Debug, Default)]
+pub(crate) struct PublicResolver {
+    inner: DefaultResolver,
+}
+
+impl Resolver for PublicResolver {
+    fn resolve(
+        &self,
+        uri: &Uri,
+        config: &Config,
+        timeout: NextTimeout,
+    ) -> std::result::Result<ResolvedSocketAddrs, ureq::Error> {
+        let resolved = self.inner.resolve(uri, config, timeout)?;
+        let mut safe = self.inner.empty();
+
+        for address in &resolved {
+            if !is_forbidden_ip(address.ip()) {
+                safe.push(*address);
+            }
+        }
+
+        if safe.is_empty() {
+            Err(ureq::Error::HostNotFound)
+        } else {
+            Ok(safe)
+        }
+    }
+}
+
+/// Onde pode estar o destino de um pedido, decidido DEPOIS da resolucao de
+/// nomes, sobre cada endereco (infra-llm-untrusted, plano 2.3). Um nome que
+/// resolve para fora da sua localidade nao e ligado: o resolvedor tira esse
+/// endereco, e sem nenhum sobra `HostNotFound`.
+///
+/// - `Public`: a Internet. `PublicResolver`, o do Reader, que o transporte
+///   de IA (`llm::transport`) usa para os hosts fixados dos fornecedores.
+/// - `Loopback`: este computador (127.0.0.0/8, `::1` e o `::1` mapeado de
+///   um IPv4 de loopback). Para os servidores de modelos locais (Ollama, LM
+///   Studio) do byom-backends.
+/// - `Lan`: a rede privada (10/8, 172.16/12, 192.168/16 e fc00::/7, direto
+///   ou mapeado em IPv6). Nunca o link-local (169.254/16, fe80::/10: o
+///   servico de metadados das nuvens vive la), nunca o CGNAT, nunca um
+///   tunel 6to4/NAT64.
+///
+/// As tres partilham `is_forbidden_ip`: o `Loopback` e o `Lan` so admitem
+/// enderecos que o `Public` recusa, e so as faixas acima dentro deles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Locality {
+    Public,
+    Loopback,
+    Lan,
+}
+
+impl Locality {
+    /// Se um endereco ja resolvido pertence a esta localidade.
+    pub fn admits(self, ip: IpAddr) -> bool {
+        match self {
+            Self::Public => !is_forbidden_ip(ip),
+            Self::Loopback => is_forbidden_ip(ip) && is_loopback_ip(ip),
+            Self::Lan => is_forbidden_ip(ip) && is_lan_ip(ip),
+        }
+    }
+}
+
+/// O IPv4 de um endereco: ele proprio, ou o mapeado (`::ffff:a.b.c.d`), que
+/// o sistema liga como o IPv4. O 6to4 e o NAT64 NAO entram: sao rotas por um
+/// relay, nao este computador nem esta rede.
+fn plain_or_mapped_v4(ip: IpAddr) -> Option<std::net::Ipv4Addr> {
+    match ip {
+        IpAddr::V4(ip) => Some(ip),
+        IpAddr::V6(ip) => ip.to_ipv4_mapped(),
+    }
+}
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match plain_or_mapped_v4(ip) {
+        Some(v4) => v4.octets()[0] == 127,
+        None => ip == IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    }
+}
+
+fn is_lan_ip(ip: IpAddr) -> bool {
+    match (plain_or_mapped_v4(ip), ip) {
+        (Some(v4), _) => {
+            let [a, b, _, _] = v4.octets();
+            a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168)
+        }
+        // fc00::/7, os enderecos locais unicos (ULA).
+        (None, IpAddr::V6(v6)) => (v6.segments()[0] & 0xfe00) == 0xfc00,
+        (None, IpAddr::V4(_)) => false,
+    }
+}
+
+/// O filtro dos resolvedores `Loopback` e `Lan`: resolve como o do sistema e
+/// guarda so os enderecos da localidade.
+fn resolve_within(
+    inner: &DefaultResolver,
+    locality: Locality,
+    uri: &Uri,
+    config: &Config,
+    timeout: NextTimeout,
+) -> std::result::Result<ResolvedSocketAddrs, ureq::Error> {
+    let resolved = inner.resolve(uri, config, timeout)?;
+    let mut kept = inner.empty();
+    for address in &resolved {
+        if locality.admits(address.ip()) {
+            kept.push(*address);
+        }
+    }
+    if kept.is_empty() {
+        Err(ureq::Error::HostNotFound)
+    } else {
+        Ok(kept)
+    }
+}
+
+/// So este computador (`Locality::Loopback`).
+#[derive(Debug, Default)]
+pub(crate) struct LoopbackResolver {
+    inner: DefaultResolver,
+}
+
+impl Resolver for LoopbackResolver {
+    fn resolve(
+        &self,
+        uri: &Uri,
+        config: &Config,
+        timeout: NextTimeout,
+    ) -> std::result::Result<ResolvedSocketAddrs, ureq::Error> {
+        resolve_within(&self.inner, Locality::Loopback, uri, config, timeout)
+    }
+}
+
+/// So a rede local privada (`Locality::Lan`).
+#[derive(Debug, Default)]
+pub(crate) struct LanResolver {
+    inner: DefaultResolver,
+}
+
+impl Resolver for LanResolver {
+    fn resolve(
+        &self,
+        uri: &Uri,
+        config: &Config,
+        timeout: NextTimeout,
+    ) -> std::result::Result<ResolvedSocketAddrs, ureq::Error> {
+        resolve_within(&self.inner, Locality::Lan, uri, config, timeout)
+    }
+}
 
 pub fn validate_web_url(input: &str) -> Result<Url> {
     let url = Url::parse(input).map_err(|_| NeuralError::InvalidUrl(input.to_string()))?;
@@ -272,6 +430,110 @@ mod tests {
             validate_redirect_target(&from, "http://127.0.0.1:8080/admin"),
             Err(NeuralError::UnsafeRedirect(_))
         ));
+    }
+
+    /// Endereco, e se o `Public`, o `Loopback` e o `Lan` o admitem.
+    const RESOLVER_TABLE: &[(&str, bool, bool, bool)] = &[
+        // Loopback, IPv4, IPv6 e IPv4 mapeado em IPv6.
+        ("127.0.0.1", false, true, false),
+        ("127.1.2.3", false, true, false),
+        ("::1", false, true, false),
+        ("::ffff:127.0.0.1", false, true, false),
+        // Rede privada (RFC 1918 e ULA), direta e mapeada.
+        ("10.0.0.5", false, false, true),
+        ("172.16.3.4", false, false, true),
+        ("172.31.255.1", false, false, true),
+        ("192.168.1.10", false, false, true),
+        ("::ffff:192.168.1.10", false, false, true),
+        ("::ffff:10.1.2.3", false, false, true),
+        ("fd12:3456::1", false, false, true),
+        ("fc00::1", false, false, true),
+        // Link-local (o servico de metadados das nuvens), direto e mapeado.
+        ("169.254.169.254", false, false, false),
+        ("::ffff:169.254.169.254", false, false, false),
+        ("fe80::1", false, false, false),
+        // CGNAT, nao especificado, multicast, documentacao.
+        ("100.64.0.1", false, false, false),
+        ("0.0.0.0", false, false, false),
+        ("::", false, false, false),
+        ("224.0.0.1", false, false, false),
+        ("ff02::1", false, false, false),
+        ("2001:db8::1", false, false, false),
+        // Tuneis para o loopback e a rede local: nem publicos nem locais.
+        ("2002:7f00:1::", false, false, false),
+        ("64:ff9b::a00:1", false, false, false),
+        // Publicos.
+        ("8.8.8.8", true, false, false),
+        ("172.32.0.1", true, false, false),
+        ("::ffff:8.8.8.8", true, false, false),
+        ("2606:4700:4700::1111", true, false, false),
+    ];
+
+    fn literal_uri(ip: IpAddr) -> Uri {
+        let host = match ip {
+            IpAddr::V4(ip) => ip.to_string(),
+            IpAddr::V6(ip) => format!("[{ip}]"),
+        };
+        format!("http://{host}:8080/")
+            .parse()
+            .expect("a literal URI")
+    }
+
+    /// O resolvedor real sobre um URI com o IP literal: o do sistema so
+    /// interpreta o literal, nenhum nome vai a um DNS.
+    fn resolver_admits(resolver: &dyn Resolver, ip: IpAddr) -> bool {
+        let config = ureq::Agent::config_builder().build();
+        let timeout = NextTimeout {
+            after: ureq::unversioned::transport::time::Duration::NotHappening,
+            reason: ureq::Timeout::Global,
+        };
+        match resolver.resolve(&literal_uri(ip), &config, timeout) {
+            Ok(addresses) => {
+                assert!(
+                    addresses.iter().all(|address| address.ip() == ip),
+                    "{ip}: only the literal comes back"
+                );
+                !addresses.is_empty()
+            }
+            Err(ureq::Error::HostNotFound) => false,
+            Err(other) => panic!("{ip}: unexpected resolver error {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolver_tables() {
+        let public = PublicResolver::default();
+        let loopback = LoopbackResolver::default();
+        let lan = LanResolver::default();
+        for &(address, in_public, in_loopback, in_lan) in RESOLVER_TABLE {
+            let ip: IpAddr = address.parse().expect(address);
+            for (locality, resolver, expected) in [
+                (Locality::Public, &public as &dyn Resolver, in_public),
+                (Locality::Loopback, &loopback as &dyn Resolver, in_loopback),
+                (Locality::Lan, &lan as &dyn Resolver, in_lan),
+            ] {
+                assert_eq!(
+                    locality.admits(ip),
+                    expected,
+                    "{locality:?}.admits({address})"
+                );
+                assert_eq!(
+                    resolver_admits(resolver, ip),
+                    expected,
+                    "the {locality:?} resolver on {address}"
+                );
+            }
+        }
+        // Cada localidade tem enderecos na tabela: nenhuma e vazia por
+        // engano.
+        for column in 0..3 {
+            assert!(
+                RESOLVER_TABLE
+                    .iter()
+                    .any(|row| [row.1, row.2, row.3][column]),
+                "column {column} admits something"
+            );
+        }
     }
 
     #[test]

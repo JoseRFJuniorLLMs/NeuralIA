@@ -422,6 +422,17 @@ jobs:
           '@
             },
             @{
+              Label = "page-eval-skips-generation"
+              Test = "page_eval_drops_a_navigated_read"
+              SourcePath = "crates/neural-app/src/windows_app/page_eval.rs"
+              Old = @'
+              if read.epoch.current() != read.generation {
+          '@
+              New = @'
+              if false && read.epoch.current() != read.generation {
+          '@
+            },
+            @{
               Label = "reader-born-without-hooks"
               Test = "every_webview_gets_the_hooks"
               SourcePath = "crates/neural-app/src/windows_app/app/pages.rs"
