@@ -1364,6 +1364,26 @@ impl ShellHost for WindowsShell {
 
 // ===================== o estado e o App =====================
 
+impl DownloadsState {
+    /// «Permitir baixar programas»: grava so a escolha em
+    /// `downloads-settings.json` (debaixo do trinco da loja: a pasta que la
+    /// esta fica como esta) e, gravada, o gestor passa a usa-la. Sem loja,
+    /// ou com a gravacao recusada, nada muda.
+    pub(in crate::windows_app) fn set_allow_programs(&mut self, on: bool) -> Result<(), String> {
+        let store = self
+            .settings_store
+            .as_mut()
+            .ok_or_else(|| "sem a pasta de dados".to_string())?;
+        store
+            .update(|settings| settings.allow_programs = on)
+            .map_err(|error| error.to_string())?;
+        let mut next = self.manager.settings().clone();
+        next.allow_programs = on;
+        self.manager.on_event(DownloadEvent::SettingsChanged(next));
+        Ok(())
+    }
+}
+
 /// O estado da feature no `App`.
 pub(in crate::windows_app) struct DownloadsUiState {
     pub(in crate::windows_app) rows: DownloadRows,
@@ -1664,20 +1684,8 @@ impl App {
     /// esta no disco fica como esta) e o gestor passa a usa-la. Mesmo
     /// ligada, cada programa pede o seu «Baixar programa?».
     pub(in crate::windows_app) fn set_allow_programs(&mut self, on: bool) {
-        let mut next = self.downloads.manager.settings().clone();
-        next.allow_programs = on;
-        let saved = match self.downloads.settings_store.as_mut() {
-            Some(store) => store
-                .update(|settings| settings.allow_programs = on)
-                .map(|_| ())
-                .map_err(|error| error.to_string()),
-            None => Err("sem a pasta de dados".to_string()),
-        };
-        match saved {
-            Ok(()) => self.download_event(DownloadEvent::SettingsChanged(next)),
-            Err(error) => {
-                self.show_splash(format!("A definição não foi gravada: {error}"), 4);
-            }
+        if let Err(error) = self.downloads.set_allow_programs(on) {
+            self.show_splash(format!("A definição não foi gravada: {error}"), 4);
         }
         self.render_downloads_panel();
     }

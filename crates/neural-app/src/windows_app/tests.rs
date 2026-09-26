@@ -24202,6 +24202,18 @@ mod downloads_gates {
             name: "setup.exe".to_string(),
             reason: BlockReason::Program,
         });
+        // O corpo de um aviso dos downloads parte-se em ate duas linhas; o
+        // do Gmail fica na linha de sempre.
+        let view = |notice: &crate::notify::Notice| {
+            ToastView::of(&crate::notify::ToastFrame {
+                token: 1,
+                notice: notice.clone(),
+            })
+        };
+        assert!(view(&toast).wrap);
+        let mut gmail = toast.clone();
+        gmail.kind = crate::notify::NoticeKind::Gmail;
+        assert!(!view(&gmail).wrap);
         assert_eq!(toast.kind, crate::notify::NoticeKind::Download);
         assert_eq!(toast.title, "Download bloqueado");
         assert!(toast.body.starts_with("setup.exe é um programa."));
@@ -24272,6 +24284,71 @@ mod downloads_gates {
             "{:?}",
             host.log
         );
+    }
+
+    /// «Permitir baixar programas» da seccao Downloads: grava so a escolha
+    /// no `downloads-settings.json` (a pasta que la estava fica) e o gestor
+    /// passa a perguntar em vez de recusar -- e desligada, volta a recusar.
+    #[test]
+    fn the_allow_programs_switch_is_saved_and_used() {
+        let dir = Scratch::new("allow");
+        let chosen = dir.0.join("baixados");
+        std::fs::create_dir_all(&chosen).expect("pasta");
+        let body = serde_json::json!({
+            "version": SETTINGS_VERSION,
+            "data": { "folder": chosen, "allow_programs": false }
+        });
+        let file = dir.0.join(DOWNLOADS_SETTINGS_STORE.name);
+        std::fs::write(&file, serde_json::to_vec(&body).expect("json")).expect("definicoes");
+        let stores = StoreRegistry::mint_for_test(&dir.0);
+        let mut state = DownloadsState::open(Some(&stores));
+        let start = |state: &mut DownloadsState, id: u64| {
+            state
+                .run(
+                    false,
+                    DownloadEvent::Starting(DownloadStart {
+                        id: DownloadId(id),
+                        webview: WebViewKey(1),
+                        private: false,
+                        proposed: chosen.join("setup.exe"),
+                        host: None,
+                        total: None,
+                        at: id,
+                    }),
+                )
+                .later
+        };
+        assert!(
+            !start(&mut state, 1)
+                .iter()
+                .any(|effect| matches!(effect, DownloadEffect::Ask { .. })),
+            "desligada, um programa ja perguntava"
+        );
+        state.set_allow_programs(true).expect("gravada");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).expect("ficheiro")).expect("json");
+        assert_eq!(saved["data"]["allow_programs"], true);
+        assert_eq!(
+            saved["data"]["folder"].as_str().map(PathBuf::from),
+            Some(chosen.clone()),
+            "a pasta que estava no ficheiro perdeu-se"
+        );
+        assert!(state.manager.settings().allow_programs);
+        assert!(start(&mut state, 2).contains(&DownloadEffect::Ask {
+            id: DownloadId(2),
+            reason: BlockReason::Program
+        }));
+        state.set_allow_programs(false).expect("gravada");
+        assert!(!state.manager.settings().allow_programs);
+        assert!(
+            !start(&mut state, 3)
+                .iter()
+                .any(|effect| matches!(effect, DownloadEffect::Ask { .. }))
+        );
+        // Sem loja (nunca no produto): nada muda.
+        let mut none = DownloadsState::open(None);
+        assert!(none.set_allow_programs(true).is_err());
+        assert!(!none.manager.settings().allow_programs);
     }
 
     /// O progresso do plano, os tamanhos e a previsao.
