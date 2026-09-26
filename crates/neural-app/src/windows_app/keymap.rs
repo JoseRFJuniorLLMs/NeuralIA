@@ -49,10 +49,11 @@ use winit::keyboard::ModifiersState;
 // disparam num atalho preso; uma pagina que reaja ao `keypress` ou ao
 // `keyup` ve o toque (e nem essa faz correr o comando, que nasce aqui).
 //
-// Hoje nenhuma WebView prende atalho nenhum: os atalhos das paginas
-// continuam todos no `NEURALIA_KEYMAP_SCRIPT` (intocado), e o unico ambito
-// com linhas e o `Window` (a janela e a omnibox). Cada atalho novo da 2.3
-// entra com o seu comando, no PR dele (regra C13).
+// As WebViews prendem so os atalhos `Global`: hoje o Ctrl+J dos Downloads
+// (downloads-ui), em cada hospedeiro menos o monitor do Gmail. Os atalhos
+// das paginas continuam todos no `NEURALIA_KEYMAP_SCRIPT` (intocado), e o
+// resto do registo e do ambito `Window` (a janela e a omnibox). Cada atalho
+// novo da 2.3 entra com o seu comando, no PR dele (regra C13).
 
 /// Uma combinacao de teclas: a tecla virtual (a que o
 /// `AcceleratorKeyPressed` e o `WM_KEYDOWN` dao) e os tres modificadores,

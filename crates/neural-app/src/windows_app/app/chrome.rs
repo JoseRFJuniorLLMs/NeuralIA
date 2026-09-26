@@ -1344,6 +1344,7 @@ impl App {
             drag: self.drag_paint(),
             pomodoro_label: self.pomodoro_bar_label(),
             maximized: self.window.as_ref().is_some_and(Window::is_maximized),
+            downloads: downloads_badge(&self.downloads.manager),
         }
     }
 }

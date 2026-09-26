@@ -42,9 +42,10 @@ use wry::PageLoadEvent;
 // embarca deixa a subida passar, por isso a pagina recebe tambem o `keyup`
 // de um atalho preso (o que o spike nao mediu).
 // O `accelerator_lookup` e a decisao do mapa de teclas (`keymap.rs`,
-// infra-commands-keymap) com o hospedeiro como origem; hoje nenhum
-// hospedeiro tem atalhos la (cada um chega no PR do seu comando), e o
-// `Handled` so muda quando ela prende a tecla.
+// infra-commands-keymap) com o hospedeiro como origem; hoje so o Ctrl+J
+// dos Downloads (downloads-ui, `Global`) e preso nas WebViews (cada atalho
+// chega no PR do seu comando), e o `Handled` so muda quando ela prende a
+// tecla.
 
 /// Que WebView e esta: quem decide o que ela recebe da tabela e de onde vem
 /// um atalho ou um item de menu (a origem e o hospedeiro, nunca a pagina).

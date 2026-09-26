@@ -282,7 +282,7 @@ pub(in crate::windows_app) unsafe extern "system" fn omnibox_subclass(
         if nonce == 0 || LIFECYCLE_LAST_HOME_NONCE.swap(nonce, Ordering::AcqRel) != nonce {
             let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
             SetWindowTextW(hwnd, windows_sys::w!(""));
-            let _ = proxy.send_event(UserEvent::HomeRequested);
+            let _ = proxy.send_event(UserEvent::LifecycleProbeHome);
         }
         return 0;
     }
@@ -386,7 +386,11 @@ impl App {
     }
 
     /// O equivalente ao Ctrl+L do Chrome. Na Home foca a caixa principal;
-    /// no comparador abre a palette flutuante da coluna ativa.
+    /// no comparador abre a palette flutuante da coluna ativa. Fora dele
+    /// (Ctrl+L, Ctrl+K e Ctrl+N na Web completa, no Leitor...) vai a Home,
+    /// que destroi a Web completa e os downloads dela: com downloads a
+    /// correr pergunta antes (`request_home`), e «Continuar baixando» deixa
+    /// a pagina onde esta.
     pub(in crate::windows_app) fn focus_omnibox(&mut self) {
         if self.surface == Surface::Comparator {
             let index = self
@@ -401,7 +405,9 @@ impl App {
             return;
         }
 
-        self.show_home();
+        if !self.request_home() {
+            return;
+        }
         if let Some(edit) = self.omnibox {
             unsafe {
                 SetFocus(edit);
@@ -444,7 +450,9 @@ impl App {
             InputRoute::OpenEpub(None) => self.open_epub_dialog(true),
             InputRoute::OpenEpub(Some(path)) => self.open_epub(path),
             InputRoute::Intent => match parse_intent(&input) {
-                Ok(Intent::Home) => self.show_home(),
+                Ok(Intent::Home) => {
+                    self.request_home();
+                }
                 Ok(Intent::Ask(query)) => self.ask(query),
                 Ok(Intent::Compare(query)) => self.compare(CompareRequest::ask(query)),
                 Ok(Intent::Read(url)) => self.read(url.to_string()),
@@ -476,7 +484,9 @@ impl App {
                     self.show_splash(message, 3);
                 }
             }
-            PaletteRoute::Home => self.show_home(),
+            PaletteRoute::Home => {
+                self.request_home();
+            }
             PaletteRoute::Pomodoro(Some(command)) => self.pomodoro_command(command),
             PaletteRoute::Pomodoro(None) => {
                 self.show_splash(POMODORO_COMMAND_HELP.to_string(), 4);
@@ -547,7 +557,8 @@ impl App {
                 return;
             }
         }
-        self.show_home();
+        // Com downloads a correr, pergunta antes (`leave_guard`).
+        self.request_home();
     }
 
     /// ‹ e › da barra: o historico da PAGINA, como no Chrome -- na fonte aberta

@@ -162,7 +162,7 @@ public static class NeuraliaCycleWindowProbe {
         // EDIT da omnibox em TODAS as janelas top-level do processo, inclusive
         // as temporariamente ocultas, e entregue a mensagem à sua subclass.
         // Isso só melhora o transporte do probe; o sucesso do gate continua
-        // exigindo externamente zero hosts WRY_WEBVIEW depois de HomeRequested.
+        // exigindo externamente zero hosts WRY_WEBVIEW depois da Home da sonda.
         bool postedToEdit = false;
         var editClass = new StringBuilder(128);
         EnumWindows(delegate(IntPtr top, IntPtr data) {
@@ -577,7 +577,8 @@ try {
         # Antes a própria app agendava Home/Reopen por timers internos. Isso
         # misturava duas coisas: teardown real e atraso do pump aninhado do
         # WebView2. A mensagem privada passa pelo mesmo EventLoopProxy e chama
-        # exatamente HomeRequested, mas deixa o teste decidir quando medir.
+        # o show_home (LifecycleProbeHome: a Home sem o cartao da saida), mas
+        # deixa o teste decidir quando medir.
         Return-LifecycleProbeHome -Process $process -Nonce $cycle
 
         $visibleAfterHome = Wait-ForNoVisibleWebSurfaces -Process $process -TimeoutSec $CloseTimeoutSec

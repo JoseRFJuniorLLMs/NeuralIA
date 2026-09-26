@@ -62,6 +62,8 @@ const ALL_SOURCES: &str = concat!(
     "\n",
     include_str!("../src/windows_app/downloads.rs"),
     "\n",
+    include_str!("../src/windows_app/downloads_ui.rs"),
+    "\n",
     include_str!("../src/windows_app/commands.rs"),
     "\n",
     include_str!("../src/windows_app/keymap.rs"),

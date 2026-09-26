@@ -880,9 +880,12 @@ impl App {
                 }
             }
             Some(BarHit::GeminiLive) => self.toggle_live_panel(),
+            Some(BarHit::Downloads) => self.toggle_downloads_panel(),
             Some(BarHit::SplitClose) => self.close_split(),
             Some(BarHit::SplitExpand) => self.toggle_split_fullscreen(),
-            Some(BarHit::Home) => self.show_home(),
+            Some(BarHit::Home) => {
+                self.request_home();
+            }
             Some(BarHit::Back) => self.navigate_history(HistoryStep::Back),
             Some(BarHit::Forward) => self.navigate_history(HistoryStep::Forward),
             Some(BarHit::ColumnBack(index)) => self.navigate_column(index, HistoryStep::Back),

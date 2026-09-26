@@ -328,7 +328,9 @@ impl App {
         match request {
             EpubUiRequest::AddBooks => self.open_epub_dialog(false),
             EpubUiRequest::OpenExternal(url) => self.web(url),
-            EpubUiRequest::Close => self.show_home(),
+            EpubUiRequest::Close => {
+                self.request_home();
+            }
         }
     }
 
