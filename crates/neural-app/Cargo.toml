@@ -48,6 +48,18 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Security_Cryptography",
+    # O canal dos agentes externos (src/agents/pipe.rs): named pipe com DACL
+    # so do utilizador atual (Security, Authorization), CreateFileW/ReadFile/
+    # WriteFile/MoveFileEx (Storage_FileSystem, System_IO), GetStdHandle
+    # (Console), OpenProcessToken (Threading). Features da mesma windows-sys
+    # do Cargo.lock: nenhum crate novo.
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
     "Win32_System_LibraryLoader",
     # MessageBeep: o som curto do fim de uma fase do Pomodoro.
     "Win32_System_Diagnostics_Debug",

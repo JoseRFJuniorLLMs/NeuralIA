@@ -6923,6 +6923,7 @@ fn clear_history_runs_every_registered_target() {
         ClearTarget::Memory,
         ClearTarget::EpubLibrary,
         ClearTarget::Downloads,
+        ClearTarget::Agents,
         ClearTarget::History,
     ] {
         assert_eq!(
@@ -6935,7 +6936,7 @@ fn clear_history_runs_every_registered_target() {
         );
     }
     assert_eq!(CLEAR_HISTORY_TARGETS.last(), Some(&ClearTarget::History));
-    assert_eq!(CLEAR_HISTORY_TARGETS.len(), 5);
+    assert_eq!(CLEAR_HISTORY_TARGETS.len(), 6);
 }
 
 /// Ligacao, nao comportamento: o comportamento esta nos gates de
@@ -24058,6 +24059,8 @@ fn existing_stores_have_a_declared_kind() {
         ("tabs.cleared", Automatic, File),
         ("panel-width.json", Automatic, File),
         ("agent", Automatic, Dir),
+        // As conversas com os agentes externos (MCP) e o canal deles.
+        ("agents", Automatic, Dir),
         ("WebView2", Automatic, Dir),
         ("theme", Setting, File),
         ("gmail", Setting, File),

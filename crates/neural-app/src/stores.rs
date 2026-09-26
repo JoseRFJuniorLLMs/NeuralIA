@@ -84,6 +84,10 @@ pub(crate) const APP_STORES: &[StoreSpec] = &[
     StoreSpec::new("panel-width.json", Automatic, File),
     // Os registos e a auditoria de cada corrida do agente.
     StoreSpec::new("agent", Automatic, Dir),
+    // As conversas com os agentes externos (MCP), o estado de leitura e as
+    // credenciais do canal (`agents::store`, `agents::pipe`). Escritas como
+    // efeito lateral do uso; as conversas saem no Ctrl+Shift+Delete.
+    StoreSpec::new("agents", Automatic, Dir),
     // O perfil do WebView2 (cookies, cache, inicios de sessao).
     StoreSpec::new("WebView2", Automatic, Dir),
     // Escolhas nos menus: tema, avisos do Gmail, duracoes do Pomodoro.

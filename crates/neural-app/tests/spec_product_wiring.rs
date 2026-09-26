@@ -76,6 +76,8 @@ const ALL_SOURCES: &str = concat!(
     "\n",
     include_str!("../src/windows_app/translation.rs"),
     "\n",
+    include_str!("../src/windows_app/agents_hub.rs"),
+    "\n",
     include_str!("../src/windows_app/app/mod.rs"),
     "\n",
     include_str!("../src/windows_app/app/gmail.rs"),
