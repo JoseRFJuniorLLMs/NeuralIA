@@ -22,17 +22,27 @@
 //! servidor local cobrem o codigo que embarca. A chave (`ApiCredential`) so
 //! entra no cabecalho de autenticacao do fornecedor; os construtores dos
 //! pedidos nunca a veem.
+//!
+//! Cada `Endpoint` tem a sua `Locality` e o agente resolve nomes com o
+//! resolvedor dela (infra-llm-untrusted): um host fixado e `Public` e usa o
+//! `PublicResolver` do Reader, por isso um DNS que respondesse com o
+//! loopback, a rede local ou o link-local nunca leva a chave para la. O
+//! loopback dos testes e `Loopback`; o `Lan` fica para os servidores da rede
+//! local do byom-backends.
 
 use std::io::Read;
 use std::time::{Duration, Instant};
 
 use ureq::{
     Agent, Body,
+    config::Config,
     http::Response,
     tls::{RootCerts, TlsConfig},
+    unversioned::transport::DefaultConnector,
 };
 
 use super::errors::{ApiError, classify_status};
+use crate::security::{LanResolver, Locality, LoopbackResolver, PublicResolver};
 
 /// O host da API Gemini (Google AI Studio). Constante: nenhum URL do
 /// transporte nasce de configuracao, de uma variavel de ambiente ou de uma
@@ -92,15 +102,18 @@ pub struct Endpoint {
     origin: String,
     /// O fornecedor do host fixado; `None` so no loopback dos testes.
     provider: Option<Provider>,
+    /// Onde os enderecos resolvidos podem estar.
+    locality: Locality,
 }
 
 impl Endpoint {
     /// O unico construtor que embarca: o host constante do fornecedor, por
-    /// HTTPS.
+    /// HTTPS, resolvido so para enderecos publicos.
     pub fn pinned(provider: Provider) -> Self {
         Self {
             origin: format!("https://{}", provider.host()),
             provider: Some(provider),
+            locality: Locality::Public,
         }
     }
 
@@ -109,7 +122,21 @@ impl Endpoint {
         Self {
             origin: format!("http://127.0.0.1:{port}"),
             provider: None,
+            locality: Locality::Loopback,
         }
+    }
+
+    /// So nos testes: a mesma origem com o resolvedor de outra localidade,
+    /// para provar que o `Public` de um host fixado nao liga ao stub local.
+    #[cfg(test)]
+    pub(crate) fn resolved_as(mut self, locality: Locality) -> Self {
+        self.locality = locality;
+        self
+    }
+
+    /// A localidade dos enderecos que este endpoint aceita.
+    pub fn locality(&self) -> Locality {
+        self.locality
     }
 
     /// O URL de um pedido: a origem mais o caminho que um construtor montou.
@@ -198,7 +225,7 @@ impl ApiClient {
             )
             .build();
         Self {
-            agent: Agent::new_with_config(config),
+            agent: agent_for(config, endpoint.locality),
             endpoint,
             max_body,
         }
@@ -302,6 +329,20 @@ impl ApiClient {
             }
         };
         result.map_err(map_transport_error)
+    }
+}
+
+/// O agente da localidade: o conector do sistema e o resolvedor que so
+/// deixa ligar a enderecos dela.
+fn agent_for(config: Config, locality: Locality) -> Agent {
+    match locality {
+        Locality::Public => {
+            Agent::with_parts(config, DefaultConnector::new(), PublicResolver::default())
+        }
+        Locality::Loopback => {
+            Agent::with_parts(config, DefaultConnector::new(), LoopbackResolver::default())
+        }
+        Locality::Lan => Agent::with_parts(config, DefaultConnector::new(), LanResolver::default()),
     }
 }
 
