@@ -544,11 +544,13 @@ impl App {
         hover_tooltip(std::ptr::null_mut(), "");
         let SplashFrame {
             text,
-            asks,
+            question,
             seconds,
             token,
         } = frame;
-        SPLASH_ASKS.store(asks, Ordering::SeqCst);
+        if let Ok(mut slot) = SPLASH_QUESTION.lock() {
+            *slot = question;
+        }
         if let Ok(mut slot) = SPLASH_TEXT.lock() {
             *slot = text;
         }
@@ -646,7 +648,9 @@ impl App {
         else {
             return;
         };
-        SPLASH_ASKS.store(false, Ordering::SeqCst);
+        if let Ok(mut slot) = SPLASH_QUESTION.lock() {
+            *slot = None;
+        }
         // So o fim do quadro da PROPRIA pergunta e um "nao" (ver
         // `SplashBoard`); um aviso que a substituiu nao responde nada.
         if question_expired {

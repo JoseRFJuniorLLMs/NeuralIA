@@ -2826,13 +2826,951 @@ fn gmail_setting_round_trips_and_the_toast_answers_by_button() {
         right: 360,
         bottom: 64,
     };
-    let (open, no) = gmail_toast_buttons(&client, 1.0);
+    let widths: Vec<f64> = gmail_notice("a", "b")
+        .actions
+        .iter()
+        .map(|action| action.width)
+        .collect();
+    let buttons = toast_buttons(&client, 1.0, &widths);
+    let [open, no] = buttons[..] else {
+        panic!("o aviso do Gmail tem dois botoes, tem {}", buttons.len());
+    };
     assert!(
         open.right <= no.left,
         "Abrir fica antes de Nao, sem se tocarem"
     );
     assert!(no.right <= client.right && open.left >= 0);
     assert!(open.top >= 0 && open.bottom <= client.bottom);
+}
+
+/// O aviso do canto num registo: o `ToastHost` dos gates. O centro e o de
+/// verdade; o que o `App` faria com a janela fica escrito.
+#[derive(Default)]
+struct ToastLog {
+    centre: crate::notify::NotifyCentre,
+    log: Vec<String>,
+}
+
+impl ToastHost for ToastLog {
+    fn notify_centre(&mut self) -> &mut crate::notify::NotifyCentre {
+        &mut self.centre
+    }
+
+    fn show_toast(&mut self, frame: &crate::notify::ToastFrame) {
+        let view = ToastView::of(frame);
+        let buttons: Vec<String> = view
+            .buttons
+            .iter()
+            .map(|button| {
+                format!(
+                    "{}{} {}",
+                    button.label,
+                    if button.primary { "*" } else { "" },
+                    button.width
+                )
+            })
+            .collect();
+        self.log.push(format!(
+            "mostra {} «{}» «{}» [{}]",
+            view.token,
+            view.title,
+            view.body,
+            buttons.join(", ")
+        ));
+    }
+
+    fn hide_toast_window(&mut self) {
+        self.log.push("esconde".to_string());
+    }
+
+    fn destroy_toast(&mut self) {
+        self.log.push("destroi".to_string());
+    }
+
+    fn hide_toast_after(&mut self, token: u64, delay: Duration) {
+        self.log
+            .push(format!("some {token} em {} ms", delay.as_millis()));
+    }
+
+    fn open_service(&mut self, service: Service) {
+        self.log.push(format!("abre {service:?}"));
+    }
+}
+
+fn toast_step(host: &mut ToastLog, input: NotifyInput) -> Vec<String> {
+    apply_notify(host, input);
+    std::mem::take(&mut host.log)
+}
+
+/// Gate: o aviso do Gmail passou a ser um `Notice` do centro de avisos sem
+/// mudar nada do que se ve e do que faz. As referencias sao o
+/// `show_gmail_toast`, o `gmail_toast_buttons`, o `position_gmail_toast` e
+/// o `answer_gmail` da 2.2.0, reescritos aqui a mao: texto, tamanho, botoes
+/// (em cada escala), canto, prazo de 12 s, o token que ignora o
+/// temporizador de um aviso substituido, "Abrir" a abrir o painel do Gmail
+/// e "Nao" so a esconder.
+#[test]
+fn gmail_toast_behaviour_unchanged() {
+    // 1. O texto: o titulo fixo e o corpo pelas quatro formas de antes.
+    for (sender, subject, body) in [
+        ("", "", "Nova mensagem na sua caixa de entrada"),
+        ("  ", " Relatório ", "Relatório"),
+        (" Ana ", "", "Ana"),
+        ("Ana", "Relatório de março", "Ana · Relatório de março"),
+    ] {
+        let notice = gmail_notice(sender, subject);
+        assert_eq!(notice.kind, crate::notify::NoticeKind::Gmail);
+        assert_eq!(notice.title, "Gmail · novo e-mail — abrir?");
+        assert_eq!(notice.body, body, "{sender:?} {subject:?}");
+        assert_eq!(notice.ttl, Duration::from_secs(12));
+        assert!(notice.content_bearing, "o corpo e o e-mail");
+        let buttons: Vec<(&str, f64, bool)> = notice
+            .actions
+            .iter()
+            .map(|action| (action.label, action.width, action.primary))
+            .collect();
+        assert_eq!(buttons, vec![("Abrir", 70.0, true), ("Não", 54.0, false)]);
+    }
+
+    // 2. O tamanho, os botoes e o canto, com as formulas de antes.
+    assert_eq!((TOAST_WIDTH, TOAST_HEIGHT), (390.0, 68.0));
+    let old_buttons = |client: &RECT, scale: f64| {
+        let height = (26.0 * scale).round() as i32;
+        let top = (client.bottom - height) / 2;
+        let gap = (6.0 * scale).round() as i32;
+        let right = client.right - (12.0 * scale).round() as i32;
+        let no_width = (54.0 * scale).round() as i32;
+        let open_width = (70.0 * scale).round() as i32;
+        [
+            (
+                right - no_width - gap - open_width,
+                top,
+                right - no_width - gap,
+                top + height,
+            ),
+            (right - no_width, top, right, top + height),
+        ]
+    };
+    let widths: Vec<f64> = gmail_notice("a", "b")
+        .actions
+        .iter()
+        .map(|action| action.width)
+        .collect();
+    for window_scale in [1.0f64, 1.25, 1.5, 1.75, 2.0, 2.25, 3.0] {
+        let width = (390.0 * window_scale).round() as i32;
+        let height = (68.0 * window_scale).round() as i32;
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        // A escala que a janela le da propria altura, como antes.
+        let scale = toast_scale(&client);
+        assert_eq!(scale, (height as f64 / 68.0).max(1.0));
+        let new: Vec<(i32, i32, i32, i32)> = toast_buttons(&client, scale, &widths)
+            .iter()
+            .map(|rect| (rect.left, rect.top, rect.right, rect.bottom))
+            .collect();
+        assert_eq!(new, old_buttons(&client, scale), "escala {window_scale}");
+        let [open, no] = old_buttons(&client, scale);
+        let buttons = toast_buttons(&client, scale, &widths);
+        let middle = |rect: (i32, i32, i32, i32)| ((rect.0 + rect.2) / 2, (rect.1 + rect.3) / 2);
+        assert_eq!(toast_hit(&buttons, middle(open).0, middle(open).1), Some(0));
+        assert_eq!(toast_hit(&buttons, middle(no).0, middle(no).1), Some(1));
+        assert_eq!(toast_hit(&buttons, open.2, middle(open).1), None, "o vao");
+        assert_eq!(toast_hit(&buttons, 10, height / 2), None, "o texto");
+
+        // O canto: 18 px logicos do canto inferior direito do cliente.
+        let origin = POINT { x: 100, y: 50 };
+        let owner = RECT {
+            left: 0,
+            top: 0,
+            right: 1600,
+            bottom: 900,
+        };
+        let margin = (18.0 * window_scale) as i32;
+        assert_eq!(
+            toast_origin(origin, &owner, width, height, window_scale),
+            (100 + 1600 - width - margin, 50 + 900 - height - margin)
+        );
+    }
+
+    // 3. O caminho do App: mostrar, agendar, substituir, responder, sair.
+    let mut host = ToastLog::default();
+    assert_eq!(
+        toast_step(
+            &mut host,
+            NotifyInput::Post(gmail_notice("Ana", "Relatório"))
+        ),
+        vec![
+            "mostra 1 «Gmail · novo e-mail — abrir?» «Ana · Relatório» [Abrir* 70, Não 54]",
+            "some 1 em 12000 ms",
+        ]
+    );
+    // Correio novo com o aviso a vista: substitui-o ja, com prazo novo.
+    assert_eq!(
+        toast_step(&mut host, NotifyInput::Post(gmail_notice("Bia", ""))),
+        vec![
+            "mostra 2 «Gmail · novo e-mail — abrir?» «Bia» [Abrir* 70, Não 54]",
+            "some 2 em 12000 ms",
+        ]
+    );
+    // O prazo do aviso substituido nao tira o novo.
+    assert!(toast_step(&mut host, NotifyInput::Event(NotifyEvent::Hide(1))).is_empty());
+    // "Abrir": esconde e abre o painel do Gmail.
+    assert_eq!(
+        toast_step(
+            &mut host,
+            NotifyInput::Event(NotifyEvent::Answer { token: 2, index: 0 })
+        ),
+        vec!["esconde", "abre Gmail"]
+    );
+    // "Nao": so esconde.
+    assert_eq!(
+        toast_step(
+            &mut host,
+            NotifyInput::Event(NotifyEvent::Answer { token: 2, index: 1 })
+        ),
+        vec!["esconde"]
+    );
+    // Fora dos botoes, ou um aviso que ja nao e este: nada.
+    for (token, index) in [(2, 2), (1, 0)] {
+        assert!(
+            toast_step(
+                &mut host,
+                NotifyInput::Event(NotifyEvent::Answer { token, index })
+            )
+            .is_empty(),
+            "{token} {index}"
+        );
+    }
+    // O prazo dele: a janela e destruida.
+    assert_eq!(
+        toast_step(&mut host, NotifyInput::Event(NotifyEvent::Hide(2))),
+        vec!["destroi"]
+    );
+    // Um aviso depois: o token continua a subir.
+    assert_eq!(
+        toast_step(&mut host, NotifyInput::Post(gmail_notice("", ""))),
+        vec![
+            "mostra 3 «Gmail · novo e-mail — abrir?» «Nova mensagem na sua caixa de entrada» [Abrir* 70, Não 54]",
+            "some 3 em 12000 ms",
+        ]
+    );
+}
+
+/// Gate (real Win32; so CI -- cria uma janela que pode ir para a frente):
+/// o aviso do canto nasce, aparece (tres vezes, como a cada `Moved`) e e
+/// clicado sem nunca tirar a ativacao a janela dona, pela receita que o
+/// produto usa (`create_toast_window`, `place_toast`). E popup owned, sem
+/// ativacao e ferramenta, nunca TOPMOST. Sabotagem na matriz do CI:
+/// `SW_SHOWNOACTIVATE` -> `SW_SHOW` em `show_popup_without_activation`.
+#[test]
+#[ignore = "needs a desktop session: runs in CI"]
+fn toast_never_activates() {
+    use windows_sys::Win32::Graphics::Gdi::UpdateWindow;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, SetActiveWindow};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongW, IsWindowVisible, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+    };
+    let frame = crate::notify::ToastFrame {
+        token: 1,
+        notice: gmail_notice("Ana", "Relatório"),
+    };
+    if let Ok(mut view) = TOAST_VIEW.lock() {
+        *view = Some(ToastView::of(&frame));
+    }
+    let width = TOAST_WIDTH.round() as i32;
+    let height = TOAST_HEIGHT.round() as i32;
+    unsafe {
+        let owner = CreateWindowExW(
+            0,
+            windows_sys::w!("STATIC"),
+            windows_sys::w!("NeuralIA dono"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            0,
+            0,
+            640,
+            400,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        assert!(!owner.is_null(), "a janela dona tem de nascer");
+        SetActiveWindow(owner);
+        assert_eq!(
+            GetActiveWindow(),
+            owner,
+            "pre-condicao: o dono e a janela ativa"
+        );
+        let toast = create_toast_window(owner, width, height, 0).expect("o aviso tem de nascer");
+        let after_create = GetActiveWindow();
+        let mut stolen_on_show = None;
+        for cycle in 0..3 {
+            place_toast(toast, 200 + cycle, 200, width, height);
+            if GetActiveWindow() != owner && stolen_on_show.is_none() {
+                stolen_on_show = Some(cycle);
+            }
+        }
+        UpdateWindow(toast);
+        let activate = SendMessageW(toast, WM_MOUSEACTIVATE, owner as WPARAM, 0);
+        let hit = SendMessageW(toast, WM_NCHITTEST, 0, 0);
+        let ex_style = GetWindowLongW(toast, GWL_EXSTYLE) as u32;
+        let visible = IsWindowVisible(toast) != 0;
+        let after_all = GetActiveWindow();
+        DestroyWindow(toast);
+        DestroyWindow(owner);
+        if let Ok(mut view) = TOAST_VIEW.lock() {
+            *view = None;
+        }
+
+        assert_eq!(after_create, owner, "criar o aviso roubou a ativacao");
+        assert_eq!(
+            stolen_on_show, None,
+            "mostrar o aviso roubou a ativacao ao dono no ciclo {stolen_on_show:?}"
+        );
+        assert_eq!(after_all, owner, "o aviso ficou com a ativacao");
+        assert!(visible, "o aviso tem de ficar visivel depois de mostrado");
+        assert_eq!(
+            activate, MA_NOACTIVATE as LRESULT,
+            "o clique ativava o aviso"
+        );
+        assert_eq!(
+            hit, HTCLIENT as LRESULT,
+            "os botoes deixavam o clique passar"
+        );
+        assert_ne!(ex_style & WS_EX_NOACTIVATE, 0);
+        assert_ne!(ex_style & WS_EX_TOOLWINDOW, 0);
+        assert_eq!(
+            ex_style & WS_EX_TOPMOST,
+            0,
+            "o aviso nao pousa sobre as outras aplicacoes"
+        );
+    }
+}
+
+/// Gate: os menus nativos passam todos por `PopupMenu` e decidem o teclado
+/// pela origem. A origem e a vista (ou a janela) onde estava o foco; o
+/// teclado volta la depois do menu, com ou sem escolha, salvo se o comando
+/// escolhido o muda de proposito. Os menus migrados guardam os itens, os
+/// ids, as marcas e os cinzentos de antes, e o HMENU montado pelo
+/// `append_entries` (o do `run_menu`) deixa um cinzento sem clique e um
+/// marcado marcado, com e sem amostra de cor.
+#[test]
+fn popup_menus_keep_their_items_and_decide_the_focus_by_origin() {
+    let hwnd = |value: usize| value as HWND;
+    // A arvore de mentira: 10 e 20 hospedam vistas; 11 e 12 estao dentro
+    // da 10, 21 dentro da 20; 30 e o EDIT da omnibox.
+    let inside = |host: HWND, child: HWND| {
+        matches!(
+            (host as usize, child as usize),
+            (10, 11) | (10, 12) | (20, 21)
+        )
+    };
+    let hosts = [hwnd(10), hwnd(20), std::ptr::null_mut()];
+    assert_eq!(
+        focus_origin(std::ptr::null_mut(), &hosts, inside),
+        FocusOrigin::Nowhere
+    );
+    assert_eq!(focus_origin(hwnd(12), &hosts, inside), FocusOrigin::Host(0));
+    assert_eq!(focus_origin(hwnd(20), &hosts, inside), FocusOrigin::Host(1));
+    assert_eq!(focus_origin(hwnd(21), &hosts, inside), FocusOrigin::Host(1));
+    assert_eq!(
+        focus_origin(hwnd(30), &hosts, inside),
+        FocusOrigin::Window(hwnd(30))
+    );
+    // Uma vista sem janela nao apanha o foco de ninguem.
+    assert_eq!(
+        focus_origin(hwnd(30), &[std::ptr::null_mut()], |_, _| true),
+        FocusOrigin::Window(hwnd(30))
+    );
+
+    for (origin, expected) in [
+        (FocusOrigin::Nowhere, FocusRestore::Leave),
+        (FocusOrigin::Host(1), FocusRestore::Host(1)),
+        (
+            FocusOrigin::Window(hwnd(30)),
+            FocusRestore::Window(hwnd(30)),
+        ),
+    ] {
+        assert_eq!(decide_focus_restore(origin, false), expected);
+        assert_eq!(
+            decide_focus_restore(origin, true),
+            FocusRestore::Leave,
+            "um comando que muda o teclado de proposito fica com ele"
+        );
+    }
+
+    // Um cinzento com razao leva-a a direita (coluna do atalho).
+    assert_eq!(
+        MenuCommand::new(3, "Pular fase")
+            .disabled("só a correr")
+            .text(),
+        "Pular fase\tsó a correr"
+    );
+    assert_eq!(MenuCommand::new(0, "Grupo").disabled("").text(), "Grupo");
+
+    // O tema: tres opcoes, ids 1.., a em vigor marcada.
+    let theme = theme_menu();
+    let current = ThemeChoice::current();
+    let items: Vec<(usize, &str, bool)> = theme
+        .entries
+        .iter()
+        .map(|entry| match entry {
+            MenuEntry::Command(command) => (command.id, command.label.as_str(), command.checked),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(items.len(), ThemeChoice::ALL.len());
+    for (index, choice) in ThemeChoice::ALL.iter().enumerate() {
+        assert_eq!(
+            items[index],
+            (index + 1, choice.label(), *choice == current)
+        );
+    }
+    assert_eq!(theme.command(0), None, "0 e fechado sem escolha");
+
+    // O Pomodoro: as linhas do controlador, com os cinzentos e as marcas.
+    let pomodoro = PomodoroController::new(crate::pomodoro_ui::PomodoroPreset::Classic.settings());
+    let lines = pomodoro.menu_items();
+    let menu = pomodoro_popup_menu(&lines);
+    assert_eq!(menu.entries.len(), lines.len());
+    for (entry, line) in menu.entries.iter().zip(&lines) {
+        match (entry, line) {
+            (MenuEntry::Separator, crate::pomodoro_ui::PomodoroMenuItem::Separator) => {}
+            (
+                MenuEntry::Command(command),
+                crate::pomodoro_ui::PomodoroMenuItem::Command {
+                    id,
+                    label,
+                    enabled,
+                    checked,
+                    ..
+                },
+            ) => {
+                assert_eq!(
+                    (command.id, command.label.as_str(), command.checked),
+                    (*id, *label, *checked)
+                );
+                assert_eq!(command.disabled.is_some(), !enabled, "{label}");
+                assert!(!command.moves_focus, "{label}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(
+        lines.iter().any(|line| matches!(
+            line,
+            crate::pomodoro_ui::PomodoroMenuItem::Command { enabled: false, .. }
+        )),
+        "parado, ha linhas cinzentas a provar"
+    );
+
+    // As cores do grupo: ids, amostras e a atual marcada, num submenu tambem.
+    let colors = group_color_items(GroupColor::ALL[2]);
+    assert_eq!(colors.len(), GroupColor::ALL.len());
+    for (index, entry) in colors.iter().enumerate() {
+        let MenuEntry::Command(command) = entry else {
+            panic!("{entry:?}");
+        };
+        assert_eq!(command.id, GROUP_MENU_COLOR_BASE + index);
+        assert_eq!(command.label, group_color_label(GroupColor::ALL[index]));
+        assert_eq!(
+            command.icon,
+            Some(MenuIcon::Swatch(GroupColor::ALL[index].rgb()))
+        );
+        assert_eq!(command.checked, index == 2);
+    }
+    let mut nested = PopupMenu::default();
+    nested.push(MenuCommand::new(TAB_MENU_OPEN, "Abrir").moves_focus());
+    nested.push(MenuEntry::Submenu {
+        label: "Cor do grupo".to_string(),
+        icon: None,
+        entries: colors,
+    });
+    assert_eq!(
+        nested
+            .command(GROUP_MENU_COLOR_BASE + 2)
+            .map(|command| command.checked),
+        Some(true),
+        "um comando dentro de um submenu"
+    );
+    assert!(nested.command(TAB_MENU_OPEN).is_some_and(|c| c.moves_focus));
+    assert_eq!(nested.command(9999), None);
+
+    // O HMENU que o `run_menu` monta (sem janela: so o menu e as amostras
+    // do GDI): um cinzento fica cinzento e sem clique tambem com icone, e o
+    // marcado fica marcado, com e sem icone.
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetMenuItemCount, GetMenuState, MF_BYCOMMAND, MF_CHECKED, MF_DISABLED, MF_GRAYED,
+        };
+        let mut real = PopupMenu::default();
+        real.push(MenuCommand::new(1, "Liso").checked(true));
+        real.push(MenuCommand::new(2, "Liso cinzento").disabled("sem abas"));
+        real.push(
+            MenuCommand::new(3, "Cor")
+                .icon(MenuIcon::Swatch(GroupColor::ALL[0].rgb()))
+                .checked(true),
+        );
+        real.push(
+            MenuCommand::new(4, "Cor cinzenta")
+                .icon(MenuIcon::Swatch(GroupColor::ALL[1].rgb()))
+                .disabled("só a correr"),
+        );
+        real.push(
+            MenuCommand::new(5, "Cor livre").icon(MenuIcon::Swatch(GroupColor::ALL[2].rgb())),
+        );
+        let (count, states) = unsafe {
+            let handle = CreatePopupMenu();
+            assert!(!handle.is_null(), "CreatePopupMenu recusou");
+            let mut texts = Vec::new();
+            let mut bitmaps = Vec::new();
+            append_entries(handle, &real.entries, 16, &mut texts, &mut bitmaps);
+            let count = GetMenuItemCount(handle);
+            let states: Vec<u32> = (1..=5u32)
+                .map(|id| GetMenuState(handle, id, MF_BYCOMMAND))
+                .collect();
+            DestroyMenu(handle);
+            for bitmap in bitmaps {
+                DeleteObject(bitmap as _);
+            }
+            (count, states)
+        };
+        assert_eq!(count, 5);
+        assert!(
+            !states.contains(&u32::MAX),
+            "um item nao chegou ao menu: {states:x?}"
+        );
+        let grey = MF_GRAYED | MF_DISABLED;
+        let seen: Vec<u32> = states
+            .iter()
+            .map(|state| state & (grey | MF_CHECKED))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![MF_CHECKED, grey, MF_CHECKED, grey, 0],
+            "liso marcado, liso cinzento, cor marcada, cor cinzenta, cor livre"
+        );
+    }
+
+    // So o `PopupMenu` chama o TrackPopupMenu: um menu solto nao devolvia
+    // o teclado a ninguem.
+    let source = shipped_source();
+    assert_eq!(
+        source.matches("TrackPopupMenu(").count(),
+        1,
+        "um TrackPopupMenu fora de popup_menu.rs"
+    );
+}
+
+static MENU_TEST_WINDOW: AtomicUsize = AtomicUsize::new(0);
+
+/// O que o WebView2 faz quando um menu fecha por cima dele: o teclado cai
+/// na janela anfitria. Depois fecha o menu, como um Esc.
+unsafe extern "system" fn dismiss_menu_like_a_webview(
+    hwnd: HWND,
+    _message: u32,
+    id: usize,
+    _time: u32,
+) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EndMenu, KillTimer};
+    KillTimer(hwnd, id);
+    SetFocus(MENU_TEST_WINDOW.load(Ordering::Acquire) as HWND);
+    EndMenu();
+}
+
+/// Rede de seguranca do gate: se o temporizador nunca chegasse ao ciclo
+/// do menu, o `WM_CANCELMODE` ao dono fecha-o ao fim de 10 s -- o gate
+/// falha em vez de prender o job do CI.
+fn cancel_menu_after(owner: HWND, delay: Duration) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+    let owner = owner as usize;
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        unsafe {
+            PostMessageW(owner as HWND, WM_CANCELMODE, 0, 0);
+        }
+    });
+}
+
+/// Uma vista de mentira: a janela `host` e o EDIT `inner` dentro dela, que
+/// recebe o teclado pelo `take_focus` (a `MoveFocus` no produto).
+struct EditHost {
+    host: HWND,
+    inner: HWND,
+    calls: std::cell::Cell<usize>,
+}
+
+impl FocusHost for EditHost {
+    fn host_window(&self) -> HWND {
+        self.host
+    }
+
+    fn take_focus(&self) {
+        self.calls.set(self.calls.get() + 1);
+        unsafe {
+            SetFocus(self.inner);
+        }
+    }
+}
+
+/// Gate (real Win32; so CI -- abre um menu modal e mexe no foco): depois de
+/// um menu fechado sem escolha, o teclado esta onde estava quando ele abriu
+/// -- no EDIT (por `SetFocus`) e dentro de uma vista (pelo `take_focus` dela,
+/// a `MoveFocus(PROGRAMMATIC)` do WebView2), mesmo com o fecho a deixa-lo na
+/// janela anfitria. Sabotagem na matriz do CI: tirar o `restore_focus` de
+/// `track_popup_menu`.
+#[test]
+#[ignore = "needs a desktop session: runs in CI"]
+fn popup_menu_restores_origin_focus() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        ES_AUTOHSCROLL, SetTimer, WS_OVERLAPPEDWINDOW,
+    };
+    unsafe {
+        let child = |class: *const u16, parent: HWND, x: i32| {
+            CreateWindowExW(
+                0,
+                class,
+                windows_sys::w!(""),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
+                x,
+                10,
+                160,
+                24,
+                parent,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        let owner = CreateWindowExW(
+            0,
+            windows_sys::w!("STATIC"),
+            windows_sys::w!("NeuralIA dono"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            0,
+            0,
+            640,
+            400,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        assert!(!owner.is_null(), "a janela dona tem de nascer");
+        SetActiveWindow(owner);
+        MENU_TEST_WINDOW.store(owner as usize, Ordering::Release);
+        let omnibox = child(windows_sys::w!("EDIT"), owner, 10);
+        let host = CreateWindowExW(
+            0,
+            windows_sys::w!("STATIC"),
+            windows_sys::w!(""),
+            WS_CHILD | WS_VISIBLE,
+            200,
+            0,
+            400,
+            200,
+            owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        let page = child(windows_sys::w!("EDIT"), host, 10);
+        assert!(!omnibox.is_null() && !host.is_null() && !page.is_null());
+        let view = EditHost {
+            host,
+            inner: page,
+            calls: std::cell::Cell::new(0),
+        };
+        let mut menu = PopupMenu::default();
+        menu.push(MenuCommand::new(1, "Um"));
+        menu.push(MenuCommand::new(2, "Dois").checked(true));
+        let hosts: [&dyn FocusHost; 1] = [&view];
+
+        // 1. O EDIT nosso (a omnibox): SetFocus.
+        SetFocus(omnibox);
+        let before_edit = GetFocus();
+        SetTimer(owner, 1, 150, Some(dismiss_menu_like_a_webview));
+        cancel_menu_after(owner, Duration::from_secs(10));
+        let picked_edit = track_popup_menu(
+            &menu,
+            owner,
+            POINT { x: 60, y: 60 },
+            MenuButton::Right,
+            1.0,
+            &hosts,
+        );
+        let after_edit = GetFocus();
+
+        // 2. Dentro de uma vista: a MoveFocus dela.
+        SetFocus(page);
+        let before_view = GetFocus();
+        SetTimer(owner, 2, 150, Some(dismiss_menu_like_a_webview));
+        cancel_menu_after(owner, Duration::from_secs(10));
+        let picked_view = track_popup_menu(
+            &menu,
+            owner,
+            POINT { x: 60, y: 60 },
+            MenuButton::Left,
+            1.0,
+            &hosts,
+        );
+        let after_view = GetFocus();
+        let view_calls = view.calls.get();
+
+        DestroyWindow(owner);
+        MENU_TEST_WINDOW.store(0, Ordering::Release);
+
+        assert_eq!(before_edit, omnibox, "pre-condicao: o EDIT tem o teclado");
+        assert_eq!(before_view, page, "pre-condicao: a vista tem o teclado");
+        assert_eq!((picked_edit, picked_view), (0, 0), "fechado sem escolha");
+        assert_eq!(
+            after_edit, omnibox,
+            "o menu fechado deixou o teclado fora da omnibox"
+        );
+        assert_eq!(
+            after_view, page,
+            "o menu fechado deixou o teclado fora da pagina"
+        );
+        assert_eq!(view_calls, 1, "a vista recebe o teclado pela MoveFocus");
+    }
+}
+
+/// Gate: o `NativeCard` e generico no que leva e guarda as regras do
+/// cartao da barra -- token por pedido (nunca 0), um pedido novo troca o
+/// que esperava, confirmar so a partir de `NATIVE_CARD_ARM` e so com algo
+/// pintado (senao fica a espera), Cancelar a qualquer momento, cliques e
+/// prazos de um cartao que ja nao esta la sem efeito.
+#[test]
+fn native_card_arms_expires_and_confirms_only_the_painted() {
+    let t0 = Instant::now();
+    let ms = Duration::from_millis;
+    let mut card: NativeCard<&str> = NativeCard::default();
+    assert_eq!(card.request("primeiro", t0), (1, false));
+    assert_eq!(card.request("segundo", t0 + ms(100)), (2, true));
+    // O clique no cartao trocado nao responde a nada.
+    assert_eq!(
+        card.answer(1, true, t0 + ms(2000), |text| Some(text.to_string())),
+        CardAnswer::Ignored
+    );
+    // Cedo demais: fica, e o mesmo clique a tempo confirma.
+    let armed = t0 + ms(100) + NATIVE_CARD_ARM;
+    assert_eq!(
+        card.answer(2, true, armed - ms(1), |text| Some(text.to_string())),
+        CardAnswer::Ignored
+    );
+    // Nada pintado: nada vai, e o cartao fica.
+    assert_eq!(
+        card.answer(2, true, armed, |_| None::<String>),
+        CardAnswer::Ignored
+    );
+    // Confirma o que a pintura mostrou, nao o pedido inteiro.
+    assert_eq!(
+        card.answer(2, true, armed, |text| Some(text[..3].to_string())),
+        CardAnswer::Confirmed("seg".to_string())
+    );
+    assert!(card.pending.is_none(), "confirmado, sai");
+    assert!(!card.expire(2), "o prazo de um cartao que ja saiu");
+
+    // Cancelar nao espera pelo armar; o prazo tira o que esperava.
+    let (token, _) = card.request("x", t0);
+    assert_eq!(token, 3);
+    assert_eq!(
+        card.answer(token, false, t0, |_| Some(())),
+        CardAnswer::Cancelled
+    );
+    let (token, replaced) = card.request("y", t0);
+    assert!(!replaced);
+    assert!(!card.expire(token - 1));
+    assert!(card.expire(token));
+    assert!(card.pending.is_none());
+
+    // O token nunca e 0, nem a dar a volta.
+    let mut wrapped: NativeCard<()> = NativeCard {
+        pending: None,
+        last_token: u64::MAX,
+    };
+    assert_eq!(wrapped.request((), t0).0, 1);
+
+    // Os cartoes e o aviso do canto: os cliques sao deles e nao os ativam.
+    assert_eq!(
+        popup_no_activate_message(WM_MOUSEACTIVATE),
+        Some(MA_NOACTIVATE as LRESULT)
+    );
+    assert_eq!(
+        popup_no_activate_message(WM_NCHITTEST),
+        Some(HTCLIENT as LRESULT)
+    );
+    assert_eq!(popup_no_activate_message(WM_PAINT), None);
+}
+
+/// Gate (real Win32; so CI -- cria uma janela que pode ir para a frente):
+/// um cartao nativo nasce pela receita dos cartoes (`create_native_card`,
+/// com a subclasse do cartao da barra), aparece tres vezes e e clicado sem
+/// nunca tirar a ativacao a janela dona; e owned por ela, sem ativacao e
+/// nunca TOPMOST. Sabotagem na matriz do CI: `WM_MOUSEACTIVATE` fora de
+/// `popup_no_activate_message`.
+#[test]
+#[ignore = "needs a desktop session: runs in CI"]
+fn native_card_never_activates() {
+    use windows_sys::Win32::Graphics::Gdi::UpdateWindow;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, SetActiveWindow};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GW_OWNER, GWL_EXSTYLE, GetWindow, GetWindowLongW, IsWindowVisible, WS_EX_TOPMOST,
+        WS_OVERLAPPEDWINDOW,
+    };
+    let sink: Box<SearchCardSink> = Box::new(Box::new(|_| {}));
+    let width = SEARCH_CARD_WIDTH.round() as i32;
+    let height = SEARCH_CARD_HEIGHT.round() as i32;
+    unsafe {
+        let owner = CreateWindowExW(
+            0,
+            windows_sys::w!("STATIC"),
+            windows_sys::w!("NeuralIA dono"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            0,
+            0,
+            800,
+            500,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        assert!(!owner.is_null(), "a janela dona tem de nascer");
+        SetActiveWindow(owner);
+        assert_eq!(
+            GetActiveWindow(),
+            owner,
+            "pre-condicao: o dono e a janela ativa"
+        );
+        if let Ok(mut view) = SEARCH_CARD_VIEW.lock() {
+            *view = Some((5, SearchIntent::Ask, "Texto".to_string()));
+        }
+        let card = create_native_card(
+            owner,
+            width,
+            height,
+            search_card_subclass,
+            SEARCH_CARD_SUBCLASS_ID,
+            (&*sink as *const SearchCardSink) as usize,
+            18,
+        )
+        .expect("o cartao tem de nascer");
+        let after_create = GetActiveWindow();
+        let mut stolen_on_show = None;
+        for cycle in 0..3 {
+            show_popup_without_activation(card);
+            if GetActiveWindow() != owner && stolen_on_show.is_none() {
+                stolen_on_show = Some(cycle);
+            }
+        }
+        UpdateWindow(card);
+        let activate = SendMessageW(card, WM_MOUSEACTIVATE, owner as WPARAM, 0);
+        let hit = SendMessageW(card, WM_NCHITTEST, 0, 0);
+        let ex_style = GetWindowLongW(card, GWL_EXSTYLE) as u32;
+        let card_owner = GetWindow(card, GW_OWNER);
+        let visible = IsWindowVisible(card) != 0;
+        let after_all = GetActiveWindow();
+        DestroyWindow(card);
+        DestroyWindow(owner);
+        if let Ok(mut view) = SEARCH_CARD_VIEW.lock() {
+            *view = None;
+        }
+        if let Ok(mut painted) = SEARCH_CARD_PAINTED.lock() {
+            *painted = (0, 0);
+        }
+
+        assert_eq!(after_create, owner, "criar o cartao roubou a ativacao");
+        assert_eq!(
+            stolen_on_show, None,
+            "mostrar o cartao roubou a ativacao ao dono no ciclo {stolen_on_show:?}"
+        );
+        assert_eq!(
+            activate, MA_NOACTIVATE as LRESULT,
+            "o clique ativava o cartao"
+        );
+        assert_eq!(after_all, owner, "o cartao ficou com a ativacao");
+        assert!(visible, "o cartao tem de ficar visivel depois de mostrado");
+        assert_eq!(hit, HTCLIENT as LRESULT, "o cartao deixava o clique passar");
+        assert_eq!(card_owner, owner, "o cartao e owned pela janela principal");
+        assert_ne!(ex_style & WS_EX_NOACTIVATE, 0);
+        assert_eq!(
+            ex_style & WS_EX_TOPMOST,
+            0,
+            "o cartao nao pousa sobre as outras aplicacoes"
+        );
+    }
+}
+
+/// Gate: a pergunta do meio da janela (`SplashQuestion`, que substituiu o
+/// `SPLASH_ASKS`) traz os seus botoes. Com os dois da rolagem, a geometria e
+/// a de sempre (cada um com um quinto da largura, a um quadragesimo); com
+/// mais, ficam encostados a direita pela ordem da lista, sem se tocarem; o
+/// clique responde pelo indice do botao na coluna dele.
+#[test]
+fn splash_question_keeps_the_yes_no_geometry_and_answers_by_button() {
+    assert_eq!(AUTO_SCROLL_QUESTION.asker, SplashAsker::AutoScroll);
+    let labels: Vec<(&str, bool)> = AUTO_SCROLL_QUESTION
+        .buttons
+        .iter()
+        .map(|button| (button.label, button.primary))
+        .collect();
+    assert_eq!(labels, vec![("Sim", true), ("Não", false)]);
+
+    let old = |client: &RECT| {
+        let width = client.right - client.left;
+        let button = width / 5;
+        let margin = width / 40;
+        let no = (
+            client.right - margin - button,
+            client.top + margin,
+            client.right - margin,
+            client.bottom - margin,
+        );
+        let yes = (no.0 - margin - button, no.1, no.0 - margin, no.3);
+        vec![yes, no]
+    };
+    for (width, height) in [(470, 46), (588, 58), (705, 69), (940, 92), (1410, 138)] {
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        let buttons = splash_buttons(&client, AUTO_SCROLL_QUESTION.buttons.len());
+        let new: Vec<(i32, i32, i32, i32)> = buttons
+            .iter()
+            .map(|rect| (rect.left, rect.top, rect.right, rect.bottom))
+            .collect();
+        assert_eq!(new, old(&client), "{width}x{height}");
+        let [yes, no] = old(&client)[..] else {
+            unreachable!()
+        };
+        assert_eq!(splash_button_at(&buttons, (yes.0 + yes.2) / 2), Some(0));
+        assert_eq!(splash_button_at(&buttons, (no.0 + no.2) / 2), Some(1));
+        assert_eq!(splash_button_at(&buttons, yes.2), None, "o vao");
+        assert_eq!(splash_button_at(&buttons, 5), None, "o texto");
+    }
+
+    let client = RECT {
+        left: 0,
+        top: 0,
+        right: 600,
+        bottom: 50,
+    };
+    let three = splash_buttons(&client, 3);
+    assert_eq!(three.len(), 3);
+    assert!(three[2].right <= client.right);
+    for pair in three.windows(2) {
+        assert!(pair[0].right < pair[1].left, "botoes a tocar-se");
+    }
+    assert!(three[0].left > 0, "sobra lugar para a pergunta");
+    assert!(splash_buttons(&client, 0).is_empty());
 }
 
 #[test]
@@ -11971,7 +12909,7 @@ fn owned_popups_are_not_topmost() {
     };
     for (from, to) in [
         ("fn show_splash", "fn position_splash"),
-        ("fn show_gmail_toast", "fn position_gmail_toast"),
+        ("fn create_toast_window", "fn place_toast"),
         ("fn sync_exit_button", "fn position_exit_button"),
         ("fn sync_comparator_splitters", "fn resize_comparator"),
     ] {
@@ -11985,19 +12923,35 @@ fn owned_popups_are_not_topmost() {
             "{from} nao pode pousar sobre as outras aplicacoes"
         );
     }
-    // show_search_card mora agora em search_card.rs
+    // show_search_card cria o cartao pela receita dos cartoes nativos
+    // (native_card.rs), que e quem chama o CreateWindowExW.
     let sc_text = body(
         &source_combined,
         "fn show_search_card(&mut self, token: u64, intent: SearchIntent, text: &str) {",
         "fn hide_search_card",
     );
     assert!(
-        sc_text.contains("CreateWindowExW"),
-        "show_search_card devia criar a janela"
+        sc_text.contains("create_native_card("),
+        "show_search_card devia criar o cartao pela receita nativa"
     );
     assert!(
         !sc_text.contains("WS_EX_TOPMOST"),
         "show_search_card nao pode pousar sobre as outras aplicacoes"
+    );
+    let card = body(
+        &source_combined,
+        "fn create_native_card",
+        "
+}
+",
+    );
+    assert!(
+        card.contains("CreateWindowExW") && card.contains("AUX_POPUP_EX_STYLE"),
+        "create_native_card devia criar a janela sem ativacao"
+    );
+    assert!(
+        !card.contains("WS_EX_TOPMOST"),
+        "um cartao nativo nao pode pousar sobre as outras aplicacoes"
     );
 }
 
@@ -16130,9 +17084,9 @@ fn a_notice_never_inherits_or_answers_the_auto_scroll_question() {
     // 1. Fim de fase com a pergunta a vista: espera, sem botoes.
     let mut board = SplashBoard::default();
     let asked = board
-        .show(question(), 20, SplashKind::Question)
+        .show(question(), 20, SplashKind::Question(AUTO_SCROLL_QUESTION))
         .expect("a pergunta aparece");
-    assert!(asked.asks);
+    assert_eq!(asked.question, Some(AUTO_SCROLL_QUESTION));
     assert_eq!(
         board.show(phase_end.clone(), 8, SplashKind::Background),
         None,
@@ -16145,7 +17099,7 @@ fn a_notice_never_inherits_or_answers_the_auto_scroll_question() {
             next: Some(next),
         } => {
             assert_eq!(next.text, phase_end);
-            assert!(!next.asks, "o aviso herdou o Sim/Nao");
+            assert_eq!(next.question, None, "o aviso herdou o Sim/Nao");
             assert_eq!(next.seconds, 8);
             assert_eq!(
                 board.hide(next.token),
@@ -16160,7 +17114,9 @@ fn a_notice_never_inherits_or_answers_the_auto_scroll_question() {
 
     // 2. Respondida: o aviso que esperava aparece quando ela sai.
     let mut board = SplashBoard::default();
-    let asked = board.show(question(), 20, SplashKind::Question).expect("q");
+    let asked = board
+        .show(question(), 20, SplashKind::Question(AUTO_SCROLL_QUESTION))
+        .expect("q");
     assert_eq!(
         board.show(phase_end.clone(), 8, SplashKind::Background),
         None
@@ -16179,7 +17135,9 @@ fn a_notice_never_inherits_or_answers_the_auto_scroll_question() {
     //    lhe responder: o fim dele nao e um "nao", e o temporizador da
     //    pergunta ja nao conta.
     let mut board = SplashBoard::default();
-    let asked = board.show(question(), 20, SplashKind::Question).expect("q");
+    let asked = board
+        .show(question(), 20, SplashKind::Question(AUTO_SCROLL_QUESTION))
+        .expect("q");
     let notice = board
         .show(
             "Pomodoro iniciado: foco de 25 min".to_string(),
@@ -16187,7 +17145,7 @@ fn a_notice_never_inherits_or_answers_the_auto_scroll_question() {
             SplashKind::Notice,
         )
         .expect("o gesto responde ja");
-    assert!(!notice.asks, "o aviso do gesto herdou o Sim/Nao");
+    assert_eq!(notice.question, None, "o aviso do gesto herdou o Sim/Nao");
     assert_eq!(board.hide(asked.token), SplashHide::Stale);
     assert_eq!(
         board.hide(notice.token),
@@ -16203,7 +17161,7 @@ fn a_notice_never_inherits_or_answers_the_auto_scroll_question() {
     let shown = board
         .show(phase_end.clone(), 8, SplashKind::Background)
         .expect("sem pergunta nao espera");
-    assert!(!shown.asks);
+    assert_eq!(shown.question, None);
 }
 
 /// Gate: o painel da respiracao e o video que o dono escolheu, em

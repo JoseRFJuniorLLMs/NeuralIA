@@ -323,31 +323,10 @@ impl App {
         // O mesmo item que o botao direito dentro da coluna, decidido pelo
         // mesmo `column_menu_responder` (menu proprio: nenhum item nativo).
         let request = column_menu_responder(col_index, self.auto_scroll.clone())(0);
-        // Vive ate ao fim da funcao: o Win32 le o texto enquanto desenha.
-        let label = wide_null(request.label);
-        let command = unsafe {
-            let menu = CreatePopupMenu();
-            if menu.is_null() {
-                return;
-            }
-            AppendMenuW(menu, MF_STRING, request.command, label.as_ptr());
-            let mut point = windows_sys::Win32::Foundation::POINT {
-                x: self.cursor.0.round() as i32,
-                y: self.cursor.1.round() as i32,
-            };
-            ClientToScreen(hwnd, &mut point);
-            let selected = TrackPopupMenu(
-                menu,
-                TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                point.x,
-                point.y,
-                0,
-                hwnd,
-                std::ptr::null(),
-            ) as usize;
-            DestroyMenu(menu);
-            selected
-        };
+        let mut menu = PopupMenu::default();
+        menu.push(MenuCommand::new(request.command, request.label));
+        let point = self.bar_menu_point(hwnd);
+        let command = self.track_menu(&menu, point, MenuButton::Right);
         if command == request.command
             && let Some(event) = request.selected()
         {
@@ -361,7 +340,6 @@ impl App {
     /// Sem isto, uma aba guardada que ficasse fora do corte das mais recentes
     /// continuava no `tabs.json` sem se poder abrir, recolorir nem fechar.
     fn show_tab_list_menu(&mut self, source_index: usize) {
-        use windows_sys::Win32::UI::WindowsAndMessaging::MF_CHECKED;
         let Some(hwnd) = self.window.as_ref().and_then(window_hwnd) else {
             return;
         };
@@ -383,10 +361,6 @@ impl App {
         if count == 0 {
             return;
         }
-        let scale = self
-            .window
-            .as_ref()
-            .map_or(1.0, |window| window.scale_factor().max(1.0));
         let point = self
             .bar_layout()
             .map(|layout| layout.tab_overflow[source_index.min(COMPARATOR_COLUMNS - 1)])
@@ -403,70 +377,31 @@ impl App {
             })
             .unwrap_or_else(|| self.bar_menu_point(hwnd));
 
-        let selected = unsafe {
-            let menu = CreatePopupMenu();
-            if menu.is_null() {
-                return;
-            }
-            // Os textos e as amostras vivem ate ao fim do bloco.
-            let mut texts: Vec<Vec<u16>> = Vec::new();
-            let mut swatches: Vec<*mut core::ffi::c_void> = Vec::new();
-            let size = (16.0 * scale).round() as i32;
-            let flags = |index: usize| {
-                if Some(index) == open {
-                    MF_STRING | MF_CHECKED
-                } else {
-                    MF_STRING
-                }
-            };
-            for entry in &entries {
-                match entry {
-                    TabListEntry::Tab { index, label } => {
-                        texts.push(wide_null(label));
-                        let text = texts.last().map_or(std::ptr::null(), |text| text.as_ptr());
-                        AppendMenuW(menu, flags(*index), TAB_LIST_BASE + index, text);
-                    }
-                    TabListEntry::Group { group, name, tabs } => {
-                        let submenu = CreatePopupMenu();
-                        if submenu.is_null() {
-                            continue;
-                        }
-                        for (index, label) in tabs {
-                            texts.push(wide_null(label));
-                            let text = texts.last().map_or(std::ptr::null(), |text| text.as_ptr());
-                            AppendMenuW(submenu, flags(*index), TAB_LIST_BASE + index, text);
-                        }
-                        texts.push(wide_null(&format!("{name} ({})", tabs.len())));
-                        let swatch = color_swatch_bitmap(
-                            colors.get(*group).copied().unwrap_or((0, 0, 0)),
-                            size,
-                        );
-                        if !swatch.is_null() {
-                            swatches.push(swatch);
-                        }
-                        // O submenu passa a ser do menu e morre com ele.
-                        let text = texts.last().map_or(&[0u16][..], |text| text.as_slice());
-                        append_swatch_submenu(menu, submenu, text, swatch);
-                    }
-                }
-            }
-            let selected = TrackPopupMenu(
-                menu,
-                // Aberto pelo botao esquerdo: sem TPM_RIGHTBUTTON.
-                TPM_RETURNCMD,
-                point.x,
-                point.y,
-                0,
-                hwnd,
-                std::ptr::null(),
-            ) as usize;
-            DestroyMenu(menu);
-            for swatch in swatches {
-                DeleteObject(swatch as _);
-            }
-            drop(texts);
-            selected
+        // Escolher uma aba abre-a ao lado, com o teclado nela: o menu nao o
+        // devolve a origem.
+        let tab_item = |index: usize, label: &str| {
+            MenuCommand::new(TAB_LIST_BASE + index, label)
+                .checked(Some(index) == open)
+                .moves_focus()
         };
+        let mut menu = PopupMenu::default();
+        for entry in &entries {
+            match entry {
+                TabListEntry::Tab { index, label } => menu.push(tab_item(*index, label)),
+                TabListEntry::Group { group, name, tabs } => menu.push(MenuEntry::Submenu {
+                    label: format!("{name} ({})", tabs.len()),
+                    icon: Some(MenuIcon::Swatch(
+                        colors.get(*group).copied().unwrap_or((0, 0, 0)),
+                    )),
+                    entries: tabs
+                        .iter()
+                        .map(|(index, label)| tab_item(*index, label).into())
+                        .collect(),
+                }),
+            }
+        }
+        // Aberto pelo botao esquerdo: sem TPM_RIGHTBUTTON.
+        let selected = self.track_menu(&menu, point, MenuButton::Left);
         if let Some(index) = tab_list_command(selected, count) {
             self.open_listed_tab(source_index, index);
         }
@@ -519,17 +454,12 @@ impl App {
     }
 
     fn show_tab_menu(&mut self, source_index: usize, context_index: usize) {
-        use windows_sys::Win32::UI::WindowsAndMessaging::MF_POPUP;
         let Some(hwnd) = self.window.as_ref().and_then(window_hwnd) else {
             return;
         };
-        let scale = self
-            .window
-            .as_ref()
-            .map_or(1.0, |window| window.scale_factor().max(1.0));
 
-        // Lidos antes de abrir o menu: dentro do bloco `unsafe` ja nao ha
-        // emprestimo do estado que sobreviva ao `TrackPopupMenu`.
+        // Lidos antes de abrir o menu: durante o `TrackPopupMenu` ja nao ha
+        // emprestimo do estado que sobreviva.
         let Some((joinable, colors, own_group)) = self.comparator.as_ref().and_then(|comp| {
             let tab = comp.contexts.get(source_index)?.get(context_index)?;
             let groups = &comp.groups[source_index];
@@ -550,117 +480,65 @@ impl App {
         let in_group = own_group.is_some();
         let point = self.bar_menu_point(hwnd);
 
-        let selected = unsafe {
-            let menu = CreatePopupMenu();
-            if menu.is_null() {
-                return;
-            }
-            // Os textos vivem ate ao fim do bloco: o menu so os le enquanto
-            // esta aberto.
-            let open = wide_null("Abrir");
-            let fullscreen = wide_null("Abrir em tela cheia");
-            let close = wide_null("Fechar aba");
-            let close_others = wide_null(if in_group {
+        let mut menu = PopupMenu::default();
+        // Abrir poe o teclado na aba aberta: o menu nao o devolve a origem.
+        menu.push(MenuCommand::new(TAB_MENU_OPEN, "Abrir").moves_focus());
+        menu.push(MenuCommand::new(TAB_MENU_FULLSCREEN, "Abrir em tela cheia").moves_focus());
+        menu.separator();
+        menu.push(MenuCommand::new(TAB_MENU_CLOSE, "Fechar aba"));
+        menu.push(MenuCommand::new(
+            TAB_MENU_CLOSE_OTHERS,
+            if in_group {
                 "Fechar outras abas deste grupo"
             } else {
                 "Fechar outras abas sem grupo"
-            });
-            let close_all = wide_null(if in_group {
+            },
+        ));
+        menu.push(MenuCommand::new(
+            TAB_MENU_CLOSE_ALL,
+            if in_group {
                 "Fechar todas deste grupo"
             } else {
                 "Fechar todas as abas sem grupo"
+            },
+        ));
+        menu.separator();
+        menu.push(MenuCommand::new(
+            TAB_MENU_NEW_GROUP,
+            "Adicionar a um novo grupo",
+        ));
+        // "Mover para o grupo ▸": um submenu com os outros grupos da coluna,
+        // cada um com a amostra da sua cor, como no Chrome.
+        if !joinable.is_empty() {
+            menu.push(MenuEntry::Submenu {
+                label: "Mover para o grupo".to_string(),
+                icon: None,
+                entries: joinable
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, (_, name))| {
+                        MenuCommand::new(TAB_MENU_GROUP_BASE + offset, name.as_str())
+                            .icon(MenuIcon::Swatch(colors[offset]))
+                            .into()
+                    })
+                    .collect(),
             });
-            let new_group = wide_null("Adicionar a um novo grupo");
-            let move_to = wide_null("Mover para o grupo");
-            let ungroup = wide_null("Remover do grupo");
-            let group_color = wide_null("Cor do grupo");
-            let color_labels: Vec<Vec<u16>> = GroupColor::ALL
-                .iter()
-                .map(|color| wide_null(group_color_label(*color)))
-                .collect();
-            let join_labels: Vec<Vec<u16>> =
-                joinable.iter().map(|(_, name)| wide_null(name)).collect();
+        }
+        if in_group {
+            menu.push(MenuCommand::new(TAB_MENU_UNGROUP, "Remover do grupo"));
+        }
+        // "Cor do grupo ▸" numa aba agrupada: a cor muda-se tambem onde
+        // estao as abas, nao so na pilula -- as mesmas amostras e ids do
+        // menu do grupo, com a atual marcada.
+        if let Some((_, current)) = own_group {
+            menu.push(MenuEntry::Submenu {
+                label: "Cor do grupo".to_string(),
+                icon: None,
+                entries: group_color_items(current),
+            });
+        }
 
-            AppendMenuW(menu, MF_STRING, TAB_MENU_OPEN, open.as_ptr());
-            AppendMenuW(menu, MF_STRING, TAB_MENU_FULLSCREEN, fullscreen.as_ptr());
-            AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-            AppendMenuW(menu, MF_STRING, TAB_MENU_CLOSE, close.as_ptr());
-            AppendMenuW(
-                menu,
-                MF_STRING,
-                TAB_MENU_CLOSE_OTHERS,
-                close_others.as_ptr(),
-            );
-            AppendMenuW(menu, MF_STRING, TAB_MENU_CLOSE_ALL, close_all.as_ptr());
-            AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-            AppendMenuW(menu, MF_STRING, TAB_MENU_NEW_GROUP, new_group.as_ptr());
-            // "Mover para o grupo ▸": um submenu com os outros grupos da
-            // coluna, cada um com a amostra da sua cor, como no Chrome.
-            let mut swatches: Vec<*mut core::ffi::c_void> = Vec::new();
-            if !joinable.is_empty() {
-                let submenu = CreatePopupMenu();
-                if !submenu.is_null() {
-                    let size = (16.0 * scale).round() as i32;
-                    for (offset, label) in join_labels.iter().enumerate() {
-                        let swatch = color_swatch_bitmap(colors[offset], size);
-                        if !swatch.is_null() {
-                            swatches.push(swatch);
-                        }
-                        append_swatch_item(
-                            submenu,
-                            TAB_MENU_GROUP_BASE + offset,
-                            label,
-                            swatch,
-                            false,
-                        );
-                    }
-                    // MF_POPUP: o submenu passa a ser do menu e morre com ele.
-                    AppendMenuW(menu, MF_POPUP, submenu as usize, move_to.as_ptr());
-                }
-            }
-            if in_group {
-                AppendMenuW(menu, MF_STRING, TAB_MENU_UNGROUP, ungroup.as_ptr());
-            }
-            // "Cor do grupo ▸" numa aba agrupada: a cor muda-se tambem onde
-            // estao as abas, nao so na pilula -- as mesmas amostras e ids do
-            // menu do grupo, com a atual marcada.
-            if let Some((_, current)) = own_group {
-                let submenu = CreatePopupMenu();
-                if !submenu.is_null() {
-                    let size = (16.0 * scale).round() as i32;
-                    for (index, color) in GroupColor::ALL.iter().enumerate() {
-                        let swatch = color_swatch_bitmap(color.rgb(), size);
-                        if !swatch.is_null() {
-                            swatches.push(swatch);
-                        }
-                        append_swatch_item(
-                            submenu,
-                            GROUP_MENU_COLOR_BASE + index,
-                            &color_labels[index],
-                            swatch,
-                            *color == current,
-                        );
-                    }
-                    AppendMenuW(menu, MF_POPUP, submenu as usize, group_color.as_ptr());
-                }
-            }
-
-            let selected = TrackPopupMenu(
-                menu,
-                TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                point.x,
-                point.y,
-                0,
-                hwnd,
-                std::ptr::null(),
-            ) as usize;
-            DestroyMenu(menu);
-            // Os bitmaps dos itens nao sao do menu: apagam-se depois dele.
-            for swatch in swatches {
-                DeleteObject(swatch as _);
-            }
-            selected
-        };
+        let selected = self.track_menu(&menu, point, MenuButton::Right);
 
         match tab_menu_command(selected, &joinable) {
             Some(TabMenuCommand::Open) => {
@@ -717,14 +595,9 @@ impl App {
     /// `at_chip`: abre por baixo da pilula (o grupo acabou de nascer), nao no
     /// rato.
     fn show_group_menu(&mut self, source_index: usize, group_index: usize, at_chip: bool) {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{MF_DISABLED, MF_GRAYED};
         let Some(hwnd) = self.window.as_ref().and_then(window_hwnd) else {
             return;
         };
-        let scale = self
-            .window
-            .as_ref()
-            .map_or(1.0, |window| window.scale_factor().max(1.0));
         let Some((group_id, name, current, collapsed)) = self
             .comparator
             .as_ref()
@@ -739,61 +612,24 @@ impl App {
             .flatten()
             .unwrap_or_else(|| self.bar_menu_point(hwnd));
 
-        let selected = unsafe {
-            let menu = CreatePopupMenu();
-            if menu.is_null() {
-                return;
-            }
-            let title = wide_null(&format!("Grupo \u{201C}{name}\u{201D}"));
-            let toggle = wide_null(if collapsed {
+        let mut menu = PopupMenu::default();
+        // O nome do grupo por cima, cinzento: um titulo, nao um comando.
+        menu.push(MenuCommand::new(0, format!("Grupo \u{201C}{name}\u{201D}")).disabled(""));
+        menu.separator();
+        menu.entries.extend(group_color_items(current));
+        menu.separator();
+        menu.push(MenuCommand::new(
+            GROUP_MENU_TOGGLE,
+            if collapsed {
                 "Expandir grupo"
             } else {
                 "Recolher grupo"
-            });
-            let ungroup = wide_null("Desagrupar");
-            let close = wide_null("Fechar grupo");
-            let color_labels: Vec<Vec<u16>> = GroupColor::ALL
-                .iter()
-                .map(|color| wide_null(group_color_label(*color)))
-                .collect();
+            },
+        ));
+        menu.push(MenuCommand::new(GROUP_MENU_UNGROUP, "Desagrupar"));
+        menu.push(MenuCommand::new(GROUP_MENU_CLOSE, "Fechar grupo"));
 
-            AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, title.as_ptr());
-            AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-            let size = (16.0 * scale).round() as i32;
-            let mut swatches: Vec<*mut core::ffi::c_void> = Vec::new();
-            for (index, color) in GroupColor::ALL.iter().enumerate() {
-                let swatch = color_swatch_bitmap(color.rgb(), size);
-                if !swatch.is_null() {
-                    swatches.push(swatch);
-                }
-                append_swatch_item(
-                    menu,
-                    GROUP_MENU_COLOR_BASE + index,
-                    &color_labels[index],
-                    swatch,
-                    *color == current,
-                );
-            }
-            AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-            AppendMenuW(menu, MF_STRING, GROUP_MENU_TOGGLE, toggle.as_ptr());
-            AppendMenuW(menu, MF_STRING, GROUP_MENU_UNGROUP, ungroup.as_ptr());
-            AppendMenuW(menu, MF_STRING, GROUP_MENU_CLOSE, close.as_ptr());
-
-            let selected = TrackPopupMenu(
-                menu,
-                TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                point.x,
-                point.y,
-                0,
-                hwnd,
-                std::ptr::null(),
-            ) as usize;
-            DestroyMenu(menu);
-            for swatch in swatches {
-                DeleteObject(swatch as _);
-            }
-            selected
-        };
+        let selected = self.track_menu(&menu, point, MenuButton::Right);
 
         if let Some(command) = group_menu_command(selected) {
             self.apply_group_menu(source_index, group_id, command);
@@ -1112,4 +948,20 @@ impl App {
             HomeClick::Nothing => {}
         }
     }
+}
+
+/// As cores de um grupo como itens de menu, com a amostra de cada uma e a
+/// `current` marcada: o menu do grupo e o submenu "Cor do grupo" de uma aba
+/// agrupada usam os mesmos ids (`GROUP_MENU_COLOR_BASE`).
+pub(in crate::windows_app) fn group_color_items(current: GroupColor) -> Vec<MenuEntry> {
+    GroupColor::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, color)| {
+            MenuCommand::new(GROUP_MENU_COLOR_BASE + index, group_color_label(*color))
+                .icon(MenuIcon::Swatch(color.rgb()))
+                .checked(*color == current)
+                .into()
+        })
+        .collect()
 }

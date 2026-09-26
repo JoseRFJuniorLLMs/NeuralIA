@@ -132,8 +132,9 @@ pub(in crate::windows_app) enum UserEvent {
     /// Pedido da pagina do painel do Gemini Live (canal proprio, lista
     /// fechada em `gemini_live::parse_live_message`).
     Live(LiveMessage),
-    /// "Abrir?" do aviso do Gmail: Sim (true) ou Nao.
-    GmailAnswer(bool),
+    /// O aviso do canto (`toast.rs`, centro de avisos `crate::notify`):
+    /// um clique num botao dele ou o fim do prazo.
+    Notify(NotifyEvent),
     HomeRequested,
     /// Voltar um nivel: de ecra completo para tres colunas, de la para a Home.
     BackRequested,
@@ -141,7 +142,12 @@ pub(in crate::windows_app) enum UserEvent {
     /// abas (WM_CAPTURECHANGED): o arrasto desse gesto cancela-se.
     TabCaptureLost(u64),
     ToggleAutoScroll,
-    AutoScrollAnswer(bool),
+    /// Clique no botao `index` da pergunta do meio da janela
+    /// (`SplashQuestion`), de quem a fez.
+    SplashAnswer {
+        asker: SplashAsker,
+        index: usize,
+    },
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -167,7 +173,6 @@ pub(in crate::windows_app) enum UserEvent {
         subject: String,
         key: String,
     },
-    HideGmailToast(u64),
     ShowHistory,
     ClearHistory,
     HistoryCleared(Result<(), String>),
@@ -382,7 +387,10 @@ const SEARCH_CARD_SECONDS: u64 = 12;
 /// Um confirmar que chega antes disto, contado desde que o cartao (ou o texto
 /// que o trocou) apareceu, nao conta: um duplo clique que a pagina pediu no
 /// sitio onde o cartao ia nascer nao o confirma.
-const SEARCH_CARD_ARM: Duration = Duration::from_millis(600);
+/// O cartao arma pelo `NATIVE_CARD_ARM` dos cartoes nativos; os gates do
+/// cartao da barra leem-no por este nome.
+#[cfg(test)]
+const SEARCH_CARD_ARM: Duration = NATIVE_CARD_ARM;
 /// O pedido fixo do Traduzir, escrito pelo nativo: as tres IAs recebem isto,
 /// uma linha em branco e o texto que o cartao pintou.
 const TRANSLATE_PROMPT: &str = "Traduza para o português do Brasil (se o texto já estiver em português, traduza para o inglês):";
@@ -748,10 +756,12 @@ unsafe extern "system" fn search_card_subclass(
     _subclass_id: usize,
     reference_data: usize,
 ) -> LRESULT {
+    // Os cliques sao do cartao (um STATIC devolve HTTRANSPARENT e iam para
+    // a pagina) e nao o ativam (`popup_no_activate_message`).
+    if let Some(result) = popup_no_activate_message(message) {
+        return result;
+    }
     match message {
-        // Um STATIC devolve HTTRANSPARENT e os cliques iam para a pagina.
-        WM_NCHITTEST => HTCLIENT as LRESULT,
-        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_LBUTTONDOWN => {
             let mut client = RECT::default();
             if GetClientRect(hwnd, &mut client) != 0 {
@@ -1690,18 +1700,28 @@ unsafe fn color_swatch_bitmap(color: Rgb, size: i32) -> *mut core::ffi::c_void {
 }
 
 /// Acrescenta ao menu um item com texto e, a esquerda, a amostra `swatch`
-/// (pode ser nula). `checked` marca-o como a escolha em vigor.
+/// (pode ser nula). `checked` marca-o como a escolha em vigor; `disabled`
+/// deixa-o cinzento e sem clique, como o `MF_GRAYED` de um item sem icone.
 unsafe fn append_swatch_item(
     menu: *mut core::ffi::c_void,
     id: usize,
     label: &[u16],
     swatch: *mut core::ffi::c_void,
     checked: bool,
+    disabled: bool,
 ) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetMenuItemCount, InsertMenuItemW, MENUITEMINFOW, MFS_CHECKED, MFT_RADIOCHECK, MFT_STRING,
-        MIIM_BITMAP, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING,
+        GetMenuItemCount, InsertMenuItemW, MENUITEMINFOW, MFS_CHECKED, MFS_DISABLED,
+        MFT_RADIOCHECK, MFT_STRING, MIIM_BITMAP, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING,
     };
+    let mut state = 0;
+    if checked {
+        state |= MFS_CHECKED;
+    }
+    if disabled {
+        // MFS_DISABLED e MFS_GRAYED sao o mesmo valor: cinzento e sem clique.
+        state |= MFS_DISABLED;
+    }
     let info = MENUITEMINFOW {
         cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
         fMask: MIIM_ID
@@ -1710,7 +1730,7 @@ unsafe fn append_swatch_item(
             | MIIM_STATE
             | if swatch.is_null() { 0 } else { MIIM_BITMAP },
         fType: MFT_STRING | if checked { MFT_RADIOCHECK } else { 0 },
-        fState: if checked { MFS_CHECKED } else { 0 },
+        fState: state,
         wID: id as u32,
         hSubMenu: std::ptr::null_mut(),
         hbmpChecked: std::ptr::null_mut(),
@@ -3006,8 +3026,10 @@ pub(in crate::windows_app) struct App {
     pub(in crate::windows_app) reading_pdf: bool,
     pub(in crate::windows_app) splash: Option<HWND>,
     pub(in crate::windows_app) splash_board: SplashBoard,
-    pub(in crate::windows_app) gmail_toast: Option<HWND>,
-    pub(in crate::windows_app) gmail_toast_token: u64,
+    /// A janela do aviso do canto (`toast.rs`), enquanto existe.
+    pub(in crate::windows_app) toast: Option<HWND>,
+    /// O centro de avisos: o aviso a vista, o token dele e a fila.
+    pub(in crate::windows_app) notify: crate::notify::NotifyCentre,
     /// O pedido da barra (Mandar para IA, Traduzir) a espera do clique no
     /// cartao nativo.
     pub(in crate::windows_app) search_card: SearchCard,
@@ -3181,8 +3203,8 @@ impl App {
             reading_pdf: false,
             splash: None,
             splash_board: SplashBoard::default(),
-            gmail_toast: None,
-            gmail_toast_token: 0,
+            toast: None,
+            notify: crate::notify::NotifyCentre::default(),
             search_card: SearchCard::default(),
             bar_notes: BarNoteGuard::default(),
             shortcut_notes: BarNoteGuard::default(),
@@ -5485,11 +5507,11 @@ enum SearchCardOutcome {
     Ignored,
 }
 
+/// O pedido do cartao da barra (`SearchCard`, um `NativeCard`): o botao que
+/// o pediu e a pergunta ja limpa. O token e a hora sao do `NativeCard`.
 struct PendingSearch {
-    token: u64,
     intent: SearchIntent,
     question: String,
-    shown_at: Instant,
 }
 
 /// O mapa de teclas (e a barra de selecao que vive nele) com a capability e
@@ -6927,6 +6949,9 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ),
     ("services.rs", include_str!("windows_app/services.rs")),
     ("search_card.rs", include_str!("windows_app/search_card.rs")),
+    ("toast.rs", include_str!("windows_app/toast.rs")),
+    ("popup_menu.rs", include_str!("windows_app/popup_menu.rs")),
+    ("native_card.rs", include_str!("windows_app/native_card.rs")),
     ("tests.rs", include_str!("windows_app/tests.rs")),
 ];
 
@@ -6990,6 +7015,12 @@ pub(in crate::windows_app) mod services;
 pub(in crate::windows_app) use services::*;
 pub(in crate::windows_app) mod search_card;
 pub(in crate::windows_app) use search_card::*;
+pub(in crate::windows_app) mod toast;
+pub(in crate::windows_app) use toast::*;
+pub(in crate::windows_app) mod popup_menu;
+pub(in crate::windows_app) use popup_menu::*;
+pub(in crate::windows_app) mod native_card;
+pub(in crate::windows_app) use native_card::*;
 
 pub(in crate::windows_app) mod app;
 #[allow(unused_imports)]

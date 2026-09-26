@@ -7,28 +7,85 @@ pub(in crate::windows_app) const SPLASH_HEIGHT: f64 = 46.0;
 /// Texto do aviso flutuante. Vive fora do App porque quem o pinta e o
 /// procedimento de janela, que nao tem acesso ao estado da aplicacao.
 pub(in crate::windows_app) static SPLASH_TEXT: Mutex<String> = Mutex::new(String::new());
-/// Verdadeiro enquanto a janela esta a fazer uma pergunta com Sim/Nao.
-pub(in crate::windows_app) static SPLASH_ASKS: AtomicBool = AtomicBool::new(false);
 
-/// Os dois botoes ocupam o terco direito da janela. Uma so funcao para o
-/// desenho e o clique concordarem sempre.
-pub(in crate::windows_app) fn splash_buttons(client: &RECT) -> (RECT, RECT) {
+/// Um botao da pergunta do meio da janela.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) struct SplashButton {
+    pub(in crate::windows_app) label: &'static str,
+    /// O principal: cheio, na cor de destaque.
+    pub(in crate::windows_app) primary: bool,
+}
+
+/// Quem faz a pergunta: a resposta volta para ele (`App::answer_splash`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) enum SplashAsker {
+    /// "Rolar a pagina sozinho...?"
+    AutoScroll,
+}
+
+/// Uma pergunta centrada na janela com os seus proprios botoes
+/// (infra-notify-popups: substitui o `SPLASH_ASKS`, que era sempre Sim/Nao
+/// e sempre da rolagem). Os botoes ficam a direita do texto, pela ordem da
+/// lista; o clique no botao `index` chega como
+/// `UserEvent::SplashAnswer { asker, index }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) struct SplashQuestion {
+    pub(in crate::windows_app) asker: SplashAsker,
+    pub(in crate::windows_app) buttons: &'static [SplashButton],
+}
+
+/// A pergunta da rolagem automatica: Sim (principal) e Nao.
+pub(in crate::windows_app) const AUTO_SCROLL_QUESTION: SplashQuestion = SplashQuestion {
+    asker: SplashAsker::AutoScroll,
+    buttons: &[
+        SplashButton {
+            label: "Sim",
+            primary: true,
+        },
+        SplashButton {
+            label: "Não",
+            primary: false,
+        },
+    ],
+};
+
+/// A pergunta a vista; `None` enquanto a janela e so um aviso (sem botoes e
+/// transparente aos cliques).
+pub(in crate::windows_app) static SPLASH_QUESTION: Mutex<Option<SplashQuestion>> = Mutex::new(None);
+
+fn splash_question() -> Option<SplashQuestion> {
+    SPLASH_QUESTION.lock().ok().and_then(|question| *question)
+}
+
+/// Os `count` botoes, encostados a direita: cada um com um quinto da
+/// largura, separados por um quadragesimo. Uma so funcao para o desenho e
+/// o clique concordarem sempre; com dois sao o Sim e o Nao de sempre.
+pub(in crate::windows_app) fn splash_buttons(client: &RECT, count: usize) -> Vec<RECT> {
     let width = client.right - client.left;
     let button = width / 5;
     let margin = width / 40;
-    let no = RECT {
-        left: client.right - margin - button,
-        top: client.top + margin,
-        right: client.right - margin,
-        bottom: client.bottom - margin,
-    };
-    let yes = RECT {
-        left: no.left - margin - button,
-        top: no.top,
-        right: no.left - margin,
-        bottom: no.bottom,
-    };
-    (yes, no)
+    let mut right = client.right - margin;
+    let mut rects: Vec<RECT> = (0..count)
+        .map(|_| {
+            let rect = RECT {
+                left: right - button,
+                top: client.top + margin,
+                right,
+                bottom: client.bottom - margin,
+            };
+            right = rect.left - margin;
+            rect
+        })
+        .collect();
+    rects.reverse();
+    rects
+}
+
+/// O botao da pergunta na coluna `x` (so a coluna conta, como sempre).
+pub(in crate::windows_app) fn splash_button_at(buttons: &[RECT], x: i32) -> Option<usize> {
+    buttons
+        .iter()
+        .position(|button| x >= button.left && x < button.right)
 }
 
 /// Aviso flutuante no fundo do ecra. Tem de ser nativo e nao injetado na
@@ -42,22 +99,31 @@ pub(in crate::windows_app) unsafe extern "system" fn splash_subclass(
     _subclass_id: usize,
     reference_data: usize,
 ) -> LRESULT {
+    let question = if matches!(message, WM_NCHITTEST | WM_LBUTTONUP | WM_PAINT) {
+        splash_question()
+    } else {
+        None
+    };
     // Quando a janela faz uma pergunta tem de receber cliques; uma janela da
     // classe STATIC devolve HTTRANSPARENT e o clique atravessava-a.
-    if message == WM_NCHITTEST && SPLASH_ASKS.load(Ordering::SeqCst) {
+    if message == WM_NCHITTEST && question.is_some() {
         return HTCLIENT as LRESULT;
     }
 
-    if message == WM_LBUTTONUP && SPLASH_ASKS.load(Ordering::SeqCst) && reference_data != 0 {
+    if message == WM_LBUTTONUP
+        && reference_data != 0
+        && let Some(question) = question
+    {
         let mut client = RECT::default();
         if GetClientRect(hwnd, &mut client) != 0 {
             let x = (lparam & 0xFFFF) as i16 as i32;
-            let (yes, no) = splash_buttons(&client);
-            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
-            if x >= yes.left && x < yes.right {
-                let _ = proxy.send_event(UserEvent::AutoScrollAnswer(true));
-            } else if x >= no.left && x < no.right {
-                let _ = proxy.send_event(UserEvent::AutoScrollAnswer(false));
+            let buttons = splash_buttons(&client, question.buttons.len());
+            if let Some(index) = splash_button_at(&buttons, x) {
+                let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+                let _ = proxy.send_event(UserEvent::SplashAnswer {
+                    asker: question.asker,
+                    index,
+                });
             }
         }
         return 0;
@@ -87,29 +153,30 @@ pub(in crate::windows_app) unsafe extern "system" fn splash_subclass(
                     .map(|value| value.clone())
                     .unwrap_or_default();
 
-                if SPLASH_ASKS.load(Ordering::SeqCst) {
-                    let (yes, no) = splash_buttons(&client);
-                    let mut question = RECT {
+                if let Some(question) = question {
+                    let buttons = splash_buttons(&client, question.buttons.len());
+                    let first = buttons.first().map_or(client.right, |button| button.left);
+                    let mut asked = RECT {
                         left: client.left + (18.0 * scale) as i32,
                         top: client.top,
-                        right: yes.left - (10.0 * scale) as i32,
+                        right: first - (10.0 * scale) as i32,
                         bottom: client.bottom,
                     };
                     draw_text(
                         hdc,
                         &text,
-                        &mut question,
+                        &mut asked,
                         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
                     );
 
-                    for (rect, label, primary) in [(yes, "Sim", true), (no, "Não", false)] {
+                    for (rect, button) in buttons.iter().zip(question.buttons) {
                         let pill = UiRect {
                             x: rect.left as f64,
                             y: rect.top as f64,
                             width: (rect.right - rect.left) as f64,
                             height: (rect.bottom - rect.top) as f64,
                         };
-                        let style = if primary {
+                        let style = if button.primary {
                             PillStyle::new(theme.accent, theme.accent, on_color(theme.accent))
                         } else {
                             PillStyle::new(
@@ -118,7 +185,7 @@ pub(in crate::windows_app) unsafe extern "system" fn splash_subclass(
                                 theme.fg,
                             )
                         };
-                        draw_pill(hdc, pill, label, style, scale, font, theme.surface);
+                        draw_pill(hdc, pill, button.label, style, scale, font, theme.surface);
                     }
                 } else {
                     let mut rect = client;
@@ -166,16 +233,17 @@ pub(in crate::windows_app) enum SplashKind {
     /// Aviso que chega sozinho (o fim de uma fase do Pomodoro): com a
     /// pergunta a vista, espera que ela saia.
     Background,
-    /// "Rolar a pagina sozinho...?" com Sim e Nao.
-    Question,
+    /// Uma pergunta com os seus botoes ("Rolar a pagina sozinho...?" com
+    /// Sim e Nao).
+    Question(SplashQuestion),
 }
 
 /// O que o popup passa a mostrar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::windows_app) struct SplashFrame {
     pub(in crate::windows_app) text: String,
-    /// Com os botoes Sim e Nao (`SPLASH_ASKS`).
-    pub(in crate::windows_app) asks: bool,
+    /// A pergunta, com os botoes dela (`SPLASH_QUESTION`); `None` num aviso.
+    pub(in crate::windows_app) question: Option<SplashQuestion>,
     pub(in crate::windows_app) seconds: u64,
     /// O `HideSplash` deste quadro.
     pub(in crate::windows_app) token: u64,
@@ -221,20 +289,24 @@ impl SplashBoard {
             self.waiting = Some((text, seconds));
             return None;
         }
-        Some(self.frame(text, seconds, kind == SplashKind::Question))
+        let question = match kind {
+            SplashKind::Question(question) => Some(question),
+            SplashKind::Notice | SplashKind::Background => None,
+        };
+        Some(self.frame(text, seconds, question))
     }
 
     pub(in crate::windows_app) fn frame(
         &mut self,
         text: String,
         seconds: u64,
-        asks: bool,
+        question: Option<SplashQuestion>,
     ) -> SplashFrame {
         self.token = self.token.wrapping_add(1);
-        self.question = asks.then_some(self.token);
+        self.question = question.is_some().then_some(self.token);
         SplashFrame {
             text,
-            asks,
+            question,
             seconds,
             token: self.token,
         }
@@ -249,7 +321,7 @@ impl SplashBoard {
         let next = self
             .waiting
             .take()
-            .map(|(text, seconds)| self.frame(text, seconds, false));
+            .map(|(text, seconds)| self.frame(text, seconds, None));
         SplashHide::Hide {
             question_expired,
             next,

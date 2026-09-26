@@ -387,29 +387,6 @@ pub(in crate::windows_app) unsafe fn search_card_fit(
     }
 }
 
-/// "Abrir" e "Nao" no canto direito do aviso do Gmail, em pixeis do cliente.
-pub(in crate::windows_app) fn gmail_toast_buttons(client: &RECT, scale: f64) -> (RECT, RECT) {
-    let height = (26.0 * scale).round() as i32;
-    let top = (client.bottom - height) / 2;
-    let gap = (6.0 * scale).round() as i32;
-    let right = client.right - (12.0 * scale).round() as i32;
-    let no_width = (54.0 * scale).round() as i32;
-    let open_width = (70.0 * scale).round() as i32;
-    let no = RECT {
-        left: right - no_width,
-        top,
-        right,
-        bottom: top + height,
-    };
-    let open = RECT {
-        left: no.left - gap - open_width,
-        top,
-        right: no.left - gap,
-        bottom: top + height,
-    };
-    (open, no)
-}
-
 /// Log de depuracao em tempo de execucao, pedido pelo dono para achar bugs
 /// intermitentes. Desligado por padrao; `NEURALIA_DEBUG_LOG=<ficheiro>` liga.
 /// Cada linha: milissegundos desde o arranque e o evento. Nunca leva URLs,
@@ -448,12 +425,13 @@ pub(in crate::windows_app) fn show_popup_without_activation(hwnd: HWND) {
     }
 }
 
-/// Um cartao de cada vez: pendente -> confirmado, cancelado, expirado ou
-/// trocado por um pedido novo.
+/// O cartao da barra de selecao: um `NativeCard` (token, armar, expiracao,
+/// so o pintado) cujo pedido e o botao da barra que o pediu e a pergunta ja
+/// limpa. Um cartao de cada vez: pendente -> confirmado, cancelado,
+/// expirado ou trocado por um pedido novo.
 #[derive(Default)]
 pub(in crate::windows_app) struct SearchCard {
-    pub(in crate::windows_app) pending: Option<PendingSearch>,
-    pub(in crate::windows_app) last_token: u64,
+    pub(in crate::windows_app) card: NativeCard<PendingSearch>,
 }
 
 impl SearchCard {
@@ -467,18 +445,8 @@ impl SearchCard {
                 let Some(SelectionSearch::Compare(question)) = selection_search(&text) else {
                     return SearchCardOutcome::Ignored;
                 };
-                self.last_token = self.last_token.wrapping_add(1).max(1);
-                let token = self.last_token;
                 let text = question.clone();
-                let replaced = self
-                    .pending
-                    .replace(PendingSearch {
-                        token,
-                        intent,
-                        question,
-                        shown_at: now,
-                    })
-                    .is_some();
+                let (token, replaced) = self.card.request(PendingSearch { intent, question }, now);
                 SearchCardOutcome::Show {
                     token,
                     intent,
@@ -491,38 +459,21 @@ impl SearchCard {
                 button,
                 shown,
             } => {
-                let Some(pending) = self.pending.take_if(|pending| pending.token == token) else {
-                    return SearchCardOutcome::Ignored;
-                };
+                let confirm = button == SearchCardButton::Confirm;
                 // O que o cartao pintou deste texto: o resto nao se viu e nao
-                // vai, por mais que a pagina o tenha posto la.
-                let seen = search_card_shown(&pending.question, shown);
-                match button {
-                    SearchCardButton::Cancel => SearchCardOutcome::Cancelled,
-                    SearchCardButton::Confirm
-                        if !seen.is_empty()
-                            && now.saturating_duration_since(pending.shown_at)
-                                >= SEARCH_CARD_ARM =>
-                    {
-                        SearchCardOutcome::Confirmed(CompareRequest::selection(
-                            pending.intent,
-                            seen,
-                        ))
-                    }
-                    SearchCardButton::Confirm => {
-                        // Cedo demais, ou nada a vista: o cartao fica, a
-                        // espera de um clique a serio.
-                        self.pending = Some(pending);
-                        SearchCardOutcome::Ignored
-                    }
+                // vai, por mais que a pagina o tenha posto la. Cedo demais, ou
+                // nada a vista: o cartao fica, a espera de um clique a serio.
+                match self.card.answer(token, confirm, now, |pending| {
+                    let seen = search_card_shown(&pending.question, shown);
+                    (!seen.is_empty()).then(|| CompareRequest::selection(pending.intent, seen))
+                }) {
+                    CardAnswer::Confirmed(request) => SearchCardOutcome::Confirmed(request),
+                    CardAnswer::Cancelled => SearchCardOutcome::Cancelled,
+                    CardAnswer::Ignored => SearchCardOutcome::Ignored,
                 }
             }
             SearchCardInput::Expire(token) => {
-                if self
-                    .pending
-                    .take_if(|pending| pending.token == token)
-                    .is_some()
-                {
+                if self.card.expire(token) {
                     SearchCardOutcome::Expired
                 } else {
                     SearchCardOutcome::Ignored
@@ -582,40 +533,21 @@ impl SearchCardHost for App {
             let height = (SEARCH_CARD_HEIGHT * scale).round() as i32;
             unsafe {
                 // Owned pela janela principal, como o splash e o aviso do
-                // Gmail: acima do WebView2 e da pagina, nao acima das outras
-                // aplicacoes; nasce invisivel e sem ativacao.
-                let created = CreateWindowExW(
-                    AUX_POPUP_EX_STYLE,
-                    windows_sys::w!("STATIC"),
-                    windows_sys::w!(""),
-                    AUX_POPUP_STYLE,
-                    0,
-                    0,
+                // canto: acima do WebView2 e da pagina, nao acima das outras
+                // aplicacoes; nasce invisivel e sem ativacao
+                // (`create_native_card`).
+                let corner = (18.0 * scale).round() as i32;
+                let Some(created) = create_native_card(
+                    owner,
                     width,
                     height,
-                    owner,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                );
-                if created.is_null() {
-                    return;
-                }
-                if SetWindowSubclass(
-                    created,
-                    Some(search_card_subclass),
+                    search_card_subclass,
                     SEARCH_CARD_SUBCLASS_ID,
                     (&*self.search_card_sink as *const SearchCardSink) as usize,
-                ) == 0
-                {
-                    DestroyWindow(created);
+                    corner,
+                ) else {
                     return;
-                }
-                let corner = (18.0 * scale).round() as i32;
-                let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, corner, corner);
-                if !region.is_null() {
-                    SetWindowRgn(created, region, 1);
-                }
+                };
                 self.search_card_popup = Some(created);
             }
         }
