@@ -12,6 +12,7 @@ pub mod history;
 pub mod intent;
 pub mod json_store;
 pub mod library;
+pub mod llm;
 pub mod local_intelligence;
 pub mod memory;
 pub mod pomodoro;

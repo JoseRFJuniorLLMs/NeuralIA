@@ -312,6 +312,15 @@ impl Drop for ApiKey {
     }
 }
 
+/// A chave que o transporte de IA (`neural_core::llm`, infra-llm-transport)
+/// aceita: ele so a le para o cabecalho de autenticacao do fornecedor, nunca
+/// para o URL nem para o corpo.
+impl neural_core::llm::ApiCredential for ApiKey {
+    fn secret(&self) -> &str {
+        self.expose()
+    }
+}
+
 pub(crate) const API_KEY_MIN_CHARS: usize = 20;
 pub(crate) const API_KEY_MAX_CHARS: usize = 300;
 
