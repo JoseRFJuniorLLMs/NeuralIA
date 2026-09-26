@@ -3,12 +3,18 @@
 //! Usado pelo subsistema de downloads e pelo explorador de arquivos para impedir
 //! execução acidental de programas, scripts, imagens de disco, atalhos do Windows
 //! e arquivos mascarados com extensões falsas, caracteres bidi ou invisíveis.
+//!
+//! Um ZIP baixado tem as entradas listadas pelo diretório central e pelos
+//! cabeçalhos locais ([`inspect_zip`], downloads-zip-inspect), sem ler os
+//! dados de nenhuma.
 
 use std::{
     fs::File,
-    io::Read,
+    io::{Read, Seek},
     path::{Path, PathBuf},
 };
+
+use crate::safezip::{self, ZipPolicy};
 
 /// Categoria de risco para um nome ou arquivo baixado.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +115,17 @@ pub const DISKIMAGE_EXTENSIONS: &[&str] = &["iso", "img", "vhd", "vhdx"];
 /// Bases e projetos do Access: abrem com macros de arranque e VBA, e o
 /// Outlook bloqueia-os como anexos.
 pub const DATABASE_APP_EXTENSIONS: &[&str] = &["mda", "mdb", "mde", "accde", "ade", "adp"];
+
+/// Arquivos compactados. Dentro de um ZIP baixado, um destes esconde o que
+/// tem: a inspeção nunca lê os dados de uma entrada, por isso um ZIP que leva
+/// outro conta como um que leva programas ([`ZipEntryRisk::NestedArchive`]).
+/// As imagens de disco (`.iso`, `.vhd`...) e o `.jar` já bloqueiam pelas
+/// listas deles; os documentos que são ZIP por dentro (`.docx`, `.epub`)
+/// não entram.
+pub const ARCHIVE_EXTENSIONS: &[&str] = &[
+    "zip", "zipx", "7z", "rar", "cab", "tar", "gz", "tgz", "bz2", "tbz", "tbz2", "xz", "txz",
+    "zst", "lz", "lzma", "z", "arj", "lzh", "lha", "ace", "wim", "cpio",
+];
 
 /// Extensões de documentos com macros habilitadas (Office/Office-like). Sozinhas
 /// são um aviso; depois de uma extensão de fachada (`fatura.pdf.docm`) são um
@@ -432,6 +449,14 @@ pub fn block_reason(name: &str) -> Option<BlockReason> {
     if WINDOWS_RESERVED_DEVICE_NAMES.contains(&base_stem.as_str()) {
         return Some(BlockReason::BadName);
     }
+    extension_reason(clean)
+}
+
+/// A parte de [`block_reason`] que olha para a extensão: `clean` já vem sem
+/// os joiners e sem os pontos e os espaços do fim. Um programa, um script,
+/// um atalho, uma imagem de disco ou uma base do Access, ou um disfarce
+/// (uma extensão perigosa ou de macro depois de uma fachada ou de espaços).
+fn extension_reason(clean: &str) -> Option<BlockReason> {
     let (stem, last_raw) = clean.rsplit_once('.')?;
     let ext = last_raw.trim().to_ascii_lowercase();
     let ext = ext.as_str();
@@ -453,6 +478,245 @@ pub fn block_reason(name: &str) -> Option<BlockReason> {
         return Some(BlockReason::Masquerade);
     }
     kind
+}
+
+// ===================== um ZIP baixado (downloads-zip-inspect) =====================
+
+/// Porque uma entrada torna perigoso o ZIP baixado que a leva.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ZipEntryRisk {
+    /// O nome da entrada bloqueia pelas regras de [`block_reason`]: um
+    /// programa, um script, um atalho, uma imagem de disco, uma base do
+    /// Access, um disfarce (`foto.jpg.exe`) ou um nome com bidi, controlos,
+    /// invisíveis ou `:`; e, só aqui, um caminho com um segmento `.` ou
+    /// `..` ou acima de [`MAX_SEGMENT_UTF16`] unidades UTF-16 (`BadName`).
+    Blocked(BlockReason),
+    /// Outro arquivo compactado ([`ARCHIVE_EXTENSIONS`]): o que ele tem
+    /// dentro não se inspeciona.
+    NestedArchive,
+}
+
+impl ZipEntryRisk {
+    /// Como no download direto ([`BlockReason::allows_confirmation`]): com
+    /// «Permitir baixar programas» ligado, o ZIP fica -- menos com um
+    /// disfarce ou um nome inseguro dentro, que o apagam sempre.
+    pub fn allows_confirmation(self) -> bool {
+        match self {
+            Self::Blocked(reason) => reason.allows_confirmation(),
+            Self::NestedArchive => true,
+        }
+    }
+
+    /// O que nunca se permite pesa mais; um programa pesa mais do que um
+    /// arquivo por inspecionar.
+    fn severity(self) -> u8 {
+        match self {
+            Self::Blocked(reason) if !reason.allows_confirmation() => 2,
+            Self::Blocked(_) => 1,
+            Self::NestedArchive => 0,
+        }
+    }
+}
+
+/// O nome como o Windows o grava: sem os joiners, sem os pontos e os espaços
+/// do fim.
+fn windows_clean_name(name: &str) -> String {
+    let visible: String = name.chars().filter(|&c| !is_text_joiner(c)).collect();
+    visible.trim_end_matches([' ', '.']).to_string()
+}
+
+/// A extensão final como o Windows a vê: sem os joiners, sem os pontos e os
+/// espaços do fim, em minúsculas. `None` sem ponto.
+fn final_extension(name: &str) -> Option<String> {
+    let clean = windows_clean_name(name);
+    let (_, ext) = clean.rsplit_once('.')?;
+    Some(ext.trim().to_ascii_lowercase())
+}
+
+/// Bidi, controlos, formatos invisíveis ou `:` (um fluxo alternativo): o que
+/// faz um nome mentir sobre o que é.
+fn has_hostile_chars(name: &str) -> bool {
+    name.contains(':')
+        || name
+            .chars()
+            .any(|c| is_bidi_or_control(c) || is_hidden_format(c))
+}
+
+/// O maior segmento de um caminho (um nome de pasta ou de arquivo) que o
+/// NTFS grava: 255 unidades UTF-16 (o ext4 aceita 255 bytes). Numa entrada
+/// de um ZIP, um segmento maior é um nome estragado: nenhum extrator o
+/// consegue gravar, e classificá-lo custaria várias passagens por até
+/// 64 KiB de nome, na thread da interface.
+pub const MAX_SEGMENT_UTF16: usize = 255;
+
+/// Uma passagem pelos bytes UTF-8 do nome de uma entrada, que pára no
+/// primeiro para lá do teto: `true` quando um segmento (`/` ou `\`) tem
+/// mais de [`MAX_SEGMENT_UTF16`] unidades UTF-16, ou quando é `..`, que
+/// sobe de pasta e que cada extrator resolve à sua maneira. Um `.` não
+/// conta aqui: não muda o caminho em nenhum extrator (o bsdtar grava
+/// `./LEIAME.txt`), e a classificação salta-o. Conta
+/// sobre os bytes, sem descodificar: um caractere começa em cada byte que
+/// não é de continuação e vale uma unidade, ou duas se tem 4 bytes. Recebe
+/// os bytes, e não o nome, para o gate contar os que ela lê.
+fn has_bad_segment(bytes: impl Iterator<Item = u8>) -> bool {
+    let is_dot_segment = |units: usize, only_dots: bool| only_dots && units == 2;
+    let mut units = 0usize;
+    let mut only_dots = true;
+    for byte in bytes {
+        if byte == b'/' || byte == b'\\' {
+            if is_dot_segment(units, only_dots) {
+                return true;
+            }
+            units = 0;
+            only_dots = true;
+            continue;
+        }
+        if byte & 0xC0 != 0x80 {
+            units += 1 + usize::from(byte >= 0xF0);
+            if units > MAX_SEGMENT_UTF16 {
+                return true;
+            }
+        }
+        only_dots &= byte == b'.';
+    }
+    is_dot_segment(units, only_dots)
+}
+
+/// Um segmento que o Windows reduz a nada: vazio ou só de pontos e espaços.
+fn is_blank_segment(segment: &str) -> bool {
+    segment.chars().all(|c| c == '.' || c == ' ')
+}
+
+/// O risco de uma entrada de um ZIP por um nome dela, tal como o diretório
+/// central, o campo Unicode Path ou o cabeçalho local o trazem.
+///
+/// Primeiro, numa só passagem que pára no teto, o caminho: um segmento com
+/// mais de [`MAX_SEGMENT_UTF16`] unidades UTF-16, ou um `..` em qualquer
+/// lugar (`../../x.bat`, `a/../setup.exe`, `setup.exe/..`), é um nome
+/// estragado ([`BlockReason::BadName`]), que apaga o ZIP sempre. Por isso as
+/// passagens seguintes só correm sobre um segmento de até 255 unidades.
+///
+/// Depois conta o último segmento real do caminho (o ZIP separa com `/`, e
+/// o Windows também aceita `\`): `pasta/sub/setup.exe` é um programa a
+/// qualquer profundidade. Os segmentos do fim feitos só de pontos e espaços
+/// caem antes, como o Windows corta os pontos e os espaços do fim de um
+/// nome (`setup.exe/ .` e `setup.exe\...` contam como `setup.exe`); só
+/// separadores depois de um segmento com nome é uma pasta (`docs/`,
+/// `setup.exe/`), que não conta. Com as regras de [`block_reason`] (o
+/// disfarce, os pontos e os espaços do fim). Um nome com o radical de um
+/// dispositivo do DOS (`aux`, `nul`, `com1`...) não é um nome estragado
+/// aqui: o Windows 11 cria `aux.exe` ou `nul.bat` como um arquivo qualquer,
+/// e um extrator grava-os e corre-os -- por isso esse nome conta pela
+/// extensão, como outro qualquer (`aux.exe` é um programa, `prn.pdf.exe` um
+/// disfarce, `aux.c` e `con.txt` nada). Um caminho só de pontos, espaços e
+/// separadores, sem `..`, não conta. Um `.` no meio (`./LEIAME.txt`,
+/// `dir/./x.txt`) não muda nada, e um `.` no fim cai como os outros
+/// segmentos só de pontos (`setup.exe/.` é o programa `setup.exe`, como o
+/// `tar.exe` o grava). Depois, outro arquivo
+/// compactado ([`ARCHIVE_EXTENSIONS`]).
+pub fn zip_entry_risk(entry: &str) -> Option<ZipEntryRisk> {
+    if has_bad_segment(entry.bytes()) {
+        return Some(ZipEntryRisk::Blocked(BlockReason::BadName));
+    }
+    let mut rest = entry;
+    let mut folder = false;
+    let mut vanished = false;
+    let name = loop {
+        let (head, segment) = match rest.rsplit_once(['/', '\\']) {
+            Some((head, segment)) => (Some(head), segment),
+            None => (None, rest),
+        };
+        if !is_blank_segment(segment) {
+            break segment;
+        }
+        if segment.is_empty() {
+            folder = true;
+        } else {
+            vanished = true;
+        }
+        rest = head?;
+    };
+    if folder && !vanished {
+        return None;
+    }
+    match block_reason(name) {
+        Some(BlockReason::BadName) if !has_hostile_chars(name) => {
+            if let Some(reason) = extension_reason(&windows_clean_name(name)) {
+                return Some(ZipEntryRisk::Blocked(reason));
+            }
+        }
+        Some(reason) => return Some(ZipEntryRisk::Blocked(reason)),
+        None => {}
+    }
+    final_extension(name)
+        .filter(|ext| ARCHIVE_EXTENSIONS.contains(&ext.as_str()))
+        .map(|_| ZipEntryRisk::NestedArchive)
+}
+
+/// O maior nome de entrada que um [`ZipVerdict::Holds`] guarda.
+pub const MAX_VERDICT_ENTRY_CHARS: usize = 255;
+
+/// O que a inspeção de um ZIP baixado encontrou.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZipVerdict {
+    /// O diretório central (um só possível) e os cabeçalhos locais foram
+    /// lidos inteiros e nenhum nome de nenhuma entrada é perigoso.
+    Clean { entries: u64 },
+    /// Uma entrada perigosa: o risco mais grave visto (o que nunca se
+    /// permite primeiro) e o nome da primeira entrada com ele, cortado a
+    /// [`MAX_VERDICT_ENTRY_CHARS`]. Vale mesmo que a listagem falhe
+    /// depois: o que se viu, viu-se.
+    Holds { risk: ZipEntryRisk, entry: String },
+    /// A listagem falhou antes de mostrar uma entrada perigosa (não é um
+    /// ZIP, está truncado ou corrompido, ZIP64 incompleto, entradas
+    /// sobrepostas, mais de um diretório possível, um cabeçalho local que
+    /// não bate com o diretório, acima dos tetos da
+    /// [`ZipPolicy::BROWSE_LITE`], erro de leitura): o que o arquivo tem não
+    /// se sabe. Nunca «seguro».
+    NotInspected,
+}
+
+/// Inspeciona um ZIP pelo diretório central e pelos cabeçalhos locais, pela
+/// [`safezip::list_central_directory`] com a [`ZipPolicy::BROWSE_LITE`]:
+/// cada nome que um extrator pode dar a uma entrada (o do diretório, o do
+/// Unicode Path, o do cabeçalho local) é classificado, e o pior vale.
+/// Nenhum byte dos dados das entradas é lido, por isso um ZIP de 2 GiB custa
+/// o mesmo que um pequeno com as mesmas entradas.
+pub fn inspect_zip(reader: impl Read + Seek + Send + 'static) -> ZipVerdict {
+    let mut worst: Option<(ZipEntryRisk, String)> = None;
+    let listed = safezip::list_central_directory(reader, &ZipPolicy::BROWSE_LITE, |entry| {
+        let Some(risk) = zip_entry_risk(entry) else {
+            return;
+        };
+        if worst
+            .as_ref()
+            .is_none_or(|(seen, _)| risk.severity() > seen.severity())
+        {
+            worst = Some((risk, entry.chars().take(MAX_VERDICT_ENTRY_CHARS).collect()));
+        }
+    });
+    match (worst, listed) {
+        (Some((risk, entry)), _) => ZipVerdict::Holds { risk, entry },
+        (None, Ok(entries)) => ZipVerdict::Clean { entries },
+        (None, Err(_)) => ZipVerdict::NotInspected,
+    }
+}
+
+/// [`inspect_zip`] sobre o arquivo no disco; um que não abre, ou que não é
+/// um arquivo regular, fica [`ZipVerdict::NotInspected`].
+pub fn inspect_zip_file(path: &Path) -> ZipVerdict {
+    match File::open(path) {
+        Ok(file) if file.metadata().is_ok_and(|meta| meta.is_file()) => inspect_zip(file),
+        _ => ZipVerdict::NotInspected,
+    }
+}
+
+/// Um nome que se inspeciona como ZIP: a extensão final, como o Windows a
+/// vê, é `.zip` -- a que o Explorador abre como uma pasta, onde um
+/// duplo-clique corre o que estiver dentro.
+pub fn is_zip_name(name: &str) -> bool {
+    final_extension(name).as_deref() == Some("zip")
 }
 
 /// Inspeciona o cabeçalho dos primeiros bytes (até 4 KiB) para identificar perigos.
@@ -1358,6 +1622,1133 @@ mod tests {
         }
         for offered in ["relatorio.pdf", "foto.PNG", "notas.txt", "musica.mp3"] {
             assert!(default_app_name_allowed(offered), "{offered}");
+        }
+    }
+
+    // ===================== downloads-zip-inspect =====================
+
+    use crate::epub::test_support::{RawEntry, ZipBuilder, unicode_path_extra};
+    use std::io::{Cursor, Seek, SeekFrom};
+    use std::sync::{Arc, Mutex};
+
+    fn verdict_of(bytes: Vec<u8>) -> ZipVerdict {
+        inspect_zip(Cursor::new(bytes))
+    }
+
+    /// O `pacote.zip` do E2E: um programa e um script.
+    fn pacote() -> Vec<u8> {
+        ZipBuilder::new()
+            .stored("setup.exe", &pe_bytes())
+            .stored("run.bat", b"@echo off\r\necho oi\r\n")
+            .build()
+    }
+
+    fn holds(risk: ZipEntryRisk, entry: &str) -> ZipVerdict {
+        ZipVerdict::Holds {
+            risk,
+            entry: entry.to_string(),
+        }
+    }
+
+    /// Gate critico (entrada nao confiavel; sabotado: saltar os nomes
+    /// dentro de pastas; saltar os arquivos compactados dentro; isentar o
+    /// radical de um dispositivo do DOS; ignorar o 0x7075 do diretorio; nao
+    /// ler o cabecalho local; ignorar o 0x7075 local; nao deixar cair os
+    /// segmentos do fim so de pontos e espacos; aceitar um `.` ou `..`;
+    /// tirar o teto do segmento): a tabela de classificacao de cada entrada
+    /// de um ZIP -- o ultimo segmento real do caminho a qualquer
+    /// profundidade (`/` e `\`), os disfarces, os pontos e espacos do fim
+    /// (tambem em segmentos inteiros: `setup.exe/ .`), os nomes inseguros,
+    /// um `.` ou `..` no caminho, um segmento acima de 255 unidades UTF-16,
+    /// os radicais do DOS (`aux.exe`) e os arquivos compactados --, e a
+    /// mesma tabela por ZIPs reais, com cada nome que um extrator pode dar
+    /// a uma entrada: o do diretorio central, o do Unicode Path (0x7075) e
+    /// o do cabecalho local.
+    #[test]
+    fn zip_entry_classification_table() {
+        use BlockReason::*;
+        use ZipEntryRisk::{Blocked, NestedArchive};
+        let rows: &[(&str, Option<ZipEntryRisk>)] = &[
+            // Programas e scripts, na raiz e dentro de pastas.
+            ("setup.exe", Some(Blocked(Program))),
+            ("run.bat", Some(Blocked(Script))),
+            ("SETUP.EXE", Some(Blocked(Program))),
+            ("pasta/setup.exe", Some(Blocked(Program))),
+            ("a/b/c/d/instalar.msi", Some(Blocked(Program))),
+            ("scripts/deploy.ps1", Some(Blocked(Script))),
+            ("src\\tools\\run.cmd", Some(Blocked(Script))),
+            ("mixed/dir\\payload.vbs", Some(Blocked(Script))),
+            ("/abs/evil.js", Some(Blocked(Script))),
+            ("C:/Windows/evil.bat", Some(Blocked(Script))),
+            ("lib/tool.pyw", Some(Blocked(Script))),
+            // Atalhos, imagens de disco e bases do Access.
+            ("atalho.lnk", Some(Blocked(Shortcut))),
+            ("docs/ajuda.url", Some(Blocked(Shortcut))),
+            ("imagens/disco.iso", Some(Blocked(DiskImage))),
+            ("dados/base.accde", Some(Blocked(DatabaseApp))),
+            // Disfarces: uma fachada antes, ou espacos antes da extensao.
+            ("foto.jpg.exe", Some(Blocked(Masquerade))),
+            ("fotos/ferias/foto.jpg.exe", Some(Blocked(Masquerade))),
+            ("fatura.pdf   .scr", Some(Blocked(Masquerade))),
+            ("contrato.pdf.docm", Some(Blocked(Masquerade))),
+            ("LEIA.txt.vbs", Some(Blocked(Masquerade))),
+            // Pontos e espacos no fim (o Windows corta-os).
+            ("setup.exe.", Some(Blocked(Program))),
+            ("setup.exe...", Some(Blocked(Program))),
+            ("setup.exe ", Some(Blocked(Program))),
+            ("setup.exe . .", Some(Blocked(Program))),
+            ("pasta/run.bat. ", Some(Blocked(Script))),
+            // Os segmentos do fim so de pontos e espacos caem: conta o
+            // ultimo segmento real (ZI-5; o Windows grava `setup.exe`).
+            ("setup.exe/ .", Some(Blocked(Program))),
+            ("setup.exe/ ./", Some(Blocked(Program))),
+            ("setup.exe\\ ", Some(Blocked(Program))),
+            ("setup.exe/...", Some(Blocked(Program))),
+            ("setup.exe/ /", Some(Blocked(Program))),
+            ("pasta/run.bat/ . /. .", Some(Blocked(Script))),
+            ("fotos/foto.jpg.exe/ .", Some(Blocked(Masquerade))),
+            ("inner.zip\\ . ", Some(NestedArchive)),
+            // Um `..` em qualquer lugar do caminho e um nome estragado (ZI-5):
+            // sobe de pasta, e cada extrator o resolve a sua maneira. Um `.`
+            // nao muda o caminho: no fim cai (o tar.exe grava `setup.exe/.`
+            // como o programa `setup.exe`), no meio nao conta, e o `./` do
+            // bsdtar (`tar -a -cf x.zip .`) e um ZIP legitimo.
+            ("setup.exe/.", Some(Blocked(Program))),
+            ("setup.exe\\.", Some(Blocked(Program))),
+            ("./setup.exe", Some(Blocked(Program))),
+            ("./docs/", None),
+            ("./fotos/./praia.jpg", None),
+            ("setup.exe/..", Some(Blocked(BadName))),
+            ("a/../setup.exe", Some(Blocked(BadName))),
+            ("dir/./x.txt", None),
+            ("../../evil.exe", Some(Blocked(BadName))),
+            ("..\\LEIAME.txt", Some(Blocked(BadName))),
+            ("./LEIAME.txt", None),
+            ("fotos/./", None),
+            ("a/..", Some(Blocked(BadName))),
+            // Nomes que mentem: bidi, invisiveis, controlos, fluxo alternativo.
+            ("fatura\u{202E}fdp.exe", Some(Blocked(BadName))),
+            ("pasta/nota\u{200B}.pdf", Some(Blocked(BadName))),
+            ("setup.exe\u{0}.txt", Some(Blocked(BadName))),
+            ("leia.txt:evil.exe", Some(Blocked(BadName))),
+            // O radical de um dispositivo do DOS nao isenta: o Windows 11
+            // cria `aux.exe` e `nul.bat` como arquivos, e um extrator
+            // corre-os. Contam pela extensao, como outro nome qualquer.
+            ("aux.exe", Some(Blocked(Program))),
+            ("nul.bat", Some(Blocked(Script))),
+            ("bin/com1.scr", Some(Blocked(Program))),
+            ("prn.pdf.exe", Some(Blocked(Masquerade))),
+            ("lpt1.lnk", Some(Blocked(Shortcut))),
+            ("con.iso", Some(Blocked(DiskImage))),
+            ("CON.EXE. ", Some(Blocked(Program))),
+            ("pasta\\Aux.Ps1", Some(Blocked(Script))),
+            ("nul.zip", Some(NestedArchive)),
+            // Outros arquivos compactados, a qualquer profundidade.
+            ("inner.zip", Some(NestedArchive)),
+            ("inner.7z", Some(NestedArchive)),
+            ("inner.rar", Some(NestedArchive)),
+            ("backup/inner.ZIP", Some(NestedArchive)),
+            ("dados\\pacote.cab", Some(NestedArchive)),
+            ("fontes.tar.gz", Some(NestedArchive)),
+            ("inner.zip.", Some(NestedArchive)),
+            ("inner.zip  ", Some(NestedArchive)),
+            ("velho.ace", Some(NestedArchive)),
+            ("foto.jpg.zip", Some(NestedArchive)),
+            ("inner.z\u{200D}ip", Some(NestedArchive)),
+            // O que nao pesa: documentos, imagens, pastas, radicais do DOS
+            // com uma extensao inofensiva ou sem nenhuma.
+            ("LEIAME.txt", None),
+            ("fotos/praia.jpg", None),
+            ("docs/manual.pdf", None),
+            ("planilhas/orcamento.xlsx", None),
+            ("livro.epub", None),
+            ("docs/", None),
+            ("setup.exe/", None),
+            ("inner.zip/", None),
+            ("pasta\\", None),
+            ("src/aux.c", None),
+            ("con.txt", None),
+            ("docs/prn.pdf", None),
+            ("COM1", None),
+            ("nul.", None),
+            ("setup", None),
+            ("relatorio.docm", None),
+            // Uma pasta e so separadores depois de um segmento com nome; tres
+            // pontos (`...`) sao um nome, nao um `..`.
+            ("setup.exe//", None),
+            ("setup.exe. /", None),
+            ("a/.../b.txt", None),
+            ("...", None),
+            (" . /", None),
+        ];
+        for (entry, expected) in rows {
+            assert_eq!(zip_entry_risk(entry), *expected, "{entry:?}");
+        }
+
+        // Um segmento acima de 255 unidades UTF-16 (o que o NTFS grava) e
+        // um nome estragado, em qualquer lugar do caminho (ZI-6). Conta em
+        // unidades UTF-16: nem em caracteres (o emoji vale 2) nem em bytes
+        // (o `€` tem 3).
+        let a = |n: usize| "a".repeat(n);
+        let computed: Vec<(String, Option<ZipEntryRisk>)> = vec![
+            (format!("{}.exe", a(251)), Some(Blocked(Program))),
+            (format!("{}.exe", a(252)), Some(Blocked(BadName))),
+            (a(255), None),
+            (a(256), Some(Blocked(BadName))),
+            (
+                format!("{}.exe", "\u{1F600}".repeat(125)),
+                Some(Blocked(Program)),
+            ),
+            (
+                format!("{}.exe", "\u{1F600}".repeat(126)),
+                Some(Blocked(BadName)),
+            ),
+            (
+                format!("{}.exe", "\u{20AC}".repeat(251)),
+                Some(Blocked(Program)),
+            ),
+            (
+                format!("{}.txt", "\u{20AC}".repeat(252)),
+                Some(Blocked(BadName)),
+            ),
+            (format!("{}/setup.exe", a(256)), Some(Blocked(BadName))),
+            (
+                format!("docs\\{}\\LEIAME.txt", a(300)),
+                Some(Blocked(BadName)),
+            ),
+            (format!("{}/", a(256)), Some(Blocked(BadName))),
+            (format!("{}/", a(255)), None),
+            (
+                format!("{}setup.exe", "p/".repeat(300)),
+                Some(Blocked(Program)),
+            ),
+            (format!("{}/{}.exe", a(255), a(251)), Some(Blocked(Program))),
+        ];
+        for (entry, expected) in &computed {
+            assert_eq!(
+                zip_entry_risk(entry),
+                *expected,
+                "{} caracteres, {} unidades UTF-16",
+                entry.chars().count(),
+                entry.encode_utf16().count()
+            );
+        }
+
+        // Pelos ZIPs reais: o pior risco visto, com o nome da primeira
+        // entrada que o tem.
+        assert_eq!(verdict_of(pacote()), holds(Blocked(Program), "setup.exe"));
+        let nested_only = ZipBuilder::new()
+            .stored("LEIAME.txt", b"ola")
+            .stored("backup/inner.7z", &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C])
+            .build();
+        assert_eq!(
+            verdict_of(nested_only),
+            holds(NestedArchive, "backup/inner.7z")
+        );
+        let deep = ZipBuilder::new()
+            .stored("projeto/", b"")
+            .stored("projeto/LEIAME.md", b"# ola")
+            .deflated("projeto/bin/Release/app.exe", &pe_bytes())
+            .build();
+        assert_eq!(
+            verdict_of(deep),
+            holds(Blocked(Program), "projeto/bin/Release/app.exe")
+        );
+        // Um disfarce pesa mais do que um programa, e um programa mais do que
+        // outro arquivo compactado, venha antes ou depois.
+        let mixed = ZipBuilder::new()
+            .stored("inner.zip", b"PK\x05\x06")
+            .stored("setup.exe", &pe_bytes())
+            .stored("fotos/foto.jpg.exe", &pe_bytes())
+            .stored("run.bat", b"@echo off")
+            .build();
+        assert_eq!(
+            verdict_of(mixed),
+            holds(Blocked(Masquerade), "fotos/foto.jpg.exe")
+        );
+        // Uma entrada cifrada ou com um metodo que o EPUB recusa lista-se
+        // na mesma: o nome esta no diretorio central.
+        let mut cipher = RawEntry::stored("secreto/setup.exe", b"xx");
+        cipher.flags = 1;
+        let mut lzma = RawEntry::stored("run.bat", b"xx");
+        lzma.method = 14;
+        lzma.local_method = Some(14);
+        assert_eq!(
+            verdict_of(ZipBuilder::new().entry(cipher).build()),
+            holds(Blocked(Program), "secreto/setup.exe")
+        );
+        assert_eq!(
+            verdict_of(ZipBuilder::new().entry(lzma).build()),
+            holds(Blocked(Script), "run.bat")
+        );
+        // O radical de um dispositivo do DOS, por um ZIP real (o que o
+        // Windows 11 grava e o tar.exe corre).
+        for (device, risk) in [
+            ("aux.exe", Blocked(Program)),
+            ("nul.bat", Blocked(Script)),
+            ("bin/com1.scr", Blocked(Program)),
+            ("prn.pdf.exe", Blocked(Masquerade)),
+            ("lpt1.lnk", Blocked(Shortcut)),
+            ("con.iso", Blocked(DiskImage)),
+        ] {
+            let zip = ZipBuilder::new()
+                .stored("LEIAME.txt", b"ola")
+                .stored(device, b"MZ")
+                .build();
+            assert_eq!(verdict_of(zip), holds(risk, device), "{device}");
+        }
+        // Os outros nomes de uma entrada: o do campo Unicode Path (0x7075)
+        // do diretorio (o 7-Zip e o bsdtar extraem `setup.exe` de um
+        // `foto.jpg`), o do cabecalho local (o tar.exe extrai por ele) e o
+        // 0x7075 do extra local.
+        let mut unicode = RawEntry::stored("fotos/foto.jpg", b"MZ");
+        unicode.extra = unicode_path_extra(b"fotos/foto.jpg", "fotos/setup.exe");
+        let mut local = RawEntry::stored("foto.jpg", b"MZ");
+        local.local_name = Some(b"setup.exe".to_vec());
+        let mut local_unicode = RawEntry::stored("foto.jpg", b"MZ");
+        local_unicode.local_extra = unicode_path_extra(b"foto.jpg", "run.bat");
+        for (entry, expected) in [
+            (unicode, holds(Blocked(Program), "fotos/setup.exe")),
+            (local, holds(Blocked(Program), "setup.exe")),
+            (local_unicode, holds(Blocked(Script), "run.bat")),
+        ] {
+            let what = String::from_utf8_lossy(&entry.name).into_owned();
+            let classic = ZipBuilder::new()
+                .stored("LEIAME.txt", b"ola")
+                .entry(entry.clone())
+                .build();
+            assert_eq!(verdict_of(classic), expected, "{what}");
+            let zip64 = ZipBuilder::new()
+                .stored("LEIAME.txt", b"ola")
+                .entry(entry)
+                .zip64()
+                .build();
+            assert_eq!(verdict_of(zip64), expected, "{what} (ZIP64)");
+        }
+        // Um 0x7075 legitimo (o nome em CP437 no cru, em UTF-8 no extra)
+        // nao pesa: fica limpo.
+        let mut accented = RawEntry::stored("ferias.txt", b"ola");
+        accented.name = b"f\x82rias.txt".to_vec();
+        accented.extra = unicode_path_extra(b"f\x82rias.txt", "f\u{e9}rias.txt");
+        accented.local_extra = accented.extra.clone();
+        assert_eq!(
+            verdict_of(ZipBuilder::new().entry(accented).build()),
+            ZipVerdict::Clean { entries: 1 }
+        );
+        // Um nome que o EPUB recusa tambem se classifica: o `\` separa, e um
+        // `..` (ou um `.`) e um nome estragado, que pesa mais do que o
+        // programa visto antes.
+        let slip = ZipBuilder::new()
+            .stored("setup.exe", &pe_bytes())
+            .stored("../../Startup/evil.bat", b"@echo off")
+            .build();
+        assert_eq!(
+            verdict_of(slip),
+            holds(Blocked(BadName), "../../Startup/evil.bat")
+        );
+        assert_eq!(
+            verdict_of(
+                ZipBuilder::new()
+                    .stored("bin\\run.cmd", b"@echo off")
+                    .build()
+            ),
+            holds(Blocked(Script), "bin\\run.cmd")
+        );
+        // ZI-5 por um ZIP real: `setup.exe/.` com os bytes de um programa (o
+        // tar.exe grava o arquivo `setup.exe`) e `setup.exe/ .` contam pelo
+        // ultimo segmento real, o programa; `docs/` continua uma pasta.
+        for (entry, risk) in [
+            ("setup.exe/.", Blocked(Program)),
+            ("setup.exe\\.", Blocked(Program)),
+            ("./setup.exe", Blocked(Program)),
+            ("setup.exe/ .", Blocked(Program)),
+            ("setup.exe/ ./", Blocked(Program)),
+            ("a/../setup.exe", Blocked(BadName)),
+        ] {
+            let zip = ZipBuilder::new()
+                .stored("docs/", b"")
+                .stored("LEIAME.txt", b"ola")
+                .stored(entry, &pe_bytes())
+                .build();
+            assert_eq!(verdict_of(zip), holds(risk, entry), "{entry:?}");
+        }
+        // ZI-6 por um ZIP real: nomes de 62 000 bytes num so segmento (a
+        // forma da revisao, em menor numero) sao nomes estragados.
+        let huge = format!("{}.txt", "a".repeat(61_996));
+        let mut crafted = ZipBuilder::new().stored("LEIAME.txt", b"ola");
+        for i in 0..3 {
+            crafted = crafted.stored(&format!("{i}{huge}"), b"");
+        }
+        match verdict_of(crafted.build()) {
+            ZipVerdict::Holds { risk, entry } => {
+                assert_eq!(risk, Blocked(BadName));
+                assert_eq!(entry, format!("0{}", &huge[..MAX_VERDICT_ENTRY_CHARS - 1]));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Limpo: fotos, documentos e pastas.
+        let clean = ZipBuilder::new()
+            .stored("fotos/", b"")
+            .stored("fotos/praia.jpg", b"\xFF\xD8\xFF\xE0")
+            .deflated("fotos/LEIAME.txt", b"ferias de 2026")
+            .stored("src/aux.c", b"int main(){}")
+            .build();
+        assert_eq!(verdict_of(clean), ZipVerdict::Clean { entries: 4 });
+        assert_eq!(
+            verdict_of(ZipBuilder::new().build()),
+            ZipVerdict::Clean { entries: 0 }
+        );
+        // ZIP64 valido e inspecionado como o classico.
+        assert_eq!(
+            verdict_of(
+                ZipBuilder::new()
+                    .stored("LEIAME.txt", b"ola")
+                    .stored("bin/setup.exe", &pe_bytes())
+                    .zip64()
+                    .build()
+            ),
+            holds(Blocked(Program), "bin/setup.exe")
+        );
+        // Um nome enorme (de segmentos curtos) guarda-se cortado.
+        let long = format!("{}setup.exe", "p/".repeat(300));
+        match verdict_of(ZipBuilder::new().stored(&long, b"x").build()) {
+            ZipVerdict::Holds { risk, entry } => {
+                assert_eq!(risk, Blocked(Program));
+                assert_eq!(entry.chars().count(), MAX_VERDICT_ENTRY_CHARS)
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Gate critico (entrada nao confiavel, ZI-6; sabotado: tirar o teto do
+    /// segmento; medi-lo so depois de ler o segmento inteiro): um nome de
+    /// entrada com um segmento acima de 255 unidades UTF-16 e um nome
+    /// estragado, decidido numa passagem que para no primeiro caractere
+    /// para la do teto -- as passagens da classificacao nunca veem esse
+    /// segmento, e nada se aloca na medida dele. Um ZIP de 523 nomes de
+    /// 64 KiB custava 1,2-1,5 s na thread da interface.
+    #[test]
+    fn a_zip_entry_name_is_classified_in_bounded_work() {
+        use crate::test_alloc::peak_during;
+        use std::cell::Cell;
+        let a = |n: usize| "a".repeat(n);
+        // A passagem pelo caminho para no byte que leva um segmento de
+        // 64 KiB a 256 unidades UTF-16, esteja ele onde estiver: o 256.o `a`,
+        // o primeiro byte do 128.o emoji (2 unidades, 4 bytes) ou do 256.o
+        // `€` (1 unidade, 3 bytes).
+        let reads = |name: &str| {
+            let read = Cell::new(0usize);
+            let bad = has_bad_segment(name.bytes().inspect(|_| read.set(read.get() + 1)));
+            (bad, read.get())
+        };
+        let cap = MAX_SEGMENT_UTF16;
+        assert_eq!(reads(&a(65_535)), (true, cap + 1));
+        assert_eq!(reads(&format!("docs/{}", a(65_530))), (true, 5 + cap + 1));
+        assert_eq!(
+            reads(&format!("{}/{}", a(255), a(65_000))),
+            (true, 256 + cap + 1)
+        );
+        assert_eq!(
+            reads(&"\u{1F600}".repeat(16_000)),
+            (true, (cap / 2) * 4 + 1)
+        );
+        assert_eq!(reads(&"\u{20AC}".repeat(21_000)), (true, cap * 3 + 1));
+        // Um nome sem segmento grande le-se inteiro, uma vez.
+        let short_segments = format!("{}setup.exe", "a/".repeat(30_000));
+        assert_eq!(reads(&short_segments), (false, 60_009));
+        // Pelo caminho que embarca: `BadName`, sem alocar na medida do nome.
+        for name in [
+            a(65_535),
+            format!("{}.exe", a(65_531)),
+            format!("pasta/{}/setup.exe", a(65_000)),
+            format!("{}\\LEIAME.txt", "\u{20AC}".repeat(20_000)),
+        ] {
+            let (risk, peak) = peak_during(|| zip_entry_risk(&name));
+            assert_eq!(risk, Some(ZipEntryRisk::Blocked(BlockReason::BadName)));
+            assert!(peak < 1024, "{peak} bytes para {} de nome", name.len());
+        }
+        // As passagens da classificacao so correm sobre o ultimo segmento.
+        let (risk, peak) = peak_during(|| zip_entry_risk(&short_segments));
+        assert_eq!(risk, Some(ZipEntryRisk::Blocked(BlockReason::Program)));
+        assert!(peak < 1024, "{peak} bytes");
+    }
+
+    /// Um ZIP enorme que so existe em memoria nos cabecalhos locais e no
+    /// fim: os dados das entradas sao zeros virtuais (nunca materializados),
+    /// e cada leitura fica registada (offset, bytes).
+    struct SparseZip {
+        len: u64,
+        /// Os bytes que existem, por ordem e sem sobreposicao: cada cabecalho
+        /// local e o fim (diretorio central e registros de fim).
+        segments: Vec<(u64, Vec<u8>)>,
+        pos: u64,
+        reads: Arc<Mutex<Vec<(u64, u64)>>>,
+    }
+
+    impl Read for SparseZip {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let left = self.len.saturating_sub(self.pos);
+            let n = (buf.len() as u64).min(left) as usize;
+            if n == 0 {
+                return Ok(0);
+            }
+            let (from, to) = (self.pos, self.pos + n as u64);
+            buf[..n].fill(0);
+            for (at, bytes) in &self.segments {
+                let end = at + bytes.len() as u64;
+                if end <= from || *at >= to {
+                    continue;
+                }
+                let lo = from.max(*at);
+                let hi = to.min(end);
+                buf[(lo - from) as usize..(hi - from) as usize]
+                    .copy_from_slice(&bytes[(lo - at) as usize..(hi - at) as usize]);
+            }
+            self.reads.lock().unwrap().push((self.pos, n as u64));
+            self.pos = to;
+            Ok(n)
+        }
+    }
+
+    impl Seek for SparseZip {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            let next = match to {
+                SeekFrom::Start(at) => Some(at),
+                SeekFrom::End(delta) => self.len.checked_add_signed(delta),
+                SeekFrom::Current(delta) => self.pos.checked_add_signed(delta),
+            };
+            self.pos = next.ok_or_else(|| std::io::Error::other("seek negativo"))?;
+            Ok(self.pos)
+        }
+    }
+
+    fn push16(out: &mut Vec<u8>, value: u16) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    fn push32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    fn push64(out: &mut Vec<u8>, value: u64) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    /// Onde esta cada parte de um [`SparseZip`].
+    struct SparseLayout {
+        directory_offset: u64,
+        directory_size: u64,
+        /// `[inicio, fim)` de cada cabecalho local (30 bytes, nome e extra).
+        local_headers: Vec<(u64, u64)>,
+    }
+
+    /// Um ZIP de entradas *stored* com `sizes` bytes cada, com os cabecalhos
+    /// locais e sem os dados: devolve o leitor e onde esta cada parte.
+    fn sparse_zip(entries: &[(&str, u64)], zip64: bool) -> (SparseZip, SparseLayout) {
+        let mut offset = 0u64;
+        let mut central = Vec::new();
+        let mut segments = Vec::new();
+        let mut local_headers = Vec::new();
+        let sized = |value: u64| {
+            if zip64 {
+                u32::MAX
+            } else {
+                u32::try_from(value).expect("cabe em 32 bits")
+            }
+        };
+        for (name, size) in entries {
+            let mut local_extra = Vec::new();
+            let mut extra = Vec::new();
+            if zip64 {
+                push16(&mut local_extra, 1);
+                push16(&mut local_extra, 16);
+                push64(&mut local_extra, *size);
+                push64(&mut local_extra, *size);
+                push16(&mut extra, 1);
+                push16(&mut extra, 24);
+                push64(&mut extra, *size);
+                push64(&mut extra, *size);
+                push64(&mut extra, offset);
+            }
+            let mut local = Vec::new();
+            push32(&mut local, 0x0403_4b50);
+            push16(&mut local, if zip64 { 45 } else { 20 });
+            push16(&mut local, 0);
+            push16(&mut local, 0);
+            push32(&mut local, 0);
+            push32(&mut local, 0);
+            push32(&mut local, sized(*size));
+            push32(&mut local, sized(*size));
+            push16(&mut local, name.len() as u16);
+            push16(&mut local, local_extra.len() as u16);
+            local.extend_from_slice(name.as_bytes());
+            local.extend_from_slice(&local_extra);
+            let local_len = local.len() as u64;
+            local_headers.push((offset, offset + local_len));
+            segments.push((offset, local));
+
+            push32(&mut central, 0x0201_4b50);
+            push16(&mut central, 0x031E);
+            push16(&mut central, if zip64 { 45 } else { 20 });
+            push16(&mut central, 0);
+            push16(&mut central, 0);
+            push32(&mut central, 0);
+            push32(&mut central, 0);
+            push32(&mut central, sized(*size));
+            push32(&mut central, sized(*size));
+            push16(&mut central, name.len() as u16);
+            push16(&mut central, extra.len() as u16);
+            push16(&mut central, 0);
+            push16(&mut central, 0);
+            push16(&mut central, 0);
+            push32(&mut central, 0);
+            push32(&mut central, sized(offset));
+            central.extend_from_slice(name.as_bytes());
+            central.extend_from_slice(&extra);
+            offset += local_len + size;
+        }
+        let directory_offset = offset;
+        let directory_size = central.len() as u64;
+        let mut tail = central;
+        let count = entries.len() as u64;
+        if zip64 {
+            let record = directory_offset + tail.len() as u64;
+            push32(&mut tail, 0x0606_4b50);
+            push64(&mut tail, 44);
+            push16(&mut tail, 45);
+            push16(&mut tail, 45);
+            push32(&mut tail, 0);
+            push32(&mut tail, 0);
+            push64(&mut tail, count);
+            push64(&mut tail, count);
+            push64(&mut tail, directory_size);
+            push64(&mut tail, directory_offset);
+            push32(&mut tail, 0x0706_4b50);
+            push32(&mut tail, 0);
+            push64(&mut tail, record);
+            push32(&mut tail, 1);
+        }
+        push32(&mut tail, 0x0605_4b50);
+        push16(&mut tail, 0);
+        push16(&mut tail, 0);
+        let short = if zip64 { u16::MAX } else { count as u16 };
+        push16(&mut tail, short);
+        push16(&mut tail, short);
+        push32(
+            &mut tail,
+            if zip64 {
+                u32::MAX
+            } else {
+                directory_size as u32
+            },
+        );
+        push32(
+            &mut tail,
+            if zip64 {
+                u32::MAX
+            } else {
+                directory_offset as u32
+            },
+        );
+        push16(&mut tail, 0);
+        let len = directory_offset + tail.len() as u64;
+        segments.push((directory_offset, tail));
+        (
+            SparseZip {
+                len,
+                segments,
+                pos: 0,
+                reads: Arc::default(),
+            },
+            SparseLayout {
+                directory_offset,
+                directory_size,
+                local_headers,
+            },
+        )
+    }
+
+    /// O que uma inspecao leu: o veredito, as leituras, o fim do arquivo e
+    /// onde esta cada parte.
+    fn inspect_sparse(
+        entries: &[(&str, u64)],
+        zip64: bool,
+    ) -> (ZipVerdict, Vec<(u64, u64)>, u64, SparseLayout) {
+        let (zip, layout) = sparse_zip(entries, zip64);
+        let reads = Arc::clone(&zip.reads);
+        let len = zip.len;
+        let verdict = inspect_zip(zip);
+        let reads = reads.lock().unwrap().clone();
+        assert!(len > layout.directory_offset + layout.directory_size);
+        (verdict, reads, len, layout)
+    }
+
+    /// Gate critico (entrada nao confiavel; sabotado: ler os dados das
+    /// entradas): um ZIP legitimo de mais de 2 GiB (e um ZIP64 de 6 GiB),
+    /// que o EPUB recusaria pelos tetos de tamanho, e inspecionado sem ler
+    /// os dados de nenhuma entrada -- sem arquivo nenhum no disco, com um
+    /// leitor que conta. A relacao: de 1 MiB a GiB por entrada, as leituras
+    /// sao exatamente as mesmas; cada leitura cai no fim do arquivo (a busca do
+    /// registro de fim, 64 KiB + 22), no diretorio central ou dentro de um
+    /// cabecalho local (30 bytes, o nome e o extra: o `tar.exe` extrai pelo
+    /// nome dele); e o total nunca passa do fim, do diretorio e dos
+    /// cabecalhos locais.
+    #[test]
+    fn a_big_zip_is_inspected_without_reading_entry_bodies() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        const TAIL_WINDOW: u64 = 22 + 0xFFFF;
+        // O classico cabe em 32 bits: de 1 MiB a mais de 1 GiB por entrada
+        // (o arquivo passa de 2 GiB). O ZIP64 vai de 1 MiB a 6 GiB por
+        // entrada (mais de 12 GiB).
+        for (zip64, bodies) in [
+            (false, vec![MIB, 64 * MIB, GIB + 4 * MIB]),
+            (true, vec![MIB, 3 * GIB, 6 * GIB]),
+        ] {
+            let mut measured = Vec::new();
+            let mut biggest = 0;
+            for body in bodies {
+                for (entries, expected) in [
+                    (
+                        [
+                            ("videos/ferias.mp4", body),
+                            ("backup/dados.bin", body),
+                            ("instalar/LEIAME.md", 4096),
+                        ],
+                        ZipVerdict::Clean { entries: 3 },
+                    ),
+                    (
+                        [
+                            ("videos/ferias.mp4", body),
+                            ("backup/dados.bin", body),
+                            ("instalar/setup.exe", 4096),
+                        ],
+                        holds(
+                            ZipEntryRisk::Blocked(BlockReason::Program),
+                            "instalar/setup.exe",
+                        ),
+                    ),
+                ] {
+                    let (verdict, reads, len, layout) = inspect_sparse(&entries, zip64);
+                    assert_eq!(verdict, expected, "zip64={zip64}, {body} bytes por entrada");
+                    biggest = biggest.max(len);
+                    // Cada leitura cai na janela do fim, no diretorio ou
+                    // dentro de um cabecalho local.
+                    let floor = layout.directory_offset.min(len.saturating_sub(TAIL_WINDOW));
+                    for &(at, n) in &reads {
+                        let in_tail = at >= floor && at + n <= len;
+                        let in_local = layout
+                            .local_headers
+                            .iter()
+                            .any(|&(start, end)| at >= start && at + n <= end);
+                        assert!(
+                            in_tail || in_local,
+                            "zip64={zip64}, {body} bytes por entrada: leitura em {at}..{} fora \
+                             do fim ({floor}..{len}) e dos cabecalhos locais {:?} -- leu os \
+                             dados de uma entrada",
+                            at + n,
+                            layout.local_headers
+                        );
+                    }
+                    // Cada cabecalho local e lido (o nome dele conta).
+                    for &(start, _) in &layout.local_headers {
+                        assert!(
+                            reads.iter().any(|&(at, _)| at == start),
+                            "zip64={zip64}: o cabecalho local em {start} nao foi lido"
+                        );
+                    }
+                    let locals: u64 = layout
+                        .local_headers
+                        .iter()
+                        .map(|&(start, end)| end - start)
+                        .sum();
+                    let total: u64 = reads.iter().map(|&(_, n)| n).sum();
+                    assert!(
+                        total <= TAIL_WINDOW + 20 + (len - layout.directory_offset) + locals,
+                        "zip64={zip64}: {total} bytes lidos"
+                    );
+                    measured.push(total);
+                }
+            }
+            assert!(biggest > 2 * GIB, "zip64={zip64}: so {biggest} bytes");
+            // A relacao: de 1 MiB a GiB por entrada, as mesmas leituras.
+            assert!(
+                measured.windows(2).all(|pair| pair[0] == pair[1]),
+                "zip64={zip64}: as leituras mudaram com o tamanho dos dados: {measured:?}"
+            );
+        }
+    }
+
+    /// Um leitor que falha a meio (um disco que desaparece).
+    struct FailingReader {
+        inner: Cursor<Vec<u8>>,
+        fail_after: u64,
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.inner.position() >= self.fail_after {
+                return Err(std::io::Error::other("o disco foi-se"));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for FailingReader {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(to)
+        }
+    }
+
+    /// `(entradas, offset, tamanho)` do diretorio central de um ZIP classico
+    /// do `ZipBuilder` (sem comentario no fim), e onde esta o registro de fim.
+    fn classic_directory(zip: &[u8]) -> (usize, usize, usize, usize) {
+        let eocd = zip.len() - 22;
+        let le16 = |at: usize| u16::from_le_bytes([zip[at], zip[at + 1]]) as usize;
+        let le32 = |at: usize| {
+            u32::from_le_bytes([zip[at], zip[at + 1], zip[at + 2], zip[at + 3]]) as usize
+        };
+        assert_eq!(le32(eocd), 0x0605_4b50);
+        (le16(eocd + 10), le32(eocd + 16), le32(eocd + 12), eocd)
+    }
+
+    /// Gate critico (entrada nao confiavel; sabotado: um ZIP nao inspecionado
+    /// dado como limpo; e, cada uma sozinha, tirar as regras do diretorio
+    /// unico -- a ultima assinatura, o diretorio colado ao fim, os campos
+    /// classicos iguais aos do ZIP64, o registro ZIP64 colado ao localizador
+    /// -- e a conferencia do cabecalho local): cada ZIP estragado, ZIP64
+    /// incompleto, com entradas sobrepostas, com mais de um diretorio
+    /// possivel ou com um cabecalho local que nao bate -- todos so com nomes
+    /// inofensivos no que se le -- fica `NotInspected`, nunca `Clean`, e
+    /// nunca panica.
+    #[test]
+    fn corrupt_zip64_and_overlap_zips_are_not_inspected() {
+        use crate::epub::test_support::{
+            classic_disagrees_with_zip64_zip, directory_gap_zip, two_end_records_zip,
+            zip64_record_gap_zip,
+        };
+        let benign = || {
+            ZipBuilder::new()
+                .stored("fotos/praia.jpg", b"\xFF\xD8\xFF\xE0")
+                .deflated("LEIAME.txt", b"ferias de 2026")
+        };
+        let good = benign().build();
+        assert_eq!(verdict_of(good.clone()), ZipVerdict::Clean { entries: 2 });
+        let good64 = benign().zip64().build();
+        assert_eq!(verdict_of(good64.clone()), ZipVerdict::Clean { entries: 2 });
+        let (entries, cd_offset, cd_size, eocd) = classic_directory(&good);
+        assert_eq!(entries, 2);
+
+        let mut fixtures: Vec<(&str, Vec<u8>)> = vec![
+            ("vazio", Vec::new()),
+            ("so PK", b"PK\x03\x04".to_vec()),
+            ("HTML", b"<!doctype html><title>404</title>".to_vec()),
+            ("sem o fim", good[..good.len() - 1].to_vec()),
+            ("metade", good[..good.len() / 2].to_vec()),
+        ];
+        let mut bad_sig = good.clone();
+        bad_sig[cd_offset] ^= 0xFF;
+        fixtures.push(("assinatura do diretorio", bad_sig));
+        let mut more = good.clone();
+        more[eocd + 8] = 3;
+        more[eocd + 10] = 3;
+        fixtures.push(("mais entradas do que o diretorio tem", more));
+        let mut less = good.clone();
+        less[eocd + 8] = 1;
+        less[eocd + 10] = 1;
+        fixtures.push(("bytes a mais no fim do diretorio", less));
+        let mut outside = good.clone();
+        outside[eocd + 12..eocd + 16].copy_from_slice(&((cd_size + 64) as u32).to_le_bytes());
+        fixtures.push(("diretorio fora do arquivo", outside));
+        let mut volumes = good.clone();
+        volumes[eocd + 4] = 1;
+        fixtures.push(("volume 1", volumes));
+        let mut start_disk = good.clone();
+        start_disk[cd_offset + 34] = 1;
+        fixtures.push(("entrada noutro volume", start_disk));
+
+        // ZIP64: campos saturados sem o registro de fim ZIP64.
+        let mut saturated = good.clone();
+        saturated[eocd + 8..eocd + 12].copy_from_slice(&[0xFF; 4]);
+        saturated[eocd + 12..eocd + 20].copy_from_slice(&[0xFF; 8]);
+        fixtures.push(("ZIP64 sem o registro de fim", saturated));
+        // ZIP64: entrada saturada sem o extra ZIP64.
+        let mut no_extra = good.clone();
+        no_extra[cd_offset + 24..cd_offset + 28].copy_from_slice(&[0xFF; 4]);
+        fixtures.push(("ZIP64 sem o extra da entrada", no_extra));
+        // ZIP64: o localizador diz dois discos; o registro sem assinatura;
+        // o registro fora do lugar; contagens que nao batem.
+        let eocd64 = good64.len() - 22;
+        let locator = eocd64 - 20;
+        let record = locator - 56;
+        let mut disks = good64.clone();
+        disks[locator + 16] = 2;
+        fixtures.push(("ZIP64 em dois discos", disks));
+        let mut record_sig = good64.clone();
+        record_sig[record] ^= 0xFF;
+        fixtures.push(("ZIP64 sem assinatura", record_sig));
+        let mut misplaced = good64.clone();
+        misplaced[locator + 8..locator + 16].copy_from_slice(&(locator as u64).to_le_bytes());
+        fixtures.push(("ZIP64 fora do lugar", misplaced));
+        let mut counts = good64.clone();
+        counts[record + 24] = 7;
+        fixtures.push(("ZIP64 com contagens diferentes", counts));
+        // ZIP64: mais entradas do que o teto da BROWSE_LITE.
+        let mut too_many = good64.clone();
+        let over = ZipPolicy::BROWSE_LITE.max_entries + 1;
+        too_many[record + 24..record + 32].copy_from_slice(&over.to_le_bytes());
+        too_many[record + 32..record + 40].copy_from_slice(&over.to_le_bytes());
+        fixtures.push(("acima do teto de entradas", too_many));
+        let mut too_big = good64.clone();
+        let size = ZipPolicy::BROWSE_LITE.max_directory_size + 1;
+        too_big[record + 40..record + 48].copy_from_slice(&size.to_le_bytes());
+        fixtures.push(("acima do teto do diretorio", too_big));
+
+        // Sobreposicao: duas entradas no mesmo cabecalho local; uma que
+        // comeca dentro dos dados da outra; uma que invade o diretorio.
+        let mut same = RawEntry::stored("fotos/b.jpg", b"\xFF\xD8\xFF\xE0");
+        same.offset = Some(0);
+        same.central_only = true;
+        fixtures.push((
+            "sobreposicao no mesmo cabecalho",
+            ZipBuilder::new()
+                .stored("fotos/a.jpg", b"\xFF\xD8\xFF\xE0")
+                .entry(same.clone())
+                .build(),
+        ));
+        fixtures.push((
+            "sobreposicao ZIP64",
+            ZipBuilder::new()
+                .stored("fotos/a.jpg", b"\xFF\xD8\xFF\xE0")
+                .entry(same)
+                .zip64()
+                .build(),
+        ));
+        let mut inside = RawEntry::stored("fotos/b.jpg", b"\xFF\xD8\xFF\xE0");
+        inside.offset = Some(40);
+        inside.central_only = true;
+        fixtures.push((
+            "entrada dentro dos dados de outra",
+            ZipBuilder::new()
+                .stored("fotos/a.jpg", &[0x55; 64])
+                .entry(inside)
+                .build(),
+        ));
+        let mut invades = RawEntry::stored("LEIAME.txt", b"ola");
+        invades.compressed = 4096;
+        fixtures.push((
+            "dados que invadem o diretorio",
+            ZipBuilder::new().entry(invades).build(),
+        ));
+
+        // Mais de um diretorio possivel: o que se le so tem o LEIAME.txt, e
+        // outro leitor lista o setup.exe do outro (7-Zip, .NET, bsdtar).
+        fixtures.push(("dois registros de fim", two_end_records_zip()));
+        fixtures.push((
+            "bytes entre o diretorio e o registro de fim",
+            directory_gap_zip(),
+        ));
+        fixtures.push((
+            "registro classico diferente do ZIP64",
+            classic_disagrees_with_zip64_zip(),
+        ));
+        fixtures.push((
+            "outro registro ZIP64 colado ao localizador",
+            zip64_record_gap_zip(),
+        ));
+        // O cabecalho local nao bate com o diretorio (o tar.exe extrai pelo
+        // nome local): sem assinatura, ou com outro nome inofensivo.
+        let mut no_local = good.clone();
+        no_local[0] ^= 0xFF;
+        fixtures.push(("cabecalho local sem assinatura", no_local));
+        let mut renamed = RawEntry::stored("fotos/a.jpg", b"\xFF\xD8\xFF\xE0");
+        renamed.local_name = Some(b"fotos/b.jpg".to_vec());
+        fixtures.push((
+            "nome local diferente",
+            ZipBuilder::new().entry(renamed).build(),
+        ));
+        let mut longer = RawEntry::stored("a.jpg", b"\xFF\xD8\xFF\xE0");
+        longer.local_name = Some(b"fotos/outra.jpg".to_vec());
+        fixtures.push((
+            "nome local de outro tamanho",
+            ZipBuilder::new().entry(longer).build(),
+        ));
+
+        for (what, bytes) in fixtures {
+            let verdict = std::panic::catch_unwind(|| verdict_of(bytes))
+                .unwrap_or_else(|_| panic!("{what}: a inspecao panicou"));
+            assert_eq!(verdict, ZipVerdict::NotInspected, "{what}");
+        }
+
+        // Um erro de leitura (o disco que desaparece) tambem.
+        let failing = FailingReader {
+            inner: Cursor::new(good.clone()),
+            fail_after: cd_offset as u64 + 10,
+        };
+        assert_eq!(inspect_zip(failing), ZipVerdict::NotInspected);
+        // E um arquivo que nao existe ou que e uma pasta.
+        let temp = TempDir::new("zip-missing");
+        assert_eq!(
+            inspect_zip_file(&temp.0.join("sumiu.zip")),
+            ZipVerdict::NotInspected
+        );
+        assert_eq!(inspect_zip_file(&temp.0), ZipVerdict::NotInspected);
+        assert_eq!(
+            inspect_zip_file(&temp.file("fotos.zip", &good)),
+            ZipVerdict::Clean { entries: 2 }
+        );
+    }
+
+    /// O `seed` classico com o diretorio central cortado em `keep` bytes e
+    /// um registro de fim novo que o declara desse tamanho: o corte chega ao
+    /// parser do diretorio.
+    fn with_directory_cut(seed: &[u8], keep: usize) -> Vec<u8> {
+        let (entries, offset, _, _) = classic_directory(seed);
+        let mut out = seed[..offset + keep].to_vec();
+        push32(&mut out, 0x0605_4b50);
+        push16(&mut out, 0);
+        push16(&mut out, 0);
+        push16(&mut out, entries as u16);
+        push16(&mut out, entries as u16);
+        push32(&mut out, keep as u32);
+        push32(&mut out, offset as u32);
+        push16(&mut out, 0);
+        out
+    }
+
+    /// Gate critico (entrada nao confiavel; o harness de mutacao): um ZIP
+    /// com um programa e um script (e um documento antes), classico e ZIP64,
+    /// cortado em cada comprimento, com o diretorio central cortado em cada
+    /// byte (com um fim que o declara), e com cada bit de cada byte trocado
+    /// e cada byte posto a 0x00 e a 0xFF: nunca panica, e nunca sai
+    /// `Clean` -- ou viu uma entrada perigosa, ou fica nao inspecionado.
+    /// Uma mutacao so mexe num nome, por isso sobra sempre outro perigoso.
+    #[test]
+    fn zip_mutation_harness_never_panics_and_never_comes_out_clean() {
+        let seed = |zip64: bool| {
+            let mut noted = RawEntry::deflated("docs/LEIAME.txt", b"leia antes de instalar");
+            noted.extra = vec![0xCA, 0xFE, 4, 0, 1, 2, 3, 4];
+            noted.comment = b"comentario".to_vec();
+            let builder = ZipBuilder::new()
+                .entry(noted)
+                .stored("setup.exe", &pe_bytes()[..64])
+                .stored("scripts/run.bat", b"@echo off\r\n");
+            if zip64 { builder.zip64() } else { builder }.build()
+        };
+        let check = |bytes: Vec<u8>, what: &str| {
+            let verdict = std::panic::catch_unwind(|| verdict_of(bytes))
+                .unwrap_or_else(|_| panic!("{what}: a inspecao panicou"));
+            assert!(
+                !matches!(verdict, ZipVerdict::Clean { .. }),
+                "{what}: saiu limpo ({verdict:?})"
+            );
+            verdict
+        };
+        let mut cases = 0usize;
+        let mut not_inspected = 0usize;
+        for zip64 in [false, true] {
+            let seed = seed(zip64);
+            assert!(matches!(verdict_of(seed.clone()), ZipVerdict::Holds { .. }));
+            for len in 0..seed.len() {
+                let verdict = check(
+                    seed[..len].to_vec(),
+                    &format!("zip64={zip64}, corte em {len}"),
+                );
+                not_inspected += usize::from(verdict == ZipVerdict::NotInspected);
+                cases += 1;
+            }
+            for at in 0..seed.len() {
+                for bit in 0..8 {
+                    let mut bytes = seed.clone();
+                    bytes[at] ^= 1 << bit;
+                    check(bytes, &format!("zip64={zip64}, bit {bit} do byte {at}"));
+                    cases += 1;
+                }
+                for value in [0x00, 0xFF] {
+                    let mut bytes = seed.clone();
+                    bytes[at] = value;
+                    check(bytes, &format!("zip64={zip64}, byte {at} = {value:#04x}"));
+                    cases += 1;
+                }
+            }
+        }
+        // Os cortes do diretorio central chegam ao parser dele.
+        let classic = seed(false);
+        let (_, _, size, _) = classic_directory(&classic);
+        assert!(matches!(
+            verdict_of(with_directory_cut(&classic, size)),
+            ZipVerdict::Holds { .. }
+        ));
+        for keep in 0..size {
+            check(
+                with_directory_cut(&classic, keep),
+                &format!("diretorio cortado em {keep} de {size}"),
+            );
+            cases += 1;
+        }
+        assert!(cases > 5_000, "{cases} casos");
+        assert!(not_inspected > 0);
+    }
+
+    /// Medicao, nao gate (AGENTS 4.4: segundos de relogio medem a maquina,
+    /// nao o algoritmo): quanto custa inspecionar no disco as formas que
+    /// pesam -- 523 entradas com nomes de 62 000 bytes (um segmento so, e
+    /// segmentos curtos), abaixo dos dois tetos de 32 MiB, e 100 000
+    /// entradas com nomes curtos (o teto; ZIP64, com o extra local de 20
+    /// bytes). O minimo e a mediana de 5 corridas, da inspecao inteira e so
+    /// da listagem. Numa build release:
+    /// `cargo test --release -p neural-core --lib -- --ignored --nocapture zip_inspection_timings`.
+    #[test]
+    #[ignore = "medicao em release, nao gate"]
+    fn zip_inspection_timings() {
+        use std::time::{Duration, Instant};
+        let temp = TempDir::new("zip-timings");
+        let long_segment = format!("{}.txt", "a".repeat(61_996 - 3));
+        let short_segments = format!("{}x.txt", "a/".repeat(30_997));
+        let mut one_segment = ZipBuilder::new();
+        let mut many_segments = ZipBuilder::new();
+        for i in 0..523 {
+            one_segment = one_segment.stored(&format!("{i:03}{long_segment}"), b"");
+            many_segments = many_segments.stored(&format!("{short_segments}{i:03}"), b"");
+        }
+        let mut short_names = ZipBuilder::new().zip64();
+        for i in 0..100_000 {
+            short_names = short_names.stored(&format!("pasta/arquivo-{i:06}.txt"), b"");
+        }
+        let min_and_median = |mut work: Box<dyn FnMut() -> String + '_>| {
+            let mut runs: Vec<Duration> = Vec::new();
+            let mut last = String::new();
+            for _ in 0..5 {
+                let start = Instant::now();
+                last = work();
+                runs.push(start.elapsed());
+            }
+            runs.sort();
+            (runs[0], runs[2], last)
+        };
+        for (what, bytes) in [
+            ("523 x 62 000 bytes, um segmento", one_segment.build()),
+            (
+                "523 x 62 000 bytes, segmentos curtos",
+                many_segments.build(),
+            ),
+            ("100 000 nomes curtos, ZIP64", short_names.build()),
+        ] {
+            let path = temp.file("forma.zip", &bytes);
+            let (min, median, verdict) = min_and_median(Box::new(|| {
+                let verdict = format!("{:?}", inspect_zip_file(&path));
+                verdict.chars().take(60).collect()
+            }));
+            let (list_min, list_median, listed) = min_and_median(Box::new(|| {
+                let file = File::open(&path).unwrap();
+                format!(
+                    "{:?}",
+                    safezip::list_central_directory(file, &ZipPolicy::BROWSE_LITE, |_| {})
+                )
+            }));
+            eprintln!(
+                "{what} ({} bytes): inspecao min {min:?} mediana {median:?} ({verdict}); \
+                 so a listagem min {list_min:?} mediana {list_median:?} ({listed})",
+                bytes.len()
+            );
         }
     }
 }

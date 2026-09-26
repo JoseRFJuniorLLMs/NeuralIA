@@ -38,6 +38,91 @@ const PDF = Buffer.from(
   'latin1',
 );
 
+// CRC-32 do ZIP (polinomio 0xEDB88320), para os ZIPs da inspecao
+// (downloads-zip-inspect) serem ZIPs de verdade para o Explorador.
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc = CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+// Um ZIP de entradas *stored*. Com `shared`, as entradas depois da primeira
+// apontam para o cabecalho local dela: a bomba de sobreposicao, que a
+// inspecao do NeuralIA nao lista (fica "nao inspecionado").
+function storedZip(entries, shared = false) {
+  const locals = [];
+  const centrals = [];
+  let offset = 0;
+  entries.forEach(([name, data], index) => {
+    const nameBytes = Buffer.from(name, 'utf8');
+    const crc = crc32(data);
+    const reused = shared && index > 0;
+    const at = reused ? 0 : offset;
+    if (!reused) {
+      const local = Buffer.alloc(30);
+      local.writeUInt32LE(0x04034b50, 0);
+      local.writeUInt16LE(20, 4);
+      local.writeUInt16LE(0x21, 12);
+      local.writeUInt32LE(crc, 14);
+      local.writeUInt32LE(data.length, 18);
+      local.writeUInt32LE(data.length, 22);
+      local.writeUInt16LE(nameBytes.length, 26);
+      locals.push(local, nameBytes, data);
+      offset += 30 + nameBytes.length + data.length;
+    }
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(0x031e, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0x21, 14);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(nameBytes.length, 28);
+    central.writeUInt32LE(at, 42);
+    centrals.push(central, nameBytes);
+  });
+  const directory = Buffer.concat(centrals);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(directory.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, directory, end]);
+}
+
+// O pacote.zip do E2E: um programa e um script dentro.
+const PACOTE_ZIP = storedZip([
+  ['setup.exe', peBytes()],
+  ['run.bat', Buffer.from('@echo off\r\necho oi\r\n', 'latin1')],
+]);
+
+// Duas fotos no mesmo cabecalho local: nomes inofensivos, estrutura que o
+// NeuralIA recusa listar.
+const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0xff, 0xd9]);
+const SOBREPOSTO_ZIP = storedZip(
+  [
+    ['fotos/a.jpg', JPEG],
+    ['fotos/b.jpg', JPEG],
+  ],
+  true,
+);
+
 function attachment(response, name, type, length) {
   response.writeHead(200, {
     'content-type': type,
@@ -105,6 +190,18 @@ const server = http.createServer((request, response) => {
     case '/files/lento':
       slow(request, response);
       return;
+    // Sem `.zip` no caminho, como o relatorio: o nome vem do
+    // content-disposition.
+    case '/files/pacote': {
+      attachment(response, 'pacote.zip', 'application/zip', PACOTE_ZIP.length);
+      response.end(PACOTE_ZIP);
+      return;
+    }
+    case '/files/sobreposto': {
+      attachment(response, 'sobreposto.zip', 'application/zip', SOBREPOSTO_ZIP.length);
+      response.end(SOBREPOSTO_ZIP);
+      return;
+    }
     default:
       response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
       response.end('nao existe');
