@@ -1,5 +1,6 @@
 use super::*;
 
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, RwLock};
 
@@ -9,6 +10,9 @@ use neural_core::adblock::{
     STORED_LIST_VERSION, StoredList, download_on_activation, is_storable_site,
     page_is_always_exempt, refresh_due, site_key,
 };
+#[cfg(test)]
+use neural_core::distraction::DistractionPolicy;
+use neural_core::distraction::{MAX_DISTRACTION_SITES, SiteChange, distraction_site_key};
 use neural_core::json_store::{StoreGrant, VersionedJsonStore};
 
 use crate::stores::{ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE};
@@ -27,7 +31,9 @@ use crate::stores::{ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE};
 // - `AdblockState`: a escolha do utilizador (`adblock-settings.json`, loja
 //   `Setting`) e a lista em memoria. A lista baixada vive em
 //   `adblock-list.json` (loja `Automatic`), lida e escrita so nas threads
-//   `neural-adblock`.
+//   `neural-adblock`. O mesmo ficheiro guarda, no campo `distraction`, a
+//   politica da anti-distracao (`distraction.rs`); as escolhas feitas no
+//   Split privado ficam so em memoria (`set_distraction_site`).
 // - O menu do botao direito (`adblock_menu`): "Ativar bloqueio de
 //   anuncios" enquanto desligado; ligado, a caixa "Bloquear anuncios em
 //   <host> (N bloqueados)" e "Desativar bloqueio de anuncios"; numa pagina
@@ -422,6 +428,14 @@ pub(in crate::windows_app) struct AdblockState {
     /// A lista guardada esta a ser lida (arranque).
     loading: bool,
     last_failure_ms: Option<u64>,
+    /// A anti-distracao (`distraction.rs`): a politica gravada (campo
+    /// `distraction` das `settings`) e as escolhas do Split privado, como
+    /// os handlers as leem.
+    pub(in crate::windows_app) distraction: Arc<DistractionShared>,
+    /// As escolhas «Ocultar distrações neste site» feitas no Split privado:
+    /// so em memoria, NUNCA gravadas (gate
+    /// `a_toggle_in_private_is_never_written`).
+    distraction_private: BTreeMap<String, bool>,
 }
 
 /// Agora, em ms desde 1970.
@@ -520,6 +534,24 @@ impl AdblockState {
         stores: Option<&StoreRegistry>,
         proxy: &EventLoopProxy<UserEvent>,
     ) -> Self {
+        let mut state = Self::load(stores);
+        if state.settings.enabled {
+            state.shared.set_filtering(true);
+            if let Some(grant) = stores.and_then(|registry| registry.grant(ADBLOCK_LIST_STORE).ok())
+            {
+                state.loading = spawn_adblock_job(
+                    move || AdblockEvent::Loaded(read_stored_list(grant)),
+                    proxy.clone(),
+                );
+            }
+        }
+        state.publish();
+        state
+    }
+
+    /// A escolha gravada (`adblock-settings.json`, pelo grant `Setting`),
+    /// sem threads: o que `open` faz antes de ler a lista.
+    pub(in crate::windows_app) fn load(stores: Option<&StoreRegistry>) -> Self {
         let mut settings_store = stores
             .and_then(|registry| registry.grant(ADBLOCK_SETTINGS_STORE).ok())
             .and_then(|grant| {
@@ -534,7 +566,8 @@ impl AdblockState {
             .as_mut()
             .map(|store| store.load().into_value().sanitized())
             .unwrap_or_default();
-        let mut state = Self {
+        let distraction = Arc::new(DistractionShared::new(settings.distraction.clone()));
+        Self {
             shared: Arc::new(AdblockShared::default()),
             settings,
             settings_store,
@@ -543,19 +576,59 @@ impl AdblockState {
             activating: false,
             loading: false,
             last_failure_ms: None,
-        };
-        if state.settings.enabled {
-            state.shared.set_filtering(true);
-            if let Some(grant) = stores.and_then(|registry| registry.grant(ADBLOCK_LIST_STORE).ok())
-            {
-                state.loading = spawn_adblock_job(
-                    move || AdblockEvent::Loaded(read_stored_list(grant)),
-                    proxy.clone(),
-                );
-            }
+            distraction,
+            distraction_private: BTreeMap::new(),
         }
-        state.publish();
-        state
+    }
+
+    /// «Ocultar distrações neste site» (`distraction.rs`). Fora do Split
+    /// privado, a escolha muda a politica e grava-se no
+    /// `adblock-settings.json`; no Split privado fica so em memoria, por
+    /// cima da gravada, e o ficheiro nunca a ve.
+    pub(in crate::windows_app) fn set_distraction_site(
+        &mut self,
+        site: &str,
+        on: bool,
+        private: bool,
+    ) -> DistractionToggle {
+        let Some(site) = distraction_site_key(site) else {
+            return DistractionToggle::Refused;
+        };
+        let outcome = if private {
+            let mut effective = self
+                .settings
+                .distraction
+                .with_overlay(&self.distraction_private);
+            match effective.set_site(&site, on) {
+                SiteChange::Changed
+                    if self.distraction_private.len() < MAX_DISTRACTION_SITES
+                        || self.distraction_private.contains_key(&site) =>
+                {
+                    self.distraction_private.insert(site, on);
+                    DistractionToggle::MemoryOnly
+                }
+                SiteChange::Unchanged => DistractionToggle::Unchanged,
+                SiteChange::Changed | SiteChange::Refused => DistractionToggle::Refused,
+            }
+        } else {
+            match self.settings.distraction.set_site(&site, on) {
+                SiteChange::Changed => {
+                    self.save_settings();
+                    DistractionToggle::Saved
+                }
+                SiteChange::Unchanged => DistractionToggle::Unchanged,
+                SiteChange::Refused => DistractionToggle::Refused,
+            }
+        };
+        self.distraction
+            .publish(&self.settings.distraction, &self.distraction_private);
+        outcome
+    }
+
+    /// A politica gravada da anti-distracao (a do ficheiro).
+    #[cfg(test)]
+    pub(in crate::windows_app) fn distraction_policy(&self) -> &DistractionPolicy {
+        &self.settings.distraction
     }
 
     /// As regras da lista em memoria com os sites permitidos de agora.
