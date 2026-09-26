@@ -360,10 +360,60 @@ The CI sabotage matrix proves it red with `reader-born-without-hooks` (the
 Reader built by wry's `build` directly) and `gmail-monitor-gets-web-chain`
 (the Gmail monitor born as `External`).
 
-`accelerator_lookup` binds nothing yet (gate
-`accelerator_lookup_binds_nothing_today`): the handler only sets `Handled`
-when the lookup says so, so no keyboard behaviour changes until the command
-registry fills it. The resource dispatcher `resource_gate_answers` is a stub
+`accelerator_lookup(keymap, host, input)` is the keymap decision
+(`accelerator_decision` in `crates/neural-app/src/windows_app/keymap.rs`) with
+the host the handler was registered for as the command origin; the handler
+calls it with the product keymap (`product_keymap()`) and that host, names no
+other host, and only sets `Handled` when the decision binds the key. The gates
+call the same function with test keymaps. The keymap is built from
+the command registry (`COMMANDS` in `windows_app/commands.rs`: one row per
+command, with its stable key, pt-BR label, palette category, keywords, chords
+with a scope, and omnibox alias) and is read through a read lock; the decision
+is pure, and the handler makes no COM call besides reading its arguments and
+`SetHandled` (gate `the_accelerator_callback_calls_out_to_nothing`). The main
+window (winit) and the Home omnibox (the EDIT subclass) ask the same decision,
+with the window or the omnibox as the origin.
+
+A key is handled only on the key-down of a chord bound in one of the origin's
+scopes: `Window` then `Global` for the main window and the omnibox; `Page`
+(columns, split, private split, full Web, Reader, PDF, EPUB) or `Panel` (Ctrl+H
+panel, service panels, Gemini Live), then `Global`, for a WebView host; none
+for the hidden Gmail monitor. The first scope that declares the chord decides.
+An auto-repeat of a bound chord stays handled without firing again; key-up and
+unbound keys are never handled (gate `accelerator_decision_table`). A handled
+key becomes `UserEvent::RunCommandKey { key, origin }`, whose origin is the
+host (or the window, or the omnibox), never page data, and only the decision
+builds it (gate `a_command_key_carries_the_host_it_came_from`); the event loop
+hands the whole event to `command_key_event`, which reads the command and the
+origin from the event itself and runs the event `resolve_command(key, origin)`
+gives (gate `a_command_key_runs_against_the_origin_it_carries`: the event
+loop's arm neither takes the event apart nor calls `resolve_command`); for a
+page-bound command that is the one that page's keymap would request over IPC
+for the same key (gate `resolve_command_runs_against_its_origin`). Two commands with the same
+chord in the same scope make the whole table invalid (gate
+`keymap_chords_are_unique_per_scope`). On the provider hosts -- the comparator
+columns and the private split -- the ChatGPT chords Ctrl+Shift+O,
+Ctrl+Shift+;, Ctrl+Shift+C, Ctrl+Shift+I, Ctrl+Shift+S and
+Ctrl+Shift+Backspace are never handled, whatever scope binds them (gate
+`provider_hosts_never_bind_the_chatgpt_chords`). The Files scope's override
+table (Ctrl+D, Ctrl+N, Ctrl+W, Ctrl+Tab, Ctrl+G, Ctrl+O, Ctrl+S,
+Ctrl+Shift+S) is consulted only by the Files chain, which no current origin
+uses (gate `files_override_wins_only_in_files`).
+
+Today no WebView host binds a chord (gate
+`accelerator_lookup_binds_no_webview_chord_today`): the pages' shortcuts are
+still those of `NEURALIA_KEYMAP_SCRIPT`, and only the `Window` scope has rows
+-- the Ctrl+R, Ctrl+Shift+R, Ctrl+H, Ctrl+N, Ctrl+O, Ctrl+Shift+Z and
+Ctrl+Shift+Delete the main window and the omnibox already answered. The CI
+accelerator spike measured native dispatch on every host kind: with
+`Handled = TRUE` the page never sees the keydown of the chord, but it may still
+receive one or two keypress events (the control character of a Ctrl+letter).
+The spike handled the chord's key-up as well and its probe listened only for
+keydown and keypress; the shipped decision leaves key-up unhandled, so the page
+also receives the keyup of a bound chord, which the spike did not measure. A
+page that reacts to keypress or keyup sees the press; none of them can run the
+command, which is born on the native side.
+The resource dispatcher `resource_gate_answers` is a stub
 the product does not yet wire to `WebResourceRequested`; the gate
 `custom_schemes_are_never_answered_by_the_resource_gate` already holds it to
 never answering a request on `neuralia-pdf`, `neuralia-epub` or

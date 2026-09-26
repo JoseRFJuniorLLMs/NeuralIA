@@ -9025,49 +9025,1338 @@ fn custom_schemes_are_never_answered_by_the_resource_gate() {
     );
 }
 
+// ===================== o registo dos comandos e o mapa de teclas (infra-commands-keymap) =====================
+
+use std::collections::{HashMap, HashSet};
+use std::sync::RwLock;
+
+/// O que um atalho corre, pelo caminho do produto: o `RunCommandKey` da
+/// decisao entregue inteiro a `command_key_event`, como o event loop o
+/// entrega (em Debug; o `UserEvent` nao tem `PartialEq`). `None`: tecla nao
+/// tratada, ou um comando que nada faz dali.
+fn chord_command_event(decision: &AcceleratorDecision) -> Option<String> {
+    match &decision.event {
+        Some(press @ UserEvent::RunCommandKey { .. }) => {
+            command_key_event(press).map(|event| format!("{event:?}"))
+        }
+        Some(other) => panic!("a decisao deu um evento que nao e um comando: {other:?}"),
+        None => None,
+    }
+}
+
+/// Uma descida de `chord`, nem repetida nem subida.
+fn press(chord: Chord) -> AcceleratorInput {
+    AcceleratorInput {
+        vk: chord.vk,
+        down: true,
+        ctrl: chord.ctrl,
+        shift: chord.shift,
+        alt: chord.alt,
+        repeat: false,
+    }
+}
+
+/// Cada hospedeiro do produto: as tres colunas, as tres fontes ao lado
+/// (normal e privada), as paginas unicas, os paineis e cada servico.
+fn every_host() -> Vec<WebViewHost> {
+    let mut hosts = Vec::new();
+    for col in 0..COMPARATOR_COLUMNS {
+        hosts.extend([
+            WebViewHost::Column(col),
+            WebViewHost::Split(col),
+            WebViewHost::PrivateSplit(col),
+        ]);
+    }
+    hosts.extend([
+        WebViewHost::External,
+        WebViewHost::Reader,
+        WebViewHost::Pdf,
+        WebViewHost::Epub,
+        WebViewHost::Live,
+        WebViewHost::GmailMonitor,
+        WebViewHost::SidePanel,
+    ]);
+    for service in [
+        Service::Meet,
+        Service::WhatsApp,
+        Service::YouTube,
+        Service::Gmail,
+        Service::Breath,
+    ] {
+        hosts.push(WebViewHost::Service(service));
+    }
+    hosts
+}
+
+/// A janela, a omnibox e cada hospedeiro.
+fn every_origin() -> Vec<CommandOrigin> {
+    let mut origins = vec![CommandOrigin::Window, CommandOrigin::Omnibox];
+    origins.extend(every_host().into_iter().map(CommandOrigin::Host));
+    origins
+}
+
+/// Uma linha de teste do registo com estes atalhos (pelo mesmo
+/// `Keymap::build` que o produto usa).
+fn test_row(id: CommandId, chords: &[(KeyScope, Chord)]) -> CommandRow {
+    let chords: Vec<ChordSpec> = chords
+        .iter()
+        .map(|&(scope, chord)| ChordSpec { scope, chord })
+        .collect();
+    CommandRow {
+        id,
+        key: "teste",
+        label: "Teste",
+        category: CommandCategory::Ferramentas,
+        keywords: &["teste"],
+        chords: Box::leak(chords.into_boxed_slice()),
+        alias: None,
+    }
+}
+
+/// A familia de ambitos de cada origem, escrita a mao: o oraculo dos gates
+/// (nao se le `scope_chain` para decidir o que se espera dela).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum OriginKind {
+    /// A janela e a omnibox.
+    Chrome,
+    /// As colunas, as fontes ao lado, a Web completa, o Leitor, o PDF e os
+    /// livros.
+    Page,
+    /// O painel do Ctrl+H, os servicos e o Gemini Live.
+    Panel,
+    /// O monitor escondido do Gmail: nunca tem o teclado.
+    Blind,
+}
+
+fn origin_kind(origin: CommandOrigin) -> OriginKind {
+    match origin {
+        CommandOrigin::Window | CommandOrigin::Omnibox => OriginKind::Chrome,
+        CommandOrigin::Host(WebViewHost::GmailMonitor) => OriginKind::Blind,
+        CommandOrigin::Host(
+            WebViewHost::Live | WebViewHost::SidePanel | WebViewHost::Service(_),
+        ) => OriginKind::Panel,
+        CommandOrigin::Host(_) => OriginKind::Page,
+    }
+}
+
 /// O `AcceleratorKeyPressed` de cada WebView consulta `accelerator_lookup`
-/// e so marca `Handled` quando ela prende a tecla. Hoje ela nao prende
-/// nenhuma, em nenhum hospedeiro -- nem os dez atalhos nativos do plano
-/// da 2.3, nem com a tecla presa, nem na subida: e o slot que
-/// infra-commands-keymap preenche.
+/// e so marca `Handled` quando ela prende a tecla. Com o mapa do produto
+/// ela hoje nao prende nenhuma, em nenhum hospedeiro: nem os dez atalhos
+/// nativos do plano da 2.3 (cada um entra no PR do seu comando), nem os da
+/// janela e da omnibox (nas paginas continuam a ser do
+/// `NEURALIA_KEYMAP_SCRIPT`), nem com a tecla presa, nem na subida.
 #[test]
-fn accelerator_lookup_binds_nothing_today() {
-    let chords = [
-        (0x44u32, true, false), // Ctrl+D
-        (0x4A, true, false),    // Ctrl+J
-        (0x45, true, true),     // Ctrl+Shift+E
-        (0x41, true, true),     // Ctrl+Shift+A
-        (0x4E, true, true),     // Ctrl+Shift+N
-        (0x50, true, true),     // Ctrl+Shift+P
-        (0x70, false, false),   // F1
-        (0x53, true, true),     // Ctrl+Shift+S
-        (0x46, true, true),     // Ctrl+Shift+F
-        (0x4F, true, false),    // Ctrl+O
-        (0x1B, false, false),   // Esc
-        (0x52, true, false),    // Ctrl+R
+fn accelerator_lookup_binds_no_webview_chord_today() {
+    let mut chords = vec![
+        Chord::ctrl(b'D'),
+        Chord::ctrl(b'J'),
+        Chord::ctrl_shift(b'E'),
+        Chord::ctrl_shift(b'A'),
+        Chord::ctrl_shift(b'N'),
+        Chord::ctrl_shift(b'P'),
+        Chord::key(0x70),
+        Chord::ctrl_shift(b'S'),
+        Chord::ctrl_shift(b'F'),
+        Chord::ctrl(b'O'),
+        Chord::key(0x1B),
+        Chord::ctrl(b'R'),
     ];
+    for row in COMMANDS {
+        chords.extend(row.chords.iter().map(|spec| spec.chord));
+    }
+    let hosts = every_host();
     let mut consulted = 0usize;
-    for host in WebViewHost::ALL {
-        for (vk, ctrl, shift) in chords {
-            for (down, repeat) in [(true, false), (true, true), (false, false)] {
-                let decision = accelerator_lookup(
-                    host,
-                    AcceleratorInput {
-                        vk,
-                        down,
-                        ctrl,
-                        shift,
-                        alt: false,
-                        repeat,
-                    },
-                );
-                assert!(!decision.handled, "{host:?} {vk:#x} down={down}");
-                assert!(decision.event.is_none(), "{host:?} {vk:#x} down={down}");
+    for &host in &hosts {
+        for &chord in &chords {
+            for input in [
+                press(chord),
+                AcceleratorInput {
+                    repeat: true,
+                    ..press(chord)
+                },
+                AcceleratorInput {
+                    down: false,
+                    ..press(chord)
+                },
+            ] {
+                let decision = accelerator_lookup(product_keymap(), host, input);
+                assert!(!decision.handled, "{host:?} {chord:?} {input:?}");
+                assert!(decision.event.is_none(), "{host:?} {chord:?} {input:?}");
                 consulted += 1;
             }
         }
     }
-    assert_eq!(consulted, WebViewHost::ALL.len() * chords.len() * 3);
+    assert_eq!(consulted, hosts.len() * chords.len() * 3);
+}
+
+/// Gate (critico: uma pagina nao sintetiza comandos): a tabela da decisao.
+/// Um atalho preso na origem: a descida e tratada (`Handled`: a pagina nao
+/// ve o keydown) e da um `RunCommandKey` com o comando e a origem; a tecla
+/// presa continua tratada, sem evento; a subida nao e tratada. Uma tecla
+/// solta -- de outro ambito, ou com outros modificadores -- nao e tratada
+/// nem dispara. Sobre um mapa com atalhos em todos os ambitos, e sobre o
+/// do produto (os da janela e da omnibox).
+#[test]
+fn accelerator_decision_table() {
+    use OriginKind::{Blind, Chrome, Page, Panel};
+    let ctrl_j = Chord::ctrl(b'J');
+    let f1 = Chord::key(0x70);
+    let ctrl_d = Chord::ctrl(b'D');
+    let ctrl_shift_e = Chord::ctrl_shift(b'E');
+    let ctrl_o = Chord::ctrl(b'O');
+    let keymap = Keymap::build(&[
+        test_row(CommandId::History, &[(KeyScope::Global, ctrl_j)]),
+        test_row(CommandId::NewTab, &[(KeyScope::Global, f1)]),
+        test_row(CommandId::Home, &[(KeyScope::Page, ctrl_d)]),
+        // O ambito mais estreito ganha: nas paginas o Ctrl+J e este.
+        test_row(CommandId::Reload, &[(KeyScope::Page, ctrl_j)]),
+        test_row(CommandId::AutoScroll, &[(KeyScope::Panel, ctrl_shift_e)]),
+        test_row(CommandId::OpenEpub, &[(KeyScope::Window, ctrl_o)]),
+    ])
+    .expect("mapa de teste");
+    let expected = |kind: OriginKind, chord: Chord| -> Option<CommandId> {
+        match kind {
+            Blind => None,
+            Page if chord == ctrl_j => Some(CommandId::Reload),
+            _ if chord == ctrl_j => Some(CommandId::History),
+            _ if chord == f1 => Some(CommandId::NewTab),
+            Page if chord == ctrl_d => Some(CommandId::Home),
+            Panel if chord == ctrl_shift_e => Some(CommandId::AutoScroll),
+            Chrome if chord == ctrl_o => Some(CommandId::OpenEpub),
+            _ => None,
+        }
+    };
+    let corpus = [
+        ctrl_j,
+        f1,
+        ctrl_d,
+        ctrl_shift_e,
+        ctrl_o,
+        // Os mesmos com outros modificadores: outra combinacao, solta.
+        Chord::ctrl_shift(b'J'),
+        Chord {
+            alt: true,
+            ..ctrl_j
+        },
+        Chord {
+            ctrl: false,
+            ..ctrl_j
+        },
+        Chord { shift: true, ..f1 },
+        Chord::ctrl(b'E'),
+        Chord::ctrl_shift(b'D'),
+        Chord::ctrl(b'R'),
+        Chord::key(0x1B),
+    ];
+    let mut bound: HashMap<OriginKind, usize> = HashMap::new();
+    for origin in every_origin() {
+        let kind = origin_kind(origin);
+        for chord in corpus {
+            let down = accelerator_decision(&keymap, press(chord), origin);
+            let held = accelerator_decision(
+                &keymap,
+                AcceleratorInput {
+                    repeat: true,
+                    ..press(chord)
+                },
+                origin,
+            );
+            let up = accelerator_decision(
+                &keymap,
+                AcceleratorInput {
+                    down: false,
+                    ..press(chord)
+                },
+                origin,
+            );
+            match expected(kind, chord) {
+                Some(command) => {
+                    assert!(
+                        down.handled,
+                        "{origin:?} {chord:?}: atalho preso e a pagina ve o keydown"
+                    );
+                    assert!(
+                        matches!(
+                            down.event,
+                            Some(UserEvent::RunCommandKey { key, origin: from })
+                                if key == command && from == origin
+                        ),
+                        "{origin:?} {chord:?}: {:?}",
+                        down.event
+                    );
+                    assert!(
+                        held.handled,
+                        "{origin:?} {chord:?}: a repeticao chegou a pagina"
+                    );
+                    assert!(
+                        held.event.is_none(),
+                        "{origin:?} {chord:?}: a tecla presa repetiu o comando"
+                    );
+                    *bound.entry(kind).or_default() += 1;
+                }
+                None => {
+                    assert!(
+                        !down.handled && down.event.is_none(),
+                        "{origin:?} {chord:?}: tecla solta tratada: {down:?}"
+                    );
+                    assert!(
+                        !held.handled && held.event.is_none(),
+                        "{origin:?} {chord:?}: tecla solta tratada: {held:?}"
+                    );
+                }
+            }
+            assert!(
+                !up.handled && up.event.is_none(),
+                "{origin:?} {chord:?}: a subida foi tratada: {up:?}"
+            );
+        }
+    }
+    for kind in [Chrome, Page, Panel] {
+        assert!(bound.get(&kind).is_some_and(|count| *count > 0), "{kind:?}");
+    }
+
+    // O mapa do produto: os atalhos da janela e da omnibox.
+    let mut window_chords = 0usize;
+    for origin in [CommandOrigin::Window, CommandOrigin::Omnibox] {
+        for row in COMMANDS {
+            for spec in row.chords {
+                let decision = keymap_decision(press(spec.chord), origin);
+                assert!(decision.handled, "{origin:?} {:?}", row.id);
+                assert!(
+                    matches!(
+                        decision.event,
+                        Some(UserEvent::RunCommandKey { key, origin: from })
+                            if key == row.id && from == origin
+                    ),
+                    "{origin:?} {:?}: {:?}",
+                    row.id,
+                    decision.event
+                );
+                let held = keymap_decision(
+                    AcceleratorInput {
+                        repeat: true,
+                        ..press(spec.chord)
+                    },
+                    origin,
+                );
+                assert!(
+                    held.handled && held.event.is_none(),
+                    "{origin:?} {:?}",
+                    row.id
+                );
+                window_chords += 1;
+            }
+        }
+    }
+    assert_eq!(window_chords, 2 * 7);
+}
+
+/// Gate (critico): um atalho por ambito. Dois comandos com a mesma tecla no
+/// mesmo ambito recusam a tabela inteira -- nunca "ganha o ultimo" --, e a
+/// mesma tecla em ambitos diferentes e de cada um. O registo do produto
+/// vira mapa, cada comando tem uma linha e so o ambito da janela tem
+/// atalhos: os da 2.2.0, nenhum novo (regra C13).
+#[test]
+fn keymap_chords_are_unique_per_scope() {
+    use CommandId::{History, Home};
+    use KeyScope::{Global, Page};
+    let mut seen = HashSet::new();
+    for row in COMMANDS {
+        for spec in row.chords {
+            assert!(
+                seen.insert((spec.scope, spec.chord)),
+                "{:?} {:?} repetido ({:?})",
+                spec.scope,
+                spec.chord,
+                row.id
+            );
+        }
+    }
+    let built = Keymap::build(COMMANDS);
+    assert!(built.is_ok(), "o registo nao vira mapa: {:?}", built.err());
+    // Cada comando uma linha; chaves unicas, ASCII, minusculas e hifens.
+    for id in CommandId::ALL {
+        assert_eq!(
+            COMMANDS.iter().filter(|row| row.id == id).count(),
+            1,
+            "{id:?}"
+        );
+    }
+    assert_eq!(COMMANDS.len(), CommandId::ALL.len());
+    let keys: HashSet<&str> = COMMANDS.iter().map(|row| row.key).collect();
+    assert_eq!(keys.len(), COMMANDS.len(), "chaves repetidas");
+    for row in COMMANDS {
+        assert!(
+            !row.key.is_empty()
+                && row
+                    .key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
+            "{}",
+            row.key
+        );
+        assert_eq!(row.id.key(), row.key);
+    }
+    // So a janela e a omnibox tem atalhos, e sao os da 2.2.0.
+    let mut window = Vec::new();
+    for row in COMMANDS {
+        for spec in row.chords {
+            assert_eq!(spec.scope, KeyScope::Window, "{:?}: atalho novo", row.id);
+            window.push((row.id, spec.chord));
+        }
+    }
+    assert_eq!(
+        window,
+        [
+            (CommandId::AutoScroll, Chord::ctrl(b'R')),
+            (CommandId::Reload, Chord::ctrl_shift(b'R')),
+            (CommandId::History, Chord::ctrl(b'H')),
+            (CommandId::NewTab, Chord::ctrl(b'N')),
+            (CommandId::OpenEpub, Chord::ctrl(b'O')),
+            (CommandId::NewNote, Chord::ctrl_shift(b'Z')),
+            (CommandId::ClearHistory, Chord::ctrl_shift(0x2E)),
+        ]
+    );
+
+    // A mesma tecla duas vezes no mesmo ambito: a tabela e recusada.
+    let ctrl_j = Chord::ctrl(b'J');
+    assert_eq!(
+        Keymap::build(&[
+            test_row(History, &[(Global, ctrl_j)]),
+            test_row(Home, &[(Global, ctrl_j)]),
+        ])
+        .err(),
+        Some(KeymapError::Duplicate {
+            scope: Global,
+            chord: ctrl_j,
+            first: History,
+            second: Home,
+        })
+    );
+    assert!(matches!(
+        Keymap::build(&[test_row(History, &[(Page, ctrl_j), (Page, ctrl_j)])]),
+        Err(KeymapError::Duplicate { .. })
+    ));
+    // A mesma tecla em ambitos diferentes: cada ambito com o seu.
+    let keymap = Keymap::build(&[
+        test_row(History, &[(Global, ctrl_j)]),
+        test_row(Home, &[(Page, ctrl_j)]),
+    ])
+    .expect("ambitos diferentes");
+    assert_eq!(keymap.lookup(&[Global], ctrl_j), Some(History));
+    assert_eq!(keymap.lookup(&[Page, Global], ctrl_j), Some(Home));
+    assert_eq!(keymap.lookup(&[Page], Chord::ctrl(b'K')), None);
+    // Uma tecla que nao pode ser atalho: sem modificador, so Shift, ou
+    // Ctrl+Alt (o AltGr do ABNT2).
+    for chord in [
+        Chord::key(b'J'),
+        Chord {
+            shift: true,
+            ..Chord::key(b'J')
+        },
+        Chord {
+            alt: true,
+            ..Chord::ctrl(b'Q')
+        },
+        Chord::key(0x6F),
+        Chord::key(0x88),
+    ] {
+        assert_eq!(
+            Keymap::build(&[test_row(History, &[(Global, chord)])]).err(),
+            Some(KeymapError::NotAChord {
+                command: History,
+                chord
+            }),
+            "{chord:?}"
+        );
+    }
+    for chord in [
+        Chord::key(0x70),
+        Chord::key(0x87),
+        Chord {
+            alt: true,
+            ..Chord::key(b'X')
+        },
+        Chord::ctrl_shift(b'X'),
+    ] {
+        assert!(
+            Keymap::build(&[test_row(History, &[(Global, chord)])]).is_ok(),
+            "{chord:?}"
+        );
+    }
+}
+
+/// Gate (critico): nos hospedeiros das IAs -- as colunas do comparador e a
+/// resposta de uma IA no painel privado -- os atalhos do ChatGPT nunca sao
+/// presos, mesmo com um ambito a declara-los: a pagina fica com eles. A
+/// Captura (Ctrl+Shift+S) fica por isso sem atalho nas IAs. Nos outros
+/// hospedeiros o mesmo mapa prende-os (o gate nao e trivial).
+#[test]
+fn provider_hosts_never_bind_the_chatgpt_chords() {
+    assert_eq!(
+        PROVIDER_DENYLIST,
+        [
+            Chord::ctrl_shift(b'O'),
+            Chord::ctrl_shift(0xBA),
+            Chord::ctrl_shift(b'C'),
+            Chord::ctrl_shift(b'I'),
+            Chord::ctrl_shift(b'S'),
+            Chord::ctrl_shift(0x08),
+        ]
+    );
+    for origin in every_origin() {
+        assert_eq!(
+            is_provider_origin(origin),
+            matches!(
+                origin,
+                CommandOrigin::Host(WebViewHost::Column(_) | WebViewHost::PrivateSplit(_))
+            ),
+            "{origin:?}"
+        );
+    }
+    let spread = |scope: KeyScope| -> Vec<(KeyScope, Chord)> {
+        PROVIDER_DENYLIST
+            .iter()
+            .map(|chord| (scope, *chord))
+            .collect()
+    };
+    let lock = RwLock::new(
+        Keymap::build(&[
+            test_row(CommandId::History, &spread(KeyScope::Global)),
+            test_row(CommandId::Home, &spread(KeyScope::Page)),
+            test_row(CommandId::AutoScroll, &spread(KeyScope::Panel)),
+            test_row(CommandId::OpenEpub, &spread(KeyScope::Window)),
+        ])
+        .expect("mapa de teste"),
+    );
+    let mut providers = 0usize;
+    let mut elsewhere = 0usize;
+    for origin in every_origin() {
+        for chord in PROVIDER_DENYLIST {
+            for input in [
+                press(chord),
+                AcceleratorInput {
+                    repeat: true,
+                    ..press(chord)
+                },
+            ] {
+                let decision = keymap_decision_in(&lock, input, origin);
+                if is_provider_origin(origin) {
+                    assert!(
+                        !decision.handled && decision.event.is_none(),
+                        "{origin:?} prendeu {chord:?}: {decision:?}"
+                    );
+                } else if origin_kind(origin) != OriginKind::Blind {
+                    assert!(decision.handled, "{origin:?} {chord:?}: mapa de teste");
+                    elsewhere += 1;
+                }
+            }
+        }
+        // O slot dos ganchos, com o mesmo mapa.
+        if let CommandOrigin::Host(host) = origin
+            && is_provider_origin(origin)
+        {
+            providers += 1;
+            for chord in PROVIDER_DENYLIST {
+                let decision = accelerator_lookup(&lock, host, press(chord));
+                assert!(
+                    !decision.handled && decision.event.is_none(),
+                    "{host:?} prendeu {chord:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(providers, 2 * COMPARATOR_COLUMNS);
+    assert!(elsewhere > 0);
+    // As outras teclas desses hospedeiros continuam a poder ser presas.
+    let other = Keymap::build(&[test_row(
+        CommandId::History,
+        &[(KeyScope::Page, Chord::ctrl_shift(b'E'))],
+    )])
+    .expect("mapa de teste");
+    for col in 0..COMPARATOR_COLUMNS {
+        for host in [WebViewHost::Column(col), WebViewHost::PrivateSplit(col)] {
+            assert!(
+                accelerator_decision(
+                    &other,
+                    press(Chord::ctrl_shift(b'E')),
+                    CommandOrigin::Host(host)
+                )
+                .handled,
+                "{host:?}"
+            );
+        }
+    }
+    // E o mapa do produto, pelo slot.
+    for host in every_host() {
+        for chord in PROVIDER_DENYLIST {
+            assert!(
+                !accelerator_lookup(product_keymap(), host, press(chord)).handled,
+                "{host:?}"
+            );
+        }
+    }
+}
+
+/// Gate: a tabela dos arquivos ganha so nos arquivos. Na cadeia dos
+/// arquivos os oito atalhos sao deles (hoje `Pass`: a pagina dos arquivos
+/// fica com eles, ate cada item files-* ligar o seu comando) mesmo com a
+/// `Page` e a `Global` a declara-los; nenhuma origem que o produto tem
+/// consulta os arquivos, e nelas a tabela nao existe.
+#[test]
+fn files_override_wins_only_in_files() {
+    use CommandId::{History, Home, OpenEpub};
+    assert_eq!(
+        FILES_OVERRIDES,
+        [
+            Chord::ctrl(b'D'),
+            Chord::ctrl(b'N'),
+            Chord::ctrl(b'W'),
+            Chord::ctrl(0x09),
+            Chord::ctrl(b'G'),
+            Chord::ctrl(b'O'),
+            Chord::ctrl(b'S'),
+            Chord::ctrl_shift(b'S'),
+        ]
+    );
+    assert_eq!(
+        FILES_CHAIN,
+        [KeyScope::Files, KeyScope::Page, KeyScope::Global]
+    );
+    for origin in every_origin() {
+        assert!(
+            !scope_chain(origin).contains(&KeyScope::Files),
+            "{origin:?} consulta os arquivos"
+        );
+    }
+    let everywhere = |scope: KeyScope| -> Vec<(KeyScope, Chord)> {
+        FILES_OVERRIDES
+            .iter()
+            .map(|chord| (scope, *chord))
+            .collect()
+    };
+    let keymap = Keymap::build(&[
+        test_row(History, &everywhere(KeyScope::Global)),
+        test_row(Home, &everywhere(KeyScope::Page)),
+        test_row(
+            OpenEpub,
+            &[
+                (KeyScope::Files, Chord::ctrl(b'S')),
+                (KeyScope::Files, Chord::ctrl(b'E')),
+            ],
+        ),
+    ])
+    .expect("mapa de teste");
+    for chord in FILES_OVERRIDES {
+        let files = keymap.lookup(FILES_CHAIN, chord);
+        if chord == Chord::ctrl(b'S') {
+            assert_eq!(files, Some(OpenEpub));
+        } else {
+            assert_eq!(
+                files, None,
+                "{chord:?}: a Page ou a Global passou por cima dos arquivos"
+            );
+        }
+        for origin in every_origin() {
+            let expected = match origin_kind(origin) {
+                OriginKind::Page => Some(Home),
+                OriginKind::Chrome | OriginKind::Panel => Some(History),
+                OriginKind::Blind => None,
+            };
+            assert_eq!(
+                keymap.lookup(scope_chain(origin), chord),
+                expected,
+                "{origin:?} {chord:?}"
+            );
+        }
+    }
+    // Um atalho dos arquivos fora da tabela tambem so vale nos arquivos.
+    assert_eq!(
+        keymap.lookup(FILES_CHAIN, Chord::ctrl(b'E')),
+        Some(OpenEpub)
+    );
+    for origin in every_origin() {
+        assert_ne!(
+            keymap.lookup(scope_chain(origin), Chord::ctrl(b'E')),
+            Some(OpenEpub),
+            "{origin:?}"
+        );
+    }
+    // Um atalho que os arquivos nao declaram desce a Page e a Global.
+    let wider = Keymap::build(&[test_row(
+        History,
+        &[(KeyScope::Global, Chord::ctrl_shift(b'E'))],
+    )])
+    .expect("mapa de teste");
+    assert_eq!(
+        wider.lookup(FILES_CHAIN, Chord::ctrl_shift(b'E')),
+        Some(History)
+    );
+    // O mapa do produto ja traz a tabela, e nenhum comando dela.
+    let product = Keymap::build(COMMANDS).expect("registo");
+    for chord in FILES_OVERRIDES {
+        assert_eq!(product.lookup(FILES_CHAIN, chord), None, "{chord:?}");
+    }
+}
+
+/// Gate (critico: uma pagina nao sintetiza comandos): o comando leva a
+/// origem que o handler recebeu no registo -- o hospedeiro -- e nada da
+/// pagina. `accelerator_lookup`, a MESMA funcao que o handler chama (ele
+/// passa-lhe o mapa do produto), com um mapa com um atalho global, devolve
+/// em cada hospedeiro o `RunCommandKey` com esse hospedeiro (o monitor do
+/// Gmail nao tem teclado). E so a decisao constroi um `RunCommandKey`:
+/// nenhum canal das paginas o faz (asserção de ausencia).
+#[test]
+fn a_command_key_carries_the_host_it_came_from() {
+    let ctrl_j = Chord::ctrl(b'J');
+    let lock = RwLock::new(
+        Keymap::build(&[test_row(CommandId::History, &[(KeyScope::Global, ctrl_j)])])
+            .expect("mapa de teste"),
+    );
+    for host in every_host() {
+        let decision = accelerator_lookup(&lock, host, press(ctrl_j));
+        if host == WebViewHost::GmailMonitor {
+            assert!(!decision.handled && decision.event.is_none());
+            continue;
+        }
+        assert!(decision.handled, "{host:?}");
+        assert!(
+            matches!(
+                decision.event,
+                Some(UserEvent::RunCommandKey {
+                    key: CommandId::History,
+                    origin: CommandOrigin::Host(from),
+                }) if from == host
+            ),
+            "{host:?}: {:?}",
+            decision.event
+        );
+    }
+    // Um comando nunca resolve noutro comando: um salto so.
+    for id in CommandId::ALL {
+        for origin in every_origin() {
+            assert!(
+                !matches!(
+                    resolve_command(id, origin),
+                    Some(UserEvent::RunCommandKey { .. })
+                ),
+                "{id:?} {origin:?}"
+            );
+        }
+    }
+    // So a decisao o constroi e so o event loop o corre (o braco entrega-o
+    // inteiro, `command_key_event` le-o); nenhum canal das paginas (o IPC,
+    // o painel, os livros, o Live, os scripts) o nomeia.
+    let source = shipped_source();
+    assert_eq!(source.matches("RunCommandKey {").count(), 4);
+    assert_eq!(
+        source
+            .matches("press @ UserEvent::RunCommandKey { .. } =>")
+            .count(),
+        1
+    );
+    assert_eq!(
+        source
+            .matches("let &UserEvent::RunCommandKey { key, origin } = press else {")
+            .count(),
+        1
+    );
+    let keymap_rs = ALL_MODULES
+        .iter()
+        .find(|(name, _)| *name == "keymap.rs")
+        .map(|(_, content)| content.replace("\r\n", "\n"))
+        .expect("keymap.rs em ALL_MODULES");
+    assert_eq!(
+        keymap_rs
+            .matches("then_some(UserEvent::RunCommandKey { key, origin })")
+            .count(),
+        1
+    );
+    for (name, channel) in [
+        ("ipc.rs", include_str!("../ipc.rs")),
+        ("epub_app.rs", include_str!("../epub_app.rs")),
+        ("gemini_live.rs", include_str!("../gemini_live.rs")),
+        ("side_panel.rs", include_str!("side_panel.rs")),
+        ("page_scripts.rs", include_str!("page_scripts.rs")),
+    ] {
+        assert!(
+            !channel.contains("RunCommandKey"),
+            "{name} nomeia RunCommandKey"
+        );
+    }
+}
+
+/// Gate (critico: uma pagina nao sintetiza comandos): o event loop corre um
+/// `RunCommandKey` contra a origem que veio com ele. O braco entrega o
+/// evento inteiro a `command_key_event` -- a funcao que este gate chama --
+/// e ela corre o comando contra a origem do proprio evento: da janela e da
+/// omnibox, Ctrl+Shift+Z e a nota da janela (nao a de uma pagina); de cada
+/// hospedeiro, pelo `accelerator_lookup` que o handler chama, o recarregar
+/// e a nota dessa pagina (nao os da Web externa). E o braco nao escolhe
+/// origem (asserção de ausencia): nao desmonta o evento nem chama
+/// `resolve_command`.
+#[test]
+fn a_command_key_runs_against_the_origin_it_carries() {
+    use CommandId::{NewNote, Reload};
+    let debug = |event: Option<UserEvent>| event.map(|event| format!("{event:?}"));
+    // Cada comando de cada origem: o que `resolve_command` da dali.
+    for id in CommandId::ALL {
+        for origin in every_origin() {
+            assert_eq!(
+                debug(command_key_event(&UserEvent::RunCommandKey {
+                    key: id,
+                    origin
+                })),
+                debug(resolve_command(id, origin)),
+                "{id:?} {origin:?}"
+            );
+        }
+    }
+    // Um evento que nao e um atalho nao corre nada.
+    assert!(command_key_event(&UserEvent::HomeRequested).is_none());
+    assert!(command_key_event(&UserEvent::NewNote).is_none());
+    // A janela e a omnibox, pelo mapa do produto: a nota da janela.
+    let ctrl_shift_z = Chord::ctrl_shift(b'Z');
+    for origin in [CommandOrigin::Window, CommandOrigin::Omnibox] {
+        assert_eq!(
+            chord_command_event(&keymap_decision(press(ctrl_shift_z), origin)),
+            Some(format!("{:?}", UserEvent::NewNote)),
+            "{origin:?}"
+        );
+    }
+    // Cada hospedeiro, com o recarregar e a nota globais num mapa de teste.
+    let reload = Chord::ctrl(b'J');
+    let note = Chord::ctrl(b'K');
+    let lock = RwLock::new(
+        Keymap::build(&[
+            test_row(Reload, &[(KeyScope::Global, reload)]),
+            test_row(NewNote, &[(KeyScope::Global, note)]),
+        ])
+        .expect("mapa de teste"),
+    );
+    let external = |id: CommandId| {
+        debug(resolve_command(
+            id,
+            CommandOrigin::Host(WebViewHost::External),
+        ))
+    };
+    let mut distinct = HashSet::new();
+    let mut not_external = 0usize;
+    for host in every_host() {
+        for (id, chord) in [(Reload, reload), (NewNote, note)] {
+            let got = chord_command_event(&accelerator_lookup(&lock, host, press(chord)));
+            assert_eq!(
+                got,
+                debug(resolve_command(id, CommandOrigin::Host(host))),
+                "{host:?} {id:?}"
+            );
+            not_external += usize::from(got != external(id));
+            distinct.insert(got);
+        }
+    }
+    // A origem conta: as colunas, o Split e o Split privado recarregam-se a
+    // si (cada um o seu evento), e so a Web, o Leitor e o PDF dao o da Web.
+    assert!(distinct.len() >= 2 * COMPARATOR_COLUMNS + 2, "{distinct:?}");
+    assert!(not_external >= 3 * COMPARATOR_COLUMNS, "{not_external}");
+    for col in 0..COMPARATOR_COLUMNS {
+        assert_ne!(
+            chord_command_event(&accelerator_lookup(
+                &lock,
+                WebViewHost::Column(col),
+                press(reload)
+            )),
+            external(Reload),
+            "coluna {col}"
+        );
+    }
+    // O braco do event loop entrega o evento inteiro e nao escolhe origem.
+    let event_loop_rs = ALL_MODULES
+        .iter()
+        .find(|(name, _)| *name == "app/event_loop.rs")
+        .map(|(_, content)| content.replace("\r\n", "\n"))
+        .expect("app/event_loop.rs em ALL_MODULES");
+    assert_eq!(
+        event_loop_rs
+            .matches(
+                "press @ UserEvent::RunCommandKey { .. } => {\n                \
+                 if let Some(event) = command_key_event(&press) {\n"
+            )
+            .count(),
+        1
+    );
+    for forbidden in [
+        "resolve_command(",
+        "RunCommandKey { key",
+        "RunCommandKey { origin",
+    ] {
+        assert!(
+            !event_loop_rs.contains(forbidden),
+            "o event loop escolhe o comando ou a origem: {forbidden}"
+        );
+    }
+}
+
+/// Gate: cada comando corre contra a sua origem. Da janela e da omnibox, o
+/// que a 2.2.0 fazia (`main_window_shortcut` e o subclass do EDIT); de uma
+/// pagina, os comandos que dependem dela dao o que o mapa de teclas dessa
+/// pagina pede pelo IPC para o mesmo gesto, pelo mesmo despacho (a coluna
+/// recarrega-se a si, o Split privado recusa a nota); dos paineis, o da
+/// janela menos o recarregar; do monitor do Gmail ou de uma coluna que nao
+/// existe, nada.
+#[test]
+fn resolve_command_runs_against_its_origin() {
+    use CommandId::{NewNote, NewTab, Reload};
+    let debug = |event: Option<UserEvent>| event.map(|event| format!("{event:?}"));
+    let shown = |event: UserEvent| Some(format!("{event:?}"));
+    let chrome = [
+        (CommandId::AutoScroll, UserEvent::ToggleAutoScroll),
+        (Reload, UserEvent::ReloadPage),
+        (CommandId::History, UserEvent::ShowHistory),
+        (NewTab, UserEvent::NewTab(0)),
+        (CommandId::OpenEpub, UserEvent::OpenEpubDialog),
+        (NewNote, UserEvent::NewNote),
+        (CommandId::ClearHistory, UserEvent::ClearHistory),
+        (CommandId::Home, UserEvent::HomeRequested),
+        (CommandId::CloseSplit, UserEvent::CloseSplit),
+        (CommandId::SplitFullscreen, UserEvent::ToggleSplitFullscreen),
+        (CommandId::Exit, UserEvent::ExitRequested),
+    ];
+    assert_eq!(chrome.len(), CommandId::ALL.len());
+    for (id, event) in chrome {
+        let expected = shown(event);
+        for origin in [CommandOrigin::Window, CommandOrigin::Omnibox] {
+            assert_eq!(
+                debug(resolve_command(id, origin)),
+                expected,
+                "{id:?} {origin:?}"
+            );
+        }
+        // Os que nao dependem da pagina: o mesmo de qualquer hospedeiro.
+        if !matches!(id, Reload | NewNote | NewTab) {
+            for host in every_host() {
+                let got = debug(resolve_command(id, CommandOrigin::Host(host)));
+                if host == WebViewHost::GmailMonitor {
+                    assert_eq!(got, None, "{id:?}");
+                } else {
+                    assert_eq!(got, expected, "{id:?} {host:?}");
+                }
+            }
+        }
+    }
+    // De uma pagina: o mesmo despacho que o IPC do mapa de teclas dela.
+    let note = || IpcAction::Note {
+        via: NoteVia::Shortcut,
+    };
+    for col in 0..COMPARATOR_COLUMNS {
+        let actions = [
+            (Reload, IpcAction::Reload),
+            (NewNote, note()),
+            (NewTab, IpcAction::NewTab { col: Some(col) }),
+        ];
+        for (id, action) in actions {
+            assert_eq!(
+                debug(resolve_command(
+                    id,
+                    CommandOrigin::Host(WebViewHost::Column(col))
+                )),
+                debug(App::column_ipc_event_impl(col, action.clone())),
+                "{id:?} coluna {col}"
+            );
+            assert_eq!(
+                debug(resolve_command(
+                    id,
+                    CommandOrigin::Host(WebViewHost::Split(col))
+                )),
+                debug(App::split_ipc_event_impl(col, false, action.clone())),
+                "{id:?} fonte {col}"
+            );
+            assert_eq!(
+                debug(resolve_command(
+                    id,
+                    CommandOrigin::Host(WebViewHost::PrivateSplit(col))
+                )),
+                debug(App::split_ipc_event_impl(col, true, action)),
+                "{id:?} fonte privada {col}"
+            );
+        }
+        let column = CommandOrigin::Host(WebViewHost::Column(col));
+        let split = CommandOrigin::Host(WebViewHost::Split(col));
+        let private = CommandOrigin::Host(WebViewHost::PrivateSplit(col));
+        assert_eq!(
+            debug(resolve_command(Reload, column)),
+            shown(UserEvent::ReloadTarget(PageTarget::Column(col)))
+        );
+        assert_eq!(
+            debug(resolve_command(Reload, split)),
+            shown(UserEvent::ReloadTarget(PageTarget::Split))
+        );
+        assert_eq!(
+            debug(resolve_command(NewTab, column)),
+            shown(UserEvent::NewTab(col))
+        );
+        assert_eq!(
+            debug(resolve_command(NewTab, private)),
+            shown(UserEvent::NewTab(col))
+        );
+        assert_eq!(
+            debug(resolve_command(NewNote, column)),
+            shown(UserEvent::NoteRequested {
+                target: Some(PageTarget::Column(col)),
+                via: NoteVia::Shortcut,
+            })
+        );
+        assert_eq!(
+            debug(resolve_command(NewNote, split)),
+            shown(UserEvent::NoteRequested {
+                target: Some(PageTarget::Split),
+                via: NoteVia::Shortcut,
+            })
+        );
+        assert_eq!(
+            debug(resolve_command(NewNote, private)),
+            shown(UserEvent::NoteRefusedPrivate)
+        );
+    }
+    for host in [WebViewHost::External, WebViewHost::Reader, WebViewHost::Pdf] {
+        let origin = CommandOrigin::Host(host);
+        assert_eq!(
+            debug(resolve_command(Reload, origin)),
+            shown(UserEvent::ReloadPage)
+        );
+        assert_eq!(
+            debug(resolve_command(NewNote, origin)),
+            shown(UserEvent::NoteRequested {
+                target: None,
+                via: NoteVia::Shortcut,
+            })
+        );
+        assert_eq!(
+            debug(resolve_command(NewTab, origin)),
+            shown(UserEvent::NewTab(0))
+        );
+    }
+    for host in every_host() {
+        let origin = CommandOrigin::Host(host);
+        if origin_kind(origin) == OriginKind::Panel || host == WebViewHost::Epub {
+            assert_eq!(debug(resolve_command(Reload, origin)), None, "{host:?}");
+            assert_eq!(
+                debug(resolve_command(NewNote, origin)),
+                shown(UserEvent::NewNote),
+                "{host:?}"
+            );
+            assert_eq!(
+                debug(resolve_command(NewTab, origin)),
+                shown(UserEvent::NewTab(0)),
+                "{host:?}"
+            );
+        }
+    }
+    // Do monitor do Gmail, ou de uma coluna que nao existe: nada.
+    for id in CommandId::ALL {
+        for host in [
+            WebViewHost::GmailMonitor,
+            WebViewHost::Column(COMPARATOR_COLUMNS),
+            WebViewHost::Split(COMPARATOR_COLUMNS),
+            WebViewHost::PrivateSplit(COMPARATOR_COLUMNS),
+        ] {
+            assert_eq!(
+                debug(resolve_command(id, CommandOrigin::Host(host))),
+                None,
+                "{id:?} {host:?}"
+            );
+        }
+    }
+}
+
+/// O registo, linha a linha, no que a paleta vai ler: rotulo, categoria,
+/// palavras e alias. Um alias e o que, escrito na omnibox, faz o mesmo
+/// que o comando.
+#[test]
+fn every_command_row_names_itself_for_the_palette() {
+    let mut labels = HashSet::new();
+    for row in COMMANDS {
+        assert!(!row.label.trim().is_empty(), "{:?}", row.id);
+        assert!(labels.insert(row.label), "rotulo repetido: {}", row.label);
+        assert!(!row.category.label().is_empty(), "{:?}", row.id);
+        assert!(
+            !row.keywords.is_empty() && row.keywords.iter().all(|word| !word.trim().is_empty()),
+            "{:?}",
+            row.id
+        );
+    }
+    let mut aliased = 0usize;
+    for row in COMMANDS {
+        let Some(alias) = row.alias else {
+            continue;
+        };
+        aliased += 1;
+        // A rota que faz o mesmo que o comando; um alias novo acrescenta a
+        // sua aqui.
+        let expected = match row.id {
+            CommandId::OpenEpub => InputRoute::OpenEpub(None),
+            other => panic!("{other:?}: alias {alias} sem rota neste gate"),
+        };
+        assert_eq!(route_input(alias), expected, "{alias}");
+    }
+    assert_eq!(aliased, 1);
+    // `epub:` e o Ctrl+O acabam no mesmo dialogo (presenca).
+    let source = shipped_source();
+    assert!(source.contains("InputRoute::OpenEpub(None) => self.open_epub_dialog(true),"));
+    assert!(source.contains("UserEvent::OpenEpubDialog => self.open_epub_dialog(true),"));
+}
+
+/// Gate: `bar_hit_command` diz, para cada alvo da barra, se o clique e um
+/// comando do registo -- exaustivo, sem `_` (um alvo novo nao compila sem
+/// dizer). Os que sao comandos dao, da janela, o evento que faz o que o
+/// clique faz.
+#[test]
+fn bar_hit_command_is_exhaustive() {
+    use CommandId::{CloseSplit, Exit, Home, SplitFullscreen};
+    let hits = [
+        (BarHit::Home, Some(Home)),
+        (BarHit::Back, None),
+        (BarHit::Forward, None),
+        (BarHit::ColumnBack(0), None),
+        (BarHit::ColumnForward(1), None),
+        (BarHit::Column(2), None),
+        (BarHit::AddTab(0), None),
+        (
+            BarHit::ContextTab {
+                source_index: 0,
+                context_index: 1,
+            },
+            None,
+        ),
+        (
+            BarHit::CloseTab {
+                source_index: 1,
+                context_index: 0,
+            },
+            None,
+        ),
+        (
+            BarHit::ContextGroup {
+                source_index: 2,
+                group_index: 0,
+            },
+            None,
+        ),
+        (BarHit::TabOverflow(1), None),
+        (BarHit::SplitExpand, Some(SplitFullscreen)),
+        (BarHit::SplitClose, Some(CloseSplit)),
+        (BarHit::Private, None),
+        (BarHit::ServiceStrip(StripButton::Close), None),
+        (BarHit::Service(Service::Meet), None),
+        (BarHit::GmailToggle, None),
+        (BarHit::Tool(Tool::Pomodoro), None),
+        (BarHit::GeminiLive, None),
+        (BarHit::WindowMinimize, None),
+        (BarHit::WindowMaximize, None),
+        (BarHit::WindowClose, Some(Exit)),
+    ];
+    for (hit, expected) in hits {
+        assert_eq!(bar_hit_command(hit), expected, "{hit:?}");
+    }
+    for (hit, event) in [
+        (BarHit::Home, UserEvent::HomeRequested),
+        (BarHit::SplitClose, UserEvent::CloseSplit),
+        (BarHit::SplitExpand, UserEvent::ToggleSplitFullscreen),
+        (BarHit::WindowClose, UserEvent::ExitRequested),
+    ] {
+        let command = bar_hit_command(hit).expect("comando");
+        assert_eq!(
+            resolve_command(command, CommandOrigin::Window).map(|event| format!("{event:?}")),
+            Some(format!("{event:?}")),
+            "{hit:?}"
+        );
+    }
+    // Exaustivo (asserção de ausencia): nenhum braco `_` no match.
+    let source = shipped_source();
+    let body = source
+        .split("fn bar_hit_command(hit: BarHit) -> Option<CommandId> {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("bar_hit_command");
+    assert!(!body.contains("_ =>"), "bar_hit_command tem um braco `_`");
+}
+
+/// Gate: a janela e a omnibox perguntam ao mesmo mapa (a antiga
+/// `main_window_shortcut` e o subclass do EDIT tinham cada um a sua
+/// lista): a mesma tecla da o mesmo comando nas duas, e a tecla lida pelo
+/// winit e pelo WM_KEYDOWN e a do AcceleratorKeyPressed.
+#[test]
+fn the_window_and_the_omnibox_share_one_keymap() {
+    use winit::keyboard::ModifiersState;
+    let ctrl = ModifiersState::CONTROL;
+    let none = ModifiersState::empty();
+    let vk = |key: Key, modifiers: ModifiersState| {
+        window_accelerator_input(&key, modifiers, false).map(|input| input.vk)
+    };
+    let text = |text: &str| Key::Character(text.into());
+    assert_eq!(vk(text("o"), ctrl), Some(0x4F));
+    assert_eq!(vk(text("O"), ctrl), Some(0x4F));
+    assert_eq!(vk(text("1"), ctrl), Some(0x31));
+    assert_eq!(vk(Key::Named(NamedKey::Delete), ctrl), Some(0x2E));
+    assert_eq!(vk(Key::Named(NamedKey::Backspace), ctrl), Some(0x08));
+    assert_eq!(vk(Key::Named(NamedKey::Tab), ctrl), Some(0x09));
+    assert_eq!(vk(Key::Named(NamedKey::F1), none), Some(0x70));
+    assert_eq!(vk(Key::Named(NamedKey::F8), none), Some(0x77));
+    assert_eq!(vk(Key::Named(NamedKey::F24), none), Some(0x87));
+    assert_eq!(vk(Key::Named(NamedKey::Escape), none), None);
+    assert_eq!(vk(Key::Named(NamedKey::Enter), none), None);
+    assert_eq!(vk(text("ç"), ctrl), None);
+    assert_eq!(vk(text("ab"), ctrl), None);
+    assert_eq!(
+        window_accelerator_input(
+            &text("r"),
+            ctrl | ModifiersState::SHIFT | ModifiersState::ALT,
+            true
+        ),
+        Some(AcceleratorInput {
+            vk: 0x52,
+            down: true,
+            ctrl: true,
+            shift: true,
+            alt: true,
+            repeat: true,
+        })
+    );
+    // O WM_KEYDOWN: o bit 30 do lParam e a tecla ja em baixo (repeticao).
+    assert_eq!(
+        omnibox_accelerator_input(0x4F, 0x0001, true, false, false),
+        AcceleratorInput {
+            vk: 0x4F,
+            down: true,
+            ctrl: true,
+            shift: false,
+            alt: false,
+            repeat: false,
+        }
+    );
+    assert!(omnibox_accelerator_input(0x4F, 0x4000_0001, true, false, false).repeat);
+    // A mesma decisao nas duas origens.
+    let mut chords: Vec<Chord> = COMMANDS
+        .iter()
+        .flat_map(|row| row.chords.iter().map(|spec| spec.chord))
+        .collect();
+    chords.extend([
+        Chord::ctrl(b'A'),
+        Chord::ctrl(b'L'),
+        Chord::ctrl(b'J'),
+        Chord::ctrl_shift(b'N'),
+        Chord::ctrl_shift(b'H'),
+        Chord {
+            alt: true,
+            ..Chord::ctrl(b'R')
+        },
+        Chord::key(0x70),
+    ]);
+    let command = |decision: &AcceleratorDecision| match decision.event {
+        Some(UserEvent::RunCommandKey { key, .. }) => Some(key),
+        _ => None,
+    };
+    let mut bound = 0usize;
+    for chord in chords {
+        let window = keymap_decision(press(chord), CommandOrigin::Window);
+        let omnibox = keymap_decision(
+            omnibox_accelerator_input(chord.vk as usize, 0, chord.ctrl, chord.shift, chord.alt),
+            CommandOrigin::Omnibox,
+        );
+        assert_eq!(window.handled, omnibox.handled, "{chord:?}");
+        assert_eq!(command(&window), command(&omnibox), "{chord:?}");
+        bound += usize::from(window.handled);
+    }
+    assert_eq!(bound, 7);
+    // Os dois caminhos passam pelo mapa (presenca); a lista antiga saiu.
+    let source = shipped_source();
+    assert!(source.contains("let decision = keymap_decision(input, CommandOrigin::Window);"));
+    assert!(source.contains(
+        "omnibox_accelerator_input(wparam, lparam, ctrl, shift, alt),\n            CommandOrigin::Omnibox,"
+    ));
+    assert!(!source.contains("fn main_window_shortcut("));
+}
+
+/// O `AcceleratorKeyPressed` corre dentro da chamada de entrada sincrona do
+/// WebView2: o handler so le os argumentos (e o `GetKeyState`), pergunta ao
+/// mapa (uma leitura) e manda o evento pelo proxy. Nenhuma chamada COM
+/// para fora (RPC_E_CANTCALLOUT_ININPUTSYNCCALL) -- asserção de ausencia --,
+/// e o mapa de teclas nao tem nada de COM nem de `unsafe`.
+#[test]
+fn the_accelerator_callback_calls_out_to_nothing() {
+    let module = |file: &str| {
+        ALL_MODULES
+            .iter()
+            .find(|(name, _)| *name == file)
+            .map(|(_, content)| content.replace("\r\n", "\n"))
+            .unwrap_or_else(|| panic!("{file} em ALL_MODULES"))
+    };
+    let hooks = module("webview_hooks.rs");
+    let handler = hooks
+        .split("AcceleratorKeyPressedEventHandler::create(Box::new(move |_, args| {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    }));\n").next())
+        .expect("o handler do AcceleratorKeyPressed");
+    assert!(handler.contains("proxy.send_event(event)"));
+    // O handler chama `accelerator_lookup` -- a funcao dos gates -- sobre o
+    // mapa do produto com o hospedeiro deste registo, uma vez; e nada no
+    // registo nomeia outro hospedeiro nem outra origem (asserção de
+    // ausencia): o `host` que chega a `accelerator_lookup` e o que o
+    // `ComHookRegistrar` recebeu de `install_hooks_with`.
+    assert_eq!(
+        handler
+            .matches("let decision = accelerator_lookup(product_keymap(), host, input);")
+            .count(),
+        1
+    );
+    assert_eq!(handler.matches("accelerator_lookup(").count(), 1);
+    let register = hooks
+        .split("fn register_webview_accelerators(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("register_webview_accelerators");
+    for forbidden in ["WebViewHost::", "CommandOrigin", "let host", "host ="] {
+        assert!(
+            !register.contains(forbidden),
+            "o registo do AcceleratorKeyPressed nomeia {forbidden}"
+        );
+    }
+    assert_eq!(hooks.matches("register_webview_accelerators(").count(), 2);
+    assert_eq!(
+        hooks
+            .matches("register_webview_accelerators(self.webview, host, self.proxy.clone())")
+            .count(),
+        1
+    );
+    let calls: Vec<&str> = handler
+        .match_indices("args.")
+        .map(|(at, _)| {
+            let rest = &handler[at + "args.".len()..];
+            &rest[..rest.find('(').unwrap_or(rest.len())]
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            "KeyEventKind",
+            "VirtualKey",
+            "PhysicalKeyStatus",
+            "SetHandled"
+        ]
+    );
+    for forbidden in [
+        "ExecuteScript",
+        ".webview()",
+        "controller",
+        "SendMessage",
+        "evaluate_script",
+        "CoreWebView2",
+    ] {
+        assert!(!handler.contains(forbidden), "o handler chama {forbidden}");
+    }
+    let keymap = module("keymap.rs");
+    for forbidden in ["unsafe", "webview2_com", "windows_core", "SendMessage"] {
+        assert!(!keymap.contains(forbidden), "keymap.rs usa {forbidden}");
+    }
 }
 
 /// Um `[[package]]` do Cargo.lock: nome, versao, origem (ausente nos
@@ -13045,35 +14334,32 @@ fn the_epub_protocol_handler_keeps_the_query_and_every_header() {
 #[test]
 fn ctrl_o_opens_the_book_dialog_on_home_and_in_the_main_window() {
     use winit::keyboard::ModifiersState;
-    // A omnibox da Home (o subclass do EDIT decide por esta função).
-    assert!(omnibox_opens_epub_dialog(0x4F, true, false));
-    assert!(!omnibox_opens_epub_dialog(0x4F, false, false));
-    assert!(!omnibox_opens_epub_dialog(0x4F, true, true));
-    assert!(!omnibox_opens_epub_dialog(0x50, true, false));
-    assert!(!omnibox_opens_epub_dialog(0x4E, true, false));
-    // A janela principal (winit).
+    let dialog = Some(format!("{:?}", UserEvent::OpenEpubDialog));
+    // A omnibox da Home: o subclass do EDIT pergunta ao mapa de teclas com
+    // a tecla do WM_KEYDOWN.
+    let omnibox = |vk: usize, ctrl: bool, shift: bool| {
+        chord_command_event(&keymap_decision(
+            omnibox_accelerator_input(vk, 0, ctrl, shift, false),
+            CommandOrigin::Omnibox,
+        ))
+    };
+    assert_eq!(omnibox(0x4F, true, false), dialog);
+    assert_eq!(omnibox(0x4F, false, false), None);
+    assert_eq!(omnibox(0x4F, true, true), None);
+    assert_eq!(omnibox(0x50, true, false), None);
+    assert_ne!(omnibox(0x4E, true, false), dialog);
+    // A janela principal (winit): o mesmo mapa, com a janela como origem.
     let key = |text: &str| Key::Character(text.into());
+    let window = |text: &str, modifiers: ModifiersState| {
+        window_accelerator_input(&key(text), modifiers, false)
+            .and_then(|input| chord_command_event(&keymap_decision(input, CommandOrigin::Window)))
+    };
     let ctrl = ModifiersState::CONTROL;
-    assert_eq!(
-        main_window_shortcut(&key("o"), ctrl),
-        Some(MainShortcut::OpenEpub)
-    );
-    assert_eq!(
-        main_window_shortcut(&key("O"), ctrl),
-        Some(MainShortcut::OpenEpub)
-    );
-    assert_eq!(
-        main_window_shortcut(&key("o"), ctrl | ModifiersState::SHIFT),
-        None
-    );
-    assert_eq!(
-        main_window_shortcut(&key("o"), ctrl | ModifiersState::ALT),
-        None
-    );
-    assert_eq!(
-        main_window_shortcut(&key("o"), ModifiersState::empty()),
-        None
-    );
+    assert_eq!(window("o", ctrl), dialog);
+    assert_eq!(window("O", ctrl), dialog);
+    assert_eq!(window("o", ctrl | ModifiersState::SHIFT), None);
+    assert_eq!(window("o", ctrl | ModifiersState::ALT), None);
+    assert_eq!(window("o", ModifiersState::empty()), None);
 }
 
 #[test]
@@ -13124,33 +14410,26 @@ fn livros_and_epub_commands_route_to_the_book_library() {
 fn the_main_window_answers_the_same_ctrl_shortcuts() {
     use winit::keyboard::ModifiersState;
     let key = |text: &str| Key::Character(text.into());
+    let window = |key: Key, modifiers: ModifiersState| {
+        window_accelerator_input(&key, modifiers, false)
+            .and_then(|input| chord_command_event(&keymap_decision(input, CommandOrigin::Window)))
+    };
+    let event = |event: UserEvent| Some(format!("{event:?}"));
     let ctrl = ModifiersState::CONTROL;
     let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+    assert_eq!(window(key("r"), ctrl), event(UserEvent::ToggleAutoScroll));
+    assert_eq!(window(key("R"), ctrl_shift), event(UserEvent::ReloadPage));
+    assert_eq!(window(key("h"), ctrl), event(UserEvent::ShowHistory));
+    assert_eq!(window(key("n"), ctrl), event(UserEvent::NewTab(0)));
+    // O Ctrl+Shift+Delete da omnibox e das paginas vale agora tambem com o
+    // teclado na janela (o mesmo mapa); pergunta antes de apagar.
     assert_eq!(
-        main_window_shortcut(&key("r"), ctrl),
-        Some(MainShortcut::AutoScroll)
-    );
-    assert_eq!(
-        main_window_shortcut(&key("R"), ctrl_shift),
-        Some(MainShortcut::Reload)
-    );
-    assert_eq!(
-        main_window_shortcut(&key("h"), ctrl),
-        Some(MainShortcut::History)
-    );
-    assert_eq!(
-        main_window_shortcut(&key("n"), ctrl),
-        Some(MainShortcut::NewTab)
+        window(Key::Named(NamedKey::Delete), ctrl_shift),
+        event(UserEvent::ClearHistory)
     );
     // Sem Ctrl, ou com Alt (AltGr no teclado portugues), a tecla e texto.
-    assert_eq!(
-        main_window_shortcut(&key("r"), ModifiersState::empty()),
-        None
-    );
-    assert_eq!(
-        main_window_shortcut(&key("r"), ctrl | ModifiersState::ALT),
-        None
-    );
+    assert_eq!(window(key("r"), ModifiersState::empty()), None);
+    assert_eq!(window(key("r"), ctrl | ModifiersState::ALT), None);
 }
 
 #[test]
@@ -21540,19 +22819,16 @@ __log.push(__json({{ tag: 'releitura', value: {NOTE_CAPTURE_SCRIPT} }}));
     fn ctrl_shift_z_in_the_main_window_is_a_new_note() {
         use winit::keyboard::ModifiersState;
         let key = |text: &str| Key::Character(text.into());
+        let window = |text: &str, modifiers: ModifiersState| {
+            window_accelerator_input(&key(text), modifiers, false).and_then(|input| {
+                chord_command_event(&keymap_decision(input, CommandOrigin::Window))
+            })
+        };
+        let new_note = Some(format!("{:?}", UserEvent::NewNote));
         let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
-        assert_eq!(
-            main_window_shortcut(&key("Z"), ctrl_shift),
-            Some(MainShortcut::NewNote)
-        );
-        assert_eq!(
-            main_window_shortcut(&key("z"), ctrl_shift),
-            Some(MainShortcut::NewNote)
-        );
-        assert_eq!(
-            main_window_shortcut(&key("z"), ModifiersState::CONTROL),
-            None
-        );
+        assert_eq!(window("Z", ctrl_shift), new_note);
+        assert_eq!(window("z", ctrl_shift), new_note);
+        assert_eq!(window("z", ModifiersState::CONTROL), None);
         // O script que a Home manda ao painel: sem a pagina das notas, nada.
         let program = format!(
             r#"
