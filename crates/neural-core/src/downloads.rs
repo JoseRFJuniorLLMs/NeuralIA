@@ -1321,7 +1321,7 @@ mod tests {
         effects.extend(m.on_event(DownloadEvent::Ended {
             id: DownloadId(1),
             end: DownloadEnd::Completed {
-                path: PathBuf::from(r"C:\d\relatorio.pdf"),
+                path: PathBuf::from(r"C:\d").join("relatorio.pdf"),
             },
         }));
         effects.extend(m.on_event(DownloadEvent::Finalized {
@@ -1342,7 +1342,7 @@ mod tests {
         effects.extend(m.on_event(DownloadEvent::Ended {
             id: DownloadId(5),
             end: DownloadEnd::Completed {
-                path: PathBuf::from(r"C:\d\mascara.pdf"),
+                path: PathBuf::from(r"C:\d").join("mascara.pdf"),
             },
         }));
         effects.extend(m.on_event(DownloadEvent::Finalized {
@@ -1363,7 +1363,7 @@ mod tests {
         m.on_event(DownloadEvent::Ended {
             id: DownloadId(1),
             end: DownloadEnd::Completed {
-                path: PathBuf::from(r"C:\d\relatorio.pdf"),
+                path: PathBuf::from(r"C:\d").join("relatorio.pdf"),
             },
         });
         let done = m.on_event(DownloadEvent::Finalized {
@@ -1386,7 +1386,7 @@ mod tests {
         assert_eq!(log.entries[1].name, "relatorio.pdf");
         assert_eq!(
             log.entries[1].path.as_deref(),
-            Some(Path::new(r"C:\d\relatorio.pdf"))
+            Some(PathBuf::from(r"C:\d").join("relatorio.pdf").as_path())
         );
         assert_eq!(log.entries[1].host.as_deref(), Some("example.com"));
     }
@@ -1458,7 +1458,7 @@ mod tests {
         let ended = m.on_event(DownloadEvent::Ended {
             id: DownloadId(1),
             end: DownloadEnd::Completed {
-                path: PathBuf::from(r"C:\d\relatorio (1).pdf"),
+                path: PathBuf::from(r"C:\d").join("relatorio (1).pdf"),
             },
         });
         assert_eq!(ended[0], DownloadEffect::ForgetOp(DownloadId(1)));
@@ -1466,7 +1466,7 @@ mod tests {
             ended[1],
             DownloadEffect::Finalize {
                 id: DownloadId(1),
-                path: PathBuf::from(r"C:\d\relatorio (1).pdf"),
+                path: PathBuf::from(r"C:\d").join("relatorio (1).pdf"),
                 confirmed_program: false,
             }
         );
@@ -1475,7 +1475,7 @@ mod tests {
             m.on_event(DownloadEvent::Ended {
                 id: DownloadId(1),
                 end: DownloadEnd::Completed {
-                    path: PathBuf::from(r"C:\d\relatorio (1).pdf"),
+                    path: PathBuf::from(r"C:\d").join("relatorio (1).pdf"),
                 },
             }),
             vec![DownloadEffect::ForgetOp(DownloadId(1))]
@@ -1489,7 +1489,7 @@ mod tests {
             id: DownloadId(4),
             webview: WebViewKey(8),
             private: false,
-            proposed: PathBuf::from(r"C:\d\outro.zip"),
+            proposed: PathBuf::from(r"C:\d").join("outro.zip"),
             host: None,
             total: None,
             at: 0,
@@ -1514,7 +1514,7 @@ mod tests {
         let late = m.on_event(DownloadEvent::Ended {
             id: DownloadId(2),
             end: DownloadEnd::Completed {
-                path: PathBuf::from(r"C:\d\grande.zip"),
+                path: PathBuf::from(r"C:\d").join("grande.zip"),
             },
         });
         assert!(
