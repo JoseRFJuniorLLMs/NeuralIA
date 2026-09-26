@@ -568,8 +568,58 @@ for (const entry of sabotages) {
   }
 }
 
+// The LLM transport (infra-llm-transport, 2.3 plan): neural_core::llm reaches
+// only the pinned provider hosts. Endpoint::pinned is its only constructor in
+// the published build; Endpoint::loopback (the unit tests' stub origin)
+// compiles only under cfg(test). Behaviour: the Rust gate
+// `release_has_no_endpoint_override` (src/llm/tests.rs) and the windows job,
+// which scans the exact ci-tested/NeuralIA.exe bytes for base-URL and fixture
+// override environment names. These assertions keep that wiring in place.
+const llmTransport = fs
+  .readFileSync('crates/neural-core/src/llm/transport.rs', 'utf8')
+  .replace(/\r\n/g, '\n');
+assert.match(
+  llmTransport,
+  /\n {4}#\[cfg\(test\)\]\n {4}pub\(crate\) fn loopback\(port: u16\) -> Self \{\n/,
+  'Endpoint::loopback compiles only in tests'
+);
+assert.equal(
+  (llmTransport.match(/\bfn loopback\(/g) || []).length,
+  1,
+  'Endpoint::loopback is declared once'
+);
+assert.equal(
+  (llmTransport.match(/\bpub fn pinned\(provider: Provider\) -> Self \{/g) || []).length,
+  1,
+  'Endpoint::pinned is the constructor that ships'
+);
+const overrideStep =
+  '      - name: Published exe has no LLM endpoint override\n' +
+  '        shell: pwsh\n' +
+  '        run: ./scripts/test-exe-no-endpoint-override.ps1 -ExePath ci-tested/NeuralIA.exe\n';
+assert.equal(windowsJob.split(overrideStep).length - 1, 1, 'the windows job scans the exe for LLM overrides once');
+const overrideAt = windowsJob.indexOf(overrideStep);
+assert.ok(overrideAt > stageAt, 'the LLM override scan reads the staged ci-tested bytes');
+assert.ok(overrideAt < markerAt, 'the LLM override scan runs before the tested exe is uploaded');
+assert.match(
+  windowsJob.slice(overrideAt + overrideStep.length),
+  /^ {6}[-#]/,
+  'the LLM override step is exactly name/shell/run (no if, no continue-on-error)'
+);
+const overrideScript = fs.readFileSync('scripts/test-exe-no-endpoint-override.ps1', 'utf8');
+for (const [pattern, why] of [
+  [/BASE_URL/, 'the scan looks for base-URL override names'],
+  [/FIXTURE/, 'the scan looks for fixture override names'],
+  [/\$canaries = @\(/, 'the scan proves it sees planted names before trusting a clean result'],
+  [/\[Text\.Encoding\]::Unicode\.GetString/, 'the scan also reads UTF-16LE strings'],
+  [/if \(\$found\.Count -gt 0\) \{\n?\s+throw /, 'the scan fails when the exe carries an override name'],
+]) {
+  assert.match(overrideScript.replace(/\r\n/g, '\n'), pattern, why);
+}
+
 console.log('release contract: single public installer asset (neural-setup around the CI-tested binary)');
 console.log('release contract: the published exe is built without the accel-spike feature');
 console.log('release contract: the published exe is built without the test-stores feature');
 console.log('release contract: the accelerator spike runs outside the CI workflow that release.yml waits for');
+console.log('release contract: the LLM transport ships only pinned hosts; the published exe has no endpoint override');
 console.log(`release contract: every anchor of the ${sabotages.length} CI sabotages matches its file exactly once`);

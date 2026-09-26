@@ -1,0 +1,89 @@
+{
+  "about": "Pick-rule table of infra-llm-transport (neural_core::llm::models). The model ids live here, never in src/llm (gate no_model_id_is_hard_coded). 'pages' are two pages of a Gemini models.list answer, served by the loopback stub. 'denied' has, for every deny token of the brief, real ids of that family and a decoy: a '*-flash-lite' id newer than the expected pick that only the deny token keeps out. Decoy versions (9.x) are synthetic.",
+  "pages": [
+    {
+      "models": [
+        { "name": "models/gemini-2.0-flash-lite", "displayName": "Flash-Lite 2.0", "supportedGenerationMethods": ["generateContent", "countTokens"] },
+        { "name": "models/gemini-2.0-flash-lite-001", "displayName": "Flash-Lite 2.0 001", "supportedGenerationMethods": ["generateContent", "countTokens"] },
+        { "name": "models/gemini-2.5-flash", "displayName": "Flash 2.5", "supportedGenerationMethods": ["generateContent", "countTokens"] },
+        { "name": "models/gemini-2.5-flash-lite-preview-09-2025", "displayName": "Flash-Lite preview", "supportedGenerationMethods": ["generateContent", "countTokens"] },
+        { "name": "models/gemini-flash-lite-latest", "displayName": "Flash-Lite latest", "supportedGenerationMethods": ["generateContent", "countTokens"] },
+        { "name": "models/gemini-3.0-flash-lite-preview", "displayName": "Flash-Lite 3 preview", "supportedGenerationMethods": ["generateContent"] },
+        { "name": "models/gemini-3.1-flash-lite", "displayName": "Flash-Lite that cannot generate", "supportedGenerationMethods": ["countTokens"] },
+        { "name": "models/gemini-embedding-001", "displayName": "Embedding", "supportedGenerationMethods": ["embedContent"] },
+        { "name": "models/gemini-2.5-pro", "displayName": "Pro 2.5", "supportedGenerationMethods": ["generateContent", "countTokens"] },
+        { "name": "models/gemini-2.5-flash-native-audio-preview-12-2025", "displayName": "Live native audio", "supportedGenerationMethods": ["countTokens", "bidiGenerateContent"] },
+        { "name": "models/gemini-2.5-flash-preview-tts", "displayName": "TTS", "supportedGenerationMethods": ["generateContent", "countTokens"] },
+        { "name": "models/gemini-2.5-flash-image", "displayName": "Image", "supportedGenerationMethods": ["generateContent", "countTokens"] },
+        { "name": "models/../../evil", "displayName": "hostile name", "supportedGenerationMethods": ["generateContent"] },
+        { "name": "models/Gemini-9.0-Flash-Lite", "displayName": "upper case", "supportedGenerationMethods": ["generateContent"] },
+        { "name": "tunedModels/gemini-9.0-flash-lite", "displayName": "not a models/ name", "supportedGenerationMethods": ["generateContent"] },
+        { "name": "models/gemini-9.1-flash-lite-realtime", "displayName": "decoy", "supportedGenerationMethods": ["generateContent"] },
+        { "name": "models/gemini-9.2-flash-lite-audio", "displayName": "decoy", "supportedGenerationMethods": ["generateContent"] },
+        { "name": "models/gemini-9.3-flash-lite-image", "displayName": "decoy", "supportedGenerationMethods": ["generateContent"] },
+        { "name": "models/gemini-9.4-flash-lite-tts", "displayName": "decoy", "supportedGenerationMethods": ["generateContent"] },
+        { "name": "models/gemini-9.5-flash-lite-transcribe", "displayName": "decoy", "supportedGenerationMethods": ["generateContent"] },
+        { "name": "models/gemini-9.6-flash-lite-search", "displayName": "decoy", "supportedGenerationMethods": ["generateContent"] },
+        { "name": "models/gemini-9.7-flash-lite-codex", "displayName": "decoy", "supportedGenerationMethods": ["generateContent"] }
+      ],
+      "nextPageToken": "page-2/+="
+    },
+    {
+      "models": [
+        { "name": "models/gemini-2.5-flash-lite", "displayName": "Flash-Lite 2.5", "supportedGenerationMethods": ["generateContent", "countTokens"], "inputTokenLimit": 1048576, "outputTokenLimit": 65536 },
+        { "name": "models/gemini-2.5-flash-lite-001", "displayName": "Flash-Lite 2.5 001", "supportedGenerationMethods": ["generateContent", "countTokens"] },
+        { "name": "models/gemini-9.8-flash-lite-pro", "displayName": "decoy", "supportedGenerationMethods": ["generateContent"] },
+        { "name": "models/gemini-9.9-flash-lite-nano", "displayName": "decoy", "supportedGenerationMethods": ["generateContent"] },
+        { "name": "models/gemini-9.10-flash-lite-oss", "displayName": "decoy", "supportedGenerationMethods": ["generateContent"] },
+        { "name": "models/gemini-9.11-flash-lite-chat-latest", "displayName": "decoy", "supportedGenerationMethods": ["generateContent"] },
+        { "name": "models/gemini-9.12-flash-lite-live", "displayName": "decoy", "supportedGenerationMethods": ["generateContent"] },
+        { "name": "models/gemini-9.13-flash-lite-native-audio", "displayName": "decoy", "supportedGenerationMethods": ["generateContent"] },
+        { "name": "models/gemini-9.14-flash-lite-embedding", "displayName": "decoy", "supportedGenerationMethods": ["generateContent"] }
+      ]
+    }
+  ],
+  "page_token_query": "pageToken=page-2%2F%2B%3D",
+  "translation": {
+    "expect": "gemini-2.5-flash-lite",
+    "tier": "Low",
+    "consent_line": "Tradução: Gemini gemini-2.5-flash-lite (custo baixo)",
+    "ranking": [
+      "gemini-2.5-flash-lite",
+      "gemini-2.5-flash-lite-001",
+      "gemini-2.0-flash-lite",
+      "gemini-2.0-flash-lite-001"
+    ]
+  },
+  "denied": {
+    "realtime": ["gpt-realtime", "gpt-4o-realtime-preview", "gemini-9.1-flash-lite-realtime"],
+    "audio": ["gpt-4o-audio-preview", "gpt-audio", "gemini-9.2-flash-lite-audio"],
+    "image": ["gemini-2.5-flash-image", "gpt-image-1", "gemini-9.3-flash-lite-image"],
+    "tts": ["gemini-2.5-flash-preview-tts", "gpt-4o-mini-tts", "gemini-9.4-flash-lite-tts"],
+    "transcribe": ["gpt-4o-transcribe", "gpt-4o-mini-transcribe", "gemini-9.5-flash-lite-transcribe"],
+    "search": ["gpt-4o-search-preview", "gemini-9.6-flash-lite-search"],
+    "codex": ["gpt-5-codex", "codex-mini-latest", "gemini-9.7-flash-lite-codex"],
+    "pro": ["gemini-2.5-pro", "gemini-9.8-flash-lite-pro"],
+    "nano": ["gpt-5-nano", "gpt-4.1-nano", "gemini-9.9-flash-lite-nano"],
+    "oss": ["gpt-oss-120b", "gpt-oss-20b", "gemini-9.10-flash-lite-oss"],
+    "chat-latest": ["gpt-5-chat-latest", "gemini-9.11-flash-lite-chat-latest"],
+    "live": ["gemini-live-2.5-flash-preview", "gemini-2.0-flash-live-001", "gemini-9.12-flash-lite-live"],
+    "native-audio": ["gemini-2.5-flash-native-audio-preview-12-2025", "gemini-9.13-flash-lite-native-audio"],
+    "embedding": ["gemini-embedding-001", "text-embedding-3-small", "gemini-9.14-flash-lite-embedding"]
+  },
+  "pins": [
+    { "pin": "gemini-2.5-pro", "model": "gemini-2.5-pro", "source": "OwnerPin", "tier": "High" },
+    { "pin": "gemini-2.0-flash-lite-001", "model": "gemini-2.0-flash-lite-001", "source": "OwnerPin", "tier": "Low" },
+    { "pin": "gemini-embedding-001", "model": "gemini-2.5-flash-lite", "source": "RuleAfterMissingPin", "tier": "Low" },
+    { "pin": "gemini-1.0-retired", "model": "gemini-2.5-flash-lite", "source": "RuleAfterMissingPin", "tier": "Low" }
+  ],
+  "tiers": {
+    "gemini-2.5-flash-lite": "Low",
+    "gpt-5-mini": "Low",
+    "claude-haiku-4-5": "Low",
+    "gemini-2.5-flash": "Medium",
+    "claude-sonnet-4-5": "Medium",
+    "gemini-2.5-pro": "High",
+    "claude-opus-4-1": "High",
+    "gemini-exp-1206": "Unknown"
+  }
+}
