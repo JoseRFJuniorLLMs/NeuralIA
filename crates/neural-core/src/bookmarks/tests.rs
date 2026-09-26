@@ -6,6 +6,7 @@ use crate::json_store::{StoreRegistry, StoreShape, StoreSpec};
 
 const CHROME_EXPORT: &str = include_str!("../../tests/fixtures/bookmarks/chrome-export.html");
 const EDGE_EXPORT: &str = include_str!("../../tests/fixtures/bookmarks/edge-export.html");
+const FIREFOX_EXPORT: &str = include_str!("../../tests/fixtures/bookmarks/firefox-export.html");
 const SPEC: StoreSpec = StoreSpec::new("bookmarks.json", StoreKind::Explicit, StoreShape::File);
 
 /// A pasta das fixtures, montada por partes (portavel).
@@ -500,6 +501,64 @@ fn caps_hold_on_every_way_in() {
         Err(OpError::TooDeep)
     );
 
+    // Importar 20 pastas encaixadas, com um favorito http em cada: todos
+    // entram. O que passa do fundo sobe para a ultima pasta que ainda leva
+    // filhos, e nenhuma pasta fica vazia no fundo.
+    let mut items: Vec<ImportedItem> = Vec::new();
+    for level in (0..20).rev() {
+        let mut children = vec![ImportedItem::Link {
+            title: format!("f{level}"),
+            url: format!("https://fundo.example/{level}"),
+            added_ms: None,
+        }];
+        children.append(&mut items);
+        items = vec![ImportedItem::Folder {
+            title: format!("p{level}"),
+            added_ms: None,
+            children,
+        }];
+    }
+    let mut deep = BookmarkTree::default();
+    let outcome = deep
+        .apply(BookmarkOp::Import {
+            folder_title: "Fundo".into(),
+            items,
+            added_ms: 1,
+        })
+        .expect("importa");
+    assert!(
+        matches!(
+            outcome,
+            OpOutcome::Imported {
+                folder: Some(_),
+                report: ImportReport {
+                    imported: 20,
+                    existing: 0,
+                    ignored: 0
+                },
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(deep.validate(), Ok(()));
+    let walk = deep.walk();
+    assert_eq!(
+        walk.iter()
+            .filter(|(_, node)| node.kind == NodeKind::Link)
+            .count(),
+        20
+    );
+    assert_eq!(walk.iter().map(|(depth, _)| *depth).max(), Some(MAX_DEPTH));
+    for (depth, node) in &walk {
+        if node.kind == NodeKind::Folder {
+            assert!(
+                !deep.children(node.id).is_empty(),
+                "pasta vazia a {depth}: {}",
+                node.title
+            );
+        }
+    }
+
     let mut full = BookmarkTree::default();
     for index in 0..MAX_NODES - 1 {
         full.nodes.push(BookmarkNode {
@@ -929,33 +988,55 @@ fn imports_are_capped_before_parsing() {
         Err(ImportError::NotNetscape)
     );
 
-    // 400 pastas encaixadas em HTML: sem estouro, e na arvore o que passa
-    // da profundidade sobe para a ultima pasta que cabe.
-    let mut html = String::from("<DL><p>");
-    for level in 0..400 {
-        html.push_str(&format!("<DT><H3>p{level}</H3><DL><p>"));
+    // Pastas encaixadas em HTML. Com 30 (a leitura segue ate
+    // `IMPORT_MAX_NESTING`), o que passa da profundidade da arvore sobe
+    // para a ultima pasta que ainda leva filhos: o favorito do fundo entra,
+    // nao e contado como ignorado. Com 400, sem estouro: a leitura para aos
+    // `IMPORT_MAX_NESTING` niveis e a arvore continua valida.
+    for levels in [30, 400] {
+        let mut html = String::from("<DL><p>");
+        for level in 0..levels {
+            html.push_str(&format!("<DT><H3>p{level}</H3><DL><p>"));
+        }
+        html.push_str("<DT><A HREF=\"https://fundo.example/\">fundo</A>");
+        let items = parse_netscape_html(html.as_bytes()).expect("html");
+        let mut tree = BookmarkTree::default();
+        let outcome = tree
+            .apply(BookmarkOp::Import {
+                folder_title: "Importado".into(),
+                items,
+                added_ms: 1,
+            })
+            .expect("importa");
+        assert!(matches!(outcome, OpOutcome::Imported { .. }));
+        assert_eq!(tree.validate(), Ok(()));
+        assert!(tree.walk().iter().all(|(depth, _)| *depth <= MAX_DEPTH));
+        if levels < IMPORT_MAX_NESTING {
+            assert!(
+                matches!(
+                    outcome,
+                    OpOutcome::Imported {
+                        folder: Some(_),
+                        report: ImportReport {
+                            imported: 1,
+                            existing: 0,
+                            ignored: 0
+                        },
+                    }
+                ),
+                "{levels}: {outcome:?}"
+            );
+        }
     }
-    html.push_str("<DT><A HREF=\"https://fundo.example/\">fundo</A>");
-    let items = parse_netscape_html(html.as_bytes()).expect("html");
-    let mut tree = BookmarkTree::default();
-    let outcome = tree
-        .apply(BookmarkOp::Import {
-            folder_title: "Importado".into(),
-            items,
-            added_ms: 1,
-        })
-        .expect("importa");
-    assert!(matches!(outcome, OpOutcome::Imported { .. }));
-    assert_eq!(tree.validate(), Ok(()));
-    assert!(tree.walk().iter().all(|(depth, _)| *depth <= MAX_DEPTH));
 }
 
 // ===================== HTML (Netscape) =====================
 
-/// Gate (critico: entrada nao confiavel): as exportacoes do Chrome e do
-/// Edge (maiusculas e minusculas, `<p>` e `<DD>` pelo meio) dao a mesma
-/// arvore que o navegador mostrava -- sub-pastas dentro de sub-pastas --,
-/// com as entidades decodificadas e as datas em ms.
+/// Gate (critico: entrada nao confiavel): as exportacoes do Chrome, do
+/// Edge e do Firefox antigo (maiusculas e minusculas, `<p>` e `<DD>` pelo
+/// meio, tambem o `<DD>` de uma pasta, que leva a `<DL>` dela para dentro
+/// dele) dao a mesma arvore que o navegador mostrava -- sub-pastas dentro
+/// de sub-pastas --, com as entidades decodificadas e as datas em ms.
 #[test]
 fn netscape_exports_of_chrome_and_edge_give_the_tree() {
     let chrome = parse_netscape_html(CHROME_EXPORT.as_bytes()).expect("chrome");
@@ -1037,6 +1118,61 @@ fn netscape_exports_of_chrome_and_edge_give_the_tree() {
             ..
         }
     ));
+
+    // O Firefox antigo: a descricao `<DD>` logo a seguir ao `<H3>` fecha o
+    // `<DT>`, e a `<DL>` da pasta fica dentro do `<DD>` (a «Barra de
+    // favoritos» e uma sub-pasta dela). O conteudo continua na pasta, e o
+    // que vem depois continua fora dela.
+    let firefox = parse_netscape_html(FIREFOX_EXPORT.as_bytes()).expect("firefox");
+    assert_eq!(counts(&firefox), (6, 3), "{firefox:?}");
+    let bar = folder_named(&firefox, "Barra de favoritos");
+    assert_eq!(bar.len(), 3, "{bar:?}");
+    assert_eq!(
+        link_of(bar, "MDN"),
+        (
+            "https://developer.mozilla.org/pt-BR/",
+            Some(1_705_305_600_000)
+        )
+    );
+    assert_eq!(
+        link_of(folder_named(bar, "Rust"), "The Rust Programming Language").0,
+        "https://doc.rust-lang.org/book/"
+    );
+    assert_eq!(
+        link_of(bar, "Hacker News").0,
+        "https://news.ycombinator.com/"
+    );
+    assert!(folder_named(&firefox, "Favoritos não organizados").is_empty());
+    assert_eq!(
+        link_of(&firefox, "Brasil").0,
+        "https://pt.wikipedia.org/wiki/Brasil"
+    );
+    assert_eq!(
+        link_of(&firefox, "Mais visitados").0,
+        "place:sort=8&maxResults=10"
+    );
+    let mut fresh = BookmarkTree::default();
+    let from_firefox = fresh
+        .apply(BookmarkOp::Import {
+            folder_title: "Importado do arquivo HTML (26/09/2026)".into(),
+            items: firefox,
+            added_ms: 1,
+        })
+        .expect("firefox");
+    assert!(
+        matches!(
+            from_firefox,
+            OpOutcome::Imported {
+                folder: Some(_),
+                report: ImportReport {
+                    imported: 5,
+                    existing: 0,
+                    ignored: 1
+                },
+            }
+        ),
+        "{from_firefox:?}"
+    );
 }
 
 /// Gate (critico: saida que outro navegador interpreta): exportar escapa

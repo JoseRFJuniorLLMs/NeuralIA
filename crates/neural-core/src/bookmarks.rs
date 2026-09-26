@@ -63,8 +63,10 @@ pub const MAX_DEPTH: usize = 16;
 pub const MAX_NODES: usize = 20_000;
 /// O maior ficheiro que a importacao le (Chrome, Edge ou HTML).
 pub const IMPORT_MAX_BYTES: u64 = 32 * 1024 * 1024;
-/// O maior encaixe de pastas que a importacao segue; abaixo disso o
-/// conteudo sobe para a ultima pasta aceite.
+/// O maior encaixe de pastas que a leitura de uma importacao segue (a
+/// pilha nunca cresce sem fim); o que vem mais abaixo fica de fora. Na
+/// arvore, o que passa de `MAX_DEPTH` sobe para a ultima pasta que ainda
+/// leva filhos.
 pub const IMPORT_MAX_NESTING: usize = 64;
 /// Quantos itens uma importacao le no maximo (antes do tecto da arvore).
 pub const IMPORT_MAX_ITEMS: usize = 100_000;
@@ -692,8 +694,11 @@ impl BookmarkTree {
                 } => {
                     let title = clean_title(&title);
                     // Fundo demais, sem nome ou sem espaco: o conteudo
-                    // entra na pasta de cima.
-                    let target = if depth < MAX_DEPTH && !title.is_empty() {
+                    // entra na pasta de cima. A pasta nova fica a
+                    // `depth + 1` e os filhos dela a `depth + 2`: so se cria
+                    // se os filhos ainda couberem (`MAX_DEPTH`), senao uma
+                    // pasta no fundo recusava cada favorito e ficava vazia.
+                    let target = if depth + 2 <= MAX_DEPTH && !title.is_empty() {
                         self.push(
                             parent,
                             NodeKind::Folder,
@@ -1266,7 +1271,8 @@ fn chromium_node(
 
 /// O HTML de favoritos que o Chrome, o Edge e o Firefox exportam
 /// («NETSCAPE-Bookmark-file-1»): `<DL>` com `<DT><H3>pasta</H3><DL>...`
-/// e `<DT><A HREF ADD_DATE>favorito</A>`. As datas vem em segundos Unix.
+/// (ou `<DT><H3>pasta</H3><DD>descricao<DL>...`, o Firefox antigo) e
+/// `<DT><A HREF ADD_DATE>favorito</A>`. As datas vem em segundos Unix.
 pub fn parse_netscape_html(bytes: &[u8]) -> Result<Vec<ImportedItem>, ImportError> {
     if bytes.len() as u64 > IMPORT_MAX_BYTES {
         return Err(ImportError::TooLarge);
@@ -1306,11 +1312,17 @@ fn netscape_list(list: ElementRef<'_>, nesting: usize, budget: &mut usize) -> Ve
             // conteudo dessa pasta.
             "dl" => {
                 let nested = netscape_list(element, nesting + 1, budget);
-                match items.last_mut() {
-                    Some(ImportedItem::Folder { children, .. }) if children.is_empty() => {
-                        children.extend(nested)
+                attach_to_last_folder(&mut items, nested);
+            }
+            // A descricao de uma pasta (`<DT><H3>..</H3><DD>texto<DL>`, o
+            // formato antigo do Firefox, na «Barra de favoritos»): o `<DD>`
+            // fecha o `<DT>`, e a `<DL>` da pasta fica dentro do `<DD>`.
+            "dd" => {
+                for list in element.children().filter_map(ElementRef::wrap) {
+                    if list.value().name() == "dl" {
+                        let nested = netscape_list(list, nesting + 1, budget);
+                        attach_to_last_folder(&mut items, nested);
                     }
-                    _ => items.extend(nested),
                 }
             }
             "p" | "div" => items.extend(netscape_list(element, nesting + 1, budget)),
@@ -1318,6 +1330,17 @@ fn netscape_list(list: ElementRef<'_>, nesting: usize, budget: &mut usize) -> Ve
         }
     }
     items
+}
+
+/// Uma `<DL>` que chegou fora do `<DT>` da pasta: e o conteudo da pasta
+/// logo antes, se ela ainda esta vazia; senao os itens ficam ao lado.
+fn attach_to_last_folder(items: &mut Vec<ImportedItem>, nested: Vec<ImportedItem>) {
+    match items.last_mut() {
+        Some(ImportedItem::Folder { children, .. }) if children.is_empty() => {
+            children.extend(nested)
+        }
+        _ => items.extend(nested),
+    }
 }
 
 /// Um `<DT>`: um favorito (`<A>`) ou uma pasta (`<H3>` e a `<DL>` dela).

@@ -25701,6 +25701,15 @@ mod bookmarks_gates {
             assert_eq!(parse(body.clone()), None, "{body}");
         }
 
+        // O botao nomeia os dois navegadores que o pedido le: numa conta so
+        // com o Edge, um clique importa o perfil do Edge sem menu.
+        assert!(
+            PANEL_HTML.contains(
+                "<button id=\"bookmarks-import-chrome\" class=\"btn\">Importar do Chrome/Edge</button>"
+            ),
+            "o botao de importar tem de nomear o Chrome e o Edge"
+        );
+
         // A pagina que embarca.
         let result = notes_gates::run_panel(&[
             "__posted.length = 0; window.neuraliaShowSection('bookmarks');".into(),
