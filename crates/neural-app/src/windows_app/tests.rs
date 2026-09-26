@@ -9383,6 +9383,11 @@ fn the_adblock_menu_follows_the_page_and_the_state() {
         }))
     ));
 
+    // Um IP ou localhost: a escolha nao se guardaria, nada do bloqueio.
+    for local in ["http://127.0.0.1:8080/", "http://localhost:3000/"] {
+        assert_eq!(labels(&respond(0, Some(local))), [LABEL_TURN_ON], "{local}");
+    }
+
     // Uma IA ou um login: cinzento, marcado como desligado, sem accao.
     for ai in ["https://chatgpt.com/c/1", "https://accounts.google.com/"] {
         let request = respond(0, Some(ai));

@@ -558,6 +558,10 @@ fn settings_keep_only_valid_sites_and_the_reserved_distraction_field() {
     assert!(clean.enabled);
     assert_eq!(clean.allow_sites.iter().collect::<Vec<_>>(), ["ok.test"]);
     assert_eq!(clean.distraction.get("ok.test"), Some(&false));
+    assert!(is_storable_site("news.example.com"));
+    for refused in ["127.0.0.1", "localhost", "Example.com", "example.com.", ""] {
+        assert!(!is_storable_site(refused), "{refused:?}");
+    }
     let empty: AdblockSettings = serde_json::from_str("{}").expect("defaults");
     assert_eq!(empty, AdblockSettings::default());
 

@@ -6,8 +6,8 @@ use std::sync::{Mutex, RwLock};
 use neural_core::adblock::{
     AdblockRules, AdblockSettings, DomainSet, ListClient, ListEndpoint, RefreshState,
     RefreshSurface, ResourceKind, SETTINGS_MAX_BYTES, SETTINGS_VERSION, STORED_LIST_MAX_BYTES,
-    STORED_LIST_VERSION, StoredList, download_on_activation, page_is_always_exempt, refresh_due,
-    site_key,
+    STORED_LIST_VERSION, StoredList, download_on_activation, is_storable_site,
+    page_is_always_exempt, refresh_due, site_key,
 };
 use neural_core::json_store::{StoreGrant, VersionedJsonStore};
 
@@ -249,7 +249,9 @@ pub(in crate::windows_app) fn adblock_menu(
         AdblockView::Off => AdblockMenu::Activate,
         _ if page_is_always_exempt(&page) => AdblockMenu::AlwaysOff,
         AdblockView::Preparing => AdblockMenu::Preparing,
-        AdblockView::Active(rules) => match site_key(&page) {
+        // Uma pagina num IP ou em `localhost`: a escolha por site nao se
+        // guardaria, por isso o bloqueio nao poe nada no menu.
+        AdblockView::Active(rules) => match site_key(&page).filter(|site| is_storable_site(site)) {
             Some(site) => AdblockMenu::Site {
                 blocking: !rules.allow_sites().contains(&site),
                 blocked,

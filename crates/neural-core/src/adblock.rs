@@ -643,6 +643,12 @@ pub struct AdblockSettings {
     pub distraction: BTreeMap<String, bool>,
 }
 
+/// Um site que a lista de permitidos pode guardar: um nome de dominio ja
+/// normalizado, com pelo menos dois rotulos (nao um IP, nem `localhost`).
+pub fn is_storable_site(site: &str) -> bool {
+    list_domain(site).is_some_and(|clean| clean == site)
+}
+
 impl AdblockSettings {
     /// Sem entradas que nao sejam um site valido (um ficheiro editado a
     /// mao) e dentro do tecto.
@@ -650,7 +656,7 @@ impl AdblockSettings {
         self.allow_sites = self
             .allow_sites
             .into_iter()
-            .filter_map(|site| list_domain(&site).filter(|clean| *clean == site))
+            .filter(|site| is_storable_site(site))
             .take(MAX_ALLOW_SITES)
             .collect();
         self
