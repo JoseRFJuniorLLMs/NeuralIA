@@ -147,7 +147,14 @@ pub(in crate::windows_app) enum UserEvent {
     /// O aviso do canto (`toast.rs`, centro de avisos `crate::notify`):
     /// um clique num botao dele ou o fim do prazo.
     Notify(NotifyEvent),
+    /// A Home de quem usa (o botao, o comando, a omnibox, a paleta, o Esc):
+    /// com downloads a correr pergunta antes (`request_home`).
     HomeRequested,
+    /// A Home da sonda do CI (a mensagem `NeuralIA.LifecycleProbe.Home`, so
+    /// com NEURALIA_LIFECYCLE_PROBE): vai a Home sem o cartao da saida, porque
+    /// o que se mede (o measure-cycles.ps1, o spike do test-downloads.ps1) e
+    /// a WebView destruida -- com o download a correr (`lifecycle_probe_home`).
+    LifecycleProbeHome,
     /// Voltar um nivel: de ecra completo para tres colunas, de la para a Home.
     BackRequested,
     /// Outra janela ficou com o rato a meio do gesto numero N na fila de

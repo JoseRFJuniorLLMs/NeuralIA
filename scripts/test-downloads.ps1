@@ -18,9 +18,11 @@ automatico de uma pagina):
    NeuralIA, a marca e ZoneId=3 sem HostUrl. O relatorio diz sempre se a
    marca que ficou leva o HostUrl (a do WebView2 pode leva-lo).
 3. /files/lento -- SPIKE, so relata (nunca falha o passo): com o download a
-   correr, a Home (a mensagem do NEURALIA_LIFECYCLE_PROBE) destroi a WebView;
-   o relatorio diz se o download acabou, quem o acabou (o WebView2 sozinho,
-   ou o gestor ao receber o WebViewGone) e com que motivo.
+   correr, a Home (a mensagem do NEURALIA_LIFECYCLE_PROBE, que no exe e o
+   LifecycleProbeHome: a Home sem o cartao da saida) destroi a WebView; o
+   relatorio diz se o download acabou, quem o acabou (o WebView2 sozinho, ou
+   o gestor ao receber o WebViewGone) e com que motivo -- ou "sem resposta"
+   quando a Home nao correu (nenhum show_home no log depois do pedido).
 
 -SelfTest confere so a leitura do spike sobre registos inventados, sem abrir
 nada (corre em qualquer maquina).
@@ -45,11 +47,21 @@ function Get-SpikeVerdict([string[]]$LogLines, [object[]]$Events, [int]$HomeLine
     $goneAt = -1
     $interruptAt = -1
     $reason = $null
+    $homeAt = -1
     for ($i = 0; $i -lt $after.Count; $i++) {
+        if ($homeAt -lt 0 -and $after[$i] -match 'show_home \(surface era') { $homeAt = $i }
         if ($goneAt -lt 0 -and $after[$i] -match 'downloads: webview \d+ destruida') { $goneAt = $i }
         if ($interruptAt -lt 0 -and $after[$i] -match 'downloads: \d+ interrompido \(motivo (\d+)\)') {
             $interruptAt = $i
             $reason = [int]$Matches[1]
+        }
+    }
+    # Sem a Home nao ha medida: a WebView nao foi destruida (antes, a Home da
+    # sonda caia no cartao da saida e o spike dizia "NAO" em falso).
+    if ($homeAt -lt 0 -and $goneAt -lt 0) {
+        return [pscustomobject]@{
+            Answer = "sem resposta"
+            Detail = "a Home pedida nao correu (nenhum show_home nem WebViewGone no log depois do pedido): a WebView nao foi destruida e nada se mediu"
         }
     }
     $aborted = @($Events | Where-Object { $_.kind -eq 'aborted' -and $_.path -eq '/files/lento' })
@@ -147,13 +159,19 @@ if ($SelfTest) {
         }
     }
     $lento = { param($kind) [pscustomobject]@{ kind = $kind; path = '/files/lento'; sent = 65536 } }
+    $homeRan = '  40 ms  show_home (surface era Web)'
     $cases = @(
         @{ Log = @('a', 'downloads: 1 interrompido (motivo 27)', 'downloads: webview 1 destruida'); Events = @(& $lento 'aborted'); Want = 'SIM, pelo WebView2' },
         @{ Log = @('a', 'downloads: webview 1 destruida', 'downloads: 1 interrompido (motivo 26)'); Events = @(& $lento 'aborted'); Want = 'SIM, pelo gestor' },
         @{ Log = @('a', 'downloads: 1 interrompido (motivo 26)', 'downloads: webview 1 destruida'); Events = @(); Want = 'SIM, pelo WebView2' },
         @{ Log = @('a', 'downloads: webview 1 destruida'); Events = @(& $lento 'aborted'); Want = 'SIM, sem StateChanged' },
-        @{ Log = @('a'); Events = @(& $lento 'finished'); Want = 'NAO' },
-        @{ Log = @('a'); Events = @(); Want = 'NAO' }
+        @{ Log = @('a', $homeRan); Events = @(& $lento 'finished'); Want = 'NAO' },
+        @{ Log = @('a', $homeRan); Events = @(); Want = 'NAO' },
+        # A Home nao correu (a sonda caiu no cartao da saida): nada se mediu,
+        # e o "NAO" de antes era falso.
+        @{ Log = @('a'); Events = @(& $lento 'finished'); Want = 'sem resposta' },
+        @{ Log = @('a'); Events = @(); Want = 'sem resposta' },
+        @{ Log = @('a', 'downloads: 1 interrompido (motivo 27)'); Events = @(& $lento 'aborted'); Want = 'sem resposta' }
     )
     foreach ($case in $cases) {
         $verdict = Get-SpikeVerdict $case.Log $case.Events 1
@@ -161,10 +179,13 @@ if ($SelfTest) {
             throw "SelfTest: '$($case.Log -join ' | ')' deu '$($verdict.Answer)', esperado '$($case.Want)'."
         }
     }
-    # Linhas de antes da Home nao contam.
-    $old = Get-SpikeVerdict @('downloads: 1 interrompido (motivo 27)', 'b') @() 1
+    # Linhas de antes da Home nao contam: nem uma interrupcao, nem o
+    # show_home do arranque.
+    $old = Get-SpikeVerdict @('downloads: 1 interrompido (motivo 27)', $homeRan) @() 1
     if ($old.Answer -ne 'NAO') { throw "SelfTest: uma linha de antes da Home contou ($($old.Answer))." }
-    Write-Host "test-downloads SelfTest: $($cases.Count + 1) casos do spike e $($motwCases.Count) da marca da Web ok."
+    $early = Get-SpikeVerdict @('  1 ms  show_home (surface era Home)', 'b') @() 1
+    if ($early.Answer -ne 'sem resposta') { throw "SelfTest: um show_home de antes da Home contou ($($early.Answer))." }
+    Write-Host "test-downloads SelfTest: $($cases.Count + 2) casos do spike e $($motwCases.Count) da marca da Web ok."
     exit 0
 }
 

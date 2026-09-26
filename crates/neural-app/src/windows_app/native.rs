@@ -478,14 +478,14 @@ pub(in crate::windows_app) unsafe extern "system" fn window_subclass(
 
             // O script faz broadcast process-wide por desenho: decorations pode
             // deixar mais de um HWND transitório vivo. Um único comando lógico
-            // não pode virar dois HomeRequested/SubmitText. Sem este filtro,
+            // não pode virar duas Homes/SubmitText. Sem este filtro,
             // um Reopen atrasado podia chegar depois da Home do ciclo seguinte
             // e recriar exactamente as três superfícies que o gate acabara de
             // derrubar.
             if nonce == 0 || seen.swap(nonce, Ordering::AcqRel) != nonce {
                 let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
                 if message == lifecycle_home {
-                    let _ = proxy.send_event(UserEvent::HomeRequested);
+                    let _ = proxy.send_event(UserEvent::LifecycleProbeHome);
                 } else {
                     let input = startup_input();
                     if !input.is_empty() {

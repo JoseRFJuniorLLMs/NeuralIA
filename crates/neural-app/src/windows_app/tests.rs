@@ -23054,6 +23054,171 @@ fn without_comment_lines(code: &str) -> String {
         .join("\n")
 }
 
+/// O codigo Rust de `source` com os comentarios (de linha, de bloco,
+/// aninhados) e os literais (strings, raw strings, bytes, chars) trocados
+/// por espacos; as quebras de linha ficam. Os gates de "quem chama X" olham
+/// so para o que compila, com qualquer formatacao: um `show_home` num
+/// comentario ou numa linha do log nao conta; um `Self::show_home` passado
+/// como funcao conta.
+fn rust_code_only(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    // Um `r` que abre uma raw string: nada de identificador antes, ou so o
+    // prefixo `b`/`c` (`br#"..."#`). Um `"` ou um `'` fora de literais abre
+    // sempre um (o prefixo `b` de `b"..."`/`b'x'` fica como codigo).
+    let starts_raw = |at: usize| {
+        at == 0
+            || !ident(chars[at - 1])
+            || (matches!(chars[at - 1], 'b' | 'c') && (at < 2 || !ident(chars[at - 2])))
+    };
+    let mut out = String::with_capacity(source.len());
+    let blank = |out: &mut String, from: usize, to: usize| {
+        for ch in &chars[from..to.min(chars.len())] {
+            out.push(if *ch == '\n' { '\n' } else { ' ' });
+        }
+    };
+    let mut at = 0;
+    while at < chars.len() {
+        let ch = chars[at];
+        let next = chars.get(at + 1).copied();
+        if ch == '/' && next == Some('/') {
+            let end = (at..chars.len())
+                .find(|index| chars[*index] == '\n')
+                .unwrap_or(chars.len());
+            blank(&mut out, at, end);
+            at = end;
+            continue;
+        }
+        if ch == '/' && next == Some('*') {
+            let mut depth = 0usize;
+            let mut end = at;
+            while end < chars.len() {
+                if chars[end] == '/' && chars.get(end + 1) == Some(&'*') {
+                    depth += 1;
+                    end += 2;
+                } else if chars[end] == '*' && chars.get(end + 1) == Some(&'/') {
+                    depth -= 1;
+                    end += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    end += 1;
+                }
+            }
+            blank(&mut out, at, end);
+            at = end;
+            continue;
+        }
+        if ch == 'r' && starts_raw(at) {
+            let mut quote = at + 1;
+            while chars.get(quote) == Some(&'#') {
+                quote += 1;
+            }
+            if chars.get(quote) == Some(&'"') {
+                let hashes = quote - at - 1;
+                let mut end = quote + 1;
+                while end < chars.len() {
+                    if chars[end] == '"'
+                        && (1..=hashes).all(|offset| chars.get(end + offset) == Some(&'#'))
+                    {
+                        end += 1 + hashes;
+                        break;
+                    }
+                    end += 1;
+                }
+                blank(&mut out, at, end);
+                at = end;
+                continue;
+            }
+        }
+        if ch == '"' {
+            let mut end = at + 1;
+            while end < chars.len() {
+                match chars[end] {
+                    '\\' => end += 2,
+                    '"' => {
+                        end += 1;
+                        break;
+                    }
+                    _ => end += 1,
+                }
+            }
+            blank(&mut out, at, end);
+            at = end;
+            continue;
+        }
+        if ch == '\'' {
+            // Um char (`'x'`, `'"'`, `'\''`, `'\u{..}'`); senao e um
+            // lifetime ou uma etiqueta (`'a`, `'static`), que ficam.
+            let end = if next == Some('\\') {
+                (at + 3..chars.len())
+                    .find(|index| chars[*index] == '\'')
+                    .map(|index| index + 1)
+            } else if chars.get(at + 2) == Some(&'\'') {
+                Some(at + 3)
+            } else {
+                None
+            };
+            if let Some(end) = end {
+                blank(&mut out, at, end);
+                at = end;
+                continue;
+            }
+        }
+        out.push(ch);
+        at += 1;
+    }
+    out
+}
+
+/// Em `code` (de `rust_code_only`): quantas vezes cada funcao chega ao
+/// metodo `name` -- `x.name(...)`, `Self::name`, `Tipo::name` passado como
+/// funcao; um metodo so se alcanca por `.` ou `::` --, pela `fn` que a
+/// contem. A declaracao `fn name` e uma variavel ou parametro com o mesmo
+/// nome nao contam; um uso fora de qualquer `fn` conta como "(fora de fn)".
+fn ident_callers(code: &str, name: &str) -> std::collections::BTreeMap<String, usize> {
+    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let whole = |at: usize, len: usize| {
+        !code[..at].chars().next_back().is_some_and(ident)
+            && !code[at + len..].chars().next().is_some_and(ident)
+    };
+    // Cada `fn nome`, pelo sitio onde comeca.
+    let mut functions = Vec::new();
+    for (at, _) in code.match_indices("fn") {
+        if !whole(at, 2) {
+            continue;
+        }
+        let rest = &code[at + 2..];
+        let gap = rest.len() - rest.trim_start().len();
+        if gap == 0 {
+            continue;
+        }
+        let function: String = rest[gap..].chars().take_while(|ch| ident(*ch)).collect();
+        if !function.is_empty() {
+            functions.push((at, function));
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for (at, _) in code.match_indices(name) {
+        let before = code[..at].trim_end();
+        let member = before.ends_with('.') || before.ends_with("::");
+        if !whole(at, name.len()) || !member {
+            continue;
+        }
+        let owner = functions
+            .iter()
+            .rev()
+            .find(|(start, _)| *start < at)
+            .map_or_else(
+                || "(fora de fn)".to_string(),
+                |(_, function)| function.clone(),
+            );
+        *out.entry(owner).or_insert(0) += 1;
+    }
+    out
+}
+
 /// Os ficheiros de `src/` fora de `windows_app/` que embarcam e podem tocar
 /// na pasta de dados.
 fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
@@ -24616,22 +24781,176 @@ mod downloads_gates {
                 }
             );
         }
+        // Que nenhum caminho salta a pergunta ate ao `show_home` ou ao `exit`
+        // prova-o `home_and_exit_callers_are_a_named_allowlist`.
+    }
 
-        // Ausencia: a Home e o fechar da janela nunca saltam a pergunta --
-        // nenhum braco vai direto ao `show_home` nem ao `exit` sem o
-        // `leave_guard`.
-        let source = shipped_source();
-        for skipped in [
-            "UserEvent::HomeRequested => self.show_home()",
-            "Some(BarHit::Home) => self.show_home()",
-            "PaletteRoute::Home => self.show_home()",
-            "Ok(Intent::Home) => self.show_home()",
-            "UserEvent::ExitRequested => {
-                self.save_notes_draft_before_exit();",
-            "WindowEvent::CloseRequested => {
-                self.save_notes_draft_before_exit();",
-        ] {
-            assert!(!source.contains(skipped), "sem a pergunta: {skipped}");
+    /// Gate critico (a saida que protege quem usa; DLUI-2, DLUI-3): quem
+    /// chama o `show_home` (destroi a Web completa, as colunas, a fonte e os
+    /// paineis -- e os downloads deles) e o `exit` da janela e uma lista com
+    /// nome, contada por ficheiro e por funcao sobre o codigo que compila
+    /// (comentarios e literais fora, `rust_code_only`), nao sobre o texto de
+    /// uma linha: um caller novo ou reescrito -- `{ self.show_home(); }` no
+    /// braco do `HomeRequested`, o Ctrl+L de volta ao `show_home`, um
+    /// `Self::show_home` passado como funcao -- muda a conta e fica vermelho,
+    /// com qualquer formatacao.
+    #[test]
+    fn home_and_exit_callers_are_a_named_allowlist() {
+        // O scanner consegue falhar: o que esta em comentarios, strings, raw
+        // strings e chars nao conta, nem um parametro com o mesmo nome; a
+        // chamada e a funcao passada contam.
+        let sample = r##"
+fn a(&mut self) {
+    // self.show_home()
+    /* self.show_home() /* aninhado */ self.show_home() */
+    debug_log("show_home (surface era {:?})");
+    let raw = r#"self.show_home() "aspas" "#;
+    let quote = '"';
+    let bytes = b'"';
+    self.show_home();
+}
+fn show_home(&mut self) {}
+fn b<'a>(&'a mut self, show_home: bool) -> &'a str {
+    let go = Self::show_home;
+    "}"
+}
+"##;
+        assert_eq!(
+            ident_callers(&rust_code_only(sample), "show_home"),
+            BTreeMap::from([("a".to_string(), 1), ("b".to_string(), 1)])
+        );
+
+        // Os ficheiros que embarcam na arvore `windows_app/` (sem os testes).
+        let mut files = vec![(
+            "windows_app.rs",
+            rust_code_only(&code_without_tests(include_str!("../windows_app.rs"))),
+        )];
+        for (name, content) in ALL_MODULES {
+            if *name != "tests.rs" {
+                files.push((name, rust_code_only(&code_without_tests(content))));
+            }
+        }
+        // O lexer nao se perdeu em nenhum literal: as chavetas e os
+        // parenteses do que sobra fecham, ficheiro a ficheiro.
+        for (name, code) in &files {
+            for (open, close) in [('{', '}'), ('(', ')')] {
+                assert_eq!(
+                    code.matches(open).count(),
+                    code.matches(close).count(),
+                    "{name}: `rust_code_only` perdeu-se num literal ({open}{close})"
+                );
+            }
+        }
+
+        // (ficheiro, funcao, quantas vezes, porque).
+        type Site = (&'static str, &'static str, usize, &'static str);
+        let allow: [(&str, &[Site]); 5] = [
+            (
+                "show_home",
+                &[
+                    (
+                        "downloads_ui.rs",
+                        "request_home",
+                        1,
+                        "a Home de quem usa, depois do leave_guard",
+                    ),
+                    (
+                        "downloads_ui.rs",
+                        "leave_confirmed",
+                        1,
+                        "o «Cancelar e sair» armado, com os downloads ja cancelados",
+                    ),
+                    (
+                        "downloads_ui.rs",
+                        "lifecycle_probe_home",
+                        1,
+                        "a sonda do CI, so com NEURALIA_LIFECYCLE_PROBE",
+                    ),
+                    (
+                        "clear_history.rs",
+                        "clear",
+                        1,
+                        "o «Apagar histórico» confirmado (limite conhecido, CHANGELOG)",
+                    ),
+                    (
+                        "app/chrome.rs",
+                        "report_history_cleared",
+                        1,
+                        "o fim do «Apagar histórico» (idem)",
+                    ),
+                ],
+            ),
+            (
+                "exit",
+                &[
+                    ("downloads_ui.rs", "exit_now", 1, "a unica saida da janela"),
+                    (
+                        "app/event_loop.rs",
+                        "resumed",
+                        1,
+                        "a janela nem chegou a existir: nada corre",
+                    ),
+                    (
+                        "app/panels.rs",
+                        "save_notes_draft_before_exit",
+                        1,
+                        "o SidePanel::exit (o rascunho das notas), nao a janela",
+                    ),
+                ],
+            ),
+            (
+                "exit_now",
+                &[
+                    (
+                        "downloads_ui.rs",
+                        "request_close",
+                        1,
+                        "depois do leave_guard",
+                    ),
+                    (
+                        "downloads_ui.rs",
+                        "leave_confirmed",
+                        1,
+                        "o «Cancelar e sair» armado",
+                    ),
+                ],
+            ),
+            (
+                "leave_confirmed",
+                &[(
+                    "downloads_ui.rs",
+                    "downloads_ui_event",
+                    1,
+                    "so a resposta do cartao pintado",
+                )],
+            ),
+            (
+                "lifecycle_probe_home",
+                &[(
+                    "app/event_loop.rs",
+                    "user_event",
+                    1,
+                    "o braco UserEvent::LifecycleProbeHome",
+                )],
+            ),
+        ];
+        for (ident, sites) in allow {
+            let mut found = BTreeMap::new();
+            for (name, code) in &files {
+                for (function, count) in ident_callers(code, ident) {
+                    found.insert((name.to_string(), function), count);
+                }
+            }
+            let expected: BTreeMap<(String, String), usize> = sites
+                .iter()
+                .map(|(file, function, count, _why)| {
+                    ((file.to_string(), function.to_string()), *count)
+                })
+                .collect();
+            assert_eq!(
+                found, expected,
+                "quem chama `{ident}` mudou: um caller novo passa pelo `request_home`/`request_close` ou entra na lista com o porque (e no CHANGELOG, se salta a pergunta)"
+            );
         }
     }
 

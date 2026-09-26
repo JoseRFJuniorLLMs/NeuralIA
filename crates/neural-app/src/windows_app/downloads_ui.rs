@@ -1442,14 +1442,15 @@ pub(in crate::windows_app) fn download_changed(
 }
 
 impl App {
-    /// O braco `UserEvent::DownloadsUi`. `Some(kind)`: o «Cancelar e sair»
-    /// foi confirmado e a janela sai por `kind` (quem sabe sair e o event
-    /// loop).
+    /// O braco `UserEvent::DownloadsUi`. Quando o «Cancelar e sair» armado
+    /// foi confirmado, a janela sai ja por onde o cartao disse
+    /// (`leave_confirmed`).
     pub(in crate::windows_app) fn downloads_ui_event(
         &mut self,
+        event_loop: &ActiveEventLoop,
         event: DownloadsUiEvent,
-    ) -> Option<LeaveKind> {
-        match event {
+    ) {
+        let leave = match event {
             DownloadsUiEvent::Show => {
                 self.toggle_downloads_panel();
                 None
@@ -1460,7 +1461,36 @@ impl App {
             DownloadsUiEvent::CardExpired(token) => {
                 self.download_card(DownloadCardInput::Expire(token))
             }
+        };
+        if let Some(kind) = leave {
+            self.leave_confirmed(event_loop, kind);
         }
+    }
+
+    /// Sair por `kind` depois do «Cancelar e sair» armado: o cartao ja
+    /// cancelou cada download (`download_card_step`). So o
+    /// `downloads_ui_event` chama isto (gate
+    /// `home_and_exit_callers_are_a_named_allowlist`).
+    fn leave_confirmed(&mut self, event_loop: &ActiveEventLoop, kind: LeaveKind) {
+        match kind {
+            LeaveKind::Home => self.show_home(),
+            LeaveKind::Close => self.exit_now(event_loop),
+        }
+    }
+
+    /// Fechar a janela (o X, Alt+F4, o comando Sair): com downloads a
+    /// correr, pergunta antes (`leave_guard`); sem nada a correr, sai ja.
+    pub(in crate::windows_app) fn request_close(&mut self, event_loop: &ActiveEventLoop) {
+        if self.leave_guard(LeaveKind::Close) {
+            self.exit_now(event_loop);
+        }
+    }
+
+    /// A unica saida da janela: o rascunho das notas vai para o disco e o
+    /// event loop acaba. So `request_close` e `leave_confirmed` a chamam.
+    fn exit_now(&mut self, event_loop: &ActiveEventLoop) {
+        self.save_notes_draft_before_exit();
+        event_loop.exit();
     }
 
     /// Uma volta do cartao e o que ela pede.
@@ -1522,6 +1552,19 @@ impl App {
         }
         self.show_home();
         true
+    }
+
+    /// A Home da sonda do CI (`UserEvent::LifecycleProbeHome`): sem o
+    /// cartao, porque o que o measure-cycles.ps1 e o spike do
+    /// test-downloads.ps1 medem e a WebView destruida -- no spike, com o
+    /// download a correr. Sem NEURALIA_LIFECYCLE_PROBE e uma Home como as
+    /// outras, com a pergunta.
+    pub(in crate::windows_app) fn lifecycle_probe_home(&mut self) {
+        if lifecycle_probe_enabled() {
+            self.show_home();
+        } else {
+            self.request_home();
+        }
     }
 
     /// Depois de cada volta do gestor: os avisos para o toast, a pergunta

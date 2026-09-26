@@ -528,9 +528,22 @@ the manager shows:
   the window would end running downloads, `leave_decision`'s "N download(s)
   em andamento (x.zip, 43%)." with "Continuar baixando" (stays, at once)
   and "Cancelar e sair" (armed: cancels each download, then leaves).
+  Every Home the user asks for goes through `request_home` (the bar's Home,
+  the Home command, Esc in the omnibox, a typed or palette Home, Ctrl+L,
+  Ctrl+K and Ctrl+N outside the comparator, the book's Close) and every
+  window close through `request_close` (the bar's X, Alt+F4, the Exit
+  command). `show_home` and the window's `exit` are reached only from a
+  named list of functions, counted per file and function over the code with
+  comments and literals removed. Known exceptions in that list: a confirmed
+  "Apagar histórico" goes Home and ends running downloads without the card,
+  and the CI lifecycle probe (`NEURALIA_LIFECYCLE_PROBE` only) goes Home
+  without it, because the downloads spike measures the destroyed WebView.
+  Leaving the comparator for the Reader, a PDF or the full Web still ends
+  the downloads of the pages it closes without asking.
 
 Gates: `abrir_goes_only_through_default_app_target`,
 `panel_downloads_messages_carry_ids_only`, `leave_decision_table`,
+`home_and_exit_callers_are_a_named_allowlist`,
 `program_card_answers_the_deferral`,
 `ctrl_j_is_the_downloads_command_and_nothing_else`,
 `downloads_slot_fits_or_vanishes`, `download_notice_texts` and
