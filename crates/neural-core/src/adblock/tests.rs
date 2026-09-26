@@ -557,7 +557,8 @@ fn settings_keep_only_valid_sites_and_the_reserved_distraction_field() {
     let clean = loaded.sanitized();
     assert!(clean.enabled);
     assert_eq!(clean.allow_sites.iter().collect::<Vec<_>>(), ["ok.test"]);
-    assert_eq!(clean.distraction.get("ok.test"), Some(&false));
+    assert_eq!(clean.distraction.sites.get("ok.test"), Some(&false));
+    assert!(clean.distraction.default_on);
     assert!(is_storable_site("news.example.com"));
     for refused in ["127.0.0.1", "localhost", "Example.com", "example.com.", ""] {
         assert!(!is_storable_site(refused), "{refused:?}");

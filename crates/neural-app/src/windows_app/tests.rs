@@ -8315,22 +8315,28 @@ fn ai_columns_and_the_split_get_the_auto_scroll_menu_item() {
                 .map(|item| item.id)
                 .collect();
             // A rolagem primeiro; depois o bloqueio de anuncios (nao na
-            // fonte privada) e, no fim, «Traduzir página» (translation).
+            // fonte privada), «Traduzir página» (translation) e, no fim,
+            // «Ocultar distrações neste site» (anti-distracao).
             let mut expected = vec![COLUMN_MENU_AUTO_SCROLL];
             if !matches!(host, WebViewHost::PrivateSplit(_)) {
                 expected.extend([ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF]);
             }
-            expected.push(MENU_TRANSLATE_PAGE);
+            expected.extend([MENU_TRANSLATE_PAGE, DISTRACTION_MENU_SITE]);
             assert_eq!(ids, expected, "{host:?}");
             assert_eq!(webview_hooks(host).menu, ids, "{host:?}: a tabela diverge");
         }
     }
-    // A Web completa nao rola sozinha, mas tem o bloqueio de anuncios e
-    // traduz-se: sem o item de rolagem.
+    // A Web completa nao rola sozinha, mas tem o bloqueio de anuncios,
+    // traduz-se e tem a anti-distracao: sem o item de rolagem.
     assert_eq!(context_menu_column(WebViewHost::External), None);
     assert_eq!(
         webview_hooks(WebViewHost::External).menu,
-        [ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF, MENU_TRANSLATE_PAGE]
+        [
+            ADBLOCK_MENU_SITE,
+            ADBLOCK_MENU_OFF,
+            MENU_TRANSLATE_PAGE,
+            DISTRACTION_MENU_SITE
+        ]
     );
     for host in WebViewHost::ALL
         .into_iter()
@@ -8377,7 +8383,7 @@ fn each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r() {
             WebViewHost::PrivateSplit(col),
         ] {
             let flag = SharedFlag::default();
-            let respond = webview_menu_responder(host, flag.clone(), None);
+            let respond = webview_menu_responder(host, flag.clone(), None, None);
 
             let first = respond(7, None);
             assert_eq!(first.separator_at, Some(7), "{host:?}");
@@ -8423,7 +8429,7 @@ fn each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r() {
             // A pilula usa o mesmo responder, sem itens nativos: o id que o
             // TrackPopupMenu devolve e o do comando, e so esse faz algo.
             flag.set(false);
-            let pill = webview_menu_responder(host, flag.clone(), None)(0, None);
+            let pill = webview_menu_responder(host, flag.clone(), None, None)(0, None);
             let item = pill
                 .item(COLUMN_MENU_AUTO_SCROLL)
                 .expect("o item da pilula");
@@ -8440,7 +8446,7 @@ fn each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r() {
     // Um hospedeiro que nao rola: nem separador nem itens, com nativos ou
     // sem eles -- o menu do WebView2 fica como veio.
     for host in [WebViewHost::SidePanel, WebViewHost::Reader] {
-        let respond = webview_menu_responder(host, SharedFlag::default(), None);
+        let respond = webview_menu_responder(host, SharedFlag::default(), None, None);
         for native in [0, 7] {
             let request = respond(native, None);
             assert_eq!(request.separator_at, None, "{host:?} {native}");
@@ -8481,6 +8487,8 @@ struct RecordingRegistrar {
     accelerators: Vec<WebViewHost>,
     downloads: Vec<WebViewHost>,
     gates: Vec<WebViewHost>,
+    /// O script contra distracoes pedido para cada hospedeiro.
+    distractions: Vec<(WebViewHost, &'static str)>,
     fail_menu: bool,
     fail_accelerators: bool,
     fail_downloads: bool,
@@ -8514,6 +8522,10 @@ impl HookRegistrar for RecordingRegistrar {
             return Err("add_WebResourceRequested falhou: E_FAIL".to_string());
         }
         self.gates.push(host);
+        Ok(())
+    }
+    fn distraction(&mut self, host: WebViewHost, script: &'static str) -> Result<(), String> {
+        self.distractions.push((host, script));
         Ok(())
     }
 }
@@ -8561,7 +8573,8 @@ impl HookedWebViewBuilder for RecordedHookedBuilder {
 /// Gmail recusam-nos. Cada hospedeiro tem a sua cadeia de navegacao, todos
 /// recebem o AcceleratorKeyPressed, o despachante de recursos e o do
 /// bloqueio de anuncios so nas colunas, na fonte ao lado (nao a privada) e
-/// na Web completa, e o slot das distracoes esta vazio.
+/// na Web completa, e o script contra distracoes (anti-distracao) so nas
+/// colunas, nas fontes ao lado (normal e privada) e na Web completa.
 #[test]
 fn the_webview_hooks_table() {
     use DownloadPolicy::{Deny, Managed};
@@ -8573,18 +8586,24 @@ fn the_webview_hooks_table() {
             resource_gate: gate,
             nav_gate: NavGate::Web,
             accelerators: true,
-            distraction: None,
+            distraction: Some(NEURALIA_DISTRACTION_SCRIPT),
         };
-    // A rolagem, o bloqueio de anuncios e «Traduzir página» (translation),
-    // pela ordem do registo.
+    // A rolagem, o bloqueio de anuncios, «Traduzir página» (translation) e
+    // «Ocultar distrações neste site», pela ordem do registo.
     let scroll_adblock_translate = [
         COLUMN_MENU_AUTO_SCROLL,
         ADBLOCK_MENU_SITE,
         ADBLOCK_MENU_OFF,
         MENU_TRANSLATE_PAGE,
+        DISTRACTION_MENU_SITE,
     ];
-    let adblock = [ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF];
-    let adblock_translate = [ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF, MENU_TRANSLATE_PAGE];
+    let adblock = [ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF, DISTRACTION_MENU_SITE];
+    let adblock_translate = [
+        ADBLOCK_MENU_SITE,
+        ADBLOCK_MENU_OFF,
+        MENU_TRANSLATE_PAGE,
+        DISTRACTION_MENU_SITE,
+    ];
     for col in 0..COMPARATOR_COLUMNS {
         assert_eq!(
             webview_hooks(WebViewHost::Column(col)),
@@ -8597,7 +8616,11 @@ fn the_webview_hooks_table() {
         assert_eq!(
             webview_hooks(WebViewHost::PrivateSplit(col)),
             gated(
-                &[COLUMN_MENU_AUTO_SCROLL, MENU_TRANSLATE_PAGE],
+                &[
+                    COLUMN_MENU_AUTO_SCROLL,
+                    MENU_TRANSLATE_PAGE,
+                    DISTRACTION_MENU_SITE
+                ],
                 Managed,
                 Open
             )
@@ -8693,6 +8716,27 @@ fn every_webview_gets_the_hooks() {
         if context_menu_column(host).is_some() || host == WebViewHost::External {
             expected.push(MENU_TRANSLATE_PAGE);
         }
+        // A anti-distracao: o item do menu e o script, so nas colunas, nas
+        // fontes ao lado (normal e privada) e na Web completa.
+        let web = matches!(
+            host,
+            WebViewHost::Column(_)
+                | WebViewHost::Split(_)
+                | WebViewHost::PrivateSplit(_)
+                | WebViewHost::External
+        );
+        if web {
+            expected.push(DISTRACTION_MENU_SITE);
+        }
+        assert_eq!(
+            registrar.distractions,
+            if web {
+                vec![(host, NEURALIA_DISTRACTION_SCRIPT)]
+            } else {
+                vec![]
+            },
+            "{host:?}: o script contra distracoes"
+        );
         if expected.is_empty() {
             assert!(
                 registrar.menus.is_empty(),
@@ -9550,7 +9594,7 @@ fn the_adblock_menu_follows_the_page_and_the_state() {
         blocked: Arc::clone(&blocked),
     };
     let host = WebViewHost::Column(1);
-    let respond = webview_menu_responder(host, SharedFlag::default(), Some(source));
+    let respond = webview_menu_responder(host, SharedFlag::default(), Some(source), None);
     let labels = |request: &MenuRequest| -> Vec<String> {
         request
             .items
@@ -9681,7 +9725,12 @@ fn the_adblock_menu_follows_the_page_and_the_state() {
     }
 
     // A fonte privada e os outros hospedeiros nao tem o bloqueio no menu.
-    let private = webview_menu_responder(WebViewHost::PrivateSplit(1), SharedFlag::default(), None);
+    let private = webview_menu_responder(
+        WebViewHost::PrivateSplit(1),
+        SharedFlag::default(),
+        None,
+        None,
+    );
     assert_eq!(
         labels(&private(0, Some("https://news.site.test/a"))),
         [LABEL_TURN_ON, TRANSLATE_PAGE_LABEL]
@@ -28272,6 +28321,7 @@ fn translate_page_labels_are_not_the_selection_bar_translate() {
     let flags = MenuFlags {
         auto_scroll: true,
         adblock: AdblockMenu::Hidden,
+        distraction: None,
     };
     assert_eq!(
         (item.view)(WebViewHost::Column(0), &flags).map(|view| view.label),
@@ -29571,5 +29621,1551 @@ mod bookmarks_gates {
                 "{hit:?}"
             );
         }
+    }
+}
+
+// ===================== anti-distracao (plano 2.4, §7) =====================
+
+mod distraction_gates {
+    use super::*;
+    use crate::stores::ADBLOCK_SETTINGS_STORE;
+    use neural_core::distraction::{
+        CMP_RULES, DistractionPolicy, DistractionSurface, SiteChange, distraction_config,
+    };
+    use neural_core::json_store::StoreRegistry;
+    use neural_core::search::{ProviderId, login_hosts};
+    use serde_json::{Value, json};
+
+    /// O DOM do harness da anti-distracao, criado DENTRO do contexto do
+    /// `node:vm` (os prototipos que a "pagina" envenena sao os dele):
+    /// elementos com atributos, `css` computado e `rect` da fixture, estilo
+    /// inline (`setProperty`), `innerText` visivel, shadow roots abertas,
+    /// um motor de seletores (`#id`, `.classe`, `tag`, `*`, `[a]`,
+    /// `[a="v"]`, `^=`, `*=`, `$=`, descendente e `>`), `NodeList`,
+    /// `DOMRect` com getters no prototipo, `MutationObserver` que so entrega
+    /// no `__flush`, temporizadores e `performance.now` num relogio virtual
+    /// (`styleCost` ms por leitura de estilo computado). O mock usa as suas
+    /// copias das primitivas: o que a pagina troca nao lhe muda nada.
+    const DISTRACTION_HARNESS: &str = r###"
+const vm = require('node:vm');
+function MOCK() {
+  var g = globalThis;
+  var U = Function.prototype.bind.bind(Function.prototype.call);
+  var $push = U(Array.prototype.push);
+  var $hasOwn = U(Object.prototype.hasOwnProperty);
+  var $slice = U(String.prototype.slice);
+  var $lower = U(String.prototype.toLowerCase);
+  var $indexOf = U(String.prototype.indexOf);
+  var $call = U(Function.prototype.call);
+  var $String = String;
+  var $assign = Object.assign;
+  var $stringify = JSON.stringify;
+  var log = { clicks: [], pageClicks: [], posted: [], errors: [], network: [], timersRun: 0, maxSpent: 0 };
+  var state = { clock: 0, styleCost: 0, timers: [], observers: [] };
+  g.__log = log;
+  g.__state = state;
+  g.__push = $push;
+
+  function isIdent(ch) {
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+      ch === '-' || ch === '_';
+  }
+  function isSpace(ch) { return ch === ' ' || ch === '\n' || ch === '\t'; }
+  function parseCompound(text) {
+    var c = { tag: null, ids: [], classes: [], attrs: [] };
+    var i = 0, n = text.length;
+    while (i < n) {
+      var ch = text[i];
+      if (ch === '#' || ch === '.') {
+        var j = i + 1;
+        while (j < n && isIdent(text[j])) j++;
+        if (ch === '#') $push(c.ids, $slice(text, i + 1, j)); else $push(c.classes, $slice(text, i + 1, j));
+        i = j;
+      } else if (ch === '[') {
+        var end = $indexOf(text, ']', i);
+        if (end < 0) throw new SyntaxError('seletor: ' + text);
+        var body = $slice(text, i + 1, end);
+        var k = 0;
+        while (k < body.length && isIdent(body[k])) k++;
+        var attr = { name: $slice(body, 0, k), op: null, value: null };
+        if (k < body.length) {
+          var op = body[k] === '=' ? '=' : $slice(body, k, k + 2);
+          if (op !== '=' && op !== '^=' && op !== '*=' && op !== '$=') throw new SyntaxError('operador: ' + text);
+          var rest = $slice(body, k + op.length);
+          var quote = rest[0];
+          attr.op = op;
+          attr.value = (quote === '"' || quote === "'") ? $slice(rest, 1, rest.length - 1) : rest;
+        }
+        $push(c.attrs, attr);
+        i = end + 1;
+      } else if (ch === '*') {
+        c.tag = '*';
+        i++;
+      } else if (isIdent(ch)) {
+        var t = i;
+        while (t < n && isIdent(text[t])) t++;
+        c.tag = $lower($slice(text, i, t));
+        i = t;
+      } else {
+        throw new SyntaxError('seletor nao suportado: ' + text);
+      }
+    }
+    return c;
+  }
+  function parseSelector(selector) {
+    var parts = [], depth = 0, quote = null, start = 0, i;
+    for (i = 0; i < selector.length; i++) {
+      var ch = selector[i];
+      if (quote) { if (ch === quote) quote = null; continue; }
+      if (ch === '"' || ch === "'") quote = ch;
+      else if (ch === '[') depth++;
+      else if (ch === ']') depth--;
+      else if (ch === ',' && depth === 0) { $push(parts, $slice(selector, start, i)); start = i + 1; }
+    }
+    $push(parts, $slice(selector, start));
+    var out = [];
+    for (var p = 0; p < parts.length; p++) {
+      var st = { seq: [], cur: '', pending: null };
+      var text = parts[p], dep = 0, qt = null;
+      var end = function () {
+        if (!st.cur.length) return;
+        $push(st.seq, { comb: st.seq.length ? (st.pending || ' ') : null, c: parseCompound(st.cur) });
+        st.cur = '';
+        st.pending = null;
+      };
+      for (i = 0; i < text.length; i++) {
+        var c2 = text[i];
+        if (qt) { st.cur += c2; if (c2 === qt) qt = null; continue; }
+        if (c2 === '"' || c2 === "'") { qt = c2; st.cur += c2; continue; }
+        if (dep === 0 && isSpace(c2)) { end(); continue; }
+        if (dep === 0 && c2 === '>') { end(); st.pending = '>'; continue; }
+        if (c2 === '[') dep++;
+        if (c2 === ']') dep--;
+        st.cur += c2;
+      }
+      end();
+      if (!st.seq.length) throw new SyntaxError('seletor vazio: ' + selector);
+      $push(out, st.seq);
+    }
+    return out;
+  }
+  function attrOf(el, name) {
+    return $hasOwn(el.__attrs, name) ? $String(el.__attrs[name]) : null;
+  }
+  function hasClass(cls, name) {
+    var i = 0;
+    while (i < cls.length) {
+      while (i < cls.length && cls[i] === ' ') i++;
+      var j = i;
+      while (j < cls.length && cls[j] !== ' ') j++;
+      if (j > i && $slice(cls, i, j) === name) return true;
+      i = j;
+    }
+    return false;
+  }
+  function matchCompound(el, c) {
+    if (!el || el.__type !== 1) return false;
+    if (c.tag && c.tag !== '*' && el.__tag !== c.tag) return false;
+    var i;
+    for (i = 0; i < c.ids.length; i++) if (attrOf(el, 'id') !== c.ids[i]) return false;
+    var cls = attrOf(el, 'class');
+    for (i = 0; i < c.classes.length; i++) if (cls === null || !hasClass(cls, c.classes[i])) return false;
+    for (i = 0; i < c.attrs.length; i++) {
+      var a = c.attrs[i], v = attrOf(el, a.name);
+      if (v === null) return false;
+      if (a.op === '=' && v !== a.value) return false;
+      if (a.op === '^=' && !(a.value.length && $indexOf(v, a.value) === 0)) return false;
+      if (a.op === '*=' && !(a.value.length && $indexOf(v, a.value) >= 0)) return false;
+      if (a.op === '$=' && !(a.value.length && v.length >= a.value.length &&
+          $slice(v, v.length - a.value.length) === a.value)) return false;
+    }
+    return true;
+  }
+  function matchSeq(el, seq, index) {
+    if (!matchCompound(el, seq[index].c)) return false;
+    if (index === 0) return true;
+    var parent = el.parentNode;
+    if (seq[index].comb === '>') return !!parent && parent.__type === 1 && matchSeq(parent, seq, index - 1);
+    for (var a = parent; a && a.__type === 1; a = a.parentNode) if (matchSeq(a, seq, index - 1)) return true;
+    return false;
+  }
+  function qsa(root, selector) {
+    var seqs = parseSelector($String(selector));
+    var items = [];
+    var walk = function (node) {
+      for (var i = 0; i < node.childNodes.length; i++) {
+        var child = node.childNodes[i];
+        if (child.__type !== 1) continue;
+        for (var s = 0; s < seqs.length; s++) {
+          if (matchSeq(child, seqs[s], seqs[s].length - 1)) { $push(items, child); break; }
+        }
+        walk(child);
+      }
+    };
+    walk(root);
+    return new g.NodeList(items);
+  }
+  var DEFAULTS = { position: 'static', display: 'block', visibility: 'visible', overflow: 'visible',
+    'overflow-y': 'visible', 'z-index': 'auto' };
+  function computedValue(el, name) {
+    if ($hasOwn(el.__inline, name)) return el.__inline[name];
+    if ($hasOwn(el.__css, name)) return $String(el.__css[name]);
+    if (name === 'overflow-y' && $hasOwn(el.__css, 'overflow')) return $String(el.__css.overflow);
+    return $hasOwn(DEFAULTS, name) ? DEFAULTS[name] : '';
+  }
+  function text(node) {
+    var out = '';
+    for (var i = 0; i < node.childNodes.length; i++) {
+      var child = node.childNodes[i];
+      if (child.__type === 3) out += child.data;
+      else if (child.__type === 1 && computedValue(child, 'display') !== 'none') {
+        var inner = text(child);
+        if (inner.length) out += (out.length ? ' ' : '') + inner;
+      }
+    }
+    return out;
+  }
+  function nameOf(el) {
+    return attrOf(el, 'data-fixture') || attrOf(el, 'id') || attrOf(el, 'class') || el.__tag;
+  }
+  function mutated(parent, child) {
+    for (var o = 0; o < state.observers.length; o++) {
+      var obs = state.observers[o];
+      for (var t = 0; t < obs.__targets.length; t++) {
+        var target = obs.__targets[t], hit = target.target === parent;
+        if (!hit && target.subtree) {
+          for (var a = parent; a; a = a.parentNode) if (a === target.target) { hit = true; break; }
+        }
+        if (hit) { $push(obs.__pending, new g.MutationRecord(parent, [child])); break; }
+      }
+    }
+  }
+
+  g.EventTarget = class EventTarget {
+    addEventListener(type, handler) {
+      if (!this.__listeners) this.__listeners = [];
+      $push(this.__listeners, { type: $String(type), handler: handler });
+    }
+    removeEventListener() {}
+  };
+  g.Node = class Node extends g.EventTarget {
+    constructor() { super(); this.parentNode = null; this.childNodes = []; }
+    get nodeType() { return this.__type; }
+    contains(other) {
+      for (var n = other; n; n = n.parentNode) if (n === this) return true;
+      return false;
+    }
+    appendChild(child) {
+      child.parentNode = this;
+      $push(this.childNodes, child);
+      mutated(this, child);
+      return child;
+    }
+  };
+  g.Text = class Text extends g.Node {
+    constructor(value) { super(); this.__type = 3; this.data = $String(value); }
+  };
+  g.Element = class Element extends g.Node {
+    constructor(tag, attrs) {
+      super();
+      this.__type = 1;
+      this.__tag = tag;
+      this.__attrs = attrs || {};
+      this.__css = {};
+      this.__inline = {};
+      this.__priority = {};
+      this.__rect = null;
+      this.__shadow = null;
+      this.__scrollHeight = 0;
+      this.__clientHeight = 0;
+      this.__clientWidth = 0;
+    }
+    get localName() { return this.__tag; }
+    getAttribute(name) { return attrOf(this, $String(name)); }
+    querySelectorAll(selector) { return qsa(this, selector); }
+    getBoundingClientRect() {
+      var r = this.__rect || [0, 0, 0, 0];
+      return new g.DOMRect(r[0], r[1], r[2], r[3]);
+    }
+    get shadowRoot() { return this.__shadow && this.__shadow.__open ? this.__shadow : null; }
+    get scrollHeight() { return this.__scrollHeight; }
+    get clientHeight() { return this.__clientHeight; }
+    get clientWidth() { return this.__clientWidth; }
+  };
+  g.HTMLElement = class HTMLElement extends g.Element {
+    get style() {
+      if (!this.__styleDecl) this.__styleDecl = new g.CSSStyleDeclaration(this, true);
+      return this.__styleDecl;
+    }
+    get innerText() { return text(this); }
+    click() { $push(log.clicks, nameOf(this)); }
+  };
+  g.CSSStyleDeclaration = class CSSStyleDeclaration {
+    constructor(el, inline) { this.__el = el; this.__isInline = inline; }
+    setProperty(name, value, priority) {
+      if (!this.__isInline) throw new Error('estilo computado e so leitura');
+      this.__el.__inline[$String(name)] = $String(value);
+      this.__el.__priority[$String(name)] = $String(priority || '');
+    }
+    getPropertyValue(name) {
+      name = $String(name);
+      if (this.__isInline) return $hasOwn(this.__el.__inline, name) ? this.__el.__inline[name] : '';
+      state.clock += state.styleCost;
+      return computedValue(this.__el, name);
+    }
+  };
+  g.DocumentFragment = class DocumentFragment extends g.Node {
+    querySelectorAll(selector) { return qsa(this, selector); }
+  };
+  g.ShadowRoot = class ShadowRoot extends g.DocumentFragment {
+    constructor(host, open) { super(); this.__type = 11; this.host = host; this.__open = open; }
+  };
+  g.Document = class Document extends g.Node {
+    constructor() { super(); this.__type = 9; this.__ready = 'loading'; this.__active = null; }
+    get documentElement() {
+      for (var i = 0; i < this.childNodes.length; i++) if (this.childNodes[i].__type === 1) return this.childNodes[i];
+      return null;
+    }
+    get body() {
+      var de = this.documentElement;
+      if (!de) return null;
+      for (var i = 0; i < de.childNodes.length; i++) if (de.childNodes[i].__tag === 'body') return de.childNodes[i];
+      return null;
+    }
+    get readyState() { return this.__ready; }
+    get activeElement() { return this.__active || this.body; }
+    querySelectorAll(selector) { return qsa(this, selector); }
+  };
+  g.NodeList = class NodeList {
+    constructor(items) { this.__items = items; }
+    get length() { return this.__items.length; }
+    item(index) { return index < this.__items.length ? this.__items[index] : null; }
+  };
+  g.DOMRectReadOnly = class DOMRectReadOnly {
+    constructor(x, y, w, h) { this.__x = x; this.__y = y; this.__w = w; this.__h = h; }
+    get top() { return this.__y; }
+    get bottom() { return this.__y + this.__h; }
+    get left() { return this.__x; }
+    get right() { return this.__x + this.__w; }
+    get width() { return this.__w; }
+    get height() { return this.__h; }
+  };
+  g.DOMRect = class DOMRect extends g.DOMRectReadOnly {};
+  g.MutationRecord = class MutationRecord {
+    constructor(target, added) { this.__target = target; this.__added = added; }
+    get addedNodes() { return new g.NodeList(this.__added); }
+  };
+  g.MutationObserver = class MutationObserver {
+    constructor(callback) {
+      this.__cb = callback;
+      this.__targets = [];
+      this.__pending = [];
+      $push(state.observers, this);
+    }
+    observe(target, init) {
+      // Como o WebIDL: le cada membro do dicionario, herdado ou nao.
+      void init.attributes;
+      if (!init.childList) throw new TypeError('childList');
+      $push(this.__targets, { target: target, subtree: !!init.subtree });
+    }
+    disconnect() { this.__targets = []; this.__pending = []; }
+  };
+  g.Performance = class Performance { now() { return state.clock; } };
+  g.performance = new g.Performance();
+  g.getComputedStyle = function (el) { return new g.CSSStyleDeclaration(el, false); };
+  g.setTimeout = function (fn, ms) {
+    $push(state.timers, { fn: fn, at: state.clock + (+ms || 0), done: false });
+    return state.timers.length;
+  };
+  g.clearTimeout = function () {};
+  g.window = g;
+  g.top = g;
+  g.document = new g.Document();
+  g.chrome = { webview: { postMessage: function (message) { $push(log.posted, $String(message)); } } };
+  g.fetch = function (url) { $push(log.network, $String(url)); };
+
+  function build(spec) {
+    if (typeof spec === 'string') return new g.Text(spec);
+    var el = new g.HTMLElement(spec.tag, $assign({}, spec.attrs || {}));
+    el.__css = $assign({}, spec.css || {});
+    el.__rect = spec.rect || null;
+    var kids = spec.children || [];
+    for (var i = 0; i < kids.length; i++) {
+      var child = build(kids[i]);
+      child.parentNode = el;
+      $push(el.childNodes, child);
+    }
+    if (spec.shadow) {
+      var root = new g.ShadowRoot(el, spec.shadow.open !== false);
+      var inner = spec.shadow.children || [];
+      for (var j = 0; j < inner.length; j++) {
+        var node = build(inner[j]);
+        node.parentNode = root;
+        $push(root.childNodes, node);
+      }
+      el.__shadow = root;
+    }
+    return el;
+  }
+  function find(node, name) {
+    for (var i = 0; i < node.childNodes.length; i++) {
+      var child = node.childNodes[i];
+      if (child.__type !== 1) continue;
+      if (nameOf(child) === name) return child;
+      var hit = find(child, name);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  g.__mount = function (spec, viewport, scrollHeight) {
+    var html = build(spec);
+    html.__clientWidth = viewport[0];
+    html.__clientHeight = viewport[1];
+    html.__scrollHeight = scrollHeight;
+    html.parentNode = g.document;
+    $push(g.document.childNodes, html);
+    var body = g.document.body;
+    if (body) body.__scrollHeight = scrollHeight;
+  };
+  g.__add = function (parent, spec) {
+    var target = parent === 'body' ? g.document.body : find(g.document, parent);
+    target.appendChild(build(spec));
+  };
+  g.__focus = function (name) { g.document.__active = find(g.document, name); };
+  function timed(fn, self, arg) {
+    var before = state.clock;
+    try { $call(fn, self, arg); } catch (e) { $push(log.errors, $String(e && e.message)); }
+    var spent = state.clock - before;
+    if (spent > log.maxSpent) log.maxSpent = spent;
+  }
+  g.__fire = function (type) {
+    var listeners = g.document.__listeners || [];
+    for (var i = 0; i < listeners.length; i++) {
+      if (listeners[i].type === type) timed(listeners[i].handler, g.document, { type: type });
+    }
+  };
+  g.__fireWindow = function (type) {
+    var listeners = g.__listeners || [];
+    for (var i = 0; i < listeners.length; i++) {
+      if (listeners[i].type === type) timed(listeners[i].handler, g, { type: type, isTrusted: true });
+    }
+  };
+  g.__flush = function () {
+    for (var o = 0; o < state.observers.length; o++) {
+      var obs = state.observers[o];
+      if (!obs.__pending.length) continue;
+      var records = obs.__pending;
+      obs.__pending = [];
+      timed(obs.__cb, obs, records);
+    }
+  };
+  g.__runUntil = function (until) {
+    for (var guard = 0; guard < 20000; guard++) {
+      var next = null;
+      for (var i = 0; i < state.timers.length; i++) {
+        var t = state.timers[i];
+        if (!t.done && t.at <= until && (!next || t.at < next.at)) next = t;
+      }
+      if (!next) break;
+      next.done = true;
+      if (next.at > state.clock) state.clock = next.at;
+      log.timersRun++;
+      timed(next.fn, g, undefined);
+    }
+    if (until > state.clock) state.clock = until;
+  };
+  g.__collect = function () {
+    var hidden = [];
+    var walk = function (node) {
+      for (var i = 0; i < node.childNodes.length; i++) {
+        var child = node.childNodes[i];
+        if (child.__type !== 1) continue;
+        if ($hasOwn(child.__inline, 'display') && child.__inline.display === 'none') {
+          $push(hidden, nameOf(child));
+        }
+        walk(child);
+        if (child.__shadow) walk(child.__shadow);
+      }
+    };
+    walk(g.document);
+    var de = g.document.documentElement, body = g.document.body, observing = 0;
+    for (var o = 0; o < state.observers.length; o++) observing += state.observers[o].__targets.length;
+    var overflow = function (el) {
+      return el && $hasOwn(el.__inline, 'overflow-y') ? el.__inline['overflow-y'] : null;
+    };
+    return $stringify({
+      clicks: log.clicks, pageClicks: log.pageClicks, posted: log.posted, errors: log.errors,
+      network: log.network, hidden: hidden, timersRun: log.timersRun, maxSpent: log.maxSpent,
+      listeners: (g.document.__listeners || []).length + (g.__listeners || []).length,
+      observers: state.observers.length, observing: observing,
+      htmlOverflow: overflow(de), bodyOverflow: overflow(body)
+    });
+  };
+}
+// A pagina, depois do script (que ja capturou o que usa): troca cada
+// primitiva que ele usa por uma que mente, conta ou rebenta.
+function POISON() {
+  var g = globalThis;
+  var push = g.__push;
+  var empty = function () { return new g.NodeList([]); };
+  var boom = function () { throw new Error('envenenado'); };
+  g.Document.prototype.querySelectorAll = empty;
+  g.document.querySelectorAll = empty;
+  g.Element.prototype.querySelectorAll = empty;
+  g.DocumentFragment.prototype.querySelectorAll = empty;
+  g.HTMLElement.prototype.click = function () { push(g.__log.pageClicks, 'pagina'); };
+  Object.defineProperty(g.HTMLElement.prototype, 'innerText', { configurable: true, get: function () { return 'Aceitar todos'; } });
+  Object.defineProperty(g.HTMLElement.prototype, 'style', { configurable: true, get: function () { return { setProperty: function () {} }; } });
+  Object.defineProperty(g.NodeList.prototype, 'length', { configurable: true, get: function () { return 0; } });
+  g.NodeList.prototype.item = function () { return null; };
+  g.Element.prototype.getAttribute = function () { return 'aceitar'; };
+  Object.defineProperty(g.Element.prototype, 'shadowRoot', { configurable: true, get: function () { return null; } });
+  Object.defineProperty(g.Element.prototype, 'clientHeight', { configurable: true, get: function () { return 0; } });
+  ['top', 'bottom', 'width', 'height'].forEach(function (name) {
+    Object.defineProperty(g.DOMRectReadOnly.prototype, name, { configurable: true, get: function () { return 0; } });
+  });
+  g.CSSStyleDeclaration.prototype.setProperty = function () {};
+  g.CSSStyleDeclaration.prototype.getPropertyValue = function () { return 'static'; };
+  g.getComputedStyle = boom;
+  g.Node.prototype.contains = function () { return true; };
+  Object.defineProperty(g.MutationRecord.prototype, 'addedNodes', { configurable: true, get: empty });
+  g.MutationObserver = function () { throw new Error('envenenado'); };
+  g.setTimeout = boom;
+  g.Performance.prototype.now = function () { return 1e15; };
+  WeakSet.prototype.has = function () { return true; };
+  WeakSet.prototype.add = boom;
+  String.prototype.toLowerCase = function () { return 'aceitar todos'; };
+  String.prototype.toUpperCase = function () { return 'aceitar todos'; };
+  String.prototype.indexOf = function () { return 0; };
+  String.prototype.slice = function () { return ''; };
+  Object.getOwnPropertyDescriptor = boom;
+  Object.create = boom;
+  Object.defineProperty(Object.prototype, 'attributes', { configurable: true, get: boom });
+  ['onetrust', 'cookiebot', 'didomi', 'n'].forEach(function (name) {
+    Object.defineProperty(Object.prototype, name, { configurable: true, get: function () { return undefined; }, set: boom });
+  });
+  Array.prototype.push = boom;
+  Function.prototype.call = boom;
+  Function.prototype.apply = boom;
+  Function.prototype.bind = boom;
+}
+const results = [];
+for (const c of INPUT.cases) {
+  const context = vm.createContext({ URLSearchParams });
+  vm.runInContext('(' + MOCK.toString() + ')();', context);
+  const url = new URL(c.href);
+  context.__loc = { href: c.href, protocol: url.protocol, hostname: url.hostname, search: url.search };
+  vm.runInContext('location = __loc;', context);
+  if (c.child) vm.runInContext('top = {};', context);
+  context.__state.styleCost = c.styleCost || 0;
+  const errors = [];
+  try {
+    vm.runInContext(c.script, context, { filename: 'distraction.js' });
+  } catch (e) {
+    errors.push('script: ' + e.message);
+  }
+  context.__spec = c.page;
+  context.__viewport = c.viewport || [1200, 800];
+  context.__scroll = c.scrollHeight === undefined ? 5000 : c.scrollHeight;
+  vm.runInContext('__mount(__spec, __viewport, __scroll); document.__ready = "interactive";', context);
+  if (c.focus) { context.__name = c.focus; vm.runInContext('__focus(__name)', context); }
+  if (c.poison) vm.runInContext('(' + POISON.toString() + ')();', context);
+  vm.runInContext('__fire("DOMContentLoaded"); __runUntil(__state.clock + 1000);', context);
+  for (const step of c.steps || []) {
+    if (step.add) {
+      context.__parent = step.add[0];
+      context.__node = step.add[1];
+      vm.runInContext('__add(__parent, __node); __flush(); __runUntil(__state.clock + 1000);', context);
+    } else if (step.advance) {
+      context.__ms = step.advance;
+      vm.runInContext('__runUntil(__state.clock + __ms);', context);
+    } else if (step.input) {
+      context.__type = step.input;
+      vm.runInContext('__fireWindow(__type);', context);
+    }
+  }
+  const out = JSON.parse(vm.runInContext('__collect()', context));
+  out.name = c.name;
+  out.errors = errors.concat(out.errors);
+  results.push(out);
+}
+process.stdout.write(JSON.stringify(results));
+"###;
+
+    /// Corre os casos (`{name, href, script, page, ...}`) e devolve o que
+    /// cada um viu, pela ordem.
+    fn run_distraction(cases: &[Value]) -> Vec<Value> {
+        let program = format!(
+            "const INPUT = {};\n{DISTRACTION_HARNESS}",
+            json!({ "cases": cases })
+        );
+        let results: Vec<Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("JSON do harness");
+        assert_eq!(results.len(), cases.len());
+        results
+    }
+
+    fn strings(value: &Value) -> Vec<String> {
+        value
+            .as_array()
+            .unwrap_or_else(|| panic!("lista: {value}"))
+            .iter()
+            .map(|item| item.as_str().expect("texto").to_string())
+            .collect()
+    }
+
+    /// Uma pagina com um artigo e, no fim do corpo, `extra`.
+    fn page(extra: Vec<Value>) -> Value {
+        page_with(json!({}), json!({}), extra)
+    }
+
+    /// `page`, com o `css` do `<html>` e do `<body>`.
+    fn page_with(html_css: Value, body_css: Value, extra: Vec<Value>) -> Value {
+        let mut children = vec![json!({ "tag": "main", "children": [
+            { "tag": "p", "children": ["Texto do artigo, que o leitor veio ler."] }
+        ] })];
+        children.extend(extra);
+        json!({ "tag": "html", "css": html_css, "children": [
+            { "tag": "head", "children": [] },
+            { "tag": "body", "css": body_css, "children": children }
+        ] })
+    }
+
+    fn button(attrs: Value, label: &str) -> Value {
+        json!({ "tag": "button", "attrs": attrs, "children": [label] })
+    }
+
+    fn case(name: &str, href: &str, script: &str, page: Value) -> Value {
+        json!({ "name": name, "href": href, "script": script, "page": page })
+    }
+
+    const NEWS: &str = "https://news.example.com/artigo";
+
+    /// Uma fixture por linha de `CMP_RULES`: o aviso como o CMP o poe no
+    /// DOM, com o botao de recusa (`data-fixture=reject`, texto `reject`), o
+    /// de aceitar (`accept`) e o que se esconde (`banner`), e a pagina onde
+    /// ele aparece (o consent.google.com e a propria pagina do aviso).
+    fn cmp_fixture(rule: &str, reject: &str) -> Option<(&'static str, Vec<Value>)> {
+        Some(match rule {
+            "onetrust" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "onetrust-consent-sdk" }, "children": [
+                { "tag": "div", "attrs": { "id": "onetrust-banner-sdk", "data-fixture": "banner" },
+                  "css": { "position": "fixed" }, "rect": [0, 680, 1200, 120], "children": [
+                    { "tag": "p", "children": ["Usamos cookies para melhorar a sua experiência."] },
+                    button(json!({ "id": "onetrust-accept-btn-handler", "data-fixture": "accept" }), "Aceitar todos os cookies"),
+                    button(json!({ "id": "onetrust-reject-all-handler", "data-fixture": "reject" }), reject)
+                ] },
+                { "tag": "div", "attrs": { "class": "onetrust-pc-dark-filter", "data-fixture": "banner" },
+                  "css": { "position": "fixed", "z-index": "100" }, "rect": [0, 0, 1200, 800] }
+            ] }),
+                ],
+            ),
+            "cookiebot" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "CybotCookiebotDialog", "data-fixture": "banner" },
+                "css": { "position": "fixed" }, "rect": [0, 680, 1200, 120], "children": [
+                    button(json!({ "id": "CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll", "data-fixture": "accept" }), "Permitir todos"),
+                    button(json!({ "id": "CybotCookiebotDialogBodyButtonDecline", "data-fixture": "reject" }), reject)
+                ] }),
+                ],
+            ),
+            "didomi" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "didomi-host", "data-fixture": "banner" }, "children": [
+                { "tag": "div", "attrs": { "id": "didomi-notice" }, "css": { "position": "fixed" }, "rect": [0, 700, 1200, 100], "children": [
+                    button(json!({ "id": "didomi-notice-agree-button", "data-fixture": "accept" }), "Concordar e fechar"),
+                    button(json!({ "id": "didomi-notice-disagree-button", "data-fixture": "reject" }), reject)
+                ] }
+            ] }),
+                ],
+            ),
+            "usercentrics" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "usercentrics-root", "data-fixture": "banner" },
+                "shadow": { "open": true, "children": [
+                    { "tag": "div", "attrs": { "class": "sc-dialog" }, "children": [
+                        button(json!({ "data-testid": "uc-accept-all-button", "data-fixture": "accept" }), "Aceitar todos"),
+                        button(json!({ "data-testid": "uc-deny-all-button", "data-fixture": "reject" }), reject)
+                    ] }
+                ] } }),
+                ],
+            ),
+            "quantcast" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "qc-cmp2-container", "class": "qc-cmp2-container", "data-fixture": "banner" }, "children": [
+                { "tag": "div", "attrs": { "id": "qc-cmp2-ui" }, "children": [
+                    { "tag": "div", "attrs": { "class": "qc-cmp2-summary-buttons" }, "children": [
+                        button(json!({ "mode": "secondary", "data-fixture": "reject" }), reject),
+                        button(json!({ "mode": "primary", "data-fixture": "accept" }), "ACEITO")
+                    ] }
+                ] }
+            ] }),
+                ],
+            ),
+            "cookieyes" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "class": "cky-consent-container", "data-fixture": "banner" },
+                    "css": { "position": "fixed" }, "rect": [0, 680, 1200, 120], "children": [
+                        button(json!({ "class": "cky-btn cky-btn-accept", "data-fixture": "accept" }), "Aceitar tudo"),
+                        button(json!({ "class": "cky-btn cky-btn-reject", "data-fixture": "reject" }), reject)
+                    ] }),
+                    json!({ "tag": "div", "attrs": { "class": "cky-overlay", "data-fixture": "banner" } }),
+                ],
+            ),
+            "complianz" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "cmplz-cookiebanner-container", "data-fixture": "banner" }, "children": [
+                { "tag": "div", "attrs": { "class": "cmplz-cookiebanner", "data-fixture": "banner" }, "children": [
+                    button(json!({ "class": "cmplz-btn cmplz-accept", "data-fixture": "accept" }), "Aceitar"),
+                    button(json!({ "class": "cmplz-btn cmplz-deny", "data-fixture": "reject" }), reject)
+                ] }
+            ] }),
+                ],
+            ),
+            "iubenda" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "iubenda-cs-banner", "data-fixture": "banner" }, "children": [
+                button(json!({ "class": "iubenda-cs-accept-btn", "data-fixture": "accept" }), "Accetta"),
+                button(json!({ "class": "iubenda-cs-reject-btn", "data-fixture": "reject" }), reject)
+            ] }),
+                ],
+            ),
+            "osano" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "class": "osano-cm-window", "data-fixture": "banner" }, "children": [
+                button(json!({ "class": "osano-cm-accept-all osano-cm-button", "data-fixture": "accept" }), "Accept all"),
+                button(json!({ "class": "osano-cm-denyAll osano-cm-button", "data-fixture": "reject" }), reject)
+            ] }),
+                ],
+            ),
+            "axeptio" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "axeptio_overlay", "data-fixture": "banner" }, "children": [
+                button(json!({ "id": "axeptio_btn_acceptAll", "data-fixture": "accept" }), "OK pour moi"),
+                button(json!({ "id": "axeptio_btn_dismiss", "data-fixture": "reject" }), reject)
+            ] }),
+                ],
+            ),
+            "termly" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "termly-code-snippet-support", "data-fixture": "banner" }, "children": [
+                button(json!({ "data-tid": "banner-accept", "data-fixture": "accept" }), "Accept"),
+                button(json!({ "data-tid": "banner-decline", "data-fixture": "reject" }), reject)
+            ] }),
+                ],
+            ),
+            "google-consent" => (
+                "https://consent.google.com/ml?continue=https://www.google.com/",
+                vec![
+                    json!({ "tag": "form", "attrs": { "action": "https://consent.google.com/save", "method": "POST" }, "children": [
+                    { "tag": "input", "attrs": { "type": "hidden", "name": "set_eom", "value": "true" } },
+                    button(json!({ "data-fixture": "reject" }), reject)
+                ] }),
+                    json!({ "tag": "form", "attrs": { "action": "https://consent.google.com/save", "method": "POST" }, "children": [
+                    { "tag": "input", "attrs": { "type": "hidden", "name": "set_eom", "value": "false" } },
+                    button(json!({ "data-fixture": "accept" }), "Aceitar tudo")
+                ] }),
+                ],
+            ),
+            "sourcepoint" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "sp_message_container_1234", "data-fixture": "banner" },
+                "css": { "position": "fixed", "z-index": "2147483647" }, "rect": [0, 0, 1200, 800], "children": [
+                    { "tag": "iframe", "attrs": { "id": "sp_message_iframe_1234", "src": "https://cdn.privacy-mgmt.com/index.html" } }
+                ] }),
+                ],
+            ),
+            "trustarc" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "class": "truste_box_overlay", "data-fixture": "banner" }, "children": [
+                    { "tag": "iframe", "attrs": { "src": "https://consent-pref.trustarc.com/?type=x" } }
+                ] }),
+                    json!({ "tag": "div", "attrs": { "class": "truste_overlay", "data-fixture": "banner" } }),
+                ],
+            ),
+            _ => return None,
+        })
+    }
+
+    /// Quantos elementos a fixture marca como `banner`.
+    fn banner_count(value: &Value) -> usize {
+        match value {
+            Value::Object(map) => {
+                let own = usize::from(
+                    map.get("attrs").and_then(|attrs| attrs.get("data-fixture"))
+                        == Some(&json!("banner")),
+                );
+                own + map.values().map(banner_count).sum::<usize>()
+            }
+            Value::Array(items) => items.iter().map(banner_count).sum(),
+            _ => 0,
+        }
+    }
+
+    /// Gate (critico, script injetado; anti-distracao): o script que
+    /// embarca, com a fixture de cada linha de `CMP_RULES`, clica SO na
+    /// recusa e so quando o texto dela e de recusa (pt, en, es, fr, de,
+    /// it). Com «Aceitar todos», «Concordo» ou «Rejeitar e aceitar» no
+    /// botao de recusa -- e com os aceitar de cada lingua -- nenhum clique:
+    /// o aviso so e escondido. O botao de aceitar nunca e clicado; as
+    /// molduras de outra origem nunca; o consent.google.com nunca e
+    /// escondido. Cada linha tem a sua fixture.
+    ///
+    /// Sabotagem: tirar o `!hasAccept(padded)` do `safeReject` ->
+    /// «Rejeitar e aceitar» e clicado -> vermelho.
+    #[test]
+    fn distraction_never_clicks_accept() {
+        let script = distraction_script(&DistractionPolicy::default());
+        let labels: [(&str, bool); 16] = [
+            ("Rejeitar tudo", true),
+            ("Aceitar todos", false),
+            ("Concordo", false),
+            ("Rejeitar e aceitar", false),
+            ("Só necessários", true),
+            ("Reject all", true),
+            ("Rechazar todo", true),
+            ("Tout refuser", true),
+            ("Alle ablehnen", true),
+            ("Rifiuta tutto", true),
+            ("Accept all", false),
+            ("Continuar sem aceitar", false),
+            ("J'accepte", false),
+            ("Alle akzeptieren", false),
+            ("Rechazar y aceptar", false),
+            ("OK", false),
+        ];
+        let mut cases = Vec::new();
+        let mut expected = Vec::new();
+        for rule in CMP_RULES {
+            for (label, clicks) in labels {
+                let (href, body) = cmp_fixture(rule.id, label)
+                    .unwrap_or_else(|| panic!("a regra {} nao tem fixture", rule.id));
+                let banners = banner_count(&json!(body));
+                assert_eq!(
+                    rule.banner.is_some(),
+                    banners > 0,
+                    "{}: a fixture e a regra discordam do que se esconde",
+                    rule.id
+                );
+                cases.push(case(
+                    &format!("{} / {label}", rule.id),
+                    href,
+                    &script,
+                    page(body),
+                ));
+                let clicks = clicks && rule.reject.is_some() && !rule.frame_only;
+                expected.push((clicks, banners));
+            }
+        }
+        let results = run_distraction(&cases);
+        for (result, (clicks, banners)) in results.iter().zip(expected) {
+            let name = result["name"].as_str().unwrap_or_default();
+            assert_eq!(strings(&result["errors"]), Vec::<String>::new(), "{name}");
+            assert_eq!(
+                strings(&result["clicks"]),
+                if clicks {
+                    vec!["reject".to_string()]
+                } else {
+                    vec![]
+                },
+                "{name}"
+            );
+            assert_eq!(
+                strings(&result["hidden"]),
+                vec!["banner".to_string(); banners],
+                "{name}: o que se escondeu"
+            );
+            assert_eq!(strings(&result["posted"]), Vec::<String>::new(), "{name}");
+        }
+    }
+
+    /// Os enderecos da decisao por pagina: cada regra do registo dos
+    /// provedores, cada login, as nossas origens, os parecidos e os sites
+    /// normais.
+    fn decision_urls() -> Vec<String> {
+        let mut urls = Vec::new();
+        for provider in ProviderId::all() {
+            for rule in provider.hosts() {
+                let with_udm = |host: &str| {
+                    if rule.require_udm50 {
+                        format!("https://{host}/search?q=x&udm=50")
+                    } else {
+                        format!("https://{host}/")
+                    }
+                };
+                urls.push(with_udm(rule.host));
+                if rule.subdomains {
+                    urls.push(with_udm(&format!("chat.{}", rule.host)));
+                }
+            }
+        }
+        for host in login_hosts() {
+            urls.push(format!("https://{host}/signin"));
+        }
+        for url in [
+            "https://chatgpt.com./c/1",
+            "https://CLAUDE.AI/new",
+            "https://chatgpt.com.evil.io/",
+            "https://evilclaude.ai/",
+            "https://www.google.com/search?q=x",
+            "https://www.google.com/search?udm=14&udm=50",
+            "https://consent.google.com/ml",
+            "https://news.example.com/a",
+            "https://www.example.com/",
+            "http://example.org/x",
+            "http://neuralia-pdf.localhost/viewer.html",
+            "http://neuralia-epub.localhost/library.html",
+            "http://localhost:8080/",
+            "http://127.0.0.1/",
+            "http://[::1]/",
+            "http://192.168.0.10/",
+            "http://intranet/",
+            "file:///C:/x.html",
+        ] {
+            urls.push(url.to_string());
+        }
+        urls
+    }
+
+    /// Gate (critico, script injetado): nunca nas paginas das IAs. O script
+    /// que embarca, em cada endereco de `decision_urls` com o aviso do
+    /// OneTrust, age exatamente quando `distraction_config` diz que sim:
+    /// nas IAs (cada regra do registo), nos logins e nas nossas origens nao
+    /// regista nada (nem ouvinte nem observador), e nos parecidos age.
+    ///
+    /// Sabotagem: tirar o ciclo `C.never` do script -> as IAs recebem o
+    /// clique -> vermelho.
+    #[test]
+    fn distraction_leaves_ai_provider_pages_untouched() {
+        let policy = DistractionPolicy::default();
+        let script = distraction_script(&policy);
+        let (_, body) = cmp_fixture("onetrust", "Rejeitar tudo").expect("onetrust");
+        let urls = decision_urls();
+        let cases: Vec<Value> = urls
+            .iter()
+            .map(|url| case(url, url, &script, page(body.clone())))
+            .collect();
+        let results = run_distraction(&cases);
+        let mut acted_on = 0;
+        for (url, result) in urls.iter().zip(&results) {
+            assert_eq!(strings(&result["errors"]), Vec::<String>::new(), "{url}");
+            let expected = Url::parse(url)
+                .ok()
+                .and_then(|parsed| distraction_config(&parsed, &policy, DistractionSurface::Web))
+                .is_some();
+            let acted = result["listeners"].as_u64() != Some(0)
+                || !strings(&result["clicks"]).is_empty()
+                || !strings(&result["hidden"]).is_empty();
+            assert_eq!(acted, expected, "{url}: o script e o nucleo discordam");
+            if expected {
+                acted_on += 1;
+                assert_eq!(strings(&result["clicks"]), ["reject"], "{url}");
+            } else {
+                assert_eq!(result["observers"], 0, "{url}");
+            }
+        }
+        // O controlo: os parecidos e os sites normais recebem o script.
+        assert!(acted_on >= 7, "{acted_on}");
+    }
+
+    /// Gate (critico, script injetado): um paywall fica intocado. Um
+    /// modal do Piano que tambem fala de newsletter, uma barra de paywall
+    /// com 30% da altura e um aviso de CMP com um marcador de "pague ou
+    /// aceite" (contentpass): nada se esconde, nada se clica, a rolagem
+    /// presa fica presa. O controlo: o mesmo modal sem o marcador
+    /// (newsletter) sai, com o fundo, e a rolagem volta.
+    ///
+    /// Sabotagem: o `hasMarker(..., C.paywall)` a devolver sempre `false`
+    /// -> vermelho.
+    #[test]
+    fn paywall_overlays_are_never_touched() {
+        let script = distraction_script(&DistractionPolicy::default());
+        let locked = json!({ "overflow": "hidden" });
+        let backdrop = json!({ "tag": "div", "attrs": { "data-fixture": "backdrop" },
+            "css": { "position": "fixed", "z-index": "90" }, "rect": [0, 0, 1200, 800] });
+        let piano = json!({ "tag": "div", "attrs": { "class": "tp-modal", "role": "dialog", "data-fixture": "paywall" },
+            "css": { "position": "fixed", "z-index": "100" }, "rect": [300, 200, 600, 400], "children": [
+                "Assine para continuar lendo. Receba também a nossa newsletter."
+            ] });
+        let bar = json!({ "tag": "div", "attrs": { "class": "paywall-bar", "data-fixture": "paywall" },
+            "css": { "position": "fixed" }, "rect": [0, 560, 1200, 240], "children": ["Leia sem limites"] });
+        let pay_or_ok = json!({ "tag": "div", "attrs": { "id": "onetrust-consent-sdk" }, "children": [
+            { "tag": "div", "attrs": { "id": "onetrust-banner-sdk", "class": "contentpass-layer", "data-fixture": "paywall" },
+              "css": { "position": "fixed" }, "rect": [0, 680, 1200, 120], "children": [
+                button(json!({ "id": "onetrust-reject-all-handler", "data-fixture": "reject" }), "Rejeitar tudo")
+            ] }
+        ] });
+        let newsletter = json!({ "tag": "div", "attrs": { "class": "newsletter-modal", "role": "dialog", "data-fixture": "newsletter" },
+            "css": { "position": "fixed", "z-index": "100" }, "rect": [300, 200, 600, 400], "children": [
+                "Receba a nossa newsletter toda semana."
+            ] });
+        let cases = [
+            case(
+                "piano",
+                NEWS,
+                &script,
+                page_with(json!({}), locked.clone(), vec![piano, backdrop.clone()]),
+            ),
+            case(
+                "barra",
+                NEWS,
+                &script,
+                page_with(json!({}), locked.clone(), vec![bar]),
+            ),
+            case(
+                "pague ou aceite",
+                NEWS,
+                &script,
+                page_with(json!({}), locked.clone(), vec![pay_or_ok]),
+            ),
+            case(
+                "newsletter",
+                NEWS,
+                &script,
+                page_with(json!({}), locked, vec![newsletter, backdrop]),
+            ),
+        ];
+        let results = run_distraction(&cases);
+        for result in &results[..3] {
+            let name = result["name"].as_str().unwrap_or_default();
+            assert_eq!(strings(&result["errors"]), Vec::<String>::new(), "{name}");
+            assert_eq!(
+                strings(&result["hidden"]),
+                Vec::<String>::new(),
+                "{name}: tocou no paywall"
+            );
+            assert_eq!(strings(&result["clicks"]), Vec::<String>::new(), "{name}");
+            assert_eq!(
+                result["bodyOverflow"],
+                Value::Null,
+                "{name}: devolveu a rolagem"
+            );
+        }
+        let control = &results[3];
+        assert_eq!(
+            strings(&control["hidden"]),
+            ["newsletter", "backdrop"],
+            "{control}"
+        );
+        assert_eq!(control["bodyOverflow"], "auto", "{control}");
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "neuralia-distraction-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("pasta temporaria");
+        dir
+    }
+
+    /// Gate (critico, dados do utilizador + script injetado): desligar um
+    /// site pelo caminho que embarca (`AdblockState::set_distraction_site`,
+    /// a loja `Setting` pelo grant) grava `sites[host] = false`;
+    /// `distraction_config` da `None` nesse site; o script ligado de novo
+    /// com a politica publicada (o `fill_distraction_script` que o
+    /// `distraction_rebind` usa) nao regista nada nesse host -- nem
+    /// ouvinte, nem observador, nem um clique -- e continua a agir nos
+    /// outros. A ligacao nova tira a anterior, mesmo a que ainda estava a
+    /// registar.
+    ///
+    /// Sabotagem: o script a ignorar `C.sites` -> vermelho.
+    #[test]
+    fn per_site_toggle_off_injects_nothing() {
+        let dir = temp_dir("toggle");
+        let registry = StoreRegistry::mint_for_test(&dir);
+        let mut state = AdblockState::load(Some(&registry));
+        assert_eq!(
+            state.set_distraction_site("www.example.com", false, false),
+            DistractionToggle::Saved
+        );
+        let saved =
+            std::fs::read_to_string(dir.join(ADBLOCK_SETTINGS_STORE.name)).expect("gravado");
+        assert!(saved.contains("\"example.com\": false"), "{saved}");
+        let reloaded = AdblockState::load(Some(&registry));
+        assert_eq!(reloaded.distraction_policy(), state.distraction_policy());
+        let policy = state.distraction.policy_for(WebViewHost::External);
+        for url in ["https://example.com/", "https://www.example.com/a"] {
+            assert_eq!(
+                distraction_config(
+                    &Url::parse(url).expect("url"),
+                    &policy,
+                    DistractionSurface::Web
+                ),
+                None,
+                "{url}"
+            );
+        }
+        let rebound = fill_distraction_script(NEURALIA_DISTRACTION_SCRIPT, &policy);
+        let (_, body) = cmp_fixture("onetrust", "Rejeitar tudo").expect("onetrust");
+        let results = run_distraction(&[
+            case(
+                "desligado",
+                "https://www.example.com/a",
+                &rebound,
+                page(body.clone()),
+            ),
+            case(
+                "outro site",
+                "https://news.example.org/",
+                &rebound,
+                page(body),
+            ),
+        ]);
+        let off = &results[0];
+        assert_eq!(off["listeners"], 0, "{off}");
+        assert_eq!(off["observers"], 0, "{off}");
+        assert_eq!(strings(&off["clicks"]), Vec::<String>::new(), "{off}");
+        assert_eq!(strings(&off["hidden"]), Vec::<String>::new(), "{off}");
+        assert_eq!(strings(&results[1]["clicks"]), ["reject"], "{}", results[1]);
+
+        // Ligar de novo tira a escolha propria.
+        assert_eq!(
+            state.set_distraction_site("example.com", true, false),
+            DistractionToggle::Saved
+        );
+        assert!(state.distraction_policy().sites.is_empty());
+        assert_eq!(
+            state.set_distraction_site("example.com", true, false),
+            DistractionToggle::Unchanged
+        );
+        assert_eq!(
+            state.set_distraction_site("127.0.0.1", false, false),
+            DistractionToggle::Refused
+        );
+
+        // A ligacao: a nova tira a anterior; um registo que acaba depois de
+        // outro ter sido pedido sai logo.
+        let slot = DistractionSlot::default();
+        let (first, previous) = slot.begin();
+        assert_eq!(previous, None);
+        assert_eq!(slot.complete(first, "id-1".into()), SlotCompletion::Keep);
+        let (second, previous) = slot.begin();
+        assert_eq!(
+            previous.as_deref(),
+            Some("id-1"),
+            "a ligacao anterior tem de sair"
+        );
+        let (third, previous) = slot.begin();
+        assert_eq!(previous, None, "a segunda ainda nao acabou");
+        assert_eq!(
+            slot.complete(second, "id-2".into()),
+            SlotCompletion::Remove("id-2".into()),
+            "um script de uma politica velha nunca fica"
+        );
+        assert_eq!(slot.complete(third, "id-3".into()), SlotCompletion::Keep);
+        assert_eq!(slot.bound_id().as_deref(), Some("id-3"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gate (critico, modo privado + dados do utilizador): uma escolha feita
+    /// no Split privado vale so la e so em memoria -- o
+    /// `adblock-settings.json` nao nasce nem muda. A escolha normal grava;
+    /// as privadas seguintes deixam o ficheiro byte a byte igual.
+    ///
+    /// Sabotagem: gravar tambem a escolha privada -> vermelho.
+    #[test]
+    fn a_toggle_in_private_is_never_written() {
+        let dir = temp_dir("private");
+        let registry = StoreRegistry::mint_for_test(&dir);
+        let file = dir.join(ADBLOCK_SETTINGS_STORE.name);
+        let mut state = AdblockState::load(Some(&registry));
+        assert_eq!(
+            state.set_distraction_site("private.example.com", false, true),
+            DistractionToggle::MemoryOnly
+        );
+        assert!(!file.exists(), "a escolha privada criou o ficheiro");
+        assert_eq!(state.distraction_policy(), &DistractionPolicy::default());
+        let private = state.distraction.policy_for(WebViewHost::PrivateSplit(0));
+        let normal = state.distraction.policy_for(WebViewHost::Split(0));
+        assert!(!private.site_on("private.example.com"));
+        assert!(
+            normal.site_on("private.example.com"),
+            "a escolha privada vazou"
+        );
+        assert_eq!(
+            state.set_distraction_site("private.example.com", false, true),
+            DistractionToggle::Unchanged
+        );
+
+        assert_eq!(
+            state.set_distraction_site("normal.example.com", false, false),
+            DistractionToggle::Saved
+        );
+        let before = std::fs::read(&file).expect("gravado");
+        assert!(!String::from_utf8_lossy(&before).contains("private.example.com"));
+        assert_eq!(
+            state.set_distraction_site("other.example.com", false, true),
+            DistractionToggle::MemoryOnly
+        );
+        assert_eq!(
+            state.set_distraction_site("normal.example.com", true, true),
+            DistractionToggle::MemoryOnly
+        );
+        assert_eq!(
+            std::fs::read(&file).expect("ficheiro"),
+            before,
+            "o ficheiro mudou"
+        );
+        let reloaded = AdblockState::load(Some(&registry));
+        let saved = reloaded.distraction_policy();
+        assert!(!saved.site_on("normal.example.com"));
+        assert!(saved.site_on("other.example.com"));
+        assert!(saved.site_on("private.example.com"));
+        // No Split privado a escolha privada ganha a gravada.
+        assert!(
+            state
+                .distraction
+                .policy_for(WebViewHost::PrivateSplit(1))
+                .site_on("normal.example.com")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gate (critico, script injetado): o script nunca usa o canal (nem o
+    /// `postMessage` nem a capability), so corre no documento de topo e
+    /// aguenta uma pagina que, depois do document-created, troca cada
+    /// primitiva que ele usa (querySelectorAll, click, innerText, style,
+    /// NodeList, getComputedStyle, DOMRect, MutationObserver, setTimeout,
+    /// performance, WeakSet, String, Object, Array, Function): recusa o
+    /// OneTrust do inicio e o Cookiebot que chega depois, esconde a
+    /// newsletter e o fundo, devolve a rolagem, e a pagina nao ve um clique
+    /// nem uma mensagem.
+    ///
+    /// Sabotagem: `document.querySelectorAll(selector)` direto no `query`
+    /// -> vermelho.
+    #[test]
+    fn distraction_script_posts_nothing_and_survives_a_poisoned_page() {
+        for forbidden in [
+            "postMessage",
+            "chrome.webview",
+            "__NEURALIA_CAP__",
+            "fetch(",
+            "XMLHttpRequest",
+            "location.replace",
+            "location.href =",
+        ] {
+            assert!(
+                !NEURALIA_DISTRACTION_SCRIPT.contains(forbidden),
+                "o script usa {forbidden}"
+            );
+        }
+        assert_eq!(
+            NEURALIA_DISTRACTION_SCRIPT
+                .matches(DISTRACTION_CONFIG_PLACEHOLDER)
+                .count(),
+            1
+        );
+        let script = distraction_script(&DistractionPolicy::default());
+        assert!(!script.contains(DISTRACTION_CONFIG_PLACEHOLDER));
+
+        let (_, mut body) = cmp_fixture("onetrust", "Rejeitar tudo").expect("onetrust");
+        body.push(json!({ "tag": "div", "attrs": { "class": "newsletter-modal", "role": "dialog", "data-fixture": "newsletter" },
+            "css": { "position": "fixed", "z-index": "100" }, "rect": [300, 200, 600, 400], "children": [
+                "Receba a nossa newsletter."
+            ] }));
+        body.push(
+            json!({ "tag": "div", "attrs": { "data-fixture": "backdrop" },
+            "css": { "position": "fixed", "z-index": "90" }, "rect": [0, 0, 1200, 800] }),
+        );
+        let late = json!({ "tag": "div", "attrs": { "id": "CybotCookiebotDialog", "data-fixture": "late-banner" },
+            "css": { "position": "fixed" }, "rect": [0, 680, 1200, 120], "children": [
+                button(json!({ "id": "CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll", "data-fixture": "late-accept" }), "Permitir todos"),
+                button(json!({ "id": "CybotCookiebotDialogBodyButtonDecline", "data-fixture": "late-reject" }), "Recusar")
+            ] });
+        let full = page_with(json!({}), json!({ "overflow": "hidden" }), body);
+        let mut poisoned = case("envenenada", NEWS, &script, full.clone());
+        poisoned["poison"] = json!(true);
+        poisoned["steps"] = json!([{ "add": ["body", late] }]);
+        let mut child = case("moldura", NEWS, &script, full);
+        child["child"] = json!(true);
+        let results = run_distraction(&[poisoned, child]);
+
+        let poisoned = &results[0];
+        assert_eq!(
+            strings(&poisoned["errors"]),
+            Vec::<String>::new(),
+            "{poisoned}"
+        );
+        assert_eq!(
+            strings(&poisoned["clicks"]),
+            ["reject", "late-reject"],
+            "{poisoned}"
+        );
+        assert_eq!(
+            strings(&poisoned["pageClicks"]),
+            Vec::<String>::new(),
+            "{poisoned}"
+        );
+        let hidden = strings(&poisoned["hidden"]);
+        for name in ["banner", "newsletter", "backdrop", "late-banner"] {
+            assert!(
+                hidden.contains(&name.to_string()),
+                "{name} ficou: {hidden:?}"
+            );
+        }
+        assert_eq!(poisoned["bodyOverflow"], "auto", "{poisoned}");
+        assert_eq!(strings(&poisoned["posted"]), Vec::<String>::new());
+        assert_eq!(strings(&poisoned["network"]), Vec::<String>::new());
+
+        let child = &results[1];
+        assert_eq!(child["listeners"], 0, "{child}");
+        assert_eq!(child["observers"], 0, "{child}");
+        assert_eq!(strings(&child["hidden"]), Vec::<String>::new());
+        assert_eq!(strings(&child["clicks"]), Vec::<String>::new());
+    }
+
+    /// Gate (amostrado): a rolagem so volta quando o script escondeu a
+    /// causa e o documento rola mesmo. Um aviso escondido numa pagina que
+    /// cabe na janela nao mexe na rolagem; uma rolagem presa pela propria
+    /// pagina (um visualizador de imagem, sem aviso) tambem nao.
+    #[test]
+    fn scroll_is_restored_only_when_we_hid_the_cause() {
+        let script = distraction_script(&DistractionPolicy::default());
+        let (_, onetrust) = cmp_fixture("onetrust", "Aceitar todos").expect("onetrust");
+        let lightbox = json!({ "tag": "div", "attrs": { "class": "lightbox", "data-fixture": "lightbox" },
+            "css": { "position": "fixed" }, "rect": [100, 100, 400, 300], "children": ["Foto 1 de 12"] });
+        let locked = || json!({ "overflow": "hidden" });
+        let mut short = case(
+            "curta",
+            NEWS,
+            &script,
+            page_with(locked(), locked(), onetrust.clone()),
+        );
+        short["scrollHeight"] = json!(800);
+        let results = run_distraction(&[
+            case(
+                "longa",
+                NEWS,
+                &script,
+                page_with(locked(), locked(), onetrust),
+            ),
+            short,
+            case(
+                "lightbox",
+                NEWS,
+                &script,
+                page_with(json!({}), locked(), vec![lightbox]),
+            ),
+        ]);
+        assert_eq!(results[0]["htmlOverflow"], "auto", "{}", results[0]);
+        assert_eq!(results[0]["bodyOverflow"], "auto", "{}", results[0]);
+        assert_eq!(results[1]["bodyOverflow"], Value::Null, "{}", results[1]);
+        assert_eq!(strings(&results[1]["hidden"]), ["banner", "banner"]);
+        assert_eq!(strings(&results[2]["hidden"]), Vec::<String>::new());
+        assert_eq!(results[2]["bodyOverflow"], Value::Null, "{}", results[2]);
+    }
+
+    /// Gate (amostrado): o limiar das barras fixas. Encostada ao topo ou ao
+    /// fundo, com pelo menos metade da largura: 20% da altura fica, 25% e
+    /// 30% saem; um layout fixo da pagina inteira fica; uma barra estreita
+    /// ou no meio da janela fica; a que tem o foco (o utilizador escreve
+    /// nela) fica.
+    ///
+    /// Sabotagem (amostra da tarefa): `stickyMin` a 0.1 -> a barra de 20%
+    /// sai -> vermelho.
+    #[test]
+    fn the_sticky_threshold_is_25_percent() {
+        let script = distraction_script(&DistractionPolicy::default());
+        let bar = |name: &str, position: &str, rect: [u32; 4]| {
+            json!({ "tag": "div", "attrs": { "data-fixture": name }, "css": { "position": position },
+                "rect": rect, "children": [format!("barra {name}")] })
+        };
+        let body = vec![
+            bar("top-20", "fixed", [0, 0, 1200, 160]),
+            bar("bottom-25", "fixed", [0, 600, 1200, 200]),
+            bar("top-30", "sticky", [0, 0, 1200, 240]),
+            bar("layout", "fixed", [0, 0, 1200, 800]),
+            bar("narrow", "fixed", [0, 0, 400, 400]),
+            bar("middle", "fixed", [0, 200, 1200, 300]),
+            json!({ "tag": "div", "attrs": { "data-fixture": "chat" }, "css": { "position": "fixed" },
+                "rect": [0, 500, 1200, 300], "children": [
+                    { "tag": "textarea", "attrs": { "data-fixture": "typing" } }
+                ] }),
+        ];
+        let mut focused = case("barras", NEWS, &script, page(body));
+        focused["focus"] = json!("typing");
+        let results = run_distraction(&[focused]);
+        assert_eq!(strings(&results[0]["errors"]), Vec::<String>::new());
+        assert_eq!(
+            strings(&results[0]["hidden"]),
+            ["bottom-25", "top-30"],
+            "{}",
+            results[0]
+        );
+    }
+
+    /// Gate (amostrado): o ritmo. Com cada leitura de estilo a custar 1 ms
+    /// (relogio virtual), o script cede a vez depois de 8 ms e acaba o
+    /// trabalho em varias vezes; depois de 30 s sem mudancas deixa de
+    /// observar a pagina (um aviso que chega depois fica), antes disso
+    /// ainda o apanha.
+    #[test]
+    fn the_script_yields_after_8_ms_and_stops_after_30_s_idle() {
+        let script = distraction_script(&DistractionPolicy::default());
+        let mut body: Vec<Value> = (0..40)
+            .map(|index| {
+                json!({ "tag": "div", "attrs": { "data-fixture": format!("c{index}") },
+                    "css": { "position": "fixed" }, "rect": [0, 300, 100, 20], "children": ["x"] })
+            })
+            .collect();
+        body.push(
+            json!({ "tag": "div", "attrs": { "data-fixture": "last-bar" },
+            "css": { "position": "fixed" }, "rect": [0, 560, 1200, 240], "children": ["y"] }),
+        );
+        let mut slow = case("lento", NEWS, &script, page(body));
+        slow["styleCost"] = json!(1);
+        let late = |name: &str| {
+            json!({ "tag": "div", "attrs": { "class": "cookie-notice", "data-fixture": name },
+                "css": { "position": "fixed" }, "rect": [0, 700, 1200, 100], "children": ["Cookies"] })
+        };
+        let mut idle = case("parado", NEWS, &script, page(vec![]));
+        idle["steps"] = json!([{ "advance": 31000 }, { "add": ["body", late("too-late")] }]);
+        let mut busy = case("a tempo", NEWS, &script, page(vec![]));
+        busy["steps"] = json!([{ "advance": 20000 }, { "add": ["body", late("in-time")] }]);
+        let results = run_distraction(&[slow, idle, busy]);
+        let slow = &results[0];
+        assert_eq!(strings(&slow["hidden"]), ["last-bar"], "{slow}");
+        assert!(slow["timersRun"].as_u64().unwrap_or(0) >= 5, "{slow}");
+        assert!(slow["maxSpent"].as_u64().unwrap_or(99) <= 12, "{slow}");
+        assert_eq!(
+            strings(&results[1]["hidden"]),
+            Vec::<String>::new(),
+            "{}",
+            results[1]
+        );
+        assert_eq!(results[1]["observing"], 0, "{}", results[1]);
+        assert_eq!(
+            strings(&results[2]["hidden"]),
+            ["in-time"],
+            "{}",
+            results[2]
+        );
+    }
+
+    /// O item do botao direito: «Ocultar distrações neste site» marcado
+    /// numa pagina normal, escolhido desliga ESTE site com o hospedeiro de
+    /// onde veio; nada nas IAs nem fora da web; no Split privado le a
+    /// escolha privada; e o aviso diz quando a escolha nao e guardada.
+    #[test]
+    fn the_distraction_menu_follows_the_page_and_the_private_overlay() {
+        let dir = temp_dir("menu");
+        let registry = StoreRegistry::mint_for_test(&dir);
+        let mut state = AdblockState::load(Some(&registry));
+        let shared = Arc::clone(&state.distraction);
+        let item = |host: WebViewHost, page: Option<&str>| {
+            webview_menu_responder(host, SharedFlag::default(), None, Some(Arc::clone(&shared)))(
+                0, page,
+            )
+            .item(DISTRACTION_MENU_SITE)
+            .cloned()
+        };
+
+        let on = item(
+            WebViewHost::External,
+            Some("https://www.news.example.com/a"),
+        )
+        .expect("item");
+        assert_eq!(on.label, LABEL_DISTRACTION_SITE);
+        assert_eq!(on.checked, Some(true));
+        match on.selected() {
+            Some(UserEvent::Distraction(DistractionEvent::SetSite { host, site, on })) => {
+                assert_eq!(host, WebViewHost::External);
+                assert_eq!(site, "news.example.com");
+                assert!(!on);
+            }
+            other => panic!("o item fez {other:?}"),
+        }
+        for page in [
+            Some("https://chatgpt.com/"),
+            Some("https://claude.ai/new"),
+            Some("http://neuralia-pdf.localhost/v.html"),
+            Some("about:blank"),
+            None,
+        ] {
+            assert!(item(WebViewHost::External, page).is_none(), "{page:?}");
+        }
+        assert!(item(WebViewHost::Reader, Some("https://news.example.com/")).is_none());
+
+        assert_eq!(
+            state.set_distraction_site("news.example.com", false, true),
+            DistractionToggle::MemoryOnly
+        );
+        let private = item(
+            WebViewHost::PrivateSplit(0),
+            Some("https://news.example.com/"),
+        )
+        .expect("privado");
+        assert_eq!(private.checked, Some(false));
+        let normal =
+            item(WebViewHost::Split(0), Some("https://news.example.com/")).expect("normal");
+        assert_eq!(normal.checked, Some(true));
+
+        assert_eq!(
+            distraction_toggle_message(true, false),
+            "Distrações ocultas neste site"
+        );
+        assert_eq!(
+            distraction_toggle_message(false, true),
+            "Distrações visíveis neste site · Modo privado: esta escolha não é guardada."
+        );
+        assert_eq!(
+            DistractionPolicy::default().set_site("x", true),
+            SiteChange::Refused
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gate (amostrado): o que o utilizador acabou de abrir fica. Uma barra
+    /// grande e as definicoes do OneTrust que aparecem logo depois de um
+    /// clique ficam (nem escondidas nem clicadas), e ficam depois disso; a
+    /// mesma barra que chega 3 s depois do clique sai. Um dialogo de login
+    /// que fala de newsletter (tem um campo de senha) nunca sai.
+    ///
+    /// Sabotagem (amostra): `justOpened` sempre `false` -> vermelho.
+    #[test]
+    fn what_the_user_just_opened_stays() {
+        let script = distraction_script(&DistractionPolicy::default());
+        let bar = |name: &str| {
+            json!({ "tag": "div", "attrs": { "data-fixture": name }, "css": { "position": "fixed" },
+                "rect": [0, 0, 1200, 300], "children": [format!("pesquisa {name}")] })
+        };
+        let (_, onetrust) = cmp_fixture("onetrust", "Rejeitar tudo").expect("onetrust");
+        let login = json!({ "tag": "div", "attrs": { "role": "dialog", "data-fixture": "login" },
+            "css": { "position": "fixed" }, "rect": [300, 200, 600, 400], "children": [
+                "Entrar e receber a nossa newsletter",
+                { "tag": "input", "attrs": { "type": "password" } }
+            ] });
+        let mut opened = case("aberto", NEWS, &script, page(vec![login]));
+        opened["steps"] = json!([
+            { "input": "pointerdown" },
+            { "add": ["body", bar("opened-bar")] },
+            { "input": "keydown" },
+            { "add": ["body", onetrust[0].clone()] },
+            { "advance": 3000 },
+            { "add": ["body", bar("later-bar")] }
+        ]);
+        let results = run_distraction(&[opened]);
+        let result = &results[0];
+        assert_eq!(strings(&result["errors"]), Vec::<String>::new(), "{result}");
+        assert_eq!(strings(&result["hidden"]), ["later-bar"], "{result}");
+        assert_eq!(strings(&result["clicks"]), Vec::<String>::new(), "{result}");
     }
 }

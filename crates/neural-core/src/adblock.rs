@@ -30,7 +30,7 @@
 //!   site da pagina.
 //! - `refresh_due`: quando a lista se renova.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use url::{Host, Url};
 
+use crate::distraction::DistractionPolicy;
 use crate::domains::{is_label_suffix, label_suffix_match, normalize_domain, without_www};
 use crate::llm::errors::ApiError;
 use crate::llm::transport::{Overflow, header, map_transport_error, policy_agent, read_body};
@@ -638,9 +639,11 @@ pub struct AdblockSettings {
     /// Os sites (host sem `www.`) com anuncios permitidos.
     #[serde(default)]
     pub allow_sites: BTreeSet<String>,
-    /// Reservado para anti-distracao: `sites[host] = false` desliga ali.
+    /// A politica da anti-distracao (`distraction::DistractionPolicy`), no
+    /// campo que a 2.3 reservou: o mapa `site -> bool` (`sites[host] =
+    /// false` desliga ali; o padrao desligado e `"*": false`).
     #[serde(default)]
-    pub distraction: BTreeMap<String, bool>,
+    pub distraction: DistractionPolicy,
 }
 
 /// Um site que a lista de permitidos pode guardar: um nome de dominio ja
@@ -659,6 +662,7 @@ impl AdblockSettings {
             .filter(|site| is_storable_site(site))
             .take(MAX_ALLOW_SITES)
             .collect();
+        self.distraction = self.distraction.sanitized();
         self
     }
 

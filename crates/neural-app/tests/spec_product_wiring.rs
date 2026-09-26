@@ -70,6 +70,8 @@ const ALL_SOURCES: &str = concat!(
     "\n",
     include_str!("../src/windows_app/adblock.rs"),
     "\n",
+    include_str!("../src/windows_app/distraction.rs"),
+    "\n",
     include_str!("../src/windows_app/bookmarks.rs"),
     "\n",
     include_str!("../src/windows_app/page_eval.rs"),

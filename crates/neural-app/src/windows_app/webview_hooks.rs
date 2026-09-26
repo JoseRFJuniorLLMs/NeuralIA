@@ -20,7 +20,9 @@ use wry::PageLoadEvent;
 //   botao direito (`WEBVIEW_MENU_ITEMS`), o `AcceleratorKeyPressed` de cada
 //   WebView, o gestor de downloads (`downloads.rs`) nas paginas da internet
 //   e o `WebResourceRequested` do bloqueio de anuncios (`register_resource_gate`)
-//   nas colunas, na fonte ao lado e na Web completa.
+//   nas colunas, na fonte ao lado e na Web completa, e o script contra
+//   distracoes (`distraction.rs`, pelo `AddScriptToExecuteOnDocumentCreated`)
+//   nas colunas, nas fontes ao lado (normal e privada) e na Web completa.
 //
 // As duas metades sao uma so chamada para quem constroi: `hooked_builder`
 // devolve um `HookedBuilder` com o hospedeiro que recebeu, e o `build` do
@@ -219,8 +221,9 @@ pub(in crate::windows_app) struct WebViewHooks {
     pub(in crate::windows_app) nav_gate: NavGate,
     /// O `AcceleratorKeyPressed` de `accelerator_lookup`: em todas.
     pub(in crate::windows_app) accelerators: bool,
-    /// O script contra distracoes a injetar no documento de topo. Vazio
-    /// ate anti-distracao o trazer (com o sim do dono, §7).
+    /// O script contra distracoes (`NEURALIA_DISTRACTION_SCRIPT`, §7) que
+    /// o COM liga ao documento de topo: so as colunas, a fonte ao lado
+    /// (normal ou privada) e a Web completa (`distraction_host`).
     pub(in crate::windows_app) distraction: Option<&'static str>,
 }
 
@@ -249,7 +252,7 @@ pub(in crate::windows_app) fn webview_hooks(host: WebViewHost) -> WebViewHooks {
         resource_gate: resource_gate_policy(host),
         nav_gate,
         accelerators: true,
-        distraction: None,
+        distraction: distraction_host(host).then_some(NEURALIA_DISTRACTION_SCRIPT),
     }
 }
 
@@ -531,6 +534,9 @@ pub(in crate::windows_app) struct MenuFlags {
     pub(in crate::windows_app) auto_scroll: bool,
     /// O bloqueio de anuncios para a pagina deste botao direito.
     pub(in crate::windows_app) adblock: AdblockMenu,
+    /// A anti-distracao para a pagina deste botao direito (`None`: a
+    /// pagina nao e uma onde o script age, ou o hospedeiro nao o tem).
+    pub(in crate::windows_app) distraction: Option<DistractionMenu>,
 }
 
 /// O que um item faz quando escolhido. Decidido no pedido, com a origem do
@@ -543,6 +549,13 @@ pub(in crate::windows_app) enum MenuAction {
     Adblock(AdblockAction),
     /// «Traduzir página» (translation): a pagina deste hospedeiro.
     Translate(WebViewHost),
+    /// «Ocultar distrações neste site» (anti-distracao): `on` e o estado
+    /// novo de `site`, escolhido no hospedeiro `host`.
+    Distraction {
+        host: WebViewHost,
+        site: String,
+        on: bool,
+    },
     /// Um item cinzento: nada.
     None,
 }
@@ -554,6 +567,13 @@ impl MenuAction {
             MenuAction::Adblock(action) => Some(UserEvent::Adblock(action.event())),
             MenuAction::Translate(host) => translatable_host(*host)
                 .then_some(UserEvent::Translate(TranslateEvent::Requested(*host))),
+            MenuAction::Distraction { host, site, on } => distraction_host(*host).then(|| {
+                UserEvent::Distraction(DistractionEvent::SetSite {
+                    host: *host,
+                    site: site.clone(),
+                    on: *on,
+                })
+            }),
             MenuAction::None => None,
         }
     }
@@ -617,6 +637,10 @@ fn translate_page_view(host: WebViewHost, _flags: &MenuFlags) -> Option<MenuItem
     })
 }
 
+fn distraction_site_view(host: WebViewHost, flags: &MenuFlags) -> Option<MenuItemView> {
+    distraction_site_item(host, flags.distraction.as_ref())
+}
+
 /// O registo: cada item do NeuralIA nos menus das WebViews, ids unicos e
 /// nunca zero (gate `context_menu_commands_are_unique`).
 pub(in crate::windows_app) const WEBVIEW_MENU_ITEMS: &[MenuItemSpec] = &[
@@ -639,6 +663,11 @@ pub(in crate::windows_app) const WEBVIEW_MENU_ITEMS: &[MenuItemSpec] = &[
         id: MENU_TRANSLATE_PAGE,
         hosts: translatable_host,
         view: translate_page_view,
+    },
+    MenuItemSpec {
+        id: DISTRACTION_MENU_SITE,
+        hosts: distraction_host,
+        view: distraction_site_view,
     },
 ];
 
@@ -761,11 +790,14 @@ impl MenuRequest {
 /// arranque. `register_webview_context_menu` e `column_pill_menu` so copiam
 /// para o Win32/COM o que isto decide. `page` e o endereco que a WebView
 /// mostra no instante do pedido (o `Source` do `sender`); `adblock` e o
-/// bloqueio dessa WebView (`None` na pilula e nos hospedeiros sem ele).
+/// bloqueio dessa WebView (`None` na pilula e nos hospedeiros sem ele);
+/// `distraction` e a politica da anti-distracao, lida em cada pedido
+/// (`None` na pilula).
 pub(in crate::windows_app) fn webview_menu_responder(
     host: WebViewHost,
     auto_scroll: SharedFlag,
     adblock: Option<AdblockMenuSource>,
+    distraction: Option<Arc<DistractionShared>>,
 ) -> impl Fn(u32, Option<&str>) -> MenuRequest {
     move |native, page| {
         let flags = MenuFlags {
@@ -773,6 +805,9 @@ pub(in crate::windows_app) fn webview_menu_responder(
             adblock: adblock
                 .as_ref()
                 .map_or(AdblockMenu::Hidden, |source| source.menu(page)),
+            distraction: distraction
+                .as_ref()
+                .and_then(|shared| distraction_menu(host, page, &shared.policy_for(host))),
         };
         let items: Vec<(usize, MenuItemView)> = webview_menu_items(host)
             .into_iter()
@@ -809,6 +844,7 @@ fn register_webview_context_menu(
     host: WebViewHost,
     auto_scroll: SharedFlag,
     adblock: Option<AdblockMenuSource>,
+    distraction: Option<Arc<DistractionShared>>,
     proxy: EventLoopProxy<UserEvent>,
 ) -> Result<(), String> {
     use webview2_com::{
@@ -833,7 +869,7 @@ fn register_webview_context_menu(
         .cast::<ICoreWebView2Environment9>()
         .map_err(|error| format!("ICoreWebView2Environment9 indisponível: {error}"))?;
 
-    let respond = webview_menu_responder(host, auto_scroll, adblock);
+    let respond = webview_menu_responder(host, auto_scroll, adblock, distraction);
     let add_items = move |sender: Option<&ICoreWebView2>,
                           args: &ICoreWebView2ContextMenuRequestedEventArgs|
           -> windows_core::Result<()> {
@@ -1035,6 +1071,9 @@ pub(in crate::windows_app) trait HookRegistrar {
     /// O `WebResourceRequested` do despachante (`resource_gate_answers`)
     /// neste hospedeiro.
     fn resource_gate(&mut self, host: WebViewHost) -> Result<(), String>;
+    /// O script contra distracoes (`script`, o do slot `distraction`) com
+    /// a politica do hospedeiro, pelo `AddScriptToExecuteOnDocumentCreated`.
+    fn distraction(&mut self, host: WebViewHost, script: &'static str) -> Result<(), String>;
 }
 
 /// O que `install_webview_hooks` faz com uma WebView acabada de construir:
@@ -1083,6 +1122,15 @@ pub(in crate::windows_app) fn install_hooks_with(
             host.describe()
         ));
     }
+    // Sem o script, a pagina fica como o site a serve: so fica no log.
+    if let Some(script) = hooks.distraction
+        && let Err(error) = registrar.distraction(host, script)
+    {
+        missing.push(format!(
+            "distraction: {} sem o script contra distracoes ({error})",
+            host.describe()
+        ));
+    }
     missing
 }
 
@@ -1096,6 +1144,8 @@ struct ComHookRegistrar<'a> {
     /// menu le o que o `WebResourceRequested` dela conta).
     adblock: Arc<AdblockShared>,
     blocked: Arc<PageBlocked>,
+    /// A politica da anti-distracao e as ligacoes do script.
+    distraction: Arc<DistractionShared>,
 }
 
 impl HookRegistrar for ComHookRegistrar<'_> {
@@ -1104,13 +1154,19 @@ impl HookRegistrar for ComHookRegistrar<'_> {
             shared: Arc::clone(&self.adblock),
             blocked: Arc::clone(&self.blocked),
         });
+        let distraction = distraction_host(host).then(|| Arc::clone(&self.distraction));
         register_webview_context_menu(
             self.webview,
             host,
             self.auto_scroll.clone(),
             adblock,
+            distraction,
             self.proxy.clone(),
         )
+    }
+
+    fn distraction(&mut self, host: WebViewHost, script: &'static str) -> Result<(), String> {
+        register_distraction_script(self.webview, host, script, &self.distraction)
     }
 
     fn accelerators(&mut self, host: WebViewHost) -> Result<(), String> {
@@ -1338,6 +1394,7 @@ impl App {
             proxy: self.proxy.clone(),
             adblock: Arc::clone(&self.adblock.shared),
             blocked: Arc::new(PageBlocked::default()),
+            distraction: Arc::clone(&self.adblock.distraction),
         };
         for line in install_hooks_with(host, &webview_hooks(host), &mut registrar) {
             debug_log(format_args!("{line}"));
