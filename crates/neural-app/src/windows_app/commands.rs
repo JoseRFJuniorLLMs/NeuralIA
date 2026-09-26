@@ -14,11 +14,11 @@ use super::*;
 // inteiro e nao escolhe origem nenhuma).
 //
 // Regra (critica C13 do plano 2.3): um atalho entra no MESMO PR que o seu
-// comando. Este registo traz so o que a 2.2.0 ja tinha -- os atalhos da
+// comando. O registo nasceu com o que a 2.2.0 ja tinha -- os atalhos da
 // janela e da omnibox (antes `main_window_shortcut` e o subclass do EDIT,
-// cada um com a sua lista) e os botoes da barra que ja eram um evento -- e
-// nenhum atalho novo. Cada feature da 2.3 acrescenta aqui a sua linha, com
-// o seu atalho, no PR dela.
+// cada um com a sua lista) e os botoes da barra que ja eram um evento. Cada
+// feature da 2.3 acrescenta aqui a sua linha, com o seu atalho, no PR
+// dela: o primeiro foi o Ctrl+J dos Downloads (downloads-ui), `Global`.
 
 /// Um comando do registo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -45,12 +45,14 @@ pub(in crate::windows_app) enum CommandId {
     SplitFullscreen,
     /// Fechar a NeuralIA (as abas ficam gravadas).
     Exit,
+    /// A seccao Downloads do painel (downloads-ui): Ctrl+J e a seta da barra.
+    Downloads,
 }
 
 impl CommandId {
     /// Cada comando, uma vez: o que os gates percorrem.
     #[cfg(test)]
-    pub(in crate::windows_app) const ALL: [CommandId; 11] = [
+    pub(in crate::windows_app) const ALL: [CommandId; 12] = [
         CommandId::AutoScroll,
         CommandId::Reload,
         CommandId::History,
@@ -62,6 +64,7 @@ impl CommandId {
         CommandId::CloseSplit,
         CommandId::SplitFullscreen,
         CommandId::Exit,
+        CommandId::Downloads,
     ];
 
     /// A chave estavel do comando (a da sua linha em `COMMANDS`).
@@ -133,6 +136,16 @@ impl ChordSpec {
     const fn window(chord: Chord) -> ChordSpec {
         ChordSpec {
             scope: KeyScope::Window,
+            chord,
+        }
+    }
+
+    /// Um atalho de toda a parte com teclado: a janela, a omnibox e cada
+    /// WebView (menos o monitor do Gmail), preso pelo `AcceleratorKeyPressed`
+    /// -- a pagina nao ve o keydown dele.
+    const fn global(chord: Chord) -> ChordSpec {
+        ChordSpec {
+            scope: KeyScope::Global,
             chord,
         }
     }
@@ -262,6 +275,15 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
         chords: &[],
         alias: None,
     },
+    CommandRow {
+        id: CommandId::Downloads,
+        key: "downloads",
+        label: "Downloads",
+        category: CommandCategory::Ferramentas,
+        keywords: &["downloads", "baixados", "transferências", "arquivos"],
+        chords: &[ChordSpec::global(Chord::ctrl(b'J'))],
+        alias: None,
+    },
 ];
 
 /// A linha de um comando.
@@ -285,6 +307,7 @@ fn chrome_event(id: CommandId) -> UserEvent {
         CommandId::CloseSplit => UserEvent::CloseSplit,
         CommandId::SplitFullscreen => UserEvent::ToggleSplitFullscreen,
         CommandId::Exit => UserEvent::ExitRequested,
+        CommandId::Downloads => UserEvent::DownloadsUi(DownloadsUiEvent::Show),
     }
 }
 
@@ -308,7 +331,8 @@ fn page_action(id: CommandId, column: Option<usize>) -> Option<IpcAction> {
         | CommandId::Home
         | CommandId::CloseSplit
         | CommandId::SplitFullscreen
-        | CommandId::Exit => None,
+        | CommandId::Exit
+        | CommandId::Downloads => None,
     }
 }
 
@@ -390,6 +414,7 @@ pub(in crate::windows_app) fn bar_hit_command(hit: BarHit) -> Option<CommandId> 
         BarHit::SplitClose => Some(CommandId::CloseSplit),
         BarHit::SplitExpand => Some(CommandId::SplitFullscreen),
         BarHit::WindowClose => Some(CommandId::Exit),
+        BarHit::Downloads => Some(CommandId::Downloads),
         // Gestos sobre um item concreto (a aba, o grupo, a coluna, a faixa
         // do servico, a pagina ao lado): o alvo debaixo do rato e parte do
         // pedido, nao um comando.

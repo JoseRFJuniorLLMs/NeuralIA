@@ -37,8 +37,8 @@ pub(crate) const AI_USAGE_STORE: StoreSpec = StoreSpec::new("ai/usage.json", Set
 /// Ctrl+Shift+Delete.
 pub(crate) const DOWNLOADS_LOG_STORE: StoreSpec = StoreSpec::new("downloads.json", Automatic, File);
 /// `<data_dir>/downloads-settings.json`: a pasta dos downloads e
-/// «Permitir baixar programas». Hoje o produto so o le; quem o escreve e a
-/// seccao Downloads do downloads-ui.
+/// «Permitir baixar programas». A seccao Downloads (downloads-ui) grava o
+/// interruptor (`App::set_allow_programs`); a pasta ainda so se le.
 pub(crate) const DOWNLOADS_SETTINGS_STORE: StoreSpec =
     StoreSpec::new("downloads-settings.json", Setting, File);
 

@@ -238,6 +238,9 @@ pub(in crate::windows_app) struct BarState {
     /// So a dica o le (Maximizar/Restaurar); a pintura dos botoes da janela
     /// nao depende dele.
     pub(in crate::windows_app) maximized: bool,
+    /// Os downloads a correr (downloads-ui): a seta do canto pinta-se na cor
+    /// de destaque e a dica diz quantos e quanto falta.
+    pub(in crate::windows_app) downloads: DownloadsBadge,
 }
 
 /// Geometria em duas linhas. As fontes ficam na title bar; os provedores ficam
@@ -1037,8 +1040,10 @@ pub(in crate::windows_app) unsafe fn apply_omnibox_interactivity(edit: HWND, sur
 #[derive(Debug, Clone, Copy)]
 pub(in crate::windows_app) struct RightControls {
     pub(in crate::windows_app) private: UiRect,
-    /// Videochamada, WhatsApp, YouTube e Gmail, a esquerda do Privado.
+    /// Videochamada, WhatsApp, YouTube e Gmail, a esquerda dos downloads.
     pub(in crate::windows_app) services: [UiRect; 4],
+    /// A seta dos downloads (downloads-ui), logo a esquerda do Privado.
+    pub(in crate::windows_app) downloads: UiRect,
     /// Gemini Live, logo a esquerda dos servicos: o inicio do canto.
     pub(in crate::windows_app) live: UiRect,
     /// Pomodoro, Notas e Respiracao (ordem de `Tool::ALL`) na linha de CIMA,
@@ -1092,6 +1097,19 @@ pub(in crate::windows_app) fn title_tools_left(
     reserved[0].x.min(actual[0].x)
 }
 
+/// A seta dos downloads (downloads-ui) cabe ou nao existe: so a partir
+/// desta largura logica da janela. Abaixo, os 34 px dela no canto tiravam a
+/// terceira IA a pilula, o "+" e os ‹ › (gate
+/// `the_tools_never_take_room_from_the_ai_columns`, a 1024 px); sem ela, o
+/// Ctrl+J continua a abrir a seccao Downloads.
+pub(in crate::windows_app) const DOWNLOADS_SLOT_MIN_WIDTH: f64 = 1100.0;
+
+/// A seta dos downloads cabe no canto a esta largura (`client_width` em
+/// pixeis fisicos).
+pub(in crate::windows_app) fn downloads_slot_fits(client_width: f64, scale: f64) -> bool {
+    client_width / scale.max(1.0) >= DOWNLOADS_SLOT_MIN_WIDTH
+}
+
 /// Geometria dos controlos encostados a direita. A mesma conta estava escrita
 /// tres vezes -- no desenho, no hit-testing e agora nos chips -- e as copias
 /// ja tinham comecado a divergir; aqui ela e uma so.
@@ -1110,15 +1128,18 @@ pub(in crate::windows_app) fn right_controls(
     let icon_gap = 4.0 * scale;
 
     // Tudo o que tem largura fixa, em pixeis logicos: a gaveta sem o rotulo
-    // (fechar, expandir, ‹ e › e as folgas), o Privado, os quatro servicos e
-    // o Gemini Live. O resto e do rotulo da gaveta.
+    // (fechar, expandir, ‹ e › e as folgas), o Privado, os downloads, os
+    // quatro servicos e o Gemini Live. O resto e do rotulo da gaveta.
     let logical = |value: f64| value / scale;
     let split_fixed = if split_active {
         30.0 + 5.0 + 30.0 + 5.0 + 6.0 + 26.0 + 4.0 + 26.0 + 6.0
     } else {
         0.0
     };
-    let icons = logical(icon) * 6.0 + logical(icon_gap) * 5.0;
+    // A seta dos downloads so conta quando cabe (`downloads_slot_fits`).
+    let downloads_fits = downloads_slot_fits(client_width, scale);
+    let slots = RIGHT_CLUSTER.len() as f64 - if downloads_fits { 0.0 } else { 1.0 };
+    let icons = logical(icon) * slots + logical(icon_gap) * (slots - 1.0);
     let room = logical(client_width) - 8.0 - split_fixed - icons - RIGHT_CONTROLS_MIN_LEFT;
     let split_label_w = split_label_width(room, split_active);
 
@@ -1162,16 +1183,33 @@ pub(in crate::windows_app) fn right_controls(
         Some((back, _)) => back.x - 6.0 * scale,
         None => client_width - margin,
     };
-    // Privado a direita e, a esquerda dele, videochamada, WhatsApp, YouTube,
-    // Gmail e o Gemini Live. As ferramentas ficam na linha de cima.
+    // Privado a direita e, a esquerda dele, os downloads (quando cabem:
+    // senao sem largura, no sitio do Privado), videochamada, WhatsApp,
+    // YouTube, Gmail e o Gemini Live. As ferramentas ficam na linha de cima.
     let private = UiRect {
         x: right - icon,
         y: row_y,
         width: icon,
         height: icon,
     };
+    let downloads = if downloads_fits {
+        UiRect {
+            x: private.x - (icon + icon_gap),
+            ..private
+        }
+    } else {
+        UiRect {
+            width: 0.0,
+            ..private
+        }
+    };
+    let services_right = if downloads_fits {
+        downloads.x
+    } else {
+        private.x
+    };
     let services: [UiRect; 4] = std::array::from_fn(|index| UiRect {
-        x: private.x - (4 - index) as f64 * (icon + icon_gap),
+        x: services_right - (4 - index) as f64 * (icon + icon_gap),
         y: row_y,
         width: icon,
         height: icon,
@@ -1187,6 +1225,7 @@ pub(in crate::windows_app) fn right_controls(
     RightControls {
         private,
         services,
+        downloads,
         live,
         tools,
         split,
@@ -1203,17 +1242,20 @@ pub(in crate::windows_app) struct ClusterSlot {
 }
 
 /// O canto direito da segunda linha, da esquerda para a direita: o Gemini
-/// Live, os quatro servicos e o Privado. E o registo do grupo: a pintura e
-/// o hit-testing percorrem esta lista com `RightControls::cluster`, e
-/// `right_controls` da a cada lugar a sua posicao. Uma feature com um icone
-/// no canto (⚖ consenso, ⬇ downloads, escudo) e uma linha aqui, um
-/// `ICON_SLOT_*` em `icons.rs` e o seu lugar em `right_controls`. O canto
-/// NAO tem a regra "cabe ou nao existe" dos botoes de coluna (registado em
-/// 3211b0c, nao alterado): cada lugar existe sempre, e o gate
-/// `right_cluster_slots_never_overlap_and_hit_back` prova so a ordem, que
-/// os lugares nao se sobrepoem e que cada um volta a si no hit-testing. Um
-/// item que queira a regra aqui acrescenta-a e prende-a num gate.
-pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 6] = [
+/// Live, os quatro servicos, os downloads (downloads-ui) e o Privado. E o
+/// registo do grupo: a pintura e o hit-testing percorrem esta lista com
+/// `RightControls::cluster`, e `right_controls` da a cada lugar a sua
+/// posicao. Uma feature com um icone no canto (⚖ consenso, ⬇ downloads,
+/// escudo) e uma linha aqui, um
+/// `ICON_SLOT_*` em `icons.rs` e o seu lugar em `right_controls`. Os lugares
+/// de 3211b0c existem sempre; o gate
+/// `right_cluster_slots_never_overlap_and_hit_back` prova a ordem, que os
+/// lugares nao se sobrepoem e que cada um volta a si no hit-testing. Um
+/// item que queira a regra "cabe ou nao existe" acrescenta-a e prende-a num
+/// gate: a seta dos downloads so existe a partir de
+/// `DOWNLOADS_SLOT_MIN_WIDTH` (sem ela, largura 0: nao se pinta nem se
+/// clica).
+pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 7] = [
     ClusterSlot {
         hit: BarHit::GeminiLive,
         icon: ICON_SLOT_LIVE,
@@ -1233,6 +1275,10 @@ pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 6] = [
     ClusterSlot {
         hit: BarHit::GmailToggle,
         icon: ICON_SLOT_MAIL,
+    },
+    ClusterSlot {
+        hit: BarHit::Downloads,
+        icon: ICON_SLOT_DOWNLOADS,
     },
     ClusterSlot {
         hit: BarHit::Private,
@@ -1255,6 +1301,7 @@ impl RightControls {
             self.services[1],
             self.services[2],
             self.services[3],
+            self.downloads,
             self.private,
         ]
     }
@@ -1291,7 +1338,8 @@ pub(in crate::windows_app) fn right_controls_hit(
             return Some(BarHit::Tool(tool));
         }
     }
-    // O canto, pela ordem do registo: Gemini Live, os servicos, o Privado.
+    // O canto, pela ordem do registo: Gemini Live, os servicos, os
+    // downloads, o Privado.
     for (slot, rect) in RIGHT_CLUSTER.iter().zip(controls.cluster()) {
         if rect.contains(x, y) {
             return Some(slot.hit);

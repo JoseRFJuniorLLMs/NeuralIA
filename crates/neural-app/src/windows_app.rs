@@ -110,6 +110,9 @@ pub(in crate::windows_app) enum UserEvent {
     /// O gestor de downloads (`downloads.rs`): o que o WebView2 avisa de cada
     /// download e o fim de cada um, com o evento do `neural_core::downloads`.
     Download(neural_core::downloads::DownloadEvent),
+    /// A interface dos downloads (`downloads_ui.rs`): o Ctrl+J, a seta da
+    /// barra e os cliques no cartao «Baixar programa?» ou da saida.
+    DownloadsUi(DownloadsUiEvent),
     /// Pedido da pagina local do painel lateral (canal proprio), com o
     /// numero da pagina que o mandou.
     Panel(side_panel::PanelPost),
@@ -144,7 +147,14 @@ pub(in crate::windows_app) enum UserEvent {
     /// O aviso do canto (`toast.rs`, centro de avisos `crate::notify`):
     /// um clique num botao dele ou o fim do prazo.
     Notify(NotifyEvent),
+    /// A Home de quem usa (o botao, o comando, a omnibox, a paleta, o Esc):
+    /// com downloads a correr pergunta antes (`request_home`).
     HomeRequested,
+    /// A Home da sonda do CI (a mensagem `NeuralIA.LifecycleProbe.Home`, so
+    /// com NEURALIA_LIFECYCLE_PROBE): vai a Home sem o cartao da saida, porque
+    /// o que se mede (o measure-cycles.ps1, o spike do test-downloads.ps1) e
+    /// a WebView destruida -- com o download a correr (`lifecycle_probe_home`).
+    LifecycleProbeHome,
     /// Voltar um nivel: de ecra completo para tres colunas, de la para a Home.
     BackRequested,
     /// Outra janela ficou com o rato a meio do gesto numero N na fila de
@@ -468,6 +478,8 @@ pub(in crate::windows_app) enum BarHit {
     Tool(Tool),
     /// O olho: liga e desliga o Gemini Live (tela, camera e microfone).
     GeminiLive,
+    /// A seta dos downloads (downloads-ui): a seccao Downloads do painel.
+    Downloads,
     WindowMinimize,
     WindowMaximize,
     WindowClose,
@@ -1024,6 +1036,7 @@ pub(in crate::windows_app) fn bar_tooltip_label(
         .to_string(),
         BarHit::Tool(tool) => tool.tooltip().to_string(),
         BarHit::GeminiLive => LIVE_TOOLTIP.to_string(),
+        BarHit::Downloads => downloads_tooltip(state.downloads),
         BarHit::WindowMinimize => caption_tooltip_label(0, maximized).to_string(),
         BarHit::WindowMaximize => caption_tooltip_label(1, maximized).to_string(),
         BarHit::WindowClose => caption_tooltip_label(2, maximized).to_string(),
@@ -3165,6 +3178,9 @@ pub(in crate::windows_app) struct App {
     /// O gestor de downloads (`downloads.rs`): o `DownloadManager`, as
     /// operacoes vivas do WebView2 e o `downloads.json`.
     pub(in crate::windows_app) downloads: DownloadsState,
+    /// A interface dos downloads (`downloads_ui.rs`): as linhas do painel,
+    /// a velocidade de cada um, o cartao e a seta da barra.
+    pub(in crate::windows_app) downloads_ui: DownloadsUiState,
 }
 
 impl App {
@@ -3216,6 +3232,7 @@ impl App {
         let stores = StoreRegistry::mint(&config.data_dir).ok();
         let keys = KeysState::new(proxy.clone());
         let downloads = DownloadsState::open(stores.as_ref());
+        let downloads_ui = DownloadsUiState::new(proxy.clone());
         Self {
             document,
             pdf_bytes: Arc::new(Mutex::new(Vec::new())),
@@ -3295,6 +3312,7 @@ impl App {
             keys,
             egress: None,
             downloads,
+            downloads_ui,
         }
     }
 }
@@ -6613,9 +6631,10 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
     // O canto direito pela ordem do registo (`RIGHT_CLUSTER`): o olho do
     // Gemini Live pinta-se do estado do painel; os outros sao icones, com
     // a cor de cada um -- o envelope do Gmail apaga-se com os avisos
-    // desligados; o Privado e o chapeu e os oculos, sem nome (pedido do
-    // dono). Os lugares nao se tocam, por isso a ordem de pintura e a do
-    // registo.
+    // desligados; a seta dos downloads fica na cor de destaque enquanto ha
+    // downloads a correr; o Privado e o chapeu e os oculos, sem nome
+    // (pedido do dono). Os lugares nao se tocam, por isso a ordem de
+    // pintura e a do registo.
     let gmail_tint = if GMAIL_NOTIFICATIONS.load(Ordering::Acquire) {
         theme.fg
     } else {
@@ -6631,6 +6650,8 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
                 let tint = match hit {
                     BarHit::Service(Service::Meet) | BarHit::Private => Some(theme.fg),
                     BarHit::GmailToggle => Some(gmail_tint),
+                    BarHit::Downloads if state.downloads.active > 0 => Some(theme.accent),
+                    BarHit::Downloads => Some(theme.fg),
                     _ => None,
                 };
                 draw_icon_button(target, rect, slot.icon, tint, hovered, scale, theme);
@@ -6982,6 +7003,10 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
         include_str!("windows_app/webview_hooks.rs"),
     ),
     ("downloads.rs", include_str!("windows_app/downloads.rs")),
+    (
+        "downloads_ui.rs",
+        include_str!("windows_app/downloads_ui.rs"),
+    ),
     ("commands.rs", include_str!("windows_app/commands.rs")),
     ("keymap.rs", include_str!("windows_app/keymap.rs")),
     ("tests.rs", include_str!("windows_app/tests.rs")),
@@ -7066,6 +7091,8 @@ pub(in crate::windows_app) mod webview_hooks;
 pub(in crate::windows_app) use webview_hooks::*;
 pub(in crate::windows_app) mod downloads;
 pub(in crate::windows_app) use downloads::*;
+pub(in crate::windows_app) mod downloads_ui;
+pub(in crate::windows_app) use downloads_ui::*;
 pub(in crate::windows_app) mod commands;
 pub(in crate::windows_app) use commands::*;
 pub(in crate::windows_app) mod keymap;
