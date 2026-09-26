@@ -294,6 +294,7 @@ impl App {
         // Memoria, sessao, aba de contexto e o SplitView leem o mesmo valor
         // que o builder recebeu.
         let private = build.incognito;
+        let host = WebViewHost::split(source_index, private);
         let valid = build.url.clone();
         let source_name = build.source_name;
 
@@ -318,11 +319,12 @@ impl App {
         // Construir primeiro, com o estado antigo intacto. WebView2 pode falhar
         // ou entrar num pump aninhado; uma tentativa falhada nao pode destruir
         // o Split que o utilizador ainda esta a ver nem sair da expansao atual.
-        let built = self
+        let builder = self
             .split_webview_builder(&build)
             .with_bounds(bounds)
-            .with_url(valid.as_str())
-            .build_as_child(window);
+            .with_url(valid.as_str());
+        let hooked = self.hooked_builder(builder, host, build.local_origin.clone());
+        let built = hooked.build_hooked_as_child(window);
 
         if !split_build_is_current(generation, self.current_generation(), self.surface) {
             if let Ok(webview) = built {
@@ -375,7 +377,6 @@ impl App {
                 }
 
                 let _ = webview.zoom(self.zoom);
-                self.install_context_menu(&webview, WebViewHost::Split(source_index));
                 #[cfg(feature = "accel-spike")]
                 self.accel_spike_hook(
                     &webview,
@@ -911,12 +912,13 @@ where
 
 /// O que `configure_split_webview` chama no builder, com os nomes do wry. O
 /// produto passa o `WebViewBuilder`; o gate passa um registo e ve o perfil,
-/// o script e os handlers que o WebView2 receberia -- e chama-os.
+/// o script e os handlers que o WebView2 receberia -- e chama-os. A trava
+/// de navegacao nao esta aqui: vem de `hooked_builder` (NavGate::Web com a
+/// origem local do `SplitBuild`), como em todas as WebViews.
 pub(in crate::windows_app) trait SplitWebViewTarget: Sized {
     fn with_incognito(self, incognito: bool) -> Self;
     fn with_initialization_script(self, script: String) -> Self;
     fn with_ipc_handler(self, handler: impl Fn(Request<String>) + 'static) -> Self;
-    fn with_navigation_handler(self, handler: impl Fn(String) -> bool + 'static) -> Self;
     /// So o endereco do popup: as `NewWindowFeatures` do wry trazem o
     /// ICoreWebView2 de quem abriu, e nao se usam.
     fn with_new_window_req_handler(
@@ -939,9 +941,6 @@ impl SplitWebViewTarget for WebViewBuilder<'static> {
     }
     fn with_ipc_handler(self, handler: impl Fn(Request<String>) + 'static) -> Self {
         WebViewBuilder::with_ipc_handler(self, handler)
-    }
-    fn with_navigation_handler(self, handler: impl Fn(String) -> bool + 'static) -> Self {
-        WebViewBuilder::with_navigation_handler(self, handler)
     }
     fn with_new_window_req_handler(
         self,
@@ -974,23 +973,12 @@ where
 {
     let ipc = build.page.ipc;
     let source_index = ipc.source_index;
-    let local_origin = build.local_origin.clone();
     let new_window_send = send.clone();
 
     builder
         .with_incognito(build.incognito)
         .with_initialization_script(build.page.init_script.clone())
         .with_ipc_handler(split_ipc_handler(build.capability.clone(), ipc, send))
-        .with_navigation_handler(move |target| {
-            if target
-                .get(..9)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
-            {
-                return false;
-            }
-            remote_web_target(&target, local_origin.as_deref())
-                || is_view_source_target(&target, local_origin.as_deref())
-        })
         .with_new_window_req_handler(move |target| {
             if remote_web_target(&target, None) {
                 // Um link que a fonte manda abrir noutra aba: o do Split

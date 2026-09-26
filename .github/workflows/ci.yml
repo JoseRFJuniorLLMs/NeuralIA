@@ -286,16 +286,19 @@ jobs:
             @{
               Label = "menu-label-frozen-at-registration"
               Test = "each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r"
+              SourcePath = "crates/neural-app/src/windows_app/webview_hooks.rs"
               Old = @'
-              move |native| ColumnMenuRequest {
-                  col_index,
-                  label: auto_scroll_menu_label(auto_scroll.get()),
+              move |native| {
+                  let flags = MenuFlags {
+                      auto_scroll: auto_scroll.get(),
+                  };
           '@
               New = @'
-              let frozen = auto_scroll_menu_label(auto_scroll.get());
-              move |native| ColumnMenuRequest {
-                  col_index,
-                  label: frozen,
+              let frozen = auto_scroll.get();
+              move |native| {
+                  let flags = MenuFlags {
+                      auto_scroll: frozen,
+                  };
           '@
             },
             @{
@@ -416,6 +419,44 @@ jobs:
           '@
               New = @'
               if false && !notice.kind.passes_focus() {
+          '@
+            },
+            @{
+              Label = "reader-born-without-hooks"
+              Test = "every_webview_gets_the_hooks"
+              SourcePath = "crates/neural-app/src/windows_app/app/pages.rs"
+              Old = @'
+                  let hooked = self.hooked_builder(builder, WebViewHost::Reader, None);
+                  let result = hooked.build_hooked(window);
+          '@
+              New = @'
+                  let result = builder.build(window);
+          '@
+            },
+            @{
+              Label = "gmail-monitor-gets-web-chain"
+              Test = "every_webview_gets_the_hooks"
+              SourcePath = "crates/neural-app/src/windows_app/app/gmail.rs"
+              Old = @'
+              let hooked = self.hooked_builder(builder, WebViewHost::GmailMonitor, None);
+          '@
+              New = @'
+              let hooked = self.hooked_builder(builder, WebViewHost::External, None);
+          '@
+            },
+            @{
+              Label = "resource-gate-answers-neuralia-pdf"
+              Test = "custom_schemes_are_never_answered_by_the_resource_gate"
+              SourcePath = "crates/neural-app/src/windows_app/webview_hooks.rs"
+              Old = @'
+              if is_custom_scheme_request(uri) {
+                  return false;
+              }
+          '@
+              New = @'
+              if is_custom_scheme_request(uri) {
+                  return uri.contains("neuralia-pdf");
+              }
           '@
             }
           )

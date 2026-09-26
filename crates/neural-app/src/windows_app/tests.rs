@@ -1,5 +1,5 @@
 use super::*;
-use crate::gemini_live::{LiveAction, live_page_url, live_panel_navigation};
+use crate::gemini_live::{LiveAction, live_page_url, live_panel_allows_navigation};
 use crate::panel_chrome::panel_width_from_drag;
 use std::ffi::OsString;
 use windows_sys::Win32::Graphics::Gdi::GetDIBits;
@@ -2588,13 +2588,13 @@ fn the_live_panel_handlers_are_the_gatekeepers_it_ships_with() {
     assert!(matches!(seen[1], UserEvent::Live(LiveMessage::Stopped)));
     assert!(matches!(seen[2], UserEvent::Live(LiveMessage::Close)));
 
-    assert!(live_panel_navigation(page.clone()));
+    assert!(live_panel_allows_navigation(&page));
     for target in [
         "https://aistudio.google.com/apikey",
         "http://neuralia-live.localhost/live.js",
         "about:blank",
     ] {
-        assert!(!live_panel_navigation(target.to_string()), "{target}");
+        assert!(!live_panel_allows_navigation(target), "{target}");
     }
 
     for kind in [
@@ -6895,10 +6895,13 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
     // cores) junto da pilula nova, como o editor do Chrome.
     let new_group = body("fn group_context_tab", "fn join_context_tab_group");
     assert!(new_group.contains("self.show_group_menu(source_index, group_index, true)"));
-    // A fonte ao lado regista o item de rolagem com a coluna dela.
-    assert!(
-        source.contains("self.install_context_menu(&webview, WebViewHost::Split(source_index));")
-    );
+    // A fonte ao lado recebe os ganchos com a coluna dela e o seu
+    // privado (o item de rolagem vem dai): o HookedBuilder constroi-a com
+    // as duas metades.
+    assert!(source.contains("let host = WebViewHost::split(source_index, private);"));
+    assert!(source.contains(
+        "let hooked = self.hooked_builder(builder, host, build.local_origin.clone());\n        let built = hooked.build_hooked_as_child(window);"
+    ));
 }
 
 #[test]
@@ -7194,6 +7197,24 @@ fn spec_0108_remote_scripts_use_message_transport_without_capability_urls() {
 
 #[test]
 fn spec_0108_remote_navigation_handlers_reject_neuralia_scheme() {
+    // A trava de navegacao de cada WebView e a cadeia da tabela
+    // (`web_navigation_verdict`), instalada por `hooked_builder`: nenhum
+    // builder que embarca instala a sua propria -- uma segunda
+    // `with_navigation_handler` no builder substituiria a da tabela.
+    let root = include_str!("../windows_app.rs");
+    assert!(
+        !root.contains(".with_navigation_handler("),
+        "windows_app.rs"
+    );
+    for (name, content) in ALL_MODULES {
+        if matches!(*name, "webview_hooks.rs" | "tests.rs") {
+            continue;
+        }
+        assert!(
+            !content.contains("with_navigation_handler("),
+            "{name} instala a sua propria trava de navegacao"
+        );
+    }
     let source = shipped_source();
     for builder in [
         "fn pdf_webview_builder",
@@ -7208,11 +7229,28 @@ fn spec_0108_remote_navigation_handlers_reject_neuralia_scheme() {
             .and_then(|part| part.split(".with_permission_handler").next())
             .expect(builder);
         assert!(body.contains("with_ipc_handler"), "{builder}");
-        assert!(
-            body.contains("eq_ignore_ascii_case(\"neuralia:\")"),
-            "{builder}"
-        );
         assert!(!body.contains("remote_neuralia_action"), "{builder}");
+    }
+    // E cada cadeia remota recusa `neuralia:` em qualquer caixa, com ou
+    // sem origem local: uma accao pedida por navegacao nunca navega.
+    for gate in [NavGate::Web, NavGate::Pdf, NavGate::Gmail] {
+        for local_origin in [None, Some("http://127.0.0.1:8000")] {
+            for target in [
+                "neuralia:home",
+                "NEURALIA:home",
+                "NeuRaLia:clearhistory",
+                "neuralia:web?url=https://example.com/",
+                "neuralia://home",
+            ] {
+                assert!(
+                    matches!(
+                        web_navigation_verdict(gate, local_origin, target),
+                        NavVerdict::Deny
+                    ),
+                    "{gate:?} {local_origin:?} {target}"
+                );
+            }
+        }
     }
 }
 
@@ -7244,9 +7282,7 @@ fn epub_pages_reach_native_code_only_through_their_own_channel() {
     );
     for required in [
         "handle_epub_ipc(&source, request.body(), &worker)",
-        ".with_navigation_handler(|target| epub_navigation_allowed(&target))",
         ".with_new_window_req_handler(|_, _| NewWindowResponse::Deny)",
-        ".with_download_started_handler(|_, _| false)",
         "UserEvent::EpubDropped(paths)",
     ] {
         assert!(
@@ -7254,6 +7290,18 @@ fn epub_pages_reach_native_code_only_through_their_own_channel() {
             "epub_webview_builder perdeu {required}"
         );
     }
+    // A trava de navegacao e a recusa de downloads vem da tabela dos
+    // ganchos, pelo hospedeiro Epub que o sitio de nascimento declara.
+    let open = body(&source, "fn open_epub_page", "fn epub_webview_builder");
+    assert!(
+        open.contains(
+            "let builder = self.epub_webview_builder(runtime).with_url(url);\n        let hooked = self.hooked_builder(builder, WebViewHost::Epub, None);\n        let result = hooked.build_hooked(window);"
+        ),
+        "open_epub_page nao passa o builder pelos ganchos do Epub"
+    );
+    let hooks = webview_hooks(WebViewHost::Epub);
+    assert_eq!(hooks.nav_gate, NavGate::Epub);
+    assert_eq!(hooks.downloads, DownloadPolicy::Deny);
     assert!(
         builder.contains(".with_permission_handler(|_| PermissionResponse::Deny)"),
         "epub_webview_builder tem de negar todas as permissoes"
@@ -8101,137 +8149,925 @@ fn column_menu_item_routes_to_that_columns_ctrl_r_toggle() {
     assert!(column_menu_event(COMPARATOR_COLUMNS, COLUMN_MENU_AUTO_SCROLL).is_none());
 }
 
-/// ctx-1: as colunas das IAs E a fonte aberta ao lado -- que o tick da
-/// rolagem tambem rola e onde o Ctrl+R tambem funciona (a resposta de uma
-/// IA pedida no painel privado abre ali) -- recebem o item. O painel
-/// lateral e os servicos, que nao rolam, nao.
+/// ctx-1: as colunas das IAs E a fonte aberta ao lado, privada ou nao --
+/// que o tick da rolagem tambem rola e onde o Ctrl+R tambem funciona (a
+/// resposta de uma IA pedida no painel privado abre ali) -- recebem o item
+/// de rolagem do registo. Nenhum outro hospedeiro o recebe.
 #[test]
 fn ai_columns_and_the_split_get_the_auto_scroll_menu_item() {
     for col in 0..COMPARATOR_COLUMNS {
-        assert_eq!(context_menu_column(WebViewHost::Column(col)), Some(col));
-        assert_eq!(
-            context_menu_column(WebViewHost::Split(col)),
-            Some(col),
-            "a fonte ao lado da coluna {col} rola e tem de oferecer parar"
-        );
-    }
-    for host in [
-        WebViewHost::Column(COMPARATOR_COLUMNS),
-        WebViewHost::Split(COMPARATOR_COLUMNS),
-        WebViewHost::SidePanel,
-        WebViewHost::Service,
-    ] {
-        assert_eq!(context_menu_column(host), None, "{host:?}");
-    }
-
-    // O que `install_context_menu` corre a cada WebView construida: o
-    // registo acontece para as colunas e para a fonte ao lado, com o
-    // indice certo, e para mais nenhuma.
-    for col in 0..COMPARATOR_COLUMNS {
-        for host in [WebViewHost::Column(col), WebViewHost::Split(col)] {
-            let mut registered = Vec::new();
-            let missing = install_column_menu(host, |index| {
-                registered.push(index);
-                Ok(())
-            });
-            assert_eq!(registered, [col], "{host:?}");
-            assert_eq!(missing, None, "{host:?}");
+        for host in [
+            WebViewHost::Column(col),
+            WebViewHost::Split(col),
+            WebViewHost::PrivateSplit(col),
+        ] {
+            assert_eq!(context_menu_column(host), Some(col), "{host:?}");
+            let ids: Vec<usize> = webview_menu_items(host)
+                .into_iter()
+                .map(|item| item.id)
+                .collect();
+            assert_eq!(ids, [COLUMN_MENU_AUTO_SCROLL], "{host:?}");
+            assert_eq!(webview_hooks(host).menu, ids, "{host:?}: a tabela diverge");
         }
     }
-    for host in [
-        WebViewHost::SidePanel,
-        WebViewHost::Service,
-        WebViewHost::Column(COMPARATOR_COLUMNS),
-        WebViewHost::Split(COMPARATOR_COLUMNS),
-    ] {
-        let mut registered = Vec::new();
-        let missing = install_column_menu(host, |index| {
-            registered.push(index);
-            Ok(())
-        });
+    for host in WebViewHost::ALL
+        .into_iter()
+        .filter(|host| context_menu_column(*host).is_none())
+        .chain([
+            WebViewHost::Column(COMPARATOR_COLUMNS),
+            WebViewHost::Split(COMPARATOR_COLUMNS),
+            WebViewHost::PrivateSplit(COMPARATOR_COLUMNS),
+        ])
+    {
+        assert_eq!(context_menu_column(host), None, "{host:?}");
         assert!(
-            registered.is_empty(),
-            "{host:?} ganhou o item: {registered:?}"
+            webview_menu_items(host).is_empty(),
+            "{host:?} ganhou itens de menu"
         );
-        assert_eq!(missing, None, "{host:?}");
+        assert!(webview_hooks(host).menu.is_empty(), "{host:?}");
     }
-
-    // Um runtime sem ContextMenuRequested: nada sobe nem para, a falha
-    // vira uma linha de log que diz a coluna e porque.
-    let missing = install_column_menu(WebViewHost::Column(2), |_| {
-        Err("ICoreWebView2_11 indisponível: E_NOINTERFACE".to_string())
-    })
-    .expect("a falha do registo fica no log");
-    assert!(missing.contains("coluna 2"), "{missing}");
-    assert!(missing.contains("E_NOINTERFACE"), "{missing}");
+    assert_eq!(
+        WebViewHost::ALL
+            .into_iter()
+            .filter(|host| context_menu_column(*host).is_none())
+            .count(),
+        8,
+        "so tres tipos de hospedeiro rolam"
+    );
 }
 
 /// ctx-2: o que o botao direito de uma coluna faz a CADA pedido, pelo
-/// mesmo `column_menu_responder` que o registo no WebView2 e a pilula
+/// mesmo `webview_menu_responder` que o registo no WebView2 e a pilula
 /// usam. Criado uma vez (como no registo), le o estado da rolagem em cada
 /// pedido -- um rotulo lido no registo ficava "Ativar" para sempre --, poe
-/// o item depois dos nativos e, escolhido, e o Ctrl+R dessa coluna.
+/// os itens depois dos nativos e, escolhido, e o Ctrl+R dessa coluna.
 #[test]
 fn each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r() {
     for col in 0..COMPARATOR_COLUMNS {
-        let flag = SharedFlag::default();
-        let respond = column_menu_responder(col, flag.clone());
+        for host in [
+            WebViewHost::Column(col),
+            WebViewHost::Split(col),
+            WebViewHost::PrivateSplit(col),
+        ] {
+            let flag = SharedFlag::default();
+            let respond = webview_menu_responder(host, flag.clone());
 
-        let first = respond(7);
-        assert_eq!(first.label, LABEL_TURN_ON, "coluna {col}");
-        assert_eq!(
-            first.placement,
-            ColumnMenuPlacement {
-                separator_at: Some(7),
-                item_at: 8,
-            },
-            "copiar, colar e inspecionar ficam onde o WebView2 os pos"
-        );
-        assert!(
-            matches!(first.selected(), Some(UserEvent::ToggleAutoScroll)),
-            "coluna {col}: o item nao faz o Ctrl+R"
-        );
+            let first = respond(7);
+            assert_eq!(first.separator_at, Some(7), "{host:?}");
+            assert_eq!(first.items.len(), 1, "{host:?}");
+            assert_eq!(first.items[0].label, LABEL_TURN_ON, "{host:?}");
+            assert_eq!(first.items[0].id, COLUMN_MENU_AUTO_SCROLL);
+            assert_eq!(first.items[0].host, host);
+            assert_eq!(
+                first.items[0].at, 8,
+                "copiar, colar e inspecionar ficam onde o WebView2 os pos"
+            );
+            assert!(
+                matches!(first.items[0].selected(), Some(UserEvent::ToggleAutoScroll)),
+                "{host:?}: o item nao faz o Ctrl+R"
+            );
 
-        // Ctrl+R liga a rolagem entre dois botoes direitos: o MESMO
-        // responder, sem novo registo, ja oferece desativar.
-        assert!(flag.toggle());
-        let second = respond(0);
-        assert_eq!(second.label, LABEL_TURN_OFF, "coluna {col}: rotulo preso");
-        assert_eq!(second.placement.separator_at, None);
-        assert!(matches!(
-            second.selected(),
-            Some(UserEvent::ToggleAutoScroll)
-        ));
+            // Ctrl+R liga a rolagem entre dois botoes direitos: o MESMO
+            // responder, sem novo registo, ja oferece desativar.
+            assert!(flag.toggle());
+            let second = respond(0);
+            assert_eq!(
+                second.items[0].label, LABEL_TURN_OFF,
+                "{host:?}: rotulo preso"
+            );
+            assert_eq!(second.separator_at, None);
+            assert_eq!(second.items[0].at, 0);
+            assert!(matches!(
+                second.items[0].selected(),
+                Some(UserEvent::ToggleAutoScroll)
+            ));
 
-        // A pilula usa o mesmo responder, sem itens nativos: o id que o
-        // TrackPopupMenu devolve e o do comando, e so esse faz algo.
-        flag.set(false);
-        let pill = column_menu_responder(col, flag.clone())(0);
-        assert_eq!(pill.label, LABEL_TURN_ON);
-        assert_eq!(pill.command, COLUMN_MENU_AUTO_SCROLL);
-        assert_ne!(pill.command, 0, "0 e o menu fechado sem escolha");
+            // A pilula usa o mesmo responder, sem itens nativos: o id que o
+            // TrackPopupMenu devolve e o do comando, e so esse faz algo.
+            flag.set(false);
+            let pill = webview_menu_responder(host, flag.clone())(0);
+            let item = pill
+                .item(COLUMN_MENU_AUTO_SCROLL)
+                .expect("o item da pilula");
+            assert_eq!(item.label, LABEL_TURN_ON);
+            assert!(pill.item(0).is_none(), "0 e o menu fechado sem escolha");
+            assert!(pill.item(COLUMN_MENU_AUTO_SCROLL + 1).is_none());
+        }
+    }
+    // Um hospedeiro que nao rola: nem separador nem itens, com nativos ou
+    // sem eles -- o menu do WebView2 fica como veio.
+    for host in [WebViewHost::SidePanel, WebViewHost::Reader] {
+        let respond = webview_menu_responder(host, SharedFlag::default());
+        for native in [0, 7] {
+            let request = respond(native);
+            assert_eq!(request.separator_at, None, "{host:?} {native}");
+            assert!(request.items.is_empty(), "{host:?} {native}");
+        }
     }
 }
 
 #[test]
 fn column_menu_item_goes_after_every_native_item() {
-    // Um menu que o WebView2 abriu vazio recebe so o item, sem separador.
+    // Um menu que o WebView2 abriu vazio recebe so os itens, sem separador.
     assert_eq!(
-        column_menu_placement(0),
-        ColumnMenuPlacement {
+        menu_placement(0),
+        MenuPlacement {
             separator_at: None,
-            item_at: 0,
+            first_item_at: 0,
         }
     );
     for native in 1..=40u32 {
-        let placement = column_menu_placement(native);
+        let placement = menu_placement(native);
         // Cada inserção empurra o que esta nesse indice para baixo: um
         // indice abaixo de `native` tiraria copiar/colar/inspecionar do
-        // sitio. O separador fica logo a seguir ao ultimo nativo e o item
-        // logo a seguir ao separador -- o fim do menu, como no Chrome.
+        // sitio. O separador fica logo a seguir ao ultimo nativo e o
+        // primeiro item logo a seguir ao separador -- o fim do menu, como
+        // no Chrome.
         assert_eq!(placement.separator_at, Some(native), "{native} nativos");
-        assert_eq!(placement.item_at, native + 1, "{native} nativos");
+        assert_eq!(placement.first_item_at, native + 1, "{native} nativos");
     }
+}
+
+// ===================== os ganchos de cada WebView (infra-webview-hooks) =====================
+
+/// O que `install_hooks_with` pediu ao registador, no lugar do COM do
+/// WebView2.
+#[derive(Default)]
+struct RecordingRegistrar {
+    menus: Vec<(WebViewHost, Vec<usize>)>,
+    accelerators: Vec<WebViewHost>,
+    fail_menu: bool,
+    fail_accelerators: bool,
+}
+
+impl HookRegistrar for RecordingRegistrar {
+    fn context_menu(&mut self, host: WebViewHost, items: &[usize]) -> Result<(), String> {
+        if self.fail_menu {
+            return Err("ICoreWebView2_11 indisponível: E_NOINTERFACE".to_string());
+        }
+        self.menus.push((host, items.to_vec()));
+        Ok(())
+    }
+    fn accelerators(&mut self, host: WebViewHost) -> Result<(), String> {
+        if self.fail_accelerators {
+            return Err("add_AcceleratorKeyPressed falhou: E_FAIL".to_string());
+        }
+        self.accelerators.push(host);
+        Ok(())
+    }
+}
+
+/// O que `hook_webview_builder` pos no builder, no lugar do WebViewBuilder
+/// (que nao deixa ler o que recebeu).
+#[derive(Default)]
+struct RecordedHookedBuilder {
+    navigation: Option<Box<dyn Fn(String) -> bool>>,
+    /// O handler de downloads que a tabela pos, ja chamado com um
+    /// download: `Some(true)` recusou-o; `None` e nenhum handler (o
+    /// WebView2 trata os downloads como sempre).
+    download_refused: Option<bool>,
+    page_load: Option<Box<dyn Fn(wry::PageLoadEvent, String)>>,
+}
+
+impl HookedWebViewBuilder for RecordedHookedBuilder {
+    fn with_navigation_handler(mut self, handler: impl Fn(String) -> bool + 'static) -> Self {
+        self.navigation = Some(Box::new(handler));
+        self
+    }
+    fn with_download_started_handler(
+        mut self,
+        mut handler: impl FnMut(String, &mut PathBuf) -> bool + 'static,
+    ) -> Self {
+        let mut path = PathBuf::from("C:/Users/x/Downloads/setup.exe");
+        self.download_refused = Some(!handler(
+            "https://example.com/setup.exe".to_string(),
+            &mut path,
+        ));
+        self
+    }
+    fn with_on_page_load_handler(
+        mut self,
+        handler: impl Fn(wry::PageLoadEvent, String) + 'static,
+    ) -> Self {
+        self.page_load = Some(Box::new(handler));
+        self
+    }
+}
+
+/// Gate: a tabela dos ganchos, linha a linha. As colunas, as fontes ao
+/// lado, a Web completa e os servicos ficam com os downloads do WebView2
+/// (o gestor da 2.3 entra por ai); cada pagina local nossa e o monitor do
+/// Gmail recusam-nos. Cada hospedeiro tem a sua cadeia de navegacao, todos
+/// recebem o AcceleratorKeyPressed, nenhum responde a pedidos de recursos
+/// e o slot das distracoes esta vazio.
+#[test]
+fn the_webview_hooks_table() {
+    let row = |menu: &[usize], downloads: DownloadPolicy, nav_gate: NavGate| WebViewHooks {
+        menu: menu.to_vec(),
+        downloads,
+        resource_gate: ResourceGatePolicy::Open,
+        nav_gate,
+        accelerators: true,
+        distraction: None,
+    };
+    use DownloadPolicy::{Deny, Managed};
+    let scroll = [COLUMN_MENU_AUTO_SCROLL];
+    for col in 0..COMPARATOR_COLUMNS {
+        assert_eq!(
+            webview_hooks(WebViewHost::Column(col)),
+            row(&scroll, Managed, NavGate::Web)
+        );
+        assert_eq!(
+            webview_hooks(WebViewHost::Split(col)),
+            row(&scroll, Managed, NavGate::Web)
+        );
+        assert_eq!(
+            webview_hooks(WebViewHost::PrivateSplit(col)),
+            row(&scroll, Managed, NavGate::Web)
+        );
+    }
+    assert_eq!(
+        webview_hooks(WebViewHost::Column(COMPARATOR_COLUMNS)),
+        row(&[], Managed, NavGate::Web)
+    );
+    assert_eq!(
+        webview_hooks(WebViewHost::External),
+        row(&[], Managed, NavGate::Web)
+    );
+    assert_eq!(
+        webview_hooks(WebViewHost::Reader),
+        row(&[], Deny, NavGate::Reader)
+    );
+    assert_eq!(
+        webview_hooks(WebViewHost::Pdf),
+        row(&[], Deny, NavGate::Pdf)
+    );
+    assert_eq!(
+        webview_hooks(WebViewHost::Epub),
+        row(&[], Deny, NavGate::Epub)
+    );
+    assert_eq!(
+        webview_hooks(WebViewHost::Live),
+        row(&[], Deny, NavGate::Live)
+    );
+    assert_eq!(
+        webview_hooks(WebViewHost::GmailMonitor),
+        row(&[], Deny, NavGate::Gmail)
+    );
+    assert_eq!(
+        webview_hooks(WebViewHost::SidePanel),
+        row(&[], Deny, NavGate::SidePanel)
+    );
+    for service in [
+        Service::Meet,
+        Service::WhatsApp,
+        Service::YouTube,
+        Service::Gmail,
+        Service::Breath,
+    ] {
+        assert_eq!(
+            webview_hooks(WebViewHost::Service(service)),
+            row(&[], Managed, NavGate::Service(service)),
+            "{service:?}"
+        );
+    }
+    // Cada tipo de hospedeiro tem a sua linha, e os nomes nao se repetem.
+    let kinds: Vec<&str> = WebViewHost::ALL.iter().map(|host| host.kind()).collect();
+    for (index, kind) in kinds.iter().enumerate() {
+        assert!(!kinds[..index].contains(kind), "{kind} repetido em ALL");
+    }
+    assert_eq!(WebViewHost::split(1, true), WebViewHost::PrivateSplit(1));
+    assert_eq!(WebViewHost::split(1, false), WebViewHost::Split(1));
+}
+
+/// Gate: toda a WebView recebe os ganchos -- as duas metades, com o
+/// hospedeiro certo, em cada sitio onde uma nasce.
+#[test]
+fn every_webview_gets_the_hooks() {
+    use wry::PageLoadEvent;
+
+    // (a) Depois do build: o registador anota o AcceleratorKeyPressed em
+    // todos os hospedeiros e os itens do menu so nos que rolam.
+    for host in WebViewHost::ALL {
+        let mut registrar = RecordingRegistrar::default();
+        let missing = install_hooks_with(host, &webview_hooks(host), &mut registrar);
+        assert!(missing.is_empty(), "{host:?}: {missing:?}");
+        assert_eq!(
+            registrar.accelerators,
+            vec![host],
+            "{host:?} sem AcceleratorKeyPressed"
+        );
+        if context_menu_column(host).is_some() {
+            assert_eq!(
+                registrar.menus,
+                vec![(host, vec![COLUMN_MENU_AUTO_SCROLL])],
+                "{host:?}"
+            );
+        } else {
+            assert!(
+                registrar.menus.is_empty(),
+                "{host:?} ganhou itens de menu: {:?}",
+                registrar.menus
+            );
+        }
+    }
+    // Um runtime sem os eventos: nada sobe nem para, cada falha vira uma
+    // linha de log que diz o hospedeiro e porque, e as outras metades
+    // seguem.
+    let mut registrar = RecordingRegistrar {
+        fail_menu: true,
+        fail_accelerators: true,
+        ..Default::default()
+    };
+    let host = WebViewHost::Column(2);
+    let missing = install_hooks_with(host, &webview_hooks(host), &mut registrar);
+    assert_eq!(missing.len(), 2, "{missing:?}");
+    assert!(
+        missing[0].contains("coluna 2") && missing[0].contains("E_NOINTERFACE"),
+        "{}",
+        missing[0]
+    );
+    assert!(
+        missing[1].contains("coluna 2") && missing[1].contains("AcceleratorKeyPressed"),
+        "{}",
+        missing[1]
+    );
+    let mut registrar = RecordingRegistrar {
+        fail_menu: true,
+        ..Default::default()
+    };
+    let missing = install_hooks_with(host, &webview_hooks(host), &mut registrar);
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert_eq!(registrar.accelerators, vec![host]);
+
+    // (b) Antes do build: a trava e a cadeia do hospedeiro com a origem
+    // local passada, os downloads recusados onde a tabela manda, e o fim
+    // do carregamento (so ele) vira `PageLoaded` com o hospedeiro.
+    let local = "http://127.0.0.1:8000";
+    for host in WebViewHost::ALL {
+        let seen: std::rc::Rc<std::cell::RefCell<Vec<UserEvent>>> = Default::default();
+        let sink = std::rc::Rc::clone(&seen);
+        let built = hook_webview_builder(
+            RecordedHookedBuilder::default(),
+            host,
+            Some(local.to_string()),
+            move |event| sink.borrow_mut().push(event),
+        );
+        let hooks = webview_hooks(host);
+        assert_eq!(
+            built.download_refused,
+            (hooks.downloads == DownloadPolicy::Deny).then_some(true),
+            "{host:?}: downloads"
+        );
+        let navigate = built.navigation.as_ref().expect("navigation handler");
+        for target in [
+            "https://example.com/",
+            "http://127.0.0.1:8000/x",
+            "http://192.168.1.1/",
+            "neuralia:home",
+            "about:blank",
+            "javascript:alert(1)",
+            "http://neuralia-pdf.localhost/viewer.html",
+            "http://neuralia-epub.localhost/library.html",
+            "http://neuralia-live.localhost/live.html",
+            "https://mail.google.com/mail/u/0/",
+            "data:text/html,<p>x</p>",
+        ] {
+            let allowed = navigate(target.to_string());
+            match web_navigation_verdict(hooks.nav_gate, Some(local), target) {
+                NavVerdict::Allow => assert!(allowed, "{host:?} {target}"),
+                NavVerdict::Deny => assert!(!allowed, "{host:?} {target}"),
+                NavVerdict::DenyWith(event) => {
+                    assert!(!allowed, "{host:?} {target}");
+                    let sent = seen
+                        .borrow_mut()
+                        .pop()
+                        .unwrap_or_else(|| panic!("{host:?} {target}: sem evento"));
+                    assert_eq!(
+                        format!("{sent:?}"),
+                        format!("{event:?}"),
+                        "{host:?} {target}"
+                    );
+                }
+            }
+            assert!(
+                seen.borrow().is_empty(),
+                "{host:?} {target}: eventos a mais {:?}",
+                seen.borrow()
+            );
+        }
+        let loaded = built.page_load.as_ref().expect("page load handler");
+        loaded(PageLoadEvent::Started, "https://example.com/".to_string());
+        assert!(
+            seen.borrow().is_empty(),
+            "{host:?}: o inicio do carregamento virou evento"
+        );
+        loaded(PageLoadEvent::Finished, "https://example.com/".to_string());
+        assert!(
+            matches!(
+                seen.borrow_mut().pop(),
+                Some(UserEvent::WebView(WebViewEvent::PageLoaded { page, url }))
+                    if page == host && url == "https://example.com/"
+            ),
+            "{host:?}: sem PageLoaded"
+        );
+    }
+
+    // (c) E cada sitio onde uma WebView nasce passa pelas duas metades com
+    // o seu hospedeiro (texto, §4.3: o App nao se constroi sem janela). As
+    // duas metades sao uma so chamada: `hooked_builder` devolve o
+    // `HookedBuilder` (campos privados: nem os sitios nem este teste o
+    // montam), e so `build_hooked`/`build_hooked_as_child` constroem -- o
+    // `build` do wry nao aparece fora do modulo. Assim nenhuma WebView
+    // nasce sem a cadeia, e o hospedeiro da metade do COM e o do builder.
+    let source = shipped_source();
+    let mut outside = include_str!("../windows_app.rs").replace("\r\n", "\n");
+    for (name, content) in ALL_MODULES {
+        if *name != "tests.rs" && *name != "webview_hooks.rs" {
+            outside.push('\n');
+            outside.push_str(&content.replace("\r\n", "\n"));
+        }
+    }
+    assert!(
+        !outside.contains(".build_as_child("),
+        "uma WebView filha nasce fora de HookedBuilder"
+    );
+    assert_eq!(
+        outside.matches(".build(").count(),
+        outside.matches(".build()").count(),
+        "uma WebView de topo nasce fora de HookedBuilder (so o EventLoop chama .build() sem argumentos)"
+    );
+    let module = ALL_MODULES
+        .iter()
+        .find(|(name, _)| *name == "webview_hooks.rs")
+        .map(|(_, content)| content.replace("\r\n", "\n"))
+        .expect("webview_hooks.rs em ALL_MODULES");
+    assert_eq!(module.matches(".build(window)").count(), 1);
+    assert_eq!(module.matches(".build_as_child(window)").count(), 1);
+    assert_eq!(
+        module.matches("install_webview_hooks(").count(),
+        3,
+        "a metade do COM e chamada pelos dois build_hooked e definida uma vez, privada"
+    );
+    assert!(
+        module.contains(
+            "    fn install_webview_hooks(&self, webview: &WebView, host: WebViewHost) {"
+        )
+    );
+
+    // Uma WebView a mais, ou um sitio que constroi sem os ganchos,
+    // desequilibra a conta.
+    let births = source.matches(".build_hooked(window)").count()
+        + source.matches(".build_hooked_as_child(window)").count();
+    assert_eq!(births, 11, "sitios onde uma WebView nasce: {births}");
+    assert_eq!(
+        source.matches(".hooked_builder(").count(),
+        births,
+        "uma WebView nasce sem passar por hooked_builder"
+    );
+    // O que fica por prender e o hospedeiro que cada sitio declara ao
+    // `hooked_builder` -- o argumento que escolhe a cadeia de navegacao e a
+    // politica de downloads dessa WebView: o monitor do Gmail nascido como
+    // `External` aceitava qualquer https e descarregava em silencio, e a
+    // conta acima nao o via. Cada um dos 11 sitios e uma linha com o
+    // hospedeiro literal, colada a ultima linha do builder que ela
+    // embrulha, e aparece uma so vez; a conta garante que nao ha um 12.o.
+    let sites: [(&str, &str); 11] = [
+        (
+            "Column",
+            ".with_url(url.as_str());\n            let hooked = self.hooked_builder(builder, WebViewHost::Column(i), None);",
+        ),
+        (
+            "Split",
+            ".with_url(valid.as_str());\n        let hooked = self.hooked_builder(builder, host, build.local_origin.clone());",
+        ),
+        // A Web completa nasce duas vezes: um link, com a origem local que
+        // a pagina autorizou; o agente, que nunca a tem.
+        (
+            "External",
+            ".external_webview_builder(local_origin.clone(), false)\n            .with_url(url);\n        let hooked = self.hooked_builder(builder, WebViewHost::External, local_origin);",
+        ),
+        (
+            "External",
+            ".external_webview_builder(None, true)\n            .with_url(valid.as_str());\n        let hooked = self.hooked_builder(builder, WebViewHost::External, None);",
+        ),
+        (
+            "Reader",
+            "let builder = self.reader_webview_builder().with_html(html);\n        let hooked = self.hooked_builder(builder, WebViewHost::Reader, None);",
+        ),
+        (
+            "Pdf",
+            ".with_url(format!(\"{PDF_ORIGIN}/viewer.html\"));\n        let hooked = self.hooked_builder(builder, WebViewHost::Pdf, None);",
+        ),
+        (
+            "Epub",
+            "let builder = self.epub_webview_builder(runtime).with_url(url);\n        let hooked = self.hooked_builder(builder, WebViewHost::Epub, None);",
+        ),
+        (
+            "Live",
+            ".with_permission_handler(live_panel_permission);\n        let hooked = self.hooked_builder(builder, WebViewHost::Live, None);",
+        ),
+        (
+            "GmailMonitor",
+            ".with_url(\"https://mail.google.com/mail/u/0/#inbox\");\n        let hooked = self.hooked_builder(builder, WebViewHost::GmailMonitor, None);",
+        ),
+        (
+            "SidePanel",
+            ".with_new_window_req_handler(|_, _| NewWindowResponse::Deny);\n        let hooked = self.hooked_builder(builder, WebViewHost::SidePanel, None);",
+        ),
+        (
+            "Service",
+            ".with_permission_handler(move |kind| service_panel_permission(service, kind));\n        let hooked = self.hooked_builder(builder, WebViewHost::Service(service), None);",
+        ),
+    ];
+    for (kind, site) in sites {
+        assert_eq!(
+            source.matches(site).count(),
+            1,
+            "{kind}: o sitio de nascimento mudou de hospedeiro, de forma ou repete-se:\n{site}"
+        );
+    }
+    // Cada tipo de hospedeiro tem o seu sitio preso; a fonte privada nasce
+    // no sitio da fonte ao lado (`WebViewHost::split(_, private)`).
+    for host in WebViewHost::ALL {
+        let born_at = match host {
+            WebViewHost::PrivateSplit(_) => "Split",
+            other => other.kind(),
+        };
+        assert!(
+            sites.iter().any(|(kind, _)| *kind == born_at),
+            "{}: sem sitio de nascimento preso",
+            host.kind()
+        );
+    }
+    // A fonte ao lado e o unico sitio que passa o hospedeiro por uma
+    // variavel (a coluna e o privado vem do SplitBuild): e esta linha, e
+    // nenhuma outra `let host =` pode sombrea-la.
+    assert_eq!(
+        source.matches("let host = WebViewHost::").count(),
+        1,
+        "um sitio escolhe o hospedeiro fora da linha do hooked_builder"
+    );
+    assert!(source.contains("let host = WebViewHost::split(source_index, private);"));
+}
+
+/// Gate (critico: navegacao e origens locais): a cadeia de cada hospedeiro
+/// da, para cada alvo, exatamente o que o closure que cada builder tinha
+/// ate a 2.2.0 dava -- o veredicto e o evento. Os closures de antes estao
+/// aqui, letra por letra, como oraculo.
+#[test]
+fn navigation_verdicts_are_the_ones_the_builders_gave() {
+    type Oracle = Box<dyn Fn(String) -> (bool, Vec<String>)>;
+    let neuralia = |target: &str| {
+        target
+            .get(..9)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
+    };
+    let web = |local_origin: Option<String>| -> Oracle {
+        Box::new(move |target| {
+            if neuralia(&target) {
+                return (false, vec![]);
+            }
+            (
+                remote_web_target(&target, local_origin.as_deref())
+                    || is_view_source_target(&target, local_origin.as_deref()),
+                vec![],
+            )
+        })
+    };
+    // O PDF nunca teve origem local no closure: o oraculo e o mesmo com e
+    // sem ela.
+    let pdf = || -> Oracle {
+        Box::new(move |target| {
+            if neuralia(&target) {
+                return (false, vec![]);
+            }
+            if is_pdf_internal_target(&target) {
+                return (true, vec![]);
+            }
+            let mut sent = vec![];
+            if remote_web_target(&target, None) {
+                sent.push(format!("{:?}", UserEvent::OpenExternal(target)));
+            }
+            (false, sent)
+        })
+    };
+    let reader: Oracle = Box::new(|target| {
+        if target.starts_with("about:blank") {
+            return (true, vec![]);
+        }
+        let Ok(action_url) = Url::parse(&target) else {
+            return (false, vec![]);
+        };
+        if action_url.scheme() != "neuralia" {
+            return (false, vec![]);
+        }
+        if let Some(event) = neuralia_action(&target) {
+            return (false, vec![format!("{event:?}")]);
+        }
+        let mut sent = vec![];
+        match action_url.path().trim_matches('/') {
+            "home" => sent.push(format!("{:?}", UserEvent::HomeRequested)),
+            "web" => {
+                if let Some((_, value)) = action_url.query_pairs().find(|(key, _)| key == "url")
+                    && neural_core::validate_web_url(value.as_ref()).is_ok()
+                {
+                    sent.push(format!("{:?}", UserEvent::OpenExternal(value.into_owned())));
+                }
+            }
+            _ => {}
+        }
+        (false, sent)
+    });
+    let epub: Oracle =
+        Box::new(|target| (crate::epub_app::epub_navigation_allowed(&target), vec![]));
+    let live: Oracle = Box::new(|target| (live_panel_allows_navigation(&target), vec![]));
+    let gmail: Oracle = Box::new(move |target| {
+        if neuralia(&target) {
+            return (false, vec![]);
+        }
+        (
+            Url::parse(&target).ok().is_some_and(|url| {
+                url.scheme() == "https"
+                    && matches!(
+                        url.host_str(),
+                        Some("mail.google.com") | Some("accounts.google.com")
+                    )
+            }),
+            vec![],
+        )
+    });
+    let side_panel: Oracle = Box::new(|target| (panel_allows_navigation(&target), vec![]));
+    let service = |service: Service| -> Oracle {
+        Box::new(move |target| (service_panel_navigation(service, &target), vec![]))
+    };
+
+    let local = "http://192.168.1.50:3000";
+    let mut gates: Vec<(NavGate, Option<&str>, Oracle)> = vec![
+        (NavGate::Web, None, web(None)),
+        (NavGate::Web, Some(local), web(Some(local.to_string()))),
+        (NavGate::Pdf, None, pdf()),
+        (NavGate::Pdf, Some(local), pdf()),
+        (NavGate::Reader, None, reader),
+        (NavGate::Epub, None, epub),
+        (NavGate::Live, None, live),
+        (NavGate::Gmail, None, gmail),
+        (NavGate::SidePanel, None, side_panel),
+    ];
+    for kind in [
+        Service::Meet,
+        Service::WhatsApp,
+        Service::YouTube,
+        Service::Gmail,
+        Service::Breath,
+    ] {
+        gates.push((NavGate::Service(kind), None, service(kind)));
+    }
+
+    let corpus = [
+        "about:blank",
+        "ABOUT:BLANK",
+        "about:blank#x",
+        "about:blank.evil",
+        "   about:blank  ",
+        "about:srcdoc",
+        "neuralia:home",
+        "NEURALIA:home",
+        "neuralia:back",
+        "neuralia:clearhistory",
+        "neuralia:zoomin?x=1",
+        "neuralia:desconhecido",
+        "neuralia:/home/",
+        "neuralia:/web?url=https://example.com/",
+        "neuralia:web?url=https://example.com/x",
+        "neuralia:web?url=file:///C:/x",
+        "neuralia:web?url=http://192.168.1.1/",
+        "neuralia:web?other=1",
+        "neuralia://home",
+        "https://example.com/",
+        "https://example.com/x?y=1#z",
+        "https://example.com/home",
+        "https://example.com/web?url=https://example.com/x",
+        "http://192.168.1.50:3000/home",
+        "file:///home",
+        "http://example.com/",
+        "HTTPS://EXAMPLE.COM/",
+        "https://user:pw@example.com/",
+        "http://192.168.1.50:3000/",
+        "http://192.168.1.50:3000/x",
+        "http://192.168.1.50:9000/",
+        "http://192.168.1.51:3000/",
+        "http://192.168.1.1/admin",
+        "http://127.0.0.1:8080/",
+        "http://localhost/",
+        "http://10.0.0.1/",
+        "view-source:https://example.com/",
+        "view-source:http://192.168.1.50:3000/",
+        "view-source:http://192.168.1.1/",
+        "view-source:about:blank",
+        "view-source:neuralia:home",
+        "VIEW-SOURCE:https://example.com/",
+        "file:///C:/Windows/win.ini",
+        "javascript:alert(1)",
+        "data:text/html,<p>x</p>",
+        "DATA:TEXT/HTML,<p>x</p>",
+        "data:text/plain,x",
+        "ftp://example.com/",
+        "chrome://settings",
+        "edge://settings",
+        "",
+        "   ",
+        "not a url",
+        "http://neuralia-pdf.localhost/viewer.html",
+        "http://neuralia-pdf.localhost/",
+        "http://neuralia-pdf.localhost:8080/viewer.html",
+        "https://neuralia-pdf.localhost/viewer.html",
+        "http://neuralia-pdf.localhost.evil.com/",
+        "neuralia-pdf://viewer",
+        "http://neuralia-epub.localhost/library.html",
+        "http://neuralia-epub.localhost/reader.html",
+        "http://neuralia-epub.localhost/reader.html?id=abc",
+        "http://neuralia-epub.localhost/x",
+        "http://neuralia-epub.localhost:8080/library.html",
+        "http://user:pw@neuralia-epub.localhost/library.html",
+        "http://neuralia-live.localhost/live.html",
+        "http://neuralia-live.localhost/live.html#fim",
+        "http://NEURALIA-LIVE.localhost/live.html",
+        "http://neuralia-live.localhost/live.js",
+        "http://neuralia-live.localhost/",
+        "https://neuralia-live.localhost/live.html",
+        "https://mail.google.com/mail/u/0/#inbox",
+        "https://accounts.google.com/ServiceLogin",
+        "http://mail.google.com/",
+        "https://mail.google.com.evil.com/",
+        "https://evil.com/?u=https://mail.google.com/",
+        "https://www.youtube.com/watch?v=1",
+        "https://youtube.com/",
+        "https://youtu.be/x",
+        "https://m.youtube.com/watch?v=1",
+        "https://consent.youtube.com/m?continue=x",
+        "https://consent.google.com/ml?continue=x",
+        "http://www.youtube.com/watch?v=1",
+        "https://youtube.com.evil.example/",
+        "https://www.youtube.com@evil.example/",
+        "https://notyoutube.com/",
+        "https://www.google.com/",
+        "https://web.whatsapp.com/",
+        "https://meet.google.com/abc",
+        "https://aistudio.google.com/apikey",
+        "https://generativelanguage.googleapis.com/",
+    ];
+    let mut compared = 0usize;
+    for (gate, local_origin, oracle) in &gates {
+        for target in corpus {
+            let (expected_allowed, expected_sent) = oracle(target.to_string());
+            let (allowed, sent) = match web_navigation_verdict(*gate, *local_origin, target) {
+                NavVerdict::Allow => (true, vec![]),
+                NavVerdict::Deny => (false, vec![]),
+                NavVerdict::DenyWith(event) => (false, vec![format!("{event:?}")]),
+            };
+            assert_eq!(
+                (allowed, &sent),
+                (expected_allowed, &expected_sent),
+                "{gate:?} {local_origin:?} {target:?}"
+            );
+            compared += 1;
+        }
+    }
+    assert_eq!(compared, gates.len() * corpus.len());
+    // A cadeia nao e trivial: cada uma deixa passar alguma coisa e recusa
+    // alguma coisa, e as que agem mandam eventos.
+    for (gate, local_origin, _) in &gates {
+        let verdicts: Vec<NavVerdict> = corpus
+            .iter()
+            .map(|target| web_navigation_verdict(*gate, *local_origin, target))
+            .collect();
+        assert!(
+            verdicts.iter().any(|v| matches!(v, NavVerdict::Allow)),
+            "{gate:?} nunca deixa passar"
+        );
+        assert!(
+            verdicts.iter().any(|v| matches!(v, NavVerdict::Deny)),
+            "{gate:?} nunca recusa"
+        );
+        if matches!(gate, NavGate::Pdf | NavGate::Reader) {
+            assert!(
+                verdicts
+                    .iter()
+                    .any(|v| matches!(v, NavVerdict::DenyWith(_))),
+                "{gate:?} nunca age"
+            );
+        }
+    }
+    // A origem local so conta para a Web: com ela, a coluna/fonte/Web
+    // completa abre a origem autorizada e so ela.
+    assert!(matches!(
+        web_navigation_verdict(NavGate::Web, Some(local), "http://192.168.1.50:3000/x"),
+        NavVerdict::Allow
+    ));
+    assert!(matches!(
+        web_navigation_verdict(NavGate::Web, None, "http://192.168.1.50:3000/x"),
+        NavVerdict::Deny
+    ));
+    assert!(matches!(
+        web_navigation_verdict(NavGate::Web, Some(local), "http://192.168.1.51:3000/"),
+        NavVerdict::Deny
+    ));
+}
+
+/// Gate (critico: origens locais): o despachante de recursos nunca responde
+/// a um pedido a um esquema proprio do wry -- quem serve o PDF, os livros e
+/// o Live e o protocolo deles, e uma resposta daqui deixava a pagina sem
+/// nada. E hoje nao responde a mais nada: nenhuma politica bloqueia.
+#[test]
+fn custom_schemes_are_never_answered_by_the_resource_gate() {
+    let custom = [
+        "http://neuralia-pdf.localhost/viewer.html",
+        "http://neuralia-pdf.localhost/pdf.worker.mjs",
+        "http://NEURALIA-PDF.localhost/viewer.html",
+        "https://neuralia-pdf.localhost/viewer.html",
+        "neuralia-pdf://viewer.html",
+        "http://neuralia-epub.localhost/library.html",
+        "http://neuralia-epub.localhost/book/abc/OEBPS/ch1.xhtml",
+        "neuralia-epub://library.html",
+        "http://neuralia-live.localhost/live.html",
+        "http://neuralia-live.localhost/live.js",
+        "neuralia-live://live.html",
+        "  http://neuralia-live.localhost/live.html  ",
+    ];
+    let other = [
+        "https://example.com/",
+        "https://ads.example.com/tracker.js",
+        "http://neuralia-pdf.localhost.evil.com/viewer.html",
+        "http://neuralia-pdf.localhost:8080/viewer.html",
+        "http://evil.com/?u=http://neuralia-pdf.localhost/",
+        "http://127.0.0.1:8080/",
+        "about:blank",
+        "",
+    ];
+    for uri in custom {
+        assert!(is_custom_scheme_request(uri), "{uri}");
+    }
+    for uri in other {
+        assert!(!is_custom_scheme_request(uri), "{uri}");
+    }
+    for host in WebViewHost::ALL {
+        for uri in custom.iter().chain(other.iter()) {
+            assert!(
+                !resource_gate_answers(host, uri),
+                "{host:?} respondeu a {uri}"
+            );
+        }
+    }
+    assert_eq!(
+        CUSTOM_SCHEMES,
+        ["neuralia-pdf", "neuralia-epub", "neuralia-live"]
+    );
+}
+
+/// O `AcceleratorKeyPressed` de cada WebView consulta `accelerator_lookup`
+/// e so marca `Handled` quando ela prende a tecla. Hoje ela nao prende
+/// nenhuma, em nenhum hospedeiro -- nem os dez atalhos nativos do plano
+/// da 2.3, nem com a tecla presa, nem na subida: e o slot que
+/// infra-commands-keymap preenche.
+#[test]
+fn accelerator_lookup_binds_nothing_today() {
+    let chords = [
+        (0x44u32, true, false), // Ctrl+D
+        (0x4A, true, false),    // Ctrl+J
+        (0x45, true, true),     // Ctrl+Shift+E
+        (0x41, true, true),     // Ctrl+Shift+A
+        (0x4E, true, true),     // Ctrl+Shift+N
+        (0x50, true, true),     // Ctrl+Shift+P
+        (0x70, false, false),   // F1
+        (0x53, true, true),     // Ctrl+Shift+S
+        (0x46, true, true),     // Ctrl+Shift+F
+        (0x4F, true, false),    // Ctrl+O
+        (0x1B, false, false),   // Esc
+        (0x52, true, false),    // Ctrl+R
+    ];
+    let mut consulted = 0usize;
+    for host in WebViewHost::ALL {
+        for (vk, ctrl, shift) in chords {
+            for (down, repeat) in [(true, false), (true, true), (false, false)] {
+                let decision = accelerator_lookup(
+                    host,
+                    AcceleratorInput {
+                        vk,
+                        down,
+                        ctrl,
+                        shift,
+                        alt: false,
+                        repeat,
+                    },
+                );
+                assert!(!decision.handled, "{host:?} {vk:#x} down={down}");
+                assert!(decision.event.is_none(), "{host:?} {vk:#x} down={down}");
+                consulted += 1;
+            }
+        }
+    }
+    assert_eq!(consulted, WebViewHost::ALL.len() * chords.len() * 3);
 }
 
 /// Um `[[package]]` do Cargo.lock: nome, versao, origem (ausente nos
@@ -10515,7 +11351,6 @@ struct RecordedSplitWebView {
     incognito: Option<bool>,
     scripts: Vec<String>,
     ipc: Option<Box<dyn Fn(Request<String>)>>,
-    navigation: Option<Box<dyn Fn(String) -> bool>>,
     new_window: Option<Box<dyn Fn(String) -> NewWindowResponse>>,
     permission: bool,
     focused: Option<bool>,
@@ -10532,10 +11367,6 @@ impl SplitWebViewTarget for RecordedSplitWebView {
     }
     fn with_ipc_handler(mut self, handler: impl Fn(Request<String>) + 'static) -> Self {
         self.ipc = Some(Box::new(handler));
-        self
-    }
-    fn with_navigation_handler(mut self, handler: impl Fn(String) -> bool + 'static) -> Self {
-        self.navigation = Some(Box::new(handler));
         self
     }
     fn with_new_window_req_handler(
@@ -10643,12 +11474,8 @@ fn open_split_mode_hands_its_private_flag_to_the_builder() {
         normal_events.take().as_slice(),
         [UserEvent::OpenSplitFromSplit { source_index: 1, url }] if url == "https://example.com/popup"
     ));
-    let navigate = built_private
-        .navigation
-        .as_ref()
-        .expect("navigation handler");
-    assert!(navigate("https://example.com/outra".to_string()));
-    assert!(!navigate("neuralia:home".to_string()));
+    // A trava de navegacao do Split (NavGate::Web com a origem local do
+    // SplitBuild) vem de `hooked_builder`: gate `every_webview_gets_the_hooks`.
 
     // O handler IPC que o builder instala, com envelopes reais: o privado
     // recusa `search` e continua a fechar-se; o normal leva o texto.
@@ -12709,6 +13536,26 @@ fn context_menu_commands_are_unique() {
     for (index, id) in ids.iter().enumerate() {
         assert!(!ids[..index].contains(id));
     }
+
+    // O registo dos itens das WebViews (`WEBVIEW_MENU_ITEMS`): ids unicos
+    // entre si, nunca 0 (o TrackPopupMenu fechado sem escolha) e cada um
+    // encontravel pelo id -- e o que o item escolhido usa para achar o seu
+    // evento.
+    let registry: Vec<usize> = WEBVIEW_MENU_ITEMS.iter().map(|item| item.id).collect();
+    assert!(!registry.is_empty(), "o item de rolagem saiu do registo");
+    for (index, id) in registry.iter().enumerate() {
+        assert_ne!(*id, 0, "0 e o menu fechado sem escolha");
+        assert!(
+            !registry[..index].contains(id),
+            "id {id} repetido no registo"
+        );
+        assert!(
+            webview_menu_item(*id).is_some_and(|item| item.id == *id),
+            "id {id} nao se encontra pelo id"
+        );
+    }
+    assert!(webview_menu_item(0).is_none());
+    assert!(webview_menu_item(registry.iter().max().copied().unwrap_or(0) + 1).is_none());
 }
 
 #[test]

@@ -320,16 +320,18 @@ impl App {
         };
         // A dica da pilula nao fica a flutuar por cima do menu.
         hover_tooltip(std::ptr::null_mut(), "");
-        // O mesmo item que o botao direito dentro da coluna, decidido pelo
-        // mesmo `column_menu_responder` (menu proprio: nenhum item nativo).
-        let request = column_menu_responder(col_index, self.auto_scroll.clone())(0);
+        // Os mesmos itens que o botao direito dentro da coluna, decididos
+        // pelo mesmo `webview_menu_responder` (menu proprio: nenhum item
+        // nativo).
+        let request =
+            webview_menu_responder(WebViewHost::Column(col_index), self.auto_scroll.clone())(0);
         let mut menu = PopupMenu::default();
-        menu.push(MenuCommand::new(request.command, request.label));
+        for item in &request.items {
+            menu.push(MenuCommand::new(item.id, item.label));
+        }
         let point = self.bar_menu_point(hwnd);
         let command = self.track_menu(&menu, point, MenuButton::Right);
-        if command == request.command
-            && let Some(event) = request.selected()
-        {
+        if let Some(event) = request.item(command).and_then(|item| item.selected()) {
             let _ = self.proxy.send_event(event);
         }
     }

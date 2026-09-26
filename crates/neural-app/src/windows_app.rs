@@ -104,6 +104,9 @@ pub(in crate::windows_app) enum UserEvent {
     /// O pedido de chave nativo (`secret_prompt.rs`): Enter com uma chave
     /// com a forma do slot, "Esquecer chave" ou cancelar.
     Keys(KeyEvent),
+    /// Os ganchos das WebViews (`webview_hooks.rs`): o que cada WebView
+    /// avisa, com o hospedeiro de onde veio.
+    WebView(WebViewEvent),
     /// Pedido da pagina local do painel lateral (canal proprio), com o
     /// numero da pagina que o mandou.
     Panel(side_panel::PanelPost),
@@ -3307,14 +3310,15 @@ impl App {
             trace: vec![format!("navigate {}", valid)],
         });
 
-        let result = if let Some(window) = &self.window {
-            self.external_webview_builder(None, true)
-                .with_url(valid.as_str())
-                .build(window)
-        } else {
+        let Some(window) = &self.window else {
             self.active_agent = None;
             return;
         };
+        let builder = self
+            .external_webview_builder(None, true)
+            .with_url(valid.as_str());
+        let hooked = self.hooked_builder(builder, WebViewHost::External, None);
+        let result = hooked.build_hooked(window);
 
         match result {
             Ok(webview) => {
@@ -6973,6 +6977,10 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ("toast.rs", include_str!("windows_app/toast.rs")),
     ("popup_menu.rs", include_str!("windows_app/popup_menu.rs")),
     ("native_card.rs", include_str!("windows_app/native_card.rs")),
+    (
+        "webview_hooks.rs",
+        include_str!("windows_app/webview_hooks.rs"),
+    ),
     ("tests.rs", include_str!("windows_app/tests.rs")),
 ];
 
@@ -7044,6 +7052,8 @@ pub(in crate::windows_app) mod popup_menu;
 pub(in crate::windows_app) use popup_menu::*;
 pub(in crate::windows_app) mod native_card;
 pub(in crate::windows_app) use native_card::*;
+pub(in crate::windows_app) mod webview_hooks;
+pub(in crate::windows_app) use webview_hooks::*;
 
 pub(in crate::windows_app) mod app;
 #[allow(unused_imports)]
@@ -7326,220 +7336,6 @@ fn auto_scroll_menu_label(on: bool) -> &'static str {
     } else {
         "Ativar rolagem automática (Ctrl+R)"
     }
-}
-
-/// Id do item de rolagem nos menus de uma coluna: o que o `TrackPopupMenu` da
-/// pilula devolve e o que o item acrescentado ao menu do WebView2 entrega.
-/// Zero e o "fechou sem escolher" do Win32, por isso nunca e um comando.
-const COLUMN_MENU_AUTO_SCROLL: usize = 1;
-
-/// O item escolhido num menu de coluna vira o evento que o Ctrl+R premido
-/// DENTRO dessa coluna produz -- o mesmo despacho, `column_ipc_event_impl`,
-/// para o atalho e o menu nunca divergirem.
-fn column_menu_event(col_index: usize, command: usize) -> Option<UserEvent> {
-    if col_index >= COMPARATOR_COLUMNS {
-        return None;
-    }
-    match command {
-        COLUMN_MENU_AUTO_SCROLL => App::column_ipc_event_impl(col_index, IpcAction::AutoScroll),
-        _ => None,
-    }
-}
-
-/// Que WebView e esta, para quem decide o que o botao direito lhe acrescenta.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::windows_app) enum WebViewHost {
-    /// Uma das colunas das IAs no comparador.
-    Column(usize),
-    /// A fonte aberta ao lado da coluna indicada -- tambem a resposta de uma
-    /// IA pedida no painel privado, e a unica pagina a vista em tela cheia.
-    Split(usize),
-    /// Historico e memoria, a direita.
-    SidePanel,
-    /// Meet, WhatsApp, YouTube e Gmail no painel.
-    Service,
-}
-
-/// Recebem o item de rolagem as paginas que rolam sozinhas: as colunas das
-/// IAs e a fonte aberta ao lado (o `auto_scroll_tick` rola-a e o Ctrl+R
-/// funciona nela -- sem o item, a resposta de uma IA aberta no painel privado
-/// rolava sem nenhum botao direito para a parar). O painel lateral e os
-/// servicos nao rolam: ficam com o menu nativo do WebView2 tal como vem.
-fn context_menu_column(host: WebViewHost) -> Option<usize> {
-    match host {
-        WebViewHost::Column(index) | WebViewHost::Split(index) if index < COMPARATOR_COLUMNS => {
-            Some(index)
-        }
-        WebViewHost::Column(_)
-        | WebViewHost::Split(_)
-        | WebViewHost::SidePanel
-        | WebViewHost::Service => None,
-    }
-}
-
-/// O que `install_context_menu` faz com uma WebView acabada de construir:
-/// chama `register` so para uma coluna, com o indice dela, e devolve a linha
-/// de log quando o registo falha -- um runtime WebView2 sem o
-/// ContextMenuRequested. Essa falha nao sobe: a coluna abre, com o menu
-/// nativo inteiro, e so o item de rolagem fica de fora.
-fn install_column_menu(
-    host: WebViewHost,
-    register: impl FnOnce(usize) -> Result<(), String>,
-) -> Option<String> {
-    let col_index = context_menu_column(host)?;
-    register(col_index)
-        .err()
-        .map(|error| format!("context menu: coluna {col_index} sem o item de rolagem ({error})"))
-}
-
-/// Onde o item de rolagem entra num menu nativo com `native` itens: DEPOIS de
-/// todos eles, separado por uma linha quando ha algo acima. Copiar, colar,
-/// inspecionar e o resto ficam nos lugares em que o WebView2 os pos.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ColumnMenuPlacement {
-    separator_at: Option<u32>,
-    item_at: u32,
-}
-
-fn column_menu_placement(native: u32) -> ColumnMenuPlacement {
-    if native == 0 {
-        ColumnMenuPlacement {
-            separator_at: None,
-            item_at: 0,
-        }
-    } else {
-        ColumnMenuPlacement {
-            separator_at: Some(native),
-            item_at: native + 1,
-        }
-    }
-}
-
-/// O item de rolagem de UM botao direito: o rotulo lido no instante do
-/// pedido, onde entra entre os `native` itens do menu, e o id que o
-/// representa.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ColumnMenuRequest {
-    col_index: usize,
-    label: &'static str,
-    placement: ColumnMenuPlacement,
-    command: usize,
-}
-
-impl ColumnMenuRequest {
-    /// O evento de escolher o item: o do Ctrl+R premido na coluna.
-    fn selected(&self) -> Option<UserEvent> {
-        column_menu_event(self.col_index, self.command)
-    }
-}
-
-/// O que responde a cada botao direito de uma coluna. Criado UMA vez, quando
-/// a WebView e registada (ou quando a pilula abre o menu), e chamado a cada
-/// pedido: por isso o rotulo le o `SharedFlag` dentro da resposta, nunca na
-/// criacao -- um rotulo lido no registo ficava preso ao estado do arranque.
-/// `register_column_context_menu` e `column_pill_menu` so copiam para o
-/// Win32/COM o que isto decide.
-fn column_menu_responder(
-    col_index: usize,
-    auto_scroll: SharedFlag,
-) -> impl Fn(u32) -> ColumnMenuRequest {
-    move |native| ColumnMenuRequest {
-        col_index,
-        label: auto_scroll_menu_label(auto_scroll.get()),
-        placement: column_menu_placement(native),
-        command: COLUMN_MENU_AUTO_SCROLL,
-    }
-}
-
-/// Acrescenta ao menu nativo do botao direito de uma coluna o item de
-/// rolagem, com o rotulo do estado no instante do clique, no lugar que
-/// `column_menu_placement` decide. Precisa do ContextMenuRequested
-/// (ICoreWebView2_11 e ICoreWebView2Environment9); num runtime sem ele devolve
-/// o erro e a coluna fica so com o menu nativo. Uma falha a montar um menu
-/// concreto fica no log e esse menu abre como o WebView2 o trouxe.
-fn register_column_context_menu(
-    webview: &WebView,
-    col_index: usize,
-    auto_scroll: SharedFlag,
-    proxy: EventLoopProxy<UserEvent>,
-) -> Result<(), String> {
-    use webview2_com::{
-        ContextMenuRequestedEventHandler, CustomItemSelectedEventHandler,
-        Microsoft::Web::WebView2::Win32::{
-            COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
-            COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR, ICoreWebView2_11,
-            ICoreWebView2ContextMenuRequestedEventArgs, ICoreWebView2Environment9,
-        },
-    };
-    use windows_core::{HSTRING, Interface};
-    use wry::WebViewExtWindows;
-
-    let core = webview
-        .webview()
-        .cast::<ICoreWebView2_11>()
-        .map_err(|error| format!("ICoreWebView2_11 indisponível: {error}"))?;
-    let environment = webview
-        .environment()
-        .cast::<ICoreWebView2Environment9>()
-        .map_err(|error| format!("ICoreWebView2Environment9 indisponível: {error}"))?;
-
-    let respond = column_menu_responder(col_index, auto_scroll);
-    let add_item =
-        move |args: &ICoreWebView2ContextMenuRequestedEventArgs| -> windows_core::Result<()> {
-            unsafe {
-                let items = args.MenuItems()?;
-                let mut native = 0u32;
-                items.Count(&mut native)?;
-                let request = respond(native);
-                let label = HSTRING::from(request.label);
-                let placement = request.placement;
-                let proxy = proxy.clone();
-                let selected = CustomItemSelectedEventHandler::create(Box::new(move |_, _| {
-                    if let Some(event) = request.selected() {
-                        let _ = proxy.send_event(event);
-                    }
-                    Ok(())
-                }));
-                // Tudo criado antes de mexer no menu: uma falha a meio nao deixa
-                // um separador solto no fim do menu nativo.
-                let item = environment.CreateContextMenuItem(
-                    &label,
-                    None,
-                    COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
-                )?;
-                let mut selected_token = 0i64;
-                item.add_CustomItemSelected(&selected, &mut selected_token)?;
-                let separator = match placement.separator_at {
-                    Some(index) => Some((
-                        index,
-                        environment.CreateContextMenuItem(
-                            &HSTRING::new(),
-                            None,
-                            COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR,
-                        )?,
-                    )),
-                    None => None,
-                };
-                if let Some((index, separator)) = separator {
-                    items.InsertValueAtIndex(index, &separator)?;
-                }
-                items.InsertValueAtIndex(placement.item_at, &item)?;
-            }
-            Ok(())
-        };
-    let handler = ContextMenuRequestedEventHandler::create(Box::new(move |_, args| {
-        if let Some(args) = args
-            && let Err(error) = add_item(&args)
-        {
-            debug_log(format_args!(
-                "context menu: coluna {col_index} abriu sem o item de rolagem ({error})"
-            ));
-        }
-        Ok(())
-    }));
-    let mut token = 0i64;
-    unsafe { core.add_ContextMenuRequested(&handler, &mut token) }
-        .map_err(|error| format!("add_ContextMenuRequested falhou: {error}"))
 }
 
 /// Uma volta completa do degradê a deslizar.

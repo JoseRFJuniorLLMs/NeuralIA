@@ -288,11 +288,11 @@ impl App {
                 .comparator_webview_builder(i, name)
                 .with_bounds(bounds)
                 .with_url(url.as_str());
+            let hooked = self.hooked_builder(builder, WebViewHost::Column(i), None);
 
-            match builder.build_as_child(window) {
+            match hooked.build_hooked_as_child(window) {
                 Ok(wv) => {
                     let _ = wv.zoom(self.zoom);
-                    self.install_context_menu(&wv, WebViewHost::Column(i));
                     #[cfg(feature = "accel-spike")]
                     self.accel_spike_hook(&wv, crate::accel_spike::SpikeHost::Column);
                     views.push(ComparatorView { webview: wv, name });
@@ -707,15 +707,8 @@ impl App {
                     let _ = ipc_proxy.send_event(event);
                 }
             })
-            .with_navigation_handler(move |target| {
-                if target
-                    .get(..9)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
-                {
-                    return false;
-                }
-                remote_web_target(&target, None) || is_view_source_target(&target, None)
-            })
+            // A trava de navegacao (NavGate::Web, sem origem local) vem de
+            // `hooked_builder`, como em todas as WebViews.
             .with_new_window_req_handler(move |target, _features| {
                 // `about:blank` NAO. Muitos sites abrem uma ligacao com
                 // `window.open('', '_blank')` e so depois atribuem o endereco
@@ -729,28 +722,6 @@ impl App {
             })
             .with_permission_handler(|kind| web_media_permission(kind, true))
             .with_focused(true)
-    }
-
-    /// A unica porta para mexer no menu do botao direito de uma WebView: cada
-    /// uma que o comparador constroi passa aqui com o que e, e so as colunas
-    /// das IAs ganham o item de rolagem. Um runtime WebView2 sem o evento
-    /// ContextMenuRequested deixa a coluna com o menu nativo e fica no log.
-    pub(in crate::windows_app) fn install_context_menu(
-        &self,
-        webview: &WebView,
-        host: WebViewHost,
-    ) {
-        let missing = install_column_menu(host, |col_index| {
-            register_column_context_menu(
-                webview,
-                col_index,
-                self.auto_scroll.clone(),
-                self.proxy.clone(),
-            )
-        });
-        if let Some(line) = missing {
-            debug_log(format_args!("{line}"));
-        }
     }
 
     /// O login abre-se com `window.open`, e ate aqui isso destruia as tres
