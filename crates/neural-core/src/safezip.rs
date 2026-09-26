@@ -24,8 +24,9 @@
 //! maiúsculas (EPUBs feitos no Windows costumam errar a caixa nos `href`).
 //!
 //! A segunda política, [`ZipPolicy::BROWSE_LITE`], é a da inspeção de um ZIP
-//! baixado (downloads-zip-inspect, [`list_central_directory`]): só o
-//! diretório central, com um teto de entradas e de bytes do diretório, sem
+//! baixado (downloads-zip-inspect, [`list_central_directory`]): o diretório
+//! central (um só possível) e o cabeçalho local de cada entrada, com um teto
+//! de entradas, de bytes do diretório e de bytes dos cabeçalhos locais, sem
 //! os tetos de tamanho do EPUB (um ZIP legítimo de 2 GiB é inspecionado) e
 //! sem ler um byte dos dados das entradas.
 
@@ -58,6 +59,18 @@ pub struct ZipPolicy {
     /// Bytes do diretório central (o que a listagem lê). `u64::MAX`: sem
     /// teto próprio (o EPUB já o limita pelas entradas e pelos campos).
     pub max_directory_size: u64,
+    /// Nomes e campos extra dos cabeçalhos locais, somados, que a listagem
+    /// lê ([`list_central_directory`]). `u64::MAX` no EPUB, que confere os
+    /// cabeçalhos locais pelo caminho dele.
+    pub max_local_header_size: u64,
+    /// Só um diretório central possível: o registro de fim escolhido é a
+    /// última assinatura dele no arquivo; o diretório acaba colado ao
+    /// registro de fim (ou ao registro ZIP64, e este colado ao
+    /// localizador); e os campos clássicos que não estão saturados dizem o
+    /// mesmo que os do ZIP64. Um leitor que escolhesse outro registro, que
+    /// lesse o diretório pelo fim ou que usasse os campos clássicos
+    /// listaria outras entradas. Desligado no EPUB (como antes).
+    pub unambiguous_directory: bool,
 }
 
 impl ZipPolicy {
@@ -72,15 +85,19 @@ impl ZipPolicy {
         max_extra_len: 4096,
         max_comment_len: 4096,
         max_directory_size: u64::MAX,
+        max_local_header_size: u64::MAX,
+        unambiguous_directory: false,
     };
 
-    /// A inspeção de um ZIP baixado (downloads-zip-inspect): só o diretório
-    /// central, sem os tetos de tamanho do EPUB -- os dados das entradas
-    /// nunca são lidos, por isso o tamanho deles não custa nada. Os campos
-    /// de 16 bits (nome, extra, comentário) ficam no máximo do formato. O que
-    /// limita o trabalho, que corre na thread da interface, é o número de
-    /// entradas e os bytes do diretório: acima deles, a inspeção falha e o
-    /// arquivo fica «não inspecionado», nunca «seguro».
+    /// A inspeção de um ZIP baixado (downloads-zip-inspect): o diretório
+    /// central e o cabeçalho local de cada entrada, sem os tetos de tamanho
+    /// do EPUB -- os dados das entradas nunca são lidos, por isso o tamanho
+    /// deles não custa nada. Os campos de 16 bits (nome, extra, comentário)
+    /// ficam no máximo do formato. O que limita o trabalho, que corre na
+    /// thread da interface, é o número de entradas, os bytes do diretório e
+    /// os dos cabeçalhos locais: acima deles, a inspeção falha e o arquivo
+    /// fica «não inspecionado», nunca «seguro». E o diretório tem de ser um
+    /// só ([`ZipPolicy::unambiguous_directory`]).
     pub const BROWSE_LITE: Self = Self {
         max_entries: 100_000,
         max_entry_size: u64::MAX,
@@ -91,6 +108,8 @@ impl ZipPolicy {
         max_extra_len: 0xFFFF,
         max_comment_len: 0xFFFF,
         max_directory_size: 32 * 1024 * 1024,
+        max_local_header_size: 32 * 1024 * 1024,
+        unambiguous_directory: true,
     };
 }
 
@@ -119,6 +138,7 @@ const ZIP64_LOCATOR_LEN: usize = 20;
 const ZIP64_EOCD_SIG: u32 = 0x0606_4b50;
 const ZIP64_EOCD_LEN: usize = 56;
 const ZIP64_EXTRA_ID: u16 = 0x0001;
+const UNICODE_PATH_EXTRA_ID: u16 = 0x7075;
 const CENTRAL_SIG: u32 = 0x0201_4b50;
 const CENTRAL_LEN: usize = 46;
 const LOCAL_SIG: u32 = 0x0403_4b50;
@@ -181,10 +201,16 @@ impl<T: Read + Seek + Send> ReadSeek for T {}
 /// lido por partes, sem carregar o livro inteiro).
 enum Source {
     Memory(Vec<u8>),
-    Stream {
-        stream: Mutex<Box<dyn ReadSeek>>,
-        len: u64,
-    },
+    Stream { stream: Mutex<Positioned>, len: u64 },
+}
+
+/// O fluxo e onde ele está (`None` depois de um erro): uma leitura que
+/// começa onde a anterior acabou não pede um `seek` -- no Windows, cada um
+/// é uma chamada ao sistema, e a listagem de um ZIP lê o cabeçalho local de
+/// cada entrada em duas leituras seguidas.
+struct Positioned {
+    stream: Box<dyn ReadSeek>,
+    pos: Option<u64>,
 }
 
 impl Source {
@@ -192,7 +218,10 @@ impl Source {
     fn stream(mut stream: impl Read + Seek + Send + 'static) -> io::Result<Self> {
         let len = stream.seek(SeekFrom::End(0))?;
         Ok(Source::Stream {
-            stream: Mutex::new(Box::new(stream)),
+            stream: Mutex::new(Positioned {
+                stream: Box::new(stream),
+                pos: Some(len),
+            }),
             len,
         })
     }
@@ -221,9 +250,16 @@ impl Source {
                 Ok(())
             }
             Source::Stream { stream, .. } => {
-                let mut stream = stream.lock().unwrap_or_else(|poison| poison.into_inner());
-                stream.seek(SeekFrom::Start(offset))?;
-                stream.read_exact(buf)
+                let mut guard = stream.lock().unwrap_or_else(|poison| poison.into_inner());
+                let Positioned { stream, pos } = &mut *guard;
+                if *pos != Some(offset) {
+                    *pos = None;
+                    stream.seek(SeekFrom::Start(offset))?;
+                }
+                *pos = None;
+                stream.read_exact(buf)?;
+                *pos = Some(end);
+                Ok(())
             }
         }
     }
@@ -525,6 +561,19 @@ fn find_directory(source: &Source, policy: &ZipPolicy) -> EpubResult<Directory> 
     let at = exact
         .or(loose)
         .ok_or_else(|| EpubError::NotZip("fim do diretório central não encontrado".into()))?;
+    // Os outros leitores (7-Zip, .NET, libarchive, Python) procuram de trás
+    // para a frente e ficam com a última assinatura: uma depois da
+    // escolhida (dentro do comentário dela, ou no lixo do fim) apontaria
+    // para outro diretório.
+    if policy.unambiguous_directory
+        && tail[at + 1..]
+            .windows(4)
+            .any(|window| window == EOCD_SIG.to_le_bytes())
+    {
+        return Err(EpubError::NotZip(
+            "mais de um registro de fim do diretório central".into(),
+        ));
+    }
     let record = &tail[at..at + EOCD_LEN];
     let eocd_pos = tail_start + at as u64;
     let disk = le16(record, 4);
@@ -538,8 +587,26 @@ fn find_directory(source: &Source, policy: &ZipPolicy) -> EpubResult<Directory> 
         || size == SATURATED_32
         || offset == SATURATED_32;
 
-    let directory = match read_zip64_directory(source, eocd_pos)? {
-        Some(directory) => directory,
+    let directory = match read_zip64_directory(source, eocd_pos, policy)? {
+        Some(directory) => {
+            // Um leitor que só olha para o ZIP64 quando um campo clássico
+            // satura (o .NET) usaria os clássicos: têm de dizer o mesmo.
+            let agrees =
+                |classic: u64, saturated: u64, zip64: u64| classic == saturated || classic == zip64;
+            if policy.unambiguous_directory
+                && !(agrees(u64::from(disk), SATURATED_16, 0)
+                    && agrees(u64::from(directory_disk), SATURATED_16, 0)
+                    && agrees(disk_entries, SATURATED_16, directory.entries)
+                    && agrees(entries, SATURATED_16, directory.entries)
+                    && agrees(size, SATURATED_32, directory.size)
+                    && agrees(offset, SATURATED_32, directory.offset))
+            {
+                return Err(EpubError::NotZip(
+                    "registro de fim clássico difere do ZIP64".into(),
+                ));
+            }
+            directory
+        }
         None if saturated => {
             return Err(EpubError::NotZip(
                 "campos ZIP64 sem o registro de fim ZIP64".into(),
@@ -571,19 +638,28 @@ fn find_directory(source: &Source, policy: &ZipPolicy) -> EpubResult<Directory> 
             limit: policy.max_directory_size,
         });
     }
-    let fits = directory
-        .offset
-        .checked_add(directory.size)
-        .is_some_and(|end| end <= directory.limit);
-    if !fits {
+    let end = directory.offset.checked_add(directory.size);
+    if !end.is_some_and(|end| end <= directory.limit) {
         return Err(EpubError::NotZip(
             "diretório central fora do arquivo".into(),
+        ));
+    }
+    // Bytes entre o fim declarado do diretório e o registro de fim: um
+    // leitor que ache o diretório pelo fim (o 7-Zip, com o arquivo
+    // deslocado) leria outros registros centrais.
+    if policy.unambiguous_directory && end != Some(directory.limit) {
+        return Err(EpubError::NotZip(
+            "bytes entre o diretório central e o registro de fim".into(),
         ));
     }
     Ok(directory)
 }
 
-fn read_zip64_directory(source: &Source, eocd_pos: u64) -> EpubResult<Option<Directory>> {
+fn read_zip64_directory(
+    source: &Source,
+    eocd_pos: u64,
+    policy: &ZipPolicy,
+) -> EpubResult<Option<Directory>> {
     let Some(locator_pos) = eocd_pos.checked_sub(ZIP64_LOCATOR_LEN as u64) else {
         return Ok(None);
     };
@@ -617,6 +693,16 @@ fn read_zip64_directory(source: &Source, eocd_pos: u64) -> EpubResult<Option<Dir
     if disk != 0 || directory_disk != 0 || disk_entries != entries {
         return Err(EpubError::Unsupported("ZIP64 dividido em volumes".into()));
     }
+    // O registro ZIP64 acaba no localizador: o 7-Zip lê o registro que está
+    // colado ao localizador antes de seguir o offset dele.
+    let record_end = record_pos
+        .checked_add(12)
+        .and_then(|end| end.checked_add(le64(&record, 4)));
+    if policy.unambiguous_directory && record_end != Some(locator_pos) {
+        return Err(EpubError::NotZip(
+            "bytes entre o registro de fim ZIP64 e o localizador".into(),
+        ));
+    }
     Ok(Some(Directory {
         entries,
         size: le64(&record, 40),
@@ -643,6 +729,8 @@ struct CentralRecord {
 /// tamanhos).
 struct RawRecord {
     raw_name: Vec<u8>,
+    /// O campo extra do registro central, como veio.
+    extra: Vec<u8>,
     flags: u16,
     method: u16,
     crc32: u32,
@@ -738,6 +826,7 @@ fn walk_central_directory(
         }
         visit(RawRecord {
             raw_name,
+            extra,
             flags,
             method,
             crc32,
@@ -764,6 +853,7 @@ fn read_central_directory(
     walk_central_directory(source, directory, policy, |raw| {
         let RawRecord {
             raw_name,
+            extra: _,
             flags,
             method,
             crc32,
@@ -837,21 +927,47 @@ fn read_central_directory(
     Ok(records)
 }
 
-/// Lista o diretório central de um ZIP sem ler os dados das entradas
-/// (downloads-zip-inspect, política [`ZipPolicy::BROWSE_LITE`]): lê o fim
-/// do arquivo (o registro de fim, até 64 KiB de comentário, e o ZIP64) e os
-/// bytes do diretório central, e mais nada -- nem os cabeçalhos locais, nem
-/// os dados. `visit` recebe o nome cru de cada entrada (pastas incluídas),
-/// em UTF-8 com perdas e sem normalizar, pela ordem do diretório, à medida
-/// que é lido: quem inspeciona fica com o que viu mesmo quando a listagem
-/// falha depois.
+/// Os nomes dos campos Info-ZIP Unicode Path (`0x7075`: versão, CRC32 do
+/// nome cru e o nome em UTF-8) de um bloco extra, central ou local. O
+/// 7-Zip e o `tar.exe` (libarchive) extraem a entrada com este nome no lugar
+/// do cru. Sem conferir a versão nem o CRC (um extrator que não os confira
+/// usa o nome na mesma); um subcampo que passa do fim do bloco dá o que
+/// cabe.
+fn unicode_path_names(extra: &[u8]) -> Vec<&[u8]> {
+    let mut names = Vec::new();
+    let mut at = 0usize;
+    while at + 4 <= extra.len() {
+        let id = le16(extra, at);
+        let len = le16(extra, at + 2) as usize;
+        let data = &extra[at + 4..extra.len().min(at + 4 + len)];
+        if id == UNICODE_PATH_EXTRA_ID && data.len() > 5 {
+            names.push(&data[5..]);
+        }
+        at += 4 + len;
+    }
+    names
+}
+
+/// Lista as entradas de um ZIP sem ler os dados delas (downloads-zip-inspect,
+/// política [`ZipPolicy::BROWSE_LITE`]): lê o fim do arquivo (o registro de
+/// fim, até 64 KiB de comentário, e o ZIP64), os bytes do diretório central
+/// e o cabeçalho local de cada entrada (30 bytes, o nome e o campo extra),
+/// e mais nada -- nunca os dados. `visit` recebe cada nome de cada entrada
+/// (pastas incluídas), em UTF-8 com perdas e sem normalizar, à medida que é
+/// lido: o nome cru do diretório central e o do campo Unicode Path
+/// (`0x7075`) dele, pela ordem do diretório; depois, pela ordem do arquivo,
+/// o nome do cabeçalho local quando difere do central e os `0x7075` do
+/// extra local (o `tar.exe` extrai pelo cabeçalho local). Quem inspeciona
+/// fica com o que viu mesmo quando a listagem falha depois.
 ///
 /// Falha (e o arquivo não conta como listado) com um diretório truncado, com
 /// assinaturas erradas, fora do arquivo, com bytes a mais no fim, acima dos
-/// tetos da política, noutro volume, com ZIP64 incompleto, ou com entradas
+/// tetos da política, noutro volume, com ZIP64 incompleto, com mais de um
+/// diretório possível ([`ZipPolicy::unambiguous_directory`]), com entradas
 /// que se sobrepõem ou invadem o diretório central -- medidas pelo mínimo
 /// que cada uma ocupa (cabeçalho local de 30 bytes, o nome e os dados
-/// comprimidos), sem ler o cabeçalho local. Devolve o número de entradas.
+/// comprimidos) --, ou com um cabeçalho local sem assinatura, que invade o
+/// diretório ou cujo nome difere do central. Devolve o número de entradas.
 pub fn list_central_directory(
     reader: impl Read + Seek + Send + 'static,
     policy: &ZipPolicy,
@@ -860,15 +976,20 @@ pub fn list_central_directory(
     let source = Source::stream(reader)?;
     let directory = find_directory(&source, policy)?;
     // `entries <= policy.max_entries`: a reserva é limitada.
-    let mut spans: Vec<(u64, u64)> = Vec::with_capacity(directory.entries as usize);
+    let mut spans: Vec<(u64, u64, Vec<u8>)> = Vec::with_capacity(directory.entries as usize);
     let trailing = walk_central_directory(&source, &directory, policy, |raw| {
         visit(&String::from_utf8_lossy(&raw.raw_name));
+        for unicode in unicode_path_names(&raw.extra) {
+            if unicode != raw.raw_name.as_slice() {
+                visit(&String::from_utf8_lossy(unicode));
+            }
+        }
         let end = raw
             .header_offset
             .checked_add((LOCAL_LEN + raw.raw_name.len()) as u64)
             .and_then(|end| end.checked_add(raw.compressed_size))
             .ok_or_else(|| EpubError::NotZip("entrada fora do arquivo".into()))?;
-        spans.push((raw.header_offset, end));
+        spans.push((raw.header_offset, end, raw.raw_name));
         Ok(())
     })?;
     if trailing {
@@ -876,9 +997,9 @@ pub fn list_central_directory(
             "bytes a mais no fim do diretório central".into(),
         ));
     }
-    spans.sort_unstable();
+    spans.sort_unstable_by_key(|&(start, end, _)| (start, end));
     let mut previous_end = 0u64;
-    for (start, end) in spans {
+    for &(start, end, _) in &spans {
         if start < previous_end {
             return Err(EpubError::NotZip("entradas sobrepostas no ZIP".into()));
         }
@@ -888,6 +1009,66 @@ pub fn list_central_directory(
             ));
         }
         previous_end = end;
+    }
+
+    // Os cabeçalhos locais, pela ordem do arquivo: o `tar.exe` (libarchive)
+    // extrai cada entrada pelo nome do cabeçalho local, e pelo `0x7075` do
+    // extra local. Nunca os dados: uma leitura dos 30 bytes fixos e do nome
+    // (do tamanho do central, que cabe no mínimo que a entrada ocupa) e,
+    // seguida, outra do extra quando o há; o nome local só se relê quando
+    // difere. O total dos nomes e dos extras tem o teto da política.
+    let mut local_bytes = 0u64;
+    let mut head = Vec::new();
+    for (start, _, central_name) in &spans {
+        head.resize(LOCAL_LEN + central_name.len(), 0);
+        source.read_at(*start, &mut head)?;
+        if le32(&head, 0) != LOCAL_SIG {
+            return Err(EpubError::NotZip("cabeçalho local inválido".into()));
+        }
+        let name_len = le16(&head, 26) as usize;
+        let extra_len = le16(&head, 28) as usize;
+        local_bytes += (name_len + extra_len) as u64;
+        if local_bytes > policy.max_local_header_size {
+            return Err(EpubError::Limit {
+                kind: LimitKind::LocalHeaderSize,
+                value: local_bytes,
+                limit: policy.max_local_header_size,
+            });
+        }
+        let name_at = start + LOCAL_LEN as u64;
+        if name_at + (name_len + extra_len) as u64 > directory.offset {
+            return Err(EpubError::NotZip(
+                "cabeçalho local invade o diretório central".into(),
+            ));
+        }
+        let same = name_len == central_name.len() && head[LOCAL_LEN..] == central_name[..];
+        let (rest_at, rest_len) = if same {
+            (name_at + name_len as u64, extra_len)
+        } else {
+            (name_at, name_len + extra_len)
+        };
+        let mut rest = vec![0u8; rest_len];
+        if rest_len > 0 {
+            source.read_at(rest_at, &mut rest)?;
+        }
+        let (local_name, local_extra) = if same {
+            (central_name.as_slice(), rest.as_slice())
+        } else {
+            rest.split_at(name_len)
+        };
+        if !same {
+            visit(&String::from_utf8_lossy(local_name));
+        }
+        for unicode in unicode_path_names(local_extra) {
+            if unicode != local_name {
+                visit(&String::from_utf8_lossy(unicode));
+            }
+        }
+        if !same {
+            return Err(EpubError::NotZip(
+                "nome do cabeçalho local difere do diretório central".into(),
+            ));
+        }
     }
     Ok(directory.entries)
 }
@@ -1116,7 +1297,7 @@ fn le64(bytes: &[u8], at: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::epub::test_support::{RawEntry, ZipBuilder};
+    use crate::epub::test_support::{self, RawEntry, ZipBuilder};
 
     #[test]
     fn epub_policy_is_unchanged_by_the_safezip_move() {
@@ -1130,6 +1311,16 @@ mod tests {
         assert_eq!(ZipPolicy::EPUB.max_comment_len, 4096);
         // Sem teto próprio do diretório central, como antes da BROWSE_LITE.
         assert_eq!(ZipPolicy::EPUB.max_directory_size, u64::MAX);
+        // O EPUB escolhe o registro de fim como antes (downloads-zip-inspect
+        // so aperta a BROWSE_LITE) e confere os cabecalhos locais pelo
+        // caminho dele.
+        assert_eq!(
+            (
+                ZipPolicy::EPUB.unambiguous_directory,
+                ZipPolicy::EPUB.max_local_header_size
+            ),
+            (false, u64::MAX)
+        );
         assert_eq!(MAX_ENTRIES, ZipPolicy::EPUB.max_entries);
         assert_eq!(MAX_ENTRY_SIZE, ZipPolicy::EPUB.max_entry_size);
         assert_eq!(MAX_TOTAL_SIZE, ZipPolicy::EPUB.max_total_size);
@@ -1338,6 +1529,97 @@ mod tests {
         let (listed, names) = list(short);
         assert_eq!(not_zip(listed), "bytes a mais no fim do diretório central");
         assert_eq!(names, ["a.txt"]);
+
+        // Um só diretório possível: nenhum nome chega a quem inspeciona.
+        for (bytes, reason) in [
+            (
+                test_support::two_end_records_zip(),
+                "mais de um registro de fim do diretório central",
+            ),
+            (
+                test_support::directory_gap_zip(),
+                "bytes entre o diretório central e o registro de fim",
+            ),
+            (
+                test_support::classic_disagrees_with_zip64_zip(),
+                "registro de fim clássico difere do ZIP64",
+            ),
+            (
+                test_support::zip64_record_gap_zip(),
+                "bytes entre o registro de fim ZIP64 e o localizador",
+            ),
+        ] {
+            let (listed, names) = list(bytes.clone());
+            assert_eq!(not_zip(listed), reason);
+            assert!(names.is_empty(), "{reason}: {names:?}");
+            // O EPUB escolhe como antes (só a BROWSE_LITE exige um
+            // diretório único): o mesmo arquivo abre, com o LEIAME.txt.
+            let epub = EpubArchive::from_bytes(bytes).expect(reason);
+            assert_eq!(epub.len(), 1, "{reason}");
+        }
+
+        // O cabeçalho local: os nomes do diretório chegam antes; o local
+        // chega quando difere; e o 0x7075, central ou local, também.
+        let mut renamed = RawEntry::stored("b.txt", b"b");
+        renamed.local_name = Some(b"setup.exe".to_vec());
+        let (listed, names) = list(
+            ZipBuilder::new()
+                .stored("a.txt", b"a")
+                .entry(renamed)
+                .build(),
+        );
+        assert_eq!(
+            not_zip(listed),
+            "nome do cabeçalho local difere do diretório central"
+        );
+        assert_eq!(names, ["a.txt", "b.txt", "setup.exe"]);
+        let mut unicode = RawEntry::stored("foto.jpg", b"x");
+        unicode.extra = test_support::unicode_path_extra(b"foto.jpg", "setup.exe");
+        unicode.local_extra = test_support::unicode_path_extra(b"foto.jpg", "run.bat");
+        let (listed, names) = list(ZipBuilder::new().entry(unicode).build());
+        assert_eq!(listed.expect("listado"), 1);
+        assert_eq!(names, ["foto.jpg", "setup.exe", "run.bat"]);
+        let mut no_local = ZipBuilder::new().stored("a.txt", b"a").build();
+        no_local[0] ^= 0xFF;
+        let (listed, names) = list(no_local);
+        assert_eq!(not_zip(listed), "cabeçalho local inválido");
+        assert_eq!(names, ["a.txt"]);
+        let mut long_extra = ZipBuilder::new().stored("a.txt", b"a").build();
+        long_extra[28..30].copy_from_slice(&[0xFF, 0xFF]);
+        let (listed, _) = list(long_extra);
+        assert_eq!(
+            not_zip(listed),
+            "cabeçalho local invade o diretório central"
+        );
+        // O teto dos cabeçalhos locais (nomes e extras somados).
+        let tight = ZipPolicy {
+            max_local_header_size: 9,
+            ..ZipPolicy::BROWSE_LITE
+        };
+        let two = ZipBuilder::new()
+            .stored("a.txt", b"a")
+            .stored("b.txt", b"b")
+            .build();
+        let listed = list_central_directory(io::Cursor::new(two.clone()), &tight, |_| {});
+        assert!(
+            matches!(
+                listed,
+                Err(EpubError::Limit {
+                    kind: LimitKind::LocalHeaderSize,
+                    value: 10,
+                    limit: 9
+                })
+            ),
+            "{listed:?}"
+        );
+        let roomy = ZipPolicy {
+            max_local_header_size: 10,
+            ..ZipPolicy::BROWSE_LITE
+        };
+        assert_eq!(
+            list_central_directory(io::Cursor::new(two), &roomy, |_| {}).expect("listado"),
+            2
+        );
 
         // Os tetos da política, antes de ler o diretório.
         let seed = ZipBuilder::new().stored("a.txt", b"a").zip64().build();

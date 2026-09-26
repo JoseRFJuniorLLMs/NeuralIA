@@ -480,24 +480,41 @@ whose effects the app applies:
   is, and that one may carry the `HostUrl`. The E2E below reports who wrote
   the mark and whether it carries a `HostUrl`;
 - a finished `.zip` (the final extension as Windows sees it) has its entries
-  listed from the central directory only (`file_risk::inspect_zip` over
-  `safezip::list_central_directory` with `ZipPolicy::BROWSE_LITE`): the end
-  record search, the ZIP64 records and the directory bytes are read, never
-  a local header nor a byte of an entry's data, with no EPUB size caps (a
-  2 GiB ZIP is inspected) but at most 100 000 entries and a 32 MiB
-  directory. Each entry is classified by the last segment of its path (`/`
+  listed from the central directory and the local headers
+  (`file_risk::inspect_zip` over `safezip::list_central_directory` with
+  `ZipPolicy::BROWSE_LITE`): the end record search, the ZIP64 records, the
+  directory bytes and each entry's local header (its 30 bytes, name and
+  extra field, in one or two reads) are read, never a byte of an entry's
+  data, with no EPUB size caps (a 2 GiB ZIP is inspected) but at most
+  100 000 entries, a 32 MiB directory and 32 MiB of local names and extras.
+  The directory must be the only one a reader can find
+  (`ZipPolicy::unambiguous_directory`): the chosen end record is the last
+  end-record signature in the file, the directory ends right at the end
+  record (or at the ZIP64 record, which ends right at its locator), and the
+  classic fields that are not saturated say the same as the ZIP64 ones.
+  Every name an extractor can give an entry counts: the central
+  directory's, the Info-ZIP Unicode Path (`0x7075`, whose name 7-Zip and
+  `tar.exe` extract under) in the central or the local extra field, and the
+  local header's (`tar.exe` extracts under it); a local name that differs
+  from the central one is classified and then fails the listing. Each name
+  is classified by the last segment of its path (`/`
   or `\`, at any depth) with the name rules above: a program, script,
   shortcut, disk image, Access database or another archive
   (`ARCHIVE_EXTENSIONS`: zip, 7z, rar, cab, tar, gz...) inside deletes the
   ZIP unless "Permitir baixar programas" is on (then it is kept and its row
   says «tem programas ou scripts dentro», or «não inspecionado» for an
   archive inside); a masquerade (`foto.jpg.exe`) or a name with bidi,
-  invisible or control characters or `:` inside deletes it always. DOS
-  device names (`aux.c`) and folders do not count. A ZIP whose listing
+  invisible or control characters or `:` inside deletes it always. A DOS
+  device stem is not an exemption: Windows 11 creates `aux.exe` or
+  `nul.bat` as ordinary files, so such a name counts by its extension
+  (`aux.exe` is a program, `prn.pdf.exe` a masquerade, `aux.c` and
+  `con.txt` nothing); folders do not count. A ZIP whose listing
   fails before a dangerous entry is seen (not a ZIP, truncated, bad
   signatures, trailing bytes in the directory, incomplete or split ZIP64,
-  over a cap, overlapping entries or data running into the directory, a
-  read error) is kept as not inspected, like a 7z or RAR sniffed at the
+  more than one possible directory, over a cap, overlapping entries or data
+  running into the directory, a local header without its signature, running
+  into the directory or named unlike the directory, a read error) is kept
+  as not inspected, like a 7z or RAR sniffed at the
   start: its row and its toast say «não inspecionado» with the warning
   tone, never plain «Concluído» (`Inspection::NotInspected`, recorded as
   `inspection` in `downloads.json`);
@@ -527,8 +544,9 @@ the downloaded files. Gates: `the_start_decision_table`,
 `a_downloaded_zip_is_inspected_on_disk`, `zip_entry_classification_table`,
 `a_big_zip_is_inspected_without_reading_entry_bodies` (a sparse ZIP of more
 than 2 GiB, and a ZIP64 of 12 GiB, through a counting reader: every read
-falls in the end window or the directory, and 1 MiB or GiB per entry cost
-the same reads), `corrupt_zip64_and_overlap_zips_are_not_inspected`,
+falls in the end window, the directory or a local header, every local
+header is read, and 1 MiB or GiB per entry cost the same reads),
+`corrupt_zip64_and_overlap_zips_are_not_inspected`,
 `zip_mutation_harness_never_panics_and_never_comes_out_clean`,
 `browse_lite_listing_fails_for_the_named_reason` (neural-core) and
 `downloads_are_denied_on_every_local_host_and_managed_on_the_web`,

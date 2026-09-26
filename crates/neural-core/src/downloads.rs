@@ -1511,11 +1511,15 @@ mod tests {
     /// Gate critico (downloads-zip-inspect), no disco, pelo
     /// `finalize_download` que o `neural-app` corre: o `pacote.zip` do E2E
     /// (setup.exe e run.bat) e apagado sem «Permitir baixar programas» e
-    /// fica com ela; um ZIP limpo fica lido; um sobreposto, um estragado e
-    /// um 7z ficam nao inspecionados; so um `.zip` e inspecionado.
+    /// fica com ela; um `aux.exe`, um `setup.exe` no Unicode Path (0x7075)
+    /// ou no cabecalho local apagam-no; um ZIP limpo fica lido; um
+    /// sobreposto, um com dois diretorios possiveis, um estragado e um 7z
+    /// ficam nao inspecionados; so um `.zip` e inspecionado.
     #[test]
     fn a_downloaded_zip_is_inspected_on_disk() {
-        use crate::epub::test_support::{RawEntry, ZipBuilder};
+        use crate::epub::test_support::{
+            RawEntry, ZipBuilder, directory_gap_zip, two_end_records_zip, unicode_path_extra,
+        };
         let dir = TempDir::new("zip");
         let pacote = ZipBuilder::new()
             .stored("setup.exe", &pe_bytes())
@@ -1539,6 +1543,46 @@ mod tests {
         );
         assert!(allowed.exists());
 
+        // O que outro extrator tira do mesmo ZIP: um `aux.exe` (o Windows 11
+        // grava-o), o nome do Unicode Path (0x7075) e o do cabecalho local.
+        let mut unicode = RawEntry::stored("foto.jpg", &pe_bytes());
+        unicode.extra = unicode_path_extra(b"foto.jpg", "setup.exe");
+        let mut local = RawEntry::stored("foto.jpg", &pe_bytes());
+        local.local_name = Some(b"setup.exe".to_vec());
+        for (name, zip) in [
+            (
+                "dispositivo.zip",
+                ZipBuilder::new()
+                    .stored("LEIAME.txt", b"ola")
+                    .stored("aux.exe", &pe_bytes())
+                    .build(),
+            ),
+            (
+                "unicode.zip",
+                ZipBuilder::new()
+                    .stored("LEIAME.txt", b"ola")
+                    .entry(unicode)
+                    .build(),
+            ),
+            (
+                "local.zip",
+                ZipBuilder::new()
+                    .stored("LEIAME.txt", b"ola")
+                    .entry(local)
+                    .build(),
+            ),
+        ] {
+            let path = dir.file(name, &zip);
+            assert_eq!(
+                finalize_download(&path, false, false),
+                FinalizeOutcome::Deleted(DeleteReason::ArchiveEntry(ZipEntryRisk::Blocked(
+                    BlockReason::Program
+                ))),
+                "{name}"
+            );
+            assert!(!path.exists(), "{name} ficou no disco");
+        }
+
         let fotos = ZipBuilder::new()
             .stored("fotos/praia.jpg", b"\xFF\xD8\xFF\xE0")
             .deflated("LEIAME.txt", b"ferias")
@@ -1558,6 +1602,8 @@ mod tests {
             .build();
         for (name, bytes) in [
             ("sobreposto.zip", overlap),
+            ("dois-fins.zip", two_end_records_zip()),
+            ("folga.zip", directory_gap_zip()),
             ("estragado.zip", pacote[..pacote.len() - 30].to_vec()),
             ("pagina.zip", b"<html>nao e um zip</html>".to_vec()),
             ("arquivo.7z", vec![0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0, 4]),
