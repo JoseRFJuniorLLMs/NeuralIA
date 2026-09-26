@@ -12,6 +12,9 @@ param(
     [switch]$SelfTest,
     # Quanto se espera depois de largar as teclas antes de ler a pagina.
     [int]$SettleMs = 700,
+    # Prazo do primeiro comando (Wait-ExeReady): o exe so le comandos depois
+    # de construir o comparador do NEURALIA_STARTUP_INPUT.
+    [int]$StartupMs = 120000,
     [string]$TablePath = "accel-spike-table.md"
 )
 
@@ -39,6 +42,25 @@ param(
 # motivo, e a corrida CONTINUA no hospedeiro seguinte: um prazo esgotado num
 # hospedeiro nunca aborta a corrida, e a tabela sai sempre, com uma linha por
 # atalho, hospedeiro e modo.
+#
+# ARRANQUE. O exe escreve o `hello` no `resumed`, ANTES de construir o
+# comparador do NEURALIA_STARTUP_INPUT (tres WebView2, cada uma com o ciclo
+# de mensagens aninhado do build_as_child); ate la nao le comandos. Na
+# corrida 36197975480 isso levou ~40 s: o `open` do primeiro hospedeiro
+# (Column) ficou sem ack nos 30 s dele e a coluna saiu "invalido" sem ter
+# sido tentada (na sabotagem, o External, primeiro la, esperou ~28 s). Por
+# isso o primeiro comando e um `ping` com prazo proprio (-StartupMs), e os
+# prazos de cada hospedeiro so contam depois dele; sem ack nesse prazo e um
+# erro do condutor, com o motivo.
+#
+# COLUNA. Mede-se na fixture de 127.0.0.1 pela excecao de navegacao que so
+# existe no exe do spike; o exe escreve no registo o que o WebView2 fez dessa
+# navegacao (`colnav`: o Cancel do gate que embarca e o que ficou depois da
+# excecao, e o NavigationCompleted). Se ela nao carregar -- o
+# NavigationCompleted vem sem sucesso (recua logo) ou a sonda nao a ve em
+# $ColumnFixtureMs --, o exe repoe a pagina ao vivo do fornecedor (`open
+# Column` sem URL), a coluna mede-se la e a nota da tabela di-lo com o
+# motivo.
 #
 # POLITICA DE SAIDA (decisao do lead, 25/09/2026). O entregavel do spike e a
 # TABELA. O script sai com 0 quando a tabela esta completa e a corrida e
@@ -70,11 +92,20 @@ $Chords = @(
 )
 $KnownHosts = @("Column", "Split", "PrivateSplit", "External", "Reader", "Pdf", "Epub", "SidePanel", "Service")
 # Os que so abrem com a fixture. A coluna tambem a pede (a excecao de
-# navegacao do exe do spike) mas, se ela nao carregar, mede-se na pagina ao
-# vivo e a nota da tabela di-lo.
+# navegacao do exe do spike) mas, se ela nao carregar, o exe repoe a pagina
+# ao vivo do fornecedor, mede-se la e a nota da tabela di-lo.
 $FixtureHosts = @("Split", "PrivateSplit", "External", "Service")
 # Quantas descidas tem a tentativa da tecla presa (a primeira e a real).
 $RepeatDowns = 5
+# Quanto a coluna tem para armar a sonda na fixture antes de recuar para a
+# pagina ao vivo (menos, se o NavigationCompleted da fixture vier sem sucesso).
+$ColumnFixtureMs = 20000
+# Os COREWEBVIEW2_WEB_ERROR_STATUS que a nota da coluna nomeia.
+$WebErrorStatus = @{
+    0 = "UNKNOWN"; 6 = "SERVER_UNREACHABLE"; 7 = "TIMEOUT"; 9 = "CONNECTION_ABORTED"; 10 = "CONNECTION_RESET"
+    11 = "DISCONNECTED"; 12 = "CANNOT_CONNECT"; 13 = "HOST_NAME_NOT_RESOLVED"; 14 = "OPERATION_CANCELED"
+    15 = "REDIRECT_FAILED"; 16 = "UNEXPECTED_ERROR"
+}
 
 # Os elementos de uma lista, pelo `foreach` -- nunca `@($value)`: o `@()`
 # sobre uma List[object] embrulhada num PSObject (e o que o `New-Object`
@@ -230,6 +261,61 @@ function ConvertFrom-PageResult($pageRecord) {
     $result = [string]$pageRecord.result
     if ($result -eq "" -or $result -eq "null") { return $null }
     try { return ($result | ConvertFrom-Json) } catch { return $null }
+}
+
+# O texto novo do registo (a cauda anterior mais o que chegou) em linhas
+# inteiras e a cauda ainda sem fim de linha. So conta uma linha com o "`n":
+# um pedaco sem nenhum fica todo na cauda. (Com `$lines[0..($lines.Count -
+# 2)]` um pedaco de uma linha so dava o intervalo 0..-1 -- o indice -1 e o
+# ultimo --, lia-a duas vezes e uma terceira quando o fim de linha chegava:
+# uma linha `native` assim contava tres disparos.)
+function Split-LogText([string]$text) {
+    $parts = $text -split "`n"
+    $complete = [System.Collections.Generic.List[string]]::new()
+    for ($i = 0; $i -lt $parts.Count - 1; $i++) { $complete.Add($parts[$i]) }
+    return [pscustomobject]@{ Lines = $complete.ToArray(); Tail = [string]$parts[$parts.Count - 1] }
+}
+
+# O ack do `ping` (ping_detail no exe: "<Hospedeiro> aberto=<bool>
+# surface=<Surface>"): o hospedeiro esta aberto?
+function Test-PingOpen([string]$detail) {
+    return $detail -match '(^|\s)aberto=true(\s|$)'
+}
+
+# O que o registo diz da navegacao da coluna para a fixture (as linhas
+# `colnav` do exe): o Cancel que o gate que embarca deixou e o que ficou
+# depois da excecao do spike, e como acabou. Summary vai para a nota da
+# tabela; Failure (ou "") diz que a fixture ja nao vai carregar -- o
+# NavigationCompleted dela veio sem sucesso --, e o condutor recua logo.
+function Get-ColumnNav($records) {
+    $start = $null
+    $done = $null
+    foreach ($record in (Get-List $records)) {
+        if ([string]$record.t -ne "colnav") { continue }
+        if ([string]$record.phase -eq "start") { $start = $record }
+        elseif ([string]$record.phase -eq "done") { $done = $record }
+    }
+    $parts = [System.Collections.Generic.List[string]]::new()
+    if ($null -eq $start) {
+        $parts.Add("nenhum NavigationStarting da fixture na coluna")
+    }
+    else {
+        $parts.Add("NavigationStarting da fixture: o gate que embarca deixou Cancel=$(([bool]$start.gate).ToString().ToLowerInvariant()), a excecao do spike Cancel=$(([bool]$start.cancel).ToString().ToLowerInvariant())")
+    }
+    $failure = ""
+    if ($null -eq $done) {
+        $parts.Add("sem NavigationCompleted da fixture")
+    }
+    elseif ([bool]$done.ok) {
+        $parts.Add("NavigationCompleted com sucesso")
+    }
+    else {
+        $status = [int]$done.status
+        $name = if ($WebErrorStatus.ContainsKey($status)) { $WebErrorStatus[$status] } else { "?" }
+        $failure = "o NavigationCompleted da fixture veio sem sucesso (WebErrorStatus $status $name)"
+        $parts.Add("NavigationCompleted sem sucesso, WebErrorStatus $status $name")
+    }
+    return [pscustomobject]@{ Summary = ($parts.ToArray() -join "; "); Failure = $failure }
 }
 
 # O plano da corrida, feito antes de se carregar numa tecla: uma tentativa
@@ -450,6 +536,11 @@ function New-SelfTestRun {
     $plan = New-TrialPlan $hostList
     $lines = [System.Collections.Generic.List[string]]::new()
     foreach ($hostName in $hostList) { $lines.Add('{"t":"hooked","host":"' + $hostName + '","ok":true}') }
+    # O arranque e a coluna na fixture, como o exe os escreve: o relatorio
+    # passa por cima destas linhas.
+    $lines.Add('{"t":"ack","seq":1,"ok":true,"detail":"Column aberto=true surface=Comparator"}')
+    $lines.Add('{"t":"colnav","phase":"start","nav":9,"uri":"http://127.0.0.1:5123/fixture.html","gate":true,"cancel":false}')
+    $lines.Add('{"t":"colnav","phase":"done","nav":9,"ok":true,"status":0}')
     $perHost = @{}
     $seq = 0
     foreach ($trial in ($plan.Keys | Sort-Object)) {
@@ -519,7 +610,7 @@ function New-SelfTestRun {
     $wrapped = New-Object -TypeName "System.Collections.Generic.List[object]"
     foreach ($record in $records) { $wrapped.Add($record) }
     $notes = @(
-        "Column: a fixture de 127.0.0.1 nao carregou na coluna (a sonda viu https://www.google.com/search); medida na pagina ao vivo, que depende da rede",
+        "Column: a fixture de 127.0.0.1 nao carregou na coluna (o NavigationCompleted da fixture veio sem sucesso (WebErrorStatus 14 OPERATION_CANCELED); NavigationStarting da fixture: o gate que embarca deixou Cancel=true, a excecao do spike Cancel=false; NavigationCompleted sem sucesso, WebErrorStatus 14 OPERATION_CANCELED); medida na pagina ao vivo do fornecedor (Column aberto: pagina ao vivo reposta (https://www.google.com)), que depende da rede",
         "Reader: invalido (20 tentativa(s)): sem foco: focus: WebView2 error",
         "External: invalido (16 tentativa(s)): o hospedeiro deixou de responder | com barra"
     )
@@ -666,6 +757,60 @@ function Invoke-SelfTest {
         foreach ($case in $exitCases) {
             $realChecks += @{ Name = "saida: $($case.Name)"; Ok = ($case.Exit.Fail -eq $case.Fail); Detail = $case.Exit.Message }
         }
+    }
+
+    # O registo lido enquanto cresce: uma linha so conta com o fim de linha,
+    # uma vez. Os pedacos sao os de uma linha `native` apanhada entre o JSON
+    # e o "`n" (o Update-Records antigo contava-a tres vezes).
+    $nativeLine = '{"t":"native","trial":3,"host":"Split","chord":"Ctrl+D","kind":"down","handled":true,"fired":true,"repeat":false}'
+    $tail = ""
+    $fired = 0
+    $partialLines = -1
+    $chunks = @($nativeLine, ("`n" + '{"t":"ack","seq":4'), (',"ok":true,"detail":"pull"}' + "`n"))
+    foreach ($chunk in $chunks) {
+        $split = Split-LogText ($tail + $chunk)
+        if ($partialLines -lt 0) { $partialLines = $split.Lines.Count }
+        $tail = $split.Tail
+        foreach ($line in $split.Lines) {
+            $record = ConvertFrom-SpikeLogLine $line
+            if ($null -ne $record -and $record.t -eq "native" -and [bool]$record.fired) { $fired++ }
+        }
+    }
+    $realChecks += @{ Name = "registo: linha sem fim de linha espera"; Ok = ($partialLines -eq 0 -and $fired -eq 1 -and $tail -eq ""); Detail = "linhas do 1o pedaco $partialLines, disparos $fired, cauda '$tail'" }
+    $empty = Split-LogText ""
+    $realChecks += @{ Name = "registo: texto vazio"; Ok = ($empty.Lines.Count -eq 0 -and $empty.Tail -eq ""); Detail = "" }
+
+    # O ack do `ping` (as strings exatas de ping_detail no teste do exe).
+    $pingCases = @(
+        @{ Detail = "Column aberto=true surface=Comparator"; Open = $true },
+        @{ Detail = "Column aberto=false surface=Home"; Open = $false },
+        @{ Detail = "External aberto=false surface=Comparator"; Open = $false },
+        @{ Detail = ""; Open = $false }
+    )
+    foreach ($case in $pingCases) {
+        $realChecks += @{ Name = "ping '$($case.Detail)'"; Ok = ((Test-PingOpen $case.Detail) -eq $case.Open); Detail = "" }
+    }
+
+    # A coluna a caminho da fixture, pelas linhas `colnav` exatas do exe
+    # (colnav_start_line / colnav_done_line no teste do exe): o recuo
+    # imediato so quando o NavigationCompleted dela vem sem sucesso.
+    $colStart = '{"t":"colnav","phase":"start","nav":9,"uri":"http://127.0.0.1:5123/fixture.html","gate":true,"cancel":false}'
+    $colRefused = '{"t":"colnav","phase":"done","nav":9,"ok":false,"status":14}'
+    $colLoaded = '{"t":"colnav","phase":"done","nav":9,"ok":true,"status":0}'
+    $navCases = @(
+        @{ Name = "recusada"; Lines = @($colStart, $colRefused); Fail = "*WebErrorStatus 14 OPERATION_CANCELED*"; Summary = "*deixou Cancel=true, a excecao do spike Cancel=false*" },
+        @{ Name = "carregada"; Lines = @($colStart, $colLoaded); Fail = ""; Summary = "*NavigationCompleted com sucesso" },
+        @{ Name = "a meio"; Lines = @($colStart); Fail = ""; Summary = "*sem NavigationCompleted da fixture" },
+        @{ Name = "sem linhas"; Lines = @(); Fail = ""; Summary = "nenhum NavigationStarting da fixture na coluna*" }
+    )
+    foreach ($case in $navCases) {
+        $records = New-Object -TypeName "System.Collections.Generic.List[object]"
+        foreach ($line in @('{"t":"ack","seq":2,"ok":true,"detail":"Column aberto: fixture pedida"}') + $case.Lines) {
+            $records.Add((ConvertFrom-SpikeLogLine $line))
+        }
+        $nav = Get-ColumnNav $records
+        $failOk = if ($case.Fail) { $nav.Failure -like $case.Fail } else { $nav.Failure -eq "" }
+        $realChecks += @{ Name = "coluna: fixture $($case.Name)"; Ok = ($failOk -and $nav.Summary -like $case.Summary); Detail = "falha '$($nav.Failure)' resumo '$($nav.Summary)'" }
     }
     foreach ($check in $realChecks) {
         if (-not $check.Ok) { $failures++ }
@@ -854,9 +999,9 @@ function Update-Records {
     finally {
         $stream.Dispose()
     }
-    $lines = $text -split "`n"
-    $script:LogTail = $lines[-1]
-    foreach ($line in $lines[0..($lines.Count - 2)]) {
+    $split = Split-LogText $text
+    $script:LogTail = $split.Tail
+    foreach ($line in $split.Lines) {
         $record = ConvertFrom-SpikeLogLine $line
         if ($null -ne $record) { $script:Records.Add($record) }
     }
@@ -893,10 +1038,47 @@ function Send-SpikeCommand([string]$verb, [string]$hostName, [string]$argument) 
     return $script:Seq
 }
 
-function Invoke-Spike([string]$verb, [string]$hostName, [string]$argument, [int]$timeoutMs = 15000) {
+function Invoke-Spike([string]$verb, [string]$hostName, [string]$argument, [int]$timeoutMs = 15000, [string]$what = "") {
     $seq = Send-SpikeCommand $verb $hostName $argument
-    $ack = Wait-Record { param($r) $r.t -eq "ack" -and [int64]$r.seq -eq $seq } $timeoutMs "ack de '$verb $hostName'"
+    if (-not $what) { $what = "ack de '$verb $hostName'" }
+    $ack = Wait-Record { param($r) $r.t -eq "ack" -and [int64]$r.seq -eq $seq } $timeoutMs $what
     return $ack
+}
+
+# O primeiro comando da corrida (ver ARRANQUE no cabecalho): `ping` ate o
+# exe responder, com o prazo proprio do arranque. Com a coluna primeiro,
+# espera tambem que ela exista (o ack diz "aberto=true"), no maximo 15 s
+# depois do primeiro ack: o comparador de arranque ou ja existe ou falhou,
+# e entao o `open Column` recusa-o logo com o motivo. Sem ack no prazo
+# LANCA -- um erro do condutor: o exe nao le comandos.
+function Wait-ExeReady([string]$hostName, [int]$budgetMs) {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $firstAck = -1
+    while ($true) {
+        $left = [Math]::Max(1000, [int]($budgetMs - $watch.ElapsedMilliseconds))
+        $ack = Invoke-Spike "ping" $hostName "" $left "ack do primeiro comando ('ping $hostName'): o exe nao leu comandos em $budgetMs ms depois do hello (o comparador do NEURALIA_STARTUP_INPUT nao acabou de se construir?)"
+        if ($firstAck -lt 0) { $firstAck = $watch.ElapsedMilliseconds }
+        $detail = [string]$ack.detail
+        $waited = $watch.ElapsedMilliseconds - $firstAck
+        if ($hostName -ne "Column" -or (Test-PingOpen $detail) -or $waited -ge 15000 -or $watch.ElapsedMilliseconds -ge $budgetMs) {
+            return [pscustomobject]@{ FirstAckMs = $firstAck; Detail = $detail }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+}
+
+# Abre o hospedeiro. Um `open` recusado (ok:false) repete-se ate $retryMs --
+# ha hospedeiros que abrem de forma assincrona; com 0 nao se repete, e a
+# recusa sai logo com o motivo do exe. Sem ack em 30 s LANCA (o hospedeiro
+# deixou de responder).
+function Open-SpikeHost([string]$hostName, [string]$argument, [int]$retryMs) {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $opened = Invoke-Spike "open" $hostName $argument 30000
+        if ($opened.ok) { return $opened }
+        if ($watch.ElapsedMilliseconds -ge $retryMs) { throw "nao abriu: $($opened.detail)" }
+        Start-Sleep -Milliseconds 500
+    }
 }
 
 # Corre um script da sonda e devolve o que a pagina respondeu (objeto), ou
@@ -943,8 +1125,10 @@ function Set-Foreground([string]$hostName) {
 
 # A sonda no documento que vai receber as teclas, depois de ele acabar de
 # carregar (e, com `$requireHref`, so nessa pagina). Devolve a resposta da
-# sonda armada ($null se nao armou no prazo) e a ultima que se viu.
-function Wait-Armed([string]$hostName, [string]$requireHref, [int]$budgetMs) {
+# sonda armada ($null se nao armou no prazo), a ultima que se viu e, com
+# `-FailFast` (um scriptblock que devolve o motivo, ou ""), porque desistiu
+# antes do prazo.
+function Wait-Armed([string]$hostName, [string]$requireHref, [int]$budgetMs, [scriptblock]$FailFast = $null) {
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $last = $null
     while ($watch.ElapsedMilliseconds -lt $budgetMs) {
@@ -952,10 +1136,35 @@ function Wait-Armed([string]$hostName, [string]$requireHref, [int]$budgetMs) {
         if ($null -ne $armed) { $last = $armed }
         $ready = $null -ne $armed -and [string]$armed.ready -eq "complete"
         if ($ready -and $requireHref) { $ready = ([string]$armed.href).StartsWith($requireHref) }
-        if ($ready) { return [pscustomobject]@{ Armed = $armed; Last = $armed } }
+        if ($ready) { return [pscustomobject]@{ Armed = $armed; Last = $armed; Failure = "" } }
+        if ($FailFast) {
+            $why = [string](& $FailFast)
+            if ($why) { return [pscustomobject]@{ Armed = $null; Last = $last; Failure = $why } }
+        }
         Start-Sleep -Milliseconds 500
     }
-    return [pscustomobject]@{ Armed = $null; Last = $last }
+    return [pscustomobject]@{ Armed = $null; Last = $last; Failure = "" }
+}
+
+# A coluna (ver COLUNA no cabecalho): a fixture primeiro; se ela nao armar,
+# a pagina ao vivo do fornecedor, que o exe repoe. Devolve o Wait-Armed de
+# onde a coluna vai ser medida, e a nota da tabela diz qual e porque.
+function Open-ColumnHost {
+    $null = Open-SpikeHost "Column" $script:FixtureUrl 0
+    $arm = Wait-Armed "Column" $script:FixtureUrl $ColumnFixtureMs -FailFast { (Get-ColumnNav $script:Records).Failure }
+    $nav = Get-ColumnNav $script:Records
+    if ($null -ne $arm.Armed) {
+        Add-SpikeNote "Column: medida na fixture de 127.0.0.1 (a excecao de navegacao da coluna so existe no exe do spike; o gate que embarca nao muda; $($nav.Summary))"
+        return $arm
+    }
+    $why = $arm.Failure
+    if (-not $why) {
+        $seen = if ($null -ne $arm.Last) { Format-Href ([string]$arm.Last.href) } else { "sem resposta da sonda" }
+        $why = "a sonda nao a viu em $ColumnFixtureMs ms (viu $seen)"
+    }
+    $live = Open-SpikeHost "Column" "" 0
+    Add-SpikeNote "Column: a fixture de 127.0.0.1 nao carregou na coluna ($why; $($nav.Summary)); medida na pagina ao vivo do fornecedor ($($live.detail)), que depende da rede"
+    return Wait-Armed "Column" "https://" 45000
 }
 
 # No fim de cada hospedeiro: um dialogo modal que uma tecla abriu (o de
@@ -980,32 +1189,16 @@ function Close-StrayDialogs([string]$hostName) {
 # tentativas dele. Um problema que impede medir o hospedeiro LANCA; quem
 # chama marca as tentativas que faltam como nao medidas e segue.
 function Invoke-HostTrials([string]$hostName, [int[]]$trials) {
-    $isFixtureHost = $FixtureHosts -contains $hostName
-    $argument = ""
-    if ($isFixtureHost -or $hostName -eq "Column") { $argument = $script:FixtureUrl }
-    $opened = $null
-    $watch = [Diagnostics.Stopwatch]::StartNew()
-    do {
-        $opened = Invoke-Spike "open" $hostName $argument 30000
-        if ($opened.ok) { break }
-        Start-Sleep -Milliseconds 500
-    } while ($watch.ElapsedMilliseconds -lt 45000)
-    if (-not $opened.ok) { throw "nao abriu: $($opened.detail)" }
-
     # A pagina acabou de carregar (e, nos web, e a fixture): so entao a
-    # sonda vai para o documento que vai receber as teclas.
+    # sonda vai para o documento que vai receber as teclas. A coluna ja
+    # existe depois do Wait-ExeReady: um `open` dela recusado sai logo.
     if ($hostName -eq "Column") {
-        $arm = Wait-Armed $hostName $script:FixtureUrl 20000
-        if ($null -ne $arm.Armed) {
-            Add-SpikeNote "Column: medida na fixture de 127.0.0.1 (a excecao de navegacao da coluna so existe no exe do spike; o gate que embarca nao muda)"
-        }
-        else {
-            $seen = if ($null -ne $arm.Last) { Format-Href ([string]$arm.Last.href) } else { "sem resposta da sonda" }
-            Add-SpikeNote "Column: a fixture de 127.0.0.1 nao carregou na coluna (a sonda viu $seen); medida na pagina ao vivo que o NEURALIA_STARTUP_INPUT abriu, que depende da rede"
-            $arm = Wait-Armed $hostName "" 45000
-        }
+        $arm = Open-ColumnHost
     }
     else {
+        $isFixtureHost = $FixtureHosts -contains $hostName
+        $argument = if ($isFixtureHost) { $script:FixtureUrl } else { "" }
+        $null = Open-SpikeHost $hostName $argument 45000
         $requireHref = if ($isFixtureHost) { $script:FixtureUrl } else { "" }
         $arm = Wait-Armed $hostName $requireHref 45000
     }
@@ -1091,6 +1284,9 @@ try {
     if (($theirs -join "|") -ne ($ours -join "|")) {
         throw "A tabela de atalhos do exe difere da do brief:`n exe:    $($theirs -join ', ')`n script: $($ours -join ', ')"
     }
+    # Os prazos de cada hospedeiro so comecam quando o exe le comandos.
+    $ready = Wait-ExeReady $Hosts[0] $StartupMs
+    Add-SpikeNote "Arranque: o exe leu o primeiro comando $($ready.FirstAckMs) ms depois do hello ($($ready.Detail)); o hello sai antes de o comparador do NEURALIA_STARTUP_INPUT existir, e os prazos de cada hospedeiro contam a partir daqui"
 
     foreach ($hostName in $Hosts) {
         Write-Host "== $hostName"

@@ -88,8 +88,9 @@ impl SpikeHost {
     }
 
     /// Os hospedeiros que carregam a pagina de fixture de 127.0.0.1: o
-    /// `open` deles exige o endereco. A coluna aceita-o sem o exigir (sem
-    /// ele fica na pagina ao vivo; ver `column_fixture_navigation`).
+    /// `open` deles exige o endereco. A coluna aceita-o sem o exigir: sem
+    /// ele fica na pagina ao vivo, ou volta a ela se a fixture tinha sido
+    /// pedida (`ColumnFixture::release`; ver `column_fixture_navigation`).
     pub(crate) fn loads_fixture(self) -> bool {
         matches!(
             self,
@@ -238,6 +239,10 @@ pub(crate) enum SpikeVerb {
     Begin(u32),
     /// Le o que a pagina viu na tentativa N.
     Pull(u32),
+    /// O primeiro comando da corrida: o ack diz que o event loop ja le
+    /// comandos (o `hello` sai no `resumed`, antes de o comparador do
+    /// `NEURALIA_STARTUP_INPUT` se construir) e se o hospedeiro esta aberto.
+    Ping,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,6 +289,66 @@ pub(crate) fn column_fixture_navigation(target: &str, fixture: Option<&str>) -> 
     }
 }
 
+/// O pedido do condutor para a coluna, que o exe do spike guarda: a origem
+/// da fixture pedida (`open Column <url>`) e a navegacao do WebView2 que a
+/// leva (o `NavigationId` do `NavigationStarting`), para o
+/// `NavigationCompleted` dessa navegacao ir para o registo e o condutor
+/// saber logo se a coluna carregou a fixture ou se o runtime a recusou.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ColumnFixture {
+    origin: Option<String>,
+    navigation: Option<u64>,
+}
+
+impl ColumnFixture {
+    /// Nenhum pedido: nem a fixture passa pela excecao.
+    pub(crate) const NONE: ColumnFixture = ColumnFixture {
+        origin: None,
+        navigation: None,
+    };
+
+    /// `open Column <url>`: a partir daqui a excecao deixa passar a origem
+    /// exata de `url` (e so ela). Devolve essa origem; `None` se `url` nao
+    /// e a fixture de 127.0.0.1 (nada passa).
+    pub(crate) fn request(&mut self, url: &str) -> Option<&str> {
+        self.origin = fixture_origin(url);
+        self.navigation = None;
+        self.origin.as_deref()
+    }
+
+    /// Um `NavigationStarting` da coluna: `true` quando e a fixture pedida
+    /// (`column_fixture_navigation`) -- a excecao repoe `Cancel = false` e a
+    /// navegacao fica a ser a que se segue ate ao `NavigationCompleted`.
+    pub(crate) fn starting(&mut self, uri: &str, navigation: u64) -> bool {
+        let fixture = column_fixture_navigation(uri, self.origin.as_deref());
+        if fixture {
+            self.navigation = Some(navigation);
+        }
+        fixture
+    }
+
+    /// Um `NavigationCompleted` da coluna: `true` so para a navegacao da
+    /// fixture (as das paginas ao vivo das tres colunas nao contam).
+    pub(crate) fn completed(&self, navigation: u64) -> bool {
+        self.navigation == Some(navigation)
+    }
+
+    /// `open Column` sem URL: a excecao deixa de valer. Devolve se havia um
+    /// pedido da fixture -- entao a coluna pode ter ficado a meio dela e o
+    /// exe repoe a pagina ao vivo do fornecedor.
+    pub(crate) fn release(&mut self) -> bool {
+        let requested = self.origin.is_some();
+        *self = ColumnFixture::NONE;
+        requested
+    }
+}
+
+/// O detalhe do ack de `ping`: o hospedeiro, se esta aberto e a superficie.
+/// O condutor le o `aberto=` (Test-PingOpen).
+pub(crate) fn ping_detail(host: SpikeHost, open: bool, surface: &str) -> String {
+    format!("{} aberto={open} surface={surface}", host.name())
+}
+
 /// `<seq> <verbo> <Hospedeiro> [argumento]`, uma linha.
 pub(crate) fn parse_spike_command(line: &str) -> Result<SpikeCommand, String> {
     let mut parts = line.split_whitespace();
@@ -317,11 +382,12 @@ pub(crate) fn parse_spike_command(line: &str) -> Result<SpikeCommand, String> {
             }
             None => SpikeVerb::Open(None),
         },
-        "arm" | "focus" if argument.is_some() => {
+        "arm" | "focus" | "ping" if argument.is_some() => {
             return Err(format!("argumentos a mais: {line:?}"));
         }
         "arm" => SpikeVerb::Arm,
         "focus" => SpikeVerb::Focus,
+        "ping" => SpikeVerb::Ping,
         "begin" => SpikeVerb::Begin(trial(argument)?),
         "pull" => SpikeVerb::Pull(trial(argument)?),
         _ => return Err(format!("verbo desconhecido: {line:?}")),
@@ -426,6 +492,24 @@ pub(crate) fn act_line(trial: u32, act: &str) -> String {
     format!(
         "{{\"t\":\"act\",\"trial\":{trial},\"act\":{}}}",
         json_string(act)
+    )
+}
+
+/// O `NavigationStarting` da fixture na coluna: o `Cancel` que o gate que
+/// embarca deixou (`gate`) e o que ficou depois da excecao do spike
+/// (`cancel`). So a fixture (127.0.0.1) vai para aqui.
+pub(crate) fn colnav_start_line(navigation: u64, uri: &str, gate: bool, cancel: bool) -> String {
+    format!(
+        "{{\"t\":\"colnav\",\"phase\":\"start\",\"nav\":{navigation},\"uri\":{},\"gate\":{gate},\"cancel\":{cancel}}}",
+        json_string(uri)
+    )
+}
+
+/// O `NavigationCompleted` dessa navegacao: `IsSuccess` e o
+/// `COREWEBVIEW2_WEB_ERROR_STATUS` (14 = OPERATION_CANCELED).
+pub(crate) fn colnav_done_line(navigation: u64, ok: bool, status: i32) -> String {
+    format!(
+        "{{\"t\":\"colnav\",\"phase\":\"done\",\"nav\":{navigation},\"ok\":{ok},\"status\":{status}}}"
     )
 }
 
@@ -721,6 +805,19 @@ mod tests {
             parse_spike_command("14 open Column").map(|command| command.verb),
             Ok(SpikeVerb::Open(None))
         );
+        // O primeiro comando da corrida, a qualquer hospedeiro, sem argumento.
+        assert_eq!(
+            parse_spike_command("1 ping Column"),
+            Ok(SpikeCommand {
+                seq: 1,
+                host: SpikeHost::Column,
+                verb: SpikeVerb::Ping,
+            })
+        );
+        assert_eq!(
+            parse_spike_command("2 ping External").map(|command| command.verb),
+            Ok(SpikeVerb::Ping)
+        );
 
         for refused in [
             "",
@@ -739,6 +836,9 @@ mod tests {
             "1 focus Column extra",
             "1 open Column http://127.0.0.1:5123/ extra",
             "1 close Column",
+            "1 ping Column extra",
+            "1 ping",
+            "1 ping Tab",
         ] {
             assert!(parse_spike_command(refused).is_err(), "{refused:?}");
         }
@@ -785,6 +885,51 @@ mod tests {
         ] {
             assert_eq!(fixture_origin(refused), None, "{refused:?}");
         }
+    }
+
+    /// A coluna a caminho da fixture: so a navegacao da fixture pedida fica
+    /// seguida (o `NavigationCompleted` dela vai para o registo, as das
+    /// paginas ao vivo nao), e o `open Column` sem URL desfaz o pedido e diz
+    /// se havia um (entao o exe repoe a pagina ao vivo).
+    #[test]
+    fn the_column_fixture_request_follows_only_its_own_navigation() {
+        let mut state = ColumnFixture::NONE;
+        // Sem pedido nada passa nem fica seguido.
+        assert!(!state.starting("http://127.0.0.1:5123/fixture.html", 7));
+        assert!(!state.completed(7));
+        assert!(!state.release());
+
+        assert_eq!(
+            state.request("http://127.0.0.1:5123/fixture.html"),
+            Some("http://127.0.0.1:5123")
+        );
+        // As paginas ao vivo das tres colunas continuam a navegar e nao
+        // contam; a fixture sim, com o id dela.
+        assert!(!state.starting("https://www.google.com/search?q=x", 3));
+        assert!(!state.starting("http://127.0.0.1:5124/fixture.html", 4));
+        assert!(state.starting("http://127.0.0.1:5123/fixture.html", 9));
+        assert!(state.completed(9));
+        assert!(!state.completed(3));
+        assert!(!state.completed(4));
+
+        // Um pedido novo esquece a navegacao anterior.
+        assert_eq!(
+            state.request("http://127.0.0.1:6000/fixture.html"),
+            Some("http://127.0.0.1:6000")
+        );
+        assert!(!state.completed(9));
+        assert!(!state.starting("http://127.0.0.1:5123/fixture.html", 10));
+
+        // O recuo para a pagina ao vivo: o pedido acaba, e acaba uma vez.
+        assert!(state.release());
+        assert_eq!(state, ColumnFixture::NONE);
+        assert!(!state.release());
+        assert!(!state.starting("http://127.0.0.1:6000/fixture.html", 11));
+
+        // Um endereco que nao e a fixture nao abre excecao nenhuma.
+        assert_eq!(state.request("http://localhost:5123/fixture.html"), None);
+        assert!(!state.starting("http://localhost:5123/fixture.html", 12));
+        assert!(!state.release());
     }
 
     #[test]
@@ -847,6 +992,24 @@ mod tests {
         assert_eq!(
             hooked_line(SpikeHost::Epub, Some("E_NOINTERFACE")),
             r#"{"t":"hooked","host":"Epub","ok":false,"error":"E_NOINTERFACE"}"#
+        );
+        // As linhas da coluna a caminho da fixture: o -SelfTest do condutor
+        // le exatamente estas (New-ColumnNavRecords).
+        assert_eq!(
+            colnav_start_line(9, "http://127.0.0.1:5123/fixture.html", true, false),
+            r#"{"t":"colnav","phase":"start","nav":9,"uri":"http://127.0.0.1:5123/fixture.html","gate":true,"cancel":false}"#
+        );
+        assert_eq!(
+            colnav_done_line(9, false, 14),
+            r#"{"t":"colnav","phase":"done","nav":9,"ok":false,"status":14}"#
+        );
+        assert_eq!(
+            ping_detail(SpikeHost::Column, true, "Comparator"),
+            "Column aberto=true surface=Comparator"
+        );
+        assert_eq!(
+            ping_detail(SpikeHost::External, false, "Home"),
+            "External aberto=false surface=Home"
         );
     }
 
