@@ -870,7 +870,7 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::sync::Mutex;
     use std::time::Instant;
-    use windows_sys::Win32::Security::Authorization::SE_FILE_OBJECT;
+    use windows_sys::Win32::Security::Authorization::{ConvertStringSidToSidW, SE_FILE_OBJECT};
 
     /// `O:<dono>D:<flags>(ace)(ace)...` -> (dono, flags, [(tipo, direitos, sid)]).
     fn parse_sddl(sddl: &str) -> (String, String, Vec<(String, String, String)>) {
@@ -896,13 +896,37 @@ mod tests {
         (owner.to_string(), flags, aces)
     }
 
+    /// O SDDL abrevia os SIDs conhecidos (`SY`; `LA` = o Administrador da
+    /// maquina, que e o utilizador do runner do CI): cada trustee volta ao
+    /// `S-1-...` completo, o mesmo texto de `current_user_sid`, antes de
+    /// comparar.
+    fn full_sid(text: &str) -> String {
+        if text.starts_with("S-1-") {
+            return text.to_string();
+        }
+        let wide = wide_null(text);
+        let mut sid: PSID = core::ptr::null_mut();
+        // SAFETY: texto terminado em zero; o SID alocado pelo sistema e
+        // convertido e depois libertado com LocalFree.
+        unsafe {
+            assert_ne!(
+                ConvertStringSidToSidW(wide.as_ptr(), &mut sid),
+                0,
+                "SID {text}"
+            );
+            let full = sid_to_string(sid);
+            LocalFree(sid as HLOCAL);
+            full.unwrap()
+        }
+    }
+
     fn assert_user_only(sddl: &str, me: &str) {
         let (owner, flags, aces) = parse_sddl(sddl);
-        assert_eq!(owner, me, "{sddl}");
+        assert_eq!(full_sid(&owner), me, "{sddl}");
         assert!(flags.contains('P'), "DACL must be protected: {sddl}");
-        let mut trustees: Vec<&str> = aces.iter().map(|(_, _, sid)| sid.as_str()).collect();
+        let mut trustees: Vec<String> = aces.iter().map(|(_, _, sid)| full_sid(sid)).collect();
         trustees.sort_unstable();
-        let mut expected = vec!["SY", me];
+        let mut expected = vec![full_sid("SY"), me.to_string()];
         expected.sort_unstable();
         assert_eq!(trustees, expected, "{sddl}");
         for (kind, rights, _) in &aces {
@@ -931,6 +955,14 @@ mod tests {
         let server = HubServer::bind(&dir.0).unwrap();
         let me = current_user_sid().unwrap();
         assert!(me.starts_with("S-1-"), "{me}");
+        // A abreviatura do SDDL volta ao SID completo (o runner do CI corre
+        // como o Administrador da maquina, que o SDDL escreve `LA`).
+        let admin = full_sid("LA");
+        assert!(
+            admin.starts_with("S-1-5-21-") && admin.ends_with("-500"),
+            "{admin}"
+        );
+        assert_eq!(full_sid("SY"), "S-1-5-18");
         assert_eq!(
             user_only_sddl(&me),
             format!("O:{me}D:P(A;;FA;;;SY)(A;;FA;;;{me})")
