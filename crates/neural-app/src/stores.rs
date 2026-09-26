@@ -63,6 +63,14 @@ pub(crate) const BOOKMARKS_STORE: StoreSpec = StoreSpec::new("bookmarks.json", E
 /// interruptor (`App::set_allow_programs`); a pasta ainda so se le.
 pub(crate) const DOWNLOADS_SETTINGS_STORE: StoreSpec =
     StoreSpec::new("downloads-settings.json", Setting, File);
+/// `<data_dir>/agents`: as conversas com os agentes externos (MCP), uma por
+/// agente (`agents/<agente>.jsonl`), o estado de leitura (`state.json`) e as
+/// credenciais do canal (`token`, `pipe`, `hub.lock`, escritas pelo
+/// `agents::pipe` com DACL so do utilizador). Escritas como efeito lateral
+/// do uso: `Automatic` -- numa sessao privada as conversas ficam so na
+/// memoria (`agents::store`). As conversas saem no Ctrl+Shift+Delete
+/// (`ClearTarget::Agents`); as credenciais ficam.
+pub(crate) const AGENTS_STORE: StoreSpec = StoreSpec::new("agents", Automatic, Dir);
 
 /// Tudo o que o produto guarda em `<data_dir>`, com o tipo. Um ficheiro, um
 /// tipo; a regra: `Setting` = escolha num menu ou definicao; `Explicit` =
@@ -84,10 +92,7 @@ pub(crate) const APP_STORES: &[StoreSpec] = &[
     StoreSpec::new("panel-width.json", Automatic, File),
     // Os registos e a auditoria de cada corrida do agente.
     StoreSpec::new("agent", Automatic, Dir),
-    // As conversas com os agentes externos (MCP), o estado de leitura e as
-    // credenciais do canal (`agents::store`, `agents::pipe`). Escritas como
-    // efeito lateral do uso; as conversas saem no Ctrl+Shift+Delete.
-    StoreSpec::new("agents", Automatic, Dir),
+    AGENTS_STORE,
     // O perfil do WebView2 (cookies, cache, inicios de sessao).
     StoreSpec::new("WebView2", Automatic, Dir),
     // Escolhas nos menus: tema, avisos do Gmail, duracoes do Pomodoro.

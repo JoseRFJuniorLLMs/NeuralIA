@@ -6988,6 +6988,20 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
         sink.contains("ClearTarget::Memory => self.memory.clear(&mut self.current_research),"),
         "\"Apagar histórico\" must also clear the semantic memory"
     );
+    // O braco dos agentes chama o hub (comportamento em
+    // agents::hub::tests::clearing_conversations_keeps_ids_growing_and_writes_nothing_else).
+    assert!(
+        sink.contains("ClearTarget::Agents => self.clear_agent_conversations(),"),
+        "\"Apagar histórico\" must also clear the agent conversations"
+    );
+    let agents_clear = body(
+        "fn clear_agent_conversations(&mut self)",
+        "self.show_splash(",
+    );
+    assert!(
+        agents_clear.contains("AgentHub::clear_conversations"),
+        "clear_agent_conversations reaches AgentHub::clear_conversations"
+    );
     assert!(
         sink.contains("ClearTarget::History => match self.history.clear() {"),
         "\"Apagar histórico\" must also clear history.jsonl"
@@ -24043,9 +24057,9 @@ fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
 #[test]
 fn existing_stores_have_a_declared_kind() {
     use crate::stores::{
-        ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AI_SETTINGS_STORE, AI_USAGE_STORE, APP_STORES,
-        BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE, KEYS_STORE, LIVE_KEY_STORE,
-        TRANSLATE_STORE,
+        ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AGENTS_STORE, AI_SETTINGS_STORE,
+        AI_USAGE_STORE, APP_STORES, BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE,
+        KEYS_STORE, LIVE_KEY_STORE, TRANSLATE_STORE,
     };
     use neural_core::json_store::StoreKind::{Automatic, Explicit, Setting};
     use neural_core::json_store::StoreShape::{Dir, File};
@@ -24129,6 +24143,7 @@ fn existing_stores_have_a_declared_kind() {
         ("DOWNLOADS_SETTINGS_STORE", DOWNLOADS_SETTINGS_STORE.name),
         ("TRANSLATE_STORE", TRANSLATE_STORE.name),
         ("BOOKMARKS_STORE", BOOKMARKS_STORE.name),
+        ("AGENTS_STORE", AGENTS_STORE.name),
     ];
     for part in compact.split(".grant(").skip(1) {
         let argument = part.split(')').next().unwrap_or_default();

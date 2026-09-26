@@ -3277,8 +3277,9 @@ impl App {
         // Sem thread nem disco: a `neural-translate` so nasce no 1.o clique.
         let translation = TranslationState::new(proxy.clone());
         let downloads_ui = DownloadsUiState::new(proxy.clone());
-        // O disco das conversas e o canal dos agentes abrem fora desta thread.
-        let agents = AgentsHubState::open(&config.data_dir, &proxy);
+        // A loja `agents` pelo grant; o disco das conversas e o canal dos
+        // agentes abrem fora desta thread.
+        let agents = AgentsHubState::open(stores.as_ref(), &proxy);
         Self {
             document,
             pdf_bytes: Arc::new(Mutex::new(Vec::new())),

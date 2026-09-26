@@ -864,7 +864,7 @@ mod tests {
     use super::*;
     use crate::agents::hub::tests::{ManualClock, fixture};
     use crate::agents::hub::{AgentEvent, QuestionAnswer};
-    use crate::agents::store::tests::TempDir;
+    use crate::agents::store::tests::{TempDir, open_store};
     use crate::agents::{RecordBody, SharedContext};
     use std::os::windows::io::AsRawHandle;
     use std::process::{Command, Stdio};
@@ -1107,6 +1107,7 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/test-agents-mcp.mjs");
         let root = TempDir::new("e2e");
         let data_dir = root.0.join("data");
+        let (_registry, store) = open_store(&data_dir);
         let clock = ManualClock::new();
         let hub_slot: Arc<Mutex<Option<AgentHub>>> = Arc::new(Mutex::new(None));
         let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1115,7 +1116,7 @@ mod tests {
             let events = Arc::clone(&events);
             let clock_for_user = clock.clone();
             AgentHub::with_clock(
-                data_dir.join("agents"),
+                store,
                 Arc::new(move |event: AgentEvent| {
                     // O «utilizador» deste teste.
                     if let AgentEvent::Question(card) = &event {

@@ -287,13 +287,17 @@ impl std::fmt::Debug for AgentHub {
 }
 
 impl AgentHub {
-    /// Um hub vazio sobre `dir` (`<data_dir>/agents`). Nao le o disco:
-    /// `load()` faz isso, numa thread que nao e a da janela.
-    pub(crate) fn new(dir: PathBuf, notify: impl Fn(AgentEvent) + Send + Sync + 'static) -> Self {
-        Self::with_clock(dir, Arc::new(notify), Arc::new(Instant::now))
+    /// Um hub vazio sobre a loja `agents` (`<data_dir>/agents`, aberta pelo
+    /// grant do registo). Nao le o disco: `load()` faz isso, numa thread que
+    /// nao e a da janela.
+    pub(crate) fn new(
+        store: ConversationStore,
+        notify: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_clock(store, Arc::new(notify), Arc::new(Instant::now))
     }
 
-    pub(crate) fn with_clock(dir: PathBuf, notify: Notifier, clock: Clock) -> Self {
+    pub(crate) fn with_clock(store: ConversationStore, notify: Notifier, clock: Clock) -> Self {
         Self {
             inner: Arc::new(HubInner {
                 state: Mutex::new(HubState {
@@ -307,7 +311,7 @@ impl AgentHub {
                     store_error: None,
                 }),
                 changed: Condvar::new(),
-                store: ConversationStore::new(dir),
+                store,
                 notify,
                 clock,
             }),
@@ -839,12 +843,15 @@ impl AgentHub {
         });
     }
 
-    /// Ctrl+Shift+Delete: apaga as conversas do disco e da memoria. As
-    /// perguntas pendentes continuam (o agente esta a espera delas).
+    /// Ctrl+Shift+Delete: apaga as conversas do disco e da memoria, debaixo
+    /// do lock (uma ponte que escreva entretanto nao ressuscita o ficheiro
+    /// a meio). As perguntas pendentes continuam (o agente esta a espera
+    /// delas).
     pub(crate) fn clear_conversations(&self) -> Result<(), String> {
         let store = self.inner.store.clone();
-        let result = store.clear().map_err(|error| error.to_string());
+        let mut result = Ok(());
         let marks = self.with_state(|state, events| {
+            result = store.clear().map_err(|error| error.to_string());
             for entry in state.agents.values_mut() {
                 let last = entry.conversation.last_id();
                 entry.marks.next_id = entry.marks.next_id.max(last + 1);
@@ -1170,8 +1177,10 @@ fn fail(error: &str, close: bool) -> SessionReply {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::agents::store::tests::TempDir;
+    use crate::agents::store::tests::{TempDir, open_store};
     use crate::agents::tools::ASK_TIMEOUT_MIN_SECS;
+    use crate::stores::AGENTS_STORE;
+    use neural_core::json_store::{StoreMode, StoreRegistry};
 
     pub(crate) const TOKEN: &str =
         "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
@@ -1197,6 +1206,8 @@ pub(crate) mod tests {
 
     pub(crate) struct Fixture {
         pub(crate) dir: TempDir,
+        /// O registo das lojas do teste; `set_mode` liga o modo privado.
+        pub(crate) registry: StoreRegistry,
         pub(crate) hub: AgentHub,
         pub(crate) clock: ManualClock,
         pub(crate) events: Arc<Mutex<Vec<AgentEvent>>>,
@@ -1204,11 +1215,12 @@ pub(crate) mod tests {
 
     pub(crate) fn fixture(tag: &str) -> Fixture {
         let dir = TempDir::new(tag);
+        let (registry, store) = open_store(&dir.0);
         let clock = ManualClock::new();
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
         let hub = AgentHub::with_clock(
-            dir.0.join("agents"),
+            store,
             Arc::new(move |event| sink.lock().unwrap().push(event)),
             clock.clock(),
         );
@@ -1216,10 +1228,17 @@ pub(crate) mod tests {
         events.lock().unwrap().clear();
         Fixture {
             dir,
+            registry,
             hub,
             clock,
             events,
         }
+    }
+
+    /// Um segundo hub sobre a mesma loja (o NeuralIA reaberto).
+    fn reopen(f: &Fixture) -> AgentHub {
+        let store = ConversationStore::open(f.registry.grant(AGENTS_STORE).unwrap()).unwrap();
+        AgentHub::new(store, |_| {})
     }
 
     fn send(hub: &AgentHub, connection: ConnectionId, text: &str) -> Result<Value, String> {
@@ -1739,7 +1758,7 @@ pub(crate) mod tests {
         send(&f.hub, claude, "três").unwrap();
         assert_eq!(f.hub.total_unread(), 1);
         // Sobrevive ao reinicio.
-        let reopened = AgentHub::new(f.hub.dir(), |_| {});
+        let reopened = reopen(&f);
         reopened.load();
         assert_eq!(reopened.unread("claude"), 1);
         assert_eq!(reopened.conversation("claude").len(), 4);
@@ -1759,7 +1778,7 @@ pub(crate) mod tests {
         assert!(f.hub.conversation("claude").is_empty());
         assert_eq!(f.hub.total_unread(), 0);
         assert!(!f.dir.0.join("agents").join("claude.jsonl").exists());
-        let reopened = AgentHub::new(f.hub.dir(), |_| {});
+        let reopened = reopen(&f);
         reopened.load();
         assert!(reopened.conversation("claude").is_empty());
         assert_eq!(reopened.user_message("claude", "três").unwrap().id, 3);
@@ -1769,6 +1788,72 @@ pub(crate) mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(top, vec!["agents".to_string()]);
+    }
+
+    /// Gate (critico: modo privado). Com o registo das lojas em `Private` o
+    /// hub continua a servir -- o ecra recebe os eventos, o agente le o que
+    /// o utilizador lhe escreveu -- mas a pasta `agents` fica byte a byte
+    /// igual: nem conversa, nem estado de leitura. Quem reabre ve so o que
+    /// ja la estava. O comportamento da reescrita esta em
+    /// `store::tests::a_private_session_never_reaches_the_disk_even_through_a_rewrite`.
+    #[test]
+    fn a_private_session_serves_the_screen_and_the_agent_but_writes_nothing() {
+        let f = fixture("private-hub");
+        let claude = f.hub.connect("claude").unwrap();
+        send(&f.hub, claude, "antes").unwrap();
+        f.hub.mark_read("claude");
+        let snapshot = |dir: &std::path::Path| -> Vec<(String, Vec<u8>)> {
+            let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .map(|p| {
+                    (
+                        p.file_name().unwrap().to_string_lossy().into_owned(),
+                        std::fs::read(&p).unwrap(),
+                    )
+                })
+                .collect();
+            files.sort();
+            files
+        };
+        let before = snapshot(&f.hub.dir());
+        assert_eq!(before.len(), 2, "claude.jsonl + state.json: {before:?}");
+
+        f.registry.set_mode(StoreMode::Private);
+        send(&f.hub, claude, "privado").unwrap();
+        f.hub.user_message("claude", "segredo").unwrap();
+        let question = ask(&f.hub, claude, 600).unwrap();
+        f.hub
+            .answer_question(question, QuestionAnswer::Button(0))
+            .unwrap();
+        f.hub.mark_read("claude");
+        // Entregue: o ecra viu a mensagem e o cartao, o agente le o segredo.
+        let events = f.events.lock().unwrap().clone();
+        assert!(events.iter().any(
+            |e| matches!(e, AgentEvent::Message { record, .. } if matches!(&record.body, RecordBody::AgentMessage { text, .. } if text == "privado"))
+        ));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Question(_))));
+        assert_eq!(f.hub.conversation("claude").len(), 5);
+        let page = f
+            .hub
+            .call(claude, ToolCall::GetUserMessages { since_id: None })
+            .unwrap();
+        assert!(page.to_string().contains("segredo"), "{page}");
+        // Gravado: nada.
+        assert_eq!(snapshot(&f.hub.dir()), before);
+        let reopened = reopen(&f);
+        reopened.load();
+        assert_eq!(reopened.conversation("claude").len(), 1);
+
+        // De volta ao normal, so o que vier a seguir vai ao disco.
+        f.registry.set_mode(StoreMode::Normal);
+        send(&f.hub, claude, "depois").unwrap();
+        let file = std::fs::read_to_string(f.hub.dir().join("claude.jsonl")).unwrap();
+        assert!(file.contains("antes") && file.contains("depois"), "{file}");
+        assert!(
+            !file.contains("privado") && !file.contains("segredo"),
+            "{file}"
+        );
     }
 
     #[test]

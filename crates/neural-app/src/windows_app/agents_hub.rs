@@ -1,17 +1,19 @@
 use super::*;
 
-use std::path::Path;
-
+use crate::agents::store::ConversationStore;
 use crate::agents::{self, AgentEvent, AgentHub, QuestionView, RecordBody};
+use crate::stores::AGENTS_STORE;
 
 // ===================== os agentes externos no app (agents-hub) =====================
 //
 // O nucleo (`crate::agents`: a ponte `--mcp`, o hub, o canal e as conversas)
 // decide e guarda; aqui vive so o que o liga ao produto:
 //
-// - o hub nasce no `App::new` sobre `<data_dir>/agents` e o canal (named
-//   pipe) abre numa thread propria (`agents::pipe::start`), nunca na thread
-//   da janela;
+// - o hub nasce no `App::new` sobre a loja `agents` (`<data_dir>/agents`,
+//   `Automatic`), aberta SO pelo grant do registo das lojas -- numa sessao
+//   privada as conversas ficam fora do disco; sem registo nao ha hub -- e o
+//   canal (named pipe) abre numa thread propria (`agents::pipe::start`),
+//   nunca na thread da janela;
 // - cada `AgentEvent` que o hub anuncia vira UM evento da janela,
 //   `UserEvent::AgentsHub(AgentsHubEvent::Hub(..))`, entregue pela thread do
 //   canal atraves do `EventLoopProxy`;
@@ -31,25 +33,38 @@ pub(in crate::windows_app) enum AgentsHubEvent {
 }
 
 /// O estado dos agentes externos no `App`: o hub (clonavel; os clones sao o
-/// mesmo hub) que as threads do canal tambem seguram.
+/// mesmo hub) que as threads do canal tambem seguram. `None` so sem registo
+/// das lojas, que nao acontece (ha um `App` por processo): sem grant nao ha
+/// pasta, nem hub, nem canal.
 pub(in crate::windows_app) struct AgentsHubState {
-    hub: AgentHub,
+    hub: Option<AgentHub>,
 }
 
 impl AgentsHubState {
-    /// Cria o hub sobre `<data_dir>/agents` e abre o canal fora desta thread
-    /// (`agents::pipe::start`: le as conversas e faz o bind do named pipe).
-    pub(in crate::windows_app) fn open(data_dir: &Path, proxy: &EventLoopProxy<UserEvent>) -> Self {
-        let proxy = proxy.clone();
-        let hub = AgentHub::new(data_dir.join("agents"), move |event| {
-            let _ = proxy.send_event(UserEvent::AgentsHub(AgentsHubEvent::Hub(event)));
-        });
-        agents::pipe::start(hub.clone());
+    /// Pede o grant da loja `agents` ao registo, cria o hub sobre ela e abre
+    /// o canal fora desta thread (`agents::pipe::start`: le as conversas e
+    /// faz o bind do named pipe).
+    pub(in crate::windows_app) fn open(
+        stores: Option<&StoreRegistry>,
+        proxy: &EventLoopProxy<UserEvent>,
+    ) -> Self {
+        let hub = stores
+            .and_then(|stores| stores.grant(AGENTS_STORE).ok())
+            .and_then(|grant| ConversationStore::open(grant).ok())
+            .map(|store| {
+                let proxy = proxy.clone();
+                AgentHub::new(store, move |event| {
+                    let _ = proxy.send_event(UserEvent::AgentsHub(AgentsHubEvent::Hub(event)));
+                })
+            });
+        if let Some(hub) = &hub {
+            agents::pipe::start(hub.clone());
+        }
         Self { hub }
     }
 
-    pub(in crate::windows_app) fn hub(&self) -> &AgentHub {
-        &self.hub
+    pub(in crate::windows_app) fn hub(&self) -> Option<&AgentHub> {
+        self.hub.as_ref()
     }
 }
 
@@ -122,7 +137,7 @@ impl App {
     /// O braco `ClearTarget::Agents` do "Apagar historico": as conversas com
     /// os agentes vao no mesmo gesto; uma falha do disco e dita, nao engolida.
     pub(in crate::windows_app) fn clear_agent_conversations(&mut self) {
-        if let Err(error) = self.agents.hub().clear_conversations() {
+        if let Some(Err(error)) = self.agents.hub().map(AgentHub::clear_conversations) {
             self.show_splash(format!("Conversas dos agentes: {error}"), 4);
         }
     }

@@ -44,6 +44,8 @@ pub(crate) use hub::{
 };
 #[allow(unused_imports)]
 pub(crate) use store::{AgentRecord, AnswerVia, CloseReason, RecordBody, SharedContext, SharedTab};
+// `agent_display_name` so o app (Windows) o chama; fora do Windows fica sem uso.
+#[cfg_attr(not(target_os = "windows"), allow(unused_imports))]
 pub(crate) use tools::{agent_display_name, sanitize_agent_name};
 
 /// Nome do agente quando a linha de comando nao diz qual.

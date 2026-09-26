@@ -9,13 +9,22 @@
 //!
 //! Nada daqui toca no historico nem na memoria da NeuralIA: e o unico sitio
 //! onde as conversas com agentes vivem, e o Ctrl+Shift+Delete apaga-o.
+//!
+//! A pasta abre-se com o `StoreGrant` da loja `agents` (`StoreKind::Automatic`,
+//! `StoreShape::Dir`: efeito lateral do uso), pedido ao `StoreRegistry` do
+//! `App`. Enquanto o registo disser `StoreMode::Private`, nada daqui escreve:
+//! as conversas ficam no ecra e na memoria (`Conversation::unsaved`), o
+//! agente le-as pelo `get_user_messages`, e nem uma reescrita posterior do
+//! ficheiro as leva ao disco. Apagar (`clear`) vale sempre.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use neural_core::json_store::{StoreError, StoreGrant, StoreShape};
 use serde_json::{Value, json};
 
 use super::tools::{
@@ -418,12 +427,17 @@ pub(crate) fn iso_utc(ms: u64) -> String {
     )
 }
 
-/// A conversa com um agente, igual ao que esta no ficheiro.
+/// A conversa com um agente: o que esta no ficheiro mais, numa sessao
+/// privada, o que so esta na memoria.
 #[derive(Debug, Default)]
 pub(crate) struct Conversation {
     pub(crate) records: VecDeque<AgentRecord>,
-    /// Tamanho do ficheiro em bytes (a soma das linhas).
+    /// Tamanho do ficheiro em bytes (a soma das linhas que estao no disco).
     bytes: u64,
+    /// Registos acrescentados enquanto as escritas estavam vedadas (modo
+    /// privado): ficam no ecra e na memoria e nunca entram numa reescrita do
+    /// ficheiro, mesmo depois de o modo voltar a normal.
+    unsaved: BTreeSet<u64>,
 }
 
 impl Conversation {
@@ -441,6 +455,7 @@ impl Conversation {
         Self {
             records: records.into(),
             bytes,
+            unsaved: BTreeSet::new(),
         }
     }
 
@@ -448,7 +463,11 @@ impl Conversation {
     fn trim_to_keep(&mut self) {
         while self.records.len() > KEEP_LINES || self.bytes > KEEP_BYTES {
             match self.records.pop_front() {
-                Some(old) => self.bytes -= old.line().len() as u64,
+                Some(old) => {
+                    if !self.unsaved.remove(&old.id) {
+                        self.bytes -= old.line().len() as u64;
+                    }
+                }
                 None => break,
             }
         }
@@ -459,10 +478,10 @@ impl Conversation {
     }
 }
 
-/// Os ficheiros das conversas numa pasta.
+/// Os ficheiros das conversas na pasta da loja `agents`, aberta pelo grant.
 #[derive(Debug, Clone)]
 pub(crate) struct ConversationStore {
-    dir: PathBuf,
+    grant: Arc<StoreGrant>,
 }
 
 /// O que o arranque leu do disco.
@@ -483,16 +502,32 @@ pub(crate) struct AgentMarks {
 }
 
 impl ConversationStore {
-    pub(crate) fn new(dir: PathBuf) -> Self {
-        Self { dir }
+    /// Abre a loja pelo grant da pasta `agents` (`stores::AGENTS_STORE`). Um
+    /// grant que nao e de uma pasta e recusado.
+    pub(crate) fn open(grant: StoreGrant) -> Result<Self, StoreError> {
+        if grant.shape() != StoreShape::Dir {
+            return Err(StoreError::WrongShape {
+                name: grant.name(),
+                expected: StoreShape::Dir,
+            });
+        }
+        Ok(Self {
+            grant: Arc::new(grant),
+        })
     }
 
     pub(crate) fn dir(&self) -> &Path {
-        &self.dir
+        self.grant.path()
+    }
+
+    /// Falso enquanto o registo das lojas disser `StoreMode::Private`: a loja
+    /// e `Automatic`, e uma sessao privada nao deixa nada no disco.
+    pub(crate) fn writes_allowed(&self) -> bool {
+        self.grant.writes_allowed()
     }
 
     fn conversation_path(&self, agent: &str) -> PathBuf {
-        self.dir.join(format!("{agent}.jsonl"))
+        self.dir().join(format!("{agent}.jsonl"))
     }
 
     /// Le tudo o que esta na pasta. Nunca falha: o que nao se le fica de fora.
@@ -501,7 +536,7 @@ impl ConversationStore {
             marks: self.load_marks(),
             ..LoadedStore::default()
         };
-        let Ok(entries) = fs::read_dir(&self.dir) else {
+        let Ok(entries) = fs::read_dir(self.dir()) else {
             return loaded;
         };
         let mut agents: Vec<String> = entries
@@ -583,13 +618,22 @@ impl ConversationStore {
     }
 
     /// Acrescenta `record` a conversa e ao ficheiro; passando do tecto,
-    /// reescreve o ficheiro so com os registos mais recentes.
+    /// reescreve o ficheiro so com os registos mais recentes. Com as
+    /// escritas vedadas (modo privado) o registo fica so na memoria.
     pub(crate) fn append(
         &self,
         agent: &str,
         conversation: &mut Conversation,
         record: AgentRecord,
     ) -> io::Result<()> {
+        if !self.writes_allowed() {
+            conversation.unsaved.insert(record.id);
+            conversation.records.push_back(record);
+            if conversation.over_cap() {
+                conversation.trim_to_keep();
+            }
+            return Ok(());
+        }
         let line = record.line();
         conversation.bytes += line.len() as u64;
         conversation.records.push_back(record);
@@ -597,7 +641,7 @@ impl ConversationStore {
             conversation.trim_to_keep();
             return self.rewrite(agent, conversation);
         }
-        fs::create_dir_all(&self.dir)?;
+        fs::create_dir_all(self.dir())?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -607,9 +651,17 @@ impl ConversationStore {
         file.write_all(line.as_bytes())
     }
 
+    /// Reescreve o ficheiro com os registos que podem estar no disco: os de
+    /// uma sessao privada (`unsaved`) nunca entram.
     fn rewrite(&self, agent: &str, conversation: &Conversation) -> io::Result<()> {
+        if !self.writes_allowed() {
+            return Ok(());
+        }
         let mut body = String::with_capacity(conversation.bytes as usize);
         for record in &conversation.records {
+            if conversation.unsaved.contains(&record.id) {
+                continue;
+            }
             body.push_str(&record.line());
         }
         write_atomic(&self.conversation_path(agent), body.as_bytes())
@@ -617,7 +669,7 @@ impl ConversationStore {
 
     fn load_marks(&self) -> BTreeMap<String, AgentMarks> {
         let mut marks = BTreeMap::new();
-        let Ok(text) = fs::read_to_string(self.dir.join(STATE_FILE)) else {
+        let Ok(text) = fs::read_to_string(self.dir().join(STATE_FILE)) else {
             return marks;
         };
         let Ok(value) = serde_json::from_str::<Value>(&text) else {
@@ -641,7 +693,12 @@ impl ConversationStore {
         marks
     }
 
+    /// Grava o estado de leitura e os ids. Com as escritas vedadas (modo
+    /// privado) nao toca no ficheiro.
     pub(crate) fn save_marks(&self, marks: &BTreeMap<String, AgentMarks>) -> io::Result<()> {
+        if !self.writes_allowed() {
+            return Ok(());
+        }
         let agents: serde_json::Map<String, Value> = marks
             .iter()
             .map(|(agent, mark)| {
@@ -652,13 +709,13 @@ impl ConversationStore {
             })
             .collect();
         let body = json!({"v": 1, "agents": agents}).to_string();
-        write_atomic(&self.dir.join(STATE_FILE), body.as_bytes())
+        write_atomic(&self.dir().join(STATE_FILE), body.as_bytes())
     }
 
-    /// Apaga as conversas (Ctrl+Shift+Delete). O token e o nome do canal
-    /// ficam: o hub continua a correr.
+    /// Apaga as conversas (Ctrl+Shift+Delete), em qualquer modo. O token e o
+    /// nome do canal ficam: o hub continua a correr.
     pub(crate) fn clear(&self) -> io::Result<()> {
-        let entries = match fs::read_dir(&self.dir) {
+        let entries = match fs::read_dir(self.dir()) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error),
@@ -700,6 +757,8 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::stores::AGENTS_STORE;
+    use neural_core::json_store::{StoreKind, StoreMode, StoreRegistry, StoreSpec};
 
     /// Pasta temporaria que se apaga sozinha.
     pub(crate) struct TempDir(pub(crate) PathBuf);
@@ -725,6 +784,14 @@ pub(crate) mod tests {
         }
     }
 
+    /// Um registo de teste sobre `root`, e a loja `agents` dele
+    /// (`<root>/agents`), como o `App` a abre.
+    pub(crate) fn open_store(root: &Path) -> (StoreRegistry, ConversationStore) {
+        let registry = StoreRegistry::mint_for_test(root);
+        let store = ConversationStore::open(registry.grant(AGENTS_STORE).unwrap()).unwrap();
+        (registry, store)
+    }
+
     fn message(id: u64, text: &str) -> AgentRecord {
         AgentRecord {
             id,
@@ -737,9 +804,103 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_store_only_opens_on_the_agents_dir_grant() {
+        let dir = TempDir::new("grant");
+        let registry = StoreRegistry::mint_for_test(&dir.0);
+        let file = registry
+            .grant(StoreSpec::new(
+                "agents.json",
+                StoreKind::Automatic,
+                StoreShape::File,
+            ))
+            .unwrap();
+        assert!(matches!(
+            ConversationStore::open(file),
+            Err(StoreError::WrongShape { .. })
+        ));
+        let store = ConversationStore::open(registry.grant(AGENTS_STORE).unwrap()).unwrap();
+        assert_eq!(store.dir(), dir.0.join("agents"));
+        assert!(store.writes_allowed());
+        // Nada no disco so por abrir.
+        assert!(!dir.0.join("agents").exists());
+    }
+
+    /// Gate (critico: dados do utilizador, modo privado). Com o registo em
+    /// `Private`, a loja `agents` (Automatic) nao escreve: conversa, estado
+    /// e reescritas ficam na memoria; a pasta fica byte a byte igual. E os
+    /// registos dessa sessao nunca chegam ao disco -- nem quando o modo
+    /// volta a `Normal` e o tecto forca uma reescrita do ficheiro.
+    #[test]
+    fn a_private_session_never_reaches_the_disk_even_through_a_rewrite() {
+        let dir = TempDir::new("private");
+        let (registry, store) = open_store(&dir.0);
+        let mut conversation = Conversation::default();
+        store
+            .append("claude", &mut conversation, message(1, "antes"))
+            .unwrap();
+        let path = store.conversation_path("claude");
+        let before = fs::read(&path).unwrap();
+        assert!(String::from_utf8_lossy(&before).contains("antes"));
+
+        registry.set_mode(StoreMode::Private);
+        assert!(!store.writes_allowed());
+        for id in 2..=(MAX_LINES as u64) {
+            store
+                .append("claude", &mut conversation, message(id, "privado"))
+                .unwrap();
+        }
+        let mut marks = BTreeMap::new();
+        marks.insert(
+            "claude".to_string(),
+            AgentMarks {
+                read_up_to: 5,
+                next_id: 9,
+            },
+        );
+        store.save_marks(&marks).unwrap();
+        // No ecra e para o agente: tudo. No disco: nada de novo.
+        assert_eq!(conversation.records.len(), MAX_LINES);
+        assert_eq!(conversation.last_id(), MAX_LINES as u64);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!store.dir().join(STATE_FILE).exists());
+        let names: Vec<String> = fs::read_dir(store.dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["claude.jsonl".to_string()]);
+        // Quem reabre le so o que ja la estava.
+        let reloaded = store.load();
+        assert_eq!(reloaded.conversations["claude"].records.len(), 1);
+        assert!(reloaded.marks.is_empty());
+
+        // De volta ao normal: o registo seguinte passa do tecto e reescreve o
+        // ficheiro -- so com o que podia estar no disco.
+        registry.set_mode(StoreMode::Normal);
+        store
+            .append(
+                "claude",
+                &mut conversation,
+                message(MAX_LINES as u64 + 1, "depois"),
+            )
+            .unwrap();
+        let file = fs::read_to_string(&path).unwrap();
+        assert_eq!(file.lines().count(), 1, "{file}");
+        assert!(file.contains("depois"), "{file}");
+        assert!(!file.contains("privado"), "{file}");
+        assert_eq!(conversation.records.len(), KEEP_LINES);
+        assert_eq!(conversation.bytes(), fs::metadata(&path).unwrap().len());
+        store.save_marks(&marks).unwrap();
+        assert!(store.dir().join(STATE_FILE).exists());
+        // Apagar vale em qualquer modo.
+        registry.set_mode(StoreMode::Private);
+        store.clear().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn every_record_kind_round_trips_through_disk() {
         let dir = TempDir::new("roundtrip");
-        let store = ConversationStore::new(dir.0.join("agents"));
+        let (_registry, store) = open_store(&dir.0);
         let bodies = vec![
             RecordBody::AgentMessage {
                 title: Some("Pronto".into()),
@@ -819,7 +980,7 @@ pub(crate) mod tests {
     #[test]
     fn conversation_file_is_capped_by_lines_and_bytes() {
         let dir = TempDir::new("caps");
-        let store = ConversationStore::new(dir.0.clone());
+        let (_registry, store) = open_store(&dir.0);
         let mut conversation = Conversation::default();
         for id in 1..=(MAX_LINES as u64 + 1) {
             store
@@ -855,13 +1016,13 @@ pub(crate) mod tests {
         assert!(conversation.bytes() <= MAX_BYTES);
         assert_eq!(conversation.last_id(), 300);
         // A reescrita e atomica: nao sobra temporario.
-        assert!(!dir.0.join("gemini.jsonl.tmp").exists());
+        assert!(!store.dir().join("gemini.jsonl.tmp").exists());
     }
 
     #[test]
     fn torn_last_line_is_dropped_and_the_file_rewritten_clean() {
         let dir = TempDir::new("torn");
-        let store = ConversationStore::new(dir.0.clone());
+        let (_registry, store) = open_store(&dir.0);
         let mut conversation = Conversation::default();
         store
             .append("claude", &mut conversation, message(1, "um"))
@@ -893,7 +1054,7 @@ pub(crate) mod tests {
         // Registos acima dos tectos, ou com nome de ficheiro estranho, ficam
         // de fora.
         fs::write(
-            dir.0.join("gemini.jsonl"),
+            store.dir().join("gemini.jsonl"),
             format!(
                 "{}\n{}\n",
                 json!({"id":1,"ts":1,"kind":"message","text":"x".repeat(MESSAGE_MAX_CHARS + 1)}),
@@ -901,7 +1062,7 @@ pub(crate) mod tests {
             ),
         )
         .unwrap();
-        fs::write(dir.0.join("Bad Name.jsonl"), "{}\n").unwrap();
+        fs::write(store.dir().join("Bad Name.jsonl"), "{}\n").unwrap();
         let loaded = store.load();
         assert_eq!(loaded.conversations["gemini"].records.len(), 1);
         assert!(!loaded.conversations.contains_key("Bad Name"));
@@ -910,17 +1071,17 @@ pub(crate) mod tests {
     #[test]
     fn clear_removes_conversations_but_keeps_the_hub_credentials() {
         let dir = TempDir::new("clear");
-        let store = ConversationStore::new(dir.0.clone());
+        let (_registry, store) = open_store(&dir.0);
         let mut conversation = Conversation::default();
         store
             .append("claude", &mut conversation, message(1, "um"))
             .unwrap();
-        fs::write(dir.0.join("token"), "t").unwrap();
-        fs::write(dir.0.join("pipe"), "p").unwrap();
+        fs::write(store.dir().join("token"), "t").unwrap();
+        fs::write(store.dir().join("pipe"), "p").unwrap();
         store.clear().unwrap();
         assert!(!store.conversation_path("claude").exists());
-        assert!(dir.0.join("token").exists());
-        assert!(dir.0.join("pipe").exists());
+        assert!(store.dir().join("token").exists());
+        assert!(store.dir().join("pipe").exists());
         assert!(store.load().conversations.is_empty());
     }
 
