@@ -112,8 +112,27 @@ jobs:
           $comparatorInjectPath = "crates/neural-app/src/windows_app/page_scripts.rs"
           $utf8 = [Text.UTF8Encoding]::new($false)
 
+          # Speed without a weaker proof (owner, 26/09/2026). dtolnay/rust-toolchain
+          # exports CARGO_INCREMENTAL=0 for the whole job, so each sabotage used to
+          # rebuild the whole neural-app crate from scratch, twice (the unit-test
+          # harness and the plain bin the integration tests need), about 35 s each.
+          # Each sabotage edits one file of one crate: incremental builds redo only
+          # what that edit and the previous restore touched. The restored tree is
+          # still proved below by a build made the way the rest of the job builds.
+          $jobIncremental = $env:CARGO_INCREMENTAL
+          $env:CARGO_INCREMENTAL = "1"
+
           function Write-Exact([string]$path, [string]$text) {
             [IO.File]::WriteAllText((Resolve-Path -LiteralPath $path), $text, $utf8)
+          }
+
+          # The restore is checked, not assumed: the next sabotage has to start
+          # from the shipped bytes, not from a tree that is merely equivalent.
+          function Restore-Exact([string]$path, [byte[]]$bytes, [string]$hash, [string]$label) {
+            [IO.File]::WriteAllBytes($path, $bytes)
+            if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $hash) {
+              throw "Sabotage '$label' did not restore $path byte-identical."
+            }
           }
 
           function Replace-Exact([string]$text, [string]$old, [string]$new, [string]$label) {
@@ -145,17 +164,28 @@ jobs:
           # to turn red by itself. A build error or another failing test does not count.
           # An Ignored gate is a CI-only real Win32 focus gate (#[ignore] in the
           # local suite): it runs alone with --ignored --exact.
+          # Only the NeuralIA bin's unit-test harness is built and run: every gate
+          # lives in crates/neural-app/src (scripts/test-release-contract.mjs holds
+          # each one there), and the package's other targets (the plain bin for the
+          # integration tests, tests/*.rs, the example) never run a gate.
+          # The log must show neural-app compiled: a run of a binary left over from
+          # the previous sabotage (often red on the same gate) would prove nothing.
           function Assert-GateRed([string]$label, [string]$test, [string]$targetPath, [string]$old, [string]$new, [bool]$ignored) {
             $resolved = (Resolve-Path -LiteralPath $targetPath).Path
+            $originalBytes = [IO.File]::ReadAllBytes($resolved)
+            $originalHash = (Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash
             $original = [IO.File]::ReadAllText($resolved, $utf8)
             $broken = Replace-Exact $original $old $new $label
             Write-Exact $resolved $broken
             try {
-              $filter = if ($ignored) { @('--', '--ignored', '--exact', "windows_app::tests::$test") } else { @($test) }
+              $filter = if ($ignored) { @('--bin', 'NeuralIA', '--', '--ignored', '--exact', "windows_app::tests::$test") } else { @('--bin', 'NeuralIA', $test) }
               $run = Invoke-GateTest $filter
             }
             finally {
-              Write-Exact $resolved $original
+              Restore-Exact $resolved $originalBytes $originalHash $label
+            }
+            if ($run.Log -notmatch 'Compiling(\x1b\[[0-9;]*m)*\s+neural-app v') {
+              throw "Sabotage '$label' was not compiled: cargo did not rebuild neural-app for it."
             }
             if ($run.Code -eq 0) {
               throw "Sabotage '$label' unexpectedly stayed green: $test"
@@ -562,15 +592,36 @@ jobs:
             }
           )
 
+          # Run grouped by target file (files in first-appearance order, matrix order
+          # inside a file), so consecutive incremental builds differ in one file.
+          # Every entry is still applied alone to the shipped bytes: the order
+          # changes no proof.
+          $byFile = [ordered]@{}
+          foreach ($sabotage in $sabotages) {
+            $target = if ($sabotage.SourcePath) { $sabotage.SourcePath } else { $defaultSourcePath }
+            if (-not $byFile.Contains($target)) {
+              $byFile[$target] = [Collections.Generic.List[object]]::new()
+            }
+            $byFile[$target].Add($sabotage)
+          }
+
           try {
-            foreach ($sabotage in $sabotages) {
-              $target = if ($sabotage.SourcePath) { $sabotage.SourcePath } else { $defaultSourcePath }
-              Assert-GateRed $sabotage.Label $sabotage.Test $target $sabotage.Old $sabotage.New ([bool]$sabotage.Ignored)
+            $proved = 0
+            foreach ($target in $byFile.Keys) {
+              foreach ($sabotage in $byFile[$target]) {
+                Assert-GateRed $sabotage.Label $sabotage.Test $target $sabotage.Old $sabotage.New ([bool]$sabotage.Ignored)
+                $proved++
+              }
+            }
+            if ($proved -ne $sabotages.Count) {
+              throw "Sabotage proof ran $proved of the $($sabotages.Count) entries."
             }
             Write-Host "Sabotage proof: each of the $($sabotages.Count) Rust UI sabotages turned its own shipped-path gate red."
 
             $jsTarget = if ($comparatorInjectPath) { $comparatorInjectPath } else { $defaultSourcePath }
             $resolvedJs = (Resolve-Path -LiteralPath $jsTarget).Path
+            $originalJsBytes = [IO.File]::ReadAllBytes($resolvedJs)
+            $originalJsHash = (Get-FileHash -LiteralPath $resolvedJs -Algorithm SHA256).Hash
             $originalJs = [IO.File]::ReadAllText($resolvedJs, $utf8)
             $brokenJs = Replace-Exact $originalJs @'
           '#neuralia-comp-controls,#neuralia-palette,a[href],button,input,textarea,select,option,label,summary,[role="button"],[role="link"],[contenteditable="true"]'
@@ -587,14 +638,21 @@ jobs:
               Write-Host "Sabotage proof: removing the link guard turns the runtime routing gate red."
             }
             finally {
-              Write-Exact $resolvedJs $originalJs
+              Restore-Exact $resolvedJs $originalJsBytes $originalJsHash "double-click-link-guard"
             }
           }
           finally {
             git checkout -- crates/neural-app/src
           }
 
+          # The restored tree is built the way every other step of this job builds
+          # (non-incremental): its green owes nothing to the sabotages' incremental
+          # cache, and the steps after this one find its artifacts fresh.
+          $env:CARGO_INCREMENTAL = $jobIncremental
           cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo fmt is not clean on the restored source."
+          }
           $restored = Invoke-GateTest @()
           if ($restored.Code -ne 0) {
             throw "neural-app tests are not green on the restored source."
@@ -615,6 +673,9 @@ jobs:
             }
           }
           node scripts/test-link-routing.mjs
+          if ($LASTEXITCODE -ne 0) {
+            throw "The runtime routing gate is not green on the restored source."
+          }
           git diff --exit-code -- crates/neural-app/src
       # Window gates that take the foreground or the keyboard focus (the
       # activatable SecretPrompt of infra-settings-keys) never run in the local
