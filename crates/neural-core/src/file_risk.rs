@@ -489,7 +489,8 @@ pub enum ZipEntryRisk {
     /// O nome da entrada bloqueia pelas regras de [`block_reason`]: um
     /// programa, um script, um atalho, uma imagem de disco, uma base do
     /// Access, um disfarce (`foto.jpg.exe`) ou um nome com bidi, controlos,
-    /// invisíveis ou `:`.
+    /// invisíveis ou `:`; e, só aqui, um caminho com um segmento `.` ou
+    /// `..` ou acima de [`MAX_SEGMENT_UTF16`] unidades UTF-16 (`BadName`).
     Blocked(BlockReason),
     /// Outro arquivo compactado ([`ARCHIVE_EXTENSIONS`]): o que ele tem
     /// dentro não se inspeciona.
@@ -542,22 +543,97 @@ fn has_hostile_chars(name: &str) -> bool {
             .any(|c| is_bidi_or_control(c) || is_hidden_format(c))
 }
 
+/// O maior segmento de um caminho (um nome de pasta ou de arquivo) que o
+/// NTFS grava: 255 unidades UTF-16 (o ext4 aceita 255 bytes). Numa entrada
+/// de um ZIP, um segmento maior é um nome estragado: nenhum extrator o
+/// consegue gravar, e classificá-lo custaria várias passagens por até
+/// 64 KiB de nome, na thread da interface.
+pub const MAX_SEGMENT_UTF16: usize = 255;
+
+/// Uma passagem pelos bytes UTF-8 do nome de uma entrada, que pára no
+/// primeiro para lá do teto: `true` quando um segmento (`/` ou `\`) tem
+/// mais de [`MAX_SEGMENT_UTF16`] unidades UTF-16, ou quando é `.` ou `..`.
+/// Nenhum ZIP legítimo tem estes: cada extrator resolve-os à sua maneira
+/// (o `tar.exe` grava `setup.exe/.` como o arquivo `setup.exe`). Conta
+/// sobre os bytes, sem descodificar: um caractere começa em cada byte que
+/// não é de continuação e vale uma unidade, ou duas se tem 4 bytes. Recebe
+/// os bytes, e não o nome, para o gate contar os que ela lê.
+fn has_bad_segment(bytes: impl Iterator<Item = u8>) -> bool {
+    let is_dot_segment = |units: usize, only_dots: bool| only_dots && matches!(units, 1 | 2);
+    let mut units = 0usize;
+    let mut only_dots = true;
+    for byte in bytes {
+        if byte == b'/' || byte == b'\\' {
+            if is_dot_segment(units, only_dots) {
+                return true;
+            }
+            units = 0;
+            only_dots = true;
+            continue;
+        }
+        if byte & 0xC0 != 0x80 {
+            units += 1 + usize::from(byte >= 0xF0);
+            if units > MAX_SEGMENT_UTF16 {
+                return true;
+            }
+        }
+        only_dots &= byte == b'.';
+    }
+    is_dot_segment(units, only_dots)
+}
+
+/// Um segmento que o Windows reduz a nada: vazio ou só de pontos e espaços.
+fn is_blank_segment(segment: &str) -> bool {
+    segment.chars().all(|c| c == '.' || c == ' ')
+}
+
 /// O risco de uma entrada de um ZIP por um nome dela, tal como o diretório
-/// central, o campo Unicode Path ou o cabeçalho local o trazem. Conta o
-/// último segmento do caminho (o ZIP separa com
-/// `/`, e o Windows também aceita `\`): `pasta/sub/setup.exe` é um
-/// programa a qualquer profundidade, `../../x.bat` um script. Um segmento
-/// vazio é uma pasta. Com as regras de [`block_reason`] (o disfarce, os
-/// pontos e os espaços do fim). Um nome com o radical de um dispositivo do
-/// DOS (`aux`, `nul`, `com1`...) não é um nome estragado aqui: o Windows 11
-/// cria `aux.exe` ou `nul.bat` como um arquivo qualquer, e um extrator
-/// grava-os e corre-os -- por isso esse nome conta pela extensão, como
-/// outro qualquer (`aux.exe` é um programa, `prn.pdf.exe` um disfarce,
-/// `aux.c` e `con.txt` nada). Os feitos só de pontos e espaços não contam.
-/// Depois, outro arquivo compactado ([`ARCHIVE_EXTENSIONS`]).
+/// central, o campo Unicode Path ou o cabeçalho local o trazem.
+///
+/// Primeiro, numa só passagem que pára no teto, o caminho: um segmento com
+/// mais de [`MAX_SEGMENT_UTF16`] unidades UTF-16, ou um `.` ou `..` em
+/// qualquer lugar (`../../x.bat`, `setup.exe/.`, `dir/./x.txt`), é um nome
+/// estragado ([`BlockReason::BadName`]), que apaga o ZIP sempre. Por isso as
+/// passagens seguintes só correm sobre um segmento de até 255 unidades.
+///
+/// Depois conta o último segmento real do caminho (o ZIP separa com `/`, e
+/// o Windows também aceita `\`): `pasta/sub/setup.exe` é um programa a
+/// qualquer profundidade. Os segmentos do fim feitos só de pontos e espaços
+/// caem antes, como o Windows corta os pontos e os espaços do fim de um
+/// nome (`setup.exe/ .` e `setup.exe\...` contam como `setup.exe`); só
+/// separadores depois de um segmento com nome é uma pasta (`docs/`,
+/// `setup.exe/`), que não conta. Com as regras de [`block_reason`] (o
+/// disfarce, os pontos e os espaços do fim). Um nome com o radical de um
+/// dispositivo do DOS (`aux`, `nul`, `com1`...) não é um nome estragado
+/// aqui: o Windows 11 cria `aux.exe` ou `nul.bat` como um arquivo qualquer,
+/// e um extrator grava-os e corre-os -- por isso esse nome conta pela
+/// extensão, como outro qualquer (`aux.exe` é um programa, `prn.pdf.exe` um
+/// disfarce, `aux.c` e `con.txt` nada). Um caminho só de pontos, espaços e
+/// separadores, sem `.` nem `..`, não conta. Depois, outro arquivo
+/// compactado ([`ARCHIVE_EXTENSIONS`]).
 pub fn zip_entry_risk(entry: &str) -> Option<ZipEntryRisk> {
-    let name = entry.rsplit(['/', '\\']).next().unwrap_or(entry);
-    if name.is_empty() {
+    if has_bad_segment(entry.bytes()) {
+        return Some(ZipEntryRisk::Blocked(BlockReason::BadName));
+    }
+    let mut rest = entry;
+    let mut folder = false;
+    let mut vanished = false;
+    let name = loop {
+        let (head, segment) = match rest.rsplit_once(['/', '\\']) {
+            Some((head, segment)) => (Some(head), segment),
+            None => (None, rest),
+        };
+        if !is_blank_segment(segment) {
+            break segment;
+        }
+        if segment.is_empty() {
+            folder = true;
+        } else {
+            vanished = true;
+        }
+        rest = head?;
+    };
+    if folder && !vanished {
         return None;
     }
     match block_reason(name) {
@@ -1573,13 +1649,17 @@ mod tests {
     /// Gate critico (entrada nao confiavel; sabotado: saltar os nomes
     /// dentro de pastas; saltar os arquivos compactados dentro; isentar o
     /// radical de um dispositivo do DOS; ignorar o 0x7075 do diretorio; nao
-    /// ler o cabecalho local; ignorar o 0x7075 local): a tabela de
-    /// classificacao de cada entrada de um ZIP -- o ultimo segmento do
-    /// caminho a qualquer profundidade (`/` e `\`), os disfarces, os pontos
-    /// e espacos do fim, os nomes inseguros, os radicais do DOS (`aux.exe`)
-    /// e os arquivos compactados --, e a mesma tabela por ZIPs reais, com
-    /// cada nome que um extrator pode dar a uma entrada: o do diretorio
-    /// central, o do Unicode Path (0x7075) e o do cabecalho local.
+    /// ler o cabecalho local; ignorar o 0x7075 local; nao deixar cair os
+    /// segmentos do fim so de pontos e espacos; aceitar um `.` ou `..`;
+    /// tirar o teto do segmento): a tabela de classificacao de cada entrada
+    /// de um ZIP -- o ultimo segmento real do caminho a qualquer
+    /// profundidade (`/` e `\`), os disfarces, os pontos e espacos do fim
+    /// (tambem em segmentos inteiros: `setup.exe/ .`), os nomes inseguros,
+    /// um `.` ou `..` no caminho, um segmento acima de 255 unidades UTF-16,
+    /// os radicais do DOS (`aux.exe`) e os arquivos compactados --, e a
+    /// mesma tabela por ZIPs reais, com cada nome que um extrator pode dar
+    /// a uma entrada: o do diretorio central, o do Unicode Path (0x7075) e
+    /// o do cabecalho local.
     #[test]
     fn zip_entry_classification_table() {
         use BlockReason::*;
@@ -1594,7 +1674,6 @@ mod tests {
             ("scripts/deploy.ps1", Some(Blocked(Script))),
             ("src\\tools\\run.cmd", Some(Blocked(Script))),
             ("mixed/dir\\payload.vbs", Some(Blocked(Script))),
-            ("../../evil.exe", Some(Blocked(Program))),
             ("/abs/evil.js", Some(Blocked(Script))),
             ("C:/Windows/evil.bat", Some(Blocked(Script))),
             ("lib/tool.pyw", Some(Blocked(Script))),
@@ -1615,6 +1694,29 @@ mod tests {
             ("setup.exe ", Some(Blocked(Program))),
             ("setup.exe . .", Some(Blocked(Program))),
             ("pasta/run.bat. ", Some(Blocked(Script))),
+            // Os segmentos do fim so de pontos e espacos caem: conta o
+            // ultimo segmento real (ZI-5; o Windows grava `setup.exe`).
+            ("setup.exe/ .", Some(Blocked(Program))),
+            ("setup.exe/ ./", Some(Blocked(Program))),
+            ("setup.exe\\ ", Some(Blocked(Program))),
+            ("setup.exe/...", Some(Blocked(Program))),
+            ("setup.exe/ /", Some(Blocked(Program))),
+            ("pasta/run.bat/ . /. .", Some(Blocked(Script))),
+            ("fotos/foto.jpg.exe/ .", Some(Blocked(Masquerade))),
+            ("inner.zip\\ . ", Some(NestedArchive)),
+            // Um `.` ou `..` em qualquer lugar do caminho e um nome estragado
+            // (ZI-5): nenhum ZIP legitimo os tem, e cada extrator os resolve
+            // a sua maneira (o tar.exe grava `setup.exe/.` como `setup.exe`).
+            ("setup.exe/.", Some(Blocked(BadName))),
+            ("setup.exe\\.", Some(Blocked(BadName))),
+            ("setup.exe/..", Some(Blocked(BadName))),
+            ("a/../setup.exe", Some(Blocked(BadName))),
+            ("dir/./x.txt", Some(Blocked(BadName))),
+            ("../../evil.exe", Some(Blocked(BadName))),
+            ("..\\LEIAME.txt", Some(Blocked(BadName))),
+            ("./LEIAME.txt", Some(Blocked(BadName))),
+            ("fotos/./", Some(Blocked(BadName))),
+            ("a/..", Some(Blocked(BadName))),
             // Nomes que mentem: bidi, invisiveis, controlos, fluxo alternativo.
             ("fatura\u{202E}fdp.exe", Some(Blocked(BadName))),
             ("pasta/nota\u{200B}.pdf", Some(Blocked(BadName))),
@@ -1660,12 +1762,67 @@ mod tests {
             ("docs/prn.pdf", None),
             ("COM1", None),
             ("nul.", None),
-            ("a/..", None),
             ("setup", None),
             ("relatorio.docm", None),
+            // Uma pasta e so separadores depois de um segmento com nome; tres
+            // pontos (`...`) sao um nome, nao um `..`.
+            ("setup.exe//", None),
+            ("setup.exe. /", None),
+            ("a/.../b.txt", None),
+            ("...", None),
+            (" . /", None),
         ];
         for (entry, expected) in rows {
             assert_eq!(zip_entry_risk(entry), *expected, "{entry:?}");
+        }
+
+        // Um segmento acima de 255 unidades UTF-16 (o que o NTFS grava) e
+        // um nome estragado, em qualquer lugar do caminho (ZI-6). Conta em
+        // unidades UTF-16: nem em caracteres (o emoji vale 2) nem em bytes
+        // (o `€` tem 3).
+        let a = |n: usize| "a".repeat(n);
+        let computed: Vec<(String, Option<ZipEntryRisk>)> = vec![
+            (format!("{}.exe", a(251)), Some(Blocked(Program))),
+            (format!("{}.exe", a(252)), Some(Blocked(BadName))),
+            (a(255), None),
+            (a(256), Some(Blocked(BadName))),
+            (
+                format!("{}.exe", "\u{1F600}".repeat(125)),
+                Some(Blocked(Program)),
+            ),
+            (
+                format!("{}.exe", "\u{1F600}".repeat(126)),
+                Some(Blocked(BadName)),
+            ),
+            (
+                format!("{}.exe", "\u{20AC}".repeat(251)),
+                Some(Blocked(Program)),
+            ),
+            (
+                format!("{}.txt", "\u{20AC}".repeat(252)),
+                Some(Blocked(BadName)),
+            ),
+            (format!("{}/setup.exe", a(256)), Some(Blocked(BadName))),
+            (
+                format!("docs\\{}\\LEIAME.txt", a(300)),
+                Some(Blocked(BadName)),
+            ),
+            (format!("{}/", a(256)), Some(Blocked(BadName))),
+            (format!("{}/", a(255)), None),
+            (
+                format!("{}setup.exe", "p/".repeat(300)),
+                Some(Blocked(Program)),
+            ),
+            (format!("{}/{}.exe", a(255), a(251)), Some(Blocked(Program))),
+        ];
+        for (entry, expected) in &computed {
+            assert_eq!(
+                zip_entry_risk(entry),
+                *expected,
+                "{} caracteres, {} unidades UTF-16",
+                entry.chars().count(),
+                entry.encode_utf16().count()
+            );
         }
 
         // Pelos ZIPs reais: o pior risco visto, com o nome da primeira
@@ -1769,14 +1926,56 @@ mod tests {
             verdict_of(ZipBuilder::new().entry(accented).build()),
             ZipVerdict::Clean { entries: 1 }
         );
-        // Um nome que o EPUB recusa (`..`, `\`) tambem se classifica.
+        // Um nome que o EPUB recusa tambem se classifica: o `\` separa, e um
+        // `..` (ou um `.`) e um nome estragado, que pesa mais do que o
+        // programa visto antes.
         let slip = ZipBuilder::new()
+            .stored("setup.exe", &pe_bytes())
             .stored("../../Startup/evil.bat", b"@echo off")
             .build();
         assert_eq!(
             verdict_of(slip),
-            holds(Blocked(Script), "../../Startup/evil.bat")
+            holds(Blocked(BadName), "../../Startup/evil.bat")
         );
+        assert_eq!(
+            verdict_of(
+                ZipBuilder::new()
+                    .stored("bin\\run.cmd", b"@echo off")
+                    .build()
+            ),
+            holds(Blocked(Script), "bin\\run.cmd")
+        );
+        // ZI-5 por um ZIP real: `setup.exe/.` com os bytes de um programa (o
+        // tar.exe grava o arquivo `setup.exe`) e `setup.exe/ .`, cujo ultimo
+        // segmento real e o programa; `docs/` continua uma pasta.
+        for (entry, risk) in [
+            ("setup.exe/.", Blocked(BadName)),
+            ("setup.exe\\.", Blocked(BadName)),
+            ("setup.exe/ .", Blocked(Program)),
+            ("setup.exe/ ./", Blocked(Program)),
+            ("a/../setup.exe", Blocked(BadName)),
+        ] {
+            let zip = ZipBuilder::new()
+                .stored("docs/", b"")
+                .stored("LEIAME.txt", b"ola")
+                .stored(entry, &pe_bytes())
+                .build();
+            assert_eq!(verdict_of(zip), holds(risk, entry), "{entry:?}");
+        }
+        // ZI-6 por um ZIP real: nomes de 62 000 bytes num so segmento (a
+        // forma da revisao, em menor numero) sao nomes estragados.
+        let huge = format!("{}.txt", "a".repeat(61_996));
+        let mut crafted = ZipBuilder::new().stored("LEIAME.txt", b"ola");
+        for i in 0..3 {
+            crafted = crafted.stored(&format!("{i}{huge}"), b"");
+        }
+        match verdict_of(crafted.build()) {
+            ZipVerdict::Holds { risk, entry } => {
+                assert_eq!(risk, Blocked(BadName));
+                assert_eq!(entry, format!("0{}", &huge[..MAX_VERDICT_ENTRY_CHARS - 1]));
+            }
+            other => panic!("{other:?}"),
+        }
         // Limpo: fotos, documentos e pastas.
         let clean = ZipBuilder::new()
             .stored("fotos/", b"")
@@ -1800,14 +1999,68 @@ mod tests {
             ),
             holds(Blocked(Program), "bin/setup.exe")
         );
-        // Um nome enorme guarda-se cortado.
-        let long = format!("{}/setup.exe", "p".repeat(600));
+        // Um nome enorme (de segmentos curtos) guarda-se cortado.
+        let long = format!("{}setup.exe", "p/".repeat(300));
         match verdict_of(ZipBuilder::new().stored(&long, b"x").build()) {
-            ZipVerdict::Holds { entry, .. } => {
+            ZipVerdict::Holds { risk, entry } => {
+                assert_eq!(risk, Blocked(Program));
                 assert_eq!(entry.chars().count(), MAX_VERDICT_ENTRY_CHARS)
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Gate critico (entrada nao confiavel, ZI-6; sabotado: tirar o teto do
+    /// segmento; medi-lo so depois de ler o segmento inteiro): um nome de
+    /// entrada com um segmento acima de 255 unidades UTF-16 e um nome
+    /// estragado, decidido numa passagem que para no primeiro caractere
+    /// para la do teto -- as passagens da classificacao nunca veem esse
+    /// segmento, e nada se aloca na medida dele. Um ZIP de 523 nomes de
+    /// 64 KiB custava 1,2-1,5 s na thread da interface.
+    #[test]
+    fn a_zip_entry_name_is_classified_in_bounded_work() {
+        use crate::test_alloc::peak_during;
+        use std::cell::Cell;
+        let a = |n: usize| "a".repeat(n);
+        // A passagem pelo caminho para no byte que leva um segmento de
+        // 64 KiB a 256 unidades UTF-16, esteja ele onde estiver: o 256.o `a`,
+        // o primeiro byte do 128.o emoji (2 unidades, 4 bytes) ou do 256.o
+        // `€` (1 unidade, 3 bytes).
+        let reads = |name: &str| {
+            let read = Cell::new(0usize);
+            let bad = has_bad_segment(name.bytes().inspect(|_| read.set(read.get() + 1)));
+            (bad, read.get())
+        };
+        let cap = MAX_SEGMENT_UTF16;
+        assert_eq!(reads(&a(65_535)), (true, cap + 1));
+        assert_eq!(reads(&format!("docs/{}", a(65_530))), (true, 5 + cap + 1));
+        assert_eq!(
+            reads(&format!("{}/{}", a(255), a(65_000))),
+            (true, 256 + cap + 1)
+        );
+        assert_eq!(
+            reads(&"\u{1F600}".repeat(16_000)),
+            (true, (cap / 2) * 4 + 1)
+        );
+        assert_eq!(reads(&"\u{20AC}".repeat(21_000)), (true, cap * 3 + 1));
+        // Um nome sem segmento grande le-se inteiro, uma vez.
+        let short_segments = format!("{}setup.exe", "a/".repeat(30_000));
+        assert_eq!(reads(&short_segments), (false, 60_009));
+        // Pelo caminho que embarca: `BadName`, sem alocar na medida do nome.
+        for name in [
+            a(65_535),
+            format!("{}.exe", a(65_531)),
+            format!("pasta/{}/setup.exe", a(65_000)),
+            format!("{}\\LEIAME.txt", "\u{20AC}".repeat(20_000)),
+        ] {
+            let (risk, peak) = peak_during(|| zip_entry_risk(&name));
+            assert_eq!(risk, Some(ZipEntryRisk::Blocked(BlockReason::BadName)));
+            assert!(peak < 1024, "{peak} bytes para {} de nome", name.len());
+        }
+        // As passagens da classificacao so correm sobre o ultimo segmento.
+        let (risk, peak) = peak_during(|| zip_entry_risk(&short_segments));
+        assert_eq!(risk, Some(ZipEntryRisk::Blocked(BlockReason::Program)));
+        assert!(peak < 1024, "{peak} bytes");
     }
 
     /// Um ZIP enorme que so existe em memoria nos cabecalhos locais e no
@@ -2423,5 +2676,69 @@ mod tests {
         }
         assert!(cases > 5_000, "{cases} casos");
         assert!(not_inspected > 0);
+    }
+
+    /// Medicao, nao gate (AGENTS 4.4: segundos de relogio medem a maquina,
+    /// nao o algoritmo): quanto custa inspecionar no disco as formas que
+    /// pesam -- 523 entradas com nomes de 62 000 bytes (um segmento so, e
+    /// segmentos curtos), abaixo dos dois tetos de 32 MiB, e 100 000
+    /// entradas com nomes curtos (o teto; ZIP64, com o extra local de 20
+    /// bytes). O minimo e a mediana de 5 corridas, da inspecao inteira e so
+    /// da listagem. Numa build release:
+    /// `cargo test --release -p neural-core --lib -- --ignored --nocapture zip_inspection_timings`.
+    #[test]
+    #[ignore = "medicao em release, nao gate"]
+    fn zip_inspection_timings() {
+        use std::time::{Duration, Instant};
+        let temp = TempDir::new("zip-timings");
+        let long_segment = format!("{}.txt", "a".repeat(61_996 - 3));
+        let short_segments = format!("{}x.txt", "a/".repeat(30_997));
+        let mut one_segment = ZipBuilder::new();
+        let mut many_segments = ZipBuilder::new();
+        for i in 0..523 {
+            one_segment = one_segment.stored(&format!("{i:03}{long_segment}"), b"");
+            many_segments = many_segments.stored(&format!("{short_segments}{i:03}"), b"");
+        }
+        let mut short_names = ZipBuilder::new().zip64();
+        for i in 0..100_000 {
+            short_names = short_names.stored(&format!("pasta/arquivo-{i:06}.txt"), b"");
+        }
+        let min_and_median = |mut work: Box<dyn FnMut() -> String + '_>| {
+            let mut runs: Vec<Duration> = Vec::new();
+            let mut last = String::new();
+            for _ in 0..5 {
+                let start = Instant::now();
+                last = work();
+                runs.push(start.elapsed());
+            }
+            runs.sort();
+            (runs[0], runs[2], last)
+        };
+        for (what, bytes) in [
+            ("523 x 62 000 bytes, um segmento", one_segment.build()),
+            (
+                "523 x 62 000 bytes, segmentos curtos",
+                many_segments.build(),
+            ),
+            ("100 000 nomes curtos, ZIP64", short_names.build()),
+        ] {
+            let path = temp.file("forma.zip", &bytes);
+            let (min, median, verdict) = min_and_median(Box::new(|| {
+                let verdict = format!("{:?}", inspect_zip_file(&path));
+                verdict.chars().take(60).collect()
+            }));
+            let (list_min, list_median, listed) = min_and_median(Box::new(|| {
+                let file = File::open(&path).unwrap();
+                format!(
+                    "{:?}",
+                    safezip::list_central_directory(file, &ZipPolicy::BROWSE_LITE, |_| {})
+                )
+            }));
+            eprintln!(
+                "{what} ({} bytes): inspecao min {min:?} mediana {median:?} ({verdict}); \
+                 so a listagem min {list_min:?} mediana {list_median:?} ({listed})",
+                bytes.len()
+            );
+        }
     }
 }

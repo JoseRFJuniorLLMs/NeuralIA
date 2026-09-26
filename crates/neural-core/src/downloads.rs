@@ -1512,7 +1512,9 @@ mod tests {
     /// `finalize_download` que o `neural-app` corre: o `pacote.zip` do E2E
     /// (setup.exe e run.bat) e apagado sem «Permitir baixar programas» e
     /// fica com ela; um `aux.exe`, um `setup.exe` no Unicode Path (0x7075)
-    /// ou no cabecalho local apagam-no; um ZIP limpo fica lido; um
+    /// ou no cabecalho local apagam-no; um `setup.exe/.`, um `a/../setup.exe`
+    /// ou um segmento de 62 000 bytes apagam-no mesmo com ela, e um
+    /// `setup.exe/ .` conta como o programa; um ZIP limpo fica lido; um
     /// sobreposto, um com dois diretorios possiveis, um estragado e um 7z
     /// ficam nao inspecionados; so um `.zip` e inspecionado.
     #[test]
@@ -1582,6 +1584,53 @@ mod tests {
             );
             assert!(!path.exists(), "{name} ficou no disco");
         }
+
+        // Um `.` ou `..` no caminho (o tar.exe grava `setup.exe/.` como o
+        // programa `setup.exe`) e um segmento de 62 000 bytes (nenhum disco
+        // o grava) sao nomes estragados: apagam o ZIP mesmo com a definicao
+        // ligada (ZI-5, ZI-6).
+        let huge = format!("{}.txt", "a".repeat(61_996));
+        for (name, entry) in [
+            ("ponto.zip", "setup.exe/."),
+            ("contrabarra.zip", "setup.exe\\."),
+            ("subida.zip", "a/../setup.exe"),
+            ("enorme.zip", huge.as_str()),
+        ] {
+            let zip = ZipBuilder::new()
+                .stored("LEIAME.txt", b"ola")
+                .stored(entry, &pe_bytes())
+                .build();
+            for allow_programs in [false, true] {
+                let path = dir.file(name, &zip);
+                assert_eq!(
+                    finalize_download(&path, false, allow_programs),
+                    FinalizeOutcome::Deleted(DeleteReason::ArchiveEntry(ZipEntryRisk::Blocked(
+                        BlockReason::BadName
+                    ))),
+                    "{name}, allow_programs={allow_programs}"
+                );
+                assert!(!path.exists(), "{name} ficou no disco");
+            }
+        }
+        // Os segmentos do fim so de pontos e espacos caem: `setup.exe/ .` e
+        // o programa `setup.exe` (ZI-5).
+        let trailing = ZipBuilder::new()
+            .stored("LEIAME.txt", b"ola")
+            .stored("setup.exe/ .", &pe_bytes())
+            .build();
+        let path = dir.file("espaco.zip", &trailing);
+        assert_eq!(
+            finalize_download(&path, false, false),
+            FinalizeOutcome::Deleted(DeleteReason::ArchiveEntry(ZipEntryRisk::Blocked(
+                BlockReason::Program
+            )))
+        );
+        assert!(!path.exists(), "o espaco.zip ficou no disco");
+        let path = dir.file("espaco.zip", &trailing);
+        assert!(matches!(
+            finalize_download(&path, false, true),
+            FinalizeOutcome::Kept(_, Inspection::HoldsPrograms)
+        ));
 
         let fotos = ZipBuilder::new()
             .stored("fotos/praia.jpg", b"\xFF\xD8\xFF\xE0")

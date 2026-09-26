@@ -497,18 +497,27 @@ whose effects the app applies:
   `tar.exe` extract under) in the central or the local extra field, and the
   local header's (`tar.exe` extracts under it); a local name that differs
   from the central one is classified and then fails the listing. Each name
-  is classified by the last segment of its path (`/`
-  or `\`, at any depth) with the name rules above: a program, script,
+  is first checked as a path, in one pass over its bytes that stops at the
+  cap: a segment longer than 255 UTF-16 units (`MAX_SEGMENT_UTF16`, what
+  NTFS stores) or a `.` or `..` segment anywhere (`setup.exe/.`, which
+  `tar.exe` writes as the file `setup.exe`; `a/../setup.exe`;
+  `./LEIAME.txt`) is an unsafe name, so the rules below only ever run on a
+  segment of at most 255 units. Then the name is classified by the last
+  real segment of its path (`/` or `\`, at any depth; trailing segments
+  made only of dots and spaces are dropped first, so `setup.exe/ .` counts
+  as `setup.exe`) with the name rules above: a program, script,
   shortcut, disk image, Access database or another archive
   (`ARCHIVE_EXTENSIONS`: zip, 7z, rar, cab, tar, gz...) inside deletes the
   ZIP unless "Permitir baixar programas" is on (then it is kept and its row
   says «tem programas ou scripts dentro», or «não inspecionado» for an
-  archive inside); a masquerade (`foto.jpg.exe`) or a name with bidi,
-  invisible or control characters or `:` inside deletes it always. A DOS
+  archive inside); a masquerade (`foto.jpg.exe`), a name with bidi,
+  invisible or control characters or `:`, or an unsafe path inside deletes
+  it always. A DOS
   device stem is not an exemption: Windows 11 creates `aux.exe` or
   `nul.bat` as ordinary files, so such a name counts by its extension
   (`aux.exe` is a program, `prn.pdf.exe` a masquerade, `aux.c` and
-  `con.txt` nothing); folders do not count. A ZIP whose listing
+  `con.txt` nothing); folders (only separators after a named segment,
+  `docs/`) do not count. A ZIP whose listing
   fails before a dangerous entry is seen (not a ZIP, truncated, bad
   signatures, trailing bytes in the directory, incomplete or split ZIP64,
   more than one possible directory, over a cap, overlapping entries or data
@@ -542,6 +551,9 @@ the downloaded files. Gates: `the_start_decision_table`,
 `private_downloads_are_never_recorded`,
 `nothing_made_in_private_mode_is_ever_recorded`,
 `a_downloaded_zip_is_inspected_on_disk`, `zip_entry_classification_table`,
+`a_zip_entry_name_is_classified_in_bounded_work` (the path pass stops at
+the byte that takes a 64 KiB segment to 256 UTF-16 units, and nothing is
+allocated in the measure of the name),
 `a_big_zip_is_inspected_without_reading_entry_bodies` (a sparse ZIP of more
 than 2 GiB, and a ZIP64 of 12 GiB, through a counting reader: every read
 falls in the end window, the directory or a local header, every local
