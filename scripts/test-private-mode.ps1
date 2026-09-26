@@ -138,8 +138,11 @@ try {
 
     $env:NEURALIA_DATA_DIR = $data
     $env:NEURALIA_DEBUG_LOG = $log
-    # `web:` abre a Web completa: a pagina entra no historico e na memoria.
-    $env:NEURALIA_STARTUP_INPUT = "web:$url"
+    # `read:` abre a pagina no Reader, que a grava no historico
+    # (PrivacyGuard::record) e a captura na memoria (PrivacyGuard::capture,
+    # capture_reader_memory). A Web completa (`web:`) so chega ao historico:
+    # a primeira corrida no CI mostrou-o.
+    $env:NEURALIA_STARTUP_INPUT = "read:$url"
     $env:NEURALIA_NO_GMAIL = "1"
     $env:NEURALIA_REDUCE_MOTION = "1"
     try {

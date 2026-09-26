@@ -1,7 +1,8 @@
 // Fixture do E2E do modo privado (infra-privacy-guard, plano 2.4). So CI:
-// scripts/test-private-mode.ps1 arranca-o e abre /page.html na Web completa
-// do exe testado, para a sessao ter uma pagina que entre no historico, na
-// memoria e nas abas sem nada sair da maquina.
+// scripts/test-private-mode.ps1 arranca-o e abre /page.html no Reader do
+// exe testado, para a sessao ter uma pagina que entre no historico e na
+// memoria sem nada sair da maquina. O artigo tem texto que chegue para o
+// Reader o extrair (extract_article).
 //
 // Uso: node scripts/private-mode-fixture.mjs <pasta-de-estado>
 // Escuta so em 127.0.0.1, numa porta livre; escreve a porta em
@@ -30,10 +31,21 @@ const PAGE = `<!doctype html>
 <title>NeuralIA private mode fixture</title>
 </head>
 <body>
+<article>
 <h1>Uma pagina da fixture do modo privado</h1>
 <p>Texto que chegue para uma entrada no historico e um documento na memoria local.
 O NeuralIA abriu esta pagina numa sessao normal, com uma pasta de dados temporaria,
 e o script confere depois que so as lojas da tabela da SPEC-0006 mudaram.</p>
+<p>O Reader extrai este artigo, grava a visita no historico pelo PrivacyGuard e
+captura o texto na memoria semantica local, tambem pelo PrivacyGuard. Nenhum destes
+passos sai da maquina: a fixture escuta so em 127.0.0.1 e nao tem ligacoes para fora.</p>
+<p>Na fase 0 o script so enumera os ficheiros que uma sessao normal escreve na pasta
+de dados e confere que cada um tem uma linha na tabela, com o tipo da loja. As fases
+seguintes do modo privado alargam essa lista e passam a exigir que uma sessao privada
+deixe as lojas automaticas byte a byte iguais.</p>
+<p>Este paragrafo existe so para o artigo ter corpo suficiente para a heuristica de
+leitura o escolher como o conteudo principal da pagina, e nao como uma nota curta.</p>
+</article>
 </body>
 </html>
 `;
