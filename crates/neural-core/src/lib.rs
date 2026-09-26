@@ -5,6 +5,7 @@
 pub mod adblock;
 pub mod agent_protocol;
 pub mod agent_security;
+pub mod bookmarks;
 pub mod config;
 pub mod domains;
 pub mod downloads;

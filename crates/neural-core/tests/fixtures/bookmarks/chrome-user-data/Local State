@@ -1,0 +1,29 @@
+{
+   "browser": {
+      "enabled_labs_experiments": [  ],
+      "last_redirect_origin": ""
+   },
+   "profile": {
+      "info_cache": {
+         "Default": {
+            "active_time": 1790166600.0,
+            "avatar_icon": "chrome://theme/IDR_PROFILE_AVATAR_26",
+            "name": "Pessoa 1",
+            "is_using_default_name": true
+         },
+         "Profile 1": {
+            "active_time": 1748736000.0,
+            "name": "Trabalho",
+            "is_using_default_name": false
+         },
+         "../fora": {
+            "name": "Fora da pasta"
+         },
+         "Profile\\2": {
+            "name": "Com barra invertida"
+         }
+      },
+      "last_used": "Default",
+      "profiles_order": [ "Profile 1", "Default" ]
+   }
+}
