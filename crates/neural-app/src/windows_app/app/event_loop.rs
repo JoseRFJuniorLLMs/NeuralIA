@@ -191,6 +191,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Download(event) => self.download_event(event),
             UserEvent::Translate(event) => self.translation_event(event),
             UserEvent::Bookmarks(event) => self.bookmarks_event(event),
+            UserEvent::AgentsHub(event) => self.agents_hub_event(event),
             // O «Cancelar e sair» confirmado no cartao sai por la.
             UserEvent::DownloadsUi(event) => self.downloads_ui_event(event_loop, event),
             UserEvent::Panel(post) => self.handle_panel_message(post),

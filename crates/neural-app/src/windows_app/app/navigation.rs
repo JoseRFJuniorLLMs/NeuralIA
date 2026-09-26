@@ -653,7 +653,7 @@ impl App {
             return false;
         };
         let body = wide_null(
-            "Apagar TODO o histórico e a memória local da NeuralIA?\n\nNos livros, some o registro de quando cada um foi aberto; a posição de leitura e os marcadores ficam.\n\nA lista de downloads também se apaga; os arquivos baixados ficam.\n\nOs favoritos ficam.\n\nIsto não pode ser desfeito.",
+            "Apagar TODO o histórico e a memória local da NeuralIA?\n\nNos livros, some o registro de quando cada um foi aberto; a posição de leitura e os marcadores ficam.\n\nA lista de downloads também se apaga; os arquivos baixados ficam.\n\nAs conversas com os agentes externos também se apagam.\n\nOs favoritos ficam.\n\nIsto não pode ser desfeito.",
         );
         let title = wide_null("NeuralIA — Apagar histórico");
         let answer = unsafe {

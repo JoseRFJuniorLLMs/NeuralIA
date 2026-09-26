@@ -3,6 +3,12 @@
     windows_subsystem = "windows"
 )]
 
+// Agentes externos (Claude Code, Codex, Gemini CLI) por MCP: a ponte
+// `--mcp`, o hub e as conversas. Protocolo, validacao e persistencia sao
+// portateis e testados tambem fora do Windows; o canal (named pipe) e so
+// Windows. Fora do Windows ninguem o chama ainda; daí o `allow(dead_code)`.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod agents;
 // O parser do canal IPC (SPEC-0108) não tem uma única chamada ao Windows: é
 // JSON, validação de argumentos e comparação em tempo constante. Estava atrás
 // de `cfg(target_os = "windows")` por arrastamento, o que deixava a superfície
@@ -77,7 +83,17 @@ mod notify;
 
 #[cfg(target_os = "windows")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    windows_app::run()
+    // `--mcp` decide-se ANTES de qualquer janela, WebView2 ou perfil: a
+    // ponte de um agente corre sem interface nenhuma e nunca rouba o foco.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    match agents::launch_mode(&args) {
+        agents::LaunchMode::App => windows_app::run(),
+        agents::LaunchMode::Bridge { agent } => std::process::exit(agents::run_bridge(agent)),
+        agents::LaunchMode::BridgeUsage(problem) => {
+            eprintln!("NeuralIA --mcp: {problem}\n{}", agents::BRIDGE_USAGE);
+            std::process::exit(2);
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]

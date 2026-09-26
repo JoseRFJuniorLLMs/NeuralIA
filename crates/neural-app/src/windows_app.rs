@@ -122,6 +122,9 @@ pub(in crate::windows_app) enum UserEvent {
     /// Os favoritos (`bookmarks.rs`): o Ctrl+D ou a estrela, com o alvo que
     /// a origem deu, e as respostas da thread `neural-bookmarks`.
     Bookmarks(BookmarksEvent),
+    /// Os agentes externos (`agents_hub.rs`): o que o hub dos agentes
+    /// (`crate::agents`) anuncia, entregue pela thread do canal.
+    AgentsHub(AgentsHubEvent),
     /// Pedido da pagina local do painel lateral (canal proprio), com o
     /// numero da pagina que o mandou.
     Panel(side_panel::PanelPost),
@@ -3214,6 +3217,10 @@ pub(in crate::windows_app) struct App {
     /// `neural-bookmarks` mandou e a pagina de cada estrela. A thread so
     /// nasce no primeiro uso.
     pub(in crate::windows_app) bookmarks: BookmarksState,
+    /// Os agentes externos (`agents_hub.rs`): o hub (`crate::agents`) com
+    /// as conversas, as perguntas e o estado de cada agente ligado por MCP.
+    /// O canal abre numa thread propria.
+    pub(in crate::windows_app) agents: AgentsHubState,
 }
 
 impl App {
@@ -3270,6 +3277,9 @@ impl App {
         // Sem thread nem disco: a `neural-translate` so nasce no 1.o clique.
         let translation = TranslationState::new(proxy.clone());
         let downloads_ui = DownloadsUiState::new(proxy.clone());
+        // A loja `agents` pelo grant; o disco das conversas e o canal dos
+        // agentes abrem fora desta thread.
+        let agents = AgentsHubState::open(stores.as_ref(), &proxy);
         Self {
             document,
             pdf_bytes: Arc::new(Mutex::new(Vec::new())),
@@ -3353,6 +3363,7 @@ impl App {
             translation,
             downloads_ui,
             bookmarks: BookmarksState::default(),
+            agents,
         }
     }
 }
@@ -7072,6 +7083,7 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ("translation.rs", include_str!("windows_app/translation.rs")),
     ("adblock.rs", include_str!("windows_app/adblock.rs")),
     ("bookmarks.rs", include_str!("windows_app/bookmarks.rs")),
+    ("agents_hub.rs", include_str!("windows_app/agents_hub.rs")),
     ("tests.rs", include_str!("windows_app/tests.rs")),
 ];
 
@@ -7166,6 +7178,8 @@ pub(in crate::windows_app) mod adblock;
 pub(in crate::windows_app) use adblock::*;
 pub(in crate::windows_app) mod bookmarks;
 pub(in crate::windows_app) use bookmarks::*;
+pub(in crate::windows_app) mod agents_hub;
+pub(in crate::windows_app) use agents_hub::*;
 
 pub(in crate::windows_app) mod app;
 #[allow(unused_imports)]
