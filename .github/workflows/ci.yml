@@ -71,6 +71,37 @@ jobs:
       - run: cargo check --locked --workspace
       - run: cargo test --locked -p neural-core
       - run: cargo test --locked -p neural-app
+      # Real Win32 focus gates (infra-notify-popups): they create a window
+      # that can take the foreground, open a modal menu and move the
+      # keyboard, so they are #[ignore] in the local suite (the owner works
+      # on the same desktop) and run here, one at a time. The step fails if
+      # any named gate did not run and pass.
+      - name: Real Win32 focus gates (CI-only)
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = "Continue"
+          $gates = @(
+            "windows_app::tests::toast_never_activates",
+            "windows_app::tests::native_card_never_activates",
+            "windows_app::tests::popup_menu_restores_origin_focus"
+          )
+          cargo test --locked -p neural-app --bin NeuralIA -- --ignored --exact --test-threads=1 @gates 2>&1 |
+            ForEach-Object { "$_" } |
+            Tee-Object -Variable lines |
+            Write-Host
+          $code = $LASTEXITCODE
+          $log = $lines -join "`n"
+          if ($code -ne 0) {
+            throw "CI-only focus gates failed (exit $code)."
+          }
+          foreach ($gate in $gates) {
+            $pattern = '(?m)^test ' + [regex]::Escape($gate) + ' \.\.\. ok\s*$'
+            if ($log -notmatch $pattern) {
+              throw "Focus gate did not run and pass: $gate"
+            }
+          }
+          Write-Host "Focus gates: each of the $($gates.Count) CI-only real Win32 gates ran and passed."
       - name: Prove 100-interaction UI gates reject sabotage
         shell: pwsh
         run: |
@@ -110,15 +141,15 @@ jobs:
 
           # Each sabotage is applied alone and only its gate runs, so every gate has
           # to turn red by itself. A build error or another failing test does not count.
-          # An `Ignored` gate (focus-affecting, `#[ignore]` in the local suite) runs
-          # here with --ignored: this runner has the desktop session it needs.
+          # An Ignored gate is a CI-only real Win32 focus gate (#[ignore] in the
+          # local suite): it runs alone with --ignored --exact.
           function Assert-GateRed([string]$label, [string]$test, [string]$targetPath, [string]$old, [string]$new, [bool]$ignored) {
             $resolved = (Resolve-Path -LiteralPath $targetPath).Path
             $original = [IO.File]::ReadAllText($resolved, $utf8)
             $broken = Replace-Exact $original $old $new $label
             Write-Exact $resolved $broken
             try {
-              $filter = if ($ignored) { @($test, '--', '--ignored') } else { @($test) }
+              $filter = if ($ignored) { @('--', '--ignored', '--exact', "windows_app::tests::$test") } else { @($test) }
               $run = Invoke-GateTest $filter
             }
             finally {
@@ -339,6 +370,53 @@ jobs:
               New = @'
           pub(in crate::windows_app) const SECRET_PROMPT_EX_STYLE: u32 = WS_EX_TOOLWINDOW | 0x0000_0008;
           '@
+            },
+            @{
+              Label = "toast-shown-with-sw-show"
+              Test = "toast_never_activates"
+              Ignored = $true
+              SourcePath = "crates/neural-app/src/windows_app/search_card.rs"
+              Old = @'
+                  ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+          '@
+              New = @'
+                  ShowWindow(hwnd, SW_SHOW);
+          '@
+            },
+            @{
+              Label = "card-activates-on-click"
+              Test = "native_card_never_activates"
+              Ignored = $true
+              SourcePath = "crates/neural-app/src/windows_app/native_card.rs"
+              Old = @'
+                  WM_MOUSEACTIVATE => Some(MA_NOACTIVATE as LRESULT),
+          '@
+              New = @'
+                  WM_MOUSEACTIVATE => None,
+          '@
+            },
+            @{
+              Label = "menu-skips-focus-restore"
+              Test = "popup_menu_restores_origin_focus"
+              Ignored = $true
+              SourcePath = "crates/neural-app/src/windows_app/popup_menu.rs"
+              Old = @'
+              restore_focus(decide_focus_restore(origin, moves_focus), hosts);
+          '@
+              New = @'
+              let _ = (origin, moves_focus);
+          '@
+            },
+            @{
+              Label = "notify-route-ignores-focus"
+              Test = "notify_route_table"
+              SourcePath = "crates/neural-app/src/notify.rs"
+              Old = @'
+              if focus_shield && !notice.kind.passes_focus() {
+          '@
+              New = @'
+              if false && !notice.kind.passes_focus() {
+          '@
             }
           )
 
@@ -384,16 +462,14 @@ jobs:
               throw "Gate did not run and pass on the restored source: $test"
             }
           }
-          $ignoredGates = @($sabotages | Where-Object { $_.Ignored } | ForEach-Object { $_.Test } | Sort-Object -Unique)
-          if ($ignoredGates.Count -gt 0) {
-            $restoredIgnored = Invoke-GateTest (@('--bin', 'NeuralIA', '--', '--ignored', '--exact') + ($ignoredGates | ForEach-Object { "windows_app::tests::$_" }))
-            if ($restoredIgnored.Code -ne 0) {
-              throw "Focus-affecting gates are not green on the restored source."
-            }
-            foreach ($test in $ignoredGates) {
-              if (-not (Test-ResultLine $restoredIgnored.Log $test 'ok')) {
-                throw "Focus-affecting gate did not run and pass on the restored source: $test"
-              }
+          $focusGates = @($sabotages | Where-Object { $_.Ignored } | ForEach-Object { $_.Test } | Sort-Object -Unique)
+          $restoredFocus = Invoke-GateTest (@('--', '--ignored', '--exact', '--test-threads=1') + @($focusGates | ForEach-Object { "windows_app::tests::$_" }))
+          if ($restoredFocus.Code -ne 0) {
+            throw "CI-only focus gates are not green on the restored source."
+          }
+          foreach ($test in $focusGates) {
+            if (-not (Test-ResultLine $restoredFocus.Log $test 'ok')) {
+              throw "Focus gate did not run and pass on the restored source: $test"
             }
           }
           node scripts/test-link-routing.mjs

@@ -55,6 +55,11 @@ mod windows_app;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod pomodoro_ui;
 
+// Centro de avisos (infra-notify-popups): a fila, a entrega pelo Foco e pela
+// privacidade e o unico aviso do canto, sem Win32 -- testado tambem no Linux.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod notify;
+
 #[cfg(target_os = "windows")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     windows_app::run()

@@ -21,7 +21,9 @@
 //!
 //! E uma excecao, so aqui: `install_column_fixture_navigation` deixa a
 //! coluna carregar a fixture de 127.0.0.1 (a origem exata que o condutor
-//! pediu) sem mexer no gate de navegacao da coluna que embarca.
+//! pediu) sem mexer no gate de navegacao da coluna que embarca, e escreve no
+//! registo o que o WebView2 fez dessa navegacao (`colnav`); se a fixture nao
+//! carregar, `open Column` sem URL repoe a pagina ao vivo do fornecedor.
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -30,33 +32,43 @@ use std::sync::atomic::AtomicU32;
 use neural_core::{ReaderArticle, ReaderBlock};
 
 use crate::accel_spike::{
-    KeyEventKind, PROBE_ARM_SCRIPT, PROBE_PULL_SCRIPT, SPIKE_COMMAND_FILE, SPIKE_DIR_ENV,
-    SPIKE_LOG_FILE, SpikeCommand, SpikeHost, SpikeKey, SpikeVerb, ack_line, act_line,
-    column_fixture_navigation, fixture_origin, hello_line, hooked_line, native_line, page_line,
-    parse_spike_command, spike_verdict, tiny_pdf,
+    ColumnFixture, KeyEventKind, PROBE_ARM_SCRIPT, PROBE_PULL_SCRIPT, SPIKE_COMMAND_FILE,
+    SPIKE_DIR_ENV, SPIKE_LOG_FILE, SpikeCommand, SpikeHost, SpikeKey, SpikeVerb, ack_line,
+    act_line, colnav_done_line, colnav_start_line, hello_line, hooked_line, native_line, page_line,
+    parse_spike_command, ping_detail, spike_verdict, tiny_pdf,
 };
 use crate::windows_app::*;
 
 /// O registo do condutor; `None` sem `NEURALIA_ACCEL_SPIKE_DIR`.
 static SPIKE_LOG: Mutex<Option<File>> = Mutex::new(None);
-/// A origem da fixture que o condutor pediu na coluna (`open Column <url>`),
-/// a unica que a excecao de navegacao da coluna deixa passar. `None` ate la.
-static SPIKE_COLUMN_FIXTURE: Mutex<Option<String>> = Mutex::new(None);
+/// O pedido do condutor na coluna (`open Column <url>`): a origem da
+/// fixture, a unica que a excecao de navegacao da coluna deixa passar, e a
+/// navegacao que a leva. Vazio ate la.
+static SPIKE_COLUMN_FIXTURE: Mutex<ColumnFixture> = Mutex::new(ColumnFixture::NONE);
+
+/// O pedido da coluna, so pelo tempo de uma expressao: os handlers de
+/// navegacao correm na mesma thread e tambem o tomam.
+fn column_fixture() -> std::sync::MutexGuard<'static, ColumnFixture> {
+    SPIKE_COLUMN_FIXTURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// A tentativa em curso (o `begin` do condutor): vai em cada linha nativa e
 /// de `act()`, para o condutor as juntar a tentativa certa.
 static SPIKE_TRIAL: AtomicU32 = AtomicU32::new(0);
 /// O condutor esta a correr: so entao os eventos de `act()` sao engolidos.
 static SPIKE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Uma linha no registo, se ele existir. Um erro de escrita nao sobe: o
-/// condutor da pela falta da linha.
+/// Uma linha no registo, se ele existir, com o fim de linha na mesma
+/// escrita (o condutor le o ficheiro enquanto ele cresce). Um erro de
+/// escrita nao sobe: o condutor da pela falta da linha.
 fn spike_log(line: &str) {
     let mut slot = SPIKE_LOG
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(file) = slot.as_mut() {
-        let _ = file.write_all(line.as_bytes());
-        let _ = file.write_all(b"\n");
+        let _ = file.write_all(format!("{line}\n").as_bytes());
         let _ = file.flush();
     }
 }
@@ -155,15 +167,22 @@ fn install_accel_spike(webview: &WebView, host: SpikeHost) -> Result<(), String>
 /// (`column_fixture_navigation`: http, 127.0.0.1, a porta da fixture). O
 /// WebView2 chama os handlers pela ordem de registo com os mesmos args, e o
 /// `Cancel` que fica e o do ultimo. Assim a coluna mede-se na fixture de
-/// 127.0.0.1, sem rede, como os outros hospedeiros web; se o runtime nao
-/// o deixar, a coluna fica na pagina ao vivo e o condutor escreve-o na nota
-/// da tabela.
+/// 127.0.0.1, sem rede, como os outros hospedeiros web.
+///
+/// O que o runtime fez dela vai para o registo: o `Cancel` antes e depois da
+/// excecao (`colnav start`) e o `NavigationCompleted` dessa navegacao
+/// (`colnav done`, com `IsSuccess` e o `WebErrorStatus`). Se ela nao
+/// carregar, o condutor sabe-o logo por aqui, escreve o motivo na nota da
+/// tabela e mede a coluna na pagina ao vivo (`open Column` sem URL).
 fn install_column_fixture_navigation(webview: &WebView) -> Result<(), String> {
-    use webview2_com::{NavigationStartingEventHandler, take_pwstr};
-    use windows_core::PWSTR;
+    use webview2_com::{
+        Microsoft::Web::WebView2::Win32::COREWEBVIEW2_WEB_ERROR_STATUS,
+        NavigationCompletedEventHandler, NavigationStartingEventHandler, take_pwstr,
+    };
+    use windows_core::{BOOL, PWSTR};
     use wry::WebViewExtWindows;
 
-    let handler = NavigationStartingEventHandler::create(Box::new(|_, args| {
+    let starting = NavigationStartingEventHandler::create(Box::new(|_, args| {
         let Some(args) = args else {
             return Ok(());
         };
@@ -172,19 +191,50 @@ fn install_column_fixture_navigation(webview: &WebView) -> Result<(), String> {
             unsafe { args.Uri(&mut uri)? };
             take_pwstr(uri)
         };
-        let fixture = SPIKE_COLUMN_FIXTURE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if column_fixture_navigation(&uri, fixture.as_deref()) {
-            unsafe { args.SetCancel(false)? };
+        let mut navigation = 0u64;
+        unsafe { args.NavigationId(&mut navigation)? };
+        if !column_fixture().starting(&uri, navigation) {
+            return Ok(());
         }
+        let mut gate = BOOL::default();
+        let mut cancel = BOOL::default();
+        unsafe {
+            args.Cancel(&mut gate)?;
+            args.SetCancel(false)?;
+            args.Cancel(&mut cancel)?;
+        }
+        spike_log(&colnav_start_line(
+            navigation,
+            &uri,
+            gate.as_bool(),
+            cancel.as_bool(),
+        ));
+        Ok(())
+    }));
+    let completed = NavigationCompletedEventHandler::create(Box::new(|_, args| {
+        let Some(args) = args else {
+            return Ok(());
+        };
+        let mut navigation = 0u64;
+        unsafe { args.NavigationId(&mut navigation)? };
+        if !column_fixture().completed(navigation) {
+            return Ok(());
+        }
+        let mut ok = BOOL::default();
+        let mut status = COREWEBVIEW2_WEB_ERROR_STATUS::default();
+        unsafe {
+            args.IsSuccess(&mut ok)?;
+            args.WebErrorStatus(&mut status)?;
+        }
+        spike_log(&colnav_done_line(navigation, ok.as_bool(), status.0));
         Ok(())
     }));
     let core = webview.webview();
     let mut token = 0i64;
-    unsafe { core.add_NavigationStarting(&handler, &mut token) }
-        .map_err(|error| format!("add_NavigationStarting falhou: {error}"))
+    unsafe { core.add_NavigationStarting(&starting, &mut token) }
+        .map_err(|error| format!("add_NavigationStarting falhou: {error}"))?;
+    unsafe { core.add_NavigationCompleted(&completed, &mut token) }
+        .map_err(|error| format!("add_NavigationCompleted falhou: {error}"))
 }
 
 /// Le `cmd.txt` da pasta do condutor (que o escreve por rename) e manda cada
@@ -303,6 +353,11 @@ impl App {
             }
         };
         let result = match verb {
+            SpikeVerb::Ping => Ok(ping_detail(
+                host,
+                self.accel_spike_webview(host).is_some(),
+                &format!("{:?}", self.surface),
+            )),
             SpikeVerb::Open(url) => self.accel_spike_open(host, url.as_deref()),
             SpikeVerb::Focus => self.accel_spike_focus(host),
             SpikeVerb::Arm => self.accel_spike_eval(seq, 0, host, "arm", PROBE_ARM_SCRIPT),
@@ -356,24 +411,47 @@ impl App {
     /// Abre o hospedeiro pelo mesmo metodo que o produto usa. A coluna e a
     /// primeira do comparador que o `NEURALIA_STARTUP_INPUT` abriu; com a
     /// URL da fixture, ela navega para la pela excecao do spike
-    /// (`install_column_fixture_navigation`), sem ela fica na pagina ao vivo.
+    /// (`install_column_fixture_navigation`). Sem ela fica na pagina ao
+    /// vivo -- e, se a fixture tinha sido pedida (a coluna pode ter ficado a
+    /// meio dela, ou sem pagina), volta a pagina ao vivo do fornecedor pelo
+    /// gate que embarca, que a deixa passar.
     fn accel_spike_open(&mut self, host: SpikeHost, url: Option<&str>) -> Result<String, String> {
         let fixture = url.unwrap_or_default().to_string();
+        let mut detail = String::new();
         match host {
             SpikeHost::Column => {
+                let column = self
+                    .comparator
+                    .as_ref()
+                    .and_then(|comparator| comparator.views.first())
+                    .ok_or_else(|| {
+                        format!(
+                            "sem coluna do comparador (surface {:?}): o NEURALIA_STARTUP_INPUT nao o abriu",
+                            self.surface
+                        )
+                    })?;
                 if let Some(url) = url {
-                    *SPIKE_COLUMN_FIXTURE
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = fixture_origin(url);
-                    let column = self
-                        .comparator
-                        .as_ref()
-                        .and_then(|comparator| comparator.views.first())
-                        .ok_or("sem coluna do comparador")?;
+                    column_fixture().request(url);
                     column
                         .webview
                         .load_url(url)
-                        .map_err(|error| format!("load_url: {error}"))?;
+                        .map_err(|error| format!("load_url da fixture: {error}"))?;
+                    detail = ": fixture pedida".to_string();
+                } else if column_fixture().release() {
+                    let live = self
+                        .provider_query_url(0, &startup_input())
+                        .map_err(|error| format!("pagina ao vivo: {error}"))?;
+                    column
+                        .webview
+                        .load_url(live.as_str())
+                        .map_err(|error| format!("load_url da pagina ao vivo: {error}"))?;
+                    detail = format!(
+                        ": pagina ao vivo reposta ({}://{})",
+                        live.scheme(),
+                        live.host_str().unwrap_or_default()
+                    );
+                } else {
+                    detail = ": pagina ao vivo".to_string();
                 }
             }
             SpikeHost::Split => {
@@ -418,7 +496,7 @@ impl App {
             SpikeHost::Epub => self.open_library(),
         }
         if self.accel_spike_webview(host).is_some() {
-            Ok(format!("{} aberto", host.name()))
+            Ok(format!("{} aberto{detail}", host.name()))
         } else {
             Err(format!(
                 "{} nao abriu (surface {:?})",

@@ -123,7 +123,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = self.tab_gesture(TabGestureInput::CaptureLost { gesture });
             }
             UserEvent::ToggleAutoScroll => self.toggle_auto_scroll(),
-            UserEvent::AutoScrollAnswer(yes) => self.answer_auto_scroll(yes),
+            UserEvent::SplashAnswer { asker, index } => self.answer_splash(asker, index),
             UserEvent::ZoomIn => self.step_zoom(1),
             UserEvent::ZoomOut => self.step_zoom(-1),
             UserEvent::ZoomReset => self.set_zoom(1.0),
@@ -182,7 +182,6 @@ impl ApplicationHandler<UserEvent> for App {
                 subject,
                 key,
             } => self.handle_gmail_state(unread, sender, subject, key),
-            UserEvent::HideGmailToast(token) => self.hide_gmail_toast(token),
             UserEvent::ShowHistory => self.toggle_side_panel(),
             UserEvent::Theme(event) => self.theme_event(event),
             UserEvent::Keys(event) => self.keys_event(event),
@@ -197,7 +196,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::NewNote => self.new_note_in_panel(),
             UserEvent::Live(message) => self.handle_live_message(message),
-            UserEvent::GmailAnswer(open) => self.answer_gmail(open),
+            UserEvent::Notify(event) => self.notify_event(event),
             // Pergunta e depois percorre a tabela dos alvos
             // (`clear_history::CLEAR_HISTORY_TARGETS`), um braco so.
             UserEvent::ClearHistory => self.clear_history(),
@@ -521,7 +520,7 @@ impl ApplicationHandler<UserEvent> for App {
             // para tras, no sitio onde ela estava antes.
             WindowEvent::Moved(_) => {
                 self.position_splash();
-                self.position_gmail_toast();
+                self.position_toast();
                 self.position_search_card();
                 self.position_exit_button();
                 self.position_palette();
