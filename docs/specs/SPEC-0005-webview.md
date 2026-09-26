@@ -403,12 +403,14 @@ table (Ctrl+D, Ctrl+N, Ctrl+W, Ctrl+Tab, Ctrl+G, Ctrl+O, Ctrl+S,
 Ctrl+Shift+S) is consulted only by the Files chain, which no current origin
 uses (gate `files_override_wins_only_in_files`).
 
-Today the only chord a WebView host binds is Ctrl+D (bookmarks,
-`CommandId::Bookmark`, `Global` scope), on every host with a keyboard and
-with that host as the origin -- the comparator column, the split, the private
+Today the WebView hosts bind only the two `Global` chords, on every host
+with a keyboard and with that host as the origin: Ctrl+D (bookmarks,
+`CommandId::Bookmark`) -- the comparator column, the split, the private
 split, the full Web, Reader and PDF bookmark their own page; the panels and
-EPUB open Favoritos (gates `accelerator_lookup_binds_only_ctrl_d_in_webviews`
-and `ctrl_d_runs_against_the_host_it_came_from`). The pages' other shortcuts
+EPUB open Favoritos (gate `ctrl_d_runs_against_the_host_it_came_from`) --
+and Ctrl+J (downloads-ui, `CommandId::Downloads`), which opens the side
+panel's Downloads section from anywhere (gate
+`accelerator_lookup_binds_only_the_global_chords_on_webviews`). The pages' other shortcuts
 are still those of `NEURALIA_KEYMAP_SCRIPT`, and the `Window` scope keeps
 the Ctrl+R, Ctrl+Shift+R, Ctrl+H, Ctrl+N, Ctrl+O, Ctrl+Shift+Z and
 Ctrl+Shift+Delete the main window and the omnibox already answered. The CI
@@ -463,8 +465,10 @@ whose effects the app applies:
   a masquerade (`fatura.pdf.exe`, a padded extension) or a name with bidi,
   invisible characters, `:` or a DOS device name is refused with no
   exception; everything else proceeds. With "Permitir baixar programas" on,
-  a refusable program would wait for a confirmation instead; until that card
-  exists the app answers no, so programs are still refused;
+  a refusable program waits in the deferral for the native "Baixar
+  programa?" card (see "Downloads UI" below): only its armed "Baixar mesmo
+  assim" lets it proceed; "Cancelar", the 30 s expiry, or a newer request
+  replacing the card refuse it;
 - progress: `BytesReceivedChanged`, throttled to one event every 250 ms per
   download before it leaves the handler;
 - end: `StateChanged` forgets the WebView2 operation; a completed file is
@@ -507,3 +511,65 @@ and on no `Deny` host. The CI-only `scripts/test-downloads.ps1` runs the
 tested exe against a 127.0.0.1 fixture: a `setup.exe` is refused; a PDF
 lands in the chosen folder with the mark of the web, NeuralIA's finalize
 ran, and a mark NeuralIA wrote is `ZoneId=3` with no `HostUrl`.
+
+### Downloads UI
+
+`crates/neural-app/src/windows_app/downloads_ui.rs` (downloads-ui) is what
+the manager shows:
+
+- the ⬇ slot of the bar corner (`RIGHT_CLUSTER`, `BarHit::Downloads`, just
+  left of Privado) and `Ctrl+J` (`CommandId::Downloads`, `KeyScope::Global`:
+  the window, the omnibox and every WebView except the hidden Gmail monitor,
+  held by `AcceleratorKeyPressed` so the page never sees the keydown) open
+  the side panel on its Downloads section; again, they close it. The ⬇ slot
+  fits or does not exist: it is there only from `DOWNLOADS_SLOT_MIN_WIDTH`
+  (1100 logical px), below which it would take the third AI column's pill,
+  "+" and ‹ › (`Ctrl+J` still works). While downloads run it is drawn in the
+  accent colour and its tooltip counts them;
+- the Downloads section of the side panel (`assets/panel/downloads.*`): this
+  session's downloads (progress as "Baixando relatorio.pdf · 3,2 de 12 MB ·
+  1 min") and the records of `downloads.json`, plus the "Permitir baixar
+  programas" switch, saved in `downloads-settings.json` (`StoreKind::Setting`).
+  Its requests (`downloads-list`, `downloads-open`, `downloads-show`,
+  `downloads-cancel`, `downloads-allow-programs`) carry only a row number
+  (`DownloadRows`, an integer from 1 to 2^53-1 with no other key) or the
+  switch state, never a path or a URL; the data sent to the page never
+  carries a path either, and the page renders it with `textContent`;
+- "Abrir" goes only through `shell_open_checked`, which requires
+  `neural_core::file_risk::DefaultAppTarget` (the name and the first 4 KiB of
+  the file, re-read on the click) and calls `ShellExecuteW` with the verb
+  `open` on the validated path, never an elevation verb. A kind the target
+  refuses (program, script, macro document, masquerade, `.url`, `.lnk`,
+  `.library-ms`, `.search-ms`, `.chm`, `.hta`, or anything outside its
+  allowlist) shows only "Mostrar na pasta" (`SHOpenFolderAndSelectItems`),
+  which runs nothing;
+- the notices (blocked, deleted, not deleted, completed) are `Download`
+  notices of the notification centre (`crate::notify`, the corner toast),
+  with the file name in the body only;
+- two native cards (`NativeCard`: token, 600 ms arm, expiry, only what was
+  painted; never activated): "Baixar programa?" and, when Home or closing
+  the window would end running downloads, `leave_decision`'s "N download(s)
+  em andamento (x.zip, 43%)." with "Continuar baixando" (stays, at once)
+  and "Cancelar e sair" (armed: cancels each download, then leaves).
+  Every Home the user asks for goes through `request_home` (the bar's Home,
+  the Home command, Esc in the omnibox, a typed or palette Home, Ctrl+L,
+  Ctrl+K and Ctrl+N outside the comparator, the book's Close) and every
+  window close through `request_close` (the bar's X, Alt+F4, the Exit
+  command). `show_home` and the window's `exit` are reached only from a
+  named list of functions, counted per file and function over the code with
+  comments and literals removed. Known exceptions in that list: a confirmed
+  "Apagar histórico" goes Home and ends running downloads without the card,
+  and the CI lifecycle probe (`NEURALIA_LIFECYCLE_PROBE` only) goes Home
+  without it, because the downloads spike measures the destroyed WebView.
+  Leaving the comparator for the Reader, a PDF or the full Web still ends
+  the downloads of the pages it closes without asking.
+
+Gates: `abrir_goes_only_through_default_app_target`,
+`panel_downloads_messages_carry_ids_only`, `leave_decision_table`,
+`home_and_exit_callers_are_a_named_allowlist`,
+`program_card_answers_the_deferral`,
+`ctrl_j_is_the_downloads_command_and_nothing_else`,
+`downloads_slot_fits_or_vanishes`, `download_notice_texts` and
+`default_app_name_allowed_agrees_with_default_app_target` (neural-core);
+the CI-only `download_card_never_activates` proves on a real window that
+the card never takes the activation.

@@ -175,6 +175,7 @@ before the site sees the key. They work on every surface unless noted.
 | `Ctrl+D` | add the page you are looking at (a comparator column, the side-by-side source, the full Web, Reader or PDF) to Favoritos -- a native shortcut, never sent through the page; on Home, in a side panel or in Livros it opens the Favoritos tab of the side panel |
 | `Ctrl+Shift+Z` | note from the selected text, with the page as its source, opened in the Notes tab of the side panel (inside a text field it stays redo; refused in the private split); on Home, a new blank note |
 | `Ctrl+Shift+Delete` | clear local history (the WebView2 profile is untouched) |
+| `Ctrl+J` | Downloads: the side panel's Downloads section (again, closes it); native, so it also works in Livros |
 | `F12` · `Ctrl+Shift+I/J/C` | Chromium DevTools |
 | `Ctrl+U` | view page source |
 | `F11` | fullscreen for the current comparator column |
@@ -186,7 +187,7 @@ before the site sees the key. They work on every surface unless noted.
 **Exception: Livros (EPUB).** The book library and the EPUB reader do not receive
 this keymap, so NeuralIA's own shortcuts (for example `Ctrl+H`, `Ctrl+Shift+Z`,
 `Ctrl+Shift+Delete`, `Ctrl+L`, `Ctrl+T` · `Ctrl+W` and `F8`) do nothing there;
-the native `Ctrl+D` opens Favoritos.
+the native `Ctrl+D` opens Favoritos and the native `Ctrl+J` the Downloads section.
 Inside Livros, `Ctrl+O` adds books, `Ctrl+F` searches (the library, or the open
 book) and `Esc` goes back (reader → library → Home); leave with `Esc` to reach the
 other tools.

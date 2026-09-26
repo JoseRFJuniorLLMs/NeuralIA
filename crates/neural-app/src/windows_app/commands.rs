@@ -18,9 +18,9 @@ use super::*;
 // janela e da omnibox (antes `main_window_shortcut` e o subclass do EDIT,
 // cada um com a sua lista) e os botoes da barra que ja eram um evento. Cada
 // feature da 2.3 acrescenta aqui a sua linha, com o seu atalho, no PR dela:
-// o primeiro e o Ctrl+D dos favoritos (`CommandId::Bookmark`, ambito
-// `Global`), que corre contra o hospedeiro de onde veio a tecla
-// (`bookmark_target`) e nunca passa pelo IPC.
+// o Ctrl+J dos Downloads (downloads-ui, `Global`) e o Ctrl+D dos favoritos
+// (`CommandId::Bookmark`, `Global`), que corre contra o hospedeiro de onde
+// veio a tecla (`bookmark_target`) e nunca passa pelo IPC.
 
 /// Um comando do registo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -50,12 +50,14 @@ pub(in crate::windows_app) enum CommandId {
     /// Ctrl+D: a pagina de onde veio para os favoritos; na Home (ou num
     /// painel), abre os Favoritos.
     Bookmark,
+    /// A seccao Downloads do painel (downloads-ui): Ctrl+J e a seta da barra.
+    Downloads,
 }
 
 impl CommandId {
     /// Cada comando, uma vez: o que os gates percorrem.
     #[cfg(test)]
-    pub(in crate::windows_app) const ALL: [CommandId; 12] = [
+    pub(in crate::windows_app) const ALL: [CommandId; 13] = [
         CommandId::AutoScroll,
         CommandId::Reload,
         CommandId::History,
@@ -68,6 +70,7 @@ impl CommandId {
         CommandId::SplitFullscreen,
         CommandId::Exit,
         CommandId::Bookmark,
+        CommandId::Downloads,
     ];
 
     /// A chave estavel do comando (a da sua linha em `COMMANDS`).
@@ -144,7 +147,8 @@ impl ChordSpec {
     }
 
     /// Um atalho de toda a parte com teclado: a janela, a omnibox e cada
-    /// WebView (menos o monitor do Gmail), preso no `AcceleratorKeyPressed`.
+    /// WebView (menos o monitor do Gmail), preso pelo `AcceleratorKeyPressed`
+    /// -- a pagina nao ve o keydown dele.
     const fn global(chord: Chord) -> ChordSpec {
         ChordSpec {
             scope: KeyScope::Global,
@@ -286,6 +290,15 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
         chords: &[ChordSpec::global(Chord::ctrl(b'D'))],
         alias: None,
     },
+    CommandRow {
+        id: CommandId::Downloads,
+        key: "downloads",
+        label: "Downloads",
+        category: CommandCategory::Ferramentas,
+        keywords: &["downloads", "baixados", "transferências", "arquivos"],
+        chords: &[ChordSpec::global(Chord::ctrl(b'J'))],
+        alias: None,
+    },
 ];
 
 /// A linha de um comando.
@@ -313,6 +326,7 @@ fn chrome_event(id: CommandId) -> UserEvent {
             target: BookmarkTarget::Window,
             via: BookmarkVia::Shortcut,
         }),
+        CommandId::Downloads => UserEvent::DownloadsUi(DownloadsUiEvent::Show),
     }
 }
 
@@ -337,6 +351,7 @@ fn page_action(id: CommandId, column: Option<usize>) -> Option<IpcAction> {
         | CommandId::CloseSplit
         | CommandId::SplitFullscreen
         | CommandId::Exit
+        | CommandId::Downloads
         // Nativo: a origem e o hospedeiro (`bookmark_target`), nunca um
         // pedido do mapa de teclas da pagina.
         | CommandId::Bookmark => None,
@@ -432,6 +447,7 @@ pub(in crate::windows_app) fn bar_hit_command(hit: BarHit) -> Option<CommandId> 
         BarHit::SplitClose => Some(CommandId::CloseSplit),
         BarHit::SplitExpand => Some(CommandId::SplitFullscreen),
         BarHit::WindowClose => Some(CommandId::Exit),
+        BarHit::Downloads => Some(CommandId::Downloads),
         // Gestos sobre um item concreto (a aba, o grupo, a coluna, a faixa
         // do servico, a pagina ao lado): o alvo debaixo do rato e parte do
         // pedido, nao um comando.

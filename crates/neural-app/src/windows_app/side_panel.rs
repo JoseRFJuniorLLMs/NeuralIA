@@ -34,6 +34,9 @@ pub(in crate::windows_app) enum PanelMessage {
     NoteDelete(String),
     /// Um pedido da seccao Favoritos (`bookmarks.rs`): so ids.
     Bookmarks(BookmarkPanelRequest),
+    /// A seccao Downloads (`downloads_ui.rs`): so o numero de uma linha ou
+    /// o estado do interruptor, nunca um caminho.
+    Downloads(DownloadsPanelRequest),
 }
 
 pub(in crate::windows_app) const PANEL_MESSAGE_MAX_BYTES: usize = 4 * 1024;
@@ -73,6 +76,11 @@ pub(in crate::windows_app) const PANEL_SECTIONS: &[PanelSection] = &[
         prefixes: &["bookmark", "bookmarks"],
         max_bytes: |_| PANEL_MESSAGE_MAX_BYTES,
         parse: parse_bookmarks_action,
+    },
+    PanelSection {
+        prefixes: &["downloads"],
+        max_bytes: |_| PANEL_MESSAGE_MAX_BYTES,
+        parse: parse_downloads_action,
     },
 ];
 
@@ -390,7 +398,8 @@ impl<W: PanelView, N: DraftRescue> SidePanel<W, N> {
             | PanelMessage::NoteOpen(_)
             | PanelMessage::NoteSaveRefused
             | PanelMessage::NoteDelete(_)
-            | PanelMessage::Bookmarks(_) => None,
+            | PanelMessage::Bookmarks(_)
+            | PanelMessage::Downloads(_) => None,
         };
         Received::Late(text.map(|edit| self.notes.rescue(NotesCommand::Save(edit))))
     }
@@ -664,14 +673,15 @@ pub(in crate::windows_app) fn panel_html(theme: &Theme) -> String {
 
 /// A pagina do painel, montada em tempo de compilacao a partir de
 /// `assets/panel/`: a folha (`panel.css`), a marcacao de cada secao
-/// (`history.html`, `notes.html`, `bookmarks.html`) e o script -- uma
-/// IIFE so, em pedacos pela ordem: `core.js` (o `post`, o `byId`, o
-/// `make`, a caixa de busca e o `theme`), `history.js` (o `render` do
-/// Historico), `notes.js` (a secao Notas), `bookmarks.js` (a secao
-/// Favoritos) e `tabs.js` (as abas, o fechar e o `ready` final, que fecha a
-/// IIFE). Uma secao nova traz o seu `<secao>.html` e `<secao>.js` e uma
-/// linha em cada `include_str!` -- o resto da pagina nao muda. Os bytes sao
-/// os da pagina de sempre (os assets sao LF por `.gitattributes`; o gate
+/// (`history.html`, `notes.html`, `bookmarks.html`, `downloads.html`) e o
+/// script -- uma IIFE so, em pedacos pela ordem: `core.js` (o `post`, o
+/// `byId`, o `make`, a caixa de busca e o `theme`), `history.js` (o
+/// `render` do Historico), `notes.js` (a secao Notas), `bookmarks.js` (a
+/// secao Favoritos), `downloads.js` (a secao Downloads, downloads-ui) e
+/// `tabs.js` (as abas, o fechar e o `ready` final, que fecha a IIFE). Uma
+/// secao nova traz o seu `<secao>.html` e `<secao>.js`, a sua aba e uma
+/// linha em cada `include_str!` -- o resto da pagina nao muda (os assets
+/// sao LF por `.gitattributes`; o gate
 /// `panel_html_is_assembled_from_its_section_assets` prende-o).
 pub(in crate::windows_app) const PANEL_HTML: &str = concat!(
     r#"<!doctype html>
@@ -680,16 +690,18 @@ pub(in crate::windows_app) const PANEL_HTML: &str = concat!(
 "#,
     include_str!("../../../../assets/panel/panel.css"),
     r#"</style></head><body>
-<header><nav class="tabs" role="tablist"><button class="tab" id="tab-history" role="tab" aria-selected="true">Histórico</button><button class="tab" id="tab-notes" role="tab" aria-selected="false">Notas</button><button class="tab" id="tab-bookmarks" role="tab" aria-selected="false">Favoritos</button></nav><button id="close" title="Fechar (Esc)">✕</button></header>
+<header><nav class="tabs" role="tablist"><button class="tab" id="tab-history" role="tab" aria-selected="true">Histórico</button><button class="tab" id="tab-notes" role="tab" aria-selected="false">Notas</button><button class="tab" id="tab-bookmarks" role="tab" aria-selected="false">Favoritos</button><button class="tab" id="tab-downloads" role="tab" aria-selected="false">Downloads</button></nav><button id="close" title="Fechar (Esc)">✕</button></header>
 "#,
     include_str!("../../../../assets/panel/history.html"),
     include_str!("../../../../assets/panel/notes.html"),
     include_str!("../../../../assets/panel/bookmarks.html"),
+    include_str!("../../../../assets/panel/downloads.html"),
     "<script>\n",
     include_str!("../../../../assets/panel/core.js"),
     include_str!("../../../../assets/panel/history.js"),
     include_str!("../../../../assets/panel/notes.js"),
     include_str!("../../../../assets/panel/bookmarks.js"),
+    include_str!("../../../../assets/panel/downloads.js"),
     include_str!("../../../../assets/panel/tabs.js"),
     "</script></body></html>"
 );

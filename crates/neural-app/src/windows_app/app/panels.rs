@@ -921,6 +921,7 @@ impl App {
                 self.handle_input(input);
             }
             PanelMessage::Close => self.close_side_panel(PanelExit::CloseButton),
+            PanelMessage::Downloads(request) => self.downloads_panel_request(request),
             // Ja seguido por `SidePanel::receive`.
             PanelMessage::NoteDraft(_) => {}
             PanelMessage::NoteSaveRefused => self.panel_run(notes_reply_script(

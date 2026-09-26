@@ -51,6 +51,9 @@ pub(in crate::windows_app) struct ToastView {
     pub(in crate::windows_app) title: String,
     pub(in crate::windows_app) body: String,
     pub(in crate::windows_app) buttons: Vec<ToastButtonView>,
+    /// O corpo em ate duas linhas (os avisos dos downloads dizem porque);
+    /// o do Gmail fica na linha de sempre, com reticencias.
+    pub(in crate::windows_app) wrap: bool,
 }
 
 impl ToastView {
@@ -69,6 +72,7 @@ impl ToastView {
                     primary: action.primary,
                 })
                 .collect(),
+            wrap: frame.notice.kind != NoticeKind::Gmail,
         }
     }
 }
@@ -230,12 +234,12 @@ unsafe fn paint_toast(hdc: *mut core::ffi::c_void, client: &RECT, view: Option<&
         right: buttons_left,
         bottom: client.bottom - (7.0 * scale) as i32,
     };
-    draw_text(
-        hdc,
-        &view.body,
-        &mut body,
-        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
-    );
+    let format = if view.wrap {
+        DT_WORDBREAK | DT_EDITCONTROL | DT_END_ELLIPSIS | DT_NOPREFIX
+    } else {
+        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX
+    };
+    draw_text(hdc, &view.body, &mut body, format);
 
     for (rect, button) in buttons.iter().zip(&view.buttons) {
         let pill = UiRect {
@@ -324,13 +328,23 @@ pub(in crate::windows_app) unsafe fn place_toast(
     InvalidateRect(toast, std::ptr::null(), 1);
 }
 
-/// O que um botao do aviso faz fora dele: abrir um servico, ou nada.
-pub(in crate::windows_app) fn notice_service(
+/// Para onde um botao do aviso leva, fora dele.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) enum NoticeTarget {
+    Service(Service),
+    /// A seccao Downloads do painel (downloads-ui).
+    Downloads,
+}
+
+/// O que um botao do aviso faz fora dele: abrir um servico, a seccao
+/// Downloads, ou nada.
+pub(in crate::windows_app) fn notice_target(
     kind: NoticeKind,
     reply: NoticeReply,
-) -> Option<Service> {
+) -> Option<NoticeTarget> {
     match (kind, reply) {
-        (NoticeKind::Gmail, NoticeReply::Open) => Some(Service::Gmail),
+        (NoticeKind::Gmail, NoticeReply::Open) => Some(NoticeTarget::Service(Service::Gmail)),
+        (NoticeKind::Download, NoticeReply::Open) => Some(NoticeTarget::Downloads),
         _ => None,
     }
 }
@@ -346,6 +360,8 @@ pub(in crate::windows_app) trait ToastHost {
     fn destroy_toast(&mut self);
     fn hide_toast_after(&mut self, token: u64, delay: Duration);
     fn open_service(&mut self, service: Service);
+    /// O «Ver» de um download: a seccao Downloads do painel.
+    fn open_downloads(&mut self);
 }
 
 /// O que entra no aviso.
@@ -379,8 +395,10 @@ pub(in crate::windows_app) fn apply_notify(host: &mut impl ToastHost, input: Not
         NotifyInput::Event(NotifyEvent::Answer { token, index }) => {
             if let Some((kind, reply)) = host.notify_centre().answer(token, index) {
                 host.hide_toast_window();
-                if let Some(service) = notice_service(kind, reply) {
-                    host.open_service(service);
+                match notice_target(kind, reply) {
+                    Some(NoticeTarget::Service(service)) => host.open_service(service),
+                    Some(NoticeTarget::Downloads) => host.open_downloads(),
+                    None => {}
                 }
             }
         }
@@ -439,6 +457,10 @@ impl ToastHost for App {
 
     fn open_service(&mut self, service: Service) {
         self.open_service_panel(service);
+    }
+
+    fn open_downloads(&mut self) {
+        self.show_downloads_panel();
     }
 }
 

@@ -5,12 +5,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 
 use neural_core::downloads::{
-    DeleteReason, DownloadEffect, DownloadEnd, DownloadEvent, DownloadId, DownloadLog,
-    DownloadManager, DownloadNotice, DownloadSettings, DownloadStart, LOG_MAX_BYTES, LOG_VERSION,
-    ProgressThrottle, SETTINGS_MAX_BYTES, SETTINGS_VERSION, WebViewKey, finalize_download,
-    unique_path,
+    DownloadEffect, DownloadEnd, DownloadEvent, DownloadId, DownloadLog, DownloadManager,
+    DownloadSettings, DownloadStart, LOG_MAX_BYTES, LOG_VERSION, ProgressThrottle,
+    SETTINGS_MAX_BYTES, SETTINGS_VERSION, WebViewKey, finalize_download, unique_path,
 };
-use neural_core::file_risk::{BlockReason, display_label};
 use neural_core::json_store::{SaveOutcome, StoreMode, VersionedJsonStore};
 
 use crate::stores::{DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE};
@@ -48,6 +46,9 @@ use crate::stores::{DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE};
 //   lojas posto antes de cada evento: `downloads_private_mode`); no Modo
 //   privado a loja tambem nao escreve. O Ctrl+Shift+Delete tira o ficheiro
 //   e as copias do disco (`erase_download_log`) em qualquer modo.
+// - O que chega a quem usa -- os avisos, o «Baixar programa?», a lista, a
+//   seta da barra -- e do `downloads_ui.rs` (downloads-ui): o braco
+//   `download_event` entrega-lhe o que cada volta do gestor deixou.
 
 /// Um download desta WebView nunca vai para o registo: o Split privado e os
 /// servicos InPrivate (a Respiracao).
@@ -636,13 +637,16 @@ pub(in crate::windows_app) struct DownloadsState {
     pub(in crate::windows_app) manager: DownloadManager,
     pub(in crate::windows_app) shared: DownloadsShared,
     pub(in crate::windows_app) log_store: Option<VersionedJsonStore<DownloadLog>>,
+    /// `downloads-settings.json` (`StoreKind::Setting`): a seccao Downloads
+    /// grava aqui «Permitir baixar programas» (`App::set_allow_programs`).
+    pub(in crate::windows_app) settings_store: Option<VersionedJsonStore<DownloadSettings>>,
 }
 
 impl DownloadsState {
     /// As definicoes e o registo, pelos grants do registo das lojas. Sem
     /// registo (nunca no produto), vale tudo por omissao e nada se grava.
     pub(in crate::windows_app) fn open(stores: Option<&StoreRegistry>) -> Self {
-        let settings = stores
+        let mut settings_store = stores
             .and_then(|stores| stores.grant(DOWNLOADS_SETTINGS_STORE).ok())
             .and_then(|grant| {
                 VersionedJsonStore::<DownloadSettings>::open(
@@ -651,8 +655,10 @@ impl DownloadsState {
                     SETTINGS_MAX_BYTES,
                 )
                 .ok()
-            })
-            .map(|mut store| store.load().into_value())
+            });
+        let settings = settings_store
+            .as_mut()
+            .map(|store| store.load().into_value())
             .unwrap_or_default();
         let settings = checked_download_settings(settings, Path::is_dir);
         let mut log_store = stores
@@ -671,6 +677,7 @@ impl DownloadsState {
             )),
             manager: DownloadManager::new(settings, log),
             log_store,
+            settings_store,
         }
     }
 
@@ -689,62 +696,6 @@ impl DownloadsState {
             private_mode,
             event,
         )
-    }
-}
-
-// ===================== os avisos =====================
-
-/// O tipo de fachada de um disfarce (`fatura.pdf.exe` -> `PDF`).
-fn decoy_label(name: &str) -> Option<String> {
-    let clean = name.trim_end_matches([' ', '.']);
-    let (stem, _) = clean.rsplit_once('.')?;
-    let (_, decoy) = stem.trim_end().rsplit_once('.')?;
-    let decoy = decoy.trim();
-    (!decoy.is_empty()).then(|| decoy.to_uppercase())
-}
-
-/// O texto provisorio de cada aviso (o downloads-ui leva-os para o toast).
-/// O nome passa por `display_label`: um bidi ou um invisivel aparece
-/// marcado, nunca a trocar a ordem do texto.
-pub(in crate::windows_app) fn download_notice_text(notice: &DownloadNotice) -> String {
-    match notice {
-        DownloadNotice::Blocked { name, reason, .. } => {
-            let label = display_label(name);
-            let what = match reason {
-                BlockReason::Program => "é um programa",
-                BlockReason::Script => "é um script",
-                BlockReason::Shortcut => "é um atalho do Windows",
-                BlockReason::DiskImage => "é uma imagem de disco",
-                BlockReason::DatabaseApp => "é uma base do Access",
-                BlockReason::Masquerade => {
-                    return match decoy_label(name) {
-                        Some(decoy) => {
-                            format!("Download bloqueado — {label} finge ser um {decoy}.")
-                        }
-                        None => format!("Download bloqueado — {label} é um disfarce."),
-                    };
-                }
-                BlockReason::BadName => {
-                    return format!("Download bloqueado — o nome «{label}» não é seguro.");
-                }
-            };
-            format!("Download bloqueado — {label} {what}.")
-        }
-        DownloadNotice::Deleted { name, reason, .. } => {
-            let label = display_label(name);
-            match reason {
-                DeleteReason::Unreadable => {
-                    format!("Download apagado — não deu para verificar {label}.")
-                }
-                DeleteReason::DangerousContent | DeleteReason::BlockedName(_) => {
-                    format!("Download apagado — {label} era um programa disfarçado.")
-                }
-            }
-        }
-        DownloadNotice::NotDeleted { name, .. } => format!(
-            "Atenção: {} é perigoso e não deu para apagar. Não o abra.",
-            display_label(name)
-        ),
     }
 }
 
@@ -775,8 +726,10 @@ pub(in crate::windows_app) fn drive_downloads<H: DownloadHandle>(
     }
 }
 
-/// O que o `App` faz a um efeito que nao e das operacoes. A pergunta e o
-/// fim do ficheiro correm ja e devolvem o evento seguinte; gravar e avisar
+/// O que o `App` faz a um efeito que nao e das operacoes. O fim do
+/// ficheiro corre ja e devolve o evento seguinte; gravar, avisar, a
+/// pergunta «Baixar programa?» (o cartao do downloads-ui, cuja resposta
+/// chega mais tarde como `DownloadEvent::Answered`) e a linha que mudou
 /// ficam em `later` (precisam do `App` inteiro).
 pub(in crate::windows_app) fn download_app_step(
     effect: DownloadEffect,
@@ -784,13 +737,12 @@ pub(in crate::windows_app) fn download_app_step(
 ) -> Option<DownloadEvent> {
     match effect {
         DownloadEffect::Ask { id, reason } => {
-            // O cartao «Baixar programa?» chega com o downloads-ui; ate la a
-            // pergunta responde «nao».
             debug_log(format_args!(
-                "downloads: {} precisa de confirmacao ({reason:?}); recusado",
+                "downloads: {} precisa de confirmacao ({reason:?})",
                 id.0
             ));
-            Some(DownloadEvent::Answered { id, allow: false })
+            later.push(effect);
+            None
         }
         DownloadEffect::Finalize {
             id,
@@ -801,14 +753,15 @@ pub(in crate::windows_app) fn download_app_step(
             debug_log(format_args!("downloads: {} acabou ({outcome:?})", id.0));
             Some(DownloadEvent::Finalized { id, outcome })
         }
-        DownloadEffect::Persist | DownloadEffect::EraseLog | DownloadEffect::Notice(_) => {
+        DownloadEffect::Persist
+        | DownloadEffect::EraseLog
+        | DownloadEffect::Notice(_)
+        | DownloadEffect::Changed(_) => {
             later.push(effect);
             None
         }
-        // A linha da lista: o downloads-ui repinta-a. Os das operacoes nunca
-        // chegam aqui (`DownloadOps::apply`).
-        DownloadEffect::Changed(_)
-        | DownloadEffect::Refuse(_)
+        // Os das operacoes nunca chegam aqui (`DownloadOps::apply`).
+        DownloadEffect::Refuse(_)
         | DownloadEffect::Proceed { .. }
         | DownloadEffect::CancelRunning(_)
         | DownloadEffect::ForgetOp(_) => None,
@@ -819,7 +772,8 @@ pub(in crate::windows_app) fn download_app_step(
 #[derive(Debug, Default)]
 pub(in crate::windows_app) struct DownloadRun {
     /// Os efeitos que ficaram para o fim, pela ordem: gravar e apagar (ja
-    /// aplicados ao disco) e os avisos (o `App` mostra-os).
+    /// aplicados ao disco), os avisos, a pergunta e as linhas que mudaram
+    /// (o downloads-ui trata deles).
     pub(in crate::windows_app) later: Vec<DownloadEffect>,
     /// O Ctrl+Shift+Delete nao conseguiu tirar o `downloads.json` do disco.
     pub(in crate::windows_app) erase_error: Option<String>,
@@ -869,20 +823,18 @@ pub(in crate::windows_app) fn run_download_event<H: DownloadHandle>(
 
 impl App {
     /// O braco `UserEvent::Download`: o gestor decide, e cada efeito vai
-    /// para as operacoes do WebView2, para o disco ou para o ecra.
+    /// para as operacoes do WebView2, para o disco ou para o ecra
+    /// (`downloads_ui_after`).
     pub(in crate::windows_app) fn download_event(&mut self, event: DownloadEvent) {
         let private_mode = downloads_private_mode(self.stores.as_ref());
         let run = self.downloads.run(private_mode, event);
-        for effect in run.later {
-            if let DownloadEffect::Notice(notice) = effect {
-                self.show_background_splash(download_notice_text(&notice), 6);
-            }
-        }
         if let Some(error) = run.erase_error {
             self.show_splash(
                 format!("Não foi possível apagar a lista de downloads: {error}"),
                 4,
             );
         }
+        // Os avisos, a pergunta, a lista e a seta (`downloads_ui.rs`).
+        self.downloads_ui_after(run.later);
     }
 }

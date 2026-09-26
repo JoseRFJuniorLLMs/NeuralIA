@@ -112,12 +112,13 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         match event {
-            UserEvent::ExitRequested => {
-                self.save_notes_draft_before_exit();
-                event_loop.exit();
-            }
+            // Com downloads a correr, pergunta antes (`leave_guard`).
+            UserEvent::ExitRequested => self.request_close(event_loop),
             UserEvent::SaveTabSession(token) => self.save_due_tab_session(token),
-            UserEvent::HomeRequested => self.show_home(),
+            UserEvent::HomeRequested => {
+                self.request_home();
+            }
+            UserEvent::LifecycleProbeHome => self.lifecycle_probe_home(),
             UserEvent::BackRequested => self.escape_or_back(),
             UserEvent::TabCaptureLost(gesture) => {
                 let _ = self.tab_gesture(TabGestureInput::CaptureLost { gesture });
@@ -189,6 +190,8 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Adblock(event) => self.adblock_event(event),
             UserEvent::Download(event) => self.download_event(event),
             UserEvent::Bookmarks(event) => self.bookmarks_event(event),
+            // O «Cancelar e sair» confirmado no cartao sai por la.
+            UserEvent::DownloadsUi(event) => self.downloads_ui_event(event_loop, event),
             UserEvent::Panel(post) => self.handle_panel_message(post),
             UserEvent::NotesReady { origin, reply } => self.notes_ready(origin, reply),
             UserEvent::NoteRequested { target, via } => self.request_note_from_page(target, via),
@@ -444,10 +447,8 @@ impl ApplicationHandler<UserEvent> for App {
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => {
-                self.save_notes_draft_before_exit();
-                event_loop.exit();
-            }
+            // Com downloads a correr, pergunta antes (`leave_guard`).
+            WindowEvent::CloseRequested => self.request_close(event_loop),
             WindowEvent::RedrawRequested => {
                 if self.needs_clear {
                     self.clear_client();
@@ -504,6 +505,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.position_live_panel();
                 self.after_panel_change();
                 self.position_search_card();
+                self.position_download_card();
                 if self.surface == Surface::Home {
                     self.sync_caption_buttons();
                 }
@@ -535,6 +537,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.position_splash();
                 self.position_toast();
                 self.position_search_card();
+                self.position_download_card();
                 self.position_exit_button();
                 self.position_palette();
                 self.sync_comparator_splitters();

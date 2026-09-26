@@ -1625,6 +1625,7 @@ dependencies = [
  "flate2",
  "image",
  "neural-core",
+ "serde",
  "serde_json",
  "url",
  "webview2-com",

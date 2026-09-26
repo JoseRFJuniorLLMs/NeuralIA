@@ -423,6 +423,27 @@ def live() -> None:
     finish(mask, solid((255, 255, 255)), "live.png")
 
 
+# ----------------------------------------------------------------- Downloads
+def downloads() -> None:
+    """Seta para baixo a entrar numa bandeja, em contorno branco (a barra
+    pinta-a com o tema e com a cor de destaque enquanto ha downloads a
+    correr). Marca generica."""
+    stroke = N * 0.085
+    mask = Image.new("L", (N, N), 0)
+    draw = ImageDraw.Draw(mask)
+    top, tip = N * 0.10, N * 0.62
+    wing = N * 0.21
+    stroked(draw, (CENTER, top), (CENTER, tip), stroke)
+    stroked(draw, (CENTER - wing, tip - wing), (CENTER, tip), stroke)
+    stroked(draw, (CENTER + wing, tip - wing), (CENTER, tip), stroke)
+    # A bandeja: as duas paredes e o fundo.
+    left, right, rim, floor = N * 0.14, N * 0.86, N * 0.68, N * 0.88
+    stroked(draw, (left, rim), (left, floor), stroke)
+    stroked(draw, (left, floor), (right, floor), stroke)
+    stroked(draw, (right, floor), (right, rim), stroke)
+    finish(mask, solid((255, 255, 255)), "downloads.png")
+
+
 ICONS = {
     "gemini": gemini,
     "chatgpt": chatgpt,
@@ -437,6 +458,7 @@ ICONS = {
     "pomodoro": pomodoro,
     "notes": notes,
     "breath": breath,
+    "downloads": downloads,
 }
 
 

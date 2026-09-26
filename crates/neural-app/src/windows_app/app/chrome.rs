@@ -1346,6 +1346,7 @@ impl App {
             maximized: self.window.as_ref().is_some_and(Window::is_maximized),
             bookmarked: self.bookmarks.column_stars(),
             split_bookmarked: self.bookmarks.split_star(),
+            downloads: downloads_badge(&self.downloads.manager),
         }
     }
 }
