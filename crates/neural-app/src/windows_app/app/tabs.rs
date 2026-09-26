@@ -323,11 +323,16 @@ impl App {
         // Os mesmos itens que o botao direito dentro da coluna, decididos
         // pelo mesmo `webview_menu_responder` (menu proprio: nenhum item
         // nativo).
-        let request =
-            webview_menu_responder(WebViewHost::Column(col_index), self.auto_scroll.clone())(0);
+        // O bloqueio de anuncios fica no botao direito DENTRO da pagina (e
+        // dela que ele fala): a pilula nao o recebe.
+        let request = webview_menu_responder(
+            WebViewHost::Column(col_index),
+            self.auto_scroll.clone(),
+            None,
+        )(0, None);
         let mut menu = PopupMenu::default();
         for item in &request.items {
-            menu.push(MenuCommand::new(item.id, item.label));
+            menu.push(MenuCommand::new(item.id, item.label.clone()));
         }
         let point = self.bar_menu_point(hwnd);
         let command = self.track_menu(&menu, point, MenuButton::Right);

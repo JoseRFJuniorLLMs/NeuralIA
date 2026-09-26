@@ -107,6 +107,9 @@ pub(in crate::windows_app) enum UserEvent {
     /// Os ganchos das WebViews (`webview_hooks.rs`): o que cada WebView
     /// avisa, com o hospedeiro de onde veio.
     WebView(WebViewEvent),
+    /// O bloqueio de anuncios (`adblock.rs`): os itens do menu e as threads
+    /// que leem e baixam a lista.
+    Adblock(AdblockEvent),
     /// Pedido da pagina local do painel lateral (canal proprio), com o
     /// numero da pagina que o mandou.
     Panel(side_panel::PanelPost),
@@ -3153,6 +3156,9 @@ pub(in crate::windows_app) struct App {
     pub(in crate::windows_app) stores: Option<StoreRegistry>,
     /// O pedido de chave nativo e o cofre das chaves (`secret_prompt.rs`).
     pub(in crate::windows_app) keys: KeysState,
+    /// O bloqueio de anuncios (`adblock.rs`): a escolha, a lista e o que os
+    /// handlers do WebView2 leem.
+    pub(in crate::windows_app) adblock: AdblockState,
 }
 
 impl App {
@@ -3203,6 +3209,8 @@ impl App {
         // disco: so os grants, pedidos depois, dizem onde cada loja vive.
         let stores = StoreRegistry::mint(&config.data_dir).ok();
         let keys = KeysState::new(proxy.clone());
+        // Desligado (quem nunca clicou em "Ativar"), so le a escolha.
+        let adblock = AdblockState::open(stores.as_ref(), &proxy);
         Self {
             document,
             pdf_bytes: Arc::new(Mutex::new(Vec::new())),
@@ -3280,6 +3288,7 @@ impl App {
             live_panel: LivePanel::off(),
             stores,
             keys,
+            adblock,
         }
     }
 }
@@ -6956,6 +6965,7 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ),
     ("commands.rs", include_str!("windows_app/commands.rs")),
     ("keymap.rs", include_str!("windows_app/keymap.rs")),
+    ("adblock.rs", include_str!("windows_app/adblock.rs")),
     ("tests.rs", include_str!("windows_app/tests.rs")),
 ];
 
@@ -7040,6 +7050,8 @@ pub(in crate::windows_app) mod commands;
 pub(in crate::windows_app) use commands::*;
 pub(in crate::windows_app) mod keymap;
 pub(in crate::windows_app) use keymap::*;
+pub(in crate::windows_app) mod adblock;
+pub(in crate::windows_app) use adblock::*;
 
 pub(in crate::windows_app) mod app;
 #[allow(unused_imports)]

@@ -2,6 +2,8 @@ use super::*;
 
 use std::sync::RwLock;
 
+use neural_core::adblock::AdblockRules;
+
 use wry::PageLoadEvent;
 
 // ===================== os ganchos de cada WebView (infra-webview-hooks) =====================
@@ -153,11 +155,25 @@ pub(in crate::windows_app) enum DownloadPolicy {
 }
 
 /// O que o despachante de recursos (`resource_gate_answers`) faz com os
-/// pedidos deste hospedeiro. So ha uma politica hoje: nenhum pedido e
-/// respondido pelo NeuralIA; o bloqueio de anuncios acrescenta a dele.
+/// pedidos deste hospedeiro.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::windows_app) enum ResourceGatePolicy {
+    /// Nenhum pedido e respondido pelo NeuralIA (e nenhum
+    /// `WebResourceRequested` e registado).
     Open,
+    /// O bloqueio de anuncios (`adblock.rs`): as colunas, a fonte ao lado
+    /// e a Web completa. A fonte privada nao.
+    Adblock,
+}
+
+/// A politica de recursos de um hospedeiro (a casa `resource_gate` da
+/// tabela), sem montar a linha inteira: o despachante le-a a cada pedido.
+pub(in crate::windows_app) fn resource_gate_policy(host: WebViewHost) -> ResourceGatePolicy {
+    if adblock_host(host) {
+        ResourceGatePolicy::Adblock
+    } else {
+        ResourceGatePolicy::Open
+    }
 }
 
 /// A cadeia de navegacao de cada hospedeiro: qual das trava de sempre
@@ -226,7 +242,7 @@ pub(in crate::windows_app) fn webview_hooks(host: WebViewHost) -> WebViewHooks {
             .map(|item| item.id)
             .collect(),
         downloads,
-        resource_gate: ResourceGatePolicy::Open,
+        resource_gate: resource_gate_policy(host),
         nav_gate,
         accelerators: true,
         distraction: None,
@@ -435,16 +451,17 @@ pub(in crate::windows_app) fn web_navigation_verdict(
 
 // ===================== o despachante de recursos (ResourceGate) =====================
 
-// O despachante e um esboco: o produto ainda nao regista o
-// `WebResourceRequested` (o bloqueio de anuncios fa-lo, com o filtro dele, e
-// consulta isto a cada pedido). Ate la nada no exe o chama; o gate
-// `custom_schemes_are_never_answered_by_the_resource_gate` prende desde ja
-// o contrato de que ele depende.
+// O bloqueio de anuncios regista o `WebResourceRequested` nos hospedeiros
+// com `ResourceGatePolicy::Adblock` (`register_resource_gate`) e o handler
+// pergunta aqui, a cada pedido, se o NeuralIA responde ele proprio (um 403
+// pelo `CreateWebResourceResponse`). O handler le a pagina e o ambiente do
+// `sender` do evento, nunca de uma WebView capturada; e um pedido a um
+// esquema proprio do wry nunca e respondido aqui (gate
+// `custom_schemes_are_never_answered_by_the_resource_gate`).
 
 /// Os esquemas proprios que o wry serve por `with_custom_protocol`: o PDF, os
 /// livros e o Gemini Live. No Windows chegam as paginas como
 /// `http://<esquema>.localhost`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::windows_app) const CUSTOM_SCHEMES: [&str; 3] = [
     "neuralia-pdf",
     crate::epub_app::EPUB_SCHEME,
@@ -453,7 +470,6 @@ pub(in crate::windows_app) const CUSTOM_SCHEMES: [&str; 3] = [
 
 /// Um pedido a um dos esquemas proprios, pelo esquema ou pela origem
 /// `<esquema>.localhost` (sem porta) com que o WebView2 o apresenta.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::windows_app) fn is_custom_scheme_request(uri: &str) -> bool {
     let Ok(url) = Url::parse(uri.trim()) else {
         return false;
@@ -470,16 +486,22 @@ pub(in crate::windows_app) fn is_custom_scheme_request(uri: &str) -> bool {
 
 /// O despachante do `WebResourceRequested`: diz se o NeuralIA responde ele
 /// proprio a um pedido deste hospedeiro (um bloqueio) em vez de o deixar
-/// seguir. E um esboco: hoje nao responde a nada, e um pedido a um esquema
-/// proprio nunca e respondido por aqui -- quem o serve e o protocolo do
-/// wry, e uma resposta daqui deixava o PDF, os livros ou o Live sem pagina.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(in crate::windows_app) fn resource_gate_answers(host: WebViewHost, uri: &str) -> bool {
+/// seguir. Um pedido a um esquema proprio nunca e respondido por aqui --
+/// quem o serve e o protocolo do wry, e uma resposta daqui deixava o PDF,
+/// os livros ou o Live sem pagina. `rules` sao as do bloqueio de anuncios
+/// em vigor (`None`: desligado ou sem lista ainda).
+pub(in crate::windows_app) fn resource_gate_answers(
+    host: WebViewHost,
+    uri: &str,
+    page: ResourcePage<'_>,
+    rules: Option<&AdblockRules>,
+) -> bool {
     if is_custom_scheme_request(uri) {
         return false;
     }
-    match webview_hooks(host).resource_gate {
+    match resource_gate_policy(host) {
         ResourceGatePolicy::Open => false,
+        ResourceGatePolicy::Adblock => adblock_blocks(uri, page, rules),
     }
 }
 
@@ -491,41 +513,98 @@ pub(in crate::windows_app) fn resource_gate_answers(host: WebViewHost, uri: &str
 pub(in crate::windows_app) const COLUMN_MENU_AUTO_SCROLL: usize = 1;
 
 /// O estado partilhado que os rotulos leem no instante do botao direito.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::windows_app) struct MenuFlags {
     pub(in crate::windows_app) auto_scroll: bool,
+    /// O bloqueio de anuncios para a pagina deste botao direito.
+    pub(in crate::windows_app) adblock: AdblockMenu,
+}
+
+/// O que um item faz quando escolhido. Decidido no pedido, com a origem do
+/// hospedeiro; nunca vem da pagina.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::windows_app) enum MenuAction {
+    /// Um comando de coluna: o mesmo despacho do atalho (`column_menu_event`).
+    Column { column: usize, command: usize },
+    /// Um item do bloqueio de anuncios.
+    Adblock(AdblockAction),
+    /// Um item cinzento: nada.
+    None,
+}
+
+impl MenuAction {
+    pub(in crate::windows_app) fn event(&self) -> Option<UserEvent> {
+        match self {
+            MenuAction::Column { column, command } => column_menu_event(*column, *command),
+            MenuAction::Adblock(action) => Some(UserEvent::Adblock(action.event())),
+            MenuAction::None => None,
+        }
+    }
+}
+
+/// Um item como aparece neste botao direito: o rotulo, a marca (so numa
+/// caixa), se se pode escolher e o que faz.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::windows_app) struct MenuItemView {
+    pub(in crate::windows_app) label: String,
+    /// `Some`: uma caixa, marcada ou nao.
+    pub(in crate::windows_app) checked: Option<bool>,
+    pub(in crate::windows_app) enabled: bool,
+    pub(in crate::windows_app) action: MenuAction,
 }
 
 /// Um item que o NeuralIA acrescenta ao menu nativo do botao direito de uma
-/// WebView: o id, o rotulo lido no pedido, os hospedeiros que o recebem e o
-/// evento de o escolher (com a origem do hospedeiro).
+/// WebView: o id, os hospedeiros que o recebem e o que mostra e faz em
+/// cada pedido (`None`: neste pedido nao aparece).
 pub(in crate::windows_app) struct MenuItemSpec {
     pub(in crate::windows_app) id: usize,
-    pub(in crate::windows_app) label: fn(MenuFlags) -> &'static str,
     pub(in crate::windows_app) hosts: fn(WebViewHost) -> bool,
-    pub(in crate::windows_app) event: fn(WebViewHost) -> Option<UserEvent>,
-}
-
-fn auto_scroll_label(flags: MenuFlags) -> &'static str {
-    auto_scroll_menu_label(flags.auto_scroll)
+    pub(in crate::windows_app) view: fn(WebViewHost, &MenuFlags) -> Option<MenuItemView>,
 }
 
 fn auto_scroll_hosts(host: WebViewHost) -> bool {
     context_menu_column(host).is_some()
 }
 
-fn auto_scroll_event(host: WebViewHost) -> Option<UserEvent> {
-    column_menu_event(context_menu_column(host)?, COLUMN_MENU_AUTO_SCROLL)
+fn auto_scroll_view(host: WebViewHost, flags: &MenuFlags) -> Option<MenuItemView> {
+    Some(MenuItemView {
+        label: auto_scroll_menu_label(flags.auto_scroll).to_string(),
+        checked: None,
+        enabled: true,
+        action: MenuAction::Column {
+            column: context_menu_column(host)?,
+            command: COLUMN_MENU_AUTO_SCROLL,
+        },
+    })
+}
+
+fn adblock_site_view(_host: WebViewHost, flags: &MenuFlags) -> Option<MenuItemView> {
+    adblock_site_item(&flags.adblock)
+}
+
+fn adblock_off_view(_host: WebViewHost, flags: &MenuFlags) -> Option<MenuItemView> {
+    adblock_off_item(&flags.adblock)
 }
 
 /// O registo: cada item do NeuralIA nos menus das WebViews, ids unicos e
 /// nunca zero (gate `context_menu_commands_are_unique`).
-pub(in crate::windows_app) const WEBVIEW_MENU_ITEMS: &[MenuItemSpec] = &[MenuItemSpec {
-    id: COLUMN_MENU_AUTO_SCROLL,
-    label: auto_scroll_label,
-    hosts: auto_scroll_hosts,
-    event: auto_scroll_event,
-}];
+pub(in crate::windows_app) const WEBVIEW_MENU_ITEMS: &[MenuItemSpec] = &[
+    MenuItemSpec {
+        id: COLUMN_MENU_AUTO_SCROLL,
+        hosts: auto_scroll_hosts,
+        view: auto_scroll_view,
+    },
+    MenuItemSpec {
+        id: ADBLOCK_MENU_SITE,
+        hosts: adblock_host,
+        view: adblock_site_view,
+    },
+    MenuItemSpec {
+        id: ADBLOCK_MENU_OFF,
+        hosts: adblock_host,
+        view: adblock_off_view,
+    },
+];
 
 /// Os itens do registo que este hospedeiro recebe, pela ordem do registo.
 pub(in crate::windows_app) fn webview_menu_items(host: WebViewHost) -> Vec<&'static MenuItemSpec> {
@@ -535,7 +614,8 @@ pub(in crate::windows_app) fn webview_menu_items(host: WebViewHost) -> Vec<&'sta
         .collect()
 }
 
-/// O item do registo com este id.
+/// O item do registo com este id (o que o gate dos ids unicos procura).
+#[cfg(test)]
 pub(in crate::windows_app) fn webview_menu_item(id: usize) -> Option<&'static MenuItemSpec> {
     WEBVIEW_MENU_ITEMS.iter().find(|item| item.id == id)
 }
@@ -598,20 +678,28 @@ pub(in crate::windows_app) fn menu_placement(native: u32) -> MenuPlacement {
     }
 }
 
-/// Um item do NeuralIA num botao direito concreto: o rotulo lido no
-/// instante do pedido e o indice em que entra no menu.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Um item do NeuralIA num botao direito concreto: o rotulo, a marca e o
+/// estado lidos no instante do pedido, o indice em que entra no menu e o
+/// que faz.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::windows_app) struct MenuItemRequest {
     pub(in crate::windows_app) host: WebViewHost,
     pub(in crate::windows_app) id: usize,
-    pub(in crate::windows_app) label: &'static str,
+    pub(in crate::windows_app) label: String,
+    pub(in crate::windows_app) checked: Option<bool>,
+    pub(in crate::windows_app) enabled: bool,
     pub(in crate::windows_app) at: u32,
+    pub(in crate::windows_app) action: MenuAction,
 }
 
 impl MenuItemRequest {
-    /// O evento de escolher o item, com a origem do hospedeiro.
+    /// O evento de escolher o item, com a origem do hospedeiro. Um item
+    /// cinzento nao faz nada.
     pub(in crate::windows_app) fn selected(&self) -> Option<UserEvent> {
-        (webview_menu_item(self.id)?.event)(self.host)
+        if !self.enabled {
+            return None;
+        }
+        self.action.event()
     }
 }
 
@@ -635,27 +723,39 @@ impl MenuRequest {
 /// a cada pedido: por isso o rotulo le o `SharedFlag` dentro da resposta,
 /// nunca na criacao -- um rotulo lido no registo ficava preso ao estado do
 /// arranque. `register_webview_context_menu` e `column_pill_menu` so copiam
-/// para o Win32/COM o que isto decide.
+/// para o Win32/COM o que isto decide. `page` e o endereco que a WebView
+/// mostra no instante do pedido (o `Source` do `sender`); `adblock` e o
+/// bloqueio dessa WebView (`None` na pilula e nos hospedeiros sem ele).
 pub(in crate::windows_app) fn webview_menu_responder(
     host: WebViewHost,
     auto_scroll: SharedFlag,
-) -> impl Fn(u32) -> MenuRequest {
-    move |native| {
+    adblock: Option<AdblockMenuSource>,
+) -> impl Fn(u32, Option<&str>) -> MenuRequest {
+    move |native, page| {
         let flags = MenuFlags {
             auto_scroll: auto_scroll.get(),
+            adblock: adblock
+                .as_ref()
+                .map_or(AdblockMenu::Hidden, |source| source.menu(page)),
         };
-        let items = webview_menu_items(host);
+        let items: Vec<(usize, MenuItemView)> = webview_menu_items(host)
+            .into_iter()
+            .filter_map(|item| Some((item.id, (item.view)(host, &flags)?)))
+            .collect();
         let placement = menu_placement(native);
         MenuRequest {
             separator_at: placement.separator_at.filter(|_| !items.is_empty()),
             items: items
                 .into_iter()
                 .enumerate()
-                .map(|(index, item)| MenuItemRequest {
+                .map(|(index, (id, view))| MenuItemRequest {
                     host,
-                    id: item.id,
-                    label: (item.label)(flags),
+                    id,
+                    label: view.label,
+                    checked: view.checked,
+                    enabled: view.enabled,
                     at: placement.first_item_at + index as u32,
+                    action: view.action,
                 })
                 .collect(),
         }
@@ -672,17 +772,20 @@ fn register_webview_context_menu(
     webview: &WebView,
     host: WebViewHost,
     auto_scroll: SharedFlag,
+    adblock: Option<AdblockMenuSource>,
     proxy: EventLoopProxy<UserEvent>,
 ) -> Result<(), String> {
     use webview2_com::{
         ContextMenuRequestedEventHandler, CustomItemSelectedEventHandler,
         Microsoft::Web::WebView2::Win32::{
+            COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_CHECK_BOX,
             COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
-            COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR, ICoreWebView2_11,
+            COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR, ICoreWebView2, ICoreWebView2_11,
             ICoreWebView2ContextMenuRequestedEventArgs, ICoreWebView2Environment9,
         },
+        take_pwstr,
     };
-    use windows_core::{HSTRING, Interface};
+    use windows_core::{HSTRING, Interface, PWSTR};
     use wry::WebViewExtWindows;
 
     let core = webview
@@ -694,60 +797,78 @@ fn register_webview_context_menu(
         .cast::<ICoreWebView2Environment9>()
         .map_err(|error| format!("ICoreWebView2Environment9 indisponível: {error}"))?;
 
-    let respond = webview_menu_responder(host, auto_scroll);
-    let add_items =
-        move |args: &ICoreWebView2ContextMenuRequestedEventArgs| -> windows_core::Result<()> {
-            unsafe {
-                let menu = args.MenuItems()?;
-                let mut native = 0u32;
-                menu.Count(&mut native)?;
-                let request = respond(native);
-                // Tudo criado antes de mexer no menu: uma falha a meio nao
-                // deixa um separador solto no fim do menu nativo.
-                let mut created = Vec::with_capacity(request.items.len());
-                for item in &request.items {
-                    let label = HSTRING::from(item.label);
+    let respond = webview_menu_responder(host, auto_scroll, adblock);
+    let add_items = move |sender: Option<&ICoreWebView2>,
+                          args: &ICoreWebView2ContextMenuRequestedEventArgs|
+          -> windows_core::Result<()> {
+        unsafe {
+            let menu = args.MenuItems()?;
+            let mut native = 0u32;
+            menu.Count(&mut native)?;
+            // A pagina deste pedido, do `sender` do evento: o que o menu
+            // do bloqueio de anuncios decide (o site, a contagem).
+            let page = match sender {
+                Some(sender) => {
+                    let mut source = PWSTR::null();
+                    sender.Source(&mut source).ok().map(|()| take_pwstr(source))
+                }
+                None => None,
+            };
+            let request = respond(native, page.as_deref());
+            // Tudo criado antes de mexer no menu: uma falha a meio nao
+            // deixa um separador solto no fim do menu nativo.
+            let mut created = Vec::with_capacity(request.items.len());
+            for item in &request.items {
+                let label = HSTRING::from(item.label.as_str());
+                let kind = if item.checked.is_some() {
+                    COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_CHECK_BOX
+                } else {
+                    COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND
+                };
+                let entry = environment.CreateContextMenuItem(&label, None, kind)?;
+                if let Some(checked) = item.checked {
+                    entry.SetIsChecked(checked)?;
+                }
+                if item.enabled {
                     let proxy = proxy.clone();
-                    let item_request = *item;
+                    let item_request = item.clone();
                     let selected = CustomItemSelectedEventHandler::create(Box::new(move |_, _| {
                         if let Some(event) = item_request.selected() {
                             let _ = proxy.send_event(event);
                         }
                         Ok(())
                     }));
-                    let entry = environment.CreateContextMenuItem(
-                        &label,
-                        None,
-                        COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
-                    )?;
                     let mut selected_token = 0i64;
                     entry.add_CustomItemSelected(&selected, &mut selected_token)?;
-                    created.push((item.at, entry));
+                } else {
+                    entry.SetIsEnabled(false)?;
                 }
-                let separator = match request.separator_at {
-                    Some(index) => Some((
-                        index,
-                        environment.CreateContextMenuItem(
-                            &HSTRING::new(),
-                            None,
-                            COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR,
-                        )?,
-                    )),
-                    None => None,
-                };
-                if let Some((index, separator)) = separator {
-                    menu.InsertValueAtIndex(index, &separator)?;
-                }
-                for (index, entry) in created {
-                    menu.InsertValueAtIndex(index, &entry)?;
-                }
+                created.push((item.at, entry));
             }
-            Ok(())
-        };
+            let separator = match request.separator_at {
+                Some(index) => Some((
+                    index,
+                    environment.CreateContextMenuItem(
+                        &HSTRING::new(),
+                        None,
+                        COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR,
+                    )?,
+                )),
+                None => None,
+            };
+            if let Some((index, separator)) = separator {
+                menu.InsertValueAtIndex(index, &separator)?;
+            }
+            for (index, entry) in created {
+                menu.InsertValueAtIndex(index, &entry)?;
+            }
+        }
+        Ok(())
+    };
     let described = host.describe();
-    let handler = ContextMenuRequestedEventHandler::create(Box::new(move |_, args| {
+    let handler = ContextMenuRequestedEventHandler::create(Box::new(move |sender, args| {
         if let Some(args) = args
-            && let Err(error) = add_items(&args)
+            && let Err(error) = add_items(sender.as_ref(), &args)
         {
             debug_log(format_args!(
                 "context menu: {described} abriu sem os itens do NeuralIA ({error})"
@@ -872,6 +993,9 @@ pub(in crate::windows_app) trait HookRegistrar {
     fn context_menu(&mut self, host: WebViewHost, items: &[usize]) -> Result<(), String>;
     /// O `AcceleratorKeyPressed` de `accelerator_lookup` neste hospedeiro.
     fn accelerators(&mut self, host: WebViewHost) -> Result<(), String>;
+    /// O `WebResourceRequested` do despachante (`resource_gate_answers`)
+    /// neste hospedeiro.
+    fn resource_gate(&mut self, host: WebViewHost) -> Result<(), String>;
 }
 
 /// O que `install_webview_hooks` faz com uma WebView acabada de construir:
@@ -901,6 +1025,14 @@ pub(in crate::windows_app) fn install_hooks_with(
             host.describe()
         ));
     }
+    if hooks.resource_gate == ResourceGatePolicy::Adblock
+        && let Err(error) = registrar.resource_gate(host)
+    {
+        missing.push(format!(
+            "resource gate: {} sem WebResourceRequested ({error})",
+            host.describe()
+        ));
+    }
     missing
 }
 
@@ -909,14 +1041,23 @@ struct ComHookRegistrar<'a> {
     webview: &'a WebView,
     auto_scroll: SharedFlag,
     proxy: EventLoopProxy<UserEvent>,
+    /// O bloqueio de anuncios partilhado e o contador DESTA WebView (o
+    /// menu le o que o `WebResourceRequested` dela conta).
+    adblock: Arc<AdblockShared>,
+    blocked: Arc<PageBlocked>,
 }
 
 impl HookRegistrar for ComHookRegistrar<'_> {
     fn context_menu(&mut self, host: WebViewHost, _items: &[usize]) -> Result<(), String> {
+        let adblock = adblock_host(host).then(|| AdblockMenuSource {
+            shared: Arc::clone(&self.adblock),
+            blocked: Arc::clone(&self.blocked),
+        });
         register_webview_context_menu(
             self.webview,
             host,
             self.auto_scroll.clone(),
+            adblock,
             self.proxy.clone(),
         )
     }
@@ -924,6 +1065,129 @@ impl HookRegistrar for ComHookRegistrar<'_> {
     fn accelerators(&mut self, host: WebViewHost) -> Result<(), String> {
         register_webview_accelerators(self.webview, host, self.proxy.clone())
     }
+
+    fn resource_gate(&mut self, host: WebViewHost) -> Result<(), String> {
+        register_resource_gate(
+            self.webview,
+            host,
+            Arc::clone(&self.adblock),
+            Arc::clone(&self.blocked),
+        )
+    }
+}
+
+// ===================== o WebResourceRequested (ResourceGate) =====================
+
+/// A razao do 403 com que um pedido bloqueado e respondido.
+const BLOCKED_REASON: &str = "Blocked by NeuralIA";
+
+/// O filtro `*` do `WebResourceRequested`, em todos os contextos e (com o
+/// `ICoreWebView2_22`, quando o runtime o tem) em todas as origens do
+/// pedido -- os workers incluidos. Liga-se com o bloqueio: sem ele nenhum
+/// pedido passa pelo handler.
+pub(in crate::windows_app) fn set_resource_filter(
+    webview: &WebView,
+    on: bool,
+) -> Result<(), String> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL, COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
+        ICoreWebView2_22,
+    };
+    use windows_core::{HSTRING, Interface};
+    use wry::WebViewExtWindows;
+
+    let core = webview.webview();
+    let filter = HSTRING::from("*");
+    let result = unsafe {
+        match core.cast::<ICoreWebView2_22>() {
+            Ok(core) if on => core.AddWebResourceRequestedFilterWithRequestSourceKinds(
+                &filter,
+                COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
+            ),
+            Ok(core) => core.RemoveWebResourceRequestedFilterWithRequestSourceKinds(
+                &filter,
+                COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
+            ),
+            Err(_) if on => {
+                core.AddWebResourceRequestedFilter(&filter, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)
+            }
+            Err(_) => core
+                .RemoveWebResourceRequestedFilter(&filter, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL),
+        }
+    };
+    result.map_err(|error| format!("filtro do WebResourceRequested: {error}"))
+}
+
+/// O `WebResourceRequested` de uma WebView com `ResourceGatePolicy::Adblock`.
+/// O handler le o pedido, o tipo e a pagina de topo do `sender` do evento --
+/// nunca de uma WebView capturada --, pergunta ao despachante e, num
+/// bloqueio, responde 403 pelo `CreateWebResourceResponse` do ambiente do
+/// mesmo `sender`. Sem regras (desligado, sem lista) sai logo. O filtro so
+/// entra se o bloqueio estiver ligado; ligado depois, `set_resource_filter`
+/// poe-no nas WebViews abertas.
+fn register_resource_gate(
+    webview: &WebView,
+    host: WebViewHost,
+    shared: Arc<AdblockShared>,
+    blocked: Arc<PageBlocked>,
+) -> Result<(), String> {
+    use webview2_com::{
+        Microsoft::Web::WebView2::Win32::{COREWEBVIEW2_WEB_RESOURCE_CONTEXT, ICoreWebView2_2},
+        WebResourceRequestedEventHandler, take_pwstr,
+    };
+    use windows_core::{HSTRING, Interface, PWSTR};
+    use wry::WebViewExtWindows;
+
+    let filtering = shared.filtering();
+    let handler = WebResourceRequestedEventHandler::create(Box::new(move |sender, args| {
+        let Some(rules) = shared.rules() else {
+            return Ok(());
+        };
+        let (Some(sender), Some(args)) = (sender, args) else {
+            return Ok(());
+        };
+        let (uri, top, context) = unsafe {
+            let request = args.Request()?;
+            let mut uri = PWSTR::null();
+            request.Uri(&mut uri)?;
+            let uri = take_pwstr(uri);
+            let mut top = PWSTR::null();
+            sender.Source(&mut top)?;
+            let top = take_pwstr(top);
+            let mut context = COREWEBVIEW2_WEB_RESOURCE_CONTEXT(0);
+            args.ResourceContext(&mut context)?;
+            (uri, top, context)
+        };
+        let page = ResourcePage {
+            top: &top,
+            kind: resource_kind_of(context.0),
+        };
+        if !resource_gate_answers(host, &uri, page, Some(&rules)) {
+            return Ok(());
+        }
+        unsafe {
+            let environment = sender.cast::<ICoreWebView2_2>()?.Environment()?;
+            let response = environment.CreateWebResourceResponse(
+                None,
+                403,
+                &HSTRING::from(BLOCKED_REASON),
+                &HSTRING::new(),
+            )?;
+            args.SetResponse(&response)?;
+        }
+        blocked.record(&top);
+        Ok(())
+    }));
+    let core = webview.webview();
+    let mut token = 0i64;
+    unsafe { core.add_WebResourceRequested(&handler, &mut token) }
+        .map_err(|error| format!("add_WebResourceRequested falhou: {error}"))?;
+    if filtering {
+        set_resource_filter(webview, true)?;
+    }
+    Ok(())
 }
 
 // ===================== o evento do modulo =====================
@@ -1012,6 +1276,8 @@ impl App {
             webview,
             auto_scroll: self.auto_scroll.clone(),
             proxy: self.proxy.clone(),
+            adblock: Arc::clone(&self.adblock.shared),
+            blocked: Arc::new(PageBlocked::default()),
         };
         for line in install_hooks_with(host, &webview_hooks(host), &mut registrar) {
             debug_log(format_args!("{line}"));
@@ -1026,10 +1292,12 @@ impl App {
         }
     }
 
-    /// Uma pagina acabou de carregar. Nada na 2.3 le ainda o endereco: fica
-    /// no evento para quem vier (favoritos, bloqueio de anuncios); o log de
-    /// depuracao nunca leva URLs, so a transicao.
-    fn page_loaded(&self, page: WebViewHost, _url: String) {
+    /// Uma pagina acabou de carregar. O endereco fica no evento para quem
+    /// vier (favoritos); o bloqueio de anuncios so precisa do hospedeiro
+    /// (a renovacao semanal da lista, nunca na Home). O log de depuracao
+    /// nunca leva URLs, so a transicao.
+    fn page_loaded(&mut self, page: WebViewHost, _url: String) {
         debug_log(format_args!("webview: {} carregou", page.describe()));
+        self.adblock_page_loaded(page);
     }
 }

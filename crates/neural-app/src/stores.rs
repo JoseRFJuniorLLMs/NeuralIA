@@ -20,6 +20,16 @@ use neural_core::json_store::StoreSpec;
 pub(crate) const KEYS_STORE: StoreSpec = StoreSpec::new("keys", Explicit, Dir);
 /// A chave do Gemini Live, a do slot `KeySlot::Gemini` do cofre.
 pub(crate) const LIVE_KEY_STORE: StoreSpec = StoreSpec::new("gemini-live.key", Explicit, File);
+/// `<data_dir>/adblock-settings.json`: o bloqueio de anuncios ligado e os
+/// sites com anuncios permitidos (e o campo reservado da anti-distracao).
+/// Muda so por uma escolha no menu: `Setting`.
+pub(crate) const ADBLOCK_SETTINGS_STORE: StoreSpec =
+    StoreSpec::new("adblock-settings.json", Setting, File);
+/// `<data_dir>/adblock-list.json`: a lista de Peter Lowe baixada. Escrita
+/// como efeito lateral de ter o bloqueio ligado (a renovacao semanal):
+/// `Automatic` -- no modo privado nao se renova.
+pub(crate) const ADBLOCK_LIST_STORE: StoreSpec =
+    StoreSpec::new("adblock-list.json", Automatic, File);
 
 /// Tudo o que o produto guarda em `<data_dir>`, com o tipo. Um ficheiro, um
 /// tipo; a regra: `Setting` = escolha num menu ou definicao; `Explicit` =
@@ -58,6 +68,8 @@ pub(crate) const APP_STORES: &[StoreSpec] = &[
     StoreSpec::new("research-exports", Explicit, Dir),
     LIVE_KEY_STORE,
     KEYS_STORE,
+    ADBLOCK_SETTINGS_STORE,
+    ADBLOCK_LIST_STORE,
 ];
 
 #[cfg(test)]

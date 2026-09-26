@@ -288,17 +288,15 @@ jobs:
               Test = "each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r"
               SourcePath = "crates/neural-app/src/windows_app/webview_hooks.rs"
               Old = @'
-              move |native| {
+              move |native, page| {
                   let flags = MenuFlags {
                       auto_scroll: auto_scroll.get(),
-                  };
           '@
               New = @'
               let frozen = auto_scroll.get();
-              move |native| {
+              move |native, page| {
                   let flags = MenuFlags {
                       auto_scroll: frozen,
-                  };
           '@
             },
             @{
@@ -468,6 +466,17 @@ jobs:
               if is_custom_scheme_request(uri) {
                   return uri.contains("neuralia-pdf");
               }
+          '@
+            },
+            @{
+              Label = "adblock-split-without-resource-gate"
+              Test = "the_adblock_gate_is_installed_on_columns_split_and_external_only"
+              SourcePath = "crates/neural-app/src/windows_app/adblock.rs"
+              Old = @'
+                  WebViewHost::Column(_) | WebViewHost::Split(_) | WebViewHost::External
+          '@
+              New = @'
+                  WebViewHost::Column(_) | WebViewHost::External
           '@
             },
             @{
@@ -689,6 +698,16 @@ jobs:
       - name: Published exe has no LLM endpoint override
         shell: pwsh
         run: ./scripts/test-exe-no-endpoint-override.ps1 -ExePath ci-tested/NeuralIA.exe
+      # E2E of the ad blocker (adblock): only here, on the exact tested bytes,
+      # because it launches the exe (the owner works on the same desktop). The
+      # fixture is 127.0.0.1 (scripts/adblock-fixture.mjs), the WebView2 maps
+      # every name to 127.0.0.1 and the stored list is fresh, so no request
+      # leaves the runner -- pgl.yoyo.org included. The script also checks the
+      # stored list was not rewritten (no refresh ran).
+      - name: Adblock E2E on the tested exe (loopback only)
+        shell: pwsh
+        timeout-minutes: 5
+        run: ./scripts/test-adblock.ps1 -ExePath ci-tested/NeuralIA.exe
       # Release contract of the CI-only accelerator spike (infra-accel-spike):
       # the exact bytes that release.yml packages were built without the spike
       # feature, so the spike marker is not in them. The spike itself runs in
