@@ -141,8 +141,9 @@ pub fn list_models(
     Ok(models)
 }
 
-/// O texto a gerar. A cerca do texto nao confiavel (`PromptBuilder`) chega
-/// com a parte 2 (`infra-llm-untrusted`); ate la nenhuma feature chama isto.
+/// O texto a gerar. Com texto de fora, `system` e `user` vem de um
+/// `untrusted::BuiltPrompt` (`system()` e `user()`), que cerca os dados;
+/// nenhuma feature chama isto ainda.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TextPrompt<'a> {
     pub system: Option<&'a str>,
