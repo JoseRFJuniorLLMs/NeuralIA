@@ -84,7 +84,8 @@ jobs:
           $gates = @(
             "windows_app::tests::toast_never_activates",
             "windows_app::tests::native_card_never_activates",
-            "windows_app::tests::popup_menu_restores_origin_focus"
+            "windows_app::tests::popup_menu_restores_origin_focus",
+            "windows_app::tests::downloads_gates::download_card_never_activates"
           )
           cargo test --locked -p neural-app --bin NeuralIA -- --ignored --exact --test-threads=1 @gates 2>&1 |
             ForEach-Object { "$_" } |

@@ -174,6 +174,7 @@ before the site sees the key. They work on every surface unless noted.
 | `Ctrl+H` | semantic local memory search (`memory:`) |
 | `Ctrl+Shift+Z` | note from the selected text, with the page as its source, opened in the Notes tab of the side panel (inside a text field it stays redo; refused in the private split); on Home, a new blank note |
 | `Ctrl+Shift+Delete` | clear local history (the WebView2 profile is untouched) |
+| `Ctrl+J` | Downloads: the side panel's Downloads section (again, closes it); native, so it also works in Livros |
 | `F12` · `Ctrl+Shift+I/J/C` | Chromium DevTools |
 | `Ctrl+U` | view page source |
 | `F11` | fullscreen for the current comparator column |

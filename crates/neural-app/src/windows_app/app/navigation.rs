@@ -444,7 +444,9 @@ impl App {
             InputRoute::OpenEpub(None) => self.open_epub_dialog(true),
             InputRoute::OpenEpub(Some(path)) => self.open_epub(path),
             InputRoute::Intent => match parse_intent(&input) {
-                Ok(Intent::Home) => self.show_home(),
+                Ok(Intent::Home) => {
+                    self.request_home();
+                }
                 Ok(Intent::Ask(query)) => self.ask(query),
                 Ok(Intent::Compare(query)) => self.compare(CompareRequest::ask(query)),
                 Ok(Intent::Read(url)) => self.read(url.to_string()),
@@ -476,7 +478,9 @@ impl App {
                     self.show_splash(message, 3);
                 }
             }
-            PaletteRoute::Home => self.show_home(),
+            PaletteRoute::Home => {
+                self.request_home();
+            }
             PaletteRoute::Pomodoro(Some(command)) => self.pomodoro_command(command),
             PaletteRoute::Pomodoro(None) => {
                 self.show_splash(POMODORO_COMMAND_HELP.to_string(), 4);
@@ -547,7 +551,8 @@ impl App {
                 return;
             }
         }
-        self.show_home();
+        // Com downloads a correr, pergunta antes (`leave_guard`).
+        self.request_home();
     }
 
     /// ‹ e › da barra: o historico da PAGINA, como no Chrome -- na fonte aberta

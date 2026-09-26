@@ -378,7 +378,7 @@ pub fn classify_download_name(name: &str) -> RiskClass {
 /// guarda e decide. `Masquerade` e `BadName` nunca têm exceção; os outros
 /// podem ser baixados só com «Permitir baixar programas» ligado e uma
 /// confirmação por download.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BlockReason {
     /// Vazio, só pontos e espaços, com `:` (ADS), bidi, controlo ou formato
@@ -584,23 +584,9 @@ pub fn default_app_target(path: impl AsRef<Path>) -> Option<DefaultAppTarget> {
     let p = path.as_ref();
     let filename = p.file_name()?.to_str()?;
 
-    // Verifica classificação geral do nome
-    match classify_download_name(filename) {
-        RiskClass::Block | RiskClass::Warn => return None,
-        RiskClass::Safe => {}
-    }
-
-    // Recusa explicitamente extensões de controle e atalhos de shell
-    let ext = p.extension()?.to_str()?.to_ascii_lowercase();
-    if matches!(
-        ext.as_str(),
-        "url" | "lnk" | "library-ms" | "search-ms" | "chm" | "hta"
-    ) {
-        return None;
-    }
-
-    // Exige correspondência estrita com a allowlist
-    if !DEFAULT_APP_ALLOWLIST.contains(&ext.as_str()) {
+    // O nome primeiro: a mesma regra que a lista de downloads usa para
+    // decidir se mostra «Abrir» (`default_app_name_allowed`).
+    if !default_app_name_allowed(filename) {
         return None;
     }
 
@@ -611,6 +597,32 @@ pub fn default_app_target(path: impl AsRef<Path>) -> Option<DefaultAppTarget> {
     }
 
     Some(DefaultAppTarget(p.to_path_buf()))
+}
+
+/// A metade do nome de [`default_app_target`], sem ler o disco: um nome
+/// `Safe` para [`classify_download_name`], que não é um atalho nem um
+/// controlo do shell (`.url`, `.lnk`, `.library-ms`, `.search-ms`, `.chm`,
+/// `.hta`) e cuja extensão está no [`DEFAULT_APP_ALLOWLIST`]. É o que a
+/// lista de downloads (downloads-ui) usa para decidir se oferece «Abrir» ou
+/// só «Mostrar na pasta»; abrir continua a exigir o [`DefaultAppTarget`],
+/// que relê o arquivo. `name` é só o nome, sem pasta.
+pub fn default_app_name_allowed(name: &str) -> bool {
+    if classify_download_name(name) != RiskClass::Safe {
+        return false;
+    }
+    // Recusa explicitamente extensões de controle e atalhos de shell
+    let Some(ext) = Path::new(name).extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    let ext = ext.to_ascii_lowercase();
+    if matches!(
+        ext.as_str(),
+        "url" | "lnk" | "library-ms" | "search-ms" | "chm" | "hta"
+    ) {
+        return false;
+    }
+    // Exige correspondência estrita com a allowlist
+    DEFAULT_APP_ALLOWLIST.contains(&ext.as_str())
 }
 
 /// Os primeiros [`SNIFF_HEAD_BYTES`] de um arquivo regular; `None` se não
@@ -1275,5 +1287,77 @@ mod tests {
         }
         assert!(!Masquerade.allows_confirmation());
         assert!(!BadName.allows_confirmation());
+    }
+
+    /// Gate (downloads-ui): a metade do nome que a lista de downloads usa
+    /// para oferecer «Abrir» e a de `default_app_target` nunca divergem --
+    /// com um conteúdo inofensivo no disco, um nome tem alvo se e só se
+    /// `default_app_name_allowed` o aceita. Um tipo recusado nunca mostra
+    /// «Abrir» (crítica C15), e um que o mostra abre.
+    #[test]
+    fn default_app_name_allowed_agrees_with_default_app_target() {
+        let temp = TempDir::new("name-allowed");
+        let mut corpus: Vec<String> = Vec::new();
+        let lists: [&[&str]; 8] = [
+            PROGRAM_EXTENSIONS,
+            SCRIPT_EXTENSIONS,
+            SHORTCUT_SHELL_EXTENSIONS,
+            DISKIMAGE_EXTENSIONS,
+            DATABASE_APP_EXTENSIONS,
+            MACRO_EXTENSIONS,
+            SAFE_DECOY_EXTENSIONS,
+            DEFAULT_APP_ALLOWLIST,
+        ];
+        for list in lists {
+            for ext in list {
+                corpus.push(format!("arquivo.{ext}"));
+                corpus.push(format!("ARQUIVO.{}", ext.to_uppercase()));
+                corpus.push(format!("fatura.pdf.{ext}"));
+            }
+        }
+        corpus.extend(
+            [
+                "LEIAME",
+                "arquivo.tar.gz",
+                "imagem.svg",
+                "pagina.html",
+                "rel\u{200D}atorio.pdf",
+                "setup.exe",
+                "livro.epub.docm",
+            ]
+            .map(str::to_string),
+        );
+        let mut allowed = 0usize;
+        for name in &corpus {
+            let path = temp.file(name, b"texto inofensivo");
+            let target = default_app_target(&path).is_some();
+            assert_eq!(
+                default_app_name_allowed(name),
+                target,
+                "{name:?}: o nome e o alvo divergem"
+            );
+            allowed += usize::from(target);
+        }
+        assert!(corpus.len() > 400, "corpus curto: {}", corpus.len());
+        assert!(allowed >= 2 * DEFAULT_APP_ALLOWLIST.len(), "{allowed}");
+        for refused in [
+            "macro.docm",
+            "app.hta",
+            "link.url",
+            "atalho.lnk",
+            "busca.search-ms",
+            "biblioteca.library-ms",
+            "ajuda.chm",
+            "setup.exe",
+            "imagem.svg",
+            "pagina.html",
+            "arquivo.zip",
+            "LEIAME",
+        ] {
+            assert!(!default_app_name_allowed(refused), "{refused}");
+        }
+        for offered in ["relatorio.pdf", "foto.PNG", "notas.txt", "musica.mp3"] {
+            assert!(default_app_name_allowed(offered), "{offered}");
+        }
     }
 }
