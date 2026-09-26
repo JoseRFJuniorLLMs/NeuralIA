@@ -332,9 +332,10 @@ go through one module, `crates/neural-app/src/windows_app/webview_hooks.rs`:
   the module), and after the build they register through WebView2 COM, for
   the same host, the NeuralIA items of the right-click menu
   (`WEBVIEW_MENU_ITEMS`: today only the auto-scroll item, on the columns and
-  on the split, private included) and an `AcceleratorKeyPressed` handler that
-  consults `accelerator_lookup` (`install_webview_hooks`, private to the
-  module).
+  on the split, private included), an `AcceleratorKeyPressed` handler that
+  consults `accelerator_lookup` and, on every `Managed` host, the download
+  manager (`install_webview_hooks`, private to the module; see "Downloads"
+  below).
 
 The host a birth site passes to `hooked_builder` is therefore the only host
 that WebView has, in both halves: a site cannot build without the chain, nor
@@ -368,3 +369,51 @@ the product does not yet wire to `WebResourceRequested`; the gate
 `custom_schemes_are_never_answered_by_the_resource_gate` already holds it to
 never answering a request on `neuralia-pdf`, `neuralia-epub` or
 `neuralia-live` (those are served by their wry custom protocols).
+
+### Downloads
+
+On every `Managed` host `register_download_manager`
+(`crates/neural-app/src/windows_app/downloads.rs`) adds a WebView2
+`DownloadStarting` handler and, when `downloads-settings.json` names an
+existing absolute folder, sets it as the profile's default download folder
+(`SetDefaultDownloadFolderPath`, the InPrivate profile included). The handler
+always takes the deferral and hands the download to the pure
+`neural_core::downloads::DownloadManager`, whose effects the app applies:
+
+- start (`decide_start`): a program, script, Windows shortcut, disk image or
+  Access database name is refused with `SetCancel` before any file exists;
+  a masquerade (`fatura.pdf.exe`, a padded extension) or a name with bidi,
+  invisible characters, `:` or a DOS device name is refused with no
+  exception; everything else proceeds. With "Permitir baixar programas" on,
+  a refusable program would wait for a confirmation instead; until that card
+  exists the app answers no, so programs are still refused;
+- progress: `BytesReceivedChanged`, throttled to one event every 250 ms per
+  download before it leaves the handler;
+- end: `StateChanged` forgets the WebView2 operation; a completed file is
+  finalized (`finalize_download`): the first 4 KiB are sniffed, an
+  unconfirmed executable, shortcut or cabinet (or an unreadable file) is
+  deleted, and anything kept gets the mark of the web (`Zone.Identifier`
+  alternate data stream, `ZoneId=3`, no `HostUrl`), written only when the
+  file has none;
+- a destroyed WebView: a guard inside the `DownloadStarting` handler sends
+  `WebViewGone` when WebView2 releases the handler, and the manager cancels
+  and forgets that WebView's running downloads. Whether destroying a WebView
+  cancels its download by itself, and when WebView2 releases the handler, is
+  the question of the spike in `scripts/test-downloads.ps1`, which only
+  reports it (in the CI log and the step summary).
+
+Finished downloads are recorded in `downloads.json` (at most 200, name,
+folder, host, size and outcome, never the full URL), an `Automatic` store:
+nothing from the private split or an InPrivate service panel is recorded,
+and nothing is written while the store registry is in private mode.
+Ctrl+Shift+Delete clears the list and leaves the files. Gates:
+`the_start_decision_table`, `the_finalize_decision_table`,
+`motw_is_written_and_read_back_through_the_ads`,
+`private_downloads_are_never_recorded` (neural-core) and
+`downloads_are_denied_on_every_local_host_and_managed_on_the_web`,
+`download_ops_follow_the_manager_and_are_cleared_on_finish_and_destroy`,
+`private_downloads_never_reach_downloads_json`, with
+`every_webview_gets_the_hooks` requiring the manager on every `Managed` host
+and on no `Deny` host. The CI-only `scripts/test-downloads.ps1` runs the
+tested exe against a 127.0.0.1 fixture: a `setup.exe` is refused and a PDF
+lands with the mark of the web.
