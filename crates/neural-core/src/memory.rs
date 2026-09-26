@@ -264,6 +264,14 @@ impl MemoryStore {
         &self.root
     }
 
+    /// Grava a sessao de pesquisa em `sessions/<id>.json` desta memoria. E a
+    /// unica porta publica para esse ficheiro (`ResearchSession::save` e do
+    /// crate): quem nao tem uma `MemoryStore` aberta nao escreve sessoes, e
+    /// no NeuralIA so o worker da memoria, aberto pelo `PrivacyGuard`, a tem.
+    pub fn save_session(&self, session: &ResearchSession) -> io::Result<PathBuf> {
+        session.save(&self.root)
+    }
+
     pub fn capture(&self, mut document: MemoryDocument) -> io::Result<CaptureOutcome> {
         if document.private {
             return Ok(CaptureOutcome::SkippedPrivate);
@@ -1602,7 +1610,7 @@ mod tests {
         let store = MemoryStore::new(&root).unwrap();
         let mut session = ResearchSession::new("forget me");
         session.id = "session-forget".into();
-        let session_path = session.save(&root).unwrap();
+        let session_path = store.save_session(&session).unwrap();
         assert_eq!(
             session_path,
             root.join("sessions").join("session-forget.json")

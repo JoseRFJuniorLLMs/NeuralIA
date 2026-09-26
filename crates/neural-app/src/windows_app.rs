@@ -2908,7 +2908,7 @@ impl MemoryWorker {
                             sink.send(UserEvent::MemoryCleared(result));
                         }
                         MemoryCommand::SaveSession(session) => {
-                            if let Err(error) = session.save(store.root()) {
+                            if let Err(error) = store.save_session(&session) {
                                 eprintln!("research session save failed: {error}");
                             }
                         }
@@ -4264,8 +4264,21 @@ impl TabPersistence {
     /// a sessao comeca limpa; um que nao se leu fica copiado antes da
     /// primeira gravacao (`SessionStore`).
     pub(crate) fn restore(&mut self) -> (RestoredTabs, Option<String>) {
+        let loaded = self.store.load();
+        self.restore_from(loaded)
+    }
+
+    /// A mesma restauracao sem escrever na pasta de dados (o modo privado,
+    /// pelo `PrivacyGuard::restore_tabs`): um ficheiro estragado fica onde
+    /// esta em vez de ir para o `tabs.json.bak` (`SessionStore::peek`).
+    pub(crate) fn restore_read_only(&mut self) -> (RestoredTabs, Option<String>) {
+        let loaded = self.store.peek();
+        self.restore_from(loaded)
+    }
+
+    fn restore_from(&mut self, loaded: Loaded) -> (RestoredTabs, Option<String>) {
         let empty = TabSession::default();
-        let (mut restored, notice) = match self.store.load() {
+        let (mut restored, notice) = match loaded {
             Loaded::Restored(session) => (restore_tab_session(&session), None),
             Loaded::Missing => (restore_tab_session(&empty), None),
             Loaded::Quarantined(error) => {
@@ -4274,6 +4287,15 @@ impl TabPersistence {
                     restore_tab_session(&empty),
                     Some(format!(
                         "Abas anteriores não restauradas: {error}. Cópia em tabs.json.bak."
+                    )),
+                )
+            }
+            Loaded::Refused(error) => {
+                debug_log(format_args!("tabs.json recusado (sem copia): {error:?}"));
+                (
+                    restore_tab_session(&empty),
+                    Some(format!(
+                        "Abas anteriores não restauradas: {error}. O arquivo ficou como estava."
                     )),
                 )
             }

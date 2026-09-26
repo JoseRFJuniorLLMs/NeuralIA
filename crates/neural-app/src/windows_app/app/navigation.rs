@@ -429,8 +429,12 @@ impl App {
                 self.show_splash("Buscando na memória local…".to_string(), 2);
             }
             InputRoute::MemoryRebuild => {
-                self.privacy.rebuild_memory();
-                self.show_splash("Reconstrução da memória agendada.".to_string(), 3);
+                let text = if self.privacy.rebuild_memory() {
+                    "Reconstrução da memória agendada."
+                } else {
+                    "Modo privado: a memória não é reconstruída."
+                };
+                self.show_splash(text.to_string(), 3);
             }
             InputRoute::History => self.show_recent_history(),
             InputRoute::Theme(Some(choice)) => self.choose_theme(choice),

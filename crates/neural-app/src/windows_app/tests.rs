@@ -24367,22 +24367,154 @@ fn registry_is_minted_once_and_owned_by_the_guard() {
     }
 }
 
+/// Cada ficheiro `.rs` que embarca de `crates/<krate>/src` -- sem os
+/// `tests.rs`, as pastas `tests/` e o spike (`accel_spike*`, nunca no exe
+/// publicado) --, como `(caminho a partir de crates/, codigo)`: sem o
+/// `mod tests` do fim, sem os `#[cfg(test)] mod x { ... }` do meio e so com
+/// o que compila (`rust_code_only`: comentarios e literais em branco). E a
+/// volta aos ficheiros dos gates do portao: um ficheiro novo entra sozinho,
+/// sem lista a manter.
+fn shipped_rust_files(krate: &str) -> Vec<(String, String)> {
+    fn shipped(path: &std::path::Path) -> bool {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let text = path.to_string_lossy().replace('\\', "/");
+        !(name.starts_with("test") || text.contains("/tests/") || name.starts_with("accel_spike"))
+    }
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("ler src") {
+            let path = entry.expect("entrada").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") && shipped(&path) {
+                out.push(path);
+            }
+        }
+    }
+
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut files = Vec::new();
+    walk(&crates.join(krate).join("src"), &mut files);
+    files.sort();
+    assert!(files.len() >= 20, "{krate}: so {} ficheiros?", files.len());
+    files
+        .into_iter()
+        .map(|file| {
+            let text = std::fs::read_to_string(&file).expect("ler o ficheiro");
+            let relative = file
+                .strip_prefix(&crates)
+                .expect("dentro de crates/")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let code = rust_code_only(&without_test_modules(&code_without_tests(&text)));
+            (relative, code)
+        })
+        .collect()
+}
+
+/// Os `use` de `code` (de `rust_code_only`), cada um numa linha so e com
+/// um espaco entre palavras: `use std::fs::{ self, File }`.
+fn use_statements(code: &str) -> Vec<String> {
+    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    code.split(';')
+        .filter_map(|segment| {
+            let at = segment
+                .match_indices("use")
+                .filter(|(at, _)| {
+                    !segment[..*at].chars().next_back().is_some_and(ident)
+                        && segment[at + 3..]
+                            .chars()
+                            .next()
+                            .is_some_and(char::is_whitespace)
+                })
+                .map(|(at, _)| at)
+                .last()?;
+            Some(
+                segment[at..]
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        })
+        .collect()
+}
+
+/// As palavras de um `use` (`as`, os caminhos, os nomes).
+fn use_words(statement: &str) -> Vec<&str> {
+    statement
+        .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
 /// Gate (critico, infra-privacy-guard; so de ausencia, §4.3): fora do
 /// `impl PrivacyGuard` (e dos proprios workers, onde as chamadas vivem)
 /// ninguem escreve o historico, a memoria nem as abas -- nem abre um
-/// `TabPersistence`, um `HistoryWriter`, um `MemoryWorker`, um
-/// `HistoryStore` ou um `MemoryStore` novo para o fazer por fora. E o
-/// guard olha para o modo (`writes_allowed`) antes de cada escrita
-/// automatica (o comportamento esta em
-/// `private_guard_turns_automatic_stores_into_noops`).
+/// `TabPersistence`, um `SessionStore`, um `HistoryWriter`, um
+/// `MemoryWorker`, um `HistoryStore` ou um `MemoryStore` novo para o fazer
+/// por fora, nem chama as funcoes soltas do `tab_session` que gravam, leem
+/// pondo de lado ou apagam o `tabs.json`. A sessao de pesquisa
+/// (`memory/sessions`) so se grava por `MemoryStore::save_session`
+/// (`ResearchSession::save` e do crate `neural-core`), e a `MemoryStore` so
+/// o worker da memoria a abre. Corre sobre TODOS os ficheiros que embarcam
+/// de `crates/neural-app/src` (a volta do `shipped_rust_files`), e recusa
+/// tambem um `use` que renomeie um destes escritores ou traga do
+/// `tab_session` um nome que escreve. E o guard olha para o modo
+/// (`writes_allowed`) antes de cada escrita automatica (o comportamento esta
+/// em `private_guard_turns_automatic_stores_into_noops`).
 #[test]
 fn history_memory_and_tabs_are_written_only_through_the_privacy_guard() {
-    let mut code = without_test_modules(&shipped_source());
-    for (_, source) in shipped_top_level_sources() {
-        code.push('\n');
-        code.push_str(&without_test_modules(&source));
+    let files = shipped_rust_files("neural-app");
+    // A volta ve os ficheiros de topo que a lista antiga deixava de fora.
+    for expected in [
+        "neural-app/src/main.rs",
+        "neural-app/src/notify.rs",
+        "neural-app/src/ipc.rs",
+        "neural-app/src/lazy_worker.rs",
+        "neural-app/src/privacy.rs",
+        "neural-app/src/tab_session.rs",
+        "neural-app/src/windows_app/app/tabs.rs",
+    ] {
+        assert!(
+            files.iter().any(|(name, _)| name == expected),
+            "{expected} fora da volta do gate"
+        );
     }
-    let code = without_comment_lines(&code);
+
+    const WRITERS: [&str; 7] = [
+        "HistoryStore",
+        "MemoryStore",
+        "TabPersistence",
+        "HistoryWriter",
+        "MemoryWorker",
+        "SessionStore",
+        "tab_session",
+    ];
+    let mut code = String::new();
+    let mut imports = Vec::new();
+    for (name, source) in &files {
+        code.push('\n');
+        code.push_str(source);
+        for statement in use_statements(source) {
+            let words = use_words(&statement);
+            let has = |word: &str| words.contains(&word);
+            let renamed = has("as") && WRITERS.iter().any(|writer| has(writer));
+            let from_tabs = has("tab_session")
+                && (statement.contains('*')
+                    || ["save", "clear", "load", "SessionStore"]
+                        .iter()
+                        .any(|item| has(item)));
+            if renamed || from_tabs {
+                imports.push(format!("{name}: {statement}"));
+            }
+        }
+    }
+    assert!(
+        imports.is_empty(),
+        "um use renomeia um escritor automatico ou traz do tab_session um nome que escreve \
+         (o gate so conta os nomes de sempre):\n{}",
+        imports.join("\n")
+    );
+
     let outside = without_impl_blocks(
         &code,
         &[
@@ -24396,10 +24528,16 @@ fn history_memory_and_tabs_are_written_only_through_the_privacy_guard() {
         ".history.append(",
         ".memory.capture(",
         ".memory.save_session(",
+        ".memory.rebuild(",
         ".tabs.save_now(",
         ".save_now(",
         ".save_due(",
+        ".restore_read_only(",
         "TabPersistence::open(",
+        "SessionStore::open(",
+        "tab_session::save(",
+        "tab_session::clear(",
+        "tab_session::load(",
         "HistoryWriter::new(",
         "MemoryWorker::new(",
         "HistoryStore::new(",
@@ -24421,8 +24559,10 @@ fn history_memory_and_tabs_are_written_only_through_the_privacy_guard() {
         "self.history.append(entry)",
         "self.memory.capture(document)",
         "self.memory.save_session(session)",
+        "self.memory.rebuild()",
         "self.tabs.save_now(contexts, groups, split)",
         "self.tabs.save_due(token, contexts, groups, split)",
+        "self.tabs.restore_read_only()",
     ] {
         assert!(guard.contains(required), "o guard perdeu {required}");
     }
@@ -24431,6 +24571,8 @@ fn history_memory_and_tabs_are_written_only_through_the_privacy_guard() {
         ("fn record(", "history_grant"),
         ("fn capture(", "memory_grant"),
         ("fn save_session(", "memory_grant"),
+        ("fn rebuild_memory(", "memory_grant"),
+        ("fn restore_tabs(", "tabs_grant"),
         ("fn save_tabs(", "tabs_grant"),
         ("fn save_tabs_due(", "tabs_grant"),
     ] {
@@ -24444,71 +24586,235 @@ fn history_memory_and_tabs_are_written_only_through_the_privacy_guard() {
             "{method} nao olha para o modo antes de escrever"
         );
     }
+    // O worker da memoria grava a sessao pela porta da MemoryStore.
+    let worker = impl_block(&code, "impl MemoryWorker {");
+    assert!(worker.contains("store.save_session(&session)"));
+}
+
+/// Uma pasta de dados nova e vazia para um gate do portao.
+fn guard_gate_dir(label: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "neuralia-privacy-guard-{label}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("pasta temporaria");
+    dir
+}
+
+/// Cada ficheiro debaixo de `dir`, pelo caminho relativo com `/`, e o que
+/// `read` tira dele. As pastas vazias nao contam: nao guardam nada.
+fn guard_gate_files<T>(
+    dir: &std::path::Path,
+    read: &dyn Fn(&std::path::Path) -> T,
+) -> std::collections::BTreeMap<String, T> {
+    fn walk<T>(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        read: &dyn Fn(&std::path::Path) -> T,
+        out: &mut std::collections::BTreeMap<String, T>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, read, out);
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("dentro da pasta")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.insert(relative, read(&path));
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, read, &mut out);
+    out
+}
+
+/// Os bytes de cada ficheiro debaixo de `dir`.
+fn guard_gate_snapshot(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    guard_gate_files(dir, &|path| std::fs::read(path).unwrap_or_default())
+}
+
+/// A hora da ultima escrita de cada ficheiro debaixo de `dir`: um ficheiro
+/// reescrito com os mesmos bytes (um indice reconstruido no mesmo segundo)
+/// tambem conta como escrito.
+fn guard_gate_stamps(
+    dir: &std::path::Path,
+) -> std::collections::BTreeMap<String, Option<std::time::SystemTime>> {
+    guard_gate_files(dir, &|path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    })
+}
+
+/// O que nasceu, mudou ou desapareceu entre duas fotografias.
+fn guard_gate_changes<T: PartialEq>(
+    before: &std::collections::BTreeMap<String, T>,
+    after: &std::collections::BTreeMap<String, T>,
+) -> Vec<String> {
+    after
+        .iter()
+        .filter(|(path, value)| before.get(*path) != Some(*value))
+        .map(|(path, _)| path.clone())
+        .chain(
+            before
+                .keys()
+                .filter(|path| !after.contains_key(*path))
+                .cloned(),
+        )
+        .collect()
+}
+
+/// A resposta do worker do historico (`HistoryLoaded`) e a do da memoria a
+/// `query`, pela ordem que chegarem; os outros eventos passam.
+fn guard_gate_answers(
+    events: &std::sync::mpsc::Receiver<UserEvent>,
+    query: &str,
+) -> (
+    Result<Vec<HistoryEntry>, String>,
+    Result<Vec<MemoryHit>, String>,
+) {
+    let (mut history, mut memory) = (None, None);
+    while history.is_none() || memory.is_none() {
+        match events.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(UserEvent::HistoryLoaded(result)) if history.is_none() => history = Some(result),
+            Ok(UserEvent::MemoryQueryReady {
+                query: asked,
+                result,
+            }) if asked == query && memory.is_none() => memory = Some(result),
+            Ok(_) => {}
+            Err(error) => panic!("os workers nao responderam: {error}"),
+        }
+    }
+    (history.expect("historico"), memory.expect("memoria"))
+}
+
+/// Os workers do historico e da memoria acabaram tudo o que tinham antes:
+/// um `Recent` e uma pesquisa vazia voltam depois do que entrou antes deles
+/// (uma fila cada).
+fn guard_gate_settle(guard: &PrivacyGuard, events: &std::sync::mpsc::Receiver<UserEvent>) {
+    assert!(guard.recent_history(1).is_none());
+    guard.query_memory(String::new());
+    let _ = guard_gate_answers(events, "");
+}
+
+/// `count` abas soltas na coluna 0.
+fn guard_gate_tabs(
+    count: u64,
+) -> (
+    [Vec<ContextTab>; COMPARATOR_COLUMNS],
+    [Vec<ContextGroup>; COMPARATOR_COLUMNS],
+) {
+    let mut contexts: [Vec<ContextTab>; COMPARATOR_COLUMNS] = std::array::from_fn(|_| Vec::new());
+    for id in 1..=count {
+        contexts[0].push(ContextTab {
+            id,
+            url: format!("https://exemplo.pt/aba-{id}"),
+            group: None,
+        });
+    }
+    (contexts, std::array::from_fn(|_| Vec::new()))
+}
+
+/// O que uma sessao conduzida pelo portao devolveu.
+struct GuardRun {
+    /// O aviso do `restore_tabs`.
+    notice: Option<String>,
+    /// O historico que o painel leu ao abrir.
+    history: Result<Vec<HistoryEntry>, String>,
+    /// O `SaveTabSession(token)` do fim do atraso.
+    due: Option<std::io::Result<TabSave>>,
+    /// O mesmo com um bilhete ja ultrapassado.
+    stale: Option<std::io::Result<TabSave>>,
+    /// A gravacao do fecho (`save_tabs`).
+    now: std::io::Result<TabSave>,
+    /// `memory:rebuild` agendado.
+    rebuilt: bool,
+}
+
+/// Tudo o que o App faz pelo portao numa sessao, pela ordem de quem usa:
+/// abre o comparador (`restore_tabs`) e o painel (`recent_history`,
+/// `query_memory`), navega (`record`, `capture`, `save_session`), muda as
+/// abas (o atraso: `observe_tabs` + `save_tabs_due`, e um bilhete
+/// ultrapassado que nao grava), fecha (`save_tabs`) e pede `memory:rebuild`.
+/// Volta depois de os workers acabarem tudo.
+fn drive_guard_session(
+    guard: &mut PrivacyGuard,
+    events: &std::sync::mpsc::Receiver<UserEvent>,
+) -> GuardRun {
+    let (_restored, notice) = guard.restore_tabs();
+    assert!(
+        guard.recent_history(10).is_none(),
+        "o historico foi lido no event loop"
+    );
+    guard.query_memory("pagina lida".to_string());
+    let (history, _) = guard_gate_answers(events, "pagina lida");
+
+    guard.record(HistoryEntry::now(
+        HistoryKind::Web,
+        "https://exemplo.pt/pagina",
+        "https://exemplo.pt/pagina",
+    ));
+    guard.capture(MemoryDocument::new(
+        MemoryKind::Source,
+        MemorySourceKind::Web,
+        "Uma pagina lida".to_string(),
+        Some("https://exemplo.pt/pagina".to_string()),
+        "O corpo de uma pagina lida, com texto que chegue para um documento da memoria."
+            .to_string(),
+    ));
+    guard.save_session(ResearchSession::new("uma pergunta"));
+
+    let (mut contexts, mut groups) = guard_gate_tabs(1);
+    let token = guard
+        .observe_tabs(&contexts, &groups, None)
+        .expect("o modelo mudou: a gravacao agenda-se");
+    let due = guard.save_tabs_due(token, &mut contexts, &mut groups, None);
+    let (mut contexts, mut groups) = guard_gate_tabs(2);
+    let newer = guard
+        .observe_tabs(&contexts, &groups, None)
+        .expect("mudou outra vez");
+    assert_ne!(newer, token);
+    let stale = guard.save_tabs_due(token, &mut contexts, &mut groups, None);
+    let now = guard.save_tabs(&mut contexts, &mut groups, None);
+    let rebuilt = guard.rebuild_memory();
+    guard_gate_settle(guard, events);
+    GuardRun {
+        notice,
+        history,
+        due,
+        stale,
+        now,
+        rebuilt,
+    }
 }
 
 /// Gate (critico, infra-privacy-guard): com o guard em `Private` (o
-/// construtor de teste, a unica porta), gravar historico, memoria, sessao
-/// e abas nao muda um byte da pasta de dados; as lojas `Explicit` e
-/// `Setting` pedidas ao mesmo guard continuam a gravar e uma `Automatic`
-/// nao. Em `Normal`, o mesmo guard e as mesmas chamadas escrevem o
-/// `history.jsonl`, a `memory/`, a sessao e o `tabs.json` -- o
-/// comportamento de sempre.
+/// construtor de teste, a unica porta), uma sessao inteira pelo portao --
+/// as leituras (`restore_tabs` com um `tabs.json` estragado,
+/// `recent_history`, `query_memory`), as escritas (`record`, `capture`,
+/// `save_session`, o atraso das abas `observe_tabs` + `save_tabs_due`, o
+/// fecho `save_tabs`) e `memory:rebuild` -- nao muda um byte nem reescreve
+/// um ficheiro (a hora da ultima escrita tambem conta) de uma pasta de
+/// dados que uma sessao `Normal` ja encheu, com a fotografia tirada ANTES de
+/// o guard nascer; numa pasta onde nunca correu uma sessao, o unico ficheiro
+/// que aparece e o `tabs.lock` vazio (o trinco da janela, SPEC-0006). As
+/// lojas `Explicit` e `Setting` pedidas ao mesmo guard continuam a gravar e
+/// uma `Automatic` nao. Em `Normal`, o mesmo guard e as mesmas chamadas
+/// escrevem o `history.jsonl`, a `memory/` (documentos, sessao, o indice do
+/// rebuild) e o `tabs.json`, pelo atraso e pelo fecho -- o comportamento de
+/// sempre.
 #[test]
 fn private_guard_turns_automatic_stores_into_noops() {
     use neural_core::json_store::{SaveOutcome, StoreKind, StoreShape, StoreSpec, TokenFile};
-    use std::collections::BTreeMap;
-    use std::sync::mpsc::{Receiver, channel};
-    use std::time::Duration;
-
-    fn snapshot(dir: &std::path::Path) -> BTreeMap<PathBuf, Vec<u8>> {
-        fn walk(dir: &std::path::Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    walk(&path, out);
-                } else {
-                    out.insert(path.clone(), std::fs::read(&path).unwrap_or_default());
-                }
-            }
-        }
-        let mut out = BTreeMap::new();
-        walk(dir, &mut out);
-        out
-    }
-
-    /// O worker do historico e o da memoria acabaram tudo o que tinham
-    /// antes: um `Recent` e uma pesquisa vazia voltam depois do que entrou
-    /// antes deles (uma fila cada).
-    fn settle(guard: &PrivacyGuard, events: &Receiver<UserEvent>) {
-        assert!(guard.recent_history(1).is_none());
-        guard.query_memory(String::new());
-        let (mut history, mut memory) = (false, false);
-        while !(history && memory) {
-            match events.recv_timeout(Duration::from_secs(30)) {
-                Ok(UserEvent::HistoryLoaded(_)) => history = true,
-                Ok(UserEvent::MemoryQueryReady { .. }) => memory = true,
-                Ok(_) => {}
-                Err(error) => panic!("os workers nao responderam: {error}"),
-            }
-        }
-    }
-
-    fn one_tab() -> (
-        [Vec<ContextTab>; COMPARATOR_COLUMNS],
-        [Vec<ContextGroup>; COMPARATOR_COLUMNS],
-    ) {
-        let mut contexts: [Vec<ContextTab>; COMPARATOR_COLUMNS] =
-            std::array::from_fn(|_| Vec::new());
-        contexts[0].push(ContextTab {
-            id: 1,
-            url: "https://exemplo.pt/aba".to_string(),
-            group: None,
-        });
-        (contexts, std::array::from_fn(|_| Vec::new()))
-    }
+    use std::sync::mpsc::channel;
 
     const SETTING: StoreSpec = StoreSpec::new("gate-setting", StoreKind::Setting, StoreShape::File);
     const EXPLICIT: StoreSpec =
@@ -24516,125 +24822,291 @@ fn private_guard_turns_automatic_stores_into_noops() {
     const AUTOMATIC: StoreSpec =
         StoreSpec::new("gate-automatic", StoreKind::Automatic, StoreShape::File);
 
-    for mode in [PrivacyMode::Private, PrivacyMode::Normal] {
-        let dir = std::env::temp_dir().join(format!(
-            "neuralia-privacy-guard-{mode:?}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("pasta temporaria");
+    // 1. Normal, numa pasta nova: as mesmas chamadas escrevem.
+    let dir = guard_gate_dir("noops");
+    {
         let (tx, events) = channel::<UserEvent>();
-        let mut guard = PrivacyGuard::for_test(&dir, mode, EventSink::channel(tx));
-        assert_eq!(guard.mode(), mode);
-        // O arranque (a pasta da memoria, o `tabs.lock`) ja aconteceu: a
-        // base e o que uma sessao encontra ao abrir.
-        settle(&guard, &events);
-        let before = snapshot(&dir);
-
-        guard.record(HistoryEntry::now(
-            HistoryKind::Web,
-            "https://exemplo.pt/pagina",
-            "https://exemplo.pt/pagina",
-        ));
-        guard.capture(MemoryDocument::new(
-            MemoryKind::Source,
-            MemorySourceKind::Web,
-            "Uma pagina lida".to_string(),
-            Some("https://exemplo.pt/pagina".to_string()),
-            "O corpo de uma pagina lida, com texto que chegue para um documento da memoria."
-                .to_string(),
-        ));
-        guard.save_session(ResearchSession::new("uma pergunta"));
-        let (mut contexts, mut groups) = one_tab();
-        let saved = guard
-            .save_tabs(&mut contexts, &mut groups, None)
-            .expect("save_tabs");
-        settle(&guard, &events);
-        let after = snapshot(&dir);
-
-        let changed: Vec<String> = after
-            .iter()
-            .filter(|(path, bytes)| before.get(*path) != Some(*bytes))
-            .map(|(path, _)| path.display().to_string())
-            .chain(
-                before
-                    .keys()
-                    .filter(|path| !after.contains_key(*path))
-                    .map(|path| path.display().to_string()),
-            )
-            .collect();
-        let has = |name: &str| {
+        let mut guard = PrivacyGuard::for_test(&dir, PrivacyMode::Normal, EventSink::channel(tx));
+        assert_eq!(guard.mode(), PrivacyMode::Normal);
+        let run = drive_guard_session(&mut guard, &events);
+        let after = guard_gate_snapshot(&dir);
+        assert_eq!(run.notice, None);
+        assert_eq!(run.history.as_ref().map(Vec::len), Ok(0));
+        assert_eq!(
+            run.due.as_ref().map(|saved| saved.as_ref().ok()),
+            Some(Some(&TabSave::Written)),
+            "o fim do atraso nao gravou as abas"
+        );
+        assert!(run.stale.is_none(), "um bilhete ultrapassado gravou");
+        assert_eq!(run.now.as_ref().ok(), Some(&TabSave::Written));
+        assert!(run.rebuilt, "memory:rebuild nao se agendou");
+        let files: Vec<&String> = after.keys().collect();
+        assert!(
             after
-                .keys()
-                .any(|path| path.to_string_lossy().contains(name))
-        };
-        match mode {
-            PrivacyMode::Private => {
-                assert_eq!(saved, TabSave::SkippedPrivate);
-                assert!(
-                    changed.is_empty(),
-                    "o modo privado escreveu na pasta de dados: {changed:?}"
-                );
-                // As lojas do mesmo guard: Explicit e Setting gravam, Automatic nao.
-                for (spec, expected) in [
-                    (SETTING, SaveOutcome::Written),
-                    (EXPLICIT, SaveOutcome::Written),
-                    (AUTOMATIC, SaveOutcome::SkippedPrivate),
-                ] {
-                    let file = TokenFile::open(guard.store(spec).expect("grant")).expect("loja");
-                    assert_eq!(
-                        file.write_token("ligado").expect("gravar"),
-                        expected,
-                        "{}",
-                        spec.name
-                    );
-                    assert_eq!(
-                        file.path().exists(),
-                        expected == SaveOutcome::Written,
-                        "{} no disco",
-                        spec.name
-                    );
-                }
-            }
-            PrivacyMode::Normal => {
-                assert_eq!(saved, TabSave::Written);
-                assert!(has("history.jsonl"), "sem history.jsonl: {changed:?}");
-                assert!(
-                    after
-                        .iter()
-                        .any(|(path, bytes)| path.ends_with("history.jsonl")
-                            && String::from_utf8_lossy(bytes).contains("exemplo.pt/pagina")),
-                    "a entrada nao chegou ao history.jsonl"
-                );
-                assert!(has("tabs.json"), "sem tabs.json: {changed:?}");
-                assert!(
-                    changed
-                        .iter()
-                        .any(|path| path.contains("memory") && !path.contains("sessions")),
-                    "a captura nao chegou a memory/: {changed:?}"
-                );
-                assert!(
-                    changed.iter().any(|path| path.contains("sessions")),
-                    "a sessao nao chegou a memory/sessions: {changed:?}"
-                );
-                let file = TokenFile::open(guard.store(AUTOMATIC).expect("grant")).expect("loja");
-                assert_eq!(
-                    file.write_token("ligado").expect("gravar"),
-                    SaveOutcome::Written
-                );
-            }
+                .get("history.jsonl")
+                .is_some_and(|bytes| String::from_utf8_lossy(bytes).contains("exemplo.pt/pagina")),
+            "a entrada nao chegou ao history.jsonl: {files:?}"
+        );
+        assert!(
+            after
+                .get("tabs.json")
+                .is_some_and(|bytes| String::from_utf8_lossy(bytes).contains("exemplo.pt/aba-2")),
+            "o fecho nao gravou o tabs.json: {files:?}"
+        );
+        for prefix in ["memory/documents/", "memory/sessions/"] {
+            assert!(
+                files.iter().any(|path| path.starts_with(prefix)),
+                "nada em {prefix}: {files:?}"
+            );
         }
-        drop(guard);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            after.contains_key("memory/db/index-manifest.json"),
+            "o rebuild nao escreveu o indice: {files:?}"
+        );
+        let file = TokenFile::open(guard.store(AUTOMATIC).expect("grant")).expect("loja");
+        assert_eq!(
+            file.write_token("ligado").expect("gravar"),
+            SaveOutcome::Written
+        );
+        std::fs::remove_file(file.path()).expect("tirar a loja do gate");
     }
+
+    // 2. Private sobre a mesma pasta (um perfil com historico, memoria e
+    // abas), com o `tabs.json` estragado. A fotografia e tirada antes de o
+    // guard nascer: nenhuma leitura fica de fora.
+    std::fs::write(
+        dir.join("tabs.json"),
+        b"{ \"version\": 1, \"columns\": [ estragado",
+    )
+    .expect("tabs.json estragado");
+    let before = guard_gate_snapshot(&dir);
+    let stamps = guard_gate_stamps(&dir);
+    {
+        let (tx, events) = channel::<UserEvent>();
+        let mut guard = PrivacyGuard::for_test(&dir, PrivacyMode::Private, EventSink::channel(tx));
+        assert_eq!(guard.mode(), PrivacyMode::Private);
+        let run = drive_guard_session(&mut guard, &events);
+        let mut changed = guard_gate_changes(&before, &guard_gate_snapshot(&dir));
+        changed.extend(
+            guard_gate_changes(&stamps, &guard_gate_stamps(&dir))
+                .into_iter()
+                .map(|path| format!("{path} (reescrito)")),
+        );
+        assert!(
+            changed.is_empty(),
+            "o modo privado escreveu na pasta de dados: {changed:?}"
+        );
+        // As leituras continuam a ler.
+        assert!(
+            run.history.as_ref().is_ok_and(|entries| entries
+                .iter()
+                .any(|entry| entry.target.contains("exemplo.pt/pagina"))),
+            "o modo privado deixou de ler o historico: {:?}",
+            run.history
+        );
+        let notice = run.notice.expect("o tabs.json estragado tem aviso");
+        assert!(
+            notice.contains("ficou como estava") && !notice.contains(".bak"),
+            "{notice}"
+        );
+        assert_eq!(
+            run.due.as_ref().map(|saved| saved.as_ref().ok()),
+            Some(Some(&TabSave::SkippedPrivate)),
+            "o fim do atraso das abas nao respeitou o modo"
+        );
+        assert!(run.stale.is_none(), "um bilhete ultrapassado respondeu");
+        assert_eq!(run.now.as_ref().ok(), Some(&TabSave::SkippedPrivate));
+        assert!(!run.rebuilt, "memory:rebuild agendou-se no modo privado");
+
+        // As lojas do mesmo guard: Explicit e Setting gravam, Automatic nao.
+        for (spec, expected) in [
+            (SETTING, SaveOutcome::Written),
+            (EXPLICIT, SaveOutcome::Written),
+            (AUTOMATIC, SaveOutcome::SkippedPrivate),
+        ] {
+            let file = TokenFile::open(guard.store(spec).expect("grant")).expect("loja");
+            assert_eq!(
+                file.write_token("ligado").expect("gravar"),
+                expected,
+                "{}",
+                spec.name
+            );
+            assert_eq!(
+                file.path().exists(),
+                expected == SaveOutcome::Written,
+                "{} no disco",
+                spec.name
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // 3. Private numa pasta onde nunca correu uma sessao: so o trinco vazio
+    // das abas, que o guard abre ao nascer em qualquer modo (e as pastas
+    // vazias da memoria, que nao guardam nada).
+    let fresh = guard_gate_dir("noops-fresh");
+    {
+        let (tx, events) = channel::<UserEvent>();
+        let mut guard =
+            PrivacyGuard::for_test(&fresh, PrivacyMode::Private, EventSink::channel(tx));
+        let run = drive_guard_session(&mut guard, &events);
+        assert_eq!(run.notice, None);
+        assert_eq!(run.history.as_ref().map(Vec::len), Ok(0));
+        let after: Vec<(String, Vec<u8>)> = guard_gate_snapshot(&fresh).into_iter().collect();
+        assert_eq!(
+            after,
+            vec![("tabs.lock".to_string(), Vec::new())],
+            "o modo privado numa pasta nova"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&fresh);
+}
+
+/// As linhas da lista do E2E do modo privado (`$allowlist` do
+/// `scripts/test-private-mode.ps1`): `(Path, Kind)`.
+fn e2e_allowlist_rows(script: &str) -> Vec<(String, String)> {
+    let list = script
+        .split("$allowlist = @(\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n)\n").next())
+        .expect("$allowlist = @( ... ) no test-private-mode.ps1");
+    list.lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .map(|line| {
+            let field = |name: &str| {
+                line.split(&format!("{name} = '"))
+                    .nth(1)
+                    .and_then(|rest| rest.split('\'').next())
+                    .unwrap_or_else(|| panic!("linha da lista sem {name}: {line}"))
+                    .to_string()
+            };
+            (field("Path"), field("Kind"))
+        })
+        .collect()
+}
+
+/// Gate (critico, infra-privacy-guard): a lista do E2E do modo privado
+/// (`scripts/test-private-mode.ps1`, so CI) cobre tudo o que uma sessao
+/// `Normal` do `PrivacyGuard` deixa na pasta de dados. A sessao e a do
+/// `drive_guard_session` (o historico, o trinco dele, a memoria, a sessao
+/// de pesquisa, o indice, as abas e o trinco delas); cada ficheiro tem de
+/// cair numa linha pela mesma regra do `Find-AllowlistRow` (um caminho com
+/// `/` no fim cobre a pasta; os outros sao exatos, sem maiusculas), e essa
+/// linha tem de ser `Automatic`. Cada linha da lista tem tambem o seu
+/// caminho na tabela da fase 0 da SPEC-0006. Sem isto, o passo do CI ficava
+/// sempre vermelho (o `history.jsonl.lock` nao tinha linha) sem nenhum teste
+/// local o ver.
+#[test]
+fn the_e2e_allowlist_covers_a_normal_guard_session() {
+    use std::sync::mpsc::channel;
+
+    let script = include_str!("../../../../scripts/test-private-mode.ps1").replace("\r\n", "\n");
+    let spec =
+        include_str!("../../../../docs/specs/SPEC-0006-security-privacy.md").replace("\r\n", "\n");
+    // A regra que aqui se repete e a do script.
+    for rule in [
+        "if ($row.Path.EndsWith('/')) {",
+        "if ($Relative.StartsWith($row.Path, [StringComparison]::OrdinalIgnoreCase)) { return $row }",
+        "} elseif ($Relative -ieq $row.Path) {",
+    ] {
+        assert!(script.contains(rule), "o Find-AllowlistRow mudou: {rule}");
+    }
+    let rows = e2e_allowlist_rows(&script);
+    assert!(rows.len() >= 20, "a lista do E2E encolheu: {rows:?}");
+    let phase0 = spec
+        .split("### Phase 0")
+        .nth(1)
+        .expect("a tabela da fase 0 na SPEC-0006");
+    for (path, kind) in &rows {
+        assert!(
+            ["Automatic", "Setting", "Explicit"].contains(&kind.as_str()),
+            "{path}: tipo {kind}"
+        );
+        let cited = if path.ends_with('/') {
+            format!("`{path}")
+        } else {
+            format!("`{path}`")
+        };
+        assert!(
+            phase0.contains(&cited),
+            "{path}: na lista do E2E mas nao na tabela da fase 0 da SPEC-0006"
+        );
+    }
+    let row_for = |relative: &str| {
+        rows.iter().find(|(path, _)| {
+            if path.ends_with('/') {
+                relative
+                    .to_ascii_lowercase()
+                    .starts_with(&path.to_ascii_lowercase())
+            } else {
+                relative.eq_ignore_ascii_case(path)
+            }
+        })
+    };
+
+    let dir = guard_gate_dir("e2e-allowlist");
+    {
+        let (tx, events) = channel::<UserEvent>();
+        let mut guard = PrivacyGuard::for_test(&dir, PrivacyMode::Normal, EventSink::channel(tx));
+        let run = drive_guard_session(&mut guard, &events);
+        assert_eq!(run.now.as_ref().ok(), Some(&TabSave::Written));
+    }
+    let files = guard_gate_snapshot(&dir);
+    for required in [
+        "history.jsonl",
+        "history.jsonl.lock",
+        "tabs.json",
+        "tabs.lock",
+    ] {
+        assert!(
+            files.contains_key(required),
+            "a sessao nao deixou {required}: {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
+    }
+    assert!(files.keys().any(|path| path.starts_with("memory/")));
+    let mut uncovered = Vec::new();
+    for relative in files.keys() {
+        match row_for(relative) {
+            None => uncovered.push(relative.clone()),
+            Some((path, kind)) => assert_eq!(
+                kind, "Automatic",
+                "{relative} cai na linha {path}, que nao e Automatic"
+            ),
+        }
+    }
+    assert!(
+        uncovered.is_empty(),
+        "a sessao Normal deixou ficheiros sem linha na lista do E2E (o passo do CI fica \
+         vermelho com \"fora da lista\"): {uncovered:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Um `use` que importa uma escrita crua com um nome que o gate nao conta:
+/// uma funcao de `std::fs` solta (`use std::fs::write;` e depois
+/// `write(...)`) ou com outro nome, e um `File`, um `OpenOptions` ou uma
+/// `Connection` renomeados.
+fn evasive_write_import(statement: &str) -> bool {
+    let words = use_words(statement);
+    let has = |word: &str| words.contains(&word);
+    let renamed = has("as");
+    (has("fs") && (renamed || ["write", "rename", "copy"].iter().any(|word| has(word))))
+        || (renamed
+            && ["File", "OpenOptions", "Connection"]
+                .iter()
+                .any(|word| has(word)))
 }
 
 /// Gate (critico, infra-privacy-guard; so de ausencia): nenhum ficheiro
 /// que embarca escreve na pasta de dados por fora de um grant sem uma
 /// linha aqui com o porque -- a tabela da fase 0 (SPEC-0006, «Persistence
 /// chokepoint»). Conta `fs::write`, `File::create`, `OpenOptions::new`,
-/// `fs::rename` e `fs::copy` no codigo que embarca de
-/// `crates/neural-app/src` e `crates/neural-core/src`, testes tirados;
+/// `File::options` (o mesmo `OpenOptions`), `fs::rename`, `fs::copy` e
+/// `Connection::open*` (o SQLite) no codigo que embarca de
+/// `crates/neural-app/src` e `crates/neural-core/src` (a volta do
+/// `shipped_rust_files`: testes, comentarios e literais tirados), e recusa
+/// um `use` que traga uma dessas escritas com um nome que ele nao conta;
 /// `json_store.rs` e o mecanismo e fica de fora. Um ficheiro novo com uma
 /// escrita crua, ou um ja listado com mais uma, fica vermelho ate a tabela
 /// e esta lista dizerem porque (ou ate a escrita passar a um grant).
@@ -24642,12 +25114,14 @@ fn private_guard_turns_automatic_stores_into_noops() {
 fn no_raw_data_dir_write_outside_a_grant() {
     use std::collections::BTreeMap;
 
-    const PATTERNS: [&str; 5] = [
+    const PATTERNS: [&str; 7] = [
         "fs::write(",
         "File::create(",
         "OpenOptions::new(",
+        "File::options(",
         "fs::rename(",
         "fs::copy(",
+        "Connection::open",
     ];
     // (ficheiro, escritas cruas, porque) -- a mesma tabela da SPEC-0006.
     const ALLOWLIST: &[(&str, usize, &str)] = &[
@@ -24714,7 +25188,7 @@ fn no_raw_data_dir_write_outside_a_grant() {
         (
             "neural-core/src/history.rs",
             3,
-            "history.jsonl (Automatic): o caminho vem do grant do guard e so PrivacyGuard::record escreve",
+            "history.jsonl e history.jsonl.lock (Automatic): o caminho vem do grant do guard e so PrivacyGuard::record escreve",
         ),
         (
             "neural-core/src/library.rs",
@@ -24733,8 +25207,8 @@ fn no_raw_data_dir_write_outside_a_grant() {
         ),
         (
             "neural-core/src/memory/sqlite_v01.rs",
-            4,
-            "memory/: o indice SQLite derivado dos documentos que o guard deixou entrar",
+            5,
+            "memory/: o indice SQLite derivado dos documentos que o guard deixou entrar (Connection::open e os renames do rebuild)",
         ),
         (
             "neural-core/src/research.rs",
@@ -24748,42 +25222,22 @@ fn no_raw_data_dir_write_outside_a_grant() {
         ),
     ];
 
-    fn shipped(path: &std::path::Path) -> bool {
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        let text = path.to_string_lossy().replace('\\', "/");
-        !(name.starts_with("test") || text.contains("/tests/") || name.starts_with("accel_spike"))
-    }
-    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("ler src") {
-            let path = entry.expect("entrada").path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|ext| ext == "rs") && shipped(&path) {
-                out.push(path);
-            }
-        }
-    }
-
-    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut found: BTreeMap<String, usize> = BTreeMap::new();
+    let mut problems = Vec::new();
     for krate in ["neural-app", "neural-core"] {
-        let src = crates.join(krate).join("src");
-        let mut files = Vec::new();
-        walk(&src, &mut files);
-        assert!(files.len() >= 20, "{krate}: so {} ficheiros?", files.len());
-        for file in files {
-            let text = std::fs::read_to_string(&file).expect("ler o ficheiro");
-            let code = without_comment_lines(&without_test_modules(&code_without_tests(&text)));
+        for (relative, code) in shipped_rust_files(krate) {
+            for statement in use_statements(&code) {
+                if evasive_write_import(&statement) {
+                    problems.push(format!(
+                        "{relative}: `{statement}` traz uma escrita crua com um nome que o gate nao conta"
+                    ));
+                }
+            }
             let writes: usize = PATTERNS
                 .iter()
                 .map(|pattern| code.matches(pattern).count())
                 .sum();
             if writes > 0 {
-                let relative = file
-                    .strip_prefix(&crates)
-                    .expect("dentro de crates/")
-                    .to_string_lossy()
-                    .replace('\\', "/");
                 found.insert(relative, writes);
             }
         }
@@ -24795,7 +25249,6 @@ fn no_raw_data_dir_write_outside_a_grant() {
         "json_store.rs deixou de ser o mecanismo que escreve"
     );
 
-    let mut problems = Vec::new();
     for (file, writes) in &found {
         match ALLOWLIST.iter().find(|(listed, _, _)| listed == file) {
             None => problems.push(format!(

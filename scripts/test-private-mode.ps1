@@ -30,11 +30,16 @@ $node = (Get-Command node -ErrorAction Stop).Source
 $utf8 = [Text.UTF8Encoding]::new($false)
 
 # A lista (SPEC-0006, tabela da fase 0). Um caminho que acaba em "/" cobre a
-# pasta inteira. Kind: Automatic = efeito lateral do uso (o que o modo
-# privado vai deixar de escrever); Setting = escolha num menu; Explicit = o
-# utilizador pediu para guardar.
+# pasta inteira; os outros sao um ficheiro exato (os trincos `.lock` ao lado
+# de uma loja tem a sua linha). Kind: Automatic = efeito lateral do uso (o
+# que o modo privado vai deixar de escrever); Setting = escolha num menu;
+# Explicit = o utilizador pediu para guardar. O gate
+# `the_e2e_allowlist_covers_a_normal_guard_session` (windows_app/tests.rs)
+# le esta lista e o Find-AllowlistRow abaixo, conduz uma sessao Normal do
+# PrivacyGuard e falha se ela deixar um ficheiro sem linha.
 $allowlist = @(
     @{ Path = 'history.jsonl'; Kind = 'Automatic'; Why = 'o historico cronologico, so pelo PrivacyGuard::record' }
+    @{ Path = 'history.jsonl.lock'; Kind = 'Automatic'; Why = 'o trinco dos escritores do historico (HistoryStore): nasce na primeira gravacao e fica' }
     @{ Path = 'memory/'; Kind = 'Automatic'; Why = 'a memoria semantica (documentos, wiki, indice SQLite derivado, sessions/), so pelo PrivacyGuard::capture/save_session' }
     @{ Path = 'tabs.json'; Kind = 'Automatic'; Why = 'as abas e os grupos do comparador, so pelo PrivacyGuard::save_tabs' }
     @{ Path = 'tabs.lock'; Kind = 'Automatic'; Why = 'o trinco da primeira janela (aberto pelo PrivacyGuard)' }

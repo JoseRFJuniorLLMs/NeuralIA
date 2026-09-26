@@ -7,14 +7,17 @@
 //! efeito lateral de navegar: o historico (`HistoryWriter`), a memoria
 //! semantica (`MemoryWorker`) e as abas (`TabPersistence`). O `App` nunca ve
 //! esses tres nem o registo: grava pelo guard (`record`, `capture`,
-//! `save_session`, `save_tabs`) e pede grants pelo guard (`store`). Enquanto
-//! o modo disser `Private`, as gravacoes `Automatic` nao fazem nada; hoje o
-//! produto so conhece `Normal` -- `Private` chega com o private-mode-core e
-//! ate la so existe pelo construtor de teste.
+//! `save_session`, `save_tabs`, `save_tabs_due`, `rebuild_memory`) e pede
+//! grants pelo guard (`store`). Enquanto o modo disser `Private`, as
+//! gravacoes `Automatic` nao fazem nada e as leituras (`recent_history`,
+//! `query_memory`, `restore_tabs`) nao escrevem; hoje o produto so conhece
+//! `Normal` -- `Private` chega com o private-mode-core e ate la so existe
+//! pelo construtor de teste.
 //!
 //! Gates (`windows_app/tests.rs`): `registry_is_minted_once_and_owned_by_the_guard`,
 //! `history_memory_and_tabs_are_written_only_through_the_privacy_guard`,
 //! `private_guard_turns_automatic_stores_into_noops`,
+//! `the_e2e_allowlist_covers_a_normal_guard_session`,
 //! `no_raw_data_dir_write_outside_a_grant`.
 
 use neural_core::json_store::{
@@ -154,7 +157,9 @@ impl PrivacyGuard {
         self.history.append(entry);
     }
 
-    /// As `limit` entradas mais recentes, pelo worker (`HistoryLoaded`).
+    /// As `limit` entradas mais recentes, pelo worker (`HistoryLoaded`). Le,
+    /// em qualquer modo; numa pasta onde nunca se gravou historico nao cria
+    /// o `history.jsonl.lock` (`HistoryStore::recent`).
     pub(crate) fn recent_history(&self, limit: usize) -> Option<Result<Vec<HistoryEntry>, String>> {
         self.history.recent(limit)
     }
@@ -184,13 +189,22 @@ impl PrivacyGuard {
     }
 
     /// Uma pesquisa na memoria (`MemoryQueryReady`): le, em qualquer modo.
+    /// So um indice que nao e o de agora (o da v2.0.x, ou o que um rebuild
+    /// interrompido deixou) e reparado na pesquisa: dados derivados, nada de
+    /// novo (SPEC-0006, excecoes da fase 0).
     pub(crate) fn query_memory(&self, query: String) {
         self.memory.query(query);
     }
 
     /// `memory:rebuild`: o indice derivado dos documentos que ja la estao.
-    pub(crate) fn rebuild_memory(&self) {
+    /// Reescreve o SQLite e o manifesto de `memory/db` (`Automatic`): no modo
+    /// privado nao faz nada e devolve `false` (nada agendado).
+    pub(crate) fn rebuild_memory(&self) -> bool {
+        if !self.memory_grant.writes_allowed() {
+            return false;
+        }
         self.memory.rebuild();
+        true
     }
 
     /// "Apagar historico": esquece tambem a sessao viva. Em qualquer modo.
@@ -200,8 +214,13 @@ impl PrivacyGuard {
 
     // ----- as abas (`tabs.json`, Automatic) -----
 
-    /// As abas da sessao anterior e o aviso para o dono, se houver.
+    /// As abas da sessao anterior e o aviso para o dono, se houver. No modo
+    /// privado le sem escrever: um `tabs.json` estragado fica onde esta, sem
+    /// ir para o `tabs.json.bak`.
     pub(crate) fn restore_tabs(&mut self) -> (RestoredTabs, Option<String>) {
+        if !self.tabs_grant.writes_allowed() {
+            return self.tabs.restore_read_only();
+        }
         self.tabs.restore()
     }
 
