@@ -9031,13 +9031,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
 /// O que um atalho corre, pelo caminho do produto: o `RunCommandKey` da
-/// decisao resolvido contra a origem que veio com ele (em Debug; o
-/// `UserEvent` nao tem `PartialEq`). `None`: tecla nao tratada, ou um
-/// comando que nada faz dali.
+/// decisao entregue inteiro a `command_key_event`, como o event loop o
+/// entrega (em Debug; o `UserEvent` nao tem `PartialEq`). `None`: tecla nao
+/// tratada, ou um comando que nada faz dali.
 fn chord_command_event(decision: &AcceleratorDecision) -> Option<String> {
     match &decision.event {
-        Some(UserEvent::RunCommandKey { key, origin }) => {
-            resolve_command(*key, *origin).map(|event| format!("{event:?}"))
+        Some(press @ UserEvent::RunCommandKey { .. }) => {
+            command_key_event(press).map(|event| format!("{event:?}"))
         }
         Some(other) => panic!("a decisao deu um evento que nao e um comando: {other:?}"),
         None => None,
@@ -9179,7 +9179,7 @@ fn accelerator_lookup_binds_no_webview_chord_today() {
                     ..press(chord)
                 },
             ] {
-                let decision = accelerator_lookup(host, input);
+                let decision = accelerator_lookup(product_keymap(), host, input);
                 assert!(!decision.handled, "{host:?} {chord:?} {input:?}");
                 assert!(decision.event.is_none(), "{host:?} {chord:?} {input:?}");
                 consulted += 1;
@@ -9558,7 +9558,7 @@ fn provider_hosts_never_bind_the_chatgpt_chords() {
         {
             providers += 1;
             for chord in PROVIDER_DENYLIST {
-                let decision = accelerator_lookup_in(&lock, host, press(chord));
+                let decision = accelerator_lookup(&lock, host, press(chord));
                 assert!(
                     !decision.handled && decision.event.is_none(),
                     "{host:?} prendeu {chord:?}"
@@ -9590,7 +9590,10 @@ fn provider_hosts_never_bind_the_chatgpt_chords() {
     // E o mapa do produto, pelo slot.
     for host in every_host() {
         for chord in PROVIDER_DENYLIST {
-            assert!(!accelerator_lookup(host, press(chord)).handled, "{host:?}");
+            assert!(
+                !accelerator_lookup(product_keymap(), host, press(chord)).handled,
+                "{host:?}"
+            );
         }
     }
 }
@@ -9698,8 +9701,9 @@ fn files_override_wins_only_in_files() {
 
 /// Gate (critico: uma pagina nao sintetiza comandos): o comando leva a
 /// origem que o handler recebeu no registo -- o hospedeiro -- e nada da
-/// pagina. O slot dos ganchos, com um mapa com um atalho global, devolve em
-/// cada hospedeiro o `RunCommandKey` com esse hospedeiro (o monitor do
+/// pagina. `accelerator_lookup`, a MESMA funcao que o handler chama (ele
+/// passa-lhe o mapa do produto), com um mapa com um atalho global, devolve
+/// em cada hospedeiro o `RunCommandKey` com esse hospedeiro (o monitor do
 /// Gmail nao tem teclado). E so a decisao constroi um `RunCommandKey`:
 /// nenhum canal das paginas o faz (asserção de ausencia).
 #[test]
@@ -9710,7 +9714,7 @@ fn a_command_key_carries_the_host_it_came_from() {
             .expect("mapa de teste"),
     );
     for host in every_host() {
-        let decision = accelerator_lookup_in(&lock, host, press(ctrl_j));
+        let decision = accelerator_lookup(&lock, host, press(ctrl_j));
         if host == WebViewHost::GmailMonitor {
             assert!(!decision.handled && decision.event.is_none());
             continue;
@@ -9740,13 +9744,20 @@ fn a_command_key_carries_the_host_it_came_from() {
             );
         }
     }
-    // So a decisao o constroi e so o event loop o corre; nenhum canal das
-    // paginas (o IPC, o painel, os livros, o Live, os scripts) o nomeia.
+    // So a decisao o constroi e so o event loop o corre (o braco entrega-o
+    // inteiro, `command_key_event` le-o); nenhum canal das paginas (o IPC,
+    // o painel, os livros, o Live, os scripts) o nomeia.
     let source = shipped_source();
-    assert_eq!(source.matches("RunCommandKey {").count(), 3);
+    assert_eq!(source.matches("RunCommandKey {").count(), 4);
     assert_eq!(
         source
-            .matches("UserEvent::RunCommandKey { key, origin } =>")
+            .matches("press @ UserEvent::RunCommandKey { .. } =>")
+            .count(),
+        1
+    );
+    assert_eq!(
+        source
+            .matches("let &UserEvent::RunCommandKey { key, origin } = press else {")
             .count(),
         1
     );
@@ -9771,6 +9782,116 @@ fn a_command_key_carries_the_host_it_came_from() {
         assert!(
             !channel.contains("RunCommandKey"),
             "{name} nomeia RunCommandKey"
+        );
+    }
+}
+
+/// Gate (critico: uma pagina nao sintetiza comandos): o event loop corre um
+/// `RunCommandKey` contra a origem que veio com ele. O braco entrega o
+/// evento inteiro a `command_key_event` -- a funcao que este gate chama --
+/// e ela corre o comando contra a origem do proprio evento: da janela e da
+/// omnibox, Ctrl+Shift+Z e a nota da janela (nao a de uma pagina); de cada
+/// hospedeiro, pelo `accelerator_lookup` que o handler chama, o recarregar
+/// e a nota dessa pagina (nao os da Web externa). E o braco nao escolhe
+/// origem (asserção de ausencia): nao desmonta o evento nem chama
+/// `resolve_command`.
+#[test]
+fn a_command_key_runs_against_the_origin_it_carries() {
+    use CommandId::{NewNote, Reload};
+    let debug = |event: Option<UserEvent>| event.map(|event| format!("{event:?}"));
+    // Cada comando de cada origem: o que `resolve_command` da dali.
+    for id in CommandId::ALL {
+        for origin in every_origin() {
+            assert_eq!(
+                debug(command_key_event(&UserEvent::RunCommandKey {
+                    key: id,
+                    origin
+                })),
+                debug(resolve_command(id, origin)),
+                "{id:?} {origin:?}"
+            );
+        }
+    }
+    // Um evento que nao e um atalho nao corre nada.
+    assert!(command_key_event(&UserEvent::HomeRequested).is_none());
+    assert!(command_key_event(&UserEvent::NewNote).is_none());
+    // A janela e a omnibox, pelo mapa do produto: a nota da janela.
+    let ctrl_shift_z = Chord::ctrl_shift(b'Z');
+    for origin in [CommandOrigin::Window, CommandOrigin::Omnibox] {
+        assert_eq!(
+            chord_command_event(&keymap_decision(press(ctrl_shift_z), origin)),
+            Some(format!("{:?}", UserEvent::NewNote)),
+            "{origin:?}"
+        );
+    }
+    // Cada hospedeiro, com o recarregar e a nota globais num mapa de teste.
+    let reload = Chord::ctrl(b'J');
+    let note = Chord::ctrl(b'K');
+    let lock = RwLock::new(
+        Keymap::build(&[
+            test_row(Reload, &[(KeyScope::Global, reload)]),
+            test_row(NewNote, &[(KeyScope::Global, note)]),
+        ])
+        .expect("mapa de teste"),
+    );
+    let external = |id: CommandId| {
+        debug(resolve_command(
+            id,
+            CommandOrigin::Host(WebViewHost::External),
+        ))
+    };
+    let mut distinct = HashSet::new();
+    let mut not_external = 0usize;
+    for host in every_host() {
+        for (id, chord) in [(Reload, reload), (NewNote, note)] {
+            let got = chord_command_event(&accelerator_lookup(&lock, host, press(chord)));
+            assert_eq!(
+                got,
+                debug(resolve_command(id, CommandOrigin::Host(host))),
+                "{host:?} {id:?}"
+            );
+            not_external += usize::from(got != external(id));
+            distinct.insert(got);
+        }
+    }
+    // A origem conta: as colunas, o Split e o Split privado recarregam-se a
+    // si (cada um o seu evento), e so a Web, o Leitor e o PDF dao o da Web.
+    assert!(distinct.len() >= 2 * COMPARATOR_COLUMNS + 2, "{distinct:?}");
+    assert!(not_external >= 3 * COMPARATOR_COLUMNS, "{not_external}");
+    for col in 0..COMPARATOR_COLUMNS {
+        assert_ne!(
+            chord_command_event(&accelerator_lookup(
+                &lock,
+                WebViewHost::Column(col),
+                press(reload)
+            )),
+            external(Reload),
+            "coluna {col}"
+        );
+    }
+    // O braco do event loop entrega o evento inteiro e nao escolhe origem.
+    let event_loop_rs = ALL_MODULES
+        .iter()
+        .find(|(name, _)| *name == "app/event_loop.rs")
+        .map(|(_, content)| content.replace("\r\n", "\n"))
+        .expect("app/event_loop.rs em ALL_MODULES");
+    assert_eq!(
+        event_loop_rs
+            .matches(
+                "press @ UserEvent::RunCommandKey { .. } => {\n                \
+                 if let Some(event) = command_key_event(&press) {\n"
+            )
+            .count(),
+        1
+    );
+    for forbidden in [
+        "resolve_command(",
+        "RunCommandKey { key",
+        "RunCommandKey { origin",
+    ] {
+        assert!(
+            !event_loop_rs.contains(forbidden),
+            "o event loop escolhe o comando ou a origem: {forbidden}"
         );
     }
 }
@@ -10175,8 +10296,37 @@ fn the_accelerator_callback_calls_out_to_nothing() {
         .nth(1)
         .and_then(|rest| rest.split("\n    }));\n").next())
         .expect("o handler do AcceleratorKeyPressed");
-    assert!(handler.contains("accelerator_lookup("));
     assert!(handler.contains("proxy.send_event(event)"));
+    // O handler chama `accelerator_lookup` -- a funcao dos gates -- sobre o
+    // mapa do produto com o hospedeiro deste registo, uma vez; e nada no
+    // registo nomeia outro hospedeiro nem outra origem (asserção de
+    // ausencia): o `host` que chega a `accelerator_lookup` e o que o
+    // `ComHookRegistrar` recebeu de `install_hooks_with`.
+    assert_eq!(
+        handler
+            .matches("let decision = accelerator_lookup(product_keymap(), host, input);")
+            .count(),
+        1
+    );
+    assert_eq!(handler.matches("accelerator_lookup(").count(), 1);
+    let register = hooks
+        .split("fn register_webview_accelerators(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("register_webview_accelerators");
+    for forbidden in ["WebViewHost::", "CommandOrigin", "let host", "host ="] {
+        assert!(
+            !register.contains(forbidden),
+            "o registo do AcceleratorKeyPressed nomeia {forbidden}"
+        );
+    }
+    assert_eq!(hooks.matches("register_webview_accelerators(").count(), 2);
+    assert_eq!(
+        hooks
+            .matches("register_webview_accelerators(self.webview, host, self.proxy.clone())")
+            .count(),
+        1
+    );
     let calls: Vec<&str> = handler
         .match_indices("args.")
         .map(|(at, _)| {

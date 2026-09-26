@@ -8,8 +8,10 @@ use super::*;
 // paleta, as palavras que o procuram, os atalhos -- cada um com o seu
 // ambito (`KeyScope`, em `keymap.rs`) -- e o alias da omnibox, quando ha
 // um. `resolve_command(id, origem)` diz o que o comando faz a partir de
-// onde foi pedido, e o event loop corre so o evento que ela devolve
-// (`UserEvent::RunCommandKey`).
+// onde foi pedido, e o event loop corre so o evento que ela devolve para
+// um `UserEvent::RunCommandKey` -- por `command_key_event`, que le o
+// comando e a origem do proprio evento (o event loop entrega-lhe o evento
+// inteiro e nao escolhe origem nenhuma).
 //
 // Regra (critica C13 do plano 2.3): um atalho entra no MESMO PR que o seu
 // comando. Este registo traz so o que a 2.2.0 ja tinha -- os atalhos da
@@ -358,6 +360,24 @@ pub(in crate::windows_app) fn resolve_command(
         },
         WebViewHost::GmailMonitor => None,
     }
+}
+
+/// O que um `UserEvent::RunCommandKey` corre no event loop: o evento que
+/// `resolve_command` da para o comando contra a origem que veio COM a
+/// tecla, lida do proprio evento -- o braco do event loop entrega-o inteiro
+/// e nao tem origem nenhuma para passar. `None` para qualquer outro evento
+/// e para um comando que nada faz dali. Nunca devolve outro
+/// `RunCommandKey` (um salto so).
+pub(in crate::windows_app) fn command_key_event(press: &UserEvent) -> Option<UserEvent> {
+    let &UserEvent::RunCommandKey { key, origin } = press else {
+        return None;
+    };
+    debug_log(format_args!(
+        "atalho: {} ({})",
+        key.key(),
+        origin.describe()
+    ));
+    resolve_command(key, origin)
 }
 
 /// O comando que um clique num alvo da barra corre (da janela), para a

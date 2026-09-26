@@ -502,6 +502,41 @@ jobs:
               New = @'
               keymap_decision_in(keymap, input, CommandOrigin::Host(WebViewHost::External))
           '@
+            },
+            @{
+              Label = "accelerator-handler-asks-for-another-host"
+              Test = "the_accelerator_callback_calls_out_to_nothing"
+              SourcePath = "crates/neural-app/src/windows_app/webview_hooks.rs"
+              Old = @'
+                  let decision = accelerator_lookup(product_keymap(), host, input);
+          '@
+              New = @'
+                  let decision = accelerator_lookup(product_keymap(), WebViewHost::External, input);
+          '@
+            },
+            @{
+              Label = "command-key-runs-from-another-origin"
+              Test = "a_command_key_runs_against_the_origin_it_carries"
+              SourcePath = "crates/neural-app/src/windows_app/commands.rs"
+              Old = @'
+              resolve_command(key, origin)
+          '@
+              New = @'
+              resolve_command(key, CommandOrigin::Host(WebViewHost::External))
+          '@
+            },
+            @{
+              Label = "event-loop-picks-the-command-origin"
+              Test = "a_command_key_runs_against_the_origin_it_carries"
+              SourcePath = "crates/neural-app/src/windows_app/app/event_loop.rs"
+              Old = @'
+                      press @ UserEvent::RunCommandKey { .. } => {
+                          if let Some(event) = command_key_event(&press) {
+          '@
+              New = @'
+                      UserEvent::RunCommandKey { key, .. } => {
+                          if let Some(event) = resolve_command(key, CommandOrigin::Host(WebViewHost::External)) {
+          '@
             }
           )
 

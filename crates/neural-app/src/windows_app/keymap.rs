@@ -40,9 +40,14 @@ use winit::keyboard::ModifiersState;
 // O spike de CI (infra-accel-spike) mediu o despacho nativo nos nove
 // hospedeiros sem fallback: com `Handled = TRUE` a pagina nunca ve o
 // keydown de um atalho preso, mas ainda recebe um ou dois `keypress` (o
-// caractere de controlo de um Ctrl+letra). Os atalhos das paginas -- o
-// `NEURALIA_KEYMAP_SCRIPT` e os dos sites -- ouvem o keydown: um atalho
-// preso nao os dispara; so uma pagina que reaja ao keypress o veria.
+// caractere de controlo de um Ctrl+letra). O spike prendia a descida, a
+// repeticao E a subida, e a sonda dele so ouvia `keydown` e `keypress`:
+// esta decisao deixa a subida passar (so a descida e a repeticao sao
+// tratadas), por isso a pagina recebe tambem o `keyup` de um atalho preso
+// -- o que o spike nao mediu. Os atalhos das paginas -- o
+// `NEURALIA_KEYMAP_SCRIPT` e os dos sites -- que ouvem o keydown nao
+// disparam num atalho preso; uma pagina que reaja ao `keypress` ou ao
+// `keyup` ve o toque (e nem essa faz correr o comando, que nasce aqui).
 //
 // Hoje nenhuma WebView prende atalho nenhum: os atalhos das paginas
 // continuam todos no `NEURALIA_KEYMAP_SCRIPT` (intocado), e o unico ambito

@@ -419,16 +419,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::OpenEpubDialog => self.open_epub_dialog(true),
-            // Um atalho do mapa de teclas: o comando corre contra a origem
-            // que veio com a tecla, pelo evento que `resolve_command` da
-            // (nunca outro `RunCommandKey`).
-            UserEvent::RunCommandKey { key, origin } => {
-                debug_log(format_args!(
-                    "atalho: {} ({})",
-                    key.key(),
-                    origin.describe()
-                ));
-                if let Some(event) = resolve_command(key, origin) {
+            // Um atalho do mapa de teclas: o evento vai inteiro para
+            // `command_key_event`, que corre o comando contra a origem que
+            // veio com a tecla (nunca outro `RunCommandKey`). Este braco nao
+            // le nem escolhe origem nenhuma.
+            press @ UserEvent::RunCommandKey { .. } => {
+                if let Some(event) = command_key_event(&press) {
                     self.user_event(event_loop, event);
                 }
             }

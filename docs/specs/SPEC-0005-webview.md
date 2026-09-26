@@ -360,10 +360,12 @@ The CI sabotage matrix proves it red with `reader-born-without-hooks` (the
 Reader built by wry's `build` directly) and `gmail-monitor-gets-web-chain`
 (the Gmail monitor born as `External`).
 
-`accelerator_lookup` is the keymap decision (`accelerator_decision` in
-`crates/neural-app/src/windows_app/keymap.rs`) over the product keymap, with
+`accelerator_lookup(keymap, host, input)` is the keymap decision
+(`accelerator_decision` in `crates/neural-app/src/windows_app/keymap.rs`) with
 the host the handler was registered for as the command origin; the handler
-only sets `Handled` when the decision binds the key. The keymap is built from
+calls it with the product keymap (`product_keymap()`) and that host, names no
+other host, and only sets `Handled` when the decision binds the key. The gates
+call the same function with test keymaps. The keymap is built from
 the command registry (`COMMANDS` in `windows_app/commands.rs`: one row per
 command, with its stable key, pt-BR label, palette category, keywords, chords
 with a scope, and omnibox alias) and is read through a read lock; the decision
@@ -382,9 +384,12 @@ unbound keys are never handled (gate `accelerator_decision_table`). A handled
 key becomes `UserEvent::RunCommandKey { key, origin }`, whose origin is the
 host (or the window, or the omnibox), never page data, and only the decision
 builds it (gate `a_command_key_carries_the_host_it_came_from`); the event loop
-runs the event `resolve_command(key, origin)` gives, which for a page-bound
-command is the one that page's keymap would request over IPC for the same key
-(gate `resolve_command_runs_against_its_origin`). Two commands with the same
+hands the whole event to `command_key_event`, which reads the command and the
+origin from the event itself and runs the event `resolve_command(key, origin)`
+gives (gate `a_command_key_runs_against_the_origin_it_carries`: the event
+loop's arm neither takes the event apart nor calls `resolve_command`); for a
+page-bound command that is the one that page's keymap would request over IPC
+for the same key (gate `resolve_command_runs_against_its_origin`). Two commands with the same
 chord in the same scope make the whole table invalid (gate
 `keymap_chords_are_unique_per_scope`). On the provider hosts -- the comparator
 columns and the private split -- the ChatGPT chords Ctrl+Shift+O,
@@ -403,6 +408,11 @@ Ctrl+Shift+Delete the main window and the omnibox already answered. The CI
 accelerator spike measured native dispatch on every host kind: with
 `Handled = TRUE` the page never sees the keydown of the chord, but it may still
 receive one or two keypress events (the control character of a Ctrl+letter).
+The spike handled the chord's key-up as well and its probe listened only for
+keydown and keypress; the shipped decision leaves key-up unhandled, so the page
+also receives the keyup of a bound chord, which the spike did not measure. A
+page that reacts to keypress or keyup sees the press; none of them can run the
+command, which is born on the native side.
 The resource dispatcher `resource_gate_answers` is a stub
 the product does not yet wire to `WebResourceRequested`; the gate
 `custom_schemes_are_never_answered_by_the_resource_gate` already holds it to

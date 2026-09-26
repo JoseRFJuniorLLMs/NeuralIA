@@ -38,6 +38,9 @@ use wry::PageLoadEvent;
 // A pagina continua a receber um `keypress` (um ou dois por toque, o
 // caractere de controlo de um Ctrl+letra): nao chega ao `keydown` que o
 // mapa de teclas e as paginas ouvem, e nao faz diferenca para os ganchos.
+// O spike prendia tambem a subida e nao ouvia o `keyup`; a decisao que
+// embarca deixa a subida passar, por isso a pagina recebe tambem o `keyup`
+// de um atalho preso (o que o spike nao mediu).
 // O `accelerator_lookup` e a decisao do mapa de teclas (`keymap.rs`,
 // infra-commands-keymap) com o hospedeiro como origem; hoje nenhum
 // hospedeiro tem atalhos la (cada um chega no PR do seu comando), e o
@@ -782,20 +785,14 @@ pub(in crate::windows_app) struct AcceleratorDecision {
 }
 
 /// A consulta que o handler faz a cada tecla: a decisao do mapa de teclas
-/// do produto (`keymap_decision`: uma leitura do mapa, o ambito do
-/// hospedeiro, a repeticao filtrada, `Handled` so nos atalhos presos, a
-/// lista do ChatGPT fora dos hospedeiros das IAs), com o hospedeiro que o
-/// handler recebeu no registo como origem -- sem chamadas COM la dentro.
+/// (`keymap_decision_in`: uma leitura do mapa, o ambito do hospedeiro, a
+/// repeticao filtrada, `Handled` so nos atalhos presos, a lista do ChatGPT
+/// fora dos hospedeiros das IAs), com o hospedeiro que o handler recebeu no
+/// registo como origem -- sem chamadas COM la dentro. O handler passa o
+/// mapa do produto (`product_keymap()`); os gates chamam esta mesma funcao
+/// com um mapa com atalhos em todos os ambitos e veem a origem que sai de
+/// cada hospedeiro.
 pub(in crate::windows_app) fn accelerator_lookup(
-    host: WebViewHost,
-    input: AcceleratorInput,
-) -> AcceleratorDecision {
-    accelerator_lookup_in(product_keymap(), host, input)
-}
-
-/// `accelerator_lookup` sobre um mapa dado: o gate passa um mapa com
-/// atalhos em todos os ambitos e ve a origem que sai de cada hospedeiro.
-pub(in crate::windows_app) fn accelerator_lookup_in(
     keymap: &RwLock<Keymap>,
     host: WebViewHost,
     input: AcceleratorInput,
@@ -804,9 +801,11 @@ pub(in crate::windows_app) fn accelerator_lookup_in(
 }
 
 /// O `AcceleratorKeyPressed` de uma WebView acabada de construir: le a
-/// tecla, pergunta a `accelerator_lookup` e so toca no `Handled` quando a
-/// decisao e prender a tecla -- um handler que nada prende deixa o WebView2
-/// exatamente como estava.
+/// tecla, pergunta a `accelerator_lookup` sobre o mapa do produto com o
+/// hospedeiro deste registo -- o unico que o handler conhece; ele nunca
+/// nomeia outro (gate `the_accelerator_callback_calls_out_to_nothing`) --
+/// e so toca no `Handled` quando a decisao e prender a tecla: um handler
+/// que nada prende deixa o WebView2 exatamente como estava.
 fn register_webview_accelerators(
     webview: &WebView,
     host: WebViewHost,
@@ -839,18 +838,16 @@ fn register_webview_accelerators(
             args.VirtualKey(&mut vk)?;
             args.PhysicalKeyStatus(&mut status)?;
         }
-        let decision = accelerator_lookup(
-            host,
-            AcceleratorInput {
-                vk,
-                down: kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
-                    || kind == COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
-                ctrl: held(VK_CONTROL),
-                shift: held(VK_SHIFT),
-                alt: held(VK_MENU),
-                repeat: status.WasKeyDown.as_bool(),
-            },
-        );
+        let input = AcceleratorInput {
+            vk,
+            down: kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
+                || kind == COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
+            ctrl: held(VK_CONTROL),
+            shift: held(VK_SHIFT),
+            alt: held(VK_MENU),
+            repeat: status.WasKeyDown.as_bool(),
+        };
+        let decision = accelerator_lookup(product_keymap(), host, input);
         if decision.handled {
             unsafe { args.SetHandled(true)? };
         }
