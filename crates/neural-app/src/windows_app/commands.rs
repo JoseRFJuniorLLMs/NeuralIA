@@ -397,6 +397,7 @@ pub(in crate::windows_app) fn bar_hit_command(hit: BarHit) -> Option<CommandId> 
         | BarHit::Forward
         | BarHit::ColumnBack(_)
         | BarHit::ColumnForward(_)
+        | BarHit::ColumnTranslate(_)
         | BarHit::Column(_)
         | BarHit::AddTab(_)
         | BarHit::ContextTab { .. }

@@ -192,21 +192,27 @@ impl BarColumns {
 pub(in crate::windows_app) enum ColumnButton {
     Back,
     Forward,
+    /// 文A: «Traduzir página» (`translation.rs`); outro clique devolve o
+    /// original.
+    Translate,
 }
 
 /// Quantos botoes tem cada coluna: o tamanho das filas de `BarLayout`.
 pub(in crate::windows_app) const COLUMN_BUTTONS: usize = ColumnButton::ALL.len();
 
 impl ColumnButton {
-    pub(in crate::windows_app) const ALL: [Self; 2] = [Self::Back, Self::Forward];
+    pub(in crate::windows_app) const ALL: [Self; 3] = [Self::Back, Self::Forward, Self::Translate];
     /// Largura logica de cada botao (a mesma do "+") e a folga entre eles.
+    /// A folga passou de 4 para 2 com o 文A (translation): com tres botoes,
+    /// a 1024 px a pilula da IA da direita ainda existe (fica estreita).
     pub(in crate::windows_app) const WIDTH: f64 = 26.0;
-    pub(in crate::windows_app) const GAP: f64 = 4.0;
+    pub(in crate::windows_app) const GAP: f64 = 2.0;
 
     pub(in crate::windows_app) fn glyph(self) -> &'static str {
         match self {
             Self::Back => "‹",
             Self::Forward => "›",
+            Self::Translate => "文A",
         }
     }
 
@@ -215,6 +221,7 @@ impl ColumnButton {
         match self {
             Self::Back => BarHit::ColumnBack(column),
             Self::Forward => BarHit::ColumnForward(column),
+            Self::Translate => BarHit::ColumnTranslate(column),
         }
     }
 }

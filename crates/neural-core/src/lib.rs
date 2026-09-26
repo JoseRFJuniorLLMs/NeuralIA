@@ -26,6 +26,7 @@ pub mod search;
 pub mod security;
 pub mod semantic_timeline;
 pub mod tissue;
+pub mod translate;
 pub mod untrusted;
 pub mod zettel;
 

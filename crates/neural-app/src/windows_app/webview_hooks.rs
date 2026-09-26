@@ -265,11 +265,15 @@ impl HookedWebViewBuilder for WebViewBuilder<'_> {
 /// A metade do builder da tabela: a trava de navegacao do hospedeiro (com
 /// a origem local autorizada, se houver), a recusa de downloads onde a
 /// tabela manda e o aviso de pagina carregada. `send` e o proxy do event
-/// loop no produto e um registo no gate.
+/// loop no produto e um registo no gate. `epoch` e a geracao de navegacao
+/// do hospedeiro (`page_eval::NavEpoch`, a da Traducao): o navigation
+/// handler sobe-a a cada navegacao que comeca, tambem as recusadas -- uma
+/// leitura da pagina anterior cai na chegada.
 pub(in crate::windows_app) fn hook_webview_builder<B, S>(
     builder: B,
     host: WebViewHost,
     local_origin: Option<String>,
+    epoch: Option<NavEpoch>,
     send: S,
 ) -> B
 where
@@ -277,11 +281,13 @@ where
     S: Fn(UserEvent) + Clone + 'static,
 {
     let hooks = webview_hooks(host);
-    let builder = builder.with_navigation_handler(webview_navigation(
-        hooks.nav_gate,
-        local_origin,
-        send.clone(),
-    ));
+    let navigation = webview_navigation(hooks.nav_gate, local_origin, send.clone());
+    let builder = builder.with_navigation_handler(move |target| {
+        if let Some(epoch) = &epoch {
+            epoch.bump();
+        }
+        navigation(target)
+    });
     let builder = match hooks.downloads {
         DownloadPolicy::Deny => builder.with_download_started_handler(|_, _| false),
         DownloadPolicy::Managed => builder,
@@ -518,14 +524,34 @@ fn auto_scroll_event(host: WebViewHost) -> Option<UserEvent> {
     column_menu_event(context_menu_column(host)?, COLUMN_MENU_AUTO_SCROLL)
 }
 
+/// Id do item «Traduzir página» (`translation.rs`) no botao direito das
+/// paginas que se traduzem e no menu da pilula.
+pub(in crate::windows_app) const MENU_TRANSLATE_PAGE: usize = 2;
+
+fn translate_page_label(_flags: MenuFlags) -> &'static str {
+    TRANSLATE_PAGE_LABEL
+}
+
+fn translate_page_event(host: WebViewHost) -> Option<UserEvent> {
+    translatable_host(host).then_some(UserEvent::Translate(TranslateEvent::Requested(host)))
+}
+
 /// O registo: cada item do NeuralIA nos menus das WebViews, ids unicos e
 /// nunca zero (gate `context_menu_commands_are_unique`).
-pub(in crate::windows_app) const WEBVIEW_MENU_ITEMS: &[MenuItemSpec] = &[MenuItemSpec {
-    id: COLUMN_MENU_AUTO_SCROLL,
-    label: auto_scroll_label,
-    hosts: auto_scroll_hosts,
-    event: auto_scroll_event,
-}];
+pub(in crate::windows_app) const WEBVIEW_MENU_ITEMS: &[MenuItemSpec] = &[
+    MenuItemSpec {
+        id: COLUMN_MENU_AUTO_SCROLL,
+        label: auto_scroll_label,
+        hosts: auto_scroll_hosts,
+        event: auto_scroll_event,
+    },
+    MenuItemSpec {
+        id: MENU_TRANSLATE_PAGE,
+        label: translate_page_label,
+        hosts: translatable_host,
+        event: translate_page_event,
+    },
+];
 
 /// Os itens do registo que este hospedeiro recebe, pela ordem do registo.
 pub(in crate::windows_app) fn webview_menu_items(host: WebViewHost) -> Vec<&'static MenuItemSpec> {
@@ -1009,7 +1035,8 @@ impl App {
         local_origin: Option<String>,
     ) -> HookedBuilder<'_> {
         let proxy = self.proxy.clone();
-        let builder = hook_webview_builder(builder, host, local_origin, move |event| {
+        let epoch = self.translation.epoch(host);
+        let builder = hook_webview_builder(builder, host, local_origin, epoch, move |event| {
             let _ = proxy.send_event(event);
         });
         HookedBuilder {
@@ -1022,7 +1049,8 @@ impl App {
     /// A unica porta para o COM de uma WebView acabada de construir: o
     /// `HookedBuilder` traz aqui cada uma que constroi, com o hospedeiro
     /// que recebeu, e ela recebe o que a tabela manda -- os itens do menu
-    /// do botao direito nas paginas que rolam, o `AcceleratorKeyPressed`
+    /// do botao direito nas paginas que rolam e nas que se traduzem, o
+    /// `AcceleratorKeyPressed`
     /// em todas, o gestor de downloads nas que tem `DownloadPolicy::Managed`.
     /// Privado ao modulo: nenhum sitio regista por conta propria.
     /// Um runtime WebView2 sem um dos eventos deixa a WebView sem esse
@@ -1047,10 +1075,12 @@ impl App {
         }
     }
 
-    /// Uma pagina acabou de carregar. Nada na 2.3 le ainda o endereco: fica
-    /// no evento para quem vier (favoritos, bloqueio de anuncios); o log de
-    /// depuracao nunca leva URLs, so a transicao.
-    fn page_loaded(&self, page: WebViewHost, _url: String) {
+    /// Uma pagina acabou de carregar. A Traducao larga a traducao de uma
+    /// pagina que ja nao esta la (`translation_page_loaded`); o endereco
+    /// fica no evento para quem vier (favoritos, bloqueio de anuncios); o
+    /// log de depuracao nunca leva URLs, so a transicao.
+    fn page_loaded(&mut self, page: WebViewHost, _url: String) {
         debug_log(format_args!("webview: {} carregou", page.describe()));
+        self.translation_page_loaded(page);
     }
 }

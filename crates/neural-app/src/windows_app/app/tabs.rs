@@ -887,6 +887,9 @@ impl App {
             Some(BarHit::Forward) => self.navigate_history(HistoryStep::Forward),
             Some(BarHit::ColumnBack(index)) => self.navigate_column(index, HistoryStep::Back),
             Some(BarHit::ColumnForward(index)) => self.navigate_column(index, HistoryStep::Forward),
+            Some(BarHit::ColumnTranslate(index)) => {
+                self.translation_event(TranslateEvent::Requested(WebViewHost::Column(index)))
+            }
             Some(BarHit::Column(index)) => self.expand_comparator(index),
             Some(BarHit::AddTab(index)) => self.open_ai_palette(index),
             Some(BarHit::ContextTab {

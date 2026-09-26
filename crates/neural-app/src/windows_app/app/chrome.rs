@@ -1275,6 +1275,7 @@ impl App {
             | BarHit::AddTab(index)
             | BarHit::ColumnBack(index)
             | BarHit::ColumnForward(index)
+            | BarHit::ColumnTranslate(index)
             | BarHit::TabOverflow(index) => Some(index),
             BarHit::ContextTab { source_index, .. }
             | BarHit::CloseTab { source_index, .. }

@@ -187,6 +187,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Keys(event) => self.keys_event(event),
             UserEvent::WebView(event) => self.webview_event(event),
             UserEvent::Download(event) => self.download_event(event),
+            UserEvent::Translate(event) => self.translation_event(event),
             UserEvent::Panel(post) => self.handle_panel_message(post),
             UserEvent::NotesReady { origin, reply } => self.notes_ready(origin, reply),
             UserEvent::NoteRequested { target, via } => self.request_note_from_page(target, via),
@@ -247,11 +248,16 @@ impl ApplicationHandler<UserEvent> for App {
                 self.search_card_event(SearchCardInput::Expire(token))
             }
             UserEvent::ResearchAnswer { source_index, text } => {
-                let provider = self
-                    .comparator
-                    .as_ref()
-                    .and_then(|comp| comp.views.get(source_index))
-                    .map(|view| view.name.to_string());
+                // Uma coluna traduzida (`translation.rs`) nao grava: texto
+                // traduzido a maquina nunca e a resposta de uma IA.
+                let provider = research_answer_provider(
+                    &self.translation,
+                    self.comparator
+                        .as_ref()
+                        .and_then(|comp| comp.views.get(source_index))
+                        .map(|view| view.name),
+                    source_index,
+                );
                 if let (Some(provider), Some(session)) = (provider, &mut self.current_research) {
                     session.upsert_provider_answer(provider, text, None);
                     self.memory.save_session(session.clone());
@@ -502,6 +508,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.position_live_panel();
                 self.after_panel_change();
                 self.position_search_card();
+                self.position_translate_card();
                 if self.surface == Surface::Home {
                     self.sync_caption_buttons();
                 }
@@ -533,6 +540,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.position_splash();
                 self.position_toast();
                 self.position_search_card();
+                self.position_translate_card();
                 self.position_exit_button();
                 self.position_palette();
                 self.sync_comparator_splitters();

@@ -110,6 +110,9 @@ pub(in crate::windows_app) enum UserEvent {
     /// O gestor de downloads (`downloads.rs`): o que o WebView2 avisa de cada
     /// download e o fim de cada um, com o evento do `neural_core::downloads`.
     Download(neural_core::downloads::DownloadEvent),
+    /// Traduzir pagina (`translation.rs`): o 文A ou o menu, as leituras do
+    /// `page_eval`, a thread `neural-translate` e o cartao.
+    Translate(TranslateEvent),
     /// Pedido da pagina local do painel lateral (canal proprio), com o
     /// numero da pagina que o mandou.
     Panel(side_panel::PanelPost),
@@ -437,6 +440,8 @@ pub(in crate::windows_app) enum BarHit {
     /// ‹ e › de cada IA, logo depois do "+" da coluna.
     ColumnBack(usize),
     ColumnForward(usize),
+    /// O 文A de cada IA: «Traduzir página» (ou devolver o original).
+    ColumnTranslate(usize),
     Column(usize),
     AddTab(usize),
     ContextTab {
@@ -990,6 +995,9 @@ pub(in crate::windows_app) fn bar_tooltip_label(
         BarHit::Forward => "Avançar na fonte aberta ao lado".to_string(),
         BarHit::ColumnBack(_) => format!("Voltar no {provider}"),
         BarHit::ColumnForward(_) => format!("Avançar no {provider}"),
+        BarHit::ColumnTranslate(_) => format!(
+            "{TRANSLATE_PAGE_LABEL} do {provider} para o português (outro clique: o original)"
+        ),
         BarHit::Column(_) => format!("{provider}: expandir esta coluna"),
         BarHit::AddTab(_) => format!("Nova pergunta ao {provider}"),
         BarHit::ContextTab { .. } => {
@@ -3165,6 +3173,10 @@ pub(in crate::windows_app) struct App {
     /// O gestor de downloads (`downloads.rs`): o `DownloadManager`, as
     /// operacoes vivas do WebView2 e o `downloads.json`.
     pub(in crate::windows_app) downloads: DownloadsState,
+    /// Traduzir pagina (`translation.rs`): as leituras, os runs e o cartao.
+    /// Nasce sem thread, sem cofre e sem disco; a thread `neural-translate`
+    /// so no primeiro clique.
+    pub(in crate::windows_app) translation: TranslationState,
 }
 
 impl App {
@@ -3216,6 +3228,8 @@ impl App {
         let stores = StoreRegistry::mint(&config.data_dir).ok();
         let keys = KeysState::new(proxy.clone());
         let downloads = DownloadsState::open(stores.as_ref());
+        // Sem thread nem disco: a `neural-translate` so nasce no 1.o clique.
+        let translation = TranslationState::new(proxy.clone());
         Self {
             document,
             pdf_bytes: Arc::new(Mutex::new(Vec::new())),
@@ -3295,15 +3309,15 @@ impl App {
             keys,
             egress: None,
             downloads,
+            translation,
         }
     }
 }
 
 impl App {
     /// O portao de saida da IA, criado no primeiro pedido com os grants do
-    /// registo das lojas. E a porta das features de IA, que chegam nas ondas
-    /// seguintes (a Traducao e a primeira).
-    #[allow(dead_code)]
+    /// registo das lojas. E a porta das features de IA; a Traducao
+    /// (`translation.rs`) e a primeira a pedi-lo.
     pub(in crate::windows_app) fn egress_gate(&mut self) -> &mut crate::egress::EgressGate {
         let stores = self.stores.as_ref();
         self.egress
@@ -6984,6 +6998,7 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ("downloads.rs", include_str!("windows_app/downloads.rs")),
     ("commands.rs", include_str!("windows_app/commands.rs")),
     ("keymap.rs", include_str!("windows_app/keymap.rs")),
+    ("translation.rs", include_str!("windows_app/translation.rs")),
     ("tests.rs", include_str!("windows_app/tests.rs")),
 ];
 
@@ -7056,8 +7071,8 @@ pub(in crate::windows_app) use popup_menu::*;
 pub(in crate::windows_app) mod native_card;
 pub(in crate::windows_app) use native_card::*;
 // Leitura de paginas por script so-leitura (infra-llm-untrusted, plano 2.3):
-// os consumidores (Traducao, Consenso, Copiloto, Escudo) chegam nas ondas
-// seguintes; ate la so corre nos testes.
+// a Traducao (`translation.rs`) e o primeiro consumidor; o Consenso, o
+// Copiloto e o Escudo chegam nas ondas seguintes.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::windows_app) mod page_eval;
 #[cfg_attr(not(test), allow(unused_imports))]
@@ -7070,6 +7085,8 @@ pub(in crate::windows_app) mod commands;
 pub(in crate::windows_app) use commands::*;
 pub(in crate::windows_app) mod keymap;
 pub(in crate::windows_app) use keymap::*;
+pub(in crate::windows_app) mod translation;
+pub(in crate::windows_app) use translation::*;
 
 pub(in crate::windows_app) mod app;
 #[allow(unused_imports)]

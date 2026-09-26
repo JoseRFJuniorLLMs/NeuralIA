@@ -30,8 +30,14 @@
 //!
 //! Quem le (a Traducao, o leitor de respostas do Consenso, o Copiloto, o
 //! Escudo) traz o seu `UserEvent`, o seu `PageReads` e liga o `NavEpoch` ao
-//! navigation handler das vistas que le. Ate o primeiro chegar, este modulo
-//! so corre nos testes.
+//! navigation handler das vistas que le. A Traducao (`translation.rs`) e a
+//! primeira: `TRANSLATE_COLLECT` le os nos de texto, e `TRANSLATE_APPLY` /
+//! `TRANSLATE_RESTORE` trocam SO o `nodeValue` de um no que ainda tem o texto
+//! esperado -- o "so-leitura" do plano (nada publica, busca, escuta, agenda,
+//! navega nem escreve HTML). Esses dois recebem as trocas como um ARGUMENTO
+//! (`ScriptArg::Json`, `PageReads::read_with_arg`): o script registado e uma
+//! funcao, e a chamada e `(<script>)(<json>)`, com o JSON do `serde_json` --
+//! dado, nunca codigo; um script sem argumento nao aceita um, e vice-versa.
 
 use super::*;
 
@@ -39,11 +45,21 @@ use super::*;
 /// sem isto, respostas que nunca chegam enchiam a lista.
 pub(in crate::windows_app) const MAX_PENDING_READS: usize = 8;
 
+/// Se o script recebe um argumento.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) enum ScriptArg {
+    /// O script e uma expressao que se avalia tal e qual.
+    None,
+    /// O script e uma funcao; a leitura chama-a com um valor JSON.
+    Json,
+}
+
 /// Um script que so le a pagina. So este modulo o constroi.
 #[derive(Debug)]
 pub(in crate::windows_app) struct ReadOnlyScript {
     name: &'static str,
     source: &'static str,
+    arg: ScriptArg,
 }
 
 impl ReadOnlyScript {
@@ -54,6 +70,31 @@ impl ReadOnlyScript {
     pub(in crate::windows_app) fn source(&self) -> &'static str {
         self.source
     }
+
+    pub(in crate::windows_app) fn arg(&self) -> ScriptArg {
+        self.arg
+    }
+}
+
+/// O texto que o WebView2 corre para `script` com `arg`: o proprio script,
+/// ou `(<funcao>)(<json>)`. O JSON e o do `serde_json` (um literal que o
+/// JavaScript le como dado; U+2028 e U+2029 vao escapados por cautela).
+/// `None` se o argumento nao bate com o script.
+pub(in crate::windows_app) fn script_call(
+    script: &ReadOnlyScript,
+    arg: Option<&serde_json::Value>,
+) -> Option<String> {
+    match (script.arg, arg) {
+        (ScriptArg::None, None) => Some(script.source.to_string()),
+        (ScriptArg::Json, Some(value)) => {
+            let json = serde_json::to_string(value)
+                .ok()?
+                .replace('\u{2028}', "\\u2028")
+                .replace('\u{2029}', "\\u2029");
+            Some(format!("({})({json})", script.source))
+        }
+        _ => None,
+    }
 }
 
 /// A selecao da pagina para uma nota (Ctrl+Shift+Z): o primeiro script da
@@ -62,15 +103,42 @@ impl ReadOnlyScript {
 pub(in crate::windows_app) static NOTE_CAPTURE_READ: ReadOnlyScript = ReadOnlyScript {
     name: "note-capture",
     source: NOTE_CAPTURE_SCRIPT,
+    arg: ScriptArg::None,
+};
+
+/// A Traducao (`translation.rs`): os nos de texto visiveis da pagina.
+pub(in crate::windows_app) static TRANSLATE_COLLECT_READ: ReadOnlyScript = ReadOnlyScript {
+    name: "translate-collect",
+    source: TRANSLATE_COLLECT_SCRIPT,
+    arg: ScriptArg::None,
+};
+
+/// A Traducao: troca o `nodeValue` de cada no que ainda tem o original.
+pub(in crate::windows_app) static TRANSLATE_APPLY_READ: ReadOnlyScript = ReadOnlyScript {
+    name: "translate-apply",
+    source: TRANSLATE_APPLY_SCRIPT,
+    arg: ScriptArg::Json,
+};
+
+/// A Traducao: devolve o original a cada no que ainda tem a traducao.
+pub(in crate::windows_app) static TRANSLATE_RESTORE_READ: ReadOnlyScript = ReadOnlyScript {
+    name: "translate-restore",
+    source: TRANSLATE_RESTORE_SCRIPT,
+    arg: ScriptArg::Json,
 };
 
 /// Os unicos scripts que `PageReads::read` corre.
-pub(in crate::windows_app) static READ_ONLY_SCRIPTS: &[&ReadOnlyScript] = &[&NOTE_CAPTURE_READ];
+pub(in crate::windows_app) static READ_ONLY_SCRIPTS: &[&ReadOnlyScript] = &[
+    &NOTE_CAPTURE_READ,
+    &TRANSLATE_COLLECT_READ,
+    &TRANSLATE_APPLY_READ,
+    &TRANSLATE_RESTORE_READ,
+];
 
 fn registered(script: &ReadOnlyScript) -> bool {
-    READ_ONLY_SCRIPTS
-        .iter()
-        .any(|known| known.name == script.name && known.source == script.source)
+    READ_ONLY_SCRIPTS.iter().any(|known| {
+        known.name == script.name && known.source == script.source && known.arg == script.arg
+    })
 }
 
 /// A geracao de navegacao de uma vista: o navigation handler dela chama
@@ -234,9 +302,43 @@ impl PageReads {
         deliver: impl Fn(PageEvalEvent) + Send + 'static,
         schedule: impl FnOnce(Duration, PageEvalEvent),
     ) -> Result<PageReadToken, PageEvalRefusal> {
+        self.read_inner(view, spec, None, epoch, now, deliver, schedule)
+    }
+
+    /// `read` de um script com argumento (`ScriptArg::Json`): corre
+    /// `(<script>)(<arg>)` (`script_call`). O resto -- token, prazo, tecto,
+    /// geracao e URL -- e o mesmo.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::windows_app) fn read_with_arg<V: EvalView + ?Sized>(
+        &mut self,
+        view: &V,
+        spec: PageEvalSpec,
+        arg: &serde_json::Value,
+        epoch: &NavEpoch,
+        now: Instant,
+        deliver: impl Fn(PageEvalEvent) + Send + 'static,
+        schedule: impl FnOnce(Duration, PageEvalEvent),
+    ) -> Result<PageReadToken, PageEvalRefusal> {
+        self.read_inner(view, spec, Some(arg), epoch, now, deliver, schedule)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_inner<V: EvalView + ?Sized>(
+        &mut self,
+        view: &V,
+        spec: PageEvalSpec,
+        arg: Option<&serde_json::Value>,
+        epoch: &NavEpoch,
+        now: Instant,
+        deliver: impl Fn(PageEvalEvent) + Send + 'static,
+        schedule: impl FnOnce(Duration, PageEvalEvent),
+    ) -> Result<PageReadToken, PageEvalRefusal> {
         if !registered(spec.script) {
             return Err(PageEvalRefusal::Unregistered);
         }
+        let Some(source) = script_call(spec.script, arg) else {
+            return Err(PageEvalRefusal::Unregistered);
+        };
         if self.pending.len() >= MAX_PENDING_READS {
             return Err(PageEvalRefusal::Busy);
         }
@@ -249,7 +351,7 @@ impl PageReads {
         let token = PageReadToken(self.next_token);
         let max_raw_bytes = spec.max_raw_bytes;
         let asked = view.eval_with_callback(
-            spec.script.source,
+            &source,
             Box::new(move |raw| {
                 deliver(PageEvalEvent::Arrived {
                     token,
