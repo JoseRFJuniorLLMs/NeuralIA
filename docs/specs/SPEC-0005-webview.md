@@ -323,13 +323,22 @@ the PDF viewer, the EPUB pages, the Gemini Live panel, the hidden Gmail
 monitor, the Ctrl+H panel and the service panels -- is born in two steps that
 go through one module, `crates/neural-app/src/windows_app/webview_hooks.rs`:
 
-- before `build`, `App::hooked_builder` installs the host's navigation gate,
-  the download refusal where the table says so, and the page-load notice
-  (`WebViewEvent::PageLoaded { page, url }`, sent on `Finished` only);
-- after `build`, `App::install_webview_hooks` registers through WebView2 COM the
-  NeuralIA items of the right-click menu (`WEBVIEW_MENU_ITEMS`: today only the
-  auto-scroll item, on the columns and on the split, private included) and an
-  `AcceleratorKeyPressed` handler that consults `accelerator_lookup`.
+- before `build`, `App::hooked_builder(builder, host, local_origin)` installs
+  the host's navigation gate, the download refusal where the table says so,
+  and the page-load notice (`WebViewEvent::PageLoaded { page, url }`, sent on
+  `Finished` only), and returns a `HookedBuilder` that carries that host;
+- `HookedBuilder::build_hooked` / `build_hooked_as_child` are the only calls
+  of wry's `build` / `build_as_child` in the product (the gate holds them to
+  the module), and after the build they register through WebView2 COM, for
+  the same host, the NeuralIA items of the right-click menu
+  (`WEBVIEW_MENU_ITEMS`: today only the auto-scroll item, on the columns and
+  on the split, private included) and an `AcceleratorKeyPressed` handler that
+  consults `accelerator_lookup` (`install_webview_hooks`, private to the
+  module).
+
+The host a birth site passes to `hooked_builder` is therefore the only host
+that WebView has, in both halves: a site cannot build without the chain, nor
+give one host's chain to the builder and another's menu to COM.
 
 What each host receives is a pure table, `webview_hooks(host)`, with one slot
 per feature: `menu`, `downloads` (`Managed` on the columns, the split, the
@@ -342,9 +351,14 @@ the gate `navigation_verdicts_are_the_ones_the_builders_gave` holds every
 verdict and every event to the closures the builders had in 2.2.0, and
 `spec_0108_remote_navigation_handlers_reject_neuralia_scheme` forbids any
 `with_navigation_handler` outside the module. `every_webview_gets_the_hooks`
-runs both halves over a recording registrar and builder for every host kind
-and holds each of the 11 birth sites to its host; `the_webview_hooks_table`
-pins the table.
+runs both halves over a recording registrar and builder for every host kind,
+forbids wry's `build` / `build_as_child` outside the module, counts the 11
+`build_hooked` calls against the 11 `hooked_builder` calls, and pins the
+`hooked_builder` line of each of the 11 birth sites (the host literal next to
+the builder it wraps, exactly once); `the_webview_hooks_table` pins the table.
+The CI sabotage matrix proves it red with `reader-born-without-hooks` (the
+Reader built by wry's `build` directly) and `gmail-monitor-gets-web-chain`
+(the Gmail monitor born as `External`).
 
 `accelerator_lookup` binds nothing yet (gate
 `accelerator_lookup_binds_nothing_today`): the handler only sets `Handled`

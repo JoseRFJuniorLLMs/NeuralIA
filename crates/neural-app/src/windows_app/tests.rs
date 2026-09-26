@@ -6896,9 +6896,12 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
     let new_group = body("fn group_context_tab", "fn join_context_tab_group");
     assert!(new_group.contains("self.show_group_menu(source_index, group_index, true)"));
     // A fonte ao lado recebe os ganchos com a coluna dela e o seu
-    // privado (o item de rolagem vem dai).
+    // privado (o item de rolagem vem dai): o HookedBuilder constroi-a com
+    // as duas metades.
     assert!(source.contains("let host = WebViewHost::split(source_index, private);"));
-    assert!(source.contains("self.install_webview_hooks(&webview, host);"));
+    assert!(source.contains(
+        "let hooked = self.hooked_builder(builder, host, build.local_origin.clone());\n        let built = hooked.build_hooked_as_child(window);"
+    ));
 }
 
 #[test]
@@ -7292,11 +7295,10 @@ fn epub_pages_reach_native_code_only_through_their_own_channel() {
     let open = body(&source, "fn open_epub_page", "fn epub_webview_builder");
     assert!(
         open.contains(
-            ".hooked_builder(self.epub_webview_builder(runtime), WebViewHost::Epub, None)"
+            "let builder = self.epub_webview_builder(runtime).with_url(url);\n        let hooked = self.hooked_builder(builder, WebViewHost::Epub, None);\n        let result = hooked.build_hooked(window);"
         ),
         "open_epub_page nao passa o builder pelos ganchos do Epub"
     );
-    assert!(open.contains("self.install_webview_hooks(&webview, WebViewHost::Epub);"));
     let hooks = webview_hooks(WebViewHost::Epub);
     assert_eq!(hooks.nav_gate, NavGate::Epub);
     assert_eq!(hooks.downloads, DownloadPolicy::Deny);
@@ -8572,63 +8574,141 @@ fn every_webview_gets_the_hooks() {
     }
 
     // (c) E cada sitio onde uma WebView nasce passa pelas duas metades com
-    // o seu hospedeiro (texto, §4.3: o App nao se constroi sem janela).
-    // Uma WebView a mais sem ganchos, ou um sitio que perde uma metade,
-    // desequilibra a conta.
+    // o seu hospedeiro (texto, §4.3: o App nao se constroi sem janela). As
+    // duas metades sao uma so chamada: `hooked_builder` devolve o
+    // `HookedBuilder` (campos privados: nem os sitios nem este teste o
+    // montam), e so `build_hooked`/`build_hooked_as_child` constroem -- o
+    // `build` do wry nao aparece fora do modulo. Assim nenhuma WebView
+    // nasce sem a cadeia, e o hospedeiro da metade do COM e o do builder.
     let source = shipped_source();
-    let births = source.matches(".build(window)").count()
-        + source.matches(".build_as_child(window)").count();
+    let mut outside = include_str!("../windows_app.rs").replace("\r\n", "\n");
+    for (name, content) in ALL_MODULES {
+        if *name != "tests.rs" && *name != "webview_hooks.rs" {
+            outside.push('\n');
+            outside.push_str(&content.replace("\r\n", "\n"));
+        }
+    }
+    assert!(
+        !outside.contains(".build_as_child("),
+        "uma WebView filha nasce fora de HookedBuilder"
+    );
+    assert_eq!(
+        outside.matches(".build(").count(),
+        outside.matches(".build()").count(),
+        "uma WebView de topo nasce fora de HookedBuilder (so o EventLoop chama .build() sem argumentos)"
+    );
+    let module = ALL_MODULES
+        .iter()
+        .find(|(name, _)| *name == "webview_hooks.rs")
+        .map(|(_, content)| content.replace("\r\n", "\n"))
+        .expect("webview_hooks.rs em ALL_MODULES");
+    assert_eq!(module.matches(".build(window)").count(), 1);
+    assert_eq!(module.matches(".build_as_child(window)").count(), 1);
+    assert_eq!(
+        module.matches("install_webview_hooks(").count(),
+        3,
+        "a metade do COM e chamada pelos dois build_hooked e definida uma vez, privada"
+    );
+    assert!(
+        module.contains(
+            "    fn install_webview_hooks(&self, webview: &WebView, host: WebViewHost) {"
+        )
+    );
+
+    // Uma WebView a mais, ou um sitio que constroi sem os ganchos,
+    // desequilibra a conta.
+    let births = source.matches(".build_hooked(window)").count()
+        + source.matches(".build_hooked_as_child(window)").count();
     assert_eq!(births, 11, "sitios onde uma WebView nasce: {births}");
-    // As chamadas levam o ponto (o rustfmt parte `self` e `.hooked_builder(`
-    // em linhas); as definicoes no modulo nao o tem.
     assert_eq!(
         source.matches(".hooked_builder(").count(),
         births,
         "uma WebView nasce sem passar por hooked_builder"
     );
-    assert_eq!(
-        source.matches(".install_webview_hooks(").count(),
-        births,
-        "uma WebView nasce sem install_webview_hooks"
-    );
-    for snippet in [
-        "let host = WebViewHost::Column(i);",
-        "self.install_webview_hooks(&wv, host);",
-        "let host = WebViewHost::split(source_index, private);",
-        "self.install_webview_hooks(&webview, host);",
-        "self.hooked_builder(self.pdf_webview_builder(), WebViewHost::Pdf, None)",
-        "self.install_webview_hooks(&webview, WebViewHost::Pdf);",
-        ".hooked_builder(self.epub_webview_builder(runtime), WebViewHost::Epub, None)",
-        "self.install_webview_hooks(&webview, WebViewHost::Epub);",
-        "self.hooked_builder(self.reader_webview_builder(), WebViewHost::Reader, None)",
-        "self.install_webview_hooks(&webview, WebViewHost::Reader);",
-        "self.install_webview_hooks(&webview, WebViewHost::External);",
-        "let host = WebViewHost::Service(service);",
-        "self.install_webview_hooks(&panel, host);",
-        "self.install_webview_hooks(&panel, WebViewHost::Live);",
-        "self.install_webview_hooks(&panel, WebViewHost::SidePanel);",
-        "self.install_webview_hooks(&webview, WebViewHost::GmailMonitor);",
-    ] {
-        assert!(source.contains(snippet), "falta {snippet}");
+    // O que fica por prender e o hospedeiro que cada sitio declara ao
+    // `hooked_builder` -- o argumento que escolhe a cadeia de navegacao e a
+    // politica de downloads dessa WebView: o monitor do Gmail nascido como
+    // `External` aceitava qualquer https e descarregava em silencio, e a
+    // conta acima nao o via. Cada um dos 11 sitios e uma linha com o
+    // hospedeiro literal, colada a ultima linha do builder que ela
+    // embrulha, e aparece uma so vez; a conta garante que nao ha um 12.o.
+    let sites: [(&str, &str); 11] = [
+        (
+            "Column",
+            ".with_url(url.as_str());\n            let hooked = self.hooked_builder(builder, WebViewHost::Column(i), None);",
+        ),
+        (
+            "Split",
+            ".with_url(valid.as_str());\n        let hooked = self.hooked_builder(builder, host, build.local_origin.clone());",
+        ),
+        // A Web completa nasce duas vezes: um link, com a origem local que
+        // a pagina autorizou; o agente, que nunca a tem.
+        (
+            "External",
+            ".external_webview_builder(local_origin.clone(), false)\n            .with_url(url);\n        let hooked = self.hooked_builder(builder, WebViewHost::External, local_origin);",
+        ),
+        (
+            "External",
+            ".external_webview_builder(None, true)\n            .with_url(valid.as_str());\n        let hooked = self.hooked_builder(builder, WebViewHost::External, None);",
+        ),
+        (
+            "Reader",
+            "let builder = self.reader_webview_builder().with_html(html);\n        let hooked = self.hooked_builder(builder, WebViewHost::Reader, None);",
+        ),
+        (
+            "Pdf",
+            ".with_url(format!(\"{PDF_ORIGIN}/viewer.html\"));\n        let hooked = self.hooked_builder(builder, WebViewHost::Pdf, None);",
+        ),
+        (
+            "Epub",
+            "let builder = self.epub_webview_builder(runtime).with_url(url);\n        let hooked = self.hooked_builder(builder, WebViewHost::Epub, None);",
+        ),
+        (
+            "Live",
+            ".with_permission_handler(live_panel_permission);\n        let hooked = self.hooked_builder(builder, WebViewHost::Live, None);",
+        ),
+        (
+            "GmailMonitor",
+            ".with_url(\"https://mail.google.com/mail/u/0/#inbox\");\n        let hooked = self.hooked_builder(builder, WebViewHost::GmailMonitor, None);",
+        ),
+        (
+            "SidePanel",
+            ".with_new_window_req_handler(|_, _| NewWindowResponse::Deny);\n        let hooked = self.hooked_builder(builder, WebViewHost::SidePanel, None);",
+        ),
+        (
+            "Service",
+            ".with_permission_handler(move |kind| service_panel_permission(service, kind));\n        let hooked = self.hooked_builder(builder, WebViewHost::Service(service), None);",
+        ),
+    ];
+    for (kind, site) in sites {
+        assert_eq!(
+            source.matches(site).count(),
+            1,
+            "{kind}: o sitio de nascimento mudou de hospedeiro, de forma ou repete-se:\n{site}"
+        );
     }
-    // A Web completa nasce duas vezes (um link, o agente): as duas com a
-    // origem local que a pagina autorizou -- o agente nunca a tem.
+    // Cada tipo de hospedeiro tem o seu sitio preso; a fonte privada nasce
+    // no sitio da fonte ao lado (`WebViewHost::split(_, private)`).
+    for host in WebViewHost::ALL {
+        let born_at = match host {
+            WebViewHost::PrivateSplit(_) => "Split",
+            other => other.kind(),
+        };
+        assert!(
+            sites.iter().any(|(kind, _)| *kind == born_at),
+            "{}: sem sitio de nascimento preso",
+            host.kind()
+        );
+    }
+    // A fonte ao lado e o unico sitio que passa o hospedeiro por uma
+    // variavel (a coluna e o privado vem do SplitBuild): e esta linha, e
+    // nenhuma outra `let host =` pode sombrea-la.
     assert_eq!(
-        source
-            .matches("self.install_webview_hooks(&webview, WebViewHost::External);")
-            .count(),
-        2
+        source.matches("let host = WebViewHost::").count(),
+        1,
+        "um sitio escolhe o hospedeiro fora da linha do hooked_builder"
     );
-    assert!(source.contains(
-        "self.hooked_builder(\n                self.external_webview_builder(local_origin.clone(), false),\n                WebViewHost::External,\n                local_origin,\n            )"
-    ));
-    assert!(source.contains(
-        "self.hooked_builder(\n                self.external_webview_builder(None, true),\n                WebViewHost::External,\n                None,\n            )"
-    ));
-    // A fonte ao lado leva a origem local do SplitBuild.
-    assert!(source.contains(
-        ".hooked_builder(\n                self.split_webview_builder(&build),\n                host,\n                build.local_origin.clone(),\n            )"
-    ));
+    assert!(source.contains("let host = WebViewHost::split(source_index, private);"));
 }
 
 /// Gate (critico: navegacao e origens locais): a cadeia de cada hospedeiro

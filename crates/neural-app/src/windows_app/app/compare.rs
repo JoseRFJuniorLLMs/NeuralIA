@@ -284,16 +284,15 @@ impl App {
                 size: LogicalSize::new(actual_w, content_h).into(),
             };
 
-            let host = WebViewHost::Column(i);
             let builder = self
-                .hooked_builder(self.comparator_webview_builder(i, name), host, None)
+                .comparator_webview_builder(i, name)
                 .with_bounds(bounds)
                 .with_url(url.as_str());
+            let hooked = self.hooked_builder(builder, WebViewHost::Column(i), None);
 
-            match builder.build_as_child(window) {
+            match hooked.build_hooked_as_child(window) {
                 Ok(wv) => {
                     let _ = wv.zoom(self.zoom);
-                    self.install_webview_hooks(&wv, host);
                     #[cfg(feature = "accel-spike")]
                     self.accel_spike_hook(&wv, crate::accel_spike::SpikeHost::Column);
                     views.push(ComparatorView { webview: wv, name });

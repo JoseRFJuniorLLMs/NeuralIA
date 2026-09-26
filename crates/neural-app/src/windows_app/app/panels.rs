@@ -164,25 +164,19 @@ impl App {
         // do WebView2: e InPrivate.
         // A trava de navegacao (NavGate::Service, a politica do servico) vem
         // de `hooked_builder`, como em todas as WebViews.
-        let host = WebViewHost::Service(service);
-        let built = self
-            .hooked_builder(
-                themed_webview_builder()
-                    .with_incognito(service.private())
-                    .with_url(service.url())
-                    .with_bounds(logical_rect(area))
-                    .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
-                    // Caminho A do WebRTC: camera e microfone pelo aviso do
-                    // WebView2 -- salvo no painel privado, onde sao recusados.
-                    .with_permission_handler(move |kind| service_panel_permission(service, kind)),
-                host,
-                None,
-            )
-            .build_as_child(window);
+        let builder = themed_webview_builder()
+            .with_incognito(service.private())
+            .with_url(service.url())
+            .with_bounds(logical_rect(area))
+            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+            // Caminho A do WebRTC: camera e microfone pelo aviso do
+            // WebView2 -- salvo no painel privado, onde sao recusados.
+            .with_permission_handler(move |kind| service_panel_permission(service, kind));
+        let hooked = self.hooked_builder(builder, WebViewHost::Service(service), None);
+        let built = hooked.build_hooked_as_child(window);
         match built {
             Ok(panel) => {
                 let _ = panel.focus();
-                self.install_webview_hooks(&panel, host);
                 #[cfg(feature = "accel-spike")]
                 self.accel_spike_hook(&panel, crate::accel_spike::SpikeHost::Service);
                 self.service_generation = self.service_generation.wrapping_add(1);
@@ -643,30 +637,24 @@ impl App {
         let proxy = self.proxy.clone();
         // A trava de navegacao (NavGate::Live: so a pagina do painel) vem de
         // `hooked_builder`, como em todas as WebViews.
-        let built = self
-            .hooked_builder(
-                themed_webview_builder()
-                    // Origem propria: `http://neuralia-live.localhost` e
-                    // contexto seguro, e sem isso nao ha getUserMedia nem
-                    // getDisplayMedia.
-                    .with_custom_protocol(LIVE_PROTOCOL.to_string(), move |_id, request| {
-                        serve_live_asset(&request)
-                    })
-                    .with_url(live_page_url())
-                    .with_bounds(bounds)
-                    .with_ipc_handler(live_panel_ipc_handler(move |event| {
-                        let _ = proxy.send_event(event);
-                    }))
-                    .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
-                    .with_permission_handler(live_panel_permission),
-                WebViewHost::Live,
-                None,
-            )
-            .build_as_child(window);
+        let builder = themed_webview_builder()
+            // Origem propria: `http://neuralia-live.localhost` e contexto
+            // seguro, e sem isso nao ha getUserMedia nem getDisplayMedia.
+            .with_custom_protocol(LIVE_PROTOCOL.to_string(), move |_id, request| {
+                serve_live_asset(&request)
+            })
+            .with_url(live_page_url())
+            .with_bounds(bounds)
+            .with_ipc_handler(live_panel_ipc_handler(move |event| {
+                let _ = proxy.send_event(event);
+            }))
+            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+            .with_permission_handler(live_panel_permission);
+        let hooked = self.hooked_builder(builder, WebViewHost::Live, None);
+        let built = hooked.build_hooked_as_child(window);
         match built {
             Ok(panel) => {
                 let _ = panel.focus();
-                self.install_webview_hooks(&panel, WebViewHost::Live);
                 debug_log(format_args!("live panel: ligado"));
                 self.live_panel.open(panel);
                 self.fit_comparator_to_panel();
@@ -793,25 +781,20 @@ impl App {
         // Criado por ultimo, fica por cima das outras WebViews. A trava de
         // navegacao (NavGate::SidePanel: so o proprio HTML local) vem de
         // `hooked_builder`, como em todas as WebViews.
-        let built = self
-            .hooked_builder(
-                themed_webview_builder()
-                    .with_html(panel_html(&Theme::system()))
-                    .with_bounds(bounds)
-                    .with_ipc_handler(move |request| {
-                        if let Some(post) = side_panel::PanelPost::parse(ticket, request.body()) {
-                            let _ = proxy.send_event(crate::windows_app::UserEvent::Panel(post));
-                        }
-                    })
-                    .with_new_window_req_handler(|_, _| NewWindowResponse::Deny),
-                WebViewHost::SidePanel,
-                None,
-            )
-            .build_as_child(window);
+        let builder = themed_webview_builder()
+            .with_html(panel_html(&Theme::system()))
+            .with_bounds(bounds)
+            .with_ipc_handler(move |request| {
+                if let Some(post) = side_panel::PanelPost::parse(ticket, request.body()) {
+                    let _ = proxy.send_event(crate::windows_app::UserEvent::Panel(post));
+                }
+            })
+            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny);
+        let hooked = self.hooked_builder(builder, WebViewHost::SidePanel, None);
+        let built = hooked.build_hooked_as_child(window);
         match built {
             Ok(panel) => {
                 let _ = panel.focus();
-                self.install_webview_hooks(&panel, WebViewHost::SidePanel);
                 #[cfg(feature = "accel-spike")]
                 self.accel_spike_hook(&panel, crate::accel_spike::SpikeHost::SidePanel);
                 // So com o painel fechado se chega aqui; um aberto nunca e

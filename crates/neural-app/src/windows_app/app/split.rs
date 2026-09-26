@@ -319,15 +319,12 @@ impl App {
         // Construir primeiro, com o estado antigo intacto. WebView2 pode falhar
         // ou entrar num pump aninhado; uma tentativa falhada nao pode destruir
         // o Split que o utilizador ainda esta a ver nem sair da expansao atual.
-        let built = self
-            .hooked_builder(
-                self.split_webview_builder(&build),
-                host,
-                build.local_origin.clone(),
-            )
+        let builder = self
+            .split_webview_builder(&build)
             .with_bounds(bounds)
-            .with_url(valid.as_str())
-            .build_as_child(window);
+            .with_url(valid.as_str());
+        let hooked = self.hooked_builder(builder, host, build.local_origin.clone());
+        let built = hooked.build_hooked_as_child(window);
 
         if !split_build_is_current(generation, self.current_generation(), self.surface) {
             if let Ok(webview) = built {
@@ -380,7 +377,6 @@ impl App {
                 }
 
                 let _ = webview.zoom(self.zoom);
-                self.install_webview_hooks(&webview, host);
                 #[cfg(feature = "accel-spike")]
                 self.accel_spike_hook(
                     &webview,

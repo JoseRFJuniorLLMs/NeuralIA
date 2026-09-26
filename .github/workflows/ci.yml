@@ -286,16 +286,19 @@ jobs:
             @{
               Label = "menu-label-frozen-at-registration"
               Test = "each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r"
+              SourcePath = "crates/neural-app/src/windows_app/webview_hooks.rs"
               Old = @'
-              move |native| ColumnMenuRequest {
-                  col_index,
-                  label: auto_scroll_menu_label(auto_scroll.get()),
+              move |native| {
+                  let flags = MenuFlags {
+                      auto_scroll: auto_scroll.get(),
+                  };
           '@
               New = @'
-              let frozen = auto_scroll_menu_label(auto_scroll.get());
-              move |native| ColumnMenuRequest {
-                  col_index,
-                  label: frozen,
+              let frozen = auto_scroll.get();
+              move |native| {
+                  let flags = MenuFlags {
+                      auto_scroll: frozen,
+                  };
           '@
             },
             @{
@@ -423,10 +426,22 @@ jobs:
               Test = "every_webview_gets_the_hooks"
               SourcePath = "crates/neural-app/src/windows_app/app/pages.rs"
               Old = @'
-              self.install_webview_hooks(&webview, WebViewHost::Reader);
+                  let hooked = self.hooked_builder(builder, WebViewHost::Reader, None);
+                  let result = hooked.build_hooked(window);
           '@
               New = @'
-              let _ = WebViewHost::Reader;
+                  let result = builder.build(window);
+          '@
+            },
+            @{
+              Label = "gmail-monitor-gets-web-chain"
+              Test = "every_webview_gets_the_hooks"
+              SourcePath = "crates/neural-app/src/windows_app/app/gmail.rs"
+              Old = @'
+              let hooked = self.hooked_builder(builder, WebViewHost::GmailMonitor, None);
+          '@
+              New = @'
+              let hooked = self.hooked_builder(builder, WebViewHost::External, None);
           '@
             },
             @{

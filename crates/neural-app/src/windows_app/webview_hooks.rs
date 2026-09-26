@@ -11,9 +11,17 @@ use wry::PageLoadEvent;
 //   do wry aceita -- a trava de navegacao (`web_navigation_verdict`, a cadeia
 //   do hospedeiro), a recusa de downloads nas paginas locais e o aviso de
 //   pagina carregada (`WebViewEvent::PageLoaded`);
-// - `App::install_webview_hooks` (depois do `build`): a metade que so o COM
-//   do WebView2 da -- os itens do NeuralIA no menu do botao direito
-//   (`WEBVIEW_MENU_ITEMS`) e o `AcceleratorKeyPressed` de cada WebView.
+// - `App::install_webview_hooks` (depois do `build`, privada ao modulo): a
+//   metade que so o COM do WebView2 da -- os itens do NeuralIA no menu do
+//   botao direito (`WEBVIEW_MENU_ITEMS`) e o `AcceleratorKeyPressed` de cada
+//   WebView.
+//
+// As duas metades sao uma so chamada para quem constroi: `hooked_builder`
+// devolve um `HookedBuilder` com o hospedeiro que recebeu, e o `build` do
+// wry so se chama dentro dele (`build_hooked`, `build_hooked_as_child`),
+// que regista a metade do COM na WebView que sai. Um sitio nao consegue
+// construir uma WebView sem a cadeia de navegacao, nem dar a cadeia de um
+// hospedeiro ao builder e o menu de outro ao COM.
 //
 // O que cada hospedeiro recebe esta numa tabela pura, `webview_hooks(host)`,
 // que os gates leem sem janela. Uma feature nova (bloqueio de anuncios,
@@ -925,32 +933,74 @@ pub(in crate::windows_app) enum WebViewEvent {
     PageLoaded { page: WebViewHost, url: String },
 }
 
+/// Um builder que ja passou pela metade do builder da tabela, com o
+/// hospedeiro que a recebeu: a unica coisa que constroi uma WebView no
+/// produto. O `build`/`build_as_child` do wry so se chama aqui dentro (gate
+/// `every_webview_gets_the_hooks`: nenhum fora deste modulo), e a WebView
+/// que sai ja tem a metade do COM registada para o mesmo hospedeiro -- um
+/// sitio nao consegue construir sem os ganchos nem registar com outro
+/// hospedeiro. Os campos sao privados: nem os sitios nem os testes o
+/// montam de outra forma.
+#[must_use = "um builder com os ganchos so serve construido: build_hooked ou build_hooked_as_child"]
+pub(in crate::windows_app) struct HookedBuilder<'app> {
+    app: &'app App,
+    builder: WebViewBuilder<'static>,
+    host: WebViewHost,
+}
+
+impl HookedBuilder<'_> {
+    /// Uma WebView de topo (a Web completa, o Leitor, o PDF, os livros),
+    /// ja com os ganchos do hospedeiro.
+    pub(in crate::windows_app) fn build_hooked(self, window: &Window) -> wry::Result<WebView> {
+        let webview = self.builder.build(window)?;
+        self.app.install_webview_hooks(&webview, self.host);
+        Ok(webview)
+    }
+
+    /// Uma WebView filha (as colunas, a fonte ao lado, os paineis, o
+    /// monitor do Gmail), ja com os ganchos do hospedeiro.
+    pub(in crate::windows_app) fn build_hooked_as_child(
+        self,
+        window: &Window,
+    ) -> wry::Result<WebView> {
+        let webview = self.builder.build_as_child(window)?;
+        self.app.install_webview_hooks(&webview, self.host);
+        Ok(webview)
+    }
+}
+
 impl App {
     /// A metade do builder para uma WebView deste hospedeiro, com a origem
     /// local que o utilizador autorizou (a Web completa e as fontes ao
-    /// lado; `None` nas outras). Cada builder passa aqui antes do `build`.
+    /// lado; `None` nas outras). Cada builder passa aqui antes do `build`,
+    /// e o `HookedBuilder` devolvido e o unico que constroi: o hospedeiro
+    /// que este argumento declara e o unico que a WebView tem, nas duas
+    /// metades.
     pub(in crate::windows_app) fn hooked_builder(
         &self,
         builder: WebViewBuilder<'static>,
         host: WebViewHost,
         local_origin: Option<String>,
-    ) -> WebViewBuilder<'static> {
+    ) -> HookedBuilder<'_> {
         let proxy = self.proxy.clone();
-        hook_webview_builder(builder, host, local_origin, move |event| {
+        let builder = hook_webview_builder(builder, host, local_origin, move |event| {
             let _ = proxy.send_event(event);
-        })
+        });
+        HookedBuilder {
+            app: self,
+            builder,
+            host,
+        }
     }
 
-    /// A unica porta para o COM de uma WebView acabada de construir: cada
-    /// uma que a app constroi passa aqui com o que e, e recebe o que a
-    /// tabela manda -- os itens do menu do botao direito nas paginas que
-    /// rolam, o `AcceleratorKeyPressed` em todas. Um runtime WebView2 sem um
-    /// dos eventos deixa a WebView sem esse gancho e fica no log.
-    pub(in crate::windows_app) fn install_webview_hooks(
-        &self,
-        webview: &WebView,
-        host: WebViewHost,
-    ) {
+    /// A unica porta para o COM de uma WebView acabada de construir: o
+    /// `HookedBuilder` traz aqui cada uma que constroi, com o hospedeiro
+    /// que recebeu, e ela recebe o que a tabela manda -- os itens do menu
+    /// do botao direito nas paginas que rolam, o `AcceleratorKeyPressed`
+    /// em todas. Privado ao modulo: nenhum sitio regista por conta propria.
+    /// Um runtime WebView2 sem um dos eventos deixa a WebView sem esse
+    /// gancho e fica no log.
+    fn install_webview_hooks(&self, webview: &WebView, host: WebViewHost) {
         let mut registrar = ComHookRegistrar {
             webview,
             auto_scroll: self.auto_scroll.clone(),

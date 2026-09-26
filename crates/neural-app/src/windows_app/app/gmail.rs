@@ -137,39 +137,34 @@ impl App {
         // Google, em https) vem de `hooked_builder`, como em todas as
         // WebViews; a tabela tambem recusa downloads deste monitor, que
         // ninguem ve.
-        let result = self
-            .hooked_builder(
-                themed_webview_builder()
-                    .with_initialization_script(init_script)
-                    .with_ipc_handler(move |request| {
-                        let Some(IpcAction::GmailState {
-                            unread,
-                            sender,
-                            subject,
-                            key,
-                        }) = parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
-                        else {
-                            return;
-                        };
-                        let _ = proxy.send_event(UserEvent::GmailInboxState {
-                            unread,
-                            sender,
-                            subject,
-                            key,
-                        });
-                    })
-                    .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
-                    .with_permission_handler(|_| PermissionResponse::Deny)
-                    .with_focused(false)
-                    .with_bounds(bounds)
-                    .with_url("https://mail.google.com/mail/u/0/#inbox"),
-                WebViewHost::GmailMonitor,
-                None,
-            )
-            .build_as_child(window);
+        let builder = themed_webview_builder()
+            .with_initialization_script(init_script)
+            .with_ipc_handler(move |request| {
+                let Some(IpcAction::GmailState {
+                    unread,
+                    sender,
+                    subject,
+                    key,
+                }) = parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
+                else {
+                    return;
+                };
+                let _ = proxy.send_event(UserEvent::GmailInboxState {
+                    unread,
+                    sender,
+                    subject,
+                    key,
+                });
+            })
+            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+            .with_permission_handler(|_| PermissionResponse::Deny)
+            .with_focused(false)
+            .with_bounds(bounds)
+            .with_url("https://mail.google.com/mail/u/0/#inbox");
+        let hooked = self.hooked_builder(builder, WebViewHost::GmailMonitor, None);
+        let result = hooked.build_hooked_as_child(window);
 
         if let Ok(webview) = result {
-            self.install_webview_hooks(&webview, WebViewHost::GmailMonitor);
             self.gmail_monitor = Some(webview);
         }
     }

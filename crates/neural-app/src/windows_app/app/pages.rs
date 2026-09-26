@@ -83,18 +83,18 @@ impl App {
             *slot = bytes;
         }
 
-        let result = if let Some(window) = &self.window {
-            self.hooked_builder(self.pdf_webview_builder(), WebViewHost::Pdf, None)
-                .with_url(format!("{PDF_ORIGIN}/viewer.html"))
-                .build(window)
-        } else {
+        let Some(window) = &self.window else {
             return;
         };
+        let builder = self
+            .pdf_webview_builder()
+            .with_url(format!("{PDF_ORIGIN}/viewer.html"));
+        let hooked = self.hooked_builder(builder, WebViewHost::Pdf, None);
+        let result = hooked.build_hooked(window);
 
         match result {
             Ok(webview) => {
                 let _ = webview.zoom(self.zoom);
-                self.install_webview_hooks(&webview, WebViewHost::Pdf);
                 #[cfg(feature = "accel-spike")]
                 self.accel_spike_hook(&webview, crate::accel_spike::SpikeHost::Pdf);
                 self.webview = Some(webview);
@@ -226,18 +226,16 @@ impl App {
         self.destroy_web_surfaces();
         self.show_omnibox(false);
         self.status = None;
-        let result = match (&self.window, &self.epub) {
-            (Some(window), Some(runtime)) => self
-                .hooked_builder(self.epub_webview_builder(runtime), WebViewHost::Epub, None)
-                .with_url(url)
-                .build(window),
-            _ => return,
+        let (Some(window), Some(runtime)) = (&self.window, &self.epub) else {
+            return;
         };
+        let builder = self.epub_webview_builder(runtime).with_url(url);
+        let hooked = self.hooked_builder(builder, WebViewHost::Epub, None);
+        let result = hooked.build_hooked(window);
         match result {
             Ok(webview) => {
                 let _ = webview.zoom(self.zoom);
                 let _ = webview.focus();
-                self.install_webview_hooks(&webview, WebViewHost::Epub);
                 #[cfg(feature = "accel-spike")]
                 self.accel_spike_hook(&webview, crate::accel_spike::SpikeHost::Epub);
                 self.webview = Some(webview);
@@ -442,22 +440,18 @@ impl App {
         // A autorizacao vale para a origem escrita, nao para a rede local.
         let local_origin = Url::parse(url).ok().as_ref().and_then(local_origin_of);
         let allow_local = local_origin.is_some();
-        let result = if let Some(window) = &self.window {
-            self.hooked_builder(
-                self.external_webview_builder(local_origin.clone(), false),
-                WebViewHost::External,
-                local_origin,
-            )
-            .with_url(url)
-            .build(window)
-        } else {
+        let Some(window) = &self.window else {
             return;
         };
+        let builder = self
+            .external_webview_builder(local_origin.clone(), false)
+            .with_url(url);
+        let hooked = self.hooked_builder(builder, WebViewHost::External, local_origin);
+        let result = hooked.build_hooked(window);
 
         match result {
             Ok(webview) => {
                 let _ = webview.zoom(self.zoom);
-                self.install_webview_hooks(&webview, WebViewHost::External);
                 #[cfg(feature = "accel-spike")]
                 self.accel_spike_hook(&webview, crate::accel_spike::SpikeHost::External);
                 self.webview = Some(webview);
@@ -493,18 +487,16 @@ impl App {
         self.show_omnibox(false);
         let html = reader_html(article);
 
-        let result = if let Some(window) = &self.window {
-            self.hooked_builder(self.reader_webview_builder(), WebViewHost::Reader, None)
-                .with_html(html)
-                .build(window)
-        } else {
+        let Some(window) = &self.window else {
             return;
         };
+        let builder = self.reader_webview_builder().with_html(html);
+        let hooked = self.hooked_builder(builder, WebViewHost::Reader, None);
+        let result = hooked.build_hooked(window);
 
         match result {
             Ok(webview) => {
                 let _ = webview.zoom(self.zoom);
-                self.install_webview_hooks(&webview, WebViewHost::Reader);
                 #[cfg(feature = "accel-spike")]
                 self.accel_spike_hook(&webview, crate::accel_spike::SpikeHost::Reader);
                 self.webview = Some(webview);

@@ -3310,23 +3310,19 @@ impl App {
             trace: vec![format!("navigate {}", valid)],
         });
 
-        let result = if let Some(window) = &self.window {
-            self.hooked_builder(
-                self.external_webview_builder(None, true),
-                WebViewHost::External,
-                None,
-            )
-            .with_url(valid.as_str())
-            .build(window)
-        } else {
+        let Some(window) = &self.window else {
             self.active_agent = None;
             return;
         };
+        let builder = self
+            .external_webview_builder(None, true)
+            .with_url(valid.as_str());
+        let hooked = self.hooked_builder(builder, WebViewHost::External, None);
+        let result = hooked.build_hooked(window);
 
         match result {
             Ok(webview) => {
                 let _ = webview.zoom(self.zoom);
-                self.install_webview_hooks(&webview, WebViewHost::External);
                 self.webview = Some(webview);
                 self.surface = Surface::External;
                 self.record(
