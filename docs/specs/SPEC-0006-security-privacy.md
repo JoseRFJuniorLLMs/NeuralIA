@@ -26,3 +26,44 @@ The optional Gmail monitor is background network activity the user is entitled t
 Local history writes MUST occur off the UI thread and retention MUST be bounded. The user MUST have a local clear-history action.
 
 The repository MUST NOT contain secrets, cookies, tokens, private certificates, or user history.
+
+## Persistence chokepoint (infra-privacy-guard, 2.4)
+
+**Status:** Partial — phase 0 (the enumeration below and the gates that pin it); the private mode itself is not reachable in the product until `private-mode-core`.
+
+Every store under `<data_dir>` has one `StoreKind` (`neural_core::json_store`): `Setting` changes only by an explicit choice in a menu or setting; `Explicit` is content the user asked to keep; `Automatic` is a side effect of use. A store opens only with a `StoreGrant`, and the only source of grants in the product is the `StoreRegistry` minted once in `App::new` and owned by the `PrivacyGuard` (`crates/neural-app/src/privacy.rs`), which never lends the registry out: features ask `guard.store(spec)`. The guard also routes the three `Automatic` writers that are side effects of browsing — the history (`record`), the semantic memory (`capture`, `save_session`) and the tab session (`save_tabs`) — and, while the shared mode says `Private`, those writes are no-ops (`private_guard_turns_automatic_stores_into_noops`; `Private` is reachable only through a `cfg(test)` constructor).
+
+### Phase 0 — every writer under the data dir
+
+The gate `no_raw_data_dir_write_outside_a_grant` (`windows_app/tests.rs`) counts `fs::write`, `File::create`, `OpenOptions::new`, `fs::rename` and `fs::copy` in the shipped code of `crates/neural-app/src` (the `windows_app` tree and the top-level modules) and of `crates/neural-core/src`, tests stripped, and fails on any occurrence outside `json_store.rs` that is not in its allowlist — one row per file, one reason per row, the same rows as this table. A file that starts writing raw turns the gate red until this table and the allowlist say why.
+
+| Writer (file) | Store under `<data_dir>` | Kind | Today | Decision |
+|---|---|---|---|---|
+| `neural-core/src/json_store.rs` | every `VersionedJsonStore`/`TokenFile` | per grant | the mechanism: `write_atomically` behind a `StoreGrant`, `writes_allowed()` checked | exempt (it is the grant) |
+| `neural-core/src/history.rs` (`HistoryStore`) | `history.jsonl` | Automatic | path-based opener | path comes from the guard's grant; every append is `PrivacyGuard::record`, a no-op in `Private` |
+| `neural-core/src/memory.rs`, `memory/sqlite_v01.rs` (`MemoryStore`) | `memory/` (documents, wiki, tombstones, derived SQLite index) | Automatic | path-based opener | root comes from the guard's grant; every capture is `PrivacyGuard::capture`, a no-op in `Private`; the SQLite index is derived from those documents |
+| `neural-core/src/research.rs` (`ResearchSession::save`) | `memory/sessions/<id>.json` | Automatic | path-based | written only by the memory worker on `PrivacyGuard::save_session`, a no-op in `Private` |
+| `neural-app/src/tab_session.rs` (`SessionStore`) + `TabPersistence` | `tabs.json`, `tabs.lock`, `tabs.cleared` | Automatic | path-based opener | only `PrivacyGuard::new` opens it; saves go through `PrivacyGuard::save_tabs`/`save_tabs_due`, no-ops in `Private` (`TabSave::SkippedPrivate`); grant-typed opener = `privacy-guard-retrofit` |
+| `neural-app/src/panel_chrome.rs` (`PanelWidths::save`) | `panel-width.json` | Automatic | path-based | allowlisted: geometry written by its own atomic helper; grant retrofit = `privacy-guard-retrofit` |
+| `neural-app/src/pomodoro_ui.rs` (`save_settings`) | `pomodoro` | Setting | path-based | allowlisted: a menu choice; `TokenFile` retrofit = `privacy-guard-retrofit` |
+| `neural-app/src/windows_app/theme.rs` (`ThemeChoice::save`) | `theme` | Setting | path-based | allowlisted: a menu choice; `TokenFile` retrofit = `privacy-guard-retrofit` |
+| `neural-app/src/windows_app/services.rs` (`save_gmail_setting`) | `gmail` | Setting | path-based | allowlisted: a menu choice; `TokenFile` retrofit = `privacy-guard-retrofit` |
+| `neural-app/src/windows_app/app/compare.rs` (`export_current_research`) | `research-exports/<id>.md` | Explicit | path-based | allowlisted: the user asked ("Exportar pesquisa"); stays writable in every mode |
+| `neural-app/src/windows_app/bookmarks.rs` (`BookmarkJob::Export`) | — (a path the user chose in the Save dialog) | Explicit | path-based | allowlisted: user-chosen export target outside the data dir |
+| `neural-app/src/windows_app/search_card.rs` (`append_debug_line`) | — (`NEURALIA_DEBUG_LOG`, outside the data dir) | — | env-chosen path | allowlisted: developer diagnostics, off by default, never under `<data_dir>` |
+| `neural-app/src/windows_app.rs` (`finish_agent`) + `neural-core/src/agent_security.rs` (`write_audit_log`) | `agent/trace-*.log`, `agent/audit-*.json` | Automatic | path-based | allowlisted: legacy agent trace and audit (PR #167 moves the agents hub credentials out of the data dir; the audit dir goes with `int-agents-finish`) |
+| `neural-app/src/secrets.rs` (`SecretFile::save`) | `keys/<slot>.key`, `gemini-live.key` | Explicit | takes grants (`KeyVault::open(keys: StoreGrant, live: StoreGrant)`) | allowlisted: the DPAPI blob is written by the vault's own atomic helper on the grant's path |
+| `neural-core/src/zettel.rs` (`ZettelStore`) | `zettel/` | Explicit | path-based opener | allowlisted: notes the user wrote; grant-typed opener = `privacy-guard-retrofit` |
+| `neural-core/src/library.rs` (`Library`) | `library/` (`books/`, `covers/`, `index.json`: Explicit; `state/`: Automatic — positions, last opened, bookmarks) | Explicit + Automatic | path-based opener | allowlisted: books the user added; the `state/` split and the grant-typed opener = `privacy-guard-retrofit` |
+| `neural-core/src/local_intelligence.rs` (`ModelPackManager`) | model packs dir | — | path-based | allowlisted: not wired into the product (`spec_0102`: `ModelPackManager` absent from the app); `local-model-packs` takes a grant from its first commit |
+| `neural-core/src/downloads.rs` (`write_motw_if_absent`) | — (the downloaded file's `Zone.Identifier`, in the user's downloads folder) | — | path-based | allowlisted: the mark of the web on a file outside the data dir |
+| `neural-core/src/bookmarks.rs` (`BookmarkStore`) | `bookmarks.json` | Explicit | takes a grant | no raw write (the `VersionedJsonStore` writes) |
+| `neural-app/src/windows_app/downloads.rs` (`DownloadsState`) | `downloads.json`, `downloads-settings.json` | Automatic, Setting | takes grants | no raw write |
+| `neural-app/src/windows_app/adblock.rs` (`AdblockState`) | `adblock-settings.json`, `adblock-list.json` | Setting, Automatic | takes grants | no raw write |
+| `neural-app/src/egress.rs`, `ai_settings.rs` (`EgressGate`) | `ai/settings.json`, `ai/usage.json`, `translate.json` | Setting, Setting, Setting | takes grants | no raw write; `ai/usage.json` is written as a side effect of paid calls but keeps `Setting` so the monthly limit survives the private store mode (`egress::tests::usage_survives_the_private_store_mode`) |
+| `neural-app/src/windows_app.rs` (`pin_webview_profile`) | `WebView2/` | Automatic | `create_dir_all` only; the WebView2 runtime writes the profile | out of the gate's patterns; the private mode of the profile is `private-mode-core`'s |
+| `neural-app/src/accel_spike_app.rs` | — (the spike dir) | — | `cfg(feature = "accel-spike")` | not scanned: never in the published exe (`test-accel-spike-marker.ps1`) |
+
+Deletions (`remove_file`, `remove_dir_all`) are not writes and stay out of the gate: they are what "Apagar histórico" and the private mode need.
+
+`scripts/test-private-mode.ps1` (CI only: it launches the exe) is phase 0 of the private-mode E2E: it hashes every file under a temporary `NEURALIA_DATA_DIR` before and after a scripted Normal session against a loopback fixture, prints what the session created or changed, and fails on any path that is not in the table above (its allowlist); later briefs extend that allowlist with the Private-mode expectations.
