@@ -188,6 +188,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Keys(event) => self.keys_event(event),
             UserEvent::WebView(event) => self.webview_event(event),
             UserEvent::Adblock(event) => self.adblock_event(event),
+            UserEvent::Distraction(event) => self.distraction_event(event),
             UserEvent::Download(event) => self.download_event(event),
             UserEvent::Translate(event) => self.translation_event(event),
             UserEvent::Bookmarks(event) => self.bookmarks_event(event),

@@ -323,11 +323,12 @@ impl App {
         // Os mesmos itens que o botao direito dentro da coluna, decididos
         // pelo mesmo `webview_menu_responder` (menu proprio: nenhum item
         // nativo).
-        // O bloqueio de anuncios fica no botao direito DENTRO da pagina (e
-        // dela que ele fala): a pilula nao o recebe.
+        // O bloqueio de anuncios e a anti-distracao ficam no botao direito
+        // DENTRO da pagina (e dela que falam): a pilula nao os recebe.
         let request = webview_menu_responder(
             WebViewHost::Column(col_index),
             self.auto_scroll.clone(),
+            None,
             None,
         )(0, None);
         let mut menu = PopupMenu::default();

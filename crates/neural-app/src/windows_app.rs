@@ -110,6 +110,9 @@ pub(in crate::windows_app) enum UserEvent {
     /// O bloqueio de anuncios (`adblock.rs`): os itens do menu e as threads
     /// que leem e baixam a lista.
     Adblock(AdblockEvent),
+    /// A anti-distracao (`distraction.rs`): a caixa «Ocultar distrações
+    /// neste site» do botao direito.
+    Distraction(DistractionEvent),
     /// O gestor de downloads (`downloads.rs`): o que o WebView2 avisa de cada
     /// download e o fim de cada um, com o evento do `neural_core::downloads`.
     Download(neural_core::downloads::DownloadEvent),
@@ -7071,6 +7074,7 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ("keymap.rs", include_str!("windows_app/keymap.rs")),
     ("translation.rs", include_str!("windows_app/translation.rs")),
     ("adblock.rs", include_str!("windows_app/adblock.rs")),
+    ("distraction.rs", include_str!("windows_app/distraction.rs")),
     ("bookmarks.rs", include_str!("windows_app/bookmarks.rs")),
     ("tests.rs", include_str!("windows_app/tests.rs")),
 ];
@@ -7164,6 +7168,8 @@ pub(in crate::windows_app) mod translation;
 pub(in crate::windows_app) use translation::*;
 pub(in crate::windows_app) mod adblock;
 pub(in crate::windows_app) use adblock::*;
+pub(in crate::windows_app) mod distraction;
+pub(in crate::windows_app) use distraction::*;
 pub(in crate::windows_app) mod bookmarks;
 pub(in crate::windows_app) use bookmarks::*;
 
