@@ -703,11 +703,44 @@ jobs:
       # fixture is 127.0.0.1 (scripts/adblock-fixture.mjs), the WebView2 maps
       # every name to 127.0.0.1 and the stored list is fresh, so no request
       # leaves the runner -- pgl.yoyo.org included. The script also checks the
-      # stored list was not rewritten (no refresh ran).
+      # stored list was not rewritten (no refresh ran). Tests and CI never
+      # reach pgl.yoyo.org: before the exe starts, the runner's hosts file
+      # maps it to 127.0.0.1, and the list refresh's resolver (pinned to
+      # Locality::Public) refuses a loopback address, so even a refresh that
+      # ran by mistake could never leave the machine.
       - name: Adblock E2E on the tested exe (loopback only)
         shell: pwsh
         timeout-minutes: 5
-        run: ./scripts/test-adblock.ps1 -ExePath ci-tested/NeuralIA.exe
+        run: |
+          $ErrorActionPreference = "Stop"
+          $hostsPath = 'C:\Windows\System32\drivers\etc\hosts'
+          $entry = '127.0.0.1 pgl.yoyo.org'
+          $pinned = '(?m)^[ \t]*127\.0\.0\.1[ \t]+pgl\.yoyo\.org[ \t]*\r?$'
+          $current = [IO.File]::ReadAllText($hostsPath)
+          if ($current -notmatch $pinned) {
+            $separator = if ($current.Length -gt 0 -and -not $current.EndsWith("`n")) { "`r`n" } else { "" }
+            [IO.File]::AppendAllText($hostsPath, "$separator$entry`r`n", [Text.Encoding]::ASCII)
+          }
+          if ([IO.File]::ReadAllText($hostsPath) -notmatch $pinned) {
+            throw "The hosts file does not map pgl.yoyo.org to 127.0.0.1."
+          }
+          Write-Host "hosts: $entry"
+          ./scripts/test-adblock.ps1 -ExePath ci-tested/NeuralIA.exe
+      # E2E of the download manager (downloads-manager) on the exact bytes
+      # that release.yml packages. It opens the exe (windows that can take the
+      # focus), so it never runs in the local suite. The fixture
+      # (scripts/downloads-fixture.mjs) listens on 127.0.0.1 only: no request
+      # leaves the runner. Gates: a fixture setup.exe is refused before it
+      # starts (nothing on disk, recorded as blocked) and a PDF lands with the
+      # mark of the web (Zone.Identifier). The spike (does destroying a WebView
+      # cancel its download?) only reports, in the log and the step summary;
+      # it never fails the step.
+      - name: Downloads E2E on the tested exe (setup.exe refused, PDF with MOTW)
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          ./scripts/test-downloads.ps1 -SelfTest
+          ./scripts/test-downloads.ps1 -ExePath ci-tested/NeuralIA.exe
       # Release contract of the CI-only accelerator spike (infra-accel-spike):
       # the exact bytes that release.yml packages were built without the spike
       # feature, so the spike marker is not in them. The spike itself runs in

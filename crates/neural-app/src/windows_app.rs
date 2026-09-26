@@ -110,6 +110,9 @@ pub(in crate::windows_app) enum UserEvent {
     /// O bloqueio de anuncios (`adblock.rs`): os itens do menu e as threads
     /// que leem e baixam a lista.
     Adblock(AdblockEvent),
+    /// O gestor de downloads (`downloads.rs`): o que o WebView2 avisa de cada
+    /// download e o fim de cada um, com o evento do `neural_core::downloads`.
+    Download(neural_core::downloads::DownloadEvent),
     /// Pedido da pagina local do painel lateral (canal proprio), com o
     /// numero da pagina que o mandou.
     Panel(side_panel::PanelPost),
@@ -3159,6 +3162,9 @@ pub(in crate::windows_app) struct App {
     /// O bloqueio de anuncios (`adblock.rs`): a escolha, a lista e o que os
     /// handlers do WebView2 leem.
     pub(in crate::windows_app) adblock: AdblockState,
+    /// O gestor de downloads (`downloads.rs`): o `DownloadManager`, as
+    /// operacoes vivas do WebView2 e o `downloads.json`.
+    pub(in crate::windows_app) downloads: DownloadsState,
 }
 
 impl App {
@@ -3211,6 +3217,7 @@ impl App {
         let keys = KeysState::new(proxy.clone());
         // Desligado (quem nunca clicou em "Ativar"), so le a escolha.
         let adblock = AdblockState::open(stores.as_ref(), &proxy);
+        let downloads = DownloadsState::open(stores.as_ref());
         Self {
             document,
             pdf_bytes: Arc::new(Mutex::new(Vec::new())),
@@ -3289,6 +3296,7 @@ impl App {
             stores,
             keys,
             adblock,
+            downloads,
         }
     }
 }
@@ -6963,6 +6971,7 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
         "webview_hooks.rs",
         include_str!("windows_app/webview_hooks.rs"),
     ),
+    ("downloads.rs", include_str!("windows_app/downloads.rs")),
     ("commands.rs", include_str!("windows_app/commands.rs")),
     ("keymap.rs", include_str!("windows_app/keymap.rs")),
     ("adblock.rs", include_str!("windows_app/adblock.rs")),
@@ -7046,6 +7055,8 @@ pub(in crate::windows_app) mod page_eval;
 pub(in crate::windows_app) use page_eval::*;
 pub(in crate::windows_app) mod webview_hooks;
 pub(in crate::windows_app) use webview_hooks::*;
+pub(in crate::windows_app) mod downloads;
+pub(in crate::windows_app) use downloads::*;
 pub(in crate::windows_app) mod commands;
 pub(in crate::windows_app) use commands::*;
 pub(in crate::windows_app) mod keymap;
