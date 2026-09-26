@@ -8,6 +8,7 @@ pub mod agent_security;
 pub mod ai_policy;
 pub mod bookmarks;
 pub mod config;
+pub mod distraction;
 pub mod domains;
 pub mod downloads;
 pub mod epub;
