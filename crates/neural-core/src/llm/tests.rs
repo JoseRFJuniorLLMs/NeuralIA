@@ -351,6 +351,20 @@ fn status_cases() -> Vec<StatusCase> {
             r#"{{"error":{{"code":{code},"message":"{message} {TEST_KEY} {BODY_SENTINEL}","status":"{status}","details":[{detail}]}}}}"#
         )
     };
+    // Uma quota da Gemini esgotada, com a forma dos corpos reais (tirada de
+    // relatos publicos, nao de uma chamada): o texto fala de faturacao tanto
+    // na quota por minuto como na diaria, as duas trazem `RetryInfo`, e so o
+    // `quotaId` do `QuotaFailure` as distingue.
+    let gemini_quota = |quota_id: &str, retry_delay: &str| {
+        gemini_error(
+            429,
+            "You exceeded your current quota, please check your plan and billing details.",
+            "RESOURCE_EXHAUSTED",
+            &format!(
+                r#"{{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{{"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","quotaId":"{quota_id}","quotaDimensions":{{"location":"global","model":"test-model"}},"quotaValue":"10"}}]}},{{"@type":"type.googleapis.com/google.rpc.Help","links":[{{"description":"Learn more about Gemini API quotas"}}]}},{{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"{retry_delay}"}}"#
+            ),
+        )
+    };
     let plain = format!(r#"{{"error":{{"message":"{TEST_KEY} {BODY_SENTINEL}"}}}}"#);
     vec![
         (
@@ -383,6 +397,14 @@ fn status_cases() -> Vec<StatusCase> {
             ApiError::NoCredits { status: 403 },
         ),
         (
+            "400 Bad Request",
+            vec![],
+            format!(
+                r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"Your credit balance is too low to access the API. {TEST_KEY} {BODY_SENTINEL}"}}}}"#
+            ),
+            ApiError::NoCredits { status: 400 },
+        ),
+        (
             "402 Payment Required",
             vec![],
             plain.clone(),
@@ -392,8 +414,29 @@ fn status_cases() -> Vec<StatusCase> {
             "429 Too Many Requests",
             vec![],
             format!(
-                r#"{{"error":{{"message":"You exceeded your current quota. {TEST_KEY} {BODY_SENTINEL}","type":"insufficient_quota","code":"insufficient_quota"}}}}"#
+                r#"{{"error":{{"message":"You exceeded your current quota, please check your plan and billing details. {TEST_KEY} {BODY_SENTINEL}","type":"insufficient_quota","code":"insufficient_quota"}}}}"#
             ),
+            ApiError::NoCredits { status: 429 },
+        ),
+        // A quota por minuto da Gemini passa sozinha: "muitos pedidos" com a
+        // espera do `retryDelay`, embora o texto fale de faturacao.
+        (
+            "429 Too Many Requests",
+            vec![],
+            gemini_quota(
+                "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+                "37s",
+            ),
+            ApiError::RateLimited {
+                retry_after_secs: Some(37),
+            },
+        ),
+        // A diaria so volta no dia seguinte: os 49 s do `retryDelay` nao
+        // chegam ao cartao.
+        (
+            "429 Too Many Requests",
+            vec![],
+            gemini_quota("GenerateRequestsPerDayPerProjectPerModel-FreeTier", "49s"),
             ApiError::NoCredits { status: 429 },
         ),
         (

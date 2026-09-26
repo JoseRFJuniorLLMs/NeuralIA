@@ -2,8 +2,8 @@
 //! utilizador ve. Um `ApiError` so leva numeros que nao identificam nada (o
 //! estado HTTP, os segundos de espera, o tecto): nunca a chave, nunca o corpo
 //! da resposta nem um pedaco dele. O corpo de um erro e lido aqui, com
-//! tecto, so para distinguir "chave recusada" de "sem creditos" -- e morre
-//! aqui.
+//! tecto, so para distinguir "chave recusada", "sem creditos" e "muitos
+//! pedidos" (com a espera) -- e morre aqui.
 
 use std::fmt;
 
@@ -15,10 +15,13 @@ pub const MAX_RETRY_AFTER_SECS: u64 = 3600;
 pub enum ApiError {
     /// 401/403, ou a razao de chave invalida no corpo.
     KeyRejected { status: u16 },
-    /// 402, ou a razao de quota/creditos/faturacao no corpo.
+    /// 402; num 400/401/403, a razao de creditos ou de faturacao no corpo;
+    /// num 429, so uma razao explicita de creditos ou a quota diaria da
+    /// Gemini esgotada.
     NoCredits { status: u16 },
-    /// 429 sem razao de creditos. `retry_after_secs` vem do `Retry-After` ou
-    /// do `retryDelay` da Gemini.
+    /// Qualquer outro 429, a quota por minuto da Gemini incluida (o texto
+    /// dela fala de faturacao). `retry_after_secs` vem do `Retry-After` ou do
+    /// `retryDelay` da Gemini.
     RateLimited { retry_after_secs: Option<u64> },
     /// 404: o modelo nao existe (ou deixou de existir) nesta API.
     ModelUnavailable { status: u16 },
@@ -77,13 +80,18 @@ const KEY_REASONS: &[&str] = &[
     "authentication_error",
 ];
 
-/// As razoes de quota, creditos ou faturacao.
-const CREDIT_REASONS: &[&str] = &["insufficient_quota", "credit balance", "billing"];
+/// As razoes que so querem dizer "sem creditos", em qualquer estado.
+const CREDIT_REASONS: &[&str] = &["insufficient_quota", "credit balance"];
+
+/// A faturacao: diz "sem creditos" num 400/401/403, nunca num 429. A Gemini
+/// (e a OpenAI) escrevem "check your plan and billing details" em toda a
+/// quota esgotada, tambem na de por minuto, que passa sozinha.
+const BILLING_REASONS: &[&str] = &["billing"];
 
 /// Classifica um estado HTTP que nao e 2xx. O corpo so e procurado por
 /// razoes conhecidas; nada dele entra no erro.
 pub(crate) fn classify_status(status: u16, retry_after: Option<&str>, body: &[u8]) -> ApiError {
-    let credits = has_any(body, CREDIT_REASONS);
+    let credits = has_any(body, CREDIT_REASONS) || has_any(body, BILLING_REASONS);
     let key = has_any(body, KEY_REASONS);
     match status {
         300..=399 => ApiError::ServiceUnavailable {
@@ -96,16 +104,28 @@ pub(crate) fn classify_status(status: u16, retry_after: Option<&str>, body: &[u8
         400 if credits => ApiError::NoCredits { status },
         404 => ApiError::ModelUnavailable { status },
         408 | 504 => ApiError::Timeout,
-        429 if credits => ApiError::NoCredits { status },
-        429 => ApiError::RateLimited {
-            retry_after_secs: retry_after
-                .and_then(parse_retry_after)
-                .or_else(|| gemini_retry_delay(body)),
-        },
+        429 => classify_too_many_requests(retry_after, body),
         400..=499 => ApiError::Rejected { status },
         _ => ApiError::ServiceUnavailable {
             status: Some(status),
         },
+    }
+}
+
+/// Um 429 e "sem creditos" so com uma razao explicita de creditos
+/// (`insufficient_quota`, `credit balance`) ou com uma quota diaria da Gemini
+/// esgotada, que so volta no dia seguinte por mais que o `retryDelay` diga
+/// segundos. Qualquer outro e "muitos pedidos", e a espera do `Retry-After`
+/// ou do `retryDelay` chega ao cartao.
+fn classify_too_many_requests(retry_after: Option<&str>, body: &[u8]) -> ApiError {
+    let details = gemini_error_details(body);
+    if has_any(body, CREDIT_REASONS) || details.iter().any(is_daily_quota_failure) {
+        return ApiError::NoCredits { status: 429 };
+    }
+    ApiError::RateLimited {
+        retry_after_secs: retry_after
+            .and_then(parse_retry_after)
+            .or_else(|| gemini_retry_delay(&details)),
     }
 }
 
@@ -131,13 +151,40 @@ fn parse_retry_after(value: &str) -> Option<u64> {
     )
 }
 
+/// Os `error.details[]` de um erro da Gemini; vazio em qualquer outro corpo.
+fn gemini_error_details(body: &[u8]) -> Vec<serde_json::Value> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    match value
+        .pointer_mut("/error/details")
+        .map(serde_json::Value::take)
+    {
+        Some(serde_json::Value::Array(details)) => details,
+        _ => Vec::new(),
+    }
+}
+
+/// A Gemini diz que quota se esgotou em `QuotaFailure.violations[].quotaId`:
+/// `GenerateRequestsPerDayPerProjectPerModel-FreeTier` e diaria,
+/// `GenerateRequestsPerMinutePerProjectPerModel-FreeTier` e por minuto.
+fn is_daily_quota_failure(detail: &serde_json::Value) -> bool {
+    detail
+        .get("violations")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|violations| {
+            violations.iter().any(|violation| {
+                violation
+                    .get("quotaId")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|quota| quota.contains("PerDay"))
+            })
+        })
+}
+
 /// A Gemini diz quanto esperar em `error.details[].retryDelay` (`"37s"`).
-fn gemini_retry_delay(body: &[u8]) -> Option<u64> {
-    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    value
-        .get("error")?
-        .get("details")?
-        .as_array()?
+fn gemini_retry_delay(details: &[serde_json::Value]) -> Option<u64> {
+    details
         .iter()
         .filter_map(|detail| detail.get("retryDelay")?.as_str())
         .find_map(parse_duration_secs)
