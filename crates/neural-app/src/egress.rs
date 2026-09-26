@@ -60,7 +60,7 @@ use neural_core::ai_policy::{DataClass, Locality, MaySend, may_send};
 use neural_core::json_store::{
     Degraded, LoadOutcome, SaveOutcome, StoreGrant, StoreKind, StoreRegistry, VersionedJsonStore,
 };
-use neural_core::llm::{Pick, PriceTier, Provider};
+use neural_core::llm::{ModelId, Pick, PriceTier, Provider};
 use serde::{Deserialize, Serialize};
 
 use crate::ai_settings::{
@@ -1032,6 +1032,15 @@ impl EgressGate {
                     .unwrap_or_default()
             })
             .soft_cap()
+    }
+
+    /// O modelo que o dono fixou para `feature` em IA › Cérebros (do
+    /// `ai/settings.json`, lido uma vez), se e um id valido. `llm::pick`
+    /// usa-o antes da regra quando ele esta na listagem.
+    pub(crate) fn model_pin(&mut self, feature: AiPurpose) -> Option<ModelId> {
+        self.soft_cap();
+        let pin = self.settings_cache.as_ref()?.purpose(feature).model_pin?;
+        ModelId::parse(&pin)
     }
 
     /// As chamadas pagas deste mes: o `ai/usage.json` relido agora (todas as

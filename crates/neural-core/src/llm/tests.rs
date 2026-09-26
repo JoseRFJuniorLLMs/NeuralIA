@@ -60,6 +60,7 @@ fn prompt() -> TextPrompt<'static> {
         temperature: Some(0.2),
         max_output_tokens: Some(256),
         json_output: false,
+        response_schema: None,
     }
 }
 
@@ -821,6 +822,24 @@ fn generate_content_request_and_answer() {
     assert_eq!(
         body["generationConfig"]["responseMimeType"],
         "application/json"
+    );
+    assert!(body["generationConfig"].get("responseSchema").is_none());
+    // A forma da Traducao: um array de strings, com o JSON implicito.
+    let schema = gemini::generate_content_request(
+        &model(),
+        &TextPrompt {
+            response_schema: Some(gemini::ResponseSchema::StringArray),
+            ..prompt()
+        },
+    );
+    let body: Value = serde_json::from_slice(schema.body()).expect("JSON body");
+    assert_eq!(
+        body["generationConfig"]["responseMimeType"],
+        "application/json"
+    );
+    assert_eq!(
+        body["generationConfig"]["responseSchema"],
+        serde_json::json!({ "type": "ARRAY", "items": { "type": "STRING" } })
     );
 
     let thought = r#"{"candidates":[{"content":{"parts":[{"text":"pensando","thought":true},{"text":"Ol"},{"text":"á"}]},"finishReason":"MAX_TOKENS"}]}"#;

@@ -22,9 +22,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 // "Esquecer chave", `Forget`. O EDIT e limpo antes de o popup ser destruido,
 // e logo que a chave sai dele.
 //
-// Quem abre o pedido sao os consumidores das chaves (traducao, juiz do
-// Consenso, BYOM, conectores), que chegam nas ondas seguintes: por agora
-// `App::open_secret_prompt` nao tem quem a chame no produto.
+// Quem abre o pedido sao os consumidores das chaves: a Traducao (o
+// «Guardar chave» do cartao sem chave, `translation.rs`) e a primeira; o
+// juiz do Consenso, o BYOM e os conectores chegam nas ondas seguintes.
 
 /// O que o pedido de chave manda ao event loop.
 #[derive(Debug)]
@@ -565,8 +565,7 @@ impl App {
     }
 
     /// Abre o pedido de chave do `slot` (um de cada vez). E a porta dos
-    /// consumidores das chaves, que chegam nas ondas seguintes.
-    #[allow(dead_code)]
+    /// consumidores das chaves (a Traducao e a primeira).
     pub(in crate::windows_app) fn open_secret_prompt(&mut self, slot: KeySlot) {
         self.close_secret_prompt();
         let Some(window) = &self.window else {

@@ -8,7 +8,8 @@
 //! que nao esteja aqui: uma loja nova nasce com o seu tipo declarado. O
 //! registo das lojas so e cunhado no `App::new`; hoje abrem as suas por grant
 //! o cofre das chaves (`KEYS_STORE`, `LIVE_KEY_STORE`) e o portao de saida da
-//! IA (`AI_SETTINGS_STORE`, `AI_USAGE_STORE`, em `egress.rs`). Levar as outras
+//! IA (`AI_SETTINGS_STORE`, `AI_USAGE_STORE`, em `egress.rs`) e a Traducao
+//! (`TRANSLATE_STORE`, a loja «Sempre neste site»). Levar as outras
 //! para grants e o `no_raw_data_dir_write_outside_a_grant` do
 //! infra-privacy-guard.
 
@@ -40,6 +41,11 @@ pub(crate) const AI_SETTINGS_STORE: StoreSpec = StoreSpec::new("ai/settings.json
 /// privado das lojas saltaria as gravacoes e o limite recomecaria na sessao
 /// seguinte (gate `egress::tests::usage_survives_the_private_store_mode`).
 pub(crate) const AI_USAGE_STORE: StoreSpec = StoreSpec::new("ai/usage.json", Setting, File);
+/// `<data_dir>/translate.json`: «Sempre neste site» da Traducao -- os pares
+/// (cerebro, origem) que o dono autorizou num cartao (`egress::SiteGrants`).
+/// So muda por um clique nesse botao, que nunca existe num contexto
+/// privado: `Setting`. Nunca leva texto de uma pagina nem uma traducao.
+pub(crate) const TRANSLATE_STORE: StoreSpec = StoreSpec::new("translate.json", Setting, File);
 /// `<data_dir>/downloads.json`: o registo dos downloads acabados
 /// (`neural_core::downloads::DownloadLog`), escrito ao fim de cada um --
 /// efeito lateral do uso. Nunca leva um download do Split privado nem de
@@ -101,6 +107,7 @@ pub(crate) const APP_STORES: &[StoreSpec] = &[
     ADBLOCK_LIST_STORE,
     AI_SETTINGS_STORE,
     AI_USAGE_STORE,
+    TRANSLATE_STORE,
     BOOKMARKS_STORE,
 ];
 

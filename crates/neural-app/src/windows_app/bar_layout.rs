@@ -188,13 +188,22 @@ impl BarColumns {
 /// `ALL`. Regra: o grupo inteiro ou cabe na faixa da coluna ou nao existe
 /// (largura 0), como o "+": nunca um botao invisivel mas clicavel por cima
 /// da IA seguinte (gate `column_buttons_fit_or_vanish`). Um botao
-/// `optional` (a estrela dos favoritos, que o Ctrl+D substitui) cede antes
-/// da pilula: so entra quando, com ele, a pilula da IA fica com pelo menos
-/// `COLUMN_PILL_MIN`; sem ele os outros ficam onde estavam.
+/// `optional` cede antes da pilula: so entra quando, com ele, a pilula da
+/// IA fica com pelo menos `COLUMN_PILL_MIN`; sem ele os outros ficam onde
+/// estavam. Sao dois, o 文A (que o item «Traduzir página» do botao direito
+/// substitui) e a estrela dos favoritos (que o Ctrl+D substitui), e cedem
+/// um a um do fim de `ALL` para o inicio: numa faixa com lugar so para um,
+/// fica o 文A e a estrela cede (a primeira a ir e a ultima da fila, por
+/// isso nenhum botao que fica muda de sitio). A regra e deterministica: o
+/// numero de opcionais que ficam e o maior que ainda deixa a pilula com
+/// `COLUMN_PILL_MIN`, e ficam os primeiros desse numero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::windows_app) enum ColumnButton {
     Back,
     Forward,
+    /// 文A: «Traduzir página» (`translation.rs`); outro clique devolve o
+    /// original.
+    Translate,
     /// A estrela dos favoritos (bookmarks): ☆ ou, com a pagina da coluna
     /// nos favoritos, ★ (a pintura escolhe pelo `BarState::bookmarked`).
     Bookmark,
@@ -208,21 +217,28 @@ pub(in crate::windows_app) const COLUMN_BUTTONS: usize = ColumnButton::ALL.len()
 pub(in crate::windows_app) const COLUMN_PILL_MIN: f64 = 60.0;
 
 impl ColumnButton {
-    pub(in crate::windows_app) const ALL: [Self; 3] = [Self::Back, Self::Forward, Self::Bookmark];
+    pub(in crate::windows_app) const ALL: [Self; 4] =
+        [Self::Back, Self::Forward, Self::Translate, Self::Bookmark];
     /// Largura logica de cada botao (a mesma do "+") e a folga entre eles.
+    /// A folga passou de 4 para 2 com o 文A (translation) e fica em 2 com a
+    /// estrela: com os quatro, os dois opcionais entram mais cedo, e a
+    /// 1024 px a pilula da IA da direita ainda existe (fica estreita).
     pub(in crate::windows_app) const WIDTH: f64 = 26.0;
-    pub(in crate::windows_app) const GAP: f64 = 4.0;
+    pub(in crate::windows_app) const GAP: f64 = 2.0;
 
-    /// Cede antes da pilula (so a estrela: o Ctrl+D faz o mesmo sem ela).
-    /// Os opcionais vem depois dos outros em `ALL`.
+    /// Cede antes da pilula: o 文A (o «Traduzir página» do botao direito
+    /// faz o mesmo sem ele) e a estrela (o Ctrl+D faz o mesmo sem ela). Os
+    /// opcionais vem depois dos outros em `ALL` e cedem do ultimo para o
+    /// primeiro: a estrela antes do 文A.
     pub(in crate::windows_app) fn optional(self) -> bool {
-        matches!(self, Self::Bookmark)
+        matches!(self, Self::Translate | Self::Bookmark)
     }
 
     pub(in crate::windows_app) fn glyph(self) -> &'static str {
         match self {
             Self::Back => "‹",
             Self::Forward => "›",
+            Self::Translate => "文A",
             Self::Bookmark => "☆",
         }
     }
@@ -232,6 +248,7 @@ impl ColumnButton {
         match self {
             Self::Back => BarHit::ColumnBack(column),
             Self::Forward => BarHit::ColumnForward(column),
+            Self::Translate => BarHit::ColumnTranslate(column),
             Self::Bookmark => BarHit::ColumnBookmark(column),
         }
     }
@@ -275,8 +292,9 @@ pub(in crate::windows_app) struct BarLayout {
     pub(in crate::windows_app) back: UiRect,
     pub(in crate::windows_app) forward: UiRect,
     /// Por coluna, os botoes a seguir ao "+", na ordem de `ColumnButton::ALL`
-    /// (‹ e ›); `column_button` le-os pelo nome. Ou o grupo inteiro cabe na
-    /// faixa da coluna ou nenhum existe (largura 0).
+    /// (‹ › 文A ☆); `column_button` le-os pelo nome. Ou o grupo inteiro cabe
+    /// na faixa da coluna ou nenhum existe (largura 0); um opcional que
+    /// cedeu tambem tem largura 0.
     pub(in crate::windows_app) column_buttons: [[UiRect; COLUMN_BUTTONS]; COMPARATOR_COLUMNS],
     /// Por coluna: a pilula do provedor sobre a sua faixa, ou -- se estiver
     /// minimizada -- o chip compacto encostado aos controlos da direita.
@@ -497,24 +515,26 @@ impl BarLayout {
             // `available >= provider_width + plus_width + gap`, o que tornava o
             // `.min()` de baixo matematicamente morto e a pilula nunca encolhia.
             let available = (right - left).max(0.0);
-            // "+" e os botoes da coluna (`ColumnButton::ALL`: ‹ e ›) depois
-            // da pilula: ela encolhe primeiro.
+            // "+" e os botoes da coluna (`ColumnButton::ALL`: ‹ › 文A ☆)
+            // depois da pilula: ela encolhe primeiro.
             let button_width = ColumnButton::WIDTH * scale;
             let button_gap = ColumnButton::GAP * scale;
             let slot = button_width + button_gap;
             let optional = ColumnButton::ALL
                 .iter()
                 .filter(|button| button.optional())
-                .count() as f64;
-            let required_after = plus_width + gap + (COLUMN_BUTTONS as f64 - optional) * slot;
-            // Os opcionais (a estrela) so entram com a pilula ainda legivel.
-            let with_optional =
-                available - required_after - optional * slot >= COLUMN_PILL_MIN * scale;
-            let reserved_after = if with_optional {
-                required_after + optional * slot
-            } else {
-                required_after
-            };
+                .count();
+            let required_after = plus_width + gap + (COLUMN_BUTTONS - optional) as f64 * slot;
+            // Os opcionais (o 文A e a estrela) so entram com a pilula ainda
+            // legivel, um a um pela ordem de `ALL`: ficam os primeiros
+            // `kept_optional`, e a estrela, a ultima, e a primeira a ceder.
+            let kept_optional = (0..=optional)
+                .rev()
+                .find(|kept| {
+                    available - required_after - *kept as f64 * slot >= COLUMN_PILL_MIN * scale
+                })
+                .unwrap_or(0);
+            let reserved_after = required_after + kept_optional as f64 * slot;
             let pill = provider_width.min((available - reserved_after).max(0.0));
             columns_rect[span.index] = UiRect {
                 x: left,
@@ -536,15 +556,20 @@ impl BarLayout {
                 },
                 height: row_h - 4.0 * scale,
             };
-            // Os botoes desta IA (‹ e ›), um a seguir ao outro depois do "+",
-            // pela ordem do registo. Tal como o "+", ou o grupo cabe na
-            // faixa ou nao existe: nunca um botao invisivel mas clicavel por
-            // cima da IA seguinte.
+            // Os botoes desta IA, um a seguir ao outro depois do "+", pela
+            // ordem do registo (dos opcionais, so os `kept_optional`
+            // primeiros). Tal como o "+", ou o grupo cabe na faixa ou nao
+            // existe: nunca um botao invisivel mas clicavel por cima da IA
+            // seguinte.
             let mut x = plus_x + plus_width;
             let mut buttons = [empty; COLUMN_BUTTONS];
+            let mut optional_seen = 0;
             for (rect, button) in buttons.iter_mut().zip(ColumnButton::ALL) {
-                if button.optional() && !with_optional {
-                    continue;
+                if button.optional() {
+                    optional_seen += 1;
+                    if optional_seen > kept_optional {
+                        continue;
+                    }
                 }
                 x += button_gap;
                 *rect = UiRect {

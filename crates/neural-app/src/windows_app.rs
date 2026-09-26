@@ -113,6 +113,9 @@ pub(in crate::windows_app) enum UserEvent {
     /// O gestor de downloads (`downloads.rs`): o que o WebView2 avisa de cada
     /// download e o fim de cada um, com o evento do `neural_core::downloads`.
     Download(neural_core::downloads::DownloadEvent),
+    /// Traduzir pagina (`translation.rs`): o 文A ou o menu, as leituras do
+    /// `page_eval`, a thread `neural-translate` e o cartao.
+    Translate(TranslateEvent),
     /// A interface dos downloads (`downloads_ui.rs`): o Ctrl+J, a seta da
     /// barra e os cliques no cartao «Baixar programa?» ou da saida.
     DownloadsUi(DownloadsUiEvent),
@@ -453,7 +456,9 @@ pub(in crate::windows_app) enum BarHit {
     /// ‹ e › de cada IA, logo depois do "+" da coluna.
     ColumnBack(usize),
     ColumnForward(usize),
-    /// A estrela ☆/★ dos favoritos de cada IA, depois do ›.
+    /// O 文A de cada IA: «Traduzir página» (ou devolver o original).
+    ColumnTranslate(usize),
+    /// A estrela ☆/★ dos favoritos de cada IA, depois do › e do 文A.
     ColumnBookmark(usize),
     /// A estrela ☆/★ da fonte aberta ao lado, depois do › dela.
     SplitBookmark,
@@ -1012,6 +1017,9 @@ pub(in crate::windows_app) fn bar_tooltip_label(
         BarHit::Forward => "Avançar na fonte aberta ao lado".to_string(),
         BarHit::ColumnBack(_) => format!("Voltar no {provider}"),
         BarHit::ColumnForward(_) => format!("Avançar no {provider}"),
+        BarHit::ColumnTranslate(_) => format!(
+            "{TRANSLATE_PAGE_LABEL} do {provider} para o português (outro clique: o original)"
+        ),
         BarHit::ColumnBookmark(index) => {
             bookmark_star_tooltip(state.bookmarked.get(index).copied().unwrap_or(false)).to_string()
         }
@@ -3195,6 +3203,10 @@ pub(in crate::windows_app) struct App {
     /// O gestor de downloads (`downloads.rs`): o `DownloadManager`, as
     /// operacoes vivas do WebView2 e o `downloads.json`.
     pub(in crate::windows_app) downloads: DownloadsState,
+    /// Traduzir pagina (`translation.rs`): as leituras, os runs e o cartao.
+    /// Nasce sem thread, sem cofre e sem disco; a thread `neural-translate`
+    /// so no primeiro clique.
+    pub(in crate::windows_app) translation: TranslationState,
     /// A interface dos downloads (`downloads_ui.rs`): as linhas do painel,
     /// a velocidade de cada um, o cartao e a seta da barra.
     pub(in crate::windows_app) downloads_ui: DownloadsUiState,
@@ -3255,6 +3267,8 @@ impl App {
         // Desligado (quem nunca clicou em "Ativar"), so le a escolha.
         let adblock = AdblockState::open(stores.as_ref(), &proxy);
         let downloads = DownloadsState::open(stores.as_ref());
+        // Sem thread nem disco: a `neural-translate` so nasce no 1.o clique.
+        let translation = TranslationState::new(proxy.clone());
         let downloads_ui = DownloadsUiState::new(proxy.clone());
         Self {
             document,
@@ -3336,6 +3350,7 @@ impl App {
             adblock,
             egress: None,
             downloads,
+            translation,
             downloads_ui,
             bookmarks: BookmarksState::default(),
         }
@@ -3344,9 +3359,8 @@ impl App {
 
 impl App {
     /// O portao de saida da IA, criado no primeiro pedido com os grants do
-    /// registo das lojas. E a porta das features de IA, que chegam nas ondas
-    /// seguintes (a Traducao e a primeira).
-    #[allow(dead_code)]
+    /// registo das lojas. E a porta das features de IA; a Traducao
+    /// (`translation.rs`) e a primeira a pedi-lo.
     pub(in crate::windows_app) fn egress_gate(&mut self) -> &mut crate::egress::EgressGate {
         let stores = self.stores.as_ref();
         self.egress
@@ -6621,7 +6635,9 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
             // A estrela enche-se quando a pagina da coluna e um favorito.
             let glyph = match button {
                 ColumnButton::Bookmark => bookmark_star_glyph(*starred),
-                ColumnButton::Back | ColumnButton::Forward => button.glyph(),
+                ColumnButton::Back | ColumnButton::Forward | ColumnButton::Translate => {
+                    button.glyph()
+                }
             };
             pairs.push((
                 layout.column_button(index, button),
@@ -7053,6 +7069,7 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ),
     ("commands.rs", include_str!("windows_app/commands.rs")),
     ("keymap.rs", include_str!("windows_app/keymap.rs")),
+    ("translation.rs", include_str!("windows_app/translation.rs")),
     ("adblock.rs", include_str!("windows_app/adblock.rs")),
     ("bookmarks.rs", include_str!("windows_app/bookmarks.rs")),
     ("tests.rs", include_str!("windows_app/tests.rs")),
@@ -7127,8 +7144,8 @@ pub(in crate::windows_app) use popup_menu::*;
 pub(in crate::windows_app) mod native_card;
 pub(in crate::windows_app) use native_card::*;
 // Leitura de paginas por script so-leitura (infra-llm-untrusted, plano 2.3):
-// os consumidores (Traducao, Consenso, Copiloto, Escudo) chegam nas ondas
-// seguintes; ate la so corre nos testes.
+// a Traducao (`translation.rs`) e o primeiro consumidor; o Consenso, o
+// Copiloto e o Escudo chegam nas ondas seguintes.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::windows_app) mod page_eval;
 #[cfg_attr(not(test), allow(unused_imports))]
@@ -7143,6 +7160,8 @@ pub(in crate::windows_app) mod commands;
 pub(in crate::windows_app) use commands::*;
 pub(in crate::windows_app) mod keymap;
 pub(in crate::windows_app) use keymap::*;
+pub(in crate::windows_app) mod translation;
+pub(in crate::windows_app) use translation::*;
 pub(in crate::windows_app) mod adblock;
 pub(in crate::windows_app) use adblock::*;
 pub(in crate::windows_app) mod bookmarks;

@@ -141,9 +141,25 @@ pub fn list_models(
     Ok(models)
 }
 
+/// A forma que a resposta tem de ter (`responseSchema`). Lista fechada: so
+/// formas escritas aqui, nunca um esquema vindo de fora.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseSchema {
+    /// Um array JSON de strings (a Traducao: um item por texto do bloco).
+    StringArray,
+}
+
+impl ResponseSchema {
+    fn json(self) -> Value {
+        match self {
+            Self::StringArray => json!({ "type": "ARRAY", "items": { "type": "STRING" } }),
+        }
+    }
+}
+
 /// O texto a gerar. Com texto de fora, `system` e `user` vem de um
 /// `untrusted::BuiltPrompt` (`system()` e `user()`), que cerca os dados;
-/// nenhuma feature chama isto ainda.
+/// a Traducao (`crate::translate`) e a primeira a chama-lo.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TextPrompt<'a> {
     pub system: Option<&'a str>,
@@ -152,6 +168,8 @@ pub struct TextPrompt<'a> {
     pub max_output_tokens: Option<u32>,
     /// Pede `application/json` na resposta.
     pub json_output: bool,
+    /// A forma da resposta; implica `application/json`.
+    pub response_schema: Option<ResponseSchema>,
 }
 
 /// O pedido `generateContent` de um modelo.
@@ -174,8 +192,11 @@ pub fn generate_content_request(model: &ModelId, prompt: &TextPrompt<'_>) -> Api
     if let Some(tokens) = prompt.max_output_tokens {
         config.insert("maxOutputTokens".to_string(), json!(tokens));
     }
-    if prompt.json_output {
+    if prompt.json_output || prompt.response_schema.is_some() {
         config.insert("responseMimeType".to_string(), json!("application/json"));
+    }
+    if let Some(schema) = prompt.response_schema {
+        config.insert("responseSchema".to_string(), schema.json());
     }
     if !config.is_empty() {
         body.insert("generationConfig".to_string(), Value::Object(config));

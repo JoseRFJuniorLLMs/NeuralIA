@@ -20,8 +20,8 @@
 //! que implementa `ApiCredential`) e so viaja no cabecalho de autenticacao.
 //! O texto de uma pagina so entra num pedido pelo `untrusted::PromptBuilder`
 //! (parte 2, `infra-llm-untrusted`): instrucoes no `system`, o pedido do
-//! utilizador e os dados cercados no `user`. Nenhuma feature do produto
-//! chama este modulo ainda: a Traducao e a primeira.
+//! utilizador e os dados cercados no `user`. A Traducao (`crate::translate`)
+//! e a primeira feature do produto a chama-lo.
 
 pub mod errors;
 pub mod gemini;

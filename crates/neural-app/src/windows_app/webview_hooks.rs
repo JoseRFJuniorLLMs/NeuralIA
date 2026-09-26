@@ -285,11 +285,17 @@ impl HookedWebViewBuilder for WebViewBuilder<'_> {
 /// A metade do builder da tabela: a trava de navegacao do hospedeiro (com
 /// a origem local autorizada, se houver), a recusa de downloads onde a
 /// tabela manda e o aviso de pagina carregada. `send` e o proxy do event
-/// loop no produto e um registo no gate.
+/// loop no produto e um registo no gate. `epoch` e a geracao de navegacao
+/// do hospedeiro (`page_eval::NavEpoch`, a da Traducao): o navigation
+/// handler sobe-a a cada navegacao que VAI, antes de ela comecar -- uma
+/// leitura da pagina anterior cai na chegada. Uma recusada (um `mailto:`,
+/// um link que abre na Web completa) nao a sobe: a pagina fica onde esta,
+/// e a traducao dela tambem (o RESTORE ainda a acha).
 pub(in crate::windows_app) fn hook_webview_builder<B, S>(
     builder: B,
     host: WebViewHost,
     local_origin: Option<String>,
+    epoch: Option<NavEpoch>,
     send: S,
 ) -> B
 where
@@ -297,11 +303,14 @@ where
     S: Fn(UserEvent) + Clone + 'static,
 {
     let hooks = webview_hooks(host);
-    let builder = builder.with_navigation_handler(webview_navigation(
-        hooks.nav_gate,
-        local_origin,
-        send.clone(),
-    ));
+    let navigation = webview_navigation(hooks.nav_gate, local_origin, send.clone());
+    let builder = builder.with_navigation_handler(move |target| {
+        let allowed = navigation(target);
+        if allowed && let Some(epoch) = &epoch {
+            epoch.bump();
+        }
+        allowed
+    });
     let builder = match hooks.downloads {
         DownloadPolicy::Deny => builder.with_download_started_handler(|_, _| false),
         DownloadPolicy::Managed => builder,
@@ -532,6 +541,8 @@ pub(in crate::windows_app) enum MenuAction {
     Column { column: usize, command: usize },
     /// Um item do bloqueio de anuncios.
     Adblock(AdblockAction),
+    /// «Traduzir página» (translation): a pagina deste hospedeiro.
+    Translate(WebViewHost),
     /// Um item cinzento: nada.
     None,
 }
@@ -541,6 +552,8 @@ impl MenuAction {
         match self {
             MenuAction::Column { column, command } => column_menu_event(*column, *command),
             MenuAction::Adblock(action) => Some(UserEvent::Adblock(action.event())),
+            MenuAction::Translate(host) => translatable_host(*host)
+                .then_some(UserEvent::Translate(TranslateEvent::Requested(*host))),
             MenuAction::None => None,
         }
     }
@@ -590,6 +603,20 @@ fn adblock_off_view(_host: WebViewHost, flags: &MenuFlags) -> Option<MenuItemVie
     adblock_off_item(&flags.adblock)
 }
 
+/// Id do item «Traduzir página» (`translation.rs`) no botao direito das
+/// paginas que se traduzem e no menu da pilula. O 2 e o 3 sao os do
+/// bloqueio de anuncios (`ADBLOCK_MENU_SITE`, `ADBLOCK_MENU_OFF`).
+pub(in crate::windows_app) const MENU_TRANSLATE_PAGE: usize = 4;
+
+fn translate_page_view(host: WebViewHost, _flags: &MenuFlags) -> Option<MenuItemView> {
+    translatable_host(host).then(|| MenuItemView {
+        label: TRANSLATE_PAGE_LABEL.to_string(),
+        checked: None,
+        enabled: true,
+        action: MenuAction::Translate(host),
+    })
+}
+
 /// O registo: cada item do NeuralIA nos menus das WebViews, ids unicos e
 /// nunca zero (gate `context_menu_commands_are_unique`).
 pub(in crate::windows_app) const WEBVIEW_MENU_ITEMS: &[MenuItemSpec] = &[
@@ -607,6 +634,11 @@ pub(in crate::windows_app) const WEBVIEW_MENU_ITEMS: &[MenuItemSpec] = &[
         id: ADBLOCK_MENU_OFF,
         hosts: adblock_host,
         view: adblock_off_view,
+    },
+    MenuItemSpec {
+        id: MENU_TRANSLATE_PAGE,
+        hosts: translatable_host,
+        view: translate_page_view,
     },
 ];
 
@@ -1277,7 +1309,8 @@ impl App {
         local_origin: Option<String>,
     ) -> HookedBuilder<'_> {
         let proxy = self.proxy.clone();
-        let builder = hook_webview_builder(builder, host, local_origin, move |event| {
+        let epoch = self.translation.epoch(host);
+        let builder = hook_webview_builder(builder, host, local_origin, epoch, move |event| {
             let _ = proxy.send_event(event);
         });
         HookedBuilder {
@@ -1290,9 +1323,10 @@ impl App {
     /// A unica porta para o COM de uma WebView acabada de construir: o
     /// `HookedBuilder` traz aqui cada uma que constroi, com o hospedeiro
     /// que recebeu, e ela recebe o que a tabela manda -- os itens do menu
-    /// do botao direito nas paginas que rolam, o `AcceleratorKeyPressed`
-    /// em todas, o gestor de downloads nas que tem `DownloadPolicy::Managed`,
-    /// o `WebResourceRequested` nas que tem `ResourceGatePolicy::Adblock`.
+    /// do botao direito nas paginas que rolam, nas que se traduzem e nas
+    /// do bloqueio de anuncios, o `AcceleratorKeyPressed` em todas, o
+    /// gestor de downloads nas que tem `DownloadPolicy::Managed`, o
+    /// `WebResourceRequested` nas que tem `ResourceGatePolicy::Adblock`.
     /// Privado ao modulo: nenhum sitio regista por conta propria.
     /// Um runtime WebView2 sem um dos eventos deixa a WebView sem esse
     /// gancho e fica no log.
@@ -1318,12 +1352,15 @@ impl App {
         }
     }
 
-    /// Uma pagina acabou de carregar. Os favoritos guardam a chave do
-    /// endereco para a estrela da coluna ou do Split; o bloqueio de
-    /// anuncios so precisa do hospedeiro (a renovacao semanal da lista,
-    /// nunca na Home). O log de depuracao nunca leva URLs, so a transicao.
+    /// Uma pagina acabou de carregar. A Traducao larga a traducao de uma
+    /// pagina que ja nao esta la (`translation_page_loaded`); os favoritos
+    /// guardam a chave do endereco para a estrela da coluna ou do Split; o
+    /// bloqueio de anuncios so precisa do hospedeiro (a renovacao semanal da
+    /// lista, nunca na Home). O log de depuracao nunca leva URLs, so a
+    /// transicao.
     fn page_loaded(&mut self, page: WebViewHost, url: String) {
         debug_log(format_args!("webview: {} carregou", page.describe()));
+        self.translation_page_loaded(page);
         self.bookmarks_page_loaded(page, &url);
         self.adblock_page_loaded(page);
     }

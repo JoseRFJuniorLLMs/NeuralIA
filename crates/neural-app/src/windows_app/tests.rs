@@ -851,6 +851,7 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
         BarHit::Forward,
         BarHit::ColumnBack(1),
         BarHit::ColumnForward(1),
+        BarHit::ColumnTranslate(1),
         BarHit::Column(1),
         BarHit::AddTab(1),
         BarHit::ContextTab {
@@ -902,6 +903,11 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
     assert_eq!(
         label(BarHit::AddTab(1), false).as_deref(),
         Some("Nova pergunta ao ChatGPT")
+    );
+    // O 文A diz «Traduzir página» -- nao o «Traduzir» da barra de selecao.
+    assert_eq!(
+        label(BarHit::ColumnTranslate(1), false).as_deref(),
+        Some("Traduzir página do ChatGPT para o português (outro clique: o original)")
     );
     assert_eq!(
         label(BarHit::WindowMaximize, false).as_deref(),
@@ -1572,14 +1578,16 @@ fn every_ai_column_has_its_own_back_and_forward_after_its_plus() {
 /// ou no canto direito, e o clique no centro dele volta a ser ELE -- ou
 /// nao existe (largura 0, e nada o encontra). O grupo e tudo ou nada: numa
 /// coluna, ou todos os botoes obrigatorios existem ou nenhum; um opcional
-/// (a estrela) so existe com eles, e so com a pilula de pelo menos
-/// `COLUMN_PILL_MIN`.
+/// (o 文A e a estrela) so existe com eles, e so com a pilula de pelo menos
+/// `COLUMN_PILL_MIN`; os opcionais cedem do fim de `ALL` para o inicio (a
+/// estrela antes do 文A), por isso os que ficam sao sempre os primeiros.
 #[test]
 fn column_buttons_fit_or_vanish() {
     assert_eq!(COLUMN_BUTTONS, ColumnButton::ALL.len());
     let center = |rect: UiRect| (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
     let mut existed = 0usize;
     let mut vanished = 0usize;
+    let (mut kept, mut ceded, mut partial) = (0usize, 0usize, 0usize);
     for scale in [1.0, 1.5, 2.0] {
         for width in (720..=2560).step_by(40) {
             for split_active in [false, true] {
@@ -1647,11 +1655,44 @@ fn column_buttons_fit_or_vanish() {
                         controls.leftmost()
                     };
                     let mut previous_right = plus.x + plus.width;
+                    let (mut optional_kept, mut optional_ceded) = (false, false);
                     for (button, rect) in ColumnButton::ALL.iter().zip(&rects) {
                         if rect.width == 0.0 {
-                            // Um opcional que cedeu: nada o encontra.
+                            // Um opcional que cedeu: nada o encontra -- nem
+                            // onde ele estaria, logo a seguir aos outros.
                             assert!(button.optional(), "{at}: {}", button.glyph());
+                            ceded += 1;
+                            optional_ceded = true;
+                            let (x, y) = (
+                                previous_right
+                                    + (ColumnButton::GAP + ColumnButton::WIDTH / 2.0) * scale,
+                                plus.y + plus.height / 2.0,
+                            );
+                            assert_ne!(
+                                layout.hit(x, y),
+                                Some(button.hit(index)),
+                                "{at}: o {} que cedeu na coluna {index} ainda e clicavel",
+                                button.glyph()
+                            );
+                            assert_ne!(
+                                bar_hit_at(Some(controls), Some(layout), x, y),
+                                Some(button.hit(index)),
+                                "{at}: o {} que cedeu na coluna {index} ainda e clicavel",
+                                button.glyph()
+                            );
                             continue;
+                        }
+                        if button.optional() {
+                            // Cedem do fim de `ALL` para o inicio: um
+                            // opcional a vista nunca vem depois de um que
+                            // cedeu (a estrela cede antes do 文A).
+                            assert!(
+                                !optional_ceded,
+                                "{at}: o {} ficou depois de um opcional que cedeu na coluna {index}",
+                                button.glyph()
+                            );
+                            kept += 1;
+                            optional_kept = true;
                         }
                         assert!(
                             rect.x >= previous_right,
@@ -1678,15 +1719,24 @@ fn column_buttons_fit_or_vanish() {
                         );
                         previous_right = rect.x + rect.width;
                     }
+                    if optional_kept && optional_ceded {
+                        partial += 1;
+                    }
                 }
             }
         }
     }
     // A varredura viu os dois lados da regra: botoes que existem (janelas
-    // largas) e botoes que sumiram (janelas estreitas a escala 2).
+    // largas) e botoes que sumiram (janelas estreitas a escala 2) -- e, com
+    // os obrigatorios a vista, opcionais presentes, opcionais que cederam a
+    // pilula e colunas com lugar so para um (o 文A fica, a estrela cede).
     assert!(
         existed > 0 && vanished > 0,
         "{existed} com botoes, {vanished} sem"
+    );
+    assert!(
+        kept > 0 && ceded > 0 && partial > 0,
+        "opcionais: {kept} a vista, {ceded} cederam, {partial} colunas so com o 文A"
     );
 }
 
@@ -8264,13 +8314,27 @@ fn ai_columns_and_the_split_get_the_auto_scroll_menu_item() {
                 .into_iter()
                 .map(|item| item.id)
                 .collect();
-            assert_eq!(ids[0], COLUMN_MENU_AUTO_SCROLL, "{host:?}");
+            // A rolagem primeiro; depois o bloqueio de anuncios (nao na
+            // fonte privada) e, no fim, «Traduzir página» (translation).
+            let mut expected = vec![COLUMN_MENU_AUTO_SCROLL];
+            if !matches!(host, WebViewHost::PrivateSplit(_)) {
+                expected.extend([ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF]);
+            }
+            expected.push(MENU_TRANSLATE_PAGE);
+            assert_eq!(ids, expected, "{host:?}");
             assert_eq!(webview_hooks(host).menu, ids, "{host:?}: a tabela diverge");
         }
     }
+    // A Web completa nao rola sozinha, mas tem o bloqueio de anuncios e
+    // traduz-se: sem o item de rolagem.
+    assert_eq!(context_menu_column(WebViewHost::External), None);
+    assert_eq!(
+        webview_hooks(WebViewHost::External).menu,
+        [ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF, MENU_TRANSLATE_PAGE]
+    );
     for host in WebViewHost::ALL
         .into_iter()
-        .filter(|host| context_menu_column(*host).is_none())
+        .filter(|host| context_menu_column(*host).is_none() && *host != WebViewHost::External)
         .chain([
             WebViewHost::Column(COMPARATOR_COLUMNS),
             WebViewHost::Split(COMPARATOR_COLUMNS),
@@ -8317,7 +8381,18 @@ fn each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r() {
 
             let first = respond(7, None);
             assert_eq!(first.separator_at, Some(7), "{host:?}");
-            assert_eq!(first.items.len(), 1, "{host:?}");
+            assert_eq!(first.items.len(), 2, "{host:?}");
+            // «Traduzir página» logo a seguir a rolagem, com o hospedeiro.
+            assert_eq!(first.items[1].id, MENU_TRANSLATE_PAGE);
+            assert_eq!(first.items[1].label, "Traduzir página");
+            assert_eq!(first.items[1].at, 9);
+            assert!(
+                matches!(
+                    first.items[1].selected(),
+                    Some(UserEvent::Translate(TranslateEvent::Requested(origin))) if origin == host
+                ),
+                "{host:?}: o item nao pede a traducao desta pagina"
+            );
             assert_eq!(first.items[0].label, LABEL_TURN_ON, "{host:?}");
             assert_eq!(first.items[0].id, COLUMN_MENU_AUTO_SCROLL);
             assert_eq!(first.items[0].host, host);
@@ -8354,7 +8429,12 @@ fn each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r() {
                 .expect("o item da pilula");
             assert_eq!(item.label, LABEL_TURN_ON);
             assert!(pill.item(0).is_none(), "0 e o menu fechado sem escolha");
-            assert!(pill.item(COLUMN_MENU_AUTO_SCROLL + 1).is_none());
+            // A pilula traz tambem o «Traduzir página» desta coluna.
+            assert!(
+                pill.item(MENU_TRANSLATE_PAGE)
+                    .is_some_and(|item| item.label == "Traduzir página")
+            );
+            assert!(pill.item(MENU_TRANSLATE_PAGE + 1).is_none());
         }
     }
     // Um hospedeiro que nao rola: nem separador nem itens, com nativos ou
@@ -8495,20 +8575,32 @@ fn the_webview_hooks_table() {
             accelerators: true,
             distraction: None,
         };
-    let scroll_and_adblock = [COLUMN_MENU_AUTO_SCROLL, ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF];
+    // A rolagem, o bloqueio de anuncios e «Traduzir página» (translation),
+    // pela ordem do registo.
+    let scroll_adblock_translate = [
+        COLUMN_MENU_AUTO_SCROLL,
+        ADBLOCK_MENU_SITE,
+        ADBLOCK_MENU_OFF,
+        MENU_TRANSLATE_PAGE,
+    ];
     let adblock = [ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF];
+    let adblock_translate = [ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF, MENU_TRANSLATE_PAGE];
     for col in 0..COMPARATOR_COLUMNS {
         assert_eq!(
             webview_hooks(WebViewHost::Column(col)),
-            gated(&scroll_and_adblock, Managed, Adblock)
+            gated(&scroll_adblock_translate, Managed, Adblock)
         );
         assert_eq!(
             webview_hooks(WebViewHost::Split(col)),
-            gated(&scroll_and_adblock, Managed, Adblock)
+            gated(&scroll_adblock_translate, Managed, Adblock)
         );
         assert_eq!(
             webview_hooks(WebViewHost::PrivateSplit(col)),
-            gated(&[COLUMN_MENU_AUTO_SCROLL], Managed, Open)
+            gated(
+                &[COLUMN_MENU_AUTO_SCROLL, MENU_TRANSLATE_PAGE],
+                Managed,
+                Open
+            )
         );
     }
     assert_eq!(
@@ -8517,7 +8609,7 @@ fn the_webview_hooks_table() {
     );
     assert_eq!(
         webview_hooks(WebViewHost::External),
-        gated(&adblock, Managed, Adblock)
+        gated(&adblock_translate, Managed, Adblock)
     );
     let row = |menu: &[usize], downloads: DownloadPolicy, nav_gate: NavGate| WebViewHooks {
         menu: menu.to_vec(),
@@ -8596,6 +8688,10 @@ fn every_webview_gets_the_hooks() {
         }
         if adblock_host(host) {
             expected.extend([ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF]);
+        }
+        // «Traduzir página»: as paginas que rolam e a Web completa.
+        if context_menu_column(host).is_some() || host == WebViewHost::External {
+            expected.push(MENU_TRANSLATE_PAGE);
         }
         if expected.is_empty() {
             assert!(
@@ -8708,15 +8804,20 @@ fn every_webview_gets_the_hooks() {
 
     // (b) Antes do build: a trava e a cadeia do hospedeiro com a origem
     // local passada, os downloads recusados onde a tabela manda, e o fim
-    // do carregamento (so ele) vira `PageLoaded` com o hospedeiro.
+    // do carregamento (so ele) vira `PageLoaded` com o hospedeiro. A
+    // geracao de navegacao do hospedeiro (`NavEpoch`, a da Traducao) sobe a
+    // cada navegacao aceite, e so a elas: uma recusada deixa a pagina onde
+    // esta.
     let local = "http://127.0.0.1:8000";
     for host in WebViewHost::ALL {
         let seen: std::rc::Rc<std::cell::RefCell<Vec<UserEvent>>> = Default::default();
         let sink = std::rc::Rc::clone(&seen);
+        let epoch = NavEpoch::default();
         let built = hook_webview_builder(
             RecordedHookedBuilder::default(),
             host,
             Some(local.to_string()),
+            Some(epoch.clone()),
             move |event| sink.borrow_mut().push(event),
         );
         let hooks = webview_hooks(host);
@@ -8739,7 +8840,13 @@ fn every_webview_gets_the_hooks() {
             "https://mail.google.com/mail/u/0/",
             "data:text/html,<p>x</p>",
         ] {
+            let before = epoch.current();
             let allowed = navigate(target.to_string());
+            assert_eq!(
+                epoch.current(),
+                before + u64::from(allowed),
+                "{host:?} {target}: a geracao nao seguiu o veredicto (aceite: {allowed})"
+            );
             match web_navigation_verdict(hooks.nav_gate, Some(local), target) {
                 NavVerdict::Allow => assert!(allowed, "{host:?} {target}"),
                 NavVerdict::Deny => assert!(!allowed, "{host:?} {target}"),
@@ -9452,9 +9559,13 @@ fn the_adblock_menu_follows_the_page_and_the_state() {
             .collect()
     };
 
-    // Desligado: "Ativar" numa pagina web, nada fora dela.
+    // Desligado: "Ativar" numa pagina web, nada fora dela. «Traduzir
+    // página» (translation) vem sempre no fim, com ou sem o bloqueio.
     let request = respond(4, Some("https://news.site.test/a"));
-    assert_eq!(labels(&request), [LABEL_TURN_ON, LABEL_ADBLOCK_ACTIVATE]);
+    assert_eq!(
+        labels(&request),
+        [LABEL_TURN_ON, LABEL_ADBLOCK_ACTIVATE, TRANSLATE_PAGE_LABEL]
+    );
     assert_eq!(request.items[1].at, 6);
     assert_eq!(request.items[1].id, ADBLOCK_MENU_SITE);
     assert!(matches!(
@@ -9467,7 +9578,11 @@ fn the_adblock_menu_follows_the_page_and_the_state() {
         Some("data:text/html,x"),
         Some("nao e url"),
     ] {
-        assert_eq!(labels(&respond(0, page)), [LABEL_TURN_ON], "{page:?}");
+        assert_eq!(
+            labels(&respond(0, page)),
+            [LABEL_TURN_ON, TRANSLATE_PAGE_LABEL],
+            "{page:?}"
+        );
     }
 
     // A preparar a lista: cinzento, sem accao; "Desativar" ao lado.
@@ -9478,7 +9593,8 @@ fn the_adblock_menu_follows_the_page_and_the_state() {
         [
             LABEL_TURN_ON,
             LABEL_ADBLOCK_PREPARING,
-            LABEL_ADBLOCK_DEACTIVATE
+            LABEL_ADBLOCK_DEACTIVATE,
+            TRANSLATE_PAGE_LABEL
         ]
     );
     assert!(!request.items[1].enabled);
@@ -9546,7 +9662,11 @@ fn the_adblock_menu_follows_the_page_and_the_state() {
 
     // Um IP ou localhost: a escolha nao se guardaria, nada do bloqueio.
     for local in ["http://127.0.0.1:8080/", "http://localhost:3000/"] {
-        assert_eq!(labels(&respond(0, Some(local))), [LABEL_TURN_ON], "{local}");
+        assert_eq!(
+            labels(&respond(0, Some(local))),
+            [LABEL_TURN_ON, TRANSLATE_PAGE_LABEL],
+            "{local}"
+        );
     }
 
     // Uma IA ou um login: cinzento, marcado como desligado, sem accao.
@@ -9564,7 +9684,7 @@ fn the_adblock_menu_follows_the_page_and_the_state() {
     let private = webview_menu_responder(WebViewHost::PrivateSplit(1), SharedFlag::default(), None);
     assert_eq!(
         labels(&private(0, Some("https://news.site.test/a"))),
-        [LABEL_TURN_ON]
+        [LABEL_TURN_ON, TRANSLATE_PAGE_LABEL]
     );
     assert_eq!(group_thousands(4512), "4 512");
     assert_eq!(group_thousands(512), "512");
@@ -10838,6 +10958,7 @@ fn bar_hit_command_is_exhaustive() {
         (BarHit::Forward, None),
         (BarHit::ColumnBack(0), None),
         (BarHit::ColumnForward(1), None),
+        (BarHit::ColumnTranslate(2), None),
         (BarHit::ColumnBookmark(2), None),
         (BarHit::SplitBookmark, None),
         (BarHit::Column(2), None),
@@ -19507,9 +19628,33 @@ fn provider_row(layout: &BarLayout) -> Vec<[f64; 4]> {
 /// 1100 perdia o "+". Agora (1) arrancar, pausar ou parar o Pomodoro nao
 /// mexe em NADA da segunda linha nem nas abas, a qualquer largura e
 /// escala; e (2) nas larguras comuns cada coluna visivel tem a sua
-/// pilula (legivel a partir de 1280), o "+" e os ‹ ›.
+/// pilula (legivel a partir de 1280), o "+" e os ‹ ›. Os dois opcionais
+/// (o 文A e a estrela, ‹ › 文A ☆) cedem antes da pilula, a estrela
+/// primeiro: de `TRANSLATE_FROM` (1290 px logicos) para cima o 文A esta
+/// nas tres colunas e de `BOOKMARK_FROM` (1374) para cima tambem a estrela,
+/// a 1x e a 1.5x; nas colunas que nao encostam ao canto os dois estao de
+/// 1280 para cima. Abaixo disso a coluna encostada ao canto -- que tambem
+/// paga a seta dos Downloads (downloads-ui) a partir de 1100 -- e a
+/// primeira a ceder: de 1290 a 1373 fica so com o 文A, abaixo de 1290 sem
+/// nenhum; o «Traduzir página» do botao direito (gate
+/// `each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r`) e
+/// o Ctrl+D (`ctrl_d_runs_against_the_host_it_came_from`) continuam.
 #[test]
 fn the_tools_never_take_room_from_the_ai_columns() {
+    // A largura (logica) a partir da qual as tres colunas a vista tem o
+    // 文A: a 1289 px a do canto ainda nao tem lugar para ele.
+    const TRANSLATE_FROM: f64 = 1290.0;
+    // E a da estrela, que precisa do lugar do 文A e do seu: a 1373 px a do
+    // canto so tem o 文A.
+    const BOOKMARK_FROM: f64 = 1374.0;
+    // Nas colunas que nao encostam ao canto os opcionais cabem de 1280 px
+    // (a pilula legivel) para cima.
+    const OTHERS_FROM: f64 = 1280.0;
+    let optional_from = |button: ColumnButton| match button {
+        ColumnButton::Translate => TRANSLATE_FROM,
+        ColumnButton::Bookmark => BOOKMARK_FROM,
+        ColumnButton::Back | ColumnButton::Forward => 0.0,
+    };
     let (running, paused) = shipped_pomodoro_labels();
     let topologies = [
         ([false, false, false], false),
@@ -19568,7 +19713,16 @@ fn the_tools_never_take_room_from_the_ai_columns() {
         }
     }
 
-    for logical_width in [1024.0, 1100.0, 1280.0, 1366.0, 1440.0, 1920.0] {
+    for logical_width in [
+        1024.0,
+        1100.0,
+        1280.0,
+        TRANSLATE_FROM,
+        1366.0,
+        BOOKMARK_FROM,
+        1440.0,
+        1920.0,
+    ] {
         for scale in [1.0, 1.5] {
             let client_width = logical_width * scale;
             for (minimized, split_active) in topologies {
@@ -19596,18 +19750,19 @@ fn the_tools_never_take_room_from_the_ai_columns() {
                         }
                         assert!(layout.add_tabs[index].width > 0.0, "sem \"+\": {at}");
                         for button in ColumnButton::ALL {
-                            // A estrela (opcional) cede antes da pilula; de
-                            // 1280 px para cima ha lugar para ela -- na
-                            // coluna encostada ao canto, que tambem paga a
-                            // seta dos Downloads, so de 1366 px para cima
-                            // (a seta cabe ou nao existe e fica; o Ctrl+D
-                            // continua sem a estrela).
-                            let star_from = if Some(index) == last_visible {
-                                1366.0
+                            // Os opcionais cedem antes da pilula, a estrela
+                            // (a ultima de `ALL`) antes do 文A: cada um so e
+                            // exigido de onde cabe nas tres colunas (a coluna
+                            // encostada ao canto, que tambem paga a seta dos
+                            // Downloads, e a primeira a cede-los; o
+                            // «Traduzir página» do botao direito e o Ctrl+D
+                            // continuam sem eles).
+                            let from = if Some(index) == last_visible {
+                                optional_from(button)
                             } else {
-                                1280.0
+                                OTHERS_FROM
                             };
-                            if button.optional() && logical_width < star_from {
+                            if button.optional() && logical_width < from {
                                 continue;
                             }
                             assert!(
@@ -19618,6 +19773,61 @@ fn the_tools_never_take_room_from_the_ai_columns() {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // De `TRANSLATE_FROM` para cima, px a px, cada coluna a vista tem o 文A,
+    // e de `BOOKMARK_FROM` para cima tambem a estrela (a etiqueta do
+    // Pomodoro nao mexe na linha: parte (1)). Um px abaixo de cada um, a
+    // coluna do canto ja o cedeu -- e so ele: a estrela cede antes do 文A,
+    // e a pilula, o "+" e os ‹ › ficam.
+    for scale in [1.0, 1.5] {
+        for logical_width in TRANSLATE_FROM as u32..=1920 {
+            let logical_width = f64::from(logical_width);
+            for (minimized, split_active) in topologies {
+                if split_active {
+                    continue;
+                }
+                let layout = layout_at(logical_width * scale, scale, minimized, false, None);
+                for index in (0..COMPARATOR_COLUMNS).filter(|index| !minimized[*index]) {
+                    for button in ColumnButton::ALL
+                        .into_iter()
+                        .filter(|b| b.optional() && logical_width >= optional_from(*b))
+                    {
+                        assert!(
+                            layout.column_button(index, button).width > 0.0,
+                            "sem {}: coluna {index} a {logical_width}px @{scale}x min={minimized:?}",
+                            button.glyph()
+                        );
+                    }
+                }
+            }
+        }
+        let corner = COMPARATOR_COLUMNS - 1;
+        for (from, kept) in [(TRANSLATE_FROM, 0usize), (BOOKMARK_FROM, 1)] {
+            let below = layout_at(
+                (from - 1.0) * scale,
+                scale,
+                [false; COMPARATOR_COLUMNS],
+                false,
+                None,
+            );
+            assert!(below.columns[corner].width > 0.0 && below.add_tabs[corner].width > 0.0);
+            let mut optional_seen = 0;
+            for button in ColumnButton::ALL {
+                let expected = if button.optional() {
+                    optional_seen += 1;
+                    optional_seen <= kept
+                } else {
+                    true
+                };
+                assert_eq!(
+                    below.column_button(corner, button).width > 0.0,
+                    expected,
+                    "{} da coluna do canto um px abaixo de {from} @{scale}x",
+                    button.glyph()
+                );
             }
         }
     }
@@ -23834,6 +24044,7 @@ fn existing_stores_have_a_declared_kind() {
     use crate::stores::{
         ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AI_SETTINGS_STORE, AI_USAGE_STORE, APP_STORES,
         BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE, KEYS_STORE, LIVE_KEY_STORE,
+        TRANSLATE_STORE,
     };
     use neural_core::json_store::StoreKind::{Automatic, Explicit, Setting};
     use neural_core::json_store::StoreShape::{Dir, File};
@@ -23860,6 +24071,8 @@ fn existing_stores_have_a_declared_kind() {
         ("adblock-list.json", Automatic, File),
         ("ai/settings.json", Setting, File),
         ("ai/usage.json", Setting, File),
+        // «Sempre neste site» da Traducao: so um clique nesse botao a muda.
+        ("translate.json", Setting, File),
         ("bookmarks.json", Explicit, File),
     ];
     expected.sort_by_key(|row| row.0);
@@ -23911,6 +24124,7 @@ fn existing_stores_have_a_declared_kind() {
         ("AI_USAGE_STORE", AI_USAGE_STORE.name),
         ("DOWNLOADS_LOG_STORE", DOWNLOADS_LOG_STORE.name),
         ("DOWNLOADS_SETTINGS_STORE", DOWNLOADS_SETTINGS_STORE.name),
+        ("TRANSLATE_STORE", TRANSLATE_STORE.name),
         ("BOOKMARKS_STORE", BOOKMARKS_STORE.name),
     ];
     for part in compact.split(".grant(").skip(1) {
@@ -27266,6 +27480,1337 @@ fn page_eval_read_only_gate_refuses_acting_scripts() {
     }
 }
 
+// ===================== translation: Traduzir pagina =====================
+
+/// O DOM do harness da Traducao: elementos com `localName`, atributos,
+/// `classList`, `isContentEditable` herdado e um `innerHTML` que so
+/// regista (um script que escreva HTML aparece em `html`); nos de texto
+/// cujo `nodeValue` regista cada escrita; e um `createTreeWalker` com a
+/// semantica do DOM (o filtro so ve os tipos pedidos; REJECT salta a
+/// subarvore, SKIP so o no). Corre os scripts QUE EMBARCAM, com a chamada
+/// que o `page_eval` monta (`script_call`), num contexto `node:vm`.
+const TRANSLATE_HARNESS: &str = r##"
+const vm = require('node:vm');
+const INPUT = JSON.parse(process.argv[2]);
+const context = vm.createContext({ __html: [], __writes: [], __network: [] });
+vm.runInContext(`
+class Node0 { constructor(type) { this.nodeType = type; this.parentNode = null; this.childNodes = []; } }
+class Text0 extends Node0 {
+  constructor(value) { super(3); this._value = String(value); }
+  get nodeValue() { return this._value; }
+  set nodeValue(value) { __writes.push(String(value)); this._value = String(value); }
+}
+class Element0 extends Node0 {
+  constructor(tag, attrs) {
+    super(1);
+    this.localName = tag;
+    this.nodeName = tag.toUpperCase();
+    this.attrs = attrs || {};
+    const self = this;
+    this.classList = { contains(name) { return String(self.attrs['class'] || '').split(/\\s+/).indexOf(name) >= 0; } };
+  }
+  getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attrs, name) ? String(this.attrs[name]) : null; }
+  get isContentEditable() {
+    for (let el = this; el && el.nodeType === 1; el = el.parentNode) {
+      const value = el.getAttribute('contenteditable');
+      if (value !== null) return value.toLowerCase() !== 'false';
+    }
+    return false;
+  }
+  set innerHTML(value) { __html.push(String(value)); }
+  get innerHTML() { return ''; }
+  set outerHTML(value) { __html.push(String(value)); }
+  insertAdjacentHTML(_where, value) { __html.push(String(value)); }
+  append(child) { child.parentNode = this; this.childNodes.push(child); return child; }
+}
+function fetch(url) { __network.push(String(url)); }
+function build(spec) {
+  if (typeof spec === 'string') return new Text0(spec);
+  const el = new Element0(spec.tag, spec.attrs);
+  for (const child of spec.children || []) el.append(build(child));
+  return el;
+}
+var document = {
+  nodeType: 9,
+  documentElement: null,
+  body: null,
+  createTreeWalker(root, what, filter) {
+    const out = [];
+    (function visit(node) {
+      for (const child of node.childNodes) {
+        const shown = (child.nodeType === 1 && (what & 1)) || (child.nodeType === 3 && (what & 4));
+        const verdict = shown ? filter.acceptNode(child) : 3;
+        if (verdict === 1) out.push(child);
+        if (child.nodeType === 1 && verdict !== 2) visit(child);
+      }
+    })(root);
+    let at = 0;
+    return { nextNode() { return at < out.length ? out[at++] : null; } };
+  },
+};
+function __texts(node, out) {
+  for (const child of node.childNodes) {
+    if (child.nodeType === 3) out.push(child._value); else __texts(child, out);
+  }
+  return out;
+}
+function __set(from, to) {
+  const all = [];
+  (function visit(node) { for (const child of node.childNodes) { if (child.nodeType === 3) all.push(child); else visit(child); } })(document.documentElement);
+  const hit = all.find((node) => node._value === from);
+  if (!hit) throw new Error('no text ' + from);
+  hit._value = to;
+}
+`, context);
+context.__page = INPUT.page;
+vm.runInContext(`document.documentElement = build(__page); document.documentElement.parentNode = document;
+document.body = document.documentElement.childNodes.find((node) => node.localName === 'body') || null;`, context);
+const steps = [];
+for (const step of INPUT.steps) {
+  let result = null;
+  if (step.eval !== undefined) {
+    const value = vm.runInContext(step.eval, context);
+    result = JSON.parse(JSON.stringify(value === undefined ? null : value));
+  } else {
+    context.__from = step.set[0];
+    context.__to = step.set[1];
+    vm.runInContext('__set(__from, __to)', context);
+  }
+  steps.push({ result, texts: vm.runInContext('__texts(document.documentElement, [])', context) });
+}
+process.stdout.write(JSON.stringify({
+  steps,
+  html: context.__html,
+  network: context.__network,
+  writes: context.__writes,
+}));
+"##;
+
+/// Corre os `steps` (`{"eval": js}` ou `{"set": [de, para]}` -- a pagina
+/// muda um texto por conta propria) no DOM de `page`.
+fn run_translate_harness(
+    page: &serde_json::Value,
+    steps: &[serde_json::Value],
+) -> serde_json::Value {
+    let input = serde_json::json!({ "page": page, "steps": steps }).to_string();
+    let program = format!(
+        "process.argv[2] = {};\n{TRANSLATE_HARNESS}",
+        serde_json::to_string(&input).expect("input")
+    );
+    serde_json::from_str(&run_node_program(&program)).expect("JSON do harness")
+}
+
+/// A pagina do harness: um texto de cada coisa que a Traducao salta, e tres
+/// que traduz (um deles dentro de um `<b>` entre espacos).
+fn translate_test_page() -> serde_json::Value {
+    serde_json::json!({ "tag": "html", "attrs": { "lang": "en" }, "children": [
+        { "tag": "head", "children": [{ "tag": "title", "children": ["Title"] }] },
+        { "tag": "body", "children": [
+            { "tag": "p", "children": ["Hello"] },
+            { "tag": "script", "children": ["var secret = 1;"] },
+            { "tag": "style", "children": ["p { color: red }"] },
+            { "tag": "noscript", "children": ["Enable JS"] },
+            { "tag": "code", "children": ["let x = 1"] },
+            { "tag": "pre", "children": ["preformatted"] },
+            { "tag": "textarea", "children": ["typed"] },
+            { "tag": "input", "attrs": { "value": "field" } },
+            { "tag": "svg", "children": [{ "tag": "text", "children": ["svg label"] }] },
+            { "tag": "math", "children": [{ "tag": "mi", "children": ["math x"] }] },
+            { "tag": "div", "attrs": { "translate": "no" }, "children": [
+                { "tag": "span", "children": ["Brand Name"] }
+            ] },
+            { "tag": "div", "attrs": { "translate": "NO" }, "children": ["Upper No"] },
+            { "tag": "span", "attrs": { "class": "logo notranslate" }, "children": ["NeuralIA"] },
+            { "tag": "div", "attrs": { "contenteditable": "true" }, "children": [
+                { "tag": "p", "children": ["Draft"] }
+            ] },
+            { "tag": "div", "attrs": { "contenteditable": "" }, "children": ["Empty editable"] },
+            { "tag": "div", "attrs": { "aria-hidden": "true" }, "children": ["Hidden"] },
+            { "tag": "p", "children": ["  ", { "tag": "b", "children": ["World"] }, " "] },
+            { "tag": "p", "children": ["Goodbye"] }
+        ] }
+    ] })
+}
+
+fn collected_texts(collected: &serde_json::Value) -> Vec<String> {
+    collected["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item[1].as_str().expect("text").to_string())
+        .collect()
+}
+
+/// Gate (critico, scripts injetados; translation): os scripts que embarcam,
+/// no DOM do harness e com a chamada exata do `page_eval`:
+///
+/// - COLLECT so le o que se traduz -- nada de script, style, noscript,
+///   code, pre, textarea, input, svg, math, `[translate=no]`,
+///   `.notranslate`, contenteditable nem `aria-hidden`; o `<head>` fica de
+///   fora; nenhuma escrita;
+/// - APPLY poe um `<img onerror>` como TEXTO literal (nenhum HTML escrito),
+///   nao toca num no que a pagina mudou entre a leitura e a troca e conta o
+///   que falta;
+/// - RESTORE devolve o original so aos nos que ainda tem a traducao;
+/// - nenhum dos tres busca nada.
+///
+/// Sabotagens: tirar o `[translate=no]` (o «Brand Name» aparece), trocar o
+/// `nodeValue` por `innerHTML` (HTML escrito), tirar a conferencia do
+/// original (o no mudado e escrito por cima).
+#[test]
+fn translate_scripts_skip_write_only_text_and_restore() {
+    let page = translate_test_page();
+    let collect = script_call(&TRANSLATE_COLLECT_READ, None).expect("collect");
+    let first = run_translate_harness(&page, &[serde_json::json!({ "eval": collect })]);
+    let collected = first["steps"][0]["result"].clone();
+    assert_eq!(
+        collected_texts(&collected),
+        ["Hello", "World", "Goodbye"],
+        "COLLECT leu o que nao se traduz: {collected}"
+    );
+    assert_eq!(collected["lang"], "en");
+    assert_eq!(collected["truncated"], false);
+    assert_eq!(first["writes"], serde_json::json!([]), "COLLECT escreveu");
+    // O que a Traducao faz com isto e o `neural_core::translate` que
+    // embarca: a leitura, os blocos e as trocas.
+    let parsed = neural_core::translate::parse_collected(&collected.to_string()).expect("parse");
+    let plan = neural_core::translate::plan_batches(&parsed.texts);
+    assert_eq!(plan.batches.len(), 1);
+    let entries = neural_core::translate::apply_entries(
+        &plan.batches[0],
+        &[
+            "<img src=x onerror=alert(1)>".to_string(),
+            "Mundo".to_string(),
+            "Tchau".to_string(),
+        ],
+    );
+    let mut with_missing = entries.clone();
+    with_missing.push(neural_core::translate::ApplyEntry {
+        node: 999,
+        from: "Ghost".into(),
+        to: "Fantasma".into(),
+    });
+    let apply =
+        script_call(&TRANSLATE_APPLY_READ, Some(&entries_arg(&with_missing))).expect("apply");
+    let restore =
+        script_call(&TRANSLATE_RESTORE_READ, Some(&entries_arg(&entries))).expect("restore");
+    let run = run_translate_harness(
+        &page,
+        &[
+            serde_json::json!({ "eval": collect }),
+            // A pagina muda o «World» entre a leitura e a troca.
+            serde_json::json!({ "set": ["World", "World!"] }),
+            serde_json::json!({ "eval": apply }),
+            // E muda o «Tchau» depois da troca.
+            serde_json::json!({ "set": ["Tchau", "Tchau!!"] }),
+            serde_json::json!({ "eval": restore }),
+        ],
+    );
+    let applied = &run["steps"][2];
+    assert_eq!(
+        applied["result"],
+        serde_json::json!({ "done": 2, "changed": 1, "missing": 1 })
+    );
+    let texts = applied["texts"].as_array().expect("texts");
+    let has = |texts: &Vec<serde_json::Value>, text: &str| texts.contains(&serde_json::json!(text));
+    assert!(
+        has(texts, "<img src=x onerror=alert(1)>"),
+        "o HTML da traducao nao ficou texto literal: {texts:?}"
+    );
+    assert!(has(texts, "World!"), "o no mudado foi escrito por cima");
+    assert!(!has(texts, "Mundo"));
+    assert!(has(texts, "Tchau"));
+    assert!(has(texts, "Brand Name") && has(texts, "Title"));
+    assert_eq!(
+        run["html"],
+        serde_json::json!([]),
+        "um script escreveu HTML"
+    );
+    assert_eq!(
+        run["network"],
+        serde_json::json!([]),
+        "um script buscou algo"
+    );
+    let restored = &run["steps"][4];
+    assert_eq!(
+        restored["result"],
+        serde_json::json!({ "done": 1, "changed": 2, "missing": 0 })
+    );
+    let texts = restored["texts"].as_array().expect("texts");
+    for kept in ["Hello", "World!", "Tchau!!"] {
+        assert!(has(texts, kept), "{kept}: {texts:?}");
+    }
+    assert!(!has(texts, "<img src=x onerror=alert(1)>"));
+    // So o APPLY e o RESTORE escrevem, e so os `nodeValue` esperados.
+    assert_eq!(
+        run["writes"],
+        serde_json::json!(["<img src=x onerror=alert(1)>", "Tchau", "Hello"])
+    );
+
+    // Uma pagina inteira `translate="no"` nao da nada.
+    let refused = serde_json::json!({ "tag": "html", "attrs": { "translate": "no" }, "children": [
+        { "tag": "body", "children": [{ "tag": "p", "children": ["Hello"] }] }
+    ] });
+    let none = run_translate_harness(&refused, &[serde_json::json!({ "eval": collect })]);
+    assert_eq!(none["steps"][0]["result"]["items"], serde_json::json!([]));
+}
+
+/// Os tres scripts da Traducao estao no registo do `page_eval` com a forma
+/// do argumento certa, e o que o WebView2 corre e exatamente a chamada de
+/// `script_call`: o COLLECT sem argumento, o APPLY e o RESTORE com o JSON
+/// das trocas (dado, U+2028/2029 escapados). Um script com o argumento
+/// trocado nao corre.
+#[test]
+fn translate_scripts_run_through_page_eval_with_their_argument() {
+    for script in [
+        &TRANSLATE_COLLECT_READ,
+        &TRANSLATE_APPLY_READ,
+        &TRANSLATE_RESTORE_READ,
+    ] {
+        assert!(
+            READ_ONLY_SCRIPTS
+                .iter()
+                .any(|known| std::ptr::eq(*known, script)),
+            "{} fora do registo",
+            script.name()
+        );
+    }
+    assert_eq!(TRANSLATE_COLLECT_READ.arg(), ScriptArg::None);
+    assert_eq!(TRANSLATE_APPLY_READ.arg(), ScriptArg::Json);
+    assert_eq!(TRANSLATE_RESTORE_READ.arg(), ScriptArg::Json);
+    let arg = serde_json::json!([[3, "a\u{2028}b", "</script><script>x()</script>"]]);
+    assert!(script_call(&TRANSLATE_APPLY_READ, None).is_none());
+    assert!(script_call(&TRANSLATE_COLLECT_READ, Some(&arg)).is_none());
+    let call = script_call(&TRANSLATE_APPLY_READ, Some(&arg)).expect("call");
+    assert!(call.starts_with(&format!("({TRANSLATE_APPLY_SCRIPT})(")));
+    // O U+2028 sai escapado (`\` `u2028`), nunca cru.
+    let escaped = format!("a{}u2028b", '\\');
+    assert!(call.ends_with(&format!(
+        r#"([[3,"{escaped}","</script><script>x()</script>"]])"#
+    )));
+    assert!(!call.contains('\u{2028}'));
+
+    let view = FakeEvalView::at(PAGE_URL);
+    let epoch = NavEpoch::default();
+    let mut reads = PageReads::default();
+    let spec = |script| PageEvalSpec {
+        script,
+        max_raw_bytes: TRANSLATE_APPLY_MAX_BYTES,
+        deadline: TRANSLATE_SCRIPT_DEADLINE,
+    };
+    let noop = |_: PageEvalEvent| {};
+    assert!(
+        reads
+            .read_with_arg(
+                &view,
+                spec(&TRANSLATE_APPLY_READ),
+                &arg,
+                &epoch,
+                Instant::now(),
+                noop,
+                |_, _| {}
+            )
+            .is_ok()
+    );
+    assert_eq!(view.asked.borrow()[0].0, call);
+    assert_eq!(
+        reads.read(
+            &view,
+            spec(&TRANSLATE_APPLY_READ),
+            &epoch,
+            Instant::now(),
+            noop,
+            |_, _| {}
+        ),
+        Err(PageEvalRefusal::Unregistered)
+    );
+    assert_eq!(
+        reads.read_with_arg(
+            &view,
+            spec(&TRANSLATE_COLLECT_READ),
+            &arg,
+            &epoch,
+            Instant::now(),
+            noop,
+            |_, _| {}
+        ),
+        Err(PageEvalRefusal::Unregistered)
+    );
+}
+
+fn translation_pick() -> neural_core::llm::Pick {
+    use neural_core::llm::{ModelId, Pick, PickSource, PriceTier, Provider, Purpose};
+    Pick {
+        purpose: Purpose::Translation,
+        provider: Provider::Gemini,
+        model: ModelId::parse("test-model").expect("id"),
+        price_tier: PriceTier::Low,
+        source: PickSource::Rule,
+    }
+}
+
+fn translation_plan() -> neural_core::translate::Plan {
+    neural_core::translate::plan_batches(&[
+        neural_core::translate::PageText {
+            node: 0,
+            text: "Hello".into(),
+        },
+        neural_core::translate::PageText {
+            node: 2,
+            text: "World".into(),
+        },
+    ])
+}
+
+/// Gate (critico, confirmacoes e modo privado; translation): o cartao de
+/// consentimento da Traducao, do pedido do clique (`translation_request`,
+/// com a privacidade do hospedeiro, `translation_privacy`) ao portao e aos
+/// botoes (`consent_choices`):
+///
+/// - coluna/fonte/Web: «Traduzir» (a sessao, este site), «Sempre neste
+///   site» e «Cancelar», com o modelo e a faixa de preco no cartao;
+/// - Split privado: «Traduzir» so desta vez e «Cancelar» -- nunca
+///   «Sempre neste site», e nada fica no `translate.json`, mesmo que se
+///   force a resposta;
+/// - Modo privado: recusado;
+/// - «Sempre neste site» fica no `translate.json` (`Setting`) e vale na
+///   janela seguinte; «Traduzir» vale so para este site nesta sessao.
+///
+/// Sabotagem: o Split privado com a privacidade normal (oferece e grava o
+/// «Sempre»).
+#[test]
+fn translation_consent_table() {
+    use crate::ai_settings::Day;
+    use crate::egress::{
+        ConsentAnswer, Decision, EgressGate, EgressPrivacy, RefuseReason, SiteOrigin,
+    };
+    use crate::stores::TRANSLATE_STORE;
+
+    let dir = std::env::temp_dir().join(format!(
+        "neuralia-translation-consent-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let registry = StoreRegistry::mint_for_test(&dir);
+    let today = Day::today();
+    let gate_for = || {
+        let mut gate = EgressGate::for_app(Some(&registry));
+        gate.attach_site_grants(
+            crate::ai_settings::AiPurpose::Translation,
+            registry.grant(TRANSLATE_STORE).expect("grant"),
+        )
+        .expect("translate.json");
+        gate
+    };
+    let plan = translation_plan();
+    let choice = translation_pick();
+    let request = |host: WebViewHost, url: &str| {
+        translation_request(
+            &plan,
+            &choice,
+            SiteOrigin::of_url(url),
+            translation_privacy(host),
+        )
+    };
+    let ask = |decision: Decision| match decision {
+        Decision::Ask(card) => card,
+        other => panic!("esperava o cartao: {other:?}"),
+    };
+    let mut gate = gate_for();
+
+    // Coluna: o cartao do brief, com o modelo e a faixa de preco.
+    let column = WebViewHost::Column(0);
+    let card = ask(gate.request(request(column, "https://exemplo.com/a"), today));
+    let choices = consent_choices(&card, translation_privacy(column));
+    assert_eq!(
+        choices,
+        [
+            CardChoice::Translate(ConsentAnswer::Session),
+            CardChoice::AlwaysOnSite,
+            CardChoice::Cancel
+        ]
+    );
+    let view = consent_view(&card, &choices, &plan);
+    assert_eq!(view.title, "Traduzir com Gemini?");
+    assert_eq!(view.lines[0], TRANSLATE_CONSENT_BODY);
+    assert!(
+        view.lines
+            .iter()
+            .any(|line| line == "Modelo: test-model · custo baixo")
+    );
+    assert!(view.lines.iter().any(|line| line == "Site: exemplo.com"));
+    assert!(
+        view.lines
+            .iter()
+            .any(|line| line.starts_with("Vai para generativelanguage.googleapis.com"))
+    );
+    assert_eq!(
+        view.buttons,
+        [
+            ("Traduzir", true),
+            ("Sempre neste site", false),
+            ("Cancelar", false)
+        ]
+    );
+
+    // Split privado: pergunta, sem «Sempre»; forcado, nada fica no disco.
+    for (private, url) in [
+        (WebViewHost::PrivateSplit(0), "https://privado.com/"),
+        (WebViewHost::PrivateSplit(2), "https://privado-dois.com/"),
+    ] {
+        let card = ask(gate.request(request(private, url), today));
+        assert!(!card.offers_always(), "{private:?}");
+        assert_eq!(
+            consent_choices(&card, translation_privacy(private)),
+            [
+                CardChoice::Translate(ConsentAnswer::Once),
+                CardChoice::Cancel
+            ],
+            "{private:?}"
+        );
+        assert_eq!(
+            gate.answer(card, ConsentAnswer::AlwaysOnSite, today),
+            Decision::Send
+        );
+    }
+    let stored = std::fs::read_to_string(dir.join("translate.json")).unwrap_or_default();
+    assert!(!stored.contains("privado"), "o privado gravou: {stored}");
+    // O «Traduzir» do Split privado vale so desta vez: o clique seguinte
+    // no mesmo site pergunta outra vez.
+    let once = WebViewHost::PrivateSplit(1);
+    let card = ask(gate.request(request(once, "https://uma-vez.com/"), today));
+    let [CardChoice::Translate(answer), CardChoice::Cancel] =
+        consent_choices(&card, translation_privacy(once))[..]
+    else {
+        panic!("o cartao privado mudou");
+    };
+    assert_eq!(gate.answer(card, answer, today), Decision::Send);
+    assert!(matches!(
+        gate.request(request(once, "https://uma-vez.com/"), today),
+        Decision::Ask(_)
+    ));
+    // O Modo privado recusa antes de perguntar.
+    let private_mode = translation_request(
+        &plan,
+        &choice,
+        SiteOrigin::of_url("https://exemplo.com/"),
+        EgressPrivacy::PrivateMode,
+    );
+    assert_eq!(
+        gate.request(private_mode, today),
+        Decision::Refuse(RefuseReason::PrivateMode)
+    );
+
+    // «Sempre neste site»: gravado, e outra janela ja o ve.
+    let card = ask(gate.request(
+        request(WebViewHost::External, "https://sempre.com/x"),
+        today,
+    ));
+    assert_eq!(
+        gate.answer(card, ConsentAnswer::AlwaysOnSite, today),
+        Decision::Send
+    );
+    let stored = std::fs::read_to_string(dir.join("translate.json")).expect("translate.json");
+    assert!(stored.contains("https://sempre.com"), "{stored}");
+    let mut next = gate_for();
+    assert_eq!(
+        next.request(
+            request(WebViewHost::Split(1), "https://sempre.com/outra"),
+            today
+        ),
+        Decision::Send
+    );
+    // «Traduzir» (a sessao): este site ja nao pergunta, outro sim.
+    let card = ask(gate.request(request(column, "https://sessao.com/"), today));
+    assert_eq!(
+        gate.answer(card, ConsentAnswer::Session, today),
+        Decision::Send
+    );
+    assert_eq!(
+        gate.request(
+            request(WebViewHost::Column(1), "https://sessao.com/b"),
+            today
+        ),
+        Decision::Send
+    );
+    assert!(matches!(
+        gate.request(request(column, "https://outro.com/"), today),
+        Decision::Ask(_)
+    ));
+    // Cada bloco e uma chamada paga contada.
+    assert!(gate.wait_usage_written());
+    assert!(gate.usage_this_month(today) >= plan.batches.len() as u32);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Gate (critico, dados do utilizador; translation): enquanto uma coluna
+/// esta traduzida -- desde que os blocos comecam a ir ate o original
+/// voltar --, a resposta dela nao e gravada na sessao de pesquisa nem na
+/// memoria (`research_answer_provider`, o que o `UserEvent::ResearchAnswer`
+/// usa). Uma coluna a espera do cartao ainda nao traduziu nada; a fonte ao
+/// lado traduzida nao cala a coluna.
+///
+/// Sabotagem: `research_answer_provider` sem a conferencia (a resposta
+/// traduzida entra na sessao).
+#[test]
+fn research_answer_is_not_saved_from_a_translated_column() {
+    let mut state = TranslationState::with_sink(Box::new(|_| {}));
+    assert_eq!(
+        research_answer_provider(&state, Some("ChatGPT"), 1).as_deref(),
+        Some("ChatGPT")
+    );
+    let asking = state.run_for_test(WebViewHost::Column(1), false);
+    assert_eq!(
+        research_answer_provider(&state, Some("ChatGPT"), 1).as_deref(),
+        Some("ChatGPT"),
+        "a espera do cartao nada foi trocado"
+    );
+    assert_eq!(
+        state.toggle(WebViewHost::Column(1)),
+        TranslateToggle::Cancel
+    );
+    state.drop_for_test(asking);
+    let translating = state.run_for_test(WebViewHost::Column(1), true);
+    assert!(state.column_translated(1));
+    assert_eq!(research_answer_provider(&state, Some("ChatGPT"), 1), None);
+    assert_eq!(
+        research_answer_provider(&state, Some("Claude"), 0).as_deref(),
+        Some("Claude")
+    );
+    state.finish_for_test(
+        translating,
+        vec![neural_core::translate::ApplyEntry {
+            node: 0,
+            from: "Hello".into(),
+            to: "Olá".into(),
+        }],
+    );
+    assert_eq!(research_answer_provider(&state, Some("ChatGPT"), 1), None);
+    assert_eq!(
+        state.toggle(WebViewHost::Column(1)),
+        TranslateToggle::Restore
+    );
+    state.drop_for_test(translating);
+    assert_eq!(
+        research_answer_provider(&state, Some("ChatGPT"), 1).as_deref(),
+        Some("ChatGPT")
+    );
+    let split = state.run_for_test(WebViewHost::Split(1), true);
+    assert_eq!(
+        research_answer_provider(&state, Some("ChatGPT"), 1).as_deref(),
+        Some("ChatGPT")
+    );
+    state.drop_for_test(split);
+    assert_eq!(state.toggle(WebViewHost::Column(1)), TranslateToggle::Start);
+    // E e isto que o braco do event loop usa (presenca, §4.3).
+    let source = shipped_source();
+    assert!(source.contains("UserEvent::ResearchAnswer { source_index, text } => {"));
+    assert_eq!(source.matches("research_answer_provider(").count(), 2);
+}
+
+/// A chave de teste da Gemini (montada com `concat!`; nao e real).
+const TRANSLATE_TEST_KEY: &str = concat!("AIza", "SyTESTONLY-translate-app_0123456789");
+
+/// O motor falso da thread: lista um modelo, traduz cada texto para
+/// `pt:<texto>` e guarda as chaves que recebeu.
+struct FakeTranslateEngine {
+    keys: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl TranslateEngine for FakeTranslateEngine {
+    fn models(
+        &mut self,
+        key: &crate::secrets::ApiKey,
+        _cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<neural_core::llm::ModelInfo>, neural_core::llm::ApiError> {
+        self.keys
+            .lock()
+            .expect("keys")
+            .push(key.expose().to_string());
+        Ok(vec![neural_core::llm::ModelInfo {
+            id: neural_core::llm::ModelId::parse("test-model").expect("id"),
+            display_name: "Test".into(),
+            generates_text: true,
+            input_token_limit: None,
+            output_token_limit: None,
+        }])
+    }
+
+    fn batch(
+        &mut self,
+        _model: &neural_core::llm::ModelId,
+        batch: &neural_core::translate::Batch,
+        key: &crate::secrets::ApiKey,
+        _cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<neural_core::translate::ApplyEntry>, neural_core::translate::BatchError> {
+        self.keys
+            .lock()
+            .expect("keys")
+            .push(key.expose().to_string());
+        let translations: Vec<String> = batch
+            .texts
+            .iter()
+            .map(|text| format!("pt:{text}"))
+            .collect();
+        Ok(neural_core::translate::apply_entries(batch, &translations))
+    }
+}
+
+/// Gate (critico, chaves e segredos; translation): a chave Gemini so vive
+/// na thread `neural-translate` -- o motor recebe-a (o teste prova que ela
+/// foi usada), mas nenhum relatorio da thread, nenhum `UserEvent` e nenhuma
+/// chamada do COLLECT/APPLY/RESTORE a leva. Sem chave, a thread diz `NoKey`
+/// e o motor nem e chamado. E o `App::new` nao cria a thread.
+#[test]
+fn the_gemini_key_never_reaches_scripts_or_events() {
+    use crate::secrets::{KeySlot, validate_api_key};
+    let used = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reports = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&reports);
+    let mut worker = TranslateWorker {
+        engine: Box::new(FakeTranslateEngine {
+            keys: std::sync::Arc::clone(&used),
+        }),
+        key: Box::new(|| validate_api_key(&KeySlot::Gemini, TRANSLATE_TEST_KEY)),
+        report: Box::new(move |report| sink.lock().expect("reports").push(report)),
+        models: None,
+    };
+    let plan = translation_plan();
+    worker.run(
+        TranslateJob::Pick {
+            run: 7,
+            pin: neural_core::llm::ModelId::parse("test-model"),
+        },
+        &|| false,
+    );
+    worker.run(
+        TranslateJob::Translate {
+            run: 7,
+            model: neural_core::llm::ModelId::parse("test-model").expect("id"),
+            batches: plan.batches.iter().cloned().enumerate().collect(),
+        },
+        &|| false,
+    );
+    let reports = reports.lock().expect("reports").clone();
+    assert!(matches!(
+        &reports[0],
+        WorkerReport::Picked { run: 7, choice } if choice.model.as_str() == "test-model"
+    ));
+    let entries: Vec<neural_core::translate::ApplyEntry> = reports
+        .iter()
+        .filter_map(|report| match report {
+            WorkerReport::BatchDone { entries, .. } => Some(entries.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].to, "pt:Hello");
+    assert!(matches!(
+        reports.last(),
+        Some(WorkerReport::Finished { run: 7 })
+    ));
+    // O motor recebeu a chave (o gate nao e vazio)...
+    let used = used.lock().expect("keys").clone();
+    assert_eq!(used, vec![TRANSLATE_TEST_KEY.to_string(); 2]);
+    // ... e ela nao esta em nada do que sai da thread nem do que corre na
+    // pagina.
+    let mut outputs: Vec<String> = reports
+        .iter()
+        .map(|report| {
+            format!(
+                "{:?}",
+                UserEvent::Translate(TranslateEvent::Worker(report.clone()))
+            )
+        })
+        .collect();
+    outputs.push(script_call(&TRANSLATE_APPLY_READ, Some(&entries_arg(&entries))).expect("apply"));
+    outputs
+        .push(script_call(&TRANSLATE_RESTORE_READ, Some(&entries_arg(&entries))).expect("restore"));
+    outputs.push(script_call(&TRANSLATE_COLLECT_READ, None).expect("collect"));
+    for text in &outputs {
+        assert!(!text.contains(TRANSLATE_TEST_KEY), "a chave saiu: {text}");
+        assert!(!text.contains("SyTESTONLY"), "parte da chave saiu: {text}");
+    }
+
+    // Sem chave: `NoKey`, e o motor nao e chamado.
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&seen);
+    let mut keyless = TranslateWorker {
+        engine: Box::new(FakeTranslateEngine {
+            keys: std::sync::Arc::clone(&calls),
+        }),
+        key: Box::new(|| None),
+        report: Box::new(move |report| sink.lock().expect("reports").push(report)),
+        models: None,
+    };
+    keyless.run(TranslateJob::Pick { run: 8, pin: None }, &|| false);
+    assert_eq!(
+        seen.lock().expect("reports").clone(),
+        vec![WorkerReport::NoKey { run: 8 }]
+    );
+    assert!(calls.lock().expect("keys").is_empty());
+
+    // A thread so nasce no primeiro clique: o estado do `App::new` nao a
+    // cria, e o `App::new` so constroi o estado.
+    let state = TranslationState::with_sink(Box::new(|_| {}));
+    assert_eq!(state.worker_threads_spawned(), 0);
+    let source = shipped_source();
+    assert!(source.contains("let translation = TranslationState::new(proxy.clone());"));
+    assert!(source.contains("const TRANSLATE_WORKER_NAME: &str = \"neural-translate\";"));
+}
+
+/// Os rotulos: o 文A e o menu dizem «Traduzir página»; o «Traduzir» da
+/// barra de selecao (as tres IAs) continua outro, com o seu titulo.
+#[test]
+fn translate_page_labels_are_not_the_selection_bar_translate() {
+    assert_eq!(TRANSLATE_PAGE_LABEL, "Traduzir página");
+    assert_eq!(ColumnButton::Translate.glyph(), "文A");
+    assert_eq!(ColumnButton::Translate.hit(2), BarHit::ColumnTranslate(2));
+    let item = webview_menu_item(MENU_TRANSLATE_PAGE).expect("item");
+    let flags = MenuFlags {
+        auto_scroll: true,
+        adblock: AdblockMenu::Hidden,
+    };
+    assert_eq!(
+        (item.view)(WebViewHost::Column(0), &flags).map(|view| view.label),
+        Some("Traduzir página".to_string())
+    );
+    assert_eq!(
+        SearchCardButton::Confirm.label(SearchIntent::Translate),
+        "Traduzir"
+    );
+    assert_eq!(
+        search_card_title(SearchIntent::Translate),
+        "Traduzir nas 3 IAs?"
+    );
+    // So as paginas da web se traduzem.
+    for host in WebViewHost::ALL {
+        let web = matches!(
+            host,
+            WebViewHost::Column(_)
+                | WebViewHost::Split(_)
+                | WebViewHost::PrivateSplit(_)
+                | WebViewHost::External
+        );
+        assert_eq!(translatable_host(host), web, "{host:?}");
+        assert_eq!(
+            (item.view)(host, &flags)
+                .and_then(|view| view.action.event())
+                .is_some(),
+            web,
+            "{host:?}"
+        );
+    }
+    assert!(!translatable_host(WebViewHost::Column(COMPARATOR_COLUMNS)));
+    assert_eq!(
+        translation_privacy(WebViewHost::PrivateSplit(1)),
+        crate::egress::EgressPrivacy::PrivateSurface
+    );
+    assert_eq!(translating_message(2, 5), "Traduzindo 2/5…");
+    assert_eq!(partial_message(3, 5), "Traduzido em parte (3 de 5 blocos)");
+}
+
+// ===================== translation -- revisao (T1..T4) =====================
+
+/// Um plano com `batches` blocos (um texto de ~3 000 caracteres cada).
+fn translation_plan_of(batches: u32) -> neural_core::translate::Plan {
+    let texts: Vec<neural_core::translate::PageText> = (0..batches)
+        .map(|index| neural_core::translate::PageText {
+            node: index * 2,
+            text: format!(
+                "Paragraph {index}: {}",
+                "The quick brown fox jumps. ".repeat(110)
+            ),
+        })
+        .collect();
+    let plan = neural_core::translate::plan_batches(&texts);
+    assert_eq!(
+        plan.batches.len(),
+        batches as usize,
+        "o plano de teste mudou"
+    );
+    plan
+}
+
+fn translation_entry(node: u32, from: &str, to: &str) -> neural_core::translate::ApplyEntry {
+    neural_core::translate::ApplyEntry {
+        node,
+        from: from.into(),
+        to: to.into(),
+    }
+}
+
+/// O portao da Traducao de um registo de teste, com o `translate.json`.
+fn translation_test_gate(registry: &StoreRegistry) -> crate::egress::EgressGate {
+    let mut gate = crate::egress::EgressGate::for_app(Some(registry));
+    gate.attach_site_grants(
+        crate::ai_settings::AiPurpose::Translation,
+        registry
+            .grant(crate::stores::TRANSLATE_STORE)
+            .expect("grant"),
+    )
+    .expect("translate.json");
+    gate
+}
+
+fn translation_asked(
+    step: TranslateStep,
+) -> (u64, crate::egress::ConsentCard, Vec<CardChoice>, CardView) {
+    match step {
+        TranslateStep::Ask(CardPrompt::Consent { run, card, choices }, view) => {
+            (run, card, choices, view)
+        }
+        other => panic!("esperava o cartao de consentimento: {other:?}"),
+    }
+}
+
+fn translation_submitted(
+    step: TranslateStep,
+) -> (
+    u64,
+    neural_core::llm::ModelId,
+    Vec<(usize, neural_core::translate::Batch)>,
+) {
+    match step {
+        TranslateStep::Submit(TranslateJob::Translate {
+            run,
+            model,
+            batches,
+        }) => (run, model, batches),
+        other => panic!("esperava o envio dos blocos: {other:?}"),
+    }
+}
+
+/// Gate (critico, confirmacoes; translation -- revisao T1): no caminho que
+/// embarca, os blocos so vao para a thread depois de um `Send` do portao.
+/// O `WorkerReport::Picked`, a resposta ao cartao e o «Tentar de novo»
+/// correm `TranslationState::picked`, `consent_answered` e `retry` (as
+/// funcoes sem janela que o App chama por `translation_gate_step`), e so o
+/// `Send` delas devolve um trabalho `Translate`:
+///
+/// - na primeira vez num site, o modelo escolhido da o cartao e nada e
+///   contado no consumo; «Cancelar» recusa sem aviso e nada vai;
+/// - «Traduzir» manda todos os blocos e conta-os; com esse consentimento da
+///   sessao, o mesmo site noutra vista vai direto;
+/// - uma resposta a um cartao cujo run ja saiu (a pagina navegou) e um
+///   modelo que chega para um run que ja nao o espera nao mandam nem
+///   contam;
+/// - o «Tentar de novo» manda so o bloco que falhou, e so depois do portao
+///   (num portao sem consentimento, o cartao outra vez).
+///
+/// Sabotagem: `picked` com `let decision = Decision::Send;` (o portao nem
+/// e perguntado).
+#[test]
+fn translation_is_sent_only_after_the_gate() {
+    use crate::ai_settings::Day;
+    use crate::egress::ConsentAnswer;
+
+    let dir =
+        std::env::temp_dir().join(format!("neuralia-translation-steps-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let registry = StoreRegistry::mint_for_test(&dir);
+    let today = Day::today();
+    let mut gate = translation_test_gate(&registry);
+    let mut state = TranslationState::with_sink(Box::new(|_| {}));
+    let column = WebViewHost::Column(0);
+
+    // Primeira vez neste site: o cartao, nao um envio.
+    let first = state.picking_for_test(column, "https://exemplo.com/a", translation_plan());
+    let (run, card, choices, view) =
+        translation_asked(state.picked(&mut gate, first, translation_pick(), today));
+    assert_eq!(run, first);
+    assert_eq!(
+        choices,
+        [
+            CardChoice::Translate(ConsentAnswer::Session),
+            CardChoice::AlwaysOnSite,
+            CardChoice::Cancel
+        ]
+    );
+    assert_eq!(view.title, TRANSLATE_CONSENT_TITLE);
+    assert_eq!(gate.usage_this_month(today), 0, "o cartao contou chamadas");
+    assert!(!state.column_translated(0), "a espera do cartao nada vai");
+    assert_eq!(state.toggle(column), TranslateToggle::Cancel);
+    // «Cancelar»: recusado, sem aviso, nada vai.
+    match state.consent_answered(&mut gate, first, card, ConsentAnswer::Cancel, today) {
+        TranslateStep::Refuse { run, message: None } => assert_eq!(run, first),
+        other => panic!("o Cancelar devia recusar sem aviso: {other:?}"),
+    }
+    assert_eq!(gate.usage_this_month(today), 0);
+    state.drop_for_test(first);
+
+    // «Traduzir»: todos os blocos, contados.
+    let second = state.picking_for_test(column, "https://exemplo.com/a", translation_plan());
+    let (_, card, choices, _) =
+        translation_asked(state.picked(&mut gate, second, translation_pick(), today));
+    let CardChoice::Translate(answer) = choices[0] else {
+        panic!("o primeiro botao nao e o Traduzir: {choices:?}");
+    };
+    let (run, model, batches) =
+        translation_submitted(state.consent_answered(&mut gate, second, card, answer, today));
+    let planned = translation_plan().batches.len();
+    assert_eq!(
+        (run, model.as_str(), batches.len()),
+        (second, "test-model", planned)
+    );
+    assert_eq!(gate.usage_this_month(today), planned as u32);
+    assert!(
+        state.column_translated(0),
+        "os blocos vao: a coluna conta como traduzida"
+    );
+
+    // O mesmo site noutra vista, na mesma sessao: direto.
+    let other = WebViewHost::Column(1);
+    let third = state.picking_for_test(other, "https://exemplo.com/b", translation_plan());
+    let (run, _, batches) =
+        translation_submitted(state.picked(&mut gate, third, translation_pick(), today));
+    assert_eq!((run, batches.len()), (third, planned));
+    assert_eq!(gate.usage_this_month(today), 2 * planned as u32);
+
+    // A pagina navegou com o cartao aberto: a resposta nao manda nem conta.
+    let gone = state.picking_for_test(
+        WebViewHost::Column(2),
+        "https://outro.com/",
+        translation_plan(),
+    );
+    let (_, card, _, _) =
+        translation_asked(state.picked(&mut gate, gone, translation_pick(), today));
+    state.drop_for_test(gone);
+    assert!(matches!(
+        state.consent_answered(&mut gate, gone, card, ConsentAnswer::Session, today),
+        TranslateStep::Gone
+    ));
+    assert!(matches!(
+        state.picked(&mut gate, gone, translation_pick(), today),
+        TranslateStep::Gone
+    ));
+    // Um modelo repetido para um run que ja traduz tambem nao manda nada.
+    assert!(matches!(
+        state.picked(&mut gate, third, translation_pick(), today),
+        TranslateStep::Gone
+    ));
+    assert_eq!(gate.usage_this_month(today), 2 * planned as u32);
+
+    // «Tentar de novo»: tres blocos, o do meio falha; so ele volta, e so
+    // depois do portao.
+    let web = WebViewHost::External;
+    let partial = state.picking_for_test(web, "https://exemplo.com/c", translation_plan_of(3));
+    let (_, _, batches) =
+        translation_submitted(state.picked(&mut gate, partial, translation_pick(), today));
+    assert_eq!(batches.len(), 3);
+    let failed_batch = batches[1].1.clone();
+    assert!(state.accept_batch(partial, &[translation_entry(0, "a", "b")]));
+    state.batch_failed(partial, 1, "falhou".into());
+    assert!(state.accept_batch(partial, &[translation_entry(4, "c", "d")]));
+    assert_eq!(
+        state.finish(partial),
+        Some(FinishOutcome::Partial {
+            translated: 2,
+            total: 3,
+            failure: Some("falhou".into())
+        })
+    );
+    // Num portao novo (outra janela: sem o consentimento desta sessao), o
+    // «Tentar de novo» pergunta primeiro.
+    assert!(gate.wait_usage_written());
+    let mut fresh = translation_test_gate(&registry);
+    let before = fresh.usage_this_month(today);
+    let (_, card, _, _) = translation_asked(state.retry(&mut fresh, partial, today));
+    assert_eq!(
+        card.token_estimate(),
+        neural_core::ai_policy::estimate_tokens(failed_batch.chars),
+        "o cartao do Tentar de novo conta so o que falhou"
+    );
+    assert_eq!(fresh.usage_this_month(today), before);
+    let (run, _, retried) = translation_submitted(state.consent_answered(
+        &mut fresh,
+        partial,
+        card,
+        ConsentAnswer::Once,
+        today,
+    ));
+    assert_eq!(run, partial);
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].1, failed_batch);
+    assert_eq!(fresh.usage_this_month(today), before + 1);
+    // Um «Tentar de novo» de um run que ja nao esta traduzido nao manda nada.
+    assert!(matches!(
+        state.retry(&mut fresh, partial, today),
+        TranslateStep::Gone
+    ));
+    assert!(gate.wait_usage_written());
+    assert!(fresh.wait_usage_written());
+
+    // E e isto que o App corre (presenca e ausencia, §4.3): os tres bracos
+    // passam pelas funcoes de cima, e o unico trabalho `Translate` que o
+    // produto constroi e o `Send` do `decided`.
+    let source = shipped_source();
+    for call in [
+        "state.picked(gate, id, choice, today)",
+        "state.consent_answered(gate, run, card, answer, today)",
+        "state.retry(gate, run, today)",
+    ] {
+        assert_eq!(source.matches(call).count(), 1, "{call}");
+    }
+    assert_eq!(
+        source.matches("TranslateJob::Translate {").count(),
+        2,
+        "um trabalho Translate construido fora do `decided`"
+    );
+    assert_eq!(
+        source
+            .matches("TranslateStep::Submit(TranslateJob::Translate {")
+            .count(),
+        1
+    );
+    assert_eq!(source.matches("submit_translate_job(").count(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Gate (critico, modo privado; translation -- revisao T2): o run que o
+/// `start_run` do produto cria para o Split privado leva a privacidade de
+/// uma superficie privada ate ao portao (`run_request`, o pedido que
+/// `picked` e `retry` fazem): o cartao so tem «Traduzir» (so desta vez) e
+/// «Cancelar»; nem uma resposta forcada «Sempre neste site» grava o site no
+/// `translate.json`; e o clique seguinte pergunta outra vez. A fonte ao
+/// lado normal, com o mesmo indice, oferece e grava.
+///
+/// Sabotagem: `start_run` com `privacy: EgressPrivacy::Normal`.
+#[test]
+fn translation_private_split_run_carries_its_privacy_to_the_gate() {
+    use crate::ai_settings::Day;
+    use crate::egress::{ConsentAnswer, EgressPrivacy};
+
+    let dir = std::env::temp_dir().join(format!(
+        "neuralia-translation-private-run-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let registry = StoreRegistry::mint_for_test(&dir);
+    let today = Day::today();
+    let mut gate = translation_test_gate(&registry);
+    let mut state = TranslationState::with_sink(Box::new(|_| {}));
+
+    for index in 0..COMPARATOR_COLUMNS {
+        let host = WebViewHost::PrivateSplit(index);
+        let url = format!("https://privado-{index}.com/x");
+        let id = state.picking_for_test(host, &url, translation_plan());
+        let (_, card, choices, view) =
+            translation_asked(state.picked(&mut gate, id, translation_pick(), today));
+        assert!(
+            !card.offers_always(),
+            "{host:?}: o portao ofereceu «Sempre neste site» num Split privado"
+        );
+        assert_eq!(
+            choices,
+            [
+                CardChoice::Translate(ConsentAnswer::Once),
+                CardChoice::Cancel
+            ],
+            "{host:?}"
+        );
+        assert!(
+            !view
+                .buttons
+                .iter()
+                .any(|(label, _)| *label == "Sempre neste site"),
+            "{host:?}"
+        );
+        assert_eq!(
+            state.run_request(id).map(|request| request.privacy),
+            Some(EgressPrivacy::PrivateSurface),
+            "{host:?}: o pedido do run"
+        );
+        assert_eq!(
+            state.run_privacy_for_test(id),
+            Some(EgressPrivacy::PrivateSurface),
+            "{host:?}"
+        );
+        // Mesmo forcada, a resposta «Sempre» nao chega ao disco.
+        translation_submitted(state.consent_answered(
+            &mut gate,
+            id,
+            card,
+            ConsentAnswer::AlwaysOnSite,
+            today,
+        ));
+        state.drop_for_test(id);
+    }
+    let stored = std::fs::read_to_string(dir.join("translate.json")).unwrap_or_default();
+    assert!(!stored.contains("privado"), "o privado gravou: {stored}");
+
+    // «Traduzir» no Split privado vale so desta vez.
+    let private = WebViewHost::PrivateSplit(1);
+    let once = state.picking_for_test(private, "https://uma-vez.com/", translation_plan());
+    let (_, card, choices, _) =
+        translation_asked(state.picked(&mut gate, once, translation_pick(), today));
+    let CardChoice::Translate(answer) = choices[0] else {
+        panic!("{choices:?}");
+    };
+    translation_submitted(state.consent_answered(&mut gate, once, card, answer, today));
+    state.drop_for_test(once);
+    let again = state.picking_for_test(private, "https://uma-vez.com/y", translation_plan());
+    translation_asked(state.picked(&mut gate, again, translation_pick(), today));
+    state.drop_for_test(again);
+
+    // A fonte ao lado normal: oferece e grava.
+    let split = WebViewHost::Split(1);
+    let normal = state.picking_for_test(split, "https://normal.com/", translation_plan());
+    assert_eq!(
+        state.run_privacy_for_test(normal),
+        Some(EgressPrivacy::Normal)
+    );
+    let (_, card, choices, _) =
+        translation_asked(state.picked(&mut gate, normal, translation_pick(), today));
+    assert!(choices.contains(&CardChoice::AlwaysOnSite), "{choices:?}");
+    translation_submitted(state.consent_answered(
+        &mut gate,
+        normal,
+        card,
+        ConsentAnswer::AlwaysOnSite,
+        today,
+    ));
+    let stored = std::fs::read_to_string(dir.join("translate.json")).expect("translate.json");
+    assert!(stored.contains("https://normal.com"), "{stored}");
+    assert!(gate.wait_usage_written());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Gate (translation -- revisao T3): uma navegacao recusada (um `mailto:`,
+/// um `tel:`, uma accao `neuralia:`, um `javascript:`) nao muda a pagina, e
+/// a traducao dela continua a poder ser devolvida. Pelo navigation handler
+/// que embarca (`hook_webview_builder` com a geracao do hospedeiro do
+/// `TranslationState`, como o `App::hooked_builder`), o run continua na sua
+/// pagina (`on_its_page`, o que o APPLY, o RESTORE e o `PageLoaded`
+/// conferem), a coluna continua traduzida (a resposta dela nao e gravada) e
+/// o 文A devolve o original. Uma navegacao aceite larga a traducao.
+///
+/// Sabotagem: subir a geracao antes do veredicto, tambem nas recusadas.
+#[test]
+fn a_translated_page_survives_a_refused_navigation() {
+    let mut state = TranslationState::with_sink(Box::new(|_| {}));
+    let column = WebViewHost::Column(0);
+    let built = hook_webview_builder(
+        RecordedHookedBuilder::default(),
+        column,
+        None,
+        state.epoch(column),
+        |_| {},
+    );
+    let navigate = built.navigation.as_ref().expect("navigation handler");
+    let id = state.picking_for_test(column, "https://exemplo.com/", translation_plan());
+    let applied = vec![translation_entry(0, "Hello", "Olá")];
+    state.finish_for_test(id, applied.clone());
+    for target in [
+        "mailto:alguem@exemplo.com",
+        "tel:+5511999999999",
+        "neuralia:home",
+        "javascript:void(0)",
+    ] {
+        assert!(
+            !navigate(target.to_string()),
+            "{target}: devia ser recusada"
+        );
+        assert!(
+            state.on_its_page(id).is_some(),
+            "{target}: a navegacao recusada largou a pagina traduzida"
+        );
+        assert!(state.column_translated(0), "{target}");
+        assert_eq!(
+            research_answer_provider(&state, Some("ChatGPT"), 0),
+            None,
+            "{target}"
+        );
+        assert_eq!(state.toggle(column), TranslateToggle::Restore, "{target}");
+    }
+    // Uma aceite: a pagina e outra, nada se devolve la.
+    assert!(navigate("https://outro.exemplo.com/".to_string()));
+    assert!(state.on_its_page(id).is_none());
+    // O RESTORE (com a pagina ainda la) devolve o que se aplicou.
+    let mut state = TranslationState::with_sink(Box::new(|_| {}));
+    let id = state.picking_for_test(column, "https://exemplo.com/", translation_plan());
+    state.finish_for_test(id, applied.clone());
+    assert_eq!(state.begin_restore(id), Some(applied));
+    assert!(state.on_its_page(id).is_some());
+}
+
+/// Gate (translation -- revisao T4): um bloco que acaba depois de o 文A
+/// pedir o original nunca chega a pagina. A thread nao o relata se o
+/// trabalho foi cancelado enquanto ele ia; e um `BatchDone` ou um
+/// `Finished` que ainda assim chegue com o run a devolver o original
+/// (`accept_batch`, `finish`, o que o event loop corre) nao corre o APPLY,
+/// nao entra no que o RESTORE devolve e nao volta o run a traduzido.
+///
+/// Sabotagens: o `accept_batch` sem conferir a fase; a thread sem a
+/// conferencia do cancelamento depois do bloco.
+#[test]
+fn translation_late_batch_never_lands_after_the_restore() {
+    use crate::secrets::{KeySlot, validate_api_key};
+    // A thread: cancelada enquanto o bloco ia -- nem BatchDone nem Finished.
+    let reports = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&reports);
+    let mut worker = TranslateWorker {
+        engine: Box::new(FakeTranslateEngine {
+            keys: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }),
+        key: Box::new(|| validate_api_key(&KeySlot::Gemini, TRANSLATE_TEST_KEY)),
+        report: Box::new(move |report| sink.lock().expect("reports").push(report)),
+        models: None,
+    };
+    let checks = std::cell::Cell::new(0_u32);
+    let cancelled = || {
+        checks.set(checks.get() + 1);
+        checks.get() > 1
+    };
+    worker.run(
+        TranslateJob::Translate {
+            run: 3,
+            model: neural_core::llm::ModelId::parse("test-model").expect("id"),
+            batches: translation_plan()
+                .batches
+                .iter()
+                .cloned()
+                .enumerate()
+                .collect(),
+        },
+        &cancelled,
+    );
+    let reports = reports.lock().expect("reports").clone();
+    assert!(
+        !reports.iter().any(|report| matches!(
+            report,
+            WorkerReport::BatchDone { .. } | WorkerReport::Finished { .. }
+        )),
+        "a thread relatou um bloco cancelado: {reports:?}"
+    );
+
+    // O event loop: o 文A pediu o original com um bloco a caminho.
+    let mut state = TranslationState::with_sink(Box::new(|_| {}));
+    let column = WebViewHost::Column(1);
+    let id = state.run_for_test(column, true);
+    let first = translation_entry(0, "Hello", "Olá");
+    assert!(state.accept_batch(id, std::slice::from_ref(&first)));
+    assert_eq!(state.begin_restore(id), Some(vec![first.clone()]));
+    assert_eq!(state.toggle(column), TranslateToggle::Busy);
+    assert!(
+        !state.accept_batch(id, &[translation_entry(2, "World", "Mundo")]),
+        "o bloco atrasado foi a pagina depois do RESTORE"
+    );
+    assert_eq!(state.applied_for_test(id), vec![first]);
+    assert_eq!(state.finish(id), None);
+    assert_eq!(
+        state.toggle(column),
+        TranslateToggle::Busy,
+        "o Finished voltou a traduzido um run que devolve o original"
+    );
+    // Um run que espera o cartao tambem nao recebe blocos.
+    let waiting = state.run_for_test(WebViewHost::Column(2), false);
+    assert!(!state.accept_batch(waiting, &[translation_entry(0, "a", "b")]));
+    assert!(state.applied_for_test(waiting).is_empty());
+}
+
 /// Gates dos favoritos (bookmarks): o Ctrl+D nativo e a origem dele, o
 /// candidato, a seccao do painel (so ids), a thread que e a unica a
 /// escrever, a estrela e o Apagar historico que os deixa.
@@ -27929,18 +29474,24 @@ mod bookmarks_gates {
         assert_eq!(bookmark_star_glyph(true), "★");
     }
 
-    /// A estrela de cada coluna vem depois do › e a da fonte ao lado entre o
-    /// › dela e o rotulo; o clique no centro de cada uma volta a ela, e a
-    /// dica diz o que o clique faz.
+    /// A estrela de cada coluna vem depois do › e do 文A (‹ › 文A ☆: e a
+    /// ultima de `ColumnButton::ALL`, por isso a primeira a ceder) e a da
+    /// fonte ao lado entre o › dela e o rotulo; o clique no centro de cada
+    /// uma volta a ela, e a dica diz o que o clique faz.
     #[test]
     fn the_stars_sit_after_forward_and_hit_back() {
         assert_eq!(ColumnButton::ALL.last(), Some(&ColumnButton::Bookmark));
         let layout = BarLayout::with_contexts(1440.0, 1.0, true, BarColumns::even(3), [0, 0, 0]);
         for index in 0..3 {
             let star = layout.column_button(index, ColumnButton::Bookmark);
+            let translate = layout.column_button(index, ColumnButton::Translate);
             let forward = layout.column_button(index, ColumnButton::Forward);
             assert!(
-                star.width > 0.0 && star.x >= forward.x + forward.width,
+                translate.width > 0.0 && translate.x >= forward.x + forward.width,
+                "{index}"
+            );
+            assert!(
+                star.width > 0.0 && star.x >= translate.x + translate.width,
                 "{index}"
             );
             let (cx, cy) = center(star);

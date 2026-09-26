@@ -895,6 +895,9 @@ impl App {
             Some(BarHit::Forward) => self.navigate_history(HistoryStep::Forward),
             Some(BarHit::ColumnBack(index)) => self.navigate_column(index, HistoryStep::Back),
             Some(BarHit::ColumnForward(index)) => self.navigate_column(index, HistoryStep::Forward),
+            Some(BarHit::ColumnTranslate(index)) => {
+                self.translation_event(TranslateEvent::Requested(WebViewHost::Column(index)))
+            }
             Some(BarHit::ColumnBookmark(index)) => self.bookmarks_event(BookmarksEvent::Request {
                 target: BookmarkTarget::Column(index),
                 via: BookmarkVia::Star,
