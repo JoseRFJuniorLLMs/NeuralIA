@@ -458,6 +458,50 @@ jobs:
                   return uri.contains("neuralia-pdf");
               }
           '@
+            },
+            @{
+              Label = "bound-chord-not-handled"
+              Test = "accelerator_decision_table"
+              SourcePath = "crates/neural-app/src/windows_app/keymap.rs"
+              Old = @'
+                  handled: true,
+          '@
+              New = @'
+                  handled: false,
+          '@
+            },
+            @{
+              Label = "duplicate-chord-in-registry"
+              Test = "keymap_chords_are_unique_per_scope"
+              SourcePath = "crates/neural-app/src/windows_app/commands.rs"
+              Old = @'
+                  chords: &[ChordSpec::window(Chord::ctrl(b'N'))],
+          '@
+              New = @'
+                  chords: &[ChordSpec::window(Chord::ctrl(b'N')), ChordSpec::window(Chord::ctrl(b'H'))],
+          '@
+            },
+            @{
+              Label = "chatgpt-chord-bound-on-provider"
+              Test = "provider_hosts_never_bind_the_chatgpt_chords"
+              SourcePath = "crates/neural-app/src/windows_app/keymap.rs"
+              Old = @'
+              if is_provider_origin(origin) && PROVIDER_DENYLIST.contains(&chord) {
+          '@
+              New = @'
+              if false && is_provider_origin(origin) && PROVIDER_DENYLIST.contains(&chord) {
+          '@
+            },
+            @{
+              Label = "command-origin-not-from-host"
+              Test = "a_command_key_carries_the_host_it_came_from"
+              SourcePath = "crates/neural-app/src/windows_app/webview_hooks.rs"
+              Old = @'
+              keymap_decision_in(keymap, input, CommandOrigin::Host(host))
+          '@
+              New = @'
+              keymap_decision_in(keymap, input, CommandOrigin::Host(WebViewHost::External))
+          '@
             }
           )
 

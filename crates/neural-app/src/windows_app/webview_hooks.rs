@@ -1,5 +1,7 @@
 use super::*;
 
+use std::sync::RwLock;
+
 use wry::PageLoadEvent;
 
 // ===================== os ganchos de cada WebView (infra-webview-hooks) =====================
@@ -36,8 +38,10 @@ use wry::PageLoadEvent;
 // A pagina continua a receber um `keypress` (um ou dois por toque, o
 // caractere de controlo de um Ctrl+letra): nao chega ao `keydown` que o
 // mapa de teclas e as paginas ouvem, e nao faz diferenca para os ganchos.
-// Hoje o `accelerator_lookup` nao prende atalho nenhum (`Handled` fica
-// como estava): infra-commands-keymap preenche-o.
+// O `accelerator_lookup` e a decisao do mapa de teclas (`keymap.rs`,
+// infra-commands-keymap) com o hospedeiro como origem; hoje nenhum
+// hospedeiro tem atalhos la (cada um chega no PR do seu comando), e o
+// `Handled` so muda quando ela prende a tecla.
 
 /// Que WebView e esta: quem decide o que ela recebe da tabela e de onde vem
 /// um atalho ou um item de menu (a origem e o hospedeiro, nunca a pagina).
@@ -777,20 +781,26 @@ pub(in crate::windows_app) struct AcceleratorDecision {
     pub(in crate::windows_app) event: Option<UserEvent>,
 }
 
-/// A consulta que o handler faz a cada tecla, com a origem do hospedeiro.
-/// Hoje nao prende atalho nenhum: nenhuma tecla e tratada e nada dispara,
-/// em todos os hospedeiros. E o slot que infra-commands-keymap preenche (a
-/// tabela por ambito, a repeticao filtrada, `Handled` so nos atalhos
-/// presos) -- sem chamadas COM la dentro.
+/// A consulta que o handler faz a cada tecla: a decisao do mapa de teclas
+/// do produto (`keymap_decision`: uma leitura do mapa, o ambito do
+/// hospedeiro, a repeticao filtrada, `Handled` so nos atalhos presos, a
+/// lista do ChatGPT fora dos hospedeiros das IAs), com o hospedeiro que o
+/// handler recebeu no registo como origem -- sem chamadas COM la dentro.
 pub(in crate::windows_app) fn accelerator_lookup(
     host: WebViewHost,
     input: AcceleratorInput,
 ) -> AcceleratorDecision {
-    let _ = (host, input);
-    AcceleratorDecision {
-        handled: false,
-        event: None,
-    }
+    accelerator_lookup_in(product_keymap(), host, input)
+}
+
+/// `accelerator_lookup` sobre um mapa dado: o gate passa um mapa com
+/// atalhos em todos os ambitos e ve a origem que sai de cada hospedeiro.
+pub(in crate::windows_app) fn accelerator_lookup_in(
+    keymap: &RwLock<Keymap>,
+    host: WebViewHost,
+    input: AcceleratorInput,
+) -> AcceleratorDecision {
+    keymap_decision_in(keymap, input, CommandOrigin::Host(host))
 }
 
 /// O `AcceleratorKeyPressed` de uma WebView acabada de construir: le a
