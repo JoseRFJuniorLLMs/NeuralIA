@@ -25169,7 +25169,6 @@ mod downloads_gates {
             "const __rows = $('dl-list').children;\
              __out.count = __rows.length;\
              __out.first = __rows[0].textContent;\
-\
              const __dlButtons = [];\
              const __walk = (n) => { for (const c of n.children) { if (c.tagName === 'BUTTON' && !c.hidden) __dlButtons.push(c); __walk(c); } };\
              __walk($('dl-list'));\
@@ -25178,6 +25177,13 @@ mod downloads_gates {
              $('dl-allow').checked = true; __fire($('dl-allow'), 'change');\
              __out.empty = $('dl-empty').hidden;"
                 .to_string(),
+            // A seta ou o Ctrl+J com o painel aberto: noutra seccao mostra
+            // os Downloads (e pede a lista); nos Downloads fecha.
+            "__click($('tab-history'));\
+             window.__neuraliaDownloads.button();\
+             __out.afterButton = __visible($('view-downloads')) && !__visible($('view-history'));"
+                .to_string(),
+            "window.__neuraliaDownloads.button();".to_string(),
         ]);
         assert_eq!(
             result["pwned"],
@@ -25216,7 +25222,14 @@ mod downloads_gates {
                 serde_json::json!({ "action": "downloads-show", "args": { "id": 11 } }),
                 serde_json::json!({ "action": "downloads-cancel", "args": { "id": 12 } }),
                 serde_json::json!({ "action": "downloads-allow-programs", "args": { "on": true } }),
+                serde_json::json!({ "action": "downloads-list", "args": {} }),
             ]
+        );
+        assert_eq!(result["out"]["afterButton"], true);
+        assert_eq!(
+            posted.last().map(|message| action_of_message(message)),
+            Some("close".to_string()),
+            "{posted:?}"
         );
         // E cada um passa no parser que embarca.
         for message in &posted {
@@ -25224,6 +25237,13 @@ mod downloads_gates {
                 assert!(parse_panel_message(message).is_some(), "{message}");
             }
         }
+    }
+
+    fn action_of_message(message: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(message)
+            .ok()
+            .and_then(|value| value["action"].as_str().map(str::to_string))
+            .unwrap_or_default()
     }
 
     fn action_is_downloads(message: &str) -> bool {
