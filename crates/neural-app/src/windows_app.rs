@@ -3144,6 +3144,12 @@ pub(in crate::windows_app) struct App {
     pub(in crate::windows_app) stores: Option<StoreRegistry>,
     /// O pedido de chave nativo e o cofre das chaves (`secret_prompt.rs`).
     pub(in crate::windows_app) keys: KeysState,
+    /// O portao de saida da IA (`crate::egress`): consentimento da sessao,
+    /// «Sempre neste site», segundo plano, limite mensal e o consumo em
+    /// `ai/usage.json`. Nasce na primeira vez que uma feature o pede
+    /// (`egress_gate`), NUNCA aqui no arranque: a Home fica com as threads e
+    /// a RAM de sempre (gate `app_new_starts_no_lazy_worker`).
+    pub(in crate::windows_app) egress: Option<crate::egress::EgressGate>,
 }
 
 impl App {
@@ -3271,7 +3277,20 @@ impl App {
             live_panel: LivePanel::off(),
             stores,
             keys,
+            egress: None,
         }
+    }
+}
+
+impl App {
+    /// O portao de saida da IA, criado no primeiro pedido com os grants do
+    /// registo das lojas. E a porta das features de IA, que chegam nas ondas
+    /// seguintes (a Traducao e a primeira).
+    #[allow(dead_code)]
+    pub(in crate::windows_app) fn egress_gate(&mut self) -> &mut crate::egress::EgressGate {
+        let stores = self.stores.as_ref();
+        self.egress
+            .get_or_insert_with(|| crate::egress::EgressGate::for_app(stores))
     }
 }
 

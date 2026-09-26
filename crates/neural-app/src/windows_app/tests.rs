@@ -21625,6 +21625,14 @@ fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
             "panel_chrome.rs",
             code_without_tests(include_str!("../panel_chrome.rs")),
         ),
+        (
+            "egress.rs",
+            code_without_tests(include_str!("../egress.rs")),
+        ),
+        (
+            "ai_settings.rs",
+            code_without_tests(include_str!("../ai_settings.rs")),
+        ),
     ]
 }
 
@@ -21634,7 +21642,9 @@ fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
 /// embarca sem linha em `stores::APP_STORES` fica vermelha.
 #[test]
 fn existing_stores_have_a_declared_kind() {
-    use crate::stores::{APP_STORES, KEYS_STORE, LIVE_KEY_STORE};
+    use crate::stores::{
+        AI_SETTINGS_STORE, AI_USAGE_STORE, APP_STORES, KEYS_STORE, LIVE_KEY_STORE,
+    };
     use neural_core::json_store::StoreKind::{Automatic, Explicit, Setting};
     use neural_core::json_store::StoreShape::{Dir, File};
     let mut expected = vec![
@@ -21654,6 +21664,8 @@ fn existing_stores_have_a_declared_kind() {
         ("research-exports", Explicit, Dir),
         ("gemini-live.key", Explicit, File),
         ("keys", Explicit, Dir),
+        ("ai/settings.json", Setting, File),
+        ("ai/usage.json", Automatic, File),
     ];
     expected.sort_by_key(|row| row.0);
     let mut table: Vec<_> = APP_STORES
@@ -21698,6 +21710,8 @@ fn existing_stores_have_a_declared_kind() {
     let specs = [
         ("KEYS_STORE", KEYS_STORE.name),
         ("LIVE_KEY_STORE", LIVE_KEY_STORE.name),
+        ("AI_SETTINGS_STORE", AI_SETTINGS_STORE.name),
+        ("AI_USAGE_STORE", AI_USAGE_STORE.name),
     ];
     for part in compact.split(".grant(").skip(1) {
         let argument = part.split(')').next().unwrap_or_default();
@@ -21746,6 +21760,47 @@ fn the_store_registry_is_minted_once_in_app_new() {
             "{name} cunha o registo"
         );
     }
+}
+
+// ===================== infra-egress: o portao de saida da IA =====================
+
+/// Gate (critico, infra-egress): o `App::new` nao arranca worker preguicoso
+/// nenhum e nao toca em `ai/`. O portao so nasce no primeiro pedido
+/// (`App::egress_gate`), e o construtor que ele usa -- o mesmo, aqui -- nao
+/// cria thread nem ficheiro: a thread `neural-usage` so aparece na primeira
+/// chamada paga (`egress::tests::the_usage_writer_starts_on_the_first_paid_call`).
+/// A Home fica com as threads e a RAM de sempre (measure-home).
+#[test]
+fn app_new_starts_no_lazy_worker() {
+    let dir = std::env::temp_dir().join(format!("neuralia-egress-app-new-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let registry = StoreRegistry::mint_for_test(&dir);
+    let gate = crate::egress::EgressGate::for_app(Some(&registry));
+    assert_eq!(
+        gate.worker_threads_spawned(),
+        0,
+        "o portao nasceu com uma thread"
+    );
+    assert!(!dir.exists(), "criar o portao escreveu na pasta de dados");
+    let without_stores = crate::egress::EgressGate::for_app(None);
+    assert_eq!(without_stores.worker_threads_spawned(), 0);
+
+    // O `App::new` deixa o portao por nascer e nao pede trabalho a worker
+    // preguicoso nenhum (gate de ausencia, AGENTS.md §4.3).
+    let source = shipped_source();
+    let app_new = source
+        .split("impl App {\n    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("App::new");
+    assert_eq!(app_new.matches("egress: None,").count(), 1);
+    for forbidden in ["EgressGate", "egress_gate", "LazyWorker", ".submit("] {
+        assert!(
+            !app_new.contains(forbidden),
+            "o App::new chama {forbidden}: o worker ja nao e preguicoso"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// As chaves sao credenciais: o Ctrl+Shift+Delete nunca as apaga. Nenhum

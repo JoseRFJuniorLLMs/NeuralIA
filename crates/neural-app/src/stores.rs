@@ -6,8 +6,9 @@
 //! O gate `existing_stores_have_a_declared_kind` (em `windows_app/tests.rs`)
 //! percorre o codigo que embarca e falha se aparecer um `data_dir.join(...)`
 //! que nao esteja aqui: uma loja nova nasce com o seu tipo declarado. O
-//! registo das lojas so e cunhado no `App::new`; hoje so o cofre das chaves
-//! abre as suas por grant (`KEYS_STORE`, `LIVE_KEY_STORE`). Levar as outras
+//! registo das lojas so e cunhado no `App::new`; hoje abrem as suas por grant
+//! o cofre das chaves (`KEYS_STORE`, `LIVE_KEY_STORE`) e o portao de saida da
+//! IA (`AI_SETTINGS_STORE`, `AI_USAGE_STORE`, em `egress.rs`). Levar as outras
 //! para grants e o `no_raw_data_dir_write_outside_a_grant` do
 //! infra-privacy-guard.
 
@@ -20,6 +21,12 @@ use neural_core::json_store::StoreSpec;
 pub(crate) const KEYS_STORE: StoreSpec = StoreSpec::new("keys", Explicit, Dir);
 /// A chave do Gemini Live, a do slot `KeySlot::Gemini` do cofre.
 pub(crate) const LIVE_KEY_STORE: StoreSpec = StoreSpec::new("gemini-live.key", Explicit, File);
+/// `<data_dir>/ai/settings.json`: as finalidades da IA e o limite mensal
+/// (`ai_settings.rs`). So muda por uma escolha em IA › Cérebros: `Setting`.
+pub(crate) const AI_SETTINGS_STORE: StoreSpec = StoreSpec::new("ai/settings.json", Setting, File);
+/// `<data_dir>/ai/usage.json`: as chamadas pagas do mes, contadas pelo
+/// `EgressGate` a cada envio -- efeito lateral do uso: `Automatic`.
+pub(crate) const AI_USAGE_STORE: StoreSpec = StoreSpec::new("ai/usage.json", Automatic, File);
 
 /// Tudo o que o produto guarda em `<data_dir>`, com o tipo. Um ficheiro, um
 /// tipo; a regra: `Setting` = escolha num menu ou definicao; `Explicit` =
@@ -58,6 +65,8 @@ pub(crate) const APP_STORES: &[StoreSpec] = &[
     StoreSpec::new("research-exports", Explicit, Dir),
     LIVE_KEY_STORE,
     KEYS_STORE,
+    AI_SETTINGS_STORE,
+    AI_USAGE_STORE,
 ];
 
 #[cfg(test)]
