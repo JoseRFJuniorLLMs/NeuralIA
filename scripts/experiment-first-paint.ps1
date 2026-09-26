@@ -6,7 +6,10 @@ param(
     [Parameter(Mandatory = $true)] [string]$ExePath,
     [Parameter(Mandatory = $true)] [string]$OutDir,
     [int]$StressRounds = 4,
-    [int]$QuietRounds = 2
+    [int]$QuietRounds = 2,
+    # The first launch on the VM is the only one with a cold WebView2 runtime.
+    [string]$FirstGate = "new",
+    [switch]$FirstStress
 )
 $ErrorActionPreference = "Stop"
 New-Item -ItemType Directory -Force $OutDir | Out-Null
@@ -108,7 +111,8 @@ function Invoke-Launch([string]$Label, [string]$Gate, [bool]$FreshProfile, [bool
 }
 
 # 1. Exactly the CI condition: first WebView2 launch on this VM, product profile.
-Invoke-Launch "00-natural-new" "new" $false $false
+$firstLabel = "00-natural-" + $(if ($FirstStress) { "stress-" } else { "" }) + $FirstGate
+Invoke-Launch $firstLabel $FirstGate $false ([bool]$FirstStress)
 # 2. Old and new alternately on a fresh WebView2 profile, under load and quiet.
 for ($k = 1; $k -le $StressRounds; $k++) {
     Invoke-Launch ("{0:D2}-stress-old" -f $k) "old" $true $true

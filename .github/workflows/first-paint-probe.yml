@@ -1,5 +1,7 @@
 # EXPERIMENT ONLY (branch ci/first-paint-probe, never merged): measures the
 # first comparator paint on fresh windows-latest runners, old gate vs new gate.
+# Round 2: the first launch on the VM (cold WebView2 runtime) under CPU and
+# disk load - the condition the two CI failures looked like.
 name: first-paint-probe
 on:
   push:
@@ -10,60 +12,26 @@ permissions:
   contents: read
 
 jobs:
-  probe:
+  cold-stress:
     runs-on: windows-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
       - run: cargo build --locked -p neural-app --bin NeuralIA --release
-      - name: First paint, old vs new gate
-        shell: pwsh
-        run: ./scripts/experiment-first-paint.ps1 -ExePath target/release/NeuralIA.exe -OutDir first-paint-out
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        if: always()
-        with:
-          name: first-paint-${{ matrix.shard }}
-          path: first-paint-out
-
-  # Sabotage (AGENTS 4.2): the shipped layout leaves only column 0 visible
-  # after activation - the flake's exact signature (1 surface, 0,76,341,720).
-  # Applied to this job's workspace only; never committed.
-  sabotage:
-    runs-on: windows-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
-      - name: Break update_comparator_layout (columns 1 and 2 hidden)
+      - name: First launch on this VM under load (old gate on odd shards, new on even)
         shell: pwsh
         run: |
-          $path = "crates/neural-app/src/windows_app/app/compare.rs"
-          $src = [IO.File]::ReadAllText($path)
-          $pattern = '(size: LogicalSize::new\(span\.width\.max\(1\.0\), content_h\)\.into\(\),\r?\n\s*\}\);\r?\n\s*)let _ = v\.webview\.set_visible\(true\);'
-          $hits = [regex]::Matches($src, $pattern).Count
-          if ($hits -ne 1) { throw "sabotage anchor matched $hits times" }
-          $src = [regex]::Replace($src, $pattern, '${1}let _ = v.webview.set_visible(span.index == 0); // SABOTAGE')
-          [IO.File]::WriteAllText($path, $src)
-          Select-String -Path $path -Pattern "SABOTAGE"
-      - run: cargo build --locked -p neural-app --bin NeuralIA --release
-      - name: New and old gate against the sabotaged exe
-        shell: pwsh
-        run: ./scripts/experiment-first-paint.ps1 -ExePath target/release/NeuralIA.exe -OutDir sabotage-out -StressRounds 1 -QuietRounds 3
+          $gate = if (${{ matrix.shard }} % 2 -eq 1) { "old" } else { "new" }
+          ./scripts/experiment-first-paint.ps1 -ExePath target/release/NeuralIA.exe -OutDir first-paint-out -FirstGate $gate -FirstStress -StressRounds 0 -QuietRounds 0
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
-          name: sabotage-${{ matrix.shard }}
-          path: sabotage-out
+          name: cold-stress-${{ matrix.shard }}
+          path: first-paint-out
