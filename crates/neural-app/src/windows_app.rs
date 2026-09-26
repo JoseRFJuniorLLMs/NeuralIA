@@ -6985,6 +6985,7 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ("toast.rs", include_str!("windows_app/toast.rs")),
     ("popup_menu.rs", include_str!("windows_app/popup_menu.rs")),
     ("native_card.rs", include_str!("windows_app/native_card.rs")),
+    ("page_eval.rs", include_str!("windows_app/page_eval.rs")),
     (
         "webview_hooks.rs",
         include_str!("windows_app/webview_hooks.rs"),
@@ -7061,6 +7062,13 @@ pub(in crate::windows_app) mod popup_menu;
 pub(in crate::windows_app) use popup_menu::*;
 pub(in crate::windows_app) mod native_card;
 pub(in crate::windows_app) use native_card::*;
+// Leitura de paginas por script so-leitura (infra-llm-untrusted, plano 2.3):
+// os consumidores (Traducao, Consenso, Copiloto, Escudo) chegam nas ondas
+// seguintes; ate la so corre nos testes.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::windows_app) mod page_eval;
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(in crate::windows_app) use page_eval::*;
 pub(in crate::windows_app) mod webview_hooks;
 pub(in crate::windows_app) use webview_hooks::*;
 pub(in crate::windows_app) mod downloads;

@@ -22,6 +22,8 @@ use serde_json::Value;
 use super::errors::ApiError;
 use super::gemini::{self, PageToken, TextPrompt};
 use super::models::{self, ModelId, PickRule, PickSource, PriceTier, Purpose};
+use crate::security::Locality;
+
 use super::transport::{
     ApiClient, ApiCredential, DEFAULT_MAX_BODY_BYTES, Endpoint, GEMINI_HOST, GENERATION_TIMEOUT,
     LIST_TIMEOUT, Provider,
@@ -699,6 +701,48 @@ fn cancel_is_cooperative() {
         &cancelled,
     );
     assert_eq!(result, Err(ApiError::Cancelled));
+}
+
+// ------------------------------------------------------------ localidade
+
+/// infra-llm-untrusted: o host fixado e `Public` e o agente resolve com o
+/// `PublicResolver`. A mesma origem local resolvida como `Public` (ou `Lan`)
+/// nunca chega a ligar: o endereco 127.0.0.1 sai no resolvedor, antes de
+/// qualquer byte (e da chave). Controlo: como `Loopback`, chega ao stub.
+#[test]
+fn the_pinned_transport_resolves_only_public_addresses() {
+    assert_eq!(
+        Endpoint::pinned(Provider::Gemini).locality(),
+        Locality::Public
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the trap");
+    listener.set_nonblocking(true).expect("non-blocking trap");
+    let port = listener.local_addr().expect("trap address").port();
+    for locality in [Locality::Public, Locality::Lan] {
+        let client = ApiClient::new(Endpoint::loopback(port).resolved_as(locality));
+        let sent = client.send(&gemini::list_models_request(None), Some(&TestKey), &|| {
+            false
+        });
+        assert_eq!(
+            sent,
+            Err(ApiError::ServiceUnavailable { status: None }),
+            "{locality:?} must refuse the loopback address"
+        );
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "{locality:?} opened a connection to 127.0.0.1"
+        );
+    }
+
+    let stub = Stub::serve(vec![json_response("200 OK", r#"{"models":[]}"#)]);
+    let reached = gemini::list_models(&stub.client(), Some(&TestKey), &|| false);
+    assert_eq!(reached.map(|models| models.len()), Ok(0));
+    assert_eq!(
+        stub.received().len(),
+        1,
+        "the Loopback control reaches the stub"
+    );
 }
 
 // ------------------------------------------------------------ construtores

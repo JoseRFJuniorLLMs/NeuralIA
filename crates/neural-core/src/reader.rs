@@ -5,14 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use ureq::{
     Agent, Body,
-    config::Config,
     http::Response,
-    http::Uri,
     tls::{RootCerts, TlsConfig},
-    unversioned::{
-        resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver},
-        transport::{DefaultConnector, NextTimeout},
-    },
+    unversioned::transport::DefaultConnector,
 };
 
 use url::Url;
@@ -20,7 +15,7 @@ use url::Url;
 use crate::{
     NeuralError, Result,
     security::{
-        is_forbidden_ip, is_local_network_target, validate_redirect_target, validate_web_url,
+        PublicResolver, is_local_network_target, validate_redirect_target, validate_web_url,
     },
 };
 
@@ -70,35 +65,6 @@ pub enum ReaderBlock {
     Quote(String),
     Code(String),
     ListItem(String),
-}
-
-#[derive(Debug, Default)]
-struct PublicResolver {
-    inner: DefaultResolver,
-}
-
-impl Resolver for PublicResolver {
-    fn resolve(
-        &self,
-        uri: &Uri,
-        config: &Config,
-        timeout: NextTimeout,
-    ) -> std::result::Result<ResolvedSocketAddrs, ureq::Error> {
-        let resolved = self.inner.resolve(uri, config, timeout)?;
-        let mut safe = self.inner.empty();
-
-        for address in &resolved {
-            if !is_forbidden_ip(address.ip()) {
-                safe.push(*address);
-            }
-        }
-
-        if safe.is_empty() {
-            Err(ureq::Error::HostNotFound)
-        } else {
-            Ok(safe)
-        }
-    }
 }
 
 #[derive(Clone)]
