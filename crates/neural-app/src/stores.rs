@@ -22,6 +22,16 @@ use neural_core::json_store::StoreSpec;
 pub(crate) const KEYS_STORE: StoreSpec = StoreSpec::new("keys", Explicit, Dir);
 /// A chave do Gemini Live, a do slot `KeySlot::Gemini` do cofre.
 pub(crate) const LIVE_KEY_STORE: StoreSpec = StoreSpec::new("gemini-live.key", Explicit, File);
+/// `<data_dir>/adblock-settings.json`: o bloqueio de anuncios ligado e os
+/// sites com anuncios permitidos (e o campo reservado da anti-distracao).
+/// Muda so por uma escolha no menu: `Setting`.
+pub(crate) const ADBLOCK_SETTINGS_STORE: StoreSpec =
+    StoreSpec::new("adblock-settings.json", Setting, File);
+/// `<data_dir>/adblock-list.json`: a lista de Peter Lowe baixada. Escrita
+/// como efeito lateral de ter o bloqueio ligado (a renovacao semanal):
+/// `Automatic` -- no modo privado nao se renova.
+pub(crate) const ADBLOCK_LIST_STORE: StoreSpec =
+    StoreSpec::new("adblock-list.json", Automatic, File);
 /// `<data_dir>/ai/settings.json`: as finalidades da IA e o limite mensal
 /// (`ai_settings.rs`). So muda por uma escolha em IA › Cérebros: `Setting`.
 pub(crate) const AI_SETTINGS_STORE: StoreSpec = StoreSpec::new("ai/settings.json", Setting, File);
@@ -42,6 +52,12 @@ pub(crate) const TRANSLATE_STORE: StoreSpec = StoreSpec::new("translate.json", S
 /// um servico InPrivate, e no Modo privado nao se escreve. Sai no
 /// Ctrl+Shift+Delete.
 pub(crate) const DOWNLOADS_LOG_STORE: StoreSpec = StoreSpec::new("downloads.json", Automatic, File);
+/// `<data_dir>/bookmarks.json`: os favoritos (`neural_core::bookmarks`).
+/// O utilizador pediu cada um (Ctrl+D, a estrela, importar): `Explicit` --
+/// no Split privado e no Modo privado grava na mesma, e o Ctrl+Shift+Delete
+/// nunca o apaga. Partilhado entre janelas pelo trinco
+/// `bookmarks.json.lock`; so a thread `neural-bookmarks` o escreve.
+pub(crate) const BOOKMARKS_STORE: StoreSpec = StoreSpec::new("bookmarks.json", Explicit, File);
 /// `<data_dir>/downloads-settings.json`: a pasta dos downloads e
 /// «Permitir baixar programas». A seccao Downloads (downloads-ui) grava o
 /// interruptor (`App::set_allow_programs`); a pasta ainda so se le.
@@ -87,9 +103,12 @@ pub(crate) const APP_STORES: &[StoreSpec] = &[
     DOWNLOADS_SETTINGS_STORE,
     LIVE_KEY_STORE,
     KEYS_STORE,
+    ADBLOCK_SETTINGS_STORE,
+    ADBLOCK_LIST_STORE,
     AI_SETTINGS_STORE,
     AI_USAGE_STORE,
     TRANSLATE_STORE,
+    BOOKMARKS_STORE,
 ];
 
 #[cfg(test)]

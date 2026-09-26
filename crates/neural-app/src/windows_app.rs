@@ -107,6 +107,9 @@ pub(in crate::windows_app) enum UserEvent {
     /// Os ganchos das WebViews (`webview_hooks.rs`): o que cada WebView
     /// avisa, com o hospedeiro de onde veio.
     WebView(WebViewEvent),
+    /// O bloqueio de anuncios (`adblock.rs`): os itens do menu e as threads
+    /// que leem e baixam a lista.
+    Adblock(AdblockEvent),
     /// O gestor de downloads (`downloads.rs`): o que o WebView2 avisa de cada
     /// download e o fim de cada um, com o evento do `neural_core::downloads`.
     Download(neural_core::downloads::DownloadEvent),
@@ -116,6 +119,9 @@ pub(in crate::windows_app) enum UserEvent {
     /// A interface dos downloads (`downloads_ui.rs`): o Ctrl+J, a seta da
     /// barra e os cliques no cartao «Baixar programa?» ou da saida.
     DownloadsUi(DownloadsUiEvent),
+    /// Os favoritos (`bookmarks.rs`): o Ctrl+D ou a estrela, com o alvo que
+    /// a origem deu, e as respostas da thread `neural-bookmarks`.
+    Bookmarks(BookmarksEvent),
     /// Pedido da pagina local do painel lateral (canal proprio), com o
     /// numero da pagina que o mandou.
     Panel(side_panel::PanelPost),
@@ -452,6 +458,10 @@ pub(in crate::windows_app) enum BarHit {
     ColumnForward(usize),
     /// O 文A de cada IA: «Traduzir página» (ou devolver o original).
     ColumnTranslate(usize),
+    /// A estrela ☆/★ dos favoritos de cada IA, depois do › e do 文A.
+    ColumnBookmark(usize),
+    /// A estrela ☆/★ da fonte aberta ao lado, depois do › dela.
+    SplitBookmark,
     Column(usize),
     AddTab(usize),
     ContextTab {
@@ -1010,6 +1020,10 @@ pub(in crate::windows_app) fn bar_tooltip_label(
         BarHit::ColumnTranslate(_) => format!(
             "{TRANSLATE_PAGE_LABEL} do {provider} para o português (outro clique: o original)"
         ),
+        BarHit::ColumnBookmark(index) => {
+            bookmark_star_tooltip(state.bookmarked.get(index).copied().unwrap_or(false)).to_string()
+        }
+        BarHit::SplitBookmark => bookmark_star_tooltip(state.split_bookmarked).to_string(),
         BarHit::Column(_) => format!("{provider}: expandir esta coluna"),
         BarHit::AddTab(_) => format!("Nova pergunta ao {provider}"),
         BarHit::ContextTab { .. } => {
@@ -3177,6 +3191,9 @@ pub(in crate::windows_app) struct App {
     pub(in crate::windows_app) stores: Option<StoreRegistry>,
     /// O pedido de chave nativo e o cofre das chaves (`secret_prompt.rs`).
     pub(in crate::windows_app) keys: KeysState,
+    /// O bloqueio de anuncios (`adblock.rs`): a escolha, a lista e o que os
+    /// handlers do WebView2 leem.
+    pub(in crate::windows_app) adblock: AdblockState,
     /// O portao de saida da IA (`crate::egress`): consentimento da sessao,
     /// «Sempre neste site», segundo plano, limite mensal e o consumo em
     /// `ai/usage.json`. Nasce na primeira vez que uma feature o pede
@@ -3193,6 +3210,10 @@ pub(in crate::windows_app) struct App {
     /// A interface dos downloads (`downloads_ui.rs`): as linhas do painel,
     /// a velocidade de cada um, o cartao e a seta da barra.
     pub(in crate::windows_app) downloads_ui: DownloadsUiState,
+    /// Os favoritos (`bookmarks.rs`): a arvore que a thread
+    /// `neural-bookmarks` mandou e a pagina de cada estrela. A thread so
+    /// nasce no primeiro uso.
+    pub(in crate::windows_app) bookmarks: BookmarksState,
 }
 
 impl App {
@@ -3243,6 +3264,8 @@ impl App {
         // disco: so os grants, pedidos depois, dizem onde cada loja vive.
         let stores = StoreRegistry::mint(&config.data_dir).ok();
         let keys = KeysState::new(proxy.clone());
+        // Desligado (quem nunca clicou em "Ativar"), so le a escolha.
+        let adblock = AdblockState::open(stores.as_ref(), &proxy);
         let downloads = DownloadsState::open(stores.as_ref());
         // Sem thread nem disco: a `neural-translate` so nasce no 1.o clique.
         let translation = TranslationState::new(proxy.clone());
@@ -3324,10 +3347,12 @@ impl App {
             live_panel: LivePanel::off(),
             stores,
             keys,
+            adblock,
             egress: None,
             downloads,
             translation,
             downloads_ui,
+            bookmarks: BookmarksState::default(),
         }
     }
 }
@@ -6264,6 +6289,8 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
         visible,
         auto_scroll,
         drag,
+        bookmarked,
+        split_bookmarked,
         ..
     } = state;
     // A meio de um arrasto a fila da coluna desenha-se ja como ficara se o
@@ -6603,11 +6630,18 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
         (layout.back, "‹", BarHit::Back),
         (layout.forward, "›", BarHit::Forward),
     ];
-    for index in 0..layout.columns_len {
+    for (index, starred) in bookmarked.iter().enumerate().take(layout.columns_len) {
         for button in ColumnButton::ALL {
+            // A estrela enche-se quando a pagina da coluna e um favorito.
+            let glyph = match button {
+                ColumnButton::Bookmark => bookmark_star_glyph(*starred),
+                ColumnButton::Back | ColumnButton::Forward | ColumnButton::Translate => {
+                    button.glyph()
+                }
+            };
             pairs.push((
                 layout.column_button(index, button),
-                button.glyph(),
+                glyph,
                 button.hit(index),
             ));
         }
@@ -6703,6 +6737,18 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
             font,
             theme,
         );
+        // A estrela da fonte, entre o › dela e o rotulo.
+        if let Some(star) = controls.split_bookmark {
+            draw_button(
+                target,
+                star,
+                bookmark_star_glyph(split_bookmarked),
+                hover == Some(BarHit::SplitBookmark),
+                scale,
+                font,
+                theme,
+            );
+        }
         // Fechar a fonte: vermelho debaixo do rato, como o fechar da janela.
         draw_pill(
             target,
@@ -7024,6 +7070,8 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ("commands.rs", include_str!("windows_app/commands.rs")),
     ("keymap.rs", include_str!("windows_app/keymap.rs")),
     ("translation.rs", include_str!("windows_app/translation.rs")),
+    ("adblock.rs", include_str!("windows_app/adblock.rs")),
+    ("bookmarks.rs", include_str!("windows_app/bookmarks.rs")),
     ("tests.rs", include_str!("windows_app/tests.rs")),
 ];
 
@@ -7114,6 +7162,10 @@ pub(in crate::windows_app) mod keymap;
 pub(in crate::windows_app) use keymap::*;
 pub(in crate::windows_app) mod translation;
 pub(in crate::windows_app) use translation::*;
+pub(in crate::windows_app) mod adblock;
+pub(in crate::windows_app) use adblock::*;
+pub(in crate::windows_app) mod bookmarks;
+pub(in crate::windows_app) use bookmarks::*;
 
 pub(in crate::windows_app) mod app;
 #[allow(unused_imports)]

@@ -1,0 +1,102 @@
+{
+   "checksum": "7c8b1d5f3e2a4b6c9d0e1f2a3b4c5d6e",
+   "roots": {
+      "bookmark_bar": {
+         "children": [ {
+            "date_added": "13434640200000000",
+            "date_last_used": "0",
+            "guid": "0b1c2d3e-0000-4000-8000-000000000001",
+            "id": "5",
+            "meta_info": {
+               "power_bookmark_meta": ""
+            },
+            "name": "NeuralIA no GitHub",
+            "type": "url",
+            "url": "https://github.com/JoseRFJuniorLLMs/NeuralIA"
+         }, {
+            "children": [ {
+               "date_added": "13393209600000000",
+               "guid": "0b1c2d3e-0000-4000-8000-000000000002",
+               "id": "7",
+               "name": "The Rust Programming Language",
+               "type": "url",
+               "url": "https://doc.rust-lang.org/book/"
+            }, {
+               "children": [ {
+                  "date_added": "13343390100000000",
+                  "guid": "0b1c2d3e-0000-4000-8000-000000000003",
+                  "id": "9",
+                  "name": "Artigo com rastreio",
+                  "type": "url",
+                  "url": "https://www.example.com/artigo/?utm_source=news&id=7"
+               }, {
+                  "date_added": "13343390100000000",
+                  "guid": "0b1c2d3e-0000-4000-8000-000000000004",
+                  "id": "10",
+                  "name": "O mesmo artigo, sem rastreio",
+                  "type": "url",
+                  "url": "https://example.com/artigo?id=7"
+               } ],
+               "date_added": "13343390100000000",
+               "date_modified": "13343390100000000",
+               "guid": "0b1c2d3e-0000-4000-8000-000000000005",
+               "id": "8",
+               "name": "Artigos",
+               "type": "folder"
+            }, {
+               "date_added": "13343390100000000",
+               "guid": "0b1c2d3e-0000-4000-8000-000000000006",
+               "id": "11",
+               "name": "Bookmarklet",
+               "type": "url",
+               "url": "javascript:alert(document.cookie)"
+            } ],
+            "date_added": "13349779200000000",
+            "date_modified": "13393209600000000",
+            "guid": "0b1c2d3e-0000-4000-8000-000000000007",
+            "id": "6",
+            "name": "Leituras",
+            "type": "folder"
+         } ],
+         "date_added": "13349779200000000",
+         "date_modified": "13434640200000000",
+         "guid": "0bc5d13f-2cba-5d74-951f-3f233fe6c908",
+         "id": "1",
+         "name": "Barra de favoritos",
+         "type": "folder"
+      },
+      "other": {
+         "children": [ {
+            "date_added": "13393209600000000",
+            "guid": "0b1c2d3e-0000-4000-8000-000000000008",
+            "id": "12",
+            "name": "nota.pdf",
+            "type": "url",
+            "url": "file:///C:/Users/pessoa/Documentos/nota.pdf"
+         }, {
+            "date_added": "0",
+            "guid": "0b1c2d3e-0000-4000-8000-000000000009",
+            "id": "13",
+            "name": "Brasil – Wikipédia",
+            "type": "url",
+            "url": "https://pt.wikipedia.org/wiki/Brasil"
+         } ],
+         "date_added": "13349779200000000",
+         "date_modified": "0",
+         "guid": "82b081ec-3dd3-529c-8475-ab6c344590dd",
+         "id": "2",
+         "name": "Outros favoritos",
+         "type": "folder"
+      },
+      "synced": {
+         "children": [  ],
+         "date_added": "13349779200000000",
+         "date_modified": "0",
+         "guid": "4cf2e351-0e85-532b-bb37-df045d8f8d0f",
+         "id": "3",
+         "name": "Favoritos do celular",
+         "type": "folder"
+      }
+   },
+   "version": 1
+}

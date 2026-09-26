@@ -323,11 +323,16 @@ impl App {
         // Os mesmos itens que o botao direito dentro da coluna, decididos
         // pelo mesmo `webview_menu_responder` (menu proprio: nenhum item
         // nativo).
-        let request =
-            webview_menu_responder(WebViewHost::Column(col_index), self.auto_scroll.clone())(0);
+        // O bloqueio de anuncios fica no botao direito DENTRO da pagina (e
+        // dela que ele fala): a pilula nao o recebe.
+        let request = webview_menu_responder(
+            WebViewHost::Column(col_index),
+            self.auto_scroll.clone(),
+            None,
+        )(0, None);
         let mut menu = PopupMenu::default();
         for item in &request.items {
-            menu.push(MenuCommand::new(item.id, item.label));
+            menu.push(MenuCommand::new(item.id, item.label.clone()));
         }
         let point = self.bar_menu_point(hwnd);
         let command = self.track_menu(&menu, point, MenuButton::Right);
@@ -892,6 +897,23 @@ impl App {
             Some(BarHit::ColumnForward(index)) => self.navigate_column(index, HistoryStep::Forward),
             Some(BarHit::ColumnTranslate(index)) => {
                 self.translation_event(TranslateEvent::Requested(WebViewHost::Column(index)))
+            }
+            Some(BarHit::ColumnBookmark(index)) => self.bookmarks_event(BookmarksEvent::Request {
+                target: BookmarkTarget::Column(index),
+                via: BookmarkVia::Star,
+            }),
+            Some(BarHit::SplitBookmark) => {
+                let split = self
+                    .comparator
+                    .as_ref()
+                    .and_then(|comp| comp.split.as_ref())
+                    .map(|split| (split.source_index, split.private));
+                if let Some((source, private)) = split {
+                    self.bookmarks_event(BookmarksEvent::Request {
+                        target: BookmarkTarget::Split { source, private },
+                        via: BookmarkVia::Star,
+                    });
+                }
             }
             Some(BarHit::Column(index)) => self.expand_comparator(index),
             Some(BarHit::AddTab(index)) => self.open_ai_palette(index),

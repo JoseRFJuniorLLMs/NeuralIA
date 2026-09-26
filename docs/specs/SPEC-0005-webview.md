@@ -331,11 +331,13 @@ go through one module, `crates/neural-app/src/windows_app/webview_hooks.rs`:
   of wry's `build` / `build_as_child` in the product (the gate holds them to
   the module), and after the build they register through WebView2 COM, for
   the same host, the NeuralIA items of the right-click menu
-  (`WEBVIEW_MENU_ITEMS`: today only the auto-scroll item, on the columns and
-  on the split, private included), an `AcceleratorKeyPressed` handler that
-  consults `accelerator_lookup` and, on every `Managed` host, the download
-  manager (`install_webview_hooks`, private to the module; see "Downloads"
-  below).
+  (`WEBVIEW_MENU_ITEMS`: the auto-scroll item, on the columns and on the
+  split, private included; and the two ad-blocking items, on the columns, the
+  non-private split and the full Web), an `AcceleratorKeyPressed` handler that
+  consults `accelerator_lookup`, on every `Managed` host the download manager
+  (see "Downloads" below), and on the hosts whose `resource_gate` is
+  `Adblock` the `WebResourceRequested` handler of the resource dispatcher
+  (`install_webview_hooks`, private to the module).
 
 The host a birth site passes to `hooked_builder` is therefore the only host
 that WebView has, in both halves: a site cannot build without the chain, nor
@@ -401,10 +403,16 @@ table (Ctrl+D, Ctrl+N, Ctrl+W, Ctrl+Tab, Ctrl+G, Ctrl+O, Ctrl+S,
 Ctrl+Shift+S) is consulted only by the Files chain, which no current origin
 uses (gate `files_override_wins_only_in_files`).
 
-Today no WebView host binds a chord (gate
-`accelerator_lookup_binds_no_webview_chord_today`): the pages' shortcuts are
-still those of `NEURALIA_KEYMAP_SCRIPT`, and only the `Window` scope has rows
--- the Ctrl+R, Ctrl+Shift+R, Ctrl+H, Ctrl+N, Ctrl+O, Ctrl+Shift+Z and
+Today the WebView hosts bind only the two `Global` chords, on every host
+with a keyboard and with that host as the origin: Ctrl+D (bookmarks,
+`CommandId::Bookmark`) -- the comparator column, the split, the private
+split, the full Web, Reader and PDF bookmark their own page; the panels and
+EPUB open Favoritos (gate `ctrl_d_runs_against_the_host_it_came_from`) --
+and Ctrl+J (downloads-ui, `CommandId::Downloads`), which opens the side
+panel's Downloads section from anywhere (gate
+`accelerator_lookup_binds_only_the_global_chords_on_webviews`). The pages' other shortcuts
+are still those of `NEURALIA_KEYMAP_SCRIPT`, and the `Window` scope keeps
+the Ctrl+R, Ctrl+Shift+R, Ctrl+H, Ctrl+N, Ctrl+O, Ctrl+Shift+Z and
 Ctrl+Shift+Delete the main window and the omnibox already answered. The CI
 accelerator spike measured native dispatch on every host kind: with
 `Handled = TRUE` the page never sees the keydown of the chord, but it may still
@@ -414,11 +422,26 @@ keydown and keypress; the shipped decision leaves key-up unhandled, so the page
 also receives the keyup of a bound chord, which the spike did not measure. A
 page that reacts to keypress or keyup sees the press; none of them can run the
 command, which is born on the native side.
-The resource dispatcher `resource_gate_answers` is a stub
-the product does not yet wire to `WebResourceRequested`; the gate
-`custom_schemes_are_never_answered_by_the_resource_gate` already holds it to
-never answering a request on `neuralia-pdf`, `neuralia-epub` or
-`neuralia-live` (those are served by their wry custom protocols).
+The resource dispatcher `resource_gate_answers(host, uri, page, rules)` is
+wired to `WebResourceRequested` on the hosts whose `resource_gate` is
+`Adblock` -- the comparator columns, the source page beside a column (not the
+private one) and the full Web -- and on no other host (gate
+`the_adblock_gate_is_installed_on_columns_split_and_external_only`; CI
+sabotage `adblock-split-without-resource-gate`). The handler
+(`register_resource_gate`) reads the request URI, its `ResourceContext` and the
+top page from the event's `sender`, never from a captured WebView (gate
+`the_resource_handler_reads_the_sender_never_a_captured_webview`), asks the
+dispatcher with the ad blocker's rules in force, and on a block answers 403
+through the `CreateWebResourceResponse` of the sender's environment. The `*`
+filter (with `ICoreWebView2_22` and all request source kinds when the runtime
+has it) is only present while ad blocking is on: new WebViews get it at
+registration and the open ones when the user turns blocking on or off. The
+dispatcher never answers a request on `neuralia-pdf`, `neuralia-epub` or
+`neuralia-live` (those are served by their wry custom protocols; gate
+`custom_schemes_are_never_answered_by_the_resource_gate`, CI sabotage
+`resource-gate-answers-neuralia-pdf`), never a document, and nothing on a page
+of an AI provider or a sign-in host of the provider registry (gate
+`the_shipped_gate_blocks_ads_but_never_documents_or_ai_pages`).
 
 ### Downloads
 

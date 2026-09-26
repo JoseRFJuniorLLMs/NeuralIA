@@ -187,8 +187,10 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Theme(event) => self.theme_event(event),
             UserEvent::Keys(event) => self.keys_event(event),
             UserEvent::WebView(event) => self.webview_event(event),
+            UserEvent::Adblock(event) => self.adblock_event(event),
             UserEvent::Download(event) => self.download_event(event),
             UserEvent::Translate(event) => self.translation_event(event),
+            UserEvent::Bookmarks(event) => self.bookmarks_event(event),
             // O «Cancelar e sair» confirmado no cartao sai por la.
             UserEvent::DownloadsUi(event) => self.downloads_ui_event(event_loop, event),
             UserEvent::Panel(post) => self.handle_panel_message(post),

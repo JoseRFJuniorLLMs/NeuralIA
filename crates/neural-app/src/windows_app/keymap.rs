@@ -50,10 +50,12 @@ use winit::keyboard::ModifiersState;
 // `keyup` ve o toque (e nem essa faz correr o comando, que nasce aqui).
 //
 // As WebViews prendem so os atalhos `Global`: hoje o Ctrl+J dos Downloads
-// (downloads-ui), em cada hospedeiro menos o monitor do Gmail. Os atalhos
-// das paginas continuam todos no `NEURALIA_KEYMAP_SCRIPT` (intocado), e o
-// resto do registo e do ambito `Window` (a janela e a omnibox). Cada atalho
-// novo da 2.3 entra com o seu comando, no PR dele (regra C13).
+// (downloads-ui, `CommandId::Downloads`) e o Ctrl+D dos favoritos
+// (`CommandId::Bookmark`), em cada hospedeiro menos o monitor do Gmail. Os
+// outros atalhos das paginas continuam no `NEURALIA_KEYMAP_SCRIPT`
+// (intocado), e o resto do registo e do ambito `Window` (a janela e a
+// omnibox). Cada atalho novo da 2.3 entra com o seu comando, no PR dele
+// (regra C13).
 
 /// Uma combinacao de teclas: a tecla virtual (a que o
 /// `AcceleratorKeyPressed` e o `WM_KEYDOWN` dao) e os tres modificadores,
