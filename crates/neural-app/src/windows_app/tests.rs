@@ -24287,13 +24287,96 @@ fn without_impl_blocks(code: &str, headers: &[&str]) -> String {
     out
 }
 
+/// Uma `fn` de `code` (de `rust_code_only`), por `fn_items`.
+struct FnItem {
+    name: String,
+    /// De `fn` ate ao `{` (ou `;`) que a fecha fora de parenteses, sem
+    /// espacos nem a virgula antes do `)`: a mesma com qualquer formatacao.
+    signature: String,
+    /// Do `fn` ao `}` que fecha o corpo (a assinatura incluida).
+    span: std::ops::Range<usize>,
+}
+
+/// Cada `fn nome` de `code` (de `rust_code_only`: nenhuma chaveta num
+/// literal ou comentario), com a assinatura e o sitio. Os tipos `fn(..)` e
+/// os `Fn`/`FnOnce` nao contam.
+fn fn_items(code: &str) -> Vec<FnItem> {
+    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let mut out = Vec::new();
+    for (at, _) in code.match_indices("fn") {
+        if code[..at].chars().next_back().is_some_and(ident) {
+            continue;
+        }
+        let rest = &code[at + 2..];
+        let gap = rest.len() - rest.trim_start().len();
+        let name: String = rest[gap..].chars().take_while(|ch| ident(*ch)).collect();
+        if gap == 0 || name.is_empty() {
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut open = None;
+        for (offset, ch) in rest.char_indices() {
+            match ch {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                '{' | ';' if depth == 0 => {
+                    open = Some((at + 2 + offset, ch));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some((open, opener)) = open else {
+            continue;
+        };
+        let signature = code[at..open]
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>()
+            .replace(",)", ")");
+        let mut end = open + 1;
+        if opener == '{' {
+            let mut level = 0usize;
+            for (offset, ch) in code[open..].char_indices() {
+                match ch {
+                    '{' => level += 1,
+                    '}' => {
+                        level -= 1;
+                        if level == 0 {
+                            end = open + offset + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out.push(FnItem {
+            name,
+            signature,
+            span: at..end,
+        });
+    }
+    out
+}
+
 /// Gate (critico, infra-privacy-guard): a unica cunhagem do registo das
 /// lojas no produto e a do `App::new`, e vai inteira para o
-/// `PrivacyGuard::new`. Nenhuma funcao devolve nem recebe `&StoreRegistry`
-/// (as features pedem grants por `privacy.store(spec)`), o registo e os
-/// workers sao campos privados do guard, o construtor de teste -- a unica
-/// porta para `Private` -- so existe em `cfg(test)`, e o `App` ja nao tem
-/// o registo, o historico, a memoria nem as abas.
+/// `PrivacyGuard::new`. Nenhuma funcao devolve nem recebe o registo (as
+/// features pedem grants por `privacy.store(spec)`): em nenhum ficheiro que
+/// embarca uma assinatura o nomeia -- com qualquer tempo de vida
+/// (`&'_ StoreRegistry`), numa caixa, numa closure --, nenhum `type` nem
+/// `use ... as` lhe muda o nome e nenhum `impl` e dele (o `Self` de um
+/// metodo seria o registo); so os dois construtores do guard o recebem,
+/// por valor. Dentro do guard o campo so se usa em `mode` e `store`: nada
+/// empresta nem devolve `self.registry`. O registo e os workers sao campos
+/// privados do guard, o construtor de teste -- a unica porta para
+/// `Private` -- so existe em `cfg(test)`, e o `App` ja nao tem o registo,
+/// o historico, a memoria nem as abas.
+///
+/// Sabotagem (revisao F5): `pub(crate) fn registry(&self) -> &'_
+/// StoreRegistry { &self.registry }` no guard, usado pelo adblock como
+/// `self.privacy.registry().grant(ADBLOCK_LIST_STORE)` -> vermelho.
 #[test]
 fn registry_is_minted_once_and_owned_by_the_guard() {
     let app = without_comment_lines(&shipped_source());
@@ -24414,6 +24497,135 @@ fn registry_is_minted_once_and_owned_by_the_guard() {
     ] {
         assert!(!app_struct.contains(gone), "o App ainda tem {gone}");
     }
+
+    // 6. Em TODOS os ficheiros que embarcam (a volta do `shipped_rust_files`,
+    // nao so a lista dos de topo): o registo so tem nome no windows_app.rs
+    // (o `use` e a cunhagem, contados em 2.) e no privacy.rs; nenhum `use`
+    // lhe muda o nome, nenhum `type` o esconde, nenhum `impl` e dele; e
+    // nenhuma assinatura o nomeia -- `&StoreRegistry`, `&'_ StoreRegistry`,
+    // `Box<StoreRegistry>`, `impl FnOnce(&StoreRegistry)` -- fora dos dois
+    // construtores do guard, que o recebem por valor e devolvem `Self`.
+    const OWNERS: [&str; 2] = ["neural-app/src/privacy.rs", "neural-app/src/windows_app.rs"];
+    const TAKE_IT_BY_VALUE: [&str; 2] = [
+        "neural-app/src/privacy.rs: fnnew(minted:Result<StoreRegistry,AlreadyMinted>,config:&CoreConfig,sink:EventSink)->Self",
+        "neural-app/src/privacy.rs: fnwith_registry(registry:StoreRegistry,config:&CoreConfig,sink:EventSink)->Self",
+    ];
+    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let whole = |code: &str, at: usize, len: usize| {
+        !code[..at].chars().next_back().is_some_and(ident)
+            && !code[at + len..].chars().next().is_some_and(ident)
+    };
+    let files = shipped_rust_files("neural-app");
+    for owner in OWNERS {
+        assert!(
+            files.iter().any(|(name, _)| name == owner),
+            "{owner} fora da volta do gate"
+        );
+    }
+    let mut signatures = Vec::new();
+    for (name, code) in &files {
+        if !code.contains("StoreRegistry") {
+            continue;
+        }
+        assert!(
+            OWNERS.contains(&name.as_str()),
+            "{name} fala no registo: so o guard o tem"
+        );
+        for statement in use_statements(code) {
+            let words = use_words(&statement);
+            assert!(
+                !(words.contains(&"StoreRegistry") && words.contains(&"as")),
+                "{name}: o registo com outro nome: {statement}"
+            );
+        }
+        for keyword in ["type", "impl"] {
+            for (at, _) in code.match_indices(keyword) {
+                if !whole(code, at, keyword.len()) {
+                    continue;
+                }
+                let end = code[at..]
+                    .find([';', '{'])
+                    .map_or(code.len(), |offset| at + offset);
+                let head = code[at..end].split_whitespace().collect::<Vec<_>>();
+                assert!(
+                    !code[at..end].contains("StoreRegistry"),
+                    "{name}: `{}` da o registo por outro nome",
+                    head.join(" ")
+                );
+            }
+        }
+        signatures.extend(
+            fn_items(code)
+                .into_iter()
+                .filter(|item| item.signature.contains("StoreRegistry"))
+                .map(|item| format!("{name}: {}", item.signature)),
+        );
+    }
+    signatures.sort();
+    assert_eq!(
+        signatures, TAKE_IT_BY_VALUE,
+        "uma assinatura recebe ou devolve o registo: so os construtores do guard o recebem"
+    );
+
+    // 7. No guard, o campo so se usa como `self.registry.mode()` em `mode` e
+    // `self.registry.grant(spec)` em `store`; os construtores (`new`,
+    // `for_test`, `with_registry`) tem-no antes de o guard existir. Nada o
+    // empresta (`&self.registry`), devolve, tira nem desmonta.
+    let guard_code = &files
+        .iter()
+        .find(|(name, _)| name == OWNERS[0])
+        .expect("privacy.rs")
+        .1;
+    let items = fn_items(guard_code);
+    let fields_at = guard_code
+        .find("struct PrivacyGuard {")
+        .expect("struct PrivacyGuard");
+    let fields_span = fields_at
+        ..fields_at
+            + guard_code[fields_at..]
+                .find('}')
+                .expect("o fim do struct PrivacyGuard");
+    let mut lent = Vec::new();
+    for (at, word) in guard_code.match_indices("registry") {
+        if !whole(guard_code, at, word.len()) {
+            continue;
+        }
+        let owner = items
+            .iter()
+            .filter(|item| item.span.contains(&at))
+            .min_by_key(|item| item.span.len())
+            .map(|item| item.name.as_str());
+        let mut before: Vec<char> = guard_code[..at]
+            .chars()
+            .rev()
+            .filter(|ch| !ch.is_whitespace())
+            .take(5)
+            .collect();
+        before.reverse();
+        let before: String = before.into_iter().collect();
+        let after: String = guard_code[at + word.len()..]
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .take(20)
+            .collect();
+        let fine = match owner {
+            Some("new" | "for_test" | "with_registry") => true,
+            Some("mode") => before == "self." && after.starts_with(".mode()"),
+            Some("store") => before == "self." && after.starts_with(".grant(spec)"),
+            None => fields_span.contains(&at) && after.starts_with(":StoreRegistry,"),
+            Some(_) => false,
+        };
+        if !fine {
+            lent.push(format!(
+                "{before}registry{after} em {}",
+                owner.map_or("(fora de fn)".to_string(), |name| format!("fn {name}"))
+            ));
+        }
+    }
+    assert!(
+        lent.is_empty(),
+        "o guard empresta, devolve ou tira o registo: {lent:#?}"
+    );
 }
 
 /// Cada ficheiro `.rs` que embarca de `crates/<krate>/src` -- sem os

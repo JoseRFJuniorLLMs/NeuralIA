@@ -828,6 +828,26 @@ jobs:
               New = @'
                   let outcome = if false {
           '@
+            },
+            @{
+              Label = "guard-lends-the-registry-with-a-lifetime"
+              Test = "registry_is_minted_once_and_owned_by_the_guard"
+              SourcePath = "crates/neural-app/src/privacy.rs"
+              Old = @'
+              pub(crate) fn store(&self, spec: StoreSpec) -> Option<StoreGrant> {
+                  self.registry.grant(spec).ok()
+              }
+          '@
+              New = @'
+              pub(crate) fn store(&self, spec: StoreSpec) -> Option<StoreGrant> {
+                  self.registry().grant(spec).ok()
+              }
+
+              /// O registo, emprestado a quem o pedir.
+              pub(crate) fn registry(&self) -> &'_ StoreRegistry {
+                  &self.registry
+              }
+          '@
             }
           )
 

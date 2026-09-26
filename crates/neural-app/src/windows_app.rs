@@ -4386,13 +4386,13 @@ impl TabPersistence {
         }
     }
 
-    /// O `SaveTabSession(token)` que o atraso entrega: so o ultimo agendado
-    /// grava (`None` para um bilhete ultrapassado por outra mudanca).
     /// O bilhete `token` ainda e o ultimo agendado?
     pub(crate) fn save_due_token(&self, token: u64) -> bool {
         token == self.sync.token
     }
 
+    /// O `SaveTabSession(token)` que o atraso entrega: so o ultimo agendado
+    /// grava (`None` para um bilhete ultrapassado por outra mudanca).
     pub(crate) fn save_due(
         &mut self,
         token: u64,
