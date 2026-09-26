@@ -187,7 +187,11 @@ impl BarColumns {
 /// geometria (`BarLayout::with_rows`), a pintura e o hit-testing percorrem
 /// `ALL`. Regra: o grupo inteiro ou cabe na faixa da coluna ou nao existe
 /// (largura 0), como o "+": nunca um botao invisivel mas clicavel por cima
-/// da IA seguinte (gate `column_buttons_fit_or_vanish`).
+/// da IA seguinte (gate `column_buttons_fit_or_vanish`). Um botao
+/// `optional` (o 文A, que o item «Traduzir página» do botao direito
+/// substitui) cede antes da pilula: so entra quando, com ele, a pilula da
+/// IA fica com pelo menos `COLUMN_PILL_MIN`; sem ele os outros ficam onde
+/// estavam.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::windows_app) enum ColumnButton {
     Back,
@@ -200,6 +204,10 @@ pub(in crate::windows_app) enum ColumnButton {
 /// Quantos botoes tem cada coluna: o tamanho das filas de `BarLayout`.
 pub(in crate::windows_app) const COLUMN_BUTTONS: usize = ColumnButton::ALL.len();
 
+/// A pilula mais estreita (em pixeis logicos) com que um botao opcional da
+/// coluna ainda entra.
+pub(in crate::windows_app) const COLUMN_PILL_MIN: f64 = 60.0;
+
 impl ColumnButton {
     pub(in crate::windows_app) const ALL: [Self; 3] = [Self::Back, Self::Forward, Self::Translate];
     /// Largura logica de cada botao (a mesma do "+") e a folga entre eles.
@@ -207,6 +215,12 @@ impl ColumnButton {
     /// a 1024 px a pilula da IA da direita ainda existe (fica estreita).
     pub(in crate::windows_app) const WIDTH: f64 = 26.0;
     pub(in crate::windows_app) const GAP: f64 = 2.0;
+
+    /// Cede antes da pilula (so o 文A: o «Traduzir página» do botao direito
+    /// faz o mesmo sem ele). Os opcionais vem depois dos outros em `ALL`.
+    pub(in crate::windows_app) fn optional(self) -> bool {
+        matches!(self, Self::Translate)
+    }
 
     pub(in crate::windows_app) fn glyph(self) -> &'static str {
         match self {
@@ -486,8 +500,20 @@ impl BarLayout {
             // da pilula: ela encolhe primeiro.
             let button_width = ColumnButton::WIDTH * scale;
             let button_gap = ColumnButton::GAP * scale;
-            let reserved_after =
-                plus_width + gap + COLUMN_BUTTONS as f64 * (button_width + button_gap);
+            let slot = button_width + button_gap;
+            let optional = ColumnButton::ALL
+                .iter()
+                .filter(|button| button.optional())
+                .count() as f64;
+            let required_after = plus_width + gap + (COLUMN_BUTTONS as f64 - optional) * slot;
+            // Os opcionais (o 文A) so entram com a pilula ainda legivel.
+            let with_optional =
+                available - required_after - optional * slot >= COLUMN_PILL_MIN * scale;
+            let reserved_after = if with_optional {
+                required_after + optional * slot
+            } else {
+                required_after
+            };
             let pill = provider_width.min((available - reserved_after).max(0.0));
             columns_rect[span.index] = UiRect {
                 x: left,
@@ -515,7 +541,10 @@ impl BarLayout {
             // cima da IA seguinte.
             let mut x = plus_x + plus_width;
             let mut buttons = [empty; COLUMN_BUTTONS];
-            for rect in &mut buttons {
+            for (rect, button) in buttons.iter_mut().zip(ColumnButton::ALL) {
+                if button.optional() && !with_optional {
+                    continue;
+                }
                 x += button_gap;
                 *rect = UiRect {
                     x,

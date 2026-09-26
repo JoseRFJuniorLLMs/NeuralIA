@@ -1575,13 +1575,16 @@ fn every_ai_column_has_its_own_back_and_forward_after_its_plus() {
 /// depois do "+", sem se sobrepor ao vizinho nem entrar na coluna seguinte
 /// ou no canto direito, e o clique no centro dele volta a ser ELE -- ou
 /// nao existe (largura 0, e nada o encontra). O grupo e tudo ou nada: numa
-/// coluna, ou todos os botoes existem ou nenhum.
+/// coluna, ou todos os botoes obrigatorios existem ou nenhum; um opcional
+/// (o 文A) so existe com eles, e so com a pilula de pelo menos
+/// `COLUMN_PILL_MIN`.
 #[test]
 fn column_buttons_fit_or_vanish() {
     assert_eq!(COLUMN_BUTTONS, ColumnButton::ALL.len());
     let center = |rect: UiRect| (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
     let mut existed = 0usize;
     let mut vanished = 0usize;
+    let (mut kept, mut ceded) = (0usize, 0usize);
     for scale in [1.0, 1.5, 2.0] {
         for width in (720..=2560).step_by(40) {
             for split_active in [false, true] {
@@ -1599,11 +1602,33 @@ fn column_buttons_fit_or_vanish() {
                         .map(|button| layout.column_button(index, *button))
                         .collect();
                     let shown = rects.iter().filter(|rect| rect.width > 0.0).count();
+                    let required: Vec<bool> = ColumnButton::ALL
+                        .iter()
+                        .zip(&rects)
+                        .filter(|(button, _)| !button.optional())
+                        .map(|(_, rect)| rect.width > 0.0)
+                        .collect();
+                    let required_shown = required.iter().filter(|shown| **shown).count();
                     assert!(
-                        shown == 0 || shown == rects.len(),
-                        "{at}: coluna {index} com {shown} de {} botoes",
-                        rects.len()
+                        required_shown == 0 || required_shown == required.len(),
+                        "{at}: coluna {index} com {required_shown} de {} botoes",
+                        required.len()
                     );
+                    for (button, rect) in ColumnButton::ALL.iter().zip(&rects) {
+                        if button.optional() && rect.width > 0.0 {
+                            assert_eq!(
+                                required_shown,
+                                required.len(),
+                                "{at}: {} sem os outros na coluna {index}",
+                                button.glyph()
+                            );
+                            assert!(
+                                layout.columns[index].width >= COLUMN_PILL_MIN * scale - 1e-9,
+                                "{at}: {} com a pilula da coluna {index} ilegivel",
+                                button.glyph()
+                            );
+                        }
+                    }
                     if shown == 0 {
                         vanished += 1;
                         for (button, rect) in ColumnButton::ALL.iter().zip(&rects) {
@@ -1628,6 +1653,33 @@ fn column_buttons_fit_or_vanish() {
                     };
                     let mut previous_right = plus.x + plus.width;
                     for (button, rect) in ColumnButton::ALL.iter().zip(&rects) {
+                        if rect.width == 0.0 {
+                            // Um opcional que cedeu: nada o encontra -- nem
+                            // onde ele estaria, logo a seguir aos outros.
+                            assert!(button.optional(), "{at}: {}", button.glyph());
+                            ceded += 1;
+                            let (x, y) = (
+                                previous_right
+                                    + (ColumnButton::GAP + ColumnButton::WIDTH / 2.0) * scale,
+                                plus.y + plus.height / 2.0,
+                            );
+                            assert_ne!(
+                                layout.hit(x, y),
+                                Some(button.hit(index)),
+                                "{at}: o {} que cedeu na coluna {index} ainda e clicavel",
+                                button.glyph()
+                            );
+                            assert_ne!(
+                                bar_hit_at(Some(controls), Some(layout), x, y),
+                                Some(button.hit(index)),
+                                "{at}: o {} que cedeu na coluna {index} ainda e clicavel",
+                                button.glyph()
+                            );
+                            continue;
+                        }
+                        if button.optional() {
+                            kept += 1;
+                        }
                         assert!(
                             rect.x >= previous_right,
                             "{at}: {} da coluna {index} sobrepoe o anterior",
@@ -1658,10 +1710,15 @@ fn column_buttons_fit_or_vanish() {
         }
     }
     // A varredura viu os dois lados da regra: botoes que existem (janelas
-    // largas) e botoes que sumiram (janelas estreitas a escala 2).
+    // largas) e botoes que sumiram (janelas estreitas a escala 2) -- e, com
+    // os obrigatorios a vista, o 文A presente e o 文A que cedeu a pilula.
     assert!(
         existed > 0 && vanished > 0,
         "{existed} com botoes, {vanished} sem"
+    );
+    assert!(
+        kept > 0 && ceded > 0,
+        "opcionais: {kept} a vista, {ceded} cederam"
     );
 }
 
@@ -19014,9 +19071,18 @@ fn provider_row(layout: &BarLayout) -> Vec<[f64; 4]> {
 /// 1100 perdia o "+". Agora (1) arrancar, pausar ou parar o Pomodoro nao
 /// mexe em NADA da segunda linha nem nas abas, a qualquer largura e
 /// escala; e (2) nas larguras comuns cada coluna visivel tem a sua
-/// pilula (legivel a partir de 1280), o "+" e os ‹ ›.
+/// pilula (legivel a partir de 1280), o "+" e os ‹ ›. O 文A (opcional)
+/// cede antes da pilula: de `TRANSLATE_FROM` (1290 px logicos, a 1x e a
+/// 1.5x) para cima esta nas tres colunas; abaixo, a coluna encostada ao
+/// canto -- que tambem paga a seta dos Downloads (downloads-ui) a partir
+/// de 1100 -- e a primeira a ficar sem ele, e o «Traduzir página» do
+/// botao direito continua (gate
+/// `each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r`).
 #[test]
 fn the_tools_never_take_room_from_the_ai_columns() {
+    // A largura (logica) a partir da qual as tres colunas a vista tem o
+    // 文A: a 1289 px a do canto ainda nao tem lugar para ele.
+    const TRANSLATE_FROM: f64 = 1290.0;
     let (running, paused) = shipped_pomodoro_labels();
     let topologies = [
         ([false, false, false], false),
@@ -19075,7 +19141,15 @@ fn the_tools_never_take_room_from_the_ai_columns() {
         }
     }
 
-    for logical_width in [1024.0, 1100.0, 1280.0, 1366.0, 1440.0, 1920.0] {
+    for logical_width in [
+        1024.0,
+        1100.0,
+        1280.0,
+        TRANSLATE_FROM,
+        1366.0,
+        1440.0,
+        1920.0,
+    ] {
         for scale in [1.0, 1.5] {
             let client_width = logical_width * scale;
             for (minimized, split_active) in topologies {
@@ -19098,6 +19172,11 @@ fn the_tools_never_take_room_from_the_ai_columns() {
                         }
                         assert!(layout.add_tabs[index].width > 0.0, "sem \"+\": {at}");
                         for button in ColumnButton::ALL {
+                            // O 文A (opcional) cede antes da pilula: so e
+                            // exigido onde cabe nas tres colunas.
+                            if button.optional() && logical_width < TRANSLATE_FROM {
+                                continue;
+                            }
                             assert!(
                                 layout.column_button(index, button).width > 0.0,
                                 "sem {}: {at}",
@@ -19107,6 +19186,47 @@ fn the_tools_never_take_room_from_the_ai_columns() {
                     }
                 }
             }
+        }
+    }
+
+    // De `TRANSLATE_FROM` para cima, px a px, cada coluna a vista tem o 文A
+    // (a etiqueta do Pomodoro nao mexe na linha: parte (1)). Um px abaixo,
+    // a coluna do canto ja o cedeu, e fica com a pilula, o "+" e os ‹ ›.
+    for scale in [1.0, 1.5] {
+        for logical_width in TRANSLATE_FROM as u32..=1920 {
+            let logical_width = f64::from(logical_width);
+            for (minimized, split_active) in topologies {
+                if split_active {
+                    continue;
+                }
+                let layout = layout_at(logical_width * scale, scale, minimized, false, None);
+                for index in (0..COMPARATOR_COLUMNS).filter(|index| !minimized[*index]) {
+                    for button in ColumnButton::ALL.into_iter().filter(|b| b.optional()) {
+                        assert!(
+                            layout.column_button(index, button).width > 0.0,
+                            "sem {}: coluna {index} a {logical_width}px @{scale}x min={minimized:?}",
+                            button.glyph()
+                        );
+                    }
+                }
+            }
+        }
+        let below = layout_at(
+            (TRANSLATE_FROM - 1.0) * scale,
+            scale,
+            [false; COMPARATOR_COLUMNS],
+            false,
+            None,
+        );
+        let corner = COMPARATOR_COLUMNS - 1;
+        assert!(below.columns[corner].width > 0.0 && below.add_tabs[corner].width > 0.0);
+        for button in ColumnButton::ALL {
+            assert_eq!(
+                below.column_button(corner, button).width > 0.0,
+                !button.optional(),
+                "{} da coluna do canto um px abaixo de {TRANSLATE_FROM} @{scale}x",
+                button.glyph()
+            );
         }
     }
 
