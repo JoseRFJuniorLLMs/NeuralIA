@@ -552,14 +552,15 @@ pub const MAX_SEGMENT_UTF16: usize = 255;
 
 /// Uma passagem pelos bytes UTF-8 do nome de uma entrada, que pára no
 /// primeiro para lá do teto: `true` quando um segmento (`/` ou `\`) tem
-/// mais de [`MAX_SEGMENT_UTF16`] unidades UTF-16, ou quando é `.` ou `..`.
-/// Nenhum ZIP legítimo tem estes: cada extrator resolve-os à sua maneira
-/// (o `tar.exe` grava `setup.exe/.` como o arquivo `setup.exe`). Conta
+/// mais de [`MAX_SEGMENT_UTF16`] unidades UTF-16, ou quando é `..`, que
+/// sobe de pasta e que cada extrator resolve à sua maneira. Um `.` não
+/// conta aqui: não muda o caminho em nenhum extrator (o bsdtar grava
+/// `./LEIAME.txt`), e a classificação salta-o. Conta
 /// sobre os bytes, sem descodificar: um caractere começa em cada byte que
 /// não é de continuação e vale uma unidade, ou duas se tem 4 bytes. Recebe
 /// os bytes, e não o nome, para o gate contar os que ela lê.
 fn has_bad_segment(bytes: impl Iterator<Item = u8>) -> bool {
-    let is_dot_segment = |units: usize, only_dots: bool| only_dots && matches!(units, 1 | 2);
+    let is_dot_segment = |units: usize, only_dots: bool| only_dots && units == 2;
     let mut units = 0usize;
     let mut only_dots = true;
     for byte in bytes {
@@ -591,8 +592,8 @@ fn is_blank_segment(segment: &str) -> bool {
 /// central, o campo Unicode Path ou o cabeçalho local o trazem.
 ///
 /// Primeiro, numa só passagem que pára no teto, o caminho: um segmento com
-/// mais de [`MAX_SEGMENT_UTF16`] unidades UTF-16, ou um `.` ou `..` em
-/// qualquer lugar (`../../x.bat`, `setup.exe/.`, `dir/./x.txt`), é um nome
+/// mais de [`MAX_SEGMENT_UTF16`] unidades UTF-16, ou um `..` em qualquer
+/// lugar (`../../x.bat`, `a/../setup.exe`, `setup.exe/..`), é um nome
 /// estragado ([`BlockReason::BadName`]), que apaga o ZIP sempre. Por isso as
 /// passagens seguintes só correm sobre um segmento de até 255 unidades.
 ///
@@ -609,7 +610,10 @@ fn is_blank_segment(segment: &str) -> bool {
 /// e um extrator grava-os e corre-os -- por isso esse nome conta pela
 /// extensão, como outro qualquer (`aux.exe` é um programa, `prn.pdf.exe` um
 /// disfarce, `aux.c` e `con.txt` nada). Um caminho só de pontos, espaços e
-/// separadores, sem `.` nem `..`, não conta. Depois, outro arquivo
+/// separadores, sem `..`, não conta. Um `.` no meio (`./LEIAME.txt`,
+/// `dir/./x.txt`) não muda nada, e um `.` no fim cai como os outros
+/// segmentos só de pontos (`setup.exe/.` é o programa `setup.exe`, como o
+/// `tar.exe` o grava). Depois, outro arquivo
 /// compactado ([`ARCHIVE_EXTENSIONS`]).
 pub fn zip_entry_risk(entry: &str) -> Option<ZipEntryRisk> {
     if has_bad_segment(entry.bytes()) {
@@ -1704,18 +1708,23 @@ mod tests {
             ("pasta/run.bat/ . /. .", Some(Blocked(Script))),
             ("fotos/foto.jpg.exe/ .", Some(Blocked(Masquerade))),
             ("inner.zip\\ . ", Some(NestedArchive)),
-            // Um `.` ou `..` em qualquer lugar do caminho e um nome estragado
-            // (ZI-5): nenhum ZIP legitimo os tem, e cada extrator os resolve
-            // a sua maneira (o tar.exe grava `setup.exe/.` como `setup.exe`).
-            ("setup.exe/.", Some(Blocked(BadName))),
-            ("setup.exe\\.", Some(Blocked(BadName))),
+            // Um `..` em qualquer lugar do caminho e um nome estragado (ZI-5):
+            // sobe de pasta, e cada extrator o resolve a sua maneira. Um `.`
+            // nao muda o caminho: no fim cai (o tar.exe grava `setup.exe/.`
+            // como o programa `setup.exe`), no meio nao conta, e o `./` do
+            // bsdtar (`tar -a -cf x.zip .`) e um ZIP legitimo.
+            ("setup.exe/.", Some(Blocked(Program))),
+            ("setup.exe\\.", Some(Blocked(Program))),
+            ("./setup.exe", Some(Blocked(Program))),
+            ("./docs/", None),
+            ("./fotos/./praia.jpg", None),
             ("setup.exe/..", Some(Blocked(BadName))),
             ("a/../setup.exe", Some(Blocked(BadName))),
-            ("dir/./x.txt", Some(Blocked(BadName))),
+            ("dir/./x.txt", None),
             ("../../evil.exe", Some(Blocked(BadName))),
             ("..\\LEIAME.txt", Some(Blocked(BadName))),
-            ("./LEIAME.txt", Some(Blocked(BadName))),
-            ("fotos/./", Some(Blocked(BadName))),
+            ("./LEIAME.txt", None),
+            ("fotos/./", None),
             ("a/..", Some(Blocked(BadName))),
             // Nomes que mentem: bidi, invisiveis, controlos, fluxo alternativo.
             ("fatura\u{202E}fdp.exe", Some(Blocked(BadName))),
@@ -1946,11 +1955,12 @@ mod tests {
             holds(Blocked(Script), "bin\\run.cmd")
         );
         // ZI-5 por um ZIP real: `setup.exe/.` com os bytes de um programa (o
-        // tar.exe grava o arquivo `setup.exe`) e `setup.exe/ .`, cujo ultimo
-        // segmento real e o programa; `docs/` continua uma pasta.
+        // tar.exe grava o arquivo `setup.exe`) e `setup.exe/ .` contam pelo
+        // ultimo segmento real, o programa; `docs/` continua uma pasta.
         for (entry, risk) in [
-            ("setup.exe/.", Blocked(BadName)),
-            ("setup.exe\\.", Blocked(BadName)),
+            ("setup.exe/.", Blocked(Program)),
+            ("setup.exe\\.", Blocked(Program)),
+            ("./setup.exe", Blocked(Program)),
             ("setup.exe/ .", Blocked(Program)),
             ("setup.exe/ ./", Blocked(Program)),
             ("a/../setup.exe", Blocked(BadName)),

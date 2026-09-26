@@ -1512,9 +1512,10 @@ mod tests {
     /// `finalize_download` que o `neural-app` corre: o `pacote.zip` do E2E
     /// (setup.exe e run.bat) e apagado sem «Permitir baixar programas» e
     /// fica com ela; um `aux.exe`, um `setup.exe` no Unicode Path (0x7075)
-    /// ou no cabecalho local apagam-no; um `setup.exe/.`, um `a/../setup.exe`
-    /// ou um segmento de 62 000 bytes apagam-no mesmo com ela, e um
-    /// `setup.exe/ .` conta como o programa; um ZIP limpo fica lido; um
+    /// ou no cabecalho local apagam-no; um `a/../setup.exe` ou um segmento
+    /// de 62 000 bytes apagam-no mesmo com ela; `setup.exe/.`,
+    /// `setup.exe\.` e `setup.exe/ .` contam como o programa; um ZIP do
+    /// bsdtar (`./LEIAME.txt`, `./docs/`) e um ZIP limpo ficam lidos; um
     /// sobreposto, um com dois diretorios possiveis, um estragado e um 7z
     /// ficam nao inspecionados; so um `.zip` e inspecionado.
     #[test]
@@ -1585,14 +1586,11 @@ mod tests {
             assert!(!path.exists(), "{name} ficou no disco");
         }
 
-        // Um `.` ou `..` no caminho (o tar.exe grava `setup.exe/.` como o
-        // programa `setup.exe`) e um segmento de 62 000 bytes (nenhum disco
-        // o grava) sao nomes estragados: apagam o ZIP mesmo com a definicao
-        // ligada (ZI-5, ZI-6).
+        // Um `..` no caminho (sobe de pasta) e um segmento de 62 000 bytes
+        // (nenhum disco o grava) sao nomes estragados: apagam o ZIP mesmo
+        // com a definicao ligada (ZI-5, ZI-6).
         let huge = format!("{}.txt", "a".repeat(61_996));
         for (name, entry) in [
-            ("ponto.zip", "setup.exe/."),
-            ("contrabarra.zip", "setup.exe\\."),
             ("subida.zip", "a/../setup.exe"),
             ("enorme.zip", huge.as_str()),
         ] {
@@ -1612,24 +1610,47 @@ mod tests {
                 assert!(!path.exists(), "{name} ficou no disco");
             }
         }
-        // Os segmentos do fim so de pontos e espacos caem: `setup.exe/ .` e
-        // o programa `setup.exe` (ZI-5).
-        let trailing = ZipBuilder::new()
-            .stored("LEIAME.txt", b"ola")
-            .stored("setup.exe/ .", &pe_bytes())
+        // Os segmentos do fim so de pontos e espacos caem: `setup.exe/.`
+        // (o tar.exe grava o programa `setup.exe`), `setup.exe\.` e
+        // `setup.exe/ .` sao o programa `setup.exe` (ZI-5).
+        for (name, entry) in [
+            ("ponto.zip", "setup.exe/."),
+            ("contrabarra.zip", "setup.exe\\."),
+            ("espaco.zip", "setup.exe/ ."),
+        ] {
+            let trailing = ZipBuilder::new()
+                .stored("LEIAME.txt", b"ola")
+                .stored(entry, &pe_bytes())
+                .build();
+            let path = dir.file(name, &trailing);
+            assert_eq!(
+                finalize_download(&path, false, false),
+                FinalizeOutcome::Deleted(DeleteReason::ArchiveEntry(ZipEntryRisk::Blocked(
+                    BlockReason::Program
+                ))),
+                "{name}"
+            );
+            assert!(!path.exists(), "o {name} ficou no disco");
+            let path = dir.file(name, &trailing);
+            assert!(
+                matches!(
+                    finalize_download(&path, false, true),
+                    FinalizeOutcome::Kept(_, Inspection::HoldsPrograms)
+                ),
+                "{name}"
+            );
+        }
+        // Um ZIP do bsdtar (`tar -a -cf x.zip .`): cada entrada comeca por
+        // `./`, que nao muda o caminho. E um ZIP limpo, lido e guardado.
+        let bsdtar = ZipBuilder::new()
+            .stored("./docs/", b"")
+            .stored("./docs/LEIAME.txt", b"ola")
+            .stored("./fotos/praia.jpg", b"\xFF\xD8\xFF\xE0")
             .build();
-        let path = dir.file("espaco.zip", &trailing);
-        assert_eq!(
-            finalize_download(&path, false, false),
-            FinalizeOutcome::Deleted(DeleteReason::ArchiveEntry(ZipEntryRisk::Blocked(
-                BlockReason::Program
-            )))
-        );
-        assert!(!path.exists(), "o espaco.zip ficou no disco");
-        let path = dir.file("espaco.zip", &trailing);
+        let path = dir.file("bsdtar.zip", &bsdtar);
         assert!(matches!(
-            finalize_download(&path, false, true),
-            FinalizeOutcome::Kept(_, Inspection::HoldsPrograms)
+            finalize_download(&path, false, false),
+            FinalizeOutcome::Kept(_, Inspection::Checked)
         ));
 
         let fotos = ZipBuilder::new()
