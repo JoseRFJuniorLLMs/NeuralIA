@@ -44,6 +44,7 @@ The browser remains infrastructure. The product is the research workflow.
 | [SPEC-0105](SPEC-0105-agent-runtime.md) | DOM/accessibility-first web agent runtime | 2.0 |
 | [SPEC-0106](SPEC-0106-execution-roadmap.md) | Implementation order and release gates | 1.7 → 2.0 |
 | [SPEC-0107](SPEC-0107-ai-memory-native-integration.md) | Native import/adaptation of ai-memory into NeuralIA memory crates | 1.7–1.9 |
+| [SPEC-0114](SPEC-0114-anti-distracao.md) | Anti-distraction: cookie banners, newsletter modals, large fixed bars (reject-only on known CMPs) | 2.4 (preview) |
 
 A matriz que responde explicitamente “este teste exercita o caminho que
 embarca?” está em
@@ -71,6 +72,9 @@ embarca?” está em
   the full integration/UX/performance criteria remain open.
 - **SPEC-0108:** bounded WebView2 IPC is implemented and product-tested; the
   independent adversarial/release gate remains pending.
+- **SPEC-0114:** proposal. Core, injected script and node:vm gates live on
+  `feat/anti-distracao`; it becomes implemented only with the PR CI green and
+  the owner's section-7 yes. The settings switch and `/distracoes` are not built.
 
 `crates/neural-core/tests/spec_010x_acceptance.rs` now keeps SPEC numbers only
 where the tested core is the same core used by the product. Reference-only
