@@ -1,5 +1,7 @@
 use super::*;
 
+use std::sync::RwLock;
+
 use wry::PageLoadEvent;
 
 // ===================== os ganchos de cada WebView (infra-webview-hooks) =====================
@@ -36,8 +38,13 @@ use wry::PageLoadEvent;
 // A pagina continua a receber um `keypress` (um ou dois por toque, o
 // caractere de controlo de um Ctrl+letra): nao chega ao `keydown` que o
 // mapa de teclas e as paginas ouvem, e nao faz diferenca para os ganchos.
-// Hoje o `accelerator_lookup` nao prende atalho nenhum (`Handled` fica
-// como estava): infra-commands-keymap preenche-o.
+// O spike prendia tambem a subida e nao ouvia o `keyup`; a decisao que
+// embarca deixa a subida passar, por isso a pagina recebe tambem o `keyup`
+// de um atalho preso (o que o spike nao mediu).
+// O `accelerator_lookup` e a decisao do mapa de teclas (`keymap.rs`,
+// infra-commands-keymap) com o hospedeiro como origem; hoje nenhum
+// hospedeiro tem atalhos la (cada um chega no PR do seu comando), e o
+// `Handled` so muda quando ela prende a tecla.
 
 /// Que WebView e esta: quem decide o que ela recebe da tabela e de onde vem
 /// um atalho ou um item de menu (a origem e o hospedeiro, nunca a pagina).
@@ -777,26 +784,28 @@ pub(in crate::windows_app) struct AcceleratorDecision {
     pub(in crate::windows_app) event: Option<UserEvent>,
 }
 
-/// A consulta que o handler faz a cada tecla, com a origem do hospedeiro.
-/// Hoje nao prende atalho nenhum: nenhuma tecla e tratada e nada dispara,
-/// em todos os hospedeiros. E o slot que infra-commands-keymap preenche (a
-/// tabela por ambito, a repeticao filtrada, `Handled` so nos atalhos
-/// presos) -- sem chamadas COM la dentro.
+/// A consulta que o handler faz a cada tecla: a decisao do mapa de teclas
+/// (`keymap_decision_in`: uma leitura do mapa, o ambito do hospedeiro, a
+/// repeticao filtrada, `Handled` so nos atalhos presos, a lista do ChatGPT
+/// fora dos hospedeiros das IAs), com o hospedeiro que o handler recebeu no
+/// registo como origem -- sem chamadas COM la dentro. O handler passa o
+/// mapa do produto (`product_keymap()`); os gates chamam esta mesma funcao
+/// com um mapa com atalhos em todos os ambitos e veem a origem que sai de
+/// cada hospedeiro.
 pub(in crate::windows_app) fn accelerator_lookup(
+    keymap: &RwLock<Keymap>,
     host: WebViewHost,
     input: AcceleratorInput,
 ) -> AcceleratorDecision {
-    let _ = (host, input);
-    AcceleratorDecision {
-        handled: false,
-        event: None,
-    }
+    keymap_decision_in(keymap, input, CommandOrigin::Host(host))
 }
 
 /// O `AcceleratorKeyPressed` de uma WebView acabada de construir: le a
-/// tecla, pergunta a `accelerator_lookup` e so toca no `Handled` quando a
-/// decisao e prender a tecla -- um handler que nada prende deixa o WebView2
-/// exatamente como estava.
+/// tecla, pergunta a `accelerator_lookup` sobre o mapa do produto com o
+/// hospedeiro deste registo -- o unico que o handler conhece; ele nunca
+/// nomeia outro (gate `the_accelerator_callback_calls_out_to_nothing`) --
+/// e so toca no `Handled` quando a decisao e prender a tecla: um handler
+/// que nada prende deixa o WebView2 exatamente como estava.
 fn register_webview_accelerators(
     webview: &WebView,
     host: WebViewHost,
@@ -829,18 +838,16 @@ fn register_webview_accelerators(
             args.VirtualKey(&mut vk)?;
             args.PhysicalKeyStatus(&mut status)?;
         }
-        let decision = accelerator_lookup(
-            host,
-            AcceleratorInput {
-                vk,
-                down: kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
-                    || kind == COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
-                ctrl: held(VK_CONTROL),
-                shift: held(VK_SHIFT),
-                alt: held(VK_MENU),
-                repeat: status.WasKeyDown.as_bool(),
-            },
-        );
+        let input = AcceleratorInput {
+            vk,
+            down: kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
+                || kind == COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
+            ctrl: held(VK_CONTROL),
+            shift: held(VK_SHIFT),
+            alt: held(VK_MENU),
+            repeat: status.WasKeyDown.as_bool(),
+        };
+        let decision = accelerator_lookup(product_keymap(), host, input);
         if decision.handled {
             unsafe { args.SetHandled(true)? };
         }

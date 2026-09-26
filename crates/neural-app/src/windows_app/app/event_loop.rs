@@ -420,6 +420,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::OpenEpubDialog => self.open_epub_dialog(true),
+            // Um atalho do mapa de teclas: o evento vai inteiro para
+            // `command_key_event`, que corre o comando contra a origem que
+            // veio com a tecla (nunca outro `RunCommandKey`). Este braco nao
+            // le nem escolhe origem nenhuma.
+            press @ UserEvent::RunCommandKey { .. } => {
+                if let Some(event) = command_key_event(&press) {
+                    self.user_event(event_loop, event);
+                }
+            }
             // `accel_spike_filter` ja a consumiu.
             #[cfg(feature = "accel-spike")]
             UserEvent::AccelSpike(_) => {}
@@ -589,16 +598,19 @@ impl ApplicationHandler<UserEvent> for App {
                 _ => {}
             },
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
-                if let Some(shortcut) = main_window_shortcut(&event.logical_key, self.modifiers) {
-                    match shortcut {
-                        MainShortcut::AutoScroll => self.toggle_auto_scroll(),
-                        MainShortcut::Reload => self.reload_page(),
-                        MainShortcut::History => self.toggle_side_panel(),
-                        MainShortcut::NewTab => self.new_tab(0),
-                        MainShortcut::OpenEpub => self.open_epub_dialog(true),
-                        MainShortcut::NewNote => self.new_note_in_panel(),
+                // O mesmo mapa de teclas das WebViews e da omnibox, com a
+                // janela como origem. Um atalho preso fica aqui (a tecla
+                // presa nao repete o comando); o resto segue.
+                if let Some(input) =
+                    window_accelerator_input(&event.logical_key, self.modifiers, event.repeat)
+                {
+                    let decision = keymap_decision(input, CommandOrigin::Window);
+                    if decision.handled {
+                        if let Some(command) = decision.event {
+                            self.user_event(event_loop, command);
+                        }
+                        return;
                     }
-                    return;
                 }
                 match event.logical_key {
                     Key::Named(NamedKey::Escape) => self.escape_or_back(),
