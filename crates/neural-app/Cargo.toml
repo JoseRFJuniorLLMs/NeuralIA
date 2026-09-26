@@ -52,6 +52,10 @@ windows-sys = { version = "0.61.2", features = [
     # MessageBeep: o som curto do fim de uma fase do Pomodoro.
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Registry",
+    # SHGetKnownFolderPath(FOLDERID_Downloads) + CoTaskMemFree: a pasta
+    # Transferencias que o gestor de downloads repoe no perfil do WebView2.
+    "Win32_System_Com",
+    "Win32_UI_Shell",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

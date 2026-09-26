@@ -374,6 +374,87 @@ pub fn classify_download_name(name: &str) -> RiskClass {
     RiskClass::Safe
 }
 
+/// Porque um nome bloqueia: o que o gestor de downloads (downloads-manager)
+/// guarda e decide. `Masquerade` e `BadName` nunca têm exceção; os outros
+/// podem ser baixados só com «Permitir baixar programas» ligado e uma
+/// confirmação por download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlockReason {
+    /// Vazio, só pontos e espaços, com `:` (ADS), bidi, controlo ou formato
+    /// invisível, ou um nome reservado do DOS (`CON`, `NUL.txt`...).
+    BadName,
+    /// Uma extensão perigosa (ou de macro) depois de uma de fachada, ou
+    /// separada por espaços: `fatura.pdf.exe`, `foto.jpg   .scr`.
+    Masquerade,
+    Program,
+    Script,
+    /// Atalhos e integrações do shell (`.lnk`, `.url`, `.reg`, `.chm`...).
+    Shortcut,
+    DiskImage,
+    /// Bases e projetos do Access.
+    DatabaseApp,
+}
+
+impl BlockReason {
+    /// Só um programa, um script, um atalho, uma imagem de disco ou uma base
+    /// do Access podem ser baixados, e só com a confirmação do utilizador:
+    /// um disfarce ou um nome estragado nunca.
+    pub fn allows_confirmation(self) -> bool {
+        !matches!(self, Self::BadName | Self::Masquerade)
+    }
+}
+
+/// A razão do `Block` de [`classify_download_name`], pelas mesmas regras e
+/// na mesma ordem; `None` para um nome que não bloqueia (`Safe` ou `Warn`).
+/// O gate `block_reason_agrees_with_classify_download_name` prende as duas
+/// funções uma à outra.
+pub fn block_reason(name: &str) -> Option<BlockReason> {
+    if name.is_empty()
+        || name.contains(':')
+        || name
+            .chars()
+            .any(|c| is_bidi_or_control(c) || is_hidden_format(c))
+    {
+        return Some(BlockReason::BadName);
+    }
+    let visible: String = name.chars().filter(|&c| !is_text_joiner(c)).collect();
+    let clean = visible.trim_end_matches([' ', '.']);
+    if clean.is_empty() {
+        return Some(BlockReason::BadName);
+    }
+    let base_stem = clean
+        .split('.')
+        .next()
+        .unwrap_or(clean)
+        .trim()
+        .to_ascii_lowercase();
+    if WINDOWS_RESERVED_DEVICE_NAMES.contains(&base_stem.as_str()) {
+        return Some(BlockReason::BadName);
+    }
+    let (stem, last_raw) = clean.rsplit_once('.')?;
+    let ext = last_raw.trim().to_ascii_lowercase();
+    let ext = ext.as_str();
+    let kind = if PROGRAM_EXTENSIONS.contains(&ext) {
+        Some(BlockReason::Program)
+    } else if SCRIPT_EXTENSIONS.contains(&ext) {
+        Some(BlockReason::Script)
+    } else if SHORTCUT_SHELL_EXTENSIONS.contains(&ext) {
+        Some(BlockReason::Shortcut)
+    } else if DISKIMAGE_EXTENSIONS.contains(&ext) {
+        Some(BlockReason::DiskImage)
+    } else if DATABASE_APP_EXTENSIONS.contains(&ext) {
+        Some(BlockReason::DatabaseApp)
+    } else {
+        None
+    };
+    let is_macro = MACRO_EXTENSIONS.contains(&ext);
+    if (kind.is_some() || is_macro) && (ends_in_decoy(stem) || last_raw.starts_with(' ')) {
+        return Some(BlockReason::Masquerade);
+    }
+    kind
+}
+
 /// Inspeciona o cabeçalho dos primeiros bytes (até 4 KiB) para identificar perigos.
 pub fn sniff_download(bytes: &[u8]) -> SniffRisk {
     let len = bytes.len().min(4096);
@@ -1117,5 +1198,82 @@ mod tests {
     fn sabotage_hta_never_passes_default_app_target() {
         let temp = TempDir::new("hta");
         assert!(default_app_target(temp.file("app.hta", b"<script></script>")).is_none());
+    }
+
+    /// Gate (downloads-manager): a razão do bloqueio e a classificação nunca
+    /// divergem -- um nome tem razão se e só se `classify_download_name` o
+    /// bloqueia --, e cada razão é a certa. O gestor de downloads decide pela
+    /// razão (um programa pode ser confirmado, um disfarce nunca).
+    #[test]
+    fn block_reason_agrees_with_classify_download_name() {
+        use BlockReason::*;
+        let mut corpus: Vec<(String, Option<BlockReason>)> = Vec::new();
+        let lists: [(&[&str], BlockReason); 5] = [
+            (PROGRAM_EXTENSIONS, Program),
+            (SCRIPT_EXTENSIONS, Script),
+            (SHORTCUT_SHELL_EXTENSIONS, Shortcut),
+            (DISKIMAGE_EXTENSIONS, DiskImage),
+            (DATABASE_APP_EXTENSIONS, DatabaseApp),
+        ];
+        for (list, reason) in lists {
+            for ext in list {
+                corpus.push((format!("arquivo.{ext}"), Some(reason)));
+                corpus.push((format!("ARQUIVO.{}", ext.to_uppercase()), Some(reason)));
+                corpus.push((format!("arquivo.{ext}. . "), Some(reason)));
+                corpus.push((format!("fatura.pdf.{ext}"), Some(Masquerade)));
+                corpus.push((format!("foto.jpg   .{ext}"), Some(Masquerade)));
+                corpus.push((format!("fatura\u{FF0E}pdf.{ext}"), Some(Masquerade)));
+            }
+        }
+        for ext in MACRO_EXTENSIONS {
+            corpus.push((format!("planilha.{ext}"), None));
+            corpus.push((format!("fatura.pdf.{ext}"), Some(Masquerade)));
+            corpus.push((format!("fatura.pdf   .{ext}"), Some(Masquerade)));
+        }
+        for ext in SAFE_DECOY_EXTENSIONS {
+            corpus.push((format!("relatorio.{ext}"), None));
+        }
+        for (name, reason) in [
+            ("", Some(BadName)),
+            ("...", Some(BadName)),
+            ("   ", Some(BadName)),
+            ("a:b.pdf", Some(BadName)),
+            ("fatura.pdf:Zone.Identifier", Some(BadName)),
+            ("safe\u{202e}exe.pdf", Some(BadName)),
+            ("nota\u{200B}.pdf", Some(BadName)),
+            ("linha\n.pdf", Some(BadName)),
+            ("CON", Some(BadName)),
+            ("nul.txt", Some(BadName)),
+            ("Com1.pdf", Some(BadName)),
+            ("LEIAME", None),
+            ("arquivo.tar.gz", None),
+            ("setup.exe", Some(Program)),
+            ("setup.exe.", Some(Program)),
+            ("install.bat", Some(Script)),
+            ("atalho.lnk", Some(Shortcut)),
+            ("disco.iso", Some(DiskImage)),
+            ("base.accde", Some(DatabaseApp)),
+            ("fatura.pdf.exe", Some(Masquerade)),
+            ("livro.epub.docm", Some(Masquerade)),
+            ("rel\u{200D}atorio.pdf", None),
+        ] {
+            corpus.push((name.to_string(), reason));
+        }
+        assert!(corpus.len() > 500, "corpus curto: {}", corpus.len());
+        for (name, reason) in &corpus {
+            assert_eq!(block_reason(name), *reason, "{name:?}");
+            assert_eq!(
+                block_reason(name).is_some(),
+                classify_download_name(name) == RiskClass::Block,
+                "{name:?}: razão {:?} e classe {:?} divergem",
+                block_reason(name),
+                classify_download_name(name)
+            );
+        }
+        for reason in [Program, Script, Shortcut, DiskImage, DatabaseApp] {
+            assert!(reason.allows_confirmation(), "{reason:?}");
+        }
+        assert!(!Masquerade.allows_confirmation());
+        assert!(!BadName.allows_confirmation());
     }
 }

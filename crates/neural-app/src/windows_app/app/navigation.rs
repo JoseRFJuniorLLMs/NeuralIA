@@ -4,7 +4,9 @@ use url::Url;
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     UI::{
-        Input::KeyboardAndMouse::{EnableWindow, GetAsyncKeyState, SetFocus, VK_CONTROL, VK_SHIFT},
+        Input::KeyboardAndMouse::{
+            EnableWindow, GetAsyncKeyState, SetFocus, VK_CONTROL, VK_MENU, VK_SHIFT,
+        },
         WindowsAndMessaging::{
             IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, MessageBoxW, SW_HIDE, SW_SHOW,
             SendMessageW, SetWindowTextW, ShowWindow, WM_CHAR, WM_KEYDOWN,
@@ -246,17 +248,24 @@ pub(in crate::windows_app) fn route_palette(
     }
 }
 
-/// Ctrl+O na omnibox da Home: o diálogo "Adicionar livros EPUB". Só nativo
-/// (a janela principal responde o mesmo em `main_window_shortcut`); o mapa de
-/// teclas das páginas (`NEURALIA_KEYMAP_SCRIPT`) não o conhece, para não
-/// nascer uma ação IPC nova no canal das páginas remotas. Nas páginas de
-/// livros quem o trata é a própria página, pelo IPC fechado delas.
-pub(in crate::windows_app) fn omnibox_opens_epub_dialog(
-    virtual_key: u32,
+/// Um `WM_KEYDOWN` da omnibox como a tecla do mapa de teclas: a tecla
+/// virtual, os modificadores lidos agora e a repeticao (o bit 30 do
+/// `lParam`: a tecla ja estava em baixo).
+pub(in crate::windows_app) fn omnibox_accelerator_input(
+    virtual_key: usize,
+    lparam: LPARAM,
     ctrl: bool,
     shift: bool,
-) -> bool {
-    virtual_key == u32::from(b'O') && ctrl && !shift
+    alt: bool,
+) -> AcceleratorInput {
+    AcceleratorInput {
+        vk: virtual_key as u32,
+        down: true,
+        ctrl,
+        shift,
+        alt,
+        repeat: (lparam >> 30) & 1 == 1,
+    }
 }
 
 pub(in crate::windows_app) unsafe extern "system" fn omnibox_subclass(
@@ -282,6 +291,21 @@ pub(in crate::windows_app) unsafe extern "system" fn omnibox_subclass(
         let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
         let ctrl = (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;
         let shift = (GetAsyncKeyState(VK_SHIFT as i32) as u16 & 0x8000) != 0;
+        let alt = (GetAsyncKeyState(VK_MENU as i32) as u16 & 0x8000) != 0;
+
+        // Os atalhos: o mesmo mapa de teclas da janela e das WebViews, com a
+        // omnibox como origem (Ctrl+H, Ctrl+N, Ctrl+O, Ctrl+R, Ctrl+Shift+R,
+        // Ctrl+Shift+Z, Ctrl+Shift+Delete). Um atalho preso nao chega ao EDIT.
+        let decision = keymap_decision(
+            omnibox_accelerator_input(wparam, lparam, ctrl, shift, alt),
+            CommandOrigin::Omnibox,
+        );
+        if decision.handled {
+            if let Some(event) = decision.event {
+                let _ = proxy.send_event(event);
+            }
+            return 0;
+        }
 
         match wparam as u32 {
             13 => {
@@ -304,38 +328,12 @@ pub(in crate::windows_app) unsafe extern "system" fn omnibox_subclass(
                 SendMessageW(hwnd, EM_SETSEL, 0, -1);
                 return 0;
             }
-            0x48 if ctrl => {
-                let _ = proxy.send_event(UserEvent::ShowHistory);
-                return 0;
-            }
-            0x4E if ctrl => {
-                let _ = proxy.send_event(UserEvent::NewTab(0));
-                return 0;
-            }
-            // Ctrl+O: adicionar e abrir livros EPUB.
-            key if omnibox_opens_epub_dialog(key, ctrl, shift) => {
-                let _ = proxy.send_event(UserEvent::OpenEpubDialog);
-                return 0;
-            }
-            0x52 if ctrl && !shift => {
-                let _ = proxy.send_event(UserEvent::ToggleAutoScroll);
-                return 0;
-            }
-            0x2E if ctrl && shift => {
-                let _ = proxy.send_event(UserEvent::ClearHistory);
-                return 0;
-            }
-            // Ctrl+Shift+Z (Z = 0x5A): nota nova no painel. Na omnibox nao
-            // ha pagina com selecao; o Ctrl+Z sozinho continua a desfazer.
-            0x5A if ctrl && shift => {
-                let _ = proxy.send_event(UserEvent::NewNote);
-                return 0;
-            }
             _ => {}
         }
     }
-    // O Ctrl+Shift+Z acima ja foi tratado: o carater 0x1A que o
-    // TranslateMessage gera a seguir seria o "desfazer" do EDIT.
+    // O Ctrl+Shift+Z (nota nova, no mapa de teclas) ja foi tratado: o
+    // carater 0x1A que o TranslateMessage gera a seguir seria o "desfazer"
+    // do EDIT. O Ctrl+Z sozinho continua a desfazer.
     if message == WM_CHAR
         && wparam == 0x1A
         && (GetAsyncKeyState(VK_SHIFT as i32) as u16 & 0x8000) != 0
@@ -644,7 +642,7 @@ impl App {
             return false;
         };
         let body = wide_null(
-            "Apagar TODO o histórico e a memória local da NeuralIA?\n\nNos livros, some o registro de quando cada um foi aberto; a posição de leitura e os marcadores ficam.\n\nIsto não pode ser desfeito.",
+            "Apagar TODO o histórico e a memória local da NeuralIA?\n\nNos livros, some o registro de quando cada um foi aberto; a posição de leitura e os marcadores ficam.\n\nA lista de downloads também se apaga; os arquivos baixados ficam.\n\nIsto não pode ser desfeito.",
         );
         let title = wide_null("NeuralIA — Apagar histórico");
         let answer = unsafe {

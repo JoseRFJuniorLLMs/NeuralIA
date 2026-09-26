@@ -332,9 +332,10 @@ go through one module, `crates/neural-app/src/windows_app/webview_hooks.rs`:
   the module), and after the build they register through WebView2 COM, for
   the same host, the NeuralIA items of the right-click menu
   (`WEBVIEW_MENU_ITEMS`: today only the auto-scroll item, on the columns and
-  on the split, private included) and an `AcceleratorKeyPressed` handler that
-  consults `accelerator_lookup` (`install_webview_hooks`, private to the
-  module).
+  on the split, private included), an `AcceleratorKeyPressed` handler that
+  consults `accelerator_lookup` and, on every `Managed` host, the download
+  manager (`install_webview_hooks`, private to the module; see "Downloads"
+  below).
 
 The host a birth site passes to `hooked_builder` is therefore the only host
 that WebView has, in both halves: a site cannot build without the chain, nor
@@ -360,11 +361,128 @@ The CI sabotage matrix proves it red with `reader-born-without-hooks` (the
 Reader built by wry's `build` directly) and `gmail-monitor-gets-web-chain`
 (the Gmail monitor born as `External`).
 
-`accelerator_lookup` binds nothing yet (gate
-`accelerator_lookup_binds_nothing_today`): the handler only sets `Handled`
-when the lookup says so, so no keyboard behaviour changes until the command
-registry fills it. The resource dispatcher `resource_gate_answers` is a stub
+`accelerator_lookup(keymap, host, input)` is the keymap decision
+(`accelerator_decision` in `crates/neural-app/src/windows_app/keymap.rs`) with
+the host the handler was registered for as the command origin; the handler
+calls it with the product keymap (`product_keymap()`) and that host, names no
+other host, and only sets `Handled` when the decision binds the key. The gates
+call the same function with test keymaps. The keymap is built from
+the command registry (`COMMANDS` in `windows_app/commands.rs`: one row per
+command, with its stable key, pt-BR label, palette category, keywords, chords
+with a scope, and omnibox alias) and is read through a read lock; the decision
+is pure, and the handler makes no COM call besides reading its arguments and
+`SetHandled` (gate `the_accelerator_callback_calls_out_to_nothing`). The main
+window (winit) and the Home omnibox (the EDIT subclass) ask the same decision,
+with the window or the omnibox as the origin.
+
+A key is handled only on the key-down of a chord bound in one of the origin's
+scopes: `Window` then `Global` for the main window and the omnibox; `Page`
+(columns, split, private split, full Web, Reader, PDF, EPUB) or `Panel` (Ctrl+H
+panel, service panels, Gemini Live), then `Global`, for a WebView host; none
+for the hidden Gmail monitor. The first scope that declares the chord decides.
+An auto-repeat of a bound chord stays handled without firing again; key-up and
+unbound keys are never handled (gate `accelerator_decision_table`). A handled
+key becomes `UserEvent::RunCommandKey { key, origin }`, whose origin is the
+host (or the window, or the omnibox), never page data, and only the decision
+builds it (gate `a_command_key_carries_the_host_it_came_from`); the event loop
+hands the whole event to `command_key_event`, which reads the command and the
+origin from the event itself and runs the event `resolve_command(key, origin)`
+gives (gate `a_command_key_runs_against_the_origin_it_carries`: the event
+loop's arm neither takes the event apart nor calls `resolve_command`); for a
+page-bound command that is the one that page's keymap would request over IPC
+for the same key (gate `resolve_command_runs_against_its_origin`). Two commands with the same
+chord in the same scope make the whole table invalid (gate
+`keymap_chords_are_unique_per_scope`). On the provider hosts -- the comparator
+columns and the private split -- the ChatGPT chords Ctrl+Shift+O,
+Ctrl+Shift+;, Ctrl+Shift+C, Ctrl+Shift+I, Ctrl+Shift+S and
+Ctrl+Shift+Backspace are never handled, whatever scope binds them (gate
+`provider_hosts_never_bind_the_chatgpt_chords`). The Files scope's override
+table (Ctrl+D, Ctrl+N, Ctrl+W, Ctrl+Tab, Ctrl+G, Ctrl+O, Ctrl+S,
+Ctrl+Shift+S) is consulted only by the Files chain, which no current origin
+uses (gate `files_override_wins_only_in_files`).
+
+Today no WebView host binds a chord (gate
+`accelerator_lookup_binds_no_webview_chord_today`): the pages' shortcuts are
+still those of `NEURALIA_KEYMAP_SCRIPT`, and only the `Window` scope has rows
+-- the Ctrl+R, Ctrl+Shift+R, Ctrl+H, Ctrl+N, Ctrl+O, Ctrl+Shift+Z and
+Ctrl+Shift+Delete the main window and the omnibox already answered. The CI
+accelerator spike measured native dispatch on every host kind: with
+`Handled = TRUE` the page never sees the keydown of the chord, but it may still
+receive one or two keypress events (the control character of a Ctrl+letter).
+The spike handled the chord's key-up as well and its probe listened only for
+keydown and keypress; the shipped decision leaves key-up unhandled, so the page
+also receives the keyup of a bound chord, which the spike did not measure. A
+page that reacts to keypress or keyup sees the press; none of them can run the
+command, which is born on the native side.
+The resource dispatcher `resource_gate_answers` is a stub
 the product does not yet wire to `WebResourceRequested`; the gate
 `custom_schemes_are_never_answered_by_the_resource_gate` already holds it to
 never answering a request on `neuralia-pdf`, `neuralia-epub` or
 `neuralia-live` (those are served by their wry custom protocols).
+
+### Downloads
+
+On every `Managed` host `register_download_manager`
+(`crates/neural-app/src/windows_app/downloads.rs`) adds a WebView2
+`DownloadStarting` handler and sets the profile's default download folder
+(`SetDefaultDownloadFolderPath`) to `profile_download_folder`: the folder
+`downloads-settings.json` names when it is an existing absolute folder,
+otherwise the user's Downloads folder (`FOLDERID_Downloads`). WebView2 keeps
+that setting in the profile across sessions, so it is reset whenever no
+folder is chosen. The gate `downloads_state_opens_through_grants_and_checks_the_folder`
+holds the choice of folder; the COM call itself is only exercised by the
+CI-only E2E below, with a chosen folder, on the full Web. The manager also
+asks for the chosen folder on every download (`target_path`, unit-tested
+for a private download too). The handler always takes the deferral and
+hands the download to the pure `neural_core::downloads::DownloadManager`,
+whose effects the app applies:
+
+- start (`decide_start`): a program, script, Windows shortcut, disk image or
+  Access database name is refused with `SetCancel` before any file exists;
+  a masquerade (`fatura.pdf.exe`, a padded extension) or a name with bidi,
+  invisible characters, `:` or a DOS device name is refused with no
+  exception; everything else proceeds. With "Permitir baixar programas" on,
+  a refusable program would wait for a confirmation instead; until that card
+  exists the app answers no, so programs are still refused;
+- progress: `BytesReceivedChanged`, throttled to one event every 250 ms per
+  download before it leaves the handler;
+- end: `StateChanged` forgets the WebView2 operation; a completed file is
+  finalized (`finalize_download`): the first 4 KiB are sniffed, an
+  unconfirmed executable, shortcut or cabinet (or an unreadable file) is
+  deleted, and anything kept gets the mark of the web (`Zone.Identifier`
+  alternate data stream): when the file has none, NeuralIA writes
+  `ZoneId=3` with no `HostUrl`; a mark WebView2 already wrote is left as it
+  is, and that one may carry the `HostUrl`. The E2E below reports who wrote
+  the mark and whether it carries a `HostUrl`;
+- a destroyed WebView: a guard inside the `DownloadStarting` handler sends
+  `WebViewGone` when WebView2 releases the handler, and the manager cancels
+  and forgets that WebView's running downloads. Whether destroying a WebView
+  cancels its download by itself, and when WebView2 releases the handler, is
+  the question of the spike in `scripts/test-downloads.ps1`, which only
+  reports it (in the CI log and the step summary).
+
+Finished downloads are recorded in `downloads.json` (at most 200, name,
+folder, host, size and outcome, never the full URL), an `Automatic` store:
+nothing from the private split or an InPrivate service panel is recorded,
+and nothing that starts or finishes while the store registry is in private
+mode (`StoreMode::Private`, which no product command turns on yet) is
+recorded either, so it never reaches the file once the mode is back to
+normal; in that mode the store writes nothing. `run_download_event`, the
+app's whole `UserEvent::Download` arm, sets the manager's private mode from
+the registry before every event. Ctrl+Shift+Delete (`DownloadEvent::ClearLog`,
+effect `EraseLog`) removes `downloads.json`, its `.bak` copy and an
+interrupted write's temporary file from disk directly, in any mode and even
+when the store is read-only (a future-version or corrupt file), and leaves
+the downloaded files. Gates: `the_start_decision_table`,
+`the_finalize_decision_table`, `motw_is_written_and_read_back_through_the_ads`,
+`private_downloads_are_never_recorded`,
+`nothing_made_in_private_mode_is_ever_recorded` (neural-core) and
+`downloads_are_denied_on_every_local_host_and_managed_on_the_web`,
+`download_ops_follow_the_manager_and_are_cleared_on_finish_and_destroy`,
+`private_downloads_never_reach_downloads_json`,
+`clearing_history_takes_downloads_json_off_the_disk`, with
+`every_webview_gets_the_hooks` requiring the manager on every `Managed` host
+and on no `Deny` host. The CI-only `scripts/test-downloads.ps1` runs the
+tested exe against a 127.0.0.1 fixture: a `setup.exe` is refused; a PDF
+lands in the chosen folder with the mark of the web, NeuralIA's finalize
+ran, and a mark NeuralIA wrote is `ZoneId=3` with no `HostUrl`.

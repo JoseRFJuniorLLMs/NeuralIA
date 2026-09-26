@@ -107,6 +107,9 @@ pub(in crate::windows_app) enum UserEvent {
     /// Os ganchos das WebViews (`webview_hooks.rs`): o que cada WebView
     /// avisa, com o hospedeiro de onde veio.
     WebView(WebViewEvent),
+    /// O gestor de downloads (`downloads.rs`): o que o WebView2 avisa de cada
+    /// download e o fim de cada um, com o evento do `neural_core::downloads`.
+    Download(neural_core::downloads::DownloadEvent),
     /// Pedido da pagina local do painel lateral (canal proprio), com o
     /// numero da pagina que o mandou.
     Panel(side_panel::PanelPost),
@@ -324,8 +327,17 @@ pub(in crate::windows_app) enum UserEvent {
     EpubUi(EpubUiRequest),
     /// Arquivos largados sobre o WebView da biblioteca/leitor.
     EpubDropped(Vec<PathBuf>),
-    /// Ctrl+O na omnibox da Home: o dialogo de livros.
+    /// O dialogo "Adicionar livros EPUB" (o comando `OpenEpub`: Ctrl+O na
+    /// janela e na omnibox).
     OpenEpubDialog,
+    /// Um atalho do mapa de teclas (`keymap.rs`): o comando `key`, a correr
+    /// contra a origem de onde a tecla veio -- o hospedeiro da WebView que a
+    /// recebeu, a janela ou a omnibox --, nunca contra nada da pagina.
+    /// So `accelerator_decision` o constroi.
+    RunCommandKey {
+        key: CommandId,
+        origin: CommandOrigin,
+    },
     /// Uma linha do condutor do spike de aceleradores (so no build de CI
     /// com `--features accel-spike`; ver `accel_spike_app.rs`).
     #[cfg(feature = "accel-spike")]
@@ -3150,6 +3162,9 @@ pub(in crate::windows_app) struct App {
     /// (`egress_gate`), NUNCA aqui no arranque: a Home fica com as threads e
     /// a RAM de sempre (gate `app_new_starts_no_lazy_worker`).
     pub(in crate::windows_app) egress: Option<crate::egress::EgressGate>,
+    /// O gestor de downloads (`downloads.rs`): o `DownloadManager`, as
+    /// operacoes vivas do WebView2 e o `downloads.json`.
+    pub(in crate::windows_app) downloads: DownloadsState,
 }
 
 impl App {
@@ -3200,6 +3215,7 @@ impl App {
         // disco: so os grants, pedidos depois, dizem onde cada loja vive.
         let stores = StoreRegistry::mint(&config.data_dir).ok();
         let keys = KeysState::new(proxy.clone());
+        let downloads = DownloadsState::open(stores.as_ref());
         Self {
             document,
             pdf_bytes: Arc::new(Mutex::new(Vec::new())),
@@ -3278,6 +3294,7 @@ impl App {
             stores,
             keys,
             egress: None,
+            downloads,
         }
     }
 }
@@ -3530,43 +3547,6 @@ impl App {
         let _ = agent
             .policy
             .write_audit_log(root.join(format!("audit-{stamp}.json")));
-    }
-}
-
-/// Atalhos com Ctrl quando o teclado esta na propria janela (depois de um
-/// clique na barra): os mesmos que o mapa de teclas das paginas.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MainShortcut {
-    AutoScroll,
-    Reload,
-    History,
-    NewTab,
-    /// Ctrl+Shift+Z sem pagina com selecao: nota nova no painel.
-    NewNote,
-    /// Ctrl+O: o dialogo de livros EPUB. So nativo: o mapa de teclas das
-    /// paginas (`NEURALIA_KEYMAP_SCRIPT`) nao o conhece, para nao nascer uma
-    /// accao IPC nova no canal das paginas remotas.
-    OpenEpub,
-}
-
-fn main_window_shortcut(
-    key: &Key,
-    modifiers: winit::keyboard::ModifiersState,
-) -> Option<MainShortcut> {
-    if !modifiers.control_key() || modifiers.alt_key() {
-        return None;
-    }
-    let Key::Character(text) = key else {
-        return None;
-    };
-    match (text.to_lowercase().as_str(), modifiers.shift_key()) {
-        ("r", false) => Some(MainShortcut::AutoScroll),
-        ("r", true) => Some(MainShortcut::Reload),
-        ("h", false) => Some(MainShortcut::History),
-        ("n", false) => Some(MainShortcut::NewTab),
-        ("o", false) => Some(MainShortcut::OpenEpub),
-        ("z", true) => Some(MainShortcut::NewNote),
-        _ => None,
     }
 }
 
@@ -7001,6 +6981,9 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
         "webview_hooks.rs",
         include_str!("windows_app/webview_hooks.rs"),
     ),
+    ("downloads.rs", include_str!("windows_app/downloads.rs")),
+    ("commands.rs", include_str!("windows_app/commands.rs")),
+    ("keymap.rs", include_str!("windows_app/keymap.rs")),
     ("tests.rs", include_str!("windows_app/tests.rs")),
 ];
 
@@ -7081,6 +7064,12 @@ pub(in crate::windows_app) mod page_eval;
 pub(in crate::windows_app) use page_eval::*;
 pub(in crate::windows_app) mod webview_hooks;
 pub(in crate::windows_app) use webview_hooks::*;
+pub(in crate::windows_app) mod downloads;
+pub(in crate::windows_app) use downloads::*;
+pub(in crate::windows_app) mod commands;
+pub(in crate::windows_app) use commands::*;
+pub(in crate::windows_app) mod keymap;
+pub(in crate::windows_app) use keymap::*;
 
 pub(in crate::windows_app) mod app;
 #[allow(unused_imports)]
