@@ -290,14 +290,20 @@ impl App {
                 .with_url(url.as_str());
             let hooked = self.hooked_builder(builder, WebViewHost::Column(i), None);
 
+            // O build e sincrono: cria o controller do WebView2 dentro de um
+            // pump aninhado. Num arranque a frio a primeira coluna paga o
+            // processo do browser; o log diz quanto tempo cada uma levou.
+            debug_log(format_args!("open_comparator: coluna {i} a construir"));
             match hooked.build_hooked_as_child(window) {
                 Ok(wv) => {
+                    debug_log(format_args!("open_comparator: coluna {i} construida"));
                     let _ = wv.zoom(self.zoom);
                     #[cfg(feature = "accel-spike")]
                     self.accel_spike_hook(&wv, crate::accel_spike::SpikeHost::Column);
                     views.push(ComparatorView { webview: wv, name });
                 }
                 Err(error) => {
+                    debug_log(format_args!("open_comparator: coluna {i} falhou: {error}"));
                     self.show_native_error(format!("WebView2 não pôde abrir {name}: {error}"));
                     return;
                 }
@@ -324,6 +330,10 @@ impl App {
     }
 
     fn activate_comparator(&mut self, sync_remote_buttons: bool) {
+        debug_log(format_args!(
+            "activate_comparator: {} coluna(s)",
+            self.comparator.as_ref().map_or(0, |comp| comp.views.len())
+        ));
         self.bar_hover = None;
         self.forget_tab_gesture();
         self.surface = Surface::Comparator;

@@ -357,6 +357,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.show_omnibox_passive(true);
                     self.position_omnibox();
                     self.request_redraw();
+                    debug_log(format_args!("RelayoutComparator: aplicado"));
                 }
             }
             UserEvent::RestoreHomeDecorations => {
