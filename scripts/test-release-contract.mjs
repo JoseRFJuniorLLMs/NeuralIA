@@ -513,9 +513,11 @@ assert.equal(
   sabotages.length,
   'sabotage labels are unique'
 );
-// Every .rs of neural-app: a gate may be an inline #[cfg(test)] module of any
-// file (cargo test -p neural-app <name> finds it), but an Ignored gate runs
-// with --exact as windows_app::tests::<name>, so it must live in that module.
+// Every .rs of neural-app/src: a gate may be an inline #[cfg(test)] module of
+// any file (src/ is the NeuralIA bin, and the step builds and runs only that
+// bin's harness: cargo test -p neural-app --bin NeuralIA <name> finds it), but
+// an Ignored gate runs with --exact as windows_app::tests::<name>, so it must
+// live in that module.
 function rustFilesUnder(dir) {
   return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
     const path = `${dir}/${entry.name}`;
