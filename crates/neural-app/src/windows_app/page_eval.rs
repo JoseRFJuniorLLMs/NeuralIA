@@ -19,8 +19,14 @@
 //!
 //! So scripts so-leitura correm por aqui: `ReadOnlyScript` so se constroi
 //! neste modulo, `read` recusa um que nao esteja em `READ_ONLY_SCRIPTS`, e o
-//! gate `page_eval_scripts_are_read_only` (windows_app/tests.rs) prova que
-//! nenhum publica, busca, escuta, agenda, navega, guarda ou escreve HTML.
+//! gate `page_eval_scripts_are_read_only` (windows_app/tests.rs) recusa no
+//! texto de cada um as formas diretas de publicar, buscar, mudar o DOM,
+//! escrever HTML, escutar, agendar, navegar (`location` fora das leituras
+//! `location.<parte>`, `history`, `reload`), submeter, clicar, mover o foco
+//! ou a rolagem, guardar e correr codigo dinamico;
+//! `page_eval_read_only_gate_refuses_acting_scripts` prova que cada forma o
+//! poe vermelho. E uma lista de negacao sobre o texto, nao uma prova
+//! semantica: cada script novo entra com o sim do dono (OQ2).
 //!
 //! Quem le (a Traducao, o leitor de respostas do Consenso, o Copiloto, o
 //! Escudo) traz o seu `UserEvent`, o seu `PageReads` e liga o `NavEpoch` ao
