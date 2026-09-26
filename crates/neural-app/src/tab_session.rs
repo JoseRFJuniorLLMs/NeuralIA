@@ -128,6 +128,9 @@ pub enum Loaded {
     Restored(TabSession),
     /// O ficheiro era invalido; foi posto de lado em `tabs.json.bak`.
     Quarantined(LoadError),
+    /// O ficheiro era invalido e ficou onde estava: a leitura sem escrita
+    /// (`SessionStore::peek`, a do modo privado) nao o poe de lado.
+    Refused(LoadError),
     /// Nao se conseguiu ler (permissao, bloqueio). O ficheiro nao e tocado.
     Unreadable(String),
 }
@@ -505,7 +508,17 @@ fn quarantine(path: &Path) {
     }
 }
 
+/// A leitura solta de um `tabs.json`, que poe de lado um ficheiro recusado.
+/// So os testes a usam: o produto le pela `SessionStore` (`load`, `peek`),
+/// que so o `TabPersistence` do `PrivacyGuard` abre.
+#[cfg(test)]
 pub fn load(path: &Path) -> Loaded {
+    read_session(path, true)
+}
+
+/// A leitura. Com `quarantine`, um ficheiro recusado vai para o `.bak`;
+/// sem, fica onde esta (`Loaded::Refused`) e nada se escreve.
+fn read_session(path: &Path, quarantine_refused: bool) -> Loaded {
     let bytes = match read_capped(path) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return Loaded::Missing,
@@ -513,10 +526,11 @@ pub fn load(path: &Path) -> Loaded {
     };
     match decode(&bytes) {
         Ok(session) => Loaded::Restored(session),
-        Err(error) => {
+        Err(error) if quarantine_refused => {
             quarantine(path);
             Loaded::Quarantined(error)
         }
+        Err(error) => Loaded::Refused(error),
     }
 }
 
@@ -714,9 +728,21 @@ impl SessionStore {
     /// Le as abas guardadas. O modelo que nascer disto reflete a geracao de
     /// "Apagar historico" de agora: volta a poder ser gravado.
     pub fn load(&mut self) -> Loaded {
+        self.read(true)
+    }
+
+    /// A mesma leitura sem escrever nada na pasta de dados (o modo privado):
+    /// um ficheiro estragado fica onde esta (`Loaded::Refused`) em vez de ir
+    /// para o `.bak`. Como o que la esta nunca foi lido, uma gravacao
+    /// posterior copia-o antes de o substituir (`tabs.json.unread`).
+    pub fn peek(&mut self) -> Loaded {
+        self.read(false)
+    }
+
+    fn read(&mut self, quarantine_refused: bool) -> Loaded {
         self.cleared_seen = read_generation(&self.cleared_path);
-        let loaded = load(&self.path);
-        self.unread = matches!(loaded, Loaded::Unreadable(_));
+        let loaded = read_session(&self.path, quarantine_refused);
+        self.unread = matches!(loaded, Loaded::Unreadable(_) | Loaded::Refused(_));
         loaded
     }
 
@@ -1254,6 +1280,47 @@ mod tests {
         assert!(matches!(store.load(), Loaded::Unreadable(_)));
         assert!(store.save(&one_tab("https://new.example/")).is_err());
         assert!(path.is_dir(), "o que la estava foi substituido sem copia");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// O modo privado le as abas sem escrever: um `tabs.json` estragado fica
+    /// onde esta, byte a byte, sem `.bak`; `load` (o modo normal) continua a
+    /// po-lo de lado. E, como o que la esta nunca foi lido, a primeira
+    /// gravacao depois de um `peek` guarda-o em `tabs.json.unread` antes de o
+    /// substituir.
+    #[test]
+    fn a_peek_leaves_a_refused_session_where_it_is() {
+        let dir = temp_dir("peek-refused");
+        let path = path_in(&dir);
+        let bad = b"{ \"version\": 1, \"columns\": [ estragado".to_vec();
+        fs::write(&path, &bad).expect("ficheiro estragado");
+        let mut store = SessionStore::open(&dir);
+        assert!(matches!(
+            store.peek(),
+            Loaded::Refused(LoadError::Corrupt(_))
+        ));
+        assert_eq!(
+            fs::read(&path).expect("ler"),
+            bad,
+            "o peek mexeu no ficheiro"
+        );
+        assert!(!backup_path(&path).exists(), "o peek fez um .bak");
+
+        assert_eq!(
+            store
+                .save(&one_tab("https://depois.example/"))
+                .expect("grava"),
+            SaveOutcome::Written
+        );
+        assert_eq!(
+            fs::read(unread_backup_path(&path)).expect("copia"),
+            bad,
+            "o que o peek recusou ficou copiado antes de ser substituido"
+        );
+
+        fs::write(&path, &bad).expect("de novo estragado");
+        assert!(matches!(store.load(), Loaded::Quarantined(_)));
+        assert!(!path.exists() && backup_path(&path).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -49,6 +49,11 @@ mod secrets;
 mod stores;
 #[cfg(target_os = "windows")]
 mod windows_app;
+// O portao da persistencia (infra-privacy-guard, plano 2.4): dono do registo
+// das lojas e dos escritores automaticos (historico, memoria, abas). Vive
+// com o `windows_app` que o usa.
+#[cfg(target_os = "windows")]
+mod privacy;
 
 // Pomodoro da barra: so decisoes (clique, menu, `pomodoro:`, tique, opcoes em
 // disco), sem Win32 -- testavel em qualquer plataforma.

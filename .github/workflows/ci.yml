@@ -591,6 +591,176 @@ jobs:
           '@
             },
             @{
+              Label = "second-registry-mint-in-a-feature-module"
+              Test = "registry_is_minted_once_and_owned_by_the_guard"
+              SourcePath = "crates/neural-app/src/windows_app/adblock.rs"
+              Old = @'
+              fn adblock_list_grant(&self) -> Option<StoreGrant> {
+                  self.privacy.store(ADBLOCK_LIST_STORE)
+              }
+          '@
+              New = @'
+              fn adblock_list_grant(&self) -> Option<StoreGrant> {
+                  StoreRegistry::mint(&self.config.data_dir)
+                      .ok()?
+                      .grant(ADBLOCK_LIST_STORE)
+                      .ok()
+              }
+          '@
+            },
+            @{
+              Label = "tab-save-bypasses-the-guard"
+              Test = "history_memory_and_tabs_are_written_only_through_the_privacy_guard"
+              SourcePath = "crates/neural-app/src/windows_app/app/tabs.rs"
+              Old = @'
+                  self.privacy
+                      .save_tabs(&mut comp.contexts, &mut comp.groups, split)
+          '@
+              New = @'
+                  TabPersistence::open(&self.config.data_dir)
+                      .save_now(&mut comp.contexts, &mut comp.groups, split)
+          '@
+            },
+            @{
+              Label = "memory-capture-bypass-beside-the-guard"
+              Test = "history_memory_and_tabs_are_written_only_through_the_privacy_guard"
+              SourcePath = "crates/neural-app/src/privacy.rs"
+              Old = @'
+                  self.tabs.forget(contexts, groups, split)
+              }
+          }
+          '@
+              New = @'
+                  self.tabs.forget(contexts, groups, split)
+              }
+          }
+
+          /// Um atalho ao lado do guard: a memoria sem o modo.
+          pub(crate) fn capture_raw(guard: &PrivacyGuard, document: MemoryDocument) {
+              guard.memory.capture(document);
+          }
+          '@
+            },
+            @{
+              Label = "raw-data-dir-write-in-a-feature-module"
+              Test = "no_raw_data_dir_write_outside_a_grant"
+              SourcePath = "crates/neural-app/src/windows_app/app/tools.rs"
+              Old = @'
+                  let saved = outcome.save.map(|settings| {
+                      crate::pomodoro_ui::save_settings(&self.config.data_dir.join("pomodoro"), settings)
+                  });
+          '@
+              New = @'
+                  let saved = outcome.save.map(|settings| {
+                      let _ = std::fs::write(self.config.data_dir.join("x.json"), b"x");
+                      crate::pomodoro_ui::save_settings(&self.config.data_dir.join("pomodoro"), settings)
+                  });
+          '@
+            },
+            @{
+              Label = "test-constructor-ignores-the-mode"
+              Test = "private_guard_turns_automatic_stores_into_noops"
+              SourcePath = "crates/neural-app/src/privacy.rs"
+              Old = @'
+                  registry.set_mode(mode.into());
+          '@
+              New = @'
+                  let _ = mode;
+          '@
+            },
+            @{
+              Label = "record-ignores-the-mode"
+              Test = "private_guard_turns_automatic_stores_into_noops"
+              SourcePath = "crates/neural-app/src/privacy.rs"
+              Old = @'
+                  if !self.history_grant.writes_allowed() {
+                      return;
+                  }
+                  self.history.append(entry);
+          '@
+              New = @'
+                  self.history.append(entry);
+          '@
+            },
+            @{
+              Label = "e2e-allowlist-without-the-history-lock"
+              Test = "the_e2e_allowlist_covers_a_normal_guard_session"
+              SourcePath = "scripts/test-private-mode.ps1"
+              Old = @'
+              @{ Path = 'history.jsonl.lock'; Kind = 'Automatic'; Why = 'o trinco dos escritores do historico (HistoryStore): nasce na primeira gravacao e fica' }
+          '@
+              New = @'
+              # (sem a linha do history.jsonl.lock)
+          '@
+            },
+            @{
+              Label = "save-tabs-due-ignores-the-mode"
+              Test = "private_guard_turns_automatic_stores_into_noops"
+              SourcePath = "crates/neural-app/src/privacy.rs"
+              Old = @'
+                      .then_some(Ok(TabSave::SkippedPrivate));
+          '@
+              New = @'
+                      .then_some(Ok::<_, std::io::Error>(TabSave::SkippedPrivate))
+                      .and(self.tabs.save_due(token, contexts, groups, split));
+          '@
+            },
+            @{
+              Label = "private-rebuild-writes-the-index"
+              Test = "private_guard_turns_automatic_stores_into_noops"
+              SourcePath = "crates/neural-app/src/privacy.rs"
+              Old = @'
+                      return false;
+                  }
+                  self.memory.rebuild();
+          '@
+              New = @'
+                      self.memory.rebuild();
+                      return false;
+                  }
+                  self.memory.rebuild();
+          '@
+            },
+            @{
+              Label = "tab-session-save-beside-the-guard"
+              Test = "history_memory_and_tabs_are_written_only_through_the_privacy_guard"
+              SourcePath = "crates/neural-app/src/windows_app/app/tabs.rs"
+              Old = @'
+                  let split = comparator_split_key(comp);
+                  self.privacy
+                      .save_tabs(&mut comp.contexts, &mut comp.groups, split)
+          '@
+              New = @'
+                  let split = comparator_split_key(comp);
+                  let _ = crate::tab_session::save(
+                      &crate::tab_session::path_in(&self.config.data_dir),
+                      &snapshot_tab_session(&comp.contexts, &comp.groups, split),
+                  );
+                  self.privacy
+                      .save_tabs(&mut comp.contexts, &mut comp.groups, split)
+          '@
+            },
+            @{
+              Label = "raw-history-write-through-file-options"
+              Test = "no_raw_data_dir_write_outside_a_grant"
+              SourcePath = "crates/neural-app/src/windows_app/app/tools.rs"
+              Old = @'
+                  let saved = outcome.save.map(|settings| {
+                      crate::pomodoro_ui::save_settings(&self.config.data_dir.join("pomodoro"), settings)
+                  });
+          '@
+              New = @'
+                  let saved = outcome.save.map(|settings| {
+                      let _ = std::fs::File::options()
+                          .create(true)
+                          .append(true)
+                          .open(self.config.data_dir.join("history.jsonl"))
+                          .and_then(|mut file| std::io::Write::write_all(&mut file, b"x"));
+                      crate::pomodoro_ui::save_settings(&self.config.data_dir.join("pomodoro"), settings)
+                  });
+          '@
+            },
+            @{
               Label = "zip-not-inspected-shown-as-done"
               Test = "a_zip_download_is_inspected_and_not_inspected_is_shown"
               SourcePath = "crates/neural-app/src/windows_app/downloads_ui.rs"
@@ -668,6 +838,26 @@ jobs:
           '@
               New = @'
                   let outcome = if false {
+          '@
+            },
+            @{
+              Label = "guard-lends-the-registry-with-a-lifetime"
+              Test = "registry_is_minted_once_and_owned_by_the_guard"
+              SourcePath = "crates/neural-app/src/privacy.rs"
+              Old = @'
+              pub(crate) fn store(&self, spec: StoreSpec) -> Option<StoreGrant> {
+                  self.registry.grant(spec).ok()
+              }
+          '@
+              New = @'
+              pub(crate) fn store(&self, spec: StoreSpec) -> Option<StoreGrant> {
+                  self.registry().grant(spec).ok()
+              }
+
+              /// O registo, emprestado a quem o pedir.
+              pub(crate) fn registry(&self) -> &'_ StoreRegistry {
+                  &self.registry
+              }
           '@
             }
           )
@@ -896,6 +1086,18 @@ jobs:
         run: |
           ./scripts/test-downloads.ps1 -SelfTest
           ./scripts/test-downloads.ps1 -ExePath ci-tested/NeuralIA.exe
+      # Phase 0 of the private-mode E2E (infra-privacy-guard, 2.4): a scripted
+      # Normal session against a loopback fixture (scripts/private-mode-fixture.mjs)
+      # on the exact tested bytes, with a temporary NEURALIA_DATA_DIR hashed
+      # before and after. Every file the session created or changed must be a
+      # store of the SPEC-0006 table (the script's allowlist, printed in the
+      # log), and the session must have reached the history and the memory;
+      # later briefs extend that list with the Private-mode expectations. It
+      # opens the exe, so it never runs in the local suite.
+      - name: Private mode phase 0 on the tested exe (data dir writers enumerated)
+        shell: pwsh
+        timeout-minutes: 5
+        run: ./scripts/test-private-mode.ps1 -ExePath ci-tested/NeuralIA.exe
       # Release contract of the CI-only accelerator spike (infra-accel-spike):
       # the exact bytes that release.yml packages were built without the spike
       # feature, so the spike marker is not in them. The spike itself runs in

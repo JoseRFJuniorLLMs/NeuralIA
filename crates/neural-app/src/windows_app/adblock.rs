@@ -15,7 +15,7 @@ use neural_core::distraction::DistractionPolicy;
 use neural_core::distraction::{MAX_DISTRACTION_SITES, SiteChange, distraction_site_key};
 use neural_core::json_store::{StoreGrant, VersionedJsonStore};
 
-use crate::stores::{ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE};
+use crate::stores::ADBLOCK_LIST_STORE;
 
 // ===================== o bloqueio de anuncios no app (adblock) =====================
 //
@@ -530,15 +530,18 @@ impl AdblockState {
     /// No arranque: le a escolha (um ficheiro pequeno, como o tema) e, so
     /// com o bloqueio ligado, manda ler a lista guardada numa thread.
     /// Desligado -- o caso de quem nunca clicou em "Ativar" -- nada mais.
+    /// Os grants (`ADBLOCK_SETTINGS_STORE`, `ADBLOCK_LIST_STORE`) vem do
+    /// `PrivacyGuard`; sem eles (nunca no produto) le-se o padrao e nada
+    /// se grava.
     pub(in crate::windows_app) fn open(
-        stores: Option<&StoreRegistry>,
+        settings_grant: Option<StoreGrant>,
+        list_grant: Option<StoreGrant>,
         proxy: &EventLoopProxy<UserEvent>,
     ) -> Self {
-        let mut state = Self::load(stores);
+        let mut state = Self::load(settings_grant);
         if state.settings.enabled {
             state.shared.set_filtering(true);
-            if let Some(grant) = stores.and_then(|registry| registry.grant(ADBLOCK_LIST_STORE).ok())
-            {
+            if let Some(grant) = list_grant {
                 state.loading = spawn_adblock_job(
                     move || AdblockEvent::Loaded(read_stored_list(grant)),
                     proxy.clone(),
@@ -549,19 +552,14 @@ impl AdblockState {
         state
     }
 
-    /// A escolha gravada (`adblock-settings.json`, pelo grant `Setting`),
-    /// sem threads: o que `open` faz antes de ler a lista.
-    pub(in crate::windows_app) fn load(stores: Option<&StoreRegistry>) -> Self {
-        let mut settings_store = stores
-            .and_then(|registry| registry.grant(ADBLOCK_SETTINGS_STORE).ok())
-            .and_then(|grant| {
-                VersionedJsonStore::<AdblockSettings>::open(
-                    grant,
-                    SETTINGS_VERSION,
-                    SETTINGS_MAX_BYTES,
-                )
+    /// A escolha gravada (`adblock-settings.json`, pelo grant `Setting` que
+    /// o `PrivacyGuard` passa), sem threads: o que `open` faz antes de ler
+    /// a lista. Sem grant le-se o padrao e nada se grava.
+    pub(in crate::windows_app) fn load(settings_grant: Option<StoreGrant>) -> Self {
+        let mut settings_store = settings_grant.and_then(|grant| {
+            VersionedJsonStore::<AdblockSettings>::open(grant, SETTINGS_VERSION, SETTINGS_MAX_BYTES)
                 .ok()
-            });
+        });
         let settings = settings_store
             .as_mut()
             .map(|store| store.load().into_value().sanitized())
@@ -679,7 +677,7 @@ impl App {
     }
 
     fn adblock_list_grant(&self) -> Option<StoreGrant> {
-        self.stores.as_ref()?.grant(ADBLOCK_LIST_STORE).ok()
+        self.privacy.store(ADBLOCK_LIST_STORE)
     }
 
     /// O clique em "Ativar": a lista guardada se ainda serve, senao o

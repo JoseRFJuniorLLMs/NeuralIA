@@ -177,7 +177,16 @@ impl HistoryStore {
     /// pode nascer ou ser substituido pelo `rename` do `append` (TOCTOU), e o
     /// teste ficava de fora do lock que devia protege-lo. `read_entries` ja
     /// trata o `NotFound` como historico vazio, por isso basta ler sempre.
+    ///
+    /// A unica excecao e uma pasta onde nenhum escritor passou -- nem o
+    /// historico nem o trinco existem: nao ha nada a ler, e um leitor nao
+    /// cria o trinco (o modo privado le sem deixar rasto na pasta de dados).
+    /// Um escritor que apareca a meio so torna esta leitura a de um instante
+    /// antes, como se tivesse corrido primeiro.
     pub fn recent(&self, limit: usize) -> Result<Vec<HistoryEntry>> {
+        if !self.lock_path().exists() && !self.path.exists() {
+            return Ok(Vec::new());
+        }
         let lock = self.acquire_lock(false)?;
         let read_result = (|| -> Result<Vec<HistoryEntry>> {
             let mut entries = self.read_entries()?;
@@ -403,6 +412,35 @@ mod tests {
         let store = HistoryStore::new(&path);
         assert!(store.recent(10).unwrap().is_empty());
         let _ = fs::remove_file(sibling(&path, "lock"));
+    }
+
+    /// Ler numa pasta onde nenhum escritor passou nao escreve nada: nem o
+    /// historico nem o trinco (o modo privado le o historico sem deixar
+    /// rasto). Com o trinco ja la, a leitura passa por ele como sempre; e a
+    /// primeira gravacao cria-o.
+    #[test]
+    fn a_read_where_no_writer_ran_creates_no_lock() {
+        let path = temp_history("read-no-lock");
+        let lock = sibling(&path, "lock");
+        let store = HistoryStore::new(&path);
+        assert!(store.recent(10).unwrap().is_empty());
+        assert!(!lock.exists(), "a leitura criou o trinco");
+        assert!(!path.exists(), "a leitura criou o historico");
+
+        store
+            .append(&HistoryEntry::now(
+                HistoryKind::Web,
+                "x",
+                "https://example.com",
+            ))
+            .unwrap();
+        assert!(lock.exists(), "a gravacao cria o trinco");
+        store.clear().unwrap();
+        fs::remove_file(&path).unwrap();
+        // O trinco ficou (o historico foi-se): a leitura continua a passar
+        // por ele e devolve vazio.
+        assert!(store.recent(10).unwrap().is_empty());
+        let _ = fs::remove_file(&lock);
     }
 
     #[test]

@@ -304,7 +304,11 @@ impl ResearchSession {
         output
     }
 
-    pub fn save(&self, root: impl AsRef<Path>) -> io::Result<PathBuf> {
+    /// So do crate: fora dele a sessao grava-se por `MemoryStore::save_session`,
+    /// e a `MemoryStore` so a abre quem e dono da memoria (no NeuralIA, o
+    /// worker que o `PrivacyGuard` arranca). Assim nenhum modulo do app grava
+    /// `memory/sessions/` por fora do modo privado.
+    pub(crate) fn save(&self, root: impl AsRef<Path>) -> io::Result<PathBuf> {
         let root = root.as_ref().join("sessions");
         fs::create_dir_all(&root)?;
         let path = root.join(format!("{}.json", self.id));
