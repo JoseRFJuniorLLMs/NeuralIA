@@ -208,6 +208,12 @@ impl ApiClient {
         &self.endpoint
     }
 
+    /// A configuracao do agente (so leitura), para o gate da politica de
+    /// rede (`tests/llm_client_policy.rs`).
+    pub fn agent_config(&self) -> &ureq::config::Config {
+        self.agent.config()
+    }
+
     /// Envia o pedido e devolve o corpo de uma resposta 2xx, ate ao tecto.
     /// Qualquer outro estado vira `ApiError` sem o corpo; a chave, quando ha,
     /// vai so no cabecalho de autenticacao do fornecedor.
