@@ -18,9 +18,26 @@ path = "src/main.rs"
 name = "brand-assets"
 path = "../../scripts/brand-assets/main.rs"
 
+[features]
+# Nenhuma feature por omissao: o exe publicado e este.
+default = []
+# So CI (infra-accel-spike, plano 2.3): o spike do AcceleratorKeyPressed em
+# cada WebView, conduzido por scripts/test-accel-spike.ps1 no workflow
+# proprio .github/workflows/accel-spike.yml (PRs e a mao), fora do workflow
+# CI de que o release.yml depende. O exe publicado e compilado SEM ela: o job
+# `windows` do ci.yml prova que o marcador do spike nao esta no
+# ci-tested/NeuralIA.exe (scripts/test-accel-spike-marker.ps1) e
+# scripts/test-release-contract.mjs prende isso aos workflows. Nao puxa crate
+# nenhuma.
+accel-spike = []
+
 [dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 neural-core = { path = "../neural-core" }
+# As lojas da IA (ai_settings.rs, egress.rs) derivam Serialize/Deserialize
+# para o `VersionedJsonStore`. O serde ja esta no Cargo.lock (o neural-core usa
+# o mesmo do workspace): nenhum crate novo.
+serde.workspace = true
 # O parser do canal IPC (src/ipc.rs) é portátil e é compilado em todas as
 # plataformas; por isso o serde_json não pode ficar só no lado Windows.
 serde_json.workspace = true
@@ -35,6 +52,16 @@ windows-sys = { version = "0.61.2", features = [
     # MessageBeep: o som curto do fim de uma fase do Pomodoro.
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Registry",
+    # SHGetKnownFolderPath(FOLDERID_Downloads) + CoTaskMemFree: a pasta
+    # Transferencias que o gestor de downloads repoe no perfil do WebView2.
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    # ILCreateFromPathW + SHOpenFolderAndSelectItems: o «Mostrar na pasta»
+    # da seccao Downloads (downloads-ui).
+    "Win32_UI_Shell_Common",
+    # GetLocalTime: o dia local da pasta «Importado do Chrome (dd/mm/aaaa)»
+    # e do nome do HTML exportado dos favoritos.
+    "Win32_System_SystemInformation",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
@@ -62,6 +89,11 @@ windows-sys = { version = "0.61.2", features = [
 # Os testes do leitor de EPUB montam livros num ZIP escrito à mão (stored e
 # deflate). O flate2 já está no Cargo.lock (via neural-core); nenhum crate novo.
 flate2 = "1.1.10"
+# So nos testes: o neural-core com a feature de CI `test-stores`
+# (`StoreRegistry::mint_for_test`). O resolver 2 nao a leva ao build normal:
+# o exe publicado tem-na desligada (passo "Published exe has the test-stores
+# feature off" do ci.yml, preso em scripts/test-release-contract.mjs).
+neural-core = { path = "../neural-core", features = ["test-stores"] }
 
 [build-dependencies]
 winres = "0.1.12"

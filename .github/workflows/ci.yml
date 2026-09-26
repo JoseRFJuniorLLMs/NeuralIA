@@ -52,10 +52,11 @@ jobs:
 
   windows:
     runs-on: windows-latest
-    # 2.2.0 green runs already take 17-20 minutes (run 36163974196: 19m56s);
-    # a run cut at the 20-minute mark after every step passed is a timeout,
-    # not a gate result.
-    timeout-minutes: 35
+    # 2.2.0 green runs already took 17-20 minutes (run 36163974196: 19m56s).
+    # With the 2.3 E2E steps and a sabotage matrix of ~35 entries (18 min on
+    # its own) a green run of PR 161 took 35m01s and was cut at the 35-minute
+    # mark after every step passed - a timeout, not a gate result.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -71,6 +72,38 @@ jobs:
       - run: cargo check --locked --workspace
       - run: cargo test --locked -p neural-core
       - run: cargo test --locked -p neural-app
+      # Real Win32 focus gates (infra-notify-popups): they create a window
+      # that can take the foreground, open a modal menu and move the
+      # keyboard, so they are #[ignore] in the local suite (the owner works
+      # on the same desktop) and run here, one at a time. The step fails if
+      # any named gate did not run and pass.
+      - name: Real Win32 focus gates (CI-only)
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = "Continue"
+          $gates = @(
+            "windows_app::tests::toast_never_activates",
+            "windows_app::tests::native_card_never_activates",
+            "windows_app::tests::popup_menu_restores_origin_focus",
+            "windows_app::tests::downloads_gates::download_card_never_activates"
+          )
+          cargo test --locked -p neural-app --bin NeuralIA -- --ignored --exact --test-threads=1 @gates 2>&1 |
+            ForEach-Object { "$_" } |
+            Tee-Object -Variable lines |
+            Write-Host
+          $code = $LASTEXITCODE
+          $log = $lines -join "`n"
+          if ($code -ne 0) {
+            throw "CI-only focus gates failed (exit $code)."
+          }
+          foreach ($gate in $gates) {
+            $pattern = '(?m)^test ' + [regex]::Escape($gate) + ' \.\.\. ok\s*$'
+            if ($log -notmatch $pattern) {
+              throw "Focus gate did not run and pass: $gate"
+            }
+          }
+          Write-Host "Focus gates: each of the $($gates.Count) CI-only real Win32 gates ran and passed."
       - name: Prove 100-interaction UI gates reject sabotage
         shell: pwsh
         run: |
@@ -110,13 +143,16 @@ jobs:
 
           # Each sabotage is applied alone and only its gate runs, so every gate has
           # to turn red by itself. A build error or another failing test does not count.
-          function Assert-GateRed([string]$label, [string]$test, [string]$targetPath, [string]$old, [string]$new) {
+          # An Ignored gate is a CI-only real Win32 focus gate (#[ignore] in the
+          # local suite): it runs alone with --ignored --exact.
+          function Assert-GateRed([string]$label, [string]$test, [string]$targetPath, [string]$old, [string]$new, [bool]$ignored) {
             $resolved = (Resolve-Path -LiteralPath $targetPath).Path
             $original = [IO.File]::ReadAllText($resolved, $utf8)
             $broken = Replace-Exact $original $old $new $label
             Write-Exact $resolved $broken
             try {
-              $run = Invoke-GateTest @($test)
+              $filter = if ($ignored) { @('--', '--ignored', '--exact', "windows_app::tests::$test") } else { @($test) }
+              $run = Invoke-GateTest $filter
             }
             finally {
               Write-Exact $resolved $original
@@ -252,16 +288,276 @@ jobs:
             @{
               Label = "menu-label-frozen-at-registration"
               Test = "each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r"
+              SourcePath = "crates/neural-app/src/windows_app/webview_hooks.rs"
               Old = @'
-              move |native| ColumnMenuRequest {
-                  col_index,
-                  label: auto_scroll_menu_label(auto_scroll.get()),
+              move |native, page| {
+                  let flags = MenuFlags {
+                      auto_scroll: auto_scroll.get(),
           '@
               New = @'
-              let frozen = auto_scroll_menu_label(auto_scroll.get());
-              move |native| ColumnMenuRequest {
-                  col_index,
-                  label: frozen,
+              let frozen = auto_scroll.get();
+              move |native, page| {
+                  let flags = MenuFlags {
+                      auto_scroll: frozen,
+          '@
+            },
+            @{
+              Label = "panel-delegator-byte-cap"
+              Test = "panel_messages_delegate_by_prefix_and_keep_caps"
+              SourcePath = "crates/neural-app/src/windows_app/side_panel.rs"
+              Old = @'
+              if body.len() > (section.max_bytes)(action) {
+          '@
+              New = @'
+              if body.len() > PANEL_MESSAGE_ABSOLUTE_MAX_BYTES {
+          '@
+            },
+            @{
+              Label = "panel-absolute-cap-before-json"
+              Test = "panel_bodies_above_the_absolute_cap_are_never_read_as_json"
+              SourcePath = "crates/neural-app/src/windows_app/side_panel.rs"
+              Old = @'
+              if body.len() > PANEL_MESSAGE_ABSOLUTE_MAX_BYTES {
+          '@
+              New = @'
+              if false {
+          '@
+            },
+            @{
+              Label = "clear-history-skips-a-registered-target"
+              Test = "clear_history_runs_every_registered_target"
+              SourcePath = "crates/neural-app/src/windows_app/clear_history.rs"
+              Old = @'
+                  sink.clear(*target);
+          '@
+              New = @'
+                  if *target != ClearTarget::Memory {
+                      sink.clear(*target);
+                  }
+          '@
+            },
+            @{
+              Label = "secret-prompt-destroyed-with-the-key"
+              Test = "the_secret_prompt_takes_typing_sends_the_key_and_clears_the_edit"
+              SourcePath = "crates/neural-app/src/windows_app/secret_prompt.rs"
+              Ignored = $true
+              Old = @'
+              clear_secret_edit(prompt.edit);
+              DestroyWindow(prompt.popup);
+          '@
+              New = @'
+              DestroyWindow(prompt.popup);
+          '@
+            },
+            @{
+              Label = "secret-prompt-enter-keeps-the-key"
+              Test = "the_secret_prompt_takes_typing_sends_the_key_and_clears_the_edit"
+              SourcePath = "crates/neural-app/src/windows_app/secret_prompt.rs"
+              Ignored = $true
+              Old = @'
+                      clear_secret_edit(edit);
+                      host.invalid.set(false);
+          '@
+              New = @'
+                      host.invalid.set(false);
+          '@
+            },
+            @{
+              Label = "secret-prompt-topmost"
+              Test = "the_secret_prompt_takes_typing_sends_the_key_and_clears_the_edit"
+              SourcePath = "crates/neural-app/src/windows_app/secret_prompt.rs"
+              Ignored = $true
+              Old = @'
+          pub(in crate::windows_app) const SECRET_PROMPT_EX_STYLE: u32 = WS_EX_TOOLWINDOW;
+          '@
+              New = @'
+          pub(in crate::windows_app) const SECRET_PROMPT_EX_STYLE: u32 = WS_EX_TOOLWINDOW | 0x0000_0008;
+          '@
+            },
+            @{
+              Label = "toast-shown-with-sw-show"
+              Test = "toast_never_activates"
+              Ignored = $true
+              SourcePath = "crates/neural-app/src/windows_app/search_card.rs"
+              Old = @'
+                  ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+          '@
+              New = @'
+                  ShowWindow(hwnd, SW_SHOW);
+          '@
+            },
+            @{
+              Label = "card-activates-on-click"
+              Test = "native_card_never_activates"
+              Ignored = $true
+              SourcePath = "crates/neural-app/src/windows_app/native_card.rs"
+              Old = @'
+                  WM_MOUSEACTIVATE => Some(MA_NOACTIVATE as LRESULT),
+          '@
+              New = @'
+                  WM_MOUSEACTIVATE => None,
+          '@
+            },
+            @{
+              Label = "menu-skips-focus-restore"
+              Test = "popup_menu_restores_origin_focus"
+              Ignored = $true
+              SourcePath = "crates/neural-app/src/windows_app/popup_menu.rs"
+              Old = @'
+              restore_focus(decide_focus_restore(origin, moves_focus), hosts);
+          '@
+              New = @'
+              let _ = (origin, moves_focus);
+          '@
+            },
+            @{
+              Label = "notify-route-ignores-focus"
+              Test = "notify_route_table"
+              SourcePath = "crates/neural-app/src/notify.rs"
+              Old = @'
+              if focus_shield && !notice.kind.passes_focus() {
+          '@
+              New = @'
+              if false && !notice.kind.passes_focus() {
+          '@
+            },
+            @{
+              Label = "page-eval-skips-generation"
+              Test = "page_eval_drops_a_navigated_read"
+              SourcePath = "crates/neural-app/src/windows_app/page_eval.rs"
+              Old = @'
+              if read.epoch.current() != read.generation {
+          '@
+              New = @'
+              if false && read.epoch.current() != read.generation {
+          '@
+            },
+            @{
+              Label = "reader-born-without-hooks"
+              Test = "every_webview_gets_the_hooks"
+              SourcePath = "crates/neural-app/src/windows_app/app/pages.rs"
+              Old = @'
+                  let hooked = self.hooked_builder(builder, WebViewHost::Reader, None);
+                  let result = hooked.build_hooked(window);
+          '@
+              New = @'
+                  let result = builder.build(window);
+          '@
+            },
+            @{
+              Label = "gmail-monitor-gets-web-chain"
+              Test = "every_webview_gets_the_hooks"
+              SourcePath = "crates/neural-app/src/windows_app/app/gmail.rs"
+              Old = @'
+              let hooked = self.hooked_builder(builder, WebViewHost::GmailMonitor, None);
+          '@
+              New = @'
+              let hooked = self.hooked_builder(builder, WebViewHost::External, None);
+          '@
+            },
+            @{
+              Label = "resource-gate-answers-neuralia-pdf"
+              Test = "custom_schemes_are_never_answered_by_the_resource_gate"
+              SourcePath = "crates/neural-app/src/windows_app/webview_hooks.rs"
+              Old = @'
+              if is_custom_scheme_request(uri) {
+                  return false;
+              }
+          '@
+              New = @'
+              if is_custom_scheme_request(uri) {
+                  return uri.contains("neuralia-pdf");
+              }
+          '@
+            },
+            @{
+              Label = "adblock-split-without-resource-gate"
+              Test = "the_adblock_gate_is_installed_on_columns_split_and_external_only"
+              SourcePath = "crates/neural-app/src/windows_app/adblock.rs"
+              Old = @'
+                  WebViewHost::Column(_) | WebViewHost::Split(_) | WebViewHost::External
+          '@
+              New = @'
+                  WebViewHost::Column(_) | WebViewHost::External
+          '@
+            },
+            @{
+              Label = "bound-chord-not-handled"
+              Test = "accelerator_decision_table"
+              SourcePath = "crates/neural-app/src/windows_app/keymap.rs"
+              Old = @'
+                  handled: true,
+          '@
+              New = @'
+                  handled: false,
+          '@
+            },
+            @{
+              Label = "duplicate-chord-in-registry"
+              Test = "keymap_chords_are_unique_per_scope"
+              SourcePath = "crates/neural-app/src/windows_app/commands.rs"
+              Old = @'
+                  chords: &[ChordSpec::window(Chord::ctrl(b'N'))],
+          '@
+              New = @'
+                  chords: &[ChordSpec::window(Chord::ctrl(b'N')), ChordSpec::window(Chord::ctrl(b'H'))],
+          '@
+            },
+            @{
+              Label = "chatgpt-chord-bound-on-provider"
+              Test = "provider_hosts_never_bind_the_chatgpt_chords"
+              SourcePath = "crates/neural-app/src/windows_app/keymap.rs"
+              Old = @'
+              if is_provider_origin(origin) && PROVIDER_DENYLIST.contains(&chord) {
+          '@
+              New = @'
+              if false && is_provider_origin(origin) && PROVIDER_DENYLIST.contains(&chord) {
+          '@
+            },
+            @{
+              Label = "command-origin-not-from-host"
+              Test = "a_command_key_carries_the_host_it_came_from"
+              SourcePath = "crates/neural-app/src/windows_app/webview_hooks.rs"
+              Old = @'
+              keymap_decision_in(keymap, input, CommandOrigin::Host(host))
+          '@
+              New = @'
+              keymap_decision_in(keymap, input, CommandOrigin::Host(WebViewHost::External))
+          '@
+            },
+            @{
+              Label = "accelerator-handler-asks-for-another-host"
+              Test = "the_accelerator_callback_calls_out_to_nothing"
+              SourcePath = "crates/neural-app/src/windows_app/webview_hooks.rs"
+              Old = @'
+                  let decision = accelerator_lookup(product_keymap(), host, input);
+          '@
+              New = @'
+                  let decision = accelerator_lookup(product_keymap(), WebViewHost::External, input);
+          '@
+            },
+            @{
+              Label = "command-key-runs-from-another-origin"
+              Test = "a_command_key_runs_against_the_origin_it_carries"
+              SourcePath = "crates/neural-app/src/windows_app/commands.rs"
+              Old = @'
+              resolve_command(key, origin)
+          '@
+              New = @'
+              resolve_command(key, CommandOrigin::Host(WebViewHost::External))
+          '@
+            },
+            @{
+              Label = "event-loop-picks-the-command-origin"
+              Test = "a_command_key_runs_against_the_origin_it_carries"
+              SourcePath = "crates/neural-app/src/windows_app/app/event_loop.rs"
+              Old = @'
+                      press @ UserEvent::RunCommandKey { .. } => {
+                          if let Some(event) = command_key_event(&press) {
+          '@
+              New = @'
+                      UserEvent::RunCommandKey { key, .. } => {
+                          if let Some(event) = resolve_command(key, CommandOrigin::Host(WebViewHost::External)) {
           '@
             }
           )
@@ -269,7 +565,7 @@ jobs:
           try {
             foreach ($sabotage in $sabotages) {
               $target = if ($sabotage.SourcePath) { $sabotage.SourcePath } else { $defaultSourcePath }
-              Assert-GateRed $sabotage.Label $sabotage.Test $target $sabotage.Old $sabotage.New
+              Assert-GateRed $sabotage.Label $sabotage.Test $target $sabotage.Old $sabotage.New ([bool]$sabotage.Ignored)
             }
             Write-Host "Sabotage proof: each of the $($sabotages.Count) Rust UI sabotages turned its own shipped-path gate red."
 
@@ -303,19 +599,80 @@ jobs:
           if ($restored.Code -ne 0) {
             throw "neural-app tests are not green on the restored source."
           }
-          foreach ($test in ($sabotages | ForEach-Object { $_.Test } | Sort-Object -Unique)) {
+          foreach ($test in ($sabotages | Where-Object { -not $_.Ignored } | ForEach-Object { $_.Test } | Sort-Object -Unique)) {
             if (-not (Test-ResultLine $restored.Log $test 'ok')) {
               throw "Gate did not run and pass on the restored source: $test"
             }
           }
+          $focusGates = @($sabotages | Where-Object { $_.Ignored } | ForEach-Object { $_.Test } | Sort-Object -Unique)
+          $restoredFocus = Invoke-GateTest (@('--', '--ignored', '--exact', '--test-threads=1') + @($focusGates | ForEach-Object { "windows_app::tests::$_" }))
+          if ($restoredFocus.Code -ne 0) {
+            throw "CI-only focus gates are not green on the restored source."
+          }
+          foreach ($test in $focusGates) {
+            if (-not (Test-ResultLine $restoredFocus.Log $test 'ok')) {
+              throw "Focus gate did not run and pass on the restored source: $test"
+            }
+          }
           node scripts/test-link-routing.mjs
           git diff --exit-code -- crates/neural-app/src
+      # Window gates that take the foreground or the keyboard focus (the
+      # activatable SecretPrompt of infra-settings-keys) never run in the local
+      # suite: they are `#[ignore = "needs a desktop session: runs in CI"]` and
+      # this runner has the desktop session. Every named gate must run and pass:
+      # a filter that matched nothing would also exit 0.
+      - name: Focus-affecting window gates (desktop session)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tests = @(
+            "windows_app::tests::the_secret_prompt_takes_typing_sends_the_key_and_clears_the_edit"
+          )
+          $ErrorActionPreference = "Continue"
+          cargo test --locked -p neural-app --bin NeuralIA -- --ignored --exact @tests 2>&1 |
+            ForEach-Object { "$_" } |
+            Tee-Object -Variable lines |
+            Write-Host
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = "Stop"
+          if ($code -ne 0) {
+            throw "Focus-affecting window gates failed (exit $code)."
+          }
+          $log = $lines -join "`n"
+          foreach ($test in $tests) {
+            $pattern = '(?m)^test ' + [regex]::Escape($test) + ' \.\.\. ok\s*$'
+            if ($log -notmatch $pattern) {
+              throw "Focus-affecting gate did not run and pass: $test"
+            }
+          }
+          Write-Host "Focus-affecting window gates: $($tests.Count) ran and passed."
       - name: Exercise ChatGPT/Claude auto-submit runtime
         run: node scripts/test-ai-auto-submit.mjs
       - name: Exercise shipped provider link routing
         run: node scripts/test-link-routing.mjs
       - run: cargo clippy --locked -p neural-app --all-targets -- -D warnings
       - run: cargo build --locked -p neural-app --bin NeuralIA --release
+      # Release contract of the CI-only feature test-stores (infra-settings-keys):
+      # neural-core's StoreRegistry::mint_for_test exists only with it, and only
+      # neural-app's [dev-dependencies] enable it. Cargo's resolver 2 keeps
+      # dev-dependency features out of the normal build graph, which is the one
+      # the release build above uses: this proves it on the real graph, and that
+      # the same query does see the feature once dev-dependencies are in.
+      - name: Published exe has the test-stores feature off
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $normal = (cargo tree --locked -p neural-app --target x86_64-pc-windows-msvc -e features,no-dev -i neural-core) -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw "cargo tree failed on the normal build graph." }
+          if ($normal -match 'test-stores') {
+            throw "The build graph of the published exe enables neural-core/test-stores:`n$normal"
+          }
+          $tests = (cargo tree --locked -p neural-app --target x86_64-pc-windows-msvc -e features -i neural-core) -join "`n"
+          if ($LASTEXITCODE -ne 0) { throw "cargo tree failed on the test build graph." }
+          if ($tests -notmatch 'neural-core feature "test-stores"') {
+            throw "The check cannot see test-stores even with dev-dependencies:`n$tests"
+          }
+          Write-Host "test-stores: off in the build graph of the published exe, on only for tests."
       - name: First comparator paint without mouse or keyboard
         shell: pwsh
         run: ./scripts/test-comparator-first-paint.ps1 -ExePath target/release/NeuralIA.exe
@@ -334,6 +691,74 @@ jobs:
           Copy-Item perf-cycles.json ci-tested/perf-cycles.json
           $hash = (Get-FileHash ci-tested/NeuralIA.exe -Algorithm SHA256).Hash.ToLower()
           "$hash  NeuralIA.exe" | Out-File -Encoding ascii ci-tested/NeuralIA.exe.sha256
+      # Release contract of the LLM transport (infra-llm-transport): the AI
+      # client reaches only the pinned provider hosts (Endpoint::pinned), its
+      # loopback exists only under cfg(test), and no environment variable
+      # redirects a host or points it at a fixture. The script first proves it
+      # sees planted override names in ASCII and UTF-16LE, then scans the exact
+      # bytes that release.yml packages.
+      - name: Published exe has no LLM endpoint override
+        shell: pwsh
+        run: ./scripts/test-exe-no-endpoint-override.ps1 -ExePath ci-tested/NeuralIA.exe
+      # E2E of the ad blocker (adblock): only here, on the exact tested bytes,
+      # because it launches the exe (the owner works on the same desktop). The
+      # fixture is 127.0.0.1 (scripts/adblock-fixture.mjs), the WebView2 maps
+      # every name to 127.0.0.1 and the stored list is fresh, so no request
+      # leaves the runner -- pgl.yoyo.org included. The script also checks the
+      # stored list was not rewritten (no refresh ran). Tests and CI never
+      # reach pgl.yoyo.org: before the exe starts, the runner's hosts file
+      # maps it to 127.0.0.1, and the list refresh's resolver (pinned to
+      # Locality::Public) refuses a loopback address, so even a refresh that
+      # ran by mistake could never leave the machine.
+      - name: Adblock E2E on the tested exe (loopback only)
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = "Stop"
+          $hostsPath = 'C:\Windows\System32\drivers\etc\hosts'
+          # pgl.yoyo.org: a refresh that ran by mistake can never leave the
+          # runner. allowed.test and ads.blocked.test: the fixture's names
+          # reach the loopback fixture (WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
+          # --host-resolver-rules is not applied under wry: PR 160's first run).
+          foreach ($name in 'pgl.yoyo.org', 'allowed.test', 'ads.blocked.test') {
+            $entry = "127.0.0.1 $name"
+            $pinned = '(?m)^[ \t]*127\.0\.0\.1[ \t]+' + [regex]::Escape($name) + '[ \t]*\r?$'
+            $current = [IO.File]::ReadAllText($hostsPath)
+            if ($current -notmatch $pinned) {
+              $separator = if ($current.Length -gt 0 -and -not $current.EndsWith("`n")) { "`r`n" } else { "" }
+              [IO.File]::AppendAllText($hostsPath, "$separator$entry`r`n", [Text.Encoding]::ASCII)
+            }
+            if ([IO.File]::ReadAllText($hostsPath) -notmatch $pinned) {
+              throw "The hosts file does not map $name to 127.0.0.1."
+            }
+            Write-Host "hosts: $entry"
+          }
+          ipconfig /flushdns | Out-Null
+          ./scripts/test-adblock.ps1 -ExePath ci-tested/NeuralIA.exe
+      # E2E of the download manager (downloads-manager) on the exact bytes
+      # that release.yml packages. It opens the exe (windows that can take the
+      # focus), so it never runs in the local suite. The fixture
+      # (scripts/downloads-fixture.mjs) listens on 127.0.0.1 only: no request
+      # leaves the runner. Gates: a fixture setup.exe is refused before it
+      # starts (nothing on disk, recorded as blocked) and a PDF lands with the
+      # mark of the web (Zone.Identifier). The spike (does destroying a WebView
+      # cancel its download?) only reports, in the log and the step summary;
+      # it never fails the step.
+      - name: Downloads E2E on the tested exe (setup.exe refused, PDF with MOTW)
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          ./scripts/test-downloads.ps1 -SelfTest
+          ./scripts/test-downloads.ps1 -ExePath ci-tested/NeuralIA.exe
+      # Release contract of the CI-only accelerator spike (infra-accel-spike):
+      # the exact bytes that release.yml packages were built without the spike
+      # feature, so the spike marker is not in them. The spike itself runs in
+      # its own workflow (accel-spike.yml), never in this one: release.yml
+      # waits for this workflow, and a failing chord is an expected spike
+      # result, not a release gate.
+      - name: Published exe has the accel-spike feature off
+        shell: pwsh
+        run: ./scripts/test-accel-spike-marker.ps1 -ExePath ci-tested/NeuralIA.exe -Expect Absent
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: neuralia-windows-tested-${{ github.sha }}

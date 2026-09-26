@@ -314,3 +314,262 @@ authenticated `palette` message; the text itself is typed and read natively.
 New-window requests MUST NOT create a second WebView. Valid HTTP(S) targets are routed into the existing Full Web surface; other targets are denied.
 
 New WebView permission requests are denied by default.
+
+## Per-WebView hooks
+
+Every WebView the app builds -- the three comparator columns, the split
+(normal and private), the full Web surface and the agent's page, the Reader,
+the PDF viewer, the EPUB pages, the Gemini Live panel, the hidden Gmail
+monitor, the Ctrl+H panel and the service panels -- is born in two steps that
+go through one module, `crates/neural-app/src/windows_app/webview_hooks.rs`:
+
+- before `build`, `App::hooked_builder(builder, host, local_origin)` installs
+  the host's navigation gate, the download refusal where the table says so,
+  and the page-load notice (`WebViewEvent::PageLoaded { page, url }`, sent on
+  `Finished` only), and returns a `HookedBuilder` that carries that host;
+- `HookedBuilder::build_hooked` / `build_hooked_as_child` are the only calls
+  of wry's `build` / `build_as_child` in the product (the gate holds them to
+  the module), and after the build they register through WebView2 COM, for
+  the same host, the NeuralIA items of the right-click menu
+  (`WEBVIEW_MENU_ITEMS`: the auto-scroll item, on the columns and on the
+  split, private included; and the two ad-blocking items, on the columns, the
+  non-private split and the full Web), an `AcceleratorKeyPressed` handler that
+  consults `accelerator_lookup`, on every `Managed` host the download manager
+  (see "Downloads" below), and on the hosts whose `resource_gate` is
+  `Adblock` the `WebResourceRequested` handler of the resource dispatcher
+  (`install_webview_hooks`, private to the module).
+
+The host a birth site passes to `hooked_builder` is therefore the only host
+that WebView has, in both halves: a site cannot build without the chain, nor
+give one host's chain to the builder and another's menu to COM.
+
+What each host receives is a pure table, `webview_hooks(host)`, with one slot
+per feature: `menu`, `downloads` (`Managed` on the columns, the split, the
+full Web and the service panels; `Deny` on the Reader, the PDF, the EPUB
+pages, the Live panel, the Ctrl+H panel and the Gmail monitor),
+`resource_gate`, `nav_gate`, `accelerators` (every host) and `distraction`
+(empty). Navigation verdicts are the per-host chain `web_navigation_verdict`
+(`Web`, `Pdf`, `Reader`, `Epub`, `Live`, `Gmail`, `SidePanel`, `Service`);
+the gate `navigation_verdicts_are_the_ones_the_builders_gave` holds every
+verdict and every event to the closures the builders had in 2.2.0, and
+`spec_0108_remote_navigation_handlers_reject_neuralia_scheme` forbids any
+`with_navigation_handler` outside the module. `every_webview_gets_the_hooks`
+runs both halves over a recording registrar and builder for every host kind,
+forbids wry's `build` / `build_as_child` outside the module, counts the 11
+`build_hooked` calls against the 11 `hooked_builder` calls, and pins the
+`hooked_builder` line of each of the 11 birth sites (the host literal next to
+the builder it wraps, exactly once); `the_webview_hooks_table` pins the table.
+The CI sabotage matrix proves it red with `reader-born-without-hooks` (the
+Reader built by wry's `build` directly) and `gmail-monitor-gets-web-chain`
+(the Gmail monitor born as `External`).
+
+`accelerator_lookup(keymap, host, input)` is the keymap decision
+(`accelerator_decision` in `crates/neural-app/src/windows_app/keymap.rs`) with
+the host the handler was registered for as the command origin; the handler
+calls it with the product keymap (`product_keymap()`) and that host, names no
+other host, and only sets `Handled` when the decision binds the key. The gates
+call the same function with test keymaps. The keymap is built from
+the command registry (`COMMANDS` in `windows_app/commands.rs`: one row per
+command, with its stable key, pt-BR label, palette category, keywords, chords
+with a scope, and omnibox alias) and is read through a read lock; the decision
+is pure, and the handler makes no COM call besides reading its arguments and
+`SetHandled` (gate `the_accelerator_callback_calls_out_to_nothing`). The main
+window (winit) and the Home omnibox (the EDIT subclass) ask the same decision,
+with the window or the omnibox as the origin.
+
+A key is handled only on the key-down of a chord bound in one of the origin's
+scopes: `Window` then `Global` for the main window and the omnibox; `Page`
+(columns, split, private split, full Web, Reader, PDF, EPUB) or `Panel` (Ctrl+H
+panel, service panels, Gemini Live), then `Global`, for a WebView host; none
+for the hidden Gmail monitor. The first scope that declares the chord decides.
+An auto-repeat of a bound chord stays handled without firing again; key-up and
+unbound keys are never handled (gate `accelerator_decision_table`). A handled
+key becomes `UserEvent::RunCommandKey { key, origin }`, whose origin is the
+host (or the window, or the omnibox), never page data, and only the decision
+builds it (gate `a_command_key_carries_the_host_it_came_from`); the event loop
+hands the whole event to `command_key_event`, which reads the command and the
+origin from the event itself and runs the event `resolve_command(key, origin)`
+gives (gate `a_command_key_runs_against_the_origin_it_carries`: the event
+loop's arm neither takes the event apart nor calls `resolve_command`); for a
+page-bound command that is the one that page's keymap would request over IPC
+for the same key (gate `resolve_command_runs_against_its_origin`). Two commands with the same
+chord in the same scope make the whole table invalid (gate
+`keymap_chords_are_unique_per_scope`). On the provider hosts -- the comparator
+columns and the private split -- the ChatGPT chords Ctrl+Shift+O,
+Ctrl+Shift+;, Ctrl+Shift+C, Ctrl+Shift+I, Ctrl+Shift+S and
+Ctrl+Shift+Backspace are never handled, whatever scope binds them (gate
+`provider_hosts_never_bind_the_chatgpt_chords`). The Files scope's override
+table (Ctrl+D, Ctrl+N, Ctrl+W, Ctrl+Tab, Ctrl+G, Ctrl+O, Ctrl+S,
+Ctrl+Shift+S) is consulted only by the Files chain, which no current origin
+uses (gate `files_override_wins_only_in_files`).
+
+Today the WebView hosts bind only the two `Global` chords, on every host
+with a keyboard and with that host as the origin: Ctrl+D (bookmarks,
+`CommandId::Bookmark`) -- the comparator column, the split, the private
+split, the full Web, Reader and PDF bookmark their own page; the panels and
+EPUB open Favoritos (gate `ctrl_d_runs_against_the_host_it_came_from`) --
+and Ctrl+J (downloads-ui, `CommandId::Downloads`), which opens the side
+panel's Downloads section from anywhere (gate
+`accelerator_lookup_binds_only_the_global_chords_on_webviews`). The pages' other shortcuts
+are still those of `NEURALIA_KEYMAP_SCRIPT`, and the `Window` scope keeps
+the Ctrl+R, Ctrl+Shift+R, Ctrl+H, Ctrl+N, Ctrl+O, Ctrl+Shift+Z and
+Ctrl+Shift+Delete the main window and the omnibox already answered. The CI
+accelerator spike measured native dispatch on every host kind: with
+`Handled = TRUE` the page never sees the keydown of the chord, but it may still
+receive one or two keypress events (the control character of a Ctrl+letter).
+The spike handled the chord's key-up as well and its probe listened only for
+keydown and keypress; the shipped decision leaves key-up unhandled, so the page
+also receives the keyup of a bound chord, which the spike did not measure. A
+page that reacts to keypress or keyup sees the press; none of them can run the
+command, which is born on the native side.
+The resource dispatcher `resource_gate_answers(host, uri, page, rules)` is
+wired to `WebResourceRequested` on the hosts whose `resource_gate` is
+`Adblock` -- the comparator columns, the source page beside a column (not the
+private one) and the full Web -- and on no other host (gate
+`the_adblock_gate_is_installed_on_columns_split_and_external_only`; CI
+sabotage `adblock-split-without-resource-gate`). The handler
+(`register_resource_gate`) reads the request URI, its `ResourceContext` and the
+top page from the event's `sender`, never from a captured WebView (gate
+`the_resource_handler_reads_the_sender_never_a_captured_webview`), asks the
+dispatcher with the ad blocker's rules in force, and on a block answers 403
+through the `CreateWebResourceResponse` of the sender's environment. The `*`
+filter (with `ICoreWebView2_22` and all request source kinds when the runtime
+has it) is only present while ad blocking is on: new WebViews get it at
+registration and the open ones when the user turns blocking on or off. The
+dispatcher never answers a request on `neuralia-pdf`, `neuralia-epub` or
+`neuralia-live` (those are served by their wry custom protocols; gate
+`custom_schemes_are_never_answered_by_the_resource_gate`, CI sabotage
+`resource-gate-answers-neuralia-pdf`), never a document, and nothing on a page
+of an AI provider or a sign-in host of the provider registry (gate
+`the_shipped_gate_blocks_ads_but_never_documents_or_ai_pages`).
+
+### Downloads
+
+On every `Managed` host `register_download_manager`
+(`crates/neural-app/src/windows_app/downloads.rs`) adds a WebView2
+`DownloadStarting` handler and sets the profile's default download folder
+(`SetDefaultDownloadFolderPath`) to `profile_download_folder`: the folder
+`downloads-settings.json` names when it is an existing absolute folder,
+otherwise the user's Downloads folder (`FOLDERID_Downloads`). WebView2 keeps
+that setting in the profile across sessions, so it is reset whenever no
+folder is chosen. The gate `downloads_state_opens_through_grants_and_checks_the_folder`
+holds the choice of folder; the COM call itself is only exercised by the
+CI-only E2E below, with a chosen folder, on the full Web. The manager also
+asks for the chosen folder on every download (`target_path`, unit-tested
+for a private download too). The handler always takes the deferral and
+hands the download to the pure `neural_core::downloads::DownloadManager`,
+whose effects the app applies:
+
+- start (`decide_start`): a program, script, Windows shortcut, disk image or
+  Access database name is refused with `SetCancel` before any file exists;
+  a masquerade (`fatura.pdf.exe`, a padded extension) or a name with bidi,
+  invisible characters, `:` or a DOS device name is refused with no
+  exception; everything else proceeds. With "Permitir baixar programas" on,
+  a refusable program waits in the deferral for the native "Baixar
+  programa?" card (see "Downloads UI" below): only its armed "Baixar mesmo
+  assim" lets it proceed; "Cancelar", the 30 s expiry, or a newer request
+  replacing the card refuse it;
+- progress: `BytesReceivedChanged`, throttled to one event every 250 ms per
+  download before it leaves the handler;
+- end: `StateChanged` forgets the WebView2 operation; a completed file is
+  finalized (`finalize_download`): the first 4 KiB are sniffed, an
+  unconfirmed executable, shortcut or cabinet (or an unreadable file) is
+  deleted, and anything kept gets the mark of the web (`Zone.Identifier`
+  alternate data stream): when the file has none, NeuralIA writes
+  `ZoneId=3` with no `HostUrl`; a mark WebView2 already wrote is left as it
+  is, and that one may carry the `HostUrl`. The E2E below reports who wrote
+  the mark and whether it carries a `HostUrl`;
+- a destroyed WebView: a guard inside the `DownloadStarting` handler sends
+  `WebViewGone` when WebView2 releases the handler, and the manager cancels
+  and forgets that WebView's running downloads. Whether destroying a WebView
+  cancels its download by itself, and when WebView2 releases the handler, is
+  the question of the spike in `scripts/test-downloads.ps1`, which only
+  reports it (in the CI log and the step summary).
+
+Finished downloads are recorded in `downloads.json` (at most 200, name,
+folder, host, size and outcome, never the full URL), an `Automatic` store:
+nothing from the private split or an InPrivate service panel is recorded,
+and nothing that starts or finishes while the store registry is in private
+mode (`StoreMode::Private`, which no product command turns on yet) is
+recorded either, so it never reaches the file once the mode is back to
+normal; in that mode the store writes nothing. `run_download_event`, the
+app's whole `UserEvent::Download` arm, sets the manager's private mode from
+the registry before every event. Ctrl+Shift+Delete (`DownloadEvent::ClearLog`,
+effect `EraseLog`) removes `downloads.json`, its `.bak` copy and an
+interrupted write's temporary file from disk directly, in any mode and even
+when the store is read-only (a future-version or corrupt file), and leaves
+the downloaded files. Gates: `the_start_decision_table`,
+`the_finalize_decision_table`, `motw_is_written_and_read_back_through_the_ads`,
+`private_downloads_are_never_recorded`,
+`nothing_made_in_private_mode_is_ever_recorded` (neural-core) and
+`downloads_are_denied_on_every_local_host_and_managed_on_the_web`,
+`download_ops_follow_the_manager_and_are_cleared_on_finish_and_destroy`,
+`private_downloads_never_reach_downloads_json`,
+`clearing_history_takes_downloads_json_off_the_disk`, with
+`every_webview_gets_the_hooks` requiring the manager on every `Managed` host
+and on no `Deny` host. The CI-only `scripts/test-downloads.ps1` runs the
+tested exe against a 127.0.0.1 fixture: a `setup.exe` is refused; a PDF
+lands in the chosen folder with the mark of the web, NeuralIA's finalize
+ran, and a mark NeuralIA wrote is `ZoneId=3` with no `HostUrl`.
+
+### Downloads UI
+
+`crates/neural-app/src/windows_app/downloads_ui.rs` (downloads-ui) is what
+the manager shows:
+
+- the ⬇ slot of the bar corner (`RIGHT_CLUSTER`, `BarHit::Downloads`, just
+  left of Privado) and `Ctrl+J` (`CommandId::Downloads`, `KeyScope::Global`:
+  the window, the omnibox and every WebView except the hidden Gmail monitor,
+  held by `AcceleratorKeyPressed` so the page never sees the keydown) open
+  the side panel on its Downloads section; again, they close it. The ⬇ slot
+  fits or does not exist: it is there only from `DOWNLOADS_SLOT_MIN_WIDTH`
+  (1100 logical px), below which it would take the third AI column's pill,
+  "+" and ‹ › (`Ctrl+J` still works). While downloads run it is drawn in the
+  accent colour and its tooltip counts them;
+- the Downloads section of the side panel (`assets/panel/downloads.*`): this
+  session's downloads (progress as "Baixando relatorio.pdf · 3,2 de 12 MB ·
+  1 min") and the records of `downloads.json`, plus the "Permitir baixar
+  programas" switch, saved in `downloads-settings.json` (`StoreKind::Setting`).
+  Its requests (`downloads-list`, `downloads-open`, `downloads-show`,
+  `downloads-cancel`, `downloads-allow-programs`) carry only a row number
+  (`DownloadRows`, an integer from 1 to 2^53-1 with no other key) or the
+  switch state, never a path or a URL; the data sent to the page never
+  carries a path either, and the page renders it with `textContent`;
+- "Abrir" goes only through `shell_open_checked`, which requires
+  `neural_core::file_risk::DefaultAppTarget` (the name and the first 4 KiB of
+  the file, re-read on the click) and calls `ShellExecuteW` with the verb
+  `open` on the validated path, never an elevation verb. A kind the target
+  refuses (program, script, macro document, masquerade, `.url`, `.lnk`,
+  `.library-ms`, `.search-ms`, `.chm`, `.hta`, or anything outside its
+  allowlist) shows only "Mostrar na pasta" (`SHOpenFolderAndSelectItems`),
+  which runs nothing;
+- the notices (blocked, deleted, not deleted, completed) are `Download`
+  notices of the notification centre (`crate::notify`, the corner toast),
+  with the file name in the body only;
+- two native cards (`NativeCard`: token, 600 ms arm, expiry, only what was
+  painted; never activated): "Baixar programa?" and, when Home or closing
+  the window would end running downloads, `leave_decision`'s "N download(s)
+  em andamento (x.zip, 43%)." with "Continuar baixando" (stays, at once)
+  and "Cancelar e sair" (armed: cancels each download, then leaves).
+  Every Home the user asks for goes through `request_home` (the bar's Home,
+  the Home command, Esc in the omnibox, a typed or palette Home, Ctrl+L,
+  Ctrl+K and Ctrl+N outside the comparator, the book's Close) and every
+  window close through `request_close` (the bar's X, Alt+F4, the Exit
+  command). `show_home` and the window's `exit` are reached only from a
+  named list of functions, counted per file and function over the code with
+  comments and literals removed. Known exceptions in that list: a confirmed
+  "Apagar histórico" goes Home and ends running downloads without the card,
+  and the CI lifecycle probe (`NEURALIA_LIFECYCLE_PROBE` only) goes Home
+  without it, because the downloads spike measures the destroyed WebView.
+  Leaving the comparator for the Reader, a PDF or the full Web still ends
+  the downloads of the pages it closes without asking.
+
+Gates: `abrir_goes_only_through_default_app_target`,
+`panel_downloads_messages_carry_ids_only`, `leave_decision_table`,
+`home_and_exit_callers_are_a_named_allowlist`,
+`program_card_answers_the_deferral`,
+`ctrl_j_is_the_downloads_command_and_nothing_else`,
+`downloads_slot_fits_or_vanishes`, `download_notice_texts` and
+`default_app_name_allowed_agrees_with_default_app_target` (neural-core);
+the CI-only `download_card_never_activates` proves on a real window that
+the card never takes the activation.

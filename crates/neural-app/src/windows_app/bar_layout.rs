@@ -180,6 +180,108 @@ impl BarColumns {
     }
 }
 
+/// Os botoes de cada coluna a seguir ao "+", pela ordem em que se desenham
+/// da esquerda para a direita. E o registo: uma feature que traga um botao
+/// por coluna (a estrela dos favoritos, o Traduzir pagina, a nota)
+/// acrescenta aqui a variante, o glifo e o alvo, e nada mais -- a
+/// geometria (`BarLayout::with_rows`), a pintura e o hit-testing percorrem
+/// `ALL`. Regra: o grupo inteiro ou cabe na faixa da coluna ou nao existe
+/// (largura 0), como o "+": nunca um botao invisivel mas clicavel por cima
+/// da IA seguinte (gate `column_buttons_fit_or_vanish`). Um botao
+/// `optional` cede antes da pilula: so entra quando, com ele, a pilula da
+/// IA fica com pelo menos `COLUMN_PILL_MIN`; sem ele os outros ficam onde
+/// estavam. Sao dois, o 文A (que o item «Traduzir página» do botao direito
+/// substitui) e a estrela dos favoritos (que o Ctrl+D substitui), e cedem
+/// um a um do fim de `ALL` para o inicio: numa faixa com lugar so para um,
+/// fica o 文A e a estrela cede (a primeira a ir e a ultima da fila, por
+/// isso nenhum botao que fica muda de sitio). A regra e deterministica: o
+/// numero de opcionais que ficam e o maior que ainda deixa a pilula com
+/// `COLUMN_PILL_MIN`, e ficam os primeiros desse numero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) enum ColumnButton {
+    Back,
+    Forward,
+    /// 文A: «Traduzir página» (`translation.rs`); outro clique devolve o
+    /// original.
+    Translate,
+    /// A estrela dos favoritos (bookmarks): ☆ ou, com a pagina da coluna
+    /// nos favoritos, ★ (a pintura escolhe pelo `BarState::bookmarked`).
+    Bookmark,
+}
+
+/// Quantos botoes tem cada coluna: o tamanho das filas de `BarLayout`.
+pub(in crate::windows_app) const COLUMN_BUTTONS: usize = ColumnButton::ALL.len();
+
+/// A pilula mais estreita (em pixeis logicos) com que um botao opcional da
+/// coluna ainda entra.
+pub(in crate::windows_app) const COLUMN_PILL_MIN: f64 = 60.0;
+
+impl ColumnButton {
+    pub(in crate::windows_app) const ALL: [Self; 4] =
+        [Self::Back, Self::Forward, Self::Translate, Self::Bookmark];
+    /// Largura logica de cada botao (a mesma do "+") e a folga entre eles.
+    /// A folga passou de 4 para 2 com o 文A (translation) e fica em 2 com a
+    /// estrela: com os quatro, os dois opcionais entram mais cedo, e a
+    /// 1024 px a pilula da IA da direita ainda existe (fica estreita).
+    pub(in crate::windows_app) const WIDTH: f64 = 26.0;
+    pub(in crate::windows_app) const GAP: f64 = 2.0;
+
+    /// Cede antes da pilula: o 文A (o «Traduzir página» do botao direito
+    /// faz o mesmo sem ele) e a estrela (o Ctrl+D faz o mesmo sem ela). Os
+    /// opcionais vem depois dos outros em `ALL` e cedem do ultimo para o
+    /// primeiro: a estrela antes do 文A.
+    pub(in crate::windows_app) fn optional(self) -> bool {
+        matches!(self, Self::Translate | Self::Bookmark)
+    }
+
+    pub(in crate::windows_app) fn glyph(self) -> &'static str {
+        match self {
+            Self::Back => "‹",
+            Self::Forward => "›",
+            Self::Translate => "文A",
+            Self::Bookmark => "☆",
+        }
+    }
+
+    /// O alvo da barra que este botao e, na coluna `column`.
+    pub(in crate::windows_app) fn hit(self, column: usize) -> BarHit {
+        match self {
+            Self::Back => BarHit::ColumnBack(column),
+            Self::Forward => BarHit::ColumnForward(column),
+            Self::Translate => BarHit::ColumnTranslate(column),
+            Self::Bookmark => BarHit::ColumnBookmark(column),
+        }
+    }
+}
+
+/// O estado da barra num instante -- o que a pintura e a dica leem alem da
+/// geometria (`BarLayout`) e das abas: o alvo debaixo do rato, se a barra
+/// esta a vista, a rolagem automatica, o arrasto em curso, a etiqueta do
+/// Pomodoro e se a janela esta maximizada. E a costura de quem pinta ou
+/// explica um botao novo (a estrela dos favoritos, o escudo, um download):
+/// acrescenta-se um campo aqui, com nome, em vez de mais um parametro
+/// posicional em `draw_comparator_bar`, em `paint_comparator_bar_with_contexts`,
+/// em `bar_tooltip_label` e em cada chamada dos testes. O `App` monta-o em
+/// `App::bar_state`; os testes montam-no a mao com `..BarState::default()`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(in crate::windows_app) struct BarState {
+    pub(in crate::windows_app) hover: Option<BarHit>,
+    pub(in crate::windows_app) visible: bool,
+    pub(in crate::windows_app) auto_scroll: bool,
+    pub(in crate::windows_app) drag: Option<DragPaint>,
+    pub(in crate::windows_app) pomodoro_label: Option<BarLabel>,
+    /// So a dica o le (Maximizar/Restaurar); a pintura dos botoes da janela
+    /// nao depende dele.
+    pub(in crate::windows_app) maximized: bool,
+    /// A pagina de cada coluna ja e um favorito: a estrela dela e ★.
+    pub(in crate::windows_app) bookmarked: [bool; COMPARATOR_COLUMNS],
+    /// A da fonte aberta ao lado.
+    pub(in crate::windows_app) split_bookmarked: bool,
+    /// Os downloads a correr (downloads-ui): a seta do canto pinta-se na cor
+    /// de destaque e a dica diz quantos e quanto falta.
+    pub(in crate::windows_app) downloads: DownloadsBadge,
+}
+
 /// Geometria em duas linhas. As fontes ficam na title bar; os provedores ficam
 /// numa segunda linha, sem disputar espaco com as abas.
 #[derive(Debug, Clone, Copy)]
@@ -189,8 +291,11 @@ pub(in crate::windows_app) struct BarLayout {
     pub(in crate::windows_app) home: UiRect,
     pub(in crate::windows_app) back: UiRect,
     pub(in crate::windows_app) forward: UiRect,
-    pub(in crate::windows_app) column_back: [UiRect; COMPARATOR_COLUMNS],
-    pub(in crate::windows_app) column_forward: [UiRect; COMPARATOR_COLUMNS],
+    /// Por coluna, os botoes a seguir ao "+", na ordem de `ColumnButton::ALL`
+    /// (‹ › 文A ☆); `column_button` le-os pelo nome. Ou o grupo inteiro cabe
+    /// na faixa da coluna ou nenhum existe (largura 0); um opcional que
+    /// cedeu tambem tem largura 0.
+    pub(in crate::windows_app) column_buttons: [[UiRect; COLUMN_BUTTONS]; COMPARATOR_COLUMNS],
     /// Por coluna: a pilula do provedor sobre a sua faixa, ou -- se estiver
     /// minimizada -- o chip compacto encostado aos controlos da direita.
     pub(in crate::windows_app) columns: [UiRect; COMPARATOR_COLUMNS],
@@ -288,8 +393,7 @@ impl BarLayout {
                 home: empty,
                 back: empty,
                 forward: empty,
-                column_back: [empty; COMPARATOR_COLUMNS],
-                column_forward: [empty; COMPARATOR_COLUMNS],
+                column_buttons: [[empty; COLUMN_BUTTONS]; COMPARATOR_COLUMNS],
                 columns: [empty; COMPARATOR_COLUMNS],
                 minimized: [false; COMPARATOR_COLUMNS],
                 add_tabs: [empty; COMPARATOR_COLUMNS],
@@ -345,8 +449,7 @@ impl BarLayout {
 
         let mut columns_rect = [empty; COMPARATOR_COLUMNS];
         let mut plus_rect = [empty; COMPARATOR_COLUMNS];
-        let mut column_back = [empty; COMPARATOR_COLUMNS];
-        let mut column_forward = [empty; COMPARATOR_COLUMNS];
+        let mut column_buttons = [[empty; COLUMN_BUTTONS]; COMPARATOR_COLUMNS];
         let mut tabs = [[empty; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS];
         let mut tab_indices = [[0usize; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS];
         let mut tab_counts = [0usize; COMPARATOR_COLUMNS];
@@ -412,10 +515,26 @@ impl BarLayout {
             // `available >= provider_width + plus_width + gap`, o que tornava o
             // `.min()` de baixo matematicamente morto e a pilula nunca encolhia.
             let available = (right - left).max(0.0);
-            // "+", ‹ e › depois da pilula: ela encolhe primeiro.
-            let nav_width = plus_width;
-            let nav_gap = 4.0 * scale;
-            let reserved_after = plus_width + gap + 2.0 * (nav_width + nav_gap);
+            // "+" e os botoes da coluna (`ColumnButton::ALL`: ‹ › 文A ☆)
+            // depois da pilula: ela encolhe primeiro.
+            let button_width = ColumnButton::WIDTH * scale;
+            let button_gap = ColumnButton::GAP * scale;
+            let slot = button_width + button_gap;
+            let optional = ColumnButton::ALL
+                .iter()
+                .filter(|button| button.optional())
+                .count();
+            let required_after = plus_width + gap + (COLUMN_BUTTONS - optional) as f64 * slot;
+            // Os opcionais (o 文A e a estrela) so entram com a pilula ainda
+            // legivel, um a um pela ordem de `ALL`: ficam os primeiros
+            // `kept_optional`, e a estrela, a ultima, e a primeira a ceder.
+            let kept_optional = (0..=optional)
+                .rev()
+                .find(|kept| {
+                    available - required_after - *kept as f64 * slot >= COLUMN_PILL_MIN * scale
+                })
+                .unwrap_or(0);
+            let reserved_after = required_after + kept_optional as f64 * slot;
             let pill = provider_width.min((available - reserved_after).max(0.0));
             columns_rect[span.index] = UiRect {
                 x: left,
@@ -437,21 +556,37 @@ impl BarLayout {
                 },
                 height: row_h - 4.0 * scale,
             };
-            // ‹ e › desta IA. Tal como o "+", ou cabem na faixa ou nao existem.
-            let back_x = plus_x + plus_width + nav_gap;
-            let forward_x = back_x + nav_width + nav_gap;
-            let fits = forward_x + nav_width <= right;
-            column_back[span.index] = UiRect {
-                x: back_x,
-                y: row_y + 2.0 * scale,
-                width: if fits { nav_width } else { 0.0 },
-                height: row_h - 4.0 * scale,
-            };
-            column_forward[span.index] = UiRect {
-                x: forward_x,
-                width: if fits { nav_width } else { 0.0 },
-                ..column_back[span.index]
-            };
+            // Os botoes desta IA, um a seguir ao outro depois do "+", pela
+            // ordem do registo (dos opcionais, so os `kept_optional`
+            // primeiros). Tal como o "+", ou o grupo cabe na faixa ou nao
+            // existe: nunca um botao invisivel mas clicavel por cima da IA
+            // seguinte.
+            let mut x = plus_x + plus_width;
+            let mut buttons = [empty; COLUMN_BUTTONS];
+            let mut optional_seen = 0;
+            for (rect, button) in buttons.iter_mut().zip(ColumnButton::ALL) {
+                if button.optional() {
+                    optional_seen += 1;
+                    if optional_seen > kept_optional {
+                        continue;
+                    }
+                }
+                x += button_gap;
+                *rect = UiRect {
+                    x,
+                    y: row_y + 2.0 * scale,
+                    width: button_width,
+                    height: row_h - 4.0 * scale,
+                };
+                x += button_width;
+            }
+            let fits = x <= right;
+            if !fits {
+                for rect in &mut buttons {
+                    rect.width = 0.0;
+                }
+            }
+            column_buttons[span.index] = buttons;
         }
 
         // Colunas minimizadas: nao tem faixa, mas nao podem desaparecer da
@@ -579,8 +714,7 @@ impl BarLayout {
             home,
             back,
             forward,
-            column_back,
-            column_forward,
+            column_buttons,
             columns: columns_rect,
             minimized: columns.minimized,
             add_tabs: plus_rect,
@@ -600,6 +734,16 @@ impl BarLayout {
             window_maximize,
             window_close,
         }
+    }
+
+    /// O rectangulo do botao `button` da coluna `column` (largura 0: nao
+    /// existe nesta largura de janela).
+    pub(in crate::windows_app) fn column_button(
+        &self,
+        column: usize,
+        button: ColumnButton,
+    ) -> UiRect {
+        self.column_buttons[column][button as usize]
     }
 
     pub(in crate::windows_app) fn hit(&self, x: f64, y: f64) -> Option<BarHit> {
@@ -653,11 +797,10 @@ impl BarLayout {
             return Some(BarHit::Forward);
         }
         for index in 0..self.columns_len {
-            if self.column_back[index].contains(x, y) {
-                return Some(BarHit::ColumnBack(index));
-            }
-            if self.column_forward[index].contains(x, y) {
-                return Some(BarHit::ColumnForward(index));
+            for button in ColumnButton::ALL {
+                if self.column_button(index, button).contains(x, y) {
+                    return Some(button.hit(index));
+                }
             }
         }
         for index in 0..self.columns_len {
@@ -959,8 +1102,10 @@ pub(in crate::windows_app) unsafe fn apply_omnibox_interactivity(edit: HWND, sur
 #[derive(Debug, Clone, Copy)]
 pub(in crate::windows_app) struct RightControls {
     pub(in crate::windows_app) private: UiRect,
-    /// Videochamada, WhatsApp, YouTube e Gmail, a esquerda do Privado.
+    /// Videochamada, WhatsApp, YouTube e Gmail, a esquerda dos downloads.
     pub(in crate::windows_app) services: [UiRect; 4],
+    /// A seta dos downloads (downloads-ui), logo a esquerda do Privado.
+    pub(in crate::windows_app) downloads: UiRect,
     /// Gemini Live, logo a esquerda dos servicos: o inicio do canto.
     pub(in crate::windows_app) live: UiRect,
     /// Pomodoro, Notas e Respiracao (ordem de `Tool::ALL`) na linha de CIMA,
@@ -973,6 +1118,8 @@ pub(in crate::windows_app) struct RightControls {
     pub(in crate::windows_app) split: Option<(UiRect, UiRect, UiRect)>,
     /// ‹ e › da fonte da gaveta, a esquerda do rotulo.
     pub(in crate::windows_app) split_nav: Option<(UiRect, UiRect)>,
+    /// A estrela dos favoritos da fonte da gaveta, entre o › e o rotulo.
+    pub(in crate::windows_app) split_bookmark: Option<UiRect>,
 }
 
 /// Onde acaba o botao Home da segunda linha (7 + 72 px) mais a folga de 8:
@@ -981,6 +1128,9 @@ pub(in crate::windows_app) const RIGHT_CONTROLS_MIN_LEFT: f64 = 87.0;
 /// Rotulo da gaveta ("Fonte · ChatGPT") inteiro, e o minimo que ainda se le.
 pub(in crate::windows_app) const SPLIT_LABEL_WIDTH: f64 = 150.0;
 pub(in crate::windows_app) const SPLIT_LABEL_MIN_WIDTH: f64 = 60.0;
+/// A estrela dos favoritos da fonte (26 px) e a folga dela (4 px), em
+/// pixeis logicos.
+pub(in crate::windows_app) const SPLIT_STAR_ROOM: f64 = 26.0 + 4.0;
 
 /// Quanto cede, numa janela estreita, o rotulo da gaveta (so informa):
 /// encolhe ate desaparecer abaixo do minimo. Em pixeis logicos; `room` e o
@@ -1014,6 +1164,19 @@ pub(in crate::windows_app) fn title_tools_left(
     reserved[0].x.min(actual[0].x)
 }
 
+/// A seta dos downloads (downloads-ui) cabe ou nao existe: so a partir
+/// desta largura logica da janela. Abaixo, os 34 px dela no canto tiravam a
+/// terceira IA a pilula, o "+" e os ‹ › (gate
+/// `the_tools_never_take_room_from_the_ai_columns`, a 1024 px); sem ela, o
+/// Ctrl+J continua a abrir a seccao Downloads.
+pub(in crate::windows_app) const DOWNLOADS_SLOT_MIN_WIDTH: f64 = 1100.0;
+
+/// A seta dos downloads cabe no canto a esta largura (`client_width` em
+/// pixeis fisicos).
+pub(in crate::windows_app) fn downloads_slot_fits(client_width: f64, scale: f64) -> bool {
+    client_width / scale.max(1.0) >= DOWNLOADS_SLOT_MIN_WIDTH
+}
+
 /// Geometria dos controlos encostados a direita. A mesma conta estava escrita
 /// tres vezes -- no desenho, no hit-testing e agora nos chips -- e as copias
 /// ja tinham comecado a divergir; aqui ela e uma so.
@@ -1032,16 +1195,26 @@ pub(in crate::windows_app) fn right_controls(
     let icon_gap = 4.0 * scale;
 
     // Tudo o que tem largura fixa, em pixeis logicos: a gaveta sem o rotulo
-    // (fechar, expandir, ‹ e › e as folgas), o Privado, os quatro servicos e
-    // o Gemini Live. O resto e do rotulo da gaveta.
+    // (fechar, expandir, ‹ e › e as folgas), o Privado, os downloads, os
+    // quatro servicos e o Gemini Live. O resto e da estrela dos favoritos
+    // da fonte e do rotulo da gaveta, por esta ordem: a estrela cabe
+    // inteira ou nao existe (como os botoes das colunas), e o rotulo, que
+    // so informa, fica com o que sobrar.
     let logical = |value: f64| value / scale;
     let split_fixed = if split_active {
         30.0 + 5.0 + 30.0 + 5.0 + 6.0 + 26.0 + 4.0 + 26.0 + 6.0
     } else {
         0.0
     };
-    let icons = logical(icon) * 6.0 + logical(icon_gap) * 5.0;
-    let room = logical(client_width) - 8.0 - split_fixed - icons - RIGHT_CONTROLS_MIN_LEFT;
+    // A seta dos downloads so conta quando cabe (`downloads_slot_fits`).
+    let downloads_fits = downloads_slot_fits(client_width, scale);
+    let slots = RIGHT_CLUSTER.len() as f64 - if downloads_fits { 0.0 } else { 1.0 };
+    let icons = logical(icon) * slots + logical(icon_gap) * (slots - 1.0);
+    let mut room = logical(client_width) - 8.0 - split_fixed - icons - RIGHT_CONTROLS_MIN_LEFT;
+    let split_star = split_active && room >= SPLIT_STAR_ROOM;
+    if split_star {
+        room -= SPLIT_STAR_ROOM;
+    }
     let split_label_w = split_label_width(room, split_active);
 
     let split = split_active.then(|| {
@@ -1066,10 +1239,21 @@ pub(in crate::windows_app) fn right_controls(
         (label, expand, close)
     });
 
+    // A estrela dos favoritos encostada ao rotulo (quando cabe), e o ‹ › a
+    // esquerda dela -- ou do rotulo, sem ela.
+    let size = row_h - 4.0 * scale;
+    let split_bookmark = split.filter(|_| split_star).map(|(label, _, _)| UiRect {
+        x: label.x - 6.0 * scale - size,
+        y: row_y + 2.0 * scale,
+        width: size,
+        height: size,
+    });
     let split_nav = split.map(|(label, _, _)| {
-        let size = row_h - 4.0 * scale;
         let forward = UiRect {
-            x: label.x - 6.0 * scale - size,
+            x: match split_bookmark {
+                Some(star) => star.x - 4.0 * scale - size,
+                None => label.x - 6.0 * scale - size,
+            },
             y: row_y + 2.0 * scale,
             width: size,
             height: size,
@@ -1084,16 +1268,33 @@ pub(in crate::windows_app) fn right_controls(
         Some((back, _)) => back.x - 6.0 * scale,
         None => client_width - margin,
     };
-    // Privado a direita e, a esquerda dele, videochamada, WhatsApp, YouTube,
-    // Gmail e o Gemini Live. As ferramentas ficam na linha de cima.
+    // Privado a direita e, a esquerda dele, os downloads (quando cabem:
+    // senao sem largura, no sitio do Privado), videochamada, WhatsApp,
+    // YouTube, Gmail e o Gemini Live. As ferramentas ficam na linha de cima.
     let private = UiRect {
         x: right - icon,
         y: row_y,
         width: icon,
         height: icon,
     };
+    let downloads = if downloads_fits {
+        UiRect {
+            x: private.x - (icon + icon_gap),
+            ..private
+        }
+    } else {
+        UiRect {
+            width: 0.0,
+            ..private
+        }
+    };
+    let services_right = if downloads_fits {
+        downloads.x
+    } else {
+        private.x
+    };
     let services: [UiRect; 4] = std::array::from_fn(|index| UiRect {
-        x: private.x - (4 - index) as f64 * (icon + icon_gap),
+        x: services_right - (4 - index) as f64 * (icon + icon_gap),
         y: row_y,
         width: icon,
         height: icon,
@@ -1109,12 +1310,67 @@ pub(in crate::windows_app) fn right_controls(
     RightControls {
         private,
         services,
+        downloads,
         live,
         tools,
         split,
         split_nav,
+        split_bookmark,
     }
 }
+
+/// Um icone do canto direito da segunda linha: o alvo que e e o icone
+/// (`ICON_SLOT_*`) que mostra.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) struct ClusterSlot {
+    pub(in crate::windows_app) hit: BarHit,
+    pub(in crate::windows_app) icon: usize,
+}
+
+/// O canto direito da segunda linha, da esquerda para a direita: o Gemini
+/// Live, os quatro servicos, os downloads (downloads-ui) e o Privado. E o
+/// registo do grupo: a pintura e o hit-testing percorrem esta lista com
+/// `RightControls::cluster`, e `right_controls` da a cada lugar a sua
+/// posicao. Uma feature com um icone no canto (⚖ consenso, ⬇ downloads,
+/// escudo) e uma linha aqui, um
+/// `ICON_SLOT_*` em `icons.rs` e o seu lugar em `right_controls`. Os lugares
+/// de 3211b0c existem sempre; o gate
+/// `right_cluster_slots_never_overlap_and_hit_back` prova a ordem, que os
+/// lugares nao se sobrepoem e que cada um volta a si no hit-testing. Um
+/// item que queira a regra "cabe ou nao existe" acrescenta-a e prende-a num
+/// gate: a seta dos downloads so existe a partir de
+/// `DOWNLOADS_SLOT_MIN_WIDTH` (sem ela, largura 0: nao se pinta nem se
+/// clica).
+pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 7] = [
+    ClusterSlot {
+        hit: BarHit::GeminiLive,
+        icon: ICON_SLOT_LIVE,
+    },
+    ClusterSlot {
+        hit: BarHit::Service(Service::Meet),
+        icon: ICON_SLOT_VIDEO,
+    },
+    ClusterSlot {
+        hit: BarHit::Service(Service::WhatsApp),
+        icon: ICON_SLOT_WHATSAPP,
+    },
+    ClusterSlot {
+        hit: BarHit::Service(Service::YouTube),
+        icon: ICON_SLOT_YOUTUBE,
+    },
+    ClusterSlot {
+        hit: BarHit::GmailToggle,
+        icon: ICON_SLOT_MAIL,
+    },
+    ClusterSlot {
+        hit: BarHit::Downloads,
+        icon: ICON_SLOT_DOWNLOADS,
+    },
+    ClusterSlot {
+        hit: BarHit::Private,
+        icon: ICON_SLOT_INCOGNITO,
+    },
+];
 
 impl RightControls {
     /// Onde comecam os controlos da direita na segunda linha: as colunas
@@ -1122,15 +1378,20 @@ impl RightControls {
     pub(in crate::windows_app) fn leftmost(&self) -> f64 {
         self.live.x
     }
-}
 
-/// O que cada icone do canto direito faz, na ordem de `RightControls::services`.
-pub(in crate::windows_app) const SERVICE_BUTTON_HITS: [BarHit; 4] = [
-    BarHit::Service(Service::Meet),
-    BarHit::Service(Service::WhatsApp),
-    BarHit::Service(Service::YouTube),
-    BarHit::GmailToggle,
-];
+    /// Os rectangulos do canto, na ordem de `RIGHT_CLUSTER`.
+    pub(in crate::windows_app) fn cluster(&self) -> [UiRect; RIGHT_CLUSTER.len()] {
+        [
+            self.live,
+            self.services[0],
+            self.services[1],
+            self.services[2],
+            self.services[3],
+            self.downloads,
+            self.private,
+        ]
+    }
+}
 
 /// O botao da barra que abre `service`: um dos icones dos servicos ou, para
 /// a Respiracao (uma ferramenta), o botao dela na linha do titulo. E nele que
@@ -1146,12 +1407,11 @@ pub(in crate::windows_app) fn service_icon_rect(
             .find(|(tool, _)| **tool == Tool::Breath)
             .map(|(_, rect)| rect);
     }
-    controls
-        .services
+    RIGHT_CLUSTER
         .iter()
-        .zip(SERVICE_BUTTON_HITS)
-        .find(|(_, hit)| *hit == BarHit::Service(service))
-        .map(|(rect, _)| *rect)
+        .zip(controls.cluster())
+        .find(|(slot, _)| slot.hit == BarHit::Service(service))
+        .map(|(_, rect)| rect)
 }
 
 pub(in crate::windows_app) fn right_controls_hit(
@@ -1164,16 +1424,12 @@ pub(in crate::windows_app) fn right_controls_hit(
             return Some(BarHit::Tool(tool));
         }
     }
-    if controls.live.contains(x, y) {
-        return Some(BarHit::GeminiLive);
-    }
-    for (rect, hit) in controls.services.iter().zip(SERVICE_BUTTON_HITS) {
+    // O canto, pela ordem do registo: Gemini Live, os servicos, os
+    // downloads, o Privado.
+    for (slot, rect) in RIGHT_CLUSTER.iter().zip(controls.cluster()) {
         if rect.contains(x, y) {
-            return Some(hit);
+            return Some(slot.hit);
         }
-    }
-    if controls.private.contains(x, y) {
-        return Some(BarHit::Private);
     }
     if let Some((_label, expand, close)) = controls.split {
         if close.contains(x, y) {
@@ -1182,6 +1438,12 @@ pub(in crate::windows_app) fn right_controls_hit(
         if expand.contains(x, y) {
             return Some(BarHit::SplitExpand);
         }
+    }
+    if controls
+        .split_bookmark
+        .is_some_and(|star| star.contains(x, y))
+    {
+        return Some(BarHit::SplitBookmark);
     }
     None
 }

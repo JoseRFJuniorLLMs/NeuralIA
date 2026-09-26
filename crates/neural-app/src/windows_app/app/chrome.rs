@@ -544,11 +544,13 @@ impl App {
         hover_tooltip(std::ptr::null_mut(), "");
         let SplashFrame {
             text,
-            asks,
+            question,
             seconds,
             token,
         } = frame;
-        SPLASH_ASKS.store(asks, Ordering::SeqCst);
+        if let Ok(mut slot) = SPLASH_QUESTION.lock() {
+            *slot = question;
+        }
         if let Ok(mut slot) = SPLASH_TEXT.lock() {
             *slot = text;
         }
@@ -646,7 +648,9 @@ impl App {
         else {
             return;
         };
-        SPLASH_ASKS.store(false, Ordering::SeqCst);
+        if let Ok(mut slot) = SPLASH_QUESTION.lock() {
+            *slot = None;
+        }
         // So o fim do quadro da PROPRIA pergunta e um "nao" (ver
         // `SplashBoard`); um aviso que a substituiu nao responde nada.
         if question_expired {
@@ -1255,15 +1259,6 @@ impl App {
         }
     }
 
-    pub(in crate::windows_app) fn choose_theme(&mut self, choice: ThemeChoice) {
-        choice.apply();
-        if let Err(error) = choice.save(&self.config.data_dir.join("theme")) {
-            self.show_native_error(format!("Não foi possível guardar o tema: {error}"));
-        }
-        self.refresh_theme();
-        self.show_splash(format!("{} ativado.", choice.label()), 2);
-    }
-
     /// A dica do alvo `hit`, com o nome da IA, o endereco da aba ou o estado
     /// do grupo que o clique vai usar.
     fn bar_tooltip_text(&self, hit: BarHit, owner: HWND) -> Option<String> {
@@ -1280,6 +1275,8 @@ impl App {
             | BarHit::AddTab(index)
             | BarHit::ColumnBack(index)
             | BarHit::ColumnForward(index)
+            | BarHit::ColumnTranslate(index)
+            | BarHit::ColumnBookmark(index)
             | BarHit::TabOverflow(index) => Some(index),
             BarHit::ContextTab { source_index, .. }
             | BarHit::CloseTab { source_index, .. }
@@ -1321,15 +1318,36 @@ impl App {
             }
             _ => None,
         };
-        let maximized = unsafe { IsZoomed(owner) != 0 };
+        // O "maximizada" da dica e o da janela dona dela, como sempre.
+        let state = BarState {
+            maximized: unsafe { IsZoomed(owner) != 0 },
+            ..self.bar_state()
+        };
         bar_hint(
             hit,
             &self.pomodoro,
             Instant::now(),
+            &state,
             provider,
-            maximized,
             tab_url,
             group,
         )
+    }
+
+    /// O estado da barra agora (`BarState`): o que a pintura
+    /// (`draw_comparator_bar`) e a dica (`bar_tooltip_text`) leem alem da
+    /// geometria. Uma feature nova preenche aqui o campo que acrescentou.
+    pub(in crate::windows_app) fn bar_state(&self) -> BarState {
+        BarState {
+            hover: self.bar_hover,
+            visible: self.bar_visible(),
+            auto_scroll: self.auto_scroll.get(),
+            drag: self.drag_paint(),
+            pomodoro_label: self.pomodoro_bar_label(),
+            maximized: self.window.as_ref().is_some_and(Window::is_maximized),
+            bookmarked: self.bookmarks.column_stars(),
+            split_bookmarked: self.bookmarks.split_star(),
+            downloads: downloads_badge(&self.downloads.manager),
+        }
     }
 }

@@ -28,9 +28,25 @@ mod tab_session;
 // Windows: correm tambem no CI Linux.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod read_aloud;
+// Spike do AcceleratorKeyPressed (infra-accel-spike, plano 2.3): so nos
+// testes e no build de CI com `--features accel-spike`. O exe publicado e
+// compilado sem a feature e nao o tem (scripts/test-accel-spike-marker.ps1).
+#[cfg(any(test, feature = "accel-spike"))]
+mod accel_spike;
 // Gemini Live: origem propria, canal fechado e chave com DPAPI (Windows).
 #[cfg(target_os = "windows")]
 mod gemini_live;
+// O cofre das chaves (infra-settings-keys, plano 2.3): a DPAPI com entropia
+// por uso, os slots, a `ApiKey` e a redacao do log (Windows). Os
+// consumidores (traducao, juiz, BYOM, conectores) chegam nas ondas
+// seguintes; ate la parte dele so corre nos testes.
+#[cfg(target_os = "windows")]
+#[cfg_attr(not(test), allow(dead_code))]
+mod secrets;
+// As lojas da pasta de dados e o tipo de cada uma: portatil, testado tambem
+// no runner Linux.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod stores;
 #[cfg(target_os = "windows")]
 mod windows_app;
 
@@ -38,6 +54,26 @@ mod windows_app;
 // disco), sem Win32 -- testavel em qualquer plataforma.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod pomodoro_ui;
+
+// A saida da IA (infra-egress, plano 2.3): o portao que decide se um dado
+// sai para um modelo (consentimento, segundo plano, modo privado, limite
+// mensal), as definicoes e o consumo em `ai/`, e o worker que so nasce no
+// primeiro trabalho. Portateis, testados tambem no Linux. A Traducao
+// (`windows_app/translation.rs`) e a primeira feature a pedir o portao
+// (`App::egress_gate`); o que so as proximas usam (segundo plano, revogacao)
+// ainda so corre nos testes, por isso o dead_code so e exigido nos testes do
+// Windows, que os usam todos.
+#[cfg_attr(not(all(test, target_os = "windows")), allow(dead_code))]
+mod ai_settings;
+#[cfg_attr(not(all(test, target_os = "windows")), allow(dead_code))]
+mod egress;
+#[cfg_attr(not(all(test, target_os = "windows")), allow(dead_code))]
+mod lazy_worker;
+
+// Centro de avisos (infra-notify-popups): a fila, a entrega pelo Foco e pela
+// privacidade e o unico aviso do canto, sem Win32 -- testado tambem no Linux.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod notify;
 
 #[cfg(target_os = "windows")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {

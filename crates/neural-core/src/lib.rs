@@ -2,15 +2,22 @@
 // debug-assertions): o pop do Reader ja duplicou texto por isso.
 #![deny(clippy::debug_assert_with_mut_call)]
 
+pub mod adblock;
 pub mod agent_protocol;
 pub mod agent_security;
+pub mod ai_policy;
+pub mod bookmarks;
 pub mod config;
+pub mod domains;
+pub mod downloads;
 pub mod epub;
 pub mod error;
 pub mod file_risk;
 pub mod history;
 pub mod intent;
+pub mod json_store;
 pub mod library;
+pub mod llm;
 pub mod local_intelligence;
 pub mod memory;
 pub mod pomodoro;
@@ -22,6 +29,8 @@ pub mod search;
 pub mod security;
 pub mod semantic_timeline;
 pub mod tissue;
+pub mod translate;
+pub mod untrusted;
 pub mod zettel;
 
 #[cfg(test)]
@@ -50,7 +59,7 @@ pub use search::{
     is_ai_provider_host, is_login_host, login_hosts, mistral_search_url, perplexity_search_url,
 };
 pub use security::{
-    is_forbidden_ip, is_local_network_target, validate_redirect_target, validate_web_url,
+    Locality, is_forbidden_ip, is_local_network_target, validate_redirect_target, validate_web_url,
 };
 
 pub use agent_security::{

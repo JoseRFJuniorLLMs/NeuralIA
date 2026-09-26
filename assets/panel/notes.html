@@ -1,0 +1,20 @@
+<div class="view" id="view-notes" hidden>
+<div id="notes-msg" role="status"></div>
+<div class="view" id="notes-browse">
+<div class="row"><input id="nq" class="field" placeholder="Buscar nas notas" autocomplete="off" spellcheck="false"><button id="note-new" class="btn primary">Nova nota</button></div>
+<main><div id="notes-list"></div></main>
+</div>
+<div class="view" id="notes-edit" hidden>
+<div class="row"><button id="note-back" class="btn" title="Voltar à lista">← Notas</button><button id="note-save" class="btn primary" title="Salvar (Ctrl+S)">Salvar</button><button id="note-delete" class="btn danger">Excluir</button></div>
+<div id="note-editor">
+<div id="note-confirm" class="confirm" hidden><span>Excluir esta nota? Ela vai para a lixeira (.trash) da pasta das notas.</span><button id="note-confirm-yes" class="btn danger">Excluir</button><button id="note-confirm-no" class="btn">Cancelar</button></div>
+<input id="note-title" class="field" placeholder="Título" autocomplete="off">
+<textarea id="note-body" class="field" placeholder="Escreva em Markdown. Ligue outra nota com [[id]] ou [[id|nome]]."></textarea>
+<input id="note-tags" class="field" placeholder="Tags, separadas por vírgula" autocomplete="off" spellcheck="false">
+<div id="note-source-row" class="meta" hidden><span>Fonte: </span><button id="note-source" class="link"></button></div>
+<div id="note-meta" class="meta"></div>
+<section id="note-preview-box" hidden><h2>Pré-visualização</h2><div id="note-preview"></div></section>
+<section id="note-backlinks-box" hidden><h2>Notas que ligam para esta</h2><div id="note-backlinks"></div></section>
+</div>
+</div>
+</div>

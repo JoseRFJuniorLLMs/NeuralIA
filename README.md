@@ -6,7 +6,7 @@
 
 ## What NeuralIA is
 
-NeuralIA **v2.2.0** is an AI-first, reader-first, system-WebView information client written in Rust.
+NeuralIA **v2.3.0** is an AI-first, reader-first, system-WebView information client written in Rust.
 
 It deliberately refuses the usual browser arms race. It does not ship Chromium, does not implement its own JavaScript engine, does not carry a local LLM, and does not recreate a full browser tab strip just to prove that rectangles can multiply.
 
@@ -167,24 +167,27 @@ before the site sees the key. They work on every surface unless noted.
 | `Backspace` · `Alt+←` · `Alt+→` | page history back / forward |
 | `Ctrl+L` | return to the omnibox with its text selected |
 | `Ctrl+T` · `Ctrl+W` | Home · back |
-| `Ctrl+R` · `F5` | reload |
+| `Ctrl+Shift+R` · `F5` | reload |
 | `Ctrl` `+` / `-` / `0` | zoom, on Chrome's ladder (25%–400%), inherited by new pages |
 | `Ctrl+F` | in-page find bar (Enter / Shift+Enter / Esc) |
 | `Ctrl+P` | print the page you are looking at |
 | `Ctrl+H` | semantic local memory search (`memory:`) |
+| `Ctrl+D` | add the page you are looking at (a comparator column, the side-by-side source, the full Web, Reader or PDF) to Favoritos -- a native shortcut, never sent through the page; on Home, in a side panel or in Livros it opens the Favoritos tab of the side panel |
 | `Ctrl+Shift+Z` | note from the selected text, with the page as its source, opened in the Notes tab of the side panel (inside a text field it stays redo; refused in the private split); on Home, a new blank note |
 | `Ctrl+Shift+Delete` | clear local history (the WebView2 profile is untouched) |
+| `Ctrl+J` | Downloads: the side panel's Downloads section (again, closes it); native, so it also works in Livros |
 | `F12` · `Ctrl+Shift+I/J/C` | Chromium DevTools |
 | `Ctrl+U` | view page source |
 | `F11` | fullscreen for the current comparator column |
-| `F8` | auto-scroll on / off |
+| `Ctrl+R` · `F8` | auto-scroll on / off |
 | `1` `2` `3` · `0` | expand a comparator column · restore three columns |
 
 `Backspace` and the digits are ignored while typing in a field; `Ctrl` combinations are not.
 
 **Exception: Livros (EPUB).** The book library and the EPUB reader do not receive
 this keymap, so NeuralIA's own shortcuts (for example `Ctrl+H`, `Ctrl+Shift+Z`,
-`Ctrl+Shift+Delete`, `Ctrl+L`, `Ctrl+T` · `Ctrl+W` and `F8`) do nothing there.
+`Ctrl+Shift+Delete`, `Ctrl+L`, `Ctrl+T` · `Ctrl+W` and `F8`) do nothing there;
+the native `Ctrl+D` opens Favoritos and the native `Ctrl+J` the Downloads section.
 Inside Livros, `Ctrl+O` adds books, `Ctrl+F` searches (the library, or the open
 book) and `Esc` goes back (reader → library → Home); leave with `Esc` to reach the
 other tools.

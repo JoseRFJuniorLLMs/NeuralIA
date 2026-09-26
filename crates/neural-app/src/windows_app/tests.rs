@@ -1,5 +1,5 @@
 use super::*;
-use crate::gemini_live::{LiveAction, live_page_url, live_panel_navigation};
+use crate::gemini_live::{LiveAction, live_page_url, live_panel_allows_navigation};
 use crate::panel_chrome::panel_width_from_drag;
 use std::ffi::OsString;
 use windows_sys::Win32::Graphics::Gdi::GetDIBits;
@@ -851,6 +851,7 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
         BarHit::Forward,
         BarHit::ColumnBack(1),
         BarHit::ColumnForward(1),
+        BarHit::ColumnTranslate(1),
         BarHit::Column(1),
         BarHit::AddTab(1),
         BarHit::ContextTab {
@@ -875,7 +876,13 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
         BarHit::WindowMaximize,
         BarHit::WindowClose,
     ] {
-        let label = bar_tooltip_label(hit, "ChatGPT", false, Some(url), Some(("Pesquisa", true)));
+        let label = bar_tooltip_label(
+            hit,
+            &BarState::default(),
+            "ChatGPT",
+            Some(url),
+            Some(("Pesquisa", true)),
+        );
         assert!(
             label.as_deref().is_some_and(|text| !text.trim().is_empty()),
             "{hit:?} ficou sem dica"
@@ -884,8 +891,11 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
     let label = |hit, maximized| {
         bar_tooltip_label(
             hit,
+            &BarState {
+                maximized,
+                ..BarState::default()
+            },
             "ChatGPT",
-            maximized,
             Some(url),
             Some(("Pesquisa", true)),
         )
@@ -893,6 +903,11 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
     assert_eq!(
         label(BarHit::AddTab(1), false).as_deref(),
         Some("Nova pergunta ao ChatGPT")
+    );
+    // O 文A diz «Traduzir página» -- nao o «Traduzir» da barra de selecao.
+    assert_eq!(
+        label(BarHit::ColumnTranslate(1), false).as_deref(),
+        Some("Traduzir página do ChatGPT para o português (outro clique: o original)")
     );
     assert_eq!(
         label(BarHit::WindowMaximize, false).as_deref(),
@@ -1112,6 +1127,268 @@ fn side_panel_messages_are_a_closed_list_with_limits() {
     assert_eq!(parse_panel_message(&huge), None, "mensagem acima de 4 KiB");
 }
 
+/// Gate (critico: mensagens de uma pagina): o delegador do canal do painel
+/// entrega cada acao a secao do prefixo dela, e so a ela; um prefixo que
+/// nenhuma secao reclamou, um campo a mais nos `args` e um corpo acima do
+/// tecto da secao morrem no delegador, sem chegar a parser nenhum.
+#[test]
+fn panel_messages_delegate_by_prefix_and_keep_caps() {
+    // Cada prefixo tem UMA secao, e as secoes nao repetem prefixos entre si.
+    let mut prefixes: Vec<&str> = PANEL_SECTIONS
+        .iter()
+        .flat_map(|section| section.prefixes.iter().copied())
+        .collect();
+    let total = prefixes.len();
+    prefixes.sort_unstable();
+    prefixes.dedup();
+    assert_eq!(prefixes.len(), total, "prefixo repetido entre secoes");
+    assert!(
+        PANEL_SECTIONS
+            .iter()
+            .all(|section| !section.prefixes.is_empty())
+    );
+    assert!(PANEL_CORE.prefixes.is_empty());
+    let notes = panel_section_of("note-save").expect("secao das notas");
+    assert_eq!(notes.prefixes, &["note", "notes"]);
+    assert!(std::ptr::eq(panel_section_of("notes-list").unwrap(), notes));
+    assert!(std::ptr::eq(
+        panel_section_of("search").unwrap(),
+        &PANEL_CORE
+    ));
+    assert!(std::ptr::eq(
+        panel_section_of("ready").unwrap(),
+        &PANEL_CORE
+    ));
+
+    // Prefixo que nenhuma secao reclamou: morre no delegador, mesmo com o
+    // corpo perfeito. Sem `-` a acao e do nucleo, que tambem a recusa.
+    for (action, body) in [
+        ("data-pick", r#"{"action":"data-pick","args":{}}"#),
+        ("pomodoro-start", r#"{"action":"pomodoro-start","args":{}}"#),
+        ("-search", r#"{"action":"-search","args":{"query":"x"}}"#),
+    ] {
+        assert!(panel_section_of(action).is_none(), "{action} tem secao?");
+        assert_eq!(parse_panel_message(body), None, "{body}");
+    }
+    assert_eq!(
+        parse_panel_message(r#"{"action":"note","args":{"id":"202609231212"}}"#),
+        None,
+        "sem prefixo, 'note' e do nucleo, que nao o conhece"
+    );
+
+    // Uma chave a mais nos args -- em qualquer secao -- recusa o pedido; o
+    // mesmo pedido sem ela passa (a recusa e so da chave).
+    for (with_extra, clean) in [
+        (
+            r#"{"action":"search","args":{"query":"x","junk":1}}"#,
+            r#"{"action":"search","args":{"query":"x"}}"#,
+        ),
+        (
+            r#"{"action":"open","args":{"input":"https://exemplo.pt","junk":1}}"#,
+            r#"{"action":"open","args":{"input":"https://exemplo.pt"}}"#,
+        ),
+        (
+            r#"{"action":"ready","args":{"junk":1}}"#,
+            r#"{"action":"ready","args":{}}"#,
+        ),
+        (
+            r#"{"action":"notes-search","args":{"query":"x","junk":1}}"#,
+            r#"{"action":"notes-search","args":{"query":"x"}}"#,
+        ),
+        (
+            r#"{"action":"note-open","args":{"id":"202609231212","junk":1}}"#,
+            r#"{"action":"note-open","args":{"id":"202609231212"}}"#,
+        ),
+        (
+            r#"{"action":"notes-list","args":{"junk":1}}"#,
+            r#"{"action":"notes-list","args":{}}"#,
+        ),
+    ] {
+        assert_eq!(parse_panel_message(with_extra), None, "{with_extra}");
+        assert!(parse_panel_message(clean).is_some(), "{clean}");
+    }
+    // Os args que faltam so passam a quem nao pede chave nenhuma.
+    assert_eq!(
+        parse_panel_message(r#"{"action":"ready"}"#),
+        Some(PanelMessage::Ready)
+    );
+    assert_eq!(parse_panel_message(r#"{"action":"search"}"#), None);
+    assert_eq!(parse_panel_message(r#"{"action":"note-open"}"#), None);
+    // Um `args` presente que nao e objecto (`null`, texto, numero) recusa
+    // ate quem nao pede chave nenhuma: so a AUSENCIA vale como vazio. (Ate
+    // e930dac o `ready` e o `close` ignoravam os args; a pagina que embarca
+    // manda sempre um objecto -- `args || {}` em `core.js`.)
+    for body in [
+        r#"{"action":"ready","args":null}"#,
+        r#"{"action":"close","args":"x"}"#,
+        r#"{"action":"notes-list","args":1}"#,
+        r#"{"action":"search","args":null}"#,
+    ] {
+        assert_eq!(parse_panel_message(body), None, "{body}");
+    }
+
+    // O tecto: 4 KiB para tudo, salvo o note-save e o note-draft, que levam
+    // o corpo de uma nota e param em NOTE_SAVE_MESSAGE_MAX_BYTES -- o
+    // delegador prende ambos ANTES de entregar a secao.
+    let pad = "x".repeat(PANEL_MESSAGE_MAX_BYTES);
+    let over_4k = |action: &str, args: &str| {
+        format!(r#"{{"action":"{action}","args":{args},"pad":"{pad}"}}"#)
+    };
+    let search = over_4k("search", r#"{"query":"x"}"#);
+    let notes_list = over_4k("notes-list", "{}");
+    assert!(search.len() > PANEL_MESSAGE_MAX_BYTES && notes_list.len() > PANEL_MESSAGE_MAX_BYTES);
+    assert_eq!(parse_panel_message(&search), None, "search acima de 4 KiB");
+    assert_eq!(
+        parse_panel_message(&notes_list),
+        None,
+        "notes-list acima de 4 KiB"
+    );
+    assert_eq!(
+        (PANEL_CORE.max_bytes)("search"),
+        PANEL_MESSAGE_MAX_BYTES,
+        "o nucleo fica nos 4 KiB"
+    );
+    assert_eq!((notes.max_bytes)("notes-list"), PANEL_MESSAGE_MAX_BYTES);
+    assert_eq!((notes.max_bytes)("note-save"), NOTE_SAVE_MESSAGE_MAX_BYTES);
+    assert_eq!((notes.max_bytes)("note-draft"), NOTE_SAVE_MESSAGE_MAX_BYTES);
+    assert_eq!(
+        PANEL_MESSAGE_ABSOLUTE_MAX_BYTES,
+        PANEL_SECTIONS
+            .iter()
+            .chain(std::iter::once(&PANEL_CORE))
+            .flat_map(|section| {
+                ["note-save", "note-draft", "notes-list", "search"]
+                    .map(|action| (section.max_bytes)(action))
+            })
+            .max()
+            .unwrap(),
+        "o tecto absoluto e o maior de todas as secoes"
+    );
+    let save = over_4k(
+        "note-save",
+        r#"{"id":null,"title":"t","body":"b","tags":[]}"#,
+    );
+    assert!(
+        matches!(parse_panel_message(&save), Some(PanelMessage::NoteSave(_))),
+        "um note-save acima dos 4 KiB e aceite (o envelope pode ter mais chaves)"
+    );
+    let too_big = format!(
+        r#"{{"action":"note-save","args":{{"id":null,"title":"t","body":"{}","tags":[]}}}}"#,
+        "b".repeat(NOTE_SAVE_MESSAGE_MAX_BYTES)
+    );
+    assert_eq!(
+        parse_panel_message(&too_big),
+        None,
+        "acima do tecto absoluto"
+    );
+}
+
+/// Gate (critico: mensagens de uma pagina): um corpo acima do tecto
+/// absoluto volta `None` ANTES de se ler como JSON -- o `serde_json` nunca
+/// ve um corpo desse tamanho. O tecto da secao do `note-save` e o mesmo
+/// numero e corre DEPOIS do JSON, por isso o `None` sozinho nao chega:
+/// sem a verificacao do delegador a secao dava o mesmo `None`. Conta-se a
+/// leitura (`PANEL_JSON_READS`, so nos testes), e conta-se tambem que o
+/// contador esta vivo -- no tecto le-se, um byte acima nao.
+#[test]
+fn panel_bodies_above_the_absolute_cap_are_never_read_as_json() {
+    let reads = || PANEL_JSON_READS.with(|count| count.get());
+    let envelope = |pad: usize| {
+        format!(
+            r#"{{"action":"note-save","args":{{"id":null,"title":"t","body":"b","tags":[]}},"pad":"{}"}}"#,
+            "x".repeat(pad)
+        )
+    };
+    let frame = envelope(0).len();
+
+    // Exactamente no tecto: le-se, e o note-save passa.
+    let at_cap = envelope(PANEL_MESSAGE_ABSOLUTE_MAX_BYTES - frame);
+    assert_eq!(at_cap.len(), PANEL_MESSAGE_ABSOLUTE_MAX_BYTES);
+    let before = reads();
+    assert!(matches!(
+        parse_panel_message(&at_cap),
+        Some(PanelMessage::NoteSave(_))
+    ));
+    assert_eq!(
+        reads(),
+        before + 1,
+        "no tecto le-se o JSON (o contador conta)"
+    );
+
+    // Lixo dentro do tecto: le-se (e morre no JSON), para o contador nao
+    // ser o que passa o teste.
+    let garbage_at_cap = "x".repeat(PANEL_MESSAGE_ABSOLUTE_MAX_BYTES);
+    let before = reads();
+    assert_eq!(parse_panel_message(&garbage_at_cap), None);
+    assert_eq!(reads(), before + 1, "lixo no tecto ainda se le");
+
+    // Um byte a mais: None SEM leitura -- JSON perfeito ou lixo, tanto faz.
+    let over_cap = envelope(PANEL_MESSAGE_ABSOLUTE_MAX_BYTES - frame + 1);
+    assert_eq!(over_cap.len(), PANEL_MESSAGE_ABSOLUTE_MAX_BYTES + 1);
+    let garbage_over_cap = "x".repeat(PANEL_MESSAGE_ABSOLUTE_MAX_BYTES + 1);
+    let before = reads();
+    for body in [&over_cap, &garbage_over_cap] {
+        assert_eq!(parse_panel_message(body), None, "{} bytes", body.len());
+    }
+    assert_eq!(
+        reads(),
+        before,
+        "acima do tecto absoluto o corpo nunca se le como JSON"
+    );
+}
+
+/// O `PANEL_HTML` que embarca e montado dos assets de `assets/panel/`, e e
+/// a pagina de sempre: LF do principio ao fim, com cada asset la dentro
+/// uma vez, pela ordem, e os marcadores que o harness do painel corta.
+#[test]
+fn panel_html_is_assembled_from_its_section_assets() {
+    assert!(
+        !PANEL_HTML.contains('\r'),
+        "CRLF no painel: o .gitattributes falhou"
+    );
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/panel");
+    let mut cursor = 0;
+    for name in [
+        "panel.css",
+        "history.html",
+        "notes.html",
+        "bookmarks.html",
+        "downloads.html",
+        "core.js",
+        "history.js",
+        "notes.js",
+        "bookmarks.js",
+        "downloads.js",
+        "tabs.js",
+    ] {
+        let asset = std::fs::read_to_string(root.join(name))
+            .unwrap_or_else(|error| panic!("assets/panel/{name}: {error}"));
+        assert!(!asset.contains('\r'), "assets/panel/{name} tem CRLF");
+        assert!(asset.ends_with('\n'), "assets/panel/{name} sem LF final");
+        let at = PANEL_HTML[cursor..]
+            .find(&asset)
+            .unwrap_or_else(|| panic!("assets/panel/{name} fora de ordem ou ausente"));
+        cursor += at + asset.len();
+    }
+    let style = PANEL_HTML.find("<style>\n").expect("<style>");
+    let style_end = PANEL_HTML
+        .find("</style></head><body>\n")
+        .expect("</style>");
+    let script = PANEL_HTML.find("<script>\n").expect("<script>");
+    assert!(style < style_end && style_end < script);
+    assert!(PANEL_HTML.ends_with("</script></body></html>"));
+    assert_eq!(PANEL_HTML.matches("<script>").count(), 1);
+    // O script e uma IIFE so, aberta logo a seguir ao `<script>` (core.js)
+    // e fechada no fim de tabs.js -- o `return` do frame guard tem de
+    // valer para os quatro pedacos.
+    assert!(
+        PANEL_HTML[script..]
+            .starts_with("<script>\n(() => {\n  if (window.top !== window) return;\n")
+    );
+    assert!(PANEL_HTML.ends_with("\n})();\n</script></body></html>"));
+    assert!(PANEL_HTML.starts_with("<!doctype html>\n"));
+}
+
 #[test]
 fn side_panel_only_ever_shows_its_local_page() {
     assert!(panel_allows_navigation("about:blank"));
@@ -1236,8 +1513,8 @@ fn every_ai_column_has_its_own_back_and_forward_after_its_plus() {
     for index in 0..3 {
         let (plus, back, forward) = (
             layout.add_tabs[index],
-            layout.column_back[index],
-            layout.column_forward[index],
+            layout.column_button(index, ColumnButton::Back),
+            layout.column_button(index, ColumnButton::Forward),
         );
         assert!(
             back.width > 0.0 && forward.width > 0.0,
@@ -1273,7 +1550,7 @@ fn every_ai_column_has_its_own_back_and_forward_after_its_plus() {
         let narrow =
             BarLayout::with_contexts(width as f64, 1.0, true, BarColumns::even(3), [0, 0, 0]);
         for index in 0..2 {
-            let forward = narrow.column_forward[index];
+            let forward = narrow.column_button(index, ColumnButton::Forward);
             assert!(
                 forward.width == 0.0 || forward.x + forward.width <= narrow.columns[index + 1].x,
                 "a {width}px os ‹ › da coluna {index} invadem a coluna seguinte"
@@ -1292,6 +1569,286 @@ fn every_ai_column_has_its_own_back_and_forward_after_its_plus() {
     assert!(
         drawer.private.x + drawer.private.width <= back.x,
         "Privado antes do par"
+    );
+}
+
+/// Gate do registo `ColumnButton` (720..2560 px, escalas 1, 1.5 e 2, com
+/// e sem gaveta): cada botao de coluna ou cabe na faixa da sua coluna --
+/// depois do "+", sem se sobrepor ao vizinho nem entrar na coluna seguinte
+/// ou no canto direito, e o clique no centro dele volta a ser ELE -- ou
+/// nao existe (largura 0, e nada o encontra). O grupo e tudo ou nada: numa
+/// coluna, ou todos os botoes obrigatorios existem ou nenhum; um opcional
+/// (o 文A e a estrela) so existe com eles, e so com a pilula de pelo menos
+/// `COLUMN_PILL_MIN`; os opcionais cedem do fim de `ALL` para o inicio (a
+/// estrela antes do 文A), por isso os que ficam sao sempre os primeiros.
+#[test]
+fn column_buttons_fit_or_vanish() {
+    assert_eq!(COLUMN_BUTTONS, ColumnButton::ALL.len());
+    let center = |rect: UiRect| (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+    let mut existed = 0usize;
+    let mut vanished = 0usize;
+    let (mut kept, mut ceded, mut partial) = (0usize, 0usize, 0usize);
+    for scale in [1.0, 1.5, 2.0] {
+        for width in (720..=2560).step_by(40) {
+            for split_active in [false, true] {
+                let columns = BarColumns {
+                    split_active,
+                    ..BarColumns::even(3)
+                };
+                let layout =
+                    BarLayout::with_contexts(width as f64, scale, true, columns, [0, 0, 0]);
+                let controls = right_controls(width as f64, scale, split_active, None);
+                let at = format!("{width}px x{scale} gaveta={split_active}");
+                for index in 0..3 {
+                    let rects: Vec<UiRect> = ColumnButton::ALL
+                        .iter()
+                        .map(|button| layout.column_button(index, *button))
+                        .collect();
+                    let shown = rects.iter().filter(|rect| rect.width > 0.0).count();
+                    let required: Vec<bool> = ColumnButton::ALL
+                        .iter()
+                        .zip(&rects)
+                        .filter(|(button, _)| !button.optional())
+                        .map(|(_, rect)| rect.width > 0.0)
+                        .collect();
+                    let required_shown = required.iter().filter(|shown| **shown).count();
+                    assert!(
+                        required_shown == 0 || required_shown == required.len(),
+                        "{at}: coluna {index} com {required_shown} de {} botoes",
+                        required.len()
+                    );
+                    for (button, rect) in ColumnButton::ALL.iter().zip(&rects) {
+                        if button.optional() && rect.width > 0.0 {
+                            assert_eq!(
+                                required_shown,
+                                required.len(),
+                                "{at}: {} sem os outros na coluna {index}",
+                                button.glyph()
+                            );
+                            assert!(
+                                layout.columns[index].width >= COLUMN_PILL_MIN * scale - 1e-9,
+                                "{at}: {} com a pilula da coluna {index} ilegivel",
+                                button.glyph()
+                            );
+                        }
+                    }
+                    if shown == 0 {
+                        vanished += 1;
+                        for (button, rect) in ColumnButton::ALL.iter().zip(&rects) {
+                            assert_ne!(
+                                layout.hit(rect.x, rect.y + rect.height / 2.0),
+                                Some(button.hit(index)),
+                                "{at}: um botao sem largura nao pode ser clicado"
+                            );
+                        }
+                        continue;
+                    }
+                    existed += 1;
+                    let plus = layout.add_tabs[index];
+                    assert!(
+                        plus.width > 0.0,
+                        "{at}: botoes sem o \"+\" na coluna {index}"
+                    );
+                    let lane_end = if index + 1 < 3 {
+                        layout.columns[index + 1].x
+                    } else {
+                        controls.leftmost()
+                    };
+                    let mut previous_right = plus.x + plus.width;
+                    let (mut optional_kept, mut optional_ceded) = (false, false);
+                    for (button, rect) in ColumnButton::ALL.iter().zip(&rects) {
+                        if rect.width == 0.0 {
+                            // Um opcional que cedeu: nada o encontra -- nem
+                            // onde ele estaria, logo a seguir aos outros.
+                            assert!(button.optional(), "{at}: {}", button.glyph());
+                            ceded += 1;
+                            optional_ceded = true;
+                            let (x, y) = (
+                                previous_right
+                                    + (ColumnButton::GAP + ColumnButton::WIDTH / 2.0) * scale,
+                                plus.y + plus.height / 2.0,
+                            );
+                            assert_ne!(
+                                layout.hit(x, y),
+                                Some(button.hit(index)),
+                                "{at}: o {} que cedeu na coluna {index} ainda e clicavel",
+                                button.glyph()
+                            );
+                            assert_ne!(
+                                bar_hit_at(Some(controls), Some(layout), x, y),
+                                Some(button.hit(index)),
+                                "{at}: o {} que cedeu na coluna {index} ainda e clicavel",
+                                button.glyph()
+                            );
+                            continue;
+                        }
+                        if button.optional() {
+                            // Cedem do fim de `ALL` para o inicio: um
+                            // opcional a vista nunca vem depois de um que
+                            // cedeu (a estrela cede antes do 文A).
+                            assert!(
+                                !optional_ceded,
+                                "{at}: o {} ficou depois de um opcional que cedeu na coluna {index}",
+                                button.glyph()
+                            );
+                            kept += 1;
+                            optional_kept = true;
+                        }
+                        assert!(
+                            rect.x >= previous_right,
+                            "{at}: {} da coluna {index} sobrepoe o anterior",
+                            button.glyph()
+                        );
+                        assert!(
+                            rect.x + rect.width <= lane_end,
+                            "{at}: {} da coluna {index} sai da faixa",
+                            button.glyph()
+                        );
+                        let (cx, cy) = center(*rect);
+                        assert_eq!(
+                            layout.hit(cx, cy),
+                            Some(button.hit(index)),
+                            "{at}: o clique no {} da coluna {index} nao volta a ele",
+                            button.glyph()
+                        );
+                        assert_eq!(
+                            bar_hit_at(Some(controls), Some(layout), cx, cy),
+                            Some(button.hit(index)),
+                            "{at}: o canto direito rouba o {} da coluna {index}",
+                            button.glyph()
+                        );
+                        previous_right = rect.x + rect.width;
+                    }
+                    if optional_kept && optional_ceded {
+                        partial += 1;
+                    }
+                }
+            }
+        }
+    }
+    // A varredura viu os dois lados da regra: botoes que existem (janelas
+    // largas) e botoes que sumiram (janelas estreitas a escala 2) -- e, com
+    // os obrigatorios a vista, opcionais presentes, opcionais que cederam a
+    // pilula e colunas com lugar so para um (o 文A fica, a estrela cede).
+    assert!(
+        existed > 0 && vanished > 0,
+        "{existed} com botoes, {vanished} sem"
+    );
+    assert!(
+        kept > 0 && ceded > 0 && partial > 0,
+        "opcionais: {kept} a vista, {ceded} cederam, {partial} colunas so com o 文A"
+    );
+}
+
+/// Gate do registo do canto direito (`RIGHT_CLUSTER`): pela ordem, sem
+/// sobreposicao, cada lugar volta a ser ele proprio no hit-testing, e a
+/// lista traz os servicos pela ordem de `RightControls::services` e a seta
+/// dos downloads (downloads-ui) logo antes do Privado.
+#[test]
+fn right_cluster_slots_never_overlap_and_hit_back() {
+    let service_hits: Vec<BarHit> = RIGHT_CLUSTER[1..5].iter().map(|slot| slot.hit).collect();
+    assert_eq!(
+        service_hits,
+        [
+            BarHit::Service(Service::Meet),
+            BarHit::Service(Service::WhatsApp),
+            BarHit::Service(Service::YouTube),
+            BarHit::GmailToggle,
+        ]
+    );
+    assert_eq!(RIGHT_CLUSTER[0].hit, BarHit::GeminiLive);
+    assert_eq!(RIGHT_CLUSTER[5].hit, BarHit::Downloads);
+    assert_eq!(RIGHT_CLUSTER[5].icon, ICON_SLOT_DOWNLOADS);
+    assert_eq!(RIGHT_CLUSTER[6].hit, BarHit::Private);
+    let mut icons: Vec<usize> = RIGHT_CLUSTER.iter().map(|slot| slot.icon).collect();
+    icons.sort_unstable();
+    icons.dedup();
+    assert_eq!(icons.len(), RIGHT_CLUSTER.len(), "icone repetido no canto");
+    for scale in [1.0, 1.5, 2.0] {
+        for width in (720..=2560).step_by(40) {
+            for split_active in [false, true] {
+                let controls = right_controls(width as f64, scale, split_active, None);
+                let at = format!("{width}px x{scale} gaveta={split_active}");
+                let mut previous_right = 0.0f64;
+                for (slot, rect) in RIGHT_CLUSTER.iter().zip(controls.cluster()) {
+                    // A seta dos downloads cabe ou nao existe.
+                    if slot.hit == BarHit::Downloads && !downloads_slot_fits(width as f64, scale) {
+                        assert_eq!(rect.width, 0.0, "{at}: a seta existe sem caber");
+                        continue;
+                    }
+                    assert!(
+                        rect.width > 0.0 && rect.height > 0.0,
+                        "{at}: {:?} sem tamanho",
+                        slot.hit
+                    );
+                    assert!(
+                        rect.x >= previous_right,
+                        "{at}: {:?} sobrepoe o lugar anterior",
+                        slot.hit
+                    );
+                    let (cx, cy) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+                    assert_eq!(
+                        right_controls_hit(controls, cx, cy),
+                        Some(slot.hit),
+                        "{at}: o clique em {:?} nao volta a ele",
+                        slot.hit
+                    );
+                    previous_right = rect.x + rect.width;
+                }
+            }
+        }
+    }
+}
+
+/// Gate (a seta dos downloads cabe ou nao existe, downloads-ui): de 720 a
+/// 2560 px, a 1x, 1,5x e 2x, com e sem gaveta, a seta existe se e so se a
+/// janela tem `DOWNLOADS_SLOT_MIN_WIDTH` px logicos; sem ela, nenhum ponto
+/// da linha a acerta e o resto do canto fica onde estava sem ela (o Gemini
+/// Live nao anda). Com ela, as tres IAs mantem a pilula, o "+" e os ‹ ›
+/// (`the_tools_never_take_room_from_the_ai_columns`, que corre sobre a
+/// mesma `right_controls`).
+#[test]
+fn downloads_slot_fits_or_vanishes() {
+    let mut present = 0usize;
+    let mut absent = 0usize;
+    for scale in [1.0, 1.5, 2.0] {
+        for width in (720..=2560).step_by(10) {
+            let width = width as f64;
+            for split_active in [false, true] {
+                let controls = right_controls(width, scale, split_active, None);
+                let at = format!("{width}px x{scale} gaveta={split_active}");
+                let fits = width / scale >= DOWNLOADS_SLOT_MIN_WIDTH;
+                assert_eq!(downloads_slot_fits(width, scale), fits, "{at}");
+                let rect = controls.downloads;
+                let row_y = rect.y + rect.height / 2.0;
+                let hits_it = (0..(width as i32)).any(|x| {
+                    right_controls_hit(controls, x as f64 + 0.5, row_y) == Some(BarHit::Downloads)
+                });
+                if fits {
+                    present += 1;
+                    assert!(rect.width > 0.0, "{at}: a seta cabia e sumiu");
+                    assert_eq!(rect.width, controls.private.width, "{at}");
+                    assert!(hits_it, "{at}: a seta nao se clica");
+                    assert!(rect.x + rect.width <= controls.private.x, "{at}");
+                    assert!(
+                        controls.services[3].x + controls.services[3].width <= rect.x,
+                        "{at}"
+                    );
+                } else {
+                    absent += 1;
+                    assert_eq!(rect.width, 0.0, "{at}: a seta existe sem caber");
+                    assert!(!hits_it, "{at}: um clique acerta a seta que nao existe");
+                    // O Gmail encosta ao Privado, como antes da seta.
+                    let gap =
+                        controls.private.x - (controls.services[3].x + controls.services[3].width);
+                    assert!((gap - 4.0 * scale).abs() < 1e-6, "{at}: {gap}");
+                }
+            }
+        }
+    }
+    assert!(
+        present > 0 && absent > 0,
+        "{present} com seta, {absent} sem"
     );
 }
 
@@ -1822,7 +2379,7 @@ fn the_gemini_live_eye_toggles_live_and_says_what_it_sends() {
             for rect in [
                 layout.columns[index],
                 layout.add_tabs[index],
-                layout.column_forward[index],
+                layout.column_button(index, ColumnButton::Forward),
             ] {
                 assert!(
                     rect.width == 0.0 || rect.x + rect.width <= live.x,
@@ -1832,7 +2389,7 @@ fn the_gemini_live_eye_toggles_live_and_says_what_it_sends() {
         }
     }
     assert_eq!(
-        bar_tooltip_label(BarHit::GeminiLive, "IA", false, None, None).as_deref(),
+        bar_tooltip_label(BarHit::GeminiLive, &BarState::default(), "IA", None, None).as_deref(),
         Some("Gemini Live: ver a tela, câmera e microfone (liga/desliga)")
     );
 }
@@ -1973,9 +2530,12 @@ fn painted_bar_with_live(width: i32, live: &LivePanel<u8>, theme: &Theme) -> Vec
             width,
             1.0,
             &["Google Gemini", "ChatGPT", "Claude"],
-            true,
-            None,
-            false,
+            BarState {
+                visible: true,
+                hover: None,
+                auto_scroll: false,
+                ..BarState::default()
+            },
             live,
             theme,
         );
@@ -2171,13 +2731,13 @@ fn the_live_panel_handlers_are_the_gatekeepers_it_ships_with() {
     assert!(matches!(seen[1], UserEvent::Live(LiveMessage::Stopped)));
     assert!(matches!(seen[2], UserEvent::Live(LiveMessage::Close)));
 
-    assert!(live_panel_navigation(page.clone()));
+    assert!(live_panel_allows_navigation(&page));
     for target in [
         "https://aistudio.google.com/apikey",
         "http://neuralia-live.localhost/live.js",
         "about:blank",
     ] {
-        assert!(!live_panel_navigation(target.to_string()), "{target}");
+        assert!(!live_panel_allows_navigation(target), "{target}");
     }
 
     for kind in [
@@ -2409,13 +2969,955 @@ fn gmail_setting_round_trips_and_the_toast_answers_by_button() {
         right: 360,
         bottom: 64,
     };
-    let (open, no) = gmail_toast_buttons(&client, 1.0);
+    let widths: Vec<f64> = gmail_notice("a", "b")
+        .actions
+        .iter()
+        .map(|action| action.width)
+        .collect();
+    let buttons = toast_buttons(&client, 1.0, &widths);
+    let [open, no] = buttons[..] else {
+        panic!("o aviso do Gmail tem dois botoes, tem {}", buttons.len());
+    };
     assert!(
         open.right <= no.left,
         "Abrir fica antes de Nao, sem se tocarem"
     );
     assert!(no.right <= client.right && open.left >= 0);
     assert!(open.top >= 0 && open.bottom <= client.bottom);
+}
+
+/// O aviso do canto num registo: o `ToastHost` dos gates. O centro e o de
+/// verdade; o que o `App` faria com a janela fica escrito.
+#[derive(Default)]
+struct ToastLog {
+    centre: crate::notify::NotifyCentre,
+    log: Vec<String>,
+}
+
+impl ToastHost for ToastLog {
+    fn notify_centre(&mut self) -> &mut crate::notify::NotifyCentre {
+        &mut self.centre
+    }
+
+    fn show_toast(&mut self, frame: &crate::notify::ToastFrame) {
+        let view = ToastView::of(frame);
+        let buttons: Vec<String> = view
+            .buttons
+            .iter()
+            .map(|button| {
+                format!(
+                    "{}{} {}",
+                    button.label,
+                    if button.primary { "*" } else { "" },
+                    button.width
+                )
+            })
+            .collect();
+        self.log.push(format!(
+            "mostra {} «{}» «{}» [{}]",
+            view.token,
+            view.title,
+            view.body,
+            buttons.join(", ")
+        ));
+    }
+
+    fn hide_toast_window(&mut self) {
+        self.log.push("esconde".to_string());
+    }
+
+    fn destroy_toast(&mut self) {
+        self.log.push("destroi".to_string());
+    }
+
+    fn hide_toast_after(&mut self, token: u64, delay: Duration) {
+        self.log
+            .push(format!("some {token} em {} ms", delay.as_millis()));
+    }
+
+    fn open_downloads(&mut self) {
+        self.log.push("abre downloads".to_string());
+    }
+
+    fn open_service(&mut self, service: Service) {
+        self.log.push(format!("abre {service:?}"));
+    }
+}
+
+fn toast_step(host: &mut ToastLog, input: NotifyInput) -> Vec<String> {
+    apply_notify(host, input);
+    std::mem::take(&mut host.log)
+}
+
+/// Gate: o aviso do Gmail passou a ser um `Notice` do centro de avisos sem
+/// mudar nada do que se ve e do que faz. As referencias sao o
+/// `show_gmail_toast`, o `gmail_toast_buttons`, o `position_gmail_toast` e
+/// o `answer_gmail` da 2.2.0, reescritos aqui a mao: texto, tamanho, botoes
+/// (em cada escala), canto, prazo de 12 s, o token que ignora o
+/// temporizador de um aviso substituido, "Abrir" a abrir o painel do Gmail
+/// e "Nao" so a esconder.
+#[test]
+fn gmail_toast_behaviour_unchanged() {
+    // 1. O texto: o titulo fixo e o corpo pelas quatro formas de antes.
+    for (sender, subject, body) in [
+        ("", "", "Nova mensagem na sua caixa de entrada"),
+        ("  ", " Relatório ", "Relatório"),
+        (" Ana ", "", "Ana"),
+        ("Ana", "Relatório de março", "Ana · Relatório de março"),
+    ] {
+        let notice = gmail_notice(sender, subject);
+        assert_eq!(notice.kind, crate::notify::NoticeKind::Gmail);
+        assert_eq!(notice.title, "Gmail · novo e-mail — abrir?");
+        assert_eq!(notice.body, body, "{sender:?} {subject:?}");
+        assert_eq!(notice.ttl, Duration::from_secs(12));
+        assert!(notice.content_bearing, "o corpo e o e-mail");
+        let buttons: Vec<(&str, f64, bool)> = notice
+            .actions
+            .iter()
+            .map(|action| (action.label, action.width, action.primary))
+            .collect();
+        assert_eq!(buttons, vec![("Abrir", 70.0, true), ("Não", 54.0, false)]);
+    }
+
+    // 2. O tamanho, os botoes e o canto, com as formulas de antes.
+    assert_eq!((TOAST_WIDTH, TOAST_HEIGHT), (390.0, 68.0));
+    let old_buttons = |client: &RECT, scale: f64| {
+        let height = (26.0 * scale).round() as i32;
+        let top = (client.bottom - height) / 2;
+        let gap = (6.0 * scale).round() as i32;
+        let right = client.right - (12.0 * scale).round() as i32;
+        let no_width = (54.0 * scale).round() as i32;
+        let open_width = (70.0 * scale).round() as i32;
+        [
+            (
+                right - no_width - gap - open_width,
+                top,
+                right - no_width - gap,
+                top + height,
+            ),
+            (right - no_width, top, right, top + height),
+        ]
+    };
+    let widths: Vec<f64> = gmail_notice("a", "b")
+        .actions
+        .iter()
+        .map(|action| action.width)
+        .collect();
+    for window_scale in [1.0f64, 1.25, 1.5, 1.75, 2.0, 2.25, 3.0] {
+        let width = (390.0 * window_scale).round() as i32;
+        let height = (68.0 * window_scale).round() as i32;
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        // A escala que a janela le da propria altura, como antes.
+        let scale = toast_scale(&client);
+        assert_eq!(scale, (height as f64 / 68.0).max(1.0));
+        let new: Vec<(i32, i32, i32, i32)> = toast_buttons(&client, scale, &widths)
+            .iter()
+            .map(|rect| (rect.left, rect.top, rect.right, rect.bottom))
+            .collect();
+        assert_eq!(new, old_buttons(&client, scale), "escala {window_scale}");
+        let [open, no] = old_buttons(&client, scale);
+        let buttons = toast_buttons(&client, scale, &widths);
+        let middle = |rect: (i32, i32, i32, i32)| ((rect.0 + rect.2) / 2, (rect.1 + rect.3) / 2);
+        assert_eq!(toast_hit(&buttons, middle(open).0, middle(open).1), Some(0));
+        assert_eq!(toast_hit(&buttons, middle(no).0, middle(no).1), Some(1));
+        assert_eq!(toast_hit(&buttons, open.2, middle(open).1), None, "o vao");
+        assert_eq!(toast_hit(&buttons, 10, height / 2), None, "o texto");
+
+        // O canto: 18 px logicos do canto inferior direito do cliente.
+        let origin = POINT { x: 100, y: 50 };
+        let owner = RECT {
+            left: 0,
+            top: 0,
+            right: 1600,
+            bottom: 900,
+        };
+        let margin = (18.0 * window_scale) as i32;
+        assert_eq!(
+            toast_origin(origin, &owner, width, height, window_scale),
+            (100 + 1600 - width - margin, 50 + 900 - height - margin)
+        );
+    }
+
+    // 3. O caminho do App: mostrar, agendar, substituir, responder, sair.
+    let mut host = ToastLog::default();
+    assert_eq!(
+        toast_step(
+            &mut host,
+            NotifyInput::Post(gmail_notice("Ana", "Relatório"))
+        ),
+        vec![
+            "mostra 1 «Gmail · novo e-mail — abrir?» «Ana · Relatório» [Abrir* 70, Não 54]",
+            "some 1 em 12000 ms",
+        ]
+    );
+    // Correio novo com o aviso a vista: substitui-o ja, com prazo novo.
+    assert_eq!(
+        toast_step(&mut host, NotifyInput::Post(gmail_notice("Bia", ""))),
+        vec![
+            "mostra 2 «Gmail · novo e-mail — abrir?» «Bia» [Abrir* 70, Não 54]",
+            "some 2 em 12000 ms",
+        ]
+    );
+    // O prazo do aviso substituido nao tira o novo.
+    assert!(toast_step(&mut host, NotifyInput::Event(NotifyEvent::Hide(1))).is_empty());
+    // "Abrir": esconde e abre o painel do Gmail.
+    assert_eq!(
+        toast_step(
+            &mut host,
+            NotifyInput::Event(NotifyEvent::Answer { token: 2, index: 0 })
+        ),
+        vec!["esconde", "abre Gmail"]
+    );
+    // "Nao": so esconde.
+    assert_eq!(
+        toast_step(
+            &mut host,
+            NotifyInput::Event(NotifyEvent::Answer { token: 2, index: 1 })
+        ),
+        vec!["esconde"]
+    );
+    // Fora dos botoes, ou um aviso que ja nao e este: nada.
+    for (token, index) in [(2, 2), (1, 0)] {
+        assert!(
+            toast_step(
+                &mut host,
+                NotifyInput::Event(NotifyEvent::Answer { token, index })
+            )
+            .is_empty(),
+            "{token} {index}"
+        );
+    }
+    // O prazo dele: a janela e destruida.
+    assert_eq!(
+        toast_step(&mut host, NotifyInput::Event(NotifyEvent::Hide(2))),
+        vec!["destroi"]
+    );
+    // Um aviso depois: o token continua a subir.
+    assert_eq!(
+        toast_step(&mut host, NotifyInput::Post(gmail_notice("", ""))),
+        vec![
+            "mostra 3 «Gmail · novo e-mail — abrir?» «Nova mensagem na sua caixa de entrada» [Abrir* 70, Não 54]",
+            "some 3 em 12000 ms",
+        ]
+    );
+}
+
+/// Gate (real Win32; so CI -- cria uma janela que pode ir para a frente):
+/// o aviso do canto nasce, aparece (tres vezes, como a cada `Moved`) e e
+/// clicado sem nunca tirar a ativacao a janela dona, pela receita que o
+/// produto usa (`create_toast_window`, `place_toast`). E popup owned, sem
+/// ativacao e ferramenta, nunca TOPMOST. Sabotagem na matriz do CI:
+/// `SW_SHOWNOACTIVATE` -> `SW_SHOW` em `show_popup_without_activation`.
+#[test]
+#[ignore = "needs a desktop session: runs in CI"]
+fn toast_never_activates() {
+    use windows_sys::Win32::Graphics::Gdi::UpdateWindow;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, SetActiveWindow};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongW, IsWindowVisible, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+    };
+    let frame = crate::notify::ToastFrame {
+        token: 1,
+        notice: gmail_notice("Ana", "Relatório"),
+    };
+    if let Ok(mut view) = TOAST_VIEW.lock() {
+        *view = Some(ToastView::of(&frame));
+    }
+    let width = TOAST_WIDTH.round() as i32;
+    let height = TOAST_HEIGHT.round() as i32;
+    unsafe {
+        let owner = CreateWindowExW(
+            0,
+            windows_sys::w!("STATIC"),
+            windows_sys::w!("NeuralIA dono"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            0,
+            0,
+            640,
+            400,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        assert!(!owner.is_null(), "a janela dona tem de nascer");
+        SetActiveWindow(owner);
+        assert_eq!(
+            GetActiveWindow(),
+            owner,
+            "pre-condicao: o dono e a janela ativa"
+        );
+        let toast = create_toast_window(owner, width, height, 0).expect("o aviso tem de nascer");
+        let after_create = GetActiveWindow();
+        let mut stolen_on_show = None;
+        for cycle in 0..3 {
+            place_toast(toast, 200 + cycle, 200, width, height);
+            if GetActiveWindow() != owner && stolen_on_show.is_none() {
+                stolen_on_show = Some(cycle);
+            }
+        }
+        UpdateWindow(toast);
+        let activate = SendMessageW(toast, WM_MOUSEACTIVATE, owner as WPARAM, 0);
+        let hit = SendMessageW(toast, WM_NCHITTEST, 0, 0);
+        let ex_style = GetWindowLongW(toast, GWL_EXSTYLE) as u32;
+        let visible = IsWindowVisible(toast) != 0;
+        let after_all = GetActiveWindow();
+        DestroyWindow(toast);
+        DestroyWindow(owner);
+        if let Ok(mut view) = TOAST_VIEW.lock() {
+            *view = None;
+        }
+
+        assert_eq!(after_create, owner, "criar o aviso roubou a ativacao");
+        assert_eq!(
+            stolen_on_show, None,
+            "mostrar o aviso roubou a ativacao ao dono no ciclo {stolen_on_show:?}"
+        );
+        assert_eq!(after_all, owner, "o aviso ficou com a ativacao");
+        assert!(visible, "o aviso tem de ficar visivel depois de mostrado");
+        assert_eq!(
+            activate, MA_NOACTIVATE as LRESULT,
+            "o clique ativava o aviso"
+        );
+        assert_eq!(
+            hit, HTCLIENT as LRESULT,
+            "os botoes deixavam o clique passar"
+        );
+        assert_ne!(ex_style & WS_EX_NOACTIVATE, 0);
+        assert_ne!(ex_style & WS_EX_TOOLWINDOW, 0);
+        assert_eq!(
+            ex_style & WS_EX_TOPMOST,
+            0,
+            "o aviso nao pousa sobre as outras aplicacoes"
+        );
+    }
+}
+
+/// Gate: os menus nativos passam todos por `PopupMenu` e decidem o teclado
+/// pela origem. A origem e a vista (ou a janela) onde estava o foco; o
+/// teclado volta la depois do menu, com ou sem escolha, salvo se o comando
+/// escolhido o muda de proposito. Os menus migrados guardam os itens, os
+/// ids, as marcas e os cinzentos de antes, e o HMENU montado pelo
+/// `append_entries` (o do `run_menu`) deixa um cinzento sem clique e um
+/// marcado marcado, com e sem amostra de cor.
+#[test]
+fn popup_menus_keep_their_items_and_decide_the_focus_by_origin() {
+    let hwnd = |value: usize| value as HWND;
+    // A arvore de mentira: 10 e 20 hospedam vistas; 11 e 12 estao dentro
+    // da 10, 21 dentro da 20; 30 e o EDIT da omnibox.
+    let inside = |host: HWND, child: HWND| {
+        matches!(
+            (host as usize, child as usize),
+            (10, 11) | (10, 12) | (20, 21)
+        )
+    };
+    let hosts = [hwnd(10), hwnd(20), std::ptr::null_mut()];
+    assert_eq!(
+        focus_origin(std::ptr::null_mut(), &hosts, inside),
+        FocusOrigin::Nowhere
+    );
+    assert_eq!(focus_origin(hwnd(12), &hosts, inside), FocusOrigin::Host(0));
+    assert_eq!(focus_origin(hwnd(20), &hosts, inside), FocusOrigin::Host(1));
+    assert_eq!(focus_origin(hwnd(21), &hosts, inside), FocusOrigin::Host(1));
+    assert_eq!(
+        focus_origin(hwnd(30), &hosts, inside),
+        FocusOrigin::Window(hwnd(30))
+    );
+    // Uma vista sem janela nao apanha o foco de ninguem.
+    assert_eq!(
+        focus_origin(hwnd(30), &[std::ptr::null_mut()], |_, _| true),
+        FocusOrigin::Window(hwnd(30))
+    );
+
+    for (origin, expected) in [
+        (FocusOrigin::Nowhere, FocusRestore::Leave),
+        (FocusOrigin::Host(1), FocusRestore::Host(1)),
+        (
+            FocusOrigin::Window(hwnd(30)),
+            FocusRestore::Window(hwnd(30)),
+        ),
+    ] {
+        assert_eq!(decide_focus_restore(origin, false), expected);
+        assert_eq!(
+            decide_focus_restore(origin, true),
+            FocusRestore::Leave,
+            "um comando que muda o teclado de proposito fica com ele"
+        );
+    }
+
+    // Um cinzento com razao leva-a a direita (coluna do atalho).
+    assert_eq!(
+        MenuCommand::new(3, "Pular fase")
+            .disabled("só a correr")
+            .text(),
+        "Pular fase\tsó a correr"
+    );
+    assert_eq!(MenuCommand::new(0, "Grupo").disabled("").text(), "Grupo");
+
+    // O tema: tres opcoes, ids 1.., a em vigor marcada.
+    let theme = theme_menu();
+    let current = ThemeChoice::current();
+    let items: Vec<(usize, &str, bool)> = theme
+        .entries
+        .iter()
+        .map(|entry| match entry {
+            MenuEntry::Command(command) => (command.id, command.label.as_str(), command.checked),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(items.len(), ThemeChoice::ALL.len());
+    for (index, choice) in ThemeChoice::ALL.iter().enumerate() {
+        assert_eq!(
+            items[index],
+            (index + 1, choice.label(), *choice == current)
+        );
+    }
+    assert_eq!(theme.command(0), None, "0 e fechado sem escolha");
+
+    // O Pomodoro: as linhas do controlador, com os cinzentos e as marcas.
+    let pomodoro = PomodoroController::new(crate::pomodoro_ui::PomodoroPreset::Classic.settings());
+    let lines = pomodoro.menu_items();
+    let menu = pomodoro_popup_menu(&lines);
+    assert_eq!(menu.entries.len(), lines.len());
+    for (entry, line) in menu.entries.iter().zip(&lines) {
+        match (entry, line) {
+            (MenuEntry::Separator, crate::pomodoro_ui::PomodoroMenuItem::Separator) => {}
+            (
+                MenuEntry::Command(command),
+                crate::pomodoro_ui::PomodoroMenuItem::Command {
+                    id,
+                    label,
+                    enabled,
+                    checked,
+                    ..
+                },
+            ) => {
+                assert_eq!(
+                    (command.id, command.label.as_str(), command.checked),
+                    (*id, *label, *checked)
+                );
+                assert_eq!(command.disabled.is_some(), !enabled, "{label}");
+                assert!(!command.moves_focus, "{label}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(
+        lines.iter().any(|line| matches!(
+            line,
+            crate::pomodoro_ui::PomodoroMenuItem::Command { enabled: false, .. }
+        )),
+        "parado, ha linhas cinzentas a provar"
+    );
+
+    // As cores do grupo: ids, amostras e a atual marcada, num submenu tambem.
+    let colors = group_color_items(GroupColor::ALL[2]);
+    assert_eq!(colors.len(), GroupColor::ALL.len());
+    for (index, entry) in colors.iter().enumerate() {
+        let MenuEntry::Command(command) = entry else {
+            panic!("{entry:?}");
+        };
+        assert_eq!(command.id, GROUP_MENU_COLOR_BASE + index);
+        assert_eq!(command.label, group_color_label(GroupColor::ALL[index]));
+        assert_eq!(
+            command.icon,
+            Some(MenuIcon::Swatch(GroupColor::ALL[index].rgb()))
+        );
+        assert_eq!(command.checked, index == 2);
+    }
+    let mut nested = PopupMenu::default();
+    nested.push(MenuCommand::new(TAB_MENU_OPEN, "Abrir").moves_focus());
+    nested.push(MenuEntry::Submenu {
+        label: "Cor do grupo".to_string(),
+        icon: None,
+        entries: colors,
+    });
+    assert_eq!(
+        nested
+            .command(GROUP_MENU_COLOR_BASE + 2)
+            .map(|command| command.checked),
+        Some(true),
+        "um comando dentro de um submenu"
+    );
+    assert!(nested.command(TAB_MENU_OPEN).is_some_and(|c| c.moves_focus));
+    assert_eq!(nested.command(9999), None);
+
+    // O HMENU que o `run_menu` monta (sem janela: so o menu e as amostras
+    // do GDI): um cinzento fica cinzento e sem clique tambem com icone, e o
+    // marcado fica marcado, com e sem icone.
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetMenuItemCount, GetMenuState, MF_BYCOMMAND, MF_CHECKED, MF_DISABLED, MF_GRAYED,
+        };
+        let mut real = PopupMenu::default();
+        real.push(MenuCommand::new(1, "Liso").checked(true));
+        real.push(MenuCommand::new(2, "Liso cinzento").disabled("sem abas"));
+        real.push(
+            MenuCommand::new(3, "Cor")
+                .icon(MenuIcon::Swatch(GroupColor::ALL[0].rgb()))
+                .checked(true),
+        );
+        real.push(
+            MenuCommand::new(4, "Cor cinzenta")
+                .icon(MenuIcon::Swatch(GroupColor::ALL[1].rgb()))
+                .disabled("só a correr"),
+        );
+        real.push(
+            MenuCommand::new(5, "Cor livre").icon(MenuIcon::Swatch(GroupColor::ALL[2].rgb())),
+        );
+        let (count, states) = unsafe {
+            let handle = CreatePopupMenu();
+            assert!(!handle.is_null(), "CreatePopupMenu recusou");
+            let mut texts = Vec::new();
+            let mut bitmaps = Vec::new();
+            append_entries(handle, &real.entries, 16, &mut texts, &mut bitmaps);
+            let count = GetMenuItemCount(handle);
+            let states: Vec<u32> = (1..=5u32)
+                .map(|id| GetMenuState(handle, id, MF_BYCOMMAND))
+                .collect();
+            DestroyMenu(handle);
+            for bitmap in bitmaps {
+                DeleteObject(bitmap as _);
+            }
+            (count, states)
+        };
+        assert_eq!(count, 5);
+        assert!(
+            !states.contains(&u32::MAX),
+            "um item nao chegou ao menu: {states:x?}"
+        );
+        let grey = MF_GRAYED | MF_DISABLED;
+        let seen: Vec<u32> = states
+            .iter()
+            .map(|state| state & (grey | MF_CHECKED))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![MF_CHECKED, grey, MF_CHECKED, grey, 0],
+            "liso marcado, liso cinzento, cor marcada, cor cinzenta, cor livre"
+        );
+    }
+
+    // So o `PopupMenu` chama o TrackPopupMenu: um menu solto nao devolvia
+    // o teclado a ninguem.
+    let source = shipped_source();
+    assert_eq!(
+        source.matches("TrackPopupMenu(").count(),
+        1,
+        "um TrackPopupMenu fora de popup_menu.rs"
+    );
+}
+
+static MENU_TEST_WINDOW: AtomicUsize = AtomicUsize::new(0);
+
+/// O que o WebView2 faz quando um menu fecha por cima dele: o teclado cai
+/// na janela anfitria. Depois fecha o menu, como um Esc.
+unsafe extern "system" fn dismiss_menu_like_a_webview(
+    hwnd: HWND,
+    _message: u32,
+    id: usize,
+    _time: u32,
+) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EndMenu, KillTimer};
+    KillTimer(hwnd, id);
+    SetFocus(MENU_TEST_WINDOW.load(Ordering::Acquire) as HWND);
+    EndMenu();
+}
+
+/// Rede de seguranca do gate: se o temporizador nunca chegasse ao ciclo
+/// do menu, o `WM_CANCELMODE` ao dono fecha-o ao fim de 10 s -- o gate
+/// falha em vez de prender o job do CI.
+fn cancel_menu_after(owner: HWND, delay: Duration) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+    let owner = owner as usize;
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        unsafe {
+            PostMessageW(owner as HWND, WM_CANCELMODE, 0, 0);
+        }
+    });
+}
+
+/// Uma vista de mentira: a janela `host` e o EDIT `inner` dentro dela, que
+/// recebe o teclado pelo `take_focus` (a `MoveFocus` no produto).
+struct EditHost {
+    host: HWND,
+    inner: HWND,
+    calls: std::cell::Cell<usize>,
+}
+
+impl FocusHost for EditHost {
+    fn host_window(&self) -> HWND {
+        self.host
+    }
+
+    fn take_focus(&self) {
+        self.calls.set(self.calls.get() + 1);
+        unsafe {
+            SetFocus(self.inner);
+        }
+    }
+}
+
+/// Gate (real Win32; so CI -- abre um menu modal e mexe no foco): depois de
+/// um menu fechado sem escolha, o teclado esta onde estava quando ele abriu
+/// -- no EDIT (por `SetFocus`) e dentro de uma vista (pelo `take_focus` dela,
+/// a `MoveFocus(PROGRAMMATIC)` do WebView2), mesmo com o fecho a deixa-lo na
+/// janela anfitria. Sabotagem na matriz do CI: tirar o `restore_focus` de
+/// `track_popup_menu`.
+#[test]
+#[ignore = "needs a desktop session: runs in CI"]
+fn popup_menu_restores_origin_focus() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        ES_AUTOHSCROLL, SetTimer, WS_OVERLAPPEDWINDOW,
+    };
+    unsafe {
+        let child = |class: *const u16, parent: HWND, x: i32| {
+            CreateWindowExW(
+                0,
+                class,
+                windows_sys::w!(""),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
+                x,
+                10,
+                160,
+                24,
+                parent,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        let owner = CreateWindowExW(
+            0,
+            windows_sys::w!("STATIC"),
+            windows_sys::w!("NeuralIA dono"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            0,
+            0,
+            640,
+            400,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        assert!(!owner.is_null(), "a janela dona tem de nascer");
+        SetActiveWindow(owner);
+        MENU_TEST_WINDOW.store(owner as usize, Ordering::Release);
+        let omnibox = child(windows_sys::w!("EDIT"), owner, 10);
+        let host = CreateWindowExW(
+            0,
+            windows_sys::w!("STATIC"),
+            windows_sys::w!(""),
+            WS_CHILD | WS_VISIBLE,
+            200,
+            0,
+            400,
+            200,
+            owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        let page = child(windows_sys::w!("EDIT"), host, 10);
+        assert!(!omnibox.is_null() && !host.is_null() && !page.is_null());
+        let view = EditHost {
+            host,
+            inner: page,
+            calls: std::cell::Cell::new(0),
+        };
+        let mut menu = PopupMenu::default();
+        menu.push(MenuCommand::new(1, "Um"));
+        menu.push(MenuCommand::new(2, "Dois").checked(true));
+        let hosts: [&dyn FocusHost; 1] = [&view];
+
+        // 1. O EDIT nosso (a omnibox): SetFocus.
+        SetFocus(omnibox);
+        let before_edit = GetFocus();
+        SetTimer(owner, 1, 150, Some(dismiss_menu_like_a_webview));
+        cancel_menu_after(owner, Duration::from_secs(10));
+        let picked_edit = track_popup_menu(
+            &menu,
+            owner,
+            POINT { x: 60, y: 60 },
+            MenuButton::Right,
+            1.0,
+            &hosts,
+        );
+        let after_edit = GetFocus();
+
+        // 2. Dentro de uma vista: a MoveFocus dela.
+        SetFocus(page);
+        let before_view = GetFocus();
+        SetTimer(owner, 2, 150, Some(dismiss_menu_like_a_webview));
+        cancel_menu_after(owner, Duration::from_secs(10));
+        let picked_view = track_popup_menu(
+            &menu,
+            owner,
+            POINT { x: 60, y: 60 },
+            MenuButton::Left,
+            1.0,
+            &hosts,
+        );
+        let after_view = GetFocus();
+        let view_calls = view.calls.get();
+
+        DestroyWindow(owner);
+        MENU_TEST_WINDOW.store(0, Ordering::Release);
+
+        assert_eq!(before_edit, omnibox, "pre-condicao: o EDIT tem o teclado");
+        assert_eq!(before_view, page, "pre-condicao: a vista tem o teclado");
+        assert_eq!((picked_edit, picked_view), (0, 0), "fechado sem escolha");
+        assert_eq!(
+            after_edit, omnibox,
+            "o menu fechado deixou o teclado fora da omnibox"
+        );
+        assert_eq!(
+            after_view, page,
+            "o menu fechado deixou o teclado fora da pagina"
+        );
+        assert_eq!(view_calls, 1, "a vista recebe o teclado pela MoveFocus");
+    }
+}
+
+/// Gate: o `NativeCard` e generico no que leva e guarda as regras do
+/// cartao da barra -- token por pedido (nunca 0), um pedido novo troca o
+/// que esperava, confirmar so a partir de `NATIVE_CARD_ARM` e so com algo
+/// pintado (senao fica a espera), Cancelar a qualquer momento, cliques e
+/// prazos de um cartao que ja nao esta la sem efeito.
+#[test]
+fn native_card_arms_expires_and_confirms_only_the_painted() {
+    let t0 = Instant::now();
+    let ms = Duration::from_millis;
+    let mut card: NativeCard<&str> = NativeCard::default();
+    assert_eq!(card.request("primeiro", t0), (1, false));
+    assert_eq!(card.request("segundo", t0 + ms(100)), (2, true));
+    // O clique no cartao trocado nao responde a nada.
+    assert_eq!(
+        card.answer(1, true, t0 + ms(2000), |text| Some(text.to_string())),
+        CardAnswer::Ignored
+    );
+    // Cedo demais: fica, e o mesmo clique a tempo confirma.
+    let armed = t0 + ms(100) + NATIVE_CARD_ARM;
+    assert_eq!(
+        card.answer(2, true, armed - ms(1), |text| Some(text.to_string())),
+        CardAnswer::Ignored
+    );
+    // Nada pintado: nada vai, e o cartao fica.
+    assert_eq!(
+        card.answer(2, true, armed, |_| None::<String>),
+        CardAnswer::Ignored
+    );
+    // Confirma o que a pintura mostrou, nao o pedido inteiro.
+    assert_eq!(
+        card.answer(2, true, armed, |text| Some(text[..3].to_string())),
+        CardAnswer::Confirmed("seg".to_string())
+    );
+    assert!(card.pending.is_none(), "confirmado, sai");
+    assert!(!card.expire(2), "o prazo de um cartao que ja saiu");
+
+    // Cancelar nao espera pelo armar; o prazo tira o que esperava.
+    let (token, _) = card.request("x", t0);
+    assert_eq!(token, 3);
+    assert_eq!(
+        card.answer(token, false, t0, |_| Some(())),
+        CardAnswer::Cancelled
+    );
+    let (token, replaced) = card.request("y", t0);
+    assert!(!replaced);
+    assert!(!card.expire(token - 1));
+    assert!(card.expire(token));
+    assert!(card.pending.is_none());
+
+    // O token nunca e 0, nem a dar a volta.
+    let mut wrapped: NativeCard<()> = NativeCard {
+        pending: None,
+        last_token: u64::MAX,
+    };
+    assert_eq!(wrapped.request((), t0).0, 1);
+
+    // Os cartoes e o aviso do canto: os cliques sao deles e nao os ativam.
+    assert_eq!(
+        popup_no_activate_message(WM_MOUSEACTIVATE),
+        Some(MA_NOACTIVATE as LRESULT)
+    );
+    assert_eq!(
+        popup_no_activate_message(WM_NCHITTEST),
+        Some(HTCLIENT as LRESULT)
+    );
+    assert_eq!(popup_no_activate_message(WM_PAINT), None);
+}
+
+/// Gate (real Win32; so CI -- cria uma janela que pode ir para a frente):
+/// um cartao nativo nasce pela receita dos cartoes (`create_native_card`,
+/// com a subclasse do cartao da barra), aparece tres vezes e e clicado sem
+/// nunca tirar a ativacao a janela dona; e owned por ela, sem ativacao e
+/// nunca TOPMOST. Sabotagem na matriz do CI: `WM_MOUSEACTIVATE` fora de
+/// `popup_no_activate_message`.
+#[test]
+#[ignore = "needs a desktop session: runs in CI"]
+fn native_card_never_activates() {
+    use windows_sys::Win32::Graphics::Gdi::UpdateWindow;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, SetActiveWindow};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GW_OWNER, GWL_EXSTYLE, GetWindow, GetWindowLongW, IsWindowVisible, WS_EX_TOPMOST,
+        WS_OVERLAPPEDWINDOW,
+    };
+    let sink: Box<SearchCardSink> = Box::new(Box::new(|_| {}));
+    let width = SEARCH_CARD_WIDTH.round() as i32;
+    let height = SEARCH_CARD_HEIGHT.round() as i32;
+    unsafe {
+        let owner = CreateWindowExW(
+            0,
+            windows_sys::w!("STATIC"),
+            windows_sys::w!("NeuralIA dono"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            0,
+            0,
+            800,
+            500,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        assert!(!owner.is_null(), "a janela dona tem de nascer");
+        SetActiveWindow(owner);
+        assert_eq!(
+            GetActiveWindow(),
+            owner,
+            "pre-condicao: o dono e a janela ativa"
+        );
+        if let Ok(mut view) = SEARCH_CARD_VIEW.lock() {
+            *view = Some((5, SearchIntent::Ask, "Texto".to_string()));
+        }
+        let card = create_native_card(
+            owner,
+            width,
+            height,
+            search_card_subclass,
+            SEARCH_CARD_SUBCLASS_ID,
+            (&*sink as *const SearchCardSink) as usize,
+            18,
+        )
+        .expect("o cartao tem de nascer");
+        let after_create = GetActiveWindow();
+        let mut stolen_on_show = None;
+        for cycle in 0..3 {
+            show_popup_without_activation(card);
+            if GetActiveWindow() != owner && stolen_on_show.is_none() {
+                stolen_on_show = Some(cycle);
+            }
+        }
+        UpdateWindow(card);
+        let activate = SendMessageW(card, WM_MOUSEACTIVATE, owner as WPARAM, 0);
+        let hit = SendMessageW(card, WM_NCHITTEST, 0, 0);
+        let ex_style = GetWindowLongW(card, GWL_EXSTYLE) as u32;
+        let card_owner = GetWindow(card, GW_OWNER);
+        let visible = IsWindowVisible(card) != 0;
+        let after_all = GetActiveWindow();
+        DestroyWindow(card);
+        DestroyWindow(owner);
+        if let Ok(mut view) = SEARCH_CARD_VIEW.lock() {
+            *view = None;
+        }
+        if let Ok(mut painted) = SEARCH_CARD_PAINTED.lock() {
+            *painted = (0, 0);
+        }
+
+        assert_eq!(after_create, owner, "criar o cartao roubou a ativacao");
+        assert_eq!(
+            stolen_on_show, None,
+            "mostrar o cartao roubou a ativacao ao dono no ciclo {stolen_on_show:?}"
+        );
+        assert_eq!(
+            activate, MA_NOACTIVATE as LRESULT,
+            "o clique ativava o cartao"
+        );
+        assert_eq!(after_all, owner, "o cartao ficou com a ativacao");
+        assert!(visible, "o cartao tem de ficar visivel depois de mostrado");
+        assert_eq!(hit, HTCLIENT as LRESULT, "o cartao deixava o clique passar");
+        assert_eq!(card_owner, owner, "o cartao e owned pela janela principal");
+        assert_ne!(ex_style & WS_EX_NOACTIVATE, 0);
+        assert_eq!(
+            ex_style & WS_EX_TOPMOST,
+            0,
+            "o cartao nao pousa sobre as outras aplicacoes"
+        );
+    }
+}
+
+/// Gate: a pergunta do meio da janela (`SplashQuestion`, que substituiu o
+/// `SPLASH_ASKS`) traz os seus botoes. Com os dois da rolagem, a geometria e
+/// a de sempre (cada um com um quinto da largura, a um quadragesimo); com
+/// mais, ficam encostados a direita pela ordem da lista, sem se tocarem; o
+/// clique responde pelo indice do botao na coluna dele.
+#[test]
+fn splash_question_keeps_the_yes_no_geometry_and_answers_by_button() {
+    assert_eq!(AUTO_SCROLL_QUESTION.asker, SplashAsker::AutoScroll);
+    let labels: Vec<(&str, bool)> = AUTO_SCROLL_QUESTION
+        .buttons
+        .iter()
+        .map(|button| (button.label, button.primary))
+        .collect();
+    assert_eq!(labels, vec![("Sim", true), ("Não", false)]);
+
+    let old = |client: &RECT| {
+        let width = client.right - client.left;
+        let button = width / 5;
+        let margin = width / 40;
+        let no = (
+            client.right - margin - button,
+            client.top + margin,
+            client.right - margin,
+            client.bottom - margin,
+        );
+        let yes = (no.0 - margin - button, no.1, no.0 - margin, no.3);
+        vec![yes, no]
+    };
+    for (width, height) in [(470, 46), (588, 58), (705, 69), (940, 92), (1410, 138)] {
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        let buttons = splash_buttons(&client, AUTO_SCROLL_QUESTION.buttons.len());
+        let new: Vec<(i32, i32, i32, i32)> = buttons
+            .iter()
+            .map(|rect| (rect.left, rect.top, rect.right, rect.bottom))
+            .collect();
+        assert_eq!(new, old(&client), "{width}x{height}");
+        let [yes, no] = old(&client)[..] else {
+            unreachable!()
+        };
+        assert_eq!(splash_button_at(&buttons, (yes.0 + yes.2) / 2), Some(0));
+        assert_eq!(splash_button_at(&buttons, (no.0 + no.2) / 2), Some(1));
+        assert_eq!(splash_button_at(&buttons, yes.2), None, "o vao");
+        assert_eq!(splash_button_at(&buttons, 5), None, "o texto");
+    }
+
+    let client = RECT {
+        left: 0,
+        top: 0,
+        right: 600,
+        bottom: 50,
+    };
+    let three = splash_buttons(&client, 3);
+    assert_eq!(three.len(), 3);
+    assert!(three[2].right <= client.right);
+    for pair in three.windows(2) {
+        assert!(pair[0].right < pair[1].left, "botoes a tocar-se");
+    }
+    assert!(three[0].left > 0, "sobra lugar para a pergunta");
+    assert!(splash_buttons(&client, 0).is_empty());
 }
 
 #[test]
@@ -2664,9 +4166,12 @@ fn render_comparator_bar_preview() {
                 width,
                 1.0,
                 &["Google Gemini", "ChatGPT", "Claude"],
-                visible,
-                hover,
-                true,
+                BarState {
+                    visible,
+                    hover,
+                    auto_scroll: true,
+                    ..BarState::default()
+                },
                 &LivePanel::<()>::off(),
                 &theme,
             );
@@ -5388,10 +6893,57 @@ fn private_palette_paths_never_touch_history_or_context_tabs() {
     assert!(private_split.contains("open_split_mode(source_index, url, false, true, None)"));
 }
 
+/// Gate (critico: apaga dados do utilizador): o percurso do "Apagar
+/// historico" que embarca (`clear_history_targets`, o mesmo que o `App`
+/// corre depois do Sim) chega a CADA alvo registado, pela ordem da tabela,
+/// uma vez so, e a tabela cobre os quatro alvos que existem -- um alvo que
+/// o percurso salte, ou que saia da tabela, fica vermelho aqui. O que o
+/// `App` faz em cada alvo (esquecer a memoria, apagar o historico) NAO se
+/// prova aqui: o braco de cada um esta preso por texto em
+/// `the_shipped_paths_are_wired_to_the_tab_session`.
+#[test]
+fn clear_history_runs_every_registered_target() {
+    struct Recorder(Vec<ClearTarget>);
+    impl ClearHistorySink for Recorder {
+        fn clear(&mut self, target: ClearTarget) {
+            self.0.push(target);
+        }
+    }
+    let mut recorder = Recorder(Vec::new());
+    clear_history_targets(&mut recorder);
+    assert_eq!(
+        recorder.0,
+        ClearTarget::ALL.to_vec(),
+        "cada alvo registado, uma vez, pela ordem"
+    );
+    // Tudo o que existe esta registado, e o historico -- que muda de ecra
+    // e escreve o estado -- vai por ultimo.
+    for target in [
+        ClearTarget::Tabs,
+        ClearTarget::Memory,
+        ClearTarget::EpubLibrary,
+        ClearTarget::Downloads,
+        ClearTarget::History,
+    ] {
+        assert_eq!(
+            CLEAR_HISTORY_TARGETS
+                .iter()
+                .filter(|registered| **registered == target)
+                .count(),
+            1,
+            "{target:?} tem de estar registado uma vez"
+        );
+    }
+    assert_eq!(CLEAR_HISTORY_TARGETS.last(), Some(&ClearTarget::History));
+    assert_eq!(CLEAR_HISTORY_TARGETS.len(), 5);
+}
+
 /// Ligacao, nao comportamento: o comportamento esta nos gates de
 /// `tab_session_gates`. Isto so prende que os caminhos que embarcam
 /// chamam as funcoes que esses gates provam -- um `TabPersistence::forget`
 /// perfeito que "Apagar historico" deixasse de chamar nao apagava nada.
+/// O mesmo para os bracos da memoria e do historico do `ClearHistorySink`
+/// do `App`: presenca por texto, nao comportamento (§4.3).
 #[test]
 fn the_shipped_paths_are_wired_to_the_tab_session() {
     let source = shipped_source();
@@ -5404,19 +6956,40 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
             .to_string()
     };
 
-    let clear = body(
-        "UserEvent::ClearHistory => {",
+    // O braco do event loop e uma linha: pergunta e percorre a tabela dos
+    // alvos (`clear_history.rs`); o gate de comportamento e
+    // clear_history_runs_every_registered_target.
+    let arm = body(
+        "UserEvent::ClearHistory => ",
         "UserEvent::HistoryCleared(result)",
+    );
+    assert!(
+        arm.contains("self.clear_history()"),
+        "o braco ClearHistory chama App::clear_history"
+    );
+    let clear = body(
+        "fn clear_history(&mut self)",
+        "clear_history_targets(self);",
     );
     let confirm = clear
         .find("self.confirm_clear_history()")
         .expect("clearing history asks first");
-    let forget = clear
-        .find("self.forget_tab_session();")
-        .expect("\"Apagar histórico\" must also forget tabs.json");
     assert!(
-        confirm < forget,
-        "tabs.json is wiped only after the owner confirms"
+        clear[confirm..].contains("return;"),
+        "sem o Sim nao se percorre a tabela"
+    );
+    let sink = body("impl ClearHistorySink for App", "impl App {");
+    assert!(
+        sink.contains("ClearTarget::Tabs => self.forget_tab_session(),"),
+        "\"Apagar histórico\" must also forget tabs.json"
+    );
+    assert!(
+        sink.contains("ClearTarget::Memory => self.memory.clear(&mut self.current_research),"),
+        "\"Apagar histórico\" must also clear the semantic memory"
+    );
+    assert!(
+        sink.contains("ClearTarget::History => match self.history.clear() {"),
+        "\"Apagar histórico\" must also clear history.jsonl"
     );
     // O comportamento destes caminhos esta em
     // the_app_path_saves_restores_and_forgets_the_real_tabs_json (sobre o
@@ -5470,10 +7043,13 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
     // cores) junto da pilula nova, como o editor do Chrome.
     let new_group = body("fn group_context_tab", "fn join_context_tab_group");
     assert!(new_group.contains("self.show_group_menu(source_index, group_index, true)"));
-    // A fonte ao lado regista o item de rolagem com a coluna dela.
-    assert!(
-        source.contains("self.install_context_menu(&webview, WebViewHost::Split(source_index));")
-    );
+    // A fonte ao lado recebe os ganchos com a coluna dela e o seu
+    // privado (o item de rolagem vem dai): o HookedBuilder constroi-a com
+    // as duas metades.
+    assert!(source.contains("let host = WebViewHost::split(source_index, private);"));
+    assert!(source.contains(
+        "let hooked = self.hooked_builder(builder, host, build.local_origin.clone());\n        let built = hooked.build_hooked_as_child(window);"
+    ));
 }
 
 #[test]
@@ -5769,6 +7345,24 @@ fn spec_0108_remote_scripts_use_message_transport_without_capability_urls() {
 
 #[test]
 fn spec_0108_remote_navigation_handlers_reject_neuralia_scheme() {
+    // A trava de navegacao de cada WebView e a cadeia da tabela
+    // (`web_navigation_verdict`), instalada por `hooked_builder`: nenhum
+    // builder que embarca instala a sua propria -- uma segunda
+    // `with_navigation_handler` no builder substituiria a da tabela.
+    let root = include_str!("../windows_app.rs");
+    assert!(
+        !root.contains(".with_navigation_handler("),
+        "windows_app.rs"
+    );
+    for (name, content) in ALL_MODULES {
+        if matches!(*name, "webview_hooks.rs" | "tests.rs") {
+            continue;
+        }
+        assert!(
+            !content.contains("with_navigation_handler("),
+            "{name} instala a sua propria trava de navegacao"
+        );
+    }
     let source = shipped_source();
     for builder in [
         "fn pdf_webview_builder",
@@ -5783,11 +7377,28 @@ fn spec_0108_remote_navigation_handlers_reject_neuralia_scheme() {
             .and_then(|part| part.split(".with_permission_handler").next())
             .expect(builder);
         assert!(body.contains("with_ipc_handler"), "{builder}");
-        assert!(
-            body.contains("eq_ignore_ascii_case(\"neuralia:\")"),
-            "{builder}"
-        );
         assert!(!body.contains("remote_neuralia_action"), "{builder}");
+    }
+    // E cada cadeia remota recusa `neuralia:` em qualquer caixa, com ou
+    // sem origem local: uma accao pedida por navegacao nunca navega.
+    for gate in [NavGate::Web, NavGate::Pdf, NavGate::Gmail] {
+        for local_origin in [None, Some("http://127.0.0.1:8000")] {
+            for target in [
+                "neuralia:home",
+                "NEURALIA:home",
+                "NeuRaLia:clearhistory",
+                "neuralia:web?url=https://example.com/",
+                "neuralia://home",
+            ] {
+                assert!(
+                    matches!(
+                        web_navigation_verdict(gate, local_origin, target),
+                        NavVerdict::Deny
+                    ),
+                    "{gate:?} {local_origin:?} {target}"
+                );
+            }
+        }
     }
 }
 
@@ -5819,9 +7430,7 @@ fn epub_pages_reach_native_code_only_through_their_own_channel() {
     );
     for required in [
         "handle_epub_ipc(&source, request.body(), &worker)",
-        ".with_navigation_handler(|target| epub_navigation_allowed(&target))",
         ".with_new_window_req_handler(|_, _| NewWindowResponse::Deny)",
-        ".with_download_started_handler(|_, _| false)",
         "UserEvent::EpubDropped(paths)",
     ] {
         assert!(
@@ -5829,6 +7438,18 @@ fn epub_pages_reach_native_code_only_through_their_own_channel() {
             "epub_webview_builder perdeu {required}"
         );
     }
+    // A trava de navegacao e a recusa de downloads vem da tabela dos
+    // ganchos, pelo hospedeiro Epub que o sitio de nascimento declara.
+    let open = body(&source, "fn open_epub_page", "fn epub_webview_builder");
+    assert!(
+        open.contains(
+            "let builder = self.epub_webview_builder(runtime).with_url(url);\n        let hooked = self.hooked_builder(builder, WebViewHost::Epub, None);\n        let result = hooked.build_hooked(window);"
+        ),
+        "open_epub_page nao passa o builder pelos ganchos do Epub"
+    );
+    let hooks = webview_hooks(WebViewHost::Epub);
+    assert_eq!(hooks.nav_gate, NavGate::Epub);
+    assert_eq!(hooks.downloads, DownloadPolicy::Deny);
     assert!(
         builder.contains(".with_permission_handler(|_| PermissionResponse::Deny)"),
         "epub_webview_builder tem de negar todas as permissoes"
@@ -5848,15 +7469,16 @@ fn epub_pages_reach_native_code_only_through_their_own_channel() {
         );
     }
 
-    // "Apagar historico" apaga tambem a leitura dos livros.
-    let clear = body(
-        &source,
-        "UserEvent::ClearHistory => {",
-        "UserEvent::HistoryCleared(result)",
-    );
+    // "Apagar historico" apaga tambem a leitura dos livros: o alvo
+    // EpubLibrary da tabela (`clear_history.rs`) manda o trabalho ao worker.
+    let clear = body(&source, "impl ClearHistorySink for App", "impl App {");
     assert!(
         clear.contains("self.submit_epub_job(EpubJob::ClearReadingHistory)"),
         "ClearHistory tem de mandar EpubJob::ClearReadingHistory"
+    );
+    assert!(
+        clear.contains("ClearTarget::EpubLibrary => {"),
+        "o alvo dos livros tem de estar registado"
     );
 
     // Ficheiros largados: um evento por ficheiro, o lote inteiro no
@@ -6675,136 +8297,2915 @@ fn column_menu_item_routes_to_that_columns_ctrl_r_toggle() {
     assert!(column_menu_event(COMPARATOR_COLUMNS, COLUMN_MENU_AUTO_SCROLL).is_none());
 }
 
-/// ctx-1: as colunas das IAs E a fonte aberta ao lado -- que o tick da
-/// rolagem tambem rola e onde o Ctrl+R tambem funciona (a resposta de uma
-/// IA pedida no painel privado abre ali) -- recebem o item. O painel
-/// lateral e os servicos, que nao rolam, nao.
+/// ctx-1: as colunas das IAs E a fonte aberta ao lado, privada ou nao --
+/// que o tick da rolagem tambem rola e onde o Ctrl+R tambem funciona (a
+/// resposta de uma IA pedida no painel privado abre ali) -- recebem o item
+/// de rolagem do registo. Nenhum outro hospedeiro o recebe.
 #[test]
 fn ai_columns_and_the_split_get_the_auto_scroll_menu_item() {
     for col in 0..COMPARATOR_COLUMNS {
-        assert_eq!(context_menu_column(WebViewHost::Column(col)), Some(col));
-        assert_eq!(
-            context_menu_column(WebViewHost::Split(col)),
-            Some(col),
-            "a fonte ao lado da coluna {col} rola e tem de oferecer parar"
-        );
-    }
-    for host in [
-        WebViewHost::Column(COMPARATOR_COLUMNS),
-        WebViewHost::Split(COMPARATOR_COLUMNS),
-        WebViewHost::SidePanel,
-        WebViewHost::Service,
-    ] {
-        assert_eq!(context_menu_column(host), None, "{host:?}");
-    }
-
-    // O que `install_context_menu` corre a cada WebView construida: o
-    // registo acontece para as colunas e para a fonte ao lado, com o
-    // indice certo, e para mais nenhuma.
-    for col in 0..COMPARATOR_COLUMNS {
-        for host in [WebViewHost::Column(col), WebViewHost::Split(col)] {
-            let mut registered = Vec::new();
-            let missing = install_column_menu(host, |index| {
-                registered.push(index);
-                Ok(())
-            });
-            assert_eq!(registered, [col], "{host:?}");
-            assert_eq!(missing, None, "{host:?}");
+        for host in [
+            WebViewHost::Column(col),
+            WebViewHost::Split(col),
+            WebViewHost::PrivateSplit(col),
+        ] {
+            assert_eq!(context_menu_column(host), Some(col), "{host:?}");
+            let ids: Vec<usize> = webview_menu_items(host)
+                .into_iter()
+                .map(|item| item.id)
+                .collect();
+            // A rolagem primeiro; depois o bloqueio de anuncios (nao na
+            // fonte privada) e, no fim, «Traduzir página» (translation).
+            let mut expected = vec![COLUMN_MENU_AUTO_SCROLL];
+            if !matches!(host, WebViewHost::PrivateSplit(_)) {
+                expected.extend([ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF]);
+            }
+            expected.push(MENU_TRANSLATE_PAGE);
+            assert_eq!(ids, expected, "{host:?}");
+            assert_eq!(webview_hooks(host).menu, ids, "{host:?}: a tabela diverge");
         }
     }
-    for host in [
-        WebViewHost::SidePanel,
-        WebViewHost::Service,
-        WebViewHost::Column(COMPARATOR_COLUMNS),
-        WebViewHost::Split(COMPARATOR_COLUMNS),
-    ] {
-        let mut registered = Vec::new();
-        let missing = install_column_menu(host, |index| {
-            registered.push(index);
-            Ok(())
-        });
+    // A Web completa nao rola sozinha, mas tem o bloqueio de anuncios e
+    // traduz-se: sem o item de rolagem.
+    assert_eq!(context_menu_column(WebViewHost::External), None);
+    assert_eq!(
+        webview_hooks(WebViewHost::External).menu,
+        [ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF, MENU_TRANSLATE_PAGE]
+    );
+    for host in WebViewHost::ALL
+        .into_iter()
+        .filter(|host| context_menu_column(*host).is_none() && *host != WebViewHost::External)
+        .chain([
+            WebViewHost::Column(COMPARATOR_COLUMNS),
+            WebViewHost::Split(COMPARATOR_COLUMNS),
+            WebViewHost::PrivateSplit(COMPARATOR_COLUMNS),
+        ])
+    {
+        assert_eq!(context_menu_column(host), None, "{host:?}");
         assert!(
-            registered.is_empty(),
-            "{host:?} ganhou o item: {registered:?}"
+            !webview_menu_items(host)
+                .iter()
+                .any(|item| item.id == COLUMN_MENU_AUTO_SCROLL),
+            "{host:?} ganhou o item de rolagem"
         );
-        assert_eq!(missing, None, "{host:?}");
+        assert!(
+            !webview_hooks(host).menu.contains(&COLUMN_MENU_AUTO_SCROLL),
+            "{host:?}"
+        );
     }
-
-    // Um runtime sem ContextMenuRequested: nada sobe nem para, a falha
-    // vira uma linha de log que diz a coluna e porque.
-    let missing = install_column_menu(WebViewHost::Column(2), |_| {
-        Err("ICoreWebView2_11 indisponível: E_NOINTERFACE".to_string())
-    })
-    .expect("a falha do registo fica no log");
-    assert!(missing.contains("coluna 2"), "{missing}");
-    assert!(missing.contains("E_NOINTERFACE"), "{missing}");
+    assert_eq!(
+        WebViewHost::ALL
+            .into_iter()
+            .filter(|host| context_menu_column(*host).is_none())
+            .count(),
+        8,
+        "so tres tipos de hospedeiro rolam"
+    );
 }
 
 /// ctx-2: o que o botao direito de uma coluna faz a CADA pedido, pelo
-/// mesmo `column_menu_responder` que o registo no WebView2 e a pilula
+/// mesmo `webview_menu_responder` que o registo no WebView2 e a pilula
 /// usam. Criado uma vez (como no registo), le o estado da rolagem em cada
 /// pedido -- um rotulo lido no registo ficava "Ativar" para sempre --, poe
-/// o item depois dos nativos e, escolhido, e o Ctrl+R dessa coluna.
+/// os itens depois dos nativos e, escolhido, e o Ctrl+R dessa coluna.
 #[test]
 fn each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r() {
     for col in 0..COMPARATOR_COLUMNS {
-        let flag = SharedFlag::default();
-        let respond = column_menu_responder(col, flag.clone());
+        for host in [
+            WebViewHost::Column(col),
+            WebViewHost::Split(col),
+            WebViewHost::PrivateSplit(col),
+        ] {
+            let flag = SharedFlag::default();
+            let respond = webview_menu_responder(host, flag.clone(), None);
 
-        let first = respond(7);
-        assert_eq!(first.label, LABEL_TURN_ON, "coluna {col}");
-        assert_eq!(
-            first.placement,
-            ColumnMenuPlacement {
-                separator_at: Some(7),
-                item_at: 8,
-            },
-            "copiar, colar e inspecionar ficam onde o WebView2 os pos"
-        );
-        assert!(
-            matches!(first.selected(), Some(UserEvent::ToggleAutoScroll)),
-            "coluna {col}: o item nao faz o Ctrl+R"
-        );
+            let first = respond(7, None);
+            assert_eq!(first.separator_at, Some(7), "{host:?}");
+            assert_eq!(first.items.len(), 2, "{host:?}");
+            // «Traduzir página» logo a seguir a rolagem, com o hospedeiro.
+            assert_eq!(first.items[1].id, MENU_TRANSLATE_PAGE);
+            assert_eq!(first.items[1].label, "Traduzir página");
+            assert_eq!(first.items[1].at, 9);
+            assert!(
+                matches!(
+                    first.items[1].selected(),
+                    Some(UserEvent::Translate(TranslateEvent::Requested(origin))) if origin == host
+                ),
+                "{host:?}: o item nao pede a traducao desta pagina"
+            );
+            assert_eq!(first.items[0].label, LABEL_TURN_ON, "{host:?}");
+            assert_eq!(first.items[0].id, COLUMN_MENU_AUTO_SCROLL);
+            assert_eq!(first.items[0].host, host);
+            assert_eq!(
+                first.items[0].at, 8,
+                "copiar, colar e inspecionar ficam onde o WebView2 os pos"
+            );
+            assert!(
+                matches!(first.items[0].selected(), Some(UserEvent::ToggleAutoScroll)),
+                "{host:?}: o item nao faz o Ctrl+R"
+            );
 
-        // Ctrl+R liga a rolagem entre dois botoes direitos: o MESMO
-        // responder, sem novo registo, ja oferece desativar.
-        assert!(flag.toggle());
-        let second = respond(0);
-        assert_eq!(second.label, LABEL_TURN_OFF, "coluna {col}: rotulo preso");
-        assert_eq!(second.placement.separator_at, None);
-        assert!(matches!(
-            second.selected(),
-            Some(UserEvent::ToggleAutoScroll)
-        ));
+            // Ctrl+R liga a rolagem entre dois botoes direitos: o MESMO
+            // responder, sem novo registo, ja oferece desativar.
+            assert!(flag.toggle());
+            let second = respond(0, None);
+            assert_eq!(
+                second.items[0].label, LABEL_TURN_OFF,
+                "{host:?}: rotulo preso"
+            );
+            assert_eq!(second.separator_at, None);
+            assert_eq!(second.items[0].at, 0);
+            assert!(matches!(
+                second.items[0].selected(),
+                Some(UserEvent::ToggleAutoScroll)
+            ));
 
-        // A pilula usa o mesmo responder, sem itens nativos: o id que o
-        // TrackPopupMenu devolve e o do comando, e so esse faz algo.
-        flag.set(false);
-        let pill = column_menu_responder(col, flag.clone())(0);
-        assert_eq!(pill.label, LABEL_TURN_ON);
-        assert_eq!(pill.command, COLUMN_MENU_AUTO_SCROLL);
-        assert_ne!(pill.command, 0, "0 e o menu fechado sem escolha");
+            // A pilula usa o mesmo responder, sem itens nativos: o id que o
+            // TrackPopupMenu devolve e o do comando, e so esse faz algo.
+            flag.set(false);
+            let pill = webview_menu_responder(host, flag.clone(), None)(0, None);
+            let item = pill
+                .item(COLUMN_MENU_AUTO_SCROLL)
+                .expect("o item da pilula");
+            assert_eq!(item.label, LABEL_TURN_ON);
+            assert!(pill.item(0).is_none(), "0 e o menu fechado sem escolha");
+            // A pilula traz tambem o «Traduzir página» desta coluna.
+            assert!(
+                pill.item(MENU_TRANSLATE_PAGE)
+                    .is_some_and(|item| item.label == "Traduzir página")
+            );
+            assert!(pill.item(MENU_TRANSLATE_PAGE + 1).is_none());
+        }
+    }
+    // Um hospedeiro que nao rola: nem separador nem itens, com nativos ou
+    // sem eles -- o menu do WebView2 fica como veio.
+    for host in [WebViewHost::SidePanel, WebViewHost::Reader] {
+        let respond = webview_menu_responder(host, SharedFlag::default(), None);
+        for native in [0, 7] {
+            let request = respond(native, None);
+            assert_eq!(request.separator_at, None, "{host:?} {native}");
+            assert!(request.items.is_empty(), "{host:?} {native}");
+        }
     }
 }
 
 #[test]
 fn column_menu_item_goes_after_every_native_item() {
-    // Um menu que o WebView2 abriu vazio recebe so o item, sem separador.
+    // Um menu que o WebView2 abriu vazio recebe so os itens, sem separador.
     assert_eq!(
-        column_menu_placement(0),
-        ColumnMenuPlacement {
+        menu_placement(0),
+        MenuPlacement {
             separator_at: None,
-            item_at: 0,
+            first_item_at: 0,
         }
     );
     for native in 1..=40u32 {
-        let placement = column_menu_placement(native);
+        let placement = menu_placement(native);
         // Cada inserção empurra o que esta nesse indice para baixo: um
         // indice abaixo de `native` tiraria copiar/colar/inspecionar do
-        // sitio. O separador fica logo a seguir ao ultimo nativo e o item
-        // logo a seguir ao separador -- o fim do menu, como no Chrome.
+        // sitio. O separador fica logo a seguir ao ultimo nativo e o
+        // primeiro item logo a seguir ao separador -- o fim do menu, como
+        // no Chrome.
         assert_eq!(placement.separator_at, Some(native), "{native} nativos");
-        assert_eq!(placement.item_at, native + 1, "{native} nativos");
+        assert_eq!(placement.first_item_at, native + 1, "{native} nativos");
+    }
+}
+
+// ===================== os ganchos de cada WebView (infra-webview-hooks) =====================
+
+/// O que `install_hooks_with` pediu ao registador, no lugar do COM do
+/// WebView2.
+#[derive(Default)]
+struct RecordingRegistrar {
+    menus: Vec<(WebViewHost, Vec<usize>)>,
+    accelerators: Vec<WebViewHost>,
+    downloads: Vec<WebViewHost>,
+    gates: Vec<WebViewHost>,
+    fail_menu: bool,
+    fail_accelerators: bool,
+    fail_downloads: bool,
+    fail_gate: bool,
+}
+
+impl HookRegistrar for RecordingRegistrar {
+    fn context_menu(&mut self, host: WebViewHost, items: &[usize]) -> Result<(), String> {
+        if self.fail_menu {
+            return Err("ICoreWebView2_11 indisponível: E_NOINTERFACE".to_string());
+        }
+        self.menus.push((host, items.to_vec()));
+        Ok(())
+    }
+    fn accelerators(&mut self, host: WebViewHost) -> Result<(), String> {
+        if self.fail_accelerators {
+            return Err("add_AcceleratorKeyPressed falhou: E_FAIL".to_string());
+        }
+        self.accelerators.push(host);
+        Ok(())
+    }
+    fn downloads(&mut self, host: WebViewHost) -> Result<(), String> {
+        if self.fail_downloads {
+            return Err("ICoreWebView2_4 indisponível: E_NOINTERFACE".to_string());
+        }
+        self.downloads.push(host);
+        Ok(())
+    }
+    fn resource_gate(&mut self, host: WebViewHost) -> Result<(), String> {
+        if self.fail_gate {
+            return Err("add_WebResourceRequested falhou: E_FAIL".to_string());
+        }
+        self.gates.push(host);
+        Ok(())
+    }
+}
+
+/// O que `hook_webview_builder` pos no builder, no lugar do WebViewBuilder
+/// (que nao deixa ler o que recebeu).
+#[derive(Default)]
+struct RecordedHookedBuilder {
+    navigation: Option<Box<dyn Fn(String) -> bool>>,
+    /// O handler de downloads que a tabela pos, ja chamado com um
+    /// download: `Some(true)` recusou-o; `None` e nenhum handler (o
+    /// WebView2 trata os downloads como sempre).
+    download_refused: Option<bool>,
+    page_load: Option<Box<dyn Fn(wry::PageLoadEvent, String)>>,
+}
+
+impl HookedWebViewBuilder for RecordedHookedBuilder {
+    fn with_navigation_handler(mut self, handler: impl Fn(String) -> bool + 'static) -> Self {
+        self.navigation = Some(Box::new(handler));
+        self
+    }
+    fn with_download_started_handler(
+        mut self,
+        mut handler: impl FnMut(String, &mut PathBuf) -> bool + 'static,
+    ) -> Self {
+        let mut path = PathBuf::from("C:/Users/x/Downloads/setup.exe");
+        self.download_refused = Some(!handler(
+            "https://example.com/setup.exe".to_string(),
+            &mut path,
+        ));
+        self
+    }
+    fn with_on_page_load_handler(
+        mut self,
+        handler: impl Fn(wry::PageLoadEvent, String) + 'static,
+    ) -> Self {
+        self.page_load = Some(Box::new(handler));
+        self
+    }
+}
+
+/// Gate: a tabela dos ganchos, linha a linha. As colunas, as fontes ao
+/// lado, a Web completa e os servicos ficam com os downloads do WebView2
+/// (o gestor da 2.3 entra por ai); cada pagina local nossa e o monitor do
+/// Gmail recusam-nos. Cada hospedeiro tem a sua cadeia de navegacao, todos
+/// recebem o AcceleratorKeyPressed, o despachante de recursos e o do
+/// bloqueio de anuncios so nas colunas, na fonte ao lado (nao a privada) e
+/// na Web completa, e o slot das distracoes esta vazio.
+#[test]
+fn the_webview_hooks_table() {
+    use DownloadPolicy::{Deny, Managed};
+    use ResourceGatePolicy::{Adblock, Open};
+    let gated =
+        |menu: &[usize], downloads: DownloadPolicy, gate: ResourceGatePolicy| WebViewHooks {
+            menu: menu.to_vec(),
+            downloads,
+            resource_gate: gate,
+            nav_gate: NavGate::Web,
+            accelerators: true,
+            distraction: None,
+        };
+    // A rolagem, o bloqueio de anuncios e «Traduzir página» (translation),
+    // pela ordem do registo.
+    let scroll_adblock_translate = [
+        COLUMN_MENU_AUTO_SCROLL,
+        ADBLOCK_MENU_SITE,
+        ADBLOCK_MENU_OFF,
+        MENU_TRANSLATE_PAGE,
+    ];
+    let adblock = [ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF];
+    let adblock_translate = [ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF, MENU_TRANSLATE_PAGE];
+    for col in 0..COMPARATOR_COLUMNS {
+        assert_eq!(
+            webview_hooks(WebViewHost::Column(col)),
+            gated(&scroll_adblock_translate, Managed, Adblock)
+        );
+        assert_eq!(
+            webview_hooks(WebViewHost::Split(col)),
+            gated(&scroll_adblock_translate, Managed, Adblock)
+        );
+        assert_eq!(
+            webview_hooks(WebViewHost::PrivateSplit(col)),
+            gated(
+                &[COLUMN_MENU_AUTO_SCROLL, MENU_TRANSLATE_PAGE],
+                Managed,
+                Open
+            )
+        );
+    }
+    assert_eq!(
+        webview_hooks(WebViewHost::Column(COMPARATOR_COLUMNS)),
+        gated(&adblock, Managed, Adblock)
+    );
+    assert_eq!(
+        webview_hooks(WebViewHost::External),
+        gated(&adblock_translate, Managed, Adblock)
+    );
+    let row = |menu: &[usize], downloads: DownloadPolicy, nav_gate: NavGate| WebViewHooks {
+        menu: menu.to_vec(),
+        downloads,
+        resource_gate: Open,
+        nav_gate,
+        accelerators: true,
+        distraction: None,
+    };
+    assert_eq!(
+        webview_hooks(WebViewHost::Reader),
+        row(&[], Deny, NavGate::Reader)
+    );
+    assert_eq!(
+        webview_hooks(WebViewHost::Pdf),
+        row(&[], Deny, NavGate::Pdf)
+    );
+    assert_eq!(
+        webview_hooks(WebViewHost::Epub),
+        row(&[], Deny, NavGate::Epub)
+    );
+    assert_eq!(
+        webview_hooks(WebViewHost::Live),
+        row(&[], Deny, NavGate::Live)
+    );
+    assert_eq!(
+        webview_hooks(WebViewHost::GmailMonitor),
+        row(&[], Deny, NavGate::Gmail)
+    );
+    assert_eq!(
+        webview_hooks(WebViewHost::SidePanel),
+        row(&[], Deny, NavGate::SidePanel)
+    );
+    for service in [
+        Service::Meet,
+        Service::WhatsApp,
+        Service::YouTube,
+        Service::Gmail,
+        Service::Breath,
+    ] {
+        assert_eq!(
+            webview_hooks(WebViewHost::Service(service)),
+            row(&[], Managed, NavGate::Service(service)),
+            "{service:?}"
+        );
+    }
+    // Cada tipo de hospedeiro tem a sua linha, e os nomes nao se repetem.
+    let kinds: Vec<&str> = WebViewHost::ALL.iter().map(|host| host.kind()).collect();
+    for (index, kind) in kinds.iter().enumerate() {
+        assert!(!kinds[..index].contains(kind), "{kind} repetido em ALL");
+    }
+    assert_eq!(WebViewHost::split(1, true), WebViewHost::PrivateSplit(1));
+    assert_eq!(WebViewHost::split(1, false), WebViewHost::Split(1));
+}
+
+/// Gate: toda a WebView recebe os ganchos -- as duas metades, com o
+/// hospedeiro certo, em cada sitio onde uma nasce.
+#[test]
+fn every_webview_gets_the_hooks() {
+    use wry::PageLoadEvent;
+
+    // (a) Depois do build: o registador anota o AcceleratorKeyPressed em
+    // todos os hospedeiros e os itens do menu so nos que rolam.
+    for host in WebViewHost::ALL {
+        let mut registrar = RecordingRegistrar::default();
+        let missing = install_hooks_with(host, &webview_hooks(host), &mut registrar);
+        assert!(missing.is_empty(), "{host:?}: {missing:?}");
+        assert_eq!(
+            registrar.accelerators,
+            vec![host],
+            "{host:?} sem AcceleratorKeyPressed"
+        );
+        let mut expected = Vec::new();
+        if context_menu_column(host).is_some() {
+            expected.push(COLUMN_MENU_AUTO_SCROLL);
+        }
+        if adblock_host(host) {
+            expected.extend([ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF]);
+        }
+        // «Traduzir página»: as paginas que rolam e a Web completa.
+        if context_menu_column(host).is_some() || host == WebViewHost::External {
+            expected.push(MENU_TRANSLATE_PAGE);
+        }
+        if expected.is_empty() {
+            assert!(
+                registrar.menus.is_empty(),
+                "{host:?} ganhou itens de menu: {:?}",
+                registrar.menus
+            );
+        } else {
+            assert_eq!(registrar.menus, vec![(host, expected)], "{host:?}");
+        }
+        // O gestor de downloads: em cada hospedeiro que os aceita, e so
+        // nesses (uma pagina local recusa-os no builder, parte (b)).
+        match webview_hooks(host).downloads {
+            DownloadPolicy::Managed => assert_eq!(
+                registrar.downloads,
+                vec![host],
+                "{host:?} aceita downloads sem o gestor"
+            ),
+            DownloadPolicy::Deny => assert!(
+                registrar.downloads.is_empty(),
+                "{host:?} recusa downloads mas ganhou o gestor"
+            ),
+        }
+        // O despachante de recursos: so onde o bloqueio vale.
+        let gated = matches!(
+            host,
+            WebViewHost::Column(_) | WebViewHost::Split(_) | WebViewHost::External
+        );
+        assert_eq!(
+            registrar.gates,
+            if gated { vec![host] } else { vec![] },
+            "{host:?}: WebResourceRequested"
+        );
+    }
+    // Todos os indices das colunas e cada servico, nao so o representante
+    // de cada tipo: a fonte ao lado de uma coluna qualquer tambem passa pelo
+    // gestor.
+    let mut managed = Vec::new();
+    for col in 0..=COMPARATOR_COLUMNS {
+        managed.extend([
+            WebViewHost::Column(col),
+            WebViewHost::Split(col),
+            WebViewHost::PrivateSplit(col),
+        ]);
+    }
+    managed.push(WebViewHost::External);
+    for service in [
+        Service::Meet,
+        Service::WhatsApp,
+        Service::YouTube,
+        Service::Gmail,
+        Service::Breath,
+    ] {
+        managed.push(WebViewHost::Service(service));
+    }
+    for host in managed {
+        let mut registrar = RecordingRegistrar::default();
+        install_hooks_with(host, &webview_hooks(host), &mut registrar);
+        assert_eq!(registrar.downloads, vec![host], "{host:?} sem o gestor");
+    }
+    let mut registrar = RecordingRegistrar {
+        fail_downloads: true,
+        ..Default::default()
+    };
+    let missing = install_hooks_with(
+        WebViewHost::External,
+        &webview_hooks(WebViewHost::External),
+        &mut registrar,
+    );
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert!(
+        missing[0].contains("web") && missing[0].contains("gestor de downloads"),
+        "{}",
+        missing[0]
+    );
+    // Um runtime sem os eventos: nada sobe nem para, cada falha vira uma
+    // linha de log que diz o hospedeiro e porque, e as outras metades
+    // seguem.
+    let mut registrar = RecordingRegistrar {
+        fail_menu: true,
+        fail_accelerators: true,
+        fail_gate: true,
+        ..Default::default()
+    };
+    let host = WebViewHost::Column(2);
+    let missing = install_hooks_with(host, &webview_hooks(host), &mut registrar);
+    assert_eq!(missing.len(), 3, "{missing:?}");
+    assert!(
+        missing[2].contains("coluna 2") && missing[2].contains("WebResourceRequested"),
+        "{}",
+        missing[2]
+    );
+    assert!(
+        missing[0].contains("coluna 2") && missing[0].contains("E_NOINTERFACE"),
+        "{}",
+        missing[0]
+    );
+    assert!(
+        missing[1].contains("coluna 2") && missing[1].contains("AcceleratorKeyPressed"),
+        "{}",
+        missing[1]
+    );
+    let mut registrar = RecordingRegistrar {
+        fail_menu: true,
+        ..Default::default()
+    };
+    let missing = install_hooks_with(host, &webview_hooks(host), &mut registrar);
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert_eq!(registrar.accelerators, vec![host]);
+
+    // (b) Antes do build: a trava e a cadeia do hospedeiro com a origem
+    // local passada, os downloads recusados onde a tabela manda, e o fim
+    // do carregamento (so ele) vira `PageLoaded` com o hospedeiro. A
+    // geracao de navegacao do hospedeiro (`NavEpoch`, a da Traducao) sobe a
+    // cada navegacao aceite, e so a elas: uma recusada deixa a pagina onde
+    // esta.
+    let local = "http://127.0.0.1:8000";
+    for host in WebViewHost::ALL {
+        let seen: std::rc::Rc<std::cell::RefCell<Vec<UserEvent>>> = Default::default();
+        let sink = std::rc::Rc::clone(&seen);
+        let epoch = NavEpoch::default();
+        let built = hook_webview_builder(
+            RecordedHookedBuilder::default(),
+            host,
+            Some(local.to_string()),
+            Some(epoch.clone()),
+            move |event| sink.borrow_mut().push(event),
+        );
+        let hooks = webview_hooks(host);
+        assert_eq!(
+            built.download_refused,
+            (hooks.downloads == DownloadPolicy::Deny).then_some(true),
+            "{host:?}: downloads"
+        );
+        let navigate = built.navigation.as_ref().expect("navigation handler");
+        for target in [
+            "https://example.com/",
+            "http://127.0.0.1:8000/x",
+            "http://192.168.1.1/",
+            "neuralia:home",
+            "about:blank",
+            "javascript:alert(1)",
+            "http://neuralia-pdf.localhost/viewer.html",
+            "http://neuralia-epub.localhost/library.html",
+            "http://neuralia-live.localhost/live.html",
+            "https://mail.google.com/mail/u/0/",
+            "data:text/html,<p>x</p>",
+        ] {
+            let before = epoch.current();
+            let allowed = navigate(target.to_string());
+            assert_eq!(
+                epoch.current(),
+                before + u64::from(allowed),
+                "{host:?} {target}: a geracao nao seguiu o veredicto (aceite: {allowed})"
+            );
+            match web_navigation_verdict(hooks.nav_gate, Some(local), target) {
+                NavVerdict::Allow => assert!(allowed, "{host:?} {target}"),
+                NavVerdict::Deny => assert!(!allowed, "{host:?} {target}"),
+                NavVerdict::DenyWith(event) => {
+                    assert!(!allowed, "{host:?} {target}");
+                    let sent = seen
+                        .borrow_mut()
+                        .pop()
+                        .unwrap_or_else(|| panic!("{host:?} {target}: sem evento"));
+                    assert_eq!(
+                        format!("{sent:?}"),
+                        format!("{event:?}"),
+                        "{host:?} {target}"
+                    );
+                }
+            }
+            assert!(
+                seen.borrow().is_empty(),
+                "{host:?} {target}: eventos a mais {:?}",
+                seen.borrow()
+            );
+        }
+        let loaded = built.page_load.as_ref().expect("page load handler");
+        loaded(PageLoadEvent::Started, "https://example.com/".to_string());
+        assert!(
+            seen.borrow().is_empty(),
+            "{host:?}: o inicio do carregamento virou evento"
+        );
+        loaded(PageLoadEvent::Finished, "https://example.com/".to_string());
+        assert!(
+            matches!(
+                seen.borrow_mut().pop(),
+                Some(UserEvent::WebView(WebViewEvent::PageLoaded { page, url }))
+                    if page == host && url == "https://example.com/"
+            ),
+            "{host:?}: sem PageLoaded"
+        );
+    }
+
+    // (c) E cada sitio onde uma WebView nasce passa pelas duas metades com
+    // o seu hospedeiro (texto, §4.3: o App nao se constroi sem janela). As
+    // duas metades sao uma so chamada: `hooked_builder` devolve o
+    // `HookedBuilder` (campos privados: nem os sitios nem este teste o
+    // montam), e so `build_hooked`/`build_hooked_as_child` constroem -- o
+    // `build` do wry nao aparece fora do modulo. Assim nenhuma WebView
+    // nasce sem a cadeia, e o hospedeiro da metade do COM e o do builder.
+    let source = shipped_source();
+    let mut outside = include_str!("../windows_app.rs").replace("\r\n", "\n");
+    for (name, content) in ALL_MODULES {
+        if *name != "tests.rs" && *name != "webview_hooks.rs" {
+            outside.push('\n');
+            outside.push_str(&content.replace("\r\n", "\n"));
+        }
+    }
+    assert!(
+        !outside.contains(".build_as_child("),
+        "uma WebView filha nasce fora de HookedBuilder"
+    );
+    assert_eq!(
+        outside.matches(".build(").count(),
+        outside.matches(".build()").count(),
+        "uma WebView de topo nasce fora de HookedBuilder (so o EventLoop chama .build() sem argumentos)"
+    );
+    let module = ALL_MODULES
+        .iter()
+        .find(|(name, _)| *name == "webview_hooks.rs")
+        .map(|(_, content)| content.replace("\r\n", "\n"))
+        .expect("webview_hooks.rs em ALL_MODULES");
+    assert_eq!(module.matches(".build(window)").count(), 1);
+    assert_eq!(module.matches(".build_as_child(window)").count(), 1);
+    assert_eq!(
+        module.matches("install_webview_hooks(").count(),
+        3,
+        "a metade do COM e chamada pelos dois build_hooked e definida uma vez, privada"
+    );
+    assert!(
+        module.contains(
+            "    fn install_webview_hooks(&self, webview: &WebView, host: WebViewHost) {"
+        )
+    );
+
+    // Uma WebView a mais, ou um sitio que constroi sem os ganchos,
+    // desequilibra a conta.
+    let births = source.matches(".build_hooked(window)").count()
+        + source.matches(".build_hooked_as_child(window)").count();
+    assert_eq!(births, 11, "sitios onde uma WebView nasce: {births}");
+    assert_eq!(
+        source.matches(".hooked_builder(").count(),
+        births,
+        "uma WebView nasce sem passar por hooked_builder"
+    );
+    // O que fica por prender e o hospedeiro que cada sitio declara ao
+    // `hooked_builder` -- o argumento que escolhe a cadeia de navegacao e a
+    // politica de downloads dessa WebView: o monitor do Gmail nascido como
+    // `External` aceitava qualquer https e descarregava em silencio, e a
+    // conta acima nao o via. Cada um dos 11 sitios e uma linha com o
+    // hospedeiro literal, colada a ultima linha do builder que ela
+    // embrulha, e aparece uma so vez; a conta garante que nao ha um 12.o.
+    let sites: [(&str, &str); 11] = [
+        (
+            "Column",
+            ".with_url(url.as_str());\n            let hooked = self.hooked_builder(builder, WebViewHost::Column(i), None);",
+        ),
+        (
+            "Split",
+            ".with_url(valid.as_str());\n        let hooked = self.hooked_builder(builder, host, build.local_origin.clone());",
+        ),
+        // A Web completa nasce duas vezes: um link, com a origem local que
+        // a pagina autorizou; o agente, que nunca a tem.
+        (
+            "External",
+            ".external_webview_builder(local_origin.clone(), false)\n            .with_url(url);\n        let hooked = self.hooked_builder(builder, WebViewHost::External, local_origin);",
+        ),
+        (
+            "External",
+            ".external_webview_builder(None, true)\n            .with_url(valid.as_str());\n        let hooked = self.hooked_builder(builder, WebViewHost::External, None);",
+        ),
+        (
+            "Reader",
+            "let builder = self.reader_webview_builder().with_html(html);\n        let hooked = self.hooked_builder(builder, WebViewHost::Reader, None);",
+        ),
+        (
+            "Pdf",
+            ".with_url(format!(\"{PDF_ORIGIN}/viewer.html\"));\n        let hooked = self.hooked_builder(builder, WebViewHost::Pdf, None);",
+        ),
+        (
+            "Epub",
+            "let builder = self.epub_webview_builder(runtime).with_url(url);\n        let hooked = self.hooked_builder(builder, WebViewHost::Epub, None);",
+        ),
+        (
+            "Live",
+            ".with_permission_handler(live_panel_permission);\n        let hooked = self.hooked_builder(builder, WebViewHost::Live, None);",
+        ),
+        (
+            "GmailMonitor",
+            ".with_url(\"https://mail.google.com/mail/u/0/#inbox\");\n        let hooked = self.hooked_builder(builder, WebViewHost::GmailMonitor, None);",
+        ),
+        (
+            "SidePanel",
+            ".with_new_window_req_handler(|_, _| NewWindowResponse::Deny);\n        let hooked = self.hooked_builder(builder, WebViewHost::SidePanel, None);",
+        ),
+        (
+            "Service",
+            ".with_permission_handler(move |kind| service_panel_permission(service, kind));\n        let hooked = self.hooked_builder(builder, WebViewHost::Service(service), None);",
+        ),
+    ];
+    for (kind, site) in sites {
+        assert_eq!(
+            source.matches(site).count(),
+            1,
+            "{kind}: o sitio de nascimento mudou de hospedeiro, de forma ou repete-se:\n{site}"
+        );
+    }
+    // Cada tipo de hospedeiro tem o seu sitio preso; a fonte privada nasce
+    // no sitio da fonte ao lado (`WebViewHost::split(_, private)`).
+    for host in WebViewHost::ALL {
+        let born_at = match host {
+            WebViewHost::PrivateSplit(_) => "Split",
+            other => other.kind(),
+        };
+        assert!(
+            sites.iter().any(|(kind, _)| *kind == born_at),
+            "{}: sem sitio de nascimento preso",
+            host.kind()
+        );
+    }
+    // A fonte ao lado e o unico sitio que passa o hospedeiro por uma
+    // variavel (a coluna e o privado vem do SplitBuild): e esta linha, e
+    // nenhuma outra `let host =` pode sombrea-la.
+    assert_eq!(
+        source.matches("let host = WebViewHost::").count(),
+        1,
+        "um sitio escolhe o hospedeiro fora da linha do hooked_builder"
+    );
+    assert!(source.contains("let host = WebViewHost::split(source_index, private);"));
+}
+
+/// Gate (critico: navegacao e origens locais): a cadeia de cada hospedeiro
+/// da, para cada alvo, exatamente o que o closure que cada builder tinha
+/// ate a 2.2.0 dava -- o veredicto e o evento. Os closures de antes estao
+/// aqui, letra por letra, como oraculo.
+#[test]
+fn navigation_verdicts_are_the_ones_the_builders_gave() {
+    type Oracle = Box<dyn Fn(String) -> (bool, Vec<String>)>;
+    let neuralia = |target: &str| {
+        target
+            .get(..9)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
+    };
+    let web = |local_origin: Option<String>| -> Oracle {
+        Box::new(move |target| {
+            if neuralia(&target) {
+                return (false, vec![]);
+            }
+            (
+                remote_web_target(&target, local_origin.as_deref())
+                    || is_view_source_target(&target, local_origin.as_deref()),
+                vec![],
+            )
+        })
+    };
+    // O PDF nunca teve origem local no closure: o oraculo e o mesmo com e
+    // sem ela.
+    let pdf = || -> Oracle {
+        Box::new(move |target| {
+            if neuralia(&target) {
+                return (false, vec![]);
+            }
+            if is_pdf_internal_target(&target) {
+                return (true, vec![]);
+            }
+            let mut sent = vec![];
+            if remote_web_target(&target, None) {
+                sent.push(format!("{:?}", UserEvent::OpenExternal(target)));
+            }
+            (false, sent)
+        })
+    };
+    let reader: Oracle = Box::new(|target| {
+        if target.starts_with("about:blank") {
+            return (true, vec![]);
+        }
+        let Ok(action_url) = Url::parse(&target) else {
+            return (false, vec![]);
+        };
+        if action_url.scheme() != "neuralia" {
+            return (false, vec![]);
+        }
+        if let Some(event) = neuralia_action(&target) {
+            return (false, vec![format!("{event:?}")]);
+        }
+        let mut sent = vec![];
+        match action_url.path().trim_matches('/') {
+            "home" => sent.push(format!("{:?}", UserEvent::HomeRequested)),
+            "web" => {
+                if let Some((_, value)) = action_url.query_pairs().find(|(key, _)| key == "url")
+                    && neural_core::validate_web_url(value.as_ref()).is_ok()
+                {
+                    sent.push(format!("{:?}", UserEvent::OpenExternal(value.into_owned())));
+                }
+            }
+            _ => {}
+        }
+        (false, sent)
+    });
+    let epub: Oracle =
+        Box::new(|target| (crate::epub_app::epub_navigation_allowed(&target), vec![]));
+    let live: Oracle = Box::new(|target| (live_panel_allows_navigation(&target), vec![]));
+    let gmail: Oracle = Box::new(move |target| {
+        if neuralia(&target) {
+            return (false, vec![]);
+        }
+        (
+            Url::parse(&target).ok().is_some_and(|url| {
+                url.scheme() == "https"
+                    && matches!(
+                        url.host_str(),
+                        Some("mail.google.com") | Some("accounts.google.com")
+                    )
+            }),
+            vec![],
+        )
+    });
+    let side_panel: Oracle = Box::new(|target| (panel_allows_navigation(&target), vec![]));
+    let service = |service: Service| -> Oracle {
+        Box::new(move |target| (service_panel_navigation(service, &target), vec![]))
+    };
+
+    let local = "http://192.168.1.50:3000";
+    let mut gates: Vec<(NavGate, Option<&str>, Oracle)> = vec![
+        (NavGate::Web, None, web(None)),
+        (NavGate::Web, Some(local), web(Some(local.to_string()))),
+        (NavGate::Pdf, None, pdf()),
+        (NavGate::Pdf, Some(local), pdf()),
+        (NavGate::Reader, None, reader),
+        (NavGate::Epub, None, epub),
+        (NavGate::Live, None, live),
+        (NavGate::Gmail, None, gmail),
+        (NavGate::SidePanel, None, side_panel),
+    ];
+    for kind in [
+        Service::Meet,
+        Service::WhatsApp,
+        Service::YouTube,
+        Service::Gmail,
+        Service::Breath,
+    ] {
+        gates.push((NavGate::Service(kind), None, service(kind)));
+    }
+
+    let corpus = [
+        "about:blank",
+        "ABOUT:BLANK",
+        "about:blank#x",
+        "about:blank.evil",
+        "   about:blank  ",
+        "about:srcdoc",
+        "neuralia:home",
+        "NEURALIA:home",
+        "neuralia:back",
+        "neuralia:clearhistory",
+        "neuralia:zoomin?x=1",
+        "neuralia:desconhecido",
+        "neuralia:/home/",
+        "neuralia:/web?url=https://example.com/",
+        "neuralia:web?url=https://example.com/x",
+        "neuralia:web?url=file:///C:/x",
+        "neuralia:web?url=http://192.168.1.1/",
+        "neuralia:web?other=1",
+        "neuralia://home",
+        "https://example.com/",
+        "https://example.com/x?y=1#z",
+        "https://example.com/home",
+        "https://example.com/web?url=https://example.com/x",
+        "http://192.168.1.50:3000/home",
+        "file:///home",
+        "http://example.com/",
+        "HTTPS://EXAMPLE.COM/",
+        "https://user:pw@example.com/",
+        "http://192.168.1.50:3000/",
+        "http://192.168.1.50:3000/x",
+        "http://192.168.1.50:9000/",
+        "http://192.168.1.51:3000/",
+        "http://192.168.1.1/admin",
+        "http://127.0.0.1:8080/",
+        "http://localhost/",
+        "http://10.0.0.1/",
+        "view-source:https://example.com/",
+        "view-source:http://192.168.1.50:3000/",
+        "view-source:http://192.168.1.1/",
+        "view-source:about:blank",
+        "view-source:neuralia:home",
+        "VIEW-SOURCE:https://example.com/",
+        "file:///C:/Windows/win.ini",
+        "javascript:alert(1)",
+        "data:text/html,<p>x</p>",
+        "DATA:TEXT/HTML,<p>x</p>",
+        "data:text/plain,x",
+        "ftp://example.com/",
+        "chrome://settings",
+        "edge://settings",
+        "",
+        "   ",
+        "not a url",
+        "http://neuralia-pdf.localhost/viewer.html",
+        "http://neuralia-pdf.localhost/",
+        "http://neuralia-pdf.localhost:8080/viewer.html",
+        "https://neuralia-pdf.localhost/viewer.html",
+        "http://neuralia-pdf.localhost.evil.com/",
+        "neuralia-pdf://viewer",
+        "http://neuralia-epub.localhost/library.html",
+        "http://neuralia-epub.localhost/reader.html",
+        "http://neuralia-epub.localhost/reader.html?id=abc",
+        "http://neuralia-epub.localhost/x",
+        "http://neuralia-epub.localhost:8080/library.html",
+        "http://user:pw@neuralia-epub.localhost/library.html",
+        "http://neuralia-live.localhost/live.html",
+        "http://neuralia-live.localhost/live.html#fim",
+        "http://NEURALIA-LIVE.localhost/live.html",
+        "http://neuralia-live.localhost/live.js",
+        "http://neuralia-live.localhost/",
+        "https://neuralia-live.localhost/live.html",
+        "https://mail.google.com/mail/u/0/#inbox",
+        "https://accounts.google.com/ServiceLogin",
+        "http://mail.google.com/",
+        "https://mail.google.com.evil.com/",
+        "https://evil.com/?u=https://mail.google.com/",
+        "https://www.youtube.com/watch?v=1",
+        "https://youtube.com/",
+        "https://youtu.be/x",
+        "https://m.youtube.com/watch?v=1",
+        "https://consent.youtube.com/m?continue=x",
+        "https://consent.google.com/ml?continue=x",
+        "http://www.youtube.com/watch?v=1",
+        "https://youtube.com.evil.example/",
+        "https://www.youtube.com@evil.example/",
+        "https://notyoutube.com/",
+        "https://www.google.com/",
+        "https://web.whatsapp.com/",
+        "https://meet.google.com/abc",
+        "https://aistudio.google.com/apikey",
+        "https://generativelanguage.googleapis.com/",
+    ];
+    let mut compared = 0usize;
+    for (gate, local_origin, oracle) in &gates {
+        for target in corpus {
+            let (expected_allowed, expected_sent) = oracle(target.to_string());
+            let (allowed, sent) = match web_navigation_verdict(*gate, *local_origin, target) {
+                NavVerdict::Allow => (true, vec![]),
+                NavVerdict::Deny => (false, vec![]),
+                NavVerdict::DenyWith(event) => (false, vec![format!("{event:?}")]),
+            };
+            assert_eq!(
+                (allowed, &sent),
+                (expected_allowed, &expected_sent),
+                "{gate:?} {local_origin:?} {target:?}"
+            );
+            compared += 1;
+        }
+    }
+    assert_eq!(compared, gates.len() * corpus.len());
+    // A cadeia nao e trivial: cada uma deixa passar alguma coisa e recusa
+    // alguma coisa, e as que agem mandam eventos.
+    for (gate, local_origin, _) in &gates {
+        let verdicts: Vec<NavVerdict> = corpus
+            .iter()
+            .map(|target| web_navigation_verdict(*gate, *local_origin, target))
+            .collect();
+        assert!(
+            verdicts.iter().any(|v| matches!(v, NavVerdict::Allow)),
+            "{gate:?} nunca deixa passar"
+        );
+        assert!(
+            verdicts.iter().any(|v| matches!(v, NavVerdict::Deny)),
+            "{gate:?} nunca recusa"
+        );
+        if matches!(gate, NavGate::Pdf | NavGate::Reader) {
+            assert!(
+                verdicts
+                    .iter()
+                    .any(|v| matches!(v, NavVerdict::DenyWith(_))),
+                "{gate:?} nunca age"
+            );
+        }
+    }
+    // A origem local so conta para a Web: com ela, a coluna/fonte/Web
+    // completa abre a origem autorizada e so ela.
+    assert!(matches!(
+        web_navigation_verdict(NavGate::Web, Some(local), "http://192.168.1.50:3000/x"),
+        NavVerdict::Allow
+    ));
+    assert!(matches!(
+        web_navigation_verdict(NavGate::Web, None, "http://192.168.1.50:3000/x"),
+        NavVerdict::Deny
+    ));
+    assert!(matches!(
+        web_navigation_verdict(NavGate::Web, Some(local), "http://192.168.1.51:3000/"),
+        NavVerdict::Deny
+    ));
+}
+
+/// Gate (critico: origens locais): o despachante de recursos nunca responde
+/// a um pedido a um esquema proprio do wry -- quem serve o PDF, os livros e
+/// o Live e o protocolo deles, e uma resposta daqui deixava a pagina sem
+/// nada. E hoje nao responde a mais nada: nenhuma politica bloqueia.
+#[test]
+fn custom_schemes_are_never_answered_by_the_resource_gate() {
+    let custom = [
+        "http://neuralia-pdf.localhost/viewer.html",
+        "http://neuralia-pdf.localhost/pdf.worker.mjs",
+        "http://NEURALIA-PDF.localhost/viewer.html",
+        "https://neuralia-pdf.localhost/viewer.html",
+        "neuralia-pdf://viewer.html",
+        "http://neuralia-epub.localhost/library.html",
+        "http://neuralia-epub.localhost/book/abc/OEBPS/ch1.xhtml",
+        "neuralia-epub://library.html",
+        "http://neuralia-live.localhost/live.html",
+        "http://neuralia-live.localhost/live.js",
+        "neuralia-live://live.html",
+        "  http://neuralia-live.localhost/live.html  ",
+    ];
+    let other = [
+        "https://example.com/",
+        "https://ads.example.com/tracker.js",
+        "http://neuralia-pdf.localhost.evil.com/viewer.html",
+        "http://neuralia-pdf.localhost:8080/viewer.html",
+        "http://evil.com/?u=http://neuralia-pdf.localhost/",
+        "http://127.0.0.1:8080/",
+        "about:blank",
+        "",
+    ];
+    for uri in custom {
+        assert!(is_custom_scheme_request(uri), "{uri}");
+    }
+    for uri in other {
+        assert!(!is_custom_scheme_request(uri), "{uri}");
+    }
+    // Mesmo com uma lista que nomeia tudo e numa pagina da internet, um
+    // esquema proprio nunca e respondido; sem regras, nada e respondido.
+    let everything = adblock_test_rules(&[
+        "neuralia-pdf.localhost",
+        "neuralia-epub.localhost",
+        "neuralia-live.localhost",
+        "localhost",
+        "example.com",
+        "evil.com",
+    ]);
+    let page = ResourcePage {
+        top: "https://news.site.test/",
+        kind: neural_core::adblock::ResourceKind::Script,
+    };
+    for host in WebViewHost::ALL {
+        for uri in custom {
+            assert!(
+                !resource_gate_answers(host, uri, page, Some(&everything)),
+                "{host:?} respondeu a {uri}"
+            );
+        }
+        for uri in custom.iter().chain(other.iter()) {
+            assert!(
+                !resource_gate_answers(host, uri, page, None),
+                "{host:?} respondeu a {uri} sem regras"
+            );
+        }
+    }
+    assert_eq!(
+        CUSTOM_SCHEMES,
+        ["neuralia-pdf", "neuralia-epub", "neuralia-live"]
+    );
+}
+
+// ===================== o bloqueio de anuncios (adblock) =====================
+
+/// Regras do bloqueio com estes dominios e nenhum site permitido.
+fn adblock_test_rules(domains: &[&str]) -> neural_core::adblock::AdblockRules {
+    let mut set = neural_core::adblock::DomainSet::new();
+    for domain in domains {
+        set.insert(domain);
+    }
+    neural_core::adblock::AdblockRules::new(Arc::new(set), Default::default())
+}
+
+fn webview2_context(name: &str) -> i32 {
+    use webview2_com::Microsoft::Web::WebView2::Win32::*;
+    match name {
+        "document" => COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT.0,
+        "script" => COREWEBVIEW2_WEB_RESOURCE_CONTEXT_SCRIPT.0,
+        "image" => COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE.0,
+        "xhr" => COREWEBVIEW2_WEB_RESOURCE_CONTEXT_XML_HTTP_REQUEST.0,
+        "fetch" => COREWEBVIEW2_WEB_RESOURCE_CONTEXT_FETCH.0,
+        "ping" => COREWEBVIEW2_WEB_RESOURCE_CONTEXT_PING.0,
+        "other" => COREWEBVIEW2_WEB_RESOURCE_CONTEXT_OTHER.0,
+        _ => panic!("{name}"),
+    }
+}
+
+/// Gate (critico, sabotagem obrigatoria: "a fonte ao lado sem o gancho"):
+/// o `WebResourceRequested` do bloqueio e registado nas tres colunas, na
+/// fonte ao lado de cada uma e na Web completa -- e so ai. A fonte privada,
+/// as paginas locais, o painel, o Live, o monitor do Gmail e os servicos
+/// nunca o recebem, e o despachante nunca responde nelas.
+#[test]
+fn the_adblock_gate_is_installed_on_columns_split_and_external_only() {
+    let rules = adblock_test_rules(&["doubleclick.net"]);
+    let ad = "https://ad.doubleclick.net/pixel.js";
+    let page = ResourcePage {
+        top: "https://news.site.test/article",
+        kind: neural_core::adblock::ResourceKind::Script,
+    };
+    let mut hosts: Vec<WebViewHost> = WebViewHost::ALL.to_vec();
+    for col in 0..COMPARATOR_COLUMNS {
+        hosts.extend([
+            WebViewHost::Column(col),
+            WebViewHost::Split(col),
+            WebViewHost::PrivateSplit(col),
+        ]);
+    }
+    for service in [
+        Service::Meet,
+        Service::WhatsApp,
+        Service::YouTube,
+        Service::Gmail,
+        Service::Breath,
+    ] {
+        hosts.push(WebViewHost::Service(service));
+    }
+    let mut installed = Vec::new();
+    for host in hosts {
+        let mut registrar = RecordingRegistrar::default();
+        let missing = install_hooks_with(host, &webview_hooks(host), &mut registrar);
+        assert!(missing.is_empty(), "{host:?}: {missing:?}");
+        let expected = matches!(
+            host,
+            WebViewHost::Column(_) | WebViewHost::Split(_) | WebViewHost::External
+        );
+        assert_eq!(
+            registrar.gates,
+            if expected { vec![host] } else { vec![] },
+            "{host:?}"
+        );
+        assert_eq!(
+            resource_gate_answers(host, ad, page, Some(&rules)),
+            expected,
+            "{host:?}: o despachante"
+        );
+        if expected {
+            installed.push(host);
+        }
+    }
+    for col in 0..COMPARATOR_COLUMNS {
+        assert!(installed.contains(&WebViewHost::Split(col)), "fonte {col}");
+        assert!(
+            installed.contains(&WebViewHost::Column(col)),
+            "coluna {col}"
+        );
+        assert!(
+            !installed.contains(&WebViewHost::PrivateSplit(col)),
+            "privada {col}"
+        );
+    }
+    assert!(installed.contains(&WebViewHost::External));
+}
+
+/// Gate (critico): o caminho que embarca -- o `ResourceContext` do WebView2
+/// lido por `resource_kind_of`, o `Source` do sender como topo e o
+/// despachante -- bloqueia o anuncio e nunca o proprio documento, nem nada
+/// numa pagina de IA ou de login, nem com o bloqueio sem lista.
+#[test]
+fn the_shipped_gate_blocks_ads_but_never_documents_or_ai_pages() {
+    use neural_core::adblock::ResourceKind;
+    assert_eq!(
+        resource_kind_of(webview2_context("document")),
+        ResourceKind::Document
+    );
+    for other in ["script", "image", "xhr", "fetch", "ping", "other"] {
+        assert_ne!(
+            resource_kind_of(webview2_context(other)),
+            ResourceKind::Document,
+            "{other}"
+        );
+    }
+    assert_eq!(
+        resource_kind_of(webview2_context("script")),
+        ResourceKind::Script
+    );
+    assert_eq!(resource_kind_of(-1), ResourceKind::Other);
+
+    let rules = adblock_test_rules(&["doubleclick.net", "ads.example.io"]);
+    let ad = "https://ad.doubleclick.net/pixel.js";
+    for host in [
+        WebViewHost::Column(0),
+        WebViewHost::Split(1),
+        WebViewHost::External,
+    ] {
+        let at = |top: &str, context: &str| {
+            resource_gate_answers(
+                host,
+                ad,
+                ResourcePage {
+                    top,
+                    kind: resource_kind_of(webview2_context(context)),
+                },
+                Some(&rules),
+            )
+        };
+        for context in ["script", "image", "xhr", "fetch", "ping", "other"] {
+            assert!(at("https://news.site.test/", context), "{host:?} {context}");
+        }
+        assert!(
+            !at("https://news.site.test/", "document"),
+            "{host:?}: documento"
+        );
+        for ai in [
+            "https://chatgpt.com/c/1",
+            "https://claude.ai/new",
+            "https://www.google.com/search?udm=50&q=x",
+            "https://gemini.google.com/app",
+            "https://accounts.google.com/signin",
+            "https://login.microsoftonline.com/",
+        ] {
+            assert!(!at(ai, "script"), "{host:?}: {ai}");
+        }
+        // A pesquisa normal do Google nao e uma IA.
+        assert!(
+            at("https://www.google.com/search?q=x", "script"),
+            "{host:?}"
+        );
+        // Topo que nao e web (about:blank): a lista vale.
+        assert!(at("about:blank", "script"), "{host:?}");
+        // Sem regras, e um endereco que nao se le: nada.
+        assert!(!resource_gate_answers(
+            host,
+            ad,
+            ResourcePage {
+                top: "https://news.site.test/",
+                kind: ResourceKind::Script
+            },
+            None
+        ));
+        assert!(!resource_gate_answers(
+            host,
+            "not a url",
+            ResourcePage {
+                top: "https://news.site.test/",
+                kind: ResourceKind::Script
+            },
+            Some(&rules)
+        ));
+    }
+}
+
+/// O menu do bloqueio de anuncios, pelo mesmo responder que o registo no
+/// WebView2 usa: "Ativar" com o bloqueio desligado; a caixa do site com a
+/// contagem da pagina a vista; cinzento nas IAs; nada fora da web.
+#[test]
+fn the_adblock_menu_follows_the_page_and_the_state() {
+    let shared = Arc::new(AdblockShared::default());
+    let blocked = Arc::new(PageBlocked::default());
+    let source = AdblockMenuSource {
+        shared: Arc::clone(&shared),
+        blocked: Arc::clone(&blocked),
+    };
+    let host = WebViewHost::Column(1);
+    let respond = webview_menu_responder(host, SharedFlag::default(), Some(source));
+    let labels = |request: &MenuRequest| -> Vec<String> {
+        request
+            .items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect()
+    };
+
+    // Desligado: "Ativar" numa pagina web, nada fora dela. «Traduzir
+    // página» (translation) vem sempre no fim, com ou sem o bloqueio.
+    let request = respond(4, Some("https://news.site.test/a"));
+    assert_eq!(
+        labels(&request),
+        [LABEL_TURN_ON, LABEL_ADBLOCK_ACTIVATE, TRANSLATE_PAGE_LABEL]
+    );
+    assert_eq!(request.items[1].at, 6);
+    assert_eq!(request.items[1].id, ADBLOCK_MENU_SITE);
+    assert!(matches!(
+        request.items[1].selected(),
+        Some(UserEvent::Adblock(AdblockEvent::Activate))
+    ));
+    for page in [
+        None,
+        Some("about:blank"),
+        Some("data:text/html,x"),
+        Some("nao e url"),
+    ] {
+        assert_eq!(
+            labels(&respond(0, page)),
+            [LABEL_TURN_ON, TRANSLATE_PAGE_LABEL],
+            "{page:?}"
+        );
+    }
+
+    // A preparar a lista: cinzento, sem accao; "Desativar" ao lado.
+    shared_set(&shared, AdblockView::Preparing);
+    let request = respond(0, Some("https://news.site.test/a"));
+    assert_eq!(
+        labels(&request),
+        [
+            LABEL_TURN_ON,
+            LABEL_ADBLOCK_PREPARING,
+            LABEL_ADBLOCK_DEACTIVATE,
+            TRANSLATE_PAGE_LABEL
+        ]
+    );
+    assert!(!request.items[1].enabled);
+    assert!(request.items[1].selected().is_none());
+
+    // Ativo: a caixa do site (sem www), marcada, com a contagem DESTA pagina.
+    let rules = adblock_test_rules(&["doubleclick.net"]);
+    shared_set(&shared, AdblockView::Active(Arc::new(rules)));
+    blocked.record("https://www.news.site.test/a#top");
+    for _ in 0..11 {
+        blocked.record("https://www.news.site.test/a");
+    }
+    let request = respond(0, Some("https://www.news.site.test/a"));
+    let site = &request.items[1];
+    assert_eq!(
+        site.label,
+        "Bloquear anúncios em news.site.test (12 bloqueados)"
+    );
+    assert_eq!(site.checked, Some(true));
+    assert!(site.enabled);
+    assert!(matches!(
+        site.selected(),
+        Some(UserEvent::Adblock(AdblockEvent::SetSite { ref site, block: false })) if site == "news.site.test"
+    ));
+    assert_eq!(request.items[2].label, LABEL_ADBLOCK_DEACTIVATE);
+    assert!(matches!(
+        request.items[2].selected(),
+        Some(UserEvent::Adblock(AdblockEvent::Deactivate))
+    ));
+    // Outra pagina recomeca do zero.
+    let other = respond(0, Some("https://other.test/"));
+    assert_eq!(
+        other.items[1].label,
+        "Bloquear anúncios em other.test (0 bloqueados)"
+    );
+    blocked.record("https://other.test/");
+    assert_eq!(blocked.count("https://www.news.site.test/a"), 0);
+    assert_eq!(blocked.count("https://other.test/#x"), 1);
+
+    // Um site permitido: a caixa desmarcada, sem contagem; escolhe-la volta a bloquear.
+    let mut allowed = std::collections::BTreeSet::new();
+    allowed.insert("news.site.test".to_string());
+    let mut set = neural_core::adblock::DomainSet::new();
+    set.insert("doubleclick.net");
+    shared_set(
+        &shared,
+        AdblockView::Active(Arc::new(neural_core::adblock::AdblockRules::new(
+            Arc::new(set),
+            allowed,
+        ))),
+    );
+    let request = respond(0, Some("https://news.site.test/a"));
+    assert_eq!(
+        request.items[1].label,
+        "Bloquear anúncios em news.site.test"
+    );
+    assert_eq!(request.items[1].checked, Some(false));
+    assert!(matches!(
+        request.items[1].selected(),
+        Some(UserEvent::Adblock(AdblockEvent::SetSite {
+            block: true,
+            ..
+        }))
+    ));
+
+    // Um IP ou localhost: a escolha nao se guardaria, nada do bloqueio.
+    for local in ["http://127.0.0.1:8080/", "http://localhost:3000/"] {
+        assert_eq!(
+            labels(&respond(0, Some(local))),
+            [LABEL_TURN_ON, TRANSLATE_PAGE_LABEL],
+            "{local}"
+        );
+    }
+
+    // Uma IA ou um login: cinzento, marcado como desligado, sem accao.
+    for ai in ["https://chatgpt.com/c/1", "https://accounts.google.com/"] {
+        let request = respond(0, Some(ai));
+        let item = &request.items[1];
+        assert_eq!(item.label, LABEL_ADBLOCK_ALWAYS_OFF, "{ai}");
+        assert!(item.label.contains("Sempre desligado nas páginas das IAs"));
+        assert_eq!(item.checked, Some(false));
+        assert!(!item.enabled);
+        assert!(item.selected().is_none(), "{ai}");
+    }
+
+    // A fonte privada e os outros hospedeiros nao tem o bloqueio no menu.
+    let private = webview_menu_responder(WebViewHost::PrivateSplit(1), SharedFlag::default(), None);
+    assert_eq!(
+        labels(&private(0, Some("https://news.site.test/a"))),
+        [LABEL_TURN_ON, TRANSLATE_PAGE_LABEL]
+    );
+    assert_eq!(group_thousands(4512), "4 512");
+    assert_eq!(group_thousands(512), "512");
+    assert_eq!(group_thousands(1_234_567), "1 234 567");
+}
+
+fn shared_set(shared: &AdblockShared, view: AdblockView) {
+    shared.set_view(view);
+}
+
+/// Gate (amostrado): a renovacao da lista nunca fica devida na Home -- nem
+/// no Leitor, no PDF ou nos livros; so no comparador e na Web completa.
+#[test]
+fn adblock_refresh_is_never_due_on_home() {
+    use neural_core::adblock::{REFRESH_EVERY_MS, RefreshState, refresh_due};
+    let now = 1_000 * REFRESH_EVERY_MS;
+    let stale = RefreshState {
+        enabled: true,
+        fetched_ms: Some(now - 2 * REFRESH_EVERY_MS),
+        in_flight: false,
+        last_failure_ms: None,
+        private: false,
+    };
+    for (surface, due) in [
+        (Surface::Home, false),
+        (Surface::Reader, false),
+        (Surface::Pdf, false),
+        (Surface::Epub, false),
+        (Surface::Comparator, true),
+        (Surface::External, true),
+    ] {
+        assert_eq!(
+            refresh_due(now, adblock_refresh_surface(surface), &stale),
+            due,
+            "{surface:?}"
+        );
+    }
+    // O gancho so pergunta nas paginas web.
+    for host in WebViewHost::ALL {
+        assert_eq!(
+            adblock_host(host),
+            matches!(
+                host,
+                WebViewHost::Column(_) | WebViewHost::Split(_) | WebViewHost::External
+            ),
+            "{host:?}"
+        );
+    }
+}
+
+/// Gate (presenca proibida, §4.3): o handler do `WebResourceRequested` le a
+/// pagina e o ambiente do `sender` do evento, nunca de uma WebView
+/// capturada (uma WebView capturada responderia pela pagina errada depois
+/// de uma navegacao ou de a WebView morrer).
+#[test]
+fn the_resource_handler_reads_the_sender_never_a_captured_webview() {
+    let source = shipped_source();
+    let start = source
+        .find("WebResourceRequestedEventHandler::create(Box::new(move |sender, args| {")
+        .expect("o handler do WebResourceRequested");
+    let end = start
+        + source[start..]
+            .find("\n    }));\n")
+            .expect("o fim do handler");
+    let handler = &source[start..end];
+    assert!(handler.contains("sender.Source(&mut top)"), "{handler}");
+    assert!(handler.contains("sender.cast::<ICoreWebView2_2>()?.Environment()"));
+    assert!(handler.contains("CreateWebResourceResponse("));
+    assert!(handler.contains("resource_gate_answers(host, &uri, page, Some(&rules))"));
+    assert!(!handler.contains("webview"), "o handler nomeia uma WebView");
+    assert_eq!(
+        source
+            .matches("WebResourceRequestedEventHandler::create(")
+            .count(),
+        1,
+        "um so handler de recursos no produto"
+    );
+}
+
+// ===================== o registo dos comandos e o mapa de teclas (infra-commands-keymap) =====================
+
+use std::collections::{HashMap, HashSet};
+use std::sync::RwLock;
+
+/// O que um atalho corre, pelo caminho do produto: o `RunCommandKey` da
+/// decisao entregue inteiro a `command_key_event`, como o event loop o
+/// entrega (em Debug; o `UserEvent` nao tem `PartialEq`). `None`: tecla nao
+/// tratada, ou um comando que nada faz dali.
+fn chord_command_event(decision: &AcceleratorDecision) -> Option<String> {
+    match &decision.event {
+        Some(press @ UserEvent::RunCommandKey { .. }) => {
+            command_key_event(press).map(|event| format!("{event:?}"))
+        }
+        Some(other) => panic!("a decisao deu um evento que nao e um comando: {other:?}"),
+        None => None,
+    }
+}
+
+/// Uma descida de `chord`, nem repetida nem subida.
+fn press(chord: Chord) -> AcceleratorInput {
+    AcceleratorInput {
+        vk: chord.vk,
+        down: true,
+        ctrl: chord.ctrl,
+        shift: chord.shift,
+        alt: chord.alt,
+        repeat: false,
+    }
+}
+
+/// Cada hospedeiro do produto: as tres colunas, as tres fontes ao lado
+/// (normal e privada), as paginas unicas, os paineis e cada servico.
+fn every_host() -> Vec<WebViewHost> {
+    let mut hosts = Vec::new();
+    for col in 0..COMPARATOR_COLUMNS {
+        hosts.extend([
+            WebViewHost::Column(col),
+            WebViewHost::Split(col),
+            WebViewHost::PrivateSplit(col),
+        ]);
+    }
+    hosts.extend([
+        WebViewHost::External,
+        WebViewHost::Reader,
+        WebViewHost::Pdf,
+        WebViewHost::Epub,
+        WebViewHost::Live,
+        WebViewHost::GmailMonitor,
+        WebViewHost::SidePanel,
+    ]);
+    for service in [
+        Service::Meet,
+        Service::WhatsApp,
+        Service::YouTube,
+        Service::Gmail,
+        Service::Breath,
+    ] {
+        hosts.push(WebViewHost::Service(service));
+    }
+    hosts
+}
+
+/// A janela, a omnibox e cada hospedeiro.
+fn every_origin() -> Vec<CommandOrigin> {
+    let mut origins = vec![CommandOrigin::Window, CommandOrigin::Omnibox];
+    origins.extend(every_host().into_iter().map(CommandOrigin::Host));
+    origins
+}
+
+/// Uma linha de teste do registo com estes atalhos (pelo mesmo
+/// `Keymap::build` que o produto usa).
+fn test_row(id: CommandId, chords: &[(KeyScope, Chord)]) -> CommandRow {
+    let chords: Vec<ChordSpec> = chords
+        .iter()
+        .map(|&(scope, chord)| ChordSpec { scope, chord })
+        .collect();
+    CommandRow {
+        id,
+        key: "teste",
+        label: "Teste",
+        category: CommandCategory::Ferramentas,
+        keywords: &["teste"],
+        chords: Box::leak(chords.into_boxed_slice()),
+        alias: None,
+    }
+}
+
+/// A familia de ambitos de cada origem, escrita a mao: o oraculo dos gates
+/// (nao se le `scope_chain` para decidir o que se espera dela).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum OriginKind {
+    /// A janela e a omnibox.
+    Chrome,
+    /// As colunas, as fontes ao lado, a Web completa, o Leitor, o PDF e os
+    /// livros.
+    Page,
+    /// O painel do Ctrl+H, os servicos e o Gemini Live.
+    Panel,
+    /// O monitor escondido do Gmail: nunca tem o teclado.
+    Blind,
+}
+
+fn origin_kind(origin: CommandOrigin) -> OriginKind {
+    match origin {
+        CommandOrigin::Window | CommandOrigin::Omnibox => OriginKind::Chrome,
+        CommandOrigin::Host(WebViewHost::GmailMonitor) => OriginKind::Blind,
+        CommandOrigin::Host(
+            WebViewHost::Live | WebViewHost::SidePanel | WebViewHost::Service(_),
+        ) => OriginKind::Panel,
+        CommandOrigin::Host(_) => OriginKind::Page,
+    }
+}
+
+/// O `AcceleratorKeyPressed` de cada WebView consulta `accelerator_lookup`
+/// e so marca `Handled` quando ela prende a tecla. Com o mapa do produto
+/// ela prende so os atalhos `Global`: o Ctrl+D dos favoritos e o Ctrl+J dos
+/// Downloads (downloads-ui), cada um no PR do seu comando (regra C13), em
+/// cada hospedeiro menos o monitor do Gmail e com esse hospedeiro como
+/// origem -- a descida e a repeticao, nunca a subida, e o comando so na
+/// primeira descida. Nenhum outro dos atalhos nativos do plano da 2.3, nem
+/// os da janela e da omnibox (nas paginas continuam a ser do
+/// `NEURALIA_KEYMAP_SCRIPT`).
+#[test]
+fn accelerator_lookup_binds_only_the_global_chords_on_webviews() {
+    let ctrl_d = Chord::ctrl(b'D');
+    let ctrl_j = Chord::ctrl(b'J');
+    // Os atalhos que as WebViews prendem, com o comando de cada um.
+    let global = [
+        (ctrl_d, CommandId::Bookmark),
+        (ctrl_j, CommandId::Downloads),
+    ];
+    let mut chords = vec![
+        ctrl_d,
+        ctrl_j,
+        Chord::ctrl_shift(b'E'),
+        Chord::ctrl_shift(b'A'),
+        Chord::ctrl_shift(b'N'),
+        Chord::ctrl_shift(b'P'),
+        Chord::key(0x70),
+        Chord::ctrl_shift(b'S'),
+        Chord::ctrl_shift(b'F'),
+        Chord::ctrl(b'O'),
+        Chord::key(0x1B),
+        Chord::ctrl(b'R'),
+    ];
+    for row in COMMANDS {
+        chords.extend(row.chords.iter().map(|spec| spec.chord));
+    }
+    let hosts = every_host();
+    let mut consulted = 0usize;
+    let mut bound = 0usize;
+    for &host in &hosts {
+        for &chord in &chords {
+            let held = |input: AcceleratorInput| AcceleratorInput {
+                repeat: true,
+                ..input
+            };
+            let up = |input: AcceleratorInput| AcceleratorInput {
+                down: false,
+                ..input
+            };
+            let decision = accelerator_lookup(product_keymap(), host, press(chord));
+            let repeat = accelerator_lookup(product_keymap(), host, held(press(chord)));
+            let release = accelerator_lookup(product_keymap(), host, up(press(chord)));
+            consulted += 3;
+            assert!(
+                !release.handled && release.event.is_none(),
+                "{host:?} {chord:?}: a subida foi tratada"
+            );
+            let command = global
+                .iter()
+                .find(|(key, _)| *key == chord)
+                .map(|(_, command)| *command);
+            match command {
+                Some(command) if host != WebViewHost::GmailMonitor => {
+                    assert!(
+                        decision.handled,
+                        "{host:?}: o {chord:?} ({command:?}) chegou a pagina"
+                    );
+                    assert!(
+                        matches!(
+                            decision.event,
+                            Some(UserEvent::RunCommandKey {
+                                key,
+                                origin: CommandOrigin::Host(from),
+                            }) if key == command && from == host
+                        ),
+                        "{host:?} {command:?}: {:?}",
+                        decision.event
+                    );
+                    assert!(
+                        repeat.handled && repeat.event.is_none(),
+                        "{host:?} {command:?}"
+                    );
+                    bound += 1;
+                }
+                _ => {
+                    assert!(!decision.handled, "{host:?} {chord:?}");
+                    assert!(decision.event.is_none(), "{host:?} {chord:?}");
+                    assert!(
+                        !repeat.handled && repeat.event.is_none(),
+                        "{host:?} {chord:?}"
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(consulted, hosts.len() * chords.len() * 3);
+    // Cada hospedeiro com teclado, uma vez por cada Ctrl+D e Ctrl+J da
+    // lista.
+    let with_keyboard = hosts
+        .iter()
+        .filter(|host| **host != WebViewHost::GmailMonitor)
+        .count();
+    let listed = chords
+        .iter()
+        .filter(|chord| global.iter().any(|(key, _)| key == *chord))
+        .count();
+    assert_eq!(bound, with_keyboard * listed);
+    // E sao os unicos atalhos fora do ambito da janela.
+    let outside_window: Vec<(CommandId, KeyScope, Chord)> = COMMANDS
+        .iter()
+        .flat_map(|row| {
+            row.chords
+                .iter()
+                .filter(|spec| spec.scope != KeyScope::Window)
+                .map(move |spec| (row.id, spec.scope, spec.chord))
+        })
+        .collect();
+    assert_eq!(
+        outside_window,
+        [
+            (CommandId::Bookmark, KeyScope::Global, ctrl_d),
+            (CommandId::Downloads, KeyScope::Global, ctrl_j),
+        ]
+    );
+}
+
+/// Gate (critico: uma pagina nao sintetiza comandos): a tabela da decisao.
+/// Um atalho preso na origem: a descida e tratada (`Handled`: a pagina nao
+/// ve o keydown) e da um `RunCommandKey` com o comando e a origem; a tecla
+/// presa continua tratada, sem evento; a subida nao e tratada. Uma tecla
+/// solta -- de outro ambito, ou com outros modificadores -- nao e tratada
+/// nem dispara. Sobre um mapa com atalhos em todos os ambitos, e sobre o
+/// do produto (os da janela e da omnibox).
+#[test]
+fn accelerator_decision_table() {
+    use OriginKind::{Blind, Chrome, Page, Panel};
+    let ctrl_j = Chord::ctrl(b'J');
+    let f1 = Chord::key(0x70);
+    let ctrl_d = Chord::ctrl(b'D');
+    let ctrl_shift_e = Chord::ctrl_shift(b'E');
+    let ctrl_o = Chord::ctrl(b'O');
+    let keymap = Keymap::build(&[
+        test_row(CommandId::History, &[(KeyScope::Global, ctrl_j)]),
+        test_row(CommandId::NewTab, &[(KeyScope::Global, f1)]),
+        test_row(CommandId::Home, &[(KeyScope::Page, ctrl_d)]),
+        // O ambito mais estreito ganha: nas paginas o Ctrl+J e este.
+        test_row(CommandId::Reload, &[(KeyScope::Page, ctrl_j)]),
+        test_row(CommandId::AutoScroll, &[(KeyScope::Panel, ctrl_shift_e)]),
+        test_row(CommandId::OpenEpub, &[(KeyScope::Window, ctrl_o)]),
+    ])
+    .expect("mapa de teste");
+    let expected = |kind: OriginKind, chord: Chord| -> Option<CommandId> {
+        match kind {
+            Blind => None,
+            Page if chord == ctrl_j => Some(CommandId::Reload),
+            _ if chord == ctrl_j => Some(CommandId::History),
+            _ if chord == f1 => Some(CommandId::NewTab),
+            Page if chord == ctrl_d => Some(CommandId::Home),
+            Panel if chord == ctrl_shift_e => Some(CommandId::AutoScroll),
+            Chrome if chord == ctrl_o => Some(CommandId::OpenEpub),
+            _ => None,
+        }
+    };
+    let corpus = [
+        ctrl_j,
+        f1,
+        ctrl_d,
+        ctrl_shift_e,
+        ctrl_o,
+        // Os mesmos com outros modificadores: outra combinacao, solta.
+        Chord::ctrl_shift(b'J'),
+        Chord {
+            alt: true,
+            ..ctrl_j
+        },
+        Chord {
+            ctrl: false,
+            ..ctrl_j
+        },
+        Chord { shift: true, ..f1 },
+        Chord::ctrl(b'E'),
+        Chord::ctrl_shift(b'D'),
+        Chord::ctrl(b'R'),
+        Chord::key(0x1B),
+    ];
+    let mut bound: HashMap<OriginKind, usize> = HashMap::new();
+    for origin in every_origin() {
+        let kind = origin_kind(origin);
+        for chord in corpus {
+            let down = accelerator_decision(&keymap, press(chord), origin);
+            let held = accelerator_decision(
+                &keymap,
+                AcceleratorInput {
+                    repeat: true,
+                    ..press(chord)
+                },
+                origin,
+            );
+            let up = accelerator_decision(
+                &keymap,
+                AcceleratorInput {
+                    down: false,
+                    ..press(chord)
+                },
+                origin,
+            );
+            match expected(kind, chord) {
+                Some(command) => {
+                    assert!(
+                        down.handled,
+                        "{origin:?} {chord:?}: atalho preso e a pagina ve o keydown"
+                    );
+                    assert!(
+                        matches!(
+                            down.event,
+                            Some(UserEvent::RunCommandKey { key, origin: from })
+                                if key == command && from == origin
+                        ),
+                        "{origin:?} {chord:?}: {:?}",
+                        down.event
+                    );
+                    assert!(
+                        held.handled,
+                        "{origin:?} {chord:?}: a repeticao chegou a pagina"
+                    );
+                    assert!(
+                        held.event.is_none(),
+                        "{origin:?} {chord:?}: a tecla presa repetiu o comando"
+                    );
+                    *bound.entry(kind).or_default() += 1;
+                }
+                None => {
+                    assert!(
+                        !down.handled && down.event.is_none(),
+                        "{origin:?} {chord:?}: tecla solta tratada: {down:?}"
+                    );
+                    assert!(
+                        !held.handled && held.event.is_none(),
+                        "{origin:?} {chord:?}: tecla solta tratada: {held:?}"
+                    );
+                }
+            }
+            assert!(
+                !up.handled && up.event.is_none(),
+                "{origin:?} {chord:?}: a subida foi tratada: {up:?}"
+            );
+        }
+    }
+    for kind in [Chrome, Page, Panel] {
+        assert!(bound.get(&kind).is_some_and(|count| *count > 0), "{kind:?}");
+    }
+
+    // O mapa do produto: os atalhos da janela e da omnibox.
+    let mut window_chords = 0usize;
+    for origin in [CommandOrigin::Window, CommandOrigin::Omnibox] {
+        for row in COMMANDS {
+            for spec in row.chords {
+                let decision = keymap_decision(press(spec.chord), origin);
+                assert!(decision.handled, "{origin:?} {:?}", row.id);
+                assert!(
+                    matches!(
+                        decision.event,
+                        Some(UserEvent::RunCommandKey { key, origin: from })
+                            if key == row.id && from == origin
+                    ),
+                    "{origin:?} {:?}: {:?}",
+                    row.id,
+                    decision.event
+                );
+                let held = keymap_decision(
+                    AcceleratorInput {
+                        repeat: true,
+                        ..press(spec.chord)
+                    },
+                    origin,
+                );
+                assert!(
+                    held.handled && held.event.is_none(),
+                    "{origin:?} {:?}",
+                    row.id
+                );
+                window_chords += 1;
+            }
+        }
+    }
+    // Os sete da 2.2.0, o Ctrl+D dos favoritos e o Ctrl+J dos Downloads
+    // (os dois `Global`, valem tambem la).
+    assert_eq!(window_chords, 2 * 9);
+}
+
+/// Gate (critico): um atalho por ambito. Dois comandos com a mesma tecla no
+/// mesmo ambito recusam a tabela inteira -- nunca "ganha o ultimo" --, e a
+/// mesma tecla em ambitos diferentes e de cada um. O registo do produto
+/// vira mapa, cada comando tem uma linha, e os atalhos sao os da 2.2.0 (no
+/// ambito da janela) mais os que cada feature da 2.3 trouxe com o seu
+/// comando (regra C13): o Ctrl+D `Global` dos favoritos e o Ctrl+J `Global`
+/// dos Downloads.
+#[test]
+fn keymap_chords_are_unique_per_scope() {
+    use CommandId::{History, Home};
+    use KeyScope::{Global, Page};
+    let mut seen = HashSet::new();
+    for row in COMMANDS {
+        for spec in row.chords {
+            assert!(
+                seen.insert((spec.scope, spec.chord)),
+                "{:?} {:?} repetido ({:?})",
+                spec.scope,
+                spec.chord,
+                row.id
+            );
+        }
+    }
+    let built = Keymap::build(COMMANDS);
+    assert!(built.is_ok(), "o registo nao vira mapa: {:?}", built.err());
+    // Cada comando uma linha; chaves unicas, ASCII, minusculas e hifens.
+    for id in CommandId::ALL {
+        assert_eq!(
+            COMMANDS.iter().filter(|row| row.id == id).count(),
+            1,
+            "{id:?}"
+        );
+    }
+    assert_eq!(COMMANDS.len(), CommandId::ALL.len());
+    let keys: HashSet<&str> = COMMANDS.iter().map(|row| row.key).collect();
+    assert_eq!(keys.len(), COMMANDS.len(), "chaves repetidas");
+    for row in COMMANDS {
+        assert!(
+            !row.key.is_empty()
+                && row
+                    .key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
+            "{}",
+            row.key
+        );
+        assert_eq!(row.id.key(), row.key);
+    }
+    // Os da 2.2.0 na janela e na omnibox, e os que a 2.3 trouxe com o seu
+    // comando -- nenhum outro.
+    let mut registered = Vec::new();
+    for row in COMMANDS {
+        for spec in row.chords {
+            registered.push((row.id, spec.scope, spec.chord));
+        }
+    }
+    assert_eq!(
+        registered,
+        [
+            (CommandId::AutoScroll, KeyScope::Window, Chord::ctrl(b'R')),
+            (CommandId::Reload, KeyScope::Window, Chord::ctrl_shift(b'R')),
+            (CommandId::History, KeyScope::Window, Chord::ctrl(b'H')),
+            (CommandId::NewTab, KeyScope::Window, Chord::ctrl(b'N')),
+            (CommandId::OpenEpub, KeyScope::Window, Chord::ctrl(b'O')),
+            (
+                CommandId::NewNote,
+                KeyScope::Window,
+                Chord::ctrl_shift(b'Z')
+            ),
+            (
+                CommandId::ClearHistory,
+                KeyScope::Window,
+                Chord::ctrl_shift(0x2E)
+            ),
+            (CommandId::Bookmark, KeyScope::Global, Chord::ctrl(b'D')),
+            (CommandId::Downloads, KeyScope::Global, Chord::ctrl(b'J')),
+        ]
+    );
+
+    // A mesma tecla duas vezes no mesmo ambito: a tabela e recusada.
+    let ctrl_j = Chord::ctrl(b'J');
+    assert_eq!(
+        Keymap::build(&[
+            test_row(History, &[(Global, ctrl_j)]),
+            test_row(Home, &[(Global, ctrl_j)]),
+        ])
+        .err(),
+        Some(KeymapError::Duplicate {
+            scope: Global,
+            chord: ctrl_j,
+            first: History,
+            second: Home,
+        })
+    );
+    assert!(matches!(
+        Keymap::build(&[test_row(History, &[(Page, ctrl_j), (Page, ctrl_j)])]),
+        Err(KeymapError::Duplicate { .. })
+    ));
+    // A mesma tecla em ambitos diferentes: cada ambito com o seu.
+    let keymap = Keymap::build(&[
+        test_row(History, &[(Global, ctrl_j)]),
+        test_row(Home, &[(Page, ctrl_j)]),
+    ])
+    .expect("ambitos diferentes");
+    assert_eq!(keymap.lookup(&[Global], ctrl_j), Some(History));
+    assert_eq!(keymap.lookup(&[Page, Global], ctrl_j), Some(Home));
+    assert_eq!(keymap.lookup(&[Page], Chord::ctrl(b'K')), None);
+    // Uma tecla que nao pode ser atalho: sem modificador, so Shift, ou
+    // Ctrl+Alt (o AltGr do ABNT2).
+    for chord in [
+        Chord::key(b'J'),
+        Chord {
+            shift: true,
+            ..Chord::key(b'J')
+        },
+        Chord {
+            alt: true,
+            ..Chord::ctrl(b'Q')
+        },
+        Chord::key(0x6F),
+        Chord::key(0x88),
+    ] {
+        assert_eq!(
+            Keymap::build(&[test_row(History, &[(Global, chord)])]).err(),
+            Some(KeymapError::NotAChord {
+                command: History,
+                chord
+            }),
+            "{chord:?}"
+        );
+    }
+    for chord in [
+        Chord::key(0x70),
+        Chord::key(0x87),
+        Chord {
+            alt: true,
+            ..Chord::key(b'X')
+        },
+        Chord::ctrl_shift(b'X'),
+    ] {
+        assert!(
+            Keymap::build(&[test_row(History, &[(Global, chord)])]).is_ok(),
+            "{chord:?}"
+        );
+    }
+}
+
+/// Gate (critico): nos hospedeiros das IAs -- as colunas do comparador e a
+/// resposta de uma IA no painel privado -- os atalhos do ChatGPT nunca sao
+/// presos, mesmo com um ambito a declara-los: a pagina fica com eles. A
+/// Captura (Ctrl+Shift+S) fica por isso sem atalho nas IAs. Nos outros
+/// hospedeiros o mesmo mapa prende-os (o gate nao e trivial).
+#[test]
+fn provider_hosts_never_bind_the_chatgpt_chords() {
+    assert_eq!(
+        PROVIDER_DENYLIST,
+        [
+            Chord::ctrl_shift(b'O'),
+            Chord::ctrl_shift(0xBA),
+            Chord::ctrl_shift(b'C'),
+            Chord::ctrl_shift(b'I'),
+            Chord::ctrl_shift(b'S'),
+            Chord::ctrl_shift(0x08),
+        ]
+    );
+    for origin in every_origin() {
+        assert_eq!(
+            is_provider_origin(origin),
+            matches!(
+                origin,
+                CommandOrigin::Host(WebViewHost::Column(_) | WebViewHost::PrivateSplit(_))
+            ),
+            "{origin:?}"
+        );
+    }
+    let spread = |scope: KeyScope| -> Vec<(KeyScope, Chord)> {
+        PROVIDER_DENYLIST
+            .iter()
+            .map(|chord| (scope, *chord))
+            .collect()
+    };
+    let lock = RwLock::new(
+        Keymap::build(&[
+            test_row(CommandId::History, &spread(KeyScope::Global)),
+            test_row(CommandId::Home, &spread(KeyScope::Page)),
+            test_row(CommandId::AutoScroll, &spread(KeyScope::Panel)),
+            test_row(CommandId::OpenEpub, &spread(KeyScope::Window)),
+        ])
+        .expect("mapa de teste"),
+    );
+    let mut providers = 0usize;
+    let mut elsewhere = 0usize;
+    for origin in every_origin() {
+        for chord in PROVIDER_DENYLIST {
+            for input in [
+                press(chord),
+                AcceleratorInput {
+                    repeat: true,
+                    ..press(chord)
+                },
+            ] {
+                let decision = keymap_decision_in(&lock, input, origin);
+                if is_provider_origin(origin) {
+                    assert!(
+                        !decision.handled && decision.event.is_none(),
+                        "{origin:?} prendeu {chord:?}: {decision:?}"
+                    );
+                } else if origin_kind(origin) != OriginKind::Blind {
+                    assert!(decision.handled, "{origin:?} {chord:?}: mapa de teste");
+                    elsewhere += 1;
+                }
+            }
+        }
+        // O slot dos ganchos, com o mesmo mapa.
+        if let CommandOrigin::Host(host) = origin
+            && is_provider_origin(origin)
+        {
+            providers += 1;
+            for chord in PROVIDER_DENYLIST {
+                let decision = accelerator_lookup(&lock, host, press(chord));
+                assert!(
+                    !decision.handled && decision.event.is_none(),
+                    "{host:?} prendeu {chord:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(providers, 2 * COMPARATOR_COLUMNS);
+    assert!(elsewhere > 0);
+    // As outras teclas desses hospedeiros continuam a poder ser presas.
+    let other = Keymap::build(&[test_row(
+        CommandId::History,
+        &[(KeyScope::Page, Chord::ctrl_shift(b'E'))],
+    )])
+    .expect("mapa de teste");
+    for col in 0..COMPARATOR_COLUMNS {
+        for host in [WebViewHost::Column(col), WebViewHost::PrivateSplit(col)] {
+            assert!(
+                accelerator_decision(
+                    &other,
+                    press(Chord::ctrl_shift(b'E')),
+                    CommandOrigin::Host(host)
+                )
+                .handled,
+                "{host:?}"
+            );
+        }
+    }
+    // E o mapa do produto, pelo slot.
+    for host in every_host() {
+        for chord in PROVIDER_DENYLIST {
+            assert!(
+                !accelerator_lookup(product_keymap(), host, press(chord)).handled,
+                "{host:?}"
+            );
+        }
+    }
+}
+
+/// Gate: a tabela dos arquivos ganha so nos arquivos. Na cadeia dos
+/// arquivos os oito atalhos sao deles (hoje `Pass`: a pagina dos arquivos
+/// fica com eles, ate cada item files-* ligar o seu comando) mesmo com a
+/// `Page` e a `Global` a declara-los; nenhuma origem que o produto tem
+/// consulta os arquivos, e nelas a tabela nao existe.
+#[test]
+fn files_override_wins_only_in_files() {
+    use CommandId::{History, Home, OpenEpub};
+    assert_eq!(
+        FILES_OVERRIDES,
+        [
+            Chord::ctrl(b'D'),
+            Chord::ctrl(b'N'),
+            Chord::ctrl(b'W'),
+            Chord::ctrl(0x09),
+            Chord::ctrl(b'G'),
+            Chord::ctrl(b'O'),
+            Chord::ctrl(b'S'),
+            Chord::ctrl_shift(b'S'),
+        ]
+    );
+    assert_eq!(
+        FILES_CHAIN,
+        [KeyScope::Files, KeyScope::Page, KeyScope::Global]
+    );
+    for origin in every_origin() {
+        assert!(
+            !scope_chain(origin).contains(&KeyScope::Files),
+            "{origin:?} consulta os arquivos"
+        );
+    }
+    let everywhere = |scope: KeyScope| -> Vec<(KeyScope, Chord)> {
+        FILES_OVERRIDES
+            .iter()
+            .map(|chord| (scope, *chord))
+            .collect()
+    };
+    let keymap = Keymap::build(&[
+        test_row(History, &everywhere(KeyScope::Global)),
+        test_row(Home, &everywhere(KeyScope::Page)),
+        test_row(
+            OpenEpub,
+            &[
+                (KeyScope::Files, Chord::ctrl(b'S')),
+                (KeyScope::Files, Chord::ctrl(b'E')),
+            ],
+        ),
+    ])
+    .expect("mapa de teste");
+    for chord in FILES_OVERRIDES {
+        let files = keymap.lookup(FILES_CHAIN, chord);
+        if chord == Chord::ctrl(b'S') {
+            assert_eq!(files, Some(OpenEpub));
+        } else {
+            assert_eq!(
+                files, None,
+                "{chord:?}: a Page ou a Global passou por cima dos arquivos"
+            );
+        }
+        for origin in every_origin() {
+            let expected = match origin_kind(origin) {
+                OriginKind::Page => Some(Home),
+                OriginKind::Chrome | OriginKind::Panel => Some(History),
+                OriginKind::Blind => None,
+            };
+            assert_eq!(
+                keymap.lookup(scope_chain(origin), chord),
+                expected,
+                "{origin:?} {chord:?}"
+            );
+        }
+    }
+    // Um atalho dos arquivos fora da tabela tambem so vale nos arquivos.
+    assert_eq!(
+        keymap.lookup(FILES_CHAIN, Chord::ctrl(b'E')),
+        Some(OpenEpub)
+    );
+    for origin in every_origin() {
+        assert_ne!(
+            keymap.lookup(scope_chain(origin), Chord::ctrl(b'E')),
+            Some(OpenEpub),
+            "{origin:?}"
+        );
+    }
+    // Um atalho que os arquivos nao declaram desce a Page e a Global.
+    let wider = Keymap::build(&[test_row(
+        History,
+        &[(KeyScope::Global, Chord::ctrl_shift(b'E'))],
+    )])
+    .expect("mapa de teste");
+    assert_eq!(
+        wider.lookup(FILES_CHAIN, Chord::ctrl_shift(b'E')),
+        Some(History)
+    );
+    // O mapa do produto ja traz a tabela, e nenhum comando dela.
+    let product = Keymap::build(COMMANDS).expect("registo");
+    for chord in FILES_OVERRIDES {
+        assert_eq!(product.lookup(FILES_CHAIN, chord), None, "{chord:?}");
+    }
+}
+
+/// Gate (critico: uma pagina nao sintetiza comandos): o comando leva a
+/// origem que o handler recebeu no registo -- o hospedeiro -- e nada da
+/// pagina. `accelerator_lookup`, a MESMA funcao que o handler chama (ele
+/// passa-lhe o mapa do produto), com um mapa com um atalho global, devolve
+/// em cada hospedeiro o `RunCommandKey` com esse hospedeiro (o monitor do
+/// Gmail nao tem teclado). E so a decisao constroi um `RunCommandKey`:
+/// nenhum canal das paginas o faz (asserção de ausencia).
+#[test]
+fn a_command_key_carries_the_host_it_came_from() {
+    let ctrl_j = Chord::ctrl(b'J');
+    let lock = RwLock::new(
+        Keymap::build(&[test_row(CommandId::History, &[(KeyScope::Global, ctrl_j)])])
+            .expect("mapa de teste"),
+    );
+    for host in every_host() {
+        let decision = accelerator_lookup(&lock, host, press(ctrl_j));
+        if host == WebViewHost::GmailMonitor {
+            assert!(!decision.handled && decision.event.is_none());
+            continue;
+        }
+        assert!(decision.handled, "{host:?}");
+        assert!(
+            matches!(
+                decision.event,
+                Some(UserEvent::RunCommandKey {
+                    key: CommandId::History,
+                    origin: CommandOrigin::Host(from),
+                }) if from == host
+            ),
+            "{host:?}: {:?}",
+            decision.event
+        );
+    }
+    // Um comando nunca resolve noutro comando: um salto so.
+    for id in CommandId::ALL {
+        for origin in every_origin() {
+            assert!(
+                !matches!(
+                    resolve_command(id, origin),
+                    Some(UserEvent::RunCommandKey { .. })
+                ),
+                "{id:?} {origin:?}"
+            );
+        }
+    }
+    // So a decisao o constroi e so o event loop o corre (o braco entrega-o
+    // inteiro, `command_key_event` le-o); nenhum canal das paginas (o IPC,
+    // o painel, os livros, o Live, os scripts) o nomeia.
+    let source = shipped_source();
+    assert_eq!(source.matches("RunCommandKey {").count(), 4);
+    assert_eq!(
+        source
+            .matches("press @ UserEvent::RunCommandKey { .. } =>")
+            .count(),
+        1
+    );
+    assert_eq!(
+        source
+            .matches("let &UserEvent::RunCommandKey { key, origin } = press else {")
+            .count(),
+        1
+    );
+    let keymap_rs = ALL_MODULES
+        .iter()
+        .find(|(name, _)| *name == "keymap.rs")
+        .map(|(_, content)| content.replace("\r\n", "\n"))
+        .expect("keymap.rs em ALL_MODULES");
+    assert_eq!(
+        keymap_rs
+            .matches("then_some(UserEvent::RunCommandKey { key, origin })")
+            .count(),
+        1
+    );
+    for (name, channel) in [
+        ("ipc.rs", include_str!("../ipc.rs")),
+        ("epub_app.rs", include_str!("../epub_app.rs")),
+        ("gemini_live.rs", include_str!("../gemini_live.rs")),
+        ("side_panel.rs", include_str!("side_panel.rs")),
+        ("page_scripts.rs", include_str!("page_scripts.rs")),
+    ] {
+        assert!(
+            !channel.contains("RunCommandKey"),
+            "{name} nomeia RunCommandKey"
+        );
+    }
+}
+
+/// Gate (critico: uma pagina nao sintetiza comandos): o event loop corre um
+/// `RunCommandKey` contra a origem que veio com ele. O braco entrega o
+/// evento inteiro a `command_key_event` -- a funcao que este gate chama --
+/// e ela corre o comando contra a origem do proprio evento: da janela e da
+/// omnibox, Ctrl+Shift+Z e a nota da janela (nao a de uma pagina); de cada
+/// hospedeiro, pelo `accelerator_lookup` que o handler chama, o recarregar
+/// e a nota dessa pagina (nao os da Web externa). E o braco nao escolhe
+/// origem (asserção de ausencia): nao desmonta o evento nem chama
+/// `resolve_command`.
+#[test]
+fn a_command_key_runs_against_the_origin_it_carries() {
+    use CommandId::{NewNote, Reload};
+    let debug = |event: Option<UserEvent>| event.map(|event| format!("{event:?}"));
+    // Cada comando de cada origem: o que `resolve_command` da dali.
+    for id in CommandId::ALL {
+        for origin in every_origin() {
+            assert_eq!(
+                debug(command_key_event(&UserEvent::RunCommandKey {
+                    key: id,
+                    origin
+                })),
+                debug(resolve_command(id, origin)),
+                "{id:?} {origin:?}"
+            );
+        }
+    }
+    // Um evento que nao e um atalho nao corre nada.
+    assert!(command_key_event(&UserEvent::HomeRequested).is_none());
+    assert!(command_key_event(&UserEvent::NewNote).is_none());
+    // A janela e a omnibox, pelo mapa do produto: a nota da janela.
+    let ctrl_shift_z = Chord::ctrl_shift(b'Z');
+    for origin in [CommandOrigin::Window, CommandOrigin::Omnibox] {
+        assert_eq!(
+            chord_command_event(&keymap_decision(press(ctrl_shift_z), origin)),
+            Some(format!("{:?}", UserEvent::NewNote)),
+            "{origin:?}"
+        );
+    }
+    // Cada hospedeiro, com o recarregar e a nota globais num mapa de teste.
+    let reload = Chord::ctrl(b'J');
+    let note = Chord::ctrl(b'K');
+    let lock = RwLock::new(
+        Keymap::build(&[
+            test_row(Reload, &[(KeyScope::Global, reload)]),
+            test_row(NewNote, &[(KeyScope::Global, note)]),
+        ])
+        .expect("mapa de teste"),
+    );
+    let external = |id: CommandId| {
+        debug(resolve_command(
+            id,
+            CommandOrigin::Host(WebViewHost::External),
+        ))
+    };
+    let mut distinct = HashSet::new();
+    let mut not_external = 0usize;
+    for host in every_host() {
+        for (id, chord) in [(Reload, reload), (NewNote, note)] {
+            let got = chord_command_event(&accelerator_lookup(&lock, host, press(chord)));
+            assert_eq!(
+                got,
+                debug(resolve_command(id, CommandOrigin::Host(host))),
+                "{host:?} {id:?}"
+            );
+            not_external += usize::from(got != external(id));
+            distinct.insert(got);
+        }
+    }
+    // A origem conta: as colunas, o Split e o Split privado recarregam-se a
+    // si (cada um o seu evento), e so a Web, o Leitor e o PDF dao o da Web.
+    assert!(distinct.len() >= 2 * COMPARATOR_COLUMNS + 2, "{distinct:?}");
+    assert!(not_external >= 3 * COMPARATOR_COLUMNS, "{not_external}");
+    for col in 0..COMPARATOR_COLUMNS {
+        assert_ne!(
+            chord_command_event(&accelerator_lookup(
+                &lock,
+                WebViewHost::Column(col),
+                press(reload)
+            )),
+            external(Reload),
+            "coluna {col}"
+        );
+    }
+    // O braco do event loop entrega o evento inteiro e nao escolhe origem.
+    let event_loop_rs = ALL_MODULES
+        .iter()
+        .find(|(name, _)| *name == "app/event_loop.rs")
+        .map(|(_, content)| content.replace("\r\n", "\n"))
+        .expect("app/event_loop.rs em ALL_MODULES");
+    assert_eq!(
+        event_loop_rs
+            .matches(
+                "press @ UserEvent::RunCommandKey { .. } => {\n                \
+                 if let Some(event) = command_key_event(&press) {\n"
+            )
+            .count(),
+        1
+    );
+    for forbidden in [
+        "resolve_command(",
+        "RunCommandKey { key",
+        "RunCommandKey { origin",
+    ] {
+        assert!(
+            !event_loop_rs.contains(forbidden),
+            "o event loop escolhe o comando ou a origem: {forbidden}"
+        );
+    }
+}
+
+/// Gate: cada comando corre contra a sua origem. Da janela e da omnibox, o
+/// que a 2.2.0 fazia (`main_window_shortcut` e o subclass do EDIT); de uma
+/// pagina, os comandos que dependem dela dao o que o mapa de teclas dessa
+/// pagina pede pelo IPC para o mesmo gesto, pelo mesmo despacho (a coluna
+/// recarrega-se a si, o Split privado recusa a nota); dos paineis, o da
+/// janela menos o recarregar; do monitor do Gmail ou de uma coluna que nao
+/// existe, nada.
+#[test]
+fn resolve_command_runs_against_its_origin() {
+    use CommandId::{NewNote, NewTab, Reload};
+    let debug = |event: Option<UserEvent>| event.map(|event| format!("{event:?}"));
+    let shown = |event: UserEvent| Some(format!("{event:?}"));
+    let chrome = [
+        (CommandId::AutoScroll, UserEvent::ToggleAutoScroll),
+        (Reload, UserEvent::ReloadPage),
+        (CommandId::History, UserEvent::ShowHistory),
+        (NewTab, UserEvent::NewTab(0)),
+        (CommandId::OpenEpub, UserEvent::OpenEpubDialog),
+        (NewNote, UserEvent::NewNote),
+        (CommandId::ClearHistory, UserEvent::ClearHistory),
+        (CommandId::Home, UserEvent::HomeRequested),
+        (CommandId::CloseSplit, UserEvent::CloseSplit),
+        (CommandId::SplitFullscreen, UserEvent::ToggleSplitFullscreen),
+        (CommandId::Exit, UserEvent::ExitRequested),
+        (
+            CommandId::Bookmark,
+            UserEvent::Bookmarks(BookmarksEvent::Request {
+                target: BookmarkTarget::Window,
+                via: BookmarkVia::Shortcut,
+            }),
+        ),
+        (
+            CommandId::Downloads,
+            UserEvent::DownloadsUi(DownloadsUiEvent::Show),
+        ),
+    ];
+    assert_eq!(chrome.len(), CommandId::ALL.len());
+    for (id, event) in chrome {
+        let expected = shown(event);
+        for origin in [CommandOrigin::Window, CommandOrigin::Omnibox] {
+            assert_eq!(
+                debug(resolve_command(id, origin)),
+                expected,
+                "{id:?} {origin:?}"
+            );
+        }
+        // Os que nao dependem da pagina: o mesmo de qualquer hospedeiro. O
+        // Ctrl+D depende (`ctrl_d_runs_against_the_host_it_came_from`).
+        if !matches!(id, Reload | NewNote | NewTab | CommandId::Bookmark) {
+            for host in every_host() {
+                let got = debug(resolve_command(id, CommandOrigin::Host(host)));
+                if host == WebViewHost::GmailMonitor {
+                    assert_eq!(got, None, "{id:?}");
+                } else {
+                    assert_eq!(got, expected, "{id:?} {host:?}");
+                }
+            }
+        }
+    }
+    // De uma pagina: o mesmo despacho que o IPC do mapa de teclas dela.
+    let note = || IpcAction::Note {
+        via: NoteVia::Shortcut,
+    };
+    for col in 0..COMPARATOR_COLUMNS {
+        let actions = [
+            (Reload, IpcAction::Reload),
+            (NewNote, note()),
+            (NewTab, IpcAction::NewTab { col: Some(col) }),
+        ];
+        for (id, action) in actions {
+            assert_eq!(
+                debug(resolve_command(
+                    id,
+                    CommandOrigin::Host(WebViewHost::Column(col))
+                )),
+                debug(App::column_ipc_event_impl(col, action.clone())),
+                "{id:?} coluna {col}"
+            );
+            assert_eq!(
+                debug(resolve_command(
+                    id,
+                    CommandOrigin::Host(WebViewHost::Split(col))
+                )),
+                debug(App::split_ipc_event_impl(col, false, action.clone())),
+                "{id:?} fonte {col}"
+            );
+            assert_eq!(
+                debug(resolve_command(
+                    id,
+                    CommandOrigin::Host(WebViewHost::PrivateSplit(col))
+                )),
+                debug(App::split_ipc_event_impl(col, true, action)),
+                "{id:?} fonte privada {col}"
+            );
+        }
+        let column = CommandOrigin::Host(WebViewHost::Column(col));
+        let split = CommandOrigin::Host(WebViewHost::Split(col));
+        let private = CommandOrigin::Host(WebViewHost::PrivateSplit(col));
+        assert_eq!(
+            debug(resolve_command(Reload, column)),
+            shown(UserEvent::ReloadTarget(PageTarget::Column(col)))
+        );
+        assert_eq!(
+            debug(resolve_command(Reload, split)),
+            shown(UserEvent::ReloadTarget(PageTarget::Split))
+        );
+        assert_eq!(
+            debug(resolve_command(NewTab, column)),
+            shown(UserEvent::NewTab(col))
+        );
+        assert_eq!(
+            debug(resolve_command(NewTab, private)),
+            shown(UserEvent::NewTab(col))
+        );
+        assert_eq!(
+            debug(resolve_command(NewNote, column)),
+            shown(UserEvent::NoteRequested {
+                target: Some(PageTarget::Column(col)),
+                via: NoteVia::Shortcut,
+            })
+        );
+        assert_eq!(
+            debug(resolve_command(NewNote, split)),
+            shown(UserEvent::NoteRequested {
+                target: Some(PageTarget::Split),
+                via: NoteVia::Shortcut,
+            })
+        );
+        assert_eq!(
+            debug(resolve_command(NewNote, private)),
+            shown(UserEvent::NoteRefusedPrivate)
+        );
+    }
+    for host in [WebViewHost::External, WebViewHost::Reader, WebViewHost::Pdf] {
+        let origin = CommandOrigin::Host(host);
+        assert_eq!(
+            debug(resolve_command(Reload, origin)),
+            shown(UserEvent::ReloadPage)
+        );
+        assert_eq!(
+            debug(resolve_command(NewNote, origin)),
+            shown(UserEvent::NoteRequested {
+                target: None,
+                via: NoteVia::Shortcut,
+            })
+        );
+        assert_eq!(
+            debug(resolve_command(NewTab, origin)),
+            shown(UserEvent::NewTab(0))
+        );
+    }
+    for host in every_host() {
+        let origin = CommandOrigin::Host(host);
+        if origin_kind(origin) == OriginKind::Panel || host == WebViewHost::Epub {
+            assert_eq!(debug(resolve_command(Reload, origin)), None, "{host:?}");
+            assert_eq!(
+                debug(resolve_command(NewNote, origin)),
+                shown(UserEvent::NewNote),
+                "{host:?}"
+            );
+            assert_eq!(
+                debug(resolve_command(NewTab, origin)),
+                shown(UserEvent::NewTab(0)),
+                "{host:?}"
+            );
+        }
+    }
+    // Do monitor do Gmail, ou de uma coluna que nao existe: nada.
+    for id in CommandId::ALL {
+        for host in [
+            WebViewHost::GmailMonitor,
+            WebViewHost::Column(COMPARATOR_COLUMNS),
+            WebViewHost::Split(COMPARATOR_COLUMNS),
+            WebViewHost::PrivateSplit(COMPARATOR_COLUMNS),
+        ] {
+            assert_eq!(
+                debug(resolve_command(id, CommandOrigin::Host(host))),
+                None,
+                "{id:?} {host:?}"
+            );
+        }
+    }
+}
+
+/// O registo, linha a linha, no que a paleta vai ler: rotulo, categoria,
+/// palavras e alias. Um alias e o que, escrito na omnibox, faz o mesmo
+/// que o comando.
+#[test]
+fn every_command_row_names_itself_for_the_palette() {
+    let mut labels = HashSet::new();
+    for row in COMMANDS {
+        assert!(!row.label.trim().is_empty(), "{:?}", row.id);
+        assert!(labels.insert(row.label), "rotulo repetido: {}", row.label);
+        assert!(!row.category.label().is_empty(), "{:?}", row.id);
+        assert!(
+            !row.keywords.is_empty() && row.keywords.iter().all(|word| !word.trim().is_empty()),
+            "{:?}",
+            row.id
+        );
+    }
+    let mut aliased = 0usize;
+    for row in COMMANDS {
+        let Some(alias) = row.alias else {
+            continue;
+        };
+        aliased += 1;
+        // A rota que faz o mesmo que o comando; um alias novo acrescenta a
+        // sua aqui.
+        let expected = match row.id {
+            CommandId::OpenEpub => InputRoute::OpenEpub(None),
+            other => panic!("{other:?}: alias {alias} sem rota neste gate"),
+        };
+        assert_eq!(route_input(alias), expected, "{alias}");
+    }
+    assert_eq!(aliased, 1);
+    // `epub:` e o Ctrl+O acabam no mesmo dialogo (presenca).
+    let source = shipped_source();
+    assert!(source.contains("InputRoute::OpenEpub(None) => self.open_epub_dialog(true),"));
+    assert!(source.contains("UserEvent::OpenEpubDialog => self.open_epub_dialog(true),"));
+}
+
+/// Gate: `bar_hit_command` diz, para cada alvo da barra, se o clique e um
+/// comando do registo -- exaustivo, sem `_` (um alvo novo nao compila sem
+/// dizer). Os que sao comandos dao, da janela, o evento que faz o que o
+/// clique faz.
+#[test]
+fn bar_hit_command_is_exhaustive() {
+    use CommandId::{CloseSplit, Downloads, Exit, Home, SplitFullscreen};
+    let hits = [
+        (BarHit::Home, Some(Home)),
+        (BarHit::Back, None),
+        (BarHit::Forward, None),
+        (BarHit::ColumnBack(0), None),
+        (BarHit::ColumnForward(1), None),
+        (BarHit::ColumnTranslate(2), None),
+        (BarHit::ColumnBookmark(2), None),
+        (BarHit::SplitBookmark, None),
+        (BarHit::Column(2), None),
+        (BarHit::AddTab(0), None),
+        (
+            BarHit::ContextTab {
+                source_index: 0,
+                context_index: 1,
+            },
+            None,
+        ),
+        (
+            BarHit::CloseTab {
+                source_index: 1,
+                context_index: 0,
+            },
+            None,
+        ),
+        (
+            BarHit::ContextGroup {
+                source_index: 2,
+                group_index: 0,
+            },
+            None,
+        ),
+        (BarHit::TabOverflow(1), None),
+        (BarHit::SplitExpand, Some(SplitFullscreen)),
+        (BarHit::SplitClose, Some(CloseSplit)),
+        (BarHit::Private, None),
+        (BarHit::ServiceStrip(StripButton::Close), None),
+        (BarHit::Service(Service::Meet), None),
+        (BarHit::GmailToggle, None),
+        (BarHit::Tool(Tool::Pomodoro), None),
+        (BarHit::GeminiLive, None),
+        (BarHit::Downloads, Some(Downloads)),
+        (BarHit::WindowMinimize, None),
+        (BarHit::WindowMaximize, None),
+        (BarHit::WindowClose, Some(Exit)),
+    ];
+    for (hit, expected) in hits {
+        assert_eq!(bar_hit_command(hit), expected, "{hit:?}");
+    }
+    for (hit, event) in [
+        (BarHit::Home, UserEvent::HomeRequested),
+        (BarHit::SplitClose, UserEvent::CloseSplit),
+        (BarHit::SplitExpand, UserEvent::ToggleSplitFullscreen),
+        (BarHit::WindowClose, UserEvent::ExitRequested),
+        (
+            BarHit::Downloads,
+            UserEvent::DownloadsUi(DownloadsUiEvent::Show),
+        ),
+    ] {
+        let command = bar_hit_command(hit).expect("comando");
+        assert_eq!(
+            resolve_command(command, CommandOrigin::Window).map(|event| format!("{event:?}")),
+            Some(format!("{event:?}")),
+            "{hit:?}"
+        );
+    }
+    // Exaustivo (asserção de ausencia): nenhum braco `_` no match.
+    let source = shipped_source();
+    let body = source
+        .split("fn bar_hit_command(hit: BarHit) -> Option<CommandId> {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("bar_hit_command");
+    assert!(!body.contains("_ =>"), "bar_hit_command tem um braco `_`");
+}
+
+/// Gate: a janela e a omnibox perguntam ao mesmo mapa (a antiga
+/// `main_window_shortcut` e o subclass do EDIT tinham cada um a sua
+/// lista): a mesma tecla da o mesmo comando nas duas, e a tecla lida pelo
+/// winit e pelo WM_KEYDOWN e a do AcceleratorKeyPressed.
+#[test]
+fn the_window_and_the_omnibox_share_one_keymap() {
+    use winit::keyboard::ModifiersState;
+    let ctrl = ModifiersState::CONTROL;
+    let none = ModifiersState::empty();
+    let vk = |key: Key, modifiers: ModifiersState| {
+        window_accelerator_input(&key, modifiers, false).map(|input| input.vk)
+    };
+    let text = |text: &str| Key::Character(text.into());
+    assert_eq!(vk(text("o"), ctrl), Some(0x4F));
+    assert_eq!(vk(text("O"), ctrl), Some(0x4F));
+    assert_eq!(vk(text("1"), ctrl), Some(0x31));
+    assert_eq!(vk(Key::Named(NamedKey::Delete), ctrl), Some(0x2E));
+    assert_eq!(vk(Key::Named(NamedKey::Backspace), ctrl), Some(0x08));
+    assert_eq!(vk(Key::Named(NamedKey::Tab), ctrl), Some(0x09));
+    assert_eq!(vk(Key::Named(NamedKey::F1), none), Some(0x70));
+    assert_eq!(vk(Key::Named(NamedKey::F8), none), Some(0x77));
+    assert_eq!(vk(Key::Named(NamedKey::F24), none), Some(0x87));
+    assert_eq!(vk(Key::Named(NamedKey::Escape), none), None);
+    assert_eq!(vk(Key::Named(NamedKey::Enter), none), None);
+    assert_eq!(vk(text("ç"), ctrl), None);
+    assert_eq!(vk(text("ab"), ctrl), None);
+    assert_eq!(
+        window_accelerator_input(
+            &text("r"),
+            ctrl | ModifiersState::SHIFT | ModifiersState::ALT,
+            true
+        ),
+        Some(AcceleratorInput {
+            vk: 0x52,
+            down: true,
+            ctrl: true,
+            shift: true,
+            alt: true,
+            repeat: true,
+        })
+    );
+    // O WM_KEYDOWN: o bit 30 do lParam e a tecla ja em baixo (repeticao).
+    assert_eq!(
+        omnibox_accelerator_input(0x4F, 0x0001, true, false, false),
+        AcceleratorInput {
+            vk: 0x4F,
+            down: true,
+            ctrl: true,
+            shift: false,
+            alt: false,
+            repeat: false,
+        }
+    );
+    assert!(omnibox_accelerator_input(0x4F, 0x4000_0001, true, false, false).repeat);
+    // A mesma decisao nas duas origens.
+    let mut chords: Vec<Chord> = COMMANDS
+        .iter()
+        .flat_map(|row| row.chords.iter().map(|spec| spec.chord))
+        .collect();
+    chords.extend([
+        Chord::ctrl(b'A'),
+        Chord::ctrl(b'L'),
+        Chord::ctrl(b'J'),
+        Chord::ctrl_shift(b'N'),
+        Chord::ctrl_shift(b'H'),
+        Chord {
+            alt: true,
+            ..Chord::ctrl(b'R')
+        },
+        Chord::key(0x70),
+    ]);
+    let command = |decision: &AcceleratorDecision| match decision.event {
+        Some(UserEvent::RunCommandKey { key, .. }) => Some(key),
+        _ => None,
+    };
+    let mut bound = 0usize;
+    for chord in chords {
+        let window = keymap_decision(press(chord), CommandOrigin::Window);
+        let omnibox = keymap_decision(
+            omnibox_accelerator_input(chord.vk as usize, 0, chord.ctrl, chord.shift, chord.alt),
+            CommandOrigin::Omnibox,
+        );
+        assert_eq!(window.handled, omnibox.handled, "{chord:?}");
+        assert_eq!(command(&window), command(&omnibox), "{chord:?}");
+        bound += usize::from(window.handled);
+    }
+    // Os sete da 2.2.0, o Ctrl+D dos favoritos (Global) e o Ctrl+J dos
+    // Downloads (o do registo e o da lista).
+    assert_eq!(bound, 10);
+    // Os dois caminhos passam pelo mapa (presenca); a lista antiga saiu.
+    let source = shipped_source();
+    assert!(source.contains("let decision = keymap_decision(input, CommandOrigin::Window);"));
+    assert!(source.contains(
+        "omnibox_accelerator_input(wparam, lparam, ctrl, shift, alt),\n            CommandOrigin::Omnibox,"
+    ));
+    assert!(!source.contains("fn main_window_shortcut("));
+}
+
+/// O `AcceleratorKeyPressed` corre dentro da chamada de entrada sincrona do
+/// WebView2: o handler so le os argumentos (e o `GetKeyState`), pergunta ao
+/// mapa (uma leitura) e manda o evento pelo proxy. Nenhuma chamada COM
+/// para fora (RPC_E_CANTCALLOUT_ININPUTSYNCCALL) -- asserção de ausencia --,
+/// e o mapa de teclas nao tem nada de COM nem de `unsafe`.
+#[test]
+fn the_accelerator_callback_calls_out_to_nothing() {
+    let module = |file: &str| {
+        ALL_MODULES
+            .iter()
+            .find(|(name, _)| *name == file)
+            .map(|(_, content)| content.replace("\r\n", "\n"))
+            .unwrap_or_else(|| panic!("{file} em ALL_MODULES"))
+    };
+    let hooks = module("webview_hooks.rs");
+    let handler = hooks
+        .split("AcceleratorKeyPressedEventHandler::create(Box::new(move |_, args| {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    }));\n").next())
+        .expect("o handler do AcceleratorKeyPressed");
+    assert!(handler.contains("proxy.send_event(event)"));
+    // O handler chama `accelerator_lookup` -- a funcao dos gates -- sobre o
+    // mapa do produto com o hospedeiro deste registo, uma vez; e nada no
+    // registo nomeia outro hospedeiro nem outra origem (asserção de
+    // ausencia): o `host` que chega a `accelerator_lookup` e o que o
+    // `ComHookRegistrar` recebeu de `install_hooks_with`.
+    assert_eq!(
+        handler
+            .matches("let decision = accelerator_lookup(product_keymap(), host, input);")
+            .count(),
+        1
+    );
+    assert_eq!(handler.matches("accelerator_lookup(").count(), 1);
+    let register = hooks
+        .split("fn register_webview_accelerators(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("register_webview_accelerators");
+    for forbidden in ["WebViewHost::", "CommandOrigin", "let host", "host ="] {
+        assert!(
+            !register.contains(forbidden),
+            "o registo do AcceleratorKeyPressed nomeia {forbidden}"
+        );
+    }
+    assert_eq!(hooks.matches("register_webview_accelerators(").count(), 2);
+    assert_eq!(
+        hooks
+            .matches("register_webview_accelerators(self.webview, host, self.proxy.clone())")
+            .count(),
+        1
+    );
+    let calls: Vec<&str> = handler
+        .match_indices("args.")
+        .map(|(at, _)| {
+            let rest = &handler[at + "args.".len()..];
+            &rest[..rest.find('(').unwrap_or(rest.len())]
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            "KeyEventKind",
+            "VirtualKey",
+            "PhysicalKeyStatus",
+            "SetHandled"
+        ]
+    );
+    for forbidden in [
+        "ExecuteScript",
+        ".webview()",
+        "controller",
+        "SendMessage",
+        "evaluate_script",
+        "CoreWebView2",
+    ] {
+        assert!(!handler.contains(forbidden), "o handler chama {forbidden}");
+    }
+    let keymap = module("keymap.rs");
+    for forbidden in ["unsafe", "webview2_com", "windows_core", "SendMessage"] {
+        assert!(!keymap.contains(forbidden), "keymap.rs usa {forbidden}");
     }
 }
 
@@ -9089,7 +13490,6 @@ struct RecordedSplitWebView {
     incognito: Option<bool>,
     scripts: Vec<String>,
     ipc: Option<Box<dyn Fn(Request<String>)>>,
-    navigation: Option<Box<dyn Fn(String) -> bool>>,
     new_window: Option<Box<dyn Fn(String) -> NewWindowResponse>>,
     permission: bool,
     focused: Option<bool>,
@@ -9106,10 +13506,6 @@ impl SplitWebViewTarget for RecordedSplitWebView {
     }
     fn with_ipc_handler(mut self, handler: impl Fn(Request<String>) + 'static) -> Self {
         self.ipc = Some(Box::new(handler));
-        self
-    }
-    fn with_navigation_handler(mut self, handler: impl Fn(String) -> bool + 'static) -> Self {
-        self.navigation = Some(Box::new(handler));
         self
     }
     fn with_new_window_req_handler(
@@ -9217,12 +13613,8 @@ fn open_split_mode_hands_its_private_flag_to_the_builder() {
         normal_events.take().as_slice(),
         [UserEvent::OpenSplitFromSplit { source_index: 1, url }] if url == "https://example.com/popup"
     ));
-    let navigate = built_private
-        .navigation
-        .as_ref()
-        .expect("navigation handler");
-    assert!(navigate("https://example.com/outra".to_string()));
-    assert!(!navigate("neuralia:home".to_string()));
+    // A trava de navegacao do Split (NavGate::Web com a origem local do
+    // SplitBuild) vem de `hooked_builder`: gate `every_webview_gets_the_hooks`.
 
     // O handler IPC que o builder instala, com envelopes reais: o privado
     // recusa `search` e continua a fechar-se; o normal leva o texto.
@@ -10792,35 +15184,32 @@ fn the_epub_protocol_handler_keeps_the_query_and_every_header() {
 #[test]
 fn ctrl_o_opens_the_book_dialog_on_home_and_in_the_main_window() {
     use winit::keyboard::ModifiersState;
-    // A omnibox da Home (o subclass do EDIT decide por esta função).
-    assert!(omnibox_opens_epub_dialog(0x4F, true, false));
-    assert!(!omnibox_opens_epub_dialog(0x4F, false, false));
-    assert!(!omnibox_opens_epub_dialog(0x4F, true, true));
-    assert!(!omnibox_opens_epub_dialog(0x50, true, false));
-    assert!(!omnibox_opens_epub_dialog(0x4E, true, false));
-    // A janela principal (winit).
+    let dialog = Some(format!("{:?}", UserEvent::OpenEpubDialog));
+    // A omnibox da Home: o subclass do EDIT pergunta ao mapa de teclas com
+    // a tecla do WM_KEYDOWN.
+    let omnibox = |vk: usize, ctrl: bool, shift: bool| {
+        chord_command_event(&keymap_decision(
+            omnibox_accelerator_input(vk, 0, ctrl, shift, false),
+            CommandOrigin::Omnibox,
+        ))
+    };
+    assert_eq!(omnibox(0x4F, true, false), dialog);
+    assert_eq!(omnibox(0x4F, false, false), None);
+    assert_eq!(omnibox(0x4F, true, true), None);
+    assert_eq!(omnibox(0x50, true, false), None);
+    assert_ne!(omnibox(0x4E, true, false), dialog);
+    // A janela principal (winit): o mesmo mapa, com a janela como origem.
     let key = |text: &str| Key::Character(text.into());
+    let window = |text: &str, modifiers: ModifiersState| {
+        window_accelerator_input(&key(text), modifiers, false)
+            .and_then(|input| chord_command_event(&keymap_decision(input, CommandOrigin::Window)))
+    };
     let ctrl = ModifiersState::CONTROL;
-    assert_eq!(
-        main_window_shortcut(&key("o"), ctrl),
-        Some(MainShortcut::OpenEpub)
-    );
-    assert_eq!(
-        main_window_shortcut(&key("O"), ctrl),
-        Some(MainShortcut::OpenEpub)
-    );
-    assert_eq!(
-        main_window_shortcut(&key("o"), ctrl | ModifiersState::SHIFT),
-        None
-    );
-    assert_eq!(
-        main_window_shortcut(&key("o"), ctrl | ModifiersState::ALT),
-        None
-    );
-    assert_eq!(
-        main_window_shortcut(&key("o"), ModifiersState::empty()),
-        None
-    );
+    assert_eq!(window("o", ctrl), dialog);
+    assert_eq!(window("O", ctrl), dialog);
+    assert_eq!(window("o", ctrl | ModifiersState::SHIFT), None);
+    assert_eq!(window("o", ctrl | ModifiersState::ALT), None);
+    assert_eq!(window("o", ModifiersState::empty()), None);
 }
 
 #[test]
@@ -10871,33 +15260,26 @@ fn livros_and_epub_commands_route_to_the_book_library() {
 fn the_main_window_answers_the_same_ctrl_shortcuts() {
     use winit::keyboard::ModifiersState;
     let key = |text: &str| Key::Character(text.into());
+    let window = |key: Key, modifiers: ModifiersState| {
+        window_accelerator_input(&key, modifiers, false)
+            .and_then(|input| chord_command_event(&keymap_decision(input, CommandOrigin::Window)))
+    };
+    let event = |event: UserEvent| Some(format!("{event:?}"));
     let ctrl = ModifiersState::CONTROL;
     let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+    assert_eq!(window(key("r"), ctrl), event(UserEvent::ToggleAutoScroll));
+    assert_eq!(window(key("R"), ctrl_shift), event(UserEvent::ReloadPage));
+    assert_eq!(window(key("h"), ctrl), event(UserEvent::ShowHistory));
+    assert_eq!(window(key("n"), ctrl), event(UserEvent::NewTab(0)));
+    // O Ctrl+Shift+Delete da omnibox e das paginas vale agora tambem com o
+    // teclado na janela (o mesmo mapa); pergunta antes de apagar.
     assert_eq!(
-        main_window_shortcut(&key("r"), ctrl),
-        Some(MainShortcut::AutoScroll)
-    );
-    assert_eq!(
-        main_window_shortcut(&key("R"), ctrl_shift),
-        Some(MainShortcut::Reload)
-    );
-    assert_eq!(
-        main_window_shortcut(&key("h"), ctrl),
-        Some(MainShortcut::History)
-    );
-    assert_eq!(
-        main_window_shortcut(&key("n"), ctrl),
-        Some(MainShortcut::NewTab)
+        window(Key::Named(NamedKey::Delete), ctrl_shift),
+        event(UserEvent::ClearHistory)
     );
     // Sem Ctrl, ou com Alt (AltGr no teclado portugues), a tecla e texto.
-    assert_eq!(
-        main_window_shortcut(&key("r"), ModifiersState::empty()),
-        None
-    );
-    assert_eq!(
-        main_window_shortcut(&key("r"), ctrl | ModifiersState::ALT),
-        None
-    );
+    assert_eq!(window(key("r"), ModifiersState::empty()), None);
+    assert_eq!(window(key("r"), ctrl | ModifiersState::ALT), None);
 }
 
 #[test]
@@ -11283,6 +15665,26 @@ fn context_menu_commands_are_unique() {
     for (index, id) in ids.iter().enumerate() {
         assert!(!ids[..index].contains(id));
     }
+
+    // O registo dos itens das WebViews (`WEBVIEW_MENU_ITEMS`): ids unicos
+    // entre si, nunca 0 (o TrackPopupMenu fechado sem escolha) e cada um
+    // encontravel pelo id -- e o que o item escolhido usa para achar o seu
+    // evento.
+    let registry: Vec<usize> = WEBVIEW_MENU_ITEMS.iter().map(|item| item.id).collect();
+    assert!(!registry.is_empty(), "o item de rolagem saiu do registo");
+    for (index, id) in registry.iter().enumerate() {
+        assert_ne!(*id, 0, "0 e o menu fechado sem escolha");
+        assert!(
+            !registry[..index].contains(id),
+            "id {id} repetido no registo"
+        );
+        assert!(
+            webview_menu_item(*id).is_some_and(|item| item.id == *id),
+            "id {id} nao se encontra pelo id"
+        );
+    }
+    assert!(webview_menu_item(0).is_none());
+    assert!(webview_menu_item(registry.iter().max().copied().unwrap_or(0) + 1).is_none());
 }
 
 #[test]
@@ -11483,7 +15885,7 @@ fn owned_popups_are_not_topmost() {
     };
     for (from, to) in [
         ("fn show_splash", "fn position_splash"),
-        ("fn show_gmail_toast", "fn position_gmail_toast"),
+        ("fn create_toast_window", "fn place_toast"),
         ("fn sync_exit_button", "fn position_exit_button"),
         ("fn sync_comparator_splitters", "fn resize_comparator"),
     ] {
@@ -11497,19 +15899,35 @@ fn owned_popups_are_not_topmost() {
             "{from} nao pode pousar sobre as outras aplicacoes"
         );
     }
-    // show_search_card mora agora em search_card.rs
+    // show_search_card cria o cartao pela receita dos cartoes nativos
+    // (native_card.rs), que e quem chama o CreateWindowExW.
     let sc_text = body(
         &source_combined,
         "fn show_search_card(&mut self, token: u64, intent: SearchIntent, text: &str) {",
         "fn hide_search_card",
     );
     assert!(
-        sc_text.contains("CreateWindowExW"),
-        "show_search_card devia criar a janela"
+        sc_text.contains("create_native_card("),
+        "show_search_card devia criar o cartao pela receita nativa"
     );
     assert!(
         !sc_text.contains("WS_EX_TOPMOST"),
         "show_search_card nao pode pousar sobre as outras aplicacoes"
+    );
+    let card = body(
+        &source_combined,
+        "fn create_native_card",
+        "
+}
+",
+    );
+    assert!(
+        card.contains("CreateWindowExW") && card.contains("AUX_POPUP_EX_STYLE"),
+        "create_native_card devia criar a janela sem ativacao"
+    );
+    assert!(
+        !card.contains("WS_EX_TOPMOST"),
+        "um cartao nativo nao pode pousar sobre as outras aplicacoes"
     );
 }
 
@@ -12852,10 +17270,12 @@ fn group_chip_underline_and_hovered_close_are_painted_like_chrome() {
             &all_groups,
             active.map(|id| (0, Some(id), false, false)),
             [None; COMPARATOR_COLUMNS],
-            true,
-            hover,
-            true,
-            None,
+            BarState {
+                visible: true,
+                hover,
+                auto_scroll: true,
+                ..BarState::default()
+            },
             &LivePanel::<()>::off(),
             &theme,
         );
@@ -14115,10 +18535,13 @@ fn the_row_reorders_live_under_the_dragged_tab() {
             &rig.groups,
             None,
             [None; COMPARATOR_COLUMNS],
-            true,
-            None,
-            true,
-            drag,
+            BarState {
+                visible: true,
+                hover: None,
+                auto_scroll: true,
+                drag,
+                ..BarState::default()
+            },
             &LivePanel::<()>::off(),
             &theme,
         );
@@ -15145,8 +19568,7 @@ fn tool_buttons_never_overlap_the_bar_at_any_width() {
                     for index in 0..COMPARATOR_COLUMNS {
                         bar.push(layout.columns[index]);
                         bar.push(layout.add_tabs[index]);
-                        bar.push(layout.column_back[index]);
-                        bar.push(layout.column_forward[index]);
+                        bar.extend(layout.column_buttons[index]);
                         bar.extend(layout.context_tabs[index]);
                         bar.extend(layout.group_pills[index]);
                     }
@@ -15187,15 +19609,11 @@ fn tool_buttons_never_overlap_the_bar_at_any_width() {
 fn provider_row(layout: &BarLayout) -> Vec<[f64; 4]> {
     let mut rects = Vec::new();
     for index in 0..COMPARATOR_COLUMNS {
-        for rect in [
-            layout.columns[index],
-            layout.add_tabs[index],
-            layout.column_back[index],
-            layout.column_forward[index],
-        ]
-        .into_iter()
-        .chain(layout.context_tabs[index])
-        .chain(layout.group_pills[index])
+        for rect in [layout.columns[index], layout.add_tabs[index]]
+            .into_iter()
+            .chain(layout.column_buttons[index])
+            .chain(layout.context_tabs[index])
+            .chain(layout.group_pills[index])
         {
             rects.push([rect.x, rect.y, rect.width, rect.height]);
         }
@@ -15210,9 +19628,33 @@ fn provider_row(layout: &BarLayout) -> Vec<[f64; 4]> {
 /// 1100 perdia o "+". Agora (1) arrancar, pausar ou parar o Pomodoro nao
 /// mexe em NADA da segunda linha nem nas abas, a qualquer largura e
 /// escala; e (2) nas larguras comuns cada coluna visivel tem a sua
-/// pilula (legivel a partir de 1280), o "+" e os ‹ ›.
+/// pilula (legivel a partir de 1280), o "+" e os ‹ ›. Os dois opcionais
+/// (o 文A e a estrela, ‹ › 文A ☆) cedem antes da pilula, a estrela
+/// primeiro: de `TRANSLATE_FROM` (1290 px logicos) para cima o 文A esta
+/// nas tres colunas e de `BOOKMARK_FROM` (1374) para cima tambem a estrela,
+/// a 1x e a 1.5x; nas colunas que nao encostam ao canto os dois estao de
+/// 1280 para cima. Abaixo disso a coluna encostada ao canto -- que tambem
+/// paga a seta dos Downloads (downloads-ui) a partir de 1100 -- e a
+/// primeira a ceder: de 1290 a 1373 fica so com o 文A, abaixo de 1290 sem
+/// nenhum; o «Traduzir página» do botao direito (gate
+/// `each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r`) e
+/// o Ctrl+D (`ctrl_d_runs_against_the_host_it_came_from`) continuam.
 #[test]
 fn the_tools_never_take_room_from_the_ai_columns() {
+    // A largura (logica) a partir da qual as tres colunas a vista tem o
+    // 文A: a 1289 px a do canto ainda nao tem lugar para ele.
+    const TRANSLATE_FROM: f64 = 1290.0;
+    // E a da estrela, que precisa do lugar do 文A e do seu: a 1373 px a do
+    // canto so tem o 文A.
+    const BOOKMARK_FROM: f64 = 1374.0;
+    // Nas colunas que nao encostam ao canto os opcionais cabem de 1280 px
+    // (a pilula legivel) para cima.
+    const OTHERS_FROM: f64 = 1280.0;
+    let optional_from = |button: ColumnButton| match button {
+        ColumnButton::Translate => TRANSLATE_FROM,
+        ColumnButton::Bookmark => BOOKMARK_FROM,
+        ColumnButton::Back | ColumnButton::Forward => 0.0,
+    };
     let (running, paused) = shipped_pomodoro_labels();
     let topologies = [
         ([false, false, false], false),
@@ -15271,13 +19713,27 @@ fn the_tools_never_take_room_from_the_ai_columns() {
         }
     }
 
-    for logical_width in [1024.0, 1100.0, 1280.0, 1366.0, 1440.0, 1920.0] {
+    for logical_width in [
+        1024.0,
+        1100.0,
+        1280.0,
+        TRANSLATE_FROM,
+        1366.0,
+        BOOKMARK_FROM,
+        1440.0,
+        1920.0,
+    ] {
         for scale in [1.0, 1.5] {
             let client_width = logical_width * scale;
             for (minimized, split_active) in topologies {
                 if split_active {
                     continue;
                 }
+                // A coluna encostada ao canto: a que paga a seta dos
+                // Downloads (downloads-ui) a partir de 1100 px.
+                let last_visible = (0..COMPARATOR_COLUMNS)
+                    .rev()
+                    .find(|index| !minimized[*index]);
                 for label in [None, running, paused] {
                     let layout = layout_at(client_width, scale, minimized, split_active, label);
                     for index in 0..COMPARATOR_COLUMNS {
@@ -15293,10 +19749,85 @@ fn the_tools_never_take_room_from_the_ai_columns() {
                             assert!(pill >= 60.0, "pilula de {pill:.1} px: {at}");
                         }
                         assert!(layout.add_tabs[index].width > 0.0, "sem \"+\": {at}");
-                        assert!(layout.column_back[index].width > 0.0, "sem ‹: {at}");
-                        assert!(layout.column_forward[index].width > 0.0, "sem ›: {at}");
+                        for button in ColumnButton::ALL {
+                            // Os opcionais cedem antes da pilula, a estrela
+                            // (a ultima de `ALL`) antes do 文A: cada um so e
+                            // exigido de onde cabe nas tres colunas (a coluna
+                            // encostada ao canto, que tambem paga a seta dos
+                            // Downloads, e a primeira a cede-los; o
+                            // «Traduzir página» do botao direito e o Ctrl+D
+                            // continuam sem eles).
+                            let from = if Some(index) == last_visible {
+                                optional_from(button)
+                            } else {
+                                OTHERS_FROM
+                            };
+                            if button.optional() && logical_width < from {
+                                continue;
+                            }
+                            assert!(
+                                layout.column_button(index, button).width > 0.0,
+                                "sem {}: {at}",
+                                button.glyph()
+                            );
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    // De `TRANSLATE_FROM` para cima, px a px, cada coluna a vista tem o 文A,
+    // e de `BOOKMARK_FROM` para cima tambem a estrela (a etiqueta do
+    // Pomodoro nao mexe na linha: parte (1)). Um px abaixo de cada um, a
+    // coluna do canto ja o cedeu -- e so ele: a estrela cede antes do 文A,
+    // e a pilula, o "+" e os ‹ › ficam.
+    for scale in [1.0, 1.5] {
+        for logical_width in TRANSLATE_FROM as u32..=1920 {
+            let logical_width = f64::from(logical_width);
+            for (minimized, split_active) in topologies {
+                if split_active {
+                    continue;
+                }
+                let layout = layout_at(logical_width * scale, scale, minimized, false, None);
+                for index in (0..COMPARATOR_COLUMNS).filter(|index| !minimized[*index]) {
+                    for button in ColumnButton::ALL
+                        .into_iter()
+                        .filter(|b| b.optional() && logical_width >= optional_from(*b))
+                    {
+                        assert!(
+                            layout.column_button(index, button).width > 0.0,
+                            "sem {}: coluna {index} a {logical_width}px @{scale}x min={minimized:?}",
+                            button.glyph()
+                        );
+                    }
+                }
+            }
+        }
+        let corner = COMPARATOR_COLUMNS - 1;
+        for (from, kept) in [(TRANSLATE_FROM, 0usize), (BOOKMARK_FROM, 1)] {
+            let below = layout_at(
+                (from - 1.0) * scale,
+                scale,
+                [false; COMPARATOR_COLUMNS],
+                false,
+                None,
+            );
+            assert!(below.columns[corner].width > 0.0 && below.add_tabs[corner].width > 0.0);
+            let mut optional_seen = 0;
+            for button in ColumnButton::ALL {
+                let expected = if button.optional() {
+                    optional_seen += 1;
+                    optional_seen <= kept
+                } else {
+                    true
+                };
+                assert_eq!(
+                    below.column_button(corner, button).width > 0.0,
+                    expected,
+                    "{} da coluna do canto um px abaixo de {from} @{scale}x",
+                    button.glyph()
+                );
             }
         }
     }
@@ -15436,7 +19967,8 @@ fn tool_hints_say_what_the_click_does() {
     ];
     for (tool, text) in expected {
         assert_eq!(
-            bar_tooltip_label(BarHit::Tool(tool), "IA", false, None, None).as_deref(),
+            bar_tooltip_label(BarHit::Tool(tool), &BarState::default(), "IA", None, None)
+                .as_deref(),
             Some(text)
         );
     }
@@ -15450,7 +19982,7 @@ fn pomodoro_hint_follows_the_session_in_the_bar_and_on_home() {
     // O que a barra mostra (`bar_hint`, pelo `App::bar_tooltip_text`) e
     // o que a Home e o refresco de cada segundo mostram (`tool_hint_at`).
     let bar = |hit: BarHit, pomodoro: &PomodoroController, now: Instant| {
-        bar_hint(hit, pomodoro, now, "IA", false, None, None)
+        bar_hint(hit, pomodoro, now, &BarState::default(), "IA", None, None)
     };
     let mut pomodoro =
         PomodoroController::new(crate::pomodoro_ui::PomodoroPreset::Classic.settings());
@@ -15491,7 +20023,7 @@ Clique: pausar · botão direito: opções";
     // O resto da barra continua com a sua dica.
     assert_eq!(
         bar(BarHit::Home, &pomodoro, at),
-        bar_tooltip_label(BarHit::Home, "IA", false, None, None)
+        bar_tooltip_label(BarHit::Home, &BarState::default(), "IA", None, None)
     );
     // Parado outra vez: a fixa.
     pomodoro.command(PomodoroCommand::Stop, at);
@@ -15636,9 +20168,9 @@ fn a_notice_never_inherits_or_answers_the_auto_scroll_question() {
     // 1. Fim de fase com a pergunta a vista: espera, sem botoes.
     let mut board = SplashBoard::default();
     let asked = board
-        .show(question(), 20, SplashKind::Question)
+        .show(question(), 20, SplashKind::Question(AUTO_SCROLL_QUESTION))
         .expect("a pergunta aparece");
-    assert!(asked.asks);
+    assert_eq!(asked.question, Some(AUTO_SCROLL_QUESTION));
     assert_eq!(
         board.show(phase_end.clone(), 8, SplashKind::Background),
         None,
@@ -15651,7 +20183,7 @@ fn a_notice_never_inherits_or_answers_the_auto_scroll_question() {
             next: Some(next),
         } => {
             assert_eq!(next.text, phase_end);
-            assert!(!next.asks, "o aviso herdou o Sim/Nao");
+            assert_eq!(next.question, None, "o aviso herdou o Sim/Nao");
             assert_eq!(next.seconds, 8);
             assert_eq!(
                 board.hide(next.token),
@@ -15666,7 +20198,9 @@ fn a_notice_never_inherits_or_answers_the_auto_scroll_question() {
 
     // 2. Respondida: o aviso que esperava aparece quando ela sai.
     let mut board = SplashBoard::default();
-    let asked = board.show(question(), 20, SplashKind::Question).expect("q");
+    let asked = board
+        .show(question(), 20, SplashKind::Question(AUTO_SCROLL_QUESTION))
+        .expect("q");
     assert_eq!(
         board.show(phase_end.clone(), 8, SplashKind::Background),
         None
@@ -15685,7 +20219,9 @@ fn a_notice_never_inherits_or_answers_the_auto_scroll_question() {
     //    lhe responder: o fim dele nao e um "nao", e o temporizador da
     //    pergunta ja nao conta.
     let mut board = SplashBoard::default();
-    let asked = board.show(question(), 20, SplashKind::Question).expect("q");
+    let asked = board
+        .show(question(), 20, SplashKind::Question(AUTO_SCROLL_QUESTION))
+        .expect("q");
     let notice = board
         .show(
             "Pomodoro iniciado: foco de 25 min".to_string(),
@@ -15693,7 +20229,7 @@ fn a_notice_never_inherits_or_answers_the_auto_scroll_question() {
             SplashKind::Notice,
         )
         .expect("o gesto responde ja");
-    assert!(!notice.asks, "o aviso do gesto herdou o Sim/Nao");
+    assert_eq!(notice.question, None, "o aviso do gesto herdou o Sim/Nao");
     assert_eq!(board.hide(asked.token), SplashHide::Stale);
     assert_eq!(
         board.hide(notice.token),
@@ -15709,7 +20245,7 @@ fn a_notice_never_inherits_or_answers_the_auto_scroll_question() {
     let shown = board
         .show(phase_end.clone(), 8, SplashKind::Background)
         .expect("sem pergunta nao espera");
-    assert!(!shown.asks);
+    assert_eq!(shown.question, None);
 }
 
 /// Gate: o painel da respiracao e o video que o dono escolheu, em
@@ -16530,7 +21066,7 @@ process.stdout.write(JSON.stringify({
 
     /// Corre o `PANEL_HTML` que embarca (com o tema posto por
     /// `panel_html`) e depois cada passo, pela ordem, no mesmo contexto.
-    fn run_panel(steps: &[String]) -> serde_json::Value {
+    pub(super) fn run_panel(steps: &[String]) -> serde_json::Value {
         let input = serde_json::json!({
             "html": panel_html(&Theme::dark((0, 120, 215))),
             "steps": steps,
@@ -16547,7 +21083,7 @@ process.stdout.write(JSON.stringify({
         result
     }
 
-    fn posted(result: &serde_json::Value) -> Vec<String> {
+    pub(super) fn posted(result: &serde_json::Value) -> Vec<String> {
         result["posted"]
             .as_array()
             .expect("posted")
@@ -19241,19 +23777,16 @@ __log.push(__json({{ tag: 'releitura', value: {NOTE_CAPTURE_SCRIPT} }}));
     fn ctrl_shift_z_in_the_main_window_is_a_new_note() {
         use winit::keyboard::ModifiersState;
         let key = |text: &str| Key::Character(text.into());
+        let window = |text: &str, modifiers: ModifiersState| {
+            window_accelerator_input(&key(text), modifiers, false).and_then(|input| {
+                chord_command_event(&keymap_decision(input, CommandOrigin::Window))
+            })
+        };
+        let new_note = Some(format!("{:?}", UserEvent::NewNote));
         let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
-        assert_eq!(
-            main_window_shortcut(&key("Z"), ctrl_shift),
-            Some(MainShortcut::NewNote)
-        );
-        assert_eq!(
-            main_window_shortcut(&key("z"), ctrl_shift),
-            Some(MainShortcut::NewNote)
-        );
-        assert_eq!(
-            main_window_shortcut(&key("z"), ModifiersState::CONTROL),
-            None
-        );
+        assert_eq!(window("Z", ctrl_shift), new_note);
+        assert_eq!(window("z", ctrl_shift), new_note);
+        assert_eq!(window("z", ModifiersState::CONTROL), None);
         // O script que a Home manda ao painel: sem a pagina das notas, nada.
         let program = format!(
             r#"
@@ -19270,5 +23803,5773 @@ console.log(JSON.stringify({{ calls, quiet: quiet === undefined }}));
             run_node_program(&program).trim(),
             r#"{"calls":["new"],"quiet":true}"#
         );
+    }
+}
+
+// ===================== infra-settings-keys: lojas, chaves, pedido de chave =====================
+
+/// O codigo de um ficheiro-fonte sem o seu `mod tests` (LF).
+fn code_without_tests(source: &str) -> String {
+    let source = source.replace("\r\n", "\n");
+    source
+        .split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// O mesmo codigo sem as linhas de comentario: os gates de ausencia olham
+/// para o que compila, nao para a doc que o explica.
+fn without_comment_lines(code: &str) -> String {
+    code.lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// O codigo Rust de `source` com os comentarios (de linha, de bloco,
+/// aninhados) e os literais (strings, raw strings, bytes, chars) trocados
+/// por espacos; as quebras de linha ficam. Os gates de "quem chama X" olham
+/// so para o que compila, com qualquer formatacao: um `show_home` num
+/// comentario ou numa linha do log nao conta; um `Self::show_home` passado
+/// como funcao conta.
+fn rust_code_only(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    // Um `r` que abre uma raw string: nada de identificador antes, ou so o
+    // prefixo `b`/`c` (`br#"..."#`). Um `"` ou um `'` fora de literais abre
+    // sempre um (o prefixo `b` de `b"..."`/`b'x'` fica como codigo).
+    let starts_raw = |at: usize| {
+        at == 0
+            || !ident(chars[at - 1])
+            || (matches!(chars[at - 1], 'b' | 'c') && (at < 2 || !ident(chars[at - 2])))
+    };
+    let mut out = String::with_capacity(source.len());
+    let blank = |out: &mut String, from: usize, to: usize| {
+        for ch in &chars[from..to.min(chars.len())] {
+            out.push(if *ch == '\n' { '\n' } else { ' ' });
+        }
+    };
+    let mut at = 0;
+    while at < chars.len() {
+        let ch = chars[at];
+        let next = chars.get(at + 1).copied();
+        if ch == '/' && next == Some('/') {
+            let end = (at..chars.len())
+                .find(|index| chars[*index] == '\n')
+                .unwrap_or(chars.len());
+            blank(&mut out, at, end);
+            at = end;
+            continue;
+        }
+        if ch == '/' && next == Some('*') {
+            let mut depth = 0usize;
+            let mut end = at;
+            while end < chars.len() {
+                if chars[end] == '/' && chars.get(end + 1) == Some(&'*') {
+                    depth += 1;
+                    end += 2;
+                } else if chars[end] == '*' && chars.get(end + 1) == Some(&'/') {
+                    depth -= 1;
+                    end += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    end += 1;
+                }
+            }
+            blank(&mut out, at, end);
+            at = end;
+            continue;
+        }
+        if ch == 'r' && starts_raw(at) {
+            let mut quote = at + 1;
+            while chars.get(quote) == Some(&'#') {
+                quote += 1;
+            }
+            if chars.get(quote) == Some(&'"') {
+                let hashes = quote - at - 1;
+                let mut end = quote + 1;
+                while end < chars.len() {
+                    if chars[end] == '"'
+                        && (1..=hashes).all(|offset| chars.get(end + offset) == Some(&'#'))
+                    {
+                        end += 1 + hashes;
+                        break;
+                    }
+                    end += 1;
+                }
+                blank(&mut out, at, end);
+                at = end;
+                continue;
+            }
+        }
+        if ch == '"' {
+            let mut end = at + 1;
+            while end < chars.len() {
+                match chars[end] {
+                    '\\' => end += 2,
+                    '"' => {
+                        end += 1;
+                        break;
+                    }
+                    _ => end += 1,
+                }
+            }
+            blank(&mut out, at, end);
+            at = end;
+            continue;
+        }
+        if ch == '\'' {
+            // Um char (`'x'`, `'"'`, `'\''`, `'\u{..}'`); senao e um
+            // lifetime ou uma etiqueta (`'a`, `'static`), que ficam.
+            let end = if next == Some('\\') {
+                (at + 3..chars.len())
+                    .find(|index| chars[*index] == '\'')
+                    .map(|index| index + 1)
+            } else if chars.get(at + 2) == Some(&'\'') {
+                Some(at + 3)
+            } else {
+                None
+            };
+            if let Some(end) = end {
+                blank(&mut out, at, end);
+                at = end;
+                continue;
+            }
+        }
+        out.push(ch);
+        at += 1;
+    }
+    out
+}
+
+/// Em `code` (de `rust_code_only`): quantas vezes cada funcao chega ao
+/// metodo `name` -- `x.name(...)`, `Self::name`, `Tipo::name` passado como
+/// funcao; um metodo so se alcanca por `.` ou `::` --, pela `fn` que a
+/// contem. A declaracao `fn name` e uma variavel ou parametro com o mesmo
+/// nome nao contam; um uso fora de qualquer `fn` conta como "(fora de fn)".
+fn ident_callers(code: &str, name: &str) -> std::collections::BTreeMap<String, usize> {
+    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let whole = |at: usize, len: usize| {
+        !code[..at].chars().next_back().is_some_and(ident)
+            && !code[at + len..].chars().next().is_some_and(ident)
+    };
+    // Cada `fn nome`, pelo sitio onde comeca.
+    let mut functions = Vec::new();
+    for (at, _) in code.match_indices("fn") {
+        if !whole(at, 2) {
+            continue;
+        }
+        let rest = &code[at + 2..];
+        let gap = rest.len() - rest.trim_start().len();
+        if gap == 0 {
+            continue;
+        }
+        let function: String = rest[gap..].chars().take_while(|ch| ident(*ch)).collect();
+        if !function.is_empty() {
+            functions.push((at, function));
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for (at, _) in code.match_indices(name) {
+        let before = code[..at].trim_end();
+        let member = before.ends_with('.') || before.ends_with("::");
+        if !whole(at, name.len()) || !member {
+            continue;
+        }
+        let owner = functions
+            .iter()
+            .rev()
+            .find(|(start, _)| *start < at)
+            .map_or_else(
+                || "(fora de fn)".to_string(),
+                |(_, function)| function.clone(),
+            );
+        *out.entry(owner).or_insert(0) += 1;
+    }
+    out
+}
+
+/// Os ficheiros de `src/` fora de `windows_app/` que embarcam e podem tocar
+/// na pasta de dados.
+fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "tab_session.rs",
+            code_without_tests(include_str!("../tab_session.rs")),
+        ),
+        (
+            "gemini_live.rs",
+            code_without_tests(include_str!("../gemini_live.rs")),
+        ),
+        (
+            "secrets.rs",
+            code_without_tests(include_str!("../secrets.rs")),
+        ),
+        (
+            "stores.rs",
+            code_without_tests(include_str!("../stores.rs")),
+        ),
+        (
+            "epub_app.rs",
+            code_without_tests(include_str!("../epub_app.rs")),
+        ),
+        (
+            "pomodoro_ui.rs",
+            code_without_tests(include_str!("../pomodoro_ui.rs")),
+        ),
+        (
+            "panel_chrome.rs",
+            code_without_tests(include_str!("../panel_chrome.rs")),
+        ),
+        (
+            "egress.rs",
+            code_without_tests(include_str!("../egress.rs")),
+        ),
+        (
+            "ai_settings.rs",
+            code_without_tests(include_str!("../ai_settings.rs")),
+        ),
+    ]
+}
+
+/// A tabela das lojas que o produto tem hoje, com o tipo de cada uma. Mudar
+/// um tipo aqui e uma decisao (a regra do tipo esta em
+/// `neural_core::json_store`), nao um acidente; e uma loja nova no codigo que
+/// embarca sem linha em `stores::APP_STORES` fica vermelha.
+#[test]
+fn existing_stores_have_a_declared_kind() {
+    use crate::stores::{
+        ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AI_SETTINGS_STORE, AI_USAGE_STORE, APP_STORES,
+        BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE, KEYS_STORE, LIVE_KEY_STORE,
+        TRANSLATE_STORE,
+    };
+    use neural_core::json_store::StoreKind::{Automatic, Explicit, Setting};
+    use neural_core::json_store::StoreShape::{Dir, File};
+    let mut expected = vec![
+        ("history.jsonl", Automatic, File),
+        ("downloads.json", Automatic, File),
+        ("downloads-settings.json", Setting, File),
+        ("memory", Automatic, Dir),
+        ("tabs.json", Automatic, File),
+        ("tabs.lock", Automatic, File),
+        ("tabs.cleared", Automatic, File),
+        ("panel-width.json", Automatic, File),
+        ("agent", Automatic, Dir),
+        ("WebView2", Automatic, Dir),
+        ("theme", Setting, File),
+        ("gmail", Setting, File),
+        ("pomodoro", Setting, File),
+        ("zettel", Explicit, Dir),
+        ("library", Explicit, Dir),
+        ("research-exports", Explicit, Dir),
+        ("gemini-live.key", Explicit, File),
+        ("keys", Explicit, Dir),
+        ("adblock-settings.json", Setting, File),
+        ("adblock-list.json", Automatic, File),
+        ("ai/settings.json", Setting, File),
+        ("ai/usage.json", Setting, File),
+        // «Sempre neste site» da Traducao: so um clique nesse botao a muda.
+        ("translate.json", Setting, File),
+        ("bookmarks.json", Explicit, File),
+    ];
+    expected.sort_by_key(|row| row.0);
+    let mut table: Vec<_> = APP_STORES
+        .iter()
+        .map(|spec| (spec.name, spec.kind, spec.shape))
+        .collect();
+    table.sort_by_key(|row| row.0);
+    assert_eq!(table, expected, "a tabela das lojas mudou");
+
+    // Tudo o que o codigo que embarca junta a `data_dir` esta na tabela, e
+    // tudo o que o registo concede tambem.
+    let mut code = shipped_source();
+    for (_, source) in shipped_top_level_sources() {
+        code.push('\n');
+        code.push_str(&source);
+    }
+    let compact: String = without_comment_lines(&code).split_whitespace().collect();
+    let named = [
+        ("PANEL_WIDTHS_FILE", PANEL_WIDTHS_FILE),
+        ("FILE_NAME", tab_session::FILE_NAME),
+        ("LOCK_NAME", tab_session::LOCK_NAME),
+        ("CLEARED_NAME", tab_session::CLEARED_NAME),
+        ("LIVE_KEY_FILE", crate::gemini_live::LIVE_KEY_FILE),
+    ];
+    let mut touched = std::collections::BTreeSet::new();
+    for part in compact.split("data_dir.join(").skip(1) {
+        let argument = part.split(')').next().unwrap_or_default();
+        let name = match argument.strip_prefix('"') {
+            Some(literal) => literal.split('"').next().unwrap_or_default(),
+            None => named
+                .iter()
+                .find(|(ident, _)| argument.trim_start_matches('&') == *ident)
+                .map(|(_, value)| *value)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "data_dir.join({argument}): nome desconhecido; declare a loja em stores::APP_STORES"
+                    )
+                }),
+        };
+        touched.insert(name);
+    }
+    let specs = [
+        ("KEYS_STORE", KEYS_STORE.name),
+        ("LIVE_KEY_STORE", LIVE_KEY_STORE.name),
+        ("ADBLOCK_SETTINGS_STORE", ADBLOCK_SETTINGS_STORE.name),
+        ("ADBLOCK_LIST_STORE", ADBLOCK_LIST_STORE.name),
+        ("AI_SETTINGS_STORE", AI_SETTINGS_STORE.name),
+        ("AI_USAGE_STORE", AI_USAGE_STORE.name),
+        ("DOWNLOADS_LOG_STORE", DOWNLOADS_LOG_STORE.name),
+        ("DOWNLOADS_SETTINGS_STORE", DOWNLOADS_SETTINGS_STORE.name),
+        ("TRANSLATE_STORE", TRANSLATE_STORE.name),
+        ("BOOKMARKS_STORE", BOOKMARKS_STORE.name),
+    ];
+    for part in compact.split(".grant(").skip(1) {
+        let argument = part.split(')').next().unwrap_or_default();
+        let name = specs
+            .iter()
+            .find(|(ident, _)| argument == *ident)
+            .map(|(_, value)| *value)
+            .unwrap_or_else(|| {
+                panic!("grant({argument}): spec desconhecida no codigo que embarca")
+            });
+        touched.insert(name);
+    }
+    for name in &touched {
+        assert!(
+            APP_STORES.iter().any(|spec| spec.name == *name),
+            "{name} e escrita pelo produto mas nao tem tipo em stores::APP_STORES"
+        );
+    }
+    for spec in APP_STORES {
+        assert!(
+            touched.contains(spec.name),
+            "{} esta na tabela mas nenhum codigo a usa",
+            spec.name
+        );
+    }
+}
+
+/// A unica cunhagem do registo das lojas no produto e a do `App::new`.
+#[test]
+fn the_store_registry_is_minted_once_in_app_new() {
+    let source = shipped_source();
+    assert_eq!(
+        source.matches("StoreRegistry::mint(").count(),
+        1,
+        "o produto cunha o registo uma vez so"
+    );
+    let app_new = source
+        .split("impl App {\n    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("App::new");
+    assert!(app_new.contains("let stores = StoreRegistry::mint(&config.data_dir).ok();"));
+    for (name, source) in shipped_top_level_sources() {
+        assert!(
+            !source.contains("StoreRegistry::mint("),
+            "{name} cunha o registo"
+        );
+    }
+}
+
+// ===================== infra-egress: o portao de saida da IA =====================
+
+/// Gate (critico, infra-egress): o `App::new` nao arranca worker preguicoso
+/// nenhum e nao toca em `ai/`. O portao so nasce no primeiro pedido
+/// (`App::egress_gate`), e o construtor que ele usa -- o mesmo, aqui -- nao
+/// cria thread nem ficheiro: a thread `neural-usage` so aparece na primeira
+/// chamada paga (`egress::tests::the_usage_writer_starts_on_the_first_paid_call`).
+/// A Home fica com as threads e a RAM de sempre (measure-home).
+#[test]
+fn app_new_starts_no_lazy_worker() {
+    let dir = std::env::temp_dir().join(format!("neuralia-egress-app-new-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let registry = StoreRegistry::mint_for_test(&dir);
+    let gate = crate::egress::EgressGate::for_app(Some(&registry));
+    assert_eq!(
+        gate.worker_threads_spawned(),
+        0,
+        "o portao nasceu com uma thread"
+    );
+    assert!(!dir.exists(), "criar o portao escreveu na pasta de dados");
+    let without_stores = crate::egress::EgressGate::for_app(None);
+    assert_eq!(without_stores.worker_threads_spawned(), 0);
+
+    // O `App::new` deixa o portao por nascer e nao pede trabalho a worker
+    // preguicoso nenhum (gate de ausencia, AGENTS.md §4.3).
+    let source = shipped_source();
+    let app_new = source
+        .split("impl App {\n    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("App::new");
+    assert_eq!(app_new.matches("egress: None,").count(), 1);
+    for forbidden in ["EgressGate", "egress_gate", "LazyWorker", ".submit("] {
+        assert!(
+            !app_new.contains(forbidden),
+            "o App::new chama {forbidden}: o worker ja nao e preguicoso"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// As chaves sao credenciais: o Ctrl+Shift+Delete nunca as apaga. Nenhum
+/// alvo da tabela e de chaves, e o modulo do "Apagar historico" nem conhece
+/// o cofre.
+#[test]
+fn keys_survive_clear_history() {
+    for target in CLEAR_HISTORY_TARGETS {
+        assert!(!format!("{target:?}").contains("Key"), "{target:?}");
+    }
+    let clear = code_without_tests(include_str!("clear_history.rs"));
+    for forbidden in [
+        "KeyVault",
+        "LiveKeyStore",
+        "KeySlot",
+        "KEYS_STORE",
+        "LIVE_KEY_STORE",
+        "gemini-live.key",
+        "secrets::",
+        "keys_event",
+    ] {
+        assert!(
+            !clear.contains(forbidden),
+            "o Apagar historico chega a {forbidden}"
+        );
+    }
+}
+
+/// Os nomes de funcao e a lista de parametros de cada `fn` de um codigo.
+fn fn_signatures(code: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (at, _) in code.match_indices("fn ") {
+        if at > 0 && !code.as_bytes()[at - 1].is_ascii_whitespace() {
+            continue;
+        }
+        let rest = &code[at + 3..];
+        let name: String = rest
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect();
+        if name.is_empty() {
+            continue;
+        }
+        let Some(open) = rest.find('(') else {
+            continue;
+        };
+        let mut depth = 0usize;
+        let mut close = None;
+        for (index, ch) in rest[open..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(close) = close {
+            out.push((name, rest[open + 1..close].to_string()));
+        }
+    }
+    out
+}
+
+/// Uma chave do cofre nunca entra numa WebView: nenhuma funcao que monte o
+/// que vai para uma pagina (scripts, JSON, HTML, o painel) recebe uma
+/// `ApiKey` ou o cofre, e o pedido de chave nao fala com WebView nenhuma
+/// (AGENTS.md §4.3: gate de ausencia). A chave do Live continua a ser a
+/// excecao de sempre, documentada no SECURITY.md: `live_start_script` leva a
+/// `LiveKey` a pagina do Live quando a sessao arranca.
+#[test]
+fn no_panel_payload_builder_takes_a_key() {
+    let mut sources = vec![("windows_app".to_string(), shipped_source())];
+    for (name, source) in shipped_top_level_sources() {
+        sources.push((name.to_string(), source));
+    }
+    let mut builders = 0;
+    for (file, code) in &sources {
+        for (name, params) in fn_signatures(code) {
+            let builder = name.ends_with("_script")
+                || name.ends_with("_json")
+                || name.ends_with("_html")
+                || name.ends_with("_payload")
+                || name.starts_with("panel_")
+                || name.contains("render");
+            if !builder {
+                continue;
+            }
+            builders += 1;
+            for secret in ["ApiKey", "KeyVault", "SecretFile", "Plain", "KeySlot"] {
+                assert!(
+                    !params.contains(secret),
+                    "{file}: {name}({params}) monta o que vai para uma pagina e recebe {secret}"
+                );
+            }
+        }
+    }
+    assert!(
+        builders > 20,
+        "o gate tem de ver os construtores de payload ({builders})"
+    );
+    let prompt = without_comment_lines(&code_without_tests(include_str!("secret_prompt.rs")));
+    let vault = without_comment_lines(&code_without_tests(include_str!("../secrets.rs")));
+    for (file, code) in [("secret_prompt.rs", &prompt), ("secrets.rs", &vault)] {
+        for forbidden in [
+            "WebView",
+            "webview",
+            "evaluate_script",
+            "panel_eval",
+            "panel_run",
+            "live_call",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "{file} fala com uma pagina ({forbidden})"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_secret_prompt_speaks_pt_br_and_only_a_well_shaped_key_leaves_it() {
+    use crate::secrets::{API_KEY_MAX_CHARS, KeySlot};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ES_PASSWORD, WS_EX_TOPMOST};
+    const OPENAI: &str = concat!("sk-", "proj-", "TESTONLY_not_a_real_key_0123456789");
+    const ANTHROPIC: &str = concat!("sk-", "ant-", "api03-TESTONLY-not-a-real-key-0123");
+    assert_eq!(
+        secret_prompt_title(&KeySlot::OpenAi),
+        "Cole a chave da OpenAI (começa por sk-)"
+    );
+    assert_eq!(
+        SECRET_PROMPT_NOTE,
+        "Fica cifrada neste Windows e só serve para o NeuralIA."
+    );
+    assert_eq!(SECRET_PROMPT_SAVE, "Salvar e verificar");
+    assert_eq!(SECRET_PROMPT_CANCEL, "Cancelar");
+    assert_eq!(SECRET_PROMPT_FORGET, "Esquecer chave");
+
+    // O Enter so deixa sair uma chave com a forma do slot, sem espacos.
+    assert!(secret_prompt_submit(&KeySlot::OpenAi, ANTHROPIC).is_none());
+    assert!(secret_prompt_submit(&KeySlot::OpenAi, "").is_none());
+    assert!(secret_prompt_submit(&KeySlot::Anthropic, OPENAI).is_none());
+    let Some(KeyEvent::Entered { slot, key }) =
+        secret_prompt_submit(&KeySlot::OpenAi, &format!("{OPENAI}\r\n"))
+    else {
+        panic!("uma chave da OpenAI tem de sair do pedido");
+    };
+    assert_eq!(slot, KeySlot::OpenAi);
+    assert_eq!(key.expose(), OPENAI);
+    // O evento nunca imprime a chave (o `UserEvent` deriva Debug).
+    let printed = format!("{:?}", UserEvent::Keys(KeyEvent::Entered { slot, key }));
+    assert!(!printed.contains(&OPENAI[3..20]), "{printed}");
+
+    // Uma colagem longa demais chega inteira a validacao e e recusada: o
+    // EDIT nao a corta ao tecto de uma chave valida (o tecto do EDIT e
+    // maior: `const` em `secret_prompt.rs`).
+    let long = format!("sk-{}", "a".repeat(API_KEY_MAX_CHARS));
+    assert!(secret_prompt_submit(&KeySlot::OpenAi, &long).is_none());
+
+    // Ativavel (recebe teclado), nunca TOPMOST, e o EDIT e de palavra-passe.
+    assert_eq!(
+        SECRET_PROMPT_EX_STYLE & (WS_EX_NOACTIVATE | WS_EX_TOPMOST),
+        0
+    );
+    assert_ne!(SECRET_PROMPT_EDIT_STYLE & ES_PASSWORD as u32, 0);
+}
+
+/// O pedido de chave como o produto o cria (`create_secret_prompt`,
+/// `show_secret_prompt`, `destroy_secret_prompt`), numa janela dona real:
+/// owned, ativavel e sem TOPMOST, fica com o teclado, o EDIT e de
+/// palavra-passe, o Enter so manda uma chave com a forma do slot e limpa o
+/// EDIT, Esc e os botoes mandam os seus eventos, e o EDIT esta vazio quando
+/// o popup e destruido. Muda o foco: corre so no CI (passo "Focus-affecting
+/// window gates" do ci.yml), nunca na suite local.
+#[test]
+#[ignore = "needs a desktop session: runs in CI"]
+fn the_secret_prompt_takes_typing_sends_the_key_and_clears_the_edit() {
+    use crate::secrets::KeySlot;
+    use std::cell::RefCell;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        BN_CLICKED, ES_PASSWORD, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetDlgItem, GetWindow,
+        GetWindowLongPtrW, IsWindowVisible, SetWindowTextW, WM_COMMAND, WM_DESTROY, WS_EX_TOPMOST,
+        WS_OVERLAPPEDWINDOW,
+    };
+    const OPENAI: &str = concat!("sk-", "proj-", "TESTONLY_not_a_real_key_0123456789");
+    const ANTHROPIC: &str = concat!("sk-", "ant-", "api03-TESTONLY-not-a-real-key-0123");
+    static TEXT_AT_DESTROY: AtomicI32 = AtomicI32::new(-1);
+    unsafe extern "system" fn probe(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _subclass_id: usize,
+        _reference_data: usize,
+    ) -> LRESULT {
+        if message == WM_DESTROY {
+            TEXT_AT_DESTROY.store(GetWindowTextLengthW(hwnd), Ordering::SeqCst);
+        }
+        DefSubclassProc(hwnd, message, wparam, lparam)
+    }
+    let events: Rc<RefCell<Vec<UserEvent>>> = Rc::default();
+    let sink = Rc::clone(&events);
+    let host = Box::new(SecretPromptHost::new(Box::new(move |event| {
+        sink.borrow_mut().push(event)
+    })));
+    host.open_for(KeySlot::OpenAi);
+    let describe = |events: &RefCell<Vec<UserEvent>>| -> Vec<String> {
+        events
+            .borrow()
+            .iter()
+            .map(|event| match event {
+                UserEvent::Keys(KeyEvent::Entered { slot, key }) => {
+                    format!("entered {slot:?} {}", key.expose())
+                }
+                UserEvent::Keys(KeyEvent::Forget(slot)) => format!("forget {slot:?}"),
+                UserEvent::Keys(KeyEvent::Cancelled) => "cancelled".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    };
+    unsafe {
+        let owner = CreateWindowExW(
+            0,
+            windows_sys::w!("STATIC"),
+            windows_sys::w!("NeuralIA dono"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            0,
+            0,
+            640,
+            480,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        assert!(!owner.is_null(), "a janela dona tem de nascer");
+        let prompt = create_secret_prompt(owner, &host, 1.0).expect("o pedido tem de nascer");
+        let (popup, edit) = (prompt.popup, prompt.edit);
+        let ex_style = GetWindowLongPtrW(popup, GWL_EXSTYLE) as u32;
+        let edit_style = GetWindowLongPtrW(edit, GWL_STYLE) as u32;
+        let owned_by = GetWindow(popup, GW_OWNER);
+        show_secret_prompt(owner, &prompt);
+        let visible = IsWindowVisible(popup) != 0;
+        let focused = GetFocus();
+
+        let type_in = |text: &str| {
+            let wide = wide_null(text);
+            SetWindowTextW(edit, wide.as_ptr());
+        };
+        let click = |id: u16| {
+            let button = GetDlgItem(popup, i32::from(id));
+            SendMessageW(
+                popup,
+                WM_COMMAND,
+                ((BN_CLICKED as usize) << 16) | usize::from(id),
+                button as isize,
+            );
+        };
+        // Uma chave da Anthropic no pedido da OpenAI: nada sai, o aviso
+        // aparece e o texto fica para o utilizador corrigir.
+        type_in(ANTHROPIC);
+        SendMessageW(edit, WM_KEYDOWN, VK_RETURN as usize, 0);
+        let after_invalid = (
+            describe(&events),
+            host.is_invalid(),
+            GetWindowTextLengthW(edit),
+        );
+        // A chave certa: sai no evento e o EDIT fica vazio.
+        type_in(OPENAI);
+        SendMessageW(edit, WM_KEYDOWN, VK_RETURN as usize, 0);
+        let after_enter = (host.is_invalid(), GetWindowTextLengthW(edit));
+        SendMessageW(edit, WM_KEYDOWN, VK_ESCAPE as usize, 0);
+        click(SECRET_PROMPT_FORGET_ID);
+        click(SECRET_PROMPT_CANCEL_ID);
+        type_in(OPENAI);
+        click(SECRET_PROMPT_SAVE_ID);
+        let after_save = GetWindowTextLengthW(edit);
+        // Fechar com texto no EDIT: a sonda (instalada por ultimo, corre
+        // primeiro) ve o EDIT no WM_DESTROY.
+        type_in(OPENAI);
+        let probed = SetWindowSubclass(edit, Some(probe), 0x7E57, 0);
+        destroy_secret_prompt(prompt);
+        let text_at_destroy = TEXT_AT_DESTROY.load(Ordering::SeqCst);
+        DestroyWindow(owner);
+
+        assert_eq!(owned_by, owner, "o pedido e owned pela janela principal");
+        assert_eq!(ex_style & WS_EX_TOPMOST, 0, "o pedido nunca e TOPMOST");
+        assert_eq!(ex_style & WS_EX_NOACTIVATE, 0, "o pedido recebe teclado");
+        assert_ne!(
+            edit_style & ES_PASSWORD as u32,
+            0,
+            "o EDIT e de palavra-passe"
+        );
+        assert!(visible, "o pedido fica visivel");
+        assert_eq!(focused, edit, "o teclado vai para o EDIT do pedido");
+        assert_eq!(
+            after_invalid.0,
+            Vec::<String>::new(),
+            "uma chave de outro slot saiu"
+        );
+        assert!(after_invalid.1, "o aviso de forma errada tem de aparecer");
+        assert!(after_invalid.2 > 0, "o texto errado fica para corrigir");
+        assert_eq!(
+            after_enter,
+            (false, 0),
+            "o EDIT fica vazio quando a chave sai"
+        );
+        assert_eq!(after_save, 0, "o Salvar tambem limpa o EDIT");
+        assert_eq!(
+            describe(&events),
+            vec![
+                format!("entered OpenAi {OPENAI}"),
+                "cancelled".to_string(),
+                "forget OpenAi".to_string(),
+                "cancelled".to_string(),
+                format!("entered OpenAi {OPENAI}"),
+            ]
+        );
+        assert_ne!(probed, 0, "a sonda do WM_DESTROY tem de ficar instalada");
+        assert_eq!(
+            text_at_destroy, 0,
+            "o EDIT tinha a chave quando foi destruido"
+        );
+    }
+}
+
+// ===================== o gestor de downloads (downloads-manager) =====================
+
+mod downloads_gates {
+    use super::*;
+    use neural_core::downloads::{
+        DeleteReason, DownloadEffect, DownloadEnd, DownloadEvent, DownloadId, DownloadLog,
+        DownloadManager, DownloadNotice, DownloadSettings, DownloadStart, DownloadState,
+        LOG_MAX_BYTES, LOG_VERSION, RecordOutcome, SETTINGS_VERSION, WebViewKey, motw_zone_id,
+        read_motw,
+    };
+    use neural_core::file_risk::BlockReason;
+    use neural_core::json_store::{StoreKind, StoreMode, VersionedJsonStore};
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use crate::stores::{DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE};
+
+    /// Uma pasta temporaria com ficheiros reais (o fim le o disco).
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            static NONCE: AtomicU64 = AtomicU64::new(1);
+            let path = std::env::temp_dir().join(format!(
+                "neuralia-dl-gates-{name}-{}-{}",
+                std::process::id(),
+                NONCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("pasta temporaria");
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// O que as operacoes falsas ouviram, por ordem.
+    #[derive(Clone, Default)]
+    struct Journal(Rc<RefCell<Vec<String>>>);
+
+    impl Journal {
+        fn push(&self, line: String) {
+            self.0.borrow_mut().push(line);
+        }
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.0.borrow_mut())
+        }
+    }
+
+    /// Uma operacao do WebView2 sem WebView2: anota o que o gestor lhe pede.
+    struct FakeDownload {
+        id: u64,
+        pending: bool,
+        journal: Journal,
+    }
+
+    impl DownloadHandle for FakeDownload {
+        fn complete_start(&mut self, path: Option<&Path>) -> Result<(), String> {
+            if !std::mem::take(&mut self.pending) {
+                return Ok(());
+            }
+            self.journal.push(match path {
+                Some(path) => format!("{} segue {}", self.id, path.display()),
+                None => format!("{} recusado", self.id),
+            });
+            Ok(())
+        }
+        fn cancel(&mut self) -> Result<(), String> {
+            if self.pending {
+                return self.complete_start(None);
+            }
+            self.journal.push(format!("{} cancelado", self.id));
+            Ok(())
+        }
+    }
+
+    /// O ciclo como o `App` o corre (`run_download_event`), sobre operacoes
+    /// falsas; com `with_disk`, tambem o registo das lojas e o
+    /// `downloads.json` reais.
+    struct Rig {
+        manager: DownloadManager,
+        ops: RefCell<DownloadOps<FakeDownload>>,
+        journal: Journal,
+        later: Vec<DownloadEffect>,
+        stores: Option<StoreRegistry>,
+        store: Option<VersionedJsonStore<DownloadLog>>,
+    }
+
+    impl Rig {
+        fn new(manager: DownloadManager) -> Self {
+            Self {
+                manager,
+                ops: RefCell::new(DownloadOps::default()),
+                journal: Journal::default(),
+                later: Vec::new(),
+                stores: None,
+                store: None,
+            }
+        }
+
+        /// Com o registo das lojas sobre `dir` e o `downloads.json` aberto
+        /// pelo grant dele, como no `DownloadsState::open`.
+        fn with_disk(manager: DownloadManager, dir: &Path) -> Self {
+            let stores = StoreRegistry::mint_for_test(dir);
+            let grant = stores.grant(DOWNLOADS_LOG_STORE).expect("grant");
+            assert_eq!(grant.kind(), StoreKind::Automatic);
+            let store = VersionedJsonStore::<DownloadLog>::open(grant, LOG_VERSION, LOG_MAX_BYTES)
+                .expect("loja");
+            Self {
+                stores: Some(stores),
+                store: Some(store),
+                ..Self::new(manager)
+            }
+        }
+
+        fn set_mode(&self, mode: StoreMode) {
+            self.stores.as_ref().expect("registo").set_mode(mode);
+        }
+
+        fn drive(&mut self, event: DownloadEvent) {
+            let run = run_download_event(
+                &mut self.manager,
+                &self.ops,
+                self.store.as_mut(),
+                downloads_private_mode(self.stores.as_ref()),
+                event,
+            );
+            assert_eq!(run.erase_error, None);
+            self.later.extend(run.later);
+        }
+
+        /// O que o `DownloadStarting` faz antes do gestor: a operacao entra
+        /// nas vivas e o `Starting` segue. `host` da a privacidade pela
+        /// mesma funcao que o COM usa.
+        fn begin(&mut self, id: u64, webview: u64, host: WebViewHost, proposed: PathBuf) {
+            self.ops.borrow_mut().insert(
+                DownloadId(id),
+                WebViewKey(webview),
+                FakeDownload {
+                    id,
+                    pending: true,
+                    journal: self.journal.clone(),
+                },
+            );
+            self.drive(DownloadEvent::Starting(DownloadStart {
+                id: DownloadId(id),
+                webview: WebViewKey(webview),
+                private: download_host_is_private(host),
+                proposed,
+                host: Some("example.com".to_string()),
+                total: Some(64),
+                at: 1_790_000_000,
+            }));
+        }
+
+        fn complete(&mut self, id: u64, path: &Path) {
+            self.drive(DownloadEvent::Ended {
+                id: DownloadId(id),
+                end: DownloadEnd::Completed {
+                    path: path.to_path_buf(),
+                },
+            });
+        }
+    }
+
+    const PDF: &[u8] = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n%%EOF\n";
+
+    fn pe_bytes() -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x100];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+        bytes
+    }
+
+    /// Gate critico (ganchos): cada pagina local recusa downloads no
+    /// builder e nunca recebe o gestor; cada pagina da internet recebe o
+    /// gestor. A lista das locais esta escrita aqui, nao lida da tabela.
+    #[test]
+    fn downloads_are_denied_on_every_local_host_and_managed_on_the_web() {
+        let local = [
+            WebViewHost::Reader,
+            WebViewHost::Pdf,
+            WebViewHost::Epub,
+            WebViewHost::Live,
+            WebViewHost::GmailMonitor,
+            WebViewHost::SidePanel,
+        ];
+        for host in WebViewHost::ALL {
+            let expected = if local.contains(&host) {
+                DownloadPolicy::Deny
+            } else {
+                DownloadPolicy::Managed
+            };
+            assert_eq!(webview_hooks(host).downloads, expected, "{host:?}");
+            let mut registrar = RecordingRegistrar::default();
+            install_hooks_with(host, &webview_hooks(host), &mut registrar);
+            assert_eq!(
+                registrar.downloads.is_empty(),
+                local.contains(&host),
+                "{host:?}: gestor {:?}",
+                registrar.downloads
+            );
+        }
+    }
+
+    /// Quem nunca vai para o registo: o Split privado e o servico InPrivate.
+    #[test]
+    fn private_download_hosts() {
+        for host in WebViewHost::ALL {
+            let private = matches!(host, WebViewHost::PrivateSplit(_));
+            assert_eq!(download_host_is_private(host), private, "{host:?}");
+        }
+        for service in [
+            Service::Meet,
+            Service::WhatsApp,
+            Service::YouTube,
+            Service::Gmail,
+            Service::Breath,
+        ] {
+            assert_eq!(
+                download_host_is_private(WebViewHost::Service(service)),
+                service.private(),
+                "{service:?}"
+            );
+        }
+        assert!(download_host_is_private(WebViewHost::Service(
+            Service::Breath
+        )));
+        for col in 0..COMPARATOR_COLUMNS {
+            assert!(download_host_is_private(WebViewHost::PrivateSplit(col)));
+            assert!(!download_host_is_private(WebViewHost::Split(col)));
+        }
+    }
+
+    /// As operacoes do WebView2 seguem o gestor que embarca: recusar,
+    /// seguir, largar quando acabam e quando a WebView delas e destruida;
+    /// o fim corre o `finalize_download` (a marca da Web, ou apagar).
+    #[test]
+    fn download_ops_follow_the_manager_and_are_cleared_on_finish_and_destroy() {
+        let dir = Scratch::new("ops");
+        let mut rig = Rig::new(DownloadManager::new(
+            DownloadSettings {
+                folder: None,
+                allow_programs: true,
+            },
+            DownloadLog::default(),
+        ));
+
+        // Um PDF: segue para o caminho proposto; acaba; a operacao sai e o
+        // ficheiro fica com a marca.
+        let pdf = dir.0.join("relatorio.pdf");
+        rig.begin(1, 1, WebViewHost::Column(0), pdf.clone());
+        assert_eq!(
+            rig.journal.take(),
+            vec![format!("1 segue {}", pdf.display())]
+        );
+        assert_eq!(rig.ops.borrow().len(), 1);
+        std::fs::write(&pdf, PDF).expect("pdf");
+        rig.complete(1, &pdf);
+        assert_eq!(rig.ops.borrow().len(), 0, "a operacao acabada ficou viva");
+        assert_eq!(
+            rig.manager.entry(DownloadId(1)).expect("entrada").state,
+            DownloadState::Done(RecordOutcome::Completed { warn: false })
+        );
+        let motw = read_motw(&pdf).expect("ler").expect("a marca da Web");
+        assert_eq!(motw_zone_id(&motw), Some(3));
+        assert!(rig.later.contains(&DownloadEffect::Persist));
+        rig.later.clear();
+
+        // Um executavel com nome de PDF: acaba e e apagado, com aviso.
+        let fake = dir.0.join("fatura.pdf");
+        rig.begin(2, 1, WebViewHost::External, fake.clone());
+        std::fs::write(&fake, pe_bytes()).expect("exe");
+        rig.complete(2, &fake);
+        assert!(!fake.exists(), "o executavel disfarcado ficou no disco");
+        assert!(rig.later.iter().any(|effect| matches!(
+            effect,
+            DownloadEffect::Notice(DownloadNotice::Deleted { .. })
+        )));
+        rig.journal.take();
+        rig.later.clear();
+
+        // Um programa com «Permitir baixar programas»: a pergunta vai para
+        // o cartao do downloads-ui e o deferral fica preso ate a resposta;
+        // o «nao» recusa e larga a operacao.
+        rig.begin(3, 1, WebViewHost::Column(1), dir.0.join("setup.exe"));
+        assert_eq!(rig.journal.take(), Vec::<String>::new());
+        assert!(rig.later.contains(&DownloadEffect::Ask {
+            id: DownloadId(3),
+            reason: BlockReason::Program
+        }));
+        assert_eq!(rig.ops.borrow().len(), 1);
+        rig.drive(DownloadEvent::Answered {
+            id: DownloadId(3),
+            allow: false,
+        });
+        assert_eq!(rig.journal.take(), vec!["3 recusado".to_string()]);
+        assert_eq!(rig.ops.borrow().len(), 0);
+
+        // A WebView 1 e destruida com dois downloads a correr; o da WebView
+        // 2 continua.
+        for (id, webview) in [(4, 1), (5, 1), (6, 2)] {
+            rig.begin(
+                id,
+                webview,
+                WebViewHost::Split(0),
+                dir.0.join(format!("grande-{id}.zip")),
+            );
+        }
+        rig.journal.take();
+        assert_eq!(rig.ops.borrow().len(), 3);
+        rig.drive(DownloadEvent::WebViewGone {
+            webview: WebViewKey(1),
+        });
+        assert_eq!(
+            rig.journal.take(),
+            vec!["4 cancelado".to_string(), "5 cancelado".to_string()]
+        );
+        assert!(rig.ops.borrow().of_webview(WebViewKey(1)).is_empty());
+        assert_eq!(
+            rig.ops.borrow().of_webview(WebViewKey(2)),
+            vec![DownloadId(6)]
+        );
+        assert_eq!(rig.manager.active(), 1);
+    }
+
+    /// Gate critico: nada de uma pagina privada nem do Modo privado chega
+    /// ao `downloads.json` -- pela volta inteira do `App`
+    /// (`run_download_event`, com o modo do registo das lojas e a loja
+    /// real). DM-1 da revisao: um download feito no Modo privado entrava no
+    /// registo em memoria, e a gravacao seguinte, ja no modo normal,
+    /// levava-o para o ficheiro.
+    #[test]
+    fn private_downloads_never_reach_downloads_json() {
+        let dir = Scratch::new("private");
+        let mut rig = Rig::with_disk(DownloadManager::default(), &dir.0);
+        let file = rig.store.as_ref().expect("loja").path().to_path_buf();
+
+        // (a) Do Split privado e da Respiracao: recusado, acabado ou com a
+        // WebView destruida, nunca pede gravacao.
+        let private_hosts = [
+            WebViewHost::PrivateSplit(0),
+            WebViewHost::PrivateSplit(2),
+            WebViewHost::Service(Service::Breath),
+        ];
+        for (n, host) in private_hosts.into_iter().enumerate() {
+            let base = 10 * (n as u64 + 1);
+            rig.begin(base, base, host, dir.0.join("setup.exe"));
+            let pdf = dir.0.join(format!("privado-{n}.pdf"));
+            rig.begin(base + 1, base, host, pdf.clone());
+            std::fs::write(&pdf, PDF).expect("pdf");
+            rig.complete(base + 1, &pdf);
+            rig.begin(base + 2, base, host, dir.0.join("grande.zip"));
+            rig.drive(DownloadEvent::WebViewGone {
+                webview: WebViewKey(base),
+            });
+        }
+        assert_eq!(rig.manager.entries().count(), 9);
+        assert!(
+            !rig.later.contains(&DownloadEffect::Persist),
+            "um download privado pediu gravacao: {:?}",
+            rig.later
+        );
+        assert!(
+            rig.manager.log().entries.is_empty(),
+            "{:?}",
+            rig.manager.log()
+        );
+        assert!(
+            !file.exists(),
+            "downloads.json nasceu de downloads privados"
+        );
+
+        // (b) Modo privado, de paginas que nao sao privadas: um PDF que
+        // comecou antes e acaba nele, um que comeca e acaba nele, um
+        // programa recusado nele e um que comeca nele e acaba ja fora.
+        // Nenhum pede gravacao.
+        let before = dir.0.join("comecou-antes.pdf");
+        rig.begin(80, 80, WebViewHost::Column(0), before.clone());
+        rig.set_mode(StoreMode::Private);
+        std::fs::write(&before, PDF).expect("pdf");
+        rig.complete(80, &before);
+        let secret = dir.0.join("segredo-modo-privado.pdf");
+        rig.begin(81, 80, WebViewHost::External, secret.clone());
+        std::fs::write(&secret, PDF).expect("pdf");
+        rig.complete(81, &secret);
+        rig.begin(82, 80, WebViewHost::Column(1), dir.0.join("programa.exe"));
+        let late = dir.0.join("acaba-depois.pdf");
+        rig.begin(83, 80, WebViewHost::Split(0), late.clone());
+        assert!(
+            !rig.later.contains(&DownloadEffect::Persist),
+            "o Modo privado pediu gravacao: {:?}",
+            rig.later
+        );
+        assert!(!file.exists(), "o Modo privado escreveu o downloads.json");
+
+        // (c) De volta ao normal: o que comecou no privado acaba sem
+        // registo; um download novo grava -- e o ficheiro so o tem a ele.
+        rig.set_mode(StoreMode::Normal);
+        std::fs::write(&late, PDF).expect("pdf");
+        rig.complete(83, &late);
+        assert!(
+            !rig.later.contains(&DownloadEffect::Persist),
+            "o que comecou no Modo privado foi registado ao acabar: {:?}",
+            rig.later
+        );
+        rig.begin(90, 90, WebViewHost::External, dir.0.join("normal.exe"));
+        assert!(rig.later.contains(&DownloadEffect::Persist));
+        let text = std::fs::read_to_string(&file).expect("downloads.json");
+        assert!(text.contains("normal.exe"), "{text}");
+        for leaked in [
+            "privado-0",
+            "privado-1",
+            "privado-2",
+            "comecou-antes",
+            "segredo-modo-privado",
+            "programa.exe",
+            "acaba-depois",
+        ] {
+            assert!(!text.contains(leaked), "{leaked} no ficheiro: {text}");
+        }
+        let loaded = rig.store.as_mut().expect("loja").load().into_value();
+        assert_eq!(loaded.entries.len(), 1, "{loaded:?}");
+        assert_eq!(
+            loaded.entries[0].outcome,
+            RecordOutcome::Blocked {
+                reason: BlockReason::Program
+            }
+        );
+    }
+
+    /// Gate critico (DM-2 da revisao): o Ctrl+Shift+Delete tira o
+    /// `downloads.json` do disco -- e a copia `.bak` e o temporario de uma
+    /// gravacao interrompida -- no modo normal, no Modo privado e com a loja
+    /// so de leitura (um ficheiro de uma versao futura). Pelo braco do
+    /// `App` (`DownloadsState::run`, o que o `ClearTarget::Downloads` corre
+    /// com `DownloadEvent::ClearLog`). Antes, o apagar era uma gravacao do
+    /// registo vazio: `SkippedPrivate` no Modo privado, `ReadOnly` com o
+    /// ficheiro degradado, e o ficheiro ficava.
+    #[test]
+    fn clearing_history_takes_downloads_json_off_the_disk() {
+        let record = |name: &str| {
+            serde_json::json!({
+                "name": name,
+                "host": "example.com",
+                "outcome": { "kind": "cancelled" },
+                "at": 1_790_000_000u64
+            })
+        };
+        let file_with = |dir: &Path, version: u32, name: &str| {
+            let body = serde_json::json!({
+                "version": version,
+                "data": { "entries": [record(name)] }
+            });
+            let path = dir.join(DOWNLOADS_LOG_STORE.name);
+            std::fs::write(&path, serde_json::to_vec(&body).expect("json")).expect("registo");
+            path
+        };
+        let clear = |state: &mut DownloadsState, stores: &StoreRegistry| {
+            let run = state.run(
+                downloads_private_mode(Some(stores)),
+                DownloadEvent::ClearLog,
+            );
+            assert_eq!(run.erase_error, None);
+            assert_eq!(run.later, vec![DownloadEffect::EraseLog]);
+        };
+
+        for mode in [StoreMode::Normal, StoreMode::Private] {
+            // (a) Um ficheiro valido, com o modo normal ou privado.
+            let dir = Scratch::new("clear");
+            let file = file_with(&dir.0, LOG_VERSION, "segredo.pdf");
+            let stores = StoreRegistry::mint_for_test(&dir.0);
+            let mut state = DownloadsState::open(Some(&stores));
+            assert_eq!(state.manager.log().entries.len(), 1);
+            stores.set_mode(mode);
+            clear(&mut state, &stores);
+            assert!(!file.exists(), "{mode:?}: o downloads.json ficou");
+            assert!(state.manager.log().entries.is_empty());
+        }
+
+        // (b) Um ficheiro de uma versao futura: a loja fica so de leitura e
+        // guarda uma copia `.bak`; uma gravacao interrompida deixou um
+        // temporario. Tudo sai.
+        let dir = Scratch::new("clear-future");
+        let file = file_with(&dir.0, LOG_VERSION + 1, "segredo.pdf");
+        let backup = dir.0.join(format!("{}.bak", DOWNLOADS_LOG_STORE.name));
+        let temp = dir
+            .0
+            .join(format!(".{}.4242-7.tmp", DOWNLOADS_LOG_STORE.name));
+        std::fs::write(
+            &temp,
+            br#"{"version":1,"data":{"entries":[{"name":"segredo.pdf"}]}}"#,
+        )
+        .expect("temporario");
+        let other = dir.0.join("tabs.json");
+        std::fs::write(&other, b"{}").expect("outro");
+        let stores = StoreRegistry::mint_for_test(&dir.0);
+        let mut state = DownloadsState::open(Some(&stores));
+        assert!(
+            state
+                .log_store
+                .as_ref()
+                .expect("loja")
+                .read_only()
+                .is_some(),
+            "a versao futura nao ficou so de leitura"
+        );
+        assert!(backup.exists(), "a loja nao fez a copia .bak");
+        clear(&mut state, &stores);
+        for left in [&file, &backup, &temp] {
+            assert!(!left.exists(), "{} ficou no disco", left.display());
+        }
+        assert!(other.exists(), "o apagar levou um ficheiro que nao e dele");
+        // Sem ficheiro, a loja volta a gravar: o download seguinte fica.
+        state.run(
+            downloads_private_mode(Some(&stores)),
+            DownloadEvent::Starting(DownloadStart {
+                id: DownloadId(1),
+                webview: WebViewKey(1),
+                private: false,
+                proposed: dir.0.join("setup.exe"),
+                host: None,
+                total: None,
+                at: 0,
+            }),
+        );
+        let text = std::fs::read_to_string(&file).expect("downloads.json");
+        assert!(text.contains("setup.exe"), "{text}");
+        assert!(!text.contains("segredo"), "{text}");
+    }
+
+    /// As definicoes e o registo abrem pelos grants; uma pasta que nao
+    /// existe volta a Transferencias do utilizador -- que vai para o perfil
+    /// do WebView2 em vez de nada (DM-3 da revisao: o perfil guarda a pasta
+    /// de uma sessao para a outra, e so a pondo quando havia escolha a
+    /// antiga ficava).
+    #[test]
+    fn downloads_state_opens_through_grants_and_checks_the_folder() {
+        assert_eq!(DOWNLOADS_SETTINGS_STORE.kind, StoreKind::Setting);
+        assert_eq!(DOWNLOADS_LOG_STORE.kind, StoreKind::Automatic);
+        let system = user_downloads_folder().expect("a pasta Transferencias do utilizador");
+        assert!(system.is_absolute(), "{}", system.display());
+        let dir = Scratch::new("state");
+        let chosen = dir.0.join("baixados");
+        std::fs::create_dir_all(&chosen).expect("pasta");
+        assert_ne!(system, chosen);
+        let write_settings = |folder: &Path, allow: bool| {
+            let body = serde_json::json!({
+                "version": SETTINGS_VERSION,
+                "data": { "folder": folder, "allow_programs": allow }
+            });
+            std::fs::write(
+                dir.0.join("downloads-settings.json"),
+                serde_json::to_vec(&body).expect("json"),
+            )
+            .expect("definicoes");
+        };
+        write_settings(&chosen, true);
+        let state = DownloadsState::open(Some(&StoreRegistry::mint_for_test(&dir.0)));
+        assert_eq!(
+            state.manager.settings().folder.as_deref(),
+            Some(chosen.as_path())
+        );
+        assert!(state.manager.settings().allow_programs);
+        assert_eq!(
+            state.shared.folder.borrow().as_deref(),
+            Some(chosen.as_path())
+        );
+
+        write_settings(&dir.0.join("nao-existe"), false);
+        let state = DownloadsState::open(Some(&StoreRegistry::mint_for_test(&dir.0)));
+        assert_eq!(state.manager.settings().folder, None);
+        assert_eq!(
+            state.shared.folder.borrow().as_deref(),
+            Some(system.as_path()),
+            "sem escolha, o perfil ficava com a pasta antiga"
+        );
+
+        // Sem registo: tudo por omissao, nada gravado, a pasta do sistema.
+        let state = DownloadsState::open(None);
+        assert_eq!(state.manager.settings(), &DownloadSettings::default());
+        assert!(state.log_store.is_none());
+        assert_eq!(
+            state.shared.folder.borrow().as_deref(),
+            Some(system.as_path())
+        );
+        // Sem a pasta do sistema (o Windows nao a deu), nada se poe.
+        assert_eq!(profile_download_folder(None, || None), None);
+        assert_eq!(
+            profile_download_folder(Some(chosen.clone()), || Some(system.clone())),
+            Some(chosen)
+        );
+    }
+
+    /// Amostra (textos, sabotada): o toast de cada aviso -- titulo escrito
+    /// pelo nativo, o nome no corpo (marcado quando esconde bidi) -- com as
+    /// frases do plano, numa linha como `download_notice_text` as junta.
+    #[test]
+    fn download_notice_texts() {
+        let blocked = |name: &str, reason| {
+            download_notice_text(&DownloadNotice::Blocked {
+                id: DownloadId(1),
+                name: name.to_string(),
+                reason,
+            })
+        };
+        assert_eq!(
+            blocked("setup.exe", BlockReason::Program),
+            "Download bloqueado — setup.exe é um programa. O NeuralIA não baixa programas nem scripts (ajuste em Downloads)."
+        );
+        assert_eq!(
+            blocked("instalar.ps1", BlockReason::Script),
+            "Download bloqueado — instalar.ps1 é um script. O NeuralIA não baixa programas nem scripts (ajuste em Downloads)."
+        );
+        assert_eq!(
+            blocked("fatura.pdf.exe", BlockReason::Masquerade),
+            "Download bloqueado — fatura.pdf.exe finge ser um PDF, mas é um programa."
+        );
+        assert_eq!(
+            blocked("foto.jpg   .vbs", BlockReason::Masquerade),
+            "Download bloqueado — foto.jpg   .vbs finge ser um JPG, mas é um script."
+        );
+        assert_eq!(
+            blocked("contrato.docx.docm", BlockReason::Masquerade),
+            "Download bloqueado — contrato.docx.docm finge ser um DOCX, mas é um documento com macros."
+        );
+        let bidi = blocked("fatura\u{202E}fdp.exe", BlockReason::BadName);
+        assert!(bidi.contains("\u{2039}RLO\u{203A}"), "{bidi}");
+        assert!(!bidi.contains('\u{202E}'), "{bidi}");
+        assert_eq!(
+            download_notice_text(&DownloadNotice::Deleted {
+                id: DownloadId(2),
+                name: "relatorio.pdf".to_string(),
+                reason: DeleteReason::DangerousContent,
+            }),
+            "Download apagado — relatorio.pdf era um programa disfarçado."
+        );
+        assert_eq!(
+            download_notice_text(&DownloadNotice::NotDeleted {
+                id: DownloadId(3),
+                name: "x.pdf".to_string(),
+                reason: DeleteReason::DangerousContent,
+            }),
+            "Download perigoso — x.pdf é perigoso e não deu para apagar. Não o abra."
+        );
+
+        // O toast: tipo Download, o titulo sem conteudo, o nome no corpo
+        // (o modo privado neutraliza-o), sem botoes.
+        let toast = download_toast(&DownloadNotice::Blocked {
+            id: DownloadId(1),
+            name: "setup.exe".to_string(),
+            reason: BlockReason::Program,
+        });
+        // O corpo de um aviso dos downloads parte-se em ate duas linhas; o
+        // do Gmail fica na linha de sempre.
+        let view = |notice: &crate::notify::Notice| {
+            ToastView::of(&crate::notify::ToastFrame {
+                token: 1,
+                notice: notice.clone(),
+            })
+        };
+        assert!(view(&toast).wrap);
+        let mut gmail = toast.clone();
+        gmail.kind = crate::notify::NoticeKind::Gmail;
+        assert!(!view(&gmail).wrap);
+        assert_eq!(toast.kind, crate::notify::NoticeKind::Download);
+        assert_eq!(toast.title, "Download bloqueado");
+        assert!(toast.body.starts_with("setup.exe é um programa."));
+        assert!(toast.content_bearing);
+        assert!(toast.actions.is_empty());
+        assert_eq!(
+            toast
+                .clone()
+                .for_privacy(crate::notify::Privacy::Private)
+                .body,
+            crate::notify::PRIVATE_NEUTRAL_BODY
+        );
+        // Um acabado: «Ver» abre a seccao Downloads.
+        let manager = {
+            let mut manager = DownloadManager::default();
+            manager.on_event(DownloadEvent::Starting(DownloadStart {
+                id: DownloadId(9),
+                webview: WebViewKey(1),
+                private: false,
+                proposed: PathBuf::from(r"C:\Baixados\relatorio.pdf"),
+                host: None,
+                total: None,
+                at: 0,
+            }));
+            manager
+        };
+        let done = completed_toast(manager.entry(DownloadId(9)).expect("entrada"));
+        assert_eq!(done.title, "Download concluído");
+        assert_eq!(done.body, "relatorio.pdf");
+        assert_eq!(done.actions, vec![DOWNLOAD_TOAST_SHOW]);
+        assert_eq!(
+            notice_target(
+                crate::notify::NoticeKind::Download,
+                crate::notify::NoticeReply::Open
+            ),
+            Some(NoticeTarget::Downloads)
+        );
+        assert_eq!(
+            notice_target(
+                crate::notify::NoticeKind::Gmail,
+                crate::notify::NoticeReply::Open
+            ),
+            Some(NoticeTarget::Service(Service::Gmail))
+        );
+        // Pelo caminho do toast (`apply_notify`): o bloqueado com o corpo em
+        // ate duas linhas, e o «Ver» do acabado abre a seccao Downloads.
+        let mut host = super::ToastLog::default();
+        apply_notify(&mut host, NotifyInput::Post(toast));
+        apply_notify(&mut host, NotifyInput::Post(done));
+        assert_eq!(
+            host.centre.current_kind(),
+            Some(crate::notify::NoticeKind::Download)
+        );
+        // O acabado substituiu o bloqueado (o mesmo tipo): e o segundo.
+        let token = 2;
+        apply_notify(
+            &mut host,
+            NotifyInput::Event(NotifyEvent::Answer { token, index: 0 }),
+        );
+        assert_eq!(
+            host.log.last().map(String::as_str),
+            Some("abre downloads"),
+            "{:?}",
+            host.log
+        );
+        assert!(
+            host.log[0].starts_with("mostra 1 «Download bloqueado» «setup.exe é um programa."),
+            "{:?}",
+            host.log
+        );
+    }
+
+    /// «Permitir baixar programas» da seccao Downloads: grava so a escolha
+    /// no `downloads-settings.json` (a pasta que la estava fica) e o gestor
+    /// passa a perguntar em vez de recusar -- e desligada, volta a recusar.
+    #[test]
+    fn the_allow_programs_switch_is_saved_and_used() {
+        let dir = Scratch::new("allow");
+        let chosen = dir.0.join("baixados");
+        std::fs::create_dir_all(&chosen).expect("pasta");
+        let body = serde_json::json!({
+            "version": SETTINGS_VERSION,
+            "data": { "folder": chosen, "allow_programs": false }
+        });
+        let file = dir.0.join(DOWNLOADS_SETTINGS_STORE.name);
+        std::fs::write(&file, serde_json::to_vec(&body).expect("json")).expect("definicoes");
+        let stores = StoreRegistry::mint_for_test(&dir.0);
+        let mut state = DownloadsState::open(Some(&stores));
+        let start = |state: &mut DownloadsState, id: u64| {
+            state
+                .run(
+                    false,
+                    DownloadEvent::Starting(DownloadStart {
+                        id: DownloadId(id),
+                        webview: WebViewKey(1),
+                        private: false,
+                        proposed: chosen.join("setup.exe"),
+                        host: None,
+                        total: None,
+                        at: id,
+                    }),
+                )
+                .later
+        };
+        assert!(
+            !start(&mut state, 1)
+                .iter()
+                .any(|effect| matches!(effect, DownloadEffect::Ask { .. })),
+            "desligada, um programa ja perguntava"
+        );
+        state.set_allow_programs(true).expect("gravada");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).expect("ficheiro")).expect("json");
+        assert_eq!(saved["data"]["allow_programs"], true);
+        assert_eq!(
+            saved["data"]["folder"].as_str().map(PathBuf::from),
+            Some(chosen.clone()),
+            "a pasta que estava no ficheiro perdeu-se"
+        );
+        assert!(state.manager.settings().allow_programs);
+        assert!(start(&mut state, 2).contains(&DownloadEffect::Ask {
+            id: DownloadId(2),
+            reason: BlockReason::Program
+        }));
+        state.set_allow_programs(false).expect("gravada");
+        assert!(!state.manager.settings().allow_programs);
+        assert!(
+            !start(&mut state, 3)
+                .iter()
+                .any(|effect| matches!(effect, DownloadEffect::Ask { .. }))
+        );
+        // Sem loja (nunca no produto): nada muda.
+        let mut none = DownloadsState::open(None);
+        assert!(none.set_allow_programs(true).is_err());
+        assert!(!none.manager.settings().allow_programs);
+    }
+
+    /// O progresso do plano, os tamanhos e a previsao.
+    #[test]
+    fn progress_text_sizes_and_eta() {
+        const MB: u64 = 1024 * 1024;
+        assert_eq!(
+            progress_text(
+                "relatorio.pdf",
+                3_355_443,
+                Some(12 * MB),
+                Some(Duration::from_secs(60))
+            ),
+            "Baixando relatorio.pdf · 3,2 de 12 MB · 1 min"
+        );
+        assert_eq!(
+            progress_text("video.mp4", 5 * MB / 2, None, None),
+            "Baixando video.mp4 · 2,5 MB"
+        );
+        assert_eq!(
+            progress_text("a.txt", 300, Some(900), Some(Duration::from_secs(4))),
+            "Baixando a.txt · 300 de 900 B · 4 s"
+        );
+        for (bytes, text) in [
+            (0, "0 B"),
+            (850, "850 B"),
+            (1024, "1 KB"),
+            (3_277, "3,2 KB"),
+            (12 * MB, "12 MB"),
+            (MB * 99 / 10, "9,9 MB"),
+            (3 * MB, "3 MB"),
+            (1536 * MB, "1,5 GB"),
+        ] {
+            assert_eq!(format_size(bytes), text, "{bytes}");
+        }
+        for (secs, text) in [
+            (0, "1 s"),
+            (40, "40 s"),
+            (60, "1 min"),
+            (89, "1 min"),
+            (90, "2 min"),
+            (3_600, "1 h"),
+            (3_900, "1 h 5 min"),
+        ] {
+            assert_eq!(format_eta(Duration::from_secs(secs)), text, "{secs}");
+        }
+        assert_eq!(download_percent(43, Some(100)), Some(43));
+        assert_eq!(download_percent(500, Some(100)), Some(100));
+        assert_eq!(download_percent(5, None), None);
+        assert_eq!(download_percent(5, Some(0)), None);
+
+        // A velocidade: 1 MB/s durante dois segundos, 10 MB por baixar.
+        let start = Instant::now();
+        let mut meter = RateMeter::default();
+        assert_eq!(meter.eta(0, Some(10 * MB)), None, "sem medida");
+        meter.observe(start, 0);
+        meter.observe(start + Duration::from_millis(100), MB / 10);
+        assert_eq!(meter.eta(0, Some(10 * MB)), None, "amostra curta demais");
+        meter.observe(start + Duration::from_secs(1), MB);
+        meter.observe(start + Duration::from_secs(2), 2 * MB);
+        let eta = meter.eta(2 * MB, Some(10 * MB)).expect("previsao");
+        assert!((7..=9).contains(&eta.as_secs()), "{eta:?}");
+        assert_eq!(meter.eta(2 * MB, None), None, "sem total");
+    }
+
+    /// Gate critico (a saida que protege quem usa): a tabela do
+    /// `leave_decision` -- a Home e o fechar, sem downloads, com um a correr
+    /// (com e sem total), um a espera do «Baixar programa?», varios e so
+    /// acabados -- e o cartao dela: «Continuar baixando» fica ja,
+    /// «Cancelar e sair» so depois do armar cancela cada um e sai.
+    #[test]
+    fn leave_decision_table() {
+        let start = |manager: &mut DownloadManager, id: u64, name: &str, total| {
+            manager.on_event(DownloadEvent::Starting(DownloadStart {
+                id: DownloadId(id),
+                webview: WebViewKey(1),
+                private: false,
+                proposed: PathBuf::from(format!(r"C:\Baixados\{name}")),
+                host: None,
+                total,
+                at: 0,
+            }));
+        };
+        let progress = |manager: &mut DownloadManager, id: u64, received: u64| {
+            manager.on_event(DownloadEvent::Progress {
+                id: DownloadId(id),
+                received,
+                total: None,
+            });
+        };
+        for kind in [LeaveKind::Home, LeaveKind::Close] {
+            let body_one = match kind {
+                LeaveKind::Home => "Voltar à Home cancela o download.",
+                LeaveKind::Close => "Fechar a NeuralIA cancela o download.",
+            };
+            let body_many = match kind {
+                LeaveKind::Home => "Voltar à Home cancela os downloads.",
+                LeaveKind::Close => "Fechar a NeuralIA cancela os downloads.",
+            };
+            let ask = |title: &str, body: &str, cancel: &[u64]| {
+                LeaveDecision::Ask(LeavePrompt {
+                    kind,
+                    title: title.to_string(),
+                    body: body.to_string(),
+                    cancel: cancel.iter().map(|id| DownloadId(*id)).collect(),
+                })
+            };
+
+            // Nada a correr: sai ja.
+            let mut manager = DownloadManager::default();
+            assert_eq!(leave_decision(kind, &manager), LeaveDecision::Leave);
+            // So acabados (cancelado, recusado): sai ja.
+            start(&mut manager, 1, "setup.exe", None);
+            start(&mut manager, 2, "velho.zip", Some(100));
+            manager.on_event(DownloadEvent::Ended {
+                id: DownloadId(2),
+                end: DownloadEnd::Cancelled,
+            });
+            assert_eq!(leave_decision(kind, &manager), LeaveDecision::Leave);
+
+            // Um a correr, com total: o nome e a percentagem.
+            start(&mut manager, 3, "x.zip", Some(1000));
+            progress(&mut manager, 3, 430);
+            assert_eq!(
+                leave_decision(kind, &manager),
+                ask("1 download em andamento (x.zip, 43%).", body_one, &[3])
+            );
+            // Sem total: so o nome.
+            let mut manager = DownloadManager::default();
+            start(&mut manager, 7, "stream.bin", None);
+            progress(&mut manager, 7, 12_345);
+            assert_eq!(
+                leave_decision(kind, &manager),
+                ask("1 download em andamento (stream.bin).", body_one, &[7])
+            );
+            // A espera do «Baixar programa?»: conta, sem percentagem.
+            let mut manager = DownloadManager::new(
+                DownloadSettings {
+                    folder: None,
+                    allow_programs: true,
+                },
+                DownloadLog::default(),
+            );
+            start(&mut manager, 4, "setup.exe", Some(100));
+            assert!(matches!(
+                manager.entry(DownloadId(4)).expect("entrada").state,
+                DownloadState::Asking(_)
+            ));
+            assert_eq!(
+                leave_decision(kind, &manager),
+                ask("1 download em andamento (setup.exe).", body_one, &[4])
+            );
+            // Varios: o mais antigo e a conta dos outros.
+            start(&mut manager, 5, "x.zip", Some(1000));
+            progress(&mut manager, 5, 430);
+            start(&mut manager, 6, "y.zip", None);
+            assert_eq!(
+                leave_decision(kind, &manager),
+                ask(
+                    "3 downloads em andamento (setup.exe e mais 2).",
+                    body_many,
+                    &[4, 5, 6]
+                )
+            );
+            // Um nome com bidi aparece marcado, nunca a trocar o texto.
+            let mut manager = DownloadManager::default();
+            start(&mut manager, 8, "fotoexe.png", Some(10));
+            let LeaveDecision::Ask(prompt) = leave_decision(kind, &manager) else {
+                panic!("devia perguntar");
+            };
+            assert!(prompt.title.contains("fotoexe.png"), "{prompt:?}");
+
+            // O cartao da saida: o seguro e ja, o que sai so armado.
+            let LeaveDecision::Ask(prompt) = leave_decision(kind, &{
+                let mut manager = DownloadManager::default();
+                start(&mut manager, 3, "x.zip", Some(1000));
+                start(&mut manager, 5, "y.zip", Some(1000));
+                manager
+            }) else {
+                panic!("devia perguntar");
+            };
+            let now = Instant::now();
+            let mut card = NativeCard::default();
+            let step = download_card_step(
+                &mut card,
+                DownloadCardInput::Request(DownloadPrompt::Leave(prompt.clone())),
+                now,
+            );
+            let (view, expiry) = step.show.expect("o cartao aparece");
+            assert_eq!(expiry, Duration::from_secs(LEAVE_CARD_SECONDS));
+            assert_eq!(view.title, prompt.title);
+            assert_eq!(
+                view.buttons
+                    .map(|button| (button.label, button.role, button.primary)),
+                [
+                    ("Continuar baixando", DownloadCardButton::Dismiss, true),
+                    ("Cancelar e sair", DownloadCardButton::Confirm, false),
+                ]
+            );
+            // Cedo demais: nada, e o cartao continua a espera.
+            let early = download_card_step(
+                &mut card,
+                DownloadCardInput::Answer {
+                    token: view.token,
+                    button: DownloadCardButton::Confirm,
+                },
+                now + Duration::from_millis(100),
+            );
+            assert_eq!(early, CardStep::default());
+            // Armado: cancela cada um e sai por `kind`.
+            let confirmed = download_card_step(
+                &mut card,
+                DownloadCardInput::Answer {
+                    token: view.token,
+                    button: DownloadCardButton::Confirm,
+                },
+                now + NATIVE_CARD_ARM,
+            );
+            assert_eq!(
+                confirmed,
+                CardStep {
+                    show: None,
+                    hide: true,
+                    events: vec![
+                        DownloadEvent::CancelRequested { id: DownloadId(3) },
+                        DownloadEvent::CancelRequested { id: DownloadId(5) },
+                    ],
+                    leave: Some(kind),
+                }
+            );
+            // «Continuar baixando»: ja, sem cancelar nada nem sair.
+            let step = download_card_step(
+                &mut card,
+                DownloadCardInput::Request(DownloadPrompt::Leave(prompt.clone())),
+                now,
+            );
+            let token = step.show.expect("de novo").0.token;
+            let stay = download_card_step(
+                &mut card,
+                DownloadCardInput::Answer {
+                    token,
+                    button: DownloadCardButton::Dismiss,
+                },
+                now,
+            );
+            assert_eq!(
+                stay,
+                CardStep {
+                    hide: true,
+                    ..CardStep::default()
+                }
+            );
+            // Sem resposta: fica.
+            let step = download_card_step(
+                &mut card,
+                DownloadCardInput::Request(DownloadPrompt::Leave(prompt)),
+                now,
+            );
+            let token = step.show.expect("de novo").0.token;
+            assert_eq!(
+                download_card_step(&mut card, DownloadCardInput::Expire(token), now),
+                CardStep {
+                    hide: true,
+                    ..CardStep::default()
+                }
+            );
+        }
+        // Que nenhum caminho salta a pergunta ate ao `show_home` ou ao `exit`
+        // prova-o `home_and_exit_callers_are_a_named_allowlist`.
+    }
+
+    /// Gate critico (a saida que protege quem usa; DLUI-2, DLUI-3): quem
+    /// chama o `show_home` (destroi a Web completa, as colunas, a fonte e os
+    /// paineis -- e os downloads deles) e o `exit` da janela e uma lista com
+    /// nome, contada por ficheiro e por funcao sobre o codigo que compila
+    /// (comentarios e literais fora, `rust_code_only`), nao sobre o texto de
+    /// uma linha: um caller novo ou reescrito -- `{ self.show_home(); }` no
+    /// braco do `HomeRequested`, o Ctrl+L de volta ao `show_home`, um
+    /// `Self::show_home` passado como funcao -- muda a conta e fica vermelho,
+    /// com qualquer formatacao.
+    #[test]
+    fn home_and_exit_callers_are_a_named_allowlist() {
+        // O scanner consegue falhar: o que esta em comentarios, strings, raw
+        // strings e chars nao conta, nem um parametro com o mesmo nome; a
+        // chamada e a funcao passada contam.
+        let sample = r##"
+fn a(&mut self) {
+    // self.show_home()
+    /* self.show_home() /* aninhado */ self.show_home() */
+    debug_log("show_home (surface era {:?})");
+    let raw = r#"self.show_home() "aspas" "#;
+    let quote = '"';
+    let bytes = b'"';
+    self.show_home();
+}
+fn show_home(&mut self) {}
+fn b<'a>(&'a mut self, show_home: bool) -> &'a str {
+    let go = Self::show_home;
+    "}"
+}
+"##;
+        assert_eq!(
+            ident_callers(&rust_code_only(sample), "show_home"),
+            BTreeMap::from([("a".to_string(), 1), ("b".to_string(), 1)])
+        );
+
+        // Os ficheiros que embarcam na arvore `windows_app/` (sem os testes).
+        let mut files = vec![(
+            "windows_app.rs",
+            rust_code_only(&code_without_tests(include_str!("../windows_app.rs"))),
+        )];
+        for (name, content) in ALL_MODULES {
+            if *name != "tests.rs" {
+                files.push((name, rust_code_only(&code_without_tests(content))));
+            }
+        }
+        // O lexer nao se perdeu em nenhum literal: as chavetas e os
+        // parenteses do que sobra fecham, ficheiro a ficheiro.
+        for (name, code) in &files {
+            for (open, close) in [('{', '}'), ('(', ')')] {
+                assert_eq!(
+                    code.matches(open).count(),
+                    code.matches(close).count(),
+                    "{name}: `rust_code_only` perdeu-se num literal ({open}{close})"
+                );
+            }
+        }
+
+        // (ficheiro, funcao, quantas vezes, porque).
+        type Site = (&'static str, &'static str, usize, &'static str);
+        let allow: [(&str, &[Site]); 5] = [
+            (
+                "show_home",
+                &[
+                    (
+                        "downloads_ui.rs",
+                        "request_home",
+                        1,
+                        "a Home de quem usa, depois do leave_guard",
+                    ),
+                    (
+                        "downloads_ui.rs",
+                        "leave_confirmed",
+                        1,
+                        "o «Cancelar e sair» armado, com os downloads ja cancelados",
+                    ),
+                    (
+                        "downloads_ui.rs",
+                        "lifecycle_probe_home",
+                        1,
+                        "a sonda do CI, so com NEURALIA_LIFECYCLE_PROBE",
+                    ),
+                    (
+                        "clear_history.rs",
+                        "clear",
+                        1,
+                        "o «Apagar histórico» confirmado (limite conhecido, CHANGELOG)",
+                    ),
+                    (
+                        "app/chrome.rs",
+                        "report_history_cleared",
+                        1,
+                        "o fim do «Apagar histórico» (idem)",
+                    ),
+                ],
+            ),
+            (
+                "exit",
+                &[
+                    ("downloads_ui.rs", "exit_now", 1, "a unica saida da janela"),
+                    (
+                        "app/event_loop.rs",
+                        "resumed",
+                        1,
+                        "a janela nem chegou a existir: nada corre",
+                    ),
+                    (
+                        "app/panels.rs",
+                        "save_notes_draft_before_exit",
+                        1,
+                        "o SidePanel::exit (o rascunho das notas), nao a janela",
+                    ),
+                ],
+            ),
+            (
+                "exit_now",
+                &[
+                    (
+                        "downloads_ui.rs",
+                        "request_close",
+                        1,
+                        "depois do leave_guard",
+                    ),
+                    (
+                        "downloads_ui.rs",
+                        "leave_confirmed",
+                        1,
+                        "o «Cancelar e sair» armado",
+                    ),
+                ],
+            ),
+            (
+                "leave_confirmed",
+                &[(
+                    "downloads_ui.rs",
+                    "downloads_ui_event",
+                    1,
+                    "so a resposta do cartao pintado",
+                )],
+            ),
+            (
+                "lifecycle_probe_home",
+                &[(
+                    "app/event_loop.rs",
+                    "user_event",
+                    1,
+                    "o braco UserEvent::LifecycleProbeHome",
+                )],
+            ),
+        ];
+        for (ident, sites) in allow {
+            let mut found = BTreeMap::new();
+            for (name, code) in &files {
+                for (function, count) in ident_callers(code, ident) {
+                    found.insert((name.to_string(), function), count);
+                }
+            }
+            let expected: BTreeMap<(String, String), usize> = sites
+                .iter()
+                .map(|(file, function, count, _why)| {
+                    ((file.to_string(), function.to_string()), *count)
+                })
+                .collect();
+            assert_eq!(
+                found, expected,
+                "quem chama `{ident}` mudou: um caller novo passa pelo `request_home`/`request_close` ou entra na lista com o porque (e no CHANGELOG, se salta a pergunta)"
+            );
+        }
+    }
+
+    /// Gate critico (confirmacao que protege quem usa): o «Baixar
+    /// programa?» com «Permitir baixar programas» ligada. O gestor deixa o
+    /// deferral preso (a pergunta vai para o cartao, nada segue); so o
+    /// «Baixar mesmo assim» armado e do cartao pintado o deixa seguir;
+    /// Cancelar, o prazo, um clique de um cartao ja trocado e um pedido
+    /// novo que troca o pendente recusam -- nunca fica um deferral preso.
+    #[test]
+    fn program_card_answers_the_deferral() {
+        let dir = Scratch::new("program-card");
+        let allow = DownloadSettings {
+            folder: None,
+            allow_programs: true,
+        };
+        let mut rig = Rig::new(DownloadManager::new(allow, DownloadLog::default()));
+        let setup = dir.0.join("setup.exe");
+        rig.begin(1, 1, WebViewHost::Column(0), setup.clone());
+        assert_eq!(
+            rig.journal.take(),
+            Vec::<String>::new(),
+            "o deferral nao ficou preso"
+        );
+        assert_eq!(rig.ops.borrow().len(), 1);
+        assert_eq!(
+            rig.later
+                .iter()
+                .filter(|effect| matches!(effect, DownloadEffect::Ask { .. }))
+                .collect::<Vec<_>>(),
+            vec![&DownloadEffect::Ask {
+                id: DownloadId(1),
+                reason: BlockReason::Program
+            }]
+        );
+        let ask = |id: u64| DownloadPrompt::Program {
+            id: DownloadId(id),
+            name: "setup.exe".to_string(),
+            reason: BlockReason::Program,
+        };
+
+        // O cartao: titulo, texto e botoes (o seguro cheio).
+        let now = Instant::now();
+        let mut card = NativeCard::default();
+        let shown = download_card_step(&mut card, DownloadCardInput::Request(ask(1)), now);
+        let (view, expiry) = shown.show.clone().expect("o cartao aparece");
+        assert_eq!(expiry, Duration::from_secs(PROGRAM_CARD_SECONDS));
+        assert_eq!(view.title, "Baixar programa?");
+        assert!(
+            view.body.starts_with("setup.exe é um programa."),
+            "{}",
+            view.body
+        );
+        assert_eq!(
+            view.buttons
+                .map(|button| (button.label, button.role, button.primary)),
+            [
+                ("Baixar mesmo assim", DownloadCardButton::Confirm, false),
+                ("Cancelar", DownloadCardButton::Dismiss, true),
+            ]
+        );
+        let answer = |card: &mut NativeCard<DownloadPrompt>, token, button, at| {
+            download_card_step(card, DownloadCardInput::Answer { token, button }, at)
+        };
+        // Um clique de outro cartao, ou cedo demais: nada.
+        assert_eq!(
+            answer(
+                &mut card,
+                view.token + 1,
+                DownloadCardButton::Confirm,
+                now + NATIVE_CARD_ARM
+            ),
+            CardStep::default()
+        );
+        assert_eq!(
+            answer(&mut card, view.token, DownloadCardButton::Confirm, now),
+            CardStep::default()
+        );
+        // Armado: segue.
+        let yes = answer(
+            &mut card,
+            view.token,
+            DownloadCardButton::Confirm,
+            now + NATIVE_CARD_ARM,
+        );
+        assert_eq!(
+            yes.events,
+            vec![DownloadEvent::Answered {
+                id: DownloadId(1),
+                allow: true
+            }]
+        );
+        assert!(yes.hide && yes.leave.is_none());
+        for event in yes.events {
+            rig.drive(event);
+        }
+        assert_eq!(
+            rig.journal.take(),
+            vec![format!("1 segue {}", setup.display())]
+        );
+        assert!(
+            rig.manager
+                .entry(DownloadId(1))
+                .expect("entrada")
+                .confirmed_program
+        );
+
+        // Cancelar: recusa, ja (sem armar).
+        rig.begin(2, 1, WebViewHost::External, dir.0.join("outro.exe"));
+        let token = download_card_step(&mut card, DownloadCardInput::Request(ask(2)), now)
+            .show
+            .expect("cartao")
+            .0
+            .token;
+        let no = answer(&mut card, token, DownloadCardButton::Dismiss, now);
+        assert_eq!(
+            no.events,
+            vec![DownloadEvent::Answered {
+                id: DownloadId(2),
+                allow: false
+            }]
+        );
+        for event in no.events {
+            rig.drive(event);
+        }
+        assert_eq!(rig.journal.take(), vec!["2 recusado".to_string()]);
+
+        // O prazo: recusa.
+        rig.begin(3, 1, WebViewHost::External, dir.0.join("terceiro.exe"));
+        let token = download_card_step(&mut card, DownloadCardInput::Request(ask(3)), now)
+            .show
+            .expect("cartao")
+            .0
+            .token;
+        let expired = download_card_step(&mut card, DownloadCardInput::Expire(token), now);
+        assert!(expired.hide);
+        for event in expired.events {
+            rig.drive(event);
+        }
+        assert_eq!(rig.journal.take(), vec!["3 recusado".to_string()]);
+
+        // Um pedido novo troca o pendente: o trocado e recusado ja.
+        rig.begin(4, 1, WebViewHost::External, dir.0.join("quarto.exe"));
+        rig.begin(5, 1, WebViewHost::External, dir.0.join("quinto.exe"));
+        download_card_step(&mut card, DownloadCardInput::Request(ask(4)), now);
+        let replaced = download_card_step(&mut card, DownloadCardInput::Request(ask(5)), now);
+        assert!(replaced.show.is_some());
+        assert_eq!(
+            replaced.events,
+            vec![DownloadEvent::Answered {
+                id: DownloadId(4),
+                allow: false
+            }]
+        );
+        for event in replaced.events {
+            rig.drive(event);
+        }
+        assert_eq!(rig.journal.take(), vec!["4 recusado".to_string()]);
+        assert_eq!(
+            rig.manager.entry(DownloadId(5)).expect("entrada").state,
+            DownloadState::Asking(BlockReason::Program),
+            "o novo continua a espera"
+        );
+    }
+
+    /// Um shell que so anota: o `ShellExecuteW` e o «Mostrar na pasta».
+    #[derive(Default)]
+    struct RecordingShell {
+        executed: Vec<(&'static str, PathBuf)>,
+        revealed: Vec<PathBuf>,
+    }
+
+    impl ShellHost for RecordingShell {
+        fn shell_execute(&mut self, verb: &'static str, file: &Path) -> Result<(), String> {
+            self.executed.push((verb, file.to_path_buf()));
+            Ok(())
+        }
+        fn reveal_in_folder(&mut self, file: &Path) -> Result<(), String> {
+            self.revealed.push(file.to_path_buf());
+            Ok(())
+        }
+    }
+
+    /// Gate critico (correr arquivos; sabotado: deixar o «Abrir» chegar ao
+    /// `ShellExecuteW` com um `.docm`): o «Abrir» so passa pelo
+    /// `shell_open_checked`, que exige o `DefaultAppTarget` -- a lista de
+    /// recusas do `file_risk` (programa, script, documento com macros,
+    /// disfarce, `.url`, `.lnk`, `.library-ms`, `.search-ms`, `.chm`,
+    /// `.hta`), o que nao esta na lista dos tipos que abrem e o conteudo
+    /// relido no disco -- e abre com "open" o caminho validado. Pela
+    /// linha do painel (`open_download_row`), da sessao e do registo: um
+    /// tipo recusado nao mostra «Abrir», so «Mostrar na pasta», e mesmo
+    /// pedido nunca chega ao shell.
+    #[test]
+    fn abrir_goes_only_through_default_app_target() {
+        let dir = Scratch::new("abrir");
+        let file = |name: &str, bytes: &[u8]| {
+            let path = dir.0.join(name);
+            std::fs::write(&path, bytes).expect("arquivo");
+            path
+        };
+        // Recusados, mesmo com um conteudo inofensivo no disco.
+        let refused = [
+            file("macro.docm", b"PK\x03\x04"),
+            file("planilha.xlsm", b"PK\x03\x04"),
+            file("setup.exe", b"texto"),
+            file("instalar.ps1", b"texto"),
+            file("fatura.pdf.exe", b"texto"),
+            file("app.hta", b"<script></script>"),
+            file("link.url", b"[InternetShortcut]"),
+            file("atalho.lnk", b"texto"),
+            file("busca.search-ms", b"texto"),
+            file("pasta.library-ms", b"texto"),
+            file("ajuda.chm", b"texto"),
+            file("pagina.html", b"<script></script>"),
+            file("imagem.svg", b"<svg><script/></svg>"),
+            file("pacote.zip", b"PK\x03\x04"),
+            file("LEIAME", b"texto"),
+            // Nome de documento, conteudo de programa: o sniff recusa.
+            file("falso.pdf", &pe_bytes()),
+        ];
+        let allowed = [
+            file("relatorio.pdf", PDF),
+            file("foto.png", b"\x89PNG\r\n\x1a\n"),
+            file("notas.txt", b"ola"),
+            file("musica.mp3", b"ID3"),
+        ];
+        let mut shell = RecordingShell::default();
+        for path in &refused {
+            assert_eq!(
+                shell_open_checked(path, &mut shell),
+                OpenOutcome::Refused,
+                "{}",
+                path.display()
+            );
+        }
+        assert!(shell.executed.is_empty(), "{:?}", shell.executed);
+        for path in &allowed {
+            assert_eq!(shell_open_checked(path, &mut shell), OpenOutcome::Opened);
+        }
+        assert_eq!(
+            shell.executed,
+            allowed
+                .iter()
+                .map(|path| (SHELL_OPEN_VERB, path.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(SHELL_OPEN_VERB, "open");
+
+        // Pela linha do painel: um PDF, um .docm (acaba com a marca: e um
+        // aviso, nao um bloqueio) e um programa confirmado.
+        let mut manager = DownloadManager::new(
+            DownloadSettings {
+                folder: None,
+                allow_programs: true,
+            },
+            DownloadLog::default(),
+        );
+        let finish = |manager: &mut DownloadManager, id: u64, path: &Path| {
+            manager.on_event(DownloadEvent::Starting(DownloadStart {
+                id: DownloadId(id),
+                webview: WebViewKey(1),
+                private: false,
+                proposed: path.to_path_buf(),
+                host: Some("example.com".to_string()),
+                total: None,
+                at: id,
+            }));
+            manager.on_event(DownloadEvent::Answered {
+                id: DownloadId(id),
+                allow: true,
+            });
+            manager.on_event(DownloadEvent::Ended {
+                id: DownloadId(id),
+                end: DownloadEnd::Completed {
+                    path: path.to_path_buf(),
+                },
+            });
+            manager.on_event(DownloadEvent::Finalized {
+                id: DownloadId(id),
+                outcome: neural_core::downloads::FinalizeOutcome::Kept(
+                    neural_core::downloads::MotwOutcome::Written,
+                ),
+            });
+        };
+        let pdf = allowed[0].clone();
+        let docm = refused[0].clone();
+        let exe = refused[2].clone();
+        finish(&mut manager, 1, &pdf);
+        finish(&mut manager, 2, &docm);
+        finish(&mut manager, 3, &exe);
+        let mut rows = DownloadRows::default();
+        let built = rows.list(&manager, &BTreeMap::new());
+        let row = |name: &str| {
+            built
+                .iter()
+                .find(|row| row.name == name)
+                .unwrap_or_else(|| panic!("{name}: {built:?}"))
+                .clone()
+        };
+        let (pdf_row, docm_row, exe_row) =
+            (row("relatorio.pdf"), row("macro.docm"), row("setup.exe"));
+        assert!(pdf_row.open && pdf_row.show, "{pdf_row:?}");
+        assert!(!docm_row.open && docm_row.show, "{docm_row:?}");
+        assert!(!exe_row.open && exe_row.show, "{exe_row:?}");
+        let mut shell = RecordingShell::default();
+        for id in [docm_row.id, exe_row.id] {
+            assert_eq!(
+                open_download_row(&manager, &rows, id, &mut shell),
+                OpenOutcome::Refused
+            );
+        }
+        assert!(shell.executed.is_empty(), "{:?}", shell.executed);
+        assert_eq!(
+            open_download_row(&manager, &rows, pdf_row.id, &mut shell),
+            OpenOutcome::Opened
+        );
+        assert_eq!(shell.executed, vec![(SHELL_OPEN_VERB, pdf.clone())]);
+        // «Mostrar na pasta» nao corre nada: so o Explorador na pasta.
+        assert_eq!(
+            show_download_row(&manager, &rows, docm_row.id, &mut shell),
+            OpenOutcome::Opened
+        );
+        assert_eq!(shell.revealed, vec![docm.clone()]);
+        assert_eq!(shell.executed.len(), 1);
+        // Um numero que nao esta na lista nao abre nada.
+        assert_eq!(
+            open_download_row(&manager, &rows, 999, &mut shell),
+            OpenOutcome::NoFile
+        );
+
+        // O mesmo pelo registo de antes (o `downloads.json` lido no arranque).
+        let log = manager.log();
+        let old = DownloadManager::new(DownloadSettings::default(), log);
+        let mut rows = DownloadRows::default();
+        let built = rows.list(&old, &BTreeMap::new());
+        assert_eq!(built.len(), 3, "{built:?}");
+        let mut shell = RecordingShell::default();
+        for row in &built {
+            let outcome = open_download_row(&old, &rows, row.id, &mut shell);
+            assert_eq!(
+                row.open,
+                outcome == OpenOutcome::Opened,
+                "{row:?} {outcome:?}"
+            );
+        }
+        assert_eq!(shell.executed, vec![(SHELL_OPEN_VERB, pdf)]);
+
+        // O conteudo e relido no clique: o PDF trocado por um programa
+        // depois de a lista ser pintada nao abre.
+        std::fs::write(&allowed[0], pe_bytes()).expect("troca");
+        let mut shell = RecordingShell::default();
+        let pdf_again = built
+            .iter()
+            .find(|row| row.name == "relatorio.pdf")
+            .expect("linha");
+        assert_eq!(
+            open_download_row(&old, &rows, pdf_again.id, &mut shell),
+            OpenOutcome::Refused
+        );
+        assert!(shell.executed.is_empty());
+        // Apagado depois de acabar: nao ha arquivo (e nada chega ao shell).
+        std::fs::remove_file(&allowed[0]).expect("apagar");
+        assert_eq!(
+            open_download_row(&old, &rows, pdf_again.id, &mut shell),
+            OpenOutcome::NoFile
+        );
+        assert!(shell.executed.is_empty());
+
+        // Ausencia: um so `ShellExecuteW(` no que embarca (o do
+        // `WindowsShell`), nenhum "runas", e o `shell_execute` so e chamado
+        // por `shell_open_checked`.
+        let source = shipped_source();
+        assert_eq!(source.matches("ShellExecuteW(").count(), 1);
+        assert!(!source.to_ascii_lowercase().contains("runas"));
+        assert_eq!(source.matches(".shell_execute(").count(), 1);
+    }
+
+    /// Gate critico (canal do painel; so numeros): a seccao Downloads so
+    /// aceita a lista, o numero de uma linha (um inteiro de 1 a 2^53-1, sem
+    /// mais nada nos `args`) e o interruptor; um caminho, um endereco, um
+    /// texto, um numero com casas, zero, negativo ou grande demais morrem no
+    /// parser. O que a pagina recebe tambem nunca leva um caminho; e a
+    /// pagina que embarca, a correr, so manda numeros.
+    #[test]
+    fn panel_downloads_messages_carry_ids_only() {
+        let parse = |action: &str, args: serde_json::Value| {
+            parse_panel_message(&serde_json::json!({ "action": action, "args": args }).to_string())
+        };
+        use DownloadsPanelRequest::*;
+        assert_eq!(
+            parse("downloads-list", serde_json::json!({})),
+            Some(PanelMessage::Downloads(List))
+        );
+        assert_eq!(
+            parse_panel_message(r#"{"action":"downloads-list"}"#),
+            Some(PanelMessage::Downloads(List))
+        );
+        for (action, make) in [
+            ("downloads-open", Open as fn(u64) -> DownloadsPanelRequest),
+            ("downloads-show", Show),
+            ("downloads-cancel", Cancel),
+        ] {
+            for id in [1u64, 7, PANEL_ROW_ID_MAX] {
+                assert_eq!(
+                    parse(action, serde_json::json!({ "id": id })),
+                    Some(PanelMessage::Downloads(make(id))),
+                    "{action} {id}"
+                );
+            }
+            for bad in [
+                serde_json::json!({ "id": "7" }),
+                serde_json::json!({ "id": r"C:\Users\ana\Downloads\setup.exe" }),
+                serde_json::json!({ "id": "https://exemplo.com/setup.exe" }),
+                serde_json::json!({ "id": 7.5 }),
+                serde_json::json!({ "id": 0 }),
+                serde_json::json!({ "id": -1 }),
+                serde_json::json!({ "id": PANEL_ROW_ID_MAX + 1 }),
+                serde_json::json!({ "id": [7] }),
+                serde_json::json!({ "id": { "path": "C:\\" } }),
+                serde_json::json!({ "id": 7, "path": r"C:\Windows\notepad.exe" }),
+                serde_json::json!({ "path": r"C:\Windows\notepad.exe" }),
+                serde_json::json!({}),
+                serde_json::Value::Null,
+                serde_json::json!("7"),
+            ] {
+                assert_eq!(parse(action, bad.clone()), None, "{action} {bad}");
+            }
+            assert_eq!(
+                parse_panel_message(&format!(r#"{{"action":"{action}"}}"#)),
+                None,
+                "{action} sem args"
+            );
+        }
+        assert_eq!(
+            parse(
+                "downloads-allow-programs",
+                serde_json::json!({ "on": true })
+            ),
+            Some(PanelMessage::Downloads(AllowPrograms(true)))
+        );
+        assert_eq!(
+            parse(
+                "downloads-allow-programs",
+                serde_json::json!({ "on": false })
+            ),
+            Some(PanelMessage::Downloads(AllowPrograms(false)))
+        );
+        for bad in [
+            serde_json::json!({ "on": "true" }),
+            serde_json::json!({ "on": 1 }),
+            serde_json::json!({ "on": true, "id": 1 }),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(
+                parse("downloads-allow-programs", bad.clone()),
+                None,
+                "{bad}"
+            );
+        }
+        for action in [
+            "downloads-run",
+            "downloads-open-path",
+            "downloads-execute",
+            "downloads",
+            "download-open",
+        ] {
+            assert_eq!(
+                parse(action, serde_json::json!({ "id": 1 })),
+                None,
+                "{action}"
+            );
+        }
+        // O tecto de 4 KiB do painel vale tambem aqui.
+        let padded = format!(
+            r#"{{"action":"downloads-list","args":{{}},"pad":"{}"}}"#,
+            "x".repeat(PANEL_MESSAGE_MAX_BYTES)
+        );
+        assert_eq!(parse_panel_message(&padded), None);
+
+        // O que a pagina recebe: nomes, estados e numeros -- nunca o
+        // caminho de um arquivo nem o endereco de onde veio.
+        let dir = Scratch::new("panel-rows");
+        let secret_dir = dir.0.join("pasta-secreta");
+        std::fs::create_dir_all(&secret_dir).expect("pasta");
+        let mut manager = DownloadManager::default();
+        for (id, name) in [(1u64, "relatorio.pdf"), (2, "grande.zip")] {
+            manager.on_event(DownloadEvent::Starting(DownloadStart {
+                id: DownloadId(id),
+                webview: WebViewKey(1),
+                private: false,
+                proposed: secret_dir.join(name),
+                host: Some("cdn.exemplo.com".to_string()),
+                total: Some(1000),
+                at: id,
+            }));
+        }
+        let path = secret_dir.join("relatorio.pdf");
+        std::fs::write(&path, PDF).expect("pdf");
+        manager.on_event(DownloadEvent::Ended {
+            id: DownloadId(1),
+            end: DownloadEnd::Completed { path },
+        });
+        manager.on_event(DownloadEvent::Finalized {
+            id: DownloadId(1),
+            outcome: neural_core::downloads::FinalizeOutcome::Kept(
+                neural_core::downloads::MotwOutcome::Written,
+            ),
+        });
+        let mut rows = DownloadRows::default();
+        let built = rows.list(&manager, &BTreeMap::new());
+        let script = downloads_render_script(&built, false);
+        assert!(!script.contains("pasta-secreta"), "{script}");
+        assert!(
+            !script.contains(&dir.0.to_string_lossy().to_string()),
+            "{script}"
+        );
+        assert!(!script.contains("https://"), "{script}");
+        assert!(script.contains("relatorio.pdf") && script.contains("cdn.exemplo.com"));
+
+        // A pagina que embarca, a correr: a lista entra como texto, e cada
+        // botao manda so `{ id }` -- o interruptor so `{ on }`.
+        let data = serde_json::json!({
+            "allowPrograms": false,
+            "rows": [
+                { "id": 11, "name": "<img src=x onerror=__pwned=1>.pdf", "status": "Concluído", "percent": null,
+                  "open": true, "show": true, "cancel": false, "tone": "done" },
+                { "id": 12, "name": "grande.zip", "status": "Baixando grande.zip · 1 de 2 MB", "percent": 50,
+                  "open": false, "show": false, "cancel": true, "tone": "running" }
+            ]
+        });
+        let result = super::notes_gates::run_panel(&[
+            "__click($('tab-downloads'));".to_string(),
+            format!("window.__neuraliaDownloads.render({data});"),
+            "const __rows = $('dl-list').children;\
+             __out.count = __rows.length;\
+             __out.first = __rows[0].textContent;\
+             const __dlButtons = [];\
+             const __walk = (n) => { for (const c of n.children) { if (c.tagName === 'BUTTON' && !c.hidden) __dlButtons.push(c); __walk(c); } };\
+             __walk($('dl-list'));\
+             __out.labels = __dlButtons.map((b) => b.textContent);\
+             for (const b of __dlButtons) __click(b);\
+             $('dl-allow').checked = true; __fire($('dl-allow'), 'change');\
+             __out.empty = $('dl-empty').hidden;"
+                .to_string(),
+            // A seta ou o Ctrl+J com o painel aberto: noutra seccao mostra
+            // os Downloads (e pede a lista); nos Downloads fecha.
+            "__click($('tab-history'));\
+             window.__neuraliaDownloads.button();\
+             __out.afterButton = __visible($('view-downloads')) && !__visible($('view-history'));"
+                .to_string(),
+            "window.__neuraliaDownloads.button();".to_string(),
+        ]);
+        assert_eq!(
+            result["pwned"],
+            serde_json::Value::Null,
+            "a pagina correu o nome"
+        );
+        assert_eq!(result["html"], serde_json::json!([]), "HTML interpretado");
+        assert_eq!(result["out"]["count"], 2);
+        assert_eq!(result["out"]["empty"], true);
+        assert!(
+            result["out"]["first"]
+                .as_str()
+                .is_some_and(|text| text.contains("<img src=x")),
+            "{}",
+            result["out"]["first"]
+        );
+        assert_eq!(
+            result["out"]["labels"],
+            serde_json::json!(["Abrir", "Mostrar na pasta", "Cancelar"])
+        );
+        let posted = super::notes_gates::posted(&result);
+        let downloads: Vec<serde_json::Value> = posted
+            .iter()
+            .map(|message| serde_json::from_str::<serde_json::Value>(message).expect("json"))
+            .filter(|message| {
+                message["action"]
+                    .as_str()
+                    .is_some_and(|action| action.starts_with("downloads-"))
+            })
+            .collect();
+        assert_eq!(
+            downloads,
+            vec![
+                serde_json::json!({ "action": "downloads-list", "args": {} }),
+                serde_json::json!({ "action": "downloads-open", "args": { "id": 11 } }),
+                serde_json::json!({ "action": "downloads-show", "args": { "id": 11 } }),
+                serde_json::json!({ "action": "downloads-cancel", "args": { "id": 12 } }),
+                serde_json::json!({ "action": "downloads-allow-programs", "args": { "on": true } }),
+                serde_json::json!({ "action": "downloads-list", "args": {} }),
+            ]
+        );
+        assert_eq!(result["out"]["afterButton"], true);
+        assert_eq!(
+            posted.last().map(|message| action_of_message(message)),
+            Some("close".to_string()),
+            "{posted:?}"
+        );
+        // E cada um passa no parser que embarca.
+        for message in &posted {
+            if action_is_downloads(message) {
+                assert!(parse_panel_message(message).is_some(), "{message}");
+            }
+        }
+    }
+
+    fn action_of_message(message: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(message)
+            .ok()
+            .and_then(|value| value["action"].as_str().map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    fn action_is_downloads(message: &str) -> bool {
+        serde_json::from_str::<serde_json::Value>(message)
+            .ok()
+            .and_then(|value| {
+                value["action"]
+                    .as_str()
+                    .map(|a| a.starts_with("downloads-"))
+            })
+            .unwrap_or(false)
+    }
+
+    /// As linhas: os numeros ficam de uma lista para a outra (um clique
+    /// numa lista ja trocada ainda cai na linha certa), um download da
+    /// sessao nao aparece duas vezes (o registo ja o tem), e um registo que
+    /// o Ctrl+Shift+Delete apagou deixa de ter numero.
+    #[test]
+    fn download_rows_keep_their_ids_and_resolve_only_what_is_shown() {
+        let record = |name: &str, at: u64| neural_core::downloads::DownloadRecord {
+            name: name.to_string(),
+            path: None,
+            host: None,
+            bytes: None,
+            outcome: RecordOutcome::Cancelled,
+            at,
+        };
+        let mut manager = DownloadManager::new(
+            DownloadSettings::default(),
+            DownloadLog {
+                entries: vec![record("antigo.zip", 5), record("mais-antigo.zip", 1)],
+            },
+        );
+        manager.on_event(DownloadEvent::Starting(DownloadStart {
+            id: DownloadId(1),
+            webview: WebViewKey(1),
+            private: false,
+            proposed: PathBuf::from(r"C:\Baixados\setup.exe"),
+            host: None,
+            total: None,
+            at: 10,
+        }));
+        let mut rows = DownloadRows::default();
+        let first = rows.list(&manager, &BTreeMap::new());
+        let names: Vec<&str> = first.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["setup.exe", "antigo.zip", "mais-antigo.zip"]);
+        assert_eq!(
+            manager.log().entries.len(),
+            3,
+            "o recusado entrou no registo"
+        );
+        let ids: Vec<u64> = first.iter().map(|row| row.id).collect();
+        let again: Vec<u64> = rows
+            .list(&manager, &BTreeMap::new())
+            .iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(ids, again, "os numeros mudaram");
+        assert_eq!(
+            rows.target(ids[0]),
+            Some(&RowTarget::Session(DownloadId(1)))
+        );
+        assert!(matches!(rows.target(ids[1]), Some(RowTarget::Record(_))));
+        // Ctrl+Shift+Delete: os registos saem; o numero deles nao resolve.
+        manager.on_event(DownloadEvent::ClearLog);
+        let cleared = rows.list(&manager, &BTreeMap::new());
+        assert!(cleared.is_empty(), "{cleared:?}");
+        for id in ids {
+            assert_eq!(rows.target(id), None);
+        }
+    }
+
+    /// A seta do canto: quantos correm e a percentagem de todos com total.
+    #[test]
+    fn downloads_badge_and_tooltip() {
+        let mut manager = DownloadManager::default();
+        assert_eq!(downloads_badge(&manager), DownloadsBadge::default());
+        assert_eq!(
+            downloads_tooltip(DownloadsBadge::default()),
+            "Downloads (Ctrl+J)"
+        );
+        for (id, total) in [(1u64, Some(1000u64)), (2, Some(3000)), (3, None)] {
+            manager.on_event(DownloadEvent::Starting(DownloadStart {
+                id: DownloadId(id),
+                webview: WebViewKey(1),
+                private: false,
+                proposed: PathBuf::from(format!(r"C:\Baixados\a{id}.zip")),
+                host: None,
+                total,
+                at: 0,
+            }));
+        }
+        manager.on_event(DownloadEvent::Progress {
+            id: DownloadId(1),
+            received: 1000,
+            total: None,
+        });
+        manager.on_event(DownloadEvent::Progress {
+            id: DownloadId(2),
+            received: 1000,
+            total: None,
+        });
+        let badge = downloads_badge(&manager);
+        assert_eq!(
+            badge,
+            DownloadsBadge {
+                active: 3,
+                percent: Some(50)
+            }
+        );
+        assert_eq!(
+            downloads_tooltip(badge),
+            "Downloads (Ctrl+J) · 3 em andamento, 50%"
+        );
+        assert_eq!(
+            bar_tooltip_label(
+                BarHit::Downloads,
+                &BarState {
+                    downloads: badge,
+                    ..BarState::default()
+                },
+                "",
+                None,
+                None
+            ),
+            Some("Downloads (Ctrl+J) · 3 em andamento, 50%".to_string())
+        );
+    }
+
+    /// Gate (atalho unico): o Ctrl+J e o comando Downloads da janela, da
+    /// omnibox e de cada WebView menos o monitor do Gmail -- o mesmo evento
+    /// da seta da barra --, e nenhuma outra linha do registo o declara em
+    /// ambito nenhum; nem a lista do ChatGPT nem a tabela dos arquivos o
+    /// tiram as paginas.
+    #[test]
+    fn ctrl_j_is_the_downloads_command_and_nothing_else() {
+        let ctrl_j = Chord::ctrl(b'J');
+        let owners: Vec<(CommandId, KeyScope)> = COMMANDS
+            .iter()
+            .flat_map(|row| {
+                row.chords
+                    .iter()
+                    .filter(|spec| spec.chord == ctrl_j)
+                    .map(move |spec| (row.id, spec.scope))
+            })
+            .collect();
+        assert_eq!(owners, vec![(CommandId::Downloads, KeyScope::Global)]);
+        assert!(!PROVIDER_DENYLIST.contains(&ctrl_j));
+        assert!(!FILES_OVERRIDES.contains(&ctrl_j));
+        let show = Some(format!(
+            "{:?}",
+            UserEvent::DownloadsUi(DownloadsUiEvent::Show)
+        ));
+        for origin in [CommandOrigin::Window, CommandOrigin::Omnibox] {
+            assert_eq!(
+                chord_command_event(&keymap_decision(press(ctrl_j), origin)),
+                show,
+                "{origin:?}"
+            );
+        }
+        for host in every_host() {
+            let got =
+                chord_command_event(&accelerator_lookup(product_keymap(), host, press(ctrl_j)));
+            if host == WebViewHost::GmailMonitor {
+                assert_eq!(got, None);
+            } else {
+                assert_eq!(
+                    got,
+                    Some(format!(
+                        "{:?}",
+                        UserEvent::DownloadsUi(DownloadsUiEvent::Show)
+                    )),
+                    "{host:?}"
+                );
+            }
+        }
+        assert_eq!(
+            bar_hit_command(BarHit::Downloads)
+                .and_then(|id| resolve_command(id, CommandOrigin::Window))
+                .map(|event| format!("{event:?}")),
+            Some(format!(
+                "{:?}",
+                UserEvent::DownloadsUi(DownloadsUiEvent::Show)
+            ))
+        );
+    }
+
+    /// Gate real Win32 (so CI): o cartao dos downloads nasce, aparece e e
+    /// clicado sem nunca tirar a ativacao a janela dona; e owned por ela,
+    /// sem ativacao e nunca TOPMOST -- pela mesma receita
+    /// (`create_native_card`) e o procedimento dele.
+    #[test]
+    #[ignore = "needs a desktop session: runs in CI"]
+    fn download_card_never_activates() {
+        use windows_sys::Win32::Graphics::Gdi::UpdateWindow;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, SetActiveWindow};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GW_OWNER, GWL_EXSTYLE, GetWindow, GetWindowLongW, IsWindowVisible, WS_EX_TOPMOST,
+            WS_OVERLAPPEDWINDOW,
+        };
+        let sink: Box<DownloadCardSink> = Box::new(Box::new(|_| {}));
+        let width = DOWNLOAD_CARD_WIDTH.round() as i32;
+        let height = DOWNLOAD_CARD_HEIGHT.round() as i32;
+        unsafe {
+            let owner = CreateWindowExW(
+                0,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!("NeuralIA dono"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                0,
+                0,
+                800,
+                500,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!owner.is_null(), "a janela dona tem de nascer");
+            SetActiveWindow(owner);
+            assert_eq!(
+                GetActiveWindow(),
+                owner,
+                "pre-condicao: o dono e a janela ativa"
+            );
+            if let Ok(mut view) = DOWNLOAD_CARD_VIEW.lock() {
+                *view = Some(
+                    DownloadPrompt::Program {
+                        id: DownloadId(1),
+                        name: "setup.exe".to_string(),
+                        reason: BlockReason::Program,
+                    }
+                    .view(5),
+                );
+            }
+            let card = create_native_card(
+                owner,
+                width,
+                height,
+                download_card_subclass,
+                DOWNLOAD_CARD_SUBCLASS_ID,
+                (&*sink as *const DownloadCardSink) as usize,
+                18,
+            )
+            .expect("o cartao tem de nascer");
+            let after_create = GetActiveWindow();
+            let mut stolen_on_show = None;
+            for cycle in 0..3 {
+                show_popup_without_activation(card);
+                if GetActiveWindow() != owner && stolen_on_show.is_none() {
+                    stolen_on_show = Some(cycle);
+                }
+            }
+            UpdateWindow(card);
+            let painted = DOWNLOAD_CARD_PAINTED.load(Ordering::Acquire);
+            let activate = SendMessageW(card, WM_MOUSEACTIVATE, owner as WPARAM, 0);
+            let hit = SendMessageW(card, WM_NCHITTEST, 0, 0);
+            let ex_style = GetWindowLongW(card, GWL_EXSTYLE) as u32;
+            let card_owner = GetWindow(card, GW_OWNER);
+            let visible = IsWindowVisible(card) != 0;
+            let after_all = GetActiveWindow();
+            DestroyWindow(card);
+            DestroyWindow(owner);
+            if let Ok(mut view) = DOWNLOAD_CARD_VIEW.lock() {
+                *view = None;
+            }
+            DOWNLOAD_CARD_PAINTED.store(0, Ordering::Release);
+
+            assert_eq!(after_create, owner, "criar o cartao roubou a ativacao");
+            assert_eq!(
+                stolen_on_show, None,
+                "mostrar o cartao roubou a ativacao ao dono no ciclo {stolen_on_show:?}"
+            );
+            assert_eq!(
+                activate, MA_NOACTIVATE as LRESULT,
+                "o clique ativava o cartao"
+            );
+            assert_eq!(after_all, owner, "o cartao ficou com a ativacao");
+            assert!(visible, "o cartao tem de ficar visivel depois de mostrado");
+            assert_eq!(hit, HTCLIENT as LRESULT, "o cartao deixava o clique passar");
+            assert_eq!(painted, 5, "a pintura nao registou o cartao pintado");
+            assert_eq!(card_owner, owner, "o cartao tem de ser owned pela janela");
+            assert_eq!(ex_style & WS_EX_TOPMOST, 0, "o cartao nunca e TOPMOST");
+            assert_ne!(ex_style & WS_EX_NOACTIVATE, 0, "sem WS_EX_NOACTIVATE");
+        }
+    }
+}
+
+// ===================== page_eval (infra-llm-untrusted) =====================
+
+/// O callback que o WebView2 chama com o JSON do script.
+type EvalCallback = Box<dyn Fn(String) + Send>;
+
+/// A vista falsa de `PageReads::read`: guarda o script e o callback do
+/// WebView2 (que o teste chama quando quer, com a resposta que quer) e
+/// mostra o URL que o teste lhe poe.
+struct FakeEvalView {
+    url: std::cell::RefCell<Option<String>>,
+    accepts: bool,
+    asked: std::cell::RefCell<Vec<(String, EvalCallback)>>,
+}
+
+impl FakeEvalView {
+    fn at(url: &str) -> Self {
+        Self {
+            url: std::cell::RefCell::new(Some(url.to_string())),
+            accepts: true,
+            asked: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// O WebView2 acaba o script `index` e devolve `raw`.
+    fn answer(&self, index: usize, raw: &str) {
+        (self.asked.borrow()[index].1)(raw.to_string());
+    }
+}
+
+impl EvalView for FakeEvalView {
+    fn page_url(&self) -> Option<String> {
+        self.url.borrow().clone()
+    }
+
+    fn eval_with_callback(
+        &self,
+        script: &str,
+        callback: Box<dyn Fn(String) + Send + 'static>,
+    ) -> bool {
+        if self.accepts {
+            self.asked.borrow_mut().push((script.to_string(), callback));
+        }
+        self.accepts
+    }
+}
+
+const PAGE_READ_CAP: usize = 64;
+const PAGE_READ_DEADLINE: Duration = Duration::from_secs(5);
+
+fn page_read_spec() -> PageEvalSpec {
+    PageEvalSpec {
+        script: &NOTE_CAPTURE_READ,
+        max_raw_bytes: PAGE_READ_CAP,
+        deadline: PAGE_READ_DEADLINE,
+    }
+}
+
+/// Uma leitura em curso: o que o callback entregou ao "event loop" e o que
+/// foi agendado no `Timers`.
+struct StartedRead {
+    token: PageReadToken,
+    delivered: std::sync::mpsc::Receiver<PageEvalEvent>,
+    scheduled: Vec<(Duration, PageEvalEvent)>,
+}
+
+fn start_page_read(
+    reads: &mut PageReads,
+    view: &FakeEvalView,
+    epoch: &NavEpoch,
+    now: Instant,
+) -> StartedRead {
+    let (sender, delivered) = std::sync::mpsc::channel();
+    let mut scheduled = Vec::new();
+    let token = reads
+        .read(
+            view,
+            page_read_spec(),
+            epoch,
+            now,
+            move |event| {
+                let _ = sender.send(event);
+            },
+            |delay, event| scheduled.push((delay, event)),
+        )
+        .expect("the read starts");
+    StartedRead {
+        token,
+        delivered,
+        scheduled,
+    }
+}
+
+const PAGE_URL: &str = "https://exemplo.com/artigo";
+const PAGE_JSON: &str = r#"{"text":"ola","url":"https://exemplo.com/artigo","title":"T"}"#;
+
+#[test]
+fn page_eval_delivers_a_read_that_arrives_in_time_on_the_same_page() {
+    let view = FakeEvalView::at(PAGE_URL);
+    let epoch = NavEpoch::default();
+    let mut reads = PageReads::default();
+    let now = Instant::now();
+    let started = start_page_read(&mut reads, &view, &epoch, now);
+
+    // O script corrido e o registado; o prazo foi para o `Timers`.
+    assert_eq!(view.asked.borrow()[0].0, NOTE_CAPTURE_SCRIPT);
+    assert_eq!(
+        started.scheduled,
+        vec![(PAGE_READ_DEADLINE, PageEvalEvent::Expired(started.token))]
+    );
+    assert_eq!(reads.in_flight(), 1);
+
+    view.answer(0, PAGE_JSON);
+    let event = started
+        .delivered
+        .try_recv()
+        .expect("the callback delivered");
+    let outcome = reads.settle(event, || view.page_url(), now + Duration::from_secs(1));
+    assert_eq!(
+        outcome,
+        PageEvalOutcome::Delivered {
+            token: started.token,
+            script: "note-capture",
+            raw: PAGE_JSON.to_string(),
+        }
+    );
+    assert_eq!(reads.in_flight(), 0);
+    let value = parse_page_json(PAGE_JSON, PAGE_READ_CAP).expect("JSON within the cap");
+    assert_eq!(value["text"], "ola");
+    // O prazo que chega depois de entregue nao faz nada.
+    assert_eq!(
+        reads.settle(
+            PageEvalEvent::Expired(started.token),
+            || view.page_url(),
+            now + PAGE_READ_DEADLINE
+        ),
+        PageEvalOutcome::Stale(started.token)
+    );
+}
+
+#[test]
+fn page_eval_drops_a_late_read() {
+    let view = FakeEvalView::at(PAGE_URL);
+    let epoch = NavEpoch::default();
+    let mut reads = PageReads::default();
+    let now = Instant::now();
+
+    // O prazo do `Timers` chega primeiro: a leitura cai uma vez, e a
+    // resposta que vem depois ja nao e de ninguem.
+    let first = start_page_read(&mut reads, &view, &epoch, now);
+    assert_eq!(
+        reads.settle(
+            PageEvalEvent::Expired(first.token),
+            || view.page_url(),
+            now + PAGE_READ_DEADLINE
+        ),
+        PageEvalOutcome::Dropped {
+            token: first.token,
+            reason: PageEvalDrop::Late,
+        }
+    );
+    view.answer(0, PAGE_JSON);
+    let late = first.delivered.try_recv().expect("the late answer arrives");
+    assert_eq!(
+        reads.settle(late, || view.page_url(), now + PAGE_READ_DEADLINE),
+        PageEvalOutcome::Stale(first.token)
+    );
+
+    // A resposta chega passado o prazo, antes de o `Timers` o dizer: cai
+    // na mesma, e o prazo que vem depois nao repete a queda.
+    let second = start_page_read(&mut reads, &view, &epoch, now);
+    view.answer(1, PAGE_JSON);
+    let arrived = second.delivered.try_recv().expect("delivered");
+    assert_eq!(
+        reads.settle(arrived, || view.page_url(), now + PAGE_READ_DEADLINE),
+        PageEvalOutcome::Dropped {
+            token: second.token,
+            reason: PageEvalDrop::Late,
+        }
+    );
+    assert_eq!(
+        reads.settle(
+            PageEvalEvent::Expired(second.token),
+            || view.page_url(),
+            now + PAGE_READ_DEADLINE
+        ),
+        PageEvalOutcome::Stale(second.token)
+    );
+    assert_eq!(reads.in_flight(), 0);
+}
+
+#[test]
+fn page_eval_drops_an_over_cap_read() {
+    let view = FakeEvalView::at(PAGE_URL);
+    let epoch = NavEpoch::default();
+    let mut reads = PageReads::default();
+    let now = Instant::now();
+    let started = start_page_read(&mut reads, &view, &epoch, now);
+
+    // Um byte acima do tecto: o callback nem leva o texto.
+    let over = format!("\"{}\"", "a".repeat(PAGE_READ_CAP - 1));
+    assert_eq!(over.len(), PAGE_READ_CAP + 1);
+    view.answer(0, &over);
+    let event = started.delivered.try_recv().expect("delivered");
+    assert_eq!(
+        event,
+        PageEvalEvent::Arrived {
+            token: started.token,
+            raw: RawArrival::OverCap {
+                bytes: PAGE_READ_CAP + 1
+            },
+        }
+    );
+    assert_eq!(
+        reads.settle(event, || view.page_url(), now),
+        PageEvalOutcome::Dropped {
+            token: started.token,
+            reason: PageEvalDrop::OverCap {
+                bytes: PAGE_READ_CAP + 1,
+                limit: PAGE_READ_CAP,
+            },
+        }
+    );
+
+    // A entrega mede outra vez: um `Within` grande demais tambem cai.
+    let again = start_page_read(&mut reads, &view, &epoch, now);
+    let forged = PageEvalEvent::Arrived {
+        token: again.token,
+        raw: RawArrival::Within(over.clone()),
+    };
+    assert!(matches!(
+        reads.settle(forged, || view.page_url(), now),
+        PageEvalOutcome::Dropped {
+            reason: PageEvalDrop::OverCap { .. },
+            ..
+        }
+    ));
+
+    // No tecto exato, passa; o serde so ve o que passou.
+    let exact = format!("\"{}\"", "a".repeat(PAGE_READ_CAP - 2));
+    let third = start_page_read(&mut reads, &view, &epoch, now);
+    view.answer(2, &exact);
+    let event = third.delivered.try_recv().expect("delivered");
+    assert!(matches!(
+        reads.settle(event, || view.page_url(), now),
+        PageEvalOutcome::Delivered { .. }
+    ));
+    assert!(parse_page_json(&over, PAGE_READ_CAP).is_none());
+    assert!(parse_page_json(&exact, PAGE_READ_CAP).is_some());
+}
+
+#[test]
+fn page_eval_drops_a_navigated_read() {
+    let view = FakeEvalView::at(PAGE_URL);
+    let epoch = NavEpoch::default();
+    let mut reads = PageReads::default();
+    let now = Instant::now();
+
+    // O mesmo URL, recarregado: so a geracao o diz.
+    let reloaded = start_page_read(&mut reads, &view, &epoch, now);
+    epoch.bump();
+    view.answer(0, PAGE_JSON);
+    let event = reloaded.delivered.try_recv().expect("delivered");
+    assert_eq!(
+        reads.settle(event, || view.page_url(), now),
+        PageEvalOutcome::Dropped {
+            token: reloaded.token,
+            reason: PageEvalDrop::Navigated,
+        },
+        "a reload between the request and the answer must drop the read"
+    );
+
+    // Outro URL sem navegacao que a vista conte (history.pushState).
+    let pushed = start_page_read(&mut reads, &view, &epoch, now);
+    *view.url.borrow_mut() = Some("https://exemplo.com/outro".to_string());
+    view.answer(1, PAGE_JSON);
+    let event = pushed.delivered.try_recv().expect("delivered");
+    assert_eq!(
+        reads.settle(event, || view.page_url(), now),
+        PageEvalOutcome::Dropped {
+            token: pushed.token,
+            reason: PageEvalDrop::Navigated,
+        }
+    );
+
+    // A vista ja nao existe.
+    let gone = start_page_read(&mut reads, &view, &epoch, now);
+    view.answer(2, PAGE_JSON);
+    let event = gone.delivered.try_recv().expect("delivered");
+    assert_eq!(
+        reads.settle(event, || None, now),
+        PageEvalOutcome::Dropped {
+            token: gone.token,
+            reason: PageEvalDrop::Navigated,
+        }
+    );
+
+    // Controlo: sem navegacao nenhuma, a mesma resposta e entregue.
+    let steady = start_page_read(&mut reads, &view, &epoch, now);
+    view.answer(3, PAGE_JSON);
+    let event = steady.delivered.try_recv().expect("delivered");
+    assert!(matches!(
+        reads.settle(event, || view.page_url(), now),
+        PageEvalOutcome::Delivered { .. }
+    ));
+}
+
+#[test]
+fn page_eval_refuses_no_page_a_failed_eval_and_too_many_reads() {
+    let epoch = NavEpoch::default();
+    let now = Instant::now();
+    let mut reads = PageReads::default();
+    let blank = FakeEvalView::at(PAGE_URL);
+    *blank.url.borrow_mut() = None;
+    let noop = |_: PageEvalEvent| {};
+    assert_eq!(
+        reads.read(&blank, page_read_spec(), &epoch, now, noop, |_, _| {}),
+        Err(PageEvalRefusal::NoPage)
+    );
+    let mut refusing = FakeEvalView::at(PAGE_URL);
+    refusing.accepts = false;
+    let mut scheduled = 0;
+    assert_eq!(
+        reads.read(&refusing, page_read_spec(), &epoch, now, noop, |_, _| {
+            scheduled += 1
+        }),
+        Err(PageEvalRefusal::EvalFailed)
+    );
+    assert_eq!(scheduled, 0, "a refused script schedules no deadline");
+    assert_eq!(reads.in_flight(), 0);
+
+    let view = FakeEvalView::at(PAGE_URL);
+    let mut tokens = std::collections::HashSet::new();
+    for _ in 0..MAX_PENDING_READS {
+        tokens.insert(start_page_read(&mut reads, &view, &epoch, now).token);
+    }
+    assert_eq!(tokens.len(), MAX_PENDING_READS, "one token per read");
+    assert_eq!(
+        reads.read(&view, page_read_spec(), &epoch, now, noop, |_, _| {}),
+        Err(PageEvalRefusal::Busy)
+    );
+    assert_eq!(reads.cancel_all(), MAX_PENDING_READS);
+    assert!(
+        reads
+            .read(&view, page_read_spec(), &epoch, now, noop, |_, _| {})
+            .is_ok()
+    );
+}
+
+/// Nomes que um script so-leitura nunca usa, lidos ou chamados: o
+/// identificador inteiro (`hasFocus` nao e `focus`, `scrollTop` nao e
+/// `scroll`), por o que fazem.
+const READ_ONLY_BANNED_NAMES: &[(&str, &[&str])] = &[
+    (
+        "publica",
+        &[
+            "postMessage",
+            "webview",
+            "__NEURALIA_CAP__",
+            "BroadcastChannel",
+            "MessageChannel",
+        ],
+    ),
+    (
+        "busca",
+        &[
+            "fetch",
+            "XMLHttpRequest",
+            "sendBeacon",
+            "WebSocket",
+            "EventSource",
+            "RTCPeerConnection",
+            "Image",
+            "Audio",
+            "Worker",
+            "SharedWorker",
+            "importScripts",
+            "open",
+        ],
+    ),
+    (
+        "muda o DOM",
+        &[
+            "createElement",
+            "createElementNS",
+            "DOMParser",
+            "createContextualFragment",
+            "setAttribute",
+            "setAttributeNS",
+            "toggleAttribute",
+            "appendChild",
+            "insertBefore",
+            "replaceChild",
+            "replaceWith",
+            "replaceChildren",
+            "insertAdjacentElement",
+            "attachShadow",
+            "adoptNode",
+            "importNode",
+        ],
+    ),
+    (
+        "escreve HTML",
+        &[
+            "innerHTML",
+            "insertAdjacentHTML",
+            "setHTMLUnsafe",
+            "write",
+            "writeln",
+        ],
+    ),
+    (
+        "escuta",
+        &[
+            "addEventListener",
+            "MutationObserver",
+            "IntersectionObserver",
+            "ResizeObserver",
+            "PerformanceObserver",
+        ],
+    ),
+    (
+        "agenda",
+        &[
+            "setTimeout",
+            "setInterval",
+            "setImmediate",
+            "requestAnimationFrame",
+            "requestIdleCallback",
+            "queueMicrotask",
+        ],
+    ),
+    (
+        "navega",
+        &["history", "navigation", "navigate", "reload", "opener"],
+    ),
+    (
+        "age pelo utilizador",
+        &[
+            "submit",
+            "requestSubmit",
+            "click",
+            "dispatchEvent",
+            "focus",
+            "blur",
+            "scroll",
+            "scrollTo",
+            "scrollBy",
+            "scrollIntoView",
+            "scrollIntoViewIfNeeded",
+            "requestFullscreen",
+            "webkitRequestFullscreen",
+            "requestPointerLock",
+            "print",
+            "execCommand",
+            "showModal",
+            "showPopover",
+            "alert",
+            "confirm",
+            "prompt",
+            "share",
+            "close",
+            "getUserMedia",
+            "getDisplayMedia",
+            "Notification",
+        ],
+    ),
+    (
+        "guarda",
+        &[
+            "localStorage",
+            "sessionStorage",
+            "indexedDB",
+            "caches",
+            "cookie",
+            "cookieStore",
+            "clipboard",
+        ],
+    ),
+    (
+        "codigo dinamico",
+        &["eval", "Function", "import", "constructor"],
+    ),
+];
+
+/// Metodos cujo nome sozinho e comum demais para ir em
+/// `READ_ONLY_BANNED_NAMES`: so a chamada `.nome(`.
+const READ_ONLY_BANNED_CALLS: &[&str] = &[
+    "select", "append", "prepend", "before", "after", "remove", "show", "play", "pause", "load",
+    "reset",
+];
+
+/// As partes de `location` que se leem; tudo o resto (`reload`, `assign`,
+/// `location` sozinho, um alias) conta como navegar.
+const LOCATION_READS: &[&str] = &[
+    "href", "origin", "protocol", "host", "hostname", "port", "pathname", "search", "hash",
+];
+
+/// Propriedades cuja atribuicao busca, navega, submete, rola ou escreve HTML.
+const READ_ONLY_BANNED_ASSIGNMENTS: &[&str] = &[
+    "src",
+    "srcset",
+    "srcdoc",
+    "href",
+    "action",
+    "formAction",
+    "target",
+    "poster",
+    "outerHTML",
+    "domain",
+    "name",
+    "value",
+    "scrollTop",
+    "scrollLeft",
+];
+
+/// Objetos globais: atribuir a qualquer propriedade deles nao e ler.
+const READ_ONLY_GLOBALS: &[&str] = &[
+    "window",
+    "document",
+    "self",
+    "globalThis",
+    "top",
+    "parent",
+    "frames",
+    "navigator",
+];
+
+fn is_js_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// Os escapes `\uXXXX` e `\u{...}` desfeitos: `loc\u0061tion` e
+/// `location` para o JavaScript, e tem de o ser para o gate.
+fn decode_js_unicode_escapes(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(at) = rest.find("\\u") {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + 2..];
+        let (hex, used) = match tail.strip_prefix('{') {
+            Some(braced) => match braced.find('}') {
+                Some(end) => (&braced[..end], end + 2),
+                None => ("", 0),
+            },
+            None => (tail.get(..4).unwrap_or(""), 4),
+        };
+        let decoded = Some(hex)
+            .filter(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .and_then(char::from_u32);
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &tail[used..];
+            }
+            None => {
+                out.push_str("\\u");
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// O script sem espacos, menos um entre dois identificadores: `return
+/// history.back()` fica `return history.back()` (tirar tudo dava
+/// `returnhistory`, e o nome escapava), `location . href = x` fica
+/// `location.href=x`.
+fn js_compact(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut gap = false;
+    for c in decode_js_unicode_escapes(source).chars() {
+        if c.is_whitespace() {
+            gap = true;
+            continue;
+        }
+        if gap && is_js_ident(c) && out.chars().next_back().is_some_and(is_js_ident) {
+            out.push(' ');
+        }
+        gap = false;
+        out.push(c);
+    }
+    out
+}
+
+/// Onde `name` aparece como identificador inteiro.
+fn js_words<'a>(code: &'a str, name: &'a str) -> impl Iterator<Item = usize> + 'a {
+    code.match_indices(name)
+        .map(|(at, _)| at)
+        .filter(move |&at| {
+            !code[..at].chars().next_back().is_some_and(is_js_ident)
+                && !code[at + name.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_js_ident)
+        })
+}
+
+/// O identificador que comeca em `rest`.
+fn js_ident_prefix(rest: &str) -> &str {
+    &rest[..rest.find(|c| !is_js_ident(c)).unwrap_or(rest.len())]
+}
+
+/// Se `rest` comeca por uma atribuicao (`=`, `+=`, `++`, ...), nao por uma
+/// comparacao.
+fn is_js_assignment(rest: &str) -> bool {
+    const COMPOUND: &[&str] = &[
+        "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", ">>>=", "**=", "&&=", "||=",
+        "??=", "++", "--",
+    ];
+    (rest.starts_with('=') && !rest.starts_with("=="))
+        || COMPOUND.iter().any(|op| rest.starts_with(op))
+}
+
+/// O que o gate de so-leitura recusa num script. E uma lista de negacao
+/// sobre o texto (§4.3: so proibe presencas), nao uma prova semantica: cobre
+/// as formas diretas de cada efeito, e um script novo entra na mesma com o
+/// sim do dono (OQ2). "So-leitura" e o do plano: `nodeValue` de um no de
+/// texto (a Traducao) e permitido.
+fn read_only_violations(source: &str) -> Vec<String> {
+    let code = js_compact(source);
+    let mut found = Vec::new();
+    for (effect, names) in READ_ONLY_BANNED_NAMES {
+        for name in *names {
+            if js_words(&code, name).next().is_some() {
+                found.push(format!("{effect}: {name}"));
+            }
+        }
+    }
+    for method in READ_ONLY_BANNED_CALLS {
+        if code.contains(&format!(".{method}(")) {
+            found.push(format!("age pelo utilizador: .{method}("));
+        }
+    }
+    // `x['nome']`: uma chave de texto esconde qualquer nome das listas.
+    for key in ["['", "[\"", "[`"] {
+        if code.contains(key) {
+            found.push(format!("chave calculada: {key}"));
+        }
+    }
+    for at in js_words(&code, "location") {
+        let rest = &code[at + "location".len()..];
+        let part = rest.strip_prefix('.').map(js_ident_prefix);
+        let read = part.is_some_and(|part| {
+            LOCATION_READS.contains(&part) && !is_js_assignment(&rest[1 + part.len()..])
+        });
+        if !read {
+            let shown: String = rest.chars().take(24).collect();
+            found.push(format!("navega: location{shown}"));
+        }
+    }
+    for (at, _) in code.match_indices('.') {
+        let property = js_ident_prefix(&code[at + 1..]);
+        if property.is_empty() || !is_js_assignment(&code[at + 1 + property.len()..]) {
+            continue;
+        }
+        let start = code[..at]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !is_js_ident(*c))
+            .map_or(0, |(before, c)| before + c.len_utf8());
+        let base = &code[start..at];
+        let handler = property.len() > 2 && property.starts_with("on");
+        if handler
+            || READ_ONLY_BANNED_ASSIGNMENTS.contains(&property)
+            || READ_ONLY_GLOBALS.contains(&base)
+        {
+            found.push(format!("atribui: {base}.{property}"));
+        }
+    }
+    found
+}
+
+/// Gate de ausencia (§4.3): nenhum script de `READ_ONLY_SCRIPTS` publica,
+/// busca, muda o DOM, escreve HTML, escuta, agenda, navega, age pelo
+/// utilizador (submeter, clicar, foco, rolagem, janelas), guarda, corre
+/// codigo dinamico ou toca na capability -- a lista de
+/// `read_only_violations`, que `page_eval_read_only_gate_refuses_acting_scripts`
+/// prova forma a forma.
+#[test]
+fn page_eval_scripts_are_read_only() {
+    assert!(!READ_ONLY_SCRIPTS.is_empty());
+    let mut names = std::collections::HashSet::new();
+    for script in READ_ONLY_SCRIPTS {
+        assert!(names.insert(script.name()), "{} twice", script.name());
+        let violations = read_only_violations(script.source());
+        assert!(
+            violations.is_empty(),
+            "{}: a read-only script acts on the page: {violations:?}",
+            script.name()
+        );
+    }
+}
+
+/// O gate de cima fica vermelho com cada forma de agir sobre a pagina --
+/// as da revisao primeiro (recarregar, `history`, `location.search=`,
+/// `requestSubmit`, `focus`) -- e verde com as leituras que os leitores
+/// vao precisar.
+#[test]
+fn page_eval_read_only_gate_refuses_acting_scripts() {
+    let acting = [
+        "location.reload()",
+        "history.go(-1)",
+        "location.search = '?x=1'",
+        "document.forms[0].requestSubmit()",
+        "document.querySelector('input').focus()",
+        "return location.reload()",
+        "return history.back()",
+        "location.hash += 'x'",
+        "window.location = 'https://exemplo.test/'",
+        "document.location.href = '/x'",
+        "var l = location; l.assign('/x')",
+        "location.replace('/x')",
+        "loc\\u0061tion.search = 'x'",
+        "\\u{66}etch('/x')",
+        "navigation.navigate('/x')",
+        "window.open('/x')",
+        "document.forms[0].submit()",
+        "var f = document.forms[0]; f.submit.call(f)",
+        "document.links[0].click()",
+        "el.dispatchEvent(new Event('input'))",
+        "document.activeElement.blur()",
+        "document.getElementById('q').select()",
+        "document.body.scrollIntoView()",
+        "window.scrollTo(0, 0)",
+        "document.scrollingElement.scrollTop = 0",
+        "document.documentElement.requestFullscreen()",
+        "window.print()",
+        "document.execCommand('copy')",
+        "window.name = 'segredo'",
+        "document.title = 'x'",
+        "new Image().src = 'https://exemplo.test/?d=' + text",
+        "document.body.appendChild(document.createElement('img'))",
+        "el.setAttribute('href', '/x')",
+        "el.innerHTML = '<b>x</b>'",
+        "el.outerHTML = ''",
+        "document.write('x')",
+        "fetch('/x')",
+        "navigator.sendBeacon('/x', text)",
+        "window.chrome.webview.postMessage('x')",
+        "window.__NEURALIA_CAP__",
+        "el.onclick = function () {}",
+        "document.addEventListener('x', f)",
+        "setTimeout(f, 1)",
+        "localStorage.x = 1",
+        "document['coo' + 'kie']",
+        "eval('1')",
+        "''.constructor.constructor('return 1')()",
+        "import('/x.js')",
+    ];
+    let wrap = |body: &str| format!("(function () {{ var text = ''; {body}; return 1; }})()");
+    // Controlo: o involucro sozinho passa, por isso o vermelho e do corpo.
+    assert_eq!(
+        read_only_violations(&wrap("var x = text.length")),
+        Vec::<String>::new()
+    );
+    for body in acting {
+        assert!(
+            !read_only_violations(&wrap(body)).is_empty(),
+            "the read-only gate lets through: {body}"
+        );
+    }
+
+    let reading = [
+        NOTE_CAPTURE_SCRIPT,
+        r#"(function () {
+  var nodes = document.querySelectorAll('p, h1, li');
+  var out = [];
+  for (var i = 0; i < nodes.length && i < 200; i++) {
+    out.push(String(nodes[i].textContent || '').slice(0, 500));
+  }
+  var box = document.body.getBoundingClientRect();
+  var first = document.images.length ? document.images[0].src : '';
+  return {
+    url: location.href, host: location.hostname, hashed: location.hash === '#a',
+    focused: document.hasFocus(), top: box.top, scrollY: window.scrollY,
+    title: document.title, lang: document.documentElement.lang, first: first, text: out
+  };
+})()"#,
+        // A Traducao troca o texto de um no de texto.
+        "(function () { var walker = document.createTreeWalker(document.body, 4); var node = walker.nextNode(); if (node) { node.nodeValue = 'traduzido'; } return 1; })()",
+    ];
+    for script in reading {
+        let violations = read_only_violations(script);
+        assert!(
+            violations.is_empty(),
+            "a reading script is refused: {violations:?}\n{script}"
+        );
+    }
+}
+
+// ===================== translation: Traduzir pagina =====================
+
+/// O DOM do harness da Traducao: elementos com `localName`, atributos,
+/// `classList`, `isContentEditable` herdado e um `innerHTML` que so
+/// regista (um script que escreva HTML aparece em `html`); nos de texto
+/// cujo `nodeValue` regista cada escrita; e um `createTreeWalker` com a
+/// semantica do DOM (o filtro so ve os tipos pedidos; REJECT salta a
+/// subarvore, SKIP so o no). Corre os scripts QUE EMBARCAM, com a chamada
+/// que o `page_eval` monta (`script_call`), num contexto `node:vm`.
+const TRANSLATE_HARNESS: &str = r##"
+const vm = require('node:vm');
+const INPUT = JSON.parse(process.argv[2]);
+const context = vm.createContext({ __html: [], __writes: [], __network: [] });
+vm.runInContext(`
+class Node0 { constructor(type) { this.nodeType = type; this.parentNode = null; this.childNodes = []; } }
+class Text0 extends Node0 {
+  constructor(value) { super(3); this._value = String(value); }
+  get nodeValue() { return this._value; }
+  set nodeValue(value) { __writes.push(String(value)); this._value = String(value); }
+}
+class Element0 extends Node0 {
+  constructor(tag, attrs) {
+    super(1);
+    this.localName = tag;
+    this.nodeName = tag.toUpperCase();
+    this.attrs = attrs || {};
+    const self = this;
+    this.classList = { contains(name) { return String(self.attrs['class'] || '').split(/\\s+/).indexOf(name) >= 0; } };
+  }
+  getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attrs, name) ? String(this.attrs[name]) : null; }
+  get isContentEditable() {
+    for (let el = this; el && el.nodeType === 1; el = el.parentNode) {
+      const value = el.getAttribute('contenteditable');
+      if (value !== null) return value.toLowerCase() !== 'false';
+    }
+    return false;
+  }
+  set innerHTML(value) { __html.push(String(value)); }
+  get innerHTML() { return ''; }
+  set outerHTML(value) { __html.push(String(value)); }
+  insertAdjacentHTML(_where, value) { __html.push(String(value)); }
+  append(child) { child.parentNode = this; this.childNodes.push(child); return child; }
+}
+function fetch(url) { __network.push(String(url)); }
+function build(spec) {
+  if (typeof spec === 'string') return new Text0(spec);
+  const el = new Element0(spec.tag, spec.attrs);
+  for (const child of spec.children || []) el.append(build(child));
+  return el;
+}
+var document = {
+  nodeType: 9,
+  documentElement: null,
+  body: null,
+  createTreeWalker(root, what, filter) {
+    const out = [];
+    (function visit(node) {
+      for (const child of node.childNodes) {
+        const shown = (child.nodeType === 1 && (what & 1)) || (child.nodeType === 3 && (what & 4));
+        const verdict = shown ? filter.acceptNode(child) : 3;
+        if (verdict === 1) out.push(child);
+        if (child.nodeType === 1 && verdict !== 2) visit(child);
+      }
+    })(root);
+    let at = 0;
+    return { nextNode() { return at < out.length ? out[at++] : null; } };
+  },
+};
+function __texts(node, out) {
+  for (const child of node.childNodes) {
+    if (child.nodeType === 3) out.push(child._value); else __texts(child, out);
+  }
+  return out;
+}
+function __set(from, to) {
+  const all = [];
+  (function visit(node) { for (const child of node.childNodes) { if (child.nodeType === 3) all.push(child); else visit(child); } })(document.documentElement);
+  const hit = all.find((node) => node._value === from);
+  if (!hit) throw new Error('no text ' + from);
+  hit._value = to;
+}
+`, context);
+context.__page = INPUT.page;
+vm.runInContext(`document.documentElement = build(__page); document.documentElement.parentNode = document;
+document.body = document.documentElement.childNodes.find((node) => node.localName === 'body') || null;`, context);
+const steps = [];
+for (const step of INPUT.steps) {
+  let result = null;
+  if (step.eval !== undefined) {
+    const value = vm.runInContext(step.eval, context);
+    result = JSON.parse(JSON.stringify(value === undefined ? null : value));
+  } else {
+    context.__from = step.set[0];
+    context.__to = step.set[1];
+    vm.runInContext('__set(__from, __to)', context);
+  }
+  steps.push({ result, texts: vm.runInContext('__texts(document.documentElement, [])', context) });
+}
+process.stdout.write(JSON.stringify({
+  steps,
+  html: context.__html,
+  network: context.__network,
+  writes: context.__writes,
+}));
+"##;
+
+/// Corre os `steps` (`{"eval": js}` ou `{"set": [de, para]}` -- a pagina
+/// muda um texto por conta propria) no DOM de `page`.
+fn run_translate_harness(
+    page: &serde_json::Value,
+    steps: &[serde_json::Value],
+) -> serde_json::Value {
+    let input = serde_json::json!({ "page": page, "steps": steps }).to_string();
+    let program = format!(
+        "process.argv[2] = {};\n{TRANSLATE_HARNESS}",
+        serde_json::to_string(&input).expect("input")
+    );
+    serde_json::from_str(&run_node_program(&program)).expect("JSON do harness")
+}
+
+/// A pagina do harness: um texto de cada coisa que a Traducao salta, e tres
+/// que traduz (um deles dentro de um `<b>` entre espacos).
+fn translate_test_page() -> serde_json::Value {
+    serde_json::json!({ "tag": "html", "attrs": { "lang": "en" }, "children": [
+        { "tag": "head", "children": [{ "tag": "title", "children": ["Title"] }] },
+        { "tag": "body", "children": [
+            { "tag": "p", "children": ["Hello"] },
+            { "tag": "script", "children": ["var secret = 1;"] },
+            { "tag": "style", "children": ["p { color: red }"] },
+            { "tag": "noscript", "children": ["Enable JS"] },
+            { "tag": "code", "children": ["let x = 1"] },
+            { "tag": "pre", "children": ["preformatted"] },
+            { "tag": "textarea", "children": ["typed"] },
+            { "tag": "input", "attrs": { "value": "field" } },
+            { "tag": "svg", "children": [{ "tag": "text", "children": ["svg label"] }] },
+            { "tag": "math", "children": [{ "tag": "mi", "children": ["math x"] }] },
+            { "tag": "div", "attrs": { "translate": "no" }, "children": [
+                { "tag": "span", "children": ["Brand Name"] }
+            ] },
+            { "tag": "div", "attrs": { "translate": "NO" }, "children": ["Upper No"] },
+            { "tag": "span", "attrs": { "class": "logo notranslate" }, "children": ["NeuralIA"] },
+            { "tag": "div", "attrs": { "contenteditable": "true" }, "children": [
+                { "tag": "p", "children": ["Draft"] }
+            ] },
+            { "tag": "div", "attrs": { "contenteditable": "" }, "children": ["Empty editable"] },
+            { "tag": "div", "attrs": { "aria-hidden": "true" }, "children": ["Hidden"] },
+            { "tag": "p", "children": ["  ", { "tag": "b", "children": ["World"] }, " "] },
+            { "tag": "p", "children": ["Goodbye"] }
+        ] }
+    ] })
+}
+
+fn collected_texts(collected: &serde_json::Value) -> Vec<String> {
+    collected["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item[1].as_str().expect("text").to_string())
+        .collect()
+}
+
+/// Gate (critico, scripts injetados; translation): os scripts que embarcam,
+/// no DOM do harness e com a chamada exata do `page_eval`:
+///
+/// - COLLECT so le o que se traduz -- nada de script, style, noscript,
+///   code, pre, textarea, input, svg, math, `[translate=no]`,
+///   `.notranslate`, contenteditable nem `aria-hidden`; o `<head>` fica de
+///   fora; nenhuma escrita;
+/// - APPLY poe um `<img onerror>` como TEXTO literal (nenhum HTML escrito),
+///   nao toca num no que a pagina mudou entre a leitura e a troca e conta o
+///   que falta;
+/// - RESTORE devolve o original so aos nos que ainda tem a traducao;
+/// - nenhum dos tres busca nada.
+///
+/// Sabotagens: tirar o `[translate=no]` (o «Brand Name» aparece), trocar o
+/// `nodeValue` por `innerHTML` (HTML escrito), tirar a conferencia do
+/// original (o no mudado e escrito por cima).
+#[test]
+fn translate_scripts_skip_write_only_text_and_restore() {
+    let page = translate_test_page();
+    let collect = script_call(&TRANSLATE_COLLECT_READ, None).expect("collect");
+    let first = run_translate_harness(&page, &[serde_json::json!({ "eval": collect })]);
+    let collected = first["steps"][0]["result"].clone();
+    assert_eq!(
+        collected_texts(&collected),
+        ["Hello", "World", "Goodbye"],
+        "COLLECT leu o que nao se traduz: {collected}"
+    );
+    assert_eq!(collected["lang"], "en");
+    assert_eq!(collected["truncated"], false);
+    assert_eq!(first["writes"], serde_json::json!([]), "COLLECT escreveu");
+    // O que a Traducao faz com isto e o `neural_core::translate` que
+    // embarca: a leitura, os blocos e as trocas.
+    let parsed = neural_core::translate::parse_collected(&collected.to_string()).expect("parse");
+    let plan = neural_core::translate::plan_batches(&parsed.texts);
+    assert_eq!(plan.batches.len(), 1);
+    let entries = neural_core::translate::apply_entries(
+        &plan.batches[0],
+        &[
+            "<img src=x onerror=alert(1)>".to_string(),
+            "Mundo".to_string(),
+            "Tchau".to_string(),
+        ],
+    );
+    let mut with_missing = entries.clone();
+    with_missing.push(neural_core::translate::ApplyEntry {
+        node: 999,
+        from: "Ghost".into(),
+        to: "Fantasma".into(),
+    });
+    let apply =
+        script_call(&TRANSLATE_APPLY_READ, Some(&entries_arg(&with_missing))).expect("apply");
+    let restore =
+        script_call(&TRANSLATE_RESTORE_READ, Some(&entries_arg(&entries))).expect("restore");
+    let run = run_translate_harness(
+        &page,
+        &[
+            serde_json::json!({ "eval": collect }),
+            // A pagina muda o «World» entre a leitura e a troca.
+            serde_json::json!({ "set": ["World", "World!"] }),
+            serde_json::json!({ "eval": apply }),
+            // E muda o «Tchau» depois da troca.
+            serde_json::json!({ "set": ["Tchau", "Tchau!!"] }),
+            serde_json::json!({ "eval": restore }),
+        ],
+    );
+    let applied = &run["steps"][2];
+    assert_eq!(
+        applied["result"],
+        serde_json::json!({ "done": 2, "changed": 1, "missing": 1 })
+    );
+    let texts = applied["texts"].as_array().expect("texts");
+    let has = |texts: &Vec<serde_json::Value>, text: &str| texts.contains(&serde_json::json!(text));
+    assert!(
+        has(texts, "<img src=x onerror=alert(1)>"),
+        "o HTML da traducao nao ficou texto literal: {texts:?}"
+    );
+    assert!(has(texts, "World!"), "o no mudado foi escrito por cima");
+    assert!(!has(texts, "Mundo"));
+    assert!(has(texts, "Tchau"));
+    assert!(has(texts, "Brand Name") && has(texts, "Title"));
+    assert_eq!(
+        run["html"],
+        serde_json::json!([]),
+        "um script escreveu HTML"
+    );
+    assert_eq!(
+        run["network"],
+        serde_json::json!([]),
+        "um script buscou algo"
+    );
+    let restored = &run["steps"][4];
+    assert_eq!(
+        restored["result"],
+        serde_json::json!({ "done": 1, "changed": 2, "missing": 0 })
+    );
+    let texts = restored["texts"].as_array().expect("texts");
+    for kept in ["Hello", "World!", "Tchau!!"] {
+        assert!(has(texts, kept), "{kept}: {texts:?}");
+    }
+    assert!(!has(texts, "<img src=x onerror=alert(1)>"));
+    // So o APPLY e o RESTORE escrevem, e so os `nodeValue` esperados.
+    assert_eq!(
+        run["writes"],
+        serde_json::json!(["<img src=x onerror=alert(1)>", "Tchau", "Hello"])
+    );
+
+    // Uma pagina inteira `translate="no"` nao da nada.
+    let refused = serde_json::json!({ "tag": "html", "attrs": { "translate": "no" }, "children": [
+        { "tag": "body", "children": [{ "tag": "p", "children": ["Hello"] }] }
+    ] });
+    let none = run_translate_harness(&refused, &[serde_json::json!({ "eval": collect })]);
+    assert_eq!(none["steps"][0]["result"]["items"], serde_json::json!([]));
+}
+
+/// Os tres scripts da Traducao estao no registo do `page_eval` com a forma
+/// do argumento certa, e o que o WebView2 corre e exatamente a chamada de
+/// `script_call`: o COLLECT sem argumento, o APPLY e o RESTORE com o JSON
+/// das trocas (dado, U+2028/2029 escapados). Um script com o argumento
+/// trocado nao corre.
+#[test]
+fn translate_scripts_run_through_page_eval_with_their_argument() {
+    for script in [
+        &TRANSLATE_COLLECT_READ,
+        &TRANSLATE_APPLY_READ,
+        &TRANSLATE_RESTORE_READ,
+    ] {
+        assert!(
+            READ_ONLY_SCRIPTS
+                .iter()
+                .any(|known| std::ptr::eq(*known, script)),
+            "{} fora do registo",
+            script.name()
+        );
+    }
+    assert_eq!(TRANSLATE_COLLECT_READ.arg(), ScriptArg::None);
+    assert_eq!(TRANSLATE_APPLY_READ.arg(), ScriptArg::Json);
+    assert_eq!(TRANSLATE_RESTORE_READ.arg(), ScriptArg::Json);
+    let arg = serde_json::json!([[3, "a\u{2028}b", "</script><script>x()</script>"]]);
+    assert!(script_call(&TRANSLATE_APPLY_READ, None).is_none());
+    assert!(script_call(&TRANSLATE_COLLECT_READ, Some(&arg)).is_none());
+    let call = script_call(&TRANSLATE_APPLY_READ, Some(&arg)).expect("call");
+    assert!(call.starts_with(&format!("({TRANSLATE_APPLY_SCRIPT})(")));
+    // O U+2028 sai escapado (`\` `u2028`), nunca cru.
+    let escaped = format!("a{}u2028b", '\\');
+    assert!(call.ends_with(&format!(
+        r#"([[3,"{escaped}","</script><script>x()</script>"]])"#
+    )));
+    assert!(!call.contains('\u{2028}'));
+
+    let view = FakeEvalView::at(PAGE_URL);
+    let epoch = NavEpoch::default();
+    let mut reads = PageReads::default();
+    let spec = |script| PageEvalSpec {
+        script,
+        max_raw_bytes: TRANSLATE_APPLY_MAX_BYTES,
+        deadline: TRANSLATE_SCRIPT_DEADLINE,
+    };
+    let noop = |_: PageEvalEvent| {};
+    assert!(
+        reads
+            .read_with_arg(
+                &view,
+                spec(&TRANSLATE_APPLY_READ),
+                &arg,
+                &epoch,
+                Instant::now(),
+                noop,
+                |_, _| {}
+            )
+            .is_ok()
+    );
+    assert_eq!(view.asked.borrow()[0].0, call);
+    assert_eq!(
+        reads.read(
+            &view,
+            spec(&TRANSLATE_APPLY_READ),
+            &epoch,
+            Instant::now(),
+            noop,
+            |_, _| {}
+        ),
+        Err(PageEvalRefusal::Unregistered)
+    );
+    assert_eq!(
+        reads.read_with_arg(
+            &view,
+            spec(&TRANSLATE_COLLECT_READ),
+            &arg,
+            &epoch,
+            Instant::now(),
+            noop,
+            |_, _| {}
+        ),
+        Err(PageEvalRefusal::Unregistered)
+    );
+}
+
+fn translation_pick() -> neural_core::llm::Pick {
+    use neural_core::llm::{ModelId, Pick, PickSource, PriceTier, Provider, Purpose};
+    Pick {
+        purpose: Purpose::Translation,
+        provider: Provider::Gemini,
+        model: ModelId::parse("test-model").expect("id"),
+        price_tier: PriceTier::Low,
+        source: PickSource::Rule,
+    }
+}
+
+fn translation_plan() -> neural_core::translate::Plan {
+    neural_core::translate::plan_batches(&[
+        neural_core::translate::PageText {
+            node: 0,
+            text: "Hello".into(),
+        },
+        neural_core::translate::PageText {
+            node: 2,
+            text: "World".into(),
+        },
+    ])
+}
+
+/// Gate (critico, confirmacoes e modo privado; translation): o cartao de
+/// consentimento da Traducao, do pedido do clique (`translation_request`,
+/// com a privacidade do hospedeiro, `translation_privacy`) ao portao e aos
+/// botoes (`consent_choices`):
+///
+/// - coluna/fonte/Web: «Traduzir» (a sessao, este site), «Sempre neste
+///   site» e «Cancelar», com o modelo e a faixa de preco no cartao;
+/// - Split privado: «Traduzir» so desta vez e «Cancelar» -- nunca
+///   «Sempre neste site», e nada fica no `translate.json`, mesmo que se
+///   force a resposta;
+/// - Modo privado: recusado;
+/// - «Sempre neste site» fica no `translate.json` (`Setting`) e vale na
+///   janela seguinte; «Traduzir» vale so para este site nesta sessao.
+///
+/// Sabotagem: o Split privado com a privacidade normal (oferece e grava o
+/// «Sempre»).
+#[test]
+fn translation_consent_table() {
+    use crate::ai_settings::Day;
+    use crate::egress::{
+        ConsentAnswer, Decision, EgressGate, EgressPrivacy, RefuseReason, SiteOrigin,
+    };
+    use crate::stores::TRANSLATE_STORE;
+
+    let dir = std::env::temp_dir().join(format!(
+        "neuralia-translation-consent-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let registry = StoreRegistry::mint_for_test(&dir);
+    let today = Day::today();
+    let gate_for = || {
+        let mut gate = EgressGate::for_app(Some(&registry));
+        gate.attach_site_grants(
+            crate::ai_settings::AiPurpose::Translation,
+            registry.grant(TRANSLATE_STORE).expect("grant"),
+        )
+        .expect("translate.json");
+        gate
+    };
+    let plan = translation_plan();
+    let choice = translation_pick();
+    let request = |host: WebViewHost, url: &str| {
+        translation_request(
+            &plan,
+            &choice,
+            SiteOrigin::of_url(url),
+            translation_privacy(host),
+        )
+    };
+    let ask = |decision: Decision| match decision {
+        Decision::Ask(card) => card,
+        other => panic!("esperava o cartao: {other:?}"),
+    };
+    let mut gate = gate_for();
+
+    // Coluna: o cartao do brief, com o modelo e a faixa de preco.
+    let column = WebViewHost::Column(0);
+    let card = ask(gate.request(request(column, "https://exemplo.com/a"), today));
+    let choices = consent_choices(&card, translation_privacy(column));
+    assert_eq!(
+        choices,
+        [
+            CardChoice::Translate(ConsentAnswer::Session),
+            CardChoice::AlwaysOnSite,
+            CardChoice::Cancel
+        ]
+    );
+    let view = consent_view(&card, &choices, &plan);
+    assert_eq!(view.title, "Traduzir com Gemini?");
+    assert_eq!(view.lines[0], TRANSLATE_CONSENT_BODY);
+    assert!(
+        view.lines
+            .iter()
+            .any(|line| line == "Modelo: test-model · custo baixo")
+    );
+    assert!(view.lines.iter().any(|line| line == "Site: exemplo.com"));
+    assert!(
+        view.lines
+            .iter()
+            .any(|line| line.starts_with("Vai para generativelanguage.googleapis.com"))
+    );
+    assert_eq!(
+        view.buttons,
+        [
+            ("Traduzir", true),
+            ("Sempre neste site", false),
+            ("Cancelar", false)
+        ]
+    );
+
+    // Split privado: pergunta, sem «Sempre»; forcado, nada fica no disco.
+    for (private, url) in [
+        (WebViewHost::PrivateSplit(0), "https://privado.com/"),
+        (WebViewHost::PrivateSplit(2), "https://privado-dois.com/"),
+    ] {
+        let card = ask(gate.request(request(private, url), today));
+        assert!(!card.offers_always(), "{private:?}");
+        assert_eq!(
+            consent_choices(&card, translation_privacy(private)),
+            [
+                CardChoice::Translate(ConsentAnswer::Once),
+                CardChoice::Cancel
+            ],
+            "{private:?}"
+        );
+        assert_eq!(
+            gate.answer(card, ConsentAnswer::AlwaysOnSite, today),
+            Decision::Send
+        );
+    }
+    let stored = std::fs::read_to_string(dir.join("translate.json")).unwrap_or_default();
+    assert!(!stored.contains("privado"), "o privado gravou: {stored}");
+    // O «Traduzir» do Split privado vale so desta vez: o clique seguinte
+    // no mesmo site pergunta outra vez.
+    let once = WebViewHost::PrivateSplit(1);
+    let card = ask(gate.request(request(once, "https://uma-vez.com/"), today));
+    let [CardChoice::Translate(answer), CardChoice::Cancel] =
+        consent_choices(&card, translation_privacy(once))[..]
+    else {
+        panic!("o cartao privado mudou");
+    };
+    assert_eq!(gate.answer(card, answer, today), Decision::Send);
+    assert!(matches!(
+        gate.request(request(once, "https://uma-vez.com/"), today),
+        Decision::Ask(_)
+    ));
+    // O Modo privado recusa antes de perguntar.
+    let private_mode = translation_request(
+        &plan,
+        &choice,
+        SiteOrigin::of_url("https://exemplo.com/"),
+        EgressPrivacy::PrivateMode,
+    );
+    assert_eq!(
+        gate.request(private_mode, today),
+        Decision::Refuse(RefuseReason::PrivateMode)
+    );
+
+    // «Sempre neste site»: gravado, e outra janela ja o ve.
+    let card = ask(gate.request(
+        request(WebViewHost::External, "https://sempre.com/x"),
+        today,
+    ));
+    assert_eq!(
+        gate.answer(card, ConsentAnswer::AlwaysOnSite, today),
+        Decision::Send
+    );
+    let stored = std::fs::read_to_string(dir.join("translate.json")).expect("translate.json");
+    assert!(stored.contains("https://sempre.com"), "{stored}");
+    let mut next = gate_for();
+    assert_eq!(
+        next.request(
+            request(WebViewHost::Split(1), "https://sempre.com/outra"),
+            today
+        ),
+        Decision::Send
+    );
+    // «Traduzir» (a sessao): este site ja nao pergunta, outro sim.
+    let card = ask(gate.request(request(column, "https://sessao.com/"), today));
+    assert_eq!(
+        gate.answer(card, ConsentAnswer::Session, today),
+        Decision::Send
+    );
+    assert_eq!(
+        gate.request(
+            request(WebViewHost::Column(1), "https://sessao.com/b"),
+            today
+        ),
+        Decision::Send
+    );
+    assert!(matches!(
+        gate.request(request(column, "https://outro.com/"), today),
+        Decision::Ask(_)
+    ));
+    // Cada bloco e uma chamada paga contada.
+    assert!(gate.wait_usage_written());
+    assert!(gate.usage_this_month(today) >= plan.batches.len() as u32);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Gate (critico, dados do utilizador; translation): enquanto uma coluna
+/// esta traduzida -- desde que os blocos comecam a ir ate o original
+/// voltar --, a resposta dela nao e gravada na sessao de pesquisa nem na
+/// memoria (`research_answer_provider`, o que o `UserEvent::ResearchAnswer`
+/// usa). Uma coluna a espera do cartao ainda nao traduziu nada; a fonte ao
+/// lado traduzida nao cala a coluna.
+///
+/// Sabotagem: `research_answer_provider` sem a conferencia (a resposta
+/// traduzida entra na sessao).
+#[test]
+fn research_answer_is_not_saved_from_a_translated_column() {
+    let mut state = TranslationState::with_sink(Box::new(|_| {}));
+    assert_eq!(
+        research_answer_provider(&state, Some("ChatGPT"), 1).as_deref(),
+        Some("ChatGPT")
+    );
+    let asking = state.run_for_test(WebViewHost::Column(1), false);
+    assert_eq!(
+        research_answer_provider(&state, Some("ChatGPT"), 1).as_deref(),
+        Some("ChatGPT"),
+        "a espera do cartao nada foi trocado"
+    );
+    assert_eq!(
+        state.toggle(WebViewHost::Column(1)),
+        TranslateToggle::Cancel
+    );
+    state.drop_for_test(asking);
+    let translating = state.run_for_test(WebViewHost::Column(1), true);
+    assert!(state.column_translated(1));
+    assert_eq!(research_answer_provider(&state, Some("ChatGPT"), 1), None);
+    assert_eq!(
+        research_answer_provider(&state, Some("Claude"), 0).as_deref(),
+        Some("Claude")
+    );
+    state.finish_for_test(
+        translating,
+        vec![neural_core::translate::ApplyEntry {
+            node: 0,
+            from: "Hello".into(),
+            to: "Olá".into(),
+        }],
+    );
+    assert_eq!(research_answer_provider(&state, Some("ChatGPT"), 1), None);
+    assert_eq!(
+        state.toggle(WebViewHost::Column(1)),
+        TranslateToggle::Restore
+    );
+    state.drop_for_test(translating);
+    assert_eq!(
+        research_answer_provider(&state, Some("ChatGPT"), 1).as_deref(),
+        Some("ChatGPT")
+    );
+    let split = state.run_for_test(WebViewHost::Split(1), true);
+    assert_eq!(
+        research_answer_provider(&state, Some("ChatGPT"), 1).as_deref(),
+        Some("ChatGPT")
+    );
+    state.drop_for_test(split);
+    assert_eq!(state.toggle(WebViewHost::Column(1)), TranslateToggle::Start);
+    // E e isto que o braco do event loop usa (presenca, §4.3).
+    let source = shipped_source();
+    assert!(source.contains("UserEvent::ResearchAnswer { source_index, text } => {"));
+    assert_eq!(source.matches("research_answer_provider(").count(), 2);
+}
+
+/// A chave de teste da Gemini (montada com `concat!`; nao e real).
+const TRANSLATE_TEST_KEY: &str = concat!("AIza", "SyTESTONLY-translate-app_0123456789");
+
+/// O motor falso da thread: lista um modelo, traduz cada texto para
+/// `pt:<texto>` e guarda as chaves que recebeu.
+struct FakeTranslateEngine {
+    keys: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl TranslateEngine for FakeTranslateEngine {
+    fn models(
+        &mut self,
+        key: &crate::secrets::ApiKey,
+        _cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<neural_core::llm::ModelInfo>, neural_core::llm::ApiError> {
+        self.keys
+            .lock()
+            .expect("keys")
+            .push(key.expose().to_string());
+        Ok(vec![neural_core::llm::ModelInfo {
+            id: neural_core::llm::ModelId::parse("test-model").expect("id"),
+            display_name: "Test".into(),
+            generates_text: true,
+            input_token_limit: None,
+            output_token_limit: None,
+        }])
+    }
+
+    fn batch(
+        &mut self,
+        _model: &neural_core::llm::ModelId,
+        batch: &neural_core::translate::Batch,
+        key: &crate::secrets::ApiKey,
+        _cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<neural_core::translate::ApplyEntry>, neural_core::translate::BatchError> {
+        self.keys
+            .lock()
+            .expect("keys")
+            .push(key.expose().to_string());
+        let translations: Vec<String> = batch
+            .texts
+            .iter()
+            .map(|text| format!("pt:{text}"))
+            .collect();
+        Ok(neural_core::translate::apply_entries(batch, &translations))
+    }
+}
+
+/// Gate (critico, chaves e segredos; translation): a chave Gemini so vive
+/// na thread `neural-translate` -- o motor recebe-a (o teste prova que ela
+/// foi usada), mas nenhum relatorio da thread, nenhum `UserEvent` e nenhuma
+/// chamada do COLLECT/APPLY/RESTORE a leva. Sem chave, a thread diz `NoKey`
+/// e o motor nem e chamado. E o `App::new` nao cria a thread.
+#[test]
+fn the_gemini_key_never_reaches_scripts_or_events() {
+    use crate::secrets::{KeySlot, validate_api_key};
+    let used = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reports = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&reports);
+    let mut worker = TranslateWorker {
+        engine: Box::new(FakeTranslateEngine {
+            keys: std::sync::Arc::clone(&used),
+        }),
+        key: Box::new(|| validate_api_key(&KeySlot::Gemini, TRANSLATE_TEST_KEY)),
+        report: Box::new(move |report| sink.lock().expect("reports").push(report)),
+        models: None,
+    };
+    let plan = translation_plan();
+    worker.run(
+        TranslateJob::Pick {
+            run: 7,
+            pin: neural_core::llm::ModelId::parse("test-model"),
+        },
+        &|| false,
+    );
+    worker.run(
+        TranslateJob::Translate {
+            run: 7,
+            model: neural_core::llm::ModelId::parse("test-model").expect("id"),
+            batches: plan.batches.iter().cloned().enumerate().collect(),
+        },
+        &|| false,
+    );
+    let reports = reports.lock().expect("reports").clone();
+    assert!(matches!(
+        &reports[0],
+        WorkerReport::Picked { run: 7, choice } if choice.model.as_str() == "test-model"
+    ));
+    let entries: Vec<neural_core::translate::ApplyEntry> = reports
+        .iter()
+        .filter_map(|report| match report {
+            WorkerReport::BatchDone { entries, .. } => Some(entries.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].to, "pt:Hello");
+    assert!(matches!(
+        reports.last(),
+        Some(WorkerReport::Finished { run: 7 })
+    ));
+    // O motor recebeu a chave (o gate nao e vazio)...
+    let used = used.lock().expect("keys").clone();
+    assert_eq!(used, vec![TRANSLATE_TEST_KEY.to_string(); 2]);
+    // ... e ela nao esta em nada do que sai da thread nem do que corre na
+    // pagina.
+    let mut outputs: Vec<String> = reports
+        .iter()
+        .map(|report| {
+            format!(
+                "{:?}",
+                UserEvent::Translate(TranslateEvent::Worker(report.clone()))
+            )
+        })
+        .collect();
+    outputs.push(script_call(&TRANSLATE_APPLY_READ, Some(&entries_arg(&entries))).expect("apply"));
+    outputs
+        .push(script_call(&TRANSLATE_RESTORE_READ, Some(&entries_arg(&entries))).expect("restore"));
+    outputs.push(script_call(&TRANSLATE_COLLECT_READ, None).expect("collect"));
+    for text in &outputs {
+        assert!(!text.contains(TRANSLATE_TEST_KEY), "a chave saiu: {text}");
+        assert!(!text.contains("SyTESTONLY"), "parte da chave saiu: {text}");
+    }
+
+    // Sem chave: `NoKey`, e o motor nao e chamado.
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&seen);
+    let mut keyless = TranslateWorker {
+        engine: Box::new(FakeTranslateEngine {
+            keys: std::sync::Arc::clone(&calls),
+        }),
+        key: Box::new(|| None),
+        report: Box::new(move |report| sink.lock().expect("reports").push(report)),
+        models: None,
+    };
+    keyless.run(TranslateJob::Pick { run: 8, pin: None }, &|| false);
+    assert_eq!(
+        seen.lock().expect("reports").clone(),
+        vec![WorkerReport::NoKey { run: 8 }]
+    );
+    assert!(calls.lock().expect("keys").is_empty());
+
+    // A thread so nasce no primeiro clique: o estado do `App::new` nao a
+    // cria, e o `App::new` so constroi o estado.
+    let state = TranslationState::with_sink(Box::new(|_| {}));
+    assert_eq!(state.worker_threads_spawned(), 0);
+    let source = shipped_source();
+    assert!(source.contains("let translation = TranslationState::new(proxy.clone());"));
+    assert!(source.contains("const TRANSLATE_WORKER_NAME: &str = \"neural-translate\";"));
+}
+
+/// Os rotulos: o 文A e o menu dizem «Traduzir página»; o «Traduzir» da
+/// barra de selecao (as tres IAs) continua outro, com o seu titulo.
+#[test]
+fn translate_page_labels_are_not_the_selection_bar_translate() {
+    assert_eq!(TRANSLATE_PAGE_LABEL, "Traduzir página");
+    assert_eq!(ColumnButton::Translate.glyph(), "文A");
+    assert_eq!(ColumnButton::Translate.hit(2), BarHit::ColumnTranslate(2));
+    let item = webview_menu_item(MENU_TRANSLATE_PAGE).expect("item");
+    let flags = MenuFlags {
+        auto_scroll: true,
+        adblock: AdblockMenu::Hidden,
+    };
+    assert_eq!(
+        (item.view)(WebViewHost::Column(0), &flags).map(|view| view.label),
+        Some("Traduzir página".to_string())
+    );
+    assert_eq!(
+        SearchCardButton::Confirm.label(SearchIntent::Translate),
+        "Traduzir"
+    );
+    assert_eq!(
+        search_card_title(SearchIntent::Translate),
+        "Traduzir nas 3 IAs?"
+    );
+    // So as paginas da web se traduzem.
+    for host in WebViewHost::ALL {
+        let web = matches!(
+            host,
+            WebViewHost::Column(_)
+                | WebViewHost::Split(_)
+                | WebViewHost::PrivateSplit(_)
+                | WebViewHost::External
+        );
+        assert_eq!(translatable_host(host), web, "{host:?}");
+        assert_eq!(
+            (item.view)(host, &flags)
+                .and_then(|view| view.action.event())
+                .is_some(),
+            web,
+            "{host:?}"
+        );
+    }
+    assert!(!translatable_host(WebViewHost::Column(COMPARATOR_COLUMNS)));
+    assert_eq!(
+        translation_privacy(WebViewHost::PrivateSplit(1)),
+        crate::egress::EgressPrivacy::PrivateSurface
+    );
+    assert_eq!(translating_message(2, 5), "Traduzindo 2/5…");
+    assert_eq!(partial_message(3, 5), "Traduzido em parte (3 de 5 blocos)");
+}
+
+// ===================== translation -- revisao (T1..T4) =====================
+
+/// Um plano com `batches` blocos (um texto de ~3 000 caracteres cada).
+fn translation_plan_of(batches: u32) -> neural_core::translate::Plan {
+    let texts: Vec<neural_core::translate::PageText> = (0..batches)
+        .map(|index| neural_core::translate::PageText {
+            node: index * 2,
+            text: format!(
+                "Paragraph {index}: {}",
+                "The quick brown fox jumps. ".repeat(110)
+            ),
+        })
+        .collect();
+    let plan = neural_core::translate::plan_batches(&texts);
+    assert_eq!(
+        plan.batches.len(),
+        batches as usize,
+        "o plano de teste mudou"
+    );
+    plan
+}
+
+fn translation_entry(node: u32, from: &str, to: &str) -> neural_core::translate::ApplyEntry {
+    neural_core::translate::ApplyEntry {
+        node,
+        from: from.into(),
+        to: to.into(),
+    }
+}
+
+/// O portao da Traducao de um registo de teste, com o `translate.json`.
+fn translation_test_gate(registry: &StoreRegistry) -> crate::egress::EgressGate {
+    let mut gate = crate::egress::EgressGate::for_app(Some(registry));
+    gate.attach_site_grants(
+        crate::ai_settings::AiPurpose::Translation,
+        registry
+            .grant(crate::stores::TRANSLATE_STORE)
+            .expect("grant"),
+    )
+    .expect("translate.json");
+    gate
+}
+
+fn translation_asked(
+    step: TranslateStep,
+) -> (u64, crate::egress::ConsentCard, Vec<CardChoice>, CardView) {
+    match step {
+        TranslateStep::Ask(CardPrompt::Consent { run, card, choices }, view) => {
+            (run, card, choices, view)
+        }
+        other => panic!("esperava o cartao de consentimento: {other:?}"),
+    }
+}
+
+fn translation_submitted(
+    step: TranslateStep,
+) -> (
+    u64,
+    neural_core::llm::ModelId,
+    Vec<(usize, neural_core::translate::Batch)>,
+) {
+    match step {
+        TranslateStep::Submit(TranslateJob::Translate {
+            run,
+            model,
+            batches,
+        }) => (run, model, batches),
+        other => panic!("esperava o envio dos blocos: {other:?}"),
+    }
+}
+
+/// Gate (critico, confirmacoes; translation -- revisao T1): no caminho que
+/// embarca, os blocos so vao para a thread depois de um `Send` do portao.
+/// O `WorkerReport::Picked`, a resposta ao cartao e o «Tentar de novo»
+/// correm `TranslationState::picked`, `consent_answered` e `retry` (as
+/// funcoes sem janela que o App chama por `translation_gate_step`), e so o
+/// `Send` delas devolve um trabalho `Translate`:
+///
+/// - na primeira vez num site, o modelo escolhido da o cartao e nada e
+///   contado no consumo; «Cancelar» recusa sem aviso e nada vai;
+/// - «Traduzir» manda todos os blocos e conta-os; com esse consentimento da
+///   sessao, o mesmo site noutra vista vai direto;
+/// - uma resposta a um cartao cujo run ja saiu (a pagina navegou) e um
+///   modelo que chega para um run que ja nao o espera nao mandam nem
+///   contam;
+/// - o «Tentar de novo» manda so o bloco que falhou, e so depois do portao
+///   (num portao sem consentimento, o cartao outra vez).
+///
+/// Sabotagem: `picked` com `let decision = Decision::Send;` (o portao nem
+/// e perguntado).
+#[test]
+fn translation_is_sent_only_after_the_gate() {
+    use crate::ai_settings::Day;
+    use crate::egress::ConsentAnswer;
+
+    let dir =
+        std::env::temp_dir().join(format!("neuralia-translation-steps-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let registry = StoreRegistry::mint_for_test(&dir);
+    let today = Day::today();
+    let mut gate = translation_test_gate(&registry);
+    let mut state = TranslationState::with_sink(Box::new(|_| {}));
+    let column = WebViewHost::Column(0);
+
+    // Primeira vez neste site: o cartao, nao um envio.
+    let first = state.picking_for_test(column, "https://exemplo.com/a", translation_plan());
+    let (run, card, choices, view) =
+        translation_asked(state.picked(&mut gate, first, translation_pick(), today));
+    assert_eq!(run, first);
+    assert_eq!(
+        choices,
+        [
+            CardChoice::Translate(ConsentAnswer::Session),
+            CardChoice::AlwaysOnSite,
+            CardChoice::Cancel
+        ]
+    );
+    assert_eq!(view.title, TRANSLATE_CONSENT_TITLE);
+    assert_eq!(gate.usage_this_month(today), 0, "o cartao contou chamadas");
+    assert!(!state.column_translated(0), "a espera do cartao nada vai");
+    assert_eq!(state.toggle(column), TranslateToggle::Cancel);
+    // «Cancelar»: recusado, sem aviso, nada vai.
+    match state.consent_answered(&mut gate, first, card, ConsentAnswer::Cancel, today) {
+        TranslateStep::Refuse { run, message: None } => assert_eq!(run, first),
+        other => panic!("o Cancelar devia recusar sem aviso: {other:?}"),
+    }
+    assert_eq!(gate.usage_this_month(today), 0);
+    state.drop_for_test(first);
+
+    // «Traduzir»: todos os blocos, contados.
+    let second = state.picking_for_test(column, "https://exemplo.com/a", translation_plan());
+    let (_, card, choices, _) =
+        translation_asked(state.picked(&mut gate, second, translation_pick(), today));
+    let CardChoice::Translate(answer) = choices[0] else {
+        panic!("o primeiro botao nao e o Traduzir: {choices:?}");
+    };
+    let (run, model, batches) =
+        translation_submitted(state.consent_answered(&mut gate, second, card, answer, today));
+    let planned = translation_plan().batches.len();
+    assert_eq!(
+        (run, model.as_str(), batches.len()),
+        (second, "test-model", planned)
+    );
+    assert_eq!(gate.usage_this_month(today), planned as u32);
+    assert!(
+        state.column_translated(0),
+        "os blocos vao: a coluna conta como traduzida"
+    );
+
+    // O mesmo site noutra vista, na mesma sessao: direto.
+    let other = WebViewHost::Column(1);
+    let third = state.picking_for_test(other, "https://exemplo.com/b", translation_plan());
+    let (run, _, batches) =
+        translation_submitted(state.picked(&mut gate, third, translation_pick(), today));
+    assert_eq!((run, batches.len()), (third, planned));
+    assert_eq!(gate.usage_this_month(today), 2 * planned as u32);
+
+    // A pagina navegou com o cartao aberto: a resposta nao manda nem conta.
+    let gone = state.picking_for_test(
+        WebViewHost::Column(2),
+        "https://outro.com/",
+        translation_plan(),
+    );
+    let (_, card, _, _) =
+        translation_asked(state.picked(&mut gate, gone, translation_pick(), today));
+    state.drop_for_test(gone);
+    assert!(matches!(
+        state.consent_answered(&mut gate, gone, card, ConsentAnswer::Session, today),
+        TranslateStep::Gone
+    ));
+    assert!(matches!(
+        state.picked(&mut gate, gone, translation_pick(), today),
+        TranslateStep::Gone
+    ));
+    // Um modelo repetido para um run que ja traduz tambem nao manda nada.
+    assert!(matches!(
+        state.picked(&mut gate, third, translation_pick(), today),
+        TranslateStep::Gone
+    ));
+    assert_eq!(gate.usage_this_month(today), 2 * planned as u32);
+
+    // «Tentar de novo»: tres blocos, o do meio falha; so ele volta, e so
+    // depois do portao.
+    let web = WebViewHost::External;
+    let partial = state.picking_for_test(web, "https://exemplo.com/c", translation_plan_of(3));
+    let (_, _, batches) =
+        translation_submitted(state.picked(&mut gate, partial, translation_pick(), today));
+    assert_eq!(batches.len(), 3);
+    let failed_batch = batches[1].1.clone();
+    assert!(state.accept_batch(partial, &[translation_entry(0, "a", "b")]));
+    state.batch_failed(partial, 1, "falhou".into());
+    assert!(state.accept_batch(partial, &[translation_entry(4, "c", "d")]));
+    assert_eq!(
+        state.finish(partial),
+        Some(FinishOutcome::Partial {
+            translated: 2,
+            total: 3,
+            failure: Some("falhou".into())
+        })
+    );
+    // Num portao novo (outra janela: sem o consentimento desta sessao), o
+    // «Tentar de novo» pergunta primeiro.
+    assert!(gate.wait_usage_written());
+    let mut fresh = translation_test_gate(&registry);
+    let before = fresh.usage_this_month(today);
+    let (_, card, _, _) = translation_asked(state.retry(&mut fresh, partial, today));
+    assert_eq!(
+        card.token_estimate(),
+        neural_core::ai_policy::estimate_tokens(failed_batch.chars),
+        "o cartao do Tentar de novo conta so o que falhou"
+    );
+    assert_eq!(fresh.usage_this_month(today), before);
+    let (run, _, retried) = translation_submitted(state.consent_answered(
+        &mut fresh,
+        partial,
+        card,
+        ConsentAnswer::Once,
+        today,
+    ));
+    assert_eq!(run, partial);
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].1, failed_batch);
+    assert_eq!(fresh.usage_this_month(today), before + 1);
+    // Um «Tentar de novo» de um run que ja nao esta traduzido nao manda nada.
+    assert!(matches!(
+        state.retry(&mut fresh, partial, today),
+        TranslateStep::Gone
+    ));
+    assert!(gate.wait_usage_written());
+    assert!(fresh.wait_usage_written());
+
+    // E e isto que o App corre (presenca e ausencia, §4.3): os tres bracos
+    // passam pelas funcoes de cima, e o unico trabalho `Translate` que o
+    // produto constroi e o `Send` do `decided`.
+    let source = shipped_source();
+    for call in [
+        "state.picked(gate, id, choice, today)",
+        "state.consent_answered(gate, run, card, answer, today)",
+        "state.retry(gate, run, today)",
+    ] {
+        assert_eq!(source.matches(call).count(), 1, "{call}");
+    }
+    assert_eq!(
+        source.matches("TranslateJob::Translate {").count(),
+        2,
+        "um trabalho Translate construido fora do `decided`"
+    );
+    assert_eq!(
+        source
+            .matches("TranslateStep::Submit(TranslateJob::Translate {")
+            .count(),
+        1
+    );
+    assert_eq!(source.matches("submit_translate_job(").count(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Gate (critico, modo privado; translation -- revisao T2): o run que o
+/// `start_run` do produto cria para o Split privado leva a privacidade de
+/// uma superficie privada ate ao portao (`run_request`, o pedido que
+/// `picked` e `retry` fazem): o cartao so tem «Traduzir» (so desta vez) e
+/// «Cancelar»; nem uma resposta forcada «Sempre neste site» grava o site no
+/// `translate.json`; e o clique seguinte pergunta outra vez. A fonte ao
+/// lado normal, com o mesmo indice, oferece e grava.
+///
+/// Sabotagem: `start_run` com `privacy: EgressPrivacy::Normal`.
+#[test]
+fn translation_private_split_run_carries_its_privacy_to_the_gate() {
+    use crate::ai_settings::Day;
+    use crate::egress::{ConsentAnswer, EgressPrivacy};
+
+    let dir = std::env::temp_dir().join(format!(
+        "neuralia-translation-private-run-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let registry = StoreRegistry::mint_for_test(&dir);
+    let today = Day::today();
+    let mut gate = translation_test_gate(&registry);
+    let mut state = TranslationState::with_sink(Box::new(|_| {}));
+
+    for index in 0..COMPARATOR_COLUMNS {
+        let host = WebViewHost::PrivateSplit(index);
+        let url = format!("https://privado-{index}.com/x");
+        let id = state.picking_for_test(host, &url, translation_plan());
+        let (_, card, choices, view) =
+            translation_asked(state.picked(&mut gate, id, translation_pick(), today));
+        assert!(
+            !card.offers_always(),
+            "{host:?}: o portao ofereceu «Sempre neste site» num Split privado"
+        );
+        assert_eq!(
+            choices,
+            [
+                CardChoice::Translate(ConsentAnswer::Once),
+                CardChoice::Cancel
+            ],
+            "{host:?}"
+        );
+        assert!(
+            !view
+                .buttons
+                .iter()
+                .any(|(label, _)| *label == "Sempre neste site"),
+            "{host:?}"
+        );
+        assert_eq!(
+            state.run_request(id).map(|request| request.privacy),
+            Some(EgressPrivacy::PrivateSurface),
+            "{host:?}: o pedido do run"
+        );
+        assert_eq!(
+            state.run_privacy_for_test(id),
+            Some(EgressPrivacy::PrivateSurface),
+            "{host:?}"
+        );
+        // Mesmo forcada, a resposta «Sempre» nao chega ao disco.
+        translation_submitted(state.consent_answered(
+            &mut gate,
+            id,
+            card,
+            ConsentAnswer::AlwaysOnSite,
+            today,
+        ));
+        state.drop_for_test(id);
+    }
+    let stored = std::fs::read_to_string(dir.join("translate.json")).unwrap_or_default();
+    assert!(!stored.contains("privado"), "o privado gravou: {stored}");
+
+    // «Traduzir» no Split privado vale so desta vez.
+    let private = WebViewHost::PrivateSplit(1);
+    let once = state.picking_for_test(private, "https://uma-vez.com/", translation_plan());
+    let (_, card, choices, _) =
+        translation_asked(state.picked(&mut gate, once, translation_pick(), today));
+    let CardChoice::Translate(answer) = choices[0] else {
+        panic!("{choices:?}");
+    };
+    translation_submitted(state.consent_answered(&mut gate, once, card, answer, today));
+    state.drop_for_test(once);
+    let again = state.picking_for_test(private, "https://uma-vez.com/y", translation_plan());
+    translation_asked(state.picked(&mut gate, again, translation_pick(), today));
+    state.drop_for_test(again);
+
+    // A fonte ao lado normal: oferece e grava.
+    let split = WebViewHost::Split(1);
+    let normal = state.picking_for_test(split, "https://normal.com/", translation_plan());
+    assert_eq!(
+        state.run_privacy_for_test(normal),
+        Some(EgressPrivacy::Normal)
+    );
+    let (_, card, choices, _) =
+        translation_asked(state.picked(&mut gate, normal, translation_pick(), today));
+    assert!(choices.contains(&CardChoice::AlwaysOnSite), "{choices:?}");
+    translation_submitted(state.consent_answered(
+        &mut gate,
+        normal,
+        card,
+        ConsentAnswer::AlwaysOnSite,
+        today,
+    ));
+    let stored = std::fs::read_to_string(dir.join("translate.json")).expect("translate.json");
+    assert!(stored.contains("https://normal.com"), "{stored}");
+    assert!(gate.wait_usage_written());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Gate (translation -- revisao T3): uma navegacao recusada (um `mailto:`,
+/// um `tel:`, uma accao `neuralia:`, um `javascript:`) nao muda a pagina, e
+/// a traducao dela continua a poder ser devolvida. Pelo navigation handler
+/// que embarca (`hook_webview_builder` com a geracao do hospedeiro do
+/// `TranslationState`, como o `App::hooked_builder`), o run continua na sua
+/// pagina (`on_its_page`, o que o APPLY, o RESTORE e o `PageLoaded`
+/// conferem), a coluna continua traduzida (a resposta dela nao e gravada) e
+/// o 文A devolve o original. Uma navegacao aceite larga a traducao.
+///
+/// Sabotagem: subir a geracao antes do veredicto, tambem nas recusadas.
+#[test]
+fn a_translated_page_survives_a_refused_navigation() {
+    let mut state = TranslationState::with_sink(Box::new(|_| {}));
+    let column = WebViewHost::Column(0);
+    let built = hook_webview_builder(
+        RecordedHookedBuilder::default(),
+        column,
+        None,
+        state.epoch(column),
+        |_| {},
+    );
+    let navigate = built.navigation.as_ref().expect("navigation handler");
+    let id = state.picking_for_test(column, "https://exemplo.com/", translation_plan());
+    let applied = vec![translation_entry(0, "Hello", "Olá")];
+    state.finish_for_test(id, applied.clone());
+    for target in [
+        "mailto:alguem@exemplo.com",
+        "tel:+5511999999999",
+        "neuralia:home",
+        "javascript:void(0)",
+    ] {
+        assert!(
+            !navigate(target.to_string()),
+            "{target}: devia ser recusada"
+        );
+        assert!(
+            state.on_its_page(id).is_some(),
+            "{target}: a navegacao recusada largou a pagina traduzida"
+        );
+        assert!(state.column_translated(0), "{target}");
+        assert_eq!(
+            research_answer_provider(&state, Some("ChatGPT"), 0),
+            None,
+            "{target}"
+        );
+        assert_eq!(state.toggle(column), TranslateToggle::Restore, "{target}");
+    }
+    // Uma aceite: a pagina e outra, nada se devolve la.
+    assert!(navigate("https://outro.exemplo.com/".to_string()));
+    assert!(state.on_its_page(id).is_none());
+    // O RESTORE (com a pagina ainda la) devolve o que se aplicou.
+    let mut state = TranslationState::with_sink(Box::new(|_| {}));
+    let id = state.picking_for_test(column, "https://exemplo.com/", translation_plan());
+    state.finish_for_test(id, applied.clone());
+    assert_eq!(state.begin_restore(id), Some(applied));
+    assert!(state.on_its_page(id).is_some());
+}
+
+/// Gate (translation -- revisao T4): um bloco que acaba depois de o 文A
+/// pedir o original nunca chega a pagina. A thread nao o relata se o
+/// trabalho foi cancelado enquanto ele ia; e um `BatchDone` ou um
+/// `Finished` que ainda assim chegue com o run a devolver o original
+/// (`accept_batch`, `finish`, o que o event loop corre) nao corre o APPLY,
+/// nao entra no que o RESTORE devolve e nao volta o run a traduzido.
+///
+/// Sabotagens: o `accept_batch` sem conferir a fase; a thread sem a
+/// conferencia do cancelamento depois do bloco.
+#[test]
+fn translation_late_batch_never_lands_after_the_restore() {
+    use crate::secrets::{KeySlot, validate_api_key};
+    // A thread: cancelada enquanto o bloco ia -- nem BatchDone nem Finished.
+    let reports = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&reports);
+    let mut worker = TranslateWorker {
+        engine: Box::new(FakeTranslateEngine {
+            keys: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }),
+        key: Box::new(|| validate_api_key(&KeySlot::Gemini, TRANSLATE_TEST_KEY)),
+        report: Box::new(move |report| sink.lock().expect("reports").push(report)),
+        models: None,
+    };
+    let checks = std::cell::Cell::new(0_u32);
+    let cancelled = || {
+        checks.set(checks.get() + 1);
+        checks.get() > 1
+    };
+    worker.run(
+        TranslateJob::Translate {
+            run: 3,
+            model: neural_core::llm::ModelId::parse("test-model").expect("id"),
+            batches: translation_plan()
+                .batches
+                .iter()
+                .cloned()
+                .enumerate()
+                .collect(),
+        },
+        &cancelled,
+    );
+    let reports = reports.lock().expect("reports").clone();
+    assert!(
+        !reports.iter().any(|report| matches!(
+            report,
+            WorkerReport::BatchDone { .. } | WorkerReport::Finished { .. }
+        )),
+        "a thread relatou um bloco cancelado: {reports:?}"
+    );
+
+    // O event loop: o 文A pediu o original com um bloco a caminho.
+    let mut state = TranslationState::with_sink(Box::new(|_| {}));
+    let column = WebViewHost::Column(1);
+    let id = state.run_for_test(column, true);
+    let first = translation_entry(0, "Hello", "Olá");
+    assert!(state.accept_batch(id, std::slice::from_ref(&first)));
+    assert_eq!(state.begin_restore(id), Some(vec![first.clone()]));
+    assert_eq!(state.toggle(column), TranslateToggle::Busy);
+    assert!(
+        !state.accept_batch(id, &[translation_entry(2, "World", "Mundo")]),
+        "o bloco atrasado foi a pagina depois do RESTORE"
+    );
+    assert_eq!(state.applied_for_test(id), vec![first]);
+    assert_eq!(state.finish(id), None);
+    assert_eq!(
+        state.toggle(column),
+        TranslateToggle::Busy,
+        "o Finished voltou a traduzido um run que devolve o original"
+    );
+    // Um run que espera o cartao tambem nao recebe blocos.
+    let waiting = state.run_for_test(WebViewHost::Column(2), false);
+    assert!(!state.accept_batch(waiting, &[translation_entry(0, "a", "b")]));
+    assert!(state.applied_for_test(waiting).is_empty());
+}
+
+/// Gates dos favoritos (bookmarks): o Ctrl+D nativo e a origem dele, o
+/// candidato, a seccao do painel (so ids), a thread que e a unica a
+/// escrever, a estrela e o Apagar historico que os deixa.
+mod bookmarks_gates {
+    use super::*;
+    use crate::stores::BOOKMARKS_STORE;
+    use neural_core::bookmarks::{
+        BookmarkOp, BookmarkStore, BookmarkTree, ChromiumBrowser, Day, ImportReport, OpOutcome,
+        ROOT_ID, import_folder_title,
+    };
+    use neural_core::json_store::{SaveOutcome, StoreMode, StoreRegistry};
+
+    /// Uma pasta temporaria so deste teste, apagada no fim.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "neuralia-bookmarks-app-{tag}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("pasta temporaria");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// As fixtures do nucleo, montadas por partes.
+    fn fixtures() -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("neural-core")
+            .join("tests")
+            .join("fixtures")
+            .join("bookmarks")
+    }
+
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).expect("pasta");
+        for entry in std::fs::read_dir(from).expect("fixtures") {
+            let entry = entry.expect("entrada");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("tipo").is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).expect("copia");
+            }
+        }
+    }
+
+    fn request(target: BookmarkTarget) -> Option<String> {
+        Some(format!(
+            "{:?}",
+            UserEvent::Bookmarks(BookmarksEvent::Request {
+                target,
+                via: BookmarkVia::Shortcut,
+            })
+        ))
+    }
+
+    fn center(rect: UiRect) -> (f64, f64) {
+        (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
+    }
+
+    /// Gate (critico: uma pagina nao sintetiza comandos, e o favorito e da
+    /// pagina certa): o Ctrl+D e um atalho NATIVO. Pelo caminho que
+    /// embarca -- o handler do `AcceleratorKeyPressed` (`accelerator_lookup`
+    /// sobre o mapa do produto) e o braco do event loop
+    /// (`command_key_event`) --, a tecla da coluna 2 pede a pagina da coluna
+    /// 2, a do Split a do Split (privado ou nao), a da Web completa, do
+    /// Leitor e do PDF a pagina unica; a da janela e da omnibox (a Home)
+    /// abre os Favoritos, e a de um painel tambem. O monitor do Gmail e
+    /// uma coluna que nao existe: nada. E nao ha caminho pelo IPC.
+    #[test]
+    fn ctrl_d_runs_against_the_host_it_came_from() {
+        let ctrl_d = Chord::ctrl(b'D');
+        let via_handler = |host: WebViewHost| {
+            chord_command_event(&accelerator_lookup(product_keymap(), host, press(ctrl_d)))
+        };
+        for col in 0..COMPARATOR_COLUMNS {
+            assert_eq!(
+                via_handler(WebViewHost::Column(col)),
+                request(BookmarkTarget::Column(col)),
+                "coluna {col}"
+            );
+            assert_eq!(
+                via_handler(WebViewHost::Split(col)),
+                request(BookmarkTarget::Split {
+                    source: col,
+                    private: false
+                }),
+                "fonte {col}"
+            );
+            assert_eq!(
+                via_handler(WebViewHost::PrivateSplit(col)),
+                request(BookmarkTarget::Split {
+                    source: col,
+                    private: true
+                }),
+                "fonte privada {col}"
+            );
+        }
+        // A coluna 2 e a coluna 2, e o Split nao e a coluna dele.
+        assert_ne!(
+            via_handler(WebViewHost::Column(2)),
+            via_handler(WebViewHost::Column(0))
+        );
+        assert_ne!(
+            via_handler(WebViewHost::Split(1)),
+            via_handler(WebViewHost::Column(1))
+        );
+        for host in [WebViewHost::External, WebViewHost::Reader, WebViewHost::Pdf] {
+            assert_eq!(via_handler(host), request(BookmarkTarget::Page), "{host:?}");
+        }
+        for host in [
+            WebViewHost::Epub,
+            WebViewHost::Live,
+            WebViewHost::SidePanel,
+            WebViewHost::Service(Service::YouTube),
+        ] {
+            assert_eq!(
+                via_handler(host),
+                request(BookmarkTarget::Panel),
+                "{host:?}"
+            );
+        }
+        assert_eq!(via_handler(WebViewHost::GmailMonitor), None);
+        for origin in [CommandOrigin::Window, CommandOrigin::Omnibox] {
+            assert_eq!(
+                chord_command_event(&keymap_decision(press(ctrl_d), origin)),
+                request(BookmarkTarget::Window),
+                "{origin:?}"
+            );
+        }
+        for host in [
+            WebViewHost::Column(COMPARATOR_COLUMNS),
+            WebViewHost::Split(COMPARATOR_COLUMNS),
+            WebViewHost::PrivateSplit(COMPARATOR_COLUMNS),
+        ] {
+            assert_eq!(bookmark_target(CommandOrigin::Host(host)), None, "{host:?}");
+        }
+        // Nativo, nunca IPC (asserção de ausencia): o canal das paginas nao
+        // tem accao de favoritos, e o mapa de teclas injetado nao os nomeia.
+        let ipc = include_str!("../ipc.rs").to_ascii_lowercase();
+        assert!(!ipc.contains("bookmark") && !ipc.contains("favorit"));
+        assert!(
+            !NEURALIA_KEYMAP_SCRIPT
+                .to_ascii_lowercase()
+                .contains("bookmark")
+        );
+    }
+
+    /// Gate (critico: navegacao e origens locais): so uma pagina da web e um
+    /// favorito. `about:blank`, `data:`, o `neuralia-pdf` (tambem como o
+    /// WebView2 o mostra, `http://neuralia-pdf.localhost`) e as outras
+    /// origens proprias nao; o titulo e o `DocumentTitle` limpo e cortado.
+    #[test]
+    fn a_bookmark_is_a_web_page_read_natively() {
+        for good in [
+            "https://example.com/a",
+            "http://pt.wikipedia.org/wiki/Brasil",
+            "https://chatgpt.com/c/abc",
+        ] {
+            assert!(bookmark_candidate(good).is_some(), "{good}");
+        }
+        let epub = format!("http://{}.localhost/library", crate::epub_app::EPUB_SCHEME);
+        let live = format!("https://{}.localhost/", crate::gemini_live::LIVE_PROTOCOL);
+        for bad in [
+            "about:blank",
+            "about:blank#x",
+            "data:text/html,<p>x</p>",
+            "neuralia-pdf://viewer/viewer.html",
+            "http://neuralia-pdf.localhost/viewer.html",
+            epub.as_str(),
+            live.as_str(),
+            "javascript:alert(1)",
+            "file:///C:/Users/pessoa/a.pdf",
+            "neuralia:home",
+            "",
+        ] {
+            assert!(bookmark_candidate(bad).is_none(), "{bad}");
+        }
+        let url = Url::parse("https://www.example.com/").expect("url");
+        assert_eq!(
+            bookmark_title("  Título\u{0}com\ncontrolo ", &url),
+            "Título com controlo"
+        );
+        assert_eq!(bookmark_title(" \u{7} ", &url), "www.example.com");
+        assert_eq!(bookmark_title(&"x".repeat(1000), &url).chars().count(), 300);
+        assert_eq!(
+            bookmark_added_notice("Exemplo", false),
+            "Adicionado aos favoritos: Exemplo"
+        );
+        assert_eq!(
+            bookmark_added_notice("Exemplo", true),
+            "Adicionado aos favoritos: Exemplo\nModo privado: favorito guardado porque você pediu."
+        );
+    }
+
+    /// Gate (critico: mensagens de uma pagina): a seccao Favoritos pede com
+    /// ids, nunca com enderecos nem caminhos. O parser recusa um endereco,
+    /// um caminho, um id que nao e um inteiro acima da raiz e qualquer
+    /// chave a mais; e a pagina que embarca, clicando em tudo, so manda
+    /// ids e `{}` -- os titulos chegam-lhe como texto.
+    #[test]
+    fn bookmark_panel_messages_carry_ids_only() {
+        use BookmarkPanelRequest::{Export, ImportChrome, ImportFile, List, Open, Remove};
+        let parse = |body: serde_json::Value| parse_panel_message(&body.to_string());
+        for (action, args, request) in [
+            ("bookmarks-list", serde_json::json!({}), List),
+            ("bookmark-open", serde_json::json!({"id": 7}), Open(7)),
+            ("bookmark-remove", serde_json::json!({"id": 8}), Remove(8)),
+            (
+                "bookmarks-import-chrome",
+                serde_json::json!({}),
+                ImportChrome,
+            ),
+            ("bookmarks-import-file", serde_json::json!({}), ImportFile),
+            ("bookmarks-export", serde_json::json!({}), Export),
+        ] {
+            assert_eq!(
+                parse(serde_json::json!({"action": action, "args": args})),
+                Some(PanelMessage::Bookmarks(request)),
+                "{action}"
+            );
+        }
+        for args in [
+            serde_json::json!({"id": 7, "url": "https://example.com/"}),
+            serde_json::json!({"url": "https://example.com/"}),
+            serde_json::json!({"id": "https://example.com/"}),
+            serde_json::json!({"id": "7"}),
+            serde_json::json!({"id": 7.5}),
+            serde_json::json!({"id": -3}),
+            serde_json::json!({"id": 0}),
+            serde_json::json!({"id": ROOT_ID}),
+            serde_json::json!({"id": (1u64 << 53) + 1}),
+            serde_json::json!({"path": "C:\\Users\\pessoa\\favoritos.html"}),
+            serde_json::json!({"id": null}),
+            serde_json::json!({}),
+        ] {
+            for action in ["bookmark-open", "bookmark-remove"] {
+                assert_eq!(
+                    parse(serde_json::json!({"action": action, "args": args})),
+                    None,
+                    "{action} {args}"
+                );
+            }
+        }
+        for action in [
+            "bookmarks-list",
+            "bookmarks-import-chrome",
+            "bookmarks-import-file",
+            "bookmarks-export",
+        ] {
+            for args in [
+                serde_json::json!({"path": "C:\\Users\\pessoa\\Bookmarks"}),
+                serde_json::json!({"url": "https://x.example/"}),
+            ] {
+                assert_eq!(
+                    parse(serde_json::json!({"action": action, "args": args})),
+                    None,
+                    "{action} {args}"
+                );
+            }
+        }
+        for body in [
+            serde_json::json!({"action": "bookmark-add", "args": {"url": "https://x.example/"}}),
+            serde_json::json!({"action": "bookmarks-import", "args": {}}),
+            serde_json::json!({"action": "bookmark-move", "args": {"id": 7, "parent": 1}}),
+        ] {
+            assert_eq!(parse(body.clone()), None, "{body}");
+        }
+
+        // O botao nomeia os dois navegadores que o pedido le: numa conta so
+        // com o Edge, um clique importa o perfil do Edge sem menu.
+        assert!(
+            PANEL_HTML.contains(
+                "<button id=\"bookmarks-import-chrome\" class=\"btn\">Importar do Chrome/Edge</button>"
+            ),
+            "o botao de importar tem de nomear o Chrome e o Edge"
+        );
+
+        // A pagina que embarca.
+        let result = notes_gates::run_panel(&[
+            "__posted.length = 0; window.neuraliaShowSection('bookmarks');".into(),
+            r#"window.__neuraliaBookmarks.receive({ notice: 'pronto', items: [
+                { id: 2, depth: 1, kind: 'folder', title: 'Pasta', detail: '' },
+                { id: 3, depth: 2, kind: 'link', title: '</A><script>window.__pwned = 1</script>', detail: 'https://example.com/a' },
+                { id: '9', depth: 1, kind: 'link', title: 'id em texto', detail: 'https://x.example/' },
+                { id: 4, depth: 1, kind: 'link', title: 'Outro', detail: 'https://b.example/' }
+            ] });"#
+                .into(),
+            "const rows = $('bookmarks-list').children; __out.rows = rows.length; \
+             __out.texts = rows.map((row) => row.textContent); \
+             __click(rows[1].children[0]); __click(rows[2].children[1]); \
+             __click($('bookmarks-import-chrome')); __click($('bookmarks-import-file')); \
+             __click($('bookmarks-export')); __out.notice = $('bookmarks-msg').textContent;"
+                .into(),
+            "__type($('bq'), 'outro'); __out.filtered = $('bookmarks-list').children.length;"
+                .into(),
+        ]);
+        assert_eq!(result["out"]["rows"], 3, "o id em texto fica de fora");
+        assert_eq!(result["out"]["filtered"], 1);
+        assert_eq!(result["out"]["notice"], "pronto");
+        assert!(
+            result["out"]["texts"][1]
+                .as_str()
+                .is_some_and(|text| text.contains("</A><script>")),
+            "o titulo e texto: {}",
+            result["out"]["texts"]
+        );
+        assert_eq!(result["html"], serde_json::json!([]));
+        assert_eq!(result["pwned"], serde_json::Value::Null);
+        let sent = notes_gates::posted(&result);
+        let parsed: Vec<Option<PanelMessage>> =
+            sent.iter().map(|body| parse_panel_message(body)).collect();
+        assert_eq!(
+            parsed,
+            [
+                Some(PanelMessage::Bookmarks(List)),
+                Some(PanelMessage::Bookmarks(Open(3))),
+                Some(PanelMessage::Bookmarks(Remove(4))),
+                Some(PanelMessage::Bookmarks(ImportChrome)),
+                Some(PanelMessage::Bookmarks(ImportFile)),
+                Some(PanelMessage::Bookmarks(Export)),
+            ],
+            "{sent:?}"
+        );
+        for body in &sent {
+            let value: serde_json::Value = serde_json::from_str(body).expect("json");
+            let args = value["args"].as_object().expect("args");
+            assert!(
+                args.keys().all(|key| key == "id") && args.values().all(|v| v.is_u64()),
+                "{body}"
+            );
+            assert!(!body.contains("http") && !body.contains(":\\"), "{body}");
+        }
+    }
+
+    /// Gate (critico: dados do utilizador): o que a thread
+    /// `neural-bookmarks` faz, tarefa a tarefa, sobre uma pasta de teste --
+    /// o mesmo `run_bookmark_job` que a thread corre. Ler, acrescentar (o
+    /// repetido e o mesmo), importar o HTML e os perfis do Chrome de um
+    /// `%LOCALAPPDATA%` de teste (so as fixtures, nunca o perfil do dono),
+    /// exportar -- e tudo fica no `bookmarks.json`.
+    #[test]
+    fn the_bookmarks_thread_jobs_do_what_they_say() {
+        let dir = TempDir::new("jobs");
+        let registry = StoreRegistry::mint_for_test(dir.0.join("data"));
+        let open =
+            || BookmarkStore::open(registry.grant(BOOKMARKS_STORE).expect("grant")).expect("loja");
+        let mut store = open();
+        match run_bookmark_job(&mut store, BookmarkJob::Load) {
+            BookmarkReply::Loaded { tree, notice: None } => assert!(tree.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        let add = |url: &str| BookmarkJob::Apply {
+            op: BookmarkOp::AddLink {
+                parent: ROOT_ID,
+                title: "Exemplo".into(),
+                url: url.into(),
+                added_ms: 1,
+            },
+            why: BookmarkWhy::Add {
+                title: "Exemplo".into(),
+                private: true,
+            },
+        };
+        match run_bookmark_job(&mut store, add("https://www.example.com/?utm_source=x")) {
+            BookmarkReply::Applied {
+                outcome: OpOutcome::Added(_),
+                why: BookmarkWhy::Add { private: true, .. },
+                ..
+            } => {}
+            other => panic!("{other:?}"),
+        }
+        match run_bookmark_job(&mut store, add("https://example.com")) {
+            BookmarkReply::Applied {
+                outcome: OpOutcome::Existing(_),
+                ..
+            } => {}
+            other => panic!("{other:?}"),
+        }
+        match run_bookmark_job(
+            &mut store,
+            BookmarkJob::ImportHtml {
+                path: fixtures().join("chrome-export.html"),
+                folder_title: "Importado do arquivo HTML (23/09/2026)".into(),
+                now_ms: 2,
+            },
+        ) {
+            BookmarkReply::Imported { report, .. } => assert_eq!(
+                report,
+                ImportReport {
+                    imported: 4,
+                    existing: 0,
+                    ignored: 2
+                }
+            ),
+            other => panic!("{other:?}"),
+        }
+        let local = dir.0.join("local");
+        copy_dir(
+            &fixtures().join("chrome-user-data"),
+            &ChromiumBrowser::Chrome.user_data_dir(&local),
+        );
+        let choices = match run_bookmark_job(
+            &mut store,
+            BookmarkJob::Profiles {
+                local_app_data: local.clone(),
+            },
+        ) {
+            BookmarkReply::Profiles(choices) => choices,
+            other => panic!("{other:?}"),
+        };
+        let labels: Vec<String> = choices.iter().map(ProfileChoice::label).collect();
+        assert_eq!(labels, ["Chrome · Trabalho", "Chrome · Pessoa 1"]);
+        let day = Day {
+            year: 2026,
+            month: 9,
+            day: 23,
+        };
+        for (choice, expected) in [
+            (
+                &choices[1],
+                ImportReport {
+                    imported: 0,
+                    existing: 5,
+                    ignored: 2,
+                },
+            ),
+            (
+                &choices[0],
+                ImportReport {
+                    imported: 1,
+                    existing: 0,
+                    ignored: 0,
+                },
+            ),
+        ] {
+            match run_bookmark_job(
+                &mut store,
+                BookmarkJob::ImportChromium {
+                    choice: choice.clone(),
+                    folder_title: import_folder_title("Chrome", day),
+                    now_ms: 3,
+                },
+            ) {
+                BookmarkReply::Imported { report, .. } => {
+                    assert_eq!(report, expected, "{}", choice.label())
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let out = dir.0.join("favoritos-neuralia-2026-09-23.html");
+        match run_bookmark_job(&mut store, BookmarkJob::Export { path: out.clone() }) {
+            BookmarkReply::Exported { links } => assert_eq!(links, 6),
+            other => panic!("{other:?}"),
+        }
+        let html = std::fs::read_to_string(&out).expect("exportado");
+        assert!(html.starts_with("<!DOCTYPE NETSCAPE-Bookmark-file-1>\n"));
+        assert_eq!(html.matches("<DT><A ").count(), 6);
+        assert!(matches!(
+            run_bookmark_job(
+                &mut store,
+                BookmarkJob::Export {
+                    path: dir.0.join("nao-existe").join("x.html"),
+                },
+            ),
+            BookmarkReply::Failed(_)
+        ));
+        // Tudo esta no disco: outra loja (outra janela) le a mesma arvore.
+        let mut again = open();
+        again.load();
+        assert_eq!(again.tree(), store.tree());
+    }
+
+    /// So a thread `neural-bookmarks` abre o `bookmarks.json`, e ela nasce
+    /// no primeiro uso -- nunca no `App::new` (asserção de ausencia: a Home
+    /// continua sem esta thread).
+    #[test]
+    fn only_the_bookmarks_thread_opens_the_store_and_it_is_born_on_first_use() {
+        let code = without_comment_lines(&shipped_source());
+        assert_eq!(code.matches("BookmarkStore::open(").count(), 1);
+        let worker = code
+            .split("fn spawn_bookmarks_worker(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("spawn_bookmarks_worker");
+        assert!(worker.contains("BookmarkStore::open(grant)"));
+        assert!(worker.contains(".name(\"neural-bookmarks\".into())"));
+        assert_eq!(code.matches(".grant(BOOKMARKS_STORE)").count(), 1);
+        assert_eq!(code.matches("spawn_bookmarks_worker(").count(), 2);
+        let new = code
+            .split(
+                "fn new(proxy: EventLoopProxy<UserEvent>) -> Self {\n        let config = CoreConfig::default();",
+            )
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n}\n").next())
+            .expect("App::new");
+        assert!(new.contains("bookmarks: BookmarksState::default(),"));
+        for forbidden in ["bookmarks_worker", "BOOKMARKS_STORE", "BookmarkJob"] {
+            assert!(!new.contains(forbidden), "App::new: {forbidden}");
+        }
+    }
+
+    /// Gate (critico: apaga dados do utilizador): o Ctrl+Shift+Delete deixa
+    /// o `bookmarks.json`. Nenhum alvo registado e dos favoritos; o modulo
+    /// do Apagar historico nao os nomeia; nada que embarca apaga um ficheiro
+    /// dos favoritos; e a loja e `Explicit` -- com o registo em modo
+    /// privado ela continua a gravar (o favorito foi pedido).
+    #[test]
+    fn clear_history_keeps_bookmarks_json() {
+        for target in CLEAR_HISTORY_TARGETS {
+            assert!(
+                !format!("{target:?}")
+                    .to_ascii_lowercase()
+                    .contains("bookmark"),
+                "{target:?}"
+            );
+        }
+        let module = ALL_MODULES
+            .iter()
+            .find(|(name, _)| *name == "clear_history.rs")
+            .map(|(_, content)| content.replace("\r\n", "\n"))
+            .expect("clear_history.rs em ALL_MODULES");
+        let code = without_comment_lines(&module).to_ascii_lowercase();
+        for forbidden in ["bookmark", "favorit"] {
+            assert!(
+                !code.contains(forbidden),
+                "o Apagar historico nomeia {forbidden}"
+            );
+        }
+        let shipped = without_comment_lines(&shipped_source());
+        for line in shipped.lines().filter(|line| {
+            line.contains("remove_file") || line.contains("remove_dir") || line.contains(".forget(")
+        }) {
+            assert!(
+                !line.to_ascii_lowercase().contains("bookmark"),
+                "apaga os favoritos: {line}"
+            );
+        }
+        assert!(shipped.contains("Os favoritos ficam."));
+
+        let dir = TempDir::new("private");
+        let registry = StoreRegistry::mint_for_test(&dir.0);
+        registry.set_mode(StoreMode::Private);
+        let mut store =
+            BookmarkStore::open(registry.grant(BOOKMARKS_STORE).expect("grant")).expect("loja");
+        let applied = store
+            .apply(BookmarkOp::AddLink {
+                parent: ROOT_ID,
+                title: "Pedido no privado".into(),
+                url: "https://example.com/".into(),
+                added_ms: 1,
+            })
+            .expect("grava");
+        assert_eq!(applied.saved, SaveOutcome::Written);
+        assert!(dir.0.join("bookmarks.json").is_file());
+    }
+
+    #[test]
+    fn the_full_star_offers_remove_move_and_open() {
+        let mut tree = BookmarkTree::default();
+        let add = |tree: &mut BookmarkTree, op| match tree.apply(op) {
+            Ok(OpOutcome::Added(id)) => id,
+            other => panic!("{other:?}"),
+        };
+        let work = add(
+            &mut tree,
+            BookmarkOp::AddFolder {
+                parent: ROOT_ID,
+                title: "Trabalho".into(),
+                added_ms: 1,
+            },
+        );
+        let docs = add(
+            &mut tree,
+            BookmarkOp::AddFolder {
+                parent: work,
+                title: "Docs".into(),
+                added_ms: 1,
+            },
+        );
+        let page = add(
+            &mut tree,
+            BookmarkOp::AddLink {
+                parent: work,
+                title: "Pagina".into(),
+                url: "https://example.com/".into(),
+                added_ms: 1,
+            },
+        );
+        let (menu, folders) = star_menu(&tree, page);
+        assert_eq!(folders, vec![ROOT_ID, work, docs]);
+        let label = |entry: &MenuEntry| match entry {
+            MenuEntry::Command(command) => command.label.clone(),
+            MenuEntry::Submenu { label, .. } => format!("{label} ▸"),
+            MenuEntry::Separator => "---".into(),
+        };
+        let top: Vec<String> = menu.entries.iter().map(label).collect();
+        assert_eq!(
+            top,
+            [
+                "Remover dos favoritos",
+                "Mover para ▸",
+                "---",
+                "Abrir Favoritos"
+            ]
+        );
+        let MenuEntry::Submenu { entries, .. } = &menu.entries[1] else {
+            panic!("sem o submenu");
+        };
+        let moves: Vec<(String, bool, bool)> = entries
+            .iter()
+            .map(|entry| match entry {
+                MenuEntry::Command(command) => (
+                    command.label.clone(),
+                    command.checked,
+                    command.disabled.is_some(),
+                ),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            moves,
+            [
+                ("Favoritos".to_string(), false, false),
+                ("   Trabalho".to_string(), true, true),
+                ("      Docs".to_string(), false, false),
+            ]
+        );
+        assert_eq!(
+            star_menu_choice(STAR_MENU_REMOVE, &folders),
+            Some(StarChoice::Remove)
+        );
+        assert_eq!(
+            star_menu_choice(STAR_MENU_OPEN, &folders),
+            Some(StarChoice::OpenPanel)
+        );
+        assert_eq!(
+            star_menu_choice(STAR_MENU_MOVE_BASE + 2, &folders),
+            Some(StarChoice::MoveTo(docs))
+        );
+        for nothing in [0, 3, STAR_MENU_MOVE_BASE + 3, STAR_MENU_MOVE_BASE - 1] {
+            assert_eq!(star_menu_choice(nothing, &folders), None, "{nothing}");
+        }
+        assert!(
+            menu.command(STAR_MENU_OPEN)
+                .is_some_and(|open| open.moves_focus)
+        );
+        assert_eq!(bookmark_star_glyph(false), "☆");
+        assert_eq!(bookmark_star_glyph(true), "★");
+    }
+
+    /// A estrela de cada coluna vem depois do › e do 文A (‹ › 文A ☆: e a
+    /// ultima de `ColumnButton::ALL`, por isso a primeira a ceder) e a da
+    /// fonte ao lado entre o › dela e o rotulo; o clique no centro de cada
+    /// uma volta a ela, e a dica diz o que o clique faz.
+    #[test]
+    fn the_stars_sit_after_forward_and_hit_back() {
+        assert_eq!(ColumnButton::ALL.last(), Some(&ColumnButton::Bookmark));
+        let layout = BarLayout::with_contexts(1440.0, 1.0, true, BarColumns::even(3), [0, 0, 0]);
+        for index in 0..3 {
+            let star = layout.column_button(index, ColumnButton::Bookmark);
+            let translate = layout.column_button(index, ColumnButton::Translate);
+            let forward = layout.column_button(index, ColumnButton::Forward);
+            assert!(
+                translate.width > 0.0 && translate.x >= forward.x + forward.width,
+                "{index}"
+            );
+            assert!(
+                star.width > 0.0 && star.x >= translate.x + translate.width,
+                "{index}"
+            );
+            let (cx, cy) = center(star);
+            assert_eq!(layout.hit(cx, cy), Some(BarHit::ColumnBookmark(index)));
+        }
+        let mut existed = 0usize;
+        let mut vanished = 0usize;
+        for scale in [1.0, 1.5, 2.0] {
+            for width in (720..=2560).step_by(40) {
+                let controls = right_controls(width as f64, scale, true, None);
+                let (back, forward) = controls.split_nav.expect("‹ ›");
+                // Cabe inteira ou nao existe -- e sem ela nada a encontra.
+                let Some(star) = controls.split_bookmark else {
+                    vanished += 1;
+                    let (label, _, _) = controls.split.expect("gaveta");
+                    assert!(forward.x + forward.width <= label.x);
+                    for x in (0..width).step_by(4) {
+                        assert_ne!(
+                            right_controls_hit(
+                                controls,
+                                x as f64,
+                                forward.y + forward.height / 2.0
+                            ),
+                            Some(BarHit::SplitBookmark)
+                        );
+                    }
+                    continue;
+                };
+                existed += 1;
+                let (label, _, _) = controls.split.expect("gaveta");
+                let at = format!("{width}px x{scale}");
+                assert!(back.x + back.width <= forward.x, "{at}");
+                assert!(forward.x + forward.width <= star.x, "{at}");
+                assert!(star.x + star.width <= label.x, "{at}");
+                assert!(
+                    controls.private.x + controls.private.width <= back.x,
+                    "{at}"
+                );
+                let (cx, cy) = center(star);
+                assert_eq!(
+                    right_controls_hit(controls, cx, cy),
+                    Some(BarHit::SplitBookmark),
+                    "{at}"
+                );
+                assert_eq!(
+                    bar_hit_at(Some(controls), None, cx, cy),
+                    Some(BarHit::SplitBookmark),
+                    "{at}"
+                );
+            }
+        }
+        assert!(existed > 0 && vanished > 0, "{existed} com, {vanished} sem");
+        assert!(
+            right_controls(1440.0, 1.0, true, None)
+                .split_bookmark
+                .is_some()
+        );
+        assert!(
+            right_controls(1440.0, 1.0, false, None)
+                .split_bookmark
+                .is_none()
+        );
+        let state = BarState {
+            bookmarked: [false, true, false],
+            split_bookmarked: true,
+            ..BarState::default()
+        };
+        let tip = |hit| bar_tooltip_label(hit, &state, "ChatGPT", None, None);
+        assert_eq!(
+            tip(BarHit::ColumnBookmark(0)).as_deref(),
+            Some("Adicionar aos favoritos (Ctrl+D)")
+        );
+        for hit in [BarHit::ColumnBookmark(1), BarHit::SplitBookmark] {
+            assert_eq!(
+                tip(hit).as_deref(),
+                Some("Nos favoritos · clique: remover, mover ou abrir Favoritos"),
+                "{hit:?}"
+            );
+        }
     }
 }

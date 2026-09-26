@@ -10,8 +10,8 @@ use wry::{NewWindowResponse, PermissionResponse, WebViewBuilder};
 
 use crate::epub_app::{
     EpubJob, EpubNotice, EpubResponse, EpubRuntime, EpubUiRequest, ServeJob, dispatch_epub_request,
-    epub_dialog_filter, epub_drop_job, epub_navigation_allowed, epub_request_target,
-    handle_epub_ipc, is_epub_path, library_url, notice_script, parse_dialog_selection, reader_url,
+    epub_dialog_filter, epub_drop_job, epub_request_target, handle_epub_ipc, is_epub_path,
+    library_url, notice_script, parse_dialog_selection, reader_url,
 };
 use neural_core::{
     HistoryEntry, MemoryDocument, MemoryKind, MemorySourceKind, ReaderArticle, ReaderBlock,
@@ -22,10 +22,10 @@ use crate::windows_app::{
     AGENT_OBSERVER_SCRIPT, App, COMPARATOR_COLUMNS, DocumentJob, EPUB_SCHEME,
     EXTERNAL_RETURN_BUTTON, HistoryKind, IpcAction, NEURALIA_KEYMAP_SCRIPT, PDF_ORIGIN,
     PDF_VIEWER_CSP, PDF_VIEWER_HTML, PDF_VIEWER_JS, PDFJS_CORE, PDFJS_WORKER, PanelExit,
-    READ_ALOUD_SCRIPT, ReaderJob, SPLIT_SCROLL_RAIL_SCRIPT, Surface, UserEvent, bind_page_script,
-    common_ipc_event, is_view_source_target, local_origin_of, neuralia_action,
-    parse_agent_observation, parse_ipc_message, remote_capability, remote_web_target,
-    themed_webview_builder, web_media_permission, wide_null, window_hwnd,
+    READ_ALOUD_SCRIPT, ReaderJob, SPLIT_SCROLL_RAIL_SCRIPT, Surface, UserEvent, WebViewHost,
+    bind_page_script, common_ipc_event, local_origin_of, parse_agent_observation,
+    parse_ipc_message, remote_capability, remote_web_target, themed_webview_builder,
+    web_media_permission, wide_null, window_hwnd,
 };
 
 impl App {
@@ -51,7 +51,6 @@ impl App {
 
     pub(in crate::windows_app) fn pdf_webview_builder(&self) -> WebViewBuilder<'static> {
         let ipc_proxy = self.proxy.clone();
-        let navigation_proxy = self.proxy.clone();
         let bytes = Arc::clone(&self.pdf_bytes);
         let capability = remote_capability();
         let ipc_capability = capability.clone();
@@ -70,21 +69,8 @@ impl App {
                     let _ = ipc_proxy.send_event(event);
                 }
             })
-            .with_navigation_handler(move |target| {
-                if target
-                    .get(..9)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
-                {
-                    return false;
-                }
-                if is_pdf_internal_target(&target) {
-                    return true;
-                }
-                if remote_web_target(&target, None) {
-                    let _ = navigation_proxy.send_event(UserEvent::OpenExternal(target));
-                }
-                false
-            })
+            // A trava de navegacao (NavGate::Pdf: a propria origem; um link
+            // da internet sai para a Web completa) vem de `hooked_builder`.
             .with_permission_handler(|_| PermissionResponse::Deny)
             .with_focused(true)
     }
@@ -97,17 +83,20 @@ impl App {
             *slot = bytes;
         }
 
-        let result = if let Some(window) = &self.window {
-            self.pdf_webview_builder()
-                .with_url(format!("{PDF_ORIGIN}/viewer.html"))
-                .build(window)
-        } else {
+        let Some(window) = &self.window else {
             return;
         };
+        let builder = self
+            .pdf_webview_builder()
+            .with_url(format!("{PDF_ORIGIN}/viewer.html"));
+        let hooked = self.hooked_builder(builder, WebViewHost::Pdf, None);
+        let result = hooked.build_hooked(window);
 
         match result {
             Ok(webview) => {
                 let _ = webview.zoom(self.zoom);
+                #[cfg(feature = "accel-spike")]
+                self.accel_spike_hook(&webview, crate::accel_spike::SpikeHost::Pdf);
                 self.webview = Some(webview);
                 self.surface = Surface::Pdf;
                 self.page_source = Some(url.to_string());
@@ -237,17 +226,18 @@ impl App {
         self.destroy_web_surfaces();
         self.show_omnibox(false);
         self.status = None;
-        let result = match (&self.window, &self.epub) {
-            (Some(window), Some(runtime)) => self
-                .epub_webview_builder(runtime)
-                .with_url(url)
-                .build(window),
-            _ => return,
+        let (Some(window), Some(runtime)) = (&self.window, &self.epub) else {
+            return;
         };
+        let builder = self.epub_webview_builder(runtime).with_url(url);
+        let hooked = self.hooked_builder(builder, WebViewHost::Epub, None);
+        let result = hooked.build_hooked(window);
         match result {
             Ok(webview) => {
                 let _ = webview.zoom(self.zoom);
                 let _ = webview.focus();
+                #[cfg(feature = "accel-spike")]
+                self.accel_spike_hook(&webview, crate::accel_spike::SpikeHost::Epub);
                 self.webview = Some(webview);
                 self.surface = Surface::Epub;
             }
@@ -259,8 +249,10 @@ impl App {
 
     /// O WebView da biblioteca e do leitor: a origem `neuralia-epub` servida
     /// fora da thread da interface, o IPC fechado das páginas EPUB (nunca o
-    /// `ipc.rs` nem a capability das páginas remotas), navegação de topo só
-    /// para as duas páginas, sem popups, downloads nem permissões.
+    /// `ipc.rs` nem a capability das páginas remotas), sem popups nem
+    /// permissões. A navegação de topo só para as duas páginas
+    /// (NavGate::Epub) e a recusa de downloads vêm de `hooked_builder`, da
+    /// tabela dos ganchos.
     pub(in crate::windows_app) fn epub_webview_builder(
         &self,
         runtime: &EpubRuntime,
@@ -288,9 +280,7 @@ impl App {
                     let _ = ipc_proxy.send_event(UserEvent::EpubUi(ui));
                 }
             })
-            .with_navigation_handler(|target| epub_navigation_allowed(&target))
             .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
-            .with_download_started_handler(|_, _| false)
             .with_drag_drop_handler(move |event| {
                 if let wry::DragDropEvent::Drop { paths, .. } = event {
                     let _ = drop_proxy.send_event(UserEvent::EpubDropped(paths));
@@ -338,7 +328,9 @@ impl App {
         match request {
             EpubUiRequest::AddBooks => self.open_epub_dialog(false),
             EpubUiRequest::OpenExternal(url) => self.web(url),
-            EpubUiRequest::Close => self.show_home(),
+            EpubUiRequest::Close => {
+                self.request_home();
+            }
         }
     }
 
@@ -368,7 +360,6 @@ impl App {
     }
 
     pub(in crate::windows_app) fn reader_webview_builder(&self) -> WebViewBuilder<'static> {
-        let navigation_proxy = self.proxy.clone();
         let ipc_proxy = self.proxy.clone();
         let capability = remote_capability();
         let ipc_capability = capability.clone();
@@ -384,41 +375,8 @@ impl App {
                     let _ = ipc_proxy.send_event(event);
                 }
             })
-            .with_navigation_handler(move |target| {
-                if target.starts_with("about:blank") {
-                    return true;
-                }
-
-                let Ok(action_url) = Url::parse(&target) else {
-                    return false;
-                };
-                if action_url.scheme() != "neuralia" {
-                    return false;
-                }
-
-                if let Some(event) = neuralia_action(&target) {
-                    let _ = navigation_proxy.send_event(event);
-                    return false;
-                }
-
-                match action_url.path().trim_matches('/') {
-                    "home" => {
-                        let _ = navigation_proxy.send_event(UserEvent::HomeRequested);
-                    }
-                    "web" => {
-                        if let Some((_, value)) =
-                            action_url.query_pairs().find(|(key, _)| key == "url")
-                            && neural_core::validate_web_url(value.as_ref()).is_ok()
-                        {
-                            let _ = navigation_proxy
-                                .send_event(UserEvent::OpenExternal(value.into_owned()));
-                        }
-                    }
-                    _ => {}
-                }
-
-                false
-            })
+            // A trava de navegacao (NavGate::Reader: `about:blank` e as
+            // accoes `neuralia:` do artigo) vem de `hooked_builder`.
             .with_permission_handler(|_| PermissionResponse::Deny)
             .with_focused(true)
     }
@@ -443,7 +401,6 @@ impl App {
     ) -> WebViewBuilder<'static> {
         let ipc_proxy = self.proxy.clone();
         let new_window_proxy = self.proxy.clone();
-        let nav_origin = local_origin.clone();
         let capability = remote_capability();
         let ipc_capability = capability.clone();
         let init_script = external_init_script(&capability, agent_enabled);
@@ -460,16 +417,8 @@ impl App {
                     let _ = ipc_proxy.send_event(event);
                 }
             })
-            .with_navigation_handler(move |target| {
-                if target
-                    .get(..9)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
-                {
-                    return false;
-                }
-                remote_web_target(&target, nav_origin.as_deref())
-                    || is_view_source_target(&target, nav_origin.as_deref())
-            })
+            // A trava de navegacao (NavGate::Web com a origem local
+            // autorizada) vem de `hooked_builder`, como em todas as WebViews.
             .with_new_window_req_handler(move |target, _features| {
                 if let Some(event) = external_new_window_event(target, local_origin.as_deref()) {
                     let _ = new_window_proxy.send_event(event);
@@ -493,17 +442,20 @@ impl App {
         // A autorizacao vale para a origem escrita, nao para a rede local.
         let local_origin = Url::parse(url).ok().as_ref().and_then(local_origin_of);
         let allow_local = local_origin.is_some();
-        let result = if let Some(window) = &self.window {
-            self.external_webview_builder(local_origin, false)
-                .with_url(url)
-                .build(window)
-        } else {
+        let Some(window) = &self.window else {
             return;
         };
+        let builder = self
+            .external_webview_builder(local_origin.clone(), false)
+            .with_url(url);
+        let hooked = self.hooked_builder(builder, WebViewHost::External, local_origin);
+        let result = hooked.build_hooked(window);
 
         match result {
             Ok(webview) => {
                 let _ = webview.zoom(self.zoom);
+                #[cfg(feature = "accel-spike")]
+                self.accel_spike_hook(&webview, crate::accel_spike::SpikeHost::External);
                 self.webview = Some(webview);
                 self.surface = Surface::External;
                 if !allow_local {
@@ -537,15 +489,18 @@ impl App {
         self.show_omnibox(false);
         let html = reader_html(article);
 
-        let result = if let Some(window) = &self.window {
-            self.reader_webview_builder().with_html(html).build(window)
-        } else {
+        let Some(window) = &self.window else {
             return;
         };
+        let builder = self.reader_webview_builder().with_html(html);
+        let hooked = self.hooked_builder(builder, WebViewHost::Reader, None);
+        let result = hooked.build_hooked(window);
 
         match result {
             Ok(webview) => {
                 let _ = webview.zoom(self.zoom);
+                #[cfg(feature = "accel-spike")]
+                self.accel_spike_hook(&webview, crate::accel_spike::SpikeHost::Reader);
                 self.webview = Some(webview);
                 self.surface = Surface::Reader;
                 self.page_source = Some(article.source_url.clone());

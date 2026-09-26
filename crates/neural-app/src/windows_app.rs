@@ -17,9 +17,7 @@ use std::{
 use image::RgbaImage;
 
 use crate::epub_app::{EPUB_SCHEME, EpubJob, EpubNotice, EpubRuntime, EpubUiRequest};
-use crate::gemini_live::{
-    LiveIndicator, LiveMessage, LivePanel, live_theme_script, redact_debug_secrets,
-};
+use crate::gemini_live::{LiveIndicator, LiveMessage, LivePanel, live_theme_script};
 #[cfg(test)]
 use crate::ipc::constant_time_eq;
 use crate::ipc::{
@@ -33,7 +31,9 @@ use crate::panel_chrome::{
 };
 use crate::pomodoro_ui::{PomodoroController, TickSchedule, TickScheduler, phase_color};
 use crate::read_aloud::READ_ALOUD_SCRIPT;
+use crate::secrets::redact_debug_secrets;
 use crate::tab_session::{self, Loaded, SessionColumn, SessionGroup, SessionTab, TabSession};
+use neural_core::json_store::StoreRegistry;
 use neural_core::{
     ActionRisk, AgentAction, AgentElement, AgentPermissionPolicy, AgentRuntimeConfig,
     AgentSecurityAction, CoreConfig, FieldKind, HistoryEntry, HistoryKind, HistoryStore, Intent,
@@ -98,8 +98,30 @@ pub(in crate::windows_app) enum PageTarget {
 
 #[derive(Debug)]
 pub(in crate::windows_app) enum UserEvent {
-    /// Escolha de tema feita no menu do botao Home.
-    ThemeChosen(ThemeChoice),
+    /// O tema (`theme.rs`): a unica variante do modulo, com o enum dele
+    /// dentro. E o padrao de cada feature: uma variante aqui, o resto la.
+    Theme(ThemeEvent),
+    /// O pedido de chave nativo (`secret_prompt.rs`): Enter com uma chave
+    /// com a forma do slot, "Esquecer chave" ou cancelar.
+    Keys(KeyEvent),
+    /// Os ganchos das WebViews (`webview_hooks.rs`): o que cada WebView
+    /// avisa, com o hospedeiro de onde veio.
+    WebView(WebViewEvent),
+    /// O bloqueio de anuncios (`adblock.rs`): os itens do menu e as threads
+    /// que leem e baixam a lista.
+    Adblock(AdblockEvent),
+    /// O gestor de downloads (`downloads.rs`): o que o WebView2 avisa de cada
+    /// download e o fim de cada um, com o evento do `neural_core::downloads`.
+    Download(neural_core::downloads::DownloadEvent),
+    /// Traduzir pagina (`translation.rs`): o 文A ou o menu, as leituras do
+    /// `page_eval`, a thread `neural-translate` e o cartao.
+    Translate(TranslateEvent),
+    /// A interface dos downloads (`downloads_ui.rs`): o Ctrl+J, a seta da
+    /// barra e os cliques no cartao «Baixar programa?» ou da saida.
+    DownloadsUi(DownloadsUiEvent),
+    /// Os favoritos (`bookmarks.rs`): o Ctrl+D ou a estrela, com o alvo que
+    /// a origem deu, e as respostas da thread `neural-bookmarks`.
+    Bookmarks(BookmarksEvent),
     /// Pedido da pagina local do painel lateral (canal proprio), com o
     /// numero da pagina que o mandou.
     Panel(side_panel::PanelPost),
@@ -131,16 +153,29 @@ pub(in crate::windows_app) enum UserEvent {
     /// Pedido da pagina do painel do Gemini Live (canal proprio, lista
     /// fechada em `gemini_live::parse_live_message`).
     Live(LiveMessage),
-    /// "Abrir?" do aviso do Gmail: Sim (true) ou Nao.
-    GmailAnswer(bool),
+    /// O aviso do canto (`toast.rs`, centro de avisos `crate::notify`):
+    /// um clique num botao dele ou o fim do prazo.
+    Notify(NotifyEvent),
+    /// A Home de quem usa (o botao, o comando, a omnibox, a paleta, o Esc):
+    /// com downloads a correr pergunta antes (`request_home`).
     HomeRequested,
+    /// A Home da sonda do CI (a mensagem `NeuralIA.LifecycleProbe.Home`, so
+    /// com NEURALIA_LIFECYCLE_PROBE): vai a Home sem o cartao da saida, porque
+    /// o que se mede (o measure-cycles.ps1, o spike do test-downloads.ps1) e
+    /// a WebView destruida -- com o download a correr (`lifecycle_probe_home`).
+    LifecycleProbeHome,
     /// Voltar um nivel: de ecra completo para tres colunas, de la para a Home.
     BackRequested,
     /// Outra janela ficou com o rato a meio do gesto numero N na fila de
     /// abas (WM_CAPTURECHANGED): o arrasto desse gesto cancela-se.
     TabCaptureLost(u64),
     ToggleAutoScroll,
-    AutoScrollAnswer(bool),
+    /// Clique no botao `index` da pergunta do meio da janela
+    /// (`SplashQuestion`), de quem a fez.
+    SplashAnswer {
+        asker: SplashAsker,
+        index: usize,
+    },
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -166,7 +201,6 @@ pub(in crate::windows_app) enum UserEvent {
         subject: String,
         key: String,
     },
-    HideGmailToast(u64),
     ShowHistory,
     ClearHistory,
     HistoryCleared(Result<(), String>),
@@ -312,8 +346,21 @@ pub(in crate::windows_app) enum UserEvent {
     EpubUi(EpubUiRequest),
     /// Arquivos largados sobre o WebView da biblioteca/leitor.
     EpubDropped(Vec<PathBuf>),
-    /// Ctrl+O na omnibox da Home: o dialogo de livros.
+    /// O dialogo "Adicionar livros EPUB" (o comando `OpenEpub`: Ctrl+O na
+    /// janela e na omnibox).
     OpenEpubDialog,
+    /// Um atalho do mapa de teclas (`keymap.rs`): o comando `key`, a correr
+    /// contra a origem de onde a tecla veio -- o hospedeiro da WebView que a
+    /// recebeu, a janela ou a omnibox --, nunca contra nada da pagina.
+    /// So `accelerator_decision` o constroi.
+    RunCommandKey {
+        key: CommandId,
+        origin: CommandOrigin,
+    },
+    /// Uma linha do condutor do spike de aceleradores (so no build de CI
+    /// com `--features accel-spike`; ver `accel_spike_app.rs`).
+    #[cfg(feature = "accel-spike")]
+    AccelSpike(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,9 +413,6 @@ const PALETTE_EDIT_HEIGHT: f64 = 30.0;
 const PALETTE_HINT_TOP: f64 = 48.0;
 /// Fraccao da altura util (abaixo da barra) a que a palette pousa.
 const PALETTE_TOP_RATIO: f64 = 0.18;
-/// A ajuda do `tema:` com uma palavra desconhecida (omnibox e palette).
-pub(in crate::windows_app) const THEME_COMMAND_HELP: &str =
-    "Use tema:sistema, tema:claro ou tema:escuro.";
 const SEARCH_CARD_SUBCLASS_ID: usize = 0x4E71;
 /// Cartao de confirmacao da barra de selecao ("Mandar para as 3 IAs?",
 /// "Traduzir nas 3 IAs?"), em pixeis logicos, centrado na janela. A caixa do
@@ -380,7 +424,10 @@ const SEARCH_CARD_SECONDS: u64 = 12;
 /// Um confirmar que chega antes disto, contado desde que o cartao (ou o texto
 /// que o trocou) apareceu, nao conta: um duplo clique que a pagina pediu no
 /// sitio onde o cartao ia nascer nao o confirma.
-const SEARCH_CARD_ARM: Duration = Duration::from_millis(600);
+/// O cartao arma pelo `NATIVE_CARD_ARM` dos cartoes nativos; os gates do
+/// cartao da barra leem-no por este nome.
+#[cfg(test)]
+const SEARCH_CARD_ARM: Duration = NATIVE_CARD_ARM;
 /// O pedido fixo do Traduzir, escrito pelo nativo: as tres IAs recebem isto,
 /// uma linha em branco e o texto que o cartao pintou.
 const TRANSLATE_PROMPT: &str = "Traduza para o português do Brasil (se o texto já estiver em português, traduza para o inglês):";
@@ -409,6 +456,12 @@ pub(in crate::windows_app) enum BarHit {
     /// ‹ e › de cada IA, logo depois do "+" da coluna.
     ColumnBack(usize),
     ColumnForward(usize),
+    /// O 文A de cada IA: «Traduzir página» (ou devolver o original).
+    ColumnTranslate(usize),
+    /// A estrela ☆/★ dos favoritos de cada IA, depois do › e do 文A.
+    ColumnBookmark(usize),
+    /// A estrela ☆/★ da fonte aberta ao lado, depois do › dela.
+    SplitBookmark,
     Column(usize),
     AddTab(usize),
     ContextTab {
@@ -440,6 +493,8 @@ pub(in crate::windows_app) enum BarHit {
     Tool(Tool),
     /// O olho: liga e desliga o Gemini Live (tela, camera e microfone).
     GeminiLive,
+    /// A seta dos downloads (downloads-ui): a seccao Downloads do painel.
+    Downloads,
     WindowMinimize,
     WindowMaximize,
     WindowClose,
@@ -746,10 +801,12 @@ unsafe extern "system" fn search_card_subclass(
     _subclass_id: usize,
     reference_data: usize,
 ) -> LRESULT {
+    // Os cliques sao do cartao (um STATIC devolve HTTRANSPARENT e iam para
+    // a pagina) e nao o ativam (`popup_no_activate_message`).
+    if let Some(result) = popup_no_activate_message(message) {
+        return result;
+    }
     match message {
-        // Um STATIC devolve HTTRANSPARENT e os cliques iam para a pagina.
-        WM_NCHITTEST => HTCLIENT as LRESULT,
-        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_LBUTTONDOWN => {
             let mut client = RECT::default();
             if GetClientRect(hwnd, &mut client) != 0 {
@@ -948,17 +1005,25 @@ const HINT_MAX_WIDTH_PX: f64 = 640.0;
 /// clique --, nao so o nome do botao.
 pub(in crate::windows_app) fn bar_tooltip_label(
     hit: BarHit,
+    state: &BarState,
     provider: &str,
-    maximized: bool,
     tab_url: Option<&str>,
     group: Option<(&str, bool)>,
 ) -> Option<String> {
+    let maximized = state.maximized;
     Some(match hit {
         BarHit::Home => "Voltar à Home".to_string(),
         BarHit::Back => "Voltar na fonte aberta ao lado".to_string(),
         BarHit::Forward => "Avançar na fonte aberta ao lado".to_string(),
         BarHit::ColumnBack(_) => format!("Voltar no {provider}"),
         BarHit::ColumnForward(_) => format!("Avançar no {provider}"),
+        BarHit::ColumnTranslate(_) => format!(
+            "{TRANSLATE_PAGE_LABEL} do {provider} para o português (outro clique: o original)"
+        ),
+        BarHit::ColumnBookmark(index) => {
+            bookmark_star_tooltip(state.bookmarked.get(index).copied().unwrap_or(false)).to_string()
+        }
+        BarHit::SplitBookmark => bookmark_star_tooltip(state.split_bookmarked).to_string(),
         BarHit::Column(_) => format!("{provider}: expandir esta coluna"),
         BarHit::AddTab(_) => format!("Nova pergunta ao {provider}"),
         BarHit::ContextTab { .. } => {
@@ -993,6 +1058,7 @@ pub(in crate::windows_app) fn bar_tooltip_label(
         .to_string(),
         BarHit::Tool(tool) => tool.tooltip().to_string(),
         BarHit::GeminiLive => LIVE_TOOLTIP.to_string(),
+        BarHit::Downloads => downloads_tooltip(state.downloads),
         BarHit::WindowMinimize => caption_tooltip_label(0, maximized).to_string(),
         BarHit::WindowMaximize => caption_tooltip_label(1, maximized).to_string(),
         BarHit::WindowClose => caption_tooltip_label(2, maximized).to_string(),
@@ -1610,54 +1676,6 @@ pub(in crate::windows_app) fn refresh_hint_text(text: &str) {
     show_pending_tooltip();
 }
 
-/// Menu de tema no cursor, com a escolha em vigor marcada. Devolve a opcao
-/// clicada, ou None se o menu foi fechado sem escolha.
-fn pick_theme_from_menu(hwnd: HWND) -> Option<ThemeChoice> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, GA_ROOT, GetAncestor, MF_CHECKED, MF_STRING,
-        SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    };
-    let current = ThemeChoice::current();
-    unsafe {
-        let menu = CreatePopupMenu();
-        if menu.is_null() {
-            return None;
-        }
-        for (index, choice) in ThemeChoice::ALL.iter().enumerate() {
-            let flags = if *choice == current {
-                MF_STRING | MF_CHECKED
-            } else {
-                MF_STRING
-            };
-            let label: Vec<u16> = choice
-                .label()
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-            AppendMenuW(menu, flags, index + 1, label.as_ptr());
-        }
-        let mut cursor = POINT { x: 0, y: 0 };
-        GetCursorPos(&mut cursor);
-        // Sem o dono em primeiro plano, o menu nao fecha ao clicar fora.
-        let root = GetAncestor(hwnd, GA_ROOT);
-        SetForegroundWindow(root);
-        let picked = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON,
-            cursor.x,
-            cursor.y,
-            0,
-            root,
-            std::ptr::null(),
-        );
-        DestroyMenu(menu);
-        usize::try_from(picked)
-            .ok()
-            .and_then(|id| id.checked_sub(1))
-            .and_then(|index| ThemeChoice::ALL.get(index).copied())
-    }
-}
-
 /// Pixeis BGRA de um disco da cor `color` com a borda suave, com o alfa ja
 /// multiplicado nos canais -- o que o menu espera de um bitmap de 32 bits.
 fn swatch_pixels(color: Rgb, size: i32) -> Vec<u8> {
@@ -1735,18 +1753,28 @@ unsafe fn color_swatch_bitmap(color: Rgb, size: i32) -> *mut core::ffi::c_void {
 }
 
 /// Acrescenta ao menu um item com texto e, a esquerda, a amostra `swatch`
-/// (pode ser nula). `checked` marca-o como a escolha em vigor.
+/// (pode ser nula). `checked` marca-o como a escolha em vigor; `disabled`
+/// deixa-o cinzento e sem clique, como o `MF_GRAYED` de um item sem icone.
 unsafe fn append_swatch_item(
     menu: *mut core::ffi::c_void,
     id: usize,
     label: &[u16],
     swatch: *mut core::ffi::c_void,
     checked: bool,
+    disabled: bool,
 ) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetMenuItemCount, InsertMenuItemW, MENUITEMINFOW, MFS_CHECKED, MFT_RADIOCHECK, MFT_STRING,
-        MIIM_BITMAP, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING,
+        GetMenuItemCount, InsertMenuItemW, MENUITEMINFOW, MFS_CHECKED, MFS_DISABLED,
+        MFT_RADIOCHECK, MFT_STRING, MIIM_BITMAP, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING,
     };
+    let mut state = 0;
+    if checked {
+        state |= MFS_CHECKED;
+    }
+    if disabled {
+        // MFS_DISABLED e MFS_GRAYED sao o mesmo valor: cinzento e sem clique.
+        state |= MFS_DISABLED;
+    }
     let info = MENUITEMINFOW {
         cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
         fMask: MIIM_ID
@@ -1755,7 +1783,7 @@ unsafe fn append_swatch_item(
             | MIIM_STATE
             | if swatch.is_null() { 0 } else { MIIM_BITMAP },
         fType: MFT_STRING | if checked { MFT_RADIOCHECK } else { 0 },
-        fState: if checked { MFS_CHECKED } else { 0 },
+        fState: state,
         wID: id as u32,
         hSubMenu: std::ptr::null_mut(),
         hbmpChecked: std::ptr::null_mut(),
@@ -2081,7 +2109,7 @@ unsafe extern "system" fn home_button_subclass(
                 && reference_data != 0
             {
                 let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
-                let _ = proxy.send_event(UserEvent::ThemeChosen(choice));
+                let _ = proxy.send_event(UserEvent::Theme(ThemeEvent::Chosen(choice)));
             }
             0
         }
@@ -3051,8 +3079,10 @@ pub(in crate::windows_app) struct App {
     pub(in crate::windows_app) reading_pdf: bool,
     pub(in crate::windows_app) splash: Option<HWND>,
     pub(in crate::windows_app) splash_board: SplashBoard,
-    pub(in crate::windows_app) gmail_toast: Option<HWND>,
-    pub(in crate::windows_app) gmail_toast_token: u64,
+    /// A janela do aviso do canto (`toast.rs`), enquanto existe.
+    pub(in crate::windows_app) toast: Option<HWND>,
+    /// O centro de avisos: o aviso a vista, o token dele e a fila.
+    pub(in crate::windows_app) notify: crate::notify::NotifyCentre,
     /// O pedido da barra (Mandar para IA, Traduzir) a espera do clique no
     /// cartao nativo.
     pub(in crate::windows_app) search_card: SearchCard,
@@ -3153,6 +3183,37 @@ pub(in crate::windows_app) struct App {
     /// Painel do Gemini Live, com o estado do olho da barra. Existir e estar
     /// ligado: fecha-lo desliga tudo.
     pub(in crate::windows_app) live_panel: LivePanel<WebView>,
+    /// O registo das lojas (`neural_core::json_store`), cunhado aqui -- a
+    /// unica cunhagem do produto. So ele passa os grants que abrem as lojas;
+    /// o infra-privacy-guard muda-o para o `PrivacyGuard`. `None` so se o
+    /// processo ja o tivesse cunhado, o que nao acontece: ha um `App` por
+    /// processo.
+    pub(in crate::windows_app) stores: Option<StoreRegistry>,
+    /// O pedido de chave nativo e o cofre das chaves (`secret_prompt.rs`).
+    pub(in crate::windows_app) keys: KeysState,
+    /// O bloqueio de anuncios (`adblock.rs`): a escolha, a lista e o que os
+    /// handlers do WebView2 leem.
+    pub(in crate::windows_app) adblock: AdblockState,
+    /// O portao de saida da IA (`crate::egress`): consentimento da sessao,
+    /// «Sempre neste site», segundo plano, limite mensal e o consumo em
+    /// `ai/usage.json`. Nasce na primeira vez que uma feature o pede
+    /// (`egress_gate`), NUNCA aqui no arranque: a Home fica com as threads e
+    /// a RAM de sempre (gate `app_new_starts_no_lazy_worker`).
+    pub(in crate::windows_app) egress: Option<crate::egress::EgressGate>,
+    /// O gestor de downloads (`downloads.rs`): o `DownloadManager`, as
+    /// operacoes vivas do WebView2 e o `downloads.json`.
+    pub(in crate::windows_app) downloads: DownloadsState,
+    /// Traduzir pagina (`translation.rs`): as leituras, os runs e o cartao.
+    /// Nasce sem thread, sem cofre e sem disco; a thread `neural-translate`
+    /// so no primeiro clique.
+    pub(in crate::windows_app) translation: TranslationState,
+    /// A interface dos downloads (`downloads_ui.rs`): as linhas do painel,
+    /// a velocidade de cada um, o cartao e a seta da barra.
+    pub(in crate::windows_app) downloads_ui: DownloadsUiState,
+    /// Os favoritos (`bookmarks.rs`): a arvore que a thread
+    /// `neural-bookmarks` mandou e a pagina de cada estrela. A thread so
+    /// nasce no primeiro uso.
+    pub(in crate::windows_app) bookmarks: BookmarksState,
 }
 
 impl App {
@@ -3199,6 +3260,16 @@ impl App {
             Arc::clone(&navigation_generation),
         );
         let tab_session = TabPersistence::open(&config.data_dir);
+        // A unica cunhagem do registo das lojas no produto. Nao toca no
+        // disco: so os grants, pedidos depois, dizem onde cada loja vive.
+        let stores = StoreRegistry::mint(&config.data_dir).ok();
+        let keys = KeysState::new(proxy.clone());
+        // Desligado (quem nunca clicou em "Ativar"), so le a escolha.
+        let adblock = AdblockState::open(stores.as_ref(), &proxy);
+        let downloads = DownloadsState::open(stores.as_ref());
+        // Sem thread nem disco: a `neural-translate` so nasce no 1.o clique.
+        let translation = TranslationState::new(proxy.clone());
+        let downloads_ui = DownloadsUiState::new(proxy.clone());
         Self {
             document,
             pdf_bytes: Arc::new(Mutex::new(Vec::new())),
@@ -3226,8 +3297,8 @@ impl App {
             reading_pdf: false,
             splash: None,
             splash_board: SplashBoard::default(),
-            gmail_toast: None,
-            gmail_toast_token: 0,
+            toast: None,
+            notify: crate::notify::NotifyCentre::default(),
             search_card: SearchCard::default(),
             bar_notes: BarNoteGuard::default(),
             shortcut_notes: BarNoteGuard::default(),
@@ -3274,7 +3345,26 @@ impl App {
             epub: None,
             pending_drops: Vec::new(),
             live_panel: LivePanel::off(),
+            stores,
+            keys,
+            adblock,
+            egress: None,
+            downloads,
+            translation,
+            downloads_ui,
+            bookmarks: BookmarksState::default(),
         }
+    }
+}
+
+impl App {
+    /// O portao de saida da IA, criado no primeiro pedido com os grants do
+    /// registo das lojas. E a porta das features de IA; a Traducao
+    /// (`translation.rs`) e a primeira a pedi-lo.
+    pub(in crate::windows_app) fn egress_gate(&mut self) -> &mut crate::egress::EgressGate {
+        let stores = self.stores.as_ref();
+        self.egress
+            .get_or_insert_with(|| crate::egress::EgressGate::for_app(stores))
     }
 }
 
@@ -3313,14 +3403,15 @@ impl App {
             trace: vec![format!("navigate {}", valid)],
         });
 
-        let result = if let Some(window) = &self.window {
-            self.external_webview_builder(None, true)
-                .with_url(valid.as_str())
-                .build(window)
-        } else {
+        let Some(window) = &self.window else {
             self.active_agent = None;
             return;
         };
+        let builder = self
+            .external_webview_builder(None, true)
+            .with_url(valid.as_str());
+        let hooked = self.hooked_builder(builder, WebViewHost::External, None);
+        let result = hooked.build_hooked(window);
 
         match result {
             Ok(webview) => {
@@ -3513,43 +3604,6 @@ impl App {
         let _ = agent
             .policy
             .write_audit_log(root.join(format!("audit-{stamp}.json")));
-    }
-}
-
-/// Atalhos com Ctrl quando o teclado esta na propria janela (depois de um
-/// clique na barra): os mesmos que o mapa de teclas das paginas.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MainShortcut {
-    AutoScroll,
-    Reload,
-    History,
-    NewTab,
-    /// Ctrl+Shift+Z sem pagina com selecao: nota nova no painel.
-    NewNote,
-    /// Ctrl+O: o dialogo de livros EPUB. So nativo: o mapa de teclas das
-    /// paginas (`NEURALIA_KEYMAP_SCRIPT`) nao o conhece, para nao nascer uma
-    /// accao IPC nova no canal das paginas remotas.
-    OpenEpub,
-}
-
-fn main_window_shortcut(
-    key: &Key,
-    modifiers: winit::keyboard::ModifiersState,
-) -> Option<MainShortcut> {
-    if !modifiers.control_key() || modifiers.alt_key() {
-        return None;
-    }
-    let Key::Character(text) = key else {
-        return None;
-    };
-    match (text.to_lowercase().as_str(), modifiers.shift_key()) {
-        ("r", false) => Some(MainShortcut::AutoScroll),
-        ("r", true) => Some(MainShortcut::Reload),
-        ("h", false) => Some(MainShortcut::History),
-        ("n", false) => Some(MainShortcut::NewTab),
-        ("o", false) => Some(MainShortcut::OpenEpub),
-        ("z", true) => Some(MainShortcut::NewNote),
-        _ => None,
     }
 }
 
@@ -5530,11 +5584,11 @@ enum SearchCardOutcome {
     Ignored,
 }
 
+/// O pedido do cartao da barra (`SearchCard`, um `NativeCard`): o botao que
+/// o pediu e a pergunta ja limpa. O token e a hora sao do `NativeCard`.
 struct PendingSearch {
-    token: u64,
     intent: SearchIntent,
     question: String,
-    shown_at: Instant,
 }
 
 /// O mapa de teclas (e a barra de selecao que vive nele) com a capability e
@@ -6098,16 +6152,12 @@ fn draw_home(
     }
 }
 
-// O arrasto das abas (2.1.7) e a etiqueta do Pomodoro chegam ambos da `App`.
-#[allow(clippy::too_many_arguments)]
+// O arrasto das abas (2.1.7), a etiqueta do Pomodoro e o resto do estado
+// chegam da `App` num `BarState` so (`App::bar_state`).
 fn draw_comparator_bar<W>(
     window: &Window,
     comp: &ComparatorState,
-    hover: Option<BarHit>,
-    visible: bool,
-    auto_scroll: bool,
-    drag: Option<DragPaint>,
-    pomodoro_label: Option<BarLabel>,
+    state: BarState,
     live: &LivePanel<W>,
 ) {
     let Ok(handle) = window.window_handle() else {
@@ -6157,7 +6207,7 @@ fn draw_comparator_bar<W>(
             width,
             scale,
             &names,
-            bar_columns(comp, pomodoro_label),
+            bar_columns(comp, state.pomodoro_label),
             &comp.contexts,
             &comp.groups,
             comp.split.as_ref().map(|split| {
@@ -6169,10 +6219,7 @@ fn draw_comparator_bar<W>(
                 )
             }),
             comp.bar_focus,
-            visible,
-            hover,
-            auto_scroll,
-            drag,
+            state,
             live,
             &Theme::system(),
         );
@@ -6192,16 +6239,13 @@ fn draw_comparator_bar<W>(
 
 /// Todo o desenho da barra de topo, num DC qualquer — o ecra em producao, um
 /// bitmap em memoria nos testes, que e como este visual se inspeciona sem ecra.
-#[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 unsafe fn paint_comparator_bar<W>(
     target: *mut core::ffi::c_void,
     width: i32,
     scale: f64,
     names: &[&str],
-    visible: bool,
-    hover: Option<BarHit>,
-    auto_scroll: bool,
+    state: BarState,
     live: &LivePanel<W>,
     theme: &Theme,
 ) {
@@ -6217,10 +6261,7 @@ unsafe fn paint_comparator_bar<W>(
         &no_groups,
         None,
         [None; COMPARATOR_COLUMNS],
-        visible,
-        hover,
-        auto_scroll,
-        None,
+        state,
         live,
         theme,
     );
@@ -6239,13 +6280,19 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
     groups: &[Vec<ContextGroup>; COMPARATOR_COLUMNS],
     active_context: Option<(usize, Option<u64>, bool, bool)>,
     focus: [Option<u64>; COMPARATOR_COLUMNS],
-    visible: bool,
-    hover: Option<BarHit>,
-    auto_scroll: bool,
-    drag: Option<DragPaint>,
+    state: BarState,
     live: &LivePanel<W>,
     theme: &Theme,
 ) {
+    let BarState {
+        hover,
+        visible,
+        auto_scroll,
+        drag,
+        bookmarked,
+        split_bookmarked,
+        ..
+    } = state;
     // A meio de um arrasto a fila da coluna desenha-se ja como ficara se o
     // botao subir agora: as outras abas abrem lugar ao que se arrasta -- e o
     // que se arrasta fica sempre na fila (e a ancora da coluna), como no
@@ -6583,13 +6630,21 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
         (layout.back, "‹", BarHit::Back),
         (layout.forward, "›", BarHit::Forward),
     ];
-    for index in 0..layout.columns_len {
-        pairs.push((layout.column_back[index], "‹", BarHit::ColumnBack(index)));
-        pairs.push((
-            layout.column_forward[index],
-            "›",
-            BarHit::ColumnForward(index),
-        ));
+    for (index, starred) in bookmarked.iter().enumerate().take(layout.columns_len) {
+        for button in ColumnButton::ALL {
+            // A estrela enche-se quando a pagina da coluna e um favorito.
+            let glyph = match button {
+                ColumnButton::Bookmark => bookmark_star_glyph(*starred),
+                ColumnButton::Back | ColumnButton::Forward | ColumnButton::Translate => {
+                    button.glyph()
+                }
+            };
+            pairs.push((
+                layout.column_button(index, button),
+                glyph,
+                button.hit(index),
+            ));
+        }
     }
     for (rect, label, hit) in pairs {
         if rect.width > 0.0 {
@@ -6621,39 +6676,36 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
             theme.bar_bg,
         );
     }
+    // O canto direito pela ordem do registo (`RIGHT_CLUSTER`): o olho do
+    // Gemini Live pinta-se do estado do painel; os outros sao icones, com
+    // a cor de cada um -- o envelope do Gmail apaga-se com os avisos
+    // desligados; a seta dos downloads fica na cor de destaque enquanto ha
+    // downloads a correr; o Privado e o chapeu e os oculos, sem nome
+    // (pedido do dono). Os lugares nao se tocam, por isso a ordem de
+    // pintura e a do registo.
     let gmail_tint = if GMAIL_NOTIFICATIONS.load(Ordering::Acquire) {
         theme.fg
     } else {
         theme.fg_muted
     };
-    let icons = [
-        (ICON_SLOT_VIDEO, Some(theme.fg)),
-        (ICON_SLOT_WHATSAPP, None),
-        (ICON_SLOT_YOUTUBE, None),
-        (ICON_SLOT_MAIL, Some(gmail_tint)),
-    ];
-    for ((rect, hit), (slot, tint)) in controls.services.iter().zip(SERVICE_BUTTON_HITS).zip(icons)
-    {
-        draw_icon_button(target, *rect, slot, tint, hover == Some(hit), scale, theme);
+    for (slot, rect) in RIGHT_CLUSTER.iter().zip(controls.cluster()) {
+        let hovered = hover == Some(slot.hit);
+        match slot.hit {
+            BarHit::GeminiLive => {
+                draw_live_button(target, rect, live.indicator(), hovered, scale, theme);
+            }
+            hit => {
+                let tint = match hit {
+                    BarHit::Service(Service::Meet) | BarHit::Private => Some(theme.fg),
+                    BarHit::GmailToggle => Some(gmail_tint),
+                    BarHit::Downloads if state.downloads.active > 0 => Some(theme.accent),
+                    BarHit::Downloads => Some(theme.fg),
+                    _ => None,
+                };
+                draw_icon_button(target, rect, slot.icon, tint, hovered, scale, theme);
+            }
+        }
     }
-    draw_live_button(
-        target,
-        controls.live,
-        live.indicator(),
-        hover == Some(BarHit::GeminiLive),
-        scale,
-        theme,
-    );
-    // Privado: o chapeu e os oculos, sem nome (pedido do dono).
-    draw_icon_button(
-        target,
-        controls.private,
-        ICON_SLOT_INCOGNITO,
-        Some(theme.fg),
-        hover == Some(BarHit::Private),
-        scale,
-        theme,
-    );
 
     if let (Some((source_index, _url, fullscreen, private_split)), Some((label, expand, close))) =
         (active_context, controls.split)
@@ -6685,6 +6737,18 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
             font,
             theme,
         );
+        // A estrela da fonte, entre o › dela e o rotulo.
+        if let Some(star) = controls.split_bookmark {
+            draw_button(
+                target,
+                star,
+                bookmark_star_glyph(split_bookmarked),
+                hover == Some(BarHit::SplitBookmark),
+                scale,
+                font,
+                theme,
+            );
+        }
         // Fechar a fonte: vermelho debaixo do rato, como o fechar da janela.
         draw_pill(
             target,
@@ -6980,8 +7044,34 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ),
     ("notes.rs", include_str!("windows_app/notes.rs")),
     ("side_panel.rs", include_str!("windows_app/side_panel.rs")),
+    (
+        "clear_history.rs",
+        include_str!("windows_app/clear_history.rs"),
+    ),
     ("services.rs", include_str!("windows_app/services.rs")),
     ("search_card.rs", include_str!("windows_app/search_card.rs")),
+    (
+        "secret_prompt.rs",
+        include_str!("windows_app/secret_prompt.rs"),
+    ),
+    ("toast.rs", include_str!("windows_app/toast.rs")),
+    ("popup_menu.rs", include_str!("windows_app/popup_menu.rs")),
+    ("native_card.rs", include_str!("windows_app/native_card.rs")),
+    ("page_eval.rs", include_str!("windows_app/page_eval.rs")),
+    (
+        "webview_hooks.rs",
+        include_str!("windows_app/webview_hooks.rs"),
+    ),
+    ("downloads.rs", include_str!("windows_app/downloads.rs")),
+    (
+        "downloads_ui.rs",
+        include_str!("windows_app/downloads_ui.rs"),
+    ),
+    ("commands.rs", include_str!("windows_app/commands.rs")),
+    ("keymap.rs", include_str!("windows_app/keymap.rs")),
+    ("translation.rs", include_str!("windows_app/translation.rs")),
+    ("adblock.rs", include_str!("windows_app/adblock.rs")),
+    ("bookmarks.rs", include_str!("windows_app/bookmarks.rs")),
     ("tests.rs", include_str!("windows_app/tests.rs")),
 ];
 
@@ -7038,14 +7128,56 @@ pub(in crate::windows_app) use notes::*;
 
 pub(in crate::windows_app) mod side_panel;
 pub(in crate::windows_app) use side_panel::*;
+pub(in crate::windows_app) mod clear_history;
+#[allow(unused_imports)]
+pub(in crate::windows_app) use clear_history::*;
 pub(in crate::windows_app) mod services;
 pub(in crate::windows_app) use services::*;
 pub(in crate::windows_app) mod search_card;
 pub(in crate::windows_app) use search_card::*;
+pub(in crate::windows_app) mod secret_prompt;
+pub(in crate::windows_app) use secret_prompt::*;
+pub(in crate::windows_app) mod toast;
+pub(in crate::windows_app) use toast::*;
+pub(in crate::windows_app) mod popup_menu;
+pub(in crate::windows_app) use popup_menu::*;
+pub(in crate::windows_app) mod native_card;
+pub(in crate::windows_app) use native_card::*;
+// Leitura de paginas por script so-leitura (infra-llm-untrusted, plano 2.3):
+// a Traducao (`translation.rs`) e o primeiro consumidor; o Consenso, o
+// Copiloto e o Escudo chegam nas ondas seguintes.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::windows_app) mod page_eval;
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(in crate::windows_app) use page_eval::*;
+pub(in crate::windows_app) mod webview_hooks;
+pub(in crate::windows_app) use webview_hooks::*;
+pub(in crate::windows_app) mod downloads;
+pub(in crate::windows_app) use downloads::*;
+pub(in crate::windows_app) mod downloads_ui;
+pub(in crate::windows_app) use downloads_ui::*;
+pub(in crate::windows_app) mod commands;
+pub(in crate::windows_app) use commands::*;
+pub(in crate::windows_app) mod keymap;
+pub(in crate::windows_app) use keymap::*;
+pub(in crate::windows_app) mod translation;
+pub(in crate::windows_app) use translation::*;
+pub(in crate::windows_app) mod adblock;
+pub(in crate::windows_app) use adblock::*;
+pub(in crate::windows_app) mod bookmarks;
+pub(in crate::windows_app) use bookmarks::*;
 
 pub(in crate::windows_app) mod app;
 #[allow(unused_imports)]
 pub(in crate::windows_app) use app::*;
+
+// Spike do AcceleratorKeyPressed (infra-accel-spike, plano 2.3), so no build
+// de CI com `--features accel-spike`. Fora de `src/windows_app/` de
+// proposito: nao embarca (o exe publicado e compilado sem a feature), por
+// isso nao e `ALL_MODULES` nem `shipped_source()`.
+#[cfg(feature = "accel-spike")]
+#[path = "accel_spike_app.rs"]
+pub(in crate::windows_app) mod accel_spike_app;
 
 // ===================== desenho com anti-aliasing =====================
 
@@ -7316,220 +7448,6 @@ fn auto_scroll_menu_label(on: bool) -> &'static str {
     } else {
         "Ativar rolagem automática (Ctrl+R)"
     }
-}
-
-/// Id do item de rolagem nos menus de uma coluna: o que o `TrackPopupMenu` da
-/// pilula devolve e o que o item acrescentado ao menu do WebView2 entrega.
-/// Zero e o "fechou sem escolher" do Win32, por isso nunca e um comando.
-const COLUMN_MENU_AUTO_SCROLL: usize = 1;
-
-/// O item escolhido num menu de coluna vira o evento que o Ctrl+R premido
-/// DENTRO dessa coluna produz -- o mesmo despacho, `column_ipc_event_impl`,
-/// para o atalho e o menu nunca divergirem.
-fn column_menu_event(col_index: usize, command: usize) -> Option<UserEvent> {
-    if col_index >= COMPARATOR_COLUMNS {
-        return None;
-    }
-    match command {
-        COLUMN_MENU_AUTO_SCROLL => App::column_ipc_event_impl(col_index, IpcAction::AutoScroll),
-        _ => None,
-    }
-}
-
-/// Que WebView e esta, para quem decide o que o botao direito lhe acrescenta.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::windows_app) enum WebViewHost {
-    /// Uma das colunas das IAs no comparador.
-    Column(usize),
-    /// A fonte aberta ao lado da coluna indicada -- tambem a resposta de uma
-    /// IA pedida no painel privado, e a unica pagina a vista em tela cheia.
-    Split(usize),
-    /// Historico e memoria, a direita.
-    SidePanel,
-    /// Meet, WhatsApp, YouTube e Gmail no painel.
-    Service,
-}
-
-/// Recebem o item de rolagem as paginas que rolam sozinhas: as colunas das
-/// IAs e a fonte aberta ao lado (o `auto_scroll_tick` rola-a e o Ctrl+R
-/// funciona nela -- sem o item, a resposta de uma IA aberta no painel privado
-/// rolava sem nenhum botao direito para a parar). O painel lateral e os
-/// servicos nao rolam: ficam com o menu nativo do WebView2 tal como vem.
-fn context_menu_column(host: WebViewHost) -> Option<usize> {
-    match host {
-        WebViewHost::Column(index) | WebViewHost::Split(index) if index < COMPARATOR_COLUMNS => {
-            Some(index)
-        }
-        WebViewHost::Column(_)
-        | WebViewHost::Split(_)
-        | WebViewHost::SidePanel
-        | WebViewHost::Service => None,
-    }
-}
-
-/// O que `install_context_menu` faz com uma WebView acabada de construir:
-/// chama `register` so para uma coluna, com o indice dela, e devolve a linha
-/// de log quando o registo falha -- um runtime WebView2 sem o
-/// ContextMenuRequested. Essa falha nao sobe: a coluna abre, com o menu
-/// nativo inteiro, e so o item de rolagem fica de fora.
-fn install_column_menu(
-    host: WebViewHost,
-    register: impl FnOnce(usize) -> Result<(), String>,
-) -> Option<String> {
-    let col_index = context_menu_column(host)?;
-    register(col_index)
-        .err()
-        .map(|error| format!("context menu: coluna {col_index} sem o item de rolagem ({error})"))
-}
-
-/// Onde o item de rolagem entra num menu nativo com `native` itens: DEPOIS de
-/// todos eles, separado por uma linha quando ha algo acima. Copiar, colar,
-/// inspecionar e o resto ficam nos lugares em que o WebView2 os pos.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ColumnMenuPlacement {
-    separator_at: Option<u32>,
-    item_at: u32,
-}
-
-fn column_menu_placement(native: u32) -> ColumnMenuPlacement {
-    if native == 0 {
-        ColumnMenuPlacement {
-            separator_at: None,
-            item_at: 0,
-        }
-    } else {
-        ColumnMenuPlacement {
-            separator_at: Some(native),
-            item_at: native + 1,
-        }
-    }
-}
-
-/// O item de rolagem de UM botao direito: o rotulo lido no instante do
-/// pedido, onde entra entre os `native` itens do menu, e o id que o
-/// representa.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ColumnMenuRequest {
-    col_index: usize,
-    label: &'static str,
-    placement: ColumnMenuPlacement,
-    command: usize,
-}
-
-impl ColumnMenuRequest {
-    /// O evento de escolher o item: o do Ctrl+R premido na coluna.
-    fn selected(&self) -> Option<UserEvent> {
-        column_menu_event(self.col_index, self.command)
-    }
-}
-
-/// O que responde a cada botao direito de uma coluna. Criado UMA vez, quando
-/// a WebView e registada (ou quando a pilula abre o menu), e chamado a cada
-/// pedido: por isso o rotulo le o `SharedFlag` dentro da resposta, nunca na
-/// criacao -- um rotulo lido no registo ficava preso ao estado do arranque.
-/// `register_column_context_menu` e `column_pill_menu` so copiam para o
-/// Win32/COM o que isto decide.
-fn column_menu_responder(
-    col_index: usize,
-    auto_scroll: SharedFlag,
-) -> impl Fn(u32) -> ColumnMenuRequest {
-    move |native| ColumnMenuRequest {
-        col_index,
-        label: auto_scroll_menu_label(auto_scroll.get()),
-        placement: column_menu_placement(native),
-        command: COLUMN_MENU_AUTO_SCROLL,
-    }
-}
-
-/// Acrescenta ao menu nativo do botao direito de uma coluna o item de
-/// rolagem, com o rotulo do estado no instante do clique, no lugar que
-/// `column_menu_placement` decide. Precisa do ContextMenuRequested
-/// (ICoreWebView2_11 e ICoreWebView2Environment9); num runtime sem ele devolve
-/// o erro e a coluna fica so com o menu nativo. Uma falha a montar um menu
-/// concreto fica no log e esse menu abre como o WebView2 o trouxe.
-fn register_column_context_menu(
-    webview: &WebView,
-    col_index: usize,
-    auto_scroll: SharedFlag,
-    proxy: EventLoopProxy<UserEvent>,
-) -> Result<(), String> {
-    use webview2_com::{
-        ContextMenuRequestedEventHandler, CustomItemSelectedEventHandler,
-        Microsoft::Web::WebView2::Win32::{
-            COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
-            COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR, ICoreWebView2_11,
-            ICoreWebView2ContextMenuRequestedEventArgs, ICoreWebView2Environment9,
-        },
-    };
-    use windows_core::{HSTRING, Interface};
-    use wry::WebViewExtWindows;
-
-    let core = webview
-        .webview()
-        .cast::<ICoreWebView2_11>()
-        .map_err(|error| format!("ICoreWebView2_11 indisponível: {error}"))?;
-    let environment = webview
-        .environment()
-        .cast::<ICoreWebView2Environment9>()
-        .map_err(|error| format!("ICoreWebView2Environment9 indisponível: {error}"))?;
-
-    let respond = column_menu_responder(col_index, auto_scroll);
-    let add_item =
-        move |args: &ICoreWebView2ContextMenuRequestedEventArgs| -> windows_core::Result<()> {
-            unsafe {
-                let items = args.MenuItems()?;
-                let mut native = 0u32;
-                items.Count(&mut native)?;
-                let request = respond(native);
-                let label = HSTRING::from(request.label);
-                let placement = request.placement;
-                let proxy = proxy.clone();
-                let selected = CustomItemSelectedEventHandler::create(Box::new(move |_, _| {
-                    if let Some(event) = request.selected() {
-                        let _ = proxy.send_event(event);
-                    }
-                    Ok(())
-                }));
-                // Tudo criado antes de mexer no menu: uma falha a meio nao deixa
-                // um separador solto no fim do menu nativo.
-                let item = environment.CreateContextMenuItem(
-                    &label,
-                    None,
-                    COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND,
-                )?;
-                let mut selected_token = 0i64;
-                item.add_CustomItemSelected(&selected, &mut selected_token)?;
-                let separator = match placement.separator_at {
-                    Some(index) => Some((
-                        index,
-                        environment.CreateContextMenuItem(
-                            &HSTRING::new(),
-                            None,
-                            COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR,
-                        )?,
-                    )),
-                    None => None,
-                };
-                if let Some((index, separator)) = separator {
-                    items.InsertValueAtIndex(index, &separator)?;
-                }
-                items.InsertValueAtIndex(placement.item_at, &item)?;
-            }
-            Ok(())
-        };
-    let handler = ContextMenuRequestedEventHandler::create(Box::new(move |_, args| {
-        if let Some(args) = args
-            && let Err(error) = add_item(&args)
-        {
-            debug_log(format_args!(
-                "context menu: coluna {col_index} abriu sem o item de rolagem ({error})"
-            ));
-        }
-        Ok(())
-    }));
-    let mut token = 0i64;
-    unsafe { core.add_ContextMenuRequested(&handler, &mut token) }
-        .map_err(|error| format!("add_ContextMenuRequested falhou: {error}"))
 }
 
 /// Uma volta completa do degradê a deslizar.

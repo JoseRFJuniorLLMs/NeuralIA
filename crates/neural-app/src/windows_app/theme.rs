@@ -309,3 +309,76 @@ impl Theme {
         BRAND_COLORS[index.min(COMPARATOR_COLUMNS - 1)]
     }
 }
+
+// ===================== o tema como modulo de feature (o padrao) =====================
+//
+// Um recurso vive no seu `windows_app/<feature>.rs`: os tipos e as decisoes
+// puras em funcoes livres (`ThemeChoice::parse`, `Theme::read_for`), a
+// logica de janela num bloco `impl App` (`choose_theme`) e o que lhe chega
+// pelo event loop num enum proprio (`ThemeEvent`). A raiz so o conhece por
+// uma linha em cada costura: a variante `UserEvent::Theme(ThemeEvent)`, o
+// campo de estado no `App` (o tema nao precisa: a escolha vive em
+// `THEME_CHOICE`) e o braco `UserEvent::Theme(event) => self.theme_event(event)`
+// em `app/event_loop.rs`. E assim que duas branches em paralelo tocam a
+// raiz sem se pisarem: cada uma acrescenta a sua linha, nunca edita a da
+// outra.
+
+/// O que o tema recebe pelo event loop. Lista fechada deste modulo: um
+/// pedido novo do tema e uma variante aqui, nao mais uma em `UserEvent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) enum ThemeEvent {
+    /// Escolha de tema feita no menu do botao Home.
+    Chosen(ThemeChoice),
+}
+
+/// A ajuda do `tema:` com uma palavra desconhecida (omnibox e palette).
+pub(in crate::windows_app) const THEME_COMMAND_HELP: &str =
+    "Use tema:sistema, tema:claro ou tema:escuro.";
+
+/// O menu do tema, com a escolha em vigor marcada. Os ids sao o indice em
+/// `ThemeChoice::ALL` mais um (0 e "fechado sem escolha").
+pub(in crate::windows_app) fn theme_menu() -> PopupMenu {
+    let current = ThemeChoice::current();
+    let mut menu = PopupMenu::default();
+    for (index, choice) in ThemeChoice::ALL.iter().enumerate() {
+        menu.push(MenuCommand::new(index + 1, choice.label()).checked(*choice == current));
+    }
+    menu
+}
+
+/// Menu de tema no cursor, com a escolha em vigor marcada. Devolve a opcao
+/// clicada, ou None se o menu foi fechado sem escolha. Abre num
+/// procedimento de janela (o botao Home), sem acesso as WebViews: o teclado
+/// volta a origem se ela for uma janela nossa (a omnibox da Home).
+pub(in crate::windows_app) fn pick_theme_from_menu(hwnd: HWND) -> Option<ThemeChoice> {
+    let picked = track_popup_menu(
+        &theme_menu(),
+        hwnd,
+        cursor_point(),
+        MenuButton::Right,
+        1.0,
+        &[],
+    );
+    picked
+        .checked_sub(1)
+        .and_then(|index| ThemeChoice::ALL.get(index).copied())
+}
+
+impl App {
+    /// O unico braco do tema no `user_event`: tudo o que o tema recebe
+    /// passa por aqui.
+    pub(in crate::windows_app) fn theme_event(&mut self, event: ThemeEvent) {
+        match event {
+            ThemeEvent::Chosen(choice) => self.choose_theme(choice),
+        }
+    }
+
+    pub(in crate::windows_app) fn choose_theme(&mut self, choice: ThemeChoice) {
+        choice.apply();
+        if let Err(error) = choice.save(&self.config.data_dir.join("theme")) {
+            self.show_native_error(format!("Não foi possível guardar o tema: {error}"));
+        }
+        self.refresh_theme();
+        self.show_splash(format!("{} ativado.", choice.label()), 2);
+    }
+}

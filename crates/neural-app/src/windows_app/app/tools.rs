@@ -99,15 +99,15 @@ pub(in crate::windows_app) fn bar_hint(
     hit: BarHit,
     pomodoro: &PomodoroController,
     now: Instant,
+    state: &BarState,
     provider: &str,
-    maximized: bool,
     tab_url: Option<&str>,
     group: Option<(&str, bool)>,
 ) -> Option<String> {
     if let BarHit::Tool(tool) = hit {
         return Some(tool_hint_at(tool, pomodoro, now));
     }
-    bar_tooltip_label(hit, provider, maximized, tab_url, group)
+    bar_tooltip_label(hit, state, provider, tab_url, group)
 }
 
 /// Som curto do sistema no fim de uma fase do Pomodoro (o "Asterisco" do
@@ -120,64 +120,49 @@ pub(in crate::windows_app) fn pomodoro_sound() {
     }
 }
 
-/// Menu do botao direito do Pomodoro no cursor, feito das linhas de
-/// `PomodoroController::menu_items` (o modelo e o `pick_theme_from_menu`).
+/// O menu do botao direito do Pomodoro, feito das linhas de
+/// `PomodoroController::menu_items`: o que nao se aplica agora fica
+/// cinzento, o preset em uso marcado.
+pub(in crate::windows_app) fn pomodoro_popup_menu(items: &[PomodoroMenuItem]) -> PopupMenu {
+    let mut menu = PopupMenu::default();
+    for item in items {
+        match *item {
+            PomodoroMenuItem::Separator => menu.separator(),
+            PomodoroMenuItem::Command {
+                id,
+                label,
+                enabled,
+                checked,
+                ..
+            } => {
+                let command = MenuCommand::new(id, label).checked(checked);
+                menu.push(if enabled {
+                    command
+                } else {
+                    command.disabled("")
+                });
+            }
+        }
+    }
+    menu
+}
+
+/// Menu do botao direito do Pomodoro no cursor (o modelo e o
+/// `pick_theme_from_menu`), com o teclado devolvido a origem entre `hosts`.
 /// Devolve o id escolhido; 0 se o menu fechou sem escolha.
 pub(in crate::windows_app) fn pick_pomodoro_from_menu(
     hwnd: HWND,
     items: &[PomodoroMenuItem],
+    hosts: &[&dyn FocusHost],
 ) -> usize {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, GA_ROOT, GetAncestor, GetCursorPos, MF_CHECKED,
-        MF_GRAYED, MF_SEPARATOR, MF_STRING, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-        TrackPopupMenu,
-    };
-    unsafe {
-        let menu = CreatePopupMenu();
-        if menu.is_null() {
-            return 0;
-        }
-        for item in items {
-            match *item {
-                PomodoroMenuItem::Separator => {
-                    AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-                }
-                PomodoroMenuItem::Command {
-                    id,
-                    label,
-                    enabled,
-                    checked,
-                    ..
-                } => {
-                    let mut flags = MF_STRING;
-                    if checked {
-                        flags |= MF_CHECKED;
-                    }
-                    if !enabled {
-                        flags |= MF_GRAYED;
-                    }
-                    let text: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
-                    AppendMenuW(menu, flags, id, text.as_ptr());
-                }
-            }
-        }
-        let mut cursor = POINT { x: 0, y: 0 };
-        GetCursorPos(&mut cursor);
-        // Sem o dono em primeiro plano, o menu nao fecha ao clicar fora.
-        let root = GetAncestor(hwnd, GA_ROOT);
-        SetForegroundWindow(root);
-        let picked = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON,
-            cursor.x,
-            cursor.y,
-            0,
-            root,
-            std::ptr::null(),
-        );
-        DestroyMenu(menu);
-        usize::try_from(picked).unwrap_or(0)
-    }
+    track_popup_menu(
+        &pomodoro_popup_menu(items),
+        hwnd,
+        cursor_point(),
+        MenuButton::Right,
+        1.0,
+        hosts,
+    )
 }
 
 impl App {
@@ -213,7 +198,7 @@ impl App {
             return;
         };
         let items = self.pomodoro.menu_items();
-        let picked = pick_pomodoro_from_menu(owner, &items);
+        let picked = pick_pomodoro_from_menu(owner, &items, &self.focus_hosts());
         if let Some(command) = pomodoro_menu_command(&items, picked) {
             self.pomodoro_command(command);
         }

@@ -75,6 +75,11 @@ pub(in crate::windows_app) const AUTO_SCROLL_SCRIPT: &str = r#"
 pub(in crate::windows_app) const PANEL_SHOW_NOTES_SCRIPT: &str =
     "window.neuraliaShowSection && window.neuraliaShowSection('notes')";
 
+/// Corre no painel do Ctrl+H quando ele foi aberto pelos Favoritos (o
+/// Ctrl+D na Home, «Abrir Favoritos» da estrela cheia).
+pub(in crate::windows_app) const PANEL_SHOW_BOOKMARKS_SCRIPT: &str =
+    "window.neuraliaShowSection && window.neuraliaShowSection('bookmarks')";
+
 /// O botao Notas com o painel ja aberto: nas Notas fecha (pelo mesmo
 /// caminho do X, que salva o editor antes), no Historico mostra as Notas.
 pub(in crate::windows_app) const PANEL_NOTES_BUTTON_SCRIPT: &str =

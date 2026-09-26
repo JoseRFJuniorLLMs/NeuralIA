@@ -15,6 +15,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.create_omnibox();
                 self.sync_caption_buttons();
                 self.request_redraw();
+                // Spike de aceleradores (so no build de CI com a feature):
+                // antes do SubmitText, para a pergunta da rolagem ja estar
+                // respondida quando o comparador abrir.
+                #[cfg(feature = "accel-spike")]
+                self.accel_spike_start();
 
                 // Abertura: a consulta padrao ja entra na omnibox e vai direto
                 // para a tela de resultados, sem esperar Enter do utilizador.
@@ -102,19 +107,24 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        #[cfg(feature = "accel-spike")]
+        let Some(event) = self.accel_spike_filter(event) else {
+            return;
+        };
         match event {
-            UserEvent::ExitRequested => {
-                self.save_notes_draft_before_exit();
-                event_loop.exit();
-            }
+            // Com downloads a correr, pergunta antes (`leave_guard`).
+            UserEvent::ExitRequested => self.request_close(event_loop),
             UserEvent::SaveTabSession(token) => self.save_due_tab_session(token),
-            UserEvent::HomeRequested => self.show_home(),
+            UserEvent::HomeRequested => {
+                self.request_home();
+            }
+            UserEvent::LifecycleProbeHome => self.lifecycle_probe_home(),
             UserEvent::BackRequested => self.escape_or_back(),
             UserEvent::TabCaptureLost(gesture) => {
                 let _ = self.tab_gesture(TabGestureInput::CaptureLost { gesture });
             }
             UserEvent::ToggleAutoScroll => self.toggle_auto_scroll(),
-            UserEvent::AutoScrollAnswer(yes) => self.answer_auto_scroll(yes),
+            UserEvent::SplashAnswer { asker, index } => self.answer_splash(asker, index),
             UserEvent::ZoomIn => self.step_zoom(1),
             UserEvent::ZoomOut => self.step_zoom(-1),
             UserEvent::ZoomReset => self.set_zoom(1.0),
@@ -173,9 +183,16 @@ impl ApplicationHandler<UserEvent> for App {
                 subject,
                 key,
             } => self.handle_gmail_state(unread, sender, subject, key),
-            UserEvent::HideGmailToast(token) => self.hide_gmail_toast(token),
             UserEvent::ShowHistory => self.toggle_side_panel(),
-            UserEvent::ThemeChosen(choice) => self.choose_theme(choice),
+            UserEvent::Theme(event) => self.theme_event(event),
+            UserEvent::Keys(event) => self.keys_event(event),
+            UserEvent::WebView(event) => self.webview_event(event),
+            UserEvent::Adblock(event) => self.adblock_event(event),
+            UserEvent::Download(event) => self.download_event(event),
+            UserEvent::Translate(event) => self.translation_event(event),
+            UserEvent::Bookmarks(event) => self.bookmarks_event(event),
+            // O «Cancelar e sair» confirmado no cartao sai por la.
+            UserEvent::DownloadsUi(event) => self.downloads_ui_event(event_loop, event),
             UserEvent::Panel(post) => self.handle_panel_message(post),
             UserEvent::NotesReady { origin, reply } => self.notes_ready(origin, reply),
             UserEvent::NoteRequested { target, via } => self.request_note_from_page(target, via),
@@ -187,34 +204,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::NewNote => self.new_note_in_panel(),
             UserEvent::Live(message) => self.handle_live_message(message),
-            UserEvent::GmailAnswer(open) => self.answer_gmail(open),
-            UserEvent::ClearHistory => {
-                if !self.confirm_clear_history() {
-                    return;
-                }
-                self.forget_tab_session();
-                self.memory.clear(&mut self.current_research);
-                // Na biblioteca de livros, some quando cada livro foi aberto
-                // ("Continuar lendo", recentes); posições e marcadores ficam.
-                if self.epub.is_some()
-                    || self
-                        .config
-                        .data_dir
-                        .join("library")
-                        .join(neural_core::library::INDEX_FILE)
-                        .exists()
-                {
-                    self.submit_epub_job(EpubJob::ClearReadingHistory);
-                }
-                match self.history.clear() {
-                    None => {
-                        self.show_home();
-                        self.status = Some("A apagar o histórico local…".to_string());
-                        self.request_redraw();
-                    }
-                    Some(result) => self.report_history_cleared(result),
-                }
-            }
+            UserEvent::Notify(event) => self.notify_event(event),
+            // Pergunta e depois percorre a tabela dos alvos
+            // (`clear_history::CLEAR_HISTORY_TARGETS`), um braco so.
+            UserEvent::ClearHistory => self.clear_history(),
             UserEvent::HistoryCleared(result) => self.report_history_cleared(result),
             UserEvent::HistoryLoaded(result) => {
                 if self.side_panel.is_open() {
@@ -260,11 +253,16 @@ impl ApplicationHandler<UserEvent> for App {
                 self.search_card_event(SearchCardInput::Expire(token))
             }
             UserEvent::ResearchAnswer { source_index, text } => {
-                let provider = self
-                    .comparator
-                    .as_ref()
-                    .and_then(|comp| comp.views.get(source_index))
-                    .map(|view| view.name.to_string());
+                // Uma coluna traduzida (`translation.rs`) nao grava: texto
+                // traduzido a maquina nunca e a resposta de uma IA.
+                let provider = research_answer_provider(
+                    &self.translation,
+                    self.comparator
+                        .as_ref()
+                        .and_then(|comp| comp.views.get(source_index))
+                        .map(|view| view.name),
+                    source_index,
+                );
                 if let (Some(provider), Some(session)) = (provider, &mut self.current_research) {
                     session.upsert_provider_answer(provider, text, None);
                     self.memory.save_session(session.clone());
@@ -433,6 +431,18 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::OpenEpubDialog => self.open_epub_dialog(true),
+            // Um atalho do mapa de teclas: o evento vai inteiro para
+            // `command_key_event`, que corre o comando contra a origem que
+            // veio com a tecla (nunca outro `RunCommandKey`). Este braco nao
+            // le nem escolhe origem nenhuma.
+            press @ UserEvent::RunCommandKey { .. } => {
+                if let Some(event) = command_key_event(&press) {
+                    self.user_event(event_loop, event);
+                }
+            }
+            // `accel_spike_filter` ja a consumiu.
+            #[cfg(feature = "accel-spike")]
+            UserEvent::AccelSpike(_) => {}
         }
     }
 
@@ -443,10 +453,8 @@ impl ApplicationHandler<UserEvent> for App {
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => {
-                self.save_notes_draft_before_exit();
-                event_loop.exit();
-            }
+            // Com downloads a correr, pergunta antes (`leave_guard`).
+            WindowEvent::CloseRequested => self.request_close(event_loop),
             WindowEvent::RedrawRequested => {
                 if self.needs_clear {
                     self.clear_client();
@@ -465,7 +473,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     Surface::Comparator => {
-                        let drag = self.drag_paint();
+                        let state = self.bar_state();
                         if let Some(window) = &self.window
                             && let Some(comp) = &self.comparator
                         {
@@ -476,16 +484,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.service_strip_physical(),
                                 )
                             });
-                            draw_comparator_bar(
-                                window,
-                                comp,
-                                self.bar_hover,
-                                self.bar_visible(),
-                                self.auto_scroll.get(),
-                                drag,
-                                self.pomodoro_bar_label(),
-                                &self.live_panel,
-                            );
+                            draw_comparator_bar(window, comp, state, &self.live_panel);
                             if let Some((service, badge, strip)) = service {
                                 draw_service_chrome(
                                     window,
@@ -512,6 +511,8 @@ impl ApplicationHandler<UserEvent> for App {
                 self.position_live_panel();
                 self.after_panel_change();
                 self.position_search_card();
+                self.position_translate_card();
+                self.position_download_card();
                 if self.surface == Surface::Home {
                     self.sync_caption_buttons();
                 }
@@ -541,8 +542,10 @@ impl ApplicationHandler<UserEvent> for App {
             // para tras, no sitio onde ela estava antes.
             WindowEvent::Moved(_) => {
                 self.position_splash();
-                self.position_gmail_toast();
+                self.position_toast();
                 self.position_search_card();
+                self.position_translate_card();
+                self.position_download_card();
                 self.position_exit_button();
                 self.position_palette();
                 self.sync_comparator_splitters();
@@ -608,16 +611,19 @@ impl ApplicationHandler<UserEvent> for App {
                 _ => {}
             },
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
-                if let Some(shortcut) = main_window_shortcut(&event.logical_key, self.modifiers) {
-                    match shortcut {
-                        MainShortcut::AutoScroll => self.toggle_auto_scroll(),
-                        MainShortcut::Reload => self.reload_page(),
-                        MainShortcut::History => self.toggle_side_panel(),
-                        MainShortcut::NewTab => self.new_tab(0),
-                        MainShortcut::OpenEpub => self.open_epub_dialog(true),
-                        MainShortcut::NewNote => self.new_note_in_panel(),
+                // O mesmo mapa de teclas das WebViews e da omnibox, com a
+                // janela como origem. Um atalho preso fica aqui (a tecla
+                // presa nao repete o comando); o resto segue.
+                if let Some(input) =
+                    window_accelerator_input(&event.logical_key, self.modifiers, event.repeat)
+                {
+                    let decision = keymap_decision(input, CommandOrigin::Window);
+                    if decision.handled {
+                        if let Some(command) = decision.event {
+                            self.user_event(event_loop, command);
+                        }
+                        return;
                     }
-                    return;
                 }
                 match event.logical_key {
                     Key::Named(NamedKey::Escape) => self.escape_or_back(),
