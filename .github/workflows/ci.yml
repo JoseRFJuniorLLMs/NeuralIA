@@ -417,6 +417,32 @@ jobs:
               New = @'
               if false && !notice.kind.passes_focus() {
           '@
+            },
+            @{
+              Label = "reader-born-without-hooks"
+              Test = "every_webview_gets_the_hooks"
+              SourcePath = "crates/neural-app/src/windows_app/app/pages.rs"
+              Old = @'
+              self.install_webview_hooks(&webview, WebViewHost::Reader);
+          '@
+              New = @'
+              let _ = WebViewHost::Reader;
+          '@
+            },
+            @{
+              Label = "resource-gate-answers-neuralia-pdf"
+              Test = "custom_schemes_are_never_answered_by_the_resource_gate"
+              SourcePath = "crates/neural-app/src/windows_app/webview_hooks.rs"
+              Old = @'
+              if is_custom_scheme_request(uri) {
+                  return false;
+              }
+          '@
+              New = @'
+              if is_custom_scheme_request(uri) {
+                  return uri.contains("neuralia-pdf");
+              }
+          '@
             }
           )
 

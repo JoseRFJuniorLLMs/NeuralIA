@@ -1,13 +1,12 @@
 use std::{ffi::OsString, sync::atomic::Ordering, time::Duration};
 
-use url::Url;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use wry::{NewWindowResponse, PermissionResponse};
 
 use crate::ipc::{IpcAction, parse_ipc_message};
 use crate::notify::{Notice, NoticeAction, NoticeKind, NoticeReply};
 use crate::windows_app::{
-    App, COMPARATOR_COLUMNS, UserEvent,
+    App, COMPARATOR_COLUMNS, UserEvent, WebViewHost,
     page_scripts::GMAIL_MONITOR_SCRIPT,
     remote_capability,
     services::{GMAIL_NOTIFICATIONS, gmail_field, gmail_is_new_mail, save_gmail_setting},
@@ -134,48 +133,43 @@ impl App {
             size: LogicalSize::new(1.0, 1.0).into(),
         };
 
-        let result = themed_webview_builder()
-            .with_initialization_script(init_script)
-            .with_ipc_handler(move |request| {
-                let Some(IpcAction::GmailState {
-                    unread,
-                    sender,
-                    subject,
-                    key,
-                }) = parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
-                else {
-                    return;
-                };
-                let _ = proxy.send_event(UserEvent::GmailInboxState {
-                    unread,
-                    sender,
-                    subject,
-                    key,
-                });
-            })
-            .with_navigation_handler(move |target| {
-                if target
-                    .get(..9)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("neuralia:"))
-                {
-                    return false;
-                }
-                Url::parse(&target).ok().is_some_and(|url| {
-                    url.scheme() == "https"
-                        && matches!(
-                            url.host_str(),
-                            Some("mail.google.com") | Some("accounts.google.com")
-                        )
-                })
-            })
-            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
-            .with_permission_handler(|_| PermissionResponse::Deny)
-            .with_focused(false)
-            .with_bounds(bounds)
-            .with_url("https://mail.google.com/mail/u/0/#inbox")
+        // A trava de navegacao (NavGate::Gmail: so o Gmail e o login da
+        // Google, em https) vem de `hooked_builder`, como em todas as
+        // WebViews; a tabela tambem recusa downloads deste monitor, que
+        // ninguem ve.
+        let result = self
+            .hooked_builder(
+                themed_webview_builder()
+                    .with_initialization_script(init_script)
+                    .with_ipc_handler(move |request| {
+                        let Some(IpcAction::GmailState {
+                            unread,
+                            sender,
+                            subject,
+                            key,
+                        }) = parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
+                        else {
+                            return;
+                        };
+                        let _ = proxy.send_event(UserEvent::GmailInboxState {
+                            unread,
+                            sender,
+                            subject,
+                            key,
+                        });
+                    })
+                    .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+                    .with_permission_handler(|_| PermissionResponse::Deny)
+                    .with_focused(false)
+                    .with_bounds(bounds)
+                    .with_url("https://mail.google.com/mail/u/0/#inbox"),
+                WebViewHost::GmailMonitor,
+                None,
+            )
             .build_as_child(window);
 
         if let Ok(webview) = result {
+            self.install_webview_hooks(&webview, WebViewHost::GmailMonitor);
             self.gmail_monitor = Some(webview);
         }
     }

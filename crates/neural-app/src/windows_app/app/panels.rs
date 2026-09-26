@@ -18,7 +18,7 @@ use neural_core::{HistoryEntry, MemoryHit};
 
 use crate::gemini_live::{
     LIVE_PROTOCOL, LiveAction, LiveKeyStore, LiveMessage, live_ipc_message, live_page_url,
-    live_panel_navigation, live_step, serve_live_asset,
+    live_step, serve_live_asset,
 };
 use crate::panel_chrome::{
     Area, EXIT_PAGE_FULLSCREEN_SCRIPT, PANEL_HANDLE_WIDTH, PANEL_WIDTHS_FILE, PanelKind,
@@ -39,13 +39,13 @@ use crate::windows_app::{
     services::{
         Service, ServicePanel, close_service_panel_in, logical_rect, open_panel_width_for,
         raise_webview_host, register_service_panel_events, service_event_is_current,
-        service_panel_navigation, service_panel_permission,
+        service_panel_permission,
     },
     show_popup_without_activation,
     side_panel::{
         self, PANEL_RECENT_LIMIT, PANEL_SUGGESTION_LIMIT, PanelExit, PanelMessage,
-        history_panel_items, memory_panel_items, panel_allows_navigation, panel_bounds, panel_html,
-        panel_render_script, panel_theme_vars, suggestion_panel_items,
+        history_panel_items, memory_panel_items, panel_bounds, panel_html, panel_render_script,
+        panel_theme_vars, suggestion_panel_items,
     },
     theme::{Theme, themed_webview_builder},
     web_media_permission, window_hwnd,
@@ -162,20 +162,27 @@ impl App {
         // corre num painel de servico chega ao historico ou a memoria do
         // NeuralIA. O privado (Respiracao) tambem nao deixa nada no perfil
         // do WebView2: e InPrivate.
-        let built = themed_webview_builder()
-            .with_incognito(service.private())
-            .with_url(service.url())
-            .with_bounds(logical_rect(area))
-            .with_navigation_handler(move |target| service_panel_navigation(service, &target))
-            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
-            // Caminho A do WebRTC: camera e microfone pelo aviso do WebView2
-            // -- salvo no painel privado, onde sao recusados.
-            .with_permission_handler(move |kind| service_panel_permission(service, kind))
+        // A trava de navegacao (NavGate::Service, a politica do servico) vem
+        // de `hooked_builder`, como em todas as WebViews.
+        let host = WebViewHost::Service(service);
+        let built = self
+            .hooked_builder(
+                themed_webview_builder()
+                    .with_incognito(service.private())
+                    .with_url(service.url())
+                    .with_bounds(logical_rect(area))
+                    .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+                    // Caminho A do WebRTC: camera e microfone pelo aviso do
+                    // WebView2 -- salvo no painel privado, onde sao recusados.
+                    .with_permission_handler(move |kind| service_panel_permission(service, kind)),
+                host,
+                None,
+            )
             .build_as_child(window);
         match built {
             Ok(panel) => {
                 let _ = panel.focus();
-                self.install_context_menu(&panel, WebViewHost::Service);
+                self.install_webview_hooks(&panel, host);
                 #[cfg(feature = "accel-spike")]
                 self.accel_spike_hook(&panel, crate::accel_spike::SpikeHost::Service);
                 self.service_generation = self.service_generation.wrapping_add(1);
@@ -634,24 +641,32 @@ impl App {
             return;
         };
         let proxy = self.proxy.clone();
-        let built = themed_webview_builder()
-            // Origem propria: `http://neuralia-live.localhost` e contexto
-            // seguro, e sem isso nao ha getUserMedia nem getDisplayMedia.
-            .with_custom_protocol(LIVE_PROTOCOL.to_string(), move |_id, request| {
-                serve_live_asset(&request)
-            })
-            .with_url(live_page_url())
-            .with_bounds(bounds)
-            .with_ipc_handler(live_panel_ipc_handler(move |event| {
-                let _ = proxy.send_event(event);
-            }))
-            .with_navigation_handler(live_panel_navigation)
-            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
-            .with_permission_handler(live_panel_permission)
+        // A trava de navegacao (NavGate::Live: so a pagina do painel) vem de
+        // `hooked_builder`, como em todas as WebViews.
+        let built = self
+            .hooked_builder(
+                themed_webview_builder()
+                    // Origem propria: `http://neuralia-live.localhost` e
+                    // contexto seguro, e sem isso nao ha getUserMedia nem
+                    // getDisplayMedia.
+                    .with_custom_protocol(LIVE_PROTOCOL.to_string(), move |_id, request| {
+                        serve_live_asset(&request)
+                    })
+                    .with_url(live_page_url())
+                    .with_bounds(bounds)
+                    .with_ipc_handler(live_panel_ipc_handler(move |event| {
+                        let _ = proxy.send_event(event);
+                    }))
+                    .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+                    .with_permission_handler(live_panel_permission),
+                WebViewHost::Live,
+                None,
+            )
             .build_as_child(window);
         match built {
             Ok(panel) => {
                 let _ = panel.focus();
+                self.install_webview_hooks(&panel, WebViewHost::Live);
                 debug_log(format_args!("live panel: ligado"));
                 self.live_panel.open(panel);
                 self.fit_comparator_to_panel();
@@ -775,22 +790,28 @@ impl App {
         // O numero desta pagina vai no canal dela: um pedido que chegue
         // depois de ela sair nao se confunde com o da seguinte.
         let ticket = self.side_panel.ticket();
-        // Criado por ultimo, fica por cima das outras WebViews.
-        let built = themed_webview_builder()
-            .with_html(panel_html(&Theme::system()))
-            .with_bounds(bounds)
-            .with_ipc_handler(move |request| {
-                if let Some(post) = side_panel::PanelPost::parse(ticket, request.body()) {
-                    let _ = proxy.send_event(crate::windows_app::UserEvent::Panel(post));
-                }
-            })
-            .with_navigation_handler(|target| panel_allows_navigation(&target))
-            .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+        // Criado por ultimo, fica por cima das outras WebViews. A trava de
+        // navegacao (NavGate::SidePanel: so o proprio HTML local) vem de
+        // `hooked_builder`, como em todas as WebViews.
+        let built = self
+            .hooked_builder(
+                themed_webview_builder()
+                    .with_html(panel_html(&Theme::system()))
+                    .with_bounds(bounds)
+                    .with_ipc_handler(move |request| {
+                        if let Some(post) = side_panel::PanelPost::parse(ticket, request.body()) {
+                            let _ = proxy.send_event(crate::windows_app::UserEvent::Panel(post));
+                        }
+                    })
+                    .with_new_window_req_handler(|_, _| NewWindowResponse::Deny),
+                WebViewHost::SidePanel,
+                None,
+            )
             .build_as_child(window);
         match built {
             Ok(panel) => {
                 let _ = panel.focus();
-                self.install_context_menu(&panel, WebViewHost::SidePanel);
+                self.install_webview_hooks(&panel, WebViewHost::SidePanel);
                 #[cfg(feature = "accel-spike")]
                 self.accel_spike_hook(&panel, crate::accel_spike::SpikeHost::SidePanel);
                 // So com o painel fechado se chega aqui; um aberto nunca e

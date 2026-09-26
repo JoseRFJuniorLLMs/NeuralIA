@@ -314,3 +314,43 @@ authenticated `palette` message; the text itself is typed and read natively.
 New-window requests MUST NOT create a second WebView. Valid HTTP(S) targets are routed into the existing Full Web surface; other targets are denied.
 
 New WebView permission requests are denied by default.
+
+## Per-WebView hooks
+
+Every WebView the app builds -- the three comparator columns, the split
+(normal and private), the full Web surface and the agent's page, the Reader,
+the PDF viewer, the EPUB pages, the Gemini Live panel, the hidden Gmail
+monitor, the Ctrl+H panel and the service panels -- is born in two steps that
+go through one module, `crates/neural-app/src/windows_app/webview_hooks.rs`:
+
+- before `build`, `App::hooked_builder` installs the host's navigation gate,
+  the download refusal where the table says so, and the page-load notice
+  (`WebViewEvent::PageLoaded { page, url }`, sent on `Finished` only);
+- after `build`, `App::install_webview_hooks` registers through WebView2 COM the
+  NeuralIA items of the right-click menu (`WEBVIEW_MENU_ITEMS`: today only the
+  auto-scroll item, on the columns and on the split, private included) and an
+  `AcceleratorKeyPressed` handler that consults `accelerator_lookup`.
+
+What each host receives is a pure table, `webview_hooks(host)`, with one slot
+per feature: `menu`, `downloads` (`Managed` on the columns, the split, the
+full Web and the service panels; `Deny` on the Reader, the PDF, the EPUB
+pages, the Live panel, the Ctrl+H panel and the Gmail monitor),
+`resource_gate`, `nav_gate`, `accelerators` (every host) and `distraction`
+(empty). Navigation verdicts are the per-host chain `web_navigation_verdict`
+(`Web`, `Pdf`, `Reader`, `Epub`, `Live`, `Gmail`, `SidePanel`, `Service`);
+the gate `navigation_verdicts_are_the_ones_the_builders_gave` holds every
+verdict and every event to the closures the builders had in 2.2.0, and
+`spec_0108_remote_navigation_handlers_reject_neuralia_scheme` forbids any
+`with_navigation_handler` outside the module. `every_webview_gets_the_hooks`
+runs both halves over a recording registrar and builder for every host kind
+and holds each of the 11 birth sites to its host; `the_webview_hooks_table`
+pins the table.
+
+`accelerator_lookup` binds nothing yet (gate
+`accelerator_lookup_binds_nothing_today`): the handler only sets `Handled`
+when the lookup says so, so no keyboard behaviour changes until the command
+registry fills it. The resource dispatcher `resource_gate_answers` is a stub
+the product does not yet wire to `WebResourceRequested`; the gate
+`custom_schemes_are_never_answered_by_the_resource_gate` already holds it to
+never answering a request on `neuralia-pdf`, `neuralia-epub` or
+`neuralia-live` (those are served by their wry custom protocols).

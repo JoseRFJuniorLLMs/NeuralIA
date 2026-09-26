@@ -141,12 +141,6 @@ pub(crate) fn live_ipc_message(source: &str, body: &str) -> Option<LiveMessage> 
     parse_live_message(body)
 }
 
-/// A regra de navegacao com a assinatura que o wry pede. O painel passa esta
-/// funcao ao `with_navigation_handler`, sem closure pelo meio.
-pub(crate) fn live_panel_navigation(target: String) -> bool {
-    live_panel_allows_navigation(&target)
-}
-
 /// A chave da API. Nunca se imprime: o `Debug` diz so que existe, para um
 /// `{:?}` de um evento (o `UserEvent` deriva Debug) nao a deixar num log.
 pub(crate) struct LiveKey(String);
@@ -758,7 +752,6 @@ return calls;
             "http://NEURALIA-LIVE.localhost/live.html",
         ] {
             assert!(live_panel_allows_navigation(target), "{target}");
-            assert!(live_panel_navigation(target.to_string()), "{target}");
             assert!(live_ipc_source_ok(target), "{target}");
             assert_eq!(
                 live_ipc_message(target, r#"{"action":"ready","args":{}}"#),
@@ -790,7 +783,6 @@ return calls;
             "",
         ] {
             assert!(!live_panel_allows_navigation(target), "{target}");
-            assert!(!live_panel_navigation(target.to_string()), "{target}");
             assert!(!live_ipc_source_ok(target), "{target}");
             // Uma mensagem valida vinda de outro documento nao passa.
             for body in [
