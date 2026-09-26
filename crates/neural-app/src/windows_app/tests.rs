@@ -8607,7 +8607,8 @@ fn every_webview_gets_the_hooks() {
     // local passada, os downloads recusados onde a tabela manda, e o fim
     // do carregamento (so ele) vira `PageLoaded` com o hospedeiro. A
     // geracao de navegacao do hospedeiro (`NavEpoch`, a da Traducao) sobe a
-    // cada navegacao que comeca, aceite ou recusada.
+    // cada navegacao aceite, e so a elas: uma recusada deixa a pagina onde
+    // esta.
     let local = "http://127.0.0.1:8000";
     for host in WebViewHost::ALL {
         let seen: std::rc::Rc<std::cell::RefCell<Vec<UserEvent>>> = Default::default();
@@ -8644,8 +8645,8 @@ fn every_webview_gets_the_hooks() {
             let allowed = navigate(target.to_string());
             assert_eq!(
                 epoch.current(),
-                before + 1,
-                "{host:?} {target}: a navegacao nao subiu a geracao"
+                before + u64::from(allowed),
+                "{host:?} {target}: a geracao nao seguiu o veredicto (aceite: {allowed})"
             );
             match web_navigation_verdict(hooks.nav_gate, Some(local), target) {
                 NavVerdict::Allow => assert!(allowed, "{host:?} {target}"),
@@ -25766,4 +25767,503 @@ fn translate_page_labels_are_not_the_selection_bar_translate() {
     );
     assert_eq!(translating_message(2, 5), "Traduzindo 2/5…");
     assert_eq!(partial_message(3, 5), "Traduzido em parte (3 de 5 blocos)");
+}
+
+// ===================== translation -- revisao (T1..T4) =====================
+
+/// Um plano com `batches` blocos (um texto de ~3 000 caracteres cada).
+fn translation_plan_of(batches: u32) -> neural_core::translate::Plan {
+    let texts: Vec<neural_core::translate::PageText> = (0..batches)
+        .map(|index| neural_core::translate::PageText {
+            node: index * 2,
+            text: format!(
+                "Paragraph {index}: {}",
+                "The quick brown fox jumps. ".repeat(110)
+            ),
+        })
+        .collect();
+    let plan = neural_core::translate::plan_batches(&texts);
+    assert_eq!(
+        plan.batches.len(),
+        batches as usize,
+        "o plano de teste mudou"
+    );
+    plan
+}
+
+fn translation_entry(node: u32, from: &str, to: &str) -> neural_core::translate::ApplyEntry {
+    neural_core::translate::ApplyEntry {
+        node,
+        from: from.into(),
+        to: to.into(),
+    }
+}
+
+/// O portao da Traducao de um registo de teste, com o `translate.json`.
+fn translation_test_gate(registry: &StoreRegistry) -> crate::egress::EgressGate {
+    let mut gate = crate::egress::EgressGate::for_app(Some(registry));
+    gate.attach_site_grants(
+        crate::ai_settings::AiPurpose::Translation,
+        registry
+            .grant(crate::stores::TRANSLATE_STORE)
+            .expect("grant"),
+    )
+    .expect("translate.json");
+    gate
+}
+
+fn translation_asked(
+    step: TranslateStep,
+) -> (u64, crate::egress::ConsentCard, Vec<CardChoice>, CardView) {
+    match step {
+        TranslateStep::Ask(CardPrompt::Consent { run, card, choices }, view) => {
+            (run, card, choices, view)
+        }
+        other => panic!("esperava o cartao de consentimento: {other:?}"),
+    }
+}
+
+fn translation_submitted(
+    step: TranslateStep,
+) -> (
+    u64,
+    neural_core::llm::ModelId,
+    Vec<(usize, neural_core::translate::Batch)>,
+) {
+    match step {
+        TranslateStep::Submit(TranslateJob::Translate {
+            run,
+            model,
+            batches,
+        }) => (run, model, batches),
+        other => panic!("esperava o envio dos blocos: {other:?}"),
+    }
+}
+
+/// Gate (critico, confirmacoes; translation -- revisao T1): no caminho que
+/// embarca, os blocos so vao para a thread depois de um `Send` do portao.
+/// O `WorkerReport::Picked`, a resposta ao cartao e o «Tentar de novo»
+/// correm `TranslationState::picked`, `consent_answered` e `retry` (as
+/// funcoes sem janela que o App chama por `translation_gate_step`), e so o
+/// `Send` delas devolve um trabalho `Translate`:
+///
+/// - na primeira vez num site, o modelo escolhido da o cartao e nada e
+///   contado no consumo; «Cancelar» recusa sem aviso e nada vai;
+/// - «Traduzir» manda todos os blocos e conta-os; com esse consentimento da
+///   sessao, o mesmo site noutra vista vai direto;
+/// - uma resposta a um cartao cujo run ja saiu (a pagina navegou) e um
+///   modelo que chega para um run que ja nao o espera nao mandam nem
+///   contam;
+/// - o «Tentar de novo» manda so o bloco que falhou, e so depois do portao
+///   (num portao sem consentimento, o cartao outra vez).
+///
+/// Sabotagem: `picked` com `let decision = Decision::Send;` (o portao nem
+/// e perguntado).
+#[test]
+fn translation_is_sent_only_after_the_gate() {
+    use crate::ai_settings::Day;
+    use crate::egress::ConsentAnswer;
+
+    let dir =
+        std::env::temp_dir().join(format!("neuralia-translation-steps-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let registry = StoreRegistry::mint_for_test(&dir);
+    let today = Day::today();
+    let mut gate = translation_test_gate(&registry);
+    let mut state = TranslationState::with_sink(Box::new(|_| {}));
+    let column = WebViewHost::Column(0);
+
+    // Primeira vez neste site: o cartao, nao um envio.
+    let first = state.picking_for_test(column, "https://exemplo.com/a", translation_plan());
+    let (run, card, choices, view) =
+        translation_asked(state.picked(&mut gate, first, translation_pick(), today));
+    assert_eq!(run, first);
+    assert_eq!(
+        choices,
+        [
+            CardChoice::Translate(ConsentAnswer::Session),
+            CardChoice::AlwaysOnSite,
+            CardChoice::Cancel
+        ]
+    );
+    assert_eq!(view.title, TRANSLATE_CONSENT_TITLE);
+    assert_eq!(gate.usage_this_month(today), 0, "o cartao contou chamadas");
+    assert!(!state.column_translated(0), "a espera do cartao nada vai");
+    assert_eq!(state.toggle(column), TranslateToggle::Cancel);
+    // «Cancelar»: recusado, sem aviso, nada vai.
+    match state.consent_answered(&mut gate, first, card, ConsentAnswer::Cancel, today) {
+        TranslateStep::Refuse { run, message: None } => assert_eq!(run, first),
+        other => panic!("o Cancelar devia recusar sem aviso: {other:?}"),
+    }
+    assert_eq!(gate.usage_this_month(today), 0);
+    state.drop_for_test(first);
+
+    // «Traduzir»: todos os blocos, contados.
+    let second = state.picking_for_test(column, "https://exemplo.com/a", translation_plan());
+    let (_, card, choices, _) =
+        translation_asked(state.picked(&mut gate, second, translation_pick(), today));
+    let CardChoice::Translate(answer) = choices[0] else {
+        panic!("o primeiro botao nao e o Traduzir: {choices:?}");
+    };
+    let (run, model, batches) =
+        translation_submitted(state.consent_answered(&mut gate, second, card, answer, today));
+    let planned = translation_plan().batches.len();
+    assert_eq!(
+        (run, model.as_str(), batches.len()),
+        (second, "test-model", planned)
+    );
+    assert_eq!(gate.usage_this_month(today), planned as u32);
+    assert!(
+        state.column_translated(0),
+        "os blocos vao: a coluna conta como traduzida"
+    );
+
+    // O mesmo site noutra vista, na mesma sessao: direto.
+    let other = WebViewHost::Column(1);
+    let third = state.picking_for_test(other, "https://exemplo.com/b", translation_plan());
+    let (run, _, batches) =
+        translation_submitted(state.picked(&mut gate, third, translation_pick(), today));
+    assert_eq!((run, batches.len()), (third, planned));
+    assert_eq!(gate.usage_this_month(today), 2 * planned as u32);
+
+    // A pagina navegou com o cartao aberto: a resposta nao manda nem conta.
+    let gone = state.picking_for_test(
+        WebViewHost::Column(2),
+        "https://outro.com/",
+        translation_plan(),
+    );
+    let (_, card, _, _) =
+        translation_asked(state.picked(&mut gate, gone, translation_pick(), today));
+    state.drop_for_test(gone);
+    assert!(matches!(
+        state.consent_answered(&mut gate, gone, card, ConsentAnswer::Session, today),
+        TranslateStep::Gone
+    ));
+    assert!(matches!(
+        state.picked(&mut gate, gone, translation_pick(), today),
+        TranslateStep::Gone
+    ));
+    // Um modelo repetido para um run que ja traduz tambem nao manda nada.
+    assert!(matches!(
+        state.picked(&mut gate, third, translation_pick(), today),
+        TranslateStep::Gone
+    ));
+    assert_eq!(gate.usage_this_month(today), 2 * planned as u32);
+
+    // «Tentar de novo»: tres blocos, o do meio falha; so ele volta, e so
+    // depois do portao.
+    let web = WebViewHost::External;
+    let partial = state.picking_for_test(web, "https://exemplo.com/c", translation_plan_of(3));
+    let (_, _, batches) =
+        translation_submitted(state.picked(&mut gate, partial, translation_pick(), today));
+    assert_eq!(batches.len(), 3);
+    let failed_batch = batches[1].1.clone();
+    assert!(state.accept_batch(partial, &[translation_entry(0, "a", "b")]));
+    state.batch_failed(partial, 1, "falhou".into());
+    assert!(state.accept_batch(partial, &[translation_entry(4, "c", "d")]));
+    assert_eq!(
+        state.finish(partial),
+        Some(FinishOutcome::Partial {
+            translated: 2,
+            total: 3,
+            failure: Some("falhou".into())
+        })
+    );
+    // Num portao novo (outra janela: sem o consentimento desta sessao), o
+    // «Tentar de novo» pergunta primeiro.
+    assert!(gate.wait_usage_written());
+    let mut fresh = translation_test_gate(&registry);
+    let before = fresh.usage_this_month(today);
+    let (_, card, _, _) = translation_asked(state.retry(&mut fresh, partial, today));
+    assert_eq!(
+        card.token_estimate(),
+        neural_core::ai_policy::estimate_tokens(failed_batch.chars),
+        "o cartao do Tentar de novo conta so o que falhou"
+    );
+    assert_eq!(fresh.usage_this_month(today), before);
+    let (run, _, retried) = translation_submitted(state.consent_answered(
+        &mut fresh,
+        partial,
+        card,
+        ConsentAnswer::Once,
+        today,
+    ));
+    assert_eq!(run, partial);
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].1, failed_batch);
+    assert_eq!(fresh.usage_this_month(today), before + 1);
+    // Um «Tentar de novo» de um run que ja nao esta traduzido nao manda nada.
+    assert!(matches!(
+        state.retry(&mut fresh, partial, today),
+        TranslateStep::Gone
+    ));
+    assert!(gate.wait_usage_written());
+    assert!(fresh.wait_usage_written());
+
+    // E e isto que o App corre (presenca e ausencia, §4.3): os tres bracos
+    // passam pelas funcoes de cima, e o unico trabalho `Translate` que o
+    // produto constroi e o `Send` do `decided`.
+    let source = shipped_source();
+    for call in [
+        "state.picked(gate, id, choice, today)",
+        "state.consent_answered(gate, run, card, answer, today)",
+        "state.retry(gate, run, today)",
+    ] {
+        assert_eq!(source.matches(call).count(), 1, "{call}");
+    }
+    assert_eq!(
+        source.matches("TranslateJob::Translate {").count(),
+        2,
+        "um trabalho Translate construido fora do `decided`"
+    );
+    assert_eq!(
+        source
+            .matches("TranslateStep::Submit(TranslateJob::Translate {")
+            .count(),
+        1
+    );
+    assert_eq!(source.matches("submit_translate_job(").count(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Gate (critico, modo privado; translation -- revisao T2): o run que o
+/// `start_run` do produto cria para o Split privado leva a privacidade de
+/// uma superficie privada ate ao portao (`run_request`, o pedido que
+/// `picked` e `retry` fazem): o cartao so tem «Traduzir» (so desta vez) e
+/// «Cancelar»; nem uma resposta forcada «Sempre neste site» grava o site no
+/// `translate.json`; e o clique seguinte pergunta outra vez. A fonte ao
+/// lado normal, com o mesmo indice, oferece e grava.
+///
+/// Sabotagem: `start_run` com `privacy: EgressPrivacy::Normal`.
+#[test]
+fn translation_private_split_run_carries_its_privacy_to_the_gate() {
+    use crate::ai_settings::Day;
+    use crate::egress::{ConsentAnswer, EgressPrivacy};
+
+    let dir = std::env::temp_dir().join(format!(
+        "neuralia-translation-private-run-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let registry = StoreRegistry::mint_for_test(&dir);
+    let today = Day::today();
+    let mut gate = translation_test_gate(&registry);
+    let mut state = TranslationState::with_sink(Box::new(|_| {}));
+
+    for index in 0..COMPARATOR_COLUMNS {
+        let host = WebViewHost::PrivateSplit(index);
+        let url = format!("https://privado-{index}.com/x");
+        let id = state.picking_for_test(host, &url, translation_plan());
+        let (_, card, choices, view) =
+            translation_asked(state.picked(&mut gate, id, translation_pick(), today));
+        assert!(
+            !card.offers_always(),
+            "{host:?}: o portao ofereceu «Sempre neste site» num Split privado"
+        );
+        assert_eq!(
+            choices,
+            [
+                CardChoice::Translate(ConsentAnswer::Once),
+                CardChoice::Cancel
+            ],
+            "{host:?}"
+        );
+        assert!(
+            !view
+                .buttons
+                .iter()
+                .any(|(label, _)| *label == "Sempre neste site"),
+            "{host:?}"
+        );
+        assert_eq!(
+            state.run_request(id).map(|request| request.privacy),
+            Some(EgressPrivacy::PrivateSurface),
+            "{host:?}: o pedido do run"
+        );
+        assert_eq!(
+            state.run_privacy_for_test(id),
+            Some(EgressPrivacy::PrivateSurface),
+            "{host:?}"
+        );
+        // Mesmo forcada, a resposta «Sempre» nao chega ao disco.
+        translation_submitted(state.consent_answered(
+            &mut gate,
+            id,
+            card,
+            ConsentAnswer::AlwaysOnSite,
+            today,
+        ));
+        state.drop_for_test(id);
+    }
+    let stored = std::fs::read_to_string(dir.join("translate.json")).unwrap_or_default();
+    assert!(!stored.contains("privado"), "o privado gravou: {stored}");
+
+    // «Traduzir» no Split privado vale so desta vez.
+    let private = WebViewHost::PrivateSplit(1);
+    let once = state.picking_for_test(private, "https://uma-vez.com/", translation_plan());
+    let (_, card, choices, _) =
+        translation_asked(state.picked(&mut gate, once, translation_pick(), today));
+    let CardChoice::Translate(answer) = choices[0] else {
+        panic!("{choices:?}");
+    };
+    translation_submitted(state.consent_answered(&mut gate, once, card, answer, today));
+    state.drop_for_test(once);
+    let again = state.picking_for_test(private, "https://uma-vez.com/y", translation_plan());
+    translation_asked(state.picked(&mut gate, again, translation_pick(), today));
+    state.drop_for_test(again);
+
+    // A fonte ao lado normal: oferece e grava.
+    let split = WebViewHost::Split(1);
+    let normal = state.picking_for_test(split, "https://normal.com/", translation_plan());
+    assert_eq!(
+        state.run_privacy_for_test(normal),
+        Some(EgressPrivacy::Normal)
+    );
+    let (_, card, choices, _) =
+        translation_asked(state.picked(&mut gate, normal, translation_pick(), today));
+    assert!(choices.contains(&CardChoice::AlwaysOnSite), "{choices:?}");
+    translation_submitted(state.consent_answered(
+        &mut gate,
+        normal,
+        card,
+        ConsentAnswer::AlwaysOnSite,
+        today,
+    ));
+    let stored = std::fs::read_to_string(dir.join("translate.json")).expect("translate.json");
+    assert!(stored.contains("https://normal.com"), "{stored}");
+    assert!(gate.wait_usage_written());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Gate (translation -- revisao T3): uma navegacao recusada (um `mailto:`,
+/// um `tel:`, uma accao `neuralia:`, um `javascript:`) nao muda a pagina, e
+/// a traducao dela continua a poder ser devolvida. Pelo navigation handler
+/// que embarca (`hook_webview_builder` com a geracao do hospedeiro do
+/// `TranslationState`, como o `App::hooked_builder`), o run continua na sua
+/// pagina (`on_its_page`, o que o APPLY, o RESTORE e o `PageLoaded`
+/// conferem), a coluna continua traduzida (a resposta dela nao e gravada) e
+/// o 文A devolve o original. Uma navegacao aceite larga a traducao.
+///
+/// Sabotagem: subir a geracao antes do veredicto, tambem nas recusadas.
+#[test]
+fn a_translated_page_survives_a_refused_navigation() {
+    let mut state = TranslationState::with_sink(Box::new(|_| {}));
+    let column = WebViewHost::Column(0);
+    let built = hook_webview_builder(
+        RecordedHookedBuilder::default(),
+        column,
+        None,
+        state.epoch(column),
+        |_| {},
+    );
+    let navigate = built.navigation.as_ref().expect("navigation handler");
+    let id = state.picking_for_test(column, "https://exemplo.com/", translation_plan());
+    let applied = vec![translation_entry(0, "Hello", "Olá")];
+    state.finish_for_test(id, applied.clone());
+    for target in [
+        "mailto:alguem@exemplo.com",
+        "tel:+5511999999999",
+        "neuralia:home",
+        "javascript:void(0)",
+    ] {
+        assert!(
+            !navigate(target.to_string()),
+            "{target}: devia ser recusada"
+        );
+        assert!(
+            state.on_its_page(id).is_some(),
+            "{target}: a navegacao recusada largou a pagina traduzida"
+        );
+        assert!(state.column_translated(0), "{target}");
+        assert_eq!(
+            research_answer_provider(&state, Some("ChatGPT"), 0),
+            None,
+            "{target}"
+        );
+        assert_eq!(state.toggle(column), TranslateToggle::Restore, "{target}");
+    }
+    // Uma aceite: a pagina e outra, nada se devolve la.
+    assert!(navigate("https://outro.exemplo.com/".to_string()));
+    assert!(state.on_its_page(id).is_none());
+    // O RESTORE (com a pagina ainda la) devolve o que se aplicou.
+    let mut state = TranslationState::with_sink(Box::new(|_| {}));
+    let id = state.picking_for_test(column, "https://exemplo.com/", translation_plan());
+    state.finish_for_test(id, applied.clone());
+    assert_eq!(state.begin_restore(id), Some(applied));
+    assert!(state.on_its_page(id).is_some());
+}
+
+/// Gate (translation -- revisao T4): um bloco que acaba depois de o 文A
+/// pedir o original nunca chega a pagina. A thread nao o relata se o
+/// trabalho foi cancelado enquanto ele ia; e um `BatchDone` ou um
+/// `Finished` que ainda assim chegue com o run a devolver o original
+/// (`accept_batch`, `finish`, o que o event loop corre) nao corre o APPLY,
+/// nao entra no que o RESTORE devolve e nao volta o run a traduzido.
+///
+/// Sabotagens: o `accept_batch` sem conferir a fase; a thread sem a
+/// conferencia do cancelamento depois do bloco.
+#[test]
+fn translation_late_batch_never_lands_after_the_restore() {
+    use crate::secrets::{KeySlot, validate_api_key};
+    // A thread: cancelada enquanto o bloco ia -- nem BatchDone nem Finished.
+    let reports = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&reports);
+    let mut worker = TranslateWorker {
+        engine: Box::new(FakeTranslateEngine {
+            keys: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }),
+        key: Box::new(|| validate_api_key(&KeySlot::Gemini, TRANSLATE_TEST_KEY)),
+        report: Box::new(move |report| sink.lock().expect("reports").push(report)),
+        models: None,
+    };
+    let checks = std::cell::Cell::new(0_u32);
+    let cancelled = || {
+        checks.set(checks.get() + 1);
+        checks.get() > 1
+    };
+    worker.run(
+        TranslateJob::Translate {
+            run: 3,
+            model: neural_core::llm::ModelId::parse("test-model").expect("id"),
+            batches: translation_plan()
+                .batches
+                .iter()
+                .cloned()
+                .enumerate()
+                .collect(),
+        },
+        &cancelled,
+    );
+    let reports = reports.lock().expect("reports").clone();
+    assert!(
+        !reports.iter().any(|report| matches!(
+            report,
+            WorkerReport::BatchDone { .. } | WorkerReport::Finished { .. }
+        )),
+        "a thread relatou um bloco cancelado: {reports:?}"
+    );
+
+    // O event loop: o 文A pediu o original com um bloco a caminho.
+    let mut state = TranslationState::with_sink(Box::new(|_| {}));
+    let column = WebViewHost::Column(1);
+    let id = state.run_for_test(column, true);
+    let first = translation_entry(0, "Hello", "Olá");
+    assert!(state.accept_batch(id, std::slice::from_ref(&first)));
+    assert_eq!(state.begin_restore(id), Some(vec![first.clone()]));
+    assert_eq!(state.toggle(column), TranslateToggle::Busy);
+    assert!(
+        !state.accept_batch(id, &[translation_entry(2, "World", "Mundo")]),
+        "o bloco atrasado foi a pagina depois do RESTORE"
+    );
+    assert_eq!(state.applied_for_test(id), vec![first]);
+    assert_eq!(state.finish(id), None);
+    assert_eq!(
+        state.toggle(column),
+        TranslateToggle::Busy,
+        "o Finished voltou a traduzido um run que devolve o original"
+    );
+    // Um run que espera o cartao tambem nao recebe blocos.
+    let waiting = state.run_for_test(WebViewHost::Column(2), false);
+    assert!(!state.accept_batch(waiting, &[translation_entry(0, "a", "b")]));
+    assert!(state.applied_for_test(waiting).is_empty());
 }

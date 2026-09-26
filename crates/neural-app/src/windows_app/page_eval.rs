@@ -142,8 +142,9 @@ fn registered(script: &ReadOnlyScript) -> bool {
 }
 
 /// A geracao de navegacao de uma vista: o navigation handler dela chama
-/// `bump` a cada navegacao que comeca (tambem as recusadas: cair a mais e
-/// o lado seguro).
+/// `bump` a cada navegacao que vai, antes de ela comecar. Uma recusada nao
+/// a sobe: a pagina fica, e o que se trocou nela (a Traducao) tem de poder
+/// ser devolvido.
 #[derive(Debug, Clone, Default)]
 pub(in crate::windows_app) struct NavEpoch(Arc<AtomicU64>);
 

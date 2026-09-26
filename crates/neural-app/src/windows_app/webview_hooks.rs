@@ -267,8 +267,10 @@ impl HookedWebViewBuilder for WebViewBuilder<'_> {
 /// tabela manda e o aviso de pagina carregada. `send` e o proxy do event
 /// loop no produto e um registo no gate. `epoch` e a geracao de navegacao
 /// do hospedeiro (`page_eval::NavEpoch`, a da Traducao): o navigation
-/// handler sobe-a a cada navegacao que comeca, tambem as recusadas -- uma
-/// leitura da pagina anterior cai na chegada.
+/// handler sobe-a a cada navegacao que VAI, antes de ela comecar -- uma
+/// leitura da pagina anterior cai na chegada. Uma recusada (um `mailto:`,
+/// um link que abre na Web completa) nao a sobe: a pagina fica onde esta,
+/// e a traducao dela tambem (o RESTORE ainda a acha).
 pub(in crate::windows_app) fn hook_webview_builder<B, S>(
     builder: B,
     host: WebViewHost,
@@ -283,10 +285,11 @@ where
     let hooks = webview_hooks(host);
     let navigation = webview_navigation(hooks.nav_gate, local_origin, send.clone());
     let builder = builder.with_navigation_handler(move |target| {
-        if let Some(epoch) = &epoch {
+        let allowed = navigation(target);
+        if allowed && let Some(epoch) = &epoch {
             epoch.bump();
         }
-        navigation(target)
+        allowed
     });
     let builder = match hooks.downloads {
         DownloadPolicy::Deny => builder.with_download_started_handler(|_, _| false),

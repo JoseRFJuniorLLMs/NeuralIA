@@ -13,7 +13,7 @@ use neural_core::translate::{
 use crate::ai_settings::{AiPurpose, Day};
 use crate::egress::{
     ConsentAnswer, ConsentCard, Decision, Destination, EgressGate, EgressPrivacy, EgressRequest,
-    SiteOrigin, Trigger,
+    RefuseReason, SiteOrigin, Trigger,
 };
 use crate::lazy_worker::{JobContext, LazyWorker};
 use crate::secrets::{ApiKey, KeySlot, KeyVault};
@@ -46,7 +46,9 @@ use crate::stores::{KEYS_STORE, LIVE_KEY_STORE, TRANSLATE_STORE};
 //    nunca no `App::new`) le a chave, lista os modelos e escolhe o da
 //    Traducao pela regra (`llm::pick`, com a fixacao do dono em
 //    `ai/settings.json`).
-// 5. O `EgressGate` decide: `Send`, `Refuse` ou `Ask(ConsentCard)` -- o
+// 5. O `EgressGate` decide (`TranslationState::picked`, `consent_answered`
+//    e `retry`, sem janela: so um `Send` devolve o trabalho `Translate`
+//    que vai para a thread): `Send`, `Refuse` ou `Ask(ConsentCard)` -- o
 //    cartao nativo (`NativeCard`: token, armar de 600 ms, expiracao, so o
 //    pintado) com «Traduzir com Gemini?», o texto que vai, os hosts, os
 //    tokens, o modelo e a faixa de preco, e os botoes [Traduzir] [Sempre
@@ -63,7 +65,10 @@ use crate::stores::{KEYS_STORE, LIVE_KEY_STORE, TRANSLATE_STORE};
 //    traduzida.» ou «Traduzido em parte (3 de 5 blocos)» com «Tentar de
 //    novo».
 // 7. Outro clique (ou o menu) corre `TRANSLATE_RESTORE`: so os nos que ainda
-//    tem a traducao voltam ao original.
+//    tem a traducao voltam ao original. Um bloco que acabe depois disso ja
+//    nao vai a pagina. Uma navegacao que vai larga a traducao; uma recusada
+//    (um `mailto:`, um link que abre na Web completa) nao muda a pagina e
+//    nao a larga.
 //
 // Enquanto uma coluna esta traduzida (desde que os blocos comecam a ir ate o
 // original voltar), a resposta dela nao entra na sessao de pesquisa nem na
@@ -656,6 +661,15 @@ pub(in crate::windows_app) enum TranslateJob {
     },
 }
 
+impl TranslateJob {
+    /// O run deste trabalho.
+    pub(in crate::windows_app) fn run(&self) -> u64 {
+        match self {
+            Self::Pick { run, .. } | Self::Translate { run, .. } => *run,
+        }
+    }
+}
+
 /// O que a thread diz ao event loop. Nunca leva a chave: so o modelo
 /// escolhido, as trocas da pagina e mensagens pt-BR que nunca a citam.
 #[derive(Debug, Clone, PartialEq)]
@@ -795,7 +809,13 @@ impl TranslateWorker {
                         done: position + 1,
                         total,
                     });
-                    match self.engine.batch(&model, batch, &key, cancelled) {
+                    let result = self.engine.batch(&model, batch, &key, cancelled);
+                    // Cancelado enquanto o bloco ia (o 文A devolve o
+                    // original, outro clique): o bloco ja nao vai a pagina.
+                    if cancelled() {
+                        return;
+                    }
+                    match result {
                         Ok(entries) => (self.report)(WorkerReport::BatchDone {
                             run,
                             batch: *batch_index,
@@ -985,6 +1005,253 @@ impl TranslationState {
     pub(in crate::windows_app) fn toggle(&self, host: WebViewHost) -> TranslateToggle {
         toggle_for(self.run_for_host(host).map(|index| &self.runs[index]))
     }
+
+    /// A vista do run ainda mostra a pagina do clique: a geracao de
+    /// navegacao do hospedeiro e a que o run guardou. So uma navegacao que
+    /// vai a sobe (`hook_webview_builder`): uma recusada deixa a pagina -- e
+    /// a traducao dela -- onde estava, e o RESTORE ainda a acha.
+    pub(in crate::windows_app) fn on_its_page(&self, id: u64) -> Option<(WebViewHost, NavEpoch)> {
+        let run = &self.runs[self.run_index(id)?];
+        let epoch = self.epoch(run.host)?;
+        (epoch.current() == run.generation).then_some((run.host, epoch))
+    }
+
+    /// O pedido de saida do run: o plano, o modelo escolhido, o site e a
+    /// privacidade que `start_run` lhe deu (no Split privado, a de uma
+    /// superficie privada: o portao nem oferece nem le «Sempre neste site»).
+    pub(in crate::windows_app) fn run_request(&self, id: u64) -> Option<EgressRequest<'static>> {
+        let run = &self.runs[self.run_index(id)?];
+        let choice = run.choice.as_ref()?;
+        Some(translation_request(
+            &run.plan,
+            choice,
+            run.origin.clone(),
+            run.privacy,
+        ))
+    }
+
+    /// `WorkerReport::Picked`: o modelo do run chegou e o pedido vai ao
+    /// portao. `Send` so se o portao ja o deixa (consentimento da sessao ou
+    /// «Sempre neste site»); senao, o cartao.
+    pub(in crate::windows_app) fn picked(
+        &mut self,
+        gate: &mut EgressGate,
+        id: u64,
+        choice: Pick,
+        today: Day,
+    ) -> TranslateStep {
+        let Some(index) = self.run_index(id) else {
+            return TranslateStep::Gone;
+        };
+        if self.runs[index].phase != RunPhase::Picking {
+            return TranslateStep::Gone;
+        }
+        self.runs[index].choice = Some(choice);
+        let Some(request) = self.run_request(id) else {
+            return TranslateStep::Gone;
+        };
+        let decision = gate.request(request, today);
+        self.decided(id, decision)
+    }
+
+    /// A resposta ao cartao de consentimento do run. Se o run ja nao espera
+    /// o cartao (a pagina navegou, o 文A devolveu o original), nada vai e
+    /// nada e contado no consumo.
+    pub(in crate::windows_app) fn consent_answered(
+        &mut self,
+        gate: &mut EgressGate,
+        id: u64,
+        card: ConsentCard,
+        answer: ConsentAnswer,
+        today: Day,
+    ) -> TranslateStep {
+        let waiting = self
+            .run_index(id)
+            .is_some_and(|index| self.runs[index].phase == RunPhase::Asking);
+        if !waiting {
+            return TranslateStep::Gone;
+        }
+        let decision = gate.answer(card, answer, today);
+        self.decided(id, decision)
+    }
+
+    /// «Tentar de novo»: o plano passa a ser so os blocos que falharam, e o
+    /// portao decide de novo (e conta as chamadas outra vez).
+    pub(in crate::windows_app) fn retry(
+        &mut self,
+        gate: &mut EgressGate,
+        id: u64,
+        today: Day,
+    ) -> TranslateStep {
+        let Some(index) = self.run_index(id) else {
+            return TranslateStep::Gone;
+        };
+        let run = &mut self.runs[index];
+        if run.phase != RunPhase::Translated || run.choice.is_none() {
+            return TranslateStep::Gone;
+        }
+        let failed = std::mem::take(&mut run.failed);
+        run.plan.batches = failed
+            .iter()
+            .filter_map(|batch| run.plan.batches.get(*batch).cloned())
+            .collect();
+        run.plan.chars = run.plan.batches.iter().map(|batch| batch.chars).sum();
+        let Some(request) = self.run_request(id) else {
+            return TranslateStep::Gone;
+        };
+        let decision = gate.request(request, today);
+        self.decided(id, decision)
+    }
+
+    /// A decisao do portao para o run. E so aqui que nasce um trabalho
+    /// `Translate`: os blocos so vao para a thread depois de um `Send`.
+    fn decided(&mut self, id: u64, decision: Decision) -> TranslateStep {
+        let Some(index) = self.run_index(id) else {
+            return TranslateStep::Gone;
+        };
+        let run = &mut self.runs[index];
+        match decision {
+            Decision::Send => {
+                let Some(choice) = run.choice.clone() else {
+                    return TranslateStep::Gone;
+                };
+                let batches: Vec<(usize, Batch)> =
+                    run.plan.batches.iter().cloned().enumerate().collect();
+                run.phase = RunPhase::Translating;
+                run.failed.clear();
+                run.failure = None;
+                run.sent = batches.len();
+                TranslateStep::Submit(TranslateJob::Translate {
+                    run: id,
+                    model: choice.model,
+                    batches,
+                })
+            }
+            Decision::Ask(card) => {
+                run.phase = RunPhase::Asking;
+                let choices = consent_choices(&card, run.privacy);
+                let view = consent_view(&card, &choices, &run.plan);
+                TranslateStep::Ask(
+                    CardPrompt::Consent {
+                        run: id,
+                        card,
+                        choices,
+                    },
+                    view,
+                )
+            }
+            Decision::Refuse(reason) => TranslateStep::Refuse {
+                run: id,
+                message: (reason != RefuseReason::Cancelled).then(|| reason.message()),
+            },
+        }
+    }
+
+    /// O 文A pediu o original: as trocas a desfazer. Com trocas, o run
+    /// passa a `Restoring` (um bloco atrasado ja nao entra); vazio, nada foi
+    /// a pagina e o run sai.
+    pub(in crate::windows_app) fn begin_restore(&mut self, id: u64) -> Option<Vec<ApplyEntry>> {
+        let index = self.run_index(id)?;
+        let entries = self.runs[index].applied.clone();
+        if !entries.is_empty() {
+            self.runs[index].phase = RunPhase::Restoring;
+        }
+        Some(entries)
+    }
+
+    /// `WorkerReport::BatchDone`: as trocas de um bloco so vao a pagina (e
+    /// so contam no que o RESTORE devolve) enquanto o run traduz. Um bloco
+    /// que chega depois de o 文A pedir o original, ou de outro run
+    /// interromper este, fica de fora. `true`: o APPLY corre.
+    pub(in crate::windows_app) fn accept_batch(&mut self, id: u64, entries: &[ApplyEntry]) -> bool {
+        let Some(index) = self.run_index(id) else {
+            return false;
+        };
+        let run = &mut self.runs[index];
+        if run.phase != RunPhase::Translating || entries.is_empty() {
+            return false;
+        }
+        run.applied.extend(entries.iter().cloned());
+        true
+    }
+
+    /// `WorkerReport::BatchFailed`, so enquanto o run traduz.
+    pub(in crate::windows_app) fn batch_failed(&mut self, id: u64, batch: usize, message: String) {
+        let Some(index) = self.run_index(id) else {
+            return;
+        };
+        let run = &mut self.runs[index];
+        if run.phase != RunPhase::Translating {
+            return;
+        }
+        if !run.failed.contains(&batch) {
+            run.failed.push(batch);
+        }
+        run.failure = Some(message);
+    }
+
+    /// O run ainda traduz.
+    fn translating(&self, id: u64) -> bool {
+        self.run_index(id)
+            .is_some_and(|index| self.runs[index].phase == RunPhase::Translating)
+    }
+
+    /// `WorkerReport::Finished`: so um run que traduzia acaba. Um que ja
+    /// devolve o original (ou que outro run interrompeu) fica como esta.
+    pub(in crate::windows_app) fn finish(&mut self, id: u64) -> Option<FinishOutcome> {
+        let index = self.run_index(id)?;
+        let run = &mut self.runs[index];
+        if run.phase != RunPhase::Translating {
+            return None;
+        }
+        run.phase = RunPhase::Translated;
+        let total = run.plan.batches.len();
+        let failed = run.failed.len();
+        if failed == 0 {
+            return Some(FinishOutcome::Done);
+        }
+        if run.applied.is_empty() && failed == run.sent {
+            return Some(FinishOutcome::Failed(
+                run.failure.clone().unwrap_or_default(),
+            ));
+        }
+        Some(FinishOutcome::Partial {
+            translated: total - failed,
+            total,
+            failure: run.failure.clone(),
+        })
+    }
+}
+
+/// O que o event loop faz por um run depois de o portao decidir
+/// (`TranslationState::picked`, `consent_answered`, `retry`).
+#[derive(Debug)]
+pub(in crate::windows_app) enum TranslateStep {
+    /// O portao disse `Send` (e contou as chamadas): o trabalho vai para a
+    /// thread.
+    Submit(TranslateJob),
+    /// O portao pergunta: o cartao de consentimento.
+    Ask(CardPrompt, CardView),
+    /// Recusado: o run desiste (`abandon_run`); `None` e o Cancelar do
+    /// utilizador, sem aviso.
+    Refuse { run: u64, message: Option<String> },
+    /// O run ja nao espera isto: nada vai e nada conta.
+    Gone,
+}
+
+/// Como acabou a vaga de blocos de um run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::windows_app) enum FinishOutcome {
+    /// Todos: «Página traduzida.»
+    Done,
+    /// Nada chegou a pagina: o run sai, com a razao.
+    Failed(String),
+    /// Uma parte: o cartao com «Tentar de novo».
+    Partial {
+        translated: usize,
+        total: usize,
+        failure: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -1018,6 +1285,37 @@ impl TranslationState {
     /// So nos gates: o original voltou (ou a pagina navegou).
     pub(in crate::windows_app) fn drop_for_test(&mut self, id: u64) {
         self.drop_run(id);
+    }
+
+    /// So nos gates: o clique em `host` sobre `url` pelo `start_run` do
+    /// produto (a privacidade e a geracao de navegacao de agora), com a
+    /// pagina ja lida em `plan` -- o run espera o modelo, como no
+    /// `translation_collected`.
+    pub(in crate::windows_app) fn picking_for_test(
+        &mut self,
+        host: WebViewHost,
+        url: &str,
+        plan: Plan,
+    ) -> u64 {
+        let generation = self.epoch(host).map_or(0, |epoch| epoch.current());
+        let id = self.start_run(host, SiteOrigin::of_url(url), generation);
+        if let Some(index) = self.run_index(id) {
+            self.runs[index].plan = plan;
+            self.runs[index].phase = RunPhase::Picking;
+        }
+        id
+    }
+
+    /// So nos gates: a privacidade do run.
+    pub(in crate::windows_app) fn run_privacy_for_test(&self, id: u64) -> Option<EgressPrivacy> {
+        Some(self.runs[self.run_index(id)?].privacy)
+    }
+
+    /// So nos gates: o que o RESTORE devolveria.
+    pub(in crate::windows_app) fn applied_for_test(&self, id: u64) -> Vec<ApplyEntry> {
+        self.run_index(id)
+            .map(|index| self.runs[index].applied.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -1139,6 +1437,41 @@ impl App {
         self.egress_gate()
     }
 
+    /// Uma decisao do portao para um run (`TranslationState::picked`,
+    /// `consent_answered`, `retry`: as funcoes sem janela que os gates
+    /// correm) e o que ela manda fazer.
+    fn translation_gate_step(
+        &mut self,
+        decide: impl FnOnce(&mut TranslationState, &mut EgressGate, Day) -> TranslateStep,
+    ) {
+        self.translation_gate();
+        let Some(gate) = self.egress.as_mut() else {
+            return;
+        };
+        let step = decide(&mut self.translation, gate, Day::today());
+        self.translation_step(step);
+    }
+
+    fn translation_step(&mut self, step: TranslateStep) {
+        match step {
+            TranslateStep::Submit(job) => {
+                let id = job.run();
+                if !self.submit_translate_job(job) {
+                    self.forget_run(id);
+                    self.show_splash(TRANSLATE_UNREADABLE.to_string(), 3);
+                }
+            }
+            TranslateStep::Ask(prompt, view) => self.show_translate_card(prompt, view),
+            TranslateStep::Refuse { run, message } => {
+                self.abandon_run(run);
+                if let Some(message) = message {
+                    self.show_splash(message, 4);
+                }
+            }
+            TranslateStep::Gone => {}
+        }
+    }
+
     /// O caminho do ficheiro da chave Gemini (o do Gemini Live), sem a ler.
     fn translation_key_file(&mut self) -> Option<PathBuf> {
         if self.translation.key_file.is_none() {
@@ -1162,9 +1495,7 @@ impl App {
     /// interrompe o de outro run -- o que escolhia o modelo sai, o que
     /// traduzia fica com o que ja trocou (o 文A devolve-o).
     fn submit_translate_job(&mut self, job: TranslateJob) -> bool {
-        let id = match &job {
-            TranslateJob::Pick { run, .. } | TranslateJob::Translate { run, .. } => *run,
-        };
+        let id = job.run();
         let interrupted: Vec<(u64, RunPhase)> = self
             .translation
             .runs
@@ -1330,18 +1661,11 @@ impl App {
 
     /// Corre o APPLY ou o RESTORE de `entries` na vista do run.
     fn run_entries_script(&mut self, id: u64, kind: ReadKind, entries: &[ApplyEntry]) -> bool {
-        let Some(index) = self.translation.run_index(id) else {
-            return false;
-        };
-        let host = self.translation.runs[index].host;
-        let Some(epoch) = self.translation.epoch(host) else {
-            return false;
-        };
         // A vista navegou desde o clique: a pagina e outra, nada se troca
         // nem se devolve la.
-        if epoch.current() != self.translation.runs[index].generation {
+        let Some((host, epoch)) = self.translation.on_its_page(id) else {
             return false;
-        }
+        };
         let script: &'static ReadOnlyScript = match kind {
             ReadKind::Apply => &TRANSLATE_APPLY_READ,
             ReadKind::Restore => &TRANSLATE_RESTORE_READ,
@@ -1382,20 +1706,15 @@ impl App {
     }
 
     fn restore_translation(&mut self, id: u64) {
-        let Some(index) = self.translation.run_index(id) else {
-            return;
-        };
-        if self.translation.runs[index].phase == RunPhase::Translating {
+        if self.translation.translating(id) {
             self.cancel_translate_job();
         }
-        let entries = self.translation.runs[index].applied.clone();
-        if entries.is_empty() {
-            self.forget_run(id);
+        let Some(entries) = self.translation.begin_restore(id) else {
             return;
-        }
-        self.translation.runs[index].phase = RunPhase::Restoring;
-        if !self.run_entries_script(id, ReadKind::Restore, &entries) {
-            // A pagina ja nao esta la: nada a devolver.
+        };
+        // Sem trocas, nada foi a pagina; sem a pagina (navegou), nada a
+        // devolver la.
+        if entries.is_empty() || !self.run_entries_script(id, ReadKind::Restore, &entries) {
             self.forget_run(id);
         }
     }
@@ -1498,7 +1817,7 @@ impl App {
                 }
             }
             WorkerReport::Progress { run, done, total } => {
-                if self.translation.run_index(run).is_some() && total > 1 {
+                if self.translation.translating(run) && total > 1 {
                     self.show_splash(translating_message(done, total), 3);
                 }
             }
@@ -1507,132 +1826,52 @@ impl App {
                 batch: _,
                 entries,
             } => {
-                let Some(index) = self.translation.run_index(run) else {
-                    return;
-                };
-                if entries.is_empty() {
-                    return;
-                }
                 // Conta como traduzida desde AGORA: o APPLY vai a caminho.
-                self.translation.runs[index]
-                    .applied
-                    .extend(entries.iter().cloned());
-                let _ = self.run_entries_script(run, ReadKind::Apply, &entries);
+                if self.translation.accept_batch(run, &entries) {
+                    let _ = self.run_entries_script(run, ReadKind::Apply, &entries);
+                }
             }
             WorkerReport::BatchFailed {
                 run,
                 batch,
                 message,
-            } => {
-                if let Some(index) = self.translation.run_index(run) {
-                    let entry = &mut self.translation.runs[index];
-                    if !entry.failed.contains(&batch) {
-                        entry.failed.push(batch);
-                    }
-                    entry.failure = Some(message);
-                }
-            }
+            } => self.translation.batch_failed(run, batch, message),
             WorkerReport::Finished { run } => self.translation_finished(run),
         }
     }
 
     fn translation_picked(&mut self, id: u64, choice: Pick) {
-        let Some(index) = self.translation.run_index(id) else {
-            return;
-        };
-        let (request, privacy) = {
-            let run = &mut self.translation.runs[index];
-            run.choice = Some(choice.clone());
-            (
-                translation_request(&run.plan, &choice, run.origin.clone(), run.privacy),
-                run.privacy,
-            )
-        };
-        let decision = self.translation_gate().request(request, Day::today());
-        self.translation_decided(id, decision, privacy);
-    }
-
-    /// A decisao do portao para o run: manda, pergunta ou diz porque nao.
-    fn translation_decided(&mut self, id: u64, decision: Decision, privacy: EgressPrivacy) {
-        match decision {
-            Decision::Send => self.send_batches(id),
-            Decision::Ask(card) => {
-                let Some(index) = self.translation.run_index(id) else {
-                    return;
-                };
-                self.translation.runs[index].phase = RunPhase::Asking;
-                let choices = consent_choices(&card, privacy);
-                let view = consent_view(&card, &choices, &self.translation.runs[index].plan);
-                self.show_translate_card(
-                    CardPrompt::Consent {
-                        run: id,
-                        card,
-                        choices,
-                    },
-                    view,
-                );
-            }
-            Decision::Refuse(reason) => {
-                self.abandon_run(id);
-                if reason != crate::egress::RefuseReason::Cancelled {
-                    self.show_splash(reason.message(), 4);
-                }
-            }
-        }
-    }
-
-    /// Manda os blocos do plano a thread (no «Tentar de novo», o plano ja
-    /// e so o que falhou).
-    fn send_batches(&mut self, id: u64) {
-        let Some(index) = self.translation.run_index(id) else {
-            return;
-        };
-        let run = &mut self.translation.runs[index];
-        let Some(choice) = run.choice.clone() else {
-            return;
-        };
-        let batches: Vec<(usize, Batch)> = run.plan.batches.iter().cloned().enumerate().collect();
-        run.phase = RunPhase::Translating;
-        run.failed.clear();
-        run.failure = None;
-        run.sent = batches.len();
-        if !self.submit_translate_job(TranslateJob::Translate {
-            run: id,
-            model: choice.model,
-            batches,
-        }) {
-            self.forget_run(id);
-            self.show_splash(TRANSLATE_UNREADABLE.to_string(), 3);
-        }
+        self.translation_gate_step(|state, gate, today| state.picked(gate, id, choice, today));
     }
 
     fn translation_finished(&mut self, id: u64) {
-        let Some(index) = self.translation.run_index(id) else {
+        let Some(outcome) = self.translation.finish(id) else {
             return;
         };
-        let run = &mut self.translation.runs[index];
-        run.phase = RunPhase::Translated;
-        let total = run.plan.batches.len();
-        let failed = run.failed.len();
-        let failure = run.failure.clone();
-        if failed == 0 {
-            self.show_splash(TRANSLATE_DONE.to_string(), 2);
-            return;
-        }
-        if run.applied.is_empty() && failed == run.sent {
-            // Nada chegou a pagina: nao ha o que devolver.
-            self.forget_run(id);
-            let why = failure.unwrap_or_default();
-            self.show_splash(format!("Não foi possível traduzir: {why}."), 4);
-            return;
-        }
+        let (total, translated, failure) = match outcome {
+            FinishOutcome::Done => {
+                self.show_splash(TRANSLATE_DONE.to_string(), 2);
+                return;
+            }
+            FinishOutcome::Failed(why) => {
+                // Nada chegou a pagina: nao ha o que devolver.
+                self.forget_run(id);
+                self.show_splash(format!("Não foi possível traduzir: {why}."), 4);
+                return;
+            }
+            FinishOutcome::Partial {
+                translated,
+                total,
+                failure,
+            } => (total, translated, failure),
+        };
         let choices = vec![CardChoice::Retry, CardChoice::Close];
         let mut lines = Vec::new();
         if let Some(why) = failure {
             lines.push(format!("Os outros blocos falharam: {why}."));
         }
         let view = CardView {
-            title: partial_message(total - failed, total),
+            title: partial_message(translated, total),
             lines,
             buttons: choices
                 .iter()
@@ -1715,39 +1954,8 @@ impl App {
                 self.open_secret_prompt(KeySlot::Gemini);
             }
             (CardPrompt::Partial { run, .. }, CardChoice::Retry) => {
-                // O plano passa a ser so os blocos que falharam, e o portao
-                // decide de novo (e conta as chamadas outra vez).
-                let Some(index) = self.translation.run_index(run) else {
-                    return;
-                };
-                let (request, privacy) = {
-                    let entry = &mut self.translation.runs[index];
-                    let Some(choice) = entry.choice.clone() else {
-                        return;
-                    };
-                    let failed = std::mem::take(&mut entry.failed);
-                    entry.plan.batches = failed
-                        .iter()
-                        .filter_map(|batch| entry.plan.batches.get(*batch).cloned())
-                        .collect();
-                    entry.plan.chars = entry.plan.batches.iter().map(|batch| batch.chars).sum();
-                    (
-                        translation_request(
-                            &entry.plan,
-                            &choice,
-                            entry.origin.clone(),
-                            entry.privacy,
-                        ),
-                        entry.privacy,
-                    )
-                };
-                let decision = self.translation_gate().request(request, Day::today());
-                if let Decision::Refuse(reason) = decision {
-                    // Fica o que ja estava traduzido; o 文A devolve-o.
-                    self.show_splash(reason.message(), 4);
-                } else {
-                    self.translation_decided(run, decision, privacy);
-                }
+                // Recusado, fica o que ja estava traduzido; o 文A devolve-o.
+                self.translation_gate_step(|state, gate, today| state.retry(gate, run, today));
             }
             (
                 CardPrompt::Consent {
@@ -1762,14 +1970,9 @@ impl App {
                     CardChoice::AlwaysOnSite => ConsentAnswer::AlwaysOnSite,
                     _ => ConsentAnswer::Cancel,
                 };
-                // A pagina navegou enquanto o cartao esperava: nada a mandar
-                // (e nada a contar no consumo).
-                let Some(index) = self.translation.run_index(run) else {
-                    return;
-                };
-                let privacy = self.translation.runs[index].privacy;
-                let decision = self.translation_gate().answer(card, answer, Day::today());
-                self.translation_decided(run, decision, privacy);
+                self.translation_gate_step(|state, gate, today| {
+                    state.consent_answered(gate, run, card, answer, today)
+                });
             }
             _ => {}
         }
@@ -1888,15 +2091,13 @@ impl App {
     /// clique, a traducao era da pagina anterior e sai (os nos ja nao estao
     /// la; a thread para).
     pub(in crate::windows_app) fn translation_page_loaded(&mut self, host: WebViewHost) {
-        let Some(epoch) = self.translation.epoch(host) else {
-            return;
-        };
         let stale: Vec<u64> = self
             .translation
             .runs
             .iter()
-            .filter(|run| run.host == host && run.generation != epoch.current())
+            .filter(|run| run.host == host)
             .map(|run| run.id)
+            .filter(|id| self.translation.on_its_page(*id).is_none())
             .collect();
         for id in stale {
             self.forget_run(id);
