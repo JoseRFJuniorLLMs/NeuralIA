@@ -68,9 +68,13 @@ mod tests {
     #[test]
     fn the_store_table_grants_cleanly_from_one_registry() {
         // Nomes unicos, validos, e um so tipo por nome: a tabela inteira
-        // cabe num registo.
+        // cabe num registo. Unicos sem maiusculas: no NTFS `WebView2` e
+        // `webview2` sao a mesma pasta.
         let registry = StoreRegistry::mint_for_test(std::env::temp_dir().join("neuralia-stores"));
-        let mut names: Vec<&str> = APP_STORES.iter().map(|spec| spec.name).collect();
+        let mut names: Vec<String> = APP_STORES
+            .iter()
+            .map(|spec| spec.name.to_ascii_lowercase())
+            .collect();
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), APP_STORES.len(), "nomes repetidos na tabela");

@@ -5,7 +5,9 @@
 //! os passa. O registo cunha-se UMA vez por processo (`StoreRegistry::mint`,
 //! chamado no `App::new` -- o unico no produto); uma segunda cunhagem devolve
 //! `Err(AlreadyMinted)`. Nem o registo nem o grant tem campos publicos,
-//! `Default`, `Clone` ou construtor publico: fora deste modulo a unica
+//! `Default`, `Clone` ou construtor publico, nem implementam trait nenhum
+//! alem de `Debug` (um `From`, `FromStr` ou `Deserialize` seria um
+//! construtor); o modulo nao tem `unsafe`: fora deste modulo a unica
 //! maneira de ter um grant e pedi-lo ao registo, com uma `StoreSpec` que diz
 //! sempre o tipo (`StoreKind`) da loja. Os testes cunham com
 //! `StoreRegistry::mint_for_test`, que so existe em `cfg(test)` e com a
@@ -16,7 +18,10 @@
 //! definicao ou menu; `Explicit` e conteudo que o utilizador pediu para
 //! guardar; `Automatic` e tudo o que se escreve como efeito lateral do uso,
 //! ate geometria inofensiva (a largura do painel, a posicao do PiP). Um
-//! ficheiro, um tipo. Enquanto o modo partilhado disser `Private`, as
+//! ficheiro, um tipo -- e o NTFS nao distingue maiusculas nem guarda o ponto
+//! final de um nome (`Panel-Width.json` e `panel-width.json.` sao o
+//! `panel-width.json`): o registo compara os nomes sem maiusculas e recusa
+//! partes que acabam em `.`. Enquanto o modo partilhado disser `Private`, as
 //! escritas de um grant `Automatic` nao fazem nada (o `PrivacyGuard` da onda 2
 //! e quem liga o modo; ate la e sempre `Normal`).
 //!
@@ -24,9 +29,11 @@
 //!
 //! - o tecto de bytes confere-se ANTES de ler e de fazer parse;
 //! - sem ficheiro valem os valores por omissao e nada se escreve;
-//! - estragado, de uma versao futura ou grande demais: estado degradado so de
-//!   leitura, o ficheiro fica como esta e ganha uma copia `.bak`; nunca e
-//!   reescrito por cima;
+//! - estragado, de uma versao futura, grande demais ou ilegivel: estado
+//!   degradado so de leitura, o ficheiro fica como esta e nunca e reescrito
+//!   por cima; o estragado e o de uma versao futura (que cabem no tecto)
+//!   ganham uma copia `.bak` com os bytes lidos; o grande demais nao (um
+//!   ficheiro de tamanho qualquer nunca se duplica no disco);
 //! - gravar e temporario + `sync_all` + `rename`: um corte a meio deixa o
 //!   ficheiro antigo ou o novo, nunca meio;
 //! - com `shared_between_windows`, um trinco (`<ficheiro>.lock`) e a releitura
@@ -35,6 +42,10 @@
 //!
 //! `TokenFile` (`read_token`/`write_token`) e o mesmo para os ficheiros de uma
 //! palavra so (`theme`, `gmail`).
+
+// Sem `unsafe`, um grant nao se copia nem se fabrica por baixo (`ptr::read`,
+// `transmute`); o `a_store_cannot_open_without_a_grant` confere esta linha.
+#![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -145,11 +156,19 @@ static MINTED: AtomicBool = AtomicBool::new(false);
 /// let registry = StoreRegistry::mint(std::env::temp_dir()).unwrap();
 /// let _segundo: StoreRegistry = registry.clone();
 /// ```
+///
+/// Nem por um trait de conversao:
+///
+/// ```compile_fail
+/// use neural_core::json_store::StoreRegistry;
+/// let _forjado: StoreRegistry = std::env::temp_dir().into();
+/// ```
 #[derive(Debug)]
 pub struct StoreRegistry {
     data_dir: PathBuf,
     private: Arc<AtomicBool>,
-    granted: Mutex<BTreeMap<&'static str, (StoreKind, StoreShape)>>,
+    /// Os nomes ja dados, sem maiusculas (`store_key`), com o tipo e a forma.
+    granted: Mutex<BTreeMap<String, (StoreKind, StoreShape)>>,
 }
 
 impl StoreRegistry {
@@ -179,16 +198,18 @@ impl StoreRegistry {
 
     /// A unica fonte de grants. O mesmo nome pode ser pedido outra vez com o
     /// mesmo tipo e forma (duas lojas no mesmo ficheiro partilhado); com
-    /// outro, e recusado.
+    /// outro, e recusado. "O mesmo nome" e o mesmo ficheiro no NTFS: sem
+    /// maiusculas (`Panel-Width.json` e o `panel-width.json`).
     pub fn grant(&self, spec: StoreSpec) -> Result<StoreGrant, GrantError> {
         if !valid_store_name(spec.name) {
             return Err(GrantError::BadName(spec.name));
         }
+        let key = store_key(spec.name);
         let mut granted = self
             .granted
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match granted.get(spec.name) {
+        match granted.get(&key) {
             Some(&(kind, shape)) if (kind, shape) != (spec.kind, spec.shape) => {
                 return Err(GrantError::Conflict {
                     name: spec.name,
@@ -198,7 +219,7 @@ impl StoreRegistry {
             }
             Some(_) => {}
             None => {
-                granted.insert(spec.name, (spec.kind, spec.shape));
+                granted.insert(key, (spec.kind, spec.shape));
             }
         }
         let mut path = self.data_dir.clone();
@@ -236,17 +257,24 @@ fn mode_of(flag: &AtomicBool) -> StoreMode {
 
 /// Um nome relativo simples: partes de `[A-Za-z0-9._-]`, separadas por `/`,
 /// sem `.`/`..`, sem raiz nem letra de unidade. Nunca sai da pasta de dados.
+/// Nenhuma parte acaba em `.`: o Windows tira-o ao abrir, e
+/// `panel-width.json.` seria o `panel-width.json` com outro nome.
 fn valid_store_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 96
         && name.split('/').all(|part| {
             !part.is_empty()
-                && part != "."
-                && part != ".."
+                && !part.ends_with('.')
                 && part
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
         })
+}
+
+/// A chave de um nome valido no registo: o ficheiro que o NTFS abre, que nao
+/// distingue maiusculas (os nomes sao ASCII, por isso basta o ASCII).
+fn store_key(name: &str) -> String {
+    name.to_ascii_lowercase()
 }
 
 /// O token de capacidade de uma loja: o caminho, o tipo, a forma e o modo
@@ -269,6 +297,11 @@ fn valid_store_name(name: &str) -> bool {
 /// let spec = StoreSpec::new("a.json", StoreKind::Setting, StoreShape::File);
 /// let grant = registry.grant(spec).unwrap();
 /// let _copia: StoreGrant = grant.clone();
+/// ```
+///
+/// ```compile_fail
+/// use neural_core::json_store::StoreGrant;
+/// let _forjado: StoreGrant = std::path::PathBuf::from("forjado.json").into();
 /// ```
 ///
 /// O mesmo caminho com o grant certo compila:
@@ -340,7 +373,8 @@ pub enum LoadOutcome<T> {
     Degraded {
         value: T,
         why: Degraded,
-        /// A copia `<ficheiro>.bak`, se foi possivel fazer.
+        /// A copia `<ficheiro>.bak` dos bytes lidos, se foi possivel fazer.
+        /// Nunca de um ficheiro `TooLarge` ou `Unreadable` (nao foi lido).
         backup: Option<PathBuf>,
     },
 }
@@ -406,7 +440,9 @@ struct Body<T> {
 enum OnDisk<T> {
     Missing,
     Valid(T),
-    Degraded(Degraded),
+    /// Com os bytes lidos (sempre dentro do tecto) quando chegou a ler:
+    /// `Corrupt` e `FutureVersion`; `TooLarge` e `Unreadable` nao os tem.
+    Degraded(Degraded, Option<Vec<u8>>),
 }
 
 /// Um JSON `{"version":N,"data":T}` numa loja de ficheiro, aberto com o seu
@@ -478,8 +514,9 @@ impl<T: Serialize + DeserializeOwned + Default> VersionedJsonStore<T> {
     }
 
     /// Le o ficheiro. Nunca escreve o ficheiro: sem ele valem os valores por
-    /// omissao; degradado, a loja passa a so de leitura e o ficheiro ganha
-    /// uma copia `.bak` (se as escritas estao permitidas).
+    /// omissao; degradado, a loja passa a so de leitura e, se o que leu cabe
+    /// no tecto (estragado ou de uma versao futura) e as escritas estao
+    /// permitidas, guarda esses bytes numa copia `.bak`.
     pub fn load(&mut self) -> LoadOutcome<T> {
         match self.on_disk() {
             OnDisk::Missing => {
@@ -490,8 +527,8 @@ impl<T: Serialize + DeserializeOwned + Default> VersionedJsonStore<T> {
                 self.read_only = None;
                 LoadOutcome::Loaded(value)
             }
-            OnDisk::Degraded(why) => {
-                let backup = self.degrade(why.clone());
+            OnDisk::Degraded(why, read) => {
+                let backup = self.degrade(why.clone(), read);
                 LoadOutcome::Degraded {
                     value: T::default(),
                     why,
@@ -514,8 +551,8 @@ impl<T: Serialize + DeserializeOwned + Default> VersionedJsonStore<T> {
         let bytes = self.encode(value)?;
         self.ensure_parent()?;
         let _lock = self.lock()?;
-        if let OnDisk::Degraded(why) = self.on_disk() {
-            self.degrade(why.clone());
+        if let OnDisk::Degraded(why, read) = self.on_disk() {
+            self.degrade(why.clone(), read);
             return Err(StoreError::ReadOnly(why));
         }
         write_atomically(&self.grant.path, &bytes)?;
@@ -532,7 +569,7 @@ impl<T: Serialize + DeserializeOwned + Default> VersionedJsonStore<T> {
         if !self.grant.writes_allowed() {
             let mut value = match self.on_disk() {
                 OnDisk::Valid(value) => value,
-                OnDisk::Missing | OnDisk::Degraded(_) => T::default(),
+                OnDisk::Missing | OnDisk::Degraded(..) => T::default(),
             };
             return Ok((change(&mut value), SaveOutcome::SkippedPrivate));
         }
@@ -544,8 +581,8 @@ impl<T: Serialize + DeserializeOwned + Default> VersionedJsonStore<T> {
         let mut value = match self.on_disk() {
             OnDisk::Missing => T::default(),
             OnDisk::Valid(value) => value,
-            OnDisk::Degraded(why) => {
-                self.degrade(why.clone());
+            OnDisk::Degraded(why, read) => {
+                self.degrade(why.clone(), read);
                 return Err(StoreError::ReadOnly(why));
             }
         };
@@ -574,64 +611,70 @@ impl<T: Serialize + DeserializeOwned + Default> VersionedJsonStore<T> {
     }
 
     fn on_disk(&self) -> OnDisk<T> {
+        let unread = |why| OnDisk::Degraded(why, None);
         let path = &self.grant.path;
         let file = match File::open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return OnDisk::Missing,
-            Err(error) => return OnDisk::Degraded(Degraded::Unreadable(error.kind())),
+            Err(error) => return unread(Degraded::Unreadable(error.kind())),
         };
         // O tecto antes de ler um byte: um ficheiro enorme nunca chega ao
         // parser (nem a memoria).
         let len = match file.metadata() {
             Ok(meta) if meta.is_dir() => {
-                return OnDisk::Degraded(Degraded::Unreadable(io::ErrorKind::IsADirectory));
+                return unread(Degraded::Unreadable(io::ErrorKind::IsADirectory));
             }
             Ok(meta) => meta.len(),
-            Err(error) => return OnDisk::Degraded(Degraded::Unreadable(error.kind())),
+            Err(error) => return unread(Degraded::Unreadable(error.kind())),
         };
         if len > self.max_bytes {
-            return OnDisk::Degraded(Degraded::TooLarge {
+            return unread(Degraded::TooLarge {
                 bytes: len,
                 max: self.max_bytes,
             });
         }
         let mut bytes = Vec::new();
         if let Err(error) = file.take(self.max_bytes + 1).read_to_end(&mut bytes) {
-            return OnDisk::Degraded(Degraded::Unreadable(error.kind()));
+            return unread(Degraded::Unreadable(error.kind()));
         }
         // Cresceu entre o metadata e a leitura.
         if bytes.len() as u64 > self.max_bytes {
-            return OnDisk::Degraded(Degraded::TooLarge {
+            return unread(Degraded::TooLarge {
                 bytes: bytes.len() as u64,
                 max: self.max_bytes,
             });
         }
         let Ok(head) = serde_json::from_slice::<Head>(&bytes) else {
-            return OnDisk::Degraded(Degraded::Corrupt);
+            return OnDisk::Degraded(Degraded::Corrupt, Some(bytes));
         };
         if head.version == 0 {
-            return OnDisk::Degraded(Degraded::Corrupt);
+            return OnDisk::Degraded(Degraded::Corrupt, Some(bytes));
         }
         if head.version > self.version {
-            return OnDisk::Degraded(Degraded::FutureVersion {
+            let why = Degraded::FutureVersion {
                 found: head.version,
                 known: self.version,
-            });
+            };
+            return OnDisk::Degraded(why, Some(bytes));
         }
         match serde_json::from_slice::<Body<T>>(&bytes) {
             Ok(body) => OnDisk::Valid(body.data),
-            Err(_) => OnDisk::Degraded(Degraded::Corrupt),
+            Err(_) => OnDisk::Degraded(Degraded::Corrupt, Some(bytes)),
         }
     }
 
-    /// Passa a so de leitura e faz a copia `.bak` do ficheiro como esta.
-    fn degrade(&mut self, why: Degraded) -> Option<PathBuf> {
+    /// Passa a so de leitura e guarda na copia `.bak` os bytes que leu. So o
+    /// que foi lido dentro do tecto vai para la: um ficheiro grande demais
+    /// (ou que nao se le) fica como esta e sem copia, e a copia nunca passa
+    /// do tecto por mais que o ficheiro cresca.
+    fn degrade(&mut self, why: Degraded, read: Option<Vec<u8>>) -> Option<PathBuf> {
         self.read_only = Some(why);
         if !self.grant.writes_allowed() {
             return None;
         }
+        let bytes = read?;
         let backup = sibling(&self.grant.path, ".bak");
-        fs::copy(&self.grant.path, &backup).ok().map(|_| backup)
+        write_atomically(&backup, &bytes).ok().map(|()| backup)
     }
 
     fn ensure_parent(&self) -> io::Result<()> {
@@ -957,14 +1000,39 @@ mod tests {
         let max = valid.len() as u64 - 1;
         fs::write(&path, &valid).expect("grande");
         let mut store = open(&registry, max);
-        assert!(matches!(
+        // Grande demais nao ganha `.bak`: nunca foi lido, e copia-lo
+        // duplicava no disco um ficheiro de tamanho qualquer a cada abertura.
+        assert_eq!(
             store.load(),
             LoadOutcome::Degraded {
-                why: Degraded::TooLarge { .. },
-                ..
+                value: Prefs::default(),
+                why: Degraded::TooLarge {
+                    bytes: max + 1,
+                    max
+                },
+                backup: None,
             }
+        );
+        assert!(matches!(
+            store.save(&Prefs::default()),
+            Err(StoreError::ReadOnly(Degraded::TooLarge { .. }))
+        ));
+        // Nem uma loja que grava sem ler antes.
+        let mut blind = open(&registry, max);
+        assert!(matches!(
+            blind.save(&Prefs::default()),
+            Err(StoreError::ReadOnly(Degraded::TooLarge { .. }))
+        ));
+        assert!(matches!(
+            blind.update(|prefs| prefs.count += 1),
+            Err(StoreError::ReadOnly(Degraded::TooLarge { .. }))
         ));
         assert_eq!(fs::read(&path).expect("ficheiro"), valid);
+        assert_eq!(
+            entries(&dir),
+            vec!["prefs.json".to_string()],
+            "um ficheiro grande demais ganhou uma copia"
+        );
         // Com o tecto certo, o mesmo ficheiro le-se: foi so o tamanho.
         assert!(matches!(
             open(&registry, max + 1).load(),
@@ -1081,6 +1149,42 @@ mod tests {
                 .is_err()
         );
         assert!(registry.grant(WIDTH).is_ok());
+        // O NTFS nao distingue maiusculas: `Panel-Width.json` e o mesmo
+        // ficheiro, e um `Setting` nele escrevia o `Automatic` no modo
+        // privado. O mesmo tipo com outras maiusculas e o mesmo grant.
+        assert_eq!(
+            registry
+                .grant(StoreSpec::new(
+                    "Panel-Width.json",
+                    StoreKind::Setting,
+                    StoreShape::File
+                ))
+                .err(),
+            Some(GrantError::Conflict {
+                name: "Panel-Width.json",
+                granted: StoreKind::Automatic,
+                granted_shape: StoreShape::File,
+            })
+        );
+        assert_eq!(
+            registry
+                .grant(StoreSpec::new(
+                    "PANEL-WIDTH.JSON",
+                    StoreKind::Automatic,
+                    StoreShape::File
+                ))
+                .map(|grant| grant.kind()),
+            Ok(StoreKind::Automatic)
+        );
+        assert!(
+            registry
+                .grant(StoreSpec::new(
+                    "NOTAS",
+                    StoreKind::Explicit,
+                    StoreShape::File
+                ))
+                .is_err()
+        );
 
         // Uma loja de pasta nao abre como ficheiro JSON.
         assert!(matches!(
@@ -1145,6 +1249,10 @@ mod tests {
             "./a",
             "espaco .json",
             "ç.json",
+            // O Windows tira o ponto final: seria o `panel-width.json`.
+            "panel-width.json.",
+            "ai./settings.json",
+            "...",
         ] {
             assert_eq!(
                 registry
@@ -1225,12 +1333,208 @@ mod tests {
         assert!(test.grant(PREFS).is_ok());
     }
 
+    const CAPABILITIES: [&str; 2] = ["StoreGrant", "StoreRegistry"];
+
+    /// O codigo Rust em tokens, sem comentarios: identificadores, cada
+    /// literal de texto, byte ou caracter vira `""`, e o resto e um caracter
+    /// de pontuacao cada. Chega para achar cabecalhos de `impl`, literais de
+    /// struct e chamadas sem se perder em chavetas dentro de um texto.
+    fn rust_tokens(code: &str) -> Vec<&str> {
+        let mut tokens = Vec::new();
+        let mut rest = code;
+        while let Some(first) = rest.chars().next() {
+            let (len, token) = if first.is_whitespace() {
+                (first.len_utf8(), None)
+            } else if rest.starts_with("//") {
+                (rest.find('\n').unwrap_or(rest.len()), None)
+            } else if rest.starts_with("/*") {
+                (rest.find("*/").map_or(rest.len(), |end| end + 2), None)
+            } else if let Some(len) = literal_len(rest) {
+                (len, Some("\"\""))
+            } else if first.is_alphanumeric() || first == '_' {
+                let len = rest
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                (len, Some(&rest[..len]))
+            } else {
+                (first.len_utf8(), Some(&rest[..first.len_utf8()]))
+            };
+            tokens.extend(token);
+            rest = &rest[len..];
+        }
+        tokens
+    }
+
+    /// O comprimento do literal no inicio de `text` (`"..."`, `b"..."`,
+    /// `r#"..."#`, `'x'`, `b'\n'`), ou `None` (um tempo de vida `'a` nao e
+    /// literal; um identificador que comeca por `b`/`r` tambem nao).
+    fn literal_len(text: &str) -> Option<usize> {
+        let prefix = if text.starts_with("br") {
+            2
+        } else if text.starts_with(['b', 'r']) {
+            1
+        } else {
+            0
+        };
+        let body = &text[prefix..];
+        if text[..prefix].ends_with('r') {
+            let hashes = body.len() - body.trim_start_matches('#').len();
+            let open = body[hashes..].strip_prefix('"')?;
+            let close = format!("\"{}", "#".repeat(hashes));
+            return open
+                .find(&close)
+                .map(|end| prefix + hashes + 1 + end + close.len());
+        }
+        if let Some(inner) = body.strip_prefix('"') {
+            let mut escaped = false;
+            for (at, c) in inner.char_indices() {
+                match c {
+                    _ if escaped => escaped = false,
+                    '\\' => escaped = true,
+                    '"' => return Some(prefix + 1 + at + 1),
+                    _ => {}
+                }
+            }
+            return None;
+        }
+        let inner = body.strip_prefix('\'')?;
+        let len = if inner.starts_with('\\') {
+            inner.get(2..)?.find('\'')? + 3
+        } else {
+            let c = inner.chars().next()?;
+            if !inner[c.len_utf8()..].starts_with('\'') {
+                return None;
+            }
+            c.len_utf8() + 1
+        };
+        Some(prefix + 1 + len)
+    }
+
+    enum Scope<'a> {
+        Impl(Vec<&'a str>),
+        Fn(&'a str),
+        Block,
+    }
+
+    fn innermost_fn<'a>(stack: &[Scope<'a>]) -> &'a str {
+        stack
+            .iter()
+            .rev()
+            .find_map(|scope| match scope {
+                Scope::Fn(name) => Some(*name),
+                _ => None,
+            })
+            .unwrap_or("-")
+    }
+
+    /// Onde o codigo do modulo nomeia um grant ou o registo.
+    #[derive(Debug, Default)]
+    struct CapabilitySites {
+        /// Cada cabecalho de `impl`, a qualquer profundidade, que os nomeia.
+        impls: Vec<String>,
+        /// Cada literal `StoreGrant { .. }`/`StoreRegistry { .. }` (ou
+        /// `Self { .. }` num impl deles) e a funcao onde esta.
+        literals: Vec<String>,
+        /// As funcoes que chamam o `build` do registo.
+        build_calls: Vec<String>,
+        /// `type`, `use`, `const` ou `static` que os nomeiam.
+        aliases: Vec<String>,
+    }
+
+    fn capability_sites(tokens: &[&str]) -> CapabilitySites {
+        let names = |text: &[&str]| CAPABILITIES.into_iter().find(|cap| text.contains(cap));
+        let mut sites = CapabilitySites::default();
+        let mut stack: Vec<Scope> = Vec::new();
+        let mut pending: Option<Scope> = None;
+        for (index, &token) in tokens.iter().enumerate() {
+            let before = |back: usize| index.checked_sub(back).map_or("", |at| tokens[at]);
+            let next = tokens.get(index + 1).copied().unwrap_or("");
+            let until = |end: &str| -> Vec<&str> {
+                tokens[index..]
+                    .iter()
+                    .copied()
+                    .take_while(|token| *token != end && *token != "{")
+                    .collect()
+            };
+            match token {
+                // Um `impl` de item (nao o `impl Trait` de um argumento).
+                "impl" if matches!(before(1), "" | "}" | ";" | "]" | "{" | "unsafe") => {
+                    let header = until(";");
+                    if names(header.as_slice()).is_some() {
+                        sites.impls.push(header.join(" "));
+                    }
+                    pending = Some(Scope::Impl(header));
+                }
+                "fn" if next.starts_with(|c: char| c.is_alphabetic() || c == '_') => {
+                    pending = Some(Scope::Fn(next));
+                }
+                "{" => stack.push(pending.take().unwrap_or(Scope::Block)),
+                "}" => {
+                    stack.pop();
+                }
+                ";" if matches!(pending, Some(Scope::Fn(_))) => pending = None,
+                // `&'static str` e um tempo de vida, nao um item.
+                "type" | "use" | "const" | "static" if next != "fn" && before(1) != "'" => {
+                    let item = tokens[index..]
+                        .iter()
+                        .copied()
+                        .take_while(|token| *token != ";")
+                        .collect::<Vec<_>>();
+                    if names(item.as_slice()).is_some() {
+                        sites.aliases.push(item.join(" "));
+                    }
+                }
+                "build" if next == "(" && matches!(before(1), ":" | ".") => {
+                    sites.build_calls.push(innermost_fn(&stack).to_string());
+                }
+                _ => {}
+            }
+            // Um literal de struct: `Nome {` que nao e a declaracao, o
+            // cabecalho de um impl nem o tipo devolvido antes do corpo.
+            let return_type = before(1) == ">" && before(2) == "-";
+            if next == "{" && !return_type && !matches!(before(1), "struct" | "impl" | "for") {
+                let built = if CAPABILITIES.contains(&token) {
+                    Some(token)
+                } else if token == "Self" {
+                    stack
+                        .iter()
+                        .rev()
+                        .find_map(|scope| match scope {
+                            Scope::Impl(header) => Some(names(header.as_slice())),
+                            _ => None,
+                        })
+                        .flatten()
+                } else {
+                    None
+                };
+                if let Some(cap) = built {
+                    sites
+                        .literals
+                        .push(format!("{cap} em {}", innermost_fn(&stack)));
+                }
+            }
+        }
+        assert!(
+            stack.is_empty() && pending.is_none(),
+            "chavetas desalinhadas: o leitor de tokens perdeu-se"
+        );
+        sites.impls.sort();
+        sites.literals.sort();
+        sites.build_calls.sort();
+        sites
+    }
+
     /// Os doctests `compile_fail` deste modulo provam que fora dele nao ha
-    /// grant nem registo sem a cunhagem (literal, `clone`, `Default`) e que
-    /// `VersionedJsonStore::open` nao aceita um caminho. Isto prova o que um
-    /// doctest nao consegue: nenhuma funcao publica (com outro nome
+    /// grant nem registo sem a cunhagem (literal, `clone`, `Default`, `From`)
+    /// e que `VersionedJsonStore::open` nao aceita um caminho. Isto prova o
+    /// que um doctest nao consegue: nenhuma funcao publica (com outro nome
     /// qualquer) devolve um `StoreGrant` ou um `StoreRegistry`, alem das tres
-    /// portas; e os doctests continuam aqui.
+    /// portas; nenhum trait (`From`, `TryFrom`, `FromStr`, `Deserialize`...)
+    /// os implementa -- so os `impl` inerentes e o `#[derive(Debug)]`; um
+    /// grant so se constroi no `grant` e um registo so no `build`, que so as
+    /// duas cunhagens chamam; nao ha `unsafe`, `macro_rules!`, `include!`,
+    /// submodulos nem apelidos que escondam isto; e os doctests continuam
+    /// aqui.
     #[test]
     fn a_store_cannot_open_without_a_grant() {
         let source = include_str!("json_store.rs").replace("\r\n", "\n");
@@ -1285,34 +1589,63 @@ mod tests {
             vec!["grant", "mint", "mint_for_test"],
             "so estas tres funcoes publicas dao um grant ou um registo"
         );
-        // Nem Clone/Copy/Default, derivados ou a mao.
-        for capability in ["StoreGrant", "StoreRegistry"] {
+        // Nenhum derive alem de `Debug`: `Clone`, `Default`, `Deserialize`...
+        // seriam uma porta com outro nome. So `#[derive(Debug)]`, sem outros
+        // atributos.
+        for capability in CAPABILITIES {
             let declared = code
                 .split(&format!("pub struct {capability} {{"))
                 .next()
                 .and_then(|before| before.rsplit("\n\n").next())
                 .expect("a struct e a sua doc");
-            let derives: String = declared
+            let attributes: Vec<&str> = declared
                 .lines()
-                .filter(|line| line.trim_start().starts_with("#[derive("))
+                .map(str::trim)
+                .filter(|line| line.starts_with("#["))
                 .collect();
-            for forbidden in ["Clone", "Copy", "Default"] {
-                assert!(
-                    !derives.contains(forbidden),
-                    "{capability} nao pode derivar {forbidden}"
-                );
-                assert!(
-                    !code.contains(&format!("impl {forbidden} for {capability}")),
-                    "{capability} nao pode implementar {forbidden}"
-                );
-            }
+            assert_eq!(
+                attributes,
+                vec!["#[derive(Debug)]"],
+                "{capability}: so #[derive(Debug)]"
+            );
             assert!(
                 !code.contains(&format!("pub struct {capability}(")),
                 "{capability} sem campos de tupla"
             );
         }
+        // Nenhum trait escrito a mao (`impl From<PathBuf> for StoreGrant`,
+        // `FromStr`, `TryFrom`, `Default`...): so os dois impl inerentes. E um
+        // grant ou um registo so se constroem nos seus dois sitios.
+        let tokens = rust_tokens(code);
+        let sites = capability_sites(&tokens);
+        assert_eq!(
+            sites.impls,
+            vec!["impl StoreGrant", "impl StoreRegistry"],
+            "so os impl inerentes nomeiam um grant ou o registo: nenhum `impl <Trait> for`"
+        );
+        assert_eq!(
+            sites.literals,
+            vec!["StoreGrant em grant", "StoreRegistry em build"],
+            "um grant so se constroi no `grant` e um registo so no `build`"
+        );
+        assert_eq!(
+            sites.build_calls,
+            vec!["mint", "mint_for_test"],
+            "so as duas cunhagens chamam o `build` do registo"
+        );
+        assert_eq!(
+            sites.aliases,
+            Vec::<String>::new(),
+            "sem `type`, `use`, `const` ou `static` com um grant ou o registo"
+        );
+        // Nada que gere codigo fora da vista deste gate, nem `unsafe` (que
+        // copiava um grant com `ptr::read`).
+        for hidden in ["macro_rules", "include", "mod", "unsafe"] {
+            assert!(!tokens.contains(&hidden), "`{hidden}` no codigo das lojas");
+        }
+        assert!(code.contains("\n#![forbid(unsafe_code)]\n"));
         // Os campos das duas sao privados.
-        for capability in ["StoreGrant", "StoreRegistry"] {
+        for capability in CAPABILITIES {
             let body = code
                 .split(&format!("pub struct {capability} {{"))
                 .nth(1)
@@ -1333,8 +1666,10 @@ mod tests {
         for door in [
             "let _forjado = StoreGrant {",
             "let _copia: StoreGrant = grant.clone();",
+            "let _forjado: StoreGrant = std::path::PathBuf::from(\"forjado.json\").into();",
             "let _forjado = StoreRegistry {",
             "let _segundo: StoreRegistry = registry.clone();",
+            "let _forjado: StoreRegistry = std::env::temp_dir().into();",
             "VersionedJsonStore::<Vec<u32>>::open(std::path::PathBuf::from(\"x.json\"), 1, 4096);",
             "let _sem_tipo = StoreSpec {",
         ] {
