@@ -1,0 +1,21 @@
+{
+   "checksum": "00000000000000000000000000000000",
+   "roots": {
+      "bookmark_bar": {
+         "children": [ {
+            "date_added": "13393209600000000",
+            "id": "5",
+            "name": "Intranet",
+            "type": "url",
+            "url": "https://intranet.example.org/"
+         } ],
+         "date_added": "13393209600000000",
+         "id": "1",
+         "name": "Barra de favoritos",
+         "type": "folder"
+      },
+      "other": { "children": [ ], "id": "2", "name": "Outros favoritos", "type": "folder" },
+      "synced": { "children": [ ], "id": "3", "name": "Favoritos do celular", "type": "folder" }
+   },
+   "version": 1
+}

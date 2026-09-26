@@ -1346,10 +1346,12 @@ fn panel_html_is_assembled_from_its_section_assets() {
         "panel.css",
         "history.html",
         "notes.html",
+        "bookmarks.html",
         "downloads.html",
         "core.js",
         "history.js",
         "notes.js",
+        "bookmarks.js",
         "downloads.js",
         "tabs.js",
     ] {
@@ -1569,7 +1571,9 @@ fn every_ai_column_has_its_own_back_and_forward_after_its_plus() {
 /// depois do "+", sem se sobrepor ao vizinho nem entrar na coluna seguinte
 /// ou no canto direito, e o clique no centro dele volta a ser ELE -- ou
 /// nao existe (largura 0, e nada o encontra). O grupo e tudo ou nada: numa
-/// coluna, ou todos os botoes existem ou nenhum.
+/// coluna, ou todos os botoes obrigatorios existem ou nenhum; um opcional
+/// (a estrela) so existe com eles, e so com a pilula de pelo menos
+/// `COLUMN_PILL_MIN`.
 #[test]
 fn column_buttons_fit_or_vanish() {
     assert_eq!(COLUMN_BUTTONS, ColumnButton::ALL.len());
@@ -1593,11 +1597,33 @@ fn column_buttons_fit_or_vanish() {
                         .map(|button| layout.column_button(index, *button))
                         .collect();
                     let shown = rects.iter().filter(|rect| rect.width > 0.0).count();
+                    let required: Vec<bool> = ColumnButton::ALL
+                        .iter()
+                        .zip(&rects)
+                        .filter(|(button, _)| !button.optional())
+                        .map(|(_, rect)| rect.width > 0.0)
+                        .collect();
+                    let required_shown = required.iter().filter(|shown| **shown).count();
                     assert!(
-                        shown == 0 || shown == rects.len(),
-                        "{at}: coluna {index} com {shown} de {} botoes",
-                        rects.len()
+                        required_shown == 0 || required_shown == required.len(),
+                        "{at}: coluna {index} com {required_shown} de {} botoes",
+                        required.len()
                     );
+                    for (button, rect) in ColumnButton::ALL.iter().zip(&rects) {
+                        if button.optional() && rect.width > 0.0 {
+                            assert_eq!(
+                                required_shown,
+                                required.len(),
+                                "{at}: {} sem os outros na coluna {index}",
+                                button.glyph()
+                            );
+                            assert!(
+                                layout.columns[index].width >= COLUMN_PILL_MIN * scale - 1e-9,
+                                "{at}: {} com a pilula da coluna {index} ilegivel",
+                                button.glyph()
+                            );
+                        }
+                    }
                     if shown == 0 {
                         vanished += 1;
                         for (button, rect) in ColumnButton::ALL.iter().zip(&rects) {
@@ -1622,6 +1648,11 @@ fn column_buttons_fit_or_vanish() {
                     };
                     let mut previous_right = plus.x + plus.width;
                     for (button, rect) in ColumnButton::ALL.iter().zip(&rects) {
+                        if rect.width == 0.0 {
+                            // Um opcional que cedeu: nada o encontra.
+                            assert!(button.optional(), "{at}: {}", button.glyph());
+                            continue;
+                        }
                         assert!(
                             rect.x >= previous_right,
                             "{at}: {} da coluna {index} sobrepoe o anterior",
@@ -9729,17 +9760,25 @@ fn origin_kind(origin: CommandOrigin) -> OriginKind {
 
 /// O `AcceleratorKeyPressed` de cada WebView consulta `accelerator_lookup`
 /// e so marca `Handled` quando ela prende a tecla. Com o mapa do produto
-/// ela hoje prende so o Ctrl+J dos Downloads (downloads-ui, `Global`), em
-/// cada hospedeiro menos o monitor do Gmail -- a descida e a repeticao,
-/// nunca a subida, e o comando so na primeira descida. Nenhum outro dos
-/// dez atalhos nativos do plano da 2.3 (cada um entra no PR do seu
-/// comando), nem os da janela e da omnibox (nas paginas continuam a ser do
+/// ela prende so os atalhos `Global`: o Ctrl+D dos favoritos e o Ctrl+J dos
+/// Downloads (downloads-ui), cada um no PR do seu comando (regra C13), em
+/// cada hospedeiro menos o monitor do Gmail e com esse hospedeiro como
+/// origem -- a descida e a repeticao, nunca a subida, e o comando so na
+/// primeira descida. Nenhum outro dos atalhos nativos do plano da 2.3, nem
+/// os da janela e da omnibox (nas paginas continuam a ser do
 /// `NEURALIA_KEYMAP_SCRIPT`).
 #[test]
-fn accelerator_lookup_binds_only_the_downloads_chord_on_webviews() {
+fn accelerator_lookup_binds_only_the_global_chords_on_webviews() {
+    let ctrl_d = Chord::ctrl(b'D');
+    let ctrl_j = Chord::ctrl(b'J');
+    // Os atalhos que as WebViews prendem, com o comando de cada um.
+    let global = [
+        (ctrl_d, CommandId::Bookmark),
+        (ctrl_j, CommandId::Downloads),
+    ];
     let mut chords = vec![
-        Chord::ctrl(b'D'),
-        Chord::ctrl(b'J'),
+        ctrl_d,
+        ctrl_j,
         Chord::ctrl_shift(b'E'),
         Chord::ctrl_shift(b'A'),
         Chord::ctrl_shift(b'N'),
@@ -9754,7 +9793,6 @@ fn accelerator_lookup_binds_only_the_downloads_chord_on_webviews() {
     for row in COMMANDS {
         chords.extend(row.chords.iter().map(|spec| spec.chord));
     }
-    let ctrl_j = Chord::ctrl(b'J');
     let hosts = every_host();
     let mut consulted = 0usize;
     let mut bound = 0usize;
@@ -9776,39 +9814,73 @@ fn accelerator_lookup_binds_only_the_downloads_chord_on_webviews() {
                 !release.handled && release.event.is_none(),
                 "{host:?} {chord:?}: a subida foi tratada"
             );
-            if chord == ctrl_j && host != WebViewHost::GmailMonitor {
-                assert!(decision.handled, "{host:?}: o Ctrl+J chegou a pagina");
-                assert!(
-                    matches!(
-                        decision.event,
-                        Some(UserEvent::RunCommandKey {
-                            key: CommandId::Downloads,
-                            origin: CommandOrigin::Host(from),
-                        }) if from == host
-                    ),
-                    "{host:?}: {:?}",
-                    decision.event
-                );
-                assert!(repeat.handled && repeat.event.is_none(), "{host:?}");
-                bound += 1;
-            } else {
-                assert!(!decision.handled, "{host:?} {chord:?}");
-                assert!(decision.event.is_none(), "{host:?} {chord:?}");
-                assert!(
-                    !repeat.handled && repeat.event.is_none(),
-                    "{host:?} {chord:?}"
-                );
+            let command = global
+                .iter()
+                .find(|(key, _)| *key == chord)
+                .map(|(_, command)| *command);
+            match command {
+                Some(command) if host != WebViewHost::GmailMonitor => {
+                    assert!(
+                        decision.handled,
+                        "{host:?}: o {chord:?} ({command:?}) chegou a pagina"
+                    );
+                    assert!(
+                        matches!(
+                            decision.event,
+                            Some(UserEvent::RunCommandKey {
+                                key,
+                                origin: CommandOrigin::Host(from),
+                            }) if key == command && from == host
+                        ),
+                        "{host:?} {command:?}: {:?}",
+                        decision.event
+                    );
+                    assert!(
+                        repeat.handled && repeat.event.is_none(),
+                        "{host:?} {command:?}"
+                    );
+                    bound += 1;
+                }
+                _ => {
+                    assert!(!decision.handled, "{host:?} {chord:?}");
+                    assert!(decision.event.is_none(), "{host:?} {chord:?}");
+                    assert!(
+                        !repeat.handled && repeat.event.is_none(),
+                        "{host:?} {chord:?}"
+                    );
+                }
             }
         }
     }
     assert_eq!(consulted, hosts.len() * chords.len() * 3);
-    // Cada hospedeiro com teclado, uma vez por cada Ctrl+J da lista.
+    // Cada hospedeiro com teclado, uma vez por cada Ctrl+D e Ctrl+J da
+    // lista.
     let with_keyboard = hosts
         .iter()
         .filter(|host| **host != WebViewHost::GmailMonitor)
         .count();
-    let listed = chords.iter().filter(|chord| **chord == ctrl_j).count();
+    let listed = chords
+        .iter()
+        .filter(|chord| global.iter().any(|(key, _)| key == *chord))
+        .count();
     assert_eq!(bound, with_keyboard * listed);
+    // E sao os unicos atalhos fora do ambito da janela.
+    let outside_window: Vec<(CommandId, KeyScope, Chord)> = COMMANDS
+        .iter()
+        .flat_map(|row| {
+            row.chords
+                .iter()
+                .filter(|spec| spec.scope != KeyScope::Window)
+                .map(move |spec| (row.id, spec.scope, spec.chord))
+        })
+        .collect();
+    assert_eq!(
+        outside_window,
+        [
+            (CommandId::Bookmark, KeyScope::Global, ctrl_d),
+            (CommandId::Downloads, KeyScope::Global, ctrl_j),
+        ]
+    );
 }
 
 /// Gate (critico: uma pagina nao sintetiza comandos): a tabela da decisao.
@@ -9970,8 +10042,9 @@ fn accelerator_decision_table() {
             }
         }
     }
-    // Os sete da 2.2.0 e o Ctrl+J `Global` dos Downloads.
-    assert_eq!(window_chords, 2 * 8);
+    // Os sete da 2.2.0, o Ctrl+D dos favoritos e o Ctrl+J dos Downloads
+    // (os dois `Global`, valem tambem la).
+    assert_eq!(window_chords, 2 * 9);
 }
 
 /// Gate (critico): um atalho por ambito. Dois comandos com a mesma tecla no
@@ -9979,7 +10052,8 @@ fn accelerator_decision_table() {
 /// mesma tecla em ambitos diferentes e de cada um. O registo do produto
 /// vira mapa, cada comando tem uma linha, e os atalhos sao os da 2.2.0 (no
 /// ambito da janela) mais os que cada feature da 2.3 trouxe com o seu
-/// comando (regra C13): o Ctrl+J `Global` dos Downloads.
+/// comando (regra C13): o Ctrl+D `Global` dos favoritos e o Ctrl+J `Global`
+/// dos Downloads.
 #[test]
 fn keymap_chords_are_unique_per_scope() {
     use CommandId::{History, Home};
@@ -10047,6 +10121,7 @@ fn keymap_chords_are_unique_per_scope() {
                 KeyScope::Window,
                 Chord::ctrl_shift(0x2E)
             ),
+            (CommandId::Bookmark, KeyScope::Global, Chord::ctrl(b'D')),
             (CommandId::Downloads, KeyScope::Global, Chord::ctrl(b'J')),
         ]
     );
@@ -10554,6 +10629,13 @@ fn resolve_command_runs_against_its_origin() {
         (CommandId::SplitFullscreen, UserEvent::ToggleSplitFullscreen),
         (CommandId::Exit, UserEvent::ExitRequested),
         (
+            CommandId::Bookmark,
+            UserEvent::Bookmarks(BookmarksEvent::Request {
+                target: BookmarkTarget::Window,
+                via: BookmarkVia::Shortcut,
+            }),
+        ),
+        (
             CommandId::Downloads,
             UserEvent::DownloadsUi(DownloadsUiEvent::Show),
         ),
@@ -10568,8 +10650,9 @@ fn resolve_command_runs_against_its_origin() {
                 "{id:?} {origin:?}"
             );
         }
-        // Os que nao dependem da pagina: o mesmo de qualquer hospedeiro.
-        if !matches!(id, Reload | NewNote | NewTab) {
+        // Os que nao dependem da pagina: o mesmo de qualquer hospedeiro. O
+        // Ctrl+D depende (`ctrl_d_runs_against_the_host_it_came_from`).
+        if !matches!(id, Reload | NewNote | NewTab | CommandId::Bookmark) {
             for host in every_host() {
                 let got = debug(resolve_command(id, CommandOrigin::Host(host)));
                 if host == WebViewHost::GmailMonitor {
@@ -10755,6 +10838,8 @@ fn bar_hit_command_is_exhaustive() {
         (BarHit::Forward, None),
         (BarHit::ColumnBack(0), None),
         (BarHit::ColumnForward(1), None),
+        (BarHit::ColumnBookmark(2), None),
+        (BarHit::SplitBookmark, None),
         (BarHit::Column(2), None),
         (BarHit::AddTab(0), None),
         (
@@ -10908,8 +10993,9 @@ fn the_window_and_the_omnibox_share_one_keymap() {
         assert_eq!(command(&window), command(&omnibox), "{chord:?}");
         bound += usize::from(window.handled);
     }
-    // Os sete da 2.2.0 e o Ctrl+J dos Downloads (o do registo e o da lista).
-    assert_eq!(bound, 9);
+    // Os sete da 2.2.0, o Ctrl+D dos favoritos (Global) e o Ctrl+J dos
+    // Downloads (o do registo e o da lista).
+    assert_eq!(bound, 10);
     // Os dois caminhos passam pelo mapa (presenca); a lista antiga saiu.
     let source = shipped_source();
     assert!(source.contains("let decision = keymap_decision(input, CommandOrigin::Window);"));
@@ -19489,6 +19575,11 @@ fn the_tools_never_take_room_from_the_ai_columns() {
                 if split_active {
                     continue;
                 }
+                // A coluna encostada ao canto: a que paga a seta dos
+                // Downloads (downloads-ui) a partir de 1100 px.
+                let last_visible = (0..COMPARATOR_COLUMNS)
+                    .rev()
+                    .find(|index| !minimized[*index]);
                 for label in [None, running, paused] {
                     let layout = layout_at(client_width, scale, minimized, split_active, label);
                     for index in 0..COMPARATOR_COLUMNS {
@@ -19505,6 +19596,20 @@ fn the_tools_never_take_room_from_the_ai_columns() {
                         }
                         assert!(layout.add_tabs[index].width > 0.0, "sem \"+\": {at}");
                         for button in ColumnButton::ALL {
+                            // A estrela (opcional) cede antes da pilula; de
+                            // 1280 px para cima ha lugar para ela -- na
+                            // coluna encostada ao canto, que tambem paga a
+                            // seta dos Downloads, so de 1366 px para cima
+                            // (a seta cabe ou nao existe e fica; o Ctrl+D
+                            // continua sem a estrela).
+                            let star_from = if Some(index) == last_visible {
+                                1366.0
+                            } else {
+                                1280.0
+                            };
+                            if button.optional() && logical_width < star_from {
+                                continue;
+                            }
                             assert!(
                                 layout.column_button(index, button).width > 0.0,
                                 "sem {}: {at}",
@@ -23728,7 +23833,7 @@ fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
 fn existing_stores_have_a_declared_kind() {
     use crate::stores::{
         ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AI_SETTINGS_STORE, AI_USAGE_STORE, APP_STORES,
-        DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE, KEYS_STORE, LIVE_KEY_STORE,
+        BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE, KEYS_STORE, LIVE_KEY_STORE,
     };
     use neural_core::json_store::StoreKind::{Automatic, Explicit, Setting};
     use neural_core::json_store::StoreShape::{Dir, File};
@@ -23755,6 +23860,7 @@ fn existing_stores_have_a_declared_kind() {
         ("adblock-list.json", Automatic, File),
         ("ai/settings.json", Setting, File),
         ("ai/usage.json", Setting, File),
+        ("bookmarks.json", Explicit, File),
     ];
     expected.sort_by_key(|row| row.0);
     let mut table: Vec<_> = APP_STORES
@@ -23805,6 +23911,7 @@ fn existing_stores_have_a_declared_kind() {
         ("AI_USAGE_STORE", AI_USAGE_STORE.name),
         ("DOWNLOADS_LOG_STORE", DOWNLOADS_LOG_STORE.name),
         ("DOWNLOADS_SETTINGS_STORE", DOWNLOADS_SETTINGS_STORE.name),
+        ("BOOKMARKS_STORE", BOOKMARKS_STORE.name),
     ];
     for part in compact.split(".grant(").skip(1) {
         let argument = part.split(')').next().unwrap_or_default();
@@ -27156,5 +27263,762 @@ fn page_eval_read_only_gate_refuses_acting_scripts() {
             violations.is_empty(),
             "a reading script is refused: {violations:?}\n{script}"
         );
+    }
+}
+
+/// Gates dos favoritos (bookmarks): o Ctrl+D nativo e a origem dele, o
+/// candidato, a seccao do painel (so ids), a thread que e a unica a
+/// escrever, a estrela e o Apagar historico que os deixa.
+mod bookmarks_gates {
+    use super::*;
+    use crate::stores::BOOKMARKS_STORE;
+    use neural_core::bookmarks::{
+        BookmarkOp, BookmarkStore, BookmarkTree, ChromiumBrowser, Day, ImportReport, OpOutcome,
+        ROOT_ID, import_folder_title,
+    };
+    use neural_core::json_store::{SaveOutcome, StoreMode, StoreRegistry};
+
+    /// Uma pasta temporaria so deste teste, apagada no fim.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "neuralia-bookmarks-app-{tag}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("pasta temporaria");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// As fixtures do nucleo, montadas por partes.
+    fn fixtures() -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("neural-core")
+            .join("tests")
+            .join("fixtures")
+            .join("bookmarks")
+    }
+
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).expect("pasta");
+        for entry in std::fs::read_dir(from).expect("fixtures") {
+            let entry = entry.expect("entrada");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("tipo").is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).expect("copia");
+            }
+        }
+    }
+
+    fn request(target: BookmarkTarget) -> Option<String> {
+        Some(format!(
+            "{:?}",
+            UserEvent::Bookmarks(BookmarksEvent::Request {
+                target,
+                via: BookmarkVia::Shortcut,
+            })
+        ))
+    }
+
+    fn center(rect: UiRect) -> (f64, f64) {
+        (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
+    }
+
+    /// Gate (critico: uma pagina nao sintetiza comandos, e o favorito e da
+    /// pagina certa): o Ctrl+D e um atalho NATIVO. Pelo caminho que
+    /// embarca -- o handler do `AcceleratorKeyPressed` (`accelerator_lookup`
+    /// sobre o mapa do produto) e o braco do event loop
+    /// (`command_key_event`) --, a tecla da coluna 2 pede a pagina da coluna
+    /// 2, a do Split a do Split (privado ou nao), a da Web completa, do
+    /// Leitor e do PDF a pagina unica; a da janela e da omnibox (a Home)
+    /// abre os Favoritos, e a de um painel tambem. O monitor do Gmail e
+    /// uma coluna que nao existe: nada. E nao ha caminho pelo IPC.
+    #[test]
+    fn ctrl_d_runs_against_the_host_it_came_from() {
+        let ctrl_d = Chord::ctrl(b'D');
+        let via_handler = |host: WebViewHost| {
+            chord_command_event(&accelerator_lookup(product_keymap(), host, press(ctrl_d)))
+        };
+        for col in 0..COMPARATOR_COLUMNS {
+            assert_eq!(
+                via_handler(WebViewHost::Column(col)),
+                request(BookmarkTarget::Column(col)),
+                "coluna {col}"
+            );
+            assert_eq!(
+                via_handler(WebViewHost::Split(col)),
+                request(BookmarkTarget::Split {
+                    source: col,
+                    private: false
+                }),
+                "fonte {col}"
+            );
+            assert_eq!(
+                via_handler(WebViewHost::PrivateSplit(col)),
+                request(BookmarkTarget::Split {
+                    source: col,
+                    private: true
+                }),
+                "fonte privada {col}"
+            );
+        }
+        // A coluna 2 e a coluna 2, e o Split nao e a coluna dele.
+        assert_ne!(
+            via_handler(WebViewHost::Column(2)),
+            via_handler(WebViewHost::Column(0))
+        );
+        assert_ne!(
+            via_handler(WebViewHost::Split(1)),
+            via_handler(WebViewHost::Column(1))
+        );
+        for host in [WebViewHost::External, WebViewHost::Reader, WebViewHost::Pdf] {
+            assert_eq!(via_handler(host), request(BookmarkTarget::Page), "{host:?}");
+        }
+        for host in [
+            WebViewHost::Epub,
+            WebViewHost::Live,
+            WebViewHost::SidePanel,
+            WebViewHost::Service(Service::YouTube),
+        ] {
+            assert_eq!(
+                via_handler(host),
+                request(BookmarkTarget::Panel),
+                "{host:?}"
+            );
+        }
+        assert_eq!(via_handler(WebViewHost::GmailMonitor), None);
+        for origin in [CommandOrigin::Window, CommandOrigin::Omnibox] {
+            assert_eq!(
+                chord_command_event(&keymap_decision(press(ctrl_d), origin)),
+                request(BookmarkTarget::Window),
+                "{origin:?}"
+            );
+        }
+        for host in [
+            WebViewHost::Column(COMPARATOR_COLUMNS),
+            WebViewHost::Split(COMPARATOR_COLUMNS),
+            WebViewHost::PrivateSplit(COMPARATOR_COLUMNS),
+        ] {
+            assert_eq!(bookmark_target(CommandOrigin::Host(host)), None, "{host:?}");
+        }
+        // Nativo, nunca IPC (asserção de ausencia): o canal das paginas nao
+        // tem accao de favoritos, e o mapa de teclas injetado nao os nomeia.
+        let ipc = include_str!("../ipc.rs").to_ascii_lowercase();
+        assert!(!ipc.contains("bookmark") && !ipc.contains("favorit"));
+        assert!(
+            !NEURALIA_KEYMAP_SCRIPT
+                .to_ascii_lowercase()
+                .contains("bookmark")
+        );
+    }
+
+    /// Gate (critico: navegacao e origens locais): so uma pagina da web e um
+    /// favorito. `about:blank`, `data:`, o `neuralia-pdf` (tambem como o
+    /// WebView2 o mostra, `http://neuralia-pdf.localhost`) e as outras
+    /// origens proprias nao; o titulo e o `DocumentTitle` limpo e cortado.
+    #[test]
+    fn a_bookmark_is_a_web_page_read_natively() {
+        for good in [
+            "https://example.com/a",
+            "http://pt.wikipedia.org/wiki/Brasil",
+            "https://chatgpt.com/c/abc",
+        ] {
+            assert!(bookmark_candidate(good).is_some(), "{good}");
+        }
+        let epub = format!("http://{}.localhost/library", crate::epub_app::EPUB_SCHEME);
+        let live = format!("https://{}.localhost/", crate::gemini_live::LIVE_PROTOCOL);
+        for bad in [
+            "about:blank",
+            "about:blank#x",
+            "data:text/html,<p>x</p>",
+            "neuralia-pdf://viewer/viewer.html",
+            "http://neuralia-pdf.localhost/viewer.html",
+            epub.as_str(),
+            live.as_str(),
+            "javascript:alert(1)",
+            "file:///C:/Users/pessoa/a.pdf",
+            "neuralia:home",
+            "",
+        ] {
+            assert!(bookmark_candidate(bad).is_none(), "{bad}");
+        }
+        let url = Url::parse("https://www.example.com/").expect("url");
+        assert_eq!(
+            bookmark_title("  Título\u{0}com\ncontrolo ", &url),
+            "Título com controlo"
+        );
+        assert_eq!(bookmark_title(" \u{7} ", &url), "www.example.com");
+        assert_eq!(bookmark_title(&"x".repeat(1000), &url).chars().count(), 300);
+        assert_eq!(
+            bookmark_added_notice("Exemplo", false),
+            "Adicionado aos favoritos: Exemplo"
+        );
+        assert_eq!(
+            bookmark_added_notice("Exemplo", true),
+            "Adicionado aos favoritos: Exemplo\nModo privado: favorito guardado porque você pediu."
+        );
+    }
+
+    /// Gate (critico: mensagens de uma pagina): a seccao Favoritos pede com
+    /// ids, nunca com enderecos nem caminhos. O parser recusa um endereco,
+    /// um caminho, um id que nao e um inteiro acima da raiz e qualquer
+    /// chave a mais; e a pagina que embarca, clicando em tudo, so manda
+    /// ids e `{}` -- os titulos chegam-lhe como texto.
+    #[test]
+    fn bookmark_panel_messages_carry_ids_only() {
+        use BookmarkPanelRequest::{Export, ImportChrome, ImportFile, List, Open, Remove};
+        let parse = |body: serde_json::Value| parse_panel_message(&body.to_string());
+        for (action, args, request) in [
+            ("bookmarks-list", serde_json::json!({}), List),
+            ("bookmark-open", serde_json::json!({"id": 7}), Open(7)),
+            ("bookmark-remove", serde_json::json!({"id": 8}), Remove(8)),
+            (
+                "bookmarks-import-chrome",
+                serde_json::json!({}),
+                ImportChrome,
+            ),
+            ("bookmarks-import-file", serde_json::json!({}), ImportFile),
+            ("bookmarks-export", serde_json::json!({}), Export),
+        ] {
+            assert_eq!(
+                parse(serde_json::json!({"action": action, "args": args})),
+                Some(PanelMessage::Bookmarks(request)),
+                "{action}"
+            );
+        }
+        for args in [
+            serde_json::json!({"id": 7, "url": "https://example.com/"}),
+            serde_json::json!({"url": "https://example.com/"}),
+            serde_json::json!({"id": "https://example.com/"}),
+            serde_json::json!({"id": "7"}),
+            serde_json::json!({"id": 7.5}),
+            serde_json::json!({"id": -3}),
+            serde_json::json!({"id": 0}),
+            serde_json::json!({"id": ROOT_ID}),
+            serde_json::json!({"id": (1u64 << 53) + 1}),
+            serde_json::json!({"path": "C:\\Users\\pessoa\\favoritos.html"}),
+            serde_json::json!({"id": null}),
+            serde_json::json!({}),
+        ] {
+            for action in ["bookmark-open", "bookmark-remove"] {
+                assert_eq!(
+                    parse(serde_json::json!({"action": action, "args": args})),
+                    None,
+                    "{action} {args}"
+                );
+            }
+        }
+        for action in [
+            "bookmarks-list",
+            "bookmarks-import-chrome",
+            "bookmarks-import-file",
+            "bookmarks-export",
+        ] {
+            for args in [
+                serde_json::json!({"path": "C:\\Users\\pessoa\\Bookmarks"}),
+                serde_json::json!({"url": "https://x.example/"}),
+            ] {
+                assert_eq!(
+                    parse(serde_json::json!({"action": action, "args": args})),
+                    None,
+                    "{action} {args}"
+                );
+            }
+        }
+        for body in [
+            serde_json::json!({"action": "bookmark-add", "args": {"url": "https://x.example/"}}),
+            serde_json::json!({"action": "bookmarks-import", "args": {}}),
+            serde_json::json!({"action": "bookmark-move", "args": {"id": 7, "parent": 1}}),
+        ] {
+            assert_eq!(parse(body.clone()), None, "{body}");
+        }
+
+        // O botao nomeia os dois navegadores que o pedido le: numa conta so
+        // com o Edge, um clique importa o perfil do Edge sem menu.
+        assert!(
+            PANEL_HTML.contains(
+                "<button id=\"bookmarks-import-chrome\" class=\"btn\">Importar do Chrome/Edge</button>"
+            ),
+            "o botao de importar tem de nomear o Chrome e o Edge"
+        );
+
+        // A pagina que embarca.
+        let result = notes_gates::run_panel(&[
+            "__posted.length = 0; window.neuraliaShowSection('bookmarks');".into(),
+            r#"window.__neuraliaBookmarks.receive({ notice: 'pronto', items: [
+                { id: 2, depth: 1, kind: 'folder', title: 'Pasta', detail: '' },
+                { id: 3, depth: 2, kind: 'link', title: '</A><script>window.__pwned = 1</script>', detail: 'https://example.com/a' },
+                { id: '9', depth: 1, kind: 'link', title: 'id em texto', detail: 'https://x.example/' },
+                { id: 4, depth: 1, kind: 'link', title: 'Outro', detail: 'https://b.example/' }
+            ] });"#
+                .into(),
+            "const rows = $('bookmarks-list').children; __out.rows = rows.length; \
+             __out.texts = rows.map((row) => row.textContent); \
+             __click(rows[1].children[0]); __click(rows[2].children[1]); \
+             __click($('bookmarks-import-chrome')); __click($('bookmarks-import-file')); \
+             __click($('bookmarks-export')); __out.notice = $('bookmarks-msg').textContent;"
+                .into(),
+            "__type($('bq'), 'outro'); __out.filtered = $('bookmarks-list').children.length;"
+                .into(),
+        ]);
+        assert_eq!(result["out"]["rows"], 3, "o id em texto fica de fora");
+        assert_eq!(result["out"]["filtered"], 1);
+        assert_eq!(result["out"]["notice"], "pronto");
+        assert!(
+            result["out"]["texts"][1]
+                .as_str()
+                .is_some_and(|text| text.contains("</A><script>")),
+            "o titulo e texto: {}",
+            result["out"]["texts"]
+        );
+        assert_eq!(result["html"], serde_json::json!([]));
+        assert_eq!(result["pwned"], serde_json::Value::Null);
+        let sent = notes_gates::posted(&result);
+        let parsed: Vec<Option<PanelMessage>> =
+            sent.iter().map(|body| parse_panel_message(body)).collect();
+        assert_eq!(
+            parsed,
+            [
+                Some(PanelMessage::Bookmarks(List)),
+                Some(PanelMessage::Bookmarks(Open(3))),
+                Some(PanelMessage::Bookmarks(Remove(4))),
+                Some(PanelMessage::Bookmarks(ImportChrome)),
+                Some(PanelMessage::Bookmarks(ImportFile)),
+                Some(PanelMessage::Bookmarks(Export)),
+            ],
+            "{sent:?}"
+        );
+        for body in &sent {
+            let value: serde_json::Value = serde_json::from_str(body).expect("json");
+            let args = value["args"].as_object().expect("args");
+            assert!(
+                args.keys().all(|key| key == "id") && args.values().all(|v| v.is_u64()),
+                "{body}"
+            );
+            assert!(!body.contains("http") && !body.contains(":\\"), "{body}");
+        }
+    }
+
+    /// Gate (critico: dados do utilizador): o que a thread
+    /// `neural-bookmarks` faz, tarefa a tarefa, sobre uma pasta de teste --
+    /// o mesmo `run_bookmark_job` que a thread corre. Ler, acrescentar (o
+    /// repetido e o mesmo), importar o HTML e os perfis do Chrome de um
+    /// `%LOCALAPPDATA%` de teste (so as fixtures, nunca o perfil do dono),
+    /// exportar -- e tudo fica no `bookmarks.json`.
+    #[test]
+    fn the_bookmarks_thread_jobs_do_what_they_say() {
+        let dir = TempDir::new("jobs");
+        let registry = StoreRegistry::mint_for_test(dir.0.join("data"));
+        let open =
+            || BookmarkStore::open(registry.grant(BOOKMARKS_STORE).expect("grant")).expect("loja");
+        let mut store = open();
+        match run_bookmark_job(&mut store, BookmarkJob::Load) {
+            BookmarkReply::Loaded { tree, notice: None } => assert!(tree.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        let add = |url: &str| BookmarkJob::Apply {
+            op: BookmarkOp::AddLink {
+                parent: ROOT_ID,
+                title: "Exemplo".into(),
+                url: url.into(),
+                added_ms: 1,
+            },
+            why: BookmarkWhy::Add {
+                title: "Exemplo".into(),
+                private: true,
+            },
+        };
+        match run_bookmark_job(&mut store, add("https://www.example.com/?utm_source=x")) {
+            BookmarkReply::Applied {
+                outcome: OpOutcome::Added(_),
+                why: BookmarkWhy::Add { private: true, .. },
+                ..
+            } => {}
+            other => panic!("{other:?}"),
+        }
+        match run_bookmark_job(&mut store, add("https://example.com")) {
+            BookmarkReply::Applied {
+                outcome: OpOutcome::Existing(_),
+                ..
+            } => {}
+            other => panic!("{other:?}"),
+        }
+        match run_bookmark_job(
+            &mut store,
+            BookmarkJob::ImportHtml {
+                path: fixtures().join("chrome-export.html"),
+                folder_title: "Importado do arquivo HTML (23/09/2026)".into(),
+                now_ms: 2,
+            },
+        ) {
+            BookmarkReply::Imported { report, .. } => assert_eq!(
+                report,
+                ImportReport {
+                    imported: 4,
+                    existing: 0,
+                    ignored: 2
+                }
+            ),
+            other => panic!("{other:?}"),
+        }
+        let local = dir.0.join("local");
+        copy_dir(
+            &fixtures().join("chrome-user-data"),
+            &ChromiumBrowser::Chrome.user_data_dir(&local),
+        );
+        let choices = match run_bookmark_job(
+            &mut store,
+            BookmarkJob::Profiles {
+                local_app_data: local.clone(),
+            },
+        ) {
+            BookmarkReply::Profiles(choices) => choices,
+            other => panic!("{other:?}"),
+        };
+        let labels: Vec<String> = choices.iter().map(ProfileChoice::label).collect();
+        assert_eq!(labels, ["Chrome · Trabalho", "Chrome · Pessoa 1"]);
+        let day = Day {
+            year: 2026,
+            month: 9,
+            day: 23,
+        };
+        for (choice, expected) in [
+            (
+                &choices[1],
+                ImportReport {
+                    imported: 0,
+                    existing: 5,
+                    ignored: 2,
+                },
+            ),
+            (
+                &choices[0],
+                ImportReport {
+                    imported: 1,
+                    existing: 0,
+                    ignored: 0,
+                },
+            ),
+        ] {
+            match run_bookmark_job(
+                &mut store,
+                BookmarkJob::ImportChromium {
+                    choice: choice.clone(),
+                    folder_title: import_folder_title("Chrome", day),
+                    now_ms: 3,
+                },
+            ) {
+                BookmarkReply::Imported { report, .. } => {
+                    assert_eq!(report, expected, "{}", choice.label())
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let out = dir.0.join("favoritos-neuralia-2026-09-23.html");
+        match run_bookmark_job(&mut store, BookmarkJob::Export { path: out.clone() }) {
+            BookmarkReply::Exported { links } => assert_eq!(links, 6),
+            other => panic!("{other:?}"),
+        }
+        let html = std::fs::read_to_string(&out).expect("exportado");
+        assert!(html.starts_with("<!DOCTYPE NETSCAPE-Bookmark-file-1>\n"));
+        assert_eq!(html.matches("<DT><A ").count(), 6);
+        assert!(matches!(
+            run_bookmark_job(
+                &mut store,
+                BookmarkJob::Export {
+                    path: dir.0.join("nao-existe").join("x.html"),
+                },
+            ),
+            BookmarkReply::Failed(_)
+        ));
+        // Tudo esta no disco: outra loja (outra janela) le a mesma arvore.
+        let mut again = open();
+        again.load();
+        assert_eq!(again.tree(), store.tree());
+    }
+
+    /// So a thread `neural-bookmarks` abre o `bookmarks.json`, e ela nasce
+    /// no primeiro uso -- nunca no `App::new` (asserção de ausencia: a Home
+    /// continua sem esta thread).
+    #[test]
+    fn only_the_bookmarks_thread_opens_the_store_and_it_is_born_on_first_use() {
+        let code = without_comment_lines(&shipped_source());
+        assert_eq!(code.matches("BookmarkStore::open(").count(), 1);
+        let worker = code
+            .split("fn spawn_bookmarks_worker(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("spawn_bookmarks_worker");
+        assert!(worker.contains("BookmarkStore::open(grant)"));
+        assert!(worker.contains(".name(\"neural-bookmarks\".into())"));
+        assert_eq!(code.matches(".grant(BOOKMARKS_STORE)").count(), 1);
+        assert_eq!(code.matches("spawn_bookmarks_worker(").count(), 2);
+        let new = code
+            .split(
+                "fn new(proxy: EventLoopProxy<UserEvent>) -> Self {\n        let config = CoreConfig::default();",
+            )
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n}\n").next())
+            .expect("App::new");
+        assert!(new.contains("bookmarks: BookmarksState::default(),"));
+        for forbidden in ["bookmarks_worker", "BOOKMARKS_STORE", "BookmarkJob"] {
+            assert!(!new.contains(forbidden), "App::new: {forbidden}");
+        }
+    }
+
+    /// Gate (critico: apaga dados do utilizador): o Ctrl+Shift+Delete deixa
+    /// o `bookmarks.json`. Nenhum alvo registado e dos favoritos; o modulo
+    /// do Apagar historico nao os nomeia; nada que embarca apaga um ficheiro
+    /// dos favoritos; e a loja e `Explicit` -- com o registo em modo
+    /// privado ela continua a gravar (o favorito foi pedido).
+    #[test]
+    fn clear_history_keeps_bookmarks_json() {
+        for target in CLEAR_HISTORY_TARGETS {
+            assert!(
+                !format!("{target:?}")
+                    .to_ascii_lowercase()
+                    .contains("bookmark"),
+                "{target:?}"
+            );
+        }
+        let module = ALL_MODULES
+            .iter()
+            .find(|(name, _)| *name == "clear_history.rs")
+            .map(|(_, content)| content.replace("\r\n", "\n"))
+            .expect("clear_history.rs em ALL_MODULES");
+        let code = without_comment_lines(&module).to_ascii_lowercase();
+        for forbidden in ["bookmark", "favorit"] {
+            assert!(
+                !code.contains(forbidden),
+                "o Apagar historico nomeia {forbidden}"
+            );
+        }
+        let shipped = without_comment_lines(&shipped_source());
+        for line in shipped.lines().filter(|line| {
+            line.contains("remove_file") || line.contains("remove_dir") || line.contains(".forget(")
+        }) {
+            assert!(
+                !line.to_ascii_lowercase().contains("bookmark"),
+                "apaga os favoritos: {line}"
+            );
+        }
+        assert!(shipped.contains("Os favoritos ficam."));
+
+        let dir = TempDir::new("private");
+        let registry = StoreRegistry::mint_for_test(&dir.0);
+        registry.set_mode(StoreMode::Private);
+        let mut store =
+            BookmarkStore::open(registry.grant(BOOKMARKS_STORE).expect("grant")).expect("loja");
+        let applied = store
+            .apply(BookmarkOp::AddLink {
+                parent: ROOT_ID,
+                title: "Pedido no privado".into(),
+                url: "https://example.com/".into(),
+                added_ms: 1,
+            })
+            .expect("grava");
+        assert_eq!(applied.saved, SaveOutcome::Written);
+        assert!(dir.0.join("bookmarks.json").is_file());
+    }
+
+    #[test]
+    fn the_full_star_offers_remove_move_and_open() {
+        let mut tree = BookmarkTree::default();
+        let add = |tree: &mut BookmarkTree, op| match tree.apply(op) {
+            Ok(OpOutcome::Added(id)) => id,
+            other => panic!("{other:?}"),
+        };
+        let work = add(
+            &mut tree,
+            BookmarkOp::AddFolder {
+                parent: ROOT_ID,
+                title: "Trabalho".into(),
+                added_ms: 1,
+            },
+        );
+        let docs = add(
+            &mut tree,
+            BookmarkOp::AddFolder {
+                parent: work,
+                title: "Docs".into(),
+                added_ms: 1,
+            },
+        );
+        let page = add(
+            &mut tree,
+            BookmarkOp::AddLink {
+                parent: work,
+                title: "Pagina".into(),
+                url: "https://example.com/".into(),
+                added_ms: 1,
+            },
+        );
+        let (menu, folders) = star_menu(&tree, page);
+        assert_eq!(folders, vec![ROOT_ID, work, docs]);
+        let label = |entry: &MenuEntry| match entry {
+            MenuEntry::Command(command) => command.label.clone(),
+            MenuEntry::Submenu { label, .. } => format!("{label} ▸"),
+            MenuEntry::Separator => "---".into(),
+        };
+        let top: Vec<String> = menu.entries.iter().map(label).collect();
+        assert_eq!(
+            top,
+            [
+                "Remover dos favoritos",
+                "Mover para ▸",
+                "---",
+                "Abrir Favoritos"
+            ]
+        );
+        let MenuEntry::Submenu { entries, .. } = &menu.entries[1] else {
+            panic!("sem o submenu");
+        };
+        let moves: Vec<(String, bool, bool)> = entries
+            .iter()
+            .map(|entry| match entry {
+                MenuEntry::Command(command) => (
+                    command.label.clone(),
+                    command.checked,
+                    command.disabled.is_some(),
+                ),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            moves,
+            [
+                ("Favoritos".to_string(), false, false),
+                ("   Trabalho".to_string(), true, true),
+                ("      Docs".to_string(), false, false),
+            ]
+        );
+        assert_eq!(
+            star_menu_choice(STAR_MENU_REMOVE, &folders),
+            Some(StarChoice::Remove)
+        );
+        assert_eq!(
+            star_menu_choice(STAR_MENU_OPEN, &folders),
+            Some(StarChoice::OpenPanel)
+        );
+        assert_eq!(
+            star_menu_choice(STAR_MENU_MOVE_BASE + 2, &folders),
+            Some(StarChoice::MoveTo(docs))
+        );
+        for nothing in [0, 3, STAR_MENU_MOVE_BASE + 3, STAR_MENU_MOVE_BASE - 1] {
+            assert_eq!(star_menu_choice(nothing, &folders), None, "{nothing}");
+        }
+        assert!(
+            menu.command(STAR_MENU_OPEN)
+                .is_some_and(|open| open.moves_focus)
+        );
+        assert_eq!(bookmark_star_glyph(false), "☆");
+        assert_eq!(bookmark_star_glyph(true), "★");
+    }
+
+    /// A estrela de cada coluna vem depois do › e a da fonte ao lado entre o
+    /// › dela e o rotulo; o clique no centro de cada uma volta a ela, e a
+    /// dica diz o que o clique faz.
+    #[test]
+    fn the_stars_sit_after_forward_and_hit_back() {
+        assert_eq!(ColumnButton::ALL.last(), Some(&ColumnButton::Bookmark));
+        let layout = BarLayout::with_contexts(1440.0, 1.0, true, BarColumns::even(3), [0, 0, 0]);
+        for index in 0..3 {
+            let star = layout.column_button(index, ColumnButton::Bookmark);
+            let forward = layout.column_button(index, ColumnButton::Forward);
+            assert!(
+                star.width > 0.0 && star.x >= forward.x + forward.width,
+                "{index}"
+            );
+            let (cx, cy) = center(star);
+            assert_eq!(layout.hit(cx, cy), Some(BarHit::ColumnBookmark(index)));
+        }
+        let mut existed = 0usize;
+        let mut vanished = 0usize;
+        for scale in [1.0, 1.5, 2.0] {
+            for width in (720..=2560).step_by(40) {
+                let controls = right_controls(width as f64, scale, true, None);
+                let (back, forward) = controls.split_nav.expect("‹ ›");
+                // Cabe inteira ou nao existe -- e sem ela nada a encontra.
+                let Some(star) = controls.split_bookmark else {
+                    vanished += 1;
+                    let (label, _, _) = controls.split.expect("gaveta");
+                    assert!(forward.x + forward.width <= label.x);
+                    for x in (0..width).step_by(4) {
+                        assert_ne!(
+                            right_controls_hit(
+                                controls,
+                                x as f64,
+                                forward.y + forward.height / 2.0
+                            ),
+                            Some(BarHit::SplitBookmark)
+                        );
+                    }
+                    continue;
+                };
+                existed += 1;
+                let (label, _, _) = controls.split.expect("gaveta");
+                let at = format!("{width}px x{scale}");
+                assert!(back.x + back.width <= forward.x, "{at}");
+                assert!(forward.x + forward.width <= star.x, "{at}");
+                assert!(star.x + star.width <= label.x, "{at}");
+                assert!(
+                    controls.private.x + controls.private.width <= back.x,
+                    "{at}"
+                );
+                let (cx, cy) = center(star);
+                assert_eq!(
+                    right_controls_hit(controls, cx, cy),
+                    Some(BarHit::SplitBookmark),
+                    "{at}"
+                );
+                assert_eq!(
+                    bar_hit_at(Some(controls), None, cx, cy),
+                    Some(BarHit::SplitBookmark),
+                    "{at}"
+                );
+            }
+        }
+        assert!(existed > 0 && vanished > 0, "{existed} com, {vanished} sem");
+        assert!(
+            right_controls(1440.0, 1.0, true, None)
+                .split_bookmark
+                .is_some()
+        );
+        assert!(
+            right_controls(1440.0, 1.0, false, None)
+                .split_bookmark
+                .is_none()
+        );
+        let state = BarState {
+            bookmarked: [false, true, false],
+            split_bookmarked: true,
+            ..BarState::default()
+        };
+        let tip = |hit| bar_tooltip_label(hit, &state, "ChatGPT", None, None);
+        assert_eq!(
+            tip(BarHit::ColumnBookmark(0)).as_deref(),
+            Some("Adicionar aos favoritos (Ctrl+D)")
+        );
+        for hit in [BarHit::ColumnBookmark(1), BarHit::SplitBookmark] {
+            assert_eq!(
+                tip(hit).as_deref(),
+                Some("Nos favoritos · clique: remover, mover ou abrir Favoritos"),
+                "{hit:?}"
+            );
+        }
     }
 }

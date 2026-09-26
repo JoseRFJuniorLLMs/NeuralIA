@@ -1275,6 +1275,7 @@ impl App {
             | BarHit::AddTab(index)
             | BarHit::ColumnBack(index)
             | BarHit::ColumnForward(index)
+            | BarHit::ColumnBookmark(index)
             | BarHit::TabOverflow(index) => Some(index),
             BarHit::ContextTab { source_index, .. }
             | BarHit::CloseTab { source_index, .. }
@@ -1343,6 +1344,8 @@ impl App {
             drag: self.drag_paint(),
             pomodoro_label: self.pomodoro_bar_label(),
             maximized: self.window.as_ref().is_some_and(Window::is_maximized),
+            bookmarked: self.bookmarks.column_stars(),
+            split_bookmarked: self.bookmarks.split_star(),
             downloads: downloads_badge(&self.downloads.manager),
         }
     }

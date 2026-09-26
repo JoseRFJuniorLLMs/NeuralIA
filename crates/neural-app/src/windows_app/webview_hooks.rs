@@ -46,10 +46,11 @@ use wry::PageLoadEvent;
 // embarca deixa a subida passar, por isso a pagina recebe tambem o `keyup`
 // de um atalho preso (o que o spike nao mediu).
 // O `accelerator_lookup` e a decisao do mapa de teclas (`keymap.rs`,
-// infra-commands-keymap) com o hospedeiro como origem; hoje so o Ctrl+J
-// dos Downloads (downloads-ui, `Global`) e preso nas WebViews (cada atalho
-// chega no PR do seu comando), e o `Handled` so muda quando ela prende a
-// tecla.
+// infra-commands-keymap) com o hospedeiro como origem; hoje as WebViews
+// prendem o Ctrl+J dos Downloads (downloads-ui, `CommandId::Downloads`) e o
+// Ctrl+D dos favoritos (`CommandId::Bookmark`), ambos do ambito `Global`
+// (cada atalho chega no PR do seu comando), e o `Handled` so muda quando
+// ela prende a tecla.
 
 /// Que WebView e esta: quem decide o que ela recebe da tabela e de onde vem
 /// um atalho ou um item de menu (a origem e o hospedeiro, nunca a pagina).
@@ -1317,12 +1318,13 @@ impl App {
         }
     }
 
-    /// Uma pagina acabou de carregar. O endereco fica no evento para quem
-    /// vier (favoritos); o bloqueio de anuncios so precisa do hospedeiro
-    /// (a renovacao semanal da lista, nunca na Home). O log de depuracao
-    /// nunca leva URLs, so a transicao.
-    fn page_loaded(&mut self, page: WebViewHost, _url: String) {
+    /// Uma pagina acabou de carregar. Os favoritos guardam a chave do
+    /// endereco para a estrela da coluna ou do Split; o bloqueio de
+    /// anuncios so precisa do hospedeiro (a renovacao semanal da lista,
+    /// nunca na Home). O log de depuracao nunca leva URLs, so a transicao.
+    fn page_loaded(&mut self, page: WebViewHost, url: String) {
         debug_log(format_args!("webview: {} carregou", page.describe()));
+        self.bookmarks_page_loaded(page, &url);
         self.adblock_page_loaded(page);
     }
 }

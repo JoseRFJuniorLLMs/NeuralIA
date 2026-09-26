@@ -403,10 +403,16 @@ table (Ctrl+D, Ctrl+N, Ctrl+W, Ctrl+Tab, Ctrl+G, Ctrl+O, Ctrl+S,
 Ctrl+Shift+S) is consulted only by the Files chain, which no current origin
 uses (gate `files_override_wins_only_in_files`).
 
-Today no WebView host binds a chord (gate
-`accelerator_lookup_binds_no_webview_chord_today`): the pages' shortcuts are
-still those of `NEURALIA_KEYMAP_SCRIPT`, and only the `Window` scope has rows
--- the Ctrl+R, Ctrl+Shift+R, Ctrl+H, Ctrl+N, Ctrl+O, Ctrl+Shift+Z and
+Today the WebView hosts bind only the two `Global` chords, on every host
+with a keyboard and with that host as the origin: Ctrl+D (bookmarks,
+`CommandId::Bookmark`) -- the comparator column, the split, the private
+split, the full Web, Reader and PDF bookmark their own page; the panels and
+EPUB open Favoritos (gate `ctrl_d_runs_against_the_host_it_came_from`) --
+and Ctrl+J (downloads-ui, `CommandId::Downloads`), which opens the side
+panel's Downloads section from anywhere (gate
+`accelerator_lookup_binds_only_the_global_chords_on_webviews`). The pages' other shortcuts
+are still those of `NEURALIA_KEYMAP_SCRIPT`, and the `Window` scope keeps
+the Ctrl+R, Ctrl+Shift+R, Ctrl+H, Ctrl+N, Ctrl+O, Ctrl+Shift+Z and
 Ctrl+Shift+Delete the main window and the omnibox already answered. The CI
 accelerator spike measured native dispatch on every host kind: with
 `Handled = TRUE` the page never sees the keydown of the chord, but it may still

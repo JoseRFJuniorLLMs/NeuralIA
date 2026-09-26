@@ -59,6 +59,9 @@ windows-sys = { version = "0.61.2", features = [
     # ILCreateFromPathW + SHOpenFolderAndSelectItems: o «Mostrar na pasta»
     # da seccao Downloads (downloads-ui).
     "Win32_UI_Shell_Common",
+    # GetLocalTime: o dia local da pasta «Importado do Chrome (dd/mm/aaaa)»
+    # e do nome do HTML exportado dos favoritos.
+    "Win32_System_SystemInformation",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

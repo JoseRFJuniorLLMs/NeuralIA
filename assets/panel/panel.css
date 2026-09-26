@@ -2,8 +2,8 @@
 html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:15px "Segoe UI",system-ui,sans-serif}
 body{display:flex;flex-direction:column;border-left:1px solid var(--line)}
 header{display:flex;align-items:center;justify-content:space-between;padding:10px 12px 8px 12px}
-.tabs{display:flex;gap:4px}
-.tab{background:none;border:0;color:var(--muted);font:inherit;font-weight:600;padding:7px 16px;border-radius:999px;cursor:pointer}
+.tabs{display:flex;flex-wrap:wrap;gap:4px;min-width:0}
+.tab{background:none;border:0;color:var(--muted);font:inherit;font-weight:600;padding:7px 12px;white-space:nowrap;border-radius:999px;cursor:pointer}
 .tab:hover{background:var(--surface)}
 .tab[aria-selected="true"]{background:var(--surface);color:var(--fg);box-shadow:inset 0 0 0 1px var(--line)}
 #close{background:none;border:0;color:var(--muted);font-size:18px;cursor:pointer;border-radius:8px;width:32px;height:32px}
@@ -13,7 +13,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
 .search{padding:4px 16px 10px}
 .field{width:100%;padding:10px 14px;border-radius:12px;border:1px solid var(--line);background:var(--surface);color:var(--fg);font:inherit;outline:none}
 .field:focus{border-color:var(--accent)}
-#q,#nq{border-radius:999px}
+#q,#nq,#bq{border-radius:999px}
 main{overflow:auto;flex:1;padding:0 8px 16px}
 ::-webkit-scrollbar{width:10px;height:10px}
 ::-webkit-scrollbar-track,::-webkit-scrollbar-corner{background:transparent}
@@ -56,3 +56,9 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
 .dl-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
 .dl-actions[hidden],.dl-actions .btn[hidden]{display:none}
 .dl-actions .btn{padding:5px 12px;font-size:12px}
+#bookmarks-msg{font-size:12px;color:var(--muted);min-height:18px;padding:0 18px 4px}
+.bm-row{display:flex;align-items:center;gap:2px;padding-left:calc(var(--depth,0) * 16px)}
+.bm-row .item{flex:1;min-width:0}
+.bm-folder{font-size:12px;font-weight:600;letter-spacing:.02em;color:var(--muted);padding:10px 10px 4px}
+.bm-remove{flex:none;background:none;border:0;color:var(--muted);font:inherit;cursor:pointer;border-radius:8px;width:30px;height:30px}
+.bm-remove:hover{background:#e81123;color:#fff}
