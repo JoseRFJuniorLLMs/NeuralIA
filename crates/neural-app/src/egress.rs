@@ -25,29 +25,40 @@
 //!    para o par (cerebro, site) -- da sessao (`ConsentLedger`, so em
 //!    memoria, nunca num ficheiro) ou, so onde um desenho o pede (a
 //!    Traducao, «Sempre neste site»), persistente (`SiteGrants`, uma loja
-//!    `StoreKind::Setting`); e uma chamada paga acima do limite mensal pede
-//!    sempre confirmacao («Limite mensal atingido (200 chamadas) —
-//!    continuar?»), nunca calada. Uma so pergunta junta as duas coisas.
+//!    `StoreKind::Setting`, relida em cada pedido: revogar noutra janela
+//!    vale no pedido seguinte desta). Sem site (um ficheiro local, um PDF,
+//!    o ditado), o consentimento da sessao e por (cerebro, finalidade,
+//!    classe do dado): o sim ao audio do ditado nao manda o texto de um PDF.
+//!    E uma chamada paga acima do limite mensal pede sempre confirmacao
+//!    («Limite mensal atingido (200 chamadas) — continuar?»), nunca calada.
+//!    Uma so pergunta junta as duas coisas.
 //!
 //! Cada `Send` de um destino pago conta as suas chamadas no `ai/usage.json`
-//! (`ai_settings::UsageBook`, `StoreKind::Automatic`) -- quem manda passa
-//! pelo portao, e o portao conta: nao ha "mandar sem contar". A gravacao
-//! vai para a thread `neural-usage`, um `LazyWorker` que so nasce na
-//! primeira chamada paga (nunca no `App::new`: a Home fica igual). O limite
-//! mensal (200 por omissao) vem do `ai/settings.json`.
+//! (`ai_settings::UsageBook`, `StoreKind::Setting`: o modo privado das
+//! lojas nao o apaga nem o salta, e o limite nao recomeca) -- quem manda
+//! passa pelo portao, e o portao conta: nao ha "mandar sem contar". A
+//! gravacao vai para a thread `neural-usage`, um `LazyWorker` que so nasce
+//! na primeira chamada paga (nunca no `App::new`: a Home fica igual). Antes
+//! de decidir o limite de um destino pago, o portao rele o `usage.json`: o
+//! que as outras janelas ja gravaram conta. O limite e suave: dois cliques
+//! no mesmo instante em duas janelas, antes de qualquer das duas gravar,
+//! podem passar ambos (e ambos contam). O limite mensal (200 por omissao)
+//! vem do `ai/settings.json`.
 //!
 //! O cartao (`ConsentCard`) e o que o `NativeCard` do infra-notify-popups
 //! pinta: hosts, tokens, modelo, faixa de preco, e o limite quando conta.
 //! A resposta (`EgressGate::answer`) regista o consentimento pedido e so
 //! entao manda. «Sempre neste site» so existe fora de qualquer contexto
-//! privado, e so para as finalidades que o oferecem.
+//! privado, e so para as finalidades que o oferecem; gravado, vive so na
+//! loja (nao tambem na sessao), e `EgressGate::revoke_site_grant` tira-o da
+//! loja e tira o consentimento da sessao desse par.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use neural_core::ai_policy::{DataClass, Locality, MaySend, may_send};
 use neural_core::json_store::{
-    SaveOutcome, StoreGrant, StoreKind, StoreRegistry, VersionedJsonStore,
+    Degraded, LoadOutcome, SaveOutcome, StoreGrant, StoreKind, StoreRegistry, VersionedJsonStore,
 };
 use neural_core::llm::{Pick, PriceTier, Provider};
 use serde::{Deserialize, Serialize};
@@ -630,22 +641,45 @@ pub(crate) fn decide(request: &EgressRequest<'_>, facts: &Facts) -> Decision {
     }
 }
 
-/// O consentimento da sessao, por (cerebro, site). So em memoria: morre com
-/// o processo e nunca toca no disco.
+/// A que vale um «Sempre nesta sessão»: um site; ou, sem site (`file:`,
+/// `neuralia-pdf:`, `data:`, uma origem longa demais, o ditado), so a mesma
+/// finalidade com a mesma classe do dado -- nunca «tudo o que nao tem site».
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ConsentScope {
+    Site(SiteOrigin),
+    NoSite(AiPurpose, DataClass),
+}
+
+impl ConsentScope {
+    fn of(feature: AiPurpose, data: DataClass, origin: Option<&SiteOrigin>) -> Self {
+        match origin {
+            Some(origin) => Self::Site(origin.clone()),
+            None => Self::NoSite(feature, data),
+        }
+    }
+}
+
+/// O consentimento da sessao, por (cerebro, `ConsentScope`). So em memoria:
+/// morre com o processo e nunca toca no disco.
 #[derive(Debug, Default)]
 pub(crate) struct ConsentLedger {
-    allowed: BTreeSet<(String, Option<SiteOrigin>)>,
+    allowed: BTreeSet<(String, ConsentScope)>,
 }
 
 impl ConsentLedger {
-    fn allow(&mut self, brain: String, origin: Option<SiteOrigin>) {
-        self.allowed.insert((brain, origin));
+    fn allow(&mut self, brain: String, scope: ConsentScope) {
+        self.allowed.insert((brain, scope));
     }
 
-    fn allows(&self, brain: &str, origin: Option<&SiteOrigin>) -> bool {
+    fn allows(&self, brain: &str, scope: &ConsentScope) -> bool {
         self.allowed
             .iter()
-            .any(|(allowed, site)| allowed == brain && site.as_ref() == origin)
+            .any(|(allowed, granted)| allowed == brain && granted == scope)
+    }
+
+    fn forget(&mut self, brain: &str, scope: &ConsentScope) {
+        self.allowed
+            .retain(|(allowed, granted)| !(allowed == brain && granted == scope));
     }
 }
 
@@ -674,11 +708,15 @@ pub(crate) enum SiteGrantsError {
 
 /// «Sempre neste site» de uma finalidade: (cerebro, origem) numa loja
 /// `Setting` que a finalidade da (a Traducao, a sua). Partilhada entre
-/// janelas; uma entrada que nao e uma origem canonica e ignorada.
+/// janelas e relida em cada pergunta: uma revogacao noutra janela vale no
+/// pedido seguinte desta. Uma entrada que nao e uma origem canonica e
+/// ignorada.
 #[derive(Debug)]
 pub(crate) struct SiteGrants {
     store: VersionedJsonStore<SiteGrantsFile>,
-    cache: Option<BTreeSet<(String, SiteOrigin)>>,
+    /// Revogados nesta janela: nao valem aqui mesmo que a loja nao tenha
+    /// conseguido gravar a revogacao. Um «Sempre» novo neste par tira-o.
+    revoked: BTreeSet<(String, SiteOrigin)>,
 }
 
 impl SiteGrants {
@@ -689,7 +727,10 @@ impl SiteGrants {
         let store = VersionedJsonStore::open(grant, SITE_GRANTS_VERSION, SITE_GRANTS_MAX_BYTES)
             .map_err(|_| SiteGrantsError::WrongShape)?
             .shared_between_windows();
-        Ok(Self { store, cache: None })
+        Ok(Self {
+            store,
+            revoked: BTreeSet::new(),
+        })
     }
 
     fn read(file: &SiteGrantsFile) -> BTreeSet<(String, SiteOrigin)> {
@@ -704,161 +745,205 @@ impl SiteGrants {
             .collect()
     }
 
-    fn sites(&mut self) -> &mut BTreeSet<(String, SiteOrigin)> {
-        let store = &mut self.store;
-        self.cache
-            .get_or_insert_with(|| Self::read(&store.load().into_value()))
+    /// Os pares gravados AGORA (a loja relida). Uma loja que nada conserta
+    /// nesta sessao (`sticky`) nao da nenhum.
+    fn on_disk(&mut self) -> BTreeSet<(String, SiteOrigin)> {
+        if sticky(self.store.read_only()) {
+            return BTreeSet::new();
+        }
+        Self::read(&self.store.load().into_value())
     }
 
     fn allows(&mut self, brain: &str, origin: &SiteOrigin) -> bool {
-        self.sites()
-            .iter()
-            .any(|(allowed, site)| allowed == brain && site == origin)
+        let pair = (brain.to_string(), origin.clone());
+        !self.revoked.contains(&pair) && self.on_disk().contains(&pair)
     }
 
-    fn allow(&mut self, brain: &str, origin: &SiteOrigin) {
+    /// Grava «Sempre neste site» para (cerebro, origem). Falso se o par nao
+    /// ficou na loja (so de leitura, cheia, erro de disco): quem chama fica
+    /// entao com o consentimento da sessao.
+    fn allow(&mut self, brain: &str, origin: &SiteOrigin) -> bool {
+        let pair = (brain.to_string(), origin.clone());
         let entry = SiteGrantEntry {
-            brain: brain.to_string(),
+            brain: pair.0.clone(),
             origin: origin.as_str().to_string(),
         };
+        self.revoked.remove(&pair);
         let written = self.store.update(|file| {
             if !file.sites.contains(&entry) && file.sites.len() < MAX_SITE_GRANTS {
                 file.sites.push(entry.clone());
             }
-            Self::read(file)
+            Self::read(file).contains(&pair)
         });
-        match written {
-            Ok((sites, _)) => self.cache = Some(sites),
-            // Loja so de leitura (estragada, de uma versao futura): vale ate
-            // fechar o NeuralIA, como a sessao.
-            Err(_) => {
-                self.sites().insert((brain.to_string(), origin.clone()));
-            }
-        }
+        matches!(written, Ok((true, SaveOutcome::Written)))
     }
 
-    /// Tira «Sempre neste site» de (cerebro, origem).
-    pub(crate) fn revoke(&mut self, brain: &str, origin: &SiteOrigin) {
+    /// Tira «Sempre neste site» de (cerebro, origem): da loja (as outras
+    /// janelas deixam de o ver no pedido seguinte) e, mesmo que a loja nao
+    /// grave, desta janela. Verdadeiro se a loja gravou a revogacao.
+    pub(crate) fn revoke(&mut self, brain: &str, origin: &SiteOrigin) -> bool {
+        self.revoked.insert((brain.to_string(), origin.clone()));
         let written = self.store.update(|file| {
             file.sites
                 .retain(|entry| !(entry.brain == brain && entry.origin == origin.as_str()));
-            Self::read(file)
         });
-        match written {
-            Ok((sites, _)) => self.cache = Some(sites),
-            Err(_) => {
-                self.sites()
-                    .retain(|(allowed, site)| !(allowed == brain && site == origin));
-            }
-        }
+        matches!(written, Ok(((), SaveOutcome::Written)))
     }
 }
 
-/// O que a janela sabe do consumo: o ultimo `usage.json` lido ou gravado,
-/// mais o que contou e ainda nao foi gravado.
+/// Uma loja que nada conserta nesta sessao: estragada, de uma versao futura
+/// ou grande demais (o NeuralIA nunca a reescreve). Nao se rele -- cada
+/// leitura guardaria outra vez a copia `.bak`; uma que nao se conseguiu
+/// abrir agora tenta outra vez no pedido seguinte.
+fn sticky(degraded: Option<&Degraded>) -> bool {
+    matches!(
+        degraded,
+        Some(Degraded::Corrupt | Degraded::FutureVersion { .. } | Degraded::TooLarge { .. })
+    )
+}
+
+/// O que a janela sabe do consumo. O total do mes e `disk` + `unsaved` +
+/// `kept`, e nenhuma chamada esta em dois deles ao mesmo tempo.
 #[derive(Debug, Default)]
 struct UsageView {
-    book: UsageBook,
-    loaded: bool,
-    pending: Vec<UsageDelta>,
+    /// O `usage.json` da ultima leitura ou gravacao (todas as janelas).
+    disk: UsageBook,
+    /// Contado nesta janela e ainda nao gravado: a espera da thread ou a
+    /// ser gravado agora.
+    unsaved: Vec<UsageDelta>,
+    /// Contado so em memoria: sem loja, ou a loja recusou a gravacao
+    /// (estragada, de uma versao futura, erro de disco).
+    kept: UsageBook,
+}
+
+impl UsageView {
+    fn month_total(&self, month: &str) -> u32 {
+        self.unsaved
+            .iter()
+            .filter(|delta| delta.month == month)
+            .fold(
+                self.disk
+                    .month_total(month)
+                    .saturating_add(self.kept.month_total(month)),
+                |total, delta| total.saturating_add(delta.calls),
+            )
+    }
 }
 
 fn lock_view(view: &Mutex<UsageView>) -> MutexGuard<'_, UsageView> {
     view.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// As duas pontas do `ai/usage.json` de uma janela: a janela rele-o antes
+/// de decidir o limite (`reader`), a thread `neural-usage` grava-o
+/// (`writer`). O trinco que as guarda serializa as duas: uma releitura
+/// nunca cai a meio de uma gravacao desta janela, que contaria duas vezes
+/// o que esta a ser gravado (no disco e ainda em `unsaved`).
+#[derive(Default)]
+struct UsageFiles {
+    reader: Option<VersionedJsonStore<UsageBook>>,
+    writer: Option<VersionedJsonStore<UsageBook>>,
+}
+
+fn lock_files(files: &Mutex<UsageFiles>) -> MutexGuard<'_, UsageFiles> {
+    files
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// "Grava o que falta": pedidos seguidos juntam-se na vaga do worker.
 struct UsageFlush;
 
-/// Os contadores do mes: contados ja na janela (o limite decide com eles),
-/// gravados no `ai/usage.json` pela thread `neural-usage`, que so nasce na
-/// primeira chamada paga. Duas janelas nunca perdem a conta uma da outra: a
-/// gravacao rele o ficheiro debaixo do trinco e soma.
+/// Os contadores do mes: contados ja na janela, gravados no `ai/usage.json`
+/// pela thread `neural-usage`, que so nasce na primeira chamada paga, e
+/// relidos do disco antes de cada decisao do limite (o que as outras
+/// janelas gravaram conta aqui). Duas janelas nunca perdem a conta uma da
+/// outra: a gravacao rele o ficheiro debaixo do trinco `usage.json.lock` e
+/// soma.
 struct UsageLedger {
-    reader: Option<VersionedJsonStore<UsageBook>>,
+    files: Arc<Mutex<UsageFiles>>,
     view: Arc<Mutex<UsageView>>,
     worker: LazyWorker<UsageFlush>,
     persistent: bool,
 }
 
 impl UsageLedger {
-    fn new(
-        reader: Option<VersionedJsonStore<UsageBook>>,
-        writer: Option<VersionedJsonStore<UsageBook>>,
-    ) -> Self {
+    fn new(files: UsageFiles) -> Self {
+        let persistent = files.writer.is_some();
+        let files = Arc::new(Mutex::new(files));
         let view = Arc::new(Mutex::new(UsageView::default()));
-        let persistent = writer.is_some();
-        let flush_view = Arc::clone(&view);
-        let mut writer = writer;
+        let (flush_files, flush_view) = (Arc::clone(&files), Arc::clone(&view));
         let worker = LazyWorker::new(USAGE_WORKER_NAME, move |_: UsageFlush, _: &JobContext| {
-            flush_usage(&flush_view, writer.as_mut());
+            flush_usage(&flush_files, &flush_view);
         });
         Self {
-            reader,
+            files,
             view,
             worker,
             persistent,
         }
     }
 
-    fn ensure_loaded(&mut self) {
-        let mut view = lock_view(&self.view);
-        if view.loaded {
-            return;
-        }
-        if let Some(reader) = self.reader.as_mut() {
-            let mut book = reader.load().into_value();
-            for delta in &view.pending {
-                book.add(delta);
-            }
-            view.book = book;
-        }
-        view.loaded = true;
-    }
-
+    /// As chamadas pagas do mes, com o `usage.json` relido AGORA (o ficheiro
+    /// tem no maximo 64 KiB e cada gravacao e um `rename` atomico: a leitura
+    /// ve o ficheiro antigo ou o novo, nunca meio). Se nao se conseguiu ler,
+    /// fica o que se leu antes -- nunca zero no lugar do que la estava.
     fn month_total(&mut self, month: &str) -> u32 {
-        self.ensure_loaded();
-        lock_view(&self.view).book.month_total(month)
+        let mut files = lock_files(&self.files);
+        if let Some(reader) = files.reader.as_mut()
+            && !sticky(reader.read_only())
+        {
+            match reader.load() {
+                LoadOutcome::Loaded(book) | LoadOutcome::Missing(book) => {
+                    lock_view(&self.view).disk = book;
+                }
+                LoadOutcome::Degraded { .. } => {}
+            }
+        }
+        drop(files);
+        lock_view(&self.view).month_total(month)
     }
 
     fn count(&mut self, delta: UsageDelta) {
-        self.ensure_loaded();
-        {
-            let mut view = lock_view(&self.view);
-            view.book.add(&delta);
-            view.pending.push(delta);
+        if !self.persistent {
+            lock_view(&self.view).kept.add(&delta);
+            return;
         }
-        if self.persistent {
-            let _ = self.worker.submit(UsageFlush);
-        }
+        lock_view(&self.view).unsaved.push(delta);
+        let _ = self.worker.submit(UsageFlush);
     }
 }
 
-/// Grava o que a janela contou: tira as contas pendentes, soma-as ao
-/// ficheiro debaixo do trinco e fica com o que o disco diz (as outras
-/// janelas incluidas) mais o que entretanto se contou. Com a loja so de
-/// leitura ou no modo privado (`Automatic`), a conta fica so em memoria.
-fn flush_usage(view: &Mutex<UsageView>, writer: Option<&mut VersionedJsonStore<UsageBook>>) {
-    let Some(writer) = writer else {
+/// Grava o que a janela contou: soma as contas por gravar ao ficheiro
+/// debaixo do trinco e, de uma vez, tira-as de `unsaved` e fica com o que o
+/// disco diz (as outras janelas incluidas). Com a loja so de leitura ou um
+/// erro de disco, essas contas ficam so em memoria (`kept`).
+fn flush_usage(files: &Mutex<UsageFiles>, view: &Mutex<UsageView>) {
+    let mut files = lock_files(files);
+    let Some(writer) = files.writer.as_mut() else {
         return;
     };
-    let deltas = std::mem::take(&mut lock_view(view).pending);
-    if deltas.is_empty() {
+    let batch = lock_view(view).unsaved.clone();
+    if batch.is_empty() {
         return;
     }
     let written = writer.update(|book| {
-        for delta in &deltas {
+        for delta in &batch {
             book.add(delta);
         }
         book.clone()
     });
-    if let Ok((fresh, SaveOutcome::Written)) = written {
-        let mut view = lock_view(view);
-        let mut merged = fresh;
-        for delta in &view.pending {
-            merged.add(delta);
+    // `count` so acrescenta no fim e so esta thread tira: o lote ainda e o
+    // comeco de `unsaved`.
+    let mut view = lock_view(view);
+    view.unsaved.drain(..batch.len());
+    match written {
+        Ok((fresh, SaveOutcome::Written)) => view.disk = fresh,
+        _ => {
+            for delta in &batch {
+                view.kept.add(delta);
+            }
         }
-        view.book = merged;
     }
 }
 
@@ -897,7 +982,7 @@ impl EgressGate {
         Self {
             consents: ConsentLedger::default(),
             site_grants: BTreeMap::new(),
-            usage: UsageLedger::new(reader, writer),
+            usage: UsageLedger::new(UsageFiles { reader, writer }),
             settings,
             settings_cache: None,
         }
@@ -917,6 +1002,25 @@ impl EgressGate {
         Ok(())
     }
 
+    /// Tira «Sempre neste site» de (cerebro, origem) numa finalidade: da
+    /// loja (as outras janelas relem-na no pedido seguinte) e desta janela
+    /// mesmo que a loja nao grave, e tira tambem o consentimento da sessao
+    /// desse par -- o pedido seguinte volta a perguntar. Verdadeiro se a loja
+    /// gravou a revogacao.
+    pub(crate) fn revoke_site_grant(
+        &mut self,
+        feature: AiPurpose,
+        brain: Brain,
+        origin: &SiteOrigin,
+    ) -> bool {
+        let brain = brain.key();
+        self.consents
+            .forget(&brain, &ConsentScope::Site(origin.clone()));
+        self.site_grants
+            .get_mut(&feature)
+            .is_some_and(|grants| grants.revoke(&brain, origin))
+    }
+
     /// O limite mensal suave (do `ai/settings.json`, lido uma vez).
     pub(crate) fn soft_cap(&mut self) -> u32 {
         let settings = &mut self.settings;
@@ -930,7 +1034,9 @@ impl EgressGate {
             .soft_cap()
     }
 
-    /// As chamadas pagas deste mes (todas as janelas, ate a ultima gravacao).
+    /// As chamadas pagas deste mes: o `ai/usage.json` relido agora (todas as
+    /// janelas, ate a ultima gravacao de cada uma) mais o que esta janela
+    /// contou e ainda nao gravou.
     pub(crate) fn usage_this_month(&mut self, today: Day) -> u32 {
         self.usage.month_total(&today.month_key())
     }
@@ -938,17 +1044,25 @@ impl EgressGate {
     fn facts(&mut self, request: &EgressRequest<'_>, today: Day) -> Facts {
         let brain = request.destination.brain.key();
         let origin = request.origin.as_ref();
-        let session = self.consents.allows(&brain, origin);
-        // «Sempre neste site» so conta fora de qualquer contexto privado.
+        let scope = ConsentScope::of(request.feature, request.data, origin);
+        let session = self.consents.allows(&brain, &scope);
+        // «Sempre neste site» so conta fora de qualquer contexto privado, e
+        // e relido da loja agora (uma revogacao noutra janela ja vale).
         let site = request.privacy == EgressPrivacy::Normal
             && origin.is_some_and(|origin| {
                 self.site_grants
                     .get_mut(&request.feature)
                     .is_some_and(|grants| grants.allows(&brain, origin))
             });
+        // So um destino pago conta no limite: so entao se rele o consumo.
+        let used = if request.destination.paid {
+            self.usage_this_month(today)
+        } else {
+            0
+        };
         Facts {
             consented: session || site,
-            used: self.usage_this_month(today),
+            used,
             cap: self.soft_cap(),
             today,
             site_grants: self.site_grants.contains_key(&request.feature),
@@ -969,8 +1083,9 @@ impl EgressGate {
     /// A resposta ao cartao: regista o consentimento que o utilizador deu e
     /// manda (o limite, se o cartao o mostrava, ficou confirmado para ESTE
     /// envio). O que nao depende da resposta (modo privado, a memoria) volta
-    /// a ser conferido. «Sempre neste site» num cartao que nao o oferecia
-    /// vale so para a sessao: nunca chega ao disco.
+    /// a ser conferido. «Sempre neste site» gravado vive so na loja (uma
+    /// revogacao tira-o de vez); num cartao que nao o oferecia, ou com a loja
+    /// sem o conseguir gravar, vale so para a sessao e nunca chega ao disco.
     pub(crate) fn answer(
         &mut self,
         card: ConsentCard,
@@ -983,18 +1098,22 @@ impl EgressGate {
         let needs_consent = card.needs_consent;
         let (mut request, offer_always) = card.into_click();
         let brain = request.destination.brain.key();
-        if needs_consent && matches!(answer, ConsentAnswer::Session | ConsentAnswer::AlwaysOnSite) {
-            self.consents.allow(brain.clone(), request.origin.clone());
-        }
-        if needs_consent
+        let persisted = needs_consent
             && answer == ConsentAnswer::AlwaysOnSite
             && offer_always
-            && let (Some(origin), Some(grants)) = (
+            && match (
                 request.origin.as_ref(),
                 self.site_grants.get_mut(&request.feature),
-            )
+            ) {
+                (Some(origin), Some(grants)) => grants.allow(&brain, origin),
+                _ => false,
+            };
+        if needs_consent
+            && !persisted
+            && matches!(answer, ConsentAnswer::Session | ConsentAnswer::AlwaysOnSite)
         {
-            grants.allow(&brain, origin);
+            let scope = ConsentScope::of(request.feature, request.data, request.origin.as_ref());
+            self.consents.allow(brain, scope);
         }
         let answered = Facts {
             consented: true,
@@ -1094,7 +1213,7 @@ fn thousands(value: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neural_core::json_store::{StoreShape, StoreSpec};
+    use neural_core::json_store::{StoreMode, StoreShape, StoreSpec};
     use neural_core::llm::{ModelId, PickSource, Purpose};
     use std::path::{Path, PathBuf};
 
@@ -1828,6 +1947,113 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Gate (critico, infra-egress; critica C4, revisao EG-1): o limite de
+    /// uma janela conta o que as outras ja gravaram. Com o limite em 3, a
+    /// janela A manda 1 e a B manda 2: o pedido seguinte de A pergunta, de 1
+    /// ou de 2 chamadas. Antes, A decidia com o `usage.json` que leu no
+    /// primeiro pedido (1 de 3) e mandava calada ate 5.
+    #[test]
+    fn the_cap_counts_what_other_windows_sent() {
+        let dir = temp_dir("cap-windows");
+        write(
+            &dir.join("ai").join("settings.json"),
+            r#"{"version":1,"data":{"monthly_soft_cap":3}}"#,
+        );
+        let page = |calls| EgressRequest {
+            calls,
+            ..click(
+                AiPurpose::Translation,
+                DataClass::PageContent,
+                gemini(),
+                EgressPrivacy::Normal,
+            )
+        };
+        let on_disk =
+            || usage_on_disk(&dir)["data"]["months"]["2026-09"]["gemini"]["traducao"].clone();
+        // Duas janelas: dois registos, a mesma pasta de dados.
+        let registry_a = StoreRegistry::mint_for_test(&dir);
+        let registry_b = StoreRegistry::mint_for_test(&dir);
+        let mut a = EgressGate::for_app(Some(&registry_a));
+        let mut b = EgressGate::for_app(Some(&registry_b));
+        let card = ask(a.request(page(1), TODAY));
+        assert_eq!(
+            a.answer(card, ConsentAnswer::Session, TODAY),
+            Decision::Send
+        );
+        assert!(a.wait_usage_written());
+        let card = ask(b.request(page(2), TODAY));
+        assert_eq!(card.cap(), None, "B ve o 1 de A: 1 + 2 cabe em 3");
+        assert_eq!(
+            b.answer(card, ConsentAnswer::Session, TODAY),
+            Decision::Send
+        );
+        assert!(b.wait_usage_written());
+        assert_eq!(on_disk(), 3);
+        // A tem consentimento na sessao: so o limite pergunta, e pergunta.
+        for calls in [1, 2] {
+            let card = ask(a.request(page(calls), TODAY));
+            assert!(!card.needs_consent(), "{calls} chamadas");
+            assert_eq!(card.cap(), Some(CapReached { used: 3, cap: 3 }));
+            assert_eq!(
+                card.title(),
+                "Limite mensal atingido (3 chamadas) — continuar?"
+            );
+        }
+        assert_eq!(a.usage_this_month(TODAY), 3);
+        assert_eq!(on_disk(), 3, "nada saiu sem o sim");
+        // E ao contrario: o «Continuar» de A conta no limite de B.
+        let card = ask(a.request(page(1), TODAY));
+        assert_eq!(a.answer(card, ConsentAnswer::Once, TODAY), Decision::Send);
+        assert!(a.wait_usage_written());
+        let card = ask(b.request(page(1), TODAY));
+        assert_eq!(card.cap(), Some(CapReached { used: 4, cap: 3 }));
+        assert_eq!(on_disk(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gate (critico, infra-egress; revisao EG-4): `ai/usage.json` e
+    /// `Setting`. Com o modo privado das lojas ligado (o `StoreMode` do
+    /// registo e a `EgressPrivacy` do pedido podem divergir), as chamadas
+    /// pagas continuam a ser gravadas e a sessao seguinte ve-as: o limite
+    /// nao recomeca. Como `Automatic`, a gravacao saltava e a conta morria
+    /// com a janela.
+    #[test]
+    fn usage_survives_the_private_store_mode() {
+        let dir = temp_dir("usage-private");
+        let registry = StoreRegistry::mint_for_test(&dir);
+        registry.set_mode(StoreMode::Private);
+        let mut gate = EgressGate::for_app(Some(&registry));
+        let page = || {
+            click(
+                AiPurpose::Translation,
+                DataClass::PageContent,
+                gemini(),
+                EgressPrivacy::Normal,
+            )
+        };
+        let card = ask(gate.request(page(), TODAY));
+        assert_eq!(
+            gate.answer(card, ConsentAnswer::Session, TODAY),
+            Decision::Send
+        );
+        for _ in 0..4 {
+            assert_eq!(gate.request(page(), TODAY), Decision::Send);
+        }
+        assert!(gate.wait_usage_written());
+        assert!(
+            dir.join("ai").join("usage.json").exists(),
+            "o modo privado das lojas saltou a gravacao do consumo"
+        );
+        assert_eq!(
+            usage_on_disk(&dir)["data"]["months"]["2026-09"]["gemini"]["traducao"],
+            5
+        );
+        let next = StoreRegistry::mint_for_test(&dir);
+        next.set_mode(StoreMode::Private);
+        assert_eq!(EgressGate::for_app(Some(&next)).usage_this_month(TODAY), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A thread que grava o consumo so nasce na primeira chamada paga: criar
     /// o portao, perguntar, recusar, mandar de graca e ler o consumo nao a
     /// criam nem escrevem nada.
@@ -1880,8 +2106,12 @@ mod tests {
             Decision::Send
         );
         assert_eq!(gate.worker_threads_spawned(), 1);
-        for _ in 0..30 {
+        // Cada pedido rele o usage.json com a thread a gravar ao lado: a
+        // conta e exata a cada passo (o que esta a ser gravado nunca conta
+        // duas vezes, no disco e por gravar).
+        for sent in 2..=31 {
             assert_eq!(gate.request(page(), TODAY), Decision::Send);
+            assert_eq!(gate.usage_this_month(TODAY), sent);
         }
         assert!(gate.wait_usage_written());
         assert_eq!(gate.worker_threads_spawned(), 1, "31 chamadas, uma thread");
@@ -1962,8 +2192,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// «Sempre neste site»: so onde o desenho o pede (a Traducao), numa loja
-    /// `Setting`, nunca vindo de um contexto privado, e nunca lida num.
+    /// Gate (critico, infra-egress; revisao EG-2): sem site (`file:`,
+    /// `neuralia-pdf:`, `data:`, uma origem com mais de 256 caracteres, o
+    /// ditado), «Sempre nesta sessão» vale so para a mesma finalidade com a
+    /// mesma classe do dado. Antes, o par (cerebro, sem site) cobria tudo: o
+    /// sim ao audio do ditado mandava calado o texto de um PDF local.
+    #[test]
+    fn session_consent_without_a_site_stays_with_its_feature_and_data() {
+        use AiPurpose::{Dictation, Translation};
+        use DataClass::{Media, PageContent, UserTyped};
+        let mut gate = EgressGate::for_app(None);
+        let free = at(Locality::Remote, false);
+        let from = |feature, data, url: &str| EgressRequest {
+            origin: SiteOrigin::of_url(url),
+            ..click(feature, data, free.clone(), EgressPrivacy::Normal)
+        };
+        // O ditado: sem site, e o cartao nao tem linha de site.
+        let card = ask(gate.request(from(Dictation, Media, ""), TODAY));
+        assert!(!card.lines().iter().any(|line| line.starts_with("Site:")));
+        assert_eq!(
+            card.answers(),
+            vec![
+                ConsentAnswer::Once,
+                ConsentAnswer::Session,
+                ConsentAnswer::Cancel
+            ]
+        );
+        assert_eq!(
+            gate.answer(card, ConsentAnswer::Session, TODAY),
+            Decision::Send
+        );
+        assert_eq!(
+            gate.request(from(Dictation, Media, ""), TODAY),
+            Decision::Send
+        );
+        // O mesmo cerebro, sem site, noutra finalidade ou com outro dado:
+        // pergunta. Nem um site herda o sim dado sem site.
+        let long = format!("https://{}.com/", vec!["a".repeat(60); 5].join("."));
+        for (feature, data, url) in [
+            (Translation, PageContent, "file:///C:/Users/x/contrato.pdf"),
+            (
+                Translation,
+                PageContent,
+                "neuralia-pdf://local/contrato.pdf",
+            ),
+            (Translation, Media, "data:text/html,x"),
+            (Translation, PageContent, long.as_str()),
+            (Dictation, UserTyped, ""),
+        ] {
+            let request = from(feature, data, url);
+            assert_eq!(request.origin, None, "{url}");
+            assert!(
+                matches!(gate.request(request, TODAY), Decision::Ask(_)),
+                "{feature:?} {data:?} {url}"
+            );
+        }
+        assert!(matches!(
+            gate.request(from(Dictation, Media, "https://exemplo.com/"), TODAY),
+            Decision::Ask(_)
+        ));
+        // O sim ao texto de um ficheiro local na Traducao vale para outro
+        // ficheiro local na Traducao; nao para outro cerebro.
+        let card = ask(gate.request(from(Translation, PageContent, "file:///C:/a.pdf"), TODAY));
+        assert_eq!(
+            gate.answer(card, ConsentAnswer::Session, TODAY),
+            Decision::Send
+        );
+        assert_eq!(
+            gate.request(
+                from(Translation, PageContent, "neuralia-pdf://local/b.pdf"),
+                TODAY
+            ),
+            Decision::Send
+        );
+        let lan = EgressRequest {
+            origin: None,
+            ..click(
+                Translation,
+                PageContent,
+                at(Locality::Lan, false),
+                EgressPrivacy::Normal,
+            )
+        };
+        assert!(matches!(gate.request(lan, TODAY), Decision::Ask(_)));
+    }
+
+    /// Gate (critico, infra-egress; revisao EG-3): «Sempre neste site» so
+    /// onde o desenho o pede (a Traducao), numa loja `Setting`, nunca vindo
+    /// de um contexto privado, e nunca lido num; e revogado, deixa de valer
+    /// ja em todas as janelas abertas, nao so nas que nascem depois.
     #[test]
     fn site_grants_only_where_offered_and_never_from_private() {
         let dir = temp_dir("sites");
@@ -2050,9 +2367,27 @@ mod tests {
             next.request(page(EgressPrivacy::PrivateSurface), TODAY),
             Decision::Ask(_)
         ));
-        // Revogar tira-o.
+        // Revogar noutra janela tira-o ja (revisao EG-3): a janela que o leu
+        // e a que o deu voltam a perguntar no pedido seguinte, sem reiniciar
+        // -- a loja e relida, e o «Sempre» gravado nao ficou tambem na sessao.
         let origin = SiteOrigin::of_url("https://exemplo.com").expect("origem");
-        sites.revoke(&free.brain.key(), &origin);
+        assert!(sites.revoke(&free.brain.key(), &origin));
+        let text = std::fs::read_to_string(dir.join("translate-test.json")).expect("loja");
+        assert!(!text.contains("https://exemplo.com"), "{text}");
+        assert!(
+            matches!(
+                next.request(page(EgressPrivacy::Normal), TODAY),
+                Decision::Ask(_)
+            ),
+            "a janela que leu o «Sempre» ainda manda depois da revogacao"
+        );
+        assert!(
+            matches!(
+                gate.request(page(EgressPrivacy::Normal), TODAY),
+                Decision::Ask(_)
+            ),
+            "a janela que deu o «Sempre» ainda manda depois da revogacao"
+        );
         let mut after = EgressGate::for_app(Some(&registry));
         after
             .attach_site_grants(
@@ -2064,6 +2399,52 @@ mod tests {
             after.request(page(EgressPrivacy::Normal), TODAY),
             Decision::Ask(_)
         ));
+        // Pelo portao: `revoke_site_grant` tira-o da loja (as outras janelas
+        // deixam de o ver) e tira o consentimento da sessao desse par; o de
+        // outro site fica.
+        let card = ask(after.request(page(EgressPrivacy::Normal), TODAY));
+        assert_eq!(
+            after.answer(card, ConsentAnswer::AlwaysOnSite, TODAY),
+            Decision::Send
+        );
+        assert_eq!(
+            next.request(page(EgressPrivacy::Normal), TODAY),
+            Decision::Send,
+            "o «Sempre» novo vale ja nas outras janelas"
+        );
+        assert!(after.revoke_site_grant(AiPurpose::Translation, free.brain, &origin));
+        assert!(matches!(
+            after.request(page(EgressPrivacy::Normal), TODAY),
+            Decision::Ask(_)
+        ));
+        assert!(matches!(
+            next.request(page(EgressPrivacy::Normal), TODAY),
+            Decision::Ask(_)
+        ));
+        let other_site = || EgressRequest {
+            origin: SiteOrigin::of_url("https://outro.com/"),
+            ..page(EgressPrivacy::Normal)
+        };
+        for request in [page(EgressPrivacy::Normal), other_site()] {
+            let card = ask(after.request(request, TODAY));
+            assert_eq!(
+                after.answer(card, ConsentAnswer::Session, TODAY),
+                Decision::Send
+            );
+        }
+        assert_eq!(
+            after.request(page(EgressPrivacy::Normal), TODAY),
+            Decision::Send
+        );
+        assert!(after.revoke_site_grant(AiPurpose::Translation, free.brain, &origin));
+        assert!(
+            matches!(
+                after.request(page(EgressPrivacy::Normal), TODAY),
+                Decision::Ask(_)
+            ),
+            "a revogacao deixou o consentimento da sessao desse site"
+        );
+        assert_eq!(after.request(other_site(), TODAY), Decision::Send);
         // So Setting, so ficheiro, so a Traducao.
         let automatic = registry
             .grant(StoreSpec::new(

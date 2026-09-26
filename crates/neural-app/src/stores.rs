@@ -25,8 +25,11 @@ pub(crate) const LIVE_KEY_STORE: StoreSpec = StoreSpec::new("gemini-live.key", E
 /// (`ai_settings.rs`). So muda por uma escolha em IA › Cérebros: `Setting`.
 pub(crate) const AI_SETTINGS_STORE: StoreSpec = StoreSpec::new("ai/settings.json", Setting, File);
 /// `<data_dir>/ai/usage.json`: as chamadas pagas do mes, contadas pelo
-/// `EgressGate` a cada envio -- efeito lateral do uso: `Automatic`.
-pub(crate) const AI_USAGE_STORE: StoreSpec = StoreSpec::new("ai/usage.json", Automatic, File);
+/// `EgressGate` a cada envio. `Setting`, como o limite que ele guarda: e a
+/// base do limite mensal que o dono escolheu, e como `Automatic` o modo
+/// privado das lojas saltaria as gravacoes e o limite recomecaria na sessao
+/// seguinte (gate `egress::tests::usage_survives_the_private_store_mode`).
+pub(crate) const AI_USAGE_STORE: StoreSpec = StoreSpec::new("ai/usage.json", Setting, File);
 
 /// Tudo o que o produto guarda em `<data_dir>`, com o tipo. Um ficheiro, um
 /// tipo; a regra: `Setting` = escolha num menu ou definicao; `Explicit` =

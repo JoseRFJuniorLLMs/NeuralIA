@@ -21665,7 +21665,7 @@ fn existing_stores_have_a_declared_kind() {
         ("gemini-live.key", Explicit, File),
         ("keys", Explicit, Dir),
         ("ai/settings.json", Setting, File),
-        ("ai/usage.json", Automatic, File),
+        ("ai/usage.json", Setting, File),
     ];
     expected.sort_by_key(|row| row.0);
     let mut table: Vec<_> = APP_STORES

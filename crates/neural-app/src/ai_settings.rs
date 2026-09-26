@@ -9,9 +9,11 @@
 //!   chamadas pagas (200 por omissao). O limite vive aqui, e nao no
 //!   `usage.json`, porque um ficheiro tem um tipo so: quem o muda e o dono.
 //! - `<data_dir>/ai/usage.json` (`stores::AI_USAGE_STORE`,
-//!   `StoreKind::Automatic`: escreve-se como efeito lateral de cada chamada
-//!   paga): os contadores do mes por cerebro e finalidade (`UsageBook`),
-//!   partilhados entre janelas. Quem conta e o `EgressGate` (`egress.rs`).
+//!   `StoreKind::Setting`: escreve-se a cada chamada paga, mas e a base do
+//!   limite que o dono escolheu, e o modo privado das lojas nao o pode
+//!   saltar sem o limite recomecar): os contadores do mes por cerebro e
+//!   finalidade (`UsageBook`), partilhados entre janelas. Quem conta e o
+//!   `EgressGate` (`egress.rs`).
 //!
 //! O mes e o do calendario UTC (`Day`): o contador vira a meia-noite UTC do
 //! dia 1, nao a local. Portatil: testado tambem no runner Linux.
