@@ -744,7 +744,21 @@ pub fn is_token(text: &str) -> bool {
 }
 
 /// Um ficheiro com uma palavra so (`theme` = `escuro`), aberto com o seu
-/// grant.
+/// grant. Sem grant nao abre:
+///
+/// ```compile_fail
+/// use neural_core::json_store::TokenFile;
+/// let _file = TokenFile::open(std::path::PathBuf::from("theme"));
+/// ```
+///
+/// Com o grant, sim:
+///
+/// ```no_run
+/// use neural_core::json_store::{StoreKind, StoreRegistry, StoreShape, StoreSpec, TokenFile};
+/// let registry = StoreRegistry::mint(std::env::temp_dir()).unwrap();
+/// let grant = registry.grant(StoreSpec::new("theme", StoreKind::Setting, StoreShape::File)).unwrap();
+/// let _file = TokenFile::open(grant).unwrap();
+/// ```
 #[derive(Debug)]
 pub struct TokenFile {
     grant: StoreGrant,
