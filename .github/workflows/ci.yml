@@ -589,6 +589,75 @@ jobs:
                       UserEvent::RunCommandKey { key, .. } => {
                           if let Some(event) = resolve_command(key, CommandOrigin::Host(WebViewHost::External)) {
           '@
+            },
+            @{
+              Label = "distraction-clicks-a-reject-that-accepts"
+              Test = "distraction_never_clicks_accept"
+              SourcePath = "crates/neural-app/src/windows_app/distraction.rs"
+              Old = @'
+              return hasPhrase(padded, C.reject) && !hasAccept(padded);
+          '@
+              New = @'
+              return hasPhrase(padded, C.reject);
+          '@
+            },
+            @{
+              Label = "distraction-acts-on-ai-pages"
+              Test = "distraction_leaves_ai_provider_pages_untouched"
+              SourcePath = "crates/neural-app/src/windows_app/distraction.rs"
+              Old = @'
+              if (hit && (rule[2] !== true || udm === '50')) return;
+          '@
+              New = @'
+              if (false && hit && (rule[2] !== true || udm === '50')) return;
+          '@
+            },
+            @{
+              Label = "distraction-ignores-the-site-toggle"
+              Test = "per_site_toggle_off_injects_nothing"
+              SourcePath = "crates/neural-app/src/windows_app/distraction.rs"
+              Old = @'
+            var on = hasOwn(C.sites, site) ? C.sites[site] === true : C.on === true;
+          '@
+              New = @'
+            var on = C.on === true;
+          '@
+            },
+            @{
+              Label = "distraction-restores-scroll-under-a-paywall"
+              Test = "paywall_overlays_are_never_touched"
+              SourcePath = "crates/neural-app/src/windows_app/distraction.rs"
+              Old = @'
+              if (hasMarker(names, C.paywall) || hasMarker(text, C.paywall) || query(el, C.paywallSel).n) {
+                walled = true;
+                return;
+          '@
+              New = @'
+              if (hasMarker(names, C.paywall) || hasMarker(text, C.paywall) || query(el, C.paywallSel).n) {
+                return;
+          '@
+            },
+            @{
+              Label = "distraction-uses-the-page-querySelectorAll"
+              Test = "distraction_script_posts_nothing_and_survives_a_poisoned_page"
+              SourcePath = "crates/neural-app/src/windows_app/distraction.rs"
+              Old = @'
+                list = root === D ? qsaDoc(D, selector)
+          '@
+              New = @'
+                list = root === D ? document.querySelectorAll(selector)
+          '@
+            },
+            @{
+              Label = "distraction-private-toggle-written"
+              Test = "a_toggle_in_private_is_never_written"
+              SourcePath = "crates/neural-app/src/windows_app/adblock.rs"
+              Old = @'
+                  let outcome = if private {
+          '@
+              New = @'
+                  let outcome = if false {
+          '@
             }
           )
 
