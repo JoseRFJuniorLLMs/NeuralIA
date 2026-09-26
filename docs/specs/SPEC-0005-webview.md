@@ -499,13 +499,15 @@ whose effects the app applies:
   from the central one is classified and then fails the listing. Each name
   is first checked as a path, in one pass over its bytes that stops at the
   cap: a segment longer than 255 UTF-16 units (`MAX_SEGMENT_UTF16`, what
-  NTFS stores) or a `.` or `..` segment anywhere (`setup.exe/.`, which
-  `tar.exe` writes as the file `setup.exe`; `a/../setup.exe`;
-  `./LEIAME.txt`) is an unsafe name, so the rules below only ever run on a
-  segment of at most 255 units. Then the name is classified by the last
+  NTFS stores) or a `..` segment anywhere (`a/../setup.exe`,
+  `../../evil.exe`) is an unsafe name, so the rules below only ever run on
+  a segment of at most 255 units. A `.` segment changes the path in no
+  extractor and is not an unsafe name: bsdtar writes every entry as
+  `./name`, and `dir/./x.txt` is `dir/x.txt`. Then the name is classified by the last
   real segment of its path (`/` or `\`, at any depth; trailing segments
-  made only of dots and spaces are dropped first, so `setup.exe/ .` counts
-  as `setup.exe`) with the name rules above: a program, script,
+  made only of dots and spaces are dropped first, so `setup.exe/.`, which
+  `tar.exe` writes as the file `setup.exe`, and `setup.exe/ .` count as
+  `setup.exe`) with the name rules above: a program, script,
   shortcut, disk image, Access database or another archive
   (`ARCHIVE_EXTENSIONS`: zip, 7z, rar, cab, tar, gz...) inside deletes the
   ZIP unless "Permitir baixar programas" is on (then it is kept and its row
