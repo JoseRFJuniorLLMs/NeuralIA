@@ -4,6 +4,7 @@
 
 pub mod agent_protocol;
 pub mod agent_security;
+pub mod ai_policy;
 pub mod config;
 pub mod downloads;
 pub mod epub;
