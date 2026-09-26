@@ -926,6 +926,7 @@ impl App {
             PanelMessage::NoteSaveRefused => self.panel_run(notes_reply_script(
                 &NotesReply::Failed(NOTE_SAVE_REFUSED.to_string()),
             )),
+            PanelMessage::Bookmarks(request) => self.bookmark_panel_request(request),
             notes @ (PanelMessage::NotesList
             | PanelMessage::NotesSearch(_)
             | PanelMessage::NoteOpen(_)

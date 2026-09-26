@@ -52,6 +52,9 @@ windows-sys = { version = "0.61.2", features = [
     # Transferencias que o gestor de downloads repoe no perfil do WebView2.
     "Win32_System_Com",
     "Win32_UI_Shell",
+    # GetLocalTime: o dia local da pasta «Importado do Chrome (dd/mm/aaaa)»
+    # e do nome do HTML exportado dos favoritos.
+    "Win32_System_SystemInformation",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

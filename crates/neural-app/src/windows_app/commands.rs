@@ -14,11 +14,13 @@ use super::*;
 // inteiro e nao escolhe origem nenhuma).
 //
 // Regra (critica C13 do plano 2.3): um atalho entra no MESMO PR que o seu
-// comando. Este registo traz so o que a 2.2.0 ja tinha -- os atalhos da
+// comando. Este registo nasceu com o que a 2.2.0 ja tinha -- os atalhos da
 // janela e da omnibox (antes `main_window_shortcut` e o subclass do EDIT,
-// cada um com a sua lista) e os botoes da barra que ja eram um evento -- e
-// nenhum atalho novo. Cada feature da 2.3 acrescenta aqui a sua linha, com
-// o seu atalho, no PR dela.
+// cada um com a sua lista) e os botoes da barra que ja eram um evento. Cada
+// feature da 2.3 acrescenta aqui a sua linha, com o seu atalho, no PR dela:
+// o primeiro e o Ctrl+D dos favoritos (`CommandId::Bookmark`, ambito
+// `Global`), que corre contra o hospedeiro de onde veio a tecla
+// (`bookmark_target`) e nunca passa pelo IPC.
 
 /// Um comando do registo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -45,12 +47,15 @@ pub(in crate::windows_app) enum CommandId {
     SplitFullscreen,
     /// Fechar a NeuralIA (as abas ficam gravadas).
     Exit,
+    /// Ctrl+D: a pagina de onde veio para os favoritos; na Home (ou num
+    /// painel), abre os Favoritos.
+    Bookmark,
 }
 
 impl CommandId {
     /// Cada comando, uma vez: o que os gates percorrem.
     #[cfg(test)]
-    pub(in crate::windows_app) const ALL: [CommandId; 11] = [
+    pub(in crate::windows_app) const ALL: [CommandId; 12] = [
         CommandId::AutoScroll,
         CommandId::Reload,
         CommandId::History,
@@ -62,6 +67,7 @@ impl CommandId {
         CommandId::CloseSplit,
         CommandId::SplitFullscreen,
         CommandId::Exit,
+        CommandId::Bookmark,
     ];
 
     /// A chave estavel do comando (a da sua linha em `COMMANDS`).
@@ -133,6 +139,15 @@ impl ChordSpec {
     const fn window(chord: Chord) -> ChordSpec {
         ChordSpec {
             scope: KeyScope::Window,
+            chord,
+        }
+    }
+
+    /// Um atalho de toda a parte com teclado: a janela, a omnibox e cada
+    /// WebView (menos o monitor do Gmail), preso no `AcceleratorKeyPressed`.
+    const fn global(chord: Chord) -> ChordSpec {
+        ChordSpec {
+            scope: KeyScope::Global,
             chord,
         }
     }
@@ -262,6 +277,15 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
         chords: &[],
         alias: None,
     },
+    CommandRow {
+        id: CommandId::Bookmark,
+        key: "adicionar-favorito",
+        label: "Adicionar aos favoritos",
+        category: CommandCategory::Pagina,
+        keywords: &["favorito", "favoritos", "marcador", "bookmark", "estrela"],
+        chords: &[ChordSpec::global(Chord::ctrl(b'D'))],
+        alias: None,
+    },
 ];
 
 /// A linha de um comando.
@@ -285,6 +309,10 @@ fn chrome_event(id: CommandId) -> UserEvent {
         CommandId::CloseSplit => UserEvent::CloseSplit,
         CommandId::SplitFullscreen => UserEvent::ToggleSplitFullscreen,
         CommandId::Exit => UserEvent::ExitRequested,
+        CommandId::Bookmark => UserEvent::Bookmarks(BookmarksEvent::Request {
+            target: BookmarkTarget::Window,
+            via: BookmarkVia::Shortcut,
+        }),
     }
 }
 
@@ -308,7 +336,10 @@ fn page_action(id: CommandId, column: Option<usize>) -> Option<IpcAction> {
         | CommandId::Home
         | CommandId::CloseSplit
         | CommandId::SplitFullscreen
-        | CommandId::Exit => None,
+        | CommandId::Exit
+        // Nativo: a origem e o hospedeiro (`bookmark_target`), nunca um
+        // pedido do mapa de teclas da pagina.
+        | CommandId::Bookmark => None,
     }
 }
 
@@ -319,6 +350,17 @@ pub(in crate::windows_app) fn resolve_command(
     id: CommandId,
     origin: CommandOrigin,
 ) -> Option<UserEvent> {
+    // O Ctrl+D leva a origem inteira: a pagina e a do hospedeiro que
+    // recebeu a tecla (a coluna 2 e a coluna 2), a janela na Home abre os
+    // Favoritos.
+    if id == CommandId::Bookmark {
+        return bookmark_target(origin).map(|target| {
+            UserEvent::Bookmarks(BookmarksEvent::Request {
+                target,
+                via: BookmarkVia::Shortcut,
+            })
+        });
+    }
     let host = match origin {
         CommandOrigin::Window | CommandOrigin::Omnibox => return Some(chrome_event(id)),
         CommandOrigin::Host(host) => host,
@@ -397,6 +439,10 @@ pub(in crate::windows_app) fn bar_hit_command(hit: BarHit) -> Option<CommandId> 
         | BarHit::Forward
         | BarHit::ColumnBack(_)
         | BarHit::ColumnForward(_)
+        // A estrela e da pagina debaixo dela (o Ctrl+D e o mesmo pedido
+        // com a origem do teclado).
+        | BarHit::ColumnBookmark(_)
+        | BarHit::SplitBookmark
         | BarHit::Column(_)
         | BarHit::AddTab(_)
         | BarHit::ContextTab { .. }

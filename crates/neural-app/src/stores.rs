@@ -36,6 +36,12 @@ pub(crate) const ADBLOCK_LIST_STORE: StoreSpec =
 /// um servico InPrivate, e no Modo privado nao se escreve. Sai no
 /// Ctrl+Shift+Delete.
 pub(crate) const DOWNLOADS_LOG_STORE: StoreSpec = StoreSpec::new("downloads.json", Automatic, File);
+/// `<data_dir>/bookmarks.json`: os favoritos (`neural_core::bookmarks`).
+/// O utilizador pediu cada um (Ctrl+D, a estrela, importar): `Explicit` --
+/// no Split privado e no Modo privado grava na mesma, e o Ctrl+Shift+Delete
+/// nunca o apaga. Partilhado entre janelas pelo trinco
+/// `bookmarks.json.lock`; so a thread `neural-bookmarks` o escreve.
+pub(crate) const BOOKMARKS_STORE: StoreSpec = StoreSpec::new("bookmarks.json", Explicit, File);
 /// `<data_dir>/downloads-settings.json`: a pasta dos downloads e
 /// «Permitir baixar programas». Hoje o produto so o le; quem o escreve e a
 /// seccao Downloads do downloads-ui.
@@ -83,6 +89,7 @@ pub(crate) const APP_STORES: &[StoreSpec] = &[
     KEYS_STORE,
     ADBLOCK_SETTINGS_STORE,
     ADBLOCK_LIST_STORE,
+    BOOKMARKS_STORE,
 ];
 
 #[cfg(test)]

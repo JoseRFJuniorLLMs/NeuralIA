@@ -892,6 +892,23 @@ impl App {
             Some(BarHit::Forward) => self.navigate_history(HistoryStep::Forward),
             Some(BarHit::ColumnBack(index)) => self.navigate_column(index, HistoryStep::Back),
             Some(BarHit::ColumnForward(index)) => self.navigate_column(index, HistoryStep::Forward),
+            Some(BarHit::ColumnBookmark(index)) => self.bookmarks_event(BookmarksEvent::Request {
+                target: BookmarkTarget::Column(index),
+                via: BookmarkVia::Star,
+            }),
+            Some(BarHit::SplitBookmark) => {
+                let split = self
+                    .comparator
+                    .as_ref()
+                    .and_then(|comp| comp.split.as_ref())
+                    .map(|split| (split.source_index, split.private));
+                if let Some((source, private)) = split {
+                    self.bookmarks_event(BookmarksEvent::Request {
+                        target: BookmarkTarget::Split { source, private },
+                        via: BookmarkVia::Star,
+                    });
+                }
+            }
             Some(BarHit::Column(index)) => self.expand_comparator(index),
             Some(BarHit::AddTab(index)) => self.open_ai_palette(index),
             Some(BarHit::ContextTab {
