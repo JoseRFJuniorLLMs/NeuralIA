@@ -4,6 +4,12 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Anti-distração (c575f2b; SPEC-0114, Proposta; §7: script injetado novo, espera o sim do dono):** nas colunas das IAs, na fonte aberta ao lado (normal ou privada) e na Web completa, o novo `NEURALIA_DISTRACTION_SCRIPT` esconde avisos de cookies, janelas de newsletter e barras fixas ou presas encostadas ao topo ou ao fundo com pelo menos 25% da altura da janela. Nos CMPs conhecidos (OneTrust, Cookiebot, Didomi, Usercentrics, Quantcast/InMobi Choice, CookieYes, Complianz, iubenda, Osano, Axeptio, Termly e a página consent.google.com) só clica em «Rejeitar»/«Só necessários», e só quando o seletor de recusa do CMP casa, o texto visível do botão é de recusa e não tem nenhuma palavra de aceitar (pt, en, es, fr, de, it) — «Aceitar todos», «Concordo» ou «Rejeitar e aceitar» nunca são clicados: aí o aviso só é escondido. Sourcepoint e TrustArc (molduras de outra origem) são só escondidos. Nunca age nas páginas das IAs nem de login (registo dos provedores), nas origens `neuralia-*`/`localhost`/IPs, nos painéis de serviço, no Leitor, no PDF, nos livros nem na Home. Um marcador de paywall deixa o que o tem intocado; a rolagem só volta quando o script escondeu a causa e a página rola mesmo; o que aparece até 1,5 s depois de um clique ou tecla do utilizador e um diálogo com campo de senha ficam. Só no documento de topo, com as primitivas capturadas no início do documento, no máximo 8 ms de cada vez, pára depois de 30 s sem mudanças, e nunca usa o canal IPC. O botão direito ganha a caixa «Ocultar distrações neste site» (ligada por omissão): a escolha fica no campo `distraction` do `adblock-settings.json` e recarrega a página; no Split privado fica só em memória («Modo privado: esta escolha não é guardada.»).
+
+### Known limitations
+- **Anti-distração (c575f2b):** ainda não há a definição «Ocultar distrações (cookies, newsletter, barras fixas)» nem o comando `/distracoes` da paleta e da Home: o botão direito é o único sítio onde se escolhe, e só por site. Os gates correm o script num DOM falso (`node:vm`); a ligação pelo WebView2 (`AddScriptToExecuteOnDocumentCreated`, o recarregar depois da escolha) não tem teste que corra o exe, e a primeira página de uma WebView acabada de abrir pode carregar antes do script. Os seletores dos CMPs não foram conferidos de novo contra os sites dos fornecedores nesta alteração.
+
 ## [2.3.0] - 2026-09-26
 
 ### Added
