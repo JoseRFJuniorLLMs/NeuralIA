@@ -13,10 +13,11 @@ param(
 #   nao fica devida, por isso o exe nunca fala com pgl.yoyo.org. No fim
 #   confere-se que a lista guardada ficou byte a byte igual (uma renovacao
 #   te-la-ia reescrito).
-# - O WebView2 corre com --host-resolver-rules="MAP * 127.0.0.1": qualquer
-#   nome resolve para o loopback (o `*.test` da fixture chega a ela; um
-#   nome da internet nunca sai daqui). Os argumentos que o wry poe por
-#   omissao seguem com ele (a variavel substitui-os).
+# - Os nomes da fixture (allowed.test, ads.blocked.test) e pgl.yoyo.org
+#   estao mapeados para 127.0.0.1 no ficheiro hosts do runner pelo passo do
+#   CI que chama este script (o WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS com
+#   --host-resolver-rules nao e aplicado sob o wry). O script confere o
+#   mapeamento antes de abrir o exe e recusa correr sem ele.
 # - NEURALIA_STARTUP_INPUT abre a pagina da fixture na Web completa.
 #
 # Prova, pelo que chegou a fixture (scripts/adblock-fixture.mjs):
@@ -28,6 +29,15 @@ param(
 # - a imagem do proprio 127.0.0.1 chegou.
 $ErrorActionPreference = "Stop"
 $exe = (Resolve-Path -LiteralPath $ExePath).Path
+
+# Sem os nomes da fixture no loopback o E2E nao prova nada (e um nome da
+# lista que nao resolve "falha" sem nenhum bloqueio): recusa-se correr.
+foreach ($name in 'allowed.test', 'ads.blocked.test', 'pgl.yoyo.org') {
+    $resolved = @([Net.Dns]::GetHostAddresses($name) | ForEach-Object { $_.ToString() })
+    if (-not ($resolved -contains '127.0.0.1')) {
+        throw "$name nao resolve para 127.0.0.1 (ficheiro hosts do runner): o E2E do bloqueio so corre no CI."
+    }
+}
 $utf8 = [Text.UTF8Encoding]::new($false)
 
 $work = Join-Path ([IO.Path]::GetTempPath()) ("neuralia-adblock-" + [guid]::NewGuid().ToString("N"))
@@ -67,7 +77,6 @@ try {
     $env:NEURALIA_DATA_DIR = $dataDir
     $env:NEURALIA_NO_GMAIL = "1"
     $env:NEURALIA_STARTUP_INPUT = "web:$origin/page.html"
-    $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --host-resolver-rules="MAP * 127.0.0.1"'
     $process = Start-Process -FilePath $exe -PassThru
 
     function Get-Seen {
@@ -109,7 +118,7 @@ try {
     [ordered]@{ settled = $done; checks = $checks; requests = @($log | Where-Object { $_.path -ne "/__log" }) } |
         ConvertTo-Json -Depth 5 | Write-Host
     if (-not $checks.page_loaded) { throw "A pagina da fixture nunca foi pedida: o NEURALIA_STARTUP_INPUT nao abriu a Web completa." }
-    if (-not $checks.unlisted_loaded) { throw "A imagem de allowed.test nunca chegou: o --host-resolver-rules nao foi aplicado, e sem ele o E2E nao prova nada." }
+    if (-not $checks.unlisted_loaded) { throw "A imagem de allowed.test nunca chegou: o nome nao chegou a fixture (hosts do runner), e sem isso o E2E nao prova nada." }
     $bad = @($checks.GetEnumerator() | Where-Object { -not $_.Value } | ForEach-Object { $_.Key })
     if ($bad.Count -gt 0) { throw "Bloqueio de anuncios: falhou $($bad -join ', ')." }
     Write-Host "Adblock E2E: o script da lista foi bloqueado (403), a moldura do mesmo dominio, o que nao esta na lista e o proprio site passaram, e a lista nao foi renovada."
@@ -118,7 +127,7 @@ catch {
     $failure = $_.Exception.Message
 }
 finally {
-    foreach ($name in "NEURALIA_DATA_DIR", "NEURALIA_NO_GMAIL", "NEURALIA_STARTUP_INPUT", "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS") {
+    foreach ($name in "NEURALIA_DATA_DIR", "NEURALIA_NO_GMAIL", "NEURALIA_STARTUP_INPUT") {
         Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
     }
     if ($process -and -not $process.HasExited) {

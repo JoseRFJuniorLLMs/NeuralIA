@@ -714,17 +714,24 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $hostsPath = 'C:\Windows\System32\drivers\etc\hosts'
-          $entry = '127.0.0.1 pgl.yoyo.org'
-          $pinned = '(?m)^[ \t]*127\.0\.0\.1[ \t]+pgl\.yoyo\.org[ \t]*\r?$'
-          $current = [IO.File]::ReadAllText($hostsPath)
-          if ($current -notmatch $pinned) {
-            $separator = if ($current.Length -gt 0 -and -not $current.EndsWith("`n")) { "`r`n" } else { "" }
-            [IO.File]::AppendAllText($hostsPath, "$separator$entry`r`n", [Text.Encoding]::ASCII)
+          # pgl.yoyo.org: a refresh that ran by mistake can never leave the
+          # runner. allowed.test and ads.blocked.test: the fixture's names
+          # reach the loopback fixture (WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
+          # --host-resolver-rules is not applied under wry: PR 160's first run).
+          foreach ($name in 'pgl.yoyo.org', 'allowed.test', 'ads.blocked.test') {
+            $entry = "127.0.0.1 $name"
+            $pinned = '(?m)^[ \t]*127\.0\.0\.1[ \t]+' + [regex]::Escape($name) + '[ \t]*\r?$'
+            $current = [IO.File]::ReadAllText($hostsPath)
+            if ($current -notmatch $pinned) {
+              $separator = if ($current.Length -gt 0 -and -not $current.EndsWith("`n")) { "`r`n" } else { "" }
+              [IO.File]::AppendAllText($hostsPath, "$separator$entry`r`n", [Text.Encoding]::ASCII)
+            }
+            if ([IO.File]::ReadAllText($hostsPath) -notmatch $pinned) {
+              throw "The hosts file does not map $name to 127.0.0.1."
+            }
+            Write-Host "hosts: $entry"
           }
-          if ([IO.File]::ReadAllText($hostsPath) -notmatch $pinned) {
-            throw "The hosts file does not map pgl.yoyo.org to 127.0.0.1."
-          }
-          Write-Host "hosts: $entry"
+          ipconfig /flushdns | Out-Null
           ./scripts/test-adblock.ps1 -ExePath ci-tested/NeuralIA.exe
       # E2E of the download manager (downloads-manager) on the exact bytes
       # that release.yml packages. It opens the exe (windows that can take the
