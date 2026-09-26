@@ -910,7 +910,14 @@ mod tests {
                 format!("Authorization: {}", format_args!("Bearer {MARK}")),
             ),
             (
-                "authorization: bearer eyJhbGciOiJIUzI1NiJ9.e30.c2lnbmF0dXJl+/=".to_string(),
+                // Fake JWT ({"alg":"HS256"} . {} . "signature"), split so
+                // secret scanners do not read the test literal as a token.
+                concat!(
+                    "authorization: bearer ",
+                    "eyJhbGci",
+                    "OiJIUzI1NiJ9.e30.c2lnbmF0dXJl+/="
+                )
+                .to_string(),
                 format!("authorization: bearer {MARK}"),
             ),
             // x-api-key e x-goog-api-key, como cabecalho, em JSON e com =.
