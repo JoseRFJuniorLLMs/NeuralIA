@@ -12,8 +12,8 @@ impl App {
             return;
         };
         if let Some(token) =
-            self.tab_session
-                .observe(&comp.contexts, &comp.groups, comparator_split_key(comp))
+            self.privacy
+                .observe_tabs(&comp.contexts, &comp.groups, comparator_split_key(comp))
         {
             self.timers
                 .after(TAB_SESSION_DEBOUNCE, UserEvent::SaveTabSession(token));
@@ -21,24 +21,25 @@ impl App {
     }
 
     /// Grava ja, se o disco estiver atrasado em relacao a barra: antes de o
-    /// comparador ser destruido e ao sair (`TabPersistence::save_now`).
+    /// comparador ser destruido e ao sair (`PrivacyGuard::save_tabs`, que no
+    /// modo privado nao grava).
     pub(in crate::windows_app) fn save_tab_session(&mut self) -> std::io::Result<TabSave> {
         let Some(comp) = &mut self.comparator else {
             return Ok(TabSave::Unchanged);
         };
         let split = comparator_split_key(comp);
-        self.tab_session
-            .save_now(&mut comp.contexts, &mut comp.groups, split)
+        self.privacy
+            .save_tabs(&mut comp.contexts, &mut comp.groups, split)
     }
 
     /// O `SaveTabSession(token)` do fim do atraso: grava se ainda for o
-    /// ultimo agendado (`TabPersistence::save_due`) e diz ao dono o que correu
-    /// mal ou o que mudou.
+    /// ultimo agendado (`PrivacyGuard::save_tabs_due`) e diz ao dono o que
+    /// correu mal ou o que mudou.
     pub(in crate::windows_app) fn save_due_tab_session(&mut self, token: u64) {
         let result = self.comparator.as_mut().and_then(|comp| {
             let split = comparator_split_key(comp);
-            self.tab_session
-                .save_due(token, &mut comp.contexts, &mut comp.groups, split)
+            self.privacy
+                .save_tabs_due(token, &mut comp.contexts, &mut comp.groups, split)
         });
         if let Some(notice) = result.as_ref().and_then(tab_save_notice) {
             self.request_redraw();
@@ -47,15 +48,15 @@ impl App {
     }
 
     /// Parte de "Apagar historico": o modelo vivo, o ficheiro e as copias,
-    /// tudo de uma vez (`TabPersistence::forget`).
+    /// tudo de uma vez (`PrivacyGuard::forget_tabs`).
     pub(in crate::windows_app) fn forget_tab_session(&mut self) {
         let result = match &mut self.comparator {
             Some(comp) => {
                 let split = comparator_split_key(comp);
-                self.tab_session
-                    .forget(&mut comp.contexts, &mut comp.groups, split)
+                self.privacy
+                    .forget_tabs(&mut comp.contexts, &mut comp.groups, split)
             }
-            None => self.tab_session.forget(
+            None => self.privacy.forget_tabs(
                 &mut std::array::from_fn(|_| Vec::new()),
                 &mut std::array::from_fn(|_| Vec::new()),
                 None,

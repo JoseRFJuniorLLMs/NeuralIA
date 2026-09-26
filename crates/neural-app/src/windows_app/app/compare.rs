@@ -70,7 +70,7 @@ impl App {
             return;
         }
         let snapshot = session.synthesize(&ids).clone();
-        self.memory.save_session(session.clone());
+        self.privacy.save_session(session.clone());
         self.show_native_text("NeuralIA — Síntese com proveniência", &snapshot.output);
     }
 
@@ -128,8 +128,8 @@ impl App {
         self.next_generation();
 
         let (session, question_memory, reopen) = compare_records(&request);
-        self.memory.capture(question_memory);
-        self.memory.save_session(session.clone());
+        self.privacy.capture(question_memory);
+        self.privacy.save_session(session.clone());
         self.current_research = Some(session);
 
         self.record(HistoryKind::Ask, reopen, "comparator-3col".to_string());
@@ -266,7 +266,7 @@ impl App {
         // carrega agora: a pergunta e o contexto ativo de cada coluna, e cada
         // aba restaurada so abre quando for escolhida. O que esta no disco e
         // o que acabou de ser lido: nada a regravar ate alguma aba mudar.
-        let (restored, tabs_notice) = self.tab_session.restore();
+        let (restored, tabs_notice) = self.privacy.restore_tabs();
 
         let targets = [
             ("Google Gemini", google_url),

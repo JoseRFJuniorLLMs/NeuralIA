@@ -6984,18 +6984,20 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
         "\"Apagar histórico\" must also forget tabs.json"
     );
     assert!(
-        sink.contains("ClearTarget::Memory => self.memory.clear(&mut self.current_research),"),
+        sink.contains(
+            "ClearTarget::Memory => self.privacy.clear_memory(&mut self.current_research),"
+        ),
         "\"Apagar histórico\" must also clear the semantic memory"
     );
     assert!(
-        sink.contains("ClearTarget::History => match self.history.clear() {"),
+        sink.contains("ClearTarget::History => match self.privacy.clear_history() {"),
         "\"Apagar histórico\" must also clear history.jsonl"
     );
     // O comportamento destes caminhos esta em
     // the_app_path_saves_restores_and_forgets_the_real_tabs_json (sobre o
     // `TabPersistence`); aqui so se prende que o App os chama.
     let forget_body = body("fn forget_tab_session", "fn context_tab_identity");
-    assert!(forget_body.contains(".forget(&mut comp.contexts, &mut comp.groups, split)"));
+    assert!(forget_body.contains(".forget_tabs(&mut comp.contexts, &mut comp.groups, split)"));
 
     // Sair do comparador (Home, Reader, Web) grava antes de o destruir, e
     // fechar a janela tambem.
@@ -7004,14 +7006,14 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
     let exiting = body("fn exiting", "fn user_event");
     assert!(exiting.contains("self.save_tab_session()"));
     let save = body("fn save_tab_session", "fn save_due_tab_session");
-    assert!(save.contains(".save_now(&mut comp.contexts, &mut comp.groups, split)"));
+    assert!(save.contains(".save_tabs(&mut comp.contexts, &mut comp.groups, split)"));
 
     // O fim do atraso grava pelo bilhete.
     assert!(
         source.contains("UserEvent::SaveTabSession(token) => self.save_due_tab_session(token),")
     );
     let due = body("fn save_due_tab_session", "fn forget_tab_session");
-    assert!(due.contains(".save_due(token, &mut comp.contexts, &mut comp.groups, split)"));
+    assert!(due.contains(".save_tabs_due(token, &mut comp.contexts, &mut comp.groups, split)"));
 
     // Depois de cada lote de eventos o modelo e observado: e so por aqui
     // que um arrasto largado, o x e o menu do grupo agendam a gravacao
@@ -7019,13 +7021,15 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
     let wait = body("fn about_to_wait", "fn exiting");
     assert!(wait.contains("self.observe_tab_session();"));
     let observe = body("fn observe_tab_session", "fn save_tab_session");
-    assert!(observe.contains(".observe(&comp.contexts, &comp.groups, comparator_split_key(comp))"));
+    assert!(
+        observe.contains(".observe_tabs(&comp.contexts, &comp.groups, comparator_split_key(comp))")
+    );
 
     // As duas entradas do comparador passam pelo mesmo modelo.
     // open_comparator vive em app/compare.rs e activate_comparator e o
     // metodo que se lhe segue. O observe_tab_session que fechava a regiao
     // no ficheiro unico esta em app/tabs.rs: com ele a regiao atravessava
-    // o resto de compare.rs e um `self.tab_session.restore()` em qualquer
+    // o resto de compare.rs e um `self.privacy.restore_tabs()` em qualquer
     // desses metodos (ou num comentario) mantinha o gate verde.
     let open = body("fn open_comparator", "fn activate_comparator");
     assert!(
@@ -7037,7 +7041,7 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
         .expect("reuse and fresh paths");
     assert!(reuse.contains("start_new_search("));
     assert!(!reuse.contains("comparator.groups = "));
-    assert!(fresh.contains("self.tab_session.restore()"));
+    assert!(fresh.contains("self.privacy.restore_tabs()"));
 
     // "Adicionar a um novo grupo" abre logo o menu do grupo (com as
     // cores) junto da pilula nova, como o editor do Chrome.
@@ -20344,6 +20348,8 @@ fn service_panels_never_reach_history_or_memory() {
         "history.append",
         "memory.capture",
         "save_session",
+        "privacy.record(",
+        "privacy.capture(",
         "with_ipc_handler",
         "with_initialization_script",
     ] {
@@ -23997,6 +24003,10 @@ fn ident_callers(code: &str, name: &str) -> std::collections::BTreeMap<String, u
 fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
     vec![
         (
+            "privacy.rs",
+            code_without_tests(include_str!("../privacy.rs")),
+        ),
+        (
             "tab_session.rs",
             code_without_tests(include_str!("../tab_session.rs")),
         ),
@@ -24043,8 +24053,8 @@ fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
 fn existing_stores_have_a_declared_kind() {
     use crate::stores::{
         ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AI_SETTINGS_STORE, AI_USAGE_STORE, APP_STORES,
-        BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE, KEYS_STORE, LIVE_KEY_STORE,
-        TRANSLATE_STORE,
+        BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE, HISTORY_STORE, KEYS_STORE,
+        LIVE_KEY_STORE, MEMORY_STORE, TABS_STORE, TRANSLATE_STORE,
     };
     use neural_core::json_store::StoreKind::{Automatic, Explicit, Setting};
     use neural_core::json_store::StoreShape::{Dir, File};
@@ -24116,6 +24126,9 @@ fn existing_stores_have_a_declared_kind() {
         touched.insert(name);
     }
     let specs = [
+        ("HISTORY_STORE", HISTORY_STORE.name),
+        ("MEMORY_STORE", MEMORY_STORE.name),
+        ("TABS_STORE", TABS_STORE.name),
         ("KEYS_STORE", KEYS_STORE.name),
         ("LIVE_KEY_STORE", LIVE_KEY_STORE.name),
         ("ADBLOCK_SETTINGS_STORE", ADBLOCK_SETTINGS_STORE.name),
@@ -24127,8 +24140,26 @@ fn existing_stores_have_a_declared_kind() {
         ("TRANSLATE_STORE", TRANSLATE_STORE.name),
         ("BOOKMARKS_STORE", BOOKMARKS_STORE.name),
     ];
-    for part in compact.split(".grant(").skip(1) {
+    // Os grants: os do proprio `PrivacyGuard` (`.grant(...)` no registo que
+    // so ele tem; o `grant(spec)` de `PrivacyGuard::store` e a passagem), os
+    // que cada feature lhe pede (`privacy.store(...)`) e os que uma feature
+    // pede pela funcao `grants` que o App lhe passa (`grants(...)`, a
+    // palavra inteira: nao o `attach_site_grants(`).
+    let by_closure = compact.match_indices("grants(").filter_map(|(at, _)| {
+        let before = at.checked_sub(1).map(|index| compact.as_bytes()[index]);
+        let word_before = before.is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        (!word_before).then(|| &compact[at + "grants(".len()..])
+    });
+    let grants = compact
+        .split(".grant(")
+        .skip(1)
+        .chain(compact.split("privacy.store(").skip(1))
+        .chain(by_closure);
+    for part in grants {
         let argument = part.split(')').next().unwrap_or_default();
+        if argument == "spec" {
+            continue;
+        }
         let name = specs
             .iter()
             .find(|(ident, _)| argument == *ident)
@@ -24153,27 +24184,642 @@ fn existing_stores_have_a_declared_kind() {
     }
 }
 
-/// A unica cunhagem do registo das lojas no produto e a do `App::new`.
+// ===================== infra-privacy-guard: o portao da persistencia =====================
+
+/// O mesmo codigo sem os modulos `#[cfg(test)] mod x { ... }` escritos no
+/// meio do ficheiro (os `tab_session_gates` do `windows_app.rs`, por
+/// exemplo): um modulo fecha na linha que e so `}` com a indentacao da
+/// linha `mod` (rustfmt). O `mod tests {` do fim continua a cargo de
+/// `code_without_tests`.
+fn without_test_modules(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    let mut lines = code.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.trim() == "#[cfg(test)]"
+            && let Some(next) = lines.peek()
+            && next.trim_start().starts_with("mod ")
+            && next.trim_end().ends_with('{')
+        {
+            let indent: String = next.chars().take_while(|ch| ch.is_whitespace()).collect();
+            let closing = format!("{indent}}}");
+            for inner in lines.by_ref() {
+                if inner == closing {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Um bloco `impl X {` de topo, ate ao `}` na coluna 0 que o fecha.
+fn impl_block<'a>(code: &'a str, header: &str) -> &'a str {
+    code.split(header)
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .unwrap_or_else(|| panic!("{header} nao esta no codigo que embarca"))
+}
+
+/// O mesmo codigo sem esses blocos `impl`.
+fn without_impl_blocks(code: &str, headers: &[&str]) -> String {
+    let mut out = code.to_string();
+    for header in headers {
+        while let Some(start) = out.find(header) {
+            let end = out[start..]
+                .find("\n}\n")
+                .map(|at| start + at + 3)
+                .unwrap_or(out.len());
+            out.replace_range(start..end, "");
+        }
+    }
+    out
+}
+
+/// Gate (critico, infra-privacy-guard): a unica cunhagem do registo das
+/// lojas no produto e a do `App::new`, e vai inteira para o
+/// `PrivacyGuard::new`. Nenhuma funcao devolve nem recebe `&StoreRegistry`
+/// (as features pedem grants por `privacy.store(spec)`), o registo e os
+/// workers sao campos privados do guard, o construtor de teste -- a unica
+/// porta para `Private` -- so existe em `cfg(test)`, e o `App` ja nao tem
+/// o registo, o historico, a memoria nem as abas.
 #[test]
-fn the_store_registry_is_minted_once_in_app_new() {
-    let source = shipped_source();
+fn registry_is_minted_once_and_owned_by_the_guard() {
+    let app = without_comment_lines(&shipped_source());
+    let tops = shipped_top_level_sources();
+    let privacy = tops
+        .iter()
+        .find(|(name, _)| *name == "privacy.rs")
+        .map(|(_, source)| without_comment_lines(source))
+        .expect("privacy.rs nas fontes de topo");
+
+    // 1. Uma cunhagem so, no App::new, direta para o guard.
+    for (name, source) in &tops {
+        assert!(
+            !without_comment_lines(source).contains("StoreRegistry::mint("),
+            "{name} cunha o registo"
+        );
+    }
     assert_eq!(
-        source.matches("StoreRegistry::mint(").count(),
+        app.matches("StoreRegistry::mint(").count(),
         1,
         "o produto cunha o registo uma vez so"
     );
-    let app_new = source
+    let app_new = app
         .split("impl App {\n    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {")
         .nth(1)
         .and_then(|rest| rest.split("\n}\n").next())
         .expect("App::new");
-    assert!(app_new.contains("let stores = StoreRegistry::mint(&config.data_dir).ok();"));
-    for (name, source) in shipped_top_level_sources() {
+    assert_eq!(app_new.matches("PrivacyGuard::new(").count(), 1);
+    let handed = app_new
+        .split("PrivacyGuard::new(")
+        .nth(1)
+        .and_then(|rest| rest.split(");").next())
+        .expect("PrivacyGuard::new no App::new");
+    assert!(
+        handed.contains("StoreRegistry::mint(&config.data_dir)"),
+        "a cunhagem nao vai direta para PrivacyGuard::new: {handed}"
+    );
+
+    // 2. Ninguem devolve nem recebe o registo: fora do guard o nome so
+    // aparece no `use` e na cunhagem do windows_app.rs.
+    assert!(
+        !app.contains("&StoreRegistry"),
+        "uma funcao do windows_app recebe ou devolve &StoreRegistry"
+    );
+    assert_eq!(
+        app.matches("StoreRegistry").count(),
+        2,
+        "windows_app: o registo so no use e na cunhagem"
+    );
+    for (name, source) in &tops {
+        if *name != "privacy.rs" {
+            assert!(
+                !without_comment_lines(source).contains("StoreRegistry"),
+                "{name} fala no registo: so o guard o tem"
+            );
+        }
+    }
+    assert!(
+        !privacy.contains("&StoreRegistry"),
+        "o guard empresta o registo"
+    );
+
+    // 3. O construtor de teste e a unica cunhagem de teste, e so em cfg(test).
+    assert_eq!(privacy.matches("StoreRegistry::mint_for_test(").count(), 1);
+    let before_for_test = privacy
+        .split("pub(crate) fn for_test(")
+        .next()
+        .expect("for_test");
+    assert!(
+        before_for_test.trim_end().ends_with("#[cfg(test)]"),
+        "PrivacyGuard::for_test sem #[cfg(test)]"
+    );
+    assert!(
+        privacy.contains("registry.set_mode(mode.into());"),
+        "for_test nao poe o modo pedido no registo"
+    );
+    let product_new = privacy
+        .split("pub(crate) fn new(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    }\n").next())
+        .expect("PrivacyGuard::new");
+    assert!(
+        !product_new.contains("set_mode("),
+        "PrivacyGuard::new muda o modo: so o construtor de teste o faz"
+    );
+
+    // 4. Campos privados: o registo, os grants e os workers so pelos metodos.
+    let fields = privacy
+        .split("pub(crate) struct PrivacyGuard {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("struct PrivacyGuard");
+    assert!(
+        !fields.contains("pub"),
+        "o guard tem um campo publico:\n{fields}"
+    );
+    for field in [
+        "registry: StoreRegistry,",
+        "history: HistoryWriter,",
+        "memory: MemoryWorker,",
+        "tabs: TabPersistence,",
+    ] {
+        assert!(fields.contains(field), "o guard perdeu o campo {field}");
+    }
+
+    // 5. O App so tem o guard.
+    let app_struct = app
+        .split("pub(in crate::windows_app) struct App {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("struct App");
+    assert!(app_struct.contains("privacy: PrivacyGuard,"));
+    for gone in [
+        "HistoryWriter",
+        "MemoryWorker",
+        "TabPersistence",
+        "StoreRegistry",
+    ] {
+        assert!(!app_struct.contains(gone), "o App ainda tem {gone}");
+    }
+}
+
+/// Gate (critico, infra-privacy-guard; so de ausencia, §4.3): fora do
+/// `impl PrivacyGuard` (e dos proprios workers, onde as chamadas vivem)
+/// ninguem escreve o historico, a memoria nem as abas -- nem abre um
+/// `TabPersistence`, um `HistoryWriter`, um `MemoryWorker`, um
+/// `HistoryStore` ou um `MemoryStore` novo para o fazer por fora. E o
+/// guard olha para o modo (`writes_allowed`) antes de cada escrita
+/// automatica (o comportamento esta em
+/// `private_guard_turns_automatic_stores_into_noops`).
+#[test]
+fn history_memory_and_tabs_are_written_only_through_the_privacy_guard() {
+    let mut code = without_test_modules(&shipped_source());
+    for (_, source) in shipped_top_level_sources() {
+        code.push('\n');
+        code.push_str(&without_test_modules(&source));
+    }
+    let code = without_comment_lines(&code);
+    let outside = without_impl_blocks(
+        &code,
+        &[
+            "impl PrivacyGuard {",
+            "impl TabPersistence {",
+            "impl HistoryWriter {",
+            "impl MemoryWorker {",
+        ],
+    );
+    for forbidden in [
+        ".history.append(",
+        ".memory.capture(",
+        ".memory.save_session(",
+        ".tabs.save_now(",
+        ".save_now(",
+        ".save_due(",
+        "TabPersistence::open(",
+        "HistoryWriter::new(",
+        "MemoryWorker::new(",
+        "HistoryStore::new(",
+        "HistoryStore::with_limit(",
+        "MemoryStore::new(",
+    ] {
         assert!(
-            !source.contains("StoreRegistry::mint("),
-            "{name} cunha o registo"
+            !outside.contains(forbidden),
+            "{forbidden} fora do impl PrivacyGuard: uma escrita automatica que o modo nao ve"
         );
     }
+
+    // A rota existe: o guard e quem abre e chama os tres.
+    let guard = impl_block(&code, "impl PrivacyGuard {");
+    for required in [
+        "HistoryWriter::new(history_store, sink.clone())",
+        "MemoryWorker::new(memory_grant.path().to_path_buf(), sink)",
+        "TabPersistence::open(&config.data_dir)",
+        "self.history.append(entry)",
+        "self.memory.capture(document)",
+        "self.memory.save_session(session)",
+        "self.tabs.save_now(contexts, groups, split)",
+        "self.tabs.save_due(token, contexts, groups, split)",
+    ] {
+        assert!(guard.contains(required), "o guard perdeu {required}");
+    }
+    // ...e cada escrita automatica pergunta ao grant (o modo partilhado).
+    for (method, grant) in [
+        ("fn record(", "history_grant"),
+        ("fn capture(", "memory_grant"),
+        ("fn save_session(", "memory_grant"),
+        ("fn save_tabs(", "tabs_grant"),
+        ("fn save_tabs_due(", "tabs_grant"),
+    ] {
+        let body = guard
+            .split(method)
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .unwrap_or_else(|| panic!("{method} no guard"));
+        assert!(
+            body.contains(&format!("if !self.{grant}.writes_allowed() {{")),
+            "{method} nao olha para o modo antes de escrever"
+        );
+    }
+}
+
+/// Gate (critico, infra-privacy-guard): com o guard em `Private` (o
+/// construtor de teste, a unica porta), gravar historico, memoria, sessao
+/// e abas nao muda um byte da pasta de dados; as lojas `Explicit` e
+/// `Setting` pedidas ao mesmo guard continuam a gravar e uma `Automatic`
+/// nao. Em `Normal`, o mesmo guard e as mesmas chamadas escrevem o
+/// `history.jsonl`, a `memory/`, a sessao e o `tabs.json` -- o
+/// comportamento de sempre.
+#[test]
+fn private_guard_turns_automatic_stores_into_noops() {
+    use neural_core::json_store::{SaveOutcome, StoreKind, StoreShape, StoreSpec, TokenFile};
+    use std::collections::BTreeMap;
+    use std::sync::mpsc::{Receiver, channel};
+    use std::time::Duration;
+
+    fn snapshot(dir: &std::path::Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(dir: &std::path::Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.insert(path.clone(), std::fs::read(&path).unwrap_or_default());
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(dir, &mut out);
+        out
+    }
+
+    /// O worker do historico e o da memoria acabaram tudo o que tinham
+    /// antes: um `Recent` e uma pesquisa vazia voltam depois do que entrou
+    /// antes deles (uma fila cada).
+    fn settle(guard: &PrivacyGuard, events: &Receiver<UserEvent>) {
+        assert!(guard.recent_history(1).is_none());
+        guard.query_memory(String::new());
+        let (mut history, mut memory) = (false, false);
+        while !(history && memory) {
+            match events.recv_timeout(Duration::from_secs(30)) {
+                Ok(UserEvent::HistoryLoaded(_)) => history = true,
+                Ok(UserEvent::MemoryQueryReady { .. }) => memory = true,
+                Ok(_) => {}
+                Err(error) => panic!("os workers nao responderam: {error}"),
+            }
+        }
+    }
+
+    fn one_tab() -> (
+        [Vec<ContextTab>; COMPARATOR_COLUMNS],
+        [Vec<ContextGroup>; COMPARATOR_COLUMNS],
+    ) {
+        let mut contexts: [Vec<ContextTab>; COMPARATOR_COLUMNS] =
+            std::array::from_fn(|_| Vec::new());
+        contexts[0].push(ContextTab {
+            id: 1,
+            url: "https://exemplo.pt/aba".to_string(),
+            group: None,
+        });
+        (contexts, std::array::from_fn(|_| Vec::new()))
+    }
+
+    const SETTING: StoreSpec = StoreSpec::new("gate-setting", StoreKind::Setting, StoreShape::File);
+    const EXPLICIT: StoreSpec =
+        StoreSpec::new("gate-explicit", StoreKind::Explicit, StoreShape::File);
+    const AUTOMATIC: StoreSpec =
+        StoreSpec::new("gate-automatic", StoreKind::Automatic, StoreShape::File);
+
+    for mode in [PrivacyMode::Private, PrivacyMode::Normal] {
+        let dir = std::env::temp_dir().join(format!(
+            "neuralia-privacy-guard-{mode:?}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("pasta temporaria");
+        let (tx, events) = channel::<UserEvent>();
+        let mut guard = PrivacyGuard::for_test(&dir, mode, EventSink::channel(tx));
+        assert_eq!(guard.mode(), mode);
+        // O arranque (a pasta da memoria, o `tabs.lock`) ja aconteceu: a
+        // base e o que uma sessao encontra ao abrir.
+        settle(&guard, &events);
+        let before = snapshot(&dir);
+
+        guard.record(HistoryEntry::now(
+            HistoryKind::Web,
+            "https://exemplo.pt/pagina",
+            "https://exemplo.pt/pagina",
+        ));
+        guard.capture(MemoryDocument::new(
+            MemoryKind::Source,
+            MemorySourceKind::Web,
+            "Uma pagina lida".to_string(),
+            Some("https://exemplo.pt/pagina".to_string()),
+            "O corpo de uma pagina lida, com texto que chegue para um documento da memoria."
+                .to_string(),
+        ));
+        guard.save_session(ResearchSession::new("uma pergunta"));
+        let (mut contexts, mut groups) = one_tab();
+        let saved = guard
+            .save_tabs(&mut contexts, &mut groups, None)
+            .expect("save_tabs");
+        settle(&guard, &events);
+        let after = snapshot(&dir);
+
+        let changed: Vec<String> = after
+            .iter()
+            .filter(|(path, bytes)| before.get(*path) != Some(*bytes))
+            .map(|(path, _)| path.display().to_string())
+            .chain(
+                before
+                    .keys()
+                    .filter(|path| !after.contains_key(*path))
+                    .map(|path| path.display().to_string()),
+            )
+            .collect();
+        let has = |name: &str| {
+            after
+                .keys()
+                .any(|path| path.to_string_lossy().contains(name))
+        };
+        match mode {
+            PrivacyMode::Private => {
+                assert_eq!(saved, TabSave::SkippedPrivate);
+                assert!(
+                    changed.is_empty(),
+                    "o modo privado escreveu na pasta de dados: {changed:?}"
+                );
+                // As lojas do mesmo guard: Explicit e Setting gravam, Automatic nao.
+                for (spec, expected) in [
+                    (SETTING, SaveOutcome::Written),
+                    (EXPLICIT, SaveOutcome::Written),
+                    (AUTOMATIC, SaveOutcome::SkippedPrivate),
+                ] {
+                    let file = TokenFile::open(guard.store(spec).expect("grant")).expect("loja");
+                    assert_eq!(
+                        file.write_token("ligado").expect("gravar"),
+                        expected,
+                        "{}",
+                        spec.name
+                    );
+                    assert_eq!(
+                        file.path().exists(),
+                        expected == SaveOutcome::Written,
+                        "{} no disco",
+                        spec.name
+                    );
+                }
+            }
+            PrivacyMode::Normal => {
+                assert_eq!(saved, TabSave::Written);
+                assert!(has("history.jsonl"), "sem history.jsonl: {changed:?}");
+                assert!(
+                    after
+                        .iter()
+                        .any(|(path, bytes)| path.ends_with("history.jsonl")
+                            && String::from_utf8_lossy(bytes).contains("exemplo.pt/pagina")),
+                    "a entrada nao chegou ao history.jsonl"
+                );
+                assert!(has("tabs.json"), "sem tabs.json: {changed:?}");
+                assert!(
+                    changed
+                        .iter()
+                        .any(|path| path.contains("memory") && !path.contains("sessions")),
+                    "a captura nao chegou a memory/: {changed:?}"
+                );
+                assert!(
+                    changed.iter().any(|path| path.contains("sessions")),
+                    "a sessao nao chegou a memory/sessions: {changed:?}"
+                );
+                let file = TokenFile::open(guard.store(AUTOMATIC).expect("grant")).expect("loja");
+                assert_eq!(
+                    file.write_token("ligado").expect("gravar"),
+                    SaveOutcome::Written
+                );
+            }
+        }
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Gate (critico, infra-privacy-guard; so de ausencia): nenhum ficheiro
+/// que embarca escreve na pasta de dados por fora de um grant sem uma
+/// linha aqui com o porque -- a tabela da fase 0 (SPEC-0006, «Persistence
+/// chokepoint»). Conta `fs::write`, `File::create`, `OpenOptions::new`,
+/// `fs::rename` e `fs::copy` no codigo que embarca de
+/// `crates/neural-app/src` e `crates/neural-core/src`, testes tirados;
+/// `json_store.rs` e o mecanismo e fica de fora. Um ficheiro novo com uma
+/// escrita crua, ou um ja listado com mais uma, fica vermelho ate a tabela
+/// e esta lista dizerem porque (ou ate a escrita passar a um grant).
+#[test]
+fn no_raw_data_dir_write_outside_a_grant() {
+    use std::collections::BTreeMap;
+
+    const PATTERNS: [&str; 5] = [
+        "fs::write(",
+        "File::create(",
+        "OpenOptions::new(",
+        "fs::rename(",
+        "fs::copy(",
+    ];
+    // (ficheiro, escritas cruas, porque) -- a mesma tabela da SPEC-0006.
+    const ALLOWLIST: &[(&str, usize, &str)] = &[
+        (
+            "neural-app/src/windows_app.rs",
+            1,
+            "finish_agent: o trace legado do agente em agent/ (Automatic); o int-agents-finish leva-o",
+        ),
+        (
+            "neural-app/src/windows_app/app/compare.rs",
+            1,
+            "research-exports (Explicit): o utilizador pediu «Exportar pesquisa»",
+        ),
+        (
+            "neural-app/src/windows_app/bookmarks.rs",
+            1,
+            "exportar favoritos para um caminho que o utilizador escolheu no dialogo, fora da pasta de dados",
+        ),
+        (
+            "neural-app/src/windows_app/search_card.rs",
+            1,
+            "NEURALIA_DEBUG_LOG: log de desenvolvimento, desligado por omissao, fora da pasta de dados",
+        ),
+        (
+            "neural-app/src/windows_app/services.rs",
+            2,
+            "gmail (Setting): uma escolha no menu; TokenFile = privacy-guard-retrofit",
+        ),
+        (
+            "neural-app/src/windows_app/theme.rs",
+            2,
+            "theme (Setting): uma escolha no menu; TokenFile = privacy-guard-retrofit",
+        ),
+        (
+            "neural-app/src/panel_chrome.rs",
+            2,
+            "panel-width.json (Automatic): geometria pelo seu helper atomico; grant = privacy-guard-retrofit",
+        ),
+        (
+            "neural-app/src/pomodoro_ui.rs",
+            2,
+            "pomodoro (Setting): uma escolha no menu; TokenFile = privacy-guard-retrofit",
+        ),
+        (
+            "neural-app/src/secrets.rs",
+            2,
+            "keys/ e gemini-live.key (Explicit): o cofre abre por grant; o blob DPAPI pelo seu helper atomico",
+        ),
+        (
+            "neural-app/src/tab_session.rs",
+            6,
+            "tabs.json/.lock/.cleared (Automatic): so o PrivacyGuard abre o TabPersistence e grava pelo modo",
+        ),
+        (
+            "neural-core/src/agent_security.rs",
+            3,
+            "agent/audit-*.json: a auditoria legada do agente; o int-agents-finish leva-a",
+        ),
+        (
+            "neural-core/src/downloads.rs",
+            1,
+            "a marca da Web no ficheiro baixado, na pasta de downloads do utilizador",
+        ),
+        (
+            "neural-core/src/history.rs",
+            3,
+            "history.jsonl (Automatic): o caminho vem do grant do guard e so PrivacyGuard::record escreve",
+        ),
+        (
+            "neural-core/src/library.rs",
+            10,
+            "library/ (Explicit; state/ Automatic): livros que o utilizador juntou; grant = privacy-guard-retrofit",
+        ),
+        (
+            "neural-core/src/local_intelligence.rs",
+            11,
+            "model packs: nao ligados ao produto (spec_0102); o local-model-packs traz o grant",
+        ),
+        (
+            "neural-core/src/memory.rs",
+            3,
+            "memory/ (Automatic): a raiz vem do grant do guard e so PrivacyGuard::capture/save_session escrevem",
+        ),
+        (
+            "neural-core/src/memory/sqlite_v01.rs",
+            4,
+            "memory/: o indice SQLite derivado dos documentos que o guard deixou entrar",
+        ),
+        (
+            "neural-core/src/research.rs",
+            2,
+            "memory/sessions (Automatic): so o worker da memoria, por PrivacyGuard::save_session",
+        ),
+        (
+            "neural-core/src/zettel.rs",
+            4,
+            "zettel/ (Explicit): notas que o utilizador escreveu; grant = privacy-guard-retrofit",
+        ),
+    ];
+
+    fn shipped(path: &std::path::Path) -> bool {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let text = path.to_string_lossy().replace('\\', "/");
+        !(name.starts_with("test") || text.contains("/tests/") || name.starts_with("accel_spike"))
+    }
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("ler src") {
+            let path = entry.expect("entrada").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") && shipped(&path) {
+                out.push(path);
+            }
+        }
+    }
+
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut found: BTreeMap<String, usize> = BTreeMap::new();
+    for krate in ["neural-app", "neural-core"] {
+        let src = crates.join(krate).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        assert!(files.len() >= 20, "{krate}: so {} ficheiros?", files.len());
+        for file in files {
+            let text = std::fs::read_to_string(&file).expect("ler o ficheiro");
+            let code = without_comment_lines(&without_test_modules(&code_without_tests(&text)));
+            let writes: usize = PATTERNS
+                .iter()
+                .map(|pattern| code.matches(pattern).count())
+                .sum();
+            if writes > 0 {
+                let relative = file
+                    .strip_prefix(&crates)
+                    .expect("dentro de crates/")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                found.insert(relative, writes);
+            }
+        }
+    }
+    assert!(
+        found
+            .remove("neural-core/src/json_store.rs")
+            .is_some_and(|n| n >= 3),
+        "json_store.rs deixou de ser o mecanismo que escreve"
+    );
+
+    let mut problems = Vec::new();
+    for (file, writes) in &found {
+        match ALLOWLIST.iter().find(|(listed, _, _)| listed == file) {
+            None => problems.push(format!(
+                "{file}: {writes} escrita(s) crua(s) sem linha na lista (e na tabela da SPEC-0006)"
+            )),
+            Some((_, expected, _)) if expected != writes => problems.push(format!(
+                "{file}: {writes} escrita(s) crua(s), a lista diz {expected}"
+            )),
+            Some(_) => {}
+        }
+    }
+    for (file, _, why) in ALLOWLIST {
+        assert!(!why.trim().is_empty(), "{file}: sem porque");
+        if !found.contains_key(*file) {
+            problems.push(format!(
+                "{file}: na lista mas sem escrita crua: tirar a linha"
+            ));
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "escritas cruas na pasta de dados fora de um grant:\n{}",
+        problems.join("\n")
+    );
 }
 
 // ===================== infra-egress: o portao de saida da IA =====================
@@ -24189,14 +24835,14 @@ fn app_new_starts_no_lazy_worker() {
     let dir = std::env::temp_dir().join(format!("neuralia-egress-app-new-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let registry = StoreRegistry::mint_for_test(&dir);
-    let gate = crate::egress::EgressGate::for_app(Some(&registry));
+    let gate = crate::egress::EgressGate::for_app(|spec| registry.grant(spec).ok());
     assert_eq!(
         gate.worker_threads_spawned(),
         0,
         "o portao nasceu com uma thread"
     );
     assert!(!dir.exists(), "criar o portao escreveu na pasta de dados");
-    let without_stores = crate::egress::EgressGate::for_app(None);
+    let without_stores = crate::egress::EgressGate::for_app(|_| None);
     assert_eq!(without_stores.worker_threads_spawned(), 0);
 
     // O `App::new` deixa o portao por nascer e nao pede trabalho a worker
@@ -24669,12 +25315,20 @@ mod downloads_gates {
             self.stores.as_ref().expect("registo").set_mode(mode);
         }
 
+        /// O modo como o App o passa ao gestor (PrivacyGuard::mode).
+        fn mode(&self) -> PrivacyMode {
+            self.stores
+                .as_ref()
+                .map_or(PrivacyMode::Normal, |stores| stores.mode().into())
+        }
+
         fn drive(&mut self, event: DownloadEvent) {
+            let private_mode = downloads_private_mode(self.mode());
             let run = run_download_event(
                 &mut self.manager,
                 &self.ops,
                 self.store.as_mut(),
-                downloads_private_mode(self.stores.as_ref()),
+                private_mode,
                 event,
             );
             assert_eq!(run.erase_error, None);
@@ -25011,7 +25665,7 @@ mod downloads_gates {
         };
         let clear = |state: &mut DownloadsState, stores: &StoreRegistry| {
             let run = state.run(
-                downloads_private_mode(Some(stores)),
+                downloads_private_mode(stores.mode().into()),
                 DownloadEvent::ClearLog,
             );
             assert_eq!(run.erase_error, None);
@@ -25023,7 +25677,7 @@ mod downloads_gates {
             let dir = Scratch::new("clear");
             let file = file_with(&dir.0, LOG_VERSION, "segredo.pdf");
             let stores = StoreRegistry::mint_for_test(&dir.0);
-            let mut state = DownloadsState::open(Some(&stores));
+            let mut state = DownloadsState::open(|spec| stores.grant(spec).ok());
             assert_eq!(state.manager.log().entries.len(), 1);
             stores.set_mode(mode);
             clear(&mut state, &stores);
@@ -25048,7 +25702,7 @@ mod downloads_gates {
         let other = dir.0.join("tabs.json");
         std::fs::write(&other, b"{}").expect("outro");
         let stores = StoreRegistry::mint_for_test(&dir.0);
-        let mut state = DownloadsState::open(Some(&stores));
+        let mut state = DownloadsState::open(|spec| stores.grant(spec).ok());
         assert!(
             state
                 .log_store
@@ -25066,7 +25720,7 @@ mod downloads_gates {
         assert!(other.exists(), "o apagar levou um ficheiro que nao e dele");
         // Sem ficheiro, a loja volta a gravar: o download seguinte fica.
         state.run(
-            downloads_private_mode(Some(&stores)),
+            downloads_private_mode(stores.mode().into()),
             DownloadEvent::Starting(DownloadStart {
                 id: DownloadId(1),
                 webview: WebViewKey(1),
@@ -25109,7 +25763,8 @@ mod downloads_gates {
             .expect("definicoes");
         };
         write_settings(&chosen, true);
-        let state = DownloadsState::open(Some(&StoreRegistry::mint_for_test(&dir.0)));
+        let state =
+            DownloadsState::open(|spec| StoreRegistry::mint_for_test(&dir.0).grant(spec).ok());
         assert_eq!(
             state.manager.settings().folder.as_deref(),
             Some(chosen.as_path())
@@ -25121,7 +25776,8 @@ mod downloads_gates {
         );
 
         write_settings(&dir.0.join("nao-existe"), false);
-        let state = DownloadsState::open(Some(&StoreRegistry::mint_for_test(&dir.0)));
+        let state =
+            DownloadsState::open(|spec| StoreRegistry::mint_for_test(&dir.0).grant(spec).ok());
         assert_eq!(state.manager.settings().folder, None);
         assert_eq!(
             state.shared.folder.borrow().as_deref(),
@@ -25130,7 +25786,7 @@ mod downloads_gates {
         );
 
         // Sem registo: tudo por omissao, nada gravado, a pasta do sistema.
-        let state = DownloadsState::open(None);
+        let state = DownloadsState::open(|_| None);
         assert_eq!(state.manager.settings(), &DownloadSettings::default());
         assert!(state.log_store.is_none());
         assert_eq!(
@@ -25303,7 +25959,7 @@ mod downloads_gates {
         let file = dir.0.join(DOWNLOADS_SETTINGS_STORE.name);
         std::fs::write(&file, serde_json::to_vec(&body).expect("json")).expect("definicoes");
         let stores = StoreRegistry::mint_for_test(&dir.0);
-        let mut state = DownloadsState::open(Some(&stores));
+        let mut state = DownloadsState::open(|spec| stores.grant(spec).ok());
         let start = |state: &mut DownloadsState, id: u64| {
             state
                 .run(
@@ -25348,7 +26004,7 @@ mod downloads_gates {
                 .any(|effect| matches!(effect, DownloadEffect::Ask { .. }))
         );
         // Sem loja (nunca no produto): nada muda.
-        let mut none = DownloadsState::open(None);
+        let mut none = DownloadsState::open(|_| None);
         assert!(none.set_allow_programs(true).is_err());
         assert!(!none.manager.settings().allow_programs);
     }
@@ -27894,7 +28550,7 @@ fn translation_consent_table() {
     let registry = StoreRegistry::mint_for_test(&dir);
     let today = Day::today();
     let gate_for = || {
-        let mut gate = EgressGate::for_app(Some(&registry));
+        let mut gate = EgressGate::for_app(|spec| registry.grant(spec).ok());
         gate.attach_site_grants(
             crate::ai_settings::AiPurpose::Translation,
             registry.grant(TRANSLATE_STORE).expect("grant"),
@@ -28344,7 +29000,7 @@ fn translation_entry(node: u32, from: &str, to: &str) -> neural_core::translate:
 
 /// O portao da Traducao de um registo de teste, com o `translate.json`.
 fn translation_test_gate(registry: &StoreRegistry) -> crate::egress::EgressGate {
-    let mut gate = crate::egress::EgressGate::for_app(Some(registry));
+    let mut gate = crate::egress::EgressGate::for_app(|spec| registry.grant(spec).ok());
     gate.attach_site_grants(
         crate::ai_settings::AiPurpose::Translation,
         registry
@@ -29310,7 +29966,7 @@ mod bookmarks_gates {
             .expect("spawn_bookmarks_worker");
         assert!(worker.contains("BookmarkStore::open(grant)"));
         assert!(worker.contains(".name(\"neural-bookmarks\".into())"));
-        assert_eq!(code.matches(".grant(BOOKMARKS_STORE)").count(), 1);
+        assert_eq!(code.matches(".store(BOOKMARKS_STORE)").count(), 1);
         assert_eq!(code.matches("spawn_bookmarks_worker(").count(), 2);
         let new = code
             .split(

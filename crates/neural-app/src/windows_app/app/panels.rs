@@ -895,7 +895,7 @@ impl App {
         };
         match message {
             PanelMessage::Ready => {
-                if let Some(result) = self.history.recent(PANEL_RECENT_LIMIT) {
+                if let Some(result) = self.privacy.recent_history(PANEL_RECENT_LIMIT) {
                     self.panel_show_history(result);
                 }
                 // Sugestoes: a pergunta da pesquisa em curso contra a memoria
@@ -907,7 +907,7 @@ impl App {
                     .filter(|question| !question.is_empty())
                 {
                     self.panel_suggestion_query = Some(question.clone());
-                    self.memory.query(question);
+                    self.privacy.query_memory(question);
                 }
                 // Aberto pelas Notas (botao, Ctrl+Shift+Z): agora a pagina
                 // ja existe e o que esperava corre, pela ordem.
@@ -915,7 +915,7 @@ impl App {
                     self.panel_eval(&script);
                 }
             }
-            PanelMessage::Search(query) => self.memory.query(query),
+            PanelMessage::Search(query) => self.privacy.query_memory(query),
             PanelMessage::Open(input) => {
                 self.close_side_panel(PanelExit::OpenItem);
                 self.handle_input(input);

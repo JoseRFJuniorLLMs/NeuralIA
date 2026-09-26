@@ -58,7 +58,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use neural_core::ai_policy::{DataClass, Locality, MaySend, may_send};
 use neural_core::json_store::{
-    Degraded, LoadOutcome, SaveOutcome, StoreGrant, StoreKind, StoreRegistry, VersionedJsonStore,
+    Degraded, LoadOutcome, SaveOutcome, StoreGrant, StoreKind, StoreSpec, VersionedJsonStore,
 };
 use neural_core::llm::{ModelId, Pick, PriceTier, Provider};
 use serde::{Deserialize, Serialize};
@@ -959,22 +959,18 @@ pub(crate) struct EgressGate {
 
 impl EgressGate {
     /// O portao do produto: `ai/settings.json` e `ai/usage.json` pelos
-    /// grants do registo. Nao le nem escreve nada e nao cria thread nenhuma
-    /// (gate `lazy_worker_spawns_nothing_until_first_job`). Sem registo, o
-    /// consumo conta so em memoria e o limite e o de omissao.
-    pub(crate) fn for_app(stores: Option<&StoreRegistry>) -> Self {
-        let settings = stores
-            .and_then(|registry| registry.grant(AI_SETTINGS_STORE).ok())
-            .and_then(|grant| {
-                VersionedJsonStore::open(grant, AI_SETTINGS_VERSION, AI_SETTINGS_MAX_BYTES).ok()
-            });
-        let reader = stores
-            .and_then(|registry| registry.grant(AI_USAGE_STORE).ok())
-            .and_then(|grant| {
-                VersionedJsonStore::open(grant, AI_USAGE_VERSION, AI_USAGE_MAX_BYTES).ok()
-            });
-        let writer = stores
-            .and_then(|registry| registry.grant(AI_USAGE_STORE).ok())
+    /// grants que `grants` da (no produto, `PrivacyGuard::store`). Nao le
+    /// nem escreve nada e nao cria thread nenhuma (gate
+    /// `lazy_worker_spawns_nothing_until_first_job`). Sem grants, o consumo
+    /// conta so em memoria e o limite e o de omissao.
+    pub(crate) fn for_app(mut grants: impl FnMut(StoreSpec) -> Option<StoreGrant>) -> Self {
+        let settings = grants(AI_SETTINGS_STORE).and_then(|grant| {
+            VersionedJsonStore::open(grant, AI_SETTINGS_VERSION, AI_SETTINGS_MAX_BYTES).ok()
+        });
+        let reader = grants(AI_USAGE_STORE).and_then(|grant| {
+            VersionedJsonStore::open(grant, AI_USAGE_VERSION, AI_USAGE_MAX_BYTES).ok()
+        });
+        let writer = grants(AI_USAGE_STORE)
             .and_then(|grant| {
                 VersionedJsonStore::open(grant, AI_USAGE_VERSION, AI_USAGE_MAX_BYTES).ok()
             })
@@ -1222,7 +1218,7 @@ fn thousands(value: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neural_core::json_store::{StoreMode, StoreShape, StoreSpec};
+    use neural_core::json_store::{StoreMode, StoreRegistry, StoreShape, StoreSpec};
     use neural_core::llm::{ModelId, PickSource, Purpose};
     use std::path::{Path, PathBuf};
 
@@ -1335,7 +1331,7 @@ mod tests {
 
     /// Uma autorizacao pelo caminho do produto: o cartao, e o sim.
     fn standing(watch_id: &str, destination: &Destination, per_day: u32) -> StandingGrant {
-        let mut gate = EgressGate::for_app(None);
+        let mut gate = EgressGate::for_app(|_| None);
         let request = click(
             AiPurpose::Dictation,
             DataClass::UserTyped,
@@ -1761,7 +1757,7 @@ mod tests {
 
         // Pelo portao: a autorizacao gasta-se por dia, e a sessao nao a
         // substitui.
-        let mut gate = EgressGate::for_app(None);
+        let mut gate = EgressGate::for_app(|_| None);
         let card = ask(gate.request(
             click(
                 AiPurpose::Dictation,
@@ -1828,7 +1824,7 @@ mod tests {
             r#"{"version":1,"data":{"monthly_soft_cap":3}}"#,
         );
         let registry = StoreRegistry::mint_for_test(&dir);
-        let mut gate = EgressGate::for_app(Some(&registry));
+        let mut gate = EgressGate::for_app(|spec| registry.grant(spec).ok());
         assert_eq!(gate.soft_cap(), 3);
         let page = |calls| EgressRequest {
             calls,
@@ -1916,7 +1912,7 @@ mod tests {
         // Outra janela (outro processo: outro registo, o mesmo ficheiro) le
         // o que esta conta, e as duas somam sem perder nada.
         let other_registry = StoreRegistry::mint_for_test(&dir);
-        let mut other = EgressGate::for_app(Some(&other_registry));
+        let mut other = EgressGate::for_app(|spec| other_registry.grant(spec).ok());
         assert_eq!(other.usage_this_month(TODAY), 4);
         let card = ask(other.request(page(1), TODAY));
         assert_eq!(
@@ -1935,12 +1931,12 @@ mod tests {
         );
         let fresh_registry = StoreRegistry::mint_for_test(&dir);
         assert_eq!(
-            EgressGate::for_app(Some(&fresh_registry)).usage_this_month(TODAY),
+            EgressGate::for_app(|spec| fresh_registry.grant(spec).ok()).usage_this_month(TODAY),
             6
         );
 
         // Sem registo o consumo conta em memoria com o limite de omissao.
-        let mut memory_only = EgressGate::for_app(None);
+        let mut memory_only = EgressGate::for_app(|_| None);
         assert_eq!(memory_only.soft_cap(), 200);
         let card = ask(memory_only.request(page(1), TODAY));
         assert_eq!(
@@ -1982,8 +1978,8 @@ mod tests {
         // Duas janelas: dois registos, a mesma pasta de dados.
         let registry_a = StoreRegistry::mint_for_test(&dir);
         let registry_b = StoreRegistry::mint_for_test(&dir);
-        let mut a = EgressGate::for_app(Some(&registry_a));
-        let mut b = EgressGate::for_app(Some(&registry_b));
+        let mut a = EgressGate::for_app(|spec| registry_a.grant(spec).ok());
+        let mut b = EgressGate::for_app(|spec| registry_b.grant(spec).ok());
         let card = ask(a.request(page(1), TODAY));
         assert_eq!(
             a.answer(card, ConsentAnswer::Session, TODAY),
@@ -2031,7 +2027,7 @@ mod tests {
         let dir = temp_dir("usage-private");
         let registry = StoreRegistry::mint_for_test(&dir);
         registry.set_mode(StoreMode::Private);
-        let mut gate = EgressGate::for_app(Some(&registry));
+        let mut gate = EgressGate::for_app(|spec| registry.grant(spec).ok());
         let page = || {
             click(
                 AiPurpose::Translation,
@@ -2059,7 +2055,10 @@ mod tests {
         );
         let next = StoreRegistry::mint_for_test(&dir);
         next.set_mode(StoreMode::Private);
-        assert_eq!(EgressGate::for_app(Some(&next)).usage_this_month(TODAY), 5);
+        assert_eq!(
+            EgressGate::for_app(|spec| next.grant(spec).ok()).usage_this_month(TODAY),
+            5
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2070,7 +2069,7 @@ mod tests {
     fn the_usage_writer_starts_on_the_first_paid_call() {
         let dir = temp_dir("lazy");
         let registry = StoreRegistry::mint_for_test(&dir);
-        let mut gate = EgressGate::for_app(Some(&registry));
+        let mut gate = EgressGate::for_app(|spec| registry.grant(spec).ok());
         assert_eq!(gate.worker_threads_spawned(), 0);
         let page = || {
             click(
@@ -2138,7 +2137,7 @@ mod tests {
         const SITES: StoreSpec =
             StoreSpec::new("translate-test.json", StoreKind::Setting, StoreShape::File);
         let session = |registry: &StoreRegistry| {
-            let mut gate = EgressGate::for_app(Some(registry));
+            let mut gate = EgressGate::for_app(|spec| registry.grant(spec).ok());
             gate.attach_site_grants(
                 AiPurpose::Translation,
                 registry.grant(SITES).expect("grant"),
@@ -2210,7 +2209,7 @@ mod tests {
     fn session_consent_without_a_site_stays_with_its_feature_and_data() {
         use AiPurpose::{Dictation, Translation};
         use DataClass::{Media, PageContent, UserTyped};
-        let mut gate = EgressGate::for_app(None);
+        let mut gate = EgressGate::for_app(|_| None);
         let free = at(Locality::Remote, false);
         let from = |feature, data, url: &str| EgressRequest {
             origin: SiteOrigin::of_url(url),
@@ -2305,7 +2304,7 @@ mod tests {
                 privacy,
             )
         };
-        let mut gate = EgressGate::for_app(Some(&registry));
+        let mut gate = EgressGate::for_app(|spec| registry.grant(spec).ok());
         // Sem loja ligada, nao se oferece.
         assert!(!ask(gate.request(page(EgressPrivacy::Normal), TODAY)).offers_always());
         gate.attach_site_grants(
@@ -2334,7 +2333,7 @@ mod tests {
             files_under(&dir)
         );
         // Fora do privado: oferecido e gravado.
-        let mut gate = EgressGate::for_app(Some(&registry));
+        let mut gate = EgressGate::for_app(|spec| registry.grant(spec).ok());
         gate.attach_site_grants(
             AiPurpose::Translation,
             registry.grant(SITES).expect("grant"),
@@ -2361,7 +2360,7 @@ mod tests {
         let text = std::fs::read_to_string(dir.join("translate-test.json")).expect("loja");
         assert!(text.contains("https://exemplo.com"), "{text}");
         // Outra sessao le a loja; a superficie privada nao.
-        let mut next = EgressGate::for_app(Some(&registry));
+        let mut next = EgressGate::for_app(|spec| registry.grant(spec).ok());
         let mut sites = SiteGrants::open(registry.grant(SITES).expect("grant")).expect("loja");
         next.attach_site_grants(
             AiPurpose::Translation,
@@ -2397,7 +2396,7 @@ mod tests {
             ),
             "a janela que deu o «Sempre» ainda manda depois da revogacao"
         );
-        let mut after = EgressGate::for_app(Some(&registry));
+        let mut after = EgressGate::for_app(|spec| registry.grant(spec).ok());
         after
             .attach_site_grants(
                 AiPurpose::Translation,
@@ -2503,7 +2502,7 @@ mod tests {
     /// utilizador escreveu, no maximo 30 dias e 24 envios por dia.
     #[test]
     fn standing_grants_are_bounded() {
-        let mut gate = EgressGate::for_app(None);
+        let mut gate = EgressGate::for_app(|_| None);
         let typed = |privacy| {
             click(
                 AiPurpose::Dictation,

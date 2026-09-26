@@ -1425,10 +1425,7 @@ impl App {
     fn translation_gate(&mut self) -> &mut EgressGate {
         if !self.translation.grants_attached {
             self.translation.grants_attached = true;
-            let grant = self
-                .stores
-                .as_ref()
-                .and_then(|stores| stores.grant(TRANSLATE_STORE).ok());
+            let grant = self.privacy.store(TRANSLATE_STORE);
             let gate = self.egress_gate();
             if let Some(grant) = grant {
                 let _ = gate.attach_site_grants(AiPurpose::Translation, grant);
@@ -1483,9 +1480,8 @@ impl App {
     }
 
     fn translation_vault(&self) -> Option<KeyVault> {
-        let stores = self.stores.as_ref()?;
-        let keys = stores.grant(KEYS_STORE).ok()?;
-        let live = stores.grant(LIVE_KEY_STORE).ok()?;
+        let keys = self.privacy.store(KEYS_STORE)?;
+        let live = self.privacy.store(LIVE_KEY_STORE)?;
         KeyVault::open(keys, live).ok()
     }
 

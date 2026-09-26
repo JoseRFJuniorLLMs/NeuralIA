@@ -265,7 +265,7 @@ impl ApplicationHandler<UserEvent> for App {
                 );
                 if let (Some(provider), Some(session)) = (provider, &mut self.current_research) {
                     session.upsert_provider_answer(provider, text, None);
-                    self.memory.save_session(session.clone());
+                    self.privacy.save_session(session.clone());
                 }
             }
             UserEvent::AgentObservation(page) => {

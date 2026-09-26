@@ -552,13 +552,12 @@ impl KeysState {
 }
 
 impl App {
-    /// O cofre, aberto com os grants `keys/` e `gemini-live.key` do registo
-    /// das lojas na primeira vez que e preciso.
+    /// O cofre, aberto com os grants `keys/` e `gemini-live.key` do
+    /// `PrivacyGuard` na primeira vez que e preciso.
     fn key_vault(&mut self) -> Option<&KeyVault> {
         if self.keys.vault.is_none() {
-            let stores = self.stores.as_ref()?;
-            let keys = stores.grant(KEYS_STORE).ok()?;
-            let live = stores.grant(LIVE_KEY_STORE).ok()?;
+            let keys = self.privacy.store(KEYS_STORE)?;
+            let live = self.privacy.store(LIVE_KEY_STORE)?;
             self.keys.vault = KeyVault::open(keys, live).ok();
         }
         self.keys.vault.as_ref()

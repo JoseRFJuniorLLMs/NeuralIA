@@ -9,7 +9,7 @@ use neural_core::bookmarks::{
     chromium_profiles_in, clean_title, export_file_name, export_netscape_html,
     import_chromium_profile, import_folder_title, parse_netscape_html, read_bookmarks_html,
 };
-use neural_core::json_store::{LoadOutcome, StoreGrant, StoreMode};
+use neural_core::json_store::{LoadOutcome, StoreGrant};
 
 use crate::stores::BOOKMARKS_STORE;
 
@@ -722,11 +722,7 @@ impl App {
         if self.bookmarks.jobs.is_some() {
             return true;
         }
-        let Some(grant) = self
-            .stores
-            .as_ref()
-            .and_then(|stores| stores.grant(BOOKMARKS_STORE).ok())
-        else {
+        let Some(grant) = self.privacy.store(BOOKMARKS_STORE) else {
             return false;
         };
         self.bookmarks.jobs = spawn_bookmarks_worker(grant, self.proxy.clone());
@@ -849,13 +845,9 @@ impl App {
             }
             return;
         }
-        // O modo privado (o Split privado, ou o registo em `Private`) guarda
+        // O modo privado (o Split privado, ou o guard em `Private`) guarda
         // na mesma: foi o utilizador que pediu (loja `Explicit`).
-        let private = private
-            || self
-                .stores
-                .as_ref()
-                .is_some_and(|stores| stores.mode() == StoreMode::Private);
+        let private = private || self.privacy.mode() == PrivacyMode::Private;
         self.submit_bookmark_job(BookmarkJob::Apply {
             op: BookmarkOp::AddLink {
                 parent: ROOT_ID,
