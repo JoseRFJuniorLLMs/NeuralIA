@@ -734,8 +734,13 @@ jobs:
             throw "The check cannot see test-stores even with dev-dependencies:`n$tests"
           }
           Write-Host "test-stores: off in the build graph of the published exe, on only for tests."
+      # Ordered by the app's own milestones (three columns built, the two
+      # no-input relayouts applied), not by a clock: on a cold, busy runner
+      # the first WebView2 alone took more than the old fixed 12 s. The
+      # script's 180 s only tells a slow start from a hang.
       - name: First comparator paint without mouse or keyboard
         shell: pwsh
+        timeout-minutes: 5
         run: ./scripts/test-comparator-first-paint.ps1 -ExePath target/release/NeuralIA.exe
       - name: Native Home performance regression gate
         shell: pwsh

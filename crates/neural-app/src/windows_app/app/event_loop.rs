@@ -357,6 +357,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.show_omnibox_passive(true);
                     self.position_omnibox();
                     self.request_redraw();
+                    // Marco lido por `scripts/test-comparator-first-paint.ps1`.
                     debug_log(format_args!("RelayoutComparator: aplicado"));
                 }
             }
