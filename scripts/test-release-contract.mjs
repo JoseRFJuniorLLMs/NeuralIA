@@ -424,6 +424,150 @@ for (const [file, text] of workflows) {
 assert.doesNotMatch(workflow, /accel-spike|accel_spike|--features|--all-features/, 'release.yml never builds the spike');
 assert.doesNotMatch(buildScript, /accel-spike|--features|--all-features/, 'the installer build never enables features');
 
+// The sabotage matrix of the windows job (AGENTS.md 4.2): each entry names a
+// gate and an Old anchor that Replace-Exact must find exactly once in its
+// target file, before the try block that restores the tree. One stale anchor
+// throws under ErrorActionPreference=Stop, the step fails, and every entry
+// after it never runs. That is what e813ba1 did on 2026-09-25: it removed
+// ColumnMenuRequest and left menu-label-frozen-at-registration pointing at
+// it. This check reads the matrix the way pwsh will (the run block dedented
+// by its ten spaces, here-strings without their closing newline) and holds
+// every anchor to exactly one match, every gate to a test that exists, and
+// every Ignored flag to a #[ignore] on that test.
+const sabotageStepName = '      - name: Prove 100-interaction UI gates reject sabotage\n';
+assert.equal(ci.split(sabotageStepName).length - 1, 1, 'the windows job has one sabotage step');
+const runMarker = '        run: |\n';
+const sabotageStep = ci.slice(ci.indexOf(sabotageStepName) + sabotageStepName.length);
+const runAt = sabotageStep.indexOf(runMarker);
+assert.ok(runAt >= 0 && runAt < 200, 'the sabotage step is a run: | block');
+const runLines = [];
+for (const line of sabotageStep.slice(runAt + runMarker.length).split('\n')) {
+  if (line === '') {
+    runLines.push('');
+  } else if (line.startsWith(' '.repeat(10))) {
+    runLines.push(line.slice(10));
+  } else {
+    break;
+  }
+}
+const sabotageScript = runLines.join('\n');
+const defaultSourcePath = sabotageScript.match(/^\$defaultSourcePath = "([^"]+)"$/m);
+assert.ok(defaultSourcePath, 'the sabotage step declares $defaultSourcePath');
+
+function parseSabotages(list) {
+  const entries = [];
+  let entry = null;
+  let field = null;
+  let body = [];
+  for (const line of list.split('\n')) {
+    if (field) {
+      if (line === "'@") {
+        entry[field] = body.join('\n');
+        field = null;
+        body = [];
+      } else {
+        body.push(line);
+      }
+      continue;
+    }
+    let match;
+    if (/^ {2}@\{\s*$/.test(line)) {
+      assert.equal(entry, null, 'sabotage matrix: an entry opens inside another');
+      entry = {};
+    } else if (/^ {2}\},?\s*$/.test(line)) {
+      assert.ok(entry, 'sabotage matrix: an entry closes without opening');
+      entries.push(entry);
+      entry = null;
+    } else if ((match = line.match(/^ {4}(Label|Test|SourcePath) = "([^"]*)"\s*$/))) {
+      entry[match[1]] = match[2];
+    } else if (/^ {4}Ignored = \$true\s*$/.test(line)) {
+      entry.Ignored = true;
+    } else if ((match = line.match(/^ {4}(Old|New) = @'\s*$/))) {
+      field = match[1];
+    } else if (line.trim() !== '') {
+      assert.fail(`sabotage matrix: unrecognised line ${JSON.stringify(line)}`);
+    }
+  }
+  assert.equal(entry, null, 'sabotage matrix: unterminated entry');
+  assert.equal(field, null, 'sabotage matrix: unterminated here-string');
+  return entries;
+}
+assert.deepEqual(
+  parseSabotages(
+    "  @{\n    Label = \"a\"\n    Test = \"t\"\n    Old = @'\n    x == 1\n      && y\n'@\n    New = @'\n    true\n'@\n  },\n" +
+      "  @{\n    Label = \"b\"\n    Test = \"u\"\n    SourcePath = \"p.rs\"\n    Ignored = $true\n    Old = @'\n  }\n'@\n    New = @'\n\n'@\n  }\n"
+  ),
+  [
+    { Label: 'a', Test: 't', Old: '    x == 1\n      && y', New: '    true' },
+    { Label: 'b', Test: 'u', SourcePath: 'p.rs', Ignored: true, Old: '  }', New: '' },
+  ],
+  'sabotage parser: two entries, here-strings kept verbatim without the closing newline'
+);
+const listStart = sabotageScript.indexOf('$sabotages = @(\n');
+const listEnd = sabotageScript.indexOf('\n)\n', listStart);
+assert.ok(listStart >= 0 && listEnd > listStart, 'the sabotage step declares $sabotages = @( ... )');
+const sabotages = parseSabotages(sabotageScript.slice(listStart + '$sabotages = @(\n'.length, listEnd));
+assert.ok(sabotages.length >= 20, `the sabotage matrix keeps its entries (found ${sabotages.length})`);
+assert.equal(
+  new Set(sabotages.map((entry) => entry.Label)).size,
+  sabotages.length,
+  'sabotage labels are unique'
+);
+// Every .rs of neural-app: a gate may be an inline #[cfg(test)] module of any
+// file (cargo test -p neural-app <name> finds it), but an Ignored gate runs
+// with --exact as windows_app::tests::<name>, so it must live in that module.
+function rustFilesUnder(dir) {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const path = `${dir}/${entry.name}`;
+    if (entry.isDirectory()) return rustFilesUnder(path);
+    return entry.name.endsWith('.rs') ? [[path, fs.readFileSync(path, 'utf8').replace(/\r\n/g, '\n')]] : [];
+  });
+}
+const neuralAppSources = rustFilesUnder('crates/neural-app/src');
+const sabotageSources = new Map();
+for (const entry of sabotages) {
+  const label = entry.Label ?? '<no label>';
+  assert.ok(entry.Label && entry.Test, `sabotage ${label}: Label and Test are set`);
+  assert.ok(typeof entry.Old === 'string' && typeof entry.New === 'string', `sabotage ${label}: Old and New are here-strings`);
+  assert.ok(entry.Old.trim() !== '', `sabotage ${label}: Old is not empty`);
+  assert.notEqual(entry.Old, entry.New, `sabotage ${label}: New must change something`);
+  const path = entry.SourcePath ?? defaultSourcePath[1];
+  assert.ok(fs.existsSync(path), `sabotage ${label}: target ${path} exists`);
+  if (!sabotageSources.has(path)) {
+    sabotageSources.set(path, fs.readFileSync(path, 'utf8').replace(/\r\n/g, '\n'));
+  }
+  const count = sabotageSources.get(path).split(entry.Old).length - 1;
+  assert.equal(
+    count,
+    1,
+    `sabotage ${label}: its Old anchor must match ${path} exactly once (found ${count}); ` +
+      'Replace-Exact throws otherwise and every entry after it never runs'
+  );
+  const declarationRe = new RegExp(`((?:^[ \\t]*#\\[[^\\n]*\\]\\n)+)[ \\t]*fn ${entry.Test}\\(`, 'm');
+  const declarations = neuralAppSources
+    .map(([path, text]) => [path, text.match(declarationRe)])
+    .filter(([, match]) => match);
+  assert.equal(
+    declarations.length,
+    1,
+    `sabotage ${label}: its gate ${entry.Test} is declared once in neural-app (found in ${declarations.map(([path]) => path).join(', ') || 'no file'})`
+  );
+  const [declaredIn, declaration] = declarations[0];
+  assert.match(declaration[1], /^[ \t]*#\[test\]$/m, `sabotage ${label}: ${entry.Test} is #[test]`);
+  assert.equal(
+    /^[ \t]*#\[ignore\b/m.test(declaration[1]),
+    Boolean(entry.Ignored),
+    `sabotage ${label}: Ignored must match the #[ignore] of ${entry.Test} (the CI-only focus gates run alone with --ignored --exact)`
+  );
+  if (entry.Ignored) {
+    assert.equal(
+      declaredIn,
+      'crates/neural-app/src/windows_app/tests.rs',
+      `sabotage ${label}: the CI-only gate ${entry.Test} runs as windows_app::tests::${entry.Test}, so it lives there`
+    );
+  }
+}
+
 // The LLM transport (infra-llm-transport, 2.3 plan): neural_core::llm reaches
 // only the pinned provider hosts. Endpoint::pinned is its only constructor in
 // the published build; Endpoint::loopback (the unit tests' stub origin)
@@ -478,3 +622,4 @@ console.log('release contract: the published exe is built without the accel-spik
 console.log('release contract: the published exe is built without the test-stores feature');
 console.log('release contract: the accelerator spike runs outside the CI workflow that release.yml waits for');
 console.log('release contract: the LLM transport ships only pinned hosts; the published exe has no endpoint override');
+console.log(`release contract: every anchor of the ${sabotages.length} CI sabotages matches its file exactly once`);
