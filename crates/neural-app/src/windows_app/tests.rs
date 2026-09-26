@@ -21228,3 +21228,423 @@ fn the_secret_prompt_takes_typing_sends_the_key_and_clears_the_edit() {
         );
     }
 }
+
+// ===================== page_eval (infra-llm-untrusted) =====================
+
+/// O callback que o WebView2 chama com o JSON do script.
+type EvalCallback = Box<dyn Fn(String) + Send>;
+
+/// A vista falsa de `PageReads::read`: guarda o script e o callback do
+/// WebView2 (que o teste chama quando quer, com a resposta que quer) e
+/// mostra o URL que o teste lhe poe.
+struct FakeEvalView {
+    url: std::cell::RefCell<Option<String>>,
+    accepts: bool,
+    asked: std::cell::RefCell<Vec<(String, EvalCallback)>>,
+}
+
+impl FakeEvalView {
+    fn at(url: &str) -> Self {
+        Self {
+            url: std::cell::RefCell::new(Some(url.to_string())),
+            accepts: true,
+            asked: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// O WebView2 acaba o script `index` e devolve `raw`.
+    fn answer(&self, index: usize, raw: &str) {
+        (self.asked.borrow()[index].1)(raw.to_string());
+    }
+}
+
+impl EvalView for FakeEvalView {
+    fn page_url(&self) -> Option<String> {
+        self.url.borrow().clone()
+    }
+
+    fn eval_with_callback(
+        &self,
+        script: &str,
+        callback: Box<dyn Fn(String) + Send + 'static>,
+    ) -> bool {
+        if self.accepts {
+            self.asked.borrow_mut().push((script.to_string(), callback));
+        }
+        self.accepts
+    }
+}
+
+const PAGE_READ_CAP: usize = 64;
+const PAGE_READ_DEADLINE: Duration = Duration::from_secs(5);
+
+fn page_read_spec() -> PageEvalSpec {
+    PageEvalSpec {
+        script: &NOTE_CAPTURE_READ,
+        max_raw_bytes: PAGE_READ_CAP,
+        deadline: PAGE_READ_DEADLINE,
+    }
+}
+
+/// Uma leitura em curso: o que o callback entregou ao "event loop" e o que
+/// foi agendado no `Timers`.
+struct StartedRead {
+    token: PageReadToken,
+    delivered: std::sync::mpsc::Receiver<PageEvalEvent>,
+    scheduled: Vec<(Duration, PageEvalEvent)>,
+}
+
+fn start_page_read(
+    reads: &mut PageReads,
+    view: &FakeEvalView,
+    epoch: &NavEpoch,
+    now: Instant,
+) -> StartedRead {
+    let (sender, delivered) = std::sync::mpsc::channel();
+    let mut scheduled = Vec::new();
+    let token = reads
+        .read(
+            view,
+            page_read_spec(),
+            epoch,
+            now,
+            move |event| {
+                let _ = sender.send(event);
+            },
+            |delay, event| scheduled.push((delay, event)),
+        )
+        .expect("the read starts");
+    StartedRead {
+        token,
+        delivered,
+        scheduled,
+    }
+}
+
+const PAGE_URL: &str = "https://exemplo.com/artigo";
+const PAGE_JSON: &str = r#"{"text":"ola","url":"https://exemplo.com/artigo","title":"T"}"#;
+
+#[test]
+fn page_eval_delivers_a_read_that_arrives_in_time_on_the_same_page() {
+    let view = FakeEvalView::at(PAGE_URL);
+    let epoch = NavEpoch::default();
+    let mut reads = PageReads::default();
+    let now = Instant::now();
+    let started = start_page_read(&mut reads, &view, &epoch, now);
+
+    // O script corrido e o registado; o prazo foi para o `Timers`.
+    assert_eq!(view.asked.borrow()[0].0, NOTE_CAPTURE_SCRIPT);
+    assert_eq!(
+        started.scheduled,
+        vec![(PAGE_READ_DEADLINE, PageEvalEvent::Expired(started.token))]
+    );
+    assert_eq!(reads.in_flight(), 1);
+
+    view.answer(0, PAGE_JSON);
+    let event = started
+        .delivered
+        .try_recv()
+        .expect("the callback delivered");
+    let outcome = reads.settle(event, || view.page_url(), now + Duration::from_secs(1));
+    assert_eq!(
+        outcome,
+        PageEvalOutcome::Delivered {
+            token: started.token,
+            script: "note-capture",
+            raw: PAGE_JSON.to_string(),
+        }
+    );
+    assert_eq!(reads.in_flight(), 0);
+    let value = parse_page_json(PAGE_JSON, PAGE_READ_CAP).expect("JSON within the cap");
+    assert_eq!(value["text"], "ola");
+    // O prazo que chega depois de entregue nao faz nada.
+    assert_eq!(
+        reads.settle(
+            PageEvalEvent::Expired(started.token),
+            || view.page_url(),
+            now + PAGE_READ_DEADLINE
+        ),
+        PageEvalOutcome::Stale(started.token)
+    );
+}
+
+#[test]
+fn page_eval_drops_a_late_read() {
+    let view = FakeEvalView::at(PAGE_URL);
+    let epoch = NavEpoch::default();
+    let mut reads = PageReads::default();
+    let now = Instant::now();
+
+    // O prazo do `Timers` chega primeiro: a leitura cai uma vez, e a
+    // resposta que vem depois ja nao e de ninguem.
+    let first = start_page_read(&mut reads, &view, &epoch, now);
+    assert_eq!(
+        reads.settle(
+            PageEvalEvent::Expired(first.token),
+            || view.page_url(),
+            now + PAGE_READ_DEADLINE
+        ),
+        PageEvalOutcome::Dropped {
+            token: first.token,
+            reason: PageEvalDrop::Late,
+        }
+    );
+    view.answer(0, PAGE_JSON);
+    let late = first.delivered.try_recv().expect("the late answer arrives");
+    assert_eq!(
+        reads.settle(late, || view.page_url(), now + PAGE_READ_DEADLINE),
+        PageEvalOutcome::Stale(first.token)
+    );
+
+    // A resposta chega passado o prazo, antes de o `Timers` o dizer: cai
+    // na mesma, e o prazo que vem depois nao repete a queda.
+    let second = start_page_read(&mut reads, &view, &epoch, now);
+    view.answer(1, PAGE_JSON);
+    let arrived = second.delivered.try_recv().expect("delivered");
+    assert_eq!(
+        reads.settle(arrived, || view.page_url(), now + PAGE_READ_DEADLINE),
+        PageEvalOutcome::Dropped {
+            token: second.token,
+            reason: PageEvalDrop::Late,
+        }
+    );
+    assert_eq!(
+        reads.settle(
+            PageEvalEvent::Expired(second.token),
+            || view.page_url(),
+            now + PAGE_READ_DEADLINE
+        ),
+        PageEvalOutcome::Stale(second.token)
+    );
+    assert_eq!(reads.in_flight(), 0);
+}
+
+#[test]
+fn page_eval_drops_an_over_cap_read() {
+    let view = FakeEvalView::at(PAGE_URL);
+    let epoch = NavEpoch::default();
+    let mut reads = PageReads::default();
+    let now = Instant::now();
+    let started = start_page_read(&mut reads, &view, &epoch, now);
+
+    // Um byte acima do tecto: o callback nem leva o texto.
+    let over = format!("\"{}\"", "a".repeat(PAGE_READ_CAP - 1));
+    assert_eq!(over.len(), PAGE_READ_CAP + 1);
+    view.answer(0, &over);
+    let event = started.delivered.try_recv().expect("delivered");
+    assert_eq!(
+        event,
+        PageEvalEvent::Arrived {
+            token: started.token,
+            raw: RawArrival::OverCap {
+                bytes: PAGE_READ_CAP + 1
+            },
+        }
+    );
+    assert_eq!(
+        reads.settle(event, || view.page_url(), now),
+        PageEvalOutcome::Dropped {
+            token: started.token,
+            reason: PageEvalDrop::OverCap {
+                bytes: PAGE_READ_CAP + 1,
+                limit: PAGE_READ_CAP,
+            },
+        }
+    );
+
+    // A entrega mede outra vez: um `Within` grande demais tambem cai.
+    let again = start_page_read(&mut reads, &view, &epoch, now);
+    let forged = PageEvalEvent::Arrived {
+        token: again.token,
+        raw: RawArrival::Within(over.clone()),
+    };
+    assert!(matches!(
+        reads.settle(forged, || view.page_url(), now),
+        PageEvalOutcome::Dropped {
+            reason: PageEvalDrop::OverCap { .. },
+            ..
+        }
+    ));
+
+    // No tecto exato, passa; o serde so ve o que passou.
+    let exact = format!("\"{}\"", "a".repeat(PAGE_READ_CAP - 2));
+    let third = start_page_read(&mut reads, &view, &epoch, now);
+    view.answer(2, &exact);
+    let event = third.delivered.try_recv().expect("delivered");
+    assert!(matches!(
+        reads.settle(event, || view.page_url(), now),
+        PageEvalOutcome::Delivered { .. }
+    ));
+    assert!(parse_page_json(&over, PAGE_READ_CAP).is_none());
+    assert!(parse_page_json(&exact, PAGE_READ_CAP).is_some());
+}
+
+#[test]
+fn page_eval_drops_a_navigated_read() {
+    let view = FakeEvalView::at(PAGE_URL);
+    let epoch = NavEpoch::default();
+    let mut reads = PageReads::default();
+    let now = Instant::now();
+
+    // O mesmo URL, recarregado: so a geracao o diz.
+    let reloaded = start_page_read(&mut reads, &view, &epoch, now);
+    epoch.bump();
+    view.answer(0, PAGE_JSON);
+    let event = reloaded.delivered.try_recv().expect("delivered");
+    assert_eq!(
+        reads.settle(event, || view.page_url(), now),
+        PageEvalOutcome::Dropped {
+            token: reloaded.token,
+            reason: PageEvalDrop::Navigated,
+        },
+        "a reload between the request and the answer must drop the read"
+    );
+
+    // Outro URL sem navegacao que a vista conte (history.pushState).
+    let pushed = start_page_read(&mut reads, &view, &epoch, now);
+    *view.url.borrow_mut() = Some("https://exemplo.com/outro".to_string());
+    view.answer(1, PAGE_JSON);
+    let event = pushed.delivered.try_recv().expect("delivered");
+    assert_eq!(
+        reads.settle(event, || view.page_url(), now),
+        PageEvalOutcome::Dropped {
+            token: pushed.token,
+            reason: PageEvalDrop::Navigated,
+        }
+    );
+
+    // A vista ja nao existe.
+    let gone = start_page_read(&mut reads, &view, &epoch, now);
+    view.answer(2, PAGE_JSON);
+    let event = gone.delivered.try_recv().expect("delivered");
+    assert_eq!(
+        reads.settle(event, || None, now),
+        PageEvalOutcome::Dropped {
+            token: gone.token,
+            reason: PageEvalDrop::Navigated,
+        }
+    );
+
+    // Controlo: sem navegacao nenhuma, a mesma resposta e entregue.
+    let steady = start_page_read(&mut reads, &view, &epoch, now);
+    view.answer(3, PAGE_JSON);
+    let event = steady.delivered.try_recv().expect("delivered");
+    assert!(matches!(
+        reads.settle(event, || view.page_url(), now),
+        PageEvalOutcome::Delivered { .. }
+    ));
+}
+
+#[test]
+fn page_eval_refuses_no_page_a_failed_eval_and_too_many_reads() {
+    let epoch = NavEpoch::default();
+    let now = Instant::now();
+    let mut reads = PageReads::default();
+    let blank = FakeEvalView::at(PAGE_URL);
+    *blank.url.borrow_mut() = None;
+    let noop = |_: PageEvalEvent| {};
+    assert_eq!(
+        reads.read(&blank, page_read_spec(), &epoch, now, noop, |_, _| {}),
+        Err(PageEvalRefusal::NoPage)
+    );
+    let mut refusing = FakeEvalView::at(PAGE_URL);
+    refusing.accepts = false;
+    let mut scheduled = 0;
+    assert_eq!(
+        reads.read(&refusing, page_read_spec(), &epoch, now, noop, |_, _| {
+            scheduled += 1
+        }),
+        Err(PageEvalRefusal::EvalFailed)
+    );
+    assert_eq!(scheduled, 0, "a refused script schedules no deadline");
+    assert_eq!(reads.in_flight(), 0);
+
+    let view = FakeEvalView::at(PAGE_URL);
+    let mut tokens = std::collections::HashSet::new();
+    for _ in 0..MAX_PENDING_READS {
+        tokens.insert(start_page_read(&mut reads, &view, &epoch, now).token);
+    }
+    assert_eq!(tokens.len(), MAX_PENDING_READS, "one token per read");
+    assert_eq!(
+        reads.read(&view, page_read_spec(), &epoch, now, noop, |_, _| {}),
+        Err(PageEvalRefusal::Busy)
+    );
+    assert_eq!(reads.cancel_all(), MAX_PENDING_READS);
+    assert!(
+        reads
+            .read(&view, page_read_spec(), &epoch, now, noop, |_, _| {})
+            .is_ok()
+    );
+}
+
+/// Gate de ausencia (§4.3): nenhum script de `READ_ONLY_SCRIPTS` publica,
+/// busca, escuta, agenda, navega, guarda, escreve HTML ou toca na
+/// capability. "So-leitura" e o do plano: nada disto; `nodeValue` de um no
+/// de texto (a Traducao) e permitido.
+#[test]
+fn page_eval_scripts_are_read_only() {
+    assert!(!READ_ONLY_SCRIPTS.is_empty());
+    let mut names = std::collections::HashSet::new();
+    for script in READ_ONLY_SCRIPTS {
+        assert!(names.insert(script.name()), "{} twice", script.name());
+        let compact: String = script
+            .source()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for forbidden in [
+            "postMessage",
+            "chrome.webview",
+            "__NEURALIA_CAP__",
+            "fetch(",
+            "XMLHttpRequest",
+            "sendBeacon",
+            "WebSocket",
+            "EventSource",
+            "addEventListener",
+            "MutationObserver",
+            "setTimeout",
+            "setInterval",
+            "requestAnimationFrame",
+            "innerHTML",
+            "outerHTML=",
+            "insertAdjacentHTML",
+            "document.write",
+            "eval(",
+            "Function(",
+            "import(",
+            "location=",
+            "location.href=",
+            "location.assign",
+            "location.replace",
+            "window.open",
+            ".submit(",
+            ".click(",
+            "localStorage",
+            "sessionStorage",
+            "indexedDB",
+            "document.cookie",
+            "navigator.clipboard",
+        ] {
+            assert!(
+                !compact.contains(forbidden),
+                "{}: a read-only script uses {forbidden}",
+                script.name()
+            );
+        }
+        // Nenhum `onxxx = ...` (um ouvinte por atribuicao).
+        let bytes = compact.as_bytes();
+        for (at, _) in compact.match_indices(".on") {
+            let name: String = compact[at + 3..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic())
+                .collect();
+            let after = at + 3 + name.len();
+            assert!(
+                name.is_empty() || bytes.get(after) != Some(&b'='),
+                "{}: a read-only script sets .on{name}",
+                script.name()
+            );
+        }
+    }
+}
